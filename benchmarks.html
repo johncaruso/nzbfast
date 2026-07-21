@@ -33,7 +33,7 @@
     <p class="kicker">Methodology first</p>
     <h2>The setup</h2>
     <ul class="plain">
-      <li><b>Clients:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (the closest Rust peer), all on the same machine per scenario (Apple M-series boxes: "London" M1 Ultra on 10&nbsp;GbE, "Miami" M3 Ultra ~2.4–3.0 Gbps line).</li>
+      <li><b>Clients:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (the closest Rust peer), all on the same machine per scenario (Apple M-series boxes: "Europe" M1 Ultra on 10&nbsp;GbE, "East Coast" M3 Ultra ~2.4–3.0 Gbps line).</li>
       <li><b>Fairness:</b> same 6 providers × 8 connections, TLS everywhere, legs run back-to-back interleaved. Every competitor tuned to its documented best: SABnzbd got <code>pipelining_requests=8</code> (<b>it ships 1 — i.e. unpipelined</b>; that setting alone took its 190 GB time from 24m24s to 19m02s), NZBGet got ArticleCache/DirectWrite/DirectUnpack/ParQuick, rustnzb its documented config.</li>
       <li><b>End state:</b> a verified, extracted, usable file — not "download finished". That's what you actually wait for.</li>
       <li><b>Reproducibility:</b> every claim traces to a dated entry in our benchmark log, recorded with the driver scripts that produced it: wall-clock + interface byte counters + process-tree peak RSS, 1–2 s resolution.</li>
@@ -44,7 +44,7 @@
 <section class="alt">
   <div class="wrap">
     <p class="kicker">Scenario 1 · clean, huge</p>
-    <h2>190.6 GB → single 167.9 GB mkv (London, 10 GbE)</h2>
+    <h2>190.6 GB → single 167.9 GB mkv (Europe, 10 GbE)</h2>
     <div class="bars">
       <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:24%"></i></span><span class="t">4m 44s</span></div>
       <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:36%"></i></span><span class="t">7m 06s · +50%</span></div>
@@ -64,7 +64,7 @@
     this scenario in the previous round ("121,975 articles missing", 71 GB orphaned).
     · ² nzbfast's memory follows its <em>configured budget</em>, not the job: this leg ran the
     default auto budget; capped at <b>1 GB</b> the same 190 GB job still completes, about 22%
-    slower — see the low-memory ladder below. On the earlier Miami round (~2.4–3 Gbps line) the
+    slower — see the low-memory ladder below. On the earlier East Coast round (~2.4–3 Gbps line) the
     same scenario ran 9m 00s vs NZBGet +30% and SABnzbd +111% — the gap holds across line speeds.</p>
   </div>
 </section>
@@ -78,11 +78,11 @@
     <div class="tblwrap"><table>
       <thead><tr><th>Job</th><th>nzbfast</th><th>NZBGet</th><th>SABnzbd</th></tr></thead>
       <tbody>
-        <tr><td>7.4 GB REMUX (London, 10 GbE)</td><td class="win">13.7 s</td><td class="lose">17.3 s (+26%)</td><td class="lose">19.0 s (+39%)</td></tr>
-        <tr><td>35 GB obfuscated 4K (London)</td><td class="win">67 s</td><td class="lose">108 s (+61%)</td><td class="lose">285 s (+325%)</td></tr>
-        <tr><td>87 GB 4K (Miami)</td><td class="win">272 s</td><td class="lose">370 s (+36%)</td><td class="lose">708 s (+160%)</td></tr>
-        <tr><td>87 GB on a 97 GB-free disk (London)</td><td class="win">3m 08s</td><td class="bad">cannot run²</td><td class="bad">cannot run²</td></tr>
-        <tr><td>190.6 GB (Miami)</td><td class="win">9m 00s</td><td class="lose">11m 43s (+30%)</td><td class="lose">19m 02s (+111%)</td></tr>
+        <tr><td>7.4 GB REMUX (Europe, 10 GbE)</td><td class="win">13.7 s</td><td class="lose">17.3 s (+26%)</td><td class="lose">19.0 s (+39%)</td></tr>
+        <tr><td>35 GB obfuscated 4K (Europe)</td><td class="win">67 s</td><td class="lose">108 s (+61%)</td><td class="lose">285 s (+325%)</td></tr>
+        <tr><td>87 GB 4K (East Coast)</td><td class="win">272 s</td><td class="lose">370 s (+36%)</td><td class="lose">708 s (+160%)</td></tr>
+        <tr><td>87 GB on a 97 GB-free disk (Europe)</td><td class="win">3m 08s</td><td class="bad">cannot run²</td><td class="bad">cannot run²</td></tr>
+        <tr><td>190.6 GB (East Coast)</td><td class="win">9m 00s</td><td class="lose">11m 43s (+30%)</td><td class="lose">19m 02s (+111%)</td></tr>
       </tbody>
     </table></div>
     <p class="note" style="text-align:left">² Their peak footprint (volumes + unpacked output
@@ -94,7 +94,7 @@
 <section class="alt">
   <div class="wrap">
     <p class="kicker">Scenario 3 · obfuscated post</p>
-    <h2>35 GB hash-named 4K → usable mkv (Miami)</h2>
+    <h2>35 GB hash-named 4K → usable mkv (East Coast)</h2>
     <div class="tblwrap"><table>
       <thead><tr><th></th><th>nzbfast</th><th>NZBGet</th><th>SABnzbd</th><th>rustnzb</th></tr></thead>
       <tbody>
@@ -111,7 +111,7 @@
 <section>
   <div class="wrap">
     <p class="kicker">Scenario 4 · queue of three</p>
-    <h2>Keeping the line lit across a queue (Miami, ~43 GB)</h2>
+    <h2>Keeping the line lit across a queue (East Coast, ~43 GB)</h2>
     <div class="tblwrap"><table>
       <thead><tr><th></th><th>nzbfast</th><th>rustnzb</th><th>NZBGet</th><th>SABnzbd</th></tr></thead>
       <tbody>
@@ -218,10 +218,10 @@
     <p class="kicker">Transport proof</p>
     <h2>The engine saturates real lines</h2>
     <ul class="plain">
-      <li><b>8.31 Gbps aggregate</b> on a measured-8.2 Gbps 10 GbE line (London M1 Ultra, 4 providers, 14,000 articles, 0 errors, 0 reconnects).</li>
+      <li><b>8.31 Gbps aggregate</b> on a measured-8.2 Gbps 10 GbE line (Europe M1 Ultra, 4 providers, 14,000 articles, 0 errors, 0 reconnects).</li>
       <li><b>9.16–9.27 Gbps</b> steady transport ticks on the same line — ≈98% of practical TCP goodput.</li>
       <li><b>5.44 Gbps sustained</b> through a full 20.4 GB job <i>including</i> in-stream verification.</li>
-      <li><b>Pipelining replicated at every RTT</b>: +64% at 63 ms Starlink, +170–177% at 14 ms datacenter, +270% at 31 ms Miami — it defeats TCP congestion-window decay, not just latency.</li>
+      <li><b>Pipelining replicated at every RTT</b>: +64% at 63 ms Starlink, +170–177% at 14 ms datacenter, +270% at 31 ms East Coast — it defeats TCP congestion-window decay, not just latency.</li>
       <li><b>Backpressure proof</b>: cap the write stage 4× below the network and input locks to the cap ±1% within 2 s, RAM <i>falls</i>, zero swaps — a slow disk can never balloon memory.</li>
       <li><b>Compute headroom</b>: measured decode+verify ceilings of 86–165 Gbps on Apple silicon — the network is the bottleneck by 4–50× on every machine tested.</li>
     </ul>
