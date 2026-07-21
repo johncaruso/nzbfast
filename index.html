@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nzbfast — the fastest NZB downloader</title>
+<meta name="description" content="A one-pass Usenet downloader: decode, verify and extract while downloading. 190 GB to a verified, playable file in 9 minutes. macOS, Windows, Linux, Docker.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+
+<header><div class="wrap">
+  <a class="logo" href="index.html"><span class="bolt">⚡</span> nzbfast</a>
+  <nav>
+    <a href="features.html">Features</a>
+    <a href="benchmarks.html">Benchmarks</a>
+    <a href="https://github.com/nzbfast/nzbfast" title="Source repository">GitHub</a>
+    <a class="cta" href="download.html">Download</a>
+  </nav>
+</div></header>
+
+<div class="hero wrap">
+  <h1>From NZB to <em>playing</em><br>before others finish downloading.</h1>
+  <p class="sub">nzbfast is a Usenet downloader built around a one-pass pipeline:
+  every byte is decoded, verified and extracted <b>while it downloads</b>.
+  No assembly pass, no verify pass, no unpack pass — when the progress bar
+  fills, the file is done and provably intact.</p>
+  <div class="chips">
+    <span class="chip"><b>8.31&nbsp;Gbps</b> on a 10&nbsp;GbE line</span>
+    <span class="chip"><b>190&nbsp;GB → 4m44s</b> to a verified file</span>
+    <span class="chip">RAR volumes <b>never touch disk</b></span>
+    <span class="chip"><b>Half the disk</b> competitors need</span>
+    <span class="chip">RAM-budgeted · <b>0 swaps, ever</b></span>
+  </div>
+  <div class="btnrow">
+    <a class="btn" href="download.html">Download</a>
+    <a class="btn ghost" href="benchmarks.html">See the numbers</a>
+  </div>
+  <p class="note">macOS · Windows · Linux · Docker — one self-contained executable, repair and unpack tools built in.</p>
+  <figure class="shot heroShot"><img src="assets/dash-hero.png" alt="nzbfast dashboard mid-download at 61 MB/s: throughput peaking at 104 MB/s across a full history graph, live resource and per-provider charts, and the download/verify/extract pipeline stages overlapping"></figure>
+</div>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Why it's fast</p>
+    <h2>Three ideas the mainstream clients don't fully exploit</h2>
+    <p class="lead">Not micro-optimisation — architecture. Each one is measured in
+    <a href="benchmarks.html">the benchmark log</a> with reproducible commands.</p>
+    <div class="grid3">
+      <div class="card"><span class="ic">🔁</span><h3>Pipelined NNTP</h3>
+        <p>Several article requests stay in flight per connection, so round-trips never
+        idle the socket — and TCP never decays its congestion window between articles.
+        Measured +12% to +270% over serial at four sites; a line saturates with 8
+        connections instead of 30–50.</p></div>
+      <div class="card"><span class="ic">🚿</span><h3>The one-pass pipeline</h3>
+        <p>Articles are SIMD-decoded in place, written once at their final offsets,
+        PAR2-verified from the decode buffers, and store-mode RAR contents are
+        extracted <i>during</i> the download — the volumes never exist as files.
+        Disk writes = content × 1.0.</p></div>
+      <div class="card"><span class="ic">🕸️</span><h3>Union availability</h3>
+        <p>An article is only "missing" when <i>every</i> configured backbone has refused
+        it. Block-exact accounting decides COMPLETE / REPAIRABLE / IMPOSSIBLE before
+        wasting bytes, fetches the exact-fit minimum of recovery blocks, and aborts
+        hopeless downloads in seconds.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">The pipeline</p>
+    <h2>Touch every byte once</h2>
+    <p class="lead">Competitors write the archive volumes, read them back to verify, read
+    them again to extract, then write the output — roughly 2× writes and 2× reads.
+    nzbfast does this instead:</p>
+    <div class="pipe"><pre>
+socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s per core)
+                   │
+                   ├─▶ <b>pwrite at final offset</b>          (plain posts)
+                   │      └─ or: RAR-map translate ─▶ pwrite straight into the
+                   │         <em>extracted</em> file (store-mode posts — the rar
+                   │         volumes never touch disk)
+                   ├─▶ <b>PAR2 block hasher</b> — every block MD5-verified from the
+                   │      decode buffer; verification finishes with the download
+                   └─▶ <b>availability ledger</b> — block-exact health, live
+</pre></div>
+    <div class="callout">Damaged post? Bad blocks are known the moment their articles fail,
+    the <b>exact-fit minimum</b> of recovery volumes is fetched <b>during</b> the download
+    (22 blocks fetched for 20 needed, in the bench round), and repair touches only the
+    damaged spans. Impossible post? It aborts in seconds having downloaded almost
+    nothing — before your quota notices.</div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Headline features</p>
+    <h2>Everything a serious setup needs</h2>
+    <p class="lead">The full list — every milestone, every integration — is on the
+    <a href="features.html">features page</a>.</p>
+    <div class="grid2">
+      <ul class="feat">
+        <li><b>Line-rate downloads</b> <span class="d">— pipelined NNTP proven at 8.31 Gbps on 10 GbE; the fastest client on every clean benchmark leg, at every size.</span></li>
+        <li><b>One-pass pipeline</b> <span class="d">— decode → verify → extract overlap; store-mode RAR volumes never hit disk; needs 1× disk where others need ~2×.</span></li>
+        <li><b>Multi-provider union availability</b> <span class="d">— block-exact routing across backbones; preflight verdicts; exact-fit repair; early abort of impossible posts.</span></li>
+        <li><b>Memory budget</b> <span class="d">— one global RAM budget with graceful spill tiers. It never swaps your machine: a 190 GB job completes inside a 1 GB budget (~1.1 GB peak RSS).</span></li>
+        <li><b>Streaming with seek</b> <span class="d">— watch while it downloads; seeks re-prioritise the article queue, so jumping ahead takes ~2 s, not minutes.</span></li>
+      </ul>
+      <ul class="feat">
+        <li><b>Drop-in APIs</b> <span class="d">— SABnzbd-compatible API and NZBGet JSON-RPC: Sonarr, Radarr, nzb360 and LunaSea work unmodified. One-click import of your SAB/NZBGet config.</span></li>
+        <li><b>Built-in indexer</b> <span class="d">— scans your newsgroups into a searchable local index, serves Newznab so your *arr stack can search it too.</span></li>
+        <li><b>Poster wall with keyless metadata</b> <span class="d">— browse your index like a streaming service: artwork, ratings, cast and synopses with zero API keys to sign up for.</span></li>
+        <li><b>Watchlist automation</b> <span class="d">— name a show or film (aired or not); it's grabbed the moment it appears, then quality-upgraded until your target is met.</span></li>
+        <li><b>A single executable</b> <span class="d">— repair (par2) and unpack (unrar) ride inside the binary. Unzip, run, done.</span></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">Benchmarks</p>
+    <h2>190.6 GB → a verified 167.9 GB file</h2>
+    <p class="lead">Same machine, same six providers, runs interleaved back-to-back.
+    Time until a usable, extracted file exists — the only metric that matters.
+    Every competitor tuned to its documented best (including switching SABnzbd's
+    pipelining <i>on</i>, which it ships without).</p>
+    <div class="bars">
+      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:24%"></i></span><span class="t">4m 44s</span></div>
+      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:36%"></i></span><span class="t">7m 06s · +50%</span></div>
+      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 31s · +312%</span></div>
+      <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">no usable file</span></div>
+    </div>
+    <p class="note" style="text-align:left">190.6 GB NZB → single 167.9 GB mkv, M1 Ultra on 10 GbE, 6 providers × 8 connections.
+    Same job completes inside a 1 GB memory budget. Full tables, six scenarios, and the legs we <i>lost</i> — plus how to reproduce —
+    on the <a href="benchmarks.html">benchmarks page</a>.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">The showcase</p>
+    <h2>Your index, presented like a streaming service</h2>
+    <p class="lead">The built-in indexer scans the newsgroups you care about; the wall turns
+    the result into posters, ratings, cast and episode grids — using only keyless public
+    sources, fetched by your own install. Click an episode chip to download it; hit ▶ to
+    stream it while it downloads.</p>
+    <figure class="shot"><img src="assets/wall-grid.jpg" alt="nzbfast poster wall: a grid of TV posters with quality badges, ratings and season counts" loading="lazy"></figure>
+    <div style="height:18px"></div>
+    <div class="strip">
+      <figure><div class="shot"><img src="assets/wall-sheet.jpg" alt="Detail sheet for a show: backdrop, IMDb rating, cast, synopsis, per-episode download chips" loading="lazy"></div>
+        <figcaption>Ratings, cast, synopsis, episode grid — no API keys, ever.</figcaption></figure>
+      <figure><div class="shot"><img src="assets/dash-queue-drawer.png" alt="Queue with a per-download detail drawer: per-file progress bars, verify blocks, per-server contribution" loading="lazy"></div>
+        <figcaption>Every download opens into per-file progress, live verify state and per-server contribution.</figcaption></figure>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">Fits your stack</p>
+    <h2>Point your existing tools at it</h2>
+    <div class="grid3">
+      <div class="card"><h3>Sonarr / Radarr</h3><p>Full SABnzbd-compatible API — add nzbfast as a
+        "SABnzbd" download client and it just works: grabs, categories, priorities, retries,
+        post-processing scripts (SAB_* contract), history. The Newznab facade also lets the
+        *arrs <i>search your local index</i> as if it were an indexer.</p></div>
+      <div class="card"><h3>nzb360 / LunaSea</h3><p>The daemon speaks NZBGet's JSON-RPC too —
+        the popular phone remotes drive nzbfast unmodified. And the dashboard itself has a
+        first-class phone layout for when you're away from the big screen.</p></div>
+      <div class="card"><h3>Coming from SAB or NZBGet?</h3><p>One click imports your servers from
+        an existing SABnzbd or NZBGet install (it also reads sabnzbd.ini directly). Watch
+        folders, RSS feeds with filters, smart folders with TV filing, and cleanup rules come
+        along for the ride.</p></div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap" style="text-align:center">
+    <h2>Try it in the next two minutes</h2>
+    <p class="lead" style="margin-left:auto;margin-right:auto">Unzip, double-click the launcher, answer
+    three questions (or let it find your SABnzbd config), and the dashboard opens. First
+    download inside two minutes.</p>
+    <div class="btnrow">
+      <a class="btn" href="download.html">Download nzbfast</a>
+      <a class="btn ghost" href="features.html">Read the full feature list</a>
+    </div>
+  </div>
+</section>
+
+<footer><div class="wrap">
+  <div class="cols">
+    <div>⚡ <b>nzbfast</b> — the one-pass Usenet downloader.</div>
+    <div>
+      <a href="features.html">Features</a> ·
+      <a href="benchmarks.html">Benchmarks</a> ·
+      <a href="download.html">Download</a> ·
+      <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
+    </div>
+  </div>
+  <p class="fine">Free software, GPL-3.0-or-later. Bundled tools keep their own licences: unrar
+  (RARLab freeware) and par2 (par2cmdline-turbo, GPL-2.0-or-later), both run as separate
+  processes under an explicit additional permission. Poster-wall metadata comes from keyless
+  public sources (TVmaze, iTunes Search, public datasets, Wikidata, Wikipedia, AniList),
+  fetched by your own installation. nzbfast downloads what you tell it to — you are
+  responsible for what that is.</p>
+</div></footer>
+
+</body>
+</html>

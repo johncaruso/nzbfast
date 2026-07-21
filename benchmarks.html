@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Benchmarks — nzbfast</title>
+<meta name="description" content="nzbfast vs SABnzbd, NZBGet and rustnzb: 4 clients × 6 scenarios on identical hardware. Honest results including the legs nzbfast lost, with reproduction steps.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+
+<header><div class="wrap">
+  <a class="logo" href="index.html"><span class="bolt">⚡</span> nzbfast</a>
+  <nav>
+    <a href="features.html">Features</a>
+    <a href="benchmarks.html" class="on">Benchmarks</a>
+    <a href="https://github.com/nzbfast/nzbfast" title="Source repository">GitHub</a>
+    <a class="cta" href="download.html">Download</a>
+  </nav>
+</div></header>
+
+<div class="hero wrap" style="padding-bottom:6px">
+  <h1>Measured, not <em>marketed</em>.</h1>
+  <p class="sub">Four clients, six scenarios, identical hardware and providers, runs
+  interleaved so provider drift cancels. The metric is <b>time to a usable file</b> —
+  downloaded, verified, extracted. Includes the two legs we lost.</p>
+</div>
+
+<section style="padding-top:26px">
+  <div class="wrap">
+    <p class="kicker">Methodology first</p>
+    <h2>The setup</h2>
+    <ul class="plain">
+      <li><b>Clients:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (the closest Rust peer), all on the same machine per scenario (Apple M-series boxes: "London" M1 Ultra on 10&nbsp;GbE, "Miami" M3 Ultra ~2.4–3.0 Gbps line).</li>
+      <li><b>Fairness:</b> same 6 providers × 8 connections, TLS everywhere, legs run back-to-back interleaved. Every competitor tuned to its documented best: SABnzbd got <code>pipelining_requests=8</code> (<b>it ships 1 — i.e. unpipelined</b>; that setting alone took its 190 GB time from 24m24s to 19m02s), NZBGet got ArticleCache/DirectWrite/DirectUnpack/ParQuick, rustnzb its documented config.</li>
+      <li><b>End state:</b> a verified, extracted, usable file — not "download finished". That's what you actually wait for.</li>
+      <li><b>Reproducibility:</b> every claim traces to a dated entry in our benchmark log, recorded with the driver scripts that produced it: wall-clock + interface byte counters + process-tree peak RSS, 1–2 s resolution.</li>
+    </ul>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">Scenario 1 · clean, huge</p>
+    <h2>190.6 GB → single 167.9 GB mkv (London, 10 GbE)</h2>
+    <div class="bars">
+      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:24%"></i></span><span class="t">4m 44s</span></div>
+      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:36%"></i></span><span class="t">7m 06s · +50%</span></div>
+      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 31s · +312%</span></div>
+      <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">no output¹</span></div>
+    </div>
+    <div class="tblwrap"><table>
+      <thead><tr><th></th><th>nzbfast</th><th>NZBGet 26.2</th><th>SABnzbd 5.0.4</th><th>rustnzb 1.3.4</th></tr></thead>
+      <tbody>
+        <tr><td>time to usable file</td><td class="win">4m 44s</td><td class="lose">7m 06s (+50%)</td><td class="lose">19m 31s (+312%)</td><td class="bad">none¹</td></tr>
+        <tr><td>GB on the wire</td><td class="win num">169.3</td><td class="num">169.6</td><td class="num">169.6</td><td class="num">186.6</td></tr>
+        <tr><td>peak RSS</td><td class="num">6.8 GB²</td><td class="num">1.8 GB</td><td class="num">1.8 GB</td><td class="win num">0.6 GB</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:left">¹ rustnzb reported the job done at 5m 42s having pulled
+    186.6 GB — 10% more wire than anyone — but left <b>no output file at all</b>. It also failed
+    this scenario in the previous round ("121,975 articles missing", 71 GB orphaned).
+    · ² nzbfast's memory follows its <em>configured budget</em>, not the job: this leg ran the
+    default auto budget; capped at <b>1 GB</b> the same 190 GB job still completes, about 22%
+    slower — see the low-memory ladder below. On the earlier Miami round (~2.4–3 Gbps line) the
+    same scenario ran 9m 00s vs NZBGet +30% and SABnzbd +111% — the gap holds across line speeds.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Scenario 2 · the gap grows with size</p>
+    <h2>Time to usable file, by job size</h2>
+    <p class="lead">One-pass means no post-download verify/unpack pass — so the bigger the job,
+    the further ahead it lands. Same-machine sequential runs:</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>Job</th><th>nzbfast</th><th>NZBGet</th><th>SABnzbd</th></tr></thead>
+      <tbody>
+        <tr><td>7.4 GB REMUX (London, 10 GbE)</td><td class="win">13.7 s</td><td class="lose">17.3 s (+26%)</td><td class="lose">19.0 s (+39%)</td></tr>
+        <tr><td>35 GB obfuscated 4K (London)</td><td class="win">67 s</td><td class="lose">108 s (+61%)</td><td class="lose">285 s (+325%)</td></tr>
+        <tr><td>87 GB 4K (Miami)</td><td class="win">272 s</td><td class="lose">370 s (+36%)</td><td class="lose">708 s (+160%)</td></tr>
+        <tr><td>87 GB on a 97 GB-free disk (London)</td><td class="win">3m 08s</td><td class="bad">cannot run²</td><td class="bad">cannot run²</td></tr>
+        <tr><td>190.6 GB (Miami)</td><td class="win">9m 00s</td><td class="lose">11m 43s (+30%)</td><td class="lose">19m 02s (+111%)</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:left">² Their peak footprint (volumes + unpacked output
+    simultaneously, ~156 GB) exceeded the 97 GB free. One-pass needs 1× the content size —
+    it halves the disk you need, not just the time.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">Scenario 3 · obfuscated post</p>
+    <h2>35 GB hash-named 4K → usable mkv (Miami)</h2>
+    <div class="tblwrap"><table>
+      <thead><tr><th></th><th>nzbfast</th><th>NZBGet</th><th>SABnzbd</th><th>rustnzb</th></tr></thead>
+      <tbody>
+        <tr><td>time to usable file</td><td class="win">96 s</td><td class="lose">153 s (+59%)</td><td class="lose">259 s (+170%)</td><td class="bad">no usable file³</td></tr>
+        <tr><td>peak RSS</td><td class="win num">1.55 GB</td><td class="num">3.7 GB</td><td class="num">8.8 GB</td><td class="num">3.6 GB</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:left">³ rustnzb downloaded in 119 s, marked the job
+    <i>Completed</i> — and shipped the raw obfuscated volumes: no rename, no extraction.
+    nzbfast deobfuscated from PAR2 metadata and extracted in-stream, zero read-back blocks.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Scenario 4 · queue of three</p>
+    <h2>Keeping the line lit across a queue (Miami, ~43 GB)</h2>
+    <div class="tblwrap"><table>
+      <thead><tr><th></th><th>nzbfast</th><th>rustnzb</th><th>NZBGet</th><th>SABnzbd</th></tr></thead>
+      <tbody>
+        <tr><td>queue wall time</td><td class="win">122 s</td><td class="num">136 s</td><td class="num">162 s</td><td class="num">277 s</td></tr>
+        <tr><td>line idle (&lt;20 MB/s)</td><td class="win">2 s (2%)</td><td class="num">16 s (12%)</td><td class="num">0 s</td><td class="bad">168 s (61%)</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:left">Three shapes of the same problem: nzbfast's tail-overlap
+    keeps the line busy edge-to-edge; NZBGet never idles but runs ~35% slower while unpacking
+    concurrently; SABnzbd downloads fast, then leaves the line <b>dark 61% of the time</b> during
+    serial post-processing. In the resilience variant (one job with encrypted RAR headers),
+    SABnzbd's queue wedged on the encrypted job and only 1 of 3 jobs ever completed; nzbfast
+    parked it with a clear message and finished the rest.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">The honest column</p>
+    <h2>Two legs we lost — one now closed</h2>
+    <div class="grid2">
+      <div class="card"><h3>Damaged store-mode post</h3>
+        <p>20 poisoned articles in a 7.4 GB REMUX: NZBGet finished usable in <b>53 s</b>; nzbfast
+        now takes <b>58 s</b> — repair complete in 32 s, all 62 volumes re-extracted, byte-exact
+        output. The end-state bug an earlier build had on this exact path (repaired volumes
+        wrecked by the re-extract while the exit code said success) is fixed, regression-tested,
+        and re-validated against real Usenet. Our repair still fetches a near-theoretical-minimum
+        22 recovery blocks for 20 needed vs their full PAR2 pass — but NZBGet keeps the leg by
+        five seconds, so it's printed here.</p></div>
+      <div class="card"><h3>kill −9 resume — closed</h3>
+        <p>Killed at ~15 GB of a 34.5 GB job, this used to be our worst number: NZBGet re-downloaded
+        <b>~0.6 GB</b>, nzbfast <b>15 GB</b> — everything decoded before PAR2 activation died with
+        the process. The journal now records every article's physical placement, so a resume
+        restores those bytes from the previous run's own output files (a local disk copy, each
+        byte re-verified against the PAR2 block map) and re-downloads <b>~0.3 GB</b> — parity
+        within provider noise. SABnzbd, for the record, has never recovered from this scenario in
+        three rounds: killed the same way, it re-fetched 0.5 GB in an hour and timed out.</p></div>
+    </div>
+    <div class="callout">Why publish losses? Because the wins are only believable next to them.
+    Every number on this page comes from the same interleaved runs, and the repo's
+    our benchmark log is a full lab notebook — negative results included.</div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Scenario 6 · starve it of RAM</p>
+    <h2>The low-memory ladder — 190 GB in ~1.1 GB of RAM</h2>
+    <p>The same four jobs, re-run at hard memory budgets of 2 GB, 1 GB and 256 MB —
+    what the auto-sizer would pick on an 8 GB box, a 4 GB box, and a 2 GB NAS. Every
+    leg produced a correct, fully verified, extracted file; peak RSS tracked the
+    <em>budget</em>, not the job. Time to usable file, 10 GbE line:</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>Job size</th><th>plenty of RAM</th><th>2 GB budget</th><th>1 GB budget</th><th>256 MB budget</th></tr></thead>
+      <tbody>
+        <tr><td>7 GB</td><td class="num">15 s</td><td class="num">15 s</td><td class="num">15 s</td><td class="num">15 s</td></tr>
+        <tr><td>35 GB</td><td class="num">65 s</td><td class="num">70 s</td><td class="num">70 s</td><td class="num">65 s</td></tr>
+        <tr><td>87 GB</td><td class="num">148 s</td><td class="num">206 s</td><td class="num">196 s</td><td class="num">180 s</td></tr>
+        <tr><td>190 GB</td><td class="num">330 s</td><td class="num">427 s</td><td class="num">402 s</td><td class="num">411 s</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:left">The 20–40% premium on the big jobs is a
+    10 GbE artifact: spilled blocks only cost time when the line outruns the disk. The
+    same 87 GB job at the same budgets on a ~2.4 Gbps line measured −1% to +7% — noise.
+    On a typical home connection a small budget is close to free at any job size. A
+    NAS profile (2 connections, 256 MB budget) finished the 35 GB job in 0.4 GB peak
+    RSS — a 2 GB NAS can run this. No other client offers a memory ceiling at all.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">Capability, not micro-benchmarks</p>
+    <h2>What each client can do</h2>
+    <div class="tblwrap"><table>
+      <thead><tr><th></th><th>nzbfast</th><th>SABnzbd 5</th><th>NZBGet 26</th><th>rustnzb</th><th>Usenapp</th><th>Newsbin</th></tr></thead>
+      <tbody>
+        <tr><td>pipelined NNTP</td><td class="yes">yes</td><td class="half">off by default</td><td class="no">no</td><td class="yes">yes</td><td class="no">—</td><td class="no">—</td></tr>
+        <tr><td>full verify during download</td><td class="yes">every block</td><td class="no">after</td><td class="half">quick-check</td><td class="no">after</td><td class="no">after</td><td class="no">after</td></tr>
+        <tr><td>extract during download</td><td class="yes">in-stream, no volumes on disk</td><td class="half">direct unpack⁴</td><td class="half">direct unpack⁴</td><td class="half">unreliable⁵</td><td class="no">no</td><td class="no">no</td></tr>
+        <tr><td>disk needed for an N-GB post</td><td class="yes">~1×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td></tr>
+        <tr><td>pre-download completability verdict</td><td class="yes">block-exact</td><td class="no">no</td><td class="half">health %</td><td class="no">no</td><td class="yes">article check</td><td class="no">no</td></tr>
+        <tr><td>bounded memory (never swap)</td><td class="yes">budgeted</td><td class="no">9.3 GB @ 190 GB</td><td class="half">cache setting</td><td class="no">no</td><td class="no">—</td><td class="no">—</td></tr>
+        <tr><td>stream + seek while downloading</td><td class="yes">yes</td><td class="no">no</td><td class="no">no</td><td class="no">no</td><td class="half">sequential</td><td class="no">no</td></tr>
+        <tr><td>built-in indexer + poster wall</td><td class="yes">yes, keyless</td><td class="no">no</td><td class="no">no</td><td class="no">no</td><td class="half">search UI</td><td class="half">group browser</td></tr>
+        <tr><td>Sonarr/Radarr drop-in</td><td class="yes">SAB API + Newznab</td><td class="yes">native</td><td class="yes">native</td><td class="half">partial</td><td class="no">no</td><td class="no">no</td></tr>
+        <tr><td>phone remotes (nzb360/LunaSea)</td><td class="yes">via NZBGet RPC</td><td class="yes">yes</td><td class="yes">yes</td><td class="no">no</td><td class="no">no</td><td class="no">no</td></tr>
+        <tr><td>watchlist auto-grab + upgrades</td><td class="yes">built in</td><td class="no">via *arr</td><td class="no">via *arr</td><td class="no">no</td><td class="yes">Watchdog</td><td class="half">rules</td></tr>
+        <tr><td>single self-contained binary</td><td class="yes">yes</td><td class="no">Python</td><td class="yes">yes</td><td class="yes">yes</td><td class="yes">.app</td><td class="yes">.exe</td></tr>
+        <tr><td>open source</td><td class="yes">GPL⁶</td><td class="yes">GPL</td><td class="yes">GPL</td><td class="yes">yes</td><td class="no">paid</td><td class="no">paid</td></tr>
+        <tr><td>platforms</td><td class="yes">mac/win/linux/docker</td><td class="yes">mac/win/linux</td><td class="yes">mac/win/linux</td><td class="half">linux/win</td><td class="no">mac only</td><td class="no">win only</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:left">⁴ Direct unpack still materialises the volumes first —
+    2× writes and 2× disk. ⁵ rustnzb shipped obfuscated volumes marked "Completed" in our round
+    (its unpack also hangs with RARLab unrar unless disabled). ⁶ GPL-3.0-or-later.
+    Usenapp/Newsbin are single-platform commercial readers with downloader features; they're
+    listed because people ask, not because they compete on speed.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Transport proof</p>
+    <h2>The engine saturates real lines</h2>
+    <ul class="plain">
+      <li><b>8.31 Gbps aggregate</b> on a measured-8.2 Gbps 10 GbE line (London M1 Ultra, 4 providers, 14,000 articles, 0 errors, 0 reconnects).</li>
+      <li><b>9.16–9.27 Gbps</b> steady transport ticks on the same line — ≈98% of practical TCP goodput.</li>
+      <li><b>5.44 Gbps sustained</b> through a full 20.4 GB job <i>including</i> in-stream verification.</li>
+      <li><b>Pipelining replicated at every RTT</b>: +64% at 63 ms Starlink, +170–177% at 14 ms datacenter, +270% at 31 ms Miami — it defeats TCP congestion-window decay, not just latency.</li>
+      <li><b>Backpressure proof</b>: cap the write stage 4× below the network and input locks to the cap ±1% within 2 s, RAM <i>falls</i>, zero swaps — a slow disk can never balloon memory.</li>
+      <li><b>Compute headroom</b>: measured decode+verify ceilings of 86–165 Gbps on Apple silicon — the network is the bottleneck by 4–50× on every machine tested.</li>
+    </ul>
+    <div class="callout">Standing rule from the repo: <b>every perf claim cites a reproducible
+    command and the conditions it ran under.</b> The full lab notebook — including negative
+    results and wrong turns — is kept as a dated lab notebook.</div>
+  </div>
+</section>
+
+<footer><div class="wrap">
+  <div class="cols">
+    <div>⚡ <b>nzbfast</b> — the one-pass Usenet downloader.</div>
+    <div>
+      <a href="features.html">Features</a> ·
+      <a href="benchmarks.html">Benchmarks</a> ·
+      <a href="download.html">Download</a> ·
+      <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
+    </div>
+  </div>
+  <p class="fine">Benchmark data: 19–20 July 2026 competitive round. Client
+  versions: SABnzbd 5.0.4, NZBGet 26.2 (nzbget.com fork), rustnzb 1.3.4. If a newer version of
+  any client materially changes a result, we'll re-run and update.</p>
+</div></footer>
+
+</body>
+</html>

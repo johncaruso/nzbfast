@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Download — nzbfast</title>
+<meta name="description" content="Download nzbfast for macOS, Windows, Linux, Docker, Synology and more. One self-contained executable with repair and unpack built in.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+
+<header><div class="wrap">
+  <a class="logo" href="index.html"><span class="bolt">⚡</span> nzbfast</a>
+  <nav>
+    <a href="features.html">Features</a>
+    <a href="benchmarks.html">Benchmarks</a>
+    <a href="https://github.com/nzbfast/nzbfast" title="Source repository">GitHub</a>
+    <a class="cta" href="download.html">Download</a>
+  </nav>
+</div></header>
+
+<div class="hero wrap" style="padding-bottom:6px">
+  <h1>One binary. <em>Batteries included.</em></h1>
+  <p class="sub">Every build is a single self-contained executable — repair (par2) and
+  unpack (unrar) are embedded. Unzip, run the launcher, answer three questions, download.</p>
+</div>
+
+<section style="padding-top:26px">
+  <div class="wrap">
+    <div class="dl">
+      <div class="card">
+        <h3>🍎 macOS <span class="tag now">available</span></h3>
+        <p>Universal binary — Apple Silicon and Intel. Includes the double-click launcher
+        with guided setup, and the native menu-bar app (beta).</p>
+        <p class="meta">macOS 12+ · ~39 MB · daemon + dashboard + Mac app</p>
+        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.0-macos-universal.zip">Download for macOS</a></p>
+      </div>
+      <div class="card">
+        <h3>🪟 Windows <span class="tag now">available</span></h3>
+        <p>Fully static x64 exe — runs on stock Windows 10/11, no runtime to install.
+        Double-click launcher included (it can also adopt your existing SABnzbd config).</p>
+        <p class="meta">Windows 10/11 x64 · ~17 MB</p>
+        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.0-windows-x64.zip">Download for Windows</a></p>
+      </div>
+      <div class="card">
+        <h3>🐧 Linux <span class="tag now">available</span></h3>
+        <p>Static musl builds for x86_64 and arm64 — seedboxes, VPSes, any NAS with SSH,
+        Raspberry Pi 4/5. No glibc-version roulette.</p>
+        <p class="meta">x86_64 · arm64 · systemd unit included</p>
+        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.0-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.0-linux-arm64.tar.gz">arm64</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.0-nas.zip">NAS bundle</a></p>
+      </div>
+      <div class="card">
+        <h3>🐳 Docker <span class="tag soon">first release</span></h3>
+        <p>Multi-arch image (amd64 + arm64), linuxserver-style PUID/PGID entrypoint,
+        healthcheck, compose file. This is the path for <b>Unraid</b>, <b>TrueNAS SCALE</b>
+        and <b>QNAP Container Station</b>.</p>
+        <pre class="cmd">docker run -p 6789:6789 -v ./config:/config \
+  -v ./downloads:/downloads nzbfast/nzbfast</pre>
+      </div>
+      <div class="card">
+        <h3>📦 Synology <span class="tag plan">planned</span></h3>
+        <p>Native .spk for DSM 7 package center. Until it lands, Synology's Container
+        Manager runs the Docker image fine.</p>
+        <p class="meta">DSM 7 · x86_64 + arm64 models</p>
+      </div>
+      <div class="card">
+        <h3>🍺 Homebrew <span class="tag soon">first release</span></h3>
+        <p>Formula with a service block (<code>brew services start nzbfast</code>).</p>
+        <pre class="cmd">brew install nzbfast/tap/nzbfast</pre>
+      </div>
+    </div>
+
+    <div class="callout" style="margin-top:26px"><b>Verifying downloads:</b> every release ships
+    sha256 sums next to the artifacts on the releases page. macOS zips preserve executable bits;
+    first launch clears the quarantine flag for you (the launcher script does it — that's most of
+    what it's for).</div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <h2>Two minutes to first download</h2>
+    <ul class="plain">
+      <li><b>1.</b> Unzip and run <code>Start nzbfast</code> (mac: .command, windows: .bat) — or just <code>./nzbfast setup</code> in a terminal.</li>
+      <li><b>2.</b> The wizard finds an existing SABnzbd/NZBGet config and offers to use it; otherwise it asks for your provider's host, username, password and connection count.</li>
+      <li><b>3.</b> The dashboard opens at <code>http://localhost:6789</code>. Drop an .nzb anywhere on it — or point Sonarr/Radarr at it as a SABnzbd client.</li>
+    </ul>
+    <p class="note" style="text-align:left">Upgrading is replacing one file. Settings, queue and
+    history live next to your config and survive restarts and upgrades.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Platform notes</h2>
+    <ul class="plain">
+      <li><b>Raspberry Pi / ARM NAS</b> — use the Linux arm64 build. The engine's SIMD decode has NEON kernels; a Pi 5 saturates gigabit with headroom.</li>
+      <li><b>Unraid</b> — install from Community Apps once the template is published (Docker image underneath); until then, add the image manually.</li>
+      <li><b>TrueNAS SCALE</b> — run the Docker image as a custom app.</li>
+      <li><b>FreeBSD / others</b> — <code>cargo build --release</code> from source is expected to work (rustls, no OpenSSL); officially untested. par2/unrar resolve from $PATH on non-mac/windows platforms for now.</li>
+      <li><b>Phones</b> — nothing to install: the dashboard has a first-class phone layout, and nzb360/LunaSea connect via the NZBGet-compatible API.</li>
+    </ul>
+  </div>
+</section>
+
+<footer><div class="wrap">
+  <div class="cols">
+    <div>⚡ <b>nzbfast</b> — the one-pass Usenet downloader.</div>
+    <div>
+      <a href="features.html">Features</a> ·
+      <a href="benchmarks.html">Benchmarks</a> ·
+      <a href="download.html">Download</a> ·
+      <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
+    </div>
+  </div>
+  <p class="fine">Free software, GPL-3.0-or-later. Bundled tools keep their own licences: unrar
+  (RARLab freeware — licence text ships in every bundle) and par2 (par2cmdline-turbo,
+  GPL-2.0-or-later; source via the releases page), both run as separate processes under
+  an explicit additional permission. sha256 checksums accompany all artifacts.</p>
+</div></footer>
+
+</body>
+</html>
