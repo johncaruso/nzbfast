@@ -22,14 +22,14 @@ body{margin:0;background:var(--bg);color:var(--fg);
 a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
 .wrap{display:grid;grid-template-columns:250px minmax(0,1fr);max-width:1160px;margin:0 auto;gap:0}
 nav{position:sticky;top:0;align-self:start;height:100vh;overflow-y:auto;
-  padding:28px 18px 40px 22px;border-right:1px solid var(--line);font-size:13px}
+  padding:28px 18px 40px;padding-inline-start:22px;border-inline-end:1px solid var(--line);font-size:13px}
 nav .brand{font-size:19px;font-weight:700;margin-bottom:2px}
 nav .brand small{color:var(--dim);font-weight:400;font-size:12px}
 nav ol{list-style:none;padding:0;margin:14px 0 0}
 nav li{margin:1px 0}
 nav a{display:block;padding:3.5px 8px;border-radius:6px;color:var(--fg)}
 nav a:hover{background:var(--code);text-decoration:none}
-nav .sub{margin-left:12px;color:var(--dim)}
+nav .sub{margin-inline-start:12px;color:var(--dim)}
 main{padding:34px 42px 90px;min-width:0}
 h1{font-size:31px;margin:0 0 4px;letter-spacing:-.02em}
 .subtitle{color:var(--dim);margin:0 0 30px;font-size:16px}
@@ -45,13 +45,14 @@ pre{background:var(--code);border:1px solid var(--line);border-radius:9px;
   padding:12px 15px;overflow-x:auto;font:12.5px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 pre code{background:none;border:none;padding:0}
 table{border-collapse:collapse;width:100%;margin:12px 0;font-size:13.5px}
-th{text-align:left;color:var(--dim);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
-th,td{padding:7px 12px 7px 0;border-bottom:1px solid var(--line);vertical-align:top}
+th{text-align:start;color:var(--dim);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+th,td{padding:7px 0;padding-inline-end:12px;border-bottom:1px solid var(--line);vertical-align:top}
 td code{white-space:nowrap}
-.tip,.note,.warn-box{border-left:3px solid var(--acc);background:var(--card);
-  border-radius:0 9px 9px 0;padding:10px 16px;margin:14px 0;font-size:14px}
-.note{border-left-color:var(--dim)}
-.warn-box{border-left-color:var(--warn)}
+.tip,.note,.warn-box{border-inline-start:3px solid var(--acc);background:var(--card);
+  border-start-start-radius:0;border-end-start-radius:0;border-start-end-radius:9px;border-end-end-radius:9px;
+  padding:10px 16px;margin:14px 0;font-size:14px}
+.note{border-inline-start-color:var(--dim)}
+.warn-box{border-inline-start-color:var(--warn)}
 .tip b:first-child,.note b:first-child,.warn-box b:first-child{display:block;font-size:12px;
   text-transform:uppercase;letter-spacing:.05em;color:var(--dim);margin-bottom:2px}
 .pill{display:inline-block;background:var(--code);border:1px solid var(--line);
@@ -61,9 +62,16 @@ td code{white-space:nowrap}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px 26px}
 hr{border:none;border-top:1px solid var(--line);margin:30px 0}
 .dim{color:var(--dim)}
+/* 2b RTL (he/ar/fa): the translated manuals are served right-to-left; the
+   layout mirrors through the logical properties above. Code stays LTR —
+   inline code is isolated so CLI flags and paths never reorder, and command
+   listings render left-to-right, left-aligned. (No literal tag names in this
+   comment: manual-check.py scans comments too and would miscount them.) */
+[dir=rtl] code,[dir=rtl] kbd{direction:ltr;unicode-bidi:isolate}
+[dir=rtl] pre{direction:ltr;text-align:left}
 @media(max-width:860px){
   .wrap{grid-template-columns:1fr}
-  nav{position:static;height:auto;border-right:none;border-bottom:1px solid var(--line)}
+  nav{position:static;height:auto;border-inline-end:none;border-bottom:1px solid var(--line)}
   main{padding:24px 20px 60px}
   .grid2{grid-template-columns:1fr}
 }
@@ -81,6 +89,8 @@ hr{border:none;border-top:1px solid var(--line);margin:30px 0}
 <div class="wrap">
 <nav>
   <div class="brand">⚡ nzbfast <small>User Manual</small></div>
+  <!-- i18n switcher: same markup in every language; hrefs never change -->
+  <div class="langsw" style="font-size:11.5px;margin-top:6px;color:var(--dim)"><a href="/manual">EN</a> · <a href="/manual/fr">FR</a> · <a href="/manual/de">DE</a> · <a href="/manual/it">IT</a> · <a href="/manual/es">ES</a> · <a href="/manual/nl">NL</a> · <a href="/manual/pt">PT</a> · <a href="/manual/sv">SV</a> · <a href="/manual/da">DA</a> · <a href="/manual/nb">NB</a> · <a href="/manual/fi">FI</a> · <a href="/manual/tr">TR</a> · <a href="/manual/ro">RO</a> · <a href="/manual/he">HE</a> · <a href="/manual/ar">AR</a> · <a href="/manual/fa">FA</a></div>
   <ol>
     <li><a href="#intro">1 · Welcome</a></li>
     <li><a href="#quickstart">2 · Quick start</a></li>
@@ -88,7 +98,7 @@ hr{border:none;border-top:1px solid var(--line);margin:30px 0}
     <li><a href="#dashboard">4 · The dashboard</a></li>
     <li><a href="#adding">5 · Adding downloads</a></li>
     <li><a href="#wall">6 · The poster wall</a></li>
-    <li><a href="#streaming">7 · Streaming &amp; playback</a></li>
+    <li><a href="#preview">7 · Preview &amp; verify</a></li>
     <li><a href="#servers">8 · Usenet servers</a></li>
     <li><a href="#settings">9 · Settings reference</a></li>
     <li><a href="#automation">10 · Automation</a></li>
@@ -111,8 +121,8 @@ hr{border:none;border-top:1px solid var(--line);margin:30px 0}
 <p>nzbfast downloads from Usenet as fast as your line, your providers, and your
 machine allow — and usually that means <em>as fast as your line</em>. It is a single
 self-contained program: the engine, a web dashboard, a poster-wall media browser,
-a built-in indexer, streaming, and the repair/extraction tools (par2, unrar) are all
-inside one executable. There is nothing else to install.</p>
+a built-in indexer, realtime preview, native PAR2 repair, and native RAR
+extraction are all inside one executable. There is nothing else to install.</p>
 <p>What makes it fast is architecture, not tweaks:</p>
 <ul>
   <li><b>Pipelined NNTP</b> — many article requests ride each connection back-to-back,
@@ -198,8 +208,9 @@ final location while downloading — no unpack step afterwards.</td></tr>
 Pipeline card on the dashboard shows all three lanes moving at once. When the last
 byte arrives, verification is already done and the file is already extracted; a
 typical job's "post-processing" time is zero. If repair is needed, only then are
-volumes materialised to disk, repaired with the built-in par2, and re-extracted —
-all automatic.</p>
+volumes materialised to disk, repaired in place by the native GF(2¹⁶) engine
+(renamed or byte-shifted obfuscated data is found and adopted by a sliding
+block scan), and re-extracted — all automatic.</p>
 <p>Interrupted downloads (crash, power loss, <kbd>kill&nbsp;-9</kbd>) resume from the
 <b>article journal</b>: bytes already on disk are never fetched twice. The journal
 records where every article's bytes physically landed — even bytes that were
@@ -262,21 +273,21 @@ session's speed samples distribute — typical vs peak. Widen the window and the
 charts show more history (up to an hour).</p>
 <h3>Stat tiles</h3>
 <p>Downloaded this session, queue depth, completed/failed counts, session peak speed.</p>
-<h3>Resources — one machine, four ceilings</h3>
+<h3 id="dash-resources">Resources — one machine, four ceilings</h3>
 <p>CPU, RAM (against nzbfast's memory budget), disk write rate and network on one
 normalized chart, with real values in the legend and a low-disk warning. No other
 NZB client shows you this; it exists to prove a point — nzbfast will max your
 <em>line</em>, not your machine.</p>
-<h3>Pipeline — stages overlap</h3>
+<h3 id="dash-pipeline">Pipeline — stages overlap</h3>
 <p>Three lanes: download, verify (PAR2 blocks checked), extract. On a healthy job
 all three move together.</p>
-<h3>Providers</h3>
+<h3 id="dash-providers">Providers</h3>
 <p>Per-server live rate, connection utilisation, share of traffic, session GB, and a
 lifetime article-completion score (colored when a server drops below 98%). A stacked
 area chart shows each provider's contribution over time. Rows re-order by live
 performance every 10&nbsp;s (configurable in Settings → Interface) so your fastest
 provider is always on top.</p>
-<h3>Queue</h3>
+<h3 id="dash-queue">Queue</h3>
 <ul>
 <li><b>Drag rows to reorder</b> (within a priority band — Force/High still run first);
 change priority inline.</li>
@@ -286,7 +297,7 @@ counts, and which server contributed how much to <em>this</em> job.</li>
 <i>paused</i> (see <a href="#performance">Performance tools</a>).</li>
 <li>A burn-down chart tracks total GB remaining across the queue.</li>
 </ul>
-<h3>Browse index</h3>
+<h3 id="dash-browse">Browse index</h3>
 <p>Search everything the built-in indexer has catalogued from your watched groups
 (see <a href="#automation">Automation</a>) and download with one click — no external
 indexer needed. The status line shows scan progress; <b>Scan now</b> forces a pass.</p>
@@ -294,12 +305,12 @@ indexer needed. The status line shows scan progress; <b>Scan now</b> forces a pa
 <p>Add titles by name — including ones not posted yet. When a matching release
 appears in the index it is grabbed automatically, with quality preferences and
 upgrade rules (a better copy replaces a worse one).</p>
-<h3>History</h3>
+<h3 id="dash-history">History</h3>
 <p>Recent downloads with status, size, location; failed jobs offer <b>Retry</b>
 (resumes from the journal). Encrypted archives show a 🔑 unlock control — enter the
 password and the job finishes in place. The verify-health strip charts bad PAR2
 blocks per download — a rising tail means articles are arriving damaged.</p>
-<h3>Data usage</h3>
+<h3 id="dash-usage">Data usage</h3>
 <p>Per-provider daily bars and Today / 7-day / 30-day totals — essential for metered
 and block accounts. Block accounts show lifetime usage against their size.</p>
 <h3>Log, System benchmark, Connection tuning, Server diversity</h3>
@@ -333,14 +344,13 @@ API or afterwards from History (🔑).</li>
 <h2 id="wall">6 · The poster wall</h2>
 <p>Click <b>🎬 wall</b> in the header. The wall turns your index into a media
 browser: every recognised film and TV release as a poster tile with rating, year,
-genres, cast and synopsis — like a streaming service, except the catalogue is your
-newsgroups.</p>
+genres, cast and synopsis — your newsgroups, browsable as a catalogue.</p>
 <ul>
 <li><b>Tabs</b> for Films / TV / Other, instant search, and five sort orders.</li>
 <li><b>Matched only</b> is on by default, hiding unidentified junk; a "+N unmatched"
 chip reveals it.</li>
 <li>Click a tile for the detail sheet: synopsis, IMDb rating and votes, cast —
-and <b>▶ Play</b> (stream it immediately, see <a href="#streaming">§7</a>) or
+and <b>▶ Play</b> (preview it immediately, see <a href="#preview">§7</a>) or
 <b>⬇ Download</b>.</li>
 <li><b>✎ Fix match</b> — if a title matched the wrong show or film, pick the right
 one from candidate posters, or enter title/year/kind manually. Manual text is
@@ -352,24 +362,27 @@ there's a signup helper in Settings → Indexing) improves film matching; a TMDB
 is honoured if you already have one.</li>
 </ul>
 
-<h2 id="streaming">7 · Streaming &amp; playback</h2>
-<p>You don't have to wait for a download to watch it.</p>
+<h2 id="preview">7 · Preview &amp; verify</h2>
+<p>You don't have to wait for a download to finish to know it's the right file.
+Open it while it downloads, check the content, language and quality are what you
+expected, and cancel early if they aren't — instead of finding out after the full
+download.</p>
 <ul>
-<li><b>▶ Play</b> on the wall (or <code>/m3u/&lt;id&gt;</code>) hands your video player
+<li><b>▶ Play</b> on the wall (or <code>/m3u/&lt;id&gt;</code>) hands your media player
 an URL; the daemon starts or reuses the download behind it.</li>
 <li>The <code>/stream/&lt;nzo_id&gt;</code> endpoint serves the file with full HTTP
-range support <em>while it downloads</em>. <b>Seeking works</b>: jump to minute 40 and
+range support <em>while it downloads</em>. <b>Checking any point works</b>: spot-check minute 40 and
 the articles for that region are promoted to the front of the download queue —
-playback typically resumes in a couple of seconds instead of minutes. The head and
+it opens there in a couple of seconds instead of minutes. The head and
 tail of the file are fetched first so players find their index data immediately.</li>
 <li><b>Library mode</b>: categories listed in <i>library_cats</i> become instant
 metadata-only entries — a <code>.strm</code> file appears at once, availability is
-verified in the background, and the real download starts on first playback.</li>
+verified in the background, and the real download starts when you first open it.</li>
 </ul>
-<div class="note"><b>Player note</b>VLC, IINA, mpv and Infuse all handle
-<code>/stream</code> URLs. For remote playback use your machine's LAN address in
+<div class="note"><b>Player note</b>VLC, IINA, mpv and Infuse all open
+<code>/stream</code> URLs. To check from another machine use your machine's LAN address in
 place of <code>localhost</code>.</div>
-<div class="note"><b>Auth note</b>With an API key set, starting a parked library
+<div class="note"><b>Auth note</b>With an API key set, opening a parked library
 entry over <code>/stream/&lt;id&gt;</code> requires a per-job token
 (<code>?t=…</code>) — players can't send API keys, so the <code>/m3u</code> handoff
 and the <code>.strm</code> pointer embed it for you; minting it (<code>/m3u</code>)
@@ -459,11 +472,11 @@ notifications on completion, provider re-sort interval.</p>
 <p>The simplest automation: add a title on the dashboard, set quality preferences,
 done. New releases are grabbed as they appear in your indexed groups;
 better-quality copies upgrade earlier grabs; a calendar view shows what's coming.</p>
-<h3>RSS feeds</h3>
+<h3 id="auto-rss">RSS feeds</h3>
 <p>Settings → RSS: any newznab/indexer RSS URL with per-feed interval, category and
 filter rules (title patterns, size bounds). Matching items are downloaded
 automatically.</p>
-<h3>Smart Folders</h3>
+<h3 id="auto-smart">Smart Folders</h3>
 <p>Rules evaluated when a job is added: match by pattern/keywords and size, assign a
 category (first match wins). With <b>TV filing</b> on, finished TV episodes are
 renamed and filed as <code>Show/Season 01/Show&nbsp;-&nbsp;S01E02.mkv</code> —
@@ -525,7 +538,7 @@ dashboard and wall have a touch layout. The Settings → Remote access panel sho
 the exact URLs and a QR code to scan.</p>
 
 <h2 id="performance">13 · Performance tools</h2>
-<h3>System benchmark</h3>
+<h3 id="perf-benchmark">System benchmark</h3>
 <p>One click measures your three ceilings — network throughput (a real 8-second
 multi-connection probe), CPU verification rate, and disk write speed — and leads
 with the answer: <b>your expected maximum download speed and which ceiling is the
@@ -533,12 +546,12 @@ limit</b>. The shortest bar is your bottleneck; the others show their headroom.
 Schedule it (6-hourly → weekly) and every run is logged to a history table, so you
 can see when your provider, ISP or hardware changed behaviour. Scheduled runs only
 happen while the queue is idle.</p>
-<h3>Connection tuning</h3>
+<h3 id="perf-tuning">Connection tuning</h3>
 <p>Measures one provider at rising connection counts and recommends the setting —
 more sockets help until the provider or your line saturates, and some providers
 punish over-asking. <b>Test all</b> compares every provider, then bursts them all
 together to check the pool saturates your line.</p>
-<h3>Server diversity</h3>
+<h3 id="perf-diversity">Server diversity</h3>
 <p>STAT-samples articles across ages on every server and clusters providers by
 shared gaps: providers with ~100% shared missing articles are the same backbone
 (redundant for recovery); independent ones genuinely extend your coverage. Ends
@@ -657,7 +670,7 @@ the <b>API key</b> (full control) and the <b>NZB key</b> (add-only:
 <tr><td>Automation</td><td><code>watchlist</code>, <code>watchlist_check_now</code>, <code>watch_calendar</code>, <code>feeds</code>, <code>smart_folders</code>, <code>schedule</code></td></tr>
 <tr><td>Diagnostics</td><td><code>sysbench</code>, <code>bench_history</code>, <code>connladder</code>, <code>pooltest</code>, <code>diversity</code>, <code>update_check</code>, <code>update_apply</code></td></tr>
 <tr><td>NZBGet JSON-RPC</td><td><code>/jsonrpc</code> — status, listgroups, history, append, editqueue, rate, pause, log (Basic auth: any user, API key as password)</td></tr>
-<tr><td>Streaming</td><td><code>/stream/&lt;nzo_id&gt;</code> (HTTP ranges; starting a parked library job needs <code>?t=</code> token or key), <code>/m3u/&lt;id&gt;</code> (needs key; mints the token), <code>/wall</code>, <code>/art/…</code></td></tr>
+<tr><td>Preview / playback</td><td><code>/stream/&lt;nzo_id&gt;</code> (HTTP ranges; starting a parked library job needs <code>?t=</code> token or key), <code>/m3u/&lt;id&gt;</code> (needs key; mints the token), <code>/wall</code>, <code>/art/…</code></td></tr>
 </table>
 
 <h2 id="files">17 · Files &amp; locations</h2>
@@ -668,7 +681,7 @@ the <b>API key</b> (full control) and the <b>NZB key</b> (add-only:
 <tr><td><code>index.db</code></td><td>The release index (SQLite) + wall metadata. Safe to delete — it rebuilds from scanning (Settings → Indexing → Wipe does this for you).</td></tr>
 <tr><td><code>&lt;downloads&gt;/.spool/</code></td><td>Queue state (survives restarts), per-job NZBs, usage ledger, benchmark history, poster art cache.</td></tr>
 <tr><td>Article journal</td><td>Inside each job's output folder while incomplete — powers crash resume and retry. Removed on success.</td></tr>
-<tr><td>Embedded tools</td><td>par2/unrar are unpacked once to the OS app-support directory (macOS: <code>~/Library/Application Support/nzbfast/tools</code>; Windows: <code>%LOCALAPPDATA%\nzbfast\tools</code>). A <code>par2</code>/<code>unrar</code> placed next to the executable overrides the embedded copy.</td></tr>
+<tr><td>External tools</td><td>None needed — RAR extraction and PAR2 repair are native. If an exotic set ever needs an external <code>unrar</code> or <code>par2</code> as a fallback, nzbfast looks next to its executable, then on <code>$PATH</code>.</td></tr>
 </table>
 
 <h2 id="troubleshooting">18 · Troubleshooting</h2>
