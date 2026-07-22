@@ -160,9 +160,20 @@
     <b>Host</b> = your NAS IP, <b>Port</b> = <code>6789</code>, <b>API Key</b> = the value you set in
     <code>NZBFAST_APIKEY</code>. It also exposes the NZBGet JSON-RPC API, so nzb360 / LunaSea connect the same way.</p>
     <h2 style="margin-top:34px">Updating</h2>
-    <p class="lead-guide">Re-download the <code>latest</code> tag in Container Manager (Registry), then recreate
-    the container — or in a Project, <b>Build</b> re-pulls it. Your <code>config</code> and <code>downloads</code>
-    survive because they live in your NAS folders, not inside the container. The image <i>is</i> the update channel.</p>
+    <p class="lead-guide">The image is the update channel — you update by pulling a newer image. Your
+    <code>config</code> and <code>downloads</code> survive because they live in your NAS folders, not the container.</p>
+    <ul class="plain">
+      <li><b>Manually</b> — Container Manager → <b>Registry</b> → re-download the <code>latest</code> tag, then
+      recreate the container (in a Project, <b>Build</b> re-pulls it).</li>
+      <li><b>Automatically</b> — add <b>Watchtower</b>, a tiny sidecar that pulls new nzbfast images and recreates
+      the container for you. In a Project, paste this alongside the <code>nzbfast</code> service:</li>
+    </ul>
+    <pre class="cmd">  watchtower:
+    image: containrrr/watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --cleanup --schedule "0 0 4 * * *" nzbfast   # daily 04:00, nzbfast only</pre>
   </div>
 </section>
 
