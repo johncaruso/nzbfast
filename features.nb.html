@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="nb">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Funksjoner — nzbfast</title>
+<meta name="description" content="Alle nzbfast-funksjoner: pipelinen i én omgang, union-tilgjengelighet, innebygd indekserer, plakatvegg, watchlist-automatisering, SABnzbd- og NZBGet-kompatible API-er.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<link rel="stylesheet" href="assets/site.css">
+<link rel="alternate" hreflang="en" href="features.html">
+<link rel="alternate" hreflang="fr" href="features.fr.html">
+<link rel="alternate" hreflang="de" href="features.de.html">
+<link rel="alternate" hreflang="it" href="features.it.html">
+<link rel="alternate" hreflang="es" href="features.es.html">
+<link rel="alternate" hreflang="nl" href="features.nl.html">
+<link rel="alternate" hreflang="pt" href="features.pt.html">
+<link rel="alternate" hreflang="sv" href="features.sv.html">
+<link rel="alternate" hreflang="da" href="features.da.html">
+<link rel="alternate" hreflang="nb" href="features.nb.html">
+<link rel="alternate" hreflang="fi" href="features.fi.html">
+<link rel="alternate" hreflang="tr" href="features.tr.html">
+<link rel="alternate" hreflang="ro" href="features.ro.html">
+<link rel="alternate" hreflang="he" href="features.he.html">
+<link rel="alternate" hreflang="ar" href="features.ar.html">
+<link rel="alternate" hreflang="fa" href="features.fa.html">
+<link rel="alternate" hreflang="x-default" href="features.html">
+</head>
+<body>
+
+<header><div class="wrap">
+  <a class="logo" href="index.nb.html"><span class="bolt">⚡</span> nzbfast</a>
+  <nav>
+    <a href="features.nb.html" class="on">Funksjoner</a>
+    <a href="benchmarks.nb.html">Ytelsestester</a>
+    <a href="MANUAL.html">Dokumentasjon</a>
+    <a href="https://github.com/nzbfast/nzbfast" title="Source repository">GitHub</a>
+    <a class="cta" href="download.nb.html">Last ned</a>
+    <!-- i18n picker: same markup in every language file; hrefs fixed -->
+    <span class="langsw" style="font-size:11.5px;opacity:.75;margin-inline-start:10px;white-space:nowrap"><a href="features.html">EN</a> · <a href="features.fr.html">FR</a> · <a href="features.de.html">DE</a> · <a href="features.it.html">IT</a> · <a href="features.es.html">ES</a> · <a href="features.nl.html">NL</a> · <a href="features.pt.html">PT</a> · <a href="features.sv.html">SV</a> · <a href="features.da.html">DA</a> · <a href="features.nb.html">NB</a> · <a href="features.fi.html">FI</a> · <a href="features.tr.html">TR</a> · <a href="features.ro.html">RO</a> · <a href="features.he.html">HE</a> · <a href="features.ar.html">AR</a> · <a href="features.fa.html">FA</a></span>
+  </nav>
+</div></header>
+
+<div class="hero wrap" style="padding-bottom:6px">
+  <h1>Hver funksjon, <em>én side</em>.</h1>
+  <p class="sub">Kortversjonen først; hele maskineriet nedenfor.</p>
+</div>
+
+<section style="padding-top:26px">
+  <div class="wrap">
+    <div class="grid2">
+      <ul class="feat">
+        <li><b>Pipelinet NNTP på linjefart</b> <span class="d">— 8,31 Gbps målt på 10 GbE.</span></li>
+        <li><b>Pipeline i én omgang</b> <span class="d">— dekoding, verifisering og utpakking overlapper; RAR-volumer rører aldri disken.</span></li>
+        <li><b>Fler-leverandør union-tilgjengelighet</b> <span class="d">— fullstendig fra unionen av serverne dine, eller avbryt tidlig.</span></li>
+        <li><b>Minnebudsjett</b> <span class="d">— avgrenset RAM, elegant spilling, swapper aldri.</span></li>
+        <li><b>Krasjsikker gjenopptaking</b> <span class="d">— journal på artikkelnivå; kill −9 midt i jobben, og den fortsetter der den slapp.</span></li>
+      </ul>
+      <ul class="feat">
+        <li><b>SABnzbd-kompatibelt + NZBGet JSON-RPC-API-er</b> <span class="d">— Sonarr/Radarr/nzb360/LunaSea fungerer uendret.</span></li>
+        <li><b>Innebygd indekserer</b> <span class="d">— skann grupper inn i en lokal, søkbar, Newznab-serverende indeks.</span></li>
+        <li><b>Plakatvegg</b> <span class="d">— illustrasjoner, vurderinger, rollebesetning, episoderutenett; ingen API-nøkler.</span></li>
+        <li><b>Watchlist auto-henting + kvalitetsoppgraderinger</b> <span class="d">— hent ved første forekomst, oppgrader til målkvalitet.</span></li>
+        <li><b>Én enkelt selvstendig kjørbar fil</b> <span class="d">— par2 + RAR-utpakking innebygd.</span></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <h2>Motor og fart</h2>
+    <div class="grid2">
+      <ul class="plain">
+        <li><b>Pipelinet NNTP</b> — flere forespørsler underveis per tilkobling beseirer både rundtursforsinkelse og forringelse av TCP-congestion-vinduet; målt +12 %…+270 % vs. seriell. Metter linjer med ~8 tilkoblinger per server.</li>
+        <li><b>SIMD yEnc-dekoding</b> (rapidyenc, NEON/AVX-kjerner) — 4,95 GB/s per kjerne, dekodet på stedet i mottaksbanen.</li>
+        <li><b>Delt kø for flere servere</b> — leverandører selvbalanserer innenfor ~2 %, ingen justering; ratebevissthet per server med hale-duplikatutsending så én treg server ikke kan dra ned en jobbs hale.</li>
+        <li><b>Soak på tvers av jobber</b> — halen av jobb N overlapper starten på jobb N+1: linjen holder seg tent fra kant til kant gjennom en kø (2 % inaktiv vs. SABnzbds 61 % mørk i benchmarken).</li>
+        <li><b>Vaktbikkje for trege jobber</b> — en nedlasting som kryper på én treg server mens andre venter, utsettes automatisk bakerst i køen (fremdriften beholdes) og gjenopptas når køen tømmes.</li>
+        <li><b>Prefetch på ledige servere</b> — servere den aktive jobben ikke kan bruke (artiklene dens ligger ikke på dem), starter den neste jobben i køen i stedet for å stå ledige.</li>
+      </ul>
+      <ul class="plain">
+        <li><b>Justeringsstige for tilkoblinger</b> — måler hver leverandørs faktiske gjennomstrømningsknekk (forespurte vs. innvilgede tilkoblinger) i stedet for å gjette.</li>
+        <li><b>Auto-fart-regulator</b> — valgfri LEDBAT-lignende RTT-regulator viker for husholdningens trafikk mens den bruker resten av linjen.</li>
+        <li><b>Fartsgrenser og ukeplanlegger</b> — live-justerbare tak, tidsplan i lokal tid (sommertid-trygg), «pause i N minutter» med auto-gjenopptaking.</li>
+        <li><b>Minnebudsjett</b> — ett globalt RAM-budsjett (auto: RAM/4, avgrenset; overstyrbart). Når budsjettet blir trangt, krymper den bufferne, spiller så over til disk og leser tilbake når jobben roer seg — den swapper aldri. En 190 GB-jobb fullføres innenfor et 1 GB-budsjett (~1,1 GB topp-RSS); en 2 GB NAS-profil er målt og dokumentert.</li>
+        <li><b>Mottrykk</b> — en treg disk struper socketene i stedet for å fylle RAM (holder seg innenfor ±1 % av et skrivetak, med RAM <i>fallende</i> under press).</li>
+        <li><b>Minnetrimming etter jobb</b> — daemonen gir frigjort minne tilbake til OS-et når den er inaktiv (fotavtrykket faller til ~8 MB mellom jobber på macOS).</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Pipelinen i én omgang</h2>
+    <div class="grid2">
+      <ul class="plain">
+        <li><b>Skriv én gang</b> — dekodede artikler pwrites til sine endelige filoffset. Ingen midlertidige filer, ingen sammensettingsrunde.</li>
+        <li><b>PAR2-verifisering i strømmen</b> — hver blokk MD5-hashes fra dekodebufferne når den kommer inn; verifiseringen blir ferdig når nedlastingen gjør det. Sterkere enn konkurrentenes hurtigsjekk, og gratis.</li>
+        <li><b>Direkte utpakking</b> — store-mode-RAR-poster (de fleste scene-utgivelser) mappes og pakkes ut under nedlasting; volumene finnes aldri på disk. Diskskrivinger = innhold × 1,0, disk nødvendig = 1× (andre trenger ~2×).</li>
+        <li><b>Deobfuskering</b> — obfuskerte poster omdøpes fra PAR2-metadata; ROT13-obfuskerte navn reddes; hash-navngitt søppel klassifiseres og filtreres.</li>
+      </ul>
+      <ul class="plain">
+        <li><b>Eksakt tilpasset reparasjon</b> — skadede blokker er kjent live; minimum-byte-settet av gjenopprettingsvolumer hentes under nedlastingen (ryggsekk-løst), og reparasjonen rører bare skadede områder.</li>
+        <li><b>Komprimert/kryptert fallback</b> — ikke-store-poster materialiseres og pakkes ut via den native RAR-utpakkeren, overlappet med køen; krypterte sett parkeres med en tydelig melding.</li>
+        <li><b>Passordhåndtering</b> — passord fra *arr-API-et, <code>{{pw}}</code>-filnavnkonvensjonen, eller NZB-metadata; en 🔑 opplåsing på dashbordet tar seg av resten (opplåsing i bakgrunnen, deretter normal arkivering).</li>
+        <li><b>Sikkerhetssperrer</b> — reparerte kildevolumer skrivebeskyttes under ny utpakking; exit-koder sier bare «suksess» når sluttilstanden faktisk er brukbar.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <h2>Pålitelighet og tilgjengelighet</h2>
+    <div class="grid2">
+      <ul class="plain">
+        <li><b>Tilgjengelighetssjekk før nedlasting</b> — pipelinede STAT-sveip bygger en per-artikkel × per-server-matrise på sekunder: COMPLETE / REPAIRABLE / IMPOSSIBLE før du har lastet ned noe. Umulige poster avbryter etter å ha hentet nesten ingenting.</li>
+        <li><b>Union-ruting</b> — en artikkel mangler bare når hver levende server avviste den; artikler rutes til servere som har dem. Ulike backbones har ulike retention-/takedown-profiler — unionen fullfører poster ingen enkelt server kan.</li>
+        <li><b>Krasjsikker journal</b> — journal på artikkelnivå; kill −9 midt i jobben, og den gjenopptar, henter på nytt bare det som ikke ble lagret. Kø og historikk overlever omstarter.</li>
+        <li><b>Parker + prøv igjen</b> — mislykkede jobber parkeres til historikk; nytt forsøk henter på nytt bare det som mangler.</li>
+        <li><b>Kaos-testet</b> — en falsk NNTP-server driver 10 ende-til-ende-feilscenarioer (430-er, korrupsjon, avkorting, stopp, døde servere, kill −9) på hver testkjøring.</li>
+      </ul>
+      <ul class="plain">
+        <li><b>Pålitelighetsscore for leverandører</b> — fullføringsrater per server spores for alltid, vises i dashbordet (advarsel &lt;98 %).</li>
+        <li><b>Servermangfold-analysator</b> — STAT-sampler på tvers av serverne dine og grupperer dem etter felles hull: finn ut hvilke av leverandørene dine som faktisk er samme backbone før du betaler for redundans du ikke har.</li>
+        <li><b>Kvoter, blokk-kontoer og diskvakt</b> — daglige/månedlige kvoter, byte-budsjetter over levetiden for blokk-kontoer (auto-ekskludert når oppbrukt), pause ved lite diskplass, daglig forbrukshistorikk per leverandør.</li>
+        <li><b>Duplikatdeteksjon</b> — dupekey/dupescore med alternativ-forfremmelse: en mislykket henting forfremmer automatisk det tilbakeholdte alternativet.</li>
+        <li><b>Retention-bevisst ruting</b> — gamle poster hopper over servere hvis retention ikke kan ha dem; ikke-serverbare poster feiler umiddelbart i stedet for å spinne.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Automatisering og integrasjoner</h2>
+    <div class="grid2">
+      <ul class="plain">
+        <li><b>SABnzbd-kompatibelt API</b> — hele flaten *arr-ene bruker: addfile/addurl, kategorier, prioriteter, pause/fortsett per jobb, nytt forsøk, paginering, to-nivå API-nøkler. Sonarr/Radarr behandler det som SABnzbd.</li>
+        <li><b>NZBGet JSON-RPC-fasade</b> — nzb360, LunaSea og andre NZBGet-fjernkontroller fungerer uendret.</li>
+        <li><b>Newznab-server</b> — din lokale indeks svarer på t=search/tvsearch/movie: *arr-ene kan bruke dine egne skanninger som en indekserer.</li>
+        <li><b>RSS auto-henting</b> — feeder med et NZBGet-aktig filterspråk; legg til / rediger live fra dashbordet.</li>
+        <li><b>Watchlist</b> — navngi serier/filmer (også usendte); sporing per episode henter hver enkelt ved første forekomst, oppgraderer kvalitet til målet ditt (f.eks. 720p → 1080p REMUX), sletter valgfritt den erstattede kopien først etter at oppgraderingen er verifisert. Sendedatokalender viser hva som kommer.</li>
+      </ul>
+      <ul class="plain">
+        <li><b>Overvåkingsmappe</b> — slipp en .nzb, den lastes ned og filen forsvinner.</li>
+        <li><b>Smartmapper</b> — regex-/stikkord-/størrelsesregler ruter nedlastinger til kategorier ved innlegging i kø; valgfri TV-arkivering gir nytt navn til <code>Show/Season NN/Show - S01E02.ext</code>.</li>
+        <li><b>Oppryddingsregler</b> — søppelendelser slettes etter fullføring.</li>
+        <li><b>Etterbehandlingsskript</b> — SABnzbds SAB_*-miljøkontrakt: ditt eksisterende skriptøkosystem kjører som det er.</li>
+        <li><b>Ett-klikks-migrering</b> — importerer servere fra SABnzbd-ini eller NZBGet-conf; leser sabnzbd.ini direkte hvis det er alt den finner.</li>
+        <li><b>Spotnet-inntak</b> — verifisering av spot-signatur og NZB-syntese, innebygd.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <h2>Indekserer og plakatveggen</h2>
+    <p class="lead">Skann gruppene du bryr deg om inn i en privat indeks, og bla så i den som en
+    plakatvegg. All metadata kommer fra nøkkelfrie offentlige kilder hentet av installasjonen
+    din — det finnes ingen API-nøkkel å tigge om.</p>
+    <figure class="shot"><img src="assets/wall-sheet.jpg" alt="Poster wall detail sheet with rating, cast, synopsis and episode chips" loading="lazy"></figure>
+    <div style="height:26px"></div>
+    <div class="grid2">
+      <ul class="plain">
+        <li><b>Kontinuerlig gruppeskanner</b> — inkrementelle OVER-skanninger på din tidsplan, ~43k headere/s over utfanede tilkoblinger; datobiseksjonerte førstegangsskanninger (<code>--max-age 2y</code> hopper over år med headere på ~20 sonderinger).</li>
+        <li><b>Inntaksfiltre</b> — filtre for type/år/oppløsning/språk/størrelse holder indekserer-spam ute av databasen din; obfuskert søppel oppdages og filtreres som standard.</li>
+        <li><b>Scene-navn-parser</b> — tittel/år/episode/kvalitet/kilde fra virkelige stammer, inkl. datokodede daglige, fler-episode-koder, ROT13-obfuskerte navn; utgivelser samles til ett kort per tittel.</li>
+        <li><b>Umiddelbart søk</b> — søk-mens-du-skriver med kvalitetsfiltre og følge-knapper per rad; kvalitetsmerker overalt.</li>
+      </ul>
+      <ul class="plain">
+        <li><b>Nøkkelfri berikelse</b> — TVmaze (TV), iTunes Search (filmer), offentlige vurderingsdatasett, Wikidata, Wikipedia og AniList fyller inn plakater, vurderinger + stemmetall, rollebesetning, sjangere og handlinger. Valgfrie OMDb-/TMDB-nøkler støttes, men kreves aldri.</li>
+        <li><b>Episoderutenett</b> — merker per sesong, beste enkoding per episode, ett klikk for å laste ned; sesongpakker merket; «følg serie» per sesongoverskrift.</li>
+        <li><b>Trend-rader</b> — nytt-denne-uken- og hett-akkurat-nå-striper fra postefrekvens.</li>
+        <li><b>Rett hva som helst</b> — feil treff? Velg blant kandidater eller skriv inn identiteten selv; manuell metadata overskrives aldri. Plakat via URL eller opplasting. Én knapp beriker en tittel på nytt; én sletter og gjenoppbygger hele indeksen.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Forhåndsvisning og bibliotek</h2>
+    <ul class="plain">
+      <li><b>Forhåndsvis før den er ferdig</b> — ▶ Spill av gir OS-spilleren din en .m3u servert av daemonen, så du kan sjekke at en nedlasting er det du ville ha uten å vente på at den fullføres. Spoling forfremmer de rette artiklene fremst i køen.</li>
+      <li><b>Biblioteksmodus</b> — umiddelbar *arr-fullføring med .strm-pekere; å spille en utløser den ekte nedlastingen med toppprioritet og re-verifisering i bakgrunnen.</li>
+    </ul>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <h2>Dashbord og innstillinger</h2>
+    <div class="strip">
+      <figure><div class="shot"><img src="assets/dash-browse.png" alt="Queue with per-file drawer and index browse card" loading="lazy"></div>
+        <figcaption>Køskuff: søyler per fil, verifiseringsblokker, bidrag per server.</figcaption></figure>
+      <figure><div class="shot"><img src="assets/settings-top.png" alt="Settings: server editor and live speed/scheduling controls" loading="lazy"></div>
+        <figcaption>Hver innstilling redigerbar i nettleseren — de fleste gjelder live.</figcaption></figure>
+      <figure><div class="shot" style="max-width:320px;margin:0 auto"><img src="assets/mobile-dash.png" alt="Phone layout of the dashboard" loading="lazy"></div>
+        <figcaption>Skikkelig telefonlayout, samme daemon.</figcaption></figure>
+    </div>
+    <div style="height:10px"></div>
+    <div class="grid2">
+      <ul class="plain">
+        <li><b>Live diagrammer, ingen biblioteker</b> — 1 s polling; gjennomstrømningsareal, stablet areal per leverandør, verifiseringshelse-tidslinje, kø-nedtelling, farts-histogram; diagrammer utvider tidsvinduet sitt med nettleservinduet ditt.</li>
+        <li><b>Ressursmonitor</b> — CPU, RAM (mot budsjett), diskskriving og nettverk på ett diagram, med en advarsel om lite diskplass.</li>
+        <li><b>Leverandør-topplista</b> — servere sorteres om etter live ytelse; øktbyte per leverandør, tilkoblingsantall, utnyttelse, pålitelighet.</li>
+        <li><b>Køhåndtering</b> — dra for å endre rekkefølge, innebygd prioritet/kategori, detaljskuff per nedlasting, optimistisk pause, «pause i N minutter».</li>
+      </ul>
+      <ul class="plain">
+        <li><b>Alt konfigurerbart i nettleseren</b> — servere (med live tilkoblingstester), fart/tidsplan, tilkoblinger/vindu/dekodere, disk/kvote, overvåking/skript, indekseringsfiltre, bibliotek, RSS, sikkerhet med nøkkelrotasjon. Innstillinger overlever omstarter.</li>
+        <li><b>Diagnostikk innebygd</b> — loggviser i grensesnittet, systembenchmark (nettverks-/CPU-/disktak + råd), servermangfold-analysator, tilkoblingsstige.</li>
+        <li><b>Dataforbruk</b> — 14-dagers stablede søyler per leverandør, daglig historikk, tellere over levetiden for blokk-kontoer.</li>
+        <li><b>Bekvemmelighet</b> — dra-slipp .nzb hvor som helst, skrivebordsvarsler, fullføringslyder, førstegangsveiviser, <code>serve --open</code>.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Utrulling</h2>
+    <ul class="plain">
+      <li><b>Én enkelt selvstendig kjørbar fil</b> — par2 + RAR-utpakking er native kode i binæren — ingenting pakkes ut ved første bruk. Ingen runtime, ingen installasjonsprogram.</li>
+      <li><b>macOS i førsteklasse</b> — universal binær (Apple Silicon + Intel), native SwiftUI-menylinje-app, launchd-enhet, Homebrew-formel.</li>
+      <li><b>Windows</b> — helt statisk x64-exe, kjører på uendret Windows 10/11; dobbeltklikk-launcher med veiledet oppsett.</li>
+      <li><b>Linux og Docker</b> — herdet systemd-enhet; flertrinns Docker-image med linuxserver-stil PUID/PGID-inngangspunkt; compose-fil inkludert. <a href="download.nb.html">Alle plattformer →</a></li>
+      <li><b>Veiledet oppsett</b> — <code>nzbfast setup</code> interaktiv veiviser, eller auto-gjenkjenning av et eksisterende SABnzbd-/NZBGet-oppsett. Første nedlasting på under to minutter.</li>
+    </ul>
+  </div>
+</section>
+
+<footer><div class="wrap">
+  <div class="cols">
+    <div>⚡ <b>nzbfast</b> — Usenet-nedlasteren i én omgang.</div>
+    <div>
+      <a href="features.nb.html">Funksjoner</a> ·
+      <a href="benchmarks.nb.html">Ytelsestester</a> ·
+      <a href="download.nb.html">Last ned</a> ·
+      <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
+    </div>
+  </div>
+  <p class="fine">Fri programvare, GPL-3.0-or-later. PAR2-reparasjon og RAR-utpakking er native kode i binæren — ingen medfølgende tredjepartsverktøy. Plakatvegg-metadata kommer fra nøkkelfrie
+  offentlige kilder, hentet av din egen installasjon.</p>
+</div></footer>
+
+</body>
+</html>

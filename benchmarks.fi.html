@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="fi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vertailut — nzbfast</title>
+<meta name="description" content="nzbfast vs. SABnzbd, NZBGet ja rustnzb: 4 asiakasta × 6 skenaariota identtisellä laitteistolla. Rehelliset tulokset mukaan lukien osuudet, jotka nzbfast hävisi, toistamisohjeineen.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<link rel="stylesheet" href="assets/site.css">
+<link rel="alternate" hreflang="en" href="benchmarks.html">
+<link rel="alternate" hreflang="fr" href="benchmarks.fr.html">
+<link rel="alternate" hreflang="de" href="benchmarks.de.html">
+<link rel="alternate" hreflang="it" href="benchmarks.it.html">
+<link rel="alternate" hreflang="es" href="benchmarks.es.html">
+<link rel="alternate" hreflang="nl" href="benchmarks.nl.html">
+<link rel="alternate" hreflang="pt" href="benchmarks.pt.html">
+<link rel="alternate" hreflang="sv" href="benchmarks.sv.html">
+<link rel="alternate" hreflang="da" href="benchmarks.da.html">
+<link rel="alternate" hreflang="nb" href="benchmarks.nb.html">
+<link rel="alternate" hreflang="fi" href="benchmarks.fi.html">
+<link rel="alternate" hreflang="tr" href="benchmarks.tr.html">
+<link rel="alternate" hreflang="ro" href="benchmarks.ro.html">
+<link rel="alternate" hreflang="he" href="benchmarks.he.html">
+<link rel="alternate" hreflang="ar" href="benchmarks.ar.html">
+<link rel="alternate" hreflang="fa" href="benchmarks.fa.html">
+<link rel="alternate" hreflang="x-default" href="benchmarks.html">
+</head>
+<body>
+
+<header><div class="wrap">
+  <a class="logo" href="index.fi.html"><span class="bolt">⚡</span> nzbfast</a>
+  <nav>
+    <a href="features.fi.html">Ominaisuudet</a>
+    <a href="benchmarks.fi.html" class="on">Vertailut</a>
+    <a href="MANUAL.html">Ohjeet</a>
+    <a href="https://github.com/nzbfast/nzbfast" title="Lähdekoodivarasto">GitHub</a>
+    <a class="cta" href="download.fi.html">Lataa</a>
+    <!-- i18n picker: same markup in every language file; hrefs fixed -->
+    <span class="langsw" style="font-size:11.5px;opacity:.75;margin-inline-start:10px;white-space:nowrap"><a href="benchmarks.html">EN</a> · <a href="benchmarks.fr.html">FR</a> · <a href="benchmarks.de.html">DE</a> · <a href="benchmarks.it.html">IT</a> · <a href="benchmarks.es.html">ES</a> · <a href="benchmarks.nl.html">NL</a> · <a href="benchmarks.pt.html">PT</a> · <a href="benchmarks.sv.html">SV</a> · <a href="benchmarks.da.html">DA</a> · <a href="benchmarks.nb.html">NB</a> · <a href="benchmarks.fi.html">FI</a> · <a href="benchmarks.tr.html">TR</a> · <a href="benchmarks.ro.html">RO</a> · <a href="benchmarks.he.html">HE</a> · <a href="benchmarks.ar.html">AR</a> · <a href="benchmarks.fa.html">FA</a></span>
+  </nav>
+</div></header>
+
+<div class="hero wrap" style="padding-bottom:6px">
+  <h1>Mitattu, ei <em>markkinoitu</em>.</h1>
+  <p class="sub">Neljä asiakasta, kuusi skenaariota, identtinen laitteisto ja palveluntarjoajat, ajot
+  lomitettuina niin että palveluntarjoajien vaihtelu kumoutuu. Mittari on <b>aika käyttökelpoiseen tiedostoon</b> —
+  ladattu, varmistettu, purettu. Sisältää kaksi osuutta, jotka hävisimme.</p>
+</div>
+
+<section style="padding-top:26px">
+  <div class="wrap">
+    <p class="kicker">Menetelmä ensin</p>
+    <h2>Koeasetelma</h2>
+    <ul class="plain">
+      <li><b>Asiakkaat:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (lähin Rust-vertainen), kaikki samalla koneella per skenaario (Apple M-sarjan koneet: ”Eurooppa” M1 Ultra 10&nbsp;GbE:llä, ”itärannikko” M3 Ultra ~2.4–3.0 Gbps -linja).</li>
+      <li><b>Reiluus:</b> samat 6 palveluntarjoajaa × 8 yhteyttä, TLS kaikkialla, osuudet ajettu peräkkäin lomitettuina. Jokainen kilpailija viritetty dokumentoituun parhaimpaansa: SABnzbd sai <code>pipelining_requests=8</code> (<b>se toimitetaan arvolla 1 — eli liukuhihnoittamattomana</b>; pelkkä tuo asetus vei sen 190 GB:n ajan 24m24s:stä 19m02s:iin), NZBGet sai ArticleCache/DirectWrite/DirectUnpack/ParQuick, rustnzb dokumentoidun määrityksensä.</li>
+      <li><b>Lopputila:</b> varmistettu, purettu, käyttökelpoinen tiedosto — ei ”lataus valmis”. Sitä oikeasti odotat.</li>
+      <li><b>Toistettavuus:</b> jokainen väite jäljittyy päivättyyn merkintään vertailulokissamme, kirjattuna sen tuottaneilla ajurikomentosarjoilla: seinäkello + rajapinnan tavulaskurit + prosessipuun huippu-RSS, 1–2 s:n tarkkuudella.</li>
+    </ul>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">Skenaario 1 · puhdas, valtava</p>
+    <h2>190.6 GB → yksi 167.9 GB mkv (Eurooppa, 10 GbE)</h2>
+    <div class="bars">
+      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:24%"></i></span><span class="t">4m 44s</span></div>
+      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:36%"></i></span><span class="t">7m 06s · +50%</span></div>
+      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 31s · +312%</span></div>
+      <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">ei tulostetta¹</span></div>
+    </div>
+    <div class="tblwrap"><table>
+      <thead><tr><th></th><th>nzbfast</th><th>NZBGet 26.2</th><th>SABnzbd 5.0.4</th><th>rustnzb 1.3.4</th></tr></thead>
+      <tbody>
+        <tr><td>aika käyttökelpoiseen tiedostoon</td><td class="win">4m 44s</td><td class="lose">7m 06s (+50%)</td><td class="lose">19m 31s (+312%)</td><td class="bad">ei mitään¹</td></tr>
+        <tr><td>GB langalla</td><td class="win num">169.3</td><td class="num">169.6</td><td class="num">169.6</td><td class="num">186.6</td></tr>
+        <tr><td>huippu-RSS</td><td class="num">6.8 GB²</td><td class="num">1.8 GB</td><td class="num">1.8 GB</td><td class="win num">0.6 GB</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:left">¹ rustnzb ilmoitti työn valmiiksi ajassa 5m 42s vedettyään
+    186.6 GB — 10% enemmän langalla kuin kukaan — mutta jätti <b>täysin tulostiedoston puuttumaan</b>. Se epäonnistui
+    tässä skenaariossa myös edellisellä kierroksella (”121 975 artikkelia puuttuu”, 71 GB orvoksi jäänyt).
+    · ² nzbfastin muisti seuraa sen <em>määritettyä budjettia</em>, ei työtä: tämä osuus ajoi
+    oletusarvoisen autobudjetin; rajattuna <b>1 GB</b>:iin sama 190 GB:n työ valmistuu yhä, noin 22%
+    hitaammin — katso vähämuistiporras alla. Aiemmalla itärannikon kierroksella (~2.4–3 Gbps -linja)
+    sama skenaario ajoi 9m 00s vs. NZBGet +30% ja SABnzbd +111% — ero pitää linjanopeuksien yli.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Skenaario 2 · ero kasvaa koon myötä</p>
+    <h2>Aika käyttökelpoiseen tiedostoon, työn koon mukaan</h2>
+    <p class="lead">Yhden läpimenon myötä ei latauksen jälkeistä varmistus-/purkuvaihetta — joten mitä isompi työ,
+    sitä pidemmälle edelle se laskeutuu. Saman koneen peräkkäiset ajot:</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>Työ</th><th>nzbfast</th><th>NZBGet</th><th>SABnzbd</th></tr></thead>
+      <tbody>
+        <tr><td>7.4 GB REMUX (Eurooppa, 10 GbE)</td><td class="win">13.7 s</td><td class="lose">17.3 s (+26%)</td><td class="lose">19.0 s (+39%)</td></tr>
+        <tr><td>35 GB peitelty 4K (Eurooppa)</td><td class="win">67 s</td><td class="lose">108 s (+61%)</td><td class="lose">285 s (+325%)</td></tr>
+        <tr><td>87 GB 4K (itärannikko)</td><td class="win">272 s</td><td class="lose">370 s (+36%)</td><td class="lose">708 s (+160%)</td></tr>
+        <tr><td>87 GB levyllä, jolla 97 GB vapaana (Eurooppa)</td><td class="win">3m 08s</td><td class="bad">ei voi ajaa²</td><td class="bad">ei voi ajaa²</td></tr>
+        <tr><td>190.6 GB (itärannikko)</td><td class="win">9m 00s</td><td class="lose">11m 43s (+30%)</td><td class="lose">19m 02s (+111%)</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:left">² Niiden huippujalanjälki (osat + purettu tuloste
+    samanaikaisesti, ~156 GB) ylitti 97 GB:n vapaan tilan. Yhden läpimenon tarvitsee 1× sisällön koon —
+    se puolittaa tarvitsemasi levyn, ei vain aikaa.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">Skenaario 3 · peitelty julkaisu</p>
+    <h2>35 GB tiivistenimetty 4K → käyttökelpoinen mkv (itärannikko)</h2>
+    <div class="tblwrap"><table>
+      <thead><tr><th></th><th>nzbfast</th><th>NZBGet</th><th>SABnzbd</th><th>rustnzb</th></tr></thead>
+      <tbody>
+        <tr><td>aika käyttökelpoiseen tiedostoon</td><td class="win">96 s</td><td class="lose">153 s (+59%)</td><td class="lose">259 s (+170%)</td><td class="bad">ei käyttökelpoista tiedostoa³</td></tr>
+        <tr><td>huippu-RSS</td><td class="win num">1.55 GB</td><td class="num">3.7 GB</td><td class="num">8.8 GB</td><td class="num">3.6 GB</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:left">³ rustnzb latasi 119 s:ssa, merkitsi työn
+    <i>valmiiksi</i> — ja toimitti raa'at peitellyt osat: ei uudelleennimeämistä, ei purkua.
+    nzbfast purki peittelyn PAR2-metatiedoista ja purki virrassa, nolla takaisinluettua lohkoa.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Skenaario 4 · kolmen jono</p>
+    <h2>Linjan pitäminen sytytettynä läpi jonon (itärannikko, ~43 GB)</h2>
+    <div class="tblwrap"><table>
+      <thead><tr><th></th><th>nzbfast</th><th>rustnzb</th><th>NZBGet</th><th>SABnzbd</th></tr></thead>
+      <tbody>
+        <tr><td>jonon seinäaika</td><td class="win">122 s</td><td class="num">136 s</td><td class="num">162 s</td><td class="num">277 s</td></tr>
+        <tr><td>linja jouten (&lt;20 MB/s)</td><td class="win">2 s (2%)</td><td class="num">16 s (12%)</td><td class="num">0 s</td><td class="bad">168 s (61%)</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:left">Kolme muotoa samasta ongelmasta: nzbfastin loppupään limitys
+    pitää linjan kiireisenä reunasta reunaan; NZBGet ei koskaan ole jouten mutta ajaa ~35% hitaammin purkaessaan
+    samanaikaisesti; SABnzbd lataa nopeasti, jättää sitten linjan <b>pimeäksi 61% ajasta</b>
+    peräkkäisen jälkikäsittelyn aikana. Sitkeysvariantissa (yksi työ salatuilla RAR-otsakkeilla),
+    SABnzbdin jono juuttui salattuun työhön ja vain 1 kolmesta työstä koskaan valmistui; nzbfast
+    pysäköi sen selkeällä viestillä ja sai loput valmiiksi.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">Rehellinen sarake</p>
+    <h2>Kaksi osuutta, jotka hävisimme — yksi nyt suljettu</h2>
+    <div class="grid2">
+      <div class="card"><h3>Vioittunut store-tilan julkaisu</h3>
+        <p>20 myrkytettyä artikkelia 7.4 GB:n REMUXissa: NZBGet valmistui käyttökelpoiseksi ajassa <b>53 s</b>; nzbfast
+        vie nyt <b>58 s</b> — korjaus valmis 32 s:ssa, kaikki 62 osaa purettu uudelleen, tavutarkka
+        tuloste. Lopputilan bugi, joka aiemmalla koonnilla oli juuri tällä polulla (korjatut osat
+        pilalla uudelleenpurun toimesta paluukoodin sanoessa onnistui), on korjattu, regressiotestattu
+        ja uudelleenvalidoitu aitoa Usenetiä vasten. Korjauksemme hakee yhä lähes teoreettisen minimin
+        22 palautuslohkoa 20 tarvitulle vs. niiden täysi PAR2-läpimeno — mutta NZBGet pitää osuuden
+        viidellä sekunnilla, joten se on painettu tähän.</p></div>
+      <div class="card"><h3>kill −9 -jatko — suljettu</h3>
+        <p>Tapettuna kohdassa ~15 GB / 34.5 GB:n työ, tämä oli ennen huonoin lukumme: NZBGet latasi uudelleen
+        <b>~0.6 GB</b>, nzbfast <b>15 GB</b> — kaikki ennen PAR2-aktivointia dekoodattu kuoli
+        prosessin mukana. Journaali kirjaa nyt jokaisen artikkelin fyysisen sijoituksen, joten jatko
+        palauttaa nuo tavut edellisen ajon omista tulostiedostoista (paikallislevykopio, jokainen
+        tavu uudelleenvarmistettu PAR2-lohkokarttaa vasten) ja lataa uudelleen <b>~0.3 GB</b> — tasoissa
+        palveluntarjoajan kohinan sisällä. SABnzbd, tiedoksi, ei ole koskaan toipunut tästä skenaariosta
+        kolmella kierroksella: tapettuna samalla tavalla se haki uudelleen 0.5 GB tunnissa ja aikakatkaisi.</p></div>
+    </div>
+    <div class="callout">Miksi julkaista häviöitä? Koska voitot ovat uskottavia vain niiden rinnalla.
+    Jokainen luku tällä sivulla tulee samoista lomitetuista ajoista, ja varaston
+    vertailulokimme on täysi laboratoriomuistikirja — negatiiviset tulokset mukaan lukien.</div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Skenaario 6 · näännytä se RAM:ista</p>
+    <h2>Vähämuistiporras — 190 GB ~1.1 GB:ssä RAM:ia</h2>
+    <p>Samat neljä työtä, ajettu uudelleen kovilla muistibudjeteilla 2 GB, 1 GB ja 256 MB —
+    se, minkä automitoittaja valitsisi 8 GB:n koneella, 4 GB:n koneella ja 2 GB:n NAS:illa. Jokainen
+    osuus tuotti oikean, täysin varmistetun, puretun tiedoston; huippu-RSS seurasi
+    <em>budjettia</em>, ei työtä. Aika käyttökelpoiseen tiedostoon, 10 GbE -linja:</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>Työn koko</th><th>runsaasti RAM:ia</th><th>2 GB budjetti</th><th>1 GB budjetti</th><th>256 MB budjetti</th></tr></thead>
+      <tbody>
+        <tr><td>7 GB</td><td class="num">15 s</td><td class="num">15 s</td><td class="num">15 s</td><td class="num">15 s</td></tr>
+        <tr><td>35 GB</td><td class="num">65 s</td><td class="num">70 s</td><td class="num">70 s</td><td class="num">65 s</td></tr>
+        <tr><td>87 GB</td><td class="num">148 s</td><td class="num">206 s</td><td class="num">196 s</td><td class="num">180 s</td></tr>
+        <tr><td>190 GB</td><td class="num">330 s</td><td class="num">427 s</td><td class="num">402 s</td><td class="num">411 s</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:left">20–40%:n lisä isoissa töissä on
+    10 GbE -artefakti: levylle valuneet lohkot maksavat aikaa vain, kun linja juoksee levyn karkuun.
+    Sama 87 GB:n työ samoilla budjeteilla ~2.4 Gbps -linjalla mittasi −1%…+7% — kohinaa.
+    Tyypillisellä kotiyhteydellä pieni budjetti on lähes ilmainen missä tahansa työn koossa.
+    NAS-profiili (2 yhteyttä, 256 MB budjetti) sai 35 GB:n työn valmiiksi 0.4 GB:n huippu-
+    RSS:ssä — 2 GB:n NAS voi ajaa tämän. Mikään muu asiakas ei tarjoa muistikattoa lainkaan.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">Kyvykkyys, ei mikrovertailut</p>
+    <h2>Mitä kukin asiakas osaa</h2>
+    <div class="tblwrap"><table>
+      <thead><tr><th></th><th>nzbfast</th><th>SABnzbd 5</th><th>NZBGet 26</th><th>rustnzb</th><th>Usenapp</th><th>Newsbin</th></tr></thead>
+      <tbody>
+        <tr><td>liukuhihnoitettu NNTP</td><td class="yes">kyllä</td><td class="half">oletuksena pois</td><td class="no">ei</td><td class="yes">kyllä</td><td class="no">—</td><td class="no">—</td></tr>
+        <tr><td>täysi varmistus latauksen aikana</td><td class="yes">joka lohko</td><td class="no">jälkeen</td><td class="half">pikatarkistus</td><td class="no">jälkeen</td><td class="no">jälkeen</td><td class="no">jälkeen</td></tr>
+        <tr><td>purku latauksen aikana</td><td class="yes">virrassa, ei osia levyllä</td><td class="half">suora purku⁴</td><td class="half">suora purku⁴</td><td class="half">epäluotettava⁵</td><td class="no">ei</td><td class="no">ei</td></tr>
+        <tr><td>levy tarvittu N-GB:n julkaisulle</td><td class="yes">~1×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td></tr>
+        <tr><td>valmistumistuomio ennen latausta</td><td class="yes">lohkotarkka</td><td class="no">ei</td><td class="half">terveys-%</td><td class="no">ei</td><td class="yes">artikkelitarkistus</td><td class="no">ei</td></tr>
+        <tr><td>rajattu muisti (ei koskaan sivutusta)</td><td class="yes">budjetoitu</td><td class="no">9.3 GB @ 190 GB</td><td class="half">välimuistiasetus</td><td class="no">ei</td><td class="no">—</td><td class="no">—</td></tr>
+        <tr><td>esikatselu + selaus latauksen aikana</td><td class="yes">kyllä</td><td class="no">ei</td><td class="no">ei</td><td class="no">ei</td><td class="half">peräkkäinen</td><td class="no">ei</td></tr>
+        <tr><td>sisäänrakennettu indeksoija + julisteseinä</td><td class="yes">kyllä, avaimeton</td><td class="no">ei</td><td class="no">ei</td><td class="no">ei</td><td class="half">hakukäyttöliittymä</td><td class="half">ryhmäselain</td></tr>
+        <tr><td>Sonarr/Radarr valmis</td><td class="yes">SAB API + Newznab</td><td class="yes">natiivi</td><td class="yes">natiivi</td><td class="half">osittainen</td><td class="no">ei</td><td class="no">ei</td></tr>
+        <tr><td>puhelinkaukosäätimet (nzb360/LunaSea)</td><td class="yes">NZBGet RPC:n kautta</td><td class="yes">kyllä</td><td class="yes">kyllä</td><td class="no">ei</td><td class="no">ei</td><td class="no">ei</td></tr>
+        <tr><td>seurantalistan automaattinappaus + päivitykset</td><td class="yes">sisäänrakennettu</td><td class="no">*arrin kautta</td><td class="no">*arrin kautta</td><td class="no">ei</td><td class="yes">Watchdog</td><td class="half">säännöt</td></tr>
+        <tr><td>yksi itsenäinen binääri</td><td class="yes">kyllä</td><td class="no">Python</td><td class="yes">kyllä</td><td class="yes">kyllä</td><td class="yes">.app</td><td class="yes">.exe</td></tr>
+        <tr><td>avoin lähdekoodi</td><td class="yes">GPL⁶</td><td class="yes">GPL</td><td class="yes">GPL</td><td class="yes">kyllä</td><td class="no">maksullinen</td><td class="no">maksullinen</td></tr>
+        <tr><td>alustat</td><td class="yes">mac/win/linux/docker</td><td class="yes">mac/win/linux</td><td class="yes">mac/win/linux</td><td class="half">linux/win</td><td class="no">vain mac</td><td class="no">vain win</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:left">⁴ Suora purku kirjoittaa osat silti ensin levylle —
+    2× kirjoitusta ja 2× levyä. ⁵ rustnzb toimitti peiteltyjä osia merkittynä ”valmiiksi” kierroksellamme
+    (sen purku myös jumittuu RARLab unrarin kanssa, ellei sitä poisteta käytöstä). ⁶ GPL-3.0-or-later.
+    Usenapp/Newsbin ovat yhden alustan kaupallisia lukijoita lataajaominaisuuksin; ne ovat
+    listattuina koska ihmiset kysyvät, ei koska ne kilpailisivat nopeudessa.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Siirtotodistus</p>
+    <h2>Moottori kyllästää oikeat linjat</h2>
+    <ul class="plain">
+      <li><b>8.31 Gbps yhteensä</b> mitatulla 8.2 Gbps:n 10 GbE -linjalla (Eurooppa M1 Ultra, 4 palveluntarjoajaa, 14 000 artikkelia, 0 virhettä, 0 uudelleenyhdistystä).</li>
+      <li><b>9.16–9.27 Gbps</b> tasaiset siirtonaksahdukset samalla linjalla — ≈98% käytännön TCP-hyötykaistasta.</li>
+      <li><b>5.44 Gbps ylläpidetty</b> läpi täyden 20.4 GB:n työn <i>mukaan lukien</i> virransisäinen varmistus.</li>
+      <li><b>Liukuhihnoitus toistettu jokaisella RTT:llä</b>: +64% 63 ms:n Starlinkillä, +170–177% 14 ms:n datakeskuksessa, +270% 31 ms:n itärannikolla — se voittaa TCP:n ruuhkanhallintaikkunan kutistumisen, ei vain viivettä.</li>
+      <li><b>Vastapainetodistus</b>: rajaa kirjoitusvaihe 4× verkon alle ja syöttö lukittuu kattoon ±1% 2 s:ssa, RAM <i>laskee</i>, nolla sivutusta — hidas levy ei voi koskaan paisuttaa muistia.</li>
+      <li><b>Laskennan pelivara</b>: mitatut dekoodaus+varmistus-katot 86–165 Gbps Apple-piillä — verkko on pullonkaula 4–50-kertaisesti jokaisella testatulla koneella.</li>
+    </ul>
+    <div class="callout">Pysyvä sääntö varastosta: <b>jokainen suorituskykyväite viittaa toistettavaan
+    komentoon ja olosuhteisiin, joissa se ajettiin.</b> Täysi laboratoriomuistikirja — mukaan lukien negatiiviset
+    tulokset ja väärät käänteet — pidetään päivättynä laboratoriomuistikirjana.</div>
+  </div>
+</section>
+
+<footer><div class="wrap">
+  <div class="cols">
+    <div>⚡ <b>nzbfast</b> — yhden läpimenon Usenet-lataaja.</div>
+    <div>
+      <a href="features.fi.html">Ominaisuudet</a> ·
+      <a href="benchmarks.fi.html">Vertailut</a> ·
+      <a href="download.fi.html">Lataa</a> ·
+      <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
+    </div>
+  </div>
+  <p class="fine">Vertailudata: 19.–20. heinäkuuta 2026 kilpailukierros. Asiakas-
+  versiot: SABnzbd 5.0.4, NZBGet 26.2 (nzbget.com-haara), rustnzb 1.3.4. Jos jonkin asiakkaan
+  uudempi versio muuttaa tulosta olennaisesti, ajamme uudelleen ja päivitämme.</p>
+</div></footer>
+
+</body>
+</html>

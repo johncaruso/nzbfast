@@ -7,6 +7,23 @@
 <meta name="description" content="A one-pass Usenet downloader: decode, verify and extract while downloading. 190 GB to a verified, playable file in 9 minutes. macOS, Windows, Linux, Docker.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
+<link rel="alternate" hreflang="en" href="index.html">
+<link rel="alternate" hreflang="fr" href="index.fr.html">
+<link rel="alternate" hreflang="de" href="index.de.html">
+<link rel="alternate" hreflang="it" href="index.it.html">
+<link rel="alternate" hreflang="es" href="index.es.html">
+<link rel="alternate" hreflang="nl" href="index.nl.html">
+<link rel="alternate" hreflang="pt" href="index.pt.html">
+<link rel="alternate" hreflang="sv" href="index.sv.html">
+<link rel="alternate" hreflang="da" href="index.da.html">
+<link rel="alternate" hreflang="nb" href="index.nb.html">
+<link rel="alternate" hreflang="fi" href="index.fi.html">
+<link rel="alternate" hreflang="tr" href="index.tr.html">
+<link rel="alternate" hreflang="ro" href="index.ro.html">
+<link rel="alternate" hreflang="he" href="index.he.html">
+<link rel="alternate" hreflang="ar" href="index.ar.html">
+<link rel="alternate" hreflang="fa" href="index.fa.html">
+<link rel="alternate" hreflang="x-default" href="index.html">
 </head>
 <body>
 
@@ -18,6 +35,8 @@
     <a href="MANUAL.html">Docs</a>
     <a href="https://github.com/nzbfast/nzbfast" title="Source repository">GitHub</a>
     <a class="cta" href="download.html">Download</a>
+    <!-- i18n picker: same markup in every language file; hrefs fixed -->
+    <span class="langsw" style="font-size:11.5px;opacity:.75;margin-inline-start:10px;white-space:nowrap"><a href="index.html">EN</a> · <a href="index.fr.html">FR</a> · <a href="index.de.html">DE</a> · <a href="index.it.html">IT</a> · <a href="index.es.html">ES</a> · <a href="index.nl.html">NL</a> · <a href="index.pt.html">PT</a> · <a href="index.sv.html">SV</a> · <a href="index.da.html">DA</a> · <a href="index.nb.html">NB</a> · <a href="index.fi.html">FI</a> · <a href="index.tr.html">TR</a> · <a href="index.ro.html">RO</a> · <a href="index.he.html">HE</a> · <a href="index.ar.html">AR</a> · <a href="index.fa.html">FA</a></span>
   </nav>
 </div></header>
 
@@ -98,22 +117,22 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
   <div class="wrap">
     <p class="kicker">Headline features</p>
     <h2>Everything a serious setup needs</h2>
-    <p class="lead">The full list — every milestone, every integration — is on the
+    <p class="lead">The full list — every knob, every integration — is on the
     <a href="features.html">features page</a>.</p>
     <div class="grid2">
       <ul class="feat">
-        <li><b>Line-rate downloads</b> <span class="d">— pipelined NNTP proven at 8.31 Gbps on 10 GbE; the fastest client on every clean benchmark leg, at every size.</span></li>
-        <li><b>One-pass pipeline</b> <span class="d">— decode → verify → extract overlap; store-mode RAR volumes never hit disk; needs 1× disk where others need ~2×.</span></li>
+        <li><b>Line-rate downloads</b> <span class="d">— pipelined NNTP measured at 8.31 Gbps on 10 GbE; the fastest client on every clean benchmark leg, at every size.</span></li>
+        <li><b>One-pass pipeline</b> <span class="d">— decode, verify and extract overlap; store-mode RAR volumes never hit disk; needs 1× disk where others need ~2×.</span></li>
         <li><b>Multi-provider union availability</b> <span class="d">— block-exact routing across backbones; preflight verdicts; exact-fit repair; early abort of impossible posts.</span></li>
         <li><b>Memory budget</b> <span class="d">— one global RAM budget with graceful spill tiers. It never swaps your machine: a 190 GB job completes inside a 1 GB budget (~1.1 GB peak RSS).</span></li>
-        <li><b>Streaming with seek</b> <span class="d">— watch while it downloads; seeks re-prioritise the article queue, so jumping ahead takes ~2 s, not minutes.</span></li>
+        <li><b>Crash-safe resume</b> <span class="d">— an article-level journal means a crash or kill −9 mid-download costs almost nothing: it resumes, refetching only what wasn't saved.</span></li>
       </ul>
       <ul class="feat">
         <li><b>Drop-in APIs</b> <span class="d">— SABnzbd-compatible API and NZBGet JSON-RPC: Sonarr, Radarr, nzb360 and LunaSea work unmodified. One-click import of your SAB/NZBGet config.</span></li>
         <li><b>Built-in indexer</b> <span class="d">— scans your newsgroups into a searchable local index, serves Newznab so your *arr stack can search it too.</span></li>
-        <li><b>Poster wall with keyless metadata</b> <span class="d">— browse your index like a streaming service: artwork, ratings, cast and synopses with zero API keys to sign up for.</span></li>
+        <li><b>Poster wall with keyless metadata</b> <span class="d">— artwork, ratings, cast and synopses for everything in your index, with no API keys to sign up for.</span></li>
         <li><b>Watchlist automation</b> <span class="d">— name a show or film (aired or not); it's grabbed the moment it appears, then quality-upgraded until your target is met.</span></li>
-        <li><b>A single executable</b> <span class="d">— repair (par2) and unpack (unrar) ride inside the binary. Unzip, run, done.</span></li>
+        <li><b>A single executable</b> <span class="d">— repair (par2) and unpack (RAR) ride inside the binary. Unzip, run, done.</span></li>
       </ul>
     </div>
   </div>
@@ -133,7 +152,7 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
       <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 31s · +312%</span></div>
       <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">no usable file</span></div>
     </div>
-    <p class="note" style="text-align:left">190.6 GB NZB → single 167.9 GB mkv, M1 Ultra on 10 GbE, 6 providers × 8 connections.
+    <p class="note" style="text-align:start">190.6 GB NZB → single 167.9 GB mkv, M1 Ultra on 10 GbE, 6 providers × 8 connections.
     Same job completes inside a 1 GB memory budget. Full tables, six scenarios, and the legs we <i>lost</i> — plus how to reproduce —
     on the <a href="benchmarks.html">benchmarks page</a>.</p>
   </div>
@@ -142,11 +161,10 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
 <section>
   <div class="wrap">
     <p class="kicker">The showcase</p>
-    <h2>Your index, presented like a streaming service</h2>
+    <h2>Your index, presented as a poster wall</h2>
     <p class="lead">The built-in indexer scans the newsgroups you care about; the wall turns
     the result into posters, ratings, cast and episode grids — using only keyless public
-    sources, fetched by your own install. Click an episode chip to download it; hit ▶ to
-    stream it while it downloads.</p>
+    sources, fetched by your own install. Click an episode chip to download it.</p>
     <figure class="shot"><img src="assets/wall-grid.jpg" alt="nzbfast poster wall: a grid of TV posters with quality badges, ratings and season counts" loading="lazy"></figure>
     <div style="height:18px"></div>
     <div class="strip">
@@ -201,9 +219,7 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
     </div>
   </div>
-  <p class="fine">Free software, GPL-3.0-or-later. Bundled tools keep their own licences: unrar
-  (RARLab freeware) and par2 (par2cmdline-turbo, GPL-2.0-or-later), both run as separate
-  processes under an explicit additional permission. Poster-wall metadata comes from keyless
+  <p class="fine">Free software, GPL-3.0-or-later. PAR2 repair and RAR extraction are native code inside the binary — no bundled third-party tools. Poster-wall metadata comes from keyless
   public sources (TVmaze, iTunes Search, public datasets, Wikidata, Wikipedia, AniList),
   fetched by your own installation. nzbfast downloads what you tell it to — you are
   responsible for what that is.</p>

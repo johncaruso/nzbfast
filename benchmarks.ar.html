@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>قياس الأداء — nzbfast</title>
+<meta name="description" content="‏nzbfast مقابل SABnzbd وNZBGet وrustnzb: 4 عملاء × 6 سيناريوهات على عتاد متطابق. نتائج صادقة تشمل الأشواط التي خسرها nzbfast، مع خطوات إعادة الإنتاج.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<link rel="stylesheet" href="assets/site.css">
+<link rel="alternate" hreflang="en" href="benchmarks.html">
+<link rel="alternate" hreflang="fr" href="benchmarks.fr.html">
+<link rel="alternate" hreflang="de" href="benchmarks.de.html">
+<link rel="alternate" hreflang="it" href="benchmarks.it.html">
+<link rel="alternate" hreflang="es" href="benchmarks.es.html">
+<link rel="alternate" hreflang="nl" href="benchmarks.nl.html">
+<link rel="alternate" hreflang="pt" href="benchmarks.pt.html">
+<link rel="alternate" hreflang="sv" href="benchmarks.sv.html">
+<link rel="alternate" hreflang="da" href="benchmarks.da.html">
+<link rel="alternate" hreflang="nb" href="benchmarks.nb.html">
+<link rel="alternate" hreflang="fi" href="benchmarks.fi.html">
+<link rel="alternate" hreflang="tr" href="benchmarks.tr.html">
+<link rel="alternate" hreflang="ro" href="benchmarks.ro.html">
+<link rel="alternate" hreflang="he" href="benchmarks.he.html">
+<link rel="alternate" hreflang="ar" href="benchmarks.ar.html">
+<link rel="alternate" hreflang="fa" href="benchmarks.fa.html">
+<link rel="alternate" hreflang="x-default" href="benchmarks.html">
+</head>
+<body>
+
+<header><div class="wrap">
+  <a class="logo" href="index.ar.html"><span class="bolt">⚡</span> nzbfast</a>
+  <nav>
+    <a href="features.ar.html">الميزات</a>
+    <a href="benchmarks.ar.html" class="on">قياس الأداء</a>
+    <a href="MANUAL.html">الدليل</a>
+    <a href="https://github.com/nzbfast/nzbfast" title="مستودع المصدر">GitHub</a>
+    <a class="cta" href="download.ar.html">تنزيل</a>
+    <!-- i18n picker: same markup in every language file; hrefs fixed -->
+    <span class="langsw" style="font-size:11.5px;opacity:.75;margin-inline-start:10px;white-space:nowrap"><a href="benchmarks.html">EN</a> · <a href="benchmarks.fr.html">FR</a> · <a href="benchmarks.de.html">DE</a> · <a href="benchmarks.it.html">IT</a> · <a href="benchmarks.es.html">ES</a> · <a href="benchmarks.nl.html">NL</a> · <a href="benchmarks.pt.html">PT</a> · <a href="benchmarks.sv.html">SV</a> · <a href="benchmarks.da.html">DA</a> · <a href="benchmarks.nb.html">NB</a> · <a href="benchmarks.fi.html">FI</a> · <a href="benchmarks.tr.html">TR</a> · <a href="benchmarks.ro.html">RO</a> · <a href="benchmarks.he.html">HE</a> · <a href="benchmarks.ar.html">AR</a> · <a href="benchmarks.fa.html">FA</a></span>
+  </nav>
+</div></header>
+
+<div class="hero wrap" style="padding-bottom:6px">
+  <h1>مقيس، لا <em>مُسوَّق</em>.</h1>
+  <p class="sub">أربعة عملاء، وستة سيناريوهات، وعتاد ومزوّدون متطابقون، وأشواط
+  متداخلة كي يُلغى انجراف المزوّدين. المقياس هو <b>الزمن حتى ملف قابل للاستخدام</b> —
+  مُنزَّل، متحقَّق منه، مستخرَج. يشمل الشوطين اللذين خسرناهما.</p>
+</div>
+
+<section style="padding-top:26px">
+  <div class="wrap">
+    <p class="kicker">المنهجية أولًا</p>
+    <h2>الإعداد</h2>
+    <ul class="plain">
+      <li><b>العملاء:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (أقرب نظير بلغة Rust)، جميعها على الجهاز نفسه لكل سيناريو (أجهزة Apple من سلسلة M: "أوروبا" M1 Ultra على 10&nbsp;GbE، و"الساحل الشرقي" M3 Ultra بخط ~2.4–3.0 Gbps).</li>
+      <li><b>الإنصاف:</b> نفس الـ 6 مزوّدين × 8 اتصالات، وTLS في كل مكان، وتُشغَّل الأشواط بالتتابع متداخلةً. ضُبط كل منافس على أفضل ما هو موثّق له: أُعطي SABnzbd <code>pipelining_requests=8</code> (<b>يأتي بـ 1 — أي بلا تسلسل بالأنابيب</b>؛ وذلك الإعداد وحده خفّض زمن 190 GB لديه من 24m24s إلى 19m02s)، وأُعطي NZBGet خيارات ArticleCache/DirectWrite/DirectUnpack/ParQuick، وأُعطي rustnzb إعداده الموثّق.</li>
+      <li><b>الحالة النهائية:</b> ملف متحقَّق منه، مستخرَج، قابل للاستخدام — لا "انتهى التنزيل". هذا ما تنتظره فعلًا.</li>
+      <li><b>قابلية إعادة الإنتاج:</b> يتتبّع كل ادّعاء إلى مُدخَل مؤرَّخ في سجلّ قياس الأداء لدينا، مسجَّلًا بسكربتات التشغيل التي أنتجته: زمن ساعة الحائط + عدّادات بايتات الواجهة + ذروة RSS لشجرة العمليات، بدقّة 1–2 ثانية.</li>
+    </ul>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">السيناريو 1 · نظيف، ضخم</p>
+    <h2>190.6 GB → ملف mkv واحد بحجم 167.9 GB (أوروبا، 10 GbE)</h2>
+    <div class="bars">
+      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:24%"></i></span><span class="t">4m 44s</span></div>
+      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:36%"></i></span><span class="t">7m 06s · +50%</span></div>
+      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 31s · +312%</span></div>
+      <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">بلا خرج¹</span></div>
+    </div>
+    <div class="tblwrap"><table>
+      <thead><tr><th></th><th>nzbfast</th><th>NZBGet 26.2</th><th>SABnzbd 5.0.4</th><th>rustnzb 1.3.4</th></tr></thead>
+      <tbody>
+        <tr><td>الزمن حتى ملف قابل للاستخدام</td><td class="win">4m 44s</td><td class="lose">7m 06s (+50%)</td><td class="lose">19m 31s (+312%)</td><td class="bad">لا شيء¹</td></tr>
+        <tr><td>GB على السلك</td><td class="win num">169.3</td><td class="num">169.6</td><td class="num">169.6</td><td class="num">186.6</td></tr>
+        <tr><td>ذروة RSS</td><td class="num">6.8 GB²</td><td class="num">1.8 GB</td><td class="num">1.8 GB</td><td class="win num">0.6 GB</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">¹ أبلغ rustnzb عن إنجاز المهمة عند 5m 42s بعد أن سحب
+    186.6 GB — أكثر بـ 10% على السلك من أيّ منافس — لكنه لم يترك <b>أي ملف خرج على الإطلاق</b>. كما أخفق
+    في هذا السيناريو في الشوط السابق ("121,975 مقالة مفقودة"، 71 GB يتيمة).
+    · ² تتبع ذاكرة nzbfast <em>ميزانيته المُعدّة</em>، لا المهمة: جرى هذا الشوط بالميزانية
+    التلقائية الافتراضية؛ ومقيَّدًا عند <b>1 GB</b> تكتمل مهمة 190 GB نفسها بعدُ، أبطأ بنحو 22%
+    — انظر سلّم الذاكرة المنخفضة أدناه. في شوط الساحل الشرقي الأسبق (خط ~2.4–3 Gbps) جرى
+    السيناريو نفسه في 9m 00s مقابل NZBGet ‏+30% وSABnzbd ‏+111% — الفجوة صامدة عبر سرعات الخطوط.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">السيناريو 2 · الفجوة تتّسع مع الحجم</p>
+    <h2>الزمن حتى ملف قابل للاستخدام، حسب حجم المهمة</h2>
+    <p class="lead">التمريرة الواحدة تعني لا تمريرة تحقق/فكّ ضغط بعد التنزيل — فكلما كبرت المهمة،
+    ازداد تقدّمها في الوصول. أشواط تسلسلية على الجهاز نفسه:</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>المهمة</th><th>nzbfast</th><th>NZBGet</th><th>SABnzbd</th></tr></thead>
+      <tbody>
+        <tr><td>7.4 GB REMUX (أوروبا، 10 GbE)</td><td class="win">13.7 s</td><td class="lose">17.3 s (+26%)</td><td class="lose">19.0 s (+39%)</td></tr>
+        <tr><td>35 GB مموّه 4K (أوروبا)</td><td class="win">67 s</td><td class="lose">108 s (+61%)</td><td class="lose">285 s (+325%)</td></tr>
+        <tr><td>87 GB 4K (الساحل الشرقي)</td><td class="win">272 s</td><td class="lose">370 s (+36%)</td><td class="lose">708 s (+160%)</td></tr>
+        <tr><td>87 GB على قرص فيه 97 GB حرّة (أوروبا)</td><td class="win">3m 08s</td><td class="bad">يتعذّر التشغيل²</td><td class="bad">يتعذّر التشغيل²</td></tr>
+        <tr><td>190.6 GB (الساحل الشرقي)</td><td class="win">9m 00s</td><td class="lose">11m 43s (+30%)</td><td class="lose">19m 02s (+111%)</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">² تجاوز أثرهما الأقصى (المجلدات + الخرج المفكوك
+    في آنٍ واحد، ~156 GB) الـ 97 GB الحرّة. تحتاج التمريرة الواحدة إلى ضعف واحد من حجم المحتوى —
+    فتنصّف القرص الذي تحتاجه، لا الوقت فحسب.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">السيناريو 3 · منشور مموّه</p>
+    <h2>35 GB بأسماء تجزئة 4K → ملف mkv قابل للاستخدام (الساحل الشرقي)</h2>
+    <div class="tblwrap"><table>
+      <thead><tr><th></th><th>nzbfast</th><th>NZBGet</th><th>SABnzbd</th><th>rustnzb</th></tr></thead>
+      <tbody>
+        <tr><td>الزمن حتى ملف قابل للاستخدام</td><td class="win">96 s</td><td class="lose">153 s (+59%)</td><td class="lose">259 s (+170%)</td><td class="bad">لا ملف قابل للاستخدام³</td></tr>
+        <tr><td>ذروة RSS</td><td class="win num">1.55 GB</td><td class="num">3.7 GB</td><td class="num">8.8 GB</td><td class="num">3.6 GB</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">³ نزّل rustnzb في 119 s، ووسم المهمة
+    <i>مكتملة</i> — وسلّم المجلدات المموّهة الخام: بلا إعادة تسمية، بلا استخراج.
+    أزال nzbfast التمويه من بيانات PAR2 الوصفية واستخرج أثناء البث، بصفر كتل معادة القراءة.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">السيناريو 4 · قائمة انتظار من ثلاث</p>
+    <h2>إبقاء الخط مضيئًا عبر قائمة انتظار (الساحل الشرقي، ~43 GB)</h2>
+    <div class="tblwrap"><table>
+      <thead><tr><th></th><th>nzbfast</th><th>rustnzb</th><th>NZBGet</th><th>SABnzbd</th></tr></thead>
+      <tbody>
+        <tr><td>زمن ساعة حائط لقائمة الانتظار</td><td class="win">122 s</td><td class="num">136 s</td><td class="num">162 s</td><td class="num">277 s</td></tr>
+        <tr><td>خمول الخط (&lt;20 MB/s)</td><td class="win">2 s (2%)</td><td class="num">16 s (12%)</td><td class="num">0 s</td><td class="bad">168 s (61%)</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">ثلاثة أشكال للمشكلة نفسها: تداخل الذيل لدى nzbfast
+    يُبقي الخط مشغولًا من طرف إلى طرف؛ وNZBGet لا يخمل أبدًا لكنه يعمل أبطأ بنحو 35% أثناء فكّ الضغط
+    بالتزامن؛ وSABnzbd يُنزّل بسرعة، ثم يترك الخط <b>مظلمًا 61% من الوقت</b> أثناء
+    المعالجة اللاحقة المتسلسلة. في متغيّر المرونة (مهمة واحدة بترويسات RAR مشفّرة)،
+    انحشرت قائمة انتظار SABnzbd على المهمة المشفّرة ولم تكتمل سوى مهمة واحدة من 3؛ أما nzbfast
+    فأركنها برسالة واضحة وأنهى البقية.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">العمود الصادق</p>
+    <h2>شوطان خسرناهما — أحدهما أُغلق الآن</h2>
+    <div class="grid2">
+      <div class="card"><h3>منشور نمط تخزين تالف</h3>
+        <p>20 مقالة مسمومة في REMUX بحجم 7.4 GB: أنهى NZBGet قابلًا للاستخدام في <b>53 s</b>؛ ويأخذ nzbfast
+        الآن <b>58 s</b> — اكتمل الإصلاح في 32 s، وأُعيد استخراج المجلدات الـ 62 كلها، وخرج
+        مطابق بالبايت. عيب الحالة النهائية الذي كان في بناء أسبق على هذا المسار بالضبط (المجلدات المُصلَحة
+        أفسدها إعادة الاستخراج بينما قال رمز الخروج نجاح) صار مُصلَحًا، ومُختبَرًا ضد الانحدار،
+        ومُعاد التحقق منه ضد Usenet حقيقي. لا يزال إصلاحنا يجلب حدًّا شبه نظري أدنى بمقدار
+        22 كتلة استعادة لأجل 20 مطلوبة مقابل تمريرة PAR2 الكاملة لديهم — لكن NZBGet يحتفظ بالشوط بفارق
+        خمس ثوانٍ، فطُبع هنا.</p></div>
+      <div class="card"><h3>استئناف kill −9 — أُغلق</h3>
+        <p>مقتولًا عند ~15 GB من مهمة 34.5 GB، كان هذا أسوأ رقم لدينا: أعاد NZBGet تنزيل
+        <b>~0.6 GB</b>، وnzbfast <b>15 GB</b> — كل ما فُكّ تشفيره قبل تفعيل PAR2 مات مع
+        العملية. يسجّل السجلّ الآن الموضع الفيزيائي لكل مقالة، فيستعيد الاستئناف
+        تلك البايتات من ملفات خرج الشوط السابق نفسها (نسخة على القرص المحلي، وكل
+        بايت مُعاد التحقق منه ضد خريطة كتل PAR2) ويعيد تنزيل <b>~0.3 GB</b> — تعادل
+        ضمن ضوضاء المزوّد. أما SABnzbd، للسجلّ، فلم يتعافَ من هذا السيناريو قط في
+        ثلاثة أشواط: مقتولًا بالطريقة نفسها، أعاد جلب 0.5 GB في ساعة وانتهت مهلته.</p></div>
+    </div>
+    <div class="callout">لماذا ننشر الخسائر؟ لأن المكاسب لا تكون قابلة للتصديق إلا بجوارها.
+    كل رقم على هذه الصفحة يأتي من الأشواط المتداخلة نفسها، وسجلّ قياس الأداء
+    في المستودع دفتر مختبر كامل — تشمل النتائج السلبية.</div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">السيناريو 6 · جوّعه من RAM</p>
+    <h2>سلّم الذاكرة المنخفضة — 190 GB في ~1.1 GB من RAM</h2>
+    <p>المهام الأربع نفسها، مُعادة التشغيل بميزانيات ذاكرة صارمة 2 GB و1 GB و256 MB —
+    ما سيختاره المحدِّد التلقائي على جهاز 8 GB، وجهاز 4 GB، وNAS بـ 2 GB. أنتج كل
+    شوط ملفًا صحيحًا، متحقَّقًا منه بالكامل، مستخرَجًا؛ وتتبّعت ذروة RSS
+    <em>الميزانية</em>، لا المهمة. الزمن حتى ملف قابل للاستخدام، خط 10 GbE:</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>حجم المهمة</th><th>وفرة من RAM</th><th>ميزانية 2 GB</th><th>ميزانية 1 GB</th><th>ميزانية 256 MB</th></tr></thead>
+      <tbody>
+        <tr><td>7 GB</td><td class="num">15 s</td><td class="num">15 s</td><td class="num">15 s</td><td class="num">15 s</td></tr>
+        <tr><td>35 GB</td><td class="num">65 s</td><td class="num">70 s</td><td class="num">70 s</td><td class="num">65 s</td></tr>
+        <tr><td>87 GB</td><td class="num">148 s</td><td class="num">206 s</td><td class="num">196 s</td><td class="num">180 s</td></tr>
+        <tr><td>190 GB</td><td class="num">330 s</td><td class="num">427 s</td><td class="num">402 s</td><td class="num">411 s</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">علاوة الـ 20–40% على المهام الكبيرة هي
+    أثر خاص بـ 10 GbE: الكتل المنسكبة لا تكلّف وقتًا إلا حين يسبق الخطُّ القرص.
+    نفس مهمة 87 GB بالميزانيات نفسها على خط ~2.4 Gbps قاست −1% إلى +7% — ضوضاء.
+    على اتصال منزلي نموذجي تكون الميزانية الصغيرة شبه مجانية عند أي حجم مهمة. أنهى
+    ملفّ NAS (2 اتصال، ميزانية 256 MB) مهمة 35 GB بذروة RSS بمقدار 0.4 GB
+    — يستطيع NAS بـ 2 GB تشغيل هذا. لا عميل آخر يقدّم سقف ذاكرة إطلاقًا.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">القدرة، لا القياسات الصغيرة</p>
+    <h2>ما يستطيعه كل عميل</h2>
+    <div class="tblwrap"><table>
+      <thead><tr><th></th><th>nzbfast</th><th>SABnzbd 5</th><th>NZBGet 26</th><th>rustnzb</th><th>Usenapp</th><th>Newsbin</th></tr></thead>
+      <tbody>
+        <tr><td>NNTP متسلسل بالأنابيب</td><td class="yes">نعم</td><td class="half">معطّل افتراضيًا</td><td class="no">لا</td><td class="yes">نعم</td><td class="no">—</td><td class="no">—</td></tr>
+        <tr><td>تحقق كامل أثناء التنزيل</td><td class="yes">كل كتلة</td><td class="no">بعده</td><td class="half">فحص سريع</td><td class="no">بعده</td><td class="no">بعده</td><td class="no">بعده</td></tr>
+        <tr><td>استخراج أثناء التنزيل</td><td class="yes">أثناء البث، بلا مجلدات على القرص</td><td class="half">فكّ ضغط مباشر⁴</td><td class="half">فكّ ضغط مباشر⁴</td><td class="half">غير موثوق⁵</td><td class="no">لا</td><td class="no">لا</td></tr>
+        <tr><td>القرص المطلوب لمنشور بحجم N-GB</td><td class="yes">~1×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td></tr>
+        <tr><td>حكم على قابلية الاكتمال قبل التنزيل</td><td class="yes">دقيق بالكتلة</td><td class="no">لا</td><td class="half">% صحة</td><td class="no">لا</td><td class="yes">فحص المقالات</td><td class="no">لا</td></tr>
+        <tr><td>ذاكرة مقيَّدة (لا مبادلة أبدًا)</td><td class="yes">بميزانية</td><td class="no">9.3 GB عند 190 GB</td><td class="half">إعداد ذاكرة مؤقتة</td><td class="no">لا</td><td class="no">—</td><td class="no">—</td></tr>
+        <tr><td>معاينة + تقديم أثناء التنزيل</td><td class="yes">نعم</td><td class="no">لا</td><td class="no">لا</td><td class="no">لا</td><td class="half">تسلسلي</td><td class="no">لا</td></tr>
+        <tr><td>مفهرِس مدمج + جدار ملصقات</td><td class="yes">نعم، بلا مفاتيح</td><td class="no">لا</td><td class="no">لا</td><td class="no">لا</td><td class="half">واجهة بحث</td><td class="half">متصفّح مجموعات</td></tr>
+        <tr><td>توافق مباشر مع Sonarr/Radarr</td><td class="yes">واجهة SAB + Newznab</td><td class="yes">أصيل</td><td class="yes">أصيل</td><td class="half">جزئي</td><td class="no">لا</td><td class="no">لا</td></tr>
+        <tr><td>تطبيقات هاتف عن بُعد (nzb360/LunaSea)</td><td class="yes">عبر NZBGet RPC</td><td class="yes">نعم</td><td class="yes">نعم</td><td class="no">لا</td><td class="no">لا</td><td class="no">لا</td></tr>
+        <tr><td>جلب تلقائي لقائمة المتابعة + ترقيات</td><td class="yes">مدمج</td><td class="no">عبر *arr</td><td class="no">عبر *arr</td><td class="no">لا</td><td class="yes">Watchdog</td><td class="half">قواعد</td></tr>
+        <tr><td>ملف تنفيذي واحد قائم بذاته</td><td class="yes">نعم</td><td class="no">Python</td><td class="yes">نعم</td><td class="yes">نعم</td><td class="yes">‏.app</td><td class="yes">‏.exe</td></tr>
+        <tr><td>مفتوح المصدر</td><td class="yes">GPL⁶</td><td class="yes">GPL</td><td class="yes">GPL</td><td class="yes">نعم</td><td class="no">مدفوع</td><td class="no">مدفوع</td></tr>
+        <tr><td>المنصّات</td><td class="yes">mac/win/linux/docker</td><td class="yes">mac/win/linux</td><td class="yes">mac/win/linux</td><td class="half">linux/win</td><td class="no">mac فقط</td><td class="no">win فقط</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">⁴ فكّ الضغط المباشر لا يزال يجسّد المجلدات أولًا —
+    ضعف كتابة وضعف قرص. ⁵ سلّم rustnzb مجلدات مموّهة موسومة "مكتملة" في شوطنا
+    (كما يتعلّق فكّ ضغطه مع RARLab unrar ما لم يُعطَّل). ⁶ GPL-3.0-or-later.
+    وUsenapp/Newsbin قارئان تجاريان أحادِيَا المنصّة بميزات تنزيل؛ أُدرِجا
+    لأن الناس يسألون، لا لأنهما ينافسان على السرعة.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">إثبات النقل</p>
+    <h2>المحرّك يُشبِع الخطوط الحقيقية</h2>
+    <ul class="plain">
+      <li><b>8.31 Gbps إجمالية</b> على خط 10 GbE مقيس بـ 8.2 Gbps (أوروبا M1 Ultra، 4 مزوّدين، 14,000 مقالة، 0 خطأ، 0 إعادة اتصال).</li>
+      <li><b>9.16–9.27 Gbps</b> نبضات نقل ثابتة على الخط نفسه — ≈98% من إنتاجية TCP العملية.</li>
+      <li><b>5.44 Gbps مُستدامة</b> عبر مهمة كاملة بحجم 20.4 GB <i>بما في ذلك</i> التحقق أثناء البث.</li>
+      <li><b>التسلسل بالأنابيب متكرّر عند كل RTT</b>: +64% عند 63 ms على Starlink، +170–177% عند 14 ms في مركز بيانات، +270% عند 31 ms على الساحل الشرقي — يهزم اضمحلال نافذة ازدحام TCP، لا الكمون فحسب.</li>
+      <li><b>إثبات الضغط العكسي</b>: حُدّ مرحلة الكتابة بـ 4 أضعاف دون الشبكة فيُقفَل الدخل عند الحد ±1% خلال 2 s، وتنخفض RAM، بصفر مبادلة — قرص بطيء لا يمكنه أبدًا تضخيم الذاكرة.</li>
+      <li><b>هامش المعالجة</b>: سقوف فك تشفير+تحقق مقيسة 86–165 Gbps على معالجات Apple — الشبكة هي عنق الزجاجة بـ 4–50 ضعفًا على كل جهاز اختُبر.</li>
+    </ul>
+    <div class="callout">قاعدة ثابتة من المستودع: <b>كل ادّعاء أداء يستشهد بأمر قابل لإعادة
+    الإنتاج وبالظروف التي جرى فيها.</b> دفتر المختبر الكامل — بما فيه النتائج
+    السلبية والمنعطفات الخاطئة — يُحفَظ بوصفه دفتر مختبر مؤرَّخًا.</div>
+  </div>
+</section>
+
+<footer><div class="wrap">
+  <div class="cols">
+    <div>⚡ <b>nzbfast</b> — أداة تنزيل Usenet ذات التمريرة الواحدة.</div>
+    <div>
+      <a href="features.ar.html">الميزات</a> ·
+      <a href="benchmarks.ar.html">قياس الأداء</a> ·
+      <a href="download.ar.html">تنزيل</a> ·
+      <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
+    </div>
+  </div>
+  <p class="fine">بيانات قياس الأداء: الشوط التنافسي 19–20 يوليو 2026. إصدارات
+  العملاء: SABnzbd 5.0.4، NZBGet 26.2 (فرع nzbget.com)، rustnzb 1.3.4. إن غيّرت نسخة أحدث من
+  أي عميل نتيجةً تغييرًا جوهريًا، فسنعيد التشغيل ونحدّث.</p>
+</div></footer>
+
+</body>
+</html>

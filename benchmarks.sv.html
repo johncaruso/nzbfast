@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="sv">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Benchmarks — nzbfast</title>
+<meta name="description" content="nzbfast vs SABnzbd, NZBGet och rustnzb: 4 klienter × 6 scenarier på identisk hårdvara. Ärliga resultat inklusive etapperna nzbfast förlorade, med reproduktionssteg.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<link rel="stylesheet" href="assets/site.css">
+<link rel="alternate" hreflang="en" href="benchmarks.html">
+<link rel="alternate" hreflang="fr" href="benchmarks.fr.html">
+<link rel="alternate" hreflang="de" href="benchmarks.de.html">
+<link rel="alternate" hreflang="it" href="benchmarks.it.html">
+<link rel="alternate" hreflang="es" href="benchmarks.es.html">
+<link rel="alternate" hreflang="nl" href="benchmarks.nl.html">
+<link rel="alternate" hreflang="pt" href="benchmarks.pt.html">
+<link rel="alternate" hreflang="sv" href="benchmarks.sv.html">
+<link rel="alternate" hreflang="da" href="benchmarks.da.html">
+<link rel="alternate" hreflang="nb" href="benchmarks.nb.html">
+<link rel="alternate" hreflang="fi" href="benchmarks.fi.html">
+<link rel="alternate" hreflang="tr" href="benchmarks.tr.html">
+<link rel="alternate" hreflang="ro" href="benchmarks.ro.html">
+<link rel="alternate" hreflang="he" href="benchmarks.he.html">
+<link rel="alternate" hreflang="ar" href="benchmarks.ar.html">
+<link rel="alternate" hreflang="fa" href="benchmarks.fa.html">
+<link rel="alternate" hreflang="x-default" href="benchmarks.html">
+</head>
+<body>
+
+<header><div class="wrap">
+  <a class="logo" href="index.sv.html"><span class="bolt">⚡</span> nzbfast</a>
+  <nav>
+    <a href="features.sv.html">Funktioner</a>
+    <a href="benchmarks.sv.html" class="on">Benchmarks</a>
+    <a href="MANUAL.html">Dokumentation</a>
+    <a href="https://github.com/nzbfast/nzbfast" title="Source repository">GitHub</a>
+    <a class="cta" href="download.sv.html">Ladda ner</a>
+    <!-- i18n picker: same markup in every language file; hrefs fixed -->
+    <span class="langsw" style="font-size:11.5px;opacity:.75;margin-inline-start:10px;white-space:nowrap"><a href="benchmarks.html">EN</a> · <a href="benchmarks.fr.html">FR</a> · <a href="benchmarks.de.html">DE</a> · <a href="benchmarks.it.html">IT</a> · <a href="benchmarks.es.html">ES</a> · <a href="benchmarks.nl.html">NL</a> · <a href="benchmarks.pt.html">PT</a> · <a href="benchmarks.sv.html">SV</a> · <a href="benchmarks.da.html">DA</a> · <a href="benchmarks.nb.html">NB</a> · <a href="benchmarks.fi.html">FI</a> · <a href="benchmarks.tr.html">TR</a> · <a href="benchmarks.ro.html">RO</a> · <a href="benchmarks.he.html">HE</a> · <a href="benchmarks.ar.html">AR</a> · <a href="benchmarks.fa.html">FA</a></span>
+  </nav>
+</div></header>
+
+<div class="hero wrap" style="padding-bottom:6px">
+  <h1>Uppmätt, inte <em>marknadsfört</em>.</h1>
+  <p class="sub">Fyra klienter, sex scenarier, identisk hårdvara och providers, körningar
+  sammanflätade så att providerdrift tar ut sig. Måttet är <b>tid till en användbar fil</b> —
+  nedladdad, verifierad, uppackad. Inklusive de två etapper vi förlorade.</p>
+</div>
+
+<section style="padding-top:26px">
+  <div class="wrap">
+    <p class="kicker">Metodik först</p>
+    <h2>Uppställningen</h2>
+    <ul class="plain">
+      <li><b>Klienter:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (den närmaste Rust-motsvarigheten), alla på samma maskin per scenario (Apple M-serie-maskiner: "Europa" M1 Ultra på 10&nbsp;GbE, "östkusten" M3 Ultra ~2.4–3.0 Gbps-linje).</li>
+      <li><b>Rättvisa:</b> samma 6 providers × 8 anslutningar, TLS överallt, etapper körda rygg mot rygg sammanflätade. Varje konkurrent trimmad till sitt dokumenterade bästa: SABnzbd fick <code>pipelining_requests=8</code> (<b>den levereras med 1 — dvs opipelinead</b>; enbart den inställningen tog dess 190 GB-tid från 24m24s till 19m02s), NZBGet fick ArticleCache/DirectWrite/DirectUnpack/ParQuick, rustnzb sin dokumenterade konfig.</li>
+      <li><b>Sluttillstånd:</b> en verifierad, uppackad, användbar fil — inte "nedladdning klar". Det är det du faktiskt väntar på.</li>
+      <li><b>Reproducerbarhet:</b> varje påstående kan spåras till en daterad post i vår benchmark-logg, registrerad med drivskripten som producerade den: wall-clock + gränssnittsbyte-räknare + toppar-RSS för processträdet, 1–2 s upplösning.</li>
+    </ul>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">Scenario 1 · ren, enorm</p>
+    <h2>190.6 GB → en enda 167.9 GB mkv (Europa, 10 GbE)</h2>
+    <div class="bars">
+      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:24%"></i></span><span class="t">4m 44s</span></div>
+      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:36%"></i></span><span class="t">7m 06s · +50%</span></div>
+      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 31s · +312%</span></div>
+      <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">ingen utdata¹</span></div>
+    </div>
+    <div class="tblwrap"><table>
+      <thead><tr><th></th><th>nzbfast</th><th>NZBGet 26.2</th><th>SABnzbd 5.0.4</th><th>rustnzb 1.3.4</th></tr></thead>
+      <tbody>
+        <tr><td>tid till användbar fil</td><td class="win">4m 44s</td><td class="lose">7m 06s (+50%)</td><td class="lose">19m 31s (+312%)</td><td class="bad">ingen¹</td></tr>
+        <tr><td>GB på tråden</td><td class="win num">169.3</td><td class="num">169.6</td><td class="num">169.6</td><td class="num">186.6</td></tr>
+        <tr><td>toppar-RSS</td><td class="num">6.8 GB²</td><td class="num">1.8 GB</td><td class="num">1.8 GB</td><td class="win num">0.6 GB</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:left">¹ rustnzb rapporterade jobbet klart vid 5m 42s efter att ha dragit
+    186.6 GB — 10 % mer tråd än någon annan — men lämnade <b>ingen utdatafil alls</b>. Den misslyckades också
+    med det här scenariot i föregående omgång ("121,975 articles missing", 71 GB föräldralösa).
+    · ² nzbfasts minne följer dess <em>konfigurerade budget</em>, inte jobbet: den här etappen körde
+    standard-autobudgeten; begränsad till <b>1 GB</b> blir samma 190 GB-jobb fortfarande klart, ungefär 22 %
+    långsammare — se lågminnesstegen nedan. På den tidigare östkusten-omgången (~2.4–3 Gbps-linje) körde
+    samma scenario 9m 00s vs NZBGet +30 % och SABnzbd +111 % — glappet håller över olika linjehastigheter.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Scenario 2 · glappet växer med storleken</p>
+    <h2>Tid till användbar fil, per jobbstorlek</h2>
+    <p class="lead">Enpass betyder inget verifierings-/uppackningspass efter nedladdning — så ju större jobb,
+    desto längre fram landar det. Sekventiella körningar på samma maskin:</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>Jobb</th><th>nzbfast</th><th>NZBGet</th><th>SABnzbd</th></tr></thead>
+      <tbody>
+        <tr><td>7.4 GB REMUX (Europa, 10 GbE)</td><td class="win">13.7 s</td><td class="lose">17.3 s (+26%)</td><td class="lose">19.0 s (+39%)</td></tr>
+        <tr><td>35 GB obfuskerad 4K (Europa)</td><td class="win">67 s</td><td class="lose">108 s (+61%)</td><td class="lose">285 s (+325%)</td></tr>
+        <tr><td>87 GB 4K (östkusten)</td><td class="win">272 s</td><td class="lose">370 s (+36%)</td><td class="lose">708 s (+160%)</td></tr>
+        <tr><td>87 GB på en disk med 97 GB ledigt (Europa)</td><td class="win">3m 08s</td><td class="bad">kan inte köra²</td><td class="bad">kan inte köra²</td></tr>
+        <tr><td>190.6 GB (östkusten)</td><td class="win">9m 00s</td><td class="lose">11m 43s (+30%)</td><td class="lose">19m 02s (+111%)</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:left">² Deras toppfotavtryck (volymer + uppackad utdata
+    samtidigt, ~156 GB) översteg de 97 GB lediga. Enpass behöver 1× innehållsstorleken —
+    det halverar disken du behöver, inte bara tiden.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">Scenario 3 · obfuskerat inlägg</p>
+    <h2>35 GB hashnamnad 4K → användbar mkv (östkusten)</h2>
+    <div class="tblwrap"><table>
+      <thead><tr><th></th><th>nzbfast</th><th>NZBGet</th><th>SABnzbd</th><th>rustnzb</th></tr></thead>
+      <tbody>
+        <tr><td>tid till användbar fil</td><td class="win">96 s</td><td class="lose">153 s (+59%)</td><td class="lose">259 s (+170%)</td><td class="bad">ingen användbar fil³</td></tr>
+        <tr><td>toppar-RSS</td><td class="win num">1.55 GB</td><td class="num">3.7 GB</td><td class="num">8.8 GB</td><td class="num">3.6 GB</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:left">³ rustnzb laddade ner på 119 s, markerade jobbet
+    <i>Completed</i> — och levererade de råa obfuskerade volymerna: ingen omdöpning, ingen uppackning.
+    nzbfast deobfuskerade från PAR2-metadata och packade upp i strömmen, noll återlästa block.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Scenario 4 · kö av tre</p>
+    <h2>Att hålla linjen tänd genom en kö (östkusten, ~43 GB)</h2>
+    <div class="tblwrap"><table>
+      <thead><tr><th></th><th>nzbfast</th><th>rustnzb</th><th>NZBGet</th><th>SABnzbd</th></tr></thead>
+      <tbody>
+        <tr><td>kö-wall-tid</td><td class="win">122 s</td><td class="num">136 s</td><td class="num">162 s</td><td class="num">277 s</td></tr>
+        <tr><td>linje i vila (&lt;20 MB/s)</td><td class="win">2 s (2%)</td><td class="num">16 s (12%)</td><td class="num">0 s</td><td class="bad">168 s (61%)</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:left">Tre former av samma problem: nzbfasts svansöverlappning
+    håller linjen upptagen kant till kant; NZBGet vilar aldrig men kör ~35 % långsammare medan den packar upp
+    samtidigt; SABnzbd laddar ner snabbt, och lämnar sedan linjen <b>mörk 61 % av tiden</b> under
+    seriell efterbehandling. I motståndskraftsvarianten (ett jobb med krypterade RAR-headers)
+    fastnade SABnzbds kö på det krypterade jobbet och bara 1 av 3 jobb blev någonsin klart; nzbfast
+    parkerade det med ett tydligt meddelande och slutförde resten.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">Den ärliga kolumnen</p>
+    <h2>Två etapper vi förlorade — en nu stängd</h2>
+    <div class="grid2">
+      <div class="card"><h3>Skadat store-mode-inlägg</h3>
+        <p>20 förgiftade artiklar i en 7.4 GB REMUX: NZBGet blev klar användbar på <b>53 s</b>; nzbfast
+        tar nu <b>58 s</b> — reparation klar på 32 s, alla 62 volymer omuppackade, byte-exakt
+        utdata. End-state-buggen en tidigare build hade på exakt den här vägen (reparerade volymer
+        förstörda av omuppackningen medan slutkoden sa framgång) är fixad, regressionstestad
+        och omvaliderad mot riktig Usenet. Vår reparation hämtar fortfarande ett nära-teoretiskt-minimum
+        på 22 återställningsblock för 20 som behövdes vs deras fulla PAR2-pass — men NZBGet behåller etappen med
+        fem sekunder, så den skrivs ut här.</p></div>
+      <div class="card"><h3>kill −9-återupptagning — stängd</h3>
+        <p>Dödad vid ~15 GB av ett 34.5 GB-jobb, detta brukade vara vår sämsta siffra: NZBGet laddade om
+        <b>~0.6 GB</b>, nzbfast <b>15 GB</b> — allt avkodat före PAR2-aktivering dog med
+        processen. Journalen registrerar nu varje artikels fysiska placering, så en återupptagning
+        återställer de bytena från den föregående körningens egna utdatafiler (en lokal diskkopia, varje
+        byte omverifierad mot PAR2-blockkartan) och laddar om <b>~0.3 GB</b> — paritet
+        inom providerbrus. SABnzbd har, för protokollet, aldrig återhämtat sig från det här scenariot i
+        tre omgångar: dödad på samma sätt hämtade den om 0.5 GB på en timme och timeout:ade.</p></div>
+    </div>
+    <div class="callout">Varför publicera förluster? För att vinsterna bara är trovärdiga bredvid dem.
+    Varje siffra på den här sidan kommer från samma sammanflätade körningar, och repots
+    benchmark-logg är en fullständig laboratorienotisbok — negativa resultat inkluderade.</div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Scenario 6 · svält den på RAM</p>
+    <h2>Lågminnesstegen — 190 GB i ~1.1 GB RAM</h2>
+    <p>Samma fyra jobb, omkörda vid hårda minnesbudgetar på 2 GB, 1 GB och 256 MB —
+    vad auto-dimensioneraren skulle välja på en 8 GB-maskin, en 4 GB-maskin och en 2 GB NAS. Varje
+    etapp gav en korrekt, fullt verifierad, uppackad fil; toppar-RSS följde
+    <em>budgeten</em>, inte jobbet. Tid till användbar fil, 10 GbE-linje:</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>Jobbstorlek</th><th>gott om RAM</th><th>2 GB budget</th><th>1 GB budget</th><th>256 MB budget</th></tr></thead>
+      <tbody>
+        <tr><td>7 GB</td><td class="num">15 s</td><td class="num">15 s</td><td class="num">15 s</td><td class="num">15 s</td></tr>
+        <tr><td>35 GB</td><td class="num">65 s</td><td class="num">70 s</td><td class="num">70 s</td><td class="num">65 s</td></tr>
+        <tr><td>87 GB</td><td class="num">148 s</td><td class="num">206 s</td><td class="num">196 s</td><td class="num">180 s</td></tr>
+        <tr><td>190 GB</td><td class="num">330 s</td><td class="num">427 s</td><td class="num">402 s</td><td class="num">411 s</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:left">Premien på 20–40 % på de stora jobben är en
+    10 GbE-artefakt: spillda block kostar bara tid när linjen springer om disken. Samma
+    87 GB-jobb vid samma budgetar på en ~2.4 Gbps-linje mätte −1 % till +7 % — brus.
+    På en typisk hemuppkoppling är en liten budget nära gratis vid vilken jobbstorlek som helst. En
+    NAS-profil (2 anslutningar, 256 MB budget) blev klar med 35 GB-jobbet i 0.4 GB toppar-
+    RSS — en 2 GB NAS kan köra detta. Ingen annan klient erbjuder ett minnestak överhuvudtaget.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">Förmåga, inte mikrobenchmarks</p>
+    <h2>Vad varje klient kan göra</h2>
+    <div class="tblwrap"><table>
+      <thead><tr><th></th><th>nzbfast</th><th>SABnzbd 5</th><th>NZBGet 26</th><th>rustnzb</th><th>Usenapp</th><th>Newsbin</th></tr></thead>
+      <tbody>
+        <tr><td>pipelinead NNTP</td><td class="yes">ja</td><td class="half">av som standard</td><td class="no">nej</td><td class="yes">ja</td><td class="no">—</td><td class="no">—</td></tr>
+        <tr><td>full verifiering under nedladdning</td><td class="yes">varje block</td><td class="no">efteråt</td><td class="half">snabbkoll</td><td class="no">efteråt</td><td class="no">efteråt</td><td class="no">efteråt</td></tr>
+        <tr><td>uppackning under nedladdning</td><td class="yes">i strömmen, inga volymer på disk</td><td class="half">direktuppackning⁴</td><td class="half">direktuppackning⁴</td><td class="half">otillförlitlig⁵</td><td class="no">nej</td><td class="no">nej</td></tr>
+        <tr><td>disk som behövs för ett N-GB-inlägg</td><td class="yes">~1×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td></tr>
+        <tr><td>utlåtande om slutförbarhet före nedladdning</td><td class="yes">blockexakt</td><td class="no">nej</td><td class="half">hälsa %</td><td class="no">nej</td><td class="yes">artikelkoll</td><td class="no">nej</td></tr>
+        <tr><td>begränsat minne (swappar aldrig)</td><td class="yes">budgeterat</td><td class="no">9.3 GB @ 190 GB</td><td class="half">cache-inställning</td><td class="no">nej</td><td class="no">—</td><td class="no">—</td></tr>
+        <tr><td>förhandsvisning + spola under nedladdning</td><td class="yes">ja</td><td class="no">nej</td><td class="no">nej</td><td class="no">nej</td><td class="half">sekventiell</td><td class="no">nej</td></tr>
+        <tr><td>inbyggd indexerare + postervägg</td><td class="yes">ja, nyckellös</td><td class="no">nej</td><td class="no">nej</td><td class="no">nej</td><td class="half">sök-UI</td><td class="half">gruppbläddrare</td></tr>
+        <tr><td>Sonarr/Radarr drop-in</td><td class="yes">SAB API + Newznab</td><td class="yes">native</td><td class="yes">native</td><td class="half">delvis</td><td class="no">nej</td><td class="no">nej</td></tr>
+        <tr><td>telefonfjärrar (nzb360/LunaSea)</td><td class="yes">via NZBGet RPC</td><td class="yes">ja</td><td class="yes">ja</td><td class="no">nej</td><td class="no">nej</td><td class="no">nej</td></tr>
+        <tr><td>bevakningslista auto-grab + uppgraderingar</td><td class="yes">inbyggt</td><td class="no">via *arr</td><td class="no">via *arr</td><td class="no">nej</td><td class="yes">Watchdog</td><td class="half">regler</td></tr>
+        <tr><td>en enda fristående binär</td><td class="yes">ja</td><td class="no">Python</td><td class="yes">ja</td><td class="yes">ja</td><td class="yes">.app</td><td class="yes">.exe</td></tr>
+        <tr><td>öppen källkod</td><td class="yes">GPL⁶</td><td class="yes">GPL</td><td class="yes">GPL</td><td class="yes">ja</td><td class="no">betald</td><td class="no">betald</td></tr>
+        <tr><td>plattformar</td><td class="yes">mac/win/linux/docker</td><td class="yes">mac/win/linux</td><td class="yes">mac/win/linux</td><td class="half">linux/win</td><td class="no">endast mac</td><td class="no">endast win</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:left">⁴ Direktuppackning materialiserar fortfarande volymerna först —
+    2× skrivningar och 2× disk. ⁵ rustnzb levererade obfuskerade volymer markerade "Completed" i vår omgång
+    (dess uppackning hänger också med RARLab unrar om den inte inaktiveras). ⁶ GPL-3.0-or-later.
+    Usenapp/Newsbin är enplattforms kommersiella läsare med nedladdningsfunktioner; de
+    listas för att folk frågar, inte för att de konkurrerar på hastighet.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Transportbevis</p>
+    <h2>Motorn mättar riktiga linjer</h2>
+    <ul class="plain">
+      <li><b>8.31 Gbps aggregat</b> på en uppmätt-8.2 Gbps 10 GbE-linje (Europa M1 Ultra, 4 providers, 14,000 artiklar, 0 fel, 0 återanslutningar).</li>
+      <li><b>9.16–9.27 Gbps</b> stabila transporttickar på samma linje — ≈98 % av praktisk TCP-goodput.</li>
+      <li><b>5.44 Gbps ihållande</b> genom ett fullständigt 20.4 GB-jobb <i>inklusive</i> verifiering i strömmen.</li>
+      <li><b>Pipelining replikerad vid varje RTT</b>: +64 % vid 63 ms Starlink, +170–177 % vid 14 ms datacenter, +270 % vid 31 ms östkusten — den besegrar TCP:s congestion-fönster-avtynande, inte bara latens.</li>
+      <li><b>Backpressure-bevis</b>: begränsa skrivsteget 4× under nätverket och input låser till taket ±1 % inom 2 s, RAM <i>faller</i>, noll swappar — en långsam disk kan aldrig blåsa upp minnet.</li>
+      <li><b>CPU-marginal</b>: uppmätta avkodnings-+verifieringstak på 86–165 Gbps på Apple silicon — nätverket är flaskhalsen med 4–50× på varje testad maskin.</li>
+    </ul>
+    <div class="callout">Stående regel från repot: <b>varje prestandapåstående citerar ett reproducerbart
+    kommando och de förhållanden det kördes under.</b> Den fullständiga laboratorienotisboken — inklusive negativa
+    resultat och felsteg — förs som en daterad laboratorienotisbok.</div>
+  </div>
+</section>
+
+<footer><div class="wrap">
+  <div class="cols">
+    <div>⚡ <b>nzbfast</b> — enpass-nedladdaren för Usenet.</div>
+    <div>
+      <a href="features.sv.html">Funktioner</a> ·
+      <a href="benchmarks.sv.html">Benchmarks</a> ·
+      <a href="download.sv.html">Ladda ner</a> ·
+      <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
+    </div>
+  </div>
+  <p class="fine">Benchmark-data: konkurrensomgång 19–20 juli 2026. Klient-
+  versioner: SABnzbd 5.0.4, NZBGet 26.2 (nzbget.com-fork), rustnzb 1.3.4. Om en nyare version av
+  någon klient väsentligt ändrar ett resultat kör vi om och uppdaterar.</p>
+</div></footer>
+
+</body>
+</html>

@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="ro">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Funcții — nzbfast</title>
+<meta name="description" content="Fiecare funcție nzbfast: pipeline-ul într-o singură trecere, disponibilitate prin uniune, indexer integrat, perete de postere, automatizare watchlist, API-uri compatibile SABnzbd și NZBGet.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<link rel="stylesheet" href="assets/site.css">
+<link rel="alternate" hreflang="en" href="features.html">
+<link rel="alternate" hreflang="fr" href="features.fr.html">
+<link rel="alternate" hreflang="de" href="features.de.html">
+<link rel="alternate" hreflang="it" href="features.it.html">
+<link rel="alternate" hreflang="es" href="features.es.html">
+<link rel="alternate" hreflang="nl" href="features.nl.html">
+<link rel="alternate" hreflang="pt" href="features.pt.html">
+<link rel="alternate" hreflang="sv" href="features.sv.html">
+<link rel="alternate" hreflang="da" href="features.da.html">
+<link rel="alternate" hreflang="nb" href="features.nb.html">
+<link rel="alternate" hreflang="fi" href="features.fi.html">
+<link rel="alternate" hreflang="tr" href="features.tr.html">
+<link rel="alternate" hreflang="ro" href="features.ro.html">
+<link rel="alternate" hreflang="he" href="features.he.html">
+<link rel="alternate" hreflang="ar" href="features.ar.html">
+<link rel="alternate" hreflang="fa" href="features.fa.html">
+<link rel="alternate" hreflang="x-default" href="features.html">
+</head>
+<body>
+
+<header><div class="wrap">
+  <a class="logo" href="index.ro.html"><span class="bolt">⚡</span> nzbfast</a>
+  <nav>
+    <a href="features.ro.html" class="on">Funcții</a>
+    <a href="benchmarks.ro.html">Benchmark-uri</a>
+    <a href="MANUAL.html">Documentație</a>
+    <a href="https://github.com/nzbfast/nzbfast" title="Source repository">GitHub</a>
+    <a class="cta" href="download.ro.html">Descarcă</a>
+    <!-- i18n picker: same markup in every language file; hrefs fixed -->
+    <span class="langsw" style="font-size:11.5px;opacity:.75;margin-inline-start:10px;white-space:nowrap"><a href="features.html">EN</a> · <a href="features.fr.html">FR</a> · <a href="features.de.html">DE</a> · <a href="features.it.html">IT</a> · <a href="features.es.html">ES</a> · <a href="features.nl.html">NL</a> · <a href="features.pt.html">PT</a> · <a href="features.sv.html">SV</a> · <a href="features.da.html">DA</a> · <a href="features.nb.html">NB</a> · <a href="features.fi.html">FI</a> · <a href="features.tr.html">TR</a> · <a href="features.ro.html">RO</a> · <a href="features.he.html">HE</a> · <a href="features.ar.html">AR</a> · <a href="features.fa.html">FA</a></span>
+  </nav>
+</div></header>
+
+<div class="hero wrap" style="padding-bottom:6px">
+  <h1>Fiecare funcție, <em>o singură pagină</em>.</h1>
+  <p class="sub">Versiunea scurtă mai întâi; toată mașinăria mai jos.</p>
+</div>
+
+<section style="padding-top:26px">
+  <div class="wrap">
+    <div class="grid2">
+      <ul class="feat">
+        <li><b>NNTP cu pipelining la viteza liniei</b> <span class="d">— 8.31 Gbps măsurați pe 10 GbE.</span></li>
+        <li><b>Pipeline într-o singură trecere</b> <span class="d">— decodarea, verificarea și extragerea se suprapun; volumele RAR nu ating niciodată discul.</span></li>
+        <li><b>Disponibilitate prin uniune multi-provider</b> <span class="d">— complet din uniunea serverelor tale, sau abandon timpuriu.</span></li>
+        <li><b>Buget de memorie</b> <span class="d">— RAM limitat, spill elegant, fără swap niciodată.</span></li>
+        <li><b>Reluare sigură la blocare</b> <span class="d">— jurnal la nivel de articol; kill −9 în mijlocul unui job și continuă de unde a rămas.</span></li>
+      </ul>
+      <ul class="feat">
+        <li><b>API compatibil SABnzbd + NZBGet JSON-RPC</b> <span class="d">— Sonarr/Radarr/nzb360/LunaSea funcționează nemodificate.</span></li>
+        <li><b>Indexer integrat</b> <span class="d">— scanează grupurile într-un index local, căutabil, care servește Newznab.</span></li>
+        <li><b>Perete de postere</b> <span class="d">— grafică, note, distribuție, grile de episoade; fără chei API.</span></li>
+        <li><b>Preluare automată watchlist + upgrade-uri de calitate</b> <span class="d">— preluare la prima apariție, upgrade până la calitatea țintă.</span></li>
+        <li><b>Un singur executabil de sine stătător</b> <span class="d">— par2 + dezarhivare RAR integrate.</span></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <h2>Motor și viteză</h2>
+    <div class="grid2">
+      <ul class="plain">
+        <li><b>NNTP cu pipelining</b> — mai multe cereri în tranzit per conexiune înving atât latența dus-întors, cât și degradarea ferestrei de congestie TCP; măsurat +12%…+270% față de serial. Saturează liniile cu ~8 conexiuni per server.</li>
+        <li><b>Decodare yEnc SIMD</b> (rapidyenc, kernele NEON/AVX) — 4.95 GB/s per nucleu, decodat pe loc în calea de recepție.</li>
+        <li><b>Coadă partajată multi-server</b> — providerii se autoechilibrează în ~2%, fără reglare; conștientizarea ratei per server cu expediere dublă a cozii, ca un server lent să nu poată trage coada unui job.</li>
+        <li><b>Suprapunere între joburi</b> — coada jobului N se suprapune cu începutul jobului N+1: linia rămâne aprinsă de la un capăt la altul de-a lungul unei cozi (2% inactiv față de 61% întuneric ai SABnzbd în benchmark).</li>
+        <li><b>Câine de pază pentru joburi lente</b> — o descărcare care se târăște pe un singur server lent în timp ce altele așteaptă este amânată automat la coada cozii (progresul e păstrat) și reluată când coada se eliberează.</li>
+        <li><b>Preîncărcare pe serverele inactive</b> — serverele pe care jobul activ nu le poate folosi (articolele lui nu sunt pe ele) pornesc următorul job din coadă în loc să stea inactive.</li>
+      </ul>
+      <ul class="plain">
+        <li><b>Scară de reglare a conexiunilor</b> — măsoară cotul real de debit al fiecărui provider (conexiuni cerute vs acordate) în loc să ghicească.</li>
+        <li><b>Regulator de viteză automat</b> — regulator RTT opțional în stil LEDBAT care cedează traficului casei tale în timp ce folosește restul liniei.</li>
+        <li><b>Limite de viteză și planificator săptămânal</b> — plafoane ajustabile live, program în ora locală (sigur la DST), „pauză pentru N minute” cu reluare automată.</li>
+        <li><b>Buget de memorie</b> — un singur buget global de RAM (auto: RAM/4, limitat; suprascriabil). Când bugetul devine strâmt, micșorează bufferele, apoi face spill pe disc și citește înapoi odată ce jobul se așază — nu face swap niciodată. Un job de 190 GB se finalizează într-un buget de 1 GB (~1.1 GB RSS de vârf); un profil de NAS de 2 GB este măsurat și documentat.</li>
+        <li><b>Contrapresiune</b> — un disc lent limitează socketurile în loc să umple RAM-ul (se menține în ±1% dintr-un plafon de scriere, cu RAM-ul <i>scăzând</i> sub presiune).</li>
+        <li><b>Reducerea memoriei după job</b> — daemonul returnează memoria eliberată sistemului de operare când e inactiv (amprenta scade la ~8 MB între joburi pe macOS).</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Pipeline-ul într-o singură trecere</h2>
+    <div class="grid2">
+      <ul class="plain">
+        <li><b>Scrie o singură dată</b> — articolele decodate sunt scrise (pwrite) la offset-urile lor finale din fișier. Fără fișiere temporare, fără trecere de asamblare.</li>
+        <li><b>Verificare PAR2 în flux</b> — fiecare bloc este hashuit MD5 din bufferele de decodare pe măsură ce sosește; verificarea se termină când se termină descărcarea. Mai puternică decât verificarea rapidă a concurenților și gratuită.</li>
+        <li><b>Extragere directă</b> — postările RAR în mod store (majoritatea release-urilor scene) sunt mapate și extrase în timpul descărcării; volumele nu există niciodată pe disc. Scrieri pe disc = conținut × 1.0, disc necesar = 1× (alții au nevoie de ~2×).</li>
+        <li><b>Deobfuscare</b> — postările obfuscate sunt redenumite din metadatele PAR2; numele obfuscate ROT13 sunt salvate; gunoiul cu nume de tip hash este clasificat și filtrat.</li>
+      </ul>
+      <ul class="plain">
+        <li><b>Reparare exact potrivită</b> — blocurile deteriorate sunt cunoscute live; setul de volume de recuperare cu minim de octeți este preluat în timpul descărcării (rezolvat ca problemă a rucsacului), iar repararea atinge doar zonele deteriorate.</li>
+        <li><b>Rezervă pentru comprimat/criptat</b> — postările non-store se materializează și se dezarhivează prin extractorul RAR nativ, suprapuse cu coada; seturile criptate sunt parcate cu un mesaj clar.</li>
+        <li><b>Gestionarea parolelor</b> — parole din API-ul *arr, convenția de nume de fișier <code>{{pw}}</code> sau metadatele NZB; o deblocare 🔑 pe panou se ocupă de rest (deblocare în fundal, apoi arhivare normală).</li>
+        <li><b>Bariere de siguranță</b> — volumele sursă reparate sunt protejate la scriere în timpul reextragerii; codurile de ieșire spun „succes” doar când starea finală este cu adevărat utilizabilă.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <h2>Fiabilitate și disponibilitate</h2>
+    <div class="grid2">
+      <ul class="plain">
+        <li><b>Verificare de disponibilitate preflight</b> — sweep-urile STAT cu pipelining construiesc o matrice per articol × per server în câteva secunde: COMPLETE / REPAIRABLE / IMPOSSIBLE înainte să fi descărcat ceva. Postările imposibile abandonează după ce au preluat aproape nimic.</li>
+        <li><b>Rutare prin uniune</b> — un articol lipsește doar când fiecare server activ l-a refuzat; articolele se direcționează către serverele care le au. Backbone-uri diferite au profiluri diferite de retenție/retragere — uniunea completează postări pe care niciun server singur nu le poate.</li>
+        <li><b>Jurnal sigur la blocare</b> — jurnal la nivel de articol; kill −9 în mijlocul unui job și se reia, repreluând doar ce nu a fost salvat. Coada și istoricul supraviețuiesc repornirilor.</li>
+        <li><b>Parcare + reîncercare</b> — joburile eșuate sunt parcate în istoric; reîncercarea repreia doar ce lipsește.</li>
+        <li><b>Testat pentru haos</b> — un server NNTP simulat conduce 10 scenarii de eșec cap-la-cap (430-uri, corupere, trunchiere, blocaje, servere moarte, kill −9) la fiecare rulare de test.</li>
+      </ul>
+      <ul class="plain">
+        <li><b>Scor de fiabilitate a providerilor</b> — ratele de completitudine per server urmărite pentru totdeauna, afișate în panou (avertisment &lt;98%).</li>
+        <li><b>Analizor de diversitate a serverelor</b> — eșantionează cu STAT pe serverele tale și le grupează după lacunele comune: află care dintre providerii tăi sunt de fapt același backbone înainte să plătești pentru o redundanță pe care n-o ai.</li>
+        <li><b>Cote, conturi cu bloc și pază de disc</b> — cote zilnice/lunare, bugete de octeți pe toată durata pentru conturile cu bloc (excluse automat când sunt epuizate), pauză la disc redus, istoric zilnic de utilizare per provider.</li>
+        <li><b>Detectare duplicate</b> — dupekey/dupescore cu promovarea alternativei: o preluare eșuată promovează automat alternativa reținută.</li>
+        <li><b>Rutare conștientă de retenție</b> — postările vechi sar peste serverele a căror retenție nu le poate avea; postările neservibile eșuează instant în loc să se învârtă.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Automatizare și integrări</h2>
+    <div class="grid2">
+      <ul class="plain">
+        <li><b>API compatibil SABnzbd</b> — întreaga suprafață pe care o folosesc *arr-urile: addfile/addurl, categorii, priorități, pauză/reluare per job, reîncercare, paginare, chei API pe două niveluri. Sonarr/Radarr îl tratează ca SABnzbd.</li>
+        <li><b>Fațadă NZBGet JSON-RPC</b> — nzb360, LunaSea și alte telecomenzi NZBGet funcționează nemodificate.</li>
+        <li><b>Server Newznab</b> — indexul tău local răspunde la t=search/tvsearch/movie: *arr-urile pot folosi propriile tale scanări ca indexer.</li>
+        <li><b>Preluare automată RSS</b> — feeduri cu un limbaj de filtrare în stil NZBGet; adaugă/editează live din panou.</li>
+        <li><b>Watchlist</b> — numește seriale/filme (chiar nedifuzate); urmărirea per episod preia fiecare la prima apariție, îmbunătățește calitatea până la ținta ta (ex. 720p → 1080p REMUX), opțional șterge copia înlocuită doar după ce upgrade-ul se verifică. Calendarul de difuzare arată ce urmează.</li>
+      </ul>
+      <ul class="plain">
+        <li><b>Folder monitorizat</b> — pui un .nzb, se descarcă și fișierul dispare.</li>
+        <li><b>Foldere inteligente</b> — reguli regex/cuvânt-cheie/dimensiune direcționează descărcările către categorii la punerea în coadă; arhivarea TV opțională redenumește în <code>Show/Season NN/Show - S01E02.ext</code>.</li>
+        <li><b>Reguli de curățare</b> — extensii gunoi șterse după finalizare.</li>
+        <li><b>Scripturi de post-procesare</b> — contractul de mediu SAB_* al SABnzbd: ecosistemul tău existent de scripturi rulează ca atare.</li>
+        <li><b>Migrare cu un clic</b> — importă servere din ini-ul SABnzbd sau conf-ul NZBGet; citește sabnzbd.ini direct dacă asta e tot ce găsește.</li>
+        <li><b>Ingestie Spotnet</b> — verificarea semnăturii spot-urilor și sinteza NZB, integrate.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <h2>Indexerul și peretele de postere</h2>
+    <p class="lead">Scanează grupurile care te interesează într-un index privat, apoi răsfoiește-l ca un
+    perete de postere. Toate metadatele provin din surse publice fără cheie preluate de instalarea ta —
+    nu există nicio cheie API de cerșit.</p>
+    <figure class="shot"><img src="assets/wall-sheet.jpg" alt="Fișă de detalii a peretelui de postere cu notă, distribuție, sinopsis și insigne de episod" loading="lazy"></figure>
+    <div style="height:26px"></div>
+    <div class="grid2">
+      <ul class="plain">
+        <li><b>Scaner continuu de grupuri</b> — scanări OVER incrementale după programul tău, ~43k antete/s pe conexiuni distribuite; prime scanări bisectate după dată (<code>--max-age 2y</code> sare ani de antete în ~20 de sonde).</li>
+        <li><b>Filtre de preluare</b> — filtre de tip/an/rezoluție/limbă/dimensiune țin spam-ul de indexer departe de baza ta de date; gunoiul obfuscat este detectat și filtrat implicit.</li>
+        <li><b>Parser de nume scene</b> — titlu/an/episod/calitate/sursă din tulpini reale, incl. episoade zilnice codate cu dată, coduri multi-episod, nume obfuscate ROT13; release-urile se deduplică într-un singur card per titlu.</li>
+        <li><b>Căutare instantanee</b> — căutare pe măsură ce scrii cu filtre de calitate și butoane de urmărire per rând; insigne de calitate peste tot.</li>
+      </ul>
+      <ul class="plain">
+        <li><b>Îmbogățire fără cheie</b> — TVmaze (TV), iTunes Search (filme), seturi de date publice de note, Wikidata, Wikipedia și AniList completează postere, note + numărul de voturi, distribuție, genuri și subiecte. Chei OMDb/TMDB opționale acceptate, dar niciodată obligatorii.</li>
+        <li><b>Grile de episoade</b> — insigne per sezon, cea mai bună codare per episod, un clic pentru descărcare; pachetele de sezon marcate; „urmărește seria” per antet de sezon.</li>
+        <li><b>Rânduri în tendințe</b> — fâșii „noi săptămâna aceasta” și „populare acum” din frecvența postărilor.</li>
+        <li><b>Corectează orice</b> — potrivire greșită? Alege dintre candidați sau scrie tu identitatea; metadatele manuale nu sunt niciodată suprascrise. Poster prin URL sau încărcare. Un buton reîmbogățește un titlu; unul golește și reconstruiește întregul index.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Previzualizare și bibliotecă</h2>
+    <ul class="plain">
+      <li><b>Previzualizează înainte să se termine</b> — ▶ Redă îi dă playerului sistemului tău un .m3u servit de daemon, ca să poți verifica dacă o descărcare este ce ai vrut fără să aștepți să se finalizeze. Derulările promovează articolele potrivite în fața cozii.</li>
+      <li><b>Mod bibliotecă</b> — finalizare *arr instantanee cu pointeri .strm; redarea unuia declanșează descărcarea reală la prioritate maximă cu reverificare în fundal.</li>
+    </ul>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <h2>Panou și setări</h2>
+    <div class="strip">
+      <figure><div class="shot"><img src="assets/dash-browse.png" alt="Coadă cu sertar per fișier și card de răsfoire a indexului" loading="lazy"></div>
+        <figcaption>Sertarul cozii: bare per fișier, blocuri de verificare, contribuție per server.</figcaption></figure>
+      <figure><div class="shot"><img src="assets/settings-top.png" alt="Setări: editor de servere și controale live de viteză/programare" loading="lazy"></div>
+        <figcaption>Fiecare setare editabilă în browser — majoritatea se aplică live.</figcaption></figure>
+      <figure><div class="shot" style="max-width:320px;margin:0 auto"><img src="assets/mobile-dash.png" alt="Aspectul de telefon al panoului" loading="lazy"></div>
+        <figcaption>Aspect de telefon așa cum trebuie, același daemon.</figcaption></figure>
+    </div>
+    <div style="height:10px"></div>
+    <div class="grid2">
+      <ul class="plain">
+        <li><b>Grafice live, fără biblioteci</b> — interogare la 1 s; arie de debit, arie stivuită per provider, cronologie de sănătate a verificării, burn-down al cozii, histogramă de viteză; graficele își lărgesc fereastra de timp odată cu fereastra browserului.</li>
+        <li><b>Monitor de resurse</b> — CPU, RAM (față de buget), scriere pe disc și rețea pe un singur grafic, cu un avertisment de disc redus.</li>
+        <li><b>Clasament de provideri</b> — serverele se resortează după performanța live; octeți pe sesiune per provider, numărul de conexiuni, utilizare, fiabilitate.</li>
+        <li><b>Gestionarea cozii</b> — trage pentru reordonare, prioritate/categorie pe loc, sertar de detalii per descărcare, pauză optimistă, „pauză pentru N minute”.</li>
+      </ul>
+      <ul class="plain">
+        <li><b>Totul configurabil în browser</b> — servere (cu teste live de conexiune), viteză/program, conexiuni/fereastră/decodoare, disc/cotă, monitorizare/scripturi, filtre de indexare, bibliotecă, RSS, securitate cu rotația cheilor. Setările persistă între reporniri.</li>
+        <li><b>Diagnostice integrate</b> — vizualizator de jurnal în interfață, benchmark de sistem (plafoane de rețea/calcul/disc + sfaturi), analizor de diversitate a serverelor, scară de conexiuni.</li>
+        <li><b>Consum de date</b> — bare stivuite pe 14 zile per provider, istoric zilnic, contoare pe toată durata pentru conturile cu bloc.</li>
+        <li><b>Confort de utilizare</b> — tragere-plasare .nzb oriunde, notificări desktop, sunete de finalizare, asistent la prima rulare, <code>serve --open</code>.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Implementare</h2>
+    <ul class="plain">
+      <li><b>Un singur executabil de sine stătător</b> — par2 + dezarhivare RAR sunt cod nativ în binar — nimic nu se extrage la prima utilizare. Fără runtime, fără installer.</li>
+      <li><b>macOS de primă clasă</b> — binar universal (Apple Silicon + Intel), aplicație nativă SwiftUI în bara de meniu, unitate launchd, formulă Homebrew.</li>
+      <li><b>Windows</b> — exe x64 complet static, rulează pe Windows 10/11 standard; launcher cu dublu-clic și configurare ghidată.</li>
+      <li><b>Linux și Docker</b> — unitate systemd întărită; imagine Docker multi-etapă cu entrypoint PUID/PGID în stil linuxserver; fișier compose inclus. <a href="download.ro.html">Toate platformele →</a></li>
+      <li><b>Configurare ghidată</b> — asistent interactiv <code>nzbfast setup</code> sau autodetectarea unei configurații SABnzbd/NZBGet existente. Prima descărcare în mai puțin de două minute.</li>
+    </ul>
+  </div>
+</section>
+
+<footer><div class="wrap">
+  <div class="cols">
+    <div>⚡ <b>nzbfast</b> — descărcătorul Usenet într-o singură trecere.</div>
+    <div>
+      <a href="features.ro.html">Funcții</a> ·
+      <a href="benchmarks.ro.html">Benchmark-uri</a> ·
+      <a href="download.ro.html">Descarcă</a> ·
+      <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
+    </div>
+  </div>
+  <p class="fine">Software liber, GPL-3.0-or-later. Repararea PAR2 și dezarhivarea RAR sunt cod nativ în binar — fără instrumente terțe incluse. Metadatele peretelui de postere provin din surse publice fără cheie,
+  preluate de propria ta instalare.</p>
+</div></footer>
+
+</body>
+</html>

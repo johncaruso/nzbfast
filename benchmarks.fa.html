@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>محک‌ها — nzbfast</title>
+<meta name="description" content="nzbfast در برابر SABnzbd، NZBGet و rustnzb: 4 کلاینت × 6 سناریو روی سخت‌افزار یکسان. نتایج صادقانه از جمله لِگ‌هایی که nzbfast باخت، همراه با گام‌های بازتولید.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<link rel="stylesheet" href="assets/site.css">
+<link rel="alternate" hreflang="en" href="benchmarks.html">
+<link rel="alternate" hreflang="fr" href="benchmarks.fr.html">
+<link rel="alternate" hreflang="de" href="benchmarks.de.html">
+<link rel="alternate" hreflang="it" href="benchmarks.it.html">
+<link rel="alternate" hreflang="es" href="benchmarks.es.html">
+<link rel="alternate" hreflang="nl" href="benchmarks.nl.html">
+<link rel="alternate" hreflang="pt" href="benchmarks.pt.html">
+<link rel="alternate" hreflang="sv" href="benchmarks.sv.html">
+<link rel="alternate" hreflang="da" href="benchmarks.da.html">
+<link rel="alternate" hreflang="nb" href="benchmarks.nb.html">
+<link rel="alternate" hreflang="fi" href="benchmarks.fi.html">
+<link rel="alternate" hreflang="tr" href="benchmarks.tr.html">
+<link rel="alternate" hreflang="ro" href="benchmarks.ro.html">
+<link rel="alternate" hreflang="he" href="benchmarks.he.html">
+<link rel="alternate" hreflang="ar" href="benchmarks.ar.html">
+<link rel="alternate" hreflang="fa" href="benchmarks.fa.html">
+<link rel="alternate" hreflang="x-default" href="benchmarks.html">
+</head>
+<body>
+
+<header><div class="wrap">
+  <a class="logo" href="index.fa.html"><span class="bolt">⚡</span> nzbfast</a>
+  <nav>
+    <a href="features.fa.html">ویژگی‌ها</a>
+    <a href="benchmarks.fa.html" class="on">محک‌ها</a>
+    <a href="MANUAL.html">مستندات</a>
+    <a href="https://github.com/nzbfast/nzbfast" title="مخزن منبع">GitHub</a>
+    <a class="cta" href="download.fa.html">دانلود</a>
+    <!-- i18n picker: same markup in every language file; hrefs fixed -->
+    <span class="langsw" style="font-size:11.5px;opacity:.75;margin-inline-start:10px;white-space:nowrap"><a href="benchmarks.html">EN</a> · <a href="benchmarks.fr.html">FR</a> · <a href="benchmarks.de.html">DE</a> · <a href="benchmarks.it.html">IT</a> · <a href="benchmarks.es.html">ES</a> · <a href="benchmarks.nl.html">NL</a> · <a href="benchmarks.pt.html">PT</a> · <a href="benchmarks.sv.html">SV</a> · <a href="benchmarks.da.html">DA</a> · <a href="benchmarks.nb.html">NB</a> · <a href="benchmarks.fi.html">FI</a> · <a href="benchmarks.tr.html">TR</a> · <a href="benchmarks.ro.html">RO</a> · <a href="benchmarks.he.html">HE</a> · <a href="benchmarks.ar.html">AR</a> · <a href="benchmarks.fa.html">FA</a></span>
+  </nav>
+</div></header>
+
+<div class="hero wrap" style="padding-bottom:6px">
+  <h1>سنجیده، نه <em>تبلیغ‌شده</em>.</h1>
+  <p class="sub">چهار کلاینت، شش سناریو، سخت‌افزار و ارائه‌دهنده‌های یکسان، اجراها
+  درهم‌تنیده تا رانش ارائه‌دهنده خنثی شود. معیار <b>زمان تا یک فایل قابل‌استفاده</b> است —
+  دانلودشده، تأییدشده، استخراج‌شده. شامل دو لِگی که باختیم.</p>
+</div>
+
+<section style="padding-top:26px">
+  <div class="wrap">
+    <p class="kicker">اول روش‌شناسی</p>
+    <h2>راه‌اندازی</h2>
+    <ul class="plain">
+      <li><b>کلاینت‌ها:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (نزدیک‌ترین همتای Rust)، همگی روی همان ماشین در هر سناریو (ماشین‌های سری M اپل: «اروپا» M1 Ultra روی 10&nbsp;GbE، «ساحل شرقی» M3 Ultra خط ~2.4–3.0 Gbps).</li>
+      <li><b>انصاف:</b> همان 6 ارائه‌دهنده × 8 اتصال، TLS همه‌جا، لِگ‌ها پشت‌سرهم درهم‌تنیده اجرا می‌شوند. هر رقیب به بهترین حالت مستندش تنظیم شده: SABnzbd به <code>pipelining_requests=8</code> رسید (<b>با 1 عرضه می‌شود — یعنی بدون خط‌لوله</b>؛ همان تنظیم به‌تنهایی زمان 190 GB آن را از 24m24s به 19m02s رساند)، NZBGet به ArticleCache/DirectWrite/DirectUnpack/ParQuick، rustnzb به پیکربندی مستندش.</li>
+      <li><b>حالت پایانی:</b> یک فایل تأییدشده، استخراج‌شده و قابل‌استفاده — نه «دانلود تمام شد». آن چیزی است که واقعاً منتظرش می‌مانید.</li>
+      <li><b>بازتولیدپذیری:</b> هر ادعا به یک ورودی تاریخ‌دار در گزارش محک ما ردیابی می‌شود، ثبت‌شده با اسکریپت‌های راننده‌ای که آن را تولید کرده‌اند: ساعت دیواری + شمارنده‌های بایت رابط + اوج RSS درخت-فرایند، با تفکیک 1–2 ثانیه.</li>
+    </ul>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">سناریو 1 · تمیز، عظیم</p>
+    <h2>190.6 GB ← یک mkv واحد 167.9 GB (اروپا، 10 GbE)</h2>
+    <div class="bars">
+      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:24%"></i></span><span class="t">4m 44s</span></div>
+      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:36%"></i></span><span class="t">7m 06s · +50%</span></div>
+      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 31s · +312%</span></div>
+      <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">بدون خروجی¹</span></div>
+    </div>
+    <div class="tblwrap"><table>
+      <thead><tr><th></th><th>nzbfast</th><th>NZBGet 26.2</th><th>SABnzbd 5.0.4</th><th>rustnzb 1.3.4</th></tr></thead>
+      <tbody>
+        <tr><td>زمان تا فایل قابل‌استفاده</td><td class="win">4m 44s</td><td class="lose">7m 06s (+50%)</td><td class="lose">19m 31s (+312%)</td><td class="bad">هیچ¹</td></tr>
+        <tr><td>GB روی سیم</td><td class="win num">169.3</td><td class="num">169.6</td><td class="num">169.6</td><td class="num">186.6</td></tr>
+        <tr><td>اوج RSS</td><td class="num">6.8 GB²</td><td class="num">1.8 GB</td><td class="num">1.8 GB</td><td class="win num">0.6 GB</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">¹ rustnzb کار را در 5m 42s تمام‌شده گزارش داد در حالی که
+    186.6 GB کشیده بود — 10% سیم بیشتر از هرکسی — اما <b>هیچ فایل خروجی‌ای باقی نگذاشت</b>. در دور قبلی هم
+    این سناریو را شکست خورد («121,975 مقالهٔ گمشده»، 71 GB یتیم).
+    · ² حافظهٔ nzbfast <em>بودجهٔ پیکربندی‌شده‌اش</em> را دنبال می‌کند، نه کار را: این لِگ با
+    بودجهٔ خودکار پیش‌فرض اجرا شد؛ با سقف <b>1 GB</b> همان کار 190 GB باز هم کامل می‌شود، حدود 22%
+    کندتر — نردبان حافظهٔ کم را پایین‌تر ببینید. در دور پیشین ساحل شرقی (خط ~2.4–3 Gbps) همان
+    سناریو 9m 00s اجرا شد در برابر NZBGet +30% و SABnzbd +111% — فاصله در سراسر سرعت‌های خط پابرجاست.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">سناریو 2 · فاصله با اندازه رشد می‌کند</p>
+    <h2>زمان تا فایل قابل‌استفاده، بر اساس اندازهٔ کار</h2>
+    <p class="lead">تک‌گذر یعنی بدون گذر تأیید/باز کردن پس از دانلود — پس هرچه کار بزرگ‌تر باشد،
+    جلوتر فرود می‌آید. اجراهای متوالی روی همان ماشین:</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>کار</th><th>nzbfast</th><th>NZBGet</th><th>SABnzbd</th></tr></thead>
+      <tbody>
+        <tr><td>7.4 GB REMUX (اروپا، 10 GbE)</td><td class="win">13.7 s</td><td class="lose">17.3 s (+26%)</td><td class="lose">19.0 s (+39%)</td></tr>
+        <tr><td>35 GB مبهم 4K (اروپا)</td><td class="win">67 s</td><td class="lose">108 s (+61%)</td><td class="lose">285 s (+325%)</td></tr>
+        <tr><td>87 GB 4K (ساحل شرقی)</td><td class="win">272 s</td><td class="lose">370 s (+36%)</td><td class="lose">708 s (+160%)</td></tr>
+        <tr><td>87 GB روی دیسک با 97 GB آزاد (اروپا)</td><td class="win">3m 08s</td><td class="bad">نمی‌تواند اجرا شود²</td><td class="bad">نمی‌تواند اجرا شود²</td></tr>
+        <tr><td>190.6 GB (ساحل شرقی)</td><td class="win">9m 00s</td><td class="lose">11m 43s (+30%)</td><td class="lose">19m 02s (+111%)</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">² اوج ردپای آن‌ها (جلدها + خروجی بازشده
+    هم‌زمان، ~156 GB) از 97 GB آزاد فراتر رفت. تک‌گذر به 1× اندازهٔ محتوا نیاز دارد —
+    دیسک موردنیاز شما را نصف می‌کند، نه فقط زمان را.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">سناریو 3 · پست مبهم</p>
+    <h2>35 GB 4K با نام هش ← mkv قابل‌استفاده (ساحل شرقی)</h2>
+    <div class="tblwrap"><table>
+      <thead><tr><th></th><th>nzbfast</th><th>NZBGet</th><th>SABnzbd</th><th>rustnzb</th></tr></thead>
+      <tbody>
+        <tr><td>زمان تا فایل قابل‌استفاده</td><td class="win">96 s</td><td class="lose">153 s (+59%)</td><td class="lose">259 s (+170%)</td><td class="bad">بدون فایل قابل‌استفاده³</td></tr>
+        <tr><td>اوج RSS</td><td class="win num">1.55 GB</td><td class="num">3.7 GB</td><td class="num">8.8 GB</td><td class="num">3.6 GB</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">³ rustnzb در 119 s دانلود کرد، کار را
+    <i>تمام‌شده</i> نشان‌دار کرد — و جلدهای مبهم خام را تحویل داد: بدون تغییرنام، بدون استخراج.
+    nzbfast از فرادادهٔ PAR2 ابهام‌زدایی و در جریان استخراج کرد، صفر بلوک بازخوانی.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">سناریو 4 · صف سه‌تایی</p>
+    <h2>روشن نگه داشتن خط در سراسر یک صف (ساحل شرقی، ~43 GB)</h2>
+    <div class="tblwrap"><table>
+      <thead><tr><th></th><th>nzbfast</th><th>rustnzb</th><th>NZBGet</th><th>SABnzbd</th></tr></thead>
+      <tbody>
+        <tr><td>زمان دیواری صف</td><td class="win">122 s</td><td class="num">136 s</td><td class="num">162 s</td><td class="num">277 s</td></tr>
+        <tr><td>بیکاری خط (&lt;20 MB/s)</td><td class="win">2 s (2%)</td><td class="num">16 s (12%)</td><td class="num">0 s</td><td class="bad">168 s (61%)</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">سه شکل از یک مسئله: هم‌پوشانی-دنبالهٔ nzbfast
+    خط را از لبه تا لبه مشغول نگه می‌دارد؛ NZBGet هرگز بیکار نمی‌شود اما در حین باز کردن هم‌زمان ~35% کندتر
+    اجرا می‌شود؛ SABnzbd سریع دانلود می‌کند، سپس خط را در طول پس‌پردازش سریالی <b>61% اوقات خاموش</b> رها
+    می‌کند. در گونهٔ تاب‌آوری (یک کار با هدرهای RAR رمزگذاری‌شده)،
+    صف SABnzbd روی کار رمزگذاری‌شده گیر کرد و تنها 1 از 3 کار اصلاً کامل شد؛ nzbfast
+    آن را با یک پیام روشن پارک کرد و بقیه را تمام کرد.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">ستون صادقانه</p>
+    <h2>دو لِگی که باختیم — یکی اکنون بسته شد</h2>
+    <div class="grid2">
+      <div class="card"><h3>پست خراب حالت-ذخیره</h3>
+        <p>20 مقالهٔ مسموم در یک 7.4 GB REMUX: NZBGet در <b>53 s</b> قابل‌استفاده تمام کرد؛ nzbfast
+        اکنون <b>58 s</b> می‌گیرد — تعمیر در 32 s کامل، هر 62 جلد دوباره استخراج‌شده، خروجی
+        بایت-دقیق. باگ حالت-پایانی که یک بیلد قبلی روی همین مسیر داشت (جلدهای تعمیرشده
+        با استخراج مجدد خراب می‌شدند در حالی که کد خروج موفقیت می‌گفت) رفع، رگرسیون-آزموده،
+        و دوباره در برابر Usenet واقعی اعتبارسنجی شد. تعمیر ما هنوز کمینهٔ تقریباً-نظری
+        22 بلوک بازیابی را برای 20 موردنیاز واکشی می‌کند در برابر گذر کامل PAR2 آن‌ها — اما NZBGet لِگ را با
+        پنج ثانیه می‌برد، پس اینجا چاپ شده است.</p></div>
+      <div class="card"><h3>ازسرگیری kill −9 — بسته‌شده</h3>
+        <p>کشته‌شده در ~15 GB از یک کار 34.5 GB، این زمانی بدترین عدد ما بود: NZBGet دوباره
+        <b>~0.6 GB</b> دانلود کرد، nzbfast <b>15 GB</b> — هر چیزی که پیش از فعال‌سازی PAR2 رمزگشایی شده بود با
+        فرایند مرد. ژورنال اکنون جای‌گذاری فیزیکی هر مقاله را ثبت می‌کند، پس یک ازسرگیری
+        آن بایت‌ها را از فایل‌های خروجی اجرای قبلی بازیابی می‌کند (یک کپی دیسک محلی، هر
+        بایت در برابر نقشهٔ بلوک PAR2 دوباره تأییدشده) و <b>~0.3 GB</b> دوباره دانلود می‌کند — برابری
+        در حد نوفهٔ ارائه‌دهنده. SABnzbd، برای ثبت، هرگز در سه دور از این سناریو بازیابی نشده است:
+        به همان روش کشته‌شده، 0.5 GB را در یک ساعت دوباره واکشی کرد و زمانش تمام شد.</p></div>
+    </div>
+    <div class="callout">چرا باخت‌ها را منتشر کنیم؟ چون بردها فقط در کنار آن‌ها باورپذیرند.
+    هر عدد روی این صفحه از همان اجراهای درهم‌تنیده می‌آید، و گزارش محک ما در مخزن
+    یک دفترچهٔ آزمایشگاهی کامل است — از جمله نتایج منفی.</div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">سناریو 6 · آن را از RAM محروم کن</p>
+    <h2>نردبان حافظهٔ کم — 190 GB در ~1.1 GB از RAM</h2>
+    <p>همان چهار کار، دوباره اجراشده با بودجه‌های سخت حافظهٔ 2 GB، 1 GB و 256 MB —
+    آنچه اندازه‌گذار خودکار روی یک ماشین 8 GB، یک ماشین 4 GB، و یک NAS 2 GB انتخاب می‌کند. هر
+    لِگ یک فایل درست، کاملاً تأییدشده و استخراج‌شده تولید کرد؛ اوج RSS
+    <em>بودجه</em> را دنبال کرد، نه کار را. زمان تا فایل قابل‌استفاده، خط 10 GbE:</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>اندازهٔ کار</th><th>RAM فراوان</th><th>بودجهٔ 2 GB</th><th>بودجهٔ 1 GB</th><th>بودجهٔ 256 MB</th></tr></thead>
+      <tbody>
+        <tr><td>7 GB</td><td class="num">15 s</td><td class="num">15 s</td><td class="num">15 s</td><td class="num">15 s</td></tr>
+        <tr><td>35 GB</td><td class="num">65 s</td><td class="num">70 s</td><td class="num">70 s</td><td class="num">65 s</td></tr>
+        <tr><td>87 GB</td><td class="num">148 s</td><td class="num">206 s</td><td class="num">196 s</td><td class="num">180 s</td></tr>
+        <tr><td>190 GB</td><td class="num">330 s</td><td class="num">427 s</td><td class="num">402 s</td><td class="num">411 s</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">سربار 20–40% روی کارهای بزرگ یک
+    اثر 10 GbE است: بلوک‌های سرریزشده فقط وقتی وقت‌گیرند که خط از دیسک جلو بزند. همان
+    کار 87 GB با همان بودجه‌ها روی یک خط ~2.4 Gbps معادل −1% تا +7% سنجیده شد — نوفه.
+    روی یک اتصال خانگی معمولی یک بودجهٔ کوچک در هر اندازهٔ کار تقریباً رایگان است. یک
+    نمای NAS (2 اتصال، بودجهٔ 256 MB) کار 35 GB را در 0.4 GB اوج
+    RSS تمام کرد — یک NAS 2 GB می‌تواند این را اجرا کند. هیچ کلاینت دیگری اصلاً سقف حافظه ارائه نمی‌دهد.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">توانمندی، نه ریزمحک‌ها</p>
+    <h2>هر کلاینت چه می‌تواند بکند</h2>
+    <div class="tblwrap"><table>
+      <thead><tr><th></th><th>nzbfast</th><th>SABnzbd 5</th><th>NZBGet 26</th><th>rustnzb</th><th>Usenapp</th><th>Newsbin</th></tr></thead>
+      <tbody>
+        <tr><td>NNTP خط‌لوله‌ای</td><td class="yes">بله</td><td class="half">به‌طور پیش‌فرض خاموش</td><td class="no">خیر</td><td class="yes">بله</td><td class="no">—</td><td class="no">—</td></tr>
+        <tr><td>تأیید کامل حین دانلود</td><td class="yes">هر بلوک</td><td class="no">پس از آن</td><td class="half">بررسی سریع</td><td class="no">پس از آن</td><td class="no">پس از آن</td><td class="no">پس از آن</td></tr>
+        <tr><td>استخراج حین دانلود</td><td class="yes">در جریان، بدون جلد روی دیسک</td><td class="half">باز کردن مستقیم⁴</td><td class="half">باز کردن مستقیم⁴</td><td class="half">نامطمئن⁵</td><td class="no">خیر</td><td class="no">خیر</td></tr>
+        <tr><td>دیسک موردنیاز برای یک پست N-GB</td><td class="yes">~1×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td></tr>
+        <tr><td>حکم قابل‌تکمیل بودن پیش از دانلود</td><td class="yes">بلوک-دقیق</td><td class="no">خیر</td><td class="half">درصد سلامت</td><td class="no">خیر</td><td class="yes">بررسی مقاله</td><td class="no">خیر</td></tr>
+        <tr><td>حافظهٔ کران‌دار (هرگز swap)</td><td class="yes">بودجه‌بندی‌شده</td><td class="no">9.3 GB @ 190 GB</td><td class="half">تنظیم حافظهٔ نهان</td><td class="no">خیر</td><td class="no">—</td><td class="no">—</td></tr>
+        <tr><td>پیش‌نمایش + پرش حین دانلود</td><td class="yes">بله</td><td class="no">خیر</td><td class="no">خیر</td><td class="no">خیر</td><td class="half">سریالی</td><td class="no">خیر</td></tr>
+        <tr><td>ایندکسر داخلی + دیوار پوستر</td><td class="yes">بله، بدون کلید</td><td class="no">خیر</td><td class="no">خیر</td><td class="no">خیر</td><td class="half">رابط جست‌وجو</td><td class="half">مرورگر گروه</td></tr>
+        <tr><td>جایگزین Sonarr/Radarr</td><td class="yes">API SAB + Newznab</td><td class="yes">بومی</td><td class="yes">بومی</td><td class="half">جزئی</td><td class="no">خیر</td><td class="no">خیر</td></tr>
+        <tr><td>کنترل‌های گوشی (nzb360/LunaSea)</td><td class="yes">از طریق RPC NZBGet</td><td class="yes">بله</td><td class="yes">بله</td><td class="no">خیر</td><td class="no">خیر</td><td class="no">خیر</td></tr>
+        <tr><td>گرفتن خودکار فهرست پیگیری + ارتقاها</td><td class="yes">درون‌ساخت</td><td class="no">از طریق *arr</td><td class="no">از طریق *arr</td><td class="no">خیر</td><td class="yes">Watchdog</td><td class="half">قواعد</td></tr>
+        <tr><td>یک باینری خودکفای واحد</td><td class="yes">بله</td><td class="no">Python</td><td class="yes">بله</td><td class="yes">بله</td><td class="yes">‎.app</td><td class="yes">‎.exe</td></tr>
+        <tr><td>متن‌باز</td><td class="yes">GPL⁶</td><td class="yes">GPL</td><td class="yes">GPL</td><td class="yes">بله</td><td class="no">پولی</td><td class="no">پولی</td></tr>
+        <tr><td>پلتفرم‌ها</td><td class="yes">mac/win/linux/docker</td><td class="yes">mac/win/linux</td><td class="yes">mac/win/linux</td><td class="half">linux/win</td><td class="no">فقط mac</td><td class="no">فقط win</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">⁴ باز کردن مستقیم هنوز اول جلدها را مادی می‌کند —
+    2× نوشتن و 2× دیسک. ⁵ rustnzb در دور ما جلدهای مبهم را با نشان «Completed» تحویل داد
+    (باز کردنش هم با unrar از RARLab قفل می‌شود مگر غیرفعال شود). ⁶ GPL-3.0-or-later.
+    Usenapp/Newsbin خواننده‌های تجاری تک‌پلتفرمی با قابلیت‌های دانلودر هستند؛ به این دلیل
+    فهرست شده‌اند که مردم می‌پرسند، نه چون بر سر سرعت رقابت می‌کنند.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">اثبات انتقال</p>
+    <h2>موتور خط‌های واقعی را اشباع می‌کند</h2>
+    <ul class="plain">
+      <li><b>8.31 Gbps تجمیعی</b> روی یک خط 10 GbE با سنجش-8.2 Gbps (اروپا M1 Ultra، 4 ارائه‌دهنده، 14,000 مقاله، 0 خطا، 0 اتصال مجدد).</li>
+      <li><b>9.16–9.27 Gbps</b> تیک‌های انتقال پایدار روی همان خط — ≈98% از goodput عملی TCP.</li>
+      <li><b>5.44 Gbps پایدار</b> در سراسر یک کار کامل 20.4 GB <i>شامل</i> تأیید در جریان.</li>
+      <li><b>خط‌لوله‌سازی در هر RTT بازتولید شد</b>: +64% در Starlink با 63 ms، +170–177% در دیتاسنتر با 14 ms، +270% در ساحل شرقی با 31 ms — تحلیل پنجرهٔ ازدحام TCP را شکست می‌دهد، نه فقط تأخیر را.</li>
+      <li><b>اثبات فشار برگشتی</b>: مرحلهٔ نوشتن را 4× زیر شبکه سقف بگذارید و ورودی ظرف 2 s به سقف ±1% قفل می‌شود، RAM <i>افت می‌کند</i>، صفر swap — یک دیسک کند هرگز نمی‌تواند حافظه را باد کند.</li>
+      <li><b>فضای مانور پردازش</b>: سقف‌های سنجیدهٔ رمزگشایی+تأیید 86–165 Gbps روی سیلیکون اپل — شبکه در هر ماشینی که آزموده شد 4–50× گلوگاه است.</li>
+    </ul>
+    <div class="callout">قاعدهٔ پابرجا از مخزن: <b>هر ادعای کارایی به یک فرمان بازتولیدپذیر
+    و شرایطی که تحت آن اجرا شده استناد می‌کند.</b> دفترچهٔ آزمایشگاهی کامل — از جمله نتایج
+    منفی و مسیرهای اشتباه — به‌عنوان یک دفترچهٔ آزمایشگاهی تاریخ‌دار نگه داشته می‌شود.</div>
+  </div>
+</section>
+
+<footer><div class="wrap">
+  <div class="cols">
+    <div>⚡ <b>nzbfast</b> — دانلودر تک‌گذر Usenet.</div>
+    <div>
+      <a href="features.fa.html">ویژگی‌ها</a> ·
+      <a href="benchmarks.fa.html">محک‌ها</a> ·
+      <a href="download.fa.html">دانلود</a> ·
+      <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
+    </div>
+  </div>
+  <p class="fine">دادهٔ محک: دور رقابتی 19–20 ژوئیهٔ 2026. نسخه‌های
+  کلاینت: SABnzbd 5.0.4، NZBGet 26.2 (فورک nzbget.com)، rustnzb 1.3.4. اگر نسخهٔ جدیدتری از
+  هر کلاینت نتیجه‌ای را به‌طور اساسی تغییر دهد، دوباره اجرا و به‌روزرسانی می‌کنیم.</p>
+</div></footer>
+
+</body>
+</html>

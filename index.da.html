@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="da">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nzbfast — den hurtigste NZB-downloader</title>
+<meta name="description" content="En one-pass Usenet-downloader: afkoder, verificerer og udpakker, mens den henter. 190 GB til en verificeret, afspilbar fil på 9 minutter. macOS, Windows, Linux, Docker.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<link rel="stylesheet" href="assets/site.css">
+<link rel="alternate" hreflang="en" href="index.html">
+<link rel="alternate" hreflang="fr" href="index.fr.html">
+<link rel="alternate" hreflang="de" href="index.de.html">
+<link rel="alternate" hreflang="it" href="index.it.html">
+<link rel="alternate" hreflang="es" href="index.es.html">
+<link rel="alternate" hreflang="nl" href="index.nl.html">
+<link rel="alternate" hreflang="pt" href="index.pt.html">
+<link rel="alternate" hreflang="sv" href="index.sv.html">
+<link rel="alternate" hreflang="da" href="index.da.html">
+<link rel="alternate" hreflang="nb" href="index.nb.html">
+<link rel="alternate" hreflang="fi" href="index.fi.html">
+<link rel="alternate" hreflang="tr" href="index.tr.html">
+<link rel="alternate" hreflang="ro" href="index.ro.html">
+<link rel="alternate" hreflang="he" href="index.he.html">
+<link rel="alternate" hreflang="ar" href="index.ar.html">
+<link rel="alternate" hreflang="fa" href="index.fa.html">
+<link rel="alternate" hreflang="x-default" href="index.html">
+</head>
+<body>
+
+<header><div class="wrap">
+  <a class="logo" href="index.da.html"><span class="bolt">⚡</span> nzbfast</a>
+  <nav>
+    <a href="features.da.html">Funktioner</a>
+    <a href="benchmarks.da.html">Benchmarks</a>
+    <a href="MANUAL.html">Docs</a>
+    <a href="https://github.com/nzbfast/nzbfast" title="Source repository">GitHub</a>
+    <a class="cta" href="download.da.html">Download</a>
+    <!-- i18n picker: same markup in every language file; hrefs fixed -->
+    <span class="langsw" style="font-size:11.5px;opacity:.75;margin-inline-start:10px;white-space:nowrap"><a href="index.html">EN</a> · <a href="index.fr.html">FR</a> · <a href="index.de.html">DE</a> · <a href="index.it.html">IT</a> · <a href="index.es.html">ES</a> · <a href="index.nl.html">NL</a> · <a href="index.pt.html">PT</a> · <a href="index.sv.html">SV</a> · <a href="index.da.html">DA</a> · <a href="index.nb.html">NB</a> · <a href="index.fi.html">FI</a> · <a href="index.tr.html">TR</a> · <a href="index.ro.html">RO</a> · <a href="index.he.html">HE</a> · <a href="index.ar.html">AR</a> · <a href="index.fa.html">FA</a></span>
+  </nav>
+</div></header>
+
+<div class="hero wrap">
+  <h1>Fra NZB til <em>afspilning</em><br>før andre er færdige med at hente.</h1>
+  <p class="sub">nzbfast er en Usenet-downloader bygget op om en one-pass-pipeline:
+  hver byte afkodes, verificeres og udpakkes, <b>mens den henter</b>.
+  Ingen samlefase, ingen verificeringsfase, ingen udpakningsfase — når fremgangsbjælken
+  er fuld, er filen færdig og beviseligt intakt.</p>
+  <div class="chips">
+    <span class="chip"><b>8.31&nbsp;Gbps</b> på en 10&nbsp;GbE-linje</span>
+    <span class="chip"><b>190&nbsp;GB → 4m44s</b> til en verificeret fil</span>
+    <span class="chip">RAR-volumener <b>rører aldrig disken</b></span>
+    <span class="chip"><b>Halvdelen af den disk</b>, konkurrenterne kræver</span>
+    <span class="chip">RAM-budgetteret · <b>0 swaps, nogensinde</b></span>
+  </div>
+  <div class="btnrow">
+    <a class="btn" href="download.da.html">Download</a>
+    <a class="btn ghost" href="benchmarks.da.html">Se tallene</a>
+  </div>
+  <p class="note">macOS · Windows · Linux · Docker — én selvstændig eksekverbar fil med reparations- og udpakningsværktøjer indbygget.</p>
+  <figure class="shot heroShot"><img src="assets/dash-hero.png" alt="nzbfast-dashboardet midt i en download ved 61 MB/s: gennemløb med top på 104 MB/s hen over en fuld historikgraf, live ressource- og pr.-udbyder-diagrammer og pipelinefaserne download/verificér/udpak, der overlapper"></figure>
+</div>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Derfor er den hurtig</p>
+    <h2>Tre idéer, som de gængse klienter ikke udnytter fuldt ud</h2>
+    <p class="lead">Ikke mikrooptimering — arkitektur. Hver enkelt er målt i
+    <a href="benchmarks.da.html">benchmark-loggen</a> med reproducerbare kommandoer.</p>
+    <div class="grid3">
+      <div class="card"><span class="ic">🔁</span><h3>Pipelinet NNTP</h3>
+        <p>Flere artikelforespørgsler er undervejs samtidig pr. forbindelse, så rundrejser aldrig
+        lader socket'en stå i tomgang — og TCP nedbryder aldrig sit overbelastningsvindue mellem artikler.
+        Målt +12% til +270% over seriel på fire steder; en linje mættes med 8
+        forbindelser i stedet for 30–50.</p></div>
+      <div class="card"><span class="ic">🚿</span><h3>One-pass-pipelinen</h3>
+        <p>Artikler SIMD-afkodes på stedet, skrives én gang på deres endelige offsets,
+        PAR2-verificeres fra afkodningsbufferne, og store-mode-RAR-indhold
+        udpakkes <i>under</i> downloaden — volumenerne findes aldrig som filer.
+        Diskskrivninger = indhold × 1.0.</p></div>
+      <div class="card"><span class="ic">🕸️</span><h3>Union-tilgængelighed</h3>
+        <p>En artikel er kun "manglende", når <i>hver eneste</i> konfigureret backbone har afvist
+        den. Blok-eksakt bogføring afgør COMPLETE / REPAIRABLE / IMPOSSIBLE, før der
+        spildes bytes, henter det nøjagtigt tilpassede minimum af genoprettelsesblokke og afbryder
+        håbløse downloads på sekunder.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">Pipelinen</p>
+    <h2>Rør hver byte én gang</h2>
+    <p class="lead">Konkurrenterne skriver arkivvolumenerne, læser dem igen for at verificere, læser
+    dem endnu en gang for at udpakke og skriver så outputtet — cirka 2× skrivninger og 2× læsninger.
+    nzbfast gør det her i stedet:</p>
+    <div class="pipe"><pre>
+socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s per core)
+                   │
+                   ├─▶ <b>pwrite at final offset</b>          (plain posts)
+                   │      └─ or: RAR-map translate ─▶ pwrite straight into the
+                   │         <em>extracted</em> file (store-mode posts — the rar
+                   │         volumes never touch disk)
+                   ├─▶ <b>PAR2 block hasher</b> — every block MD5-verified from the
+                   │      decode buffer; verification finishes with the download
+                   └─▶ <b>availability ledger</b> — block-exact health, live
+</pre></div>
+    <div class="callout">Beskadiget post? Defekte blokke kendes i det øjeblik, deres artikler fejler,
+    det <b>nøjagtigt tilpassede minimum</b> af genoprettelsesvolumener hentes <b>under</b> downloaden
+    (22 blokke hentet for 20 nødvendige i bench-runden), og reparationen rører kun de
+    beskadigede spænd. Umulig post? Den afbryder på sekunder efter at have hentet næsten
+    intet — før din kvote opdager det.</div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Nøglefunktioner</p>
+    <h2>Alt, hvad en seriøs opsætning har brug for</h2>
+    <p class="lead">Hele listen — hver knap, hver integration — findes på
+    <a href="features.da.html">funktionssiden</a>.</p>
+    <div class="grid2">
+      <ul class="feat">
+        <li><b>Downloads ved linjehastighed</b> <span class="d">— pipelinet NNTP målt ved 8.31 Gbps på 10 GbE; den hurtigste klient på hvert rent benchmark-ben, ved enhver størrelse.</span></li>
+        <li><b>One-pass-pipeline</b> <span class="d">— afkodning, verificering og udpakning overlapper; store-mode-RAR-volumener rammer aldrig disken; kræver 1× disk, hvor andre kræver ~2×.</span></li>
+        <li><b>Union-tilgængelighed på tværs af udbydere</b> <span class="d">— blok-eksakt routing på tværs af backbones; preflight-domme; nøjagtigt tilpasset reparation; tidlig afbrydelse af umulige posts.</span></li>
+        <li><b>Hukommelsesbudget</b> <span class="d">— ét globalt RAM-budget med nænsomme spill-niveauer. Den swapper aldrig din maskine: et 190 GB-job fuldføres inden for et 1 GB-budget (~1.1 GB top-RSS).</span></li>
+        <li><b>Crash-sikker genoptagelse</b> <span class="d">— en journal på artikelniveau betyder, at et crash eller kill −9 midt i en download næsten intet koster: den genoptager og henter kun det igen, der ikke blev gemt.</span></li>
+      </ul>
+      <ul class="feat">
+        <li><b>Drop-in-API'er</b> <span class="d">— SABnzbd-kompatibelt API og NZBGet JSON-RPC: Sonarr, Radarr, nzb360 og LunaSea virker uændret. Import af din SAB-/NZBGet-konfiguration med ét klik.</span></li>
+        <li><b>Indbygget indexer</b> <span class="d">— scanner dine newsgroups til et søgbart lokalt indeks og serverer Newznab, så din *arr-stak også kan søge i det.</span></li>
+        <li><b>Postervæg med nøglefri metadata</b> <span class="d">— artwork, bedømmelser, medvirkende og synopser for alt i dit indeks, uden en eneste API-nøgle at skulle tilmelde sig.</span></li>
+        <li><b>Overvågningsliste-automatisering</b> <span class="d">— navngiv en serie eller film (sendt eller ej); den hentes i det øjeblik den dukker op og kvalitetsopgraderes derefter, indtil dit mål er nået.</span></li>
+        <li><b>Én eksekverbar fil</b> <span class="d">— reparation (par2) og udpakning (RAR) er indbygget i binæren. Pak ud, kør, færdig.</span></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">Benchmarks</p>
+    <h2>190.6 GB → en verificeret 167.9 GB-fil</h2>
+    <p class="lead">Samme maskine, samme seks udbydere, kørsler flettet ryg mod ryg.
+    Tid indtil en brugbar, udpakket fil findes — det eneste tal, der betyder noget.
+    Hver konkurrent tunet til sit dokumenterede bedste (inklusive at slå SABnzbds
+    pipelining <i>til</i>, som den leveres uden).</p>
+    <div class="bars">
+      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:24%"></i></span><span class="t">4m 44s</span></div>
+      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:36%"></i></span><span class="t">7m 06s · +50%</span></div>
+      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 31s · +312%</span></div>
+      <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">ingen brugbar fil</span></div>
+    </div>
+    <p class="note" style="text-align:left">190.6 GB NZB → én enkelt 167.9 GB mkv, M1 Ultra på 10 GbE, 6 udbydere × 8 forbindelser.
+    Samme job fuldføres inden for et 1 GB-hukommelsesbudget. Fulde tabeller, seks scenarier og de ben, vi <i>tabte</i> — plus hvordan du reproducerer det —
+    på <a href="benchmarks.da.html">benchmark-siden</a>.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Fremvisningen</p>
+    <h2>Dit indeks, præsenteret som en postervæg</h2>
+    <p class="lead">Den indbyggede indexer scanner de newsgroups, du går op i; væggen forvandler
+    resultatet til postere, bedømmelser, medvirkende og episodegitre — kun ud fra nøglefrie offentlige
+    kilder, hentet af din egen installation. Klik på en episode-chip for at hente den.</p>
+    <figure class="shot"><img src="assets/wall-grid.jpg" alt="nzbfast-postervæg: et gitter af tv-postere med kvalitetsmærker, bedømmelser og sæsonantal" loading="lazy"></figure>
+    <div style="height:18px"></div>
+    <div class="strip">
+      <figure><div class="shot"><img src="assets/wall-sheet.jpg" alt="Detaljeark for en serie: baggrundsbillede, IMDb-bedømmelse, medvirkende, synopsis, download-chips pr. episode" loading="lazy"></div>
+        <figcaption>Bedømmelser, medvirkende, synopsis, episodegitter — ingen API-nøgler, nogensinde.</figcaption></figure>
+      <figure><div class="shot"><img src="assets/dash-queue-drawer.png" alt="Kø med en detaljeskuffe pr. download: fremgangsbjælker pr. fil, verificeringsblokke, bidrag pr. server" loading="lazy"></div>
+        <figcaption>Hver download åbner til fremgang pr. fil, live verificeringstilstand og bidrag pr. server.</figcaption></figure>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">Passer til din opsætning</p>
+    <h2>Ret dine eksisterende værktøjer mod den</h2>
+    <div class="grid3">
+      <div class="card"><h3>Sonarr / Radarr</h3><p>Fuldt SABnzbd-kompatibelt API — tilføj nzbfast som en
+        "SABnzbd"-downloadklient, og det virker bare: hentninger, kategorier, prioriteter, nye forsøg,
+        efterbehandlingsscripts (SAB_*-kontrakt), historik. Newznab-facaden lader også
+        *arr-programmerne <i>søge i dit lokale indeks</i>, som var det en indexer.</p></div>
+      <div class="card"><h3>nzb360 / LunaSea</h3><p>Daemonen taler også NZBGets JSON-RPC —
+        de populære telefon-fjernbetjeninger styrer nzbfast uændret. Og selve dashboardet har et
+        førsteklasses telefonlayout til, når du er væk fra den store skærm.</p></div>
+      <div class="card"><h3>Kommer du fra SAB eller NZBGet?</h3><p>Ét klik importerer dine servere fra
+        en eksisterende SABnzbd- eller NZBGet-installation (den læser også sabnzbd.ini direkte). Watch-mapper,
+        RSS-feeds med filtre, smarte mapper med tv-arkivering og oprydningsregler
+        følger med på købet.</p></div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap" style="text-align:center">
+    <h2>Prøv den i løbet af de næste to minutter</h2>
+    <p class="lead" style="margin-left:auto;margin-right:auto">Pak ud, dobbeltklik på starteren, svar på
+    tre spørgsmål (eller lad den finde din SABnzbd-konfiguration), og dashboardet åbner. Første
+    download inden for to minutter.</p>
+    <div class="btnrow">
+      <a class="btn" href="download.da.html">Download nzbfast</a>
+      <a class="btn ghost" href="features.da.html">Læs hele funktionslisten</a>
+    </div>
+  </div>
+</section>
+
+<footer><div class="wrap">
+  <div class="cols">
+    <div>⚡ <b>nzbfast</b> — one-pass Usenet-downloaderen.</div>
+    <div>
+      <a href="features.da.html">Funktioner</a> ·
+      <a href="benchmarks.da.html">Benchmarks</a> ·
+      <a href="download.da.html">Download</a> ·
+      <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
+    </div>
+  </div>
+  <p class="fine">Fri software, GPL-3.0-or-later. PAR2-reparation og RAR-udpakning er native kode i binæren — ingen medfølgende tredjepartsværktøjer. Postervæggens metadata kommer fra nøglefrie
+  offentlige kilder (TVmaze, iTunes Search, offentlige datasæt, Wikidata, Wikipedia, AniList),
+  hentet af din egen installation. nzbfast henter det, du beder den om — du er
+  ansvarlig for, hvad det er.</p>
+</div></footer>
+
+</body>
+</html>

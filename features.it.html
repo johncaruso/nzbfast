@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Funzionalità — nzbfast</title>
+<meta name="description" content="Tutte le funzionalità di nzbfast: la pipeline a passata unica, la disponibilità in unione, l'indexer integrato, la bacheca dei poster, l'automazione della watchlist, le API compatibili SABnzbd e NZBGet.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<link rel="stylesheet" href="assets/site.css">
+<link rel="alternate" hreflang="en" href="features.html">
+<link rel="alternate" hreflang="fr" href="features.fr.html">
+<link rel="alternate" hreflang="de" href="features.de.html">
+<link rel="alternate" hreflang="it" href="features.it.html">
+<link rel="alternate" hreflang="es" href="features.es.html">
+<link rel="alternate" hreflang="nl" href="features.nl.html">
+<link rel="alternate" hreflang="pt" href="features.pt.html">
+<link rel="alternate" hreflang="sv" href="features.sv.html">
+<link rel="alternate" hreflang="da" href="features.da.html">
+<link rel="alternate" hreflang="nb" href="features.nb.html">
+<link rel="alternate" hreflang="fi" href="features.fi.html">
+<link rel="alternate" hreflang="tr" href="features.tr.html">
+<link rel="alternate" hreflang="ro" href="features.ro.html">
+<link rel="alternate" hreflang="he" href="features.he.html">
+<link rel="alternate" hreflang="ar" href="features.ar.html">
+<link rel="alternate" hreflang="fa" href="features.fa.html">
+<link rel="alternate" hreflang="x-default" href="features.html">
+</head>
+<body>
+
+<header><div class="wrap">
+  <a class="logo" href="index.it.html"><span class="bolt">⚡</span> nzbfast</a>
+  <nav>
+    <a href="features.it.html" class="on">Funzionalità</a>
+    <a href="benchmarks.it.html">Benchmark</a>
+    <a href="MANUAL.html">Documentazione</a>
+    <a href="https://github.com/nzbfast/nzbfast" title="Source repository">GitHub</a>
+    <a class="cta" href="download.it.html">Scarica</a>
+    <!-- i18n picker: same markup in every language file; hrefs fixed -->
+    <span class="langsw" style="font-size:11.5px;opacity:.75;margin-inline-start:10px;white-space:nowrap"><a href="features.html">EN</a> · <a href="features.fr.html">FR</a> · <a href="features.de.html">DE</a> · <a href="features.it.html">IT</a> · <a href="features.es.html">ES</a> · <a href="features.nl.html">NL</a> · <a href="features.pt.html">PT</a> · <a href="features.sv.html">SV</a> · <a href="features.da.html">DA</a> · <a href="features.nb.html">NB</a> · <a href="features.fi.html">FI</a> · <a href="features.tr.html">TR</a> · <a href="features.ro.html">RO</a> · <a href="features.he.html">HE</a> · <a href="features.ar.html">AR</a> · <a href="features.fa.html">FA</a></span>
+  </nav>
+</div></header>
+
+<div class="hero wrap" style="padding-bottom:6px">
+  <h1>Tutte le funzionalità, <em>in una pagina</em>.</h1>
+  <p class="sub">Prima la versione breve; sotto, l'intera macchina.</p>
+</div>
+
+<section style="padding-top:26px">
+  <div class="wrap">
+    <div class="grid2">
+      <ul class="feat">
+        <li><b>NNTP in pipeline a velocità di linea</b> <span class="d">— 8.31 Gbps misurati su 10 GbE.</span></li>
+        <li><b>Pipeline a passata unica</b> <span class="d">— decodifica, verifica ed estrazione si sovrappongono; i volumi RAR non toccano mai il disco.</span></li>
+        <li><b>Disponibilità in unione multi-provider</b> <span class="d">— completa dall'unione dei tuoi server, o interrompe subito.</span></li>
+        <li><b>Budget di memoria</b> <span class="d">— RAM limitata, spill controllato, mai swap.</span></li>
+        <li><b>Ripresa a prova di crash</b> <span class="d">— journal a livello di articolo; kill −9 a metà job e riprende da dove si era fermato.</span></li>
+      </ul>
+      <ul class="feat">
+        <li><b>API compatibile SABnzbd + JSON-RPC NZBGet</b> <span class="d">— Sonarr/Radarr/nzb360/LunaSea funzionano senza modifiche.</span></li>
+        <li><b>Indexer integrato</b> <span class="d">— scansiona i gruppi in un indice locale, ricercabile, servito via Newznab.</span></li>
+        <li><b>Bacheca dei poster</b> <span class="d">— copertine, valutazioni, cast, griglie episodi; nessuna chiave API.</span></li>
+        <li><b>Prelievo automatico da watchlist + upgrade di qualità</b> <span class="d">— preleva alla prima apparizione, migliora fino alla qualità obiettivo.</span></li>
+        <li><b>Un unico eseguibile autonomo</b> <span class="d">— par2 + estrazione RAR integrati.</span></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <h2>Motore &amp; velocità</h2>
+    <div class="grid2">
+      <ul class="plain">
+        <li><b>NNTP in pipeline</b> — più richieste in volo per connessione battono sia la latenza di andata e ritorno sia il decadimento della finestra di congestione TCP; +12%…+270% misurati rispetto al seriale. Satura la linea con ~8 connessioni per server.</li>
+        <li><b>Decodifica yEnc SIMD</b> (rapidyenc, kernel NEON/AVX) — 4.95 GB/s per core, decodifica sul posto nel percorso di ricezione.</li>
+        <li><b>Coda condivisa multi-server</b> — i provider si bilanciano da soli entro ~2%, senza tuning; consapevolezza della velocità per server, con invio duplicato sul finale così un server lento non trascina la coda del job.</li>
+        <li><b>Saturazione tra job</b> — il finale del job N si sovrappone all'avvio del job N+1: la linea resta accesa da un capo all'altro della coda (2% di inattività contro il 61% al buio di SABnzbd nel benchmark).</li>
+        <li><b>Watchdog dei job lenti</b> — un download che arranca su un server lento mentre altri attendono viene rinviato automaticamente in fondo alla coda (avanzamento conservato) e ripreso quando la coda si libera.</li>
+        <li><b>Prefetch sui server inattivi</b> — i server che il job attivo non può usare (non hanno i suoi articoli) avviano il prossimo job in coda invece di restare fermi.</li>
+      </ul>
+      <ul class="plain">
+        <li><b>Ottimizzazione connessioni a gradini</b> — misura il vero punto di flesso di ogni provider (connessioni richieste vs concesse) invece di tirare a indovinare.</li>
+        <li><b>Regolatore automatico di velocità</b> — un governatore RTT opzionale in stile LEDBAT cede il passo al traffico di casa usando tutto il resto della linea.</li>
+        <li><b>Limiti di velocità &amp; pianificazione settimanale</b> — tetti regolabili al volo, orari in ora locale (a prova di ora legale), «pausa per N minuti» con ripresa automatica.</li>
+        <li><b>Budget di memoria</b> — un unico budget globale di RAM (auto: RAM/4, con tetto; personalizzabile). Quando il budget si fa stretto riduce i buffer, poi fa spill su disco e rilegge quando il job si stabilizza — non va mai in swap. Un job da 190 GB si completa dentro un budget di 1 GB (~1.1 GB di picco RSS); il profilo NAS da 2 GB è misurato e documentato.</li>
+        <li><b>Backpressure</b> — un disco lento frena i socket invece di riempire la RAM (si mantiene entro ±1% da un tetto di scrittura, con la RAM che <i>scende</i> sotto pressione).</li>
+        <li><b>Rilascio memoria a fine job</b> — il daemon restituisce al sistema la memoria liberata quando è inattivo (l'impronta scende a ~8 MB tra un job e l'altro su macOS).</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>La pipeline a passata unica</h2>
+    <div class="grid2">
+      <ul class="plain">
+        <li><b>Scrittura unica</b> — gli articoli decodificati vengono scritti (pwrite) direttamente all'offset finale nel file. Niente file temporanei, nessuna passata di assemblaggio.</li>
+        <li><b>Verifica PAR2 nel flusso</b> — ogni blocco riceve l'hash MD5 dai buffer di decodifica man mano che arriva; la verifica finisce insieme al download. Più robusta del quick-check dei concorrenti, e gratis.</li>
+        <li><b>Estrazione diretta</b> — i post RAR in modalità store (la maggior parte delle release scene) vengono mappati ed estratti durante il download; i volumi non esistono mai su disco. Scritture su disco = contenuto × 1.0, spazio richiesto = 1× (agli altri serve ~2×).</li>
+        <li><b>Deoffuscamento</b> — i post offuscati vengono rinominati dai metadati PAR2; i nomi offuscati in ROT13 vengono recuperati; la robaccia dai nomi hash viene classificata e filtrata.</li>
+      </ul>
+      <ul class="plain">
+        <li><b>Riparazione su misura</b> — i blocchi danneggiati sono noti in tempo reale; il set di volumi di recupero a byte minimi viene scaricato durante il download (risolto come problema dello zaino), e la riparazione tocca solo gli intervalli danneggiati.</li>
+        <li><b>Fallback per compressi/cifrati</b> — i post non-store si materializzano e si estraggono con l'estrattore RAR nativo, in sovrapposizione con la coda; i set cifrati vengono parcheggiati con un messaggio chiaro.</li>
+        <li><b>Gestione password</b> — password dall'API degli *arr, dalla convenzione <code>{{pw}}</code> nel nome file o dai metadati NZB; per il resto c'è lo sblocco 🔑 nella dashboard (sblocco in background, poi archiviazione normale).</li>
+        <li><b>Reti di sicurezza</b> — i volumi sorgente riparati sono protetti da scrittura durante la ri-estrazione; i codici di uscita dicono «successo» solo quando lo stato finale è davvero utilizzabile.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <h2>Affidabilità &amp; disponibilità</h2>
+    <div class="grid2">
+      <ul class="plain">
+        <li><b>Controllo di disponibilità preliminare</b> — scansioni STAT in pipeline costruiscono in pochi secondi una matrice articolo × server: COMPLETO / RIPARABILE / IMPOSSIBILE prima di aver scaricato qualsiasi cosa. I post impossibili si interrompono avendo scaricato quasi nulla.</li>
+        <li><b>Instradamento in unione</b> — un articolo è mancante solo quando ogni server attivo lo ha rifiutato; gli articoli vanno ai server che li hanno. Backbone diversi hanno profili diversi di retention e takedown — l'unione completa post che nessun singolo server può completare.</li>
+        <li><b>Journal a prova di crash</b> — journal a livello di articolo; kill −9 a metà job e riprende, riscaricando solo quanto non era stato persistito. Coda e storico sopravvivono ai riavvii.</li>
+        <li><b>Parcheggio + riprova</b> — i job non riusciti vengono parcheggiati nello storico; Riprova riscarica solo ciò che manca.</li>
+        <li><b>Collaudato al caos</b> — un server NNTP simulato guida 10 scenari di guasto end-to-end (errori 430, corruzione, troncamenti, stalli, server morti, kill −9) a ogni esecuzione dei test.</li>
+      </ul>
+      <ul class="plain">
+        <li><b>Punteggio di affidabilità dei provider</b> — tassi di completamento per server tracciati per sempre e mostrati nella dashboard (avviso &lt;98%).</li>
+        <li><b>Analisi della diversità dei server</b> — campiona con STAT tutti i tuoi server e li raggruppa per lacune condivise: scopri quali dei tuoi provider sono in realtà lo stesso backbone prima di pagare per una ridondanza che non hai.</li>
+        <li><b>Quote, account a blocchi &amp; guardia disco</b> — quote giornaliere/mensili, budget di byte a vita per gli account a blocchi (esclusi automaticamente quando esauriti), pausa a spazio scarso, storico di utilizzo giornaliero per provider.</li>
+        <li><b>Rilevamento duplicati</b> — dupekey/dupescore con promozione dell'alternativa: un prelievo non riuscito promuove automaticamente l'alternativa trattenuta.</li>
+        <li><b>Instradamento consapevole della retention</b> — i post vecchi saltano i server la cui retention non può averli; i post inservibili falliscono all'istante invece di girare a vuoto.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Automazione &amp; integrazioni</h2>
+    <div class="grid2">
+      <ul class="plain">
+        <li><b>API compatibile SABnzbd</b> — l'intera superficie usata dagli *arr: addfile/addurl, categorie, priorità, pausa/ripresa per job, riprova, paginazione, chiavi API a due livelli. Sonarr/Radarr lo trattano come SABnzbd.</li>
+        <li><b>Facciata JSON-RPC NZBGet</b> — nzb360, LunaSea e gli altri telecomandi NZBGet funzionano senza modifiche.</li>
+        <li><b>Server Newznab</b> — il tuo indice locale risponde a t=search/tvsearch/movie: gli *arr possono usare le tue scansioni come indexer.</li>
+        <li><b>Prelievo automatico RSS</b> — feed con un linguaggio di filtri in stile NZBGet; aggiungi e modifica al volo dalla dashboard.</li>
+        <li><b>Watchlist</b> — indica serie e film (anche non ancora usciti); il tracciamento per episodio preleva ciascuno alla prima apparizione, migliora la qualità fino al tuo obiettivo (es. 720p → 1080p REMUX) e, se vuoi, elimina la copia superata solo dopo che l'upgrade è verificato. Il calendario delle messe in onda mostra cosa sta per arrivare.</li>
+      </ul>
+      <ul class="plain">
+        <li><b>Cartella monitorata</b> — lasciaci un .nzb: viene scaricato e il file sparisce.</li>
+        <li><b>Cartelle smart</b> — regole regex/parola chiave/dimensione instradano i download nelle categorie all'accodamento; l'archiviazione TV opzionale rinomina in <code>Show/Season NN/Show - S01E02.ext</code>.</li>
+        <li><b>Regole di pulizia</b> — le estensioni spazzatura vengono eliminate a completamento avvenuto.</li>
+        <li><b>Script di post-elaborazione</b> — il contratto d'ambiente SAB_* di SABnzbd: il tuo ecosistema di script esistente gira così com'è.</li>
+        <li><b>Migrazione in un clic</b> — importa i server dall'ini di SABnzbd o dal conf di NZBGet; legge direttamente sabnzbd.ini se è tutto ciò che trova.</li>
+        <li><b>Ingestione Spotnet</b> — verifica delle firme degli spot e sintesi degli NZB, integrate.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <h2>Indexer &amp; bacheca dei poster</h2>
+    <p class="lead">Scansiona i gruppi che ti interessano in un indice privato, poi sfoglialo come una
+    bacheca di poster. Tutti i metadati arrivano da fonti pubbliche senza chiave, recuperate dalla tua installazione —
+    nessuna chiave API da elemosinare.</p>
+    <figure class="shot"><img src="assets/wall-sheet.jpg" alt="Poster wall detail sheet with rating, cast, synopsis and episode chips" loading="lazy"></figure>
+    <div style="height:26px"></div>
+    <div class="grid2">
+      <ul class="plain">
+        <li><b>Scanner continuo dei gruppi</b> — scansioni OVER incrementali secondo la tua pianificazione, ~43k header/s su connessioni a ventaglio; prime scansioni con bisezione per data (<code>--max-age 2y</code> salta anni di header in ~20 sondaggi).</li>
+        <li><b>Filtri di ingresso</b> — filtri per tipo/anno/risoluzione/lingua/dimensione tengono lo spam da indexer fuori dal tuo database; la robaccia offuscata viene rilevata e filtrata di default.</li>
+        <li><b>Parser dei nomi scene</b> — titolo/anno/episodio/qualità/sorgente dai nomi reali, inclusi i daily con data, i codici multi-episodio, i nomi offuscati in ROT13; le release si deduplicano in una sola scheda per titolo.</li>
+        <li><b>Ricerca istantanea</b> — risultati mentre digiti, con filtri qualità e pulsante Segui su ogni riga; badge di qualità ovunque.</li>
+      </ul>
+      <ul class="plain">
+        <li><b>Arricchimento senza chiavi</b> — TVmaze (serie TV), iTunes Search (film), dataset pubblici di valutazioni, Wikidata, Wikipedia e AniList riempiono poster, valutazioni con conteggio dei voti, cast, generi e trame. Chiavi OMDb/TMDB opzionali supportate, ma mai obbligatorie.</li>
+        <li><b>Griglie episodi</b> — chip per stagione, il miglior encode per episodio, un clic per scaricare; stagioni complete segnalate; «segui la serie» in ogni intestazione di stagione.</li>
+        <li><b>File di tendenza</b> — strisce «nuovi questa settimana» e «caldi adesso» ricavate dalla frequenza dei post.</li>
+        <li><b>Correggi tutto</b> — corrispondenza sbagliata? Scegli tra i candidati o inserisci tu l'identità; i metadati manuali non vengono mai sovrascritti. Poster via URL o caricamento. Un pulsante ri-arricchisce un titolo; un altro azzera e ricostruisce l'intero indice.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Anteprima &amp; libreria</h2>
+    <ul class="plain">
+      <li><b>Anteprima prima che finisca</b> — ▶ Riproduci consegna al player del sistema un .m3u servito dal daemon, così puoi controllare che un download sia quello che volevi senza aspettare che si completi. I seek promuovono gli articoli giusti in testa alla coda.</li>
+      <li><b>Modalità libreria</b> — completamento *arr istantaneo con puntatori .strm; riprodurne uno avvia il download reale a priorità massima, con ri-verifica in background.</li>
+    </ul>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <h2>Dashboard &amp; impostazioni</h2>
+    <div class="strip">
+      <figure><div class="shot"><img src="assets/dash-browse.png" alt="Queue with per-file drawer and index browse card" loading="lazy"></div>
+        <figcaption>Cassetto della coda: barre per file, blocchi di verifica, contributo per server.</figcaption></figure>
+      <figure><div class="shot"><img src="assets/settings-top.png" alt="Settings: server editor and live speed/scheduling controls" loading="lazy"></div>
+        <figcaption>Ogni impostazione modificabile nel browser — la maggior parte si applica al volo.</figcaption></figure>
+      <figure><div class="shot" style="max-width:320px;margin:0 auto"><img src="assets/mobile-dash.png" alt="Phone layout of the dashboard" loading="lazy"></div>
+        <figcaption>Un vero layout per telefono, stesso daemon.</figcaption></figure>
+    </div>
+    <div style="height:10px"></div>
+    <div class="grid2">
+      <ul class="plain">
+        <li><b>Grafici live, zero librerie</b> — polling a 1 s; area della velocità, area impilata per provider, timeline della salute delle verifiche, burn-down della coda, istogramma delle velocità; i grafici allargano la finestra temporale insieme alla finestra del browser.</li>
+        <li><b>Monitor risorse</b> — CPU, RAM (rispetto al budget), scrittura disco e rete in un unico grafico, con avviso di spazio scarso.</li>
+        <li><b>Classifica dei provider</b> — i server si riordinano per prestazioni in tempo reale; byte di sessione, numero di connessioni, utilizzo e affidabilità per provider.</li>
+        <li><b>Gestione della coda</b> — trascina per riordinare, priorità/categoria inline, cassetto dei dettagli per download, pausa ottimistica, «pausa per N minuti».</li>
+      </ul>
+      <ul class="plain">
+        <li><b>Tutto configurabile dal browser</b> — server (con prova di connessione dal vivo), velocità/pianificazione, connessioni/finestra/decoder, disco/quota, cartella monitorata/script, filtri di indicizzazione, libreria, RSS, sicurezza con rotazione delle chiavi. Le impostazioni sopravvivono ai riavvii.</li>
+        <li><b>Diagnostica integrata</b> — visore dei log nell'interfaccia, benchmark di sistema (tetti di rete/calcolo/disco + consigli), analisi della diversità dei server, ottimizzazione connessioni.</li>
+        <li><b>Utilizzo dati</b> — barre impilate per provider su 14 giorni, storico giornaliero, contatori a vita per gli account a blocchi.</li>
+        <li><b>Qualità della vita</b> — trascina un .nzb ovunque, notifiche desktop, suoni di completamento, procedura guidata al primo avvio, <code>serve --open</code>.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Distribuzione</h2>
+    <ul class="plain">
+      <li><b>Un unico eseguibile autonomo</b> — par2 + estrazione RAR sono codice nativo nel binario — nulla viene estratto al primo uso. Nessun runtime, nessun installer.</li>
+      <li><b>macOS di prima classe</b> — binario universale (Apple Silicon + Intel), app nativa SwiftUI nella barra dei menu, unità launchd, formula Homebrew.</li>
+      <li><b>Windows</b> — exe x64 completamente statico, gira su Windows 10/11 di serie; launcher a doppio clic con configurazione guidata.</li>
+      <li><b>Linux &amp; Docker</b> — unità systemd blindata; immagine Docker multi-stage con entrypoint PUID/PGID in stile linuxserver; file compose incluso. <a href="download.it.html">Tutte le piattaforme →</a></li>
+      <li><b>Configurazione guidata</b> — la procedura interattiva <code>nzbfast setup</code>, oppure il rilevamento automatico di una configurazione SABnzbd/NZBGet esistente. Primo download in meno di due minuti.</li>
+    </ul>
+  </div>
+</section>
+
+<footer><div class="wrap">
+  <div class="cols">
+    <div>⚡ <b>nzbfast</b> — il downloader Usenet a passata unica.</div>
+    <div>
+      <a href="features.it.html">Funzionalità</a> ·
+      <a href="benchmarks.it.html">Benchmark</a> ·
+      <a href="download.it.html">Scarica</a> ·
+      <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
+    </div>
+  </div>
+  <p class="fine">Software libero, GPL-3.0-or-later. La riparazione PAR2 e l'estrazione RAR sono codice nativo nel binario — nessuno strumento di terze parti incluso. I metadati della bacheca dei poster provengono da
+  fonti pubbliche senza chiave, recuperate dalla tua installazione.</p>
+</div></footer>
+
+</body>
+</html>

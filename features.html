@@ -4,9 +4,26 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Features — nzbfast</title>
-<meta name="description" content="Every nzbfast feature: the one-pass pipeline, union availability, built-in indexer, poster wall, streaming, watchlist automation, SABnzbd and NZBGet compatible APIs.">
+<meta name="description" content="Every nzbfast feature: the one-pass pipeline, union availability, built-in indexer, poster wall, watchlist automation, SABnzbd and NZBGet compatible APIs.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
+<link rel="alternate" hreflang="en" href="features.html">
+<link rel="alternate" hreflang="fr" href="features.fr.html">
+<link rel="alternate" hreflang="de" href="features.de.html">
+<link rel="alternate" hreflang="it" href="features.it.html">
+<link rel="alternate" hreflang="es" href="features.es.html">
+<link rel="alternate" hreflang="nl" href="features.nl.html">
+<link rel="alternate" hreflang="pt" href="features.pt.html">
+<link rel="alternate" hreflang="sv" href="features.sv.html">
+<link rel="alternate" hreflang="da" href="features.da.html">
+<link rel="alternate" hreflang="nb" href="features.nb.html">
+<link rel="alternate" hreflang="fi" href="features.fi.html">
+<link rel="alternate" hreflang="tr" href="features.tr.html">
+<link rel="alternate" hreflang="ro" href="features.ro.html">
+<link rel="alternate" hreflang="he" href="features.he.html">
+<link rel="alternate" hreflang="ar" href="features.ar.html">
+<link rel="alternate" hreflang="fa" href="features.fa.html">
+<link rel="alternate" hreflang="x-default" href="features.html">
 </head>
 <body>
 
@@ -18,6 +35,8 @@
     <a href="MANUAL.html">Docs</a>
     <a href="https://github.com/nzbfast/nzbfast" title="Source repository">GitHub</a>
     <a class="cta" href="download.html">Download</a>
+    <!-- i18n picker: same markup in every language file; hrefs fixed -->
+    <span class="langsw" style="font-size:11.5px;opacity:.75;margin-inline-start:10px;white-space:nowrap"><a href="features.html">EN</a> · <a href="features.fr.html">FR</a> · <a href="features.de.html">DE</a> · <a href="features.it.html">IT</a> · <a href="features.es.html">ES</a> · <a href="features.nl.html">NL</a> · <a href="features.pt.html">PT</a> · <a href="features.sv.html">SV</a> · <a href="features.da.html">DA</a> · <a href="features.nb.html">NB</a> · <a href="features.fi.html">FI</a> · <a href="features.tr.html">TR</a> · <a href="features.ro.html">RO</a> · <a href="features.he.html">HE</a> · <a href="features.ar.html">AR</a> · <a href="features.fa.html">FA</a></span>
   </nav>
 </div></header>
 
@@ -30,18 +49,18 @@
   <div class="wrap">
     <div class="grid2">
       <ul class="feat">
-        <li><b>Pipelined NNTP at line rate</b> <span class="d">— 8.31 Gbps proven on 10 GbE.</span></li>
-        <li><b>One-pass pipeline</b> <span class="d">— decode → verify → extract overlap; RAR volumes never touch disk.</span></li>
+        <li><b>Pipelined NNTP at line rate</b> <span class="d">— 8.31 Gbps measured on 10 GbE.</span></li>
+        <li><b>One-pass pipeline</b> <span class="d">— decode, verify and extract overlap; RAR volumes never touch disk.</span></li>
         <li><b>Multi-provider union availability</b> <span class="d">— complete from the union of your servers, or abort early.</span></li>
         <li><b>Memory budget</b> <span class="d">— bounded RAM, graceful spill, never swaps.</span></li>
-        <li><b>Streaming with seek</b> <span class="d">— watch while downloading; seeks jump the queue.</span></li>
+        <li><b>Crash-safe resume</b> <span class="d">— article-level journal; kill −9 mid-job and it picks up where it left off.</span></li>
       </ul>
       <ul class="feat">
         <li><b>SABnzbd-compatible + NZBGet JSON-RPC APIs</b> <span class="d">— Sonarr/Radarr/nzb360/LunaSea work unmodified.</span></li>
         <li><b>Built-in indexer</b> <span class="d">— scan groups into a local, searchable, Newznab-serving index.</span></li>
-        <li><b>Poster wall</b> <span class="d">— artwork, ratings, cast, episode grids; zero API keys.</span></li>
+        <li><b>Poster wall</b> <span class="d">— artwork, ratings, cast, episode grids; no API keys.</span></li>
         <li><b>Watchlist auto-grab + quality upgrades</b> <span class="d">— grab on first appearance, upgrade to target quality.</span></li>
-        <li><b>Single self-contained executable</b> <span class="d">— par2 + unrar embedded.</span></li>
+        <li><b>Single self-contained executable</b> <span class="d">— par2 + RAR unpack embedded.</span></li>
       </ul>
     </div>
   </div>
@@ -57,14 +76,14 @@
         <li><b>Multi-server shared queue</b> — providers self-balance within ~2%, no tuning; per-server rate awareness with tail duplicate-dispatch so one slow server can't drag a job's tail.</li>
         <li><b>Cross-job soak</b> — the tail of job N overlaps the start of job N+1: the line stays lit edge-to-edge across a queue (2% idle vs SABnzbd's 61% dark in the bench).</li>
         <li><b>Slow-job watchdog</b> — a download crawling on one slow server while others wait is auto-deferred to the back of the queue (progress kept) and resumed when the queue clears.</li>
-        <li><b>Idle-server prefetch</b> — servers the active job can't use (its articles aren't on them) start the next queued job instead of idling. No other client does cross-job server overlap.</li>
+        <li><b>Idle-server prefetch</b> — servers the active job can't use (its articles aren't on them) start the next queued job instead of idling.</li>
       </ul>
       <ul class="plain">
         <li><b>Connection-tuning ladder</b> — measures each provider's actual throughput knee (asked vs granted connections) instead of guessing.</li>
         <li><b>Auto-speed governor</b> — optional LEDBAT-style RTT governor yields to your household's traffic while using the rest of the line.</li>
         <li><b>Speed limits &amp; weekly scheduler</b> — live-adjustable caps, local-time (DST-safe) schedule, "pause for N minutes" with auto-resume.</li>
-        <li><b>Memory budget (M15)</b> — one global RAM budget (auto: RAM/4, capped; overridable). Overflow degrades gracefully: smaller buffers → spill to disk → settle read-back. Swapping: never. A 190 GB job completes inside a 1 GB budget (~1.1 GB peak RSS); a 2 GB NAS profile is measured and documented.</li>
-        <li><b>Backpressure by design</b> — a slow disk throttles the sockets (proven ±1% lock to a write cap, with RAM <i>falling</i> under pressure).</li>
+        <li><b>Memory budget</b> — one global RAM budget (auto: RAM/4, capped; overridable). When the budget gets tight it shrinks buffers, then spills to disk and reads back once the job settles — it never swaps. A 190 GB job completes inside a 1 GB budget (~1.1 GB peak RSS); a 2 GB NAS profile is measured and documented.</li>
+        <li><b>Backpressure</b> — a slow disk throttles the sockets rather than filling RAM (holds within ±1% of a write cap, with RAM <i>falling</i> under pressure).</li>
         <li><b>Post-job memory trim</b> — the daemon hands freed memory back to the OS when idle (footprint drops to ~8 MB between jobs on macOS).</li>
       </ul>
     </div>
@@ -83,7 +102,7 @@
       </ul>
       <ul class="plain">
         <li><b>Exact-fit repair</b> — damaged blocks are known live; the minimum-byte set of recovery volumes is fetched during the download (knapsack-solved), and repair touches only damaged spans.</li>
-        <li><b>Compressed/encrypted fallback</b> — non-store posts materialise and unpack via the bundled unrar, overlapped with the queue; encrypted sets park with a clear message.</li>
+        <li><b>Compressed/encrypted fallback</b> — non-store posts materialise and unpack via the native RAR engine, overlapped with the queue; encrypted sets park with a clear message.</li>
         <li><b>Password handling</b> — passwords from the *arr API, <code>{{pw}}</code> filename convention, or NZB metadata; a 🔑 unlock on the dashboard handles the rest (background unlock, then normal filing).</li>
         <li><b>Safety rails</b> — repaired source volumes are write-protected during re-extraction; exit codes only say "success" when the end state is actually usable.</li>
       </ul>
@@ -96,7 +115,7 @@
     <h2>Reliability &amp; availability</h2>
     <div class="grid2">
       <ul class="plain">
-        <li><b>Pre-flight availability check</b> — pipelined STAT sweeps build a per-article × per-server matrix in seconds: COMPLETE / REPAIRABLE / IMPOSSIBLE before you've downloaded anything. Impossible posts abort having fetched almost zero bytes.</li>
+        <li><b>Pre-flight availability check</b> — pipelined STAT sweeps build a per-article × per-server matrix in seconds: COMPLETE / REPAIRABLE / IMPOSSIBLE before you've downloaded anything. Impossible posts abort having fetched almost nothing.</li>
         <li><b>Union routing</b> — an article is missing only when every live server refused it; articles route to servers that have them. Different backbones have different retention/takedown profiles — the union completes posts no single server can.</li>
         <li><b>Crash-safe journal</b> — article-level journal; kill −9 mid-job and it resumes, refetching only what wasn't persisted. Queue and history survive restarts.</li>
         <li><b>Park + retry</b> — failed jobs park to history; retry refetches only what's missing.</li>
@@ -139,8 +158,8 @@
 <section class="alt">
   <div class="wrap">
     <h2>Indexer &amp; the poster wall</h2>
-    <p class="lead">Scan the groups you care about into a private index, then browse it like a
-    streaming service. All metadata comes from keyless public sources fetched by your install —
+    <p class="lead">Scan the groups you care about into a private index, then browse it as a
+    poster wall. All metadata comes from keyless public sources fetched by your install —
     there is no API key to beg for.</p>
     <figure class="shot"><img src="assets/wall-sheet.jpg" alt="Poster wall detail sheet with rating, cast, synopsis and episode chips" loading="lazy"></figure>
     <div style="height:26px"></div>
@@ -163,11 +182,9 @@
 
 <section>
   <div class="wrap">
-    <h2>Streaming</h2>
+    <h2>Preview &amp; library</h2>
     <ul class="plain">
-      <li><b>Watch while it downloads</b> — download rate ≫ any media bitrate, so playback can start seconds after queue-add. ▶ Play hands your OS player an .m3u pointing at the daemon's range-serving stream endpoint.</li>
-      <li><b>Real seeking</b> — the byte→article map exists before the download starts, so a seek past the frontier promotes exactly the right articles to the queue front: ~2 s to first byte instead of minutes. File heads and tails (MKV Cues / MP4 moov) are burst first so players can seek immediately.</li>
-      <li><b>Store-mode RAR streaming</b> — inner-file offsets translate exactly through the RAR map; you're streaming out of archives that never existed on disk.</li>
+      <li><b>Preview before it finishes</b> — ▶ Play hands your OS player an .m3u served by the daemon, so you can check a download is what you wanted without waiting for it to complete. Seeks promote the right articles to the queue front.</li>
       <li><b>Library mode</b> — instant *arr completion with .strm pointers; playing one triggers the real download at top priority with background re-verify.</li>
     </ul>
   </div>
@@ -182,13 +199,13 @@
       <figure><div class="shot"><img src="assets/settings-top.png" alt="Settings: server editor and live speed/scheduling controls" loading="lazy"></div>
         <figcaption>Every setting editable in the browser — most apply live.</figcaption></figure>
       <figure><div class="shot" style="max-width:320px;margin:0 auto"><img src="assets/mobile-dash.png" alt="Phone layout of the dashboard" loading="lazy"></div>
-        <figcaption>First-class phone layout, same daemon.</figcaption></figure>
+        <figcaption>Proper phone layout, same daemon.</figcaption></figure>
     </div>
     <div style="height:10px"></div>
     <div class="grid2">
       <ul class="plain">
         <li><b>Live charts, no libraries</b> — 1 s polling; throughput area, per-provider stacked area, verify-health timeline, queue burn-down, speed histogram; charts widen their time window with your browser window.</li>
-        <li><b>Resource monitor</b> — CPU, RAM (vs budget), disk write and network on one chart, with a low-disk warning. No competitor shows the machine.</li>
+        <li><b>Resource monitor</b> — CPU, RAM (vs budget), disk write and network on one chart, with a low-disk warning.</li>
         <li><b>Provider leaderboard</b> — servers re-sort by live performance; per-provider session bytes, connection counts, utilisation, reliability.</li>
         <li><b>Queue management</b> — drag to reorder, inline priority/category, per-download detail drawer, optimistic pause, "pause for N minutes".</li>
       </ul>
@@ -206,7 +223,7 @@
   <div class="wrap">
     <h2>Deployment</h2>
     <ul class="plain">
-      <li><b>Single self-contained executable</b> — par2 + unrar embedded and extracted on first use (their licences ride along). No runtime, no installer.</li>
+      <li><b>Single self-contained executable</b> — par2 + RAR unpack are native code in the binary — nothing extracted on first use. No runtime, no installer.</li>
       <li><b>macOS first-class</b> — universal binary (Apple Silicon + Intel), native SwiftUI menu-bar app, launchd unit, Homebrew formula.</li>
       <li><b>Windows</b> — fully static x64 exe, runs on stock Windows 10/11; double-click launcher with guided setup.</li>
       <li><b>Linux &amp; Docker</b> — hardened systemd unit; multi-stage Docker image with linuxserver-style PUID/PGID entrypoint; compose file included. <a href="download.html">All platforms →</a></li>
@@ -225,9 +242,7 @@
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
     </div>
   </div>
-  <p class="fine">Free software, GPL-3.0-or-later. Bundled tools keep their own licences: unrar
-  (RARLab freeware) and par2 (par2cmdline-turbo, GPL-2.0-or-later), both run as separate
-  processes under an explicit additional permission. Poster-wall metadata comes from keyless
+  <p class="fine">Free software, GPL-3.0-or-later. PAR2 repair and RAR extraction are native code inside the binary — no bundled third-party tools. Poster-wall metadata comes from keyless
   public sources, fetched by your own installation.</p>
 </div></footer>
 

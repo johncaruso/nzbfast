@@ -25,7 +25,7 @@ header .wrap{display:flex;align-items:center;gap:22px;height:58px}
 .logo{display:flex;align-items:center;gap:9px;font-weight:700;font-size:19px;color:var(--fg)}
 .logo:hover{text-decoration:none}
 .logo .bolt{filter:drop-shadow(0 0 8px rgba(77,163,255,.6))}
-nav{display:flex;gap:4px;margin-left:auto}
+nav{display:flex;gap:4px;margin-inline-start:auto}
 nav a{color:var(--dim);font-size:14px;padding:7px 13px;border-radius:8px}
 nav a:hover{color:var(--fg);background:var(--card2);text-decoration:none}
 nav a.on{color:var(--fg)}
@@ -73,20 +73,20 @@ p.lead{color:var(--dim);font-size:17px;max-width:720px;margin:0 0 34px}
 
 /* feature lists */
 ul.feat{list-style:none;padding:0;margin:0}
-ul.feat li{padding:7px 0 7px 28px;position:relative;font-size:15px}
-ul.feat li::before{content:"";position:absolute;left:4px;top:14px;width:8px;height:8px;
+ul.feat li{padding:7px 0;padding-inline-start:28px;position:relative;font-size:15px}
+ul.feat li::before{content:"";position:absolute;inset-inline-start:4px;top:14px;width:8px;height:8px;
   border-radius:3px;background:var(--acc)}
 ul.feat li b{font-weight:650}
 ul.feat li .d{color:var(--dim)}
 ul.plain{list-style:none;padding:0;margin:0}
-ul.plain li{padding:5px 0 5px 24px;position:relative;font-size:14.5px;color:var(--dim)}
-ul.plain li::before{content:"·";position:absolute;left:8px;color:var(--acc);font-weight:800}
+ul.plain li{padding:5px 0;padding-inline-start:24px;position:relative;font-size:14.5px;color:var(--dim)}
+ul.plain li::before{content:"·";position:absolute;inset-inline-start:8px;color:var(--acc);font-weight:800}
 ul.plain li b{color:var(--fg);font-weight:600}
 
 /* tables */
 .tblwrap{overflow-x:auto;border:1px solid var(--line);border-radius:13px;background:var(--card)}
 table{width:100%;border-collapse:collapse;font-size:14.5px;min-width:640px}
-td,th{padding:11px 16px;text-align:left;border-top:1px solid var(--line);vertical-align:top}
+td,th{padding:11px 16px;text-align:start;border-top:1px solid var(--line);vertical-align:top}
 thead th{border-top:none;color:var(--dim);font-weight:600;font-size:12px;
   text-transform:uppercase;letter-spacing:.05em;background:var(--card2)}
 td.win{color:var(--ok);font-weight:700;white-space:nowrap}
@@ -106,7 +106,7 @@ tbody tr:hover{background:color-mix(in srgb,var(--card2) 60%,transparent)}
 .bar .trk i{display:block;height:100%;border-radius:7px;background:var(--dim)}
 .bar.me .trk i{background:linear-gradient(90deg,var(--acc),var(--acc2))}
 .bar.me{font-weight:700}
-.bar .t{text-align:right;font-variant-numeric:tabular-nums;color:var(--dim)}
+.bar .t{text-align:end;font-variant-numeric:tabular-nums;color:var(--dim)}
 .bar.me .t{color:var(--fg)}
 .bar .dnf i{background:repeating-linear-gradient(45deg,var(--bad),var(--bad) 6px,transparent 6px,transparent 12px);opacity:.5}
 
@@ -138,10 +138,10 @@ pre.cmd{background:var(--card2);border:1px solid var(--line);border-radius:10px;
   padding:14px 16px;overflow-x:auto;font:13.5px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace}
 
 /* callouts */
-.callout{border-left:3px solid var(--acc);background:var(--card);border-radius:0 12px 12px 0;
+.callout{border-inline-start:3px solid var(--acc);background:var(--card);border-start-start-radius:0;border-end-start-radius:0;border-start-end-radius:12px;border-end-end-radius:12px;
   padding:16px 20px;font-size:14.5px;color:var(--dim);margin:20px 0}
 .callout b{color:var(--fg)}
-.callout.warn{border-left-color:var(--warn)}
+.callout.warn{border-inline-start-color:var(--warn)}
 
 /* footer */
 footer{border-top:1px solid var(--line);padding:38px 0 50px;margin-top:40px;
@@ -157,3 +157,10 @@ footer .fine{margin-top:22px;font-size:12px;max-width:760px}
   nav a{padding:7px 9px}
 }
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+
+/* §5 2b RTL (he/ar/fa website pages set <html dir="rtl">): the layout
+   mirrors through the logical properties above. Code stays LTR — inline
+   <code>/<kbd> isolated so CLI flags/paths never reorder, and the command
+   listings + the ASCII pipeline diagram render left-to-right, left-aligned. */
+[dir=rtl] code,[dir=rtl] kbd{direction:ltr;unicode-bidi:isolate}
+[dir=rtl] pre,[dir=rtl] pre.cmd,[dir=rtl] .pipe pre{direction:ltr;text-align:left}

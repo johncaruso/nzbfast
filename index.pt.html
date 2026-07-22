@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="pt">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nzbfast — o baixador de NZB mais rápido</title>
+<meta name="description" content="Um baixador da Usenet de passagem única: decodifica, verifica e extrai enquanto baixa. 190 GB até um arquivo verificado e reproduzível em 9 minutos. macOS, Windows, Linux, Docker.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<link rel="stylesheet" href="assets/site.css">
+<link rel="alternate" hreflang="en" href="index.html">
+<link rel="alternate" hreflang="fr" href="index.fr.html">
+<link rel="alternate" hreflang="de" href="index.de.html">
+<link rel="alternate" hreflang="it" href="index.it.html">
+<link rel="alternate" hreflang="es" href="index.es.html">
+<link rel="alternate" hreflang="nl" href="index.nl.html">
+<link rel="alternate" hreflang="pt" href="index.pt.html">
+<link rel="alternate" hreflang="sv" href="index.sv.html">
+<link rel="alternate" hreflang="da" href="index.da.html">
+<link rel="alternate" hreflang="nb" href="index.nb.html">
+<link rel="alternate" hreflang="fi" href="index.fi.html">
+<link rel="alternate" hreflang="tr" href="index.tr.html">
+<link rel="alternate" hreflang="ro" href="index.ro.html">
+<link rel="alternate" hreflang="he" href="index.he.html">
+<link rel="alternate" hreflang="ar" href="index.ar.html">
+<link rel="alternate" hreflang="fa" href="index.fa.html">
+<link rel="alternate" hreflang="x-default" href="index.html">
+</head>
+<body>
+
+<header><div class="wrap">
+  <a class="logo" href="index.pt.html"><span class="bolt">⚡</span> nzbfast</a>
+  <nav>
+    <a href="features.pt.html">Recursos</a>
+    <a href="benchmarks.pt.html">Benchmarks</a>
+    <a href="MANUAL.html">Docs</a>
+    <a href="https://github.com/nzbfast/nzbfast" title="Repositório de código">GitHub</a>
+    <a class="cta" href="download.pt.html">Baixar</a>
+    <!-- i18n picker: same markup in every language file; hrefs fixed -->
+    <span class="langsw" style="font-size:11.5px;opacity:.75;margin-inline-start:10px;white-space:nowrap"><a href="index.html">EN</a> · <a href="index.fr.html">FR</a> · <a href="index.de.html">DE</a> · <a href="index.it.html">IT</a> · <a href="index.es.html">ES</a> · <a href="index.nl.html">NL</a> · <a href="index.pt.html">PT</a> · <a href="index.sv.html">SV</a> · <a href="index.da.html">DA</a> · <a href="index.nb.html">NB</a> · <a href="index.fi.html">FI</a> · <a href="index.tr.html">TR</a> · <a href="index.ro.html">RO</a> · <a href="index.he.html">HE</a> · <a href="index.ar.html">AR</a> · <a href="index.fa.html">FA</a></span>
+  </nav>
+</div></header>
+
+<div class="hero wrap">
+  <h1>Do NZB ao <em>play</em><br>antes de os outros terminarem de baixar.</h1>
+  <p class="sub">O nzbfast é um baixador da Usenet construído em torno de um pipeline de passagem única:
+  cada byte é decodificado, verificado e extraído <b>enquanto baixa</b>.
+  Sem passagem de montagem, sem passagem de verificação, sem passagem de extração — quando a barra de progresso
+  enche, o arquivo está pronto e comprovadamente intacto.</p>
+  <div class="chips">
+    <span class="chip"><b>8,31&nbsp;Gbps</b> em uma linha de 10&nbsp;GbE</span>
+    <span class="chip"><b>190&nbsp;GB → 4m44s</b> até um arquivo verificado</span>
+    <span class="chip">Volumes RAR <b>nunca tocam o disco</b></span>
+    <span class="chip"><b>Metade do disco</b> que os concorrentes precisam</span>
+    <span class="chip">RAM orçada · <b>0 swaps, nunca</b></span>
+  </div>
+  <div class="btnrow">
+    <a class="btn" href="download.pt.html">Baixar</a>
+    <a class="btn ghost" href="benchmarks.pt.html">Ver os números</a>
+  </div>
+  <p class="note">macOS · Windows · Linux · Docker — um executável autossuficiente, com ferramentas de reparo e extração embutidas.</p>
+  <figure class="shot heroShot"><img src="assets/dash-hero.png" alt="Painel do nzbfast em meio a um download a 61 MB/s: vazão com pico de 104 MB/s ao longo de um gráfico de histórico completo, gráficos ao vivo de recursos e por provedor, e as etapas do pipeline de download/verificação/extração se sobrepondo"></figure>
+</div>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Por que é rápido</p>
+    <h2>Três ideias que os clientes convencionais não exploram por completo</h2>
+    <p class="lead">Não é micro-otimização — é arquitetura. Cada uma é medida em
+    <a href="benchmarks.pt.html">nosso benchmark log</a> com comandos reproduzíveis.</p>
+    <div class="grid3">
+      <div class="card"><span class="ic">🔁</span><h3>NNTP com pipeline</h3>
+        <p>Várias solicitações de artigos ficam em trânsito por conexão, então as idas e voltas nunca
+        deixam o socket ocioso — e o TCP nunca degrada sua janela de congestionamento entre artigos.
+        Medido de +12% a +270% sobre o modo serial em quatro sites; uma linha satura com 8
+        conexões em vez de 30–50.</p></div>
+      <div class="card"><span class="ic">🚿</span><h3>O pipeline de passagem única</h3>
+        <p>Os artigos são decodificados por SIMD no lugar, escritos uma vez em seus deslocamentos finais,
+        verificados por PAR2 a partir dos buffers de decodificação, e o conteúdo de RAR em modo armazenamento é
+        extraído <i>durante</i> o download — os volumes nunca existem como arquivos.
+        Escritas em disco = conteúdo × 1,0.</p></div>
+      <div class="card"><span class="ic">🕸️</span><h3>Disponibilidade por união</h3>
+        <p>Um artigo só está "ausente" quando <i>todo</i> backbone configurado o recusou.
+        A contabilidade exata por bloco decide COMPLETE / REPAIRABLE / IMPOSSIBLE antes de
+        desperdiçar bytes, busca o mínimo sob medida de blocos de recuperação e aborta
+        downloads sem esperança em segundos.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">O pipeline</p>
+    <h2>Toque em cada byte uma só vez</h2>
+    <p class="lead">Os concorrentes escrevem os volumes de arquivo, os leem de volta para verificar, os leem
+    de novo para extrair e então escrevem a saída — cerca de 2× escritas e 2× leituras.
+    O nzbfast faz assim:</p>
+    <div class="pipe"><pre>
+socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s per core)
+                   │
+                   ├─▶ <b>pwrite at final offset</b>          (plain posts)
+                   │      └─ or: RAR-map translate ─▶ pwrite straight into the
+                   │         <em>extracted</em> file (store-mode posts — the rar
+                   │         volumes never touch disk)
+                   ├─▶ <b>PAR2 block hasher</b> — every block MD5-verified from the
+                   │      decode buffer; verification finishes with the download
+                   └─▶ <b>availability ledger</b> — block-exact health, live
+</pre></div>
+    <div class="callout">Publicação danificada? Os blocos defeituosos são conhecidos no instante em que seus artigos falham,
+    o <b>mínimo sob medida</b> de volumes de recuperação é buscado <b>durante</b> o download
+    (22 blocos buscados para 20 necessários, na rodada de bench), e o reparo toca apenas os
+    trechos danificados. Publicação impossível? Aborta em segundos tendo baixado quase
+    nada — antes de sua cota perceber.</div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Recursos de destaque</p>
+    <h2>Tudo o que um setup sério precisa</h2>
+    <p class="lead">A lista completa — cada ajuste, cada integração — está na
+    <a href="features.pt.html">página de recursos</a>.</p>
+    <div class="grid2">
+      <ul class="feat">
+        <li><b>Downloads em velocidade de linha</b> <span class="d">— NNTP com pipeline medido a 8,31 Gbps em 10 GbE; o cliente mais rápido em cada leg limpo de benchmark, em todos os tamanhos.</span></li>
+        <li><b>Pipeline de passagem única</b> <span class="d">— decodificação, verificação e extração se sobrepõem; volumes RAR em modo armazenamento nunca chegam ao disco; precisa de 1× de disco onde outros precisam de ~2×.</span></li>
+        <li><b>Disponibilidade por união multiprovedor</b> <span class="d">— roteamento exato por bloco entre backbones; vereditos de preflight; reparo sob medida; aborto antecipado de publicações impossíveis.</span></li>
+        <li><b>Orçamento de memória</b> <span class="d">— um orçamento de RAM global com níveis graduais de spill. Ele nunca faz swap da sua máquina: um trabalho de 190 GB termina dentro de um orçamento de 1 GB (~1,1 GB de pico de RSS).</span></li>
+        <li><b>Retomada à prova de travamento</b> <span class="d">— um diário no nível de artigo faz com que um travamento ou kill −9 no meio do download custe quase nada: ele retoma, rebuscando apenas o que não foi salvo.</span></li>
+      </ul>
+      <ul class="feat">
+        <li><b>APIs de encaixe direto</b> <span class="d">— API compatível com o SABnzbd e JSON-RPC do NZBGet: Sonarr, Radarr, nzb360 e LunaSea funcionam sem modificação. Importação de um clique da sua configuração SAB/NZBGet.</span></li>
+        <li><b>Indexador integrado</b> <span class="d">— varre seus newsgroups para um índice local pesquisável, serve Newznab para que sua pilha *arr também possa pesquisá-lo.</span></li>
+        <li><b>Mural de pôsteres com metadados sem chave</b> <span class="d">— imagens, notas, elenco e sinopses para tudo no seu índice, sem nenhuma chave de API para cadastrar.</span></li>
+        <li><b>Automação de lista de acompanhamento</b> <span class="d">— nomeie uma série ou filme (estreado ou não); é capturado no momento em que aparece, depois tem a qualidade melhorada até atingir seu alvo.</span></li>
+        <li><b>Um único executável</b> <span class="d">— reparo (par2) e extração (RAR) viajam dentro do binário. Descompacte, execute, pronto.</span></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">Benchmarks</p>
+    <h2>190,6 GB → um arquivo verificado de 167,9 GB</h2>
+    <p class="lead">Mesma máquina, mesmos seis provedores, execuções intercaladas uma atrás da outra.
+    Tempo até existir um arquivo utilizável e extraído — a única métrica que importa.
+    Cada concorrente ajustado ao seu melhor documentado (inclusive ligando o pipeline do SABnzbd,
+    que vem <i>desligado</i>).</p>
+    <div class="bars">
+      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:24%"></i></span><span class="t">4m 44s</span></div>
+      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:36%"></i></span><span class="t">7m 06s · +50%</span></div>
+      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 31s · +312%</span></div>
+      <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">nenhum arquivo utilizável</span></div>
+    </div>
+    <p class="note" style="text-align:left">NZB de 190,6 GB → um único mkv de 167,9 GB, M1 Ultra em 10 GbE, 6 provedores × 8 conexões.
+    O mesmo trabalho termina dentro de um orçamento de memória de 1 GB. Tabelas completas, seis cenários e os legs que <i>perdemos</i> — além de como reproduzir —
+    na <a href="benchmarks.pt.html">página de benchmarks</a>.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">A vitrine</p>
+    <h2>Seu índice, apresentado como um mural de pôsteres</h2>
+    <p class="lead">O indexador integrado varre os newsgroups que você se importa; o mural transforma
+    o resultado em pôsteres, notas, elenco e grades de episódios — usando apenas fontes públicas
+    sem chave, buscadas pela sua própria instalação. Clique num chip de episódio para baixá-lo.</p>
+    <figure class="shot"><img src="assets/wall-grid.jpg" alt="Mural de pôsteres do nzbfast: uma grade de pôsteres de TV com emblemas de qualidade, notas e contagens de temporadas" loading="lazy"></figure>
+    <div style="height:18px"></div>
+    <div class="strip">
+      <figure><div class="shot"><img src="assets/wall-sheet.jpg" alt="Folha de detalhes de uma série: pano de fundo, nota do IMDb, elenco, sinopse, chips de download por episódio" loading="lazy"></div>
+        <figcaption>Notas, elenco, sinopse, grade de episódios — sem chaves de API, nunca.</figcaption></figure>
+      <figure><div class="shot"><img src="assets/dash-queue-drawer.png" alt="Fila com uma gaveta de detalhes por download: barras de progresso por arquivo, blocos de verificação, contribuição por servidor" loading="lazy"></div>
+        <figcaption>Cada download se abre em progresso por arquivo, estado de verificação ao vivo e contribuição por servidor.</figcaption></figure>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">Encaixa no seu setup</p>
+    <h2>Aponte suas ferramentas existentes para ele</h2>
+    <div class="grid3">
+      <div class="card"><h3>Sonarr / Radarr</h3><p>API totalmente compatível com o SABnzbd — adicione o nzbfast como
+        cliente de download "SABnzbd" e simplesmente funciona: capturas, categorias, prioridades, repetições,
+        scripts de pós-processamento (contrato SAB_*), histórico. A fachada Newznab também permite que os
+        *arrs <i>pesquisem seu índice local</i> como se fosse um indexador.</p></div>
+      <div class="card"><h3>nzb360 / LunaSea</h3><p>O daemon também fala o JSON-RPC do NZBGet —
+        os populares controles remotos de celular pilotam o nzbfast sem modificação. E o próprio painel tem um
+        layout de celular de primeira classe para quando você está longe da tela grande.</p></div>
+      <div class="card"><h3>Vindo do SAB ou do NZBGet?</h3><p>Um clique importa seus servidores de
+        uma instalação existente do SABnzbd ou do NZBGet (também lê sabnzbd.ini diretamente). Pastas
+        monitoradas, feeds RSS com filtros, pastas inteligentes com arquivamento de TV e regras de limpeza vêm
+        junto na viagem.</p></div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap" style="text-align:center">
+    <h2>Experimente nos próximos dois minutos</h2>
+    <p class="lead" style="margin-left:auto;margin-right:auto">Descompacte, dê duplo clique no lançador, responda
+    três perguntas (ou deixe-o encontrar sua configuração do SABnzbd), e o painel abre. Primeiro
+    download em dois minutos.</p>
+    <div class="btnrow">
+      <a class="btn" href="download.pt.html">Baixar o nzbfast</a>
+      <a class="btn ghost" href="features.pt.html">Ler a lista completa de recursos</a>
+    </div>
+  </div>
+</section>
+
+<footer><div class="wrap">
+  <div class="cols">
+    <div>⚡ <b>nzbfast</b> — o baixador da Usenet de passagem única.</div>
+    <div>
+      <a href="features.pt.html">Recursos</a> ·
+      <a href="benchmarks.pt.html">Benchmarks</a> ·
+      <a href="download.pt.html">Baixar</a> ·
+      <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
+    </div>
+  </div>
+  <p class="fine">Software livre, GPL-3.0-or-later. O reparo PAR2 e a extração RAR são código nativo dentro do binário — sem ferramentas de terceiros incluídas. Os metadados do mural de pôsteres vêm de fontes
+  públicas sem chave (TVmaze, iTunes Search, conjuntos de dados públicos, Wikidata, Wikipédia, AniList),
+  buscadas pela sua própria instalação. O nzbfast baixa o que você mandar — você é
+  responsável pelo que isso for.</p>
+</div></footer>
+
+</body>
+</html>

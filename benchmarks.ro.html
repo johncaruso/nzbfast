@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="ro">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Benchmark-uri — nzbfast</title>
+<meta name="description" content="nzbfast vs SABnzbd, NZBGet și rustnzb: 4 clienți × 6 scenarii pe hardware identic. Rezultate oneste, inclusiv probele pe care nzbfast le-a pierdut, cu pași de reproducere.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<link rel="stylesheet" href="assets/site.css">
+<link rel="alternate" hreflang="en" href="benchmarks.html">
+<link rel="alternate" hreflang="fr" href="benchmarks.fr.html">
+<link rel="alternate" hreflang="de" href="benchmarks.de.html">
+<link rel="alternate" hreflang="it" href="benchmarks.it.html">
+<link rel="alternate" hreflang="es" href="benchmarks.es.html">
+<link rel="alternate" hreflang="nl" href="benchmarks.nl.html">
+<link rel="alternate" hreflang="pt" href="benchmarks.pt.html">
+<link rel="alternate" hreflang="sv" href="benchmarks.sv.html">
+<link rel="alternate" hreflang="da" href="benchmarks.da.html">
+<link rel="alternate" hreflang="nb" href="benchmarks.nb.html">
+<link rel="alternate" hreflang="fi" href="benchmarks.fi.html">
+<link rel="alternate" hreflang="tr" href="benchmarks.tr.html">
+<link rel="alternate" hreflang="ro" href="benchmarks.ro.html">
+<link rel="alternate" hreflang="he" href="benchmarks.he.html">
+<link rel="alternate" hreflang="ar" href="benchmarks.ar.html">
+<link rel="alternate" hreflang="fa" href="benchmarks.fa.html">
+<link rel="alternate" hreflang="x-default" href="benchmarks.html">
+</head>
+<body>
+
+<header><div class="wrap">
+  <a class="logo" href="index.ro.html"><span class="bolt">⚡</span> nzbfast</a>
+  <nav>
+    <a href="features.ro.html">Funcții</a>
+    <a href="benchmarks.ro.html" class="on">Benchmark-uri</a>
+    <a href="MANUAL.html">Documentație</a>
+    <a href="https://github.com/nzbfast/nzbfast" title="Source repository">GitHub</a>
+    <a class="cta" href="download.ro.html">Descarcă</a>
+    <!-- i18n picker: same markup in every language file; hrefs fixed -->
+    <span class="langsw" style="font-size:11.5px;opacity:.75;margin-inline-start:10px;white-space:nowrap"><a href="benchmarks.html">EN</a> · <a href="benchmarks.fr.html">FR</a> · <a href="benchmarks.de.html">DE</a> · <a href="benchmarks.it.html">IT</a> · <a href="benchmarks.es.html">ES</a> · <a href="benchmarks.nl.html">NL</a> · <a href="benchmarks.pt.html">PT</a> · <a href="benchmarks.sv.html">SV</a> · <a href="benchmarks.da.html">DA</a> · <a href="benchmarks.nb.html">NB</a> · <a href="benchmarks.fi.html">FI</a> · <a href="benchmarks.tr.html">TR</a> · <a href="benchmarks.ro.html">RO</a> · <a href="benchmarks.he.html">HE</a> · <a href="benchmarks.ar.html">AR</a> · <a href="benchmarks.fa.html">FA</a></span>
+  </nav>
+</div></header>
+
+<div class="hero wrap" style="padding-bottom:6px">
+  <h1>Măsurat, nu <em>promovat</em>.</h1>
+  <p class="sub">Patru clienți, șase scenarii, hardware și provideri identici, rulări
+  intercalate ca variația providerilor să se anuleze. Măsura este <b>timpul până la un fișier utilizabil</b> —
+  descărcat, verificat, extras. Include cele două probe pe care le-am pierdut.</p>
+</div>
+
+<section style="padding-top:26px">
+  <div class="wrap">
+    <p class="kicker">Mai întâi metodologia</p>
+    <h2>Configurația</h2>
+    <ul class="plain">
+      <li><b>Clienți:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (cel mai apropiat omolog Rust), toți pe aceeași mașină per scenariu (mașini Apple din seria M: „Europa” M1 Ultra pe 10&nbsp;GbE, „Coasta de Est” M3 Ultra pe o linie de ~2.4–3.0 Gbps).</li>
+      <li><b>Corectitudine:</b> aceiași 6 provideri × 8 conexiuni, TLS peste tot, probele rulate una după alta, intercalat. Fiecare concurent reglat la maximul său documentat: SABnzbd a primit <code>pipelining_requests=8</code> (<b>vine cu 1 — adică fără pipelining</b>; doar acea setare i-a redus timpul pe 190 GB de la 24m24s la 19m02s), NZBGet a primit ArticleCache/DirectWrite/DirectUnpack/ParQuick, rustnzb configurația sa documentată.</li>
+      <li><b>Stare finală:</b> un fișier verificat, extras, utilizabil — nu „descărcare terminată”. Asta e ce aștepți de fapt.</li>
+      <li><b>Reproductibilitate:</b> fiecare afirmație se leagă de o intrare datată în jurnalul nostru de benchmark, înregistrată cu scripturile driver care au produs-o: timp real + contoare de octeți pe interfață + RSS de vârf pe arborele de procese, rezoluție 1–2 s.</li>
+    </ul>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">Scenariul 1 · curat, uriaș</p>
+    <h2>190.6 GB → un singur mkv de 167.9 GB (Europa, 10 GbE)</h2>
+    <div class="bars">
+      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:24%"></i></span><span class="t">4m 44s</span></div>
+      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:36%"></i></span><span class="t">7m 06s · +50%</span></div>
+      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 31s · +312%</span></div>
+      <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">no output¹</span></div>
+    </div>
+    <div class="tblwrap"><table>
+      <thead><tr><th></th><th>nzbfast</th><th>NZBGet 26.2</th><th>SABnzbd 5.0.4</th><th>rustnzb 1.3.4</th></tr></thead>
+      <tbody>
+        <tr><td>timp până la fișierul utilizabil</td><td class="win">4m 44s</td><td class="lose">7m 06s (+50%)</td><td class="lose">19m 31s (+312%)</td><td class="bad">none¹</td></tr>
+        <tr><td>GB pe fir</td><td class="win num">169.3</td><td class="num">169.6</td><td class="num">169.6</td><td class="num">186.6</td></tr>
+        <tr><td>RSS de vârf</td><td class="num">6.8 GB²</td><td class="num">1.8 GB</td><td class="num">1.8 GB</td><td class="win num">0.6 GB</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:left">¹ rustnzb a raportat jobul terminat la 5m 42s după ce a tras
+    186.6 GB — cu 10% mai mult trafic decât oricine — dar nu a lăsat <b>niciun fișier de ieșire</b>. A eșuat și
+    acest scenariu în runda anterioară („121,975 articole lipsă”, 71 GB orfani).
+    · ² memoria nzbfast urmează <em>bugetul configurat</em>, nu jobul: această probă a rulat pe
+    bugetul auto implicit; limitat la <b>1 GB</b>, același job de 190 GB tot se finalizează, cu aproximativ 22%
+    mai lent — vezi scara de memorie redusă mai jos. În runda anterioară de pe Coasta de Est (linie de ~2.4–3 Gbps),
+    același scenariu a rulat 9m 00s față de NZBGet +30% și SABnzbd +111% — diferența se menține la diferite viteze de linie.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Scenariul 2 · diferența crește cu dimensiunea</p>
+    <h2>Timp până la fișierul utilizabil, după dimensiunea jobului</h2>
+    <p class="lead">O singură trecere înseamnă fără trecere de verificare/dezarhivare după descărcare — așa că, cu cât jobul e mai mare,
+    cu atât aterizează mai în față. Rulări secvențiale pe aceeași mașină:</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>Job</th><th>nzbfast</th><th>NZBGet</th><th>SABnzbd</th></tr></thead>
+      <tbody>
+        <tr><td>7.4 GB REMUX (Europa, 10 GbE)</td><td class="win">13.7 s</td><td class="lose">17.3 s (+26%)</td><td class="lose">19.0 s (+39%)</td></tr>
+        <tr><td>35 GB 4K obfuscat (Europa)</td><td class="win">67 s</td><td class="lose">108 s (+61%)</td><td class="lose">285 s (+325%)</td></tr>
+        <tr><td>87 GB 4K (Coasta de Est)</td><td class="win">272 s</td><td class="lose">370 s (+36%)</td><td class="lose">708 s (+160%)</td></tr>
+        <tr><td>87 GB pe un disc cu 97 GB liberi (Europa)</td><td class="win">3m 08s</td><td class="bad">cannot run²</td><td class="bad">cannot run²</td></tr>
+        <tr><td>190.6 GB (Coasta de Est)</td><td class="win">9m 00s</td><td class="lose">11m 43s (+30%)</td><td class="lose">19m 02s (+111%)</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:left">² Amprenta lor de vârf (volume + ieșire dezarhivată
+    simultan, ~156 GB) a depășit cei 97 GB liberi. O singură trecere are nevoie de 1× dimensiunea conținutului —
+    înjumătățește discul de care ai nevoie, nu doar timpul.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">Scenariul 3 · postare obfuscată</p>
+    <h2>35 GB 4K cu nume de tip hash → mkv utilizabil (Coasta de Est)</h2>
+    <div class="tblwrap"><table>
+      <thead><tr><th></th><th>nzbfast</th><th>NZBGet</th><th>SABnzbd</th><th>rustnzb</th></tr></thead>
+      <tbody>
+        <tr><td>timp până la fișierul utilizabil</td><td class="win">96 s</td><td class="lose">153 s (+59%)</td><td class="lose">259 s (+170%)</td><td class="bad">no usable file³</td></tr>
+        <tr><td>RSS de vârf</td><td class="win num">1.55 GB</td><td class="num">3.7 GB</td><td class="num">8.8 GB</td><td class="num">3.6 GB</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:left">³ rustnzb a descărcat în 119 s, a marcat jobul
+    <i>Completed</i> — și a livrat volumele obfuscate brute: fără redenumire, fără extragere.
+    nzbfast a deobfuscat din metadatele PAR2 și a extras în flux, zero blocuri citite înapoi.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Scenariul 4 · coadă de trei</p>
+    <h2>Menținerea liniei aprinse de-a lungul unei cozi (Coasta de Est, ~43 GB)</h2>
+    <div class="tblwrap"><table>
+      <thead><tr><th></th><th>nzbfast</th><th>rustnzb</th><th>NZBGet</th><th>SABnzbd</th></tr></thead>
+      <tbody>
+        <tr><td>timp real al cozii</td><td class="win">122 s</td><td class="num">136 s</td><td class="num">162 s</td><td class="num">277 s</td></tr>
+        <tr><td>linie inactivă (&lt;20 MB/s)</td><td class="win">2 s (2%)</td><td class="num">16 s (12%)</td><td class="num">0 s</td><td class="bad">168 s (61%)</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:left">Trei forme ale aceleiași probleme: suprapunerea cozii nzbfast
+    ține linia ocupată de la un capăt la altul; NZBGet nu stă niciodată inactiv, dar rulează cu ~35% mai lent în timp ce dezarhivează
+    concurent; SABnzbd descarcă rapid, apoi lasă linia <b>întunecată 61% din timp</b> în timpul
+    post-procesării seriale. În varianta de reziliență (un job cu antete RAR criptate),
+    coada SABnzbd s-a înțepenit pe jobul criptat și doar 1 din 3 joburi s-a finalizat vreodată; nzbfast
+    l-a parcat cu un mesaj clar și a terminat restul.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">Coloana onestă</p>
+    <h2>Două probe pe care le-am pierdut — una acum închisă</h2>
+    <div class="grid2">
+      <div class="card"><h3>Postare deteriorată în mod store</h3>
+        <p>20 de articole otrăvite într-un REMUX de 7.4 GB: NZBGet a terminat cu un fișier utilizabil în <b>53 s</b>; nzbfast
+        acum durează <b>58 s</b> — reparare completă în 32 s, toate cele 62 de volume reextrase, ieșire exactă
+        la octet. Bug-ul de stare finală pe care un build anterior îl avea pe exact această cale (volume reparate
+        distruse de reextragere în timp ce codul de ieșire spunea succes) este rezolvat, testat pentru regresie
+        și revalidat pe Usenet real. Repararea noastră tot preia 22 de blocuri de recuperare, aproape de
+        minimul teoretic, pentru 20 necesare, față de trecerea PAR2 completă a lor — dar NZBGet câștigă proba la
+        cinci secunde, așa că e trecută aici.</p></div>
+      <div class="card"><h3>reluare kill −9 — închisă</h3>
+        <p>Oprit la ~15 GB dintr-un job de 34.5 GB, acesta era cândva cel mai prost număr al nostru: NZBGet a redescărcat
+        <b>~0.6 GB</b>, nzbfast <b>15 GB</b> — tot ce a fost decodat înainte de activarea PAR2 a murit odată cu
+        procesul. Jurnalul înregistrează acum plasarea fizică a fiecărui articol, așa că o reluare
+        restaurează acei octeți din fișierele de ieșire ale rulării anterioare (o copie pe discul local, fiecare
+        octet reverificat în raport cu harta de blocuri PAR2) și redescarcă <b>~0.3 GB</b> — paritate
+        în limita zgomotului providerilor. SABnzbd, pentru consemnare, nu s-a recuperat niciodată din acest scenariu în
+        trei runde: oprit în același mod, a repreluat 0.5 GB într-o oră și a expirat.</p></div>
+    </div>
+    <div class="callout">De ce publicăm pierderile? Pentru că victoriile sunt credibile doar alături de ele.
+    Fiecare număr de pe această pagină provine din aceleași rulări intercalate, iar
+    jurnalul nostru de benchmark din repo este un caiet de laborator complet — cu rezultate negative incluse.</div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Scenariul 6 · înfometează-l de RAM</p>
+    <h2>Scara de memorie redusă — 190 GB în ~1.1 GB de RAM</h2>
+    <p>Aceleași patru joburi, rerulate la bugete de memorie stricte de 2 GB, 1 GB și 256 MB —
+    ce ar alege dimensionatorul automat pe o mașină de 8 GB, una de 4 GB și un NAS de 2 GB. Fiecare
+    probă a produs un fișier corect, complet verificat și extras; RSS de vârf a urmărit
+    <em>bugetul</em>, nu jobul. Timp până la fișierul utilizabil, linie de 10 GbE:</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>Dimensiunea jobului</th><th>suficient RAM</th><th>buget 2 GB</th><th>buget 1 GB</th><th>buget 256 MB</th></tr></thead>
+      <tbody>
+        <tr><td>7 GB</td><td class="num">15 s</td><td class="num">15 s</td><td class="num">15 s</td><td class="num">15 s</td></tr>
+        <tr><td>35 GB</td><td class="num">65 s</td><td class="num">70 s</td><td class="num">70 s</td><td class="num">65 s</td></tr>
+        <tr><td>87 GB</td><td class="num">148 s</td><td class="num">206 s</td><td class="num">196 s</td><td class="num">180 s</td></tr>
+        <tr><td>190 GB</td><td class="num">330 s</td><td class="num">427 s</td><td class="num">402 s</td><td class="num">411 s</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:left">Suplimentul de 20–40% la joburile mari este un
+    artefact al 10 GbE: blocurile trecute pe disc costă timp doar când linia întrece discul. Același
+    job de 87 GB la aceleași bugete pe o linie de ~2.4 Gbps a măsurat −1% până la +7% — zgomot.
+    Pe o conexiune casnică tipică, un buget mic este aproape gratuit la orice dimensiune de job. Un
+    profil de NAS (2 conexiuni, buget de 256 MB) a terminat jobul de 35 GB cu 0.4 GB RSS de vârf
+    — un NAS de 2 GB poate rula asta. Niciun alt client nu oferă vreun plafon de memorie.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">Capabilitate, nu micro-benchmark-uri</p>
+    <h2>Ce poate face fiecare client</h2>
+    <div class="tblwrap"><table>
+      <thead><tr><th></th><th>nzbfast</th><th>SABnzbd 5</th><th>NZBGet 26</th><th>rustnzb</th><th>Usenapp</th><th>Newsbin</th></tr></thead>
+      <tbody>
+        <tr><td>NNTP cu pipelining</td><td class="yes">yes</td><td class="half">off by default</td><td class="no">no</td><td class="yes">yes</td><td class="no">—</td><td class="no">—</td></tr>
+        <tr><td>verificare completă în timpul descărcării</td><td class="yes">every block</td><td class="no">after</td><td class="half">quick-check</td><td class="no">after</td><td class="no">after</td><td class="no">after</td></tr>
+        <tr><td>extragere în timpul descărcării</td><td class="yes">in-stream, no volumes on disk</td><td class="half">direct unpack⁴</td><td class="half">direct unpack⁴</td><td class="half">unreliable⁵</td><td class="no">no</td><td class="no">no</td></tr>
+        <tr><td>disc necesar pentru o postare de N GB</td><td class="yes">~1×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td></tr>
+        <tr><td>verdict de completabilitate înainte de descărcare</td><td class="yes">block-exact</td><td class="no">no</td><td class="half">health %</td><td class="no">no</td><td class="yes">article check</td><td class="no">no</td></tr>
+        <tr><td>memorie limitată (fără swap niciodată)</td><td class="yes">budgeted</td><td class="no">9.3 GB @ 190 GB</td><td class="half">cache setting</td><td class="no">no</td><td class="no">—</td><td class="no">—</td></tr>
+        <tr><td>previzualizare + derulare în timpul descărcării</td><td class="yes">yes</td><td class="no">no</td><td class="no">no</td><td class="no">no</td><td class="half">sequential</td><td class="no">no</td></tr>
+        <tr><td>indexer integrat + perete de postere</td><td class="yes">yes, keyless</td><td class="no">no</td><td class="no">no</td><td class="no">no</td><td class="half">search UI</td><td class="half">group browser</td></tr>
+        <tr><td>drop-in Sonarr/Radarr</td><td class="yes">SAB API + Newznab</td><td class="yes">native</td><td class="yes">native</td><td class="half">partial</td><td class="no">no</td><td class="no">no</td></tr>
+        <tr><td>telecomenzi de telefon (nzb360/LunaSea)</td><td class="yes">via NZBGet RPC</td><td class="yes">yes</td><td class="yes">yes</td><td class="no">no</td><td class="no">no</td><td class="no">no</td></tr>
+        <tr><td>preluare automată watchlist + upgrade-uri</td><td class="yes">built in</td><td class="no">via *arr</td><td class="no">via *arr</td><td class="no">no</td><td class="yes">Watchdog</td><td class="half">rules</td></tr>
+        <tr><td>binar unic de sine stătător</td><td class="yes">yes</td><td class="no">Python</td><td class="yes">yes</td><td class="yes">yes</td><td class="yes">.app</td><td class="yes">.exe</td></tr>
+        <tr><td>open source</td><td class="yes">GPL⁶</td><td class="yes">GPL</td><td class="yes">GPL</td><td class="yes">yes</td><td class="no">paid</td><td class="no">paid</td></tr>
+        <tr><td>platforme</td><td class="yes">mac/win/linux/docker</td><td class="yes">mac/win/linux</td><td class="yes">mac/win/linux</td><td class="half">linux/win</td><td class="no">mac only</td><td class="no">win only</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:left">⁴ Dezarhivarea directă tot materializează întâi volumele —
+    2× scrieri și 2× disc. ⁵ rustnzb a livrat volume obfuscate marcate „Completed” în runda noastră
+    (dezarhivarea sa se și blochează cu unrar RARLab dacă nu e dezactivată). ⁶ GPL-3.0-or-later.
+    Usenapp/Newsbin sunt cititoare comerciale mono-platformă cu funcții de descărcare; sunt
+    listate pentru că oamenii întreabă, nu pentru că ar concura la viteză.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Dovada de transport</p>
+    <h2>Motorul saturează linii reale</h2>
+    <ul class="plain">
+      <li><b>8.31 Gbps agregat</b> pe o linie de 10 GbE măsurată la 8.2 Gbps (Europa M1 Ultra, 4 provideri, 14,000 de articole, 0 erori, 0 reconectări).</li>
+      <li><b>9.16–9.27 Gbps</b> tic-uri de transport constante pe aceeași linie — ≈98% din goodput-ul TCP practic.</li>
+      <li><b>5.44 Gbps susținut</b> pe tot parcursul unui job complet de 20.4 GB <i>inclusiv</i> verificarea în flux.</li>
+      <li><b>Pipelining replicat la fiecare RTT</b>: +64% la 63 ms Starlink, +170–177% la 14 ms datacenter, +270% la 31 ms Coasta de Est — învinge degradarea ferestrei de congestie TCP, nu doar latența.</li>
+      <li><b>Dovadă de contrapresiune</b>: limitează etapa de scriere de 4× sub rețea și intrarea se blochează la plafon ±1% în 2 s, RAM-ul <i>scade</i>, zero swap-uri — un disc lent nu poate umfla niciodată memoria.</li>
+      <li><b>Marjă de calcul</b>: plafoane măsurate de decodare+verificare de 86–165 Gbps pe Apple silicon — rețeaua este strangularea cu 4–50× pe fiecare mașină testată.</li>
+    </ul>
+    <div class="callout">Regulă permanentă din repo: <b>fiecare afirmație de performanță citează o comandă
+    reproductibilă și condițiile în care a rulat.</b> Caietul de laborator complet — inclusiv rezultatele
+    negative și pașii greșiți — este ținut ca un caiet de laborator datat.</div>
+  </div>
+</section>
+
+<footer><div class="wrap">
+  <div class="cols">
+    <div>⚡ <b>nzbfast</b> — descărcătorul Usenet într-o singură trecere.</div>
+    <div>
+      <a href="features.ro.html">Funcții</a> ·
+      <a href="benchmarks.ro.html">Benchmark-uri</a> ·
+      <a href="download.ro.html">Descarcă</a> ·
+      <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
+    </div>
+  </div>
+  <p class="fine">Date de benchmark: runda competitivă din 19–20 iulie 2026. Versiuni de
+  client: SABnzbd 5.0.4, NZBGet 26.2 (fork nzbget.com), rustnzb 1.3.4. Dacă o versiune mai nouă a
+  oricărui client schimbă semnificativ un rezultat, vom rerula și actualiza.</p>
+</div></footer>
+
+</body>
+</html>

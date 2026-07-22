@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>בדיקות ביצועים — nzbfast</title>
+<meta name="description" content="nzbfast מול SABnzbd, NZBGet ו-rustnzb: 4 קליינטים × 6 תרחישים על חומרה זהה. תוצאות כנות כולל המקטעים ש-nzbfast הפסיד, עם שלבי שחזור.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<link rel="stylesheet" href="assets/site.css">
+<link rel="alternate" hreflang="en" href="benchmarks.html">
+<link rel="alternate" hreflang="fr" href="benchmarks.fr.html">
+<link rel="alternate" hreflang="de" href="benchmarks.de.html">
+<link rel="alternate" hreflang="it" href="benchmarks.it.html">
+<link rel="alternate" hreflang="es" href="benchmarks.es.html">
+<link rel="alternate" hreflang="nl" href="benchmarks.nl.html">
+<link rel="alternate" hreflang="pt" href="benchmarks.pt.html">
+<link rel="alternate" hreflang="sv" href="benchmarks.sv.html">
+<link rel="alternate" hreflang="da" href="benchmarks.da.html">
+<link rel="alternate" hreflang="nb" href="benchmarks.nb.html">
+<link rel="alternate" hreflang="fi" href="benchmarks.fi.html">
+<link rel="alternate" hreflang="tr" href="benchmarks.tr.html">
+<link rel="alternate" hreflang="ro" href="benchmarks.ro.html">
+<link rel="alternate" hreflang="he" href="benchmarks.he.html">
+<link rel="alternate" hreflang="ar" href="benchmarks.ar.html">
+<link rel="alternate" hreflang="fa" href="benchmarks.fa.html">
+<link rel="alternate" hreflang="x-default" href="benchmarks.html">
+</head>
+<body>
+
+<header><div class="wrap">
+  <a class="logo" href="index.he.html"><span class="bolt">⚡</span> nzbfast</a>
+  <nav>
+    <a href="features.he.html">תכונות</a>
+    <a href="benchmarks.he.html" class="on">בדיקות ביצועים</a>
+    <a href="MANUAL.html">מסמכים</a>
+    <a href="https://github.com/nzbfast/nzbfast" title="Source repository">GitHub</a>
+    <a class="cta" href="download.he.html">הורדה</a>
+    <!-- i18n picker: same markup in every language file; hrefs fixed -->
+    <span class="langsw" style="font-size:11.5px;opacity:.75;margin-inline-start:10px;white-space:nowrap"><a href="benchmarks.html">EN</a> · <a href="benchmarks.fr.html">FR</a> · <a href="benchmarks.de.html">DE</a> · <a href="benchmarks.it.html">IT</a> · <a href="benchmarks.es.html">ES</a> · <a href="benchmarks.nl.html">NL</a> · <a href="benchmarks.pt.html">PT</a> · <a href="benchmarks.sv.html">SV</a> · <a href="benchmarks.da.html">DA</a> · <a href="benchmarks.nb.html">NB</a> · <a href="benchmarks.fi.html">FI</a> · <a href="benchmarks.tr.html">TR</a> · <a href="benchmarks.ro.html">RO</a> · <a href="benchmarks.he.html">HE</a> · <a href="benchmarks.ar.html">AR</a> · <a href="benchmarks.fa.html">FA</a></span>
+  </nav>
+</div></header>
+
+<div class="hero wrap" style="padding-bottom:6px">
+  <h1>נמדד, לא <em>משווק</em>.</h1>
+  <p class="sub">ארבעה קליינטים, שישה תרחישים, חומרה וספקים זהים, הרצות
+  משולבות כך שסחיפת הספק מתקזזת. המדד הוא <b>זמן לקובץ שמיש</b> —
+  מורד, מאומת, מחולץ. כולל את שני המקטעים שהפסדנו.</p>
+</div>
+
+<section style="padding-top:26px">
+  <div class="wrap">
+    <p class="kicker">קודם המתודולוגיה</p>
+    <h2>המערך</h2>
+    <ul class="plain">
+      <li><b>קליינטים:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (העמית הקרוב ביותר ב-Rust), כולם על אותה מכונה לכל תרחיש (מכונות Apple מסדרת M: "אירופה" M1 Ultra על 10&nbsp;GbE, "החוף המזרחי" M3 Ultra קו ~2.4–3.0 Gbps).</li>
+      <li><b>הוגנות:</b> אותם 6 ספקים × 8 חיבורים, TLS בכל מקום, המקטעים רצים משולבים בזה אחר זה. כל מתחרה מכוונן למיטבו המתועד: SABnzbd קיבל <code>pipelining_requests=8</code> (<b>הוא מגיע עם 1 — כלומר ללא צנרת</b>; הגדרה זו לבדה הורידה את זמן ה-190 GB שלו מ-24m24s ל-19m02s), NZBGet קיבל ArticleCache/DirectWrite/DirectUnpack/ParQuick, ו-rustnzb את התצורה המתועדת שלו.</li>
+      <li><b>מצב סופי:</b> קובץ מאומת, מחולץ, שמיש — לא "ההורדה הסתיימה". לזה אתה באמת מחכה.</li>
+      <li><b>ניתנות לשחזור:</b> כל טענה מתחקה לרשומה מתוארכת ביומן בדיקות הביצועים שלנו, מתועדת עם סקריפטי ההנעה שהפיקו אותה: שעון-קיר + מוני בייטים של הממשק + שיא RSS של עץ התהליכים, ברזולוציה של 1–2 שנ'.</li>
+    </ul>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">תרחיש 1 · נקי, ענק</p>
+    <h2>190.6 GB → mkv יחיד של 167.9 GB (אירופה, 10 GbE)</h2>
+    <div class="bars">
+      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:24%"></i></span><span class="t">4m 44s</span></div>
+      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:36%"></i></span><span class="t">7m 06s · +50%</span></div>
+      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 31s · +312%</span></div>
+      <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">אין פלט¹</span></div>
+    </div>
+    <div class="tblwrap"><table>
+      <thead><tr><th></th><th>nzbfast</th><th>NZBGet 26.2</th><th>SABnzbd 5.0.4</th><th>rustnzb 1.3.4</th></tr></thead>
+      <tbody>
+        <tr><td>זמן לקובץ שמיש</td><td class="win">4m 44s</td><td class="lose">7m 06s (+50%)</td><td class="lose">19m 31s (+312%)</td><td class="bad">אין¹</td></tr>
+        <tr><td>GB על החוט</td><td class="win num">169.3</td><td class="num">169.6</td><td class="num">169.6</td><td class="num">186.6</td></tr>
+        <tr><td>שיא RSS</td><td class="num">6.8 GB²</td><td class="num">1.8 GB</td><td class="num">1.8 GB</td><td class="win num">0.6 GB</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">¹ rustnzb דיווח על סיום המשימה ב-5m 42s לאחר שמשך
+    186.6 GB — ‏10% יותר על החוט מכל אחד אחר — אך השאיר <b>שום קובץ פלט בכלל</b>. הוא גם נכשל
+    בתרחיש זה בסבב הקודם ("121,975 מאמרים חסרים", 71 GB יתומים).
+    · ² הזיכרון של nzbfast עוקב אחר <em>התקציב המוגדר</em> שלו, לא אחר המשימה: מקטע זה רץ
+    בתקציב האוטומטי כברירת מחדל; מוגבל ל-<b>1 GB</b> אותה משימת 190 GB עדיין מסתיימת, כ-22%
+    לאט יותר — ראה את סולם הזיכרון-הנמוך למטה. בסבב המוקדם יותר של החוף המזרחי (קו ~2.4–3 Gbps)
+    אותו תרחיש רץ 9m 00s מול NZBGet ‎+30% ו-SABnzbd ‎+111% — הפער מחזיק לאורך מהירויות קו.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">תרחיש 2 · הפער גדל עם הגודל</p>
+    <h2>זמן לקובץ שמיש, לפי גודל משימה</h2>
+    <p class="lead">מעבר יחיד פירושו בלי מעבר אימות/פריקה לאחר הורדה — כך שככל שהמשימה גדולה יותר,
+    כך היא נוחתת רחוק יותר קדימה. הרצות סדרתיות באותה מכונה:</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>משימה</th><th>nzbfast</th><th>NZBGet</th><th>SABnzbd</th></tr></thead>
+      <tbody>
+        <tr><td>7.4 GB REMUX (אירופה, 10 GbE)</td><td class="win">13.7 s</td><td class="lose">17.3 s (+26%)</td><td class="lose">19.0 s (+39%)</td></tr>
+        <tr><td>35 GB 4K מעורפל (אירופה)</td><td class="win">67 s</td><td class="lose">108 s (+61%)</td><td class="lose">285 s (+325%)</td></tr>
+        <tr><td>87 GB 4K (החוף המזרחי)</td><td class="win">272 s</td><td class="lose">370 s (+36%)</td><td class="lose">708 s (+160%)</td></tr>
+        <tr><td>87 GB על דיסק עם 97 GB פנויים (אירופה)</td><td class="win">3m 08s</td><td class="bad">לא יכול לרוץ²</td><td class="bad">לא יכול לרוץ²</td></tr>
+        <tr><td>190.6 GB (החוף המזרחי)</td><td class="win">9m 00s</td><td class="lose">11m 43s (+30%)</td><td class="lose">19m 02s (+111%)</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">² טביעת הרגל השיא שלהם (כרכים + פלט מפורק
+    בו-זמנית, ~156 GB) עברה את 97 GB הפנויים. מעבר יחיד צריך פי 1 מגודל התוכן —
+    הוא מקצץ בחצי את הדיסק שאתה צריך, לא רק את הזמן.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">תרחיש 3 · פוסט מעורפל</p>
+    <h2>35 GB 4K בעל שם-גיבוב → mkv שמיש (החוף המזרחי)</h2>
+    <div class="tblwrap"><table>
+      <thead><tr><th></th><th>nzbfast</th><th>NZBGet</th><th>SABnzbd</th><th>rustnzb</th></tr></thead>
+      <tbody>
+        <tr><td>זמן לקובץ שמיש</td><td class="win">96 s</td><td class="lose">153 s (+59%)</td><td class="lose">259 s (+170%)</td><td class="bad">אין קובץ שמיש³</td></tr>
+        <tr><td>שיא RSS</td><td class="win num">1.55 GB</td><td class="num">3.7 GB</td><td class="num">8.8 GB</td><td class="num">3.6 GB</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">³ rustnzb הוריד ב-119 שנ', סימן את המשימה
+    <i>הושלמה</i> — ושלח את הכרכים המעורפלים הגולמיים: בלי שינוי שם, בלי חילוץ.
+    nzbfast ביטל את הערפול ממטא-נתוני PAR2 וחילץ בזרם, אפס בלוקי קריאה-חזרה.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">תרחיש 4 · תור של שלושה</p>
+    <h2>לשמור על הקו דולק לאורך תור (החוף המזרחי, ~43 GB)</h2>
+    <div class="tblwrap"><table>
+      <thead><tr><th></th><th>nzbfast</th><th>rustnzb</th><th>NZBGet</th><th>SABnzbd</th></tr></thead>
+      <tbody>
+        <tr><td>זמן קיר של התור</td><td class="win">122 s</td><td class="num">136 s</td><td class="num">162 s</td><td class="num">277 s</td></tr>
+        <tr><td>קו בטל (&lt;20 MB/s)</td><td class="win">2 s (2%)</td><td class="num">16 s (12%)</td><td class="num">0 s</td><td class="bad">168 s (61%)</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">שלוש צורות של אותה בעיה: חפיפת הזנב של nzbfast
+    שומרת על הקו עסוק מקצה לקצה; NZBGet לעולם לא בטל אך רץ ~35% לאט יותר בזמן פריקה
+    בו-זמנית; SABnzbd מוריד מהר, ואז משאיר את הקו <b>חשוך 61% מהזמן</b> במהלך
+    עיבוד סדרתי לאחר הורדה. בגרסת העמידות (משימה אחת עם כותרות RAR מוצפנות),
+    התור של SABnzbd נתקע על המשימה המוצפנת ורק 1 מתוך 3 משימות אי פעם הסתיימה; nzbfast
+    החנה אותה עם הודעה ברורה וסיים את השאר.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">הטור הכן</p>
+    <h2>שני מקטעים שהפסדנו — אחד כעת סגור</h2>
+    <div class="grid2">
+      <div class="card"><h3>פוסט פגום במצב אחסון</h3>
+        <p>20 מאמרים מורעלים ב-REMUX של 7.4 GB: NZBGet סיים שמיש ב-<b>53 s</b>; nzbfast
+        כעת לוקח <b>58 s</b> — תיקון הושלם ב-32 s, כל 62 הכרכים חולצו מחדש, פלט
+        מדויק-בייט. באג המצב-הסופי שבנייה מוקדמת יותר סבלה ממנו בנתיב מדויק זה (כרכים מתוקנים
+        שנהרסו בחילוץ מחדש בזמן שקוד היציאה אמר הצלחה) תוקן, נבדק לרגרסיה,
+        ואומת מחדש מול Usenet אמיתי. התיקון שלנו עדיין מוריד מינימום כמעט-תיאורטי של
+        22 בלוקי שחזור עבור 20 נדרשים מול מעבר ה-PAR2 המלא שלהם — אך NZBGet שומר על המקטע ב
+        חמש שניות, ולכן הוא מודפס כאן.</p></div>
+      <div class="card"><h3>חידוש kill −9 — סגור</h3>
+        <p>נהרג ב-~15 GB של משימת 34.5 GB, זה היה פעם המספר הגרוע ביותר שלנו: NZBGet הוריד מחדש
+        <b>~0.6 GB</b>, nzbfast <b>15 GB</b> — כל מה שפוענח לפני הפעלת PAR2 מת עם
+        התהליך. היומן כעת מתעד את המיקום הפיזי של כל מאמר, כך שחידוש
+        משחזר את הבייטים האלה מקובצי הפלט של ההרצה הקודמת עצמה (עותק דיסק מקומי, כל
+        בייט מאומת מחדש מול מפת בלוקי ה-PAR2) ומוריד מחדש <b>~0.3 GB</b> — שקילות
+        בתוך רעש הספק. SABnzbd, לפרוטוקול, מעולם לא התאושש מתרחיש זה ב
+        שלושה סבבים: נהרג באותו אופן, הוא הוריד מחדש 0.5 GB בשעה וחרג מהזמן.</p></div>
+    </div>
+    <div class="callout">למה לפרסם הפסדים? כי הניצחונות אמינים רק לצדם.
+    כל מספר בעמוד הזה מגיע מאותן הרצות משולבות, ויומן
+    בדיקות הביצועים שלנו במאגר הוא מחברת מעבדה מלאה — כולל תוצאות שליליות.</div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">תרחיש 6 · הרעב אותו מ-RAM</p>
+    <h2>סולם הזיכרון-הנמוך — 190 GB ב-~1.1 GB של RAM</h2>
+    <p>אותן ארבע משימות, מורצות מחדש בתקציבי זיכרון קשיחים של 2 GB, ‏1 GB ו-256 MB —
+    מה שמכוונן הגודל האוטומטי היה בוחר על מכונת 8 GB, מכונת 4 GB, ו-NAS של 2 GB. כל
+    מקטע הפיק קובץ נכון, מאומת במלואו, מחולץ; שיא RSS עקב אחר
+    <em>התקציב</em>, לא אחר המשימה. זמן לקובץ שמיש, קו 10 GbE:</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>גודל משימה</th><th>שפע RAM</th><th>תקציב 2 GB</th><th>תקציב 1 GB</th><th>תקציב 256 MB</th></tr></thead>
+      <tbody>
+        <tr><td>7 GB</td><td class="num">15 s</td><td class="num">15 s</td><td class="num">15 s</td><td class="num">15 s</td></tr>
+        <tr><td>35 GB</td><td class="num">65 s</td><td class="num">70 s</td><td class="num">70 s</td><td class="num">65 s</td></tr>
+        <tr><td>87 GB</td><td class="num">148 s</td><td class="num">206 s</td><td class="num">196 s</td><td class="num">180 s</td></tr>
+        <tr><td>190 GB</td><td class="num">330 s</td><td class="num">427 s</td><td class="num">402 s</td><td class="num">411 s</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">הפרמיה של 20–40% על המשימות הגדולות היא
+    ארטיפקט של 10 GbE: בלוקים שגלשו עולים זמן רק כשהקו מקדים את הדיסק. אותה
+    משימת 87 GB באותם תקציבים על קו ~2.4 Gbps נמדדה ‎−1% עד ‎+7% — רעש.
+    בחיבור ביתי טיפוסי תקציב קטן הוא כמעט חינם בכל גודל משימה. פרופיל
+    NAS (2 חיבורים, תקציב 256 MB) סיים את משימת ה-35 GB ב-0.4 GB שיא
+    RSS — ‏NAS של 2 GB יכול להריץ את זה. שום קליינט אחר לא מציע תקרת זיכרון בכלל.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">יכולת, לא מיקרו-בדיקות</p>
+    <h2>מה כל קליינט יכול לעשות</h2>
+    <div class="tblwrap"><table>
+      <thead><tr><th></th><th>nzbfast</th><th>SABnzbd 5</th><th>NZBGet 26</th><th>rustnzb</th><th>Usenapp</th><th>Newsbin</th></tr></thead>
+      <tbody>
+        <tr><td>NNTP בצנרת</td><td class="yes">כן</td><td class="half">כבוי כברירת מחדל</td><td class="no">לא</td><td class="yes">כן</td><td class="no">—</td><td class="no">—</td></tr>
+        <tr><td>אימות מלא תוך כדי הורדה</td><td class="yes">כל בלוק</td><td class="no">אחרי</td><td class="half">בדיקה מהירה</td><td class="no">אחרי</td><td class="no">אחרי</td><td class="no">אחרי</td></tr>
+        <tr><td>חילוץ תוך כדי הורדה</td><td class="yes">בזרם, בלי כרכים בדיסק</td><td class="half">פריקה ישירה⁴</td><td class="half">פריקה ישירה⁴</td><td class="half">לא אמין⁵</td><td class="no">לא</td><td class="no">לא</td></tr>
+        <tr><td>דיסק נדרש לפוסט של N-GB</td><td class="yes">~1×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td></tr>
+        <tr><td>פסק דין השלמה טרם-הורדה</td><td class="yes">מדויק-בלוקים</td><td class="no">לא</td><td class="half">אחוז תקינות</td><td class="no">לא</td><td class="yes">בדיקת מאמרים</td><td class="no">לא</td></tr>
+        <tr><td>זיכרון חסום (לעולם לא swap)</td><td class="yes">מתוקצב</td><td class="no">9.3 GB @ 190 GB</td><td class="half">הגדרת מטמון</td><td class="no">לא</td><td class="no">—</td><td class="no">—</td></tr>
+        <tr><td>תצוגה מקדימה + דילוג תוך כדי הורדה</td><td class="yes">כן</td><td class="no">לא</td><td class="no">לא</td><td class="no">לא</td><td class="half">סדרתי</td><td class="no">לא</td></tr>
+        <tr><td>אינדקסר מובנה + קיר פוסטרים</td><td class="yes">כן, ללא מפתח</td><td class="no">לא</td><td class="no">לא</td><td class="no">לא</td><td class="half">ממשק חיפוש</td><td class="half">דפדפן קבוצות</td></tr>
+        <tr><td>תוסף Sonarr/Radarr</td><td class="yes">SAB API + Newznab</td><td class="yes">מקורי</td><td class="yes">מקורי</td><td class="half">חלקי</td><td class="no">לא</td><td class="no">לא</td></tr>
+        <tr><td>שלטי טלפון (nzb360/LunaSea)</td><td class="yes">דרך NZBGet RPC</td><td class="yes">כן</td><td class="yes">כן</td><td class="no">לא</td><td class="no">לא</td><td class="no">לא</td></tr>
+        <tr><td>תפיסה אוטומטית ברשימת מעקב + שדרוגים</td><td class="yes">מובנה</td><td class="no">דרך *arr</td><td class="no">דרך *arr</td><td class="no">לא</td><td class="yes">Watchdog</td><td class="half">כללים</td></tr>
+        <tr><td>בינארי עצמאי יחיד</td><td class="yes">כן</td><td class="no">Python</td><td class="yes">כן</td><td class="yes">כן</td><td class="yes">.app</td><td class="yes">.exe</td></tr>
+        <tr><td>קוד פתוח</td><td class="yes">GPL⁶</td><td class="yes">GPL</td><td class="yes">GPL</td><td class="yes">כן</td><td class="no">בתשלום</td><td class="no">בתשלום</td></tr>
+        <tr><td>פלטפורמות</td><td class="yes">mac/win/linux/docker</td><td class="yes">mac/win/linux</td><td class="yes">mac/win/linux</td><td class="half">linux/win</td><td class="no">mac בלבד</td><td class="no">win בלבד</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">⁴ פריקה ישירה עדיין מממשת את הכרכים תחילה —
+    פי 2 כתיבות ופי 2 דיסק. ⁵ rustnzb שלח כרכים מעורפלים המסומנים "הושלמה" בסבב שלנו
+    (הפריקה שלו גם נתקעת עם unrar של RARLab אלא אם מבוטלת). ⁶ GPL-3.0-or-later.
+    Usenapp/Newsbin הם קוראים מסחריים חד-פלטפורמיים עם תכונות מוריד; הם
+    מופיעים כי אנשים שואלים, לא כי הם מתחרים על מהירות.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">הוכחת תעבורה</p>
+    <h2>המנוע מרווה קווים אמיתיים</h2>
+    <ul class="plain">
+      <li><b>8.31 Gbps מצטבר</b> על קו 10 GbE שנמדד ב-8.2 Gbps (אירופה M1 Ultra, ‏4 ספקים, ‏14,000 מאמרים, ‏0 שגיאות, ‏0 חיבורים מחדש).</li>
+      <li><b>9.16–9.27 Gbps</b> תקתוקי תעבורה יציבים על אותו קו — ‏≈98% מתפוקת ה-TCP המעשית.</li>
+      <li><b>5.44 Gbps מתמשך</b> לאורך משימת 20.4 GB מלאה <i>כולל</i> אימות בזרם.</li>
+      <li><b>הצנרת שוחזרה בכל RTT</b>: ‏+64% ב-63 ms Starlink, ‏+170–177% ב-14 ms מרכז נתונים, ‏+270% ב-31 ms החוף המזרחי — היא מביסה את דעיכת חלון הגודש של TCP, לא רק את ההשהיה.</li>
+      <li><b>הוכחת לחץ נגדי</b>: הגבל את שלב הכתיבה פי 4 מתחת לרשת והקלט ננעל לתקרה ±1% תוך 2 שנ', ה-RAM <i>יורד</i>, אפס החלפות — דיסק איטי לעולם לא יכול לנפח את הזיכרון.</li>
+      <li><b>מרווח מעבד</b>: תקרות פענוח+אימות שנמדדו של 86–165 Gbps על מעבדי Apple — הרשת היא צוואר הבקבוק פי 4–50 בכל מכונה שנבדקה.</li>
+    </ul>
+    <div class="callout">כלל קבוע מהמאגר: <b>כל טענת ביצועים מצטטת פקודה הניתנת
+    לשחזור ואת התנאים שבהם רצה.</b> מחברת המעבדה המלאה — כולל תוצאות
+    שליליות ופניות שגויות — נשמרת כמחברת מעבדה מתוארכת.</div>
+  </div>
+</section>
+
+<footer><div class="wrap">
+  <div class="cols">
+    <div>⚡ <b>nzbfast</b> — מוריד ה-Usenet במעבר יחיד.</div>
+    <div>
+      <a href="features.he.html">תכונות</a> ·
+      <a href="benchmarks.he.html">בדיקות ביצועים</a> ·
+      <a href="download.he.html">הורדה</a> ·
+      <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
+    </div>
+  </div>
+  <p class="fine">נתוני בדיקות: סבב תחרותי 19–20 ביולי 2026. גרסאות
+  קליינט: SABnzbd 5.0.4, NZBGet 26.2 (fork של nzbget.com), rustnzb 1.3.4. אם גרסה חדשה יותר של
+  קליינט כלשהו משנה מהותית תוצאה, נריץ מחדש ונעדכן.</p>
+</div></footer>
+
+</body>
+</html>
