@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Benchmark — nzbfast</title>
-<meta name="description" content="nzbfast contro SABnzbd, NZBGet e rustnzb: 4 client × 6 scenari su hardware identico. Risultati onesti, comprese le prove che nzbfast ha perso, con i passi per riprodurli.">
+<meta name="description" content="nzbfast contro SABnzbd, NZBGet e rustnzb: 4 client × 6 scenari su hardware identico. Risultati onesti, compresa l'unica prova che nzbfast non vince, con i passi per riprodurli.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
 <link rel="alternate" hreflang="en" href="benchmarks.html">
@@ -41,10 +41,10 @@
 </div></header>
 
 <div class="hero wrap" style="padding-bottom:6px">
-  <h1>Misurato, non <em>pubblicizzato</em>.</h1>
+  <h1>Benchmark</h1>
   <p class="sub">Quattro client, sei scenari, hardware e provider identici, esecuzioni
   alternate così la deriva dei provider si annulla. La metrica è il <b>tempo per un file utilizzabile</b> —
-  scaricato, verificato, estratto. Comprese le due prove che abbiamo perso.</p>
+  scaricato, verificato, estratto. Compresa l'unica prova che non vinciamo.</p>
 </div>
 
 <section style="padding-top:26px">
@@ -150,28 +150,17 @@
 <section class="alt">
   <div class="wrap">
     <p class="kicker">La colonna dell'onestà</p>
-    <h2>Due prove che abbiamo perso — una ora chiusa</h2>
+    <h2>L'unica prova che non vinciamo</h2>
     <div class="grid2">
       <div class="card"><h3>Post danneggiato in modalità store</h3>
-        <p>20 articoli avvelenati in un REMUX da 7.4 GB: NZBGet ha finito utilizzabile in <b>53 s</b>; nzbfast
-        ora impiega <b>58 s</b> — riparazione completa in 32 s, tutti i 62 volumi ri-estratti, output
-        byte-esatto. Il bug di stato finale che una build precedente aveva su questo esatto percorso (volumi riparati
-        rovinati dalla ri-estrazione mentre il codice di uscita diceva successo) è corretto, testato contro le
-        regressioni e ri-validato su Usenet reale. La nostra riparazione scarica ancora 22 blocchi di recupero, quasi
-        il minimo teorico, per 20 necessari, contro la loro passata PAR2 completa — ma NZBGet vince la prova per
-        cinque secondi, quindi è riportato qui.</p></div>
-      <div class="card"><h3>ripresa dopo kill −9 — chiuso</h3>
-        <p>Ucciso a ~15 GB di un job da 34.5 GB, questo era il nostro numero peggiore: NZBGet ha riscaricato
-        <b>~0.6 GB</b>, nzbfast <b>15 GB</b> — tutto ciò che era decodificato prima dell'attivazione di PAR2 moriva
-        col processo. Il journal ora registra la posizione fisica di ogni articolo, così una ripresa
-        ripristina quei byte dai file di output della sessione precedente (una copia su disco locale, ogni
-        byte ri-verificato rispetto alla mappa dei blocchi PAR2) e riscarica <b>~0.3 GB</b> — parità
-        entro il rumore dei provider. SABnzbd, per la cronaca, non si è mai ripreso da questo scenario in
-        tre giri: ucciso allo stesso modo, ha riscaricato 0.5 GB in un'ora ed è andato in timeout.</p></div>
+        <p>20 articoli avvelenati in un REMUX da 7.4 GB: NZBGet finisce utilizzabile in <b>53 s</b>, nzbfast
+        in <b>58 s</b>. La nostra riparazione si completa in 32 s, ri-estrae tutti i 62 volumi e l'output è
+        byte-esatto — e scarica 22 blocchi di recupero, quasi il minimo teorico, per i 20 necessari, contro la
+        passata PAR2 completa di NZBGet. Ma NZBGet vince la prova per cinque secondi, ed eccola qui.</p></div>
     </div>
-    <div class="callout">Perché pubblicare le sconfitte? Perché le vittorie sono credibili solo accanto ad esse.
-    Ogni numero in questa pagina proviene dalle stesse esecuzioni alternate, e il nostro log dei benchmark nel
-    repository è un vero quaderno di laboratorio — risultati negativi compresi.</div>
+    <div class="callout">Perché mostrare una sconfitta? Perché le vittorie sono credibili solo accanto ad essa.
+    Ogni numero in questa pagina proviene dalle stesse esecuzioni alternate, e nel repository teniamo tutto quanto
+    come un vero quaderno di laboratorio — risultati negativi compresi.</div>
   </div>
 </section>
 
@@ -245,8 +234,8 @@
       <li><b>Margine di calcolo</b>: tetti di decodifica+verifica misurati tra 86–165 Gbps su Apple silicon — la rete è il collo di bottiglia di 4–50× su ogni macchina testata.</li>
     </ul>
     <div class="callout">Regola fissa del repository: <b>ogni affermazione sulle prestazioni cita un comando
-    riproducibile e le condizioni in cui è stato eseguito.</b> L'intero quaderno di laboratorio — inclusi i risultati
-    negativi e le strade sbagliate — è tenuto come un quaderno di laboratorio datato.</div>
+    riproducibile e le condizioni in cui è stato eseguito.</b> Tutto quanto vive nel repository come un quaderno di
+    laboratorio datato — risultati negativi e strade sbagliate compresi.</div>
   </div>
 </section>
 

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Benchmarks — nzbfast</title>
-<meta name="description" content="nzbfast frente a SABnzbd, NZBGet y rustnzb: 4 clientes × 6 escenarios sobre hardware idéntico. Resultados honestos, incluidos los tramos que nzbfast perdió, con pasos para reproducirlos.">
+<meta name="description" content="nzbfast frente a SABnzbd, NZBGet y rustnzb: 4 clientes × 6 escenarios sobre hardware idéntico. Resultados honestos, incluido el único tramo que nzbfast no gana, con pasos para reproducirlos.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
 <link rel="alternate" hreflang="en" href="benchmarks.html">
@@ -41,10 +41,10 @@
 </div></header>
 
 <div class="hero wrap" style="padding-bottom:6px">
-  <h1>Medido, no <em>promocionado</em>.</h1>
+  <h1>Benchmarks</h1>
   <p class="sub">Cuatro clientes, seis escenarios, hardware y proveedores idénticos, ejecuciones
   intercaladas para que la deriva del proveedor se cancele. La métrica es el <b>tiempo hasta un archivo usable</b> —
-  descargado, verificado, extraído. Incluye los dos tramos que perdimos.</p>
+  descargado, verificado, extraído. Incluye el único tramo que no ganamos.</p>
 </div>
 
 <section style="padding-top:26px">
@@ -150,28 +150,17 @@
 <section class="alt">
   <div class="wrap">
     <p class="kicker">La columna honesta</p>
-    <h2>Dos tramos que perdimos — uno ya cerrado</h2>
+    <h2>El único tramo que no ganamos</h2>
     <div class="grid2">
       <div class="card"><h3>Publicación dañada en modo almacenamiento</h3>
-        <p>20 artículos envenenados en un REMUX de 7.4 GB: NZBGet terminó usable en <b>53 s</b>; nzbfast
-        ahora tarda <b>58 s</b> — reparación completa en 32 s, los 62 volúmenes reextraídos, salida byte a byte
-        exacta. El bug de estado final que una compilación anterior tenía en esta misma ruta (volúmenes reparados
-        arruinados por la reextracción mientras el código de salida decía «éxito») está corregido, probado contra
-        regresiones y revalidado con Usenet real. Nuestra reparación sigue obteniendo unos casi teóricamente mínimos
-        22 bloques de recuperación para 20 necesarios frente a su pasada completa de PAR2 — pero NZBGet gana el tramo por
-        cinco segundos, así que aquí queda impreso.</p></div>
-      <div class="card"><h3>reanudación tras kill −9 — cerrado</h3>
-        <p>Interrumpido a los ~15 GB de un trabajo de 34.5 GB, este solía ser nuestro peor número: NZBGet volvió a descargar
-        <b>~0.6 GB</b>, nzbfast <b>15 GB</b> — todo lo decodificado antes de activar PAR2 murió con
-        el proceso. El diario ahora registra la ubicación física de cada artículo, así que una reanudación
-        restaura esos bytes desde los propios archivos de salida de la ejecución anterior (una copia en disco local, cada
-        byte reverificado contra el mapa de bloques PAR2) y vuelve a descargar <b>~0.3 GB</b> — a la par,
-        dentro del ruido del proveedor. SABnzbd, que conste, nunca se ha recuperado de este escenario en
-        tres rondas: interrumpido de la misma forma, volvió a traer 0.5 GB en una hora y agotó el tiempo de espera.</p></div>
+        <p>20 artículos envenenados en un REMUX de 7.4 GB: NZBGet termina usable en <b>53 s</b> y nzbfast en <b>58 s</b>.
+        Nuestra reparación se completa en 32 s, reextrae los 62 volúmenes y la salida es byte a byte exacta —y obtiene
+        unos casi teóricamente mínimos 22 bloques de recuperación para los 20 necesarios, frente a la pasada completa de
+        PAR2 de NZBGet. Pero NZBGet gana el tramo por cinco segundos, así que aquí queda.</p></div>
     </div>
-    <div class="callout">¿Por qué publicar las derrotas? Porque las victorias solo son creíbles junto a ellas.
-    Cada número de esta página procede de las mismas ejecuciones intercaladas, y el registro de benchmarks del repo
-    es un cuaderno de laboratorio completo — con los resultados negativos incluidos.</div>
+    <div class="callout">¿Por qué mostrar siquiera una derrota? Porque las victorias solo son creíbles junto a ella.
+    Cada número de esta página procede de las mismas ejecuciones intercaladas, y el repo conserva todo
+    como un cuaderno de laboratorio completo — con los resultados negativos incluidos.</div>
   </div>
 </section>
 
@@ -245,8 +234,8 @@
       <li><b>Margen de cálculo</b>: techos medidos de decodificación+verificación de 86–165 Gbps en Apple silicon — la red es el cuello de botella por 4–50× en cada máquina probada.</li>
     </ul>
     <div class="callout">Regla permanente del repo: <b>cada afirmación de rendimiento cita un comando
-    reproducible y las condiciones en las que se ejecutó.</b> El cuaderno de laboratorio completo — incluidos los
-    resultados negativos y los caminos equivocados — se conserva como un cuaderno de laboratorio fechado.</div>
+    reproducible y las condiciones en las que se ejecutó.</b> Todo vive en el repo como un cuaderno de laboratorio
+    fechado — con los resultados negativos y los caminos equivocados incluidos.</div>
   </div>
 </section>
 

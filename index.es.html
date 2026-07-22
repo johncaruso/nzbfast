@@ -42,10 +42,10 @@
 
 <div class="hero wrap">
   <h1>De NZB a un <em>archivo verificado</em><br>antes de que otros terminen de descargar.</h1>
-  <p class="sub">nzbfast es un descargador de Usenet construido en torno a un pipeline de una sola pasada:
+  <p class="sub">nzbfast es un descargador de Usenet construido en torno a una sola pasada:
   cada byte se decodifica, se verifica y se extrae <b>mientras se descarga</b>.
-  Sin pasada de ensamblado, sin pasada de verificación, sin pasada de desempaquetado — cuando la barra de progreso
-  se llena, el archivo está listo y su integridad está demostrada.</p>
+  No hay una pasada de ensamblado al final, ni nada que verificar o desempaquetar cuando termina: en el momento
+  en que la barra de progreso se llena, el archivo está terminado y su integridad, demostrada.</p>
   <div class="chips">
     <span class="chip"><b>8.31&nbsp;Gbps</b> en una línea de 10&nbsp;GbE</span>
     <span class="chip"><b>190&nbsp;GB → 4m44s</b> a un archivo verificado</span>
@@ -65,19 +65,19 @@
   <div class="wrap">
     <p class="kicker">Por qué es rápido</p>
     <h2>Tres ideas que los clientes convencionales no explotan del todo</h2>
-    <p class="lead">No es microoptimización — es arquitectura. Cada una está medida en
-    <a href="benchmarks.es.html">el registro de benchmarks</a> con comandos reproducibles.</p>
+    <p class="lead">Esto es arquitectura, no microoptimización, y cada pieza está medida en
+    <a href="benchmarks.es.html">el registro de benchmarks</a> con comandos que puedes volver a ejecutar.</p>
     <div class="grid3">
       <div class="card"><span class="ic">🔁</span><h3>NNTP en pipeline</h3>
-        <p>Varias solicitudes de artículos permanecen en vuelo por conexión, así que las idas y vueltas nunca
-        dejan el socket ocioso — y TCP nunca deja decaer su ventana de congestión entre artículos.
-        Medido de +12% a +270% frente al modo serial en cuatro sitios; una línea se satura con 8
+        <p>Varias solicitudes de artículos permanecen en vuelo por conexión, así que una ida y vuelta nunca
+        deja el socket ocioso y TCP nunca deja decaer su ventana de congestión entre artículos.
+        En cuatro sitios medimos de +12% a +270% frente al modo serial, y una línea se satura con 8
         conexiones en lugar de 30–50.</p></div>
       <div class="card"><span class="ic">🚿</span><h3>El pipeline de una sola pasada</h3>
-        <p>Los artículos se decodifican con SIMD in situ, se escriben una sola vez en sus offsets finales,
-        se verifican con PAR2 desde los búferes de decodificación, y el contenido de los RAR en modo
-        almacenamiento se extrae <i>durante</i> la descarga — los volúmenes nunca existen como archivos.
-        Escrituras en disco = contenido × 1.0.</p></div>
+        <p>Los artículos se decodifican con SIMD in situ y se escriben una sola vez, directos a sus offsets finales,
+        y luego se verifican con PAR2 desde esos mismos búferes de decodificación. En las publicaciones RAR en modo
+        almacenamiento el contenido se extrae <i>durante</i> la descarga, así que los volúmenes nunca existen como archivos:
+        lo escrito en disco queda en contenido × 1.0.</p></div>
       <div class="card"><span class="ic">🕸️</span><h3>Disponibilidad por unión</h3>
         <p>Un artículo solo está «ausente» cuando <i>todos</i> los backbones configurados lo han
         rechazado. Una contabilidad exacta por bloque decide COMPLETO / REPARABLE / IMPOSIBLE antes
@@ -153,7 +153,7 @@ socket ──TLS──▶ <b>decodificación SIMD rapidyenc</b> (in situ — 4.9
       <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">sin archivo usable</span></div>
     </div>
     <p class="note" style="text-align:left">NZB de 190.6 GB → un único mkv de 167.9 GB, M1 Ultra en 10 GbE, 6 proveedores × 8 conexiones.
-    El mismo trabajo se completa dentro de un presupuesto de memoria de 1 GB. Tablas completas, seis escenarios y los tramos que <i>perdimos</i> — además de cómo reproducirlo —
+    El mismo trabajo se completa dentro de un presupuesto de memoria de 1 GB. Tablas completas, seis escenarios y el único tramo que no <i>ganamos</i> — además de cómo reproducirlo —
     en la <a href="benchmarks.es.html">página de benchmarks</a>.</p>
   </div>
 </section>

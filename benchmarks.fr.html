@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Benchmarks — nzbfast</title>
-<meta name="description" content="nzbfast face à SABnzbd, NZBGet et rustnzb : 4 clients × 6 scénarios sur un matériel identique. Des résultats honnêtes, y compris les manches perdues par nzbfast, avec les étapes de reproduction.">
+<meta name="description" content="nzbfast face à SABnzbd, NZBGet et rustnzb : 4 clients × 6 scénarios sur un matériel identique. Des résultats honnêtes, y compris la seule manche que nzbfast ne gagne pas, avec les étapes de reproduction.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
 <link rel="alternate" hreflang="en" href="benchmarks.html">
@@ -41,10 +41,10 @@
 </div></header>
 
 <div class="hero wrap" style="padding-bottom:6px">
-  <h1>Mesuré, pas <em>vendu</em>.</h1>
+  <h1>Benchmarks</h1>
   <p class="sub">Quatre clients, six scénarios, matériel et fournisseurs identiques, exécutions
   entrelacées pour que la dérive des fournisseurs s’annule. La métrique est le <b>temps jusqu’à un
-  fichier utilisable</b> — téléchargé, vérifié, extrait. Y compris les deux manches que nous avons perdues.</p>
+  fichier utilisable</b> — téléchargé, vérifié, extrait. Y compris la seule manche que nous ne gagnons pas.</p>
 </div>
 
 <section style="padding-top:26px">
@@ -151,28 +151,18 @@
 <section class="alt">
   <div class="wrap">
     <p class="kicker">La colonne honnête</p>
-    <h2>Deux manches perdues — une désormais close</h2>
+    <h2>La seule manche que nous ne gagnons pas</h2>
     <div class="grid2">
       <div class="card"><h3>Post en mode store endommagé</h3>
-        <p>20 articles empoisonnés dans un REMUX de 7.4 GB : NZBGet a fini utilisable en <b>53 s</b> ; nzbfast
-        prend désormais <b>58 s</b> — réparation bouclée en 32 s, les 62 volumes ré-extraits, sortie exacte à
-        l’octet. Le bug d’état final qu’un build antérieur présentait sur ce chemin précis (volumes réparés
-        ruinés par la ré-extraction alors que le code de sortie annonçait un succès) est corrigé, testé en
-        non-régression et revalidé sur du vrai Usenet. Notre réparation ne récupère toujours que 22 blocs de
-        récupération pour 20 nécessaires — quasi le minimum théorique — face à leur passe PAR2 complète, mais
-        NZBGet remporte la manche de cinq secondes, alors on l’affiche ici.</p></div>
-      <div class="card"><h3>reprise après kill −9 — close</h3>
-        <p>Tué à ~15 GB d’une tâche de 34.5 GB, c’était jadis notre pire chiffre : NZBGet re-téléchargeait
-        <b>~0.6 GB</b>, nzbfast <b>15 GB</b> — tout ce qui était décodé avant l’activation de PAR2 mourait avec
-        le processus. Le journal consigne désormais le placement physique de chaque article : une reprise
-        restaure ces octets depuis les propres fichiers de sortie de l’exécution précédente (une copie sur disque
-        local, chaque octet revérifié face à la carte de blocs PAR2) et re-télécharge <b>~0.3 GB</b> — à parité,
-        dans le bruit des fournisseurs. SABnzbd, pour mémoire, ne s’est jamais remis de ce scénario en trois
-        manches : tué de la même façon, il a re-récupéré 0.5 GB en une heure avant d’expirer.</p></div>
+        <p>20 articles empoisonnés dans un REMUX de 7.4 GB : NZBGet finit utilisable en <b>53 s</b>, nzbfast
+        en <b>58 s</b>. Notre réparation s’achève en 32 s, ré-extrait les 62 volumes, et la sortie est exacte
+        à l’octet — et elle ne récupère que 22 blocs de récupération pour les 20 nécessaires, quasi le minimum
+        théorique, face à la passe PAR2 complète de NZBGet. Mais NZBGet remporte la manche de cinq secondes,
+        alors le voici.</p></div>
     </div>
-    <div class="callout">Pourquoi publier les défaites ? Parce que les victoires ne sont crédibles qu’à côté
-    d’elles. Chaque chiffre de cette page provient des mêmes exécutions entrelacées, et notre journal de
-    benchmarks dans le dépôt est un véritable cahier de laboratoire — résultats négatifs compris.</div>
+    <div class="callout">Pourquoi montrer ne serait-ce qu’une défaite ? Parce que les victoires ne sont crédibles
+    qu’à côté d’elle. Chaque chiffre de cette page provient des mêmes exécutions entrelacées, et le dépôt en
+    conserve l’intégralité sous forme de véritable cahier de laboratoire — résultats négatifs compris.</div>
   </div>
 </section>
 
@@ -246,8 +236,8 @@
       <li><b>Marge de calcul</b> : plafonds décodage+vérification mesurés à 86–165 Gbps sur Apple silicon — le réseau est le goulet d’étranglement par 4–50× sur chaque machine testée.</li>
     </ul>
     <div class="callout">Règle permanente du dépôt : <b>chaque affirmation de perf cite une commande
-    reproductible et les conditions dans lesquelles elle a tourné.</b> Le cahier de laboratoire complet —
-    résultats négatifs et fausses pistes compris — est tenu comme un cahier de laboratoire daté.</div>
+    reproductible et les conditions dans lesquelles elle a tourné.</b> L’ensemble vit dans le dépôt sous
+    forme de cahier de laboratoire daté — résultats négatifs et fausses pistes compris.</div>
   </div>
 </section>
 

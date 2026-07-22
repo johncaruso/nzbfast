@@ -44,8 +44,9 @@
   <h1>De NZB à <em>un fichier vérifié</em><br>avant que les autres aient fini de télécharger.</h1>
   <p class="sub">nzbfast est un téléchargeur Usenet bâti autour d’un pipeline en une passe :
   chaque octet est décodé, vérifié et extrait <b>pendant qu’il se télécharge</b>.
-  Pas de passe d’assemblage, pas de passe de vérification, pas de passe d’extraction — quand
-  la barre de progression se remplit, le fichier est prêt et prouvé intact.</p>
+  Aucune passe d’assemblage ensuite, plus rien à vérifier ni à décompresser une fois qu’il est
+  terminé — à l’instant où la barre de progression se remplit, le fichier est achevé et son
+  intégrité prouvée.</p>
   <div class="chips">
     <span class="chip"><b>8.31&nbsp;Gbps</b> sur une ligne 10&nbsp;GbE</span>
     <span class="chip"><b>190&nbsp;GB → 4m44s</b> vers un fichier vérifié</span>
@@ -65,8 +66,8 @@
   <div class="wrap">
     <p class="kicker">Pourquoi c’est rapide</p>
     <h2>Trois idées que les clients grand public n’exploitent pas à fond</h2>
-    <p class="lead">Pas de la micro-optimisation — de l’architecture. Chacune est mesurée dans
-    <a href="benchmarks.fr.html">le journal de benchmarks</a> avec des commandes reproductibles.</p>
+    <p class="lead">C’est de l’architecture, pas de la micro-optimisation, et tout est mesuré dans
+    <a href="benchmarks.fr.html">le journal de benchmarks</a> avec des commandes que vous pouvez relancer vous-même.</p>
     <div class="grid3">
       <div class="card"><span class="ic">🔁</span><h3>NNTP pipeliné</h3>
         <p>Plusieurs requêtes d’articles restent en vol par connexion : les allers-retours ne
@@ -153,7 +154,7 @@ socket ──TLS──▶ <b>décodage SIMD rapidyenc</b> (sur place — 4.95 GB
       <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">aucun fichier utilisable</span></div>
     </div>
     <p class="note" style="text-align:left">NZB de 190.6 GB → un seul mkv de 167.9 GB, M1 Ultra sur 10 GbE, 6 fournisseurs × 8 connexions.
-    La même tâche se termine dans un budget mémoire de 1 GB. Tableaux complets, six scénarios, et les manches que nous avons <i>perdues</i> — plus comment les reproduire —
+    La même tâche se termine dans un budget mémoire de 1 GB. Tableaux complets, six scénarios, et la seule manche que nous ne gagnons pas — plus comment les reproduire —
     sur la <a href="benchmarks.fr.html">page des benchmarks</a>.</p>
   </div>
 </section>
@@ -182,10 +183,10 @@ socket ──TLS──▶ <b>décodage SIMD rapidyenc</b> (sur place — 4.95 GB
     <p class="kicker">S’intègre à votre pile</p>
     <h2>Pointez vos outils existants dessus</h2>
     <div class="grid3">
-      <div class="card"><h3>Sonarr / Radarr</h3><p>API entièrement compatible SABnzbd — ajoutez nzbfast comme
-        client de téléchargement « SABnzbd » et ça marche tout seul : récupérations, catégories, priorités, réessais,
-        scripts de post-traitement (contrat SAB_*), historique. La façade Newznab permet aussi aux
-        *arr de <i>chercher dans votre index local</i> comme s’il s’agissait d’un indexeur.</p></div>
+      <div class="card"><h3>Sonarr / Radarr</h3><p>Il embarque toute l’API compatible SABnzbd : ajoutez nzbfast
+        comme client de téléchargement « SABnzbd » et ça fonctionne tout seul — récupérations, catégories, priorités,
+        réessais, scripts de post-traitement sur le contrat SAB_*, historique. La façade Newznab va encore plus loin
+        et laisse les *arr <i>chercher dans votre index local</i> comme s’il s’agissait d’un indexeur.</p></div>
       <div class="card"><h3>nzb360 / LunaSea</h3><p>Le daemon parle aussi le JSON-RPC de NZBGet —
         les télécommandes mobiles populaires pilotent nzbfast sans modification. Et le tableau de bord
         lui-même offre une vraie disposition téléphone pour quand vous êtes loin du grand écran.</p></div>

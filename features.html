@@ -41,8 +41,8 @@
 </div></header>
 
 <div class="hero wrap" style="padding-bottom:6px">
-  <h1>Every feature, <em>one page</em>.</h1>
-  <p class="sub">The short version first; the whole machine below.</p>
+  <h1>Features</h1>
+  <p class="sub">The short version up top, the full detail below.</p>
 </div>
 
 <section style="padding-top:26px">
@@ -71,20 +71,20 @@
     <h2>Engine &amp; speed</h2>
     <div class="grid2">
       <ul class="plain">
-        <li><b>Pipelined NNTP</b> — multiple requests in flight per connection defeats both round-trip latency and TCP congestion-window decay; measured +12%…+270% vs serial. Saturates lines with ~8 connections per server.</li>
-        <li><b>SIMD yEnc decode</b> (rapidyenc, NEON/AVX kernels) — 4.95 GB/s per core, decoded in place in the receive path.</li>
-        <li><b>Multi-server shared queue</b> — providers self-balance within ~2%, no tuning; per-server rate awareness with tail duplicate-dispatch so one slow server can't drag a job's tail.</li>
-        <li><b>Cross-job soak</b> — the tail of job N overlaps the start of job N+1: the line stays lit edge-to-edge across a queue (2% idle vs SABnzbd's 61% dark in the bench).</li>
-        <li><b>Slow-job watchdog</b> — a download crawling on one slow server while others wait is auto-deferred to the back of the queue (progress kept) and resumed when the queue clears.</li>
-        <li><b>Idle-server prefetch</b> — servers the active job can't use (its articles aren't on them) start the next queued job instead of idling.</li>
+        <li><b>Pipelined NNTP.</b> Keeping several requests in flight per connection beats both round-trip latency and TCP congestion-window decay. We measure anywhere from +12% to +270% over serial fetching, and about 8 connections per server is enough to saturate the line.</li>
+        <li><b>SIMD yEnc decode</b> (rapidyenc, with NEON and AVX kernels) runs at 4.95 GB/s per core, decoded in place as the bytes land in the receive path.</li>
+        <li><b>Multi-server shared queue.</b> Providers self-balance to within ~2% with no tuning. Each one's real rate is tracked, and the tail of a job is duplicate-dispatched so a single slow server can't drag out the finish.</li>
+        <li><b>Cross-job soak.</b> The tail of job N overlaps the start of job N+1, so the line stays lit edge to edge across a whole queue — 2% idle here versus SABnzbd's 61% dark in the same bench.</li>
+        <li><b>Slow-job watchdog.</b> A download crawling on one slow server while the rest sit idle gets bumped to the back of the queue, progress kept, and resumes once the queue clears.</li>
+        <li><b>Idle-server prefetch</b> — a server the active job can't use, because its articles aren't stored there, starts on the next queued job instead of sitting idle.</li>
       </ul>
       <ul class="plain">
-        <li><b>Connection-tuning ladder</b> — measures each provider's actual throughput knee (asked vs granted connections) instead of guessing.</li>
-        <li><b>Auto-speed governor</b> — optional LEDBAT-style RTT governor yields to your household's traffic while using the rest of the line.</li>
-        <li><b>Speed limits &amp; weekly scheduler</b> — live-adjustable caps, local-time (DST-safe) schedule, "pause for N minutes" with auto-resume.</li>
-        <li><b>Memory budget</b> — one global RAM budget (auto: RAM/4, capped; overridable). When the budget gets tight it shrinks buffers, then spills to disk and reads back once the job settles — it never swaps. A 190 GB job completes inside a 1 GB budget (~1.1 GB peak RSS); a 2 GB NAS profile is measured and documented.</li>
-        <li><b>Backpressure</b> — a slow disk throttles the sockets rather than filling RAM (holds within ±1% of a write cap, with RAM <i>falling</i> under pressure).</li>
-        <li><b>Post-job memory trim</b> — the daemon hands freed memory back to the OS when idle (footprint drops to ~8 MB between jobs on macOS).</li>
+        <li><b>Connection-tuning ladder.</b> Rather than guess, it measures where each provider's throughput actually stops climbing — connections asked for versus granted — and settles there.</li>
+        <li><b>Auto-speed governor</b> — an optional LEDBAT-style RTT governor that yields to the rest of your household's traffic and takes what's left of the line.</li>
+        <li><b>Speed limits and a weekly scheduler</b> — live-adjustable caps, a local-time (DST-safe) schedule, and a "pause for N minutes" that resumes on its own.</li>
+        <li><b>Memory budget.</b> One global RAM budget (auto: a quarter of RAM, capped, overridable). As it tightens, buffers shrink first, then data spills to disk and reads back once the job settles. It never swaps. A 190 GB job finishes inside a 1 GB budget at ~1.1 GB peak RSS, and there's a measured, documented 2 GB profile for NAS boxes.</li>
+        <li><b>Backpressure.</b> A slow disk throttles the sockets instead of letting RAM fill — it holds within ±1% of a write cap, and RAM actually <i>falls</i> under pressure.</li>
+        <li><b>Post-job memory trim</b> — once idle, the daemon hands freed memory back to the OS, dropping to around 8 MB between jobs on macOS.</li>
       </ul>
     </div>
   </div>
@@ -95,16 +95,16 @@
     <h2>The one-pass pipeline</h2>
     <div class="grid2">
       <ul class="plain">
-        <li><b>Write once</b> — decoded articles are pwritten at their final file offsets. No temp files, no assembly pass.</li>
-        <li><b>In-stream PAR2 verification</b> — every block MD5-hashed from the decode buffers as it arrives; verification finishes when the download does. Stronger than the competitors' quick-check, and free.</li>
-        <li><b>Direct extraction</b> — store-mode RAR posts (most scene releases) are mapped and extracted during download; the volumes never exist on disk. Disk writes = content × 1.0, disk needed = 1× (others need ~2×).</li>
-        <li><b>Deobfuscation</b> — obfuscated posts are renamed from PAR2 metadata; ROT13-obfuscated names get rescued; hash-named junk is classified and gated.</li>
+        <li><b>Write once.</b> Decoded articles are pwritten straight to their final file offsets. No temp files, no separate assembly pass.</li>
+        <li><b>In-stream PAR2 verification.</b> Every block is MD5-hashed from the decode buffers as it arrives, so verification finishes the moment the download does. That beats the quick-check the other clients settle for, and it costs nothing.</li>
+        <li><b>Direct extraction</b> — store-mode RAR posts (most scene releases) are mapped and extracted while they download, so the volumes never land on disk at all. Disk written comes to content × 1.0 and disk needed to 1×, where others want roughly 2×.</li>
+        <li><b>Deobfuscation.</b> Obfuscated posts are renamed from their PAR2 metadata, ROT13-scrambled names get rescued, and hash-named junk is classified and gated out.</li>
       </ul>
       <ul class="plain">
-        <li><b>Exact-fit repair</b> — damaged blocks are known live; the minimum-byte set of recovery volumes is fetched during the download (knapsack-solved), and repair touches only damaged spans.</li>
-        <li><b>Compressed/encrypted fallback</b> — non-store posts materialise and unpack via the native RAR engine, overlapped with the queue; encrypted sets park with a clear message.</li>
-        <li><b>Password handling</b> — passwords from the *arr API, <code>{{pw}}</code> filename convention, or NZB metadata; a 🔑 unlock on the dashboard handles the rest (background unlock, then normal filing).</li>
-        <li><b>Safety rails</b> — repaired source volumes are write-protected during re-extraction; exit codes only say "success" when the end state is actually usable.</li>
+        <li><b>Exact-fit repair.</b> Damaged blocks are known as they happen, so only the minimum-byte set of recovery volumes gets fetched — a knapsack solve — and repair touches nothing but the damaged spans.</li>
+        <li><b>Compressed and encrypted fallback</b> — non-store posts materialise and unpack through the native RAR engine, overlapped with the rest of the queue. Encrypted sets park with a clear message instead of failing quietly.</li>
+        <li><b>Password handling.</b> Passwords come from the *arr API, the <code>{{pw}}</code> filename convention, or NZB metadata. For anything left over, a 🔑 unlock on the dashboard takes it from there: it unlocks in the background, then files as normal.</li>
+        <li><b>Safety rails.</b> Repaired source volumes are write-protected while re-extraction runs, and an exit code reports "success" only when the end state is genuinely usable.</li>
       </ul>
     </div>
   </div>
@@ -115,18 +115,18 @@
     <h2>Reliability &amp; availability</h2>
     <div class="grid2">
       <ul class="plain">
-        <li><b>Pre-flight availability check</b> — pipelined STAT sweeps build a per-article × per-server matrix in seconds: COMPLETE / REPAIRABLE / IMPOSSIBLE before you've downloaded anything. Impossible posts abort having fetched almost nothing.</li>
-        <li><b>Union routing</b> — an article is missing only when every live server refused it; articles route to servers that have them. Different backbones have different retention/takedown profiles — the union completes posts no single server can.</li>
-        <li><b>Crash-safe journal</b> — article-level journal; kill −9 mid-job and it resumes, refetching only what wasn't persisted. Queue and history survive restarts.</li>
-        <li><b>Park + retry</b> — failed jobs park to history; retry refetches only what's missing.</li>
-        <li><b>Chaos-tested</b> — a mock NNTP server drives 10 end-to-end failure scenarios (430s, corruption, truncation, stalls, dead servers, kill −9) on every test run.</li>
+        <li><b>Pre-flight availability check.</b> Pipelined STAT sweeps build a per-article × per-server matrix in seconds and mark the job COMPLETE, REPAIRABLE or IMPOSSIBLE before a byte of content is fetched. An impossible post aborts having pulled almost nothing.</li>
+        <li><b>Union routing.</b> An article counts as missing only once every live server has refused it; until then it routes to whichever server holds it. Backbones differ in retention and takedowns, so the union quietly completes posts that no single server could.</li>
+        <li><b>Crash-safe journal.</b> The journal works at article granularity. Send a kill −9 mid-job and it comes back, refetching only what hadn't been persisted; the queue and history outlive restarts.</li>
+        <li><b>Park and retry</b> — failed jobs park in history, and a retry pulls only the pieces still missing.</li>
+        <li><b>Chaos-tested.</b> A mock NNTP server runs ten end-to-end failure scenarios — 430s, corruption, truncation, stalls, dead servers, kill −9 — on every single test run.</li>
       </ul>
       <ul class="plain">
-        <li><b>Provider reliability scoring</b> — per-server completion rates tracked forever, surfaced in the dashboard (warn &lt;98%).</li>
-        <li><b>Server diversity analyser</b> — STAT-samples across your servers and clusters them by shared gaps: learn which of your providers are actually the same backbone before you pay for redundancy you don't have.</li>
-        <li><b>Quotas, block accounts &amp; disk guard</b> — daily/monthly quotas, lifetime byte budgets for block accounts (auto-excluded when exhausted), low-disk pause, per-provider daily usage history.</li>
-        <li><b>Dupe detection</b> — dupekey/dupescore with alternative promotion: a failed grab automatically promotes the held alternative.</li>
-        <li><b>Retention-aware routing</b> — old posts skip servers whose retention can't have them; unservable posts fail instantly instead of spinning.</li>
+        <li><b>Provider reliability scoring.</b> Per-server completion rates are kept for good and shown in the dashboard, with a warning below 98%.</li>
+        <li><b>Server diversity analyser.</b> It STAT-samples across your servers and clusters them by the gaps they share, so you can tell which "different" providers are really the same backbone before paying for redundancy you don't actually have.</li>
+        <li><b>Quotas, block accounts and a disk guard</b> — daily and monthly quotas, lifetime byte budgets for block accounts (auto-excluded once spent), a low-disk pause, and per-provider daily usage history.</li>
+        <li><b>Dupe detection</b> — dupekey and dupescore, with a held alternative promoted automatically the moment a grab fails.</li>
+        <li><b>Retention-aware routing.</b> Posts older than a server's retention skip it entirely, and anything no server can serve fails at once rather than spinning.</li>
       </ul>
     </div>
   </div>
@@ -137,19 +137,19 @@
     <h2>Automation &amp; integrations</h2>
     <div class="grid2">
       <ul class="plain">
-        <li><b>SABnzbd-compatible API</b> — the full surface the *arrs use: addfile/addurl, categories, priorities, pause/resume per job, retry, pagination, two-tier API keys. Sonarr/Radarr treat it as SABnzbd.</li>
-        <li><b>NZBGet JSON-RPC facade</b> — nzb360, LunaSea and other NZBGet remotes work unmodified.</li>
-        <li><b>Newznab server</b> — your local index answers t=search/tvsearch/movie: the *arrs can use your own scans as an indexer.</li>
-        <li><b>RSS auto-grab</b> — feeds with an NZBGet-style filter language; add/edit live from the dashboard.</li>
-        <li><b>Watchlist</b> — name shows/films (even unaired); per-episode tracking grabs each one on first appearance, upgrades quality until your target (e.g. 720p → 1080p REMUX), optionally deletes the superseded copy only after the upgrade verifies. Airdate calendar shows what's coming.</li>
+        <li><b>SABnzbd-compatible API</b> — the whole surface the *arrs actually use: addfile/addurl, categories, priorities, per-job pause/resume, retry, pagination, two-tier API keys. Sonarr and Radarr talk to it as if it were SABnzbd.</li>
+        <li><b>NZBGet JSON-RPC facade.</b> nzb360, LunaSea and other NZBGet remotes connect unmodified.</li>
+        <li><b>Newznab server.</b> Your local index answers t=search/tvsearch/movie, so the *arrs can treat your own scans as an indexer.</li>
+        <li><b>RSS auto-grab</b> — feeds filtered with an NZBGet-style language, added and edited live from the dashboard.</li>
+        <li><b>Watchlist.</b> Name the shows and films you want, even ones that haven't aired yet. Each episode is grabbed on its first appearance and upgraded until it reaches your target quality (say, 720p → 1080p REMUX), with the superseded copy deleted only after the upgrade has verified. An airdate calendar shows what's coming.</li>
       </ul>
       <ul class="plain">
-        <li><b>Watch folder</b> — drop a .nzb, it downloads and the file disappears.</li>
-        <li><b>Smart folders</b> — regex/keyword/size rules route downloads to categories at enqueue; optional TV filing renames to <code>Show/Season NN/Show - S01E02.ext</code>.</li>
-        <li><b>Cleanup rules</b> — junk extensions deleted post-completion.</li>
-        <li><b>Post-processing scripts</b> — SABnzbd's SAB_* env contract: your existing script ecosystem runs as-is.</li>
-        <li><b>One-click migration</b> — imports servers from SABnzbd ini or NZBGet conf; reads sabnzbd.ini directly if that's all it finds.</li>
-        <li><b>Spotnet ingestion</b> — spot signature verification and NZB synthesis, built in.</li>
+        <li><b>Watch folder.</b> Drop a .nzb in and it downloads; the file disappears once it's been taken.</li>
+        <li><b>Smart folders</b> — regex, keyword and size rules sort downloads into categories at enqueue time, with optional TV filing to <code>Show/Season NN/Show - S01E02.ext</code>.</li>
+        <li><b>Cleanup rules</b> — junk extensions are removed once a job completes.</li>
+        <li><b>Post-processing scripts.</b> They honour SABnzbd's SAB_* environment contract, so the scripts you already have run as they are.</li>
+        <li><b>One-click migration.</b> It imports servers from a SABnzbd ini or an NZBGet conf, and reads sabnzbd.ini directly if that's all it can find.</li>
+        <li><b>Spotnet ingestion</b> — spot signature verification and NZB synthesis, built right in.</li>
       </ul>
     </div>
   </div>
@@ -158,23 +158,23 @@
 <section class="alt">
   <div class="wrap">
     <h2>Indexer &amp; the poster wall</h2>
-    <p class="lead">Scan the groups you care about into a private index, then browse it as a
-    poster wall. All metadata comes from keyless public sources fetched by your install —
-    there is no API key to beg for.</p>
+    <p class="lead">Scan the groups you care about into a private index, then browse the result as a
+    poster wall. Every bit of the metadata is pulled from keyless public sources by your own
+    install — there's no API key to go begging for.</p>
     <figure class="shot"><img src="assets/wall-sheet.jpg" alt="Poster wall detail sheet with rating, cast, synopsis and episode chips" loading="lazy"></figure>
     <div style="height:26px"></div>
     <div class="grid2">
       <ul class="plain">
-        <li><b>Continuous group scanner</b> — incremental OVER scans on your schedule, ~43k headers/s over fanned-out connections; date-bisected first scans (<code>--max-age 2y</code> skips years of headers in ~20 probes).</li>
-        <li><b>Ingest gates</b> — kind/year/resolution/language/size filters keep indexer spam out of your database; obfuscated junk is detected and gated by default.</li>
-        <li><b>Scene-name parser</b> — title/year/episode/quality/source from real-world stems, incl. date-coded dailies, multi-episode codes, ROT13-obfuscated names; releases dedupe into one card per title.</li>
-        <li><b>Instant search</b> — search-as-you-type with quality filters and per-row watch buttons; quality badges everywhere.</li>
+        <li><b>Continuous group scanner.</b> Incremental OVER scans run on your schedule at ~43k headers/s across fanned-out connections. First scans are date-bisected, so <code>--max-age 2y</code> skips years of headers in about 20 probes.</li>
+        <li><b>Ingest gates</b> — filters on kind, year, resolution, language and size keep indexer spam out of your database, and obfuscated junk is caught and gated by default.</li>
+        <li><b>Scene-name parser.</b> It pulls title, year, episode, quality and source out of real-world stems — date-coded dailies, multi-episode codes and ROT13-obfuscated names included — and dedupes releases down to one card per title.</li>
+        <li><b>Instant search</b> — search-as-you-type with quality filters, per-row watch buttons, and quality badges throughout.</li>
       </ul>
       <ul class="plain">
-        <li><b>Keyless enrichment</b> — TVmaze (TV), iTunes Search (movies), public ratings datasets, Wikidata, Wikipedia and AniList fill in posters, ratings + vote counts, cast, genres and plots. Optional OMDb/TMDB keys supported but never required.</li>
-        <li><b>Episode grids</b> — per-season chips, best encode per episode, one click to download; season packs marked; "watch series" per season header.</li>
-        <li><b>Trending rows</b> — new-this-week and hot-right-now strips from post frequency.</li>
-        <li><b>Fix anything</b> — wrong match? Pick from candidates or type the identity yourself; manual metadata is never overwritten. Poster by URL or upload. One button re-enriches a title; one wipes and rebuilds the whole index.</li>
+        <li><b>Keyless enrichment.</b> TVmaze for TV, iTunes Search for film, plus public ratings datasets, Wikidata, Wikipedia and AniList fill in posters, ratings and vote counts, cast, genres and plots. OMDb and TMDB keys work if you have them, but nothing needs one.</li>
+        <li><b>Episode grids</b> — per-season chips with the best encode of each episode a click from downloading, season packs flagged, and a "watch series" on every season header.</li>
+        <li><b>Trending rows</b> — new-this-week and hot-right-now strips built from post frequency.</li>
+        <li><b>Fix anything.</b> Wrong match? Pick from the candidates or just type the right identity — anything you set by hand is never overwritten. Point a poster at a URL or upload one. One button re-enriches a single title; another wipes and rebuilds the whole index.</li>
       </ul>
     </div>
   </div>
@@ -184,8 +184,8 @@
   <div class="wrap">
     <h2>Preview &amp; library</h2>
     <ul class="plain">
-      <li><b>Preview before it finishes</b> — ▶ Play hands your OS player an .m3u served by the daemon, so you can check a download is what you wanted without waiting for it to complete. Checking a point further in pulls the right articles to the front of the queue.</li>
-      <li><b>Library mode</b> — instant *arr completion with .strm pointers; playing one triggers the real download at top priority with background re-verify.</li>
+      <li><b>Preview before it finishes.</b> ▶ Play hands your OS player an .m3u served by the daemon, so you can confirm a download is the thing you wanted without waiting for it to complete. Skip further in and the articles you need jump to the front of the queue.</li>
+      <li><b>Library mode.</b> The *arrs see instant completion via .strm pointers; play one and the real download kicks off at top priority, re-verifying in the background.</li>
     </ul>
   </div>
 </section>
@@ -204,16 +204,16 @@
     <div style="height:10px"></div>
     <div class="grid2">
       <ul class="plain">
-        <li><b>Live charts, no libraries</b> — 1 s polling; throughput area, per-provider stacked area, verify-health timeline, queue burn-down, speed histogram; charts widen their time window with your browser window.</li>
-        <li><b>Resource monitor</b> — CPU, RAM (vs budget), disk write and network on one chart, with a low-disk warning.</li>
-        <li><b>Provider leaderboard</b> — servers re-sort by live performance; per-provider session bytes, connection counts, utilisation, reliability.</li>
-        <li><b>Queue management</b> — drag to reorder, inline priority/category, per-download detail drawer, optimistic pause, "pause for N minutes".</li>
+        <li><b>Live charts, no libraries.</b> Everything polls once a second — a throughput area, per-provider stacked area, a verify-health timeline, queue burn-down, a speed histogram — and the charts widen their time window as you widen the browser.</li>
+        <li><b>Resource monitor</b> — CPU, RAM against budget, disk writes and network on a single chart, with a low-disk warning.</li>
+        <li><b>Provider leaderboard.</b> Servers re-sort themselves by live performance, each showing session bytes, connection count, utilisation and reliability.</li>
+        <li><b>Queue management</b> — drag to reorder, set priority and category inline, open a per-download drawer, pause optimistically, or "pause for N minutes".</li>
       </ul>
       <ul class="plain">
-        <li><b>Everything configurable in-browser</b> — servers (with live connection tests), speed/schedule, connections/window/decoders, disk/quota, watch/scripts, indexing gates, library, RSS, security with key rotation. Settings persist across restarts.</li>
-        <li><b>Diagnostics built in</b> — in-UI log viewer, system benchmark (network/compute/disk ceilings + advice), server-diversity analyser, connection ladder.</li>
-        <li><b>Data usage</b> — 14-day stacked per-provider bars, daily history, lifetime counters for block accounts.</li>
-        <li><b>Quality of life</b> — drag-drop .nzb anywhere, desktop notifications, completion sounds, first-run wizard, <code>serve --open</code>.</li>
+        <li><b>Everything is configurable in the browser</b> — servers (with live connection tests), speed and schedule, connections/window/decoders, disk and quota, watch folders and scripts, indexing gates, library, RSS, and security with key rotation. Settings survive restarts.</li>
+        <li><b>Diagnostics built in</b> — an in-UI log viewer, a system benchmark that finds your network, compute and disk ceilings and tells you what to do about them, the server-diversity analyser, and the connection ladder.</li>
+        <li><b>Data usage</b> — 14-day stacked per-provider bars, daily history, and lifetime counters for block accounts.</li>
+        <li><b>Quality of life.</b> Drag and drop a .nzb anywhere, desktop notifications, completion sounds, a first-run wizard, and <code>serve --open</code>.</li>
       </ul>
     </div>
   </div>
@@ -223,11 +223,11 @@
   <div class="wrap">
     <h2>Deployment</h2>
     <ul class="plain">
-      <li><b>Single self-contained executable</b> — par2 + RAR unpack are native code in the binary — nothing extracted on first use. No runtime, no installer.</li>
-      <li><b>macOS first-class</b> — universal binary (Apple Silicon + Intel), native SwiftUI menu-bar app, launchd unit, Homebrew formula.</li>
-      <li><b>Windows</b> — fully static x64 exe, runs on stock Windows 10/11; double-click launcher with guided setup.</li>
-      <li><b>Linux &amp; Docker</b> — hardened systemd unit; multi-stage Docker image with linuxserver-style PUID/PGID entrypoint; compose file included. <a href="download.html">All platforms →</a></li>
-      <li><b>Guided setup</b> — <code>nzbfast setup</code> interactive wizard, or auto-detection of an existing SABnzbd/NZBGet config. First download in under two minutes.</li>
+      <li><b>Single self-contained executable.</b> par2 and RAR unpacking are native code compiled into the binary — nothing gets extracted on first run, and there's no runtime and no installer to fuss with.</li>
+      <li><b>macOS, first-class</b> — a universal binary for Apple Silicon and Intel, a native SwiftUI menu-bar app, a launchd unit, and a Homebrew formula.</li>
+      <li><b>Windows</b> — a fully static x64 exe that runs on stock Windows 10 and 11, with a double-click launcher and guided setup.</li>
+      <li><b>Linux and Docker</b> — a hardened systemd unit, a multi-stage Docker image with a linuxserver-style PUID/PGID entrypoint, and a compose file in the box. <a href="download.html">All platforms →</a></li>
+      <li><b>Guided setup.</b> Run the <code>nzbfast setup</code> wizard, or let it auto-detect an existing SABnzbd or NZBGet config. You'll have a first download running in under two minutes.</li>
     </ul>
   </div>
 </section>

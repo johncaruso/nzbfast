@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Ytelsestester — nzbfast</title>
-<meta name="description" content="nzbfast vs. SABnzbd, NZBGet og rustnzb: 4 klienter × 6 scenarioer på identisk maskinvare. Ærlige resultater, inkludert etappene nzbfast tapte, med reproduksjonssteg.">
+<meta name="description" content="nzbfast vs. SABnzbd, NZBGet og rustnzb: 4 klienter × 6 scenarioer på identisk maskinvare. Ærlige resultater, inkludert den ene etappen nzbfast ikke vinner, med reproduksjonssteg.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
 <link rel="alternate" hreflang="en" href="benchmarks.html">
@@ -41,10 +41,10 @@
 </div></header>
 
 <div class="hero wrap" style="padding-bottom:6px">
-  <h1>Målt, ikke <em>markedsført</em>.</h1>
+  <h1>Ytelsestester</h1>
   <p class="sub">Fire klienter, seks scenarioer, identisk maskinvare og leverandører, kjøringer
   flettet så leverandørdrift kanselleres. Målingen er <b>tid til en brukbar fil</b> —
-  lastet ned, verifisert, utpakket. Inkluderer de to etappene vi tapte.</p>
+  lastet ned, verifisert, utpakket. Inkluderer den ene etappen vi ikke vinner.</p>
 </div>
 
 <section style="padding-top:26px">
@@ -150,28 +150,17 @@
 <section class="alt">
   <div class="wrap">
     <p class="kicker">Den ærlige spalten</p>
-    <h2>To etapper vi tapte — én nå lukket</h2>
+    <h2>Den ene etappen vi ikke vinner</h2>
     <div class="grid2">
       <div class="card"><h3>Skadet store-mode-post</h3>
-        <p>20 forgiftede artikler i en 7.4 GB REMUX: NZBGet ble ferdig brukbar på <b>53 s</b>; nzbfast
-        tar nå <b>58 s</b> — reparasjon ferdig på 32 s, alle 62 volumer pakket ut på nytt, byte-eksakt
-        utdata. Sluttilstands-buggen en tidligere bygg hadde på akkurat denne banen (reparerte volumer
-        ødelagt av den nye utpakkingen mens exit-koden sa suksess) er fikset, regresjonstestet,
-        og re-validert mot ekte Usenet. Reparasjonen vår henter fortsatt et nær-teoretisk-minimum
-        på 22 gjenopprettingsblokker for 20 nødvendige vs. deres fulle PAR2-runde — men NZBGet beholder etappen med
-        fem sekunder, så den er trykket her.</p></div>
-      <div class="card"><h3>kill −9-gjenopptaking — lukket</h3>
-        <p>Drept ved ~15 GB av en 34.5 GB-jobb pleide dette å være vårt verste tall: NZBGet lastet ned på nytt
-        <b>~0.6 GB</b>, nzbfast <b>15 GB</b> — alt dekodet før PAR2-aktivering døde med
-        prosessen. Journalen registrerer nå hver artikkels fysiske plassering, så en gjenopptaking
-        gjenoppretter de bytene fra forrige kjørings egne utdatafiler (en lokal diskkopi, hver
-        byte re-verifisert mot PAR2-blokkartet) og laster ned på nytt <b>~0.3 GB</b> — paritet
-        innenfor leverandørstøy. SABnzbd har, for ordens skyld, aldri kommet seg etter dette scenarioet i
-        tre runder: drept på samme måte hentet den 0.5 GB på nytt på en time og fikk tidsavbrudd.</p></div>
+        <p>20 forgiftede artikler i en 7.4 GB REMUX: NZBGet ble ferdig brukbar på <b>53 s</b>, nzbfast
+        på <b>58 s</b>. Reparasjonen vår er ferdig på 32 s, pakker ut alle 62 volumer på nytt, og utdataen
+        er byte-eksakt — og den henter et nær-teoretisk-minimum på 22 gjenopprettingsblokker for de 20
+        som trengs, mot NZBGets fulle PAR2-runde. Men NZBGet tar etappen med fem sekunder, så her er den.</p></div>
     </div>
-    <div class="callout">Hvorfor publisere tap? Fordi seirene bare er troverdige ved siden av dem.
-    Hvert tall på denne siden kommer fra de samme flettede kjøringene, og repoets
-    benchmark-logg er en fullstendig laboratoriejournal — negative resultater inkludert.</div>
+    <div class="callout">Hvorfor vise et tap i det hele tatt? Fordi seirene bare er troverdige ved siden av det.
+    Hvert tall på denne siden kommer fra de samme flettede kjøringene, og repoet holder hele greia
+    som en fullstendig laboratoriejournal — negative resultater inkludert.</div>
   </div>
 </section>
 
@@ -245,8 +234,8 @@
       <li><b>CPU-margin</b>: målte dekode+verifiser-tak på 86–165 Gbps på Apple-silisium — nettverket er flaskehalsen med 4–50× på hver maskin som er testet.</li>
     </ul>
     <div class="callout">Stående regel fra repoet: <b>hvert ytelsesutsagn siterer en reproduserbar
-    kommando og betingelsene det kjørte under.</b> Den fullstendige laboratoriejournalen — inkludert negative
-    resultater og feilspor — holdes som en datert laboratoriejournal.</div>
+    kommando og betingelsene det kjørte under.</b> Alt sammen ligger i repoet som en datert
+    laboratoriejournal — negative resultater og feilspor inkludert.</div>
   </div>
 </section>
 

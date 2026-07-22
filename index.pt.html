@@ -42,10 +42,10 @@
 
 <div class="hero wrap">
   <h1>Do NZB a um <em>arquivo verificado</em><br>antes de os outros terminarem de baixar.</h1>
-  <p class="sub">O nzbfast é um baixador da Usenet construído em torno de um pipeline de passagem única:
+  <p class="sub">O nzbfast é um baixador da Usenet construído em torno de uma única passagem:
   cada byte é decodificado, verificado e extraído <b>enquanto baixa</b>.
-  Sem passagem de montagem, sem passagem de verificação, sem passagem de extração — quando a barra de progresso
-  enche, o arquivo está pronto e comprovadamente intacto.</p>
+  Não há passagem de montagem depois, nada sobra para verificar ou extrair quando termina — no instante
+  em que a barra de progresso enche, o arquivo está pronto e comprovadamente intacto.</p>
   <div class="chips">
     <span class="chip"><b>8,31&nbsp;Gbps</b> em uma linha de 10&nbsp;GbE</span>
     <span class="chip"><b>190&nbsp;GB → 4m44s</b> até um arquivo verificado</span>
@@ -65,23 +65,23 @@
   <div class="wrap">
     <p class="kicker">Por que é rápido</p>
     <h2>Três ideias que os clientes convencionais não exploram por completo</h2>
-    <p class="lead">Não é micro-otimização — é arquitetura. Cada uma é medida em
-    <a href="benchmarks.pt.html">nosso benchmark log</a> com comandos reproduzíveis.</p>
+    <p class="lead">Isto é arquitetura, não micro-otimização, e cada detalhe é medido em
+    <a href="benchmarks.pt.html">nosso benchmark log</a> com comandos que você mesmo pode reexecutar.</p>
     <div class="grid3">
       <div class="card"><span class="ic">🔁</span><h3>NNTP com pipeline</h3>
-        <p>Várias solicitações de artigos ficam em trânsito por conexão, então as idas e voltas nunca
-        deixam o socket ocioso — e o TCP nunca degrada sua janela de congestionamento entre artigos.
-        Medido de +12% a +270% sobre o modo serial em quatro sites; uma linha satura com 8
+        <p>Várias solicitações de artigos ficam em trânsito em cada conexão, então uma ida e volta nunca
+        deixa o socket ocioso e o TCP nunca deixa sua janela de congestionamento degradar entre artigos.
+        Em quatro locais, medimos de +12% a +270% sobre o serial, e uma linha satura com 8
         conexões em vez de 30–50.</p></div>
       <div class="card"><span class="ic">🚿</span><h3>O pipeline de passagem única</h3>
-        <p>Os artigos são decodificados por SIMD no lugar, escritos uma vez em seus deslocamentos finais,
-        verificados por PAR2 a partir dos buffers de decodificação, e o conteúdo de RAR em modo armazenamento é
-        extraído <i>durante</i> o download — os volumes nunca existem como arquivos.
-        Escritas em disco = conteúdo × 1,0.</p></div>
+        <p>Os artigos são decodificados por SIMD no próprio lugar e escritos uma única vez, direto para seus
+        deslocamentos finais, e então verificados por PAR2 a partir dos mesmos buffers de decodificação.
+        Nas publicações RAR em modo armazenamento, o conteúdo é extraído <i>durante</i> o download, então os
+        volumes nunca existem como arquivos — o disco escrito fica em conteúdo × 1,0.</p></div>
       <div class="card"><span class="ic">🕸️</span><h3>Disponibilidade por união</h3>
-        <p>Um artigo só está "ausente" quando <i>todo</i> backbone configurado o recusou.
-        A contabilidade exata por bloco decide COMPLETE / REPAIRABLE / IMPOSSIBLE antes de
-        desperdiçar bytes, busca o mínimo sob medida de blocos de recuperação e aborta
+        <p>Um artigo só conta como "ausente" quando <i>todo</i> backbone configurado o recusou.
+        A contabilidade exata por bloco declara o trabalho COMPLETE, REPAIRABLE ou IMPOSSIBLE antes de
+        desperdiçar bytes, puxa apenas o mínimo sob medida de blocos de recuperação e descarta
         downloads sem esperança em segundos.</p></div>
     </div>
   </div>
@@ -95,15 +95,15 @@
     de novo para extrair e então escrevem a saída — cerca de 2× escritas e 2× leituras.
     O nzbfast faz assim:</p>
     <div class="pipe"><pre>
-socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s per core)
+socket ──TLS──▶ <b>decodificação SIMD rapidyenc</b> (no lugar — 4,95 GB/s por núcleo)
                    │
-                   ├─▶ <b>pwrite at final offset</b>          (plain posts)
-                   │      └─ or: RAR-map translate ─▶ pwrite straight into the
-                   │         <em>extracted</em> file (store-mode posts — the rar
-                   │         volumes never touch disk)
-                   ├─▶ <b>PAR2 block hasher</b> — every block MD5-verified from the
-                   │      decode buffer; verification finishes with the download
-                   └─▶ <b>availability ledger</b> — block-exact health, live
+                   ├─▶ <b>pwrite no deslocamento final</b>     (posts simples)
+                   │      └─ ou: tradução RAR-map ─▶ pwrite direto no
+                   │         arquivo <em>extraído</em> (posts em modo store — os
+                   │         volumes rar nunca tocam o disco)
+                   ├─▶ <b>hasher de blocos PAR2</b> — cada bloco verificado em MD5 do
+                   │      buffer de decodificação; a verificação termina com o download
+                   └─▶ <b>registro de disponibilidade</b> — saúde exata por bloco, ao vivo
 </pre></div>
     <div class="callout">Publicação danificada? Os blocos defeituosos são conhecidos no instante em que seus artigos falham,
     o <b>mínimo sob medida</b> de volumes de recuperação é buscado <b>durante</b> o download
@@ -142,10 +142,10 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
   <div class="wrap">
     <p class="kicker">Benchmarks</p>
     <h2>190,6 GB → um arquivo verificado de 167,9 GB</h2>
-    <p class="lead">Mesma máquina, mesmos seis provedores, execuções intercaladas uma atrás da outra.
-    Tempo até existir um arquivo utilizável e extraído — a única métrica que importa.
-    Cada concorrente ajustado ao seu melhor documentado (inclusive ligando o pipeline do SABnzbd,
-    que vem <i>desligado</i>).</p>
+    <p class="lead">Mesma máquina, mesmos seis provedores, execuções intercaladas uma logo após a outra.
+    O que é cronometrado é o momento em que existe um arquivo utilizável e extraído — a única métrica que
+    realmente importa. Cada concorrente foi ajustado ao próprio melhor documentado, a ponto de ligar o pipeline
+    do SABnzbd, que vem <i>sem</i> ele.</p>
     <div class="bars">
       <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:24%"></i></span><span class="t">4m 44s</span></div>
       <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:36%"></i></span><span class="t">7m 06s · +50%</span></div>
@@ -153,8 +153,8 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
       <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">nenhum arquivo utilizável</span></div>
     </div>
     <p class="note" style="text-align:left">NZB de 190,6 GB → um único mkv de 167,9 GB, M1 Ultra em 10 GbE, 6 provedores × 8 conexões.
-    O mesmo trabalho termina dentro de um orçamento de memória de 1 GB. Tabelas completas, seis cenários e os legs que <i>perdemos</i> — além de como reproduzir —
-    na <a href="benchmarks.pt.html">página de benchmarks</a>.</p>
+    O mesmo trabalho também termina dentro de um orçamento de memória de 1 GB. Tabelas completas, todos os seis cenários e o único leg que <i>não vencemos</i> — além de como reproduzi-los —
+    estão na <a href="benchmarks.pt.html">página de benchmarks</a>.</p>
   </div>
 </section>
 
@@ -162,9 +162,9 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
   <div class="wrap">
     <p class="kicker">A vitrine</p>
     <h2>Seu índice, apresentado como um mural de pôsteres</h2>
-    <p class="lead">O indexador integrado varre os newsgroups que você se importa; o mural transforma
-    o resultado em pôsteres, notas, elenco e grades de episódios — usando apenas fontes públicas
-    sem chave, buscadas pela sua própria instalação. Clique num chip de episódio para baixá-lo.</p>
+    <p class="lead">O indexador integrado varre os newsgroups que lhe interessam, e o mural transforma
+    o que encontra em pôsteres, notas, elenco e grades de episódios — tudo a partir de fontes públicas
+    sem chave que a sua própria instalação busca. Clique num chip de episódio para baixá-lo.</p>
     <figure class="shot"><img src="assets/wall-grid.jpg" alt="Mural de pôsteres do nzbfast: uma grade de pôsteres de TV com emblemas de qualidade, notas e contagens de temporadas" loading="lazy"></figure>
     <div style="height:18px"></div>
     <div class="strip">
@@ -181,10 +181,10 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
     <p class="kicker">Encaixa no seu setup</p>
     <h2>Aponte suas ferramentas existentes para ele</h2>
     <div class="grid3">
-      <div class="card"><h3>Sonarr / Radarr</h3><p>API totalmente compatível com o SABnzbd — adicione o nzbfast como
-        cliente de download "SABnzbd" e simplesmente funciona: capturas, categorias, prioridades, repetições,
-        scripts de pós-processamento (contrato SAB_*), histórico. A fachada Newznab também permite que os
-        *arrs <i>pesquisem seu índice local</i> como se fosse um indexador.</p></div>
+      <div class="card"><h3>Sonarr / Radarr</h3><p>Ele traz a API completa compatível com o SABnzbd, então você
+        adiciona o nzbfast como cliente de download "SABnzbd" e ele simplesmente funciona — capturas, categorias,
+        prioridades, repetições, scripts de pós-processamento no contrato SAB_*, histórico. A fachada Newznab vai
+        além e deixa os *arr <i>pesquisarem seu índice local</i> como se fosse um indexador.</p></div>
       <div class="card"><h3>nzb360 / LunaSea</h3><p>O daemon também fala o JSON-RPC do NZBGet —
         os populares controles remotos de celular pilotam o nzbfast sem modificação. E o próprio painel tem um
         layout de celular de primeira classe para quando você está longe da tela grande.</p></div>
@@ -200,8 +200,8 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
   <div class="wrap" style="text-align:center">
     <h2>Experimente nos próximos dois minutos</h2>
     <p class="lead" style="margin-left:auto;margin-right:auto">Descompacte, dê duplo clique no lançador, responda
-    três perguntas (ou deixe-o encontrar sua configuração do SABnzbd), e o painel abre. Primeiro
-    download em dois minutos.</p>
+    três perguntas — ou deixe-o encontrar sua configuração existente do SABnzbd — e o painel abre. Seu primeiro
+    download chega em menos de dois minutos.</p>
     <div class="btnrow">
       <a class="btn" href="download.pt.html">Baixar o nzbfast</a>
       <a class="btn ghost" href="features.pt.html">Ler a lista completa de recursos</a>

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Benchmarks — nzbfast</title>
-<meta name="description" content="nzbfast vs. SABnzbd, NZBGet und rustnzb: 4 Clients × 6 Szenarien auf identischer Hardware. Ehrliche Ergebnisse inklusive der Etappen, die nzbfast verloren hat, mit Reproduktionsanleitung.">
+<meta name="description" content="nzbfast vs. SABnzbd, NZBGet und rustnzb: 4 Clients × 6 Szenarien auf identischer Hardware. Ehrliche Ergebnisse inklusive der einen Etappe, die nzbfast nicht gewinnt, mit Reproduktionsanleitung.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
 <link rel="alternate" hreflang="en" href="benchmarks.html">
@@ -41,10 +41,10 @@
 </div></header>
 
 <div class="hero wrap" style="padding-bottom:6px">
-  <h1>Gemessen, nicht <em>vermarktet</em>.</h1>
+  <h1>Benchmarks</h1>
   <p class="sub">Vier Clients, sechs Szenarien, identische Hardware und Provider, Läufe
   verschränkt, sodass sich Provider-Drift aufhebt. Die Kennzahl ist <b>Zeit bis zur benutzbaren Datei</b> —
-  geladen, geprüft, entpackt. Inklusive der zwei Etappen, die wir verloren haben.</p>
+  geladen, geprüft, entpackt. Inklusive der einen Etappe, die wir nicht gewinnen.</p>
 </div>
 
 <section style="padding-top:26px">
@@ -150,28 +150,18 @@
 <section class="alt">
   <div class="wrap">
     <p class="kicker">Die ehrliche Spalte</p>
-    <h2>Zwei verlorene Etappen — eine inzwischen geschlossen</h2>
+    <h2>Die eine Etappe, die wir nicht gewinnen</h2>
     <div class="grid2">
       <div class="card"><h3>Beschädigter Store-Modus-Post</h3>
-        <p>20 vergiftete Artikel in einem 7.4 GB REMUX: NZBGet wurde in <b>53 s</b> benutzbar fertig; nzbfast
-        braucht jetzt <b>58 s</b> — Reparatur in 32 s abgeschlossen, alle 62 Volumes neu entpackt, byte-exakte
-        Ausgabe. Der Endzustands-Bug, den ein früherer Build auf genau diesem Pfad hatte (reparierte Volumes
-        durch das erneute Entpacken zerstört, während der Exit-Code Erfolg meldete), ist behoben, regressionsgetestet
-        und gegen echtes Usenet neu validiert. Unsere Reparatur holt weiterhin nahezu das theoretische Minimum von
-        22 Recovery-Blöcken für 20 benötigte gegenüber ihrem vollen PAR2-Durchlauf — aber NZBGet gewinnt die
-        Etappe um fünf Sekunden, also steht sie hier.</p></div>
-      <div class="card"><h3>kill −9-Wiederaufnahme — geschlossen</h3>
-        <p>Bei ~15 GB eines 34.5 GB-Jobs abgeschossen, war das mal unsere schlechteste Zahl: NZBGet lud
-        <b>~0.6 GB</b> erneut, nzbfast <b>15 GB</b> — alles, was vor der PAR2-Aktivierung dekodiert war, starb mit
-        dem Prozess. Das Journal erfasst jetzt die physische Platzierung jedes Artikels, sodass eine Wiederaufnahme
-        diese Bytes aus den eigenen Ausgabedateien des vorigen Laufs wiederherstellt (eine lokale Plattenkopie, jedes
-        Byte erneut gegen die PAR2-Block-Karte geprüft) und <b>~0.3 GB</b> neu lädt — Gleichstand innerhalb des
-        Provider-Rauschens. SABnzbd hat sich, fürs Protokoll, in drei Runden nie von diesem Szenario erholt:
-        gleich abgeschossen, holte es 0.5 GB in einer Stunde neu und lief in einen Timeout.</p></div>
+        <p>20 vergiftete Artikel in einem 7.4 GB REMUX: NZBGet wird in <b>53 s</b> benutzbar fertig, nzbfast
+        in <b>58 s</b>. Unsere Reparatur ist in 32 s abgeschlossen, entpackt alle 62 Volumes neu, und die
+        Ausgabe ist byte-exakt — und sie holt mit 22 Recovery-Blöcken für die 20 benötigten nahezu das
+        theoretische Minimum, gegenüber NZBGets vollem PAR2-Durchlauf. Aber NZBGet gewinnt die Etappe um
+        fünf Sekunden, also steht sie hier.</p></div>
     </div>
-    <div class="callout">Warum Niederlagen veröffentlichen? Weil die Siege nur daneben glaubwürdig sind.
-    Jede Zahl auf dieser Seite stammt aus denselben verschränkten Läufen, und unser Benchmark-Log im Repo
-    ist ein komplettes Laborbuch — negative Ergebnisse inklusive.</div>
+    <div class="callout">Warum überhaupt eine Niederlage zeigen? Weil die Siege nur daneben glaubwürdig sind.
+    Jede Zahl auf dieser Seite stammt aus denselben verschränkten Läufen, und das Repo hält das Ganze als
+    komplettes Laborbuch fest — negative Ergebnisse inklusive.</div>
   </div>
 </section>
 
@@ -245,8 +235,8 @@
       <li><b>Rechen-Reserve</b>: gemessene Decode-+-Prüf-Obergrenzen von 86–165 Gbps auf Apple Silicon — das Netzwerk ist auf jeder getesteten Maschine um 4–50× der Flaschenhals.</li>
     </ul>
     <div class="callout">Stehende Regel aus dem Repo: <b>jede Perf-Behauptung nennt einen reproduzierbaren
-    Befehl und die Bedingungen, unter denen er lief.</b> Das komplette Laborbuch — inklusive negativer
-    Ergebnisse und Irrwege — wird als datiertes Laborbuch geführt.</div>
+    Befehl und die Bedingungen, unter denen er lief.</b> Das Ganze wird im Repo als datiertes Laborbuch
+    geführt — negative Ergebnisse und Irrwege inklusive.</div>
   </div>
 </section>
 

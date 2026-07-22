@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Benchmark-uri — nzbfast</title>
-<meta name="description" content="nzbfast vs SABnzbd, NZBGet și rustnzb: 4 clienți × 6 scenarii pe hardware identic. Rezultate oneste, inclusiv probele pe care nzbfast le-a pierdut, cu pași de reproducere.">
+<meta name="description" content="nzbfast vs SABnzbd, NZBGet și rustnzb: 4 clienți × 6 scenarii pe hardware identic. Rezultate oneste, inclusiv singura probă pe care nzbfast n-o câștigă, cu pași de reproducere.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
 <link rel="alternate" hreflang="en" href="benchmarks.html">
@@ -41,10 +41,10 @@
 </div></header>
 
 <div class="hero wrap" style="padding-bottom:6px">
-  <h1>Măsurat, nu <em>promovat</em>.</h1>
+  <h1>Benchmark-uri</h1>
   <p class="sub">Patru clienți, șase scenarii, hardware și provideri identici, rulări
   intercalate ca variația providerilor să se anuleze. Măsura este <b>timpul până la un fișier utilizabil</b> —
-  descărcat, verificat, extras. Include cele două probe pe care le-am pierdut.</p>
+  descărcat, verificat, extras. Include singura probă pe care n-o câștigăm.</p>
 </div>
 
 <section style="padding-top:26px">
@@ -150,28 +150,18 @@
 <section class="alt">
   <div class="wrap">
     <p class="kicker">Coloana onestă</p>
-    <h2>Două probe pe care le-am pierdut — una acum închisă</h2>
+    <h2>Singura probă pe care n-o câștigăm</h2>
     <div class="grid2">
       <div class="card"><h3>Postare deteriorată în mod store</h3>
-        <p>20 de articole otrăvite într-un REMUX de 7.4 GB: NZBGet a terminat cu un fișier utilizabil în <b>53 s</b>; nzbfast
-        acum durează <b>58 s</b> — reparare completă în 32 s, toate cele 62 de volume reextrase, ieșire exactă
-        la octet. Bug-ul de stare finală pe care un build anterior îl avea pe exact această cale (volume reparate
-        distruse de reextragere în timp ce codul de ieșire spunea succes) este rezolvat, testat pentru regresie
-        și revalidat pe Usenet real. Repararea noastră tot preia 22 de blocuri de recuperare, aproape de
-        minimul teoretic, pentru 20 necesare, față de trecerea PAR2 completă a lor — dar NZBGet câștigă proba la
-        cinci secunde, așa că e trecută aici.</p></div>
-      <div class="card"><h3>reluare kill −9 — închisă</h3>
-        <p>Oprit la ~15 GB dintr-un job de 34.5 GB, acesta era cândva cel mai prost număr al nostru: NZBGet a redescărcat
-        <b>~0.6 GB</b>, nzbfast <b>15 GB</b> — tot ce a fost decodat înainte de activarea PAR2 a murit odată cu
-        procesul. Jurnalul înregistrează acum plasarea fizică a fiecărui articol, așa că o reluare
-        restaurează acei octeți din fișierele de ieșire ale rulării anterioare (o copie pe discul local, fiecare
-        octet reverificat în raport cu harta de blocuri PAR2) și redescarcă <b>~0.3 GB</b> — paritate
-        în limita zgomotului providerilor. SABnzbd, pentru consemnare, nu s-a recuperat niciodată din acest scenariu în
-        trei runde: oprit în același mod, a repreluat 0.5 GB într-o oră și a expirat.</p></div>
+        <p>20 de articole otrăvite într-un REMUX de 7.4 GB: NZBGet termină cu un fișier utilizabil în <b>53 s</b>,
+        nzbfast în <b>58 s</b>. Repararea noastră se încheie în 32 s, reextrage toate cele 62 de volume, iar
+        ieșirea e exactă la octet — și preia doar 22 de blocuri de recuperare, aproape de minimul teoretic,
+        pentru cele 20 necesare, față de trecerea PAR2 completă a lui NZBGet. Dar NZBGet ia proba cu cinci
+        secunde, așa că iat-o aici.</p></div>
     </div>
-    <div class="callout">De ce publicăm pierderile? Pentru că victoriile sunt credibile doar alături de ele.
+    <div class="callout">De ce să arătăm măcar o pierdere? Pentru că victoriile sunt credibile doar alături de ea.
     Fiecare număr de pe această pagină provine din aceleași rulări intercalate, iar
-    jurnalul nostru de benchmark din repo este un caiet de laborator complet — cu rezultate negative incluse.</div>
+    repo-ul ține totul ca un caiet de laborator complet — cu rezultate negative incluse.</div>
   </div>
 </section>
 
@@ -245,8 +235,8 @@
       <li><b>Marjă de calcul</b>: plafoane măsurate de decodare+verificare de 86–165 Gbps pe Apple silicon — rețeaua este strangularea cu 4–50× pe fiecare mașină testată.</li>
     </ul>
     <div class="callout">Regulă permanentă din repo: <b>fiecare afirmație de performanță citează o comandă
-    reproductibilă și condițiile în care a rulat.</b> Caietul de laborator complet — inclusiv rezultatele
-    negative și pașii greșiți — este ținut ca un caiet de laborator datat.</div>
+    reproductibilă și condițiile în care a rulat.</b> Totul e ținut în repo ca un caiet de laborator datat —
+    inclusiv rezultatele negative și pașii greșiți.</div>
   </div>
 </section>
 

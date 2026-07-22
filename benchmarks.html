@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Benchmarks — nzbfast</title>
-<meta name="description" content="nzbfast vs SABnzbd, NZBGet and rustnzb: 4 clients × 6 scenarios on identical hardware. Honest results including the legs nzbfast lost, with reproduction steps.">
+<meta name="description" content="nzbfast vs SABnzbd, NZBGet and rustnzb: 4 clients × 6 scenarios on identical hardware. Honest results including the one leg nzbfast doesn't win, with reproduction steps.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
 <link rel="alternate" hreflang="en" href="benchmarks.html">
@@ -41,10 +41,10 @@
 </div></header>
 
 <div class="hero wrap" style="padding-bottom:6px">
-  <h1>Measured, not <em>marketed</em>.</h1>
+  <h1>Benchmarks</h1>
   <p class="sub">Four clients, six scenarios, identical hardware and providers, runs
   interleaved so provider drift cancels. The metric is <b>time to a usable file</b> —
-  downloaded, verified, extracted. Includes the two legs we lost.</p>
+  downloaded, verified, extracted. Includes the one leg we don't win.</p>
 </div>
 
 <section style="padding-top:26px">
@@ -150,28 +150,17 @@
 <section class="alt">
   <div class="wrap">
     <p class="kicker">The honest column</p>
-    <h2>Two legs we lost — one now closed</h2>
+    <h2>The one leg we don't win</h2>
     <div class="grid2">
       <div class="card"><h3>Damaged store-mode post</h3>
-        <p>20 poisoned articles in a 7.4 GB REMUX: NZBGet finished usable in <b>53 s</b>; nzbfast
-        now takes <b>58 s</b> — repair complete in 32 s, all 62 volumes re-extracted, byte-exact
-        output. The end-state bug an earlier build had on this exact path (repaired volumes
-        wrecked by the re-extract while the exit code said success) is fixed, regression-tested,
-        and re-validated against real Usenet. Our repair still fetches a near-theoretical-minimum
-        22 recovery blocks for 20 needed vs their full PAR2 pass — but NZBGet keeps the leg by
-        five seconds, so it's printed here.</p></div>
-      <div class="card"><h3>kill −9 resume — closed</h3>
-        <p>Killed at ~15 GB of a 34.5 GB job, this used to be our worst number: NZBGet re-downloaded
-        <b>~0.6 GB</b>, nzbfast <b>15 GB</b> — everything decoded before PAR2 activation died with
-        the process. The journal now records every article's physical placement, so a resume
-        restores those bytes from the previous run's own output files (a local disk copy, each
-        byte re-verified against the PAR2 block map) and re-downloads <b>~0.3 GB</b> — parity
-        within provider noise. SABnzbd, for the record, has never recovered from this scenario in
-        three rounds: killed the same way, it re-fetched 0.5 GB in an hour and timed out.</p></div>
+        <p>20 poisoned articles in a 7.4 GB REMUX: NZBGet finishes usable in <b>53 s</b>, nzbfast
+        in <b>58 s</b>. Our repair completes in 32 s, re-extracts all 62 volumes, and the output is
+        byte-exact — and it pulls a near-theoretical-minimum 22 recovery blocks for the 20 needed,
+        against NZBGet's full PAR2 pass. But NZBGet takes the leg by five seconds, so here it is.</p></div>
     </div>
-    <div class="callout">Why publish losses? Because the wins are only believable next to them.
-    Every number on this page comes from the same interleaved runs, and the repo's
-    our benchmark log is a full lab notebook — negative results included.</div>
+    <div class="callout">Why show a loss at all? Because the wins are only believable next to it.
+    Every number on this page comes from the same interleaved runs, and the repo keeps the whole
+    thing as a full lab notebook — negative results included.</div>
   </div>
 </section>
 
@@ -245,8 +234,8 @@
       <li><b>Compute headroom</b>: measured decode+verify ceilings of 86–165 Gbps on Apple silicon — the network is the bottleneck by 4–50× on every machine tested.</li>
     </ul>
     <div class="callout">Standing rule from the repo: <b>every perf claim cites a reproducible
-    command and the conditions it ran under.</b> The full lab notebook — including negative
-    results and wrong turns — is kept as a dated lab notebook.</div>
+    command and the conditions it ran under.</b> The whole thing lives in the repo as a dated
+    lab notebook — negative results and wrong turns included.</div>
   </div>
 </section>
 

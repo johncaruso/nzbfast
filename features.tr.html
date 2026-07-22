@@ -41,8 +41,8 @@
 </div></header>
 
 <div class="hero wrap" style="padding-bottom:6px">
-  <h1>Her özellik, <em>tek sayfa</em>.</h1>
-  <p class="sub">Önce kısa sürüm; tüm makine aşağıda.</p>
+  <h1>Özellikler</h1>
+  <p class="sub">Kısa özet en üstte, tüm ayrıntı aşağıda.</p>
 </div>
 
 <section style="padding-top:26px">
@@ -71,20 +71,20 @@
     <h2>Motor &amp; hız</h2>
     <div class="grid2">
       <ul class="plain">
-        <li><b>İşlem hattı NNTP</b> — bağlantı başına uçuşta birden çok istek hem gidiş-dönüş gecikmesini hem de TCP tıkanıklık penceresi düşüşünü yener; seriye karşı +%12…+%270 ölçüldü. Hatları sunucu başına ~8 bağlantıyla doyurur.</li>
-        <li><b>SIMD yEnc kod çözme</b> (rapidyenc, NEON/AVX çekirdekleri) — çekirdek başına 4.95 GB/s, alım yolunda yerinde kod çözülür.</li>
-        <li><b>Çoklu sunucu paylaşımlı kuyruk</b> — sağlayıcılar ayar olmadan ~%2 içinde kendini dengeler; kuyruk sonu çift gönderimli sunucu başına hız farkındalığıyla tek bir yavaş sunucu bir işin kuyruğunu sürükleyemez.</li>
-        <li><b>İşler arası ıslatma</b> — N işinin kuyruğu N+1 işinin başlangıcıyla örtüşür: hat bir kuyruk boyunca uçtan uca yanık kalır (kıyaslamada SABnzbd'nin %61 karanlığına karşı %2 boşta).</li>
-        <li><b>Yavaş iş bekçisi</b> — diğerleri beklerken tek bir yavaş sunucuda sürünen bir indirme kuyruğun sonuna otomatik ertelenir (ilerleme korunur) ve kuyruk boşaldığında sürdürülür.</li>
-        <li><b>Boştaki sunucu ön yüklemesi</b> — etkin işin kullanamadığı sunucular (makaleleri onlarda değil) boşta durmak yerine bir sonraki kuyruktaki işi başlatır.</li>
+        <li><b>İşlem hattı NNTP.</b> Her bağlantıda birkaç isteği uçuşta tutmak hem gidiş-dönüş gecikmesini hem de TCP'nin tıkanıklık penceresi düşüşünü yener. Seri getirmeye göre +%12 ile +%270 arasında ölçüyoruz; hattı doyurmak için sunucu başına yaklaşık 8 bağlantı yetiyor.</li>
+        <li><b>SIMD yEnc kod çözme</b> (rapidyenc, NEON ve AVX çekirdekleriyle) çekirdek başına 4.95 GB/s hızında çalışır; baytlar alım yoluna düştükçe yerinde çözülür.</li>
+        <li><b>Çoklu sunucu paylaşımlı kuyruk.</b> Sağlayıcılar hiçbir ayar gerektirmeden ~%2 içinde kendini dengeler. Her birinin gerçek hızı izlenir ve işin son kısmı çift gönderilir; böylece tek bir yavaş sunucu bitişi geciktiremez.</li>
+        <li><b>İşler arası süreklilik.</b> N işinin son kısmı N+1 işinin başlangıcıyla örtüşür, böylece hat bütün kuyruk boyunca uçtan uca yanık kalır — aynı kıyaslamada burada %2 boşta kalınırken SABnzbd %61 karanlıkta.</li>
+        <li><b>Yavaş iş bekçisi.</b> Geri kalanı boştayken tek bir yavaş sunucuda sürünen bir indirme, ilerlemesi korunarak kuyruğun sonuna alınır ve kuyruk boşaldığında kaldığı yerden devam eder.</li>
+        <li><b>Boştaki sunucu ön getirmesi</b> — etkin işin kullanamadığı bir sunucu (makaleler orada saklanmadığı için) boşta beklemek yerine kuyruktaki bir sonraki işe başlar.</li>
       </ul>
       <ul class="plain">
-        <li><b>Bağlantı ayarı merdiveni</b> — tahmin etmek yerine her sağlayıcının gerçek verim dizini (istenen vs verilen bağlantılar) ölçer.</li>
-        <li><b>Otomatik hız denetçisi</b> — isteğe bağlı LEDBAT tarzı RTT denetçisi, hattın geri kalanını kullanırken evinin trafiğine öncelik verir.</li>
-        <li><b>Hız sınırları &amp; haftalık zamanlayıcı</b> — canlı ayarlanabilir üst sınırlar, yerel saat (DST güvenli) zamanlama, otomatik sürdürmeli "N dakika duraklat".</li>
-        <li><b>Bellek bütçesi</b> — tek bir küresel RAM bütçesi (otomatik: RAM/4, kelepçeli; geçersiz kılınabilir). Bütçe daralınca tamponları küçültür, sonra diske döker ve iş durulunca geri okur — asla takasa girmez. 190 GB'lık bir iş 1 GB bütçenin içinde tamamlanır (~1.1 GB zirve RSS); bir 2 GB NAS profili ölçüldü ve belgelendi.</li>
-        <li><b>Geri basınç</b> — yavaş bir disk RAM'i doldurmak yerine soketleri kısar (bir yazma üst sınırının ±%1'i içinde kalır, RAM baskı altında <i>düşerken</i>).</li>
-        <li><b>İş sonrası bellek budaması</b> — arka plan süreci boştayken serbest belleği işletim sistemine geri verir (macOS'ta işler arası ayak izi ~8 MB'a düşer).</li>
+        <li><b>Bağlantı ayarı merdiveni.</b> Tahmin yürütmek yerine, her sağlayıcının veriminin gerçekte nerede tırmanmayı bıraktığını ölçer — istenen bağlantılara karşı verilenler — ve orada karar kılar.</li>
+        <li><b>Otomatik hız yöneticisi</b> — isteğe bağlı, LEDBAT tarzı bir RTT yöneticisi; evindeki diğer trafiğe yol verir ve hattan geriye kalanı kullanır.</li>
+        <li><b>Hız sınırları ve haftalık zamanlayıcı</b> — canlı ayarlanabilen üst sınırlar, yerel saate göre (yaz saati uyumlu) bir zamanlama ve kendiliğinden devam eden bir "N dakika duraklat".</li>
+        <li><b>Bellek bütçesi.</b> Tek bir küresel RAM bütçesi (otomatik: RAM'in dörtte biri, sınırlı, geçersiz kılınabilir). Bütçe daraldıkça önce tamponlar küçülür, sonra veriler diske dökülür ve iş yatıştığında geri okunur. Asla takasa girmez. 190 GB'lık bir iş, ~1.1 GB zirve RSS ile 1 GB bütçenin içinde biter; NAS kutuları için ölçülmüş ve belgelenmiş bir 2 GB profili de var.</li>
+        <li><b>Geri basınç.</b> Yavaş bir disk, RAM'in dolmasına izin vermek yerine soketleri kısar — bir yazma üst sınırının ±%1'i içinde tutar ve RAM baskı altında aslında <i>düşer</i>.</li>
+        <li><b>İş sonrası bellek budaması</b> — arka plan süreci boşa çıktığında serbest kalan belleği işletim sistemine geri verir; macOS'ta işler arasında ~8 MB'a kadar iner.</li>
       </ul>
     </div>
   </div>
@@ -95,16 +95,16 @@
     <h2>Tek geçişli işlem hattı</h2>
     <div class="grid2">
       <ul class="plain">
-        <li><b>Bir kez yaz</b> — kod çözülen makaleler son dosya ofsetlerine pwrite ile yazılır. Geçici dosya yok, birleştirme geçişi yok.</li>
-        <li><b>Akış içi PAR2 doğrulaması</b> — her blok geldikçe kod çözme tamponlarından MD5 ile özetlenir; doğrulama indirme bittiğinde biter. Rakiplerin hızlı denetiminden güçlü ve bedava.</li>
-        <li><b>Doğrudan çıkarma</b> — depolama modu RAR gönderileri (çoğu scene sürümü) indirme sırasında haritalanır ve çıkarılır; birimler diskte hiç var olmaz. Disk yazmaları = içerik × 1.0, gereken disk = 1× (diğerleri ~2× ister).</li>
-        <li><b>Gizlilik açma</b> — gizlenmiş gönderiler PAR2 meta verisinden yeniden adlandırılır; ROT13 ile gizlenmiş adlar kurtarılır; hash adlı çöp sınıflandırılır ve geçit uygulanır.</li>
+        <li><b>Bir kez yaz.</b> Kodu çözülen makaleler doğrudan son dosya ofsetlerine pwrite edilir. Geçici dosya yok, ayrı bir birleştirme geçişi yok.</li>
+        <li><b>Akış içi PAR2 doğrulaması.</b> Her blok geldikçe kod çözme tamponlarından MD5 ile özetlenir, böylece doğrulama tam indirmeyle aynı anda biter. Bu, diğer istemcilerin yetindiği hızlı denetimi geride bırakır ve hiçbir maliyeti yoktur.</li>
+        <li><b>Doğrudan çıkarma</b> — depolama modu RAR gönderileri (çoğu scene sürümü) indirilirken haritalanıp çıkarılır, dolayısıyla birimler diske hiç düşmez. Diske yazılan içerik × 1.0'a, gereken disk ise 1×'e iner; diğerleri kabaca 2× ister.</li>
+        <li><b>Gizleme çözme.</b> Gizlenmiş gönderiler PAR2 meta verilerinden yeniden adlandırılır, ROT13 ile karıştırılmış adlar kurtarılır, hash adlı çöp ise sınıflandırılıp elenir.</li>
       </ul>
       <ul class="plain">
-        <li><b>Tam-oturan onarım</b> — hasarlı bloklar canlı bilinir; kurtarma birimlerinin en az baytlı kümesi indirme sırasında getirilir (sırt çantası çözümlü) ve onarım yalnızca hasarlı aralıklara dokunur.</li>
-        <li><b>Sıkıştırılmış/şifreli yedek yol</b> — depolama olmayan gönderiler gerçekleşir ve kuyrukla örtüşerek yerleşik RAR çıkarıcıyla açılır; şifreli kümeler açık bir mesajla park eder.</li>
-        <li><b>Parola işleme</b> — parolalar *arr API'sinden, <code>{{pw}}</code> dosya adı geleneğinden ya da NZB meta verisinden; paneldeki bir 🔑 kilit açma gerisini halleder (arka planda açma, sonra normal dosyalama).</li>
-        <li><b>Güvenlik korkulukları</b> — onarılan kaynak birimleri yeniden çıkarma sırasında yazmaya karşı korunur; çıkış kodları yalnızca son durum gerçekten kullanılabilir olduğunda "başarı" der.</li>
+        <li><b>Tam-oturan onarım.</b> Hasarlı bloklar oluştukları anda bilinir, bu yüzden yalnızca kurtarma birimlerinin en az baytlı kümesi getirilir — bir sırt çantası çözümü — ve onarım hasarlı aralıklardan başka hiçbir şeye dokunmaz.</li>
+        <li><b>Sıkıştırılmış ve şifreli için yedek yol</b> — depolama modu olmayan gönderiler, kuyruğun geri kalanıyla örtüşerek yerleşik RAR motoru üzerinden gerçekleşip açılır. Şifreli kümeler sessizce başarısız olmak yerine açık bir mesajla park eder.</li>
+        <li><b>Parola işleme.</b> Parolalar *arr API'sinden, <code>{{pw}}</code> dosya adı geleneğinden ya da NZB meta verisinden gelir. Geriye kalanlar için paneldeki bir 🔑 kilit açma devreye girer: arka planda kilidi açar, sonra normal şekilde dosyalar.</li>
+        <li><b>Güvenlik korkulukları.</b> Onarılan kaynak birimleri yeniden çıkarma çalışırken yazmaya karşı korunur ve bir çıkış kodu ancak son durum gerçekten kullanılabilir olduğunda "başarı" bildirir.</li>
       </ul>
     </div>
   </div>
@@ -115,18 +115,18 @@
     <h2>Güvenilirlik &amp; kullanılabilirlik</h2>
     <div class="grid2">
       <ul class="plain">
-        <li><b>Ön uçuş kullanılabilirlik denetimi</b> — işlem hattı STAT taramaları saniyeler içinde makale başına × sunucu başına bir matris kurar: hiçbir şey indirmeden önce COMPLETE / REPAIRABLE / IMPOSSIBLE. İmkânsız gönderiler neredeyse hiçbir şey getirmeden durur.</li>
-        <li><b>Birleşim yönlendirmesi</b> — bir makale yalnızca her canlı sunucu onu reddettiğinde eksiktir; makaleler onlara sahip sunuculara yönlendirilir. Farklı backbone'ların farklı saklama/kaldırma profilleri vardır — birleşim, tek bir sunucunun tamamlayamayacağı gönderileri tamamlar.</li>
-        <li><b>Çökmeye dayanıklı günlük</b> — makale düzeyinde günlük; iş ortasında kill −9 ve devam eder, yalnızca kalıcılaşmayanı yeniden getirir. Kuyruk ve geçmiş yeniden başlatmaları atlatır.</li>
-        <li><b>Park + yeniden dene</b> — başarısız işler geçmişe park eder; yeniden deneme yalnızca eksik olanı yeniden getirir.</li>
-        <li><b>Kaos testli</b> — sahte bir NNTP sunucusu her test çalıştırmasında 10 uçtan uca başarısızlık senaryosunu (430'lar, bozulma, kesilme, takılmalar, ölü sunucular, kill −9) sürer.</li>
+        <li><b>Ön uçuş kullanılabilirlik denetimi.</b> İşlem hattılı STAT taramaları, saniyeler içinde makale başına × sunucu başına bir matris kurar ve içerikten tek bir bayt getirilmeden işi COMPLETE, REPAIRABLE ya da IMPOSSIBLE olarak işaretler. İmkânsız bir gönderi neredeyse hiçbir şey çekmeden iptal olur.</li>
+        <li><b>Birleşim yönlendirmesi.</b> Bir makale ancak her canlı sunucu onu geri çevirdiğinde eksik sayılır; o ana dek hangi sunucu ona sahipse oraya yönlendirilir. Backbone'lar saklama süresi ve kaldırmalarda farklılık gösterir, bu yüzden birleşim, tek bir sunucunun asla tamamlayamayacağı gönderileri sessizce tamamlar.</li>
+        <li><b>Çökmeye dayanıklı günlük.</b> Günlük, makale ayrıntısında çalışır. İşin ortasında bir kill −9 gönder; geri döner ve yalnızca kalıcılaştırılmamış olanı yeniden getirir. Kuyruk ve geçmiş, yeniden başlatmalardan sağ çıkar.</li>
+        <li><b>Park et ve yeniden dene</b> — başarısız işler geçmişte park eder ve bir yeniden deneme yalnızca hâlâ eksik olan parçaları çeker.</li>
+        <li><b>Kaos testli.</b> Sahte bir NNTP sunucusu, her tek test çalıştırmasında on uçtan uca başarısızlık senaryosunu — 430'lar, bozulma, kesilme, takılmalar, ölü sunucular, kill −9 — çalıştırır.</li>
       </ul>
       <ul class="plain">
-        <li><b>Sağlayıcı güvenilirlik puanlaması</b> — sunucu başına tamamlanma oranları sonsuza dek izlenir, panelde gösterilir (&lt;%98 uyarı).</li>
-        <li><b>Sunucu çeşitliliği çözümleyicisi</b> — sunucularında STAT örneklemesi yapar ve onları ortak boşluklara göre kümeler: sahip olmadığın yedeklilik için ödeme yapmadan önce sağlayıcılarından hangilerinin gerçekten aynı backbone olduğunu öğren.</li>
-        <li><b>Kotalar, blok hesaplar &amp; disk koruması</b> — günlük/aylık kotalar, blok hesaplar için ömür boyu bayt bütçeleri (tükendiğinde otomatik dışlanır), az-disk duraklaması, sağlayıcı başına günlük kullanım geçmişi.</li>
-        <li><b>Kopya algılama</b> — alternatif yükseltmeli dupekey/dupescore: başarısız bir yakalama tutulan alternatifi otomatik yükseltir.</li>
-        <li><b>Saklama farkında yönlendirme</b> — eski gönderiler, saklaması onları içeremeyecek sunucuları atlar; sunulamaz gönderiler dönüp durmak yerine anında başarısız olur.</li>
+        <li><b>Sağlayıcı güvenilirlik puanlaması.</b> Sunucu başına tamamlanma oranları kalıcı olarak tutulur ve panelde gösterilir; %98'in altında bir uyarı çıkar.</li>
+        <li><b>Sunucu çeşitliliği çözümleyicisi.</b> Sunucuların arasında STAT örneklemesi yapar ve onları paylaştıkları boşluklara göre kümeler; böylece aslında sahip olmadığın bir yedeklilik için para ödemeden önce hangi "farklı" sağlayıcıların gerçekte aynı backbone olduğunu görebilirsin.</li>
+        <li><b>Kotalar, blok hesaplar ve disk koruması</b> — günlük ve aylık kotalar, blok hesaplar için ömür boyu bayt bütçeleri (tükendiğinde otomatik dışlanır), az-disk duraklaması ve sağlayıcı başına günlük kullanım geçmişi.</li>
+        <li><b>Kopya algılama</b> — dupekey ve dupescore; bir yakalama başarısız olduğu an, bekletilen bir alternatif otomatik olarak öne çıkarılır.</li>
+        <li><b>Saklamaya duyarlı yönlendirme.</b> Bir sunucunun saklama süresinden eski gönderiler o sunucuyu tümüyle atlar ve hiçbir sunucunun sunamadığı bir şey, boş yere dönüp durmak yerine hemen başarısız olur.</li>
       </ul>
     </div>
   </div>
@@ -137,19 +137,19 @@
     <h2>Otomasyon &amp; tümleştirmeler</h2>
     <div class="grid2">
       <ul class="plain">
-        <li><b>SABnzbd uyumlu API</b> — *arr'ların kullandığı tam yüzey: addfile/addurl, kategoriler, öncelikler, iş başına duraklat/sürdür, yeniden dene, sayfalama, iki katmanlı API anahtarları. Sonarr/Radarr onu SABnzbd olarak görür.</li>
-        <li><b>NZBGet JSON-RPC cephesi</b> — nzb360, LunaSea ve diğer NZBGet uzaktan kumandaları değişmeden çalışır.</li>
-        <li><b>Newznab sunucusu</b> — yerel dizinin t=search/tvsearch/movie'i yanıtlar: *arr'lar kendi taramalarını bir dizinleyici olarak kullanabilir.</li>
-        <li><b>RSS otomatik yakalama</b> — NZBGet tarzı bir filtre diliyle beslemeler; panelden canlı ekle/düzenle.</li>
-        <li><b>İzleme listesi</b> — dizileri/filmleri adlandır (henüz yayınlanmamış olsa bile); bölüm başına izleme her birini ilk görünüşte yakalar, hedefine dek kaliteyi yükseltir (örn. 720p → 1080p REMUX), isteğe bağlı olarak yerine geçilen kopyayı yalnızca yükseltme doğrulandıktan sonra siler. Yayın tarihi takvimi neyin geldiğini gösterir.</li>
+        <li><b>SABnzbd uyumlu API</b> — *arr'ların gerçekte kullandığı tüm yüzey: addfile/addurl, kategoriler, öncelikler, iş başına duraklat/sürdür, yeniden dene, sayfalama, iki katmanlı API anahtarları. Sonarr ve Radarr onunla sanki SABnzbd'ymiş gibi konuşur.</li>
+        <li><b>NZBGet JSON-RPC cephesi.</b> nzb360, LunaSea ve diğer NZBGet uzaktan kumandaları hiçbir değişiklik olmadan bağlanır.</li>
+        <li><b>Newznab sunucusu.</b> Yerel dizinin t=search/tvsearch/movie isteklerini yanıtlar, böylece *arr'lar kendi taramalarını bir dizinleyici gibi kullanabilir.</li>
+        <li><b>RSS otomatik yakalama</b> — NZBGet tarzı bir dille filtrelenen beslemeler; panelden canlı olarak eklenip düzenlenir.</li>
+        <li><b>İzleme listesi.</b> İstediğin dizileri ve filmleri, henüz yayınlanmamış olanları bile adıyla ekle. Her bölüm ilk göründüğünde yakalanır ve hedef kalitene ulaşana dek yükseltilir (diyelim 720p → 1080p REMUX); yerini alan kopya ise yalnızca yükseltme doğrulandıktan sonra silinir. Bir yayın tarihi takvimi neyin geleceğini gösterir.</li>
       </ul>
       <ul class="plain">
-        <li><b>İzleme klasörü</b> — bir .nzb bırak, indirilir ve dosya kaybolur.</li>
-        <li><b>Akıllı klasörler</b> — regex/anahtar kelime/boyut kuralları indirmeleri kuyruğa alırken kategorilere yönlendirir; isteğe bağlı TV dosyalama <code>Show/Season NN/Show - S01E02.ext</code> olarak yeniden adlandırır.</li>
-        <li><b>Temizleme kuralları</b> — çöp uzantılar tamamlanma sonrası silinir.</li>
-        <li><b>Son işlem betikleri</b> — SABnzbd'nin SAB_* ortam sözleşmesi: mevcut betik ekosistemin olduğu gibi çalışır.</li>
-        <li><b>Tek tıkla geçiş</b> — sunucuları SABnzbd ini'den ya da NZBGet conf'tan içe aktarır; bulduğu tek şey oysa sabnzbd.ini'yi doğrudan okur.</li>
-        <li><b>Spotnet alımı</b> — spot imza doğrulaması ve NZB sentezi, gömülü.</li>
+        <li><b>İzleme klasörü.</b> İçine bir .nzb bırak, indirilir; dosya alındıktan sonra ortadan kaybolur.</li>
+        <li><b>Akıllı klasörler</b> — regex, anahtar kelime ve boyut kuralları, indirmeleri kuyruğa alınırken kategorilere ayırır; isteğe bağlı TV dosyalamasıyla <code>Show/Season NN/Show - S01E02.ext</code> biçimine yerleştirir.</li>
+        <li><b>Temizleme kuralları</b> — bir iş tamamlandığında çöp uzantılar silinir.</li>
+        <li><b>Son işlem betikleri.</b> SABnzbd'nin SAB_* ortam sözleşmesine uyarlar, dolayısıyla halihazırdaki betiklerin olduğu gibi çalışır.</li>
+        <li><b>Tek tıkla geçiş.</b> Sunucuları bir SABnzbd ini'sinden ya da NZBGet conf'undan içe aktarır; bulabildiği tek şey oysa sabnzbd.ini'yi doğrudan okur.</li>
+        <li><b>Spotnet alımı</b> — spot imza doğrulaması ve NZB sentezi, doğrudan içe gömülü.</li>
       </ul>
     </div>
   </div>
@@ -158,23 +158,23 @@
 <section class="alt">
   <div class="wrap">
     <h2>Dizinleyici &amp; poster duvarı</h2>
-    <p class="lead">Önem verdiğin grupları özel bir dizine tara, sonra ona bir poster
-    duvarı olarak göz at. Tüm meta veri kurulumunca getirilen anahtarsız açık kaynaklardan gelir —
-    yalvaracağın bir API anahtarı yok.</p>
+    <p class="lead">Önem verdiğin grupları özel bir dizine tara, sonra ortaya çıkanı bir
+    poster duvarı olarak gez. Meta verinin her parçası, kendi kurulumun tarafından anahtarsız
+    açık kaynaklardan çekilir — dilenmen gereken bir API anahtarı yok.</p>
     <figure class="shot"><img src="assets/wall-sheet.jpg" alt="Puan, oyuncular, özet ve bölüm çipleriyle poster duvarı ayrıntı sayfası" loading="lazy"></figure>
     <div style="height:26px"></div>
     <div class="grid2">
       <ul class="plain">
-        <li><b>Sürekli grup tarayıcısı</b> — zamanlamanda artımlı OVER taramaları, dağıtılmış bağlantılar üzerinden ~43 bin başlık/s; tarih ikiye bölmeli ilk taramalar (<code>--max-age 2y</code> ~20 sondada yıllarca başlığı atlar).</li>
-        <li><b>Alım geçitleri</b> — tür/yıl/çözünürlük/dil/boyut filtreleri dizinleyici spam'ini veritabanından uzak tutar; gizlenmiş çöp varsayılan olarak algılanır ve geçit uygulanır.</li>
-        <li><b>Scene adı ayrıştırıcısı</b> — gerçek dünya köklerinden başlık/yıl/bölüm/kalite/kaynak, tarih kodlu günlükler, çok bölümlü kodlar, ROT13 ile gizlenmiş adlar dahil; sürümler başlık başına tek karta indirgenir.</li>
-        <li><b>Anlık arama</b> — kalite filtreleri ve satır başına izle düğmeleriyle yazarken ara; her yerde kalite rozetleri.</li>
+        <li><b>Sürekli grup tarayıcısı.</b> Artımlı OVER taramaları, senin belirlediğin zamanlamada, dağıtılmış bağlantılar üzerinden saniyede ~43 bin başlık hızıyla çalışır. İlk taramalar tarihe göre ikiye bölünür, böylece <code>--max-age 2y</code> yıllarca süren başlığı yaklaşık 20 yoklamada atlar.</li>
+        <li><b>Alım geçitleri</b> — tür, yıl, çözünürlük, dil ve boyut filtreleri dizinleyici spam'ini veritabanından uzak tutar; gizlenmiş çöp ise varsayılan olarak yakalanıp elenir.</li>
+        <li><b>Scene adı ayrıştırıcısı.</b> Gerçek dünyadaki köklerden başlık, yıl, bölüm, kalite ve kaynağı çekip çıkarır — tarih kodlu günlükler, çok bölümlü kodlar ve ROT13 ile gizlenmiş adlar dahil — ve sürümleri başlık başına tek bir karta indirger.</li>
+        <li><b>Anlık arama</b> — kalite filtreleri, satır başına izle düğmeleri ve her yerde kalite rozetleriyle, yazdıkça arama.</li>
       </ul>
       <ul class="plain">
-        <li><b>Anahtarsız zenginleştirme</b> — TVmaze (TV), iTunes Search (filmler), açık puan veri kümeleri, Wikidata, Wikipedia ve AniList; posterleri, puanları + oy sayılarını, oyuncuları, türleri ve konuları doldurur. İsteğe bağlı OMDb/TMDB anahtarları desteklenir ama asla gerekmez.</li>
-        <li><b>Bölüm ızgaraları</b> — sezon başına çipler, bölüm başına en iyi kodlama, tek tıkla indir; sezon paketleri işaretli; sezon başlığı başına "diziyi izle".</li>
-        <li><b>Gözde satırlar</b> — gönderi sıklığından bu hafta yeni ve şu an gözde şeritleri.</li>
-        <li><b>Her şeyi düzelt</b> — yanlış eşleşme mi? Adaylardan seç ya da kimliği kendin yaz; elle girilen meta verinin üzerine asla yazılmaz. URL ya da yüklemeyle poster. Bir düğme bir başlığı yeniden zenginleştirir; biri tüm dizini siler ve yeniden inşa eder.</li>
+        <li><b>Anahtarsız zenginleştirme.</b> TV için TVmaze, film için iTunes Search; ayrıca açık puan veri kümeleri, Wikidata, Wikipedia ve AniList posterleri, puanları ve oy sayılarını, oyuncuları, türleri ve konuları doldurur. OMDb ve TMDB anahtarların varsa çalışır ama hiçbiri için bir anahtar gerekmez.</li>
+        <li><b>Bölüm ızgaraları</b> — sezon başına çipler; her bölümün en iyi kodlaması tek tık uzağında, sezon paketleri işaretli ve her sezon başlığında bir "diziyi izle".</li>
+        <li><b>Gözde satırlar</b> — gönderi sıklığına göre oluşturulan "bu hafta yeni" ve "şu an popüler" şeritleri.</li>
+        <li><b>Her şeyi düzelt.</b> Yanlış eşleşme mi? Adaylardan birini seç ya da doğru kimliği kendin yaz — elle ayarladığın hiçbir şeyin üzerine asla yazılmaz. Bir posteri bir URL'ye yönlendir ya da kendin yükle. Bir düğme tek bir başlığı yeniden zenginleştirir; bir diğeri tüm dizini silip yeniden kurar.</li>
       </ul>
     </div>
   </div>
@@ -184,8 +184,8 @@
   <div class="wrap">
     <h2>Önizleme &amp; kitaplık</h2>
     <ul class="plain">
-      <li><b>Bitmeden önizle</b> — ▶ Oynat, işletim sistemi oynatıcına arka plan sürecinin sunduğu bir .m3u verir; böylece bir indirmenin istediğin şey olup olmadığını, tamamlanmasını beklemeden denetleyebilirsin. İleri bir noktayı kontrol etmek doğru makaleleri kuyruğun önüne alır.</li>
-      <li><b>Kitaplık modu</b> — .strm işaretçileriyle anlık *arr tamamlanması; birini oynatmak gerçek indirmeyi arka planda yeniden doğrulamayla en yüksek öncelikte tetikler.</li>
+      <li><b>Bitmeden önizle.</b> ▶ Oynat, işletim sistemi oynatıcına arka plan sürecinin sunduğu bir .m3u verir; böylece bir indirmenin gerçekten istediğin şey olduğunu, tamamlanmasını beklemeden doğrulayabilirsin. Daha ileriye atla, ihtiyacın olan makaleler kuyruğun başına geçsin.</li>
+      <li><b>Kitaplık modu.</b> *arr'lar .strm işaretçileri sayesinde işi anında tamamlanmış görür; birini oynattığında gerçek indirme en yüksek öncelikte başlar ve arka planda yeniden doğrulanır.</li>
     </ul>
   </div>
 </section>
@@ -197,23 +197,23 @@
       <figure><div class="shot"><img src="assets/dash-browse.png" alt="Dosya başına çekmece ve dizin göz at kartı olan kuyruk" loading="lazy"></div>
         <figcaption>Kuyruk çekmecesi: dosya başına çubuklar, doğrulama blokları, sunucu başına katkı.</figcaption></figure>
       <figure><div class="shot"><img src="assets/settings-top.png" alt="Ayarlar: sunucu düzenleyici ve canlı hız/zamanlama denetimleri" loading="lazy"></div>
-        <figcaption>Tarayıcıda düzenlenebilir her ayar — çoğu canlı geçerlidir.</figcaption></figure>
+        <figcaption>Her ayar tarayıcıda düzenlenebilir — çoğu anında geçerli olur.</figcaption></figure>
       <figure><div class="shot" style="max-width:320px;margin:0 auto"><img src="assets/mobile-dash.png" alt="Panelin telefon düzeni" loading="lazy"></div>
         <figcaption>Düzgün telefon düzeni, aynı arka plan süreci.</figcaption></figure>
     </div>
     <div style="height:10px"></div>
     <div class="grid2">
       <ul class="plain">
-        <li><b>Canlı grafikler, kitaplık yok</b> — 1 sn yoklama; verim alanı, sağlayıcı başına yığılmış alan, doğrulama sağlığı zaman çizelgesi, kuyruk inişi, hız histogramı; grafikler zaman pencerelerini tarayıcı pencerenle genişletir.</li>
-        <li><b>Kaynak monitörü</b> — CPU, RAM (bütçeye karşı), disk yazma ve ağ tek bir grafikte, bir az-disk uyarısıyla.</li>
-        <li><b>Sağlayıcı sıralaması</b> — sunucular canlı performansa göre yeniden sıralanır; sağlayıcı başına oturum baytları, bağlantı sayıları, kullanım, güvenilirlik.</li>
-        <li><b>Kuyruk yönetimi</b> — yeniden sıralamak için sürükle, satır içi öncelik/kategori, indirme başına ayrıntı çekmecesi, iyimser duraklama, "N dakika duraklat".</li>
+        <li><b>Canlı grafikler, kütüphane yok.</b> Her şey saniyede bir yoklanır — bir verim alanı, sağlayıcı başına yığılmış alan, bir doğrulama sağlığı zaman çizelgesi, kuyruk erimesi, bir hız histogramı — ve tarayıcıyı genişlettikçe grafikler zaman pencerelerini genişletir.</li>
+        <li><b>Kaynak monitörü</b> — CPU, bütçeye karşı RAM, disk yazmaları ve ağ tek bir grafikte, bir az-disk uyarısıyla.</li>
+        <li><b>Sağlayıcı sıralaması.</b> Sunucular canlı performansa göre kendini yeniden sıralar; her biri oturum baytlarını, bağlantı sayısını, kullanımı ve güvenilirliği gösterir.</li>
+        <li><b>Kuyruk yönetimi</b> — yeniden sıralamak için sürükle, önceliği ve kategoriyi satır içinde ayarla, indirme başına bir çekmece aç, iyimser duraklat ya da "N dakika duraklat".</li>
       </ul>
       <ul class="plain">
-        <li><b>Her şey tarayıcıda yapılandırılabilir</b> — sunucular (canlı bağlantı testleriyle), hız/zamanlama, bağlantılar/pencere/kod çözücüler, disk/kota, izleme/betikler, dizinleme geçitleri, kitaplık, RSS, anahtar döndürmeli güvenlik. Ayarlar yeniden başlatmaları atlatır.</li>
-        <li><b>Gömülü tanılama</b> — arayüz içi günlük görüntüleyici, sistem kıyaslaması (ağ/işlem/disk tavanları + tavsiye), sunucu çeşitliliği çözümleyicisi, bağlantı merdiveni.</li>
-        <li><b>Veri kullanımı</b> — 14 günlük sağlayıcı başına yığılmış çubuklar, günlük geçmiş, blok hesaplar için ömür boyu sayaçlar.</li>
-        <li><b>Yaşam kalitesi</b> — herhangi bir yere .nzb sürükle-bırak, masaüstü bildirimleri, tamamlanma sesleri, ilk çalıştırma sihirbazı, <code>serve --open</code>.</li>
+        <li><b>Her şey tarayıcıda yapılandırılabilir</b> — sunucular (canlı bağlantı testleriyle), hız ve zamanlama, bağlantılar/pencere/kod çözücüler, disk ve kota, izleme klasörleri ve betikler, dizinleme geçitleri, kitaplık, RSS ve anahtar döndürmeli güvenlik. Ayarlar yeniden başlatmalardan sağ çıkar.</li>
+        <li><b>Gömülü tanılama</b> — arayüz içi bir günlük görüntüleyici, ağ, işlem ve disk tavanlarını bulup bunlar hakkında ne yapman gerektiğini söyleyen bir sistem kıyaslaması, sunucu çeşitliliği çözümleyicisi ve bağlantı merdiveni.</li>
+        <li><b>Veri kullanımı</b> — 14 günlük sağlayıcı başına yığılmış çubuklar, günlük geçmiş ve blok hesaplar için ömür boyu sayaçlar.</li>
+        <li><b>Yaşam kalitesi.</b> Herhangi bir yere .nzb sürükle-bırak, masaüstü bildirimleri, tamamlanma sesleri, bir ilk çalıştırma sihirbazı ve <code>serve --open</code>.</li>
       </ul>
     </div>
   </div>
@@ -223,11 +223,11 @@
   <div class="wrap">
     <h2>Dağıtım</h2>
     <ul class="plain">
-      <li><b>Tek, kendi kendine yeten çalıştırılabilir dosya</b> — par2 + RAR açma ikilinin içinde yerleşik koddur — ilk kullanımda hiçbir şey çıkarılmaz. Çalışma zamanı yok, kurucu yok.</li>
-      <li><b>macOS birinci sınıf</b> — evrensel ikili (Apple Silicon + Intel), yerel SwiftUI menü çubuğu uygulaması, launchd birimi, Homebrew formülü.</li>
-      <li><b>Windows</b> — tamamen statik x64 exe, hazır Windows 10/11'de çalışır; kılavuzlu kurulumlu çift tıkla başlatıcı.</li>
-      <li><b>Linux &amp; Docker</b> — sağlamlaştırılmış systemd birimi; linuxserver tarzı PUID/PGID giriş noktalı çok aşamalı Docker imgesi; compose dosyası dahil. <a href="download.tr.html">Tüm platformlar →</a></li>
-      <li><b>Kılavuzlu kurulum</b> — <code>nzbfast setup</code> etkileşimli sihirbazı ya da mevcut bir SABnzbd/NZBGet yapılandırmasının otomatik algılanması. İlk indirme iki dakikanın altında.</li>
+      <li><b>Tek, kendi kendine yeten çalıştırılabilir dosya.</b> par2 ve RAR açma, ikilinin içine derlenmiş yerel koddur — ilk çalıştırmada hiçbir şey dışarı çıkarılmaz, uğraşacağın bir çalışma zamanı ya da kurucu yoktur.</li>
+      <li><b>macOS, birinci sınıf</b> — Apple Silicon ve Intel için evrensel bir ikili, yerel bir SwiftUI menü çubuğu uygulaması, bir launchd birimi ve bir Homebrew formülü.</li>
+      <li><b>Windows</b> — hazır Windows 10 ve 11'de çalışan, tamamen statik bir x64 exe; çift tıkla başlatıcı ve kılavuzlu kurulumla birlikte.</li>
+      <li><b>Linux ve Docker</b> — sağlamlaştırılmış bir systemd birimi, linuxserver tarzı PUID/PGID giriş noktalı çok aşamalı bir Docker imgesi ve kutuda bir compose dosyası. <a href="download.tr.html">Tüm platformlar →</a></li>
+      <li><b>Kılavuzlu kurulum.</b> <code>nzbfast setup</code> sihirbazını çalıştır ya da mevcut bir SABnzbd veya NZBGet yapılandırmasını otomatik algılamasına izin ver. İlk indirmen iki dakikadan kısa sürede çalışıyor olacak.</li>
     </ul>
   </div>
 </section>

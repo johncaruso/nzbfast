@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Kıyaslamalar — nzbfast</title>
-<meta name="description" content="nzbfast vs SABnzbd, NZBGet ve rustnzb: özdeş donanımda 4 istemci × 6 senaryo. nzbfast'in kaybettiği ayaklar dahil dürüst sonuçlar, yeniden üretim adımlarıyla.">
+<meta name="description" content="nzbfast vs SABnzbd, NZBGet ve rustnzb: özdeş donanımda 4 istemci × 6 senaryo. nzbfast'in kazanamadığı tek ayak dahil dürüst sonuçlar, yeniden üretim adımlarıyla.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
 <link rel="alternate" hreflang="en" href="benchmarks.html">
@@ -41,10 +41,10 @@
 </div></header>
 
 <div class="hero wrap" style="padding-bottom:6px">
-  <h1>Ölçüldü, <em>pazarlanmadı</em>.</h1>
-  <p class="sub">Dört istemci, altı senaryo, özdeş donanım ve sağlayıcılar, sağlayıcı
-  kayması iptal olsun diye iç içe çalıştırmalar. Ölçüt <b>kullanılabilir bir dosyaya
-  geçen süre</b> — indirildi, doğrulandı, çıkarıldı. Kaybettiğimiz iki ayak dahil.</p>
+  <h1>Kıyaslamalar</h1>
+  <p class="sub">Dört istemci, altı senaryo, özdeş donanım ve sağlayıcılar; sağlayıcı
+  kayması birbirini götürsün diye iç içe çalıştırmalar. Ölçüt, <b>kullanılabilir bir
+  dosyaya geçen süre</b> — indirildi, doğrulandı, çıkarıldı. Kazanamadığımız tek ayak da dahil.</p>
 </div>
 
 <section style="padding-top:26px">
@@ -152,29 +152,18 @@
 <section class="alt">
   <div class="wrap">
     <p class="kicker">Dürüst sütun</p>
-    <h2>Kaybettiğimiz iki ayak — biri artık kapandı</h2>
+    <h2>Kazanamadığımız tek ayak</h2>
     <div class="grid2">
       <div class="card"><h3>Hasarlı depolama modu gönderisi</h3>
-        <p>7.4 GB'lık bir REMUX'ta 20 zehirlenmiş makale: NZBGet kullanılabiliri <b>53 s</b>'de
-        bitirdi; nzbfast şimdi <b>58 s</b> alıyor — onarım 32 s'de tamamlandı, 62 birimin hepsi
-        yeniden çıkarıldı, bayt kesinlikli çıktı. Daha önceki bir yapının tam bu yolda sahip olduğu
-        son durum hatası (çıkış kodu başarı derken yeniden çıkarmanın onarılmış birimleri mahvetmesi)
-        düzeltildi, gerileme testi yapıldı ve gerçek Usenet'e karşı yeniden doğrulandı. Onarımımız
-        yine de tam PAR2 geçişlerine karşı 20 gereken için kuramsal-en-aza-yakın 22 kurtarma bloğu
-        getirir — ama NZBGet ayağı beş saniyeyle tuttuğu için burada yazılı.</p></div>
-      <div class="card"><h3>kill −9 devamı — kapandı</h3>
-        <p>34.5 GB'lık bir işin ~15 GB'ında öldürüldü, bu eskiden en kötü rakamımızdı: NZBGet
-        <b>~0.6 GB</b> yeniden indirdi, nzbfast <b>15 GB</b> — PAR2 etkinleşmesinden önce kod
-        çözülen her şey süreçle birlikte öldü. Günlük artık her makalenin fiziksel yerleşimini
-        kaydediyor, böylece bir devam o baytları önceki çalıştırmanın kendi çıktı dosyalarından
-        geri yükler (yerel bir disk kopyası, her bayt PAR2 blok haritasına karşı yeniden doğrulanır)
-        ve <b>~0.3 GB</b> yeniden indirir — sağlayıcı gürültüsü içinde denklik. Kayıt için, SABnzbd
-        bu senaryodan üç turda hiç kurtulamadı: aynı şekilde öldürüldü, bir saatte 0.5 GB yeniden
-        getirdi ve zaman aşımına uğradı.</p></div>
+        <p>7.4 GB'lık bir REMUX'ta 20 zehirlenmiş makale: NZBGet kullanılabilir dosyayı <b>53 s</b>'de,
+        nzbfast ise <b>58 s</b>'de bitirir. Onarımımız 32 s'de tamamlanır, 62 birimin hepsini yeniden
+        çıkarır ve çıktı bayt kesinliğindedir — üstelik NZBGet'in tam PAR2 geçişine karşılık, gereken
+        20 blok için kuramsal en aza yakın 22 kurtarma bloğu çeker. Ama NZBGet ayağı beş saniye farkla
+        alıyor, işte burada.</p></div>
     </div>
-    <div class="callout">Neden kayıpları yayımlayalım? Çünkü kazanımlar ancak onların yanında
-    inandırıcıdır. Bu sayfadaki her rakam aynı iç içe çalıştırmalardan gelir ve deponun
-    kıyaslama günlüğü tam bir laboratuvar defteridir — olumsuz sonuçlar dahil.</div>
+    <div class="callout">Neden bir kaybı hiç gösterelim ki? Çünkü kazanımlar ancak onun yanında
+    inandırıcıdır. Bu sayfadaki her rakam aynı iç içe çalıştırmalardan gelir ve depo bütün süreci
+    tam bir laboratuvar defteri olarak tutar — olumsuz sonuçlar dahil.</div>
   </div>
 </section>
 
@@ -248,8 +237,8 @@
       <li><b>İşlem payı</b>: Apple silicon'da ölçülen 86–165 Gbps kod çözme+doğrulama tavanları — ağ, test edilen her makinede 4–50× darboğazdır.</li>
     </ul>
     <div class="callout">Depodan kalıcı kural: <b>her performans iddiası yeniden üretilebilir bir
-    komut ve altında çalıştığı koşulları anar.</b> Tam laboratuvar defteri — olumsuz sonuçlar ve
-    yanlış dönüşler dahil — tarihli bir laboratuvar defteri olarak tutulur.</div>
+    komut ve altında çalıştığı koşulları anar.</b> Bütün süreç, depoda tarihli bir laboratuvar
+    defteri olarak yaşar — olumsuz sonuçlar ve yanlış dönüşler dahil.</div>
   </div>
 </section>
 

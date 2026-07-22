@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Benchmarks — nzbfast</title>
-<meta name="description" content="nzbfast vs SABnzbd, NZBGet och rustnzb: 4 klienter × 6 scenarier på identisk hårdvara. Ärliga resultat inklusive etapperna nzbfast förlorade, med reproduktionssteg.">
+<meta name="description" content="nzbfast vs SABnzbd, NZBGet och rustnzb: 4 klienter × 6 scenarier på identisk hårdvara. Ärliga resultat inklusive den enda etapp nzbfast inte vinner, med reproduktionssteg.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
 <link rel="alternate" hreflang="en" href="benchmarks.html">
@@ -41,10 +41,10 @@
 </div></header>
 
 <div class="hero wrap" style="padding-bottom:6px">
-  <h1>Uppmätt, inte <em>marknadsfört</em>.</h1>
+  <h1>Benchmarks</h1>
   <p class="sub">Fyra klienter, sex scenarier, identisk hårdvara och providers, körningar
   sammanflätade så att providerdrift tar ut sig. Måttet är <b>tid till en användbar fil</b> —
-  nedladdad, verifierad, uppackad. Inklusive de två etapper vi förlorade.</p>
+  nedladdad, verifierad, uppackad. Inklusive den enda etapp vi inte vinner.</p>
 </div>
 
 <section style="padding-top:26px">
@@ -150,28 +150,17 @@
 <section class="alt">
   <div class="wrap">
     <p class="kicker">Den ärliga kolumnen</p>
-    <h2>Två etapper vi förlorade — en nu stängd</h2>
+    <h2>Den enda etapp vi inte vinner</h2>
     <div class="grid2">
       <div class="card"><h3>Skadat store-mode-inlägg</h3>
-        <p>20 förgiftade artiklar i en 7.4 GB REMUX: NZBGet blev klar användbar på <b>53 s</b>; nzbfast
-        tar nu <b>58 s</b> — reparation klar på 32 s, alla 62 volymer omuppackade, byte-exakt
-        utdata. End-state-buggen en tidigare build hade på exakt den här vägen (reparerade volymer
-        förstörda av omuppackningen medan slutkoden sa framgång) är fixad, regressionstestad
-        och omvaliderad mot riktig Usenet. Vår reparation hämtar fortfarande ett nära-teoretiskt-minimum
-        på 22 återställningsblock för 20 som behövdes vs deras fulla PAR2-pass — men NZBGet behåller etappen med
-        fem sekunder, så den skrivs ut här.</p></div>
-      <div class="card"><h3>kill −9-återupptagning — stängd</h3>
-        <p>Dödad vid ~15 GB av ett 34.5 GB-jobb, detta brukade vara vår sämsta siffra: NZBGet laddade om
-        <b>~0.6 GB</b>, nzbfast <b>15 GB</b> — allt avkodat före PAR2-aktivering dog med
-        processen. Journalen registrerar nu varje artikels fysiska placering, så en återupptagning
-        återställer de bytena från den föregående körningens egna utdatafiler (en lokal diskkopia, varje
-        byte omverifierad mot PAR2-blockkartan) och laddar om <b>~0.3 GB</b> — paritet
-        inom providerbrus. SABnzbd har, för protokollet, aldrig återhämtat sig från det här scenariot i
-        tre omgångar: dödad på samma sätt hämtade den om 0.5 GB på en timme och timeout:ade.</p></div>
+        <p>20 förgiftade artiklar i en 7.4 GB REMUX: NZBGet blir klar och användbar på <b>53 s</b>, nzbfast
+        på <b>58 s</b>. Vår reparation blir klar på 32 s, packar om alla 62 volymer, och utdatan är
+        byte-exakt — och den hämtar nära det teoretiska minimumet, 22 återställningsblock för de 20 som
+        behövs, mot NZBGets fulla PAR2-pass. Men NZBGet tar etappen med fem sekunder, så här är den.</p></div>
     </div>
-    <div class="callout">Varför publicera förluster? För att vinsterna bara är trovärdiga bredvid dem.
-    Varje siffra på den här sidan kommer från samma sammanflätade körningar, och repots
-    benchmark-logg är en fullständig laboratorienotisbok — negativa resultat inkluderade.</div>
+    <div class="callout">Varför visa en förlust över huvud taget? För att vinsterna bara är trovärdiga bredvid den.
+    Varje siffra på den här sidan kommer från samma sammanflätade körningar, och repot behåller alltihop
+    som en fullständig laboratorienotisbok — negativa resultat inräknade.</div>
   </div>
 </section>
 
@@ -245,8 +234,8 @@
       <li><b>CPU-marginal</b>: uppmätta avkodnings-+verifieringstak på 86–165 Gbps på Apple silicon — nätverket är flaskhalsen med 4–50× på varje testad maskin.</li>
     </ul>
     <div class="callout">Stående regel från repot: <b>varje prestandapåstående citerar ett reproducerbart
-    kommando och de förhållanden det kördes under.</b> Den fullständiga laboratorienotisboken — inklusive negativa
-    resultat och felsteg — förs som en daterad laboratorienotisbok.</div>
+    kommando och de förhållanden det kördes under.</b> Hela härligheten finns i repot som en daterad
+    laboratorienotisbok — negativa resultat och felsteg inräknade.</div>
   </div>
 </section>
 

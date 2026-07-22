@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Benchmarks — nzbfast</title>
-<meta name="description" content="nzbfast vs SABnzbd, NZBGet en rustnzb: 4 clients × 6 scenario's op identieke hardware. Eerlijke resultaten, inclusief de legs die nzbfast verloor, met reproductiestappen.">
+<meta name="description" content="nzbfast vs SABnzbd, NZBGet en rustnzb: 4 clients × 6 scenario's op identieke hardware. Eerlijke resultaten, inclusief de ene leg die nzbfast niet wint, met reproductiestappen.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
 <link rel="alternate" hreflang="en" href="benchmarks.html">
@@ -41,10 +41,10 @@
 </div></header>
 
 <div class="hero wrap" style="padding-bottom:6px">
-  <h1>Gemeten, niet <em>beloofd</em>.</h1>
+  <h1>Benchmarks</h1>
   <p class="sub">Vier clients, zes scenario's, identieke hardware en providers, runs
   afwisselend uitgevoerd zodat providerdrift wegvalt. De maatstaf is <b>tijd tot een bruikbaar bestand</b> —
-  gedownload, geverifieerd, uitgepakt. Inclusief de twee legs die we verloren.</p>
+  gedownload, geverifieerd, uitgepakt. Inclusief de ene leg die we niet winnen.</p>
 </div>
 
 <section style="padding-top:26px">
@@ -150,28 +150,18 @@
 <section class="alt">
   <div class="wrap">
     <p class="kicker">De eerlijke kolom</p>
-    <h2>Twee legs die we verloren — één nu gesloten</h2>
+    <h2>De ene leg die we niet winnen</h2>
     <div class="grid2">
       <div class="card"><h3>Beschadigde store-mode post</h3>
-        <p>20 vergiftigde artikelen in een REMUX van 7.4 GB: NZBGet was bruikbaar klaar in <b>53 s</b>; nzbfast
-        doet er nu <b>58 s</b> over — herstel klaar in 32 s, alle 62 volumes opnieuw uitgepakt, byte-exacte
-        uitvoer. De eindtoestand-bug die een eerdere build op precies dit pad had (herstelde volumes
-        verwoest door het opnieuw uitpakken terwijl de exitcode succes meldde) is verholpen, regressie-getest
-        en opnieuw gevalideerd tegen echt Usenet. Ons herstel haalt nog steeds een bijna-theoretisch-minimum
-        van 22 recovery-blokken op voor 20 benodigde vs hun volledige PAR2-pass — maar NZBGet wint de leg met
-        vijf seconden, dus staat hij hier vermeld.</p></div>
-      <div class="card"><h3>kill −9-hervatten — gesloten</h3>
-        <p>Afgebroken op ~15 GB van een taak van 34.5 GB was dit ooit ons slechtste cijfer: NZBGet downloadde
-        <b>~0.6 GB</b> opnieuw, nzbfast <b>15 GB</b> — alles wat vóór de PAR2-activering gedecodeerd was,
-        sneuvelde met het proces. Het journal legt nu de fysieke plaatsing van elk artikel vast, zodat een
-        hervatting die bytes herstelt uit de eigen uitvoerbestanden van de vorige run (een lokale schijfkopie,
-        elke byte opnieuw geverifieerd tegen de PAR2-blokmap) en <b>~0.3 GB</b> opnieuw downloadt — gelijk
-        binnen providerruis. SABnzbd, voor de goede orde, heeft in drie rondes nooit van dit scenario weten te
-        herstellen: op dezelfde manier afgebroken haalde het in een uur 0.5 GB opnieuw op en liep in een time-out.</p></div>
+        <p>20 vergiftigde artikelen in een REMUX van 7.4 GB: NZBGet is bruikbaar klaar in <b>53 s</b>, nzbfast
+        in <b>58 s</b>. Ons herstel is klaar in 32 s, pakt alle 62 volumes opnieuw uit, en de uitvoer is
+        byte-exact — en het haalt een bijna-theoretisch-minimum van 22 recovery-blokken op voor de 20
+        benodigde, tegenover de volledige PAR2-pass van NZBGet. Maar NZBGet wint de leg met vijf seconden,
+        dus hier staat hij.</p></div>
     </div>
-    <div class="callout">Waarom verliezen publiceren? Omdat de overwinningen alleen geloofwaardig zijn náást de
-    verliezen. Elk getal op deze pagina komt uit dezelfde afwisselende runs, en onze benchmarklog in de repo
-    is een volledig labjournaal — negatieve resultaten incluis.</div>
+    <div class="callout">Waarom überhaupt een verlies laten zien? Omdat de overwinningen alleen geloofwaardig
+    zijn náást dat ene verlies. Elk getal op deze pagina komt uit dezelfde afwisselende runs, en de repo
+    bewaart het geheel als een volledig labjournaal — negatieve resultaten incluis.</div>
   </div>
 </section>
 
@@ -245,8 +235,8 @@
       <li><b>Rekenmarge</b>: gemeten decode+verify-plafonds van 86–165 Gbps op Apple silicon — het netwerk is de bottleneck met een factor 4–50× op elke geteste machine.</li>
     </ul>
     <div class="callout">Vaste regel uit de repo: <b>elke prestatieclaim citeert een reproduceerbaar
-    commando en de omstandigheden waaronder het draaide.</b> Het volledige labjournaal — inclusief negatieve
-    resultaten en doodlopende wegen — wordt bijgehouden als een gedateerd labjournaal.</div>
+    commando en de omstandigheden waaronder het draaide.</b> Het geheel wordt in de repo bijgehouden als een
+    gedateerd labjournaal — inclusief negatieve resultaten en doodlopende wegen.</div>
   </div>
 </section>
 

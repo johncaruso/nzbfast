@@ -42,10 +42,10 @@
 
 <div class="hero wrap">
   <h1>Från NZB till en <em>verifierad fil</em><br>innan andra ens laddat klart.</h1>
-  <p class="sub">nzbfast är en Usenet-nedladdare byggd kring en enpassrörledning:
+  <p class="sub">nzbfast är en Usenet-nedladdare byggd kring ett enda pass:
   varje byte avkodas, verifieras och packas upp <b>medan den laddas ner</b>.
-  Inget monteringspass, inget verifieringspass, inget uppackningspass — när förloppsstapeln
-  fylls är filen klar och bevisligen intakt.</p>
+  Det finns inget monteringspass efteråt, inget kvar att verifiera eller packa upp när den väl
+  är klar — i samma stund som förloppsstapeln fylls är filen färdig och bevisligen intakt.</p>
   <div class="chips">
     <span class="chip"><b>8.31&nbsp;Gbps</b> på en 10&nbsp;GbE-linje</span>
     <span class="chip"><b>190&nbsp;GB → 4m44s</b> till en verifierad fil</span>
@@ -65,24 +65,24 @@
   <div class="wrap">
     <p class="kicker">Varför den är snabb</p>
     <h2>Tre idéer som de gängse klienterna inte utnyttjar fullt ut</h2>
-    <p class="lead">Inte mikrooptimering — arkitektur. Var och en är uppmätt i
-    <a href="benchmarks.sv.html">benchmark-loggen</a> med reproducerbara kommandon.</p>
+    <p class="lead">Det här är arkitektur, inte mikrooptimering, och varenda del av det är uppmätt i
+    <a href="benchmarks.sv.html">benchmark-loggen</a> med kommandon du kan köra om.</p>
     <div class="grid3">
       <div class="card"><span class="ic">🔁</span><h3>Pipelinead NNTP</h3>
-        <p>Flera artikelförfrågningar hålls i luften per anslutning, så tur-och-retur aldrig
-        låter socketen vila — och TCP släpper aldrig sitt congestion-fönster mellan artiklar.
-        Uppmätt +12 % till +270 % över seriell på fyra sajter; en linje mättas med 8
-        anslutningar i stället för 30–50.</p></div>
+        <p>Flera artikelförfrågningar hålls i luften på varje anslutning, så en tur och retur
+        lämnar aldrig socketen sysslolös och TCP låter aldrig sitt congestion-fönster tyna mellan
+        artiklar. Över fyra sajter mätte vi +12 % till +270 % jämfört med seriell, och en linje
+        mättas vid 8 anslutningar i stället för 30–50.</p></div>
       <div class="card"><span class="ic">🚿</span><h3>Enpassrörledningen</h3>
-        <p>Artiklar SIMD-avkodas på plats, skrivs en gång till sina slutliga offset,
-        PAR2-verifieras från avkodningsbuffertarna, och store-mode-RAR-innehåll
-        packas upp <i>under</i> nedladdningen — volymerna existerar aldrig som filer.
-        Diskskrivningar = innehåll × 1.0.</p></div>
+        <p>Artiklar SIMD-avkodas på plats och skrivs en enda gång, rakt till sina slutliga
+        offset, och PAR2-verifieras sedan ur samma avkodningsbuffertar. För store-mode-RAR-inlägg
+        packas innehållet upp <i>under</i> nedladdningen, så volymerna existerar aldrig som filer
+        — diskskrivningar hamnar på innehåll × 1.0.</p></div>
       <div class="card"><span class="ic">🕸️</span><h3>Union-tillgänglighet</h3>
-        <p>En artikel är bara "saknad" när <i>varje</i> konfigurerad backbone har nekat
-        den. Blockexakt bokföring avgör COMPLETE / REPAIRABLE / IMPOSSIBLE innan
-        byte slösas, hämtar det exakt passande minimum av återställningsblock och avbryter
-        hopplösa nedladdningar på sekunder.</p></div>
+        <p>En artikel räknas som "saknad" först när <i>varje</i> konfigurerad backbone har
+        tackat nej. Blockexakt bokföring avgör COMPLETE, REPAIRABLE eller IMPOSSIBLE innan byte
+        slösas bort, hämtar precis det exakt passande minimum av återställningsblock och släpper
+        hopplösa nedladdningar på några sekunder.</p></div>
     </div>
   </div>
 </section>
@@ -91,9 +91,9 @@
   <div class="wrap">
     <p class="kicker">Rörledningen</p>
     <h2>Rör varje byte en gång</h2>
-    <p class="lead">Konkurrenter skriver arkivvolymerna, läser tillbaka dem för att verifiera, läser
-    dem igen för att packa upp, och skriver sedan utdatan — grovt räknat 2× skrivningar och 2× läsningar.
-    nzbfast gör i stället så här:</p>
+    <p class="lead">Andra klienter skriver arkivvolymerna, läser tillbaka dem för att verifiera, läser
+    dem en andra gång för att packa upp och skriver sedan utdatan — grovt räknat 2× skrivningar och 2× läsningar.
+    Så här gör nzbfast i stället:</p>
     <div class="pipe"><pre>
 socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s per core)
                    │
@@ -153,7 +153,7 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
       <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">ingen användbar fil</span></div>
     </div>
     <p class="note" style="text-align:left">190.6 GB NZB → en enda 167.9 GB mkv, M1 Ultra på 10 GbE, 6 providers × 8 anslutningar.
-    Samma jobb blir klart inom en 1 GB minnesbudget. Fullständiga tabeller, sex scenarier, och etapperna vi <i>förlorade</i> — plus hur man reproducerar —
+    Samma jobb blir klart inom en 1 GB minnesbudget. Fullständiga tabeller, sex scenarier, och den enda etapp vi <i>inte vinner</i> — plus hur man reproducerar —
     på <a href="benchmarks.sv.html">benchmark-sidan</a>.</p>
   </div>
 </section>
@@ -181,16 +181,16 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
     <p class="kicker">Passar din uppsättning</p>
     <h2>Rikta dina befintliga verktyg mot den</h2>
     <div class="grid3">
-      <div class="card"><h3>Sonarr / Radarr</h3><p>Fullständigt SABnzbd-kompatibelt API — lägg till nzbfast som en
-        "SABnzbd"-nedladdningsklient och den bara fungerar: grabbar, kategorier, prioriteter, nya försök,
-        efterbehandlingsskript (SAB_*-kontrakt), historik. Newznab-fasaden låter också
-        *arr-verktygen <i>söka i ditt lokala index</i> som om det vore en indexerare.</p></div>
-      <div class="card"><h3>nzb360 / LunaSea</h3><p>Daemonen talar även NZBGets JSON-RPC —
-        de populära telefonfjärrarna styr nzbfast oförändrat. Och instrumentpanelen själv har en
-        förstklassig telefonlayout för när du är borta från den stora skärmen.</p></div>
-      <div class="card"><h3>Kommer från SAB eller NZBGet?</h3><p>Ett klick importerar dina servrar från
-        en befintlig SABnzbd- eller NZBGet-installation (den läser också sabnzbd.ini direkt). Bevaknings-
-        mappar, RSS-flöden med filter, smarta mappar med TV-arkivering och städregler följer
+      <div class="card"><h3>Sonarr / Radarr</h3><p>Den bär hela det SABnzbd-kompatibla API:et, så du lägger
+        till nzbfast som en "SABnzbd"-nedladdningsklient och det bara fungerar — grabbar, kategorier, prioriteter,
+        nya försök, efterbehandlingsskript på SAB_*-kontraktet, historik. Newznab-fasaden går ett steg längre och
+        låter *arr-verktygen <i>söka i ditt lokala index</i> som om det vore en indexerare.</p></div>
+      <div class="card"><h3>nzb360 / LunaSea</h3><p>Daemonen talar även NZBGets JSON-RPC, så de
+        populära telefonfjärrarna styr nzbfast utan några ändringar. Instrumentpanelen själv har dessutom en
+        riktig telefonlayout för när du är borta från den stora skärmen.</p></div>
+      <div class="card"><h3>Kommer från SAB eller NZBGet?</h3><p>Ett klick hämtar in dina servrar från
+        en befintlig SABnzbd- eller NZBGet-installation, och den läser sabnzbd.ini direkt om det är vad den
+        hittar. Bevakningsmappar, filtrerade RSS-flöden, smarta mappar med TV-arkivering och städregler följer
         med på köpet.</p></div>
     </div>
   </div>
@@ -200,8 +200,8 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
   <div class="wrap" style="text-align:center">
     <h2>Prova den inom de närmaste två minuterna</h2>
     <p class="lead" style="margin-left:auto;margin-right:auto">Packa upp, dubbelklicka på startaren, svara på
-    tre frågor (eller låt den hitta din SABnzbd-konfig), och instrumentpanelen öppnas. Första
-    nedladdningen inom två minuter.</p>
+    tre frågor — eller låt den hitta din befintliga SABnzbd-konfig — och instrumentpanelen öppnas. Din första
+    nedladdning landar inom två minuter.</p>
     <div class="btnrow">
       <a class="btn" href="download.sv.html">Ladda ner nzbfast</a>
       <a class="btn ghost" href="features.sv.html">Läs hela funktionslistan</a>

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Benchmarks — nzbfast</title>
-<meta name="description" content="nzbfast mod SABnzbd, NZBGet og rustnzb: 4 klienter × 6 scenarier på identisk hardware. Ærlige resultater, inklusive de ben, nzbfast tabte, med reproduktionstrin.">
+<meta name="description" content="nzbfast mod SABnzbd, NZBGet og rustnzb: 4 klienter × 6 scenarier på identisk hardware. Ærlige resultater, inklusive det ene ben, nzbfast ikke vinder, med reproduktionstrin.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
 <link rel="alternate" hreflang="en" href="benchmarks.html">
@@ -41,10 +41,10 @@
 </div></header>
 
 <div class="hero wrap" style="padding-bottom:6px">
-  <h1>Målt, ikke <em>markedsført</em>.</h1>
+  <h1>Benchmarks</h1>
   <p class="sub">Fire klienter, seks scenarier, identisk hardware og udbydere, kørsler
   flettet, så udbyderdrift ophæves. Målet er <b>tid til en brugbar fil</b> —
-  hentet, verificeret, udpakket. Inklusive de to ben, vi tabte.</p>
+  hentet, verificeret, udpakket. Inklusive det ene ben, vi ikke vinder.</p>
 </div>
 
 <section style="padding-top:26px">
@@ -150,28 +150,17 @@
 <section class="alt">
   <div class="wrap">
     <p class="kicker">Den ærlige kolonne</p>
-    <h2>To ben, vi tabte — ét nu lukket</h2>
+    <h2>Det ene ben, vi ikke vinder</h2>
     <div class="grid2">
       <div class="card"><h3>Beskadiget store-mode-post</h3>
-        <p>20 forgiftede artikler i en 7.4 GB REMUX: NZBGet blev brugbar færdig på <b>53 s</b>; nzbfast
-        tager nu <b>58 s</b> — reparation færdig på 32 s, alle 62 volumener genudpakket, byte-nøjagtigt
-        output. Sluttilstands-fejlen, som et tidligere build havde på præcis denne sti (reparerede volumener
-        ødelagt af genudpakningen, mens exit-koden sagde succes), er rettet, regressionstestet
-        og genvalideret mod rigtig Usenet. Vores reparation henter stadig et næsten-teoretisk-minimum på
-        22 genoprettelsesblokke for 20 nødvendige mod deres fulde PAR2-gennemløb — men NZBGet vinder benet med
-        fem sekunder, så det står trykt her.</p></div>
-      <div class="card"><h3>kill −9-genoptagelse — lukket</h3>
-        <p>Dræbt ved ~15 GB af et 34.5 GB-job var dette engang vores værste tal: NZBGet gen-hentede
-        <b>~0.6 GB</b>, nzbfast <b>15 GB</b> — alt afkodet før PAR2-aktivering døde med
-        processen. Journalen registrerer nu hver artikels fysiske placering, så en genoptagelse
-        gendanner de bytes fra den forrige kørsels egne outputfiler (en lokal diskkopi, hvor hver
-        byte genverificeres mod PAR2-blok-mappet) og gen-henter <b>~0.3 GB</b> — paritet
-        inden for udbyderstøj. SABnzbd har, for en ordens skyld, aldrig kommet sig fra dette scenarie i
-        tre runder: dræbt på samme måde gen-hentede den 0.5 GB på en time og fik timeout.</p></div>
+        <p>20 forgiftede artikler i en 7.4 GB REMUX: NZBGet bliver brugbar færdig på <b>53 s</b>, nzbfast
+        på <b>58 s</b>. Vores reparation er færdig på 32 s, genudpakker alle 62 volumener, og outputtet er
+        byte-nøjagtigt — og den henter et næsten-teoretisk-minimum på 22 genoprettelsesblokke for de 20 nødvendige,
+        mod NZBGets fulde PAR2-gennemløb. Men NZBGet tager benet med fem sekunder, så her er det.</p></div>
     </div>
-    <div class="callout">Hvorfor offentliggøre nederlag? Fordi sejrene kun er troværdige ved siden af dem.
-    Hvert tal på denne side kommer fra de samme flettede kørsler, og repoets
-    benchmark-log er en fuld laboratoriejournal — negative resultater inkluderet.</div>
+    <div class="callout">Hvorfor overhovedet vise et nederlag? Fordi sejrene kun er troværdige ved siden af det.
+    Hvert tal på denne side kommer fra de samme flettede kørsler, og repoet gemmer det hele
+    som en fuld laboratoriejournal — negative resultater inkluderet.</div>
   </div>
 </section>
 
@@ -245,8 +234,8 @@
       <li><b>CPU-reserve</b>: målte afkodnings+verificerings-lofter på 86–165 Gbps på Apple silicon — netværket er flaskehalsen med 4–50× på hver testet maskine.</li>
     </ul>
     <div class="callout">Stående regel fra repoet: <b>hver ydelses-påstand citerer en reproducerbar
-    kommando og de betingelser, den kørte under.</b> Den fulde laboratoriejournal — inklusive negative
-    resultater og forkerte drejninger — føres som en dateret laboratoriejournal.</div>
+    kommando og de betingelser, den kørte under.</b> Det hele lever i repoet som en dateret
+    laboratoriejournal — inklusive negative resultater og forkerte drejninger.</div>
   </div>
 </section>
 

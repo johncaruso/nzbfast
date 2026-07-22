@@ -42,10 +42,11 @@
 
 <div class="hero wrap">
   <h1>Van NZB naar een <em>geverifieerd bestand</em><br>voordat anderen klaar zijn met downloaden.</h1>
-  <p class="sub">nzbfast is een Usenet-downloader die draait om een one-pass pipeline:
+  <p class="sub">nzbfast is een Usenet-downloader die om één enkele pass is gebouwd:
   elke byte wordt gedecodeerd, geverifieerd en uitgepakt <b>tijdens het downloaden</b>.
-  Geen samenvoegpass, geen verificatiepass, geen uitpakpass — als de voortgangsbalk
-  vol is, is het bestand klaar en aantoonbaar intact.</p>
+  Achteraf volgt geen samenvoegpass, en er blijft niets meer te verifiëren of uit te pakken
+  zodra hij klaar is — op het moment dat de voortgangsbalk vol loopt, is het bestand af en
+  aantoonbaar intact.</p>
   <div class="chips">
     <span class="chip"><b>8,31&nbsp;Gbps</b> op een 10&nbsp;GbE-lijn</span>
     <span class="chip"><b>190&nbsp;GB → 4m44s</b> tot een geverifieerd bestand</span>
@@ -65,8 +66,8 @@
   <div class="wrap">
     <p class="kicker">Waarom het snel is</p>
     <h2>Drie ideeën die de gangbare clients niet volledig benutten</h2>
-    <p class="lead">Geen micro-optimalisatie — architectuur. Elk idee is gemeten in
-    <a href="benchmarks.nl.html">de benchmarklog</a> met reproduceerbare commando's.</p>
+    <p class="lead">Dit is architectuur, geen micro-optimalisatie, en alles ervan is gemeten in
+    <a href="benchmarks.nl.html">de benchmarklog</a> met commando's die je zelf opnieuw kunt draaien.</p>
     <div class="grid3">
       <div class="card"><span class="ic">🔁</span><h3>Gepipelinede NNTP</h3>
         <p>Meerdere artikelverzoeken blijven tegelijk onderweg per verbinding, dus round-trips
@@ -142,10 +143,10 @@ socket ──TLS──▶ <b>rapidyenc SIMD-decode</b> (in-place — 4,95 GB/s p
   <div class="wrap">
     <p class="kicker">Benchmarks</p>
     <h2>190,6 GB → een geverifieerd bestand van 167,9 GB</h2>
-    <p class="lead">Zelfde machine, dezelfde zes providers, runs afwisselend achter elkaar.
-    Tijd totdat er een bruikbaar, uitgepakt bestand is — de enige maatstaf die telt.
-    Elke concurrent afgesteld op z'n gedocumenteerde optimum (inclusief het
-    <i>aanzetten</i> van SABnzbds pipelining, die standaard uit staat).</p>
+    <p class="lead">Zelfde machine, dezelfde zes providers, runs afwisselend achter elkaar gedraaid.
+    Wat geklokt wordt, is wanneer er een bruikbaar, uitgepakt bestand bestaat — de enige maatstaf die
+    er echt toe doet. Elke concurrent is afgesteld op z'n eigen gedocumenteerde optimum, tot en met het
+    <i>aanzetten</i> van SABnzbds pipelining, die het standaard zonder levert.</p>
     <div class="bars">
       <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:24%"></i></span><span class="t">4m 44s</span></div>
       <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:36%"></i></span><span class="t">7m 06s · +50%</span></div>
@@ -153,7 +154,7 @@ socket ──TLS──▶ <b>rapidyenc SIMD-decode</b> (in-place — 4,95 GB/s p
       <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">geen bruikbaar bestand</span></div>
     </div>
     <p class="note" style="text-align:left">190,6 GB NZB → één mkv van 167,9 GB, M1 Ultra op 10 GbE, 6 providers × 8 verbindingen.
-    Dezelfde taak voltooit binnen een geheugenbudget van 1 GB. Volledige tabellen, zes scenario's en de legs die we <i>verloren</i> — plus hoe je het reproduceert —
+    Dezelfde taak voltooit binnen een geheugenbudget van 1 GB. Volledige tabellen, alle zes scenario's en de ene leg die we <i>niet winnen</i> — plus hoe je het reproduceert —
     op de <a href="benchmarks.nl.html">benchmarkpagina</a>.</p>
   </div>
 </section>
@@ -181,17 +182,17 @@ socket ──TLS──▶ <b>rapidyenc SIMD-decode</b> (in-place — 4,95 GB/s p
     <p class="kicker">Past in je stack</p>
     <h2>Richt je bestaande tools erop</h2>
     <div class="grid3">
-      <div class="card"><h3>Sonarr / Radarr</h3><p>Volledig SABnzbd-compatibele API — voeg nzbfast toe als
-        "SABnzbd"-downloadclient en het werkt gewoon: grabs, categorieën, prioriteiten, retries,
-        nabewerkingsscripts (SAB_*-contract), geschiedenis. Via de Newznab-facade kunnen de
-        *arrs bovendien <i>je lokale index doorzoeken</i> alsof het een indexer is.</p></div>
-      <div class="card"><h3>nzb360 / LunaSea</h3><p>De daemon spreekt ook NZBGets JSON-RPC —
-        de populaire telefoon-remotes bedienen nzbfast zonder aanpassing. En het dashboard zelf heeft een
-        volwaardige telefoonweergave voor als je niet achter het grote scherm zit.</p></div>
-      <div class="card"><h3>Kom je van SAB of NZBGet?</h3><p>Eén klik importeert je servers uit
-        een bestaande SABnzbd- of NZBGet-installatie (hij leest ook sabnzbd.ini rechtstreeks). Watchmappen,
-        RSS-feeds met filters, slimme mappen met tv-opberging en opruimregels reizen gewoon
-        mee.</p></div>
+      <div class="card"><h3>Sonarr / Radarr</h3><p>Hij draagt de volledige SABnzbd-compatibele API, dus
+        je voegt nzbfast toe als "SABnzbd"-downloadclient en het werkt meteen: grabs, categorieën,
+        prioriteiten, retries, nabewerkingsscripts op het SAB_*-contract, geschiedenis. De Newznab-facade
+        gaat nog een stap verder en laat de *arrs <i>je lokale index doorzoeken</i> alsof het een indexer is.</p></div>
+      <div class="card"><h3>nzb360 / LunaSea</h3><p>De daemon spreekt ook NZBGets JSON-RPC, dus de
+        populaire telefoon-remotes bedienen nzbfast zonder enige aanpassing. Het dashboard zelf heeft
+        bovendien een volwaardige telefoonweergave voor als je niet achter het grote scherm zit.</p></div>
+      <div class="card"><h3>Kom je van SAB of NZBGet?</h3><p>Eén klik haalt je servers binnen uit
+        een bestaande SABnzbd- of NZBGet-installatie, en hij leest sabnzbd.ini rechtstreeks als dat is wat
+        hij aantreft. Watchmappen, gefilterde RSS-feeds, slimme mappen met tv-opberging en opruimregels
+        reizen allemaal mee.</p></div>
     </div>
   </div>
 </section>
@@ -200,8 +201,8 @@ socket ──TLS──▶ <b>rapidyenc SIMD-decode</b> (in-place — 4,95 GB/s p
   <div class="wrap" style="text-align:center">
     <h2>Probeer het in de komende twee minuten</h2>
     <p class="lead" style="margin-left:auto;margin-right:auto">Uitpakken, dubbelklik de launcher, beantwoord
-    drie vragen (of laat hem je SABnzbd-config vinden), en het dashboard opent. Je eerste
-    download binnen twee minuten.</p>
+    drie vragen (of laat hem je bestaande SABnzbd-config vinden), en het dashboard opent. Je eerste
+    download landt binnen twee minuten.</p>
     <div class="btnrow">
       <a class="btn" href="download.nl.html">Download nzbfast</a>
       <a class="btn ghost" href="features.nl.html">Lees de volledige functielijst</a>

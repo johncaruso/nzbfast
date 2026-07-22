@@ -41,8 +41,8 @@
 </div></header>
 
 <div class="hero wrap" style="padding-bottom:6px">
-  <h1>Cada recurso, <em>uma página</em>.</h1>
-  <p class="sub">A versão curta primeiro; a máquina inteira abaixo.</p>
+  <h1>Recursos</h1>
+  <p class="sub">A versão curta em cima, o detalhe completo embaixo.</p>
 </div>
 
 <section style="padding-top:26px">
@@ -71,20 +71,20 @@
     <h2>Motor e velocidade</h2>
     <div class="grid2">
       <ul class="plain">
-        <li><b>NNTP com pipeline</b> — múltiplas solicitações em trânsito por conexão derrotam tanto a latência de ida e volta quanto a degradação da janela de congestionamento do TCP; medido +12%…+270% vs serial. Satura linhas com ~8 conexões por servidor.</li>
-        <li><b>Decodificação yEnc por SIMD</b> (rapidyenc, kernels NEON/AVX) — 4,95 GB/s por núcleo, decodificado no lugar no caminho de recepção.</li>
-        <li><b>Fila compartilhada multi-servidor</b> — os provedores se autobalanceiam dentro de ~2%, sem ajuste; consciência de taxa por servidor com despacho duplicado de cauda para que um servidor lento não arraste a cauda de um trabalho.</li>
-        <li><b>Absorção entre trabalhos</b> — a cauda do trabalho N se sobrepõe ao início do trabalho N+1: a linha permanece acesa de ponta a ponta ao longo de uma fila (2% ociosa vs os 61% no escuro do SABnzbd no bench).</li>
-        <li><b>Vigia de trabalhos lentos</b> — um download se arrastando em um servidor lento enquanto outros esperam é adiado automaticamente para o fim da fila (progresso mantido) e retomado quando a fila fica livre.</li>
-        <li><b>Pré-carga em servidor ocioso</b> — servidores que o trabalho ativo não pode usar (seus artigos não estão neles) iniciam o próximo trabalho da fila em vez de ficar ociosos.</li>
+        <li><b>NNTP com pipeline.</b> Manter várias solicitações em trânsito em cada conexão vence tanto a latência de ida e volta quanto a degradação da janela de congestionamento do TCP. Medimos de +12% a +270% sobre a busca serial, e cerca de 8 conexões por servidor bastam para saturar a linha.</li>
+        <li><b>Decodificação yEnc por SIMD</b> (rapidyenc, com kernels NEON e AVX) roda a 4,95 GB/s por núcleo, decodificando no próprio lugar à medida que os bytes chegam pelo caminho de recepção.</li>
+        <li><b>Fila compartilhada entre servidores.</b> Os provedores se equilibram sozinhos dentro de ~2%, sem nenhum ajuste. A taxa real de cada um é acompanhada, e a cauda de um trabalho é despachada em duplicata para que um único servidor lento não arraste o final.</li>
+        <li><b>Absorção entre trabalhos.</b> A cauda do trabalho N se sobrepõe ao início do trabalho N+1, de modo que a linha continua acesa de ponta a ponta ao longo de uma fila inteira — 2% de ociosidade aqui contra os 61% de tempo morto do SABnzbd no mesmo bench.</li>
+        <li><b>Vigia de trabalhos lentos.</b> Um download que se arrasta em um servidor lento enquanto os demais ficam parados é jogado para o fim da fila, com o progresso preservado, e recomeça assim que a fila esvazia.</li>
+        <li><b>Pré-carga em servidor ocioso</b> — um servidor que o trabalho ativo não consegue usar, porque seus artigos não estão armazenados nele, começa o próximo trabalho da fila em vez de ficar parado.</li>
       </ul>
       <ul class="plain">
-        <li><b>Escada de ajuste de conexões</b> — mede o joelho real de vazão de cada provedor (conexões pedidas vs concedidas) em vez de chutar.</li>
-        <li><b>Regulador de velocidade automática</b> — regulador de RTT opcional ao estilo LEDBAT que cede ao tráfego da sua casa enquanto usa o restante da linha.</li>
-        <li><b>Limites de velocidade e agendador semanal</b> — tetos ajustáveis ao vivo, agenda em horário local (à prova de horário de verão), "pausar por N minutos" com retomada automática.</li>
-        <li><b>Orçamento de memória</b> — um orçamento de RAM global (auto: RAM/4, com limite; substituível). Quando o orçamento aperta, ele encolhe os buffers, depois faz spill para o disco e lê de volta quando o trabalho estabiliza — nunca faz swap. Um trabalho de 190 GB termina dentro de um orçamento de 1 GB (~1,1 GB de pico de RSS); um perfil de NAS de 2 GB é medido e documentado.</li>
-        <li><b>Contrapressão</b> — um disco lento estrangula os sockets em vez de encher a RAM (mantém-se dentro de ±1% de um teto de escrita, com a RAM <i>caindo</i> sob pressão).</li>
-        <li><b>Corte de memória após o trabalho</b> — o daemon devolve a memória liberada ao SO quando ocioso (a pegada cai para ~8 MB entre trabalhos no macOS).</li>
+        <li><b>Escada de ajuste de conexões.</b> Em vez de chutar, ela mede onde a vazão de cada provedor realmente para de subir — conexões pedidas contra concedidas — e se fixa ali.</li>
+        <li><b>Regulador automático de velocidade</b> — um regulador de RTT opcional ao estilo LEDBAT que cede lugar ao restante do tráfego da sua casa e fica com o que sobra da linha.</li>
+        <li><b>Limites de velocidade e agendador semanal</b> — tetos ajustáveis ao vivo, uma agenda em horário local (à prova de horário de verão) e um "pausar por N minutos" que retoma sozinho.</li>
+        <li><b>Orçamento de memória.</b> Um único orçamento global de RAM (automático: um quarto da RAM, com limite, substituível). Conforme ele aperta, primeiro os buffers encolhem, depois os dados fazem spill para o disco e voltam a ser lidos quando o trabalho estabiliza. Ele nunca faz swap. Um trabalho de 190 GB termina dentro de um orçamento de 1 GB com ~1,1 GB de pico de RSS, e há um perfil de 2 GB, medido e documentado, para NAS.</li>
+        <li><b>Contrapressão.</b> Um disco lento estrangula os sockets em vez de deixar a RAM encher — ele se mantém dentro de ±1% de um teto de escrita, e a RAM na verdade <i>cai</i> sob pressão.</li>
+        <li><b>Corte de memória após o trabalho</b> — quando fica ocioso, o daemon devolve a memória liberada ao SO, caindo para cerca de 8 MB entre trabalhos no macOS.</li>
       </ul>
     </div>
   </div>
@@ -95,16 +95,16 @@
     <h2>O pipeline de passagem única</h2>
     <div class="grid2">
       <ul class="plain">
-        <li><b>Escreva uma vez</b> — os artigos decodificados são escritos com pwrite em seus deslocamentos finais no arquivo. Sem arquivos temporários, sem passagem de montagem.</li>
-        <li><b>Verificação PAR2 no fluxo</b> — cada bloco tem seu MD5 calculado a partir dos buffers de decodificação conforme chega; a verificação termina quando o download termina. Mais forte que a verificação rápida dos concorrentes, e de graça.</li>
-        <li><b>Extração direta</b> — publicações RAR em modo armazenamento (a maioria dos lançamentos scene) são mapeadas e extraídas durante o download; os volumes nunca existem no disco. Escritas em disco = conteúdo × 1,0, disco necessário = 1× (outros precisam de ~2×).</li>
-        <li><b>Desofuscação</b> — publicações ofuscadas são renomeadas a partir dos metadados PAR2; nomes ofuscados por ROT13 são resgatados; lixo com nome de hash é classificado e filtrado.</li>
+        <li><b>Escreva uma vez.</b> Os artigos decodificados vão de pwrite direto para seus deslocamentos finais no arquivo. Sem arquivos temporários, sem uma passagem de montagem à parte.</li>
+        <li><b>Verificação PAR2 no fluxo.</b> Cada bloco tem o MD5 calculado a partir dos buffers de decodificação assim que chega, então a verificação termina no exato momento em que o download termina. Isso supera a verificação rápida com que os outros clientes se contentam, e não custa nada.</li>
+        <li><b>Extração direta</b> — publicações RAR em modo armazenamento (a maioria dos lançamentos scene) são mapeadas e extraídas enquanto baixam, de modo que os volumes nunca chegam ao disco. O disco escrito fica em conteúdo × 1,0 e o disco necessário em 1×, ao passo que os outros querem cerca de 2×.</li>
+        <li><b>Desofuscação.</b> Publicações ofuscadas são renomeadas a partir de seus metadados PAR2, nomes embaralhados por ROT13 são resgatados, e o lixo com nome de hash é classificado e barrado.</li>
       </ul>
       <ul class="plain">
-        <li><b>Reparo sob medida</b> — os blocos danificados são conhecidos ao vivo; o conjunto de volumes de recuperação de menor número de bytes é buscado durante o download (resolvido por mochila), e o reparo toca apenas os trechos danificados.</li>
-        <li><b>Recurso para comprimidos/criptografados</b> — publicações fora do modo armazenamento se materializam e são extraídas pelo extrator RAR nativo, sobrepostas à fila; conjuntos criptografados são estacionados com uma mensagem clara.</li>
-        <li><b>Tratamento de senhas</b> — senhas vindas da API *arr, da convenção de nome de arquivo <code>{{pw}}</code> ou dos metadados do NZB; um desbloqueio 🔑 no painel cuida do resto (desbloqueio em segundo plano, depois arquivamento normal).</li>
-        <li><b>Trilhos de segurança</b> — volumes de origem reparados são protegidos contra escrita durante a reextração; os códigos de saída só dizem "sucesso" quando o estado final é de fato utilizável.</li>
+        <li><b>Reparo sob medida.</b> Os blocos danificados são conhecidos no momento em que acontecem, então só o conjunto de volumes de recuperação com menor número de bytes é buscado — um problema da mochila resolvido — e o reparo não toca em nada além dos trechos danificados.</li>
+        <li><b>Recurso para comprimidos e criptografados</b> — publicações fora do modo armazenamento se materializam e são extraídas pelo motor RAR nativo, sobrepostas ao resto da fila. Conjuntos criptografados ficam estacionados com uma mensagem clara em vez de falhar em silêncio.</li>
+        <li><b>Tratamento de senhas.</b> As senhas vêm da API dos *arr, da convenção de nome de arquivo <code>{{pw}}</code> ou dos metadados do NZB. Para o que sobrar, um desbloqueio 🔑 no painel assume dali: desbloqueia em segundo plano e depois arquiva normalmente.</li>
+        <li><b>Trilhos de segurança.</b> Os volumes de origem reparados ficam protegidos contra escrita enquanto a reextração roda, e o código de saída só informa "sucesso" quando o estado final é de fato utilizável.</li>
       </ul>
     </div>
   </div>
@@ -115,18 +115,18 @@
     <h2>Confiabilidade e disponibilidade</h2>
     <div class="grid2">
       <ul class="plain">
-        <li><b>Verificação de disponibilidade pré-voo</b> — varreduras STAT com pipeline montam uma matriz por artigo × por servidor em segundos: COMPLETE / REPAIRABLE / IMPOSSIBLE antes de você ter baixado qualquer coisa. Publicações impossíveis abortam tendo buscado quase nada.</li>
-        <li><b>Roteamento por união</b> — um artigo só está ausente quando todo servidor ativo o recusou; os artigos são roteados para servidores que os têm. Backbones diferentes têm perfis diferentes de retenção/remoção — a união completa publicações que nenhum servidor sozinho consegue.</li>
-        <li><b>Diário à prova de travamento</b> — diário no nível de artigo; dê kill −9 no meio do trabalho e ele retoma, rebuscando apenas o que não foi persistido. Fila e histórico sobrevivem a reinícios.</li>
-        <li><b>Estacionar + repetir</b> — trabalhos falhados são estacionados no histórico; a repetição rebusca apenas o que está faltando.</li>
-        <li><b>Testado no caos</b> — um servidor NNTP simulado conduz 10 cenários de falha de ponta a ponta (430s, corrupção, truncamento, travamentos, servidores mortos, kill −9) em cada execução de teste.</li>
+        <li><b>Verificação de disponibilidade pré-voo.</b> Varreduras STAT com pipeline montam uma matriz por artigo × por servidor em segundos e marcam o trabalho como COMPLETE, REPAIRABLE ou IMPOSSIBLE antes de baixar um único byte de conteúdo. Uma publicação impossível aborta tendo puxado quase nada.</li>
+        <li><b>Roteamento por união.</b> Um artigo só conta como ausente depois que todos os servidores ativos o recusaram; até lá, ele é roteado para qualquer servidor que o tenha. Os backbones diferem em retenção e remoções, então a união conclui discretamente publicações que nenhum servidor sozinho conseguiria.</li>
+        <li><b>Diário à prova de travamento.</b> O diário trabalha na granularidade de artigo. Dê um kill −9 no meio do trabalho e ele volta, rebuscando só o que ainda não tinha sido persistido; a fila e o histórico sobrevivem a reinícios.</li>
+        <li><b>Estacionar e repetir</b> — trabalhos que falham ficam estacionados no histórico, e uma nova tentativa puxa apenas as partes que ainda faltam.</li>
+        <li><b>Testado no caos.</b> Um servidor NNTP simulado conduz dez cenários de falha de ponta a ponta — 430s, corrupção, truncamento, travamentos, servidores mortos, kill −9 — em cada execução dos testes.</li>
       </ul>
       <ul class="plain">
-        <li><b>Pontuação de confiabilidade de provedor</b> — taxas de compleção por servidor acompanhadas para sempre, exibidas no painel (aviso &lt;98%).</li>
-        <li><b>Analisador de diversidade de servidores</b> — amostra por STAT entre seus servidores e os agrupa por lacunas compartilhadas: descubra quais dos seus provedores são na verdade o mesmo backbone antes de pagar por uma redundância que você não tem.</li>
-        <li><b>Cotas, contas de bloco e guarda de disco</b> — cotas diárias/mensais, orçamentos de bytes acumulados para contas de bloco (excluídas automaticamente quando esgotadas), pausa por pouco espaço em disco, histórico de uso diário por provedor.</li>
-        <li><b>Detecção de duplicados</b> — dupekey/dupescore com promoção de alternativa: uma captura falha promove automaticamente a alternativa retida.</li>
-        <li><b>Roteamento consciente de retenção</b> — publicações antigas pulam servidores cuja retenção não pode tê-las; publicações inservíveis falham na hora em vez de ficarem girando.</li>
+        <li><b>Pontuação de confiabilidade de provedor.</b> As taxas de conclusão de cada servidor são guardadas para sempre e mostradas no painel, com um aviso abaixo de 98%.</li>
+        <li><b>Analisador de diversidade de servidores.</b> Ele faz amostragem por STAT nos seus servidores e os agrupa pelas lacunas que compartilham, para você saber quais provedores "diferentes" são na verdade o mesmo backbone antes de pagar por uma redundância que você não tem de fato.</li>
+        <li><b>Cotas, contas de bloco e guarda de disco</b> — cotas diárias e mensais, orçamentos de bytes vitalícios para contas de bloco (excluídas automaticamente quando se esgotam), uma pausa por pouco espaço em disco e histórico de uso diário por provedor.</li>
+        <li><b>Detecção de duplicados</b> — dupekey e dupescore, com uma alternativa reservada promovida automaticamente no instante em que uma captura falha.</li>
+        <li><b>Roteamento consciente de retenção.</b> Publicações mais antigas que a retenção de um servidor o ignoram por completo, e o que nenhum servidor consegue servir falha de imediato em vez de ficar girando.</li>
       </ul>
     </div>
   </div>
@@ -137,19 +137,19 @@
     <h2>Automação e integrações</h2>
     <div class="grid2">
       <ul class="plain">
-        <li><b>API compatível com o SABnzbd</b> — toda a superfície que os *arrs usam: addfile/addurl, categorias, prioridades, pausar/retomar por trabalho, repetir, paginação, chaves de API em dois níveis. O Sonarr/Radarr o tratam como SABnzbd.</li>
-        <li><b>Fachada JSON-RPC do NZBGet</b> — nzb360, LunaSea e outros controles remotos do NZBGet funcionam sem modificação.</li>
-        <li><b>Servidor Newznab</b> — seu índice local responde a t=search/tvsearch/movie: os *arrs podem usar suas próprias varreduras como indexador.</li>
-        <li><b>Captura automática por RSS</b> — feeds com uma linguagem de filtro ao estilo NZBGet; adicione/edite ao vivo pelo painel.</li>
-        <li><b>Lista de acompanhamento</b> — nomeie séries/filmes (mesmo não estreados); o rastreamento por episódio captura cada um na primeira aparição, melhora a qualidade até seu alvo (ex.: 720p → 1080p REMUX) e opcionalmente exclui a cópia substituída somente após a melhoria verificar. O calendário de estreias mostra o que está por vir.</li>
+        <li><b>API compatível com o SABnzbd</b> — toda a superfície que os *arr realmente usam: addfile/addurl, categorias, prioridades, pausar/retomar por trabalho, repetir, paginação, chaves de API em dois níveis. O Sonarr e o Radarr conversam com ele como se fosse o SABnzbd.</li>
+        <li><b>Fachada JSON-RPC do NZBGet.</b> nzb360, LunaSea e outros controles remotos do NZBGet se conectam sem modificação.</li>
+        <li><b>Servidor Newznab.</b> Seu índice local responde a t=search/tvsearch/movie, então os *arr podem tratar suas próprias varreduras como um indexador.</li>
+        <li><b>Captura automática por RSS</b> — feeds filtrados com uma linguagem ao estilo NZBGet, adicionados e editados ao vivo pelo painel.</li>
+        <li><b>Lista de acompanhamento.</b> Nomeie as séries e os filmes que você quer, até os que ainda nem estrearam. Cada episódio é capturado na primeira aparição e melhorado até chegar à qualidade-alvo (digamos, 720p → 1080p REMUX), e a cópia substituída só é apagada depois que a melhoria é verificada. Um calendário de estreias mostra o que está por vir.</li>
       </ul>
       <ul class="plain">
-        <li><b>Pasta monitorada</b> — solte um .nzb, ele baixa e o arquivo desaparece.</li>
-        <li><b>Pastas inteligentes</b> — regras de regex/palavra-chave/tamanho roteiam downloads para categorias no enfileiramento; o arquivamento de TV opcional renomeia para <code>Show/Season NN/Show - S01E02.ext</code>.</li>
-        <li><b>Regras de limpeza</b> — extensões de lixo excluídas após a conclusão.</li>
-        <li><b>Scripts de pós-processamento</b> — o contrato de ambiente SAB_* do SABnzbd: seu ecossistema de scripts existente roda como está.</li>
-        <li><b>Migração de um clique</b> — importa servidores de um ini do SABnzbd ou conf do NZBGet; lê sabnzbd.ini diretamente se for só isso que encontrar.</li>
-        <li><b>Ingestão de Spotnet</b> — verificação de assinatura de spot e síntese de NZB, embutidas.</li>
+        <li><b>Pasta monitorada.</b> Solte um .nzb dentro e ele baixa; o arquivo some assim que é recolhido.</li>
+        <li><b>Pastas inteligentes</b> — regras de regex, palavra-chave e tamanho organizam os downloads em categorias já no enfileiramento, com arquivamento de TV opcional para <code>Show/Season NN/Show - S01E02.ext</code>.</li>
+        <li><b>Regras de limpeza</b> — extensões de lixo são removidas assim que um trabalho conclui.</li>
+        <li><b>Scripts de pós-processamento.</b> Eles respeitam o contrato de ambiente SAB_* do SABnzbd, então os scripts que você já tem rodam do jeito que estão.</li>
+        <li><b>Migração de um clique.</b> Ele importa servidores de um ini do SABnzbd ou de um conf do NZBGet, e lê o sabnzbd.ini diretamente se for só isso que encontrar.</li>
+        <li><b>Ingestão de Spotnet</b> — verificação de assinatura de spot e síntese de NZB, embutidas de fábrica.</li>
       </ul>
     </div>
   </div>
@@ -158,23 +158,23 @@
 <section class="alt">
   <div class="wrap">
     <h2>Indexador e o mural de pôsteres</h2>
-    <p class="lead">Varra os grupos que você se importa para um índice privado, depois navegue nele como um
-    mural de pôsteres. Todos os metadados vêm de fontes públicas sem chave, buscadas pela sua instalação —
-    não há chave de API para implorar.</p>
+    <p class="lead">Varra os grupos que lhe interessam para um índice privado e depois navegue no resultado como um
+    mural de pôsteres. Cada pedacinho dos metadados é obtido de fontes públicas sem chave pela sua própria instalação —
+    não há nenhuma chave de API para ficar implorando.</p>
     <figure class="shot"><img src="assets/wall-sheet.jpg" alt="Folha de detalhes do mural de pôsteres com nota, elenco, sinopse e chips de episódios" loading="lazy"></figure>
     <div style="height:26px"></div>
     <div class="grid2">
       <ul class="plain">
-        <li><b>Varredor contínuo de grupos</b> — varreduras OVER incrementais no seu horário, ~43 mil cabeçalhos/s em conexões distribuídas; primeiras varreduras bissectadas por data (<code>--max-age 2y</code> pula anos de cabeçalhos em ~20 sondagens).</li>
-        <li><b>Filtros de ingestão</b> — filtros de tipo/ano/resolução/idioma/tamanho mantêm o spam de indexador fora do seu banco de dados; lixo ofuscado é detectado e filtrado por padrão.</li>
-        <li><b>Parser de nomes scene</b> — título/ano/episódio/qualidade/fonte a partir de radicais do mundo real, incl. dailies com código de data, códigos de múltiplos episódios, nomes ofuscados por ROT13; os lançamentos são deduplicados em um cartão por título.</li>
-        <li><b>Busca instantânea</b> — busca conforme você digita com filtros de qualidade e botões de acompanhar por linha; emblemas de qualidade por toda parte.</li>
+        <li><b>Varredor contínuo de grupos.</b> Varreduras OVER incrementais rodam no seu horário a ~43 mil cabeçalhos/s em conexões distribuídas. As primeiras varreduras são bissectadas por data, então <code>--max-age 2y</code> pula anos de cabeçalhos em cerca de 20 sondagens.</li>
+        <li><b>Filtros de ingestão</b> — filtros de tipo, ano, resolução, idioma e tamanho mantêm o spam de indexador fora do seu banco de dados, e o lixo ofuscado é detectado e barrado por padrão.</li>
+        <li><b>Parser de nomes scene.</b> Ele extrai título, ano, episódio, qualidade e fonte de radicais do mundo real — incluindo dailies com código de data, códigos de múltiplos episódios e nomes ofuscados por ROT13 — e reduz os lançamentos a um cartão por título.</li>
+        <li><b>Busca instantânea</b> — busca conforme você digita, com filtros de qualidade, botões de acompanhar em cada linha e emblemas de qualidade por toda parte.</li>
       </ul>
       <ul class="plain">
-        <li><b>Enriquecimento sem chave</b> — TVmaze (TV), iTunes Search (filmes), conjuntos de dados públicos de notas, Wikidata, Wikipédia e AniList preenchem pôsteres, notas + contagens de votos, elenco, gêneros e enredos. Chaves OMDb/TMDB opcionais são suportadas, mas nunca exigidas.</li>
-        <li><b>Grades de episódios</b> — chips por temporada, o melhor encode por episódio, um clique para baixar; pacotes de temporada marcados; "acompanhar série" no cabeçalho de cada temporada.</li>
-        <li><b>Linhas em alta</b> — faixas de novidades da semana e em alta agora com base na frequência de publicações.</li>
-        <li><b>Corrija qualquer coisa</b> — correspondência errada? Escolha entre candidatos ou digite a identidade você mesmo; metadados manuais nunca são sobrescritos. Pôster por URL ou upload. Um botão reenriquece um título; um apaga e reconstrói o índice inteiro.</li>
+        <li><b>Enriquecimento sem chave.</b> TVmaze para TV, iTunes Search para cinema, além de conjuntos de dados públicos de notas, Wikidata, Wikipédia e AniList preenchem pôsteres, notas e contagens de votos, elenco, gêneros e enredos. Chaves OMDb e TMDB funcionam se você as tiver, mas nada exige uma.</li>
+        <li><b>Grades de episódios</b> — chips por temporada com o melhor encode de cada episódio a um clique do download, pacotes de temporada sinalizados e um "acompanhar série" no cabeçalho de cada temporada.</li>
+        <li><b>Linhas em alta</b> — faixas de novidades da semana e do momento, montadas a partir da frequência de publicações.</li>
+        <li><b>Corrija qualquer coisa.</b> Correspondência errada? Escolha entre os candidatos ou simplesmente digite a identidade certa — nada do que você define à mão é sobrescrito. Aponte um pôster para uma URL ou envie um. Um botão reenriquece um único título; outro apaga e reconstrói o índice inteiro.</li>
       </ul>
     </div>
   </div>
@@ -184,8 +184,8 @@
   <div class="wrap">
     <h2>Prévia e biblioteca</h2>
     <ul class="plain">
-      <li><b>Prévia antes de terminar</b> — ▶ Reproduzir entrega ao reprodutor do seu SO um .m3u servido pelo daemon, para você conferir se um download é o que queria sem esperar que ele conclua. Conferir um ponto mais adiante leva os artigos certos para o início da fila.</li>
-      <li><b>Modo biblioteca</b> — conclusão instantânea para os *arr com ponteiros .strm; reproduzir um dispara o download real com prioridade máxima e reverificação em segundo plano.</li>
+      <li><b>Prévia antes de terminar.</b> O ▶ Reproduzir entrega ao reprodutor do seu SO um .m3u servido pelo daemon, para você confirmar que um download é o que queria sem esperar que ele conclua. Avance mais para a frente e os artigos de que você precisa saltam para o início da fila.</li>
+      <li><b>Modo biblioteca.</b> Os *arr veem conclusão instantânea por meio de ponteiros .strm; reproduza um e o download de verdade dispara com prioridade máxima, reverificando em segundo plano.</li>
     </ul>
   </div>
 </section>
@@ -204,16 +204,16 @@
     <div style="height:10px"></div>
     <div class="grid2">
       <ul class="plain">
-        <li><b>Gráficos ao vivo, sem bibliotecas</b> — atualização a cada 1 s; área de vazão, área empilhada por provedor, linha do tempo de saúde da verificação, contagem regressiva da fila, histograma de velocidade; os gráficos alargam sua janela de tempo com a janela do seu navegador.</li>
-        <li><b>Monitor de recursos</b> — CPU, RAM (vs orçamento), escrita em disco e rede em um gráfico, com um aviso de pouco espaço em disco.</li>
-        <li><b>Ranking de provedores</b> — os servidores se reordenam por desempenho ao vivo; bytes da sessão por provedor, contagens de conexões, utilização, confiabilidade.</li>
-        <li><b>Gerenciamento da fila</b> — arraste para reordenar, prioridade/categoria na própria linha, gaveta de detalhes por download, pausa otimista, "pausar por N minutos".</li>
+        <li><b>Gráficos ao vivo, sem bibliotecas.</b> Tudo é atualizado uma vez por segundo — uma área de vazão, uma área empilhada por provedor, uma linha do tempo de saúde da verificação, a queima da fila, um histograma de velocidade — e os gráficos alargam sua janela de tempo conforme você alarga o navegador.</li>
+        <li><b>Monitor de recursos</b> — CPU, RAM contra o orçamento, escritas em disco e rede em um único gráfico, com um aviso de pouco espaço em disco.</li>
+        <li><b>Ranking de provedores.</b> Os servidores se reordenam sozinhos pelo desempenho ao vivo, cada um mostrando bytes da sessão, número de conexões, utilização e confiabilidade.</li>
+        <li><b>Gerenciamento da fila</b> — arraste para reordenar, defina prioridade e categoria na própria linha, abra uma gaveta por download, pause de forma otimista ou "pause por N minutos".</li>
       </ul>
       <ul class="plain">
-        <li><b>Tudo configurável no navegador</b> — servidores (com testes de conexão ao vivo), velocidade/agendamento, conexões/janela/decodificadores, disco/cota, monitoramento/scripts, filtros de indexação, biblioteca, RSS, segurança com rotação de chave. Os ajustes persistem entre reinícios.</li>
-        <li><b>Diagnóstico embutido</b> — visualizador de log na interface, benchmark do sistema (tetos de rede/cálculo/disco + conselhos), analisador de diversidade de servidores, escada de conexões.</li>
-        <li><b>Uso de dados</b> — barras empilhadas por provedor de 14 dias, histórico diário, contadores acumulados para contas de bloco.</li>
-        <li><b>Qualidade de vida</b> — arraste e solte .nzb em qualquer lugar, notificações da área de trabalho, sons de conclusão, assistente de primeira execução, <code>serve --open</code>.</li>
+        <li><b>Tudo configurável no navegador</b> — servidores (com testes de conexão ao vivo), velocidade e agenda, conexões/janela/decodificadores, disco e cota, pastas monitoradas e scripts, filtros de indexação, biblioteca, RSS e segurança com rotação de chave. Os ajustes sobrevivem a reinícios.</li>
+        <li><b>Diagnóstico embutido</b> — um visualizador de log na própria interface, um benchmark do sistema que descobre os tetos de rede, cálculo e disco e diz o que fazer a respeito, o analisador de diversidade de servidores e a escada de conexões.</li>
+        <li><b>Uso de dados</b> — barras empilhadas por provedor de 14 dias, histórico diário e contadores vitalícios para contas de bloco.</li>
+        <li><b>Qualidade de vida.</b> Arraste e solte um .nzb em qualquer lugar, notificações da área de trabalho, sons de conclusão, um assistente de primeira execução e <code>serve --open</code>.</li>
       </ul>
     </div>
   </div>
@@ -223,11 +223,11 @@
   <div class="wrap">
     <h2>Implantação</h2>
     <ul class="plain">
-      <li><b>Executável único e autossuficiente</b> — par2 + extração RAR são código nativo no binário — nada é extraído no primeiro uso. Sem runtime, sem instalador.</li>
-      <li><b>macOS de primeira classe</b> — binário universal (Apple Silicon + Intel), app nativo de barra de menu em SwiftUI, unidade launchd, fórmula Homebrew.</li>
-      <li><b>Windows</b> — exe x64 totalmente estático, roda no Windows 10/11 de fábrica; lançador de duplo clique com configuração guiada.</li>
-      <li><b>Linux e Docker</b> — unidade systemd reforçada; imagem Docker multiestágio com entrypoint PUID/PGID ao estilo linuxserver; arquivo compose incluído. <a href="download.pt.html">Todas as plataformas →</a></li>
-      <li><b>Configuração guiada</b> — assistente interativo <code>nzbfast setup</code>, ou detecção automática de uma configuração existente do SABnzbd/NZBGet. Primeiro download em menos de dois minutos.</li>
+      <li><b>Executável único e autossuficiente.</b> A extração par2 e RAR é código nativo compilado no binário — nada é extraído no primeiro uso, e não há runtime nem instalador com que se preocupar.</li>
+      <li><b>macOS, de primeira classe</b> — um binário universal para Apple Silicon e Intel, um app nativo de barra de menu em SwiftUI, uma unidade launchd e uma fórmula Homebrew.</li>
+      <li><b>Windows</b> — um exe x64 totalmente estático que roda no Windows 10 e 11 de fábrica, com um lançador de duplo clique e configuração guiada.</li>
+      <li><b>Linux e Docker</b> — uma unidade systemd reforçada, uma imagem Docker multiestágio com um entrypoint PUID/PGID ao estilo linuxserver e um arquivo compose já incluído. <a href="download.pt.html">Todas as plataformas →</a></li>
+      <li><b>Configuração guiada.</b> Rode o assistente <code>nzbfast setup</code>, ou deixe-o detectar automaticamente uma configuração existente do SABnzbd ou do NZBGet. Você terá um primeiro download rodando em menos de dois minutos.</li>
     </ul>
   </div>
 </section>

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Vertailut — nzbfast</title>
-<meta name="description" content="nzbfast vs. SABnzbd, NZBGet ja rustnzb: 4 asiakasta × 6 skenaariota identtisellä laitteistolla. Rehelliset tulokset mukaan lukien osuudet, jotka nzbfast hävisi, toistamisohjeineen.">
+<meta name="description" content="nzbfast vs. SABnzbd, NZBGet ja rustnzb: 4 asiakasta × 6 skenaariota identtisellä laitteistolla. Rehelliset tulokset mukaan lukien se ainoa osuus, jossa nzbfast ei voita, toistamisohjeineen.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
 <link rel="alternate" hreflang="en" href="benchmarks.html">
@@ -41,10 +41,10 @@
 </div></header>
 
 <div class="hero wrap" style="padding-bottom:6px">
-  <h1>Mitattu, ei <em>markkinoitu</em>.</h1>
+  <h1>Vertailut</h1>
   <p class="sub">Neljä asiakasta, kuusi skenaariota, identtinen laitteisto ja palveluntarjoajat, ajot
   lomitettuina niin että palveluntarjoajien vaihtelu kumoutuu. Mittari on <b>aika käyttökelpoiseen tiedostoon</b> —
-  ladattu, varmistettu, purettu. Sisältää kaksi osuutta, jotka hävisimme.</p>
+  ladattu, varmistettu, purettu. Mukana myös se ainoa osuus, jossa emme voita.</p>
 </div>
 
 <section style="padding-top:26px">
@@ -150,28 +150,18 @@
 <section class="alt">
   <div class="wrap">
     <p class="kicker">Rehellinen sarake</p>
-    <h2>Kaksi osuutta, jotka hävisimme — yksi nyt suljettu</h2>
+    <h2>Se ainoa osuus, jossa emme voita</h2>
     <div class="grid2">
       <div class="card"><h3>Vioittunut store-tilan julkaisu</h3>
-        <p>20 myrkytettyä artikkelia 7.4 GB:n REMUXissa: NZBGet valmistui käyttökelpoiseksi ajassa <b>53 s</b>; nzbfast
-        vie nyt <b>58 s</b> — korjaus valmis 32 s:ssa, kaikki 62 osaa purettu uudelleen, tavutarkka
-        tuloste. Lopputilan bugi, joka aiemmalla koonnilla oli juuri tällä polulla (korjatut osat
-        pilalla uudelleenpurun toimesta paluukoodin sanoessa onnistui), on korjattu, regressiotestattu
-        ja uudelleenvalidoitu aitoa Usenetiä vasten. Korjauksemme hakee yhä lähes teoreettisen minimin
-        22 palautuslohkoa 20 tarvitulle vs. niiden täysi PAR2-läpimeno — mutta NZBGet pitää osuuden
-        viidellä sekunnilla, joten se on painettu tähän.</p></div>
-      <div class="card"><h3>kill −9 -jatko — suljettu</h3>
-        <p>Tapettuna kohdassa ~15 GB / 34.5 GB:n työ, tämä oli ennen huonoin lukumme: NZBGet latasi uudelleen
-        <b>~0.6 GB</b>, nzbfast <b>15 GB</b> — kaikki ennen PAR2-aktivointia dekoodattu kuoli
-        prosessin mukana. Journaali kirjaa nyt jokaisen artikkelin fyysisen sijoituksen, joten jatko
-        palauttaa nuo tavut edellisen ajon omista tulostiedostoista (paikallislevykopio, jokainen
-        tavu uudelleenvarmistettu PAR2-lohkokarttaa vasten) ja lataa uudelleen <b>~0.3 GB</b> — tasoissa
-        palveluntarjoajan kohinan sisällä. SABnzbd, tiedoksi, ei ole koskaan toipunut tästä skenaariosta
-        kolmella kierroksella: tapettuna samalla tavalla se haki uudelleen 0.5 GB tunnissa ja aikakatkaisi.</p></div>
+        <p>20 myrkytettyä artikkelia 7.4 GB:n REMUXissa: NZBGet valmistuu käyttökelpoiseksi ajassa <b>53 s</b>,
+        nzbfast ajassa <b>58 s</b>. Korjauksemme valmistuu 32 s:ssa, purkaa kaikki 62 osaa uudelleen ja
+        tuloste on tavutarkka — ja se hakee lähes teoreettisen minimin verran, 22 palautuslohkoa
+        tarvituille 20:lle, NZBGetin täyden PAR2-läpimenon sijaan. Mutta NZBGet vie osuuden viidellä
+        sekunnilla, joten tässä se on.</p></div>
     </div>
-    <div class="callout">Miksi julkaista häviöitä? Koska voitot ovat uskottavia vain niiden rinnalla.
-    Jokainen luku tällä sivulla tulee samoista lomitetuista ajoista, ja varaston
-    vertailulokimme on täysi laboratoriomuistikirja — negatiiviset tulokset mukaan lukien.</div>
+    <div class="callout">Miksi näyttää häviötä lainkaan? Koska voitot ovat uskottavia vain sen rinnalla.
+    Jokainen luku tällä sivulla tulee samoista lomitetuista ajoista, ja varasto pitää koko aineiston
+    täytenä laboratoriomuistikirjana — negatiiviset tulokset mukaan lukien.</div>
   </div>
 </section>
 
@@ -245,8 +235,8 @@
       <li><b>Laskennan pelivara</b>: mitatut dekoodaus+varmistus-katot 86–165 Gbps Apple-piillä — verkko on pullonkaula 4–50-kertaisesti jokaisella testatulla koneella.</li>
     </ul>
     <div class="callout">Pysyvä sääntö varastosta: <b>jokainen suorituskykyväite viittaa toistettavaan
-    komentoon ja olosuhteisiin, joissa se ajettiin.</b> Täysi laboratoriomuistikirja — mukaan lukien negatiiviset
-    tulokset ja väärät käänteet — pidetään päivättynä laboratoriomuistikirjana.</div>
+    komentoon ja olosuhteisiin, joissa se ajettiin.</b> Koko aineisto elää varastossa päivättynä
+    laboratoriomuistikirjana — negatiiviset tulokset ja väärät käänteet mukaan lukien.</div>
   </div>
 </section>
 

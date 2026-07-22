@@ -42,10 +42,10 @@
 
 <div class="hero wrap">
   <h1>From NZB to a <em>verified file</em><br>before others finish downloading.</h1>
-  <p class="sub">nzbfast is a Usenet downloader built around a one-pass pipeline:
-  every byte is decoded, verified and extracted <b>while it downloads</b>.
-  No assembly pass, no verify pass, no unpack pass — when the progress bar
-  fills, the file is done and provably intact.</p>
+  <p class="sub">nzbfast is a Usenet downloader built around a single pass: every byte gets
+  decoded, verified and extracted <b>while it downloads</b>. There's no assembly pass
+  afterwards, nothing left to verify or unpack once it's done — the moment the progress bar
+  fills, the file is finished and provably intact.</p>
   <div class="chips">
     <span class="chip"><b>8.31&nbsp;Gbps</b> on a 10&nbsp;GbE line</span>
     <span class="chip"><b>190&nbsp;GB → 4m44s</b> to a verified file</span>
@@ -65,24 +65,24 @@
   <div class="wrap">
     <p class="kicker">Why it's fast</p>
     <h2>Three ideas the mainstream clients don't fully exploit</h2>
-    <p class="lead">Not micro-optimisation — architecture. Each one is measured in
-    <a href="benchmarks.html">the benchmark log</a> with reproducible commands.</p>
+    <p class="lead">This is architecture, not micro-optimisation, and every bit of it is
+    measured in <a href="benchmarks.html">the benchmark log</a> with commands you can re-run.</p>
     <div class="grid3">
       <div class="card"><span class="ic">🔁</span><h3>Pipelined NNTP</h3>
-        <p>Several article requests stay in flight per connection, so round-trips never
-        idle the socket — and TCP never decays its congestion window between articles.
-        Measured +12% to +270% over serial at four sites; a line saturates with 8
-        connections instead of 30–50.</p></div>
+        <p>Several article requests stay in flight on each connection, so a round-trip
+        never leaves the socket idle and TCP never lets its congestion window decay between
+        articles. Across four sites we measured +12% to +270% over serial, and a line
+        saturates at 8 connections rather than 30–50.</p></div>
       <div class="card"><span class="ic">🚿</span><h3>The one-pass pipeline</h3>
-        <p>Articles are SIMD-decoded in place, written once at their final offsets,
-        PAR2-verified from the decode buffers, and store-mode RAR contents are
-        extracted <i>during</i> the download — the volumes never exist as files.
-        Disk writes = content × 1.0.</p></div>
+        <p>Articles are SIMD-decoded in place and written once, straight to their final
+        offsets, then PAR2-verified out of the same decode buffers. For store-mode RAR posts
+        the contents are extracted <i>during</i> the download, so the volumes never exist as
+        files — disk written comes to content × 1.0.</p></div>
       <div class="card"><span class="ic">🕸️</span><h3>Union availability</h3>
-        <p>An article is only "missing" when <i>every</i> configured backbone has refused
-        it. Block-exact accounting decides COMPLETE / REPAIRABLE / IMPOSSIBLE before
-        wasting bytes, fetches the exact-fit minimum of recovery blocks, and aborts
-        hopeless downloads in seconds.</p></div>
+        <p>An article counts as "missing" only once <i>every</i> configured backbone has
+        turned it down. Block-exact accounting calls the job COMPLETE, REPAIRABLE or
+        IMPOSSIBLE before wasting bytes, pulls just the exact-fit minimum of recovery
+        blocks, and drops hopeless downloads within seconds.</p></div>
     </div>
   </div>
 </section>
@@ -91,9 +91,9 @@
   <div class="wrap">
     <p class="kicker">The pipeline</p>
     <h2>Touch every byte once</h2>
-    <p class="lead">Competitors write the archive volumes, read them back to verify, read
-    them again to extract, then write the output — roughly 2× writes and 2× reads.
-    nzbfast does this instead:</p>
+    <p class="lead">Other clients write the archive volumes, read them back to verify, read
+    them a second time to extract, then write the output — roughly 2× the writes and 2× the
+    reads. Here's what nzbfast does instead:</p>
     <div class="pipe"><pre>
 socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s per core)
                    │
@@ -105,11 +105,11 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
                    │      decode buffer; verification finishes with the download
                    └─▶ <b>availability ledger</b> — block-exact health, live
 </pre></div>
-    <div class="callout">Damaged post? Bad blocks are known the moment their articles fail,
-    the <b>exact-fit minimum</b> of recovery volumes is fetched <b>during</b> the download
-    (22 blocks fetched for 20 needed, in the bench round), and repair touches only the
-    damaged spans. Impossible post? It aborts in seconds having downloaded almost
-    nothing — before your quota notices.</div>
+    <div class="callout">Damaged post? The bad blocks are known the moment their articles
+    fail, so the <b>exact-fit minimum</b> of recovery volumes is pulled <b>during</b> the
+    download (22 fetched for 20 needed, in the bench round) and repair touches only the
+    damaged spans. Impossible post? It gives up in seconds having downloaded next to
+    nothing — before your quota even notices.</div>
   </div>
 </section>
 
@@ -142,19 +142,19 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
   <div class="wrap">
     <p class="kicker">Benchmarks</p>
     <h2>190.6 GB → a verified 167.9 GB file</h2>
-    <p class="lead">Same machine, same six providers, runs interleaved back-to-back.
-    Time until a usable, extracted file exists — the only metric that matters.
-    Every competitor tuned to its documented best (including switching SABnzbd's
-    pipelining <i>on</i>, which it ships without).</p>
+    <p class="lead">Same machine, same six providers, runs interleaved back-to-back. What's
+    timed is when a usable, extracted file exists — the only metric that really matters.
+    Every competitor was tuned to its own documented best, right down to switching SABnzbd's
+    pipelining <i>on</i>, which it ships without.</p>
     <div class="bars">
       <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:24%"></i></span><span class="t">4m 44s</span></div>
       <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:36%"></i></span><span class="t">7m 06s · +50%</span></div>
       <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 31s · +312%</span></div>
       <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">no usable file</span></div>
     </div>
-    <p class="note" style="text-align:start">190.6 GB NZB → single 167.9 GB mkv, M1 Ultra on 10 GbE, 6 providers × 8 connections.
-    Same job completes inside a 1 GB memory budget. Full tables, six scenarios, and the legs we <i>lost</i> — plus how to reproduce —
-    on the <a href="benchmarks.html">benchmarks page</a>.</p>
+    <p class="note" style="text-align:start">190.6 GB NZB → a single 167.9 GB mkv, M1 Ultra on 10 GbE, 6 providers × 8 connections.
+    The same job also finishes inside a 1 GB memory budget. Full tables, all six scenarios, and the one leg we <i>don't win</i> — plus how to reproduce them —
+    are on the <a href="benchmarks.html">benchmarks page</a>.</p>
   </div>
 </section>
 
@@ -162,9 +162,9 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
   <div class="wrap">
     <p class="kicker">The showcase</p>
     <h2>Your index, presented as a poster wall</h2>
-    <p class="lead">The built-in indexer scans the newsgroups you care about; the wall turns
-    the result into posters, ratings, cast and episode grids — using only keyless public
-    sources, fetched by your own install. Click an episode chip to download it.</p>
+    <p class="lead">The built-in indexer scans the newsgroups you care about, and the wall
+    turns what it finds into posters, ratings, cast and episode grids — all from keyless
+    public sources that your own install fetches. Click an episode chip to download it.</p>
     <figure class="shot"><img src="assets/wall-grid.jpg" alt="nzbfast poster wall: a grid of TV posters with quality badges, ratings and season counts" loading="lazy"></figure>
     <div style="height:18px"></div>
     <div class="strip">
@@ -181,17 +181,17 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
     <p class="kicker">Fits your stack</p>
     <h2>Point your existing tools at it</h2>
     <div class="grid3">
-      <div class="card"><h3>Sonarr / Radarr</h3><p>Full SABnzbd-compatible API — add nzbfast as a
-        "SABnzbd" download client and it just works: grabs, categories, priorities, retries,
-        post-processing scripts (SAB_* contract), history. The Newznab facade also lets the
-        *arrs <i>search your local index</i> as if it were an indexer.</p></div>
-      <div class="card"><h3>nzb360 / LunaSea</h3><p>The daemon speaks NZBGet's JSON-RPC too —
-        the popular phone remotes drive nzbfast unmodified. And the dashboard itself has a
-        first-class phone layout for when you're away from the big screen.</p></div>
-      <div class="card"><h3>Coming from SAB or NZBGet?</h3><p>One click imports your servers from
-        an existing SABnzbd or NZBGet install (it also reads sabnzbd.ini directly). Watch
-        folders, RSS feeds with filters, smart folders with TV filing, and cleanup rules come
-        along for the ride.</p></div>
+      <div class="card"><h3>Sonarr / Radarr</h3><p>It carries the full SABnzbd-compatible API, so
+        you add nzbfast as a "SABnzbd" download client and it just works — grabs, categories,
+        priorities, retries, post-processing scripts on the SAB_* contract, history. The Newznab
+        facade goes one further and lets the *arrs <i>search your local index</i> as if it were an indexer.</p></div>
+      <div class="card"><h3>nzb360 / LunaSea</h3><p>The daemon speaks NZBGet's JSON-RPC as well,
+        so the popular phone remotes drive nzbfast without any changes. The dashboard itself also
+        has a proper phone layout for when you're away from the big screen.</p></div>
+      <div class="card"><h3>Coming from SAB or NZBGet?</h3><p>One click pulls your servers in from
+        an existing SABnzbd or NZBGet install, and it'll read sabnzbd.ini directly if that's what
+        it finds. Watch folders, filtered RSS feeds, smart folders with TV filing and cleanup
+        rules all come along too.</p></div>
     </div>
   </div>
 </section>
@@ -200,8 +200,8 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
   <div class="wrap" style="text-align:center">
     <h2>Try it in the next two minutes</h2>
     <p class="lead" style="margin-left:auto;margin-right:auto">Unzip, double-click the launcher, answer
-    three questions (or let it find your SABnzbd config), and the dashboard opens. First
-    download inside two minutes.</p>
+    three questions — or let it find your existing SABnzbd config — and the dashboard opens. Your first
+    download lands inside two minutes.</p>
     <div class="btnrow">
       <a class="btn" href="download.html">Download nzbfast</a>
       <a class="btn ghost" href="features.html">Read the full feature list</a>
