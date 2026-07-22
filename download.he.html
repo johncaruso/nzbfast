@@ -36,7 +36,7 @@
     <a href="https://github.com/nzbfast/nzbfast" title="Source repository">GitHub</a>
     <a class="cta" href="download.he.html">הורדה</a>
     <!-- i18n picker: same markup in every language file; hrefs fixed -->
-    <span class="langsw" style="font-size:11.5px;opacity:.75;margin-inline-start:10px;white-space:nowrap"><a href="download.html">EN</a> · <a href="download.fr.html">FR</a> · <a href="download.de.html">DE</a> · <a href="download.it.html">IT</a> · <a href="download.es.html">ES</a> · <a href="download.nl.html">NL</a> · <a href="download.pt.html">PT</a> · <a href="download.sv.html">SV</a> · <a href="download.da.html">DA</a> · <a href="download.nb.html">NB</a> · <a href="download.fi.html">FI</a> · <a href="download.tr.html">TR</a> · <a href="download.ro.html">RO</a> · <a href="download.he.html">HE</a> · <a href="download.ar.html">AR</a> · <a href="download.fa.html">FA</a></span>
+    <select class="langsw" aria-label="Language" style="font-size:11.5px;opacity:.8;margin-inline-start:10px;background:transparent;color:inherit;border:1px solid rgba(128,128,128,.4);border-radius:6px;padding:2px 4px;cursor:pointer;max-width:110px" onchange="location.href=this.value"><option value="download.html">English</option><option value="download.fr.html">Français</option><option value="download.de.html">Deutsch</option><option value="download.it.html">Italiano</option><option value="download.es.html">Español</option><option value="download.nl.html">Nederlands</option><option value="download.pt.html">Português</option><option value="download.sv.html">Svenska</option><option value="download.da.html">Dansk</option><option value="download.nb.html">Norsk</option><option value="download.fi.html">Suomi</option><option value="download.tr.html">Türkçe</option><option value="download.ro.html">Română</option><option value="download.he.html" selected>עברית</option><option value="download.ar.html">العربية</option><option value="download.fa.html">فارسی</option></select>
   </nav>
 </div></header>
 
@@ -54,7 +54,7 @@
         <p>אפליקציית NzbFast — גרור ל-Applications וקדימה. אוניברסלי (Apple Silicon ו-
         Intel), לוח מחוונים בחלון משלו, לחיצה כפולה על ‎.nzb, הפעלה בכניסה.</p>
         <p class="meta">macOS 12+ · ~16 MB DMG · אפליקציה + מנוע</p>
-        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.1-macos.dmg">הורד את אפליקציית ה-Mac</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.1-macos-universal.zip">‎.zip נייד</a></p>
+        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-macos.dmg">הורד את אפליקציית ה-Mac</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-macos-universal.zip">‎.zip נייד</a></p>
       </div>
       <div class="card">
         <h3>🪟 Windows <span class="tag now">זמין</span></h3>
@@ -62,14 +62,14 @@
         הפעלה-עם-Windows אופציונלית ולחיצה כפולה על ‎.nzb. סטטי מלא — בלי סביבת ריצה
         להתקין; הוא גם יכול לאמץ את תצורת ה-SABnzbd הקיימת שלך.</p>
         <p class="meta">Windows 10/11 x64 · מתקין ~8 MB</p>
-        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-setup-1.0.1.exe">הורד את המתקין</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.1-windows-x64.zip">‎.zip נייד</a></p>
+        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-setup-1.0.3.exe">הורד את המתקין</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-windows-x64.zip">‎.zip נייד</a></p>
       </div>
       <div class="card">
         <h3>🐧 Linux <span class="tag now">זמין</span></h3>
         <p>בניות musl סטטיות ל-x86_64 ו-arm64 — seedboxes, שרתי VPS, כל NAS עם SSH,
         Raspberry Pi 4/5. בלי רולטת גרסאות glibc.</p>
         <p class="meta">x86_64 · arm64 · יחידת systemd כלולה</p>
-        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.1-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.1-linux-arm64.tar.gz">arm64</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.1-nas.zip">חבילת NAS</a></p>
+        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-linux-arm64.tar.gz">arm64</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-nas.zip">חבילת NAS</a></p>
       </div>
       <div class="card">
         <h3>🐳 Docker <span class="tag soon">מהדורה ראשונה</span></h3>
