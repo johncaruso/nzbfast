@@ -72,18 +72,16 @@
         <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-linux-arm64.tar.gz">arm64</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-nas.zip">NAS-pakke</a></p>
       </div>
       <div class="card">
-        <h3>🐳 Docker <span class="tag soon">første utgave</span></h3>
-        <p>Fler-arkitektur-image (amd64 + arm64), linuxserver-stil PUID/PGID-inngangspunkt,
-        healthcheck, compose-fil. Dette er veien for <b>Unraid</b>, <b>TrueNAS SCALE</b>
-        og <b>QNAP Container Station</b>.</p>
-        <pre class="cmd">docker run -p 6789:6789 -v ./config:/config \
-  -v ./downloads:/downloads nzbfast/nzbfast</pre>
+        <h3>🐳 Docker <span class="tag now">tilgjengelig</span></h3>
+        <p>Multi-arch-image (amd64 + arm64) på Docker Hub og ghcr, PUID/PGID-entrypoint i linuxserver-stil, healthcheck, compose-fil. Også veien for <b>Unraid</b>, <b>TrueNAS SCALE</b> og <b>QNAP Container Station</b>.</p>
+        <pre class="cmd">docker run -d -p 6789:6789 \
+  -v ./config:/config -v ./downloads:/downloads -v ./watch:/watch \
+  nzbfast/nzbfast</pre>
       </div>
       <div class="card">
-        <h3>📦 Synology <span class="tag plan">planlagt</span></h3>
-        <p>Native .spk for DSM 7-pakkesenteret. Inntil den lander, kjører Synologys Container
-        Manager Docker-imaget helt fint.</p>
-        <p class="meta">DSM 7 · x86_64- + arm64-modeller</p>
+        <h3>📦 Synology <span class="tag now">tilgjengelig</span></h3>
+        <p>Kjører på DSM 7 via <b>Container Manager</b>: søk etter <code>nzbfast</code> i Registry, last ned, tilordne tre mapper og port 6789. Ingen konfigurasjonsfil å redigere — legg til leverandøren din i velkomstpanelet på dashbordet.</p>
+        <p class="meta">DSM 7 · Intel- + ARM-modeller · <a href="synology.html">trinnvis veiledning →</a></p>
       </div>
       <div class="card">
         <h3>🍺 Homebrew <span class="tag soon">første utgave</span></h3>

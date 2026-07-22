@@ -72,18 +72,16 @@
         <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-linux-arm64.tar.gz">arm64</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-nas.zip">حزمة NAS</a></p>
       </div>
       <div class="card">
-        <h3>🐳 Docker <span class="tag soon">أول إصدار</span></h3>
-        <p>صورة متعددة المعماريات (amd64 + arm64)، ونقطة دخول PUID/PGID بأسلوب linuxserver،
-        وفحص السلامة، وملف compose. هذا هو المسار لأنظمة <b>Unraid</b> و<b>TrueNAS SCALE</b>
-        و<b>QNAP Container Station</b>.</p>
-        <pre class="cmd">docker run -p 6789:6789 -v ./config:/config \
-  -v ./downloads:/downloads nzbfast/nzbfast</pre>
+        <h3>🐳 Docker <span class="tag now">متاح</span></h3>
+        <p>صورة متعددة المعماريات (amd64 + arm64) على Docker Hub و ghcr، نقطة دخول PUID/PGID بأسلوب linuxserver، فحص صحة، ملف compose. وهي أيضًا المسار لـ <b>Unraid</b> و<b>TrueNAS SCALE</b> و<b>QNAP Container Station</b>.</p>
+        <pre class="cmd">docker run -d -p 6789:6789 \
+  -v ./config:/config -v ./downloads:/downloads -v ./watch:/watch \
+  nzbfast/nzbfast</pre>
       </div>
       <div class="card">
-        <h3>📦 Synology <span class="tag plan">مُخطَّط له</span></h3>
-        <p>ملف .spk أصيل لمركز حزم DSM 7. وإلى أن يصدر، يشغّل Container
-        Manager من Synology صورة Docker بلا مشكلات.</p>
-        <p class="meta">DSM 7 · طُرز x86_64 + arm64</p>
+        <h3>📦 Synology <span class="tag now">متاح</span></h3>
+        <p>يعمل على DSM 7 عبر <b>Container Manager</b>: ابحث عن <code>nzbfast</code> في Registry، ونزّله، واربط ثلاثة مجلدات والمنفذ 6789. لا يوجد ملف إعداد لتحريره — أضِف مزوّدك من لوحة الترحيب في لوحة التحكم.</p>
+        <p class="meta">DSM 7 · طُرز Intel + ARM · <a href="synology.html">دليل خطوة بخطوة →</a></p>
       </div>
       <div class="card">
         <h3>🍺 Homebrew <span class="tag soon">أول إصدار</span></h3>

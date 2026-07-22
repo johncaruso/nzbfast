@@ -72,18 +72,20 @@
         <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-linux-arm64.tar.gz">arm64</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-nas.zip">NAS bundle</a></p>
       </div>
       <div class="card">
-        <h3>🐳 Docker <span class="tag soon">first release</span></h3>
-        <p>Multi-arch image (amd64 + arm64), linuxserver-style PUID/PGID entrypoint,
-        healthcheck, compose file. This is the path for <b>Unraid</b>, <b>TrueNAS SCALE</b>
-        and <b>QNAP Container Station</b>.</p>
-        <pre class="cmd">docker run -p 6789:6789 -v ./config:/config \
-  -v ./downloads:/downloads nzbfast/nzbfast</pre>
+        <h3>🐳 Docker <span class="tag now">available</span></h3>
+        <p>Multi-arch image (amd64 + arm64) on Docker Hub and ghcr, linuxserver-style
+        PUID/PGID entrypoint, healthcheck, compose file. Also the path for <b>Unraid</b>,
+        <b>TrueNAS SCALE</b> and <b>QNAP Container Station</b>.</p>
+        <pre class="cmd">docker run -d -p 6789:6789 \
+  -v ./config:/config -v ./downloads:/downloads -v ./watch:/watch \
+  nzbfast/nzbfast</pre>
       </div>
       <div class="card">
-        <h3>📦 Synology <span class="tag plan">planned</span></h3>
-        <p>Native .spk for DSM 7 package center. Until it lands, Synology's Container
-        Manager runs the Docker image fine.</p>
-        <p class="meta">DSM 7 · x86_64 + arm64 models</p>
+        <h3>📦 Synology <span class="tag now">available</span></h3>
+        <p>Runs on DSM 7 through <b>Container Manager</b>: search <code>nzbfast</code> in
+        the Registry, download, map three folders and port 6789. No config file to edit —
+        add your provider in the dashboard's Welcome panel.</p>
+        <p class="meta">DSM 7 · Intel + ARM models · <a href="synology.html">step-by-step guide →</a></p>
       </div>
       <div class="card">
         <h3>🍺 Homebrew <span class="tag soon">first release</span></h3>

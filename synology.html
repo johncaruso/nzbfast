@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Install on Synology — nzbfast</title>
+<meta name="description" content="Install nzbfast on a Synology NAS with Container Manager — search, download, map three folders, done. Step-by-step guide for DSM 7 (Intel and ARM models).">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<link rel="stylesheet" href="assets/site.css">
+<style>
+  .steps{list-style:none;counter-reset:s;padding:0;margin:0}
+  .steps>li{position:relative;padding:0 0 22px 46px;margin:0}
+  .steps>li::before{counter-increment:s;content:counter(s);position:absolute;inset-inline-start:0;top:-2px;
+    width:30px;height:30px;border-radius:50%;display:grid;place-items:center;font-weight:700;font-size:14px;
+    background:color-mix(in srgb,var(--acc) 18%,transparent);color:var(--acc)}
+  .steps>li:not(:last-child)::after{content:"";position:absolute;inset-inline-start:14px;top:32px;bottom:6px;width:2px;
+    background:var(--line)}
+  .steps h3{margin:2px 0 8px;font-size:16px}
+  .steps p,.steps ul{color:var(--dim);font-size:14.5px}
+  .tbl{overflow-x:auto;margin:14px 0;border:1px solid var(--line);border-radius:12px}
+  .tbl table{min-width:480px}
+  .routes{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:8px}
+  @media(max-width:720px){.routes{grid-template-columns:1fr}}
+  .lead-guide{color:var(--dim);font-size:16px;max-width:720px;margin:0 0 8px}
+</style>
+</head>
+<body>
+
+<header><div class="wrap">
+  <a class="logo" href="index.html"><span class="bolt">⚡</span> nzbfast</a>
+  <nav>
+    <a href="features.html">Features</a>
+    <a href="benchmarks.html">Benchmarks</a>
+    <a href="MANUAL.html">Docs</a>
+    <a href="https://github.com/nzbfast/nzbfast" title="Source repository">GitHub</a>
+    <a class="cta" href="download.html">Download</a>
+  </nav>
+</div></header>
+
+<div class="hero wrap" style="padding-bottom:6px">
+  <h1>nzbfast on <em>Synology</em></h1>
+  <p class="sub">One container gives you the full dashboard, the SABnzbd/NZBGet API for
+  Sonarr &amp; Radarr, and the built-in indexer. Search, download, map three folders — done.</p>
+</div>
+
+<section style="padding-top:20px">
+  <div class="wrap">
+    <p class="lead-guide">nzbfast runs on DSM 7 as a Docker container through <b>Container Manager</b>
+    (on DSM 6 the same app is called <b>Docker</b>). The image is multi-arch, so it runs unchanged on
+    both Intel and ARM Synology models.</p>
+    <div class="callout"><b>Two registries, one image.</b> The identical image lives on Docker Hub as
+    <code>nzbfast/nzbfast</code> (the one Container Manager can search) and on GitHub as
+    <code>ghcr.io/nzbfast/nzbfast</code>. Use whichever you like — this guide uses the Docker Hub name.</div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <h2>First: your PUID / PGID <span class="note" style="font-weight:400">· 30 seconds</span></h2>
+    <p class="lead-guide">The container writes downloads as a specific user ID so the files belong to
+    <i>you</i>, not to root. Find yours once:</p>
+    <ol class="steps">
+      <li><h3>Enable SSH</h3><p>Control Panel → <b>Terminal &amp; SNMP</b> → tick <b>Enable SSH service</b>.</p></li>
+      <li><h3>Read your IDs</h3><p>SSH in and run:</p>
+        <pre class="cmd">id your_dsm_username</pre>
+        <p>Note the <code>uid=</code> and <code>gid=</code> numbers. On most Synology boxes the first user
+        is <code>uid=1026</code> and the group <code>users</code> is <code>gid=100</code> — but use whatever
+        <code>id</code> prints. You can turn SSH back off afterwards.</p></li>
+    </ol>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Route A — Container Manager <span class="tag now" style="vertical-align:middle">easiest</span></h2>
+    <p class="lead-guide">Best for most people. No text files.</p>
+    <ol class="steps">
+      <li><h3>Make the folders</h3>
+        <p>File Station → create a shared folder or sub-tree for the container's data, e.g.:</p>
+        <div class="tbl"><table><tbody>
+          <tr><td><code>/docker/nzbfast/config</code></td><td>settings + index database</td></tr>
+          <tr><td><code>/docker/nzbfast/downloads</code></td><td>finished files land here</td></tr>
+          <tr><td><code>/docker/nzbfast/watch</code></td><td>drop an <code>.nzb</code> here to auto-download it</td></tr>
+        </tbody></table></div>
+      </li>
+      <li><h3>Get the image</h3>
+        <p>Container Manager → <b>Registry</b> → search <b><code>nzbfast</code></b> → select
+        <b><code>nzbfast/nzbfast</code></b> → <b>Download</b> → tag <b><code>latest</code></b>.</p>
+      </li>
+      <li><h3>Create the container</h3>
+        <p>Container Manager → <b>Image</b> → select <code>nzbfast/nzbfast:latest</code> → <b>Run</b>. In the wizard:</p>
+        <ul>
+          <li><b>General:</b> turn on <i>Enable auto-restart</i>.</li>
+          <li><b>Port:</b> map local <b>6789</b> → container <b>6789</b> (change the local side only if 6789 is taken).</li>
+          <li><b>Volumes</b> — add three folder mounts:</li>
+        </ul>
+        <div class="tbl"><table>
+          <thead><tr><th>Folder (on your NAS)</th><th>Mount path</th></tr></thead>
+          <tbody>
+            <tr><td><code>/docker/nzbfast/config</code></td><td><code>/config</code></td></tr>
+            <tr><td><code>/docker/nzbfast/downloads</code></td><td><code>/downloads</code></td></tr>
+            <tr><td><code>/docker/nzbfast/watch</code></td><td><code>/watch</code></td></tr>
+          </tbody>
+        </table></div>
+        <ul><li><b>Environment</b> — add these variables:</li></ul>
+        <div class="tbl"><table>
+          <thead><tr><th>Variable</th><th>Value</th></tr></thead>
+          <tbody>
+            <tr><td><code>PUID</code></td><td>your uid (e.g. <code>1026</code>)</td></tr>
+            <tr><td><code>PGID</code></td><td>your gid (e.g. <code>100</code>)</td></tr>
+            <tr><td><code>TZ</code></td><td>your timezone, e.g. <code>Europe/London</code></td></tr>
+          </tbody>
+        </table></div>
+      </li>
+      <li><h3>Run it</h3><p>Then jump to <a href="#firstrun">First run</a> below.</p></li>
+    </ol>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <h2>Route B — Container Manager Project</h2>
+    <p class="lead-guide">Prefer one file you can back up? Container Manager → <b>Project</b> → <b>Create</b>,
+    name it <code>nzbfast</code>, path <code>/docker/nzbfast</code>, source <i>Create docker-compose.yml</i>, and paste:</p>
+    <pre class="cmd">services:
+  nzbfast:
+    image: nzbfast/nzbfast:latest
+    container_name: nzbfast
+    restart: unless-stopped
+    ports:
+      - "6789:6789"
+    environment:
+      - PUID=1026          # your uid  (id your_dsm_username)
+      - PGID=100           # your gid
+      - TZ=Europe/London   # your timezone
+      # - NZBFAST_APIKEY=change-me   # only if you'll connect Sonarr/Radarr
+    volumes:
+      - ./config:/config
+      - ./downloads:/downloads
+      - ./watch:/watch</pre>
+    <p class="note">The <code>./config</code>, <code>./downloads</code> and <code>./watch</code> folders are
+    created for you inside the project folder.</p>
+  </div>
+</section>
+
+<section id="firstrun">
+  <div class="wrap">
+    <h2>First run — add your provider</h2>
+    <p class="lead-guide">There is <b>no config file to edit.</b> Open <code>http://YOUR_NAS_IP:6789</code>.
+    A <b>Welcome</b> panel asks for your Usenet server — enter the host, username, password and connection
+    count from your provider's welcome email and save. It applies immediately, no restart. Drop an
+    <code>.nzb</code> on the dashboard (or into the <code>watch</code> folder) and it downloads.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <h2>Connecting Sonarr / Radarr</h2>
+    <p class="lead-guide">nzbfast speaks the SABnzbd API. In your *arr app, add a <b>SABnzbd</b> download client:
+    <b>Host</b> = your NAS IP, <b>Port</b> = <code>6789</code>, <b>API Key</b> = the value you set in
+    <code>NZBFAST_APIKEY</code>. It also exposes the NZBGet JSON-RPC API, so nzb360 / LunaSea connect the same way.</p>
+    <h2 style="margin-top:34px">Updating</h2>
+    <p class="lead-guide">Re-download the <code>latest</code> tag in Container Manager (Registry), then recreate
+    the container — or in a Project, <b>Build</b> re-pulls it. Your <code>config</code> and <code>downloads</code>
+    survive because they live in your NAS folders, not inside the container. The image <i>is</i> the update channel.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Troubleshooting</h2>
+    <ul class="plain">
+      <li><b>"Permission denied" / files owned by root</b> — your <code>PUID</code>/<code>PGID</code> don't match
+      the folder owner. Re-check with <code>id your_dsm_username</code>. This is the most common issue.</li>
+      <li><b>Can't reach the dashboard</b> — confirm the container is running and the port is mapped. If something
+      else uses 6789, remap the local side (e.g. <code>6889:6789</code>) and browse to <code>:6889</code>.</li>
+      <li><b>Not searchable in Registry</b> — make sure you're on the <b>Registry</b> tab (not <i>Image</i>), and the
+      NAS has internet. You can also pull it by exact name <code>nzbfast/nzbfast</code>.</li>
+      <li><b>Nothing downloads</b> — open the dashboard; if the Welcome panel is still showing, the provider isn't saved yet.</li>
+    </ul>
+    <div class="callout" style="margin-top:22px"><b>Which models?</b> Any DSM 7 unit with Container Manager (most DSM 6
+    units with Docker), Intel or ARM64. Very low-end ARMv7/32-bit models aren't supported. Same image also runs on
+    <b>Unraid</b>, <b>TrueNAS SCALE</b> and <b>QNAP</b> Container Station.</div>
+  </div>
+</section>
+
+<footer><div class="wrap">
+  <div class="cols">
+    <div>⚡ <b>nzbfast</b> — the one-pass Usenet downloader.</div>
+    <div>
+      <a href="features.html">Features</a> ·
+      <a href="benchmarks.html">Benchmarks</a> ·
+      <a href="download.html">Download</a> ·
+      <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
+    </div>
+  </div>
+  <p class="fine">Free software, GPL-3.0-or-later. PAR2 repair and RAR extraction are native code inside the binary — no bundled third-party tools.</p>
+</div></footer>
+
+</body>
+</html>

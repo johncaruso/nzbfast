@@ -72,18 +72,16 @@
         <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-linux-arm64.tar.gz">arm64</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-nas.zip">NAS paketi</a></p>
       </div>
       <div class="card">
-        <h3>🐳 Docker <span class="tag soon">ilk sürüm</span></h3>
-        <p>Çoklu mimari imge (amd64 + arm64), linuxserver tarzı PUID/PGID giriş noktası,
-        sağlık denetimi, compose dosyası. Bu, <b>Unraid</b>, <b>TrueNAS SCALE</b>
-        ve <b>QNAP Container Station</b> için yoldur.</p>
-        <pre class="cmd">docker run -p 6789:6789 -v ./config:/config \
-  -v ./downloads:/downloads nzbfast/nzbfast</pre>
+        <h3>🐳 Docker <span class="tag now">mevcut</span></h3>
+        <p>Çok mimarili görüntü (amd64 + arm64), Docker Hub ve ghcr üzerinde, linuxserver tarzı PUID/PGID entrypoint, healthcheck, compose dosyası. Ayrıca <b>Unraid</b>, <b>TrueNAS SCALE</b> ve <b>QNAP Container Station</b> için de yol budur.</p>
+        <pre class="cmd">docker run -d -p 6789:6789 \
+  -v ./config:/config -v ./downloads:/downloads -v ./watch:/watch \
+  nzbfast/nzbfast</pre>
       </div>
       <div class="card">
-        <h3>📦 Synology <span class="tag plan">planlanan</span></h3>
-        <p>DSM 7 paket merkezi için yerel .spk. Gelene dek Synology'nin Container
-        Manager'ı Docker imgesini sorunsuz çalıştırır.</p>
-        <p class="meta">DSM 7 · x86_64 + arm64 modelleri</p>
+        <h3>📦 Synology <span class="tag now">mevcut</span></h3>
+        <p>DSM 7'de <b>Container Manager</b> ile çalışır: Registry'de <code>nzbfast</code> aratın, indirin, üç klasörü ve 6789 portunu eşleyin. Düzenlenecek yapılandırma dosyası yok — sağlayıcınızı panonun karşılama panelinden ekleyin.</p>
+        <p class="meta">DSM 7 · Intel + ARM modelleri · <a href="synology.html">adım adım kılavuz →</a></p>
       </div>
       <div class="card">
         <h3>🍺 Homebrew <span class="tag soon">ilk sürüm</span></h3>

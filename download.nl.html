@@ -72,18 +72,16 @@
         <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-linux-arm64.tar.gz">arm64</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-nas.zip">NAS-bundel</a></p>
       </div>
       <div class="card">
-        <h3>🐳 Docker <span class="tag soon">eerste release</span></h3>
-        <p>Multi-arch image (amd64 + arm64), PUID/PGID-entrypoint in linuxserver-stijl,
-        healthcheck, compose-bestand. Dit is de route voor <b>Unraid</b>, <b>TrueNAS SCALE</b>
-        en <b>QNAP Container Station</b>.</p>
-        <pre class="cmd">docker run -p 6789:6789 -v ./config:/config \
-  -v ./downloads:/downloads nzbfast/nzbfast</pre>
+        <h3>🐳 Docker <span class="tag now">beschikbaar</span></h3>
+        <p>Multi-arch image (amd64 + arm64) op Docker Hub en ghcr, PUID/PGID-entrypoint in linuxserver-stijl, healthcheck, compose-bestand. Ook de route voor <b>Unraid</b>, <b>TrueNAS SCALE</b> en <b>QNAP Container Station</b>.</p>
+        <pre class="cmd">docker run -d -p 6789:6789 \
+  -v ./config:/config -v ./downloads:/downloads -v ./watch:/watch \
+  nzbfast/nzbfast</pre>
       </div>
       <div class="card">
-        <h3>📦 Synology <span class="tag plan">gepland</span></h3>
-        <p>Native .spk voor het DSM 7-packagecenter. Tot die er is, draait Synology's Container
-        Manager de Docker-image prima.</p>
-        <p class="meta">DSM 7 · x86_64- + arm64-modellen</p>
+        <h3>📦 Synology <span class="tag now">beschikbaar</span></h3>
+        <p>Draait op DSM 7 via <b>Container Manager</b>: zoek <code>nzbfast</code> in de Registry, download, koppel drie mappen en poort 6789. Geen configuratiebestand om te bewerken — voeg je provider toe in het welkomstpaneel van het dashboard.</p>
+        <p class="meta">DSM 7 · Intel- + ARM-modellen · <a href="synology.html">stapsgewijze handleiding →</a></p>
       </div>
       <div class="card">
         <h3>🍺 Homebrew <span class="tag soon">eerste release</span></h3>

@@ -72,18 +72,16 @@
         <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-linux-arm64.tar.gz">arm64</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-nas.zip">بستهٔ NAS</a></p>
       </div>
       <div class="card">
-        <h3>🐳 Docker <span class="tag soon">اولین انتشار</span></h3>
-        <p>تصویر چند-معماری (amd64 + arm64)، نقطهٔ ورود PUID/PGID به‌سبک linuxserver،
-        بررسی سلامت، فایل compose. این مسیر برای <b>Unraid</b>، <b>TrueNAS SCALE</b>
-        و <b>QNAP Container Station</b> است.</p>
-        <pre class="cmd">docker run -p 6789:6789 -v ./config:/config \
-  -v ./downloads:/downloads nzbfast/nzbfast</pre>
+        <h3>🐳 Docker <span class="tag now">در دسترس</span></h3>
+        <p>ایمیج چندمعماری (amd64 + arm64) روی Docker Hub و ghcr، اینترپوینت PUID/PGID به سبک linuxserver، healthcheck، فایل compose. مسیر <b>Unraid</b>، <b>TrueNAS SCALE</b> و <b>QNAP Container Station</b> هم همین است.</p>
+        <pre class="cmd">docker run -d -p 6789:6789 \
+  -v ./config:/config -v ./downloads:/downloads -v ./watch:/watch \
+  nzbfast/nzbfast</pre>
       </div>
       <div class="card">
-        <h3>📦 Synology <span class="tag plan">برنامه‌ریزی‌شده</span></h3>
-        <p>‎.spk بومی برای مرکز بستهٔ DSM 7. تا زمان رسیدنش، مدیر کانتینر Synology
-        تصویر Docker را به‌خوبی اجرا می‌کند.</p>
-        <p class="meta">DSM 7 · مدل‌های x86_64 + arm64</p>
+        <h3>📦 Synology <span class="tag now">در دسترس</span></h3>
+        <p>روی DSM 7 از طریق <b>Container Manager</b> اجرا می‌شود: در Registry عبارت <code>nzbfast</code> را جست‌وجو کنید، دانلود کنید، سه پوشه و پورت 6789 را نگاشت کنید. هیچ فایل پیکربندی‌ای برای ویرایش نیست — ارائه‌دهنده‌تان را از پنل خوش‌آمدگویی داشبورد اضافه کنید.</p>
+        <p class="meta">DSM 7 · مدل‌های Intel + ARM · <a href="synology.html">راهنمای گام‌به‌گام →</a></p>
       </div>
       <div class="card">
         <h3>🍺 Homebrew <span class="tag soon">اولین انتشار</span></h3>

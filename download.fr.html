@@ -72,18 +72,16 @@
         <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-linux-arm64.tar.gz">arm64</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-nas.zip">Bundle NAS</a></p>
       </div>
       <div class="card">
-        <h3>🐳 Docker <span class="tag soon">première version</span></h3>
-        <p>Image multi-arch (amd64 + arm64), point d’entrée PUID/PGID façon linuxserver,
-        healthcheck, fichier compose. C’est la voie pour <b>Unraid</b>, <b>TrueNAS SCALE</b>
-        et <b>QNAP Container Station</b>.</p>
-        <pre class="cmd">docker run -p 6789:6789 -v ./config:/config \
-  -v ./downloads:/downloads nzbfast/nzbfast</pre>
+        <h3>🐳 Docker <span class="tag now">disponible</span></h3>
+        <p>Image multi-arch (amd64 + arm64) sur Docker Hub et ghcr, point d'entrée PUID/PGID façon linuxserver, healthcheck, fichier compose. C'est aussi la voie pour <b>Unraid</b>, <b>TrueNAS SCALE</b> et <b>QNAP Container Station</b>.</p>
+        <pre class="cmd">docker run -d -p 6789:6789 \
+  -v ./config:/config -v ./downloads:/downloads -v ./watch:/watch \
+  nzbfast/nzbfast</pre>
       </div>
       <div class="card">
-        <h3>📦 Synology <span class="tag plan">prévu</span></h3>
-        <p>Un .spk natif pour le centre de paquets DSM 7. En attendant, le Container Manager de
-        Synology fait tourner l’image Docker sans problème.</p>
-        <p class="meta">DSM 7 · modèles x86_64 + arm64</p>
+        <h3>📦 Synology <span class="tag now">disponible</span></h3>
+        <p>Fonctionne sous DSM 7 via <b>Container Manager</b> : cherchez <code>nzbfast</code> dans le Registre, téléchargez, mappez trois dossiers et le port 6789. Aucun fichier de configuration à modifier — ajoutez votre fournisseur dans le panneau de bienvenue du tableau de bord.</p>
+        <p class="meta">DSM 7 · modèles Intel + ARM · <a href="synology.html">guide pas à pas →</a></p>
       </div>
       <div class="card">
         <h3>🍺 Homebrew <span class="tag soon">première version</span></h3>

@@ -72,18 +72,16 @@
         <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-linux-arm64.tar.gz">arm64</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-nas.zip">NAS-Bundle</a></p>
       </div>
       <div class="card">
-        <h3>🐳 Docker <span class="tag soon">erstes Release</span></h3>
-        <p>Multi-Arch-Image (amd64 + arm64), PUID/PGID-Entrypoint im linuxserver-Stil,
-        Healthcheck, Compose-Datei. Das ist der Weg für <b>Unraid</b>, <b>TrueNAS SCALE</b>
-        und <b>QNAP Container Station</b>.</p>
-        <pre class="cmd">docker run -p 6789:6789 -v ./config:/config \
-  -v ./downloads:/downloads nzbfast/nzbfast</pre>
+        <h3>🐳 Docker <span class="tag now">verfügbar</span></h3>
+        <p>Multi-Arch-Image (amd64 + arm64) auf Docker Hub und ghcr, PUID/PGID-Entrypoint im linuxserver-Stil, Healthcheck, Compose-Datei. Auch der Weg für <b>Unraid</b>, <b>TrueNAS SCALE</b> und <b>QNAP Container Station</b>.</p>
+        <pre class="cmd">docker run -d -p 6789:6789 \
+  -v ./config:/config -v ./downloads:/downloads -v ./watch:/watch \
+  nzbfast/nzbfast</pre>
       </div>
       <div class="card">
-        <h3>📦 Synology <span class="tag plan">geplant</span></h3>
-        <p>Natives .spk für das DSM-7-Paketzentrum. Bis es so weit ist, führt Synologys Container
-        Manager das Docker-Image problemlos aus.</p>
-        <p class="meta">DSM 7 · x86_64- + arm64-Modelle</p>
+        <h3>📦 Synology <span class="tag now">verfügbar</span></h3>
+        <p>Läuft unter DSM 7 über den <b>Container Manager</b>: Suche <code>nzbfast</code> in der Registry, lade es herunter, ordne drei Ordner und Port 6789 zu. Keine Konfigurationsdatei zu bearbeiten — trage deinen Provider im Willkommensbereich des Dashboards ein.</p>
+        <p class="meta">DSM 7 · Intel- + ARM-Modelle · <a href="synology.html">Schritt-für-Schritt-Anleitung →</a></p>
       </div>
       <div class="card">
         <h3>🍺 Homebrew <span class="tag soon">erstes Release</span></h3>

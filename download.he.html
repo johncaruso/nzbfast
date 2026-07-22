@@ -72,18 +72,16 @@
         <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-linux-arm64.tar.gz">arm64</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.3-nas.zip">חבילת NAS</a></p>
       </div>
       <div class="card">
-        <h3>🐳 Docker <span class="tag soon">מהדורה ראשונה</span></h3>
-        <p>תמונה רב-ארכיטקטורית (amd64 + arm64), נקודת כניסה בסגנון linuxserver ל-PUID/PGID,
-        בדיקת תקינות, קובץ compose. זהו הנתיב עבור <b>Unraid</b>, <b>TrueNAS SCALE</b>
-        ו-<b>QNAP Container Station</b>.</p>
-        <pre class="cmd">docker run -p 6789:6789 -v ./config:/config \
-  -v ./downloads:/downloads nzbfast/nzbfast</pre>
+        <h3>🐳 Docker <span class="tag now">זמין</span></h3>
+        <p>תמונת multi-arch‏ (amd64 + arm64) ב-Docker Hub וב-ghcr, נקודת כניסה PUID/PGID בסגנון linuxserver, healthcheck, קובץ compose. זו גם הדרך עבור <b>Unraid</b>, <b>TrueNAS SCALE</b> ו-<b>QNAP Container Station</b>.</p>
+        <pre class="cmd">docker run -d -p 6789:6789 \
+  -v ./config:/config -v ./downloads:/downloads -v ./watch:/watch \
+  nzbfast/nzbfast</pre>
       </div>
       <div class="card">
-        <h3>📦 Synology <span class="tag plan">מתוכנן</span></h3>
-        <p>‎.spk מקורי למרכז החבילות של DSM 7. עד שזה יגיע, ה-Container
-        Manager של Synology מריץ את תמונת ה-Docker היטב.</p>
-        <p class="meta">DSM 7 · דגמי x86_64 + arm64</p>
+        <h3>📦 Synology <span class="tag now">זמין</span></h3>
+        <p>רץ על DSM 7 דרך <b>Container Manager</b>: חפשו <code>nzbfast</code> ב-Registry, הורידו, מפו שלוש תיקיות ואת פורט 6789. אין קובץ הגדרות לערוך — הוסיפו את הספק שלכם בלוח קבלת הפנים של לוח הבקרה.</p>
+        <p class="meta">DSM 7 · דגמי Intel + ARM · <a href="synology.html">מדריך שלב אחר שלב →</a></p>
       </div>
       <div class="card">
         <h3>🍺 Homebrew <span class="tag soon">מהדורה ראשונה</span></h3>
