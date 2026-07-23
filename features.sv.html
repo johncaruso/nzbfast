@@ -49,18 +49,18 @@
   <div class="wrap">
     <div class="grid2">
       <ul class="feat">
-        <li><b>Pipelinead NNTP i linjefart</b> <span class="d">- 8.31 Gbps uppmätt på 10 GbE.</span></li>
-        <li><b>Enpassrörledning</b> <span class="d">- avkoda, verifiera och packa upp överlappar; RAR-volymer rör aldrig disken.</span></li>
-        <li><b>Union-tillgänglighet över flera providers</b> <span class="d">- komplett från unionen av dina servrar, eller avbryt tidigt.</span></li>
-        <li><b>Minnesbudget</b> <span class="d">- begränsat RAM, graciöst spill, swappar aldrig.</span></li>
-        <li><b>Kraschsäker återupptagning</b> <span class="d">- journal på artikelnivå; kill −9 mitt i jobbet och det fortsätter där det slutade.</span></li>
+        <li><b>Pipelinead NNTP i linjefart:</b> <span class="d">8.31 Gbps uppmätt på 10 GbE.</span></li>
+        <li><b>Enpassrörledning:</b> <span class="d">avkoda, verifiera och packa upp överlappar; RAR-volymer rör aldrig disken.</span></li>
+        <li><b>Union-tillgänglighet över flera providers:</b> <span class="d">komplett från unionen av dina servrar, eller avbryt tidigt.</span></li>
+        <li><b>Minnesbudget:</b> <span class="d">begränsat RAM, graciöst spill, swappar aldrig.</span></li>
+        <li><b>Kraschsäker återupptagning:</b> <span class="d">journal på artikelnivå; kill −9 mitt i jobbet och det fortsätter där det slutade.</span></li>
       </ul>
       <ul class="feat">
-        <li><b>SABnzbd-kompatibla + NZBGet JSON-RPC API:er</b> <span class="d">- Sonarr/Radarr/nzb360/LunaSea fungerar oförändrade.</span></li>
-        <li><b>Inbyggd indexerare</b> <span class="d">- skanna grupper till ett lokalt, sökbart, Newznab-serverande index.</span></li>
-        <li><b>Postervägg</b> <span class="d">- omslag, betyg, skådespelare, avsnittsrutnät; inga API-nycklar.</span></li>
-        <li><b>Bevakningslistans auto-grab + kvalitetsuppgraderingar</b> <span class="d">- grabba vid första förekomst, uppgradera till målkvalitet.</span></li>
-        <li><b>En enda fristående körbar fil</b> <span class="d">- par2 + RAR-uppackning inbäddade.</span></li>
+        <li><b>SABnzbd-kompatibla + NZBGet JSON-RPC API:er:</b> <span class="d">Sonarr/Radarr/nzb360/LunaSea fungerar oförändrade.</span></li>
+        <li><b>Inbyggd indexerare:</b> <span class="d">skanna grupper till ett lokalt, sökbart, Newznab-serverande index.</span></li>
+        <li><b>Postervägg:</b> <span class="d">omslag, betyg, skådespelare, avsnittsrutnät; inga API-nycklar.</span></li>
+        <li><b>Bevakningslistans auto-grab + kvalitetsuppgraderingar:</b> <span class="d">grabba vid första förekomst, uppgradera till målkvalitet.</span></li>
+        <li><b>En enda fristående körbar fil:</b> <span class="d">par2 + RAR-uppackning inbäddade.</span></li>
       </ul>
     </div>
   </div>
@@ -74,17 +74,17 @@
         <li><b>Pipelinead NNTP.</b> Att hålla flera förfrågningar i luften per anslutning slår både tur-och-retur-latensen och TCP:s avtynande congestion-fönster. Vi mäter allt från +12 % till +270 % jämfört med seriell hämtning, och runt 8 anslutningar per server räcker för att mätta linjen.</li>
         <li><b>SIMD yEnc-avkodning</b> (rapidyenc, med NEON- och AVX-kärnor) går i 4.95 GB/s per kärna och avkodas på plats i samma stund byten landar i mottagningsvägen.</li>
         <li><b>Delad kö över flera servrar.</b> Providerna balanserar sig själva till inom ~2 % helt utan trimning. Vi håller koll på varje servers verkliga fart, och svansen på ett jobb dubbeldispatchas så att en enda långsam server inte kan dra ut på slutet.</li>
-        <li><b>Genomsköljning mellan jobb.</b> Svansen på jobb N överlappar starten av jobb N+1, så linjen hålls tänd kant till kant genom hela kön - 2 % vila här mot SABnzbds 61 % mörker i samma bench.</li>
+        <li><b>Genomsköljning mellan jobb.</b> Svansen på jobb N överlappar starten av jobb N+1, så linjen hålls tänd kant till kant genom hela kön: 2 % vila här mot SABnzbds 61 % mörker i samma bench.</li>
         <li><b>Vakthund för långsamma jobb.</b> En nedladdning som kryper fram på en enda långsam server medan resten står stilla flyttas längst bak i kön, behåller sitt förlopp och återupptas så snart kön är fri.</li>
-        <li><b>Prefetch på lediga servrar</b> - en server som det aktiva jobbet inte kan använda, eftersom dess artiklar inte finns lagrade där, sätter i gång med nästa jobb i kön i stället för att stå och vila.</li>
+        <li><b>Prefetch på lediga servrar:</b> en server som det aktiva jobbet inte kan använda, eftersom dess artiklar inte finns lagrade där, sätter i gång med nästa jobb i kön i stället för att stå och vila.</li>
       </ul>
       <ul class="plain">
-        <li><b>Trimningsstege för anslutningar.</b> I stället för att gissa mäter den var varje providers genomströmning faktiskt slutar klättra - begärda mot beviljade anslutningar - och lägger sig där.</li>
-        <li><b>Automatisk fartregulator</b> - en valfri LEDBAT-liknande RTT-regulator som ger vika för resten av hushållets trafik och tar det som blir kvar av linjen.</li>
-        <li><b>Hastighetsgränser och ett veckoschema</b> - tak som går att justera live, ett schema i lokal tid (DST-säkert) och en "pausa i N minuter" som startar om av sig själv.</li>
+        <li><b>Trimningsstege för anslutningar.</b> I stället för att gissa mäter den var varje providers genomströmning faktiskt slutar klättra (begärda mot beviljade anslutningar) och lägger sig där.</li>
+        <li><b>Automatisk fartregulator:</b> en valfri LEDBAT-liknande RTT-regulator som ger vika för resten av hushållets trafik och tar det som blir kvar av linjen.</li>
+        <li><b>Hastighetsgränser och ett veckoschema:</b> tak som går att justera live, ett schema i lokal tid (DST-säkert) och en "pausa i N minuter" som startar om av sig själv.</li>
         <li><b>Minnesbudget.</b> En enda global RAM-budget (auto: en fjärdedel av RAM, med tak, går att åsidosätta). När det börjar bli trångt krymper buffertarna först, sedan spiller data till disk och läses tillbaka när jobbet lugnat sig. Den swappar aldrig. Ett 190 GB-jobb blir klart inom en 1 GB-budget vid ~1.1 GB topp-RSS, och det finns en uppmätt, dokumenterad 2 GB-profil för NAS-lådor.</li>
-        <li><b>Backpressure.</b> En långsam disk stryper socketarna i stället för att låta RAM fyllas - den håller sig inom ±1 % av ett skrivtak, och RAM <i>sjunker</i> faktiskt under tryck.</li>
-        <li><b>Minnestrim efter jobb</b> - så snart daemonen är ledig lämnar den tillbaka frigjort minne till OS:et och sjunker till runt 8 MB mellan jobb på macOS.</li>
+        <li><b>Backpressure.</b> En långsam disk stryper socketarna i stället för att låta RAM fyllas. Den håller sig inom ±1 % av ett skrivtak, och RAM <i>sjunker</i> faktiskt under tryck.</li>
+        <li><b>Minnestrim efter jobb:</b> så snart daemonen är ledig lämnar den tillbaka frigjort minne till OS:et och sjunker till runt 8 MB mellan jobb på macOS.</li>
       </ul>
     </div>
   </div>
@@ -97,12 +97,12 @@
       <ul class="plain">
         <li><b>Skriv en gång.</b> Avkodade artiklar pwrite:as rakt till sina slutliga fil-offset. Inga tempfiler, inget separat monteringspass.</li>
         <li><b>PAR2-verifiering i strömmen.</b> Varje block MD5-hashas ur avkodningsbuffertarna medan det anländer, så verifieringen är klar i samma stund som nedladdningen. Det slår snabbkollen de andra klienterna nöjer sig med, och det kostar ingenting.</li>
-        <li><b>Direktuppackning</b> - store-mode-RAR-inlägg (de flesta scene-releaser) mappas och packas upp medan de laddas ner, så volymerna landar aldrig på disk över huvud taget. Diskskrivningar hamnar på innehåll × 1.0 och disk som behövs på 1×, där andra vill ha ungefär 2×.</li>
+        <li><b>Direktuppackning:</b> store-mode-RAR-inlägg (de flesta scene-releaser) mappas och packas upp medan de laddas ner, så volymerna landar aldrig på disk över huvud taget. Diskskrivningar hamnar på innehåll × 1.0 och disk som behövs på 1×, där andra vill ha ungefär 2×.</li>
         <li><b>Deobfuskering.</b> Obfuskerade inlägg döps om utifrån sin PAR2-metadata, ROT13-krypterade namn räddas, och hashnamnat skräp klassificeras och sållas bort.</li>
       </ul>
       <ul class="plain">
-        <li><b>Exakt passande reparation.</b> Skadade block är kända allteftersom de uppstår, så bara den byte-minimala uppsättningen återställningsvolymer hämtas - ett knapsack-problem - och reparationen rör inget annat än de skadade spannen.</li>
-        <li><b>Fallback för komprimerat och krypterat</b> - inlägg som inte är store materialiseras och packas upp genom den inbyggda RAR-motorn, överlappat med resten av kön. Krypterade set parkeras med ett tydligt meddelande i stället för att fallera tyst.</li>
+        <li><b>Exakt passande reparation.</b> Skadade block är kända allteftersom de uppstår, så bara den byte-minimala uppsättningen återställningsvolymer hämtas (ett knapsack-problem) och reparationen rör inget annat än de skadade spannen.</li>
+        <li><b>Fallback för komprimerat och krypterat:</b> inlägg som inte är store materialiseras och packas upp genom den inbyggda RAR-motorn, överlappat med resten av kön. Krypterade set parkeras med ett tydligt meddelande i stället för att fallera tyst.</li>
         <li><b>Lösenordshantering.</b> Lösenord kommer från *arr-API:et, filnamnskonventionen <code>{{pw}}</code> eller NZB-metadata. Det som blir över tar en 🔑 upplåsning på instrumentpanelen hand om: den låser upp i bakgrunden och arkiverar sedan som vanligt.</li>
         <li><b>Skyddsräcken.</b> Reparerade källvolymer skrivskyddas medan omuppackningen körs, och en slutkod rapporterar "framgång" bara när sluttillståndet verkligen är användbart.</li>
       </ul>
@@ -118,14 +118,14 @@
         <li><b>Tillgänglighetskoll före start.</b> Pipelinade STAT-svep bygger på sekunder en matris per artikel × per server och markerar jobbet COMPLETE, REPAIRABLE eller IMPOSSIBLE innan en enda byte innehåll hämtats. Ett omöjligt inlägg avbryter efter att knappt ha dragit något alls.</li>
         <li><b>Union-routning.</b> En artikel räknas som saknad först när varje levande server har nekat den; fram till dess routas den till vilken server som än har den. Backbones skiljer sig åt i retention och takedowns, så unionen slutför i tysthet inlägg som ingen enskild server hade klarat.</li>
         <li><b>Kraschsäker journal.</b> Journalen arbetar på artikelnivå. Skicka en kill −9 mitt i jobbet så kommer den tillbaka och hämtar bara om det som inte hunnit sparas; kön och historiken överlever omstarter.</li>
-        <li><b>Parkera och försök igen</b> - misslyckade jobb parkeras i historiken, och ett nytt försök hämtar bara de bitar som fortfarande saknas.</li>
-        <li><b>Kaos-testad.</b> En mock-NNTP-server kör tio felscenarier från början till slut - 430:or, korruption, trunkering, stopp, döda servrar, kill −9 - vid varenda testkörning.</li>
+        <li><b>Parkera och försök igen:</b> misslyckade jobb parkeras i historiken, och ett nytt försök hämtar bara de bitar som fortfarande saknas.</li>
+        <li><b>Kaos-testad.</b> En mock-NNTP-server kör tio felscenarier från början till slut (430:or, korruption, trunkering, stopp, döda servrar, kill −9) vid varenda testkörning.</li>
       </ul>
       <ul class="plain">
         <li><b>Tillförlitlighetspoäng per provider.</b> Kompletteringsgraden för varje server sparas för gott och visas på instrumentpanelen, med en varning under 98 %.</li>
         <li><b>Analys av serverdiversitet.</b> Den STAT-provtar tvärs över dina servrar och klustrar dem efter luckorna de delar, så att du kan se vilka "olika" providers som egentligen är samma backbone innan du betalar för redundans du i själva verket inte har.</li>
-        <li><b>Kvoter, blockkonton och en diskvakt</b> - dagliga och månatliga kvoter, livstidsbudgetar i byte för blockkonton (auto-uteslutna när de är slut), en paus vid låg disk, och daglig förbrukningshistorik per provider.</li>
-        <li><b>Dubblettdetektering</b> - dupekey och dupescore, där ett hållet alternativ befordras automatiskt i samma stund en grab misslyckas.</li>
+        <li><b>Kvoter, blockkonton och en diskvakt:</b> dagliga och månatliga kvoter, livstidsbudgetar i byte för blockkonton (auto-uteslutna när de är slut), en paus vid låg disk, och daglig förbrukningshistorik per provider.</li>
+        <li><b>Dubblettdetektering:</b> dupekey och dupescore, där ett hållet alternativ befordras automatiskt i samma stund en grab misslyckas.</li>
         <li><b>Retention-medveten routning.</b> Inlägg som är äldre än en servers retention hoppar över den helt, och allt som ingen server kan leverera fallerar direkt i stället för att snurra.</li>
       </ul>
     </div>
@@ -137,19 +137,19 @@
     <h2>Automatisering &amp; integrationer</h2>
     <div class="grid2">
       <ul class="plain">
-        <li><b>SABnzbd-kompatibelt API</b> - hela den yta som *arr-verktygen faktiskt använder: addfile/addurl, kategorier, prioriteter, paus/återuppta per jobb, nytt försök, paginering, API-nycklar i två nivåer. Sonarr och Radarr pratar med det som om det vore SABnzbd.</li>
+        <li><b>SABnzbd-kompatibelt API:</b> hela den yta som *arr-verktygen faktiskt använder: addfile/addurl, kategorier, prioriteter, paus/återuppta per jobb, nytt försök, paginering, API-nycklar i två nivåer. Sonarr och Radarr pratar med det som om det vore SABnzbd.</li>
         <li><b>NZBGet JSON-RPC-fasad.</b> nzb360, LunaSea och andra NZBGet-fjärrar ansluter oförändrade.</li>
         <li><b>Newznab-server.</b> Ditt lokala index svarar på t=search/tvsearch/movie, så *arr-verktygen kan behandla dina egna skanningar som en indexerare.</li>
-        <li><b>RSS auto-grab</b> - flöden filtrerade med ett NZBGet-liknande språk, tillagda och redigerade live från instrumentpanelen.</li>
+        <li><b>RSS auto-grab:</b> flöden filtrerade med ett NZBGet-liknande språk, tillagda och redigerade live från instrumentpanelen.</li>
         <li><b>Bevakningslista.</b> Namnge serierna och filmerna du vill ha, även sådana som inte sänts än. Varje avsnitt grabbas vid sin första förekomst och uppgraderas tills det når din målkvalitet (säg 720p → 1080p REMUX), och den ersatta kopian raderas först efter att uppgraderingen verifierats. En kalender över sändningsdatum visar vad som är på väg.</li>
       </ul>
       <ul class="plain">
         <li><b>Bevakningsmapp.</b> Släpp in en .nzb så laddas den ner; filen försvinner så snart den plockats upp.</li>
-        <li><b>Smarta mappar</b> - regler för regex, nyckelord och storlek sorterar nedladdningar i kategorier redan vid inläggning i kön, med valfri TV-arkivering till <code>Show/Season NN/Show - S01E02.ext</code>.</li>
-        <li><b>Städregler</b> - skräptillägg tas bort så snart ett jobb är klart.</li>
+        <li><b>Smarta mappar:</b> regler för regex, nyckelord och storlek sorterar nedladdningar i kategorier redan vid inläggning i kön, med valfri TV-arkivering till <code>Show/Season NN/Show - S01E02.ext</code>.</li>
+        <li><b>Städregler:</b> skräptillägg tas bort så snart ett jobb är klart.</li>
         <li><b>Efterbehandlingsskript.</b> De följer SABnzbds SAB_*-miljökontrakt, så skripten du redan har körs precis som de är.</li>
         <li><b>Migrering med ett klick.</b> Den importerar servrar från en SABnzbd-ini eller en NZBGet-conf, och läser sabnzbd.ini direkt om det är allt den hittar.</li>
-        <li><b>Spotnet-inmatning</b> - verifiering av spotsignaturer och NZB-syntes, inbyggt direkt.</li>
+        <li><b>Spotnet-inmatning:</b> verifiering av spotsignaturer och NZB-syntes, inbyggt direkt.</li>
       </ul>
     </div>
   </div>
@@ -159,22 +159,22 @@
   <div class="wrap">
     <h2>Indexerare &amp; posterväggen</h2>
     <p class="lead">Skanna de grupper du bryr dig om till ett privat index, och bläddra sedan i det som en
-    postervägg. All metadata kommer från nyckellösa publika källor hämtade av din installation -
-    det finns ingen API-nyckel att tigga om.</p>
+    postervägg. All metadata kommer från nyckellösa publika källor hämtade av din installation.
+    Det finns ingen API-nyckel att tigga om.</p>
     <figure class="shot"><img src="assets/wall-sheet.jpg" alt="Poster wall detail sheet with rating, cast, synopsis and episode chips" loading="lazy"></figure>
     <div style="height:26px"></div>
     <div class="grid2">
       <ul class="plain">
         <li><b>Kontinuerlig gruppskanner.</b> Inkrementella OVER-skanningar körs enligt ditt schema i ~43k headers/s över utfanade anslutningar. Den första skanningen är datum-bisekterad, så <code>--max-age 2y</code> hoppar över år av headers på ungefär 20 probar.</li>
-        <li><b>Ingest-filter</b> - filter på typ, år, upplösning, språk och storlek håller indexer-spam borta från din databas, och obfuskerat skräp fångas och sållas bort som standard.</li>
-        <li><b>Parser för scene-namn.</b> Den plockar ut titel, år, avsnitt, kvalitet och källa ur verkliga stammar - datumkodade dagliga, fleravsnittskoder och ROT13-obfuskerade namn inräknat - och deduplicerar releaser ner till ett kort per titel.</li>
-        <li><b>Direktsök</b> - sök medan du skriver, med kvalitetsfilter, bevakningsknappar per rad och kvalitetsmärken rakt igenom.</li>
+        <li><b>Ingest-filter:</b> filter på typ, år, upplösning, språk och storlek håller indexer-spam borta från din databas, och obfuskerat skräp fångas och sållas bort som standard.</li>
+        <li><b>Parser för scene-namn.</b> Den plockar ut titel, år, avsnitt, kvalitet och källa ur verkliga stammar (datumkodade dagliga, fleravsnittskoder och ROT13-obfuskerade namn inräknat) och deduplicerar releaser ner till ett kort per titel.</li>
+        <li><b>Direktsök:</b> sök medan du skriver, med kvalitetsfilter, bevakningsknappar per rad och kvalitetsmärken rakt igenom.</li>
       </ul>
       <ul class="plain">
         <li><b>Nyckellös berikning.</b> TVmaze för TV, iTunes Search för film, plus publika betygsdataset, Wikidata, Wikipedia och AniList fyller i posters, betyg och röstantal, skådespelare, genrer och handling. OMDb- och TMDB-nycklar fungerar om du har dem, men inget kräver någon.</li>
-        <li><b>Avsnittsrutnät</b> - chips per säsong med bästa encode av varje avsnitt ett klick från nedladdning, säsongspaket markerade och ett "bevaka serie" på varje säsongsrubrik.</li>
-        <li><b>Trendrader</b> - remsor för nytt-den-här-veckan och hett-just-nu, byggda utifrån postfrekvens.</li>
-        <li><b>Korrigera vad som helst.</b> Fel matchning? Välj bland kandidaterna eller skriv bara in rätt identitet - det du sätter för hand skrivs aldrig över. Peka en poster mot en URL eller ladda upp en själv. En knapp berikar om en enskild titel; en annan raderar och bygger om hela indexet.</li>
+        <li><b>Avsnittsrutnät:</b> chips per säsong med bästa encode av varje avsnitt ett klick från nedladdning, säsongspaket markerade och ett "bevaka serie" på varje säsongsrubrik.</li>
+        <li><b>Trendrader:</b> remsor för nytt-den-här-veckan och hett-just-nu, byggda utifrån postfrekvens.</li>
+        <li><b>Korrigera vad som helst.</b> Fel matchning? Välj bland kandidaterna eller skriv bara in rätt identitet. Det du sätter för hand skrivs aldrig över. Peka en poster mot en URL eller ladda upp en själv. En knapp berikar om en enskild titel; en annan raderar och bygger om hela indexet.</li>
       </ul>
     </div>
   </div>
@@ -197,22 +197,22 @@
       <figure><div class="shot"><img src="assets/dash-browse.png" alt="Queue with per-file drawer and index browse card" loading="lazy"></div>
         <figcaption>Kölåda: staplar per fil, verifieringsblock, bidrag per server.</figcaption></figure>
       <figure><div class="shot"><img src="assets/settings-top.png" alt="Settings: server editor and live speed/scheduling controls" loading="lazy"></div>
-        <figcaption>Varje inställning redigerbar i webbläsaren - de flesta gäller live.</figcaption></figure>
+        <figcaption>Varje inställning redigerbar i webbläsaren. De flesta gäller live.</figcaption></figure>
       <figure><div class="shot" style="max-width:320px;margin:0 auto"><img src="assets/mobile-dash.png" alt="Phone layout of the dashboard" loading="lazy"></div>
         <figcaption>Riktig telefonlayout, samma daemon.</figcaption></figure>
     </div>
     <div style="height:10px"></div>
     <div class="grid2">
       <ul class="plain">
-        <li><b>Live-diagram, inga bibliotek.</b> Allt pollas en gång i sekunden - en genomströmningsarea, staplad area per provider, en tidslinje för verifieringshälsa, könedräkning och ett hastighetshistogram - och diagrammen breddar sitt tidsfönster i takt med att du breddar webbläsaren.</li>
-        <li><b>Resursmonitor</b> - CPU, RAM mot budget, diskskrivningar och nätverk i ett enda diagram, med en varning för låg disk.</li>
+        <li><b>Live-diagram, inga bibliotek.</b> Allt pollas en gång i sekunden (en genomströmningsarea, staplad area per provider, en tidslinje för verifieringshälsa, könedräkning och ett hastighetshistogram) och diagrammen breddar sitt tidsfönster i takt med att du breddar webbläsaren.</li>
+        <li><b>Resursmonitor:</b> CPU, RAM mot budget, diskskrivningar och nätverk i ett enda diagram, med en varning för låg disk.</li>
         <li><b>Topplista över providers.</b> Servrarna sorterar om sig själva efter live-prestanda och visar var och en sessionsbyte, antal anslutningar, utnyttjande och tillförlitlighet.</li>
-        <li><b>Köhantering</b> - dra för att ändra ordning, sätt prioritet och kategori inline, öppna en låda per nedladdning, pausa optimistiskt eller "pausa i N minuter".</li>
+        <li><b>Köhantering:</b> dra för att ändra ordning, sätt prioritet och kategori inline, öppna en låda per nedladdning, pausa optimistiskt eller "pausa i N minuter".</li>
       </ul>
       <ul class="plain">
-        <li><b>Allt går att konfigurera i webbläsaren</b> - servrar (med live-anslutningstester), hastighet och schema, anslutningar/fönster/avkodare, disk och kvot, bevakningsmappar och skript, indexeringsfilter, bibliotek, RSS, och säkerhet med nyckelrotation. Inställningarna överlever omstarter.</li>
-        <li><b>Diagnostik inbyggd</b> - en loggvisare i gränssnittet, ett systembenchmark som hittar dina tak för nätverk, beräkning och disk och talar om vad du ska göra åt dem, analysen av serverdiversitet, och anslutningsstegen.</li>
-        <li><b>Dataförbrukning</b> - staplade staplar per provider över 14 dagar, daglig historik, och livstidsräknare för blockkonton.</li>
+        <li><b>Allt går att konfigurera i webbläsaren:</b> servrar (med live-anslutningstester), hastighet och schema, anslutningar/fönster/avkodare, disk och kvot, bevakningsmappar och skript, indexeringsfilter, bibliotek, RSS, och säkerhet med nyckelrotation. Inställningarna överlever omstarter.</li>
+        <li><b>Diagnostik inbyggd:</b> en loggvisare i gränssnittet, ett systembenchmark som hittar dina tak för nätverk, beräkning och disk och talar om vad du ska göra åt dem, analysen av serverdiversitet, och anslutningsstegen.</li>
+        <li><b>Dataförbrukning:</b> staplade staplar per provider över 14 dagar, daglig historik, och livstidsräknare för blockkonton.</li>
         <li><b>Bekvämligheter.</b> Dra och släpp en .nzb var som helst, skrivbordsaviseringar, slutförandeljud, en förstagångsguide och <code>serve --open</code>.</li>
       </ul>
     </div>
@@ -223,10 +223,10 @@
   <div class="wrap">
     <h2>Distribution</h2>
     <ul class="plain">
-      <li><b>En enda fristående körbar fil.</b> par2 och RAR-uppackning är native-kod inkompilerad i binären - inget packas upp vid första körningen, och det finns ingen runtime och ingen installer att pyssla med.</li>
-      <li><b>macOS, förstklassigt</b> - en universell binär för Apple Silicon och Intel, en native SwiftUI-menyradsapp, en launchd-enhet och en Homebrew-formula.</li>
-      <li><b>Windows</b> - en helt statisk x64-exe som körs på standard Windows 10 och 11, med en startare för dubbelklick och guidad konfiguration.</li>
-      <li><b>Linux och Docker</b> - en härdad systemd-enhet, en flerstegs Docker-image med en linuxserver-liknande PUID/PGID-entrypoint, och en compose-fil på köpet. <a href="download.sv.html">Alla plattformar →</a></li>
+      <li><b>En enda fristående körbar fil.</b> par2 och RAR-uppackning är native-kod inkompilerad i binären. Inget packas upp vid första körningen, och det finns ingen runtime och ingen installer att pyssla med.</li>
+      <li><b>macOS, förstklassigt:</b> en universell binär för Apple Silicon och Intel, en native SwiftUI-menyradsapp, en launchd-enhet och en Homebrew-formula.</li>
+      <li><b>Windows:</b> en helt statisk x64-exe som körs på standard Windows 10 och 11, med en startare för dubbelklick och guidad konfiguration.</li>
+      <li><b>Linux och Docker:</b> en härdad systemd-enhet, en flerstegs Docker-image med en linuxserver-liknande PUID/PGID-entrypoint, och en compose-fil på köpet. <a href="download.sv.html">Alla plattformar →</a></li>
       <li><b>Guidad konfiguration.</b> Kör guiden <code>nzbfast setup</code>, eller låt den autodetektera en befintlig SABnzbd- eller NZBGet-konfig. Du har en första nedladdning igång på under två minuter.</li>
     </ul>
   </div>
@@ -242,7 +242,7 @@
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
     </div>
   </div>
-  <p class="fine">Fri programvara, GPL-3.0-or-later. PAR2-reparation och RAR-uppackning är native-kod i binären - inga medföljande tredjepartsverktyg. Posterväggens metadata kommer från nyckellösa
+  <p class="fine">Fri programvara, GPL-3.0-or-later. PAR2-reparation och RAR-uppackning är native-kod i binären: inga medföljande tredjepartsverktyg. Posterväggens metadata kommer från nyckellösa
   publika källor, hämtade av din egen installation.</p>
 </div></footer>
 

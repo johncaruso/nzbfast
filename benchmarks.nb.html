@@ -43,7 +43,7 @@
 <div class="hero wrap" style="padding-bottom:6px">
   <h1>Ytelsestester</h1>
   <p class="sub">Fire klienter, seks scenarioer, identisk maskinvare og leverandører, kjøringer
-  flettet så leverandørdrift kanselleres. Målingen er <b>tid til en brukbar fil</b> -
+  flettet så leverandørdrift kanselleres. Målingen er <b>tid til en brukbar fil</b>:
   lastet ned, verifisert, utpakket. Inkluderer den ene etappen vi ikke vinner.</p>
 </div>
 
@@ -53,8 +53,8 @@
     <h2>Oppsettet</h2>
     <ul class="plain">
       <li><b>Klienter:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (den nærmeste Rust-slektningen), alle på samme maskin per scenario (Apple M-serie-maskiner: «Europa» M1 Ultra på 10&nbsp;GbE, «østkysten» M3 Ultra ~2,4–3,0 Gbps-linje).</li>
-      <li><b>Rettferdighet:</b> samme 6 leverandører × 8 tilkoblinger, TLS overalt, etapper kjørt rett etter hverandre og flettet. Hver konkurrent justert til sitt dokumenterte beste: SABnzbd fikk <code>pipelining_requests=8</code> (<b>den leveres med 1 - dvs. upipelinet</b>; den innstillingen alene tok 190 GB-tiden dens fra 24m24s til 19m02s), NZBGet fikk ArticleCache/DirectWrite/DirectUnpack/ParQuick, rustnzb sin dokumenterte konfigurasjon.</li>
-      <li><b>Sluttilstand:</b> en verifisert, utpakket, brukbar fil - ikke «nedlasting ferdig». Det er det du faktisk venter på.</li>
+      <li><b>Rettferdighet:</b> samme 6 leverandører × 8 tilkoblinger, TLS overalt, etapper kjørt rett etter hverandre og flettet. Hver konkurrent justert til sitt dokumenterte beste: SABnzbd fikk <code>pipelining_requests=8</code> (<b>den leveres med 1, dvs. upipelinet</b>; den innstillingen alene tok 190 GB-tiden dens fra 24m24s til 19m02s), NZBGet fikk ArticleCache/DirectWrite/DirectUnpack/ParQuick, rustnzb sin dokumenterte konfigurasjon.</li>
+      <li><b>Sluttilstand:</b> en verifisert, utpakket, brukbar fil, ikke «nedlasting ferdig». Det er det du faktisk venter på.</li>
       <li><b>Reproduserbarhet:</b> hvert utsagn kan spores til en datert oppføring i benchmark-loggen vår, registrert med driverskriptene som produserte det: veggklokke + grensesnitt-byte-tellere + prosess-tre-topp-RSS, 1–2 s oppløsning.</li>
     </ul>
   </div>
@@ -79,12 +79,12 @@
       </tbody>
     </table></div>
     <p class="note" style="text-align:left">¹ rustnzb rapporterte jobben ferdig på 5m 42s etter å ha dratt
-    186.6 GB - 10 % mer tråd enn noen andre - men etterlot <b>ingen utdatafil i det hele tatt</b>. Den feilet også
+    186.6 GB (10 % mer tråd enn noen andre) men etterlot <b>ingen utdatafil i det hele tatt</b>. Den feilet også
     dette scenarioet i forrige runde («121,975 articles missing», 71 GB foreldreløse).
     · ² nzbfasts minne følger sitt <em>konfigurerte budsjett</em>, ikke jobben: denne etappen kjørte det
     standard auto-budsjettet; avgrenset til <b>1 GB</b> fullføres den samme 190 GB-jobben fortsatt, omtrent 22 %
-    tregere - se lav-minne-stigen nedenfor. På den tidligere østkysten-runden (~2,4–3 Gbps-linje) kjørte det
-    samme scenarioet 9m 00s vs. NZBGet +30 % og SABnzbd +111 % - gapet holder på tvers av linjefarter.</p>
+    tregere (se lav-minne-stigen nedenfor). På den tidligere østkysten-runden (~2,4–3 Gbps-linje) kjørte det
+    samme scenarioet 9m 00s vs. NZBGet +30 % og SABnzbd +111 %. Gapet holder på tvers av linjefarter.</p>
   </div>
 </section>
 
@@ -92,7 +92,7 @@
   <div class="wrap">
     <p class="kicker">Scenario 2 · gapet vokser med størrelsen</p>
     <h2>Tid til brukbar fil, etter jobbstørrelse</h2>
-    <p class="lead">Én omgang betyr ingen verifiserings-/utpakkingsrunde etter nedlasting - så jo større jobben er,
+    <p class="lead">Én omgang betyr ingen verifiserings-/utpakkingsrunde etter nedlasting, så jo større jobben er,
     desto lengre foran lander den. Sekvensielle kjøringer på samme maskin:</p>
     <div class="tblwrap"><table>
       <thead><tr><th>Jobb</th><th>nzbfast</th><th>NZBGet</th><th>SABnzbd</th></tr></thead>
@@ -105,7 +105,7 @@
       </tbody>
     </table></div>
     <p class="note" style="text-align:left">² Deres topp-fotavtrykk (volumer + utpakkede utdata
-    samtidig, ~156 GB) oversteg de 97 GB ledige. Én omgang trenger 1× innholdsstørrelsen -
+    samtidig, ~156 GB) oversteg de 97 GB ledige. Én omgang trenger 1× innholdsstørrelsen:
     den halverer disken du trenger, ikke bare tiden.</p>
   </div>
 </section>
@@ -122,7 +122,7 @@
       </tbody>
     </table></div>
     <p class="note" style="text-align:left">³ rustnzb lastet ned på 119 s, merket jobben
-    <i>Completed</i> - og leverte de rå obfuskerte volumene: ingen omdøping, ingen utpakking.
+    <i>Completed</i>, og leverte de rå obfuskerte volumene: ingen omdøping, ingen utpakking.
     nzbfast deobfuskerte fra PAR2-metadata og pakket ut i strømmen, null innleste blokker.</p>
   </div>
 </section>
@@ -155,20 +155,20 @@
       <div class="card"><h3>Skadet store-mode-post</h3>
         <p>20 forgiftede artikler i en 7.4 GB REMUX: NZBGet ble ferdig brukbar på <b>53 s</b>, nzbfast
         på <b>58 s</b>. Reparasjonen vår er ferdig på 32 s, pakker ut alle 62 volumer på nytt, og utdataen
-        er byte-eksakt - og den henter et nær-teoretisk-minimum på 22 gjenopprettingsblokker for de 20
+        er byte-eksakt, og den henter et nær-teoretisk-minimum på 22 gjenopprettingsblokker for de 20
         som trengs, mot NZBGets fulle PAR2-runde. Men NZBGet tar etappen med fem sekunder, så her er den.</p></div>
     </div>
     <div class="callout">Hvorfor vise et tap i det hele tatt? Fordi seirene bare er troverdige ved siden av det.
     Hvert tall på denne siden kommer fra de samme flettede kjøringene, og repoet holder hele greia
-    som en fullstendig laboratoriejournal - negative resultater inkludert.</div>
+    som en fullstendig laboratoriejournal, negative resultater inkludert.</div>
   </div>
 </section>
 
 <section>
   <div class="wrap">
     <p class="kicker">Scenario 6 · sult den på RAM</p>
-    <h2>Lav-minne-stigen - 190 GB på ~1.1 GB RAM</h2>
-    <p>De samme fire jobbene, kjørt på nytt ved harde minnebudsjetter på 2 GB, 1 GB og 256 MB -
+    <h2>Lav-minne-stigen: 190 GB på ~1.1 GB RAM</h2>
+    <p>De samme fire jobbene, kjørt på nytt ved harde minnebudsjetter på 2 GB, 1 GB og 256 MB:
     det auto-dimensjoneringen ville valgt på en 8 GB-maskin, en 4 GB-maskin og en 2 GB NAS. Hver
     etappe produserte en korrekt, fullstendig verifisert, utpakket fil; topp-RSS fulgte
     <em>budsjettet</em>, ikke jobben. Tid til brukbar fil, 10 GbE-linje:</p>
@@ -183,10 +183,10 @@
     </table></div>
     <p class="note" style="text-align:left">De 20–40 % ekstra på de store jobbene er et
     10 GbE-artefakt: spilte blokker koster bare tid når linjen er raskere enn disken. Den
-    samme 87 GB-jobben ved de samme budsjettene på en ~2,4 Gbps-linje målte −1 % til +7 % - støy.
+    samme 87 GB-jobben ved de samme budsjettene på en ~2,4 Gbps-linje målte −1 % til +7 %, støy.
     På en typisk hjemmetilkobling er et lite budsjett nær gratis ved enhver jobbstørrelse. En
     NAS-profil (2 tilkoblinger, 256 MB-budsjett) gjorde ferdig 35 GB-jobben på 0.4 GB topp-
-    RSS - en 2 GB NAS kan kjøre dette. Ingen annen klient tilbyr et minnetak i det hele tatt.</p>
+    RSS. En 2 GB NAS kan kjøre dette. Ingen annen klient tilbyr et minnetak i det hele tatt.</p>
   </div>
 </section>
 
@@ -213,7 +213,7 @@
         <tr><td>plattformer</td><td class="yes">mac/win/linux/docker</td><td class="yes">mac/win/linux</td><td class="yes">mac/win/linux</td><td class="half">linux/win</td><td class="no">kun mac</td><td class="no">kun win</td></tr>
       </tbody>
     </table></div>
-    <p class="note" style="text-align:left">⁴ Direkte utpakking materialiserer fortsatt volumene først -
+    <p class="note" style="text-align:left">⁴ Direkte utpakking materialiserer fortsatt volumene først:
     2× skrivinger og 2× disk. ⁵ rustnzb leverte obfuskerte volumer merket «Completed» i vår runde
     (utpakkingen dens henger også med RARLab unrar med mindre den deaktiveres). ⁶ GPL-3.0-or-later.
     Usenapp/Newsbin er enkeltplattform-kommersielle lesere med nedlasterfunksjoner; de er
@@ -227,15 +227,15 @@
     <h2>Motoren metter ekte linjer</h2>
     <ul class="plain">
       <li><b>8.31 Gbps aggregert</b> på en målt-8.2 Gbps 10 GbE-linje (Europa M1 Ultra, 4 leverandører, 14,000 artikler, 0 feil, 0 gjentilkoblinger).</li>
-      <li><b>9.16–9.27 Gbps</b> jevne transporttikk på den samme linjen - ≈98 % av praktisk TCP-goodput.</li>
+      <li><b>9.16–9.27 Gbps</b> jevne transporttikk på den samme linjen, ≈98 % av praktisk TCP-goodput.</li>
       <li><b>5.44 Gbps vedvarende</b> gjennom en full 20.4 GB-jobb <i>inkludert</i> verifisering i strømmen.</li>
-      <li><b>Pipelining replikert ved hver RTT</b>: +64 % ved 63 ms Starlink, +170–177 % ved 14 ms datasenter, +270 % ved 31 ms østkysten - den beseirer forringelse av TCP-congestion-vinduet, ikke bare forsinkelse.</li>
-      <li><b>Mottrykksbevis</b>: sett et tak på skrivestadiet 4× under nettverket, og inndata låses til taket ±1 % innen 2 s, RAM <i>faller</i>, null swaps - en treg disk kan aldri blåse opp minnet.</li>
-      <li><b>CPU-margin</b>: målte dekode+verifiser-tak på 86–165 Gbps på Apple-silisium - nettverket er flaskehalsen med 4–50× på hver maskin som er testet.</li>
+      <li><b>Pipelining replikert ved hver RTT</b>: +64 % ved 63 ms Starlink, +170–177 % ved 14 ms datasenter, +270 % ved 31 ms østkysten. Den beseirer forringelse av TCP-congestion-vinduet, ikke bare forsinkelse.</li>
+      <li><b>Mottrykksbevis</b>: sett et tak på skrivestadiet 4× under nettverket, og inndata låses til taket ±1 % innen 2 s, RAM <i>faller</i>, null swaps. En treg disk kan aldri blåse opp minnet.</li>
+      <li><b>CPU-margin</b>: målte dekode+verifiser-tak på 86–165 Gbps på Apple-silisium. Nettverket er flaskehalsen med 4–50× på hver maskin som er testet.</li>
     </ul>
     <div class="callout">Stående regel fra repoet: <b>hvert ytelsesutsagn siterer en reproduserbar
     kommando og betingelsene det kjørte under.</b> Alt sammen ligger i repoet som en datert
-    laboratoriejournal - negative resultater og feilspor inkludert.</div>
+    laboratoriejournal, negative resultater og feilspor inkludert.</div>
   </div>
 </section>
 

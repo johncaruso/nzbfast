@@ -43,7 +43,7 @@
 <div class="hero wrap" style="padding-bottom:6px">
   <h1>Benchmarks</h1>
   <p class="sub">Vier clients, zes scenario's, identieke hardware en providers, runs
-  afwisselend uitgevoerd zodat providerdrift wegvalt. De maatstaf is <b>tijd tot een bruikbaar bestand</b> -
+  afwisselend uitgevoerd zodat providerdrift wegvalt. De maatstaf is <b>tijd tot een bruikbaar bestand</b>:
   gedownload, geverifieerd, uitgepakt. Inclusief de ene leg die we niet winnen.</p>
 </div>
 
@@ -53,8 +53,8 @@
     <h2>De opzet</h2>
     <ul class="plain">
       <li><b>Clients:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (de dichtstbijzijnde Rust-tegenhanger), allemaal op dezelfde machine per scenario (Apple M-serie machines: "Europa" M1 Ultra op 10&nbsp;GbE, "oostkust VS" M3 Ultra ~2.4–3.0 Gbps-lijn).</li>
-      <li><b>Eerlijkheid:</b> dezelfde 6 providers × 8 verbindingen, overal TLS, legs afwisselend achter elkaar uitgevoerd. Elke concurrent afgesteld op z'n gedocumenteerde optimum: SABnzbd kreeg <code>pipelining_requests=8</code> (<b>standaard staat die op 1 - dus ongepipelined</b>; alleen die instelling al bracht z'n 190 GB-tijd terug van 24m24s naar 19m02s), NZBGet kreeg ArticleCache/DirectWrite/DirectUnpack/ParQuick, rustnzb z'n gedocumenteerde config.</li>
-      <li><b>Eindtoestand:</b> een geverifieerd, uitgepakt, bruikbaar bestand - niet "download klaar". Daar wacht je namelijk echt op.</li>
+      <li><b>Eerlijkheid:</b> dezelfde 6 providers × 8 verbindingen, overal TLS, legs afwisselend achter elkaar uitgevoerd. Elke concurrent afgesteld op z'n gedocumenteerde optimum: SABnzbd kreeg <code>pipelining_requests=8</code> (<b>standaard staat die op 1, dus ongepipelined</b>; alleen die instelling al bracht z'n 190 GB-tijd terug van 24m24s naar 19m02s), NZBGet kreeg ArticleCache/DirectWrite/DirectUnpack/ParQuick, rustnzb z'n gedocumenteerde config.</li>
+      <li><b>Eindtoestand:</b> een geverifieerd, uitgepakt, bruikbaar bestand, niet "download klaar". Daar wacht je namelijk echt op.</li>
       <li><b>Reproduceerbaarheid:</b> elke claim is te herleiden tot een gedateerde vermelding in onze benchmarklog, vastgelegd met de driver-scripts die hem produceerden: wall-clock + interface-bytetellers + piek-RSS van de processtructuur, resolutie van 1–2 s.</li>
     </ul>
   </div>
@@ -79,12 +79,12 @@
       </tbody>
     </table></div>
     <p class="note" style="text-align:left">¹ rustnzb meldde de taak klaar op 5m 42s na het binnenhalen van
-    186.6 GB - 10% meer over de lijn dan wie dan ook - maar liet <b>helemaal geen uitvoerbestand</b> achter.
+    186.6 GB (10% meer over de lijn dan wie dan ook) maar liet <b>helemaal geen uitvoerbestand</b> achter.
     Hij faalde ook in de vorige ronde op dit scenario ("121,975 articles missing", 71 GB verweesd).
     · ² het geheugen van nzbfast volgt z'n <em>ingestelde budget</em>, niet de taak: deze leg draaide het
     standaard auto-budget; begrensd op <b>1 GB</b> voltooit dezelfde taak van 190 GB nog steeds, zo'n 22%
-    trager - zie de low-memory-ladder hieronder. In de eerdere oostkust-VS-ronde (~2.4–3 Gbps-lijn) draaide
-    hetzelfde scenario in 9m 00s vs NZBGet +30% en SABnzbd +111% - de kloof houdt stand over verschillende lijnsnelheden.</p>
+    trager (zie de low-memory-ladder hieronder). In de eerdere oostkust-VS-ronde (~2.4–3 Gbps-lijn) draaide
+    hetzelfde scenario in 9m 00s vs NZBGet +30% en SABnzbd +111%. De kloof houdt stand over verschillende lijnsnelheden.</p>
   </div>
 </section>
 
@@ -92,7 +92,7 @@
   <div class="wrap">
     <p class="kicker">Scenario 2 · de kloof groeit met de grootte</p>
     <h2>Tijd tot bruikbaar bestand, per taakgrootte</h2>
-    <p class="lead">One-pass betekent geen aparte verificatie-/uitpakpass na de download - dus hoe groter de taak,
+    <p class="lead">One-pass betekent geen aparte verificatie-/uitpakpass na de download, dus hoe groter de taak,
     hoe verder hij vooruit ligt. Sequentiële runs op dezelfde machine:</p>
     <div class="tblwrap"><table>
       <thead><tr><th>Taak</th><th>nzbfast</th><th>NZBGet</th><th>SABnzbd</th></tr></thead>
@@ -105,7 +105,7 @@
       </tbody>
     </table></div>
     <p class="note" style="text-align:left">² Hun piekvoetafdruk (volumes + uitgepakte uitvoer
-    tegelijk, ~156 GB) overschreed de 97 GB vrij. One-pass heeft 1× de contentgrootte nodig -
+    tegelijk, ~156 GB) overschreed de 97 GB vrij. One-pass heeft 1× de contentgrootte nodig:
     het halveert de schijf die je nodig hebt, niet alleen de tijd.</p>
   </div>
 </section>
@@ -122,7 +122,7 @@
       </tbody>
     </table></div>
     <p class="note" style="text-align:left">³ rustnzb downloadde in 119 s, markeerde de taak als
-    <i>Completed</i> - en leverde de rauwe geobfusceerde volumes: geen hernoeming, geen uitpakken.
+    <i>Completed</i>, en leverde de rauwe geobfusceerde volumes: geen hernoeming, geen uitpakken.
     nzbfast deobfusceerde vanuit PAR2-metadata en pakte in-stream uit, nul terug te lezen blokken.</p>
   </div>
 </section>
@@ -155,21 +155,21 @@
       <div class="card"><h3>Beschadigde store-mode post</h3>
         <p>20 vergiftigde artikelen in een REMUX van 7.4 GB: NZBGet is bruikbaar klaar in <b>53 s</b>, nzbfast
         in <b>58 s</b>. Ons herstel is klaar in 32 s, pakt alle 62 volumes opnieuw uit, en de uitvoer is
-        byte-exact - en het haalt een bijna-theoretisch-minimum van 22 recovery-blokken op voor de 20
+        byte-exact, en het haalt een bijna-theoretisch-minimum van 22 recovery-blokken op voor de 20
         benodigde, tegenover de volledige PAR2-pass van NZBGet. Maar NZBGet wint de leg met vijf seconden,
         dus hier staat hij.</p></div>
     </div>
     <div class="callout">Waarom überhaupt een verlies laten zien? Omdat de overwinningen alleen geloofwaardig
     zijn náást dat ene verlies. Elk getal op deze pagina komt uit dezelfde afwisselende runs, en de repo
-    bewaart het geheel als een volledig labjournaal - negatieve resultaten incluis.</div>
+    bewaart het geheel als een volledig labjournaal, negatieve resultaten incluis.</div>
   </div>
 </section>
 
 <section>
   <div class="wrap">
     <p class="kicker">Scenario 6 · verhonger het van RAM</p>
-    <h2>De low-memory-ladder - 190 GB in ~1.1 GB RAM</h2>
-    <p>Dezelfde vier taken, opnieuw gedraaid bij harde geheugenbudgetten van 2 GB, 1 GB en 256 MB -
+    <h2>De low-memory-ladder: 190 GB in ~1.1 GB RAM</h2>
+    <p>Dezelfde vier taken, opnieuw gedraaid bij harde geheugenbudgetten van 2 GB, 1 GB en 256 MB:
     wat de auto-sizer zou kiezen op een 8 GB-machine, een 4 GB-machine en een 2 GB-NAS. Elke
     leg leverde een correct, volledig geverifieerd, uitgepakt bestand; piek-RSS volgde het
     <em>budget</em>, niet de taak. Tijd tot bruikbaar bestand, 10 GbE-lijn:</p>
@@ -184,10 +184,10 @@
     </table></div>
     <p class="note" style="text-align:left">De opslag van 20–40% op de grote taken is een
     10 GbE-artefact: gespilde blokken kosten alleen tijd als de lijn de schijf voorbijstreeft. Dezelfde
-    taak van 87 GB bij dezelfde budgetten op een ~2.4 Gbps-lijn mat −1% tot +7% - ruis.
+    taak van 87 GB bij dezelfde budgetten op een ~2.4 Gbps-lijn mat −1% tot +7%, ruis.
     Op een doorsnee thuisverbinding is een klein budget bij elke taakgrootte vrijwel gratis. Een
-    NAS-profiel (2 verbindingen, budget 256 MB) rondde de taak van 35 GB af in 0.4 GB piek-RSS -
-    een 2 GB-NAS kan dit draaien. Geen enkele andere client biedt überhaupt een geheugenplafond.</p>
+    NAS-profiel (2 verbindingen, budget 256 MB) rondde de taak van 35 GB af in 0.4 GB piek-RSS.
+    Een 2 GB-NAS kan dit draaien. Geen enkele andere client biedt überhaupt een geheugenplafond.</p>
   </div>
 </section>
 
@@ -214,7 +214,7 @@
         <tr><td>platforms</td><td class="yes">mac/win/linux/docker</td><td class="yes">mac/win/linux</td><td class="yes">mac/win/linux</td><td class="half">linux/win</td><td class="no">alleen mac</td><td class="no">alleen win</td></tr>
       </tbody>
     </table></div>
-    <p class="note" style="text-align:left">⁴ Direct unpack materialiseert de volumes eerst alsnog -
+    <p class="note" style="text-align:left">⁴ Direct unpack materialiseert de volumes eerst alsnog:
     2× schrijven en 2× schijf. ⁵ rustnzb leverde geobfusceerde volumes gemarkeerd als "Completed" in onze
     ronde (z'n uitpakken loopt bovendien vast met RARLab-unrar tenzij uitgeschakeld). ⁶ GPL-3.0-or-later.
     Usenapp/Newsbin zijn commerciële readers voor één platform met downloaderfuncties; ze staan erbij
@@ -228,15 +228,15 @@
     <h2>De engine verzadigt echte lijnen</h2>
     <ul class="plain">
       <li><b>8.31 Gbps totaal</b> op een op-8.2 Gbps-gemeten 10 GbE-lijn (Europa M1 Ultra, 4 providers, 14,000 artikelen, 0 fouten, 0 reconnects).</li>
-      <li><b>9.16–9.27 Gbps</b> stabiele transport-ticks op dezelfde lijn - ≈98% van de praktische TCP-goodput.</li>
+      <li><b>9.16–9.27 Gbps</b> stabiele transport-ticks op dezelfde lijn, ≈98% van de praktische TCP-goodput.</li>
       <li><b>5.44 Gbps</b> volgehouden door een volledige taak van 20.4 GB <i>inclusief</i> in-stream-verificatie.</li>
-      <li><b>Pipelining gerepliceerd bij elke RTT</b>: +64% bij 63 ms Starlink, +170–177% bij 14 ms datacenter, +270% bij 31 ms oostkust VS - het verslaat de degradatie van het TCP-congestievenster, niet alleen latency.</li>
-      <li><b>Backpressure-bewijs</b>: begrens de schrijffase 4× onder het netwerk en de invoer klemt zich binnen 2 s op de limiet vast ±1%, RAM <i>daalt</i>, nul swaps - een trage schijf kan het geheugen nooit laten opzwellen.</li>
-      <li><b>Rekenmarge</b>: gemeten decode+verify-plafonds van 86–165 Gbps op Apple silicon - het netwerk is de bottleneck met een factor 4–50× op elke geteste machine.</li>
+      <li><b>Pipelining gerepliceerd bij elke RTT</b>: +64% bij 63 ms Starlink, +170–177% bij 14 ms datacenter, +270% bij 31 ms oostkust VS. Het verslaat de degradatie van het TCP-congestievenster, niet alleen latency.</li>
+      <li><b>Backpressure-bewijs</b>: begrens de schrijffase 4× onder het netwerk en de invoer klemt zich binnen 2 s op de limiet vast ±1%, RAM <i>daalt</i>, nul swaps. Een trage schijf kan het geheugen nooit laten opzwellen.</li>
+      <li><b>Rekenmarge</b>: gemeten decode+verify-plafonds van 86–165 Gbps op Apple silicon. Het netwerk is de bottleneck met een factor 4–50× op elke geteste machine.</li>
     </ul>
     <div class="callout">Vaste regel uit de repo: <b>elke prestatieclaim citeert een reproduceerbaar
     commando en de omstandigheden waaronder het draaide.</b> Het geheel wordt in de repo bijgehouden als een
-    gedateerd labjournaal - inclusief negatieve resultaten en doodlopende wegen.</div>
+    gedateerd labjournaal, inclusief negatieve resultaten en doodlopende wegen.</div>
   </div>
 </section>
 

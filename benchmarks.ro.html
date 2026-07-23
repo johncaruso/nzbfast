@@ -43,7 +43,7 @@
 <div class="hero wrap" style="padding-bottom:6px">
   <h1>Benchmark-uri</h1>
   <p class="sub">Patru clienți, șase scenarii, hardware și provideri identici, rulări
-  intercalate ca variația providerilor să se anuleze. Măsura este <b>timpul până la un fișier utilizabil</b> -
+  intercalate ca variația providerilor să se anuleze. Măsura este <b>timpul până la un fișier utilizabil</b>:
   descărcat, verificat, extras. Include singura probă pe care n-o câștigăm.</p>
 </div>
 
@@ -53,8 +53,8 @@
     <h2>Configurația</h2>
     <ul class="plain">
       <li><b>Clienți:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (cel mai apropiat omolog Rust), toți pe aceeași mașină per scenariu (mașini Apple din seria M: „Europa” M1 Ultra pe 10&nbsp;GbE, „Coasta de Est” M3 Ultra pe o linie de ~2.4–3.0 Gbps).</li>
-      <li><b>Corectitudine:</b> aceiași 6 provideri × 8 conexiuni, TLS peste tot, probele rulate una după alta, intercalat. Fiecare concurent reglat la maximul său documentat: SABnzbd a primit <code>pipelining_requests=8</code> (<b>vine cu 1 - adică fără pipelining</b>; doar acea setare i-a redus timpul pe 190 GB de la 24m24s la 19m02s), NZBGet a primit ArticleCache/DirectWrite/DirectUnpack/ParQuick, rustnzb configurația sa documentată.</li>
-      <li><b>Stare finală:</b> un fișier verificat, extras, utilizabil - nu „descărcare terminată”. Asta e ce aștepți de fapt.</li>
+      <li><b>Corectitudine:</b> aceiași 6 provideri × 8 conexiuni, TLS peste tot, probele rulate una după alta, intercalat. Fiecare concurent reglat la maximul său documentat: SABnzbd a primit <code>pipelining_requests=8</code> (<b>vine cu 1, adică fără pipelining</b>; doar acea setare i-a redus timpul pe 190 GB de la 24m24s la 19m02s), NZBGet a primit ArticleCache/DirectWrite/DirectUnpack/ParQuick, rustnzb configurația sa documentată.</li>
+      <li><b>Stare finală:</b> un fișier verificat, extras, utilizabil, nu „descărcare terminată”. Asta e ce aștepți de fapt.</li>
       <li><b>Reproductibilitate:</b> fiecare afirmație se leagă de o intrare datată în jurnalul nostru de benchmark, înregistrată cu scripturile driver care au produs-o: timp real + contoare de octeți pe interfață + RSS de vârf pe arborele de procese, rezoluție 1–2 s.</li>
     </ul>
   </div>
@@ -79,12 +79,12 @@
       </tbody>
     </table></div>
     <p class="note" style="text-align:left">¹ rustnzb a raportat jobul terminat la 5m 42s după ce a tras
-    186.6 GB - cu 10% mai mult trafic decât oricine - dar nu a lăsat <b>niciun fișier de ieșire</b>. A eșuat și
+    186.6 GB (cu 10% mai mult trafic decât oricine), dar nu a lăsat <b>niciun fișier de ieșire</b>. A eșuat și
     acest scenariu în runda anterioară („121,975 articole lipsă”, 71 GB orfani).
     · ² memoria nzbfast urmează <em>bugetul configurat</em>, nu jobul: această probă a rulat pe
     bugetul auto implicit; limitat la <b>1 GB</b>, același job de 190 GB tot se finalizează, cu aproximativ 22%
-    mai lent - vezi scara de memorie redusă mai jos. În runda anterioară de pe Coasta de Est (linie de ~2.4–3 Gbps),
-    același scenariu a rulat 9m 00s față de NZBGet +30% și SABnzbd +111% - diferența se menține la diferite viteze de linie.</p>
+    mai lent (vezi scara de memorie redusă mai jos). În runda anterioară de pe Coasta de Est (linie de ~2.4–3 Gbps),
+    același scenariu a rulat 9m 00s față de NZBGet +30% și SABnzbd +111%. Diferența se menține la diferite viteze de linie.</p>
   </div>
 </section>
 
@@ -92,7 +92,7 @@
   <div class="wrap">
     <p class="kicker">Scenariul 2 · diferența crește cu dimensiunea</p>
     <h2>Timp până la fișierul utilizabil, după dimensiunea jobului</h2>
-    <p class="lead">O singură trecere înseamnă fără trecere de verificare/dezarhivare după descărcare - așa că, cu cât jobul e mai mare,
+    <p class="lead">O singură trecere înseamnă fără trecere de verificare/dezarhivare după descărcare, așa că, cu cât jobul e mai mare,
     cu atât aterizează mai în față. Rulări secvențiale pe aceeași mașină:</p>
     <div class="tblwrap"><table>
       <thead><tr><th>Job</th><th>nzbfast</th><th>NZBGet</th><th>SABnzbd</th></tr></thead>
@@ -105,7 +105,7 @@
       </tbody>
     </table></div>
     <p class="note" style="text-align:left">² Amprenta lor de vârf (volume + ieșire dezarhivată
-    simultan, ~156 GB) a depășit cei 97 GB liberi. O singură trecere are nevoie de 1× dimensiunea conținutului -
+    simultan, ~156 GB) a depășit cei 97 GB liberi. O singură trecere are nevoie de 1× dimensiunea conținutului:
     înjumătățește discul de care ai nevoie, nu doar timpul.</p>
   </div>
 </section>
@@ -122,7 +122,7 @@
       </tbody>
     </table></div>
     <p class="note" style="text-align:left">³ rustnzb a descărcat în 119 s, a marcat jobul
-    <i>Completed</i> - și a livrat volumele obfuscate brute: fără redenumire, fără extragere.
+    <i>Completed</i>, și a livrat volumele obfuscate brute: fără redenumire, fără extragere.
     nzbfast a deobfuscat din metadatele PAR2 și a extras în flux, zero blocuri citite înapoi.</p>
   </div>
 </section>
@@ -155,21 +155,21 @@
       <div class="card"><h3>Postare deteriorată în mod store</h3>
         <p>20 de articole otrăvite într-un REMUX de 7.4 GB: NZBGet termină cu un fișier utilizabil în <b>53 s</b>,
         nzbfast în <b>58 s</b>. Repararea noastră se încheie în 32 s, reextrage toate cele 62 de volume, iar
-        ieșirea e exactă la octet - și preia doar 22 de blocuri de recuperare, aproape de minimul teoretic,
+        ieșirea e exactă la octet, și preia doar 22 de blocuri de recuperare, aproape de minimul teoretic,
         pentru cele 20 necesare, față de trecerea PAR2 completă a lui NZBGet. Dar NZBGet ia proba cu cinci
         secunde, așa că iat-o aici.</p></div>
     </div>
     <div class="callout">De ce să arătăm măcar o pierdere? Pentru că victoriile sunt credibile doar alături de ea.
     Fiecare număr de pe această pagină provine din aceleași rulări intercalate, iar
-    repo-ul ține totul ca un caiet de laborator complet - cu rezultate negative incluse.</div>
+    repo-ul ține totul ca un caiet de laborator complet, cu rezultate negative incluse.</div>
   </div>
 </section>
 
 <section>
   <div class="wrap">
     <p class="kicker">Scenariul 6 · înfometează-l de RAM</p>
-    <h2>Scara de memorie redusă - 190 GB în ~1.1 GB de RAM</h2>
-    <p>Aceleași patru joburi, rerulate la bugete de memorie stricte de 2 GB, 1 GB și 256 MB -
+    <h2>Scara de memorie redusă: 190 GB în ~1.1 GB de RAM</h2>
+    <p>Aceleași patru joburi, rerulate la bugete de memorie stricte de 2 GB, 1 GB și 256 MB:
     ce ar alege dimensionatorul automat pe o mașină de 8 GB, una de 4 GB și un NAS de 2 GB. Fiecare
     probă a produs un fișier corect, complet verificat și extras; RSS de vârf a urmărit
     <em>bugetul</em>, nu jobul. Timp până la fișierul utilizabil, linie de 10 GbE:</p>
@@ -184,10 +184,10 @@
     </table></div>
     <p class="note" style="text-align:left">Suplimentul de 20–40% la joburile mari este un
     artefact al 10 GbE: blocurile trecute pe disc costă timp doar când linia întrece discul. Același
-    job de 87 GB la aceleași bugete pe o linie de ~2.4 Gbps a măsurat −1% până la +7% - zgomot.
+    job de 87 GB la aceleași bugete pe o linie de ~2.4 Gbps a măsurat −1% până la +7%, zgomot.
     Pe o conexiune casnică tipică, un buget mic este aproape gratuit la orice dimensiune de job. Un
-    profil de NAS (2 conexiuni, buget de 256 MB) a terminat jobul de 35 GB cu 0.4 GB RSS de vârf
-    - un NAS de 2 GB poate rula asta. Niciun alt client nu oferă vreun plafon de memorie.</p>
+    profil de NAS (2 conexiuni, buget de 256 MB) a terminat jobul de 35 GB cu 0.4 GB RSS de vârf.
+    Un NAS de 2 GB poate rula asta. Niciun alt client nu oferă vreun plafon de memorie.</p>
   </div>
 </section>
 
@@ -214,7 +214,7 @@
         <tr><td>platforme</td><td class="yes">mac/win/linux/docker</td><td class="yes">mac/win/linux</td><td class="yes">mac/win/linux</td><td class="half">linux/win</td><td class="no">mac only</td><td class="no">win only</td></tr>
       </tbody>
     </table></div>
-    <p class="note" style="text-align:left">⁴ Dezarhivarea directă tot materializează întâi volumele -
+    <p class="note" style="text-align:left">⁴ Dezarhivarea directă tot materializează întâi volumele:
     2× scrieri și 2× disc. ⁵ rustnzb a livrat volume obfuscate marcate „Completed” în runda noastră
     (dezarhivarea sa se și blochează cu unrar RARLab dacă nu e dezactivată). ⁶ GPL-3.0-or-later.
     Usenapp/Newsbin sunt cititoare comerciale mono-platformă cu funcții de descărcare; sunt
@@ -228,14 +228,14 @@
     <h2>Motorul saturează linii reale</h2>
     <ul class="plain">
       <li><b>8.31 Gbps agregat</b> pe o linie de 10 GbE măsurată la 8.2 Gbps (Europa M1 Ultra, 4 provideri, 14,000 de articole, 0 erori, 0 reconectări).</li>
-      <li><b>9.16–9.27 Gbps</b> tic-uri de transport constante pe aceeași linie - ≈98% din goodput-ul TCP practic.</li>
+      <li><b>9.16–9.27 Gbps</b> tic-uri de transport constante pe aceeași linie, ≈98% din goodput-ul TCP practic.</li>
       <li><b>5.44 Gbps susținut</b> pe tot parcursul unui job complet de 20.4 GB <i>inclusiv</i> verificarea în flux.</li>
-      <li><b>Pipelining replicat la fiecare RTT</b>: +64% la 63 ms Starlink, +170–177% la 14 ms datacenter, +270% la 31 ms Coasta de Est - învinge degradarea ferestrei de congestie TCP, nu doar latența.</li>
-      <li><b>Dovadă de contrapresiune</b>: limitează etapa de scriere de 4× sub rețea și intrarea se blochează la plafon ±1% în 2 s, RAM-ul <i>scade</i>, zero swap-uri - un disc lent nu poate umfla niciodată memoria.</li>
-      <li><b>Marjă de calcul</b>: plafoane măsurate de decodare+verificare de 86–165 Gbps pe Apple silicon - rețeaua este strangularea cu 4–50× pe fiecare mașină testată.</li>
+      <li><b>Pipelining replicat la fiecare RTT</b>: +64% la 63 ms Starlink, +170–177% la 14 ms datacenter, +270% la 31 ms Coasta de Est. Învinge degradarea ferestrei de congestie TCP, nu doar latența.</li>
+      <li><b>Dovadă de contrapresiune</b>: limitează etapa de scriere de 4× sub rețea și intrarea se blochează la plafon ±1% în 2 s, RAM-ul <i>scade</i>, zero swap-uri. Un disc lent nu poate umfla niciodată memoria.</li>
+      <li><b>Marjă de calcul</b>: plafoane măsurate de decodare+verificare de 86–165 Gbps pe Apple silicon. Rețeaua este strangularea cu 4–50× pe fiecare mașină testată.</li>
     </ul>
     <div class="callout">Regulă permanentă din repo: <b>fiecare afirmație de performanță citează o comandă
-    reproductibilă și condițiile în care a rulat.</b> Totul e ținut în repo ca un caiet de laborator datat -
+    reproductibilă și condițiile în care a rulat.</b> Totul e ținut în repo ca un caiet de laborator datat,
     inclusiv rezultatele negative și pașii greșiți.</div>
   </div>
 </section>

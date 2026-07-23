@@ -43,7 +43,7 @@
 <div class="hero wrap" style="padding-bottom:6px">
   <h1>Benchmarks</h1>
   <p class="sub">Four clients, six scenarios, identical hardware and providers, runs
-  interleaved so provider drift cancels. The metric is <b>time to a usable file</b> -
+  interleaved so provider drift cancels. The metric is <b>time to a usable file</b>:
   downloaded, verified, extracted. Includes the one leg we don't win.</p>
 </div>
 
@@ -105,7 +105,7 @@
       </tbody>
     </table></div>
     <p class="note" style="text-align:start">² Their peak footprint (volumes + unpacked output
-    simultaneously, ~156 GB) exceeded the 97 GB free. One-pass needs 1× the content size -
+    simultaneously, ~156 GB) exceeded the 97 GB free. One-pass needs 1× the content size:
     it halves the disk you need, not just the time.</p>
   </div>
 </section>
@@ -168,7 +168,7 @@
   <div class="wrap">
     <p class="kicker">Scenario 6 · starve it of RAM</p>
     <h2>The low-memory ladder: 190 GB in ~1.1 GB of RAM</h2>
-    <p>The same four jobs, re-run at hard memory budgets of 2 GB, 1 GB and 256 MB -
+    <p>The same four jobs, re-run at hard memory budgets of 2 GB, 1 GB and 256 MB:
     what the auto-sizer would pick on an 8 GB box, a 4 GB box, and a 2 GB NAS. Every
     leg produced a correct, fully verified, extracted file; peak RSS tracked the
     <em>budget</em>, not the job. Time to usable file, 10 GbE line:</p>
@@ -213,7 +213,7 @@
         <tr><td>platforms</td><td class="yes">mac/win/linux/docker</td><td class="yes">mac/win/linux</td><td class="yes">mac/win/linux</td><td class="half">linux/win</td><td class="no">mac only</td><td class="no">win only</td></tr>
       </tbody>
     </table></div>
-    <p class="note" style="text-align:start">⁴ Direct unpack still materialises the volumes first -
+    <p class="note" style="text-align:start">⁴ Direct unpack still materialises the volumes first:
     2× writes and 2× disk. ⁵ rustnzb shipped obfuscated volumes marked "Completed" in our round
     (its unpack also hangs with RARLab unrar unless disabled). ⁶ GPL-3.0-or-later.
     Usenapp/Newsbin are single-platform commercial readers with downloader features; they're

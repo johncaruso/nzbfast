@@ -43,7 +43,7 @@
 <div class="hero wrap" style="padding-bottom:6px">
   <h1>Benchmarks</h1>
   <p class="sub">Cuatro clientes, seis escenarios, hardware y proveedores idénticos, ejecuciones
-  intercaladas para que la deriva del proveedor se cancele. La métrica es el <b>tiempo hasta un archivo usable</b> -
+  intercaladas para que la deriva del proveedor se cancele. La métrica es el <b>tiempo hasta un archivo usable</b>:
   descargado, verificado, extraído. Incluye el único tramo que no ganamos.</p>
 </div>
 
@@ -53,8 +53,8 @@
     <h2>El montaje</h2>
     <ul class="plain">
       <li><b>Clientes:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (el par más cercano en Rust), todos en la misma máquina por escenario (equipos Apple de la serie M: M1 Ultra «Europa» en 10&nbsp;GbE, M3 Ultra «costa este» con línea de ~2.4–3.0 Gbps).</li>
-      <li><b>Imparcialidad:</b> los mismos 6 proveedores × 8 conexiones, TLS en todo, tramos ejecutados de forma intercalada uno tras otro. Cada competidor ajustado a su mejor configuración documentada: SABnzbd recibió <code>pipelining_requests=8</code> (<b>viene con 1 - es decir, sin pipeline</b>; ese ajuste por sí solo bajó su tiempo de 190 GB de 24m24s a 19m02s), NZBGet recibió ArticleCache/DirectWrite/DirectUnpack/ParQuick, y rustnzb su configuración documentada.</li>
-      <li><b>Estado final:</b> un archivo verificado, extraído y usable - no «descarga terminada». Eso es lo que realmente esperas.</li>
+      <li><b>Imparcialidad:</b> los mismos 6 proveedores × 8 conexiones, TLS en todo, tramos ejecutados de forma intercalada uno tras otro. Cada competidor ajustado a su mejor configuración documentada: SABnzbd recibió <code>pipelining_requests=8</code> (<b>viene con 1, es decir, sin pipeline</b>; ese ajuste por sí solo bajó su tiempo de 190 GB de 24m24s a 19m02s), NZBGet recibió ArticleCache/DirectWrite/DirectUnpack/ParQuick, y rustnzb su configuración documentada.</li>
+      <li><b>Estado final:</b> un archivo verificado, extraído y usable, no «descarga terminada». Eso es lo que realmente esperas.</li>
       <li><b>Reproducibilidad:</b> cada afirmación se remonta a una entrada fechada en nuestro registro de benchmarks, anotada con los scripts que la produjeron: reloj de pared + contadores de bytes de la interfaz + RSS pico del árbol de procesos, con resolución de 1–2 s.</li>
     </ul>
   </div>
@@ -79,12 +79,12 @@
       </tbody>
     </table></div>
     <p class="note" style="text-align:left">¹ rustnzb informó de que el trabajo estaba hecho a los 5m 42s tras haber traído
-    186.6 GB - un 10% más de cable que nadie - pero no dejó <b>ningún archivo de salida</b>. También falló
+    186.6 GB (un 10% más de cable que nadie) pero no dejó <b>ningún archivo de salida</b>. También falló
     este escenario en la ronda anterior («121,975 artículos ausentes», 71 GB huérfanos).
     · ² la memoria de nzbfast sigue su <em>presupuesto configurado</em>, no el trabajo: este tramo se ejecutó con el
     presupuesto automático por defecto; limitado a <b>1 GB</b>, el mismo trabajo de 190 GB también se completa, un 22%
-    más lento aproximadamente - mira la escalera de baja memoria más abajo. En la ronda anterior de costa este (línea de ~2.4–3 Gbps) el
-    mismo escenario corrió en 9m 00s frente a NZBGet +30% y SABnzbd +111% - la diferencia se mantiene a distintas velocidades de línea.</p>
+    más lento aproximadamente (mira la escalera de baja memoria más abajo). En la ronda anterior de costa este (línea de ~2.4–3 Gbps) el
+    mismo escenario corrió en 9m 00s frente a NZBGet +30% y SABnzbd +111%. La diferencia se mantiene a distintas velocidades de línea.</p>
   </div>
 </section>
 
@@ -92,7 +92,7 @@
   <div class="wrap">
     <p class="kicker">Escenario 2 · la diferencia crece con el tamaño</p>
     <h2>Tiempo hasta archivo usable, por tamaño de trabajo</h2>
-    <p class="lead">Una sola pasada significa que no hay pasada de verificación/desempaquetado posterior a la descarga - así que cuanto mayor es el trabajo,
+    <p class="lead">Una sola pasada significa que no hay pasada de verificación/desempaquetado posterior a la descarga, así que cuanto mayor es el trabajo,
     más ventaja saca. Ejecuciones secuenciales en la misma máquina:</p>
     <div class="tblwrap"><table>
       <thead><tr><th>Trabajo</th><th>nzbfast</th><th>NZBGet</th><th>SABnzbd</th></tr></thead>
@@ -105,7 +105,7 @@
       </tbody>
     </table></div>
     <p class="note" style="text-align:left">² Su huella máxima (volúmenes + salida desempaquetada
-    a la vez, ~156 GB) superó los 97 GB libres. Una sola pasada necesita 1× el tamaño del contenido -
+    a la vez, ~156 GB) superó los 97 GB libres. Una sola pasada necesita 1× el tamaño del contenido:
     reduce a la mitad el disco que necesitas, no solo el tiempo.</p>
   </div>
 </section>
@@ -122,7 +122,7 @@
       </tbody>
     </table></div>
     <p class="note" style="text-align:left">³ rustnzb descargó en 119 s, marcó el trabajo como
-    <i>Completado</i> - y entregó los volúmenes ofuscados en bruto: sin renombrado, sin extracción.
+    <i>Completado</i>, y entregó los volúmenes ofuscados en bruto: sin renombrado, sin extracción.
     nzbfast desofuscó a partir de los metadatos PAR2 y extrajo en el flujo, con cero bloques de relectura.</p>
   </div>
 </section>
@@ -160,15 +160,15 @@
     </div>
     <div class="callout">¿Por qué mostrar siquiera una derrota? Porque las victorias solo son creíbles junto a ella.
     Cada número de esta página procede de las mismas ejecuciones intercaladas, y el repo conserva todo
-    como un cuaderno de laboratorio completo - con los resultados negativos incluidos.</div>
+    como un cuaderno de laboratorio completo, con los resultados negativos incluidos.</div>
   </div>
 </section>
 
 <section>
   <div class="wrap">
     <p class="kicker">Escenario 6 · privado de RAM</p>
-    <h2>La escalera de baja memoria - 190 GB en ~1.1 GB de RAM</h2>
-    <p>Los mismos cuatro trabajos, reejecutados con presupuestos de memoria fijos de 2 GB, 1 GB y 256 MB -
+    <h2>La escalera de baja memoria: 190 GB en ~1.1 GB de RAM</h2>
+    <p>Los mismos cuatro trabajos, reejecutados con presupuestos de memoria fijos de 2 GB, 1 GB y 256 MB:
     lo que el autoajuste elegiría en un equipo de 8 GB, uno de 4 GB y un NAS de 2 GB. Cada
     tramo produjo un archivo correcto, totalmente verificado y extraído; el RSS pico siguió al
     <em>presupuesto</em>, no al trabajo. Tiempo hasta archivo usable, línea de 10 GbE:</p>
@@ -183,10 +183,10 @@
     </table></div>
     <p class="note" style="text-align:left">El sobrecoste del 20–40% en los trabajos grandes es un
     artefacto de 10 GbE: los bloques desbordados solo cuestan tiempo cuando la línea supera al disco. El
-    mismo trabajo de 87 GB con los mismos presupuestos en una línea de ~2.4 Gbps midió de −1% a +7% - ruido.
+    mismo trabajo de 87 GB con los mismos presupuestos en una línea de ~2.4 Gbps midió de −1% a +7%, ruido.
     En una conexión doméstica típica, un presupuesto pequeño es casi gratis a cualquier tamaño de trabajo. Un
     perfil NAS (2 conexiones, presupuesto de 256 MB) terminó el trabajo de 35 GB con 0.4 GB de RSS
-    pico - un NAS de 2 GB puede con esto. Ningún otro cliente ofrece siquiera un techo de memoria.</p>
+    pico. Un NAS de 2 GB puede con esto. Ningún otro cliente ofrece siquiera un techo de memoria.</p>
   </div>
 </section>
 
@@ -213,7 +213,7 @@
         <tr><td>plataformas</td><td class="yes">mac/win/linux/docker</td><td class="yes">mac/win/linux</td><td class="yes">mac/win/linux</td><td class="half">linux/win</td><td class="no">solo mac</td><td class="no">solo win</td></tr>
       </tbody>
     </table></div>
-    <p class="note" style="text-align:left">⁴ El desempaquetado directo sigue materializando primero los volúmenes -
+    <p class="note" style="text-align:left">⁴ El desempaquetado directo sigue materializando primero los volúmenes:
     2× escrituras y 2× disco. ⁵ rustnzb entregó volúmenes ofuscados marcados como «Completado» en nuestra ronda
     (su desempaquetado además se cuelga con el unrar de RARLab salvo que se desactive). ⁶ GPL-3.0-or-later.
     Usenapp/Newsbin son lectores comerciales de una sola plataforma con funciones de descarga; aparecen
@@ -227,15 +227,15 @@
     <h2>El motor satura líneas reales</h2>
     <ul class="plain">
       <li><b>8.31 Gbps agregados</b> en una línea de 10 GbE medida a 8.2 Gbps (M1 Ultra de Europa, 4 proveedores, 14,000 artículos, 0 errores, 0 reconexiones).</li>
-      <li><b>9.16–9.27 Gbps</b> de tics de transporte estables en la misma línea - ≈98% del goodput práctico de TCP.</li>
+      <li><b>9.16–9.27 Gbps</b> de tics de transporte estables en la misma línea, ≈98% del goodput práctico de TCP.</li>
       <li><b>5.44 Gbps sostenidos</b> a lo largo de un trabajo completo de 20.4 GB <i>incluida</i> la verificación en el flujo.</li>
-      <li><b>Pipelining replicado en cada RTT</b>: +64% a 63 ms en Starlink, +170–177% a 14 ms en centro de datos, +270% a 31 ms en costa este - vence el decaimiento de la ventana de congestión de TCP, no solo la latencia.</li>
-      <li><b>Prueba de contrapresión</b>: limita la etapa de escritura a 4× por debajo de la red y la entrada se fija al tope con ±1% en 2 s, la RAM <i>baja</i>, cero swaps - un disco lento nunca puede disparar la memoria.</li>
-      <li><b>Margen de cálculo</b>: techos medidos de decodificación+verificación de 86–165 Gbps en Apple silicon - la red es el cuello de botella por 4–50× en cada máquina probada.</li>
+      <li><b>Pipelining replicado en cada RTT</b>: +64% a 63 ms en Starlink, +170–177% a 14 ms en centro de datos, +270% a 31 ms en costa este. Vence el decaimiento de la ventana de congestión de TCP, no solo la latencia.</li>
+      <li><b>Prueba de contrapresión</b>: limita la etapa de escritura a 4× por debajo de la red y la entrada se fija al tope con ±1% en 2 s, la RAM <i>baja</i>, cero swaps. Un disco lento nunca puede disparar la memoria.</li>
+      <li><b>Margen de cálculo</b>: techos medidos de decodificación+verificación de 86–165 Gbps en Apple silicon. La red es el cuello de botella por 4–50× en cada máquina probada.</li>
     </ul>
     <div class="callout">Regla permanente del repo: <b>cada afirmación de rendimiento cita un comando
     reproducible y las condiciones en las que se ejecutó.</b> Todo vive en el repo como un cuaderno de laboratorio
-    fechado - con los resultados negativos y los caminos equivocados incluidos.</div>
+    fechado, con los resultados negativos y los caminos equivocados incluidos.</div>
   </div>
 </section>
 

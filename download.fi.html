@@ -42,7 +42,7 @@
 
 <div class="hero wrap" style="padding-bottom:6px">
   <h1>Yksi binääri. <em>Kaikki mukana.</em></h1>
-  <p class="sub">Jokainen koonti on yksi itsenäinen suoritettava tiedosto - korjaus (par2) ja
+  <p class="sub">Jokainen koonti on yksi itsenäinen suoritettava tiedosto: korjaus (par2) ja
   purku (RAR) ovat upotettuina. Pura, aja käynnistin, vastaa kolmeen kysymykseen, lataa.</p>
 </div>
 
@@ -51,7 +51,7 @@
     <div class="dl">
       <div class="card">
         <h3>🍎 macOS <span class="tag now">saatavilla</span></h3>
-        <p>NzbFast-sovellus - vedä Ohjelmiin ja mene. Universaali (Apple Silicon ja
+        <p>NzbFast-sovellus: vedä Ohjelmiin ja mene. Universaali (Apple Silicon ja
         Intel), koontinäyttö omassa ikkunassaan, .nzb-kaksoisnapsautus, käynnistys kirjautumisessa.</p>
         <p class="meta">macOS 12+ · ~16 MB DMG · sovellus + moottori</p>
         <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-macos.dmg">Lataa Mac-sovellus</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-macos-universal.zip">siirrettävä .zip</a></p>
@@ -59,14 +59,14 @@
       <div class="card">
         <h3>🪟 Windows <span class="tag now">saatavilla</span></h3>
         <p>Asennusohjelma pystyttää ilmaisinaluesovelluksen (ei konsoli-ikkunaa), Käynnistä-valikon merkinnän,
-        valinnaisen Windowsin-kanssa-käynnistyksen ja .nzb-kaksoisnapsautuksen. Täysin staattinen - ei asennettavaa
+        valinnaisen Windowsin-kanssa-käynnistyksen ja .nzb-kaksoisnapsautuksen. Täysin staattinen, ei asennettavaa
         ajoympäristöä; se voi myös omaksua olemassa olevan SABnzbd-määrityksesi.</p>
         <p class="meta">Windows 10/11 x64 · ~8 MB asennusohjelma</p>
         <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-setup-1.0.4.exe">Lataa asennusohjelma</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-windows-x64.zip">siirrettävä .zip</a></p>
       </div>
       <div class="card">
         <h3>🐧 Linux <span class="tag now">saatavilla</span></h3>
-        <p>Staattiset musl-koonnit x86_64:lle ja arm64:lle - seedboxit, VPS:t, mikä tahansa NAS SSH:lla,
+        <p>Staattiset musl-koonnit x86_64:lle ja arm64:lle: seedboxit, VPS:t, mikä tahansa NAS SSH:lla,
         Raspberry Pi 4/5. Ei glibc-versioruletttia.</p>
         <p class="meta">x86_64 · arm64 · systemd-yksikkö mukana</p>
         <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-linux-arm64.tar.gz">arm64</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-nas.zip">NAS-paketti</a></p>
@@ -80,7 +80,7 @@
       </div>
       <div class="card">
         <h3>📦 Synology <span class="tag now">saatavilla</span></h3>
-        <p>Toimii DSM 7:ssä <b>Container Managerin</b> kautta: hae <code>nzbfast</code> Registrystä, lataa, liitä kolme kansiota ja portti 6789. Ei muokattavaa asetustiedostoa - lisää palveluntarjoajasi hallintapaneelin tervetulopaneeliin.</p>
+        <p>Toimii DSM 7:ssä <b>Container Managerin</b> kautta: hae <code>nzbfast</code> Registrystä, lataa, liitä kolme kansiota ja portti 6789. Ei muokattavaa asetustiedostoa: lisää palveluntarjoajasi hallintapaneelin tervetulopaneeliin.</p>
         <p class="meta">DSM 7 · Intel- + ARM-mallit · <a href="synology.html">vaiheittainen opas →</a></p>
       </div>
       <div class="card">
@@ -92,7 +92,7 @@
 
     <div class="callout" style="margin-top:26px"><b>Latausten varmistaminen:</b> jokainen julkaisu toimittaa
     sha256-summat artefaktien vieressä julkaisusivulla. macOS-zipit säilyttävät suoritusbitit;
-    ensimmäinen käynnistys tyhjentää karanteenilipun puolestasi (käynnistinkomentosarja tekee sen - se on suurin osa
+    ensimmäinen käynnistys tyhjentää karanteenilipun puolestasi (käynnistinkomentosarja tekee sen: se on suurin osa
     siitä, mihin sitä tarvitaan).</div>
   </div>
 </section>
@@ -101,9 +101,9 @@
   <div class="wrap">
     <h2>Kaksi minuuttia ensimmäiseen lataukseen</h2>
     <ul class="plain">
-      <li><b>1.</b> Pura ja aja <code>Start nzbfast</code> (mac: .command, windows: .bat) - tai vain <code>./nzbfast setup</code> terminaalissa.</li>
+      <li><b>1.</b> Pura ja aja <code>Start nzbfast</code> (mac: .command, windows: .bat), tai vain <code>./nzbfast setup</code> terminaalissa.</li>
       <li><b>2.</b> Velho löytää olemassa olevan SABnzbd/NZBGet-määrityksen ja tarjoutuu käyttämään sitä; muuten se kysyy palveluntarjoajasi osoitteen, käyttäjänimen, salasanan ja yhteysmäärän.</li>
-      <li><b>3.</b> Koontinäyttö avautuu osoitteessa <code>http://localhost:6789</code>. Pudota .nzb minne tahansa sillä - tai osoita Sonarr/Radarr siihen SABnzbd-asiakkaana.</li>
+      <li><b>3.</b> Koontinäyttö avautuu osoitteessa <code>http://localhost:6789</code>. Pudota .nzb minne tahansa sillä, tai osoita Sonarr/Radarr siihen SABnzbd-asiakkaana.</li>
     </ul>
     <p class="note" style="text-align:left">Päivittäminen on yhden tiedoston korvaamista. Asetukset, jono ja
     historia asuvat määrityksesi vieressä ja selviävät uudelleenkäynnistyksistä ja päivityksistä.</p>
@@ -114,11 +114,11 @@
   <div class="wrap">
     <h2>Alustahuomiot</h2>
     <ul class="plain">
-      <li><b>Raspberry Pi / ARM NAS</b> - käytä Linuxin arm64-koontia. Moottorin SIMD-dekoodauksella on NEON-ytimet; Pi 5 kyllästää gigabitin pelivaralla.</li>
-      <li><b>Unraid</b> - asenna Community Apps -sovelluksista, kun malli on julkaistu (Docker-kuva alla); siihen asti lisää kuva käsin.</li>
-      <li><b>TrueNAS SCALE</b> - aja Docker-kuva mukautettuna sovelluksena.</li>
-      <li><b>FreeBSD / muut</b> - <code>cargo build --release</code> lähdekoodista odotetaan toimivan (rustls, ei OpenSSL:ää); virallisesti testaamaton. PAR2-korjaus ja RAR-purku ovat natiiveja kaikilla alustoilla.</li>
-      <li><b>Puhelimet</b> - ei mitään asennettavaa: koontinäytöllä on ensiluokkainen puhelinasettelu, ja nzb360/LunaSea yhdistyvät NZBGet-yhteensopivan API:n kautta.</li>
+      <li><b>Raspberry Pi / ARM NAS:</b> käytä Linuxin arm64-koontia. Moottorin SIMD-dekoodauksella on NEON-ytimet; Pi 5 kyllästää gigabitin pelivaralla.</li>
+      <li><b>Unraid:</b> asenna Community Apps -sovelluksista, kun malli on julkaistu (Docker-kuva alla); siihen asti lisää kuva käsin.</li>
+      <li><b>TrueNAS SCALE:</b> aja Docker-kuva mukautettuna sovelluksena.</li>
+      <li><b>FreeBSD / muut:</b> <code>cargo build --release</code> lähdekoodista odotetaan toimivan (rustls, ei OpenSSL:ää); virallisesti testaamaton. PAR2-korjaus ja RAR-purku ovat natiiveja kaikilla alustoilla.</li>
+      <li><b>Puhelimet:</b> ei mitään asennettavaa: koontinäytöllä on ensiluokkainen puhelinasettelu, ja nzb360/LunaSea yhdistyvät NZBGet-yhteensopivan API:n kautta.</li>
     </ul>
   </div>
 </section>
@@ -133,7 +133,7 @@
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
     </div>
   </div>
-  <p class="fine">Vapaa ohjelmisto, GPL-3.0-or-later. PAR2-korjaus ja RAR-purku ovat natiivia koodia binäärin sisällä - ei mukana toimitettuja kolmannen osapuolen työkaluja. sha256-tarkistussummat seuraavat kaikkia artefakteja.</p>
+  <p class="fine">Vapaa ohjelmisto, GPL-3.0-or-later. PAR2-korjaus ja RAR-purku ovat natiivia koodia binäärin sisällä, ei mukana toimitettuja kolmannen osapuolen työkaluja. sha256-tarkistussummat seuraavat kaikkia artefakteja.</p>
 </div></footer>
 
 </body>

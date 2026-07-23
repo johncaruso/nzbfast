@@ -42,7 +42,7 @@
 
 <div class="hero wrap" style="padding-bottom:6px">
   <h1>Un binario. <em>Todo incluido.</em></h1>
-  <p class="sub">Cada compilación es un único ejecutable autocontenido - la reparación (par2) y el
+  <p class="sub">Cada compilación es un único ejecutable autocontenido: la reparación (par2) y el
   desempaquetado (RAR) van integrados. Descomprime, ejecuta el lanzador, responde tres preguntas y descarga.</p>
 </div>
 
@@ -51,7 +51,7 @@
     <div class="dl">
       <div class="card">
         <h3>🍎 macOS <span class="tag now">disponible</span></h3>
-        <p>La app NzbFast - arrástrala a Aplicaciones y listo. Universal (Apple Silicon e
+        <p>La app NzbFast: arrástrala a Aplicaciones y listo. Universal (Apple Silicon e
         Intel), panel en su propia ventana, doble clic en .nzb, inicio al iniciar sesión.</p>
         <p class="meta">macOS 12+ · DMG de ~16 MB · app + motor</p>
         <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-macos.dmg">Descargar la app de Mac</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-macos-universal.zip">.zip portátil</a></p>
@@ -59,14 +59,14 @@
       <div class="card">
         <h3>🪟 Windows <span class="tag now">disponible</span></h3>
         <p>El instalador configura una app en la bandeja (sin ventana de consola), una entrada en el menú Inicio,
-        arranque con Windows opcional y doble clic en .nzb. Totalmente estático - sin runtime
+        arranque con Windows opcional y doble clic en .nzb. Totalmente estático, sin runtime
         que instalar; también puede adoptar tu configuración existente de SABnzbd.</p>
         <p class="meta">Windows 10/11 x64 · instalador de ~8 MB</p>
         <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-setup-1.0.4.exe">Descargar el instalador</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-windows-x64.zip">.zip portátil</a></p>
       </div>
       <div class="card">
         <h3>🐧 Linux <span class="tag now">disponible</span></h3>
-        <p>Compilaciones estáticas con musl para x86_64 y arm64 - seedboxes, VPS, cualquier NAS con SSH,
+        <p>Compilaciones estáticas con musl para x86_64 y arm64: seedboxes, VPS, cualquier NAS con SSH,
         Raspberry Pi 4/5. Sin ruleta de versiones de glibc.</p>
         <p class="meta">x86_64 · arm64 · unidad systemd incluida</p>
         <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-linux-arm64.tar.gz">arm64</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-nas.zip">paquete NAS</a></p>
@@ -92,7 +92,7 @@
 
     <div class="callout" style="margin-top:26px"><b>Verificar las descargas:</b> cada versión incluye
     sumas sha256 junto a los artefactos en la página de versiones. Los zip de macOS conservan los bits de ejecución;
-    el primer arranque borra por ti la marca de cuarentena (lo hace el script del lanzador - es la mayor parte
+    el primer arranque borra por ti la marca de cuarentena (lo hace el script del lanzador: es la mayor parte
     de su función).</div>
   </div>
 </section>
@@ -101,9 +101,9 @@
   <div class="wrap">
     <h2>Dos minutos hasta la primera descarga</h2>
     <ul class="plain">
-      <li><b>1.</b> Descomprime y ejecuta <code>Start nzbfast</code> (mac: .command, windows: .bat) - o simplemente <code>./nzbfast setup</code> en un terminal.</li>
+      <li><b>1.</b> Descomprime y ejecuta <code>Start nzbfast</code> (mac: .command, windows: .bat), o simplemente <code>./nzbfast setup</code> en un terminal.</li>
       <li><b>2.</b> El asistente encuentra una configuración existente de SABnzbd/NZBGet y se ofrece a usarla; si no, te pide el host, el usuario, la contraseña y el número de conexiones de tu proveedor.</li>
-      <li><b>3.</b> El panel se abre en <code>http://localhost:6789</code>. Suelta un .nzb en cualquier parte - o apunta Sonarr/Radarr hacia él como cliente SABnzbd.</li>
+      <li><b>3.</b> El panel se abre en <code>http://localhost:6789</code>. Suelta un .nzb en cualquier parte, o apunta Sonarr/Radarr hacia él como cliente SABnzbd.</li>
     </ul>
     <p class="note" style="text-align:left">Actualizar es reemplazar un archivo. Los ajustes, la cola y el
     historial viven junto a tu configuración y sobreviven a reinicios y actualizaciones.</p>
@@ -114,11 +114,11 @@
   <div class="wrap">
     <h2>Notas por plataforma</h2>
     <ul class="plain">
-      <li><b>Raspberry Pi / NAS ARM</b> - usa la compilación Linux arm64. La decodificación SIMD del motor tiene kernels NEON; una Pi 5 satura el gigabit con margen de sobra.</li>
-      <li><b>Unraid</b> - instálalo desde Community Apps cuando se publique la plantilla (con la imagen Docker por debajo); hasta entonces, añade la imagen manualmente.</li>
-      <li><b>TrueNAS SCALE</b> - ejecuta la imagen Docker como una app personalizada.</li>
-      <li><b>FreeBSD / otros</b> - se espera que <code>cargo build --release</code> desde el código funcione (rustls, sin OpenSSL); oficialmente sin probar. La reparación PAR2 y la extracción RAR son nativas en todas las plataformas.</li>
-      <li><b>Teléfonos</b> - nada que instalar: el panel tiene un diseño para móvil de primera clase, y nzb360/LunaSea se conectan mediante la API compatible con NZBGet.</li>
+      <li><b>Raspberry Pi / NAS ARM:</b> usa la compilación Linux arm64. La decodificación SIMD del motor tiene kernels NEON; una Pi 5 satura el gigabit con margen de sobra.</li>
+      <li><b>Unraid:</b> instálalo desde Community Apps cuando se publique la plantilla (con la imagen Docker por debajo); hasta entonces, añade la imagen manualmente.</li>
+      <li><b>TrueNAS SCALE:</b> ejecuta la imagen Docker como una app personalizada.</li>
+      <li><b>FreeBSD / otros:</b> se espera que <code>cargo build --release</code> desde el código funcione (rustls, sin OpenSSL); oficialmente sin probar. La reparación PAR2 y la extracción RAR son nativas en todas las plataformas.</li>
+      <li><b>Teléfonos:</b> nada que instalar: el panel tiene un diseño para móvil de primera clase, y nzb360/LunaSea se conectan mediante la API compatible con NZBGet.</li>
     </ul>
   </div>
 </section>
@@ -133,7 +133,7 @@
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
     </div>
   </div>
-  <p class="fine">Software libre, GPL-3.0-or-later. La reparación PAR2 y la extracción RAR son código nativo dentro del binario - sin herramientas de terceros incluidas. Las sumas de verificación sha256 acompañan a todos los artefactos.</p>
+  <p class="fine">Software libre, GPL-3.0-or-later. La reparación PAR2 y la extracción RAR son código nativo dentro del binario, sin herramientas de terceros incluidas. Las sumas de verificación sha256 acompañan a todos los artefactos.</p>
 </div></footer>
 
 </body>

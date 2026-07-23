@@ -45,7 +45,7 @@
   <p class="sub">nzbfast, tek bir geçiş etrafında kurulmuş bir Usenet indiricisidir:
   her bayt <b>indirilirken</b> kod çözülür, doğrulanır ve çıkarılır. Sonrasında bir
   birleştirme geçişi yoktur; iş bittiğinde doğrulanacak ya da açılacak hiçbir şey
-  kalmaz - ilerleme çubuğu dolduğu anda dosya tamamlanmış ve kanıtlanabilir biçimde sağlamdır.</p>
+  kalmaz. İlerleme çubuğu dolduğu anda dosya tamamlanmış ve kanıtlanabilir biçimde sağlamdır.</p>
   <div class="chips">
     <span class="chip">10&nbsp;GbE bir hatta <b>8.31&nbsp;Gbps</b></span>
     <span class="chip"><b>190&nbsp;GB → 4m44s</b> doğrulanmış dosyaya</span>
@@ -57,7 +57,7 @@
     <a class="btn" href="download.tr.html">İndir</a>
     <a class="btn ghost" href="benchmarks.tr.html">Rakamları gör</a>
   </div>
-  <p class="note">macOS · Windows · Linux · Docker - kendi kendine yeten tek çalıştırılabilir dosya, onarım ve açma araçları gömülü.</p>
+  <p class="note">macOS · Windows · Linux · Docker: kendi kendine yeten tek çalıştırılabilir dosya, onarım ve açma araçları gömülü.</p>
   <figure class="shot heroShot"><img src="assets/dash-hero.png" alt="nzbfast paneli indirmenin ortasında 61 MB/s'de: tam bir geçmiş grafiğinde 104 MB/s'de zirve yapan verim, canlı kaynak ve sağlayıcı başına grafikler ve örtüşen indirme/doğrulama/çıkarma işlem hattı aşamaları"></figure>
 </div>
 
@@ -65,18 +65,18 @@
   <div class="wrap">
     <p class="kicker">Neden hızlı</p>
     <h2>Yaygın istemcilerin tam kullanmadığı üç fikir</h2>
-    <p class="lead">Mikro optimizasyon değil - mimari. Her biri
+    <p class="lead">Mikro optimizasyon değil, mimari. Her biri
     <a href="benchmarks.tr.html">kıyaslama günlüğünde</a> yeniden üretilebilir komutlarla ölçülür.</p>
     <div class="grid3">
       <div class="card"><span class="ic">🔁</span><h3>İşlem hattı NNTP</h3>
         <p>Bağlantı başına birkaç makale isteği uçuşta kalır, böylece gidiş-dönüşler soketi
-        asla boşa çıkarmaz - ve TCP makaleler arasında tıkanıklık penceresini asla düşürmez.
+        asla boşa çıkarmaz ve TCP makaleler arasında tıkanıklık penceresini asla düşürmez.
         Dört sitede seriye karşı +%12 ile +%270 ölçüldü; bir hat 30–50 yerine 8
         bağlantıyla doyar.</p></div>
       <div class="card"><span class="ic">🚿</span><h3>Tek geçişli işlem hattı</h3>
         <p>Makaleler yerinde SIMD ile kod çözülür, son ofsetlerinde bir kez yazılır,
         kod çözme tamponlarından PAR2 ile doğrulanır ve depolama modu RAR içeriği
-        indirme <i>sırasında</i> çıkarılır - birimler dosya olarak hiç var olmaz.
+        indirme <i>sırasında</i> çıkarılır. Birimler dosya olarak hiç var olmaz.
         Disk yazmaları = içerik × 1.0.</p></div>
       <div class="card"><span class="ic">🕸️</span><h3>Birleşim kullanılabilirliği</h3>
         <p>Bir makale yalnızca yapılandırılmış <i>her</i> backbone onu reddettiğinde
@@ -92,7 +92,7 @@
     <p class="kicker">İşlem hattı</p>
     <h2>Her bayta bir kez dokun</h2>
     <p class="lead">Rakipler arşiv birimlerini yazar, doğrulamak için geri okur, çıkarmak
-    için yeniden okur, sonra çıktıyı yazar - kabaca 2× yazma ve 2× okuma.
+    için yeniden okur, sonra çıktıyı yazar, kabaca 2× yazma ve 2× okuma.
     nzbfast bunun yerine şunu yapar:</p>
     <div class="pipe"><pre>
 socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place - 4.95 GB/s per core)
@@ -109,7 +109,7 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place - 4.95 GB/s per
     bilinir, kurtarma birimlerinin <b>tam-oturan en azı</b> indirme <b>sırasında</b> getirilir
     (kıyaslama turunda 20 gereken için 22 blok getirildi) ve onarım yalnızca hasarlı
     aralıklara dokunur. İmkânsız gönderi mi? Neredeyse hiçbir şey indirmeden saniyeler içinde
-    durur - kotan fark etmeden.</div>
+    durur, kotan fark etmeden.</div>
   </div>
 </section>
 
@@ -117,22 +117,22 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place - 4.95 GB/s per
   <div class="wrap">
     <p class="kicker">Öne çıkan özellikler</p>
     <h2>Ciddi bir kurulumun ihtiyaç duyduğu her şey</h2>
-    <p class="lead">Tam liste - her ayar düğmesi, her tümleştirme -
+    <p class="lead">Tam liste (her ayar düğmesi, her tümleştirme)
     <a href="features.tr.html">özellikler sayfasında</a>.</p>
     <div class="grid2">
       <ul class="feat">
-        <li><b>Hat hızında indirmeler</b> <span class="d">- işlem hattı NNTP, 10 GbE'de 8.31 Gbps'de ölçüldü; her temiz kıyaslama ayağında, her boyutta en hızlı istemci.</span></li>
-        <li><b>Tek geçişli işlem hattı</b> <span class="d">- kod çözme, doğrulama ve çıkarma örtüşür; depolama modu RAR birimleri diske hiç değmez; diğerlerinin ~2× ihtiyaç duyduğu yerde 1× disk ister.</span></li>
-        <li><b>Çoklu sağlayıcı birleşim kullanılabilirliği</b> <span class="d">- backbone'lar arası blok kesinlikli yönlendirme; ön uçuş kararları; tam-oturan onarım; imkânsız gönderilerin erken durdurulması.</span></li>
-        <li><b>Bellek bütçesi</b> <span class="d">- nazik dökülme katmanlarıyla tek bir küresel RAM bütçesi. Makineni asla takasa sokmaz: 190 GB'lık bir iş 1 GB bütçenin içinde tamamlanır (~1.1 GB zirve RSS).</span></li>
-        <li><b>Çökmeye dayanıklı sürdürme</b> <span class="d">- makale düzeyinde bir günlük sayesinde indirme ortasında bir çökme ya da kill −9 neredeyse hiçbir şeye mal olmaz: kaldığı yerden devam eder, yalnızca kaydedilmeyeni yeniden getirir.</span></li>
+        <li><b>Hat hızında indirmeler:</b> <span class="d">işlem hattı NNTP, 10 GbE'de 8.31 Gbps'de ölçüldü; her temiz kıyaslama ayağında, her boyutta en hızlı istemci.</span></li>
+        <li><b>Tek geçişli işlem hattı:</b> <span class="d">kod çözme, doğrulama ve çıkarma örtüşür; depolama modu RAR birimleri diske hiç değmez; diğerlerinin ~2× ihtiyaç duyduğu yerde 1× disk ister.</span></li>
+        <li><b>Çoklu sağlayıcı birleşim kullanılabilirliği:</b> <span class="d">backbone'lar arası blok kesinlikli yönlendirme; ön uçuş kararları; tam-oturan onarım; imkânsız gönderilerin erken durdurulması.</span></li>
+        <li><b>Bellek bütçesi:</b> <span class="d">nazik dökülme katmanlarıyla tek bir küresel RAM bütçesi. Makineni asla takasa sokmaz: 190 GB'lık bir iş 1 GB bütçenin içinde tamamlanır (~1.1 GB zirve RSS).</span></li>
+        <li><b>Çökmeye dayanıklı sürdürme:</b> <span class="d">makale düzeyinde bir günlük sayesinde indirme ortasında bir çökme ya da kill −9 neredeyse hiçbir şeye mal olmaz: kaldığı yerden devam eder, yalnızca kaydedilmeyeni yeniden getirir.</span></li>
       </ul>
       <ul class="feat">
-        <li><b>Tak-çalıştır API'ler</b> <span class="d">- SABnzbd uyumlu API ve NZBGet JSON-RPC: Sonarr, Radarr, nzb360 ve LunaSea değişmeden çalışır. SAB/NZBGet yapılandırmanı tek tıkla içe aktar.</span></li>
-        <li><b>Gömülü dizinleyici</b> <span class="d">- haber gruplarını aranabilir bir yerel dizine tarar, Newznab sunar, böylece *arr yığının da onu arayabilir.</span></li>
-        <li><b>Anahtarsız meta verili poster duvarı</b> <span class="d">- dizinindeki her şey için görseller, puanlar, oyuncular ve özetler; kaydolman gereken hiçbir API anahtarı olmadan.</span></li>
-        <li><b>İzleme listesi otomasyonu</b> <span class="d">- bir diziyi ya da filmi adlandır (yayınlanmış olsun ya da olmasın); belirdiği an yakalanır, sonra hedefine ulaşana dek kalitesi yükseltilir.</span></li>
-        <li><b>Tek bir çalıştırılabilir dosya</b> <span class="d">- onarım (par2) ve açma (RAR) ikili dosyanın içinde gider. Aç, çalıştır, bitti.</span></li>
+        <li><b>Tak-çalıştır API'ler:</b> <span class="d">SABnzbd uyumlu API ve NZBGet JSON-RPC: Sonarr, Radarr, nzb360 ve LunaSea değişmeden çalışır. SAB/NZBGet yapılandırmanı tek tıkla içe aktar.</span></li>
+        <li><b>Gömülü dizinleyici:</b> <span class="d">haber gruplarını aranabilir bir yerel dizine tarar, Newznab sunar, böylece *arr yığının da onu arayabilir.</span></li>
+        <li><b>Anahtarsız meta verili poster duvarı:</b> <span class="d">dizinindeki her şey için görseller, puanlar, oyuncular ve özetler; kaydolman gereken hiçbir API anahtarı olmadan.</span></li>
+        <li><b>İzleme listesi otomasyonu:</b> <span class="d">bir diziyi ya da filmi adlandır (yayınlanmış olsun ya da olmasın); belirdiği an yakalanır, sonra hedefine ulaşana dek kalitesi yükseltilir.</span></li>
+        <li><b>Tek bir çalıştırılabilir dosya:</b> <span class="d">onarım (par2) ve açma (RAR) ikili dosyanın içinde gider. Aç, çalıştır, bitti.</span></li>
       </ul>
     </div>
   </div>
@@ -143,7 +143,7 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place - 4.95 GB/s per
     <p class="kicker">Kıyaslamalar</p>
     <h2>190.6 GB → doğrulanmış 167.9 GB'lık bir dosya</h2>
     <p class="lead">Aynı makine, aynı altı sağlayıcı, art arda iç içe çalıştırmalar.
-    Kullanılabilir, çıkarılmış bir dosya var olana kadar geçen süre - önemli olan tek ölçüt.
+    Kullanılabilir, çıkarılmış bir dosya var olana kadar geçen süre, önemli olan tek ölçüt.
     Her rakip belgelenmiş en iyisine ince ayar edildi (SABnzbd'nin işlem hatlamasını
     <i>açmak</i> dahil, ki onsuz gönderiliyor).</p>
     <div class="bars">
@@ -153,7 +153,7 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place - 4.95 GB/s per
       <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">kullanılabilir dosya yok</span></div>
     </div>
     <p class="note" style="text-align:left">190.6 GB NZB → tek 167.9 GB mkv, 10 GbE'de M1 Ultra, 6 sağlayıcı × 8 bağlantı.
-    Aynı iş 1 GB bellek bütçesinin içinde tamamlanır. Tam tablolar, altı senaryo ve <i>kazanamadığımız</i> tek ayak - ayrıca nasıl yeniden üretileceği -
+    Aynı iş 1 GB bellek bütçesinin içinde tamamlanır. Tam tablolar, altı senaryo ve <i>kazanamadığımız</i> tek ayak (ayrıca nasıl yeniden üretileceği)
     <a href="benchmarks.tr.html">kıyaslamalar sayfasında</a>.</p>
   </div>
 </section>
@@ -163,14 +163,14 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place - 4.95 GB/s per
     <p class="kicker">Vitrin</p>
     <h2>Dizinin, bir poster duvarı olarak sunuldu</h2>
     <p class="lead">Gömülü dizinleyici önem verdiğin haber gruplarını tarar; duvar
-    sonucu posterlere, puanlara, oyunculara ve bölüm ızgaralarına çevirir - yalnızca
+    sonucu posterlere, puanlara, oyunculara ve bölüm ızgaralarına çevirir, yalnızca
     anahtarsız açık kaynakları kullanarak, kendi kurulumunca getirilir. İndirmek için bir
     bölüm çipine tıkla.</p>
     <figure class="shot"><img src="assets/wall-grid.jpg" alt="nzbfast poster duvarı: kalite rozetleri, puanlar ve sezon sayılarıyla bir TV posterleri ızgarası" loading="lazy"></figure>
     <div style="height:18px"></div>
     <div class="strip">
       <figure><div class="shot"><img src="assets/wall-sheet.jpg" alt="Bir dizi için ayrıntı sayfası: arka plan, IMDb puanı, oyuncular, özet, bölüm başına indirme çipleri" loading="lazy"></div>
-        <figcaption>Puanlar, oyuncular, özet, bölüm ızgarası - hiç, ama hiç API anahtarı yok.</figcaption></figure>
+        <figcaption>Puanlar, oyuncular, özet, bölüm ızgarası. Hiç, ama hiç API anahtarı yok.</figcaption></figure>
       <figure><div class="shot"><img src="assets/dash-queue-drawer.png" alt="İndirme başına ayrıntı çekmecesi olan kuyruk: dosya başına ilerleme çubukları, doğrulama blokları, sunucu başına katkı" loading="lazy"></div>
         <figcaption>Her indirme dosya başına ilerleme, canlı doğrulama durumu ve sunucu başına katkıya açılır.</figcaption></figure>
     </div>
@@ -182,7 +182,7 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place - 4.95 GB/s per
     <p class="kicker">Yığınına uyar</p>
     <h2>Mevcut araçlarını ona yönlendir</h2>
     <div class="grid3">
-      <div class="card"><h3>Sonarr / Radarr</h3><p>Tam SABnzbd uyumlu API - nzbfast'i bir
+      <div class="card"><h3>Sonarr / Radarr</h3><p>Tam SABnzbd uyumlu API, nzbfast'i bir
         "SABnzbd" indirme istemcisi olarak ekle ve öylece çalışır: yakalamalar, kategoriler,
         öncelikler, yeniden denemeler, son işlem betikleri (SAB_* sözleşmesi), geçmiş. Newznab
         cephesi ayrıca *arr'ların <i>yerel dizinini</i> bir dizinleyiciymiş gibi
@@ -222,9 +222,9 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place - 4.95 GB/s per
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
     </div>
   </div>
-  <p class="fine">Özgür yazılım, GPL-3.0-or-later. PAR2 onarımı ve RAR açma, ikili dosyanın içinde yerleşik koddur - paketlenmiş üçüncü taraf araç yok. Poster duvarı meta verisi, kendi kurulumunca getirilen
+  <p class="fine">Özgür yazılım, GPL-3.0-or-later. PAR2 onarımı ve RAR açma, ikili dosyanın içinde yerleşik koddur, paketlenmiş üçüncü taraf araç yok. Poster duvarı meta verisi, kendi kurulumunca getirilen
   anahtarsız açık kaynaklardan gelir (TVmaze, iTunes Search, açık veri kümeleri, Wikidata, Wikipedia,
-  AniList). nzbfast ona söylediğini indirir - bunun ne olduğundan sen sorumlusun.</p>
+  AniList). nzbfast ona söylediğini indirir. Bunun ne olduğundan sen sorumlusun.</p>
 </div></footer>
 
 </body>
