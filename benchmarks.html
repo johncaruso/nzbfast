@@ -53,8 +53,8 @@
     <h2>The setup</h2>
     <ul class="plain">
       <li><b>Clients:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (the closest Rust peer), all on the same machine per scenario (Apple M-series boxes: "Europe" M1 Ultra on 10&nbsp;GbE, "East Coast" M3 Ultra ~2.4–3.0 Gbps line).</li>
-      <li><b>Fairness:</b> same 6 providers × 8 connections, TLS everywhere, legs run back-to-back interleaved. Every competitor tuned to its documented best: SABnzbd got <code>pipelining_requests=8</code> (<b>it ships 1 - i.e. unpipelined</b>; that setting alone took its 190 GB time from 24m24s to 19m02s), NZBGet got ArticleCache/DirectWrite/DirectUnpack/ParQuick, rustnzb its documented config.</li>
-      <li><b>End state:</b> a verified, extracted, usable file - not "download finished". That's what you actually wait for.</li>
+      <li><b>Fairness:</b> same 6 providers × 8 connections, TLS everywhere, legs run back-to-back interleaved. Every competitor tuned to its documented best: SABnzbd got <code>pipelining_requests=8</code> (<b>it ships 1, i.e. unpipelined</b>; that setting alone took its 190 GB time from 24m24s to 19m02s), NZBGet got ArticleCache/DirectWrite/DirectUnpack/ParQuick, rustnzb its documented config.</li>
+      <li><b>End state:</b> a verified, extracted, usable file, not "download finished". That's what you actually wait for.</li>
       <li><b>Reproducibility:</b> every claim traces to a dated entry in our benchmark log, recorded with the driver scripts that produced it: wall-clock + interface byte counters + process-tree peak RSS, 1–2 s resolution.</li>
     </ul>
   </div>
@@ -79,12 +79,12 @@
       </tbody>
     </table></div>
     <p class="note" style="text-align:start">¹ rustnzb reported the job done at 5m 42s having pulled
-    186.6 GB - 10% more wire than anyone - but left <b>no output file at all</b>. It also failed
+    186.6 GB (10% more wire than anyone) but left <b>no output file at all</b>. It also failed
     this scenario in the previous round ("121,975 articles missing", 71 GB orphaned).
     · ² nzbfast's memory follows its <em>configured budget</em>, not the job: this leg ran the
     default auto budget; capped at <b>1 GB</b> the same 190 GB job still completes, about 22%
-    slower - see the low-memory ladder below. On the earlier East Coast round (~2.4–3 Gbps line) the
-    same scenario ran 9m 00s vs NZBGet +30% and SABnzbd +111% - the gap holds across line speeds.</p>
+    slower (see the low-memory ladder below). On the earlier East Coast round (~2.4–3 Gbps line) the
+    same scenario ran 9m 00s vs NZBGet +30% and SABnzbd +111%. The gap holds across line speeds.</p>
   </div>
 </section>
 
@@ -92,7 +92,7 @@
   <div class="wrap">
     <p class="kicker">Scenario 2 · the gap grows with size</p>
     <h2>Time to usable file, by job size</h2>
-    <p class="lead">One-pass means no post-download verify/unpack pass - so the bigger the job,
+    <p class="lead">One-pass means no post-download verify/unpack pass, so the bigger the job,
     the further ahead it lands. Same-machine sequential runs:</p>
     <div class="tblwrap"><table>
       <thead><tr><th>Job</th><th>nzbfast</th><th>NZBGet</th><th>SABnzbd</th></tr></thead>
@@ -122,7 +122,7 @@
       </tbody>
     </table></div>
     <p class="note" style="text-align:start">³ rustnzb downloaded in 119 s, marked the job
-    <i>Completed</i> - and shipped the raw obfuscated volumes: no rename, no extraction.
+    <i>Completed</i>, and shipped the raw obfuscated volumes: no rename, no extraction.
     nzbfast deobfuscated from PAR2 metadata and extracted in-stream, zero read-back blocks.</p>
   </div>
 </section>
@@ -155,19 +155,19 @@
       <div class="card"><h3>Damaged store-mode post</h3>
         <p>20 poisoned articles in a 7.4 GB REMUX: NZBGet finishes usable in <b>53 s</b>, nzbfast
         in <b>58 s</b>. Our repair completes in 32 s, re-extracts all 62 volumes, and the output is
-        byte-exact - and it pulls a near-theoretical-minimum 22 recovery blocks for the 20 needed,
+        byte-exact, and it pulls a near-theoretical-minimum 22 recovery blocks for the 20 needed,
         against NZBGet's full PAR2 pass. But NZBGet takes the leg by five seconds, so here it is.</p></div>
     </div>
     <div class="callout">Why show a loss at all? Because the wins are only believable next to it.
     Every number on this page comes from the same interleaved runs, and the repo keeps the whole
-    thing as a full lab notebook - negative results included.</div>
+    thing as a full lab notebook, negative results included.</div>
   </div>
 </section>
 
 <section>
   <div class="wrap">
     <p class="kicker">Scenario 6 · starve it of RAM</p>
-    <h2>The low-memory ladder - 190 GB in ~1.1 GB of RAM</h2>
+    <h2>The low-memory ladder: 190 GB in ~1.1 GB of RAM</h2>
     <p>The same four jobs, re-run at hard memory budgets of 2 GB, 1 GB and 256 MB -
     what the auto-sizer would pick on an 8 GB box, a 4 GB box, and a 2 GB NAS. Every
     leg produced a correct, fully verified, extracted file; peak RSS tracked the
@@ -183,10 +183,10 @@
     </table></div>
     <p class="note" style="text-align:start">The 20–40% premium on the big jobs is a
     10 GbE artifact: spilled blocks only cost time when the line outruns the disk. The
-    same 87 GB job at the same budgets on a ~2.4 Gbps line measured −1% to +7% - noise.
+    same 87 GB job at the same budgets on a ~2.4 Gbps line measured −1% to +7%, noise.
     On a typical home connection a small budget is close to free at any job size. A
     NAS profile (2 connections, 256 MB budget) finished the 35 GB job in 0.4 GB peak
-    RSS - a 2 GB NAS can run this. No other client offers a memory ceiling at all.</p>
+    RSS. A 2 GB NAS can run this. No other client offers a memory ceiling at all.</p>
   </div>
 </section>
 
@@ -227,15 +227,15 @@
     <h2>The engine saturates real lines</h2>
     <ul class="plain">
       <li><b>8.31 Gbps aggregate</b> on a measured-8.2 Gbps 10 GbE line (Europe M1 Ultra, 4 providers, 14,000 articles, 0 errors, 0 reconnects).</li>
-      <li><b>9.16–9.27 Gbps</b> steady transport ticks on the same line - ≈98% of practical TCP goodput.</li>
+      <li><b>9.16–9.27 Gbps</b> steady transport ticks on the same line, ≈98% of practical TCP goodput.</li>
       <li><b>5.44 Gbps sustained</b> through a full 20.4 GB job <i>including</i> in-stream verification.</li>
-      <li><b>Pipelining replicated at every RTT</b>: +64% at 63 ms Starlink, +170–177% at 14 ms datacenter, +270% at 31 ms East Coast - it defeats TCP congestion-window decay, not just latency.</li>
-      <li><b>Backpressure proof</b>: cap the write stage 4× below the network and input locks to the cap ±1% within 2 s, RAM <i>falls</i>, zero swaps - a slow disk can never balloon memory.</li>
-      <li><b>Compute headroom</b>: measured decode+verify ceilings of 86–165 Gbps on Apple silicon - the network is the bottleneck by 4–50× on every machine tested.</li>
+      <li><b>Pipelining replicated at every RTT</b>: +64% at 63 ms Starlink, +170–177% at 14 ms datacenter, +270% at 31 ms East Coast. It defeats TCP congestion-window decay, not just latency.</li>
+      <li><b>Backpressure proof</b>: cap the write stage 4× below the network and input locks to the cap ±1% within 2 s, RAM <i>falls</i>, zero swaps. A slow disk can never balloon memory.</li>
+      <li><b>Compute headroom</b>: measured decode+verify ceilings of 86–165 Gbps on Apple silicon. The network is the bottleneck by 4–50× on every machine tested.</li>
     </ul>
     <div class="callout">Standing rule from the repo: <b>every perf claim cites a reproducible
     command and the conditions it ran under.</b> The whole thing lives in the repo as a dated
-    lab notebook - negative results and wrong turns included.</div>
+    lab notebook, negative results and wrong turns included.</div>
   </div>
 </section>
 

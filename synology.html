@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Install on Synology - nzbfast</title>
-<meta name="description" content="Install nzbfast on a Synology NAS with Container Manager - search, download, map three folders, done. Step-by-step guide for DSM 7 (Intel and ARM models).">
+<meta name="description" content="Install nzbfast on a Synology NAS with Container Manager: search, download, map three folders, done. Step-by-step guide for DSM 7 (Intel and ARM models).">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
 <style>
@@ -40,7 +40,7 @@
 <div class="hero wrap" style="padding-bottom:6px">
   <h1>nzbfast on <em>Synology</em></h1>
   <p class="sub">One container gives you the full dashboard, the SABnzbd/NZBGet API for
-  Sonarr &amp; Radarr, and the built-in indexer. Search, download, map three folders - done.</p>
+  Sonarr &amp; Radarr, and the built-in indexer. Search, download, map three folders, done.</p>
 </div>
 
 <section style="padding-top:20px">
@@ -50,7 +50,7 @@
     both Intel and ARM Synology models.</p>
     <div class="callout"><b>Two registries, one image.</b> The identical image lives on Docker Hub as
     <code>nzbfast/nzbfast</code> (the one Container Manager can search) and on GitHub as
-    <code>ghcr.io/nzbfast/nzbfast</code>. Use whichever you like - this guide uses the Docker Hub name.</div>
+    <code>ghcr.io/nzbfast/nzbfast</code>. Use whichever you like. This guide uses the Docker Hub name.</div>
   </div>
 </section>
 
@@ -64,7 +64,7 @@
       <li><h3>Read your IDs</h3><p>SSH in and run:</p>
         <pre class="cmd">id your_dsm_username</pre>
         <p>Note the <code>uid=</code> and <code>gid=</code> numbers. On most Synology boxes the first user
-        is <code>uid=1026</code> and the group <code>users</code> is <code>gid=100</code> - but use whatever
+        is <code>uid=1026</code> and the group <code>users</code> is <code>gid=100</code>, but use whatever
         <code>id</code> prints. You can turn SSH back off afterwards.</p></li>
     </ol>
   </div>
@@ -72,7 +72,7 @@
 
 <section>
   <div class="wrap">
-    <h2>Route A - Container Manager <span class="tag now" style="vertical-align:middle">easiest</span></h2>
+    <h2>Route A: Container Manager <span class="tag now" style="vertical-align:middle">easiest</span></h2>
     <p class="lead-guide">Best for most people. No text files.</p>
     <ol class="steps">
       <li><h3>Make the folders</h3>
@@ -92,7 +92,7 @@
         <ul>
           <li><b>General:</b> turn on <i>Enable auto-restart</i>.</li>
           <li><b>Port:</b> map local <b>6789</b> → container <b>6789</b> (change the local side only if 6789 is taken).</li>
-          <li><b>Volumes</b> - add three folder mounts:</li>
+          <li><b>Volumes:</b> add three folder mounts:</li>
         </ul>
         <div class="tbl"><table>
           <thead><tr><th>Folder (on your NAS)</th><th>Mount path</th></tr></thead>
@@ -102,7 +102,7 @@
             <tr><td><code>/docker/nzbfast/watch</code></td><td><code>/watch</code></td></tr>
           </tbody>
         </table></div>
-        <ul><li><b>Environment</b> - add these variables:</li></ul>
+        <ul><li><b>Environment:</b> add these variables:</li></ul>
         <div class="tbl"><table>
           <thead><tr><th>Variable</th><th>Value</th></tr></thead>
           <tbody>
@@ -119,7 +119,7 @@
 
 <section class="alt">
   <div class="wrap">
-    <h2>Route B - Container Manager Project</h2>
+    <h2>Route B: Container Manager Project</h2>
     <p class="lead-guide">Prefer one file you can back up? Container Manager → <b>Project</b> → <b>Create</b>,
     name it <code>nzbfast</code>, path <code>/docker/nzbfast</code>, source <i>Create docker-compose.yml</i>, and paste:</p>
     <pre class="cmd">services:
@@ -145,9 +145,9 @@
 
 <section id="firstrun">
   <div class="wrap">
-    <h2>First run - add your provider</h2>
+    <h2>First run: add your provider</h2>
     <p class="lead-guide">There is <b>no config file to edit.</b> Open <code>http://YOUR_NAS_IP:6789</code>.
-    A <b>Welcome</b> panel asks for your Usenet server - enter the host, username, password and connection
+    A <b>Welcome</b> panel asks for your Usenet server. Enter the host, username, password and connection
     count from your provider's welcome email and save. It applies immediately, no restart. Drop an
     <code>.nzb</code> on the dashboard (or into the <code>watch</code> folder) and it downloads.</p>
   </div>
@@ -160,12 +160,12 @@
     <b>Host</b> = your NAS IP, <b>Port</b> = <code>6789</code>, <b>API Key</b> = the value you set in
     <code>NZBFAST_APIKEY</code>. It also exposes the NZBGet JSON-RPC API, so nzb360 / LunaSea connect the same way.</p>
     <h2 style="margin-top:34px">Updating</h2>
-    <p class="lead-guide">The image is the update channel - you update by pulling a newer image. Your
+    <p class="lead-guide">The image is the update channel. You update by pulling a newer image. Your
     <code>config</code> and <code>downloads</code> survive because they live in your NAS folders, not the container.</p>
     <ul class="plain">
-      <li><b>Manually</b> - Container Manager → <b>Registry</b> → re-download the <code>latest</code> tag, then
+      <li><b>Manually:</b> Container Manager → <b>Registry</b> → re-download the <code>latest</code> tag, then
       recreate the container (in a Project, <b>Build</b> re-pulls it).</li>
-      <li><b>Automatically</b> - add <b>Watchtower</b>, a tiny sidecar that pulls new nzbfast images and recreates
+      <li><b>Automatically:</b> add <b>Watchtower</b>, a tiny sidecar that pulls new nzbfast images and recreates
       the container for you. In a Project, paste this alongside the <code>nzbfast</code> service:</li>
     </ul>
     <pre class="cmd">  watchtower:
@@ -181,13 +181,13 @@
   <div class="wrap">
     <h2>Troubleshooting</h2>
     <ul class="plain">
-      <li><b>"Permission denied" / files owned by root</b> - your <code>PUID</code>/<code>PGID</code> don't match
+      <li><b>"Permission denied" / files owned by root</b>: your <code>PUID</code>/<code>PGID</code> don't match
       the folder owner. Re-check with <code>id your_dsm_username</code>. This is the most common issue.</li>
-      <li><b>Can't reach the dashboard</b> - confirm the container is running and the port is mapped. If something
+      <li><b>Can't reach the dashboard</b>: confirm the container is running and the port is mapped. If something
       else uses 6789, remap the local side (e.g. <code>6889:6789</code>) and browse to <code>:6889</code>.</li>
-      <li><b>Not searchable in Registry</b> - make sure you're on the <b>Registry</b> tab (not <i>Image</i>), and the
+      <li><b>Not searchable in Registry</b>: make sure you're on the <b>Registry</b> tab (not <i>Image</i>), and the
       NAS has internet. You can also pull it by exact name <code>nzbfast/nzbfast</code>.</li>
-      <li><b>Nothing downloads</b> - open the dashboard; if the Welcome panel is still showing, the provider isn't saved yet.</li>
+      <li><b>Nothing downloads</b>: open the dashboard; if the Welcome panel is still showing, the provider isn't saved yet.</li>
     </ul>
     <div class="callout" style="margin-top:22px"><b>Which models?</b> Any DSM 7 unit with Container Manager (most DSM 6
     units with Docker), Intel or ARM64. Very low-end ARMv7/32-bit models aren't supported. Same image also runs on
@@ -205,7 +205,7 @@
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
     </div>
   </div>
-  <p class="fine">Free software, GPL-3.0-or-later. PAR2 repair and RAR extraction are native code inside the binary - no bundled third-party tools.</p>
+  <p class="fine">Free software, GPL-3.0-or-later. PAR2 repair and RAR extraction are native code inside the binary, no bundled third-party tools.</p>
 </div></footer>
 
 </body>
