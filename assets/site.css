@@ -1,4 +1,4 @@
-/* nzbfast.com — shared styles. Same design language as the product
+/* nzbfast.com - shared styles. Same design language as the product
    dashboard (web/dashboard.html): dark-first, system stack, soft cards. */
 :root{
   --bg:#0e1014;--card:#171a21;--card2:#1e222b;--fg:#e8eaf0;--dim:#8991a5;
@@ -159,7 +159,7 @@ footer .fine{margin-top:22px;font-size:12px;max-width:760px}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 
 /* §5 2b RTL (he/ar/fa website pages set <html dir="rtl">): the layout
-   mirrors through the logical properties above. Code stays LTR — inline
+   mirrors through the logical properties above. Code stays LTR - inline
    <code>/<kbd> isolated so CLI flags/paths never reorder, and the command
    listings + the ASCII pipeline diagram render left-to-right, left-aligned. */
 [dir=rtl] code,[dir=rtl] kbd{direction:ltr;unicode-bidi:isolate}
