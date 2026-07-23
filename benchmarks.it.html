@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Benchmark — nzbfast</title>
+<title>Benchmark - nzbfast</title>
 <meta name="description" content="nzbfast contro SABnzbd, NZBGet e rustnzb: 4 client × 6 scenari su hardware identico. Risultati onesti, compresa l'unica prova che nzbfast non vince, con i passi per riprodurli.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
@@ -43,7 +43,7 @@
 <div class="hero wrap" style="padding-bottom:6px">
   <h1>Benchmark</h1>
   <p class="sub">Quattro client, sei scenari, hardware e provider identici, esecuzioni
-  alternate così la deriva dei provider si annulla. La metrica è il <b>tempo per un file utilizzabile</b> —
+  alternate così la deriva dei provider si annulla. La metrica è il <b>tempo per un file utilizzabile</b> -
   scaricato, verificato, estratto. Compresa l'unica prova che non vinciamo.</p>
 </div>
 
@@ -53,8 +53,8 @@
     <h2>L'impostazione</h2>
     <ul class="plain">
       <li><b>Client:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (il concorrente Rust più vicino), tutti sulla stessa macchina per ogni scenario (macchine Apple M-series: M1 Ultra «Europa» su 10&nbsp;GbE, M3 Ultra «costa est» con linea ~2.4–3.0 Gbps).</li>
-      <li><b>Equità:</b> stessi 6 provider × 8 connessioni, TLS ovunque, prove eseguite in sequenza alternata. Ogni concorrente ottimizzato al suo meglio documentato: SABnzbd ha ricevuto <code>pipelining_requests=8</code> (<b>di serie è 1 — cioè senza pipeline</b>; quella sola impostazione ha portato il suo tempo sui 190 GB da 24m24s a 19m02s), NZBGet ha ricevuto ArticleCache/DirectWrite/DirectUnpack/ParQuick, rustnzb la sua configurazione documentata.</li>
-      <li><b>Stato finale:</b> un file verificato, estratto e utilizzabile — non «download terminato». È questo che aspetti davvero.</li>
+      <li><b>Equità:</b> stessi 6 provider × 8 connessioni, TLS ovunque, prove eseguite in sequenza alternata. Ogni concorrente ottimizzato al suo meglio documentato: SABnzbd ha ricevuto <code>pipelining_requests=8</code> (<b>di serie è 1 - cioè senza pipeline</b>; quella sola impostazione ha portato il suo tempo sui 190 GB da 24m24s a 19m02s), NZBGet ha ricevuto ArticleCache/DirectWrite/DirectUnpack/ParQuick, rustnzb la sua configurazione documentata.</li>
+      <li><b>Stato finale:</b> un file verificato, estratto e utilizzabile - non «download terminato». È questo che aspetti davvero.</li>
       <li><b>Riproducibilità:</b> ogni affermazione risale a una voce datata nel nostro log dei benchmark, registrata con gli script driver che l'hanno prodotta: tempo reale + contatori di byte dell'interfaccia + picco di RSS dell'albero dei processi, risoluzione 1–2 s.</li>
     </ul>
   </div>
@@ -79,12 +79,12 @@
       </tbody>
     </table></div>
     <p class="note" style="text-align:left">¹ rustnzb ha segnalato il job concluso a 5m 42s dopo aver scaricato
-    186.6 GB — il 10% di rete in più di chiunque altro — ma non ha lasciato <b>alcun file di output</b>. Ha fallito
+    186.6 GB - il 10% di rete in più di chiunque altro - ma non ha lasciato <b>alcun file di output</b>. Ha fallito
     questo scenario anche nel giro precedente («121,975 articoli mancanti», 71 GB orfani).
     · ² la memoria di nzbfast segue il suo <em>budget configurato</em>, non il job: questa prova ha usato il
     budget automatico predefinito; limitato a <b>1 GB</b> lo stesso job da 190 GB si completa comunque, circa il 22%
-    più lento — vedi la scala a bassa memoria qui sotto. Nel precedente giro sulla costa est (linea ~2.4–3 Gbps) lo
-    stesso scenario ha girato in 9m 00s contro NZBGet +30% e SABnzbd +111% — il divario regge a ogni velocità di linea.</p>
+    più lento - vedi la scala a bassa memoria qui sotto. Nel precedente giro sulla costa est (linea ~2.4–3 Gbps) lo
+    stesso scenario ha girato in 9m 00s contro NZBGet +30% e SABnzbd +111% - il divario regge a ogni velocità di linea.</p>
   </div>
 </section>
 
@@ -92,7 +92,7 @@
   <div class="wrap">
     <p class="kicker">Scenario 2 · il divario cresce con la dimensione</p>
     <h2>Tempo per file utilizzabile, per dimensione del job</h2>
-    <p class="lead">Passata unica significa nessuna passata di verifica/estrazione dopo il download — quindi più
+    <p class="lead">Passata unica significa nessuna passata di verifica/estrazione dopo il download - quindi più
     grande è il job, più stacca. Esecuzioni sequenziali sulla stessa macchina:</p>
     <div class="tblwrap"><table>
       <thead><tr><th>Job</th><th>nzbfast</th><th>NZBGet</th><th>SABnzbd</th></tr></thead>
@@ -105,7 +105,7 @@
       </tbody>
     </table></div>
     <p class="note" style="text-align:left">² La loro impronta di picco (volumi + output estratto
-    contemporaneamente, ~156 GB) ha superato i 97 GB liberi. La passata unica richiede 1× la dimensione del contenuto —
+    contemporaneamente, ~156 GB) ha superato i 97 GB liberi. La passata unica richiede 1× la dimensione del contenuto -
     dimezza il disco che serve, non solo il tempo.</p>
   </div>
 </section>
@@ -122,7 +122,7 @@
       </tbody>
     </table></div>
     <p class="note" style="text-align:left">³ rustnzb ha scaricato in 119 s, ha segnato il job come
-    <i>Completato</i> — e ha consegnato i volumi offuscati grezzi: nessuna rinomina, nessuna estrazione.
+    <i>Completato</i> - e ha consegnato i volumi offuscati grezzi: nessuna rinomina, nessuna estrazione.
     nzbfast ha deoffuscato dai metadati PAR2 ed estratto nel flusso, zero blocchi riletti.</p>
   </div>
 </section>
@@ -155,20 +155,20 @@
       <div class="card"><h3>Post danneggiato in modalità store</h3>
         <p>20 articoli avvelenati in un REMUX da 7.4 GB: NZBGet finisce utilizzabile in <b>53 s</b>, nzbfast
         in <b>58 s</b>. La nostra riparazione si completa in 32 s, ri-estrae tutti i 62 volumi e l'output è
-        byte-esatto — e scarica 22 blocchi di recupero, quasi il minimo teorico, per i 20 necessari, contro la
+        byte-esatto - e scarica 22 blocchi di recupero, quasi il minimo teorico, per i 20 necessari, contro la
         passata PAR2 completa di NZBGet. Ma NZBGet vince la prova per cinque secondi, ed eccola qui.</p></div>
     </div>
     <div class="callout">Perché mostrare una sconfitta? Perché le vittorie sono credibili solo accanto ad essa.
     Ogni numero in questa pagina proviene dalle stesse esecuzioni alternate, e nel repository teniamo tutto quanto
-    come un vero quaderno di laboratorio — risultati negativi compresi.</div>
+    come un vero quaderno di laboratorio - risultati negativi compresi.</div>
   </div>
 </section>
 
 <section>
   <div class="wrap">
     <p class="kicker">Scenario 6 · affamalo di RAM</p>
-    <h2>La scala a bassa memoria — 190 GB in ~1.1 GB di RAM</h2>
-    <p>Gli stessi quattro job, ri-eseguiti con budget di memoria rigidi di 2 GB, 1 GB e 256 MB —
+    <h2>La scala a bassa memoria - 190 GB in ~1.1 GB di RAM</h2>
+    <p>Gli stessi quattro job, ri-eseguiti con budget di memoria rigidi di 2 GB, 1 GB e 256 MB -
     ciò che il dimensionatore automatico sceglierebbe su una macchina da 8 GB, una da 4 GB e un NAS da 2 GB. Ogni
     prova ha prodotto un file corretto, pienamente verificato ed estratto; il picco RSS ha seguito il
     <em>budget</em>, non il job. Tempo per file utilizzabile, linea 10 GbE:</p>
@@ -183,9 +183,9 @@
     </table></div>
     <p class="note" style="text-align:left">Il sovrapprezzo del 20–40% sui job grandi è un
     artefatto del 10 GbE: i blocchi spillati costano tempo solo quando la linea supera il disco. Lo
-    stesso job da 87 GB agli stessi budget su una linea ~2.4 Gbps ha misurato da −1% a +7% — rumore.
+    stesso job da 87 GB agli stessi budget su una linea ~2.4 Gbps ha misurato da −1% a +7% - rumore.
     Su una tipica connessione domestica un budget piccolo è quasi gratis a qualsiasi dimensione di job. Un
-    profilo NAS (2 connessioni, budget 256 MB) ha finito il job da 35 GB con un picco RSS di 0.4 GB — un NAS da 2 GB
+    profilo NAS (2 connessioni, budget 256 MB) ha finito il job da 35 GB con un picco RSS di 0.4 GB - un NAS da 2 GB
     può farlo girare. Nessun altro client offre alcun tetto di memoria.</p>
   </div>
 </section>
@@ -197,12 +197,12 @@
     <div class="tblwrap"><table>
       <thead><tr><th></th><th>nzbfast</th><th>SABnzbd 5</th><th>NZBGet 26</th><th>rustnzb</th><th>Usenapp</th><th>Newsbin</th></tr></thead>
       <tbody>
-        <tr><td>NNTP in pipeline</td><td class="yes">sì</td><td class="half">off di default</td><td class="no">no</td><td class="yes">sì</td><td class="no">—</td><td class="no">—</td></tr>
+        <tr><td>NNTP in pipeline</td><td class="yes">sì</td><td class="half">off di default</td><td class="no">no</td><td class="yes">sì</td><td class="no">-</td><td class="no">-</td></tr>
         <tr><td>verifica completa durante il download</td><td class="yes">ogni blocco</td><td class="no">dopo</td><td class="half">quick-check</td><td class="no">dopo</td><td class="no">dopo</td><td class="no">dopo</td></tr>
         <tr><td>estrazione durante il download</td><td class="yes">nel flusso, nessun volume su disco</td><td class="half">direct unpack⁴</td><td class="half">direct unpack⁴</td><td class="half">inaffidabile⁵</td><td class="no">no</td><td class="no">no</td></tr>
         <tr><td>disco necessario per un post da N GB</td><td class="yes">~1×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td></tr>
         <tr><td>verdetto di completabilità pre-download</td><td class="yes">esatto al blocco</td><td class="no">no</td><td class="half">salute %</td><td class="no">no</td><td class="yes">controllo articoli</td><td class="no">no</td></tr>
-        <tr><td>memoria limitata (mai swap)</td><td class="yes">a budget</td><td class="no">9.3 GB @ 190 GB</td><td class="half">impostazione cache</td><td class="no">no</td><td class="no">—</td><td class="no">—</td></tr>
+        <tr><td>memoria limitata (mai swap)</td><td class="yes">a budget</td><td class="no">9.3 GB @ 190 GB</td><td class="half">impostazione cache</td><td class="no">no</td><td class="no">-</td><td class="no">-</td></tr>
         <tr><td>controlla il file in qualsiasi punto durante il download</td><td class="yes">sì</td><td class="no">no</td><td class="no">no</td><td class="no">no</td><td class="half">sequenziale</td><td class="no">no</td></tr>
         <tr><td>indexer integrato + bacheca dei poster</td><td class="yes">sì, senza chiave</td><td class="no">no</td><td class="no">no</td><td class="no">no</td><td class="half">UI di ricerca</td><td class="half">browser dei gruppi</td></tr>
         <tr><td>drop-in Sonarr/Radarr</td><td class="yes">API SAB + Newznab</td><td class="yes">nativo</td><td class="yes">nativo</td><td class="half">parziale</td><td class="no">no</td><td class="no">no</td></tr>
@@ -213,7 +213,7 @@
         <tr><td>piattaforme</td><td class="yes">mac/win/linux/docker</td><td class="yes">mac/win/linux</td><td class="yes">mac/win/linux</td><td class="half">linux/win</td><td class="no">solo mac</td><td class="no">solo win</td></tr>
       </tbody>
     </table></div>
-    <p class="note" style="text-align:left">⁴ Il direct unpack materializza comunque prima i volumi —
+    <p class="note" style="text-align:left">⁴ Il direct unpack materializza comunque prima i volumi -
     2× scritture e 2× disco. ⁵ rustnzb ha consegnato volumi offuscati segnati come «Completato» nel nostro giro
     (la sua estrazione inoltre si blocca con l'unrar di RARLab se non disattivata). ⁶ GPL-3.0-or-later.
     Usenapp/Newsbin sono lettori commerciali a piattaforma singola con funzioni di download; sono
@@ -227,21 +227,21 @@
     <h2>Il motore satura linee reali</h2>
     <ul class="plain">
       <li><b>8.31 Gbps aggregati</b> su una linea 10 GbE misurata a 8.2 Gbps (M1 Ultra Europa, 4 provider, 14,000 articoli, 0 errori, 0 riconnessioni).</li>
-      <li><b>9.16–9.27 Gbps</b> di tick di trasporto costanti sulla stessa linea — ≈98% del goodput TCP pratico.</li>
+      <li><b>9.16–9.27 Gbps</b> di tick di trasporto costanti sulla stessa linea - ≈98% del goodput TCP pratico.</li>
       <li><b>5.44 Gbps sostenuti</b> attraverso un intero job da 20.4 GB <i>inclusa</i> la verifica nel flusso.</li>
-      <li><b>Pipelining replicato a ogni RTT</b>: +64% a 63 ms su Starlink, +170–177% a 14 ms in datacenter, +270% a 31 ms sulla costa est — sconfigge il decadimento della finestra di congestione TCP, non solo la latenza.</li>
-      <li><b>Prova di backpressure</b>: limita la fase di scrittura a 4× sotto la rete e l'input si aggancia al limite entro ±1% in 2 s, la RAM <i>scende</i>, zero swap — un disco lento non può mai gonfiare la memoria.</li>
-      <li><b>Margine di calcolo</b>: tetti di decodifica+verifica misurati tra 86–165 Gbps su Apple silicon — la rete è il collo di bottiglia di 4–50× su ogni macchina testata.</li>
+      <li><b>Pipelining replicato a ogni RTT</b>: +64% a 63 ms su Starlink, +170–177% a 14 ms in datacenter, +270% a 31 ms sulla costa est - sconfigge il decadimento della finestra di congestione TCP, non solo la latenza.</li>
+      <li><b>Prova di backpressure</b>: limita la fase di scrittura a 4× sotto la rete e l'input si aggancia al limite entro ±1% in 2 s, la RAM <i>scende</i>, zero swap - un disco lento non può mai gonfiare la memoria.</li>
+      <li><b>Margine di calcolo</b>: tetti di decodifica+verifica misurati tra 86–165 Gbps su Apple silicon - la rete è il collo di bottiglia di 4–50× su ogni macchina testata.</li>
     </ul>
     <div class="callout">Regola fissa del repository: <b>ogni affermazione sulle prestazioni cita un comando
     riproducibile e le condizioni in cui è stato eseguito.</b> Tutto quanto vive nel repository come un quaderno di
-    laboratorio datato — risultati negativi e strade sbagliate compresi.</div>
+    laboratorio datato - risultati negativi e strade sbagliate compresi.</div>
   </div>
 </section>
 
 <footer><div class="wrap">
   <div class="cols">
-    <div>⚡ <b>nzbfast</b> — il downloader Usenet a passata unica.</div>
+    <div>⚡ <b>nzbfast</b> - il downloader Usenet a passata unica.</div>
     <div>
       <a href="features.it.html">Funzionalità</a> ·
       <a href="benchmarks.it.html">Benchmark</a> ·

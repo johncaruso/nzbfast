@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Funktionen — nzbfast</title>
+<title>Funktionen - nzbfast</title>
 <meta name="description" content="Alle nzbfast-Funktionen: Ein-Pass-Pipeline, Union-Verfügbarkeit, eingebauter Indexer, Posterwand, Watchlist-Automatik, SABnzbd- und NZBGet-kompatible APIs.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
@@ -49,18 +49,18 @@
   <div class="wrap">
     <div class="grid2">
       <ul class="feat">
-        <li><b>Pipelined NNTP auf Leitungstempo</b> <span class="d">— 8,31 Gbps gemessen auf 10 GbE.</span></li>
-        <li><b>Ein-Pass-Pipeline</b> <span class="d">— Dekodieren, Prüfen und Entpacken überlappen; RAR-Volumes berühren nie die Festplatte.</span></li>
-        <li><b>Union-Verfügbarkeit über mehrere Provider</b> <span class="d">— vervollständigt aus der Vereinigung deiner Server oder bricht früh ab.</span></li>
-        <li><b>Speicher-Budget</b> <span class="d">— begrenzter RAM, sauberes Auslagern, niemals Swapping.</span></li>
-        <li><b>Absturzfestes Fortsetzen</b> <span class="d">— Journal auf Artikelebene; kill −9 mitten im Job, und es macht genau da weiter, wo es aufgehört hat.</span></li>
+        <li><b>Pipelined NNTP auf Leitungstempo</b> <span class="d">- 8,31 Gbps gemessen auf 10 GbE.</span></li>
+        <li><b>Ein-Pass-Pipeline</b> <span class="d">- Dekodieren, Prüfen und Entpacken überlappen; RAR-Volumes berühren nie die Festplatte.</span></li>
+        <li><b>Union-Verfügbarkeit über mehrere Provider</b> <span class="d">- vervollständigt aus der Vereinigung deiner Server oder bricht früh ab.</span></li>
+        <li><b>Speicher-Budget</b> <span class="d">- begrenzter RAM, sauberes Auslagern, niemals Swapping.</span></li>
+        <li><b>Absturzfestes Fortsetzen</b> <span class="d">- Journal auf Artikelebene; kill −9 mitten im Job, und es macht genau da weiter, wo es aufgehört hat.</span></li>
       </ul>
       <ul class="feat">
-        <li><b>SABnzbd-kompatible + NZBGet-JSON-RPC-APIs</b> <span class="d">— Sonarr/Radarr/nzb360/LunaSea laufen unverändert.</span></li>
-        <li><b>Eingebauter Indexer</b> <span class="d">— scannt Newsgroups in einen lokalen, durchsuchbaren Index mit Newznab-Schnittstelle.</span></li>
-        <li><b>Posterwand</b> <span class="d">— Artwork, Bewertungen, Besetzung, Episodenraster; keine API-Keys.</span></li>
-        <li><b>Watchlist-Auto-Grab + Qualitäts-Upgrades</b> <span class="d">— holt beim ersten Auftauchen und rüstet bis zur Zielqualität auf.</span></li>
-        <li><b>Eine einzige, in sich geschlossene Programmdatei</b> <span class="d">— par2 + RAR-Entpacken eingebettet.</span></li>
+        <li><b>SABnzbd-kompatible + NZBGet-JSON-RPC-APIs</b> <span class="d">- Sonarr/Radarr/nzb360/LunaSea laufen unverändert.</span></li>
+        <li><b>Eingebauter Indexer</b> <span class="d">- scannt Newsgroups in einen lokalen, durchsuchbaren Index mit Newznab-Schnittstelle.</span></li>
+        <li><b>Posterwand</b> <span class="d">- Artwork, Bewertungen, Besetzung, Episodenraster; keine API-Keys.</span></li>
+        <li><b>Watchlist-Auto-Grab + Qualitäts-Upgrades</b> <span class="d">- holt beim ersten Auftauchen und rüstet bis zur Zielqualität auf.</span></li>
+        <li><b>Eine einzige, in sich geschlossene Programmdatei</b> <span class="d">- par2 + RAR-Entpacken eingebettet.</span></li>
       </ul>
     </div>
   </div>
@@ -74,17 +74,17 @@
         <li><b>Pipelined NNTP.</b> Mehrere gleichzeitig offene Anfragen pro Verbindung schlagen sowohl die Round-Trip-Latenz als auch den Verfall des TCP-Congestion-Windows. Wir messen irgendwo zwischen +12 % und +270 % gegenüber seriellem Abruf, und rund 8 Verbindungen pro Server genügen, um die Leitung auszulasten.</li>
         <li><b>SIMD-yEnc-Dekodierung</b> (rapidyenc, mit NEON- und AVX-Kerneln) läuft mit 4,95 GB/s pro Kern und dekodiert an Ort und Stelle, während die Bytes im Empfangspfad eintreffen.</li>
         <li><b>Gemeinsame Warteschlange über alle Server.</b> Ohne jedes Tuning gleichen sich die Provider bis auf etwa 2 % selbst aus. Die tatsächliche Rate jedes Servers wird mitverfolgt, und das Ende eines Jobs wird doppelt vergeben, damit ein einzelner langsamer Server das Finale nicht in die Länge zieht.</li>
-        <li><b>Job-übergreifendes Durchziehen.</b> Das Ende von Job N überlappt den Start von Job N+1, sodass die Leitung über eine ganze Warteschlange hinweg von Kante zu Kante ausgelastet bleibt — hier 2 % Leerlauf gegenüber 61 % Dunkelzeit bei SABnzbd im selben Benchmark.</li>
-        <li><b>Watchdog für langsame Jobs.</b> Kriecht ein Download auf einem einzigen langsamen Server dahin, während der Rest untätig wartet, wandert er ans Ende der Warteschlange — der Fortschritt bleibt erhalten — und läuft weiter, sobald die Warteschlange frei ist.</li>
-        <li><b>Prefetch auf freien Servern</b> — ein Server, den der aktive Job nicht nutzen kann, weil seine Artikel dort nicht liegen, beginnt stattdessen mit dem nächsten Job in der Warteschlange, statt untätig zu bleiben.</li>
+        <li><b>Job-übergreifendes Durchziehen.</b> Das Ende von Job N überlappt den Start von Job N+1, sodass die Leitung über eine ganze Warteschlange hinweg von Kante zu Kante ausgelastet bleibt - hier 2 % Leerlauf gegenüber 61 % Dunkelzeit bei SABnzbd im selben Benchmark.</li>
+        <li><b>Watchdog für langsame Jobs.</b> Kriecht ein Download auf einem einzigen langsamen Server dahin, während der Rest untätig wartet, wandert er ans Ende der Warteschlange - der Fortschritt bleibt erhalten - und läuft weiter, sobald die Warteschlange frei ist.</li>
+        <li><b>Prefetch auf freien Servern</b> - ein Server, den der aktive Job nicht nutzen kann, weil seine Artikel dort nicht liegen, beginnt stattdessen mit dem nächsten Job in der Warteschlange, statt untätig zu bleiben.</li>
       </ul>
       <ul class="plain">
-        <li><b>Verbindungs-Tuning-Leiter.</b> Statt zu raten, misst sie, wo der Durchsatz jedes Providers wirklich aufhört zu steigen — angefragte gegenüber gewährten Verbindungen — und pendelt sich dort ein.</li>
-        <li><b>Auto-Tempo-Regler</b> — ein optionaler RTT-Regler nach LEDBAT-Art, der dem übrigen Verkehr in deinem Haushalt den Vortritt lässt und sich mit dem nimmt, was von der Leitung übrig ist.</li>
-        <li><b>Tempolimits und ein Wochenplan</b> — live verstellbare Obergrenzen, ein Zeitplan in lokaler Zeit (sommerzeitfest) und ein „Pause für N Minuten“, das von selbst wieder anläuft.</li>
+        <li><b>Verbindungs-Tuning-Leiter.</b> Statt zu raten, misst sie, wo der Durchsatz jedes Providers wirklich aufhört zu steigen - angefragte gegenüber gewährten Verbindungen - und pendelt sich dort ein.</li>
+        <li><b>Auto-Tempo-Regler</b> - ein optionaler RTT-Regler nach LEDBAT-Art, der dem übrigen Verkehr in deinem Haushalt den Vortritt lässt und sich mit dem nimmt, was von der Leitung übrig ist.</li>
+        <li><b>Tempolimits und ein Wochenplan</b> - live verstellbare Obergrenzen, ein Zeitplan in lokaler Zeit (sommerzeitfest) und ein „Pause für N Minuten“, das von selbst wieder anläuft.</li>
         <li><b>Speicher-Budget.</b> Ein einziges globales RAM-Budget (automatisch ein Viertel des RAM, gedeckelt, übersteuerbar). Wird es knapp, schrumpfen zuerst die Puffer, dann wandern Daten auf die Platte und werden zurückgelesen, sobald der Job zur Ruhe kommt. Geswappt wird nie. Ein 190-GB-Job läuft in einem 1-GB-Budget bei ~1,1 GB Spitzen-RSS durch, und für NAS-Geräte gibt es ein vermessenes, dokumentiertes 2-GB-Profil.</li>
-        <li><b>Gegendruck.</b> Eine langsame Festplatte drosselt die Sockets, statt den RAM volllaufen zu lassen — sie hält ein Schreiblimit auf ±1 % genau ein, und der RAM <i>sinkt</i> unter Druck sogar.</li>
-        <li><b>Speicher-Rückgabe nach dem Job</b> — sobald er im Leerlauf ist, gibt der Daemon freigewordenen Speicher ans Betriebssystem zurück und fällt zwischen Jobs unter macOS auf rund 8 MB.</li>
+        <li><b>Gegendruck.</b> Eine langsame Festplatte drosselt die Sockets, statt den RAM volllaufen zu lassen - sie hält ein Schreiblimit auf ±1 % genau ein, und der RAM <i>sinkt</i> unter Druck sogar.</li>
+        <li><b>Speicher-Rückgabe nach dem Job</b> - sobald er im Leerlauf ist, gibt der Daemon freigewordenen Speicher ans Betriebssystem zurück und fällt zwischen Jobs unter macOS auf rund 8 MB.</li>
       </ul>
     </div>
   </div>
@@ -96,13 +96,13 @@
     <div class="grid2">
       <ul class="plain">
         <li><b>Einmal schreiben.</b> Dekodierte Artikel werden per pwrite direkt an ihre endgültigen Datei-Offsets geschrieben. Keine Temp-Dateien, kein separater Zusammensetz-Durchlauf.</li>
-        <li><b>PAR2-Prüfung im Datenstrom.</b> Jeder Block wird beim Eintreffen aus den Decode-Puffern MD5-gehasht, sodass die Verifikation genau dann fertig ist, wenn der Download es ist. Das schlägt den Quick-Check, mit dem sich die anderen Clients begnügen — und kostet nichts.</li>
-        <li><b>Direktes Entpacken</b> — RAR-Posts im Store-Modus (die meisten Scene-Releases) werden schon während des Downloads gemappt und entpackt, sodass die Volumes gar nicht erst auf der Festplatte landen. Die Schreiblast beträgt Inhalt × 1,0 und der Plattenbedarf 1×, wo andere rund 2× verlangen.</li>
+        <li><b>PAR2-Prüfung im Datenstrom.</b> Jeder Block wird beim Eintreffen aus den Decode-Puffern MD5-gehasht, sodass die Verifikation genau dann fertig ist, wenn der Download es ist. Das schlägt den Quick-Check, mit dem sich die anderen Clients begnügen - und kostet nichts.</li>
+        <li><b>Direktes Entpacken</b> - RAR-Posts im Store-Modus (die meisten Scene-Releases) werden schon während des Downloads gemappt und entpackt, sodass die Volumes gar nicht erst auf der Festplatte landen. Die Schreiblast beträgt Inhalt × 1,0 und der Plattenbedarf 1×, wo andere rund 2× verlangen.</li>
         <li><b>Deobfuskierung.</b> Verschleierte Posts werden anhand ihrer PAR2-Metadaten umbenannt, ROT13-verwürfelte Namen gerettet und hash-benannter Müll erkannt und aussortiert.</li>
       </ul>
       <ul class="plain">
-        <li><b>Passgenaue Reparatur.</b> Beschädigte Blöcke sind bekannt, sobald sie auftreten, sodass nur die byteminimale Menge an Recovery-Volumes geholt wird — ein Knapsack-Problem — und die Reparatur nichts als die beschädigten Bereiche anfasst.</li>
-        <li><b>Fallback für Komprimiertes und Verschlüsseltes</b> — Nicht-Store-Posts landen auf der Platte und werden über die native RAR-Engine entpackt, überlappt mit dem Rest der Warteschlange. Verschlüsselte Sets parken mit einer klaren Meldung, statt still zu scheitern.</li>
+        <li><b>Passgenaue Reparatur.</b> Beschädigte Blöcke sind bekannt, sobald sie auftreten, sodass nur die byteminimale Menge an Recovery-Volumes geholt wird - ein Knapsack-Problem - und die Reparatur nichts als die beschädigten Bereiche anfasst.</li>
+        <li><b>Fallback für Komprimiertes und Verschlüsseltes</b> - Nicht-Store-Posts landen auf der Platte und werden über die native RAR-Engine entpackt, überlappt mit dem Rest der Warteschlange. Verschlüsselte Sets parken mit einer klaren Meldung, statt still zu scheitern.</li>
         <li><b>Passwort-Handling.</b> Passwörter stammen aus der *arr-API, der <code>{{pw}}</code>-Namenskonvention oder den NZB-Metadaten. Für alles Übrige übernimmt ein 🔑-Entsperren im Dashboard: Es entsperrt im Hintergrund und sortiert dann ganz normal ein.</li>
         <li><b>Sicherheitsgurte.</b> Reparierte Quell-Volumes sind schreibgeschützt, solange das erneute Entpacken läuft, und ein Exit-Code meldet nur dann „Erfolg“, wenn das Endergebnis wirklich benutzbar ist.</li>
       </ul>
@@ -118,14 +118,14 @@
         <li><b>Verfügbarkeits-Check vor dem Start.</b> Pipelinete STAT-Sweeps bauen in Sekunden eine Matrix aus Artikel × Server auf und markieren den Job als VOLLSTÄNDIG, REPARIERBAR oder UNMÖGLICH, bevor auch nur ein Byte Inhalt geladen ist. Ein unmöglicher Post bricht ab, ohne fast etwas gezogen zu haben.</li>
         <li><b>Union-Routing.</b> Ein Artikel gilt erst dann als fehlend, wenn ihn jeder aktive Server verweigert hat; bis dahin wird er zu dem Server geleitet, der ihn vorhält. Backbones unterscheiden sich in Retention und Takedowns, und so vervollständigt die Vereinigung klammheimlich Posts, die kein einzelner Server schaffen würde.</li>
         <li><b>Absturzfestes Journal.</b> Das Journal arbeitet auf Artikelebene. Schick mitten im Job ein kill −9, und es kommt zurück und lädt nur nach, was noch nicht gesichert war; Warteschlange und Verlauf überstehen Neustarts.</li>
-        <li><b>Parken und erneut versuchen</b> — fehlgeschlagene Jobs parken im Verlauf, und ein erneuter Versuch holt nur die Teile, die noch fehlen.</li>
-        <li><b>Chaos-getestet.</b> Ein Mock-NNTP-Server fährt bei jedem einzelnen Testlauf zehn End-to-End-Fehlerszenarien durch — 430er, Korruption, Abschneiden, Hänger, tote Server, kill −9.</li>
+        <li><b>Parken und erneut versuchen</b> - fehlgeschlagene Jobs parken im Verlauf, und ein erneuter Versuch holt nur die Teile, die noch fehlen.</li>
+        <li><b>Chaos-getestet.</b> Ein Mock-NNTP-Server fährt bei jedem einzelnen Testlauf zehn End-to-End-Fehlerszenarien durch - 430er, Korruption, Abschneiden, Hänger, tote Server, kill −9.</li>
       </ul>
       <ul class="plain">
         <li><b>Provider-Zuverlässigkeitswertung.</b> Die Vollständigkeitsraten pro Server werden dauerhaft festgehalten und im Dashboard angezeigt, mit einer Warnung unterhalb von 98 %.</li>
-        <li><b>Server-Diversitäts-Analyse.</b> Sie zieht STAT-Stichproben über deine Server und gruppiert sie nach den Lücken, die sie teilen — so erkennst du, welche „unterschiedlichen“ Provider in Wahrheit dasselbe Backbone sind, bevor du für Redundanz zahlst, die du gar nicht hast.</li>
-        <li><b>Quotas, Block-Konten und ein Platten-Wächter</b> — Tages- und Monats-Quotas, Lebenszeit-Byte-Budgets für Block-Konten (automatisch ausgenommen, sobald aufgebraucht), eine Pause bei wenig Plattenplatz und eine tägliche Verbrauchshistorie pro Provider.</li>
-        <li><b>Duplikat-Erkennung</b> — Dupekey und Dupescore, wobei eine zurückgehaltene Alternative automatisch nachrückt, sobald ein Grab fehlschlägt.</li>
+        <li><b>Server-Diversitäts-Analyse.</b> Sie zieht STAT-Stichproben über deine Server und gruppiert sie nach den Lücken, die sie teilen - so erkennst du, welche „unterschiedlichen“ Provider in Wahrheit dasselbe Backbone sind, bevor du für Redundanz zahlst, die du gar nicht hast.</li>
+        <li><b>Quotas, Block-Konten und ein Platten-Wächter</b> - Tages- und Monats-Quotas, Lebenszeit-Byte-Budgets für Block-Konten (automatisch ausgenommen, sobald aufgebraucht), eine Pause bei wenig Plattenplatz und eine tägliche Verbrauchshistorie pro Provider.</li>
+        <li><b>Duplikat-Erkennung</b> - Dupekey und Dupescore, wobei eine zurückgehaltene Alternative automatisch nachrückt, sobald ein Grab fehlschlägt.</li>
         <li><b>Retention-bewusstes Routing.</b> Posts, die älter sind als die Retention eines Servers, überspringen ihn ganz, und was kein Server ausliefern kann, scheitert sofort, statt sich im Kreis zu drehen.</li>
       </ul>
     </div>
@@ -137,19 +137,19 @@
     <h2>Automatisierung &amp; Integrationen</h2>
     <div class="grid2">
       <ul class="plain">
-        <li><b>SABnzbd-kompatible API</b> — die ganze Oberfläche, die die *arrs tatsächlich nutzen: addfile/addurl, Kategorien, Prioritäten, Pause/Fortsetzen pro Job, erneut versuchen, Paginierung, zweistufige API-Keys. Sonarr und Radarr sprechen mit ihr, als wäre sie SABnzbd.</li>
+        <li><b>SABnzbd-kompatible API</b> - die ganze Oberfläche, die die *arrs tatsächlich nutzen: addfile/addurl, Kategorien, Prioritäten, Pause/Fortsetzen pro Job, erneut versuchen, Paginierung, zweistufige API-Keys. Sonarr und Radarr sprechen mit ihr, als wäre sie SABnzbd.</li>
         <li><b>NZBGet-JSON-RPC-Fassade.</b> nzb360, LunaSea und andere NZBGet-Fernsteuerungen verbinden sich unverändert.</li>
         <li><b>Newznab-Server.</b> Dein lokaler Index beantwortet t=search/tvsearch/movie, sodass die *arrs deine eigenen Scans wie einen Indexer behandeln können.</li>
-        <li><b>RSS-Auto-Grab</b> — Feeds, gefiltert mit einer Sprache im NZBGet-Stil, live im Dashboard hinzugefügt und bearbeitet.</li>
-        <li><b>Watchlist.</b> Nenn die Serien und Filme, die du willst — auch solche, die noch nicht ausgestrahlt sind. Jede Episode wird bei ihrem ersten Auftauchen geholt und aufgerüstet, bis sie deine Zielqualität erreicht (etwa 720p → 1080p REMUX), wobei die überholte Kopie erst gelöscht wird, nachdem das Upgrade verifiziert wurde. Ein Ausstrahlungskalender zeigt, was kommt.</li>
+        <li><b>RSS-Auto-Grab</b> - Feeds, gefiltert mit einer Sprache im NZBGet-Stil, live im Dashboard hinzugefügt und bearbeitet.</li>
+        <li><b>Watchlist.</b> Nenn die Serien und Filme, die du willst - auch solche, die noch nicht ausgestrahlt sind. Jede Episode wird bei ihrem ersten Auftauchen geholt und aufgerüstet, bis sie deine Zielqualität erreicht (etwa 720p → 1080p REMUX), wobei die überholte Kopie erst gelöscht wird, nachdem das Upgrade verifiziert wurde. Ein Ausstrahlungskalender zeigt, was kommt.</li>
       </ul>
       <ul class="plain">
         <li><b>Watch-Ordner.</b> Leg eine .nzb hinein, und sie wird geladen; die Datei verschwindet, sobald sie übernommen wurde.</li>
-        <li><b>Smarte Ordner</b> — Regex-, Stichwort- und Größenregeln sortieren Downloads schon beim Einreihen in Kategorien, mit optionaler TV-Ablage nach <code>Show/Season NN/Show - S01E02.ext</code>.</li>
-        <li><b>Aufräumregeln</b> — Müll-Endungen werden entfernt, sobald ein Job abgeschlossen ist.</li>
+        <li><b>Smarte Ordner</b> - Regex-, Stichwort- und Größenregeln sortieren Downloads schon beim Einreihen in Kategorien, mit optionaler TV-Ablage nach <code>Show/Season NN/Show - S01E02.ext</code>.</li>
+        <li><b>Aufräumregeln</b> - Müll-Endungen werden entfernt, sobald ein Job abgeschlossen ist.</li>
         <li><b>Nachbearbeitungs-Skripte.</b> Sie halten sich an SABnzbds SAB_*-Umgebungsvertrag, sodass die Skripte, die du schon hast, unverändert laufen.</li>
         <li><b>Ein-Klick-Migration.</b> Sie importiert Server aus einer SABnzbd-ini oder einer NZBGet-conf und liest sabnzbd.ini direkt, wenn nur das zu finden ist.</li>
-        <li><b>Spotnet-Ingestion</b> — Spot-Signaturprüfung und NZB-Synthese, direkt eingebaut.</li>
+        <li><b>Spotnet-Ingestion</b> - Spot-Signaturprüfung und NZB-Synthese, direkt eingebaut.</li>
       </ul>
     </div>
   </div>
@@ -160,21 +160,21 @@
     <h2>Indexer &amp; die Posterwand</h2>
     <p class="lead">Scanne die Gruppen, die dich interessieren, in einen privaten Index und stöbere dann
     im Ergebnis als Posterwand. Jedes bisschen der Metadaten holt deine eigene Installation aus
-    schlüssellosen öffentlichen Quellen — es gibt keinen API-Key, um den du betteln müsstest.</p>
+    schlüssellosen öffentlichen Quellen - es gibt keinen API-Key, um den du betteln müsstest.</p>
     <figure class="shot"><img src="assets/wall-sheet.jpg" alt="Poster wall detail sheet with rating, cast, synopsis and episode chips" loading="lazy"></figure>
     <div style="height:26px"></div>
     <div class="grid2">
       <ul class="plain">
         <li><b>Kontinuierlicher Gruppen-Scanner.</b> Inkrementelle OVER-Scans laufen nach deinem Zeitplan mit ~43k Headern/s über aufgefächerte Verbindungen. Erstscans werden datumshalbiert, sodass <code>--max-age 2y</code> Jahre an Headern in etwa 20 Sondierungen überspringt.</li>
-        <li><b>Ingest-Filter</b> — Filter nach Art, Jahr, Auflösung, Sprache und Größe halten Indexer-Spam aus deiner Datenbank, und verschleierter Müll wird standardmäßig erkannt und ausgefiltert.</li>
-        <li><b>Scene-Namen-Parser.</b> Er zieht Titel, Jahr, Episode, Qualität und Quelle aus echten Release-Namen — datumscodierte Dailies, Multi-Episoden-Codes und ROT13-verschleierte Namen inbegriffen — und dedupliziert Releases auf eine Karte pro Titel.</li>
-        <li><b>Sofortsuche</b> — Suche beim Tippen mit Qualitätsfiltern, Beobachten-Knöpfen pro Zeile und Qualitäts-Badges überall.</li>
+        <li><b>Ingest-Filter</b> - Filter nach Art, Jahr, Auflösung, Sprache und Größe halten Indexer-Spam aus deiner Datenbank, und verschleierter Müll wird standardmäßig erkannt und ausgefiltert.</li>
+        <li><b>Scene-Namen-Parser.</b> Er zieht Titel, Jahr, Episode, Qualität und Quelle aus echten Release-Namen - datumscodierte Dailies, Multi-Episoden-Codes und ROT13-verschleierte Namen inbegriffen - und dedupliziert Releases auf eine Karte pro Titel.</li>
+        <li><b>Sofortsuche</b> - Suche beim Tippen mit Qualitätsfiltern, Beobachten-Knöpfen pro Zeile und Qualitäts-Badges überall.</li>
       </ul>
       <ul class="plain">
         <li><b>Anreicherung ohne Keys.</b> TVmaze für Serien, iTunes Search für Filme, dazu öffentliche Bewertungs-Datensätze, Wikidata, Wikipedia und AniList füllen Poster, Bewertungen und Stimmenzahlen, Besetzung, Genres und Handlung. OMDb- und TMDB-Keys funktionieren, wenn du sie hast, nötig ist aber keiner.</li>
-        <li><b>Episodenraster</b> — Chips pro Staffel, bei denen der beste Encode jeder Episode nur einen Klick vom Download entfernt ist, markierte Staffel-Packs und ein „Serie beobachten“ in jedem Staffel-Kopf.</li>
-        <li><b>Trend-Leisten</b> — Leisten für „Neu diese Woche“ und „Gerade heiß“, gebildet aus der Post-Frequenz.</li>
-        <li><b>Alles korrigierbar.</b> Falsche Zuordnung? Wähl aus den Kandidaten oder tipp einfach die richtige Identität ein — was du von Hand setzt, wird nie überschrieben. Verweise ein Poster auf eine URL oder lade eins hoch. Ein Knopf reichert einen einzelnen Titel neu an, ein anderer löscht den ganzen Index und baut ihn neu auf.</li>
+        <li><b>Episodenraster</b> - Chips pro Staffel, bei denen der beste Encode jeder Episode nur einen Klick vom Download entfernt ist, markierte Staffel-Packs und ein „Serie beobachten“ in jedem Staffel-Kopf.</li>
+        <li><b>Trend-Leisten</b> - Leisten für „Neu diese Woche“ und „Gerade heiß“, gebildet aus der Post-Frequenz.</li>
+        <li><b>Alles korrigierbar.</b> Falsche Zuordnung? Wähl aus den Kandidaten oder tipp einfach die richtige Identität ein - was du von Hand setzt, wird nie überschrieben. Verweise ein Poster auf eine URL oder lade eins hoch. Ein Knopf reichert einen einzelnen Titel neu an, ein anderer löscht den ganzen Index und baut ihn neu auf.</li>
       </ul>
     </div>
   </div>
@@ -197,22 +197,22 @@
       <figure><div class="shot"><img src="assets/dash-browse.png" alt="Queue with per-file drawer and index browse card" loading="lazy"></div>
         <figcaption>Warteschlangen-Drawer: Balken pro Datei, Prüf-Blöcke, Beitrag pro Server.</figcaption></figure>
       <figure><div class="shot"><img src="assets/settings-top.png" alt="Settings: server editor and live speed/scheduling controls" loading="lazy"></div>
-        <figcaption>Jede Einstellung im Browser editierbar — die meisten gelten sofort.</figcaption></figure>
+        <figcaption>Jede Einstellung im Browser editierbar - die meisten gelten sofort.</figcaption></figure>
       <figure><div class="shot" style="max-width:320px;margin:0 auto"><img src="assets/mobile-dash.png" alt="Phone layout of the dashboard" loading="lazy"></div>
         <figcaption>Richtiges Handy-Layout, derselbe Daemon.</figcaption></figure>
     </div>
     <div style="height:10px"></div>
     <div class="grid2">
       <ul class="plain">
-        <li><b>Live-Diagramme, ohne Libraries.</b> Alles pollt einmal pro Sekunde — eine Durchsatz-Fläche, eine gestapelte Fläche pro Provider, eine Prüfstatus-Zeitleiste, ein Warteschlangen-Burn-down, ein Tempo-Histogramm — und die Diagramme weiten ihr Zeitfenster, sobald du das Browserfenster breiter ziehst.</li>
-        <li><b>Ressourcen-Monitor</b> — CPU, RAM gegen das Budget, Schreibvorgänge und Netzwerk in einem einzigen Diagramm, mit einer Warnung bei wenig Plattenplatz.</li>
+        <li><b>Live-Diagramme, ohne Libraries.</b> Alles pollt einmal pro Sekunde - eine Durchsatz-Fläche, eine gestapelte Fläche pro Provider, eine Prüfstatus-Zeitleiste, ein Warteschlangen-Burn-down, ein Tempo-Histogramm - und die Diagramme weiten ihr Zeitfenster, sobald du das Browserfenster breiter ziehst.</li>
+        <li><b>Ressourcen-Monitor</b> - CPU, RAM gegen das Budget, Schreibvorgänge und Netzwerk in einem einzigen Diagramm, mit einer Warnung bei wenig Plattenplatz.</li>
         <li><b>Provider-Rangliste.</b> Die Server sortieren sich nach Live-Leistung selbst um und zeigen jeweils Sitzungs-Bytes, Verbindungszahl, Auslastung und Zuverlässigkeit.</li>
-        <li><b>Warteschlangen-Verwaltung</b> — zum Umsortieren ziehen, Priorität und Kategorie inline setzen, einen Drawer pro Download öffnen, optimistisch pausieren oder „Pause für N Minuten“.</li>
+        <li><b>Warteschlangen-Verwaltung</b> - zum Umsortieren ziehen, Priorität und Kategorie inline setzen, einen Drawer pro Download öffnen, optimistisch pausieren oder „Pause für N Minuten“.</li>
       </ul>
       <ul class="plain">
-        <li><b>Alles im Browser konfigurierbar</b> — Server (mit Live-Verbindungstests), Tempo und Zeitplan, Verbindungen/Fenster/Decoder, Platte und Quota, Watch-Ordner und Skripte, Ingest-Filter, Bibliothek, RSS und Sicherheit mit Key-Rotation. Die Einstellungen überstehen Neustarts.</li>
-        <li><b>Diagnose eingebaut</b> — ein Log-Viewer direkt in der UI, ein System-Benchmark, der deine Netzwerk-, Rechen- und Platten-Obergrenzen findet und dir sagt, was dagegen zu tun ist, die Server-Diversitäts-Analyse und die Verbindungs-Leiter.</li>
-        <li><b>Datenverbrauch</b> — gestapelte Balken pro Provider über 14 Tage, Tageshistorie und Lebenszeit-Zähler für Block-Konten.</li>
+        <li><b>Alles im Browser konfigurierbar</b> - Server (mit Live-Verbindungstests), Tempo und Zeitplan, Verbindungen/Fenster/Decoder, Platte und Quota, Watch-Ordner und Skripte, Ingest-Filter, Bibliothek, RSS und Sicherheit mit Key-Rotation. Die Einstellungen überstehen Neustarts.</li>
+        <li><b>Diagnose eingebaut</b> - ein Log-Viewer direkt in der UI, ein System-Benchmark, der deine Netzwerk-, Rechen- und Platten-Obergrenzen findet und dir sagt, was dagegen zu tun ist, die Server-Diversitäts-Analyse und die Verbindungs-Leiter.</li>
+        <li><b>Datenverbrauch</b> - gestapelte Balken pro Provider über 14 Tage, Tageshistorie und Lebenszeit-Zähler für Block-Konten.</li>
         <li><b>Komfort.</b> Eine .nzb einfach irgendwohin ziehen, Desktop-Benachrichtigungen, Abschluss-Sounds, ein Erststart-Assistent und <code>serve --open</code>.</li>
       </ul>
     </div>
@@ -223,10 +223,10 @@
   <div class="wrap">
     <h2>Deployment</h2>
     <ul class="plain">
-      <li><b>Eine einzige, in sich geschlossene Programmdatei.</b> par2 und RAR-Entpacken sind nativer Code, direkt in die Binary kompiliert — beim ersten Start wird nichts entpackt, und es gibt weder eine Runtime noch einen Installer, mit dem man sich herumschlagen müsste.</li>
-      <li><b>macOS, erstklassig</b> — eine Universal-Binary für Apple Silicon und Intel, eine native SwiftUI-Menüleisten-App, eine launchd-Unit und eine Homebrew-Formel.</li>
-      <li><b>Windows</b> — eine vollständig statische x64-Exe, die auf Windows 10 und 11 ab Werk läuft, mit Doppelklick-Launcher und geführter Einrichtung.</li>
-      <li><b>Linux und Docker</b> — eine gehärtete systemd-Unit, ein Multi-Stage-Docker-Image mit PUID/PGID-Entrypoint im linuxserver-Stil und eine Compose-Datei liegt bei. <a href="download.de.html">Alle Plattformen →</a></li>
+      <li><b>Eine einzige, in sich geschlossene Programmdatei.</b> par2 und RAR-Entpacken sind nativer Code, direkt in die Binary kompiliert - beim ersten Start wird nichts entpackt, und es gibt weder eine Runtime noch einen Installer, mit dem man sich herumschlagen müsste.</li>
+      <li><b>macOS, erstklassig</b> - eine Universal-Binary für Apple Silicon und Intel, eine native SwiftUI-Menüleisten-App, eine launchd-Unit und eine Homebrew-Formel.</li>
+      <li><b>Windows</b> - eine vollständig statische x64-Exe, die auf Windows 10 und 11 ab Werk läuft, mit Doppelklick-Launcher und geführter Einrichtung.</li>
+      <li><b>Linux und Docker</b> - eine gehärtete systemd-Unit, ein Multi-Stage-Docker-Image mit PUID/PGID-Entrypoint im linuxserver-Stil und eine Compose-Datei liegt bei. <a href="download.de.html">Alle Plattformen →</a></li>
       <li><b>Geführte Einrichtung.</b> Starte den Assistenten <code>nzbfast setup</code> oder lass ihn eine bestehende SABnzbd- oder NZBGet-Konfiguration automatisch erkennen. Dein erster Download läuft in unter zwei Minuten.</li>
     </ul>
   </div>
@@ -234,7 +234,7 @@
 
 <footer><div class="wrap">
   <div class="cols">
-    <div>⚡ <b>nzbfast</b> — der Ein-Pass-Usenet-Downloader.</div>
+    <div>⚡ <b>nzbfast</b> - der Ein-Pass-Usenet-Downloader.</div>
     <div>
       <a href="features.de.html">Funktionen</a> ·
       <a href="benchmarks.de.html">Benchmarks</a> ·
@@ -242,7 +242,7 @@
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
     </div>
   </div>
-  <p class="fine">Freie Software, GPL-3.0-or-later. PAR2-Reparatur und RAR-Entpacken sind nativer Code im Binary — keine mitgelieferten Dritt-Tools. Die Posterwand-Metadaten kommen aus
+  <p class="fine">Freie Software, GPL-3.0-or-later. PAR2-Reparatur und RAR-Entpacken sind nativer Code im Binary - keine mitgelieferten Dritt-Tools. Die Posterwand-Metadaten kommen aus
   schlüssellosen öffentlichen Quellen, geholt von deiner eigenen Installation.</p>
 </div></footer>
 

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Download — nzbfast</title>
+<title>Download - nzbfast</title>
 <meta name="description" content="Download nzbfast voor macOS, Windows, Linux, Docker, Synology en meer. Eén op zichzelf staand uitvoerbaar bestand met herstel en uitpakken ingebouwd.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
@@ -42,7 +42,7 @@
 
 <div class="hero wrap" style="padding-bottom:6px">
   <h1>Eén binary. <em>Alles inbegrepen.</em></h1>
-  <p class="sub">Elke build is één op zichzelf staand uitvoerbaar bestand — herstel (par2) en
+  <p class="sub">Elke build is één op zichzelf staand uitvoerbaar bestand - herstel (par2) en
   uitpakken (RAR) zitten erin. Uitpakken, launcher starten, drie vragen beantwoorden, downloaden.</p>
 </div>
 
@@ -51,7 +51,7 @@
     <div class="dl">
       <div class="card">
         <h3>🍎 macOS <span class="tag now">beschikbaar</span></h3>
-        <p>De NzbFast-app — sleep naar Programma's en klaar. Universal (Apple Silicon en
+        <p>De NzbFast-app - sleep naar Programma's en klaar. Universal (Apple Silicon en
         Intel), dashboard in een eigen venster, .nzb-dubbelklik, starten bij inloggen.</p>
         <p class="meta">macOS 12+ · ~16 MB DMG · app + engine</p>
         <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-macos.dmg">Download de Mac-app</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-macos-universal.zip">draagbare .zip</a></p>
@@ -59,14 +59,14 @@
       <div class="card">
         <h3>🪟 Windows <span class="tag now">beschikbaar</span></h3>
         <p>De installer zet een tray-app op (geen consolevenster), een vermelding in het Startmenu,
-        optioneel starten met Windows en .nzb-dubbelklik. Volledig statisch — geen runtime
+        optioneel starten met Windows en .nzb-dubbelklik. Volledig statisch - geen runtime
         te installeren; hij kan ook je bestaande SABnzbd-config overnemen.</p>
         <p class="meta">Windows 10/11 x64 · ~8 MB installer</p>
         <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-setup-1.0.4.exe">Download de installer</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-windows-x64.zip">draagbare .zip</a></p>
       </div>
       <div class="card">
         <h3>🐧 Linux <span class="tag now">beschikbaar</span></h3>
-        <p>Statische musl-builds voor x86_64 en arm64 — seedboxes, VPS'en, elke NAS met SSH,
+        <p>Statische musl-builds voor x86_64 en arm64 - seedboxes, VPS'en, elke NAS met SSH,
         Raspberry Pi 4/5. Geen glibc-versieroulette.</p>
         <p class="meta">x86_64 · arm64 · systemd-unit meegeleverd</p>
         <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-linux-arm64.tar.gz">arm64</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-nas.zip">NAS-bundel</a></p>
@@ -80,7 +80,7 @@
       </div>
       <div class="card">
         <h3>📦 Synology <span class="tag now">beschikbaar</span></h3>
-        <p>Draait op DSM 7 via <b>Container Manager</b>: zoek <code>nzbfast</code> in de Registry, download, koppel drie mappen en poort 6789. Geen configuratiebestand om te bewerken — voeg je provider toe in het welkomstpaneel van het dashboard.</p>
+        <p>Draait op DSM 7 via <b>Container Manager</b>: zoek <code>nzbfast</code> in de Registry, download, koppel drie mappen en poort 6789. Geen configuratiebestand om te bewerken - voeg je provider toe in het welkomstpaneel van het dashboard.</p>
         <p class="meta">DSM 7 · Intel- + ARM-modellen · <a href="synology.html">stapsgewijze handleiding →</a></p>
       </div>
       <div class="card">
@@ -92,7 +92,7 @@
 
     <div class="callout" style="margin-top:26px"><b>Downloads verifiëren:</b> elke release levert
     sha256-sommen naast de artifacts op de releasespagina. macOS-zips behouden de executable-bits;
-    bij de eerste start wordt de quarantainevlag voor je gewist (het launcher-script doet dat — daar is het
+    bij de eerste start wordt de quarantainevlag voor je gewist (het launcher-script doet dat - daar is het
     grotendeels voor).</div>
   </div>
 </section>
@@ -101,9 +101,9 @@
   <div class="wrap">
     <h2>Twee minuten tot je eerste download</h2>
     <ul class="plain">
-      <li><b>1.</b> Pak uit en start <code>Start nzbfast</code> (mac: .command, windows: .bat) — of gewoon <code>./nzbfast setup</code> in een terminal.</li>
+      <li><b>1.</b> Pak uit en start <code>Start nzbfast</code> (mac: .command, windows: .bat) - of gewoon <code>./nzbfast setup</code> in een terminal.</li>
       <li><b>2.</b> De wizard vindt een bestaande SABnzbd/NZBGet-config en biedt aan die te gebruiken; anders vraagt hij om de host, gebruikersnaam, wachtwoord en het aantal verbindingen van je provider.</li>
-      <li><b>3.</b> Het dashboard opent op <code>http://localhost:6789</code>. Zet er een .nzb op — waar dan ook — of richt Sonarr/Radarr erop als SABnzbd-client.</li>
+      <li><b>3.</b> Het dashboard opent op <code>http://localhost:6789</code>. Zet er een .nzb op - waar dan ook - of richt Sonarr/Radarr erop als SABnzbd-client.</li>
     </ul>
     <p class="note" style="text-align:left">Upgraden is één bestand vervangen. Instellingen, wachtrij en
     geschiedenis staan naast je config en overleven herstarts en upgrades.</p>
@@ -114,18 +114,18 @@
   <div class="wrap">
     <h2>Platformnotities</h2>
     <ul class="plain">
-      <li><b>Raspberry Pi / ARM-NAS</b> — gebruik de Linux arm64-build. De SIMD-decode van de engine heeft NEON-kernels; een Pi 5 verzadigt gigabit met marge over.</li>
-      <li><b>Unraid</b> — installeer via Community Apps zodra het template gepubliceerd is (met de Docker-image eronder); tot die tijd voeg je de image handmatig toe.</li>
-      <li><b>TrueNAS SCALE</b> — draai de Docker-image als custom app.</li>
-      <li><b>FreeBSD / overige</b> — <code>cargo build --release</code> vanaf de broncode werkt naar verwachting (rustls, geen OpenSSL); officieel niet getest. PAR2-herstel en RAR-uitpakken zijn native op alle platforms.</li>
-      <li><b>Telefoons</b> — niets te installeren: het dashboard heeft een volwaardige telefoonweergave, en nzb360/LunaSea verbinden via de NZBGet-compatibele API.</li>
+      <li><b>Raspberry Pi / ARM-NAS</b> - gebruik de Linux arm64-build. De SIMD-decode van de engine heeft NEON-kernels; een Pi 5 verzadigt gigabit met marge over.</li>
+      <li><b>Unraid</b> - installeer via Community Apps zodra het template gepubliceerd is (met de Docker-image eronder); tot die tijd voeg je de image handmatig toe.</li>
+      <li><b>TrueNAS SCALE</b> - draai de Docker-image als custom app.</li>
+      <li><b>FreeBSD / overige</b> - <code>cargo build --release</code> vanaf de broncode werkt naar verwachting (rustls, geen OpenSSL); officieel niet getest. PAR2-herstel en RAR-uitpakken zijn native op alle platforms.</li>
+      <li><b>Telefoons</b> - niets te installeren: het dashboard heeft een volwaardige telefoonweergave, en nzb360/LunaSea verbinden via de NZBGet-compatibele API.</li>
     </ul>
   </div>
 </section>
 
 <footer><div class="wrap">
   <div class="cols">
-    <div>⚡ <b>nzbfast</b> — de one-pass Usenet-downloader.</div>
+    <div>⚡ <b>nzbfast</b> - de one-pass Usenet-downloader.</div>
     <div>
       <a href="features.nl.html">Functies</a> ·
       <a href="benchmarks.nl.html">Benchmarks</a> ·
@@ -133,7 +133,7 @@
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
     </div>
   </div>
-  <p class="fine">Vrije software, GPL-3.0-or-later. PAR2-herstel en RAR-uitpakken zijn native code in de binary — geen meegeleverde tools van derden. sha256-checksums begeleiden alle artifacts.</p>
+  <p class="fine">Vrije software, GPL-3.0-or-later. PAR2-herstel en RAR-uitpakken zijn native code in de binary - geen meegeleverde tools van derden. sha256-checksums begeleiden alle artifacts.</p>
 </div></footer>
 
 </body>

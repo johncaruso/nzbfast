@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Kıyaslamalar — nzbfast</title>
+<title>Kıyaslamalar - nzbfast</title>
 <meta name="description" content="nzbfast vs SABnzbd, NZBGet ve rustnzb: özdeş donanımda 4 istemci × 6 senaryo. nzbfast'in kazanamadığı tek ayak dahil dürüst sonuçlar, yeniden üretim adımlarıyla.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
@@ -44,7 +44,7 @@
   <h1>Kıyaslamalar</h1>
   <p class="sub">Dört istemci, altı senaryo, özdeş donanım ve sağlayıcılar; sağlayıcı
   kayması birbirini götürsün diye iç içe çalıştırmalar. Ölçüt, <b>kullanılabilir bir
-  dosyaya geçen süre</b> — indirildi, doğrulandı, çıkarıldı. Kazanamadığımız tek ayak da dahil.</p>
+  dosyaya geçen süre</b> - indirildi, doğrulandı, çıkarıldı. Kazanamadığımız tek ayak da dahil.</p>
 </div>
 
 <section style="padding-top:26px">
@@ -53,8 +53,8 @@
     <h2>Kurulum</h2>
     <ul class="plain">
       <li><b>İstemciler:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (en yakın Rust benzeri), senaryo başına hepsi aynı makinede (Apple M serisi kutular: 10&nbsp;GbE'de "Avrupa" M1 Ultra, "Doğu Yakası" M3 Ultra ~2.4–3.0 Gbps hat).</li>
-      <li><b>Adalet:</b> aynı 6 sağlayıcı × 8 bağlantı, her yerde TLS, ayaklar art arda iç içe çalışır. Her rakip belgelenmiş en iyisine ince ayar edildi: SABnzbd <code>pipelining_requests=8</code> aldı (<b>1 gönderiyor — yani işlem hattısız</b>; yalnızca o ayar 190 GB süresini 24m24s'ten 19m02s'e çekti), NZBGet ArticleCache/DirectWrite/DirectUnpack/ParQuick aldı, rustnzb belgelenmiş yapılandırmasını.</li>
-      <li><b>Son durum:</b> doğrulanmış, çıkarılmış, kullanılabilir bir dosya — "indirme bitti" değil. Asıl beklediğin şey budur.</li>
+      <li><b>Adalet:</b> aynı 6 sağlayıcı × 8 bağlantı, her yerde TLS, ayaklar art arda iç içe çalışır. Her rakip belgelenmiş en iyisine ince ayar edildi: SABnzbd <code>pipelining_requests=8</code> aldı (<b>1 gönderiyor - yani işlem hattısız</b>; yalnızca o ayar 190 GB süresini 24m24s'ten 19m02s'e çekti), NZBGet ArticleCache/DirectWrite/DirectUnpack/ParQuick aldı, rustnzb belgelenmiş yapılandırmasını.</li>
+      <li><b>Son durum:</b> doğrulanmış, çıkarılmış, kullanılabilir bir dosya - "indirme bitti" değil. Asıl beklediğin şey budur.</li>
       <li><b>Yeniden üretilebilirlik:</b> her iddia, onu üreten sürücü betikleriyle kaydedilmiş, kıyaslama günlüğümüzdeki tarihli bir girişe izlenir: duvar saati + arayüz bayt sayaçları + süreç ağacı zirve RSS, 1–2 sn çözünürlük.</li>
     </ul>
   </div>
@@ -79,12 +79,12 @@
       </tbody>
     </table></div>
     <p class="note" style="text-align:left">¹ rustnzb işi 5m 42s'de bitmiş bildirdi ve
-    186.6 GB çekti — herkesten %10 daha fazla hat — ama <b>hiç çıktı dosyası bırakmadı</b>. Önceki
+    186.6 GB çekti - herkesten %10 daha fazla hat - ama <b>hiç çıktı dosyası bırakmadı</b>. Önceki
     turda da bu senaryoda başarısız oldu ("121,975 makale eksik", 71 GB öksüz kaldı).
     · ² nzbfast'in belleği işi değil, <em>yapılandırılmış bütçesini</em> izler: bu ayak varsayılan
     otomatik bütçeyi çalıştırdı; <b>1 GB</b>'a kelepçelendiğinde aynı 190 GB'lık iş yine tamamlanır,
-    yaklaşık %22 daha yavaş — aşağıdaki az bellek merdivenine bak. Daha önceki Doğu Yakası turunda
-    (~2.4–3 Gbps hat) aynı senaryo NZBGet +%30 ve SABnzbd +%111'e karşı 9m 00s çalıştı — fark hat
+    yaklaşık %22 daha yavaş - aşağıdaki az bellek merdivenine bak. Daha önceki Doğu Yakası turunda
+    (~2.4–3 Gbps hat) aynı senaryo NZBGet +%30 ve SABnzbd +%111'e karşı 9m 00s çalıştı - fark hat
     hızları boyunca korunur.</p>
   </div>
 </section>
@@ -93,7 +93,7 @@
   <div class="wrap">
     <p class="kicker">Senaryo 2 · fark boyutla büyür</p>
     <h2>İş boyutuna göre kullanılabilir dosyaya süre</h2>
-    <p class="lead">Tek geçiş, indirme sonrası doğrulama/açma geçişi olmaması demektir — bu yüzden
+    <p class="lead">Tek geçiş, indirme sonrası doğrulama/açma geçişi olmaması demektir - bu yüzden
     iş ne kadar büyükse, o kadar önde iner. Aynı makinede sıralı çalıştırmalar:</p>
     <div class="tblwrap"><table>
       <thead><tr><th>İş</th><th>nzbfast</th><th>NZBGet</th><th>SABnzbd</th></tr></thead>
@@ -106,7 +106,7 @@
       </tbody>
     </table></div>
     <p class="note" style="text-align:left">² Zirve ayak izleri (birimler + açılmış çıktı
-    aynı anda, ~156 GB) 97 GB boş alanı aştı. Tek geçiş içerik boyutunun 1 katına ihtiyaç duyar —
+    aynı anda, ~156 GB) 97 GB boş alanı aştı. Tek geçiş içerik boyutunun 1 katına ihtiyaç duyar -
     yalnızca zamanı değil, ihtiyaç duyduğun diski de yarıya indirir.</p>
   </div>
 </section>
@@ -123,7 +123,7 @@
       </tbody>
     </table></div>
     <p class="note" style="text-align:left">³ rustnzb 119 s'de indirdi, işi
-    <i>Completed</i> olarak işaretledi — ve ham gizlenmiş birimleri gönderdi: yeniden adlandırma yok,
+    <i>Completed</i> olarak işaretledi - ve ham gizlenmiş birimleri gönderdi: yeniden adlandırma yok,
     çıkarma yok. nzbfast PAR2 meta verisinden gizliliği açtı ve akış içinde çıkardı, sıfır geri
     okuma bloğu.</p>
   </div>
@@ -157,21 +157,21 @@
       <div class="card"><h3>Hasarlı depolama modu gönderisi</h3>
         <p>7.4 GB'lık bir REMUX'ta 20 zehirlenmiş makale: NZBGet kullanılabilir dosyayı <b>53 s</b>'de,
         nzbfast ise <b>58 s</b>'de bitirir. Onarımımız 32 s'de tamamlanır, 62 birimin hepsini yeniden
-        çıkarır ve çıktı bayt kesinliğindedir — üstelik NZBGet'in tam PAR2 geçişine karşılık, gereken
+        çıkarır ve çıktı bayt kesinliğindedir - üstelik NZBGet'in tam PAR2 geçişine karşılık, gereken
         20 blok için kuramsal en aza yakın 22 kurtarma bloğu çeker. Ama NZBGet ayağı beş saniye farkla
         alıyor, işte burada.</p></div>
     </div>
     <div class="callout">Neden bir kaybı hiç gösterelim ki? Çünkü kazanımlar ancak onun yanında
     inandırıcıdır. Bu sayfadaki her rakam aynı iç içe çalıştırmalardan gelir ve depo bütün süreci
-    tam bir laboratuvar defteri olarak tutar — olumsuz sonuçlar dahil.</div>
+    tam bir laboratuvar defteri olarak tutar - olumsuz sonuçlar dahil.</div>
   </div>
 </section>
 
 <section>
   <div class="wrap">
     <p class="kicker">Senaryo 6 · onu RAM'den aç bırak</p>
-    <h2>Az bellek merdiveni — ~1.1 GB RAM'de 190 GB</h2>
-    <p>Aynı dört iş, 2 GB, 1 GB ve 256 MB'lık sabit bellek bütçelerinde yeniden çalıştırıldı —
+    <h2>Az bellek merdiveni - ~1.1 GB RAM'de 190 GB</h2>
+    <p>Aynı dört iş, 2 GB, 1 GB ve 256 MB'lık sabit bellek bütçelerinde yeniden çalıştırıldı -
     otomatik boyutlandırıcının bir 8 GB kutuda, bir 4 GB kutuda ve bir 2 GB NAS'ta seçeceği şey. Her
     ayak doğru, tam doğrulanmış, çıkarılmış bir dosya üretti; zirve RSS işi değil,
     <em>bütçeyi</em> izledi. Kullanılabilir dosyaya süre, 10 GbE hat:</p>
@@ -186,9 +186,9 @@
     </table></div>
     <p class="note" style="text-align:left">Büyük işlerdeki %20–40 fazlalık bir
     10 GbE eseridir: dökülen bloklar yalnızca hat diski geçtiğinde zaman maliyeti getirir. Aynı
-    87 GB'lık iş aynı bütçelerde ~2.4 Gbps bir hatta −%1 ila +%7 ölçtü — gürültü.
+    87 GB'lık iş aynı bütçelerde ~2.4 Gbps bir hatta −%1 ila +%7 ölçtü - gürültü.
     Tipik bir ev bağlantısında küçük bir bütçe herhangi bir iş boyutunda neredeyse bedavadır. Bir
-    NAS profili (2 bağlantı, 256 MB bütçe) 35 GB'lık işi 0.4 GB zirve RSS'te bitirdi — bir 2 GB NAS
+    NAS profili (2 bağlantı, 256 MB bütçe) 35 GB'lık işi 0.4 GB zirve RSS'te bitirdi - bir 2 GB NAS
     bunu çalıştırabilir. Başka hiçbir istemci bir bellek tavanı sunmaz bile.</p>
   </div>
 </section>
@@ -200,12 +200,12 @@
     <div class="tblwrap"><table>
       <thead><tr><th></th><th>nzbfast</th><th>SABnzbd 5</th><th>NZBGet 26</th><th>rustnzb</th><th>Usenapp</th><th>Newsbin</th></tr></thead>
       <tbody>
-        <tr><td>işlem hattı NNTP</td><td class="yes">evet</td><td class="half">varsayılan kapalı</td><td class="no">hayır</td><td class="yes">evet</td><td class="no">—</td><td class="no">—</td></tr>
+        <tr><td>işlem hattı NNTP</td><td class="yes">evet</td><td class="half">varsayılan kapalı</td><td class="no">hayır</td><td class="yes">evet</td><td class="no">-</td><td class="no">-</td></tr>
         <tr><td>indirme sırasında tam doğrulama</td><td class="yes">her blok</td><td class="no">sonra</td><td class="half">hızlı denetim</td><td class="no">sonra</td><td class="no">sonra</td><td class="no">sonra</td></tr>
         <tr><td>indirme sırasında çıkarma</td><td class="yes">akış içi, diskte birim yok</td><td class="half">doğrudan açma⁴</td><td class="half">doğrudan açma⁴</td><td class="half">güvenilmez⁵</td><td class="no">hayır</td><td class="no">hayır</td></tr>
         <tr><td>N-GB gönderi için gereken disk</td><td class="yes">~1×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td></tr>
         <tr><td>indirme öncesi tamamlanabilirlik kararı</td><td class="yes">blok kesinlikli</td><td class="no">hayır</td><td class="half">sağlık %</td><td class="no">hayır</td><td class="yes">makale denetimi</td><td class="no">hayır</td></tr>
-        <tr><td>sınırlı bellek (asla takas)</td><td class="yes">bütçeli</td><td class="no">9.3 GB @ 190 GB</td><td class="half">önbellek ayarı</td><td class="no">hayır</td><td class="no">—</td><td class="no">—</td></tr>
+        <tr><td>sınırlı bellek (asla takas)</td><td class="yes">bütçeli</td><td class="no">9.3 GB @ 190 GB</td><td class="half">önbellek ayarı</td><td class="no">hayır</td><td class="no">-</td><td class="no">-</td></tr>
         <tr><td>indirirken dosyayı herhangi bir noktada kontrol et</td><td class="yes">evet</td><td class="no">hayır</td><td class="no">hayır</td><td class="no">hayır</td><td class="half">sıralı</td><td class="no">hayır</td></tr>
         <tr><td>gömülü dizinleyici + poster duvarı</td><td class="yes">evet, anahtarsız</td><td class="no">hayır</td><td class="no">hayır</td><td class="no">hayır</td><td class="half">arama arayüzü</td><td class="half">grup tarayıcısı</td></tr>
         <tr><td>Sonarr/Radarr tak-çalıştır</td><td class="yes">SAB API + Newznab</td><td class="yes">yerel</td><td class="yes">yerel</td><td class="half">kısmi</td><td class="no">hayır</td><td class="no">hayır</td></tr>
@@ -216,7 +216,7 @@
         <tr><td>platformlar</td><td class="yes">mac/win/linux/docker</td><td class="yes">mac/win/linux</td><td class="yes">mac/win/linux</td><td class="half">linux/win</td><td class="no">yalnızca mac</td><td class="no">yalnızca win</td></tr>
       </tbody>
     </table></div>
-    <p class="note" style="text-align:left">⁴ Doğrudan açma yine de önce birimleri gerçekleştirir —
+    <p class="note" style="text-align:left">⁴ Doğrudan açma yine de önce birimleri gerçekleştirir -
     2× yazma ve 2× disk. ⁵ rustnzb turumuzda "Completed" olarak işaretli gizlenmiş birimleri gönderdi
     (açması ayrıca devre dışı bırakılmazsa RARLab unrar ile takılır). ⁶ GPL-3.0-or-later.
     Usenapp/Newsbin, indirici özellikleri olan tek platformlu ticari okuyuculardır; hızda
@@ -230,21 +230,21 @@
     <h2>Motor gerçek hatları doyurur</h2>
     <ul class="plain">
       <li><b>8.31 Gbps toplam</b>, ölçülen 8.2 Gbps'lik bir 10 GbE hatta (Avrupa M1 Ultra, 4 sağlayıcı, 14,000 makale, 0 hata, 0 yeniden bağlanma).</li>
-      <li><b>9.16–9.27 Gbps</b> aynı hatta düzenli taşıma tikleri — pratik TCP goodput'unun ≈%98'i.</li>
+      <li><b>9.16–9.27 Gbps</b> aynı hatta düzenli taşıma tikleri - pratik TCP goodput'unun ≈%98'i.</li>
       <li><b>5.44 Gbps sürekli</b>, akış içi doğrulama <i>dahil</i> tam bir 20.4 GB'lık iş boyunca.</li>
-      <li><b>Her RTT'de yinelenen işlem hatlama</b>: 63 ms Starlink'te +%64, 14 ms veri merkezinde +%170–177, 31 ms Doğu Yakası'nda +%270 — yalnızca gecikmeyi değil, TCP tıkanıklık penceresi düşüşünü yener.</li>
-      <li><b>Geri basınç kanıtı</b>: yazma aşamasını ağın 4× altına sınırla ve giriş 2 sn içinde sınıra ±%1 kilitlenir, RAM <i>düşer</i>, sıfır takas — yavaş bir disk belleği asla şişiremez.</li>
-      <li><b>İşlem payı</b>: Apple silicon'da ölçülen 86–165 Gbps kod çözme+doğrulama tavanları — ağ, test edilen her makinede 4–50× darboğazdır.</li>
+      <li><b>Her RTT'de yinelenen işlem hatlama</b>: 63 ms Starlink'te +%64, 14 ms veri merkezinde +%170–177, 31 ms Doğu Yakası'nda +%270 - yalnızca gecikmeyi değil, TCP tıkanıklık penceresi düşüşünü yener.</li>
+      <li><b>Geri basınç kanıtı</b>: yazma aşamasını ağın 4× altına sınırla ve giriş 2 sn içinde sınıra ±%1 kilitlenir, RAM <i>düşer</i>, sıfır takas - yavaş bir disk belleği asla şişiremez.</li>
+      <li><b>İşlem payı</b>: Apple silicon'da ölçülen 86–165 Gbps kod çözme+doğrulama tavanları - ağ, test edilen her makinede 4–50× darboğazdır.</li>
     </ul>
     <div class="callout">Depodan kalıcı kural: <b>her performans iddiası yeniden üretilebilir bir
     komut ve altında çalıştığı koşulları anar.</b> Bütün süreç, depoda tarihli bir laboratuvar
-    defteri olarak yaşar — olumsuz sonuçlar ve yanlış dönüşler dahil.</div>
+    defteri olarak yaşar - olumsuz sonuçlar ve yanlış dönüşler dahil.</div>
   </div>
 </section>
 
 <footer><div class="wrap">
   <div class="cols">
-    <div>⚡ <b>nzbfast</b> — tek geçişli Usenet indiricisi.</div>
+    <div>⚡ <b>nzbfast</b> - tek geçişli Usenet indiricisi.</div>
     <div>
       <a href="features.tr.html">Özellikler</a> ·
       <a href="benchmarks.tr.html">Kıyaslamalar</a> ·

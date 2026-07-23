@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>nzbfast — cel mai rapid descărcător NZB</title>
+<title>nzbfast - cel mai rapid descărcător NZB</title>
 <meta name="description" content="Un descărcător Usenet într-o singură trecere: decodează, verifică și extrage în timpul descărcării. 190 GB către un fișier verificat și redabil în 9 minute. macOS, Windows, Linux, Docker.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
@@ -44,7 +44,7 @@
   <h1>De la NZB la <em>un fișier verificat</em><br>înainte ca alții să termine descărcarea.</h1>
   <p class="sub">nzbfast este un descărcător Usenet construit în jurul unui pipeline într-o singură trecere:
   fiecare octet este decodat, verificat și extras <b>în timp ce se descarcă</b>.
-  Nu urmează nicio trecere de asamblare, nu mai rămâne nimic de verificat sau dezarhivat odată terminat — în clipa
+  Nu urmează nicio trecere de asamblare, nu mai rămâne nimic de verificat sau dezarhivat odată terminat - în clipa
   în care bara de progres se umple, fișierul e gata și demonstrabil intact.</p>
   <div class="chips">
     <span class="chip"><b>8.31&nbsp;Gbps</b> pe o linie de 10&nbsp;GbE</span>
@@ -57,7 +57,7 @@
     <a class="btn" href="download.ro.html">Descarcă</a>
     <a class="btn ghost" href="benchmarks.ro.html">Vezi cifrele</a>
   </div>
-  <p class="note">macOS · Windows · Linux · Docker — un singur executabil de sine stătător, cu instrumentele de reparare și dezarhivare integrate.</p>
+  <p class="note">macOS · Windows · Linux · Docker - un singur executabil de sine stătător, cu instrumentele de reparare și dezarhivare integrate.</p>
   <figure class="shot heroShot"><img src="assets/dash-hero.png" alt="panoul nzbfast în timpul unei descărcări, la 61 MB/s: debit cu vârf de 104 MB/s pe un grafic de istoric complet, grafice live de resurse și per provider, și etapele pipeline-ului descărcare/verificare/extragere suprapunându-se"></figure>
 </div>
 
@@ -65,18 +65,18 @@
   <div class="wrap">
     <p class="kicker">De ce e rapid</p>
     <h2>Trei idei pe care clienții obișnuiți nu le exploatează pe deplin</h2>
-    <p class="lead">Nu micro-optimizare — arhitectură. Fiecare este măsurată în
+    <p class="lead">Nu micro-optimizare - arhitectură. Fiecare este măsurată în
     <a href="benchmarks.ro.html">jurnalul de benchmark</a> cu comenzi reproductibile.</p>
     <div class="grid3">
       <div class="card"><span class="ic">🔁</span><h3>NNTP cu pipelining</h3>
         <p>Mai multe cereri de articole rămân în tranzit per conexiune, așa că dus-întorsurile nu lasă niciodată
-        socketul inactiv — iar TCP nu-și degradează niciodată fereastra de congestie între articole.
+        socketul inactiv - iar TCP nu-și degradează niciodată fereastra de congestie între articole.
         Măsurat +12% până la +270% față de serial la patru servere; o linie se saturează cu 8
         conexiuni în loc de 30–50.</p></div>
       <div class="card"><span class="ic">🚿</span><h3>Pipeline-ul într-o singură trecere</h3>
         <p>Articolele sunt decodate SIMD pe loc, scrise o singură dată la offset-urile lor finale,
         verificate PAR2 din bufferele de decodare, iar conținutul RAR în mod store este
-        extras <i>în timpul</i> descărcării — volumele nu există niciodată ca fișiere.
+        extras <i>în timpul</i> descărcării - volumele nu există niciodată ca fișiere.
         Scrieri pe disc = conținut × 1.0.</p></div>
       <div class="card"><span class="ic">🕸️</span><h3>Disponibilitate prin uniune</h3>
         <p>Un articol este „lipsă” doar când <i>fiecare</i> backbone configurat l-a
@@ -92,24 +92,24 @@
     <p class="kicker">Pipeline-ul</p>
     <h2>Atinge fiecare octet o singură dată</h2>
     <p class="lead">Concurenții scriu volumele de arhivă, le citesc înapoi pentru verificare, le citesc
-    din nou pentru extragere, apoi scriu ieșirea — aproximativ 2× scrieri și 2× citiri.
+    din nou pentru extragere, apoi scriu ieșirea - aproximativ 2× scrieri și 2× citiri.
     nzbfast face în schimb asta:</p>
     <div class="pipe"><pre>
-socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s per core)
+socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place - 4.95 GB/s per core)
                    │
                    ├─▶ <b>pwrite at final offset</b>          (plain posts)
                    │      └─ or: RAR-map translate ─▶ pwrite straight into the
-                   │         <em>extracted</em> file (store-mode posts — the rar
+                   │         <em>extracted</em> file (store-mode posts - the rar
                    │         volumes never touch disk)
-                   ├─▶ <b>PAR2 block hasher</b> — every block MD5-verified from the
+                   ├─▶ <b>PAR2 block hasher</b> - every block MD5-verified from the
                    │      decode buffer; verification finishes with the download
-                   └─▶ <b>availability ledger</b> — block-exact health, live
+                   └─▶ <b>availability ledger</b> - block-exact health, live
 </pre></div>
     <div class="callout">Postare deteriorată? Blocurile defecte sunt cunoscute în clipa în care articolele lor eșuează,
     <b>minimul exact potrivit</b> de volume de recuperare este preluat <b>în timpul</b> descărcării
     (22 de blocuri preluate pentru 20 necesare, în runda de benchmark), iar repararea atinge doar zonele
     deteriorate. Postare imposibilă? Abandonează în câteva secunde după ce a descărcat aproape
-    nimic — înainte ca cota ta să observe.</div>
+    nimic - înainte ca cota ta să observe.</div>
   </div>
 </section>
 
@@ -117,22 +117,22 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
   <div class="wrap">
     <p class="kicker">Funcții principale</p>
     <h2>Tot ce are nevoie o configurație serioasă</h2>
-    <p class="lead">Lista completă — fiecare reglaj, fiecare integrare — este pe
+    <p class="lead">Lista completă - fiecare reglaj, fiecare integrare - este pe
     <a href="features.ro.html">pagina de funcții</a>.</p>
     <div class="grid2">
       <ul class="feat">
-        <li><b>Descărcări la viteza liniei</b> <span class="d">— NNTP cu pipelining măsurat la 8.31 Gbps pe 10 GbE; cel mai rapid client pe fiecare probă de benchmark curată, la orice dimensiune.</span></li>
-        <li><b>Pipeline într-o singură trecere</b> <span class="d">— decodarea, verificarea și extragerea se suprapun; volumele RAR în mod store nu ating niciodată discul; are nevoie de 1× disc unde alții au nevoie de ~2×.</span></li>
-        <li><b>Disponibilitate prin uniune multi-provider</b> <span class="d">— rutare exactă la nivel de bloc între backbone-uri; verdicte preflight; reparare exact potrivită; abandon timpuriu al postărilor imposibile.</span></li>
-        <li><b>Buget de memorie</b> <span class="d">— un singur buget global de RAM cu niveluri elegante de spill. Nu îți solicită niciodată swap-ul mașinii: un job de 190 GB se finalizează într-un buget de 1 GB (~1.1 GB RSS de vârf).</span></li>
-        <li><b>Reluare sigură la blocare</b> <span class="d">— un jurnal la nivel de articol înseamnă că o blocare sau un kill −9 în mijlocul descărcării nu costă aproape nimic: se reia, repreluând doar ce nu a fost salvat.</span></li>
+        <li><b>Descărcări la viteza liniei</b> <span class="d">- NNTP cu pipelining măsurat la 8.31 Gbps pe 10 GbE; cel mai rapid client pe fiecare probă de benchmark curată, la orice dimensiune.</span></li>
+        <li><b>Pipeline într-o singură trecere</b> <span class="d">- decodarea, verificarea și extragerea se suprapun; volumele RAR în mod store nu ating niciodată discul; are nevoie de 1× disc unde alții au nevoie de ~2×.</span></li>
+        <li><b>Disponibilitate prin uniune multi-provider</b> <span class="d">- rutare exactă la nivel de bloc între backbone-uri; verdicte preflight; reparare exact potrivită; abandon timpuriu al postărilor imposibile.</span></li>
+        <li><b>Buget de memorie</b> <span class="d">- un singur buget global de RAM cu niveluri elegante de spill. Nu îți solicită niciodată swap-ul mașinii: un job de 190 GB se finalizează într-un buget de 1 GB (~1.1 GB RSS de vârf).</span></li>
+        <li><b>Reluare sigură la blocare</b> <span class="d">- un jurnal la nivel de articol înseamnă că o blocare sau un kill −9 în mijlocul descărcării nu costă aproape nimic: se reia, repreluând doar ce nu a fost salvat.</span></li>
       </ul>
       <ul class="feat">
-        <li><b>API-uri drop-in</b> <span class="d">— API compatibil SABnzbd și NZBGet JSON-RPC: Sonarr, Radarr, nzb360 și LunaSea funcționează nemodificate. Import cu un clic al configurației tale SAB/NZBGet.</span></li>
-        <li><b>Indexer integrat</b> <span class="d">— scanează newsgroup-urile tale într-un index local căutabil, servește Newznab ca stack-ul tău *arr să-l poată căuta și el.</span></li>
-        <li><b>Perete de postere cu metadate fără cheie</b> <span class="d">— grafică, note, distribuție și sinopsisuri pentru tot ce e în indexul tău, fără nicio cheie API de creat.</span></li>
-        <li><b>Automatizare watchlist</b> <span class="d">— numește un serial sau un film (difuzat sau nu); este preluat în clipa în care apare, apoi îmbunătățit ca calitate până se atinge ținta ta.</span></li>
-        <li><b>Un singur executabil</b> <span class="d">— repararea (par2) și dezarhivarea (RAR) sunt în interiorul binarului. Dezarhivezi, rulezi, gata.</span></li>
+        <li><b>API-uri drop-in</b> <span class="d">- API compatibil SABnzbd și NZBGet JSON-RPC: Sonarr, Radarr, nzb360 și LunaSea funcționează nemodificate. Import cu un clic al configurației tale SAB/NZBGet.</span></li>
+        <li><b>Indexer integrat</b> <span class="d">- scanează newsgroup-urile tale într-un index local căutabil, servește Newznab ca stack-ul tău *arr să-l poată căuta și el.</span></li>
+        <li><b>Perete de postere cu metadate fără cheie</b> <span class="d">- grafică, note, distribuție și sinopsisuri pentru tot ce e în indexul tău, fără nicio cheie API de creat.</span></li>
+        <li><b>Automatizare watchlist</b> <span class="d">- numește un serial sau un film (difuzat sau nu); este preluat în clipa în care apare, apoi îmbunătățit ca calitate până se atinge ținta ta.</span></li>
+        <li><b>Un singur executabil</b> <span class="d">- repararea (par2) și dezarhivarea (RAR) sunt în interiorul binarului. Dezarhivezi, rulezi, gata.</span></li>
       </ul>
     </div>
   </div>
@@ -143,7 +143,7 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
     <p class="kicker">Benchmark-uri</p>
     <h2>190.6 GB → un fișier verificat de 167.9 GB</h2>
     <p class="lead">Aceeași mașină, aceiași șase provideri, rulări intercalate una după alta.
-    Timpul până la existența unui fișier utilizabil și extras — singura măsură care contează.
+    Timpul până la existența unui fișier utilizabil și extras - singura măsură care contează.
     Fiecare concurent reglat la maximul său documentat (inclusiv activarea pipelining-ului
     SABnzbd, pe care nu îl are <i>pornit</i> din fabrică).</p>
     <div class="bars">
@@ -153,7 +153,7 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
       <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">niciun fișier utilizabil</span></div>
     </div>
     <p class="note" style="text-align:left">NZB de 190.6 GB → un singur mkv de 167.9 GB, M1 Ultra pe 10 GbE, 6 provideri × 8 conexiuni.
-    Același job se finalizează într-un buget de memorie de 1 GB. Tabele complete, șase scenarii și singura probă pe care <i>n-o câștigăm</i> — plus cum să reproduci —
+    Același job se finalizează într-un buget de memorie de 1 GB. Tabele complete, șase scenarii și singura probă pe care <i>n-o câștigăm</i> - plus cum să reproduci -
     pe <a href="benchmarks.ro.html">pagina de benchmark-uri</a>.</p>
   </div>
 </section>
@@ -163,13 +163,13 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
     <p class="kicker">Vitrina</p>
     <h2>Indexul tău, prezentat ca un perete de postere</h2>
     <p class="lead">Indexerul integrat scanează newsgroup-urile care te interesează; peretele transformă
-    rezultatul în postere, note, distribuție și grile de episoade — folosind doar surse publice fără
+    rezultatul în postere, note, distribuție și grile de episoade - folosind doar surse publice fără
     cheie, preluate de propria ta instalare. Dă clic pe o insignă de episod pentru a-l descărca.</p>
     <figure class="shot"><img src="assets/wall-grid.jpg" alt="peretele de postere nzbfast: o grilă de postere TV cu insigne de calitate, note și numărul de sezoane" loading="lazy"></figure>
     <div style="height:18px"></div>
     <div class="strip">
       <figure><div class="shot"><img src="assets/wall-sheet.jpg" alt="Fișă de detalii pentru un serial: fundal, notă IMDb, distribuție, sinopsis, insigne de descărcare per episod" loading="lazy"></div>
-        <figcaption>Note, distribuție, sinopsis, grilă de episoade — fără chei API, niciodată.</figcaption></figure>
+        <figcaption>Note, distribuție, sinopsis, grilă de episoade - fără chei API, niciodată.</figcaption></figure>
       <figure><div class="shot"><img src="assets/dash-queue-drawer.png" alt="Coadă cu un sertar de detalii per descărcare: bare de progres per fișier, blocuri de verificare, contribuție per server" loading="lazy"></div>
         <figcaption>Fiecare descărcare se deschide în progres per fișier, stare de verificare live și contribuție per server.</figcaption></figure>
     </div>
@@ -181,11 +181,11 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
     <p class="kicker">Se potrivește cu stack-ul tău</p>
     <h2>Îndreaptă-ți instrumentele existente spre el</h2>
     <div class="grid3">
-      <div class="card"><h3>Sonarr / Radarr</h3><p>API complet compatibil SABnzbd — adaugă nzbfast ca un
+      <div class="card"><h3>Sonarr / Radarr</h3><p>API complet compatibil SABnzbd - adaugă nzbfast ca un
         client de descărcare „SABnzbd” și pur și simplu funcționează: preluări, categorii, priorități, reîncercări,
         scripturi de post-procesare (contractul SAB_*), istoric. Fațada Newznab le permite și
         *arr-urilor <i>să caute în indexul tău local</i> ca și cum ar fi un indexer.</p></div>
-      <div class="card"><h3>nzb360 / LunaSea</h3><p>Daemonul vorbește și JSON-RPC-ul NZBGet —
+      <div class="card"><h3>nzb360 / LunaSea</h3><p>Daemonul vorbește și JSON-RPC-ul NZBGet -
         telecomenzile populare de telefon controlează nzbfast nemodificat. Iar panoul în sine are un
         aspect de telefon de primă clasă pentru când ești departe de ecranul mare.</p></div>
       <div class="card"><h3>Vii de la SAB sau NZBGet?</h3><p>Un singur clic îți importă serverele dintr-o
@@ -211,7 +211,7 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
 
 <footer><div class="wrap">
   <div class="cols">
-    <div>⚡ <b>nzbfast</b> — descărcătorul Usenet într-o singură trecere.</div>
+    <div>⚡ <b>nzbfast</b> - descărcătorul Usenet într-o singură trecere.</div>
     <div>
       <a href="features.ro.html">Funcții</a> ·
       <a href="benchmarks.ro.html">Benchmark-uri</a> ·
@@ -219,9 +219,9 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
     </div>
   </div>
-  <p class="fine">Software liber, GPL-3.0-or-later. Repararea PAR2 și dezarhivarea RAR sunt cod nativ în binar — fără instrumente terțe incluse. Metadatele peretelui de postere provin din surse publice fără cheie
+  <p class="fine">Software liber, GPL-3.0-or-later. Repararea PAR2 și dezarhivarea RAR sunt cod nativ în binar - fără instrumente terțe incluse. Metadatele peretelui de postere provin din surse publice fără cheie
   (TVmaze, iTunes Search, seturi de date publice, Wikidata, Wikipedia, AniList),
-  preluate de propria ta instalare. nzbfast descarcă ceea ce îi spui — tu ești
+  preluate de propria ta instalare. nzbfast descarcă ceea ce îi spui - tu ești
   responsabil pentru ce anume este acela.</p>
 </div></footer>
 

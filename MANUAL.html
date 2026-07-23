@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>nzbfast — User Manual</title>
+<title>nzbfast - User Manual</title>
 <style>
 :root{
   --bg:#f7f8fb;--card:#ffffff;--fg:#16181d;--dim:#5b6270;--line:rgba(30,40,70,.12);
@@ -63,7 +63,7 @@ td code{white-space:nowrap}
 hr{border:none;border-top:1px solid var(--line);margin:30px 0}
 .dim{color:var(--dim)}
 /* 2b RTL (he/ar/fa): the translated manuals are served right-to-left; the
-   layout mirrors through the logical properties above. Code stays LTR —
+   layout mirrors through the logical properties above. Code stays LTR -
    inline code is isolated so CLI flags and paths never reorder, and command
    listings render left-to-right, left-aligned. (No literal tag names in this
    comment: manual-check.py scans comments too and would miscount them.) */
@@ -115,30 +115,30 @@ hr{border:none;border-top:1px solid var(--line);margin:30px 0}
 <main>
 
 <h1>⚡ nzbfast</h1>
-<p class="subtitle">The fast Usenet downloader — user manual</p>
+<p class="subtitle">The fast Usenet downloader - user manual</p>
 
 <h2 id="intro">1 · Welcome</h2>
 <p>nzbfast downloads from Usenet as fast as your line, your providers, and your
-machine allow — and usually that means <em>as fast as your line</em>. It is a single
+machine allow - and usually that means <em>as fast as your line</em>. It is a single
 self-contained program: the engine, a web dashboard, a poster-wall media browser,
 a built-in indexer, realtime preview, native PAR2 repair, and native RAR
 extraction are all inside one executable. There is nothing else to install.</p>
 <p>What makes it fast is architecture, not tweaks:</p>
 <ul>
-  <li><b>Pipelined NNTP</b> — many article requests ride each connection back-to-back,
+  <li><b>Pipelined NNTP</b> - many article requests ride each connection back-to-back,
   keeping every connection at full speed instead of waiting out round-trips.</li>
-  <li><b>A one-pass pipeline</b> — downloading, verification, and extraction overlap.
+  <li><b>A one-pass pipeline</b> - downloading, verification, and extraction overlap.
   Archive volumes are extracted <em>in the stream</em>; on a typical store-mode post the
   RAR files never touch your disk, so the job needs 1× the release size, not 2×,
   and finishes when the download finishes.</li>
-  <li><b>Multi-provider union</b> — every configured server contributes; an article
+  <li><b>Multi-provider union</b> - every configured server contributes; an article
   missing on one backbone is fetched from another. Slow or dead servers never stall
   the queue.</li>
-  <li><b>A memory budget</b> — the engine adapts to a bounded RAM allowance and
+  <li><b>A memory budget</b> - the engine adapts to a bounded RAM allowance and
   degrades to disk if needed. It never swaps your machine.</li>
 </ul>
 <p>Measured against the field on identical hardware, jobs and providers, nzbfast has
-finished a 190&nbsp;GB download in around 5 minutes on a 10&nbsp;GbE line — with the
+finished a 190&nbsp;GB download in around 5 minutes on a 10&nbsp;GbE line - with the
 leading alternatives 30–220% behind on the same tests, where they completed them at
 all. The figures are in <a href="#concepts">§3</a>.</p>
 
@@ -148,32 +148,32 @@ all. The figures are in <a href="#concepts">§3</a>.</p>
   <li>Open <code>nzbfast-&lt;version&gt;-macos.dmg</code> and drag
   <b>NzbFast</b> into <b>Applications</b> (universal: Apple Silicon + Intel).</li>
   <li>First launch: macOS warns that nzbfast isn't Apple-notarized yet.
-  Right-click the app → <b>Open</b> — or open System Settings →
+  Right-click the app → <b>Open</b> - or open System Settings →
   <b>Privacy&nbsp;&amp;&nbsp;Security</b>, scroll down, and click
   <b>Open&nbsp;Anyway</b>. This is a one-time step.</li>
-  <li>The app window shows the dashboard with a welcome card — click it and add
+  <li>The app window shows the dashboard with a welcome card - click it and add
   at least one Usenet server (host, port 563, username, password). You can add
   more later in Settings.</li>
-  <li>Drop an <code>.nzb</code> anywhere on the dashboard — or just double-click
+  <li>Drop an <code>.nzb</code> anywhere on the dashboard - or just double-click
   <code>.nzb</code> files in Finder. Downloads land in
   <code>~/Downloads/nzbfast</code>. Quit from the menu; downloads resume where
   they left off.</li>
 </ol>
 <p class="dim" style="font-size:0.92em">Prefer no app? The plain zip (binary +
-<code>Start nzbfast.command</code> launcher, same engine) still works as before —
+<code>Start nzbfast.command</code> launcher, same engine) still works as before -
 steps below under "From a terminal".</p>
 <h3>Windows</h3>
 <ol>
   <li>Run <code>nzbfast-setup-&lt;version&gt;.exe</code>. It installs for your user
   only (no administrator password). Because this release is not yet code-signed,
-  SmartScreen may show "Windows protected your PC" — click <b>More info</b> →
+  SmartScreen may show "Windows protected your PC" - click <b>More info</b> →
   <b>Run anyway</b>.</li>
   <li>nzbfast lives in the system tray: double-click the tray icon (or use
   <b>Open Dashboard</b> in its right-click menu) to open the dashboard, then add
   your Usenet server from the welcome card. The tray menu also has Pause/Resume,
   your downloads folder, and Quit.</li>
   <li>Double-clicking a <code>.nzb</code> file queues it. Windows Defender may ask
-  once to allow local network listening — allow it.</li>
+  once to allow local network listening - allow it.</li>
 </ol>
 <p>Prefer a portable copy? The <code>-windows-x64.zip</code> still works: unzip
 anywhere and double-click <code>nzbfast.exe</code> (or <code>Start nzbfast.bat</code>)
@@ -193,7 +193,7 @@ on the command line.</div>
 <tr><td><b>Provider / server</b></td><td>A Usenet service you have an account with
 (Newshosting, Eweka, XS News…). Each allows some number of simultaneous connections.</td></tr>
 <tr><td><b>Backbone</b></td><td>The infrastructure behind a provider. Several brands often
-resell the same backbone — useful to know, because two providers on one backbone
+resell the same backbone - useful to know, because two providers on one backbone
 miss the <em>same</em> articles. See <a href="#performance">Server diversity</a>.</td></tr>
 <tr><td><b>NZB</b></td><td>A small XML file listing the articles that make up a post.
 This is what you feed nzbfast.</td></tr>
@@ -202,7 +202,7 @@ against it <em>during</em> the download and repairs automatically when articles 
 damaged or missing.</td></tr>
 <tr><td><b>Store-mode RAR</b></td><td>Most releases are packed into RAR volumes without
 compression. nzbfast recognises this and writes the <em>inner file</em> directly to its
-final location while downloading — no unpack step afterwards.</td></tr>
+final location while downloading - no unpack step afterwards.</td></tr>
 </table>
 <p>The pipeline runs download → decode → verify → extract <em>concurrently</em>. The
 Pipeline card on the dashboard shows all three lanes moving at once. When the last
@@ -210,15 +210,15 @@ byte arrives, verification is already done and the file is already extracted; a
 typical job's "post-processing" time is zero. If repair is needed, only then are
 volumes materialised to disk, repaired in place by the native GF(2¹⁶) engine
 (renamed or byte-shifted obfuscated data is found and adopted by a sliding
-block scan), and re-extracted — all automatic.</p>
+block scan), and re-extracted - all automatic.</p>
 <p>Interrupted downloads (crash, power loss, <kbd>kill&nbsp;-9</kbd>) resume from the
 <b>article journal</b>: bytes already on disk are never fetched twice. The journal
-records where every article's bytes physically landed — even bytes that were
-direct-extracted into the final file — so a resume rebuilds from local disk and
+records where every article's bytes physically landed - even bytes that were
+direct-extracted into the final file - so a resume rebuilds from local disk and
 re-verifies everything it restored against the PAR2 block map before trusting it.</p>
 <h3>How that compares</h3>
 <p>Measured against SABnzbd 5.0.4 and NZBGet 26.2 on the same machine, the same
-providers and the same NZBs, timed to a <em>usable file</em> — download, verify,
+providers and the same NZBs, timed to a <em>usable file</em> - download, verify,
 repair and extract all included, because that is when the job is actually done:</p>
 <table>
 <tr><th>Job size</th><th>nzbfast</th><th>NZBGet 26.2</th><th>SABnzbd 5.0.4</th></tr>
@@ -228,7 +228,7 @@ repair and extract all included, because that is when the job is actually done:<
 <tr><td>190 GB</td><td><b>9 m 00 s</b></td><td>+30%</td><td>+111%</td></tr>
 </table>
 <p>The gap is the post-processing the others still have to do after the last byte
-lands. Both competitors were tuned for the comparison, not left on defaults —
+lands. Both competitors were tuned for the comparison, not left on defaults -
 SABnzbd in particular ships with request pipelining <em>off</em>, which costs it
 dearly, so it was switched on.</p>
 <p>Two differences matter as much as the times:</p>
@@ -238,12 +238,12 @@ archive volumes and then unpack them need <b>2×</b>. On a test machine with 97 
 free, an 87 GB job finished here in 3 m 08 s and the other two <em>could not run at
 all</em>.</li>
 <li><b>Memory.</b> On the 190 GB job, peak usage was 3.9 GB against SABnzbd's 9.3 GB
-— and nzbfast will do the same job in about 1 GB if told to (see
+- and nzbfast will do the same job in about 1 GB if told to (see
 <a href="#memory">Memory budget</a>).</li>
 </ul>
 <div class="note"><b>Crash resume, measured</b>Kill a download mid-flight
 (<kbd>kill&nbsp;-9</kbd> at 15 GB of a 34.5 GB job) and the resume re-fetches
-<b>~0.3 GB</b> — only the articles genuinely in flight at the kill — against
+<b>~0.3 GB</b> - only the articles genuinely in flight at the kill - against
 NZBGet's 0.2 GB in the same test. This used to be a loss we published (15.3 GB
 re-fetched, when the journal couldn't account for direct-extracted bytes); the
 placement journal fixed it: the resume restores those bytes from the local output
@@ -253,13 +253,13 @@ method and raw numbers.</div>
 
 <h2 id="dashboard">4 · The dashboard</h2>
 <p>Open <code>http://localhost:6789</code> (or your machine's address from another
-device — the phone layout adapts automatically). Everything updates live, once a
+device - the phone layout adapts automatically). Everything updates live, once a
 second. The cards, top to bottom:</p>
 <h3>Header bar</h3>
 <ul>
-<li><b>Speed limit</b> menu — fixed caps, <i>auto · yield to LAN</i> (an RTT-governed
+<li><b>Speed limit</b> menu - fixed caps, <i>auto · yield to LAN</i> (an RTT-governed
 mode that backs off when someone else in the house needs the line), or unlimited.</li>
-<li><b>Pause for…</b> — pause everything for 15&nbsp;min/30&nbsp;min/1&nbsp;h/3&nbsp;h with
+<li><b>Pause for…</b> - pause everything for 15&nbsp;min/30&nbsp;min/1&nbsp;h/3&nbsp;h with
 automatic resume, or use the Pause button for an open-ended pause. Pause is
 immediate: the active transfer stops within seconds and resumes later from the
 journal, losing nothing. (Force-priority jobs keep downloading, SABnzbd-style.)</li>
@@ -269,16 +269,16 @@ journal, losing nothing. (Force-priority jobs keep downloading, SABnzbd-style.)<
 <h3>Throughput</h3>
 <p>Live MB/s with a scrolling chart; the dashed watermarks mark this session's
 high/low, the faint line is a moving average. Below it, a histogram shows how the
-session's speed samples distribute — typical vs peak. Widen the window and the
+session's speed samples distribute - typical vs peak. Widen the window and the
 charts show more history (up to an hour).</p>
 <h3>Stat tiles</h3>
 <p>Downloaded this session, queue depth, completed/failed counts, session peak speed.</p>
-<h3 id="dash-resources">Resources — one machine, four ceilings</h3>
+<h3 id="dash-resources">Resources - one machine, four ceilings</h3>
 <p>CPU, RAM (against nzbfast's memory budget), disk write rate and network on one
 normalized chart, with real values in the legend and a low-disk warning. No other
-NZB client shows you this; it exists to prove a point — nzbfast will max your
+NZB client shows you this; it exists to prove a point - nzbfast will max your
 <em>line</em>, not your machine.</p>
-<h3 id="dash-pipeline">Pipeline — stages overlap</h3>
+<h3 id="dash-pipeline">Pipeline - stages overlap</h3>
 <p>Three lanes: download, verify (PAR2 blocks checked), extract. On a healthy job
 all three move together.</p>
 <h3 id="dash-providers">Providers</h3>
@@ -289,7 +289,7 @@ performance every 10&nbsp;s (configurable in Settings → Interface) so your fas
 provider is always on top.</p>
 <h3 id="dash-queue">Queue</h3>
 <ul>
-<li><b>Drag rows to reorder</b> (within a priority band — Force/High still run first);
+<li><b>Drag rows to reorder</b> (within a priority band - Force/High still run first);
 change priority inline.</li>
 <li><b>Click a row</b> for the detail drawer: per-file progress bars, verify block
 counts, and which server contributed how much to <em>this</em> job.</li>
@@ -299,19 +299,19 @@ counts, and which server contributed how much to <em>this</em> job.</li>
 </ul>
 <h3 id="dash-browse">Browse index</h3>
 <p>Search everything the built-in indexer has catalogued from your watched groups
-(see <a href="#automation">Automation</a>) and download with one click — no external
+(see <a href="#automation">Automation</a>) and download with one click - no external
 indexer needed. The status line shows scan progress; <b>Scan now</b> forces a pass.</p>
 <h3>Watchlist</h3>
-<p>Add titles by name — including ones not posted yet. When a matching release
+<p>Add titles by name - including ones not posted yet. When a matching release
 appears in the index it is grabbed automatically, with quality preferences and
 upgrade rules (a better copy replaces a worse one).</p>
 <h3 id="dash-history">History</h3>
 <p>Recent downloads with status, size, location; failed jobs offer <b>Retry</b>
-(resumes from the journal). Encrypted archives show a 🔑 unlock control — enter the
+(resumes from the journal). Encrypted archives show a 🔑 unlock control - enter the
 password and the job finishes in place. The verify-health strip charts bad PAR2
-blocks per download — a rising tail means articles are arriving damaged.</p>
+blocks per download - a rising tail means articles are arriving damaged.</p>
 <h3 id="dash-usage">Data usage</h3>
-<p>Per-provider daily bars and Today / 7-day / 30-day totals — essential for metered
+<p>Per-provider daily bars and Today / 7-day / 30-day totals - essential for metered
 and block accounts. Block accounts show lifetime usage against their size.</p>
 <h3>Log, System benchmark, Connection tuning, Server diversity</h3>
 <p>An in-page log viewer, and the three self-measurement tools described in
@@ -326,8 +326,8 @@ picked up within 5 seconds and the file removed. Point your browser's download
 directory at it for one-click grabs from indexer sites.</td></tr>
 <tr><td><b>From a URL</b></td><td>Paste an NZB link (API <code>mode=addurl</code>, or via any connected app).</td></tr>
 <tr><td><b>Browse index</b></td><td>Click any complete release in the Browse card.</td></tr>
-<tr><td><b>Watchlist / RSS</b></td><td>Automatic — see <a href="#automation">Automation</a>.</td></tr>
-<tr><td><b>Sonarr/Radarr etc.</b></td><td>They send grabs straight to the queue — see <a href="#arr">§11</a>.</td></tr>
+<tr><td><b>Watchlist / RSS</b></td><td>Automatic - see <a href="#automation">Automation</a>.</td></tr>
+<tr><td><b>Sonarr/Radarr etc.</b></td><td>They send grabs straight to the queue - see <a href="#arr">§11</a>.</td></tr>
 <tr><td><b>Command line</b></td><td><code>nzbfast get file.nzb</code> downloads without the daemon.</td></tr>
 </table>
 <h3>Categories, priorities, passwords</h3>
@@ -344,20 +344,20 @@ API or afterwards from History (🔑).</li>
 <h2 id="wall">6 · The poster wall</h2>
 <p>Click <b>🎬 wall</b> in the header. The wall turns your index into a media
 browser: every recognised film and TV release as a poster tile with rating, year,
-genres, cast and synopsis — your newsgroups, browsable as a catalogue.</p>
+genres, cast and synopsis - your newsgroups, browsable as a catalogue.</p>
 <ul>
 <li><b>Tabs</b> for Films / TV / Other, instant search, and five sort orders.</li>
 <li><b>Matched only</b> is on by default, hiding unidentified junk; a "+N unmatched"
 chip reveals it.</li>
-<li>Click a tile for the detail sheet: synopsis, IMDb rating and votes, cast —
+<li>Click a tile for the detail sheet: synopsis, IMDb rating and votes, cast -
 and <b>▶ Play</b> (preview it immediately, see <a href="#preview">§7</a>) or
 <b>⬇ Download</b>.</li>
-<li><b>✎ Fix match</b> — if a title matched the wrong show or film, pick the right
+<li><b>✎ Fix match</b> - if a title matched the wrong show or film, pick the right
 one from candidate posters, or enter title/year/kind manually. Manual text is
 never overwritten by the enricher. <b>↻ Refresh metadata</b> re-fetches one title;
 Settings → Indexing can refresh all or wipe/rebuild the whole index.</li>
-<li>Metadata is <b>keyless by default</b> — TVmaze, iTunes, IMDb datasets, Wikidata,
-Wikipedia and AniList need no accounts. An OMDb key (free, email-only signup —
+<li>Metadata is <b>keyless by default</b> - TVmaze, iTunes, IMDb datasets, Wikidata,
+Wikipedia and AniList need no accounts. An OMDb key (free, email-only signup -
 there's a signup helper in Settings → Indexing) improves film matching; a TMDB key
 is honoured if you already have one.</li>
 </ul>
@@ -365,18 +365,18 @@ is honoured if you already have one.</li>
 <h2 id="preview">7 · Preview &amp; verify</h2>
 <p>You don't have to wait for a download to finish to know it's the right file.
 Open it while it downloads, check the content, language and quality are what you
-expected, and cancel early if they aren't — instead of finding out after the full
+expected, and cancel early if they aren't - instead of finding out after the full
 download.</p>
 <ul>
 <li><b>▶ Play</b> on the wall (or <code>/m3u/&lt;id&gt;</code>) hands your media player
 an URL; the daemon starts or reuses the download behind it.</li>
 <li>The <code>/stream/&lt;nzo_id&gt;</code> endpoint serves the file with full HTTP
 range support <em>while it downloads</em>. <b>Checking any point works</b>: spot-check minute 40 and
-the articles for that region are promoted to the front of the download queue —
+the articles for that region are promoted to the front of the download queue -
 it opens there in a couple of seconds instead of minutes. The head and
 tail of the file are fetched first so players find their index data immediately.</li>
 <li><b>Library mode</b>: categories listed in <i>library_cats</i> become instant
-metadata-only entries — a <code>.strm</code> file appears at once, availability is
+metadata-only entries - a <code>.strm</code> file appears at once, availability is
 verified in the background, and the real download starts when you first open it.</li>
 </ul>
 <div class="note"><b>Player note</b>VLC, IINA, mpv and Infuse all open
@@ -384,7 +384,7 @@ verified in the background, and the real download starts when you first open it.
 place of <code>localhost</code>.</div>
 <div class="note"><b>Auth note</b>With an API key set, opening a parked library
 entry over <code>/stream/&lt;id&gt;</code> requires a per-job token
-(<code>?t=…</code>) — players can't send API keys, so the <code>/m3u</code> handoff
+(<code>?t=…</code>) - players can't send API keys, so the <code>/m3u</code> handoff
 and the <code>.strm</code> pointer embed it for you; minting it (<code>/m3u</code>)
 requires the key. Plain byte-serving of an already-active download stays open, and
 keyless installs behave as before.</div>
@@ -394,7 +394,7 @@ keyless installs behave as before.</div>
 disable, reorder. Each server has:</p>
 <table>
 <tr><th>Field</th><th>Notes</th></tr>
-<tr><td>Host / port</td><td>Use SSL port <b>563</b>. TLS costs nothing measurable — nzbfast always encrypts.</td></tr>
+<tr><td>Host / port</td><td>Use SSL port <b>563</b>. TLS costs nothing measurable - nzbfast always encrypts.</td></tr>
 <tr><td>Username / password</td><td>Stored locally in <code>config.local.json</code>, never shown back to the browser. Leaving password blank on edit keeps the stored one.</td></tr>
 <tr><td>Connections</td><td>Per-server simultaneous connections. Use <b>Connection tuning</b> (<a href="#performance">§13</a>) to find each provider's sweet spot rather than guessing high.</td></tr>
 <tr><td>Level (tier)</td><td>0 = primary; higher levels are fill servers, only asked for articles every lower level missed. Put unlimited accounts at 0, block accounts at 1+.</td></tr>
@@ -404,7 +404,7 @@ disable, reorder. Each server has:</p>
 <li><b>Test</b> does a real connect + TLS + login and reports round-trip time.</li>
 <li><b>Import from SABnzbd / NZBGet…</b> scans the usual install locations, shows what
 it found, and copies servers in (skipping duplicates).</li>
-<li>Server edits apply from the <em>next</em> download — no restart.</li>
+<li>Server edits apply from the <em>next</em> download - no restart.</li>
 </ul>
 <div class="tip"><b>Recommendation</b>Two providers on <em>different</em> backbones
 beat three on the same one. Run <b>Server diversity</b> (<a href="#performance">§13</a>)
@@ -412,7 +412,7 @@ to see which of your providers actually diversify your coverage and which are
 redundant copies of each other.</div>
 
 <h2 id="settings">9 · Settings reference</h2>
-<p>Everything is configurable from the dashboard — ⚙ Settings. Values marked
+<p>Everything is configurable from the dashboard - ⚙ Settings. Values marked
 <span class="pill live">live</span> apply immediately; <span class="pill restart">restart</span>
 values apply on the next launch. Every change made here is persisted to
 <code>settings.json</code> and survives restarts (UI values win over command-line flags).</p>
@@ -420,12 +420,12 @@ values apply on the next launch. Every change made here is persisted to
 <h3>Speed &amp; scheduling <span class="pill live">live</span></h3>
 <table>
 <tr><th>Setting</th><th>What it does</th></tr>
-<tr><td>Speed limit</td><td>Cap in bytes/sec (<code>50M</code>, <code>1G</code>, 0 = unlimited). Remote apps may send percentages — set <i>Line speed</i> so they translate correctly.</td></tr>
+<tr><td>Speed limit</td><td>Cap in bytes/sec (<code>50M</code>, <code>1G</code>, 0 = unlimited). Remote apps may send percentages - set <i>Line speed</i> so they translate correctly.</td></tr>
 <tr><td>Auto speed</td><td>RTT-governed cap that yields to other household traffic and re-expands when the line is quiet.</td></tr>
 <tr><td>Auto-defer slow downloads</td><td>A job stuck on one slow server while others wait is moved to the back of the queue (progress kept). See <a href="#performance">§13</a>.</td></tr>
 <tr><td>Prefetch on idle servers</td><td>Servers useless to the active job start the next queued one. See <a href="#performance">§13</a>.</td></tr>
 <tr><td>Auto-update / Update check URL</td><td>See <a href="#updates">§14</a>.</td></tr>
-<tr><td>Line speed</td><td>Your connection's rated speed — enables percentage limits from SABnzbd-compatible apps.</td></tr>
+<tr><td>Line speed</td><td>Your connection's rated speed - enables percentage limits from SABnzbd-compatible apps.</td></tr>
 <tr><td>Weekly schedule</td><td>Row editor for time-of-week rules: pause, resume, or set a speed limit at given days/times (local time). E.g. limit to 20&nbsp;MB/s on weekdays 9–17, unlimited otherwise.</td></tr>
 </table>
 
@@ -436,7 +436,7 @@ are right for most lines; use the tuning tools before raising blindly.</p>
 
 <h3>Disk &amp; quota <span class="pill live">live</span></h3>
 <p><b>Minimum free space</b> (pause new jobs below it), <b>download quota</b> per
-day or month (UTC; Force jobs bypass), <b>memory limit</b> — the engine's RAM budget
+day or month (UTC; Force jobs bypass), <b>memory limit</b> - the engine's RAM budget
 (default: ¼ of RAM, clamped; raise it on a big-RAM box for maximum speed on huge
 jobs, and see <a href="#memory">what low memory costs</a> before lowering it)
 <span class="pill restart">restart</span>.</p>
@@ -444,7 +444,7 @@ jobs, and see <a href="#memory">what low memory costs</a> before lowering it)
 <h3>Folders &amp; processing</h3>
 <p><b>Download folder</b> <span class="pill restart">restart</span>, <b>watch folder</b>,
 <b>post-processing script</b> (run after every job with SABnzbd-compatible arguments
-and <code>SAB_*</code> environment — existing SAB scripts work unchanged),
+and <code>SAB_*</code> environment - existing SAB scripts work unchanged),
 <b>cleanup extensions</b> (junk files deleted after completion), <b>Smart Folders</b>
 and <b>TV filing</b> (see <a href="#automation">§10</a>).</p>
 
@@ -455,15 +455,15 @@ and <b>TV filing</b> (see <a href="#automation">§10</a>).</p>
 <tr><td>Scan interval</td><td>Seconds between passes (default 900).</td></tr>
 <tr><td>Backfill articles</td><td>Headers fetched on a group's very first scan.</td></tr>
 <tr><td>Deepen per scan</td><td>Each pass also indexes this many <em>older</em> articles, growing your searchable history in the background until Max age is reached (default 200,000 per pass ≈ tens of millions of articles per day of uptime).</td></tr>
-<tr><td>Max age</td><td>Ignore posts older than this (<code>90d</code>, <code>6m</code>, <code>2y</code>) — caps index size and scan time.</td></tr>
+<tr><td>Max age</td><td>Ignore posts older than this (<code>90d</code>, <code>6m</code>, <code>2y</code>) - caps index size and scan time.</td></tr>
 <tr><td>Ingest gates</td><td>JSON rules filtering what enters the index: kinds (obfuscated junk is dropped by default), year/resolution/language, size bounds.</td></tr>
 <tr><td>Scan now / deep rescan</td><td>Run a pass immediately; with a depth, re-scan that many recent headers.</td></tr>
-<tr><td>OMDb key / metadata refresh / wipe</td><td>Wall enrichment controls (<a href="#wall">§6</a>). Wipe rebuilds the database from scratch — the recovery path if it is ever corrupted.</td></tr>
+<tr><td>OMDb key / metadata refresh / wipe</td><td>Wall enrichment controls (<a href="#wall">§6</a>). Wipe rebuilds the database from scratch - the recovery path if it is ever corrupted.</td></tr>
 </table>
 
 <h3>Library, Security, Interface</h3>
 <p><b>Library</b>: categories treated as instant library entries + re-check interval.
-<b>Security</b>: the full API key (everything) and the NZB key (add-only — safe to
+<b>Security</b>: the full API key (everything) and the NZB key (add-only - safe to
 give indexer sites), both rotatable live. <b>Interface</b>: click sounds, desktop
 notifications on completion, provider re-sort interval.</p>
 
@@ -479,18 +479,18 @@ automatically.</p>
 <h3 id="auto-smart">Smart Folders</h3>
 <p>Rules evaluated when a job is added: match by pattern/keywords and size, assign a
 category (first match wins). With <b>TV filing</b> on, finished TV episodes are
-renamed and filed as <code>Show/Season 01/Show&nbsp;-&nbsp;S01E02.mkv</code> —
+renamed and filed as <code>Show/Season 01/Show&nbsp;-&nbsp;S01E02.mkv</code> -
 plex/Jellyfin-ready without an external tool.</p>
 <h3>Scheduler</h3>
 <p>The weekly schedule (see <a href="#settings">§9</a>) automates pause/resume/speed
 by time of day.</p>
 <h3>Scripts</h3>
 <p>A post-processing script receives SABnzbd's positional arguments and
-<code>SAB_*</code> environment variables — the large ecosystem of SAB scripts runs
+<code>SAB_*</code> environment variables - the large ecosystem of SAB scripts runs
 as-is.</p>
 
 <h2 id="arr">11 · Sonarr, Radarr &amp; friends</h2>
-<p>nzbfast speaks the SABnzbd API natively, so every *arr works out of the box —
+<p>nzbfast speaks the SABnzbd API natively, so every *arr works out of the box -
 and it can act as their <em>indexer</em> too.</p>
 <h3>As the download client</h3>
 <ol>
@@ -533,21 +533,21 @@ reorder/pause/delete, history, add-NZB, speed limit, pause/resume, log.</p>
 <tr><td>API key</td><td>your API key (or the NZB key for add-only access)</td></tr>
 </table>
 <h3>The dashboard on your phone</h3>
-<p>Just open <code>http://&lt;machine&gt;:6789</code> in a mobile browser — the whole
+<p>Just open <code>http://&lt;machine&gt;:6789</code> in a mobile browser - the whole
 dashboard and wall have a touch layout. The Settings → Remote access panel shows
 the exact URLs and a QR code to scan.</p>
 
 <h2 id="performance">13 · Performance tools</h2>
 <h3 id="perf-benchmark">System benchmark</h3>
-<p>One click measures your three ceilings — network throughput (a real 8-second
-multi-connection probe), CPU verification rate, and disk write speed — and leads
+<p>One click measures your three ceilings - network throughput (a real 8-second
+multi-connection probe), CPU verification rate, and disk write speed - and leads
 with the answer: <b>your expected maximum download speed and which ceiling is the
 limit</b>. The shortest bar is your bottleneck; the others show their headroom.
 Schedule it (6-hourly → weekly) and every run is logged to a history table, so you
 can see when your provider, ISP or hardware changed behaviour. Scheduled runs only
 happen while the queue is idle.</p>
 <h3 id="perf-tuning">Connection tuning</h3>
-<p>Measures one provider at rising connection counts and recommends the setting —
+<p>Measures one provider at rising connection counts and recommends the setting -
 more sockets help until the provider or your line saturates, and some providers
 punish over-asking. <b>Test all</b> compares every provider, then bursts them all
 together to check the pool saturates your line.</p>
@@ -567,14 +567,14 @@ client does cross-job overlap.</li>
 <li><b>Cross-job soak</b>: while a finished job's tail (verify/extract) completes on
 disk, the next job's download already owns the line.</li>
 </ul>
-<h3 id="memory">Memory budget — and what low memory costs</h3>
+<h3 id="memory">Memory budget - and what low memory costs</h3>
 <p>All engine caches share one budget (default ¼ of physical RAM, clamped to
 256 MB–16 GB). Set it explicitly with <i>Memory limit</i> in Settings, or
 <code>--mem-limit</code> on the command line.</p>
 <p>nzbfast is built to soak your network and your disk at the same time, and RAM is
 what lets it do both in <em>one pass</em>: articles are decoded, verified and written
 straight to their final offsets, so archive volumes need never touch the disk at all.
-Starve it of memory and nothing breaks — every cache has a spill path, and the engine
+Starve it of memory and nothing breaks - every cache has a spill path, and the engine
 degrades to more disk I/O rather than swapping or failing. But that spill is not
 free, and on big jobs you can measure it.</p>
 <p>Measured on one machine and one line (M1 Ultra, 10 GbE), same files at each
@@ -587,35 +587,35 @@ budget. Every run produced a correct, fully verified, extracted result:</p>
 <tr><td>190 GB</td><td>330 s</td><td>427 s <span class="dim">+29%</span></td><td>402 s <span class="dim">+22%</span></td><td>411 s <span class="dim">+25%</span></td></tr>
 </table>
 <p>Peak memory tracks the <em>budget</em>, not the job: that 190 GB download completes
-in about 1.1 GB of RAM. What you trade for it is time — and only on large jobs.</p>
+in about 1.1 GB of RAM. What you trade for it is time - and only on large jobs.</p>
 <ul>
 <li><b>Up to ~35 GB, low memory is free.</b> The working set fits regardless, so a
 4 GB machine finishes such a job as fast as a 64 GB one.</li>
-<li><b>Past ~87 GB you pay 20–40% — but only when your line outruns your disk.</b>
+<li><b>Past ~87 GB you pay 20–40% - but only when your line outruns your disk.</b>
 Verification blocks and archive volumes that would have stayed in RAM get written out
 and read back instead, and that only costs time if the network can deliver faster than
 the disk can absorb the extra traffic. The 20–40% above was measured on 10 GbE; the same
 87 GB job at the same budgets on a ~2.4 Gbps line showed no penalty at all (−1 to +7%,
 within run-to-run noise). The penalty is a function of how far the line outruns the
-disk, <em>not</em> of the job size — on a typical home connection a small budget is
+disk, <em>not</em> of the job size - on a typical home connection a small budget is
 close to free even on very large jobs.</li>
 <li><b>The penalty plateaus.</b> Once a job is large enough to spill, every constrained
-budget spills about the same amount — the 2 GB, 1 GB and 256 MB runs read back
+budget spills about the same amount - the 2 GB, 1 GB and 256 MB runs read back
 essentially the same number of blocks from disk, and finish within noise of each other.
 So a little more RAM below the threshold that avoids spilling entirely doesn't buy back
 the cost: give it enough to keep the job in memory, or the exact figure barely matters.</li>
 </ul>
 <div class="tip"><b>Recommendation</b>Give nzbfast roughly <b>2 GB of budget per
-100 GB</b> of the largest job you download, and leave the default alone otherwise —
+100 GB</b> of the largest job you download, and leave the default alone otherwise -
 ¼ of RAM is already the right answer on most machines. In practice: <b>4 GB RAM</b>
 covers jobs up to ~35 GB at full speed; <b>8–16 GB</b> keeps 100 GB-plus jobs there
 too; a <b>2 GB NAS</b> will finish anything you throw at it, but treat it as a
 background downloader rather than something that will saturate a fast line.</div>
 <p>On a small NAS, also drop <i>Connections</i> (2–4) along with the budget. At a
-256 MB budget and 2 connections, peak memory stays near <b>190 MB</b> — comfortably
+256 MB budget and 2 connections, peak memory stays near <b>190 MB</b> - comfortably
 inside what a 2 GB NAS has spare. Be aware that at that point the connection count,
 not the memory, is what limits you: the same 35 GB job took 286 s instead of 65 s.
-That is the honest shape of the trade — it will always finish, and finish correctly;
+That is the honest shape of the trade - it will always finish, and finish correctly;
 it just won't soak the line.</p>
 <p class="dim">Benchmarks are re-run for each release; method and per-machine
 figures are published alongside the results.</p>
@@ -624,16 +624,16 @@ figures are published alongside the results.</p>
 <ul>
 <li>nzbfast checks for new releases twice a day (configurable URL; empty disables
 checking entirely).</li>
-<li>When one exists, the header shows <b>⬆ v X available — install</b>. Click it and
+<li>When one exists, the header shows <b>⬆ v X available - install</b>. Click it and
 the new binary is downloaded, its SHA-256 checksum verified against the release
 manifest, and swapped in next to the running one (your current version is kept as
 <code>nzbfast.old</code>). Restart to run the new version.</li>
 <li><b>Auto-update</b> (Settings, off by default) does the download/verify/swap by
-itself — never while something is downloading — so a restart is all that's ever
+itself - never while something is downloading - so a restart is all that's ever
 needed.</li>
 <li><b>Installed via the Mac app or Windows installer?</b> The binary lives inside
 the app bundle / installed tree, so nzbfast won't swap it in place. The chip reads
-<b>⬆ v X available — download</b> instead and links to the download page — install
+<b>⬆ v X available - download</b> instead and links to the download page - install
 the new version the same way you installed the current one.</li>
 </ul>
 
@@ -642,9 +642,9 @@ the new version the same way you installed the current one.</li>
 <table>
 <tr><th>Command</th><th>Purpose</th></tr>
 <tr><td><code>nzbfast setup</code></td><td>Interactive server setup.</td></tr>
-<tr><td><code>nzbfast serve</code></td><td>Run the daemon (dashboard + API + automation). <code>--open</code> opens the browser; see <code>--help</code> for the full flag list — every dashboard setting has a flag twin.</td></tr>
+<tr><td><code>nzbfast serve</code></td><td>Run the daemon (dashboard + API + automation). <code>--open</code> opens the browser; see <code>--help</code> for the full flag list - every dashboard setting has a flag twin.</td></tr>
 <tr><td><code>nzbfast get file.nzb</code></td><td>Download one NZB, full pipeline, no daemon. <code>--preflight</code> aborts early if the post can't complete; <code>--password</code> for encrypted sets.</td></tr>
-<tr><td><code>nzbfast check file.nzb</code></td><td>Availability verdict — COMPLETE / REPAIRABLE / IMPOSSIBLE — without downloading payload.</td></tr>
+<tr><td><code>nzbfast check file.nzb</code></td><td>Availability verdict - COMPLETE / REPAIRABLE / IMPOSSIBLE - without downloading payload.</td></tr>
 <tr><td><code>nzbfast verify DIR</code></td><td>Verify files against the PAR2 set in a directory.</td></tr>
 <tr><td><code>nzbfast sysbench</code></td><td>The system benchmark + diversity report, in the terminal.</td></tr>
 <tr><td><code>nzbfast index / search</code></td><td>Scan groups into the index / search it, without the daemon.</td></tr>
@@ -657,7 +657,7 @@ the new version the same way you installed the current one.</li>
 command takes <code>--config</code> and <code>--help</code>.</p>
 
 <h2 id="api">16 · API overview</h2>
-<p>Base endpoint: <code>http://host:6789/api?mode=…&amp;apikey=…&amp;output=json</code> —
+<p>Base endpoint: <code>http://host:6789/api?mode=…&amp;apikey=…&amp;output=json</code> -
 SABnzbd-compatible, so existing SAB integrations work unchanged. Two keys:
 the <b>API key</b> (full control) and the <b>NZB key</b> (add-only:
 <code>addfile</code>/<code>addurl</code>).</p>
@@ -669,7 +669,7 @@ the <b>API key</b> (full control) and the <b>NZB key</b> (add-only:
 <tr><td>Index &amp; wall</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, plus newznab at <code>/api?t=caps|search|tvsearch|movie</code> and <code>/getnzb/&lt;id&gt;</code></td></tr>
 <tr><td>Automation</td><td><code>watchlist</code>, <code>watchlist_check_now</code>, <code>watch_calendar</code>, <code>feeds</code>, <code>smart_folders</code>, <code>schedule</code></td></tr>
 <tr><td>Diagnostics</td><td><code>sysbench</code>, <code>bench_history</code>, <code>connladder</code>, <code>pooltest</code>, <code>diversity</code>, <code>update_check</code>, <code>update_apply</code></td></tr>
-<tr><td>NZBGet JSON-RPC</td><td><code>/jsonrpc</code> — status, listgroups, history, append, editqueue, rate, pause, log (Basic auth: any user, API key as password)</td></tr>
+<tr><td>NZBGet JSON-RPC</td><td><code>/jsonrpc</code> - status, listgroups, history, append, editqueue, rate, pause, log (Basic auth: any user, API key as password)</td></tr>
 <tr><td>Preview / playback</td><td><code>/stream/&lt;nzo_id&gt;</code> (HTTP ranges; starting a parked library job needs <code>?t=</code> token or key), <code>/m3u/&lt;id&gt;</code> (needs key; mints the token), <code>/wall</code>, <code>/art/…</code></td></tr>
 </table>
 
@@ -678,31 +678,31 @@ the <b>API key</b> (full control) and the <b>NZB key</b> (add-only:
 <tr><th>File</th><th>Contents</th></tr>
 <tr><td><code>config.local.json</code></td><td>Server credentials and per-server options. Created by the wizard; editable in Settings. Keep it private.</td></tr>
 <tr><td><code>settings.json</code></td><td>Every setting changed in the dashboard. Lives next to the config; UI values override command-line flags. Delete a key (or the file) to fall back to flags/defaults.</td></tr>
-<tr><td><code>index.db</code></td><td>The release index (SQLite) + wall metadata. Safe to delete — it rebuilds from scanning (Settings → Indexing → Wipe does this for you).</td></tr>
+<tr><td><code>index.db</code></td><td>The release index (SQLite) + wall metadata. Safe to delete - it rebuilds from scanning (Settings → Indexing → Wipe does this for you).</td></tr>
 <tr><td><code>&lt;downloads&gt;/.spool/</code></td><td>Queue state (survives restarts), per-job NZBs, usage ledger, benchmark history, poster art cache.</td></tr>
-<tr><td>Article journal</td><td>Inside each job's output folder while incomplete — powers crash resume and retry. Removed on success.</td></tr>
-<tr><td>External tools</td><td>None needed — RAR extraction and PAR2 repair are native. If an exotic set ever needs an external <code>unrar</code> or <code>par2</code> as a fallback, nzbfast looks next to its executable, then on <code>$PATH</code>.</td></tr>
+<tr><td>Article journal</td><td>Inside each job's output folder while incomplete - powers crash resume and retry. Removed on success.</td></tr>
+<tr><td>External tools</td><td>None needed - RAR extraction and PAR2 repair are native. If an exotic set ever needs an external <code>unrar</code> or <code>par2</code> as a fallback, nzbfast looks next to its executable, then on <code>$PATH</code>.</td></tr>
 </table>
 
 <h2 id="troubleshooting">18 · Troubleshooting</h2>
 <table>
 <tr><th>Symptom</th><th>Check</th></tr>
-<tr><td>Slow downloads</td><td>Run <b>System benchmark</b> — it names the bottleneck outright. If it's network: run <b>Connection tuning</b>, check per-server connection counts, and confirm your providers aren't all one backbone (<b>Server diversity</b>).</td></tr>
+<tr><td>Slow downloads</td><td>Run <b>System benchmark</b> - it names the bottleneck outright. If it's network: run <b>Connection tuning</b>, check per-server connection counts, and confirm your providers aren't all one backbone (<b>Server diversity</b>).</td></tr>
 <tr><td>Slow only on very large jobs<br>(NAS or low-RAM machine)</td><td>Expected, and measurable: a starved memory budget spills caches to disk and costs 20–40% past ~87 GB. See <a href="#memory">Memory budget</a> for the figures and how much RAM to give it. Smaller jobs are unaffected.</td></tr>
 <tr><td>Download fails "articles missing"</td><td>The post has expired or was taken down on your providers. A second provider on a different backbone rescues most of these. <code>nzbfast check</code> predicts this before downloading.</td></tr>
-<tr><td>Finished archive wants a password</td><td>History row shows 🔑 — enter the password there; the job completes in place. </td></tr>
+<tr><td>Finished archive wants a password</td><td>History row shows 🔑 - enter the password there; the job completes in place. </td></tr>
 <tr><td>Sonarr/Radarr can't connect</td><td>Port 6789 reachable? API key correct (full key, not NZB key)? Client type set to SABnzbd?</td></tr>
-<tr><td>Browse card stays small</td><td>The indexer grows in the background — check Settings → Indexing groups are set, and give Deepen per scan time to accumulate history. "Scan now" forces a pass; the status line shows live progress.</td></tr>
+<tr><td>Browse card stays small</td><td>The indexer grows in the background - check Settings → Indexing groups are set, and give Deepen per scan time to accumulate history. "Scan now" forces a pass; the status line shows live progress.</td></tr>
 <tr><td>Wall shows wrong/no artwork</td><td>Detail sheet → ✎ Fix match or ↻ Refresh metadata. Movie lookups improve with a free OMDb key.</td></tr>
-<tr><td>Daemon won't start: port in use</td><td>Another instance is running — or change <code>--port</code>.</td></tr>
+<tr><td>Daemon won't start: port in use</td><td>Another instance is running - or change <code>--port</code>.</td></tr>
 <tr><td>Where are the logs?</td><td>The Log card on the dashboard, or the terminal/logfile you launched <code>serve</code> with.</td></tr>
 </table>
-<div class="note"><b>Still stuck?</b>The Log card usually names the culprit —
+<div class="note"><b>Still stuck?</b>The Log card usually names the culprit -
 include its tail when reporting an issue, along with your
 <code>nzbfast --version</code>.</div>
 
 <hr>
-<p class="dim">nzbfast — this manual ships with every release. Settings, endpoints
+<p class="dim">nzbfast - this manual ships with every release. Settings, endpoints
 and defaults referenced here match the version it shipped with.</p>
 
 </main>

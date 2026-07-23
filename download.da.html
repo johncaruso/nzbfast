@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Download — nzbfast</title>
+<title>Download - nzbfast</title>
 <meta name="description" content="Download nzbfast til macOS, Windows, Linux, Docker, Synology og mere. Én selvstændig eksekverbar fil med reparation og udpakning indbygget.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
@@ -42,7 +42,7 @@
 
 <div class="hero wrap" style="padding-bottom:6px">
   <h1>Én binær. <em>Alt følger med.</em></h1>
-  <p class="sub">Hvert build er én selvstændig eksekverbar fil — reparation (par2) og
+  <p class="sub">Hvert build er én selvstændig eksekverbar fil - reparation (par2) og
   udpakning (RAR) er indlejret. Pak ud, kør starteren, svar på tre spørgsmål, hent.</p>
 </div>
 
@@ -51,7 +51,7 @@
     <div class="dl">
       <div class="card">
         <h3>🍎 macOS <span class="tag now">tilgængelig</span></h3>
-        <p>NzbFast-appen — træk til Programmer og i gang. Universal (Apple Silicon og
+        <p>NzbFast-appen - træk til Programmer og i gang. Universal (Apple Silicon og
         Intel), dashboard i sit eget vindue, dobbeltklik på .nzb, start ved login.</p>
         <p class="meta">macOS 12+ · ~16 MB DMG · app + motor</p>
         <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-macos.dmg">Download Mac-appen</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-macos-universal.zip">bærbar .zip</a></p>
@@ -59,14 +59,14 @@
       <div class="card">
         <h3>🪟 Windows <span class="tag now">tilgængelig</span></h3>
         <p>Installeren sætter en tray-app op (intet konsolvindue), en post i Start-menuen,
-        valgfri start-med-Windows og dobbeltklik på .nzb. Fuldt statisk — ingen runtime
+        valgfri start-med-Windows og dobbeltklik på .nzb. Fuldt statisk - ingen runtime
         at installere; den kan også overtage din eksisterende SABnzbd-konfiguration.</p>
         <p class="meta">Windows 10/11 x64 · ~8 MB installer</p>
         <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-setup-1.0.4.exe">Download installeren</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-windows-x64.zip">bærbar .zip</a></p>
       </div>
       <div class="card">
         <h3>🐧 Linux <span class="tag now">tilgængelig</span></h3>
-        <p>Statiske musl-builds til x86_64 og arm64 — seedboxe, VPS'er, enhver NAS med SSH,
+        <p>Statiske musl-builds til x86_64 og arm64 - seedboxe, VPS'er, enhver NAS med SSH,
         Raspberry Pi 4/5. Ingen glibc-versions-roulette.</p>
         <p class="meta">x86_64 · arm64 · systemd-unit inkluderet</p>
         <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-linux-arm64.tar.gz">arm64</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-nas.zip">NAS-bundt</a></p>
@@ -80,7 +80,7 @@
       </div>
       <div class="card">
         <h3>📦 Synology <span class="tag now">tilgængelig</span></h3>
-        <p>Kører på DSM 7 via <b>Container Manager</b>: søg efter <code>nzbfast</code> i Registry, download, tilknyt tre mapper og port 6789. Ingen konfigurationsfil at redigere — tilføj din udbyder i dashboardets velkomstpanel.</p>
+        <p>Kører på DSM 7 via <b>Container Manager</b>: søg efter <code>nzbfast</code> i Registry, download, tilknyt tre mapper og port 6789. Ingen konfigurationsfil at redigere - tilføj din udbyder i dashboardets velkomstpanel.</p>
         <p class="meta">DSM 7 · Intel- + ARM-modeller · <a href="synology.html">trin-for-trin-guide →</a></p>
       </div>
       <div class="card">
@@ -92,7 +92,7 @@
 
     <div class="callout" style="margin-top:26px"><b>Verificering af downloads:</b> hver udgivelse leveres med
     sha256-summer ved siden af artefakterne på udgivelsessiden. macOS-zips bevarer eksekveringsbits;
-    første start rydder karantæneflaget for dig (starter-scriptet gør det — det er det meste af,
+    første start rydder karantæneflaget for dig (starter-scriptet gør det - det er det meste af,
     hvad det er til for).</div>
   </div>
 </section>
@@ -101,9 +101,9 @@
   <div class="wrap">
     <h2>To minutter til første download</h2>
     <ul class="plain">
-      <li><b>1.</b> Pak ud og kør <code>Start nzbfast</code> (mac: .command, windows: .bat) — eller bare <code>./nzbfast setup</code> i en terminal.</li>
+      <li><b>1.</b> Pak ud og kør <code>Start nzbfast</code> (mac: .command, windows: .bat) - eller bare <code>./nzbfast setup</code> i en terminal.</li>
       <li><b>2.</b> Guiden finder en eksisterende SABnzbd-/NZBGet-konfiguration og tilbyder at bruge den; ellers spørger den om din udbyders host, brugernavn, adgangskode og antal forbindelser.</li>
-      <li><b>3.</b> Dashboardet åbner på <code>http://localhost:6789</code>. Smid en .nzb hvor som helst på det — eller ret Sonarr/Radarr mod det som en SABnzbd-klient.</li>
+      <li><b>3.</b> Dashboardet åbner på <code>http://localhost:6789</code>. Smid en .nzb hvor som helst på det - eller ret Sonarr/Radarr mod det som en SABnzbd-klient.</li>
     </ul>
     <p class="note" style="text-align:left">At opgradere er at udskifte én fil. Indstillinger, kø og
     historik ligger ved siden af din konfiguration og overlever genstarter og opgraderinger.</p>
@@ -114,18 +114,18 @@
   <div class="wrap">
     <h2>Platformsnoter</h2>
     <ul class="plain">
-      <li><b>Raspberry Pi / ARM-NAS</b> — brug Linux arm64-buildet. Motorens SIMD-afkodning har NEON-kerner; en Pi 5 mætter gigabit med reserve.</li>
-      <li><b>Unraid</b> — installér fra Community Apps, når skabelonen er udgivet (Docker-image nedenunder); indtil da tilføjer du imaget manuelt.</li>
-      <li><b>TrueNAS SCALE</b> — kør Docker-imaget som en custom app.</li>
-      <li><b>FreeBSD / andre</b> — <code>cargo build --release</code> fra kildekode forventes at virke (rustls, ingen OpenSSL); officielt utestet. PAR2-reparation og RAR-udpakning er native på alle platforme.</li>
-      <li><b>Telefoner</b> — intet at installere: dashboardet har et førsteklasses telefonlayout, og nzb360/LunaSea forbinder via det NZBGet-kompatible API.</li>
+      <li><b>Raspberry Pi / ARM-NAS</b> - brug Linux arm64-buildet. Motorens SIMD-afkodning har NEON-kerner; en Pi 5 mætter gigabit med reserve.</li>
+      <li><b>Unraid</b> - installér fra Community Apps, når skabelonen er udgivet (Docker-image nedenunder); indtil da tilføjer du imaget manuelt.</li>
+      <li><b>TrueNAS SCALE</b> - kør Docker-imaget som en custom app.</li>
+      <li><b>FreeBSD / andre</b> - <code>cargo build --release</code> fra kildekode forventes at virke (rustls, ingen OpenSSL); officielt utestet. PAR2-reparation og RAR-udpakning er native på alle platforme.</li>
+      <li><b>Telefoner</b> - intet at installere: dashboardet har et førsteklasses telefonlayout, og nzb360/LunaSea forbinder via det NZBGet-kompatible API.</li>
     </ul>
   </div>
 </section>
 
 <footer><div class="wrap">
   <div class="cols">
-    <div>⚡ <b>nzbfast</b> — one-pass Usenet-downloaderen.</div>
+    <div>⚡ <b>nzbfast</b> - one-pass Usenet-downloaderen.</div>
     <div>
       <a href="features.da.html">Funktioner</a> ·
       <a href="benchmarks.da.html">Benchmarks</a> ·
@@ -133,7 +133,7 @@
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
     </div>
   </div>
-  <p class="fine">Fri software, GPL-3.0-or-later. PAR2-reparation og RAR-udpakning er native kode i binæren — ingen medfølgende tredjepartsværktøjer. sha256-checksummer følger alle artefakter.</p>
+  <p class="fine">Fri software, GPL-3.0-or-later. PAR2-reparation og RAR-udpakning er native kode i binæren - ingen medfølgende tredjepartsværktøjer. sha256-checksummer følger alle artefakter.</p>
 </div></footer>
 
 </body>

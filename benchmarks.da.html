@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Benchmarks — nzbfast</title>
+<title>Benchmarks - nzbfast</title>
 <meta name="description" content="nzbfast mod SABnzbd, NZBGet og rustnzb: 4 klienter × 6 scenarier på identisk hardware. Ærlige resultater, inklusive det ene ben, nzbfast ikke vinder, med reproduktionstrin.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
@@ -43,7 +43,7 @@
 <div class="hero wrap" style="padding-bottom:6px">
   <h1>Benchmarks</h1>
   <p class="sub">Fire klienter, seks scenarier, identisk hardware og udbydere, kørsler
-  flettet, så udbyderdrift ophæves. Målet er <b>tid til en brugbar fil</b> —
+  flettet, så udbyderdrift ophæves. Målet er <b>tid til en brugbar fil</b> -
   hentet, verificeret, udpakket. Inklusive det ene ben, vi ikke vinder.</p>
 </div>
 
@@ -53,8 +53,8 @@
     <h2>Opsætningen</h2>
     <ul class="plain">
       <li><b>Klienter:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (den nærmeste Rust-modpart), alle på samme maskine pr. scenarie (Apple M-serie-maskiner: "Europa" M1 Ultra på 10&nbsp;GbE, "østkysten" M3 Ultra ~2.4–3.0 Gbps-linje).</li>
-      <li><b>Fairness:</b> samme 6 udbydere × 8 forbindelser, TLS overalt, ben kørt ryg mod ryg og flettet. Hver konkurrent tunet til sit dokumenterede bedste: SABnzbd fik <code>pipelining_requests=8</code> (<b>den leveres med 1 — dvs. upipelinet</b>; alene den indstilling bragte dens 190 GB-tid fra 24m24s til 19m02s), NZBGet fik ArticleCache/DirectWrite/DirectUnpack/ParQuick, rustnzb sin dokumenterede konfiguration.</li>
-      <li><b>Sluttilstand:</b> en verificeret, udpakket, brugbar fil — ikke "download færdig". Det er det, du faktisk venter på.</li>
+      <li><b>Fairness:</b> samme 6 udbydere × 8 forbindelser, TLS overalt, ben kørt ryg mod ryg og flettet. Hver konkurrent tunet til sit dokumenterede bedste: SABnzbd fik <code>pipelining_requests=8</code> (<b>den leveres med 1 - dvs. upipelinet</b>; alene den indstilling bragte dens 190 GB-tid fra 24m24s til 19m02s), NZBGet fik ArticleCache/DirectWrite/DirectUnpack/ParQuick, rustnzb sin dokumenterede konfiguration.</li>
+      <li><b>Sluttilstand:</b> en verificeret, udpakket, brugbar fil - ikke "download færdig". Det er det, du faktisk venter på.</li>
       <li><b>Reproducerbarhed:</b> hver påstand kan spores til en dateret post i vores benchmark-log, optaget med de driver-scripts, der frembragte den: vægur + interface-byte-tællere + top-RSS for procestræet, 1–2 s opløsning.</li>
     </ul>
   </div>
@@ -79,12 +79,12 @@
       </tbody>
     </table></div>
     <p class="note" style="text-align:left">¹ rustnzb rapporterede jobbet færdigt på 5m 42s efter at have trukket
-    186.6 GB — 10% mere ledning end nogen anden — men efterlod <b>slet ingen outputfil</b>. Den fejlede også
+    186.6 GB - 10% mere ledning end nogen anden - men efterlod <b>slet ingen outputfil</b>. Den fejlede også
     dette scenarie i den forrige runde ("121,975 artikler mangler", 71 GB efterladt).
     · ² nzbfasts hukommelse følger sit <em>konfigurerede budget</em>, ikke jobbet: dette ben kørte
     standard-auto-budgettet; begrænset til <b>1 GB</b> fuldføres samme 190 GB-job stadig, cirka 22%
-    langsommere — se lav-hukommelses-stigen nedenfor. På den tidligere østkyst-runde (~2.4–3 Gbps-linje) kørte
-    samme scenarie 9m 00s mod NZBGet +30% og SABnzbd +111% — forspringet holder på tværs af linjehastigheder.</p>
+    langsommere - se lav-hukommelses-stigen nedenfor. På den tidligere østkyst-runde (~2.4–3 Gbps-linje) kørte
+    samme scenarie 9m 00s mod NZBGet +30% og SABnzbd +111% - forspringet holder på tværs af linjehastigheder.</p>
   </div>
 </section>
 
@@ -92,7 +92,7 @@
   <div class="wrap">
     <p class="kicker">Scenarie 2 · forspringet vokser med størrelsen</p>
     <h2>Tid til brugbar fil, efter jobstørrelse</h2>
-    <p class="lead">One-pass betyder ingen verificerings-/udpakningsfase efter download — så jo større jobbet er,
+    <p class="lead">One-pass betyder ingen verificerings-/udpakningsfase efter download - så jo større jobbet er,
     jo længere foran lander den. Sekventielle kørsler på samme maskine:</p>
     <div class="tblwrap"><table>
       <thead><tr><th>Job</th><th>nzbfast</th><th>NZBGet</th><th>SABnzbd</th></tr></thead>
@@ -105,7 +105,7 @@
       </tbody>
     </table></div>
     <p class="note" style="text-align:left">² Deres maksimale fodaftryk (volumener + udpakket output
-    samtidig, ~156 GB) oversteg de 97 GB fri. One-pass kræver 1× indholdets størrelse —
+    samtidig, ~156 GB) oversteg de 97 GB fri. One-pass kræver 1× indholdets størrelse -
     den halverer den disk, du har brug for, ikke kun tiden.</p>
   </div>
 </section>
@@ -122,7 +122,7 @@
       </tbody>
     </table></div>
     <p class="note" style="text-align:left">³ rustnzb hentede på 119 s, markerede jobbet
-    <i>Completed</i> — og leverede de rå obfuskerede volumener: ingen omdøbning, ingen udpakning.
+    <i>Completed</i> - og leverede de rå obfuskerede volumener: ingen omdøbning, ingen udpakning.
     nzbfast deobfuskerede ud fra PAR2-metadata og udpakkede i strømmen, nul tilbagelæsningsblokke.</p>
   </div>
 </section>
@@ -155,20 +155,20 @@
       <div class="card"><h3>Beskadiget store-mode-post</h3>
         <p>20 forgiftede artikler i en 7.4 GB REMUX: NZBGet bliver brugbar færdig på <b>53 s</b>, nzbfast
         på <b>58 s</b>. Vores reparation er færdig på 32 s, genudpakker alle 62 volumener, og outputtet er
-        byte-nøjagtigt — og den henter et næsten-teoretisk-minimum på 22 genoprettelsesblokke for de 20 nødvendige,
+        byte-nøjagtigt - og den henter et næsten-teoretisk-minimum på 22 genoprettelsesblokke for de 20 nødvendige,
         mod NZBGets fulde PAR2-gennemløb. Men NZBGet tager benet med fem sekunder, så her er det.</p></div>
     </div>
     <div class="callout">Hvorfor overhovedet vise et nederlag? Fordi sejrene kun er troværdige ved siden af det.
     Hvert tal på denne side kommer fra de samme flettede kørsler, og repoet gemmer det hele
-    som en fuld laboratoriejournal — negative resultater inkluderet.</div>
+    som en fuld laboratoriejournal - negative resultater inkluderet.</div>
   </div>
 </section>
 
 <section>
   <div class="wrap">
     <p class="kicker">Scenarie 6 · sult den for RAM</p>
-    <h2>Lav-hukommelses-stigen — 190 GB i ~1.1 GB RAM</h2>
-    <p>De samme fire job, kørt igen ved hårde hukommelsesbudgetter på 2 GB, 1 GB og 256 MB —
+    <h2>Lav-hukommelses-stigen - 190 GB i ~1.1 GB RAM</h2>
+    <p>De samme fire job, kørt igen ved hårde hukommelsesbudgetter på 2 GB, 1 GB og 256 MB -
     hvad auto-dimensioneringen ville vælge på en 8 GB-maskine, en 4 GB-maskine og en 2 GB-NAS. Hvert
     ben frembragte en korrekt, fuldt verificeret, udpakket fil; top-RSS fulgte
     <em>budgettet</em>, ikke jobbet. Tid til brugbar fil, 10 GbE-linje:</p>
@@ -183,10 +183,10 @@
     </table></div>
     <p class="note" style="text-align:left">Præmien på 20–40% på de store job er et
     10 GbE-artefakt: spillede blokke koster kun tid, når linjen løber fra disken. Samme
-    87 GB-job ved de samme budgetter på en ~2.4 Gbps-linje målte −1% til +7% — støj.
+    87 GB-job ved de samme budgetter på en ~2.4 Gbps-linje målte −1% til +7% - støj.
     På en typisk hjemmeforbindelse er et lille budget næsten gratis ved enhver jobstørrelse. En
     NAS-profil (2 forbindelser, 256 MB-budget) gjorde 35 GB-jobbet færdigt i 0.4 GB top-RSS
-    — en 2 GB-NAS kan køre dette. Ingen anden klient tilbyder overhovedet et hukommelsesloft.</p>
+    - en 2 GB-NAS kan køre dette. Ingen anden klient tilbyder overhovedet et hukommelsesloft.</p>
   </div>
 </section>
 
@@ -197,12 +197,12 @@
     <div class="tblwrap"><table>
       <thead><tr><th></th><th>nzbfast</th><th>SABnzbd 5</th><th>NZBGet 26</th><th>rustnzb</th><th>Usenapp</th><th>Newsbin</th></tr></thead>
       <tbody>
-        <tr><td>pipelinet NNTP</td><td class="yes">ja</td><td class="half">fra som standard</td><td class="no">nej</td><td class="yes">ja</td><td class="no">—</td><td class="no">—</td></tr>
+        <tr><td>pipelinet NNTP</td><td class="yes">ja</td><td class="half">fra som standard</td><td class="no">nej</td><td class="yes">ja</td><td class="no">-</td><td class="no">-</td></tr>
         <tr><td>fuld verificering under download</td><td class="yes">hver blok</td><td class="no">efter</td><td class="half">hurtigtjek</td><td class="no">efter</td><td class="no">efter</td><td class="no">efter</td></tr>
         <tr><td>udpak under download</td><td class="yes">i strømmen, ingen volumener på disk</td><td class="half">direkte udpakning⁴</td><td class="half">direkte udpakning⁴</td><td class="half">upålidelig⁵</td><td class="no">nej</td><td class="no">nej</td></tr>
         <tr><td>disk krævet til en N-GB-post</td><td class="yes">~1×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td></tr>
         <tr><td>fuldførbarheds-dom før download</td><td class="yes">blok-eksakt</td><td class="no">nej</td><td class="half">sundhed %</td><td class="no">nej</td><td class="yes">artikeltjek</td><td class="no">nej</td></tr>
-        <tr><td>begrænset hukommelse (swapper aldrig)</td><td class="yes">budgetteret</td><td class="no">9.3 GB @ 190 GB</td><td class="half">cache-indstilling</td><td class="no">nej</td><td class="no">—</td><td class="no">—</td></tr>
+        <tr><td>begrænset hukommelse (swapper aldrig)</td><td class="yes">budgetteret</td><td class="no">9.3 GB @ 190 GB</td><td class="half">cache-indstilling</td><td class="no">nej</td><td class="no">-</td><td class="no">-</td></tr>
         <tr><td>tjek filen på ethvert punkt under download</td><td class="yes">ja</td><td class="no">nej</td><td class="no">nej</td><td class="no">nej</td><td class="half">sekventiel</td><td class="no">nej</td></tr>
         <tr><td>indbygget indexer + postervæg</td><td class="yes">ja, nøglefri</td><td class="no">nej</td><td class="no">nej</td><td class="no">nej</td><td class="half">søge-UI</td><td class="half">gruppebrowser</td></tr>
         <tr><td>Sonarr/Radarr drop-in</td><td class="yes">SAB API + Newznab</td><td class="yes">native</td><td class="yes">native</td><td class="half">delvis</td><td class="no">nej</td><td class="no">nej</td></tr>
@@ -213,7 +213,7 @@
         <tr><td>platforme</td><td class="yes">mac/win/linux/docker</td><td class="yes">mac/win/linux</td><td class="yes">mac/win/linux</td><td class="half">linux/win</td><td class="no">kun mac</td><td class="no">kun win</td></tr>
       </tbody>
     </table></div>
-    <p class="note" style="text-align:left">⁴ Direkte udpakning materialiserer stadig volumenerne først —
+    <p class="note" style="text-align:left">⁴ Direkte udpakning materialiserer stadig volumenerne først -
     2× skrivninger og 2× disk. ⁵ rustnzb leverede obfuskerede volumener markeret "Completed" i vores runde
     (dens udpakning hænger også med RARLab-unrar, medmindre den er slået fra). ⁶ GPL-3.0-or-later.
     Usenapp/Newsbin er kommercielle læsere til én platform med downloader-funktioner; de er
@@ -227,21 +227,21 @@
     <h2>Motoren mætter rigtige linjer</h2>
     <ul class="plain">
       <li><b>8.31 Gbps samlet</b> på en målt-8.2 Gbps 10 GbE-linje (Europa M1 Ultra, 4 udbydere, 14,000 artikler, 0 fejl, 0 genforbindelser).</li>
-      <li><b>9.16–9.27 Gbps</b> stabile transport-tik på samme linje — ≈98% af praktisk TCP-goodput.</li>
+      <li><b>9.16–9.27 Gbps</b> stabile transport-tik på samme linje - ≈98% af praktisk TCP-goodput.</li>
       <li><b>5.44 Gbps vedvarende</b> gennem et fuldt 20.4 GB-job <i>inklusive</i> verificering i strømmen.</li>
-      <li><b>Pipelining replikeret ved enhver RTT</b>: +64% ved 63 ms Starlink, +170–177% ved 14 ms datacenter, +270% ved 31 ms østkysten — den besejrer TCP's nedbrydning af overbelastningsvinduet, ikke kun latens.</li>
-      <li><b>Modtryks-bevis</b>: begræns skrivefasen 4× under netværket, og input låser til loftet ±1% inden for 2 s, RAM <i>falder</i>, nul swaps — en langsom disk kan aldrig få hukommelsen til at eksplodere.</li>
-      <li><b>CPU-reserve</b>: målte afkodnings+verificerings-lofter på 86–165 Gbps på Apple silicon — netværket er flaskehalsen med 4–50× på hver testet maskine.</li>
+      <li><b>Pipelining replikeret ved enhver RTT</b>: +64% ved 63 ms Starlink, +170–177% ved 14 ms datacenter, +270% ved 31 ms østkysten - den besejrer TCP's nedbrydning af overbelastningsvinduet, ikke kun latens.</li>
+      <li><b>Modtryks-bevis</b>: begræns skrivefasen 4× under netværket, og input låser til loftet ±1% inden for 2 s, RAM <i>falder</i>, nul swaps - en langsom disk kan aldrig få hukommelsen til at eksplodere.</li>
+      <li><b>CPU-reserve</b>: målte afkodnings+verificerings-lofter på 86–165 Gbps på Apple silicon - netværket er flaskehalsen med 4–50× på hver testet maskine.</li>
     </ul>
     <div class="callout">Stående regel fra repoet: <b>hver ydelses-påstand citerer en reproducerbar
     kommando og de betingelser, den kørte under.</b> Det hele lever i repoet som en dateret
-    laboratoriejournal — inklusive negative resultater og forkerte drejninger.</div>
+    laboratoriejournal - inklusive negative resultater og forkerte drejninger.</div>
   </div>
 </section>
 
 <footer><div class="wrap">
   <div class="cols">
-    <div>⚡ <b>nzbfast</b> — one-pass Usenet-downloaderen.</div>
+    <div>⚡ <b>nzbfast</b> - one-pass Usenet-downloaderen.</div>
     <div>
       <a href="features.da.html">Funktioner</a> ·
       <a href="benchmarks.da.html">Benchmarks</a> ·

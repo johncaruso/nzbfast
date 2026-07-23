@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>nzbfast — nopein NZB-lataaja</title>
+<title>nzbfast - nopein NZB-lataaja</title>
 <meta name="description" content="Yhden läpimenon Usenet-lataaja: dekoodaa, varmista ja pura latauksen aikana. 190 GB varmistettuun, toistettavaan tiedostoon 9 minuutissa. macOS, Windows, Linux, Docker.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
@@ -44,7 +44,7 @@
   <h1>NZB:stä <em>varmennettuun tiedostoon</em><br>ennen kuin muut ehtivät ladata.</h1>
   <p class="sub">nzbfast on Usenet-lataaja, joka on rakennettu yhden ainoan läpimenon varaan:
   jokainen tavu dekoodataan, varmistetaan ja puretaan <b>latauksen aikana</b>.
-  Jälkeenpäin ei jää kokoamisvaihetta, ei mitään enää varmistettavaa tai purettavaa — sillä hetkellä
+  Jälkeenpäin ei jää kokoamisvaihetta, ei mitään enää varmistettavaa tai purettavaa - sillä hetkellä
   kun edistymispalkki täyttyy, tiedosto on valmis ja todistettavasti eheä.</p>
   <div class="chips">
     <span class="chip"><b>8.31&nbsp;Gbps</b> 10&nbsp;GbE-linjalla</span>
@@ -57,7 +57,7 @@
     <a class="btn" href="download.fi.html">Lataa</a>
     <a class="btn ghost" href="benchmarks.fi.html">Katso luvut</a>
   </div>
-  <p class="note">macOS · Windows · Linux · Docker — yksi itsenäinen suoritettava tiedosto, korjaus- ja purkutyökalut sisäänrakennettuina.</p>
+  <p class="note">macOS · Windows · Linux · Docker - yksi itsenäinen suoritettava tiedosto, korjaus- ja purkutyökalut sisäänrakennettuina.</p>
   <figure class="shot heroShot"><img src="assets/dash-hero.png" alt="nzbfast-koontinäyttö kesken latauksen nopeudella 61 MB/s: nopeus huipussaan 104 MB/s koko historiakaaviossa, live-resurssi- ja palveluntarjoajakaaviot sekä lataus/varmistus/purku-liukuhihnan vaiheet limittymässä"></figure>
 </div>
 
@@ -77,7 +77,7 @@
         <p>Artikkelit dekoodataan SIMD:llä paikan päällä ja kirjoitetaan kerran suoraan lopullisiin
         siirtymiinsä, minkä jälkeen ne varmistetaan PAR2:lla samoista dekoodauspuskureista. Store-tilan
         RAR-julkaisuissa sisältö puretaan <i>latauksen</i> aikana, joten osat eivät koskaan ole olemassa
-        tiedostoina — levykirjoitukset ovat sisältö × 1.0.</p></div>
+        tiedostoina - levykirjoitukset ovat sisältö × 1.0.</p></div>
       <div class="card"><span class="ic">🕸️</span><h3>Yhdistetty saatavuus</h3>
         <p>Artikkeli lasketaan ”puuttuvaksi” vasta kun <i>jokainen</i> määritetty backbone on torjunut
         sen. Lohkotarkka kirjanpito julistaa työn tilaan COMPLETE, REPAIRABLE tai IMPOSSIBLE ennen
@@ -92,24 +92,24 @@
     <p class="kicker">Liukuhihna</p>
     <h2>Kosketa jokaista tavua kerran</h2>
     <p class="lead">Muut asiakkaat kirjoittavat arkisto-osat, lukevat ne takaisin varmistaakseen, lukevat
-    ne toistamiseen purkaakseen ja kirjoittavat sitten tuloksen — karkeasti 2× kirjoitusta ja 2× lukua.
+    ne toistamiseen purkaakseen ja kirjoittavat sitten tuloksen - karkeasti 2× kirjoitusta ja 2× lukua.
     Näin nzbfast tekee sen sijaan:</p>
     <div class="pipe"><pre>
-socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s per core)
+socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place - 4.95 GB/s per core)
                    │
                    ├─▶ <b>pwrite at final offset</b>          (plain posts)
                    │      └─ or: RAR-map translate ─▶ pwrite straight into the
-                   │         <em>extracted</em> file (store-mode posts — the rar
+                   │         <em>extracted</em> file (store-mode posts - the rar
                    │         volumes never touch disk)
-                   ├─▶ <b>PAR2 block hasher</b> — every block MD5-verified from the
+                   ├─▶ <b>PAR2 block hasher</b> - every block MD5-verified from the
                    │      decode buffer; verification finishes with the download
-                   └─▶ <b>availability ledger</b> — block-exact health, live
+                   └─▶ <b>availability ledger</b> - block-exact health, live
 </pre></div>
     <div class="callout">Vioittunut julkaisu? Vialliset lohkot tunnetaan heti kun niiden artikkelit epäonnistuvat,
     joten tarkalleen sopiva <b>minimimäärä</b> palautusosia vedetään <b>latauksen aikana</b>
     (22 haettu tarvituille 20:lle vertailukierroksella), ja korjaus koskee vain
     vioittuneita alueita. Mahdoton julkaisu? Se luovuttaa sekunneissa ladattuaan lähes
-    tyhjää — ennen kuin kiintiösi ehtii edes huomata.</div>
+    tyhjää - ennen kuin kiintiösi ehtii edes huomata.</div>
   </div>
 </section>
 
@@ -117,22 +117,22 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
   <div class="wrap">
     <p class="kicker">Pääominaisuudet</p>
     <h2>Kaikki, mitä vakava kokoonpano tarvitsee</h2>
-    <p class="lead">Koko lista — jokainen säädin, jokainen integraatio — on
+    <p class="lead">Koko lista - jokainen säädin, jokainen integraatio - on
     <a href="features.fi.html">ominaisuussivulla</a>.</p>
     <div class="grid2">
       <ul class="feat">
-        <li><b>Linjanopeuden lataukset</b> <span class="d">— liukuhihnoitettu NNTP mitattu 8.31 Gbps:iin 10 GbE:llä; nopein asiakas jokaisella puhtaalla vertailuosuudella, joka koossa.</span></li>
-        <li><b>Yhden läpimenon liukuhihna</b> <span class="d">— dekoodaus, varmistus ja purku limittyvät; store-tilan RAR-osat eivät koskaan osu levylle; tarvitsee 1× levyä siinä missä muut ~2×.</span></li>
-        <li><b>Monen palveluntarjoajan yhdistetty saatavuus</b> <span class="d">— lohkotarkka reititys backbonejen välillä; ennakkotuomiot; tarkalleen sopiva korjaus; mahdottomien julkaisujen varhainen keskeytys.</span></li>
-        <li><b>Muistibudjetti</b> <span class="d">— yksi globaali RAM-budjetti hallitusti levylle valuvin tasoin. Se ei koskaan sivuta konettasi: 190 GB:n työ valmistuu 1 GB:n budjetin sisällä (~1.1 GB huippu-RSS).</span></li>
-        <li><b>Kaatumisvarma jatko</b> <span class="d">— artikkelitason journaali tarkoittaa, että kaatuminen tai tappo −9 kesken latauksen maksaa tuskin mitään: se jatkaa hakien uudelleen vain sen, mitä ei ehditty tallentaa.</span></li>
+        <li><b>Linjanopeuden lataukset</b> <span class="d">- liukuhihnoitettu NNTP mitattu 8.31 Gbps:iin 10 GbE:llä; nopein asiakas jokaisella puhtaalla vertailuosuudella, joka koossa.</span></li>
+        <li><b>Yhden läpimenon liukuhihna</b> <span class="d">- dekoodaus, varmistus ja purku limittyvät; store-tilan RAR-osat eivät koskaan osu levylle; tarvitsee 1× levyä siinä missä muut ~2×.</span></li>
+        <li><b>Monen palveluntarjoajan yhdistetty saatavuus</b> <span class="d">- lohkotarkka reititys backbonejen välillä; ennakkotuomiot; tarkalleen sopiva korjaus; mahdottomien julkaisujen varhainen keskeytys.</span></li>
+        <li><b>Muistibudjetti</b> <span class="d">- yksi globaali RAM-budjetti hallitusti levylle valuvin tasoin. Se ei koskaan sivuta konettasi: 190 GB:n työ valmistuu 1 GB:n budjetin sisällä (~1.1 GB huippu-RSS).</span></li>
+        <li><b>Kaatumisvarma jatko</b> <span class="d">- artikkelitason journaali tarkoittaa, että kaatuminen tai tappo −9 kesken latauksen maksaa tuskin mitään: se jatkaa hakien uudelleen vain sen, mitä ei ehditty tallentaa.</span></li>
       </ul>
       <ul class="feat">
-        <li><b>Valmiit API:t</b> <span class="d">— SABnzbd-yhteensopiva API ja NZBGet JSON-RPC: Sonarr, Radarr, nzb360 ja LunaSea toimivat muuttamatta. Yhden napsautuksen tuonti SAB-/NZBGet-määrityksestäsi.</span></li>
-        <li><b>Sisäänrakennettu indeksoija</b> <span class="d">— skannaa keskusteluryhmäsi haettavaan paikalliseen indeksiin, tarjoaa Newznabin, jotta *arr-pinosi voi hakea siitäkin.</span></li>
-        <li><b>Julisteseinä avaimettomilla metatiedoilla</b> <span class="d">— kuvitus, arvosanat, näyttelijät ja juonet kaikelle indeksissäsi, ilman ainoatakaan rekisteröitävää API-avainta.</span></li>
-        <li><b>Seurantalistan automaatio</b> <span class="d">— nimeä sarja tai elokuva (esitetty tai ei); se napataan heti sen ilmestyessä ja päivitetään laadultaan, kunnes tavoitteesi täyttyy.</span></li>
-        <li><b>Yksi suoritettava tiedosto</b> <span class="d">— korjaus (par2) ja purku (RAR) kulkevat binäärin sisällä. Pura, aja, valmis.</span></li>
+        <li><b>Valmiit API:t</b> <span class="d">- SABnzbd-yhteensopiva API ja NZBGet JSON-RPC: Sonarr, Radarr, nzb360 ja LunaSea toimivat muuttamatta. Yhden napsautuksen tuonti SAB-/NZBGet-määrityksestäsi.</span></li>
+        <li><b>Sisäänrakennettu indeksoija</b> <span class="d">- skannaa keskusteluryhmäsi haettavaan paikalliseen indeksiin, tarjoaa Newznabin, jotta *arr-pinosi voi hakea siitäkin.</span></li>
+        <li><b>Julisteseinä avaimettomilla metatiedoilla</b> <span class="d">- kuvitus, arvosanat, näyttelijät ja juonet kaikelle indeksissäsi, ilman ainoatakaan rekisteröitävää API-avainta.</span></li>
+        <li><b>Seurantalistan automaatio</b> <span class="d">- nimeä sarja tai elokuva (esitetty tai ei); se napataan heti sen ilmestyessä ja päivitetään laadultaan, kunnes tavoitteesi täyttyy.</span></li>
+        <li><b>Yksi suoritettava tiedosto</b> <span class="d">- korjaus (par2) ja purku (RAR) kulkevat binäärin sisällä. Pura, aja, valmis.</span></li>
       </ul>
     </div>
   </div>
@@ -143,7 +143,7 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
     <p class="kicker">Vertailut</p>
     <h2>190.6 GB → varmistettu 167.9 GB:n tiedosto</h2>
     <p class="lead">Sama kone, samat kuusi palveluntarjoajaa, ajot lomitettuina peräkkäin.
-    Ajastetaan se hetki, jolloin käyttökelpoinen, purettu tiedosto on olemassa — ainoa mittari, jolla on oikeasti väliä.
+    Ajastetaan se hetki, jolloin käyttökelpoinen, purettu tiedosto on olemassa - ainoa mittari, jolla on oikeasti väliä.
     Jokainen kilpailija viritettiin omaan dokumentoituun parhaimpaansa, aina myöten sen, että
     SABnzbdin liukuhihnoitus kytkettiin <i>päälle</i>, vaikka se ei sitä toimita.</p>
     <div class="bars">
@@ -153,7 +153,7 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
       <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">ei käyttökelpoista tiedostoa</span></div>
     </div>
     <p class="note" style="text-align:left">190.6 GB NZB → yksi 167.9 GB mkv, M1 Ultra 10 GbE:llä, 6 palveluntarjoajaa × 8 yhteyttä.
-    Sama työ valmistuu myös 1 GB:n muistibudjetin sisällä. Täydet taulukot, kaikki kuusi skenaariota ja se ainoa osuus, jossa <i>emme voita</i> — sekä ohjeet niiden toistamiseen —
+    Sama työ valmistuu myös 1 GB:n muistibudjetin sisällä. Täydet taulukot, kaikki kuusi skenaariota ja se ainoa osuus, jossa <i>emme voita</i> - sekä ohjeet niiden toistamiseen -
     löytyvät <a href="benchmarks.fi.html">vertailusivulta</a>.</p>
   </div>
 </section>
@@ -163,13 +163,13 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
     <p class="kicker">Esittely</p>
     <h2>Indeksisi esitettynä julisteseinänä</h2>
     <p class="lead">Sisäänrakennettu indeksoija skannaa keskusteluryhmät, joista välität, ja seinä muuttaa
-    löytämänsä julisteiksi, arvosanoiksi, näyttelijöiksi ja jaksoruudukoiksi — kaikki avaimettomista julkisista
+    löytämänsä julisteiksi, arvosanoiksi, näyttelijöiksi ja jaksoruudukoiksi - kaikki avaimettomista julkisista
     lähteistä, jotka oma asennuksesi hakee. Napsauta jaksomerkkiä ladataksesi sen.</p>
     <figure class="shot"><img src="assets/wall-grid.jpg" alt="nzbfast-julisteseinä: ruudukko TV-julisteita laatumerkeillä, arvosanoilla ja kausimäärillä" loading="lazy"></figure>
     <div style="height:18px"></div>
     <div class="strip">
       <figure><div class="shot"><img src="assets/wall-sheet.jpg" alt="Sarjan tietosivu: taustakuva, IMDb-arvosana, näyttelijät, juoni, jaksokohtaiset latausmerkit" loading="lazy"></div>
-        <figcaption>Arvosanat, näyttelijät, juoni, jaksoruudukko — ei API-avaimia, koskaan.</figcaption></figure>
+        <figcaption>Arvosanat, näyttelijät, juoni, jaksoruudukko - ei API-avaimia, koskaan.</figcaption></figure>
       <figure><div class="shot"><img src="assets/dash-queue-drawer.png" alt="Jono latauskohtaisella tietolaatikolla: tiedostokohtaiset edistymispalkit, varmistuslohkot, palvelinkohtainen osuus" loading="lazy"></div>
         <figcaption>Jokainen lataus avautuu tiedostokohtaiseen edistymiseen, live-varmistustilaan ja palvelinkohtaiseen osuuteen.</figcaption></figure>
     </div>
@@ -182,7 +182,7 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
     <h2>Osoita olemassa olevat työkalusi siihen</h2>
     <div class="grid3">
       <div class="card"><h3>Sonarr / Radarr</h3><p>Se kantaa täyden SABnzbd-yhteensopivan API:n, joten
-        lisäät nzbfastin ”SABnzbd”-latausasiakkaana ja se vain toimii — nappaukset, kategoriat, prioriteetit,
+        lisäät nzbfastin ”SABnzbd”-latausasiakkaana ja se vain toimii - nappaukset, kategoriat, prioriteetit,
         uudelleenyritykset, jälkikäsittelykomentosarjat SAB_*-sopimuksella, historia. Newznab-julkisivu menee
         vielä pidemmälle ja antaa *arrien <i>hakea paikallisesta indeksistäsi</i> kuin se olisi indeksoija.</p></div>
       <div class="card"><h3>nzb360 / LunaSea</h3><p>Daemon puhuu myös NZBGetin JSON-RPC:tä, joten
@@ -200,7 +200,7 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
   <div class="wrap" style="text-align:center">
     <h2>Kokeile sitä seuraavan kahden minuutin aikana</h2>
     <p class="lead" style="margin-left:auto;margin-right:auto">Pura, kaksoisnapsauta käynnistintä, vastaa
-    kolmeen kysymykseen — tai anna sen löytää olemassa oleva SABnzbd-määrityksesi — ja koontinäyttö avautuu. Ensimmäinen
+    kolmeen kysymykseen - tai anna sen löytää olemassa oleva SABnzbd-määrityksesi - ja koontinäyttö avautuu. Ensimmäinen
     lataus laskeutuu alle kahdessa minuutissa.</p>
     <div class="btnrow">
       <a class="btn" href="download.fi.html">Lataa nzbfast</a>
@@ -211,7 +211,7 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
 
 <footer><div class="wrap">
   <div class="cols">
-    <div>⚡ <b>nzbfast</b> — yhden läpimenon Usenet-lataaja.</div>
+    <div>⚡ <b>nzbfast</b> - yhden läpimenon Usenet-lataaja.</div>
     <div>
       <a href="features.fi.html">Ominaisuudet</a> ·
       <a href="benchmarks.fi.html">Vertailut</a> ·
@@ -219,9 +219,9 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place — 4.95 GB/s p
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
     </div>
   </div>
-  <p class="fine">Vapaa ohjelmisto, GPL-3.0-or-later. PAR2-korjaus ja RAR-purku ovat natiivia koodia binäärin sisällä — ei mukana toimitettuja kolmannen osapuolen työkaluja. Julisteseinän metatiedot tulevat avaimettomista
+  <p class="fine">Vapaa ohjelmisto, GPL-3.0-or-later. PAR2-korjaus ja RAR-purku ovat natiivia koodia binäärin sisällä - ei mukana toimitettuja kolmannen osapuolen työkaluja. Julisteseinän metatiedot tulevat avaimettomista
   julkisista lähteistä (TVmaze, iTunes Search, julkiset aineistot, Wikidata, Wikipedia, AniList),
-  jotka oma asennuksesi hakee. nzbfast lataa sen, minkä sille käsket — sinä olet
+  jotka oma asennuksesi hakee. nzbfast lataa sen, minkä sille käsket - sinä olet
   vastuussa siitä, mitä se on.</p>
 </div></footer>
 

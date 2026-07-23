@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Functies — nzbfast</title>
+<title>Functies - nzbfast</title>
 <meta name="description" content="Alle functies van nzbfast: de one-pass pipeline, union-beschikbaarheid, ingebouwde indexer, posterwall, watchlist-automatisering, SABnzbd- en NZBGet-compatibele API's.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
@@ -49,18 +49,18 @@
   <div class="wrap">
     <div class="grid2">
       <ul class="feat">
-        <li><b>Gepipelinede NNTP op lijnsnelheid</b> <span class="d">— 8,31 Gbps gemeten op 10 GbE.</span></li>
-        <li><b>One-pass pipeline</b> <span class="d">— decoderen, verifiëren en uitpakken overlappen; RAR-volumes raken de schijf nooit aan.</span></li>
-        <li><b>Union-beschikbaarheid over providers</b> <span class="d">— compleet vanuit de unie van al je servers, of vroegtijdig afbreken.</span></li>
-        <li><b>Geheugenbudget</b> <span class="d">— begrensd RAM, nette spill naar schijf, swapt nooit.</span></li>
-        <li><b>Crashbestendig hervatten</b> <span class="d">— journal op artikelniveau; kill −9 midden in een taak en hij gaat verder waar hij gebleven was.</span></li>
+        <li><b>Gepipelinede NNTP op lijnsnelheid</b> <span class="d">- 8,31 Gbps gemeten op 10 GbE.</span></li>
+        <li><b>One-pass pipeline</b> <span class="d">- decoderen, verifiëren en uitpakken overlappen; RAR-volumes raken de schijf nooit aan.</span></li>
+        <li><b>Union-beschikbaarheid over providers</b> <span class="d">- compleet vanuit de unie van al je servers, of vroegtijdig afbreken.</span></li>
+        <li><b>Geheugenbudget</b> <span class="d">- begrensd RAM, nette spill naar schijf, swapt nooit.</span></li>
+        <li><b>Crashbestendig hervatten</b> <span class="d">- journal op artikelniveau; kill −9 midden in een taak en hij gaat verder waar hij gebleven was.</span></li>
       </ul>
       <ul class="feat">
-        <li><b>SABnzbd-compatibele + NZBGet JSON-RPC API's</b> <span class="d">— Sonarr/Radarr/nzb360/LunaSea werken zonder aanpassing.</span></li>
-        <li><b>Ingebouwde indexer</b> <span class="d">— scan nieuwsgroepen naar een lokale, doorzoekbare index die Newznab serveert.</span></li>
-        <li><b>Posterwall</b> <span class="d">— artwork, ratings, cast, afleveringsgrids; geen API-sleutels.</span></li>
-        <li><b>Watchlist-auto-grab + kwaliteitsupgrades</b> <span class="d">— grijpt bij de eerste verschijning, upgradet tot je doelkwaliteit.</span></li>
-        <li><b>Eén op zichzelf staand uitvoerbaar bestand</b> <span class="d">— par2 + RAR-uitpakken ingebouwd.</span></li>
+        <li><b>SABnzbd-compatibele + NZBGet JSON-RPC API's</b> <span class="d">- Sonarr/Radarr/nzb360/LunaSea werken zonder aanpassing.</span></li>
+        <li><b>Ingebouwde indexer</b> <span class="d">- scan nieuwsgroepen naar een lokale, doorzoekbare index die Newznab serveert.</span></li>
+        <li><b>Posterwall</b> <span class="d">- artwork, ratings, cast, afleveringsgrids; geen API-sleutels.</span></li>
+        <li><b>Watchlist-auto-grab + kwaliteitsupgrades</b> <span class="d">- grijpt bij de eerste verschijning, upgradet tot je doelkwaliteit.</span></li>
+        <li><b>Eén op zichzelf staand uitvoerbaar bestand</b> <span class="d">- par2 + RAR-uitpakken ingebouwd.</span></li>
       </ul>
     </div>
   </div>
@@ -74,17 +74,17 @@
         <li><b>Gepipelinede NNTP.</b> Meerdere verzoeken tegelijk onderweg per verbinding verslaan zowel de round-trip-latency als het inzakken van het TCP-congestievenster. We meten overal tussen +12% en +270% t.o.v. serieel ophalen, en zo'n 8 verbindingen per server volstaan om de lijn te verzadigen.</li>
         <li><b>SIMD yEnc-decodering</b> (rapidyenc, met NEON- en AVX-kernels) draait op 4,95 GB/s per core, in-place gedecodeerd zodra de bytes in het ontvangstpad binnenkomen.</li>
         <li><b>Gedeelde wachtrij over meerdere servers.</b> Providers balanceren zichzelf tot binnen ~2%, zonder ook maar iets bij te stellen. Van elke server wordt de echte snelheid bijgehouden, en de staart van een taak wordt dubbel uitgestuurd zodat één trage server het einde niet kan ophouden.</li>
-        <li><b>Cross-job soak.</b> De staart van taak N overlapt de start van taak N+1, dus de lijn blijft van rand tot rand branden over een hele wachtrij — hier 2% idle tegenover de 61% donker van SABnzbd in dezelfde benchmark.</li>
+        <li><b>Cross-job soak.</b> De staart van taak N overlapt de start van taak N+1, dus de lijn blijft van rand tot rand branden over een hele wachtrij - hier 2% idle tegenover de 61% donker van SABnzbd in dezelfde benchmark.</li>
         <li><b>Watchdog voor trage taken.</b> Een download die op één trage server kruipt terwijl de rest stilzit, gaat naar achter in de wachtrij, met behoud van voortgang, en hervat zodra de wachtrij leeg is.</li>
-        <li><b>Prefetch op inactieve servers</b> — een server die de actieve taak niet kan gebruiken, omdat de artikelen er niet op staan, begint alvast aan de volgende taak in de wachtrij in plaats van niks te doen.</li>
+        <li><b>Prefetch op inactieve servers</b> - een server die de actieve taak niet kan gebruiken, omdat de artikelen er niet op staan, begint alvast aan de volgende taak in de wachtrij in plaats van niks te doen.</li>
       </ul>
       <ul class="plain">
-        <li><b>Verbindingstuning-ladder.</b> In plaats van te gokken meet hij waar de doorvoer van elke provider echt ophoudt met stijgen — gevraagde tegenover toegekende verbindingen — en blijft daar hangen.</li>
-        <li><b>Autosnelheid-governor</b> — een optionele LEDBAT-achtige RTT-regelaar die wijkt voor het overige verkeer bij jou in huis en neemt wat er van de lijn overblijft.</li>
-        <li><b>Snelheidslimieten en een weekschema</b> — live aanpasbare limieten, een schema in lokale tijd (zomertijd-proof) en een "pauzeer voor N minuten" die vanzelf weer hervat.</li>
+        <li><b>Verbindingstuning-ladder.</b> In plaats van te gokken meet hij waar de doorvoer van elke provider echt ophoudt met stijgen - gevraagde tegenover toegekende verbindingen - en blijft daar hangen.</li>
+        <li><b>Autosnelheid-governor</b> - een optionele LEDBAT-achtige RTT-regelaar die wijkt voor het overige verkeer bij jou in huis en neemt wat er van de lijn overblijft.</li>
+        <li><b>Snelheidslimieten en een weekschema</b> - live aanpasbare limieten, een schema in lokale tijd (zomertijd-proof) en een "pauzeer voor N minuten" die vanzelf weer hervat.</li>
         <li><b>Geheugenbudget.</b> Eén globaal RAM-budget (auto: een kwart van het RAM, met plafond, instelbaar). Wordt het krap, dan krimpen eerst de buffers, daarna spilt data naar schijf en wordt teruggelezen zodra de taak tot rust komt. Swappen doet hij nooit. Een taak van 190 GB voltooit binnen een budget van 1 GB bij ~1,1 GB piek-RSS, en er is een gemeten, gedocumenteerd 2 GB-profiel voor NAS-apparaten.</li>
-        <li><b>Backpressure.</b> Een trage schijf remt de sockets af in plaats van het RAM te laten vollopen — hij blijft binnen ±1% van een schrijflimiet, en het RAM-gebruik <i>daalt</i> onder druk juist.</li>
-        <li><b>Geheugen teruggeven na de taak</b> — zodra hij inactief is, geeft de daemon vrijgekomen geheugen terug aan het OS en zakt tussen taken naar zo'n 8 MB op macOS.</li>
+        <li><b>Backpressure.</b> Een trage schijf remt de sockets af in plaats van het RAM te laten vollopen - hij blijft binnen ±1% van een schrijflimiet, en het RAM-gebruik <i>daalt</i> onder druk juist.</li>
+        <li><b>Geheugen teruggeven na de taak</b> - zodra hij inactief is, geeft de daemon vrijgekomen geheugen terug aan het OS en zakt tussen taken naar zo'n 8 MB op macOS.</li>
       </ul>
     </div>
   </div>
@@ -97,12 +97,12 @@
       <ul class="plain">
         <li><b>Eén keer schrijven.</b> Gedecodeerde artikelen gaan met pwrite meteen naar hun definitieve bestandsoffsets. Geen tijdelijke bestanden, geen aparte samenvoegpass.</li>
         <li><b>PAR2-verificatie in de stream.</b> Elk blok wordt bij binnenkomst MD5-gehasht vanuit de decodebuffers, dus de verificatie is klaar op het moment dat de download dat is. Dat verslaat de quick-check waar de andere clients genoegen mee nemen, en het kost niets.</li>
-        <li><b>Direct uitpakken</b> — store-mode RAR-posts (de meeste scene-releases) worden tijdens de download gemapt en uitgepakt, dus de volumes belanden helemaal niet op schijf. Het schrijfwerk komt uit op content × 1,0 en de benodigde schijfruimte op 1×, waar anderen grofweg 2× willen.</li>
+        <li><b>Direct uitpakken</b> - store-mode RAR-posts (de meeste scene-releases) worden tijdens de download gemapt en uitgepakt, dus de volumes belanden helemaal niet op schijf. Het schrijfwerk komt uit op content × 1,0 en de benodigde schijfruimte op 1×, waar anderen grofweg 2× willen.</li>
         <li><b>Deobfuscatie.</b> Geobfusceerde posts worden hernoemd op basis van hun PAR2-metadata, ROT13-verhaspelde namen worden gered, en hash-genaamde rommel wordt geclassificeerd en tegengehouden.</li>
       </ul>
       <ul class="plain">
-        <li><b>Exact passend herstel.</b> Beschadigde blokken zijn bekend zodra ze optreden, dus alleen de byte-minimale set recovery-volumes wordt opgehaald — een knapsack-oplossing — en het herstel raakt niets anders aan dan de beschadigde stukken.</li>
-        <li><b>Fallback voor gecomprimeerd en versleuteld</b> — niet-store-posts worden op schijf gezet en uitgepakt via de native RAR-engine, overlappend met de rest van de wachtrij. Versleutelde sets worden geparkeerd met een duidelijke melding in plaats van stilletjes te mislukken.</li>
+        <li><b>Exact passend herstel.</b> Beschadigde blokken zijn bekend zodra ze optreden, dus alleen de byte-minimale set recovery-volumes wordt opgehaald - een knapsack-oplossing - en het herstel raakt niets anders aan dan de beschadigde stukken.</li>
+        <li><b>Fallback voor gecomprimeerd en versleuteld</b> - niet-store-posts worden op schijf gezet en uitgepakt via de native RAR-engine, overlappend met de rest van de wachtrij. Versleutelde sets worden geparkeerd met een duidelijke melding in plaats van stilletjes te mislukken.</li>
         <li><b>Wachtwoordafhandeling.</b> Wachtwoorden komen uit de *arr-API, de <code>{{pw}}</code>-bestandsnaamconventie of NZB-metadata. Voor al het overige neemt een 🔑-ontgrendeling op het dashboard het over: hij ontgrendelt op de achtergrond en bergt daarna gewoon op.</li>
         <li><b>Vangrails.</b> Herstelde bronvolumes zijn schrijfbeveiligd terwijl het opnieuw uitpakken loopt, en een exitcode meldt pas "succes" als het eindresultaat echt bruikbaar is.</li>
       </ul>
@@ -118,14 +118,14 @@
         <li><b>Beschikbaarheidscheck vooraf.</b> Gepipelinede STAT-sweeps bouwen in seconden een matrix per artikel × per server en markeren de taak als COMPLEET, HERSTELBAAR of ONMOGELIJK voordat er een byte content is opgehaald. Een onmogelijke post breekt af met vrijwel niets binnengehaald.</li>
         <li><b>Union-routing.</b> Een artikel telt pas als ontbrekend zodra elke actieve server het heeft geweigerd; tot dan gaat het naar de server die het wél heeft. Backbones verschillen in retentie en takedowns, dus de unie maakt in stilte posts compleet die geen enkele server in z'n eentje kon leveren.</li>
         <li><b>Crashbestendig journal.</b> Het journal werkt op artikelniveau. Stuur midden in een taak een kill −9 en hij komt terug, waarbij alleen opnieuw wordt opgehaald wat nog niet was weggeschreven; wachtrij en geschiedenis overleven herstarts.</li>
-        <li><b>Parkeren en opnieuw proberen</b> — mislukte taken parkeren in de geschiedenis, en een nieuwe poging haalt alleen de stukken op die nog ontbreken.</li>
-        <li><b>Chaos-getest.</b> Een mock-NNTP-server draait tien end-to-end-faalscenario's — 430's, corruptie, afkapping, stalls, dode servers, kill −9 — bij elke afzonderlijke testrun.</li>
+        <li><b>Parkeren en opnieuw proberen</b> - mislukte taken parkeren in de geschiedenis, en een nieuwe poging haalt alleen de stukken op die nog ontbreken.</li>
+        <li><b>Chaos-getest.</b> Een mock-NNTP-server draait tien end-to-end-faalscenario's - 430's, corruptie, afkapping, stalls, dode servers, kill −9 - bij elke afzonderlijke testrun.</li>
       </ul>
       <ul class="plain">
         <li><b>Betrouwbaarheidsscore per provider.</b> De completion per server wordt voorgoed bijgehouden en in het dashboard getoond, met een waarschuwing onder de 98%.</li>
         <li><b>Serverdiversiteit-analyse.</b> Hij neemt STAT-steekproeven over je servers en clustert ze op de gaten die ze delen, zodat je kunt zien welke "verschillende" providers eigenlijk dezelfde backbone zijn voordat je betaalt voor redundantie die je niet hebt.</li>
-        <li><b>Quota, blokaccounts en een schijfbewaker</b> — dag- en maandquota, bytebudgetten over de looptijd voor blokaccounts (automatisch uitgesloten zodra opgebruikt), een pauze bij weinig schijfruimte, en dagelijkse verbruikshistorie per provider.</li>
-        <li><b>Duplicaatdetectie</b> — dupekey en dupescore, waarbij een vastgehouden alternatief automatisch wordt gepromoveerd zodra een grab mislukt.</li>
+        <li><b>Quota, blokaccounts en een schijfbewaker</b> - dag- en maandquota, bytebudgetten over de looptijd voor blokaccounts (automatisch uitgesloten zodra opgebruikt), een pauze bij weinig schijfruimte, en dagelijkse verbruikshistorie per provider.</li>
+        <li><b>Duplicaatdetectie</b> - dupekey en dupescore, waarbij een vastgehouden alternatief automatisch wordt gepromoveerd zodra een grab mislukt.</li>
         <li><b>Retentiebewuste routing.</b> Posts die ouder zijn dan de retentie van een server slaan die server helemaal over, en wat geen enkele server kan leveren faalt meteen in plaats van te blijven hangen.</li>
       </ul>
     </div>
@@ -137,19 +137,19 @@
     <h2>Automatisering &amp; integraties</h2>
     <div class="grid2">
       <ul class="plain">
-        <li><b>SABnzbd-compatibele API</b> — het volledige oppervlak dat de *arrs daadwerkelijk gebruiken: addfile/addurl, categorieën, prioriteiten, pauzeren/hervatten per taak, opnieuw proberen, paginering, API-sleutels in twee niveaus. Sonarr en Radarr praten ermee alsof het SABnzbd is.</li>
+        <li><b>SABnzbd-compatibele API</b> - het volledige oppervlak dat de *arrs daadwerkelijk gebruiken: addfile/addurl, categorieën, prioriteiten, pauzeren/hervatten per taak, opnieuw proberen, paginering, API-sleutels in twee niveaus. Sonarr en Radarr praten ermee alsof het SABnzbd is.</li>
         <li><b>NZBGet JSON-RPC-facade.</b> nzb360, LunaSea en andere NZBGet-remotes verbinden zonder aanpassing.</li>
         <li><b>Newznab-server.</b> Je lokale index beantwoordt t=search/tvsearch/movie, zodat de *arrs je eigen scans als indexer kunnen behandelen.</li>
-        <li><b>RSS auto-grab</b> — feeds gefilterd met een taal in NZBGet-stijl, live toegevoegd en bewerkt vanuit het dashboard.</li>
+        <li><b>RSS auto-grab</b> - feeds gefilterd met een taal in NZBGet-stijl, live toegevoegd en bewerkt vanuit het dashboard.</li>
         <li><b>Watchlist.</b> Noem de series en films die je wilt, ook die nog niet zijn uitgezonden. Elke aflevering wordt bij de eerste verschijning gegrepen en geüpgraded tot je doelkwaliteit is bereikt (bijvoorbeeld 720p → 1080p REMUX), waarbij de vervangen kopie pas wordt verwijderd nadat de upgrade is geverifieerd. Een uitzendkalender laat zien wat eraan komt.</li>
       </ul>
       <ul class="plain">
         <li><b>Watchmap.</b> Zet er een .nzb in en hij wordt gedownload; het bestand verdwijnt zodra het is opgepakt.</li>
-        <li><b>Slimme mappen</b> — regels op regex, trefwoord en grootte sorteren downloads bij het toevoegen al in categorieën, met optionele tv-opberging naar <code>Show/Season NN/Show - S01E02.ext</code>.</li>
-        <li><b>Opruimregels</b> — rommel-extensies worden verwijderd zodra een taak klaar is.</li>
+        <li><b>Slimme mappen</b> - regels op regex, trefwoord en grootte sorteren downloads bij het toevoegen al in categorieën, met optionele tv-opberging naar <code>Show/Season NN/Show - S01E02.ext</code>.</li>
+        <li><b>Opruimregels</b> - rommel-extensies worden verwijderd zodra een taak klaar is.</li>
         <li><b>Nabewerkingsscripts.</b> Ze respecteren SABnzbd's SAB_*-omgevingscontract, dus de scripts die je al hebt draaien ongewijzigd door.</li>
         <li><b>Migratie met één klik.</b> Hij importeert servers uit een SABnzbd-ini of een NZBGet-conf, en leest sabnzbd.ini rechtstreeks als dat het enige is dat hij aantreft.</li>
-        <li><b>Spotnet-ingestie</b> — verificatie van spot-handtekeningen en NZB-synthese, direct ingebouwd.</li>
+        <li><b>Spotnet-ingestie</b> - verificatie van spot-handtekeningen en NZB-synthese, direct ingebouwd.</li>
       </ul>
     </div>
   </div>
@@ -160,21 +160,21 @@
     <h2>Indexer &amp; de posterwall</h2>
     <p class="lead">Scan de groepen die jou interesseren naar een privé-index en blader het resultaat
     daarna door als posterwall. Elk stukje metadata wordt door je eigen installatie uit sleutelloze
-    publieke bronnen gehaald — er is geen API-sleutel om achteraan te moeten.</p>
+    publieke bronnen gehaald - er is geen API-sleutel om achteraan te moeten.</p>
     <figure class="shot"><img src="assets/wall-sheet.jpg" alt="Detailblad van de posterwall met rating, cast, synopsis en afleveringschips" loading="lazy"></figure>
     <div style="height:26px"></div>
     <div class="grid2">
       <ul class="plain">
         <li><b>Continue groepsscanner.</b> Incrementele OVER-scans draaien op jouw schema met ~43k headers/s over uitgewaaierde verbindingen. Eerste scans gaan met datum-bisectie, dus <code>--max-age 2y</code> slaat jaren aan headers over in zo'n 20 probes.</li>
-        <li><b>Ingest-filters</b> — filters op soort, jaar, resolutie, taal en grootte houden indexerspam uit je database, en geobfusceerde rommel wordt standaard opgevangen en tegengehouden.</li>
-        <li><b>Scene-naamparser.</b> Hij haalt titel, jaar, aflevering, kwaliteit en bron uit echte releasenamen — dailies met datumcode, multi-afleveringscodes en ROT13-verhaspelde namen incluis — en dedupliceert releases tot één kaart per titel.</li>
-        <li><b>Direct zoeken</b> — zoeken terwijl je typt, met kwaliteitsfilters, een volgknop per rij en overal kwaliteitsbadges.</li>
+        <li><b>Ingest-filters</b> - filters op soort, jaar, resolutie, taal en grootte houden indexerspam uit je database, en geobfusceerde rommel wordt standaard opgevangen en tegengehouden.</li>
+        <li><b>Scene-naamparser.</b> Hij haalt titel, jaar, aflevering, kwaliteit en bron uit echte releasenamen - dailies met datumcode, multi-afleveringscodes en ROT13-verhaspelde namen incluis - en dedupliceert releases tot één kaart per titel.</li>
+        <li><b>Direct zoeken</b> - zoeken terwijl je typt, met kwaliteitsfilters, een volgknop per rij en overal kwaliteitsbadges.</li>
       </ul>
       <ul class="plain">
         <li><b>Verrijking zonder sleutels.</b> TVmaze voor tv, iTunes Search voor films, plus publieke ratingdatasets, Wikidata, Wikipedia en AniList vullen posters, ratings en stemaantallen, cast, genres en plots in. OMDb- en TMDB-sleutels werken als je ze hebt, maar niets vereist er een.</li>
-        <li><b>Afleveringsgrids</b> — chips per seizoen met de beste encode van elke aflevering op één klik van downloaden, gemarkeerde seizoenspacks, en een "volg serie" op elke seizoenskop.</li>
-        <li><b>Trending-rijen</b> — stroken "nieuw deze week" en "nu populair", opgebouwd uit postfrequentie.</li>
-        <li><b>Alles te corrigeren.</b> Verkeerde match? Kies uit de kandidaten of typ gewoon de juiste identiteit — wat je met de hand instelt wordt nooit overschreven. Wijs een poster naar een URL of upload er een. Eén knop verrijkt een enkele titel opnieuw; een andere wist en herbouwt de hele index.</li>
+        <li><b>Afleveringsgrids</b> - chips per seizoen met de beste encode van elke aflevering op één klik van downloaden, gemarkeerde seizoenspacks, en een "volg serie" op elke seizoenskop.</li>
+        <li><b>Trending-rijen</b> - stroken "nieuw deze week" en "nu populair", opgebouwd uit postfrequentie.</li>
+        <li><b>Alles te corrigeren.</b> Verkeerde match? Kies uit de kandidaten of typ gewoon de juiste identiteit - wat je met de hand instelt wordt nooit overschreven. Wijs een poster naar een URL of upload er een. Eén knop verrijkt een enkele titel opnieuw; een andere wist en herbouwt de hele index.</li>
       </ul>
     </div>
   </div>
@@ -197,22 +197,22 @@
       <figure><div class="shot"><img src="assets/dash-browse.png" alt="Wachtrij met paneel per bestand en de kaart Index doorzoeken" loading="lazy"></div>
         <figcaption>Wachtrijpaneel: balken per bestand, verificatieblokken, bijdrage per server.</figcaption></figure>
       <figure><div class="shot"><img src="assets/settings-top.png" alt="Instellingen: servereditor en live snelheids- en schemabediening" loading="lazy"></div>
-        <figcaption>Elke instelling bewerkbaar in de browser — de meeste gelden direct.</figcaption></figure>
+        <figcaption>Elke instelling bewerkbaar in de browser - de meeste gelden direct.</figcaption></figure>
       <figure><div class="shot" style="max-width:320px;margin:0 auto"><img src="assets/mobile-dash.png" alt="Telefoonweergave van het dashboard" loading="lazy"></div>
         <figcaption>Degelijke telefoonweergave, dezelfde daemon.</figcaption></figure>
     </div>
     <div style="height:10px"></div>
     <div class="grid2">
       <ul class="plain">
-        <li><b>Live grafieken, geen libraries.</b> Alles polt één keer per seconde — een doorvoervlak, gestapeld vlak per provider, een tijdlijn van de verificatiegezondheid, wachtrij-burn-down, een snelheidshistogram — en de grafieken verbreden hun tijdvenster naarmate je de browser verbreedt.</li>
-        <li><b>Resourcemonitor</b> — CPU, RAM tegenover het budget, schijfschrijfacties en netwerk in één grafiek, met een waarschuwing bij weinig schijfruimte.</li>
+        <li><b>Live grafieken, geen libraries.</b> Alles polt één keer per seconde - een doorvoervlak, gestapeld vlak per provider, een tijdlijn van de verificatiegezondheid, wachtrij-burn-down, een snelheidshistogram - en de grafieken verbreden hun tijdvenster naarmate je de browser verbreedt.</li>
+        <li><b>Resourcemonitor</b> - CPU, RAM tegenover het budget, schijfschrijfacties en netwerk in één grafiek, met een waarschuwing bij weinig schijfruimte.</li>
         <li><b>Provider-ranglijst.</b> Servers hersorteren zichzelf op live prestaties, elk met sessiebytes, aantal verbindingen, benutting en betrouwbaarheid.</li>
-        <li><b>Wachtrijbeheer</b> — sleep om te herordenen, stel prioriteit en categorie inline in, open een paneel per download, pauzeer optimistisch, of "pauzeer voor N minuten".</li>
+        <li><b>Wachtrijbeheer</b> - sleep om te herordenen, stel prioriteit en categorie inline in, open een paneel per download, pauzeer optimistisch, of "pauzeer voor N minuten".</li>
       </ul>
       <ul class="plain">
-        <li><b>Alles instelbaar in de browser</b> — servers (met live verbindingstests), snelheid en schema, verbindingen/venster/decoders, schijf en quotum, watchmappen en scripts, indexeringsfilters, bibliotheek, RSS, en beveiliging met sleutelrotatie. Instellingen overleven herstarts.</li>
-        <li><b>Diagnostiek ingebouwd</b> — een logviewer in de UI, een systeembenchmark die je plafonds voor netwerk, rekenkracht en schijf opzoekt en vertelt wat je eraan kunt doen, de serverdiversiteit-analyse, en de verbindingsladder.</li>
-        <li><b>Dataverbruik</b> — 14 dagen gestapelde staven per provider, dagelijkse historie, en totaaltellers voor blokaccounts.</li>
+        <li><b>Alles instelbaar in de browser</b> - servers (met live verbindingstests), snelheid en schema, verbindingen/venster/decoders, schijf en quotum, watchmappen en scripts, indexeringsfilters, bibliotheek, RSS, en beveiliging met sleutelrotatie. Instellingen overleven herstarts.</li>
+        <li><b>Diagnostiek ingebouwd</b> - een logviewer in de UI, een systeembenchmark die je plafonds voor netwerk, rekenkracht en schijf opzoekt en vertelt wat je eraan kunt doen, de serverdiversiteit-analyse, en de verbindingsladder.</li>
+        <li><b>Dataverbruik</b> - 14 dagen gestapelde staven per provider, dagelijkse historie, en totaaltellers voor blokaccounts.</li>
         <li><b>Fijne extra's.</b> Sleep een .nzb waar dan ook heen, bureaubladmeldingen, geluiden bij voltooiing, een wizard bij de eerste start, en <code>serve --open</code>.</li>
       </ul>
     </div>
@@ -223,10 +223,10 @@
   <div class="wrap">
     <h2>Deployment</h2>
     <ul class="plain">
-      <li><b>Eén op zichzelf staand uitvoerbaar bestand.</b> par2 en RAR-uitpakken zijn native code, meegecompileerd in de binary — er wordt bij het eerste gebruik niets uitgepakt, en er is geen runtime en geen installer om mee te stoeien.</li>
-      <li><b>macOS, eersteklas</b> — een universele binary voor Apple Silicon en Intel, een native SwiftUI-menubalk-app, een launchd-unit en een Homebrew-formule.</li>
-      <li><b>Windows</b> — een volledig statische x64-exe die op kaal Windows 10 en 11 draait, met een dubbelklik-launcher en begeleide setup.</li>
-      <li><b>Linux en Docker</b> — een geharde systemd-unit, een multi-stage Docker-image met een PUID/PGID-entrypoint in linuxserver-stijl, en een compose-bestand in de doos. <a href="download.nl.html">Alle platforms →</a></li>
+      <li><b>Eén op zichzelf staand uitvoerbaar bestand.</b> par2 en RAR-uitpakken zijn native code, meegecompileerd in de binary - er wordt bij het eerste gebruik niets uitgepakt, en er is geen runtime en geen installer om mee te stoeien.</li>
+      <li><b>macOS, eersteklas</b> - een universele binary voor Apple Silicon en Intel, een native SwiftUI-menubalk-app, een launchd-unit en een Homebrew-formule.</li>
+      <li><b>Windows</b> - een volledig statische x64-exe die op kaal Windows 10 en 11 draait, met een dubbelklik-launcher en begeleide setup.</li>
+      <li><b>Linux en Docker</b> - een geharde systemd-unit, een multi-stage Docker-image met een PUID/PGID-entrypoint in linuxserver-stijl, en een compose-bestand in de doos. <a href="download.nl.html">Alle platforms →</a></li>
       <li><b>Begeleide setup.</b> Draai de <code>nzbfast setup</code>-wizard, of laat hem een bestaande SABnzbd- of NZBGet-config automatisch detecteren. Binnen twee minuten heb je een eerste download draaien.</li>
     </ul>
   </div>
@@ -234,7 +234,7 @@
 
 <footer><div class="wrap">
   <div class="cols">
-    <div>⚡ <b>nzbfast</b> — de one-pass Usenet-downloader.</div>
+    <div>⚡ <b>nzbfast</b> - de one-pass Usenet-downloader.</div>
     <div>
       <a href="features.nl.html">Functies</a> ·
       <a href="benchmarks.nl.html">Benchmarks</a> ·
@@ -242,7 +242,7 @@
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
     </div>
   </div>
-  <p class="fine">Vrije software, GPL-3.0-or-later. PAR2-herstel en RAR-uitpakken zijn native code in de binary — geen meegeleverde tools van derden. De metadata van de posterwall komt van
+  <p class="fine">Vrije software, GPL-3.0-or-later. PAR2-herstel en RAR-uitpakken zijn native code in de binary - geen meegeleverde tools van derden. De metadata van de posterwall komt van
   sleutelloze publieke bronnen, opgehaald door je eigen installatie.</p>
 </div></footer>
 

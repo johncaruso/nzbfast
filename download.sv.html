@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ladda ner — nzbfast</title>
+<title>Ladda ner - nzbfast</title>
 <meta name="description" content="Ladda ner nzbfast för macOS, Windows, Linux, Docker, Synology med mera. En fristående körbar fil med reparation och uppackning inbyggda.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
@@ -42,7 +42,7 @@
 
 <div class="hero wrap" style="padding-bottom:6px">
   <h1>En binär. <em>Allt inkluderat.</em></h1>
-  <p class="sub">Varje bygge är en enda fristående körbar fil — reparation (par2) och
+  <p class="sub">Varje bygge är en enda fristående körbar fil - reparation (par2) och
   uppackning (RAR) är inbäddade. Packa upp, kör startaren, svara på tre frågor, ladda ner.</p>
 </div>
 
@@ -51,7 +51,7 @@
     <div class="dl">
       <div class="card">
         <h3>🍎 macOS <span class="tag now">tillgänglig</span></h3>
-        <p>NzbFast-appen — dra till Program och kör. Universell (Apple Silicon och
+        <p>NzbFast-appen - dra till Program och kör. Universell (Apple Silicon och
         Intel), instrumentpanel i sitt eget fönster, .nzb-dubbelklick, Starta vid inloggning.</p>
         <p class="meta">macOS 12+ · ~16 MB DMG · app + motor</p>
         <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-macos.dmg">Ladda ner Mac-appen</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-macos-universal.zip">portabel .zip</a></p>
@@ -59,14 +59,14 @@
       <div class="card">
         <h3>🪟 Windows <span class="tag now">tillgänglig</span></h3>
         <p>Installeraren sätter upp en fältapp (inget konsolfönster), Startmeny-post,
-        valfri starta-med-Windows och .nzb-dubbelklick. Helt statisk — ingen runtime
+        valfri starta-med-Windows och .nzb-dubbelklick. Helt statisk - ingen runtime
         att installera; den kan även adoptera din befintliga SABnzbd-konfig.</p>
         <p class="meta">Windows 10/11 x64 · ~8 MB installer</p>
         <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-setup-1.0.4.exe">Ladda ner installeraren</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-windows-x64.zip">portabel .zip</a></p>
       </div>
       <div class="card">
         <h3>🐧 Linux <span class="tag now">tillgänglig</span></h3>
-        <p>Statiska musl-byggen för x86_64 och arm64 — seedboxar, VPS:er, valfri NAS med SSH,
+        <p>Statiska musl-byggen för x86_64 och arm64 - seedboxar, VPS:er, valfri NAS med SSH,
         Raspberry Pi 4/5. Ingen glibc-versionsrysk roulett.</p>
         <p class="meta">x86_64 · arm64 · systemd-enhet inkluderad</p>
         <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-linux-arm64.tar.gz">arm64</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.4-nas.zip">NAS-bunt</a></p>
@@ -80,7 +80,7 @@
       </div>
       <div class="card">
         <h3>📦 Synology <span class="tag now">tillgänglig</span></h3>
-        <p>Körs på DSM 7 via <b>Container Manager</b>: sök efter <code>nzbfast</code> i Registry, ladda ner, mappa tre mappar och port 6789. Ingen konfigurationsfil att redigera — lägg till din leverantör i instrumentpanelens välkomstruta.</p>
+        <p>Körs på DSM 7 via <b>Container Manager</b>: sök efter <code>nzbfast</code> i Registry, ladda ner, mappa tre mappar och port 6789. Ingen konfigurationsfil att redigera - lägg till din leverantör i instrumentpanelens välkomstruta.</p>
         <p class="meta">DSM 7 · Intel- + ARM-modeller · <a href="synology.html">steg-för-steg-guide →</a></p>
       </div>
       <div class="card">
@@ -92,7 +92,7 @@
 
     <div class="callout" style="margin-top:26px"><b>Verifiera nedladdningar:</b> varje utgåva levererar
     sha256-summor bredvid artefakterna på utgåvesidan. macOS-zip:ar bevarar körbarhetsbitar;
-    första starten rensar quarantine-flaggan åt dig (startarskriptet gör det — det är det mesta
+    första starten rensar quarantine-flaggan åt dig (startarskriptet gör det - det är det mesta
     av vad det är till för).</div>
   </div>
 </section>
@@ -101,9 +101,9 @@
   <div class="wrap">
     <h2>Två minuter till första nedladdningen</h2>
     <ul class="plain">
-      <li><b>1.</b> Packa upp och kör <code>Start nzbfast</code> (mac: .command, windows: .bat) — eller bara <code>./nzbfast setup</code> i en terminal.</li>
+      <li><b>1.</b> Packa upp och kör <code>Start nzbfast</code> (mac: .command, windows: .bat) - eller bara <code>./nzbfast setup</code> i en terminal.</li>
       <li><b>2.</b> Guiden hittar en befintlig SABnzbd-/NZBGet-konfig och erbjuder att använda den; annars frågar den efter din providers host, användarnamn, lösenord och anslutningsantal.</li>
-      <li><b>3.</b> Instrumentpanelen öppnas på <code>http://localhost:6789</code>. Släpp en .nzb var som helst på den — eller rikta Sonarr/Radarr mot den som en SABnzbd-klient.</li>
+      <li><b>3.</b> Instrumentpanelen öppnas på <code>http://localhost:6789</code>. Släpp en .nzb var som helst på den - eller rikta Sonarr/Radarr mot den som en SABnzbd-klient.</li>
     </ul>
     <p class="note" style="text-align:left">Att uppgradera är att byta ut en fil. Inställningar, kö och
     historik ligger bredvid din konfig och överlever omstarter och uppgraderingar.</p>
@@ -114,18 +114,18 @@
   <div class="wrap">
     <h2>Plattformsnoter</h2>
     <ul class="plain">
-      <li><b>Raspberry Pi / ARM NAS</b> — använd Linux arm64-bygget. Motorns SIMD-avkodning har NEON-kärnor; en Pi 5 mättar gigabit med marginal.</li>
-      <li><b>Unraid</b> — installera från Community Apps när mallen är publicerad (Docker-image under huven); tills dess, lägg till imagen manuellt.</li>
-      <li><b>TrueNAS SCALE</b> — kör Docker-imagen som en custom app.</li>
-      <li><b>FreeBSD / övrigt</b> — <code>cargo build --release</code> från källkod förväntas fungera (rustls, ingen OpenSSL); officiellt otestat. PAR2-reparation och RAR-uppackning är native på alla plattformar.</li>
-      <li><b>Telefoner</b> — inget att installera: instrumentpanelen har en förstklassig telefonlayout, och nzb360/LunaSea ansluter via det NZBGet-kompatibla API:et.</li>
+      <li><b>Raspberry Pi / ARM NAS</b> - använd Linux arm64-bygget. Motorns SIMD-avkodning har NEON-kärnor; en Pi 5 mättar gigabit med marginal.</li>
+      <li><b>Unraid</b> - installera från Community Apps när mallen är publicerad (Docker-image under huven); tills dess, lägg till imagen manuellt.</li>
+      <li><b>TrueNAS SCALE</b> - kör Docker-imagen som en custom app.</li>
+      <li><b>FreeBSD / övrigt</b> - <code>cargo build --release</code> från källkod förväntas fungera (rustls, ingen OpenSSL); officiellt otestat. PAR2-reparation och RAR-uppackning är native på alla plattformar.</li>
+      <li><b>Telefoner</b> - inget att installera: instrumentpanelen har en förstklassig telefonlayout, och nzb360/LunaSea ansluter via det NZBGet-kompatibla API:et.</li>
     </ul>
   </div>
 </section>
 
 <footer><div class="wrap">
   <div class="cols">
-    <div>⚡ <b>nzbfast</b> — enpass-nedladdaren för Usenet.</div>
+    <div>⚡ <b>nzbfast</b> - enpass-nedladdaren för Usenet.</div>
     <div>
       <a href="features.sv.html">Funktioner</a> ·
       <a href="benchmarks.sv.html">Benchmarks</a> ·
@@ -133,7 +133,7 @@
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
     </div>
   </div>
-  <p class="fine">Fri programvara, GPL-3.0-or-later. PAR2-reparation och RAR-uppackning är native-kod i binären — inga medföljande tredjepartsverktyg. sha256-kontrollsummor medföljer alla artefakter.</p>
+  <p class="fine">Fri programvara, GPL-3.0-or-later. PAR2-reparation och RAR-uppackning är native-kod i binären - inga medföljande tredjepartsverktyg. sha256-kontrollsummor medföljer alla artefakter.</p>
 </div></footer>
 
 </body>

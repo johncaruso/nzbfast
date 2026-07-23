@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>nzbfast — le téléchargeur NZB le plus rapide</title>
+<title>nzbfast - le téléchargeur NZB le plus rapide</title>
 <meta name="description" content="Un téléchargeur Usenet en une passe : décodage, vérification et extraction pendant le téléchargement. 190 GB vers un fichier vérifié et lisible en 9 minutes. macOS, Windows, Linux, Docker.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
@@ -45,7 +45,7 @@
   <p class="sub">nzbfast est un téléchargeur Usenet bâti autour d’un pipeline en une passe :
   chaque octet est décodé, vérifié et extrait <b>pendant qu’il se télécharge</b>.
   Aucune passe d’assemblage ensuite, plus rien à vérifier ni à décompresser une fois qu’il est
-  terminé — à l’instant où la barre de progression se remplit, le fichier est achevé et son
+  terminé - à l’instant où la barre de progression se remplit, le fichier est achevé et son
   intégrité prouvée.</p>
   <div class="chips">
     <span class="chip"><b>8.31&nbsp;Gbps</b> sur une ligne 10&nbsp;GbE</span>
@@ -58,7 +58,7 @@
     <a class="btn" href="download.fr.html">Télécharger</a>
     <a class="btn ghost" href="benchmarks.fr.html">Voir les chiffres</a>
   </div>
-  <p class="note">macOS · Windows · Linux · Docker — un seul exécutable autonome, outils de réparation et d’extraction embarqués.</p>
+  <p class="note">macOS · Windows · Linux · Docker - un seul exécutable autonome, outils de réparation et d’extraction embarqués.</p>
   <figure class="shot heroShot"><img src="assets/dash-hero.png" alt="nzbfast dashboard mid-download at 61 MB/s: throughput peaking at 104 MB/s across a full history graph, live resource and per-provider charts, and the download/verify/extract pipeline stages overlapping"></figure>
 </div>
 
@@ -71,13 +71,13 @@
     <div class="grid3">
       <div class="card"><span class="ic">🔁</span><h3>NNTP pipeliné</h3>
         <p>Plusieurs requêtes d’articles restent en vol par connexion : les allers-retours ne
-        laissent jamais le socket inactif — et TCP n’affaisse jamais sa fenêtre de congestion
+        laissent jamais le socket inactif - et TCP n’affaisse jamais sa fenêtre de congestion
         entre deux articles. Mesuré de +12% à +270% face au mode sériel sur quatre sites ; une
         ligne sature avec 8 connexions au lieu de 30–50.</p></div>
       <div class="card"><span class="ic">🚿</span><h3>Le pipeline en une passe</h3>
         <p>Les articles sont décodés en SIMD sur place, écrits une seule fois à leur position
         finale, vérifiés en PAR2 depuis les tampons de décodage, et le contenu des RAR en mode
-        store est extrait <i>pendant</i> le téléchargement — les volumes n’existent jamais sous
+        store est extrait <i>pendant</i> le téléchargement - les volumes n’existent jamais sous
         forme de fichiers. Écritures disque = contenu × 1.0.</p></div>
       <div class="card"><span class="ic">🕸️</span><h3>Disponibilité en union</h3>
         <p>Un article n’est « manquant » que lorsque <i>chaque</i> backbone configuré l’a refusé.
@@ -93,24 +93,24 @@
     <p class="kicker">Le pipeline</p>
     <h2>Toucher chaque octet une seule fois</h2>
     <p class="lead">Les concurrents écrivent les volumes d’archive, les relisent pour vérifier,
-    les relisent encore pour extraire, puis écrivent le résultat — en gros 2× d’écritures et 2× de
+    les relisent encore pour extraire, puis écrivent le résultat - en gros 2× d’écritures et 2× de
     lectures. nzbfast fait plutôt ceci :</p>
     <div class="pipe"><pre>
-socket ──TLS──▶ <b>décodage SIMD rapidyenc</b> (sur place — 4.95 GB/s par cœur)
+socket ──TLS──▶ <b>décodage SIMD rapidyenc</b> (sur place - 4.95 GB/s par cœur)
                    │
                    ├─▶ <b>pwrite à la position finale</b>       (posts simples)
                    │      └─ ou : traduction RAR-map ─▶ pwrite directement dans le
-                   │         fichier <em>extrait</em> (posts en mode store — les
+                   │         fichier <em>extrait</em> (posts en mode store - les
                    │         volumes rar ne touchent jamais le disque)
-                   ├─▶ <b>hacheur de blocs PAR2</b> — chaque bloc vérifié en MD5 depuis
+                   ├─▶ <b>hacheur de blocs PAR2</b> - chaque bloc vérifié en MD5 depuis
                    │      le tampon de décodage ; la vérification finit avec le téléchargement
-                   └─▶ <b>registre de disponibilité</b> — santé au bloc près, en direct
+                   └─▶ <b>registre de disponibilité</b> - santé au bloc près, en direct
 </pre></div>
     <div class="callout">Post endommagé ? Les blocs défectueux sont connus dès l’instant où leurs
     articles échouent, le <b>minimum ajusté</b> de volumes de récupération est récupéré <b>pendant</b>
     le téléchargement (22 blocs récupérés pour 20 nécessaires, lors de la manche de benchmark), et la
     réparation ne touche que les zones endommagées. Post impossible ? Il abandonne en quelques
-    secondes en n’ayant presque rien téléchargé — avant même que votre quota s’en aperçoive.</div>
+    secondes en n’ayant presque rien téléchargé - avant même que votre quota s’en aperçoive.</div>
   </div>
 </section>
 
@@ -118,22 +118,22 @@ socket ──TLS──▶ <b>décodage SIMD rapidyenc</b> (sur place — 4.95 GB
   <div class="wrap">
     <p class="kicker">Fonctionnalités phares</p>
     <h2>Tout ce qu’exige une installation sérieuse</h2>
-    <p class="lead">La liste complète — chaque réglage, chaque intégration — est sur la
+    <p class="lead">La liste complète - chaque réglage, chaque intégration - est sur la
     <a href="features.fr.html">page des fonctionnalités</a>.</p>
     <div class="grid2">
       <ul class="feat">
-        <li><b>Téléchargements à la vitesse de la ligne</b> <span class="d">— NNTP pipeliné mesuré à 8.31 Gbps sur 10 GbE ; le client le plus rapide sur chaque manche de benchmark propre, à toutes les tailles.</span></li>
-        <li><b>Pipeline en une passe</b> <span class="d">— décodage, vérification et extraction se chevauchent ; les volumes RAR en mode store ne touchent jamais le disque ; 1× de disque là où les autres en exigent ~2×.</span></li>
-        <li><b>Disponibilité en union multi-fournisseurs</b> <span class="d">— routage au bloc près à travers les backbones ; verdicts avant décollage ; réparation au plus juste ; abandon précoce des posts impossibles.</span></li>
-        <li><b>Budget mémoire</b> <span class="d">— un budget global de RAM avec des paliers de débordement en douceur. Il ne fait jamais swapper votre machine : une tâche de 190 GB se termine dans un budget de 1 GB (~1.1 GB de RSS au pic).</span></li>
-        <li><b>Reprise résistante aux crashs</b> <span class="d">— grâce au journal au niveau de l’article, un crash ou un kill −9 en plein téléchargement ne coûte presque rien : il reprend, en ne re-téléchargeant que ce qui n’était pas sauvegardé.</span></li>
+        <li><b>Téléchargements à la vitesse de la ligne</b> <span class="d">- NNTP pipeliné mesuré à 8.31 Gbps sur 10 GbE ; le client le plus rapide sur chaque manche de benchmark propre, à toutes les tailles.</span></li>
+        <li><b>Pipeline en une passe</b> <span class="d">- décodage, vérification et extraction se chevauchent ; les volumes RAR en mode store ne touchent jamais le disque ; 1× de disque là où les autres en exigent ~2×.</span></li>
+        <li><b>Disponibilité en union multi-fournisseurs</b> <span class="d">- routage au bloc près à travers les backbones ; verdicts avant décollage ; réparation au plus juste ; abandon précoce des posts impossibles.</span></li>
+        <li><b>Budget mémoire</b> <span class="d">- un budget global de RAM avec des paliers de débordement en douceur. Il ne fait jamais swapper votre machine : une tâche de 190 GB se termine dans un budget de 1 GB (~1.1 GB de RSS au pic).</span></li>
+        <li><b>Reprise résistante aux crashs</b> <span class="d">- grâce au journal au niveau de l’article, un crash ou un kill −9 en plein téléchargement ne coûte presque rien : il reprend, en ne re-téléchargeant que ce qui n’était pas sauvegardé.</span></li>
       </ul>
       <ul class="feat">
-        <li><b>API prêtes à l’emploi</b> <span class="d">— API compatible SABnzbd et JSON-RPC NZBGet : Sonarr, Radarr, nzb360 et LunaSea fonctionnent sans modification. Import en un clic de votre config SAB/NZBGet.</span></li>
-        <li><b>Indexeur intégré</b> <span class="d">— scanne vos newsgroups vers un index local cherchable, et sert du Newznab pour que votre pile *arr puisse le chercher aussi.</span></li>
-        <li><b>Mur d’affiches avec métadonnées sans clé</b> <span class="d">— affiches, notes, casting et synopsis pour tout ce que contient votre index, sans aucune clé API à demander.</span></li>
-        <li><b>Automatisation par liste de suivi</b> <span class="d">— nommez une série ou un film (diffusé ou non) ; il est récupéré dès son apparition, puis monté en qualité jusqu’à atteindre votre cible.</span></li>
-        <li><b>Un seul exécutable</b> <span class="d">— la réparation (par2) et l’extraction (RAR) voyagent dans le binaire. Dézippez, lancez, c’est fait.</span></li>
+        <li><b>API prêtes à l’emploi</b> <span class="d">- API compatible SABnzbd et JSON-RPC NZBGet : Sonarr, Radarr, nzb360 et LunaSea fonctionnent sans modification. Import en un clic de votre config SAB/NZBGet.</span></li>
+        <li><b>Indexeur intégré</b> <span class="d">- scanne vos newsgroups vers un index local cherchable, et sert du Newznab pour que votre pile *arr puisse le chercher aussi.</span></li>
+        <li><b>Mur d’affiches avec métadonnées sans clé</b> <span class="d">- affiches, notes, casting et synopsis pour tout ce que contient votre index, sans aucune clé API à demander.</span></li>
+        <li><b>Automatisation par liste de suivi</b> <span class="d">- nommez une série ou un film (diffusé ou non) ; il est récupéré dès son apparition, puis monté en qualité jusqu’à atteindre votre cible.</span></li>
+        <li><b>Un seul exécutable</b> <span class="d">- la réparation (par2) et l’extraction (RAR) voyagent dans le binaire. Dézippez, lancez, c’est fait.</span></li>
       </ul>
     </div>
   </div>
@@ -144,7 +144,7 @@ socket ──TLS──▶ <b>décodage SIMD rapidyenc</b> (sur place — 4.95 GB
     <p class="kicker">Benchmarks</p>
     <h2>190.6 GB → un fichier vérifié de 167.9 GB</h2>
     <p class="lead">Même machine, mêmes six fournisseurs, exécutions entrelacées coup sur coup.
-    Temps jusqu’à l’existence d’un fichier utilisable et extrait — la seule métrique qui compte.
+    Temps jusqu’à l’existence d’un fichier utilisable et extrait - la seule métrique qui compte.
     Chaque concurrent réglé à son meilleur documenté (y compris en <i>activant</i> le pipelining
     de SABnzbd, livré sans).</p>
     <div class="bars">
@@ -154,7 +154,7 @@ socket ──TLS──▶ <b>décodage SIMD rapidyenc</b> (sur place — 4.95 GB
       <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">aucun fichier utilisable</span></div>
     </div>
     <p class="note" style="text-align:left">NZB de 190.6 GB → un seul mkv de 167.9 GB, M1 Ultra sur 10 GbE, 6 fournisseurs × 8 connexions.
-    La même tâche se termine dans un budget mémoire de 1 GB. Tableaux complets, six scénarios, et la seule manche que nous ne gagnons pas — plus comment les reproduire —
+    La même tâche se termine dans un budget mémoire de 1 GB. Tableaux complets, six scénarios, et la seule manche que nous ne gagnons pas - plus comment les reproduire -
     sur la <a href="benchmarks.fr.html">page des benchmarks</a>.</p>
   </div>
 </section>
@@ -164,14 +164,14 @@ socket ──TLS──▶ <b>décodage SIMD rapidyenc</b> (sur place — 4.95 GB
     <p class="kicker">La vitrine</p>
     <h2>Votre index, présenté comme un mur d’affiches</h2>
     <p class="lead">L’indexeur intégré scanne les newsgroups qui vous intéressent ; le mur transforme
-    le résultat en affiches, notes, casting et grilles d’épisodes — en s’appuyant uniquement sur des
+    le résultat en affiches, notes, casting et grilles d’épisodes - en s’appuyant uniquement sur des
     sources publiques sans clé, récupérées par votre propre installation. Cliquez sur une pastille
     d’épisode pour le télécharger.</p>
     <figure class="shot"><img src="assets/wall-grid.jpg" alt="nzbfast poster wall: a grid of TV posters with quality badges, ratings and season counts" loading="lazy"></figure>
     <div style="height:18px"></div>
     <div class="strip">
       <figure><div class="shot"><img src="assets/wall-sheet.jpg" alt="Detail sheet for a show: backdrop, IMDb rating, cast, synopsis, per-episode download chips" loading="lazy"></div>
-        <figcaption>Notes, casting, synopsis, grille d’épisodes — aucune clé API, jamais.</figcaption></figure>
+        <figcaption>Notes, casting, synopsis, grille d’épisodes - aucune clé API, jamais.</figcaption></figure>
       <figure><div class="shot"><img src="assets/dash-queue-drawer.png" alt="Queue with a per-download detail drawer: per-file progress bars, verify blocks, per-server contribution" loading="lazy"></div>
         <figcaption>Chaque téléchargement s’ouvre sur la progression par fichier, l’état de vérification en direct et la contribution par serveur.</figcaption></figure>
     </div>
@@ -184,10 +184,10 @@ socket ──TLS──▶ <b>décodage SIMD rapidyenc</b> (sur place — 4.95 GB
     <h2>Pointez vos outils existants dessus</h2>
     <div class="grid3">
       <div class="card"><h3>Sonarr / Radarr</h3><p>Il embarque toute l’API compatible SABnzbd : ajoutez nzbfast
-        comme client de téléchargement « SABnzbd » et ça fonctionne tout seul — récupérations, catégories, priorités,
+        comme client de téléchargement « SABnzbd » et ça fonctionne tout seul - récupérations, catégories, priorités,
         réessais, scripts de post-traitement sur le contrat SAB_*, historique. La façade Newznab va encore plus loin
         et laisse les *arr <i>chercher dans votre index local</i> comme s’il s’agissait d’un indexeur.</p></div>
-      <div class="card"><h3>nzb360 / LunaSea</h3><p>Le daemon parle aussi le JSON-RPC de NZBGet —
+      <div class="card"><h3>nzb360 / LunaSea</h3><p>Le daemon parle aussi le JSON-RPC de NZBGet -
         les télécommandes mobiles populaires pilotent nzbfast sans modification. Et le tableau de bord
         lui-même offre une vraie disposition téléphone pour quand vous êtes loin du grand écran.</p></div>
       <div class="card"><h3>Vous venez de SAB ou NZBGet ?</h3><p>Un clic importe vos serveurs depuis
@@ -213,7 +213,7 @@ socket ──TLS──▶ <b>décodage SIMD rapidyenc</b> (sur place — 4.95 GB
 
 <footer><div class="wrap">
   <div class="cols">
-    <div>⚡ <b>nzbfast</b> — le téléchargeur Usenet en une passe.</div>
+    <div>⚡ <b>nzbfast</b> - le téléchargeur Usenet en une passe.</div>
     <div>
       <a href="features.fr.html">Fonctionnalités</a> ·
       <a href="benchmarks.fr.html">Benchmarks</a> ·
@@ -221,9 +221,9 @@ socket ──TLS──▶ <b>décodage SIMD rapidyenc</b> (sur place — 4.95 GB
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
     </div>
   </div>
-  <p class="fine">Logiciel libre, GPL-3.0-or-later. La réparation PAR2 et l’extraction RAR sont du code natif dans le binaire — aucun outil tiers embarqué. Les métadonnées du mur d’affiches proviennent de sources publiques
+  <p class="fine">Logiciel libre, GPL-3.0-or-later. La réparation PAR2 et l’extraction RAR sont du code natif dans le binaire - aucun outil tiers embarqué. Les métadonnées du mur d’affiches proviennent de sources publiques
   sans clé (TVmaze, iTunes Search, jeux de données publics, Wikidata, Wikipédia, AniList), récupérées par votre
-  propre installation. nzbfast télécharge ce que vous lui demandez — vous êtes responsable de ce que c’est.</p>
+  propre installation. nzbfast télécharge ce que vous lui demandez - vous êtes responsable de ce que c’est.</p>
 </div></footer>
 
 </body>

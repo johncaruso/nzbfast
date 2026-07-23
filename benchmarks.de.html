@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Benchmarks — nzbfast</title>
+<title>Benchmarks - nzbfast</title>
 <meta name="description" content="nzbfast vs. SABnzbd, NZBGet und rustnzb: 4 Clients × 6 Szenarien auf identischer Hardware. Ehrliche Ergebnisse inklusive der einen Etappe, die nzbfast nicht gewinnt, mit Reproduktionsanleitung.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
@@ -43,7 +43,7 @@
 <div class="hero wrap" style="padding-bottom:6px">
   <h1>Benchmarks</h1>
   <p class="sub">Vier Clients, sechs Szenarien, identische Hardware und Provider, Läufe
-  verschränkt, sodass sich Provider-Drift aufhebt. Die Kennzahl ist <b>Zeit bis zur benutzbaren Datei</b> —
+  verschränkt, sodass sich Provider-Drift aufhebt. Die Kennzahl ist <b>Zeit bis zur benutzbaren Datei</b> -
   geladen, geprüft, entpackt. Inklusive der einen Etappe, die wir nicht gewinnen.</p>
 </div>
 
@@ -53,8 +53,8 @@
     <h2>Der Aufbau</h2>
     <ul class="plain">
       <li><b>Clients:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (der nächste Rust-Verwandte), alle pro Szenario auf derselben Maschine (Apple-M-Series-Boxen: „Europa“ M1 Ultra auf 10&nbsp;GbE, „US-Ostküste“ M3 Ultra ~2.4–3.0 Gbps Leitung).</li>
-      <li><b>Fairness:</b> dieselben 6 Provider × 8 Verbindungen, überall TLS, Etappen verschränkt hintereinander. Jede Konkurrenz auf ihr dokumentiertes Bestes getunt: SABnzbd bekam <code>pipelining_requests=8</code> (<b>es liefert 1 aus — also ungepipelinet</b>; allein diese Einstellung brachte seine 190-GB-Zeit von 24m24s auf 19m02s), NZBGet bekam ArticleCache/DirectWrite/DirectUnpack/ParQuick, rustnzb seine dokumentierte Konfiguration.</li>
-      <li><b>Endzustand:</b> eine geprüfte, entpackte, benutzbare Datei — nicht „Download fertig“. Darauf wartest du wirklich.</li>
+      <li><b>Fairness:</b> dieselben 6 Provider × 8 Verbindungen, überall TLS, Etappen verschränkt hintereinander. Jede Konkurrenz auf ihr dokumentiertes Bestes getunt: SABnzbd bekam <code>pipelining_requests=8</code> (<b>es liefert 1 aus - also ungepipelinet</b>; allein diese Einstellung brachte seine 190-GB-Zeit von 24m24s auf 19m02s), NZBGet bekam ArticleCache/DirectWrite/DirectUnpack/ParQuick, rustnzb seine dokumentierte Konfiguration.</li>
+      <li><b>Endzustand:</b> eine geprüfte, entpackte, benutzbare Datei - nicht „Download fertig“. Darauf wartest du wirklich.</li>
       <li><b>Reproduzierbarkeit:</b> jede Behauptung führt auf einen datierten Eintrag in unserem Benchmark-Log zurück, aufgezeichnet mit den Treiber-Skripten, die ihn erzeugt haben: Wall-Clock + Interface-Byte-Zähler + Prozessbaum-Spitzen-RSS, 1–2 s Auflösung.</li>
     </ul>
   </div>
@@ -79,12 +79,12 @@
       </tbody>
     </table></div>
     <p class="note" style="text-align:left">¹ rustnzb meldete den Job bei 5m 42s als fertig, nachdem es
-    186.6 GB gezogen hatte — 10% mehr über die Leitung als alle anderen — hinterließ aber <b>überhaupt keine
+    186.6 GB gezogen hatte - 10% mehr über die Leitung als alle anderen - hinterließ aber <b>überhaupt keine
     Ausgabedatei</b>. Es scheiterte an diesem Szenario auch in der vorigen Runde („121,975 articles missing“, 71 GB verwaist).
     · ² nzbfasts Speicher folgt seinem <em>konfigurierten Budget</em>, nicht dem Job: diese Etappe lief mit dem
     Standard-Auto-Budget; gedeckelt auf <b>1 GB</b> läuft derselbe 190 GB-Job trotzdem durch, etwa 22%
-    langsamer — siehe die Niedrigspeicher-Leiter weiter unten. In der früheren „US-Ostküste“-Runde (~2.4–3 Gbps Leitung) lief das
-    gleiche Szenario in 9m 00s vs. NZBGet +30% und SABnzbd +111% — der Abstand hält über Leitungsgeschwindigkeiten hinweg.</p>
+    langsamer - siehe die Niedrigspeicher-Leiter weiter unten. In der früheren „US-Ostküste“-Runde (~2.4–3 Gbps Leitung) lief das
+    gleiche Szenario in 9m 00s vs. NZBGet +30% und SABnzbd +111% - der Abstand hält über Leitungsgeschwindigkeiten hinweg.</p>
   </div>
 </section>
 
@@ -92,7 +92,7 @@
   <div class="wrap">
     <p class="kicker">Szenario 2 · der Abstand wächst mit der Größe</p>
     <h2>Zeit bis zur benutzbaren Datei, nach Job-Größe</h2>
-    <p class="lead">Ein-Pass heißt: kein nachgelagerter Prüf-/Entpack-Durchlauf — je größer der Job,
+    <p class="lead">Ein-Pass heißt: kein nachgelagerter Prüf-/Entpack-Durchlauf - je größer der Job,
     desto weiter zieht es davon. Sequenzielle Läufe auf derselben Maschine:</p>
     <div class="tblwrap"><table>
       <thead><tr><th>Job</th><th>nzbfast</th><th>NZBGet</th><th>SABnzbd</th></tr></thead>
@@ -105,7 +105,7 @@
       </tbody>
     </table></div>
     <p class="note" style="text-align:left">² Ihr Spitzen-Fußabdruck (Volumes + entpackte Ausgabe
-    gleichzeitig, ~156 GB) überstieg die 97 GB frei. Ein-Pass braucht 1× die Inhaltsgröße —
+    gleichzeitig, ~156 GB) überstieg die 97 GB frei. Ein-Pass braucht 1× die Inhaltsgröße -
     es halbiert die Platte, die du brauchst, nicht nur die Zeit.</p>
   </div>
 </section>
@@ -122,7 +122,7 @@
       </tbody>
     </table></div>
     <p class="note" style="text-align:left">³ rustnzb lud in 119 s, markierte den Job als
-    <i>Completed</i> — und lieferte die rohen verschleierten Volumes: keine Umbenennung, kein Entpacken.
+    <i>Completed</i> - und lieferte die rohen verschleierten Volumes: keine Umbenennung, kein Entpacken.
     nzbfast deobfuskierte aus den PAR2-Metadaten und entpackte im Stream, null Rücklese-Blöcke.</p>
   </div>
 </section>
@@ -155,21 +155,21 @@
       <div class="card"><h3>Beschädigter Store-Modus-Post</h3>
         <p>20 vergiftete Artikel in einem 7.4 GB REMUX: NZBGet wird in <b>53 s</b> benutzbar fertig, nzbfast
         in <b>58 s</b>. Unsere Reparatur ist in 32 s abgeschlossen, entpackt alle 62 Volumes neu, und die
-        Ausgabe ist byte-exakt — und sie holt mit 22 Recovery-Blöcken für die 20 benötigten nahezu das
+        Ausgabe ist byte-exakt - und sie holt mit 22 Recovery-Blöcken für die 20 benötigten nahezu das
         theoretische Minimum, gegenüber NZBGets vollem PAR2-Durchlauf. Aber NZBGet gewinnt die Etappe um
         fünf Sekunden, also steht sie hier.</p></div>
     </div>
     <div class="callout">Warum überhaupt eine Niederlage zeigen? Weil die Siege nur daneben glaubwürdig sind.
     Jede Zahl auf dieser Seite stammt aus denselben verschränkten Läufen, und das Repo hält das Ganze als
-    komplettes Laborbuch fest — negative Ergebnisse inklusive.</div>
+    komplettes Laborbuch fest - negative Ergebnisse inklusive.</div>
   </div>
 </section>
 
 <section>
   <div class="wrap">
     <p class="kicker">Szenario 6 · lass es am RAM verhungern</p>
-    <h2>Die Niedrigspeicher-Leiter — 190 GB in ~1.1 GB RAM</h2>
-    <p>Dieselben vier Jobs, erneut mit harten Speicher-Budgets von 2 GB, 1 GB und 256 MB gefahren —
+    <h2>Die Niedrigspeicher-Leiter - 190 GB in ~1.1 GB RAM</h2>
+    <p>Dieselben vier Jobs, erneut mit harten Speicher-Budgets von 2 GB, 1 GB und 256 MB gefahren -
     was der Auto-Sizer auf einer 8-GB-Box, einer 4-GB-Box und einem 2-GB-NAS wählen würde. Jede
     Etappe erzeugte eine korrekte, voll geprüfte, entpackte Datei; das Spitzen-RSS folgte dem
     <em>Budget</em>, nicht dem Job. Zeit bis zur benutzbaren Datei, 10-GbE-Leitung:</p>
@@ -184,9 +184,9 @@
     </table></div>
     <p class="note" style="text-align:left">Der Aufschlag von 20–40% bei den großen Jobs ist ein
     10-GbE-Artefakt: ausgelagerte Blöcke kosten nur Zeit, wenn die Leitung die Platte überholt. Derselbe
-    87 GB-Job bei denselben Budgets auf einer ~2.4 Gbps-Leitung maß −1% bis +7% — Rauschen. Auf einem
+    87 GB-Job bei denselben Budgets auf einer ~2.4 Gbps-Leitung maß −1% bis +7% - Rauschen. Auf einem
     typischen Heimanschluss ist ein kleines Budget bei jeder Job-Größe quasi gratis. Ein NAS-Profil
-    (2 Verbindungen, 256 MB Budget) beendete den 35 GB-Job mit 0.4 GB Spitzen-RSS — ein 2-GB-NAS kann
+    (2 Verbindungen, 256 MB Budget) beendete den 35 GB-Job mit 0.4 GB Spitzen-RSS - ein 2-GB-NAS kann
     das stemmen. Kein anderer Client bietet überhaupt eine Speicherobergrenze.</p>
   </div>
 </section>
@@ -198,12 +198,12 @@
     <div class="tblwrap"><table>
       <thead><tr><th></th><th>nzbfast</th><th>SABnzbd 5</th><th>NZBGet 26</th><th>rustnzb</th><th>Usenapp</th><th>Newsbin</th></tr></thead>
       <tbody>
-        <tr><td>Pipelined NNTP</td><td class="yes">ja</td><td class="half">standardmäßig aus</td><td class="no">nein</td><td class="yes">ja</td><td class="no">—</td><td class="no">—</td></tr>
+        <tr><td>Pipelined NNTP</td><td class="yes">ja</td><td class="half">standardmäßig aus</td><td class="no">nein</td><td class="yes">ja</td><td class="no">-</td><td class="no">-</td></tr>
         <tr><td>volle Prüfung während des Downloads</td><td class="yes">jeder Block</td><td class="no">danach</td><td class="half">Quick-Check</td><td class="no">danach</td><td class="no">danach</td><td class="no">danach</td></tr>
         <tr><td>Entpacken während des Downloads</td><td class="yes">im Stream, keine Volumes auf der Platte</td><td class="half">Direct Unpack⁴</td><td class="half">Direct Unpack⁴</td><td class="half">unzuverlässig⁵</td><td class="no">nein</td><td class="no">nein</td></tr>
         <tr><td>Platte für einen N-GB-Post</td><td class="yes">~1×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td><td class="no">~2×N</td></tr>
         <tr><td>Vollständigkeits-Urteil vor dem Download</td><td class="yes">blockgenau</td><td class="no">nein</td><td class="half">Zustand %</td><td class="no">nein</td><td class="yes">Artikel-Check</td><td class="no">nein</td></tr>
-        <tr><td>begrenzter Speicher (nie swappen)</td><td class="yes">budgetiert</td><td class="no">9.3 GB @ 190 GB</td><td class="half">Cache-Einstellung</td><td class="no">nein</td><td class="no">—</td><td class="no">—</td></tr>
+        <tr><td>begrenzter Speicher (nie swappen)</td><td class="yes">budgetiert</td><td class="no">9.3 GB @ 190 GB</td><td class="half">Cache-Einstellung</td><td class="no">nein</td><td class="no">-</td><td class="no">-</td></tr>
         <tr><td>Datei an jeder Stelle beim Download prüfen</td><td class="yes">ja</td><td class="no">nein</td><td class="no">nein</td><td class="no">nein</td><td class="half">sequenziell</td><td class="no">nein</td></tr>
         <tr><td>eingebauter Indexer + Posterwand</td><td class="yes">ja, schlüssellos</td><td class="no">nein</td><td class="no">nein</td><td class="no">nein</td><td class="half">Such-UI</td><td class="half">Gruppen-Browser</td></tr>
         <tr><td>Sonarr/Radarr-Drop-in</td><td class="yes">SAB API + Newznab</td><td class="yes">nativ</td><td class="yes">nativ</td><td class="half">teilweise</td><td class="no">nein</td><td class="no">nein</td></tr>
@@ -214,7 +214,7 @@
         <tr><td>Plattformen</td><td class="yes">mac/win/linux/docker</td><td class="yes">mac/win/linux</td><td class="yes">mac/win/linux</td><td class="half">linux/win</td><td class="no">nur mac</td><td class="no">nur win</td></tr>
       </tbody>
     </table></div>
-    <p class="note" style="text-align:left">⁴ Direct Unpack materialisiert die Volumes trotzdem zuerst —
+    <p class="note" style="text-align:left">⁴ Direct Unpack materialisiert die Volumes trotzdem zuerst -
     2× Schreiben und 2× Platte. ⁵ rustnzb lieferte in unserer Runde verschleierte Volumes, markiert als „Completed“
     (sein Entpacken hängt sich mit RARLab-unrar zudem auf, sofern nicht deaktiviert). ⁶ GPL-3.0-or-later.
     Usenapp/Newsbin sind kommerzielle Ein-Plattform-Reader mit Downloader-Funktionen; sie stehen hier,
@@ -228,21 +228,21 @@
     <h2>Die Engine sättigt echte Leitungen</h2>
     <ul class="plain">
       <li><b>8.31 Gbps aggregiert</b> auf einer 10 GbE-Leitung mit gemessenen 8.2 Gbps („Europa“ M1 Ultra, 4 Provider, 14,000 Artikel, 0 Fehler, 0 Reconnects).</li>
-      <li><b>9.16–9.27 Gbps</b> gleichmäßige Transport-Ticks auf derselben Leitung — ≈98% des praktischen TCP-Goodputs.</li>
+      <li><b>9.16–9.27 Gbps</b> gleichmäßige Transport-Ticks auf derselben Leitung - ≈98% des praktischen TCP-Goodputs.</li>
       <li><b>5.44 Gbps durchgehend</b> über einen kompletten 20.4 GB-Job <i>inklusive</i> Prüfung im Stream.</li>
-      <li><b>Pipelining bei jedem RTT repliziert</b>: +64% bei 63 ms Starlink, +170–177% bei 14 ms Rechenzentrum, +270% bei 31 ms „US-Ostküste“ — es besiegt den Verfall des TCP-Congestion-Windows, nicht nur Latenz.</li>
-      <li><b>Gegendruck-Beweis</b>: deckle die Schreibstufe 4× unter das Netzwerk, und der Input rastet innerhalb von 2 s auf ±1% genau auf dem Deckel ein, der RAM <i>sinkt</i>, null Swaps — eine langsame Platte kann den Speicher nie aufblähen.</li>
-      <li><b>Rechen-Reserve</b>: gemessene Decode-+-Prüf-Obergrenzen von 86–165 Gbps auf Apple Silicon — das Netzwerk ist auf jeder getesteten Maschine um 4–50× der Flaschenhals.</li>
+      <li><b>Pipelining bei jedem RTT repliziert</b>: +64% bei 63 ms Starlink, +170–177% bei 14 ms Rechenzentrum, +270% bei 31 ms „US-Ostküste“ - es besiegt den Verfall des TCP-Congestion-Windows, nicht nur Latenz.</li>
+      <li><b>Gegendruck-Beweis</b>: deckle die Schreibstufe 4× unter das Netzwerk, und der Input rastet innerhalb von 2 s auf ±1% genau auf dem Deckel ein, der RAM <i>sinkt</i>, null Swaps - eine langsame Platte kann den Speicher nie aufblähen.</li>
+      <li><b>Rechen-Reserve</b>: gemessene Decode-+-Prüf-Obergrenzen von 86–165 Gbps auf Apple Silicon - das Netzwerk ist auf jeder getesteten Maschine um 4–50× der Flaschenhals.</li>
     </ul>
     <div class="callout">Stehende Regel aus dem Repo: <b>jede Perf-Behauptung nennt einen reproduzierbaren
     Befehl und die Bedingungen, unter denen er lief.</b> Das Ganze wird im Repo als datiertes Laborbuch
-    geführt — negative Ergebnisse und Irrwege inklusive.</div>
+    geführt - negative Ergebnisse und Irrwege inklusive.</div>
   </div>
 </section>
 
 <footer><div class="wrap">
   <div class="cols">
-    <div>⚡ <b>nzbfast</b> — der Ein-Pass-Usenet-Downloader.</div>
+    <div>⚡ <b>nzbfast</b> - der Ein-Pass-Usenet-Downloader.</div>
     <div>
       <a href="features.de.html">Funktionen</a> ·
       <a href="benchmarks.de.html">Benchmarks</a> ·

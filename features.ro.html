@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Funcții — nzbfast</title>
+<title>Funcții - nzbfast</title>
 <meta name="description" content="Fiecare funcție nzbfast: pipeline-ul într-o singură trecere, disponibilitate prin uniune, indexer integrat, perete de postere, automatizare watchlist, API-uri compatibile SABnzbd și NZBGet.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
@@ -49,18 +49,18 @@
   <div class="wrap">
     <div class="grid2">
       <ul class="feat">
-        <li><b>NNTP cu pipelining la viteza liniei</b> <span class="d">— 8.31 Gbps măsurați pe 10 GbE.</span></li>
-        <li><b>Pipeline într-o singură trecere</b> <span class="d">— decodarea, verificarea și extragerea se suprapun; volumele RAR nu ating niciodată discul.</span></li>
-        <li><b>Disponibilitate prin uniune multi-provider</b> <span class="d">— complet din uniunea serverelor tale, sau abandon timpuriu.</span></li>
-        <li><b>Buget de memorie</b> <span class="d">— RAM limitat, spill elegant, fără swap niciodată.</span></li>
-        <li><b>Reluare sigură la blocare</b> <span class="d">— jurnal la nivel de articol; kill −9 în mijlocul unui job și continuă de unde a rămas.</span></li>
+        <li><b>NNTP cu pipelining la viteza liniei</b> <span class="d">- 8.31 Gbps măsurați pe 10 GbE.</span></li>
+        <li><b>Pipeline într-o singură trecere</b> <span class="d">- decodarea, verificarea și extragerea se suprapun; volumele RAR nu ating niciodată discul.</span></li>
+        <li><b>Disponibilitate prin uniune multi-provider</b> <span class="d">- complet din uniunea serverelor tale, sau abandon timpuriu.</span></li>
+        <li><b>Buget de memorie</b> <span class="d">- RAM limitat, spill elegant, fără swap niciodată.</span></li>
+        <li><b>Reluare sigură la blocare</b> <span class="d">- jurnal la nivel de articol; kill −9 în mijlocul unui job și continuă de unde a rămas.</span></li>
       </ul>
       <ul class="feat">
-        <li><b>API compatibil SABnzbd + NZBGet JSON-RPC</b> <span class="d">— Sonarr/Radarr/nzb360/LunaSea funcționează nemodificate.</span></li>
-        <li><b>Indexer integrat</b> <span class="d">— scanează grupurile într-un index local, căutabil, care servește Newznab.</span></li>
-        <li><b>Perete de postere</b> <span class="d">— grafică, note, distribuție, grile de episoade; fără chei API.</span></li>
-        <li><b>Preluare automată watchlist + upgrade-uri de calitate</b> <span class="d">— preluare la prima apariție, upgrade până la calitatea țintă.</span></li>
-        <li><b>Un singur executabil de sine stătător</b> <span class="d">— par2 + dezarhivare RAR integrate.</span></li>
+        <li><b>API compatibil SABnzbd + NZBGet JSON-RPC</b> <span class="d">- Sonarr/Radarr/nzb360/LunaSea funcționează nemodificate.</span></li>
+        <li><b>Indexer integrat</b> <span class="d">- scanează grupurile într-un index local, căutabil, care servește Newznab.</span></li>
+        <li><b>Perete de postere</b> <span class="d">- grafică, note, distribuție, grile de episoade; fără chei API.</span></li>
+        <li><b>Preluare automată watchlist + upgrade-uri de calitate</b> <span class="d">- preluare la prima apariție, upgrade până la calitatea țintă.</span></li>
+        <li><b>Un singur executabil de sine stătător</b> <span class="d">- par2 + dezarhivare RAR integrate.</span></li>
       </ul>
     </div>
   </div>
@@ -74,17 +74,17 @@
         <li><b>NNTP cu pipelining.</b> Mai multe cereri ținute simultan în tranzit pe fiecare conexiune înving și latența dus-întors, și degradarea ferestrei de congestie TCP. Măsurăm între +12% și +270% față de preluarea serială, iar circa 8 conexiuni per server sunt de ajuns ca să saturăm linia.</li>
         <li><b>Decodarea yEnc SIMD</b> (rapidyenc, cu kernele NEON și AVX) rulează la 4.95 GB/s per nucleu, chiar pe loc, pe măsură ce octeții sosesc în calea de recepție.</li>
         <li><b>Coadă partajată între servere.</b> Providerii se autoechilibrează până la ~2% fără nicio reglare. Rata reală a fiecăruia e urmărită, iar coada unui job e expediată în dublu, ca un singur server lent să nu poată întârzia finalul.</li>
-        <li><b>Suprapunere între joburi.</b> Coada jobului N se suprapune cu începutul jobului N+1, așa că linia rămâne aprinsă de la un capăt la altul de-a lungul întregii cozi — 2% inactiv aici, față de 61% întuneric la SABnzbd în același benchmark.</li>
-        <li><b>Câine de pază pentru joburi lente.</b> O descărcare care se târăște pe un singur server lent, în timp ce restul stau degeaba, e trimisă la coada cozii — progresul se păstrează — și reia când coada se eliberează.</li>
-        <li><b>Preîncărcare pe serverele inactive</b> — un server pe care jobul activ nu-l poate folosi, pentru că articolele lui nu sunt stocate acolo, pornește în schimb următorul job din coadă, în loc să stea degeaba.</li>
+        <li><b>Suprapunere între joburi.</b> Coada jobului N se suprapune cu începutul jobului N+1, așa că linia rămâne aprinsă de la un capăt la altul de-a lungul întregii cozi - 2% inactiv aici, față de 61% întuneric la SABnzbd în același benchmark.</li>
+        <li><b>Câine de pază pentru joburi lente.</b> O descărcare care se târăște pe un singur server lent, în timp ce restul stau degeaba, e trimisă la coada cozii - progresul se păstrează - și reia când coada se eliberează.</li>
+        <li><b>Preîncărcare pe serverele inactive</b> - un server pe care jobul activ nu-l poate folosi, pentru că articolele lui nu sunt stocate acolo, pornește în schimb următorul job din coadă, în loc să stea degeaba.</li>
       </ul>
       <ul class="plain">
-        <li><b>Scară de reglare a conexiunilor.</b> În loc să ghicească, măsoară unde se oprește de fapt din urcat debitul fiecărui provider — conexiuni cerute față de conexiuni acordate — și se așază acolo.</li>
-        <li><b>Regulator automat de viteză</b> — un regulator RTT opțional, în stil LEDBAT, care cedează în fața traficului din casa ta și ia ce mai rămâne din linie.</li>
-        <li><b>Limite de viteză și un planificator săptămânal</b> — plafoane ajustabile în timp real, un program în ora locală (sigur la trecerea la ora de vară) și o „pauză de N minute” care se reia singură.</li>
+        <li><b>Scară de reglare a conexiunilor.</b> În loc să ghicească, măsoară unde se oprește de fapt din urcat debitul fiecărui provider - conexiuni cerute față de conexiuni acordate - și se așază acolo.</li>
+        <li><b>Regulator automat de viteză</b> - un regulator RTT opțional, în stil LEDBAT, care cedează în fața traficului din casa ta și ia ce mai rămâne din linie.</li>
+        <li><b>Limite de viteză și un planificator săptămânal</b> - plafoane ajustabile în timp real, un program în ora locală (sigur la trecerea la ora de vară) și o „pauză de N minute” care se reia singură.</li>
         <li><b>Buget de memorie.</b> Un singur buget global de RAM (automat: un sfert din RAM, plafonat, dar care poate fi suprascris). Când se strânge, se micșorează întâi bufferele, apoi datele trec pe disc și sunt citite înapoi odată ce jobul se așază. Nu face niciodată swap. Un job de 190 GB se încheie într-un buget de 1 GB, la ~1.1 GB RSS de vârf, iar pentru NAS-uri există un profil de 2 GB, măsurat și documentat.</li>
-        <li><b>Contrapresiune.</b> Un disc lent frânează socketurile în loc să lase RAM-ul să se umple — se menține în ±1% dintr-un plafon de scriere, iar RAM-ul chiar <i>scade</i> sub presiune.</li>
-        <li><b>Eliberarea memoriei după job</b> — odată inactiv, daemonul returnează memoria eliberată sistemului de operare și coboară la circa 8 MB între joburi pe macOS.</li>
+        <li><b>Contrapresiune.</b> Un disc lent frânează socketurile în loc să lase RAM-ul să se umple - se menține în ±1% dintr-un plafon de scriere, iar RAM-ul chiar <i>scade</i> sub presiune.</li>
+        <li><b>Eliberarea memoriei după job</b> - odată inactiv, daemonul returnează memoria eliberată sistemului de operare și coboară la circa 8 MB între joburi pe macOS.</li>
       </ul>
     </div>
   </div>
@@ -97,12 +97,12 @@
       <ul class="plain">
         <li><b>Scrie o singură dată.</b> Articolele decodate sunt scrise (pwrite) direct la offset-urile lor finale din fișier. Fără fișiere temporare, fără o trecere separată de asamblare.</li>
         <li><b>Verificare PAR2 în flux.</b> Fiecare bloc primește un hash MD5 din bufferele de decodare pe măsură ce sosește, așa că verificarea se încheie exact în momentul în care se termină descărcarea. E mai riguroasă decât verificarea rapidă cu care se mulțumesc ceilalți clienți și nu costă nimic.</li>
-        <li><b>Extragere directă</b> — postările RAR în mod store (majoritatea release-urilor scene) sunt mapate și extrase chiar în timpul descărcării, așa că volumele nu ajung deloc pe disc. Se scrie pe disc conținut × 1.0, iar discul necesar e 1×, acolo unde alții cer cam 2×.</li>
+        <li><b>Extragere directă</b> - postările RAR în mod store (majoritatea release-urilor scene) sunt mapate și extrase chiar în timpul descărcării, așa că volumele nu ajung deloc pe disc. Se scrie pe disc conținut × 1.0, iar discul necesar e 1×, acolo unde alții cer cam 2×.</li>
         <li><b>Deobfuscare.</b> Postările obfuscate sunt redenumite din metadatele lor PAR2, numele amestecate cu ROT13 sunt recuperate, iar gunoiul cu nume de tip hash e clasificat și blocat.</li>
       </ul>
       <ul class="plain">
-        <li><b>Reparare exact potrivită.</b> Blocurile deteriorate sunt cunoscute pe măsură ce apar, așa că se preia doar setul de volume de recuperare cu cel mai mic număr de octeți — o rezolvare de tip rucsac — iar repararea atinge numai zonele deteriorate.</li>
-        <li><b>Rezervă pentru comprimat și criptat</b> — postările non-store se materializează și se dezarhivează prin motorul RAR nativ, suprapuse cu restul cozii. Seturile criptate sunt parcate cu un mesaj clar, în loc să eșueze în tăcere.</li>
+        <li><b>Reparare exact potrivită.</b> Blocurile deteriorate sunt cunoscute pe măsură ce apar, așa că se preia doar setul de volume de recuperare cu cel mai mic număr de octeți - o rezolvare de tip rucsac - iar repararea atinge numai zonele deteriorate.</li>
+        <li><b>Rezervă pentru comprimat și criptat</b> - postările non-store se materializează și se dezarhivează prin motorul RAR nativ, suprapuse cu restul cozii. Seturile criptate sunt parcate cu un mesaj clar, în loc să eșueze în tăcere.</li>
         <li><b>Gestionarea parolelor.</b> Parolele vin din API-ul *arr, din convenția de denumire <code>{{pw}}</code> sau din metadatele NZB. Pentru ce rămâne, o deblocare 🔑 din panou preia ștafeta: deblochează în fundal, apoi arhivează normal.</li>
         <li><b>Bariere de siguranță.</b> Volumele sursă reparate sunt protejate la scriere cât timp rulează reextragerea, iar codul de ieșire raportează „succes” doar când starea finală e cu adevărat utilizabilă.</li>
       </ul>
@@ -118,14 +118,14 @@
         <li><b>Verificare de disponibilitate preflight.</b> Sweep-urile STAT cu pipelining construiesc în câteva secunde o matrice per articol × per server și marchează jobul COMPLETE, REPAIRABLE sau IMPOSSIBLE înainte să se descarce vreun octet de conținut. O postare imposibilă abandonează după ce n-a tras aproape nimic.</li>
         <li><b>Rutare prin uniune.</b> Un articol e considerat lipsă abia după ce fiecare server activ l-a refuzat; până atunci, e direcționat către serverul care îl are. Backbone-urile diferă la retenție și la retrageri, așa că uniunea completează discret postări pe care niciun server luat singur nu le-ar putea completa.</li>
         <li><b>Jurnal sigur la blocare.</b> Jurnalul lucrează la granularitate de articol. Trimite un kill −9 în mijlocul unui job și revine, repreluând doar ce nu apucase să fie salvat; coada și istoricul supraviețuiesc repornirilor.</li>
-        <li><b>Parcare și reîncercare</b> — joburile eșuate rămân parcate în istoric, iar o reîncercare preia doar bucățile încă lipsă.</li>
-        <li><b>Testat pentru haos.</b> Un server NNTP simulat rulează zece scenarii de eșec cap-la-cap — 430-uri, corupere, trunchiere, blocaje, servere moarte, kill −9 — la fiecare rulare de test.</li>
+        <li><b>Parcare și reîncercare</b> - joburile eșuate rămân parcate în istoric, iar o reîncercare preia doar bucățile încă lipsă.</li>
+        <li><b>Testat pentru haos.</b> Un server NNTP simulat rulează zece scenarii de eșec cap-la-cap - 430-uri, corupere, trunchiere, blocaje, servere moarte, kill −9 - la fiecare rulare de test.</li>
       </ul>
       <ul class="plain">
         <li><b>Scor de fiabilitate a providerilor.</b> Ratele de completitudine per server sunt păstrate definitiv și afișate în panou, cu un avertisment sub 98%.</li>
         <li><b>Analizor de diversitate a serverelor.</b> Eșantionează cu STAT pe serverele tale și le grupează după lacunele comune, ca să vezi care provideri „diferiți” sunt de fapt același backbone înainte să plătești pentru o redundanță pe care n-o ai cu adevărat.</li>
-        <li><b>Cote, conturi bloc și pază de disc</b> — cote zilnice și lunare, bugete de octeți pe toată durata de viață pentru conturile bloc (excluse automat odată consumate), o pauză la disc redus și un istoric zilnic de utilizare per provider.</li>
-        <li><b>Detectare duplicate</b> — dupekey și dupescore, cu o alternativă reținută promovată automat în clipa în care o preluare eșuează.</li>
+        <li><b>Cote, conturi bloc și pază de disc</b> - cote zilnice și lunare, bugete de octeți pe toată durata de viață pentru conturile bloc (excluse automat odată consumate), o pauză la disc redus și un istoric zilnic de utilizare per provider.</li>
+        <li><b>Detectare duplicate</b> - dupekey și dupescore, cu o alternativă reținută promovată automat în clipa în care o preluare eșuează.</li>
         <li><b>Rutare conștientă de retenție.</b> Postările mai vechi decât retenția unui server îl ocolesc complet, iar orice nu poate servi niciun server eșuează imediat, în loc să se învârtă degeaba.</li>
       </ul>
     </div>
@@ -137,19 +137,19 @@
     <h2>Automatizare și integrări</h2>
     <div class="grid2">
       <ul class="plain">
-        <li><b>API compatibil SABnzbd</b> — toată suprafața pe care o folosesc efectiv *arr-urile: addfile/addurl, categorii, priorități, pauză/reluare per job, reîncercare, paginare, chei API pe două niveluri. Sonarr și Radarr vorbesc cu el ca și cum ar fi SABnzbd.</li>
+        <li><b>API compatibil SABnzbd</b> - toată suprafața pe care o folosesc efectiv *arr-urile: addfile/addurl, categorii, priorități, pauză/reluare per job, reîncercare, paginare, chei API pe două niveluri. Sonarr și Radarr vorbesc cu el ca și cum ar fi SABnzbd.</li>
         <li><b>Fațadă NZBGet JSON-RPC.</b> nzb360, LunaSea și alte telecomenzi NZBGet se conectează nemodificate.</li>
         <li><b>Server Newznab.</b> Indexul tău local răspunde la t=search/tvsearch/movie, așa că *arr-urile pot trata propriile tale scanări ca pe un indexer.</li>
-        <li><b>Preluare automată RSS</b> — feeduri filtrate cu un limbaj în stil NZBGet, adăugate și editate live din panou.</li>
+        <li><b>Preluare automată RSS</b> - feeduri filtrate cu un limbaj în stil NZBGet, adăugate și editate live din panou.</li>
         <li><b>Watchlist.</b> Enumeră serialele și filmele pe care le vrei, chiar și pe cele încă nedifuzate. Fiecare episod e preluat la prima apariție și îmbunătățit până atinge calitatea-țintă (de pildă, 720p → 1080p REMUX), iar copia înlocuită e ștearsă abia după ce upgrade-ul a fost verificat. Un calendar de difuzare arată ce urmează.</li>
       </ul>
       <ul class="plain">
         <li><b>Folder monitorizat.</b> Pui un .nzb înăuntru și se descarcă; fișierul dispare odată ce a fost preluat.</li>
-        <li><b>Foldere inteligente</b> — reguli de regex, cuvinte-cheie și dimensiune sortează descărcările pe categorii chiar la punerea în coadă, cu arhivare TV opțională în <code>Show/Season NN/Show - S01E02.ext</code>.</li>
-        <li><b>Reguli de curățare</b> — extensiile-gunoi sunt eliminate odată ce un job se finalizează.</li>
+        <li><b>Foldere inteligente</b> - reguli de regex, cuvinte-cheie și dimensiune sortează descărcările pe categorii chiar la punerea în coadă, cu arhivare TV opțională în <code>Show/Season NN/Show - S01E02.ext</code>.</li>
+        <li><b>Reguli de curățare</b> - extensiile-gunoi sunt eliminate odată ce un job se finalizează.</li>
         <li><b>Scripturi de post-procesare.</b> Respectă contractul de mediu SAB_* al SABnzbd, așa că scripturile pe care le ai deja rulează ca atare.</li>
         <li><b>Migrare cu un clic.</b> Importă serverele dintr-un ini SABnzbd sau dintr-un conf NZBGet și citește direct sabnzbd.ini, dacă asta e tot ce găsește.</li>
-        <li><b>Ingestie Spotnet</b> — verificarea semnăturii spot-urilor și sinteza NZB, integrate direct.</li>
+        <li><b>Ingestie Spotnet</b> - verificarea semnăturii spot-urilor și sinteza NZB, integrate direct.</li>
       </ul>
     </div>
   </div>
@@ -159,22 +159,22 @@
   <div class="wrap">
     <h2>Indexerul și peretele de postere</h2>
     <p class="lead">Scanează grupurile care te interesează într-un index privat, apoi răsfoiește-l ca un
-    perete de postere. Toate metadatele provin din surse publice fără cheie preluate de instalarea ta —
+    perete de postere. Toate metadatele provin din surse publice fără cheie preluate de instalarea ta -
     nu există nicio cheie API de cerșit.</p>
     <figure class="shot"><img src="assets/wall-sheet.jpg" alt="Fișă de detalii a peretelui de postere cu notă, distribuție, sinopsis și insigne de episod" loading="lazy"></figure>
     <div style="height:26px"></div>
     <div class="grid2">
       <ul class="plain">
         <li><b>Scaner continuu de grupuri.</b> Scanările OVER incrementale rulează după programul tău, la ~43k antete/s pe conexiuni distribuite. Primele scanări sunt bisectate după dată, așa că <code>--max-age 2y</code> sare peste ani de antete în circa 20 de sonde.</li>
-        <li><b>Filtre de preluare</b> — filtrele pe tip, an, rezoluție, limbă și dimensiune țin spamul de indexer departe de baza ta de date, iar gunoiul obfuscat e prins și blocat implicit.</li>
-        <li><b>Parser de nume scene.</b> Extrage titlul, anul, episodul, calitatea și sursa din tulpini reale — inclusiv episoade zilnice codate cu dată, coduri multi-episod și nume obfuscate cu ROT13 — și deduplică release-urile la un singur card per titlu.</li>
-        <li><b>Căutare instantanee</b> — cauți pe măsură ce scrii, cu filtre de calitate, butoane de urmărire pe fiecare rând și insigne de calitate peste tot.</li>
+        <li><b>Filtre de preluare</b> - filtrele pe tip, an, rezoluție, limbă și dimensiune țin spamul de indexer departe de baza ta de date, iar gunoiul obfuscat e prins și blocat implicit.</li>
+        <li><b>Parser de nume scene.</b> Extrage titlul, anul, episodul, calitatea și sursa din tulpini reale - inclusiv episoade zilnice codate cu dată, coduri multi-episod și nume obfuscate cu ROT13 - și deduplică release-urile la un singur card per titlu.</li>
+        <li><b>Căutare instantanee</b> - cauți pe măsură ce scrii, cu filtre de calitate, butoane de urmărire pe fiecare rând și insigne de calitate peste tot.</li>
       </ul>
       <ul class="plain">
         <li><b>Îmbogățire fără cheie.</b> TVmaze pentru TV, iTunes Search pentru filme, plus seturi de date publice de note, Wikidata, Wikipedia și AniList completează posterele, notele și numărul de voturi, distribuția, genurile și subiectele. Cheile OMDb și TMDB funcționează dacă le ai, dar nimic nu are nevoie de vreuna.</li>
-        <li><b>Grile de episoade</b> — insigne per sezon, cu cea mai bună codare a fiecărui episod la un clic distanță de descărcare, pachetele de sezon marcate și un „urmărește seria” pe fiecare antet de sezon.</li>
-        <li><b>Rânduri în tendințe</b> — fâșii „noi săptămâna aceasta” și „populare acum”, construite din frecvența postărilor.</li>
-        <li><b>Corectează orice.</b> Potrivire greșită? Alege dintre candidați sau scrie pur și simplu identitatea corectă — nimic din ce setezi manual nu e vreodată suprascris. Indică un poster printr-un URL sau încarcă unul. Un buton reîmbogățește un singur titlu; altul șterge și reconstruiește tot indexul.</li>
+        <li><b>Grile de episoade</b> - insigne per sezon, cu cea mai bună codare a fiecărui episod la un clic distanță de descărcare, pachetele de sezon marcate și un „urmărește seria” pe fiecare antet de sezon.</li>
+        <li><b>Rânduri în tendințe</b> - fâșii „noi săptămâna aceasta” și „populare acum”, construite din frecvența postărilor.</li>
+        <li><b>Corectează orice.</b> Potrivire greșită? Alege dintre candidați sau scrie pur și simplu identitatea corectă - nimic din ce setezi manual nu e vreodată suprascris. Indică un poster printr-un URL sau încarcă unul. Un buton reîmbogățește un singur titlu; altul șterge și reconstruiește tot indexul.</li>
       </ul>
     </div>
   </div>
@@ -197,22 +197,22 @@
       <figure><div class="shot"><img src="assets/dash-browse.png" alt="Coadă cu sertar per fișier și card de răsfoire a indexului" loading="lazy"></div>
         <figcaption>Sertarul cozii: bare per fișier, blocuri de verificare, contribuție per server.</figcaption></figure>
       <figure><div class="shot"><img src="assets/settings-top.png" alt="Setări: editor de servere și controale live de viteză/programare" loading="lazy"></div>
-        <figcaption>Fiecare setare editabilă în browser — majoritatea se aplică live.</figcaption></figure>
+        <figcaption>Fiecare setare editabilă în browser - majoritatea se aplică live.</figcaption></figure>
       <figure><div class="shot" style="max-width:320px;margin:0 auto"><img src="assets/mobile-dash.png" alt="Aspectul de telefon al panoului" loading="lazy"></div>
         <figcaption>Aspect de telefon așa cum trebuie, același daemon.</figcaption></figure>
     </div>
     <div style="height:10px"></div>
     <div class="grid2">
       <ul class="plain">
-        <li><b>Grafice live, fără biblioteci.</b> Totul se interoghează o dată pe secundă — o arie de debit, o arie stivuită per provider, o cronologie a sănătății verificării, un burn-down al cozii, o histogramă de viteză — iar graficele își lărgesc fereastra de timp pe măsură ce lărgești browserul.</li>
-        <li><b>Monitor de resurse</b> — CPU, RAM față de buget, scrieri pe disc și rețea, toate pe un singur grafic, cu un avertisment de disc redus.</li>
+        <li><b>Grafice live, fără biblioteci.</b> Totul se interoghează o dată pe secundă - o arie de debit, o arie stivuită per provider, o cronologie a sănătății verificării, un burn-down al cozii, o histogramă de viteză - iar graficele își lărgesc fereastra de timp pe măsură ce lărgești browserul.</li>
+        <li><b>Monitor de resurse</b> - CPU, RAM față de buget, scrieri pe disc și rețea, toate pe un singur grafic, cu un avertisment de disc redus.</li>
         <li><b>Clasament al providerilor.</b> Serverele se resortează singure după performanța live, fiecare arătând octeții pe sesiune, numărul de conexiuni, gradul de utilizare și fiabilitatea.</li>
-        <li><b>Gestionarea cozii</b> — tragi pentru reordonare, setezi prioritatea și categoria pe loc, deschizi un sertar per descărcare, pui pauză optimist sau alegi „pauză de N minute”.</li>
+        <li><b>Gestionarea cozii</b> - tragi pentru reordonare, setezi prioritatea și categoria pe loc, deschizi un sertar per descărcare, pui pauză optimist sau alegi „pauză de N minute”.</li>
       </ul>
       <ul class="plain">
-        <li><b>Totul se configurează în browser</b> — servere (cu teste de conexiune live), viteză și program, conexiuni/fereastră/decodoare, disc și cotă, foldere monitorizate și scripturi, filtre de indexare, bibliotecă, RSS și securitate cu rotația cheilor. Setările supraviețuiesc repornirilor.</li>
-        <li><b>Diagnostice integrate</b> — un vizualizator de jurnal în interfață, un benchmark de sistem care îți găsește plafoanele de rețea, calcul și disc și îți spune ce să faci cu ele, analizorul de diversitate a serverelor și scara de conexiuni.</li>
-        <li><b>Consum de date</b> — bare stivuite pe 14 zile per provider, istoric zilnic și contoare pe toată durata de viață pentru conturile bloc.</li>
+        <li><b>Totul se configurează în browser</b> - servere (cu teste de conexiune live), viteză și program, conexiuni/fereastră/decodoare, disc și cotă, foldere monitorizate și scripturi, filtre de indexare, bibliotecă, RSS și securitate cu rotația cheilor. Setările supraviețuiesc repornirilor.</li>
+        <li><b>Diagnostice integrate</b> - un vizualizator de jurnal în interfață, un benchmark de sistem care îți găsește plafoanele de rețea, calcul și disc și îți spune ce să faci cu ele, analizorul de diversitate a serverelor și scara de conexiuni.</li>
+        <li><b>Consum de date</b> - bare stivuite pe 14 zile per provider, istoric zilnic și contoare pe toată durata de viață pentru conturile bloc.</li>
         <li><b>Confort de utilizare.</b> Tragi și plasezi un .nzb oriunde, notificări pe desktop, sunete la finalizare, un asistent la prima rulare și <code>serve --open</code>.</li>
       </ul>
     </div>
@@ -223,10 +223,10 @@
   <div class="wrap">
     <h2>Implementare</h2>
     <ul class="plain">
-      <li><b>Un singur executabil de sine stătător.</b> par2 și dezarhivarea RAR sunt cod nativ compilat în binar — nimic nu se extrage la prima rulare și nu ai de-a face cu niciun runtime și niciun installer.</li>
-      <li><b>macOS, de primă clasă</b> — un binar universal pentru Apple Silicon și Intel, o aplicație nativă SwiftUI în bara de meniu, o unitate launchd și o formulă Homebrew.</li>
-      <li><b>Windows</b> — un exe x64 complet static care rulează pe Windows 10 și 11 standard, cu un launcher cu dublu-clic și o configurare ghidată.</li>
-      <li><b>Linux și Docker</b> — o unitate systemd întărită, o imagine Docker multi-etapă cu entrypoint PUID/PGID în stil linuxserver și un fișier compose inclus. <a href="download.ro.html">Toate platformele →</a></li>
+      <li><b>Un singur executabil de sine stătător.</b> par2 și dezarhivarea RAR sunt cod nativ compilat în binar - nimic nu se extrage la prima rulare și nu ai de-a face cu niciun runtime și niciun installer.</li>
+      <li><b>macOS, de primă clasă</b> - un binar universal pentru Apple Silicon și Intel, o aplicație nativă SwiftUI în bara de meniu, o unitate launchd și o formulă Homebrew.</li>
+      <li><b>Windows</b> - un exe x64 complet static care rulează pe Windows 10 și 11 standard, cu un launcher cu dublu-clic și o configurare ghidată.</li>
+      <li><b>Linux și Docker</b> - o unitate systemd întărită, o imagine Docker multi-etapă cu entrypoint PUID/PGID în stil linuxserver și un fișier compose inclus. <a href="download.ro.html">Toate platformele →</a></li>
       <li><b>Configurare ghidată.</b> Rulează asistentul <code>nzbfast setup</code> sau lasă-l să detecteze automat o configurație SABnzbd sau NZBGet existentă. Vei avea prima descărcare în mai puțin de două minute.</li>
     </ul>
   </div>
@@ -234,7 +234,7 @@
 
 <footer><div class="wrap">
   <div class="cols">
-    <div>⚡ <b>nzbfast</b> — descărcătorul Usenet într-o singură trecere.</div>
+    <div>⚡ <b>nzbfast</b> - descărcătorul Usenet într-o singură trecere.</div>
     <div>
       <a href="features.ro.html">Funcții</a> ·
       <a href="benchmarks.ro.html">Benchmark-uri</a> ·
@@ -242,7 +242,7 @@
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
     </div>
   </div>
-  <p class="fine">Software liber, GPL-3.0-or-later. Repararea PAR2 și dezarhivarea RAR sunt cod nativ în binar — fără instrumente terțe incluse. Metadatele peretelui de postere provin din surse publice fără cheie,
+  <p class="fine">Software liber, GPL-3.0-or-later. Repararea PAR2 și dezarhivarea RAR sunt cod nativ în binar - fără instrumente terțe incluse. Metadatele peretelui de postere provin din surse publice fără cheie,
   preluate de propria ta instalare.</p>
 </div></footer>
 
