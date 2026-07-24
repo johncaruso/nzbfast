@@ -72,8 +72,67 @@
 
 <section>
   <div class="wrap">
-    <h2>Route A: Container Manager <span class="tag now" style="vertical-align:middle">easiest</span></h2>
-    <p class="lead-guide">Best for most people. No text files.</p>
+    <h2>Route A: Container Manager Project <span class="tag now" style="vertical-align:middle">recommended</span></h2>
+    <p class="lead-guide">One file you can back up, re-use, and update with a single click. This is the
+    route to take if you want nzbfast to keep itself up to date.</p>
+    <ol class="steps">
+      <li><h3>Create the project</h3>
+        <p>File Station → make the project folder, e.g. <code>/docker/nzbfast</code>. Then Container Manager →
+        <b>Project</b> → <b>Create</b>, name it <code>nzbfast</code>, path <code>/docker/nzbfast</code>,
+        source <i>Create docker-compose.yml</i>.</p>
+      </li>
+      <li><h3>Paste this</h3>
+        <pre class="cmd">services:
+  nzbfast:
+    image: nzbfast/nzbfast:latest
+    container_name: nzbfast
+    restart: unless-stopped
+    ports:
+      - "6789:6789"
+    environment:
+      - PUID=1026          # your uid  (id your_dsm_username)
+      - PGID=100           # your gid
+      - TZ=Europe/London   # your timezone
+      # - NZBFAST_APIKEY=change-me   # only if you'll connect Sonarr/Radarr
+    volumes:
+      - ./config:/config          # settings + index database
+      - ./downloads:/downloads    # finished files
+      - ./watch:/watch            # drop an .nzb here to auto-download
+
+  # Optional: checks nightly for a newer nzbfast image and recreates the
+  # container when one ships. Delete this service to update by hand instead.
+  watchtower:
+    image: containrrr/watchtower
+    container_name: nzbfast-watchtower
+    restart: unless-stopped
+    environment:
+      - TZ=Europe/London   # same timezone, so the schedule below is your 04:00
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --cleanup --schedule "0 0 4 * * *" nzbfast   # daily 04:00, nzbfast only</pre>
+        <p class="note">The <code>./config</code>, <code>./downloads</code> and <code>./watch</code> folders are
+        created for you inside the project folder.</p>
+      </li>
+      <li><h3>Finish the wizard</h3>
+        <p>Container Manager pulls the images and starts them. Then jump to
+        <a href="#firstrun">First run</a> below.</p>
+      </li>
+    </ol>
+    <div class="callout"><b>About that last service.</b> Watchtower is what keeps nzbfast current, and it
+    needs the Docker socket to recreate containers. That access is root-equivalent on your NAS, so it is a
+    real trade: convenience against handing one container broad control. If you would rather not, delete the
+    <code>watchtower</code> block and update by hand (see <a href="#updating">Updating</a>). It is scoped to
+    the <code>nzbfast</code> container by the name at the end of the <code>command</code> line, so it will
+    never touch your other containers.</div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <h2>Route B: Container Manager, search and click</h2>
+    <p class="lead-guide">No text files at all. The trade-off: a container built this way
+    <b>cannot auto-update</b>, because Container Manager's volume picker only browses shared folders and so
+    cannot mount the Docker socket that Watchtower needs. You update it by hand, a few clicks each release.</p>
     <ol class="steps">
       <li><h3>Make the folders</h3>
         <p>File Station → create a shared folder or sub-tree for the container's data, e.g.:</p>
@@ -117,32 +176,6 @@
   </div>
 </section>
 
-<section class="alt">
-  <div class="wrap">
-    <h2>Route B: Container Manager Project</h2>
-    <p class="lead-guide">Prefer one file you can back up? Container Manager → <b>Project</b> → <b>Create</b>,
-    name it <code>nzbfast</code>, path <code>/docker/nzbfast</code>, source <i>Create docker-compose.yml</i>, and paste:</p>
-    <pre class="cmd">services:
-  nzbfast:
-    image: nzbfast/nzbfast:latest
-    container_name: nzbfast
-    restart: unless-stopped
-    ports:
-      - "6789:6789"
-    environment:
-      - PUID=1026          # your uid  (id your_dsm_username)
-      - PGID=100           # your gid
-      - TZ=Europe/London   # your timezone
-      # - NZBFAST_APIKEY=change-me   # only if you'll connect Sonarr/Radarr
-    volumes:
-      - ./config:/config
-      - ./downloads:/downloads
-      - ./watch:/watch</pre>
-    <p class="note">The <code>./config</code>, <code>./downloads</code> and <code>./watch</code> folders are
-    created for you inside the project folder.</p>
-  </div>
-</section>
-
 <section id="firstrun">
   <div class="wrap">
     <h2>First run: add your provider</h2>
@@ -159,21 +192,22 @@
     <p class="lead-guide">nzbfast speaks the SABnzbd API. In your *arr app, add a <b>SABnzbd</b> download client:
     <b>Host</b> = your NAS IP, <b>Port</b> = <code>6789</code>, <b>API Key</b> = the value you set in
     <code>NZBFAST_APIKEY</code>. It also exposes the NZBGet JSON-RPC API, so nzb360 / LunaSea connect the same way.</p>
-    <h2 style="margin-top:34px">Updating</h2>
-    <p class="lead-guide">The image is the update channel. You update by pulling a newer image. Your
-    <code>config</code> and <code>downloads</code> survive because they live in your NAS folders, not the container.</p>
+    <h2 id="updating" style="margin-top:34px">Updating</h2>
+    <p class="lead-guide">The image is the update channel: nzbfast in a container never swaps its own binary,
+    you move it forward by pulling a newer image. Your <code>config</code> and <code>downloads</code> survive,
+    because they live in your NAS folders and not inside the container.</p>
     <ul class="plain">
-      <li><b>Manually:</b> Container Manager → <b>Registry</b> → re-download the <code>latest</code> tag, then
-      recreate the container (in a Project, <b>Build</b> re-pulls it).</li>
-      <li><b>Automatically:</b> add <b>Watchtower</b>, a tiny sidecar that pulls new nzbfast images and recreates
-      the container for you. In a Project, paste this alongside the <code>nzbfast</code> service:</li>
+      <li><b>Automatically</b>, if you took Route A and kept the <code>watchtower</code> service: nothing to do.
+      It checks nightly at 04:00 and recreates the container when a new version ships.</li>
+      <li><b>By hand, in a Project:</b> Container Manager → <b>Project</b> → <code>nzbfast</code> → <b>Stop</b>,
+      then <b>Build</b> (this re-pulls <code>latest</code>), then <b>Start</b>.</li>
+      <li><b>By hand, Route B:</b> Container Manager → <b>Registry</b> → re-download the <code>latest</code> tag,
+      then <b>Container</b> → stop nzbfast → <b>Action → Reset</b> to recreate it on the new image.</li>
     </ul>
-    <pre class="cmd">  watchtower:
-    image: containrrr/watchtower
-    restart: unless-stopped
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    command: --cleanup --schedule "0 0 4 * * *" nzbfast   # daily 04:00, nzbfast only</pre>
+    <div class="callout"><b>Check your image tag first.</b> All of the above assumes your container is on
+    <code>nzbfast/nzbfast:latest</code>. If it is pinned to a version, say <code>:1.0.3</code>, then neither
+    Watchtower nor a re-pull will ever move it: both fetch the tag the container was created with. Container
+    Manager → <b>Container</b> → <b>Details</b> shows which one you have.</div>
   </div>
 </section>
 
@@ -188,6 +222,9 @@
       <li><b>Not searchable in Registry</b>: make sure you're on the <b>Registry</b> tab (not <i>Image</i>), and the
       NAS has internet. You can also pull it by exact name <code>nzbfast/nzbfast</code>.</li>
       <li><b>Nothing downloads</b>: open the dashboard; if the Welcome panel is still showing, the provider isn't saved yet.</li>
+      <li><b>Auto-update never fires</b>: check the container is on the <code>latest</code> tag rather than a pinned
+      version, and that the schedule ran in your timezone (set <code>TZ</code> on the watchtower service, or
+      <code>0 0 4 * * *</code> means 04:00 UTC). <code>sudo docker logs nzbfast-watchtower</code> shows its next run.</li>
     </ul>
     <div class="callout" style="margin-top:22px"><b>Which models?</b> Any DSM 7 unit with Container Manager (most DSM 6
     units with Docker), Intel or ARM64. Very low-end ARMv7/32-bit models aren't supported. Same image also runs on
