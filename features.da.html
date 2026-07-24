@@ -102,7 +102,8 @@
       </ul>
       <ul class="plain">
         <li><b>Nøjagtigt tilpasset reparation.</b> Beskadigede blokke kendes, i det øjeblik de opstår, så kun det byte-minimale sæt af genoprettelsesvolumener hentes (løst som et rygsæksproblem) og reparationen rører intet andet end de beskadigede spænd.</li>
-        <li><b>Fallback for komprimeret og krypteret:</b> non-store-posts materialiseres og udpakkes gennem den native RAR-motor, overlappet med resten af køen. Krypterede sæt parkeres med en tydelig besked i stedet for at fejle i stilhed.</li>
+        <li><b>RAR-gendannelsesdata.</b> Når PAR2 er brugt op, eller aldrig blev postet, reparerer indlejrede RAR-gendannelsesdata beskadigede volumener på stedet.</li>
+        <li><b>Fallback for komprimeret og krypteret:</b> non-store-posts materialiseres og udpakkes gennem den native RAR-motor, alt fra RAR4 til det nye RAR7, overlappet med resten af køen. Krypterede sæt parkeres med en tydelig besked i stedet for at fejle i stilhed.</li>
         <li><b>Håndtering af adgangskoder.</b> Adgangskoder kommer fra *arr-API'et, filnavnskonventionen <code>{{pw}}</code> eller NZB-metadata. Er der noget tilbage, klarer en 🔑 lås-op på dashboardet resten: den låser op i baggrunden og arkiverer så som normalt.</li>
         <li><b>Sikkerhedsgelændre.</b> Reparerede kildevolumener skrivebeskyttes, mens genudpakningen kører, og en exit-kode melder kun "succes", når sluttilstanden er ægte brugbar.</li>
       </ul>
@@ -170,11 +171,13 @@
         <li><b>Ingest-filtre:</b> filtre på type, år, opløsning, sprog og størrelse holder indexer-spam ude af din database, og obfuskeret skrald fanges og lukkes ude som standard.</li>
         <li><b>Scene-navne-parser.</b> Den trækker titel, år, episode, kvalitet og kilde ud af virkelige stems (inklusive datokodede dailies, multi-episode-koder og ROT13-obfuskerede navne) og deduplikerer releases ned til ét kort pr. titel.</li>
         <li><b>Øjeblikkelig søgning:</b> søg-mens-du-skriver med kvalitetsfiltre, overvågningsknapper pr. række og kvalitetsmærker overalt.</li>
+        <li><b>Takedown-detektion.</b> Tilgængelighedssampling i baggrunden opdager, når en gruppe er ved at blive høstet, og sætter mærker på dens releases, så en post, der allerede er på vej væk, ikke spilder en hentning.</li>
       </ul>
       <ul class="plain">
         <li><b>Nøglefri berigelse.</b> TVmaze til tv, iTunes Search til film, plus offentlige bedømmelses-datasæt, Wikidata, Wikipedia og AniList fylder postere, bedømmelser og stemmetal, medvirkende, genrer og handlinger ud. OMDb- og TMDB-nøgler virker, hvis du har dem, men intet kræver en.</li>
         <li><b>Episodegitre:</b> chips pr. sæson med det bedste encode af hver episode ét klik fra at blive hentet, sæsonpakker markeret og et "overvåg serie" på hver sæson-header.</li>
         <li><b>Trend-rækker:</b> nyt-i-denne-uge- og hot-lige-nu-striber bygget ud fra postfrekvens.</li>
+        <li><b>En væg, der lærer.</b> "Ikke interesseret" skjuler en titel og lærer den en stående regel; sorteringen "Til dig" rangerer væggen efter den smagsprofil, dine egne hentninger bygger. Det hele forbliver lokalt.</li>
         <li><b>Ret hvad som helst.</b> Forkert match? Vælg blandt kandidaterne, eller skriv bare den rigtige identitet. Alt, hvad du sætter i hånden, overskrives aldrig. Peg en poster mod en URL, eller upload en. Én knap beriger en enkelt titel på ny; en anden sletter og genopbygger hele indekset.</li>
       </ul>
     </div>
@@ -214,6 +217,7 @@
         <li><b>Alt kan konfigureres i browseren:</b> servere (med live forbindelsestests), hastighed og tidsplan, forbindelser/vindue/decodere, disk og kvote, watch-mapper og scripts, indekserings-filtre, bibliotek, RSS og sikkerhed med nøgle-rotation. Indstillinger overlever genstarter.</li>
         <li><b>Diagnostik indbygget:</b> en logfremviser i UI'et, et system-benchmark, der finder dine lofter for netværk, beregning og disk og fortæller dig, hvad du skal gøre ved dem, analyseværktøjet for server-diversitet og forbindelsesstigen.</li>
         <li><b>Dataforbrug:</b> 14-dages stablede bjælker pr. udbyder, daglig historik og livstids-tællere for blok-konti.</li>
+        <li><b>28 sprog.</b> Dashboardet leveres fuldt lokaliseret, højre-mod-venstre-skrifter inklusive; manualen og dette websted findes på 16.</li>
         <li><b>Bekvemmelighed.</b> Træk og slip en .nzb hvor som helst, skrivebordsnotifikationer, fuldførelseslyde, en guide ved første kørsel og <code>serve --open</code>.</li>
       </ul>
     </div>
@@ -227,7 +231,8 @@
       <li><b>Én selvstændig eksekverbar fil.</b> par2 og RAR-udpakning er native kode kompileret ind i binæren. Intet udpakkes ved første kørsel, og der er ingen runtime og ingen installer at rode med.</li>
       <li><b>macOS i første klasse:</b> en universal binær til Apple Silicon og Intel, en native SwiftUI-menubjælke-app, en launchd-unit og en Homebrew-formel.</li>
       <li><b>Windows:</b> en fuldt statisk x64-exe, der kører på en standard Windows 10 og 11, med en dobbeltklik-starter og guidet opsætning.</li>
-      <li><b>Linux og Docker:</b> en hærdet systemd-unit, et multi-stage Docker-image med et linuxserver-agtigt PUID/PGID-entrypoint og en compose-fil i pakken. <a href="download.da.html">Alle platforme →</a></li>
+      <li><b>Linux, Docker og NAS:</b> en hærdet systemd-unit, et multi-stage Docker-image med et linuxserver-agtigt PUID/PGID-entrypoint, en compose-fil i pakken, en Unraid-skabelon og en Synology-guide. <a href="download.da.html">Alle platforme →</a></li>
+      <li><b>Den opdaterer aldrig sig selv.</b> Nye releases dukker op som en notits på dashboardet, eller ikke engang det, hvis du slår tjekket fra. At opdatere forbliver din beslutning, i dit eget tempo.</li>
       <li><b>Guidet opsætning.</b> Kør guiden <code>nzbfast setup</code>, eller lad den auto-detektere en eksisterende SABnzbd- eller NZBGet-konfiguration. Du har en første download kørende på under to minutter.</li>
     </ul>
   </div>

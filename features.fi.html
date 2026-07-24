@@ -102,7 +102,8 @@
       </ul>
       <ul class="plain">
         <li><b>Tarkalleen sopiva korjaus.</b> Vioittuneet lohkot tunnetaan heti niiden sattuessa, joten haetaan vain minimitavumäärän verran palautusosia (reppuongelman ratkaisu) ja korjaus koskee vain vioittuneita alueita.</li>
-        <li><b>Pakattu ja salattu varajärjestely:</b> ei-store-julkaisut kirjoittuvat levylle ja puretaan natiivilla RAR-moottorilla, muun jonon kanssa limitettynä. Salatut sarjat pysäköidään selkeällä viestillä sen sijaan, että ne kaatuisivat hiljaa.</li>
+        <li><b>RAR-palautustietueet.</b> Kun PAR2 on käytetty loppuun, tai sitä ei koskaan julkaistu, RAR-osiin upotetut palautustietueet korjaavat vioittuneet osat paikoillaan.</li>
+        <li><b>Pakattu ja salattu varajärjestely:</b> ei-store-julkaisut kirjoittuvat levylle ja puretaan natiivilla RAR-moottorilla, kaikki RAR4:stä uuteen RAR7:ään, muun jonon kanssa limitettynä. Salatut sarjat pysäköidään selkeällä viestillä sen sijaan, että ne kaatuisivat hiljaa.</li>
         <li><b>Salasanojen käsittely.</b> Salasanat tulevat *arr-API:sta, <code>{{pw}}</code>-tiedostonimikäytännöstä tai NZB-metatiedoista. Lopuille 🔑-lukituksen avaus koontinäytöllä hoitaa homman: se avaa lukituksen taustalla ja arkistoi sitten normaalisti.</li>
         <li><b>Turvakaiteet.</b> Korjatut lähdeosat kirjoitussuojataan uudelleenpurun ajaksi, ja paluukoodi ilmoittaa ”onnistui” vain kun lopputila on aidosti käyttökelpoinen.</li>
       </ul>
@@ -170,11 +171,13 @@
         <li><b>Sisäänoton portit:</b> tyyppi-, vuosi-, resoluutio-, kieli- ja kokosuodattimet pitävät indeksoijaroskan poissa tietokannastasi, ja peitelty roska havaitaan ja portitetaan oletuksena.</li>
         <li><b>Scene-nimijäsennin.</b> Se poimii nimikkeen, vuoden, jakson, laadun ja lähteen tosielämän rungoista (mukaan lukien päivämääräkoodatut dailyt, moniosakoodit ja ROT13-peitellyt nimet) ja tiivistää julkaisut yhteen korttiin per nimike.</li>
         <li><b>Pikahaku:</b> haku kirjoittaessa laatusuodattimin, rivikohtaisin seurantapainikkein ja laatumerkein kaikkialla.</li>
+        <li><b>Poistojen tunnistus.</b> Taustalla ajettava saatavuusnäytteistys huomaa, kun ryhmää niitetään, ja merkitsee sen julkaisut, joten jo poistettavana oleva julkaisu ei tuhlaa nappausta.</li>
       </ul>
       <ul class="plain">
         <li><b>Avaimeton rikastus.</b> TVmaze TV:lle, iTunes Search elokuville, sekä julkiset arvosana-aineistot, Wikidata, Wikipedia ja AniList täyttävät julisteet, arvosanat ja äänimäärät, näyttelijät, genret ja juonet. OMDb- ja TMDB-avaimet toimivat, jos sinulla on, mutta mikään ei niitä vaadi.</li>
         <li><b>Jaksoruudukot:</b> kausikohtaiset merkit, joissa kunkin jakson paras enkoodaus on napsautuksen päässä latauksesta, kausipaketit merkittyinä ja ”seuraa sarjaa” jokaisen kausiotsikon kohdalla.</li>
         <li><b>Trendirivit:</b> uutta tällä viikolla- ja juuri nyt kuumaa -nauhat julkaisutiheydestä koottuina.</li>
+        <li><b>Seinä, joka oppii.</b> ”Ei kiinnosta” piilottaa nimikkeen ja opettaa pysyvän säännön; ”Sinulle”-järjestys lajittelee seinän sen makuprofiilin mukaan, jonka omat nappauksesi rakentavat. Kaikki tämä pysyy paikallisena.</li>
         <li><b>Korjaa mikä tahansa.</b> Väärä osuma? Valitse ehdokkaista tai kirjoita oikea identiteetti itse. Mitään käsin asettamaasi ei koskaan ylikirjoiteta. Osoita juliste URL:iin tai lataa oma. Yksi painike rikastaa yksittäisen nimikkeen uudelleen, toinen pyyhkii ja rakentaa koko indeksin uudelleen.</li>
       </ul>
     </div>
@@ -214,6 +217,7 @@
         <li><b>Kaikki on määritettävissä selaimessa:</b> palvelimet (live-yhteystesteineen), nopeus ja ajastus, yhteydet/ikkuna/dekooderit, levy ja kiintiö, valvontakansiot ja komentosarjat, indeksoinnin portit, kirjasto, RSS sekä suojaus avaimen vaihdolla. Asetukset säilyvät uudelleenkäynnistysten yli.</li>
         <li><b>Diagnostiikka sisäänrakennettuna:</b> käyttöliittymän sisäinen lokinkatselin, järjestelmän mittaus, joka löytää verkon, laskennan ja levyn katot ja kertoo, mitä niille tehdä, palvelinten monimuotoisuusanalysaattori ja yhteysporras.</li>
         <li><b>Datan käyttö:</b> 14 päivän pinotut palveluntarjoajakohtaiset palkit, päivittäinen historia ja elinaikaiset laskurit lohkotileille.</li>
+        <li><b>28 kieltä.</b> Koontinäyttö toimitetaan täysin lokalisoituna, oikealta vasemmalle kirjoitettavat kielet mukaan lukien; manuaali ja tämä sivusto ovat saatavilla 16:lla.</li>
         <li><b>Käytön mukavuus.</b> Raahaa ja pudota .nzb minne tahansa, työpöytäilmoitukset, valmistumisäänet, ensikäynnistysvelho ja <code>serve --open</code>.</li>
       </ul>
     </div>
@@ -227,7 +231,8 @@
       <li><b>Yksi itsenäinen suoritettava tiedosto.</b> par2 ja RAR-purku ovat binääriin käännettyä natiivikoodia. Mitään ei pureta ensikäynnistyksellä, eikä ole ajoympäristöä tai asennusohjelmaa säädettäväksi.</li>
       <li><b>macOS ensiluokkaisesti:</b> universaali binääri Apple Siliconille ja Intelille, natiivi SwiftUI-valikkopalkkisovellus, launchd-yksikkö ja Homebrew-formula.</li>
       <li><b>Windows:</b> täysin staattinen x64-exe, joka toimii vakio-Windows 10:llä ja 11:llä, kaksoisnapsautuskäynnistimineen ja ohjattuine asennuksineen.</li>
-      <li><b>Linux ja Docker:</b> kovennettu systemd-yksikkö, monivaiheinen Docker-kuva linuxserver-tyylisellä PUID/PGID-sisäänmenopisteellä ja compose-tiedosto mukana. <a href="download.fi.html">Kaikki alustat →</a></li>
+      <li><b>Linux, Docker ja NAS:</b> kovennettu systemd-yksikkö, monivaiheinen Docker-kuva linuxserver-tyylisellä PUID/PGID-sisäänmenopisteellä, compose-tiedosto mukana, Unraid-malli ja Synology-opas. <a href="download.fi.html">Kaikki alustat →</a></li>
+      <li><b>Se ei koskaan päivitä itseään.</b> Uudet julkaisut näkyvät ilmoituksena koontinäytöllä, tai eivät edes sitä, jos kytket tarkistuksen pois. Päivittäminen pysyy sinun päätöksenäsi, sinun aikataulussasi.</li>
       <li><b>Ohjattu asennus.</b> Aja <code>nzbfast setup</code> -velho, tai anna sen tunnistaa automaattisesti olemassa oleva SABnzbd- tai NZBGet-määritys. Ensimmäinen lataus on käynnissä alle kahdessa minuutissa.</li>
     </ul>
   </div>

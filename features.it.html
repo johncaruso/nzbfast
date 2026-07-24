@@ -102,7 +102,8 @@
       </ul>
       <ul class="plain">
         <li><b>Riparazione su misura.</b> I blocchi danneggiati si conoscono appena si presentano, così viene scaricato solo l'insieme di volumi di recupero dal minor numero di byte (un problema dello zaino) e la riparazione tocca soltanto gli intervalli danneggiati.</li>
-        <li><b>Fallback per compressi e cifrati:</b> i post non-store si materializzano e si estraggono con il motore RAR nativo, in sovrapposizione con il resto della coda. I set cifrati si parcheggiano con un messaggio chiaro invece di fallire in silenzio.</li>
+        <li><b>Record di recupero RAR.</b> Quando il PAR2 è esaurito, o non è mai stato postato, i record di recupero incorporati nei RAR riparano i volumi danneggiati sul posto.</li>
+        <li><b>Fallback per compressi e cifrati:</b> i post non-store si materializzano e si estraggono con il motore RAR nativo, tutto dal RAR4 al nuovo RAR7, in sovrapposizione con il resto della coda. I set cifrati si parcheggiano con un messaggio chiaro invece di fallire in silenzio.</li>
         <li><b>Gestione delle password.</b> Le password arrivano dall'API degli *arr, dalla convenzione <code>{{pw}}</code> nel nome file o dai metadati NZB. Per tutto il resto ci pensa lo sblocco 🔑 nella dashboard: sblocca in background, poi archivia come al solito.</li>
         <li><b>Reti di sicurezza.</b> I volumi sorgente riparati sono protetti da scrittura mentre gira la ri-estrazione, e un codice di uscita segnala «successo» solo quando lo stato finale è davvero utilizzabile.</li>
       </ul>
@@ -170,11 +171,13 @@
         <li><b>Filtri d'ingresso:</b> filtri per tipo, anno, risoluzione, lingua e dimensione tengono lo spam da indexer fuori dal tuo database, e la robaccia offuscata viene intercettata e bloccata di default.</li>
         <li><b>Parser dei nomi scene.</b> Estrae titolo, anno, episodio, qualità e sorgente dai nomi reali (daily con data nel nome, codici multi-episodio e nomi offuscati in ROT13 inclusi) e deduplica le release fino a una sola scheda per titolo.</li>
         <li><b>Ricerca istantanea:</b> risultati mentre digiti, con filtri di qualità, pulsanti Segui su ogni riga e badge di qualità dappertutto.</li>
+        <li><b>Rilevamento dei takedown.</b> Il campionamento di disponibilità in background si accorge quando un gruppo viene ripulito e contrassegna le sue release con un badge, così un post già in via di rimozione non spreca un prelievo.</li>
       </ul>
       <ul class="plain">
         <li><b>Arricchimento senza chiavi.</b> TVmaze per le serie, iTunes Search per il cinema, più dataset pubblici di valutazioni, Wikidata, Wikipedia e AniList riempiono poster, valutazioni con conteggio dei voti, cast, generi e trame. Le chiavi OMDb e TMDB funzionano se le hai, ma nessuna è necessaria.</li>
         <li><b>Griglie di episodi:</b> chip per stagione con il miglior encode di ogni episodio a un clic dal download, i season pack segnalati e un «segui la serie» su ogni intestazione di stagione.</li>
         <li><b>Righe di tendenza:</b> strisce «novità della settimana» e «caldi adesso» costruite sulla frequenza dei post.</li>
+        <li><b>Una bacheca che impara.</b> «Non mi interessa» nasconde un titolo e insegna una regola permanente; l'ordinamento «Per te» classifica la bacheca secondo il profilo dei gusti costruito dai tuoi stessi prelievi. Tutto resta in locale.</li>
         <li><b>Correggi qualsiasi cosa.</b> Corrispondenza sbagliata? Scegli tra i candidati o digita semplicemente l'identità giusta. Ciò che imposti a mano non viene mai sovrascritto. Punta un poster a un URL o caricalo tu. Un pulsante ri-arricchisce un singolo titolo; un altro azzera e ricostruisce l'intero indice.</li>
       </ul>
     </div>
@@ -214,6 +217,7 @@
         <li><b>Tutto configurabile dal browser:</b> i server (con test di connessione dal vivo), velocità e pianificazione, connessioni/finestra/decoder, disco e quota, cartelle monitorate e script, filtri di indicizzazione, libreria, RSS e sicurezza con rotazione delle chiavi. Le impostazioni sopravvivono ai riavvii.</li>
         <li><b>Diagnostica integrata:</b> un visore dei log dentro l'interfaccia, un benchmark di sistema che individua i tetti di rete, calcolo e disco e ti dice come intervenire, l'analisi della diversità dei server e la scala delle connessioni.</li>
         <li><b>Utilizzo dati:</b> barre impilate per provider su 14 giorni, storico giornaliero e contatori a vita per gli account a blocchi.</li>
+        <li><b>28 lingue.</b> La dashboard arriva completamente localizzata, scritture da destra a sinistra comprese; il manuale e questo sito sono in 16.</li>
         <li><b>Qualità della vita.</b> Trascina un .nzb ovunque, notifiche desktop, suoni di completamento, una procedura guidata al primo avvio e <code>serve --open</code>.</li>
       </ul>
     </div>
@@ -227,7 +231,8 @@
       <li><b>Un unico eseguibile autonomo.</b> par2 e l'estrazione RAR sono codice nativo compilato nel binario. Al primo avvio non viene estratto nulla, e non c'è alcun runtime né installer di cui preoccuparsi.</li>
       <li><b>macOS, di prima classe:</b> un binario universale per Apple Silicon e Intel, un'app nativa SwiftUI nella barra dei menu, un'unità launchd e una formula Homebrew.</li>
       <li><b>Windows:</b> un exe x64 completamente statico che gira su Windows 10 e 11 di serie, con launcher a doppio clic e configurazione guidata.</li>
-      <li><b>Linux e Docker:</b> un'unità systemd blindata, un'immagine Docker multi-stage con entrypoint PUID/PGID in stile linuxserver e un file compose incluso. <a href="download.it.html">Tutte le piattaforme →</a></li>
+      <li><b>Linux, Docker e NAS:</b> un'unità systemd blindata, un'immagine Docker multi-stage con entrypoint PUID/PGID in stile linuxserver, un file compose incluso, un template Unraid e una guida Synology. <a href="download.it.html">Tutte le piattaforme →</a></li>
+      <li><b>Non si aggiorna mai da solo.</b> Le nuove versioni compaiono come avviso nella dashboard, o nemmeno quello se disattivi il controllo. Aggiornare resta una tua scelta, con i tuoi tempi.</li>
       <li><b>Configurazione guidata.</b> Lancia la procedura <code>nzbfast setup</code>, oppure lascia che rilevi da solo una configurazione SABnzbd o NZBGet esistente. Avrai un primo download in corso in meno di due minuti.</li>
     </ul>
   </div>

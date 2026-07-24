@@ -102,7 +102,8 @@
       </ul>
       <ul class="plain">
         <li><b>Passgenaue Reparatur.</b> Beschädigte Blöcke sind bekannt, sobald sie auftreten, sodass nur die byteminimale Menge an Recovery-Volumes geholt wird (ein Knapsack-Problem) und die Reparatur nichts als die beschädigten Bereiche anfasst.</li>
-        <li><b>Fallback für Komprimiertes und Verschlüsseltes:</b> Nicht-Store-Posts landen auf der Platte und werden über die native RAR-Engine entpackt, überlappt mit dem Rest der Warteschlange. Verschlüsselte Sets parken mit einer klaren Meldung, statt still zu scheitern.</li>
+        <li><b>RAR-Recovery-Records.</b> Wenn das PAR2 aufgebraucht ist, oder nie gepostet wurde, reparieren die in den RARs eingebetteten Recovery-Records beschädigte Volumes an Ort und Stelle.</li>
+        <li><b>Fallback für Komprimiertes und Verschlüsseltes:</b> Nicht-Store-Posts landen auf der Platte und werden über die native RAR-Engine entpackt, alles von RAR4 bis zum neuen RAR7, überlappt mit dem Rest der Warteschlange. Verschlüsselte Sets parken mit einer klaren Meldung, statt still zu scheitern.</li>
         <li><b>Passwort-Handling.</b> Passwörter stammen aus der *arr-API, der <code>{{pw}}</code>-Namenskonvention oder den NZB-Metadaten. Für alles Übrige übernimmt ein 🔑-Entsperren im Dashboard: Es entsperrt im Hintergrund und sortiert dann ganz normal ein.</li>
         <li><b>Sicherheitsgurte.</b> Reparierte Quell-Volumes sind schreibgeschützt, solange das erneute Entpacken läuft, und ein Exit-Code meldet nur dann „Erfolg“, wenn das Endergebnis wirklich benutzbar ist.</li>
       </ul>
@@ -170,11 +171,13 @@
         <li><b>Ingest-Filter:</b> Filter nach Art, Jahr, Auflösung, Sprache und Größe halten Indexer-Spam aus deiner Datenbank, und verschleierter Müll wird standardmäßig erkannt und ausgefiltert.</li>
         <li><b>Scene-Namen-Parser.</b> Er zieht Titel, Jahr, Episode, Qualität und Quelle aus echten Release-Namen (datumscodierte Dailies, Multi-Episoden-Codes und ROT13-verschleierte Namen inbegriffen) und dedupliziert Releases auf eine Karte pro Titel.</li>
         <li><b>Sofortsuche:</b> Suche beim Tippen mit Qualitätsfiltern, Beobachten-Knöpfen pro Zeile und Qualitäts-Badges überall.</li>
+        <li><b>Takedown-Erkennung.</b> Verfügbarkeits-Stichproben im Hintergrund bemerken, wenn eine Gruppe abgeräumt wird, und versehen ihre Releases mit einem Badge, sodass ein Post, der ohnehin schon entfernt wird, keinen Grab verschwendet.</li>
       </ul>
       <ul class="plain">
         <li><b>Anreicherung ohne Keys.</b> TVmaze für Serien, iTunes Search für Filme, dazu öffentliche Bewertungs-Datensätze, Wikidata, Wikipedia und AniList füllen Poster, Bewertungen und Stimmenzahlen, Besetzung, Genres und Handlung. OMDb- und TMDB-Keys funktionieren, wenn du sie hast, nötig ist aber keiner.</li>
         <li><b>Episodenraster:</b> Chips pro Staffel, bei denen der beste Encode jeder Episode nur einen Klick vom Download entfernt ist, markierte Staffel-Packs und ein „Serie beobachten“ in jedem Staffel-Kopf.</li>
         <li><b>Trend-Leisten:</b> Leisten für „Neu diese Woche“ und „Gerade heiß“, gebildet aus der Post-Frequenz.</li>
+        <li><b>Eine Wand, die dazulernt.</b> „Kein Interesse“ blendet einen Titel aus und bringt zugleich eine dauerhafte Regel bei; die Sortierung „Für dich“ ordnet die Posterwand nach dem Geschmacksprofil, das deine eigenen Grabs aufbauen. All das bleibt lokal.</li>
         <li><b>Alles korrigierbar.</b> Falsche Zuordnung? Wähl aus den Kandidaten oder tipp einfach die richtige Identität ein. Was du von Hand setzt, wird nie überschrieben. Verweise ein Poster auf eine URL oder lade eins hoch. Ein Knopf reichert einen einzelnen Titel neu an, ein anderer löscht den ganzen Index und baut ihn neu auf.</li>
       </ul>
     </div>
@@ -214,6 +217,7 @@
         <li><b>Alles im Browser konfigurierbar:</b> Server (mit Live-Verbindungstests), Tempo und Zeitplan, Verbindungen/Fenster/Decoder, Platte und Quota, Watch-Ordner und Skripte, Ingest-Filter, Bibliothek, RSS und Sicherheit mit Key-Rotation. Die Einstellungen überstehen Neustarts.</li>
         <li><b>Diagnose eingebaut:</b> ein Log-Viewer direkt in der UI, ein System-Benchmark, der deine Netzwerk-, Rechen- und Platten-Obergrenzen findet und dir sagt, was dagegen zu tun ist, die Server-Diversitäts-Analyse und die Verbindungs-Leiter.</li>
         <li><b>Datenverbrauch:</b> gestapelte Balken pro Provider über 14 Tage, Tageshistorie und Lebenszeit-Zähler für Block-Konten.</li>
+        <li><b>28 Sprachen.</b> Das Dashboard kommt vollständig übersetzt, Rechts-nach-links-Schriften eingeschlossen; das Handbuch und diese Seite gibt es in 16.</li>
         <li><b>Komfort.</b> Eine .nzb einfach irgendwohin ziehen, Desktop-Benachrichtigungen, Abschluss-Sounds, ein Erststart-Assistent und <code>serve --open</code>.</li>
       </ul>
     </div>
@@ -227,7 +231,8 @@
       <li><b>Eine einzige, in sich geschlossene Programmdatei.</b> par2 und RAR-Entpacken sind nativer Code, direkt in die Binary kompiliert. Beim ersten Start wird nichts entpackt, und es gibt weder eine Runtime noch einen Installer, mit dem man sich herumschlagen müsste.</li>
       <li><b>macOS, erstklassig:</b> eine Universal-Binary für Apple Silicon und Intel, eine native SwiftUI-Menüleisten-App, eine launchd-Unit und eine Homebrew-Formel.</li>
       <li><b>Windows:</b> eine vollständig statische x64-Exe, die auf Windows 10 und 11 ab Werk läuft, mit Doppelklick-Launcher und geführter Einrichtung.</li>
-      <li><b>Linux und Docker:</b> eine gehärtete systemd-Unit, ein Multi-Stage-Docker-Image mit PUID/PGID-Entrypoint im linuxserver-Stil und eine Compose-Datei liegt bei. <a href="download.de.html">Alle Plattformen →</a></li>
+      <li><b>Linux, Docker und NAS:</b> eine gehärtete systemd-Unit, ein Multi-Stage-Docker-Image mit PUID/PGID-Entrypoint im linuxserver-Stil, eine Compose-Datei, ein Unraid-Template und ein Synology-Guide liegen bei. <a href="download.de.html">Alle Plattformen →</a></li>
+      <li><b>Es aktualisiert sich nie selbst.</b> Neue Releases erscheinen als Hinweis im Dashboard, oder nicht einmal das, wenn du die Prüfung abschaltest. Das Update bleibt deine Entscheidung, nach deinem Zeitplan.</li>
       <li><b>Geführte Einrichtung.</b> Starte den Assistenten <code>nzbfast setup</code> oder lass ihn eine bestehende SABnzbd- oder NZBGet-Konfiguration automatisch erkennen. Dein erster Download läuft in unter zwei Minuten.</li>
     </ul>
   </div>

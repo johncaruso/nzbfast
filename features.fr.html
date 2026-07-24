@@ -102,7 +102,8 @@
       </ul>
       <ul class="plain">
         <li><b>Réparation au plus juste.</b> Les blocs endommagés sont connus au fil de l’eau, donc seul l’ensemble de volumes de récupération le plus léger en octets est téléchargé (un problème de sac à dos résolu) et la réparation ne touche rien d’autre que les zones endommagées.</li>
-        <li><b>Repli compressé et chiffré :</b> les posts hors mode store se matérialisent et se décompressent via le moteur RAR natif, en recouvrement avec le reste de la file. Les jeux chiffrés se garent avec un message clair plutôt que d’échouer en silence.</li>
+        <li><b>Enregistrements de récupération RAR.</b> Quand le PAR2 est épuisé, ou n’a jamais été posté, les enregistrements de récupération embarqués dans les RAR réparent les volumes endommagés sur place.</li>
+        <li><b>Repli compressé et chiffré :</b> les posts hors mode store se matérialisent et se décompressent via le moteur RAR natif, du RAR4 jusqu’au nouveau RAR7, en recouvrement avec le reste de la file. Les jeux chiffrés se garent avec un message clair plutôt que d’échouer en silence.</li>
         <li><b>Gestion des mots de passe.</b> Les mots de passe viennent de l’API des *arr, de la convention de nommage <code>{{pw}}</code> ou des métadonnées du NZB. Pour tout le reste, un déverrouillage 🔑 sur le tableau de bord prend le relais : il déverrouille en arrière-plan, puis classe normalement.</li>
         <li><b>Garde-fous.</b> Les volumes sources réparés sont protégés en écriture pendant la ré-extraction, et un code de sortie n’annonce « succès » que lorsque l’état final est réellement utilisable.</li>
       </ul>
@@ -170,11 +171,13 @@
         <li><b>Filtres d’ingestion :</b> des filtres de type, année, résolution, langue et taille tiennent le spam d’indexeur hors de votre base, et le tout-venant obfusqué est repéré et écarté par défaut.</li>
         <li><b>Analyseur de noms scene.</b> Il extrait titre, année, épisode, qualité et source de vrais noms de release (émissions quotidiennes datées, codes multi-épisodes et noms brouillés en ROT13 compris) et dédoublonne les releases en une seule carte par titre.</li>
         <li><b>Recherche instantanée :</b> résultats au fil de la frappe, filtres de qualité, boutons de suivi sur chaque ligne et badges de qualité partout.</li>
+        <li><b>Détection des retraits.</b> Un échantillonnage de disponibilité en arrière-plan repère un groupe en cours de purge et appose un badge sur ses releases : un post déjà en train d’être retiré ne gaspille pas un téléchargement.</li>
       </ul>
       <ul class="plain">
         <li><b>Enrichissement sans clé.</b> TVmaze pour les séries, iTunes Search pour le cinéma, plus des jeux de données de notes publics, Wikidata, Wikipédia et AniList remplissent affiches, notes et nombres de votes, casting, genres et synopsis. Les clés OMDb et TMDB fonctionnent si vous en avez, mais aucune n’est nécessaire.</li>
         <li><b>Grilles d’épisodes :</b> des pastilles par saison, le meilleur encodage de chaque épisode à un clic du téléchargement, les packs de saison signalés et un « suivre la série » sur chaque en-tête de saison.</li>
         <li><b>Rangées tendance :</b> des bandeaux « nouveautés de la semaine » et « en vogue en ce moment » bâtis à partir de la fréquence des posts.</li>
+        <li><b>Un mur qui apprend.</b> « Pas intéressé » masque un titre et enseigne une règle permanente ; le tri « Pour vous » classe le mur d’affiches selon le profil de goûts que vos propres téléchargements construisent. Tout cela reste en local.</li>
         <li><b>Tout se corrige.</b> Mauvaise correspondance ? Choisissez parmi les candidats ou saisissez simplement la bonne identité. Rien de ce que vous réglez à la main n’est jamais écrasé. Pointez une affiche vers une URL ou téléversez-la. Un bouton ré-enrichit un seul titre ; un autre efface et reconstruit tout l’index.</li>
       </ul>
     </div>
@@ -214,6 +217,7 @@
         <li><b>Tout se configure dans le navigateur :</b> serveurs (avec tests de connexion en direct), vitesse et planification, connexions/fenêtre/décodeurs, disque et quota, dossiers surveillés et scripts, filtres d’indexation, bibliothèque, RSS, et sécurité avec rotation des clés. Les réglages survivent aux redémarrages.</li>
         <li><b>Diagnostics intégrés :</b> une visionneuse de journal dans l’interface, un benchmark système qui trouve vos plafonds réseau, calcul et disque et vous dit quoi en faire, l’analyseur de diversité des serveurs, et le réglage des connexions par paliers.</li>
         <li><b>Consommation de données :</b> des barres empilées par fournisseur sur 14 jours, un historique quotidien, et des compteurs à vie pour les comptes à bloc.</li>
+        <li><b>28 langues.</b> Le tableau de bord est livré entièrement traduit, écritures de droite à gauche comprises ; le manuel et ce site existent en 16.</li>
         <li><b>Confort d’usage.</b> Glissez-déposez un .nzb n’importe où, notifications de bureau, sons de fin, assistant de premier lancement, et <code>serve --open</code>.</li>
       </ul>
     </div>
@@ -227,7 +231,8 @@
       <li><b>Un seul exécutable autonome.</b> par2 et l’extraction RAR sont du code natif compilé dans le binaire. Rien n’est extrait au premier lancement, et il n’y a ni runtime ni installeur à gérer.</li>
       <li><b>macOS, en première classe :</b> un binaire universel pour Apple Silicon et Intel, une app de barre de menus SwiftUI native, une unité launchd et une formule Homebrew.</li>
       <li><b>Windows :</b> un exe x64 entièrement statique qui tourne sur un Windows 10 et 11 d’origine, avec un lanceur double-clic et une installation guidée.</li>
-      <li><b>Linux et Docker :</b> une unité systemd durcie, une image Docker multi-étapes avec un point d’entrée PUID/PGID façon linuxserver, et un fichier compose fourni. <a href="download.fr.html">Toutes les plateformes →</a></li>
+      <li><b>Linux, Docker et NAS :</b> une unité systemd durcie, une image Docker multi-étapes avec un point d’entrée PUID/PGID façon linuxserver, un fichier compose fourni, un modèle Unraid et un guide Synology. <a href="download.fr.html">Toutes les plateformes →</a></li>
+      <li><b>Il ne se met jamais à jour tout seul.</b> Les nouvelles versions se signalent par un avis sur le tableau de bord, ou même pas si vous désactivez la vérification. La mise à jour reste votre décision, à votre rythme.</li>
       <li><b>Installation guidée.</b> Lancez l’assistant <code>nzbfast setup</code>, ou laissez-le détecter une configuration SABnzbd ou NZBGet existante. Vous aurez un premier téléchargement en marche en moins de deux minutes.</li>
     </ul>
   </div>

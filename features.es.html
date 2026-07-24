@@ -102,7 +102,8 @@
       </ul>
       <ul class="plain">
         <li><b>Reparación a medida.</b> Los bloques dañados se conocen en el momento en que ocurren, así que solo se obtiene el conjunto de volúmenes de recuperación con el mínimo de bytes -resuelto como un problema de la mochila- y la reparación no toca más que los tramos dañados.</li>
-        <li><b>Respaldo para comprimidos y cifrados:</b> las publicaciones que no van en modo almacenamiento se materializan y se desempaquetan con el motor RAR nativo, solapadas con el resto de la cola. Los conjuntos cifrados se aparcan con un mensaje claro en vez de fallar en silencio.</li>
+        <li><b>Registros de recuperación RAR.</b> Cuando el PAR2 se agota, o nunca se publicó, los registros de recuperación incrustados en los RAR reparan los volúmenes dañados in situ.</li>
+        <li><b>Respaldo para comprimidos y cifrados:</b> las publicaciones que no van en modo almacenamiento se materializan y se desempaquetan con el motor RAR nativo, todo desde RAR4 hasta el nuevo RAR7, solapadas con el resto de la cola. Los conjuntos cifrados se aparcan con un mensaje claro en vez de fallar en silencio.</li>
         <li><b>Gestión de contraseñas.</b> Las contraseñas vienen de la API de los *arr, de la convención de nombre <code>{{pw}}</code> o de los metadatos del NZB. Para lo que quede, un desbloqueo 🔑 en el panel se encarga del resto: desbloquea en segundo plano y luego archiva con normalidad.</li>
         <li><b>Barandillas de seguridad.</b> Los volúmenes fuente reparados quedan protegidos contra escritura mientras corre la reextracción, y un código de salida informa de «éxito» solo cuando el estado final es de verdad usable.</li>
       </ul>
@@ -170,11 +171,13 @@
         <li><b>Filtros de ingesta:</b> filtros por tipo, año, resolución, idioma y tamaño mantienen el spam de indexador fuera de tu base de datos, y la basura ofuscada se detecta y se descarta por defecto.</li>
         <li><b>Analizador de nombres de escena.</b> Extrae título, año, episodio, calidad y origen de nombres del mundo real -incluidos los programas diarios con fecha codificada, los códigos multiepisodio y los nombres ofuscados con ROT13- y deduplica los lanzamientos hasta una sola tarjeta por título.</li>
         <li><b>Búsqueda instantánea:</b> busca mientras escribes, con filtros de calidad, botones de seguimiento en cada fila y distintivos de calidad por todas partes.</li>
+        <li><b>Detección de retiradas.</b> El muestreo de disponibilidad en segundo plano nota cuándo un grupo está siendo purgado y marca sus lanzamientos con un distintivo, así una publicación que ya está siendo retirada no desperdicia una captura.</li>
       </ul>
       <ul class="plain">
         <li><b>Enriquecimiento sin claves.</b> TVmaze para series, iTunes Search para cine, y además conjuntos públicos de valoraciones, Wikidata, Wikipedia y AniList rellenan pósteres, valoraciones y recuentos de votos, reparto, géneros y argumentos. Las claves de OMDb y TMDB funcionan si las tienes, pero ninguna hace falta.</li>
         <li><b>Rejillas de episodios:</b> chips por temporada con la mejor codificación de cada episodio a un clic de la descarga, los packs de temporada marcados y un «seguir serie» en la cabecera de cada temporada.</li>
         <li><b>Filas de tendencias:</b> franjas de «nuevo esta semana» y «de moda ahora» construidas a partir de la frecuencia de publicación.</li>
+        <li><b>Un muro que aprende.</b> «No me interesa» oculta un título y enseña una regla permanente; el orden «Para ti» clasifica el muro de pósteres según el perfil de gustos que construyen tus propias capturas. Todo se queda en local.</li>
         <li><b>Corrige lo que sea.</b> ¿Coincidencia errónea? Elige entre los candidatos o simplemente escribe la identidad correcta: lo que fijas a mano nunca se sobrescribe. Apunta un póster a una URL o sube uno. Un botón reenriquece un solo título; otro borra y reconstruye el índice entero.</li>
       </ul>
     </div>
@@ -214,6 +217,7 @@
         <li><b>Todo se configura en el navegador:</b> servidores (con pruebas de conexión en vivo), velocidad y programación, conexiones/ventana/decodificadores, disco y cuota, carpetas vigiladas y scripts, filtros de indexación, biblioteca, RSS y seguridad con rotación de claves. Los ajustes sobreviven a los reinicios.</li>
         <li><b>Diagnósticos integrados:</b> un visor de registro en la propia interfaz, un benchmark del sistema que encuentra los techos de red, cálculo y disco y te dice qué hacer con ellos, el analizador de diversidad de servidores y la escalera de conexiones.</li>
         <li><b>Uso de datos:</b> barras apiladas por proveedor de 14 días, historial diario y contadores de por vida para las cuentas de bloque.</li>
+        <li><b>28 idiomas.</b> El panel llega totalmente traducido, escrituras de derecha a izquierda incluidas; el manual y este sitio están en 16.</li>
         <li><b>Detalles que se agradecen.</b> Arrastra y suelta un .nzb en cualquier parte, notificaciones de escritorio, sonidos de finalización, un asistente de primer arranque y <code>serve --open</code>.</li>
       </ul>
     </div>
@@ -227,7 +231,8 @@
       <li><b>Un solo ejecutable autocontenido.</b> par2 y el desempaquetado RAR son código nativo compilado dentro del binario: nada se extrae en el primer arranque, y no hay runtime ni instalador con el que pelearse.</li>
       <li><b>macOS, de primera:</b> un binario universal para Apple Silicon e Intel, una app nativa de barra de menús en SwiftUI, una unidad launchd y una fórmula de Homebrew.</li>
       <li><b>Windows:</b> un exe x64 totalmente estático que corre en Windows 10 y 11 de serie, con lanzador de doble clic y configuración guiada.</li>
-      <li><b>Linux y Docker:</b> una unidad systemd endurecida, una imagen Docker multietapa con un entrypoint PUID/PGID al estilo linuxserver y un archivo compose en la caja. <a href="download.es.html">Todas las plataformas →</a></li>
+      <li><b>Linux, Docker y NAS:</b> una unidad systemd endurecida, una imagen Docker multietapa con un entrypoint PUID/PGID al estilo linuxserver, un archivo compose en la caja, una plantilla para Unraid y una guía para Synology. <a href="download.es.html">Todas las plataformas →</a></li>
+      <li><b>Nunca se actualiza solo.</b> Las versiones nuevas aparecen como un aviso en el panel, o ni siquiera eso si desactivas la comprobación. Actualizar sigue siendo decisión tuya, a tu ritmo.</li>
       <li><b>Configuración guiada.</b> Ejecuta el asistente <code>nzbfast setup</code> o deja que detecte solo una configuración existente de SABnzbd o NZBGet. Tendrás una primera descarga en marcha en menos de dos minutos.</li>
     </ul>
   </div>

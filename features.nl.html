@@ -102,7 +102,8 @@
       </ul>
       <ul class="plain">
         <li><b>Exact passend herstel.</b> Beschadigde blokken zijn bekend zodra ze optreden, dus alleen de byte-minimale set recovery-volumes wordt opgehaald (een knapsack-oplossing) en het herstel raakt niets anders aan dan de beschadigde stukken.</li>
-        <li><b>Fallback voor gecomprimeerd en versleuteld:</b> niet-store-posts worden op schijf gezet en uitgepakt via de native RAR-engine, overlappend met de rest van de wachtrij. Versleutelde sets worden geparkeerd met een duidelijke melding in plaats van stilletjes te mislukken.</li>
+        <li><b>RAR-recovery-records.</b> Als de PAR2 op is, of nooit is gepost, repareren de in de RARs ingebedde recovery-records beschadigde volumes ter plekke.</li>
+        <li><b>Fallback voor gecomprimeerd en versleuteld:</b> niet-store-posts worden op schijf gezet en uitgepakt via de native RAR-engine, alles van RAR4 tot het nieuwe RAR7, overlappend met de rest van de wachtrij. Versleutelde sets worden geparkeerd met een duidelijke melding in plaats van stilletjes te mislukken.</li>
         <li><b>Wachtwoordafhandeling.</b> Wachtwoorden komen uit de *arr-API, de <code>{{pw}}</code>-bestandsnaamconventie of NZB-metadata. Voor al het overige neemt een 🔑-ontgrendeling op het dashboard het over: hij ontgrendelt op de achtergrond en bergt daarna gewoon op.</li>
         <li><b>Vangrails.</b> Herstelde bronvolumes zijn schrijfbeveiligd terwijl het opnieuw uitpakken loopt, en een exitcode meldt pas "succes" als het eindresultaat echt bruikbaar is.</li>
       </ul>
@@ -170,11 +171,13 @@
         <li><b>Ingest-filters:</b> filters op soort, jaar, resolutie, taal en grootte houden indexerspam uit je database, en geobfusceerde rommel wordt standaard opgevangen en tegengehouden.</li>
         <li><b>Scene-naamparser.</b> Hij haalt titel, jaar, aflevering, kwaliteit en bron uit echte releasenamen (dailies met datumcode, multi-afleveringscodes en ROT13-verhaspelde namen incluis) en dedupliceert releases tot één kaart per titel.</li>
         <li><b>Direct zoeken:</b> zoeken terwijl je typt, met kwaliteitsfilters, een volgknop per rij en overal kwaliteitsbadges.</li>
+        <li><b>Takedown-detectie.</b> Beschikbaarheidssteekproeven op de achtergrond merken het wanneer een groep wordt opgeruimd en geven zijn releases een badge, zodat een post die toch al offline wordt gehaald geen grab verspilt.</li>
       </ul>
       <ul class="plain">
         <li><b>Verrijking zonder sleutels.</b> TVmaze voor tv, iTunes Search voor films, plus publieke ratingdatasets, Wikidata, Wikipedia en AniList vullen posters, ratings en stemaantallen, cast, genres en plots in. OMDb- en TMDB-sleutels werken als je ze hebt, maar niets vereist er een.</li>
         <li><b>Afleveringsgrids:</b> chips per seizoen met de beste encode van elke aflevering op één klik van downloaden, gemarkeerde seizoenspacks, en een "volg serie" op elke seizoenskop.</li>
         <li><b>Trending-rijen:</b> stroken "nieuw deze week" en "nu populair", opgebouwd uit postfrequentie.</li>
+        <li><b>Een wall die leert.</b> "Niet geïnteresseerd" verbergt een titel en leert meteen een vaste regel aan; de sortering "Voor jou" rangschikt de posterwall op het smaakprofiel dat je eigen grabs opbouwen. Dat blijft allemaal lokaal.</li>
         <li><b>Alles te corrigeren.</b> Verkeerde match? Kies uit de kandidaten of typ gewoon de juiste identiteit. Wat je met de hand instelt wordt nooit overschreven. Wijs een poster naar een URL of upload er een. Eén knop verrijkt een enkele titel opnieuw; een andere wist en herbouwt de hele index.</li>
       </ul>
     </div>
@@ -214,6 +217,7 @@
         <li><b>Alles instelbaar in de browser:</b> servers (met live verbindingstests), snelheid en schema, verbindingen/venster/decoders, schijf en quotum, watchmappen en scripts, indexeringsfilters, bibliotheek, RSS, en beveiliging met sleutelrotatie. Instellingen overleven herstarts.</li>
         <li><b>Diagnostiek ingebouwd:</b> een logviewer in de UI, een systeembenchmark die je plafonds voor netwerk, rekenkracht en schijf opzoekt en vertelt wat je eraan kunt doen, de serverdiversiteit-analyse, en de verbindingsladder.</li>
         <li><b>Dataverbruik:</b> 14 dagen gestapelde staven per provider, dagelijkse historie, en totaaltellers voor blokaccounts.</li>
+        <li><b>28 talen.</b> Het dashboard komt volledig vertaald, rechts-naar-links-schriften inbegrepen; de handleiding en deze site zijn er in 16.</li>
         <li><b>Fijne extra's.</b> Sleep een .nzb waar dan ook heen, bureaubladmeldingen, geluiden bij voltooiing, een wizard bij de eerste start, en <code>serve --open</code>.</li>
       </ul>
     </div>
@@ -227,7 +231,8 @@
       <li><b>Eén op zichzelf staand uitvoerbaar bestand.</b> par2 en RAR-uitpakken zijn native code, meegecompileerd in de binary. Er wordt bij het eerste gebruik niets uitgepakt, en er is geen runtime en geen installer om mee te stoeien.</li>
       <li><b>macOS, eersteklas:</b> een universele binary voor Apple Silicon en Intel, een native SwiftUI-menubalk-app, een launchd-unit en een Homebrew-formule.</li>
       <li><b>Windows:</b> een volledig statische x64-exe die op kaal Windows 10 en 11 draait, met een dubbelklik-launcher en begeleide setup.</li>
-      <li><b>Linux en Docker:</b> een geharde systemd-unit, een multi-stage Docker-image met een PUID/PGID-entrypoint in linuxserver-stijl, en een compose-bestand in de doos. <a href="download.nl.html">Alle platforms →</a></li>
+      <li><b>Linux, Docker en NAS:</b> een geharde systemd-unit, een multi-stage Docker-image met een PUID/PGID-entrypoint in linuxserver-stijl, een compose-bestand in de doos, een Unraid-template en een Synology-gids. <a href="download.nl.html">Alle platforms →</a></li>
+      <li><b>Het werkt zichzelf nooit bij.</b> Nieuwe releases verschijnen als een melding op het dashboard, of zelfs dat niet als je de controle uitzet. Updaten blijft jouw keuze, op jouw moment.</li>
       <li><b>Begeleide setup.</b> Draai de <code>nzbfast setup</code>-wizard, of laat hem een bestaande SABnzbd- of NZBGet-config automatisch detecteren. Binnen twee minuten heb je een eerste download draaien.</li>
     </ul>
   </div>

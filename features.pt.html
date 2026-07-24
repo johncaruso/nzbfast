@@ -102,7 +102,8 @@
       </ul>
       <ul class="plain">
         <li><b>Reparo sob medida.</b> Os blocos danificados são conhecidos no momento em que acontecem, então só o conjunto de volumes de recuperação com menor número de bytes é buscado (um problema da mochila resolvido) e o reparo não toca em nada além dos trechos danificados.</li>
-        <li><b>Recurso para comprimidos e criptografados:</b> publicações fora do modo armazenamento se materializam e são extraídas pelo motor RAR nativo, sobrepostas ao resto da fila. Conjuntos criptografados ficam estacionados com uma mensagem clara em vez de falhar em silêncio.</li>
+        <li><b>Registros de recuperação do RAR.</b> Quando o PAR2 se esgota, ou nunca foi publicado, os registros de recuperação embutidos no RAR reparam os volumes danificados no próprio lugar.</li>
+        <li><b>Recurso para comprimidos e criptografados:</b> publicações fora do modo armazenamento se materializam e são extraídas pelo motor RAR nativo, tudo do RAR4 ao novo RAR7, sobrepostas ao resto da fila. Conjuntos criptografados ficam estacionados com uma mensagem clara em vez de falhar em silêncio.</li>
         <li><b>Tratamento de senhas.</b> As senhas vêm da API dos *arr, da convenção de nome de arquivo <code>{{pw}}</code> ou dos metadados do NZB. Para o que sobrar, um desbloqueio 🔑 no painel assume dali: desbloqueia em segundo plano e depois arquiva normalmente.</li>
         <li><b>Trilhos de segurança.</b> Os volumes de origem reparados ficam protegidos contra escrita enquanto a reextração roda, e o código de saída só informa "sucesso" quando o estado final é de fato utilizável.</li>
       </ul>
@@ -170,11 +171,13 @@
         <li><b>Filtros de ingestão:</b> filtros de tipo, ano, resolução, idioma e tamanho mantêm o spam de indexador fora do seu banco de dados, e o lixo ofuscado é detectado e barrado por padrão.</li>
         <li><b>Parser de nomes scene.</b> Ele extrai título, ano, episódio, qualidade e fonte de radicais do mundo real (incluindo dailies com código de data, códigos de múltiplos episódios e nomes ofuscados por ROT13) e reduz os lançamentos a um cartão por título.</li>
         <li><b>Busca instantânea:</b> busca conforme você digita, com filtros de qualidade, botões de acompanhar em cada linha e emblemas de qualidade por toda parte.</li>
+        <li><b>Detecção de remoções.</b> A amostragem de disponibilidade em segundo plano percebe quando um grupo está sendo ceifado e marca seus lançamentos com um emblema, para que uma publicação que já está sendo removida não desperdice uma captura.</li>
       </ul>
       <ul class="plain">
         <li><b>Enriquecimento sem chave.</b> TVmaze para TV, iTunes Search para cinema, além de conjuntos de dados públicos de notas, Wikidata, Wikipédia e AniList preenchem pôsteres, notas e contagens de votos, elenco, gêneros e enredos. Chaves OMDb e TMDB funcionam se você as tiver, mas nada exige uma.</li>
         <li><b>Grades de episódios:</b> chips por temporada com o melhor encode de cada episódio a um clique do download, pacotes de temporada sinalizados e um "acompanhar série" no cabeçalho de cada temporada.</li>
         <li><b>Linhas em alta:</b> faixas de novidades da semana e do momento, montadas a partir da frequência de publicações.</li>
+        <li><b>Um mural que aprende.</b> "Sem interesse" oculta um título e ensina uma regra permanente; a ordenação "Para você" classifica o mural pelo perfil de gosto que as suas próprias capturas constroem. Tudo isso fica local.</li>
         <li><b>Corrija qualquer coisa.</b> Correspondência errada? Escolha entre os candidatos ou simplesmente digite a identidade certa. Nada do que você define à mão é sobrescrito. Aponte um pôster para uma URL ou envie um. Um botão reenriquece um único título; outro apaga e reconstrói o índice inteiro.</li>
       </ul>
     </div>
@@ -214,6 +217,7 @@
         <li><b>Tudo configurável no navegador:</b> servidores (com testes de conexão ao vivo), velocidade e agenda, conexões/janela/decodificadores, disco e cota, pastas monitoradas e scripts, filtros de indexação, biblioteca, RSS e segurança com rotação de chave. Os ajustes sobrevivem a reinícios.</li>
         <li><b>Diagnóstico embutido:</b> um visualizador de log na própria interface, um benchmark do sistema que descobre os tetos de rede, cálculo e disco e diz o que fazer a respeito, o analisador de diversidade de servidores e a escada de conexões.</li>
         <li><b>Uso de dados:</b> barras empilhadas por provedor de 14 dias, histórico diário e contadores vitalícios para contas de bloco.</li>
+        <li><b>28 idiomas.</b> O painel vem totalmente localizado, incluindo escritas da direita para a esquerda; o manual e este site estão em 16.</li>
         <li><b>Qualidade de vida.</b> Arraste e solte um .nzb em qualquer lugar, notificações da área de trabalho, sons de conclusão, um assistente de primeira execução e <code>serve --open</code>.</li>
       </ul>
     </div>
@@ -227,7 +231,8 @@
       <li><b>Executável único e autossuficiente.</b> A extração par2 e RAR é código nativo compilado no binário. Nada é extraído no primeiro uso, e não há runtime nem instalador com que se preocupar.</li>
       <li><b>macOS, de primeira classe:</b> um binário universal para Apple Silicon e Intel, um app nativo de barra de menu em SwiftUI, uma unidade launchd e uma fórmula Homebrew.</li>
       <li><b>Windows:</b> um exe x64 totalmente estático que roda no Windows 10 e 11 de fábrica, com um lançador de duplo clique e configuração guiada.</li>
-      <li><b>Linux e Docker:</b> uma unidade systemd reforçada, uma imagem Docker multiestágio com um entrypoint PUID/PGID ao estilo linuxserver e um arquivo compose já incluído. <a href="download.pt.html">Todas as plataformas →</a></li>
+      <li><b>Linux, Docker e NAS:</b> uma unidade systemd reforçada, uma imagem Docker multiestágio com um entrypoint PUID/PGID ao estilo linuxserver, um arquivo compose já incluído, um template para Unraid e um guia para Synology. <a href="download.pt.html">Todas as plataformas →</a></li>
+      <li><b>Ele nunca se atualiza sozinho.</b> Novas versões aparecem como um aviso no painel, ou nem isso se você desligar a verificação. Atualizar continua sendo decisão sua, no seu ritmo.</li>
       <li><b>Configuração guiada.</b> Rode o assistente <code>nzbfast setup</code>, ou deixe-o detectar automaticamente uma configuração existente do SABnzbd ou do NZBGet. Você terá um primeiro download rodando em menos de dois minutos.</li>
     </ul>
   </div>

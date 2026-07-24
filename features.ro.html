@@ -102,7 +102,8 @@
       </ul>
       <ul class="plain">
         <li><b>Reparare exact potrivită.</b> Blocurile deteriorate sunt cunoscute pe măsură ce apar, așa că se preia doar setul de volume de recuperare cu cel mai mic număr de octeți (o rezolvare de tip rucsac), iar repararea atinge numai zonele deteriorate.</li>
-        <li><b>Rezervă pentru comprimat și criptat:</b> postările non-store se materializează și se dezarhivează prin motorul RAR nativ, suprapuse cu restul cozii. Seturile criptate sunt parcate cu un mesaj clar, în loc să eșueze în tăcere.</li>
+        <li><b>Înregistrări de recuperare RAR.</b> Când PAR2 e epuizat, sau nu a fost postat niciodată, înregistrările de recuperare RAR încorporate repară volumele deteriorate pe loc.</li>
+        <li><b>Rezervă pentru comprimat și criptat:</b> postările non-store se materializează și se dezarhivează prin motorul RAR nativ, totul de la RAR4 până la noul RAR7, suprapuse cu restul cozii. Seturile criptate sunt parcate cu un mesaj clar, în loc să eșueze în tăcere.</li>
         <li><b>Gestionarea parolelor.</b> Parolele vin din API-ul *arr, din convenția de denumire <code>{{pw}}</code> sau din metadatele NZB. Pentru ce rămâne, o deblocare 🔑 din panou preia ștafeta: deblochează în fundal, apoi arhivează normal.</li>
         <li><b>Bariere de siguranță.</b> Volumele sursă reparate sunt protejate la scriere cât timp rulează reextragerea, iar codul de ieșire raportează „succes” doar când starea finală e cu adevărat utilizabilă.</li>
       </ul>
@@ -170,11 +171,13 @@
         <li><b>Filtre de preluare:</b> filtrele pe tip, an, rezoluție, limbă și dimensiune țin spamul de indexer departe de baza ta de date, iar gunoiul obfuscat e prins și blocat implicit.</li>
         <li><b>Parser de nume scene.</b> Extrage titlul, anul, episodul, calitatea și sursa din tulpini reale (inclusiv episoade zilnice codate cu dată, coduri multi-episod și nume obfuscate cu ROT13) și deduplică release-urile la un singur card per titlu.</li>
         <li><b>Căutare instantanee:</b> cauți pe măsură ce scrii, cu filtre de calitate, butoane de urmărire pe fiecare rând și insigne de calitate peste tot.</li>
+        <li><b>Detectarea retragerilor.</b> Eșantionarea disponibilității în fundal observă când un grup e secerat și marchează release-urile lui cu o insignă, așa că o postare aflată deja în curs de retragere nu irosește o descărcare.</li>
       </ul>
       <ul class="plain">
         <li><b>Îmbogățire fără cheie.</b> TVmaze pentru TV, iTunes Search pentru filme, plus seturi de date publice de note, Wikidata, Wikipedia și AniList completează posterele, notele și numărul de voturi, distribuția, genurile și subiectele. Cheile OMDb și TMDB funcționează dacă le ai, dar nimic nu are nevoie de vreuna.</li>
         <li><b>Grile de episoade:</b> insigne per sezon, cu cea mai bună codare a fiecărui episod la un clic distanță de descărcare, pachetele de sezon marcate și un „urmărește seria” pe fiecare antet de sezon.</li>
         <li><b>Rânduri în tendințe:</b> fâșii „noi săptămâna aceasta” și „populare acum”, construite din frecvența postărilor.</li>
+        <li><b>Un perete care învață.</b> „Nu mă interesează” ascunde un titlu și învață o regulă permanentă; sortarea „Pentru tine” ordonează peretele după profilul de gusturi pe care îl construiesc propriile tale descărcări. Totul rămâne local.</li>
         <li><b>Corectează orice.</b> Potrivire greșită? Alege dintre candidați sau scrie pur și simplu identitatea corectă. Nimic din ce setezi manual nu e vreodată suprascris. Indică un poster printr-un URL sau încarcă unul. Un buton reîmbogățește un singur titlu; altul șterge și reconstruiește tot indexul.</li>
       </ul>
     </div>
@@ -214,6 +217,7 @@
         <li><b>Totul se configurează în browser:</b> servere (cu teste de conexiune live), viteză și program, conexiuni/fereastră/decodoare, disc și cotă, foldere monitorizate și scripturi, filtre de indexare, bibliotecă, RSS și securitate cu rotația cheilor. Setările supraviețuiesc repornirilor.</li>
         <li><b>Diagnostice integrate:</b> un vizualizator de jurnal în interfață, un benchmark de sistem care îți găsește plafoanele de rețea, calcul și disc și îți spune ce să faci cu ele, analizorul de diversitate a serverelor și scara de conexiuni.</li>
         <li><b>Consum de date:</b> bare stivuite pe 14 zile per provider, istoric zilnic și contoare pe toată durata de viață pentru conturile bloc.</li>
+        <li><b>28 de limbi.</b> Panoul vine complet localizat, inclusiv scrierile de la dreapta la stânga; manualul și acest site sunt în 16.</li>
         <li><b>Confort de utilizare.</b> Tragi și plasezi un .nzb oriunde, notificări pe desktop, sunete la finalizare, un asistent la prima rulare și <code>serve --open</code>.</li>
       </ul>
     </div>
@@ -227,7 +231,8 @@
       <li><b>Un singur executabil de sine stătător.</b> par2 și dezarhivarea RAR sunt cod nativ compilat în binar. Nimic nu se extrage la prima rulare și nu ai de-a face cu niciun runtime și niciun installer.</li>
       <li><b>macOS, de primă clasă:</b> un binar universal pentru Apple Silicon și Intel, o aplicație nativă SwiftUI în bara de meniu, o unitate launchd și o formulă Homebrew.</li>
       <li><b>Windows:</b> un exe x64 complet static care rulează pe Windows 10 și 11 standard, cu un launcher cu dublu-clic și o configurare ghidată.</li>
-      <li><b>Linux și Docker:</b> o unitate systemd întărită, o imagine Docker multi-etapă cu entrypoint PUID/PGID în stil linuxserver și un fișier compose inclus. <a href="download.ro.html">Toate platformele →</a></li>
+      <li><b>Linux, Docker și NAS:</b> o unitate systemd întărită, o imagine Docker multi-etapă cu entrypoint PUID/PGID în stil linuxserver, un fișier compose inclus, un șablon Unraid și un ghid pentru Synology. <a href="download.ro.html">Toate platformele →</a></li>
+      <li><b>Nu se actualizează niciodată singur.</b> Versiunile noi apar ca o notificare în panou, sau nici măcar atât dacă oprești verificarea. Actualizarea rămâne decizia ta, după programul tău.</li>
       <li><b>Configurare ghidată.</b> Rulează asistentul <code>nzbfast setup</code> sau lasă-l să detecteze automat o configurație SABnzbd sau NZBGet existentă. Vei avea prima descărcare în mai puțin de două minute.</li>
     </ul>
   </div>

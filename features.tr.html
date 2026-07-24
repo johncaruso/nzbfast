@@ -102,7 +102,8 @@
       </ul>
       <ul class="plain">
         <li><b>Tam-oturan onarım.</b> Hasarlı bloklar oluştukları anda bilinir, bu yüzden yalnızca kurtarma birimlerinin en az baytlı kümesi getirilir (bir sırt çantası çözümü) ve onarım hasarlı aralıklardan başka hiçbir şeye dokunmaz.</li>
-        <li><b>Sıkıştırılmış ve şifreli için yedek yol:</b> depolama modu olmayan gönderiler, kuyruğun geri kalanıyla örtüşerek yerleşik RAR motoru üzerinden gerçekleşip açılır. Şifreli kümeler sessizce başarısız olmak yerine açık bir mesajla park eder.</li>
+        <li><b>RAR kurtarma kayıtları.</b> PAR2 tükendiğinde ya da hiç gönderilmediğinde, gömülü RAR kurtarma kayıtları hasarlı birimleri yerinde onarır.</li>
+        <li><b>Sıkıştırılmış ve şifreli için yedek yol:</b> depolama modu olmayan gönderiler, kuyruğun geri kalanıyla örtüşerek yerleşik RAR motoru üzerinden - RAR4'ten yeni RAR7'ye kadar her şey - gerçekleşip açılır. Şifreli kümeler sessizce başarısız olmak yerine açık bir mesajla park eder.</li>
         <li><b>Parola işleme.</b> Parolalar *arr API'sinden, <code>{{pw}}</code> dosya adı geleneğinden ya da NZB meta verisinden gelir. Geriye kalanlar için paneldeki bir 🔑 kilit açma devreye girer: arka planda kilidi açar, sonra normal şekilde dosyalar.</li>
         <li><b>Güvenlik korkulukları.</b> Onarılan kaynak birimleri yeniden çıkarma çalışırken yazmaya karşı korunur ve bir çıkış kodu ancak son durum gerçekten kullanılabilir olduğunda "başarı" bildirir.</li>
       </ul>
@@ -170,11 +171,13 @@
         <li><b>Alım geçitleri:</b> tür, yıl, çözünürlük, dil ve boyut filtreleri dizinleyici spam'ini veritabanından uzak tutar; gizlenmiş çöp ise varsayılan olarak yakalanıp elenir.</li>
         <li><b>Scene adı ayrıştırıcısı.</b> Gerçek dünyadaki köklerden başlık, yıl, bölüm, kalite ve kaynağı çekip çıkarır (tarih kodlu günlükler, çok bölümlü kodlar ve ROT13 ile gizlenmiş adlar dahil) ve sürümleri başlık başına tek bir karta indirger.</li>
         <li><b>Anlık arama:</b> kalite filtreleri, satır başına izle düğmeleri ve her yerde kalite rozetleriyle, yazdıkça arama.</li>
+        <li><b>Kaldırma tespiti.</b> Arka planda çalışan erişilebilirlik örneklemesi bir grubun biçilmekte olduğunu fark eder ve sürümlerini rozetler; böylece zaten kaldırılmakta olan bir gönderi boşa bir indirme harcamaz.</li>
       </ul>
       <ul class="plain">
         <li><b>Anahtarsız zenginleştirme.</b> TV için TVmaze, film için iTunes Search; ayrıca açık puan veri kümeleri, Wikidata, Wikipedia ve AniList posterleri, puanları ve oy sayılarını, oyuncuları, türleri ve konuları doldurur. OMDb ve TMDB anahtarların varsa çalışır ama hiçbiri için bir anahtar gerekmez.</li>
         <li><b>Bölüm ızgaraları:</b> sezon başına çipler; her bölümün en iyi kodlaması tek tık uzağında, sezon paketleri işaretli ve her sezon başlığında bir "diziyi izle".</li>
         <li><b>Gözde satırlar:</b> gönderi sıklığına göre oluşturulan "bu hafta yeni" ve "şu an popüler" şeritleri.</li>
+        <li><b>Öğrenen bir duvar.</b> "İlgilenmiyorum" bir başlığı gizler ve kalıcı bir kural öğretir; "Sana özel" sıralaması ise duvarı, kendi indirmelerinin oluşturduğu beğeni profiline göre dizer. Hepsi yerelde kalır.</li>
         <li><b>Her şeyi düzelt.</b> Yanlış eşleşme mi? Adaylardan birini seç ya da doğru kimliği kendin yaz. Elle ayarladığın hiçbir şeyin üzerine asla yazılmaz. Bir posteri bir URL'ye yönlendir ya da kendin yükle. Bir düğme tek bir başlığı yeniden zenginleştirir; bir diğeri tüm dizini silip yeniden kurar.</li>
       </ul>
     </div>
@@ -214,6 +217,7 @@
         <li><b>Her şey tarayıcıda yapılandırılabilir:</b> sunucular (canlı bağlantı testleriyle), hız ve zamanlama, bağlantılar/pencere/kod çözücüler, disk ve kota, izleme klasörleri ve betikler, dizinleme geçitleri, kitaplık, RSS ve anahtar döndürmeli güvenlik. Ayarlar yeniden başlatmalardan sağ çıkar.</li>
         <li><b>Gömülü tanılama:</b> arayüz içi bir günlük görüntüleyici, ağ, işlem ve disk tavanlarını bulup bunlar hakkında ne yapman gerektiğini söyleyen bir sistem kıyaslaması, sunucu çeşitliliği çözümleyicisi ve bağlantı merdiveni.</li>
         <li><b>Veri kullanımı:</b> 14 günlük sağlayıcı başına yığılmış çubuklar, günlük geçmiş ve blok hesaplar için ömür boyu sayaçlar.</li>
+        <li><b>28 dil.</b> Panel, sağdan sola yazılan alfabeler dahil tamamen yerelleştirilmiş olarak gelir; kılavuz ve bu site 16 dilde.</li>
         <li><b>Yaşam kalitesi.</b> Herhangi bir yere .nzb sürükle-bırak, masaüstü bildirimleri, tamamlanma sesleri, bir ilk çalıştırma sihirbazı ve <code>serve --open</code>.</li>
       </ul>
     </div>
@@ -227,7 +231,8 @@
       <li><b>Tek, kendi kendine yeten çalıştırılabilir dosya.</b> par2 ve RAR açma, ikilinin içine derlenmiş yerel koddur. İlk çalıştırmada hiçbir şey dışarı çıkarılmaz, uğraşacağın bir çalışma zamanı ya da kurucu yoktur.</li>
       <li><b>macOS, birinci sınıf:</b> Apple Silicon ve Intel için evrensel bir ikili, yerel bir SwiftUI menü çubuğu uygulaması, bir launchd birimi ve bir Homebrew formülü.</li>
       <li><b>Windows:</b> hazır Windows 10 ve 11'de çalışan, tamamen statik bir x64 exe; çift tıkla başlatıcı ve kılavuzlu kurulumla birlikte.</li>
-      <li><b>Linux ve Docker:</b> sağlamlaştırılmış bir systemd birimi, linuxserver tarzı PUID/PGID giriş noktalı çok aşamalı bir Docker imgesi ve kutuda bir compose dosyası. <a href="download.tr.html">Tüm platformlar →</a></li>
+      <li><b>Linux, Docker ve NAS:</b> sağlamlaştırılmış bir systemd birimi, linuxserver tarzı PUID/PGID giriş noktalı çok aşamalı bir Docker imgesi, kutuda bir compose dosyası, bir Unraid şablonu ve bir Synology rehberi. <a href="download.tr.html">Tüm platformlar →</a></li>
+      <li><b>Kendini asla güncellemez.</b> Yeni sürümler panelde bir bildirim olarak görünür; denetimi kapatırsan o kadarı bile olmaz. Güncelleme senin kararın olarak, senin takviminde kalır.</li>
       <li><b>Kılavuzlu kurulum.</b> <code>nzbfast setup</code> sihirbazını çalıştır ya da mevcut bir SABnzbd veya NZBGet yapılandırmasını otomatik algılamasına izin ver. İlk indirmen iki dakikadan kısa sürede çalışıyor olacak.</li>
     </ul>
   </div>
