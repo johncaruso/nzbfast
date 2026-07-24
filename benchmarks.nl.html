@@ -241,15 +241,17 @@
         <p>Tegen unrar 7.23, 7-Zip, bsdtar, unar en de upstream rars-crate op een Apple M3 Ultra wint of
         evenaart de uitpakker van nzbfast elke vorm: 400 kleine bestanden in <b>0.13 s</b> tegenover de
         0.66 s van unrar, solid <b>0.50</b> vs 0.87, versleuteld <b>0.49</b> vs 0.82, een RAR7-archief met
-        128 MB-woordenboek <b>0.71</b> vs 0.92. Opnieuw gedraaid op een Intel-laptop met 14 cores worden de
+        128 MB-woordenboek <b>0.71</b> vs 0.92. Opnieuw gedraaid op een M1 Ultra met 20 cores en op een
+        Intel-laptop met 14 cores houdt het resultaat stand bij elke vorm, en op de laptop worden de
         marges groter: de parallelle decodeerpaden schalen mee met de extra threads. Elke gerapporteerde tijd
         leverde sha256-identieke uitvoer op.</p></div>
       <div class="card"><h3>PAR2-verificatie + herstel · set van 1 GiB</h3>
-        <p>Tegen het klassieke par2cmdline en de SIMD-fork par2cmdline-turbo: schone verificatie <b>0.41 s</b>
-        vs 0.94 vs 3.27; herstel van 101 beschadigde blokken <b>1.09 s</b> vs 2.18 vs 5.94, elk hersteld
-        bestand byte-identiek. Twee eerlijke kanttekeningen: we maken geen PAR2 aan (een downloader heeft dat
-        niet nodig, en die leg is van ParPar), en op een laptop met 14 cores blijft ons herstel achter op
-        turbo (6.24 s vs 4.04 s): het herstelpad wil de cores van de grote machine.</p></div>
+        <p>Tegen het klassieke par2cmdline, de SIMD-fork par2cmdline-turbo en MultiPar heeft nzbfast op elke
+        gebenchte machine de snelste verificatie en het snelste herstel. Desktop met 20 cores: schone
+        verificatie <b>0.40 s</b> tegenover de 1.08 van turbo en de 3.67 van de klassieker; herstel van 101
+        beschadigde blokken <b>1.26 s</b> vs 2.61 en 7.52. Laptop met 14 cores: verificatie <b>1.26</b> vs
+        1.48, herstel <b>2.57</b> vs 3.62. Elk hersteld bestand byte-identiek. Eén eerlijke kanttekening: we
+        maken geen PAR2 aan (een downloader heeft dat niet nodig, en die leg is van ParPar).</p></div>
     </div>
   </div>
 </section>

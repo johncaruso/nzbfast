@@ -241,15 +241,16 @@
         <p>Against unrar 7.23, 7-Zip, bsdtar, unar and the upstream rars crate on an Apple M3 Ultra,
         nzbfast's extractor wins or ties every shape: 400 small files <b>0.13 s</b> to unrar's
         0.66 s, solid <b>0.50</b> vs 0.87, encrypted <b>0.49</b> vs 0.82, a RAR7 128 MB-dictionary
-        archive <b>0.71</b> vs 0.92. Re-run on a 14-core Intel laptop, the margins widen: the
-        parallel decode paths scale into the extra threads. Every reported time produced
-        sha256-identical output.</p></div>
+        archive <b>0.71</b> vs 0.92. Re-run on a 20-core M1 Ultra and on a 14-core Intel laptop,
+        the result holds on every shape, and on the laptop the margins widen: the parallel decode
+        paths scale into the extra threads. Every reported time produced sha256-identical output.</p></div>
       <div class="card"><h3>PAR2 verify + repair · 1 GiB set</h3>
-        <p>Against classic par2cmdline and the SIMD par2cmdline-turbo fork: clean verify
-        <b>0.41 s</b> vs 0.94 vs 3.27; repairing 101 damaged blocks <b>1.09 s</b> vs 2.18 vs 5.94,
-        every repaired file byte-identical. Two honest notes: we don't create PAR2 (a downloader
-        doesn't need to, and ParPar owns that leg), and on a 14-core laptop our repair trails turbo
-        (6.24 s vs 4.04 s): the repair path wants the big machine's cores.</p></div>
+        <p>Against classic par2cmdline, the SIMD par2cmdline-turbo fork and MultiPar, nzbfast has
+        the fastest verify and the fastest repair on every machine benched. 20-core desktop: clean
+        verify <b>0.40 s</b> to turbo's 1.08 and classic's 3.67; repairing 101 damaged blocks
+        <b>1.26 s</b> vs 2.61 and 7.52. 14-core laptop: verify <b>1.26</b> vs 1.48, repair
+        <b>2.57</b> vs 3.62. Every repaired file byte-identical. One honest note: we don't create
+        PAR2 (a downloader doesn't need to, and ParPar owns that leg).</p></div>
     </div>
   </div>
 </section>

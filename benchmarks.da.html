@@ -238,14 +238,16 @@
         <p>Mod unrar 7.23, 7-Zip, bsdtar, unar og upstream rars-craten på en Apple M3 Ultra vinder eller
         deler nzbfasts udpakker hver form: 400 små filer <b>0.13 s</b> mod unrars 0.66 s, solid
         <b>0.50</b> mod 0.87, krypteret <b>0.49</b> mod 0.82, et RAR7-arkiv med 128 MB-ordbog <b>0.71</b>
-        mod 0.92. Kørt igen på en 14-kernes Intel-laptop bliver marginerne bredere: de parallelle
+        mod 0.92. Kørt igen på en 20-kernes M1 Ultra og på en 14-kernes Intel-laptop holder resultatet
+        på hver form, og på laptoppen bliver marginerne bredere: de parallelle
         afkodningsstier skalerer ind i de ekstra tråde. Hver rapporteret tid gav sha256-identisk output.</p></div>
       <div class="card"><h3>PAR2-verificering + reparation · 1 GiB-sæt</h3>
-        <p>Mod klassisk par2cmdline og SIMD-forken par2cmdline-turbo: ren verificering <b>0.41 s</b> mod
-        0.94 mod 3.27; reparation af 101 beskadigede blokke <b>1.09 s</b> mod 2.18 mod 5.94, hver
-        repareret fil byte-identisk. To ærlige noter: vi opretter ikke PAR2 (en downloader behøver det
-        ikke, og ParPar ejer det ben), og på en 14-kernes laptop halter vores reparation efter turbo
-        (6.24 s mod 4.04 s): reparationsstien vil have den store maskines kerner.</p></div>
+        <p>Mod klassisk par2cmdline, SIMD-forken par2cmdline-turbo og MultiPar har nzbfast den
+        hurtigste verificering og den hurtigste reparation på hver benchet maskine. 20-kernes
+        desktop: ren verificering <b>0.40 s</b> mod turboens 1.08 og klassikerens 3.67; reparation
+        af 101 beskadigede blokke <b>1.26 s</b> mod 2.61 og 7.52. 14-kernes laptop: verificering
+        <b>1.26</b> mod 1.48, reparation <b>2.57</b> mod 3.62. Hver repareret fil byte-identisk.
+        En ærlig note: vi opretter ikke PAR2 (en downloader behøver det ikke, og ParPar ejer det ben).</p></div>
     </div>
   </div>
 </section>

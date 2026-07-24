@@ -242,15 +242,17 @@
         <p>Contro unrar 7.23, 7-Zip, bsdtar, unar e il crate rars upstream su un Apple M3 Ultra, l'estrattore
         di nzbfast vince o pareggia ogni forma: 400 file piccoli in <b>0.13 s</b> contro gli 0.66 s di unrar,
         solid <b>0.50</b> contro 0.87, cifrato <b>0.49</b> contro 0.82, un archivio RAR7 con dizionario da
-        128 MB <b>0.71</b> contro 0.92. Rieseguito su un portatile Intel a 14 core, i margini si allargano: i
+        128 MB <b>0.71</b> contro 0.92. Rieseguito su un M1 Ultra a 20 core e su un portatile Intel a 14 core,
+        il risultato regge su ogni forma, e sul portatile i margini si allargano: i
         percorsi di decodifica paralleli scalano sui thread in più. Ogni tempo riportato ha prodotto output
         sha256-identico.</p></div>
       <div class="card"><h3>Verifica + riparazione PAR2 · set da 1 GiB</h3>
-        <p>Contro il classico par2cmdline e il fork SIMD par2cmdline-turbo: verifica pulita <b>0.41 s</b>
-        contro 0.94 contro 3.27; riparazione di 101 blocchi danneggiati <b>1.09 s</b> contro 2.18 contro 5.94,
-        ogni file riparato byte-identico. Due note oneste: non creiamo PAR2 (a un downloader non serve, e quella
-        prova appartiene a ParPar), e su un portatile a 14 core la nostra riparazione resta dietro a turbo
-        (6.24 s contro 4.04 s): il percorso di riparazione vuole i core della macchina grossa.</p></div>
+        <p>Contro il classico par2cmdline, il fork SIMD par2cmdline-turbo e MultiPar, nzbfast ha la verifica
+        più veloce e la riparazione più veloce su ogni macchina testata. Desktop a 20 core: verifica pulita
+        <b>0.40 s</b> contro l'1.08 di turbo e il 3.67 del classico; riparazione di 101 blocchi danneggiati
+        <b>1.26 s</b> contro 2.61 e 7.52. Portatile a 14 core: verifica <b>1.26</b> contro 1.48, riparazione
+        <b>2.57</b> contro 3.62. Ogni file riparato byte-identico. Una nota onesta: non creiamo PAR2 (a un
+        downloader non serve, e quella prova appartiene a ParPar).</p></div>
     </div>
   </div>
 </section>

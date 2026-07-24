@@ -246,16 +246,18 @@
         <p>Bir Apple M3 Ultra'da unrar 7.23, 7-Zip, bsdtar, unar ve akış yukarı rars crate'ine
         karşı nzbfast'in çıkarıcısı her biçimi kazanır ya da berabere kalır: 400 küçük dosya
         unrar'ın 0.66 s'sine karşı <b>0.13 s</b>, solid <b>0.50</b>'ye 0.87, şifreli <b>0.49</b>'a
-        0.82, 128 MB sözlüklü bir RAR7 arşivi <b>0.71</b>'e 0.92. 14 çekirdekli bir Intel
-        dizüstünde yeniden çalıştırıldığında farklar açılır: paralel kod çözme yolları fazladan iş
+        0.82, 128 MB sözlüklü bir RAR7 arşivi <b>0.71</b>'e 0.92. 20 çekirdekli bir M1 Ultra'da
+        ve 14 çekirdekli bir Intel dizüstünde yeniden çalıştırıldığında sonuç her biçimde geçerli
+        kalır ve dizüstünde farklar açılır: paralel kod çözme yolları fazladan iş
         parçacıklarına ölçeklenir. Bildirilen her süre sha256 özdeş çıktı üretti.</p></div>
       <div class="card"><h3>PAR2 doğrulama + onarım · 1 GiB küme</h3>
-        <p>Klasik par2cmdline'a ve SIMD'li par2cmdline-turbo çatalına karşı: temiz doğrulama
-        <b>0.41 s</b>'ye karşı 0.94 ve 3.27; 101 hasarlı bloğun onarımı <b>1.09 s</b>'ye karşı
-        2.18 ve 5.94, onarılan her dosya bayt bayt özdeş. İki dürüst not: PAR2 üretmiyoruz (bir
-        indiricinin buna ihtiyacı yok ve o ayak ParPar'ın) ve 14 çekirdekli bir dizüstünde
-        onarımımız turbo'nun gerisinde kalıyor (6.24 s'ye karşı 4.04 s): onarım yolu büyük
-        makinenin çekirdeklerini istiyor.</p></div>
+        <p>Klasik par2cmdline'a, SIMD'li par2cmdline-turbo çatalına ve MultiPar'a karşı
+        nzbfast, yarıştırılan her makinede en hızlı doğrulamaya ve en hızlı onarıma sahip.
+        20 çekirdekli masaüstü: temiz doğrulama <b>0.40 s</b>'ye karşı turbo'da 1.08 ve
+        klasikte 3.67; 101 hasarlı bloğun onarımı <b>1.26 s</b>'ye karşı 2.61 ve 7.52.
+        14 çekirdekli dizüstü: doğrulama <b>1.26</b>'ya karşı 1.48, onarım <b>2.57</b>'ye
+        karşı 3.62. Onarılan her dosya bayt bayt özdeş. Bir dürüst not: PAR2 üretmiyoruz
+        (bir indiricinin buna ihtiyacı yok ve o ayak ParPar'ın).</p></div>
     </div>
   </div>
 </section>

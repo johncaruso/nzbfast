@@ -242,15 +242,18 @@
         <p>Contra unrar 7.23, 7-Zip, bsdtar, unar e o crate rars original em um Apple M3 Ultra, o extrator
         do nzbfast vence ou empata em todas as formas: 400 arquivos pequenos em <b>0,13 s</b> contra os
         0,66 s do unrar, sólido <b>0,50</b> vs 0,87, criptografado <b>0,49</b> vs 0,82, um arquivo RAR7
-        com dicionário de 128 MB <b>0,71</b> vs 0,92. Refeito em um laptop Intel de 14 núcleos, as margens
+        com dicionário de 128 MB <b>0,71</b> vs 0,92. Refeito em um M1 Ultra de 20 núcleos e em um laptop
+        Intel de 14 núcleos, o resultado se mantém em todas as formas, e no laptop as margens
         aumentam: os caminhos de decodificação paralela escalam para os threads extras. Cada tempo relatado
         produziu saída sha256-idêntica.</p></div>
       <div class="card"><h3>Verificação + reparo PAR2 · conjunto de 1 GiB</h3>
-        <p>Contra o par2cmdline clássico e o fork SIMD par2cmdline-turbo: verificação limpa em
-        <b>0,41 s</b> vs 0,94 vs 3,27; reparo de 101 blocos danificados em <b>1,09 s</b> vs 2,18 vs 5,94,
-        cada arquivo reparado byte-idêntico. Duas notas honestas: não criamos PAR2 (um baixador não precisa,
-        e o ParPar é dono desse leg), e em um laptop de 14 núcleos nosso reparo fica atrás do turbo
-        (6,24 s vs 4,04 s): o caminho de reparo quer os núcleos da máquina grande.</p></div>
+        <p>Contra o par2cmdline clássico, o fork SIMD par2cmdline-turbo e o MultiPar, o nzbfast tem
+        a verificação mais rápida e o reparo mais rápido em todas as máquinas testadas. Desktop de
+        20 núcleos: verificação limpa em <b>0,40 s</b> contra 1,08 do turbo e 3,67 do clássico;
+        reparo de 101 blocos danificados em <b>1,26 s</b> vs 2,61 e 7,52. Laptop de 14 núcleos:
+        verificação <b>1,26</b> vs 1,48, reparo <b>2,57</b> vs 3,62. Cada arquivo reparado
+        byte-idêntico. Uma nota honesta: não criamos PAR2 (um baixador não precisa, e o ParPar é
+        dono desse leg).</p></div>
     </div>
   </div>
 </section>

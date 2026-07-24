@@ -242,16 +242,18 @@
         <p>Frente a unrar 7.23, 7-Zip, bsdtar, unar y el crate rars original en un Apple M3 Ultra, el extractor
         de nzbfast gana o empata en todas las formas: 400 archivos pequeños en <b>0.13 s</b> frente a los 0.66 s
         de unrar, solid <b>0.50</b> frente a 0.87, cifrado <b>0.49</b> frente a 0.82, un archivo RAR7 con
-        diccionario de 128 MB <b>0.71</b> frente a 0.92. Repetido en un portátil Intel de 14 núcleos, los
+        diccionario de 128 MB <b>0.71</b> frente a 0.92. Repetido en un M1 Ultra de 20 núcleos y en un
+        portátil Intel de 14 núcleos, el resultado se mantiene en todas las formas, y en el portátil los
         márgenes se amplían: las rutas de decodificación paralelas escalan con los hilos adicionales. Cada
         tiempo informado produjo una salida sha256 idéntica.</p></div>
       <div class="card"><h3>Verificación + reparación PAR2 · conjunto de 1 GiB</h3>
-        <p>Frente al par2cmdline clásico y al fork SIMD par2cmdline-turbo: verificación limpia <b>0.41 s</b>
-        frente a 0.94 frente a 3.27; reparación de 101 bloques dañados <b>1.09 s</b> frente a 2.18 frente a
-        5.94, cada archivo reparado byte a byte idéntico. Dos notas honestas: no creamos PAR2 (un descargador
-        no lo necesita, y ese tramo es de ParPar), y en un portátil de 14 núcleos nuestra reparación queda por
-        detrás de turbo (6.24 s frente a 4.04 s): la ruta de reparación quiere los núcleos de la máquina
-        grande.</p></div>
+        <p>Frente al par2cmdline clásico, al fork SIMD par2cmdline-turbo y a MultiPar, nzbfast tiene la
+        verificación más rápida y la reparación más rápida en todas las máquinas probadas. Escritorio de
+        20 núcleos: verificación limpia <b>0.40 s</b> frente al 1.08 de turbo y el 3.67 del clásico;
+        reparación de 101 bloques dañados <b>1.26 s</b> frente a 2.61 y 7.52. Portátil de 14 núcleos:
+        verificación <b>1.26</b> frente a 1.48, reparación <b>2.57</b> frente a 3.62. Cada archivo reparado
+        byte a byte idéntico. Una nota honesta: no creamos PAR2 (un descargador no lo necesita, y ese tramo
+        es de ParPar).</p></div>
     </div>
   </div>
 </section>

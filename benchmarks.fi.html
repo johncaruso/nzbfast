@@ -244,15 +244,18 @@
         <p>unrar 7.23:a, 7-Zipiä, bsdtaria, unaria ja alkuperäistä rars-cratea vastaan Apple M3 Ultralla
         nzbfastin purkaja voittaa tai tasaa jokaisen muodon: 400 pientä tiedostoa <b>0.13 s</b> unrarin
         0.66 s:a vastaan, solid <b>0.50</b> vs. 0.87, salattu <b>0.49</b> vs. 0.82, RAR7-arkisto 128 MB:n
-        sanakirjalla <b>0.71</b> vs. 0.92. Uudelleen ajettuna 14-ytimisellä Intel-kannettavalla marginaalit
+        sanakirjalla <b>0.71</b> vs. 0.92. Uudelleen ajettuna 20-ytimisellä M1 Ultralla ja 14-ytimisellä
+        Intel-kannettavalla tulos pitää jokaisessa muodossa, ja kannettavalla marginaalit
         levenevät: rinnakkaiset dekoodauspolut skaalautuvat lisäsäikeisiin. Jokainen raportoitu aika
         tuotti sha256-identtisen tulosteen.</p></div>
       <div class="card"><h3>PAR2-varmistus + korjaus · 1 GiB:n sarja</h3>
-        <p>Klassista par2cmdlinea ja SIMD-haaraa par2cmdline-turboa vastaan: puhdas varmistus
-        <b>0.41 s</b> vs. 0.94 vs. 3.27; 101 vioittuneen lohkon korjaus <b>1.09 s</b> vs. 2.18 vs. 5.94,
-        jokainen korjattu tiedosto tavuidenttinen. Kaksi rehellistä huomiota: emme luo PAR2:ta (lataaja
-        ei sitä tarvitse, ja ParPar omistaa sen osuuden), ja 14-ytimisellä kannettavalla korjauksemme jää
-        turbosta jälkeen (6.24 s vs. 4.04 s): korjauspolku haluaa ison koneen ytimet.</p></div>
+        <p>Klassista par2cmdlinea, SIMD-haaraa par2cmdline-turboa ja MultiParia vastaan nzbfastilla
+        on nopein varmistus ja nopein korjaus jokaisella benchatulla koneella. 20-ytiminen
+        pöytäkone: puhdas varmistus <b>0.40 s</b> turbon 1.08:aa ja klassisen 3.67:ää vastaan;
+        101 vioittuneen lohkon korjaus <b>1.26 s</b> vs. 2.61 ja 7.52. 14-ytiminen kannettava:
+        varmistus <b>1.26</b> vs. 1.48, korjaus <b>2.57</b> vs. 3.62. Jokainen korjattu tiedosto
+        tavuidenttinen. Yksi rehellinen huomio: emme luo PAR2:ta (lataaja ei sitä tarvitse, ja
+        ParPar omistaa sen osuuden).</p></div>
     </div>
   </div>
 </section>

@@ -244,17 +244,19 @@
         <p>Face à unrar 7.23, 7-Zip, bsdtar, unar et la crate rars amont sur un Apple M3 Ultra,
         l’extracteur de nzbfast gagne ou fait match nul sur chaque forme : 400 petits fichiers en
         <b>0.13 s</b> contre 0.66 s pour unrar, solid <b>0.50</b> contre 0.87, chiffré <b>0.49</b>
-        contre 0.82, une archive RAR7 à dictionnaire de 128 MB <b>0.71</b> contre 0.92. Relancées sur
-        un portable Intel à 14 cœurs, les marges s’élargissent : les chemins de décodage parallèles
+        contre 0.82, une archive RAR7 à dictionnaire de 128 MB <b>0.71</b> contre 0.92. Relancé sur
+        un M1 Ultra à 20 cœurs et sur un portable Intel à 14 cœurs, le résultat tient sur chaque
+        forme, et sur le portable les marges s’élargissent : les chemins de décodage parallèles
         montent en charge sur les threads supplémentaires. Chaque temps rapporté a produit une sortie
         identique en sha256.</p></div>
       <div class="card"><h3>Vérification + réparation PAR2 · jeu de 1 GiB</h3>
-        <p>Face au par2cmdline classique et au fork SIMD par2cmdline-turbo : vérification propre
-        <b>0.41 s</b> contre 0.94 contre 3.27 ; réparation de 101 blocs endommagés <b>1.09 s</b> contre
-        2.18 contre 5.94, chaque fichier réparé identique à l’octet. Deux notes honnêtes : nous ne créons
-        pas de PAR2 (un téléchargeur n’en a pas besoin, et ParPar règne sur cette manche), et sur un
-        portable à 14 cœurs notre réparation reste derrière turbo (6.24 s contre 4.04 s) : le chemin de
-        réparation veut les cœurs de la grosse machine.</p></div>
+        <p>Face au par2cmdline classique, au fork SIMD par2cmdline-turbo et à MultiPar, nzbfast a la
+        vérification la plus rapide et la réparation la plus rapide sur chaque machine testée. Bureau
+        à 20 cœurs : vérification propre <b>0.40 s</b> contre 1.08 pour turbo et 3.67 pour le
+        classique ; réparation de 101 blocs endommagés <b>1.26 s</b> contre 2.61 et 7.52. Portable à
+        14 cœurs : vérification <b>1.26</b> contre 1.48, réparation <b>2.57</b> contre 3.62. Chaque
+        fichier réparé identique à l’octet. Une note honnête : nous ne créons pas de PAR2 (un
+        téléchargeur n’en a pas besoin, et ParPar règne sur cette manche).</p></div>
     </div>
   </div>
 </section>

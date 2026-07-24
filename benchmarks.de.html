@@ -245,15 +245,17 @@
         gewinnt nzbfasts Entpacker jede Form oder liegt gleichauf: 400 kleine Dateien in <b>0.13 s</b>
         zu unrars 0.66 s, solid <b>0.50</b> vs. 0.87, verschlüsselt <b>0.49</b> vs. 0.82, ein
         RAR7-Archiv mit 128 MB-Wörterbuch <b>0.71</b> vs. 0.92. Erneut gefahren auf einem
-        14-Kern-Intel-Laptop weiten sich die Abstände: die parallelen Decode-Pfade skalieren in die
+        20-Kern-M1-Ultra und auf einem 14-Kern-Intel-Laptop hält das Ergebnis bei jeder Form, und
+        auf dem Laptop weiten sich die Abstände: die parallelen Decode-Pfade skalieren in die
         zusätzlichen Threads. Jede gemeldete Zeit erzeugte sha256-identische Ausgabe.</p></div>
       <div class="card"><h3>PAR2-Prüfung + Reparatur · 1 GiB-Set</h3>
-        <p>Gegen das klassische par2cmdline und den SIMD-Fork par2cmdline-turbo: saubere Prüfung
-        <b>0.41 s</b> vs. 0.94 vs. 3.27; Reparatur von 101 beschädigten Blöcken <b>1.09 s</b> vs. 2.18
-        vs. 5.94, jede reparierte Datei byte-identisch. Zwei ehrliche Anmerkungen: Wir erzeugen kein
-        PAR2 (ein Downloader braucht das nicht, und ParPar gehört diese Etappe), und auf einem
-        14-Kern-Laptop liegt unsere Reparatur hinter turbo (6.24 s vs. 4.04 s): der Reparaturpfad will
-        die Kerne der großen Maschine.</p></div>
+        <p>Gegen das klassische par2cmdline, den SIMD-Fork par2cmdline-turbo und MultiPar hat
+        nzbfast auf jeder gebenchten Maschine die schnellste Prüfung und die schnellste Reparatur.
+        20-Kern-Desktop: saubere Prüfung <b>0.40 s</b> zu turbos 1.08 und den 3.67 des Klassikers;
+        Reparatur von 101 beschädigten Blöcken <b>1.26 s</b> vs. 2.61 und 7.52. 14-Kern-Laptop:
+        Prüfung <b>1.26</b> vs. 1.48, Reparatur <b>2.57</b> vs. 3.62. Jede reparierte Datei
+        byte-identisch. Eine ehrliche Anmerkung: Wir erzeugen kein PAR2 (ein Downloader braucht das
+        nicht, und ParPar gehört diese Etappe).</p></div>
     </div>
   </div>
 </section>
