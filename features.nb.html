@@ -50,7 +50,7 @@
     <div class="grid2">
       <ul class="feat">
         <li><b>Pipelinet NNTP på linjefart:</b> <span class="d">8,31 Gbps målt på 10 GbE.</span></li>
-        <li><b>Pipeline i én omgang:</b> <span class="d">dekoding, verifisering og utpakking overlapper; RAR-volumer rører aldri disken.</span></li>
+        <li><b>Pipeline i én omgang:</b> <span class="d">dekoding, verifisering og utpakking overlapper; RAR-volumer rører aldri disken; nøstede arkiver pakkes ut i samme omgang.</span></li>
         <li><b>Fler-leverandør union-tilgjengelighet:</b> <span class="d">fullstendig fra unionen av serverne dine, eller avbryt tidlig.</span></li>
         <li><b>Minnebudsjett:</b> <span class="d">avgrenset RAM, elegant spilling, swapper aldri.</span></li>
         <li><b>Krasjsikker gjenopptaking:</b> <span class="d">journal på artikkelnivå; kill −9 midt i jobben, og den fortsetter der den slapp.</span></li>
@@ -98,14 +98,16 @@
         <li><b>Skriv én gang.</b> Dekodede artikler pwrites rett til sine endelige filoffset. Ingen midlertidige filer, ingen egen sammensettingsrunde.</li>
         <li><b>PAR2-verifisering i strømmen.</b> Hver blokk MD5-hashes fra dekodebufferne etter hvert som den kommer inn, så verifiseringen er ferdig i samme øyeblikk som nedlastingen. Det slår hurtigsjekken de andre klientene nøyer seg med, og det koster ingenting.</li>
         <li><b>Direkte utpakking:</b> store-mode-RAR-poster (de fleste scene-utgivelser) mappes og pakkes ut mens de lastes ned, så volumene lander aldri på disk i det hele tatt. Diskskrivinger blir innhold × 1,0 og disk nødvendig 1×, der andre vil ha omtrent 2×.</li>
+        <li><b>Nøstede arkiver, fortsatt én omgang.</b> Arkiver inni arkiver - RAR i RAR, 7z inni RAR, stiger flere nivåer dype - avnøstes i farten i stedet for å bli skrevet ut og åpnet på nytt. Én kopi på disk der en skriv-ut-og-skann-på-nytt-tilnærming holder to.</li>
         <li><b>Deobfuskering.</b> Obfuskerte poster får nytt navn fra PAR2-metadataen sin, ROT13-krypterte navn reddes, og hash-navngitt søppel klassifiseres og filtreres ut.</li>
       </ul>
       <ul class="plain">
         <li><b>Eksakt tilpasset reparasjon.</b> Skadede blokker er kjent i det de oppstår, så bare minimum-byte-settet av gjenopprettingsvolumer hentes (løst som et ryggsekkproblem) og reparasjonen rører ikke annet enn de skadede områdene.</li>
         <li><b>RAR-gjenopprettingsdata.</b> Når PAR2 er oppbrukt, eller aldri ble postet, reparerer innebygde RAR-gjenopprettingsdata skadede volumer på stedet.</li>
+        <li><b>Reparasjon på hvert dyp.</b> Et PAR2-sett pakket inni et indre lag blir funnet og kjørt på sitt eget nivå, og en par-only-post (data slettet, et sett med 100 % gjenoppretting etterlatt) gjenoppbygges helt og pakkes deretter ut.</li>
         <li><b>Fallback for komprimert og kryptert:</b> ikke-store-poster materialiseres og pakkes ut via den native RAR-motoren, alt fra RAR4 til nye RAR7, overlappet med resten av køen. Krypterte sett parkeres med en tydelig melding i stedet for å feile stille.</li>
-        <li><b>Passordhåndtering.</b> Passord kommer fra *arr-API-et, filnavnkonvensjonen <code>{{pw}}</code> eller NZB-metadata. For alt som blir igjen, tar en 🔑 opplåsing på dashbordet over derfra: den låser opp i bakgrunnen og arkiverer så som normalt.</li>
-        <li><b>Sikkerhetssperrer.</b> Reparerte kildevolumer skrivebeskyttes mens ny utpakking kjører, og en exit-kode melder «suksess» bare når sluttilstanden faktisk er brukbar.</li>
+        <li><b>Passordhåndtering.</b> Passord kommer fra *arr-API-et, filnavnkonvensjonen <code>{{pw}}</code> eller NZB-metadata. For alt som blir igjen, tar en 🔑 opplåsing på dashbordet over derfra: den låser opp i bakgrunnen og arkiverer så som normalt. Kjedede passord løser seg selv: når utpakkingen av ett lag frembringer neste lags passordfil, leses den og brukes automatisk.</li>
+        <li><b>Sikkerhetssperrer.</b> Reparerte kildevolumer skrivebeskyttes mens ny utpakking kjører, den ferdige filens egen sjekksum verifiseres ende til ende (på som standard), og en exit-kode melder «suksess» bare når sluttilstanden faktisk er brukbar.</li>
       </ul>
     </div>
   </div>
@@ -167,7 +169,7 @@
     <div style="height:26px"></div>
     <div class="grid2">
       <ul class="plain">
-        <li><b>Kontinuerlig gruppeskanner.</b> Inkrementelle OVER-skanninger kjører på din tidsplan i ~43k headere/s over utfanede tilkoblinger. Første skanning er datobiseksjonert, så <code>--max-age 2y</code> hopper over år med headere på rundt 20 sonderinger.</li>
+        <li><b>Kontinuerlig gruppeskanner.</b> Inkrementelle OVER-skanninger kjører på din tidsplan i ~43k headere/s over utfanede tilkoblinger, og forhandler komprimerte headere (RFC 8054) der en server tilbyr dem. Første skanning er datobiseksjonert, så <code>--max-age 2y</code> hopper over år med headere på rundt 20 sonderinger.</li>
         <li><b>Inntaksfiltre:</b> filtre på type, år, oppløsning, språk og størrelse holder indekserer-spam ute av databasen din, og obfuskert søppel fanges opp og filtreres som standard.</li>
         <li><b>Scene-navn-parser.</b> Den henter tittel, år, episode, kvalitet og kilde ut av virkelige stammer (datokodede daglige, fler-episode-koder og ROT13-obfuskerte navn inkludert) og samler utgivelser til ett kort per tittel.</li>
         <li><b>Umiddelbart søk:</b> søk mens du skriver, med kvalitetsfiltre, følge-knapper per rad og kvalitetsmerker overalt.</li>

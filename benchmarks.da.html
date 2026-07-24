@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Benchmarks - nzbfast</title>
-<meta name="description" content="nzbfast mod SABnzbd, NZBGet og rustnzb: 4 klienter × 6 scenarier på identisk hardware. Ærlige resultater, inklusive det ene ben, nzbfast ikke vinder, med reproduktionstrin.">
+<meta name="description" content="nzbfast mod SABnzbd, NZBGet og rustnzb: 4 klienter × 7 scenarier på identisk hardware. Ærlige resultater, inklusive de ben, nzbfast ikke vinder, med reproduktionstrin.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
 <link rel="alternate" hreflang="en" href="benchmarks.html">
@@ -42,9 +42,9 @@
 
 <div class="hero wrap" style="padding-bottom:6px">
   <h1>Benchmarks</h1>
-  <p class="sub">Fire klienter, seks scenarier, identisk hardware og udbydere, kørsler
+  <p class="sub">Fire klienter, syv scenarier, identisk hardware og udbydere, kørsler
   flettet, så udbyderdrift ophæves. Målet er <b>tid til en brugbar fil</b>:
-  hentet, verificeret, udpakket. Inklusive det ene ben, vi ikke vinder.</p>
+  hentet, verificeret, udpakket. Inklusive de ben, vi ikke vinder.</p>
 </div>
 
 <section style="padding-top:26px">
@@ -65,25 +65,26 @@
     <p class="kicker">Scenarie 1 · rent, kæmpe</p>
     <h2>190.6 GB → én enkelt 167.9 GB mkv (Europa, 10 GbE)</h2>
     <div class="bars">
-      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:24%"></i></span><span class="t">4m 44s</span></div>
-      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:36%"></i></span><span class="t">7m 06s · +50%</span></div>
-      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 31s · +312%</span></div>
+      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:23%"></i></span><span class="t">4m 33s</span></div>
+      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:41%"></i></span><span class="t">7m 58s · +75%</span></div>
+      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 32s · +329%</span></div>
       <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">intet output¹</span></div>
     </div>
     <div class="tblwrap"><table>
       <thead><tr><th></th><th>nzbfast</th><th>NZBGet 26.2</th><th>SABnzbd 5.0.4</th><th>rustnzb 1.3.4</th></tr></thead>
       <tbody>
-        <tr><td>tid til brugbar fil</td><td class="win">4m 44s</td><td class="lose">7m 06s (+50%)</td><td class="lose">19m 31s (+312%)</td><td class="bad">ingen¹</td></tr>
-        <tr><td>GB på ledningen</td><td class="win num">169.3</td><td class="num">169.6</td><td class="num">169.6</td><td class="num">186.6</td></tr>
-        <tr><td>top-RSS</td><td class="num">6.8 GB²</td><td class="num">1.8 GB</td><td class="num">1.8 GB</td><td class="win num">0.6 GB</td></tr>
+        <tr><td>tid til brugbar fil</td><td class="win">4m 33s</td><td class="lose">7m 58s (+75%)</td><td class="lose">19m 32s (+329%)</td><td class="bad">ingen¹</td></tr>
+        <tr><td>GB på ledningen</td><td class="win num">169.6</td><td class="num">169.8</td><td class="num">169.7</td><td class="num">186.5</td></tr>
+        <tr><td>top-RSS</td><td class="num">1.4 GB²</td><td class="num">1.5 GB</td><td class="num">1.8 GB</td><td class="win num">0.6 GB</td></tr>
       </tbody>
     </table></div>
-    <p class="note" style="text-align:left">¹ rustnzb rapporterede jobbet færdigt på 5m 42s efter at have trukket
-    186.6 GB (10% mere ledning end nogen anden) men efterlod <b>slet ingen outputfil</b>. Den fejlede også
-    dette scenarie i den forrige runde ("121,975 artikler mangler", 71 GB efterladt).
-    · ² nzbfasts hukommelse følger sit <em>konfigurerede budget</em>, ikke jobbet: dette ben kørte
-    standard-auto-budgettet; begrænset til <b>1 GB</b> fuldføres samme 190 GB-job stadig, cirka 22%
-    langsommere (se lav-hukommelses-stigen nedenfor). På den tidligere østkyst-runde (~2.4–3 Gbps-linje) kørte
+    <p class="note" style="text-align:left">¹ rustnzb blev færdig med at flytte bytes på 5m 42s efter at have
+    trukket 186.5 GB (10% mere ledning end nogen anden), men efterlod <b>ingen udpakkede medier</b>, dens
+    tredje fejlede runde i træk på denne post.
+    · ² nzbfasts hukommelse følger sit <em>konfigurerede budget</em>, ikke jobbet: denne runde kørte
+    standard-auto-budgettet og toppede på 1.4 GB; et bevidst kæmpestort 64 GB-budget køber kun 4% (4m 22s),
+    og begrænset til <b>1 GB</b> fuldføres samme 190 GB-job stadig (se lav-hukommelses-stigen nedenfor).
+    På den tidligere østkyst-runde (~2.4–3 Gbps-linje) kørte
     samme scenarie 9m 00s mod NZBGet +30% og SABnzbd +111%. Forspringet holder på tværs af linjehastigheder.</p>
   </div>
 </section>
@@ -150,13 +151,18 @@
 <section class="alt">
   <div class="wrap">
     <p class="kicker">Den ærlige kolonne</p>
-    <h2>Det ene ben, vi ikke vinder</h2>
+    <h2>De ben, vi ikke vinder</h2>
     <div class="grid2">
       <div class="card"><h3>Beskadiget store-mode-post</h3>
         <p>20 forgiftede artikler i en 7.4 GB REMUX: NZBGet bliver brugbar færdig på <b>53 s</b>, nzbfast
         på <b>58 s</b>. Vores reparation er færdig på 32 s, genudpakker alle 62 volumener, og outputtet er
         byte-nøjagtigt, og den henter et næsten-teoretisk-minimum på 22 genoprettelsesblokke for de 20 nødvendige,
         mod NZBGets fulde PAR2-gennemløb. Men NZBGet tager benet med fem sekunder, så her er det.</p></div>
+      <div class="card"><h3>Par-only-genopbygning</h3>
+        <p>Posteren slettede hver eneste dataartikel og efterlod kun et PAR2-sæt med 100% redundans. Alle
+        fire klienter genopbygger hele volumensættet fra paritet; NZBGet gør det hurtigst, <b>8 s</b> mod
+        vores <b>19 s</b> på en 1.5 GB-post (rustnzb 49 s, SABnzbd 6m 30s). At genopbygge et helt sæt fra
+        ingenting er den ene reparationsform, hvor en motor i strømmen ingen fordel har.</p></div>
     </div>
     <div class="callout">Hvorfor overhovedet vise et nederlag? Fordi sejrene kun er troværdige ved siden af det.
     Hvert tal på denne side kommer fra de samme flettede kørsler, og repoet gemmer det hele
@@ -186,6 +192,61 @@
     87 GB-job ved de samme budgetter på en ~2.4 Gbps-linje målte −1% til +7%, støj.
     På en typisk hjemmeforbindelse er et lille budget næsten gratis ved enhver jobstørrelse. En
     NAS-profil (2 forbindelser, 256 MB-budget) gjorde 35 GB-jobbet færdigt i 0.4 GB top-RSS. En 2 GB-NAS kan køre dette. Ingen anden klient tilbyder overhovedet et hukommelsesloft.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">Scenarie 7 · arkiver inde i arkiver</p>
+    <h2>Ti nestede former: hvem bliver færdig uden dig</h2>
+    <p class="lead">Posts ankommer i stigende grad nestede: en RAR inde i en RAR, en 7z gemt i et
+    store-arkiv, en stige af lag, en adgangskodekæde. Denne runde bedømmer, hvad der er tilbage til
+    operatøren. <b>auto</b> betyder hver payload udpakket, byte-identisk, uden hænder; <b>manuelt</b>
+    betyder, at klienten meldte succes, men efterlod et indre arkiv i output-mappen, som du selv må åbne.</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>form</th><th>nzbfast</th><th>SABnzbd</th><th>NZBGet</th><th>rustnzb</th></tr></thead>
+      <tbody>
+        <tr><td>store-RAR inde i store-RAR</td><td class="win">auto</td><td>auto</td><td class="bad">manuelt</td><td class="bad">manuelt</td></tr>
+        <tr><td>komprimeret RAR inde i store-RAR</td><td class="win">auto</td><td>auto</td><td class="bad">manuelt</td><td class="bad">manuelt</td></tr>
+        <tr><td>7z inde i en store-RAR</td><td class="win">auto</td><td>auto</td><td class="bad">manuelt</td><td class="bad">manuelt</td></tr>
+        <tr><td>5-niveauers stige, 6 payloads</td><td class="win">auto · 6/6</td><td class="bad">manuelt · 3/6</td><td class="bad">manuelt · 1/6</td><td class="bad">manuelt · 1/6</td></tr>
+        <tr><td>adgangskodekæde, 3 krypterede niveauer</td><td class="win">auto · 3/3</td><td class="bad">beder om en adgangskode</td><td class="bad">beder om en adgangskode</td><td class="bad">fejlede</td></tr>
+        <tr><td><b>auto-fuldført, alle ti former</b></td><td class="win"><b>8/10</b></td><td class="num">6/10</td><td class="num">2/10</td><td class="num">2/10</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">Loopback-rig, maskingenereret korpus, alle fire klienter på
+    samme maskine, bedømt efter indholdshash, så en klient, der omdøber payloaden, stadig får kredit.
+    Fordi indre lag afnestes i farten, holder nzbfast én ~1.5 GB-kopi på disken, hvor
+    skriv-ud-og-udpak-klienter holder ~3 GB, og bliver færdig med disse ben på 1–2 s mod 4–8 s.
+    På adgangskodekæden leveres hvert lags adgangskode i en fil, som laget ovenover udpakker: nzbfast
+    læser den og låser alle tre niveauer op; de andre stopper og venter på, at du taster den ind. De to
+    former, den ikke auto-fuldfører, bedømmes hårdt med vilje: en 10-niveauers stige ud over dens
+    standard-dybdegrænse og en post beskadiget på alle tre niveauer. På begge genvinder den flere payloads
+    end nogen anden klient, men afslutter med en kode forskellig fra nul i stedet for at kalde et delvist
+    job en succes, så begge tæller som fejl her.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Komponent-dueller</p>
+    <h2>Udpaknings- og reparationsmotorerne, i soloopgør</h2>
+    <p class="lead">Udpakning og PAR2 er vores egen native kode, så vi kører dem også selvstændigt mod
+    feltet på identiske korpusser. En tid tæller kun, når outputtet er byte-identisk med kilde-payloaden.</p>
+    <div class="grid2">
+      <div class="card"><h3>RAR-udpakning · 8 arkivformer</h3>
+        <p>Mod unrar 7.23, 7-Zip, bsdtar, unar og upstream rars-craten på en Apple M3 Ultra vinder eller
+        deler nzbfasts udpakker hver form: 400 små filer <b>0.13 s</b> mod unrars 0.66 s, solid
+        <b>0.50</b> mod 0.87, krypteret <b>0.49</b> mod 0.82, et RAR7-arkiv med 128 MB-ordbog <b>0.71</b>
+        mod 0.92. Kørt igen på en 14-kernes Intel-laptop bliver marginerne bredere: de parallelle
+        afkodningsstier skalerer ind i de ekstra tråde. Hver rapporteret tid gav sha256-identisk output.</p></div>
+      <div class="card"><h3>PAR2-verificering + reparation · 1 GiB-sæt</h3>
+        <p>Mod klassisk par2cmdline og SIMD-forken par2cmdline-turbo: ren verificering <b>0.41 s</b> mod
+        0.94 mod 3.27; reparation af 101 beskadigede blokke <b>1.09 s</b> mod 2.18 mod 5.94, hver
+        repareret fil byte-identisk. To ærlige noter: vi opretter ikke PAR2 (en downloader behøver det
+        ikke, og ParPar ejer det ben), og på en 14-kernes laptop halter vores reparation efter turbo
+        (6.24 s mod 4.04 s): reparationsstien vil have den store maskines kerner.</p></div>
+    </div>
   </div>
 </section>
 
@@ -248,7 +309,7 @@
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
     </div>
   </div>
-  <p class="fine">Benchmark-data: konkurrence-runde 19.-20. juli 2026. Klientversioner:
+  <p class="fine">Benchmark-data: konkurrence-runder 19.-24. juli 2026. Klientversioner:
   SABnzbd 5.0.4, NZBGet 26.2 (nzbget.com-fork), rustnzb 1.3.4. Hvis en nyere version af
   en klient ændrer et resultat væsentligt, kører vi igen og opdaterer.</p>
 </div></footer>

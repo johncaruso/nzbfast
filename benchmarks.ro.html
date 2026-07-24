@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Benchmark-uri - nzbfast</title>
-<meta name="description" content="nzbfast vs SABnzbd, NZBGet și rustnzb: 4 clienți × 6 scenarii pe hardware identic. Rezultate oneste, inclusiv singura probă pe care nzbfast n-o câștigă, cu pași de reproducere.">
+<meta name="description" content="nzbfast vs SABnzbd, NZBGet și rustnzb: 4 clienți × 7 scenarii pe hardware identic. Rezultate oneste, inclusiv probele pe care nzbfast nu le câștigă, cu pași de reproducere.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
 <link rel="alternate" hreflang="en" href="benchmarks.html">
@@ -42,9 +42,9 @@
 
 <div class="hero wrap" style="padding-bottom:6px">
   <h1>Benchmark-uri</h1>
-  <p class="sub">Patru clienți, șase scenarii, hardware și provideri identici, rulări
+  <p class="sub">Patru clienți, șapte scenarii, hardware și provideri identici, rulări
   intercalate ca variația providerilor să se anuleze. Măsura este <b>timpul până la un fișier utilizabil</b>:
-  descărcat, verificat, extras. Include singura probă pe care n-o câștigăm.</p>
+  descărcat, verificat, extras. Include probele pe care nu le câștigăm.</p>
 </div>
 
 <section style="padding-top:26px">
@@ -65,25 +65,26 @@
     <p class="kicker">Scenariul 1 · curat, uriaș</p>
     <h2>190.6 GB → un singur mkv de 167.9 GB (Europa, 10 GbE)</h2>
     <div class="bars">
-      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:24%"></i></span><span class="t">4m 44s</span></div>
-      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:36%"></i></span><span class="t">7m 06s · +50%</span></div>
-      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 31s · +312%</span></div>
+      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:23%"></i></span><span class="t">4m 33s</span></div>
+      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:41%"></i></span><span class="t">7m 58s · +75%</span></div>
+      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 32s · +329%</span></div>
       <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">no output¹</span></div>
     </div>
     <div class="tblwrap"><table>
       <thead><tr><th></th><th>nzbfast</th><th>NZBGet 26.2</th><th>SABnzbd 5.0.4</th><th>rustnzb 1.3.4</th></tr></thead>
       <tbody>
-        <tr><td>timp până la fișierul utilizabil</td><td class="win">4m 44s</td><td class="lose">7m 06s (+50%)</td><td class="lose">19m 31s (+312%)</td><td class="bad">none¹</td></tr>
-        <tr><td>GB pe fir</td><td class="win num">169.3</td><td class="num">169.6</td><td class="num">169.6</td><td class="num">186.6</td></tr>
-        <tr><td>RSS de vârf</td><td class="num">6.8 GB²</td><td class="num">1.8 GB</td><td class="num">1.8 GB</td><td class="win num">0.6 GB</td></tr>
+        <tr><td>timp până la fișierul utilizabil</td><td class="win">4m 33s</td><td class="lose">7m 58s (+75%)</td><td class="lose">19m 32s (+329%)</td><td class="bad">none¹</td></tr>
+        <tr><td>GB pe fir</td><td class="win num">169.6</td><td class="num">169.8</td><td class="num">169.7</td><td class="num">186.5</td></tr>
+        <tr><td>RSS de vârf</td><td class="num">1.4 GB²</td><td class="num">1.5 GB</td><td class="num">1.8 GB</td><td class="win num">0.6 GB</td></tr>
       </tbody>
     </table></div>
-    <p class="note" style="text-align:left">¹ rustnzb a raportat jobul terminat la 5m 42s după ce a tras
-    186.6 GB (cu 10% mai mult trafic decât oricine), dar nu a lăsat <b>niciun fișier de ieșire</b>. A eșuat și
-    acest scenariu în runda anterioară („121,975 articole lipsă”, 71 GB orfani).
-    · ² memoria nzbfast urmează <em>bugetul configurat</em>, nu jobul: această probă a rulat pe
-    bugetul auto implicit; limitat la <b>1 GB</b>, același job de 190 GB tot se finalizează, cu aproximativ 22%
-    mai lent (vezi scara de memorie redusă mai jos). În runda anterioară de pe Coasta de Est (linie de ~2.4–3 Gbps),
+    <p class="note" style="text-align:left">¹ rustnzb a terminat de mutat octeții la 5m 42s, după ce a tras
+    186.5 GB (cu 10% mai mult trafic decât oricine), dar nu a lăsat <b>niciun fișier media extras</b>, a treia lui
+    rundă eșuată la rând pe această postare.
+    · ² memoria nzbfast urmează <em>bugetul configurat</em>, nu jobul: această rundă a rulat pe
+    bugetul auto implicit și a atins un vârf de 1.4 GB; un buget uriaș de 64 GB, ales dinadins, aduce doar 4% (4m 22s),
+    iar limitat la <b>1 GB</b>, același job de 190 GB tot se finalizează (vezi scara de memorie redusă mai jos).
+    În runda anterioară de pe Coasta de Est (linie de ~2.4–3 Gbps),
     același scenariu a rulat 9m 00s față de NZBGet +30% și SABnzbd +111%. Diferența se menține la diferite viteze de linie.</p>
   </div>
 </section>
@@ -150,7 +151,7 @@
 <section class="alt">
   <div class="wrap">
     <p class="kicker">Coloana onestă</p>
-    <h2>Singura probă pe care n-o câștigăm</h2>
+    <h2>Probele pe care nu le câștigăm</h2>
     <div class="grid2">
       <div class="card"><h3>Postare deteriorată în mod store</h3>
         <p>20 de articole otrăvite într-un REMUX de 7.4 GB: NZBGet termină cu un fișier utilizabil în <b>53 s</b>,
@@ -158,6 +159,12 @@
         ieșirea e exactă la octet, și preia doar 22 de blocuri de recuperare, aproape de minimul teoretic,
         pentru cele 20 necesare, față de trecerea PAR2 completă a lui NZBGet. Dar NZBGet ia proba cu cinci
         secunde, așa că iat-o aici.</p></div>
+      <div class="card"><h3>Reconstrucție doar din par</h3>
+        <p>Autorul postării a șters toate articolele de date și a lăsat doar un set PAR2 cu redundanță de 100%.
+        Toți cei patru clienți reconstruiesc întregul set de volume din paritate; NZBGet o face cel mai repede,
+        <b>8 s</b> față de <b>19 s</b> la noi, pe o postare de 1.5 GB (rustnzb 49 s, SABnzbd 6m 30s).
+        Reconstrucția unui set întreg din nimic e singura formă de reparare în care un motor în flux
+        nu are niciun avantaj.</p></div>
     </div>
     <div class="callout">De ce să arătăm măcar o pierdere? Pentru că victoriile sunt credibile doar alături de ea.
     Fiecare număr de pe această pagină provine din aceleași rulări intercalate, iar
@@ -188,6 +195,67 @@
     Pe o conexiune casnică tipică, un buget mic este aproape gratuit la orice dimensiune de job. Un
     profil de NAS (2 conexiuni, buget de 256 MB) a terminat jobul de 35 GB cu 0.4 GB RSS de vârf.
     Un NAS de 2 GB poate rula asta. Niciun alt client nu oferă vreun plafon de memorie.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">Scenariul 7 · arhive în arhive</p>
+    <h2>Zece forme imbricate: cine termină fără tine</h2>
+    <p class="lead">Postările sosesc tot mai des imbricate: un RAR într-un RAR, un 7z vârât într-o
+    arhivă store, o scară de straturi, un lanț de parole. Această rundă notează ce rămâne pe seama
+    operatorului. <b>auto</b> înseamnă fiecare payload extras, identic la octet, fără nicio
+    intervenție; <b>manual</b> înseamnă că clientul a raportat succes, dar a lăsat o arhivă
+    interioară în directorul de ieșire, să o deschizi tu.</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>forma</th><th>nzbfast</th><th>SABnzbd</th><th>NZBGet</th><th>rustnzb</th></tr></thead>
+      <tbody>
+        <tr><td>RAR store într-un RAR store</td><td class="win">auto</td><td>auto</td><td class="bad">manual</td><td class="bad">manual</td></tr>
+        <tr><td>RAR comprimat într-un RAR store</td><td class="win">auto</td><td>auto</td><td class="bad">manual</td><td class="bad">manual</td></tr>
+        <tr><td>7z într-un RAR store</td><td class="win">auto</td><td>auto</td><td class="bad">manual</td><td class="bad">manual</td></tr>
+        <tr><td>scară pe 5 niveluri, 6 payload-uri</td><td class="win">auto · 6/6</td><td class="bad">manual · 3/6</td><td class="bad">manual · 1/6</td><td class="bad">manual · 1/6</td></tr>
+        <tr><td>lanț de parole, 3 niveluri criptate</td><td class="win">auto · 3/3</td><td class="bad">cere o parolă</td><td class="bad">cere o parolă</td><td class="bad">a eșuat</td></tr>
+        <tr><td><b>auto-finalizare, toate cele zece forme</b></td><td class="win"><b>8/10</b></td><td class="num">6/10</td><td class="num">2/10</td><td class="num">2/10</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">Montaj loopback, corpus generat de mașină, toți cei
+    patru clienți pe aceeași mașină, notare după hash-ul conținutului, așa că un client care
+    redenumește payload-ul tot primește credit. Pentru că straturile interioare sunt dezimbricate
+    din mers, nzbfast ține pe disc o singură copie de ~1.5 GB, acolo unde clienții care scriu pe
+    disc și despachetează țin ~3 GB, și termină aceste probe în 1–2 s față de 4–8 s. La lanțul de
+    parole, parola fiecărui strat vine într-un fișier pe care îl extrage stratul de deasupra:
+    nzbfast îl citește și deblochează toate cele trei niveluri; ceilalți se opresc și așteaptă să
+    o tastezi tu. Cele două forme pe care nu le auto-finalizează sunt notate dinadins cu asprime:
+    o scară pe 10 niveluri dincolo de plafonul implicit de adâncime și o postare deteriorată la
+    toate cele trei niveluri. Pe ambele recuperează mai multe payload-uri decât oricare alt client,
+    dar iese cu cod diferit de zero în loc să numească succes un job parțial, așa că ambele
+    contează aici ca eșecuri.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Dueluri pe componente</p>
+    <h2>Motoarele de dezarhivare și reparare, în cursă solo</h2>
+    <p class="lead">Extragerea și PAR2 sunt cod nativ propriu, așa că le punem și separat în cursă
+    cu restul terenului, pe corpusuri identice. Un timp contează doar când ieșirea este identică
+    la octet cu payload-ul sursă.</p>
+    <div class="grid2">
+      <div class="card"><h3>Extragere RAR · 8 forme de arhivă</h3>
+        <p>Față de unrar 7.23, 7-Zip, bsdtar, unar și crate-ul rars din amonte, pe un Apple M3 Ultra,
+        extractorul nzbfast câștigă sau egalează fiecare formă: 400 de fișiere mici în <b>0.13 s</b>
+        față de 0.66 s la unrar, solid <b>0.50</b> vs 0.87, criptat <b>0.49</b> vs 0.82, o arhivă
+        RAR7 cu dicționar de 128 MB <b>0.71</b> vs 0.92. Rerulate pe un laptop Intel cu 14 nuclee,
+        marjele se lărgesc: căile de decodare paralelă scalează în firele suplimentare. Fiecare timp
+        raportat a produs ieșire identică sha256.</p></div>
+      <div class="card"><h3>Verificare + reparare PAR2 · set de 1 GiB</h3>
+        <p>Față de clasicul par2cmdline și de fork-ul SIMD par2cmdline-turbo: verificare curată
+        <b>0.41 s</b> vs 0.94 vs 3.27; repararea a 101 blocuri deteriorate <b>1.09 s</b> vs 2.18
+        vs 5.94, fiecare fișier reparat identic la octet. Două note oneste: nu creăm PAR2 (un
+        program de descărcare nu are nevoie, iar proba aceea îi aparține lui ParPar), iar pe un
+        laptop cu 14 nuclee repararea noastră rămâne în urma lui turbo (6.24 s vs 4.04 s): calea
+        de reparare vrea nucleele mașinii mari.</p></div>
+    </div>
   </div>
 </section>
 
@@ -250,7 +318,7 @@
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
     </div>
   </div>
-  <p class="fine">Date de benchmark: runda competitivă din 19–20 iulie 2026. Versiuni de
+  <p class="fine">Date de benchmark: rundele competitive din 19–24 iulie 2026. Versiuni de
   client: SABnzbd 5.0.4, NZBGet 26.2 (fork nzbget.com), rustnzb 1.3.4. Dacă o versiune mai nouă a
   oricărui client schimbă semnificativ un rezultat, vom rerula și actualiza.</p>
 </div></footer>

@@ -48,7 +48,7 @@
   fills, the file is finished and provably intact.</p>
   <div class="chips">
     <span class="chip"><b>8.31&nbsp;Gbps</b> on a 10&nbsp;GbE line</span>
-    <span class="chip"><b>190&nbsp;GB → 4m44s</b> to a verified file</span>
+    <span class="chip"><b>190&nbsp;GB → 4m33s</b> to a verified file</span>
     <span class="chip">RAR volumes <b>never touch disk</b></span>
     <span class="chip"><b>Half the disk</b> competitors need</span>
     <span class="chip">RAM-budgeted · <b>0 swaps, ever</b></span>
@@ -122,7 +122,7 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place - 4.95 GB/s per
     <div class="grid2">
       <ul class="feat">
         <li><b>Line-rate downloads:</b> <span class="d">pipelined NNTP measured at 8.31 Gbps on 10 GbE; the fastest client on every clean benchmark leg, at every size.</span></li>
-        <li><b>One-pass pipeline:</b> <span class="d">decode, verify and extract overlap; store-mode RAR volumes never hit disk; needs 1× disk where others need ~2×.</span></li>
+        <li><b>One-pass pipeline:</b> <span class="d">decode, verify and extract overlap; store-mode RAR volumes never hit disk; nested archives unpack in the same pass; needs 1× disk where others need ~2×.</span></li>
         <li><b>Multi-provider union availability:</b> <span class="d">block-exact routing across backbones; preflight verdicts; exact-fit repair; early abort of impossible posts.</span></li>
         <li><b>Memory budget:</b> <span class="d">one global RAM budget with graceful spill tiers. It never swaps your machine: a 190 GB job completes inside a 1 GB budget (~1.1 GB peak RSS).</span></li>
         <li><b>Crash-safe resume:</b> <span class="d">an article-level journal means a crash or kill −9 mid-download costs almost nothing. It resumes, refetching only what wasn't saved.</span></li>
@@ -147,13 +147,13 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place - 4.95 GB/s per
     Every competitor was tuned to its own documented best, right down to switching SABnzbd's
     pipelining <i>on</i>, which it ships without.</p>
     <div class="bars">
-      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:24%"></i></span><span class="t">4m 44s</span></div>
-      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:36%"></i></span><span class="t">7m 06s · +50%</span></div>
-      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 31s · +312%</span></div>
+      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:23%"></i></span><span class="t">4m 33s</span></div>
+      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:41%"></i></span><span class="t">7m 58s · +75%</span></div>
+      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 32s · +329%</span></div>
       <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">no usable file</span></div>
     </div>
     <p class="note" style="text-align:start">190.6 GB NZB → a single 167.9 GB mkv, M1 Ultra on 10 GbE, 6 providers × 8 connections.
-    The same job also finishes inside a 1 GB memory budget. Full tables, all six scenarios, and the one leg we <i>don't win</i> (plus how to reproduce them)
+    The same job also finishes inside a 1 GB memory budget. Full tables, all seven scenarios, and the legs we <i>don't win</i> (plus how to reproduce them)
     are on the <a href="benchmarks.html">benchmarks page</a>.</p>
   </div>
 </section>

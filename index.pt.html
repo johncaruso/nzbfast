@@ -48,7 +48,7 @@
   em que a barra de progresso enche, o arquivo está pronto e comprovadamente intacto.</p>
   <div class="chips">
     <span class="chip"><b>8,31&nbsp;Gbps</b> em uma linha de 10&nbsp;GbE</span>
-    <span class="chip"><b>190&nbsp;GB → 4m44s</b> até um arquivo verificado</span>
+    <span class="chip"><b>190&nbsp;GB → 4m33s</b> até um arquivo verificado</span>
     <span class="chip">Volumes RAR <b>nunca tocam o disco</b></span>
     <span class="chip"><b>Metade do disco</b> que os concorrentes precisam</span>
     <span class="chip">RAM orçada · <b>0 swaps, nunca</b></span>
@@ -122,7 +122,7 @@ socket ──TLS──▶ <b>decodificação SIMD rapidyenc</b> (no lugar - 4,95
     <div class="grid2">
       <ul class="feat">
         <li><b>Downloads em velocidade de linha:</b> <span class="d">NNTP com pipeline medido a 8,31 Gbps em 10 GbE; o cliente mais rápido em cada leg limpo de benchmark, em todos os tamanhos.</span></li>
-        <li><b>Pipeline de passagem única:</b> <span class="d">decodificação, verificação e extração se sobrepõem; volumes RAR em modo armazenamento nunca chegam ao disco; precisa de 1× de disco onde outros precisam de ~2×.</span></li>
+        <li><b>Pipeline de passagem única:</b> <span class="d">decodificação, verificação e extração se sobrepõem; volumes RAR em modo armazenamento nunca chegam ao disco; arquivos aninhados são desempacotados na mesma passagem; precisa de 1× de disco onde outros precisam de ~2×.</span></li>
         <li><b>Disponibilidade por união multiprovedor:</b> <span class="d">roteamento exato por bloco entre backbones; vereditos de preflight; reparo sob medida; aborto antecipado de publicações impossíveis.</span></li>
         <li><b>Orçamento de memória:</b> <span class="d">um orçamento de RAM global com níveis graduais de spill. Ele nunca faz swap da sua máquina: um trabalho de 190 GB termina dentro de um orçamento de 1 GB (~1,1 GB de pico de RSS).</span></li>
         <li><b>Retomada à prova de travamento:</b> <span class="d">um diário no nível de artigo faz com que um travamento ou kill −9 no meio do download custe quase nada: ele retoma, rebuscando apenas o que não foi salvo.</span></li>
@@ -147,13 +147,13 @@ socket ──TLS──▶ <b>decodificação SIMD rapidyenc</b> (no lugar - 4,95
     realmente importa. Cada concorrente foi ajustado ao próprio melhor documentado, a ponto de ligar o pipeline
     do SABnzbd, que vem <i>sem</i> ele.</p>
     <div class="bars">
-      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:24%"></i></span><span class="t">4m 44s</span></div>
-      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:36%"></i></span><span class="t">7m 06s · +50%</span></div>
-      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 31s · +312%</span></div>
+      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:23%"></i></span><span class="t">4m 33s</span></div>
+      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:41%"></i></span><span class="t">7m 58s · +75%</span></div>
+      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 32s · +329%</span></div>
       <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">nenhum arquivo utilizável</span></div>
     </div>
     <p class="note" style="text-align:left">NZB de 190,6 GB → um único mkv de 167,9 GB, M1 Ultra em 10 GbE, 6 provedores × 8 conexões.
-    O mesmo trabalho também termina dentro de um orçamento de memória de 1 GB. Tabelas completas, todos os seis cenários e o único leg que <i>não vencemos</i> (além de como reproduzi-los)
+    O mesmo trabalho também termina dentro de um orçamento de memória de 1 GB. Tabelas completas, todos os sete cenários e os legs que <i>não vencemos</i> (além de como reproduzi-los)
     estão na <a href="benchmarks.pt.html">página de benchmarks</a>.</p>
   </div>
 </section>

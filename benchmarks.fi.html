@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Vertailut - nzbfast</title>
-<meta name="description" content="nzbfast vs. SABnzbd, NZBGet ja rustnzb: 4 asiakasta × 6 skenaariota identtisellä laitteistolla. Rehelliset tulokset mukaan lukien se ainoa osuus, jossa nzbfast ei voita, toistamisohjeineen.">
+<meta name="description" content="nzbfast vs. SABnzbd, NZBGet ja rustnzb: 4 asiakasta × 7 skenaariota identtisellä laitteistolla. Rehelliset tulokset mukaan lukien ne osuudet, joissa nzbfast ei voita, toistamisohjeineen.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
 <link rel="alternate" hreflang="en" href="benchmarks.html">
@@ -42,9 +42,9 @@
 
 <div class="hero wrap" style="padding-bottom:6px">
   <h1>Vertailut</h1>
-  <p class="sub">Neljä asiakasta, kuusi skenaariota, identtinen laitteisto ja palveluntarjoajat, ajot
+  <p class="sub">Neljä asiakasta, seitsemän skenaariota, identtinen laitteisto ja palveluntarjoajat, ajot
   lomitettuina niin että palveluntarjoajien vaihtelu kumoutuu. Mittari on <b>aika käyttökelpoiseen tiedostoon</b>:
-  ladattu, varmistettu, purettu. Mukana myös se ainoa osuus, jossa emme voita.</p>
+  ladattu, varmistettu, purettu. Mukana myös ne osuudet, joissa emme voita.</p>
 </div>
 
 <section style="padding-top:26px">
@@ -65,25 +65,26 @@
     <p class="kicker">Skenaario 1 · puhdas, valtava</p>
     <h2>190.6 GB → yksi 167.9 GB mkv (Eurooppa, 10 GbE)</h2>
     <div class="bars">
-      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:24%"></i></span><span class="t">4m 44s</span></div>
-      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:36%"></i></span><span class="t">7m 06s · +50%</span></div>
-      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 31s · +312%</span></div>
+      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:23%"></i></span><span class="t">4m 33s</span></div>
+      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:41%"></i></span><span class="t">7m 58s · +75%</span></div>
+      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 32s · +329%</span></div>
       <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">ei tulostetta¹</span></div>
     </div>
     <div class="tblwrap"><table>
       <thead><tr><th></th><th>nzbfast</th><th>NZBGet 26.2</th><th>SABnzbd 5.0.4</th><th>rustnzb 1.3.4</th></tr></thead>
       <tbody>
-        <tr><td>aika käyttökelpoiseen tiedostoon</td><td class="win">4m 44s</td><td class="lose">7m 06s (+50%)</td><td class="lose">19m 31s (+312%)</td><td class="bad">ei mitään¹</td></tr>
-        <tr><td>GB langalla</td><td class="win num">169.3</td><td class="num">169.6</td><td class="num">169.6</td><td class="num">186.6</td></tr>
-        <tr><td>huippu-RSS</td><td class="num">6.8 GB²</td><td class="num">1.8 GB</td><td class="num">1.8 GB</td><td class="win num">0.6 GB</td></tr>
+        <tr><td>aika käyttökelpoiseen tiedostoon</td><td class="win">4m 33s</td><td class="lose">7m 58s (+75%)</td><td class="lose">19m 32s (+329%)</td><td class="bad">ei mitään¹</td></tr>
+        <tr><td>GB langalla</td><td class="win num">169.6</td><td class="num">169.8</td><td class="num">169.7</td><td class="num">186.5</td></tr>
+        <tr><td>huippu-RSS</td><td class="num">1.4 GB²</td><td class="num">1.5 GB</td><td class="num">1.8 GB</td><td class="win num">0.6 GB</td></tr>
       </tbody>
     </table></div>
-    <p class="note" style="text-align:left">¹ rustnzb ilmoitti työn valmiiksi ajassa 5m 42s vedettyään
-    186.6 GB (10% enemmän langalla kuin kukaan) mutta jätti <b>täysin tulostiedoston puuttumaan</b>. Se epäonnistui
-    tässä skenaariossa myös edellisellä kierroksella (”121 975 artikkelia puuttuu”, 71 GB orvoksi jäänyt).
-    · ² nzbfastin muisti seuraa sen <em>määritettyä budjettia</em>, ei työtä: tämä osuus ajoi
-    oletusarvoisen autobudjetin; rajattuna <b>1 GB</b>:iin sama 190 GB:n työ valmistuu yhä, noin 22%
-    hitaammin (katso vähämuistiporras alla). Aiemmalla itärannikon kierroksella (~2.4–3 Gbps -linja)
+    <p class="note" style="text-align:left">¹ rustnzb sai tavujen siirron valmiiksi ajassa 5m 42s vedettyään
+    186.5 GB (10% enemmän langalla kuin kukaan), mutta ei jättänyt <b>lainkaan purettua mediaa</b>, sen
+    kolmas peräkkäinen epäonnistunut kierros tällä julkaisulla.
+    · ² nzbfastin muisti seuraa sen <em>määritettyä budjettia</em>, ei työtä: tämä kierros ajoi
+    oletusarvoisen autobudjetin ja huipentui 1.4 GB:iin; tarkoituksella valtava 64 GB:n budjetti ostaa
+    vain 4% (4m 22s), ja rajattuna <b>1 GB</b>:iin sama 190 GB:n työ valmistuu yhä (katso vähämuistiporras
+    alla). Aiemmalla itärannikon kierroksella (~2.4–3 Gbps -linja)
     sama skenaario ajoi 9m 00s vs. NZBGet +30% ja SABnzbd +111%. Ero pitää linjanopeuksien yli.</p>
   </div>
 </section>
@@ -150,7 +151,7 @@
 <section class="alt">
   <div class="wrap">
     <p class="kicker">Rehellinen sarake</p>
-    <h2>Se ainoa osuus, jossa emme voita</h2>
+    <h2>Ne osuudet, joissa emme voita</h2>
     <div class="grid2">
       <div class="card"><h3>Vioittunut store-tilan julkaisu</h3>
         <p>20 myrkytettyä artikkelia 7.4 GB:n REMUXissa: NZBGet valmistuu käyttökelpoiseksi ajassa <b>53 s</b>,
@@ -158,6 +159,12 @@
         tuloste on tavutarkka, ja se hakee lähes teoreettisen minimin verran, 22 palautuslohkoa
         tarvituille 20:lle, NZBGetin täyden PAR2-läpimenon sijaan. Mutta NZBGet vie osuuden viidellä
         sekunnilla, joten tässä se on.</p></div>
+      <div class="card"><h3>Jälleenrakennus pelkistä pareista</h3>
+        <p>Julkaisija poisti jokaisen data-artikkelin ja jätti jäljelle vain 100% redundanssin PAR2-sarjan.
+        Kaikki neljä asiakasta rakentavat koko osasarjan uudelleen pariteetista; NZBGet tekee sen nopeimmin,
+        <b>8 s</b> meidän <b>19 s</b>:aamme vastaan 1.5 GB:n julkaisulla (rustnzb 49 s, SABnzbd 6m 30s).
+        Kokonaisen sarjan rakentaminen tyhjästä on se ainoa korjauksen muoto, jossa virransisäisellä
+        moottorilla ei ole etua.</p></div>
     </div>
     <div class="callout">Miksi näyttää häviötä lainkaan? Koska voitot ovat uskottavia vain sen rinnalla.
     Jokainen luku tällä sivulla tulee samoista lomitetuista ajoista, ja varasto pitää koko aineiston
@@ -188,6 +195,65 @@
     Tyypillisellä kotiyhteydellä pieni budjetti on lähes ilmainen missä tahansa työn koossa.
     NAS-profiili (2 yhteyttä, 256 MB budjetti) sai 35 GB:n työn valmiiksi 0.4 GB:n huippu-
     RSS:ssä. 2 GB:n NAS voi ajaa tämän. Mikään muu asiakas ei tarjoa muistikattoa lainkaan.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">Skenaario 7 · arkistoja arkistojen sisällä</p>
+    <h2>Kymmenen sisäkkäistä muotoa: kuka valmistuu ilman sinua</h2>
+    <p class="lead">Julkaisut saapuvat yhä useammin sisäkkäisinä: RAR RARin sisällä, 7z sujautettuna
+    store-arkistoon, kerrosten tikkaat, salasanaketju. Tämä kierros arvostelee sen, mitä käyttäjälle jää
+    tehtäväksi. <b>auto</b> tarkoittaa, että jokainen hyötykuorma on purettu, tavuidenttinen, käsin
+    koskematta; <b>käsin</b> tarkoittaa, että asiakas ilmoitti onnistumisesta mutta jätti sisemmän
+    arkiston tulostehakemistoon sinun itsesi avattavaksi.</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>muoto</th><th>nzbfast</th><th>SABnzbd</th><th>NZBGet</th><th>rustnzb</th></tr></thead>
+      <tbody>
+        <tr><td>store-RAR store-RARin sisällä</td><td class="win">auto</td><td>auto</td><td class="bad">käsin</td><td class="bad">käsin</td></tr>
+        <tr><td>pakattu RAR store-RARin sisällä</td><td class="win">auto</td><td>auto</td><td class="bad">käsin</td><td class="bad">käsin</td></tr>
+        <tr><td>7z store-RARin sisällä</td><td class="win">auto</td><td>auto</td><td class="bad">käsin</td><td class="bad">käsin</td></tr>
+        <tr><td>5 tason tikkaat, 6 hyötykuormaa</td><td class="win">auto · 6/6</td><td class="bad">käsin · 3/6</td><td class="bad">käsin · 1/6</td><td class="bad">käsin · 1/6</td></tr>
+        <tr><td>salasanaketju, 3 salattua tasoa</td><td class="win">auto · 3/3</td><td class="bad">kysyy salasanaa</td><td class="bad">kysyy salasanaa</td><td class="bad">epäonnistui</td></tr>
+        <tr><td><b>automaattisesti valmiiksi, kaikki kymmenen muotoa</b></td><td class="win"><b>8/10</b></td><td class="num">6/10</td><td class="num">2/10</td><td class="num">2/10</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">Loopback-testipenkki, koneellisesti tuotettu korpus, kaikki
+    neljä asiakasta samalla koneella, arvostelu sisältötiivisteen perusteella, joten hyötykuorman uudelleen
+    nimeävä asiakas saa silti pisteet. Koska sisemmät kerrokset puretaan sisäkkäisyydestään lennossa,
+    nzbfast pitää levyllä yhden ~1.5 GB:n kopion siinä missä kirjoita-ja-pura-asiakkaat pitävät ~3 GB, ja
+    valmistuu näissä osuuksissa 1–2 s:ssa 4–8 s:a vastaan. Salasanaketjussa kunkin kerroksen salasana
+    kulkee tiedostossa, jonka sitä ylempi kerros purkaa: nzbfast lukee sen ja avaa kaikki kolme tasoa;
+    muut pysähtyvät odottamaan, että kirjoitat sen. Ne kaksi muotoa, joita se ei saa automaattisesti
+    valmiiksi, arvostellaan tahallaan ankarasti: oletussyvyysrajan ylittävät 10 tason tikkaat ja julkaisu,
+    joka on vioittunut kaikilla kolmella tasolla. Molemmissa se palauttaa enemmän hyötykuormia kuin
+    yksikään muu asiakas, mutta poistuu nollasta poikkeavalla koodilla sen sijaan, että kutsuisi
+    osittaista työtä onnistumiseksi, joten molemmat lasketaan tässä epäonnistumisiksi.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Komponenttien kaksintaistelut</p>
+    <h2>Purku- ja korjausmoottorit, soolokisassa</h2>
+    <p class="lead">Purku ja PAR2 ovat omaa natiivikoodiamme, joten kilpailutamme ne myös itsenäisinä
+    kenttää vastaan identtisillä korpuksilla. Aika lasketaan vain, kun tuloste on tavuidenttinen
+    lähdehyötykuorman kanssa.</p>
+    <div class="grid2">
+      <div class="card"><h3>RAR-purku · 8 arkistomuotoa</h3>
+        <p>unrar 7.23:a, 7-Zipiä, bsdtaria, unaria ja alkuperäistä rars-cratea vastaan Apple M3 Ultralla
+        nzbfastin purkaja voittaa tai tasaa jokaisen muodon: 400 pientä tiedostoa <b>0.13 s</b> unrarin
+        0.66 s:a vastaan, solid <b>0.50</b> vs. 0.87, salattu <b>0.49</b> vs. 0.82, RAR7-arkisto 128 MB:n
+        sanakirjalla <b>0.71</b> vs. 0.92. Uudelleen ajettuna 14-ytimisellä Intel-kannettavalla marginaalit
+        levenevät: rinnakkaiset dekoodauspolut skaalautuvat lisäsäikeisiin. Jokainen raportoitu aika
+        tuotti sha256-identtisen tulosteen.</p></div>
+      <div class="card"><h3>PAR2-varmistus + korjaus · 1 GiB:n sarja</h3>
+        <p>Klassista par2cmdlinea ja SIMD-haaraa par2cmdline-turboa vastaan: puhdas varmistus
+        <b>0.41 s</b> vs. 0.94 vs. 3.27; 101 vioittuneen lohkon korjaus <b>1.09 s</b> vs. 2.18 vs. 5.94,
+        jokainen korjattu tiedosto tavuidenttinen. Kaksi rehellistä huomiota: emme luo PAR2:ta (lataaja
+        ei sitä tarvitse, ja ParPar omistaa sen osuuden), ja 14-ytimisellä kannettavalla korjauksemme jää
+        turbosta jälkeen (6.24 s vs. 4.04 s): korjauspolku haluaa ison koneen ytimet.</p></div>
+    </div>
   </div>
 </section>
 
@@ -250,7 +316,7 @@
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
     </div>
   </div>
-  <p class="fine">Vertailudata: 19.–20. heinäkuuta 2026 kilpailukierros. Asiakas-
+  <p class="fine">Vertailudata: 19.–24. heinäkuuta 2026 kilpailukierrokset. Asiakas-
   versiot: SABnzbd 5.0.4, NZBGet 26.2 (nzbget.com-haara), rustnzb 1.3.4. Jos jonkin asiakkaan
   uudempi versio muuttaa tulosta olennaisesti, ajamme uudelleen ja päivitämme.</p>
 </div></footer>

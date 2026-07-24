@@ -50,7 +50,7 @@
     <div class="grid2">
       <ul class="feat">
         <li><b>Liukuhihnoitettu NNTP linjanopeudella:</b> <span class="d">8.31 Gbps mitattu 10 GbE:llä.</span></li>
-        <li><b>Yhden läpimenon liukuhihna:</b> <span class="d">dekoodaus, varmistus ja purku limittyvät; RAR-osat eivät koskaan kosketa levyä.</span></li>
+        <li><b>Yhden läpimenon liukuhihna:</b> <span class="d">dekoodaus, varmistus ja purku limittyvät; RAR-osat eivät koskaan kosketa levyä; sisäkkäiset arkistot puretaan samassa läpimenossa.</span></li>
         <li><b>Monen palveluntarjoajan yhdistetty saatavuus:</b> <span class="d">täydellinen palvelimiesi yhdistelmästä, tai keskeytä aikaisin.</span></li>
         <li><b>Muistibudjetti:</b> <span class="d">rajattu RAM, hallittu levylle valuminen, ei koskaan sivuta.</span></li>
         <li><b>Kaatumisvarma jatko:</b> <span class="d">artikkelitason journaali; tapa −9 kesken työn ja se jatkaa siitä, mihin jäi.</span></li>
@@ -98,14 +98,16 @@
         <li><b>Kirjoita kerran.</b> Dekoodatut artikkelit kirjoitetaan (pwrite) suoraan lopullisiin tiedostosiirtymiinsä. Ei väliaikaistiedostoja, ei erillistä kokoamisvaihetta.</li>
         <li><b>Virransisäinen PAR2-varmistus.</b> Jokainen lohko MD5-tiivistetään dekoodauspuskureista sen saapuessa, joten varmistus valmistuu samalla hetkellä kuin lataus. Se päihittää pikatarkistuksen, johon muut asiakkaat tyytyvät, eikä maksa mitään.</li>
         <li><b>Suora purku:</b> store-tilan RAR-julkaisut (useimmat scene-julkaisut) kartoitetaan ja puretaan latauksen aikana, joten osat eivät koskaan päädy levylle. Levykirjoitukset ovat sisältö × 1.0 ja tarvittava levy 1×, siinä missä muut haluavat noin 2×.</li>
+        <li><b>Sisäkkäiset arkistot, yhä yksi läpimeno.</b> Arkistot arkistojen sisällä - RAR RARin sisällä, 7z RARin sisällä, useita tasoja syvät tikkaat - puretaan sisäkkäisyydestään lennossa sen sijaan, että ne kirjoitettaisiin levylle ja avattaisiin uudelleen. Yksi kopio levyllä siinä missä kirjoita-ja-skannaa-uudelleen-lähestymistapa pitää kaksi.</li>
         <li><b>Peittelyn purku.</b> Peitellyt julkaisut nimetään uudelleen niiden PAR2-metatiedoista, ROT13-sekoitetut nimet pelastetaan, ja tiivistenimetty roska luokitellaan ja portitetaan pois.</li>
       </ul>
       <ul class="plain">
         <li><b>Tarkalleen sopiva korjaus.</b> Vioittuneet lohkot tunnetaan heti niiden sattuessa, joten haetaan vain minimitavumäärän verran palautusosia (reppuongelman ratkaisu) ja korjaus koskee vain vioittuneita alueita.</li>
         <li><b>RAR-palautustietueet.</b> Kun PAR2 on käytetty loppuun, tai sitä ei koskaan julkaistu, RAR-osiin upotetut palautustietueet korjaavat vioittuneet osat paikoillaan.</li>
+        <li><b>Korjaus joka syvyydellä.</b> Sisemmän kerroksen sisään pakattu PAR2-sarja löydetään ja ajetaan omalla tasollaan, ja pelkät parit sisältävä julkaisu (data poistettu, jäljellä 100% palautuksen sarja) rakennetaan kokonaan uudelleen ja puretaan sitten.</li>
         <li><b>Pakattu ja salattu varajärjestely:</b> ei-store-julkaisut kirjoittuvat levylle ja puretaan natiivilla RAR-moottorilla, kaikki RAR4:stä uuteen RAR7:ään, muun jonon kanssa limitettynä. Salatut sarjat pysäköidään selkeällä viestillä sen sijaan, että ne kaatuisivat hiljaa.</li>
-        <li><b>Salasanojen käsittely.</b> Salasanat tulevat *arr-API:sta, <code>{{pw}}</code>-tiedostonimikäytännöstä tai NZB-metatiedoista. Lopuille 🔑-lukituksen avaus koontinäytöllä hoitaa homman: se avaa lukituksen taustalla ja arkistoi sitten normaalisti.</li>
-        <li><b>Turvakaiteet.</b> Korjatut lähdeosat kirjoitussuojataan uudelleenpurun ajaksi, ja paluukoodi ilmoittaa ”onnistui” vain kun lopputila on aidosti käyttökelpoinen.</li>
+        <li><b>Salasanojen käsittely.</b> Salasanat tulevat *arr-API:sta, <code>{{pw}}</code>-tiedostonimikäytännöstä tai NZB-metatiedoista. Lopuille 🔑-lukituksen avaus koontinäytöllä hoitaa homman: se avaa lukituksen taustalla ja arkistoi sitten normaalisti. Ketjutetut salasanat ratkeavat itsestään: kun yhden kerroksen purku tuottaa seuraavan kerroksen salasanatiedoston, se luetaan ja otetaan käyttöön automaattisesti.</li>
+        <li><b>Turvakaiteet.</b> Korjatut lähdeosat kirjoitussuojataan uudelleenpurun ajaksi, valmiin tiedoston oma tarkistussumma varmistetaan päästä päähän (oletuksena päällä), ja paluukoodi ilmoittaa ”onnistui” vain kun lopputila on aidosti käyttökelpoinen.</li>
       </ul>
     </div>
   </div>
@@ -167,7 +169,7 @@
     <div style="height:26px"></div>
     <div class="grid2">
       <ul class="plain">
-        <li><b>Jatkuva ryhmäskanneri.</b> Inkrementaaliset OVER-skannaukset ajetaan aikataulusi mukaan nopeudella ~43k otsaketta/s haaroitetuilla yhteyksillä. Ensiskannaukset puolittavat päivämäärävälin, joten <code>--max-age 2y</code> ohittaa vuosien otsakkeet noin 20 luotaimella.</li>
+        <li><b>Jatkuva ryhmäskanneri.</b> Inkrementaaliset OVER-skannaukset ajetaan aikataulusi mukaan nopeudella ~43k otsaketta/s haaroitetuilla yhteyksillä, neuvotellen pakatut otsakkeet (RFC 8054) siellä missä palvelin niitä tarjoaa. Ensiskannaukset puolittavat päivämäärävälin, joten <code>--max-age 2y</code> ohittaa vuosien otsakkeet noin 20 luotaimella.</li>
         <li><b>Sisäänoton portit:</b> tyyppi-, vuosi-, resoluutio-, kieli- ja kokosuodattimet pitävät indeksoijaroskan poissa tietokannastasi, ja peitelty roska havaitaan ja portitetaan oletuksena.</li>
         <li><b>Scene-nimijäsennin.</b> Se poimii nimikkeen, vuoden, jakson, laadun ja lähteen tosielämän rungoista (mukaan lukien päivämääräkoodatut dailyt, moniosakoodit ja ROT13-peitellyt nimet) ja tiivistää julkaisut yhteen korttiin per nimike.</li>
         <li><b>Pikahaku:</b> haku kirjoittaessa laatusuodattimin, rivikohtaisin seurantapainikkein ja laatumerkein kaikkialla.</li>

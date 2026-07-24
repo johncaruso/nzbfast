@@ -50,7 +50,7 @@
     <div class="grid2">
       <ul class="feat">
         <li><b>NNTP en pipeline a velocidad de línea:</b> <span class="d">8.31 Gbps medidos en 10 GbE.</span></li>
-        <li><b>Pipeline de una sola pasada:</b> <span class="d">decodificación, verificación y extracción se solapan; los volúmenes RAR nunca tocan el disco.</span></li>
+        <li><b>Pipeline de una sola pasada:</b> <span class="d">decodificación, verificación y extracción se solapan; los volúmenes RAR nunca tocan el disco; los archivos anidados se desempaquetan en la misma pasada.</span></li>
         <li><b>Disponibilidad por unión de proveedores:</b> <span class="d">completa desde la unión de tus servidores, o aborta a tiempo.</span></li>
         <li><b>Presupuesto de memoria:</b> <span class="d">RAM acotada, desbordamiento controlado a disco, nunca hace swap.</span></li>
         <li><b>Reanudación a prueba de fallos:</b> <span class="d">diario a nivel de artículo; mata el proceso con kill −9 a mitad de trabajo y retoma donde lo dejó.</span></li>
@@ -98,14 +98,16 @@
         <li><b>Escribe una sola vez.</b> Los artículos decodificados se escriben con pwrite directamente en su posición final del archivo. Sin archivos temporales, sin una pasada de ensamblado aparte.</li>
         <li><b>Verificación PAR2 en el flujo.</b> Cada bloque se resume con MD5 desde los búferes de decodificación según llega, así que la verificación acaba en el mismo instante que la descarga. Supera al quick-check con el que se conforman los demás clientes, y no cuesta nada.</li>
         <li><b>Extracción directa:</b> las publicaciones RAR en modo almacenamiento (la mayoría de los lanzamientos de escena) se mapean y se extraen mientras se descargan, así que los volúmenes ni siquiera llegan a tocar el disco. Lo escrito en disco queda en contenido × 1.0 y el disco necesario en 1×, donde otros piden en torno a 2×.</li>
+        <li><b>Archivos anidados, todavía en una sola pasada.</b> Archivos dentro de archivos - RAR dentro de RAR, 7z dentro de un RAR, escaleras de varios niveles de profundidad - se desanidan al vuelo en lugar de escribirse en disco y abrirse de nuevo. Una sola copia en disco donde un enfoque de «escribir y reescanear» mantiene dos.</li>
         <li><b>Desofuscación.</b> Las publicaciones ofuscadas se renombran a partir de sus metadatos PAR2, los nombres revueltos con ROT13 se rescatan y la basura con nombre de hash se clasifica y se descarta.</li>
       </ul>
       <ul class="plain">
         <li><b>Reparación a medida.</b> Los bloques dañados se conocen en el momento en que ocurren, así que solo se obtiene el conjunto de volúmenes de recuperación con el mínimo de bytes -resuelto como un problema de la mochila- y la reparación no toca más que los tramos dañados.</li>
         <li><b>Registros de recuperación RAR.</b> Cuando el PAR2 se agota, o nunca se publicó, los registros de recuperación incrustados en los RAR reparan los volúmenes dañados in situ.</li>
+        <li><b>Reparación a cualquier profundidad.</b> Un conjunto PAR2 empaquetado dentro de una capa interna se encuentra y se ejecuta en su propio nivel, y una publicación de solo PAR (datos borrados, con un conjunto de recuperación al 100% dejado atrás) se reconstruye entera y luego se desempaqueta.</li>
         <li><b>Respaldo para comprimidos y cifrados:</b> las publicaciones que no van en modo almacenamiento se materializan y se desempaquetan con el motor RAR nativo, todo desde RAR4 hasta el nuevo RAR7, solapadas con el resto de la cola. Los conjuntos cifrados se aparcan con un mensaje claro en vez de fallar en silencio.</li>
-        <li><b>Gestión de contraseñas.</b> Las contraseñas vienen de la API de los *arr, de la convención de nombre <code>{{pw}}</code> o de los metadatos del NZB. Para lo que quede, un desbloqueo 🔑 en el panel se encarga del resto: desbloquea en segundo plano y luego archiva con normalidad.</li>
-        <li><b>Barandillas de seguridad.</b> Los volúmenes fuente reparados quedan protegidos contra escritura mientras corre la reextracción, y un código de salida informa de «éxito» solo cuando el estado final es de verdad usable.</li>
+        <li><b>Gestión de contraseñas.</b> Las contraseñas vienen de la API de los *arr, de la convención de nombre <code>{{pw}}</code> o de los metadatos del NZB. Para lo que quede, un desbloqueo 🔑 en el panel se encarga del resto: desbloquea en segundo plano y luego archiva con normalidad. Las contraseñas encadenadas se resuelven solas: cuando la extracción de una capa produce el archivo de contraseña de la capa siguiente, se lee y se usa automáticamente.</li>
+        <li><b>Barandillas de seguridad.</b> Los volúmenes fuente reparados quedan protegidos contra escritura mientras corre la reextracción, la propia suma de comprobación del archivo terminado se verifica de extremo a extremo (activado por defecto), y un código de salida informa de «éxito» solo cuando el estado final es de verdad usable.</li>
       </ul>
     </div>
   </div>
@@ -167,7 +169,7 @@
     <div style="height:26px"></div>
     <div class="grid2">
       <ul class="plain">
-        <li><b>Escáner continuo de grupos.</b> Los escaneos OVER incrementales corren según tu programación a ~43k cabeceras/s repartidos por conexiones en abanico. Los primeros escaneos usan bisección por fecha, así que <code>--max-age 2y</code> se salta años de cabeceras en unas 20 sondas.</li>
+        <li><b>Escáner continuo de grupos.</b> Los escaneos OVER incrementales corren según tu programación a ~43k cabeceras/s repartidos por conexiones en abanico, negociando cabeceras comprimidas (RFC 8054) donde un servidor las ofrece. Los primeros escaneos usan bisección por fecha, así que <code>--max-age 2y</code> se salta años de cabeceras en unas 20 sondas.</li>
         <li><b>Filtros de ingesta:</b> filtros por tipo, año, resolución, idioma y tamaño mantienen el spam de indexador fuera de tu base de datos, y la basura ofuscada se detecta y se descarta por defecto.</li>
         <li><b>Analizador de nombres de escena.</b> Extrae título, año, episodio, calidad y origen de nombres del mundo real -incluidos los programas diarios con fecha codificada, los códigos multiepisodio y los nombres ofuscados con ROT13- y deduplica los lanzamientos hasta una sola tarjeta por título.</li>
         <li><b>Búsqueda instantánea:</b> busca mientras escribes, con filtros de calidad, botones de seguimiento en cada fila y distintivos de calidad por todas partes.</li>

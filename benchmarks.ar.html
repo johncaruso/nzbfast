@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>قياس الأداء - nzbfast</title>
-<meta name="description" content="‏nzbfast مقابل SABnzbd وNZBGet وrustnzb: 4 عملاء × 6 سيناريوهات على عتاد متطابق. نتائج صادقة تشمل الشوط الوحيد الذي لا يفوز به nzbfast، مع خطوات إعادة الإنتاج.">
+<meta name="description" content="‏nzbfast مقابل SABnzbd وNZBGet وrustnzb: 4 عملاء × 7 سيناريوهات على عتاد متطابق. نتائج صادقة تشمل الأشواط التي لا يفوز بها nzbfast، مع خطوات إعادة الإنتاج.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
 <link rel="alternate" hreflang="en" href="benchmarks.html">
@@ -42,9 +42,9 @@
 
 <div class="hero wrap" style="padding-bottom:6px">
   <h1>قياس الأداء</h1>
-  <p class="sub">أربعة عملاء، وستة سيناريوهات، وعتاد ومزوّدون متطابقون، وأشواط
+  <p class="sub">أربعة عملاء، وسبعة سيناريوهات، وعتاد ومزوّدون متطابقون، وأشواط
   متداخلة كي يُلغى انجراف المزوّدين. المقياس هو <b>الزمن حتى ملف قابل للاستخدام</b>:
-  مُنزَّل، متحقَّق منه، مستخرَج. يشمل الشوط الوحيد الذي لا نفوز به.</p>
+  مُنزَّل، متحقَّق منه، مستخرَج. يشمل الأشواط التي لا نفوز بها.</p>
 </div>
 
 <section style="padding-top:26px">
@@ -65,24 +65,25 @@
     <p class="kicker">السيناريو 1 · نظيف، ضخم</p>
     <h2>190.6 GB → ملف mkv واحد بحجم 167.9 GB (أوروبا، 10 GbE)</h2>
     <div class="bars">
-      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:24%"></i></span><span class="t">4m 44s</span></div>
-      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:36%"></i></span><span class="t">7m 06s · +50%</span></div>
-      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 31s · +312%</span></div>
+      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:23%"></i></span><span class="t">4m 33s</span></div>
+      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:41%"></i></span><span class="t">7m 58s · +75%</span></div>
+      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 32s · +329%</span></div>
       <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">بلا خرج¹</span></div>
     </div>
     <div class="tblwrap"><table>
       <thead><tr><th></th><th>nzbfast</th><th>NZBGet 26.2</th><th>SABnzbd 5.0.4</th><th>rustnzb 1.3.4</th></tr></thead>
       <tbody>
-        <tr><td>الزمن حتى ملف قابل للاستخدام</td><td class="win">4m 44s</td><td class="lose">7m 06s (+50%)</td><td class="lose">19m 31s (+312%)</td><td class="bad">لا شيء¹</td></tr>
-        <tr><td>GB على السلك</td><td class="win num">169.3</td><td class="num">169.6</td><td class="num">169.6</td><td class="num">186.6</td></tr>
-        <tr><td>ذروة RSS</td><td class="num">6.8 GB²</td><td class="num">1.8 GB</td><td class="num">1.8 GB</td><td class="win num">0.6 GB</td></tr>
+        <tr><td>الزمن حتى ملف قابل للاستخدام</td><td class="win">4m 33s</td><td class="lose">7m 58s (+75%)</td><td class="lose">19m 32s (+329%)</td><td class="bad">لا شيء¹</td></tr>
+        <tr><td>GB على السلك</td><td class="win num">169.6</td><td class="num">169.8</td><td class="num">169.7</td><td class="num">186.5</td></tr>
+        <tr><td>ذروة RSS</td><td class="num">1.4 GB²</td><td class="num">1.5 GB</td><td class="num">1.8 GB</td><td class="win num">0.6 GB</td></tr>
       </tbody>
     </table></div>
-    <p class="note" style="text-align:start">¹ أبلغ rustnzb عن إنجاز المهمة عند 5m 42s بعد أن سحب
-    186.6 GB (أكثر بـ 10% على السلك من أيّ منافس) لكنه لم يترك <b>أي ملف خرج على الإطلاق</b>. كما أخفق
-    في هذا السيناريو في الشوط السابق ("121,975 مقالة مفقودة"، 71 GB يتيمة).
+    <p class="note" style="text-align:start">¹ أنهى rustnzb نقل البايتات عند 5m 42s بعد أن سحب
+    186.5 GB (أكثر بـ 10% على السلك من أيّ منافس) لكنه لم يترك <b>أي وسائط مستخرجة</b>، وهذا
+    شوطه الفاشل الثالث على التوالي على هذا المنشور.
     · ² تتبع ذاكرة nzbfast <em>ميزانيته المُعدّة</em>، لا المهمة: جرى هذا الشوط بالميزانية
-    التلقائية الافتراضية؛ ومقيَّدًا عند <b>1 GB</b> تكتمل مهمة 190 GB نفسها بعدُ، أبطأ بنحو 22%
+    التلقائية الافتراضية وبلغ ذروة 1.4 GB؛ وميزانية ضخمة عمدًا قدرها 64 GB لا تشتري سوى 4%
+    (4m 22s)، ومقيَّدًا عند <b>1 GB</b> تكتمل مهمة 190 GB نفسها بعدُ
     (انظر سلّم الذاكرة المنخفضة أدناه). في شوط الساحل الشرقي الأسبق (خط ~2.4–3 Gbps) جرى
     السيناريو نفسه في 9m 00s مقابل NZBGet ‏+30% وSABnzbd ‏+111%. الفجوة صامدة عبر سرعات الخطوط.</p>
   </div>
@@ -150,13 +151,18 @@
 <section class="alt">
   <div class="wrap">
     <p class="kicker">العمود الصادق</p>
-    <h2>الشوط الوحيد الذي لا نفوز به</h2>
+    <h2>الأشواط التي لا نفوز بها</h2>
     <div class="grid2">
       <div class="card"><h3>منشور نمط تخزين تالف</h3>
         <p>20 مقالة مسمومة في REMUX بحجم 7.4 GB: يُنهي NZBGet ملفًا قابلًا للاستخدام في <b>53 s</b>،
         وnzbfast في <b>58 s</b>. يكتمل إصلاحنا في 32 s، ويعيد استخراج المجلدات الـ 62 كلها، والخرج
         مطابق بالبايت، كما يجلب 22 كتلة استعادة، وهو حدّ شبه نظري أدنى، لأجل الـ 20 المطلوبة، مقابل
         تمريرة PAR2 الكاملة لدى NZBGet. لكن NZBGet يكسب الشوط بفارق خمس ثوانٍ، فها هو ذا.</p></div>
+      <div class="card"><h3>إعادة بناء من par فقط</h3>
+        <p>حذف الناشر كل مقالات البيانات وترك مجموعة PAR2 بفائض 100% فقط. العملاء الأربعة كلهم
+        يعيدون بناء مجموعة المجلدات كاملة من التكافؤ؛ وNZBGet هو الأسرع، <b>8 s</b> مقابل
+        <b>19 s</b> لدينا على منشور بحجم 1.5 GB (‏rustnzb ‏49 s، وSABnzbd ‏6m 30s). إعادة بناء
+        مجموعة كاملة من لا شيء هي شكل الإصلاح الوحيد الذي لا أفضلية فيه لمحرك يعمل ضمن التدفق.</p></div>
     </div>
     <div class="callout">لماذا نعرض خسارة أصلًا؟ لأن المكاسب لا تكون قابلة للتصديق إلا بجوارها.
     كل رقم على هذه الصفحة يأتي من الأشواط المتداخلة نفسها، ويحتفظ المستودع بالأمر كله بوصفه
@@ -187,6 +193,62 @@
     على اتصال منزلي نموذجي تكون الميزانية الصغيرة شبه مجانية عند أي حجم مهمة. أنهى
     ملفّ NAS (2 اتصال، ميزانية 256 MB) مهمة 35 GB بذروة RSS بمقدار 0.4 GB.
     يستطيع NAS بـ 2 GB تشغيل هذا. لا عميل آخر يقدّم سقف ذاكرة إطلاقًا.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">السيناريو 7 · أرشيفات داخل أرشيفات</p>
+    <h2>عشرة أشكال متداخلة: من يُنهي المهمة من دونك</h2>
+    <p class="lead">المنشورات تصل متداخلة أكثر فأكثر: RAR داخل RAR، و7z مدسوس في أرشيف تخزين،
+    وسلّم من الطبقات، وسلسلة كلمات مرور. هذا الشوط يقيّم ما يتبقى على عاتق المشغّل.
+    <b>تلقائي</b> تعني أن كل حمولة استُخرجت، مطابقةً بالبايت، دون أي تدخّل؛ و<b>يدوي</b> تعني
+    أن العميل أبلغ عن النجاح لكنه ترك أرشيفًا داخليًا جاثمًا في دليل الخرج لتفتحه أنت بنفسك.</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>الشكل</th><th>nzbfast</th><th>SABnzbd</th><th>NZBGet</th><th>rustnzb</th></tr></thead>
+      <tbody>
+        <tr><td>RAR تخزين داخل RAR تخزين</td><td class="win">تلقائي</td><td>تلقائي</td><td class="bad">يدوي</td><td class="bad">يدوي</td></tr>
+        <tr><td>RAR مضغوط داخل RAR تخزين</td><td class="win">تلقائي</td><td>تلقائي</td><td class="bad">يدوي</td><td class="bad">يدوي</td></tr>
+        <tr><td>7z داخل RAR تخزين</td><td class="win">تلقائي</td><td>تلقائي</td><td class="bad">يدوي</td><td class="bad">يدوي</td></tr>
+        <tr><td>سلّم من 5 مستويات، 6 حمولات</td><td class="win">تلقائي · 6/6</td><td class="bad">يدوي · 3/6</td><td class="bad">يدوي · 1/6</td><td class="bad">يدوي · 1/6</td></tr>
+        <tr><td>سلسلة كلمات مرور، 3 مستويات مشفّرة</td><td class="win">تلقائي · 3/3</td><td class="bad">يطلب كلمة مرور</td><td class="bad">يطلب كلمة مرور</td><td class="bad">فشل</td></tr>
+        <tr><td><b>إكمال تلقائي، الأشكال العشرة كلها</b></td><td class="win"><b>8/10</b></td><td class="num">6/10</td><td class="num">2/10</td><td class="num">2/10</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">منصة loopback، ومتن مولَّد آليًا، والعملاء الأربعة
+    كلهم على الآلة نفسها، والتقييم بتجزئة المحتوى، فالعميل الذي يعيد تسمية الحمولة ينال حقه مع
+    ذلك. ولأن الطبقات الداخلية تُفكّ من تداخلها أثناء التدفق، يحتفظ nzbfast بنسخة واحدة نحو
+    1.5 GB على القرص حيث يحتفظ عملاء الكتابة-ثم-الفكّ بنحو 3 GB، ويُنهي هذه الأشواط في
+    1–2 ثانية مقابل 4–8 ثوانٍ. في سلسلة كلمات المرور، تصل كلمة مرور كل طبقة في ملف تستخرجه
+    الطبقة التي فوقها: يقرؤه nzbfast ويفتح المستويات الثلاثة كلها؛ بينما يتوقف الآخرون منتظرين
+    أن تكتبها أنت. أما الشكلان اللذان لا يُكملهما تلقائيًا فيُقيَّمان بقسوة عن قصد: سلّم من
+    10 مستويات يتجاوز حدّ العمق الافتراضي، ومنشور تالف في مستوياته الثلاثة كلها. في كليهما
+    يسترد حمولات أكثر من أي عميل آخر، لكنه يخرج برمز غير صفري بدل أن يسمّي مهمة ناقصة نجاحًا،
+    ولذلك يُحسبان هنا فشلَين.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">مبارزات المكوّنات</p>
+    <h2>محركا الفكّ والإصلاح، في سباق منفرد</h2>
+    <p class="lead">الاستخراج وPAR2 كودنا الأصيل، لذلك نسابقهما أيضًا منفردَين أمام الميدان على
+    متون متطابقة. لا يُحتسب زمن إلا عندما يكون الخرج مطابقًا بالبايت للحمولة المصدر.</p>
+    <div class="grid2">
+      <div class="card"><h3>استخراج RAR · ‏8 أشكال أرشيف</h3>
+        <p>أمام unrar 7.23 و7-Zip وbsdtar وunar وحزمة rars الأصلية على Apple M3 Ultra، يفوز
+        مستخرج nzbfast أو يتعادل في كل شكل: 400 ملف صغير في <b>0.13 s</b> مقابل 0.66 s لدى
+        unrar، وsolid ‏<b>0.50</b> مقابل 0.87، ومشفّر <b>0.49</b> مقابل 0.82، وأرشيف RAR7
+        بقاموس 128 MB ‏<b>0.71</b> مقابل 0.92. وبإعادة التشغيل على حاسوب محمول Intel بـ 14
+        نواة تتسع الفوارق: مسارات فك التشفير المتوازية تتمدد في الخيوط الإضافية. كل زمن
+        مُبلَّغ عنه أنتج خرجًا مطابقًا بـ sha256.</p></div>
+      <div class="card"><h3>تحقق + إصلاح PAR2 · مجموعة 1 GiB</h3>
+        <p>أمام par2cmdline الكلاسيكي وتفريعة SIMD ‏par2cmdline-turbo: تحقق نظيف
+        <b>0.41 s</b> مقابل 0.94 مقابل 3.27؛ وإصلاح 101 كتلة تالفة <b>1.09 s</b> مقابل 2.18
+        مقابل 5.94، وكل ملف مُصلَح مطابق بالبايت. ملاحظتان صادقتان: نحن لا ننشئ PAR2 (لا يحتاج
+        المنزّل إلى ذلك، وهذا الشوط ملك ParPar)، وعلى حاسوب محمول بـ 14 نواة يتخلف إصلاحنا عن
+        turbo (‏6.24 s مقابل 4.04 s): مسار الإصلاح يريد أنوية الآلة الكبيرة.</p></div>
+    </div>
   </div>
 </section>
 
@@ -249,7 +311,7 @@
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
     </div>
   </div>
-  <p class="fine">بيانات قياس الأداء: الشوط التنافسي 19–20 يوليو 2026. إصدارات
+  <p class="fine">بيانات قياس الأداء: الأشواط التنافسية 19–24 يوليو 2026. إصدارات
   العملاء: SABnzbd 5.0.4، NZBGet 26.2 (فرع nzbget.com)، rustnzb 1.3.4. إن غيّرت نسخة أحدث من
   أي عميل نتيجةً تغييرًا جوهريًا، فسنعيد التشغيل ونحدّث.</p>
 </div></footer>

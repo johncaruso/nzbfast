@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>בדיקות ביצועים - nzbfast</title>
-<meta name="description" content="nzbfast מול SABnzbd, NZBGet ו-rustnzb: 4 קליינטים × 6 תרחישים על חומרה זהה. תוצאות כנות כולל המקטע היחיד שבו nzbfast אינו מנצח, עם שלבי שחזור.">
+<meta name="description" content="nzbfast מול SABnzbd, NZBGet ו-rustnzb: 4 קליינטים × 7 תרחישים על חומרה זהה. תוצאות כנות כולל המקטעים שבהם nzbfast אינו מנצח, עם שלבי שחזור.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
 <link rel="alternate" hreflang="en" href="benchmarks.html">
@@ -42,9 +42,9 @@
 
 <div class="hero wrap" style="padding-bottom:6px">
   <h1>בדיקות ביצועים</h1>
-  <p class="sub">ארבעה קליינטים, שישה תרחישים, חומרה וספקים זהים, הרצות
+  <p class="sub">ארבעה קליינטים, שבעה תרחישים, חומרה וספקים זהים, הרצות
   משולבות כך שסחיפת הספק מתקזזת. המדד הוא <b>זמן לקובץ שמיש</b>:
-  מורד, מאומת, מחולץ. כולל את המקטע היחיד שבו איננו מנצחים.</p>
+  מורד, מאומת, מחולץ. כולל את המקטעים שבהם איננו מנצחים.</p>
 </div>
 
 <section style="padding-top:26px">
@@ -65,25 +65,26 @@
     <p class="kicker">תרחיש 1 · נקי, ענק</p>
     <h2>190.6 GB → mkv יחיד של 167.9 GB (אירופה, 10 GbE)</h2>
     <div class="bars">
-      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:24%"></i></span><span class="t">4m 44s</span></div>
-      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:36%"></i></span><span class="t">7m 06s · +50%</span></div>
-      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 31s · +312%</span></div>
+      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:23%"></i></span><span class="t">4m 33s</span></div>
+      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:41%"></i></span><span class="t">7m 58s · +75%</span></div>
+      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 32s · +329%</span></div>
       <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">אין פלט¹</span></div>
     </div>
     <div class="tblwrap"><table>
       <thead><tr><th></th><th>nzbfast</th><th>NZBGet 26.2</th><th>SABnzbd 5.0.4</th><th>rustnzb 1.3.4</th></tr></thead>
       <tbody>
-        <tr><td>זמן לקובץ שמיש</td><td class="win">4m 44s</td><td class="lose">7m 06s (+50%)</td><td class="lose">19m 31s (+312%)</td><td class="bad">אין¹</td></tr>
-        <tr><td>GB על החוט</td><td class="win num">169.3</td><td class="num">169.6</td><td class="num">169.6</td><td class="num">186.6</td></tr>
-        <tr><td>שיא RSS</td><td class="num">6.8 GB²</td><td class="num">1.8 GB</td><td class="num">1.8 GB</td><td class="win num">0.6 GB</td></tr>
+        <tr><td>זמן לקובץ שמיש</td><td class="win">4m 33s</td><td class="lose">7m 58s (+75%)</td><td class="lose">19m 32s (+329%)</td><td class="bad">אין¹</td></tr>
+        <tr><td>GB על החוט</td><td class="win num">169.6</td><td class="num">169.8</td><td class="num">169.7</td><td class="num">186.5</td></tr>
+        <tr><td>שיא RSS</td><td class="num">1.4 GB²</td><td class="num">1.5 GB</td><td class="num">1.8 GB</td><td class="win num">0.6 GB</td></tr>
       </tbody>
     </table></div>
-    <p class="note" style="text-align:start">¹ rustnzb דיווח על סיום המשימה ב-5m 42s לאחר שמשך
-    186.6 GB (‏10% יותר על החוט מכל אחד אחר) אך השאיר <b>שום קובץ פלט בכלל</b>. הוא גם נכשל
-    בתרחיש זה בסבב הקודם ("121,975 מאמרים חסרים", 71 GB יתומים).
-    · ² הזיכרון של nzbfast עוקב אחר <em>התקציב המוגדר</em> שלו, לא אחר המשימה: מקטע זה רץ
-    בתקציב האוטומטי כברירת מחדל; מוגבל ל-<b>1 GB</b> אותה משימת 190 GB עדיין מסתיימת, כ-22%
-    לאט יותר (ראה את סולם הזיכרון-הנמוך למטה). בסבב המוקדם יותר של החוף המזרחי (קו ~2.4–3 Gbps)
+    <p class="note" style="text-align:start">¹ rustnzb סיים להעביר בייטים ב-5m 42s לאחר שמשך
+    186.5 GB (‏10% יותר על החוט מכל אחד אחר) אך השאיר <b>שום מדיה מחולצת</b>, הסבב הכושל
+    השלישי שלו ברציפות על הפוסט הזה.
+    · ² הזיכרון של nzbfast עוקב אחר <em>התקציב המוגדר</em> שלו, לא אחר המשימה: סבב זה רץ
+    בתקציב האוטומטי כברירת מחדל והגיע לשיא של 1.4 GB; תקציב ענק במכוון של 64 GB קונה רק 4%
+    (4m 22s), ומוגבל ל-<b>1 GB</b> אותה משימת 190 GB עדיין מסתיימת (ראה את סולם הזיכרון-הנמוך
+    למטה). בסבב המוקדם יותר של החוף המזרחי (קו ~2.4–3 Gbps)
     אותו תרחיש רץ 9m 00s מול NZBGet ‎+30% ו-SABnzbd ‎+111%. הפער מחזיק לאורך מהירויות קו.</p>
   </div>
 </section>
@@ -150,13 +151,18 @@
 <section class="alt">
   <div class="wrap">
     <p class="kicker">הטור הכן</p>
-    <h2>המקטע היחיד שבו איננו מנצחים</h2>
+    <h2>המקטעים שבהם איננו מנצחים</h2>
     <div class="grid2">
       <div class="card"><h3>פוסט פגום במצב אחסון</h3>
         <p>20 מאמרים מורעלים ב-REMUX של 7.4 GB: NZBGet מסיים שמיש ב-<b>53 s</b>, nzbfast
         ב-<b>58 s</b>. התיקון שלנו מסתיים ב-32 s, מחלץ מחדש את כל 62 הכרכים, והפלט
         מדויק-בייט, והוא מושך מינימום כמעט-תיאורטי של 22 בלוקי שחזור עבור 20 הנדרשים,
         מול מעבר ה-PAR2 המלא של NZBGet. אבל NZBGet לוקח את המקטע בחמש שניות, אז הנה הוא.</p></div>
+      <div class="card"><h3>שחזור מ-par בלבד</h3>
+        <p>המפרסם מחק כל מאמר נתונים והשאיר רק סט PAR2 עם יתירות של 100%. כל ארבעת
+        הקליינטים בונים מחדש את כל סט הכרכים מהזוגיות; NZBGet עושה זאת הכי מהר, <b>8 s</b>
+        מול <b>19 s</b> שלנו על פוסט של 1.5 GB (‏rustnzb ‏49 s, ‏SABnzbd ‏6m 30s). בנייה
+        מחדש של סט שלם מכלום היא צורת התיקון היחידה שבה למנוע בתוך-הזרם אין שום יתרון.</p></div>
     </div>
     <div class="callout">למה בכלל להראות הפסד? כי הניצחונות אמינים רק לצדו.
     כל מספר בעמוד הזה מגיע מאותן הרצות משולבות, והמאגר שומר את כל התמונה
@@ -187,6 +193,62 @@
     בחיבור ביתי טיפוסי תקציב קטן הוא כמעט חינם בכל גודל משימה. פרופיל
     NAS (2 חיבורים, תקציב 256 MB) סיים את משימת ה-35 GB ב-0.4 GB שיא
     RSS. ‏NAS של 2 GB יכול להריץ את זה. שום קליינט אחר לא מציע תקרת זיכרון בכלל.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">תרחיש 7 · ארכיונים בתוך ארכיונים</p>
+    <h2>עשר צורות מקוננות: מי מסיים בלעדיך</h2>
+    <p class="lead">פוסטים מגיעים מקוננים יותר ויותר: RAR בתוך RAR, ‏7z תחוב בארכיון אחסון,
+    סולם של שכבות, שרשרת סיסמאות. הסבב הזה מדרג מה נשאר למפעיל.
+    <b>אוטומטי</b> פירושו שכל מטען חולץ, זהה-בייט, בלי ידיים; <b>ידני</b> פירושו שהקליינט
+    דיווח על הצלחה אך השאיר ארכיון פנימי בתיקיית הפלט כדי שתפתח אותו בעצמך.</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>צורה</th><th>nzbfast</th><th>SABnzbd</th><th>NZBGet</th><th>rustnzb</th></tr></thead>
+      <tbody>
+        <tr><td>RAR אחסון בתוך RAR אחסון</td><td class="win">אוטומטי</td><td>אוטומטי</td><td class="bad">ידני</td><td class="bad">ידני</td></tr>
+        <tr><td>RAR דחוס בתוך RAR אחסון</td><td class="win">אוטומטי</td><td>אוטומטי</td><td class="bad">ידני</td><td class="bad">ידני</td></tr>
+        <tr><td>7z בתוך RAR אחסון</td><td class="win">אוטומטי</td><td>אוטומטי</td><td class="bad">ידני</td><td class="bad">ידני</td></tr>
+        <tr><td>סולם של 5 רמות, 6 מטענים</td><td class="win">אוטומטי · 6/6</td><td class="bad">ידני · 3/6</td><td class="bad">ידני · 1/6</td><td class="bad">ידני · 1/6</td></tr>
+        <tr><td>שרשרת סיסמאות, 3 רמות מוצפנות</td><td class="win">אוטומטי · 3/3</td><td class="bad">מבקש סיסמה</td><td class="bad">מבקש סיסמה</td><td class="bad">נכשל</td></tr>
+        <tr><td><b>השלמה אוטומטית, כל עשר הצורות</b></td><td class="win"><b>8/10</b></td><td class="num">6/10</td><td class="num">2/10</td><td class="num">2/10</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">מתקן loopback, קורפוס שנוצר במכונה, כל ארבעת
+    הקליינטים על אותה מכונה, מדורג לפי גיבוב תוכן, כך שקליינט שמשנה את שם המטען עדיין מקבל
+    קרדיט. מכיוון ששכבות פנימיות נפתחות מהקינון תוך כדי תנועה, nzbfast מחזיק עותק אחד של
+    ‎~1.5 GB על הדיסק במקום שקליינטים של כתוב-ופרוק מחזיקים ‎~3 GB, ומסיים את המקטעים האלה
+    ב-1–2 שניות מול 4–8. בשרשרת הסיסמאות, הסיסמה של כל שכבה מגיעה בקובץ שהשכבה שמעליה
+    מחלצת: nzbfast קורא אותו ופותח את כל שלוש הרמות; האחרים עוצרים ומחכים שתקליד אותה.
+    שתי הצורות שהוא אינו משלים אוטומטית מדורגות בחומרה בכוונה: סולם של 10 רמות מעבר לתקרת
+    העומק המוגדרת כברירת מחדל ופוסט פגום בכל שלוש הרמות. בשתיהן הוא משחזר יותר מטענים מכל
+    קליינט אחר, אך יוצא עם קוד שונה מאפס במקום לקרוא למשימה חלקית הצלחה, ולכן שתיהן נספרות
+    כאן ככישלונות.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">דו-קרב רכיבים</p>
+    <h2>מנועי הפריקה והתיקון, בתחרות סולו</h2>
+    <p class="lead">חילוץ ו-PAR2 הם קוד מקורי שלנו, ולכן אנחנו מריצים אותם גם בנפרד מול
+    השדה על קורפוסים זהים. זמן נספר רק כשהפלט זהה-בייט למטען המקור.</p>
+    <div class="grid2">
+      <div class="card"><h3>חילוץ RAR · ‏8 צורות ארכיון</h3>
+        <p>מול unrar 7.23, ‏7-Zip, ‏bsdtar, ‏unar וחבילת ה-rars במעלה הזרם על Apple M3 Ultra,
+        המחלץ של nzbfast מנצח או משתווה בכל צורה: 400 קבצים קטנים ב-<b>0.13 s</b> מול 0.66 s
+        של unrar, ‏solid ‏<b>0.50</b> מול 0.87, מוצפן <b>0.49</b> מול 0.82, ארכיון RAR7 עם
+        מילון של 128 MB ‏<b>0.71</b> מול 0.92. בהרצה חוזרת על מחשב נייד Intel עם 14 ליבות
+        הפערים מתרחבים: נתיבי הפענוח המקביליים מתרחבים אל תוך החוטים הנוספים. כל זמן שדווח
+        הפיק פלט זהה-sha256.</p></div>
+      <div class="card"><h3>אימות + תיקון PAR2 · סט של 1 GiB</h3>
+        <p>מול par2cmdline הקלאסי ומול פיצול ה-SIMD ‏par2cmdline-turbo: אימות נקי
+        <b>0.41 s</b> מול 0.94 מול 3.27; תיקון 101 בלוקים פגומים <b>1.09 s</b> מול 2.18 מול
+        5.94, כל קובץ מתוקן זהה-בייט. שתי הערות כנות: אנחנו לא יוצרים PAR2 (מוריד לא זקוק
+        לכך, והמקטע הזה שייך ל-ParPar), ועל מחשב נייד עם 14 ליבות התיקון שלנו מפגר אחרי
+        turbo (‏6.24 s מול 4.04 s): נתיב התיקון רוצה את הליבות של המכונה הגדולה.</p></div>
+    </div>
   </div>
 </section>
 
@@ -249,7 +311,7 @@
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
     </div>
   </div>
-  <p class="fine">נתוני בדיקות: סבב תחרותי 19–20 ביולי 2026. גרסאות
+  <p class="fine">נתוני בדיקות: סבבים תחרותיים 19–24 ביולי 2026. גרסאות
   קליינט: SABnzbd 5.0.4, NZBGet 26.2 (fork של nzbget.com), rustnzb 1.3.4. אם גרסה חדשה יותר של
   קליינט כלשהו משנה מהותית תוצאה, נריץ מחדש ונעדכן.</p>
 </div></footer>

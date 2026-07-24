@@ -50,7 +50,7 @@
     <div class="grid2">
       <ul class="feat">
         <li><b>NNTP com pipeline em velocidade de linha:</b> <span class="d">8,31 Gbps medidos em 10 GbE.</span></li>
-        <li><b>Pipeline de passagem única:</b> <span class="d">decodificação, verificação e extração se sobrepõem; volumes RAR nunca tocam o disco.</span></li>
+        <li><b>Pipeline de passagem única:</b> <span class="d">decodificação, verificação e extração se sobrepõem; volumes RAR nunca tocam o disco; arquivos aninhados são desempacotados na mesma passagem.</span></li>
         <li><b>Disponibilidade por união multiprovedor:</b> <span class="d">completa a partir da união dos seus servidores, ou aborta cedo.</span></li>
         <li><b>Orçamento de memória:</b> <span class="d">RAM limitada, spill gradual, nunca faz swap.</span></li>
         <li><b>Retomada à prova de travamento:</b> <span class="d">diário no nível de artigo; dê kill −9 no meio do trabalho e ele retoma de onde parou.</span></li>
@@ -98,14 +98,16 @@
         <li><b>Escreva uma vez.</b> Os artigos decodificados vão de pwrite direto para seus deslocamentos finais no arquivo. Sem arquivos temporários, sem uma passagem de montagem à parte.</li>
         <li><b>Verificação PAR2 no fluxo.</b> Cada bloco tem o MD5 calculado a partir dos buffers de decodificação assim que chega, então a verificação termina no exato momento em que o download termina. Isso supera a verificação rápida com que os outros clientes se contentam, e não custa nada.</li>
         <li><b>Extração direta:</b> publicações RAR em modo armazenamento (a maioria dos lançamentos scene) são mapeadas e extraídas enquanto baixam, de modo que os volumes nunca chegam ao disco. O disco escrito fica em conteúdo × 1,0 e o disco necessário em 1×, ao passo que os outros querem cerca de 2×.</li>
+        <li><b>Arquivos aninhados, ainda em uma passagem.</b> Arquivos dentro de arquivos - RAR em RAR, 7z dentro de RAR, escadas com vários níveis de profundidade - são desaninhados em pleno voo em vez de serem gravados e abertos de novo. Uma cópia no disco onde uma abordagem de gravar e revarrer mantém duas.</li>
         <li><b>Desofuscação.</b> Publicações ofuscadas são renomeadas a partir de seus metadados PAR2, nomes embaralhados por ROT13 são resgatados, e o lixo com nome de hash é classificado e barrado.</li>
       </ul>
       <ul class="plain">
         <li><b>Reparo sob medida.</b> Os blocos danificados são conhecidos no momento em que acontecem, então só o conjunto de volumes de recuperação com menor número de bytes é buscado (um problema da mochila resolvido) e o reparo não toca em nada além dos trechos danificados.</li>
         <li><b>Registros de recuperação do RAR.</b> Quando o PAR2 se esgota, ou nunca foi publicado, os registros de recuperação embutidos no RAR reparam os volumes danificados no próprio lugar.</li>
+        <li><b>Reparo em todas as profundidades.</b> Um conjunto PAR2 embalado dentro de uma camada interna é encontrado e executado no seu próprio nível, e uma publicação só com par (dados apagados, um conjunto de recuperação de 100% deixado para trás) é reconstruída por inteiro e depois desempacotada.</li>
         <li><b>Recurso para comprimidos e criptografados:</b> publicações fora do modo armazenamento se materializam e são extraídas pelo motor RAR nativo, tudo do RAR4 ao novo RAR7, sobrepostas ao resto da fila. Conjuntos criptografados ficam estacionados com uma mensagem clara em vez de falhar em silêncio.</li>
-        <li><b>Tratamento de senhas.</b> As senhas vêm da API dos *arr, da convenção de nome de arquivo <code>{{pw}}</code> ou dos metadados do NZB. Para o que sobrar, um desbloqueio 🔑 no painel assume dali: desbloqueia em segundo plano e depois arquiva normalmente.</li>
-        <li><b>Trilhos de segurança.</b> Os volumes de origem reparados ficam protegidos contra escrita enquanto a reextração roda, e o código de saída só informa "sucesso" quando o estado final é de fato utilizável.</li>
+        <li><b>Tratamento de senhas.</b> As senhas vêm da API dos *arr, da convenção de nome de arquivo <code>{{pw}}</code> ou dos metadados do NZB. Para o que sobrar, um desbloqueio 🔑 no painel assume dali: desbloqueia em segundo plano e depois arquiva normalmente. Senhas encadeadas se resolvem sozinhas: quando a extração de uma camada produz o arquivo de senha da camada seguinte, ele é lido e usado automaticamente.</li>
+        <li><b>Trilhos de segurança.</b> Os volumes de origem reparados ficam protegidos contra escrita enquanto a reextração roda, o checksum do próprio arquivo final é verificado de ponta a ponta (ligado por padrão), e o código de saída só informa "sucesso" quando o estado final é de fato utilizável.</li>
       </ul>
     </div>
   </div>
@@ -167,7 +169,7 @@
     <div style="height:26px"></div>
     <div class="grid2">
       <ul class="plain">
-        <li><b>Varredor contínuo de grupos.</b> Varreduras OVER incrementais rodam no seu horário a ~43 mil cabeçalhos/s em conexões distribuídas. As primeiras varreduras são bissectadas por data, então <code>--max-age 2y</code> pula anos de cabeçalhos em cerca de 20 sondagens.</li>
+        <li><b>Varredor contínuo de grupos.</b> Varreduras OVER incrementais rodam no seu horário a ~43 mil cabeçalhos/s em conexões distribuídas, negociando cabeçalhos comprimidos (RFC 8054) onde um servidor os oferece. As primeiras varreduras são bissectadas por data, então <code>--max-age 2y</code> pula anos de cabeçalhos em cerca de 20 sondagens.</li>
         <li><b>Filtros de ingestão:</b> filtros de tipo, ano, resolução, idioma e tamanho mantêm o spam de indexador fora do seu banco de dados, e o lixo ofuscado é detectado e barrado por padrão.</li>
         <li><b>Parser de nomes scene.</b> Ele extrai título, ano, episódio, qualidade e fonte de radicais do mundo real (incluindo dailies com código de data, códigos de múltiplos episódios e nomes ofuscados por ROT13) e reduz os lançamentos a um cartão por título.</li>
         <li><b>Busca instantânea:</b> busca conforme você digita, com filtros de qualidade, botões de acompanhar em cada linha e emblemas de qualidade por toda parte.</li>

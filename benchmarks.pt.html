@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Benchmarks - nzbfast</title>
-<meta name="description" content="nzbfast vs SABnzbd, NZBGet e rustnzb: 4 clientes × 6 cenários em hardware idêntico. Resultados honestos, incluindo o único leg que o nzbfast não vence, com passos de reprodução.">
+<meta name="description" content="nzbfast vs SABnzbd, NZBGet e rustnzb: 4 clientes × 7 cenários em hardware idêntico. Resultados honestos, incluindo os legs que o nzbfast não vence, com passos de reprodução.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
 <link rel="alternate" hreflang="en" href="benchmarks.html">
@@ -42,9 +42,9 @@
 
 <div class="hero wrap" style="padding-bottom:6px">
   <h1>Benchmarks</h1>
-  <p class="sub">Quatro clientes, seis cenários, hardware e provedores idênticos, execuções
+  <p class="sub">Quatro clientes, sete cenários, hardware e provedores idênticos, execuções
   intercaladas para que a deriva dos provedores se cancele. A métrica é <b>tempo até um arquivo utilizável</b>:
-  baixado, verificado, extraído. Inclui o único leg que não vencemos.</p>
+  baixado, verificado, extraído. Inclui os legs que não vencemos.</p>
 </div>
 
 <section style="padding-top:26px">
@@ -65,25 +65,26 @@
     <p class="kicker">Cenário 1 · limpo, enorme</p>
     <h2>190,6 GB → um único mkv de 167,9 GB (Europa, 10 GbE)</h2>
     <div class="bars">
-      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:24%"></i></span><span class="t">4m 44s</span></div>
-      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:36%"></i></span><span class="t">7m 06s · +50%</span></div>
-      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 31s · +312%</span></div>
+      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:23%"></i></span><span class="t">4m 33s</span></div>
+      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:41%"></i></span><span class="t">7m 58s · +75%</span></div>
+      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 32s · +329%</span></div>
       <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">sem saída¹</span></div>
     </div>
     <div class="tblwrap"><table>
       <thead><tr><th></th><th>nzbfast</th><th>NZBGet 26.2</th><th>SABnzbd 5.0.4</th><th>rustnzb 1.3.4</th></tr></thead>
       <tbody>
-        <tr><td>tempo até arquivo utilizável</td><td class="win">4m 44s</td><td class="lose">7m 06s (+50%)</td><td class="lose">19m 31s (+312%)</td><td class="bad">nenhum¹</td></tr>
-        <tr><td>GB na linha</td><td class="win num">169.3</td><td class="num">169.6</td><td class="num">169.6</td><td class="num">186.6</td></tr>
-        <tr><td>pico de RSS</td><td class="num">6.8 GB²</td><td class="num">1.8 GB</td><td class="num">1.8 GB</td><td class="win num">0.6 GB</td></tr>
+        <tr><td>tempo até arquivo utilizável</td><td class="win">4m 33s</td><td class="lose">7m 58s (+75%)</td><td class="lose">19m 32s (+329%)</td><td class="bad">nenhum¹</td></tr>
+        <tr><td>GB na linha</td><td class="win num">169.6</td><td class="num">169.8</td><td class="num">169.7</td><td class="num">186.5</td></tr>
+        <tr><td>pico de RSS</td><td class="num">1.4 GB²</td><td class="num">1.5 GB</td><td class="num">1.8 GB</td><td class="win num">0.6 GB</td></tr>
       </tbody>
     </table></div>
-    <p class="note" style="text-align:left">¹ o rustnzb informou o trabalho concluído aos 5m 42s tendo puxado
-    186,6 GB (10% mais tráfego que qualquer um) mas deixou <b>nenhum arquivo de saída</b>. Ele também falhou
-    neste cenário na rodada anterior ("121.975 artigos ausentes", 71 GB órfãos).
-    · ² a memória do nzbfast segue seu <em>orçamento configurado</em>, não o trabalho: este leg rodou o
-    orçamento automático padrão; limitado a <b>1 GB</b>, o mesmo trabalho de 190 GB ainda termina, cerca de 22%
-    mais lento (veja a escada de pouca memória abaixo). Na rodada anterior da costa leste (linha de ~2,4–3 Gbps), o
+    <p class="note" style="text-align:left">¹ o rustnzb terminou de mover bytes aos 5m 42s tendo puxado
+    186,5 GB (10% mais tráfego que qualquer um), mas não deixou <b>nenhuma mídia extraída</b>, sua terceira
+    rodada seguida fracassada nesta publicação.
+    · ² a memória do nzbfast segue seu <em>orçamento configurado</em>, não o trabalho: esta rodada rodou o
+    orçamento automático padrão e teve pico de 1,4 GB; um orçamento deliberadamente enorme de 64 GB compra
+    só 4% (4m 22s), e limitado a <b>1 GB</b> o mesmo trabalho de 190 GB ainda termina (veja a escada de
+    pouca memória abaixo). Na rodada anterior da costa leste (linha de ~2,4–3 Gbps), o
     mesmo cenário rodou 9m 00s vs NZBGet +30% e SABnzbd +111%. A diferença se mantém entre velocidades de linha.</p>
   </div>
 </section>
@@ -150,13 +151,19 @@
 <section class="alt">
   <div class="wrap">
     <p class="kicker">A coluna honesta</p>
-    <h2>O único leg que não vencemos</h2>
+    <h2>Os legs que não vencemos</h2>
     <div class="grid2">
       <div class="card"><h3>Publicação danificada em modo armazenamento</h3>
         <p>20 artigos envenenados em um REMUX de 7,4 GB: o NZBGet termina utilizável em <b>53 s</b>, o nzbfast
         em <b>58 s</b>. Nosso reparo conclui em 32 s, reextrai todos os 62 volumes e a saída é byte-exata, e ele
         busca 22 blocos de recuperação, quase o mínimo teórico, para os 20 necessários, contra a passagem PAR2
         completa do NZBGet. Mas o NZBGet leva o leg por cinco segundos, então aqui está ele.</p></div>
+      <div class="card"><h3>Reconstrução só com par</h3>
+        <p>O autor da publicação apagou todos os artigos de dados e deixou apenas um conjunto PAR2 com 100%
+        de redundância. Os quatro clientes reconstroem o conjunto inteiro de volumes a partir da paridade;
+        o NZBGet é o mais rápido, <b>8 s</b> contra os nossos <b>19 s</b> em uma publicação de 1,5 GB
+        (rustnzb 49 s, SABnzbd 6m 30s). Reconstruir um conjunto inteiro do nada é a única forma de reparo
+        em que um motor no fluxo não tem vantagem.</p></div>
     </div>
     <div class="callout">Por que mostrar uma derrota? Porque as vitórias só são críveis ao lado dela.
     Cada número desta página vem das mesmas execuções intercaladas, e o repositório guarda tudo
@@ -187,6 +194,64 @@
     Em uma conexão doméstica típica, um orçamento pequeno é quase de graça em qualquer tamanho de trabalho. Um
     perfil de NAS (2 conexões, orçamento de 256 MB) terminou o trabalho de 35 GB em 0,4 GB de pico de
     RSS. Um NAS de 2 GB consegue rodar isto. Nenhum outro cliente oferece qualquer teto de memória.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">Cenário 7 · arquivos dentro de arquivos</p>
+    <h2>Dez formas aninhadas: quem termina sem você</h2>
+    <p class="lead">As publicações chegam cada vez mais aninhadas: um RAR dentro de um RAR, um 7z enfiado
+    em um arquivo em modo armazenamento, uma escada de camadas, uma cadeia de senhas. Esta rodada avalia o
+    que sobra para o operador. <b>auto</b> significa cada payload extraído, byte-idêntico, sem pôr a mão;
+    <b>manual</b> significa que o cliente informou sucesso, mas deixou um arquivo interno parado no diretório
+    de saída para você mesmo abrir.</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>forma</th><th>nzbfast</th><th>SABnzbd</th><th>NZBGet</th><th>rustnzb</th></tr></thead>
+      <tbody>
+        <tr><td>RAR em modo armazenamento dentro de RAR em modo armazenamento</td><td class="win">auto</td><td>auto</td><td class="bad">manual</td><td class="bad">manual</td></tr>
+        <tr><td>RAR comprimido dentro de RAR em modo armazenamento</td><td class="win">auto</td><td>auto</td><td class="bad">manual</td><td class="bad">manual</td></tr>
+        <tr><td>7z dentro de um RAR em modo armazenamento</td><td class="win">auto</td><td>auto</td><td class="bad">manual</td><td class="bad">manual</td></tr>
+        <tr><td>escada de 5 níveis, 6 payloads</td><td class="win">auto · 6/6</td><td class="bad">manual · 3/6</td><td class="bad">manual · 1/6</td><td class="bad">manual · 1/6</td></tr>
+        <tr><td>cadeia de senhas, 3 níveis criptografados</td><td class="win">auto · 3/3</td><td class="bad">pede uma senha</td><td class="bad">pede uma senha</td><td class="bad">falhou</td></tr>
+        <tr><td><b>conclusão automática, todas as dez formas</b></td><td class="win"><b>8/10</b></td><td class="num">6/10</td><td class="num">2/10</td><td class="num">2/10</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">Bancada em loopback, corpus gerado por máquina, os quatro
+    clientes na mesma máquina, avaliação por hash de conteúdo, de modo que um cliente que renomeia o payload
+    ainda recebe crédito. Como as camadas internas são desaninhadas em pleno voo, o nzbfast mantém uma única
+    cópia de ~1,5 GB no disco onde os clientes que gravam e desempacotam mantêm ~3 GB, e termina esses legs
+    em 1–2 s contra 4–8 s. Na cadeia de senhas, a senha de cada camada vem em um arquivo que a camada acima
+    extrai: o nzbfast a lê e desbloqueia os três níveis; os outros param e esperam você digitá-la. As duas
+    formas que ele não conclui automaticamente são avaliadas com rigor de propósito: uma escada de 10 níveis
+    além do seu limite de profundidade padrão e uma publicação danificada nos três níveis. Em ambas ele
+    recupera mais payloads que qualquer outro cliente, mas sai com código diferente de zero em vez de chamar
+    um trabalho parcial de sucesso, então as duas contam como falhas aqui.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Duelos de componentes</p>
+    <h2>Os motores de extração e reparo, correndo sozinhos</h2>
+    <p class="lead">A extração e o PAR2 são código nativo nosso, então também os corremos isoladamente
+    contra o campo em corpora idênticos. Um tempo só conta quando a saída é byte-idêntica ao payload
+    de origem.</p>
+    <div class="grid2">
+      <div class="card"><h3>Extração RAR · 8 formas de arquivo</h3>
+        <p>Contra unrar 7.23, 7-Zip, bsdtar, unar e o crate rars original em um Apple M3 Ultra, o extrator
+        do nzbfast vence ou empata em todas as formas: 400 arquivos pequenos em <b>0,13 s</b> contra os
+        0,66 s do unrar, sólido <b>0,50</b> vs 0,87, criptografado <b>0,49</b> vs 0,82, um arquivo RAR7
+        com dicionário de 128 MB <b>0,71</b> vs 0,92. Refeito em um laptop Intel de 14 núcleos, as margens
+        aumentam: os caminhos de decodificação paralela escalam para os threads extras. Cada tempo relatado
+        produziu saída sha256-idêntica.</p></div>
+      <div class="card"><h3>Verificação + reparo PAR2 · conjunto de 1 GiB</h3>
+        <p>Contra o par2cmdline clássico e o fork SIMD par2cmdline-turbo: verificação limpa em
+        <b>0,41 s</b> vs 0,94 vs 3,27; reparo de 101 blocos danificados em <b>1,09 s</b> vs 2,18 vs 5,94,
+        cada arquivo reparado byte-idêntico. Duas notas honestas: não criamos PAR2 (um baixador não precisa,
+        e o ParPar é dono desse leg), e em um laptop de 14 núcleos nosso reparo fica atrás do turbo
+        (6,24 s vs 4,04 s): o caminho de reparo quer os núcleos da máquina grande.</p></div>
+    </div>
   </div>
 </section>
 
@@ -249,7 +314,7 @@
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
     </div>
   </div>
-  <p class="fine">Dados de benchmark: rodada competitiva de 19–20 de julho de 2026. Versões
+  <p class="fine">Dados de benchmark: rodadas competitivas de 19–24 de julho de 2026. Versões
   dos clientes: SABnzbd 5.0.4, NZBGet 26.2 (fork nzbget.com), rustnzb 1.3.4. Se uma versão mais nova de
   qualquer cliente mudar materialmente um resultado, vamos refazer e atualizar.</p>
 </div></footer>

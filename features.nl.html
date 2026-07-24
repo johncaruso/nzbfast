@@ -50,7 +50,7 @@
     <div class="grid2">
       <ul class="feat">
         <li><b>Gepipelinede NNTP op lijnsnelheid:</b> <span class="d">8,31 Gbps gemeten op 10 GbE.</span></li>
-        <li><b>One-pass pipeline:</b> <span class="d">decoderen, verifiëren en uitpakken overlappen; RAR-volumes raken de schijf nooit aan.</span></li>
+        <li><b>One-pass pipeline:</b> <span class="d">decoderen, verifiëren en uitpakken overlappen; RAR-volumes raken de schijf nooit aan; geneste archieven pakken uit in dezelfde doorgang.</span></li>
         <li><b>Union-beschikbaarheid over providers:</b> <span class="d">compleet vanuit de unie van al je servers, of vroegtijdig afbreken.</span></li>
         <li><b>Geheugenbudget:</b> <span class="d">begrensd RAM, nette spill naar schijf, swapt nooit.</span></li>
         <li><b>Crashbestendig hervatten:</b> <span class="d">journal op artikelniveau; kill −9 midden in een taak en hij gaat verder waar hij gebleven was.</span></li>
@@ -98,14 +98,16 @@
         <li><b>Eén keer schrijven.</b> Gedecodeerde artikelen gaan met pwrite meteen naar hun definitieve bestandsoffsets. Geen tijdelijke bestanden, geen aparte samenvoegpass.</li>
         <li><b>PAR2-verificatie in de stream.</b> Elk blok wordt bij binnenkomst MD5-gehasht vanuit de decodebuffers, dus de verificatie is klaar op het moment dat de download dat is. Dat verslaat de quick-check waar de andere clients genoegen mee nemen, en het kost niets.</li>
         <li><b>Direct uitpakken:</b> store-mode RAR-posts (de meeste scene-releases) worden tijdens de download gemapt en uitgepakt, dus de volumes belanden helemaal niet op schijf. Het schrijfwerk komt uit op content × 1,0 en de benodigde schijfruimte op 1×, waar anderen grofweg 2× willen.</li>
+        <li><b>Geneste archieven, nog steeds one-pass.</b> Archieven in archieven - RAR in RAR, 7z in een RAR, ladders van meerdere niveaus diep - worden on-the-fly ontnest in plaats van weggeschreven en opnieuw geopend. Eén kopie op schijf waar een aanpak van wegschrijven-en-opnieuw-scannen er twee vasthoudt.</li>
         <li><b>Deobfuscatie.</b> Geobfusceerde posts worden hernoemd op basis van hun PAR2-metadata, ROT13-verhaspelde namen worden gered, en hash-genaamde rommel wordt geclassificeerd en tegengehouden.</li>
       </ul>
       <ul class="plain">
         <li><b>Exact passend herstel.</b> Beschadigde blokken zijn bekend zodra ze optreden, dus alleen de byte-minimale set recovery-volumes wordt opgehaald (een knapsack-oplossing) en het herstel raakt niets anders aan dan de beschadigde stukken.</li>
         <li><b>RAR-recovery-records.</b> Als de PAR2 op is, of nooit is gepost, repareren de in de RARs ingebedde recovery-records beschadigde volumes ter plekke.</li>
+        <li><b>Herstel op elke diepte.</b> Een PAR2-set die in een binnenste laag zit ingepakt wordt gevonden en op zijn eigen niveau uitgevoerd, en een par-only post (data verwijderd, alleen een recovery-set met 100% dekking achtergelaten) wordt in zijn geheel herbouwd en daarna uitgepakt.</li>
         <li><b>Fallback voor gecomprimeerd en versleuteld:</b> niet-store-posts worden op schijf gezet en uitgepakt via de native RAR-engine, alles van RAR4 tot het nieuwe RAR7, overlappend met de rest van de wachtrij. Versleutelde sets worden geparkeerd met een duidelijke melding in plaats van stilletjes te mislukken.</li>
-        <li><b>Wachtwoordafhandeling.</b> Wachtwoorden komen uit de *arr-API, de <code>{{pw}}</code>-bestandsnaamconventie of NZB-metadata. Voor al het overige neemt een 🔑-ontgrendeling op het dashboard het over: hij ontgrendelt op de achtergrond en bergt daarna gewoon op.</li>
-        <li><b>Vangrails.</b> Herstelde bronvolumes zijn schrijfbeveiligd terwijl het opnieuw uitpakken loopt, en een exitcode meldt pas "succes" als het eindresultaat echt bruikbaar is.</li>
+        <li><b>Wachtwoordafhandeling.</b> Wachtwoorden komen uit de *arr-API, de <code>{{pw}}</code>-bestandsnaamconventie of NZB-metadata. Voor al het overige neemt een 🔑-ontgrendeling op het dashboard het over: hij ontgrendelt op de achtergrond en bergt daarna gewoon op. Geketende wachtwoorden lossen zichzelf op: als het uitpakken van de ene laag het wachtwoordbestand van de volgende laag oplevert, wordt dat automatisch gelezen en gebruikt.</li>
+        <li><b>Vangrails.</b> Herstelde bronvolumes zijn schrijfbeveiligd terwijl het opnieuw uitpakken loopt, de eigen checksum van het voltooide bestand wordt end-to-end geverifieerd (standaard aan), en een exitcode meldt pas "succes" als het eindresultaat echt bruikbaar is.</li>
       </ul>
     </div>
   </div>
@@ -167,7 +169,7 @@
     <div style="height:26px"></div>
     <div class="grid2">
       <ul class="plain">
-        <li><b>Continue groepsscanner.</b> Incrementele OVER-scans draaien op jouw schema met ~43k headers/s over uitgewaaierde verbindingen. Eerste scans gaan met datum-bisectie, dus <code>--max-age 2y</code> slaat jaren aan headers over in zo'n 20 probes.</li>
+        <li><b>Continue groepsscanner.</b> Incrementele OVER-scans draaien op jouw schema met ~43k headers/s over uitgewaaierde verbindingen, waarbij gecomprimeerde headers (RFC 8054) worden bedongen waar een server ze aanbiedt. Eerste scans gaan met datum-bisectie, dus <code>--max-age 2y</code> slaat jaren aan headers over in zo'n 20 probes.</li>
         <li><b>Ingest-filters:</b> filters op soort, jaar, resolutie, taal en grootte houden indexerspam uit je database, en geobfusceerde rommel wordt standaard opgevangen en tegengehouden.</li>
         <li><b>Scene-naamparser.</b> Hij haalt titel, jaar, aflevering, kwaliteit en bron uit echte releasenamen (dailies met datumcode, multi-afleveringscodes en ROT13-verhaspelde namen incluis) en dedupliceert releases tot één kaart per titel.</li>
         <li><b>Direct zoeken:</b> zoeken terwijl je typt, met kwaliteitsfilters, een volgknop per rij en overal kwaliteitsbadges.</li>

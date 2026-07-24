@@ -50,7 +50,7 @@
     <div class="grid2">
       <ul class="feat">
         <li><b>Hat hızında işlem hattı NNTP:</b> <span class="d">10 GbE'de 8.31 Gbps ölçüldü.</span></li>
-        <li><b>Tek geçişli işlem hattı:</b> <span class="d">kod çözme, doğrulama ve çıkarma örtüşür; RAR birimleri diske hiç dokunmaz.</span></li>
+        <li><b>Tek geçişli işlem hattı:</b> <span class="d">kod çözme, doğrulama ve çıkarma örtüşür; RAR birimleri diske hiç dokunmaz; iç içe arşivler aynı geçişte açılır.</span></li>
         <li><b>Çoklu sağlayıcı birleşim kullanılabilirliği:</b> <span class="d">sunucularının birleşiminden tamamla ya da erken durdur.</span></li>
         <li><b>Bellek bütçesi:</b> <span class="d">sınırlı RAM, nazik dökülme, asla takas yok.</span></li>
         <li><b>Çökmeye dayanıklı sürdürme:</b> <span class="d">makale düzeyinde günlük; iş ortasında kill −9 ve kaldığı yerden devam eder.</span></li>
@@ -98,14 +98,16 @@
         <li><b>Bir kez yaz.</b> Kodu çözülen makaleler doğrudan son dosya ofsetlerine pwrite edilir. Geçici dosya yok, ayrı bir birleştirme geçişi yok.</li>
         <li><b>Akış içi PAR2 doğrulaması.</b> Her blok geldikçe kod çözme tamponlarından MD5 ile özetlenir, böylece doğrulama tam indirmeyle aynı anda biter. Bu, diğer istemcilerin yetindiği hızlı denetimi geride bırakır ve hiçbir maliyeti yoktur.</li>
         <li><b>Doğrudan çıkarma:</b> depolama modu RAR gönderileri (çoğu scene sürümü) indirilirken haritalanıp çıkarılır, dolayısıyla birimler diske hiç düşmez. Diske yazılan içerik × 1.0'a, gereken disk ise 1×'e iner; diğerleri kabaca 2× ister.</li>
+        <li><b>İç içe arşivler, yine tek geçiş.</b> Arşiv içindeki arşivler - RAR içinde RAR, RAR içinde 7z, birkaç düzey derinlikte merdivenler - diske yazılıp yeniden açılmak yerine akış sırasında iç içelikten çözülür. Yaz-ve-yeniden-tara yaklaşımının iki kopya tuttuğu yerde diskte tek kopya.</li>
         <li><b>Gizleme çözme.</b> Gizlenmiş gönderiler PAR2 meta verilerinden yeniden adlandırılır, ROT13 ile karıştırılmış adlar kurtarılır, hash adlı çöp ise sınıflandırılıp elenir.</li>
       </ul>
       <ul class="plain">
         <li><b>Tam-oturan onarım.</b> Hasarlı bloklar oluştukları anda bilinir, bu yüzden yalnızca kurtarma birimlerinin en az baytlı kümesi getirilir (bir sırt çantası çözümü) ve onarım hasarlı aralıklardan başka hiçbir şeye dokunmaz.</li>
         <li><b>RAR kurtarma kayıtları.</b> PAR2 tükendiğinde ya da hiç gönderilmediğinde, gömülü RAR kurtarma kayıtları hasarlı birimleri yerinde onarır.</li>
+        <li><b>Her derinlikte onarım.</b> Bir iç katmana paketlenmiş bir PAR2 kümesi bulunur ve kendi düzeyinde çalıştırılır; yalnızca par içeren bir gönderi (verisi silinmiş, geriye %100 kurtarmalı bir küme bırakılmış) ise önce bütünüyle yeniden kurulur, sonra açılır.</li>
         <li><b>Sıkıştırılmış ve şifreli için yedek yol:</b> depolama modu olmayan gönderiler, kuyruğun geri kalanıyla örtüşerek yerleşik RAR motoru üzerinden - RAR4'ten yeni RAR7'ye kadar her şey - gerçekleşip açılır. Şifreli kümeler sessizce başarısız olmak yerine açık bir mesajla park eder.</li>
-        <li><b>Parola işleme.</b> Parolalar *arr API'sinden, <code>{{pw}}</code> dosya adı geleneğinden ya da NZB meta verisinden gelir. Geriye kalanlar için paneldeki bir 🔑 kilit açma devreye girer: arka planda kilidi açar, sonra normal şekilde dosyalar.</li>
-        <li><b>Güvenlik korkulukları.</b> Onarılan kaynak birimleri yeniden çıkarma çalışırken yazmaya karşı korunur ve bir çıkış kodu ancak son durum gerçekten kullanılabilir olduğunda "başarı" bildirir.</li>
+        <li><b>Parola işleme.</b> Parolalar *arr API'sinden, <code>{{pw}}</code> dosya adı geleneğinden ya da NZB meta verisinden gelir. Geriye kalanlar için paneldeki bir 🔑 kilit açma devreye girer: arka planda kilidi açar, sonra normal şekilde dosyalar. Zincirlenmiş parolalar kendi kendine çözülür: bir katmanın çıkarılması bir sonraki katmanın parola dosyasını ürettiğinde, dosya otomatik olarak okunup kullanılır.</li>
+        <li><b>Güvenlik korkulukları.</b> Onarılan kaynak birimleri yeniden çıkarma çalışırken yazmaya karşı korunur, biten dosyanın kendi sağlama toplamı uçtan uca doğrulanır (varsayılan olarak açık) ve bir çıkış kodu ancak son durum gerçekten kullanılabilir olduğunda "başarı" bildirir.</li>
       </ul>
     </div>
   </div>
@@ -167,7 +169,7 @@
     <div style="height:26px"></div>
     <div class="grid2">
       <ul class="plain">
-        <li><b>Sürekli grup tarayıcısı.</b> Artımlı OVER taramaları, senin belirlediğin zamanlamada, dağıtılmış bağlantılar üzerinden saniyede ~43 bin başlık hızıyla çalışır. İlk taramalar tarihe göre ikiye bölünür, böylece <code>--max-age 2y</code> yıllarca süren başlığı yaklaşık 20 yoklamada atlar.</li>
+        <li><b>Sürekli grup tarayıcısı.</b> Artımlı OVER taramaları, senin belirlediğin zamanlamada, dağıtılmış bağlantılar üzerinden saniyede ~43 bin başlık hızıyla çalışır ve bir sunucu sunduğunda sıkıştırılmış başlıklar (RFC 8054) üzerinde anlaşır. İlk taramalar tarihe göre ikiye bölünür, böylece <code>--max-age 2y</code> yıllarca süren başlığı yaklaşık 20 yoklamada atlar.</li>
         <li><b>Alım geçitleri:</b> tür, yıl, çözünürlük, dil ve boyut filtreleri dizinleyici spam'ini veritabanından uzak tutar; gizlenmiş çöp ise varsayılan olarak yakalanıp elenir.</li>
         <li><b>Scene adı ayrıştırıcısı.</b> Gerçek dünyadaki köklerden başlık, yıl, bölüm, kalite ve kaynağı çekip çıkarır (tarih kodlu günlükler, çok bölümlü kodlar ve ROT13 ile gizlenmiş adlar dahil) ve sürümleri başlık başına tek bir karta indirger.</li>
         <li><b>Anlık arama:</b> kalite filtreleri, satır başına izle düğmeleri ve her yerde kalite rozetleriyle, yazdıkça arama.</li>

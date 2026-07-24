@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Kıyaslamalar - nzbfast</title>
-<meta name="description" content="nzbfast vs SABnzbd, NZBGet ve rustnzb: özdeş donanımda 4 istemci × 6 senaryo. nzbfast'in kazanamadığı tek ayak dahil dürüst sonuçlar, yeniden üretim adımlarıyla.">
+<meta name="description" content="nzbfast vs SABnzbd, NZBGet ve rustnzb: özdeş donanımda 4 istemci × 7 senaryo. nzbfast'in kazanamadığı ayaklar dahil dürüst sonuçlar, yeniden üretim adımlarıyla.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
 <link rel="alternate" hreflang="en" href="benchmarks.html">
@@ -42,9 +42,9 @@
 
 <div class="hero wrap" style="padding-bottom:6px">
   <h1>Kıyaslamalar</h1>
-  <p class="sub">Dört istemci, altı senaryo, özdeş donanım ve sağlayıcılar; sağlayıcı
+  <p class="sub">Dört istemci, yedi senaryo, özdeş donanım ve sağlayıcılar; sağlayıcı
   kayması birbirini götürsün diye iç içe çalıştırmalar. Ölçüt, <b>kullanılabilir bir
-  dosyaya geçen süre</b>: indirildi, doğrulandı, çıkarıldı. Kazanamadığımız tek ayak da dahil.</p>
+  dosyaya geçen süre</b>: indirildi, doğrulandı, çıkarıldı. Kazanamadığımız ayaklar da dahil.</p>
 </div>
 
 <section style="padding-top:26px">
@@ -65,25 +65,26 @@
     <p class="kicker">Senaryo 1 · temiz, devasa</p>
     <h2>190.6 GB → tek 167.9 GB mkv (Avrupa, 10 GbE)</h2>
     <div class="bars">
-      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:24%"></i></span><span class="t">4m 44s</span></div>
-      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:36%"></i></span><span class="t">7m 06s · +50%</span></div>
-      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 31s · +312%</span></div>
+      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:23%"></i></span><span class="t">4m 33s</span></div>
+      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:41%"></i></span><span class="t">7m 58s · +75%</span></div>
+      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 32s · +329%</span></div>
       <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">çıktı yok¹</span></div>
     </div>
     <div class="tblwrap"><table>
       <thead><tr><th></th><th>nzbfast</th><th>NZBGet 26.2</th><th>SABnzbd 5.0.4</th><th>rustnzb 1.3.4</th></tr></thead>
       <tbody>
-        <tr><td>kullanılabilir dosyaya süre</td><td class="win">4m 44s</td><td class="lose">7m 06s (+50%)</td><td class="lose">19m 31s (+312%)</td><td class="bad">yok¹</td></tr>
-        <tr><td>hattaki GB</td><td class="win num">169.3</td><td class="num">169.6</td><td class="num">169.6</td><td class="num">186.6</td></tr>
-        <tr><td>zirve RSS</td><td class="num">6.8 GB²</td><td class="num">1.8 GB</td><td class="num">1.8 GB</td><td class="win num">0.6 GB</td></tr>
+        <tr><td>kullanılabilir dosyaya süre</td><td class="win">4m 33s</td><td class="lose">7m 58s (+75%)</td><td class="lose">19m 32s (+329%)</td><td class="bad">yok¹</td></tr>
+        <tr><td>hattaki GB</td><td class="win num">169.6</td><td class="num">169.8</td><td class="num">169.7</td><td class="num">186.5</td></tr>
+        <tr><td>zirve RSS</td><td class="num">1.4 GB²</td><td class="num">1.5 GB</td><td class="num">1.8 GB</td><td class="win num">0.6 GB</td></tr>
       </tbody>
     </table></div>
-    <p class="note" style="text-align:left">¹ rustnzb işi 5m 42s'de bitmiş bildirdi ve
-    186.6 GB çekti (herkesten %10 daha fazla hat) ama <b>hiç çıktı dosyası bırakmadı</b>. Önceki
-    turda da bu senaryoda başarısız oldu ("121,975 makale eksik", 71 GB öksüz kaldı).
-    · ² nzbfast'in belleği işi değil, <em>yapılandırılmış bütçesini</em> izler: bu ayak varsayılan
-    otomatik bütçeyi çalıştırdı; <b>1 GB</b>'a kelepçelendiğinde aynı 190 GB'lık iş yine tamamlanır,
-    yaklaşık %22 daha yavaş (aşağıdaki az bellek merdivenine bak). Daha önceki Doğu Yakası turunda
+    <p class="note" style="text-align:left">¹ rustnzb baytları taşımayı 5m 42s'de bitirdi,
+    186.5 GB çekmişti (herkesten %10 daha fazla hat) ama <b>hiç çıkarılmış medya bırakmadı</b>;
+    bu gönderideki üst üste üçüncü başarısız turu.
+    · ² nzbfast'in belleği işi değil, <em>yapılandırılmış bütçesini</em> izler: bu tur varsayılan
+    otomatik bütçeyle çalıştı ve 1.4 GB'ta zirve yaptı; kasten devasa tutulmuş bir 64 GB bütçe
+    yalnızca %4 kazandırır (4m 22s) ve <b>1 GB</b>'a kelepçelendiğinde aynı 190 GB'lık iş yine
+    tamamlanır (aşağıdaki az bellek merdivenine bak). Daha önceki Doğu Yakası turunda
     (~2.4–3 Gbps hat) aynı senaryo NZBGet +%30 ve SABnzbd +%111'e karşı 9m 00s çalıştı. Fark hat
     hızları boyunca korunur.</p>
   </div>
@@ -152,7 +153,7 @@
 <section class="alt">
   <div class="wrap">
     <p class="kicker">Dürüst sütun</p>
-    <h2>Kazanamadığımız tek ayak</h2>
+    <h2>Kazanamadığımız ayaklar</h2>
     <div class="grid2">
       <div class="card"><h3>Hasarlı depolama modu gönderisi</h3>
         <p>7.4 GB'lık bir REMUX'ta 20 zehirlenmiş makale: NZBGet kullanılabilir dosyayı <b>53 s</b>'de,
@@ -160,6 +161,12 @@
         çıkarır ve çıktı bayt kesinliğindedir, üstelik NZBGet'in tam PAR2 geçişine karşılık, gereken
         20 blok için kuramsal en aza yakın 22 kurtarma bloğu çeker. Ama NZBGet ayağı beş saniye farkla
         alıyor, işte burada.</p></div>
+      <div class="card"><h3>Yalnızca par'dan yeniden kurma</h3>
+        <p>Gönderici her veri makalesini silmiş ve geriye yalnızca %100 fazlalıklı bir PAR2 kümesi
+        bırakmış. Dört istemcinin dördü de bütün birim kümesini pariteden yeniden kurar; en hızlısı
+        NZBGet: 1.5 GB'lık bir gönderide bizim <b>19 s</b>'mize karşı <b>8 s</b> (rustnzb 49 s,
+        SABnzbd 6m 30s). Bir kümenin tamamını hiç yoktan yeniden kurmak, akış içi bir motorun
+        hiçbir üstünlük taşımadığı tek onarım biçimi.</p></div>
     </div>
     <div class="callout">Neden bir kaybı hiç gösterelim ki? Çünkü kazanımlar ancak onun yanında
     inandırıcıdır. Bu sayfadaki her rakam aynı iç içe çalıştırmalardan gelir ve depo bütün süreci
@@ -190,6 +197,66 @@
     Tipik bir ev bağlantısında küçük bir bütçe herhangi bir iş boyutunda neredeyse bedavadır. Bir
     NAS profili (2 bağlantı, 256 MB bütçe) 35 GB'lık işi 0.4 GB zirve RSS'te bitirdi. Bir 2 GB NAS
     bunu çalıştırabilir. Başka hiçbir istemci bir bellek tavanı sunmaz bile.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">Senaryo 7 · arşiv içinde arşivler</p>
+    <h2>On iç içe biçim: kim sensiz bitiriyor</h2>
+    <p class="lead">Gönderiler giderek daha sık iç içe geliyor: RAR içinde bir RAR, bir depolama
+    arşivine sokulmuş bir 7z, katmanlardan bir merdiven, bir parola zinciri. Bu tur, operatöre ne
+    kaldığını notlandırır. <b>otomatik</b>, her yükün elle hiç dokunulmadan, bayt bayt özdeş
+    biçimde çıkarıldığı anlamına gelir; <b>manuel</b> ise istemcinin başarı bildirdiği ama çıktı
+    dizininde kendin açasın diye bir iç arşiv bıraktığı anlamına gelir.</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>biçim</th><th>nzbfast</th><th>SABnzbd</th><th>NZBGet</th><th>rustnzb</th></tr></thead>
+      <tbody>
+        <tr><td>depolama RAR içinde depolama RAR</td><td class="win">otomatik</td><td>otomatik</td><td class="bad">manuel</td><td class="bad">manuel</td></tr>
+        <tr><td>depolama RAR içinde sıkıştırılmış RAR</td><td class="win">otomatik</td><td>otomatik</td><td class="bad">manuel</td><td class="bad">manuel</td></tr>
+        <tr><td>depolama RAR içinde 7z</td><td class="win">otomatik</td><td>otomatik</td><td class="bad">manuel</td><td class="bad">manuel</td></tr>
+        <tr><td>5 düzeyli merdiven, 6 yük</td><td class="win">otomatik · 6/6</td><td class="bad">manuel · 3/6</td><td class="bad">manuel · 1/6</td><td class="bad">manuel · 1/6</td></tr>
+        <tr><td>parola zinciri, 3 şifreli düzey</td><td class="win">otomatik · 3/3</td><td class="bad">parola soruyor</td><td class="bad">parola soruyor</td><td class="bad">başarısız</td></tr>
+        <tr><td><b>otomatik tamamlama, on biçimin hepsi</b></td><td class="win"><b>8/10</b></td><td class="num">6/10</td><td class="num">2/10</td><td class="num">2/10</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">Geri döngü düzeneği, makine üretimi derlem, dört
+    istemci de aynı makinede, içerik özetine göre notlandırıldı; böylece yükü yeniden adlandıran
+    bir istemci de hakkını alır. İç katmanlar akış sırasında iç içelikten çözüldüğü için nzbfast
+    diskte ~1.5 GB'lık tek bir kopya tutar; yaz-ve-aç istemcileri ~3 GB tutar ve nzbfast bu ayakları
+    4–8 sn'ye karşı 1–2 sn'de bitirir. Parola zincirinde her katmanın parolası, bir üstteki katmanın
+    çıkardığı bir dosyada gelir: nzbfast onu okur ve üç düzeyin de kilidini açar; diğerleri durup
+    senin yazmanı bekler. Otomatik tamamlayamadığı iki biçim bilerek sert notlandırıldı: varsayılan
+    derinlik sınırının ötesindeki 10 düzeyli bir merdiven ve üç düzeyin üçünde de hasarlı bir
+    gönderi. Her ikisinde de diğer tüm istemcilerden daha fazla yük kurtarır ama yarım kalmış bir
+    işe başarı demek yerine sıfırdan farklı bir kodla çıkar; bu yüzden ikisi de burada başarısız
+    sayılır.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Bileşen düelloları</p>
+    <h2>Açma ve onarım motorları, tek başına yarıştırıldı</h2>
+    <p class="lead">Çıkarma ve PAR2 bizim kendi yerel kodumuz, bu yüzden onları özdeş derlemler
+    üzerinde alandaki rakiplere karşı tek başına da yarıştırıyoruz. Bir süre ancak çıktı kaynak
+    yüke bayt bayt özdeş olduğunda sayılır.</p>
+    <div class="grid2">
+      <div class="card"><h3>RAR çıkarma · 8 arşiv biçimi</h3>
+        <p>Bir Apple M3 Ultra'da unrar 7.23, 7-Zip, bsdtar, unar ve akış yukarı rars crate'ine
+        karşı nzbfast'in çıkarıcısı her biçimi kazanır ya da berabere kalır: 400 küçük dosya
+        unrar'ın 0.66 s'sine karşı <b>0.13 s</b>, solid <b>0.50</b>'ye 0.87, şifreli <b>0.49</b>'a
+        0.82, 128 MB sözlüklü bir RAR7 arşivi <b>0.71</b>'e 0.92. 14 çekirdekli bir Intel
+        dizüstünde yeniden çalıştırıldığında farklar açılır: paralel kod çözme yolları fazladan iş
+        parçacıklarına ölçeklenir. Bildirilen her süre sha256 özdeş çıktı üretti.</p></div>
+      <div class="card"><h3>PAR2 doğrulama + onarım · 1 GiB küme</h3>
+        <p>Klasik par2cmdline'a ve SIMD'li par2cmdline-turbo çatalına karşı: temiz doğrulama
+        <b>0.41 s</b>'ye karşı 0.94 ve 3.27; 101 hasarlı bloğun onarımı <b>1.09 s</b>'ye karşı
+        2.18 ve 5.94, onarılan her dosya bayt bayt özdeş. İki dürüst not: PAR2 üretmiyoruz (bir
+        indiricinin buna ihtiyacı yok ve o ayak ParPar'ın) ve 14 çekirdekli bir dizüstünde
+        onarımımız turbo'nun gerisinde kalıyor (6.24 s'ye karşı 4.04 s): onarım yolu büyük
+        makinenin çekirdeklerini istiyor.</p></div>
+    </div>
   </div>
 </section>
 
@@ -252,7 +319,7 @@
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
     </div>
   </div>
-  <p class="fine">Kıyaslama verisi: 19–20 Temmuz 2026 rekabet turu. İstemci
+  <p class="fine">Kıyaslama verisi: 19–24 Temmuz 2026 rekabet turları. İstemci
   sürümleri: SABnzbd 5.0.4, NZBGet 26.2 (nzbget.com çatalı), rustnzb 1.3.4. Herhangi bir istemcinin
   daha yeni bir sürümü bir sonucu esaslı biçimde değiştirirse, yeniden çalıştırıp güncelleriz.</p>
 </div></footer>

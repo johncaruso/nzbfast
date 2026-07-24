@@ -50,7 +50,7 @@
     <div class="grid2">
       <ul class="feat">
         <li><b>Pipelined NNTP at line rate:</b> <span class="d">8.31 Gbps measured on 10 GbE.</span></li>
-        <li><b>One-pass pipeline:</b> <span class="d">decode, verify and extract overlap; RAR volumes never touch disk.</span></li>
+        <li><b>One-pass pipeline:</b> <span class="d">decode, verify and extract overlap; RAR volumes never touch disk; nested archives unpack in the same pass.</span></li>
         <li><b>Multi-provider union availability:</b> <span class="d">complete from the union of your servers, or abort early.</span></li>
         <li><b>Memory budget:</b> <span class="d">bounded RAM, graceful spill, never swaps.</span></li>
         <li><b>Crash-safe resume:</b> <span class="d">article-level journal; kill −9 mid-job and it picks up where it left off.</span></li>
@@ -98,14 +98,16 @@
         <li><b>Write once.</b> Decoded articles are pwritten straight to their final file offsets. No temp files, no separate assembly pass.</li>
         <li><b>In-stream PAR2 verification.</b> Every block is MD5-hashed from the decode buffers as it arrives, so verification finishes the moment the download does. That beats the quick-check the other clients settle for, and it costs nothing.</li>
         <li><b>Direct extraction:</b> store-mode RAR posts (most scene releases) are mapped and extracted while they download, so the volumes never land on disk at all. Disk written comes to content × 1.0 and disk needed to 1×, where others want roughly 2×.</li>
+        <li><b>Nested archives, still one pass.</b> Archives inside archives - RAR in RAR, 7z inside RAR, ladders several levels deep - are denested on the fly instead of being written out and opened again. One copy on disk where a write-out-and-rescan approach holds two.</li>
         <li><b>Deobfuscation.</b> Obfuscated posts are renamed from their PAR2 metadata, ROT13-scrambled names get rescued, and hash-named junk is classified and gated out.</li>
       </ul>
       <ul class="plain">
         <li><b>Exact-fit repair.</b> Damaged blocks are known as they happen, so only the minimum-byte set of recovery volumes gets fetched (a knapsack solve) and repair touches nothing but the damaged spans.</li>
         <li><b>RAR recovery records.</b> When PAR2 is exhausted, or was never posted, embedded RAR recovery records repair damaged volumes in place.</li>
+        <li><b>Repair at every depth.</b> A PAR2 set packed inside an inner layer is found and run at its own level, and a par-only post (data deleted, a 100%-recovery set left behind) is rebuilt whole and then unpacked.</li>
         <li><b>Compressed and encrypted fallback:</b> non-store posts materialise and unpack through the native RAR engine, everything from RAR4 to the new RAR7, overlapped with the rest of the queue. Encrypted sets park with a clear message instead of failing quietly.</li>
-        <li><b>Password handling.</b> Passwords come from the *arr API, the <code>{{pw}}</code> filename convention, or NZB metadata. For anything left over, a 🔑 unlock on the dashboard takes it from there: it unlocks in the background, then files as normal.</li>
-        <li><b>Safety rails.</b> Repaired source volumes are write-protected while re-extraction runs, and an exit code reports "success" only when the end state is genuinely usable.</li>
+        <li><b>Password handling.</b> Passwords come from the *arr API, the <code>{{pw}}</code> filename convention, or NZB metadata. For anything left over, a 🔑 unlock on the dashboard takes it from there: it unlocks in the background, then files as normal. Chained passwords resolve themselves: when one layer's extraction produces the next layer's password file, it's read and used automatically.</li>
+        <li><b>Safety rails.</b> Repaired source volumes are write-protected while re-extraction runs, the finished file's own checksum is verified end to end (on by default), and an exit code reports "success" only when the end state is genuinely usable.</li>
       </ul>
     </div>
   </div>
@@ -167,7 +169,7 @@
     <div style="height:26px"></div>
     <div class="grid2">
       <ul class="plain">
-        <li><b>Continuous group scanner.</b> Incremental OVER scans run on your schedule at ~43k headers/s across fanned-out connections. First scans are date-bisected, so <code>--max-age 2y</code> skips years of headers in about 20 probes.</li>
+        <li><b>Continuous group scanner.</b> Incremental OVER scans run on your schedule at ~43k headers/s across fanned-out connections, negotiating compressed headers (RFC 8054) where a server offers them. First scans are date-bisected, so <code>--max-age 2y</code> skips years of headers in about 20 probes.</li>
         <li><b>Ingest gates:</b> filters on kind, year, resolution, language and size keep indexer spam out of your database, and obfuscated junk is caught and gated by default.</li>
         <li><b>Scene-name parser.</b> It pulls title, year, episode, quality and source out of real-world stems (date-coded dailies, multi-episode codes and ROT13-obfuscated names included) and dedupes releases down to one card per title.</li>
         <li><b>Instant search:</b> search-as-you-type with quality filters, per-row watch buttons, and quality badges throughout.</li>

@@ -50,7 +50,7 @@
     <div class="grid2">
       <ul class="feat">
         <li><b>NNTP cu pipelining la viteza liniei:</b> <span class="d">8.31 Gbps măsurați pe 10 GbE.</span></li>
-        <li><b>Pipeline într-o singură trecere:</b> <span class="d">decodarea, verificarea și extragerea se suprapun; volumele RAR nu ating niciodată discul.</span></li>
+        <li><b>Pipeline într-o singură trecere:</b> <span class="d">decodarea, verificarea și extragerea se suprapun; volumele RAR nu ating niciodată discul; arhivele imbricate se despachetează în aceeași trecere.</span></li>
         <li><b>Disponibilitate prin uniune multi-provider:</b> <span class="d">complet din uniunea serverelor tale, sau abandon timpuriu.</span></li>
         <li><b>Buget de memorie:</b> <span class="d">RAM limitat, spill elegant, fără swap niciodată.</span></li>
         <li><b>Reluare sigură la blocare:</b> <span class="d">jurnal la nivel de articol; kill −9 în mijlocul unui job și continuă de unde a rămas.</span></li>
@@ -98,14 +98,16 @@
         <li><b>Scrie o singură dată.</b> Articolele decodate sunt scrise (pwrite) direct la offset-urile lor finale din fișier. Fără fișiere temporare, fără o trecere separată de asamblare.</li>
         <li><b>Verificare PAR2 în flux.</b> Fiecare bloc primește un hash MD5 din bufferele de decodare pe măsură ce sosește, așa că verificarea se încheie exact în momentul în care se termină descărcarea. E mai riguroasă decât verificarea rapidă cu care se mulțumesc ceilalți clienți și nu costă nimic.</li>
         <li><b>Extragere directă:</b> postările RAR în mod store (majoritatea release-urilor scene) sunt mapate și extrase chiar în timpul descărcării, așa că volumele nu ajung deloc pe disc. Se scrie pe disc conținut × 1.0, iar discul necesar e 1×, acolo unde alții cer cam 2×.</li>
+        <li><b>Arhive imbricate, tot într-o singură trecere.</b> Arhivele din interiorul arhivelor - RAR în RAR, 7z în RAR, scări adânci de mai multe niveluri - sunt dezimbricate din mers, în loc să fie scrise pe disc și deschise din nou. O singură copie pe disc, acolo unde o abordare de tip scrie-pe-disc-și-rescanează ține două.</li>
         <li><b>Deobfuscare.</b> Postările obfuscate sunt redenumite din metadatele lor PAR2, numele amestecate cu ROT13 sunt recuperate, iar gunoiul cu nume de tip hash e clasificat și blocat.</li>
       </ul>
       <ul class="plain">
         <li><b>Reparare exact potrivită.</b> Blocurile deteriorate sunt cunoscute pe măsură ce apar, așa că se preia doar setul de volume de recuperare cu cel mai mic număr de octeți (o rezolvare de tip rucsac), iar repararea atinge numai zonele deteriorate.</li>
         <li><b>Înregistrări de recuperare RAR.</b> Când PAR2 e epuizat, sau nu a fost postat niciodată, înregistrările de recuperare RAR încorporate repară volumele deteriorate pe loc.</li>
+        <li><b>Reparare la orice adâncime.</b> Un set PAR2 împachetat într-un strat interior e găsit și rulat la propriul lui nivel, iar o postare doar-par (datele șterse, lăsat în urmă un set cu recuperare 100%) e reconstruită întreagă și apoi despachetată.</li>
         <li><b>Rezervă pentru comprimat și criptat:</b> postările non-store se materializează și se dezarhivează prin motorul RAR nativ, totul de la RAR4 până la noul RAR7, suprapuse cu restul cozii. Seturile criptate sunt parcate cu un mesaj clar, în loc să eșueze în tăcere.</li>
-        <li><b>Gestionarea parolelor.</b> Parolele vin din API-ul *arr, din convenția de denumire <code>{{pw}}</code> sau din metadatele NZB. Pentru ce rămâne, o deblocare 🔑 din panou preia ștafeta: deblochează în fundal, apoi arhivează normal.</li>
-        <li><b>Bariere de siguranță.</b> Volumele sursă reparate sunt protejate la scriere cât timp rulează reextragerea, iar codul de ieșire raportează „succes” doar când starea finală e cu adevărat utilizabilă.</li>
+        <li><b>Gestionarea parolelor.</b> Parolele vin din API-ul *arr, din convenția de denumire <code>{{pw}}</code> sau din metadatele NZB. Pentru ce rămâne, o deblocare 🔑 din panou preia ștafeta: deblochează în fundal, apoi arhivează normal. Parolele înlănțuite se rezolvă singure: când extragerea unui strat produce fișierul cu parola stratului următor, acesta e citit și folosit automat.</li>
+        <li><b>Bariere de siguranță.</b> Volumele sursă reparate sunt protejate la scriere cât timp rulează reextragerea, suma de control proprie a fișierului final e verificată cap-coadă (activată implicit), iar codul de ieșire raportează „succes” doar când starea finală e cu adevărat utilizabilă.</li>
       </ul>
     </div>
   </div>
@@ -167,7 +169,7 @@
     <div style="height:26px"></div>
     <div class="grid2">
       <ul class="plain">
-        <li><b>Scaner continuu de grupuri.</b> Scanările OVER incrementale rulează după programul tău, la ~43k antete/s pe conexiuni distribuite. Primele scanări sunt bisectate după dată, așa că <code>--max-age 2y</code> sare peste ani de antete în circa 20 de sonde.</li>
+        <li><b>Scaner continuu de grupuri.</b> Scanările OVER incrementale rulează după programul tău, la ~43k antete/s pe conexiuni distribuite, negociind antete comprimate (RFC 8054) acolo unde un server le oferă. Primele scanări sunt bisectate după dată, așa că <code>--max-age 2y</code> sare peste ani de antete în circa 20 de sonde.</li>
         <li><b>Filtre de preluare:</b> filtrele pe tip, an, rezoluție, limbă și dimensiune țin spamul de indexer departe de baza ta de date, iar gunoiul obfuscat e prins și blocat implicit.</li>
         <li><b>Parser de nume scene.</b> Extrage titlul, anul, episodul, calitatea și sursa din tulpini reale (inclusiv episoade zilnice codate cu dată, coduri multi-episod și nume obfuscate cu ROT13) și deduplică release-urile la un singur card per titlu.</li>
         <li><b>Căutare instantanee:</b> cauți pe măsură ce scrii, cu filtre de calitate, butoane de urmărire pe fiecare rând și insigne de calitate peste tot.</li>

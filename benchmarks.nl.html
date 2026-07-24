@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Benchmarks - nzbfast</title>
-<meta name="description" content="nzbfast vs SABnzbd, NZBGet en rustnzb: 4 clients × 6 scenario's op identieke hardware. Eerlijke resultaten, inclusief de ene leg die nzbfast niet wint, met reproductiestappen.">
+<meta name="description" content="nzbfast vs SABnzbd, NZBGet en rustnzb: 4 clients × 7 scenario's op identieke hardware. Eerlijke resultaten, inclusief de legs die nzbfast niet wint, met reproductiestappen.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
 <link rel="alternate" hreflang="en" href="benchmarks.html">
@@ -42,9 +42,9 @@
 
 <div class="hero wrap" style="padding-bottom:6px">
   <h1>Benchmarks</h1>
-  <p class="sub">Vier clients, zes scenario's, identieke hardware en providers, runs
+  <p class="sub">Vier clients, zeven scenario's, identieke hardware en providers, runs
   afwisselend uitgevoerd zodat providerdrift wegvalt. De maatstaf is <b>tijd tot een bruikbaar bestand</b>:
-  gedownload, geverifieerd, uitgepakt. Inclusief de ene leg die we niet winnen.</p>
+  gedownload, geverifieerd, uitgepakt. Inclusief de legs die we niet winnen.</p>
 </div>
 
 <section style="padding-top:26px">
@@ -65,25 +65,26 @@
     <p class="kicker">Scenario 1 · schoon, enorm</p>
     <h2>190.6 GB → één mkv van 167.9 GB (Europa, 10 GbE)</h2>
     <div class="bars">
-      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:24%"></i></span><span class="t">4m 44s</span></div>
-      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:36%"></i></span><span class="t">7m 06s · +50%</span></div>
-      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 31s · +312%</span></div>
+      <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:23%"></i></span><span class="t">4m 33s</span></div>
+      <div class="bar"><span>NZBGet 26.2</span><span class="trk"><i style="width:41%"></i></span><span class="t">7m 58s · +75%</span></div>
+      <div class="bar"><span>SABnzbd 5.0.4</span><span class="trk"><i style="width:100%"></i></span><span class="t">19m 32s · +329%</span></div>
       <div class="bar"><span>rustnzb 1.3.4</span><span class="trk dnf"><i style="width:100%"></i></span><span class="t">geen uitvoer¹</span></div>
     </div>
     <div class="tblwrap"><table>
       <thead><tr><th></th><th>nzbfast</th><th>NZBGet 26.2</th><th>SABnzbd 5.0.4</th><th>rustnzb 1.3.4</th></tr></thead>
       <tbody>
-        <tr><td>tijd tot bruikbaar bestand</td><td class="win">4m 44s</td><td class="lose">7m 06s (+50%)</td><td class="lose">19m 31s (+312%)</td><td class="bad">geen¹</td></tr>
-        <tr><td>GB over de lijn</td><td class="win num">169.3</td><td class="num">169.6</td><td class="num">169.6</td><td class="num">186.6</td></tr>
-        <tr><td>piek-RSS</td><td class="num">6.8 GB²</td><td class="num">1.8 GB</td><td class="num">1.8 GB</td><td class="win num">0.6 GB</td></tr>
+        <tr><td>tijd tot bruikbaar bestand</td><td class="win">4m 33s</td><td class="lose">7m 58s (+75%)</td><td class="lose">19m 32s (+329%)</td><td class="bad">geen¹</td></tr>
+        <tr><td>GB over de lijn</td><td class="win num">169.6</td><td class="num">169.8</td><td class="num">169.7</td><td class="num">186.5</td></tr>
+        <tr><td>piek-RSS</td><td class="num">1.4 GB²</td><td class="num">1.5 GB</td><td class="num">1.8 GB</td><td class="win num">0.6 GB</td></tr>
       </tbody>
     </table></div>
-    <p class="note" style="text-align:left">¹ rustnzb meldde de taak klaar op 5m 42s na het binnenhalen van
-    186.6 GB (10% meer over de lijn dan wie dan ook) maar liet <b>helemaal geen uitvoerbestand</b> achter.
-    Hij faalde ook in de vorige ronde op dit scenario ("121,975 articles missing", 71 GB verweesd).
+    <p class="note" style="text-align:left">¹ rustnzb was op 5m 42s klaar met bytes verplaatsen na het
+    binnenhalen van 186.5 GB (10% meer over de lijn dan wie dan ook) maar liet <b>geen uitgepakte media</b>
+    achter, z'n derde mislukte ronde op rij op deze post.
     · ² het geheugen van nzbfast volgt z'n <em>ingestelde budget</em>, niet de taak: deze leg draaide het
-    standaard auto-budget; begrensd op <b>1 GB</b> voltooit dezelfde taak van 190 GB nog steeds, zo'n 22%
-    trager (zie de low-memory-ladder hieronder). In de eerdere oostkust-VS-ronde (~2.4–3 Gbps-lijn) draaide
+    standaard auto-budget en piekte op 1.4 GB; een bewust reusachtig budget van 64 GB levert maar 4% op
+    (4m 22s), en begrensd op <b>1 GB</b> voltooit dezelfde taak van 190 GB nog steeds (zie de
+    low-memory-ladder hieronder). In de eerdere oostkust-VS-ronde (~2.4–3 Gbps-lijn) draaide
     hetzelfde scenario in 9m 00s vs NZBGet +30% en SABnzbd +111%. De kloof houdt stand over verschillende lijnsnelheden.</p>
   </div>
 </section>
@@ -150,7 +151,7 @@
 <section class="alt">
   <div class="wrap">
     <p class="kicker">De eerlijke kolom</p>
-    <h2>De ene leg die we niet winnen</h2>
+    <h2>De legs die we niet winnen</h2>
     <div class="grid2">
       <div class="card"><h3>Beschadigde store-mode post</h3>
         <p>20 vergiftigde artikelen in een REMUX van 7.4 GB: NZBGet is bruikbaar klaar in <b>53 s</b>, nzbfast
@@ -158,6 +159,11 @@
         byte-exact, en het haalt een bijna-theoretisch-minimum van 22 recovery-blokken op voor de 20
         benodigde, tegenover de volledige PAR2-pass van NZBGet. Maar NZBGet wint de leg met vijf seconden,
         dus hier staat hij.</p></div>
+      <div class="card"><h3>Par-only reconstructie</h3>
+        <p>De poster verwijderde elk data-artikel en liet alleen een PAR2-set met 100% redundantie achter.
+        Alle vier de clients herbouwen de hele volumeset uit pariteit; NZBGet doet het het snelst, <b>8 s</b>
+        tegenover onze <b>19 s</b> op een post van 1.5 GB (rustnzb 49 s, SABnzbd 6m 30s). Een complete set
+        uit het niets herbouwen is de ene herstelvorm waarin een in-stream-engine geen voorsprong heeft.</p></div>
     </div>
     <div class="callout">Waarom überhaupt een verlies laten zien? Omdat de overwinningen alleen geloofwaardig
     zijn náást dat ene verlies. Elk getal op deze pagina komt uit dezelfde afwisselende runs, en de repo
@@ -188,6 +194,63 @@
     Op een doorsnee thuisverbinding is een klein budget bij elke taakgrootte vrijwel gratis. Een
     NAS-profiel (2 verbindingen, budget 256 MB) rondde de taak van 35 GB af in 0.4 GB piek-RSS.
     Een 2 GB-NAS kan dit draaien. Geen enkele andere client biedt überhaupt een geheugenplafond.</p>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <p class="kicker">Scenario 7 · archieven in archieven</p>
+    <h2>Tien geneste vormen: wie is klaar zonder jou</h2>
+    <p class="lead">Posts komen steeds vaker genest binnen: een RAR in een RAR, een 7z weggestopt in een
+    store-archief, een ladder van lagen, een wachtwoordketen. Deze ronde beoordeelt wat er voor de operator
+    overblijft. <b>auto</b> betekent elke payload uitgepakt, byte-identiek, zonder ook maar iets te doen;
+    <b>handmatig</b> betekent dat de client succes meldde maar een binnenste archief in de uitvoermap liet
+    liggen om zelf te openen.</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>vorm</th><th>nzbfast</th><th>SABnzbd</th><th>NZBGet</th><th>rustnzb</th></tr></thead>
+      <tbody>
+        <tr><td>store-RAR in een store-RAR</td><td class="win">auto</td><td>auto</td><td class="bad">handmatig</td><td class="bad">handmatig</td></tr>
+        <tr><td>gecomprimeerde RAR in een store-RAR</td><td class="win">auto</td><td>auto</td><td class="bad">handmatig</td><td class="bad">handmatig</td></tr>
+        <tr><td>7z in een store-RAR</td><td class="win">auto</td><td>auto</td><td class="bad">handmatig</td><td class="bad">handmatig</td></tr>
+        <tr><td>ladder van 5 niveaus, 6 payloads</td><td class="win">auto · 6/6</td><td class="bad">handmatig · 3/6</td><td class="bad">handmatig · 1/6</td><td class="bad">handmatig · 1/6</td></tr>
+        <tr><td>wachtwoordketen, 3 versleutelde niveaus</td><td class="win">auto · 3/3</td><td class="bad">vraagt om een wachtwoord</td><td class="bad">vraagt om een wachtwoord</td><td class="bad">mislukt</td></tr>
+        <tr><td><b>automatisch voltooid, alle tien vormen</b></td><td class="win"><b>8/10</b></td><td class="num">6/10</td><td class="num">2/10</td><td class="num">2/10</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">Loopback-rig, machinaal gegenereerd corpus, alle vier de clients
+    op dezelfde machine, beoordeeld op content-hash, dus een client die de payload hernoemt krijgt gewoon de
+    punten. Doordat binnenste lagen on-the-fly worden ontnest, houdt nzbfast één kopie van ~1.5 GB op schijf
+    vast waar wegschrijf-en-uitpak-clients ~3 GB vasthouden, en maakt het deze legs af in 1–2 s tegenover
+    4–8 s. Bij de wachtwoordketen zit het wachtwoord van elke laag in een bestand dat de laag erboven uitpakt:
+    nzbfast leest het en ontgrendelt alle drie de niveaus; de anderen stoppen en wachten tot jij het intypt.
+    De twee vormen die hij niet automatisch afmaakt worden met opzet streng beoordeeld: een ladder van 10
+    niveaus voorbij z'n standaard dieptelimiet en een post die op alle drie de niveaus beschadigd is. Op beide
+    redt hij meer payloads dan welke andere client ook, maar hij eindigt met een niet-nul exitcode in plaats
+    van een half werk succes te noemen, dus beide tellen hier als mislukkingen.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Componentduels</p>
+    <h2>De uitpak- en herstel-engines, solo geracet</h2>
+    <p class="lead">Uitpakken en PAR2 zijn onze eigen native code, dus we racen ze ook los tegen het veld op
+    identieke corpora. Een tijd telt alleen als de uitvoer byte-identiek is aan de bron-payload.</p>
+    <div class="grid2">
+      <div class="card"><h3>RAR-uitpakken · 8 archiefvormen</h3>
+        <p>Tegen unrar 7.23, 7-Zip, bsdtar, unar en de upstream rars-crate op een Apple M3 Ultra wint of
+        evenaart de uitpakker van nzbfast elke vorm: 400 kleine bestanden in <b>0.13 s</b> tegenover de
+        0.66 s van unrar, solid <b>0.50</b> vs 0.87, versleuteld <b>0.49</b> vs 0.82, een RAR7-archief met
+        128 MB-woordenboek <b>0.71</b> vs 0.92. Opnieuw gedraaid op een Intel-laptop met 14 cores worden de
+        marges groter: de parallelle decodeerpaden schalen mee met de extra threads. Elke gerapporteerde tijd
+        leverde sha256-identieke uitvoer op.</p></div>
+      <div class="card"><h3>PAR2-verificatie + herstel · set van 1 GiB</h3>
+        <p>Tegen het klassieke par2cmdline en de SIMD-fork par2cmdline-turbo: schone verificatie <b>0.41 s</b>
+        vs 0.94 vs 3.27; herstel van 101 beschadigde blokken <b>1.09 s</b> vs 2.18 vs 5.94, elk hersteld
+        bestand byte-identiek. Twee eerlijke kanttekeningen: we maken geen PAR2 aan (een downloader heeft dat
+        niet nodig, en die leg is van ParPar), en op een laptop met 14 cores blijft ons herstel achter op
+        turbo (6.24 s vs 4.04 s): het herstelpad wil de cores van de grote machine.</p></div>
+    </div>
   </div>
 </section>
 
@@ -250,7 +313,7 @@
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
     </div>
   </div>
-  <p class="fine">Benchmarkdata: competitieve ronde van 19–20 juli 2026. Clientversies:
+  <p class="fine">Benchmarkdata: competitieve rondes van 19–24 juli 2026. Clientversies:
   SABnzbd 5.0.4, NZBGet 26.2 (nzbget.com-fork), rustnzb 1.3.4. Als een nieuwere versie van
   een client een resultaat wezenlijk verandert, draaien we opnieuw en werken we bij.</p>
 </div></footer>

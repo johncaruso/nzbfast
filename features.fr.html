@@ -50,7 +50,7 @@
     <div class="grid2">
       <ul class="feat">
         <li><b>NNTP pipeliné à la vitesse de la ligne:</b> <span class="d">8.31 Gbps mesurés sur 10 GbE.</span></li>
-        <li><b>Pipeline en une passe:</b> <span class="d">décodage, vérification et extraction se chevauchent ; les volumes RAR ne touchent jamais le disque.</span></li>
+        <li><b>Pipeline en une passe:</b> <span class="d">décodage, vérification et extraction se chevauchent ; les volumes RAR ne touchent jamais le disque ; les archives imbriquées se décompressent dans la même passe.</span></li>
         <li><b>Disponibilité en union multi-fournisseurs:</b> <span class="d">complétez depuis l’union de vos serveurs, ou abandonnez tôt.</span></li>
         <li><b>Budget mémoire:</b> <span class="d">RAM bornée, débordement en douceur, jamais de swap.</span></li>
         <li><b>Reprise résistante aux crashs:</b> <span class="d">journal au niveau de l’article ; tuez le processus (kill −9) en pleine tâche et il reprend là où il s’était arrêté.</span></li>
@@ -98,14 +98,16 @@
         <li><b>Écrit une seule fois.</b> Les articles décodés sont écrits (pwrite) droit à leur position finale dans le fichier. Aucun fichier temporaire, aucune passe d’assemblage séparée.</li>
         <li><b>Vérification PAR2 au fil de l’eau.</b> Chaque bloc est haché en MD5 depuis les tampons de décodage dès son arrivée : la vérification s’achève au moment même où le téléchargement se termine. C’est mieux que le quick-check dont se contentent les autres clients, et ça ne coûte rien.</li>
         <li><b>Extraction directe :</b> les posts RAR en mode store (la plupart des releases scene) sont cartographiés et extraits pendant leur téléchargement, si bien que les volumes n’atterrissent jamais sur le disque. Le disque écrit revient à contenu × 1.0 et l’espace requis à 1×, là où les autres en réclament environ 2×.</li>
+        <li><b>Archives imbriquées, toujours en une passe.</b> Les archives dans des archives - RAR dans RAR, 7z dans un RAR, des empilements de plusieurs niveaux - sont désimbriquées à la volée au lieu d’être écrites sur disque puis rouvertes. Une seule copie sur disque là où une approche « écrire puis rescanner » en conserve deux.</li>
         <li><b>Désobfuscation.</b> Les posts obfusqués sont renommés d’après leurs métadonnées PAR2, les noms brouillés en ROT13 sont récupérés, et le tout-venant à noms hachés est classé puis écarté.</li>
       </ul>
       <ul class="plain">
         <li><b>Réparation au plus juste.</b> Les blocs endommagés sont connus au fil de l’eau, donc seul l’ensemble de volumes de récupération le plus léger en octets est téléchargé (un problème de sac à dos résolu) et la réparation ne touche rien d’autre que les zones endommagées.</li>
         <li><b>Enregistrements de récupération RAR.</b> Quand le PAR2 est épuisé, ou n’a jamais été posté, les enregistrements de récupération embarqués dans les RAR réparent les volumes endommagés sur place.</li>
+        <li><b>Réparation à chaque profondeur.</b> Un jeu PAR2 emballé dans une couche interne est trouvé et exécuté à son propre niveau, et un post ne contenant que du PAR2 (données supprimées, un jeu de récupération à 100% laissé sur place) est reconstruit en entier puis décompressé.</li>
         <li><b>Repli compressé et chiffré :</b> les posts hors mode store se matérialisent et se décompressent via le moteur RAR natif, du RAR4 jusqu’au nouveau RAR7, en recouvrement avec le reste de la file. Les jeux chiffrés se garent avec un message clair plutôt que d’échouer en silence.</li>
-        <li><b>Gestion des mots de passe.</b> Les mots de passe viennent de l’API des *arr, de la convention de nommage <code>{{pw}}</code> ou des métadonnées du NZB. Pour tout le reste, un déverrouillage 🔑 sur le tableau de bord prend le relais : il déverrouille en arrière-plan, puis classe normalement.</li>
-        <li><b>Garde-fous.</b> Les volumes sources réparés sont protégés en écriture pendant la ré-extraction, et un code de sortie n’annonce « succès » que lorsque l’état final est réellement utilisable.</li>
+        <li><b>Gestion des mots de passe.</b> Les mots de passe viennent de l’API des *arr, de la convention de nommage <code>{{pw}}</code> ou des métadonnées du NZB. Pour tout le reste, un déverrouillage 🔑 sur le tableau de bord prend le relais : il déverrouille en arrière-plan, puis classe normalement. Les mots de passe en chaîne se résolvent d’eux-mêmes : quand l’extraction d’une couche produit le fichier de mot de passe de la couche suivante, il est lu et utilisé automatiquement.</li>
+        <li><b>Garde-fous.</b> Les volumes sources réparés sont protégés en écriture pendant la ré-extraction, la somme de contrôle propre au fichier final est vérifiée de bout en bout (activé par défaut), et un code de sortie n’annonce « succès » que lorsque l’état final est réellement utilisable.</li>
       </ul>
     </div>
   </div>
@@ -167,7 +169,7 @@
     <div style="height:26px"></div>
     <div class="grid2">
       <ul class="plain">
-        <li><b>Scanner de groupes en continu.</b> Des scans OVER incrémentaux tournent à votre rythme, à ~43k en-têtes/s sur des connexions déployées en éventail. Les premiers scans procèdent par bissection de dates, si bien que <code>--max-age 2y</code> saute des années d’en-têtes en environ 20 sondes.</li>
+        <li><b>Scanner de groupes en continu.</b> Des scans OVER incrémentaux tournent à votre rythme, à ~43k en-têtes/s sur des connexions déployées en éventail, en négociant les en-têtes compressés (RFC 8054) quand un serveur les propose. Les premiers scans procèdent par bissection de dates, si bien que <code>--max-age 2y</code> saute des années d’en-têtes en environ 20 sondes.</li>
         <li><b>Filtres d’ingestion :</b> des filtres de type, année, résolution, langue et taille tiennent le spam d’indexeur hors de votre base, et le tout-venant obfusqué est repéré et écarté par défaut.</li>
         <li><b>Analyseur de noms scene.</b> Il extrait titre, année, épisode, qualité et source de vrais noms de release (émissions quotidiennes datées, codes multi-épisodes et noms brouillés en ROT13 compris) et dédoublonne les releases en une seule carte par titre.</li>
         <li><b>Recherche instantanée :</b> résultats au fil de la frappe, filtres de qualité, boutons de suivi sur chaque ligne et badges de qualité partout.</li>
