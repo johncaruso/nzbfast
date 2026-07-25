@@ -159,12 +159,8 @@
     <p class="kicker">Den ærlige spalten</p>
     <h2>De etappene vi ikke vinner</h2>
     <div>
-      <div class="card"><h3>Par-only-gjenoppbygging</h3>
-        <p>Posteren slettet hver eneste dataartikkel og etterlot bare et PAR2-sett med 100 % redundans.
-        Alle fire klientene gjenoppbygger hele volumsettet fra paritet; NZBGet gjør det raskest, <b>8 s</b>
-        mot våre <b>19 s</b> på en 1.5 GB-post (rustnzb 49 s, SABnzbd 6m 30s). Å gjenoppbygge et helt sett
-        fra ingenting er den ene reparasjonsformen der en motor i strømmen ikke har noe fortrinn.</p></div>
     </div>
+    <p class="lead">Begge testene som stod her er målt på nytt på den utgitte builden, og ingen av dem er lenger et tap: den skadede store-mode-posten tar oss nå 30 s mot NZBGets 38 s, og rekonstruksjon bare fra paritet er ferdig på 9 s der den tok 19 s, på en test der NZBGet kommer tilbake på samme tid, men ikke leverer noe. Vi lar seksjonen bli stående i stedet for å slette den: det er hit tapene våre går, og neste runde som finner ett, setter det tilbake.</p>
     <div class="callout">Hvorfor vise et tap i det hele tatt? Fordi seirene bare er troverdige ved siden av det. Hvert tall på denne siden kommer fra de samme flettede kjøringene, og en test vi taper blir stående publisert til en ny kjøring erstatter den.</div>
   </div>
 </section>
@@ -250,6 +246,24 @@
         byte-identisk. En ærlig merknad: vi lager ikke PAR2 (en nedlaster trenger ikke det, og
         ParPar eier den etappen).</p></div>
     </div>
+  </div>
+</section>
+
+<section id="disk-cost">
+  <div class="wrap">
+    <p class="kicker">Hva en jobb koster</p>
+    <h2>Topp diskbruk for 1,5 GB nyttelast</h2>
+    <p class="lead">Løftet om én gjennomgang handler like mye om disk som om fart, så her er det målt i stedet for påstått: det høyeste arbeidskatalogen nådde under de nøstede kjøringene, avlest to ganger i sekundet. Én avlesning til slutt ville ikke si noe, for en klient som sletter volumene sine etter utpakking ville se ut som om den aldri hadde skrevet dem.</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>form</th><th>nzbfast</th><th>NZBGet 26.2</th><th>rustnzb 1.3.4</th><th>SABnzbd 5.0.4</th></tr></thead>
+      <tbody>
+        <tr><td>store-RAR i store-RAR</td><td class="win num">1538</td><td class="num">1538</td><td class="num">1774</td><td class="num">3080</td></tr>
+        <tr><td>komprimert indre lag</td><td class="win num">1536</td><td class="num">1536</td><td class="num">1674</td><td class="num">3102</td></tr>
+        <tr><td>RAR i RAR, dybde 2</td><td class="win num">1536</td><td class="num">1536</td><td class="num">1714</td><td class="num">3076</td></tr>
+        <tr><td>7z pakket i en store-RAR</td><td class="win num">1503</td><td class="num">1536</td><td class="num">1722</td><td class="num">3102</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">Megabyte, lavere er bedre. <b>NZBGet er på høyde med oss her</b>, og det er verdt å si hvorfor: den kjører med <code>DirectUnpack</code> og <code>DirectWrite</code> på, slik vi setter opp enhver konkurrent, og på disse formene holder det til én kopi på disken. SABnzbd holder to. Forskjellen som står igjen er den pipelinen ble bygget for: vi materialiserer aldri volumene, så toppen er nyttelasten selv i stedet for nyttelasten pluss arkivet som bar den.</p>
   </div>
 </section>
 

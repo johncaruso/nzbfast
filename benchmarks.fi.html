@@ -159,13 +159,8 @@
     <p class="kicker">Rehellinen sarake</p>
     <h2>Ne osuudet, joissa emme voita</h2>
     <div>
-      <div class="card"><h3>Jälleenrakennus pelkistä pareista</h3>
-        <p>Julkaisija poisti jokaisen data-artikkelin ja jätti jäljelle vain 100% redundanssin PAR2-sarjan.
-        Kaikki neljä asiakasta rakentavat koko osasarjan uudelleen pariteetista; NZBGet tekee sen nopeimmin,
-        <b>8 s</b> meidän <b>19 s</b>:aamme vastaan 1.5 GB:n julkaisulla (rustnzb 49 s, SABnzbd 6m 30s).
-        Kokonaisen sarjan rakentaminen tyhjästä on se ainoa korjauksen muoto, jossa virransisäisellä
-        moottorilla ei ole etua.</p></div>
     </div>
+    <p class="lead">Molemmat tässä olleet osuudet on mitattu uudelleen julkaistulla versiolla, eikä kumpikaan ole enää häviö: vaurioitunut store-mode-postaus vie meiltä nyt 30 s NZBGetin 38 s vastaan, ja pelkästä pariteetista rakentaminen valmistuu 9 sekunnissa entisen 19 sijaan, osuudella jossa NZBGet palaa samassa ajassa mutta ei toimita mitään. Jätämme osion paikalleen sen sijaan että poistaisimme sen: tänne häviömme tulevat, ja seuraava kierros joka löytää sellaisen palauttaa sen tähän.</p>
     <div class="callout">Miksi näyttää häviötä lainkaan? Koska voitot ovat uskottavia vain sen rinnalla. Jokainen luku tällä sivulla tulee samoista lomitetuista ajoista, ja häviämämme osuus pysyy julkaistuna, kunnes uusi ajo korvaa sen.</div>
   </div>
 </section>
@@ -255,6 +250,24 @@
         tavuidenttinen. Yksi rehellinen huomio: emme luo PAR2:ta (lataaja ei sitä tarvitse, ja
         ParPar omistaa sen osuuden).</p></div>
     </div>
+  </div>
+</section>
+
+<section id="disk-cost">
+  <div class="wrap">
+    <p class="kicker">Mitä työ maksaa</p>
+    <h2>Levyn huippukäyttö 1,5 GB:n kuormalle</h2>
+    <p class="lead">Lupaus yhdestä ajosta koskee levyä yhtä lailla kuin nopeutta, joten tässä se on mitattuna eikä väitettynä: korkein taso, jonka työhakemisto saavutti sisäkkäisten ajojen aikana, näytteistettynä kahdesti sekunnissa. Kertaluku lopussa ei kertoisi mitään, koska asiakas joka poistaa niteensä purkamisen jälkeen näyttäisi siltä ettei olisi koskaan kirjoittanut niitä.</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>muoto</th><th>nzbfast</th><th>NZBGet 26.2</th><th>rustnzb 1.3.4</th><th>SABnzbd 5.0.4</th></tr></thead>
+      <tbody>
+        <tr><td>store-RAR store-RAR:in sisällä</td><td class="win num">1538</td><td class="num">1538</td><td class="num">1774</td><td class="num">3080</td></tr>
+        <tr><td>pakattu sisäkerros</td><td class="win num">1536</td><td class="num">1536</td><td class="num">1674</td><td class="num">3102</td></tr>
+        <tr><td>RAR RAR:in sisällä, syvyys 2</td><td class="win num">1536</td><td class="num">1536</td><td class="num">1714</td><td class="num">3076</td></tr>
+        <tr><td>7z store-RAR:in sisällä</td><td class="win num">1503</td><td class="num">1536</td><td class="num">1722</td><td class="num">3102</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">Megatavuja, pienempi on parempi. <b>NZBGet on tässä tasoissamme</b>, ja syy kannattaa kertoa: se ajaa <code>DirectUnpack</code> ja <code>DirectWrite</code> päällä, kuten säädämme jokaisen kilpailijan, ja näillä muodoilla se riittää yhteen kopioon levyllä. SABnzbd pitää kahta. Jäljelle jäävä ero on se, jota varten putki rakennettiin: emme materialisoi niteitä lainkaan, joten huippu on itse hyötykuorma eikä hyötykuorma plus sitä kantanut arkisto.</p>
   </div>
 </section>
 

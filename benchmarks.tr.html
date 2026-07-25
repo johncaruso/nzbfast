@@ -161,13 +161,8 @@
     <p class="kicker">Dürüst sütun</p>
     <h2>Kazanamadığımız ayaklar</h2>
     <div>
-      <div class="card"><h3>Yalnızca par'dan yeniden kurma</h3>
-        <p>Gönderici her veri makalesini silmiş ve geriye yalnızca %100 fazlalıklı bir PAR2 kümesi
-        bırakmış. Dört istemcinin dördü de bütün birim kümesini pariteden yeniden kurar; en hızlısı
-        NZBGet: 1.5 GB'lık bir gönderide bizim <b>19 s</b>'mize karşı <b>8 s</b> (rustnzb 49 s,
-        SABnzbd 6m 30s). Bir kümenin tamamını hiç yoktan yeniden kurmak, akış içi bir motorun
-        hiçbir üstünlük taşımadığı tek onarım biçimi.</p></div>
     </div>
+    <p class="lead">Burada duran iki tur da yayınlanan sürümde yeniden ölçüldü ve artık ikisi de kayıp değil: hasarlı store-mode gönderisi bize artık 30 s'ye mal oluyor, NZBGet'in 38 s'sine karşı; yalnızca pariteden yeniden inşa ise 19 s yerine 9 s'de bitiyor, üstelik NZBGet'in aynı sürede dönüp hiçbir şey teslim etmediği bir turda. Bölümü silmek yerine burada bırakıyoruz: kayıplarımızın yeri burası ve bir sonraki turda çıkacak olan buraya konacak.</p>
     <div class="callout">Neden bir kaybı hiç gösterelim ki? Çünkü kazanımlar ancak onun yanında inandırıcıdır. Bu sayfadaki her rakam aynı iç içe çalıştırmalardan gelir ve kaybettiğimiz bir tur, yeni bir çalıştırma onun yerini alana kadar yayında kalır.</div>
   </div>
 </section>
@@ -257,6 +252,24 @@
         karşı 3.62. Onarılan her dosya bayt bayt özdeş. Bir dürüst not: PAR2 üretmiyoruz
         (bir indiricinin buna ihtiyacı yok ve o ayak ParPar'ın).</p></div>
     </div>
+  </div>
+</section>
+
+<section id="disk-cost">
+  <div class="wrap">
+    <p class="kicker">Bir işin maliyeti</p>
+    <h2>1.5 GB yük için tepe disk kullanımı</h2>
+    <p class="lead">Tek geçiş iddiası hız kadar disk hakkındadır; işte iddia yerine ölçüm: iç içe koşular sırasında çalışma dizininin ulaştığı en yüksek nokta, saniyede iki kez örneklendi. Sonda bir kez okumak hiçbir şey söylemezdi, çünkü çıkarımdan sonra birimlerini silen bir istemci onları hiç yazmamış gibi görünürdü.</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>biçim</th><th>nzbfast</th><th>NZBGet 26.2</th><th>rustnzb 1.3.4</th><th>SABnzbd 5.0.4</th></tr></thead>
+      <tbody>
+        <tr><td>store RAR içinde store RAR</td><td class="win num">1538</td><td class="num">1538</td><td class="num">1774</td><td class="num">3080</td></tr>
+        <tr><td>sıkıştırılmış iç katman</td><td class="win num">1536</td><td class="num">1536</td><td class="num">1674</td><td class="num">3102</td></tr>
+        <tr><td>RAR içinde RAR, derinlik 2</td><td class="win num">1536</td><td class="num">1536</td><td class="num">1714</td><td class="num">3076</td></tr>
+        <tr><td>store RAR içine sarılmış 7z</td><td class="win num">1503</td><td class="num">1536</td><td class="num">1722</td><td class="num">3102</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">Megabayt, düşük olan iyidir. <b>NZBGet burada bizimle başa baş</b> ve nedenini söylemek gerekir: <code>DirectUnpack</code> ve <code>DirectWrite</code> açık çalışıyor; her rakibi böyle yapılandırıyoruz ve bu biçimlerde diskte tek kopya için bu yeterli. SABnzbd iki tutuyor. Kalan fark, hattın kendisi için kurulduğu farktır: biz birimleri hiç maddileştirmiyoruz, dolayısıyla tepe değeri yükün kendisidir, yükün üstüne onu taşıyan arşiv değil.</p>
   </div>
 </section>
 

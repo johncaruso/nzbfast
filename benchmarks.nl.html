@@ -159,12 +159,8 @@
     <p class="kicker">De eerlijke kolom</p>
     <h2>De legs die we niet winnen</h2>
     <div>
-      <div class="card"><h3>Par-only reconstructie</h3>
-        <p>De poster verwijderde elk data-artikel en liet alleen een PAR2-set met 100% redundantie achter.
-        Alle vier de clients herbouwen de hele volumeset uit pariteit; NZBGet doet het het snelst, <b>8 s</b>
-        tegenover onze <b>19 s</b> op een post van 1.5 GB (rustnzb 49 s, SABnzbd 6m 30s). Een complete set
-        uit het niets herbouwen is de ene herstelvorm waarin een in-stream-engine geen voorsprong heeft.</p></div>
     </div>
+    <p class="lead">Beide runs die hier stonden zijn opnieuw gemeten op de uitgebrachte build en geen van beide is nog een verlies: de beschadigde store-mode post kost ons nu 30 s tegen 38 s voor NZBGet, en reconstructie uit alleen pariteit is klaar in 9 s waar het 19 s duurde, op een run waar NZBGet in dezelfde tijd terugkeert maar niets aflevert. We laten de sectie staan in plaats van hem te verwijderen: hier komen onze verliezen, en de volgende ronde die er een vindt zet hem terug.</p>
     <div class="callout">Waarom überhaupt een verlies laten zien? Omdat de overwinningen alleen geloofwaardig zijn náást dat ene verlies. Elk getal op deze pagina komt uit dezelfde afwisselende runs, en een run die we verliezen blijft gepubliceerd totdat een nieuwe meting hem vervangt.</div>
   </div>
 </section>
@@ -251,6 +247,24 @@
         1.48, herstel <b>2.57</b> vs 3.62. Elk hersteld bestand byte-identiek. Eén eerlijke kanttekening: we
         maken geen PAR2 aan (een downloader heeft dat niet nodig, en die leg is van ParPar).</p></div>
     </div>
+  </div>
+</section>
+
+<section id="disk-cost">
+  <div class="wrap">
+    <p class="kicker">Wat een klus je kost</p>
+    <h2>Piekverbruik op schijf voor 1.5 GB</h2>
+    <p class="lead">De belofte van één ronde gaat net zo goed over schijfruimte als over snelheid, dus hier is hij gemeten in plaats van beweerd: het hoogste punt dat de werkmap bereikte tijdens de geneste runs, twee keer per seconde bemonsterd. Eén keer aflezen aan het eind zou niets zeggen, want een client die zijn volumes na het uitpakken verwijdert zou lijken alsof hij ze nooit geschreven heeft.</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>vorm</th><th>nzbfast</th><th>NZBGet 26.2</th><th>rustnzb 1.3.4</th><th>SABnzbd 5.0.4</th></tr></thead>
+      <tbody>
+        <tr><td>store-RAR in store-RAR</td><td class="win num">1538</td><td class="num">1538</td><td class="num">1774</td><td class="num">3080</td></tr>
+        <tr><td>gecomprimeerde binnenlaag</td><td class="win num">1536</td><td class="num">1536</td><td class="num">1674</td><td class="num">3102</td></tr>
+        <tr><td>RAR in RAR, diepte 2</td><td class="win num">1536</td><td class="num">1536</td><td class="num">1714</td><td class="num">3076</td></tr>
+        <tr><td>7z verpakt in een store-RAR</td><td class="win num">1503</td><td class="num">1536</td><td class="num">1722</td><td class="num">3102</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">Megabytes, lager is beter. <b>NZBGet komt hier gelijk met ons</b> en het is de moeite waard te zeggen waarom: het draait met <code>DirectUnpack</code> en <code>DirectWrite</code> aan, zoals we elke concurrent instellen, en op deze vormen is dat genoeg voor één kopie op schijf. SABnzbd houdt er twee. Het verschil dat overblijft is waar de pijplijn voor gebouwd is: wij materialiseren de volumes helemaal niet, dus de piek is de payload zelf en niet de payload plus het archief dat hem droeg.</p>
   </div>
 </section>
 

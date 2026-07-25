@@ -159,13 +159,8 @@
     <p class="kicker">La colonna dell'onestà</p>
     <h2>Le prove che non vinciamo</h2>
     <div>
-      <div class="card"><h3>Ricostruzione da soli PAR</h3>
-        <p>Il poster ha cancellato ogni articolo di dati e ha lasciato solo un set PAR2 con ridondanza al 100%.
-        Tutti e quattro i client ricostruiscono l'intero set di volumi dalla parità; NZBGet è il più veloce,
-        <b>8 s</b> contro i nostri <b>19 s</b> su un post da 1.5 GB (rustnzb 49 s, SABnzbd 6m 30s). Ricostruire
-        un set intero dal nulla è l'unica forma di riparazione in cui un motore nel flusso non ha alcun
-        vantaggio.</p></div>
     </div>
+    <p class="lead">Entrambe le prove che stavano qui sono state rimisurate sulla build pubblicata e nessuna è più una sconfitta: il post store-mode danneggiato ora ci costa 30 s contro i 38 s di NZBGet, e la ricostruzione dalla sola parità si chiude in 9 s dove ne servivano 19, su una prova in cui NZBGet torna nello stesso tempo ma non consegna nulla. Lasciamo la sezione al suo posto invece di cancellarla: è qui che finiscono le nostre sconfitte, e il prossimo giro che ne troverà una la rimetterà.</p>
     <div class="callout">Perché mostrare una sconfitta? Perché le vittorie sono credibili solo accanto ad essa. Ogni numero in questa pagina proviene dalle stesse esecuzioni alternate, e una prova che perdiamo resta pubblicata finché una nuova esecuzione non la sostituisce.</div>
   </div>
 </section>
@@ -253,6 +248,24 @@
         <b>2.57</b> contro 3.62. Ogni file riparato byte-identico. Una nota onesta: non creiamo PAR2 (a un
         downloader non serve, e quella prova appartiene a ParPar).</p></div>
     </div>
+  </div>
+</section>
+
+<section id="disk-cost">
+  <div class="wrap">
+    <p class="kicker">Quanto costa un lavoro</p>
+    <h2>Picco di disco per un payload da 1.5 GB</h2>
+    <p class="lead">La promessa della passata unica riguarda il disco quanto la velocità, quindi eccola misurata invece che affermata: il massimo raggiunto dalla directory di lavoro durante le esecuzioni annidate, campionato due volte al secondo. Leggerlo una volta sola alla fine non direbbe nulla, perché un client che cancella i volumi dopo l’estrazione sembrerebbe non averli mai scritti.</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>forma</th><th>nzbfast</th><th>NZBGet 26.2</th><th>rustnzb 1.3.4</th><th>SABnzbd 5.0.4</th></tr></thead>
+      <tbody>
+        <tr><td>RAR store dentro RAR store</td><td class="win num">1538</td><td class="num">1538</td><td class="num">1774</td><td class="num">3080</td></tr>
+        <tr><td>livello interno compresso</td><td class="win num">1536</td><td class="num">1536</td><td class="num">1674</td><td class="num">3102</td></tr>
+        <tr><td>RAR dentro RAR, profondità 2</td><td class="win num">1536</td><td class="num">1536</td><td class="num">1714</td><td class="num">3076</td></tr>
+        <tr><td>7z avvolto in un RAR store</td><td class="win num">1503</td><td class="num">1536</td><td class="num">1722</td><td class="num">3102</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">Megabyte, meno è meglio. <b>NZBGet ci eguaglia qui</b> ed è giusto dire perché: gira con <code>DirectUnpack</code> e <code>DirectWrite</code> attivi, come configuriamo ogni concorrente, e su queste forme basta per tenere una sola copia su disco. SABnzbd ne tiene due. Il divario che resta è quello per cui la pipeline è stata costruita: non materializziamo mai i volumi, quindi il picco è il payload stesso e non il payload più l’archivio che lo trasportava.</p>
   </div>
 </section>
 

@@ -159,13 +159,8 @@
     <p class="kicker">Coloana onestă</p>
     <h2>Probele pe care nu le câștigăm</h2>
     <div>
-      <div class="card"><h3>Reconstrucție doar din par</h3>
-        <p>Autorul postării a șters toate articolele de date și a lăsat doar un set PAR2 cu redundanță de 100%.
-        Toți cei patru clienți reconstruiesc întregul set de volume din paritate; NZBGet o face cel mai repede,
-        <b>8 s</b> față de <b>19 s</b> la noi, pe o postare de 1.5 GB (rustnzb 49 s, SABnzbd 6m 30s).
-        Reconstrucția unui set întreg din nimic e singura formă de reparare în care un motor în flux
-        nu are niciun avantaj.</p></div>
     </div>
+    <p class="lead">Ambele probe care stăteau aici au fost remăsurate pe versiunea publicată și niciuna nu mai este o pierdere: postarea store-mode deteriorată ne ia acum 30 s față de 38 s la NZBGet, iar reconstrucția doar din paritate se încheie în 9 s față de 19 s, pe o probă unde NZBGet revine în același timp dar nu livrează nimic. Lăsăm secțiunea aici în loc să o ștergem: aici ajung pierderile noastre, iar următoarea rundă care găsește una o va pune la loc.</p>
     <div class="callout">De ce să arătăm măcar o pierdere? Pentru că victoriile sunt credibile doar alături de ea. Fiecare număr de pe această pagină provine din aceleași rulări intercalate, iar o probă pe care o pierdem rămâne publicată până când o nouă rulare o înlocuiește.</div>
   </div>
 </section>
@@ -256,6 +251,24 @@
         Fiecare fișier reparat, identic la octet. O notă onestă: nu creăm PAR2 (un program de
         descărcare nu are nevoie, iar proba aceea îi aparține lui ParPar).</p></div>
     </div>
+  </div>
+</section>
+
+<section id="disk-cost">
+  <div class="wrap">
+    <p class="kicker">Cât costă o sarcină</p>
+    <h2>Vârf de disc pentru 1.5 GB</h2>
+    <p class="lead">Promisiunea unei singure treceri ține de disc la fel de mult ca de viteză, așa că iat-o măsurată în loc de afirmată: maximul atins de directorul de lucru în timpul rulărilor imbricate, eșantionat de două ori pe secundă. O singură citire la final n-ar spune nimic, pentru că un client care își șterge volumele după extragere ar părea că nu le-a scris niciodată.</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>formă</th><th>nzbfast</th><th>NZBGet 26.2</th><th>rustnzb 1.3.4</th><th>SABnzbd 5.0.4</th></tr></thead>
+      <tbody>
+        <tr><td>RAR store în RAR store</td><td class="win num">1538</td><td class="num">1538</td><td class="num">1774</td><td class="num">3080</td></tr>
+        <tr><td>strat interior comprimat</td><td class="win num">1536</td><td class="num">1536</td><td class="num">1674</td><td class="num">3102</td></tr>
+        <tr><td>RAR în RAR, adâncime 2</td><td class="win num">1536</td><td class="num">1536</td><td class="num">1714</td><td class="num">3076</td></tr>
+        <tr><td>7z învelit într-un RAR store</td><td class="win num">1503</td><td class="num">1536</td><td class="num">1722</td><td class="num">3102</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">Megaocteți, mai puțin e mai bine. <b>NZBGet ne egalează aici</b> și merită spus de ce: rulează cu <code>DirectUnpack</code> și <code>DirectWrite</code> activate, așa cum configurăm fiecare concurent, iar pe aceste forme e suficient pentru o singură copie pe disc. SABnzbd ține două. Diferența rămasă este cea pentru care a fost construită conducta: noi nu materializăm deloc volumele, deci vârful este chiar conținutul, nu conținutul plus arhiva care l-a purtat.</p>
   </div>
 </section>
 

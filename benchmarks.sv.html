@@ -159,12 +159,8 @@
     <p class="kicker">Den ärliga kolumnen</p>
     <h2>De etapper vi inte vinner</h2>
     <div>
-      <div class="card"><h3>Par-only-återuppbyggnad</h3>
-        <p>Postaren raderade varje dataartikel och lämnade bara ett PAR2-set med 100 % redundans. Alla fyra
-        klienter bygger upp hela volymsetet igen från pariteten; NZBGet gör det snabbast, <b>8 s</b> mot våra
-        <b>19 s</b> på ett 1.5 GB-inlägg (rustnzb 49 s, SABnzbd 6m 30s). Att bygga upp ett helt set från
-        ingenting är den enda reparationsform där en motor i strömmen inte har något försprång.</p></div>
     </div>
+    <p class="lead">Båda grenarna som stod här har mätts om på det levererade bygget och ingen är längre en förlust: den skadade store-mode-posten tar oss nu 30 s mot NZBGets 38 s, och rekonstruktion enbart ur paritet är klar på 9 s där den tog 19 s, på en gren där NZBGet återkommer på samma tid men levererar ingenting. Vi låter avsnittet stå kvar i stället för att radera det: det är hit våra förluster går, och nästa omgång som hittar en sätter tillbaka den.</p>
     <div class="callout">Varför visa en förlust över huvud taget? För att vinsterna bara är trovärdiga bredvid den. Varje siffra på den här sidan kommer från samma sammanflätade körningar, och en gren vi förlorar står kvar publicerad tills en ny körning ersätter den.</div>
   </div>
 </section>
@@ -250,6 +246,24 @@
         vs 1.48, reparation <b>2.57</b> vs 3.62. Varje reparerad fil byte-identisk. En ärlig
         notering: vi skapar inte PAR2 (en nedladdare behöver inte det, och ParPar äger den etappen).</p></div>
     </div>
+  </div>
+</section>
+
+<section id="disk-cost">
+  <div class="wrap">
+    <p class="kicker">Vad ett jobb kostar</p>
+    <h2>Toppdiskbehov för 1,5 GB nyttolast</h2>
+    <p class="lead">Löftet om en enda genomgång handlar lika mycket om disk som om hastighet, så här är det mätt i stället för påstått: det högsta arbetskatalogen någonsin nådde under de nästlade körningarna, avläst två gånger i sekunden. Att läsa en gång på slutet skulle inte säga något, eftersom en klient som raderar sina volymer efter uppackning skulle se ut att aldrig ha skrivit dem.</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>form</th><th>nzbfast</th><th>NZBGet 26.2</th><th>rustnzb 1.3.4</th><th>SABnzbd 5.0.4</th></tr></thead>
+      <tbody>
+        <tr><td>store-RAR i store-RAR</td><td class="win num">1538</td><td class="num">1538</td><td class="num">1774</td><td class="num">3080</td></tr>
+        <tr><td>komprimerat inre lager</td><td class="win num">1536</td><td class="num">1536</td><td class="num">1674</td><td class="num">3102</td></tr>
+        <tr><td>RAR i RAR, djup 2</td><td class="win num">1536</td><td class="num">1536</td><td class="num">1714</td><td class="num">3076</td></tr>
+        <tr><td>7z inlindad i en store-RAR</td><td class="win num">1503</td><td class="num">1536</td><td class="num">1722</td><td class="num">3102</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">Megabyte, lägre är bättre. <b>NZBGet går jämsides med oss här</b> och det är värt att säga varför: den kör med <code>DirectUnpack</code> och <code>DirectWrite</code> på, vilket är hur vi ställer in varje konkurrent, och på de här formerna räcker det för en enda kopia på disk. SABnzbd håller två. Gapet som återstår är det pipelinen byggdes för: vi materialiserar aldrig volymerna, så toppen är nyttolasten själv i stället för nyttolasten plus arkivet som bar den.</p>
   </div>
 </section>
 

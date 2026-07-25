@@ -159,13 +159,8 @@
     <p class="kicker">La colonne honnête</p>
     <h2>Les manches que nous ne gagnons pas</h2>
     <div>
-      <div class="card"><h3>Reconstruction depuis le seul PAR2</h3>
-        <p>Le posteur a supprimé chaque article de données et n’a laissé qu’un jeu PAR2 à 100% de
-        redondance. Les quatre clients reconstruisent l’ensemble des volumes à partir de la parité ;
-        NZBGet est le plus rapide, <b>8 s</b> contre nos <b>19 s</b> sur un post de 1.5 GB (rustnzb 49 s,
-        SABnzbd 6m 30s). Reconstruire un jeu entier à partir de rien est la seule forme de réparation où
-        un moteur au fil du flux n’a aucun avantage.</p></div>
     </div>
+    <p class="lead">Les deux manches qui figuraient ici ont été remesurées sur la version publiée et aucune n'est plus une défaite : le post store-mode endommagé nous prend maintenant 30 s contre 38 s pour NZBGet, et la reconstruction par parité seule s'achève en 9 s au lieu de 19 s, sur une manche où NZBGet répond dans le même temps mais ne livre rien. Nous laissons la section en place plutôt que de la supprimer : c'est ici que vont nos défaites, et la prochaine série qui en trouvera une la remettra.</p>
     <div class="callout">Pourquoi montrer ne serait-ce qu’une défaite ? Parce que les victoires ne sont crédibles qu’à côté d’elle. Chaque chiffre de cette page provient des mêmes exécutions entrelacées, et une manche que nous perdons reste publiée jusqu’à ce qu’une nouvelle mesure la remplace.</div>
   </div>
 </section>
@@ -256,6 +251,24 @@
         fichier réparé identique à l’octet. Une note honnête : nous ne créons pas de PAR2 (un
         téléchargeur n’en a pas besoin, et ParPar règne sur cette manche).</p></div>
     </div>
+  </div>
+</section>
+
+<section id="disk-cost">
+  <div class="wrap">
+    <p class="kicker">Ce qu’une tâche vous coûte</p>
+    <h2>Pic de disque pour une charge de 1.5 GB</h2>
+    <p class="lead">La promesse d’une seule passe concerne le disque autant que la vitesse ; la voici mesurée plutôt qu’affirmée : le maximum atteint par le répertoire de travail pendant les runs imbriqués, relevé deux fois par seconde. Une seule lecture à la fin ne voudrait rien dire, car un client qui supprime ses volumes après extraction semblerait ne jamais les avoir écrits.</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>forme</th><th>nzbfast</th><th>NZBGet 26.2</th><th>rustnzb 1.3.4</th><th>SABnzbd 5.0.4</th></tr></thead>
+      <tbody>
+        <tr><td>RAR store dans un RAR store</td><td class="win num">1538</td><td class="num">1538</td><td class="num">1774</td><td class="num">3080</td></tr>
+        <tr><td>couche interne compressée</td><td class="win num">1536</td><td class="num">1536</td><td class="num">1674</td><td class="num">3102</td></tr>
+        <tr><td>RAR dans RAR, profondeur 2</td><td class="win num">1536</td><td class="num">1536</td><td class="num">1714</td><td class="num">3076</td></tr>
+        <tr><td>7z enveloppé dans un RAR store</td><td class="win num">1503</td><td class="num">1536</td><td class="num">1722</td><td class="num">3102</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">En mégaoctets, plus bas est meilleur. <b>NZBGet nous égale ici</b> et il vaut la peine de dire pourquoi : il tourne avec <code>DirectUnpack</code> et <code>DirectWrite</code> activés, comme nous configurons chaque concurrent, et sur ces formes cela suffit à n’occuper qu’une copie sur le disque. SABnzbd en garde deux. L’écart qui subsiste est celui pour lequel le pipeline a été conçu : nous ne matérialisons jamais les volumes, donc le pic correspond à la charge utile elle-même et non à la charge plus l’archive qui la transportait.</p>
   </div>
 </section>
 

@@ -159,13 +159,8 @@
     <p class="kicker">Die ehrliche Spalte</p>
     <h2>Die Etappen, die wir nicht gewinnen</h2>
     <div>
-      <div class="card"><h3>Nur-PAR-Rekonstruktion</h3>
-        <p>Der Poster löschte jeden Datenartikel und ließ nur ein PAR2-Set mit 100% Redundanz zurück.
-        Alle vier Clients rekonstruieren das gesamte Volume-Set aus der Parität; NZBGet ist am schnellsten,
-        <b>8 s</b> gegenüber unseren <b>19 s</b> bei einem 1.5 GB-Post (rustnzb 49 s, SABnzbd 6m 30s).
-        Ein komplettes Set aus dem Nichts wiederaufzubauen ist die eine Reparaturform, bei der eine
-        In-Stream-Engine keinen Vorteil hat.</p></div>
     </div>
+    <p class="lead">Beide Läufe, die hier standen, wurden auf dem ausgelieferten Build neu gemessen und keiner ist mehr eine Niederlage: Der beschädigte Store-Mode-Post kostet uns jetzt 30 s gegen NZBGets 38 s, und die Rekonstruktion aus reiner Parität ist in 9 s fertig statt in 19 s, auf einem Lauf, bei dem NZBGet in derselben Zeit zurückkehrt, aber nichts liefert. Wir lassen den Abschnitt stehen, statt ihn zu löschen: Hier landen unsere Niederlagen, und die nächste Runde, die eine findet, stellt sie wieder hier hinein.</p>
     <div class="callout">Warum überhaupt eine Niederlage zeigen? Weil die Siege nur daneben glaubwürdig sind. Jede Zahl auf dieser Seite stammt aus denselben verschränkten Läufen, und eine Runde, die wir verlieren, bleibt veröffentlicht, bis ein neuer Lauf sie ersetzt.</div>
   </div>
 </section>
@@ -255,6 +250,24 @@
         byte-identisch. Eine ehrliche Anmerkung: Wir erzeugen kein PAR2 (ein Downloader braucht das
         nicht, und ParPar gehört diese Etappe).</p></div>
     </div>
+  </div>
+</section>
+
+<section id="disk-cost">
+  <div class="wrap">
+    <p class="kicker">Was ein Job kostet</p>
+    <h2>Spitzenbedarf an Speicherplatz für 1,5 GB Nutzlast</h2>
+    <p class="lead">Das Ein-Durchlauf-Versprechen betrifft den Speicherplatz genauso wie das Tempo, hier also gemessen statt behauptet: der Höchststand des Arbeitsverzeichnisses während der verschachtelten Läufe, zweimal pro Sekunde abgefragt. Einmal am Ende zu messen wäre sinnlos, denn ein Client, der seine Volumes nach dem Entpacken löscht, sähe aus, als hätte er sie nie geschrieben.</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>Form</th><th>nzbfast</th><th>NZBGet 26.2</th><th>rustnzb 1.3.4</th><th>SABnzbd 5.0.4</th></tr></thead>
+      <tbody>
+        <tr><td>Store-RAR im Store-RAR</td><td class="win num">1538</td><td class="num">1538</td><td class="num">1774</td><td class="num">3080</td></tr>
+        <tr><td>komprimierte innere Ebene</td><td class="win num">1536</td><td class="num">1536</td><td class="num">1674</td><td class="num">3102</td></tr>
+        <tr><td>RAR im RAR, Tiefe 2</td><td class="win num">1536</td><td class="num">1536</td><td class="num">1714</td><td class="num">3076</td></tr>
+        <tr><td>7z in einem Store-RAR</td><td class="win num">1503</td><td class="num">1536</td><td class="num">1722</td><td class="num">3102</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">Megabyte, weniger ist besser. <b>NZBGet zieht hier mit uns gleich</b>, und der Grund gehört dazu: Es läuft mit <code>DirectUnpack</code> und <code>DirectWrite</code>, so wie wir jeden Konkurrenten konfigurieren, und auf diesen Formen reicht das für eine einzige Kopie auf der Platte. SABnzbd hält zwei. Der verbleibende Abstand ist der, für den die Pipeline gebaut wurde: Wir materialisieren die Volumes gar nicht erst, der Spitzenwert ist also die Nutzlast selbst statt der Nutzlast plus dem Archiv, das sie transportiert hat.</p>
   </div>
 </section>
 

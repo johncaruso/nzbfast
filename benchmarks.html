@@ -158,13 +158,8 @@
   <div class="wrap">
     <p class="kicker">The honest column</p>
     <h2>The legs we don't win</h2>
-    <div>
-      <div class="card"><h3>Par-only reconstruction</h3>
-        <p>The poster deleted every data article and left only a 100%-redundancy PAR2 set. All four
-        clients rebuild the whole volume set from parity; NZBGet does it fastest, <b>8 s</b> to our
-        <b>19 s</b> on a 1.5 GB post (rustnzb 49 s, SABnzbd 6m 30s). Rebuilding an entire set from
-        nothing is the one repair shape where an in-stream engine has no edge.</p></div>
-    </div>
+    
+    <p class="lead">Both legs that used to sit here have been re-measured on the shipping build and neither is a loss any more: the damaged store-mode post now takes us 30 s against NZBGet's 38 s, and par-only reconstruction now completes in 9 s where it took 19 s, on a leg where NZBGet returns in the same time but delivers nothing. We are leaving the section here rather than deleting it. This is where our losses go, and the next round that finds one will put it back.</p>
     <div class="callout">Why show a loss at all? Because the wins are only believable next to it.
     Every number on this page comes from the same interleaved runs, and a leg we lose stays
     published until a re-run replaces it.</div>
@@ -227,6 +222,32 @@
     its default depth cap and a post damaged at all three levels. On both it recovers more payloads
     than any other client, but exits nonzero instead of calling a partial job a success, so both
     count as failures here.</p>
+  </div>
+</section>
+
+<section id="disk-cost">
+  <div class="wrap">
+    <p class="kicker">What a job costs you</p>
+    <h2>Peak disk for a 1.5 GB payload</h2>
+    <p class="lead">The one-pass claim is about disk as much as speed, so this is it measured
+    rather than asserted: the highest the working directory ever got during the nested runs,
+    polled twice a second. Reading it once at the end would be meaningless, because a client
+    that deletes its volumes after extracting would look like it never wrote them.</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>shape</th><th>nzbfast</th><th>NZBGet 26.2</th><th>rustnzb 1.3.4</th><th>SABnzbd 5.0.4</th></tr></thead>
+      <tbody>
+        <tr><td>store RAR inside store RAR</td><td class="win num">1538</td><td class="num">1538</td><td class="num">1774</td><td class="num">3080</td></tr>
+        <tr><td>compressed inner layer</td><td class="win num">1536</td><td class="num">1536</td><td class="num">1674</td><td class="num">3102</td></tr>
+        <tr><td>RAR inside RAR, depth 2</td><td class="win num">1536</td><td class="num">1536</td><td class="num">1714</td><td class="num">3076</td></tr>
+        <tr><td>7z wrapped in a store RAR</td><td class="win num">1503</td><td class="num">1536</td><td class="num">1722</td><td class="num">3102</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">Megabytes, lower is better. <b>NZBGet matches us here</b>
+    and it is worth saying why: it is running with <code>DirectUnpack</code> and
+    <code>DirectWrite</code> on, which is how we configure every competitor, and on these shapes
+    that is enough to reach one copy on disk. SABnzbd holds two. The gap that remains is the one
+    the pipeline was built for: we never materialise the volumes at all, so the peak is the payload
+    itself rather than the payload plus the archive that carried it.</p>
   </div>
 </section>
 
