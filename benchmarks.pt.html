@@ -47,7 +47,11 @@
   baixado, verificado, extraído. Inclui os legs que não vencemos.</p>
 </div>
 
-<section style="padding-top:26px">
+<div class="wrap" data-benchtoc style="padding:10px 0 2px">
+  <p class="kicker">Nesta página</p>
+  <nav aria-label="Nesta página" style="display:flex;flex-wrap:wrap;gap:7px"><a href="#setup" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">O setup</a><a href="#huge-190" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">190,6 GB → um único mkv de 167,9 GB (Europa, 10 GbE)</a><a href="#by-job-size" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Tempo até arquivo utilizável, por tamanho do trabalho</a><a href="#hash-named-35" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">4K de 35 GB com nome de hash → mkv utilizável (costa leste)</a><a href="#queue" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Manter a linha acesa ao longo de uma fila (costa leste, ~43 GB)</a><a href="#legs-we-lose" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Os legs que não vencemos</a><a href="#low-memory" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">A escada de pouca memória: 190 GB em ~1,1 GB de RAM</a><a href="#nested" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Dez formas aninhadas: quem termina sem você</a><a href="#unpack-repair" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Os motores de extração e reparo, correndo sozinhos</a><a href="#client-matrix" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">O que cada cliente consegue fazer</a><a href="#real-lines" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">O motor satura linhas reais</a></nav>
+</div>
+<section style="padding-top:26px" id="setup">
   <div class="wrap">
     <p class="kicker">Metodologia primeiro</p>
     <h2>O setup</h2>
@@ -60,7 +64,7 @@
   </div>
 </section>
 
-<section class="alt">
+<section class="alt" id="huge-190">
   <div class="wrap">
     <p class="kicker">Cenário 1 · limpo, enorme</p>
     <h2>190,6 GB → um único mkv de 167,9 GB (Europa, 10 GbE)</h2>
@@ -89,7 +93,7 @@
   </div>
 </section>
 
-<section>
+<section id="by-job-size">
   <div class="wrap">
     <p class="kicker">Cenário 2 · a diferença cresce com o tamanho</p>
     <h2>Tempo até arquivo utilizável, por tamanho do trabalho</h2>
@@ -111,7 +115,7 @@
   </div>
 </section>
 
-<section class="alt">
+<section class="alt" id="hash-named-35">
   <div class="wrap">
     <p class="kicker">Cenário 3 · publicação ofuscada</p>
     <h2>4K de 35 GB com nome de hash → mkv utilizável (costa leste)</h2>
@@ -128,7 +132,7 @@
   </div>
 </section>
 
-<section>
+<section id="queue">
   <div class="wrap">
     <p class="kicker">Cenário 4 · fila de três</p>
     <h2>Manter a linha acesa ao longo de uma fila (costa leste, ~43 GB)</h2>
@@ -148,7 +152,7 @@
   </div>
 </section>
 
-<section class="alt">
+<section class="alt" id="legs-we-lose">
   <div class="wrap">
     <p class="kicker">A coluna honesta</p>
     <h2>Os legs que não vencemos</h2>
@@ -171,7 +175,7 @@
   </div>
 </section>
 
-<section>
+<section id="low-memory">
   <div class="wrap">
     <p class="kicker">Cenário 6 · prive-o de RAM</p>
     <h2>A escada de pouca memória: 190 GB em ~1,1 GB de RAM</h2>
@@ -197,7 +201,7 @@
   </div>
 </section>
 
-<section class="alt">
+<section class="alt" id="nested">
   <div class="wrap">
     <p class="kicker">Cenário 7 · arquivos dentro de arquivos</p>
     <h2>Dez formas aninhadas: quem termina sem você</h2>
@@ -230,7 +234,7 @@
   </div>
 </section>
 
-<section>
+<section id="unpack-repair">
   <div class="wrap">
     <p class="kicker">Duelos de componentes</p>
     <h2>Os motores de extração e reparo, correndo sozinhos</h2>
@@ -258,7 +262,7 @@
   </div>
 </section>
 
-<section class="alt">
+<section class="alt" id="client-matrix">
   <div class="wrap">
     <p class="kicker">Capacidade, não micro-benchmarks</p>
     <h2>O que cada cliente consegue fazer</h2>
@@ -289,7 +293,7 @@
   </div>
 </section>
 
-<section>
+<section id="real-lines">
   <div class="wrap">
     <p class="kicker">Prova de transporte</p>
     <h2>O motor satura linhas reais</h2>

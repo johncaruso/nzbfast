@@ -47,7 +47,11 @@
   fichier utilisable</b> : téléchargé, vérifié, extrait. Y compris les manches que nous ne gagnons pas.</p>
 </div>
 
-<section style="padding-top:26px">
+<div class="wrap" data-benchtoc style="padding:10px 0 2px">
+  <p class="kicker">Sur cette page</p>
+  <nav aria-label="Sur cette page" style="display:flex;flex-wrap:wrap;gap:7px"><a href="#setup" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Le protocole</a><a href="#huge-190" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">190.6 GB → un seul mkv de 167.9 GB (Europe, 10 GbE)</a><a href="#by-job-size" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Temps jusqu’au fichier utilisable, par taille de tâche</a><a href="#hash-named-35" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">4K à noms hachés de 35 GB → mkv utilisable (côte Est)</a><a href="#queue" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Garder la ligne allumée sur toute une file (côte Est, ~43 GB)</a><a href="#legs-we-lose" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Les manches que nous ne gagnons pas</a><a href="#low-memory" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">L’échelle basse mémoire : 190 GB dans ~1.1 GB de RAM</a><a href="#nested" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Dix formes imbriquées : qui finit sans vous</a><a href="#unpack-repair" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Les moteurs d’extraction et de réparation, en course en solo</a><a href="#client-matrix" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Ce que chaque client sait faire</a><a href="#real-lines" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Le moteur sature de vraies lignes</a></nav>
+</div>
+<section style="padding-top:26px" id="setup">
   <div class="wrap">
     <p class="kicker">La méthodologie d’abord</p>
     <h2>Le protocole</h2>
@@ -60,7 +64,7 @@
   </div>
 </section>
 
-<section class="alt">
+<section class="alt" id="huge-190">
   <div class="wrap">
     <p class="kicker">Scénario 1 · propre, énorme</p>
     <h2>190.6 GB → un seul mkv de 167.9 GB (Europe, 10 GbE)</h2>
@@ -89,7 +93,7 @@
   </div>
 </section>
 
-<section>
+<section id="by-job-size">
   <div class="wrap">
     <p class="kicker">Scénario 2 · l’écart croît avec la taille</p>
     <h2>Temps jusqu’au fichier utilisable, par taille de tâche</h2>
@@ -111,7 +115,7 @@
   </div>
 </section>
 
-<section class="alt">
+<section class="alt" id="hash-named-35">
   <div class="wrap">
     <p class="kicker">Scénario 3 · post obfusqué</p>
     <h2>4K à noms hachés de 35 GB → mkv utilisable (côte Est)</h2>
@@ -128,7 +132,7 @@
   </div>
 </section>
 
-<section>
+<section id="queue">
   <div class="wrap">
     <p class="kicker">Scénario 4 · file de trois</p>
     <h2>Garder la ligne allumée sur toute une file (côte Est, ~43 GB)</h2>
@@ -148,7 +152,7 @@
   </div>
 </section>
 
-<section class="alt">
+<section class="alt" id="legs-we-lose">
   <div class="wrap">
     <p class="kicker">La colonne honnête</p>
     <h2>Les manches que nous ne gagnons pas</h2>
@@ -172,7 +176,7 @@
   </div>
 </section>
 
-<section>
+<section id="low-memory">
   <div class="wrap">
     <p class="kicker">Scénario 6 · affamez-le de RAM</p>
     <h2>L’échelle basse mémoire : 190 GB dans ~1.1 GB de RAM</h2>
@@ -198,7 +202,7 @@
   </div>
 </section>
 
-<section class="alt">
+<section class="alt" id="nested">
   <div class="wrap">
     <p class="kicker">Scénario 7 · des archives dans des archives</p>
     <h2>Dix formes imbriquées : qui finit sans vous</h2>
@@ -232,7 +236,7 @@
   </div>
 </section>
 
-<section>
+<section id="unpack-repair">
   <div class="wrap">
     <p class="kicker">Duels de composants</p>
     <h2>Les moteurs d’extraction et de réparation, en course en solo</h2>
@@ -261,7 +265,7 @@
   </div>
 </section>
 
-<section class="alt">
+<section class="alt" id="client-matrix">
   <div class="wrap">
     <p class="kicker">Des capacités, pas des micro-benchmarks</p>
     <h2>Ce que chaque client sait faire</h2>
@@ -292,7 +296,7 @@
   </div>
 </section>
 
-<section>
+<section id="real-lines">
   <div class="wrap">
     <p class="kicker">Preuve de transport</p>
     <h2>Le moteur sature de vraies lignes</h2>

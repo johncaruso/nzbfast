@@ -47,7 +47,11 @@
   descargado, verificado, extraído. Incluye los tramos que no ganamos.</p>
 </div>
 
-<section style="padding-top:26px">
+<div class="wrap" data-benchtoc style="padding:10px 0 2px">
+  <p class="kicker">En esta página</p>
+  <nav aria-label="En esta página" style="display:flex;flex-wrap:wrap;gap:7px"><a href="#setup" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">El montaje</a><a href="#huge-190" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">190.6 GB → un único mkv de 167.9 GB (Europa, 10 GbE)</a><a href="#by-job-size" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Tiempo hasta archivo usable, por tamaño de trabajo</a><a href="#hash-named-35" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">35 GB 4K con nombre hash → mkv usable (costa este)</a><a href="#queue" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Mantener la línea encendida a lo largo de una cola (costa este, ~43 GB)</a><a href="#legs-we-lose" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Los tramos que no ganamos</a><a href="#low-memory" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">La escalera de baja memoria: 190 GB en ~1.1 GB de RAM</a><a href="#nested" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Diez formas anidadas: quién termina sin ti</a><a href="#unpack-repair" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Los motores de desempaquetado y reparación, compitiendo en solitario</a><a href="#client-matrix" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Qué puede hacer cada cliente</a><a href="#real-lines" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">El motor satura líneas reales</a></nav>
+</div>
+<section style="padding-top:26px" id="setup">
   <div class="wrap">
     <p class="kicker">Primero la metodología</p>
     <h2>El montaje</h2>
@@ -60,7 +64,7 @@
   </div>
 </section>
 
-<section class="alt">
+<section class="alt" id="huge-190">
   <div class="wrap">
     <p class="kicker">Escenario 1 · limpio, enorme</p>
     <h2>190.6 GB → un único mkv de 167.9 GB (Europa, 10 GbE)</h2>
@@ -89,7 +93,7 @@
   </div>
 </section>
 
-<section>
+<section id="by-job-size">
   <div class="wrap">
     <p class="kicker">Escenario 2 · la diferencia crece con el tamaño</p>
     <h2>Tiempo hasta archivo usable, por tamaño de trabajo</h2>
@@ -111,7 +115,7 @@
   </div>
 </section>
 
-<section class="alt">
+<section class="alt" id="hash-named-35">
   <div class="wrap">
     <p class="kicker">Escenario 3 · publicación ofuscada</p>
     <h2>35 GB 4K con nombre hash → mkv usable (costa este)</h2>
@@ -128,7 +132,7 @@
   </div>
 </section>
 
-<section>
+<section id="queue">
   <div class="wrap">
     <p class="kicker">Escenario 4 · cola de tres</p>
     <h2>Mantener la línea encendida a lo largo de una cola (costa este, ~43 GB)</h2>
@@ -148,7 +152,7 @@
   </div>
 </section>
 
-<section class="alt">
+<section class="alt" id="legs-we-lose">
   <div class="wrap">
     <p class="kicker">La columna honesta</p>
     <h2>Los tramos que no ganamos</h2>
@@ -171,7 +175,7 @@
   </div>
 </section>
 
-<section>
+<section id="low-memory">
   <div class="wrap">
     <p class="kicker">Escenario 6 · privado de RAM</p>
     <h2>La escalera de baja memoria: 190 GB en ~1.1 GB de RAM</h2>
@@ -197,7 +201,7 @@
   </div>
 </section>
 
-<section class="alt">
+<section class="alt" id="nested">
   <div class="wrap">
     <p class="kicker">Escenario 7 · archivos dentro de archivos</p>
     <h2>Diez formas anidadas: quién termina sin ti</h2>
@@ -230,7 +234,7 @@
   </div>
 </section>
 
-<section>
+<section id="unpack-repair">
   <div class="wrap">
     <p class="kicker">Duelos de componentes</p>
     <h2>Los motores de desempaquetado y reparación, compitiendo en solitario</h2>
@@ -258,7 +262,7 @@
   </div>
 </section>
 
-<section class="alt">
+<section class="alt" id="client-matrix">
   <div class="wrap">
     <p class="kicker">Capacidad, no microbenchmarks</p>
     <h2>Qué puede hacer cada cliente</h2>
@@ -289,7 +293,7 @@
   </div>
 </section>
 
-<section>
+<section id="real-lines">
   <div class="wrap">
     <p class="kicker">Prueba de transporte</p>
     <h2>El motor satura líneas reales</h2>

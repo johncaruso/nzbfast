@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Benchmarks - nzbfast</title>
-<meta name="description" content="nzbfast vs SABnzbd, NZBGet and rustnzb: 4 clients × 7 scenarios on identical hardware. Honest results including the legs nzbfast doesn't win, with reproduction steps.">
+<meta name="description" content="nzbfast vs SABnzbd, NZBGet, rustnzb and Weaver: 5 clients × 8 scenarios on identical hardware. Honest results including the legs nzbfast doesn't win, with reproduction steps.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="assets/site.css">
 <link rel="alternate" hreflang="en" href="benchmarks.html">
@@ -42,17 +42,21 @@
 
 <div class="hero wrap" style="padding-bottom:6px">
   <h1>Benchmarks</h1>
-  <p class="sub">Four clients, seven scenarios, identical hardware and providers, runs
+  <p class="sub">Five clients, eight scenarios, identical hardware and providers, runs
   interleaved so provider drift cancels. The metric is <b>time to a usable file</b>:
   downloaded, verified, extracted. Includes the legs we don't win.</p>
 </div>
 
-<section style="padding-top:26px">
+<div class="wrap" data-benchtoc style="padding:10px 0 2px">
+  <p class="kicker">On this page</p>
+  <nav aria-label="On this page" style="display:flex;flex-wrap:wrap;gap:7px"><a href="#setup" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">The setup</a><a href="#huge-190" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">190.6 GB → single 167.9 GB mkv (Europe, 10 GbE)</a><a href="#by-job-size" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Time to usable file, by job size</a><a href="#hash-named-35" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">35 GB hash-named 4K → usable mkv (East Coast)</a><a href="#queue" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Keeping the line lit across a queue (East Coast, ~43 GB)</a><a href="#legs-we-lose" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">The legs we don&#x27;t win</a><a href="#low-memory" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">The low-memory ladder: 190 GB in ~1.1 GB of RAM</a><a href="#nested" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Ten nested shapes: who finishes without you</a><a href="#client-ceiling" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Client ceiling: 9.68 GB served from RAM, Weaver included</a><a href="#unpack-repair" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">The unpack and repair engines, raced solo</a><a href="#client-matrix" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">What each client can do</a><a href="#real-lines" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">The engine saturates real lines</a></nav>
+</div>
+<section style="padding-top:26px" id="setup">
   <div class="wrap">
     <p class="kicker">Methodology first</p>
     <h2>The setup</h2>
     <ul class="plain">
-      <li><b>Clients:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (the closest Rust peer), all on the same machine per scenario (Apple M-series boxes: "Europe" M1 Ultra on 10&nbsp;GbE, "East Coast" M3 Ultra ~2.4–3.0 Gbps line).</li>
+      <li><b>Clients:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 · Weaver (the two closest Rust peers), all on the same machine per scenario (Apple M-series boxes: "Europe" M1 Ultra on 10&nbsp;GbE, "East Coast" M3 Ultra ~2.4–3.0 Gbps line). Weaver appears in the reproducible client-ceiling leg below; the provider legs predate it.</li>
       <li><b>Fairness:</b> same 6 providers × 8 connections, TLS everywhere, legs run back-to-back interleaved. Every competitor tuned to its documented best: SABnzbd got <code>pipelining_requests=8</code> (<b>it ships 1, i.e. unpipelined</b>; that setting alone took its 190 GB time from 24m24s to 19m02s), NZBGet got ArticleCache/DirectWrite/DirectUnpack/ParQuick, rustnzb its documented config.</li>
       <li><b>End state:</b> a verified, extracted, usable file, not "download finished". That's what you actually wait for.</li>
       <li><b>Reproducibility:</b> every claim traces to a dated entry in our benchmark log, recorded with the driver scripts that produced it: wall-clock + interface byte counters + process-tree peak RSS, 1–2 s resolution.</li>
@@ -60,7 +64,7 @@
   </div>
 </section>
 
-<section class="alt">
+<section class="alt" id="huge-190">
   <div class="wrap">
     <p class="kicker">Scenario 1 · clean, huge</p>
     <h2>190.6 GB → single 167.9 GB mkv (Europe, 10 GbE)</h2>
@@ -89,7 +93,7 @@
   </div>
 </section>
 
-<section>
+<section id="by-job-size">
   <div class="wrap">
     <p class="kicker">Scenario 2 · the gap grows with size</p>
     <h2>Time to usable file, by job size</h2>
@@ -111,7 +115,7 @@
   </div>
 </section>
 
-<section class="alt">
+<section class="alt" id="hash-named-35">
   <div class="wrap">
     <p class="kicker">Scenario 3 · obfuscated post</p>
     <h2>35 GB hash-named 4K → usable mkv (East Coast)</h2>
@@ -128,7 +132,7 @@
   </div>
 </section>
 
-<section>
+<section id="queue">
   <div class="wrap">
     <p class="kicker">Scenario 4 · queue of three</p>
     <h2>Keeping the line lit across a queue (East Coast, ~43 GB)</h2>
@@ -148,7 +152,7 @@
   </div>
 </section>
 
-<section class="alt">
+<section class="alt" id="legs-we-lose">
   <div class="wrap">
     <p class="kicker">The honest column</p>
     <h2>The legs we don't win</h2>
@@ -170,7 +174,7 @@
   </div>
 </section>
 
-<section>
+<section id="low-memory">
   <div class="wrap">
     <p class="kicker">Scenario 6 · starve it of RAM</p>
     <h2>The low-memory ladder: 190 GB in ~1.1 GB of RAM</h2>
@@ -196,7 +200,7 @@
   </div>
 </section>
 
-<section class="alt">
+<section class="alt" id="nested">
   <div class="wrap">
     <p class="kicker">Scenario 7 · archives inside archives</p>
     <h2>Ten nested shapes: who finishes without you</h2>
@@ -229,7 +233,59 @@
   </div>
 </section>
 
-<section>
+<section id="client-ceiling">
+  <div class="wrap">
+    <p class="kicker">Scenario 8 · five clients, reproducible content</p>
+    <h2>Client ceiling: 9.68 GB served from RAM, Weaver included</h2>
+    <p class="lead">Every leg above runs against commercial providers, so you have to take our word
+    for the line conditions. This one you can rebuild yourself: the content is Blender's open movies
+    (Tears of Steel 4K, Sintel, Big Buck Bunny 4K at 60 and 30 fps), CC-BY 3.0, packed store-mode
+    RAR plus 10% PAR2 into 53 files and 14,521 articles, served over loopback NNTP from RAM by a rig
+    in this repository. <b>No provider is involved</b>, so this measures the client itself, with
+    provider variance removed rather than averaged out.</p>
+    <p class="note" style="text-align:start">Because the articles come from memory, the absolute
+    times are far shorter than any real download and are <b>not</b> comparable to the provider legs
+    above. Read the ratios and the disk column, not the seconds.</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>client</th><th>time to finish</th><th>connections</th><th>peak disk</th><th>vs nzbfast</th></tr></thead>
+      <tbody>
+        <tr><td><b>nzbfast</b></td><td><b>5 s</b></td><td>8</td><td><b>8.6 GB</b></td><td>baseline</td></tr>
+        <tr><td>Weaver (warmed)</td><td>8 s</td><td>120 (auto-ramp)</td><td>17.9 GB</td><td>1.6× slower</td></tr>
+        <tr><td>NZBGet 26.2</td><td>12 s</td><td>16</td><td>17.6 GB</td><td>2.4× slower</td></tr>
+        <tr><td>SABnzbd 5.0.4</td><td>14 s</td><td>8</td><td>17.6 GB</td><td>2.8× slower</td></tr>
+        <tr><td>rustnzb 1.3.4</td><td>23 s</td><td>8</td><td>18.7 GB</td><td>4.6× slower</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start"><b>Time to finish</b> runs from starting the job to all
+    four videos being on disk, verified and extracted. <b>Peak disk</b> is the most disk the client
+    ever occupied at any instant, sampled twice a second, and it is the column that matters most
+    here: one-pass needs about 1× the content, everything else about 2×. All five ended holding the
+    same 8.6 GB once they had tidied up, which is exactly why the peak is the interesting figure.
+    Every client produced all four payloads sha256-identical to source. Each is shown at whichever
+    connection count made <i>it</i> fastest (8, 16 and 32 were tried on each; nzbfast was flat at
+    all three, so more connections would not have helped it).</p>
+    <p class="note" style="text-align:start"><b>Every competitor at its documented best, and what
+    that cost us.</b> A rival must never lose because we misconfigured it, and auditing this round
+    turned up four defects that had all flattered nzbfast. SABnzbd was running <i>unpipelined</i>: it
+    rewrites its own ini at startup and silently reverted <code>pipelining_requests=8</code> to the
+    shipped <code>1</code>, so it has to be set over the API afterwards and read back to confirm.
+    Fixing that alone took it from 57 s to 14 s, a 4× gain. NZBGet was running with its article cache
+    off, because a standalone <code>-c</code> config inherits NZBGet's built-in defaults rather than
+    the values in its shipped conf: 28 s to 19 s. Weaver needs warming, since it auto-ramps to 120
+    connections and tunes its pools on the first job, and its <code>download</code> CLI never exits,
+    so it is measured as a persistent daemon with a discarded warm-up pass. Cold it looks broken;
+    warmed it is the closest competitor here. Weaver's 8 s is therefore a warmed daemon at 120
+    connections against our cold one-shot at 8. That is each client at its best by our own rule, but
+    the asymmetry is real and we would rather state it than bury it.</p>
+    <p class="note" style="text-align:start">Weaver also looked one-pass at first: a single
+    measurement after its run showed it holding about the same 8.6 GB as everyone else. That was the
+    tidied aftermath, since it deletes volumes once extraction finishes. Polled every half second its
+    true peak is 17.9 GB, the highest of the five. For anything that self-cleans, report the peak,
+    not the leftovers.</p>
+  </div>
+</section>
+
+<section id="unpack-repair">
   <div class="wrap">
     <p class="kicker">Component shootouts</p>
     <h2>The unpack and repair engines, raced solo</h2>
@@ -255,7 +311,7 @@
   </div>
 </section>
 
-<section class="alt">
+<section class="alt" id="client-matrix">
   <div class="wrap">
     <p class="kicker">Capability, not micro-benchmarks</p>
     <h2>What each client can do</h2>
@@ -286,7 +342,7 @@
   </div>
 </section>
 
-<section>
+<section id="real-lines">
   <div class="wrap">
     <p class="kicker">Transport proof</p>
     <h2>The engine saturates real lines</h2>
@@ -315,8 +371,17 @@
     </div>
   </div>
   <p class="fine">Benchmark data: 19–24 July 2026 competitive rounds. Client
-  versions: SABnzbd 5.0.4, NZBGet 26.2 (nzbget.com fork), rustnzb 1.3.4. If a newer version of
-  any client materially changes a result, we'll re-run and update.</p>
+  versions: SABnzbd 5.0.4, NZBGet 26.2 (nzbget.com fork), rustnzb 1.3.4, Weaver (build of 23 July).
+  If a newer version of any client materially changes a result, we'll re-run and update.
+  <b>Two honest caveats about age.</b> The head-to-head provider legs were measured on
+  20–24 July against the nzbfast of that date, before a run of decode, sharding and PAR2 work
+  landed, so our own figures there understate the current build rather than flatter it. And those
+  legs predate both Weaver's inclusion and several tuning defects we later found in our own
+  harness (SABnzbd silently unpipelined, NZBGet's article cache off), all of which had favoured
+  us. A refreshed provider round on the shipping build, with every competitor at the settings
+  documented above and Weaver included, is in progress; these numbers will be replaced by it
+  rather than added to. We are also preparing test files whose NZBs we can publish, so the
+  provider legs become independently reproducible in the way the client-ceiling leg already is.</p>
 </div></footer>
 
 </body>
