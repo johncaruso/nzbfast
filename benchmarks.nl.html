@@ -58,7 +58,7 @@
     <p class="kicker">Eerst de methodologie</p>
     <h2>De opzet</h2>
     <ul class="plain">
-      <li><b>Clients:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (de dichtstbijzijnde Rust-tegenhanger), allemaal op dezelfde machine per scenario (Apple M-serie machines: "Europa" M1 Ultra op 10&nbsp;GbE, "oostkust VS" M3 Ultra ~2.4–3.0 Gbps-lijn).</li>
+      <li><b>Clients:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (de dichtstbijzijnde Rust-tegenhanger), allemaal op dezelfde machine per scenario (Apple M-serie machines: "Europa" M1 Ultra op 10&nbsp;GbE, "oostkust VS" M3 Ultra ~2.4–3.0 Gbps-lijn). De cijfers van nzbfast beslaan de builds 1.0.2 tot 1.0.7 terwijl de engine veranderde; oudere runs onderschatten de uitgebrachte build in plaats van hem te vleien.</li>
       <li><b>Eerlijkheid:</b> dezelfde 6 providers × 8 verbindingen, overal TLS, legs afwisselend achter elkaar uitgevoerd. Elke concurrent afgesteld op z'n gedocumenteerde optimum: SABnzbd kreeg <code>pipelining_requests=8</code> (<b>standaard staat die op 1, dus ongepipelined</b>; alleen die instelling al bracht z'n 190 GB-tijd terug van 24m24s naar 19m02s), NZBGet kreeg ArticleCache/DirectWrite/DirectUnpack/ParQuick, rustnzb z'n gedocumenteerde config.</li>
       <li><b>Eindtoestand:</b> een geverifieerd, uitgepakt, bruikbaar bestand, niet "download klaar". Daar wacht je namelijk echt op.</li>
       <li><b>Reproduceerbaarheid:</b> elke claim is te herleiden tot een gedateerde vermelding in onze benchmarklog, vastgelegd met de driver-scripts die hem produceerden: verstreken tijd + interface-bytetellers + piek-RSS van de processtructuur, resolutie van 1–2 s.</li>

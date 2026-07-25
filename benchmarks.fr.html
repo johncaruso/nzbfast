@@ -58,7 +58,7 @@
     <p class="kicker">La méthodologie d’abord</p>
     <h2>Le protocole</h2>
     <ul class="plain">
-      <li><b>Clients :</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (le pair Rust le plus proche), tous sur la même machine par scénario (machines Apple série M : M1 Ultra « Europe » sur 10&nbsp;GbE, M3 Ultra « côte Est » sur une ligne ~2.4–3.0 Gbps).</li>
+      <li><b>Clients :</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (le pair Rust le plus proche), tous sur la même machine par scénario (machines Apple série M : M1 Ultra « Europe » sur 10&nbsp;GbE, M3 Ultra « côte Est » sur une ligne ~2.4–3.0 Gbps). Les chiffres de nzbfast couvrent les versions 1.0.2 à 1.0.7 au fil de l’évolution du moteur ; les manches les plus anciennes sous-estiment la version publiée plutôt qu’elles ne la flattent.</li>
       <li><b>Équité :</b> mêmes 6 fournisseurs × 8 connexions, TLS partout, manches exécutées coup sur coup en entrelacé. Chaque concurrent réglé à son meilleur documenté : SABnzbd a reçu <code>pipelining_requests=8</code> (<b>il est livré avec 1, c’est-à-dire non pipeliné</b> ; ce seul réglage a fait passer son temps sur 190 GB de 24m24s à 19m02s), NZBGet a reçu ArticleCache/DirectWrite/DirectUnpack/ParQuick, rustnzb sa config documentée.</li>
       <li><b>État final :</b> un fichier vérifié, extrait, utilisable, pas « téléchargement terminé ». C’est ce que vous attendez réellement.</li>
       <li><b>Reproductibilité :</b> chaque affirmation renvoie à une entrée datée de notre journal de benchmarks, consignée avec les scripts de pilotage qui l’ont produite : horloge murale + compteurs d’octets d’interface + pic de RSS de l’arbre de processus, résolution de 1–2 s.</li>

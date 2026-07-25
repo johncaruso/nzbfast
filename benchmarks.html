@@ -58,7 +58,7 @@
     <p class="kicker">Methodology first</p>
     <h2>The setup</h2>
     <ul class="plain">
-      <li><b>Clients:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 · Weaver, all on the same machine per scenario (Apple M-series boxes: "Europe" M1 Ultra on 10&nbsp;GbE, "East Coast" M3 Ultra ~2.4–3.0 Gbps line). The provider legs below predate Weaver's inclusion; it appears in the reproducible client-ceiling leg.</li>
+      <li><b>Clients:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 · Weaver, all on the same machine per scenario (Apple M-series boxes: "Europe" M1 Ultra on 10&nbsp;GbE, "East Coast" M3 Ultra ~2.4–3.0 Gbps line). The provider legs below predate Weaver's inclusion; it appears in the reproducible client-ceiling leg. nzbfast's own figures span builds 1.0.2 to 1.0.7 as the engine changed; older legs understate the shipping build rather than flatter it.</li>
       <li><b>Fairness:</b> same 6 providers × 8 connections, TLS everywhere, legs run back-to-back interleaved. Every competitor tuned to its documented best: SABnzbd got <code>pipelining_requests=8</code> (<b>it ships 1, i.e. unpipelined</b>; that setting alone took its 190 GB time from 24m24s to 19m02s), NZBGet got ArticleCache/DirectWrite/DirectUnpack/ParQuick, rustnzb its documented config.</li>
       <li><b>End state:</b> a verified, extracted, usable file, not "download finished". That's what you actually wait for.</li>
       <li><b>Reproducibility:</b> every claim is dated and measured the same way: elapsed time + interface byte counters + process-tree peak RSS, 1–2 s resolution. Where a leg runs on a publicly posted NZB, we name it so you can run it yourself.</li>
@@ -490,7 +490,7 @@
     </div>
   </div>
   <p class="fine">Benchmark data: 19&ndash;24 July 2026 competitive rounds. Client
-  versions: SABnzbd 5.0.4, NZBGet 26.2 (nzbget.com fork), rustnzb 1.3.4, Weaver (build of 23 July).
+  versions: SABnzbd 5.0.4, NZBGet 26.2 (nzbget.com fork), rustnzb 1.3.4, Weaver (source build <code>410c114</code>, 23 July; it reports no version string of its own).
   If a newer version of any client materially changes a result, we'll re-run and update.
   <b>One honest caveat about age.</b> The head-to-head provider legs were measured on 20&ndash;24 July
   against the nzbfast of that date, before a run of decode, sharding and PAR2 work landed, so our own

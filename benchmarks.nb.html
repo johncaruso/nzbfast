@@ -58,7 +58,7 @@
     <p class="kicker">Metode først</p>
     <h2>Oppsettet</h2>
     <ul class="plain">
-      <li><b>Klienter:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (den nærmeste Rust-slektningen), alle på samme maskin per scenario (Apple M-serie-maskiner: «Europa» M1 Ultra på 10&nbsp;GbE, «østkysten» M3 Ultra ~2,4–3,0 Gbps-linje).</li>
+      <li><b>Klienter:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (den nærmeste Rust-slektningen), alle på samme maskin per scenario (Apple M-serie-maskiner: «Europa» M1 Ultra på 10&nbsp;GbE, «østkysten» M3 Ultra ~2,4–3,0 Gbps-linje). nzbfasts egne tall spenner over buildene 1.0.2 til 1.0.7 mens motoren endret seg; eldre kjøringer undervurderer den utgitte builden i stedet for å smigre den.</li>
       <li><b>Rettferdighet:</b> samme 6 leverandører × 8 tilkoblinger, TLS overalt, etapper kjørt rett etter hverandre og flettet. Hver konkurrent justert til sitt dokumenterte beste: SABnzbd fikk <code>pipelining_requests=8</code> (<b>den leveres med 1, dvs. upipelinet</b>; den innstillingen alene tok 190 GB-tiden dens fra 24m24s til 19m02s), NZBGet fikk ArticleCache/DirectWrite/DirectUnpack/ParQuick, rustnzb sin dokumenterte konfigurasjon.</li>
       <li><b>Sluttilstand:</b> en verifisert, utpakket, brukbar fil, ikke «nedlasting ferdig». Det er det du faktisk venter på.</li>
       <li><b>Reproduserbarhet:</b> hvert utsagn kan spores til en datert oppføring i benchmark-loggen vår, registrert med driverskriptene som produserte det: veggklokke + grensesnitt-byte-tellere + prosess-tre-topp-RSS, 1–2 s oppløsning.</li>

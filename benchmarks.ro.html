@@ -58,7 +58,7 @@
     <p class="kicker">Mai întâi metodologia</p>
     <h2>Configurația</h2>
     <ul class="plain">
-      <li><b>Clienți:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (cel mai apropiat omolog Rust), toți pe aceeași mașină per scenariu (mașini Apple din seria M: „Europa” M1 Ultra pe 10&nbsp;GbE, „Coasta de Est” M3 Ultra pe o linie de ~2.4–3.0 Gbps).</li>
+      <li><b>Clienți:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (cel mai apropiat omolog Rust), toți pe aceeași mașină per scenariu (mașini Apple din seria M: „Europa” M1 Ultra pe 10&nbsp;GbE, „Coasta de Est” M3 Ultra pe o linie de ~2.4–3.0 Gbps). Cifrele nzbfast acoperă versiunile 1.0.2 până la 1.0.7 pe măsură ce motorul s-a schimbat; rulările mai vechi subestimează versiunea publicată în loc să o flateze.</li>
       <li><b>Corectitudine:</b> aceiași 6 provideri × 8 conexiuni, TLS peste tot, probele rulate una după alta, intercalat. Fiecare concurent reglat la maximul său documentat: SABnzbd a primit <code>pipelining_requests=8</code> (<b>vine cu 1, adică fără pipelining</b>; doar acea setare i-a redus timpul pe 190 GB de la 24m24s la 19m02s), NZBGet a primit ArticleCache/DirectWrite/DirectUnpack/ParQuick, rustnzb configurația sa documentată.</li>
       <li><b>Stare finală:</b> un fișier verificat, extras, utilizabil, nu „descărcare terminată”. Asta e ce aștepți de fapt.</li>
       <li><b>Reproductibilitate:</b> fiecare afirmație se leagă de o intrare datată în jurnalul nostru de benchmark, înregistrată cu scripturile driver care au produs-o: timp real + contoare de octeți pe interfață + RSS de vârf pe arborele de procese, rezoluție 1–2 s.</li>

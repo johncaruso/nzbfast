@@ -58,7 +58,7 @@
     <p class="kicker">Erst die Methodik</p>
     <h2>Der Aufbau</h2>
     <ul class="plain">
-      <li><b>Clients:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (der nächste Rust-Verwandte), alle pro Szenario auf derselben Maschine (Apple-M-Series-Boxen: „Europa“ M1 Ultra auf 10&nbsp;GbE, „US-Ostküste“ M3 Ultra ~2.4–3.0 Gbps Leitung).</li>
+      <li><b>Clients:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (der nächste Rust-Verwandte), alle pro Szenario auf derselben Maschine (Apple-M-Series-Boxen: „Europa“ M1 Ultra auf 10&nbsp;GbE, „US-Ostküste“ M3 Ultra ~2.4–3.0 Gbps Leitung). nzbfasts eigene Zahlen erstrecken sich über die Builds 1.0.2 bis 1.0.7, während sich die Engine änderte; ältere Läufe untertreiben den ausgelieferten Build, statt ihm zu schmeicheln.</li>
       <li><b>Fairness:</b> dieselben 6 Provider × 8 Verbindungen, überall TLS, Etappen verschränkt hintereinander. Jede Konkurrenz auf ihr dokumentiertes Bestes getunt: SABnzbd bekam <code>pipelining_requests=8</code> (<b>es liefert 1 aus, also ungepipelinet</b>; allein diese Einstellung brachte seine 190-GB-Zeit von 24m24s auf 19m02s), NZBGet bekam ArticleCache/DirectWrite/DirectUnpack/ParQuick, rustnzb seine dokumentierte Konfiguration.</li>
       <li><b>Endzustand:</b> eine geprüfte, entpackte, benutzbare Datei, nicht „Download fertig“. Darauf wartest du wirklich.</li>
       <li><b>Reproduzierbarkeit:</b> jede Behauptung führt auf einen datierten Eintrag in unserem Benchmark-Log zurück, aufgezeichnet mit den Treiber-Skripten, die ihn erzeugt haben: Wall-Clock + Interface-Byte-Zähler + Prozessbaum-Spitzen-RSS, 1–2 s Auflösung.</li>
