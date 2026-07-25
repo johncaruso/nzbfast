@@ -173,3 +173,9 @@ footer .fine{margin-top:22px;font-size:11.5px;max-width:760px;line-height:1.7}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 [dir=rtl] code,[dir=rtl] kbd{direction:ltr;unicode-bidi:isolate}
 [dir=rtl] pre,[dir=rtl] pre.cmd,[dir=rtl] .pipe pre{direction:ltr;text-align:left}
+
+/* benchmark tables: a group-header row that splits one table by machine */
+.bars.wide .bar{grid-template-columns:150px 1fr 208px}
+@media (max-width:640px){.bars.wide .bar{grid-template-columns:92px 1fr 132px}}
+tbody td.grp{font:700 11px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;
+  color:var(--acc);background:var(--card2);padding-top:15px}
