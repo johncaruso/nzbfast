@@ -24,10 +24,14 @@ a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
 nav{position:sticky;top:0;align-self:start;height:100vh;overflow-y:auto;
   padding:28px 18px 40px;padding-inline-start:22px;border-inline-end:1px solid var(--line);font-size:13px}
 nav .brand{font-size:19px;font-weight:700;margin-bottom:2px}
+nav a.brand{display:block;color:inherit;text-decoration:none}
+nav a.brand:hover{opacity:.72}
 nav .brand small{color:var(--dim);font-weight:400;font-size:12px}
 nav ol{list-style:none;padding:0;margin:14px 0 0}
 nav li{margin:1px 0}
 nav a{display:block;padding:3.5px 8px;border-radius:6px;color:var(--fg)}
+/* the language row is inline: nav a is display:block for the contents list */
+nav .langsw a{display:inline;padding:0;border-radius:0}
 nav a:hover{background:var(--code);text-decoration:none}
 nav .sub{margin-inline-start:12px;color:var(--dim)}
 main{padding:34px 42px 90px;min-width:0}
@@ -88,9 +92,9 @@ hr{border:none;border-top:1px solid var(--line);margin:30px 0}
 <body>
 <div class="wrap">
 <nav>
-  <div class="brand">⚡ nzbfast <small>User Manual</small></div>
+  <a class="brand" href="index.html">⚡ nzbfast <small>User Manual</small></a>
   <!-- i18n switcher: same markup in every language; hrefs never change -->
-  <div class="langsw" style="font-size:11.5px;margin-top:6px;color:var(--dim)"><a href="/manual">EN</a> · <a href="/manual/fr">FR</a> · <a href="/manual/de">DE</a> · <a href="/manual/it">IT</a> · <a href="/manual/es">ES</a> · <a href="/manual/nl">NL</a> · <a href="/manual/pt">PT</a> · <a href="/manual/sv">SV</a> · <a href="/manual/da">DA</a> · <a href="/manual/nb">NB</a> · <a href="/manual/fi">FI</a> · <a href="/manual/tr">TR</a> · <a href="/manual/ro">RO</a> · <a href="/manual/he">HE</a> · <a href="/manual/ar">AR</a> · <a href="/manual/fa">FA</a></div>
+  <div class="langsw" style="font-size:11.5px;margin-top:6px;color:var(--dim)"><a href="MANUAL.html">EN</a> · <a href="MANUAL.fr.html">FR</a> · <a href="MANUAL.de.html">DE</a> · <a href="MANUAL.it.html">IT</a> · <a href="MANUAL.es.html">ES</a> · <a href="MANUAL.nl.html">NL</a> · <a href="MANUAL.pt.html">PT</a> · <a href="MANUAL.sv.html">SV</a> · <a href="MANUAL.da.html">DA</a> · <a href="MANUAL.nb.html">NB</a> · <a href="MANUAL.fi.html">FI</a> · <a href="MANUAL.tr.html">TR</a> · <a href="MANUAL.ro.html">RO</a> · <a href="MANUAL.he.html">HE</a> · <a href="MANUAL.ar.html">AR</a> · <a href="MANUAL.fa.html">FA</a></div>
   <ol>
     <li><a href="#intro">1 · Welcome</a></li>
     <li><a href="#quickstart">2 · Quick start</a></li>

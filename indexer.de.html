@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Indexer &amp; die Posterwand - nzbfast</title>
+<meta name="description" content="Scanne die Gruppen, die dich interessieren, in einen privaten Index und stöbere dann im Ergebnis als Posterwand. Jedes bisschen der Metadaten holt deine eigene Installation aus sch">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<link rel="stylesheet" href="assets/site.css">
+<link rel="alternate" hreflang="en" href="indexer.html">
+<link rel="alternate" hreflang="fr" href="indexer.fr.html">
+<link rel="alternate" hreflang="de" href="indexer.de.html">
+<link rel="alternate" hreflang="it" href="indexer.it.html">
+<link rel="alternate" hreflang="es" href="indexer.es.html">
+<link rel="alternate" hreflang="nl" href="indexer.nl.html">
+<link rel="alternate" hreflang="pt" href="indexer.pt.html">
+<link rel="alternate" hreflang="sv" href="indexer.sv.html">
+<link rel="alternate" hreflang="da" href="indexer.da.html">
+<link rel="alternate" hreflang="nb" href="indexer.nb.html">
+<link rel="alternate" hreflang="fi" href="indexer.fi.html">
+<link rel="alternate" hreflang="tr" href="indexer.tr.html">
+<link rel="alternate" hreflang="ro" href="indexer.ro.html">
+<link rel="alternate" hreflang="he" href="indexer.he.html">
+<link rel="alternate" hreflang="ar" href="indexer.ar.html">
+<link rel="alternate" hreflang="fa" href="indexer.fa.html">
+<link rel="alternate" hreflang="x-default" href="indexer.html">
+</head>
+<body>
+
+<header><div class="wrap">
+  <a class="logo" href="index.de.html"><span class="bolt">⚡</span> nzbfast</a>
+  <nav>
+    <a href="index.de.html" class="home">Startseite</a>
+    <a href="features.de.html">Funktionen</a>
+    <a href="indexer.de.html" class="on">Indexer</a>
+    <a href="benchmarks.de.html">Benchmarks</a>
+    <a href="MANUAL.html">Doku</a>
+    <a href="https://github.com/nzbfast/nzbfast" title="Source repository">GitHub</a>
+    <a class="cta" href="download.de.html">Download</a>
+    <!-- i18n picker: same markup in every language file; hrefs fixed -->
+    <select class="langsw" aria-label="Language" style="font-size:11.5px;opacity:.8;margin-inline-start:10px;background:transparent;color:inherit;border:1px solid rgba(128,128,128,.4);border-radius:6px;padding:2px 4px;cursor:pointer;max-width:110px" onchange="location.href=this.value"><option value="indexer.html">English</option><option value="indexer.fr.html">Français</option><option value="indexer.de.html" selected>Deutsch</option><option value="indexer.it.html">Italiano</option><option value="indexer.es.html">Español</option><option value="indexer.nl.html">Nederlands</option><option value="indexer.pt.html">Português</option><option value="indexer.sv.html">Svenska</option><option value="indexer.da.html">Dansk</option><option value="indexer.nb.html">Norsk</option><option value="indexer.fi.html">Suomi</option><option value="indexer.tr.html">Türkçe</option><option value="indexer.ro.html">Română</option><option value="indexer.he.html">עברית</option><option value="indexer.ar.html">العربية</option><option value="indexer.fa.html">فارسی</option></select>
+  </nav>
+</div></header>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Das Schaufenster</p>
+    <h2>Dein Index, präsentiert als Posterwand</h2>
+    <p class="lead">Der eingebaute Indexer scannt die Newsgroups, die dich interessieren; die Wand macht
+    daraus Poster, Bewertungen, Besetzung und Episodenraster, nur aus schlüssellosen öffentlichen
+    Quellen, geholt von deiner eigenen Installation. Klick auf einen Episoden-Chip, um ihn zu laden.</p>
+    <figure class="shot"><img src="assets/wall-grid.jpg" alt="nzbfast poster wall: a grid of TV posters with quality badges, ratings and season counts" loading="lazy"></figure>
+    <div style="height:18px"></div>
+    <div class="shots">
+      <figure><div class="shot"><img src="assets/dash-browse.png" alt="Sofortsuche: Suche beim Tippen mit Qualitätsfiltern, Beobachten-Knöpfen pro Zeile und Qualitäts-Badges überall." loading="lazy"></div>
+        <figcaption>Sofortsuche: Suche beim Tippen mit Qualitätsfiltern, Beobachten-Knöpfen pro Zeile und Qualitäts-Badges überall.</figcaption></figure>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <h2>Indexer &amp; die Posterwand</h2>
+    <p class="lead">Scanne die Gruppen, die dich interessieren, in einen privaten Index und stöbere dann
+    im Ergebnis als Posterwand. Jedes bisschen der Metadaten holt deine eigene Installation aus
+    schlüssellosen öffentlichen Quellen. Es gibt keinen API-Key, um den du betteln müsstest.</p>
+    <div class="shots">
+      <figure><div class="shot"><img src="assets/wall-sheet.jpg" alt="Poster wall detail sheet with rating, cast, synopsis and episode chips" loading="lazy"></div>
+        <figcaption>Bewertungen, Besetzung, Handlung, Episodenraster. Nie API-Keys.</figcaption></figure>
+    </div>
+    <div style="height:26px"></div>
+    <div class="grid2">
+      <ul class="plain">
+        <li><b>Kontinuierlicher Gruppen-Scanner.</b> Inkrementelle OVER-Scans laufen nach deinem Zeitplan mit ~43k Headern/s über aufgefächerte Verbindungen und handeln dabei komprimierte Header (RFC 8054) aus, wo ein Server sie anbietet. Erstscans werden datumshalbiert, sodass <code>--max-age 2y</code> Jahre an Headern in etwa 20 Sondierungen überspringt.</li>
+        <li><b>Ingest-Filter:</b> Filter nach Art, Jahr, Auflösung, Sprache und Größe halten Indexer-Spam aus deiner Datenbank, und verschleierter Müll wird standardmäßig erkannt und ausgefiltert.</li>
+        <li><b>Scene-Namen-Parser.</b> Er zieht Titel, Jahr, Episode, Qualität und Quelle aus echten Release-Namen (datumscodierte Dailies, Multi-Episoden-Codes und ROT13-verschleierte Namen inbegriffen) und dedupliziert Releases auf eine Karte pro Titel.</li>
+        <li><b>Takedown-Erkennung.</b> Verfügbarkeits-Stichproben im Hintergrund bemerken, wenn eine Gruppe abgeräumt wird, und versehen ihre Releases mit einem Badge, sodass ein Post, der ohnehin schon entfernt wird, keinen Grab verschwendet.</li>
+      </ul>
+      <ul class="plain">
+        <li><b>Anreicherung ohne Keys.</b> TVmaze für Serien, iTunes Search für Filme, dazu öffentliche Bewertungs-Datensätze, Wikidata, Wikipedia und AniList füllen Poster, Bewertungen und Stimmenzahlen, Besetzung, Genres und Handlung. OMDb- und TMDB-Keys funktionieren, wenn du sie hast, nötig ist aber keiner.</li>
+        <li><b>Episodenraster:</b> Chips pro Staffel, bei denen der beste Encode jeder Episode nur einen Klick vom Download entfernt ist, markierte Staffel-Packs und ein „Serie beobachten“ in jedem Staffel-Kopf.</li>
+        <li><b>Trend-Leisten:</b> Leisten für „Neu diese Woche“ und „Gerade heiß“, gebildet aus der Post-Frequenz.</li>
+        <li><b>Eine Wand, die dazulernt.</b> „Kein Interesse“ blendet einen Titel aus und bringt zugleich eine dauerhafte Regel bei; die Sortierung „Für dich“ ordnet die Posterwand nach dem Geschmacksprofil, das deine eigenen Grabs aufbauen. All das bleibt lokal.</li>
+        <li><b>Alles korrigierbar.</b> Falsche Zuordnung? Wähl aus den Kandidaten oder tipp einfach die richtige Identität ein. Was du von Hand setzt, wird nie überschrieben. Verweise ein Poster auf eine URL oder lade eins hoch. Ein Knopf reichert einen einzelnen Titel neu an, ein anderer löscht den ganzen Index und baut ihn neu auf.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<footer><div class="wrap">
+  <div class="cols">
+    <div>⚡ <b>nzbfast</b> - der Ein-Pass-Usenet-Downloader.</div>
+    <div>
+      <a href="index.de.html">Startseite</a> ·
+      <a href="features.de.html">Funktionen</a> ·
+      <a href="indexer.de.html">Indexer</a> ·
+      <a href="benchmarks.de.html">Benchmarks</a> ·
+      <a href="download.de.html">Download</a> ·
+      <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
+    </div>
+  </div>
+  <p class="fine">Freie Software, GPL-3.0-or-later. PAR2-Reparatur und RAR-Entpacken sind nativer Code im Binary: keine mitgelieferten Dritt-Tools. Die Posterwand-Metadaten kommen aus
+  schlüssellosen öffentlichen Quellen, geholt von deiner eigenen Installation.</p>
+</div></footer>
+
+</body>
+</html>

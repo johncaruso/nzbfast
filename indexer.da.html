@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="da">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Indexer &amp; postervæggen - nzbfast</title>
+<meta name="description" content="Scan de grupper, du går op i, til et privat indeks, og gennemse det så som en postervæg. Alle metadata kommer fra nøglefrie offentlige kilder, hentet af din installation. Der er in">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<link rel="stylesheet" href="assets/site.css">
+<link rel="alternate" hreflang="en" href="indexer.html">
+<link rel="alternate" hreflang="fr" href="indexer.fr.html">
+<link rel="alternate" hreflang="de" href="indexer.de.html">
+<link rel="alternate" hreflang="it" href="indexer.it.html">
+<link rel="alternate" hreflang="es" href="indexer.es.html">
+<link rel="alternate" hreflang="nl" href="indexer.nl.html">
+<link rel="alternate" hreflang="pt" href="indexer.pt.html">
+<link rel="alternate" hreflang="sv" href="indexer.sv.html">
+<link rel="alternate" hreflang="da" href="indexer.da.html">
+<link rel="alternate" hreflang="nb" href="indexer.nb.html">
+<link rel="alternate" hreflang="fi" href="indexer.fi.html">
+<link rel="alternate" hreflang="tr" href="indexer.tr.html">
+<link rel="alternate" hreflang="ro" href="indexer.ro.html">
+<link rel="alternate" hreflang="he" href="indexer.he.html">
+<link rel="alternate" hreflang="ar" href="indexer.ar.html">
+<link rel="alternate" hreflang="fa" href="indexer.fa.html">
+<link rel="alternate" hreflang="x-default" href="indexer.html">
+</head>
+<body>
+
+<header><div class="wrap">
+  <a class="logo" href="index.da.html"><span class="bolt">⚡</span> nzbfast</a>
+  <nav>
+    <a href="index.da.html" class="home">Hjem</a>
+    <a href="features.da.html">Funktioner</a>
+    <a href="indexer.da.html" class="on">Indexer</a>
+    <a href="benchmarks.da.html">Benchmarks</a>
+    <a href="MANUAL.html">Docs</a>
+    <a href="https://github.com/nzbfast/nzbfast" title="Source repository">GitHub</a>
+    <a class="cta" href="download.da.html">Download</a>
+    <!-- i18n picker: same markup in every language file; hrefs fixed -->
+    <select class="langsw" aria-label="Language" style="font-size:11.5px;opacity:.8;margin-inline-start:10px;background:transparent;color:inherit;border:1px solid rgba(128,128,128,.4);border-radius:6px;padding:2px 4px;cursor:pointer;max-width:110px" onchange="location.href=this.value"><option value="indexer.html">English</option><option value="indexer.fr.html">Français</option><option value="indexer.de.html">Deutsch</option><option value="indexer.it.html">Italiano</option><option value="indexer.es.html">Español</option><option value="indexer.nl.html">Nederlands</option><option value="indexer.pt.html">Português</option><option value="indexer.sv.html">Svenska</option><option value="indexer.da.html" selected>Dansk</option><option value="indexer.nb.html">Norsk</option><option value="indexer.fi.html">Suomi</option><option value="indexer.tr.html">Türkçe</option><option value="indexer.ro.html">Română</option><option value="indexer.he.html">עברית</option><option value="indexer.ar.html">العربية</option><option value="indexer.fa.html">فارسی</option></select>
+  </nav>
+</div></header>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Fremvisningen</p>
+    <h2>Dit indeks, præsenteret som en postervæg</h2>
+    <p class="lead">Den indbyggede indexer scanner de newsgroups, du går op i; væggen forvandler
+    resultatet til postere, bedømmelser, medvirkende og episodegitre, kun ud fra nøglefrie offentlige
+    kilder, hentet af din egen installation. Klik på en episode-chip for at hente den.</p>
+    <figure class="shot"><img src="assets/wall-grid.jpg" alt="nzbfast-postervæg: et gitter af tv-postere med kvalitetsmærker, bedømmelser og sæsonantal" loading="lazy"></figure>
+    <div style="height:18px"></div>
+    <div class="shots">
+      <figure><div class="shot"><img src="assets/dash-browse.png" alt="Øjeblikkelig søgning: søg-mens-du-skriver med kvalitetsfiltre, overvågningsknapper pr. række og kvalitetsmærker overalt." loading="lazy"></div>
+        <figcaption>Øjeblikkelig søgning: søg-mens-du-skriver med kvalitetsfiltre, overvågningsknapper pr. række og kvalitetsmærker overalt.</figcaption></figure>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <h2>Indexer &amp; postervæggen</h2>
+    <p class="lead">Scan de grupper, du går op i, til et privat indeks, og gennemse det så som en
+    postervæg. Alle metadata kommer fra nøglefrie offentlige kilder, hentet af din installation.
+    Der er ingen API-nøgle at tigge om.</p>
+    <div class="shots">
+      <figure><div class="shot"><img src="assets/wall-sheet.jpg" alt="Postervæggens detaljeark med bedømmelse, medvirkende, synopsis og episode-chips" loading="lazy"></div>
+        <figcaption>Bedømmelser, medvirkende, synopsis, episodegitter. Ingen API-nøgler, nogensinde.</figcaption></figure>
+    </div>
+    <div style="height:26px"></div>
+    <div class="grid2">
+      <ul class="plain">
+        <li><b>Kontinuerlig gruppescanner.</b> Inkrementelle OVER-scanninger kører på din tidsplan ved ~43k headers/s over udfoldede forbindelser, og forhandler komprimerede headers (RFC 8054), hvor en server tilbyder dem. Første scanninger dato-halveres, så <code>--max-age 2y</code> springer års headers over på omkring 20 sonderinger.</li>
+        <li><b>Ingest-filtre:</b> filtre på type, år, opløsning, sprog og størrelse holder indexer-spam ude af din database, og obfuskeret skrald fanges og lukkes ude som standard.</li>
+        <li><b>Scene-navne-parser.</b> Den trækker titel, år, episode, kvalitet og kilde ud af virkelige stems (inklusive datokodede dailies, multi-episode-koder og ROT13-obfuskerede navne) og deduplikerer releases ned til ét kort pr. titel.</li>
+        <li><b>Takedown-detektion.</b> Tilgængelighedssampling i baggrunden opdager, når en gruppe er ved at blive høstet, og sætter mærker på dens releases, så en post, der allerede er på vej væk, ikke spilder en hentning.</li>
+      </ul>
+      <ul class="plain">
+        <li><b>Nøglefri berigelse.</b> TVmaze til tv, iTunes Search til film, plus offentlige bedømmelses-datasæt, Wikidata, Wikipedia og AniList fylder postere, bedømmelser og stemmetal, medvirkende, genrer og handlinger ud. OMDb- og TMDB-nøgler virker, hvis du har dem, men intet kræver en.</li>
+        <li><b>Episodegitre:</b> chips pr. sæson med det bedste encode af hver episode ét klik fra at blive hentet, sæsonpakker markeret og et "overvåg serie" på hver sæson-header.</li>
+        <li><b>Trend-rækker:</b> nyt-i-denne-uge- og hot-lige-nu-striber bygget ud fra postfrekvens.</li>
+        <li><b>En væg, der lærer.</b> "Ikke interesseret" skjuler en titel og lærer den en stående regel; sorteringen "Til dig" rangerer væggen efter den smagsprofil, dine egne hentninger bygger. Det hele forbliver lokalt.</li>
+        <li><b>Ret hvad som helst.</b> Forkert match? Vælg blandt kandidaterne, eller skriv bare den rigtige identitet. Alt, hvad du sætter i hånden, overskrives aldrig. Peg en poster mod en URL, eller upload en. Én knap beriger en enkelt titel på ny; en anden sletter og genopbygger hele indekset.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<footer><div class="wrap">
+  <div class="cols">
+    <div>⚡ <b>nzbfast</b> - one-pass Usenet-downloaderen.</div>
+    <div>
+      <a href="index.da.html">Hjem</a> ·
+      <a href="features.da.html">Funktioner</a> ·
+      <a href="indexer.da.html">Indexer</a> ·
+      <a href="benchmarks.da.html">Benchmarks</a> ·
+      <a href="download.da.html">Download</a> ·
+      <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
+    </div>
+  </div>
+  <p class="fine">Fri software, GPL-3.0-or-later. PAR2-reparation og RAR-udpakning er native kode i binæren: ingen medfølgende tredjepartsværktøjer. Postervæggens metadata kommer fra nøglefrie
+  offentlige kilder, hentet af din egen installation.</p>
+</div></footer>
+
+</body>
+</html>

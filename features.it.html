@@ -30,7 +30,9 @@
 <header><div class="wrap">
   <a class="logo" href="index.it.html"><span class="bolt">⚡</span> nzbfast</a>
   <nav>
+    <a href="index.it.html" class="home">Home</a>
     <a href="features.it.html" class="on">Funzionalità</a>
+    <a href="indexer.it.html">Indexer</a>
     <a href="benchmarks.it.html">Benchmark</a>
     <a href="MANUAL.html">Documentazione</a>
     <a href="https://github.com/nzbfast/nzbfast" title="Source repository">GitHub</a>
@@ -98,7 +100,7 @@
         <li><b>Scrittura unica.</b> Gli articoli decodificati vengono scritti (pwrite) direttamente al loro offset finale nel file. Niente file temporanei, nessuna passata di assemblaggio a parte.</li>
         <li><b>Verifica PAR2 nel flusso.</b> Ogni blocco riceve l'hash MD5 dai buffer di decodifica appena arriva, così la verifica finisce nell'istante stesso in cui finisce il download. Batte il quick-check di cui si accontentano gli altri client, e non costa nulla.</li>
         <li><b>Estrazione diretta:</b> i post RAR in modalità store (la maggior parte delle release scene) vengono mappati ed estratti mentre scaricano, così i volumi non finiscono mai su disco. Le scritture su disco si fermano a contenuto × 1.0 e lo spazio richiesto a 1×, dove agli altri serve grosso modo 2×.</li>
-        <li><b>Archivi annidati, sempre in una passata.</b> Archivi dentro archivi - RAR in RAR, 7z dentro un RAR, scale profonde diversi livelli - vengono de-annidati al volo invece di venire scritti su disco e riaperti. Una sola copia su disco dove un approccio «scrivi e riscansiona» ne tiene due.</li>
+        <li><b>Archivi annidati, e la profondità non costa quasi nulla.</b> Gli archivi dentro archivi - RAR dentro RAR, 7z dentro un RAR, scale profonde molti livelli - vengono disannidati mentre i byte arrivano, dentro la passata che stavamo già facendo. La differenza è tutta qui: un client che scrive ogni livello su disco, lo chiude, lo riapre e lo rilegge paga una passata intera per livello, quindi ogni livello in più gli costa un altro giro sul disco. I nostri viaggiano nella prima passata, e il payload esce da una scala di dieci livelli come esce da una di uno. Una copia su disco dove scrivi-e-rileggi ne tiene due o tre.</li>
         <li><b>Deoffuscamento.</b> I post offuscati vengono rinominati dai loro metadati PAR2, i nomi mescolati in ROT13 vengono recuperati, e la robaccia dai nomi hash viene classificata e tenuta fuori.</li>
       </ul>
       <ul class="plain">
@@ -106,7 +108,7 @@
         <li><b>Record di recupero RAR.</b> Quando il PAR2 è esaurito, o non è mai stato postato, i record di recupero incorporati nei RAR riparano i volumi danneggiati sul posto.</li>
         <li><b>Riparazione a ogni profondità.</b> Un set PAR2 impacchettato dentro uno strato interno viene trovato ed eseguito al proprio livello, e un post di soli PAR (dati cancellati, lasciato solo un set di recupero al 100%) viene ricostruito per intero e poi estratto.</li>
         <li><b>Fallback per compressi e cifrati:</b> i post non-store si materializzano e si estraggono con il motore RAR nativo, tutto dal RAR4 al nuovo RAR7, in sovrapposizione con il resto della coda. I set cifrati si parcheggiano con un messaggio chiaro invece di fallire in silenzio.</li>
-        <li><b>Gestione delle password.</b> Le password arrivano dall'API degli *arr, dalla convenzione <code>{{pw}}</code> nel nome file o dai metadati NZB. Per tutto il resto ci pensa lo sblocco 🔑 nella dashboard: sblocca in background, poi archivia come al solito. Le password concatenate si risolvono da sole: quando l'estrazione di uno strato produce il file di password dello strato successivo, viene letto e usato automaticamente.</li>
+        <li><b>Va a cercarsi la password da solo.</b> La maggior parte dei post cifrati non ha bisogno di te. Prova i metadati dell’NZB e la convenzione di nome <code>{{pw}}</code>, l’API degli *arr, poi qualsiasi breve nota di testo pubblicata accanto ai file e, in mancanza d’altro, i nomi della release e dei file stessi. Ripete quella ricerca a <i>ogni</i> livello: una catena che nasconde la password di ciascuno strato dentro lo strato superiore - una password diversa a ogni livello - si sblocca fino in fondo senza che tu digiti nulla. Quel che resta davvero passa dallo sblocco 🔑 sulla dashboard: sblocca in background, poi archivia normalmente.</li>
         <li><b>Reti di sicurezza.</b> I volumi sorgente riparati sono protetti da scrittura mentre gira la ri-estrazione, il checksum proprio del file finito viene verificato da capo a fondo (attivo per impostazione predefinita), e un codice di uscita segnala «successo» solo quando lo stato finale è davvero utilizzabile.</li>
       </ul>
     </div>
@@ -143,7 +145,7 @@
         <li><b>API compatibile SABnzbd:</b> tutta la superficie che gli *arr usano davvero: addfile/addurl, categorie, priorità, pausa/ripresa per job, riprova, paginazione, chiavi API a due livelli. Sonarr e Radarr le parlano come se fosse SABnzbd.</li>
         <li><b>Facciata JSON-RPC NZBGet.</b> nzb360, LunaSea e gli altri telecomandi NZBGet si collegano senza modifiche.</li>
         <li><b>Server Newznab.</b> Il tuo indice locale risponde a t=search/tvsearch/movie, così gli *arr possono trattare le tue scansioni come un indexer.</li>
-        <li><b>Prelievo automatico da RSS:</b> feed filtrati con un linguaggio in stile NZBGet, aggiunti e modificati al volo dalla dashboard.</li>
+        <li><b>Prelievo automatico da RSS:</b> il feed di un indicizzatore è la stessa cosa a cui si abbona un lettore di notizie, solo che elenca ciò che è appena stato pubblicato su Usenet. Tutto ciò che corrisponde ai filtri si scarica da solo. Feed filtrati con un linguaggio in stile NZBGet, aggiunti e modificati al volo dalla dashboard.</li>
         <li><b>Watchlist.</b> Elenca le serie e i film che vuoi, anche quelli non ancora in onda. Ogni episodio viene prelevato alla prima apparizione e migliorato finché non raggiunge la qualità obiettivo (per esempio, 720p → 1080p REMUX), con la copia superata cancellata solo dopo che l'upgrade è stato verificato. Un calendario delle uscite mostra cosa sta per arrivare.</li>
       </ul>
       <ul class="plain">
@@ -161,33 +163,6 @@
 
 <section class="alt">
   <div class="wrap">
-    <h2>Indexer &amp; bacheca dei poster</h2>
-    <p class="lead">Scansiona i gruppi che ti interessano in un indice privato, poi sfoglialo come una
-    bacheca di poster. Tutti i metadati arrivano da fonti pubbliche senza chiave, recuperate dalla tua installazione.
-    Nessuna chiave API da elemosinare.</p>
-    <figure class="shot"><img src="assets/wall-sheet.jpg" alt="Poster wall detail sheet with rating, cast, synopsis and episode chips" loading="lazy"></figure>
-    <div style="height:26px"></div>
-    <div class="grid2">
-      <ul class="plain">
-        <li><b>Scanner continuo dei gruppi.</b> Le scansioni OVER incrementali girano secondo la tua pianificazione a ~43k header/s su connessioni aperte a ventaglio, negoziando gli header compressi (RFC 8054) dove un server li offre. Le prime scansioni procedono per bisezione di data, così <code>--max-age 2y</code> salta anni di header in una ventina di sondaggi.</li>
-        <li><b>Filtri d'ingresso:</b> filtri per tipo, anno, risoluzione, lingua e dimensione tengono lo spam da indexer fuori dal tuo database, e la robaccia offuscata viene intercettata e bloccata di default.</li>
-        <li><b>Parser dei nomi scene.</b> Estrae titolo, anno, episodio, qualità e sorgente dai nomi reali (daily con data nel nome, codici multi-episodio e nomi offuscati in ROT13 inclusi) e deduplica le release fino a una sola scheda per titolo.</li>
-        <li><b>Ricerca istantanea:</b> risultati mentre digiti, con filtri di qualità, pulsanti Segui su ogni riga e badge di qualità dappertutto.</li>
-        <li><b>Rilevamento dei takedown.</b> Il campionamento di disponibilità in background si accorge quando un gruppo viene ripulito e contrassegna le sue release con un badge, così un post già in via di rimozione non spreca un prelievo.</li>
-      </ul>
-      <ul class="plain">
-        <li><b>Arricchimento senza chiavi.</b> TVmaze per le serie, iTunes Search per il cinema, più dataset pubblici di valutazioni, Wikidata, Wikipedia e AniList riempiono poster, valutazioni con conteggio dei voti, cast, generi e trame. Le chiavi OMDb e TMDB funzionano se le hai, ma nessuna è necessaria.</li>
-        <li><b>Griglie di episodi:</b> chip per stagione con il miglior encode di ogni episodio a un clic dal download, i season pack segnalati e un «segui la serie» su ogni intestazione di stagione.</li>
-        <li><b>Righe di tendenza:</b> strisce «novità della settimana» e «caldi adesso» costruite sulla frequenza dei post.</li>
-        <li><b>Una bacheca che impara.</b> «Non mi interessa» nasconde un titolo e insegna una regola permanente; l'ordinamento «Per te» classifica la bacheca secondo il profilo dei gusti costruito dai tuoi stessi prelievi. Tutto resta in locale.</li>
-        <li><b>Correggi qualsiasi cosa.</b> Corrispondenza sbagliata? Scegli tra i candidati o digita semplicemente l'identità giusta. Ciò che imposti a mano non viene mai sovrascritto. Punta un poster a un URL o caricalo tu. Un pulsante ri-arricchisce un singolo titolo; un altro azzera e ricostruisce l'intero indice.</li>
-      </ul>
-    </div>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
     <h2>Anteprima &amp; libreria</h2>
     <ul class="plain">
       <li><b>Anteprima prima che finisca.</b> ▶ Riproduci passa al player del sistema un .m3u servito dal daemon, così confermi che un download sia proprio quello che volevi senza aspettare che si completi. Salta più avanti e gli articoli che ti servono balzano in testa alla coda.</li>
@@ -196,15 +171,15 @@
   </div>
 </section>
 
-<section class="alt">
+<section>
   <div class="wrap">
     <h2>Dashboard &amp; impostazioni</h2>
-    <div class="strip">
-      <figure><div class="shot"><img src="assets/dash-browse.png" alt="Queue with per-file drawer and index browse card" loading="lazy"></div>
+    <div class="shots">
+      <figure><div class="shot"><img src="assets/dash-queue-drawer.png" alt="Queue with a per-download detail drawer: per-file progress bars, verify blocks, per-server contribution" loading="lazy"></div>
         <figcaption>Cassetto della coda: barre per file, blocchi di verifica, contributo per server.</figcaption></figure>
       <figure><div class="shot"><img src="assets/settings-top.png" alt="Settings: server editor and live speed/scheduling controls" loading="lazy"></div>
         <figcaption>Ogni impostazione modificabile nel browser. La maggior parte si applica al volo.</figcaption></figure>
-      <figure><div class="shot" style="max-width:320px;margin:0 auto"><img src="assets/mobile-dash.png" alt="Phone layout of the dashboard" loading="lazy"></div>
+      <figure class="phone"><div class="shot"><img src="assets/mobile-dash.png" alt="Phone layout of the dashboard" loading="lazy"></div>
         <figcaption>Un vero layout per telefono, stesso daemon.</figcaption></figure>
     </div>
     <div style="height:10px"></div>
@@ -226,7 +201,7 @@
   </div>
 </section>
 
-<section>
+<section class="alt">
   <div class="wrap">
     <h2>Distribuzione</h2>
     <ul class="plain">
@@ -244,7 +219,9 @@
   <div class="cols">
     <div>⚡ <b>nzbfast</b> - il downloader Usenet a passata unica.</div>
     <div>
+      <a href="index.it.html">Home</a> ·
       <a href="features.it.html">Funzionalità</a> ·
+      <a href="indexer.it.html">Indexer</a> ·
       <a href="benchmarks.it.html">Benchmark</a> ·
       <a href="download.it.html">Scarica</a> ·
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>

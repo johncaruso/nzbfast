@@ -1,0 +1,826 @@
+<!doctype html>
+<html lang="ro">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>nzbfast - Manual de utilizare</title>
+<style>
+:root{
+  --bg:#f7f8fb;--card:#ffffff;--fg:#16181d;--dim:#5b6270;--line:rgba(30,40,70,.12);
+  --acc:#1f6fd6;--acc2:#6d47e6;--ok:#1f9e6e;--warn:#b97e14;--bad:#c94747;
+  --code:#f0f2f7;--mark:#fff3c9;
+}
+@media(prefers-color-scheme:dark){:root{
+  --bg:#0f1116;--card:#161a22;--fg:#e8eaf0;--dim:#9aa2b1;--line:rgba(140,150,175,.16);
+  --acc:#4da3ff;--acc2:#9b7cff;--ok:#35c88a;--warn:#f5b445;--bad:#ec5a5a;
+  --code:#1d222d;--mark:#4a3f14;
+}}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
+.wrap{display:grid;grid-template-columns:250px minmax(0,1fr);max-width:1160px;margin:0 auto;gap:0}
+nav{position:sticky;top:0;align-self:start;height:100vh;overflow-y:auto;
+  padding:28px 18px 40px 22px;border-right:1px solid var(--line);font-size:13px}
+nav .brand{font-size:19px;font-weight:700;margin-bottom:2px}
+nav a.brand{display:block;color:inherit;text-decoration:none}
+nav a.brand:hover{opacity:.72}
+nav .brand small{color:var(--dim);font-weight:400;font-size:12px}
+nav ol{list-style:none;padding:0;margin:14px 0 0}
+nav li{margin:1px 0}
+nav a{display:block;padding:3.5px 8px;border-radius:6px;color:var(--fg)}
+/* the language row is inline: nav a is display:block for the contents list */
+nav .langsw a{display:inline;padding:0;border-radius:0}
+nav a:hover{background:var(--code);text-decoration:none}
+nav .sub{margin-left:12px;color:var(--dim)}
+main{padding:34px 42px 90px;min-width:0}
+h1{font-size:31px;margin:0 0 4px;letter-spacing:-.02em}
+.subtitle{color:var(--dim);margin:0 0 30px;font-size:16px}
+h2{font-size:22px;margin:52px 0 10px;padding-top:18px;border-top:1px solid var(--line);letter-spacing:-.01em}
+h2:first-of-type{border-top:none;margin-top:8px}
+h3{font-size:16.5px;margin:28px 0 6px}
+h4{font-size:14.5px;margin:20px 0 4px}
+p{margin:8px 0}
+li{margin:3px 0}
+code,kbd{background:var(--code);border:1px solid var(--line);border-radius:5px;
+  padding:1px 6px;font:12.5px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+pre{background:var(--code);border:1px solid var(--line);border-radius:9px;
+  padding:12px 15px;overflow-x:auto;font:12.5px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+pre code{background:none;border:none;padding:0}
+table{border-collapse:collapse;width:100%;margin:12px 0;font-size:13.5px}
+th{text-align:left;color:var(--dim);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+th,td{padding:7px 12px 7px 0;border-bottom:1px solid var(--line);vertical-align:top}
+td code{white-space:nowrap}
+.tip,.note,.warn-box{border-left:3px solid var(--acc);background:var(--card);
+  border-radius:0 9px 9px 0;padding:10px 16px;margin:14px 0;font-size:14px}
+.note{border-left-color:var(--dim)}
+.warn-box{border-left-color:var(--warn)}
+.tip b:first-child,.note b:first-child,.warn-box b:first-child{display:block;font-size:12px;
+  text-transform:uppercase;letter-spacing:.05em;color:var(--dim);margin-bottom:2px}
+.pill{display:inline-block;background:var(--code);border:1px solid var(--line);
+  border-radius:20px;padding:1px 10px;font-size:11.5px;color:var(--dim);vertical-align:1px}
+.pill.live{color:var(--ok)}
+.pill.restart{color:var(--warn)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px 26px}
+hr{border:none;border-top:1px solid var(--line);margin:30px 0}
+.dim{color:var(--dim)}
+@media(max-width:860px){
+  .wrap{grid-template-columns:1fr}
+  nav{position:static;height:auto;border-right:none;border-bottom:1px solid var(--line)}
+  main{padding:24px 20px 60px}
+  .grid2{grid-template-columns:1fr}
+}
+@media print{
+  nav{display:none}
+  .wrap{grid-template-columns:1fr}
+  body{background:#fff;color:#000;font-size:11.5pt}
+  h2{page-break-after:avoid}
+  pre{white-space:pre-wrap}
+  a{color:inherit}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav>
+  <a class="brand" href="index.ro.html">⚡ nzbfast <small>Manual de utilizare</small></a>
+  <!-- i18n switcher: same markup in every language; hrefs never change -->
+  <div class="langsw" style="font-size:11.5px;margin-top:6px;color:var(--dim)"><a href="MANUAL.html">EN</a> · <a href="MANUAL.fr.html">FR</a> · <a href="MANUAL.de.html">DE</a> · <a href="MANUAL.it.html">IT</a> · <a href="MANUAL.es.html">ES</a> · <a href="MANUAL.nl.html">NL</a> · <a href="MANUAL.pt.html">PT</a> · <a href="MANUAL.sv.html">SV</a> · <a href="MANUAL.da.html">DA</a> · <a href="MANUAL.nb.html">NB</a> · <a href="MANUAL.fi.html">FI</a> · <a href="MANUAL.tr.html">TR</a> · <a href="MANUAL.ro.html">RO</a> · <a href="MANUAL.he.html">HE</a> · <a href="MANUAL.ar.html">AR</a> · <a href="MANUAL.fa.html">FA</a></div>
+  <ol>
+    <li><a href="#intro">1 · Bun venit</a></li>
+    <li><a href="#quickstart">2 · Pornire rapidă</a></li>
+    <li><a href="#concepts">3 · Cum funcționează nzbfast</a></li>
+    <li><a href="#dashboard">4 · Panoul</a></li>
+    <li><a href="#adding">5 · Adăugarea descărcărilor</a></li>
+    <li><a href="#wall">6 · Peretele de postere</a></li>
+    <li><a href="#preview">7 · Previzualizare și verificare</a></li>
+    <li><a href="#servers">8 · Servere Usenet</a></li>
+    <li><a href="#settings">9 · Referință de setări</a></li>
+    <li><a href="#automation">10 · Automatizare</a></li>
+    <li><a href="#arr">11 · Sonarr, Radarr și prietenii</a></li>
+    <li><a href="#remotes">12 · Telefon și aplicații la distanță</a></li>
+    <li><a href="#performance">13 · Instrumente de performanță</a></li>
+    <li><a href="#updates">14 · Actualizări</a></li>
+    <li><a href="#cli">15 · Linia de comandă</a></li>
+    <li><a href="#api">16 · Prezentare API</a></li>
+    <li><a href="#files">17 · Fișiere și locații</a></li>
+    <li><a href="#troubleshooting">18 · Depanare</a></li>
+  </ol>
+</nav>
+<main>
+
+<h1>⚡ nzbfast</h1>
+<p class="subtitle">Descărcătorul rapid de Usenet - manual de utilizare</p>
+
+<h2 id="intro">1 · Bun venit</h2>
+<p>nzbfast descarcă de pe Usenet atât de repede pe cât permit linia ta, providerii tăi
+și mașina ta - și de obicei asta înseamnă <em>atât de repede pe cât permite linia ta</em>. Este
+un singur program de sine stătător: motorul, un panou web, un browser media de tip
+perete de postere, un indexer integrat, previzualizare în timp real, reparare PAR2 nativă și extragerea RAR nativă sunt toate într-un singur executabil. Nu mai e nimic altceva de instalat.</p>
+<p>Ce îl face rapid este arhitectura, nu ajustările:</p>
+<ul>
+  <li><b>NNTP cu pipelining</b> - multe cereri de articole circulă pe fiecare conexiune una după alta,
+  menținând fiecare conexiune la viteză maximă în loc să aștepte dus-întorsurile.</li>
+  <li><b>Un pipeline într-o singură trecere</b> - descărcarea, verificarea și extragerea se suprapun.
+  Volumele de arhivă sunt extrase <em>în flux</em>; la o postare tipică în mod store,
+  fișierele RAR nu ating niciodată discul, deci jobul are nevoie de 1× dimensiunea release-ului, nu 2×,
+  și se termină când se termină descărcarea.</li>
+  <li><b>Uniune multi-provider</b> - fiecare server configurat contribuie; un articol
+  care lipsește pe un backbone este preluat de pe altul. Serverele lente sau moarte nu blochează
+  niciodată coada.</li>
+  <li><b>Un buget de memorie</b> - motorul se adaptează la o alocare limitată de RAM și
+  degradează la disc dacă e nevoie. Nu îți solicită niciodată swap-ul mașinii.</li>
+</ul>
+<p>Măsurat față de concurență pe hardware, joburi și provideri identici, nzbfast a
+terminat o descărcare de 190&nbsp;GB în aproximativ 5 minute pe o linie de 10&nbsp;GbE - cu
+alternativele de top rămase în urmă cu 30–220% la aceleași teste, acolo unde le-au
+finalizat. Cifrele sunt în <a href="#concepts">§3</a>.</p>
+
+<h2 id="quickstart">2 · Pornire rapidă</h2>
+<h3>macOS</h3>
+<ol>
+  <li>Deschide <code>nzbfast-&lt;version&gt;-macos.dmg</code> și trage
+  <b>NzbFast</b> în <b>Applications</b> (universal: Apple Silicon + Intel).</li>
+  <li>Prima lansare: macOS avertizează că nzbfast nu este încă notarizat de Apple.
+  Clic dreapta pe aplicație → <b>Open</b> - sau deschide System Settings →
+  <b>Privacy&nbsp;&amp;&nbsp;Security</b>, derulează în jos și dă clic pe
+  <b>Open&nbsp;Anyway</b>. Este un pas unic.</li>
+  <li>Fereastra aplicației arată panoul cu un card de bun venit - dă clic pe el și adaugă
+  cel puțin un server Usenet (host, portul 563, nume de utilizator, parolă). Poți adăuga
+  mai multe ulterior în Setări.</li>
+  <li>Trage un <code>.nzb</code> oriunde pe panou - sau doar dublu-clic pe
+  fișiere <code>.nzb</code> în Finder. Descărcările ajung în
+  <code>~/Downloads/nzbfast</code>. Închide din meniu; descărcările se reiau de unde
+  au rămas.</li>
+</ol>
+<p class="dim" style="font-size:0.92em">Preferi fără aplicație? Zip-ul simplu (binar +
+launcherul <code>Start nzbfast.command</code>, același motor) funcționează în continuare ca înainte -
+pașii de mai jos, la „Dintr-un terminal”.</p>
+<h3>Windows</h3>
+<ol>
+  <li>Rulează <code>nzbfast-setup-&lt;version&gt;.exe</code>. Se instalează doar pentru
+  utilizatorul tău (fără parolă de administrator). Deoarece acest release nu este încă semnat digital,
+  SmartScreen ar putea afișa „Windows protected your PC” - dă clic pe <b>More info</b> →
+  <b>Run anyway</b>.</li>
+  <li>nzbfast stă în bara de sistem (system tray): dublu-clic pe iconița din tray (sau folosește
+  <b>Open Dashboard</b> din meniul contextual) pentru a deschide panoul, apoi adaugă
+  serverul tău Usenet din cardul de bun venit. Meniul din tray are și Pauză/Reluare,
+  folderul tău de descărcări și Quit.</li>
+  <li>Dublu-clic pe un fișier <code>.nzb</code> îl pune în coadă. Windows Defender ar putea cere
+  o dată permisiunea de ascultare pe rețeaua locală - permite-o.</li>
+</ol>
+<p>Preferi o copie portabilă? <code>-windows-x64.zip</code> funcționează în continuare: dezarhivează
+oriunde și dublu-clic pe <code>nzbfast.exe</code> (sau <code>Start nzbfast.bat</code>)
+pentru asistentul din terminal.</p>
+<h3>Dintr-un terminal (orice platformă)</h3>
+<pre><code>nzbfast setup            # interactive server setup (writes config.local.json)
+nzbfast serve --open     # start the daemon and open the dashboard</code></pre>
+<div class="tip"><b>Sfat</b>Ai rulat deja SABnzbd sau NZBGet? Sari peste tastarea credențialelor:
+Setări → Servere Usenet → <b>Importă din SABnzbd / NZBGet…</b> îți găsește instalarea
+existentă și îi copiază serverele. Există și <code>nzbfast import-sab</code>
+pe linia de comandă.</div>
+
+<h2 id="concepts">3 · Cum funcționează nzbfast</h2>
+<p>O scurtă terminologie ca restul manualului să se citească ușor:</p>
+<table>
+<tr><th>Termen</th><th>Sens</th></tr>
+<tr><td><b>Provider / server</b></td><td>Un serviciu Usenet la care ai un cont
+(Newshosting, Eweka, XS News…). Fiecare permite un anumit număr de conexiuni simultane.</td></tr>
+<tr><td><b>Backbone</b></td><td>Infrastructura din spatele unui provider. Mai multe branduri revând adesea
+același backbone - util de știut, deoarece doi provideri pe un backbone
+ratează <em>aceleași</em> articole. Vezi <a href="#performance">Diversitatea serverelor</a>.</td></tr>
+<tr><td><b>NZB</b></td><td>Un mic fișier XML care listează articolele ce compun o postare.
+Asta îi dai lui nzbfast.</td></tr>
+<tr><td><b>PAR2</b></td><td>Date de recuperare postate alături de un release. nzbfast verifică
+în raport cu ele <em>în timpul</em> descărcării și repară automat când articolele sunt
+deteriorate sau lipsesc.</td></tr>
+<tr><td><b>RAR în mod store</b></td><td>Majoritatea release-urilor sunt împachetate în volume RAR fără
+compresie. nzbfast recunoaște acest lucru și scrie <em>fișierul interior</em> direct în locația sa
+finală în timpul descărcării - fără pas de dezarhivare ulterior.</td></tr>
+</table>
+<p>Pipeline-ul rulează descărcare → decodare → verificare → extragere <em>concurent</em>. Cardul
+Pipeline din panou arată toate cele trei benzi mișcându-se simultan. Când sosește ultimul
+octet, verificarea e deja făcută și fișierul e deja extras; timpul de „post-procesare” al unui
+job tipic este zero. Dacă e nevoie de reparare, abia atunci volumele sunt materializate pe disc,
+reparate pe loc de motorul nativ GF(2¹⁶) (datele obfuscate redenumite sau deplasate cu octeți
+sunt găsite și adoptate printr-o scanare glisantă de blocuri) și reextrase - totul automat.</p>
+<p>Descărcările întrerupte (blocare, pană de curent, <kbd>kill&nbsp;-9</kbd>) se reiau din
+<b>jurnalul de articole</b>: octeții deja pe disc nu sunt preluați niciodată de două ori. Jurnalul
+înregistrează unde au aterizat fizic octeții fiecărui articol - chiar și octeții care au fost
+extrași direct în fișierul final - astfel încât o reluare reconstruiește din discul local și
+reverifică tot ce a restaurat în raport cu harta de blocuri PAR2 înainte de a-i acorda încredere.</p>
+<h3>Cum se compară</h3>
+<p>Măsurat față de SABnzbd 5.0.4 și NZBGet 26.2 pe aceeași mașină, aceiași
+provideri și aceleași NZB-uri, cronometrat până la un <em>fișier utilizabil</em> - descărcare, verificare,
+reparare și extragere incluse, pentru că atunci este jobul cu adevărat gata:</p>
+<table>
+<tr><th>Dimensiunea jobului</th><th>nzbfast</th><th>NZBGet 26.2</th><th>SABnzbd 5.0.4</th></tr>
+<tr><td>7 GB</td><td><b>13.7 s</b></td><td>+26%</td><td>+39%</td></tr>
+<tr><td>35 GB</td><td><b>67 s</b></td><td>+61%</td><td>+325%</td></tr>
+<tr><td>87 GB</td><td><b>272 s</b></td><td>+36%</td><td>+160%</td></tr>
+<tr><td>190 GB</td><td><b>9 m 00 s</b></td><td>+30%</td><td>+111%</td></tr>
+</table>
+<p>Diferența este post-procesarea pe care ceilalți încă trebuie s-o facă după ce aterizează ultimul
+octet. Ambii concurenți au fost reglați pentru comparație, nu lăsați pe valorile implicite -
+SABnzbd în special vine cu pipelining-ul cererilor <em>oprit</em>, ceea ce îl costă
+scump, așa că a fost pornit.</p>
+<p>Două diferențe contează la fel de mult ca timpii:</p>
+<ul>
+<li><b>Spațiu pe disc.</b> O singură trecere are nevoie de <b>1× dimensiunea release-ului</b>; clienții care scriu
+volume de arhivă și apoi le dezarhivează au nevoie de <b>2×</b>. Pe o mașină de test cu 97 GB
+liberi, un job de 87 GB s-a terminat aici în 3 m 08 s, iar celelalte două <em>nu au putut rula
+deloc</em>.</li>
+<li><b>Memorie.</b> La jobul de 190 GB, utilizarea de vârf a fost de 3.9 GB față de 9.3 GB ai SABnzbd
+- iar nzbfast va face același job în aproximativ 1 GB dacă i se cere (vezi
+<a href="#memory">Buget de memorie</a>).</li>
+</ul>
+<div class="note"><b>Reluare după blocare, măsurată</b>Omoară o descărcare în plin zbor
+(<kbd>kill&nbsp;-9</kbd> la 15 GB dintr-un job de 34.5 GB) și reluarea repreia
+<b>~0.3 GB</b> - doar articolele aflate cu adevărat în tranzit la momentul opririi - față de
+0.2 GB ai NZBGet în același test. Aceasta era cândva o pierdere pe care o publicam (15.3 GB
+repreluați, când jurnalul nu putea contabiliza octeții extrași direct); jurnalul de plasare
+a rezolvat-o: reluarea restaurează acei octeți din fișierele de ieșire locale și reverifică
+fiecare octet restaurat în raport cu harta de blocuri PAR2 înainte de a-i acorda încredere.
+Fiecare scenariu pe care îl pierdem este publicat alături de câștiguri, cu metoda completă
+și cifrele brute.</div>
+
+<h2 id="dashboard">4 · Panoul</h2>
+<p>Deschide <code>http://localhost:6789</code> (sau adresa mașinii tale de pe alt
+dispozitiv - aspectul pentru telefon se adaptează automat). Totul se actualizează live, o dată pe
+secundă. Cardurile, de sus în jos:</p>
+<h3>Bara de sus</h3>
+<ul>
+<li>Meniul <b>Limită de viteză</b> - plafoane fixe, <i>auto · cedează LAN-ului</i> (un mod guvernat de RTT
+care se retrage când altcineva din casă are nevoie de linie), sau nelimitat.</li>
+<li><b>Pauză pentru…</b> - pune totul în pauză pentru 15&nbsp;min/30&nbsp;min/1&nbsp;h/3&nbsp;h cu
+reluare automată, sau folosește butonul Pauză pentru o pauză fără termen. Pauza este
+imediată: transferul activ se oprește în câteva secunde și se reia mai târziu din
+jurnal, fără a pierde nimic. (Joburile cu prioritate Forțată continuă să descarce, în stil SABnzbd.)</li>
+<li>Un <b>banner de actualizare</b> apare aici când e disponibilă o versiune nouă
+(vezi <a href="#updates">Actualizări</a>).</li>
+</ul>
+<h3>Debit</h3>
+<p>MB/s în timp real cu un grafic derulant; filigranele punctate marchează maximul/minimul acestei
+sesiuni, linia estompată este o medie mobilă. Sub el, o histogramă arată cum se distribuie
+mostrele de viteză din sesiune - tipic vs vârf. Lărgește fereastra și
+graficele arată mai mult istoric (până la o oră).</p>
+<h3>Plăci statistice</h3>
+<p>Descărcat în această sesiune, adâncimea cozii, numărul de finalizate/eșuate, viteza de vârf a sesiunii.</p>
+<h3 id="dash-resources">Resurse - o mașină, patru plafoane</h3>
+<p>CPU, RAM (față de bugetul de memorie al nzbfast), rata de scriere pe disc și rețeaua pe un singur
+grafic normalizat, cu valori reale în legendă și un avertisment de spațiu redus. Niciun alt
+client NZB nu-ți arată asta; există pentru a demonstra un lucru - nzbfast îți va satura
+<em>linia</em>, nu mașina.</p>
+<h3 id="dash-pipeline">Pipeline - etapele se suprapun</h3>
+<p>Trei benzi: descărcare, verificare (blocuri PAR2 verificate), extragere. La un job sănătos
+toate trei se mișcă împreună.</p>
+<h3 id="dash-providers">Provideri</h3>
+<p>Rata în timp real per server, utilizarea conexiunilor, ponderea din trafic, GB pe sesiune și un
+scor de completitudine a articolelor pe toată durata (colorat când un server scade sub 98%). Un grafic
+cu arii stivuite arată contribuția fiecărui provider în timp. Rândurile se reordonează după
+performanța în timp real la fiecare 10&nbsp;s (configurabil în Setări → Interfață), astfel încât
+providerul tău cel mai rapid să fie mereu în frunte.</p>
+<h3 id="dash-queue">Coadă</h3>
+<ul>
+<li><b>Trage rândurile pentru a le reordona</b> (în cadrul unei benzi de prioritate - Forțată/Ridicată rulează tot primele);
+schimbă prioritatea pe loc.</li>
+<li><b>Dă clic pe un rând</b> pentru sertarul de detalii: bare de progres per fișier, numărul de
+blocuri verificate și cât a contribuit fiecare server la <em>acest</em> job.</li>
+<li>Insignele arată stări speciale: <i>amânat (lent)</i>, <i>preîncărcare</i>,
+<i>în pauză</i> (vezi <a href="#performance">Instrumente de performanță</a>).</li>
+<li>Un grafic burn-down urmărește totalul de GB rămași în toată coada.</li>
+</ul>
+<h3 id="dash-browse">Răsfoiește indexul</h3>
+<p>Caută tot ce a catalogat indexerul integrat din grupurile tale urmărite
+(vezi <a href="#automation">Automatizare</a>) și descarcă cu un singur clic - fără indexer
+extern. Linia de stare arată progresul scanării; <b>Scanează acum</b> forțează o trecere.</p>
+<h3>Watchlist</h3>
+<p>Adaugă titluri după nume - inclusiv unele nepostate încă. Când un release potrivit
+apare în index, este preluat automat, cu preferințe de calitate și reguli de
+upgrade (o copie mai bună o înlocuiește pe una mai slabă).</p>
+<h3 id="dash-history">Istoric</h3>
+<p>Descărcări recente cu stare, dimensiune, locație; joburile eșuate oferă <b>Reîncearcă</b>
+(reia din jurnal). Arhivele criptate arată un control de deblocare 🔑 - introdu
+parola și jobul se termină pe loc. Fâșia de sănătate a verificării trasează blocurile PAR2
+defecte per descărcare - o coadă în creștere înseamnă că articolele sosesc deteriorate.</p>
+<h3 id="dash-usage">Consum de date</h3>
+<p>Bare zilnice per provider și totaluri Azi / 7 zile / 30 de zile - esențiale pentru conturile contorizate
+și cu bloc. Conturile cu bloc arată utilizarea pe toată durata față de dimensiunea lor.</p>
+<h3>Jurnal, Benchmark de sistem, Reglarea conexiunilor, Diversitatea serverelor</h3>
+<p>Un vizualizator de jurnal în pagină și cele trei instrumente de auto-măsurare descrise în
+<a href="#performance">Instrumente de performanță</a>.</p>
+
+<h2 id="adding">5 · Adăugarea descărcărilor</h2>
+<table>
+<tr><th>Metodă</th><th>Cum</th></tr>
+<tr><td><b>Trage și plasează</b></td><td>Trage unul sau mai multe fișiere <code>.nzb</code> oriunde pe panou.</td></tr>
+<tr><td><b>Folder monitorizat</b></td><td>Setează un folder în Setări; orice <code>.nzb</code> salvat în el este
+preluat în 5 secunde, iar fișierul e eliminat. Îndreaptă directorul de descărcări al browserului tău
+spre el pentru preluări cu un singur clic de pe site-urile de indexer.</td></tr>
+<tr><td><b>Dintr-un URL</b></td><td>Lipește un link NZB (API <code>mode=addurl</code>, sau prin orice aplicație conectată).</td></tr>
+<tr><td><b>Răsfoiește indexul</b></td><td>Dă clic pe orice release complet din cardul Răsfoiește.</td></tr>
+<tr><td><b>Watchlist / RSS</b></td><td>Automat - vezi <a href="#automation">Automatizare</a>.</td></tr>
+<tr><td><b>Sonarr/Radarr etc.</b></td><td>Trimit preluările direct în coadă - vezi <a href="#arr">§11</a>.</td></tr>
+<tr><td><b>Linia de comandă</b></td><td><code>nzbfast get file.nzb</code> descarcă fără daemon.</td></tr>
+</table>
+<h3>Categorii, priorități, parole</h3>
+<ul>
+<li><b>Categoriile</b> sunt etichete libere; fiecare devine un subfolder al directorului tău de
+descărcare, iar Folderele inteligente (vezi <a href="#automation">§10</a>) le pot atribui după reguli.</li>
+<li><b>Priorități</b>: Forțată &gt; Ridicată &gt; Normală &gt; Scăzută. Forțata ignoră pauza și cota.</li>
+<li><b>Parolele</b> pentru arhivele criptate sunt preluate automat din
+<code>&lt;meta type="password"&gt;</code> din interiorul NZB-ului sau dintr-un
+nume de fișier <code>Name{{password}}.nzb</code> și pot fi furnizate per job prin
+API sau ulterior din Istoric (🔑).</li>
+</ul>
+
+<h2 id="wall">6 · Peretele de postere</h2>
+<p>Dă clic pe <b>🎬 perete</b> în bara de sus. Peretele transformă indexul tău într-un
+browser media: fiecare film și release TV recunoscut ca o placă de poster cu notă, an,
+genuri, distribuție și sinopsis - newsgroup-urile tale, navigabile ca un catalog.</p>
+<ul>
+<li><b>File</b> pentru Filme / Seriale / Altele, căutare instantanee și șapte
+sortări: <b>Pentru tine</b>, Cele mai noi postări, Anul apariției, Cele mai bine cotate,
+Titlu A–Z, Cele mai mari și Cele mai postate.</li>
+<li><b>Doar potrivite</b> este activ implicit, ascunzând gunoiul neidentificat; o insignă „+N nepotrivite”
+îl dezvăluie.</li>
+<li>Dă clic pe o placă pentru fișa de detalii: sinopsis, notă și voturi IMDb, distribuție -
+și <b>▶ Redă</b> (previzualizează-l imediat, vezi <a href="#preview">§7</a>) sau
+<b>⬇ Descarcă</b>.</li>
+<li><b>✎ Corectează potrivirea</b> - dacă un titlu s-a potrivit cu serialul sau filmul greșit, alege-l pe cel corect
+dintre posterele candidate sau introdu titlul/anul/tipul manual. Textul manual este
+niciodată suprascris de instrumentul de îmbogățire. <b>↻ Reîmprospătează metadatele</b> repreia un singur titlu;
+Setări → Indexare poate reîmprospăta tot sau poate goli/reconstrui întregul index.</li>
+<li>Metadatele sunt <b>fără cheie în mod implicit</b> - seturile de date TVmaze, iTunes, IMDb, Wikidata,
+Wikipedia și AniList nu au nevoie de conturi. O cheie OMDb (gratuită, înscriere doar cu email -
+există un asistent de înscriere în Setări → Indexare) îmbunătățește potrivirea filmelor; o cheie TMDB
+este respectată dacă ai deja una.</li>
+<li><b>Pentru tine</b> ordonează peretele după un profil de gusturi construit pe
+această mașină din propriul tău istoric finalizat și din lista ta de urmărire: genurile
+preferate, dacă înclini spre film sau serial și aproximativ ce epocă. Titlurile pe care
+le ai deja coboară la fund în loc să dispară, iar o legendă „Pentru că vezi …” spune pe
+ce s-a bazat. Fără istoric, revine la Cele mai postate, așa că fila nu e niciodată
+goală. Nimic din toate acestea nu părăsește daemonul.</li>
+<li><b>Nu mă interesează</b> pe o plachetă ascunde acel titlu, iar dacă ascunzi câteva
+similare peretele învață: îți propune un filtru pe care îl accepți dintr-un clic
+(„Ascunzi toate titlurile Reality de acum înainte?”). Tot ce ai ascuns și fiecare
+filtru învățat se află la <b>Ascunse și filtre</b> și pot fi anulate acolo.</li>
+<li>Un mic <b>punct de disponibilitate</b> pe o plachetă este verdictul oracolului
+(<a href="#performance">§13</a>): un „?” chihlimbariu înseamnă incert la providerii tăi,
+roșu că părțile lipsesc în mod repetat. Grupurile aflate în curățare poartă o insignă
+<b>curățat</b>.</li>
+</ul>
+
+<h2 id="preview">7 · Previzualizare și verificare</h2>
+<p>Nu trebuie să aștepți să se termine o descărcare ca să știi că e fișierul
+potrivit. Deschide-l în timp ce se descarcă, verifică dacă conținutul, limba și
+calitatea sunt cele așteptate și anulează din timp dacă nu sunt - în loc să afli
+abia după descărcarea completă.</p>
+<ul>
+<li><b>▶ Redă</b> pe perete (sau <code>/m3u/&lt;id&gt;</code>) îi dă playerului tău media
+un URL; daemonul pornește sau reutilizează descărcarea din spate.</li>
+<li>Endpointul <code>/stream/&lt;nzo_id&gt;</code> servește fișierul cu suport complet pentru intervale HTTP
+<em>în timp ce se descarcă</em>. <b>Verificarea oricărui punct funcționează</b>: verifică rapid minutul 40 și
+articolele pentru acea regiune sunt promovate în fața cozii de descărcare -
+se deschide acolo în câteva secunde în loc de minute. Capul și
+coada fișierului sunt preluate primele, ca playerele să-și găsească imediat datele de index.</li>
+<li><b>Mod bibliotecă</b>: categoriile listate în <i>library_cats</i> devin intrări instantanee
+doar cu metadate - un fișier <code>.strm</code> apare imediat, disponibilitatea este
+verificată în fundal, iar descărcarea reală pornește când îl deschizi prima dată.</li>
+</ul>
+<div class="note"><b>Notă despre player</b>VLC, IINA, mpv și Infuse deschid toate
+URL-urile <code>/stream</code>. Pentru a verifica de pe altă mașină, folosește adresa LAN a mașinii tale în
+locul lui <code>localhost</code>.</div>
+<div class="note"><b>Notă despre autentificare</b>Cu o cheie API setată, deschiderea unei intrări de bibliotecă
+parcate prin <code>/stream/&lt;id&gt;</code> necesită un token per job
+(<code>?t=…</code>) - playerele nu pot trimite chei API, așa că predarea <code>/m3u</code>
+și pointerul <code>.strm</code> îl încorporează pentru tine; generarea lui (<code>/m3u</code>)
+necesită cheia. Servirea simplă de octeți a unei descărcări deja active rămâne deschisă, iar
+instalările fără cheie se comportă ca înainte.</div>
+
+<h2 id="servers">8 · Servere Usenet</h2>
+<p>Setări → <b>Servere Usenet</b> este editorul complet: adăugare, editare, ștergere, reordonare și includerea
+sau excluderea oricărui server din pool. Fiecare server are:</p>
+<table>
+<tr><th>Câmp</th><th>Note</th></tr>
+<tr><td>Host / port</td><td>Folosește portul SSL <b>563</b>. TLS nu costă nimic măsurabil - nzbfast criptează întotdeauna.</td></tr>
+<tr><td>Nume de utilizator / parolă</td><td>Stocate local în <code>config.local.json</code>, nearătate niciodată înapoi browserului. Lăsând parola goală la editare, se păstrează cea stocată.</td></tr>
+<tr><td>Conexiuni</td><td>Conexiuni simultane per server. Folosește <b>Reglarea conexiunilor</b> (<a href="#performance">§13</a>) pentru a găsi punctul optim al fiecărui provider în loc să ghicești mare.</td></tr>
+<tr><td>Nivel (treaptă)</td><td>0 = primar; nivelurile mai mari sunt servere de umplere, întrebate doar pentru articolele pe care le-a ratat fiecare nivel inferior. Pune conturile nelimitate la 0, conturile cu bloc la 1+.</td></tr>
+<tr><td>Dimensiunea blocului (GB)</td><td>Pentru conturile cu bloc (plată-per-GB): nzbfast urmărește utilizarea pe toată durata față de aceasta și nu mai folosește serverul când e consumat (avertisment la 85%).</td></tr>
+</table>
+<p>Alte două opțiuni per server nu au încă un control în panou: adaugă-le manual în
+intrarea acelui server din <code>config.local.json</code>
+(vezi <a href="#files">§17</a>) și repornește.</p>
+<table>
+<tr><th>Cheie</th><th>Note</th></tr>
+<tr><td><code>bind_ip</code></td><td>Leagă conexiunile de ieșire ale acestui server de o adresă locală anume, pentru mașini cu mai multe ieșiri și tuneluri VPN divizate. Familia de adrese alege și familia țintă: o legare v4 se conectează la adresa v4 a serverului.</td></tr>
+<tr><td><code>socks5</code></td><td>Trimite traficul NNTP al acestui server printr-un proxy SOCKS5: <code>host:port</code> sau <code>user:pass@host:port</code>. Numele gazdei este rezolvat <em>de proxy</em>, deci nu există scurgere DNS locală.</td></tr>
+</table>
+<ul>
+<li><b>Bifa</b> de lângă fiecare server este comutatorul lui: bifat înseamnă că serverul
+este în pool-ul de descărcare, nebifat înseamnă dezactivat. Un server dezactivat își
+păstrează datele de autentificare și setările și poate fi în continuare testat; pur și
+simplu nu i se cer niciodată articole. Rândul se estompează, numărătoarea din titlu
+(2 din 3 active) scade, iar modificarea se aplică de la <em>următoarea</em> descărcare.
+Util pentru a menaja un cont pe blocuri pe care îl păstrezi, sau pentru a demonstra că un
+furnizor este cauza unei probleme fără a-l șterge.</li>
+<li><b>Testează</b> face o conectare reală + TLS + autentificare și raportează timpul dus-întors.</li>
+<li><b>Importă din SABnzbd / NZBGet…</b> scanează locațiile obișnuite de instalare, arată ce
+a găsit și copiază serverele (sărind duplicatele).</li>
+<li>Editările de server se aplică de la <em>următoarea</em> descărcare - fără repornire.</li>
+</ul>
+<div class="tip"><b>Recomandare</b>Doi provideri pe backbone-uri <em>diferite</em>
+întrec trei pe același. Rulează <b>Diversitatea serverelor</b> (<a href="#performance">§13</a>)
+pentru a vedea care dintre providerii tăi îți diversifică efectiv acoperirea și care sunt
+copii redundante unul al altuia.</div>
+
+<h2 id="settings">9 · Referință de setări</h2>
+<p>Aproape tot se poate configura din panou, la ⚙ Setări; cele patru excepții sunt
+enumerate la finalul acestei secțiuni. Valorile marcate
+<span class="pill live">live</span> se aplică imediat, cele
+<span class="pill restart">restart</span> la următoarea pornire. Fiecare modificare
+făcută aici este salvată în <code>settings.json</code> și supraviețuiește repornirilor
+(valorile din interfață bat opțiunile din linia de comandă).</p>
+
+<h3>Viteză și programare <span class="pill live">live</span></h3>
+<table>
+<tr><th>Setare</th><th>Ce face</th></tr>
+<tr><td>Limită de viteză</td><td>Plafon în octeți/sec (<code>50M</code>, <code>1G</code>, 0 = nelimitat). Aplicațiile la distanță pot trimite procentaje - setează <i>Viteza liniei</i> ca ele să se traducă corect.</td></tr>
+<tr><td>Viteză automată</td><td>Plafon guvernat de RTT care cedează celuilalt trafic din casă și se reextinde când linia e liniștită.</td></tr>
+<tr><td>Amână automat descărcările lente</td><td>Un job blocat pe un singur server lent în timp ce altele așteaptă este mutat la coada cozii (progresul e păstrat). Vezi <a href="#performance">§13</a>.</td></tr>
+<tr><td>Preîncărcare pe serverele inactive</td><td>Serverele inutile pentru jobul activ pornesc următorul job din coadă. Vezi <a href="#performance">§13</a>.</td></tr>
+<tr><td>Actualizare automată / URL de verificare a actualizărilor</td><td>Vezi <a href="#updates">§14</a>.</td></tr>
+<tr><td>Viteza liniei</td><td>Viteza nominală a conexiunii tale - activează limitele procentuale de la aplicațiile compatibile SABnzbd.</td></tr>
+<tr><td>Program săptămânal</td><td>Editor de rânduri pentru reguli după momentul săptămânii: pauză, reluare sau setarea unei limite de viteză la anumite zile/ore (ora locală). Ex. limitează la 20&nbsp;MB/s în zilele lucrătoare 9–17, nelimitat altfel.</td></tr>
+</table>
+
+<h3>Următoarea descărcare <span class="pill live">live</span></h3>
+<p><b>Conexiuni</b> (per server), <b>fereastra</b> (adâncimea de pipelining per conexiune),
+<b>decodoare</b> (fire de decodare paralele). Eșantionate când pornește fiecare job. Valorile implicite
+sunt potrivite pentru majoritatea liniilor; folosește instrumentele de reglare înainte de a mări orbește.</p>
+
+<p><b>Verificare rapidă (CRC32)</b> (activată implicit) revendică blocurile PAR2 prin
+CRC32 cât timp descărcarea încă rulează, ceea ce e de 2-3x mai rapid pe un procesor
+lent. Suma de control proprie fiecărui articol este oricum verificată, iar trecerea
+finală folosește întotdeauna MD5 complet: nu se sacrifică nimic din corectitudine.
+Debifeaz-o pentru a calcula MD5 pe bloc și în timpul descărcării.</p>
+<h3>Disc și cotă <span class="pill live">live</span></h3>
+<p><b>Spațiu liber minim</b> (pune în pauză joburile noi sub el), <b>cotă de descărcare</b> pe
+zi sau lună (UTC; joburile Forțate ignoră), <b>limită de memorie</b> - bugetul de RAM al motorului
+(implicit: ¼ din RAM, limitat; mărește-l pe o mașină cu mult RAM pentru viteză maximă la joburi
+uriașe și vezi <a href="#memory">cât costă memoria redusă</a> înainte de a-l scădea)
+<span class="pill restart">repornire</span>.</p>
+<p><b>Mută finalizatele în</b>: după dezarhivare, curățare și redenumire,
+descărcările finalizate se mută aici - un share NAS, un disc media, oriunde îți
+stă biblioteca. Structura pe categorii se păstrează (un job terminat sub
+<code>tv/</code> ajunge sub <code>tv/</code> la destinație), iar istoricul
+urmează mutarea, așa că aplicațiile conectate importă și șterg din noua
+locație. Dacă destinația nu e accesibilă când se termină un job (share offline,
+spațiu epuizat), fișierele rămân în folderul de descărcare și jobul se încheie
+oricum normal. Gol = dezactivat. <b>Destinații per categorie</b> trimit anumite
+categorii în altă parte (<code>tv=/Volumes/NAS/TV, movies=/Volumes/NAS/Movies</code>); fiecare cale listată <em>este</em> folderul
+acelei categorii, deci în ea nu se creează niciun subfolder de categorie
+suplimentar. Categoriile nelistate urmează <b>Mută finalizatele în</b>.</p>
+
+<p><b>Adâncimea arhivelor imbricate</b> (implicit 5) este numărul de straturi
+arhivă-în-arhivă dezarhivate automat: un set RAR care conține un 7z care conține alt RAR
+este ceva obișnuit pe Usenet, iar nzbfast urmează lanțul fără o a doua trecere. La
+limită, arhiva cea mai adâncă este pur și simplu lăsată pe loc, nedezarhivată, iar
+descărcarea se finalizează oricum. Mărește valoarea doar pentru release-uri neobișnuit
+de adânci.</p>
+
+<h3>Redenumire automată și curățare <span class="pill live">live</span></h3>
+<p><b>Redenumește descărcările finalizate</b> (activată implicit) dă folderului și
+fișierului principal un nume curat și clar: un film devine
+<code>Example Movie (2024)</code>, serialele păstrează <code>Show - S01E02</code>.
+Numele ofuscate sau nerecunoscute sunt lăsate exact așa cum au fost postate, în loc să
+fie ghicite.</p>
+<table>
+<tr><th>Setare</th><th>Ce face</th></tr>
+<tr><td>Include rezoluția</td><td>Adaugă <code>1080p</code>, <code>2160p</code>… în nume. <b>Activată implicit</b>; celelalte patru marcaje sunt dezactivate.</td></tr>
+<tr><td>Include codecul video</td><td><code>x265</code>, <code>x264</code>, <code>AV1</code>…</td></tr>
+<tr><td>Include codecul audio</td><td><code>Atmos</code>, <code>DTS-HD</code>, <code>AC3</code>…</td></tr>
+<tr><td>Include sursa</td><td><code>BluRay</code>, <code>WEB</code>, <code>REMUX</code>…</td></tr>
+<tr><td>Include grupul de release</td><td>Marcajul <code>-GROUP</code> de la final.</td></tr>
+<tr><td>Elimină fișierele inutile</td><td><b>Activată implicit.</b> Șterge fișierele <code>.par2</code>, <code>.nzb</code>, <code>.sfv</code>, <code>.nfo</code> rămase și clipurile-eșantion din folderele de film și serial finalizate. Niciodată videoclipul sau subtitrările lui.</td></tr>
+<tr><td>Păstrează doar fișierul media</td><td><b>Dezactivată implicit și distructivă:</b> șterge definitiv tot din folder în afară de videoclip(uri) și subtitrări. Fiecare episod dintr-un pachet de sezon este păstrat. Are întâietate față de <b>Elimină fișierele inutile</b> când ambele sunt active.</td></tr>
+</table>
+<p class="dim">Întregul grup rulează după reparare și dezarhivare și înainte de <b>Mută
+finalizatele în</b>, și este sărit complet pentru o sarcină care încă așteaptă o parolă.
+Ambii pași de ștergere se aplică <em>doar</em> release-urilor recunoscute ca film sau
+serial: o încărcătură software sau un set neclasificabil (ofuscat) nu este niciodată
+curățat.</p>
+
+<h3>Foldere și procesare</h3>
+<p><b>Folder de descărcare</b> <span class="pill restart">repornire</span>, <b>folder monitorizat</b>,
+<b>script de post-procesare</b> (rulat după fiecare job cu argumente compatibile SABnzbd
+și mediul <code>SAB_*</code> - scripturile SAB existente funcționează neschimbate),
+<b>extensii de curățare</b> (fișiere gunoi șterse după finalizare), <b>Foldere inteligente</b>
+și <b>arhivare TV</b> (vezi <a href="#automation">§10</a>).</p>
+
+<h3>Indexare <span class="pill live">live</span></h3>
+<table>
+<tr><th>Setare</th><th>Ce face</th></tr>
+<tr><td>Grupuri</td><td>Newsgroup-urile pe care le scanează indexerul integrat (ex. <code>alt.binaries.teevee</code>).</td></tr>
+<tr><td>Interval de scanare</td><td>Secunde între treceri (implicit 900).</td></tr>
+<tr><td>Articole de backfill</td><td>Antete preluate la prima scanare a unui grup.</td></tr>
+<tr><td>Aprofundare per scanare</td><td>Fiecare trecere indexează și acest număr de articole <em>mai vechi</em>, extinzând istoricul tău căutabil în fundal până la atingerea Vârstei maxime (implicit 200.000 per trecere ≈ zeci de milioane de articole per zi de funcționare).</td></tr>
+<tr><td>Vârsta maximă</td><td>Ignoră postările mai vechi de atât (<code>90d</code>, <code>6m</code>, <code>2y</code>) - limitează dimensiunea indexului și timpul de scanare.</td></tr>
+<tr><td>Restrânge la fereastra de vârstă</td><td><b>Activată implicit.</b> Șterge și release-urile deja stocate odată ce depășesc vârsta maximă, astfel încât indexul să țină aproximativ acea fereastră în loc să crească la nesfârșit. Dezactivată = doar postările noi sunt filtrate, iar ce e stocat rămâne. Fragmentele moarte (ascunse, încă incomplete după o săptămână) sunt strânse oricum.</td></tr>
+<tr><td>Filtre de preluare</td><td>Reguli JSON care filtrează ce intră în index: tipuri (gunoiul obfuscat este eliminat implicit), an/rezoluție/limbă, limite de dimensiune.</td></tr>
+<tr><td>Scanează acum / rescanare profundă</td><td>Rulează imediat o trecere; cu o adâncime, rescanează acel număr de antete recente.</td></tr>
+<tr><td>Cheie OMDb / reîmprospătare metadate / golire</td><td>Controale de îmbogățire a peretelui (<a href="#wall">§6</a>). Golirea reconstruiește baza de date de la zero - soluția de recuperare dacă e vreodată coruptă.</td></tr>
+</table>
+
+<h3>Bibliotecă, Securitate, Interfață</h3>
+<p><b>Bibliotecă</b>: categorii tratate ca intrări instantanee de bibliotecă + interval de reverificare.
+<b>Securitate</b>: cheia API completă (tot) și cheia NZB (doar adăugare - sigur de dat
+site-urilor de indexer), ambele rotibile live. <b>Interfață</b>: sunete la clic, notificări desktop
+la finalizare, interval de resortare a providerilor.</p>
+
+<p><b>Unități de viteză</b> <span class="pill live">live</span> decide cum este
+afișată fiecare viteză din panou: megaocteți (MB/s, norma managerelor de descărcare,
+valoarea implicită) sau megabiți (Mb/s, așa cum își anunță furnizorii liniile).
+Dimensiunile fișierelor rămân în octeți. Este o proprietate a daemonului, nu a
+navigatorului tău, deci se aplică oricărui dispozitiv care privește această
+instalare.</p>
+<h3>Avansat: setări fără control în panou</h3>
+<p>Patru setări nu au nici control în interfață, nici opțiune în linia de comandă.
+Setează-le prin API (<a href="#api">§16</a>), de ex.
+<code>/api?mode=config&amp;name=verify_mode&amp;value=lean&amp;apikey=…</code>. Ca toate
+celelalte, ajung în <code>settings.json</code>.</p>
+<table>
+<tr><th>Nume</th><th>Ce face</th></tr>
+<tr><td><code>verify_mode</code></td><td><code>full</code> | <code>fast</code> | <code>lean</code> (implicit <code>fast</code>). <code>lean</code> este impulsul pentru procesoare lente: ca fast, dar sare în plus peste CRC-ul yEnc per articol de îndată ce PAR2 acoperă un fișier, lăsând un singur strat CRC32 în loc de două. Descărcările fără PAR2 își păstrează CRC-urile de articol, iar verificarea și repararea de la finalul sarcinii rămân neschimbate în ambele cazuri. <b>Verificarea rapidă</b> de mai sus este același control pentru full față de fast.</td></tr>
+<tr><td><code>auto_retry_mins</code></td><td>Așteptarea dinaintea <em>singurei</em> reîncercări automate pe care o primește un prim eșec cu articole lipsă (implicit 20). Întârzierea de propagare este o cauză reală a articolelor lipsă și se rezolvă de la sine; datorită jurnalului, reluarea aduce doar ce încă lipsește. Eșecurile din cauza parolei sau a retragerii nu se califică niciodată.</td></tr>
+<tr><td><code>index_scan_par</code></td><td>Câte grupuri scanează indexatorul în paralel (implicit 3, limitat la 1-8).</td></tr>
+<tr><td><code>oracle_sample</code></td><td>Bugetul de STAT în repaus al oracolului de disponibilitate (<a href="#oracle">§13</a>), sondaje pe oră și pe server. Implicit 300, maximum 3600, <code>0</code> dezactivează complet eșantionarea.</td></tr>
+</table>
+<h2 id="automation">10 · Automatizare</h2>
+<h3>Watchlist</h3>
+<p>Cea mai simplă automatizare: adaugă un titlu pe panou, setează preferințele de calitate,
+gata. Release-urile noi sunt preluate pe măsură ce apar în grupurile tale indexate;
+copiile de calitate mai bună fac upgrade preluărilor anterioare; o vizualizare de tip calendar arată ce urmează.</p>
+<h3 id="auto-rss">Feeduri RSS</h3>
+<p>Setări → RSS: orice URL RSS newznab/indexer cu interval per feed, categorie și
+reguli de filtrare (tipare de titlu, limite de dimensiune). Elementele care se potrivesc sunt descărcate
+automat.</p>
+<h3 id="auto-smart">Foldere inteligente</h3>
+<p>Reguli evaluate când un job este adăugat: potrivire după tipar/cuvinte-cheie și dimensiune, atribuie o
+categorie (prima potrivire câștigă). Cu <b>arhivarea TV</b> activă, episoadele TV terminate sunt
+redenumite și arhivate ca <code>Show/Season 01/Show&nbsp;-&nbsp;S01E02.mkv</code> -
+gata pentru Plex/Jellyfin fără un instrument extern.</p>
+<h3>Planificator</h3>
+<p>Programul săptămânal (vezi <a href="#settings">§9</a>) automatizează pauza/reluarea/viteza
+după ora zilei.</p>
+<h3>Scripturi</h3>
+<p>Un script de post-procesare primește argumentele poziționale ale SABnzbd și
+variabilele de mediu <code>SAB_*</code> - ecosistemul mare de scripturi SAB rulează
+ca atare.</p>
+
+<h2 id="arr">11 · Sonarr, Radarr și prietenii</h2>
+<p>nzbfast vorbește nativ API-ul SABnzbd, așa că fiecare *arr funcționează imediat -
+și poate acționa și ca <em>indexer</em> al lor.</p>
+<h3>Ca client de descărcare</h3>
+<ol>
+<li>În Sonarr/Radarr: Settings → Download Clients → adaugă <b>SABnzbd</b>.</li>
+<li>Host: mașina ta nzbfast · Port: <b>6789</b> · Cheie API: cheia ta API completă
+(Setări → Securitate; controlul QR/copiere este lângă ea).</li>
+<li>Categorie după preferință (ex. <code>tv</code> / <code>movies</code>). Test → bifă verde → Save.</li>
+</ol>
+<p>Coada, istoricul, starea per job, „remove &amp; delete”, reîncercarea și rutarea pe categorii
+se comportă toate cum se așteaptă *arr-urile.</p>
+<h3>Ca indexer (newznab)</h3>
+<ol>
+<li>Settings → Indexers → adaugă <b>Newznab</b>.</li>
+<li>URL: <code>http://&lt;host&gt;:6789/</code> · Calea API: <code>/api</code> · cheie: cheia ta API.</li>
+<li>nzbfast servește interogările <code>caps</code>, <code>search</code>, <code>tvsearch</code> și
+<code>movie</code> din propriul index al grupurilor tale urmărite, iar
+<code>/getnzb/&lt;id&gt;</code> returnează NZB-ul.</li>
+</ol>
+<div class="note"><b>De ce să te obosești?</b>Un indexer auto-găzduit exact al grupurilor care te
+interesează: fără conturi, fără limite de accesări API, retenție atât de adâncă pe cât o lași să scaneze.</div>
+
+<h2 id="remotes">12 · Telefon și aplicații la distanță</h2>
+<p>nzbfast implementează <em>ambele</em> protocoale majore de control la distanță, așa că aproape fiecare
+aplicație de mobil/tabletă funcționează. Alege protocolul pe care îl acceptă aplicația ta:</p>
+<h3>Aplicații care vorbesc NZBGet (nzb360, LunaSea, NZB Unity…)</h3>
+<table>
+<tr><th>Câmpul din aplicație</th><th>Valoare</th></tr>
+<tr><td>Tip</td><td>NZBGet</td></tr>
+<tr><td>Host / port</td><td>mașina ta : <b>6789</b></td></tr>
+<tr><td>Nume de utilizator</td><td>orice (ex. <code>nzbfast</code>)</td></tr>
+<tr><td>Parolă</td><td><b>cheia ta API</b></td></tr>
+</table>
+<p>Întreaga suprafață JSON-RPC folosită de aceste aplicații este servită: stare, coadă cu
+reordonare/pauză/ștergere, istoric, adăugare-NZB, limită de viteză, pauză/reluare, jurnal.</p>
+<h3>Aplicații care vorbesc SABnzbd</h3>
+<table>
+<tr><th>Câmpul din aplicație</th><th>Valoare</th></tr>
+<tr><td>Tip</td><td>SABnzbd</td></tr>
+<tr><td>Host / port</td><td>mașina ta : <b>6789</b></td></tr>
+<tr><td>Cheie API</td><td>cheia ta API (sau cheia NZB pentru acces doar-adăugare)</td></tr>
+</table>
+<h3>Panoul pe telefonul tău</h3>
+<p>Doar deschide <code>http://&lt;machine&gt;:6789</code> într-un browser mobil - întregul
+panou și perete au un aspect tactil. Panoul Setări → Acces la distanță arată
+URL-urile exacte și un cod QR de scanat.</p>
+
+<h2 id="performance">13 · Instrumente de performanță</h2>
+<h3 id="perf-benchmark">Benchmark de sistem</h3>
+<p>Un singur clic măsoară cele trei plafoane ale tale - debitul de rețea (o sondă reală de 8 secunde
+cu mai multe conexiuni), rata de verificare CPU și viteza de scriere pe disc - și începe
+cu răspunsul: <b>viteza maximă de descărcare estimată și care plafon este
+limita</b>. Bara cea mai scurtă este strangularea ta; celelalte arată marja lor.
+Programează-l (la 6 ore → săptămânal) și fiecare rulare este înregistrată într-un tabel de istoric, ca să
+poți vedea când providerul, ISP-ul sau hardware-ul tău și-au schimbat comportamentul. Rulările programate au loc
+doar când coada e inactivă.</p>
+<h3 id="perf-tuning">Reglarea conexiunilor</h3>
+<p>Măsoară un provider la numere crescânde de conexiuni și recomandă setarea -
+mai multe socketuri ajută până când providerul sau linia ta se saturează, iar unii provideri
+penalizează cererea excesivă. <b>Testează tot</b> compară fiecare provider, apoi le pornește pe toate
+împreună pentru a verifica dacă pool-ul îți saturează linia.</p>
+<h3 id="perf-diversity">Diversitatea serverelor</h3>
+<p>Eșantionează cu STAT articole de diferite vârste pe fiecare server și grupează providerii după
+lacunele comune: providerii cu ~100% articole lipsă comune sunt același backbone
+(redundant pentru recuperare); cei independenți îți extind cu adevărat acoperirea. Se încheie
+cu o recomandare în limbaj clar.</p>
+<h3>Inteligență automată a cozii</h3>
+<ul>
+<li><b>Amânare automată</b>: o descărcare care șchioapătă pe un singur server lent în timp ce alte joburi
+așteaptă este parcată la coadă (jurnalul îi păstrează progresul) și reîncercată când coada
+e liberă.</li>
+<li><b>Preîncărcare pe serverele inactive</b>: serverele care nu pot ajuta jobul activ (copiile
+lor au dispărut) încep între timp să descarce <em>următorul</em> job din coadă. Niciun alt
+client nu face suprapunere între joburi.</li>
+<li><b>Suprapunere între joburi</b>: în timp ce coada unui job terminat (verificare/extragere) se finalizează pe
+disc, descărcarea următorului job deține deja linia.</li>
+</ul>
+<h3 id="oracle">Oracolul de disponibilitate</h3>
+<p>Retragerile sunt principalul motiv pentru care eșuează o descărcare Usenet și sunt
+previzibile: același release dispare de pe un backbone în timp ce altul încă îl are.
+nzbfast ține un mic registru al a ceea ce au servit efectiv propriii tăi provideri și
+cheltuiește un buget minuscul de sondaje STAT în repaus (câteva sute pe oră și pe
+server, niciodată în timpul unei descărcări) ca să-l țină la zi. Nu descarcă niciodată
+încărcătură utilă pentru asta.</p>
+<p>Ce obții din asta:</p>
+<ul>
+<li>Un <b>verdict de disponibilitate</b> pe plachetele peretelui și pe rândurile
+indexului (<a href="#wall">§6</a>): „?” chihlimbariu pentru incert la providerii tăi,
+roșu pentru dispărut cu certitudine. Fără marcaj înseamnă că arată bine.</li>
+<li>O insignă <b>curățat</b> pe grupurile unde postările proaspete sunt deja retrase,
+ca să deosebești un grup pe moarte de un release ghinionist.</li>
+<li><b>Sari peste providerii pe care oracolul i-a scos din calcul</b> (Setări,
+<b>dezactivat implicit, experimental</b>): când verificarea e sigură că backbone-ul unui
+provider a pierdut un release, acesta e sărit direct pentru descărcarea respectivă, în
+loc să se aștepte eșecul. Nu va sări niciodată peste ultimul tău provider rămas.</li>
+</ul>
+<p class="dim">Verdictul este o predicție pornind de la indicii, nu o garanție. Pentru
+un răspuns ferm despre un NZB, <code>nzbfast check</code> (<a href="#cli">§15</a>)
+numără articolele reale.</p>
+<h3 id="memory">Buget de memorie - și cât costă memoria redusă</h3>
+<p>Toate cache-urile motorului împart un singur buget (implicit ¼ din RAM-ul fizic, limitat la
+256 MB–16 GB). Setează-l explicit cu <i>Limită de memorie</i> în Setări sau cu
+<code>--mem-limit</code> pe linia de comandă.</p>
+<p>nzbfast este construit să-ți satureze rețeaua și discul în același timp, iar RAM-ul este
+ce îi permite să facă ambele într-<em>o singură trecere</em>: articolele sunt decodate, verificate și scrise
+direct la offset-urile lor finale, așa că volumele de arhivă nu trebuie să atingă deloc discul.
+Înfometează-l de memorie și nimic nu se rupe - fiecare cache are o cale de spill, iar motorul
+degradează spre mai mult I/O pe disc în loc să facă swap sau să eșueze. Dar acel spill nu e gratuit,
+iar la joburi mari îl poți măsura.</p>
+<p>Măsurat pe o singură mașină și o singură linie (M1 Ultra, 10 GbE), aceleași fișiere la fiecare
+buget. Fiecare rulare a produs un rezultat corect, complet verificat și extras:</p>
+<table>
+<tr><th>Dimensiunea jobului</th><th>Suficient RAM</th><th>Buget 2 GB<br><span class="dim">≈ mașină 8 GB</span></th><th>Buget 1 GB<br><span class="dim">≈ mașină 4 GB</span></th><th>Buget 256 MB<br><span class="dim">≈ NAS 2 GB</span></th></tr>
+<tr><td>7 GB</td><td>15 s</td><td>15 s</td><td>15 s</td><td>15 s</td></tr>
+<tr><td>35 GB</td><td>65 s</td><td>70 s</td><td>70 s</td><td>65 s</td></tr>
+<tr><td>87 GB</td><td>148 s</td><td>206 s <span class="dim">+39%</span></td><td>196 s <span class="dim">+32%</span></td><td>180 s <span class="dim">+22%</span></td></tr>
+<tr><td>190 GB</td><td>330 s</td><td>427 s <span class="dim">+29%</span></td><td>402 s <span class="dim">+22%</span></td><td>411 s <span class="dim">+25%</span></td></tr>
+</table>
+<p>Memoria de vârf urmărește <em>bugetul</em>, nu jobul: acea descărcare de 190 GB se finalizează
+în aproximativ 1.1 GB de RAM. Ce plătești în schimb este timp - și doar la joburi mari.</p>
+<ul>
+<li><b>Până la ~35 GB, memoria redusă e gratuită.</b> Setul de lucru încape indiferent, așa că o
+mașină de 4 GB termină un astfel de job la fel de repede ca una de 64 GB.</li>
+<li><b>Peste ~87 GB plătești 20–40% - dar numai când linia ta întrece discul.</b>
+Blocurile de verificare și volumele de arhivă care ar fi rămas în RAM sunt scrise pe disc
+și citite înapoi, iar asta costă timp doar dacă rețeaua poate livra mai repede decât
+poate discul să absoarbă traficul suplimentar. Cei 20–40% de mai sus au fost măsurați pe 10 GbE; același
+job de 87 GB la aceleași bugete pe o linie de ~2.4 Gbps nu a arătat nicio penalizare (−1 până la +7%,
+în zgomotul de la o rulare la alta). Penalizarea este o funcție a cât de mult întrece linia
+discul, <em>nu</em> a dimensiunii jobului - pe o conexiune casnică tipică, un buget mic este
+aproape gratuit chiar și la joburi foarte mari.</li>
+<li><b>Penalizarea se aplatizează.</b> Odată ce un job este suficient de mare pentru a face spill, fiecare buget constrâns
+face spill aproximativ la fel - rulările de 2 GB, 1 GB și 256 MB citesc înapoi
+în esență același număr de blocuri de pe disc și se termină în limita zgomotului una față de alta.
+Așa că puțin mai mult RAM sub pragul care evită complet spill-ul nu îți recuperează
+costul: dă-i destul cât să țină jobul în memorie, sau cifra exactă abia contează.</li>
+</ul>
+<div class="tip"><b>Recomandare</b>Dă-i nzbfast aproximativ <b>2 GB de buget per
+100 GB</b> din cel mai mare job pe care îl descarci și lasă valoarea implicită în pace altfel -
+¼ din RAM este deja răspunsul corect pe majoritatea mașinilor. În practică: <b>4 GB RAM</b>
+acoperă joburi până la ~35 GB la viteză maximă; <b>8–16 GB</b> le ține acolo și pe cele de peste
+100 GB; un <b>NAS de 2 GB</b> va termina orice îi dai, dar tratează-l ca pe un
+descărcător de fundal, nu ca pe ceva care va satura o linie rapidă.</div>
+<p>Pe un NAS mic, scade și <i>Conexiunile</i> (2–4) odată cu bugetul. La un
+buget de 256 MB și 2 conexiuni, memoria de vârf rămâne aproape de <b>190 MB</b> - confortabil
+în ce are liber un NAS de 2 GB. Ține cont că în acel punct numărul de conexiuni,
+nu memoria, este ce te limitează: același job de 35 GB a durat 286 s în loc de 65 s.
+Aceasta este forma onestă a compromisului - va termina întotdeauna și va termina corect;
+doar nu va satura linia.</p>
+<p class="dim">Benchmark-urile sunt rerulate pentru fiecare release; metoda și cifrele per mașină
+sunt publicate alături de rezultate.</p>
+
+<h2 id="updates">14 · Actualizări</h2>
+<ul>
+<li>Actualizările sunt <b>doar notificare</b>: nzbfast nu își descarcă și nu
+își înlocuiește niciodată propriul binar și nu conține cod care să poată face
+asta. Când există o versiune nouă, antetul arată
+<b>⬆ v X disponibilă - descarcă</b>; cipul duce la pagina oficială de
+descărcare (linkul e fixat în aplicație, nu vine niciodată din manifestul de
+actualizare). Instalează versiunea nouă la fel cum ai instalat-o pe cea
+curentă.</li>
+<li>nzbfast verifică versiunile noi de două ori pe zi. Dezactivează
+<b>Verifică actualizările</b> (Setări) și nu mai contactează deloc manifestul
+de actualizare; un URL de verificare gol face același lucru.</li>
+</ul>
+
+<h2 id="cli">15 · Linia de comandă</h2>
+<p>Tot ce face daemonul poate fi și scriptat. Comenzile de zi cu zi:</p>
+<table>
+<tr><th>Comandă</th><th>Scop</th></tr>
+<tr><td><code>nzbfast setup</code></td><td>Configurare interactivă a serverului.</td></tr>
+<tr><td><code>nzbfast serve</code></td><td>Rulează daemonul (panou + API + automatizare). <code>--open</code> deschide browserul; vezi <code>--help</code> pentru lista completă de flaguri - fiecare setare din panou are un flag geamăn.</td></tr>
+<tr><td><code>nzbfast get file.nzb</code></td><td>Descarcă un NZB, pipeline complet, fără daemon. <code>--preflight</code> abandonează devreme dacă postarea nu se poate finaliza; <code>--password</code> pentru seturi criptate.</td></tr>
+<tr><td><code>nzbfast check file.nzb</code></td><td>Verdict de disponibilitate - COMPLETE / REPAIRABLE / IMPOSSIBLE - fără a descărca payload-ul.</td></tr>
+<tr><td><code>nzbfast verify DIR</code></td><td>Verifică fișierele în raport cu setul PAR2 dintr-un director.</td></tr>
+<tr><td><code>nzbfast sysbench</code></td><td>Benchmark-ul de sistem + raportul de diversitate, în terminal.</td></tr>
+<tr><td><code>nzbfast index / search</code></td><td>Scanează grupurile în index / caută în el, fără daemon.</td></tr>
+<tr><td><code>nzbfast import-sab</code></td><td>Importă servere dintr-un ini SABnzbd.</td></tr>
+</table>
+<p class="dim">Disponibile și: <code>inspect</code>, <code>probe</code>,
+<code>bench</code>, <code>bench-cpu</code>, <code>soak</code>, <code>fetch</code>,
+<code>spots</code>/<code>spot-search</code>/<code>spot-get</code> (Spotnet),
+<code>make-release-nzb</code>/<code>make-test-nzb</code> (fixturi de test). Fiecare
+comandă acceptă <code>--config</code> și <code>--help</code>. Li se adaugă <code>post</code>: încarcă fișiere ca articole
+yEnc și scrie NZB-ul corespunzător. Este o unealtă de operare, cere un
+<code>--post-server</code> explicit și nu alege niciodată un server în locul tău.</p>
+
+<h2 id="api">16 · Prezentare API</h2>
+<p>Endpoint de bază: <code>http://host:6789/api?mode=…&amp;apikey=…&amp;output=json</code> -
+compatibil SABnzbd, așa că integrările SAB existente funcționează neschimbate. Două chei:
+<b>cheia API</b> (control complet) și <b>cheia NZB</b> (doar adăugare:
+<code>addfile</code>/<code>addurl</code>).</p>
+<table>
+<tr><th>Zonă</th><th>Moduri</th></tr>
+<tr><td>Coadă</td><td><code>queue</code> (cu <code>name=delete/pause/resume/priority/switch</code>), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>retry</code>, <code>set_password</code></td></tr>
+<tr><td>Info</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code></td></tr>
+<tr><td>Config</td><td><code>get_config</code>, <code>config&amp;name=&lt;setting&gt;&amp;value=…</code> (fiecare câmp din Setări), <code>server_save/delete/test/enable/reorder</code>, <code>import_probe/apply</code></td></tr>
+<tr><td>Index și perete</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, plus newznab la <code>/api?t=caps|search|tvsearch|movie</code> și <code>/getnzb/&lt;id&gt;</code></td></tr>
+<tr><td>Automatizare</td><td><code>watchlist</code>, <code>watchlist_check_now</code>, <code>watch_calendar</code>, <code>feeds</code>, <code>smart_folders</code>, <code>schedule</code></td></tr>
+<tr><td>Diagnostice</td><td><code>sysbench</code>, <code>bench_history</code>, <code>connladder</code>, <code>pooltest</code>, <code>diversity</code>, <code>update_check</code>, <code>update_apply</code></td></tr>
+<tr><td>NZBGet JSON-RPC</td><td><code>/jsonrpc</code> - status, listgroups, history, append, editqueue, rate, pause, log (autentificare Basic: orice utilizator, cheia API drept parolă)</td></tr>
+<tr><td>Previzualizare / redare</td><td><code>/stream/&lt;nzo_id&gt;</code> (intervale HTTP; pornirea unui job de bibliotecă parcat necesită token <code>?t=</code> sau cheie), <code>/m3u/&lt;id&gt;</code> (necesită cheie; generează tokenul), <code>/wall</code>, <code>/art/…</code></td></tr>
+</table>
+
+<h2 id="files">17 · Fișiere și locații</h2>
+<table>
+<tr><th>Fișier</th><th>Conținut</th></tr>
+<tr><td><code>config.local.json</code></td><td>Credențiale de server și opțiuni per server. Creat de asistent; editabil în Setări. Păstrează-l privat.</td></tr>
+<tr><td><code>settings.json</code></td><td>Fiecare setare schimbată în panou. Se află lângă config; valorile din interfață au prioritate față de flagurile din linia de comandă. Șterge o cheie (sau fișierul) pentru a reveni la flaguri/valori implicite.</td></tr>
+<tr><td><code>index.db</code></td><td>Indexul de release-uri (SQLite) + metadatele peretelui. Sigur de șters - se reconstruiește prin scanare (Setări → Indexare → Golire face asta pentru tine).</td></tr>
+<tr><td><code>&lt;downloads&gt;/.spool/</code></td><td>Starea cozii (supraviețuiește repornirilor), NZB-uri per job, registrul de utilizare, istoricul benchmark-urilor, cache-ul de imagini poster.</td></tr>
+<tr><td>Jurnal de articole</td><td>În interiorul folderului de ieșire al fiecărui job cât timp e incomplet - alimentează reluarea după blocare și reîncercarea. Eliminat la succes.</td></tr>
+<tr><td>Instrumente externe</td><td>Nu e nevoie de niciunul - extragerea RAR și repararea PAR2 sunt native. Dacă un set exotic are vreodată nevoie de un <code>unrar</code> sau <code>par2</code> extern ca rezervă, nzbfast caută lângă executabilul său, apoi în <code>$PATH</code>.</td></tr>
+</table>
+
+<h2 id="troubleshooting">18 · Depanare</h2>
+<table>
+<tr><th>Simptom</th><th>Verificare</th></tr>
+<tr><td>Descărcări lente</td><td>Rulează <b>Benchmark de sistem</b> - numește strangularea direct. Dacă e rețeaua: rulează <b>Reglarea conexiunilor</b>, verifică numărul de conexiuni per server și confirmă că providerii tăi nu sunt toți un singur backbone (<b>Diversitatea serverelor</b>).</td></tr>
+<tr><td>Lent doar la joburi foarte mari<br>(NAS sau mașină cu RAM redus)</td><td>De așteptat și măsurabil: un buget de memorie înfometat face spill cache-urilor pe disc și costă 20–40% peste ~87 GB. Vezi <a href="#memory">Buget de memorie</a> pentru cifre și câtă memorie să-i dai. Joburile mai mici nu sunt afectate.</td></tr>
+<tr><td>Descărcarea eșuează cu „articole lipsă”</td><td>Postarea a expirat sau a fost retrasă la providerii tăi. Un al doilea provider pe un backbone diferit salvează majoritatea acestora. <code>nzbfast check</code> prezice asta înainte de descărcare. Iar peretele semnalează din timp release-urile probabil dispărute prin
+punctul său de disponibilitate (<a href="#oracle">§13</a>). Un prim eșec de acest fel se
+reia singur o dată după o așteptare, fiindcă întârzierea de propagare arată exact la fel
+și se rezolvă de la sine.</td></tr>
+<tr><td>Arhiva terminată cere o parolă</td><td>Rândul din Istoric arată 🔑 - introdu parola acolo; jobul se finalizează pe loc. </td></tr>
+<tr><td>Sonarr/Radarr nu se poate conecta</td><td>Portul 6789 e accesibil? Cheia API e corectă (cheia completă, nu cheia NZB)? Tipul de client setat pe SABnzbd?</td></tr>
+<tr><td>Cardul Răsfoiește rămâne mic</td><td>Indexerul crește în fundal - verifică dacă grupurile din Setări → Indexare sunt setate și dă-i timp Aprofundării per scanare să acumuleze istoric. „Scanează acum” forțează o trecere; linia de stare arată progresul în timp real.</td></tr>
+<tr><td>Peretele arată grafică greșită/lipsă</td><td>Fișa de detalii → ✎ Corectează potrivirea sau ↻ Reîmprospătează metadatele. Căutările de filme se îmbunătățesc cu o cheie OMDb gratuită.</td></tr>
+<tr><td>Daemonul nu pornește: portul e ocupat</td><td>Rulează altă instanță - sau schimbă <code>--port</code>.</td></tr>
+<tr><td>Unde sunt jurnalele?</td><td>Cardul Jurnal din panou sau terminalul/fișierul de jurnal cu care ai lansat <code>serve</code>.</td></tr>
+</table>
+<div class="note"><b>Tot blocat?</b>Cardul Jurnal numește de obicei vinovatul -
+include coada lui când raportezi o problemă, împreună cu
+<code>nzbfast --version</code>.</div>
+
+<hr>
+<p class="dim">nzbfast - acest manual vine cu fiecare release. Setările, endpointurile
+și valorile implicite menționate aici corespund versiunii cu care a fost livrat.</p>
+
+</main>
+</div>
+</body>
+</html>

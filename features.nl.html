@@ -30,7 +30,9 @@
 <header><div class="wrap">
   <a class="logo" href="index.nl.html"><span class="bolt">⚡</span> nzbfast</a>
   <nav>
+    <a href="index.nl.html" class="home">Home</a>
     <a href="features.nl.html" class="on">Functies</a>
+    <a href="indexer.nl.html">Indexer</a>
     <a href="benchmarks.nl.html">Benchmarks</a>
     <a href="MANUAL.html">Documentatie</a>
     <a href="https://github.com/nzbfast/nzbfast" title="Broncode-repository">GitHub</a>
@@ -98,7 +100,7 @@
         <li><b>Eén keer schrijven.</b> Gedecodeerde artikelen gaan met pwrite meteen naar hun definitieve bestandsoffsets. Geen tijdelijke bestanden, geen aparte samenvoegpass.</li>
         <li><b>PAR2-verificatie in de stream.</b> Elk blok wordt bij binnenkomst MD5-gehasht vanuit de decodebuffers, dus de verificatie is klaar op het moment dat de download dat is. Dat verslaat de quick-check waar de andere clients genoegen mee nemen, en het kost niets.</li>
         <li><b>Direct uitpakken:</b> store-mode RAR-posts (de meeste scene-releases) worden tijdens de download gemapt en uitgepakt, dus de volumes belanden helemaal niet op schijf. Het schrijfwerk komt uit op content × 1,0 en de benodigde schijfruimte op 1×, waar anderen grofweg 2× willen.</li>
-        <li><b>Geneste archieven, nog steeds one-pass.</b> Archieven in archieven - RAR in RAR, 7z in een RAR, ladders van meerdere niveaus diep - worden on-the-fly ontnest in plaats van weggeschreven en opnieuw geopend. Eén kopie op schijf waar een aanpak van wegschrijven-en-opnieuw-scannen er twee vasthoudt.</li>
+        <li><b>Geneste archieven, en diepte kost bijna niets.</b> Archieven in archieven - RAR in RAR, 7z in een RAR, ladders van vele niveaus - worden ontnest terwijl de bytes binnenkomen, binnen de ronde die we toch al maakten. Daar zit het hele verschil: een client die elke laag wegschrijft, sluit, heropent en opnieuw scant betaalt een volle ronde per niveau, dus elk niveau dieper kost hem nog een rondje over de schijf. De onze liften mee in de eerste ronde, en de payload komt uit een ladder van tien niveaus net zo tevoorschijn als uit één van één. Eén kopie op schijf waar wegschrijven-en-herlezen er twee of drie vasthoudt.</li>
         <li><b>Deobfuscatie.</b> Geobfusceerde posts worden hernoemd op basis van hun PAR2-metadata, ROT13-verhaspelde namen worden gered, en hash-genaamde rommel wordt geclassificeerd en tegengehouden.</li>
       </ul>
       <ul class="plain">
@@ -106,7 +108,7 @@
         <li><b>RAR-recovery-records.</b> Als de PAR2 op is, of nooit is gepost, repareren de in de RARs ingebedde recovery-records beschadigde volumes ter plekke.</li>
         <li><b>Herstel op elke diepte.</b> Een PAR2-set die in een binnenste laag zit ingepakt wordt gevonden en op zijn eigen niveau uitgevoerd, en een par-only post (data verwijderd, alleen een recovery-set met 100% dekking achtergelaten) wordt in zijn geheel herbouwd en daarna uitgepakt.</li>
         <li><b>Fallback voor gecomprimeerd en versleuteld:</b> niet-store-posts worden op schijf gezet en uitgepakt via de native RAR-engine, alles van RAR4 tot het nieuwe RAR7, overlappend met de rest van de wachtrij. Versleutelde sets worden geparkeerd met een duidelijke melding in plaats van stilletjes te mislukken.</li>
-        <li><b>Wachtwoordafhandeling.</b> Wachtwoorden komen uit de *arr-API, de <code>{{pw}}</code>-bestandsnaamconventie of NZB-metadata. Voor al het overige neemt een 🔑-ontgrendeling op het dashboard het over: hij ontgrendelt op de achtergrond en bergt daarna gewoon op. Geketende wachtwoorden lossen zichzelf op: als het uitpakken van de ene laag het wachtwoordbestand van de volgende laag oplevert, wordt dat automatisch gelezen en gebruikt.</li>
+        <li><b>Hij gaat zelf op zoek naar het wachtwoord.</b> De meeste versleutelde posts hebben je niet nodig. Hij probeert de metadata van de NZB en de <code>{{pw}}</code>-naamconventie, de *arr-API, dan elk kort tekstnotitietje dat naast de bestanden is gepost, en als dat niets oplevert de namen van de release en de bestanden zelf. Die zoektocht herhaalt hij op <i>elk</i> niveau: een keten die het wachtwoord van elke laag verstopt in de laag erboven - een ander wachtwoord per niveau - gaat helemaal open zonder dat je iets typt. Wat echt overblijft krijgt de 🔑-ontgrendeling op het dashboard: hij ontgrendelt op de achtergrond en archiveert daarna gewoon.</li>
         <li><b>Vangrails.</b> Herstelde bronvolumes zijn schrijfbeveiligd terwijl het opnieuw uitpakken loopt, de eigen checksum van het voltooide bestand wordt end-to-end geverifieerd (standaard aan), en een exitcode meldt pas "succes" als het eindresultaat echt bruikbaar is.</li>
       </ul>
     </div>
@@ -143,7 +145,7 @@
         <li><b>SABnzbd-compatibele API:</b> het volledige oppervlak dat de *arrs daadwerkelijk gebruiken: addfile/addurl, categorieën, prioriteiten, pauzeren/hervatten per taak, opnieuw proberen, paginering, API-sleutels in twee niveaus. Sonarr en Radarr praten ermee alsof het SABnzbd is.</li>
         <li><b>NZBGet JSON-RPC-facade.</b> nzb360, LunaSea en andere NZBGet-remotes verbinden zonder aanpassing.</li>
         <li><b>Newznab-server.</b> Je lokale index beantwoordt t=search/tvsearch/movie, zodat de *arrs je eigen scans als indexer kunnen behandelen.</li>
-        <li><b>RSS auto-grab:</b> feeds gefilterd met een taal in NZBGet-stijl, live toegevoegd en bewerkt vanuit het dashboard.</li>
+        <li><b>RSS auto-grab:</b> de feed van een indexer is hetzelfde als waar een nieuwslezer zich op abonneert, alleen staat erin wat er net op Usenet is geplaatst. Alles wat aan de filters voldoet, downloadt zichzelf. Feeds gefilterd met een taal in NZBGet-stijl, live toegevoegd en bewerkt vanuit het dashboard.</li>
         <li><b>Watchlist.</b> Noem de series en films die je wilt, ook die nog niet zijn uitgezonden. Elke aflevering wordt bij de eerste verschijning gegrepen en geüpgraded tot je doelkwaliteit is bereikt (bijvoorbeeld 720p → 1080p REMUX), waarbij de vervangen kopie pas wordt verwijderd nadat de upgrade is geverifieerd. Een uitzendkalender laat zien wat eraan komt.</li>
       </ul>
       <ul class="plain">
@@ -161,33 +163,6 @@
 
 <section class="alt">
   <div class="wrap">
-    <h2>Indexer &amp; de posterwall</h2>
-    <p class="lead">Scan de groepen die jou interesseren naar een privé-index en blader het resultaat
-    daarna door als posterwall. Elk stukje metadata wordt door je eigen installatie uit sleutelloze
-    publieke bronnen gehaald. Er is geen API-sleutel om achteraan te moeten.</p>
-    <figure class="shot"><img src="assets/wall-sheet.jpg" alt="Detailblad van de posterwall met rating, cast, synopsis en afleveringschips" loading="lazy"></figure>
-    <div style="height:26px"></div>
-    <div class="grid2">
-      <ul class="plain">
-        <li><b>Continue groepsscanner.</b> Incrementele OVER-scans draaien op jouw schema met ~43k headers/s over uitgewaaierde verbindingen, waarbij gecomprimeerde headers (RFC 8054) worden bedongen waar een server ze aanbiedt. Eerste scans gaan met datum-bisectie, dus <code>--max-age 2y</code> slaat jaren aan headers over in zo'n 20 probes.</li>
-        <li><b>Ingest-filters:</b> filters op soort, jaar, resolutie, taal en grootte houden indexerspam uit je database, en geobfusceerde rommel wordt standaard opgevangen en tegengehouden.</li>
-        <li><b>Scene-naamparser.</b> Hij haalt titel, jaar, aflevering, kwaliteit en bron uit echte releasenamen (dailies met datumcode, multi-afleveringscodes en ROT13-verhaspelde namen incluis) en dedupliceert releases tot één kaart per titel.</li>
-        <li><b>Direct zoeken:</b> zoeken terwijl je typt, met kwaliteitsfilters, een volgknop per rij en overal kwaliteitsbadges.</li>
-        <li><b>Takedown-detectie.</b> Beschikbaarheidssteekproeven op de achtergrond merken het wanneer een groep wordt opgeruimd en geven zijn releases een badge, zodat een post die toch al offline wordt gehaald geen grab verspilt.</li>
-      </ul>
-      <ul class="plain">
-        <li><b>Verrijking zonder sleutels.</b> TVmaze voor tv, iTunes Search voor films, plus publieke ratingdatasets, Wikidata, Wikipedia en AniList vullen posters, ratings en stemaantallen, cast, genres en plots in. OMDb- en TMDB-sleutels werken als je ze hebt, maar niets vereist er een.</li>
-        <li><b>Afleveringsgrids:</b> chips per seizoen met de beste encode van elke aflevering op één klik van downloaden, gemarkeerde seizoenspacks, en een "volg serie" op elke seizoenskop.</li>
-        <li><b>Trending-rijen:</b> stroken "nieuw deze week" en "nu populair", opgebouwd uit postfrequentie.</li>
-        <li><b>Een wall die leert.</b> "Niet geïnteresseerd" verbergt een titel en leert meteen een vaste regel aan; de sortering "Voor jou" rangschikt de posterwall op het smaakprofiel dat je eigen grabs opbouwen. Dat blijft allemaal lokaal.</li>
-        <li><b>Alles te corrigeren.</b> Verkeerde match? Kies uit de kandidaten of typ gewoon de juiste identiteit. Wat je met de hand instelt wordt nooit overschreven. Wijs een poster naar een URL of upload er een. Eén knop verrijkt een enkele titel opnieuw; een andere wist en herbouwt de hele index.</li>
-      </ul>
-    </div>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
     <h2>Voorvertoning &amp; bibliotheek</h2>
     <ul class="plain">
       <li><b>Voorvertoning vóór het klaar is.</b> ▶ Afspelen geeft je systeemspeler een .m3u die de daemon serveert, zodat je kunt bevestigen dat een download is wat je wilde zonder te wachten tot hij compleet is. Spring verder vooruit en de artikelen die je nodig hebt schuiven vooraan in de wachtrij.</li>
@@ -196,15 +171,15 @@
   </div>
 </section>
 
-<section class="alt">
+<section>
   <div class="wrap">
     <h2>Dashboard &amp; instellingen</h2>
-    <div class="strip">
-      <figure><div class="shot"><img src="assets/dash-browse.png" alt="Wachtrij met paneel per bestand en de kaart Index doorzoeken" loading="lazy"></div>
+    <div class="shots">
+      <figure><div class="shot"><img src="assets/dash-queue-drawer.png" alt="Wachtrij met een detailpaneel per download: voortgangsbalken per bestand, verificatieblokken, bijdrage per server" loading="lazy"></div>
         <figcaption>Wachtrijpaneel: balken per bestand, verificatieblokken, bijdrage per server.</figcaption></figure>
       <figure><div class="shot"><img src="assets/settings-top.png" alt="Instellingen: servereditor en live snelheids- en schemabediening" loading="lazy"></div>
         <figcaption>Elke instelling bewerkbaar in de browser. De meeste gelden direct.</figcaption></figure>
-      <figure><div class="shot" style="max-width:320px;margin:0 auto"><img src="assets/mobile-dash.png" alt="Telefoonweergave van het dashboard" loading="lazy"></div>
+      <figure class="phone"><div class="shot"><img src="assets/mobile-dash.png" alt="Telefoonweergave van het dashboard" loading="lazy"></div>
         <figcaption>Degelijke telefoonweergave, dezelfde daemon.</figcaption></figure>
     </div>
     <div style="height:10px"></div>
@@ -226,7 +201,7 @@
   </div>
 </section>
 
-<section>
+<section class="alt">
   <div class="wrap">
     <h2>Deployment</h2>
     <ul class="plain">
@@ -244,7 +219,9 @@
   <div class="cols">
     <div>⚡ <b>nzbfast</b> - de one-pass Usenet-downloader.</div>
     <div>
+      <a href="index.nl.html">Home</a> ·
       <a href="features.nl.html">Functies</a> ·
+      <a href="indexer.nl.html">Indexer</a> ·
       <a href="benchmarks.nl.html">Benchmarks</a> ·
       <a href="download.nl.html">Download</a> ·
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>

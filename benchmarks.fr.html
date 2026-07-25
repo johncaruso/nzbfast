@@ -30,7 +30,9 @@
 <header><div class="wrap">
   <a class="logo" href="index.fr.html"><span class="bolt">⚡</span> nzbfast</a>
   <nav>
+    <a href="index.fr.html" class="home">Accueil</a>
     <a href="features.fr.html">Fonctionnalités</a>
+    <a href="indexer.fr.html">Indexeur</a>
     <a href="benchmarks.fr.html" class="on">Benchmarks</a>
     <a href="MANUAL.html">Docs</a>
     <a href="https://github.com/nzbfast/nzbfast" title="Source repository">GitHub</a>
@@ -49,7 +51,7 @@
 
 <div class="wrap" data-benchtoc style="padding:10px 0 2px">
   <p class="kicker">Sur cette page</p>
-  <nav aria-label="Sur cette page" style="display:flex;flex-wrap:wrap;gap:7px"><a href="#setup" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Le protocole</a><a href="#huge-190" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">190.6 GB → un seul mkv de 167.9 GB (Europe, 10 GbE)</a><a href="#by-job-size" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Temps jusqu’au fichier utilisable, par taille de tâche</a><a href="#hash-named-35" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">4K à noms hachés de 35 GB → mkv utilisable (côte Est)</a><a href="#queue" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Garder la ligne allumée sur toute une file (côte Est, ~43 GB)</a><a href="#legs-we-lose" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Les manches que nous ne gagnons pas</a><a href="#low-memory" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">L’échelle basse mémoire : 190 GB dans ~1.1 GB de RAM</a><a href="#nested" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Dix formes imbriquées : qui finit sans vous</a><a href="#unpack-repair" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Les moteurs d’extraction et de réparation, en course en solo</a><a href="#client-matrix" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Ce que chaque client sait faire</a><a href="#real-lines" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Le moteur sature de vraies lignes</a></nav>
+  <nav aria-label="Sur cette page" style="display:flex;flex-wrap:wrap;gap:7px"><a href="#setup" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Le protocole</a><a href="#huge-190" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">190.6 GB → un seul mkv de 167.9 GB (Europe, 10 GbE)</a><a href="#by-job-size" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Temps jusqu’au fichier utilisable, par taille de tâche</a><a href="#hash-named-35" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">4K à noms hachés de 35 GB → mkv utilisable (côte Est)</a><a href="#queue" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Garder la ligne allumée sur toute une file (côte Est, ~43 GB)</a><a href="#legs-we-lose" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Les manches que nous ne gagnons pas</a><a href="#low-memory" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">L’échelle basse mémoire : 190 GB dans ~1.1 GB de RAM</a><a href="#nested" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Dix formes imbriquées : qui finit sans vous</a><a href="#unpack-repair" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Les moteurs d’extraction et de réparation, en course en solo</a><a href="#client-matrix" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Ce que chaque client sait faire</a><a href="#real-lines" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Le moteur sature de vraies lignes</a></nav>
 </div>
 <section style="padding-top:26px" id="setup">
   <div class="wrap">
@@ -156,13 +158,7 @@
   <div class="wrap">
     <p class="kicker">La colonne honnête</p>
     <h2>Les manches que nous ne gagnons pas</h2>
-    <div class="grid2">
-      <div class="card"><h3>Post en mode store endommagé</h3>
-        <p>20 articles empoisonnés dans un REMUX de 7.4 GB : NZBGet finit utilisable en <b>53 s</b>, nzbfast
-        en <b>58 s</b>. Notre réparation s’achève en 32 s, ré-extrait les 62 volumes, et la sortie est exacte
-        à l’octet, et elle ne récupère que 22 blocs de récupération pour les 20 nécessaires, quasi le minimum
-        théorique, face à la passe PAR2 complète de NZBGet. Mais NZBGet remporte la manche de cinq secondes,
-        alors le voici.</p></div>
+    <div>
       <div class="card"><h3>Reconstruction depuis le seul PAR2</h3>
         <p>Le posteur a supprimé chaque article de données et n’a laissé qu’un jeu PAR2 à 100% de
         redondance. Les quatre clients reconstruisent l’ensemble des volumes à partir de la parité ;
@@ -170,9 +166,7 @@
         SABnzbd 6m 30s). Reconstruire un jeu entier à partir de rien est la seule forme de réparation où
         un moteur au fil du flux n’a aucun avantage.</p></div>
     </div>
-    <div class="callout">Pourquoi montrer ne serait-ce qu’une défaite ? Parce que les victoires ne sont crédibles
-    qu’à côté d’elle. Chaque chiffre de cette page provient des mêmes exécutions entrelacées, et le dépôt en
-    conserve l’intégralité sous forme de véritable cahier de laboratoire, résultats négatifs compris.</div>
+    <div class="callout">Pourquoi montrer ne serait-ce qu’une défaite ? Parce que les victoires ne sont crédibles qu’à côté d’elle. Chaque chiffre de cette page provient des mêmes exécutions entrelacées, et une manche que nous perdons reste publiée jusqu’à ce qu’une nouvelle mesure la remplace.</div>
   </div>
 </section>
 
@@ -308,9 +302,7 @@
       <li><b>Preuve de contre-pression</b> : plafonnez l’étape d’écriture 4× sous le réseau et l’entrée se verrouille sur le plafond à ±1% en 2 s, la RAM <i>baisse</i>, zéro swap. Un disque lent ne peut jamais faire exploser la mémoire.</li>
       <li><b>Marge de calcul</b> : plafonds décodage+vérification mesurés à 86–165 Gbps sur Apple silicon. Le réseau est le goulet d’étranglement par 4–50× sur chaque machine testée.</li>
     </ul>
-    <div class="callout">Règle permanente du dépôt : <b>chaque affirmation de perf cite une commande
-    reproductible et les conditions dans lesquelles elle a tourné.</b> L’ensemble vit dans le dépôt sous
-    forme de cahier de laboratoire daté, résultats négatifs et fausses pistes compris.</div>
+    <div class="callout"><b>Règle permanente : chaque affirmation de performance cite les conditions dans lesquelles elle a tourné</b>, résultats négatifs et fausses pistes compris.</div>
   </div>
 </section>
 
@@ -318,7 +310,9 @@
   <div class="cols">
     <div>⚡ <b>nzbfast</b> - le téléchargeur Usenet en une passe.</div>
     <div>
+      <a href="index.fr.html">Accueil</a> ·
       <a href="features.fr.html">Fonctionnalités</a> ·
+      <a href="indexer.fr.html">Indexeur</a> ·
       <a href="benchmarks.fr.html">Benchmarks</a> ·
       <a href="download.fr.html">Télécharger</a> ·
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>

@@ -30,7 +30,9 @@
 <header><div class="wrap">
   <a class="logo" href="index.de.html"><span class="bolt">⚡</span> nzbfast</a>
   <nav>
+    <a href="index.de.html" class="home">Startseite</a>
     <a href="features.de.html" class="on">Funktionen</a>
+    <a href="indexer.de.html">Indexer</a>
     <a href="benchmarks.de.html">Benchmarks</a>
     <a href="MANUAL.html">Doku</a>
     <a href="https://github.com/nzbfast/nzbfast" title="Source repository">GitHub</a>
@@ -98,7 +100,7 @@
         <li><b>Einmal schreiben.</b> Dekodierte Artikel werden per pwrite direkt an ihre endgültigen Datei-Offsets geschrieben. Keine Temp-Dateien, kein separater Zusammensetz-Durchlauf.</li>
         <li><b>PAR2-Prüfung im Datenstrom.</b> Jeder Block wird beim Eintreffen aus den Decode-Puffern MD5-gehasht, sodass die Verifikation genau dann fertig ist, wenn der Download es ist. Das schlägt den Quick-Check, mit dem sich die anderen Clients begnügen, und kostet nichts.</li>
         <li><b>Direktes Entpacken:</b> RAR-Posts im Store-Modus (die meisten Scene-Releases) werden schon während des Downloads gemappt und entpackt, sodass die Volumes gar nicht erst auf der Festplatte landen. Die Schreiblast beträgt Inhalt × 1,0 und der Plattenbedarf 1×, wo andere rund 2× verlangen.</li>
-        <li><b>Verschachtelte Archive, weiterhin ein Durchlauf.</b> Archive in Archiven - RAR im RAR, 7z im RAR, mehrere Ebenen tiefe Leitern - werden im Flug entschachtelt, statt erst ausgeschrieben und wieder geöffnet zu werden. Eine Kopie auf der Platte, wo ein Ansatz mit Ausschreiben und Neu-Einlesen zwei hält.</li>
+        <li><b>Verschachtelte Archive, und Tiefe kostet fast nichts.</b> Archive in Archiven - RAR im RAR, 7z im RAR, viele Ebenen tiefe Leitern - werden entschachtelt, während die Bytes ankommen, innerhalb des Durchlaufs, den wir ohnehin machen. Genau darin liegt der Unterschied: Ein Client, der jede Ebene herausschreibt, schließt, wieder öffnet und erneut liest, zahlt pro Ebene einen vollen Durchlauf, jede weitere Ebene kostet ihn also noch einen Umweg über die Platte. Unsere fahren im ersten Durchlauf mit, und die Nutzlast kommt aus einer zehnstufigen Leiter genauso heraus wie aus einer einstufigen. Eine Kopie auf der Platte, wo Herausschreiben-und-neu-Lesen zwei oder drei hält.</li>
         <li><b>Deobfuskierung.</b> Verschleierte Posts werden anhand ihrer PAR2-Metadaten umbenannt, ROT13-verwürfelte Namen gerettet und hash-benannter Müll erkannt und aussortiert.</li>
       </ul>
       <ul class="plain">
@@ -106,7 +108,7 @@
         <li><b>RAR-Recovery-Records.</b> Wenn das PAR2 aufgebraucht ist, oder nie gepostet wurde, reparieren die in den RARs eingebetteten Recovery-Records beschädigte Volumes an Ort und Stelle.</li>
         <li><b>Reparatur auf jeder Ebene.</b> Ein PAR2-Set, das in einer inneren Schicht steckt, wird gefunden und auf seiner eigenen Ebene ausgeführt, und ein Nur-PAR-Post (Daten gelöscht, nur ein Recovery-Set mit 100 % Deckung zurückgelassen) wird erst komplett rekonstruiert und dann entpackt.</li>
         <li><b>Fallback für Komprimiertes und Verschlüsseltes:</b> Nicht-Store-Posts landen auf der Platte und werden über die native RAR-Engine entpackt, alles von RAR4 bis zum neuen RAR7, überlappt mit dem Rest der Warteschlange. Verschlüsselte Sets parken mit einer klaren Meldung, statt still zu scheitern.</li>
-        <li><b>Passwort-Handling.</b> Passwörter stammen aus der *arr-API, der <code>{{pw}}</code>-Namenskonvention oder den NZB-Metadaten. Für alles Übrige übernimmt ein 🔑-Entsperren im Dashboard: Es entsperrt im Hintergrund und sortiert dann ganz normal ein. Verkettete Passwörter lösen sich von selbst: Wenn das Entpacken einer Schicht die Passwortdatei der nächsten Schicht hervorbringt, wird sie automatisch gelesen und verwendet.</li>
+        <li><b>Es sucht das Passwort selbst.</b> Die meisten verschlüsselten Posts brauchen dich gar nicht. Es probiert die NZB-Metadaten und die <code>{{pw}}</code>-Namenskonvention, die *arr-API, dann jede kurze Textnotiz, die neben den Dateien liegt, und zuletzt die Namen der Release und der Dateien selbst. Diese Suche wiederholt es auf <i>jeder</i> Ebene: Eine Kette, die das Passwort jeder Schicht in der Schicht darüber versteckt - ein anderes Passwort pro Ebene - schließt sich bis ganz nach unten auf, ohne dass du etwas tippst. Was wirklich übrig bleibt, bekommt das 🔑-Entsperren im Dashboard: Es entsperrt im Hintergrund und legt dann normal ab.</li>
         <li><b>Sicherheitsgurte.</b> Reparierte Quell-Volumes sind schreibgeschützt, solange das erneute Entpacken läuft, die eigene Prüfsumme der fertigen Datei wird Ende-zu-Ende verifiziert (standardmäßig aktiv), und ein Exit-Code meldet nur dann „Erfolg“, wenn das Endergebnis wirklich benutzbar ist.</li>
       </ul>
     </div>
@@ -143,7 +145,7 @@
         <li><b>SABnzbd-kompatible API:</b> die ganze Oberfläche, die die *arrs tatsächlich nutzen: addfile/addurl, Kategorien, Prioritäten, Pause/Fortsetzen pro Job, erneut versuchen, Paginierung, zweistufige API-Keys. Sonarr und Radarr sprechen mit ihr, als wäre sie SABnzbd.</li>
         <li><b>NZBGet-JSON-RPC-Fassade.</b> nzb360, LunaSea und andere NZBGet-Fernsteuerungen verbinden sich unverändert.</li>
         <li><b>Newznab-Server.</b> Dein lokaler Index beantwortet t=search/tvsearch/movie, sodass die *arrs deine eigenen Scans wie einen Indexer behandeln können.</li>
-        <li><b>RSS-Auto-Grab:</b> Feeds, gefiltert mit einer Sprache im NZBGet-Stil, live im Dashboard hinzugefügt und bearbeitet.</li>
+        <li><b>RSS-Auto-Grab:</b> Der Feed eines Indexers ist dasselbe, was ein News-Reader abonniert, nur listet er auf, was gerade im Usenet gepostet wurde. Alles, was auf die Filter passt, lädt sich von selbst herunter. Feeds, gefiltert mit einer Sprache im NZBGet-Stil, live im Dashboard hinzugefügt und bearbeitet.</li>
         <li><b>Watchlist.</b> Nenn die Serien und Filme, die du willst, auch solche, die noch nicht ausgestrahlt sind. Jede Episode wird bei ihrem ersten Auftauchen geholt und aufgerüstet, bis sie deine Zielqualität erreicht (etwa 720p → 1080p REMUX), wobei die überholte Kopie erst gelöscht wird, nachdem das Upgrade verifiziert wurde. Ein Ausstrahlungskalender zeigt, was kommt.</li>
       </ul>
       <ul class="plain">
@@ -161,33 +163,6 @@
 
 <section class="alt">
   <div class="wrap">
-    <h2>Indexer &amp; die Posterwand</h2>
-    <p class="lead">Scanne die Gruppen, die dich interessieren, in einen privaten Index und stöbere dann
-    im Ergebnis als Posterwand. Jedes bisschen der Metadaten holt deine eigene Installation aus
-    schlüssellosen öffentlichen Quellen. Es gibt keinen API-Key, um den du betteln müsstest.</p>
-    <figure class="shot"><img src="assets/wall-sheet.jpg" alt="Poster wall detail sheet with rating, cast, synopsis and episode chips" loading="lazy"></figure>
-    <div style="height:26px"></div>
-    <div class="grid2">
-      <ul class="plain">
-        <li><b>Kontinuierlicher Gruppen-Scanner.</b> Inkrementelle OVER-Scans laufen nach deinem Zeitplan mit ~43k Headern/s über aufgefächerte Verbindungen und handeln dabei komprimierte Header (RFC 8054) aus, wo ein Server sie anbietet. Erstscans werden datumshalbiert, sodass <code>--max-age 2y</code> Jahre an Headern in etwa 20 Sondierungen überspringt.</li>
-        <li><b>Ingest-Filter:</b> Filter nach Art, Jahr, Auflösung, Sprache und Größe halten Indexer-Spam aus deiner Datenbank, und verschleierter Müll wird standardmäßig erkannt und ausgefiltert.</li>
-        <li><b>Scene-Namen-Parser.</b> Er zieht Titel, Jahr, Episode, Qualität und Quelle aus echten Release-Namen (datumscodierte Dailies, Multi-Episoden-Codes und ROT13-verschleierte Namen inbegriffen) und dedupliziert Releases auf eine Karte pro Titel.</li>
-        <li><b>Sofortsuche:</b> Suche beim Tippen mit Qualitätsfiltern, Beobachten-Knöpfen pro Zeile und Qualitäts-Badges überall.</li>
-        <li><b>Takedown-Erkennung.</b> Verfügbarkeits-Stichproben im Hintergrund bemerken, wenn eine Gruppe abgeräumt wird, und versehen ihre Releases mit einem Badge, sodass ein Post, der ohnehin schon entfernt wird, keinen Grab verschwendet.</li>
-      </ul>
-      <ul class="plain">
-        <li><b>Anreicherung ohne Keys.</b> TVmaze für Serien, iTunes Search für Filme, dazu öffentliche Bewertungs-Datensätze, Wikidata, Wikipedia und AniList füllen Poster, Bewertungen und Stimmenzahlen, Besetzung, Genres und Handlung. OMDb- und TMDB-Keys funktionieren, wenn du sie hast, nötig ist aber keiner.</li>
-        <li><b>Episodenraster:</b> Chips pro Staffel, bei denen der beste Encode jeder Episode nur einen Klick vom Download entfernt ist, markierte Staffel-Packs und ein „Serie beobachten“ in jedem Staffel-Kopf.</li>
-        <li><b>Trend-Leisten:</b> Leisten für „Neu diese Woche“ und „Gerade heiß“, gebildet aus der Post-Frequenz.</li>
-        <li><b>Eine Wand, die dazulernt.</b> „Kein Interesse“ blendet einen Titel aus und bringt zugleich eine dauerhafte Regel bei; die Sortierung „Für dich“ ordnet die Posterwand nach dem Geschmacksprofil, das deine eigenen Grabs aufbauen. All das bleibt lokal.</li>
-        <li><b>Alles korrigierbar.</b> Falsche Zuordnung? Wähl aus den Kandidaten oder tipp einfach die richtige Identität ein. Was du von Hand setzt, wird nie überschrieben. Verweise ein Poster auf eine URL oder lade eins hoch. Ein Knopf reichert einen einzelnen Titel neu an, ein anderer löscht den ganzen Index und baut ihn neu auf.</li>
-      </ul>
-    </div>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
     <h2>Vorschau &amp; Bibliothek</h2>
     <ul class="plain">
       <li><b>Vorschau, bevor es fertig ist.</b> ▶ Abspielen reicht deinem System-Player eine .m3u, die der Daemon ausliefert, sodass du bestätigen kannst, dass ein Download das Richtige ist, ohne auf seinen Abschluss zu warten. Spulst du weiter vor, springen die benötigten Artikel an den Anfang der Warteschlange.</li>
@@ -196,15 +171,15 @@
   </div>
 </section>
 
-<section class="alt">
+<section>
   <div class="wrap">
     <h2>Dashboard &amp; Einstellungen</h2>
-    <div class="strip">
-      <figure><div class="shot"><img src="assets/dash-browse.png" alt="Queue with per-file drawer and index browse card" loading="lazy"></div>
+    <div class="shots">
+      <figure><div class="shot"><img src="assets/dash-queue-drawer.png" alt="Queue with a per-download detail drawer: per-file progress bars, verify blocks, per-server contribution" loading="lazy"></div>
         <figcaption>Warteschlangen-Drawer: Balken pro Datei, Prüf-Blöcke, Beitrag pro Server.</figcaption></figure>
       <figure><div class="shot"><img src="assets/settings-top.png" alt="Settings: server editor and live speed/scheduling controls" loading="lazy"></div>
         <figcaption>Jede Einstellung im Browser editierbar. Die meisten gelten sofort.</figcaption></figure>
-      <figure><div class="shot" style="max-width:320px;margin:0 auto"><img src="assets/mobile-dash.png" alt="Phone layout of the dashboard" loading="lazy"></div>
+      <figure class="phone"><div class="shot"><img src="assets/mobile-dash.png" alt="Phone layout of the dashboard" loading="lazy"></div>
         <figcaption>Richtiges Handy-Layout, derselbe Daemon.</figcaption></figure>
     </div>
     <div style="height:10px"></div>
@@ -226,7 +201,7 @@
   </div>
 </section>
 
-<section>
+<section class="alt">
   <div class="wrap">
     <h2>Deployment</h2>
     <ul class="plain">
@@ -244,7 +219,9 @@
   <div class="cols">
     <div>⚡ <b>nzbfast</b> - der Ein-Pass-Usenet-Downloader.</div>
     <div>
+      <a href="index.de.html">Startseite</a> ·
       <a href="features.de.html">Funktionen</a> ·
+      <a href="indexer.de.html">Indexer</a> ·
       <a href="benchmarks.de.html">Benchmarks</a> ·
       <a href="download.de.html">Download</a> ·
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>

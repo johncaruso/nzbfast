@@ -30,7 +30,9 @@
 <header><div class="wrap">
   <a class="logo" href="index.html"><span class="bolt">⚡</span> nzbfast</a>
   <nav>
+    <a href="index.html" class="home">Home</a>
     <a href="features.html" class="on">Features</a>
+    <a href="indexer.html">Indexer</a>
     <a href="benchmarks.html">Benchmarks</a>
     <a href="MANUAL.html">Docs</a>
     <a href="https://github.com/nzbfast/nzbfast" title="Source repository">GitHub</a>
@@ -98,7 +100,7 @@
         <li><b>Write once.</b> Decoded articles are pwritten straight to their final file offsets. No temp files, no separate assembly pass.</li>
         <li><b>In-stream PAR2 verification.</b> Every block is MD5-hashed from the decode buffers as it arrives, so verification finishes the moment the download does. That beats the quick-check the other clients settle for, and it costs nothing.</li>
         <li><b>Direct extraction:</b> store-mode RAR posts (most scene releases) are mapped and extracted while they download, so the volumes never land on disk at all. Disk written comes to content × 1.0 and disk needed to 1×, where others want roughly 2×.</li>
-        <li><b>Nested archives, still one pass.</b> Archives inside archives - RAR in RAR, 7z inside RAR, ladders several levels deep - are denested on the fly instead of being written out and opened again. One copy on disk where a write-out-and-rescan approach holds two.</li>
+        <li><b>Nested archives, and depth barely costs anything.</b> Archives inside archives - RAR in RAR, 7z inside RAR, ladders many levels deep - are denested as the bytes arrive, inside the pass we were already making. That is the whole difference: a client that writes each layer out, closes it, reopens it and scans it again pays a fresh pass for every level, so each layer it goes down costs it another round trip through the disk. Ours ride along in the first pass, and the payload comes out of a ten-level ladder the same way it comes out of a one-level one. One copy on disk where write-out-and-rescan holds two or three.</li>
         <li><b>Deobfuscation.</b> Obfuscated posts are renamed from their PAR2 metadata, ROT13-scrambled names get rescued, and hash-named junk is classified and gated out.</li>
       </ul>
       <ul class="plain">
@@ -106,7 +108,7 @@
         <li><b>RAR recovery records.</b> When PAR2 is exhausted, or was never posted, embedded RAR recovery records repair damaged volumes in place.</li>
         <li><b>Repair at every depth.</b> A PAR2 set packed inside an inner layer is found and run at its own level, and a par-only post (data deleted, a 100%-recovery set left behind) is rebuilt whole and then unpacked.</li>
         <li><b>Compressed and encrypted fallback:</b> non-store posts materialise and unpack through the native RAR engine, everything from RAR4 to the new RAR7, overlapped with the rest of the queue. Encrypted sets park with a clear message instead of failing quietly.</li>
-        <li><b>Password handling.</b> Passwords come from the *arr API, the <code>{{pw}}</code> filename convention, or NZB metadata. For anything left over, a 🔑 unlock on the dashboard takes it from there: it unlocks in the background, then files as normal. Chained passwords resolve themselves: when one layer's extraction produces the next layer's password file, it's read and used automatically.</li>
+        <li><b>It goes looking for the password itself.</b> Most encrypted posts never need you. It tries the NZB's own metadata and the <code>{{pw}}</code> filename convention, the *arr API, then any short text note posted alongside the files, and failing all that the release and file names themselves. It repeats that hunt at <i>every</i> level, so a chain that hides each layer's password inside the layer above it - a different password at every level - unlocks all the way down with nothing typed. Anything genuinely left over gets a 🔑 unlock on the dashboard: it unlocks in the background, then files as normal.</li>
         <li><b>Safety rails.</b> Repaired source volumes are write-protected while re-extraction runs, the finished file's own checksum is verified end to end (on by default), and an exit code reports "success" only when the end state is genuinely usable.</li>
       </ul>
     </div>
@@ -143,7 +145,7 @@
         <li><b>SABnzbd-compatible API:</b> the whole surface the *arrs actually use: addfile/addurl, categories, priorities, per-job pause/resume, retry, pagination, two-tier API keys. Sonarr and Radarr talk to it as if it were SABnzbd.</li>
         <li><b>NZBGet JSON-RPC facade.</b> nzb360, LunaSea and other NZBGet remotes connect unmodified.</li>
         <li><b>Newznab server.</b> Your local index answers t=search/tvsearch/movie, so the *arrs can treat your own scans as an indexer.</li>
-        <li><b>RSS auto-grab:</b> feeds filtered with an NZBGet-style language, added and edited live from the dashboard.</li>
+        <li><b>RSS auto-grab:</b> an indexer's feed is the same thing a news reader subscribes to, except it lists what has just been posted to Usenet. Anything matching the filters downloads itself. Feeds are filtered with an NZBGet-style language, added and edited live from the dashboard.</li>
         <li><b>Watchlist.</b> Name the shows and films you want, even ones that haven't aired yet. Each episode is grabbed on its first appearance and upgraded until it reaches your target quality (say, 720p → 1080p REMUX), with the superseded copy deleted only after the upgrade has verified. An airdate calendar shows what's coming.</li>
       </ul>
       <ul class="plain">
@@ -161,33 +163,6 @@
 
 <section class="alt">
   <div class="wrap">
-    <h2>Indexer &amp; the poster wall</h2>
-    <p class="lead">Scan the groups you care about into a private index, then browse the result as a
-    poster wall. Every bit of the metadata is pulled from keyless public sources by your own
-    install. There's no API key to go begging for.</p>
-    <figure class="shot"><img src="assets/wall-sheet.jpg" alt="Poster wall detail sheet with rating, cast, synopsis and release list" loading="lazy"></figure>
-    <div style="height:26px"></div>
-    <div class="grid2">
-      <ul class="plain">
-        <li><b>Continuous group scanner.</b> Incremental OVER scans run on your schedule at ~43k headers/s across fanned-out connections, negotiating compressed headers (RFC 8054) where a server offers them. First scans are date-bisected, so <code>--max-age 2y</code> skips years of headers in about 20 probes.</li>
-        <li><b>Ingest gates:</b> filters on kind, year, resolution, language and size keep indexer spam out of your database, and obfuscated junk is caught and gated by default.</li>
-        <li><b>Scene-name parser.</b> It pulls title, year, episode, quality and source out of real-world stems (date-coded dailies, multi-episode codes and ROT13-obfuscated names included) and dedupes releases down to one card per title.</li>
-        <li><b>Instant search:</b> search-as-you-type with quality filters, per-row watch buttons, and quality badges throughout.</li>
-        <li><b>Takedown detection.</b> Background availability sampling notices a group being reaped and badges its releases, so a post that's already being taken down doesn't waste a grab.</li>
-      </ul>
-      <ul class="plain">
-        <li><b>Keyless enrichment.</b> TVmaze for TV, iTunes Search for film, plus public ratings datasets, Wikidata, Wikipedia and AniList fill in posters, ratings and vote counts, cast, genres and plots. OMDb and TMDB keys work if you have them, but nothing needs one.</li>
-        <li><b>Episode grids:</b> per-season chips with the best encode of each episode a click from downloading, season packs flagged, and a "watch series" on every season header.</li>
-        <li><b>Trending rows:</b> new-this-week and hot-right-now strips built from post frequency.</li>
-        <li><b>A wall that learns.</b> "Not interested" hides a title and teaches a standing rule; the "For you" sort ranks the wall by the taste profile your own grabs build. All of it stays local.</li>
-        <li><b>Fix anything.</b> Wrong match? Pick from the candidates or just type the right identity. Anything you set by hand is never overwritten. Point a poster at a URL or upload one. One button re-enriches a single title; another wipes and rebuilds the whole index.</li>
-      </ul>
-    </div>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
     <h2>Preview &amp; library</h2>
     <ul class="plain">
       <li><b>Preview before it finishes.</b> ▶ Play hands your OS player an .m3u served by the daemon, so you can confirm a download is the thing you wanted without waiting for it to complete. Skip further in and the articles you need jump to the front of the queue.</li>
@@ -196,15 +171,15 @@
   </div>
 </section>
 
-<section class="alt">
+<section>
   <div class="wrap">
     <h2>Dashboard &amp; settings</h2>
-    <div class="strip">
-      <figure><div class="shot"><img src="assets/dash-browse.png" alt="Queue with per-file drawer and index browse card" loading="lazy"></div>
+    <div class="shots">
+      <figure><div class="shot"><img src="assets/dash-queue-drawer.png" alt="Queue with a per-download detail drawer: per-file progress bars, verify blocks, per-server contribution" loading="lazy"></div>
         <figcaption>Queue drawer: per-file bars, verify blocks, per-server contribution.</figcaption></figure>
       <figure><div class="shot"><img src="assets/settings-top.png" alt="Settings: server editor and live speed/scheduling controls" loading="lazy"></div>
         <figcaption>Every setting editable in the browser. Most apply live.</figcaption></figure>
-      <figure><div class="shot" style="max-width:320px;margin:0 auto"><img src="assets/mobile-dash.png" alt="Phone layout of the dashboard" loading="lazy"></div>
+      <figure class="phone"><div class="shot"><img src="assets/mobile-dash.png" alt="Phone layout of the dashboard" loading="lazy"></div>
         <figcaption>Proper phone layout, same daemon.</figcaption></figure>
     </div>
     <div style="height:10px"></div>
@@ -226,7 +201,7 @@
   </div>
 </section>
 
-<section>
+<section class="alt">
   <div class="wrap">
     <h2>Deployment</h2>
     <ul class="plain">
@@ -244,7 +219,9 @@
   <div class="cols">
     <div>⚡ <b>nzbfast</b> - the one-pass Usenet downloader.</div>
     <div>
+      <a href="index.html">Home</a> ·
       <a href="features.html">Features</a> ·
+      <a href="indexer.html">Indexer</a> ·
       <a href="benchmarks.html">Benchmarks</a> ·
       <a href="download.html">Download</a> ·
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>

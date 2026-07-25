@@ -30,7 +30,9 @@
 <header><div class="wrap">
   <a class="logo" href="index.he.html"><span class="bolt">⚡</span> nzbfast</a>
   <nav>
+    <a href="index.he.html" class="home">בית</a>
     <a href="features.he.html">תכונות</a>
+    <a href="indexer.he.html">האינדקסר</a>
     <a href="benchmarks.he.html" class="on">בדיקות ביצועים</a>
     <a href="MANUAL.html">מסמכים</a>
     <a href="https://github.com/nzbfast/nzbfast" title="Source repository">GitHub</a>
@@ -49,7 +51,7 @@
 
 <div class="wrap" data-benchtoc style="padding:10px 0 2px">
   <p class="kicker">בדף הזה</p>
-  <nav aria-label="בדף הזה" style="display:flex;flex-wrap:wrap;gap:7px"><a href="#setup" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">המערך</a><a href="#huge-190" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">190.6 GB → mkv יחיד של 167.9 GB (אירופה, 10 GbE)</a><a href="#by-job-size" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">זמן לקובץ שמיש, לפי גודל משימה</a><a href="#hash-named-35" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">35 GB 4K בעל שם-גיבוב → mkv שמיש (החוף המזרחי)</a><a href="#queue" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">לשמור על הקו דולק לאורך תור (החוף המזרחי, ~43 GB)</a><a href="#legs-we-lose" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">המקטעים שבהם איננו מנצחים</a><a href="#low-memory" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">סולם הזיכרון-הנמוך: 190 GB ב-~1.1 GB של RAM</a><a href="#nested" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">עשר צורות מקוננות: מי מסיים בלעדיך</a><a href="#unpack-repair" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">מנועי הפריקה והתיקון, בתחרות סולו</a><a href="#client-matrix" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">מה כל קליינט יכול לעשות</a><a href="#real-lines" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">המנוע מרווה קווים אמיתיים</a></nav>
+  <nav aria-label="בדף הזה" style="display:flex;flex-wrap:wrap;gap:7px"><a href="#setup" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">המערך</a><a href="#huge-190" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">190.6 GB → mkv יחיד של 167.9 GB (אירופה, 10 GbE)</a><a href="#by-job-size" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">זמן לקובץ שמיש, לפי גודל משימה</a><a href="#hash-named-35" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">35 GB 4K בעל שם-גיבוב → mkv שמיש (החוף המזרחי)</a><a href="#queue" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">לשמור על הקו דולק לאורך תור (החוף המזרחי, ~43 GB)</a><a href="#legs-we-lose" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">המקטעים שבהם איננו מנצחים</a><a href="#low-memory" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">סולם הזיכרון-הנמוך: 190 GB ב-~1.1 GB של RAM</a><a href="#nested" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">עשר צורות מקוננות: מי מסיים בלעדיך</a><a href="#unpack-repair" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">מנועי הפריקה והתיקון, בתחרות סולו</a><a href="#client-matrix" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">מה כל קליינט יכול לעשות</a><a href="#real-lines" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">המנוע מרווה קווים אמיתיים</a></nav>
 </div>
 <section style="padding-top:26px" id="setup">
   <div class="wrap">
@@ -156,21 +158,14 @@
   <div class="wrap">
     <p class="kicker">הטור הכן</p>
     <h2>המקטעים שבהם איננו מנצחים</h2>
-    <div class="grid2">
-      <div class="card"><h3>פוסט פגום במצב אחסון</h3>
-        <p>20 מאמרים מורעלים ב-REMUX של 7.4 GB: NZBGet מסיים שמיש ב-<b>53 s</b>, nzbfast
-        ב-<b>58 s</b>. התיקון שלנו מסתיים ב-32 s, מחלץ מחדש את כל 62 הכרכים, והפלט
-        מדויק-בייט, והוא מושך מינימום כמעט-תיאורטי של 22 בלוקי שחזור עבור 20 הנדרשים,
-        מול מעבר ה-PAR2 המלא של NZBGet. אבל NZBGet לוקח את המקטע בחמש שניות, אז הנה הוא.</p></div>
+    <div>
       <div class="card"><h3>שחזור מ-par בלבד</h3>
         <p>המפרסם מחק כל מאמר נתונים והשאיר רק סט PAR2 עם יתירות של 100%. כל ארבעת
         הקליינטים בונים מחדש את כל סט הכרכים מהזוגיות; NZBGet עושה זאת הכי מהר, <b>8 s</b>
         מול <b>19 s</b> שלנו על פוסט של 1.5 GB (‏rustnzb ‏49 s, ‏SABnzbd ‏6m 30s). בנייה
         מחדש של סט שלם מכלום היא צורת התיקון היחידה שבה למנוע בתוך-הזרם אין שום יתרון.</p></div>
     </div>
-    <div class="callout">למה בכלל להראות הפסד? כי הניצחונות אמינים רק לצדו.
-    כל מספר בעמוד הזה מגיע מאותן הרצות משולבות, והמאגר שומר את כל התמונה
-    כמחברת מעבדה מלאה, כולל תוצאות שליליות.</div>
+    <div class="callout">למה בכלל להראות הפסד? כי הניצחונות אמינים רק לצדו. כל מספר בעמוד הזה מגיע מאותן הרצות משולבות, וסבב שאנחנו מפסידים נשאר מפורסם עד שהרצה חדשה מחליפה אותו.</div>
   </div>
 </section>
 
@@ -301,9 +296,7 @@
       <li><b>הוכחת לחץ נגדי</b>: הגבל את שלב הכתיבה פי 4 מתחת לרשת והקלט ננעל לתקרה ±1% תוך 2 שנ', ה-RAM <i>יורד</i>, אפס החלפות. דיסק איטי לעולם לא יכול לנפח את הזיכרון.</li>
       <li><b>מרווח מעבד</b>: תקרות פענוח+אימות שנמדדו של 86–165 Gbps על מעבדי Apple. הרשת היא צוואר הבקבוק פי 4–50 בכל מכונה שנבדקה.</li>
     </ul>
-    <div class="callout">כלל קבוע מהמאגר: <b>כל טענת ביצועים מצטטת פקודה הניתנת
-    לשחזור ואת התנאים שבהם רצה.</b> כל התמונה חיה במאגר כמחברת מעבדה
-    מתוארכת, כולל תוצאות שליליות ופניות שגויות.</div>
+    <div class="callout"><b>כלל קבוע: כל טענת ביצועים מציינת את התנאים שבהם רצה</b>, כולל תוצאות שליליות ופניות שגויות.</div>
   </div>
 </section>
 
@@ -311,7 +304,9 @@
   <div class="cols">
     <div>⚡ <b>nzbfast</b> - מוריד ה-Usenet במעבר יחיד.</div>
     <div>
+      <a href="index.he.html">בית</a> ·
       <a href="features.he.html">תכונות</a> ·
+      <a href="indexer.he.html">האינדקסר</a> ·
       <a href="benchmarks.he.html">בדיקות ביצועים</a> ·
       <a href="download.he.html">הורדה</a> ·
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>

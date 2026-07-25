@@ -30,7 +30,9 @@
 <header><div class="wrap">
   <a class="logo" href="index.fi.html"><span class="bolt">⚡</span> nzbfast</a>
   <nav>
+    <a href="index.fi.html" class="home">Etusivu</a>
     <a href="features.fi.html">Ominaisuudet</a>
+    <a href="indexer.fi.html">Indeksoija</a>
     <a href="benchmarks.fi.html" class="on">Vertailut</a>
     <a href="MANUAL.html">Ohjeet</a>
     <a href="https://github.com/nzbfast/nzbfast" title="Lähdekoodivarasto">GitHub</a>
@@ -49,7 +51,7 @@
 
 <div class="wrap" data-benchtoc style="padding:10px 0 2px">
   <p class="kicker">Tällä sivulla</p>
-  <nav aria-label="Tällä sivulla" style="display:flex;flex-wrap:wrap;gap:7px"><a href="#setup" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Koeasetelma</a><a href="#huge-190" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">190.6 GB → yksi 167.9 GB mkv (Eurooppa, 10 GbE)</a><a href="#by-job-size" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Aika käyttökelpoiseen tiedostoon, työn koon mukaan</a><a href="#hash-named-35" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">35 GB tiivistenimetty 4K → käyttökelpoinen mkv (itärannikko)</a><a href="#queue" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Linjan pitäminen sytytettynä läpi jonon (itärannikko, ~43 GB)</a><a href="#legs-we-lose" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Ne osuudet, joissa emme voita</a><a href="#low-memory" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Vähämuistiporras: 190 GB ~1.1 GB:ssä RAM:ia</a><a href="#nested" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Kymmenen sisäkkäistä muotoa: kuka valmistuu ilman sinua</a><a href="#unpack-repair" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Purku- ja korjausmoottorit, soolokisassa</a><a href="#client-matrix" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Mitä kukin asiakas osaa</a><a href="#real-lines" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Moottori kyllästää oikeat linjat</a></nav>
+  <nav aria-label="Tällä sivulla" style="display:flex;flex-wrap:wrap;gap:7px"><a href="#setup" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Koeasetelma</a><a href="#huge-190" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">190.6 GB → yksi 167.9 GB mkv (Eurooppa, 10 GbE)</a><a href="#by-job-size" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Aika käyttökelpoiseen tiedostoon, työn koon mukaan</a><a href="#hash-named-35" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">35 GB tiivistenimetty 4K → käyttökelpoinen mkv (itärannikko)</a><a href="#queue" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Linjan pitäminen sytytettynä läpi jonon (itärannikko, ~43 GB)</a><a href="#legs-we-lose" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Ne osuudet, joissa emme voita</a><a href="#low-memory" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Vähämuistiporras: 190 GB ~1.1 GB:ssä RAM:ia</a><a href="#nested" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Kymmenen sisäkkäistä muotoa: kuka valmistuu ilman sinua</a><a href="#unpack-repair" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Purku- ja korjausmoottorit, soolokisassa</a><a href="#client-matrix" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Mitä kukin asiakas osaa</a><a href="#real-lines" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Moottori kyllästää oikeat linjat</a></nav>
 </div>
 <section style="padding-top:26px" id="setup">
   <div class="wrap">
@@ -156,13 +158,7 @@
   <div class="wrap">
     <p class="kicker">Rehellinen sarake</p>
     <h2>Ne osuudet, joissa emme voita</h2>
-    <div class="grid2">
-      <div class="card"><h3>Vioittunut store-tilan julkaisu</h3>
-        <p>20 myrkytettyä artikkelia 7.4 GB:n REMUXissa: NZBGet valmistuu käyttökelpoiseksi ajassa <b>53 s</b>,
-        nzbfast ajassa <b>58 s</b>. Korjauksemme valmistuu 32 s:ssa, purkaa kaikki 62 osaa uudelleen ja
-        tuloste on tavutarkka, ja se hakee lähes teoreettisen minimin verran, 22 palautuslohkoa
-        tarvituille 20:lle, NZBGetin täyden PAR2-läpimenon sijaan. Mutta NZBGet vie osuuden viidellä
-        sekunnilla, joten tässä se on.</p></div>
+    <div>
       <div class="card"><h3>Jälleenrakennus pelkistä pareista</h3>
         <p>Julkaisija poisti jokaisen data-artikkelin ja jätti jäljelle vain 100% redundanssin PAR2-sarjan.
         Kaikki neljä asiakasta rakentavat koko osasarjan uudelleen pariteetista; NZBGet tekee sen nopeimmin,
@@ -170,9 +166,7 @@
         Kokonaisen sarjan rakentaminen tyhjästä on se ainoa korjauksen muoto, jossa virransisäisellä
         moottorilla ei ole etua.</p></div>
     </div>
-    <div class="callout">Miksi näyttää häviötä lainkaan? Koska voitot ovat uskottavia vain sen rinnalla.
-    Jokainen luku tällä sivulla tulee samoista lomitetuista ajoista, ja varasto pitää koko aineiston
-    täytenä laboratoriomuistikirjana, negatiiviset tulokset mukaan lukien.</div>
+    <div class="callout">Miksi näyttää häviötä lainkaan? Koska voitot ovat uskottavia vain sen rinnalla. Jokainen luku tällä sivulla tulee samoista lomitetuista ajoista, ja häviämämme osuus pysyy julkaistuna, kunnes uusi ajo korvaa sen.</div>
   </div>
 </section>
 
@@ -307,9 +301,7 @@
       <li><b>Vastapainetodistus</b>: rajaa kirjoitusvaihe 4× verkon alle ja syöttö lukittuu kattoon ±1% 2 s:ssa, RAM <i>laskee</i>, nolla sivutusta. Hidas levy ei voi koskaan paisuttaa muistia.</li>
       <li><b>Laskennan pelivara</b>: mitatut dekoodaus+varmistus-katot 86–165 Gbps Apple-piillä. Verkko on pullonkaula 4–50-kertaisesti jokaisella testatulla koneella.</li>
     </ul>
-    <div class="callout">Pysyvä sääntö varastosta: <b>jokainen suorituskykyväite viittaa toistettavaan
-    komentoon ja olosuhteisiin, joissa se ajettiin.</b> Koko aineisto elää varastossa päivättynä
-    laboratoriomuistikirjana, negatiiviset tulokset ja väärät käänteet mukaan lukien.</div>
+    <div class="callout"><b>Pysyvä sääntö: jokainen suorituskykyväite kertoo olosuhteet, joissa se ajettiin</b>, negatiiviset tulokset ja väärät käänteet mukaan lukien.</div>
   </div>
 </section>
 
@@ -317,7 +309,9 @@
   <div class="cols">
     <div>⚡ <b>nzbfast</b> - yhden läpimenon Usenet-lataaja.</div>
     <div>
+      <a href="index.fi.html">Etusivu</a> ·
       <a href="features.fi.html">Ominaisuudet</a> ·
+      <a href="indexer.fi.html">Indeksoija</a> ·
       <a href="benchmarks.fi.html">Vertailut</a> ·
       <a href="download.fi.html">Lataa</a> ·
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>

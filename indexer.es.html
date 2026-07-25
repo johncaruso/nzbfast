@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Indexador y muro de pósteres - nzbfast</title>
+<meta name="description" content="Escanea los grupos que te interesan hacia un índice privado y explóralo como un muro de pósteres. Todos los metadatos vienen de fuentes públicas sin clave, obtenidos por tu propia ">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<link rel="stylesheet" href="assets/site.css">
+<link rel="alternate" hreflang="en" href="indexer.html">
+<link rel="alternate" hreflang="fr" href="indexer.fr.html">
+<link rel="alternate" hreflang="de" href="indexer.de.html">
+<link rel="alternate" hreflang="it" href="indexer.it.html">
+<link rel="alternate" hreflang="es" href="indexer.es.html">
+<link rel="alternate" hreflang="nl" href="indexer.nl.html">
+<link rel="alternate" hreflang="pt" href="indexer.pt.html">
+<link rel="alternate" hreflang="sv" href="indexer.sv.html">
+<link rel="alternate" hreflang="da" href="indexer.da.html">
+<link rel="alternate" hreflang="nb" href="indexer.nb.html">
+<link rel="alternate" hreflang="fi" href="indexer.fi.html">
+<link rel="alternate" hreflang="tr" href="indexer.tr.html">
+<link rel="alternate" hreflang="ro" href="indexer.ro.html">
+<link rel="alternate" hreflang="he" href="indexer.he.html">
+<link rel="alternate" hreflang="ar" href="indexer.ar.html">
+<link rel="alternate" hreflang="fa" href="indexer.fa.html">
+<link rel="alternate" hreflang="x-default" href="indexer.html">
+</head>
+<body>
+
+<header><div class="wrap">
+  <a class="logo" href="index.es.html"><span class="bolt">⚡</span> nzbfast</a>
+  <nav>
+    <a href="index.es.html" class="home">Inicio</a>
+    <a href="features.es.html">Funciones</a>
+    <a href="indexer.es.html" class="on">Indexador</a>
+    <a href="benchmarks.es.html">Benchmarks</a>
+    <a href="MANUAL.html">Manual</a>
+    <a href="https://github.com/nzbfast/nzbfast" title="Repositorio del código">GitHub</a>
+    <a class="cta" href="download.es.html">Descargar</a>
+    <!-- i18n picker: same markup in every language file; hrefs fixed -->
+    <select class="langsw" aria-label="Language" style="font-size:11.5px;opacity:.8;margin-inline-start:10px;background:transparent;color:inherit;border:1px solid rgba(128,128,128,.4);border-radius:6px;padding:2px 4px;cursor:pointer;max-width:110px" onchange="location.href=this.value"><option value="indexer.html">English</option><option value="indexer.fr.html">Français</option><option value="indexer.de.html">Deutsch</option><option value="indexer.it.html">Italiano</option><option value="indexer.es.html" selected>Español</option><option value="indexer.nl.html">Nederlands</option><option value="indexer.pt.html">Português</option><option value="indexer.sv.html">Svenska</option><option value="indexer.da.html">Dansk</option><option value="indexer.nb.html">Norsk</option><option value="indexer.fi.html">Suomi</option><option value="indexer.tr.html">Türkçe</option><option value="indexer.ro.html">Română</option><option value="indexer.he.html">עברית</option><option value="indexer.ar.html">العربية</option><option value="indexer.fa.html">فارسی</option></select>
+  </nav>
+</div></header>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">El escaparate</p>
+    <h2>Tu índice, presentado como un muro de pósteres</h2>
+    <p class="lead">El indexador integrado escanea los newsgroups que te interesan; el muro convierte
+    el resultado en pósteres, valoraciones, reparto y rejillas de episodios, usando solo fuentes
+    públicas sin clave, obtenidas por tu propia instalación. Haz clic en un chip de episodio para descargarlo.</p>
+    <figure class="shot"><img src="assets/wall-grid.jpg" alt="Muro de pósteres de nzbfast: una rejilla de pósteres de TV con distintivos de calidad, valoraciones y número de temporadas" loading="lazy"></figure>
+    <div style="height:18px"></div>
+    <div class="shots">
+      <figure><div class="shot"><img src="assets/dash-browse.png" alt="Búsqueda instantánea: busca mientras escribes, con filtros de calidad, botones de seguimiento en cada fila y distintivos de calidad por todas partes." loading="lazy"></div>
+        <figcaption>Búsqueda instantánea: busca mientras escribes, con filtros de calidad, botones de seguimiento en cada fila y distintivos de calidad por todas partes.</figcaption></figure>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <h2>Indexador y muro de pósteres</h2>
+    <p class="lead">Escanea los grupos que te interesan hacia un índice privado y explóralo como
+    un muro de pósteres. Todos los metadatos vienen de fuentes públicas sin clave, obtenidos por tu
+    propia instalación. No hay ninguna clave API que mendigar.</p>
+    <div class="shots">
+      <figure><div class="shot"><img src="assets/wall-sheet.jpg" alt="Ficha de detalle del muro de pósteres con valoración, reparto, sinopsis y chips de episodios" loading="lazy"></div>
+        <figcaption>Valoraciones, reparto, sinopsis, rejilla de episodios. Sin claves API, nunca.</figcaption></figure>
+    </div>
+    <div style="height:26px"></div>
+    <div class="grid2">
+      <ul class="plain">
+        <li><b>Escáner continuo de grupos.</b> Los escaneos OVER incrementales corren según tu programación a ~43k cabeceras/s repartidos por conexiones en abanico, negociando cabeceras comprimidas (RFC 8054) donde un servidor las ofrece. Los primeros escaneos usan bisección por fecha, así que <code>--max-age 2y</code> se salta años de cabeceras en unas 20 sondas.</li>
+        <li><b>Filtros de ingesta:</b> filtros por tipo, año, resolución, idioma y tamaño mantienen el spam de indexador fuera de tu base de datos, y la basura ofuscada se detecta y se descarta por defecto.</li>
+        <li><b>Analizador de nombres de escena.</b> Extrae título, año, episodio, calidad y origen de nombres del mundo real -incluidos los programas diarios con fecha codificada, los códigos multiepisodio y los nombres ofuscados con ROT13- y deduplica los lanzamientos hasta una sola tarjeta por título.</li>
+        <li><b>Detección de retiradas.</b> El muestreo de disponibilidad en segundo plano nota cuándo un grupo está siendo purgado y marca sus lanzamientos con un distintivo, así una publicación que ya está siendo retirada no desperdicia una captura.</li>
+      </ul>
+      <ul class="plain">
+        <li><b>Enriquecimiento sin claves.</b> TVmaze para series, iTunes Search para cine, y además conjuntos públicos de valoraciones, Wikidata, Wikipedia y AniList rellenan pósteres, valoraciones y recuentos de votos, reparto, géneros y argumentos. Las claves de OMDb y TMDB funcionan si las tienes, pero ninguna hace falta.</li>
+        <li><b>Rejillas de episodios:</b> chips por temporada con la mejor codificación de cada episodio a un clic de la descarga, los packs de temporada marcados y un «seguir serie» en la cabecera de cada temporada.</li>
+        <li><b>Filas de tendencias:</b> franjas de «nuevo esta semana» y «de moda ahora» construidas a partir de la frecuencia de publicación.</li>
+        <li><b>Un muro que aprende.</b> «No me interesa» oculta un título y enseña una regla permanente; el orden «Para ti» clasifica el muro de pósteres según el perfil de gustos que construyen tus propias capturas. Todo se queda en local.</li>
+        <li><b>Corrige lo que sea.</b> ¿Coincidencia errónea? Elige entre los candidatos o simplemente escribe la identidad correcta: lo que fijas a mano nunca se sobrescribe. Apunta un póster a una URL o sube uno. Un botón reenriquece un solo título; otro borra y reconstruye el índice entero.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<footer><div class="wrap">
+  <div class="cols">
+    <div>⚡ <b>nzbfast</b> - el descargador de Usenet de una sola pasada.</div>
+    <div>
+      <a href="index.es.html">Inicio</a> ·
+      <a href="features.es.html">Funciones</a> ·
+      <a href="indexer.es.html">Indexador</a> ·
+      <a href="benchmarks.es.html">Benchmarks</a> ·
+      <a href="download.es.html">Descargar</a> ·
+      <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
+    </div>
+  </div>
+  <p class="fine">Software libre, GPL-3.0-or-later. La reparación PAR2 y la extracción RAR son código nativo dentro del binario, sin herramientas de terceros incluidas. Los metadatos del muro de pósteres
+  provienen de fuentes públicas sin clave, obtenidos por tu propia instalación.</p>
+</div></footer>
+
+</body>
+</html>

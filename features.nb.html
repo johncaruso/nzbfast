@@ -30,7 +30,9 @@
 <header><div class="wrap">
   <a class="logo" href="index.nb.html"><span class="bolt">⚡</span> nzbfast</a>
   <nav>
+    <a href="index.nb.html" class="home">Hjem</a>
     <a href="features.nb.html" class="on">Funksjoner</a>
+    <a href="indexer.nb.html">Indekserer</a>
     <a href="benchmarks.nb.html">Ytelsestester</a>
     <a href="MANUAL.html">Dokumentasjon</a>
     <a href="https://github.com/nzbfast/nzbfast" title="Source repository">GitHub</a>
@@ -98,7 +100,7 @@
         <li><b>Skriv én gang.</b> Dekodede artikler pwrites rett til sine endelige filoffset. Ingen midlertidige filer, ingen egen sammensettingsrunde.</li>
         <li><b>PAR2-verifisering i strømmen.</b> Hver blokk MD5-hashes fra dekodebufferne etter hvert som den kommer inn, så verifiseringen er ferdig i samme øyeblikk som nedlastingen. Det slår hurtigsjekken de andre klientene nøyer seg med, og det koster ingenting.</li>
         <li><b>Direkte utpakking:</b> store-mode-RAR-poster (de fleste scene-utgivelser) mappes og pakkes ut mens de lastes ned, så volumene lander aldri på disk i det hele tatt. Diskskrivinger blir innhold × 1,0 og disk nødvendig 1×, der andre vil ha omtrent 2×.</li>
-        <li><b>Nøstede arkiver, fortsatt én omgang.</b> Arkiver inni arkiver - RAR i RAR, 7z inni RAR, stiger flere nivåer dype - avnøstes i farten i stedet for å bli skrevet ut og åpnet på nytt. Én kopi på disk der en skriv-ut-og-skann-på-nytt-tilnærming holder to.</li>
+        <li><b>Nøstede arkiver, og dybde koster nesten ingenting.</b> Arkiver inni arkiver - RAR i RAR, 7z i et RAR, stiger mange nivåer dype - pakkes ut mens bytene kommer inn, inne i den gjennomgangen vi allerede holdt på med. Der ligger hele forskjellen: en klient som skriver hvert lag ut, lukker det, åpner det igjen og skanner det på nytt, betaler en hel gjennomgang per nivå, så hvert nivå ned koster den enda en tur over disken. Våre blir med i den første gjennomgangen, og nyttelasten kommer ut av en ti nivåer dyp stige på samme måte som ut av en på ett. Én kopi på disk der skriv-ut-og-les-om holder to eller tre.</li>
         <li><b>Deobfuskering.</b> Obfuskerte poster får nytt navn fra PAR2-metadataen sin, ROT13-krypterte navn reddes, og hash-navngitt søppel klassifiseres og filtreres ut.</li>
       </ul>
       <ul class="plain">
@@ -106,7 +108,7 @@
         <li><b>RAR-gjenopprettingsdata.</b> Når PAR2 er oppbrukt, eller aldri ble postet, reparerer innebygde RAR-gjenopprettingsdata skadede volumer på stedet.</li>
         <li><b>Reparasjon på hvert dyp.</b> Et PAR2-sett pakket inni et indre lag blir funnet og kjørt på sitt eget nivå, og en par-only-post (data slettet, et sett med 100 % gjenoppretting etterlatt) gjenoppbygges helt og pakkes deretter ut.</li>
         <li><b>Fallback for komprimert og kryptert:</b> ikke-store-poster materialiseres og pakkes ut via den native RAR-motoren, alt fra RAR4 til nye RAR7, overlappet med resten av køen. Krypterte sett parkeres med en tydelig melding i stedet for å feile stille.</li>
-        <li><b>Passordhåndtering.</b> Passord kommer fra *arr-API-et, filnavnkonvensjonen <code>{{pw}}</code> eller NZB-metadata. For alt som blir igjen, tar en 🔑 opplåsing på dashbordet over derfra: den låser opp i bakgrunnen og arkiverer så som normalt. Kjedede passord løser seg selv: når utpakkingen av ett lag frembringer neste lags passordfil, leses den og brukes automatisk.</li>
+        <li><b>Den leter selv etter passordet.</b> De fleste krypterte postene trenger deg ikke. Den prøver NZB-ens egne metadata og navnekonvensjonen <code>{{pw}}</code>, *arr-API-et, deretter enhver kort tekstnotis lagt ut ved siden av filene, og til slutt navnene på releasen og filene selv. Det søket gjentar den på <i>hvert</i> nivå: en kjede som gjemmer hvert lags passord i laget over - et annet passord på hvert nivå - låses opp hele veien ned uten at du taster noe. Det som virkelig blir igjen, får 🔑-opplåsingen på dashbordet: den låser opp i bakgrunnen og arkiverer så som vanlig.</li>
         <li><b>Sikkerhetssperrer.</b> Reparerte kildevolumer skrivebeskyttes mens ny utpakking kjører, den ferdige filens egen sjekksum verifiseres ende til ende (på som standard), og en exit-kode melder «suksess» bare når sluttilstanden faktisk er brukbar.</li>
       </ul>
     </div>
@@ -143,7 +145,7 @@
         <li><b>SABnzbd-kompatibelt API:</b> hele flaten *arr-ene faktisk bruker: addfile/addurl, kategorier, prioriteter, pause/fortsett per jobb, nytt forsøk, paginering, to-nivå API-nøkler. Sonarr og Radarr snakker med det som om det var SABnzbd.</li>
         <li><b>NZBGet JSON-RPC-fasade.</b> nzb360, LunaSea og andre NZBGet-fjernkontroller kobler til uendret.</li>
         <li><b>Newznab-server.</b> Din lokale indeks svarer på t=search/tvsearch/movie, så *arr-ene kan behandle dine egne skanninger som en indekserer.</li>
-        <li><b>RSS auto-henting:</b> feeder filtrert med et NZBGet-aktig språk, lagt til og redigert live fra dashbordet.</li>
+        <li><b>RSS auto-henting:</b> en indekserers feed er det samme som en nyhetsleser abonnerer på, bare at den lister opp det som nettopp er lagt ut på Usenet. Alt som treffer filtrene, lastes ned av seg selv. Feeder filtrert med et NZBGet-aktig språk, lagt til og redigert live fra dashbordet.</li>
         <li><b>Watchlist.</b> Navngi seriene og filmene du vil ha, også de som ikke har blitt sendt ennå. Hver episode hentes ved første forekomst og oppgraderes til den når målkvaliteten din (for eksempel 720p → 1080p REMUX), og den erstattede kopien slettes først etter at oppgraderingen er verifisert. En sendedatokalender viser hva som er på vei.</li>
       </ul>
       <ul class="plain">
@@ -161,33 +163,6 @@
 
 <section class="alt">
   <div class="wrap">
-    <h2>Indekserer og plakatveggen</h2>
-    <p class="lead">Skann gruppene du bryr deg om inn i en privat indeks, og bla så i den som en
-    plakatvegg. All metadata kommer fra nøkkelfrie offentlige kilder hentet av installasjonen
-    din. Det finnes ingen API-nøkkel å tigge om.</p>
-    <figure class="shot"><img src="assets/wall-sheet.jpg" alt="Poster wall detail sheet with rating, cast, synopsis and episode chips" loading="lazy"></figure>
-    <div style="height:26px"></div>
-    <div class="grid2">
-      <ul class="plain">
-        <li><b>Kontinuerlig gruppeskanner.</b> Inkrementelle OVER-skanninger kjører på din tidsplan i ~43k headere/s over utfanede tilkoblinger, og forhandler komprimerte headere (RFC 8054) der en server tilbyr dem. Første skanning er datobiseksjonert, så <code>--max-age 2y</code> hopper over år med headere på rundt 20 sonderinger.</li>
-        <li><b>Inntaksfiltre:</b> filtre på type, år, oppløsning, språk og størrelse holder indekserer-spam ute av databasen din, og obfuskert søppel fanges opp og filtreres som standard.</li>
-        <li><b>Scene-navn-parser.</b> Den henter tittel, år, episode, kvalitet og kilde ut av virkelige stammer (datokodede daglige, fler-episode-koder og ROT13-obfuskerte navn inkludert) og samler utgivelser til ett kort per tittel.</li>
-        <li><b>Umiddelbart søk:</b> søk mens du skriver, med kvalitetsfiltre, følge-knapper per rad og kvalitetsmerker overalt.</li>
-        <li><b>Takedown-deteksjon.</b> Tilgjengelighetssampling i bakgrunnen oppdager når en gruppe er i ferd med å bli høstet, og merker utgivelsene dens, slik at en post som allerede er på vei bort ikke kaster bort en henting.</li>
-      </ul>
-      <ul class="plain">
-        <li><b>Nøkkelfri berikelse.</b> TVmaze for TV, iTunes Search for film, pluss offentlige vurderingsdatasett, Wikidata, Wikipedia og AniList fyller inn plakater, vurderinger og stemmetall, rollebesetning, sjangere og handlinger. OMDb- og TMDB-nøkler fungerer hvis du har dem, men ingenting krever noen.</li>
-        <li><b>Episoderutenett:</b> merker per sesong med den beste enkodingen av hver episode ett klikk fra nedlasting, sesongpakker merket, og en «følg serie» på hver sesongoverskrift.</li>
-        <li><b>Trend-rader:</b> nytt-denne-uken- og hett-akkurat-nå-striper bygget fra postefrekvens.</li>
-        <li><b>En vegg som lærer.</b> «Ikke interessert» skjuler en tittel og lærer den en fast regel; sorteringen «For deg» rangerer veggen etter smaksprofilen dine egne hentinger bygger. Alt sammen blir værende lokalt.</li>
-        <li><b>Rett hva som helst.</b> Feil treff? Velg blant kandidatene eller bare skriv inn den riktige identiteten. Det du setter for hånd blir aldri overskrevet. Pek en plakat mot en URL eller last opp en. Én knapp beriker en enkelt tittel på nytt; en annen sletter og gjenoppbygger hele indeksen.</li>
-      </ul>
-    </div>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
     <h2>Forhåndsvisning og bibliotek</h2>
     <ul class="plain">
       <li><b>Forhåndsvis før den er ferdig.</b> ▶ Spill av gir OS-spilleren din en .m3u servert av daemonen, så du kan bekrefte at en nedlasting er den du var ute etter uten å vente på at den fullføres. Hopp lenger inn, og artiklene du trenger hopper fremst i køen.</li>
@@ -196,15 +171,15 @@
   </div>
 </section>
 
-<section class="alt">
+<section>
   <div class="wrap">
     <h2>Dashbord og innstillinger</h2>
-    <div class="strip">
-      <figure><div class="shot"><img src="assets/dash-browse.png" alt="Queue with per-file drawer and index browse card" loading="lazy"></div>
+    <div class="shots">
+      <figure><div class="shot"><img src="assets/dash-queue-drawer.png" alt="Queue with a per-download detail drawer: per-file progress bars, verify blocks, per-server contribution" loading="lazy"></div>
         <figcaption>Køskuff: søyler per fil, verifiseringsblokker, bidrag per server.</figcaption></figure>
       <figure><div class="shot"><img src="assets/settings-top.png" alt="Settings: server editor and live speed/scheduling controls" loading="lazy"></div>
         <figcaption>Hver innstilling redigerbar i nettleseren. De fleste gjelder live.</figcaption></figure>
-      <figure><div class="shot" style="max-width:320px;margin:0 auto"><img src="assets/mobile-dash.png" alt="Phone layout of the dashboard" loading="lazy"></div>
+      <figure class="phone"><div class="shot"><img src="assets/mobile-dash.png" alt="Phone layout of the dashboard" loading="lazy"></div>
         <figcaption>Skikkelig telefonlayout, samme daemon.</figcaption></figure>
     </div>
     <div style="height:10px"></div>
@@ -226,7 +201,7 @@
   </div>
 </section>
 
-<section>
+<section class="alt">
   <div class="wrap">
     <h2>Utrulling</h2>
     <ul class="plain">
@@ -244,7 +219,9 @@
   <div class="cols">
     <div>⚡ <b>nzbfast</b> - Usenet-nedlasteren i én omgang.</div>
     <div>
+      <a href="index.nb.html">Hjem</a> ·
       <a href="features.nb.html">Funksjoner</a> ·
+      <a href="indexer.nb.html">Indekserer</a> ·
       <a href="benchmarks.nb.html">Ytelsestester</a> ·
       <a href="download.nb.html">Last ned</a> ·
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>

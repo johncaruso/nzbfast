@@ -1,0 +1,822 @@
+<!doctype html>
+<html lang="da">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>nzbfast - Brugermanual</title>
+<style>
+:root{
+  --bg:#f7f8fb;--card:#ffffff;--fg:#16181d;--dim:#5b6270;--line:rgba(30,40,70,.12);
+  --acc:#1f6fd6;--acc2:#6d47e6;--ok:#1f9e6e;--warn:#b97e14;--bad:#c94747;
+  --code:#f0f2f7;--mark:#fff3c9;
+}
+@media(prefers-color-scheme:dark){:root{
+  --bg:#0f1116;--card:#161a22;--fg:#e8eaf0;--dim:#9aa2b1;--line:rgba(140,150,175,.16);
+  --acc:#4da3ff;--acc2:#9b7cff;--ok:#35c88a;--warn:#f5b445;--bad:#ec5a5a;
+  --code:#1d222d;--mark:#4a3f14;
+}}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
+.wrap{display:grid;grid-template-columns:250px minmax(0,1fr);max-width:1160px;margin:0 auto;gap:0}
+nav{position:sticky;top:0;align-self:start;height:100vh;overflow-y:auto;
+  padding:28px 18px 40px 22px;border-right:1px solid var(--line);font-size:13px}
+nav .brand{font-size:19px;font-weight:700;margin-bottom:2px}
+nav a.brand{display:block;color:inherit;text-decoration:none}
+nav a.brand:hover{opacity:.72}
+nav .brand small{color:var(--dim);font-weight:400;font-size:12px}
+nav ol{list-style:none;padding:0;margin:14px 0 0}
+nav li{margin:1px 0}
+nav a{display:block;padding:3.5px 8px;border-radius:6px;color:var(--fg)}
+/* the language row is inline: nav a is display:block for the contents list */
+nav .langsw a{display:inline;padding:0;border-radius:0}
+nav a:hover{background:var(--code);text-decoration:none}
+nav .sub{margin-left:12px;color:var(--dim)}
+main{padding:34px 42px 90px;min-width:0}
+h1{font-size:31px;margin:0 0 4px;letter-spacing:-.02em}
+.subtitle{color:var(--dim);margin:0 0 30px;font-size:16px}
+h2{font-size:22px;margin:52px 0 10px;padding-top:18px;border-top:1px solid var(--line);letter-spacing:-.01em}
+h2:first-of-type{border-top:none;margin-top:8px}
+h3{font-size:16.5px;margin:28px 0 6px}
+h4{font-size:14.5px;margin:20px 0 4px}
+p{margin:8px 0}
+li{margin:3px 0}
+code,kbd{background:var(--code);border:1px solid var(--line);border-radius:5px;
+  padding:1px 6px;font:12.5px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+pre{background:var(--code);border:1px solid var(--line);border-radius:9px;
+  padding:12px 15px;overflow-x:auto;font:12.5px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+pre code{background:none;border:none;padding:0}
+table{border-collapse:collapse;width:100%;margin:12px 0;font-size:13.5px}
+th{text-align:left;color:var(--dim);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+th,td{padding:7px 12px 7px 0;border-bottom:1px solid var(--line);vertical-align:top}
+td code{white-space:nowrap}
+.tip,.note,.warn-box{border-left:3px solid var(--acc);background:var(--card);
+  border-radius:0 9px 9px 0;padding:10px 16px;margin:14px 0;font-size:14px}
+.note{border-left-color:var(--dim)}
+.warn-box{border-left-color:var(--warn)}
+.tip b:first-child,.note b:first-child,.warn-box b:first-child{display:block;font-size:12px;
+  text-transform:uppercase;letter-spacing:.05em;color:var(--dim);margin-bottom:2px}
+.pill{display:inline-block;background:var(--code);border:1px solid var(--line);
+  border-radius:20px;padding:1px 10px;font-size:11.5px;color:var(--dim);vertical-align:1px}
+.pill.live{color:var(--ok)}
+.pill.restart{color:var(--warn)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px 26px}
+hr{border:none;border-top:1px solid var(--line);margin:30px 0}
+.dim{color:var(--dim)}
+@media(max-width:860px){
+  .wrap{grid-template-columns:1fr}
+  nav{position:static;height:auto;border-right:none;border-bottom:1px solid var(--line)}
+  main{padding:24px 20px 60px}
+  .grid2{grid-template-columns:1fr}
+}
+@media print{
+  nav{display:none}
+  .wrap{grid-template-columns:1fr}
+  body{background:#fff;color:#000;font-size:11.5pt}
+  h2{page-break-after:avoid}
+  pre{white-space:pre-wrap}
+  a{color:inherit}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav>
+  <a class="brand" href="index.da.html">⚡ nzbfast <small>Brugermanual</small></a>
+  <!-- i18n switcher: same markup in every language; hrefs never change -->
+  <div class="langsw" style="font-size:11.5px;margin-top:6px;color:var(--dim)"><a href="MANUAL.html">EN</a> · <a href="MANUAL.fr.html">FR</a> · <a href="MANUAL.de.html">DE</a> · <a href="MANUAL.it.html">IT</a> · <a href="MANUAL.es.html">ES</a> · <a href="MANUAL.nl.html">NL</a> · <a href="MANUAL.pt.html">PT</a> · <a href="MANUAL.sv.html">SV</a> · <a href="MANUAL.da.html">DA</a> · <a href="MANUAL.nb.html">NB</a> · <a href="MANUAL.fi.html">FI</a> · <a href="MANUAL.tr.html">TR</a> · <a href="MANUAL.ro.html">RO</a> · <a href="MANUAL.he.html">HE</a> · <a href="MANUAL.ar.html">AR</a> · <a href="MANUAL.fa.html">FA</a></div>
+  <ol>
+    <li><a href="#intro">1 · Velkommen</a></li>
+    <li><a href="#quickstart">2 · Kom hurtigt i gang</a></li>
+    <li><a href="#concepts">3 · Sådan virker nzbfast</a></li>
+    <li><a href="#dashboard">4 · Dashboardet</a></li>
+    <li><a href="#adding">5 · Tilføj downloads</a></li>
+    <li><a href="#wall">6 · Postervæggen</a></li>
+    <li><a href="#preview">7 · Forhåndsvisning &amp; verificering</a></li>
+    <li><a href="#servers">8 · Usenet-servere</a></li>
+    <li><a href="#settings">9 · Indstillingsoversigt</a></li>
+    <li><a href="#automation">10 · Automatisering</a></li>
+    <li><a href="#arr">11 · Sonarr, Radarr &amp; venner</a></li>
+    <li><a href="#remotes">12 · Telefon &amp; fjernbetjenings-apps</a></li>
+    <li><a href="#performance">13 · Ydelsesværktøjer</a></li>
+    <li><a href="#updates">14 · Opdateringer</a></li>
+    <li><a href="#cli">15 · Kommandolinje</a></li>
+    <li><a href="#api">16 · API-oversigt</a></li>
+    <li><a href="#files">17 · Filer &amp; placeringer</a></li>
+    <li><a href="#troubleshooting">18 · Fejlfinding</a></li>
+  </ol>
+</nav>
+<main>
+
+<h1>⚡ nzbfast</h1>
+<p class="subtitle">Den hurtige Usenet-downloader - brugermanual</p>
+
+<h2 id="intro">1 · Velkommen</h2>
+<p>nzbfast henter fra Usenet så hurtigt, som din linje, dine udbydere og din
+maskine tillader - og som regel betyder det <em>så hurtigt som din linje</em>. Det er ét enkelt
+selvstændigt program: motoren, et web-dashboard, en postervægs-mediebrowser,
+en indbygget indexer, realtids-forhåndsvisning, native PAR2-reparation og native RAR-udpakning er alle inde i én eksekverbar fil. Der er ikke andet at installere.</p>
+<p>Det, der gør den hurtig, er arkitektur, ikke finjusteringer:</p>
+<ul>
+  <li><b>Pipelinet NNTP</b> - mange artikelforespørgsler rider på hver forbindelse ryg mod ryg
+  og holder hver forbindelse på fuld hastighed i stedet for at vente rundrejser af.</li>
+  <li><b>En one-pass-pipeline</b> - download, verificering og udpakning overlapper.
+  Arkivvolumener udpakkes <em>i strømmen</em>; på en typisk store-mode-post rører
+  RAR-filerne aldrig din disk, så jobbet kræver 1× release-størrelsen, ikke 2×,
+  og bliver færdigt, når downloaden bliver færdig.</li>
+  <li><b>Union på tværs af udbydere</b> - hver konfigureret server bidrager; en artikel,
+  der mangler på én backbone, hentes fra en anden. Langsomme eller døde servere sætter aldrig
+  køen i stå.</li>
+  <li><b>Et hukommelsesbudget</b> - motoren tilpasser sig en begrænset RAM-tildeling og
+  degraderer til disk om nødvendigt. Den swapper aldrig din maskine.</li>
+</ul>
+<p>Målt mod feltet på identisk hardware, samme jobs og udbydere har nzbfast
+fuldført en 190&nbsp;GB-download på omkring 5 minutter på en 10&nbsp;GbE-linje - med de
+førende alternativer 30–220% bagefter på de samme tests, dér hvor de overhovedet fuldførte
+dem. Tallene står i <a href="#concepts">§3</a>.</p>
+
+<h2 id="quickstart">2 · Kom hurtigt i gang</h2>
+<h3>macOS</h3>
+<ol>
+  <li>Åbn <code>nzbfast-&lt;version&gt;-macos.dmg</code> og træk
+  <b>NzbFast</b> ind i <b>Programmer</b> (universal: Apple Silicon + Intel).</li>
+  <li>Første start: macOS advarer om, at nzbfast endnu ikke er Apple-notariseret.
+  Højreklik på appen → <b>Åbn</b> - eller åbn Systemindstillinger →
+  <b>Anonymitet&nbsp;&amp;&nbsp;sikkerhed</b>, rul ned, og klik
+  <b>Åbn&nbsp;alligevel</b>. Dette er et engangstrin.</li>
+  <li>App-vinduet viser dashboardet med et velkomstkort - klik på det og tilføj
+  mindst én Usenet-server (host, port 563, brugernavn, adgangskode). Du kan tilføje
+  flere senere under Indstillinger.</li>
+  <li>Slip en <code>.nzb</code> hvor som helst på dashboardet - eller dobbeltklik bare på
+  <code>.nzb</code>-filer i Finder. Downloads lander i
+  <code>~/Downloads/nzbfast</code>. Afslut fra menuen; downloads genoptager, hvor
+  de slap.</li>
+</ol>
+<p class="dim" style="font-size:0.92em">Vil du hellere undvære app'en? Den almindelige zip (binær +
+<code>Start nzbfast.command</code>-starter, samme motor) virker stadig som før -
+trin nedenfor under "Fra en terminal".</p>
+<h3>Windows</h3>
+<ol>
+  <li>Kør <code>nzbfast-setup-&lt;version&gt;.exe</code>. Den installeres kun for din
+  bruger (ingen administratoradgangskode). Da denne udgivelse endnu ikke er kodesigneret,
+  viser SmartScreen måske "Windows beskyttede din pc" - klik <b>Flere oplysninger</b> →
+  <b>Kør alligevel</b>.</li>
+  <li>nzbfast bor i systembakken: dobbeltklik på bakke-ikonet (eller brug
+  <b>Åbn dashboard</b> i dets højrekliksmenu) for at åbne dashboardet, og tilføj
+  så din Usenet-server fra velkomstkortet. Bakke-menuen har også Pause/Genoptag,
+  din downloadmappe og Afslut.</li>
+  <li>At dobbeltklikke på en <code>.nzb</code>-fil sætter den i kø. Windows Defender spørger
+  måske én gang om at tillade lytning på det lokale netværk - tillad det.</li>
+</ol>
+<p>Vil du hellere have en bærbar kopi? <code>-windows-x64.zip</code> virker stadig: pak ud
+hvor som helst og dobbeltklik på <code>nzbfast.exe</code> (eller <code>Start nzbfast.bat</code>)
+for terminal-guiden.</p>
+<h3>Fra en terminal (enhver platform)</h3>
+<pre><code>nzbfast setup            # interactive server setup (writes config.local.json)
+nzbfast serve --open     # start the daemon and open the dashboard</code></pre>
+<div class="tip"><b>Tip</b>Kører du allerede SABnzbd eller NZBGet? Spring indtastning af
+loginoplysninger over: Indstillinger → Usenet-servere → <b>Importér fra SABnzbd / NZBGet…</b>
+finder din eksisterende installation og kopierer dens servere over. Der findes også
+<code>nzbfast import-sab</code> på kommandolinjen.</div>
+
+<h2 id="concepts">3 · Sådan virker nzbfast</h2>
+<p>En hurtig ordliste, så resten af manualen er let at læse:</p>
+<table>
+<tr><th>Begreb</th><th>Betydning</th></tr>
+<tr><td><b>Udbyder / server</b></td><td>En Usenet-tjeneste, du har en konto hos
+(Newshosting, Eweka, XS News…). Hver tillader et vist antal samtidige forbindelser.</td></tr>
+<tr><td><b>Backbone</b></td><td>Infrastrukturen bag en udbyder. Flere brands videresælger ofte
+den samme backbone - nyttigt at vide, fordi to udbydere på én backbone
+mangler de <em>samme</em> artikler. Se <a href="#performance">Server-diversitet</a>.</td></tr>
+<tr><td><b>NZB</b></td><td>En lille XML-fil, der viser de artikler, en post består af.
+Det er den, du fodrer nzbfast med.</td></tr>
+<tr><td><b>PAR2</b></td><td>Genoprettelsesdata, der postes sammen med en release. nzbfast verificerer
+mod den <em>under</em> downloaden og reparerer automatisk, når artikler er
+beskadigede eller mangler.</td></tr>
+<tr><td><b>Store-mode-RAR</b></td><td>De fleste releases er pakket i RAR-volumener uden
+komprimering. nzbfast genkender dette og skriver den <em>indre fil</em> direkte til dens
+endelige placering, mens den henter - ingen udpakningsfase bagefter.</td></tr>
+</table>
+<p>Pipelinen kører download → afkod → verificér → udpak <em>samtidig</em>. Pipeline-kortet
+på dashboardet viser alle tre baner bevæge sig på én gang. Når den sidste
+byte ankommer, er verificeringen allerede færdig, og filen er allerede udpakket; et
+typisk jobs "efterbehandlings"-tid er nul. Er reparation nødvendig, materialiseres
+volumenerne først da til disk, repareres på stedet af den native GF(2¹⁶)-motor
+(omdøbte eller byte-forskudte obfuskerede data findes og adopteres af en glidende
+blokscanning) og udpakkes igen - alt automatisk.</p>
+<p>Afbrudte downloads (crash, strømsvigt, <kbd>kill&nbsp;-9</kbd>) genoptager fra
+<b>artikel-journalen</b>: bytes, der allerede ligger på disken, hentes aldrig to gange. Journalen
+registrerer, hvor hver artikels bytes fysisk landede - selv bytes, der blev
+direkte-udpakket ind i den endelige fil - så en genoptagelse genopbygger fra lokal disk og
+genverificerer alt, den gendannede, mod PAR2-blok-mappet, før den stoler på det.</p>
+<h3>Sådan står det til sammenligning</h3>
+<p>Målt mod SABnzbd 5.0.4 og NZBGet 26.2 på samme maskine, samme
+udbydere og samme NZB'er, taget tid til en <em>brugbar fil</em> - download, verificering,
+reparation og udpakning alt inkluderet, for det er, når jobbet reelt er færdigt:</p>
+<table>
+<tr><th>Jobstørrelse</th><th>nzbfast</th><th>NZBGet 26.2</th><th>SABnzbd 5.0.4</th></tr>
+<tr><td>7 GB</td><td><b>13.7 s</b></td><td>+26%</td><td>+39%</td></tr>
+<tr><td>35 GB</td><td><b>67 s</b></td><td>+61%</td><td>+325%</td></tr>
+<tr><td>87 GB</td><td><b>272 s</b></td><td>+36%</td><td>+160%</td></tr>
+<tr><td>190 GB</td><td><b>9 m 00 s</b></td><td>+30%</td><td>+111%</td></tr>
+</table>
+<p>Forskellen er den efterbehandling, de andre stadig skal lave, efter den sidste byte
+lander. Begge konkurrenter blev tunet til sammenligningen, ikke efterladt på standardindstillinger -
+SABnzbd leveres i særdeleshed med anmodnings-pipelining <em>slået fra</em>, hvilket koster den
+dyrt, så den blev slået til.</p>
+<p>To forskelle betyder lige så meget som tiderne:</p>
+<ul>
+<li><b>Diskplads.</b> One-pass kræver <b>1× release-størrelsen</b>; klienter, der skriver
+arkivvolumener og så pakker dem ud, kræver <b>2×</b>. På en testmaskine med 97 GB
+fri blev et 87 GB-job færdigt her på 3 m 08 s, og de to andre <em>kunne slet ikke køre</em>.</li>
+<li><b>Hukommelse.</b> På 190 GB-jobbet var topforbruget 3.9 GB mod SABnzbds 9.3 GB
+- og nzbfast klarer samme job på cirka 1 GB, hvis den får besked på det (se
+<a href="#memory">Hukommelsesbudget</a>).</li>
+</ul>
+<div class="note"><b>Crash-genoptagelse, målt</b>Dræb en download midt i flugten
+(<kbd>kill&nbsp;-9</kbd> ved 15 GB af et 34.5 GB-job), og genoptagelsen gen-henter
+<b>~0.3 GB</b> - kun de artikler, der reelt var undervejs ved drabet - mod
+NZBGets 0.2 GB i samme test. Dette var engang et nederlag, vi offentliggjorde (15.3 GB
+gen-hentet, dengang journalen ikke kunne gøre rede for direkte-udpakkede bytes);
+placerings-journalen løste det: genoptagelsen gendanner de bytes fra de lokale output-
+filer og genverificerer hver gendannet byte mod PAR2-blok-mappet, før den stoler på
+det. Hvert scenarie, vi taber, offentliggøres sammen med sejrene, med hele
+metoden og de rå tal.</div>
+
+<h2 id="dashboard">4 · Dashboardet</h2>
+<p>Åbn <code>http://localhost:6789</code> (eller din maskines adresse fra en anden
+enhed - telefonlayoutet tilpasser sig automatisk). Alt opdateres live, én gang i
+sekundet. Kortene, oppefra og ned:</p>
+<h3>Header-bjælken</h3>
+<ul>
+<li><b>Hastighedsgrænse</b>-menu - faste lofter, <i>auto · giv plads til LAN</i> (en RTT-styret
+tilstand, der trækker sig, når en anden i huset har brug for linjen) eller ubegrænset.</li>
+<li><b>Pause i…</b> - sæt alt på pause i 15&nbsp;min/30&nbsp;min/1&nbsp;t/3&nbsp;t med
+automatisk genoptagelse, eller brug Pause-knappen for en tidsubestemt pause. Pause er
+øjeblikkelig: den aktive overførsel stopper inden for få sekunder og genoptager senere fra
+journalen uden at miste noget. (Job med Tving-prioritet henter videre, SABnzbd-stil.)</li>
+<li>Et <b>opdateringsbanner</b> dukker op her, når en ny version er tilgængelig
+(se <a href="#updates">Opdateringer</a>).</li>
+</ul>
+<h3>Gennemløb</h3>
+<p>Live MB/s med et rullende diagram; de stiplede vandmærker markerer denne sessions
+høj/lav, den svage linje er et glidende gennemsnit. Nedenunder viser et histogram, hvordan
+sessionens hastighedsmålinger fordeler sig - typisk vs. top. Gør vinduet bredere, og
+diagrammerne viser mere historik (op til en time).</p>
+<h3>Statistik-fliser</h3>
+<p>Hentet i denne session, kødybde, antal fuldført/mislykket, sessionens tophastighed.</p>
+<h3 id="dash-resources">Ressourcer - én maskine, fire lofter</h3>
+<p>CPU, RAM (mod nzbfasts hukommelsesbudget), diskskrivningshastighed og netværk på ét
+normaliseret diagram, med rigtige værdier i signaturforklaringen og en advarsel ved lav disk. Ingen anden
+NZB-klient viser dig dette; det findes for at bevise en pointe - nzbfast maksimerer din
+<em>linje</em>, ikke din maskine.</p>
+<h3 id="dash-pipeline">Pipeline - faser overlapper</h3>
+<p>Tre baner: download, verificér (PAR2-blokke tjekket), udpak. På et sundt job
+bevæger alle tre sig sammen.</p>
+<h3 id="dash-providers">Udbydere</h3>
+<p>Live-hastighed pr. server, forbindelsesudnyttelse, andel af trafikken, sessions-GB og en
+livstids-score for artikel-fuldførelse (farvet, når en server falder under 98%). Et stablet
+arealdiagram viser hver udbyders bidrag over tid. Rækker gensorteres efter live-
+ydelse hvert 10.&nbsp;s (kan konfigureres under Indstillinger → Grænseflade), så din hurtigste
+udbyder altid er øverst.</p>
+<h3 id="dash-queue">Kø</h3>
+<ul>
+<li><b>Træk rækker for at ændre rækkefølge</b> (inden for et prioritetsbånd - Tving/Høj kører stadig først);
+skift prioritet inline.</li>
+<li><b>Klik på en række</b> for detaljeskuffen: fremgangsbjælker pr. fil, antal verificerings-
+blokke, og hvilken server der bidrog med hvor meget til <em>dette</em> job.</li>
+<li>Mærker viser særlige tilstande: <i>udskudt (langsom)</i>, <i>prefetcher</i>,
+<i>på pause</i> (se <a href="#performance">Ydelsesværktøjer</a>).</li>
+<li>Et nedtællingsdiagram følger de samlede GB, der er tilbage i hele køen.</li>
+</ul>
+<h3 id="dash-browse">Gennemse indeks</h3>
+<p>Søg i alt, hvad den indbyggede indexer har katalogiseret fra dine overvågede grupper
+(se <a href="#automation">Automatisering</a>) og hent med ét klik - ingen ekstern
+indexer nødvendig. Statuslinjen viser scanningsfremgang; <b>Scan nu</b> fremtvinger en gennemgang.</p>
+<h3>Overvågningsliste</h3>
+<p>Tilføj titler ved navn - også dem, der endnu ikke er postet. Når en matchende release
+dukker op i indekset, hentes den automatisk, med kvalitetspræferencer og
+opgraderingsregler (en bedre kopi erstatter en dårligere).</p>
+<h3 id="dash-history">Historik</h3>
+<p>Seneste downloads med status, størrelse, placering; mislykkede jobs tilbyder <b>Prøv igen</b>
+(genoptager fra journalen). Krypterede arkiver viser en 🔑 lås-op-kontrol - indtast
+adgangskoden, og jobbet bliver færdigt på stedet. Verificerings-sundhedsstriben viser defekte PAR2-
+blokke pr. download - en stigende hale betyder, at artikler kommer beskadigede frem.</p>
+<h3 id="dash-usage">Dataforbrug</h3>
+<p>Daglige bjælker pr. udbyder og totaler for I dag / 7 dage / 30 dage - uundværligt for målte
+og blok-konti. Blok-konti viser livstidsforbrug mod deres størrelse.</p>
+<h3>Log, System-benchmark, Forbindelsestuning, Server-diversitet</h3>
+<p>En logfremviser på siden og de tre selvmålingsværktøjer beskrevet i
+<a href="#performance">Ydelsesværktøjer</a>.</p>
+
+<h2 id="adding">5 · Tilføj downloads</h2>
+<table>
+<tr><th>Metode</th><th>Hvordan</th></tr>
+<tr><td><b>Træk &amp; slip</b></td><td>Slip en eller flere <code>.nzb</code>-filer hvor som helst på dashboardet.</td></tr>
+<tr><td><b>Watch-mappe</b></td><td>Vælg en mappe under Indstillinger; enhver <code>.nzb</code>, der gemmes i den, opfanges
+inden for 5 sekunder, og filen fjernes. Peg din browsers downloadmappe
+mod den for hentninger med ét klik fra indexer-sites.</td></tr>
+<tr><td><b>Fra en URL</b></td><td>Indsæt et NZB-link (API <code>mode=addurl</code>, eller via en tilsluttet app).</td></tr>
+<tr><td><b>Gennemse indeks</b></td><td>Klik på en hvilken som helst komplet release i Gennemse-kortet.</td></tr>
+<tr><td><b>Overvågningsliste / RSS</b></td><td>Automatisk - se <a href="#automation">Automatisering</a>.</td></tr>
+<tr><td><b>Sonarr/Radarr osv.</b></td><td>De sender hentninger direkte til køen - se <a href="#arr">§11</a>.</td></tr>
+<tr><td><b>Kommandolinje</b></td><td><code>nzbfast get file.nzb</code> henter uden daemonen.</td></tr>
+</table>
+<h3>Kategorier, prioriteter, adgangskoder</h3>
+<ul>
+<li><b>Kategorier</b> er frie labels; hver bliver til en undermappe i din downloadmappe,
+og Smarte mapper (se <a href="#automation">§10</a>) kan tildele dem efter regel.</li>
+<li><b>Prioriteter</b>: Tving &gt; Høj &gt; Normal &gt; Lav. Tving omgår pause og kvote.</li>
+<li><b>Adgangskoder</b> til krypterede arkiver opfanges automatisk fra
+<code>&lt;meta type="password"&gt;</code> inde i NZB'en eller et
+<code>Name{{password}}.nzb</code>-filnavn og kan angives pr. job gennem
+API'et eller bagefter fra Historik (🔑).</li>
+</ul>
+
+<h2 id="wall">6 · Postervæggen</h2>
+<p>Klik på <b>🎬 væg</b> i headeren. Væggen forvandler dit indeks til en medie-
+browser: hver genkendt film- og tv-release som en posterflise med bedømmelse, år,
+genrer, medvirkende og synopsis - dine newsgroups, til at gennemse som et katalog.</p>
+<ul>
+<li><b>Faneblade</b> til Film / Serier / Andet, øjeblikkelig søgning og syv
+sorteringer: <b>Til dig</b>, Nyeste poster, Udgivelsesår, Bedst bedømt, Titel A–Z,
+Største og Mest postet.</li>
+<li><b>Kun matchede</b> er slået til som standard og skjuler uidentificeret skrald; en "+N umatchede"-
+chip viser det.</li>
+<li>Klik på en flise for detaljearket: synopsis, IMDb-bedømmelse og stemmer, medvirkende -
+og <b>▶ Afspil</b> (forhåndsvis den med det samme, se <a href="#preview">§7</a>) eller
+<b>⬇ Download</b>.</li>
+<li><b>✎ Ret match</b> - hvis en titel matchede den forkerte serie eller film, vælg den rigtige
+blandt kandidatposterne, eller indtast titel/år/type manuelt. Manuel tekst
+overskrives aldrig af berigelsen. <b>↻ Genopfrisk metadata</b> henter én titel igen;
+Indstillinger → Indeksering kan genopfriske alle eller slette/genopbygge hele indekset.</li>
+<li>Metadata er <b>nøglefri som standard</b> - TVmaze, iTunes, IMDb-datasæt, Wikidata,
+Wikipedia og AniList kræver ingen konti. En OMDb-nøgle (gratis, kun e-mail-tilmelding -
+der er en tilmeldingshjælper under Indstillinger → Indeksering) forbedrer filmmatchning; en TMDB-nøgle
+respekteres, hvis du allerede har en.</li>
+<li><b>Til dig</b> rangordner væggen efter en smagsprofil, der bygges på denne maskine
+ud fra din egen fuldførte historik og din overvågningsliste: yndlingsgenrer, om du
+hælder til film eller serier, og cirka hvilken æra. Titler, du allerede har, synker til
+bunden i stedet for at forsvinde, og en billedtekst »Fordi du ser …« fortæller, hvad
+den gik efter. Uden historik falder den tilbage på Mest postet, så fanebladet er aldrig
+tomt. Intet af dette forlader daemonen.</li>
+<li><b>Ikke interesseret</b> på et felt skjuler den titel, og skjuler du et par
+lignende, lærer væggen noget: den foreslår et filter, du godtager med ét klik (»Skjul
+alle Reality-titler fra nu af?«). Alt det skjulte, og hvert lært filter, står under
+<b>Skjult &amp; filtre</b> og kan fortrydes der.</li>
+<li>En lille <b>tilgængelighedsprik</b> på et felt er oraklets dom
+(<a href="#performance">§13</a>): et gult »?« betyder usikkert hos dine udbydere, rødt
+at delene bliver ved med at mangle. Hele grupper, der er ved at blive ryddet, får et
+<b>ryddet</b>-mærke.</li>
+</ul>
+
+<h2 id="preview">7 · Forhåndsvisning &amp; verificering</h2>
+<p>Du behøver ikke vente på, at en download bliver færdig, for at vide, om det er den
+rigtige fil. Åbn den, mens den henter, tjek at indhold, sprog og kvalitet er som
+forventet, og annuller tidligt, hvis de ikke er - i stedet for først at opdage det
+efter hele downloaden.</p>
+<ul>
+<li><b>▶ Afspil</b> på væggen (eller <code>/m3u/&lt;id&gt;</code>) giver din medieafspiller
+en URL; daemonen starter eller genbruger downloaden bag den.</li>
+<li><code>/stream/&lt;nzo_id&gt;</code>-endpointet serverer filen med fuld HTTP-
+range-understøttelse, <em>mens den henter</em>. <b>Kontrol af ethvert punkt virker</b>: tag en stikprøve ved minut 40, og
+artiklerne til det område promoveres forrest i downloadkøen -
+den åbner der på et par sekunder i stedet for minutter. Filens hoved og
+hale hentes først, så afspillere finder deres indeksdata med det samme.</li>
+<li><b>Bibliotekstilstand</b>: kategorier angivet i <i>library_cats</i> bliver til øjeblikkelige
+metadata-kun-poster - en <code>.strm</code>-fil dukker straks op, tilgængeligheden
+verificeres i baggrunden, og den rigtige download starter, når du åbner den første gang.</li>
+</ul>
+<div class="note"><b>Afspiller-note</b>VLC, IINA, mpv og Infuse åbner alle
+<code>/stream</code>-URL'er. For at kontrollere fra en anden maskine: brug din maskines LAN-adresse i
+stedet for <code>localhost</code>.</div>
+<div class="note"><b>Godkendelses-note</b>Med en API-nøgle sat kræver det en pr.-job-token
+(<code>?t=…</code>) at åbne en parkeret biblioteks-post over <code>/stream/&lt;id&gt;</code>
+- afspillere kan ikke sende API-nøgler, så <code>/m3u</code>-overdragelsen
+og <code>.strm</code>-pegepinden indlejrer den for dig; at udstede den (<code>/m3u</code>)
+kræver nøglen. Ren byte-servering af en allerede aktiv download er fortsat åben, og
+nøglefri installationer opfører sig som før.</div>
+
+<h2 id="servers">8 · Usenet-servere</h2>
+<p>Indstillinger → <b>Usenet-servere</b> er den fulde editor: tilføje, redigere, fjerne, omarrangere og tage enhver
+server ind i eller ud af puljen. Hver server har:</p>
+<table>
+<tr><th>Felt</th><th>Noter</th></tr>
+<tr><td>Host / port</td><td>Brug SSL-port <b>563</b>. TLS koster intet måleligt - nzbfast krypterer altid.</td></tr>
+<tr><td>Brugernavn / adgangskode</td><td>Gemmes lokalt i <code>config.local.json</code>, vises aldrig tilbage til browseren. Lader du adgangskoden stå tom ved redigering, beholdes den gemte.</td></tr>
+<tr><td>Forbindelser</td><td>Samtidige forbindelser pr. server. Brug <b>Forbindelsestuning</b> (<a href="#performance">§13</a>) til at finde hver udbyders bedste punkt frem for at gætte højt.</td></tr>
+<tr><td>Niveau (tier)</td><td>0 = primær; højere niveauer er fill-servere, der kun spørges om artikler, som alle lavere niveauer missede. Sæt ubegrænsede konti på 0, blok-konti på 1+.</td></tr>
+<tr><td>Blokstørrelse (GB)</td><td>Til blok-konti (betaling pr. GB): nzbfast holder styr på livstidsforbruget mod dette og holder op med at bruge serveren, når den er brugt op (advarsel ved 85%).</td></tr>
+</table>
+<p>To yderligere indstillinger pr. server har endnu ingen betjening i dashboardet:
+skriv dem i hånden ved den servers post i <code>config.local.json</code>
+(se <a href="#files">§17</a>), og genstart.</p>
+<table>
+<tr><th>Nøgle</th><th>Noter</th></tr>
+<tr><td><code>bind_ip</code></td><td>Binder denne servers udgående forbindelser til en bestemt lokal adresse, til maskiner med flere udgange og delte VPN-tunneler. Adressefamilien vælger samtidig målfamilien: en v4-binding forbinder til serverens v4-adresse.</td></tr>
+<tr><td><code>socks5</code></td><td>Sender denne servers NNTP-trafik gennem en SOCKS5-proxy: <code>host:port</code>, eller <code>user:pass@host:port</code>. Værtsnavnet slås op <em>af proxyen</em>, så der er intet lokalt DNS-læk.</td></tr>
+</table>
+<ul>
+<li><b>Fluebenet</b> ved siden af hver server er dens til/fra-kontakt: sat betyder, at
+serveren er med i download-puljen, ikke sat betyder deaktiveret. En deaktiveret server
+beholder sine loginoplysninger og indstillinger og kan stadig testes; den bliver bare
+aldrig bedt om artikler. Rækken tones ned, tællingen i overskriften (2 af 3 aktive)
+falder, og ændringen gælder fra <em>næste</em> download. Nyttigt til at spare på en
+blokkonto, eller til at bevise at én udbyder står bag et problem uden at slette den.</li>
+<li><b>Test</b> laver en rigtig forbindelse + TLS + login og rapporterer rundrejsetiden.</li>
+<li><b>Importér fra SABnzbd / NZBGet…</b> scanner de sædvanlige installationsplaceringer, viser, hvad
+den fandt, og kopierer servere ind (springer dubletter over).</li>
+<li>Serverændringer gælder fra den <em>næste</em> download - ingen genstart.</li>
+</ul>
+<div class="tip"><b>Anbefaling</b>To udbydere på <em>forskellige</em> backbones
+slår tre på den samme. Kør <b>Server-diversitet</b> (<a href="#performance">§13</a>)
+for at se, hvilke af dine udbydere der reelt spreder din dækning, og hvilke der er
+redundante kopier af hinanden.</div>
+
+<h2 id="settings">9 · Indstillingsoversigt</h2>
+<p>Næsten alt kan indstilles fra dashboardet under ⚙ Indstillinger; de fire
+undtagelser står sidst i dette afsnit. Værdier mærket
+<span class="pill live">live</span> gælder med det samme;
+<span class="pill restart">restart</span>-værdier ved næste opstart. Hver ændring, der
+foretages her, gemmes i <code>settings.json</code> og overlever genstart (værdier fra
+brugerfladen slår flag på kommandolinjen).</p>
+
+<h3>Hastighed &amp; planlægning <span class="pill live">live</span></h3>
+<table>
+<tr><th>Indstilling</th><th>Hvad den gør</th></tr>
+<tr><td>Hastighedsgrænse</td><td>Loft i bytes/sek. (<code>50M</code>, <code>1G</code>, 0 = ubegrænset). Fjern-apps kan sende procenter - sæt <i>Linjehastighed</i>, så de oversættes korrekt.</td></tr>
+<tr><td>Auto-hastighed</td><td>RTT-styret loft, der viger for anden trafik i husstanden og udvider sig igen, når linjen er stille.</td></tr>
+<tr><td>Udskyd langsomme downloads automatisk</td><td>Et job, der hænger på én langsom server, mens andre venter, flyttes bagest i køen (fremgang beholdes). Se <a href="#performance">§13</a>.</td></tr>
+<tr><td>Prefetch på ledige servere</td><td>Servere, der er ubrugelige for det aktive job, starter det næste i køen. Se <a href="#performance">§13</a>.</td></tr>
+<tr><td>Auto-opdatering / URL til opdateringstjek</td><td>Se <a href="#updates">§14</a>.</td></tr>
+<tr><td>Linjehastighed</td><td>Din forbindelses angivne hastighed - muliggør procentvise grænser fra SABnzbd-kompatible apps.</td></tr>
+<tr><td>Ugeplan</td><td>Rækkeeditor til regler efter ugetidspunkt: pause, genoptag eller sæt en hastighedsgrænse på givne dage/tidspunkter (lokal tid). F.eks. begræns til 20&nbsp;MB/s på hverdage 9–17, ubegrænset ellers.</td></tr>
+</table>
+
+<h3>Næste download <span class="pill live">live</span></h3>
+<p><b>Forbindelser</b> (pr. server), <b>vindue</b> (pipelining-dybde pr. forbindelse),
+<b>decodere</b> (parallelle afkodningstråde). Aflæses, når hvert job starter. Standardværdierne
+passer til de fleste linjer; brug tuning-værktøjerne, før du hæver blindt.</p>
+
+<p><b>Hurtig verificering (CRC32)</b> (slået til som standard) gør krav på
+PAR2-blokke via CRC32, mens downloadet stadig kører, hvilket er 2-3x hurtigere på en
+langsom CPU. Hver artikels egen kontrolsum bliver stadig verificeret, og den afsluttende
+runde bruger altid fuld MD5: der gås ikke på kompromis med korrektheden. Fjern fluebenet
+for også at køre MD5 pr. blok under downloadet.</p>
+<h3>Disk &amp; kvote <span class="pill live">live</span></h3>
+<p><b>Minimum fri plads</b> (sæt nye jobs på pause under den), <b>downloadkvote</b> pr.
+dag eller måned (UTC; Tving-jobs omgår den), <b>hukommelsesgrænse</b> - motorens RAM-budget
+(standard: ¼ af RAM, med loft; hæv den på en maskine med meget RAM for maksimal hastighed på kæmpe
+jobs, og se <a href="#memory">hvad lav hukommelse koster</a>, før du sænker den)
+<span class="pill restart">genstart</span>.</p>
+<p><b>Flyt fuldførte til</b>: efter udpakning, oprydning og omdøbning flyttes
+færdige downloads hertil - et NAS-share, et mediedrev, dér hvor dit bibliotek
+bor. Kategoristrukturen bevares (et job, der blev færdigt under
+<code>tv/</code>, lander under <code>tv/</code> på destinationen), og
+historikken følger med flytningen, så tilsluttede apps importerer og sletter på
+den nye placering. Er destinationen utilgængelig, når et job bliver færdigt
+(share offline, ikke mere plads), bliver filerne i downloadmappen, og jobbet
+fuldføres alligevel helt normalt. Tom = fra. <b>Destinationer pr. kategori</b>
+sender bestemte kategorier et andet sted hen (<code>tv=/Volumes/NAS/TV, movies=/Volumes/NAS/Movies</code>); hver angivet sti
+<em>er</em> den kategoris mappe, så der oprettes ingen ekstra
+kategoriundermappe i den. Kategorier uden en regel følger <b>Flyt fuldførte
+til</b>.</p>
+
+<p><b>Dybde for indlejrede arkiver</b> (standard 5) er, hvor mange lag
+arkiv-i-arkiv der pakkes ud automatisk: et RAR-sæt med en 7z indeni, som igen
+indeholder en RAR, er normalt på Usenet, og nzbfast følger kæden uden en ekstra
+omgang. Ved grænsen bliver det dybeste arkiv simpelthen liggende, ikke pakket videre
+ud, og downloadet fuldføres alligevel. Hæv den kun til usædvanligt dybe udgivelser.</p>
+
+<h3>Auto-omdøbning &amp; oprydning <span class="pill live">live</span></h3>
+<p><b>Omdøb færdige downloads</b> (slået til som standard) giver mappen og hovedfilen
+et rent, sigende navn: en film bliver <code>Example Movie (2024)</code>, serier beholder
+<code>Show - S01E02</code>. Slørede eller ukendte navne får lov at stå præcis som
+postet i stedet for at blive gættet.</p>
+<table>
+<tr><th>Indstilling</th><th>Hvad den gør</th></tr>
+<tr><td>Medtag opløsning</td><td>Sætter <code>1080p</code>, <code>2160p</code>… i navnet. <b>Slået til som standard</b>; de øvrige fire mærker er slået fra.</td></tr>
+<tr><td>Medtag videocodec</td><td><code>x265</code>, <code>x264</code>, <code>AV1</code>…</td></tr>
+<tr><td>Medtag lydcodec</td><td><code>Atmos</code>, <code>DTS-HD</code>, <code>AC3</code>…</td></tr>
+<tr><td>Medtag kilde</td><td><code>BluRay</code>, <code>WEB</code>, <code>REMUX</code>…</td></tr>
+<tr><td>Medtag release-gruppe</td><td>Mærket <code>-GROUP</code> til sidst.</td></tr>
+<tr><td>Fjern skraldefiler</td><td><b>Slået til som standard.</b> Sletter efterladte <code>.par2</code>, <code>.nzb</code>, <code>.sfv</code>, <code>.nfo</code> og sample-klip fra færdige film- og seriemapper. Aldrig videoen eller dens undertekster.</td></tr>
+<tr><td>Behold kun mediefilen</td><td><b>Slået fra som standard, og destruktiv:</b> sletter permanent alt i mappen undtagen videoen (eller videoerne) og underteksterne. Hvert afsnit i en sæsonpakke bevares. Går forud for <b>Fjern skraldefiler</b>, når begge er slået til.</td></tr>
+</table>
+<p class="dim">Hele gruppen kører efter reparation og udpakning og før <b>Flyt fuldførte
+til</b>, og springes helt over for et job, der stadig venter på en adgangskode. Begge
+sletttrin gælder <em>kun</em> udgivelser, der er genkendt som film eller serie: en
+softwarelast eller et sæt, der ikke kan klassificeres (sløret), bliver aldrig ryddet.</p>
+
+<h3>Mapper &amp; behandling</h3>
+<p><b>Downloadmappe</b> <span class="pill restart">genstart</span>, <b>watch-mappe</b>,
+<b>efterbehandlingsscript</b> (kører efter hvert job med SABnzbd-kompatible argumenter
+og <code>SAB_*</code>-miljø - eksisterende SAB-scripts virker uændret),
+<b>oprydningsendelser</b> (skraldfiler slettet efter fuldførelse), <b>Smarte mapper</b>
+og <b>tv-arkivering</b> (se <a href="#automation">§10</a>).</p>
+
+<h3>Indeksering <span class="pill live">live</span></h3>
+<table>
+<tr><th>Indstilling</th><th>Hvad den gør</th></tr>
+<tr><td>Grupper</td><td>Newsgroups, som den indbyggede indexer scanner (f.eks. <code>alt.binaries.teevee</code>).</td></tr>
+<tr><td>Scanningsinterval</td><td>Sekunder mellem gennemgange (standard 900).</td></tr>
+<tr><td>Backfill-artikler</td><td>Headers hentet ved en gruppes allerførste scanning.</td></tr>
+<tr><td>Uddyb pr. scanning</td><td>Hver gennemgang indekserer også så mange <em>ældre</em> artikler og lader din søgbare historik vokse i baggrunden, indtil Maks-alder er nået (standard 200,000 pr. gennemgang ≈ titusinder af millioner artikler pr. døgns oppetid).</td></tr>
+<tr><td>Maks-alder</td><td>Ignorér poster ældre end dette (<code>90d</code>, <code>6m</code>, <code>2y</code>) - begrænser indeksstørrelse og scanningstid.</td></tr>
+<tr><td>Beskær til aldersvinduet</td><td><b>Slået til som standard.</b> Sletter også allerede gemte udgivelser, når de bliver ældre end Maks. alder, så indekset holder omtrent det vindue i stedet for at vokse i det uendelige. Slået fra = kun nye poster filtreres, og det gemte bliver stående. Døde skraldefragmenter (skjulte, stadig ufuldstændige efter en uge) høstes under alle omstændigheder.</td></tr>
+<tr><td>Ingest-filtre</td><td>JSON-regler, der filtrerer, hvad der kommer ind i indekset: typer (obfuskeret skrald droppes som standard), år/opløsning/sprog, størrelsesgrænser.</td></tr>
+<tr><td>Scan nu / dyb genscanning</td><td>Kør en gennemgang med det samme; med en dybde genscannes så mange nylige headers.</td></tr>
+<tr><td>OMDb-nøgle / genopfrisk metadata / slet</td><td>Kontroller til væg-berigelse (<a href="#wall">§6</a>). Slet genopbygger databasen fra bunden - genoprettelsesvejen, hvis den nogensinde bliver korrupt.</td></tr>
+</table>
+
+<h3>Bibliotek, Sikkerhed, Grænseflade</h3>
+<p><b>Bibliotek</b>: kategorier behandlet som øjeblikkelige biblioteksposter + gentjek-interval.
+<b>Sikkerhed</b>: den fulde API-nøgle (alt) og NZB-nøglen (kun-tilføj - sikker at
+give til indexer-sites), begge kan roteres live. <b>Grænseflade</b>: kliklyde, skrivebords-
+notifikationer ved fuldførelse, interval for gensortering af udbydere.</p>
+
+<p><b>Hastighedsenheder</b> <span class="pill live">live</span> afgør, hvordan hver
+hastighed vises i dashboardet: megabyte (MB/s, normen blandt downloadprogrammer,
+standarden) eller megabit (Mb/s, sådan som udbydere angiver linjer). Filstørrelser
+bliver i byte. Det er en egenskab ved daemonen, ikke ved din browser, så det gælder
+hver enhed, der kigger på denne installation.</p>
+<h3>Avanceret: indstillinger uden betjening i dashboardet</h3>
+<p>Fire indstillinger har hverken en betjening i brugerfladen eller et flag på
+kommandolinjen. Sæt dem via API'et (<a href="#api">§16</a>), f.eks.
+<code>/api?mode=config&amp;name=verify_mode&amp;value=lean&amp;apikey=…</code>. Som
+alle andre gemmes de i <code>settings.json</code>.</p>
+<table>
+<tr><th>Navn</th><th>Hvad den gør</th></tr>
+<tr><td><code>verify_mode</code></td><td><code>full</code> | <code>fast</code> | <code>lean</code> (standard <code>fast</code>). <code>lean</code> er skubbet til langsomme CPU'er: som fast, men springer desuden yEnc-CRC pr. artikel over, så snart PAR2 dækker en fil, altså ét CRC32-lag i stedet for to. Downloads uden PAR2 beholder deres artikel-CRC'er, og verificering og reparation i slutningen af jobbet er uændrede i begge tilfælde. <b>Hurtig verificering</b> ovenfor er den samme betjening for full mod fast.</td></tr>
+<tr><td><code>auto_retry_mins</code></td><td>Ventetid før det <em>ene</em> automatiske gentagne forsøg, som en første fejl med manglende artikler får (standard 20). Propagationsforsinkelse er en reel årsag til manglende artikler og løser sig selv; takket være journalen henter genkørslen kun det, der stadig mangler. Fejl på grund af adgangskode eller takedown kvalificerer sig aldrig.</td></tr>
+<tr><td><code>index_scan_par</code></td><td>Hvor mange grupper indekseringen skanner parallelt (standard 3, begrænset til 1-8).</td></tr>
+<tr><td><code>oracle_sample</code></td><td>Tilgængelighedsoraklets STAT-budget i tomgang (<a href="#oracle">§13</a>), sonderinger i timen pr. server. Standard 300, maks. 3600, <code>0</code> slår sampling helt fra.</td></tr>
+</table>
+<h2 id="automation">10 · Automatisering</h2>
+<h3>Overvågningsliste</h3>
+<p>Den enkleste automatisering: tilføj en titel på dashboardet, sæt kvalitetspræferencer,
+færdig. Nye releases hentes, efterhånden som de dukker op i dine indekserede grupper;
+kopier af bedre kvalitet opgraderer tidligere hentninger; en kalendervisning viser, hvad der er på vej.</p>
+<h3 id="auto-rss">RSS-feeds</h3>
+<p>Indstillinger → RSS: enhver newznab-/indexer-RSS-URL med interval pr. feed, kategori og
+filterregler (titelmønstre, størrelsesgrænser). Matchende emner hentes
+automatisk.</p>
+<h3 id="auto-smart">Smarte mapper</h3>
+<p>Regler, der evalueres, når et job tilføjes: match efter mønster/nøgleord og størrelse, tildel en
+kategori (første match vinder). Med <b>tv-arkivering</b> slået til omdøbes og arkiveres
+færdige tv-episoder som <code>Show/Season 01/Show&nbsp;-&nbsp;S01E02.mkv</code> -
+klar til Plex/Jellyfin uden et eksternt værktøj.</p>
+<h3>Planlægger</h3>
+<p>Ugeplanen (se <a href="#settings">§9</a>) automatiserer pause/genoptag/hastighed
+efter tidspunkt på dagen.</p>
+<h3>Scripts</h3>
+<p>Et efterbehandlingsscript modtager SABnzbds positionsargumenter og
+<code>SAB_*</code>-miljøvariabler - det store økosystem af SAB-scripts kører
+som det er.</p>
+
+<h2 id="arr">11 · Sonarr, Radarr &amp; venner</h2>
+<p>nzbfast taler SABnzbd-API'et native, så hvert *arr virker ud af boksen -
+og den kan også fungere som deres <em>indexer</em>.</p>
+<h3>Som downloadklient</h3>
+<ol>
+<li>I Sonarr/Radarr: Settings → Download Clients → tilføj <b>SABnzbd</b>.</li>
+<li>Host: din nzbfast-maskine · Port: <b>6789</b> · API-nøgle: din fulde API-nøgle
+(Indstillinger → Sikkerhed; QR-/kopiér-kontrollen er ved siden af).</li>
+<li>Kategori efter ønske (f.eks. <code>tv</code> / <code>movies</code>). Test → grønt flueben → Gem.</li>
+</ol>
+<p>Kø, historik, status pr. job, "fjern &amp; slet", nyt forsøg og kategoridirigering
+opfører sig alle, som *arr-programmerne forventer.</p>
+<h3>Som en indexer (newznab)</h3>
+<ol>
+<li>Settings → Indexers → tilføj <b>Newznab</b>.</li>
+<li>URL: <code>http://&lt;host&gt;:6789/</code> · API-sti: <code>/api</code> · nøgle: din API-nøgle.</li>
+<li>nzbfast serverer <code>caps</code>-, <code>search</code>-, <code>tvsearch</code>- og
+<code>movie</code>-forespørgsler fra sit eget indeks over dine overvågede grupper, og
+<code>/getnzb/&lt;id&gt;</code> giver NZB'en tilbage.</li>
+</ol>
+<div class="note"><b>Hvorfor bøvle med det?</b>En selv-hostet indexer over præcis de grupper, du
+går op i: ingen konti, ingen grænser for API-kald, retention så dyb, som du lader den scanne.</div>
+
+<h2 id="remotes">12 · Telefon &amp; fjernbetjenings-apps</h2>
+<p>nzbfast implementerer <em>begge</em> de store fjernbetjeningsprotokoller, så næsten alle
+mobil-/tablet-apps virker. Vælg den protokol, din app understøtter:</p>
+<h3>Apps, der taler NZBGet (nzb360, LunaSea, NZB Unity…)</h3>
+<table>
+<tr><th>Felt i app'en</th><th>Værdi</th></tr>
+<tr><td>Type</td><td>NZBGet</td></tr>
+<tr><td>Host / port</td><td>din maskine : <b>6789</b></td></tr>
+<tr><td>Brugernavn</td><td>hvad som helst (f.eks. <code>nzbfast</code>)</td></tr>
+<tr><td>Adgangskode</td><td>din <b>API-nøgle</b></td></tr>
+</table>
+<p>Hele den JSON-RPC-flade, disse apps bruger, serveres: status, kø med
+omorganisér/pause/slet, historik, tilføj-NZB, hastighedsgrænse, pause/genoptag, log.</p>
+<h3>Apps, der taler SABnzbd</h3>
+<table>
+<tr><th>Felt i app'en</th><th>Værdi</th></tr>
+<tr><td>Type</td><td>SABnzbd</td></tr>
+<tr><td>Host / port</td><td>din maskine : <b>6789</b></td></tr>
+<tr><td>API-nøgle</td><td>din API-nøgle (eller NZB-nøglen for kun-tilføj-adgang)</td></tr>
+</table>
+<h3>Dashboardet på din telefon</h3>
+<p>Åbn bare <code>http://&lt;machine&gt;:6789</code> i en mobilbrowser - hele
+dashboardet og væggen har et touch-layout. Panelet Indstillinger → Fjernadgang viser
+de præcise URL'er og en QR-kode til at scanne.</p>
+
+<h2 id="performance">13 · Ydelsesværktøjer</h2>
+<h3 id="perf-benchmark">System-benchmark</h3>
+<p>Ét klik måler dine tre lofter - netværksgennemløb (en rigtig 8-sekunders
+multi-forbindelses-sondering), CPU-verificeringshastighed og diskskrivningshastighed - og leder
+med svaret: <b>din forventede maksimale downloadhastighed, og hvilket loft der er
+grænsen</b>. Den korteste bjælke er din flaskehals; de andre viser deres reserve.
+Planlæg den (hver 6. time → ugentligt), og hver kørsel logges til en historiktabel, så du
+kan se, hvornår din udbyder, ISP eller hardware ændrede adfærd. Planlagte kørsler sker kun,
+mens køen er i tomgang.</p>
+<h3 id="perf-tuning">Forbindelsestuning</h3>
+<p>Måler én udbyder ved stigende antal forbindelser og anbefaler indstillingen -
+flere sockets hjælper, indtil udbyderen eller din linje mættes, og nogle udbydere
+straffer, hvis man beder om for meget. <b>Test alle</b> sammenligner hver udbyder og lader dem så alle
+burste sammen for at tjekke, om poolen mætter din linje.</p>
+<h3 id="perf-diversity">Server-diversitet</h3>
+<p>STAT-sampler artikler på tværs af aldre på hver server og klynger udbydere efter
+fælles huller: udbydere med ~100% fælles manglende artikler er den samme backbone
+(redundante til genoprettelse); uafhængige udvider reelt din dækning. Slutter
+med en anbefaling i klart sprog.</p>
+<h3>Automatisk kø-intelligens</h3>
+<ul>
+<li><b>Auto-udskyd</b>: en download, der halter på en enkelt langsom server, mens andre jobs
+venter, parkeres bagest (journalen beholder dens fremgang) og forsøges igen, når køen
+er tom.</li>
+<li><b>Prefetch på ledige servere</b>: servere, der ikke kan hjælpe det aktive job (deres
+kopier er væk), begynder i mellemtiden at hente det <em>næste</em> job i køen. Ingen anden
+klient laver overlap på tværs af jobs.</li>
+<li><b>Soak på tværs af jobs</b>: mens et færdigt jobs hale (verificér/udpak) gøres færdig på
+disken, ejer det næste jobs download allerede linjen.</li>
+</ul>
+<h3 id="oracle">Tilgængelighedsoraklet</h3>
+<p>Takedowns er den vigtigste grund til, at et Usenet-download slår fejl, og de kan
+forudsiges: den samme udgivelse forsvinder hos én backbone, mens en anden stadig har
+den. nzbfast fører et lille register over, hvad dine egne udbydere faktisk har leveret,
+og bruger et bittelille tomgangsbudget på STAT-sonderinger (nogle få hundrede i timen
+pr. server, aldrig under et download) for at holde det aktuelt. Den henter aldrig
+nyttelast for at finde ud af det.</p>
+<p>Hvad du får ud af det:</p>
+<ul>
+<li>En <b>tilgængelighedsdom</b> på væggens felter og indeksets rækker
+(<a href="#wall">§6</a>): gult »?« for usikkert hos dine udbydere, rødt for med
+sikkerhed væk. Ingen markering betyder, at det ser fint ud.</li>
+<li>Et <b>ryddet</b>-mærke på grupper, hvor friske poster allerede fjernes, så du kan
+skelne en døende gruppe fra en uheldig udgivelse.</li>
+<li><b>Spring udbydere over, som oraklet har dømt ude</b> (Indstillinger, <b>slået fra
+som standard, eksperimentel</b>): når kontrollen er sikker på, at én udbyders backbone
+har mistet en udgivelse, springes den direkte over for det download i stedet for at
+vente på, at den fejler. Den springer aldrig din sidste tilbageværende udbyder
+over.</li>
+</ul>
+<p class="dim">Dommen er en forudsigelse ud fra indicier, ikke en garanti. For et
+håndfast svar om én NZB tæller <code>nzbfast check</code> (<a href="#cli">§15</a>) de
+faktiske artikler.</p>
+<h3 id="memory">Hukommelsesbudget - og hvad lav hukommelse koster</h3>
+<p>Alle motorens caches deler ét budget (standard ¼ af den fysiske RAM, begrænset til
+256 MB–16 GB). Sæt det eksplicit med <i>Hukommelsesgrænse</i> under Indstillinger, eller
+<code>--mem-limit</code> på kommandolinjen.</p>
+<p>nzbfast er bygget til at mætte dit netværk og din disk på samme tid, og RAM er
+det, der lader den gøre begge dele i <em>ét gennemløb</em>: artikler afkodes, verificeres og skrives
+direkte til deres endelige offsets, så arkivvolumener aldrig behøver at røre disken overhovedet.
+Sult den for hukommelse, og intet går i stykker - hver cache har en spill-vej, og motoren
+degraderer til mere disk-I/O frem for at swappe eller fejle. Men den spill er ikke
+gratis, og på store jobs kan du måle den.</p>
+<p>Målt på én maskine og én linje (M1 Ultra, 10 GbE), samme filer ved hvert
+budget. Hver kørsel frembragte et korrekt, fuldt verificeret, udpakket resultat:</p>
+<table>
+<tr><th>Jobstørrelse</th><th>Rigeligt RAM</th><th>2 GB-budget<br><span class="dim">≈ 8 GB-maskine</span></th><th>1 GB-budget<br><span class="dim">≈ 4 GB-maskine</span></th><th>256 MB-budget<br><span class="dim">≈ 2 GB-NAS</span></th></tr>
+<tr><td>7 GB</td><td>15 s</td><td>15 s</td><td>15 s</td><td>15 s</td></tr>
+<tr><td>35 GB</td><td>65 s</td><td>70 s</td><td>70 s</td><td>65 s</td></tr>
+<tr><td>87 GB</td><td>148 s</td><td>206 s <span class="dim">+39%</span></td><td>196 s <span class="dim">+32%</span></td><td>180 s <span class="dim">+22%</span></td></tr>
+<tr><td>190 GB</td><td>330 s</td><td>427 s <span class="dim">+29%</span></td><td>402 s <span class="dim">+22%</span></td><td>411 s <span class="dim">+25%</span></td></tr>
+</table>
+<p>Topforbruget følger <em>budgettet</em>, ikke jobbet: den 190 GB-download fuldføres
+i cirka 1.1 GB RAM. Det, du bytter for det, er tid - og kun på store jobs.</p>
+<ul>
+<li><b>Op til ~35 GB er lav hukommelse gratis.</b> Arbejdssættet passer uanset, så en
+4 GB-maskine gør sådan et job færdigt lige så hurtigt som en 64 GB-maskine.</li>
+<li><b>Efter ~87 GB betaler du 20–40% - men kun når din linje løber fra din disk.</b>
+Verificeringsblokke og arkivvolumener, der ville have ligget i RAM, skrives ud
+og læses tilbage i stedet, og det koster kun tid, hvis netværket kan levere hurtigere, end
+disken kan optage den ekstra trafik. De 20–40% ovenfor blev målt på 10 GbE; samme
+87 GB-job ved de samme budgetter på en ~2.4 Gbps-linje viste slet ingen straf (−1 til +7%,
+inden for støjen fra kørsel til kørsel). Straffen er en funktion af, hvor langt linjen løber fra
+disken, <em>ikke</em> af jobstørrelsen - på en typisk hjemmeforbindelse er et lille budget
+næsten gratis selv på meget store jobs.</li>
+<li><b>Straffen flader ud.</b> Når et job er stort nok til at spille, spiller hvert begrænset
+budget nogenlunde samme mængde - kørslerne på 2 GB, 1 GB og 256 MB læser
+i bund og grund det samme antal blokke tilbage fra disken og bliver færdige inden for støjen af hinanden.
+Så lidt mere RAM under tærsklen, der undgår spill helt, køber ikke
+omkostningen tilbage: giv den nok til at holde jobbet i hukommelsen, ellers betyder det præcise tal knap noget.</li>
+</ul>
+<div class="tip"><b>Anbefaling</b>Giv nzbfast cirka <b>2 GB budget pr.
+100 GB</b> af det største job, du henter, og lad ellers standarden være -
+¼ af RAM er allerede det rigtige svar på de fleste maskiner. I praksis: <b>4 GB RAM</b>
+dækker jobs op til ~35 GB ved fuld hastighed; <b>8–16 GB</b> holder også 100 GB-plus-jobs der;
+en <b>2 GB-NAS</b> gør alt, du kaster efter den, færdigt, men behandl den som en
+baggrunds-downloader snarere end noget, der vil mætte en hurtig linje.</div>
+<p>På en lille NAS: sænk også <i>Forbindelser</i> (2–4) sammen med budgettet. Ved et
+256 MB-budget og 2 forbindelser holder topforbruget sig nær <b>190 MB</b> - komfortabelt
+inden for, hvad en 2 GB-NAS har til overs. Vær opmærksom på, at det på det tidspunkt er antallet af forbindelser,
+ikke hukommelsen, der begrænser dig: samme 35 GB-job tog 286 s i stedet for 65 s.
+Det er den ærlige form på afvejningen - den bliver altid færdig, og færdig korrekt;
+den mætter bare ikke linjen.</p>
+<p class="dim">Benchmarks køres igen for hver udgivelse; metode og tal pr. maskine
+offentliggøres sammen med resultaterne.</p>
+
+<h2 id="updates">14 · Opdateringer</h2>
+<ul>
+<li>Opdateringer er <b>kun besked</b>: nzbfast downloader eller udskifter
+aldrig sin egen binær, og der er ingen kode i den, der kan. Når en ny version
+findes, viser headeren <b>⬆ v X tilgængelig - download</b>; chippen linker til
+den officielle downloadside (linket er fast i appen og kommer aldrig fra
+opdateringsmanifestet). Installér den nye version på samme måde, som du
+installerede den nuværende.</li>
+<li>nzbfast søger efter nye versioner to gange om dagen. Slå <b>Søg efter
+opdateringer</b> (Indstillinger) fra, og den kontakter slet ikke
+opdateringsmanifestet; en tom opdaterings-URL gør det samme.</li>
+</ul>
+
+<h2 id="cli">15 · Kommandolinje</h2>
+<p>Alt, hvad daemonen gør, kan også scriptes. De daglige kommandoer:</p>
+<table>
+<tr><th>Kommando</th><th>Formål</th></tr>
+<tr><td><code>nzbfast setup</code></td><td>Interaktiv serveropsætning.</td></tr>
+<tr><td><code>nzbfast serve</code></td><td>Kør daemonen (dashboard + API + automatisering). <code>--open</code> åbner browseren; se <code>--help</code> for hele flag-listen - hver dashboard-indstilling har en flag-tvilling.</td></tr>
+<tr><td><code>nzbfast get file.nzb</code></td><td>Hent én NZB, fuld pipeline, ingen daemon. <code>--preflight</code> afbryder tidligt, hvis posten ikke kan fuldføres; <code>--password</code> til krypterede sæt.</td></tr>
+<tr><td><code>nzbfast check file.nzb</code></td><td>Tilgængeligheds-dom - COMPLETE / REPAIRABLE / IMPOSSIBLE - uden at hente payload.</td></tr>
+<tr><td><code>nzbfast verify DIR</code></td><td>Verificér filer mod PAR2-sættet i en mappe.</td></tr>
+<tr><td><code>nzbfast sysbench</code></td><td>System-benchmarken + diversitetsrapporten, i terminalen.</td></tr>
+<tr><td><code>nzbfast index / search</code></td><td>Scan grupper ind i indekset / søg i det, uden daemonen.</td></tr>
+<tr><td><code>nzbfast import-sab</code></td><td>Importér servere fra en SABnzbd-ini.</td></tr>
+</table>
+<p class="dim">Også tilgængelige: <code>inspect</code>, <code>probe</code>,
+<code>bench</code>, <code>bench-cpu</code>, <code>soak</code>, <code>fetch</code>,
+<code>spots</code>/<code>spot-search</code>/<code>spot-get</code> (Spotnet),
+<code>make-release-nzb</code>/<code>make-test-nzb</code> (test-fixtures). Hver
+kommando tager <code>--config</code> og <code>--help</code>. Dertil kommer <code>post</code>: den uploader filer som
+yEnc-artikler og skriver den tilhørende NZB. Et driftsværktøj; det kræver et
+udtrykkeligt <code>--post-server</code> og vælger aldrig en server for dig.</p>
+
+<h2 id="api">16 · API-oversigt</h2>
+<p>Basis-endpoint: <code>http://host:6789/api?mode=…&amp;apikey=…&amp;output=json</code> -
+SABnzbd-kompatibelt, så eksisterende SAB-integrationer virker uændret. To nøgler:
+<b>API-nøglen</b> (fuld kontrol) og <b>NZB-nøglen</b> (kun-tilføj:
+<code>addfile</code>/<code>addurl</code>).</p>
+<table>
+<tr><th>Område</th><th>Modes</th></tr>
+<tr><td>Kø</td><td><code>queue</code> (med <code>name=delete/pause/resume/priority/switch</code>), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>retry</code>, <code>set_password</code></td></tr>
+<tr><td>Info</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code></td></tr>
+<tr><td>Konfiguration</td><td><code>get_config</code>, <code>config&amp;name=&lt;setting&gt;&amp;value=…</code> (hvert Indstillinger-felt), <code>server_save/delete/test/enable/reorder</code>, <code>import_probe/apply</code></td></tr>
+<tr><td>Indeks &amp; væg</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, plus newznab på <code>/api?t=caps|search|tvsearch|movie</code> og <code>/getnzb/&lt;id&gt;</code></td></tr>
+<tr><td>Automatisering</td><td><code>watchlist</code>, <code>watchlist_check_now</code>, <code>watch_calendar</code>, <code>feeds</code>, <code>smart_folders</code>, <code>schedule</code></td></tr>
+<tr><td>Diagnostik</td><td><code>sysbench</code>, <code>bench_history</code>, <code>connladder</code>, <code>pooltest</code>, <code>diversity</code>, <code>update_check</code>, <code>update_apply</code></td></tr>
+<tr><td>NZBGet JSON-RPC</td><td><code>/jsonrpc</code> - status, listgroups, history, append, editqueue, rate, pause, log (Basic auth: enhver bruger, API-nøgle som adgangskode)</td></tr>
+<tr><td>Forhåndsvisning / afspilning</td><td><code>/stream/&lt;nzo_id&gt;</code> (HTTP-ranges; at starte et parkeret biblioteksjob kræver <code>?t=</code>-token eller nøgle), <code>/m3u/&lt;id&gt;</code> (kræver nøgle; udsteder token'en), <code>/wall</code>, <code>/art/…</code></td></tr>
+</table>
+
+<h2 id="files">17 · Filer &amp; placeringer</h2>
+<table>
+<tr><th>Fil</th><th>Indhold</th></tr>
+<tr><td><code>config.local.json</code></td><td>Server-loginoplysninger og indstillinger pr. server. Oprettet af guiden; kan redigeres under Indstillinger. Hold den privat.</td></tr>
+<tr><td><code>settings.json</code></td><td>Hver indstilling, der er ændret i dashboardet. Ligger ved siden af konfigurationen; UI-værdier tilsidesætter kommandolinje-flag. Slet en nøgle (eller filen) for at falde tilbage til flag/standarder.</td></tr>
+<tr><td><code>index.db</code></td><td>Release-indekset (SQLite) + væg-metadata. Sikkert at slette - det genopbygges ved scanning (Indstillinger → Indeksering → Slet gør dette for dig).</td></tr>
+<tr><td><code>&lt;downloads&gt;/.spool/</code></td><td>Kø-tilstand (overlever genstarter), NZB'er pr. job, forbrugsregnskab, benchmark-historik, poster-artwork-cache.</td></tr>
+<tr><td>Artikel-journal</td><td>Inde i hvert jobs outputmappe, mens det er ufuldstændigt - driver crash-genoptagelse og nyt forsøg. Fjernes ved succes.</td></tr>
+<tr><td>Eksterne værktøjer</td><td>Ingen nødvendige - RAR-udpakning og PAR2-reparation er native. Hvis et eksotisk sæt nogensinde kræver en ekstern <code>unrar</code> eller <code>par2</code> som fallback, kigger nzbfast ved siden af sin eksekverbare fil, derefter på <code>$PATH</code>.</td></tr>
+</table>
+
+<h2 id="troubleshooting">18 · Fejlfinding</h2>
+<table>
+<tr><th>Symptom</th><th>Tjek</th></tr>
+<tr><td>Langsomme downloads</td><td>Kør <b>System-benchmark</b> - den udpeger flaskehalsen direkte. Er det netværket: kør <b>Forbindelsestuning</b>, tjek antal forbindelser pr. server, og bekræft, at dine udbydere ikke alle er én backbone (<b>Server-diversitet</b>).</td></tr>
+<tr><td>Langsom kun på meget store jobs<br>(NAS eller maskine med lidt RAM)</td><td>Forventet og måleligt: et udsultet hukommelsesbudget spiller caches til disk og koster 20–40% efter ~87 GB. Se <a href="#memory">Hukommelsesbudget</a> for tallene og hvor meget RAM, den skal have. Mindre jobs er upåvirkede.</td></tr>
+<tr><td>Download fejler med "articles missing"</td><td>Posten er udløbet eller blev fjernet hos dine udbydere. En anden udbyder på en anden backbone redder de fleste af disse. <code>nzbfast check</code> forudsiger dette før download. Og væggen markerer på forhånd de sandsynligt forsvundne med sin
+tilgængelighedsprik (<a href="#oracle">§13</a>). En første fejl af den type prøver sig
+selv igen én gang efter en ventetid, for propagationsforsinkelse ser præcis sådan ud og
+løser sig selv.</td></tr>
+<tr><td>Færdigt arkiv vil have en adgangskode</td><td>Historik-rækken viser 🔑 - indtast adgangskoden der; jobbet bliver færdigt på stedet. </td></tr>
+<tr><td>Sonarr/Radarr kan ikke forbinde</td><td>Kan port 6789 nås? API-nøgle korrekt (fuld nøgle, ikke NZB-nøgle)? Klienttype sat til SABnzbd?</td></tr>
+<tr><td>Gennemse-kortet forbliver lille</td><td>Indexeren vokser i baggrunden - tjek, at grupper er sat under Indstillinger → Indeksering, og giv Uddyb pr. scanning tid til at opbygge historik. "Scan nu" fremtvinger en gennemgang; statuslinjen viser live fremgang.</td></tr>
+<tr><td>Væggen viser forkert/intet artwork</td><td>Detaljeark → ✎ Ret match eller ↻ Genopfrisk metadata. Filmopslag forbedres med en gratis OMDb-nøgle.</td></tr>
+<tr><td>Daemonen vil ikke starte: porten er i brug</td><td>En anden instans kører - eller skift <code>--port</code>.</td></tr>
+<tr><td>Hvor er loggene?</td><td>Log-kortet på dashboardet, eller den terminal/logfil, du startede <code>serve</code> med.</td></tr>
+</table>
+<div class="note"><b>Stadig gået i stå?</b>Log-kortet udpeger som regel synderen -
+vedlæg dens hale, når du rapporterer et problem, sammen med din
+<code>nzbfast --version</code>.</div>
+
+<hr>
+<p class="dim">nzbfast - denne manual følger med hver udgivelse. Indstillinger, endpoints
+og standarder, der er nævnt her, svarer til den version, den blev leveret med.</p>
+
+</main>
+</div>
+</body>
+</html>

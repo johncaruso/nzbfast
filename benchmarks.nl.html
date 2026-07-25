@@ -30,7 +30,9 @@
 <header><div class="wrap">
   <a class="logo" href="index.nl.html"><span class="bolt">⚡</span> nzbfast</a>
   <nav>
+    <a href="index.nl.html" class="home">Home</a>
     <a href="features.nl.html">Functies</a>
+    <a href="indexer.nl.html">Indexer</a>
     <a href="benchmarks.nl.html" class="on">Benchmarks</a>
     <a href="MANUAL.html">Documentatie</a>
     <a href="https://github.com/nzbfast/nzbfast" title="Broncode-repository">GitHub</a>
@@ -49,7 +51,7 @@
 
 <div class="wrap" data-benchtoc style="padding:10px 0 2px">
   <p class="kicker">Op deze pagina</p>
-  <nav aria-label="Op deze pagina" style="display:flex;flex-wrap:wrap;gap:7px"><a href="#setup" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">De opzet</a><a href="#huge-190" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">190.6 GB → één mkv van 167.9 GB (Europa, 10 GbE)</a><a href="#by-job-size" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Tijd tot bruikbaar bestand, per taakgrootte</a><a href="#hash-named-35" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">35 GB hash-benoemd 4K → bruikbare mkv (oostkust VS)</a><a href="#queue" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">De lijn brandend houden over een wachtrij (oostkust VS, ~43 GB)</a><a href="#legs-we-lose" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">De legs die we niet winnen</a><a href="#low-memory" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">De low-memory-ladder: 190 GB in ~1.1 GB RAM</a><a href="#nested" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Tien geneste vormen: wie is klaar zonder jou</a><a href="#unpack-repair" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">De uitpak- en herstel-engines, solo geracet</a><a href="#client-matrix" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Wat elke client kan</a><a href="#real-lines" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">De engine verzadigt echte lijnen</a></nav>
+  <nav aria-label="Op deze pagina" style="display:flex;flex-wrap:wrap;gap:7px"><a href="#setup" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">De opzet</a><a href="#huge-190" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">190.6 GB → één mkv van 167.9 GB (Europa, 10 GbE)</a><a href="#by-job-size" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Tijd tot bruikbaar bestand, per taakgrootte</a><a href="#hash-named-35" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">35 GB hash-benoemd 4K → bruikbare mkv (oostkust VS)</a><a href="#queue" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">De lijn brandend houden over een wachtrij (oostkust VS, ~43 GB)</a><a href="#legs-we-lose" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">De legs die we niet winnen</a><a href="#low-memory" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">De low-memory-ladder: 190 GB in ~1.1 GB RAM</a><a href="#nested" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Tien geneste vormen: wie is klaar zonder jou</a><a href="#unpack-repair" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">De uitpak- en herstel-engines, solo geracet</a><a href="#client-matrix" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Wat elke client kan</a><a href="#real-lines" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">De engine verzadigt echte lijnen</a></nav>
 </div>
 <section style="padding-top:26px" id="setup">
   <div class="wrap">
@@ -59,7 +61,7 @@
       <li><b>Clients:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 (de dichtstbijzijnde Rust-tegenhanger), allemaal op dezelfde machine per scenario (Apple M-serie machines: "Europa" M1 Ultra op 10&nbsp;GbE, "oostkust VS" M3 Ultra ~2.4–3.0 Gbps-lijn).</li>
       <li><b>Eerlijkheid:</b> dezelfde 6 providers × 8 verbindingen, overal TLS, legs afwisselend achter elkaar uitgevoerd. Elke concurrent afgesteld op z'n gedocumenteerde optimum: SABnzbd kreeg <code>pipelining_requests=8</code> (<b>standaard staat die op 1, dus ongepipelined</b>; alleen die instelling al bracht z'n 190 GB-tijd terug van 24m24s naar 19m02s), NZBGet kreeg ArticleCache/DirectWrite/DirectUnpack/ParQuick, rustnzb z'n gedocumenteerde config.</li>
       <li><b>Eindtoestand:</b> een geverifieerd, uitgepakt, bruikbaar bestand, niet "download klaar". Daar wacht je namelijk echt op.</li>
-      <li><b>Reproduceerbaarheid:</b> elke claim is te herleiden tot een gedateerde vermelding in onze benchmarklog, vastgelegd met de driver-scripts die hem produceerden: wall-clock + interface-bytetellers + piek-RSS van de processtructuur, resolutie van 1–2 s.</li>
+      <li><b>Reproduceerbaarheid:</b> elke claim is te herleiden tot een gedateerde vermelding in onze benchmarklog, vastgelegd met de driver-scripts die hem produceerden: verstreken tijd + interface-bytetellers + piek-RSS van de processtructuur, resolutie van 1–2 s.</li>
     </ul>
   </div>
 </section>
@@ -139,7 +141,7 @@
     <div class="tblwrap"><table>
       <thead><tr><th></th><th>nzbfast</th><th>rustnzb</th><th>NZBGet</th><th>SABnzbd</th></tr></thead>
       <tbody>
-        <tr><td>wachtrij-wall-time</td><td class="win">122 s</td><td class="num">136 s</td><td class="num">162 s</td><td class="num">277 s</td></tr>
+        <tr><td>tijd om de wachtrij af te ronden</td><td class="win">122 s</td><td class="num">136 s</td><td class="num">162 s</td><td class="num">277 s</td></tr>
         <tr><td>lijn inactief (&lt;20 MB/s)</td><td class="win">2 s (2%)</td><td class="num">16 s (12%)</td><td class="num">0 s</td><td class="bad">168 s (61%)</td></tr>
       </tbody>
     </table></div>
@@ -156,22 +158,14 @@
   <div class="wrap">
     <p class="kicker">De eerlijke kolom</p>
     <h2>De legs die we niet winnen</h2>
-    <div class="grid2">
-      <div class="card"><h3>Beschadigde store-mode post</h3>
-        <p>20 vergiftigde artikelen in een REMUX van 7.4 GB: NZBGet is bruikbaar klaar in <b>53 s</b>, nzbfast
-        in <b>58 s</b>. Ons herstel is klaar in 32 s, pakt alle 62 volumes opnieuw uit, en de uitvoer is
-        byte-exact, en het haalt een bijna-theoretisch-minimum van 22 recovery-blokken op voor de 20
-        benodigde, tegenover de volledige PAR2-pass van NZBGet. Maar NZBGet wint de leg met vijf seconden,
-        dus hier staat hij.</p></div>
+    <div>
       <div class="card"><h3>Par-only reconstructie</h3>
         <p>De poster verwijderde elk data-artikel en liet alleen een PAR2-set met 100% redundantie achter.
         Alle vier de clients herbouwen de hele volumeset uit pariteit; NZBGet doet het het snelst, <b>8 s</b>
         tegenover onze <b>19 s</b> op een post van 1.5 GB (rustnzb 49 s, SABnzbd 6m 30s). Een complete set
         uit het niets herbouwen is de ene herstelvorm waarin een in-stream-engine geen voorsprong heeft.</p></div>
     </div>
-    <div class="callout">Waarom überhaupt een verlies laten zien? Omdat de overwinningen alleen geloofwaardig
-    zijn náást dat ene verlies. Elk getal op deze pagina komt uit dezelfde afwisselende runs, en de repo
-    bewaart het geheel als een volledig labjournaal, negatieve resultaten incluis.</div>
+    <div class="callout">Waarom überhaupt een verlies laten zien? Omdat de overwinningen alleen geloofwaardig zijn náást dat ene verlies. Elk getal op deze pagina komt uit dezelfde afwisselende runs, en een run die we verliezen blijft gepubliceerd totdat een nieuwe meting hem vervangt.</div>
   </div>
 </section>
 
@@ -303,9 +297,7 @@
       <li><b>Backpressure-bewijs</b>: begrens de schrijffase 4× onder het netwerk en de invoer klemt zich binnen 2 s op de limiet vast ±1%, RAM <i>daalt</i>, nul swaps. Een trage schijf kan het geheugen nooit laten opzwellen.</li>
       <li><b>Rekenmarge</b>: gemeten decode+verify-plafonds van 86–165 Gbps op Apple silicon. Het netwerk is de bottleneck met een factor 4–50× op elke geteste machine.</li>
     </ul>
-    <div class="callout">Vaste regel uit de repo: <b>elke prestatieclaim citeert een reproduceerbaar
-    commando en de omstandigheden waaronder het draaide.</b> Het geheel wordt in de repo bijgehouden als een
-    gedateerd labjournaal, inclusief negatieve resultaten en doodlopende wegen.</div>
+    <div class="callout"><b>Vaste regel: elke prestatieclaim vermeldt de omstandigheden waaronder hij draaide</b>, inclusief negatieve resultaten en doodlopende wegen.</div>
   </div>
 </section>
 
@@ -313,7 +305,9 @@
   <div class="cols">
     <div>⚡ <b>nzbfast</b> - de one-pass Usenet-downloader.</div>
     <div>
+      <a href="index.nl.html">Home</a> ·
       <a href="features.nl.html">Functies</a> ·
+      <a href="indexer.nl.html">Indexer</a> ·
       <a href="benchmarks.nl.html">Benchmarks</a> ·
       <a href="download.nl.html">Download</a> ·
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>

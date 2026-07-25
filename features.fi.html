@@ -30,7 +30,9 @@
 <header><div class="wrap">
   <a class="logo" href="index.fi.html"><span class="bolt">⚡</span> nzbfast</a>
   <nav>
+    <a href="index.fi.html" class="home">Etusivu</a>
     <a href="features.fi.html" class="on">Ominaisuudet</a>
+    <a href="indexer.fi.html">Indeksoija</a>
     <a href="benchmarks.fi.html">Vertailut</a>
     <a href="MANUAL.html">Ohjeet</a>
     <a href="https://github.com/nzbfast/nzbfast" title="Lähdekoodivarasto">GitHub</a>
@@ -98,7 +100,7 @@
         <li><b>Kirjoita kerran.</b> Dekoodatut artikkelit kirjoitetaan (pwrite) suoraan lopullisiin tiedostosiirtymiinsä. Ei väliaikaistiedostoja, ei erillistä kokoamisvaihetta.</li>
         <li><b>Virransisäinen PAR2-varmistus.</b> Jokainen lohko MD5-tiivistetään dekoodauspuskureista sen saapuessa, joten varmistus valmistuu samalla hetkellä kuin lataus. Se päihittää pikatarkistuksen, johon muut asiakkaat tyytyvät, eikä maksa mitään.</li>
         <li><b>Suora purku:</b> store-tilan RAR-julkaisut (useimmat scene-julkaisut) kartoitetaan ja puretaan latauksen aikana, joten osat eivät koskaan päädy levylle. Levykirjoitukset ovat sisältö × 1.0 ja tarvittava levy 1×, siinä missä muut haluavat noin 2×.</li>
-        <li><b>Sisäkkäiset arkistot, yhä yksi läpimeno.</b> Arkistot arkistojen sisällä - RAR RARin sisällä, 7z RARin sisällä, useita tasoja syvät tikkaat - puretaan sisäkkäisyydestään lennossa sen sijaan, että ne kirjoitettaisiin levylle ja avattaisiin uudelleen. Yksi kopio levyllä siinä missä kirjoita-ja-skannaa-uudelleen-lähestymistapa pitää kaksi.</li>
+        <li><b>Sisäkkäiset arkistot, ja syvyys ei juuri maksa mitään.</b> Arkistot arkistojen sisällä - RAR RAR:in sisällä, 7z RAR:in sisällä, monen tason tikkaat - puretaan sitä mukaa kuin tavut saapuvat, sen saman ajon sisällä jonka jo teimme. Siinä on koko ero: asiakas joka kirjoittaa jokaisen kerroksen levylle, sulkee sen, avaa uudelleen ja lukee läpi, maksaa täyden ajon jokaisesta tasosta, joten jokainen taso alaspäin maksaa sille vielä yhden kierroksen levyn kautta. Meidän kerroksemme kulkevat mukana ensimmäisessä ajossa, ja hyötykuorma tulee ulos kymmenen tason tikkailta samalla tavalla kuin yhden tason. Yksi kopio levyllä siinä missä kirjoita-ja-lue-uudelleen pitää kahta tai kolmea.</li>
         <li><b>Peittelyn purku.</b> Peitellyt julkaisut nimetään uudelleen niiden PAR2-metatiedoista, ROT13-sekoitetut nimet pelastetaan, ja tiivistenimetty roska luokitellaan ja portitetaan pois.</li>
       </ul>
       <ul class="plain">
@@ -106,7 +108,7 @@
         <li><b>RAR-palautustietueet.</b> Kun PAR2 on käytetty loppuun, tai sitä ei koskaan julkaistu, RAR-osiin upotetut palautustietueet korjaavat vioittuneet osat paikoillaan.</li>
         <li><b>Korjaus joka syvyydellä.</b> Sisemmän kerroksen sisään pakattu PAR2-sarja löydetään ja ajetaan omalla tasollaan, ja pelkät parit sisältävä julkaisu (data poistettu, jäljellä 100% palautuksen sarja) rakennetaan kokonaan uudelleen ja puretaan sitten.</li>
         <li><b>Pakattu ja salattu varajärjestely:</b> ei-store-julkaisut kirjoittuvat levylle ja puretaan natiivilla RAR-moottorilla, kaikki RAR4:stä uuteen RAR7:ään, muun jonon kanssa limitettynä. Salatut sarjat pysäköidään selkeällä viestillä sen sijaan, että ne kaatuisivat hiljaa.</li>
-        <li><b>Salasanojen käsittely.</b> Salasanat tulevat *arr-API:sta, <code>{{pw}}</code>-tiedostonimikäytännöstä tai NZB-metatiedoista. Lopuille 🔑-lukituksen avaus koontinäytöllä hoitaa homman: se avaa lukituksen taustalla ja arkistoi sitten normaalisti. Ketjutetut salasanat ratkeavat itsestään: kun yhden kerroksen purku tuottaa seuraavan kerroksen salasanatiedoston, se luetaan ja otetaan käyttöön automaattisesti.</li>
+        <li><b>Se etsii salasanan itse.</b> Useimmat salatut postaukset eivät tarvitse sinua. Se kokeilee NZB:n omia metatietoja ja <code>{{pw}}</code>-nimeämiskäytäntöä, *arr-rajapintaa, sitten mitä tahansa lyhyttä tekstimuistiinpanoa tiedostojen vierestä, ja viimeisenä julkaisun ja tiedostojen omia nimiä. Se toistaa haun <i>jokaisella</i> tasolla: ketju, joka piilottaa kunkin kerroksen salasanan sen yläpuoliseen kerrokseen - eri salasana joka tasolla - aukeaa pohjaan asti ilman että kirjoitat mitään. Se mikä oikeasti jää jäljelle, hoituu koontinäytön 🔑-avauksella: se avaa taustalla ja arkistoi sitten normaalisti.</li>
         <li><b>Turvakaiteet.</b> Korjatut lähdeosat kirjoitussuojataan uudelleenpurun ajaksi, valmiin tiedoston oma tarkistussumma varmistetaan päästä päähän (oletuksena päällä), ja paluukoodi ilmoittaa ”onnistui” vain kun lopputila on aidosti käyttökelpoinen.</li>
       </ul>
     </div>
@@ -143,7 +145,7 @@
         <li><b>SABnzbd-yhteensopiva API:</b> koko se pinta, jota *arrit oikeasti käyttävät: addfile/addurl, kategoriat, prioriteetit, työkohtainen keskeytä/jatka, uudelleenyritys, sivutus, kaksitasoiset API-avaimet. Sonarr ja Radarr juttelevat sille kuin se olisi SABnzbd.</li>
         <li><b>NZBGet JSON-RPC -julkisivu.</b> nzb360, LunaSea ja muut NZBGet-kaukosäätimet yhdistävät muuttamatta.</li>
         <li><b>Newznab-palvelin.</b> Paikallinen indeksisi vastaa kyselyihin t=search/tvsearch/movie, joten *arrit voivat kohdella omia skannauksiasi indeksoijana.</li>
-        <li><b>RSS-automaattinappaus:</b> syötteet suodatettuina NZBGet-tyylisellä kielellä, lisättyinä ja muokattuina livenä koontinäytöltä.</li>
+        <li><b>RSS-automaattinappaus:</b> indeksoijan syöte on sama asia, jota uutislukija tilaa, paitsi että se luettelee sen, mitä Usenetiin on juuri lähetetty. Kaikki suodattimiin osuva latautuu itsestään. Syötteet suodatettuina NZBGet-tyylisellä kielellä, lisättyinä ja muokattuina livenä koontinäytöltä.</li>
         <li><b>Seurantalista.</b> Nimeä haluamasi sarjat ja elokuvat, myös vielä esittämättömät. Jokainen jakso napataan heti sen ensiesiintymisellä ja päivitetään, kunnes se saavuttaa tavoitelaatusi (vaikkapa 720p → 1080p REMUX), ja korvattu kopio poistetaan vasta kun päivitys on varmistettu. Esityspäiväkalenteri näyttää, mitä on tulossa.</li>
       </ul>
       <ul class="plain">
@@ -161,33 +163,6 @@
 
 <section class="alt">
   <div class="wrap">
-    <h2>Indeksoija &amp; julisteseinä</h2>
-    <p class="lead">Skannaa ryhmät, joista välität, yksityiseen indeksiin ja selaa lopputulosta
-    julisteseinänä. Jokainen metatiedon murunen tulee avaimettomista julkisista lähteistä, jotka oma
-    asennuksesi hakee. Ei ainoatakaan API-avainta anottavaksi.</p>
-    <figure class="shot"><img src="assets/wall-sheet.jpg" alt="Julisteseinän tietosivu arvosanalla, näyttelijöillä, juonella ja jaksomerkeillä" loading="lazy"></figure>
-    <div style="height:26px"></div>
-    <div class="grid2">
-      <ul class="plain">
-        <li><b>Jatkuva ryhmäskanneri.</b> Inkrementaaliset OVER-skannaukset ajetaan aikataulusi mukaan nopeudella ~43k otsaketta/s haaroitetuilla yhteyksillä, neuvotellen pakatut otsakkeet (RFC 8054) siellä missä palvelin niitä tarjoaa. Ensiskannaukset puolittavat päivämäärävälin, joten <code>--max-age 2y</code> ohittaa vuosien otsakkeet noin 20 luotaimella.</li>
-        <li><b>Sisäänoton portit:</b> tyyppi-, vuosi-, resoluutio-, kieli- ja kokosuodattimet pitävät indeksoijaroskan poissa tietokannastasi, ja peitelty roska havaitaan ja portitetaan oletuksena.</li>
-        <li><b>Scene-nimijäsennin.</b> Se poimii nimikkeen, vuoden, jakson, laadun ja lähteen tosielämän rungoista (mukaan lukien päivämääräkoodatut dailyt, moniosakoodit ja ROT13-peitellyt nimet) ja tiivistää julkaisut yhteen korttiin per nimike.</li>
-        <li><b>Pikahaku:</b> haku kirjoittaessa laatusuodattimin, rivikohtaisin seurantapainikkein ja laatumerkein kaikkialla.</li>
-        <li><b>Poistojen tunnistus.</b> Taustalla ajettava saatavuusnäytteistys huomaa, kun ryhmää niitetään, ja merkitsee sen julkaisut, joten jo poistettavana oleva julkaisu ei tuhlaa nappausta.</li>
-      </ul>
-      <ul class="plain">
-        <li><b>Avaimeton rikastus.</b> TVmaze TV:lle, iTunes Search elokuville, sekä julkiset arvosana-aineistot, Wikidata, Wikipedia ja AniList täyttävät julisteet, arvosanat ja äänimäärät, näyttelijät, genret ja juonet. OMDb- ja TMDB-avaimet toimivat, jos sinulla on, mutta mikään ei niitä vaadi.</li>
-        <li><b>Jaksoruudukot:</b> kausikohtaiset merkit, joissa kunkin jakson paras enkoodaus on napsautuksen päässä latauksesta, kausipaketit merkittyinä ja ”seuraa sarjaa” jokaisen kausiotsikon kohdalla.</li>
-        <li><b>Trendirivit:</b> uutta tällä viikolla- ja juuri nyt kuumaa -nauhat julkaisutiheydestä koottuina.</li>
-        <li><b>Seinä, joka oppii.</b> ”Ei kiinnosta” piilottaa nimikkeen ja opettaa pysyvän säännön; ”Sinulle”-järjestys lajittelee seinän sen makuprofiilin mukaan, jonka omat nappauksesi rakentavat. Kaikki tämä pysyy paikallisena.</li>
-        <li><b>Korjaa mikä tahansa.</b> Väärä osuma? Valitse ehdokkaista tai kirjoita oikea identiteetti itse. Mitään käsin asettamaasi ei koskaan ylikirjoiteta. Osoita juliste URL:iin tai lataa oma. Yksi painike rikastaa yksittäisen nimikkeen uudelleen, toinen pyyhkii ja rakentaa koko indeksin uudelleen.</li>
-      </ul>
-    </div>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
     <h2>Esikatselu &amp; kirjasto</h2>
     <ul class="plain">
       <li><b>Esikatsele ennen valmistumista.</b> ▶ Toista antaa käyttöjärjestelmäsi soittimelle daemonin tarjoaman .m3u:n, joten voit vahvistaa, että lataus on juuri se, mitä halusit, odottamatta sen valmistumista. Hyppää pidemmälle, niin tarvitsemasi artikkelit nousevat jonon kärkeen.</li>
@@ -196,15 +171,15 @@
   </div>
 </section>
 
-<section class="alt">
+<section>
   <div class="wrap">
     <h2>Koontinäyttö &amp; asetukset</h2>
-    <div class="strip">
-      <figure><div class="shot"><img src="assets/dash-browse.png" alt="Jono tiedostokohtaisella laatikolla ja indeksin selauskortti" loading="lazy"></div>
+    <div class="shots">
+      <figure><div class="shot"><img src="assets/dash-queue-drawer.png" alt="Jono latauskohtaisella tietolaatikolla: tiedostokohtaiset edistymispalkit, varmistuslohkot, palvelinkohtainen osuus" loading="lazy"></div>
         <figcaption>Jonolaatikko: tiedostokohtaiset palkit, varmistuslohkot, palvelinkohtainen osuus.</figcaption></figure>
       <figure><div class="shot"><img src="assets/settings-top.png" alt="Asetukset: palvelineditori ja live-nopeuden/ajastuksen hallinta" loading="lazy"></div>
         <figcaption>Jokainen asetus muokattavissa selaimessa. Useimmat astuvat voimaan livenä.</figcaption></figure>
-      <figure><div class="shot" style="max-width:320px;margin:0 auto"><img src="assets/mobile-dash.png" alt="Koontinäytön puhelinasettelu" loading="lazy"></div>
+      <figure class="phone"><div class="shot"><img src="assets/mobile-dash.png" alt="Koontinäytön puhelinasettelu" loading="lazy"></div>
         <figcaption>Kunnollinen puhelinasettelu, sama daemon.</figcaption></figure>
     </div>
     <div style="height:10px"></div>
@@ -226,7 +201,7 @@
   </div>
 </section>
 
-<section>
+<section class="alt">
   <div class="wrap">
     <h2>Käyttöönotto</h2>
     <ul class="plain">
@@ -244,7 +219,9 @@
   <div class="cols">
     <div>⚡ <b>nzbfast</b> - yhden läpimenon Usenet-lataaja.</div>
     <div>
+      <a href="index.fi.html">Etusivu</a> ·
       <a href="features.fi.html">Ominaisuudet</a> ·
+      <a href="indexer.fi.html">Indeksoija</a> ·
       <a href="benchmarks.fi.html">Vertailut</a> ·
       <a href="download.fi.html">Lataa</a> ·
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>

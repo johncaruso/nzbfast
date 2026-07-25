@@ -30,7 +30,9 @@
 <header><div class="wrap">
   <a class="logo" href="index.html"><span class="bolt">⚡</span> nzbfast</a>
   <nav>
+    <a href="index.html" class="home">Home</a>
     <a href="features.html">Features</a>
+    <a href="indexer.html">Indexer</a>
     <a href="benchmarks.html" class="on">Benchmarks</a>
     <a href="MANUAL.html">Docs</a>
     <a href="https://github.com/nzbfast/nzbfast" title="Source repository">GitHub</a>
@@ -49,7 +51,7 @@
 
 <div class="wrap" data-benchtoc style="padding:10px 0 2px">
   <p class="kicker">On this page</p>
-  <nav aria-label="On this page" style="display:flex;flex-wrap:wrap;gap:7px"><a href="#setup" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">The setup</a><a href="#huge-190" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">190.6 GB → single 167.9 GB mkv (Europe, 10 GbE)</a><a href="#by-job-size" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Time to usable file, by job size</a><a href="#hash-named-35" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">35 GB hash-named 4K → usable mkv (East Coast)</a><a href="#queue" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Keeping the line lit across a queue (East Coast, ~43 GB)</a><a href="#legs-we-lose" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">The legs we don&#x27;t win</a><a href="#low-memory" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">The low-memory ladder: 190 GB in ~1.1 GB of RAM</a><a href="#nested" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Ten nested shapes: who finishes without you</a><a href="#client-ceiling" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Client ceiling: 9.68 GB served from RAM, and you can rebuild it</a><a href="#unpack-repair" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">The more technical benchmarks, for people who like more data</a><a href="#client-matrix" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">What each client can do</a><a href="#real-lines" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">The engine saturates real lines</a></nav>
+  <nav aria-label="On this page" style="display:flex;flex-wrap:wrap;gap:7px"><a href="#setup" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">The setup</a><a href="#huge-190" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">190.6 GB → single 167.9 GB mkv (Europe, 10 GbE)</a><a href="#by-job-size" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Time to usable file, by job size</a><a href="#hash-named-35" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">35 GB hash-named 4K → usable mkv (East Coast)</a><a href="#queue" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Keeping the line lit across a queue (East Coast, ~43 GB)</a><a href="#legs-we-lose" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">The legs we don&#x27;t win</a><a href="#low-memory" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">The low-memory ladder: 190 GB in ~1.1 GB of RAM</a><a href="#nested" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Ten nested shapes: who finishes without you</a><a href="#client-ceiling" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Client ceiling: 9.68 GB served from RAM, and you can rebuild it</a><a href="#unpack-repair" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">The more technical benchmarks, for people who like more data</a><a href="#client-matrix" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">What each client can do</a><a href="#real-lines" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">The engine saturates real lines</a></nav>
 </div>
 <section style="padding-top:26px" id="setup">
   <div class="wrap">
@@ -59,7 +61,7 @@
       <li><b>Clients:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 · Weaver, all on the same machine per scenario (Apple M-series boxes: "Europe" M1 Ultra on 10&nbsp;GbE, "East Coast" M3 Ultra ~2.4–3.0 Gbps line). The provider legs below predate Weaver's inclusion; it appears in the reproducible client-ceiling leg.</li>
       <li><b>Fairness:</b> same 6 providers × 8 connections, TLS everywhere, legs run back-to-back interleaved. Every competitor tuned to its documented best: SABnzbd got <code>pipelining_requests=8</code> (<b>it ships 1, i.e. unpipelined</b>; that setting alone took its 190 GB time from 24m24s to 19m02s), NZBGet got ArticleCache/DirectWrite/DirectUnpack/ParQuick, rustnzb its documented config.</li>
       <li><b>End state:</b> a verified, extracted, usable file, not "download finished". That's what you actually wait for.</li>
-      <li><b>Reproducibility:</b> every claim traces to a dated entry in our benchmark log, recorded with the driver scripts that produced it: wall-clock + interface byte counters + process-tree peak RSS, 1–2 s resolution.</li>
+      <li><b>Reproducibility:</b> every claim is dated and measured the same way: elapsed time + interface byte counters + process-tree peak RSS, 1–2 s resolution. Where a leg runs on a publicly posted NZB, we name it so you can run it yourself.</li>
     </ul>
   </div>
 </section>
@@ -139,7 +141,7 @@
     <div class="tblwrap"><table>
       <thead><tr><th></th><th>nzbfast</th><th>rustnzb</th><th>NZBGet</th><th>SABnzbd</th></tr></thead>
       <tbody>
-        <tr><td>queue wall time</td><td class="win">122 s</td><td class="num">136 s</td><td class="num">162 s</td><td class="num">277 s</td></tr>
+        <tr><td>time to finish the queue</td><td class="win">122 s</td><td class="num">136 s</td><td class="num">162 s</td><td class="num">277 s</td></tr>
         <tr><td>line idle (&lt;20 MB/s)</td><td class="win">2 s (2%)</td><td class="num">16 s (12%)</td><td class="num">0 s</td><td class="bad">168 s (61%)</td></tr>
       </tbody>
     </table></div>
@@ -156,12 +158,7 @@
   <div class="wrap">
     <p class="kicker">The honest column</p>
     <h2>The legs we don't win</h2>
-    <div class="grid2">
-      <div class="card"><h3>Damaged store-mode post</h3>
-        <p>20 poisoned articles in a 7.4 GB REMUX: NZBGet finishes usable in <b>53 s</b>, nzbfast
-        in <b>58 s</b>. Our repair completes in 32 s, re-extracts all 62 volumes, and the output is
-        byte-exact, and it pulls a near-theoretical-minimum 22 recovery blocks for the 20 needed,
-        against NZBGet's full PAR2 pass. But NZBGet takes the leg by five seconds, so here it is.</p></div>
+    <div>
       <div class="card"><h3>Par-only reconstruction</h3>
         <p>The poster deleted every data article and left only a 100%-redundancy PAR2 set. All four
         clients rebuild the whole volume set from parity; NZBGet does it fastest, <b>8 s</b> to our
@@ -169,8 +166,8 @@
         nothing is the one repair shape where an in-stream engine has no edge.</p></div>
     </div>
     <div class="callout">Why show a loss at all? Because the wins are only believable next to it.
-    Every number on this page comes from the same interleaved runs, and the repo keeps the whole
-    thing as a full lab notebook, negative results included.</div>
+    Every number on this page comes from the same interleaved runs, and a leg we lose stays
+    published until a re-run replaces it.</div>
   </div>
 </section>
 
@@ -296,11 +293,11 @@
     <div class="chips">
       <span class="chip"><b>3</b> machines, laptop to 32-core</span>
       <span class="chip"><b>8</b> RAR archive shapes</span>
-      <span class="chip"><b>7</b> extractors raced</span>
+      <span class="chip"><b>6</b> extractors raced</span>
       <span class="chip"><b>best of 3</b> interleaved, warm cache</span>
     </div>
 
-    <h3 style="margin:38px 0 4px">RAR extraction: 8 archive shapes, 7 tools</h3>
+    <h3 style="margin:38px 0 4px">RAR extraction: 8 archive shapes, 6 tools</h3>
     <p class="note" style="text-align:start;margin-top:6px">Each bar is our time as a fraction of
     <b>unrar 7.23</b>, RARLab's own reference implementation and the fastest of the field on most
     shapes. Full track = unrar. 32-core desktop, best of 3, tools interleaved inside each round.</p>
@@ -315,39 +312,40 @@
       <div class="bar me"><span>store</span><span class="trk"><i style="width:100%"></i></span><span class="t">0.05 s vs 0.05 · tie</span></div>
     </div>
 
-    <p class="note" style="text-align:start"><b>The whole field, wall seconds, lower is better.</b>
+    <p class="note" style="text-align:start"><b>The whole field, seconds, lower is better.</b>
     Same eight archives on all three machines. Archives were created by official <code>rar</code>
-    7.23 so no tool is judged on input from its own encoder.</p>
+    7.23 so no tool is judged on input from its own encoder. <code>rarpar</code> is Weaver's own
+    RAR and PAR2 code, built from source at HEAD.</p>
     <div class="tblwrap"><table>
-      <thead><tr><th>shape</th><th>nzbfast</th><th>unrar 7.23</th><th>unar</th><th>rars 0.4.7</th><th>bsdtar</th><th>7-Zip</th></tr></thead>
+      <thead><tr><th>shape</th><th>nzbfast</th><th>unrar 7.23</th><th>rarpar</th><th>unar</th><th>rars 0.4.7</th><th>bsdtar</th></tr></thead>
       <tbody>
         <tr><td colspan="7" class="grp">High-end desktop, 32 cores</td></tr>
-        <tr><td>store 200 MB</td><td><b>0.05</b></td><td>0.05</td><td>0.13</td><td>0.15</td><td>0.08</td><td>0.07</td></tr>
-        <tr><td>big, 3 volumes</td><td><b>0.49</b></td><td>0.75</td><td>2.32</td><td>2.60</td><td class="no">wrong output²</td><td class="no">unsup</td></tr>
-        <tr><td>400 small files</td><td><b>0.13</b></td><td>0.66</td><td>1.96</td><td>2.13</td><td>4.79</td><td class="no">unsup</td></tr>
-        <tr><td>solid</td><td><b>0.50</b></td><td>0.87</td><td>2.40</td><td>3.06</td><td>5.25</td><td class="no">unsup</td></tr>
-        <tr><td>repetitive</td><td><b>0.03</b></td><td>0.04</td><td>0.08</td><td>0.14</td><td>0.19</td><td class="no">unsup</td></tr>
-        <tr><td>encrypted</td><td><b>0.49</b></td><td>0.82</td><td>3.10</td><td>6.95</td><td class="no">unsup</td><td class="no">unsup</td></tr>
-        <tr><td>RAR4</td><td><b>0.78</b></td><td>1.36</td><td class="no">reject³</td><td>1.29</td><td class="no">reject³</td><td class="no">unsup</td></tr>
-        <tr><td>128 MB dictionary</td><td><b>0.71</b></td><td>0.92</td><td>2.77</td><td>3.03</td><td class="no">unsup</td><td class="no">unsup</td></tr>
+        <tr><td>store 200 MB</td><td><b>0.05</b></td><td>0.05</td><td>0.06</td><td>0.13</td><td>0.15</td><td>0.08</td></tr>
+        <tr><td>big, 3 volumes</td><td><b>0.49</b></td><td>0.75</td><td>0.77</td><td>2.32</td><td>2.60</td><td class="no">wrong output²</td></tr>
+        <tr><td>400 small files</td><td><b>0.13</b></td><td>0.66</td><td>0.83</td><td>1.96</td><td>2.13</td><td>4.79</td></tr>
+        <tr><td>solid</td><td><b>0.50</b></td><td>0.87</td><td>1.05</td><td>2.40</td><td>3.06</td><td>5.25</td></tr>
+        <tr><td>repetitive</td><td><b>0.03</b></td><td>0.04</td><td>0.04</td><td>0.08</td><td>0.14</td><td>0.19</td></tr>
+        <tr><td>encrypted</td><td><b>0.49</b></td><td>0.82</td><td>0.77</td><td>3.10</td><td>6.95</td><td class="no">unsup</td></tr>
+        <tr><td>RAR4</td><td><b>0.78</b></td><td>1.36</td><td class="no">reject³</td><td class="no">reject³</td><td>1.29</td><td class="no">reject³</td></tr>
+        <tr><td>128 MB dictionary</td><td><b>0.71</b></td><td>0.92</td><td>1.00</td><td>2.77</td><td>3.03</td><td class="no">unsup</td></tr>
         <tr><td colspan="7" class="grp">Older desktop, 20 cores</td></tr>
-        <tr><td>store 200 MB</td><td><b>0.05</b></td><td>0.05</td><td>0.13</td><td>0.16</td><td>0.07</td><td>0.07</td></tr>
-        <tr><td>big, 3 volumes</td><td><b>0.49</b></td><td>0.89</td><td>2.42</td><td>2.91</td><td class="no">wrong output²</td><td class="no">unsup</td></tr>
-        <tr><td>400 small files</td><td><b>0.16</b></td><td>0.81</td><td>2.19</td><td>2.55</td><td>4.63</td><td class="no">unsup</td></tr>
-        <tr><td>solid</td><td><b>0.54</b></td><td>1.05</td><td>2.49</td><td>3.57</td><td>4.96</td><td class="no">unsup</td></tr>
-        <tr><td>repetitive</td><td><b>0.03</b></td><td>0.04</td><td>0.10</td><td>0.16</td><td>0.21</td><td class="no">unsup</td></tr>
-        <tr><td>encrypted</td><td><b>0.49</b></td><td>0.99</td><td>3.45</td><td>8.08</td><td class="no">unsup</td><td class="no">unsup</td></tr>
-        <tr><td>RAR4</td><td><b>0.97</b></td><td>1.78</td><td class="no">reject³</td><td>1.62</td><td class="no">reject³</td><td class="no">unsup</td></tr>
-        <tr><td>128 MB dictionary</td><td><b>0.71</b></td><td>1.15</td><td>2.88</td><td>3.18</td><td class="no">unsup</td><td class="no">unsup</td></tr>
+        <tr><td>store 200 MB</td><td><b>0.05</b></td><td>0.05</td><td>0.06</td><td>0.13</td><td>0.16</td><td>0.07</td></tr>
+        <tr><td>big, 3 volumes</td><td><b>0.49</b></td><td>0.89</td><td>0.79</td><td>2.42</td><td>2.91</td><td class="no">wrong output²</td></tr>
+        <tr><td>400 small files</td><td><b>0.16</b></td><td>0.81</td><td>0.98</td><td>2.19</td><td>2.55</td><td>4.63</td></tr>
+        <tr><td>solid</td><td><b>0.54</b></td><td>1.05</td><td>1.14</td><td>2.49</td><td>3.57</td><td>4.96</td></tr>
+        <tr><td>repetitive</td><td><b>0.03</b></td><td>0.04</td><td>0.04</td><td>0.10</td><td>0.16</td><td>0.21</td></tr>
+        <tr><td>encrypted</td><td><b>0.49</b></td><td>0.99</td><td>0.81</td><td>3.45</td><td>8.08</td><td class="no">unsup</td></tr>
+        <tr><td>RAR4</td><td><b>0.97</b></td><td>1.78</td><td class="no">reject³</td><td class="no">reject³</td><td>1.62</td><td class="no">reject³</td></tr>
+        <tr><td>128 MB dictionary</td><td><b>0.71</b></td><td>1.15</td><td>1.03</td><td>2.88</td><td>3.18</td><td class="no">unsup</td></tr>
         <tr><td colspan="7" class="grp">Laptop, 14 cores / 20 threads, Windows⁴</td></tr>
-        <tr><td>store 200 MB</td><td><b>0.08</b></td><td>0.16</td><td class="no">no CLI</td><td>0.24</td><td>0.17</td><td>0.16</td></tr>
-        <tr><td>big, 3 volumes</td><td><b>0.66</b></td><td>1.28</td><td class="no">no CLI</td><td>6.16</td><td class="no">wrong output²</td><td>1.42</td></tr>
-        <tr><td>400 small files</td><td><b>0.29</b></td><td>1.29</td><td class="no">no CLI</td><td>4.26</td><td>2.27</td><td>1.46</td></tr>
-        <tr><td>solid</td><td><b>0.71</b></td><td>1.62</td><td class="no">no CLI</td><td>20.91</td><td>2.75</td><td>1.76</td></tr>
-        <tr><td>repetitive</td><td><b>0.07</b></td><td>0.14</td><td class="no">no CLI</td><td>0.28</td><td>0.14</td><td>0.11</td></tr>
-        <tr><td>encrypted</td><td><b>0.66</b></td><td>1.30</td><td class="no">no CLI</td><td class="no">fail</td><td class="no">unsup</td><td>1.44</td></tr>
-        <tr><td>RAR4</td><td><b>0.89</b></td><td>1.51</td><td class="no">no CLI</td><td>2.30</td><td class="no">reject³</td><td class="no">reject³</td></tr>
-        <tr><td>128 MB dictionary</td><td><b>0.85</b></td><td>1.42</td><td class="no">no CLI</td><td>7.55</td><td class="no">unsup</td><td>1.66</td></tr>
+        <tr><td>store 200 MB</td><td><b>0.08</b></td><td>0.16</td><td>0.16</td><td class="no">no CLI</td><td>0.24</td><td>0.17</td></tr>
+        <tr><td>big, 3 volumes</td><td><b>0.66</b></td><td>1.28</td><td>1.10</td><td class="no">no CLI</td><td>6.16</td><td class="no">wrong output²</td></tr>
+        <tr><td>400 small files</td><td><b>0.29</b></td><td>1.29</td><td>2.14</td><td class="no">no CLI</td><td>4.26</td><td>2.27</td></tr>
+        <tr><td>solid</td><td><b>0.71</b></td><td>1.62</td><td>2.15</td><td class="no">no CLI</td><td>20.91</td><td>2.75</td></tr>
+        <tr><td>repetitive</td><td><b>0.07</b></td><td>0.14</td><td>0.09</td><td class="no">no CLI</td><td>0.28</td><td>0.14</td></tr>
+        <tr><td>encrypted</td><td><b>0.66</b></td><td>1.30</td><td>1.13</td><td class="no">no CLI</td><td class="no">fail</td><td class="no">unsup</td></tr>
+        <tr><td>RAR4</td><td><b>0.89</b></td><td>1.51</td><td class="no">reject³</td><td class="no">no CLI</td><td>2.30</td><td class="no">reject³</td></tr>
+        <tr><td>128 MB dictionary</td><td><b>0.85</b></td><td>1.42</td><td>1.32</td><td class="no">no CLI</td><td>7.55</td><td class="no">unsup</td></tr>
       </tbody>
     </table></div>
     <p class="note" style="text-align:start">The margins are <i>widest</i> on the laptop, not the
@@ -358,8 +356,7 @@
     ² bsdtar has no RAR5 multi-volume support and silently produced a truncated file, so that leg is
     a correctness failure, not a slow time. ³ <code>rar</code> 7.x can no longer create RAR4, so
     that one archive comes from the rars encoder (unrar-validated); several tools reject it.
-    ⁴ Windows 7-Zip carries the unRAR codec so it competes on every shape, unlike the Homebrew
-    build; unar has no Windows CLI.</p>
+    ⁴ unar has no Windows CLI, so the laptop field is five tools.</p>
 
     <h3 style="margin:44px 0 4px">PAR2 verify and repair: 1 GiB set, 101 damaged blocks</h3>
     <p class="note" style="text-align:start;margin-top:6px">Corpus: 1 GiB payload packed store-mode
@@ -421,16 +418,14 @@
     its own instance of the corpus recipe, so the field there is internally consistent; the shipping
     build measures 0.39 s verify and 1.02 s repair on the shared corpus.</p>
     <p class="note" style="text-align:start"><b>What we deliberately do not do:</b> we never
-    <i>create</i> PAR2. A downloader has no reason to, and ParPar owns that leg. We also buy wall
-    time with memory on both engines: extraction peaks around 240 MB against unrar's 41 MB, and
+    <i>create</i> PAR2. A downloader has no reason to, and ParPar owns that leg. We also buy speed
+    with memory on both engines: extraction peaks around 240 MB against unrar's 41 MB, and
     verify around 126 MB against turbo's 7 MB, because these are the inline engines that ride a
     live download rather than standalone one-shots. If you want the smallest possible resident set
     for a standalone job, the dedicated tools still win that column.</p>
-    <div class="callout">Every number on this page comes out of a dated lab notebook kept in the
-    repository, negative results and abandoned approaches included, with the exact command and
-    conditions for each run. <a href="https://github.com/nzbfast/nzbfast/blob/main/BENCHMARKS.md">Read
-    the raw notebook</a> if you want the CPU-seconds, peak-RSS and per-run spread behind these
-    medians.</div>
+    <div class="callout">Every number on this page is a dated run with its exact command and
+    conditions recorded, negative results and abandoned approaches included. These pages are the
+    published record, and they get fleshed out as further rounds land.</div>
   </div>
 </section>
 
@@ -477,9 +472,8 @@
       <li><b>Backpressure proof</b>: cap the write stage 4× below the network and input locks to the cap ±1% within 2 s, RAM <i>falls</i>, zero swaps. A slow disk can never balloon memory.</li>
       <li><b>Compute headroom</b>: measured decode+verify ceilings of 86–165 Gbps on Apple silicon. The network is the bottleneck by 4–50× on every machine tested.</li>
     </ul>
-    <div class="callout">Standing rule from the repo: <b>every perf claim cites a reproducible
-    command and the conditions it ran under.</b> The whole thing lives in the repo as a dated
-    lab notebook, negative results and wrong turns included.</div>
+    <div class="callout">Standing rule: <b>every performance claim cites the conditions it ran
+    under</b>, negative results and wrong turns included.</div>
   </div>
 </section>
 
@@ -487,7 +481,9 @@
   <div class="cols">
     <div>⚡ <b>nzbfast</b> - the one-pass Usenet downloader.</div>
     <div>
+      <a href="index.html">Home</a> ·
       <a href="features.html">Features</a> ·
+      <a href="indexer.html">Indexer</a> ·
       <a href="benchmarks.html">Benchmarks</a> ·
       <a href="download.html">Download</a> ·
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>

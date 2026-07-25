@@ -30,7 +30,9 @@
 <header><div class="wrap">
   <a class="logo" href="index.ro.html"><span class="bolt">⚡</span> nzbfast</a>
   <nav>
+    <a href="index.ro.html" class="home">Acasă</a>
     <a href="features.ro.html" class="on">Funcții</a>
+    <a href="indexer.ro.html">Indexer</a>
     <a href="benchmarks.ro.html">Benchmark-uri</a>
     <a href="MANUAL.html">Documentație</a>
     <a href="https://github.com/nzbfast/nzbfast" title="Source repository">GitHub</a>
@@ -98,7 +100,7 @@
         <li><b>Scrie o singură dată.</b> Articolele decodate sunt scrise (pwrite) direct la offset-urile lor finale din fișier. Fără fișiere temporare, fără o trecere separată de asamblare.</li>
         <li><b>Verificare PAR2 în flux.</b> Fiecare bloc primește un hash MD5 din bufferele de decodare pe măsură ce sosește, așa că verificarea se încheie exact în momentul în care se termină descărcarea. E mai riguroasă decât verificarea rapidă cu care se mulțumesc ceilalți clienți și nu costă nimic.</li>
         <li><b>Extragere directă:</b> postările RAR în mod store (majoritatea release-urilor scene) sunt mapate și extrase chiar în timpul descărcării, așa că volumele nu ajung deloc pe disc. Se scrie pe disc conținut × 1.0, iar discul necesar e 1×, acolo unde alții cer cam 2×.</li>
-        <li><b>Arhive imbricate, tot într-o singură trecere.</b> Arhivele din interiorul arhivelor - RAR în RAR, 7z în RAR, scări adânci de mai multe niveluri - sunt dezimbricate din mers, în loc să fie scrise pe disc și deschise din nou. O singură copie pe disc, acolo unde o abordare de tip scrie-pe-disc-și-rescanează ține două.</li>
+        <li><b>Arhive imbricate, iar adâncimea aproape nu costă nimic.</b> Arhivele din arhive - RAR în RAR, 7z într-un RAR, scări adânci de multe niveluri - sunt dezimbricate pe măsură ce sosesc octeții, în interiorul trecerii pe care oricum o făceam. Aici e toată diferența: un client care scrie fiecare strat pe disc, îl închide, îl redeschide și îl scanează din nou plătește o trecere întreagă per nivel, așa că fiecare strat coborât îl costă încă un drum dus-întors pe disc. Ale noastre merg în prima trecere, iar conținutul iese dintr-o scară de zece niveluri la fel cum iese dintr-una de un nivel. O copie pe disc, acolo unde scrie-și-rescanează ține două sau trei.</li>
         <li><b>Deobfuscare.</b> Postările obfuscate sunt redenumite din metadatele lor PAR2, numele amestecate cu ROT13 sunt recuperate, iar gunoiul cu nume de tip hash e clasificat și blocat.</li>
       </ul>
       <ul class="plain">
@@ -106,7 +108,7 @@
         <li><b>Înregistrări de recuperare RAR.</b> Când PAR2 e epuizat, sau nu a fost postat niciodată, înregistrările de recuperare RAR încorporate repară volumele deteriorate pe loc.</li>
         <li><b>Reparare la orice adâncime.</b> Un set PAR2 împachetat într-un strat interior e găsit și rulat la propriul lui nivel, iar o postare doar-par (datele șterse, lăsat în urmă un set cu recuperare 100%) e reconstruită întreagă și apoi despachetată.</li>
         <li><b>Rezervă pentru comprimat și criptat:</b> postările non-store se materializează și se dezarhivează prin motorul RAR nativ, totul de la RAR4 până la noul RAR7, suprapuse cu restul cozii. Seturile criptate sunt parcate cu un mesaj clar, în loc să eșueze în tăcere.</li>
-        <li><b>Gestionarea parolelor.</b> Parolele vin din API-ul *arr, din convenția de denumire <code>{{pw}}</code> sau din metadatele NZB. Pentru ce rămâne, o deblocare 🔑 din panou preia ștafeta: deblochează în fundal, apoi arhivează normal. Parolele înlănțuite se rezolvă singure: când extragerea unui strat produce fișierul cu parola stratului următor, acesta e citit și folosit automat.</li>
+        <li><b>Caută singur parola.</b> Majoritatea postărilor criptate nu au nevoie de tine. Încearcă metadatele NZB-ului și convenția de nume <code>{{pw}}</code>, API-ul *arr, apoi orice notiță text scurtă postată lângă fișiere și, în lipsa lor, numele release-ului și ale fișierelor. Reia căutarea la <i>fiecare</i> nivel: un lanț care ascunde parola fiecărui strat în stratul de deasupra - o parolă diferită la fiecare nivel - se deschide până la capăt fără să tastezi nimic. Ce rămâne cu adevărat trece prin deblocarea 🔑 din panou: deblochează în fundal, apoi arhivează normal.</li>
         <li><b>Bariere de siguranță.</b> Volumele sursă reparate sunt protejate la scriere cât timp rulează reextragerea, suma de control proprie a fișierului final e verificată cap-coadă (activată implicit), iar codul de ieșire raportează „succes” doar când starea finală e cu adevărat utilizabilă.</li>
       </ul>
     </div>
@@ -143,7 +145,7 @@
         <li><b>API compatibil SABnzbd:</b> toată suprafața pe care o folosesc efectiv *arr-urile: addfile/addurl, categorii, priorități, pauză/reluare per job, reîncercare, paginare, chei API pe două niveluri. Sonarr și Radarr vorbesc cu el ca și cum ar fi SABnzbd.</li>
         <li><b>Fațadă NZBGet JSON-RPC.</b> nzb360, LunaSea și alte telecomenzi NZBGet se conectează nemodificate.</li>
         <li><b>Server Newznab.</b> Indexul tău local răspunde la t=search/tvsearch/movie, așa că *arr-urile pot trata propriile tale scanări ca pe un indexer.</li>
-        <li><b>Preluare automată RSS:</b> feeduri filtrate cu un limbaj în stil NZBGet, adăugate și editate live din panou.</li>
+        <li><b>Preluare automată RSS:</b> fluxul unui indexator este același lucru la care se abonează un cititor de știri, doar că listează ce tocmai a fost postat pe Usenet. Tot ce se potrivește cu filtrele se descarcă singur. Feeduri filtrate cu un limbaj în stil NZBGet, adăugate și editate live din panou.</li>
         <li><b>Watchlist.</b> Enumeră serialele și filmele pe care le vrei, chiar și pe cele încă nedifuzate. Fiecare episod e preluat la prima apariție și îmbunătățit până atinge calitatea-țintă (de pildă, 720p → 1080p REMUX), iar copia înlocuită e ștearsă abia după ce upgrade-ul a fost verificat. Un calendar de difuzare arată ce urmează.</li>
       </ul>
       <ul class="plain">
@@ -161,33 +163,6 @@
 
 <section class="alt">
   <div class="wrap">
-    <h2>Indexerul și peretele de postere</h2>
-    <p class="lead">Scanează grupurile care te interesează într-un index privat, apoi răsfoiește-l ca un
-    perete de postere. Toate metadatele provin din surse publice fără cheie preluate de instalarea ta.
-    Nu există nicio cheie API de cerșit.</p>
-    <figure class="shot"><img src="assets/wall-sheet.jpg" alt="Fișă de detalii a peretelui de postere cu notă, distribuție, sinopsis și insigne de episod" loading="lazy"></figure>
-    <div style="height:26px"></div>
-    <div class="grid2">
-      <ul class="plain">
-        <li><b>Scaner continuu de grupuri.</b> Scanările OVER incrementale rulează după programul tău, la ~43k antete/s pe conexiuni distribuite, negociind antete comprimate (RFC 8054) acolo unde un server le oferă. Primele scanări sunt bisectate după dată, așa că <code>--max-age 2y</code> sare peste ani de antete în circa 20 de sonde.</li>
-        <li><b>Filtre de preluare:</b> filtrele pe tip, an, rezoluție, limbă și dimensiune țin spamul de indexer departe de baza ta de date, iar gunoiul obfuscat e prins și blocat implicit.</li>
-        <li><b>Parser de nume scene.</b> Extrage titlul, anul, episodul, calitatea și sursa din tulpini reale (inclusiv episoade zilnice codate cu dată, coduri multi-episod și nume obfuscate cu ROT13) și deduplică release-urile la un singur card per titlu.</li>
-        <li><b>Căutare instantanee:</b> cauți pe măsură ce scrii, cu filtre de calitate, butoane de urmărire pe fiecare rând și insigne de calitate peste tot.</li>
-        <li><b>Detectarea retragerilor.</b> Eșantionarea disponibilității în fundal observă când un grup e secerat și marchează release-urile lui cu o insignă, așa că o postare aflată deja în curs de retragere nu irosește o descărcare.</li>
-      </ul>
-      <ul class="plain">
-        <li><b>Îmbogățire fără cheie.</b> TVmaze pentru TV, iTunes Search pentru filme, plus seturi de date publice de note, Wikidata, Wikipedia și AniList completează posterele, notele și numărul de voturi, distribuția, genurile și subiectele. Cheile OMDb și TMDB funcționează dacă le ai, dar nimic nu are nevoie de vreuna.</li>
-        <li><b>Grile de episoade:</b> insigne per sezon, cu cea mai bună codare a fiecărui episod la un clic distanță de descărcare, pachetele de sezon marcate și un „urmărește seria” pe fiecare antet de sezon.</li>
-        <li><b>Rânduri în tendințe:</b> fâșii „noi săptămâna aceasta” și „populare acum”, construite din frecvența postărilor.</li>
-        <li><b>Un perete care învață.</b> „Nu mă interesează” ascunde un titlu și învață o regulă permanentă; sortarea „Pentru tine” ordonează peretele după profilul de gusturi pe care îl construiesc propriile tale descărcări. Totul rămâne local.</li>
-        <li><b>Corectează orice.</b> Potrivire greșită? Alege dintre candidați sau scrie pur și simplu identitatea corectă. Nimic din ce setezi manual nu e vreodată suprascris. Indică un poster printr-un URL sau încarcă unul. Un buton reîmbogățește un singur titlu; altul șterge și reconstruiește tot indexul.</li>
-      </ul>
-    </div>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
     <h2>Previzualizare și bibliotecă</h2>
     <ul class="plain">
       <li><b>Previzualizează înainte să se termine.</b> ▶ Redă îi predă playerului sistemului tău un .m3u servit de daemon, ca să confirmi că o descărcare e chiar ce ai vrut, fără să aștepți să se finalizeze. Sari mai în față și articolele de care ai nevoie trec în capul cozii.</li>
@@ -196,15 +171,15 @@
   </div>
 </section>
 
-<section class="alt">
+<section>
   <div class="wrap">
     <h2>Panou și setări</h2>
-    <div class="strip">
-      <figure><div class="shot"><img src="assets/dash-browse.png" alt="Coadă cu sertar per fișier și card de răsfoire a indexului" loading="lazy"></div>
+    <div class="shots">
+      <figure><div class="shot"><img src="assets/dash-queue-drawer.png" alt="Coadă cu un sertar de detalii per descărcare: bare de progres per fișier, blocuri de verificare, contribuție per server" loading="lazy"></div>
         <figcaption>Sertarul cozii: bare per fișier, blocuri de verificare, contribuție per server.</figcaption></figure>
       <figure><div class="shot"><img src="assets/settings-top.png" alt="Setări: editor de servere și controale live de viteză/programare" loading="lazy"></div>
         <figcaption>Fiecare setare editabilă în browser. Majoritatea se aplică live.</figcaption></figure>
-      <figure><div class="shot" style="max-width:320px;margin:0 auto"><img src="assets/mobile-dash.png" alt="Aspectul de telefon al panoului" loading="lazy"></div>
+      <figure class="phone"><div class="shot"><img src="assets/mobile-dash.png" alt="Aspectul de telefon al panoului" loading="lazy"></div>
         <figcaption>Aspect de telefon așa cum trebuie, același daemon.</figcaption></figure>
     </div>
     <div style="height:10px"></div>
@@ -226,7 +201,7 @@
   </div>
 </section>
 
-<section>
+<section class="alt">
   <div class="wrap">
     <h2>Implementare</h2>
     <ul class="plain">
@@ -244,7 +219,9 @@
   <div class="cols">
     <div>⚡ <b>nzbfast</b> - descărcătorul Usenet într-o singură trecere.</div>
     <div>
+      <a href="index.ro.html">Acasă</a> ·
       <a href="features.ro.html">Funcții</a> ·
+      <a href="indexer.ro.html">Indexer</a> ·
       <a href="benchmarks.ro.html">Benchmark-uri</a> ·
       <a href="download.ro.html">Descarcă</a> ·
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>

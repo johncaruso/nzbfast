@@ -30,7 +30,9 @@
 <header><div class="wrap">
   <a class="logo" href="index.nb.html"><span class="bolt">⚡</span> nzbfast</a>
   <nav>
+    <a href="index.nb.html" class="home">Hjem</a>
     <a href="features.nb.html">Funksjoner</a>
+    <a href="indexer.nb.html">Indekserer</a>
     <a href="benchmarks.nb.html" class="on">Ytelsestester</a>
     <a href="MANUAL.html">Dokumentasjon</a>
     <a href="https://github.com/nzbfast/nzbfast" title="Source repository">GitHub</a>
@@ -49,7 +51,7 @@
 
 <div class="wrap" data-benchtoc style="padding:10px 0 2px">
   <p class="kicker">På denne siden</p>
-  <nav aria-label="På denne siden" style="display:flex;flex-wrap:wrap;gap:7px"><a href="#setup" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Oppsettet</a><a href="#huge-190" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">190.6 GB → én enkelt 167.9 GB mkv (Europa, 10 GbE)</a><a href="#by-job-size" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Tid til brukbar fil, etter jobbstørrelse</a><a href="#hash-named-35" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">35 GB hash-navngitt 4K → brukbar mkv (østkysten)</a><a href="#queue" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Å holde linjen tent gjennom en kø (østkysten, ~43 GB)</a><a href="#legs-we-lose" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">De etappene vi ikke vinner</a><a href="#low-memory" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Lav-minne-stigen: 190 GB på ~1.1 GB RAM</a><a href="#nested" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Ti nøstede former: hvem blir ferdig uten deg</a><a href="#unpack-repair" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Utpakkings- og reparasjonsmotorene, i solokappløp</a><a href="#client-matrix" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Hva hver klient kan gjøre</a><a href="#real-lines" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85;white-space:nowrap">Motoren metter ekte linjer</a></nav>
+  <nav aria-label="På denne siden" style="display:flex;flex-wrap:wrap;gap:7px"><a href="#setup" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Oppsettet</a><a href="#huge-190" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">190.6 GB → én enkelt 167.9 GB mkv (Europa, 10 GbE)</a><a href="#by-job-size" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Tid til brukbar fil, etter jobbstørrelse</a><a href="#hash-named-35" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">35 GB hash-navngitt 4K → brukbar mkv (østkysten)</a><a href="#queue" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Å holde linjen tent gjennom en kø (østkysten, ~43 GB)</a><a href="#legs-we-lose" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">De etappene vi ikke vinner</a><a href="#low-memory" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Lav-minne-stigen: 190 GB på ~1.1 GB RAM</a><a href="#nested" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Ti nøstede former: hvem blir ferdig uten deg</a><a href="#unpack-repair" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Utpakkings- og reparasjonsmotorene, i solokappløp</a><a href="#client-matrix" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Hva hver klient kan gjøre</a><a href="#real-lines" style="font-size:12px;padding:3px 9px;border:1px solid rgba(128,128,128,.34);border-radius:999px;text-decoration:none;color:inherit;opacity:.85">Motoren metter ekte linjer</a></nav>
 </div>
 <section style="padding-top:26px" id="setup">
   <div class="wrap">
@@ -156,21 +158,14 @@
   <div class="wrap">
     <p class="kicker">Den ærlige spalten</p>
     <h2>De etappene vi ikke vinner</h2>
-    <div class="grid2">
-      <div class="card"><h3>Skadet store-mode-post</h3>
-        <p>20 forgiftede artikler i en 7.4 GB REMUX: NZBGet ble ferdig brukbar på <b>53 s</b>, nzbfast
-        på <b>58 s</b>. Reparasjonen vår er ferdig på 32 s, pakker ut alle 62 volumer på nytt, og utdataen
-        er byte-eksakt, og den henter et nær-teoretisk-minimum på 22 gjenopprettingsblokker for de 20
-        som trengs, mot NZBGets fulle PAR2-runde. Men NZBGet tar etappen med fem sekunder, så her er den.</p></div>
+    <div>
       <div class="card"><h3>Par-only-gjenoppbygging</h3>
         <p>Posteren slettet hver eneste dataartikkel og etterlot bare et PAR2-sett med 100 % redundans.
         Alle fire klientene gjenoppbygger hele volumsettet fra paritet; NZBGet gjør det raskest, <b>8 s</b>
         mot våre <b>19 s</b> på en 1.5 GB-post (rustnzb 49 s, SABnzbd 6m 30s). Å gjenoppbygge et helt sett
         fra ingenting er den ene reparasjonsformen der en motor i strømmen ikke har noe fortrinn.</p></div>
     </div>
-    <div class="callout">Hvorfor vise et tap i det hele tatt? Fordi seirene bare er troverdige ved siden av det.
-    Hvert tall på denne siden kommer fra de samme flettede kjøringene, og repoet holder hele greia
-    som en fullstendig laboratoriejournal, negative resultater inkludert.</div>
+    <div class="callout">Hvorfor vise et tap i det hele tatt? Fordi seirene bare er troverdige ved siden av det. Hvert tall på denne siden kommer fra de samme flettede kjøringene, og en test vi taper blir stående publisert til en ny kjøring erstatter den.</div>
   </div>
 </section>
 
@@ -301,9 +296,7 @@
       <li><b>Mottrykksbevis</b>: sett et tak på skrivestadiet 4× under nettverket, og inndata låses til taket ±1 % innen 2 s, RAM <i>faller</i>, null swaps. En treg disk kan aldri blåse opp minnet.</li>
       <li><b>CPU-margin</b>: målte dekode+verifiser-tak på 86–165 Gbps på Apple-silisium. Nettverket er flaskehalsen med 4–50× på hver maskin som er testet.</li>
     </ul>
-    <div class="callout">Stående regel fra repoet: <b>hvert ytelsesutsagn siterer en reproduserbar
-    kommando og betingelsene det kjørte under.</b> Alt sammen ligger i repoet som en datert
-    laboratoriejournal, negative resultater og feilspor inkludert.</div>
+    <div class="callout"><b>Stående regel: hvert ytelsesutsagn oppgir betingelsene det kjørte under</b>, negative resultater og feilspor inkludert.</div>
   </div>
 </section>
 
@@ -311,7 +304,9 @@
   <div class="cols">
     <div>⚡ <b>nzbfast</b> - Usenet-nedlasteren i én omgang.</div>
     <div>
+      <a href="index.nb.html">Hjem</a> ·
       <a href="features.nb.html">Funksjoner</a> ·
+      <a href="indexer.nb.html">Indekserer</a> ·
       <a href="benchmarks.nb.html">Ytelsestester</a> ·
       <a href="download.nb.html">Last ned</a> ·
       <a href="https://github.com/nzbfast/nzbfast">GitHub</a>
