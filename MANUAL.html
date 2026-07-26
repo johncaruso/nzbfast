@@ -92,9 +92,9 @@ hr{border:none;border-top:1px solid var(--line);margin:30px 0}
 <body>
 <div class="wrap">
 <nav>
-  <a class="brand" href="index.html">⚡ nzbfast <small>User Manual</small></a>
+  <a class="brand" href="/index.html">⚡ nzbfast <small>User Manual</small></a>
   <!-- i18n switcher: same markup in every language; hrefs never change -->
-  <div class="langsw" style="font-size:11.5px;margin-top:6px;color:var(--dim)"><a href="MANUAL.html">EN</a> · <a href="MANUAL.fr.html">FR</a> · <a href="MANUAL.de.html">DE</a> · <a href="MANUAL.it.html">IT</a> · <a href="MANUAL.es.html">ES</a> · <a href="MANUAL.nl.html">NL</a> · <a href="MANUAL.pt.html">PT</a> · <a href="MANUAL.sv.html">SV</a> · <a href="MANUAL.da.html">DA</a> · <a href="MANUAL.nb.html">NB</a> · <a href="MANUAL.fi.html">FI</a> · <a href="MANUAL.tr.html">TR</a> · <a href="MANUAL.ro.html">RO</a> · <a href="MANUAL.he.html">HE</a> · <a href="MANUAL.ar.html">AR</a> · <a href="MANUAL.fa.html">FA</a></div>
+  <div class="langsw" style="font-size:11.5px;margin-top:6px;color:var(--dim)"><a href="/manual">EN</a> · <a href="/manual/fr">FR</a> · <a href="/manual/de">DE</a> · <a href="/manual/it">IT</a> · <a href="/manual/es">ES</a> · <a href="/manual/nl">NL</a> · <a href="/manual/pt">PT</a> · <a href="/manual/sv">SV</a> · <a href="/manual/da">DA</a> · <a href="/manual/nb">NB</a> · <a href="/manual/fi">FI</a> · <a href="/manual/tr">TR</a> · <a href="/manual/ro">RO</a> · <a href="/manual/he">HE</a> · <a href="/manual/ar">AR</a> · <a href="/manual/fa">FA</a></div>
   <ol>
     <li><a href="#intro">1 · Welcome</a></li>
     <li><a href="#quickstart">2 · Quick start</a></li>
@@ -168,7 +168,7 @@ all. The figures are in <a href="#concepts">§3</a>.</p>
 The steps are below, under "From a terminal".</p>
 <h3>Windows</h3>
 <ol>
-  <li>Run <code>nzbfast-setup-&lt;version&gt;.exe</code>. It installs for your user
+  <li>Run <code>nzbfast-&lt;version&gt;-windows-x64-setup.exe</code>. It installs for your user
   only (no administrator password). Because this release is not yet code-signed,
   SmartScreen may show "Windows protected your PC". Click <b>More info</b> →
   <b>Run anyway</b>.</li>
@@ -190,6 +190,44 @@ Settings → Usenet servers → <b>Import from SABnzbd / NZBGet…</b> finds you
 installation and copies its servers over. There is also <code>nzbfast import-sab</code>
 on the command line.</div>
 
+<h3 id="firstrun-key">Your API key</h3>
+<p>On a genuinely new install, nzbfast makes itself an API key the first time the
+daemon starts, and prints it once in a banner just under the dashboard address.
+From then on every request needs that key, so the dashboard and the API are not
+open to everything that can reach the machine.</p>
+<p>What you do with it depends on how you started nzbfast:</p>
+<ul>
+  <li><b>The macOS app, the Windows tray, or <code>serve --open</code></b>: nothing.
+  They pass the key to the browser window they open, the dashboard remembers it,
+  and you are already signed in.</li>
+  <li><b>A browser you opened yourself</b>, or the dashboard on a phone or another
+  computer: the page asks for the key once and remembers it after that.</li>
+  <li><b>Sonarr, Radarr, nzb360 and friends</b>: paste it in as their SABnzbd or
+  NZBGet key (<a href="#arr">§11</a>, <a href="#remotes">§12</a>).</li>
+</ul>
+<p>The key is kept in a file called <code>apikey</code> beside your config file, so
+it stays the same across restarts and you can read it back whenever you need it.
+On macOS and Linux that file is readable only by the account that runs nzbfast.
+It is also in the daemon's own output, so the dashboard's Log card has it if the
+terminal has scrolled away.</p>
+<div class="note"><b>Upgrading changes nothing.</b>An install that already exists
+is left exactly as it was, key or no key. A key is only ever made on a first run -
+one with no dashboard settings and no saved queue - because a key appearing under
+a working install would lock out every Sonarr, Radarr and phone app you had
+already connected, on a restart you never connected to a settings change.</div>
+<p>To use a key of your own instead, type it into Settings → Security; it applies
+at once. That panel changes the key but never shows the current one, so read the
+<code>apikey</code> file if you need the generated value back. To run with no key
+at all, because something in front of nzbfast already handles sign-in, start it
+with <code>NZBFAST_OPEN=1</code> in the environment. nzbfast then stays open and
+says so plainly at startup.</p>
+<p>Which machines can reach the daemon at all is a separate choice:
+<code>serve --bind</code>. The default is <code>0.0.0.0</code>, meaning every
+network interface, because a NAS box, a phone, and a Sonarr on another computer
+all have to be able to connect. <code>--bind 127.0.0.1</code> narrows it to the
+machine nzbfast runs on, which is what you want on a single desktop where nothing
+else needs access.</p>
+
 <h2 id="concepts">3 · How nzbfast works</h2>
 <p>A quick vocabulary so the rest of the manual reads easily:</p>
 <table>
@@ -205,7 +243,7 @@ This is what you feed nzbfast.</td></tr>
 against it <em>during</em> the download and repairs automatically when articles are
 damaged or missing.</td></tr>
 <tr><td><b>Store-mode RAR</b></td><td>Most releases are packed into RAR volumes without
-compression. nzbfast recognises this and writes the <em>inner file</em> directly to its
+compression. nzbfast recognizes this and writes the <em>inner file</em> directly to its
 final location while downloading, with no unpack step afterwards.</td></tr>
 </table>
 <p>The pipeline runs download → decode → verify → extract <em>concurrently</em>. The
@@ -286,7 +324,7 @@ NZB client shows you this; it exists to prove a point: nzbfast will max your
 <p>Three lanes: download, verify (PAR2 blocks checked), extract. On a healthy job
 all three move together.</p>
 <h3 id="dash-providers">Providers</h3>
-<p>Per-server live rate, connection utilisation, share of traffic, session GB, and a
+<p>Per-server live rate, connection utilization, share of traffic, session GB, and a
 lifetime article-completion score (colored when a server drops below 98%). A stacked
 area chart shows each provider's contribution over time. Rows re-order by live
 performance every 10&nbsp;s (configurable in Settings → Interface) so your fastest
@@ -347,7 +385,7 @@ API or afterwards from History (🔑).</li>
 
 <h2 id="wall">6 · The poster wall</h2>
 <p>Click <b>🎬 wall</b> in the header. The wall turns your index into a media
-browser: every recognised film and TV release as a poster tile with rating, year,
+browser: every recognized film and TV release as a poster tile with rating, year,
 genres, cast and synopsis: your newsgroups, browsable as a catalogue.</p>
 <ul>
 <li><b>Tabs</b> for Films / TV / Other, instant search, and seven sort orders:
@@ -430,7 +468,7 @@ and restart.</p>
 </table>
 <ul>
 <li>The <b>tick</b> beside each server is its on/off switch: ticked means the server
-is in the download pool, unticked means it is disabled. A disabled server keeps its
+is in the download pool, unchecked means it is disabled. A disabled server keeps its
 credentials and settings and can still be tested; it is simply never asked for
 articles. Its row dims, the heading count ("2 of 3 active") drops, and the change
 applies from the <em>next</em> download. Handy for resting a block account you are
@@ -471,7 +509,7 @@ are right for most lines; use the tuning tools before raising blindly.</p>
 <p><b>Fast verify (CRC32)</b> (on by default) claims PAR2 blocks by CRC32 while the
 download is still running, which is 2-3x faster on a slow CPU. Every article's own
 checksum is still verified, and the final settle pass always uses full MD5, so this
-trades no correctness. Untick it to do per-block MD5 during the download too.</p>
+trades no correctness. Uncheck it to do per-block MD5 during the download too.</p>
 
 <h3>Disk &amp; quota <span class="pill live">live</span></h3>
 <p><b>Minimum free space</b> (pause new jobs below it), <b>download quota</b> per
@@ -499,7 +537,7 @@ completes. Raise it only for unusually deep releases.</p>
 <h3>Naming &amp; cleanup <span class="pill live">live</span></h3>
 <p><b>Rename finished downloads</b> (on by default) gives the folder and the main
 file a clean, informative name: a film becomes <code>Example Movie (2024)</code>,
-TV keeps <code>Show - S01E02</code>. Obfuscated or unrecognised names are left
+TV keeps <code>Show - S01E02</code>. Obfuscated or unrecognized names are left
 exactly as posted rather than guessed at.</p>
 <table>
 <tr><th>Setting</th><th>What it does</th></tr>
@@ -513,7 +551,7 @@ exactly as posted rather than guessed at.</p>
 </table>
 <p class="dim">The whole group runs after repair and unpack and before <b>Move
 completed to</b>, and is skipped entirely for a job still waiting on a password.
-Both delete steps apply <em>only</em> to releases recognised as film or TV: a
+Both delete steps apply <em>only</em> to releases recognized as film or TV: a
 software payload or an unclassifiable (obfuscated) set is never swept.</p>
 
 <h3>Folders &amp; processing</h3>
@@ -540,7 +578,10 @@ and <b>TV filing</b> (see <a href="#automation">§10</a>).</p>
 <h3>Library, Security, Interface</h3>
 <p><b>Library</b>: categories treated as instant library entries + re-check interval.
 <b>Security</b>: the full API key (everything) and the NZB key (add-only, safe to
-give indexer sites), both rotatable live. <b>Interface</b>: click sounds, desktop
+give indexer sites), both rotatable live. Either box replaces the key it belongs
+to as soon as you leave the field, and neither ever displays the current value -
+to read back the key nzbfast made for itself on the first run, see
+<a href="#firstrun-key">§2</a>. <b>Interface</b>: click sounds, desktop
 notifications on completion, provider re-sort interval.</p>
 <p><b>Speed units</b> <span class="pill live">live</span> decides how every speed in
 the dashboard is shown: megabytes (MB/s, the download-manager norm, the default) or
@@ -590,7 +631,7 @@ and it can act as their <em>indexer</em> too.</p>
 <ol>
 <li>In Sonarr/Radarr: Settings → Download Clients → add <b>SABnzbd</b>.</li>
 <li>Host: your nzbfast machine · Port: <b>6789</b> · API key: your full API key
-(Settings → Security; the QR/copy control is next to it).</li>
+(where to find it: <a href="#firstrun-key">§2</a>).</li>
 <li>Category as desired (e.g. <code>tv</code> / <code>movies</code>). Test → green check → Save.</li>
 </ol>
 <p>Queue, history, per-job status, "remove &amp; delete", retry and category routing
@@ -638,7 +679,7 @@ multi-connection probe), CPU verification rate, and disk write speed. It leads
 with the answer: <b>your expected maximum download speed and which ceiling is the
 limit</b>. The shortest bar is your bottleneck; the others show their headroom.
 Schedule it (6-hourly → weekly) and every run is logged to a history table, so you
-can see when your provider, ISP or hardware changed behaviour. Scheduled runs only
+can see when your provider, ISP or hardware changed behavior. Scheduled runs only
 happen while the queue is idle.</p>
 <h3 id="perf-tuning">Connection tuning</h3>
 <p>Measures one provider at rising connection counts and recommends the setting:
@@ -752,7 +793,7 @@ check URL does the same.</li>
 <table>
 <tr><th>Command</th><th>Purpose</th></tr>
 <tr><td><code>nzbfast setup</code></td><td>Interactive server setup.</td></tr>
-<tr><td><code>nzbfast serve</code></td><td>Run the daemon (dashboard + API + automation). <code>--open</code> opens the browser; see <code>--help</code> for the full flag list; every dashboard setting has a flag twin.</td></tr>
+<tr><td><code>nzbfast serve</code></td><td>Run the daemon (dashboard + API + automation). <code>--open</code> opens the browser; <code>--apikey</code> sets the key by hand (<a href="#firstrun-key">§2</a>); <code>--bind</code> chooses the listening address, default <code>0.0.0.0</code> (every interface), <code>127.0.0.1</code> for this machine only. See <code>--help</code> for the full flag list; every dashboard setting has a flag twin.</td></tr>
 <tr><td><code>nzbfast get file.nzb</code></td><td>Download one NZB, full pipeline, no daemon. <code>--preflight</code> aborts early if the post can't complete; <code>--password</code> for encrypted sets.</td></tr>
 <tr><td><code>nzbfast check file.nzb</code></td><td>Availability verdict (COMPLETE / REPAIRABLE / IMPOSSIBLE) without downloading payload.</td></tr>
 <tr><td><code>nzbfast verify DIR</code></td><td>Verify files against the PAR2 set in a directory.</td></tr>
@@ -791,6 +832,7 @@ the <b>API key</b> (full control) and the <b>NZB key</b> (add-only:
 <tr><th>File</th><th>Contents</th></tr>
 <tr><td><code>config.local.json</code></td><td>Server credentials and per-server options. Created by the wizard; editable in Settings. Keep it private.</td></tr>
 <tr><td><code>settings.json</code></td><td>Every setting changed in the dashboard. Lives next to the config; UI values override command-line flags. Delete a key (or the file) to fall back to flags/defaults.</td></tr>
+<tr><td><code>apikey</code></td><td>The API key nzbfast made for itself on a first run (<a href="#firstrun-key">§2</a>). Lives next to the config; readable only by the account running nzbfast on macOS and Linux. Do not delete it to get a fresh key: on an install that has already run, nothing replaces it and the daemon comes back up with no key at all. Set a new one in Settings → Security instead.</td></tr>
 <tr><td><code>index.db</code></td><td>The release index (SQLite) + wall metadata. Safe to delete: it rebuilds from scanning (Settings → Indexing → Wipe does this for you).</td></tr>
 <tr><td><code>&lt;config&gt;/.spool/</code></td><td>Queue state (survives restarts), per-job NZBs, usage ledger, benchmark history, poster art cache.</td></tr>
 <tr><td>Article journal</td><td>Inside each job's output folder while incomplete; powers crash resume and retry. Removed on success.</td></tr>
@@ -805,6 +847,8 @@ the <b>API key</b> (full control) and the <b>NZB key</b> (add-only:
 <tr><td>Download fails "articles missing"</td><td>The post has expired or was taken down on your providers. A second provider on a different backbone rescues most of these. <code>nzbfast check</code> predicts this before downloading, and the wall's availability dot (<a href="#oracle">§13</a>) flags the likely-gone ones in advance. A first failure of this shape retries itself once after a cooldown, since propagation lag looks identical and clears on its own.</td></tr>
 <tr><td>Finished archive wants a password</td><td>History row shows 🔑: enter the password there; the job completes in place.</td></tr>
 <tr><td>Sonarr/Radarr can't connect</td><td>Port 6789 reachable? API key correct (full key, not NZB key)? Client type set to SABnzbd?</td></tr>
+<tr><td>The dashboard asks for an API key I never set</td><td>A new install makes one for itself and prints it once at startup (<a href="#firstrun-key">§2</a>). It is in the <code>apikey</code> file next to your config, and in the startup output. Or type a key of your own into Settings → Security from a browser that is already signed in.</td></tr>
+<tr><td>Nothing on the network can reach the daemon</td><td>Check <code>--bind</code>: <code>127.0.0.1</code> serves only the machine nzbfast runs on. The default, <code>0.0.0.0</code>, serves every interface. Then check the machine's own firewall for port 6789.</td></tr>
 <tr><td>Browse card stays small</td><td>The indexer grows in the background. Check Settings → Indexing groups are set, and give Deepen per scan time to accumulate history. "Scan now" forces a pass; the status line shows live progress.</td></tr>
 <tr><td>Wall shows wrong/no artwork</td><td>Detail sheet → ✎ Fix match or ↻ Refresh metadata. Movie lookups improve with a free OMDb key.</td></tr>
 <tr><td>Daemon won't start: port in use</td><td>Another instance is running, or change <code>--port</code>.</td></tr>
