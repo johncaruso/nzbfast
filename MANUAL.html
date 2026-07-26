@@ -792,7 +792,7 @@ the <b>API key</b> (full control) and the <b>NZB key</b> (add-only:
 <tr><td><code>config.local.json</code></td><td>Server credentials and per-server options. Created by the wizard; editable in Settings. Keep it private.</td></tr>
 <tr><td><code>settings.json</code></td><td>Every setting changed in the dashboard. Lives next to the config; UI values override command-line flags. Delete a key (or the file) to fall back to flags/defaults.</td></tr>
 <tr><td><code>index.db</code></td><td>The release index (SQLite) + wall metadata. Safe to delete: it rebuilds from scanning (Settings → Indexing → Wipe does this for you).</td></tr>
-<tr><td><code>&lt;downloads&gt;/.spool/</code></td><td>Queue state (survives restarts), per-job NZBs, usage ledger, benchmark history, poster art cache.</td></tr>
+<tr><td><code>&lt;config&gt;/.spool/</code></td><td>Queue state (survives restarts), per-job NZBs, usage ledger, benchmark history, poster art cache.</td></tr>
 <tr><td>Article journal</td><td>Inside each job's output folder while incomplete; powers crash resume and retry. Removed on success.</td></tr>
 <tr><td>External tools</td><td>None needed: RAR extraction and PAR2 repair are native. If an exotic set ever needs an external <code>unrar</code> or <code>par2</code> as a fallback, nzbfast looks next to its executable, then on <code>$PATH</code>.</td></tr>
 </table>

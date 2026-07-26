@@ -834,7 +834,7 @@ NZB</b> (solo inserimento: <code>addfile</code>/<code>addurl</code>).</p>
 <tr><td><code>config.local.json</code></td><td>Credenziali dei server e opzioni per server. Creato dalla procedura guidata; modificabile nelle Impostazioni. Tienilo privato.</td></tr>
 <tr><td><code>settings.json</code></td><td>Ogni impostazione cambiata dalla dashboard. Sta accanto al config; i valori dell'interfaccia prevalgono sui flag da riga di comando. Elimina una chiave (o il file) per tornare a flag e valori predefiniti.</td></tr>
 <tr><td><code>index.db</code></td><td>L'indice delle release (SQLite) + i metadati della bacheca. Si può eliminare senza rischi - si ricostruisce con la scansione (Impostazioni → Indicizzazione → Azzera lo fa per te).</td></tr>
-<tr><td><code>&lt;downloads&gt;/.spool/</code></td><td>Stato della coda (sopravvive ai riavvii), NZB per job, registro dei consumi, storico dei benchmark, cache delle copertine.</td></tr>
+<tr><td><code>&lt;config&gt;/.spool/</code></td><td>Stato della coda (sopravvive ai riavvii), NZB per job, registro dei consumi, storico dei benchmark, cache delle copertine.</td></tr>
 <tr><td>Journal degli articoli</td><td>Dentro la cartella di output di ogni job finché incompleto - alimenta la ripresa dopo crash e Riprova. Rimosso a successo avvenuto.</td></tr>
 <tr><td>Strumenti esterni</td><td>Nessuno necessario - l'estrazione RAR e la riparazione PAR2 sono native. Se un set esotico dovesse mai richiedere un <code>unrar</code> o <code>par2</code> esterno come ripiego, nzbfast cerca accanto al proprio eseguibile, poi nel <code>$PATH</code>.</td></tr>
 </table>

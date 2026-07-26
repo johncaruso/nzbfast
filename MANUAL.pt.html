@@ -791,7 +791,7 @@ a <b>chave de API</b> (controle total) e a <b>chave NZB</b> (apenas adição:
 <tr><td><code>config.local.json</code></td><td>Credenciais de servidor e opções por servidor. Criado pelo assistente; editável em Ajustes. Mantenha-o privado.</td></tr>
 <tr><td><code>settings.json</code></td><td>Cada ajuste alterado no painel. Fica ao lado da configuração; os valores da interface substituem os flags de linha de comando. Exclua uma chave (ou o arquivo) para voltar a flags/padrões.</td></tr>
 <tr><td><code>index.db</code></td><td>O índice de lançamentos (SQLite) + metadados do mural. Seguro de excluir - reconstrói a partir da varredura (Ajustes → Indexação → Apagar faz isso por você).</td></tr>
-<tr><td><code>&lt;downloads&gt;/.spool/</code></td><td>Estado da fila (sobrevive a reinícios), NZBs por trabalho, registro de uso, histórico de benchmark, cache de imagens de pôster.</td></tr>
+<tr><td><code>&lt;config&gt;/.spool/</code></td><td>Estado da fila (sobrevive a reinícios), NZBs por trabalho, registro de uso, histórico de benchmark, cache de imagens de pôster.</td></tr>
 <tr><td>Diário de artigos</td><td>Dentro da pasta de saída de cada trabalho enquanto incompleto - sustenta a retomada de travamento e a repetição. Removido em caso de sucesso.</td></tr>
 <tr><td>Ferramentas externas</td><td>Nenhuma é necessária - a extração RAR e o reparo PAR2 são nativos. Se um conjunto exótico algum dia precisar de um <code>unrar</code> ou <code>par2</code> externo como reserva, o nzbfast procura ao lado de seu executável, depois no <code>$PATH</code>.</td></tr>
 </table>

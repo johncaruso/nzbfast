@@ -787,7 +787,7 @@ SABnzbd-kompatibelt, så eksisterende SAB-integrationer virker uændret. To nøg
 <tr><td><code>config.local.json</code></td><td>Server-loginoplysninger og indstillinger pr. server. Oprettet af guiden; kan redigeres under Indstillinger. Hold den privat.</td></tr>
 <tr><td><code>settings.json</code></td><td>Hver indstilling, der er ændret i dashboardet. Ligger ved siden af konfigurationen; UI-værdier tilsidesætter kommandolinje-flag. Slet en nøgle (eller filen) for at falde tilbage til flag/standarder.</td></tr>
 <tr><td><code>index.db</code></td><td>Release-indekset (SQLite) + væg-metadata. Sikkert at slette - det genopbygges ved scanning (Indstillinger → Indeksering → Slet gør dette for dig).</td></tr>
-<tr><td><code>&lt;downloads&gt;/.spool/</code></td><td>Kø-tilstand (overlever genstarter), NZB'er pr. job, forbrugsregnskab, benchmark-historik, poster-artwork-cache.</td></tr>
+<tr><td><code>&lt;config&gt;/.spool/</code></td><td>Kø-tilstand (overlever genstarter), NZB'er pr. job, forbrugsregnskab, benchmark-historik, poster-artwork-cache.</td></tr>
 <tr><td>Artikel-journal</td><td>Inde i hvert jobs outputmappe, mens det er ufuldstændigt - driver crash-genoptagelse og nyt forsøg. Fjernes ved succes.</td></tr>
 <tr><td>Eksterne værktøjer</td><td>Ingen nødvendige - RAR-udpakning og PAR2-reparation er native. Hvis et eksotisk sæt nogensinde kræver en ekstern <code>unrar</code> eller <code>par2</code> som fallback, kigger nzbfast ved siden af sin eksekverbare fil, derefter på <code>$PATH</code>.</td></tr>
 </table>

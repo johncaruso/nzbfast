@@ -795,7 +795,7 @@ SABnzbd-yhteensopiva, joten olemassa olevat SAB-integraatiot toimivat muuttumatt
 <tr><td><code>config.local.json</code></td><td>Palvelintunnukset ja palvelinkohtaiset valinnat. Velhon luoma; muokattavissa Asetuksissa. Pidä se yksityisenä.</td></tr>
 <tr><td><code>settings.json</code></td><td>Jokainen koontinäytöllä muutettu asetus. Asuu määrityksen vieressä; käyttöliittymäarvot voittavat komentorivilliput. Poista avain (tai tiedosto) palataksesi lippuihin/oletuksiin.</td></tr>
 <tr><td><code>index.db</code></td><td>Julkaisuindeksi (SQLite) + seinän metatiedot. Turvallista poistaa - se rakentuu uudelleen skannauksesta (Asetukset → Indeksointi → Pyyhi tekee tämän puolestasi).</td></tr>
-<tr><td><code>&lt;downloads&gt;/.spool/</code></td><td>Jonon tila (säilyy uudelleenkäynnistyksissä), työkohtaiset NZB:t, käyttökirjanpito, mittaushistoria, julistekuvien välimuisti.</td></tr>
+<tr><td><code>&lt;config&gt;/.spool/</code></td><td>Jonon tila (säilyy uudelleenkäynnistyksissä), työkohtaiset NZB:t, käyttökirjanpito, mittaushistoria, julistekuvien välimuisti.</td></tr>
 <tr><td>Artikkelijournaali</td><td>Kunkin työn tulostuskansion sisällä keskeneräisenä - pyörittää kaatumisen jälkeistä jatkoa ja uudelleenyritystä. Poistetaan onnistuessa.</td></tr>
 <tr><td>Ulkoiset työkalut</td><td>Ei tarvita - RAR-purku ja PAR2-korjaus ovat natiiveja. Jos jokin eksoottinen sarja koskaan tarvitsee ulkoista <code>unrar</code>- tai <code>par2</code>-työkalua varajärjestelynä, nzbfast etsii sen suoritettavansa vierestä, sitten polusta <code>$PATH</code>.</td></tr>
 </table>

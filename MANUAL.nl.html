@@ -819,7 +819,7 @@ de <b>API-sleutel</b> (volledige controle) en de <b>NZB-sleutel</b> (alleen toev
 <tr><td><code>config.local.json</code></td><td>Serverinloggegevens en opties per server. Aangemaakt door de wizard; te bewerken in Instellingen. Houd hem privé.</td></tr>
 <tr><td><code>settings.json</code></td><td>Elke instelling die in het dashboard is gewijzigd. Staat naast de config; UI-waarden overschrijven commandoregelvlaggen. Verwijder een sleutel (of het bestand) om terug te vallen op vlaggen/standaardwaarden.</td></tr>
 <tr><td><code>index.db</code></td><td>De release-index (SQLite) + wall-metadata. Veilig te verwijderen - hij wordt door het scannen opnieuw opgebouwd (Instellingen → Indexeren → Wissen doet dit voor je).</td></tr>
-<tr><td><code>&lt;downloads&gt;/.spool/</code></td><td>Wachtrijstatus (overleeft herstarts), NZB's per taak, verbruiksgrootboek, benchmarkgeschiedenis, posterart-cache.</td></tr>
+<tr><td><code>&lt;config&gt;/.spool/</code></td><td>Wachtrijstatus (overleeft herstarts), NZB's per taak, verbruiksgrootboek, benchmarkgeschiedenis, posterart-cache.</td></tr>
 <tr><td>Artikeljournal</td><td>Staat in de uitvoermap van elke taak zolang die incompleet is - drijft crash-hervatting en opnieuw proberen aan. Wordt bij succes verwijderd.</td></tr>
 <tr><td>Externe tools</td><td>Geen nodig - RAR-uitpakken en PAR2-herstel zijn native. Mocht een exotische set ooit een externe <code>unrar</code> of <code>par2</code> als fallback nodig hebben, dan kijkt nzbfast eerst naast zijn executable en daarna op <code>$PATH</code>.</td></tr>
 </table>

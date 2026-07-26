@@ -782,7 +782,7 @@ SABnzbd-kompatibelt, så eksisterende SAB-integrasjoner fungerer uendret. To nø
 <tr><td><code>config.local.json</code></td><td>Serverlegitimasjon og alternativer per server. Opprettet av veiviseren; redigerbar i Innstillinger. Hold den privat.</td></tr>
 <tr><td><code>settings.json</code></td><td>Hver innstilling endret i dashbordet. Ligger ved siden av config-en; UI-verdier overstyrer kommandolinjeflagg. Slett en nøkkel (eller filen) for å falle tilbake til flagg/standarder.</td></tr>
 <tr><td><code>index.db</code></td><td>Utgivelsesindeksen (SQLite) + vegg-metadata. Trygg å slette - den gjenoppbygges fra skanning (Innstillinger → Indeksering → Slett gjør dette for deg).</td></tr>
-<tr><td><code>&lt;downloads&gt;/.spool/</code></td><td>Køtilstand (overlever omstarter), NZB-er per jobb, forbruksjournal, benchmark-historikk, plakatbildebuffer.</td></tr>
+<tr><td><code>&lt;config&gt;/.spool/</code></td><td>Køtilstand (overlever omstarter), NZB-er per jobb, forbruksjournal, benchmark-historikk, plakatbildebuffer.</td></tr>
 <tr><td>Artikkeljournal</td><td>Inne i hver jobbs utdatamappe mens den er uferdig - driver krasj-gjenopptaking og nytt forsøk. Fjernes ved suksess.</td></tr>
 <tr><td>Eksterne verktøy</td><td>Ingen nødvendige - RAR-utpakking og PAR2-reparasjon er native. Hvis et eksotisk sett noen gang trenger en ekstern <code>unrar</code> eller <code>par2</code> som fallback, ser nzbfast ved siden av den kjørbare filen sin, deretter på <code>$PATH</code>.</td></tr>
 </table>

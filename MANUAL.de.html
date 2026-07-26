@@ -844,7 +844,7 @@ Keys: der <b>API-Key</b> (volle Kontrolle) und der <b>NZB-Key</b> (nur Hinzufüg
 <tr><td><code>config.local.json</code></td><td>Server-Zugangsdaten und Optionen pro Server. Vom Assistenten angelegt; in den Einstellungen bearbeitbar. Halte sie privat.</td></tr>
 <tr><td><code>settings.json</code></td><td>Jede im Dashboard geänderte Einstellung. Liegt neben der Config; UI-Werte übersteuern Kommandozeilen-Flags. Lösche einen Key (oder die Datei), um auf Flags/Standardwerte zurückzufallen.</td></tr>
 <tr><td><code>index.db</code></td><td>Der Release-Index (SQLite) + Wand-Metadaten. Kann gefahrlos gelöscht werden - er baut sich durchs Scannen neu auf (Einstellungen → Indexierung → Index löschen erledigt das für dich).</td></tr>
-<tr><td><code>&lt;downloads&gt;/.spool/</code></td><td>Warteschlangen-Zustand (übersteht Neustarts), NZBs pro Job, Verbrauchs-Buch, Benchmark-Verlauf, Poster-Art-Cache.</td></tr>
+<tr><td><code>&lt;config&gt;/.spool/</code></td><td>Warteschlangen-Zustand (übersteht Neustarts), NZBs pro Job, Verbrauchs-Buch, Benchmark-Verlauf, Poster-Art-Cache.</td></tr>
 <tr><td>Artikel-Journal</td><td>Liegt im Ausgabeordner jedes Jobs, solange er unvollständig ist - treibt Absturz-Resume und Erneut-Versuchen an. Bei Erfolg entfernt.</td></tr>
 <tr><td>Externe Tools</td><td>Keine nötig - RAR-Entpacken und PAR2-Reparatur sind nativ. Sollte ein exotisches Set je ein externes <code>unrar</code> oder <code>par2</code> als Fallback brauchen, schaut nzbfast neben seine ausführbare Datei, dann auf den <code>$PATH</code>.</td></tr>
 </table>

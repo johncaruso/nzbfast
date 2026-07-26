@@ -787,7 +787,7 @@ SABnzbd-kompatibel, så befintliga SAB-integrationer fungerar oförändrade. Tv�
 <tr><td><code>config.local.json</code></td><td>Serverinloggningar och alternativ per server. Skapas av guiden; redigerbar i Inställningar. Håll den privat.</td></tr>
 <tr><td><code>settings.json</code></td><td>Varje inställning som ändrats på instrumentpanelen. Ligger bredvid config; UI-värden åsidosätter kommandoradsflaggor. Radera en nyckel (eller filen) för att falla tillbaka på flaggor/standardvärden.</td></tr>
 <tr><td><code>index.db</code></td><td>Releaseindexet (SQLite) + väggmetadata. Säkert att radera - det byggs om från skanning (Inställningar → Indexering → Radera gör detta åt dig).</td></tr>
-<tr><td><code>&lt;downloads&gt;/.spool/</code></td><td>Kötillstånd (överlever omstarter), NZB:er per jobb, förbrukningsjournal, benchmark-historik, cache för posteromslag.</td></tr>
+<tr><td><code>&lt;config&gt;/.spool/</code></td><td>Kötillstånd (överlever omstarter), NZB:er per jobb, förbrukningsjournal, benchmark-historik, cache för posteromslag.</td></tr>
 <tr><td>Artikeljournal</td><td>Inuti varje jobbs utmapp medan det är ofullständigt - driver kraschåterupptagning och nytt försök. Tas bort vid framgång.</td></tr>
 <tr><td>Externa verktyg</td><td>Inga behövs - RAR-uppackning och PAR2-reparation är native. Om ett exotiskt set någonsin behöver en extern <code>unrar</code> eller <code>par2</code> som reserv letar nzbfast bredvid sin körbara fil, sedan på <code>$PATH</code>.</td></tr>
 </table>

@@ -791,7 +791,7 @@ compatibil SABnzbd, așa că integrările SAB existente funcționează neschimba
 <tr><td><code>config.local.json</code></td><td>Credențiale de server și opțiuni per server. Creat de asistent; editabil în Setări. Păstrează-l privat.</td></tr>
 <tr><td><code>settings.json</code></td><td>Fiecare setare schimbată în panou. Se află lângă config; valorile din interfață au prioritate față de flagurile din linia de comandă. Șterge o cheie (sau fișierul) pentru a reveni la flaguri/valori implicite.</td></tr>
 <tr><td><code>index.db</code></td><td>Indexul de release-uri (SQLite) + metadatele peretelui. Sigur de șters - se reconstruiește prin scanare (Setări → Indexare → Golire face asta pentru tine).</td></tr>
-<tr><td><code>&lt;downloads&gt;/.spool/</code></td><td>Starea cozii (supraviețuiește repornirilor), NZB-uri per job, registrul de utilizare, istoricul benchmark-urilor, cache-ul de imagini poster.</td></tr>
+<tr><td><code>&lt;config&gt;/.spool/</code></td><td>Starea cozii (supraviețuiește repornirilor), NZB-uri per job, registrul de utilizare, istoricul benchmark-urilor, cache-ul de imagini poster.</td></tr>
 <tr><td>Jurnal de articole</td><td>În interiorul folderului de ieșire al fiecărui job cât timp e incomplet - alimentează reluarea după blocare și reîncercarea. Eliminat la succes.</td></tr>
 <tr><td>Instrumente externe</td><td>Nu e nevoie de niciunul - extragerea RAR și repararea PAR2 sunt native. Dacă un set exotic are vreodată nevoie de un <code>unrar</code> sau <code>par2</code> extern ca rezervă, nzbfast caută lângă executabilul său, apoi în <code>$PATH</code>.</td></tr>
 </table>

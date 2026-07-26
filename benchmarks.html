@@ -58,7 +58,7 @@
     <p class="kicker">Methodology first</p>
     <h2>The setup</h2>
     <ul class="plain">
-      <li><b>Clients:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 · Weaver, all on the same machine per scenario (Apple M-series boxes: "Europe" M1 Ultra on 10&nbsp;GbE, "East Coast" M3 Ultra ~2.4–3.0 Gbps line). The provider legs below predate Weaver's inclusion; it appears in the reproducible client-ceiling leg. nzbfast's own figures span builds 1.0.2 to 1.0.7 as the engine changed; older legs understate the shipping build rather than flatter it.</li>
+      <li><b>Clients:</b> nzbfast · SABnzbd 5.0.4 · NZBGet 26.2 · rustnzb 1.3.4 · Weaver, all on the same machine per scenario (Apple M-series boxes: "Europe" M1 Ultra on 10&nbsp;GbE, "East Coast" M3 Ultra ~2.4–3.0 Gbps line). The provider legs below predate Weaver's inclusion; it appears in the reproducible client-ceiling leg. nzbfast's own figures span builds 1.0.2 to 1.0.8 as the engine changed; older legs understate the shipping build rather than flatter it.</li>
       <li><b>Fairness:</b> same 6 providers × 8 connections, TLS everywhere, legs run back-to-back interleaved. Every competitor tuned to its documented best: SABnzbd got <code>pipelining_requests=8</code> (<b>it ships 1, i.e. unpipelined</b>; that setting alone took its 190 GB time from 24m24s to 19m02s), NZBGet got ArticleCache/DirectWrite/DirectUnpack/ParQuick, rustnzb its documented config.</li>
       <li><b>End state:</b> a verified, extracted, usable file, not "download finished". That's what you actually wait for.</li>
       <li><b>Reproducibility:</b> every claim is dated and measured the same way: elapsed time + interface byte counters + process-tree peak RSS, 1–2 s resolution. Where a leg runs on a publicly posted NZB, we name it so you can run it yourself.</li>
@@ -321,43 +321,44 @@
     <h3 style="margin:38px 0 4px">RAR extraction: 8 archive shapes, 6 tools</h3>
     <p class="note" style="text-align:start;margin-top:6px">Each bar is our time as a fraction of
     <b>unrar 7.23</b>, RARLab's own reference implementation and the fastest of the field on most
-    shapes. Full track = unrar. 32-core desktop, best of 3, tools interleaved inside each round.</p>
+    shapes. Full track = unrar. 32-core desktop, best of 3, tools interleaved inside each round.
+    Seven bars, not eight: RAR4 cannot be created by <code>rar</code> 7.x, so that shape ran on the
+    laptop only and is in the table below.</p>
     <div class="bars wide">
-      <div class="bar me"><span>400 small files</span><span class="trk"><i style="width:20%"></i></span><span class="t">0.13 s vs 0.66 · 5.1×</span></div>
-      <div class="bar me"><span>solid</span><span class="trk"><i style="width:57%"></i></span><span class="t">0.50 s vs 0.87 · 1.7×</span></div>
-      <div class="bar me"><span>encrypted</span><span class="trk"><i style="width:60%"></i></span><span class="t">0.49 s vs 0.82 · 1.7×</span></div>
-      <div class="bar me"><span>RAR4</span><span class="trk"><i style="width:57%"></i></span><span class="t">0.78 s vs 1.36 · 1.7×</span></div>
-      <div class="bar me"><span>big 3-volume</span><span class="trk"><i style="width:65%"></i></span><span class="t">0.49 s vs 0.75 · 1.5×</span></div>
-      <div class="bar me"><span>128 MB dict</span><span class="trk"><i style="width:77%"></i></span><span class="t">0.71 s vs 0.92 · 1.3×</span></div>
+      <div class="bar me"><span>400 small files</span><span class="trk"><i style="width:23%"></i></span><span class="t">0.07 s vs 0.30 · 4.3×</span></div>
+      <div class="bar me"><span>solid</span><span class="trk"><i style="width:45%"></i></span><span class="t">0.15 s vs 0.33 · 2.2×</span></div>
+      <div class="bar me"><span>encrypted</span><span class="trk"><i style="width:61%"></i></span><span class="t">0.48 s vs 0.79 · 1.6×</span></div>
+      <div class="bar me"><span>big 3-volume</span><span class="trk"><i style="width:64%"></i></span><span class="t">0.47 s vs 0.73 · 1.6×</span></div>
       <div class="bar me"><span>repetitive</span><span class="trk"><i style="width:75%"></i></span><span class="t">0.03 s vs 0.04 · 1.3×</span></div>
+      <div class="bar me"><span>128 MB dict</span><span class="trk"><i style="width:78%"></i></span><span class="t">0.70 s vs 0.90 · 1.3×</span></div>
       <div class="bar me"><span>store</span><span class="trk"><i style="width:100%"></i></span><span class="t">0.05 s vs 0.05 · tie</span></div>
     </div>
 
     <p class="note" style="text-align:start"><b>The whole field, seconds, lower is better.</b>
-    Same eight archives on all three machines. Archives were created by official <code>rar</code>
-    7.23 so no tool is judged on input from its own encoder. <code>rarpar</code> is Weaver's own
-    RAR and PAR2 code, built from source at HEAD.</p>
+    The same archive shapes on all three machines, seven on the desktops and eight on the laptop.
+    Archives were created by official <code>rar</code> 7.23 so no tool is judged on input from its
+    own encoder. <code>rarpar</code> is Weaver's own RAR and PAR2 code, built from source at
+    <code>a5de0d3</code>; we pin the commit rather than a version because its crates carry three
+    different version numbers.</p>
     <div class="tblwrap"><table>
       <thead><tr><th>shape</th><th>nzbfast</th><th>unrar 7.23</th><th>rarpar</th><th>unar</th><th>rars 0.4.7</th><th>bsdtar</th></tr></thead>
       <tbody>
         <tr><td colspan="7" class="grp">High-end desktop, 32 cores</td></tr>
-        <tr><td>store 200 MB</td><td><b>0.05</b></td><td>0.05</td><td>0.06</td><td>0.13</td><td>0.15</td><td>0.08</td></tr>
-        <tr><td>big, 3 volumes</td><td><b>0.49</b></td><td>0.75</td><td>0.77</td><td>2.32</td><td>2.60</td><td class="no">wrong output²</td></tr>
-        <tr><td>400 small files</td><td><b>0.13</b></td><td>0.66</td><td>0.83</td><td>1.96</td><td>2.13</td><td>4.79</td></tr>
-        <tr><td>solid</td><td><b>0.50</b></td><td>0.87</td><td>1.05</td><td>2.40</td><td>3.06</td><td>5.25</td></tr>
-        <tr><td>repetitive</td><td><b>0.03</b></td><td>0.04</td><td>0.04</td><td>0.08</td><td>0.14</td><td>0.19</td></tr>
-        <tr><td>encrypted</td><td><b>0.49</b></td><td>0.82</td><td>0.77</td><td>3.10</td><td>6.95</td><td class="no">unsup</td></tr>
-        <tr><td>RAR4</td><td><b>0.78</b></td><td>1.36</td><td class="no">reject³</td><td class="no">reject³</td><td>1.29</td><td class="no">reject³</td></tr>
-        <tr><td>128 MB dictionary</td><td><b>0.71</b></td><td>0.92</td><td>1.00</td><td>2.77</td><td>3.03</td><td class="no">unsup</td></tr>
+        <tr><td>store 200 MB</td><td><b>0.05</b></td><td>0.05</td><td>0.05</td><td>0.12</td><td>0.14</td><td>0.07</td></tr>
+        <tr><td>big, 3 volumes</td><td><b>0.47</b></td><td>0.73</td><td>0.74</td><td>2.12</td><td>2.45</td><td class="no">wrong output²</td></tr>
+        <tr><td>400 small files</td><td><b>0.07</b></td><td>0.30</td><td>0.35</td><td>1.24</td><td>1.35</td><td>2.37</td></tr>
+        <tr><td>solid</td><td><b>0.15</b></td><td>0.33</td><td>0.38</td><td>1.29</td><td>1.84</td><td>2.39</td></tr>
+        <tr><td>repetitive</td><td><b>0.03</b></td><td>0.04</td><td>0.03</td><td>0.08</td><td>0.14</td><td>0.19</td></tr>
+        <tr><td>encrypted</td><td><b>0.48</b></td><td>0.79</td><td>0.73</td><td>2.91</td><td>5.88</td><td class="no">unsup</td></tr>
+        <tr><td>128 MB dictionary</td><td><b>0.70</b></td><td>0.90</td><td>0.96</td><td>2.63</td><td>2.83</td><td class="no">unsup</td></tr>
         <tr><td colspan="7" class="grp">Older desktop, 20 cores</td></tr>
-        <tr><td>store 200 MB</td><td><b>0.05</b></td><td>0.05</td><td>0.06</td><td>0.13</td><td>0.16</td><td>0.07</td></tr>
-        <tr><td>big, 3 volumes</td><td><b>0.49</b></td><td>0.89</td><td>0.79</td><td>2.42</td><td>2.91</td><td class="no">wrong output²</td></tr>
-        <tr><td>400 small files</td><td><b>0.16</b></td><td>0.81</td><td>0.98</td><td>2.19</td><td>2.55</td><td>4.63</td></tr>
-        <tr><td>solid</td><td><b>0.54</b></td><td>1.05</td><td>1.14</td><td>2.49</td><td>3.57</td><td>4.96</td></tr>
-        <tr><td>repetitive</td><td><b>0.03</b></td><td>0.04</td><td>0.04</td><td>0.10</td><td>0.16</td><td>0.21</td></tr>
-        <tr><td>encrypted</td><td><b>0.49</b></td><td>0.99</td><td>0.81</td><td>3.45</td><td>8.08</td><td class="no">unsup</td></tr>
-        <tr><td>RAR4</td><td><b>0.97</b></td><td>1.78</td><td class="no">reject³</td><td class="no">reject³</td><td>1.62</td><td class="no">reject³</td></tr>
-        <tr><td>128 MB dictionary</td><td><b>0.71</b></td><td>1.15</td><td>1.03</td><td>2.88</td><td>3.18</td><td class="no">unsup</td></tr>
+        <tr><td>store 200 MB</td><td><b>0.05</b></td><td>0.05</td><td>0.06</td><td>0.14</td><td>0.16</td><td>0.07</td></tr>
+        <tr><td>big, 3 volumes</td><td><b>0.59</b></td><td>1.02</td><td>0.89</td><td>2.59</td><td>3.08</td><td class="no">wrong output²</td></tr>
+        <tr><td>400 small files</td><td><b>0.09</b></td><td>0.39</td><td>0.44</td><td>1.45</td><td>1.72</td><td>2.81</td></tr>
+        <tr><td>solid</td><td><b>0.19</b></td><td>0.42</td><td>0.47</td><td>1.49</td><td>2.43</td><td>2.84</td></tr>
+        <tr><td>repetitive</td><td><b>0.03</b></td><td>0.05</td><td>0.04</td><td>0.10</td><td>0.17</td><td>0.22</td></tr>
+        <tr><td>encrypted</td><td><b>0.60</b></td><td>1.12</td><td>0.92</td><td>3.64</td><td>7.56</td><td class="no">unsup</td></tr>
+        <tr><td>128 MB dictionary</td><td><b>0.78</b></td><td>1.27</td><td>1.11</td><td>3.09</td><td>3.44</td><td class="no">unsup</td></tr>
         <tr><td colspan="7" class="grp">Laptop, 14 cores / 20 threads, Windows⁴</td></tr>
         <tr><td>store 200 MB</td><td><b>0.08</b></td><td>0.16</td><td>0.16</td><td class="no">no CLI</td><td>0.24</td><td>0.17</td></tr>
         <tr><td>big, 3 volumes</td><td><b>0.66</b></td><td>1.28</td><td>1.10</td><td class="no">no CLI</td><td>6.16</td><td class="no">wrong output²</td></tr>
@@ -376,8 +377,16 @@
     unmodified: our fork is 3× to 16× faster than it, which is the extraction work in one column.
     ² bsdtar has no RAR5 multi-volume support and silently produced a truncated file, so that leg is
     a correctness failure, not a slow time. ³ <code>rar</code> 7.x can no longer create RAR4, so
-    that one archive comes from the rars encoder (unrar-validated); several tools reject it.
+    that one archive comes from the rars encoder (unrar-validated); several tools reject it, and it
+    is the one shape the two desktop rounds could not rebuild, so it appears on the laptop only.
     ⁴ unar has no Windows CLI, so the laptop field is five tools.</p>
+    <p class="note" style="text-align:start"><b>Dates, because they are not all the same.</b> The two
+    desktop groups were re-measured for 1.0.8 on one freshly built corpus, with every tool run from
+    the same staged binaries so no machine raced a different version. The laptop group is the earlier
+    round and is unchanged. That is deliberate rather than lazy: extraction performance did not move
+    between 1.0.7 and 1.0.8, which we checked by racing both builds head to head on every shape and
+    finding them level, so the laptop figures still describe the shipping build. Re-running that rig
+    would have changed the corpus without changing the answer.</p>
 
     <h3 style="margin:44px 0 4px">PAR2 verify and repair: 1 GiB set, 101 damaged blocks</h3>
     <p class="note" style="text-align:start;margin-top:6px">Corpus: 1 GiB payload packed store-mode
@@ -389,19 +398,19 @@
         <h3>Clean verify</h3>
         <p class="note" style="margin:0 0 6px">High-end desktop, 32 cores</p>
         <div class="bars" style="margin:0 0 18px">
-          <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:13%"></i></span><span class="t">0.41 s</span></div>
-          <div class="bar"><span>par2-turbo</span><span class="trk"><i style="width:29%"></i></span><span class="t">0.94 s</span></div>
-          <div class="bar"><span>par2cmdline</span><span class="trk"><i style="width:100%"></i></span><span class="t">3.27 s</span></div>
+          <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:11%"></i></span><span class="t">0.34 s</span></div>
+          <div class="bar"><span>par2-turbo</span><span class="trk"><i style="width:29%"></i></span><span class="t">0.90 s</span></div>
+          <div class="bar"><span>par2cmdline</span><span class="trk"><i style="width:100%"></i></span><span class="t">3.10 s</span></div>
         </div>
         <p class="note" style="margin:0 0 6px">Older desktop, 20 cores</p>
         <div class="bars" style="margin:0 0 18px">
-          <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:11%"></i></span><span class="t">0.40 s</span></div>
+          <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:11%"></i></span><span class="t">0.41 s</span></div>
           <div class="bar"><span>par2-turbo</span><span class="trk"><i style="width:29%"></i></span><span class="t">1.08 s</span></div>
-          <div class="bar"><span>par2cmdline</span><span class="trk"><i style="width:100%"></i></span><span class="t">3.67 s</span></div>
+          <div class="bar"><span>par2cmdline</span><span class="trk"><i style="width:100%"></i></span><span class="t">3.68 s</span></div>
         </div>
         <p class="note" style="margin:0 0 6px">Laptop, 14 cores, Windows</p>
         <div class="bars" style="margin:0">
-          <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:73%"></i></span><span class="t">1.26 s</span></div>
+          <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:65%"></i></span><span class="t">1.12 s</span></div>
           <div class="bar"><span>par2-turbo</span><span class="trk"><i style="width:86%"></i></span><span class="t">1.48 s</span></div>
           <div class="bar"><span>MultiPar</span><span class="trk"><i style="width:100%"></i></span><span class="t">1.73 s</span></div>
         </div>
@@ -410,15 +419,15 @@
         <h3>Repairing 101 damaged blocks</h3>
         <p class="note" style="margin:0 0 6px">High-end desktop, 32 cores</p>
         <div class="bars" style="margin:0 0 18px">
-          <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:18%"></i></span><span class="t">1.09 s</span></div>
-          <div class="bar"><span>par2-turbo</span><span class="trk"><i style="width:37%"></i></span><span class="t">2.18 s</span></div>
-          <div class="bar"><span>par2cmdline</span><span class="trk"><i style="width:100%"></i></span><span class="t">5.94 s</span></div>
+          <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:16%"></i></span><span class="t">0.88 s</span></div>
+          <div class="bar"><span>par2-turbo</span><span class="trk"><i style="width:38%"></i></span><span class="t">2.07 s</span></div>
+          <div class="bar"><span>par2cmdline</span><span class="trk"><i style="width:100%"></i></span><span class="t">5.49 s</span></div>
         </div>
         <p class="note" style="margin:0 0 6px">Older desktop, 20 cores</p>
         <div class="bars" style="margin:0 0 18px">
-          <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:17%"></i></span><span class="t">1.26 s</span></div>
-          <div class="bar"><span>par2-turbo</span><span class="trk"><i style="width:35%"></i></span><span class="t">2.61 s</span></div>
-          <div class="bar"><span>par2cmdline</span><span class="trk"><i style="width:100%"></i></span><span class="t">7.52 s</span></div>
+          <div class="bar me"><span>nzbfast</span><span class="trk"><i style="width:17%"></i></span><span class="t">1.28 s</span></div>
+          <div class="bar"><span>par2-turbo</span><span class="trk"><i style="width:35%"></i></span><span class="t">2.66 s</span></div>
+          <div class="bar"><span>par2cmdline</span><span class="trk"><i style="width:100%"></i></span><span class="t">7.55 s</span></div>
         </div>
         <p class="note" style="margin:0 0 6px">Laptop, 14 cores, Windows</p>
         <div class="bars" style="margin:0">
@@ -432,12 +441,51 @@
     machines, against the SIMD <code>par2cmdline-turbo</code> fork, classic
     <code>par2cmdline</code> 1.2.0 and MultiPar's <code>par2j</code>. Every repaired volume came out
     byte-identical to the pristine set. The gap is widest on the desktops because our repair path
-    spreads the Reed-Solomon fold across cores; on 14 cores it is 1.4× rather than 2×.
+    spreads the Reed-Solomon fold across cores; on 14 cores it is 1.4× rather than 2×. Weaver's
+    <code>rarpar</code> was raced on the two desktops as well and lands behind classic
+    <code>par2cmdline</code> on repair: 4.91 s and 5.87 s against our 0.88 s and 1.28 s.
     ⁵ <code>par2j</code> verifies this set fine but returned a non-zero status on the repair leg in
     our harness; it likely wants a different invocation and we did not chase it, so read that row as
-    "not measured", not as a failure of MultiPar. The 32-core figures come from the morning round on
-    its own instance of the corpus recipe, so the field there is internally consistent; the shipping
-    build measures 0.39 s verify and 1.02 s repair on the shared corpus.</p>
+    "not measured", not as a failure of MultiPar.</p>
+    <p class="note" style="text-align:start"><b>Light damage, the common field case.</b> A handful of
+    failed articles is far more typical than 101 dead blocks, so this round adds a 3-block repair leg:
+    <b>0.58 s</b> against par2-turbo's 1.12 s on 32 cores, <b>0.69 s</b> against 1.37 s on 20 cores.
+    It is worth saying what did <i>not</i> move. The 1.0.8 repair rewrite spreads the fold across
+    rows <i>and</i> columns, and rows are the missing-block count, so light damage is exactly where
+    the old code left a big machine idle. In the fold microbenchmark alone that is a 3.65× speedup.
+    End to end it is worth almost nothing, because the fold is about a millisecond of a run dominated
+    by reading and MD5-ing a gigabyte. Both halves are true and the second one is the one that
+    reaches users.</p>
+    <h3 style="margin:44px 0 4px">RAR recovery records: repairing without PAR2</h3>
+    <p class="note" style="text-align:start;margin-top:6px">When PAR2 cannot cover the damage, the
+    recovery record inside the RAR itself is the last line of defence. Until 1.0.8 ours failed on any
+    archive over about 13 MB, so this leg could not be run at all. Damage is three 3,000-byte holes at
+    20%, 50% and 80% through the protected region. Both tools produced output byte-identical to the
+    pristine file, and ours is byte-identical to what <code>rar r</code> itself writes.</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>archive</th><th>nzbfast</th><th>rar 7.23 repair</th><th></th></tr></thead>
+      <tbody>
+        <tr><td>16 MB</td><td><b>0.15</b></td><td>0.26</td><td>1.7× faster</td></tr>
+        <tr><td>32 MB</td><td><b>0.26</b></td><td>0.44</td><td>1.7× faster</td></tr>
+        <tr><td>128 MB</td><td><b>0.89</b></td><td>1.03</td><td>1.2× faster</td></tr>
+        <tr><td>512 MB</td><td>3.46</td><td><b>2.23</b></td><td class="no">1.6× slower</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">We lead to about 128 MB and RARLab pulls ahead by 512 MB,
+    so the crossover sits somewhere in the low hundreds of MB. That last row is a loss and it stays on
+    the page: our repair streams rather than holding whole volumes in memory, which costs throughput
+    at the top end and buys a bounded working set. On the 8 GB to 20 GB volumes a daemon actually
+    meets, holding the volume is not an option, so it is the right trade even where it loses. Measured
+    against the buffered path on the same archive: 1.4× slower to run, 2.3× less peak memory.</p>
+
+    <p class="note" style="text-align:start"><b>What else moved in 1.0.8, and where it does not
+    show.</b> Three more engine changes landed that these corpora cannot see, listed here so the
+    numbers above are not read as the whole story: rebuilding a <code>.rev</code> volume now does one
+    erasure solve instead of one per byte; RAR5 archives with tens of thousands of members resolve
+    each member once rather than walking the list per worker (3× less processor time at 40,000
+    members); and the RAR1.3 bit reader works a word at a time (2×). None of them appear above,
+    because the shapes here have 400 members, no <code>.rev</code> set, and no RAR1.3.</p>
+
     <p class="note" style="text-align:start"><b>What we deliberately do not do:</b> we never
     <i>create</i> PAR2. A downloader has no reason to, and ParPar owns that leg. We also buy speed
     with memory on both engines: extraction peaks around 240 MB against unrar's 41 MB, and

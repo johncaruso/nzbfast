@@ -863,7 +863,7 @@ changement. Deux clés : la <b>clé API</b> (contrôle total) et la <b>clé NZB<
 <tr><td><code>config.local.json</code></td><td>Identifiants des serveurs et options par serveur. Créé par l'assistant ; modifiable dans les Paramètres. Gardez-le privé.</td></tr>
 <tr><td><code>settings.json</code></td><td>Chaque réglage modifié dans le tableau de bord. Vit à côté de la config ; les valeurs de l'interface priment sur les drapeaux de ligne de commande. Supprimez une clé (ou le fichier) pour retomber sur les drapeaux/valeurs par défaut.</td></tr>
 <tr><td><code>index.db</code></td><td>L'index des releases (SQLite) + les métadonnées du mur. Sans risque à supprimer - il se reconstruit par le scan (Paramètres → Indexation → Effacer le fait pour vous).</td></tr>
-<tr><td><code>&lt;downloads&gt;/.spool/</code></td><td>État de la file (survit aux redémarrages), NZB par tâche, registre de consommation, historique des benchmarks, cache des affiches.</td></tr>
+<tr><td><code>&lt;config&gt;/.spool/</code></td><td>État de la file (survit aux redémarrages), NZB par tâche, registre de consommation, historique des benchmarks, cache des affiches.</td></tr>
 <tr><td>Journal d'articles</td><td>Dans le dossier de sortie de chaque tâche tant qu'elle est incomplète - alimente la reprise après crash et le réessai. Supprimé en cas de succès.</td></tr>
 <tr><td>Outils externes</td><td>Aucun n'est nécessaire - l'extraction RAR et la réparation PAR2 sont natives. Si un jeu exotique nécessite un jour un <code>unrar</code> ou <code>par2</code> externe en repli, nzbfast regarde à côté de son exécutable, puis dans <code>$PATH</code>.</td></tr>
 </table>
