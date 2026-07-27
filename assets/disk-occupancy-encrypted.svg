@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 400" width="100%" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" role="img" aria-label="Disk in use during one 94 GB encrypted download. Both behaviours track each other to 90 GB; the old one then spikes to 166 GB while the new one stops.">
+<text x="66" y="24" fill="#e9e4da" font-size="15" font-weight="600">Disk in use during one 94 GB encrypted download</text>
+<rect x="66" y="38" width="16" height="3" fill="#e0576b"/>
+<text x="89" y="43" fill="#9a938a" font-size="12.5">before</text>
+<rect x="152" y="38" width="16" height="3" fill="#3fb8a6"/>
+<text x="175" y="43" fill="#9a938a" font-size="12.5">now</text>
+<line x1="66" y1="354.0" x2="672" y2="354.0" stroke="#3a3632" stroke-width="1"/>
+<text x="56" y="358.0" fill="#9a938a" font-size="11.5" text-anchor="end">0 GB</text>
+<line x1="66" y1="321.3" x2="672" y2="321.3" stroke="#3a3632" stroke-width="1"/>
+<text x="56" y="325.3" fill="#9a938a" font-size="11.5" text-anchor="end">20 GB</text>
+<line x1="66" y1="288.7" x2="672" y2="288.7" stroke="#3a3632" stroke-width="1"/>
+<text x="56" y="292.7" fill="#9a938a" font-size="11.5" text-anchor="end">40 GB</text>
+<line x1="66" y1="256.0" x2="672" y2="256.0" stroke="#3a3632" stroke-width="1"/>
+<text x="56" y="260.0" fill="#9a938a" font-size="11.5" text-anchor="end">60 GB</text>
+<line x1="66" y1="223.3" x2="672" y2="223.3" stroke="#3a3632" stroke-width="1"/>
+<text x="56" y="227.3" fill="#9a938a" font-size="11.5" text-anchor="end">80 GB</text>
+<line x1="66" y1="190.7" x2="672" y2="190.7" stroke="#3a3632" stroke-width="1"/>
+<text x="56" y="194.7" fill="#9a938a" font-size="11.5" text-anchor="end">100 GB</text>
+<line x1="66" y1="158.0" x2="672" y2="158.0" stroke="#3a3632" stroke-width="1"/>
+<text x="56" y="162.0" fill="#9a938a" font-size="11.5" text-anchor="end">120 GB</text>
+<line x1="66" y1="125.3" x2="672" y2="125.3" stroke="#3a3632" stroke-width="1"/>
+<text x="56" y="129.3" fill="#9a938a" font-size="11.5" text-anchor="end">140 GB</text>
+<line x1="66" y1="92.7" x2="672" y2="92.7" stroke="#3a3632" stroke-width="1"/>
+<text x="56" y="96.7" fill="#9a938a" font-size="11.5" text-anchor="end">160 GB</text>
+<line x1="66" y1="60.0" x2="672" y2="60.0" stroke="#3a3632" stroke-width="1"/>
+<text x="56" y="64.0" fill="#9a938a" font-size="11.5" text-anchor="end">180 GB</text>
+<text x="66.0" y="374.0" fill="#9a938a" font-size="11.5" text-anchor="middle">0m</text>
+<text x="205.5" y="374.0" fill="#9a938a" font-size="11.5" text-anchor="middle">1m</text>
+<text x="345.1" y="374.0" fill="#9a938a" font-size="11.5" text-anchor="middle">2m</text>
+<text x="484.6" y="374.0" fill="#9a938a" font-size="11.5" text-anchor="middle">3m</text>
+<text x="624.2" y="374.0" fill="#9a938a" font-size="11.5" text-anchor="middle">4m</text>
+<polyline fill="none" stroke="#e0576b" stroke-width="2.5" stroke-linejoin="round" points="66.0,354.0 77.7,351.7 89.4,348.6 101.0,345.4 112.7,342.3 124.3,339.1 135.9,335.9 147.6,332.9 159.2,329.8 170.9,326.4 182.5,323.1 194.2,320.1 205.8,317.0 217.5,314.2 229.1,311.6 240.8,308.4 252.5,305.4 264.1,302.4 275.8,299.2 287.4,296.4 299.1,293.5 310.7,290.3 322.4,287.4 334.0,284.2 345.6,281.0 357.3,278.2 368.9,275.0 380.6,272.0 392.2,269.1 403.9,266.3 415.5,263.2 427.2,260.4 438.9,257.3 450.5,254.0 462.2,250.6 473.8,247.7 485.4,244.7 497.1,241.7 508.7,238.4 520.4,235.0 532.1,231.9 543.7,228.6 555.4,225.6 567.0,222.6 578.7,219.3 590.3,216.1 602.0,212.9 613.6,209.7 625.3,207.4 637.0,163.9 648.6,122.5 660.3,83.3 672.0,207.4"/>
+<polyline fill="none" stroke="#3fb8a6" stroke-width="2.5" stroke-linejoin="round" points="66.0,354.0 77.7,351.8 89.3,348.8 101.0,345.7 112.6,342.5 124.3,339.4 135.9,336.5 147.5,333.5 159.2,330.5 170.8,327.4 182.5,324.3 194.1,321.3 205.8,318.5 217.4,315.4 229.1,312.4 240.7,309.2 252.4,306.1 264.0,303.1 275.7,300.2 287.3,297.1 298.9,294.0 310.6,290.8 322.2,287.7 333.9,284.7 345.5,281.9 357.2,278.5 368.8,275.5 380.5,272.5 392.1,269.5 403.8,266.4 415.4,263.6 427.1,260.4 438.7,257.4 450.3,254.6 462.0,251.5 473.6,248.4 485.3,245.7 496.9,242.5 508.6,239.2 520.2,236.0 531.9,232.6 543.5,229.5 555.2,226.7 566.8,223.6 578.5,220.4 590.1,217.3 601.8,214.3 613.4,211.1 625.0,208.2"/>
+<circle cx="660.3" cy="83.3" r="3.5" fill="#e0576b"/>
+<text x="668.3" y="75.3" fill="#e0576b" font-size="12.5" font-weight="600">166 GB peak</text>
+<circle cx="625.0" cy="208.2" r="3.5" fill="#3fb8a6"/>
+<text x="633.0" y="214.2" fill="#3fb8a6" font-size="12.5" font-weight="600">89 GB peak</text>
+</svg>
