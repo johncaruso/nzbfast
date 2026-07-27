@@ -67,25 +67,29 @@
 <section>
   <div class="wrap">
     <p class="kicker">Waarom het snel is</p>
-    <h2>Drie ideeën die de gangbare clients niet volledig benutten</h2>
-    <p class="lead">Dit is architectuur, geen micro-optimalisatie, en alles ervan is gemeten in
+    <h2>Ongeveer 97% van alle usenet-downloads in één doorgang</h2>
+    <p class="lead">We hebben eerst gemeten wat er op usenet daadwerkelijk gepost wordt voordat
+    we besloten wat we zouden optimaliseren, en één idee doet het meeste werk. Alles ervan is gemeten in
     <a href="benchmarks.nl.html">de benchmarklog</a> met commando's die je zelf opnieuw kunt draaien.</p>
     <div class="grid3">
-      <div class="card"><span class="ic">🔁</span><h3>Gepipelinede NNTP</h3>
-        <p>Meerdere artikelverzoeken blijven tegelijk onderweg per verbinding, dus round-trips
-        laten de socket nooit stilvallen, en TCP laat z'n congestievenster tussen artikelen door
-        nooit inzakken. Gemeten +12% tot +270% t.o.v. serieel op vier locaties; een lijn raakt
-        verzadigd met 8 verbindingen in plaats van 30–50.</p></div>
-      <div class="card"><span class="ic">🚿</span><h3>De one-pass pipeline</h3>
+      <div class="card"><span class="ic">🚿</span><h3>Eén doorgang, vrijwel elke vorm</h3>
         <p>Artikelen worden in-place SIMD-gedecodeerd, één keer weggeschreven op hun definitieve
-        offsets, PAR2-geverifieerd vanuit de decodebuffers, en de inhoud van store-mode RAR's
-        wordt <i>tijdens</i> de download uitgepakt. De volumes bestaan nooit als bestand.
-        Schrijfwerk naar schijf = content × 1,0.</p></div>
+        offsets en PAR2-geverifieerd vanuit dezelfde buffers. Het archief wordt <i>tijdens</i> de
+        download uitgepakt, dus de volumes bestaan nooit als bestand. Dat geldt voor gewone,
+        <b>versleutelde</b> en geneste archieven, samen <a href="benchmarks.nl.html#census">zo'n
+        97% van alles wat gepost wordt, naar volume</a>. Alleen echt gecomprimeerde archieven en
+        top-level 7z hebben nog een tweede doorgang nodig, en samen zijn ze ongeveer 3%.</p></div>
       <div class="card"><span class="ic">🕸️</span><h3>Union-beschikbaarheid</h3>
         <p>Een artikel is pas "ontbrekend" als <i>élke</i> ingestelde backbone het heeft geweigerd.
         Blok-exacte boekhouding bepaalt COMPLEET / HERSTELBAAR / ONMOGELIJK voordat er bytes
         verspild worden, haalt het exact passende minimum aan recovery-blokken op, en breekt
         kansloze downloads binnen seconden af.</p></div>
+      <div class="card"><span class="ic">🔁</span><h3>Gepipelinede NNTP, goed gedaan</h3>
+        <p>Meerdere verzoeken tegelijk onderweg houden per verbinding is niet ons idee, en de
+        goede clients doen het. Dat van ons is ongewoon efficiënt: op vier locaties maten we
+        +12% tot +270% t.o.v. serieel, en een lijn raakt verzadigd met 8 verbindingen in plaats
+        van 30–50, dus je haalt de volle snelheid zonder je provider te overvragen. SABnzbd
+        levert het nog altijd uitgeschakeld.</p></div>
     </div>
   </div>
 </section>
@@ -101,9 +105,10 @@
 socket ──TLS──▶ <b>rapidyenc SIMD-decode</b> (in-place - 4,95 GB/s per core)
                    │
                    ├─▶ <b>pwrite op definitieve offset</b>     (gewone posts)
-                   │      └─ of: RAR-map vertalen ─▶ pwrite rechtstreeks in het
-                   │         <em>uitgepakte</em> bestand (store-mode posts - de rar-
-                   │         volumes raken de schijf nooit aan)
+                   │      └─ of: RAR-map vertalen ─▶ (ontgrendelen, indien versleuteld) ─▶
+                   │         pwrite rechtstreeks in het <em>uitgepakte</em> bestand
+                   │         (de rar-volumes raken de schijf nooit aan - gewone,
+                   │         versleutelde en geneste archieven, allemaal)
                    ├─▶ <b>PAR2-blokhasher</b> - elk blok MD5-geverifieerd vanuit de
                    │      decodebuffer; verificatie is klaar als de download klaar is
                    └─▶ <b>beschikbaarheidsregister</b> - blok-exacte status, live
@@ -125,7 +130,7 @@ socket ──TLS──▶ <b>rapidyenc SIMD-decode</b> (in-place - 4,95 GB/s per
     <div class="grid2">
       <ul class="feat">
         <li><b>Downloaden op lijnsnelheid:</b> <span class="d">gepipelinede NNTP gemeten op 8,31 Gbps over 10 GbE; de snelste client op elke schone benchmarkleg, bij elke grootte.</span></li>
-        <li><b>One-pass pipeline:</b> <span class="d">decoderen, verifiëren en uitpakken overlappen; store-mode RAR-volumes raken de schijf nooit; geneste archieven pakken uit in dezelfde doorgang; heeft 1× schijf nodig waar anderen ~2× nodig hebben.</span></li>
+        <li><b>One-pass pipeline:</b> <span class="d">decoderen, verifiëren en uitpakken overlappen; de archiefvolumes raken de schijf nooit, of de post nu gewoon, versleuteld of genest is; heeft 1× schijf nodig waar anderen ~2× nodig hebben. Bij een versleutelde release van 94 GB is dat 90 GB geschreven in plaats van 180 GB.</span></li>
         <li><b>Union-beschikbaarheid over meerdere providers:</b> <span class="d">blok-exacte routing over backbones; preflight-oordelen; exact passend herstel; vroegtijdig afbreken van onmogelijke posts.</span></li>
         <li><b>Geheugenbudget:</b> <span class="d">één globaal RAM-budget met nette spill-niveaus. Het laat je machine nooit swappen: een taak van 190 GB voltooit binnen een budget van 1 GB (~1,1 GB piek-RSS).</span></li>
         <li><b>Crashbestendig hervatten:</b> <span class="d">dankzij een journal op artikelniveau kost een crash of kill −9 midden in een download vrijwel niets: hij hervat en haalt alleen opnieuw op wat nog niet was opgeslagen.</span></li>

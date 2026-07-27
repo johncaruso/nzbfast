@@ -66,25 +66,29 @@
 <section>
   <div class="wrap">
     <p class="kicker">De ce e rapid</p>
-    <h2>Trei idei pe care clienții obișnuiți nu le exploatează pe deplin</h2>
-    <p class="lead">Nu micro-optimizare, arhitectură. Fiecare este măsurată în
-    <a href="benchmarks.ro.html">jurnalul de benchmark</a> cu comenzi reproductibile.</p>
+    <h2>Circa 97% dintre descărcările usenet într-o singură trecere</h2>
+    <p class="lead">Am măsurat ce se postează de fapt pe usenet înainte de a decide ce optimizăm,
+    iar o singură idee face cea mai mare parte a muncii. Totul este măsurat în
+    <a href="benchmarks.ro.html">jurnalul de benchmark</a> cu comenzi pe care le poți rula din nou.</p>
     <div class="grid3">
-      <div class="card"><span class="ic">🔁</span><h3>NNTP cu pipelining</h3>
-        <p>Mai multe cereri de articole rămân în tranzit per conexiune, așa că dus-întorsurile nu lasă niciodată
-        socketul inactiv, iar TCP nu-și degradează niciodată fereastra de congestie între articole.
-        Măsurat +12% până la +270% față de serial la patru servere; o linie se saturează cu 8
-        conexiuni în loc de 30–50.</p></div>
-      <div class="card"><span class="ic">🚿</span><h3>Pipeline-ul într-o singură trecere</h3>
-        <p>Articolele sunt decodate SIMD pe loc, scrise o singură dată la offset-urile lor finale,
-        verificate PAR2 din bufferele de decodare, iar conținutul RAR în mod store este
-        extras <i>în timpul</i> descărcării. Volumele nu există niciodată ca fișiere.
-        Scrieri pe disc = conținut × 1.0.</p></div>
+      <div class="card"><span class="ic">🚿</span><h3>O singură trecere, aproape orice formă</h3>
+        <p>Articolele sunt decodate SIMD pe loc, scrise o singură dată direct la offset-urile lor
+        finale și verificate PAR2 din aceleași buffere. Arhiva este extrasă <i>în timpul</i>
+        descărcării, așa că volumele ei nu există niciodată ca fișiere. Asta e valabil pentru
+        arhivele simple, <b>criptate</b> și imbricate, adică <a href="benchmarks.ro.html#census">circa
+        97% din tot ce se postează, ca volum de date</a>. Doar arhivele cu adevărat comprimate și
+        7z la nivelul de sus mai au nevoie de o a doua trecere, iar împreună sunt circa 3%.</p></div>
       <div class="card"><span class="ic">🕸️</span><h3>Disponibilitate prin uniune</h3>
         <p>Un articol este „lipsă” doar când <i>fiecare</i> backbone configurat l-a
         refuzat. Contabilitatea exactă la nivel de bloc decide COMPLETE / REPAIRABLE / IMPOSSIBLE înainte de
         a irosi octeți, preia minimul exact potrivit de blocuri de recuperare și abandonează
         descărcările fără speranță în câteva secunde.</p></div>
+      <div class="card"><span class="ic">🔁</span><h3>NNTP cu pipelining, făcut bine</h3>
+        <p>Să ții mai multe cereri în tranzit per conexiune nu e ideea noastră, iar clienții buni
+        o fac. Al nostru este neobișnuit de eficient: la patru servere am măsurat +12% până la
+        +270% față de serial, iar o linie se saturează cu 8 conexiuni în loc de 30–50, așa că
+        obții viteză maximă fără să-ți suprasoliciți providerul. SABnzbd încă îl livrează
+        dezactivat.</p></div>
     </div>
   </div>
 </section>
@@ -100,9 +104,10 @@
 socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place - 4.95 GB/s per core)
                    │
                    ├─▶ <b>pwrite at final offset</b>          (plain posts)
-                   │      └─ or: RAR-map translate ─▶ pwrite straight into the
-                   │         <em>extracted</em> file (store-mode posts - the rar
-                   │         volumes never touch disk)
+                   │      └─ or: RAR-map translate ─▶ (unlock, if encrypted) ─▶
+                   │         pwrite straight into the <em>extracted</em> file
+                   │         (the rar volumes never touch disk - plain,
+                   │         encrypted and nested archives alike)
                    ├─▶ <b>PAR2 block hasher</b> - every block MD5-verified from the
                    │      decode buffer; verification finishes with the download
                    └─▶ <b>availability ledger</b> - block-exact health, live
@@ -124,7 +129,7 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place - 4.95 GB/s per
     <div class="grid2">
       <ul class="feat">
         <li><b>Descărcări la viteza liniei:</b> <span class="d">NNTP cu pipelining măsurat la 8.31 Gbps pe 10 GbE; cel mai rapid client pe fiecare probă de benchmark curată, la orice dimensiune.</span></li>
-        <li><b>Pipeline într-o singură trecere:</b> <span class="d">decodarea, verificarea și extragerea se suprapun; volumele RAR în mod store nu ating niciodată discul; arhivele imbricate se despachetează în aceeași trecere; are nevoie de 1× disc unde alții au nevoie de ~2×.</span></li>
+        <li><b>Pipeline într-o singură trecere:</b> <span class="d">decodarea, verificarea și extragerea se suprapun; volumele de arhivă nu ating niciodată discul, fie că postarea e simplă, criptată sau imbricată; are nevoie de 1× disc unde alții au nevoie de ~2×. La o lansare criptată de 94 GB, asta înseamnă 90 GB scriși în loc de 180 GB.</span></li>
         <li><b>Disponibilitate prin uniune multi-provider:</b> <span class="d">rutare exactă la nivel de bloc între backbone-uri; verdicte preflight; reparare exact potrivită; abandon timpuriu al postărilor imposibile.</span></li>
         <li><b>Buget de memorie:</b> <span class="d">un singur buget global de RAM cu niveluri elegante de spill. Nu îți solicită niciodată swap-ul mașinii: un job de 190 GB se finalizează într-un buget de 1 GB (~1.1 GB RSS de vârf).</span></li>
         <li><b>Reluare sigură la blocare:</b> <span class="d">un jurnal la nivel de articol înseamnă că o blocare sau un kill −9 în mijlocul descărcării nu costă aproape nimic: se reia, repreluând doar ce nu a fost salvat.</span></li>

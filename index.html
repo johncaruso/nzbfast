@@ -66,25 +66,28 @@
 <section>
   <div class="wrap">
     <p class="kicker">Why it's fast</p>
-    <h2>Three ideas the mainstream clients don't fully exploit</h2>
-    <p class="lead">This is architecture, not micro-optimisation, and every bit of it is
-    measured in <a href="benchmarks.html">the benchmark log</a> with commands you can re-run.</p>
+    <h2>About 97% of usenet downloads in a single pass</h2>
+    <p class="lead">We measured what usenet actually posts before deciding what to optimise,
+    and one idea does most of the work. All of it is measured in
+    <a href="benchmarks.html">the benchmark log</a> with commands you can re-run.</p>
     <div class="grid3">
-      <div class="card"><span class="ic">🔁</span><h3>Pipelined NNTP</h3>
-        <p>Several article requests stay in flight on each connection, so a round-trip
-        never leaves the socket idle and TCP never lets its congestion window decay between
-        articles. Across four sites we measured +12% to +270% over serial, and a line
-        saturates at 8 connections rather than 30–50.</p></div>
-      <div class="card"><span class="ic">🚿</span><h3>The one-pass pipeline</h3>
-        <p>Articles are SIMD-decoded in place and written once, straight to their final
-        offsets, then PAR2-verified out of the same decode buffers. For store-mode RAR posts
-        the contents are extracted <i>during</i> the download, so the volumes never exist as
-        files: disk written comes to content × 1.0.</p></div>
+      <div class="card"><span class="ic">🚿</span><h3>One pass, nearly every shape</h3>
+        <p>Articles are SIMD-decoded in place, written once straight to their final offsets,
+        and PAR2-verified out of the same buffers. The archive is extracted <i>during</i> the
+        download, so its volumes never exist as files at all. That holds for plain,
+        <b>encrypted</b> and nested archives, which is <a href="benchmarks.html#census">about
+        97% of everything posted, by volume</a>. Only genuinely compressed archives and
+        top-level 7z still need a second pass, and between them they are about 3%.</p></div>
       <div class="card"><span class="ic">🕸️</span><h3>Union availability</h3>
         <p>An article counts as "missing" only once <i>every</i> configured backbone has
         turned it down. Block-exact accounting calls the job COMPLETE, REPAIRABLE or
         IMPOSSIBLE before wasting bytes, pulls just the exact-fit minimum of recovery
         blocks, and drops hopeless downloads within seconds.</p></div>
+      <div class="card"><span class="ic">🔁</span><h3>Pipelined NNTP, done well</h3>
+        <p>Keeping several requests in flight per connection is not our idea, and the good
+        clients do it. Ours is unusually efficient: across four sites we measured +12% to
+        +270% over serial, and a line saturates at 8 connections rather than 30–50, so you
+        get full speed without hammering your provider. SABnzbd still ships it switched off.</p></div>
     </div>
   </div>
 </section>
@@ -100,9 +103,10 @@
 socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place - 4.95 GB/s per core)
                    │
                    ├─▶ <b>pwrite at final offset</b>          (plain posts)
-                   │      └─ or: RAR-map translate ─▶ pwrite straight into the
-                   │         <em>extracted</em> file (store-mode posts - the rar
-                   │         volumes never touch disk)
+                   │      └─ or: RAR-map translate ─▶ (unlock, if encrypted) ─▶
+                   │         pwrite straight into the <em>extracted</em> file
+                   │         (the rar volumes never touch disk - plain,
+                   │         encrypted and nested archives alike)
                    ├─▶ <b>PAR2 block hasher</b> - every block MD5-verified from the
                    │      decode buffer; verification finishes with the download
                    └─▶ <b>availability ledger</b> - block-exact health, live
@@ -124,7 +128,7 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place - 4.95 GB/s per
     <div class="grid2">
       <ul class="feat">
         <li><b>Line-rate downloads:</b> <span class="d">pipelined NNTP measured at 8.31 Gbps on 10 GbE; the fastest client on every clean benchmark leg, at every size.</span></li>
-        <li><b>One-pass pipeline:</b> <span class="d">decode, verify and extract overlap; store-mode RAR volumes never hit disk; nested archives unpack in the same pass; needs 1× disk where others need ~2×.</span></li>
+        <li><b>One-pass pipeline:</b> <span class="d">decode, verify and extract overlap; the archive volumes never hit disk, whether the post is plain, encrypted or nested; needs 1× disk where others need ~2×. On a 94 GB encrypted release that is 90 GB written instead of 180 GB.</span></li>
         <li><b>Multi-provider union availability:</b> <span class="d">block-exact routing across backbones; preflight verdicts; exact-fit repair; early abort of impossible posts.</span></li>
         <li><b>Memory budget:</b> <span class="d">one global RAM budget with graceful spill tiers. It never swaps your machine: a 190 GB job completes inside a 1 GB budget (~1.1 GB peak RSS).</span></li>
         <li><b>Crash-safe resume:</b> <span class="d">an article-level journal means a crash or kill −9 mid-download costs almost nothing. It resumes, refetching only what wasn't saved.</span></li>

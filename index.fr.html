@@ -67,25 +67,30 @@
 <section>
   <div class="wrap">
     <p class="kicker">Pourquoi c’est rapide</p>
-    <h2>Trois idées que les clients grand public n’exploitent pas à fond</h2>
-    <p class="lead">C’est de l’architecture, pas de la micro-optimisation, et tout est mesuré dans
+    <h2>Environ 97% des téléchargements usenet en une seule passe</h2>
+    <p class="lead">Nous avons mesuré ce qu’usenet poste réellement avant de décider quoi
+    optimiser, et une seule idée fait l’essentiel du travail. Tout est mesuré dans
     <a href="benchmarks.fr.html">le journal de benchmarks</a> avec des commandes que vous pouvez relancer vous-même.</p>
     <div class="grid3">
-      <div class="card"><span class="ic">🔁</span><h3>NNTP pipeliné</h3>
-        <p>Plusieurs requêtes d’articles restent en vol par connexion : les allers-retours ne
-        laissent jamais le socket inactif, et TCP n’affaisse jamais sa fenêtre de congestion
-        entre deux articles. Mesuré de +12% à +270% face au mode sériel sur quatre sites ; une
-        ligne sature avec 8 connexions au lieu de 30–50.</p></div>
-      <div class="card"><span class="ic">🚿</span><h3>Le pipeline en une passe</h3>
-        <p>Les articles sont décodés en SIMD sur place, écrits une seule fois à leur position
-        finale, vérifiés en PAR2 depuis les tampons de décodage, et le contenu des RAR en mode
-        store est extrait <i>pendant</i> le téléchargement, les volumes n’existent jamais sous
-        forme de fichiers. Écritures disque = contenu × 1.0.</p></div>
+      <div class="card"><span class="ic">🚿</span><h3>Une passe, presque toutes les formes</h3>
+        <p>Les articles sont décodés en SIMD sur place, écrits une seule fois directement à leur
+        position finale, et vérifiés en PAR2 depuis les mêmes tampons. L’archive est extraite
+        <i>pendant</i> le téléchargement, ses volumes n’existent donc jamais sous forme de
+        fichiers. Cela vaut pour les archives simples, <b>chiffrées</b> et imbriquées, soit
+        <a href="benchmarks.fr.html#census">environ 97% de tout ce qui est posté, en volume</a>.
+        Seules les archives réellement compressées et les 7z de premier niveau exigent encore une
+        seconde passe, et à elles deux elles représentent environ 3%.</p></div>
       <div class="card"><span class="ic">🕸️</span><h3>Disponibilité en union</h3>
         <p>Un article n’est « manquant » que lorsque <i>chaque</i> backbone configuré l’a refusé.
         Un décompte au bloc près tranche COMPLET / RÉPARABLE / IMPOSSIBLE avant de gaspiller le
         moindre octet, récupère le minimum ajusté de blocs de récupération, et abandonne les
         téléchargements sans espoir en quelques secondes.</p></div>
+      <div class="card"><span class="ic">🔁</span><h3>NNTP pipeliné, bien fait</h3>
+        <p>Garder plusieurs requêtes en vol par connexion n’est pas notre idée, et les bons
+        clients le font. Le nôtre est exceptionnellement efficace : sur quatre sites nous avons
+        mesuré de +12% à +270% face au mode sériel, et une ligne sature avec 8 connexions au lieu
+        de 30–50, vous obtenez donc la pleine vitesse sans marteler votre fournisseur. SABnzbd le
+        livre toujours désactivé.</p></div>
     </div>
   </div>
 </section>
@@ -101,9 +106,10 @@
 socket ──TLS──▶ <b>décodage SIMD rapidyenc</b> (sur place - 4.95 GB/s par cœur)
                    │
                    ├─▶ <b>pwrite à la position finale</b>       (posts simples)
-                   │      └─ ou : traduction RAR-map ─▶ pwrite directement dans le
-                   │         fichier <em>extrait</em> (posts en mode store - les
-                   │         volumes rar ne touchent jamais le disque)
+                   │      └─ ou : traduction RAR-map ─▶ (déverrouillage, si chiffré) ─▶
+                   │         pwrite directement dans le fichier <em>extrait</em>
+                   │         (les volumes rar ne touchent jamais le disque - archives
+                   │         simples, chiffrées et imbriquées)
                    ├─▶ <b>hacheur de blocs PAR2</b> - chaque bloc vérifié en MD5 depuis
                    │      le tampon de décodage ; la vérification finit avec le téléchargement
                    └─▶ <b>registre de disponibilité</b> - santé au bloc près, en direct
@@ -125,7 +131,7 @@ socket ──TLS──▶ <b>décodage SIMD rapidyenc</b> (sur place - 4.95 GB/s
     <div class="grid2">
       <ul class="feat">
         <li><b>Téléchargements à la vitesse de la ligne:</b> <span class="d">NNTP pipeliné mesuré à 8.31 Gbps sur 10 GbE ; le client le plus rapide sur chaque manche de benchmark propre, à toutes les tailles.</span></li>
-        <li><b>Pipeline en une passe:</b> <span class="d">décodage, vérification et extraction se chevauchent ; les volumes RAR en mode store ne touchent jamais le disque ; les archives imbriquées se décompressent dans la même passe ; 1× de disque là où les autres en exigent ~2×.</span></li>
+        <li><b>Pipeline en une passe:</b> <span class="d">décodage, vérification et extraction se chevauchent ; les volumes d’archive ne touchent jamais le disque, que le post soit simple, chiffré ou imbriqué ; 1× de disque là où les autres en exigent ~2×. Sur une publication chiffrée de 94 GB, cela fait 90 GB écrits au lieu de 180 GB.</span></li>
         <li><b>Disponibilité en union multi-fournisseurs:</b> <span class="d">routage au bloc près à travers les backbones ; verdicts avant décollage ; réparation au plus juste ; abandon précoce des posts impossibles.</span></li>
         <li><b>Budget mémoire:</b> <span class="d">un budget global de RAM avec des paliers de débordement en douceur. Il ne fait jamais swapper votre machine : une tâche de 190 GB se termine dans un budget de 1 GB (~1.1 GB de RSS au pic).</span></li>
         <li><b>Reprise résistante aux crashs:</b> <span class="d">grâce au journal au niveau de l’article, un crash ou un kill −9 en plein téléchargement ne coûte presque rien : il reprend, en ne re-téléchargeant que ce qui n’était pas sauvegardé.</span></li>

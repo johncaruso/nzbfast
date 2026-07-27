@@ -66,25 +66,30 @@
 <section>
   <div class="wrap">
     <p class="kicker">Perché è veloce</p>
-    <h2>Tre idee che i client mainstream non sfruttano fino in fondo</h2>
-    <p class="lead">Non micro-ottimizzazioni, architettura. Ognuna è misurata nel
+    <h2>Circa il 97% dei download usenet in una sola passata</h2>
+    <p class="lead">Abbiamo misurato cosa viene davvero pubblicato su usenet prima di decidere
+    cosa ottimizzare, e un'idea da sola fa quasi tutto il lavoro. Tutto è misurato nel
     <a href="benchmarks.it.html">log dei benchmark</a> con comandi riproducibili.</p>
     <div class="grid3">
-      <div class="card"><span class="ic">🔁</span><h3>NNTP in pipeline</h3>
-        <p>Più richieste di articoli restano in volo per connessione, così i round-trip non lasciano
-        mai il socket inattivo, e TCP non decade mai la sua finestra di congestione tra un articolo e l'altro.
-        Misurato da +12% a +270% rispetto al seriale su quattro siti; una linea satura con 8
-        connessioni invece di 30–50.</p></div>
-      <div class="card"><span class="ic">🚿</span><h3>La pipeline a passata unica</h3>
-        <p>Gli articoli vengono decodificati SIMD sul posto, scritti una sola volta ai loro offset finali,
-        verificati PAR2 dai buffer di decodifica, e i contenuti RAR in modalità store vengono
-        estratti <i>durante</i> il download, i volumi non esistono mai come file.
-        Scritture su disco = contenuto × 1.0.</p></div>
+      <div class="card"><span class="ic">🚿</span><h3>Una passata, quasi ogni forma</h3>
+        <p>Gli articoli vengono decodificati SIMD sul posto, scritti una sola volta ai loro
+        offset finali e verificati PAR2 dagli stessi buffer. L'archivio viene estratto
+        <i>durante</i> il download, così i suoi volumi non esistono mai come file. Vale per gli
+        archivi semplici, <b>cifrati</b> e annidati, cioè <a href="benchmarks.it.html#census">circa
+        il 97% di tutto ciò che viene pubblicato, in volume</a>. Solo gli archivi davvero
+        compressi e i 7z di primo livello richiedono ancora una seconda passata, e insieme
+        sono circa il 3%.</p></div>
       <div class="card"><span class="ic">🕸️</span><h3>Disponibilità in unione</h3>
         <p>Un articolo è «mancante» solo quando <i>ogni</i> backbone configurato lo ha rifiutato.
         Una contabilità esatta al blocco decide COMPLETO / RIPARABILE / IMPOSSIBILE prima di
         sprecare byte, recupera il minimo su misura di blocchi di recupero e interrompe in pochi
         secondi i download senza speranza.</p></div>
+      <div class="card"><span class="ic">🔁</span><h3>NNTP in pipeline, fatto bene</h3>
+        <p>Tenere più richieste in volo per connessione non è un'idea nostra, e i client migliori
+        lo fanno. Il nostro è insolitamente efficiente: su quattro siti abbiamo misurato da +12%
+        a +270% rispetto al seriale, e una linea satura con 8 connessioni invece di 30–50, così
+        hai la piena velocità senza martellare il tuo provider. SABnzbd lo distribuisce ancora
+        disattivato.</p></div>
     </div>
   </div>
 </section>
@@ -100,9 +105,10 @@
 socket ──TLS──▶ <b>decodifica SIMD rapidyenc</b> (sul posto - 4.95 GB/s per core)
                    │
                    ├─▶ <b>pwrite all'offset finale</b>          (post semplici)
-                   │      └─ oppure: traduzione RAR-map ─▶ pwrite dritto nel file
-                   │         <em>estratto</em> (post in modalità store - i volumi rar
-                   │         non toccano mai il disco)
+                   │      └─ oppure: traduzione RAR-map ─▶ (sblocco, se cifrato) ─▶
+                   │         pwrite dritto nel file <em>estratto</em>
+                   │         (i volumi rar non toccano mai il disco - archivi
+                   │         semplici, cifrati e annidati allo stesso modo)
                    ├─▶ <b>hasher a blocchi PAR2</b> - ogni blocco verificato in MD5 dal
                    │      buffer di decodifica; la verifica finisce col download
                    └─▶ <b>registro di disponibilità</b> - salute esatta al blocco, in tempo reale
@@ -124,7 +130,7 @@ socket ──TLS──▶ <b>decodifica SIMD rapidyenc</b> (sul posto - 4.95 GB/
     <div class="grid2">
       <ul class="feat">
         <li><b>Download a velocità di linea:</b> <span class="d">NNTP in pipeline misurato a 8.31 Gbps su 10 GbE; il client più veloce in ogni prova di benchmark pulita, a ogni dimensione.</span></li>
-        <li><b>Pipeline a passata unica:</b> <span class="d">decodifica, verifica ed estrazione si sovrappongono; i volumi RAR in modalità store non toccano mai il disco; gli archivi annidati si estraggono nella stessa passata; serve 1× di disco dove agli altri serve ~2×.</span></li>
+        <li><b>Pipeline a passata unica:</b> <span class="d">decodifica, verifica ed estrazione si sovrappongono; i volumi dell'archivio non toccano mai il disco, che il post sia semplice, cifrato o annidato; serve 1× di disco dove agli altri serve ~2×. Su una release cifrata da 94 GB sono 90 GB scritti invece di 180 GB.</span></li>
         <li><b>Disponibilità in unione multi-provider:</b> <span class="d">instradamento esatto al blocco tra i backbone; verdetti preliminari; riparazione su misura; interruzione precoce dei post impossibili.</span></li>
         <li><b>Budget di memoria:</b> <span class="d">un unico budget globale di RAM con livelli di spill gestiti con grazia. Non manda mai in swap la tua macchina: un job da 190 GB si completa dentro un budget di 1 GB (~1.1 GB di picco RSS).</span></li>
         <li><b>Ripresa a prova di crash:</b> <span class="d">un journal a livello di articolo fa sì che un crash o un kill −9 a metà download costi quasi nulla: riprende, riscaricando solo quanto non era stato salvato.</span></li>

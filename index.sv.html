@@ -66,25 +66,29 @@
 <section>
   <div class="wrap">
     <p class="kicker">Varför den är snabb</p>
-    <h2>Tre idéer som de gängse klienterna inte utnyttjar fullt ut</h2>
-    <p class="lead">Det här är arkitektur, inte mikrooptimering, och varenda del av det är uppmätt i
+    <h2>Ungefär 97 % av alla usenet-nedladdningar i ett enda pass</h2>
+    <p class="lead">Vi mätte vad usenet faktiskt postar innan vi bestämde vad som skulle optimeras,
+    och en enda idé gör det mesta av jobbet. Allt är uppmätt i
     <a href="benchmarks.sv.html">benchmark-loggen</a> med kommandon du kan köra om.</p>
     <div class="grid3">
-      <div class="card"><span class="ic">🔁</span><h3>Pipelinead NNTP</h3>
-        <p>Flera artikelförfrågningar hålls i luften på varje anslutning, så en tur och retur
-        lämnar aldrig socketen sysslolös och TCP låter aldrig sitt congestion-fönster tyna mellan
-        artiklar. Över fyra sajter mätte vi +12 % till +270 % jämfört med seriell, och en linje
-        mättas vid 8 anslutningar i stället för 30–50.</p></div>
-      <div class="card"><span class="ic">🚿</span><h3>Enpassrörledningen</h3>
-        <p>Artiklar SIMD-avkodas på plats och skrivs en enda gång, rakt till sina slutliga
-        offset, och PAR2-verifieras sedan ur samma avkodningsbuffertar. För store-mode-RAR-inlägg
-        packas innehållet upp <i>under</i> nedladdningen, så volymerna existerar aldrig som filer:
-        diskskrivningar hamnar på innehåll × 1.0.</p></div>
+      <div class="card"><span class="ic">🚿</span><h3>Ett pass, nästan varje form</h3>
+        <p>Artiklar SIMD-avkodas på plats, skrivs en enda gång rakt till sina slutliga offset
+        och PAR2-verifieras ur samma buffertar. Arkivet packas upp <i>under</i> nedladdningen,
+        så dess volymer existerar aldrig som filer över huvud taget. Det gäller vanliga,
+        <b>krypterade</b> och nästlade arkiv, vilket är <a href="benchmarks.sv.html#census">ungefär
+        97 % av allt som postas, räknat i volym</a>. Bara genuint komprimerade arkiv och 7z på
+        toppnivå behöver fortfarande ett andra pass, och tillsammans är de ungefär 3 %.</p></div>
       <div class="card"><span class="ic">🕸️</span><h3>Union-tillgänglighet</h3>
         <p>En artikel räknas som "saknad" först när <i>varje</i> konfigurerad backbone har
         tackat nej. Blockexakt bokföring avgör COMPLETE, REPAIRABLE eller IMPOSSIBLE innan byte
         slösas bort, hämtar precis det exakt passande minimum av återställningsblock och släpper
         hopplösa nedladdningar på några sekunder.</p></div>
+      <div class="card"><span class="ic">🔁</span><h3>Pipelinead NNTP, gjord ordentligt</h3>
+        <p>Att hålla flera förfrågningar i luften per anslutning är inte vår idé, och de bra
+        klienterna gör det. Vår är ovanligt effektiv: över fyra sajter mätte vi +12 % till
+        +270 % jämfört med seriell, och en linje mättas vid 8 anslutningar i stället för 30–50,
+        så du får full fart utan att hamra på din provider. SABnzbd levererar den fortfarande
+        avstängd.</p></div>
     </div>
   </div>
 </section>
@@ -100,9 +104,10 @@
 socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place - 4.95 GB/s per core)
                    │
                    ├─▶ <b>pwrite at final offset</b>          (plain posts)
-                   │      └─ or: RAR-map translate ─▶ pwrite straight into the
-                   │         <em>extracted</em> file (store-mode posts - the rar
-                   │         volumes never touch disk)
+                   │      └─ or: RAR-map translate ─▶ (unlock, if encrypted) ─▶
+                   │         pwrite straight into the <em>extracted</em> file
+                   │         (the rar volumes never touch disk - plain,
+                   │         encrypted and nested archives alike)
                    ├─▶ <b>PAR2 block hasher</b> - every block MD5-verified from the
                    │      decode buffer; verification finishes with the download
                    └─▶ <b>availability ledger</b> - block-exact health, live
@@ -124,7 +129,7 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place - 4.95 GB/s per
     <div class="grid2">
       <ul class="feat">
         <li><b>Nedladdningar i linjefart:</b> <span class="d">pipelinead NNTP uppmätt till 8.31 Gbps på 10 GbE; den snabbaste klienten på varje ren benchmark-etapp, i varje storlek.</span></li>
-        <li><b>Enpassrörledning:</b> <span class="d">avkoda, verifiera och packa upp överlappar; store-mode-RAR-volymer rör aldrig disken; nästlade arkiv packas upp i samma pass; behöver 1× disk där andra behöver ~2×.</span></li>
+        <li><b>Enpassrörledning:</b> <span class="d">avkoda, verifiera och packa upp överlappar; arkivvolymerna rör aldrig disken, oavsett om inlägget är vanligt, krypterat eller nästlat; behöver 1× disk där andra behöver ~2×. På en 94 GB krypterad release är det 90 GB skrivet i stället för 180 GB.</span></li>
         <li><b>Union-tillgänglighet över flera providers:</b> <span class="d">blockexakt routning över backbones; preflight-utlåtanden; exakt passande reparation; tidigt avbrott av omöjliga inlägg.</span></li>
         <li><b>Minnesbudget:</b> <span class="d">en global RAM-budget med graciösa spill-nivåer. Den swappar aldrig din maskin: ett 190 GB-jobb blir klart inom en 1 GB-budget (~1.1 GB topp-RSS).</span></li>
         <li><b>Kraschsäker återupptagning:</b> <span class="d">en journal på artikelnivå gör att en krasch eller kill −9 mitt i nedladdningen kostar nästan ingenting: den återupptas och hämtar bara om det som inte hunnit sparas.</span></li>

@@ -66,25 +66,30 @@
 <section>
   <div class="wrap">
     <p class="kicker">Por que é rápido</p>
-    <h2>Três ideias que os clientes convencionais não exploram por completo</h2>
-    <p class="lead">Isto é arquitetura, não micro-otimização, e cada detalhe é medido em
+    <h2>Cerca de 97% dos downloads de usenet em uma única passagem</h2>
+    <p class="lead">Medimos o que a usenet realmente publica antes de decidir o que otimizar,
+    e uma ideia sozinha faz a maior parte do trabalho. Tudo é medido em
     <a href="benchmarks.pt.html">nosso benchmark log</a> com comandos que você mesmo pode reexecutar.</p>
     <div class="grid3">
-      <div class="card"><span class="ic">🔁</span><h3>NNTP com pipeline</h3>
-        <p>Várias solicitações de artigos ficam em trânsito em cada conexão, então uma ida e volta nunca
-        deixa o socket ocioso e o TCP nunca deixa sua janela de congestionamento degradar entre artigos.
-        Em quatro locais, medimos de +12% a +270% sobre o serial, e uma linha satura com 8
-        conexões em vez de 30–50.</p></div>
-      <div class="card"><span class="ic">🚿</span><h3>O pipeline de passagem única</h3>
-        <p>Os artigos são decodificados por SIMD no próprio lugar e escritos uma única vez, direto para seus
-        deslocamentos finais, e então verificados por PAR2 a partir dos mesmos buffers de decodificação.
-        Nas publicações RAR em modo armazenamento, o conteúdo é extraído <i>durante</i> o download, então os
-        volumes nunca existem como arquivos: o disco escrito fica em conteúdo × 1,0.</p></div>
+      <div class="card"><span class="ic">🚿</span><h3>Uma passagem, quase todo formato</h3>
+        <p>Os artigos são decodificados por SIMD no próprio lugar, escritos uma única vez direto
+        para seus deslocamentos finais e verificados por PAR2 a partir dos mesmos buffers. O
+        arquivo compactado é extraído <i>durante</i> o download, então seus volumes nunca existem
+        como arquivos. Isso vale para arquivos simples, <b>criptografados</b> e aninhados, o que é
+        <a href="benchmarks.pt.html#census">cerca de 97% de tudo o que é publicado, em volume</a>.
+        Só arquivos genuinamente comprimidos e 7z de nível superior ainda precisam de uma segunda
+        passagem, e juntos somam cerca de 3%.</p></div>
       <div class="card"><span class="ic">🕸️</span><h3>Disponibilidade por união</h3>
         <p>Um artigo só conta como "ausente" quando <i>todo</i> backbone configurado o recusou.
         A contabilidade exata por bloco declara o trabalho COMPLETE, REPAIRABLE ou IMPOSSIBLE antes de
         desperdiçar bytes, puxa apenas o mínimo sob medida de blocos de recuperação e descarta
         downloads sem esperança em segundos.</p></div>
+      <div class="card"><span class="ic">🔁</span><h3>NNTP com pipeline, bem feito</h3>
+        <p>Manter várias solicitações em trânsito por conexão não é ideia nossa, e os bons
+        clientes fazem isso. O nosso é incomumente eficiente: em quatro locais medimos de +12%
+        a +270% sobre o serial, e uma linha satura com 8 conexões em vez de 30–50, então você
+        tem a velocidade total sem martelar seu provedor. O SABnzbd ainda o entrega
+        desligado.</p></div>
     </div>
   </div>
 </section>
@@ -100,9 +105,10 @@
 socket ──TLS──▶ <b>decodificação SIMD rapidyenc</b> (no lugar - 4,95 GB/s por núcleo)
                    │
                    ├─▶ <b>pwrite no deslocamento final</b>     (posts simples)
-                   │      └─ ou: tradução RAR-map ─▶ pwrite direto no
-                   │         arquivo <em>extraído</em> (posts em modo store - os
-                   │         volumes rar nunca tocam o disco)
+                   │      └─ ou: tradução RAR-map ─▶ (desbloqueio, se criptografado) ─▶
+                   │         pwrite direto no arquivo <em>extraído</em>
+                   │         (os volumes rar nunca tocam o disco - arquivos
+                   │         simples, criptografados e aninhados, todos)
                    ├─▶ <b>hasher de blocos PAR2</b> - cada bloco verificado em MD5 do
                    │      buffer de decodificação; a verificação termina com o download
                    └─▶ <b>registro de disponibilidade</b> - saúde exata por bloco, ao vivo
@@ -124,7 +130,7 @@ socket ──TLS──▶ <b>decodificação SIMD rapidyenc</b> (no lugar - 4,95
     <div class="grid2">
       <ul class="feat">
         <li><b>Downloads em velocidade de linha:</b> <span class="d">NNTP com pipeline medido a 8,31 Gbps em 10 GbE; o cliente mais rápido em cada leg limpo de benchmark, em todos os tamanhos.</span></li>
-        <li><b>Pipeline de passagem única:</b> <span class="d">decodificação, verificação e extração se sobrepõem; volumes RAR em modo armazenamento nunca chegam ao disco; arquivos aninhados são desempacotados na mesma passagem; precisa de 1× de disco onde outros precisam de ~2×.</span></li>
+        <li><b>Pipeline de passagem única:</b> <span class="d">decodificação, verificação e extração se sobrepõem; os volumes do arquivo nunca chegam ao disco, seja a publicação simples, criptografada ou aninhada; precisa de 1× de disco onde outros precisam de ~2×. Em uma release criptografada de 94 GB, isso é 90 GB escritos em vez de 180 GB.</span></li>
         <li><b>Disponibilidade por união multiprovedor:</b> <span class="d">roteamento exato por bloco entre backbones; vereditos de preflight; reparo sob medida; aborto antecipado de publicações impossíveis.</span></li>
         <li><b>Orçamento de memória:</b> <span class="d">um orçamento de RAM global com níveis graduais de spill. Ele nunca faz swap da sua máquina: um trabalho de 190 GB termina dentro de um orçamento de 1 GB (~1,1 GB de pico de RSS).</span></li>
         <li><b>Retomada à prova de travamento:</b> <span class="d">um diário no nível de artigo faz com que um travamento ou kill −9 no meio do download custe quase nada: ele retoma, rebuscando apenas o que não foi salvo.</span></li>

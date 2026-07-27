@@ -66,25 +66,31 @@
 <section>
   <div class="wrap">
     <p class="kicker">Warum es schnell ist</p>
-    <h2>Drei Ideen, die die gängigen Clients nicht voll ausreizen</h2>
-    <p class="lead">Das ist Architektur, keine Mikro-Optimierung, und jedes bisschen davon ist im
+    <h2>Rund 97 % der Usenet-Downloads in einem einzigen Durchlauf</h2>
+    <p class="lead">Wir haben gemessen, was im Usenet tatsächlich gepostet wird, bevor wir
+    entschieden haben, was wir optimieren, und eine Idee erledigt den Großteil der Arbeit.
+    Alles davon ist im
     <a href="benchmarks.de.html">Benchmark-Log</a> mit Befehlen belegt, die du selbst nachfahren kannst.</p>
     <div class="grid3">
-      <div class="card"><span class="ic">🔁</span><h3>Pipelined NNTP</h3>
-        <p>Mehrere Artikel-Anfragen bleiben pro Verbindung gleichzeitig unterwegs, sodass
-        ein Round-Trip den Socket nie leerlaufen lässt und TCP sein Congestion-Window
-        zwischen Artikeln nie verfallen lässt. An vier Standorten haben wir +12 % bis +270 %
-        gegenüber seriell gemessen, und eine Leitung sättigt schon bei 8 Verbindungen statt 30–50.</p></div>
-      <div class="card"><span class="ic">🚿</span><h3>Die Ein-Pass-Pipeline</h3>
-        <p>Artikel werden per SIMD an Ort und Stelle dekodiert, einmal an ihre endgültigen
-        Offsets geschrieben, aus den Decode-Puffern PAR2-geprüft, und Store-Modus-RAR-Inhalte
-        werden <i>während</i> des Downloads entpackt. Die Volumes existieren nie als Dateien.
-        Schreiblast = Inhalt × 1,0.</p></div>
+      <div class="card"><span class="ic">🚿</span><h3>Ein Pass, fast jede Form</h3>
+        <p>Artikel werden per SIMD an Ort und Stelle dekodiert, einmal direkt an ihre
+        endgültigen Offsets geschrieben und aus denselben Puffern PAR2-geprüft. Das Archiv wird
+        <i>während</i> des Downloads entpackt, seine Volumes existieren also nie als Dateien.
+        Das gilt für einfache, <b>verschlüsselte</b> und verschachtelte Archive, also
+        <a href="benchmarks.de.html#census">rund 97 % von allem, was gepostet wird, nach
+        Volumen</a>. Nur echt komprimierte Archive und Top-Level-7z brauchen noch einen zweiten
+        Durchlauf, und zusammen machen sie etwa 3 % aus.</p></div>
       <div class="card"><span class="ic">🕸️</span><h3>Union-Verfügbarkeit</h3>
         <p>Ein Artikel gilt erst als „fehlend“, wenn <i>jedes</i> konfigurierte Backbone ihn
         verweigert hat. Blockgenaue Buchführung entscheidet VOLLSTÄNDIG / REPARIERBAR / UNMÖGLICH,
         bevor Bytes verschwendet werden, holt die passgenaue Mindestmenge an Recovery-Blöcken und
         bricht aussichtslose Downloads in Sekunden ab.</p></div>
+      <div class="card"><span class="ic">🔁</span><h3>Pipelined NNTP, richtig gemacht</h3>
+        <p>Mehrere Anfragen pro Verbindung gleichzeitig unterwegs zu halten ist nicht unsere
+        Idee, und die guten Clients tun das. Unsere Umsetzung ist ungewöhnlich effizient: An
+        vier Standorten haben wir +12 % bis +270 % gegenüber seriell gemessen, und eine Leitung
+        sättigt schon bei 8 Verbindungen statt 30–50, du bekommst also volles Tempo, ohne deinen
+        Provider zu bombardieren. SABnzbd liefert es weiterhin abgeschaltet aus.</p></div>
     </div>
   </div>
 </section>
@@ -100,9 +106,10 @@
 socket ──TLS──▶ <b>rapidyenc SIMD-Dekodierung</b> (an Ort und Stelle - 4,95 GB/s pro Kern)
                    │
                    ├─▶ <b>pwrite an den endgültigen Offset</b>   (einfache Posts)
-                   │      └─ oder: RAR-Map-Übersetzung ─▶ pwrite direkt in die
-                   │         <em>entpackte</em> Datei (Store-Modus-Posts - die RAR-
-                   │         Volumes berühren nie die Festplatte)
+                   │      └─ oder: RAR-Map-Übersetzung ─▶ (entsperren, falls verschlüsselt) ─▶
+                   │         pwrite direkt in die <em>entpackte</em> Datei
+                   │         (die RAR-Volumes berühren nie die Festplatte - einfache,
+                   │         verschlüsselte und verschachtelte Archive gleichermaßen)
                    ├─▶ <b>PAR2-Block-Hasher</b> - jeder Block wird aus dem Decode-
                    │      Puffer MD5-geprüft; die Prüfung endet mit dem Download
                    └─▶ <b>Verfügbarkeits-Register</b> - blockgenauer Zustand, live
@@ -124,7 +131,7 @@ socket ──TLS──▶ <b>rapidyenc SIMD-Dekodierung</b> (an Ort und Stelle -
     <div class="grid2">
       <ul class="feat">
         <li><b>Downloads auf Leitungstempo:</b> <span class="d">Pipelined NNTP gemessen mit 8,31 Gbps auf 10 GbE; der schnellste Client auf jeder sauberen Benchmark-Etappe, bei jeder Größe.</span></li>
-        <li><b>Ein-Pass-Pipeline:</b> <span class="d">Dekodieren, Prüfen und Entpacken überlappen; Store-Modus-RAR-Volumes berühren nie die Festplatte; verschachtelte Archive werden im selben Durchlauf entpackt; braucht 1× Platte, wo andere ~2× brauchen.</span></li>
+        <li><b>Ein-Pass-Pipeline:</b> <span class="d">Dekodieren, Prüfen und Entpacken überlappen; die Archiv-Volumes berühren nie die Festplatte, egal ob der Post einfach, verschlüsselt oder verschachtelt ist; braucht 1× Platte, wo andere ~2× brauchen. Bei einem verschlüsselten 94-GB-Release sind das 90 GB geschrieben statt 180 GB.</span></li>
         <li><b>Union-Verfügbarkeit über mehrere Provider:</b> <span class="d">blockgenaues Routing über Backbones; Vorab-Urteile; passgenaue Reparatur; früher Abbruch unmöglicher Posts.</span></li>
         <li><b>Speicher-Budget:</b> <span class="d">ein globales RAM-Budget mit sanften Auslager-Stufen. Es bringt deine Maschine nie zum Swappen: Ein 190-GB-Job läuft in einem 1-GB-Budget durch (~1,1 GB Spitzen-RSS).</span></li>
         <li><b>Absturzfestes Fortsetzen:</b> <span class="d">ein Journal auf Artikelebene heißt: Ein Absturz oder kill −9 mitten im Download kostet fast nichts. Es setzt fort und lädt nur neu, was noch nicht gesichert war.</span></li>

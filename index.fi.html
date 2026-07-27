@@ -66,25 +66,29 @@
 <section>
   <div class="wrap">
     <p class="kicker">Miksi se on nopea</p>
-    <h2>Kolme ideaa, joita valtavirran asiakkaat eivät täysin hyödynnä</h2>
-    <p class="lead">Tämä on arkkitehtuuria, ei mikro-optimointia, ja joka ikinen kohta on mitattu
+    <h2>Noin 97% usenet-latauksista yhdellä läpimenolla</h2>
+    <p class="lead">Mittasimme, mitä usenetiin oikeasti postataan, ennen kuin päätimme mitä optimoida,
+    ja yksi idea tekee suurimman osan työstä. Kaikki on mitattu
     <a href="benchmarks.fi.html">vertailulokissa</a> komennoin, jotka voit ajaa itse uudelleen.</p>
     <div class="grid3">
-      <div class="card"><span class="ic">🔁</span><h3>Liukuhihnoitettu NNTP</h3>
-        <p>Useita artikkelipyyntöjä pysyy lennossa jokaisella yhteydellä, joten edestakainen kierros ei
-        koskaan jätä sockettia jouten eikä TCP anna ruuhkanhallintaikkunansa kutistua artikkelien välillä.
-        Neljällä sivustolla mittasimme +12%…+270% peräkkäishakuun verrattuna, ja linja kyllästyy 8
-        yhteydellä 30–50:n sijaan.</p></div>
-      <div class="card"><span class="ic">🚿</span><h3>Yhden läpimenon liukuhihna</h3>
-        <p>Artikkelit dekoodataan SIMD:llä paikan päällä ja kirjoitetaan kerran suoraan lopullisiin
-        siirtymiinsä, minkä jälkeen ne varmistetaan PAR2:lla samoista dekoodauspuskureista. Store-tilan
-        RAR-julkaisuissa sisältö puretaan <i>latauksen</i> aikana, joten osat eivät koskaan ole olemassa
-        tiedostoina: levykirjoitukset ovat sisältö × 1.0.</p></div>
+      <div class="card"><span class="ic">🚿</span><h3>Yksi läpimeno, lähes joka muodolle</h3>
+        <p>Artikkelit dekoodataan SIMD:llä paikan päällä, kirjoitetaan kerran suoraan lopullisiin
+        siirtymiinsä ja varmistetaan PAR2:lla samoista puskureista. Arkisto puretaan <i>latauksen</i>
+        aikana, joten sen osat eivät koskaan ole olemassa tiedostoina. Tämä pätee tavallisiin,
+        <b>salattuihin</b> ja sisäkkäisiin arkistoihin, mikä on <a href="benchmarks.fi.html#census">noin
+        97% kaikesta postatusta, tavumäärällä mitattuna</a>. Vain aidosti pakatut arkistot ja ylimmän
+        tason 7z tarvitsevat yhä toisen läpimenon, ja yhdessä ne ovat noin 3%.</p></div>
       <div class="card"><span class="ic">🕸️</span><h3>Yhdistetty saatavuus</h3>
         <p>Artikkeli lasketaan ”puuttuvaksi” vasta kun <i>jokainen</i> määritetty backbone on torjunut
         sen. Lohkotarkka kirjanpito julistaa työn tilaan COMPLETE, REPAIRABLE tai IMPOSSIBLE ennen
         tavujen tuhlaamista, hakee vain tarkalleen sopivan minimin palautuslohkoja ja pudottaa
         toivottomat lataukset sekunneissa.</p></div>
+      <div class="card"><span class="ic">🔁</span><h3>Liukuhihnoitettu NNTP, tehty hyvin</h3>
+        <p>Useiden pyyntöjen pitäminen lennossa yhteyttä kohden ei ole meidän ideamme, ja hyvät
+        asiakkaat tekevät sen. Meidän toteutuksemme on epätavallisen tehokas: neljällä sivustolla
+        mittasimme +12%…+270% peräkkäishakuun verrattuna, ja linja kyllästyy 8 yhteydellä 30–50:n
+        sijaan, joten saat täyden nopeuden kurittamatta palveluntarjoajaasi. SABnzbd toimittaa
+        sen yhä oletuksena pois päältä.</p></div>
     </div>
   </div>
 </section>
@@ -100,9 +104,10 @@
 socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place - 4.95 GB/s per core)
                    │
                    ├─▶ <b>pwrite at final offset</b>          (plain posts)
-                   │      └─ or: RAR-map translate ─▶ pwrite straight into the
-                   │         <em>extracted</em> file (store-mode posts - the rar
-                   │         volumes never touch disk)
+                   │      └─ or: RAR-map translate ─▶ (unlock, if encrypted) ─▶
+                   │         pwrite straight into the <em>extracted</em> file
+                   │         (the rar volumes never touch disk - plain,
+                   │         encrypted and nested archives alike)
                    ├─▶ <b>PAR2 block hasher</b> - every block MD5-verified from the
                    │      decode buffer; verification finishes with the download
                    └─▶ <b>availability ledger</b> - block-exact health, live
@@ -124,7 +129,7 @@ socket ──TLS──▶ <b>rapidyenc SIMD decode</b> (in place - 4.95 GB/s per
     <div class="grid2">
       <ul class="feat">
         <li><b>Linjanopeuden lataukset:</b> <span class="d">liukuhihnoitettu NNTP mitattu 8.31 Gbps:iin 10 GbE:llä; nopein asiakas jokaisella puhtaalla vertailuosuudella, joka koossa.</span></li>
-        <li><b>Yhden läpimenon liukuhihna:</b> <span class="d">dekoodaus, varmistus ja purku limittyvät; store-tilan RAR-osat eivät koskaan osu levylle; sisäkkäiset arkistot puretaan samassa läpimenossa; tarvitsee 1× levyä siinä missä muut ~2×.</span></li>
+        <li><b>Yhden läpimenon liukuhihna:</b> <span class="d">dekoodaus, varmistus ja purku limittyvät; arkisto-osat eivät koskaan osu levylle, olipa julkaisu tavallinen, salattu tai sisäkkäinen; tarvitsee 1× levyä siinä missä muut ~2×. 94 GB:n salatussa julkaisussa se tarkoittaa 90 GB kirjoitettuna 180 GB:n sijaan.</span></li>
         <li><b>Monen palveluntarjoajan yhdistetty saatavuus:</b> <span class="d">lohkotarkka reititys backbonejen välillä; ennakkotuomiot; tarkalleen sopiva korjaus; mahdottomien julkaisujen varhainen keskeytys.</span></li>
         <li><b>Muistibudjetti:</b> <span class="d">yksi globaali RAM-budjetti hallitusti levylle valuvin tasoin. Se ei koskaan sivuta konettasi: 190 GB:n työ valmistuu 1 GB:n budjetin sisällä (~1.1 GB huippu-RSS).</span></li>
         <li><b>Kaatumisvarma jatko:</b> <span class="d">artikkelitason journaali tarkoittaa, että kaatuminen tai tappo −9 kesken latauksen maksaa tuskin mitään: se jatkaa hakien uudelleen vain sen, mitä ei ehditty tallentaa.</span></li>
