@@ -97,6 +97,14 @@ struct Daemon {
 /// `build` is handed the port to serve on and returns the fully
 /// configured command; it may be called again on a fresh port, so it must
 /// not consume anything.
+/// Mark a scratch install as having the built-in indexer switched on.
+/// settings.json lives beside the config file, and its presence also
+/// marks the install as not-first-run, which these keyless suites
+/// already arrange for themselves with NZBFAST_OPEN.
+fn index_enabled(cfg: &Path) {
+    std::fs::write(cfg.with_file_name("settings.json"), "{\"index_enabled\": true}").unwrap();
+}
+
 async fn serve(dir: &Path, build: impl Fn(u16) -> Command) -> Daemon {
     for attempt in 0..3 {
         let port = free_port();
@@ -199,6 +207,12 @@ async fn newznab_caps_search_and_getnzb() {
     let cfg = dir.join("config.json");
     std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
         .unwrap();
+    // The newznab facade IS the built-in index published over newznab,
+    // and that indexer's master switch defaults OFF - a daemon with it
+    // off answers every t= with <error code="101"> on purpose. These
+    // tests seed a database and then ask the facade about it, so they
+    // are the "switched on" case and have to say so.
+    index_enabled(&cfg);
     let d = serve(&dir, |port| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
         // The daemon mints an API key on a genuinely first run (see
@@ -353,6 +367,40 @@ fn items(body: &str) -> usize {
     body.matches("<item>").count()
 }
 
+/// [`http_get`] with extra request headers - the reverse-proxy hops.
+fn http_get_hdrs(port: u16, req: &str, hdrs: &str) -> (u16, String) {
+    let mut last = String::new();
+    for attempt in 0..5u32 {
+        let once = || -> std::io::Result<(u16, String)> {
+            let mut s = TcpStream::connect(("127.0.0.1", port))?;
+            write!(
+                s,
+                "GET {req} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{hdrs}Connection: close\r\n\r\n"
+            )?;
+            let mut out = String::new();
+            let n = s.read_to_string(&mut out)?;
+            if n == 0 {
+                return Err(std::io::Error::other("empty"));
+            }
+            let code = out
+                .split_whitespace()
+                .nth(1)
+                .and_then(|c| c.parse().ok())
+                .unwrap_or(0);
+            let body = out.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
+            Ok((code, body))
+        };
+        match once() {
+            Ok(out) => return out,
+            Err(e) => {
+                last = e.to_string();
+                std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(attempt) + 50));
+            }
+        }
+    }
+    panic!("daemon on :{port} never served {req}: {last}");
+}
+
 /// The numeric categories are the standard newznab tree in BOTH
 /// directions: `cat=` selects the kind it names, and the id reported back
 /// is the one that kind would have been asked for. Software (PC, 4000)
@@ -387,6 +435,12 @@ async fn newznab_categories_follow_the_standard_tree() {
     let cfg = dir.join("config.json");
     std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
         .unwrap();
+    // The newznab facade IS the built-in index published over newznab,
+    // and that indexer's master switch defaults OFF - a daemon with it
+    // off answers every t= with <error code="101"> on purpose. These
+    // tests seed a database and then ask the facade about it, so they
+    // are the "switched on" case and have to say so.
+    index_enabled(&cfg);
     let d = serve(&dir, |port| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
         c.env("NZBFAST_OPEN", "1")
@@ -515,6 +569,12 @@ async fn feed_items_are_dated_by_upload_not_by_index_time() {
     let cfg = dir.join("config.json");
     std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
         .unwrap();
+    // The newznab facade IS the built-in index published over newznab,
+    // and that indexer's master switch defaults OFF - a daemon with it
+    // off answers every t= with <error code="101"> on purpose. These
+    // tests seed a database and then ask the facade about it, so they
+    // are the "switched on" case and have to say so.
+    index_enabled(&cfg);
     let d = serve(&dir, |port| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
         c.env("NZBFAST_OPEN", "1")
@@ -555,6 +615,280 @@ async fn feed_items_are_dated_by_upload_not_by_index_time() {
             "unknown-date release should fall back to when we saw it: {nodate}\n{body}"
         );
         assert!(!nodate.contains("1970"), "unknown-date release dated at the epoch: {nodate}");
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The search-shaping parameters the *arrs actually send.
+///
+/// Each assertion here stands for a way the facade used to answer the
+/// wrong question:
+/// - `season=` with no `ep=` is Sonarr's SEASON-PACK search. The season
+///   was dropped unless an episode came with it, so the answer was every
+///   release of the series, at every season.
+/// - a daily-series search (`ep=07/28`, or a season that is really a
+///   year) has no SxxEyy to narrow by, and must keep the plain-title
+///   search Sonarr then date-filters - not an `s2026` that matches
+///   nothing.
+/// - `<newznab:response>` is how a client learns there is a second page.
+///   Absent, every response looked like the last one.
+/// - an `imdbid` we hold nothing for must answer EMPTY. Ignoring it
+///   returned the whole index for the *arr to title-match against.
+/// - an unsupported function gets the spec's own error rather than
+///   falling through to search.
+#[tokio::test(flavor = "multi_thread")]
+async fn newznab_honours_the_arr_search_parameters() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-nnsearch-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let db = dir.join("index.db");
+    {
+        let mut ix = nzbkit::index::Index::open(&db).unwrap();
+        ix.ingest(
+            "alt.binaries.teevee",
+            &[
+                over(1, "\"Cat.Show.S02E01.1080p.rar\" yEnc (1/1)", "<a1@x>", 1000),
+                over(2, "\"Cat.Show.S02E01.1080p.par2\" yEnc (1/1)", "<a2@x>", 200),
+                over(3, "\"Cat.Show.S02E02.1080p.rar\" yEnc (1/1)", "<b1@x>", 1000),
+                over(4, "\"Cat.Show.S02E02.1080p.par2\" yEnc (1/1)", "<b2@x>", 200),
+                over(5, "\"Cat.Show.S03E01.1080p.rar\" yEnc (1/1)", "<c1@x>", 1000),
+                over(6, "\"Cat.Show.S03E01.1080p.par2\" yEnc (1/1)", "<c2@x>", 200),
+            ],
+            1_700_000_000,
+        )
+        .unwrap();
+    }
+
+    let cfg = dir.join("config.json");
+    std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
+        .unwrap();
+    // The newznab facade IS the built-in index published over newznab,
+    // and that indexer's master switch defaults OFF - a daemon with it
+    // off answers every t= with <error code="101"> on purpose. These
+    // tests seed a database and then ask the facade about it, so they
+    // are the "switched on" case and have to say so.
+    index_enabled(&cfg);
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--index-db")
+            .arg(&db);
+        c
+    })
+    .await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        // Season-pack search: both season-2 episodes, and NOT season 3.
+        let (_, body) = http_get(port, "/api?t=tvsearch&q=Cat.Show&season=2");
+        assert_eq!(items(&body), 2, "season alone did not narrow the search: {body}");
+        assert!(body.contains("S02E01") && body.contains("S02E02"), "{body}");
+        assert!(!body.contains("S03E01"), "season filter leaked another season: {body}");
+
+        // Season + episode still narrows to the one episode.
+        let (_, body) = http_get(port, "/api?t=tvsearch&q=Cat.Show&season=2&ep=1");
+        assert_eq!(items(&body), 1, "{body}");
+        assert!(body.contains("S02E01"), "{body}");
+
+        // A daily-series search keeps the plain-title result set: there
+        // is no SxxEyy to narrow by, and an empty answer would be worse
+        // than one Sonarr can date-filter itself.
+        let (_, body) = http_get(port, "/api?t=tvsearch&q=Cat.Show&season=2026&ep=07/28");
+        assert_eq!(items(&body), 3, "a daily search should not be narrowed: {body}");
+
+        // The page footer a client needs to ask for page two.
+        let (_, body) = http_get(port, "/api?t=search&q=Cat.Show&limit=2");
+        assert_eq!(items(&body), 2, "{body}");
+        assert!(body.contains("<newznab:response"), "no paging element: {body}");
+        assert!(body.contains("total=\"3\""), "total should count matches, not the page: {body}");
+        assert!(body.contains("offset=\"0\""), "{body}");
+
+        // Extended attrs ride along for the columns the *arrs show.
+        assert!(body.contains("name=\"usenetdate\""), "{body}");
+        assert!(body.contains("name=\"files\""), "{body}");
+        assert!(body.contains("name=\"group\""), "{body}");
+
+        // An id we hold nothing for is an empty feed, never the index.
+        let (code, body) = http_get(port, "/api?t=movie&imdbid=9999999");
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(items(&body), 0, "an unknown imdbid returned rows: {body}");
+        assert!(body.contains("total=\"0\""), "{body}");
+
+        // Unsupported and unknown functions get the spec's error codes on
+        // HTTP 200, rather than being answered with a search.
+        let (code, body) = http_get(port, "/api?t=music&q=Cat");
+        assert_eq!(code, 200, "{body}");
+        assert!(body.contains("code=\"203\""), "audio search should decline: {body}");
+        assert_eq!(items(&body), 0, "{body}");
+        let (_, body) = http_get(port, "/api?t=frobnicate");
+        assert!(body.contains("code=\"202\""), "{body}");
+
+        // maxage is an age ceiling in days, measured on the upload date.
+        // Everything here was posted in 2023, so a one-day window is empty
+        // and an eternity is not.
+        let (_, body) = http_get(port, "/api?t=search&q=Cat.Show&maxage=1");
+        assert_eq!(items(&body), 0, "maxage did not bound the feed: {body}");
+        let (_, body) = http_get(port, "/api?t=search&q=Cat.Show&maxage=99999");
+        assert_eq!(items(&body), 3, "{body}");
+
+        // Behind an HTTPS reverse proxy the links must be the proxy's,
+        // or every NZB fetch is blocked as mixed content.
+        let (_, body) = http_get_hdrs(
+            port,
+            "/api?t=search&q=Cat.Show",
+            "X-Forwarded-Proto: https\r\nX-Forwarded-Host: nzb.example.com\r\n",
+        );
+        assert!(body.contains("https://nzb.example.com/getnzb/"), "{body}");
+        assert!(!body.contains("http://127.0.0.1"), "{body}");
+
+        // Without the hops it is still the plain Host header.
+        let (_, body) = http_get(port, "/api?t=search&q=Cat.Show");
+        assert!(body.contains(&format!("http://127.0.0.1:{port}/getnzb/")), "{body}");
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The built-in indexer's master switch, end to end against the binary.
+///
+/// It is the whole feature's contract, so it is worth pinning rather than
+/// trusting: OFF is the default, an existing install keeps working, the
+/// index database is not so much as created while it is off, and the
+/// facade says so instead of answering an empty search that an *arr
+/// would read as "the indexer is fine, there is just nothing there".
+#[tokio::test(flavor = "multi_thread")]
+async fn the_indexer_switch_defaults_off_and_closes_the_facade() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-idxsw-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("index.db");
+    let cfg = dir.join("config.json");
+    std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
+        .unwrap();
+    // An existing install, but one that never chose anything to index:
+    // the migration must NOT read that as "was using the indexer".
+    std::fs::write(cfg.with_file_name("settings.json"), "{}").unwrap();
+
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--index-db")
+            .arg(&db);
+        c
+    })
+    .await;
+    let port = d.port;
+    let db2 = db.clone();
+
+    tokio::task::spawn_blocking(move || {
+        // Default off, and reported as such by both the settings block
+        // and index_stats (the dashboard reads the second one before it
+        // decides what to draw).
+        let (_, body) = http_get(port, "/api?mode=get_config&output=json");
+        assert!(body.contains("\"index_enabled\":false"), "{body}");
+        let (_, body) = http_get(port, "/api?mode=index_stats&output=json");
+        assert!(body.contains("\"enabled\":false"), "{body}");
+        assert!(body.contains("\"paused\":\"off\""), "{body}");
+
+        // No database. Not empty - absent: `with_index` refuses to open
+        // it, so a user who never wanted an indexer never gets the file.
+        assert!(!db2.exists(), "index.db was created with the indexer off");
+
+        // The facade is closed, INCLUDING caps, which is what an *arr
+        // tests an indexer with.
+        for q in ["/api?t=caps", "/api?t=tvsearch&q=show", "/newznab/api?t=search&q=show"] {
+            let (code, body) = http_get(port, q);
+            assert_eq!(code, 200, "{q}: {body}");
+            assert!(body.contains("code=\"101\""), "{q} answered: {body}");
+            assert!(!body.contains("<caps>"), "{q} answered: {body}");
+        }
+
+        // Switch it on: the facade opens and the database appears.
+        let (_, body) = http_get(port, "/api?mode=config&name=index_enabled&value=1&output=json");
+        assert!(body.contains("\"status\":true"), "{body}");
+        let (_, body) = http_get(port, "/api?t=caps");
+        assert!(body.contains("<caps>"), "{body}");
+        let (_, body) = http_get(port, "/api?mode=index_stats&output=json");
+        assert!(body.contains("\"enabled\":true"), "{body}");
+        assert!(db2.exists(), "index.db missing after switching the indexer on");
+
+        // And off again closes it back up, in the same process.
+        let (_, body) = http_get(port, "/api?mode=config&name=index_enabled&value=0&output=json");
+        assert!(body.contains("\"status\":true"), "{body}");
+        let (_, body) = http_get(port, "/api?t=caps");
+        assert!(body.contains("code=\"101\""), "{body}");
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The upgrade case: an install that was already indexing keeps indexing.
+/// Silently stopping somebody's working index would be a data-shaped
+/// surprise, so a saved `index_groups` with no `index_enabled` seeds ON.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_install_that_was_already_indexing_stays_on() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-idxmig-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = dir.join("config.json");
+    std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
+        .unwrap();
+    std::fs::write(
+        cfg.with_file_name("settings.json"),
+        "{\"index_groups\":[\"alt.binaries.teevee\"]}",
+    )
+    .unwrap();
+
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--index-db")
+            .arg(dir.join("index.db"));
+        c
+    })
+    .await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        let (_, body) = http_get(port, "/api?mode=index_stats&output=json");
+        assert!(body.contains("\"enabled\":true"), "{body}");
+        let (_, body) = http_get(port, "/api?t=caps");
+        assert!(body.contains("<caps>"), "{body}");
     })
     .await
     .unwrap();

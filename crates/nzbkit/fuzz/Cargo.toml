@@ -53,3 +53,10 @@ path = "fuzz_targets/rar_recovery_scan.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "mkv_parse"
+path = "fuzz_targets/mkv_parse.rs"
+test = false
+doc = false
+bench = false

@@ -69,6 +69,7 @@ fi
 #   3. an existing key file -> the daemon reads it, stable across restarts.
 #   4. a first run          -> the daemon generates one and prints it once.
 KEYFILE="$(dirname "$CONFIG")/apikey"
+SETTINGS="$(dirname "$CONFIG")/settings.json"
 if [ -z "$NZBFAST_APIKEY" ] && [ "${NZBFAST_OPEN:-0}" != "1" ]; then
     if [ -f "$KEYFILE" ]; then
         # An empty or unreadable key file makes the daemon warn and start
@@ -84,7 +85,20 @@ if [ -z "$NZBFAST_APIKEY" ] && [ "${NZBFAST_OPEN:-0}" != "1" ]; then
             echo "         deliberately run without a key." >&2
             exit 1
         fi
-    elif [ -e "$(dirname "$CONFIG")/settings.json" ] || [ -e "$(dirname "$CONFIG")/.spool" ]; then
+    elif grep -q '"apikey"[[:space:]]*:[[:space:]]*"[^"]' "$SETTINGS" 2>/dev/null; then
+        # No key file, but Settings holds one. That is a real, keyed
+        # install: a key set in the dashboard is written to settings.json,
+        # which WINS over the key file when the daemon loads. So the
+        # listener will be authenticated and there is nothing to refuse.
+        #
+        # Reachable because clearing the key in the dashboard deletes the
+        # key file (deliberately - that is what makes "keyless" survive a
+        # restart) and setting one again only rewrote the file from a
+        # later build. A container that cleared and then re-set its key
+        # under an older build has settings.json keyed and no key file,
+        # and used to be unable to start at all.
+        :
+    elif [ -e "$SETTINGS" ] || [ -e "$(dirname "$CONFIG")/.spool" ]; then
         # No key file, but this install has run before. The daemon mints only
         # on a genuinely first run - deliberately, so a key can never appear
         # under a desktop install and lock out remotes the user already wired

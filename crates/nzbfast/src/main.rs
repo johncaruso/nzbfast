@@ -20,6 +20,7 @@ mod groups;
 mod groupstats;
 mod import_sab;
 mod interests;
+mod newznab;
 mod notify;
 mod persist;
 mod post_cmd;
@@ -3434,6 +3435,12 @@ pub(crate) async fn get_with_progress(
         !no_extract && !resuming,
         resuming,
     ));
+    // The root has to know its own Arc before any span arrives, or a
+    // top-level chase (a posted .7z) has nothing for its worker to reach
+    // the extractor through and quietly declines. Unconditional: the
+    // promote hook below anchors too, but it only exists on the daemon
+    // path, and `nzbfast get` chases the same archives.
+    extractor.anchor();
     extractor.set_holds_cap(budget.holds_cap());
     // An inner file's declared `unpacked_size` is an attacker-controlled
     // RAR header vint, and on Linux preallocation is a real fallocate - so
@@ -3511,9 +3518,15 @@ pub(crate) async fn get_with_progress(
     // read positions into promotions through it.
     let queue_ctl = Arc::new(nzbkit::pool::QueueControl::default());
     let abort_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    if let Some(h) = &hub {
-        *h.extractor.lock().unwrap() = Some((stream_owner.to_string(), extractor.clone()));
-        *h.verifier.lock().unwrap() = Some(verifier.clone());
+    // The promote ladder is built for EVERY run, not just the daemon's.
+    // A player seek needs the hub; the 7z tail prefetch does not - it is
+    // the extractor asking for the articles carrying an archive's end
+    // header, and without it the chase cannot read the archive map until
+    // the tail arrives on its own, which in a sequential download is
+    // last. That turns one-pass into a decode burst at the end, and it
+    // denies drop-behind trimming the read watermark it needs, so a `get`
+    // of a large .7z demoted where the daemon streamed it.
+    let seek = {
         let mut vol_slots: Vec<usize> = slots
             .iter()
             .enumerate()
@@ -3521,22 +3534,24 @@ pub(crate) async fn get_with_progress(
             .map(|(i, _)| i)
             .collect();
         vol_slots.sort_by_key(|&i| nzbkit::extract::vol_sort_key(&slots[i].hint));
-        let seek = Arc::new(SeekCtl {
+        Arc::new(SeekCtl {
             slot_articles: std::mem::take(&mut slot_arts),
             ctl: queue_ctl.clone(),
             extractor: extractor.clone(),
             vol_slots,
-        });
-        // Nested 7z tail prefetch: a child extractor that classifies an
-        // inner .7z asks for its footer articles through the same
-        // promote ladder a player seek uses. Weak - the hook must not
-        // pin the SeekCtl/Extractor pair into a reference cycle.
-        let weak_seek = Arc::downgrade(&seek);
-        extractor.set_promote_hook(Arc::new(move |name: &str, size: u64, spans: &[(u64, u64)]| {
-            if let Some(s) = weak_seek.upgrade() {
-                s.promote_output_spans(name, size, spans);
-            }
-        }));
+        })
+    };
+    // Weak - the hook must not pin the SeekCtl/Extractor pair into a
+    // reference cycle.
+    let weak_seek = Arc::downgrade(&seek);
+    extractor.set_promote_hook(Arc::new(move |name: &str, size: u64, spans: &[(u64, u64)]| {
+        if let Some(s) = weak_seek.upgrade() {
+            s.promote_output_spans(name, size, spans);
+        }
+    }));
+    if let Some(h) = &hub {
+        *h.extractor.lock().unwrap() = Some((stream_owner.to_string(), extractor.clone()));
+        *h.verifier.lock().unwrap() = Some(verifier.clone());
         *h.seek.lock().unwrap() = Some(seek);
         *h.abort.lock().unwrap() = Some(abort_flag.clone());
         *h.queue_ctl.lock().unwrap() = Some(queue_ctl.clone());
@@ -4393,7 +4408,13 @@ pub(crate) async fn get_with_progress(
                                 break;
                             }
                             let sidx = slot_list[i];
-                            let r = if extractor.is_mapped(sidx) {
+                            // A chased slot has no file either - its bytes
+                            // are in the frontier buffer - and read_at
+                            // serves it byte-exact, so it takes the same
+                            // reader. Sending it down the path branch
+                            // would read-back against a file that does not
+                            // exist and report every pending block bad.
+                            let r = if extractor.is_mapped(sidx) || extractor.is_chased(sidx) {
                                 let reader = |off: u64, buf: &mut [u8]| {
                                     extractor.read_at(sidx, off, buf)
                                 };
@@ -4438,7 +4459,15 @@ pub(crate) async fn get_with_progress(
                     // Deobfuscation: the PAR2 FileDesc name is the real one.
                     if let Some(pname) = &r.par2_name {
                         extractor.rename(sidx, pname);
-                        if !mapped {
+                        // A CHASED slot is excluded from the on-disk half
+                        // for the same reason a mapped one is: it has no
+                        // finished file. It can now have a PARTIAL one -
+                        // drop-behind trimming spills the archive's
+                        // consumed prefix there - and renaming that moves
+                        // the path out from under a live writer's open
+                        // fd, so the rest of the spill lands in a file
+                        // nothing points at.
+                        if !mapped && !extractor.is_chased(sidx) {
                             if let Some(path) = extractor.slot_path(sidx) {
                                 let real = nzbkit::disk::sanitize_filename(pname);
                                 if path.file_name().and_then(|n| n.to_str())
@@ -4564,13 +4593,21 @@ pub(crate) async fn get_with_progress(
                 } else {
                 // PAR2 repair operates on volume FILES - materialize every
                 // mapped slot of the set (complete ones too: par2 verifies
-                // the whole set from disk) under its PAR2 name.
+                // the whole set from disk) under its PAR2 name. A CHASED
+                // slot (a posted .7z streaming out of RAM) has no file
+                // either and must come down too, or par2 sees it missing
+                // and tries to recreate a whole archive we are holding.
                 let any_mapped = reports.iter().any(|(s, _)| extractor.is_mapped(*s));
-                if any_mapped {
+                let any_chased = reports.iter().any(|(s, _)| extractor.is_chased(*s));
+                if any_mapped || any_chased {
                     println!("materializing volumes for repair…");
-                    damage_in_mapped = true;
+                    // Only a MAPPED set needs the post-repair re-extract:
+                    // a materialized .7z is the disk post-pass's input and
+                    // it runs regardless, so claiming it here would send
+                    // the set through reextract_dir for nothing.
+                    damage_in_mapped |= any_mapped;
                     for (sidx, r) in &reports {
-                        if extractor.is_mapped(*sidx) {
+                        if extractor.is_mapped(*sidx) || extractor.is_chased(*sidx) {
                             if let Some(pname) = &r.par2_name {
                                 extractor.rename(*sidx, pname);
                             }
@@ -4718,22 +4755,31 @@ pub(crate) async fn get_with_progress(
                 Some("resumed job: the verified volumes on disk could not be extracted");
         }
     }
+    // The unrar ladder below reasons about RAR VOLUMES, so a top-level 7z
+    // chase that demoted is filtered out of it entirely: that demote
+    // leaves a materialized .7z, which the post-extraction pass further
+    // down owns. Left in, its reason text steers all three arms wrongly -
+    // "held-bytes cap" reads as an unowned set and "encrypted" as a
+    // locked RAR - and each one ends at try_unrar over a directory with
+    // no RAR in it, which answers false and fails a job that is fine.
+    let vol_fallbacks: Vec<&(String, String)> = ex_report
+        .fallbacks
+        .iter()
+        .filter(|(_, w)| !sevenz_disk_fallback(w))
+        .collect();
     // Compressed (non-encrypted) archives can't stream-extract, but a
     // bundled unrar unpacks the verified volumes. Encrypted sets join in
     // when a password is known; without one they stay on disk.
-    let enc_fallback = ex_report
-        .fallbacks
+    let enc_fallback = vol_fallbacks
         .iter()
         .any(|(_, w)| w.contains("encrypted") || w.contains("password"));
     // Every OTHER demote leaves its volumes unowned - see
     // [`fallback_needs_disk_unpack`].
-    let unowned_fallback = ex_report
-        .fallbacks
+    let unowned_fallback = vol_fallbacks
         .iter()
         .any(|(_, w)| fallback_needs_disk_unpack(w));
     if all_good
-        && (ex_report
-            .fallbacks
+        && (vol_fallbacks
             .iter()
             .any(|(_, w)| w.contains("compressed"))
             || (enc_fallback && password.is_some()))
@@ -5049,6 +5095,21 @@ fn braces_password(nzb_path: &std::path::Path) -> Option<String> {
     crate::smart::name_password(name).map(|(pw, _)| pw)
 }
 
+/// Is this demote one the 7z disk post-pass already owns? A top-level `.7z`
+/// chase that gives up materializes its archive into the output directory,
+/// which is exactly that pass's input.
+///
+/// It is filtered out of the unrar ladder entirely rather than added to
+/// [`fallback_needs_disk_unpack`]'s exclusions, because its reason text
+/// steers all three arms of that ladder and every one of them is wrong for a
+/// 7z: the retention-cap wording reads as an unowned RAR set, the
+/// encrypted-7z wording reads as a locked one, and both end at `try_unrar`
+/// over a directory with no RAR in it - which answers false and fails a job
+/// whose payload unpacks perfectly one pass later.
+pub(crate) fn sevenz_disk_fallback(why: &str) -> bool {
+    why.starts_with(nzbkit::extract::SEVENZ_DISK_FALLBACK_PREFIX)
+}
+
 /// Does a level-0 extraction fallback leave its volumes UNOWNED, i.e. is the
 /// on-disk unrar pass the only thing left that would unpack them?
 ///
@@ -5077,6 +5138,9 @@ fn braces_password(nzb_path: &std::path::Path) -> Option<String> {
 ///     par2 could see the volumes on disk, and it re-extracts them (and then
 ///     REMOVES them) as soon as the repair lands. Running the disk pass over
 ///     what it leaves behind finds no volumes at all.
+///
+/// A demote the 7z post-pass owns never reaches here at all - see
+/// [`sevenz_disk_fallback`], which filters it out of the whole ladder.
 pub(crate) fn fallback_needs_disk_unpack(why: &str) -> bool {
     !why.starts_with("nested fallback:")
         && !why.contains("encrypted")
@@ -5488,6 +5552,44 @@ fn sweep_stale_rev_temps(dir: &std::path::Path) {
     }
 }
 
+/// Last case-insensitive occurrence of an ASCII `needle`, as a byte offset
+/// that is valid in `hay` itself. Searching a `to_lowercase()` copy instead
+/// would shift every offset past a character whose lowercase form has a
+/// different byte length (U+0130 lowercases to two chars), which then either
+/// panics on a non-boundary slice or cuts the name in the wrong place.
+fn rfind_ascii_ci(hay: &str, needle: &str) -> Option<usize> {
+    let (hay, needle) = (hay.as_bytes(), needle.as_bytes());
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    // An ASCII byte never appears inside a multi-byte UTF-8 sequence, so a
+    // match of an all-ASCII needle always starts on a char boundary.
+    (0..=hay.len() - needle.len())
+        .rev()
+        .find(|&i| hay[i..i + needle.len()].eq_ignore_ascii_case(needle))
+}
+
+/// Name for `slot` (0-based) derived from `known`, the on-disk name of the
+/// volume filling slot `known_slot`: same `.partNN` pattern, same
+/// zero-padding, same casing. `None` when `known` does not carry a `.part`
+/// number matching its own slot, in which case we cannot infer the series.
+fn derive_part_name(known: &str, known_slot: usize, slot: usize) -> Option<String> {
+    let p = rfind_ascii_ci(known, ".part")?;
+    let tail = &known[p + 5..];
+    let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() || digits.parse::<usize>().ok()? != known_slot + 1 {
+        return None;
+    }
+    Some(format!(
+        "{}{}{:0width$}{}",
+        &known[..p],
+        &known[p..p + 5],
+        slot + 1,
+        &tail[digits.len()..],
+        width = digits.len()
+    ))
+}
+
 /// Rebuild what one coherent .rev set can. `keep` indexes the members of a
 /// single set within `rev_sources`/`rev_meta`; returns true when at least one
 /// volume was rebuilt.
@@ -5544,23 +5646,8 @@ fn try_rev_group(
         let (i, known) = slot_name
             .iter()
             .enumerate()
-            .find_map(|(i, n)| n.as_ref().map(|n| (i, n.clone())))?;
-        let low = known.to_lowercase();
-        let p = low.rfind(".part")?;
-        let digits: String = known[p + 5..]
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect();
-        if digits.is_empty() || digits.parse::<usize>().ok()? != i + 1 {
-            return None;
-        }
-        Some(format!(
-            "{}.part{:0width$}{}",
-            &known[..p],
-            slot + 1,
-            &known[p + 5 + digits.len()..],
-            width = digits.len()
-        ))
+            .find_map(|(i, n)| n.as_ref().map(|n| (i, n.as_str())))?;
+        derive_part_name(known, i, slot)
     };
 
     // Intact volumes stay on disk and are read by range; only the missing
@@ -7373,6 +7460,36 @@ mod rev_recovery_tests {
         assert_eq!(snapshot(&dir), before);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// The neighbour's name is sliced at offsets found by a case-insensitive
+    /// search, so characters whose lowercase form is a different byte length
+    /// must not shift them. U+0130 (İ, 2 bytes) lowercases to 3 bytes and
+    /// U+1E9E (ẞ, 3 bytes) to 2, one shift in each direction; a `to_lowercase()`
+    /// copy would put `.part` at the wrong offset and panic or mangle the name.
+    #[test]
+    fn derived_part_names_survive_length_changing_case() {
+        // "İstanbul" + "ẞ" - two chars whose lowercase byte length differs.
+        for stem in ["\u{130}stanbul", "Gru\u{1e9e}e", "\u{130}\u{1e9e}x", "Plain"] {
+            let known = format!("{stem}.part03.rar");
+            let got = derive_part_name(&known, 2, 6).expect("neighbour names its own slot");
+            assert_eq!(got, format!("{stem}.part07.rar"));
+            // The prefix must come out of the original string untouched.
+            assert!(got.starts_with(stem), "{got} lost the original bytes of {stem}");
+        }
+
+        // A length-changing char inside the extension side of the split too,
+        // and mixed casing on `.part` itself, which is preserved.
+        let known = "Se\u{130}t.PART002.r\u{130}r";
+        assert_eq!(
+            derive_part_name(known, 1, 11).unwrap(),
+            "Se\u{130}t.PART012.r\u{130}r"
+        );
+
+        // A neighbour that does not number its own slot tells us nothing.
+        assert!(derive_part_name("x.part03.rar", 0, 1).is_none());
+        assert!(derive_part_name("x.rar", 0, 1).is_none());
+        assert!(derive_part_name("\u{130}.part", 0, 1).is_none());
+    }
 }
 
 #[cfg(test)]
@@ -7744,6 +7861,32 @@ mod repair_tests {
                 "'{why}' is already owned - unpacking it again fails a good job"
             );
         }
+    }
+
+    /// A top-level 7z chase that demoted is owned by the 7z post-pass,
+    /// and its reason must not reach the RAR ladder at all - not the
+    /// unowned arm, not the encrypted arm. Both wordings are pinned
+    /// because both occur (the retention cap, and an archive whose
+    /// header needs a password), and both would otherwise end at
+    /// `try_unrar` over a directory holding one .7z, which fails.
+    #[test]
+    fn a_demoted_top_level_7z_stays_out_of_the_rar_ladder() {
+        for why in [
+            "held-bytes cap: chase memory",
+            "inner 7z is encrypted (no password)",
+            "inner 7z codec unsupported: 30101",
+            "materialized for repair",
+        ] {
+            let marked =
+                format!("{}{why}", nzbkit::extract::SEVENZ_DISK_FALLBACK_PREFIX);
+            assert!(sevenz_disk_fallback(&marked), "'{marked}'");
+            // The underlying reason stays readable inside it - the
+            // "held-bytes cap" substring other callers key off included.
+            assert!(marked.contains(why));
+        }
+        // A RAR volume demote is untouched by the marker check.
+        assert!(!sevenz_disk_fallback("held-bytes cap: chase memory"));
+        assert!(!sevenz_disk_fallback("nested fallback: inner 7z decode failed"));
     }
 
     /// The speculative recovery prefetch promises "a tiny side pool (1
@@ -9010,7 +9153,14 @@ async fn sysbench_cmd(config: &PathBuf, group: &str) -> Result<()> {
     let disk = nzbkit::sysbench::disk_write(&out, 512).unwrap_or(0.0);
     println!("disk:    {:.2} GB/s sequential write ({:.1} Gbps)", disk, disk * 8.0);
     let srv = &cfg.servers[0];
-    let grp = srv.group.clone().unwrap_or_else(|| group.to_string());
+    // The probe group is the --group argument, never `ServerConfig.group`:
+    // that field is a MIRROR LABEL (servers sharing it are backbone twins,
+    // and the pool dedups 430s by it), freeform text from the dashboard and
+    // not a newsgroup at all. Sending it as a GROUP argument answered 411 -
+    // which network_probe folded into a "0.00 Gbps" verdict, and which made
+    // the diversity phase below hard-error - while also overriding the group
+    // the user explicitly asked for.
+    let grp = group.to_string();
     print!("network: probing {} for 8s… ", srv.host);
     use std::io::Write as _;
     std::io::stdout().flush().ok();
@@ -9152,6 +9302,7 @@ pub(crate) async fn index_scan(
     // a CLI scan ingested.
     index_scan_into(
         config, group, backfill, max_age_secs, gates, Vec::new(), &mut ix, None, 0, None, 1, true,
+        true,
     )
     .await
 }
@@ -9192,6 +9343,9 @@ pub(crate) async fn index_scan_into(
     // M30 turbo: nothing is downloading, so header fetch may use a
     // deeper per-group connection fan-out (clamp 10 instead of 5).
     turbo: bool,
+    // A8: scan the OTHER eligible backbones' tips too (their own marks),
+    // so propagation holes and single-backbone posts reach the index.
+    coverage: bool,
 ) -> Result<()> {
     if let Some(g) = gates {
         let g = g.clone();
@@ -9199,15 +9353,80 @@ pub(crate) async fn index_scan_into(
         ix.set_gate(Box::new(move |stem| g.allows_with(stem, &gc)));
     }
     ix.set_custom(cats);
-    let server = load_server(config)?;
-    let (mut conn, _) = Connection::connect(&server).await?;
-    let g = conn.group(group).await?;
+    let cfg = Config::load(config)
+        .with_context(|| format!("loading {} (copy config.local.json.example?)", config.display()))?;
+    if cfg.servers.is_empty() {
+        anyhow::bail!("no servers configured");
+    }
+    // Single-server-era marks rows (server='') were built against
+    // whichever server was first in the config - claim them before any
+    // mark is read. Idempotent, so every scan path may call it.
+    let _ = ix.adopt_legacy_marks(&cfg.servers[0].host);
+
+    // Probe every scan-eligible backbone: who carries this group, and
+    // how much of it? A probe failure only drops that server from this
+    // pass - its coverage resumes from its own marks next time.
+    struct Probe {
+        server: ServerConfig,
+        key: String,
+        conn: Connection,
+        info: nzbkit::nntp::GroupInfo,
+    }
+    let mut probes: Vec<Probe> = Vec::new();
+    for s in scan_servers(&cfg) {
+        match Connection::connect(&s).await {
+            Ok((mut c, _)) => match c.group(group).await {
+                Ok(info) => probes.push(Probe {
+                    key: nzbkit::index::Index::server_key(&s.host),
+                    server: s,
+                    conn: c,
+                    info,
+                }),
+                Err(e) => {
+                    // 411 = this server does not carry the group. Routine,
+                    // and exactly what per-group provider choice is for.
+                    println!("[scan] {}: {group}: {e}", s.host);
+                    c.quit().await;
+                }
+            },
+            Err(e) => println!("[scan] {}: connect: {e}", s.host),
+        }
+    }
+    if probes.is_empty() {
+        anyhow::bail!("no configured server carries {group}");
+    }
+    if probes.iter().all(|p| p.server.block_bytes.is_some_and(|b| b > 0)) {
+        println!(
+            "[scan] {group}: only block accounts are enabled - header \
+             traffic is spending prepaid credit"
+        );
+    }
+    // Primary = the probe with the largest article span: one number
+    // that captures both carriage and retention depth, and comparable
+    // across servers in magnitude even though the numbers themselves
+    // are per-server. Ties keep the level/config-order rank. The
+    // primary runs the full forward + deepen legs; every other
+    // backbone contributes a cheap tip leg below.
+    let pi = probes
+        .iter()
+        .enumerate()
+        .max_by_key(|(i, p)| (p.info.high.saturating_sub(p.info.low), std::cmp::Reverse(*i)))
+        .map(|(i, _)| i)
+        .expect("probes is non-empty");
+    let chosen = probes.remove(pi);
+    // Persist the choice so the realtime tip watcher follows the same
+    // server between passes (marks are only valid against their server).
+    let _ = ix.kv_set(&format!("scan_primary:{group}"), &chosen.key);
+    let server = chosen.server;
+    let skey = chosen.key;
+    let mut conn = chosen.conn;
+    let g = chosen.info;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    let mark = ix.high_water(group);
+    let mark = ix.high_water(group, &skey);
     // Resume from the mark; first scan starts at the age cutoff when
     // one is set (Date bisection), else backfill-count from the newest.
     // A deep override starts n articles back regardless of the mark.
@@ -9245,6 +9464,7 @@ pub(crate) async fn index_scan_into(
         let pass = scan_article_range(
             &server,
             group,
+            &skey,
             low,
             g.high,
             ix,
@@ -9270,10 +9490,10 @@ pub(crate) async fn index_scan_into(
     // up-to-date branch (a group idle at scan time otherwise never
     // starts deepening). Worst case the seed sits above already-scanned
     // coverage and one slice gets rescanned; ingest is idempotent.
-    if ix.low_water(group) == 0 {
+    if ix.low_water(group, &skey) == 0 {
         let seed = if low > g.high { mark } else { low }.max(g.low);
         if seed > 0 {
-            let _ = ix.set_low_water(group, seed);
+            let _ = ix.set_low_water(group, &skey, seed);
         }
     }
 
@@ -9285,7 +9505,7 @@ pub(crate) async fn index_scan_into(
     // grew'). The low-water mark moves only once the WHOLE slice lands;
     // a failed slice is rescanned next pass (ingest is idempotent).
     if deepen > 0 && healthy {
-        let cur = ix.low_water(group);
+        let cur = ix.low_water(group, &skey);
         let mut floor = g.low;
         if max_age_secs > 0 && cur > floor {
             floor = floor
@@ -9298,6 +9518,7 @@ pub(crate) async fn index_scan_into(
             let pass = scan_article_range(
                 &server,
                 group,
+                &skey,
                 lo2,
                 hi2,
                 ix,
@@ -9318,7 +9539,7 @@ pub(crate) async fn index_scan_into(
             // whole slice is simply retried next pass (ingest is
             // idempotent).
             if pass.complete {
-                ix.set_low_water(group, lo2)?;
+                ix.set_low_water(group, &skey, lo2)?;
                 println!(
                     "  history now back to article {lo2} ({} older articles remain)",
                     lo2.saturating_sub(floor)
@@ -9329,6 +9550,68 @@ pub(crate) async fn index_scan_into(
         }
     }
     conn.quit().await;
+
+    // A8 coverage legs: every other eligible backbone advances its OWN
+    // forward tip under its own (grp, server) marks. Message-ids are
+    // portable, so ingest merges whatever the primary's spool never
+    // received - the release that looked permanently incomplete
+    // completes the moment another backbone's headers land. Forward
+    // only, on purpose: history depth is the primary's job (it was
+    // chosen for having the most of it), and old incompletes are the
+    // targeted gap-fill pass's job - re-deepening every backbone would
+    // multiply the whole history cost for mostly-duplicate headers.
+    // A secondary's failure never fails the pass; it resumes from its
+    // own marks next time.
+    if coverage {
+        for p in probes {
+            let Probe { server: s, key, conn: mut sconn, info } = p;
+            let smark = ix.high_water(group, &key);
+            let lo = if smark > 0 {
+                smark.saturating_add(1)
+            } else if max_age_secs > 0 {
+                bisect_cutoff(&mut sconn, info.low, info.high, now - max_age_secs as i64).await
+            } else {
+                info.high.saturating_sub(backfill).max(info.low)
+            };
+            sconn.quit().await;
+            if lo > info.high {
+                continue;
+            }
+            println!(
+                "coverage {group} via {}: articles {lo}..{} ({})",
+                s.host,
+                info.high,
+                info.high - lo + 1
+            );
+            match scan_article_range(
+                &s,
+                group,
+                &key,
+                lo,
+                info.high,
+                ix,
+                now,
+                Some(smark),
+                progress.as_ref(),
+                scanned,
+                t0,
+                share,
+                turbo,
+            )
+            .await
+            {
+                Ok(pass) => {
+                    scanned += pass.scanned;
+                    completed += pass.completed;
+                }
+                Err(e) => println!("[scan] {}: coverage leg for {group}: {e}", s.host),
+            }
+        }
+    } else {
+        for p in probes {
+            p.conn.quit().await;
+        }
+    }
 
     if let Some(g) = gates {
         let (min, max) = g.size_bounds();
@@ -9345,6 +9628,146 @@ pub(crate) async fn index_scan_into(
         t0.elapsed()
     );
     Ok(())
+}
+
+/// A8 phase 2: targeted gap-fill. Pick up to `count` incomplete
+/// releases and re-OVER each one's posting window on the OTHER eligible
+/// backbones - idempotent ingest merges whatever headers the release's
+/// scanning server never received, and `complete` flips the moment the
+/// last part lands. Marks are untouched (out-of-band coverage, exactly
+/// like the one-off deep rescan); every pick is stamped afterwards so
+/// the rotation moves on whatever the outcome.
+///
+/// The oracle ledger RANKS the candidate backbones (best measured
+/// carrier of the release's family and age first) but never skips one:
+/// the ledger measures BODY availability, and headers may well still be
+/// listed where bodies are gone - and an NZB indexed here is
+/// downloadable from the whole pool, not just the server that indexed
+/// it.
+///
+/// Returns (releases tried, releases now complete).
+pub(crate) async fn index_gapfill_pass(
+    config: &PathBuf,
+    ix: &mut nzbkit::index::Index,
+    count: u32,
+    stop: impl Fn() -> bool,
+) -> Result<(u32, u32)> {
+    // The window around first_posted to re-read. first_posted is the
+    // EARLIEST article date seen, and uploads run forward from there,
+    // so the window leans forward. Multi-day uploads outrun this; the
+    // budget below bounds the spend either way.
+    const WIN_BACK: i64 = 1800;
+    const WIN_FWD: i64 = 4 * 3600;
+    // OVER budget per (group, server) per pass - a busy group's 4.5 h
+    // window can span ~100k articles, and this is background polish
+    // that must never crowd out the scan proper.
+    const MAX_ARTICLES: u64 = 100_000;
+    const CHUNK: u64 = 20_000;
+
+    let cfg = Config::load(config)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let picks = ix.gapfill_pick(count, now)?;
+    if picks.is_empty() {
+        return Ok((0, 0));
+    }
+    let servers = scan_servers(&cfg);
+    if servers.len() < 2 {
+        // One backbone total: there is no "other" provider to ask.
+        return Ok((0, 0));
+    }
+    let snap = ix.oracle_snapshot().unwrap_or_default();
+    let mut by_grp: std::collections::BTreeMap<String, Vec<(i64, i64)>> = Default::default();
+    for (id, grp, posted) in &picks {
+        by_grp.entry(grp.clone()).or_default().push((*id, *posted));
+    }
+    let mut completed = 0u32;
+    'grps: for (grp, mut rels) in by_grp {
+        if stop() {
+            break;
+        }
+        let primary = ix.kv_get(&format!("scan_primary:{grp}")).unwrap_or_default();
+        let fam = nzbkit::oracle::group_family(&grp);
+        rels.sort_by_key(|&(_, p)| p);
+        // Cluster overlapping windows: one busy evening's picks cost one
+        // bisection pair, not one per release.
+        let mut windows: Vec<(i64, i64)> = Vec::new();
+        for &(_, p) in &rels {
+            let (s, e) = (p - WIN_BACK, p + WIN_FWD);
+            match windows.last_mut() {
+                Some(w) if s <= w.1 => w.1 = w.1.max(e),
+                _ => windows.push((s, e)),
+            }
+        }
+        // The ledger bucket the ranking reads: the median pick's age.
+        let mid_posted = rels[rels.len() / 2].1;
+        let bucket = nzbkit::oracle::age_bucket(((now - mid_posted).max(0) / 86_400) as u32);
+        let mut secs: Vec<&ServerConfig> = servers
+            .iter()
+            .filter(|s| nzbkit::index::Index::server_key(&s.host) != primary)
+            .collect();
+        if secs.is_empty() {
+            continue;
+        }
+        // Best measured carrier first; a blind spot ranks between a good
+        // and a bad cell (unknown is not gone).
+        let rate = |s: &ServerConfig| {
+            snap.carry_rate(&nzbkit::oracle::backbone_of(&s.host), &fam, bucket)
+                .unwrap_or(0.75)
+        };
+        secs.sort_by(|a, b| rate(b).partial_cmp(&rate(a)).unwrap_or(std::cmp::Ordering::Equal));
+        for s in secs {
+            if stop() {
+                break 'grps;
+            }
+            let Ok((mut conn, _)) = Connection::connect(s).await else { continue };
+            let Ok(g) = conn.group(&grp).await else {
+                conn.quit().await;
+                continue;
+            };
+            let mut budget = MAX_ARTICLES;
+            for &(ws, we) in &windows {
+                if budget == 0 || stop() {
+                    break;
+                }
+                let lo = bisect_cutoff(&mut conn, g.low, g.high, ws).await;
+                let hi = bisect_cutoff(&mut conn, g.low, g.high, we).await.min(g.high);
+                if hi <= lo {
+                    continue;
+                }
+                let mut at = lo;
+                while at <= hi && budget > 0 && !stop() {
+                    let chunk_hi = at.saturating_add(CHUNK.min(budget) - 1).min(hi);
+                    match conn.over(at, chunk_hi).await {
+                        Ok(entries) => {
+                            let _ = ix.ingest(&grp, &entries, now);
+                        }
+                        Err(_) => break,
+                    }
+                    budget = budget.saturating_sub(chunk_hi - at + 1);
+                    at = chunk_hi.saturating_add(1);
+                }
+            }
+            conn.quit().await;
+            if rels.iter().all(|&(id, _)| ix.is_complete(id)) {
+                break; // every pick in this group landed - stop spending
+            }
+        }
+        for &(id, _) in &rels {
+            if ix.is_complete(id) {
+                completed += 1;
+            }
+        }
+    }
+    // Stamp every pick - including ones a stop() cut short. Rotating an
+    // untried pick is the lesser evil against a pause storm pinning the
+    // same picks forever.
+    for (id, _, _) in &picks {
+        let _ = ix.gapfill_mark(*id, now);
+    }
+    Ok((picks.len() as u32, completed))
 }
 
 /// Connect for a header scan, opting in to RFC 8054 COMPRESS DEFLATE
@@ -9442,6 +9865,9 @@ fn scan_idle_timeout() -> std::time::Duration {
 async fn scan_article_range(
     server: &nzbkit::config::ServerConfig,
     group: &str,
+    // Marks identity of `server` - the high-water this pass advances
+    // belongs to (group, mark_server).
+    mark_server: &str,
     low: u64,
     g_high: u64,
     ix: &mut nzbkit::index::Index,
@@ -9564,6 +9990,7 @@ async fn scan_article_range(
         &mut rx,
         ix,
         group,
+        mark_server,
         low,
         g_high,
         now,
@@ -9588,6 +10015,7 @@ async fn collect_scan_pass(
     rx: &mut tokio::sync::mpsc::Receiver<Result<(u64, u64, Vec<nzbkit::nntp::OverEntry>)>>,
     ix: &mut nzbkit::index::Index,
     group: &str,
+    mark_server: &str,
     low: u64,
     g_high: u64,
     now: i64,
@@ -9645,7 +10073,7 @@ async fn collect_scan_pass(
                     next_expected = hi.saturating_add(1);
                     if let Some(mark) = forward_mark {
                         if hi > mark {
-                            ix.set_high_water(group, hi)?;
+                            ix.set_high_water(group, mark_server, hi)?;
                         }
                     }
                 }
@@ -9723,7 +10151,8 @@ async fn spots_scan(config: &PathBuf, group: &str, backfill: u64, db: &PathBuf) 
     let mut ix = nzbkit::index::Index::open(db)?;
     let (mut conn, _) = Connection::connect(&server).await?;
     let t0 = Instant::now();
-    let sum = nzbkit::spot::scan_spots(&mut conn, &mut ix, group, backfill).await?;
+    let _ = ix.adopt_legacy_marks(&server.host);
+    let sum = nzbkit::spot::scan_spots(&mut conn, &mut ix, group, &server.host, backfill).await?;
     conn.quit().await;
     let total = ix.spot_stats()?;
     println!(
@@ -10308,6 +10737,62 @@ pub(crate) fn load_server(config: &PathBuf) -> Result<ServerConfig> {
     Ok(cfg.servers[0].clone())
 }
 
+/// A8 multi-server indexing: the servers worth scanning HEADERS from.
+///
+/// - enabled only;
+/// - never a prepaid block (`block_bytes` set): OVER traffic burns the
+///   credit that exists to rescue missing bodies;
+/// - one per backbone: mirrors share a spool, so a second reseller of
+///   the same backbone contributes no headers the first didn't. Mirrors
+///   are detected by the explicit `group` field first, else by
+///   [`nzbkit::oracle::backbone_of`];
+/// - ranked level-then-config-order, which is the tiebreak order the
+///   per-group primary choice uses.
+///
+/// An all-block (but enabled) config falls back to the enabled list
+/// unfiltered - a user who configured indexing gets an index; the
+/// caller logs that headers are spending block credit.
+/// Resolve a marks server key (see [`nzbkit::index::Index::server_key`])
+/// back to its config entry - the scan loop persists only the key.
+/// None = the config no longer carries that server.
+pub(crate) fn find_scan_server(config: &PathBuf, key: &str) -> Option<ServerConfig> {
+    let cfg = Config::load(config).ok()?;
+    cfg.servers
+        .iter()
+        .find(|s| nzbkit::index::Index::server_key(&s.host) == key)
+        .cloned()
+}
+
+pub(crate) fn scan_servers(cfg: &Config) -> Vec<ServerConfig> {
+    let eligible: Vec<&ServerConfig> = {
+        let flat: Vec<&ServerConfig> = cfg
+            .servers
+            .iter()
+            .filter(|s| s.enabled && !s.block_bytes.is_some_and(|b| b > 0))
+            .collect();
+        if flat.is_empty() {
+            cfg.servers.iter().filter(|s| s.enabled).collect()
+        } else {
+            flat
+        }
+    };
+    let mut ranked = eligible;
+    // Stable: config order survives within a level.
+    ranked.sort_by_key(|s| s.level);
+    let mut seen = std::collections::HashSet::new();
+    ranked
+        .into_iter()
+        .filter(|s| {
+            let backbone = s
+                .group
+                .clone()
+                .unwrap_or_else(|| nzbkit::oracle::backbone_of(&s.host));
+            seen.insert(backbone)
+        })
+        .cloned()
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // probe
 // ---------------------------------------------------------------------------
@@ -10788,6 +11273,7 @@ mod scan_pass_tests {
                 &mut rx,
                 &mut ix,
                 "alt.test",
+                "srv1",
                 100,
                 999,
                 0,
@@ -10808,7 +11294,7 @@ mod scan_pass_tests {
         // CRITICAL: the contiguous prefix stops where coverage really
         // ends. Advancing it to g_high would write the missing 200..999
         // off as scanned forever.
-        assert_eq!(ix.high_water("alt.test"), 199);
+        assert_eq!(ix.high_water("alt.test", "srv1"), 199);
         drop(wedged);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -10830,6 +11316,7 @@ mod scan_pass_tests {
                 &mut rx,
                 &mut ix,
                 "alt.test",
+                "srv1",
                 100,
                 299,
                 0,
@@ -10847,7 +11334,7 @@ mod scan_pass_tests {
 
         assert!(pass.complete);
         assert_eq!(pass.scanned, 200);
-        assert_eq!(ix.high_water("alt.test"), 299);
+        assert_eq!(ix.high_water("alt.test", "srv1"), 299);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -10869,6 +11356,7 @@ mod scan_pass_tests {
                 &mut rx,
                 &mut ix,
                 "alt.test",
+                "srv1",
                 100,
                 399,
                 0,
@@ -10886,12 +11374,66 @@ mod scan_pass_tests {
 
         assert!(!pass.complete);
         assert_eq!(
-            ix.high_water("alt.test"),
+            ix.high_water("alt.test", "srv1"),
             199,
             "the mark must stop at the hole, not follow the last chunk in"
         );
         drop(wedged);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod multi_server_selection {
+    use super::*;
+
+    fn cfg(servers: serde_json::Value) -> Config {
+        serde_json::from_value(serde_json::json!({ "servers": servers })).unwrap()
+    }
+
+    /// A8: header scanning never spends block credit, never reads the
+    /// same backbone twice (mirrors share a spool), and ranks
+    /// level-then-config-order.
+    #[test]
+    fn scan_servers_skip_blocks_and_dedupe_backbones() {
+        let c = cfg(serde_json::json!([
+            { "host": "news.eweka.nl" },
+            // Same backbone (omicron reseller): contributes nothing.
+            { "host": "news.newshosting.com" },
+            // Prepaid block: OVER would burn rescue credit.
+            { "host": "news.blocknews.net", "block_bytes": 5_000_000_000u64 },
+            // Fill server, flatrate, own backbone: eligible, ranked after
+            // the level-0 entries.
+            { "host": "news.xsnews.nl", "level": 1 },
+            { "host": "news.usenetexpress.com", "enabled": false },
+        ]));
+        let picked: Vec<String> = scan_servers(&c).into_iter().map(|s| s.host).collect();
+        assert_eq!(picked, ["news.eweka.nl", "news.xsnews.nl"]);
+    }
+
+    /// The explicit mirror `group` field outranks hostname clustering:
+    /// two hosts the alias map would call separate backbones are one
+    /// spool when the user says so.
+    #[test]
+    fn scan_servers_honour_the_mirror_group_field() {
+        let c = cfg(serde_json::json!([
+            { "host": "news.eweka.nl", "group": "main" },
+            { "host": "news.xsnews.nl", "group": "main" },
+        ]));
+        let picked: Vec<String> = scan_servers(&c).into_iter().map(|s| s.host).collect();
+        assert_eq!(picked, ["news.eweka.nl"]);
+    }
+
+    /// An all-block config still gets an index: the user configured
+    /// indexing, and "no index at all" is worse than spending credit.
+    #[test]
+    fn scan_servers_fall_back_to_blocks_when_nothing_else_exists() {
+        let c = cfg(serde_json::json!([
+            { "host": "news.blocknews.net", "block_bytes": 5_000_000_000u64 },
+            { "host": "news.abavia.com", "enabled": false },
+        ]));
+        let picked: Vec<String> = scan_servers(&c).into_iter().map(|s| s.host).collect();
+        assert_eq!(picked, ["news.blocknews.net"]);
     }
 }
 

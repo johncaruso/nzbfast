@@ -1580,13 +1580,22 @@ async fn kill9_resume_completes_without_refetching_everything() {
     fx.add_file("big.bin", &data, 25_000); // 120 articles
     assert!(fx.add_par2(10, &["big.bin"], 25_000));
     let total_articles = fx.articles.len() as u64;
-    let srv = MockServer::start(fx.articles.clone(), Chaos::default()).await;
+    // Paced for the same reason as the direct-extract sibling below: an
+    // unpaced server on a busy machine can finish all 120 articles before
+    // the poll loop ever sees 40%, and a kill after completion leaves
+    // nothing to resume.
+    let srv = MockServer::start(
+        fx.articles.clone(),
+        Chaos { delay_ms: 10, ..Chaos::default() },
+    )
+    .await;
     let served = srv.served.clone();
     let cfg = fx.write_config(&[&srv]);
     let nzb = fx.write_nzb();
     let out = fx.dir.join("out");
 
-    // Run 1: kill -9 once ~40% of the articles have been served.
+    // Run 1: kill -9 once ~40% of the articles have been served AND the
+    // journal has recorded real progress for run 2 to resume from.
     {
         let cfg = cfg.clone();
         let nzb = nzb.clone();
@@ -1608,7 +1617,10 @@ async fn kill9_resume_completes_without_refetching_everything() {
                 .spawn()
                 .unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            while served.load(std::sync::atomic::Ordering::Relaxed) < total_articles * 2 / 5 {
+            let journal = out.join(".nzbfast.journal");
+            while served.load(std::sync::atomic::Ordering::Relaxed) < total_articles * 2 / 5
+                || !std::fs::read_to_string(&journal).is_ok_and(|s| s.lines().count() > 1)
+            {
                 if std::time::Instant::now() > deadline {
                     break;
                 }
@@ -1688,13 +1700,22 @@ async fn kill9_resume_direct_extract_refetches_little() {
         assert!(fx.add_par2(20, &names, 25_000), "par2 create failed");
     }
     let total_articles = fx.articles.len() as u64;
-    let srv = MockServer::start(fx.articles.clone(), Chaos::default()).await;
+    // Pace the network so decode and placement keep up with the request
+    // counter. Unpaced, a machine busy with the rest of the suite can
+    // serve 40% of the articles while the client has journaled nothing,
+    // and the kill lands before the first placement record exists.
+    let srv = MockServer::start(
+        fx.articles.clone(),
+        Chaos { delay_ms: 10, ..Chaos::default() },
+    )
+    .await;
     let served = srv.served.clone();
     let cfg = fx.write_config(&[&srv]);
     let nzb = fx.write_nzb();
     let out = fx.dir.join("out");
 
-    // Run 1: kill -9 once ~40% of the articles have been served.
+    // Run 1: kill -9 once ~40% of the articles have been served AND the
+    // direct extractor has journaled at least one placement.
     {
         let cfg = cfg.clone();
         let nzb = nzb.clone();
@@ -1716,7 +1737,11 @@ async fn kill9_resume_direct_extract_refetches_little() {
                 .spawn()
                 .unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            while served.load(std::sync::atomic::Ordering::Relaxed) < total_articles * 2 / 5 {
+            let journal = out.join(".nzbfast.journal");
+            while served.load(std::sync::atomic::Ordering::Relaxed) < total_articles * 2 / 5
+                || !std::fs::read_to_string(&journal)
+                    .is_ok_and(|s| s.lines().any(|line| line.starts_with("R ")))
+            {
                 if std::time::Instant::now() > deadline {
                     break;
                 }
@@ -2327,7 +2352,16 @@ async fn tiny_mem_budget_fast_verify_never_spills() {
         fx.add_par2_opts(5, Some(30_000_000), &["big.bin"], 300_000),
         "par2 create failed"
     );
-    let srv = MockServer::start(fx.articles.clone(), Chaos::default()).await;
+    // A server that delivers at a plausible rate rather than at memcpy
+    // speed. Trimming releases what the decoder has already READ, so a
+    // mock that hands over 40 MB in 0.3 s is testing the case trimming
+    // cannot help (arrivals outrunning decode, which correctly demotes),
+    // not the case it exists for.
+    let chaos = Chaos {
+        delay_ms: 60,
+        ..Default::default()
+    };
+    let srv = MockServer::start(fx.articles.clone(), chaos).await;
     let cfg = fx.write_config(&[&srv]);
     let nzb = fx.write_nzb();
     let out = fx.dir.join("out");
@@ -3162,4 +3196,249 @@ fn extract_local_par_only_dir_recreates_and_extracts() {
         "payload bytes differ after CLI reconstruction"
     );
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// TODO 37 step 1: a POSTED single-file `.7z` - no RAR around it, the
+/// shape 3.3% of releases actually use. The chase now takes it at depth
+/// 0, so its payload streams out while the archive downloads and the
+/// `.7z` itself never touches disk. Before this, the badge said
+/// `7z · unpacked after download` and the archive sat on disk waiting
+/// for the post-pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn top_level_7z_extracts_one_pass() {
+    if !have_par2() {
+        eprintln!("skipping: par2 not installed");
+        return;
+    }
+    let mut fx = Fixture::new("top7z");
+    // Incompressible, like real payload: LZMA2 leaves it ~1:1, so the
+    // posted archive is genuinely article-sized rather than a stub.
+    let movie = incompressible(900_000, 41);
+    let arch = sevenz_container(&[("movie.mkv", &movie)]);
+    fx.add_file("release.7z", &arch, 60_000);
+    assert!(fx.add_par2(10, &["release.7z"], 60_000));
+    let srv = MockServer::start(fx.articles.clone(), Chaos::default()).await;
+    let cfg = fx.write_config(&[&srv]);
+    let nzb = fx.write_nzb();
+    let out = fx.dir.join("out");
+
+    let (log, ok) = tokio::task::spawn_blocking(move || run_get(&cfg, &nzb, &out, &[]))
+        .await
+        .unwrap();
+    assert!(ok, "get failed:\n{log}");
+    assert!(log.contains("clean download"), "no clean verdict:\n{log}");
+    assert!(log.contains("extracted 1 file(s) in-stream"), "{log}");
+    assert!(log.contains("7z · one-pass"), "badge still says on-disk:\n{log}");
+    assert_eq!(
+        std::fs::read(fx.dir.join("out/movie.mkv")).expect("extracted file"),
+        movie,
+        "extracted bytes differ"
+    );
+    assert!(
+        !fx.dir.join("out/release.7z").exists(),
+        "the archive must not touch disk"
+    );
+}
+
+/// The same shape, damaged. A chased slot cannot take a mapped repair
+/// (its bytes are in RAM, not a file par2 can patch), so the ladder must
+/// materialize it first - which is the pre-TODO-37 end state - repair it
+/// on disk, and let the 7z post-pass unpack it. The failure this pins is
+/// silent and total: without the chased slot in the materialize sweep,
+/// par2 finds no `release.7z` at all and calls the whole file missing.
+#[tokio::test(flavor = "multi_thread")]
+async fn damaged_top_level_7z_materializes_repairs_and_unpacks() {
+    if !have_par2() {
+        eprintln!("skipping: par2 not installed");
+        return;
+    }
+    let mut fx = Fixture::new("top7zdmg");
+    let movie = incompressible(900_000, 42);
+    let arch = sevenz_container(&[("movie.mkv", &movie)]);
+    fx.add_file("release.7z", &arch, 60_000);
+    assert!(fx.add_par2(30, &["release.7z"], 60_000));
+    // Two mid-archive articles vanish: enough damage to need repair,
+    // well inside the 30% redundancy.
+    let victims: Vec<String> = ["-3@mock>", "-5@mock>"]
+        .iter()
+        .map(|suffix| {
+            fx.articles
+                .keys()
+                .find(|k| k.contains("release_7z") && k.ends_with(suffix))
+                .unwrap_or_else(|| panic!("no {suffix} article: {:?}", fx.articles.len()))
+                .clone()
+        })
+        .collect();
+    let chaos = Chaos {
+        missing: victims.into_iter().collect(),
+        ..Default::default()
+    };
+    let srv = MockServer::start(fx.articles.clone(), chaos).await;
+    let cfg = fx.write_config(&[&srv]);
+    let nzb = fx.write_nzb();
+    let out = fx.dir.join("out");
+
+    let (log, ok) = tokio::task::spawn_blocking(move || run_get(&cfg, &nzb, &out, &[]))
+        .await
+        .unwrap();
+    assert!(ok, "get failed:\n{log}");
+    assert!(
+        !log.contains("file missing entirely"),
+        "par2 could not see the chased archive:\n{log}"
+    );
+    assert!(log.contains("materializing volumes for repair"), "{log}");
+    assert!(log.contains("repair complete"), "no repair:\n{log}");
+    assert_eq!(
+        std::fs::read(fx.dir.join("out/movie.mkv")).expect("payload after repair"),
+        movie,
+        "payload differs after repair + post-pass"
+    );
+}
+
+/// Payload LZMA2 cannot shrink (xorshift), so a 7z fixture's posted size
+/// tracks its content size.
+fn incompressible(n: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed | 1;
+    (0..n)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 24) as u8
+        })
+        .collect()
+}
+
+/// An in-memory single-file `.7z`, LZMA2 default.
+fn sevenz_container(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut w = sevenz_rust2::ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+    for &(n, d) in entries {
+        w.push_archive_entry(sevenz_rust2::ArchiveEntry::new_file(n), Some(d))
+            .unwrap();
+    }
+    w.finish().unwrap().into_inner()
+}
+
+/// TODO 37 step 2: an archive several times the retention cap streams
+/// anyway. The chase drops the prefix the decoder has already read past
+/// out of RAM and into the archive's own path as it goes, so what bounds
+/// it is the live window rather than the whole file; on success that
+/// partial spill is removed and the payload is the only thing left.
+///
+/// `--mem-limit 64M` floors the budget, which puts the extractor's
+/// held-span ceiling at ~29 MB against a ~36 MB archive. Before
+/// trimming, a job like this could only demote.
+#[tokio::test(flavor = "multi_thread")]
+async fn top_level_7z_over_the_cap_trims_and_still_streams() {
+    if !have_par2() {
+        eprintln!("skipping: par2 not installed");
+        return;
+    }
+    let mut fx = Fixture::new("top7ztrim");
+    // Store-codec 7z over incompressible payload - the shape the census
+    // says dominates (already-compressed video), and the one where
+    // decode keeps up with arrival so the trim watermark advances.
+    let movie = incompressible(36 << 20, 43);
+    let arch = sevenz_store_container(&[("movie.mkv", &movie)]);
+    assert!(arch.len() > 36 << 20, "fixture too small: {}", arch.len());
+    fx.add_file("release.7z", &arch, 700_000);
+    // PAR2 stays on for this one: verifying a slot whose prefix has been
+    // trimmed out from under it is the interaction most likely to break.
+    assert!(fx.add_par2(5, &["release.7z"], 700_000));
+    // A server that delivers at a plausible rate rather than at memcpy
+    // speed. Trimming releases what the decoder has already READ, so a
+    // mock that hands over 40 MB in 0.3 s is testing the case trimming
+    // cannot help (arrivals outrunning decode, which correctly demotes),
+    // not the case it exists for.
+    let chaos = Chaos {
+        delay_ms: 60,
+        ..Default::default()
+    };
+    let srv = MockServer::start(fx.articles.clone(), chaos).await;
+    let cfg = fx.write_config(&[&srv]);
+    let nzb = fx.write_nzb();
+    let out = fx.dir.join("out");
+
+    let (log, ok) = tokio::task::spawn_blocking(move || {
+        run_get_args(&cfg, &nzb, &out, &[], &["--mem-limit", "64M"])
+    })
+    .await
+    .unwrap();
+    assert!(ok, "get failed:\n{log}");
+    assert!(
+        !log.contains("held-bytes cap"),
+        "the archive demoted instead of trimming:\n{log}"
+    );
+    assert!(log.contains("extracted 1 file(s) in-stream"), "{log}");
+    assert!(log.contains("7z · one-pass"), "{log}");
+    assert_eq!(
+        std::fs::read(fx.dir.join("out/movie.mkv")).expect("extracted file"),
+        movie,
+        "extracted bytes differ"
+    );
+    assert!(
+        !fx.dir.join("out/release.7z").exists(),
+        "the spilled archive survived a successful chase"
+    );
+}
+
+/// An in-memory single-file `.7z` with the payload STORED (Copy codec).
+fn sevenz_store_container(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut w = sevenz_rust2::ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+    w.set_content_methods(vec![sevenz_rust2::EncoderConfiguration::new(
+        sevenz_rust2::EncoderMethod::COPY,
+    )]);
+    for &(n, d) in entries {
+        w.push_archive_entry(sevenz_rust2::ArchiveEntry::new_file(n), Some(d))
+            .unwrap();
+    }
+    w.finish().unwrap().into_inner()
+}
+
+/// The other half of the same story: whenever a trim cannot happen, the
+/// job must land exactly where it did before trimming existed - archive
+/// materialized, disk post-pass unpacks it, payload still right.
+///
+/// Driven through the kill switch rather than by outrunning the decoder.
+/// Arrival-beats-decode reaches the same code, but asserting on it means
+/// asserting on who won a race: under a loaded machine the chase wins,
+/// streams, and the "it demoted" assertion fails for the best possible
+/// reason. The gate pins the behaviour; the race is a field question.
+#[tokio::test(flavor = "multi_thread")]
+async fn top_level_7z_over_the_cap_demotes_cleanly_when_it_cannot_trim() {
+    if !have_par2() {
+        eprintln!("skipping: par2 not installed");
+        return;
+    }
+    let mut fx = Fixture::new("top7znotrim");
+    let movie = incompressible(36 << 20, 44);
+    let arch = sevenz_store_container(&[("movie.mkv", &movie)]);
+    // No PAR2: this test is about where the archive ENDS UP, and the
+    // set costs more to build than the rest of the case put together.
+    // The chase-plus-PAR2 interactions have their own tests, small ones.
+    fx.add_file("release.7z", &arch, 700_000);
+    let srv = MockServer::start(fx.articles.clone(), Chaos::default()).await;
+    let cfg = fx.write_config(&[&srv]);
+    let nzb = fx.write_nzb();
+    let out = fx.dir.join("out");
+
+    let (log, ok) = tokio::task::spawn_blocking(move || {
+        run_get_args(
+            &cfg,
+            &nzb,
+            &out,
+            &[("NZBFAST_NO_7Z_TRIM", "1")],
+            &["--mem-limit", "64M"],
+        )
+    })
+    .await
+    .unwrap();
+    assert!(ok, "get failed:\n{log}");
+    assert!(log.contains("held-bytes cap: chase memory"), "{log}");
+    assert!(log.contains("7z unpack complete"), "the post-pass never ran:\n{log}");
+    assert_eq!(
+        std::fs::read(fx.dir.join("out/movie.mkv")).expect("payload after the disk pass"),
+        movie,
+        "the demoted archive did not reconstruct"
+    );
 }

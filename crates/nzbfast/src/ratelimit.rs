@@ -13,13 +13,31 @@
 //! roughly 1 request/second and blocks clients that ignore it, so the
 //! music lane needs a limit on REQUESTS, not on titles.
 //!
-//! Scope, stated honestly: this module is used by the music and book
-//! providers only. The movie and TV lanes still pace by sleeping between
-//! titles. Moving them across is the rest of C3 and is deliberately not
-//! bundled here - it means deleting their per-title sleep at the same
-//! time, and that pacing was measured and shipped days ago (research
-//! §7.2). Adding a bucket underneath it without removing it would just
-//! make the movie lane slower.
+//! Every lane is on a bucket now. The movie and TV lanes came across on
+//! 27 Jul and their per-title sleeps were deleted in the same change -
+//! a bucket UNDER a sleep is just a slower sleep. What that move
+//! measured is the reason the numbers below are what they are, and it
+//! is worth reading before adjusting any of them:
+//!
+//! The Wikidata action API does not enforce a rate. It enforces a
+//! QUOTA: ten requests, then HTTP 429 with a `Retry-After` that counts
+//! down to a ~60 s window reset. Probed 27 Jul at 400 ms and at 1000 ms
+//! spacing - both got exactly ten through and were then refused for the
+//! rest of the run, which is what tells you it is a count and not a
+//! rate. The old sleep-between-titles pacing could not see this: a movie
+//! title makes two or three Wikidata calls back to back, so the burst
+//! inside ONE title spent a quarter of a window, and 3-4 titles in every
+//! 10 stalled ~55 s on a 429. Measured cost of that: 18.6-23.6 s/title
+//! across three runs. The quota, not the sleep, was setting the pace.
+//!
+//! Two consequences worth keeping in mind before tuning anything here:
+//!
+//! - **The keyless movie lane is at its provider's ceiling.** Ten
+//!   requests a minute over two or three per title is 3-4 titles a
+//!   minute, and that is the whole budget. No pacing scheme beats it;
+//!   only asking Wikidata FEWER times per title would.
+//! - **Do not merge buckets by operator.** `Wikipedia` looks like it
+//!   belongs with `Wikidata` and does not - see its doc comment.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -39,6 +57,42 @@ pub enum Provider {
     CoverArt,
     /// OpenLibrary. No published limit for search.json; same reasoning.
     OpenLibrary,
+    /// The Wikidata action API (www.wikidata.org/w/api.php). The tightest
+    /// limit any lane here faces, and the one that sets the keyless movie
+    /// lane's ceiling.
+    Wikidata,
+    /// Wikipedia's REST summary endpoint (en.wikipedia.org/api/rest_v1).
+    ///
+    /// A SEPARATE bucket from Wikidata, and that is a measured fact, not
+    /// a guess: probed 27 Jul, 24 consecutive calls at 2.5 req/s with no
+    /// refusal, while wikidata.org was simultaneously refusing anything
+    /// past ten a minute. Putting both on one bucket was tried first and
+    /// cost the movie lane 41% - the Wikipedia half of every title sat
+    /// waiting on an allowance it does not actually spend.
+    Wikipedia,
+    /// The Wikidata SPARQL endpoint (query.wikidata.org), which is a
+    /// third service again. Only the person-page filmography uses it,
+    /// one query at a time, on a click - so this rate is a courtesy
+    /// default rather than a probed figure, and it is deliberately NOT
+    /// the Wikidata bucket: a person page must not queue behind the
+    /// enricher's crawl.
+    WikidataSparql,
+    /// TVmaze. Publishes 20 requests / 10 seconds and means it; probed
+    /// 27 Jul at 2 req/s for 24 consecutive calls with no refusal.
+    Tvmaze,
+    /// OMDb, on the user's own free key. The free tier is capped per DAY
+    /// (1,000 calls), not per second, so this bucket is courtesy only -
+    /// going slower here does not buy a single extra lookup.
+    Omdb,
+    /// TMDB, bring-your-own-key only (they decline applications for NZB
+    /// tooling). Their documented ceiling is ~50 req/s, far above
+    /// anything a background enricher does.
+    Tmdb,
+    /// AniList, the last-chance fallback for video. 90 requests/minute
+    /// published, and unlike the others here that figure is NOT probed -
+    /// it is a rare fallback, so a live calibration run would have spent
+    /// more of their capacity than the enricher does.
+    AniList,
 }
 
 impl Provider {
@@ -53,6 +107,36 @@ impl Provider {
             Provider::MusicBrainz => (1.0, 1.0),
             Provider::CoverArt => (2.0, 2.0),
             Provider::OpenLibrary => (2.0, 2.0),
+            // Sized to fit inside a fixed window of 10 requests / 60 s,
+            // which is the shape probing found. 7.5 s apart is 8 per
+            // minute in the steady state, and 9 in the first minute
+            // after an idle bucket (t=0 plus eight more) - one request
+            // of headroom under the quota.
+            //
+            // NO BURST, and that is the second thing this was measured
+            // into rather than reasoned into. A burst of 2 is tempting:
+            // a movie title's first two Wikidata calls (search, then
+            // claims) are what produce the card, so letting them go back
+            // to back is what a title the user is LOOKING AT wants. But
+            // it puts 10 in that first window - exactly the quota - and
+            // live runs drew a 429 anyway in 2 of 3 attempts, because
+            // anything else on this IP shares the allowance. The 45 s
+            // stall a 429 costs is far worse than the 7.5 s the burst
+            // saved. Verified at this spacing: 24 consecutive calls,
+            // three minutes, zero 429s.
+            Provider::Wikidata => (8.0 / 60.0, 1.0),
+            Provider::Wikipedia => (2.0, 2.0),
+            Provider::WikidataSparql => (1.0, 2.0),
+            // 20 requests / 10 s published. A leaky bucket emits
+            // `burst + rate*T` in a window of length T, so 2 req/s with
+            // a burst of 2 is 22 in their window - over the line every
+            // time the enricher runs flat out. 1.8 lands on exactly 20.
+            Provider::Tvmaze => (1.8, 2.0),
+            Provider::Omdb => (3.0, 2.0),
+            Provider::Tmdb => (5.0, 5.0),
+            // 90/minute published; 1.5 with a burst of 2 is 92. Same
+            // arithmetic as TVmaze above, and see the quota test.
+            Provider::AniList => (1.4, 2.0),
         }
     }
 }
@@ -109,6 +193,40 @@ pub fn acquire(p: Provider) {
     }
 }
 
+/// Claim a slot only if the wait is short, and REFUSE rather than queue
+/// when it is not. Returns whether the caller may make the request.
+///
+/// `acquire` is right for the background enricher, which has nothing
+/// better to do than wait its turn. It is wrong on an interactive path:
+/// the dashboard's search runs on one of a few blocking API workers, in
+/// front of the HTTP timeout, so a queued claim (or a 60 s `penalise`
+/// from a 429 the enricher drew) parks a worker for as long as the
+/// bucket says - and enough clicks park every worker, which stalls
+/// dashboard polling too. A click that cannot be served fast should
+/// degrade to whatever the handler already knows locally.
+///
+/// A refusal must cost the caller nothing and the LANE nothing: `tat` is
+/// left exactly as it was, so a refused click does not slow the
+/// enricher down or push the next caller further out.
+pub fn try_acquire(p: Provider, max_wait: Duration) -> bool {
+    let (interval, tolerance) = timings(p);
+    let wait = {
+        let now = Instant::now();
+        let mut map = buckets().lock().unwrap_or_else(|e| e.into_inner());
+        let b = map.entry(p).or_insert(Bucket { tat: now });
+        let wait = b.tat.saturating_duration_since(now + tolerance);
+        if wait > max_wait {
+            return false;
+        }
+        b.tat = b.tat.max(now) + interval;
+        wait
+    };
+    if !wait.is_zero() {
+        std::thread::sleep(wait);
+    }
+    true
+}
+
 /// Push this provider's next slot out by `secs`, on top of whatever is
 /// already queued. For an explicit "you are going too fast" from
 /// upstream (HTTP 429/503 + Retry-After), where carrying on at the
@@ -163,6 +281,83 @@ mod tests {
         assert!(
             spent >= Duration::from_millis(1400),
             "four concurrent calls at 2 req/s cleared in {spent:?} - they collided"
+        );
+    }
+
+    /// Every provider whose limit is a fixed-window QUOTA rather than a
+    /// rate. A leaky bucket can emit `burst + rate*T` in a window of
+    /// length T, so a config is only safe while
+    /// `burst + window*rate <= quota` - and that is not obvious from
+    /// either number alone: raising the rate to use "the last of the
+    /// budget", or handing a provider a burst so a hot card appears
+    /// sooner, is exactly the tempting edit that puts the movie lane
+    /// back to stalling ~45 s on a 429. Both were tried live on Wikidata
+    /// before this test existed.
+    ///
+    /// Pure arithmetic on purpose: a real one would have to spend a
+    /// minute of each provider's allowance to say the same thing.
+    #[test]
+    fn quota_providers_stay_inside_their_windows() {
+        // (provider, window seconds, requests allowed in that window).
+        // Wikidata's is measured (see the module header); TVmaze's and
+        // AniList's are the figures they publish.
+        const QUOTAS: [(Provider, f64, f64); 3] = [
+            (Provider::Wikidata, 60.0, 10.0),
+            (Provider::Tvmaze, 10.0, 20.0),
+            (Provider::AniList, 60.0, 90.0),
+        ];
+        for (p, window, quota) in QUOTAS {
+            let (rate, burst) = p.limit();
+            let worst = burst + window * rate;
+            assert!(
+                worst <= quota,
+                "{p:?} could emit {worst} in a {window} s window; the quota is {quota}"
+            );
+        }
+    }
+
+    /// `try_acquire` refuses without reserving. Both halves matter: a
+    /// refusal that still pushed `tat` would let a burst of refused
+    /// clicks starve the enricher of the very allowance they never used.
+    #[test]
+    fn try_acquire_refuses_without_consuming() {
+        // TVmaze's bucket belongs to this test alone. Drain its burst
+        // first: while a bucket is still inside its tolerance every
+        // caller is conforming and there is nothing to refuse.
+        let (interval, _) = timings(Provider::Tvmaze);
+        acquire(Provider::Tvmaze);
+        acquire(Provider::Tvmaze);
+        let t0 = Instant::now();
+        for _ in 0..5 {
+            assert!(
+                !try_acquire(Provider::Tvmaze, Duration::from_millis(50)),
+                "a slot ~{interval:?} out was granted against a 50 ms budget"
+            );
+        }
+        // Five refusals must leave the queue exactly where it was: the
+        // next slot is one interval out, not six.
+        assert!(
+            try_acquire(Provider::Tvmaze, interval * 2),
+            "the refusals consumed the slots they declined"
+        );
+        assert!(
+            t0.elapsed() < interval * 2,
+            "waited {:?} for a slot {interval:?} out - the refusals pushed it back",
+            t0.elapsed()
+        );
+    }
+
+    /// An idle bucket grants immediately, and the grant IS a claim.
+    #[test]
+    fn try_acquire_grants_and_claims() {
+        // Wikidata: no burst, 7.5 s apart, and no other test here spends
+        // from it - so both halves are unambiguous and neither sleeps.
+        let t0 = Instant::now();
+        assert!(try_acquire(Provider::Wikidata, Duration::from_millis(200)));
+        assert!(t0.elapsed() < Duration::from_millis(100), "an idle bucket made us wait");
+        assert!(
+            !try_acquire(Provider::Wikidata, Duration::from_millis(200)),
+            "the grant above did not claim the slot"
         );
     }
 

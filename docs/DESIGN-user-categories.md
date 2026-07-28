@@ -178,10 +178,15 @@ String/SQL sites (swept by hand, per the grep map):
   (`c:<slug>:…`), so two sessions of one season never collapse into one
   slot. Year pins and season/episode scopes both apply, since a
   category can be either shape. The language gate is skipped for custom
-  kinds - a Bundesliga category would otherwise match nothing. Known
-  limit: a daily-dated post keeps no date in the parse, so a daily
-  category has one slot (one grab, not a storm); the fix is a date
-  field on `Parsed`. Index protection resolves the tailed keys through
+  kinds - a Bundesliga category would otherwise match nothing. The
+  daily-dated collision this section used to list as a known limit is
+  closed: `Parsed` carries the episode date, the key above folds it in,
+  and a bare-season post now fills that season's pack slot rather than
+  none (the M23e pack preference rule: with nothing of a season in
+  hand a pack is taken; against episodes already grabbed it must match
+  the best single's quality and bring at least two missing episodes,
+  and at least as many as it repeats).
+  Index protection resolves the tailed keys through
   the index by prefix, the way a year-less film already did.
 - **wall_search / wall_fix** (`serve.rs`): still movie/tv only - the
   fix-match flow is about metadata identity, which custom kinds don't

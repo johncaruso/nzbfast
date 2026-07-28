@@ -374,10 +374,70 @@ fn an_empty_existing_keyfile_refuses_to_start_instead_of_opening_the_api() {
         log.contains(nzbfast_keyless_marker()) || log.contains("refusing to start"),
         "no refusal message in the log:\n{log}"
     );
+    // The listener check is the daemon's OWN startup banner, which is
+    // printed on the line after the bind succeeds. Probing the port after
+    // the process has exited proves nothing about whether it was ever
+    // open, and under a fully parallel `cargo test` it is worse than
+    // nothing: free_port() releases the port before we spawn, so another
+    // suite's daemon can be sitting on it by the time we connect, and the
+    // test then fails for a reason it does not care about.
     assert!(
-        TcpStream::connect(("127.0.0.1", port)).is_err(),
-        "a failed-closed startup still opened the listener"
+        !log.contains("nzbfast is running"),
+        "a failed-closed startup still opened the listener:\n{log}"
     );
+}
+
+/// A refusal has to SURVIVE the exit it causes. `serve` tees its own
+/// stdout/stderr through a pipe so the dashboard can show its log, and
+/// until the tee learned to drain on the way out, the bytes of a message
+/// printed immediately before exit were still sitting unread in that pipe
+/// when the process (and with it the reader thread) went away. Measured
+/// at 13 of 24 concurrent starts losing the whole refusal: the user got a
+/// failed start and no reason, and three tests in this file flaked on it
+/// under a parallel suite. Concurrency is the trigger, so this starts a
+/// small pile of refusals at once and insists every one of them speaks.
+#[test]
+fn a_refusal_survives_the_exit_it_causes() {
+    let mut running = Vec::new();
+    for i in 0..8 {
+        let dir = scratch(&format!("refusal-speaks-{i}"));
+        std::fs::write(dir.join("settings.json"), "{\"auto_speed\":false}").unwrap();
+        std::fs::write(dir.join("apikey"), "").unwrap();
+        let log = dir.join("daemon.log");
+        let out = std::fs::File::create(&log).unwrap();
+        let err = out.try_clone().unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_nzbfast"))
+            .env("NZBFAST_NO_ENRICH", "1")
+            .env_remove("NZBFAST_OPEN")
+            .arg("--config")
+            .arg(dir.join("config.json"))
+            .arg("serve")
+            .arg("--port")
+            .arg(free_port().to_string())
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .stdout(Stdio::from(out))
+            .stderr(Stdio::from(err))
+            .spawn()
+            .unwrap();
+        running.push((child, log));
+    }
+    for (mut child, log) in running {
+        let status = child.wait().unwrap();
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(!status.success(), "daemon accepted an empty credential file:\n{text}");
+        assert!(
+            text.contains(nzbfast_keyless_marker()),
+            "a refusal exited without saying why:\n{text}"
+        );
+        // The whole message, not a prefix: the tail is the sentence that
+        // explains how the file went empty, and a half-drained pipe used
+        // to cut the message off mid-way just as often as it lost it.
+        assert!(
+            text.contains("An empty file usually means"),
+            "the refusal was cut off before it finished:\n{text}"
+        );
+    }
 }
 
 /// (b) THE regression that protects current users: an install that is
@@ -587,6 +647,50 @@ fn setting_a_key_in_the_dashboard_survives_a_restart() {
     assert!(ok.contains("version"), "dashboard-set key lost across a restart: {ok}");
     let anon = http(r2.port, "/api?mode=version&output=json");
     assert!(rejected(&anon), "dashboard-set key not enforced after a restart: {anon}");
+    assert!(
+        dir.join("apikey").exists(),
+        "a dashboard-set key must also land in the key file the container reads"
+    );
+}
+
+/// Clear the key, then set a new one - the shape a user rotating a
+/// credential from the dashboard actually performs.
+///
+/// The clear deletes the key file (that is what makes "keyless" survive a
+/// restart) and setting a new one used to update only the live daemon and
+/// settings.json. The daemon itself does not mind - settings.json wins at
+/// load - but the container entrypoint reads the FILE to decide whether an
+/// established install is about to publish the control API keyless, and
+/// with the file gone it refused to start. Clearing and re-keying from the
+/// dashboard bricked the container until someone hand-edited /config.
+#[test]
+fn clear_then_rekey_restores_the_key_file() {
+    let dir = scratch("rekey");
+    let keyfile = dir.join("apikey");
+
+    let r = serve(&dir, &[]);
+    let key = std::fs::read_to_string(&keyfile).expect("apikey file must be written");
+    let cleared =
+        http(r.port, &format!("/api?mode=config&name=apikey&value=&apikey={key}&output=json"));
+    assert!(cleared.contains("\"status\""), "clear rejected: {cleared}");
+    assert!(!keyfile.exists(), "the clear must take the key file with it");
+
+    // THE REGRESSION: re-keying has to put the file back.
+    let set = http(r.port, "/api?mode=config&name=apikey&value=second-key&output=json");
+    assert!(set.contains("\"status\""), "re-key rejected: {set}");
+    assert_eq!(
+        std::fs::read_to_string(&keyfile).unwrap_or_default().trim(),
+        "second-key",
+        "re-keying left the container with no key file to read"
+    );
+
+    // And the key itself is live and survives the restart, as before.
+    let anon = http(r.port, "/api?mode=version&output=json");
+    assert!(rejected(&anon), "re-keying did not close the API: {anon}");
+    drop(r);
+    let r2 = serve(&dir, &[]);
+    let ok = http(r2.port, "/api?mode=version&apikey=second-key&output=json");
+    assert!(ok.contains("version"), "re-keyed value lost across a restart: {ok}");
 }
 
 /// (d) --bind exists, still defaults to 0.0.0.0, and narrows the listener

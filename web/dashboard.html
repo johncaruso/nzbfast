@@ -230,6 +230,34 @@ button.danger:hover{background:color-mix(in srgb,var(--bad) 12%,transparent)}
    user's saved card layout and left it there forever. */
 body.firstrun #dashview>.card:not(#welcomeCard),
 body.firstrun #tiles,body.firstrun #layoutTip,body.firstrun #hiddenBar{display:none}
+/* Built-in indexer switched off. Same technique and the same reason as
+   .firstrun above: half this UI exists to show an index, and showing it
+   permanently empty is worse than not showing it. Hidden by a body class
+   so nothing is written into the saved card layout - a user who switches
+   the indexer back on must get their cards back exactly as they left
+   them, in their own order.
+   The Indexing settings card is the deliberate exception: it survives,
+   because it is where the switch lives. Inside it .idxon hides and
+   .idxoff appears. */
+body.noidx #browseCard,body.noidx #idxPill,
+body.noidx .idxon{display:none!important}
+/* The watchlist keeps a leg over third-party indexers (M35 phase 2), so
+   it only goes when there is no indexer of either kind. Own class, set
+   by the boot block, because that needs the indexer COUNT too. */
+body.nowatch #watchCard{display:none!important}
+/* #navWall is deliberately NOT in that list: whether it survives depends
+   on a second fact (are any third-party indexers configured?), so the
+   boot script owns it. A rule here would have to be beaten by an inline
+   style, which !important does not allow. */
+/* Shown ONLY with the indexer off. Written as "hide unless", never as a
+   display value to restore: .idxoff sits on both a <p> and a .row, whose
+   natural displays are block and grid, and any rule that turns them back
+   on has to pick one of those and gets the other wrong. */
+body:not(.noidx) .idxoff{display:none!important}
+.idxnote{font-size:12.5px;line-height:1.6;color:var(--dim);margin:2px 0 4px}
+.idxnote>div{margin:0 0 9px}
+.idxnote code{font-size:11.5px;word-break:break-all}
+.idxnote b{color:var(--fg);font-weight:600}
 .setupsteps{list-style:none;margin:10px 0 0;padding:0;display:flex;flex-direction:column;gap:14px}
 .setupsteps li{display:flex;gap:13px;align-items:flex-start}
 .setupsteps .n{flex:none;width:23px;height:23px;border-radius:50%;display:grid;place-items:center;
@@ -689,6 +717,8 @@ input.txt.sm{max-width:120px}
 .schedrow{display:grid;grid-template-columns:1fr 120px 130px 110px 36px;gap:8px;margin:6px 0}
 .feedrow{display:grid;grid-template-columns:1fr 110px 120px 36px;gap:8px;margin:10px 0 4px}
 .feedrow textarea{grid-column:1/-1;min-height:52px;resize:vertical}
+.idxrow{display:grid;grid-template-columns:120px 1fr 190px 84px 84px auto auto 36px;gap:8px;margin:10px 0 4px;align-items:center}
+.idxrow [data-k=result]{grid-column:1/-1;min-height:0;font-size:12.5px}
 .wlrow{display:grid;grid-template-columns:1fr 88px 64px 64px 78px 84px 84px 92px 112px 92px 32px;gap:7px;margin:10px 0 2px;align-items:center}
 .wlrow .wlst{grid-column:1/-1;font-size:12px;margin:-3px 0 5px}
 .wlrow label{display:flex;gap:5px;align-items:center;font-size:12px;white-space:nowrap}
@@ -713,7 +743,7 @@ input.txt.sm{max-width:120px}
 /* The webhook body template only applies to one kind, so it gets its own
    full-width line rather than a column every other kind leaves blank. */
 .notifyrow .nbody{grid-column:1/-1;margin:-2px 0 4px}
-@media(max-width:720px){.set .row{grid-template-columns:1fr}.set .row>.hint{grid-column:auto}.schedrow{grid-template-columns:1fr 1fr}.feedrow{grid-template-columns:1fr 1fr}.smartrow{grid-template-columns:1fr 1fr}.wlrow{grid-template-columns:1fr 1fr}.notifyrow{grid-template-columns:1fr 1fr}.catrow{grid-template-columns:1fr 1fr}}
+@media(max-width:720px){.set .row{grid-template-columns:1fr}.set .row>.hint{grid-column:auto}.schedrow{grid-template-columns:1fr 1fr}.feedrow{grid-template-columns:1fr 1fr}.smartrow{grid-template-columns:1fr 1fr}.wlrow{grid-template-columns:1fr 1fr}.notifyrow{grid-template-columns:1fr 1fr}.catrow{grid-template-columns:1fr 1fr}.idxrow{grid-template-columns:1fr 1fr}}
 
 /* ================= phone + touch layer - purely additive ================= */
 /* Tap targets ≥44px on touch screens (and in any phone-width window). */
@@ -787,7 +817,11 @@ input.txt.sm{max-width:120px}
        stood. -->
   <nav class="nav">
   <a href="#" class="pill" id="navDash" style="text-decoration:none" data-i18n-title="hdr.dash.title" title="Downloads and status" onclick="return setView('dash')"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-dash"/></svg> <span data-i18n="hdr.dash">dashboard</span></a>
-  <a href="/wall" class="pill" style="text-decoration:none" data-i18n-title="hdr.wall.title" title="Poster wall"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-wall"/></svg> <span data-i18n="hdr.wall">wall</span></a>
+  <!-- Hidden with the indexer off UNLESS third-party indexers are
+       configured: /wall is the pull-search surface too, and taking the
+       pill away would take the commercial-indexer search with it. The
+       boot script decides and relabels it. -->
+  <a href="/wall" class="pill" id="navWall" style="text-decoration:none" data-i18n-title="hdr.wall.title" title="Poster wall"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-wall"/></svg> <span data-i18n="hdr.wall" id="navWallLbl">wall</span></a>
   <a href="#" class="pill" id="setPill" style="text-decoration:none" data-i18n-title="hdr.settings.title" title="Settings" onclick="return setView('settings')"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-settings"/></svg> <span data-i18n="hdr.settings">settings</span></a>
   <a href="/manual" target="_blank" class="pill" style="text-decoration:none" data-i18n-title="hdr.manual.title" title="User manual"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-manual"/></svg> <span data-i18n="hdr.manual">manual</span></a>
   </nav>
@@ -903,6 +937,10 @@ input.txt.sm{max-width:120px}
     <button class="ghost" onclick="addWatchRow('movie')" data-i18n="watch.addmovie">+ movie</button>
     <button onclick="saveWatchlist(this)" data-i18n="watch.apply">Apply watchlist</button>
   </div>
+  <label class="mtog" style="margin-top:11px" data-i18n-title="watch.ext.title"
+    title="Each watched item asks your indexer accounts about twice a day, and only for things it has not found here. Your daily limits still apply.">
+    <input type="checkbox" id="s_watchlist_external" onchange="setCfg('watchlist_external',this.checked?1:0)">
+    <span data-i18n="watch.ext">Also search my indexer accounts for wanted items</span></label>
   <div class="cardgrip" data-card="watchCard" tabindex="0" role="separator" aria-orientation="horizontal"></div>
 </div>
 
@@ -1168,6 +1206,8 @@ input.txt.sm{max-width:120px}
     <div class="pathrow"><input class="txt" id="s_out_dir" onchange="setCfg('out_dir',this.value)"><button class="mini" onclick="browseDir('out_dir','dir')" data-i18n-title="btn.browse.title" title="Browse for a folder - including other drives" data-i18n="btn.browse">Browse…</button><button class="mini" onclick="openDir('out_dir')" data-i18n-title="btn.openfolder.title" title="Open this folder" aria-label="Open this folder">📂</button></div></div>
   <div class="row"><label data-i18n="set.disk.move">Move completed to<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.disk.move.hint">after unpack and renaming, finished downloads move here - a NAS share, media drive etc. Category subfolders are kept. Empty = leave them in the download folder. If the destination is unreachable the files stay put</span></label>
     <div class="pathrow"><input class="txt" id="s_move_completed" data-i18n-placeholder="set.disk.move.ph" placeholder="e.g. /Volumes/Media - empty = off" onchange="setCfg('move_completed',this.value)"><button class="mini" onclick="browseDir('move_completed','dir')" data-i18n-title="btn.browse.title" title="Browse for a folder - including other drives" data-i18n="btn.browse">Browse…</button><button class="mini" onclick="openDir('move_completed')" data-i18n-title="btn.openfolder.title" title="Open this folder" aria-label="Open this folder">📂</button></div></div>
+  <div class="row"><label data-i18n="set.disk.cats">Categories<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.disk.cats.hint">the categories offered to Sonarr, Radarr and other clients, and the subfolder each one downloads into. tv, movies, music and books are always available; add any others your apps are set to use - a client whose category is missing here refuses to connect</span></label>
+    <input class="txt" id="s_categories" data-i18n-placeholder="set.disk.cats.ph" placeholder="tv, movies, music, books" onchange="setCfg('categories',this.value)"></div>
   <div class="row"><label data-i18n="set.disk.movecats">Per-category destinations<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.disk.movecats.hint">override where specific categories land, e.g. tv=/Volumes/NAS/TV, movies=/Volumes/NAS/Movies. The path IS that category's folder. Other categories follow the setting above; empty = no overrides</span></label>
     <input class="txt" id="s_move_completed_cats" data-i18n-placeholder="set.disk.movecats.ph" placeholder="tv=/Volumes/NAS/TV, movies=/Volumes/NAS/Movies" onchange="setCfg('move_completed_cats',this.value)"></div>
   <div class="row"><label data-i18n="set.disk.minfree">Minimum free space<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.disk.minfree.hint">pause new jobs below this, e.g. 25G; 0 = off</span></label>
@@ -1263,8 +1303,56 @@ input.txt.sm{max-width:120px}
   </div>
 </div>
 
+<div class="card set" data-sg="organise" data-sk="pullsearch">
+  <h3 data-i18n="set.nnab.title">Search indexers <span class="badge live" data-i18n="badge.live">live</span></h3>
+  <div class="row" style="grid-template-columns:1fr"><label data-i18n="set.nnab.list">Indexer accounts<span class="hint" data-i18n="set.nnab.list.hint">your accounts on NZB indexers (NZBGeek, DrunkenSlug, a Prowlarr or NZBHydra instance, …). Searches on the wall can then ask them too and grab results straight into the queue. API keys never leave this machine. The daily limits mirror your account's allowance: 0 means unlimited.</span></label></div>
+  <div id="idxrows"></div>
+  <div style="display:flex;gap:8px;margin-top:6px">
+    <button class="ghost" onclick="addIdxRow()" data-i18n="set.nnab.add">+ Add indexer</button>
+    <button onclick="saveIdx(this)" data-i18n="set.nnab.apply">Apply indexers</button>
+  </div>
+</div>
+
+<!-- The only settings card that stays visible with the indexer off, and
+     the only place the switch lives. Everything below .idxon is hidden
+     in that state (see body.noidx in the stylesheet), so the card
+     collapses to: the switch, an honest account of what a header
+     scanner can and cannot do, and a way to reclaim the disk. -->
 <div class="card set" data-sg="organise" data-sk="indexing">
   <h3 data-i18n="set.idx.title">Indexing</h3>
+  <div class="row"><label data-i18n="set.idx.enabled">Built-in indexer<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.enabled.hint">off unless you turn it on. It scans the newsgroups you choose, straight from your provider, so you can search and browse Usenet here without a third-party account. Read what it does and does not find below before you decide.</span></label>
+    <input type="checkbox" id="s_index_enabled" onchange="setIndexEnabled(this)"></div>
+  <div class="idxnote">
+    <div data-i18n-html="set.idx.can"><b>What it finds:</b> posts that were uploaded under a real
+    filename. The scan reads newsgroup headers, so something posted as
+    <code>Some.Film.2026.1080p.WEB-DL.x264-GROUP.part01.rar</code> is recognised, filed under its
+    title, and shown on the wall with a poster, cast and ratings.</div>
+    <div data-i18n-html="set.idx.cant"><b>What it cannot find:</b> posts with the name taken out. A
+    large and growing share of Usenet is uploaded deliberately obfuscated: the subject is random
+    (<code>p5cbKvaDJ1Y0PW6DvKCIfztzZ</code>), the filenames inside are random too, and it all goes
+    into a catch-all group like <code>alt.binaries.boneless</code>. The real name exists only in an
+    NZB the uploader publishes somewhere else, so it was never posted to Usenet at all and there is
+    nothing on the wire for any scanner to read. This is not a gap we can close later: no
+    competitor recovers those by scanning either.</div>
+    <div data-i18n-html="set.idx.scale">For scale, in our own measurements a full index of
+    <b>14.8 million</b> scanned posts yielded about <b>31,000</b> browsable releases. Roughly one in
+    five hundred.</div>
+    <div data-i18n-html="set.idx.good"><b>Worth turning on if</b> you follow particular newsgroups
+    where people still post under real names, you want to see what your provider actually carries
+    rather than what somebody else says it carries, you want to judge retention and completeness
+    yourself, or you would simply rather not depend on anyone else's service.</div>
+    <div data-i18n-html="set.idx.why"><b>Why a commercial indexer is still recommended:</b> an
+    indexer is <i>told</i> what a release is by whoever uploaded it, so it can name the obfuscated
+    posts that no scanner can. It also carries years of back catalogue, and it is what Sonarr and
+    Radarr expect. Add your accounts under <b>Search indexers</b> just above: searches on the wall
+    can then ask them and grab straight into the queue, with none of this switched on.</div>
+    <div data-i18n-html="set.idx.offdoes"><b>With the switch off</b> nothing is scanned, no headers
+    are fetched, no metadata or artwork is looked up, and no availability sampling runs. The poster
+    wall, Browse and the Sonarr/Radarr feed are hidden until you turn it back on. The watchlist
+    stays as long as you have indexer accounts, because it can ask those instead.</div>
+    <div class="idxoff" id="idxLeftover"></div>
+  </div>
+  <div class="idxon">
   <div class="row" style="grid-template-columns:1fr"><label data-i18n="set.idx.want">What to index<span class="hint" data-i18n="set.idx.want.hint">nothing is indexed unless you pick something here. Each choice scans the newsgroups listed under it, and only the ones your provider carries.</span></label></div>
   <div id="interestRows"></div>
   <div class="row"><label data-i18n="set.idx.groups">Groups to scan<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.groups.hint">comma-separated, e.g. alt.binaries.teevee; feeds Browse, the wall and the newznab facade</span></label>
@@ -1277,6 +1365,10 @@ input.txt.sm{max-width:120px}
     <input class="txt sm" type="number" min="0" id="s_index_backfill" onchange="setCfg('index_backfill',this.value)"></div>
   <div class="row" data-adv="1"><label data-i18n="set.idx.deepen">Deepen per scan<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.deepen.hint">every scan pass also indexes this many OLDER articles per group, growing history in the background until Max age (or the group's start) is reached; 0 = off</span></label>
     <input class="txt sm" type="number" min="0" id="s_index_deepen" onchange="setCfg('index_deepen',this.value)"></div>
+  <div class="row"><label data-i18n="set.idx.coverage">Index from every provider<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.coverage.hint">scan new posts on each of your provider networks, not just one. Posts do not always reach every provider, and providers carry different newsgroups; scanning them all means a release stops looking incomplete when a different provider has the missing parts. The deepest provider still does the history work, the others only follow new posts. Prepaid block accounts are never used for scanning</span></label>
+    <input type="checkbox" id="s_index_coverage" onchange="setCfg('index_coverage',this.checked?1:0)"></div>
+  <div class="row" data-adv="1"><label data-i18n="set.idx.gapfill">Re-hunt incomplete releases<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.gapfill.hint">each scan pass picks this many incomplete releases and asks the other providers for headers around their posting time, filling gaps the scanning provider never received; 0 = off</span></label>
+    <input class="txt sm" type="number" min="0" max="100" id="s_index_gapfill" onchange="setCfg('index_gapfill',this.value)"></div>
   <div class="row"><label data-i18n="set.idx.scannow">Scan now<span class="hint" data-i18n="set.idx.scannow.hint">run a scan pass immediately; with a depth, one-off deep backfill: rescan that many recent headers per group even where already scanned (e.g. 500000)</span></label>
     <span><input class="txt sm" type="number" min="0" id="s_scan_depth" data-i18n-placeholder="set.idx.depth.ph" placeholder="depth (optional)">
     <button class="ghost" onclick="scanNow(this, +document.getElementById('s_scan_depth').value||0)" data-i18n="set.idx.scannow.btn">Scan now</button></span></div>
@@ -1321,9 +1413,19 @@ input.txt.sm{max-width:120px}
         <option value="x264">x264 / AVC</option><option value="VC-1">VC-1</option>
         <option value="XviD">XviD</option><option value="DivX">DivX</option></select>
     </span></div>
+  </div><!-- /.idxon -->
+  <!-- Off-state only: the database is deliberately KEPT so the switch is
+       reversible without a rescan, which means the one thing the card
+       still owes the user is a way to get that disk space back. Reuses
+       the Database card's wipe, since that card is hidden here. -->
+  <div class="row idxoff"><label data-i18n="set.idx.dropdb">Stored index<span class="hint" data-i18n="set.idx.dropdb.hint">the database is kept while the indexer is off, so turning it back on picks up where it stopped instead of rescanning. Delete it if you want the disk space back now</span></label>
+    <span><button class="ghost" style="color:var(--bad);border-color:var(--bad)" onclick="wipeIndex(this)" data-i18n="set.idx.dropdb.btn">Delete the index database…</button></span></div>
 </div>
 
-<div class="card set" data-sg="organise" data-sk="database">
+<!-- .idxon: this whole card is about the index database, so it goes with
+     the indexer. The off state keeps one button from it (delete the
+     database) on the Indexing card, which stays visible. -->
+<div class="card set idxon" data-sg="organise" data-sk="database">
   <h3 data-i18n="set.db.title">Database</h3>
   <div id="dbState" class="dim" style="font-size:12.5px;line-height:1.55;margin:2px 0 4px"></div>
   <div class="dim" style="font-size:11.5px;line-height:1.5;margin:0 0 12px" data-i18n="set.db.lag">Deleting releases frees space inside the database file, but the file itself only gets smaller once it is compacted, and a compact waits for a moment when nothing is downloading or scanning. So the size above can sit still for a while after a cleanup. The size limit is measured against what is actually stored, not against the space waiting to be reclaimed.</div>
@@ -1616,6 +1718,32 @@ input.txt.sm{max-width:120px}
 // daemon's default (injected at serve time, for embedded webviews) →
 // navigator.language.
 const DAEMON_LOCALE='__NZBFAST_LOCALE__';   // serve.rs replaces this token
+// The built-in indexer's master switch, and how many third-party Newznab
+// accounts are configured. Both are stamped in by serve.rs (see
+// ui_shell_state) rather than fetched, because they decide what the page
+// SHOWS: waiting for the first API response would render the wall pill,
+// the Browse card and the watchlist and then take them away again.
+// A page opened straight from disk keeps the untouched token, and an
+// unreplaced token must mean "on" - that is the state where nothing is
+// hidden, so the fallback can never hide a working feature.
+const IDX_ON='__NZBFAST_INDEX__'!=='0';
+const IDX_COUNT=+'__NZBFAST_INDEXERS__'||0;
+// This script runs after the markup but DURING parsing, so <body> and
+// the nav already exist and nothing has painted yet: the class lands on
+// body (what the stylesheet keys on) with no flash of the hidden UI.
+// The wall pill is decided here too, for the same no-flash reason - it
+// only disappears when there is no third-party indexer to search
+// either. Relabelling it waits for t(); see idxNavPill().
+// The watchlist survives the built-in indexer being off as long as some
+// indexer account remains for it to ask.
+const WATCH_OK = IDX_ON || IDX_COUNT>0;
+if(!IDX_ON){
+  document.body.classList.add('noidx');
+  if(!IDX_COUNT){
+    document.getElementById('navWall').style.display='none';
+    document.body.classList.add('nowatch');
+  }
+}
 const LOCALES=['en','fr','de','it','es','nl','pt','sv','da','nb','fi','tr','ro','ru','pl','cs','uk','el','ja','he','ar','fa','hu','sk','hr','sr','bg','sl'];
 // [native name, English name] for every tag in LOCALES - the single source
 // for both Settings → Interface language selects, which are populated below
@@ -2013,6 +2141,11 @@ function gbpsToMbps(g){ return (g||0)*125; }
 let IDX_PAUSED=null;
 async function refreshIdxPill(){
   const el=document.getElementById('idxPill'); if(!el) return;
+  // The pill reports on scanning, so with the indexer switched off it has
+  // nothing to say and the CSS has already taken it off the header. Stop
+  // the poll rather than run a 15-second database query into a hidden
+  // element.
+  if(!IDX_ON) return;
   try{
     const s=await api('index_stats');
     const groups=(s.groups||[]).length;
@@ -2855,6 +2988,10 @@ function renderSearch(){
 // Browse-card status: what the index holds and whether it's growing.
 let idxQuick=null;
 async function refreshIdxStatus(){
+  // Nothing to report and nothing on screen to report it on: the Browse
+  // card is hidden. Skipping the poll is the point - a switched-off
+  // indexer should not be answering a status request every minute.
+  if(!IDX_ON) return;
   try{
     const s=await api('index_stats');
     const el=document.getElementById('idxStatus');
@@ -2884,6 +3021,42 @@ async function refreshIdxStatus(){
     // Poll fast while a scan runs so the header count visibly moves.
     clearTimeout(idxQuick); idxQuick=null;
     if(s.scanning) idxQuick=setTimeout(refreshIdxStatus, 2000);
+  }catch(e){}
+}
+// The master switch. Unlike every other setting on the page this one
+// changes what the page IS - which nav pills exist, which cards exist,
+// which settings cards exist - and all of that is decided once at load
+// from a server-stamped token. So save, then reload: re-deriving the
+// whole shell in place would mean a second implementation of the boot
+// path, kept in sync by hand, for a control that gets used once.
+// The hash survives a reload, so settings stays open on this card.
+async function setIndexEnabled(el){
+  const on=el.checked;
+  el.disabled=true;
+  try{
+    await api('config',`&name=index_enabled&value=${on?1:0}`);
+  }catch(e){
+    el.disabled=false; el.checked=!on;
+    toast(t('toast.idxfail','Could not change that. The daemon did not accept it.'));
+    return;
+  }
+  toast(on?t('toast.idxon','Indexer on. Choose what to index below.')
+          :t('toast.idxoff','Indexer off. Nothing is scanned, fetched or stored.'));
+  // Long enough to read the toast, short enough not to feel broken.
+  setTimeout(()=>location.reload(), 900);
+}
+// Off-state footnote: how much disk the kept database is still using.
+// Only asked for when it is the answer to a question the user can see
+// (the delete button sits right under it).
+async function idxLeftoverLine(){
+  if(IDX_ON) return;
+  const el=document.getElementById('idxLeftover'); if(!el) return;
+  try{
+    const s=await api('index_stats');
+    el.innerHTML=s.file_bytes
+      ? t('set.idx.leftover','An index from earlier scanning is still on disk: <b>{size}</b>, {n} releases. It is not being read or added to.',
+          {size:sizeStr(s.file_bytes), n:num(s.releases||0,0)})
+      : t('set.idx.noleftover','Nothing is stored: this indexer has never run here.');
   }catch(e){}
 }
 async function setIdxPaused(btn,on){
@@ -3256,10 +3429,24 @@ function initAppearanceControls(){
   const fp=document.getElementById('fontPct'); if(fp) fp.textContent=f+'%';
   updateContrastReport();
 }
+// How the clients that name themselves are spelt. Display only - the
+// daemon classifies off the User-Agent's leading token, so a client
+// missing from here is still named, just in lower case.
+const API_CLIENT_NAMES={sonarr:'Sonarr',radarr:'Radarr',lidarr:'Lidarr',readarr:'Readarr',
+  whisparr:'Whisparr',prowlarr:'Prowlarr',nzbhydra2:'NZBHydra2',sabnzbd:'SABnzbd',
+  nzbget:'NZBGet',nzb360:'nzb360',lunasea:'LunaSea',nzbunity:'NZB Unity',curl:'curl'};
 // Job origin as something a person would say. An RSS origin carries its
-// feed URL after a colon, so the feed is named rather than lumped in
-// with every other feed.
+// feed URL after a colon, and an API origin the client that sent the
+// job, so each is named rather than lumped in with every other one.
 function originLabel(o){
+  if(o.startsWith('arr:')){
+    // A proper noun, so it is returned verbatim rather than through a
+    // catalogue - no translation, and none of the 28 need touching. The
+    // token is attacker-controlled, but the daemon has already reduced
+    // it to [a-z0-9-] and the caller escapes.
+    const c=o.slice(4);
+    return API_CLIENT_NAMES[c]||c.charAt(0).toUpperCase()+c.slice(1);
+  }
   if(o.startsWith('rss:')){
     const u=o.slice(4);
     let host=u;
@@ -3410,7 +3597,9 @@ function renderWatchlist(list){
   paintWatchStatus();
 }
 // What to call one grabbed slot in the status line: an episode reads as
-// "S02E03", a film needs no label at all, and a category slot is the
+// "S02E03", a whole-season pack as "S02", a film needs no label at all,
+// a daily show's slot is the night it aired ("d:20260721" → 2026-07-21,
+// which is how the post itself names it), and a category slot is the
 // identity key the watcher tracks on ("c:formula-1:formula1:2026:round11
 // hungary qualifying") - its last segment is the part that tells two
 // grabs of one category apart.
@@ -3418,6 +3607,8 @@ function slotLabel(slot){
   const s=String(slot||'');
   if(!s||s==='movie') return '';
   if(s.startsWith('c:')) return s.split(':').pop()+' ';
+  const d=/^d:(\d{4})(\d{2})(\d{2})$/.exec(s);
+  if(d) return `${d[1]}-${d[2]}-${d[3]} `;
   return s.toUpperCase()+' ';
 }
 function paintWatchStatus(){
@@ -3431,6 +3622,7 @@ function paintWatchStatus(){
   }
 }
 async function refreshWatchStatus(){
+  if(!WATCH_OK) return;   // see loadWatchlist
   try{
     const j=await api('watchlist_status');
     wlStatusById=Object.fromEntries((j.items||[]).map(i=>[String(i.id),i]));
@@ -3477,13 +3669,26 @@ function renderCalendar(j){
   box.style.display='';
 }
 async function loadWatchlist(){
+  // Hidden only when the watchlist has nothing to ask: since M35 phase 2
+  // it has a second leg over your indexer accounts, so the built-in
+  // indexer being off is not on its own a reason to take it away.
+  if(!WATCH_OK) return;
   try{
     const c=(await api('get_config')).config.nzbfast;
     wlCats=c.custom_categories||[];
     if(!document.querySelector('#wlrows :focus')) renderWatchlist(c.watchlist||[]);
     const s=await api('index_stats');
+    // Three states, not two: matching locally, matching only through
+    // your indexer accounts (the built-in indexer is off, which is now
+    // the default and NOT a warning), or nothing to match against.
     setHtml('wlStatus', (s.groups||[]).length
       ?t('watch.status','matches everything indexed from <b>{groups}</b> (the watched newsgroups; edit them in ⚙ settings → Indexing) · min = floor · upgrade-to = ceiling',{groups:esc(s.groups.join(', '))})
+      :!IDX_ON&&IDX_COUNT
+      ?(c.watchlist_external
+        ?t('watch.extonly','asks your indexer accounts about wanted items a couple of times a day · min = floor · upgrade-to = ceiling')
+        // The switch that fixes this is the checkbox at the bottom of
+        // this very card, so point at it rather than send anyone away.
+        :t('watch.extoff','the built-in indexer is off, so there is no local index to match against. Tick “Also search my indexer accounts” below and this watchlist works off your indexer accounts instead.'))
       :`⚠ ${t('watch.idxoff','indexing is off, so the watchlist has nothing to match against.')} <button class="ghost mini" onclick="goSetting('indexing')">${t('idx.choose','Choose what to index')}</button> ${t('watch.idxoff2','or pick newsgroups in ⚙ settings → Indexing.')}`);
   }catch(e){}
 }
@@ -4875,7 +5080,7 @@ function setView(which){
     const v=document.getElementById(want?'settingsview':'dashview');
     v.classList.remove('viewanim'); void v.offsetWidth; v.classList.add('viewanim');
   }
-  if(want){ loadSettings(); loadRemote(); }
+  if(want){ loadSettings(); loadRemote(); idxLeftoverLine(); }
   else checkWelcome(); // back to dashboard - a server may have been added
   return false;
 }
@@ -4902,7 +5107,13 @@ const SETGROUPS=[
   {k:'system',  i:'set.g.system',   d:'System'},
 ];
 let setGroup=null;
-const setCards=()=>[...document.querySelectorAll('#setMain .card.set')];
+// Cards the rail can show. A card hidden by the indexer switch is
+// filtered out here rather than at each call site, so the per-group
+// counts in the rail match what is actually on screen - a rail reading
+// "8" over six visible cards is the kind of small wrongness that makes
+// people hunt for a card that is not there.
+const setCards=()=>[...document.querySelectorAll('#setMain .card.set')]
+  .filter(c=>IDX_ON||!c.classList.contains('idxon'));
 const setSmooth=()=>matchMedia('(prefers-reduced-motion: reduce)').matches?'auto':'smooth';
 
 function initSetShell(){
@@ -5218,7 +5429,7 @@ async function loadSettings(){
   const fvp=document.getElementById('s_fast_verify');
   if(document.activeElement!==fvp) fvp.checked=c.fast_verify!==false&&c.fast_verify!==0;
   put('s_mem_limit', sizeStr(c.mem_limit));
-  put('s_out_dir', c.out_dir); put('s_move_completed', c.move_completed||''); put('s_move_completed_cats', c.move_completed_cats||''); put('s_min_free', sizeStr(c.min_free)); put('s_quota', sizeStr(c.quota));
+  put('s_out_dir', c.out_dir); put('s_move_completed', c.move_completed||''); put('s_categories', c.categories||''); put('s_move_completed_cats', c.move_completed_cats||''); put('s_min_free', sizeStr(c.min_free)); put('s_quota', sizeStr(c.quota));
   put('s_quota_period', c.quota_period||'d');
   put('s_nested_max_depth', c.nested_max_depth??5);
   put('s_watch', c.watch); put('s_script', c.script);
@@ -5230,6 +5441,11 @@ async function loadSettings(){
     const pq=c.prefer_quality||{};
     for(const f of ['res','hdr','acodec','vcodec']) put('s_pq_'+f, pq[f]||'');
   }
+  // The master switch. Defaults OFF on a config that predates it, which
+  // matches the daemon's own default; the daemon is the authority and
+  // sends a real boolean, so this only covers a stale cached page.
+  const iEn=document.getElementById('s_index_enabled');
+  if(iEn&&document.activeElement!==iEn) iEn.checked=!!c.index_enabled;
   put('s_index_groups', (c.index_groups||[]).join(', '));
   if(!document.querySelector('#interestRows :focus')) loadInterests();
   // Same focus guard as the other checkboxes: a poll must not yank a
@@ -5238,11 +5454,17 @@ async function loadSettings(){
   if(isc&&document.activeElement!==isc) isc.checked=!!c.group_desc_isc;
   put('s_index_interval_secs', c.index_interval_secs); put('s_index_backfill', c.index_backfill);
   put('s_index_deepen', c.index_deepen??200000);
+  const cov=document.getElementById('s_index_coverage');
+  if(cov&&document.activeElement!==cov) cov.checked=c.index_coverage!==false;
+  put('s_index_gapfill', c.index_gapfill??4);
   put('s_index_max_age', Math.round((c.index_max_age_secs||0)/86400));
   const ret=document.getElementById('s_index_retention');
   if(ret&&document.activeElement!==ret) ret.checked=c.index_retention!==false;
   const pdl=document.getElementById('s_index_pause_dl');
   if(pdl&&document.activeElement!==pdl) pdl.checked=c.index_pause_on_download!==false;
+  // M35 phase 2: opt-IN, so === true (an absent value must read as off).
+  const wex=document.getElementById('s_watchlist_external');
+  if(wex&&document.activeElement!==wex) wex.checked=c.watchlist_external===true;
   put('s_index_gates', c.index_gates||'');
   const ok=document.getElementById('s_omdb_key');
   if(document.activeElement!==ok){ ok.value=''; ok.placeholder=c.has_omdb?t('ph.keyset','set: paste a new key to replace'):t('ph.omdbunset','not set: paste your key here'); }
@@ -5279,6 +5501,7 @@ async function loadSettings(){
   srvList=c.servers||[]; srvTuned=c.conntune||{}; srvAutoConn=!!c.auto_connections; renderServers(); renderSetup(c);
   if(!document.querySelector('#schedrows :focus')) renderSched(parseSchedText(c.schedule));
   if(!document.querySelector('#feedrows :focus')) renderFeeds(c.feeds||[]);
+  if(!document.querySelector('#idxrows :focus')) renderIdx(c.indexers||[]);
   if(!document.querySelector('#smartrows :focus')) renderSmart(c.smart_folders||[]);
   wlCats=c.custom_categories||[];   // the watchlist kind select reads this
   if(!document.querySelector('#catrows :focus')) renderCats(wlCats);
@@ -5407,6 +5630,47 @@ async function saveFeeds(btn){ await busy(btn,t('busy.applying','Applying…'), 
   }).filter(f=>f.url);
   await setCfg('feeds', rows.length?JSON.stringify(rows):'');
 }); }
+// M35 pull-search indexers editor: rows ↔ the daemon's indexers JSON.
+// get_config never echoes an apikey (has_key only); a blank key field on
+// save keeps the stored one, so a round-trip cannot erase it.
+function idxRowHtml(x){
+  return `<div class="idxrow" data-haskey="${x.has_key?1:''}">
+    <input class="txt" data-k="name" value="${escA(x.name||'')}" placeholder="${escA(t('nnab.name.ph','name'))}" title="${escA(t('nnab.name.title','a label for this account; renaming makes it a new entry, so re-enter the key'))}">
+    <input class="txt" data-k="url" value="${escA(x.url||'')}" placeholder="https://api.indexer.example" title="${escA(t('nnab.url.title','the indexer API URL. The site address works; a Prowlarr entry looks like http://host:9696/1/api'))}">
+    <input class="txt" data-k="apikey" type="password" value="" autocomplete="new-password" placeholder="${escA(x.has_key?t('nnab.key.saved','key saved - blank keeps it'):t('nnab.key.ph','API key'))}">
+    <input class="txt" data-k="hits" type="number" min="0" value="${+x.hits_per_day||0}" title="${escA(t('nnab.hits.title','searches per day this entry may spend (API hits); 0 = unlimited'))}">
+    <input class="txt" data-k="grabs" type="number" min="0" value="${+x.grabs_per_day||0}" title="${escA(t('nnab.grabs.title','downloads per day this entry may spend (grabs); 0 = unlimited'))}">
+    <label class="mtog" data-i18n-skip title="${escA(t('nnab.enabled.title','searched only while enabled'))}"><input type="checkbox" data-k="enabled"${x.enabled===false?'':' checked'}> <span>${t('nnab.enabled','on')}</span></label>
+    <button class="ghost" onclick="testIdx(this)" data-i18n-skip title="${escA(t('nnab.test.title','Ask this indexer what it supports - proves the URL and key work'))}">${t('nnab.test','Test')}</button>
+    <button class="ghost" onclick="this.closest('.idxrow').remove()" title="${escA(t('nnab.remove.title','Remove this indexer'))}" aria-label="${escA(t('nnab.remove.title','Remove this indexer'))}">×</button>
+    <div class="dim" data-k="result"></div></div>`;
+}
+function renderIdx(list){ setHtml('idxrows', list.map(idxRowHtml).join('')||`<div class="dim">${t('nnab.none','no indexers: add your indexer account below to search it from the wall')}</div>`); }
+function addIdxRow(){
+  const fr=document.getElementById('idxrows');
+  if(fr.firstElementChild&&!fr.firstElementChild.classList.contains('idxrow')) fr.innerHTML='';
+  fr.insertAdjacentHTML('beforeend', idxRowHtml({}));
+}
+function idxRowData(r){
+  const g=k=>r.querySelector(`[data-k=${k}]`).value.trim();
+  return { name:g('name'), url:g('url'), apikey:g('apikey'),
+    enabled:r.querySelector('[data-k=enabled]').checked,
+    hits_per_day:Math.max(0,+g('hits')||0), grabs_per_day:Math.max(0,+g('grabs')||0) };
+}
+async function saveIdx(btn){ await busy(btn,t('busy.applying','Applying…'), async()=>{
+  const rows=[...document.querySelectorAll('#idxrows .idxrow')].map(idxRowData)
+    .filter(x=>x.name||x.url);
+  await setCfg('indexers', rows.length?JSON.stringify(rows):'');
+}); }
+async function testIdx(btn){
+  const row=btn.closest('.idxrow'), out=row.querySelector('[data-k=result]');
+  out.textContent='…';
+  const j=await apiPost('indexer_test',{indexer:idxRowData(row)});
+  out.textContent=j.status
+    ? `✓ ${j.server||'?'} · ${tn('nnab.cats',j.categories||0,'{n} category','{n} categories')}`
+    : `✗ ${tErr(j.error)||j.error||''}`;
+  out.style.color=j.status?'var(--ok)':'var(--bad)';
+}
 // M23 Smart Folders editor: rows ↔ the daemon's smart_folders JSON.
 // Sizes round-trip as SAB-style strings ("200M"); the daemon stores bytes.
 function smartRowHtml(r){
@@ -5849,6 +6113,7 @@ function dbCapText(v){
 // would deny the disk space actually in use. So show the file, and name
 // the gap whenever there is one.
 async function refreshDbState(){
+  if(!IDX_ON) return;   // the Database card is hidden with the indexer off
   const el=document.getElementById('dbState'); if(!el) return;
   try{
     const s=await api('index_stats');
@@ -5980,7 +6245,12 @@ function renderSetup(c){
      h:groups ? tn('setup.s3.on',groups,'Indexing {n} newsgroup.','Indexing {n} newsgroups.')
               : t('setup.s3.hint','optional: pick the kinds of thing you want indexed and they fill a browsable wall, the way a streaming app does. Nothing is indexed until you choose.'),
      cta:t('setup.s3.cta','Choose'), go:"goSetting('indexing')"},
-  ];
+  // Step 3 exists only while the built-in indexer does. It is off by
+  // default now, so on a fresh install this checklist is two steps -
+  // server, folder - and nothing on it asks about a feature the user has
+  // not switched on. Turning the indexer on brings the step back, still
+  // unanswered, which is when it is a real next action.
+  ].filter((_,i)=>i<2||IDX_ON);
   document.getElementById('setupSteps').innerHTML=steps.map((s,i)=>
     `<li class="${s.done?'done':''}"><span class="n">${s.done?'✓':i+1}</span><span class="b">`+
     `<span class="t">${esc(s.t)}</span>`+
@@ -6553,6 +6823,22 @@ initUnitMode();
 // The per-tick renders (queue, tiles, providers…) pick t() up on their
 // next pass within a second or two.
 injectHelp();
+// The wall pill with the built-in indexer off. /wall is two surfaces in
+// one: the poster grid over the local index, and the search that asks
+// your third-party indexer accounts. Only the first goes away here, so
+// the pill goes away only when there is no second - and when it stays,
+// it says what it now is, because "wall" would be a lie with no wall
+// behind it. Runs before the catalogue fetch below, and again after, so
+// a non-English page relabels too.
+function idxNavPill(){
+  const a=document.getElementById('navWall'); if(!a||IDX_ON||!IDX_COUNT) return;
+  a.href='/wall#search';
+  const lbl=document.getElementById('navWallLbl');
+  if(lbl){ lbl.textContent=t('hdr.search','search'); lbl.removeAttribute('data-i18n'); }
+  const tip=t('hdr.search.title','Search your indexer accounts');
+  a.title=tip; a.setAttribute('data-i18n-title','hdr.search.title');
+}
+idxNavPill();
 if(LOCALE!=='en'){
   document.documentElement.lang=LOCALE;
   // RTL: stamped synchronously during initial script execution, so the
@@ -6567,7 +6853,7 @@ if(LOCALE!=='en'){
     document.querySelectorAll('.draghandle').forEach(g=>g.title=t('layout.drag.title','drag to move this card'));
     document.querySelectorAll('.cardhide').forEach(x=>x.title=t('layout.hide.title','hide this card: bring it back from the Hidden bar at the bottom, or Settings → Interface → Reset layout'));
     renderHiddenBar();
-    renderSndEvents(); fillVoices(); checkWelcome();
+    renderSndEvents(); fillVoices(); checkWelcome(); idxNavPill();
     // (The 📖 pill + ? links are already locale-aware via injectHelp/manualUrl.)
     refreshIdxStatus(); loadWatchlist(); loadBenchHist(); refreshUsage(); loadSetup();
     if(inSettings) loadSettings();

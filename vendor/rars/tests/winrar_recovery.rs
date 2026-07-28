@@ -76,7 +76,7 @@ fn repair_streaming(damaged: &Path, out: &Path) -> Vec<usize> {
     let scan = scan_inline_recovery_chunks(&source, 64 << 20).expect("scan recovery records");
 
     let plan = scan.plan().expect("a plan");
-    let groups = rars::recovery::rar5::recovery_groups(plan).expect("groups");
+    let groups = rar5::recovery_groups(plan).expect("groups");
     assert!(
         groups.len() > 1,
         "this fixture must span more than one group or it proves nothing \
@@ -94,6 +94,18 @@ fn repair_streaming(damaged: &Path, out: &Path) -> Vec<usize> {
         .expect("create output");
     repair_prefix_streaming(&source, 0, &scan, &source, &mut dest, 64 << 20)
         .expect("streaming repair")
+}
+
+/// Repairs `damaged` through the BUFFERED path (`Archive::repair_recovery`),
+/// which holds the archive and returns the repaired bytes.
+///
+/// Not what the daemon calls, which is exactly why it needs its own leg here:
+/// it kept a single-group shard stride and one group's CRC table for the whole
+/// set long after the streaming path was fixed, and every existing test of it
+/// sat under the 13.1 MB where that is indistinguishable.
+fn repair_buffered(damaged: &Path) -> Vec<u8> {
+    let archive = rars::ArchiveReader::read_path(damaged).expect("parse damaged archive");
+    archive.repair_recovery().expect("buffered repair")
 }
 
 #[test]
@@ -133,6 +145,15 @@ fn multi_group_recovery_matches_winrar_byte_for_byte() {
             fs::read(&ours).expect("read ours"),
             fs::read(&pristine).expect("read pristine"),
             "{mb} MB: our repair is not byte-identical to the pristine archive"
+        );
+
+        // The buffered path over the same damage. It is not the daemon's, but
+        // it is public api, and a multi-group archive is where it silently
+        // stopped repairing.
+        assert_eq!(
+            repair_buffered(&damaged),
+            fs::read(&pristine).expect("read pristine"),
+            "{mb} MB: the buffered repair is not byte-identical to the pristine archive"
         );
 
         // RARLab's own repair of the SAME damaged file, as an independent

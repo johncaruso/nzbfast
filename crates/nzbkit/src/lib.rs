@@ -21,6 +21,7 @@ pub mod journal;
 pub mod live;
 pub mod logtee;
 pub mod mem;
+pub mod mkv;
 pub mod mock;
 pub mod nntp;
 pub mod nzb;

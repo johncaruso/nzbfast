@@ -23,6 +23,10 @@
 //! - Samples are PAIRED and ALTERNATED. An unpaired comparison on a
 //!   variable link is worthless - we measured a 2.5x spread on identical
 //!   bytes - and a fixed arm order lets drift masquerade as a result.
+//!   Alternated means the order INSIDE the pair changes: half the pairs
+//!   time fresh and then warm, half time warm and then fresh, so a link
+//!   that is steadily slowing cannot charge the whole of that trend to
+//!   one arm.
 //! - The verdict rests on a CONFIDENCE INTERVAL, never a point estimate.
 //!   A point estimate from few samples is exactly how an interim read
 //!   showed -5.9% and then reversed.
@@ -90,8 +94,8 @@ impl BenchResult {
 }
 
 /// Paired samples to take. Enough for the interval to mean something on a
-/// steady link, few enough that the whole run is seconds: each pair costs
-/// roughly two connects.
+/// steady link, few enough that the whole run is seconds: a pair costs one
+/// connect, or two on the pairs that time the claim first.
 pub const PAIRS: usize = 12;
 
 /// A pair is discarded if either arm takes longer than this - a stall is
@@ -170,8 +174,11 @@ async fn time_claim(conn: &mut Connection) -> Option<Duration> {
     Some(t0.elapsed())
 }
 
-/// Measure one server. Alternates which arm goes first on every pair so
-/// drift cannot accumulate into one of them.
+/// Measure one server. Alternates which arm of the pair is timed FIRST,
+/// so drift cannot accumulate into one of them. Odd pairs pay for that
+/// with an extra connect: something has to be open before it can be
+/// claimed, and on those pairs that opening connect's timing is thrown
+/// away in favour of a fresh connect taken after the claim.
 pub async fn measure(server: &ServerConfig, pairs: usize) -> BenchResult {
     let mut deltas = Vec::with_capacity(pairs);
     let mut fresh_all = Vec::with_capacity(pairs);
@@ -190,30 +197,57 @@ pub async fn measure(server: &ServerConfig, pairs: usize) -> BenchResult {
             break;
         }
         // A held-open connection stands in for a parked one: claiming it
-        // costs exactly what a pool hit costs (one DATE round-trip).
+        // costs exactly what a pool hit costs (one DATE round-trip). The
+        // connect that opens it is only the pair's fresh arm when the
+        // fresh arm is the one going first.
         let Some((fresh_a, mut held)) = time_fresh(server).await else {
             consecutive_failures += 1;
             continue;
         };
-        let warm = match i % 2 {
-            // Alternate: on odd pairs the claim is timed BEFORE the
-            // second fresh connect, on even pairs after.
-            0 => time_claim(&mut held).await,
+        // Alternate which arm of the PAIR is timed first, so monotonic
+        // drift lands on fresh on half the pairs and on warm on the other
+        // half instead of biasing every delta the same way.
+        let timed = match i % 2 {
+            // Even: fresh went first, and it is the connect above. The
+            // claim on the connection it opened follows it.
+            0 => {
+                let w = time_claim(&mut held).await;
+                held.quit().await;
+                w.map(|w| (fresh_a, w))
+            }
+            // Odd: warm goes first. The connect above only exists to have
+            // something to claim, so its timing is DISCARDED; the fresh
+            // arm is a second connect taken after the claim. The held
+            // connection is closed before it, so both arms are measured
+            // with the same number of our own sessions open.
             _ => {
                 let w = time_claim(&mut held).await;
-                let _ = time_fresh(server).await;
-                w
+                held.quit().await;
+                match w {
+                    // A failed claim leaves nothing to pair a fresh arm
+                    // with, so do not pay for the second connect at all.
+                    None => None,
+                    Some(w) => match time_fresh(server).await {
+                        Some((fresh_b, second)) => {
+                            // QUIT it rather than dropping it: an
+                            // abandoned socket holds a provider slot
+                            // until it times out, and the next pair may
+                            // need that slot.
+                            second.quit().await;
+                            Some((fresh_b, w))
+                        }
+                        None => None,
+                    },
+                }
             }
         };
-        let Some(warm) = warm else {
-            held.quit().await;
+        let Some((fresh, warm)) = timed else {
             consecutive_failures += 1;
             continue;
         };
-        held.quit().await;
         consecutive_failures = 0;
 
-        let f = fresh_a.as_secs_f64() * 1000.0;
+        let f = fresh.as_secs_f64() * 1000.0;
         let w = warm.as_secs_f64() * 1000.0;
         fresh_all.push(f);
         warm_all.push(w);
@@ -251,6 +285,121 @@ pub async fn measure(server: &ServerConfig, pairs: usize) -> BenchResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    /// The smallest server [`measure`] can be run against: greeting,
+    /// DATE, QUIT, nothing else. Connections numbered `slow_from` and
+    /// later (1-based, in accept order) sit on `delay` before sending
+    /// their greeting.
+    ///
+    /// That delay is what makes the arm ORDER observable from outside:
+    /// the pair's fresh arm is either the connect that opened the
+    /// connection to claim, or a later one taken after the claim, and
+    /// only the second of those lands on a slowed connection.
+    struct GreetingRig {
+        cfg: ServerConfig,
+        accepted: Arc<AtomicUsize>,
+        _task: tokio::task::JoinHandle<()>,
+    }
+
+    async fn greeting_rig(slow_from: usize, delay: Duration) -> GreetingRig {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let seen = accepted.clone();
+        let task = tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let n = seen.fetch_add(1, Ordering::SeqCst) + 1;
+                tokio::spawn(async move {
+                    if n >= slow_from {
+                        tokio::time::sleep(delay).await;
+                    }
+                    let (r, mut w) = sock.into_split();
+                    if w.write_all(b"200 rig ready\r\n").await.is_err() {
+                        return;
+                    }
+                    let mut lines = BufReader::new(r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let up = line.trim().to_ascii_uppercase();
+                        let quit = up.starts_with("QUIT");
+                        let reply: &[u8] = match () {
+                            _ if quit => b"205 bye\r\n",
+                            _ if up.starts_with("DATE") => b"111 20260727120000\r\n",
+                            _ => b"500 unknown\r\n",
+                        };
+                        if w.write_all(reply).await.is_err() || quit {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        // Built through serde so the rig keeps compiling when a field is
+        // added to ServerConfig: everything but the host has a default.
+        let cfg: ServerConfig = serde_json::from_str(&format!(
+            r#"{{"host":"{}","port":{},"tls":false}}"#,
+            addr.ip(),
+            addr.port()
+        ))
+        .unwrap();
+        GreetingRig { cfg, accepted, _task: task }
+    }
+
+    /// The alternation the module doc promises has to be REAL: on the
+    /// pairs that time the claim first, the fresh arm must be the connect
+    /// taken AFTER it, not the one that opened the claimed connection.
+    /// Regression: those pairs used to make the second connect, throw its
+    /// timing away and record the first one, so fresh was measured first
+    /// on every single pair and steady drift biased every delta the same
+    /// way.
+    ///
+    /// Two pairs, and only the third connection is slowed. Pair 0 times
+    /// fresh first (connection 1, fast). Pair 1 times the claim first
+    /// (on connection 2, fast) and its fresh arm is connection 3, the
+    /// slow one - so the recorded fresh median must carry that delay.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_fresh_arm_of_a_warm_first_pair_is_the_later_connect() {
+        let rig = greeting_rig(3, Duration::from_millis(1500)).await;
+        let r = measure(&rig.cfg, 2).await;
+
+        assert_eq!(r.samples, 2, "both pairs should have produced a delta");
+        assert_eq!(
+            rig.accepted.load(Ordering::SeqCst),
+            3,
+            "one connect for the fresh-first pair, two for the warm-first pair"
+        );
+        // Median of two samples is their mean: one near-zero connect and
+        // one 1500 ms connect. Recording the discarded arm instead would
+        // leave this in the single-digit milliseconds. The margins are wide
+        // (600 out of a 750 floor, 400 for a couple of round-trips) so a
+        // few hundred ms of scheduler stall under a parallel build cannot
+        // flake the test, while the regression it pins still misses by 100x.
+        assert!(
+            r.fresh_ms > 600.0,
+            "the slowed connect must be the recorded fresh arm, got {:.1} ms",
+            r.fresh_ms
+        );
+        // The claim never touches the slowed connection.
+        assert!(r.warm_ms < 400.0, "claims are one round-trip, got {:.1} ms", r.warm_ms);
+    }
+
+    /// Against a server that answers everything, no pair is lost - the
+    /// restructured loop must not drop a pair on the branch that makes
+    /// the second connect.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_healthy_server_yields_every_pair() {
+        let rig = greeting_rig(usize::MAX, Duration::ZERO).await;
+        let r = measure(&rig.cfg, 4).await;
+        assert_eq!(r.samples, 4);
+        assert_eq!(
+            rig.accepted.load(Ordering::SeqCst),
+            6,
+            "two fresh-first pairs at one connect, two warm-first pairs at two"
+        );
+        assert_ne!(r.verdict, Verdict::Failed);
+    }
 
     /// The rule that matters: an interval touching zero is OFF. This is
     /// the guard against the interim read that showed -5.9% and reversed.

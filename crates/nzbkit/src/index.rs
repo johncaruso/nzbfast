@@ -735,8 +735,17 @@ impl Index {
                 segments TEXT NOT NULL DEFAULT '[]',
                 UNIQUE(release_id, filename));
              CREATE TABLE IF NOT EXISTS marks(
-                grp TEXT PRIMARY KEY,
-                high INTEGER NOT NULL);
+                -- A8 multi-server indexing: article NUMBERS are assigned
+                -- per server spool (message-ids are the portable half),
+                -- so scan coverage is tracked per (group, server). The
+                -- server key is the lowercased host; '' marks rows from
+                -- the single-server era, adopted by the historical
+                -- primary via adopt_legacy_marks.
+                grp TEXT NOT NULL,
+                server TEXT NOT NULL DEFAULT '',
+                high INTEGER NOT NULL,
+                low INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(grp, server));
              CREATE INDEX IF NOT EXISTS idx_rel_stem ON releases(stem);
              CREATE TABLE IF NOT EXISTS spots(
                 id INTEGER PRIMARY KEY,
@@ -851,8 +860,48 @@ impl Index {
             // safe cursor because SQLite may reuse the highest rowid after
             // eviction deletes it.
             "ALTER TABLE releases ADD COLUMN arrival_seq INTEGER NOT NULL DEFAULT 0",
+            // A8 targeted gap-fill: when a secondary-server window scan
+            // last tried to complete this release (0 = never) - oldest
+            // first, like oracle_at.
+            "ALTER TABLE releases ADD COLUMN gapfill_at INTEGER NOT NULL DEFAULT 0",
         ] {
             let _ = db.execute(ddl, []);
+        }
+        // A8: rebuild a single-server-era marks table (PRIMARY KEY(grp))
+        // to the (grp, server) shape. SQLite cannot ALTER a primary key,
+        // so this is the standard rebuild - one-time; the PRAGMA guard
+        // keeps every later open from bumping the schema version. Rows
+        // keep server='' until adopt_legacy_marks assigns them to the
+        // server that actually built them. Non-fatal like the other
+        // migrations: on failure the next open retries, and the worst a
+        // lost marks table costs is a rescan (ingest is idempotent).
+        let has_server_col = db
+            .prepare("SELECT 1 FROM pragma_table_info('marks') WHERE name='server'")
+            .and_then(|mut s| s.exists([]))
+            .unwrap_or(false);
+        if !has_server_col {
+            // A real Transaction object, not a BEGIN/COMMIT batch: a
+            // mid-batch failure would otherwise leave the transaction
+            // open on this connection, and every later statement in this
+            // open() would silently run (and hold the write lock) inside
+            // it. The drop of an uncommitted Transaction rolls back.
+            let rebuild = db.unchecked_transaction().and_then(|tx| {
+                tx.execute_batch(
+                    "DROP TABLE IF EXISTS marks_v2;
+                     CREATE TABLE marks_v2(
+                        grp TEXT NOT NULL,
+                        server TEXT NOT NULL DEFAULT '',
+                        high INTEGER NOT NULL,
+                        low INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY(grp, server));
+                     INSERT INTO marks_v2(grp, server, high, low)
+                       SELECT grp, '', high, low FROM marks;
+                     DROP TABLE marks;
+                     ALTER TABLE marks_v2 RENAME TO marks;",
+                )?;
+                tx.commit()
+            });
+            let _ = rebuild;
         }
         // Existing rows receive their current id as an initial cursor.
         // New inserts advance a persistent counter in the same SQLite write
@@ -981,6 +1030,19 @@ impl Index {
                ON people(tvmaze_id) WHERE tvmaze_id > 0;
              CREATE UNIQUE INDEX IF NOT EXISTS idx_people_qid
                ON people(wikidata_qid) WHERE wikidata_qid <> '';
+             -- Same rule for the IMDb id, and safe to add to an existing
+             -- database: nothing ever wrote this column before the
+             -- Wikidata P345 lane did, so every pre-existing row holds
+             -- '' and falls outside the partial index. It carries the
+             -- same trade the other two already do - the blank-fill
+             -- UPDATE can collide when the handle-first lookup lands on
+             -- a row whose blank belongs to another row's id, which
+             -- fails that one title's credit write and lets the next
+             -- enrichment retry it. Duplicate Wikidata items for one
+             -- person, which is the common way two rows share an nm id,
+             -- resolve through the lookup instead and merge cleanly.
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_people_imdb
+               ON people(imdb) WHERE imdb <> '';
              CREATE INDEX IF NOT EXISTS idx_people_name ON people(name COLLATE NOCASE);",
         )?;
         // Name search. Unlike rel_fts there IS an UPDATE trigger: a
@@ -1395,6 +1457,49 @@ impl Index {
         Ok(())
     }
 
+    /// A8 targeted gap-fill: incomplete releases worth re-hunting on the
+    /// other backbones, least-recently-tried first (gapfill_at 0 =
+    /// never). Junk-gated like the sampler - the endless obfuscated
+    /// stream must not eat the budget users could see spent on real
+    /// cards. Releases first seen in the last hour are skipped: their
+    /// missing parts are usually still propagating (or still uploading),
+    /// and the next tip pass gets them for free.
+    /// Returns (id, group, first_posted).
+    pub fn gapfill_pick(&self, limit: u32, now: i64) -> rusqlite::Result<Vec<(i64, String, i64)>> {
+        let mut stmt = self.db.prepare(
+            "SELECT id, grp, first_posted FROM releases
+             WHERE complete=0 AND junk < 50 AND first_posted > 0
+               AND first_seen < ?2
+             ORDER BY gapfill_at ASC, (id * 2654435761) % 4294967296 LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![limit, now - 3600], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+        rows.collect()
+    }
+
+    /// Stamp a release as gap-fill-tried now (rotates the pick order).
+    pub fn gapfill_mark(&self, release_id: i64, now: i64) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE releases SET gapfill_at=?2 WHERE id=?1",
+            rusqlite::params![release_id, now],
+        )?;
+        Ok(())
+    }
+
+    /// Is this release complete? (gap-fill measures its own success by
+    /// the flip.)
+    pub fn is_complete(&self, release_id: i64) -> bool {
+        self.db
+            .query_row(
+                "SELECT complete FROM releases WHERE id=?1",
+                [release_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(false)
+    }
+
     /// Tiny persisted key/value pairs (dataset refresh stamps and such).
     pub fn kv_get(&self, k: &str) -> Option<String> {
         self.db
@@ -1567,41 +1672,73 @@ impl Index {
         Ok(changed)
     }
 
-    /// Deepest article this group's history has been scanned back to
-    /// (0 = never recorded). The scan loop's auto-deepen extends this
-    /// downward a bounded slice per pass.
-    pub fn low_water(&self, grp: &str) -> u64 {
+    /// Canonical marks identity for a server: the lowercased host.
+    /// Precise on purpose - even same-backbone resellers get their own
+    /// rows, because nothing guarantees two spools share numbering.
+    pub fn server_key(host: &str) -> String {
+        host.trim().to_ascii_lowercase()
+    }
+
+    /// One-time adoption of single-server-era marks rows (server=''):
+    /// they were built against whichever server was `servers[0]`, so the
+    /// caller passes that host and the rows become its. A group that
+    /// already has a row for this server keeps it (the fresher of the
+    /// two); its legacy row is dropped either way. Idempotent - after
+    /// the first call there are no '' rows left.
+    pub fn adopt_legacy_marks(&self, host: &str) -> rusqlite::Result<()> {
+        let server = Self::server_key(host);
+        if server.is_empty() {
+            return Ok(());
+        }
+        self.db.execute(
+            "UPDATE marks SET server=?1
+              WHERE server=''
+                AND grp NOT IN (SELECT grp FROM marks WHERE server=?1)",
+            [&server],
+        )?;
+        self.db.execute("DELETE FROM marks WHERE server=''", [])?;
+        Ok(())
+    }
+
+    /// Deepest article this group's history has been scanned back to on
+    /// `server` (0 = never recorded). The scan loop's auto-deepen
+    /// extends this downward a bounded slice per pass.
+    pub fn low_water(&self, grp: &str, server: &str) -> u64 {
         self.db
-            .query_row("SELECT low FROM marks WHERE grp=?1", [grp], |r| {
-                r.get::<_, i64>(0)
-            })
+            .query_row(
+                "SELECT low FROM marks WHERE grp=?1 AND server=?2",
+                [grp, &Self::server_key(server)],
+                |r| r.get::<_, i64>(0),
+            )
             .map(|v| v as u64)
             .unwrap_or(0)
     }
 
-    pub fn set_low_water(&self, grp: &str, low: u64) -> rusqlite::Result<()> {
+    pub fn set_low_water(&self, grp: &str, server: &str, low: u64) -> rusqlite::Result<()> {
         self.db.execute(
-            "INSERT INTO marks(grp, high, low) VALUES(?1, 0, ?2)
-             ON CONFLICT(grp) DO UPDATE SET low=excluded.low",
-            rusqlite::params![grp, low as i64],
+            "INSERT INTO marks(grp, server, high, low) VALUES(?1, ?2, 0, ?3)
+             ON CONFLICT(grp, server) DO UPDATE SET low=excluded.low",
+            rusqlite::params![grp, Self::server_key(server), low as i64],
         )?;
         Ok(())
     }
 
-    pub fn high_water(&self, grp: &str) -> u64 {
+    pub fn high_water(&self, grp: &str, server: &str) -> u64 {
         self.db
-            .query_row("SELECT high FROM marks WHERE grp=?1", [grp], |r| {
-                r.get::<_, i64>(0)
-            })
+            .query_row(
+                "SELECT high FROM marks WHERE grp=?1 AND server=?2",
+                [grp, &Self::server_key(server)],
+                |r| r.get::<_, i64>(0),
+            )
             .map(|v| v as u64)
             .unwrap_or(0)
     }
 
-    pub fn set_high_water(&self, grp: &str, high: u64) -> rusqlite::Result<()> {
+    pub fn set_high_water(&self, grp: &str, server: &str, high: u64) -> rusqlite::Result<()> {
         self.db.execute(
-            "INSERT INTO marks(grp, high) VALUES(?1, ?2)
-             ON CONFLICT(grp) DO UPDATE SET high=excluded.high",
-            rusqlite::params![grp, high as i64],
+            "INSERT INTO marks(grp, server, high) VALUES(?1, ?2, ?3)
+             ON CONFLICT(grp, server) DO UPDATE SET high=excluded.high",
+            rusqlite::params![grp, Self::server_key(server), high as i64],
         )?;
         Ok(())
     }
@@ -1887,6 +2024,74 @@ impl Index {
         rows.collect()
     }
 
+    /// Resolve a newznab `imdbid` to the parse-key its releases carry,
+    /// so an id-based Radarr search can be answered from the enriched
+    /// `titles` table instead of a title substring.
+    ///
+    /// Newznab carries the bare number (`imdbid=0468569`) while we store
+    /// the canonical `tt`-prefixed form, and IMDb widened from 7 digits
+    /// to 8 - so both the zero-padded and the as-given widths are tried.
+    /// `None` means "we hold nothing for that id", which the facade must
+    /// answer with an empty feed rather than an unfiltered one.
+    pub fn title_key_for_imdb(&self, imdb: &str) -> rusqlite::Result<Option<String>> {
+        let digits: String = imdb.chars().filter(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            return Ok(None);
+        }
+        let padded = format!("tt{digits:0>7}");
+        let bare = format!("tt{digits}");
+        self.db
+            .query_row(
+                "SELECT key FROM titles WHERE imdb=?1 OR imdb=?2 LIMIT 1",
+                rusqlite::params![padded, bare],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    /// Resolve a newznab `tmdbid` to its parse-key - the
+    /// [`Self::title_key_for_imdb`] counterpart for the id Radarr sends
+    /// when it has no IMDb id for a title.
+    pub fn title_key_for_tmdb(&self, tmdb: i64) -> rusqlite::Result<Option<String>> {
+        if tmdb <= 0 {
+            return Ok(None);
+        }
+        self.db
+            .query_row(
+                "SELECT key FROM titles WHERE tmdb_id=?1 LIMIT 1",
+                rusqlite::params![tmdb],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    /// The one year the index knows a movie title by - or None when it
+    /// knows none, or more than one. The renamer asks this for a
+    /// yearless post, and the ambiguity rule is the whole safety story:
+    /// a remade title ("The Thing") has two keys with two years, and
+    /// guessing between them names the file after the wrong film. Keys
+    /// are `m:<norm>` (yearless parse, year filled by enrichment) and
+    /// `m:<norm>:<year>`; `norm_title` output is alphanumeric+spaces,
+    /// so the LIKE pattern needs no escaping.
+    pub fn movie_year(&self, norm: &str) -> rusqlite::Result<Option<u32>> {
+        if norm.is_empty() {
+            return Ok(None);
+        }
+        let key = format!("m:{norm}");
+        let mut stmt = self.db.prepare(
+            "SELECT DISTINCT year FROM titles
+              WHERE (key = ?1 OR key LIKE ?1 || ':%')
+                AND kind = 'movie' AND year > 0
+              LIMIT 2",
+        )?;
+        let years: Vec<u32> =
+            stmt.query_map([&key], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        Ok(match years.as_slice() {
+            [y] => Some(*y),
+            _ => None,
+        })
+    }
+
     /// M25 browse view: filtered, sorted, paginated release listing -
     /// what the wall's list mode and the Newznab facade page through.
     /// Returns (rows, total matching rows) so the UI can paginate.
@@ -2091,34 +2296,56 @@ impl Index {
         // sort). None on cold start -> Affinity degrades to Releases.
         affinity: Option<&AffinityCtx>,
     ) -> rusqlite::Result<(Vec<Card>, u64)> {
-        let mut wheres: Vec<String> = vec!["r.title_key != ''".into()];
+        // Per-release predicates are written with `{}` where the releases
+        // alias goes, the same way browse() does: the page renders them
+        // against `r.`, and the representative subqueries at the bottom
+        // render the SAME list against their own alias `s.`. A card's
+        // rep_stem / rep_grp would otherwise be taken from the title's
+        // newest release even when this view excludes it - an obfuscated
+        // junk stem driving the parse and the enrichment seed, a "have"
+        // badge keyed on the wrong dupe, an oracle verdict computed for a
+        // group the page filtered out. Both renderings cite the same ?N,
+        // so nothing below has to renumber.
+        let mut wheres: Vec<String> = vec!["{}title_key != ''".into()];
+        // Title-level predicates (the `titles` join, and the year
+        // expression built on it): constant for every release sharing a
+        // title_key, so repeating them inside the per-title subquery would
+        // buy nothing. They stay out of the aliased list.
+        let mut title_wheres: Vec<String> = Vec::new();
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         let bind = |params: &mut Vec<Box<dyn rusqlite::ToSql>>, v: Box<dyn rusqlite::ToSql>| {
             params.push(v);
             format!("?{}", params.len())
         };
+        let alias = |wheres: &[String], pfx: &str| {
+            wheres
+                .iter()
+                .map(|w| w.replace("{}", pfx))
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        };
         if let Some(kind) = &q.kind {
             let p = bind(&mut params, Box::new(kind.clone()));
-            wheres.push(format!("r.kind = {p}"));
+            wheres.push(format!("{{}}kind = {p}"));
         }
         if let Some(res) = &q.res {
             let p = bind(&mut params, Box::new(res.clone()));
-            wheres.push(format!("r.res = {p}"));
+            wheres.push(format!("{{}}res = {p}"));
         }
         if q.complete_only {
-            wheres.push("r.complete".into());
+            wheres.push("{}complete".into());
         }
         if q.min_bytes > 0 {
             let p = bind(&mut params, Box::new(q.min_bytes as i64));
-            wheres.push(format!("r.total_bytes >= {p}"));
+            wheres.push(format!("{{}}total_bytes >= {p}"));
         }
         if q.newer_than > 0 {
             let p = bind(&mut params, Box::new(q.newer_than));
-            wheres.push(format!("r.first_posted >= {p}"));
+            wheres.push(format!("{{}}first_posted >= {p}"));
         }
         if let Some(max) = q.max_junk {
             let p = bind(&mut params, Box::new(max as i64));
-            wheres.push(format!("r.junk < {p}"));
+            wheres.push(format!("{{}}junk < {p}"));
         }
         // 24C: exact-card fetch. The Releases surface asks for ONE
         // title's card (hover preview, group-by-title header row) by
@@ -2126,7 +2353,7 @@ impl Index {
         // query - same field browse() already honors.
         if let Some(tk) = &q.title_key {
             let p = bind(&mut params, Box::new(tk.clone()));
-            wheres.push(format!("r.title_key = {p}"));
+            wheres.push(format!("{{}}title_key = {p}"));
         }
         // The people leg. Release stems are all the FTS index covers, so
         // "tom cruise" used to find nothing at all unless a filename
@@ -2143,11 +2370,11 @@ impl Index {
                 return String::new();
             }
             params.push(Box::new(people_m.clone()));
+            let n = params.len();
             format!(
-                " OR r.title_key IN (SELECT tp.key FROM title_people tp
+                " OR {{}}title_key IN (SELECT tp.key FROM title_people tp
                     WHERE tp.person_id IN
-                          (SELECT rowid FROM people_fts WHERE people_fts MATCH ?{}))",
-                params.len()
+                          (SELECT rowid FROM people_fts WHERE people_fts MATCH ?{n}))"
             )
         };
         let fts_m = if self.fts { fts_match(&q.q) } else { String::new() };
@@ -2155,11 +2382,11 @@ impl Index {
             let p = bind(&mut params, Box::new(fts_m));
             let leg = people_leg(&mut params);
             wheres.push(format!(
-                "(r.id IN (SELECT rowid FROM rel_fts WHERE rel_fts MATCH {p}){leg})"
+                "({{}}id IN (SELECT rowid FROM rel_fts WHERE rel_fts MATCH {p}){leg})"
             ));
         } else if !q.q.trim().is_empty() {
             const NS: &str =
-                "REPLACE(REPLACE(REPLACE(LOWER(r.stem),'.',' '),'_',' '),'-',' ')";
+                "REPLACE(REPLACE(REPLACE(LOWER({}stem),'.',' '),'_',' '),'-',' ')";
             // Every term must appear in the stem - but a people match
             // satisfies the whole query at once, so it wraps the lot
             // rather than being ANDed in term by term.
@@ -2175,40 +2402,55 @@ impl Index {
             }
             if !terms.is_empty() {
                 let leg = people_leg(&mut params);
-                wheres.push(format!("(({}){leg})", terms.join(" AND ")));
+                let joined = terms.join(" AND ");
+                wheres.push(format!("(({joined}){leg})"));
             }
         }
         if matched_only {
             // LEFT JOIN NULLs fail both predicates, so unmatched groups
             // drop out here too.
-            wheres.push("t.checked > 0 AND t.poster != ''".into());
+            title_wheres.push("t.checked > 0 AND t.poster != ''".into());
         }
         // M30: genre chip filter - substring over the enriched genre
         // list ("Drama, Comedy"); unenriched cards drop out while a
         // chip is active (their genre is unknown).
         if let Some(g) = q.genre.as_deref().filter(|g| !g.trim().is_empty()) {
             let p = bind(&mut params, Box::new(g.trim().to_string()));
-            wheres.push(format!("t.genres LIKE '%' || {p} || '%'"));
+            title_wheres.push(format!("t.genres LIKE '%' || {p} || '%'"));
         }
         // M30: decade chips - original-year range over the same
         // enriched-year-with-parse-key-fallback expression the Year
         // sort uses.
         if q.year_min > 0 {
             let p = bind(&mut params, Box::new(q.year_min as i64));
-            wheres.push(format!("{CARD_YEAR_SQL} >= {p}"));
+            title_wheres.push(format!("{CARD_YEAR_SQL} >= {p}"));
         }
         if q.year_max > 0 {
             let p = bind(&mut params, Box::new(q.year_max as i64));
-            wheres.push(format!("{CARD_YEAR_SQL} <= {p} AND {CARD_YEAR_SQL} > 0"));
+            title_wheres.push(format!("{CARD_YEAR_SQL} <= {p} AND {CARD_YEAR_SQL} > 0"));
         }
         // M30: user curation (hides + rules). Rules filter individual
         // releases pre-GROUP BY, so a card only disappears when every
         // one of its releases is excluded (a German dub next to an
-        // English encode never hides the whole title).
+        // English encode never hides the whole title). It already takes
+        // the alias as an argument, so the placeholder passes straight
+        // through and the rules reach the representative pick too.
         if q.curated {
-            self.curation_wheres("r.", &mut wheres, &mut params)?;
+            self.curation_wheres("{}", &mut wheres, &mut params)?;
         }
-        let where_clause = wheres.join(" AND ");
+        // The representative pick: the same per-release predicates,
+        // re-rendered against the subquery's alias. `wheres` is never
+        // empty (it is seeded with the title_key test), so the AND always
+        // has a left side.
+        let rep_where = alias(&wheres, "s.");
+        let where_clause = {
+            let mut all = alias(&wheres, "r.");
+            for w in &title_wheres {
+                all.push_str(" AND ");
+                all.push_str(w);
+            }
+            all
+        };
         // The COUNT runs on the WHERE params ALONE, so it must happen
         // before the Affinity ORDER BY binds any of its own params (those
         // belong to the paged query only).
@@ -2316,16 +2558,22 @@ impl Index {
         } else {
             ""
         };
+        // The two representative subqueries carry an IDENTICAL predicate
+        // list and an identical, fully deterministic ORDER BY (the id
+        // tiebreak settles same-second posts), so rep_stem and rep_grp
+        // can never come from two different rows.
         let sql = format!(
             "SELECT r.title_key, MAX(r.kind), COUNT(*) AS n,
                     MAX(r.first_posted) AS latest, MAX(r.complete),
                     MAX(r.total_bytes) AS max_bytes,
                     MAX(CASE r.res WHEN '2160p' THEN 4 WHEN '1080p' THEN 3
                                    WHEN '720p' THEN 2 WHEN '' THEN 0 ELSE 1 END),
-                    (SELECT s.stem FROM releases s WHERE s.title_key = r.title_key
-                     ORDER BY s.first_posted DESC LIMIT 1),
-                    (SELECT s.grp FROM releases s WHERE s.title_key = r.title_key
-                     ORDER BY s.first_posted DESC LIMIT 1),
+                    (SELECT s.stem FROM releases s
+                      WHERE s.title_key = r.title_key AND {rep_where}
+                      ORDER BY s.first_posted DESC, s.id DESC LIMIT 1),
+                    (SELECT s.grp FROM releases s
+                      WHERE s.title_key = r.title_key AND {rep_where}
+                      ORDER BY s.first_posted DESC, s.id DESC LIMIT 1),
                     COALESCE(t.title,''), COALESCE(t.year,0), COALESCE(t.rating,0),
                     COALESCE(t.genres,''), COALESCE(t.overview,''),
                     COALESCE(t.poster,''), COALESCE(t.backdrop,''),
@@ -3006,30 +3254,54 @@ impl Index {
 
     /// Resolve a credit to a `people.id`, creating or completing the row.
     ///
-    /// Handles win over names, in the order a provider can be trusted:
-    /// a TVmaze person id and a Wikidata Q-id each identify exactly one
-    /// human, so either one matching IS the person. Only when a credit
-    /// carries no handle at all (OMDb and TMDB give bare names) does the
-    /// name decide - and then only against a row whose corresponding
-    /// handle is still empty.
+    /// Handles win over names, in the order a provider can be trusted: a
+    /// TVmaze person id, a Wikidata Q-id and an IMDb `nm…` id each
+    /// identify exactly one human, so any one of them matching IS the
+    /// person. Only when a credit carries no handle at all (OMDb and
+    /// TMDB give bare names) does the name decide - and then only
+    /// against a row that contradicts none of what the credit knows.
     ///
-    /// That guard is narrower than it looks, and the limit is deliberate.
-    /// It refuses a row whose SAME handle disagrees, but a name still
-    /// matches across DIFFERENT handle types: a Wikidata-identified row
-    /// and a TVmaze-identified credit sharing a name become one person.
-    /// That is required - it is how one human seen by two providers gets
-    /// merged rather than forked, which
-    /// `people_identity_credits_and_the_search_leg` pins - and it is
-    /// exactly why two DIFFERENT same-named people, one carrying a qid
-    /// and one a tvmaze id, also merge. Nothing available here separates
-    /// the two cases; both are a name plus one handle on each side.
-    /// Fixing it needs a disambiguator (birth date, or an overlap test
-    /// against the titles each is credited on), not a tighter query.
+    /// **Why the name fallback has to allow a cross-handle match.** The
+    /// two provider handles live in disjoint id spaces: nothing TVmaze
+    /// publishes about a person appears in Wikidata and vice versa, so a
+    /// human seen by both arrives as a name plus a tvmaze id on one side
+    /// and a name plus a qid on the other. Refusing that match forks one
+    /// human into two rows, which is what
+    /// `people_identity_credits_and_the_search_leg` pins against.
     ///
-    /// The residual risk is two same-named people with no handles
-    /// merging into one row. That is the behaviour `titles.actors`
-    /// already had (it is a plain string of names), and unlike a wrong
-    /// split it is visible and fixable.
+    /// **Why that used to fuse two different people** (finding D2): the
+    /// same shape - a name plus one handle on each side - is also what
+    /// two same-named strangers look like, and until both sides carried
+    /// a fact in a SHARED vocabulary there was nothing to tell the cases
+    /// apart. `born` is that shared fact, and it is here because it is
+    /// the one both cast providers actually publish: TVmaze hands the
+    /// birthday over in the cast payload itself, and Wikidata's P569
+    /// rides along with P345 in one batched query.
+    ///
+    /// The IMDb id would have been the better join, and `imdb` is
+    /// populated and matched for exactly that reason - but only Wikidata
+    /// can supply it. Measured 27 Jul 2026 against the live API: TVmaze
+    /// exposes no IMDb id for a person anywhere (no `externals` on the
+    /// person object embedded or standalone, `/lookup/people?imdb=` is
+    /// 404, and the public person page carries no IMDb link), and
+    /// Wikidata has no TVmaze *person* property either - P8600 and
+    /// friends are series, season, episode and character only. So `imdb`
+    /// alone would have separated only people the qid already separated.
+    ///
+    /// Both disagreement tests are one-sided on purpose: a blank on
+    /// either side never blocks a match, so a provider that gave us
+    /// nothing cannot fork a person it simply failed to describe.
+    ///
+    /// Two residual risks, both accepted:
+    ///
+    /// - Two same-named people with no handles and no birth dates still
+    ///   merge. That is the behaviour `titles.actors` already had (it is
+    ///   a plain string of names), and unlike a wrong split it is
+    ///   visible and fixable.
+    /// - Two providers disagreeing on one real person's birthday split
+    ///   them. Day-precision only (see `parse_person_facts`) keeps the
+    ///   common "Wikidata knows only the year" case out of the
+    ///   comparison entirely, which is where the disagreements were.
     pub fn person_upsert(&self, c: &Credit) -> rusqlite::Result<i64> {
         let name = c.name.trim();
         if name.is_empty() {
@@ -3054,25 +3326,28 @@ impl Index {
                 )
                 .optional()?;
         }
+        if existing.is_none() && !c.imdb.is_empty() {
+            existing = self
+                .db
+                .query_row("SELECT id FROM people WHERE imdb=?1", [&c.imdb], |r| r.get(0))
+                .optional()?;
+        }
         if existing.is_none() {
-            // Name fallback. The clauses refuse a row whose SAME handle
-            // is set to something else, which is all they can do: they
-            // deliberately still allow a name match across DIFFERENT
-            // handle types, because that is how one person seen by two
-            // providers gets merged instead of forked - the Wikidata
-            // credit and the TVmaze credit for Tom Cruise share nothing
-            // but the name, and `people_identity_credits_and_the_search_leg`
-            // pins that they become one row.
+            // Name fallback, guarded by every fact both sides hold. Each
+            // clause reads "one of us does not know, or we agree", so a
+            // blank never blocks a match and a contradiction always
+            // does.
             //
-            // The cost is symmetrical and unavoidable here: two DIFFERENT
-            // people sharing a name, one identified by a qid and one by a
-            // tvmaze id, also merge. Nothing available at upsert time
-            // separates that case from Tom Cruise - the credit carries a
-            // name and one handle, and the row carries a name and the
-            // other. Telling them apart needs a disambiguator we do not
-            // have here (birth date, or an overlap test against the
-            // titles each is credited on), so this is a design limit, not
-            // an oversight in the query. Tracked as the D2 case.
+            // The two handle clauses can only ever refuse a row whose
+            // SAME handle differs - a TVmaze credit says nothing about a
+            // Wikidata row - which is why the name match still crosses
+            // handle types, and why it used to fuse two same-named
+            // people. `imdb` and `born` are the clauses that carry
+            // across: both come from vocabularies a provider does not
+            // own, so a Wikidata-identified row and a TVmaze-identified
+            // credit finally have something to disagree about. See the
+            // doc comment for why `born` does the cross-provider work
+            // and `imdb` mostly does not.
             existing = self
                 .db
                 .query_row(
@@ -3080,17 +3355,19 @@ impl Index {
                       WHERE name=?1 COLLATE NOCASE
                         AND (?2 = 0  OR tvmaze_id = 0     OR tvmaze_id = ?2)
                         AND (?3 = '' OR wikidata_qid = '' OR wikidata_qid = ?3)
+                        AND (?4 = '' OR imdb = ''         OR imdb = ?4)
+                        AND (?5 = '' OR born = ''         OR born = ?5)
                       ORDER BY id LIMIT 1",
-                    rusqlite::params![name, c.tvmaze_id, c.wikidata_qid],
+                    rusqlite::params![name, c.tvmaze_id, c.wikidata_qid, c.imdb, c.born],
                     |r| r.get(0),
                 )
                 .optional()?;
         }
         let Some(id) = existing else {
             self.db.execute(
-                "INSERT INTO people(name, imdb, tvmaze_id, wikidata_qid, photo)
-                 VALUES(?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![name, c.imdb, c.tvmaze_id, c.wikidata_qid, c.photo],
+                "INSERT INTO people(name, imdb, tvmaze_id, wikidata_qid, born, photo)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![name, c.imdb, c.tvmaze_id, c.wikidata_qid, c.born, c.photo],
             )?;
             return Ok(self.db.last_insert_rowid());
         };
@@ -3102,9 +3379,10 @@ impl Index {
                 imdb         = CASE WHEN imdb=''         THEN ?2 ELSE imdb END,
                 tvmaze_id    = CASE WHEN tvmaze_id=0     THEN ?3 ELSE tvmaze_id END,
                 wikidata_qid = CASE WHEN wikidata_qid='' THEN ?4 ELSE wikidata_qid END,
-                photo        = CASE WHEN photo=''        THEN ?5 ELSE photo END
+                born         = CASE WHEN born=''         THEN ?5 ELSE born END,
+                photo        = CASE WHEN photo=''        THEN ?6 ELSE photo END
               WHERE id=?1",
-            rusqlite::params![id, c.imdb, c.tvmaze_id, c.wikidata_qid, c.photo],
+            rusqlite::params![id, c.imdb, c.tvmaze_id, c.wikidata_qid, c.born, c.photo],
         )?;
         Ok(id)
     }
@@ -4083,7 +4361,16 @@ pub struct Credit {
     pub ord: i64,
     pub tvmaze_id: i64,
     pub wikidata_qid: String,
+    /// IMDb `nm…` id. Unlike the two handles above this one is shared
+    /// vocabulary rather than a provider's own numbering, so it is the
+    /// only field that can identify the same human across providers.
     pub imdb: String,
+    /// Date of birth, ISO `YYYY-MM-DD`, empty when unknown. Not an
+    /// identifier - it is the disambiguator `person_upsert` uses to tell
+    /// two same-named people apart, and it earns that job by being the
+    /// one fact BOTH cast providers publish (TVmaze `person.birthday`,
+    /// Wikidata P569).
+    pub born: String,
     /// Headshot: a provider URL as parsed, swapped for the local
     /// art-cache filename once the enricher has fetched it.
     pub photo: String,
@@ -4502,6 +4789,49 @@ mod tests {
         // Size fragments and version dots are not filenames.
         assert_eq!(quoted_name("Big Release 4.2GB yEnc"), None);
         assert_eq!(quoted_name("Release v1.0 done"), None);
+    }
+
+    #[test]
+    fn a_movie_year_answers_only_when_unambiguous() {
+        let dir =
+            std::env::temp_dir().join(format!("nzbfast-index-my-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ix = Index::open(&dir.join("index.db")).unwrap();
+        let put = |key: &str, kind: &str, year: u32| {
+            ix.db
+                .execute(
+                    "INSERT INTO titles(key, kind, title, year) VALUES(?1, ?2, ?3, ?4)",
+                    rusqlite::params![key, kind, "x", year],
+                )
+                .unwrap();
+        };
+        // One title, one year - via the yearless enriched key.
+        put("m:example film", "movie", 2019);
+        assert_eq!(ix.movie_year("example film").unwrap(), Some(2019));
+        // The yeared key spelling answers too.
+        put("m:other film:2007", "movie", 2007);
+        assert_eq!(ix.movie_year("other film").unwrap(), Some(2007));
+        // A remake means two distinct years: refuse to guess.
+        put("m:the remake:1982", "movie", 1982);
+        put("m:the remake:2011", "movie", 2011);
+        assert_eq!(ix.movie_year("the remake").unwrap(), None);
+        // Duplicate keys carrying the SAME year stay unambiguous.
+        put("m:same year", "movie", 1999);
+        put("m:same year:1999", "movie", 1999);
+        assert_eq!(ix.movie_year("same year").unwrap(), Some(1999));
+        // Unenriched (year 0) and non-movie rows say nothing.
+        put("m:unchecked", "movie", 0);
+        assert_eq!(ix.movie_year("unchecked").unwrap(), None);
+        put("t:show title", "tv", 2020);
+        assert_eq!(ix.movie_year("show title").unwrap(), None);
+        // A title that PREFIXES another must not inherit its year:
+        // "alien" and "aliens" share no key, and the ':'-anchored LIKE
+        // keeps "m:alien" from matching "m:aliens" rows... which it
+        // cannot anyway, but the guard worth pinning is the space case.
+        put("m:alien nation:1988", "movie", 1988);
+        assert_eq!(ix.movie_year("alien").unwrap(), None);
+        assert_eq!(ix.movie_year("").unwrap(), None);
     }
 
     #[test]
@@ -5762,9 +6092,11 @@ mod tests {
             4
         );
 
-        // High-water marks persist.
-        ix.set_high_water("alt.test", 42).unwrap();
-        assert_eq!(ix.high_water("alt.test"), 42);
+        // High-water marks persist, independently per server (A8:
+        // article numbers are per-server, message-ids are not).
+        ix.set_high_water("alt.test", "News.EXAMPLE.com", 42).unwrap();
+        assert_eq!(ix.high_water("alt.test", "news.example.com"), 42);
+        assert_eq!(ix.high_water("alt.test", "other.example.com"), 0);
         assert_eq!(ix.stats().unwrap(), (1, 1));
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -6177,6 +6509,95 @@ mod tests {
         assert_eq!((one.len(), total), (1, 1), "{one:?}");
         assert_eq!(one[0].title_key, alpha.title_key);
         assert_eq!(one[0].n_releases, 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// N9: a card's representative (rep_stem / rep_grp - what drives the
+    /// title parse, the enrichment seed, the "have" dupe key and the
+    /// oracle verdict) has to come from a release THIS view accepts. The
+    /// title's newest release is the wrong answer when the active filters
+    /// exclude it.
+    #[test]
+    fn card_representative_obeys_the_active_filters() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-repfilt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ix = Index::open(&dir.join("index.db")).unwrap();
+        // Two releases of one title, written straight to SQL so junk /
+        // group / post date are exact. The NEWER one is the junk copy
+        // from the group a rule will hide.
+        let key = "m:rep filter:2020";
+        let rel = |id: i64, stem: &str, grp: &str, junk: i64, posted: i64| {
+            ix.db
+                .execute(
+                    "INSERT INTO releases(id, stem, poster, grp, total_bytes, files,
+                         has_par2, complete, first_posted, first_seen, kind, res,
+                         have_parts, need_parts, title_key, junk, oracle_at, langs)
+                     VALUES(?1, ?2, 'p@p', ?3, 4096, 1, 0, 1, ?4, ?4, 'movie',
+                            '1080p', 1, 1, ?5, ?6, 0, '')",
+                    rusqlite::params![id, stem, grp, posted, key, junk],
+                )
+                .unwrap();
+        };
+        rel(1, "Rep.Filter.2020.1080p.WEB.x264-GOOD", "alt.binaries.good", 0, 100);
+        rel(2, "0a1b2c3d4e5f60718293a4b5", "alt.binaries.junk", 90, 900);
+
+        let cards = |q: BrowseQuery| -> Card {
+            let (c, total) = ix
+                .browse_cards(&q, CardSort::Latest, false, false, None)
+                .unwrap();
+            assert_eq!((c.len(), total), (1, 1), "{c:?}");
+            c.into_iter().next().unwrap()
+        };
+
+        // Unfiltered: the newest release IS the representative.
+        let all = cards(BrowseQuery::default());
+        assert_eq!(all.n_releases, 2);
+        assert_eq!(all.rep_stem, "0a1b2c3d4e5f60718293a4b5");
+        assert_eq!(all.rep_grp, "alt.binaries.junk");
+
+        // Junk ceiling: the newest release is excluded, so the card must
+        // describe itself with the one release the view kept.
+        let clean = cards(BrowseQuery { max_junk: Some(50), ..Default::default() });
+        assert_eq!(clean.n_releases, 1);
+        assert_eq!(clean.rep_stem, "Rep.Filter.2020.1080p.WEB.x264-GOOD", "{clean:?}");
+        assert_eq!(clean.rep_grp, "alt.binaries.good", "{clean:?}");
+
+        // Same for a per-release curation rule (hide one group).
+        ix.rule_add("group", "alt.binaries.junk", false).unwrap();
+        let curated = cards(BrowseQuery { curated: true, ..Default::default() });
+        assert_eq!(curated.n_releases, 1);
+        assert_eq!(curated.rep_stem, "Rep.Filter.2020.1080p.WEB.x264-GOOD", "{curated:?}");
+        assert_eq!(curated.rep_grp, "alt.binaries.good", "{curated:?}");
+
+        // ...and a row-level filter that excludes the OLDER release still
+        // leaves the newest one as the representative.
+        let big = cards(BrowseQuery { newer_than: 500, ..Default::default() });
+        assert_eq!(big.n_releases, 1);
+        assert_eq!(big.rep_grp, "alt.binaries.junk", "{big:?}");
+
+        // Title-level filters are constant per card, so they must not
+        // strand the representative: an unenriched card is dropped whole
+        // by matched_only rather than losing its rep.
+        let (none, total) = ix
+            .browse_cards(&Default::default(), CardSort::Latest, true, false, None)
+            .unwrap();
+        assert_eq!((none.len(), total as usize), (0, 0));
+
+        // The flat browse() path is unchanged: it filters and dedupes by
+        // stem exactly as before.
+        let (rows, total) = ix.browse(&BrowseQuery::default()).unwrap();
+        assert_eq!((rows.len(), total), (2, 2));
+        let (rows, total) = ix
+            .browse(&BrowseQuery { max_junk: Some(50), ..Default::default() })
+            .unwrap();
+        assert_eq!((rows.len(), total), (1, 1));
+        assert_eq!(rows[0].stem, "Rep.Filter.2020.1080p.WEB.x264-GOOD");
+        let (rows, _) = ix
+            .browse(&BrowseQuery { curated: true, ..Default::default() })
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].grp, "alt.binaries.good");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -7016,4 +7437,155 @@ mod obfuscated_posts_are_unindexable {
             "the real subject has no quoted filename, so ingest skips it"
         );
     }
+
 }
+
+#[cfg(test)]
+mod multi_server_indexing {
+    use crate::index::{BrowseQuery, Index};
+    use crate::nntp::OverEntry;
+
+    fn entry(subject: &str, from: &str, id: &str, bytes: u64) -> OverEntry {
+        OverEntry {
+            number: 0,
+            subject: subject.into(),
+            from: from.into(),
+            message_id: format!("<{id}>"),
+            bytes,
+            date: 0,
+        }
+    }
+
+    /// A8: a single-server-era marks table (PRIMARY KEY on grp alone)
+    /// migrates to the (grp, server) shape with its coverage intact, and
+    /// adopt_legacy_marks hands the '' rows to the historical primary
+    /// without ever clobbering a row that server has since written.
+    #[test]
+    fn marks_migrate_to_per_server_and_adoption_never_clobbers() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-marksmig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("index.db");
+        {
+            // Build the old shape by hand, exactly as v1.0.10 left it.
+            let db = rusqlite::Connection::open(&db_path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE marks(grp TEXT PRIMARY KEY, high INTEGER NOT NULL);
+                 ALTER TABLE marks ADD COLUMN low INTEGER NOT NULL DEFAULT 0;
+                 INSERT INTO marks(grp, high, low) VALUES('alt.old', 500, 100);
+                 INSERT INTO marks(grp, high, low) VALUES('spots:free.pt', 77, 0);",
+            )
+            .unwrap();
+        }
+        let ix = Index::open(&db_path).unwrap();
+        // Migrated rows are visible to no server until adopted.
+        assert_eq!(ix.high_water("alt.old", "news.first.example"), 0);
+        ix.adopt_legacy_marks("News.FIRST.Example").unwrap();
+        assert_eq!(ix.high_water("alt.old", "news.first.example"), 500);
+        assert_eq!(ix.low_water("alt.old", "news.first.example"), 100);
+        // Spot marks migrate the same way (they share the table).
+        assert_eq!(ix.high_water("spots:free.pt", "news.first.example"), 77);
+        // Adoption never clobbers what the server has since written: a
+        // straggling legacy row for an already-claimed group is dropped.
+        ix.set_high_water("alt.old", "news.first.example", 900).unwrap();
+        ix.db
+            .execute("INSERT INTO marks(grp, server, high, low) VALUES('alt.old', '', 1, 1)", [])
+            .unwrap();
+        ix.adopt_legacy_marks("news.first.example").unwrap();
+        assert_eq!(ix.high_water("alt.old", "news.first.example"), 900);
+        // Idempotent: nothing legacy left.
+        ix.adopt_legacy_marks("news.first.example").unwrap();
+        // Per-server independence - the whole point of the migration.
+        ix.set_high_water("alt.old", "other.example", 42).unwrap();
+        assert_eq!(ix.high_water("alt.old", "other.example"), 42);
+        assert_eq!(ix.high_water("alt.old", "news.first.example"), 900);
+        // A fresh database gets the new shape directly (no rebuild): the
+        // reopen must not have bumped anything - just prove reads work.
+        drop(ix);
+        let ix2 = Index::open(&db_path).unwrap();
+        assert_eq!(ix2.high_water("alt.old", "news.first.example"), 900);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A8: two servers scanning the same group merge into one release -
+    /// message-ids are portable, so a part the first server's spool
+    /// never received completes the release when another backbone's
+    /// headers land. Overlap must not double-count.
+    #[test]
+    fn coverage_scans_from_two_servers_merge_and_complete() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-covmerge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ix = Index::open(&dir.join("index.db")).unwrap();
+        let grp = "alt.binaries.teevee";
+        // Server A saw parts 1 and 2 of 3 (a propagation hole ate #3).
+        let a = [
+            entry(r#""Show.S01E02.720p-GRP.mkv" yEnc (1/3)"#, "p@x", "s1e2.p1", 700_000),
+            entry(r#""Show.S01E02.720p-GRP.mkv" yEnc (2/3)"#, "p@x", "s1e2.p2", 700_000),
+        ];
+        ix.ingest(grp, &a, 1_000).unwrap();
+        let (r, _) = ix.browse(&BrowseQuery::default()).unwrap();
+        assert_eq!(r.len(), 1);
+        assert!(!r[0].complete, "two of three parts is incomplete");
+        // Server B carries parts 2 and 3 - same message-ids for the
+        // overlap, which must merge rather than duplicate.
+        let b = [
+            entry(r#""Show.S01E02.720p-GRP.mkv" yEnc (2/3)"#, "p@x", "s1e2.p2", 700_000),
+            entry(r#""Show.S01E02.720p-GRP.mkv" yEnc (3/3)"#, "p@x", "s1e2.p3", 700_000),
+        ];
+        let flipped = ix.ingest(grp, &b, 1_000).unwrap();
+        assert_eq!(flipped, 1, "the merge is what completes the release");
+        let (r, _) = ix.browse(&BrowseQuery::default()).unwrap();
+        assert_eq!(r.len(), 1, "still one release, not one per server");
+        assert!(r[0].complete);
+        let nzb = ix.make_nzb(r[0].id).unwrap();
+        let parsed = crate::nzb::Nzb::parse(nzb.as_bytes()).unwrap();
+        assert_eq!(
+            parsed.files.iter().map(|f| f.segments.len()).sum::<usize>(),
+            3,
+            "the overlapping part must not be emitted twice"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A8 gap-fill pick: only incomplete, junk-gated, settled releases
+    /// are worth re-hunting, and the stamp rotates the pick.
+    #[test]
+    fn gapfill_pick_gates_and_rotates() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-gapfill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ix = Index::open(&dir.join("index.db")).unwrap();
+        let grp = "alt.binaries.teevee";
+        let now = 1_000_000i64;
+        let old = now - 100_000;
+        // Eligible: incomplete, seen long ago.
+        ix.ingest(grp, &[entry(r#""Old.Show.S01E01.720p-GRP.mkv" yEnc (1/2)"#, "p@x", "old.p1", 300_000_000)], old)
+            .unwrap();
+        // Complete: nothing to hunt.
+        ix.ingest(grp, &[entry(r#""Done.Show.S01E01.720p-GRP.mkv" yEnc (1/1)"#, "p@x", "done.p1", 300_000_000)], old)
+            .unwrap();
+        // Too fresh: parts are usually still propagating.
+        ix.ingest(grp, &[entry(r#""New.Show.S01E01.720p-GRP.mkv" yEnc (1/2)"#, "p@x", "new.p1", 300_000_000)], now - 60)
+            .unwrap();
+        // Junk-hidden: must not eat the budget.
+        ix.ingest(grp, &[entry(r#""Junky.Show.S01E01.720p-GRP.mkv" yEnc (1/2)"#, "p@x", "junk.p1", 300_000_000)], old)
+            .unwrap();
+        ix.db
+            .execute("UPDATE releases SET junk=90 WHERE stem LIKE 'Junky%'", [])
+            .unwrap();
+        let picks = ix.gapfill_pick(10, now).unwrap();
+        assert_eq!(picks.len(), 1, "only the settled incomplete release qualifies");
+        let (id, g, posted) = &picks[0];
+        assert_eq!(g, grp);
+        assert_eq!(*posted, old);
+        assert!(!ix.is_complete(*id) );
+        // The stamp rotates: a marked release yields to unmarked ones.
+        ix.ingest(grp, &[entry(r#""Also.Old.S01E01.720p-GRP.mkv" yEnc (1/2)"#, "p@x", "also.p1", 300_000_000)], old)
+            .unwrap();
+        ix.gapfill_mark(*id, now).unwrap();
+        let picks2 = ix.gapfill_pick(1, now).unwrap();
+        assert_eq!(picks2.len(), 1);
+        assert_ne!(picks2[0].0, *id, "the stamped release rotates to the back");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }}

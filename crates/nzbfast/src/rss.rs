@@ -131,14 +131,14 @@ pub fn rules_accept(rules: &[String], item: &FeedItem) -> bool {
     !has_accept || accepted
 }
 
-fn tag_text<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+pub(crate) fn tag_text<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
     let open = xml.find(&format!("<{tag}"))?;
     let start = xml[open..].find('>')? + open + 1;
     let end = xml[start..].find(&format!("</{tag}>"))? + start;
     Some(xml[start..end].trim())
 }
 
-fn unescape(s: &str) -> String {
+pub(crate) fn unescape(s: &str) -> String {
     // &amp; MUST be decoded LAST: doing it first turns `&amp;lt;` (an escaped
     // literal "&lt;") into `&lt;`, which the later pass then wrongly decodes
     // to "<", corrupting the title/link (and its dedupe identity).
@@ -151,7 +151,7 @@ fn unescape(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
-fn attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+pub(crate) fn attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
     let pat = format!("{name}=\"");
     let start = tag.find(&pat)? + pat.len();
     let end = tag[start..].find('"')? + start;

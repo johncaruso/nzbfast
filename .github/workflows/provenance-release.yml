@@ -12,9 +12,11 @@ name: provenance-release
 #     gh attestation verify <file> --repo nzbfast/nzbfast
 #
 # SCOPE: the per-target tar.gz binaries this workflow uploads
-# (nzbfast-<target-triple>.tar.gz). The platform installers (.dmg,
-# setup.exe) are packaged and signed through separate channels and are
-# not covered here.
+# (nzbfast-<target-triple>.tar.gz), plus - when the `image` input is set -
+# the container image, which this workflow assembles and pushes itself so
+# the attested digest is one a runner actually produced. The platform
+# installers (.dmg, setup.exe) are packaged and signed through separate
+# channels and are not covered here.
 #
 # DISPATCH-ONLY: run from Actions -> provenance-release -> Run workflow
 # with the tag of an existing release to attach the artifacts to.
@@ -33,6 +35,10 @@ on:
       tag:
         description: "Existing release tag to attach attested binaries to (e.g. v1.0.5)"
         required: true
+      image:
+        description: "Also build, push and attest the container image (moves :latest - only at release time, never for an old tag)"
+        type: boolean
+        default: false
 
 permissions:
   id-token: write       # Sigstore keyless signing (OIDC identity token)
@@ -88,18 +94,60 @@ jobs:
           echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
           echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++" >> "$GITHUB_ENV"
 
+      # Pin every build-time clock to the tag's commit time, so a rebuild
+      # of the same tag can produce the same bytes. Without this the binary
+      # embeds the wall clock (mimalloc prints __DATE__/__TIME__ in its
+      # version banner), which made every build unrepeatable - including a
+      # CI re-run of the same tag. Both gcc and clang honor
+      # SOURCE_DATE_EPOCH for __DATE__/__TIME__.
+      - name: Pin SOURCE_DATE_EPOCH to the tag's commit time
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+
       # --locked: build exactly the pinned dependency graph or fail.
       # CARGO_INCREMENTAL=0 keeps codegen deterministic.
+      # The remap keeps the builder's home directory (cargo registry
+      # paths in panic metadata - 398 of them) out of the binary, so a
+      # rebuild by a different user can match. Rebuilders use the same
+      # flag. Measured (docs/REPRODUCE.md): differing flag literals and
+      # differing build paths each perturb ONLY the linker's LC_UUID
+      # plus its derived signature slot (48 bytes); all code and data
+      # stay byte-stable.
+      # (If a .cargo/config.toml with rustflags ever lands in this repo,
+      # fold this remap into it - a RUSTFLAGS env var REPLACES config
+      # rustflags entirely.)
       - name: Build
         env:
           CARGO_INCREMENTAL: "0"
+          RUSTFLAGS: "--remap-path-prefix=${{ runner.os == 'Linux' && '/home/runner' || '/Users/runner' }}=/build"
         run: cargo build --release --locked -p nzbfast --target ${{ matrix.target }}
 
+      # Deterministic packaging: pin the entry mtime to the commit time,
+      # zero the owner (a tarball must not record who built it), and gzip
+      # with -n so no name/timestamp lands in the gzip header. Plain
+      # `tar czf` embedded the build's wall clock in three places.
       - name: Package + checksum
+        # pipefail is load-bearing: without it a tar failure upstream of
+        # gzip yields a "successful" step whose artifact is an empty gzip
+        # stream - which would then be attested and uploaded. (Default
+        # Actions bash is -e only, no pipefail.)
         run: |
+          set -euo pipefail
           BIN=target/${{ matrix.target }}/release/nzbfast
           ART=nzbfast-${{ matrix.target }}.tar.gz
-          tar czf "$ART" -C "$(dirname "$BIN")" nzbfast
+          python3 -c 'import os,sys; t=int(os.environ["SOURCE_DATE_EPOCH"]); os.utime(sys.argv[1],(t,t))' "$BIN"
+          # Ownership-zeroing flags differ by tar flavour: GNU tar on the
+          # linux runners, bsdtar on the mac runners. GNU tar rejects the
+          # bsd spellings outright ("unrecognized option '--uid'").
+          if tar --version | grep -q GNU; then
+            tar --owner=0 --group=0 --numeric-owner \
+                -cf - -C "$(dirname "$BIN")" nzbfast | gzip -n -9 > "$ART"
+          else
+            tar --uid 0 --gid 0 --uname "" --gname "" \
+                -cf - -C "$(dirname "$BIN")" nzbfast | gzip -n -9 > "$ART"
+          fi
+          # Belt and braces alongside pipefail: a real nzbfast tarball is
+          # megabytes; refuse to ship anything implausibly small.
+          test "$(wc -c < "$ART")" -gt 1000000
           shasum -a 256 "$ART" > "$ART.sha256"
 
       # THE provenance step: signs a SLSA statement over the artifact,
@@ -128,3 +176,90 @@ jobs:
             "nzbfast-$TARGET.tar.gz" \
             "nzbfast-$TARGET.tar.gz.sha256" \
             --repo "$REPO"
+
+  # Container image: assemble, push and attest IN THIS RUN, so the attested
+  # digest is one this workflow actually produced. What the provenance claim
+  # covers is exactly what the job does, no more: the image is assembled by
+  # packaging/docker/push-image.sh from the linux binaries already attached
+  # to release <tag>, after verifying them against the release's
+  # SHA256SUMS.txt. It repackages release assets; it does not compile them.
+  # The workflow source is public, so the claim is auditable.
+  #
+  # OPT-IN (`image` input, default false) because the push moves the
+  # :<version> AND :latest tags on ghcr + Docker Hub. Enable it when
+  # dispatching for a freshly cut release; leave it off when re-dispatching
+  # an OLD tag (e.g. re-attesting after a release deletion), or :latest
+  # would regress to that old version.
+  #
+  # Auth: GHCR_TOKEN falls back to the workflow's own GITHUB_TOKEN, which
+  # can push only if the ghcr package grants this repo's Actions write
+  # access (package settings -> Manage Actions access). Set a GHCR_TOKEN
+  # repo secret (write:packages) if that grant is absent. DOCKERHUB_TOKEN
+  # is optional; without the secret the job pushes ghcr only, exactly like
+  # a local push-image.sh run.
+  image:
+    if: ${{ inputs.image && github.repository == 'nzbfast/nzbfast' }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write       # Sigstore keyless signing (OIDC identity token)
+      attestations: write   # write the attestation to the GH attestations API
+      contents: read
+      packages: write       # push the image + its attestation to ghcr
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+
+      # Same guard as the binaries job: the Dockerfile + entrypoint used to
+      # assemble the image must come from the tag being attested.
+      - name: Verify the checkout matches the tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          want=$(git rev-parse "refs/tags/$TAG^{commit}")
+          have=$(git rev-parse HEAD)
+          if [ "$want" != "$have" ]; then
+            echo "checkout is $have but tag $TAG is $want" >&2
+            exit 1
+          fi
+          echo "building image for $TAG at $have"
+
+      # arm64 layers run under emulation (the Dockerfile apt-gets packages).
+      - name: Set up QEMU (arm64)
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: arm64
+
+      # The exact same script a maintainer runs locally: fetches the
+      # release's linux tarballs, checksums them against SHA256SUMS.txt,
+      # and buildx-pushes one multi-arch manifest to ghcr (+ Docker Hub
+      # when a token is present).
+      - name: Build + push image from release binaries
+        env:
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || github.token }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: packaging/docker/push-image.sh "${TAG#v}"
+
+      # The digest of the manifest list just pushed. buildx pushed the same
+      # manifest to every tag/registry in one build, so this single digest
+      # identifies the image on ghcr AND Docker Hub.
+      - name: Resolve pushed digest
+        id: digest
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          d=$(docker buildx imagetools inspect \
+                "ghcr.io/nzbfast/nzbfast:${TAG#v}" \
+                --format '{{println .Manifest.Digest}}')
+          echo "digest=$d" >> "$GITHUB_OUTPUT"
+          echo "pushed manifest digest: $d"
+
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-name: ghcr.io/nzbfast/nzbfast
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          push-to-registry: true

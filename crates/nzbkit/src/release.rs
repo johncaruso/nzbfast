@@ -411,10 +411,43 @@ pub fn identity_tail<'a, I: IntoIterator<Item = &'a str>>(after_year: I) -> Vec<
     if any_ident { tail } else { Vec::new() }
 }
 
+/// Junk a reposter appends AFTER the real group tag
+/// ("…x264-GRP-Obfuscated", "…-Rakuvfinhel"). Matched whole, so a group
+/// that merely contains one of the words ("-RPGroup") is not one of these.
+fn is_reposter_tag(tag: &str) -> bool {
+    const TAGS: &[&str] = &[
+        "obfuscated", "obfuscation", "scrambled", "sample", "postbot",
+        "xpost", "buymore", "asrequested", "alternativetorequested",
+        "gerov", "z0ids3n", "chamele0n", "4planet", "altezachen",
+        "repackpost", "nzbgeek", "rp",
+    ];
+    let low = tag.to_ascii_lowercase();
+    TAGS.contains(&low.as_str())
+        || (low.starts_with("rakuv")
+            && low[5..].chars().all(|c| c.is_ascii_alphanumeric()))
+}
+
+/// Strip those tags off the end of a stem. Repeatedly: they chain
+/// ("…-GRP-xpost-Obfuscated"). A stem that is nothing but tags strips to
+/// empty, which leaves the parse with no group at all - the caller keeps
+/// the stem as posted. Bare "-1" is deliberately not in the list, too many
+/// real groups and part numbers end that way.
+fn strip_reposter_tags(stem: &str) -> &str {
+    let mut s = stem;
+    while let Some((head, tag)) = s.rsplit_once('-') {
+        if !is_reposter_tag(tag.trim()) {
+            break;
+        }
+        s = head.trim_end_matches(['.', '_', ' ']);
+    }
+    s
+}
+
 /// Release-group tag: the text after the LAST hyphen when it reads as a
 /// group rather than release furniture ("…x264-FGT" → "FGT", but
 /// "…WEB-DL" → None). Returns the body with the tag removed, and the tag.
 fn split_group(stem: &str) -> (&str, Option<&str>) {
+    let stem = strip_reposter_tags(stem);
     match stem.rsplit_once('-') {
         Some((b, g)) => {
             let g = g.trim();
@@ -448,6 +481,18 @@ pub fn looks_obfuscated(stem: &str) -> bool {
     }
     // All tokens long hex → hash name ("2137d880a074…").
     if toks.iter().all(|t| t.len() >= 8 && t.chars().all(|c| c.is_ascii_hexdigit())) {
+        return true;
+    }
+    // Fixed-width HEX blob the whole way across ("d41d8cd98f00b204…"):
+    // md5-shaped renames that carry no digits and only a capital or two,
+    // so every rule below misses them. Anchored on the whole stem, which
+    // means a real title cannot match - titles carry separators.
+    //
+    // Hex, not alnum: an md5 is hex by definition, and the wider test
+    // swallowed a 32-character concatenated title
+    // ("ThelordoftheringsReturnoftheking") that every other rule here
+    // deliberately passes.
+    if stem.len() == 32 && stem.chars().all(|c| c.is_ascii_hexdigit()) {
         return true;
     }
     if toks.len() != 1 {
@@ -870,8 +915,103 @@ pub fn norm_title(t: &str) -> String {
         .join(" ")
 }
 
+// ---------------------------------------------------------------------------
+// Reversed stems. A reposter writes the whole name backwards
+// ("PRG-462x.p0801.4202.eivoM.elpmaxE"), which defeats every furniture
+// rule above because none of the tokens read forwards. Only a token that
+// could not be anything BUT backwards triggers the flip, and the flipped
+// parse has to be strictly better than the forward one to be believed.
+// ---------------------------------------------------------------------------
+
+/// A whole token that only makes sense read backwards: a resolution
+/// ("p027" = 720p, "p0801" = 1080p) or an SxxEyy marker ("20E10S" =
+/// S01E02, "210E10S" = S01E012). Whole-token only, so a real word that
+/// merely contains one of these is not one.
+fn reads_backwards(tok: &str) -> bool {
+    // Every shape below is 4 ("p084") to 7 ("210E10S") characters, and
+    // this runs over every token of every furniture-less stem the index
+    // scans - so the width decides before anything allocates.
+    if !(4..=7).contains(&tok.len()) {
+        return false;
+    }
+    let t = tok.to_ascii_lowercase();
+    let b = t.as_bytes();
+    // Reversed resolution. Derived from `res_of` rather than listed, so
+    // the two cannot drift apart, and shaped so only the "<digits>p"
+    // resolutions qualify - "4k" backwards is two characters of nothing.
+    let reversed_res = t.strip_prefix('p').is_some_and(|digits| {
+        (3..=4).contains(&digits.len())
+            && digits.bytes().all(|c| c.is_ascii_digit())
+            && res_of(&t.chars().rev().collect::<String>()).is_some()
+    });
+    if reversed_res {
+        return true;
+    }
+    // Reversed episode marker: episode digits, 'e', season digits, 's'.
+    (6..=7).contains(&b.len())
+        && b[b.len() - 1] == b's'
+        && b[b.len() - 4] == b'e'
+        && b[..b.len() - 4].iter().all(u8::is_ascii_digit)
+        && b[b.len() - 3..b.len() - 1].iter().all(u8::is_ascii_digit)
+}
+
+/// Flip the stem and keep the flipped parse only when it is strictly
+/// more informative: the forward parse found NO scene furniture at all,
+/// and the flipped one found a pronounceable title plus enough facts to
+/// rule out coincidence. Without the title test a flip that recovers a
+/// resolution but leaves a bare number for a name would be believed.
+///
+/// "Forward furniture" has to mean every identity signal, not just the
+/// two the flip is hunting for: a year, a source or an air date all say
+/// the stem already reads forwards, and "Christmas.p0801.Home.Movies.
+/// 2019" flipped to "9102 seivoM emoH".
+///
+/// The English test cannot carry the rest on its own, because vowels
+/// survive a reversal - "epaT" reads as pronounceably as "Tape" - so the
+/// acceptance bar is `rot13_rescue`'s furniture count, raised to two
+/// signals with no one-plus-a-common-word escape: a reversed title keeps
+/// real English words, so the common-word tell that works for ROT13
+/// proves nothing here. Season and episode come from ONE SxxEyy token
+/// and so count once between them, and only when the season reads
+/// plausibly - otherwise the single page marker in
+/// "Lecture.Notes.12e34s.Extra" flips it to S43E21 of "artxE".
+fn reversed_rescue(stem: &str, direct: &Parsed) -> Option<Parsed> {
+    if direct.res.is_some()
+        || direct.season.is_some()
+        || direct.episode.is_some()
+        || direct.year.is_some()
+        || direct.source.is_some()
+        || direct.date.is_some()
+        || direct.group.is_some()
+        || direct.remux
+    {
+        return None;
+    }
+    if !stem.split(|c: char| !c.is_ascii_alphanumeric()).any(reads_backwards) {
+        return None;
+    }
+    let p = parse_one(&stem.chars().rev().collect::<String>());
+    if !matches!(p.kind, Kind::Movie | Kind::Tv) || !english_words(&p.title).0 {
+        return None;
+    }
+    let episode = (p.season.is_some() || p.episode.is_some())
+        && p.season.map_or(true, |s| (1..=40).contains(&s));
+    let signals = [episode, p.year.is_some(), p.res.is_some(), p.source.is_some(), p.remux]
+        .iter()
+        .filter(|b| **b)
+        .count();
+    if signals < 2 {
+        return None;
+    }
+    (p.res.is_some() || p.season.is_some() || p.episode.is_some()).then_some(p)
+}
+
 pub fn parse_release(stem: &str) -> Parsed {
     let direct = parse_one(stem);
+    if let Some(mut p) = reversed_rescue(stem, &direct) {
+        p.rescued = true;
+        return p;
+    }
     // ROT13 rescue: only worth trying when the direct parse found NO
     // scene furniture at all - any recognized year/SxxEyy/res/source
     // token means the stem is already plain text, and rotating a real
@@ -1018,13 +1158,42 @@ fn parse_one(stem: &str) -> Parsed {
     let is_datecode = |t: &str| {
         (t.len() == 6 || t.len() == 8) && t.chars().all(|c| c.is_ascii_digit())
     };
-    // A 2-digit month or day in range. The daily flag is deliberately
-    // looser than this (any 6/8-digit run reads as a datecode); only a
-    // date that validates becomes an identity.
+    // A 2-digit month or day in range. At eight digits the daily flag is
+    // deliberately looser than this (any run of that width reads as a
+    // datecode); only a date that validates becomes an identity.
     let d2 = |s: &str, max: u32| {
         s.len() == 2
             && s.bytes().all(|c| c.is_ascii_digit())
             && s.parse::<u32>().is_ok_and(|v| (1..=max).contains(&v))
+    };
+    // The normalized "yyyymmdd" a datecode reads as, or None when it is
+    // not a date. Six digits are held to a much harder bar than eight:
+    // that width is also how ids, sizes and part counts look, and YYMMDD
+    // has only one sane reading (20YY, near enough to now to be a real
+    // air date). Anything short of that is left alone as an ordinary
+    // word rather than guessed at.
+    let datecode_of = |t: &str| -> Option<String> {
+        let (y, md) = t.split_at(t.len() - 4);
+        let (mth, day) = md.split_at(2);
+        if !d2(mth, 12) || !d2(day, 31) {
+            return None;
+        }
+        if y.len() == 4 {
+            return Some(format!("{y}{mth}{day}"));
+        }
+        if !y.parse::<u32>().is_ok_and(|v| v <= 39) {
+            return None;
+        }
+        // A four-digit year or an SxxEyy marker anywhere in the stem
+        // names the release better than a bare six-digit run ever could,
+        // so a stem carrying either is not read as YYMMDD at all. Walked
+        // here, at the one token that needs the answer, rather than up
+        // front for every stem the index parses.
+        let competing = toks
+            .iter()
+            .enumerate()
+            .any(|(j, x)| (j > 0 && is_year(x)) || tv_marker(x).is_some());
+        (!competing).then(|| format!("20{y}{mth}{day}"))
     };
     // First tag / TV-marker index = hard end of the title region.
     let mut boundary = toks.len();
@@ -1040,18 +1209,13 @@ fn parse_one(stem: &str) -> Parsed {
             boundary = boundary.min(i);
         } else if is_tag(t) {
             boundary = boundary.min(i);
-        } else if i > 0 && is_datecode(t) {
+        } else if i > 0 && is_datecode(t) && (t.len() == 8 || datecode_of(t).is_some()) {
             daily = true;
             // "150615" (YYMMDD) and "20150615" both normalize to
             // yyyymmdd, so the two conventions compare equal.
-            let (y, md) = t.split_at(t.len() - 4);
-            let (mth, day) = md.split_at(2);
-            if d2(mth, 12) && d2(day, 31) {
-                let year = if y.len() == 2 { format!("20{y}") } else { y.to_string() };
-                if date.is_none() {
-                    date = Some(format!("{year}{mth}{day}"));
-                    date_end = Some(i + 1);
-                }
+            if let Some(d) = datecode_of(t).filter(|_| date.is_none()) {
+                date = Some(d);
+                date_end = Some(i + 1);
             }
             boundary = boundary.min(i);
         } else if i > 0
@@ -1341,6 +1505,30 @@ pub fn quality_suffix(p: &Parsed, style: &NameStyle) -> String {
     out
 }
 
+/// Split a [`Parsed::date`] ("20260721") into the year a daily show is
+/// filed under and the dotted air date its episode is named after
+/// ("2026", "2026.07.21") - the `{Series Title} - {Air-Date}` convention
+/// every library uses for a show that has no season/episode numbers.
+///
+/// None unless the string is exactly the normalized 8-digit shape
+/// `parse_release` produces AND reads as a real calendar date, so a
+/// caller building a filename declines rather than emit half a date.
+/// This is deliberately stricter than the `daily` flag: that flag only
+/// has to decide "TV, not a movie", while a name written to disk has to
+/// be right.
+pub fn air_date_parts(date: &str) -> Option<(String, String)> {
+    if date.len() != 8 || !date.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (year, md) = date.split_at(4);
+    let (month, day) = md.split_at(2);
+    let in_range = |s: &str, max: u32| s.parse::<u32>().is_ok_and(|v| (1..=max).contains(&v));
+    if !in_range(month, 12) || !in_range(year, 9999) || !in_range(day, 31) {
+        return None;
+    }
+    Some((year.to_string(), format!("{year}.{month}.{day}")))
+}
+
 /// Friendly base name (no extension) for a movie / loose file:
 /// "The Matrix (1999)" plus the style suffix. Path-safe. Returns None when
 /// there's nothing better to offer than the original - an obfuscated /
@@ -1400,7 +1588,11 @@ pub fn movie_name(p: &Parsed, style: &NameStyle) -> Option<String> {
         base.push_str(&extra);
     }
     base.push_str(&suffix);
-    Some(sanitize_name(&base))
+    // Nothing nameable survived sanitisation (a title that was all
+    // punctuation): decline, as everywhere else here, so the poster's own
+    // name stands rather than a placeholder.
+    let name = sanitize_name(&base);
+    if name.is_empty() { None } else { Some(name) }
 }
 
 /// The unrecognised words of a release, filtered down to what is worth
@@ -1455,15 +1647,91 @@ fn extra_words(p: &Parsed) -> Option<String> {
     Some(out.join(" "))
 }
 
+/// Spell a colon out as a separator instead of losing it. A colon is
+/// illegal on Windows and carries path meaning there, but in a title it
+/// is doing real work ("Alien: Romulus", "Dune: Part Two"), and blanking
+/// it to a space read as two titles run together. The convention every
+/// library uses: ": " becomes " - ", a bare ":" becomes "-".
+fn expand_colons(t: &str) -> String {
+    let mut out = String::with_capacity(t.len() + 2);
+    let mut chars = t.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != ':' {
+            out.push(c);
+            continue;
+        }
+        if chars.peek() == Some(&' ') {
+            chars.next();
+            out.push_str(" - ");
+        } else {
+            out.push('-');
+        }
+    }
+    out
+}
+
+/// Collapse a separator run that colon expansion doubled up ("Title - -
+/// Sub", "Title--Sub") back down to one. Only runs of TWO OR MORE hyphens
+/// are touched, so a hyphenated word ("Spider-Man") and an ordinary
+/// " - " are left exactly as they were.
+fn collapse_separators(t: &str) -> String {
+    let chars: Vec<char> = t.chars().collect();
+    let mut out = String::with_capacity(t.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '-' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let (mut hyphens, mut spaced) = (0, false);
+        while i < chars.len() && (chars[i] == '-' || chars[i] == ' ') {
+            if chars[i] == '-' {
+                hyphens += 1;
+            } else {
+                spaced = true;
+            }
+            i += 1;
+        }
+        if hyphens < 2 {
+            out.extend(&chars[start..i]);
+        } else if spaced {
+            out.push_str(" - ");
+        } else {
+            out.push('-');
+        }
+    }
+    out
+}
+
 /// Strip path-hostile characters and collapse whitespace for a file/dir
 /// name. Keeps brackets/parens (used by the quality suffix).
+///
+/// The result then goes through the same strong guarantees enqueue-time
+/// folder naming uses ([`crate::disk::sanitize_filename`]), with the
+/// Windows rules forced ON regardless of host: a finished tree gets moved
+/// to a NAS/SMB share, so a leading dot (hidden), a trailing dot (silently
+/// truncated) or a reserved device stem ("CON") is a problem everywhere,
+/// not just on a Windows box. Without this, stage 4 could emit names that
+/// enqueue-time naming had already been fixed to reject.
+///
+/// Returns an EMPTY string when nothing nameable survives, so callers
+/// decline rather than emit `sanitize_filename`'s "unnamed" placeholder or
+/// a bare-dot component.
 pub fn sanitize_name(t: &str) -> String {
-    t.chars()
+    let expanded = collapse_separators(&expand_colons(t));
+    let mapped: String = expanded
+        .chars()
         .map(|c| if "/\\:*?\"<>|".contains(c) { ' ' } else { c })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+        .collect();
+    let collapsed = mapped.split_whitespace().collect::<Vec<_>>().join(" ");
+    // A colon at the very start or end leaves a dangling separator behind.
+    let collapsed = collapsed.trim_start_matches("- ").trim_end_matches(" -").trim();
+    if !collapsed.chars().any(|c| c.is_alphanumeric()) {
+        return String::new();
+    }
+    crate::disk::sanitize_filename_for(collapsed, true)
 }
 
 #[cfg(test)]
@@ -1797,6 +2065,30 @@ mod tests {
         assert_eq!(m.year, Some(2017));
     }
 
+    /// The air date is a daily show's whole identity, so the split that
+    /// turns it into a folder year and a filename has to refuse anything
+    /// that is not a real date rather than emit half of one.
+    #[test]
+    fn air_dates_split_into_a_year_and_a_name() {
+        let parts = air_date_parts;
+        assert_eq!(parts("20260721"), Some(("2026".into(), "2026.07.21".into())));
+        assert_eq!(parts("20150615"), Some(("2015".into(), "2015.06.15".into())));
+        // Both conventions the parser normalizes reach the same name.
+        assert_eq!(
+            air_date_parts(p("At.Midnight.150615.720p.HDTV-GRP").date.as_deref().unwrap()),
+            air_date_parts(p("At.Midnight.20150615.720p.HDTV-GRP").date.as_deref().unwrap())
+        );
+        assert_eq!(
+            parts(p("The.Daily.Show.2026.07.21.1080p.WEB-GRP").date.as_deref().unwrap()),
+            Some(("2026".into(), "2026.07.21".into()))
+        );
+        // Declines: wrong width, non-digits, out-of-range fields.
+        for s in ["", "2026072", "202607211", "2026-07-21", "2026o721", "20261321", "20260732",
+                  "20260700", "20260021", "00000101"] {
+            assert_eq!(air_date_parts(s), None, "{s:?} is not an air date");
+        }
+    }
+
     #[test]
     fn year_as_season_marker_is_tv() {
         // "S2026E015" (annual sports/soaps) parsed as Movie before -
@@ -2108,6 +2400,74 @@ mod tests {
     }
 
 
+    /// Reposters append their own tag after the real group, and with
+    /// `NameStyle::group` on it would land in the filename.
+    #[test]
+    fn reposter_tags_never_become_the_group() {
+        let g = |s: &str| p(s).group;
+        assert_eq!(g("Example.Movie.2024.1080p.x264-GRP-Obfuscated").as_deref(), Some("GRP"));
+        assert_eq!(g("Example.Movie.2024.1080p.x264-Obfuscated"), None);
+        // They chain, in any case, in any order.
+        assert_eq!(
+            g("Example.Movie.2024.1080p.x264-GRP-xpost-Obfuscated").as_deref(),
+            Some("GRP")
+        );
+        assert_eq!(
+            g("Example.Movie.2024.1080p.x264-GRP-NZBGeek-postbot-RP").as_deref(),
+            Some("GRP")
+        );
+        assert_eq!(g("Example.Movie.2024.1080p.x264-GRP-RAKUVFINHEL").as_deref(), Some("GRP"));
+        assert_eq!(g("Example.Movie.2024.1080p.x264-GRP-AlteZachen").as_deref(), Some("GRP"));
+        assert_eq!(g("Example.Movie.2024.1080p.x264-GRP.-Chamele0n").as_deref(), Some("GRP"));
+        // A real group that merely CONTAINS one of the words is untouched.
+        assert_eq!(g("Example.Movie.2024.1080p.x264-RPGroup").as_deref(), Some("RPGroup"));
+        assert_eq!(g("Example.Movie.2024.1080p.x264-Sampler").as_deref(), Some("Sampler"));
+        assert_eq!(g("Example.Movie.2024.1080p.x264-GEROVA").as_deref(), Some("GEROVA"));
+        // Sonarr strips a bare "-1" too; we do not, it is too risky - so
+        // the tail keeps hiding the group instead of exposing a wrong one.
+        assert_eq!(g("Example.Movie.2024.1080p.x264-GRP-1"), None);
+        // Nothing but tags: no group, and the stem survives as the title.
+        assert_eq!(group_of("-Obfuscated"), None);
+        assert_eq!(p("-Obfuscated").title, "-Obfuscated");
+        // The tag leaves no trace in the rest of the parse either.
+        let m = p("Example.Movie.2024.1080p.x264-GRP-Obfuscated");
+        assert_eq!(m.title, "Example Movie");
+        assert_eq!(m.year, Some(2024));
+        assert!(!m.extra.iter().any(|w| w.eq_ignore_ascii_case("obfuscated")));
+    }
+
+    /// Fixed-width hash renames seen in the wild, full-stem anchored.
+    #[test]
+    fn obfuscated_hash_shapes_are_caught() {
+        for s in [
+            "ABCDEFGHIJK123",                   // 11 caps + 3 digits
+            "abcdefghijkl123",                  // 12 lowercase + 3 digits
+            "d41d8cd98f00b204e9800998ecf8427e", // 32 hex, md5
+            "abcdefabcdefabcdefabcdefabcdefAb", // 32 hex, no digits, one cap
+            "abcdefghijklmnopqrstuvwx",         // 24 lowercase
+            "a1b2c3d4e5f6g7h8i9j0k1l2",         // 24 alnum
+        ] {
+            assert!(looks_obfuscated(s), "should be obfuscated: {s}");
+        }
+        // Real names of the same length are separated, and separators are
+        // what the anchored shapes cannot contain.
+        for s in [
+            "The Lord of the Rings The Two Tow", // 33 chars with spaces
+            "Everything Everywhere All At Once", // 33 chars with spaces
+            "Pirates.Of.The.Caribbean.At.Worl",  // 32 chars, dotted
+            "The.Matrix.Reloaded.2003.1080p.BluRay.x264-AMIABLE",
+            "Show.S01E01.1080p.WEB-DL.DD5.1.H264-NTb",
+            "Week 03",
+            // 32 characters of run-together title. The md5 rule is
+            // anchored on hex for exactly this: it is unpresentable
+            // hex-shaped renames we are after, not any 32-character run
+            // of letters somebody typed without separators.
+            "ThelordoftheringsReturnoftheking",
+        ] {
+            assert!(!looks_obfuscated(s), "should NOT be obfuscated: {s}");
+        }
+    }
+
     /// Real stems from the live index. The lowercase-base32 shape was
     /// missed by every earlier rule: no digits, no internal capitals.
     #[test]
@@ -2129,4 +2489,290 @@ mod tests {
             assert!(!looks_obfuscated(s), "should NOT be obfuscated: {s}");
         }
     }
+
+    // Hostile-input fuzz: the indexer runs parse_release over every scraped
+    // subject, which an attacker controls. The parser byte-indexes &str in
+    // several spots (tv_marker, the version closure, the leading-zero SSEE
+    // case), so a subject engineered to place a multi-byte UTF-8 char at a
+    // slice boundary would panic the scan thread (DoS) if any of those sites
+    // were unguarded. Throw adversarial unicode, control chars, ROT13 bait,
+    // and pathological separator runs at every public entry point and assert
+    // it never panics (a panic here fails the test = a real finding).
+    #[test]
+    fn parser_never_panics_on_hostile_input() {
+        // Cheap deterministic LCG so the corpus is reproducible.
+        let mut state: u64 = 0x9e3779b97f4a7c15;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        // Bytes chosen to stress char-boundary math: multi-byte UTF-8 leads,
+        // scene separators, digits, and the S/E/v/x markers that drive the
+        // byte-slicing branches.
+        let alphabet: &[&str] = &[
+            "s", "e", "v", "x", "S", "E", "0", "1", "2", "6", "9", ".", "_", "-", " ",
+            "[", "]", "(", ")", "é", "ß", "λ", "中", "日", "\u{200f}", "\u{0301}", "🎬",
+            "\u{feff}", "\t", "\n", "web", "dl", "1080p", "x265", "2024", "s01e01",
+        ];
+        // A few fixed adversarial seeds alongside the random corpus.
+        let seeds = [
+            "",
+            "s01ée01",           // multi-byte char right after the season 's'
+            "vé.6",              // version closure: 'v' then a multi-byte char
+            "0é01",              // leading-zero SSEE lookalike with a wide char
+            "中文.2024.1080p.WEB-中",
+            "\u{feff}s2026é015",
+            "----",
+            "a-b-c-d-e-f",
+            "s99999999999999999999e88888888888888888888",
+            &"x".repeat(5000),
+            &"1.".repeat(2000),
+        ];
+        let run = |stem: &str| {
+            let parsed = parse_release(stem);
+            // Exercise the downstream formatters too - they slice on the
+            // parsed fields.
+            let _ = norm_title(stem);
+            let _ = sanitize_name(stem);
+            let _ = quality_label(&parsed);
+            let style = NameStyle::default();
+            let _ = quality_suffix(&parsed, &style);
+            let _ = movie_name(&parsed, &style);
+        };
+        for s in seeds {
+            run(s);
+        }
+        for _ in 0..20_000 {
+            let len = (next() % 40) as usize;
+            let mut stem = String::new();
+            for _ in 0..len {
+                stem.push_str(alphabet[(next() as usize) % alphabet.len()]);
+            }
+            run(&stem);
+        }
+    }
+
+    /// Stage 4 writes real files and folders, and a finished tree gets
+    /// moved to a NAS/SMB share, so the Windows rules apply whatever host
+    /// produced the name. Enqueue-time folder naming had these guarantees
+    /// already; the friendly renamer did not, and could emit a hidden
+    /// name, a name Windows silently truncates, or a device stem.
+    #[test]
+    fn a_friendly_name_is_portable() {
+        // Leading dot: hidden on macOS/Linux, and not what anyone asked
+        // for on Windows either.
+        assert_eq!(sanitize_name(".Hidden Movie (2024)"), "Hidden Movie (2024)");
+        assert_eq!(sanitize_name("..Hidden Movie (2024)"), "Hidden Movie (2024)");
+        // Trailing dot / space: Windows strips them, so the name on disk
+        // stops matching the name we recorded.
+        assert_eq!(sanitize_name("Movie (2024)."), "Movie (2024)");
+        assert_eq!(sanitize_name("Movie (2024). "), "Movie (2024)");
+        // Reserved DOS device stems: creating one opens the device.
+        assert_eq!(sanitize_name("CON"), "_CON");
+        assert_eq!(sanitize_name("com1"), "_com1");
+        assert_eq!(sanitize_name("nul.mkv"), "_nul.mkv");
+        // Path separators and the rest of the illegal set never survive.
+        for s in ["../../etc/passwd", "a\\b", "Movie <2024>", "Q|A?", "x\u{7}y"] {
+            let out = sanitize_name(s);
+            assert_eq!(
+                std::path::Path::new(&out).components().count(),
+                1,
+                "not a single component: {s:?} -> {out:?}"
+            );
+            assert!(!out.chars().any(|c| c.is_control()), "{s:?} -> {out:?}");
+        }
+        // Nothing nameable left: an empty name, so the caller declines.
+        for s in ["", "...", " . . ", "----", ":"] {
+            assert_eq!(sanitize_name(s), "", "{s:?} should be unnameable");
+        }
+    }
+
+    /// A colon separates a title from its subtitle, so it has to be
+    /// SPELLED OUT, not blanked - "Alien Romulus" reads as one title.
+    #[test]
+    fn a_colon_becomes_a_separator() {
+        assert_eq!(sanitize_name("Alien: Romulus"), "Alien - Romulus");
+        assert_eq!(sanitize_name("Alien:Romulus"), "Alien-Romulus");
+        assert_eq!(sanitize_name("Alien : Romulus"), "Alien - Romulus");
+        // Doubled separators the expansion creates are collapsed back.
+        assert_eq!(sanitize_name("Alien:: Romulus"), "Alien - Romulus");
+        assert_eq!(sanitize_name("Alien -: Romulus"), "Alien - Romulus");
+        // A dangling colon leaves no dangling separator behind.
+        assert_eq!(sanitize_name("Alien: "), "Alien");
+        // A hyphen that was always there is not a separator run and is
+        // left exactly as the poster wrote it.
+        assert_eq!(sanitize_name("Spider-Man: Homecoming"), "Spider-Man - Homecoming");
+        assert_eq!(sanitize_name("Mission Impossible - Fallout"), "Mission Impossible - Fallout");
+    }
+
+    /// The same guarantees through the real movie entry point, and a
+    /// legitimately-named release left byte-for-byte alone.
+    #[test]
+    fn movie_names_are_portable() {
+        let style = NameStyle { resolution: true, year_parens: true, ..Default::default() };
+        let name = |s: &str| movie_name(&p(s), &style);
+
+        assert_eq!(
+            name("Alien: Romulus 2024 1080p WEB-DL x264-GRP").as_deref(),
+            Some("Alien - Romulus (2024) 1080p")
+        );
+        // "CON (2024) 1080p" is not a device stem, but the title alone
+        // is - so the guard has to survive the whole build, not just the
+        // title. With no year and no quality facts movie_name declines
+        // anyway, which is the other half of the same safety.
+        assert_eq!(name("CON 2024 1080p x264-GRP").as_deref(), Some("CON (2024) 1080p"));
+        assert_eq!(name("CON"), None);
+        // Negative: an ordinary release is not reshaped by any of this.
+        assert_eq!(
+            name("The.Matrix.1999.1080p.BluRay.x264-AMIABLE").as_deref(),
+            Some("The Matrix (1999) 1080p")
+        );
+        // Whatever the shape, what comes out is a usable component.
+        for s in [".Hidden.2024.1080p", "Movie..2024.1080p", "CON.2024.1080p", "..2024.1080p"] {
+            if let Some(n) = name(s) {
+                assert!(!n.starts_with('.') && !n.ends_with('.'), "{s:?} -> {n:?}");
+                assert!(!n.ends_with(' '), "{s:?} -> {n:?}");
+                assert!(!n.is_empty());
+            }
+        }
+    }
+
+    /// A reversed stem has to land on EXACTLY the parse its forward form
+    /// would have given - a flip that recovers the resolution but drops
+    /// half the name is not a rescue.
+    #[test]
+    fn reversed_stems_parse_as_their_forward_form() {
+        let same = |fwd: &str| {
+            let want = p(fwd);
+            let backwards: String = fwd.chars().rev().collect();
+            let mut got = p(&backwards);
+            assert!(got.rescued, "not rescued: {backwards}");
+            got.rescued = want.rescued; // the only field that may differ
+            assert_eq!(format!("{got:?}"), format!("{want:?}"), "{backwards}");
+        };
+        same("Example.Movie.2024.1080p.x264-GRP");
+        same("Show.Name.S01E02.720p.HDTV.x264-GRP");
+        same("Show.Name.S01E012.2160p.WEB-DL.x265-GRP");
+        same("The.Big.Show.2024.480p.DVDRip.XviD-GRP");
+        // The shape as posted, group tag left forwards - the flip reads
+        // it as "PRG", which is what a whole-stem reversal can promise.
+        let m = p("GRP-462x.p0801.4202.eivoM.elpmaxE");
+        assert_eq!(m.title, "Example Movie");
+        assert_eq!(m.year, Some(2024));
+        assert_eq!(m.res.as_deref(), Some("1080p"));
+        assert!(m.rescued);
+    }
+
+    /// And the other half: an ordinary name is never flipped, and a
+    /// backwards-looking token alone is not enough to believe one.
+    #[test]
+    fn forward_names_are_never_reversed() {
+        for s in [
+            "The.Matrix.1999.1080p.BluRay.x264-AMIABLE",
+            "Show.S01E01.1080p.WEB-DL.DD5.1.H264-NTb",
+            "Frank Herbert - Dune 1965 epub",
+            "Formula1.2026.Round11.Hungary.Race.1080p-GRP",
+            // "p027" inside a word is not a token, so nothing triggers.
+            "Chapter.Mp027x.Notes",
+            "Series.Movies.Codeps.Notes",
+            // A real trigger token whose flip says nothing: the reversed
+            // "title" is the bare number 4202, so the flip is refused
+            // and the poster's own name stands.
+            "Chapter.p027.2024",
+        ] {
+            assert!(!p(s).rescued, "should not have flipped: {s}");
+        }
+        assert_eq!(p("The.Matrix.1999.1080p.BluRay.x264-AMIABLE").title, "The Matrix");
+        assert_eq!(p("Chapter.p027.2024").title, "Chapter p027");
+    }
+
+    /// A forward name that happens to carry ONE backwards-shaped token -
+    /// a page or catalog marker ("p027", "p0801"), an "NNeNNs" reference
+    /// - is still a forward name. Reversal keeps vowels, so the flipped
+    /// title reads as English too and the English test cannot tell the
+    /// two apart; these are the stems that flipped anyway and renamed a
+    /// legitimately-named file to "epaT 1080p".
+    #[test]
+    fn one_backwards_token_does_not_flip_a_forward_name() {
+        let style = NameStyle { resolution: true, ..Default::default() };
+        for s in [
+            // Only the marker flips, and one resolution is not two facts.
+            "Concert.Bootleg.p0801.Tape",
+            "Label.Sampler.p027.Promo",
+            // A forward YEAR, a forward SOURCE and a forward air date all
+            // say the stem already reads forwards.
+            "Christmas.p0801.Home.Movies.2019",
+            "Example.Movie.DVDRip-p0801",
+            "Podcast.p027.260721.Notes",
+            // Flips to S43E21: two fields, one token, and a season nobody
+            // has ever posted.
+            "Lecture.Notes.12e34s.Extra",
+        ] {
+            assert!(!p(s).rescued, "should not have flipped: {s}");
+        }
+        // Nothing to offer, so nothing is renamed - and the kind stays
+        // Movie rather than being demoted (see finalize_names).
+        let tape = p("Concert.Bootleg.p0801.Tape");
+        assert_eq!(tape.title, "Concert Bootleg p0801 Tape");
+        assert_eq!(movie_name(&tape, &style), None);
+        assert_eq!(p("Lecture.Notes.12e34s.Extra").kind, Kind::Movie);
+        // Where a name IS offered it is built from the poster's own
+        // words forwards, never "9102 seivoM emoH 1080p".
+        assert_eq!(
+            movie_name(&p("Christmas.p0801.Home.Movies.2019"), &style).as_deref(),
+            Some("Christmas p0801 Home Movies 2019")
+        );
+    }
+
+    /// A bare YYMMDD run is a daily show's whole identity, but six digits
+    /// are also how ids and part counts look - so it only reads as a date
+    /// when it validates AND nothing stronger already named the release.
+    #[test]
+    fn six_digit_datecodes_read_as_air_dates() {
+        let d = |s: &str| p(s).date;
+        let show = p("Show.Name.260721.1080p.WEB.x264-GRP");
+        assert_eq!(show.date.as_deref(), Some("20260721"));
+        assert_eq!(show.kind, Kind::Tv);
+        assert_eq!(show.title, "Show Name");
+        assert_eq!(show.year, None);
+        // Both conventions normalize to the same identity.
+        assert_eq!(d("Show.Name.260721.1080p.WEB.x264-GRP"),
+                   d("Show.Name.20260721.1080p.WEB.x264-GRP"));
+
+        // Not a date: month or day out of range, or a year that reads as
+        // decades away. The token is left alone as an ordinary word, and
+        // a release with no other TV evidence stays a Movie.
+        for s in [
+            "Show.Name.261321.1080p.WEB-GRP", // month 13
+            "Show.Name.260732.1080p.WEB-GRP", // day 32
+            "Show.Name.260021.1080p.WEB-GRP", // month 00
+            "Show.Name.260700.1080p.WEB-GRP", // day 00
+            "Show.Name.123456.1080p.WEB-GRP", // an id, not a date
+            "Show.Name.991231.1080p.WEB-GRP", // 2099 is not an air date
+        ] {
+            assert_eq!(d(s), None, "{s}");
+            assert_eq!(p(s).kind, Kind::Movie, "{s}");
+            assert!(p(s).title.contains(&s[10..16]), "{s} -> {}", p(s).title);
+        }
+
+        // Six digits that are part of an id are not a token at all.
+        for s in ["Show.Name.ID260721.1080p.WEB-GRP", "Show.Name.260721x.1080p.WEB-GRP"] {
+            assert_eq!(d(s), None, "{s}");
+        }
+        // …and neither is a leading run, which is the title.
+        assert_eq!(d("260721.1080p.WEB-GRP"), None);
+
+        // Stronger signals win outright: a four-digit year or an SxxEyy
+        // marker means the release is not naming its episode by day.
+        let m = p("Example.Movie.2024.260721.1080p.WEB-GRP");
+        assert_eq!(m.date, None);
+        assert_eq!(m.kind, Kind::Movie);
+        assert_eq!((m.title.as_str(), m.year), ("Example Movie", Some(2024)));
+        let t = p("Show.Name.S01E02.260721.1080p.WEB-GRP");
+        assert_eq!(t.date, None);
+        assert_eq!((t.season, t.episode), (Some(1), Some(2)));
+        // Eight digits stay unambiguous, so a year alongside is fine.
+        assert_eq!(d("Show.Name.2024.20260721.1080p.WEB-GRP").as_deref(), Some("20260721"));
+    }
+
 }

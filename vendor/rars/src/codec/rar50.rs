@@ -1470,6 +1470,12 @@ pub struct Unpack50Decoder {
     // a checkpoint can assert its truncate-based restore stayed valid).
     history: Vec<u8>,
     history_start: usize,
+    // Sparse zeroes logically in front of `history` from a streamed member
+    // whose output was (partly) emitted as unmaterialized zero runs - see
+    // `StreamingOutput::zero_prefix`. Carried so a solid member can still
+    // reference into a preceding all-zero member's output; reset whenever
+    // the bytes ahead of the retained window stop being provably zero.
+    history_zero_prefix: usize,
     history_compactions: u64,
     retain_history: bool,
     window_limit: usize,
@@ -1485,6 +1491,7 @@ pub struct Unpack50Decoder {
 #[cfg(feature = "parallel")]
 pub struct SolidStateSnapshot {
     window: Vec<u8>,
+    zero_prefix: usize,
     tables: Option<std::sync::Arc<DecodeTables>>,
     reps: [usize; 4],
     last_length: usize,
@@ -1502,6 +1509,7 @@ pub struct SolidCheckpoint {
     last_length: usize,
     history_start: usize,
     history_len: usize,
+    history_zero_prefix: usize,
     compactions: u64,
 }
 
@@ -1514,6 +1522,7 @@ impl Unpack50Decoder {
             last_length: 0,
             history: Vec::new(),
             history_start: 0,
+            history_zero_prefix: 0,
             history_compactions: 0,
             window_limit: usize::MAX,
             #[cfg(test)]
@@ -1538,6 +1547,11 @@ impl Unpack50Decoder {
     fn trim_history_to(&mut self, limit: usize) {
         if self.history_window_len() > limit {
             self.history_start = self.history.len() - limit;
+            // The dropped front bytes are no longer provably zero, so any
+            // carried sparse run behind them must be dropped with them.
+            // Nothing is lost: a window already at `limit` leaves no
+            // distance below the limit for the run to serve.
+            self.history_zero_prefix = 0;
         }
     }
 
@@ -1561,6 +1575,7 @@ impl Unpack50Decoder {
             last_length: self.last_length,
             history_start: self.history_start,
             history_len: self.history.len(),
+            history_zero_prefix: self.history_zero_prefix,
             compactions: self.history_compactions,
         }
     }
@@ -1575,6 +1590,7 @@ impl Unpack50Decoder {
         );
         self.history.truncate(cp.history_len);
         self.history_start = cp.history_start;
+        self.history_zero_prefix = cp.history_zero_prefix;
         self.tables = cp.tables.clone();
         self.reps = cp.reps;
         self.last_length = cp.last_length;
@@ -1876,6 +1892,9 @@ impl Unpack50Decoder {
                 if self.retain_history {
                     self.history = flat.into_history(history_limit);
                     self.history_start = 0;
+                    // Flat mode is gated to an empty window; everything the
+                    // next member can reach is materialized in `history`.
+                    self.history_zero_prefix = 0;
                 }
                 Ok(())
             } else {
@@ -1885,6 +1904,7 @@ impl Unpack50Decoder {
 
         let mut output = StreamingOutput::new(
             self.take_history_vec(),
+            std::mem::take(&mut self.history_zero_prefix),
             output_size,
             dictionary_size,
             history_limit,
@@ -1943,8 +1963,10 @@ impl Unpack50Decoder {
         if output.written() == output_size {
             output.finish(&mut sink)?;
             if self.retain_history {
-                self.history = output.into_history();
+                let (history, zero_prefix) = output.into_history();
+                self.history = history;
                 self.history_start = 0;
+                self.history_zero_prefix = zero_prefix;
             }
             Ok(())
         } else {
@@ -1988,8 +2010,14 @@ impl Unpack50Decoder {
         // fast path (wild copies, no ring masking, scan on its own thread)
         // - the same pipeline that put big non-solid members ahead of
         // unrar. Needs an empty window (group starts at the archive's
-        // first member); groups seeded mid-archive stream instead.
-        if self.history_window_len() == 0 && total_output_size as u64 <= flat_limit {
+        // first member); groups seeded mid-archive stream instead. A carried
+        // sparse zero run counts as window here: `FlatOutput` knows nothing
+        // of the run, so taking this path would silently drop it and reject
+        // any match reaching into it - the streaming path below honors it.
+        if self.history_window_len() == 0
+            && self.history_zero_prefix == 0
+            && total_output_size as u64 <= flat_limit
+        {
             let mut flat = FlatOutput::new(total_output_size, dictionary_size, history_limit);
             self.run_blocks_flat_chain(
                 first,
@@ -2004,6 +2032,9 @@ impl Unpack50Decoder {
                 if self.retain_history {
                     self.history = flat.into_history(history_limit);
                     self.history_start = 0;
+                    // Flat chains start on an empty window; everything the
+                    // next member can reach is materialized in `history`.
+                    self.history_zero_prefix = 0;
                 }
                 Ok(())
             } else {
@@ -2012,6 +2043,7 @@ impl Unpack50Decoder {
         }
         let mut output = StreamingOutput::new(
             self.take_history_vec(),
+            std::mem::take(&mut self.history_zero_prefix),
             total_output_size,
             dictionary_size,
             history_limit,
@@ -2027,8 +2059,10 @@ impl Unpack50Decoder {
         if output.written() == total_output_size {
             output.finish(&mut sink)?;
             if self.retain_history {
-                self.history = output.into_history();
+                let (history, zero_prefix) = output.into_history();
+                self.history = history;
                 self.history_start = 0;
+                self.history_zero_prefix = zero_prefix;
             }
             Ok(())
         } else {
@@ -2051,6 +2085,14 @@ impl Unpack50Decoder {
     pub fn snapshot_solid_state(&self) -> SolidStateSnapshot {
         SolidStateSnapshot {
             window: self.history_window().to_vec(),
+            // The window copy drops the dead front; a carried sparse zero
+            // run stays provably in front of it only when nothing live was
+            // dropped with the front.
+            zero_prefix: if self.history_start == 0 {
+                self.history_zero_prefix
+            } else {
+                0
+            },
             tables: self.tables.clone(),
             reps: self.reps,
             last_length: self.last_length,
@@ -2062,6 +2104,7 @@ impl Unpack50Decoder {
     pub fn restore_solid_state(&mut self, snapshot: SolidStateSnapshot) {
         self.history = snapshot.window;
         self.history_start = 0;
+        self.history_zero_prefix = snapshot.zero_prefix;
         // Any O(1) checkpoint taken before this restore is now stale.
         self.history_compactions += 1;
         self.tables = snapshot.tables;
@@ -2075,6 +2118,7 @@ impl Unpack50Decoder {
         self.last_length = 0;
         self.history.clear();
         self.history_start = 0;
+        self.history_zero_prefix = 0;
     }
 
     fn copy_match(
@@ -2090,7 +2134,17 @@ impl Unpack50Decoder {
                 "RAR 5 match distance exceeds dictionary",
             ));
         }
-        if distance == 0 || distance > self.history_window_len() + output.len() {
+        // The reachable window is the materialized history plus the sparse
+        // zero run logically in front of it (`history_zero_prefix`): a
+        // streamed all-zero solid member hands over a few bytes of window
+        // and a multi-MiB run, so counting only materialized bytes rejected
+        // valid archives here with "match distance exceeds window" whenever
+        // the NEXT member was small enough to route down this buffered path.
+        // The streaming twin (`StreamingOutput::copy_match`) accepts the
+        // same logical window.
+        let materialized = self.history_window_len() + output.len();
+        let logical_window = materialized.saturating_add(self.history_zero_prefix);
+        if distance == 0 || distance > logical_window {
             return Err(Error::InvalidData("RAR 5 match distance exceeds window"));
         }
         if output
@@ -2101,6 +2155,21 @@ impl Unpack50Decoder {
             return Err(Error::InvalidData("RAR 5 match exceeds output limit"));
         }
         let mut remaining = length;
+        if distance > materialized {
+            // The match starts inside the sparse run. Everything logically
+            // older than the materialized history is provably zero while the
+            // prefix is nonzero (see `history_zero_prefix`), so the run's
+            // share of the match is emitted as zeroes; each one closes the
+            // gap by a byte, and once it reaches zero the tail is the
+            // ordinary history/output copy below - overlapped matches
+            // included, since the emitted zeroes are real output bytes.
+            let zeroes = remaining.min(distance - materialized);
+            output.resize(output.len() + zeroes, 0);
+            remaining -= zeroes;
+            if remaining == 0 {
+                return Ok(());
+            }
+        }
         // Head of the match that reaches back into carried-over history.
         while remaining != 0 && distance > output.len() {
             let window = self.history_window();
@@ -2132,7 +2201,8 @@ impl Unpack50Decoder {
 /// match copies are chunked `copy_within` calls instead of per-byte deque
 /// probes. Sparse zero runs are NOT materialized (only reported to the
 /// sink as `Repeated`), mirroring the previous implementation: `head`
-/// tracks materialized bytes, `written` tracks logical output.
+/// tracks materialized bytes, `written` tracks logical output, and
+/// `zero_prefix` counts the sparse zeroes so matches may still reach them.
 /// A declared filter waiting for its range to materialize in the ring.
 /// `filter.start` is the member-output ("file") position; `ring_start` is
 /// the same position in materialized-byte space (the two differ by however
@@ -2154,6 +2224,15 @@ struct StreamingOutput {
     dictionary_size: usize,
     history_limit: usize,
     all_zero: bool,
+    // Logical zeroes emitted as sparse `Repeated` runs and never
+    // materialized, plus any such run carried in from an earlier solid
+    // member. Sparse runs are only ever taken while `all_zero` holds, so
+    // whenever this is nonzero every logical byte older than the ring's
+    // materialized content is provably zero - which is what lets
+    // `copy_match` accept a distance reaching past `window_len()` into the
+    // run instead of rejecting a valid archive with "match distance exceeds
+    // window" after a long leading zero run or an all-zero solid member.
+    zero_prefix: usize,
     // Once a filter is seen, every ring growth reserves filter hold-back
     // headroom (see `reserve`); most members never declare one.
     has_filters: bool,
@@ -2165,6 +2244,7 @@ struct StreamingOutput {
 impl StreamingOutput {
     fn new(
         history: Vec<u8>,
+        zero_prefix: usize,
         output_limit: usize,
         dictionary_size: usize,
         history_limit: usize,
@@ -2188,6 +2268,7 @@ impl StreamingOutput {
         ring[..history.len()].copy_from_slice(&history);
         Self {
             all_zero: history.iter().all(|&byte| byte == 0),
+            zero_prefix,
             mask: capacity - 1,
             head: history.len(),
             flushed: history.len(),
@@ -2480,6 +2561,11 @@ impl StreamingOutput {
             self.ring[0] = 0;
             self.head = 1;
             self.flushed = 1;
+            // The seed materializes one of the run's zeroes; the rest of the
+            // run stays logical-only and is accounted for below.
+            self.zero_prefix += count.saturating_sub(1);
+        } else {
+            self.zero_prefix += count;
         }
         Ok(())
     }
@@ -2503,10 +2589,17 @@ impl StreamingOutput {
             }
             .into());
         }
-        if self.all_zero && distance <= self.written + self.flushed.min(self.history_limit) {
+        // The reachable window is the materialized ring PLUS the sparse zero
+        // run logically in front of it: those bytes were emitted as
+        // `Repeated` zeroes and never stored, so `window_len()` alone
+        // under-counts what a valid archive may reference (a member opening
+        // with a multi-MiB zero run, or one following an all-zero solid
+        // member, was rejected here with "match distance exceeds window").
+        let logical_window = self.window_len().saturating_add(self.zero_prefix);
+        if self.all_zero && distance <= logical_window {
             return self.push_zeroes(length, sink);
         }
-        if distance == 0 || distance > self.window_len() {
+        if distance == 0 || distance > logical_window {
             return Err(Error::InvalidData("RAR 5 match distance exceeds window").into());
         }
         if self
@@ -2515,6 +2608,25 @@ impl StreamingOutput {
             .is_none_or(|end| end > self.output_limit)
         {
             return Err(Error::InvalidData("RAR 5 match exceeds output limit").into());
+        }
+        let mut length = length;
+        let window = self.window_len();
+        if distance > window {
+            // The match starts inside the sparse zero run. Everything
+            // logically older than the ring's content is zero while
+            // `zero_prefix` is nonzero (see the field), so the head of the
+            // match emits zeroes - MATERIALIZED, via push_repeated, so ring
+            // positions stay aligned with logical positions for the tail
+            // copy and for every later reference. Once the run's share is
+            // emitted the window has grown to exactly `distance`, and the
+            // tail (window bytes, then period-`distance` repetition for
+            // overlapped matches) is the ordinary ring copy below.
+            let zeroes = length.min(distance - window);
+            self.push_repeated(0, zeroes, sink)?;
+            length -= zeroes;
+            if length == 0 {
+                return Ok(());
+            }
         }
         if distance == 1 {
             let byte = self.ring[(self.head - 1) & self.mask];
@@ -2673,8 +2785,26 @@ impl StreamingOutput {
         Ok(())
     }
 
-    fn into_history(self) -> Vec<u8> {
+    /// The retained window, plus the count of sparse zeroes logically in
+    /// front of it for the next solid member to keep honoring (an all-zero
+    /// streamed member materializes almost nothing, so the window alone
+    /// would shrink the next member's reachable history to a few bytes).
+    fn into_history(self) -> (Vec<u8>, usize) {
         let keep = self.flushed.min(self.history_limit).min(self.head);
+        // The carried count is only meaningful while every logical byte
+        // older than the returned bytes is provably zero. Truncation drops
+        // materialized bytes ahead of the run, so it keeps that true only
+        // when the whole stream was zero (`all_zero`, where the dropped
+        // bytes join the run); otherwise the run must be dropped rather
+        // than guessed at - 0 is always safe, it merely narrows the next
+        // member's accepted distances back to the ring itself.
+        let zero_prefix = if self.all_zero {
+            self.zero_prefix + (self.head - keep)
+        } else if keep == self.head {
+            self.zero_prefix
+        } else {
+            0
+        };
         let mut history = Vec::with_capacity(keep);
         let mut pos = self.head - keep;
         while pos < self.head {
@@ -2683,7 +2813,7 @@ impl StreamingOutput {
             history.extend_from_slice(&self.ring[offset..offset + len]);
             pos += len;
         }
-        history
+        (history, zero_prefix)
     }
 }
 
@@ -5600,11 +5730,434 @@ mod tests {
             filter_type: FilterType::E8,
             channels: 0,
         };
-        let mut output = StreamingOutput::new(Vec::new(), 1 << 20, 1 << 20, 1 << 20);
+        let mut output = StreamingOutput::new(Vec::new(), 0, 1 << 20, 1 << 20, 1 << 20);
         let error = output
             .add_filter::<std::convert::Infallible>(filter)
             .unwrap_err();
         assert!(matches!(error, StreamDecodeError::FilteredMember));
+    }
+
+    /// Byte-at-a-time LZ reference: `out[i] = out[len - distance + i]`,
+    /// overlap included - the semantics every copy path must reproduce.
+    fn reference_extend(stream: &mut Vec<u8>, distance: usize, length: usize) {
+        for _ in 0..length {
+            let byte = stream[stream.len() - distance];
+            stream.push(byte);
+        }
+    }
+
+    #[test]
+    fn streaming_zero_run_back_references_resolve_within_a_member() {
+        // A streamed member OPENING with a multi-MiB zero run keeps the run
+        // sparse: `Repeated` chunks, nothing materialized. A later match may
+        // legally reach back into that run - the window is logical output,
+        // not ring bytes - and used to be rejected with "match distance
+        // exceeds window" once any nonzero byte had landed. Ops are hand-fed
+        // because the encoder never chooses such distances on its own (its
+        // match finder always has a nearer zero to point at); real WinRAR
+        // streams can and do.
+        let dict = 32 << 20;
+        let mut output = StreamingOutput::new(Vec::new(), 0, 64 << 20, dict, dict);
+        let mut expected: Vec<u8> = Vec::new();
+        let mut decoded: Vec<u8> = Vec::new();
+        let mut sink = |chunk: DecodedChunk<'_>| {
+            match chunk {
+                DecodedChunk::Bytes(bytes) => decoded.extend_from_slice(bytes),
+                DecodedChunk::Repeated { byte, len } => {
+                    decoded.resize(decoded.len() + len, byte)
+                }
+            }
+            Ok::<_, std::convert::Infallible>(())
+        };
+
+        output.push(0, &mut sink).unwrap();
+        expected.push(0);
+        output.copy_match(1, 6 << 20, &mut sink).unwrap();
+        reference_extend(&mut expected, 1, 6 << 20);
+        assert!(
+            output.head < 64 * 1024,
+            "the leading zero run must stay sparse, not materialize"
+        );
+
+        for index in 0..8192u32 {
+            let byte = (index % 251) as u8 + 1;
+            output.push(byte, &mut sink).unwrap();
+            expected.push(byte);
+        }
+
+        // Wholly inside the zero run.
+        output.copy_match(5 << 20, 100_000, &mut sink).unwrap();
+        reference_extend(&mut expected, 5 << 20, 100_000);
+        // Straddling the run into materialized bytes.
+        let deep = output.window_len() + 1000;
+        output.copy_match(deep, 5000, &mut sink).unwrap();
+        reference_extend(&mut expected, deep, 5000);
+        // Overlapped (length > distance) across the run boundary: the
+        // output must repeat with period `distance`, zeroes included.
+        let deep = output.window_len() + 640;
+        output.copy_match(deep, 3 * deep + 100, &mut sink).unwrap();
+        reference_extend(&mut expected, deep, 3 * deep + 100);
+        // Past the logical window is still corruption, loudly.
+        let over = output.window_len() + output.zero_prefix + 1;
+        assert!(output.copy_match(over, 16, &mut sink).is_err());
+
+        output.finish(&mut sink).unwrap();
+        drop(sink);
+        assert_eq!(decoded.len(), expected.len());
+        assert!(
+            decoded == expected,
+            "streamed bytes diverge from the LZ reference"
+        );
+    }
+
+    #[test]
+    fn streaming_all_zero_member_carries_its_run_to_the_next_solid_member() {
+        // An all-zero streamed member materializes almost nothing, so the
+        // window it hands the next solid member is a few bytes. References
+        // into the zero output used to fail there with "match distance
+        // exceeds window"; the sparse run now travels with the history.
+        let dict = 32 << 20;
+        let total = 8 << 20;
+        let mut first = StreamingOutput::new(Vec::new(), 0, total, dict, dict);
+        let mut first_len = 0usize;
+        let mut first_nonzero = false;
+        {
+            let mut sink = |chunk: DecodedChunk<'_>| {
+                match chunk {
+                    DecodedChunk::Bytes(bytes) => {
+                        first_len += bytes.len();
+                        first_nonzero |= bytes.iter().any(|&byte| byte != 0);
+                    }
+                    DecodedChunk::Repeated { byte, len } => {
+                        first_len += len;
+                        first_nonzero |= byte != 0 && len != 0;
+                    }
+                }
+                Ok::<_, std::convert::Infallible>(())
+            };
+            first.push(0, &mut sink).unwrap();
+            first.copy_match(1, total - 1, &mut sink).unwrap();
+            first.finish(&mut sink).unwrap();
+        }
+        assert_eq!(first_len, total);
+        assert!(!first_nonzero);
+        let (history, zero_prefix) = first.into_history();
+        assert!(
+            history.len() < 4096,
+            "an all-zero member must carry a few bytes, not its output"
+        );
+        assert_eq!(
+            history.len() + zero_prefix,
+            total,
+            "the sparse run must be carried, not lost"
+        );
+
+        // The whole logical stream so far seeds the reference model.
+        let mut expected = vec![0u8; total];
+        let start = expected.len();
+        let mut second = StreamingOutput::new(history, zero_prefix, 8 << 20, dict, dict);
+        let mut decoded: Vec<u8> = Vec::new();
+        let mut sink = |chunk: DecodedChunk<'_>| {
+            match chunk {
+                DecodedChunk::Bytes(bytes) => decoded.extend_from_slice(bytes),
+                DecodedChunk::Repeated { byte, len } => {
+                    decoded.resize(decoded.len() + len, byte)
+                }
+            }
+            Ok::<_, std::convert::Infallible>(())
+        };
+        // Deep into the previous member's zeroes - the false rejection.
+        second.copy_match(4 << 20, 4096, &mut sink).unwrap();
+        reference_extend(&mut expected, 4 << 20, 4096);
+        for index in 0..4096u32 {
+            let byte = (index % 250) as u8 + 1;
+            second.push(byte, &mut sink).unwrap();
+            expected.push(byte);
+        }
+        second.copy_match(6 << 20, 8192, &mut sink).unwrap();
+        reference_extend(&mut expected, 6 << 20, 8192);
+        let deep = second.window_len() + 512;
+        second.copy_match(deep, 2048, &mut sink).unwrap();
+        reference_extend(&mut expected, deep, 2048);
+        second.finish(&mut sink).unwrap();
+        drop(sink);
+        assert!(
+            decoded.as_slice() == &expected[start..],
+            "solid continuation diverges from the LZ reference"
+        );
+    }
+
+    #[test]
+    fn solid_member_after_an_all_zero_streamed_member_decodes() {
+        // The end-to-end shape extract takes: a large all-zero member goes
+        // down the streaming path (its output stays sparse), then a solid
+        // member decodes against that history. Byte equality here is what
+        // the extract layer's CRC check would enforce.
+        let first = vec![0u8; 8 << 20];
+        let mut second = vec![0u8; 96 * 1024];
+        let mut state = 0x5EEDu64;
+        while second.len() < 160 * 1024 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            second.extend_from_slice(&(state >> 24).to_le_bytes());
+        }
+        let m1 = encode_lz_member(&first, 0).unwrap();
+        let m2 = encode_lz_member_with_history(&second, &first, 0).unwrap();
+
+        let dict = 32 << 20;
+        let mut decoder = Unpack50Decoder::new();
+        let mut decoded_first = Vec::new();
+        decoder
+            .decode_member_from_reader_with_dictionary_to_sink(
+                &mut m1.as_slice(),
+                0,
+                first.len(),
+                dict,
+                false,
+                0, // flat_limit 0: keep the member on the streaming path
+                |chunk| {
+                    match chunk {
+                        DecodedChunk::Bytes(bytes) => decoded_first.extend_from_slice(bytes),
+                        DecodedChunk::Repeated { byte, len } => {
+                            decoded_first.resize(decoded_first.len() + len, byte)
+                        }
+                    }
+                    Ok::<_, std::convert::Infallible>(())
+                },
+            )
+            .unwrap();
+        assert!(decoded_first == first);
+        assert!(
+            decoder.history.len() < 64 * 1024,
+            "an all-zero member's window must stay sparse end to end"
+        );
+        assert_eq!(
+            decoder.history.len() + decoder.history_zero_prefix,
+            first.len(),
+            "the sparse run must be carried into the solid window"
+        );
+
+        let mut decoded_second = Vec::new();
+        decoder
+            .decode_member_from_reader_with_dictionary_to_sink(
+                &mut m2.as_slice(),
+                0,
+                second.len(),
+                dict,
+                true,
+                0,
+                |chunk| {
+                    match chunk {
+                        DecodedChunk::Bytes(bytes) => decoded_second.extend_from_slice(bytes),
+                        DecodedChunk::Repeated { byte, len } => {
+                            decoded_second.resize(decoded_second.len() + len, byte)
+                        }
+                    }
+                    Ok::<_, std::convert::Infallible>(())
+                },
+            )
+            .unwrap();
+        assert!(
+            decoded_second == second,
+            "a solid member after an all-zero member must decode"
+        );
+    }
+
+    /// Streams one all-zero member through the real member path, leaving the
+    /// decoder holding a few materialized bytes and a carried sparse run -
+    /// the state every carried-zero-run test below starts from.
+    fn decoder_after_streamed_zero_member(size: usize, dict: usize) -> Unpack50Decoder {
+        let member = encode_lz_member(&vec![0u8; size], 0).unwrap();
+        let mut decoder = Unpack50Decoder::new();
+        let mut decoded = 0usize;
+        decoder
+            .decode_member_from_reader_with_dictionary_to_sink(
+                &mut member.as_slice(),
+                0,
+                size,
+                dict,
+                false,
+                0, // flat_limit 0: keep the member on the streaming path
+                |chunk| {
+                    decoded += match chunk {
+                        DecodedChunk::Bytes(bytes) => bytes.len(),
+                        DecodedChunk::Repeated { len, .. } => len,
+                    };
+                    Ok::<_, std::convert::Infallible>(())
+                },
+            )
+            .unwrap();
+        assert_eq!(decoded, size);
+        assert!(
+            decoder.history.len() < 64 * 1024,
+            "the zero member's window must stay sparse"
+        );
+        assert_eq!(
+            decoder.history.len() + decoder.history_zero_prefix,
+            size,
+            "the sparse run must be carried into the solid window"
+        );
+        decoder
+    }
+
+    #[test]
+    fn buffered_solid_member_after_an_all_zero_streamed_member_decodes() {
+        // The same end-to-end shape as the streaming test above, except the
+        // second member is SMALL - at the extract layer anything under the
+        // buffered ceiling routes through `decode_member_from_reader_with_
+        // dictionary` (the Vec-output path), whose window gate ignored the
+        // carried sparse run and rejected this valid chain with "match
+        // distance exceeds window". The failure depended only on member B's
+        // size: the >4 MiB variant streamed and extracted fine.
+        let first = vec![0u8; 8 << 20];
+        let mut second = vec![0u8; 96 * 1024];
+        let mut state = 0x5EEDu64;
+        while second.len() < 160 * 1024 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            second.extend_from_slice(&(state >> 24).to_le_bytes());
+        }
+        let m2 = encode_lz_member_with_history(&second, &first, 0).unwrap();
+
+        let dict = 32 << 20;
+        let mut decoder = decoder_after_streamed_zero_member(first.len(), dict);
+        let decoded_second = decoder
+            .decode_member_from_reader_with_dictionary(
+                &mut m2.as_slice(),
+                0,
+                second.len(),
+                dict,
+                true,
+                DecodeMode::Lz,
+            )
+            .unwrap();
+        assert!(
+            decoded_second == second,
+            "a buffered solid member after an all-zero member must decode"
+        );
+    }
+
+    #[test]
+    fn buffered_copy_match_reaches_into_a_carried_zero_run() {
+        // The buffered mirror of `streaming_zero_run_back_references_resolve
+        // _within_a_member`: deep distances hand-fed straight into the
+        // buffered decoder's `copy_match`, because the encoder never chooses
+        // such distances on its own (its match finder always has a nearer
+        // zero to point at); real WinRAR streams can and do. The decoder
+        // state comes from a real streamed member, not from field surgery.
+        let total = 8 << 20;
+        let dict = 32 << 20;
+        let decoder = decoder_after_streamed_zero_member(total, dict);
+
+        // Reference model: the whole logical stream so far is zeroes.
+        let mut expected = vec![0u8; total];
+        let start = expected.len();
+        let mut output: Vec<u8> = Vec::new();
+        let limit = 16 << 20;
+
+        for index in 0..4096u32 {
+            let byte = (index % 251) as u8 + 1;
+            output.push(byte);
+            expected.push(byte);
+        }
+        let window = decoder.history_window_len();
+        // Wholly inside the carried zero run.
+        decoder
+            .copy_match(&mut output, 5 << 20, 100_000, limit, dict)
+            .unwrap();
+        reference_extend(&mut expected, 5 << 20, 100_000);
+        // Straddling the run into materialized bytes.
+        let deep = window + output.len() + 1000;
+        decoder
+            .copy_match(&mut output, deep, 5000, limit, dict)
+            .unwrap();
+        reference_extend(&mut expected, deep, 5000);
+        // Overlapped (length > distance) across the run boundary: the output
+        // must repeat with period `distance`, zeroes included.
+        let deep = window + output.len() + 640;
+        decoder
+            .copy_match(&mut output, deep, 3 * deep + 100, limit, dict)
+            .unwrap();
+        reference_extend(&mut expected, deep, 3 * deep + 100);
+        // Past the logical window is still corruption, loudly.
+        let over = window + decoder.history_zero_prefix + output.len() + 1;
+        assert!(decoder
+            .copy_match(&mut output.clone(), over, 16, limit, dict)
+            .is_err());
+
+        assert_eq!(output.len(), expected.len() - start);
+        assert!(
+            output.as_slice() == &expected[start..],
+            "buffered bytes diverge from the LZ reference"
+        );
+    }
+
+    #[test]
+    fn carried_zero_run_survives_a_buffered_member_into_a_streamed_member() {
+        // The buffered->streamed direction: a streamed all-zero member, then
+        // a small buffered solid member, then a large streamed solid member.
+        // The buffered member appends its output to the history it was
+        // handed, and the (window, zero_prefix) pair has to stay consistent
+        // through that hand-off so the third member's ring is seeded with
+        // the run still logically in front of it.
+        let first = vec![0u8; 8 << 20];
+        let mut second = vec![0u8; 32 * 1024];
+        let mut state = 0xB0BAu64;
+        while second.len() < 64 * 1024 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            second.extend_from_slice(&(state >> 24).to_le_bytes());
+        }
+        let mut history = first.clone();
+        history.extend_from_slice(&second);
+        let mut third = vec![0u8; 48 * 1024];
+        while third.len() < 128 * 1024 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            third.extend_from_slice(&(state >> 24).to_le_bytes());
+        }
+        let m2 = encode_lz_member_with_history(&second, &first, 0).unwrap();
+        let m3 = encode_lz_member_with_history(&third, &history, 0).unwrap();
+
+        let dict = 32 << 20;
+        let mut decoder = decoder_after_streamed_zero_member(first.len(), dict);
+        let decoded_second = decoder
+            .decode_member_from_reader_with_dictionary(
+                &mut m2.as_slice(),
+                0,
+                second.len(),
+                dict,
+                true,
+                DecodeMode::Lz,
+            )
+            .unwrap();
+        assert!(decoded_second == second);
+        assert_eq!(
+            decoder.history_window_len() + decoder.history_zero_prefix,
+            first.len() + second.len(),
+            "the buffered member must extend the window without dropping the run"
+        );
+
+        let mut decoded_third = Vec::new();
+        decoder
+            .decode_member_from_reader_with_dictionary_to_sink(
+                &mut m3.as_slice(),
+                0,
+                third.len(),
+                dict,
+                true,
+                0,
+                |chunk| {
+                    match chunk {
+                        DecodedChunk::Bytes(bytes) => decoded_third.extend_from_slice(bytes),
+                        DecodedChunk::Repeated { byte, len } => {
+                            decoded_third.resize(decoded_third.len() + len, byte)
+                        }
+                    }
+                    Ok::<_, std::convert::Infallible>(())
+                },
+            )
+            .unwrap();
+        assert!(
+            decoded_third == third,
+            "a streamed member after a buffered one must still see the run"
+        );
     }
 
     #[test]

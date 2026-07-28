@@ -237,6 +237,12 @@ async fn seeded_ledger_drives_browse_verdicts() {
     let cfg = dir.join("config.json");
     std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
         .unwrap();
+    // The availability ledger is a table in the index database, which
+    // the daemon refuses to open while the built-in indexer's master
+    // switch is off (its default). This test seeds that database and
+    // then reads verdicts back through browse, so it is the switched-on
+    // case; settings.json lives beside the config file.
+    std::fs::write(cfg.with_file_name("settings.json"), "{\"index_enabled\": true}").unwrap();
     let d = serve(&dir, |port| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
         // The daemon mints an API key on a genuinely first run (see

@@ -139,6 +139,17 @@ struct Daemon {
 /// `build` is handed the port to serve on and returns the fully
 /// configured command; it may be called again on a fresh port, so it must
 /// not consume anything.
+/// Mark a scratch install as having the built-in indexer switched on.
+///
+/// The switch defaults OFF, and while it is off the daemon will not even
+/// open the index database - so every wall, browse and watchlist route
+/// answers empty. This whole file drives those routes over a seeded
+/// database, so it is the switched-on case. settings.json lives beside
+/// the config file.
+fn index_enabled(cfg: &Path) {
+    std::fs::write(cfg.with_file_name("settings.json"), "{\"index_enabled\": true}").unwrap();
+}
+
 async fn serve(dir: &Path, build: impl Fn(u16) -> Command) -> Daemon {
     for attempt in 0..3 {
         let port = free_port();
@@ -244,6 +255,7 @@ async fn wall_groups_dedupes_and_serves() {
     let cfg = dir.join("config.json");
     std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
         .unwrap();
+    index_enabled(&cfg);
     let d = serve(&dir, |port| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
         // The daemon mints an API key on a genuinely first run (see
@@ -504,6 +516,7 @@ async fn watchlist_grabs_for_a_user_category() {
     let cfg = dir.join("config.json");
     std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
         .unwrap();
+    index_enabled(&cfg);
     let d = serve(&dir, |port| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
         c.env("NZBFAST_OPEN", "1")
@@ -647,6 +660,7 @@ async fn wall_arrivals_and_expanded_rows_answer_the_page_honestly() {
     let cfg = dir.join("config.json");
     std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
         .unwrap();
+    index_enabled(&cfg);
     let d = serve(&dir, |port| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
         c.env("NZBFAST_OPEN", "1")
@@ -775,6 +789,7 @@ async fn a_grab_names_the_job_from_the_index_however_deep_the_row_is() {
     let cfg = dir.join("config.json");
     std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
         .unwrap();
+    index_enabled(&cfg);
     let d = serve(&dir, |port| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
         c.env("NZBFAST_OPEN", "1")

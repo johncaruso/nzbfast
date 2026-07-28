@@ -420,6 +420,17 @@ fn read_chunk_at(
     {
         return Err(RecoveryError::BadRecoveryChunk.into());
     }
+    // Shard counts past the reconstruction cap describe a grid no plan can
+    // ever act on (`StripeRepairPlan::new` refuses them too), so a record
+    // declaring one dies here at scan time instead of surviving to sizing.
+    // Real WinRAR writes at most 200 data shards; the cap leaves a wide
+    // margin above that while keeping a crafted u16 declaration from asking
+    // for a 32k x 32k encoder matrix per damaged group.
+    if data_shards > rar5::MAX_RECONSTRUCTION_SHARDS as u64
+        || recovery_shards > rar5::MAX_RECONSTRUCTION_SHARDS as u64
+    {
+        return Err(RecoveryError::BadRecoveryChunk.into());
+    }
     // The plan the record DECLARES must be one the format's own arithmetic
     // could have produced: `group_count = ceil(protected/data_shards)`
     // rounded up to even, whose capacity always lands inside
@@ -1125,5 +1136,44 @@ mod tests {
         let stripe = repair.stripe_len_for_budget(16 << 20).unwrap();
         assert!(repair.working_bytes(stripe) <= 16 << 20);
         assert!(stripe < plan.group_count as usize);
+    }
+
+    #[test]
+    fn scan_rejects_a_record_declaring_a_wire_scale_grid() {
+        // A record declares its shard counts as u16s, and everything else
+        // about this one is internally consistent - sizes, version bytes,
+        // capacity arithmetic, CRC64. The only thing wrong with it is a
+        // 32767 x 32768 grid, which no plan may ever be sized from: the scan
+        // has to drop the record, not carry it to the repair.
+        let data_shards: u64 = 32_767;
+        let recovery_shards: u64 = 32_768;
+        let group_count: u64 = 2;
+        let header_size = CHUNK_FIXED_HEADER + data_shards * 8;
+        let total_size = header_size + group_count;
+        let protected_size = data_shards * group_count;
+        let shard_size = header_size + group_count;
+
+        let mut record = vec![0u8; total_size as usize];
+        record[..4].copy_from_slice(b"{RB}");
+        record[0x0c..0x10].copy_from_slice(&(total_size as u32).to_le_bytes());
+        record[0x10..0x14].copy_from_slice(&(header_size as u32).to_le_bytes());
+        record[0x14] = 1;
+        record[0x15] = 1;
+        record[0x22..0x2a].copy_from_slice(&protected_size.to_le_bytes());
+        record[0x2a..0x32].copy_from_slice(&group_count.to_le_bytes());
+        record[0x32..0x3a].copy_from_slice(&shard_size.to_le_bytes());
+        record[0x3a..0x3c].copy_from_slice(&(data_shards as u16).to_le_bytes());
+        record[0x3c..0x3e].copy_from_slice(&(recovery_shards as u16).to_le_bytes());
+        let crc = crc64_update(&record[0x0c..], CRC64_XZ_SEED) ^ CRC64_XZ_SEED;
+        record[0x04..0x0c].copy_from_slice(&crc.to_le_bytes());
+
+        let mut archive = vec![0u8; protected_size as usize];
+        archive.extend_from_slice(&record);
+        let source = MemorySource(archive);
+
+        assert!(
+            scan_inline_recovery_chunks(&source, 1 << 20).is_err(),
+            "a wire-scale shard grid must not scan as a recovery set"
+        );
     }
 }

@@ -66,6 +66,65 @@ fn select_server(cfg: &Config, wanted: &str) -> Result<ServerConfig> {
     }
 }
 
+/// Persist a retrieval index, never on top of someone else's file.
+/// Normally the claim taken before the upload is still ours - the EMPTY file
+/// this run created - and the index goes straight into it. If it has been
+/// moved or removed underneath us, or something with bytes in it now sits
+/// there, the index lands under a name only this process holds: whatever is
+/// at the claim path is another run's only record of its own articles, and
+/// truncating it would strand them. A write that fails at the claim falls
+/// back to that unique name too, so one bad write cannot lose the index.
+fn write_rescue(claim: &std::path::Path, xml: &str) -> std::io::Result<PathBuf> {
+    // Write THROUGH the claim only while it is still empty, and check the
+    // length on the open handle rather than the path, so the file we measure
+    // is the file we write.
+    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(claim) {
+        if f.metadata().is_ok_and(|m| m.len() == 0) {
+            use std::io::Write;
+            match f.write_all(xml.as_bytes()) {
+                Ok(()) => return Ok(claim.to_path_buf()),
+                // A half-written claim reads exactly like an earlier run's
+                // rescue index, and the next run would tell the operator to
+                // publish it. Put it back to the empty claim it was, then
+                // try a name of our own.
+                Err(_) => {
+                    let _ = f.set_len(0);
+                }
+            }
+        }
+    }
+    let alt = |suffix: String| -> PathBuf {
+        let mut p = claim.to_path_buf().into_os_string();
+        p.push(suffix);
+        PathBuf::from(p)
+    };
+    let pid = std::process::id();
+    let mut last = std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free rescue name");
+    for n in 0..16 {
+        let path = alt(if n == 0 { format!(".{pid}") } else { format!(".{pid}.{n}") });
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut f) => {
+                use std::io::Write;
+                f.write_all(xml.as_bytes())?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = e,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last)
+}
+
+/// Give back the exclusive claim this run took, so a rerun is not blocked by
+/// a file that holds nothing. Best effort, and ONLY while the claim is still
+/// the empty file we created: bytes at that path are a retrieval index (ours,
+/// or another run's after an exotic interleaving) and are never removed.
+fn release_empty_claim(claim: &std::path::Path) {
+    if std::fs::metadata(claim).is_ok_and(|m| m.len() == 0) {
+        let _ = std::fs::remove_file(claim);
+    }
+}
+
 pub async fn run(config: &PathBuf, args: PostArgs) -> Result<()> {
     anyhow::ensure!(
         !args.post_server.trim().is_empty(),
@@ -82,10 +141,10 @@ pub async fn run(config: &PathBuf, args: PostArgs) -> Result<()> {
     // Validate the NZB destination BEFORE posting. Every article is uploaded
     // with a fresh RANDOM Message-ID whose only retrieval index is this NZB,
     // so a write that fails AFTER the upload orphans the whole post. Reject a
-    // directory or a missing parent now, prove writability with a temp file
-    // in the destination directory, and post into that temp - the real
-    // destination is only (atomically) replaced once every upload succeeds,
-    // so an existing NZB is never truncated on a failed run.
+    // directory or a missing parent now, then CLAIM a temp file in the
+    // destination directory (exclusive create - see below) and post into that
+    // temp - the real destination is only (atomically) replaced once every
+    // upload succeeds, so an existing NZB is never truncated on a failed run.
     if args.nzb.is_dir() {
         anyhow::bail!("--nzb {} is a directory, not a file", args.nzb.display());
     }
@@ -104,24 +163,46 @@ pub async fn run(config: &PathBuf, args: PostArgs) -> Result<()> {
         t.push(".nzbtmp");
         PathBuf::from(t)
     };
-    // Write-probe: prove the destination is writable before a single byte is
-    // uploaded. A NON-EMPTY temp already sitting there is the rescue index of
-    // an earlier run - one that uploaded fine but failed to publish, or one
-    // that aborted partway with articles already accepted. Either way those
-    // articles are on the server under randomly generated Message-IDs, and
-    // that file is the only record of them. Truncating it here (File::create
-    // truncates) would strand them permanently, so refuse instead.
-    if std::fs::metadata(&nzb_tmp).is_ok_and(|m| m.len() > 0) {
-        anyhow::bail!(
-            "{} already holds the retrieval index of a previous upload that \
-             did not publish - rename it to {} (or move it aside) before \
-             posting again",
-            nzb_tmp.display(),
-            args.nzb.display()
-        );
+    // Exclusive claim: prove the destination is writable before a single byte
+    // is uploaded, AND make the temp this run's alone. The claim has to be
+    // create_new (O_EXCL) rather than a probe-then-create, for two reasons.
+    //
+    // A NON-EMPTY temp already sitting there is the rescue index of an earlier
+    // run - one that uploaded fine but failed to publish, or one that aborted
+    // partway with articles already accepted. Either way those articles are on
+    // the server under randomly generated Message-IDs, and that file is the
+    // only record of them; a truncating create would strand them permanently.
+    //
+    // And the temp path is derived purely from --nzb, so two concurrent posts
+    // to the same destination share it. Without the exclusive claim both would
+    // upload their own articles and both would rename onto the destination,
+    // the loser's Message-IDs losing their only index. The claim makes the
+    // second run stop here, before it posts anything.
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&nzb_tmp) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            if std::fs::metadata(&nzb_tmp).is_ok_and(|m| m.len() > 0) {
+                anyhow::bail!(
+                    "{} already holds the retrieval index of a previous upload that \
+                     did not publish - rename it to {} (or move it aside) before \
+                     posting again",
+                    nzb_tmp.display(),
+                    args.nzb.display()
+                );
+            }
+            anyhow::bail!(
+                "{} is already claimed - another `nzbfast post` is probably writing \
+                 {} right now (post elsewhere with --nzb), or the claim is stale and \
+                 can be deleted",
+                nzb_tmp.display(),
+                args.nzb.display()
+            );
+        }
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("cannot write NZB next to {}", args.nzb.display()));
+        }
     }
-    std::fs::File::create(&nzb_tmp)
-        .with_context(|| format!("cannot write NZB next to {}", args.nzb.display()))?;
 
     // The confirmation block: exactly which server, and what will happen.
     println!(
@@ -172,18 +253,18 @@ pub async fn run(config: &PathBuf, args: PostArgs) -> Result<()> {
             println!(
                 "[post] ABORTED - {n} articles were accepted or duplicate-reported by the server."
             );
-            match std::fs::write(&nzb_tmp, &rescue) {
-                Ok(()) => {
+            match write_rescue(&nzb_tmp, &rescue) {
+                Ok(at) => {
                     println!(
                         "[post] their Message-IDs are in {} - rename it to {} to use it, \
                          or delete it once you no longer need the record.",
-                        nzb_tmp.display(),
+                        at.display(),
                         args.nzb.display()
                     );
                     anyhow::bail!(
                         "posting failed: {message} ({n} articles are posted or may be posted; \
                          their retrieval index is at {})",
-                        nzb_tmp.display()
+                        at.display()
                     );
                 }
                 // Last resort: the index cannot be written, so put it where
@@ -201,7 +282,16 @@ pub async fn run(config: &PathBuf, args: PostArgs) -> Result<()> {
                 }
             }
         }
-        Err(e) => anyhow::bail!("posting failed: {e}"),
+        // Every other error means NOTHING was accepted (an upload that got
+        // articles onto the server comes back as Aborted), so the claim is
+        // still the empty file we made and protects no Message-IDs. Give it
+        // back: keeping it would meet the next run - a rerun after a refused
+        // connection, say - with "another post is probably writing", which
+        // is both wrong and unhelpful.
+        Err(e) => {
+            release_empty_claim(&nzb_tmp);
+            anyhow::bail!("posting failed: {e}")
+        }
     };
     println!(
         "[post] upload complete in {:.1}s",
@@ -212,15 +302,42 @@ pub async fn run(config: &PathBuf, args: PostArgs) -> Result<()> {
     // Publish atomically: write the index into the pre-reserved temp, then
     // rename it over the destination. If the rename fails, the temp still
     // holds the full retrieval index for the just-completed upload.
-    std::fs::write(&nzb_tmp, &xml)
-        .with_context(|| format!("writing {}", nzb_tmp.display()))?;
-    std::fs::rename(&nzb_tmp, &args.nzb).with_context(|| {
-        format!(
-            "publishing NZB to {} (index preserved at {})",
-            args.nzb.display(),
-            nzb_tmp.display()
-        )
-    })?;
+    //
+    // The write goes through the same path as the abort rescue, because the
+    // stakes are identical: every article is already public under a random
+    // Message-ID that exists nowhere but this index. A write that fails at
+    // the claim therefore falls back to a name of our own instead of leaving
+    // a torn file the next run would offer up as "the retrieval index", and
+    // if no write lands at all the index is printed rather than lost.
+    match write_rescue(&nzb_tmp, &xml) {
+        Ok(at) => {
+            std::fs::rename(&at, &args.nzb).with_context(|| {
+                format!(
+                    "publishing NZB to {} (index preserved at {})",
+                    args.nzb.display(),
+                    at.display()
+                )
+            })?;
+            // The claim only still exists if the index took a different
+            // name; it is empty, so it would block the next run for nothing.
+            if at != nzb_tmp {
+                release_empty_claim(&nzb_tmp);
+            }
+        }
+        Err(e) => {
+            println!(
+                "[post] cannot write {} ({e}) - printing the retrieval index instead:",
+                nzb_tmp.display()
+            );
+            println!("{xml}");
+            release_empty_claim(&nzb_tmp);
+            anyhow::bail!(
+                "the upload succeeded but its retrieval index could not be written next to \
+                 {} ({e}); nothing was published and the index was printed above",
+                args.nzb.display()
+            );
+        }
+    }
     println!("[post] wrote {}", args.nzb.display());
 
     if args.verify {
@@ -386,6 +503,160 @@ mod tests {
         // Disabled server: refused even when named explicitly.
         let e = select_server(&c, "news.off.example").unwrap_err().to_string();
         assert!(e.contains("disabled"), "{e}");
+    }
+
+    /// The temp path is derived from --nzb alone, so two posts to the same
+    /// destination race for it. The claim is exclusive: an existing temp
+    /// stops the run before anything is uploaded, whether it holds an
+    /// earlier rescue index or is just another run's fresh (empty) claim.
+    #[tokio::test]
+    async fn an_existing_tmp_claim_stops_the_run_before_it_posts() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-postclaim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("corpus.bin"), vec![7u8; 4_000]).unwrap();
+        let config_path = dir.join("config.json");
+        // Port 1 is never dialled: the claim is checked before any connection.
+        std::fs::write(
+            &config_path,
+            "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}",
+        )
+        .unwrap();
+        let nzb_path = dir.join("posted.nzb");
+        let tmp = PathBuf::from(format!("{}.nzbtmp", nzb_path.display()));
+        let args = || PostArgs {
+            paths: vec![dir.join("corpus.bin")],
+            post_server: "127.0.0.1:1".into(),
+            nzb: nzb_path.clone(),
+            group: "alt.binaries.test".into(),
+            from: "corpus@nzbfast.com".into(),
+            msgid_domain: "corpus.nzbfast.com".into(),
+            article_size: 1_000,
+            title: None,
+            connections: 1,
+            verify: false,
+        };
+
+        // An EMPTY temp is another run's claim - refuse (this used to proceed
+        // and later rename over whatever that run published).
+        std::fs::write(&tmp, b"").unwrap();
+        let err = format!("{:#}", run(&config_path, args()).await.unwrap_err());
+        assert!(err.contains("is already claimed"), "{err}");
+        assert!(err.contains("another `nzbfast post`"), "{err}");
+
+        // A NON-EMPTY temp is a stranded rescue index - different guidance.
+        std::fs::write(&tmp, b"<nzb/>").unwrap();
+        let err = format!("{:#}", run(&config_path, args()).await.unwrap_err());
+        assert!(err.contains("already holds the retrieval index"), "{err}");
+
+        // Neither refusal touched the record it was protecting.
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"<nzb/>");
+        assert!(!nzb_path.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A rescue index never overwrites a file it does not own: if the claim
+    /// is gone, the rescue lands under a name unique to this process.
+    #[test]
+    fn a_rescue_never_overwrites_a_claim_it_lost() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-postrescue-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let claim = dir.join("posted.nzb.nzbtmp");
+
+        // Claim held: the rescue goes straight into it.
+        std::fs::write(&claim, b"").unwrap();
+        assert_eq!(write_rescue(&claim, "<nzb>mine</nzb>").unwrap(), claim);
+        assert_eq!(std::fs::read_to_string(&claim).unwrap(), "<nzb>mine</nzb>");
+
+        // Claim moved out from under us: the rescue lands elsewhere rather
+        // than re-creating (and later being mistaken for) the lost temp.
+        let published = dir.join("posted.nzb");
+        std::fs::rename(&claim, &published).unwrap();
+        let at = write_rescue(&claim, "<nzb>later</nzb>").unwrap();
+        assert!(
+            at.to_string_lossy().ends_with(&format!(".{}", std::process::id())),
+            "{}",
+            at.display()
+        );
+        assert_eq!(std::fs::read_to_string(&at).unwrap(), "<nzb>later</nzb>");
+        assert_eq!(std::fs::read_to_string(&published).unwrap(), "<nzb>mine</nzb>");
+
+        // Someone else's rescue index now sits at the claim path (our claim
+        // was cleared away mid-run and a second run left its own record
+        // there). It has bytes in it, so it is never truncated - ours goes
+        // to the next free name of our own.
+        std::fs::write(&claim, b"<nzb>theirs</nzb>").unwrap();
+        let at2 = write_rescue(&claim, "<nzb>ours</nzb>").unwrap();
+        assert_ne!(at2, claim);
+        assert_eq!(
+            at2,
+            PathBuf::from(format!("{}.{}.1", claim.display(), std::process::id()))
+        );
+        assert_eq!(std::fs::read_to_string(&at2).unwrap(), "<nzb>ours</nzb>");
+        assert_eq!(std::fs::read_to_string(&claim).unwrap(), "<nzb>theirs</nzb>");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A failure that put NOTHING on the server has no Message-IDs to
+    /// protect, so the claim it took is handed back. Leaving that empty file
+    /// behind would meet the retry - one transient refusal later - with
+    /// "another post is probably writing", which is simply untrue.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_post_that_never_landed_gives_its_claim_back() {
+        let srv = nzbkit::mock::MockServer::start(
+            Default::default(),
+            nzbkit::mock::Chaos {
+                post: nzbkit::mock::PostChaos {
+                    // Rejected from the very first article: nothing is stored.
+                    reject_441: Some("posting failed".into()),
+                    reject_after: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await;
+        let dir = std::env::temp_dir().join(format!("nzbfast-postnone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("corpus.bin"), vec![9u8; 3_000]).unwrap();
+        let config_path = dir.join("config.json");
+        std::fs::write(
+            &config_path,
+            format!(
+                "{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}",
+                srv.addr.port()
+            ),
+        )
+        .unwrap();
+        let nzb_path = dir.join("posted.nzb");
+        let args = || PostArgs {
+            paths: vec![dir.join("corpus.bin")],
+            post_server: format!("127.0.0.1:{}", srv.addr.port()),
+            nzb: nzb_path.clone(),
+            group: "alt.binaries.test".into(),
+            from: "corpus@nzbfast.com".into(),
+            msgid_domain: "corpus.nzbfast.com".into(),
+            article_size: 1_000,
+            title: None,
+            connections: 1,
+            verify: false,
+        };
+        let tmp = PathBuf::from(format!("{}.nzbtmp", nzb_path.display()));
+
+        let err = format!("{:#}", run(&config_path, args()).await.unwrap_err());
+        assert!(err.contains("posting failed"), "{err}");
+        assert!(!tmp.exists(), "the claim outlived a run that posted nothing");
+        assert!(!nzb_path.exists());
+
+        // So the retry gets as far as the server, instead of being refused
+        // by the last run's leftovers.
+        let err = format!("{:#}", run(&config_path, args()).await.unwrap_err());
+        assert!(!err.contains("already claimed"), "{err}");
+        assert!(!err.contains("already holds the retrieval index"), "{err}");
+        assert!(!tmp.exists(), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The whole CLI path against the mock server: run() with --verify

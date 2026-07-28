@@ -990,6 +990,43 @@ fn sevenz_env_off_value(v: Option<&str>) -> bool {
     v == Some("1")
 }
 
+/// Soak isolation switch for the TOP-LEVEL 7z chase alone (TODO 37 step
+/// 1), one level finer than `NZBFAST_NO_NESTED_7Z`: with it set, an
+/// inner .7z still streams but a posted `.7z` materializes and waits for
+/// the disk post-pass exactly as it did before the depth guard came off.
+/// Latched at construction.
+fn top_sevenz_env_off() -> bool {
+    top_sevenz_env_off_value(std::env::var("NZBFAST_NO_TOP_7Z").ok().as_deref())
+}
+
+/// Pure parse of the top-level 7z escape-hatch value (same rationale as
+/// [`nested_env_off_value`]).
+fn top_sevenz_env_off_value(v: Option<&str>) -> bool {
+    v == Some("1")
+}
+
+/// Escape hatch for drop-behind trimming (TODO 37 step 2): with it set,
+/// a 7z chase retains every byte it has taken and an archive over the
+/// retention cap demotes, which is exactly the behaviour before trimming
+/// existed. Latched at construction.
+fn sevenz_trim_env_off() -> bool {
+    sevenz_trim_env_off_value(std::env::var("NZBFAST_NO_7Z_TRIM").ok().as_deref())
+}
+
+/// Pure parse of the trim escape-hatch value (same rationale as
+/// [`nested_env_off_value`]).
+fn sevenz_trim_env_off_value(v: Option<&str>) -> bool {
+    v == Some("1")
+}
+
+/// Reason prefix for a demote of a TOP-LEVEL 7z chase. The archive
+/// materializes into the output directory, which is precisely the disk
+/// post-pass's input, so the demote is owned - the caller must keep it
+/// out of the RAR unpack ladder (handing a directory holding one .7z to
+/// unrar fails a job that is fine). The underlying reason, "held-bytes
+/// cap: chase memory" included, stays readable inside the string.
+pub const SEVENZ_DISK_FALLBACK_PREFIX: &str = "7z materialized for the disk pass: ";
+
 /// Escape hatch for the final-output CRC gate, mirroring the nested
 /// gates: with it set, the level-0 store payload ships unverified
 /// exactly as before the gate existed. Latched at construction.
@@ -1832,7 +1869,13 @@ struct FrontierBuffer {
 
 #[derive(Default)]
 struct FrontierState {
-    /// Contiguous bytes from volume offset 0.
+    /// Volume offset of `data[0]`. Zero until a drop-behind trim moves
+    /// it; past that point the bytes below it are no longer in RAM (the
+    /// trim spilled them into the slot's own archive file, which is
+    /// where a demotion would have put them anyway). Reads below it
+    /// fail here and are served by the caller from that file.
+    base: u64,
+    /// Contiguous bytes from volume offset `base`.
     data: Vec<u8>,
     /// Spans beyond the frontier, keyed by start offset.
     pending: BTreeMap<u64, Vec<u8>>,
@@ -1848,11 +1891,21 @@ struct FrontierState {
     abort: Option<String>,
 }
 
+impl FrontierState {
+    /// One past the last contiguous byte, in VOLUME offsets. The single
+    /// place `base` and `data.len()` are combined - everything that used
+    /// to read `data.len()` as "the frontier" goes through here.
+    fn frontier(&self) -> u64 {
+        self.base + self.data.len() as u64
+    }
+}
+
 impl std::fmt::Debug for FrontierBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let st = self.state.lock().unwrap();
         f.debug_struct("FrontierBuffer")
-            .field("frontier", &st.data.len())
+            .field("base", &st.base)
+            .field("frontier", &st.frontier())
             .field("pending", &st.pending.len())
             .field("total", &st.total)
             .field("abort", &st.abort)
@@ -1901,18 +1954,27 @@ impl FrontierBuffer {
             return st.stored;
         }
         let bytes = &bytes[..(end - offset) as usize];
-        let frontier = st.data.len() as u64;
+        let base = st.base;
+        let frontier = st.frontier();
         let mut accepted = false;
         let mut differed = false;
         // Whatever we already retain for this range, the newest delivery
         // wins. Checked against the frontier AND the parked spans: the 7z
         // chase peeks at arbitrary offsets, so a parked span can have been
         // read too, and a rewrite of one is no safer to discard.
-        if offset < frontier {
-            let n = (frontier.min(end) - offset) as usize;
-            let dst = &mut st.data[offset as usize..offset as usize + n];
-            if *dst != bytes[..n] {
-                dst.copy_from_slice(&bytes[..n]);
+        //
+        // The sub-range below `base` is not ours to reconcile - it is on
+        // disk, not in `data`. `below_base()` reports it and the caller
+        // fixes the file and forfeits; here it is simply skipped, which
+        // is why the clip is to `base` and not to `offset`.
+        if offset < frontier && end > base {
+            let a = offset.max(base);
+            let n = (frontier.min(end) - a) as usize;
+            let di = (a - base) as usize;
+            let si = (a - offset) as usize;
+            let dst = &mut st.data[di..di + n];
+            if *dst != bytes[si..si + n] {
+                dst.copy_from_slice(&bytes[si..si + n]);
                 differed = true;
             }
         }
@@ -1947,7 +2009,7 @@ impl FrontierBuffer {
             // overlap with the frontier was reconciled when they were
             // written, so only the tail is new.
             while let Some((&s, _)) = st.pending.first_key_value() {
-                let f = st.data.len() as u64;
+                let f = st.frontier();
                 if s > f {
                     break;
                 }
@@ -2003,22 +2065,38 @@ impl FrontierBuffer {
         self.state.lock().unwrap().conflict
     }
 
-    /// Frontier progress (bytes contiguous from 0) vs the declared total.
+    /// Force the forfeit from outside: used when a span lands below the
+    /// trim point, where the buffer cannot compare it against anything
+    /// because those bytes are on disk rather than in `data`.
+    fn mark_conflict(&self) {
+        self.state.lock().unwrap().conflict = true;
+    }
+
+    /// Frontier progress (bytes contiguous from 0, trimmed prefix
+    /// included - those bytes arrived, they just live on disk now) vs
+    /// the declared total.
     fn is_complete(&self) -> bool {
         let st = self.state.lock().unwrap();
-        st.data.len() as u64 >= st.total
+        st.frontier() >= st.total
     }
 
     /// Non-blocking volume-view read for the verifier/repair read-back:
     /// serves frontier AND parked bytes, errors if any hole intersects.
+    /// A trimmed prefix reads as a hole - those bytes are on disk, and
+    /// the slot-level read splits the request at [`Self::base`] before
+    /// getting here.
     fn peek(&self, off: u64, out: &mut [u8]) -> io::Result<()> {
         let st = self.state.lock().unwrap();
         let mut pos = off;
         let end = off + out.len() as u64;
-        let frontier = st.data.len() as u64;
+        if pos < st.base {
+            return Err(nofile());
+        }
+        let frontier = st.frontier();
         if pos < frontier {
             let n = (frontier.min(end) - pos) as usize;
-            out[..n].copy_from_slice(&st.data[pos as usize..pos as usize + n]);
+            let di = (pos - st.base) as usize;
+            out[..n].copy_from_slice(&st.data[di..di + n]);
             pos += n as u64;
         }
         while pos < end {
@@ -2039,13 +2117,16 @@ impl FrontierBuffer {
     }
 
     /// Present sub-ranges of `[off, off+len)` in volume offsets, merged.
+    /// A trimmed prefix is absent here by construction; the slot-level
+    /// coverage adds the archive file's own intervals for it.
     fn intervals(&self, off: u64, len: u64) -> Vec<(u64, u64)> {
         let st = self.state.lock().unwrap();
         let end = off + len;
         let mut ivs: Vec<(u64, u64)> = Vec::new();
-        let frontier = st.data.len() as u64;
-        if off < frontier {
-            ivs.push((off, frontier.min(end)));
+        let frontier = st.frontier();
+        let lo = off.max(st.base);
+        if lo < frontier && lo < end {
+            ivs.push((lo, frontier.min(end)));
         }
         for (&s, v) in st.pending.range(..end) {
             let a = off.max(s);
@@ -2054,28 +2135,21 @@ impl FrontierBuffer {
                 ivs.push((a, b));
             }
         }
-        ivs.sort_unstable();
-        let mut out: Vec<(u64, u64)> = Vec::new();
-        for (a, b) in ivs {
-            if let Some(last) = out.last_mut()
-                && a <= last.1
-            {
-                last.1 = last.1.max(b);
-                continue;
-            }
-            out.push((a, b));
-        }
-        out
+        merge_intervals(ivs)
     }
 
     /// Consume the retained bytes for demotion: the frontier moves out as
-    /// one span, parked spans follow as-is. The buffer is empty after.
+    /// one span AT ITS OWN OFFSET, parked spans follow as-is. The buffer
+    /// is empty after. A trimmed prefix is not here and does not need to
+    /// be: the trim already wrote it to the very file this demotion
+    /// materializes into.
     fn take_spans(&self) -> Vec<(u64, Vec<u8>)> {
         let mut st = self.state.lock().unwrap();
         let mut out: Vec<(u64, Vec<u8>)> = Vec::new();
+        let base = st.base;
         let data = std::mem::take(&mut st.data);
         if !data.is_empty() {
-            out.push((0, data));
+            out.push((base, data));
         }
         for (s, v) in std::mem::take(&mut st.pending) {
             out.push((s, v));
@@ -2087,6 +2161,60 @@ impl FrontierBuffer {
     /// Declared total size (the level-N entry's unpacked size).
     fn total(&self) -> u64 {
         self.state.lock().unwrap().total
+    }
+
+    /// Volume offset of the first byte still in RAM. Everything below it
+    /// has been trimmed out to the slot's archive file.
+    fn base(&self) -> u64 {
+        self.state.lock().unwrap().base
+    }
+
+    /// Bytes currently held in RAM - what the holds budget is charged
+    /// for. Re-read after a trim to give the budget its bytes back.
+    fn stored(&self) -> usize {
+        self.state.lock().unwrap().stored
+    }
+
+    /// One past the last contiguous byte, in volume offsets.
+    fn frontier(&self) -> u64 {
+        self.state.lock().unwrap().frontier()
+    }
+
+    /// Drop-behind: release the frontier bytes below `watermark` and hand
+    /// them back so the caller can spill them into the slot's archive
+    /// file. Returns `(offset, bytes)` of what left RAM, or None if there
+    /// was nothing to release.
+    ///
+    /// `watermark` is the lowest offset the decode engine may still ask
+    /// for - the READ frontier, not decode progress: MT-LZMA2 prefetches
+    /// tens of MB ahead of what it has decoded, so trimming to decode
+    /// position would take bytes the prefetcher still wants. Parked spans
+    /// are untouched by construction: they all sit ABOVE the frontier.
+    ///
+    /// Nothing is trimmed while a conflict is pending - that buffer is
+    /// about to demote and `take_spans` is the only thing left to run.
+    ///
+    /// `min_release` is what makes this affordable. The release is a
+    /// `Vec::drain` from the front, so it memmoves whatever is still
+    /// live; refusing to trim for less than a worthwhile chunk bounds
+    /// that work to a constant per arriving byte. It also answers the
+    /// case trimming cannot fix - arrivals running far ahead of decode,
+    /// where the live window IS the cap - by declining, which demotes.
+    fn trim_to(&self, watermark: u64, min_release: u64) -> Option<(u64, Vec<u8>)> {
+        let mut st = self.state.lock().unwrap();
+        if st.conflict || st.abort.is_some() {
+            return None;
+        }
+        let cut = watermark.min(st.frontier());
+        if cut < st.base + min_release.max(1) {
+            return None;
+        }
+        let n = (cut - st.base) as usize;
+        let out = st.data.drain(..n).collect::<Vec<u8>>();
+        let at = st.base;
+        st.base = cut;
+        st.stored = st.data.len() + st.pending.values().map(|v| v.len()).sum::<usize>();
+        Some((at, out))
     }
 
     /// Blocking RANDOM-ACCESS read for the 7z chase. The trait method
@@ -2108,9 +2236,21 @@ impl FrontierBuffer {
             if offset >= st.total {
                 return Ok(0);
             }
-            let frontier = st.data.len() as u64;
+            // Behind the trim point: those bytes went to disk and the
+            // engine promised never to come back for them. A read here
+            // means the promise broke (BCJ2 is the only shape that
+            // would, and it is refused a trim up front), so fail loudly
+            // - the chase forfeits and the archive materializes, which
+            // is cheap because most of it is already written.
+            if offset < st.base {
+                return Err(io::Error::other(format!(
+                    "chase source read {offset} behind the trim point {}",
+                    st.base
+                )));
+            }
+            let frontier = st.frontier();
             if offset < frontier {
-                let start = offset as usize;
+                let start = (offset - st.base) as usize;
                 let take = buf.len().min(st.data.len() - start);
                 buf[..take].copy_from_slice(&st.data[start..start + take]);
                 return Ok(take);
@@ -2140,12 +2280,26 @@ struct BlockingSeekReader {
     buf: Arc<FrontierBuffer>,
     pos: u64,
     total: u64,
+    /// Lowest offset the engine may still ask for - the drop-behind trim
+    /// watermark, published for the routing thread. Deliberately the
+    /// READ position and not decode progress: MT-LZMA2 runs its source
+    /// reads tens of MB ahead of what it has decoded, so a watermark
+    /// keyed to decode would trim bytes the prefetcher still wants.
+    ///
+    /// A seek REPLACES it rather than raising it, which is what makes
+    /// the open phase safe without any phase detection of its own: the
+    /// parse seeks to the tail, reads the end header, then seeks back to
+    /// 32, and the watermark follows it straight back down.
+    low_water: Arc<AtomicU64>,
 }
 
 impl io::Read for BlockingSeekReader {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         let n = self.buf.read_covered_blocking(self.pos, out)?;
         self.pos += n as u64;
+        // The bytes are in the engine's own buffer now; the source does
+        // not own them any more.
+        self.low_water.store(self.pos, Ordering::Relaxed);
         Ok(n)
     }
 }
@@ -2161,8 +2315,27 @@ impl io::Seek for BlockingSeekReader {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "seek out of range"));
         }
         self.pos = target as u64;
+        self.low_water.store(self.pos, Ordering::Relaxed);
         Ok(self.pos)
     }
+}
+
+/// Sort and coalesce touching/overlapping `[a, b)` ranges. Every
+/// coverage answer in this file ends with this shape; it was written out
+/// four times before the trim split made it five.
+fn merge_intervals(mut ivs: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    ivs.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for (a, b) in ivs {
+        if let Some(last) = out.last_mut()
+            && a <= last.1
+        {
+            last.1 = last.1.max(b);
+            continue;
+        }
+        out.push((a, b));
+    }
+    out
 }
 
 /// 7z container magic at offset 0.
@@ -2198,9 +2371,20 @@ impl rars::BlockingRangeSource for FrontierBuffer {
             if let Some(reason) = &st.abort {
                 return Err(io::Error::other(format!("chase source aborted: {reason}")));
             }
-            let frontier = st.data.len() as u64;
+            // The RAR chase never trims (the rars reader's access
+            // pattern has not been measured the way the 7z one has), so
+            // `base` is always 0 here - but read it rather than assume
+            // it, so the day that changes this fails instead of serving
+            // the wrong bytes.
+            if offset < st.base {
+                return Err(io::Error::other(format!(
+                    "chase source read {offset} behind the trim point {}",
+                    st.base
+                )));
+            }
+            let frontier = st.frontier();
             if offset < frontier {
-                let start = offset as usize;
+                let start = (offset - st.base) as usize;
                 let take = buf.len().min(st.data.len() - start);
                 buf[..take].copy_from_slice(&st.data[start..start + take]);
                 return Ok(take);
@@ -2213,7 +2397,8 @@ impl rars::BlockingRangeSource for FrontierBuffer {
     }
 
     fn known_len(&self) -> u64 {
-        self.state.lock().unwrap().data.len() as u64
+        let st = self.state.lock().unwrap();
+        st.frontier()
     }
 
     fn total_len(&self) -> Option<u64> {
@@ -2290,6 +2475,18 @@ impl ChaseCtl {
 /// parts materialize and the disk post-pass joins and extracts them).
 struct SevenZCtl {
     buf: Arc<FrontierBuffer>,
+    /// Drop-behind watermark, published by [`BlockingSeekReader`]: the
+    /// lowest offset the engine may still ask for.
+    low_water: Arc<AtomicU64>,
+    /// May this chase trim? False until the archive map has been parsed
+    /// (before that the watermark means nothing - the open phase is
+    /// still seeking around), and false forever if the map contains a
+    /// BCJ2 coder. BCJ2 serves four pack streams from four concurrent
+    /// cursors, one of them at the block's far end, so it needs the
+    /// whole archive behind its read frontier - measured 100.0% on a
+    /// 256 MiB fixture, and scaling with size. Every other coder chain
+    /// measured needs exactly zero bytes of history, solid included.
+    trim_ok: std::sync::atomic::AtomicBool,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Child-extractor slots the sink opened for extracted entries -
     /// abandoned (partial outputs deleted) if the chase demotes.
@@ -2427,6 +2624,15 @@ struct Inner {
     /// 7z-chase gate (`NZBFAST_NO_NESTED_7Z` / runtime setter). Off: an
     /// inner .7z materializes exactly as before the 7z path existed.
     sevenz_on: bool,
+    /// Top-level 7z gate (`NZBFAST_NO_TOP_7Z` / runtime setter). Only
+    /// depth 0 reads it, so children carry it unused. Off: a posted
+    /// `.7z` materializes for the disk post-pass, the pre-TODO-37
+    /// behaviour.
+    top_sevenz_on: bool,
+    /// Drop-behind trim gate (`NZBFAST_NO_7Z_TRIM` / runtime setter).
+    /// Off: a 7z chase retains everything and an archive over the
+    /// retention cap demotes, as it did before trimming existed.
+    sevenz_trim_on: bool,
     /// Nested depth cap for this chain: the child created AT this depth is
     /// disabled, so the deepest layer materializes (never a hard failure).
     /// Resolved from the daemon setting / env at construction and inherited
@@ -2584,6 +2790,22 @@ impl Extractor {
         self.inner.lock().unwrap().sevenz_on = on;
     }
 
+    /// Top-level 7z gate (see `NZBFAST_NO_TOP_7Z`, latched at
+    /// construction). Same set-before-spans discipline as the other
+    /// gates: a posted `.7z` is classified once, on its offset-0
+    /// article.
+    pub fn set_top_level_sevenz(&self, on: bool) {
+        self.inner.lock().unwrap().top_sevenz_on = on;
+    }
+
+    /// Drop-behind trim gate (see `NZBFAST_NO_7Z_TRIM`, latched at
+    /// construction). Unlike the other gates this one is safe to flip
+    /// mid-download - it only decides whether a budget breach trims
+    /// before it demotes - but tests set it up front like the rest.
+    pub fn set_sevenz_trim(&self, on: bool) {
+        self.inner.lock().unwrap().sevenz_trim_on = on;
+    }
+
     /// Final-output CRC gate (see `NZBFAST_NO_OUTPUT_CRC`, latched at
     /// construction; default on). Same set-before-spans discipline as
     /// the other gates - composition happens as spans route, so a
@@ -2604,9 +2826,23 @@ impl Extractor {
     /// span arrives, like the gates - it also anchors the chain's root
     /// for the upward walk.
     pub fn set_promote_hook(self: &Arc<Self>, hook: PromoteHook) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.self_weak = Arc::downgrade(self);
-        inner.promote = Some(hook);
+        self.anchor();
+        self.inner.lock().unwrap().promote = Some(hook);
+    }
+
+    /// Anchor the chain's ROOT: record its own `Arc` weakly, which is
+    /// what a chase worker upgrades through on every callback (and what
+    /// lets a cancelled job actually drop). A child gets this from
+    /// `ensure_child`; the root cannot get it at construction, because
+    /// the public constructors hand back an owned value and only the
+    /// caller knows whether it becomes an `Arc`.
+    ///
+    /// A root that is never anchored simply does not chase at depth 0 -
+    /// a posted `.7z` materializes for the disk post-pass, which is the
+    /// pre-TODO-37 behaviour - so forgetting this degrades rather than
+    /// breaks. Call it once, before any span arrives.
+    pub fn anchor(self: &Arc<Self>) {
+        self.inner.lock().unwrap().self_weak = Arc::downgrade(self);
     }
 
     /// Re-extraction mode: slot bytes are fed from real volume files in
@@ -2702,6 +2938,12 @@ impl Extractor {
                 nested_on,
                 chase_on,
                 sevenz_on,
+                // Read here rather than threaded through `build`: only
+                // depth 0 consults it, and depth 0 is exactly what the
+                // public constructors make. Same construction-time
+                // latching as every other gate.
+                top_sevenz_on: !top_sevenz_env_off(),
+                sevenz_trim_on: !sevenz_trim_env_off(),
                 nested_max_depth: nested_max_depth.max(1),
                 verify_output_crc,
                 promote: None,
@@ -2972,10 +3214,15 @@ impl Extractor {
                                 article_crc,
                             )?;
                         } else if self.try_attach_sevenz(inner, slot, data)? {
-                            // Phase 3: an inner .7z gets the tail-prefetch
-                            // chase - this span (and everything held) feeds
-                            // its frontier buffer.
-                            self.shape.note(self.depth, SH_7Z | SH_ONE_PASS);
+                            // Phase 3: a .7z gets the tail-prefetch chase -
+                            // this span (and everything held) feeds its
+                            // frontier buffer. Only the FORMAT is known
+                            // yet; `one-pass` is claimed in sevenz_finish,
+                            // once the archive actually decoded. Claiming
+                            // it here would badge a top-level archive that
+                            // demoted on the retention cap "partly on
+                            // disk" when every byte of it went to disk.
+                            self.shape.note(self.depth, SH_7Z);
                             self.chase_span(inner, slot, offset, data)?;
                         } else if inner.protect_sources {
                             // A supposed volume that isn't RAR: writing it
@@ -3697,12 +3944,47 @@ impl Extractor {
     /// group to materialized volumes. A span landing after demotion
     /// writes through the slot's current mode like any late span.
     fn chase_span(&self, inner: &mut Inner, slot: usize, offset: u64, data: &[u8]) -> io::Result<()> {
+        // Anything below the trim point is not the buffer's to reconcile
+        // - it is already in the archive file. A late span there is
+        // either a routing re-feed (which cannot happen after a trim:
+        // re-feeds all land at classification) or a PAR2 repair rewrite,
+        // and we cannot tell cheaply. So take the safe reading: write it
+        // to the file, where it OVERWRITES whatever the trim spilled, and
+        // force the forfeit below - the engine may already have decoded
+        // from the stale copy. Same shape and same direction as the
+        // conflict guard, which is what actually fires here.
+        //
+        // Unreachable in practice: `patch_volume_span` refuses a SevenZ
+        // slot outright, and at depth 0 the caller materializes a chased
+        // slot before repair runs at all.
+        let trimmed = inner.slots[slot].chase.as_ref().map(|ch| (ch.buf.clone(), ch.buf.base()));
+        if let Some((buf, base)) = trimmed
+            && offset < base
+        {
+            let n = ((base - offset) as usize).min(data.len());
+            buf.mark_conflict();
+            self.plain_span(inner, slot, offset, &data[..n])?;
+        }
         let Some(ch) = inner.slots[slot].chase.as_mut() else {
             return match inner.slots[slot].mode {
                 SlotMode::Plain | SlotMode::RarFallback => {
                     self.plain_span(inner, slot, offset, data)
                 }
-                _ => Ok(()),
+                // Still a chase mode but the chase is gone means finish()
+                // already took it on success, so this span goes nowhere -
+                // and the conflict check that would catch a differing
+                // rewrite lives on the chase we no longer have. Nothing in
+                // this crate reaches it (the daemon is strictly download ->
+                // repair -> finish), but that sequencing is a caller
+                // contract, so assert rather than trust it.
+                _ => {
+                    debug_assert!(
+                        false,
+                        "span for slot {slot} arrived after finish() took its chase - \
+                         a differing rewrite here would go undetected"
+                    );
+                    Ok(())
+                }
             };
         };
         let stored = ch.buf.write_span(offset, data);
@@ -3721,6 +4003,12 @@ impl Extractor {
             return self.fallback_slot_or_group(inner, slot, "repair rewrote chased bytes");
         }
         if inner.budget.over() {
+            // Drop-behind first: an archive whose decode is keeping up
+            // has a long prefix nobody will read again, and releasing it
+            // is what lets a set larger than the cap stream at all.
+            self.sevenz_trim_slot(inner, slot)?;
+        }
+        if inner.budget.over() {
             // Same shared budget as the holds cap, so the reason carries
             // the same substring: the caller keys volume-level remediation
             // off "held-bytes cap", and the bare wording this used to have
@@ -3728,6 +4016,56 @@ impl Extractor {
             // job with no payload and exit 0.
             self.fallback_slot_or_group(inner, slot, "held-bytes cap: chase memory")?;
         }
+        Ok(())
+    }
+
+    /// Drop-behind trim (TODO 37 step 2): release the bytes of a chased
+    /// 7z slot that the decode engine has already read past, writing
+    /// them into the slot's own archive file on the way out.
+    ///
+    /// Spilling into THAT file, rather than a temp one, is what keeps the
+    /// demote path free. A demotion materializes the archive at exactly
+    /// these offsets, so the spill is not a cost paid against demotion -
+    /// it IS demotion, done incrementally and early. If the chase later
+    /// fails, `fallback_slot` writes only what is still in RAM and finds
+    /// the rest already on disk; if it succeeds, `sevenz_finish` deletes
+    /// the partial file, because the payload came out the other way.
+    ///
+    /// Declines, leaving the caller to demote, when: the gate is off; the
+    /// archive needs history behind its frontier (BCJ2); the map has not
+    /// parsed yet, so the watermark means nothing; or the release would
+    /// be too small to be worth a `Vec::drain` of what is still live -
+    /// which is also the honest answer when arrivals have run so far
+    /// ahead of decode that the live window alone fills the cap.
+    fn sevenz_trim_slot(&self, inner: &mut Inner, slot: usize) -> io::Result<()> {
+        if !inner.sevenz_trim_on {
+            return Ok(());
+        }
+        let Some(ctl) = inner.slots[slot].sevenz.clone() else {
+            return Ok(());
+        };
+        if !ctl.trim_ok.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        // Half the cap: bounds the drain's memmove to a constant amount
+        // of work per arriving byte, since two trims cannot be closer
+        // together than that many bytes of arrival.
+        let min_release = (inner.budget.cap() / 2) as u64;
+        let watermark = ctl.low_water.load(Ordering::Relaxed);
+        let Some((at, bytes)) = ctl.buf.trim_to(watermark, min_release) else {
+            return Ok(());
+        };
+        self.plain_span(inner, slot, at, &bytes)?;
+        let now = ctl.buf.stored();
+        let released = match inner.slots[slot].chase.as_mut() {
+            Some(ch) => {
+                let d = ch.charged.saturating_sub(now);
+                ch.charged = now;
+                d
+            }
+            None => 0,
+        };
+        inner.budget.sub(released);
         Ok(())
     }
 
@@ -3867,8 +4205,17 @@ impl Extractor {
     /// multipart `.7z.001` part never attaches (its end header lies
     /// past its own bytes - the v1 limitation): the parts materialize
     /// and the disk post-pass joins them.
+    ///
+    /// TODO 37 step 1: this runs at depth 0 too, so a POSTED single-file
+    /// `.7z` joins the chase and its payload streams out while the
+    /// archive downloads. Nothing about the engine is depth-specific -
+    /// the guard predated the root promote wiring (see
+    /// [`Self::promote_slot_spans`]). An archive the retention budget
+    /// cannot hold demotes to a materialized `.7z` for the disk
+    /// post-pass, exactly as every top-level 7z did before; without
+    /// drop-behind trimming that is the intended outcome, not a gap.
     fn try_attach_sevenz(&self, inner: &mut Inner, slot: usize, data: &[u8]) -> io::Result<bool> {
-        if self.depth == 0
+        if (self.depth == 0 && !inner.top_sevenz_on)
             || !inner.nested_on
             || !inner.sevenz_on
             || inner.protect_sources
@@ -3910,6 +4257,8 @@ impl Extractor {
         });
         let ctl = Arc::new(SevenZCtl {
             buf,
+            low_water: Arc::new(AtomicU64::new(0)),
+            trim_ok: std::sync::atomic::AtomicBool::new(false),
             worker: Mutex::new(None),
             sink_slots: Mutex::new(Vec::new()),
             outcome: Mutex::new(None),
@@ -3971,6 +4320,32 @@ impl Extractor {
         *st = Some(result);
     }
 
+    /// Does this archive's coder map need bytes BEHIND the read frontier,
+    /// i.e. must the chase keep everything it has retained?
+    ///
+    /// Measured on sevenz-rust2 0.21.3 + lzma-rust2 0.16.5 through this
+    /// exact call path: for LZMA2, Copy, BZip2, PPMd, Delta chains and
+    /// AES256, solid and non-solid, plain / encoded / encrypted headers,
+    /// payload reads ascend strictly from offset 32 to the tail header
+    /// and never revisit - zero bytes of history, independent of archive
+    /// size. BCJ2 is the sole exception and it is total: its four pack
+    /// streams are served by four concurrent cursors, the range coder's
+    /// at the block's far end read first, needing 100.0% of a 256 MiB
+    /// fixture behind the frontier and scaling with size.
+    ///
+    /// So the test is exactly "is there a BCJ2 coder", and those archives
+    /// keep the retain-everything behaviour (and stay bound by the cap).
+    /// BCJ2 is an x86-executable filter and the shape census says posted
+    /// payload is overwhelmingly already-compressed video, so this should
+    /// almost never fire.
+    fn sevenz_needs_history(archive: &sevenz_rust2::Archive) -> bool {
+        archive.blocks.iter().any(|b| {
+            b.coders
+                .iter()
+                .any(|c| c.encoder_method_id() == sevenz_rust2::EncoderMethod::ID_BCJ2)
+        })
+    }
+
     /// The worker's engine drive: parse blocks (the initial footer reads
     /// block only until the promoted tail lands), then decode every
     /// entry in block order through the blocking view. CRC-checked per
@@ -3986,12 +4361,20 @@ impl Extractor {
             buf: ctl.buf.clone(),
             pos: 0,
             total,
+            low_water: ctl.low_water.clone(),
         };
         let pw = match &password {
             Some(p) => sevenz_rust2::Password::from(&**p),
             None => sevenz_rust2::Password::empty(),
         };
         let mut reader = sevenz_rust2::ArchiveReader::new(src, pw)?;
+        // Drop-behind is decided HERE and only here, between the parse
+        // and the first payload read: the coder chains come from the end
+        // header, so they are all known before a single payload byte is
+        // touched, and the watermark below is meaningful from here on
+        // (the open phase's seek to the tail and back is over).
+        ctl.trim_ok
+            .store(!Self::sevenz_needs_history(reader.archive()), Ordering::Relaxed);
         reader.for_each_entries(|entry, rd| {
             if entry.is_directory {
                 return Ok(true);
@@ -4024,6 +4407,22 @@ impl Extractor {
             io::copy(rd, &mut sink)?;
             Ok(true)
         })
+    }
+
+    /// Unlink a slot's own file and release the name it claimed. Used
+    /// when a trimmed 7z chase SUCCEEDS: the spilled prefix is a
+    /// truncated archive whose payload already shipped by another route.
+    fn drop_slot_file(inner: &mut Inner, slot: usize) {
+        let Some(w) = inner.slots[slot].writer.take() else {
+            return;
+        };
+        let _ = std::fs::remove_file(&w.path);
+        let name = w.path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        inner
+            .names_taken
+            .lock()
+            .unwrap()
+            .remove(&name_collision_key(inner.fold_names, &name));
     }
 
     /// Abandon every partial output slot a 7z chase's sink opened, so
@@ -4072,9 +4471,18 @@ impl Extractor {
             }
             match outcome {
                 Some(Ok(())) => {
+                    // The archive decoded: this is where one-pass is
+                    // earned (see the attach site's note).
+                    self.shape.note(self.depth, SH_ONE_PASS);
                     if let Some(ch) = inner.slots[slot].chase.take() {
                         inner.budget.sub(ch.charged);
                     }
+                    // A trim may have spilled a prefix into the archive
+                    // file on the way past. The payload came out the
+                    // other way, so that file is a truncated archive
+                    // nobody wants - shipping it beside the payload
+                    // would look like a second, broken download.
+                    Self::drop_slot_file(inner, slot);
                 }
                 other => {
                     let why = match other {
@@ -4093,9 +4501,10 @@ impl Extractor {
     /// `spans` of this slot's byte space (7z tail prefetch). A slot's
     /// byte space IS its level-N file's byte space, and that file is an
     /// entry of the parent's groups - so the parent handles it as a
-    /// file promote.
+    /// file promote. At the ROOT there is no parent and none is needed:
+    /// the slot is a posted file already, so it goes straight to this
+    /// level's own hook.
     fn promote_slot_spans(&self, slot: usize, spans: &[(u64, u64)]) {
-        let Some(p) = self.parent.upgrade() else { return };
         let (name, size) = {
             let inner = self.inner.lock().unwrap();
             (inner.slots[slot].name.clone(), inner.slots[slot].size)
@@ -4103,7 +4512,17 @@ impl Extractor {
         if name.is_empty() || size == 0 {
             return;
         }
-        p.promote_file(&sanitize_filename(&name), size, spans);
+        let name = sanitize_filename(&name);
+        match self.parent.upgrade() {
+            Some(p) => p.promote_file(&name, size, spans),
+            // The ROOT: a slot here is a POSTED file, so its byte space
+            // is already the byte space the installed hook resolves to
+            // articles - no translation left to do, hand it straight
+            // over. This used to be `else { return }`, which silently
+            // no-opped, which is why a top-level 7z never got its tail
+            // front-loaded even after the depth guard came off.
+            None => self.promote_file(&name, size, spans),
+        }
     }
 
     /// Promote byte spans of file `name` (an inner file of one of THIS
@@ -4930,7 +5349,21 @@ impl Extractor {
                         }
                     }
                     let name = inner.slots[slot].name.clone();
-                    inner.slot_fallbacks.push((name, reason.to_string()));
+                    // A TOP-LEVEL 7z chase that gives up leaves the
+                    // archive materialized in the output directory,
+                    // which is the disk post-pass's own input - mark it
+                    // so the caller's volume remediation leaves it
+                    // alone (see [`SEVENZ_DISK_FALLBACK_PREFIX`]).
+                    // Nested demotes need no marking: the child fold
+                    // already prefixes them "nested fallback:".
+                    let why = if self.depth == 0
+                        && matches!(inner.slots[slot].mode, SlotMode::SevenZ)
+                    {
+                        format!("{SEVENZ_DISK_FALLBACK_PREFIX}{reason}")
+                    } else {
+                        reason.to_string()
+                    };
+                    inner.slot_fallbacks.push((name, why));
                 }
                 self.fallback_slot(inner, slot)
             }
@@ -4993,6 +5426,18 @@ impl Extractor {
         // that some of this set is going to disk after all.
         self.shape.note(self.depth, SH_MATERIALIZED);
         if inner.protect_sources {
+            // discard_slot does NOT abort a frontier buffer or abandon a
+            // 7z worker's sinks, so reaching here with either live would
+            // leave the worker writing into slots nobody tears down. It
+            // cannot happen: both chase attaches are gated on
+            // `!protect_sources`, and the only production caller sets the
+            // flag immediately after `Extractor::new`. That ordering is a
+            // contract held in another crate, so assert it here.
+            debug_assert!(
+                inner.slots[slot].chase.is_none() && inner.slots[slot].sevenz.is_none(),
+                "protect_sources reached slot {slot} with a live chase - \
+                 set_protect_sources must precede the first write"
+            );
             self.discard_slot(inner, slot);
             return Ok(());
         }
@@ -5161,10 +5606,28 @@ impl Extractor {
                 .as_ref()
                 .is_some_and(|w| w.covered(off, len as u64)),
             // Chased slot: the frontier buffer is the byte record
-            // (frontier + parked out-of-order spans).
-            SlotMode::RarChase | SlotMode::SevenZ => s.chase.as_ref().is_some_and(|ch| {
-                len == 0 || ch.buf.intervals(off, len as u64) == [(off, off + len as u64)]
-            }),
+            // (frontier + parked out-of-order spans) from the trim point
+            // up; below it the slot's own archive file holds the bytes a
+            // drop-behind trim spilled, and they count exactly the same.
+            SlotMode::RarChase | SlotMode::SevenZ => {
+                let Some(ch) = s.chase.as_ref() else { return false };
+                if len == 0 {
+                    return true;
+                }
+                let end = off + len as u64;
+                let base = ch.buf.base();
+                if off < base {
+                    let spilled = base.min(end);
+                    if !s.writer.as_ref().is_some_and(|w| w.covered(off, spilled - off)) {
+                        return false;
+                    }
+                    if end <= base {
+                        return true;
+                    }
+                    return ch.buf.intervals(base, end - base) == [(base, end)];
+                }
+                ch.buf.intervals(off, len as u64) == [(off, end)]
+            }
             SlotMode::Rar => {
                 let Some(m) = s.mapper.as_ref() else { return false };
                 let mut filled = vec![false; len];
@@ -5304,9 +5767,22 @@ impl Extractor {
                 }
                 // Chased slot: byte-exact view straight from the
                 // frontier buffer (RAM memcpy - fine under the lock).
+                // A drop-behind trim splits the request: the prefix it
+                // spilled is served from the slot's archive file, on the
+                // deferred plan like any other pread.
                 SlotMode::RarChase | SlotMode::SevenZ => {
                     let ch = s.chase.as_ref().ok_or_else(nofile)?;
-                    ch.buf.peek(off, buf)?;
+                    let base = ch.buf.base();
+                    let end = off + buf.len() as u64;
+                    if off < base {
+                        let w = s.writer.as_ref().ok_or_else(nofile)?;
+                        let n = (base.min(end) - off) as usize;
+                        reads.push(Plan::W(w.clone(), 0, n, off));
+                    }
+                    if end > base {
+                        let from = base.max(off);
+                        ch.buf.peek(from, &mut buf[(from - off) as usize..])?;
+                    }
                 }
                 // Unclassified slot: serve from pre-sniff holds when they
                 // fully cover the range (see covered_intervals).
@@ -5362,11 +5838,23 @@ impl Extractor {
                 .as_ref()
                 .map(|w| w.covered_intervals(off, len))
                 .unwrap_or_default(),
-            SlotMode::RarChase | SlotMode::SevenZ => s
-                .chase
-                .as_ref()
-                .map(|ch| ch.buf.intervals(off, len))
-                .unwrap_or_default(),
+            // Same split as `covered`: a drop-behind trim moved the
+            // prefix into the slot's archive file, and it is every bit
+            // as reconstructible from there.
+            SlotMode::RarChase | SlotMode::SevenZ => {
+                let Some(ch) = s.chase.as_ref() else { return Vec::new() };
+                let base = ch.buf.base();
+                let end = off + len;
+                let mut ivs = Vec::new();
+                if off < base && let Some(w) = s.writer.as_ref() {
+                    ivs.extend(w.covered_intervals(off, base.min(end) - off));
+                }
+                if end > base {
+                    let from = base.max(off);
+                    ivs.extend(ch.buf.intervals(from, end - from));
+                }
+                merge_intervals(ivs)
+            }
             SlotMode::Rar => {
                 let Some(m) = s.mapper.as_ref() else { return Vec::new() };
                 let end = off + len;
@@ -5397,18 +5885,7 @@ impl Extractor {
                         ivs.push((off + span_off + (a - file_lo), off + span_off + (b - file_lo)));
                     }
                 }
-                ivs.sort_unstable();
-                let mut out: Vec<(u64, u64)> = Vec::new();
-                for (a, b) in ivs {
-                    if let Some(last) = out.last_mut()
-                        && a <= last.1
-                    {
-                        last.1 = last.1.max(b);
-                        continue;
-                    }
-                    out.push((a, b));
-                }
-                out
+                merge_intervals(ivs)
             }
             // Unclassified slot: pre-sniff holds are exact file bytes at
             // file offsets (a nested child whose offset-0 header is the
@@ -5424,18 +5901,7 @@ impl Extractor {
                         ivs.push((a, b));
                     }
                 }
-                ivs.sort_unstable();
-                let mut out: Vec<(u64, u64)> = Vec::new();
-                for (a, b) in ivs {
-                    if let Some(last) = out.last_mut()
-                        && a <= last.1
-                    {
-                        last.1 = last.1.max(b);
-                        continue;
-                    }
-                    out.push((a, b));
-                }
-                out
+                merge_intervals(ivs)
             }
             SlotMode::Discard => Vec::new(),
         }
@@ -5493,6 +5959,18 @@ impl Extractor {
                 if fname == name {
                     return vec![(si, start.min(w.size), end.min(w.size), w.size)];
                 }
+                continue;
+            }
+            // Chased slot: identity too, but keyed by NAME - a chase
+            // holds its bytes in a frontier buffer and never opens a
+            // writer, so the match above can never see it. Without this
+            // a top-level 7z's tail promote resolved to nothing and fell
+            // back to the coarse NZB-ladder estimate.
+            if matches!(s.mode, SlotMode::RarChase | SlotMode::SevenZ)
+                && !s.name.is_empty()
+                && sanitize_filename(&s.name) == name
+            {
+                return vec![(si, start.min(s.size), end.min(s.size), s.size)];
             }
         }
         // Extracted inner file: walk every resolved (volume-slot, entry)
@@ -5739,6 +6217,21 @@ impl Extractor {
     /// mapped slot onto the no-writer path (worse than a few bad blocks).
     pub fn is_mapped(&self, slot: usize) -> bool {
         matches!(self.inner.lock().unwrap().slots[slot].mode, SlotMode::Rar)
+    }
+
+    /// Is this slot being CHASED - its bytes retained in a frontier
+    /// buffer rather than written to a file? Like a mapped slot it has
+    /// no on-disk copy, so PAR2 read-back must come through
+    /// [`Self::read_at`] and a repair that wants volume files must
+    /// [`Self::materialize`] it first; unlike a mapped slot it cannot
+    /// take a [`Self::patch_volume_span`] rewrite, so mapped repair has
+    /// to decline it. Only reachable at depth 0 for a posted `.7z`
+    /// (TODO 37 step 1); nested chases live below the caller's view.
+    pub fn is_chased(&self, slot: usize) -> bool {
+        matches!(
+            self.inner.lock().unwrap().slots[slot].mode,
+            SlotMode::RarChase | SlotMode::SevenZ
+        )
     }
 
 
@@ -8223,9 +8716,12 @@ mod tests {
     #[test]
     fn shape_reports_a_top_level_7z_as_unpacked_on_disk() {
         let dir = tmpdir("shape-7z");
-        // A top-level .7z never maps in-stream (the chase is nested-only),
-        // so it lands on disk for the post-pass. Without the signature
-        // sniff the badge would say nothing at all about a 7z release.
+        // A top-level .7z the chase cannot take - here the start header
+        // fails its own CRC, so `sevenz_start_header` declines before the
+        // depth question even arises - lands on disk for the post-pass.
+        // Without the signature sniff the badge would say nothing at all
+        // about a 7z release. (A well-formed one streams instead: see
+        // `sevenz_top_level_extracts_one_pass`.)
         let mut vol = b"7z\xbc\xaf\x27\x1c".to_vec();
         vol.extend_from_slice(&payload(80_000, 6));
         let ex = Extractor::new(&dir, 1, true);
@@ -10724,6 +11220,68 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The conflict forfeit, end to end through `write` - the trigger the
+    /// buffer-level tests do not exercise.
+    ///
+    /// The story is the one the guard exists for: an article arrives whose
+    /// own CRC passes but whose bytes are wrong, the chase decodes them,
+    /// and only then does PAR2 rebuild the range and deliver a DIFFERING
+    /// copy. Carrying on would ship what was decoded from the stale bytes
+    /// with every checksum on the path still passing, so the rewrite must
+    /// forfeit the chase. The retained record ends up holding the repaired
+    /// bytes, so the materialized volume is byte-exact and the disk pass
+    /// re-extracts it.
+    #[test]
+    fn chase_differing_rewrite_forfeits_and_materializes_repaired() {
+        let dir = tmpdir("chase-rewrite");
+        let f = noisy(2_400_000, 121);
+        let inner_arch = rars_compressed_volume(&[("F.bin", &f)]);
+        assert_not_store(&inner_arch);
+        let outer = fixtures::rar5_volume(&[(
+            "inner.rar",
+            inner_arch.len() as u64,
+            &inner_arch,
+            false,
+            false,
+        )]);
+        // Well past the outer headers, so the damaged chunk lands in the
+        // inner payload the chase is decoding, not in the mapping.
+        const BAD: usize = 10;
+        const STEP: usize = 50_000;
+        assert!(outer.len() > (BAD + 4) * STEP, "outer too small: {}", outer.len());
+
+        let ex = Extractor::new(&dir, 1, true);
+        for (i, chunk) in outer.chunks(STEP).enumerate() {
+            let off = (i * STEP) as u64;
+            if i == BAD {
+                // Passes its own CRC, still wrong.
+                let mut stale = chunk.to_vec();
+                for b in stale.iter_mut() {
+                    *b ^= 0xff;
+                }
+                ex.write(0, "v.rar", outer.len() as u64, off, &stale).unwrap();
+                continue;
+            }
+            ex.write(0, "v.rar", outer.len() as u64, off, chunk).unwrap();
+        }
+        // The repair lands after the chase has already consumed the range.
+        let fixed = &outer[BAD * STEP..(BAD + 1) * STEP];
+        ex.write(0, "v.rar", outer.len() as u64, (BAD * STEP) as u64, fixed)
+            .unwrap();
+
+        let rep = ex.finish().unwrap();
+        let reasons: Vec<&str> = rep.fallbacks.iter().map(|(_, w)| w.as_str()).collect();
+        assert!(
+            reasons.iter().any(|w| w.contains("rewrote")),
+            "the forfeit must be reported, and say why: {reasons:?}"
+        );
+        // Byte-exact against the REPAIRED archive: the later delivery won,
+        // so nothing decoded from the stale copy survived into the output.
+        assert_eq!(std::fs::read(dir.join("inner.rar")).unwrap(), inner_arch);
+        assert!(!dir.join("F.bin").exists(), "partial chase output survived");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Bytes never arrive: finish() aborts the still-blocked chase and
     /// demotes cleanly - no hang, job Ok, the materialized level-1
     /// archive carries everything that DID arrive (the lost article's
@@ -11828,6 +12386,545 @@ mod tests {
         assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
         assert_eq!(std::fs::read(dir.join("inner.7z.001")).unwrap(), &arch[..half]);
         assert_eq!(dir_files(&dir), vec!["inner.7z.001".to_string()]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // -- TODO 37 step 1: the SAME chase, one level up (posted .7z) --
+
+    /// A single-file `.7z` posted directly - no RAR around it. The chase
+    /// takes it at depth 0 now, so its payload streams out and the
+    /// archive itself never touches disk. Three feed orders, including
+    /// the natural one where the end header arrives dead last.
+    #[test]
+    fn sevenz_top_level_extracts_one_pass() {
+        let f = payload(280_000, 120);
+        let arch = sevenz_archive(&[("F.bin", &f)], None, false);
+        let art = 7000usize;
+        let n_arts = arch.len().div_ceil(art);
+        let orders: Vec<Vec<usize>> = vec![
+            (0..n_arts).collect(),                               // tail last
+            (0..n_arts).rev().collect(),                         // tail first
+            (0..n_arts).map(|i| (i * 7 + 3) % n_arts).collect(), // scrambled
+        ];
+        for (t, order) in orders.iter().enumerate() {
+            let dir = tmpdir(&format!("7z-top-onepass{t}"));
+            let ex = Arc::new(Extractor::new(&dir, 1, true));
+            ex.anchor();
+            let mut seen = vec![false; n_arts];
+            for &i in order {
+                if std::mem::replace(&mut seen[i], true) {
+                    continue;
+                }
+                let s = i * art;
+                let e = (s + art).min(arch.len());
+                ex.write(0, "release.7z", arch.len() as u64, s as u64, &arch[s..e])
+                    .unwrap();
+            }
+            let rep = ex.finish().unwrap();
+            assert!(rep.fallbacks.is_empty(), "order {t}: {:?}", rep.fallbacks);
+            assert!(
+                rep.extracted
+                    .iter()
+                    .any(|(n, s)| n == "F.bin" && *s == f.len() as u64),
+                "order {t}: {:?}",
+                rep.extracted
+            );
+            assert_eq!(std::fs::read(dir.join("F.bin")).unwrap(), f, "order {t}");
+            // The point of the whole exercise: no materialized archive.
+            assert_eq!(dir_files(&dir), vec!["F.bin".to_string()], "order {t}");
+            assert_eq!(shape_of(&ex), ["7z", "one-pass"], "order {t}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// The root half of the tail-prefetch wiring, which never worked
+    /// before: `promote_slot_spans` used to bail at the root because it
+    /// looked for a parent, and `map_output_range` could not see a slot
+    /// with no writer. Now the posted `.7z` reaches the installed hook
+    /// by its own name, and that name resolves back to its own slot.
+    #[test]
+    fn sevenz_top_level_tail_promote_reaches_the_root_hook() {
+        let f = payload(240_000, 121);
+        let arch = sevenz_archive(&[("F.bin", &f)], None, false);
+        let (ho, hs) = sevenz_start_header(&arch).expect("fixture start header");
+        let tail = (32 + ho, 32 + ho + hs);
+        let dir = tmpdir("7z-top-promote");
+        let ex = Arc::new(Extractor::new(&dir, 1, true));
+        type Calls = Arc<Mutex<Vec<(String, u64, Vec<(u64, u64)>)>>>;
+        let calls: Calls = Default::default();
+        let sink = calls.clone();
+        ex.set_promote_hook(Arc::new(move |n: &str, s: u64, sp: &[(u64, u64)]| {
+            sink.lock().unwrap().push((n.to_string(), s, sp.to_vec()));
+        }));
+        feed(&ex, 0, "release.7z", &arch, 6000, 50);
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(std::fs::read(dir.join("F.bin")).unwrap(), f);
+        assert_eq!(
+            calls.lock().unwrap().clone(),
+            vec![("release.7z".to_string(), arch.len() as u64, vec![tail])]
+        );
+        // The main.rs half: the hook's (name, range) resolves to this
+        // slot's own bytes, identity - it IS the posted file.
+        assert_eq!(
+            ex.map_output_range("release.7z", tail.0, tail.1),
+            vec![(0usize, tail.0, tail.1, arch.len() as u64)]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Over the retention cap at depth 0: with no drop-behind trimming
+    /// the archive cannot be held, so it demotes to a materialized .7z
+    /// for the disk post-pass - byte-exact, partial output swept. The
+    /// demote reason keeps the "held-bytes cap" substring the caller
+    /// reads, under the marker that keeps a lone .7z out of the RAR
+    /// unpack ladder.
+    #[test]
+    fn sevenz_top_level_budget_breach_demotes() {
+        let f = noisy(2_400_000, 122);
+        let arch = sevenz_archive(&[("F.bin", &f)], None, false);
+        assert!(arch.len() > 900_000, "packed too small: {}", arch.len());
+        let dir = tmpdir("7z-top-budget");
+        let ex = Arc::new(Extractor::new(&dir, 3, true));
+        ex.anchor();
+        ex.set_holds_cap(1); // floors at 8 MB
+        let junk = payload(65_000, 123);
+        for slot in [1usize, 2] {
+            for i in 0..60u64 {
+                ex.write(slot, &format!("dummy{slot}.bin"), 8_000_000, 64_000 + i * 65_000, &junk)
+                    .unwrap();
+            }
+        }
+        for (i, chunk) in arch.chunks(50_000).enumerate() {
+            ex.write(0, "release.7z", arch.len() as u64, (i * 50_000) as u64, chunk)
+                .unwrap();
+        }
+        let rep = ex.finish().unwrap();
+        assert!(
+            rep.fallbacks.iter().any(|(_, w)| w
+                .starts_with(SEVENZ_DISK_FALLBACK_PREFIX)
+                && w.contains("held-bytes cap: chase memory")),
+            "{:?}",
+            rep.fallbacks
+        );
+        assert_eq!(std::fs::read(dir.join("release.7z")).unwrap(), arch);
+        assert!(!dir.join("F.bin").exists(), "partial 7z output survived");
+        // Nothing streamed, so the badge must not claim a partial pass.
+        assert_eq!(shape_of(&ex), ["7z", "on-disk"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Multipart stays excluded AT DEPTH 0 too. The nested pin for this
+    /// (`sevenz_multipart_part_declines_to_materialize`) runs below the
+    /// root, where the old depth guard declined first, so it could not
+    /// have caught a regression here. What holds the line is the
+    /// arithmetic - a part's end header lies past its own bytes.
+    #[test]
+    fn sevenz_top_level_multipart_declines_to_materialize() {
+        let f = payload(200_000, 124);
+        let arch = sevenz_archive(&[("F.bin", &f)], None, false);
+        let half = arch.len() / 2;
+        let dir = tmpdir("7z-top-multipart");
+        let ex = Arc::new(Extractor::new(&dir, 1, true));
+        ex.anchor();
+        feed(&ex, 0, "release.7z.001", &arch[..half], 7000, 51);
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(
+            std::fs::read(dir.join("release.7z.001")).unwrap(),
+            &arch[..half]
+        );
+        assert_eq!(dir_files(&dir), vec!["release.7z.001".to_string()]);
+        assert_eq!(shape_of(&ex), ["7z", "on-disk"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The top-level gate: NZBFAST_NO_TOP_7Z=1 parses as off, and the
+    /// runtime setter drives the same latch - with it off a posted .7z
+    /// materializes for the disk post-pass exactly as it did before the
+    /// depth guard came off, while a NESTED .7z keeps streaming. The env
+    /// PARSE is asserted on the pure helper for the same parallel-runner
+    /// reason as `nested_disabled_by_env`.
+    #[test]
+    fn top_level_sevenz_disabled_by_env() {
+        assert!(top_sevenz_env_off_value(Some("1")));
+        assert!(!top_sevenz_env_off_value(Some("0")));
+        assert!(!top_sevenz_env_off_value(None));
+
+        let f = payload(150_000, 125);
+        let arch = sevenz_archive(&[("F.bin", &f)], None, false);
+        let dir = tmpdir("7z-top-gate");
+        let ex = Arc::new(Extractor::new(&dir, 1, true));
+        ex.anchor();
+        assert!(
+            ex.inner.lock().unwrap().top_sevenz_on,
+            "gate must default on"
+        );
+        ex.set_top_level_sevenz(false);
+        feed(&ex, 0, "release.7z", &arch, 7000, 52);
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(std::fs::read(dir.join("release.7z")).unwrap(), arch);
+        assert_eq!(dir_files(&dir), vec!["release.7z".to_string()]);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // Same gate off, a .7z one level down: still streams.
+        let outer = store_outer("inner.7z", &arch);
+        let dir = tmpdir("7z-top-gate-nested");
+        let ex = Arc::new(Extractor::new(&dir, 1, true));
+        ex.anchor();
+        ex.set_top_level_sevenz(false);
+        feed(&ex, 0, "v.rar", &outer, 7000, 53);
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(std::fs::read(dir.join("F.bin")).unwrap(), f);
+        assert_eq!(dir_files(&dir), vec!["F.bin".to_string()]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // -- TODO 37 step 2: drop-behind trimming --
+
+    /// A chased slot's live 7z control, for the trim tests.
+    fn sevenz_ctl(ex: &Extractor, slot: usize) -> Option<Arc<SevenZCtl>> {
+        ex.inner.lock().unwrap().slots[slot].sevenz.clone()
+    }
+
+    /// Feed a chased slot the way a real download behaves against a
+    /// decoder that is keeping up: the offset-0 article first (the sniff
+    /// that attaches the chase), then the TAIL (which in production the
+    /// promote hook front-loads, and without which the engine can never
+    /// open the archive), then the body in order - waiting between
+    /// chunks for the engine's read frontier to come within `slack` of
+    /// the arrival frontier.
+    ///
+    /// That wait is the whole point: the trim releases bytes BELOW the
+    /// engine's read position, so a test that shovels the archive in
+    /// faster than it decodes is testing the case trimming cannot help
+    /// (and correctly demotes), not the case it exists for. Returns the
+    /// highest trim point the buffer reached.
+    fn feed_paced_tail_first(
+        ex: &Extractor,
+        slot: usize,
+        name: &str,
+        vol: &[u8],
+        chunk: usize,
+        slack: u64,
+        withhold_body_chunks: usize,
+    ) -> u64 {
+        let n = vol.len();
+        let put = |off: usize, end: usize| {
+            ex.write(slot, name, n as u64, off as u64, &vol[off..end.min(n)]).unwrap();
+        };
+        put(0, chunk);
+        let tail_from = n.saturating_sub(chunk * 2).max(chunk);
+        put(tail_from, n);
+        // Leaving a gap short of the tail keeps the chase LIVE and
+        // trimmed at the end of the feed, which is the state the demote
+        // and read-back tests need to look at.
+        let body_end = tail_from.saturating_sub(withhold_body_chunks * chunk);
+        let mut high_base = 0u64;
+        let mut off = chunk;
+        while off < body_end {
+            put(off, off + chunk);
+            off += chunk;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let Some(ch) = ex.inner.lock().unwrap().slots[slot].chase.as_ref().map(|c| c.buf.clone())
+                else {
+                    break; // demoted, or finish() already took it
+                };
+                high_base = high_base.max(ch.base());
+                let (front, low) = (
+                    ch.frontier(),
+                    sevenz_ctl(ex, slot).map_or(u64::MAX, |c| c.low_water.load(Ordering::Relaxed)),
+                );
+                if low + slack >= front || std::time::Instant::now() > deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        high_base
+    }
+
+    /// A `.7z` several times the retention cap streams end to end: the
+    /// engine's consumed prefix is dropped out of RAM into the archive's
+    /// own path as it goes, and on success that partial file is removed,
+    /// so the payload is the only thing left. Before trimming, an
+    /// archive this size could only demote.
+    #[test]
+    fn sevenz_trim_streams_an_archive_over_the_cap() {
+        let f = noisy(24 << 20, 130);
+        // Copy codec: no compression, so "decode" keeps up with arrival
+        // the way it does on the already-compressed video that is the
+        // overwhelming majority of posted payload.
+        let arch = sevenz_archive(
+            &[("F.bin", &f)],
+            Some(vec![sevenz_rust2::EncoderConfiguration::new(
+                sevenz_rust2::EncoderMethod::COPY,
+            )]),
+            false,
+        );
+        assert!(arch.len() > 24 << 20, "fixture too small: {}", arch.len());
+        let dir = tmpdir("7z-trim-stream");
+        let ex = Arc::new(Extractor::new(&dir, 1, true));
+        ex.anchor();
+        ex.set_holds_cap(1); // floors at 8 MB, so the archive is 3x the cap
+        let high_base = feed_paced_tail_first(&ex, 0, "big.7z", &arch, 256 << 10, 2 << 20, 0);
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert!(high_base > 0, "nothing was ever trimmed - the test proved nothing");
+        assert_eq!(std::fs::read(dir.join("F.bin")).unwrap(), f);
+        assert_eq!(dir_files(&dir), vec!["F.bin".to_string()], "spilled archive survived");
+        assert_eq!(shape_of(&ex), ["7z", "one-pass"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The demote path stays free. Spilling into the archive's own path
+    /// rather than a temp file means a chase that trims and THEN fails
+    /// finds its prefix already in the right place: `fallback_slot`
+    /// writes only what is still in RAM, and the materialized archive is
+    /// whole and byte-exact.
+    #[test]
+    fn sevenz_trim_then_demote_materializes_byte_exact() {
+        let f = noisy(24 << 20, 131);
+        let arch = sevenz_archive(
+            &[("F.bin", &f)],
+            Some(vec![sevenz_rust2::EncoderConfiguration::new(
+                sevenz_rust2::EncoderMethod::COPY,
+            )]),
+            false,
+        );
+        let dir = tmpdir("7z-trim-demote");
+        let ex = Arc::new(Extractor::new(&dir, 1, true));
+        ex.anchor();
+        ex.set_holds_cap(1);
+        // Stop short of the end so the chase cannot complete, then feed
+        // the remainder and demote: the archive must still be exact.
+        let chunk = 256 << 10;
+        let high_base = feed_paced_tail_first(&ex, 0, "big.7z", &arch, chunk, 2 << 20, 4);
+        assert!(high_base > 0, "nothing was ever trimmed - the test proved nothing");
+        {
+            let mut g = ex.inner.lock().unwrap();
+            let inner = &mut *g;
+            ex.fallback_slot_or_group(inner, 0, "held-bytes cap: chase memory").unwrap();
+        }
+        // The body chunks the demote never saw arrive afterwards, as
+        // late articles would, and land in the materialized file.
+        let tail_from = arch.len().saturating_sub(chunk * 2).max(chunk);
+        let gap = tail_from - chunk * 4;
+        ex.write(0, "big.7z", arch.len() as u64, gap as u64, &arch[gap..tail_from])
+            .unwrap();
+        let rep = ex.finish().unwrap();
+        assert!(
+            rep.fallbacks.iter().any(|(_, w)| w.contains("held-bytes cap: chase memory")),
+            "{:?}",
+            rep.fallbacks
+        );
+        assert_eq!(
+            std::fs::read(dir.join("big.7z")).unwrap(),
+            arch,
+            "the materialized archive lost the trimmed prefix"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// PAR2 read-back has to work over a trimmed prefix, or a job whose
+    /// archive is being trimmed reports its own blocks bad. The slot's
+    /// coverage and read paths split at the trim point: below it the
+    /// spilled archive file answers, above it the buffer does.
+    #[test]
+    fn sevenz_trim_keeps_the_slot_readable_across_the_split() {
+        let f = noisy(24 << 20, 132);
+        let arch = sevenz_archive(
+            &[("F.bin", &f)],
+            Some(vec![sevenz_rust2::EncoderConfiguration::new(
+                sevenz_rust2::EncoderMethod::COPY,
+            )]),
+            false,
+        );
+        let dir = tmpdir("7z-trim-readback");
+        let ex = Arc::new(Extractor::new(&dir, 1, true));
+        ex.anchor();
+        ex.set_holds_cap(1);
+        let chunk = 256 << 10;
+        let high_base = feed_paced_tail_first(&ex, 0, "big.7z", &arch, chunk, 2 << 20, 4);
+        assert!(high_base > 0, "nothing was ever trimmed - the test proved nothing");
+        let base = ex.inner.lock().unwrap().slots[0].chase.as_ref().unwrap().buf.base();
+        assert!(base > 0);
+        // A window straddling the trim point: half off disk, half out of
+        // the frontier buffer, and it has to read as the archive does.
+        let lo = (base - 4096) as usize;
+        let hi = (base + 4096) as usize;
+        assert!(ex.covered(0, lo as u64, hi - lo), "straddling window not covered");
+        let mut got = vec![0u8; hi - lo];
+        ex.read_at(0, lo as u64, &mut got).unwrap();
+        assert_eq!(got, arch[lo..hi], "read across the trim point differs");
+        // And the very first bytes, long since spilled.
+        assert!(ex.covered(0, 0, 4096));
+        let mut head = vec![0u8; 4096];
+        ex.read_at(0, 0, &mut head).unwrap();
+        assert_eq!(head, arch[..4096]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The trim gate: NZBFAST_NO_7Z_TRIM=1 parses as off, and with it off
+    /// an archive over the cap demotes exactly as it did before trimming
+    /// existed. The env PARSE is asserted on the pure helper for the same
+    /// parallel-runner reason as `nested_disabled_by_env`.
+    #[test]
+    fn sevenz_trim_disabled_by_env() {
+        assert!(sevenz_trim_env_off_value(Some("1")));
+        assert!(!sevenz_trim_env_off_value(Some("0")));
+        assert!(!sevenz_trim_env_off_value(None));
+
+        let f = noisy(24 << 20, 133);
+        let arch = sevenz_archive(
+            &[("F.bin", &f)],
+            Some(vec![sevenz_rust2::EncoderConfiguration::new(
+                sevenz_rust2::EncoderMethod::COPY,
+            )]),
+            false,
+        );
+        let dir = tmpdir("7z-trim-gate");
+        let ex = Arc::new(Extractor::new(&dir, 1, true));
+        ex.anchor();
+        assert!(ex.inner.lock().unwrap().sevenz_trim_on, "gate must default on");
+        ex.set_sevenz_trim(false);
+        ex.set_holds_cap(1);
+        let high_base = feed_paced_tail_first(&ex, 0, "big.7z", &arch, 256 << 10, 2 << 20, 0);
+        let rep = ex.finish().unwrap();
+        assert_eq!(high_base, 0, "the gate did not stop the trim");
+        assert!(
+            rep.fallbacks.iter().any(|(_, w)| w.contains("held-bytes cap: chase memory")),
+            "{:?}",
+            rep.fallbacks
+        );
+        assert_eq!(std::fs::read(dir.join("big.7z")).unwrap(), arch);
+        assert!(!dir.join("F.bin").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A span landing BELOW the trim point is the one delivery the
+    /// buffer cannot judge - those bytes are on disk, not in `data`, so
+    /// there is nothing to compare against. It is treated as a repair
+    /// rewrite: the file takes the new bytes (so the materialized
+    /// archive carries them) and the chase forfeits, because anything
+    /// the engine decoded from that range came from the old copy.
+    #[test]
+    fn sevenz_span_below_the_trim_point_forfeits_and_corrects_the_file() {
+        let f = noisy(24 << 20, 135);
+        let arch = sevenz_archive(
+            &[("F.bin", &f)],
+            Some(vec![sevenz_rust2::EncoderConfiguration::new(
+                sevenz_rust2::EncoderMethod::COPY,
+            )]),
+            false,
+        );
+        let dir = tmpdir("7z-trim-rewrite");
+        let ex = Arc::new(Extractor::new(&dir, 1, true));
+        ex.anchor();
+        ex.set_holds_cap(1);
+        let chunk = 256 << 10;
+        let high_base = feed_paced_tail_first(&ex, 0, "big.7z", &arch, chunk, 2 << 20, 4);
+        assert!(high_base > 0, "nothing was ever trimmed - the test proved nothing");
+        let base = ex.inner.lock().unwrap().slots[0].chase.as_ref().unwrap().buf.base();
+        // A rewrite of a long-spilled range, with DIFFERENT bytes - the
+        // poster-side damage shape the conflict guard exists for.
+        let at = (base / 2) as usize;
+        let mut fixed = arch[at..at + 8192].to_vec();
+        fixed[0] ^= 0xff;
+        ex.write(0, "big.7z", arch.len() as u64, at as u64, &fixed).unwrap();
+        // Deliver the rest so nothing is missing but the forfeit.
+        let tail_from = arch.len().saturating_sub(chunk * 2).max(chunk);
+        let gap = tail_from - chunk * 4;
+        ex.write(0, "big.7z", arch.len() as u64, gap as u64, &arch[gap..tail_from])
+            .unwrap();
+        let rep = ex.finish().unwrap();
+        assert!(
+            rep.fallbacks.iter().any(|(_, w)| w.contains("repair rewrote chased bytes")),
+            "the chase did not forfeit: {:?}",
+            rep.fallbacks
+        );
+        assert!(!dir.join("F.bin").exists(), "partial output survived the forfeit");
+        let mut want = arch.clone();
+        want[at..at + 8192].copy_from_slice(&fixed);
+        assert_eq!(
+            std::fs::read(dir.join("big.7z")).unwrap(),
+            want,
+            "the materialized archive kept the stale bytes"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The BCJ2 opt-out reads the coder map, which is known from the end
+    /// header before any payload byte is touched. The encoder half of
+    /// sevenz-rust2 cannot WRITE a BCJ2 archive, so the positive case has
+    /// no in-process fixture; what is pinned here is that the predicate
+    /// runs against a real parsed archive and clears the ordinary chains,
+    /// which is what decides whether trimming is allowed at all.
+    #[test]
+    fn sevenz_needs_history_clears_the_ordinary_coder_chains() {
+        let f = payload(200_000, 134);
+        for (tag, methods) in [
+            ("lzma2", None),
+            (
+                "copy",
+                Some(vec![sevenz_rust2::EncoderConfiguration::new(
+                    sevenz_rust2::EncoderMethod::COPY,
+                )]),
+            ),
+        ] {
+            let arch = sevenz_archive(&[("F.bin", &f)], methods, false);
+            let reader = sevenz_rust2::ArchiveReader::new(
+                std::io::Cursor::new(arch),
+                sevenz_rust2::Password::empty(),
+            )
+            .unwrap();
+            assert!(
+                !Extractor::sevenz_needs_history(reader.archive()),
+                "{tag} must be trimmable"
+            );
+        }
+    }
+
+    /// A root that never called [`Extractor::anchor`] has no handle for
+    /// a chase worker to reach it through, so a posted `.7z` declines
+    /// and materializes. That is the safe direction (it is exactly the
+    /// pre-TODO-37 behaviour), and pinning it here says so out loud -
+    /// the alternative reading, "the guard lift did nothing", would look
+    /// identical from the output directory.
+    #[test]
+    fn sevenz_top_level_declines_without_an_anchor() {
+        let f = payload(150_000, 127);
+        let arch = sevenz_archive(&[("F.bin", &f)], None, false);
+        let dir = tmpdir("7z-top-unanchored");
+        let ex = Extractor::new(&dir, 1, true); // no Arc, no anchor
+        feed(&ex, 0, "release.7z", &arch, 7000, 55);
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(dir_files(&dir), vec!["release.7z".to_string()]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A resumed run never chases: extraction is disabled wholesale, so
+    /// every slot classifies Plain on its first span and the posted .7z
+    /// lands on disk. That is what keeps the journal honest - chase
+    /// bytes are held in RAM and never recorded as persisted, so a
+    /// resumed job that re-entered the chase would re-download the whole
+    /// archive to fill a buffer it then throws away.
+    #[test]
+    fn sevenz_top_level_never_chases_on_a_resumed_run() {
+        let f = payload(160_000, 126);
+        let arch = sevenz_archive(&[("F.bin", &f)], None, false);
+        let dir = tmpdir("7z-top-resume");
+        let ex = Arc::new(Extractor::with_resume(&dir, 1, false, true));
+        ex.anchor();
+        feed(&ex, 0, "release.7z", &arch, 7000, 54);
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(std::fs::read(dir.join("release.7z")).unwrap(), arch);
+        assert_eq!(dir_files(&dir), vec!["release.7z".to_string()]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

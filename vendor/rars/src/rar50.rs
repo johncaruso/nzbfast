@@ -980,6 +980,25 @@ impl Rev5VolumeMeta {
         {
             return Err(Error::InvalidHeader("RAR 5 REV volume number is invalid"));
         }
+        // The same rules `StripeRepairPlan::new` enforces, applied where the
+        // counts come off the wire so a hostile header dies at parse time.
+        // `data_count` is deliberately NOT capped on its own: a large release
+        // legitimately spans thousands of data volumes, and the repair cost
+        // scales with the recovery/damage side, not the slot count. The two
+        // together must still fit the GF(2^16) code word, which is the bound
+        // no REV set - real or forged - can escape.
+        if usize::from(recovery_count) > crate::recovery::rar5::MAX_RECONSTRUCTION_SHARDS {
+            return Err(Error::InvalidHeader(
+                "RAR 5 REV recovery volume count is implausibly large",
+            ));
+        }
+        if usize::from(data_count) + usize::from(recovery_count)
+            > crate::recovery::rar5::FIELD_SIZE
+        {
+            return Err(Error::InvalidHeader(
+                "RAR 5 REV volume counts exceed the recovery field",
+            ));
+        }
 
         let expected_table_len = data_count as usize * 12;
         let expected_table_end =
@@ -2598,10 +2617,19 @@ mod tests {
     #[test]
     fn rev5_reconstruction_refuses_a_slot_count_nothing_backs() {
         let payload = vec![0x5a; 1024 * 1024];
-        let rev = forged_rev(65_535, 1, 65_535, &payload);
+        // 65_535 data volumes plus even one recovery volume cannot fit the
+        // GF(2^16) code word, so that shape now dies at parse time.
+        assert!(
+            Rev5Volume::parse(&forged_rev(65_535, 1, 65_535, &payload)).is_err(),
+            "a REV set wider than the recovery field must not parse"
+        );
+
+        // The widest declaration the field admits still claims a grid no
+        // whole-set reconstruction can afford.
+        let rev = forged_rev(65_534, 1, 65_534, &payload);
         assert_eq!(
-            65_535u64 * payload.len() as u64,
-            68_718_428_160,
+            65_534u64 * payload.len() as u64,
+            68_717_379_584,
             "the file claims a 64 GiB grid"
         );
         assert!(
@@ -2611,8 +2639,8 @@ mod tests {
         );
 
         let volume = Rev5Volume::parse(&rev).unwrap();
-        assert_eq!(volume.data_volumes.len(), 65_535);
-        let slots: Vec<Option<&[u8]>> = vec![None; 65_535];
+        assert_eq!(volume.data_volumes.len(), 65_534);
+        let slots: Vec<Option<&[u8]>> = vec![None; 65_534];
 
         let before = resident_bytes();
         let result = repair_rev5_volumes_to(&slots, &[volume], |_, _| Ok(()));
@@ -2791,6 +2819,108 @@ mod rev_stream_tests {
                 assert_eq!(crc32(&rebuilt[slot]), slots[index].crc32);
             }
         }
+    }
+
+    /// A REV set the size real releases actually reach: a 100 GB release cut
+    /// into 15 MB volumes is ~6,800 data volumes, well past
+    /// MAX_RECONSTRUCTION_SHARDS. The striped planner's first cap refused
+    /// the slot count outright (`ReconstructionTooLarge`), turning a repair
+    /// this crate used to perform into a hard failure - the matrix only ever
+    /// costs `damaged * data_count`, so the slot count alone must never be
+    /// the reason a repair is refused. Volumes are tiny here so only the
+    /// GEOMETRY is large; the repair math is identical.
+    #[test]
+    fn streaming_rev_repairs_a_set_with_thousands_of_data_volumes() {
+        let sizes: Vec<usize> = (0..6_800).map(|index| 24 + (index % 3) * 2).collect();
+        let (data, revs) = build_rev_set(&sizes, 2);
+        let rev_sources: Vec<MemorySource> =
+            revs.iter().map(|bytes| MemorySource(bytes.clone())).collect();
+        let metas: Vec<Rev5VolumeRef> = rev_sources
+            .iter()
+            .map(|source| read_rev5_meta(source).unwrap())
+            .collect();
+        assert_eq!(metas[0].meta.data_count, 6_800);
+        let slots = metas[0].meta.data_volumes.clone();
+
+        let missing = vec![13usize, 5_431];
+        let sources: Vec<MemorySource> =
+            data.iter().map(|bytes| MemorySource(bytes.clone())).collect();
+        let intact: Vec<Option<&dyn crate::recovery::stream::RangeSource>> = (0..data.len())
+            .map(|index| {
+                (!missing.contains(&index))
+                    .then_some(&sources[index] as &dyn crate::recovery::stream::RangeSource)
+            })
+            .collect();
+        let recovery: Vec<Rev5RecoverySource<'_>> = rev_sources
+            .iter()
+            .zip(&metas)
+            .map(|(source, meta)| Rev5RecoverySource {
+                row: meta.row().unwrap(),
+                source,
+                payload: meta.payload.clone(),
+            })
+            .collect();
+
+        let mut rebuilt: Vec<Vec<u8>> = missing
+            .iter()
+            .map(|&index| vec![0u8; data[index].len()])
+            .collect();
+        let indices = repair_rev5_volumes_streaming(
+            &slots,
+            &intact,
+            &recovery,
+            metas[0].meta.recovery_count as usize,
+            64 << 10,
+            &mut |slot, offset, bytes| {
+                let start = offset as usize;
+                rebuilt[slot][start..start + bytes.len()].copy_from_slice(bytes);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(indices, missing);
+        for (slot, &index) in missing.iter().enumerate() {
+            assert_eq!(rebuilt[slot], data[index], "volume {index} not rebuilt");
+            assert_eq!(crc32(&rebuilt[slot]), slots[index].crc32);
+        }
+    }
+
+    /// The hostile counterpart: headers wider than the GF(2^16) code word,
+    /// or dragging a reconstruction-cap recovery count, must die at parse
+    /// time - quickly, and before anything is sized from them.
+    #[test]
+    fn rev_parse_rejects_wire_scale_volume_counts() {
+        let (_, revs) = build_rev_set(&[600, 512, 480], 2);
+        let started = std::time::Instant::now();
+
+        // 65_535 data + 1 recovery volumes cannot fit the field.
+        let mut over_field = revs[0].clone();
+        forge_counts(&mut over_field, 65_535, 1, 65_535);
+        assert!(read_rev5_meta(&MemorySource(over_field)).is_err());
+
+        // A recovery volume count past the reconstruction cap.
+        let mut over_cap = revs[0].clone();
+        forge_counts(&mut over_cap, 3, 60_000, 3);
+        assert!(read_rev5_meta(&MemorySource(over_cap)).is_err());
+
+        assert!(
+            started.elapsed().as_millis() < 500,
+            "hostile headers must be refused before anything is sized"
+        );
+    }
+
+    /// Rewrites a built `.rev`'s count fields and re-CRCs the header, so the
+    /// hostile-header tests never build the set the header merely declares.
+    fn forge_counts(rev: &mut [u8], data_count: u16, recovery_count: u16, recovery_number: u16) {
+        // Header body starts at 16; version byte, then the three u16s.
+        rev[17..19].copy_from_slice(&data_count.to_le_bytes());
+        rev[19..21].copy_from_slice(&recovery_count.to_le_bytes());
+        rev[21..23].copy_from_slice(&recovery_number.to_le_bytes());
+        let header_size =
+            u32::from_le_bytes(rev[12..16].try_into().unwrap()) as usize;
+        let header_crc = crc32(&rev[12..16 + header_size]);
+        rev[8..12].copy_from_slice(&header_crc.to_le_bytes());
     }
 
     /// The 5-volume RAR5 set and its 2 recovery volumes that WinRAR itself

@@ -504,6 +504,32 @@ button:active:not(:disabled){transform:scale(.94);filter:brightness(1.35)}
   .rels td:last-child .act{margin-left:8px}
   #toast{max-width:calc(100vw - 28px);bottom:calc(18px + env(safe-area-inset-bottom,0px))}
 }
+/* Built-in indexer switched off. This page stops being a wall and
+   becomes the search over your indexer accounts, so everything that
+   reads the LOCAL index goes: the poster grid and its strips, the
+   layout/density/zoom controls that only shape a grid, the local-only
+   filters, and the surface switcher itself (there is one surface now).
+   The search box, the category tabs and the results table stay - they
+   are what pull search uses. The setter of this class is the boot block
+   in the script; it runs before first paint, so nothing flashes. */
+body.noidx #views,body.noidx #strips,body.noidx #wall,
+body.noidx #suggest,body.noidx #chips,body.noidx #affnote,
+body.noidx #scope,body.noidx #sort,body.noidx #lsort,
+body.noidx #densctl,body.noidx #zoomwrap,body.noidx #unmChip,body.noidx #hidChip,
+body.noidx #viewPop{display:none!important}
+/* Nothing to search at all: built-in indexer off AND no indexer account.
+   A class rather than inline styles because setView() runs after the
+   boot block and sets #list's display itself - this has to outrank it,
+   and only !important does. */
+body.nosearch #list,body.nosearch #q,body.nosearch #tabs,
+body.nosearch #sortwrap,body.nosearch #more{display:none!important}
+/* Sits where the results table would be, when there is no indexer
+   account to search either - a blank page with a search box that can
+   never answer is worse than saying so. */
+#noidxnote{max-width:640px;margin:34px auto;padding:0 18px;line-height:1.65;
+  font-size:13.5px;color:var(--dim);text-align:center}
+#noidxnote b{color:var(--fg)}
+#noidxnote a{color:var(--acc)}
 </style></head><body>
 
 <div class="bar">
@@ -529,6 +555,12 @@ button:active:not(:disabled){transform:scale(.94);filter:brightness(1.35)}
   </div>
   <input id="q" data-i18n-placeholder="wall.q.ph" placeholder="Search titles…  ( / )" autocomplete="off">
   <span id="sortwrap" class="sortwrap">
+  <select id="scope" class="listonly" style="display:none" data-i18n-title="wall.scope.title"
+    title="Where a search looks: this machine's index, your indexer accounts (Settings), or both">
+    <option value="mine" data-i18n="wall.scope.mine">This index</option>
+    <option value="idx" data-i18n="wall.scope.idx">Indexers</option>
+    <option value="both" data-i18n="wall.scope.both">Both</option>
+  </select>
   <select id="sort">
     <option value="affinity" data-i18n="wall.sort.affinity">For you</option>
     <option value="latest" data-i18n="wall.sort.newest">Newest posts</option>
@@ -614,6 +646,11 @@ button:active:not(:disabled){transform:scale(.94);filter:brightness(1.35)}
      titles (the search has a people leg server-side); this strip is the
      way IN to a person page. -->
 <div id="peoplebar"></div>
+<!-- Shown only when the built-in indexer is off AND no third-party
+     indexer is configured, i.e. this page has nothing at all to search.
+     Filled by the boot block rather than written here, so it can point
+     at whichever of the two switches the user is missing. -->
+<div id="noidxnote" style="display:none"></div>
 <div class="wall" id="wall"></div>
 <!-- M28: infinite-scroll sentinel - crossing it pulls the next page. -->
 <div id="more" style="height:1px"></div>
@@ -692,6 +729,16 @@ button:active:not(:disabled){transform:scale(.94);filter:brightness(1.35)}
 // locale = browser choice → daemon default (serve-time token) →
 // navigator.language. Loader at the end of the script.
 const DAEMON_LOCALE='__NZBFAST_LOCALE__';
+// The built-in indexer's master switch and the number of third-party
+// Newznab accounts, stamped in by serve.rs (ui_shell_state) - see the
+// matching block in dashboard.html for why these are injected rather
+// than fetched. With the switch off this page keeps existing, because it
+// is also where pull search lives: the poster wall goes, and what is
+// left is a search over your indexer accounts. An unreplaced token means
+// "on", the state that hides nothing.
+const IDX_ON='__NZBFAST_INDEX__'!=='0';
+const IDX_COUNT=+'__NZBFAST_INDEXERS__'||0;
+if(!IDX_ON) document.body.classList.add('noidx');
 const LOCALES=['en','fr','de','it','es','nl','pt','sv','da','nb','fi','tr','ro','ru','pl','cs','uk','el','ja','he','ar','fa','hu','sk','hr','sr','bg','sl'];
 // §5 2b: RTL locales - loader stamps dir="rtl" for Hebrew/Arabic/Persian.
 const RTL_LOCALES=['he','ar','fa'];
@@ -779,7 +826,7 @@ let key = localStorage.nzbfastKey || '';
 // M31b: the sort is persisted so "For you" (affinity) sticks across
 // reloads; it also keeps the select's value in sync with sortBy given
 // affinity now leads the option list.
-let cards = [], tab = '', sortBy = localStorage.nzbfastWallSort || 'latest', hasTmdb = false, openKey = null;
+let cards = [], tab = '', sortBy = localStorage.nzbfastWallSort || 'latest', hasTmdb = false, openKey = null, openSeq = 0;
 // 'year' became 'aired' (same ordering, now to the day where a provider
 // gave us one). Migrate rather than leaving the select blank on the
 // reload after an upgrade.
@@ -1090,7 +1137,7 @@ async function renderStrips(){
   const toCard=c=>({
     key:c.key, kind:c.kind, title:c.title, year:c.year||0, aired:c.aired||'',
     poster:c.poster, complete:c.complete, res:c.res, n:c.n,
-    rating:c.rating, verdict:c.verdict, have:c.have, seasons:[],
+    rating:c.rating, verdict:c.verdict, have:c.have, reaped:c.reaped, seasons:[],
   });
   try{
     let html='';
@@ -1204,6 +1251,11 @@ let view, density, zoomPx;
 {
   const v2=localStorage.nzbfastWallView2, old=localStorage.nzbfastWallView;
   view = (v2==='wall'||v2==='releases') ? v2 : (old==='list'?'releases':'wall');
+  // With no local index there is no poster wall to lay out, so the table
+  // is the only surface. Deliberately NOT written back to localStorage:
+  // this is a forced view, not a choice, and it must not overwrite the
+  // wall the user will come back to when they switch the indexer on.
+  if(!IDX_ON) view='releases';
   const d2=localStorage.nzbfastWallDensity2;
   density = DENS[d2] ? d2 : (old==='dense'?'s':'m');
   // The slider's fine-tune rides ON TOP of the presets. One-shot legacy
@@ -1220,6 +1272,14 @@ let view, density, zoomPx;
 // lrows keeps the page currently on screen so a late i18n catalogue can
 // repaint the rows locally; null = nothing rendered yet.
 let lpage=0, ltotal=0, lseq=0, lrows=null;
+// M35 pull search: external-indexer results ride below the local rows.
+let extRows=[], extNotes=[];
+// Set when results were just fetched by something OTHER than the search
+// box (the title drawer's "Search my indexers", which asks by IMDb id).
+// The next browseFetch keeps them instead of re-running the query as
+// free text, which would both spend a second metered API hit and answer
+// with worse matches than the id search it would be overwriting.
+let extPinned=false;
 const LPAGE=50;
 // ---- poster density + zoom ------------------------------------------
 const ZOOM_MIN=84, ZOOM_MAX=320;
@@ -1377,7 +1437,10 @@ function setSortDir(flip){
 }
 
 function setView(v){
-  view=v; localStorage.nzbfastWallView2=v;
+  // Same reason as the forced view at boot: with the indexer off the
+  // table is not a preference, so remembering it would silently replace
+  // the wall the user chose before switching the indexer off.
+  view=v; if(IDX_ON) localStorage.nzbfastWallView2=v;
   document.querySelectorAll('#views button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));
   const rel=v==='releases';
   applyZoom();
@@ -1575,14 +1638,48 @@ async function browseFetch(){
     const sort=document.getElementById('lsort').value;
     const complete=document.getElementById('onlyComplete').checked?1:0;
     const dir=curDesc()?'desc':'asc';
-    const j=await api('index_browse',
-      `&cat=${encodeURIComponent(tab||'all')}&q=${encodeURIComponent(q)}`+
-      `&sort=${sort}&dir=${dir}&complete=${complete}&limit=${LPAGE}&offset=${lpage*LPAGE}`);
+    const scope=(document.getElementById('scope')||{value:'mine'}).value;
+    // M35: 'idx'/'both' also asks the configured external indexers.
+    // External search needs a query (an empty q would burn API-hit
+    // budgets browsing) and is unpaged - it renders on the first page.
+    const wantLocal=scope!=='idx';
+    const wantExt=scope!=='mine' && !!q && lpage===0 && !extPinned;
+    const kindMap={movie:'movie',tv:'tv',other:'other'};
+    const [j,xj]=await Promise.all([
+      wantLocal
+        ? api('index_browse',
+          `&cat=${encodeURIComponent(tab||'all')}&q=${encodeURIComponent(q)}`+
+          `&sort=${sort}&dir=${dir}&complete=${complete}&limit=${LPAGE}&offset=${lpage*LPAGE}`)
+        : Promise.resolve({results:[],total:0}),
+      wantExt
+        ? api('indexer_search',`&q=${encodeURIComponent(q)}&kind=${encodeURIComponent(kindMap[tab]||'')}`)
+          .catch(e=>({status:false,error:String(e)}))
+        : Promise.resolve(null),
+    ]);
     if(seq!==lseq) return;
     if(j.error){ toast(tErr(j.error)); return; }
-    updateCats(j.cats);
+    if(wantLocal) updateCats(j.cats);
     ltotal=j.total||0;
     lrows=j.results||[];
+    if(extPinned){
+      // Keep the pinned results exactly as they were; the pin is spent.
+      extPinned=false;
+      renderList(lrows);
+      return;
+    }
+    extNotes=[]; extRows=[];
+    if(xj){
+      if(!xj.status){ extNotes=[{error:xj.error||'?'}]; }
+      else{
+        // Prefer the local copy: a grab from our own index is free,
+        // the same release off an indexer spends the day's quota.
+        const have=new Set(lrows.map(r=>(r.name||'').toLowerCase()));
+        extRows=(xj.results||[]).filter(x=>!have.has((x.title||'').toLowerCase()));
+        extNotes=xj.notes||[];
+      }
+    } else if(scope!=='mine' && !q && lpage===0){
+      extNotes=[{hint:t('wall.ext.typeq','Type a search to ask your indexers - browsing them would spend your daily API allowance.')}];
+    }
     renderList(lrows);
   }catch(e){
     if(seq!==lseq) return;
@@ -1635,6 +1732,37 @@ function relRow(r,sub){
     ${actCell(r)}
   </tr>`;
 }
+// M35: one external-indexer result row. No ⓘ (nothing local to open),
+// no .nzb link and no checkbox - the token is the only handle, and the
+// daemon fetches the NZB itself on Download.
+function extRow(x){
+  const ts=x.age_days==null?0:Math.floor(Date.now()/1e3)-x.age_days*86400;
+  return `<tr class="ext">
+    <td class="selcol"></td>
+    <td class="name" title="${esc(x.title)}"><span class="stem">${esc(x.title)}</span>
+      <div class="brow"><span class="nbadge" data-i18n-skip title="${esc(t('wall.ext.src','Found on your indexer account'))}">${esc(x.indexer)}</span></div></td>
+    <td>${esc(x.kind||'')}</td>
+    <td class="mono dim">${age(ts)}</td>
+    <td class="mono">${gb(x.size||0)}</td>
+    <td class="mono dim">–</td>
+    <td class="mono dim" title="${esc(t('wall.ext.grabs','How often this indexer’s users grabbed it'))}">${x.grabs?x.grabs+'↓':''}</td>
+    <td style="text-align:end;white-space:nowrap">
+      <button class="act" onclick="grabExt('${esc(x.token)}',this)">${t('wall.download','Download')}</button>
+    </td>
+  </tr>`;
+}
+// Grab an external result: the daemon spends the indexer grab, fetches
+// the NZB server-side and queues it (origin "indexer").
+async function grabExt(token,btn){
+  if(btn) btn.disabled=true;
+  const j=await api('indexer_grab',`&token=${encodeURIComponent(token)}&priority=1`);
+  if(!j.status){
+    if(btn) btn.disabled=false;
+    toast(t('wall.failed','Failed: {err}',{err:tErr(j.error)||t('wall.unknown','unknown')}));
+    return;
+  }
+  toast(t('wall.queued','Queued for download'));
+}
 function pageFoot(){
   const last=Math.min((lpage+1)*LPAGE,ltotal);
   document.getElementById('lrange').textContent=
@@ -1650,11 +1778,15 @@ function renderList(rows){
   document.getElementById('lhFiles').firstChild.nodeValue=t('wall.col.files','Files');
   document.getElementById('count').textContent=
     ltotal?tn('wall.lcount',ltotal,'{n} release','{n} releases'):'';
-  if(!rows.length){
-    body.innerHTML=`<tr><td colspan="8" class="dim">${t('wall.nomatch','No matches.')}</td></tr>`;
-  } else {
-    body.innerHTML=rows.map(r=>relRow(r,false)).join('');
+  let html=rows.map(r=>relRow(r,false)).join('');
+  // M35: external-indexer results and their notes ride below the local
+  // rows; quota skips and per-indexer errors render, never vanish.
+  for(const n of extNotes){
+    const msg=n.hint?esc(n.hint):(n.indexer?esc(n.indexer)+': ':'')+esc(n.skipped||n.error||'');
+    html+=`<tr><td colspan="8" class="dim">${msg}</td></tr>`;
   }
+  html+=extRows.map(extRow).join('');
+  body.innerHTML=html||`<tr><td colspan="8" class="dim">${t('wall.nomatch','No matches.')}</td></tr>`;
   markSortHeads();
   updateSelBar();
   pageFoot();
@@ -1816,6 +1948,10 @@ async function openCard(k){
   // (card-scoped server query; junk included so nothing is missing
   // from its own sheet). Unknown keys get a stub so the list view's
   // ⓘ works even for cards outside the fetched window.
+  // Latest-open-wins: a slow fetch for card A must not repaint the sheet
+  // (or openKey, which the grab/hide/watch actions key off) after card B
+  // was clicked, and must not re-open a sheet the user already closed.
+  const seq=++openSeq;
   let c=cards.find(x=>x.key===k);
   if(!c){
     const custom=k.match(/^c:([^:]+):/);
@@ -1826,6 +1962,7 @@ async function openCard(k){
   if(!c.releases){
     const j=await api('index_browse',
       `&title_key=${encodeURIComponent(k)}&all=1&limit=200&sort=size`);
+    if(seq!==openSeq) return;
     c.releases=(j.results||[]).map(r=>({
       id:r.id, stem:r.name, grp:r.group, size:r.size, complete:r.complete,
       posted:r.first_posted, seen:r.first_seen, quality:r.quality,
@@ -1842,6 +1979,7 @@ async function openCard(k){
       }
     }
   }
+  if(seq!==openSeq) return;
   openKey=k;
   // Ordered by how well each release matches the quality preference
   // (server-scored), biggest-first within equal matches - size alone put
@@ -1865,6 +2003,7 @@ async function openCard(k){
         ${c.actors?`<div class="meta" style="margin-top:-4px">${esc(c.actors)}</div>`:''}
         <div class="plot">${esc(c.overview||t('wall.nosynopsis','No synopsis available.'))}</div>
         <div style="margin-top:10px">
+          <button class="act ghost" onclick="askIndexers(this)" title="${esc(t('wall.ask.title','Ask your indexer accounts for this title - for films it matches on the IMDb id rather than the words in the name'))}">⌕ ${t('wall.ask','Search my indexers')}</button>
           <button class="act ghost" onclick="findTrailer()" title="${esc(t('wall.trailer.title','Search YouTube for a trailer in a new tab - nothing is fetched or stored here'))}">▶ ${t('wall.trailer','Find trailer')}</button>
           <button class="act ghost" onclick="fixToggle()">✎ ${t('wall.fix','Fix match')}</button>
           <button class="act ghost" onclick="metaRefresh(this)" title="${esc(t('wall.refresh.title',"Wipe this title's cached metadata and artwork and fetch it fresh - releases are untouched"))}">↻ ${t('wall.refresh','Refresh metadata')}</button>
@@ -1936,6 +2075,9 @@ async function openCard(k){
   loadCredits(k);
 }
 function closeOvl(){
+  // Retires any in-flight openCard so a late response cannot re-open the
+  // sheet the user just dismissed.
+  openSeq++;
   openKey=null;
   document.getElementById('ovl').classList.remove('open');
   document.body.style.overflow='';
@@ -1996,6 +2138,10 @@ async function loadCredits(k){
 // The card to come back to when a person page was opened from one.
 let personBack=null;
 async function openPerson(id, backKey){
+  // Same latest-open-wins seq as openCard: this shares the overlay, so a
+  // slow card fetch must not paint its sheet over the person page (or
+  // the other way round).
+  const seq=++openSeq;
   personBack=backKey||null;
   openKey=null;
   const sheet=document.getElementById('sheet');
@@ -2004,6 +2150,7 @@ async function openPerson(id, backKey){
   document.body.style.overflow='hidden';
   document.getElementById('ovl').scrollTop=0;
   const j=await api('person',`&value=${encodeURIComponent(id)}`);
+  if(seq!==openSeq) return;
   if(!j.status){
     sheet.innerHTML=`<div class="pbody"><div class="dim">${t('wall.person.gone','That person is no longer in the index.')}</div></div>`;
     return;
@@ -2140,7 +2287,7 @@ async function applyCand(i){
           air_date:cand.air_date||''}});
   if(!j.status){ toast(t('wall.failed','Failed: {err}',{err:tErr(j.error)||t('wall.unknown','unknown')})); return; }
   toast(t('wall.matchupdated','Match updated.'));
-  lastPayload=''; await refresh();
+  wsig=''; await refresh();
 }
 async function manualSave(refetch){
   if(!openKey) return;
@@ -2153,8 +2300,8 @@ async function manualSave(refetch){
   const j=await apiPost('wall_fix',body);
   if(!j.status){ toast(t('wall.failed','Failed: {err}',{err:tErr(j.error)||t('wall.unknown','unknown')})); return; }
   toast(refetch?t('wall.savedfetch','Saved: fresh metadata arrives within ~30 s.'):t('wall.saved','Saved.'));
-  lastPayload=''; await refresh();
-  if(refetch) setTimeout(()=>{ lastPayload=''; refresh(); }, 25000);
+  wsig=''; await refresh();
+  if(refetch) setTimeout(()=>{ wsig=''; refresh(); }, 25000);
 }
 // ---- M30 merge: move this card's releases under another title ----
 let mergeCands=[];
@@ -2185,7 +2332,7 @@ async function applyMerge(i){
 async function artDone(j){
   if(!j.status){ toast(t('wall.failed','Failed: {err}',{err:tErr(j.error)||t('wall.unknown','unknown')})); return; }
   toast(t('wall.posterupdated','Poster updated.'));
-  lastPayload=''; await refresh();
+  wsig=''; await refresh();
   // Re-render the sheet so the new poster shows immediately (this
   // collapses the fix panel, which is fine - the job is done).
   if(openKey) openCard(openKey);
@@ -2234,14 +2381,15 @@ async function wallFetch(reset){
     const q=document.getElementById('q').value.trim();
     const offset=reset?0:cards.length;
     // Matched only OFF = show everything, junk included (all=1).
-    const j=await api('wall2',
+    const qs=
       `&cat=${encodeURIComponent(tab||'all')}&q=${encodeURIComponent(q)}`+
       `&sort=${sortBy}&dir=${curDesc()?'desc':'asc'}&limit=${WPAGE}&offset=${offset}`+
       `&matched=${matchedOnly?1:0}&all=${matchedOnly?0:1}`+
       `&catgroup=${catGroup?1:0}`+
       (genreSel?`&genre=${encodeURIComponent(genreSel)}`:'')+
       (resSel?`&res=${encodeURIComponent(resSel)}`:'')+
-      (decSel?`&year_min=${decSel.split('-')[0]}&year_max=${decSel.split('-')[1]}`:''));
+      (decSel?`&year_min=${decSel.split('-')[0]}&year_max=${decSel.split('-')[1]}`:'');
+    const j=await api('wall2', qs);
     if(seq!==wseq) return;
     if(j.error){ toast(tErr(j.error)); return; }
     updateCats(j.cats);
@@ -2252,13 +2400,28 @@ async function wallFetch(reset){
       actors:c.actors, poster:c.poster, poster_full:c.poster_full,
       backdrop:c.backdrop, n:c.n, newest:c.latest, complete:c.complete,
       res:c.res, size:c.size, stem:c.stem, releases:null, votes:0,
-      verdict:c.verdict, have:c.have,
+      verdict:c.verdict, have:c.have, reaped:c.reaped,
     }));
     if(reset){
       // Unchanged first page ⇒ no re-render: never yank cards out from
-      // under a hovering cursor for nothing.
-      const sig=JSON.stringify(page);
-      if(sig===wsig && cards.length>=page.length) return;
+      // under a hovering cursor for nothing. The signature carries the
+      // QUERY as well as the page: a filter change can leave page 1
+      // byte-identical while gutting pages 2+, and skipping the render
+      // there would strand stale appended pages in the DOM.
+      // The total is deliberately NOT in it. A live scan changes the
+      // count every few seconds while page 1 stays identical (common
+      // under non-latest sorts), and re-rendering for that alone costs
+      // the appended pages, the scroll position and the focus. The
+      // early return repaints the number instead.
+      // Trade-off: a total that shrank under stale appended cards is
+      // left alone until the next user-driven change, which moves qs
+      // and re-renders anyway.
+      const sig=`${qs} ${JSON.stringify(page)}`;
+      if(sig===wsig && cards.length>=page.length){
+        document.getElementById('count').textContent =
+          wtotal ? tn('wall.count',wtotal,'{n} title','{n} titles') : '';
+        return;
+      }
       wsig=sig; cards=page;
       render();
       renderStrips();
@@ -2340,6 +2503,41 @@ function findTrailer(){
   open('https://www.youtube.com/results?search_query='+encodeURIComponent(q),
        '_blank','noopener,noreferrer');
 }
+// M35 phase 2: ask the configured indexers about the open title, then
+// hand the answer to the Releases table (Indexers scope) so results are
+// read, sorted and grabbed exactly like any other search result.
+//
+// The title's own key goes with the query and the daemon resolves the
+// IMDb id from it - the page has never held one, and for films an id
+// search is the difference between the film and every release whose
+// name happens to contain those words.
+async function askIndexers(btn){
+  const c=cards.find(x=>x.key===openKey); if(!c) return;
+  const name=c.title||String(c.stem||'').replace(/[._]+/g,' ').trim();
+  if(!name) return;
+  if(btn) btn.disabled=true;
+  const j=await api('indexer_search',
+    `&q=${encodeURIComponent(name)}&kind=${encodeURIComponent(c.kind||'')}`+
+    `&title_key=${encodeURIComponent(c.key)}`);
+  if(btn) btn.disabled=false;
+  if(!j.status){
+    toast(tErr(j.error)||t('wall.ask.none','No indexers configured - add one in Settings'));
+    return;
+  }
+  extRows=j.results||[]; extNotes=j.notes||[];
+  extPinned=true;
+  closeOvl();
+  // Show them where the results are: the table, scoped to indexers,
+  // with the search box carrying the query that produced them.
+  const sc=document.getElementById('scope');
+  if(sc){ sc.value='idx'; localStorage.nzbfastWallScope='idx'; }
+  document.getElementById('q').value=name;
+  lpage=0;
+  // setView runs a browseFetch of its own; the pin above is what stops
+  // it re-asking the indexers for what we already have.
+  if(view!=='releases') setView('releases'); else browseFetch();
+  if(!extRows.length) toast(t('wall.ask.empty','Your indexers had nothing for this title'));
+}
 async function unhideKey(k){
   await api('wall_unhide',`&value=${encodeURIComponent(k)}`);
   wsig=''; wallFetch(true);
@@ -2392,8 +2590,12 @@ async function dismissSug(){
 }
 // The Hidden & filters panel - reuses the detail-sheet overlay.
 async function openHidden(){
+  // Shares the overlay with openCard/openPerson, so it takes the same
+  // latest-open-wins seq (a card fetch in flight must not clobber it).
+  const seq=++openSeq;
   openKey=null;
   const [hj,rj]=await Promise.all([api('wall_hidden'),api('wall_rules')]);
+  if(seq!==openSeq) return;
   const hid=hj.hidden||[], rules=rj.rules||[];
   hidCount=hid.length; updateHidChip();
   const fieldName=f=>({lang:t('wall.rule.lang','Language'),word:t('wall.rule.word','Word'),
@@ -2507,6 +2709,47 @@ document.getElementById('onlyComplete').addEventListener('change', ()=>{
   // part of the current view, so a filter change invalidates that cache.
   relCache.clear(); viewBadge(); lpage=0; browseFetch();
 });
+// M35: search scope (this index / indexers / both) persists per browser.
+{
+  const sc=document.getElementById('scope');
+  const saved=localStorage.nzbfastWallScope;
+  if(saved==='idx'||saved==='both') sc.value=saved;
+  // With the built-in indexer off, "this index" and "both" are the same
+  // as "indexers" with a wasted query, and a three-way choice with one
+  // real answer is just a control to read and dismiss. Pin it and hide
+  // it (see body.noidx in the stylesheet); the saved preference is left
+  // untouched, so it comes back when the indexer does.
+  if(!IDX_ON) sc.value='idx';
+  sc.addEventListener('change', ()=>{
+    localStorage.nzbfastWallScope=sc.value;
+    lpage=0; browseFetch();
+  });
+}
+// The built-in indexer is off. Say what this page is now, and - when
+// there is no indexer account either - say that instead of showing a
+// search box that cannot answer. A function because the strings come
+// from t(): the catalogue arrives after this first call, and these
+// elements lose their data-i18n markup here, so applyI18n cannot fix
+// them up later - the loader calls this again instead.
+function idxOffPage(){
+  if(IDX_ON) return;
+  const pill=document.querySelector('.nav a[href="/wall"]');
+  if(pill){
+    const lbl=pill.querySelector('[data-i18n="hdr.wall"]');
+    if(lbl){ lbl.textContent=t('hdr.search','search'); lbl.removeAttribute('data-i18n'); }
+    pill.setAttribute('data-i18n-title','hdr.search.title');
+    pill.title=t('hdr.search.title','Search your indexer accounts');
+  }
+  const q=document.getElementById('q');
+  if(q) q.placeholder=t('wall.q.ph.ext','Search your indexers…  ( / )');
+  if(!IDX_COUNT){
+    document.body.classList.add('nosearch');   // see the stylesheet
+    const n=document.getElementById('noidxnote');
+    n.style.display='';
+    n.innerHTML=t('wall.nothing','<b>Nothing to search yet.</b><br>The built-in indexer is off, and no indexer accounts are set up. Add an account under <a href="/#settings/pullsearch">Settings → Search indexers</a> to search from here, or switch the built-in indexer on under <a href="/#settings/indexing">Settings → Indexing</a> to scan newsgroups yourself.');
+  }
+}
+idxOffPage();
 document.getElementById('lprev').addEventListener('click', ()=>{ if(lpage>0){ lpage--; browseFetch(); } });
 document.getElementById('lnext').addEventListener('click', ()=>{ lpage++; browseFetch(); });
 document.getElementById('matchedOnly').addEventListener('change', e=>{ viewBadge();
@@ -2783,6 +3026,7 @@ if(LOCALE!=='en'){
     // List rows repaint from the page we already hold rather than re-asking
     // the daemon; renderList is synchronous, so its count still lands last.
     renderChips();
+    idxOffPage();
     render();
     if(view==='releases'){
       if(grpTitle && lgroups) renderGroups();

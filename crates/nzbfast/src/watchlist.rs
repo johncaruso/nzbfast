@@ -13,6 +13,12 @@
 //! `wall::Parsed`, matching, and the grab/upgrade/skip decision - so it
 //! is unit-testable without a daemon. The loop lives in serve.rs.
 //!
+//! What a "slot" is - the unit the watcher tracks one grab against - is
+//! the other half of the model: a film, an episode, a whole season when
+//! the post is a pack, or a day when the show is a daily. See
+//! [`slot_of`], and [`pack_eligible`] for when a pack is the better way
+//! to get a season than going on collecting episodes.
+//!
 //! 24D: an item may also target a user category by slug. Nothing here
 //! runs category rules - the loop classifies each candidate through
 //! `categories::classify`, exactly as ingest does, and matching reads
@@ -125,6 +131,13 @@ pub struct WatchState {
     pub slots: HashMap<String, Slot>,
     #[serde(default)]
     pub pending: Vec<PendingDelete>,
+    /// M35 phase 2: item id → when this item last spent an external
+    /// indexer search (unix). The watcher runs every 60 s and a
+    /// third-party account is metered per day, so an item may only ask
+    /// the indexers on its own slow cadence; this is what enforces it
+    /// across restarts.
+    #[serde(default)]
+    pub ext_checked: HashMap<u64, i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -533,31 +546,82 @@ pub fn matches(item: &WatchItem, stem: &str, p: &Parsed) -> bool {
     true
 }
 
-/// Which slot of the item a release fills: movies have one ("movie"),
-/// TV tracks per-episode ("s01e05"). Season packs and bare-season posts
-/// return None - episode-level tracking would double-download them.
+/// Slot key for one episode ("s01e05"; "s2026e15" for the year-as-season
+/// posts an annual sport or soap uses).
+pub fn episode_slot(season: u32, episode: u32) -> String {
+    format!("s{season:02}e{episode:02}")
+}
+
+/// Slot key for a whole-season pack ("s01"). Deliberately an episode key
+/// with the episode left off, which is also how the posts themselves are
+/// named, so [`slot_parts`] reads both with one parser and the dashboard
+/// prints "S01" beside "S01E05" without being taught anything.
+pub fn pack_slot(season: u32) -> String {
+    format!("s{season:02}")
+}
+
+/// Slot key for a daily-dated post ("d:20260721"). Prefixed, because a
+/// bare "20260721" would parse as neither an episode nor a season and a
+/// future reader would have to guess which of the three a key is.
+pub fn date_slot(date: &str) -> String {
+    format!("d:{date}")
+}
+
+/// The season and episode a slot key names: "s01e05" → (1, Some(5)),
+/// "s01" → (1, None), i.e. a PACK. None for every other shape ("movie",
+/// "d:…" dailies, "c:…" custom identity keys) - those are not part of a
+/// season and no pack covers them.
+pub fn slot_parts(slot: &str) -> Option<(u32, Option<u32>)> {
+    let rest = slot.strip_prefix('s')?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let season: u32 = digits.parse().ok()?;
+    match &rest[digits.len()..] {
+        "" => Some((season, None)),
+        tail => {
+            let ep = tail.strip_prefix('e')?;
+            (!ep.is_empty() && ep.bytes().all(|c| c.is_ascii_digit()))
+                .then(|| ep.parse().ok().map(|e| (season, Some(e))))
+                .flatten()
+        }
+    }
+}
+
+/// Does this slot key name a whole season rather than one episode?
+pub fn is_pack_slot(slot: &str) -> bool {
+    matches!(slot_parts(slot), Some((_, None)))
+}
+
+/// Which slot of the item a release fills: movies have one ("movie"), TV
+/// tracks per-episode ("s01e05"), a bare-season post fills that season's
+/// PACK slot ("s01"), and a daily-dated show keys on the day it aired
+/// ("d:20260721").
 ///
-/// A custom category is either shape, so it takes both: an episode
-/// marker tracks per episode, and everything else tracks on the
-/// classified identity key (`c:<slug>:formula1:2026:round11 hungary
-/// qualifying`). That key is the F1 lesson made load-bearing - a
-/// "movie"-style single slot would grab one session and call the whole
-/// season done.
-///
-/// Known limit: a daily-dated custom post ("The.Daily.Show.2026.07.21")
-/// keeps no date in the parse, so its key is title-only and every
-/// episode shares one slot. One grab, not a duplicate storm; giving the
-/// parser a date field is the fix, and it belongs there, not here.
+/// A custom category is any of those shapes, so it takes them all: an
+/// episode marker tracks per episode, a bare season is that season's
+/// pack, and everything else tracks on the classified identity key
+/// (`c:<slug>:formula1:2026:round11 hungary qualifying`). That key is the
+/// F1 lesson made load-bearing - a "movie"-style single slot would grab
+/// one session and call the whole season done. It already folds in the
+/// parsed date, which is why the daily arm below is only needed for the
+/// built-in TV kind.
 pub fn slot_of(item: &WatchItem, p: &Parsed) -> Option<String> {
-    let episode_slot = || match (p.season, p.episode) {
-        (Some(s), Some(e)) => Some(format!("s{s:02}e{e:02}")),
-        _ => None,
+    let episodic = || match (p.season, p.episode) {
+        (Some(s), Some(e)) => Some(episode_slot(s, e)),
+        (Some(s), None) => Some(pack_slot(s)),
+        (None, _) => None,
     };
     match item.kind.as_str() {
         "movie" => Some("movie".into()),
-        "tv" => episode_slot(),
+        // A daily show carries no SxxEyy at all: the date IS the episode
+        // ("The.Daily.Show.2026.07.21"). Without this arm every daily
+        // post answered None and a watched daily show grabbed nothing,
+        // ever - it looked like a show nobody had posted.
+        "tv" => episodic().or_else(|| p.date.as_deref().map(date_slot)),
         _ => match p.season {
-            Some(_) => episode_slot(),
+            Some(_) => episodic(),
             None => Some(p.key.clone()),
         },
     }
@@ -566,6 +630,33 @@ pub fn slot_of(item: &WatchItem, p: &Parsed) -> Option<String> {
 /// Full state key for a slot of an item.
 pub fn state_key(item_id: u64, slot: &str) -> String {
     format!("{item_id}:{slot}")
+}
+
+/// The version an episode slot effectively has: its own grab, or the
+/// season pack that covers it, whichever is the better copy. Emptied
+/// slots (a failed or deleted grab) count as having nothing.
+///
+/// A pack is not written into the episode slots it covers, because
+/// nothing here knows how many episodes a season HAS - a pack that
+/// claimed "s01e01…s01e10" would be inventing that number. So coverage
+/// is answered by looking up, at the moment it matters, rather than
+/// stored: a season with a pack reads as "have it" for every episode,
+/// however many turn out to exist.
+pub fn covering<'a>(
+    slots: &'a HashMap<String, Slot>,
+    item_id: u64,
+    slot: &str,
+) -> Option<&'a Slot> {
+    let filled = |k: String| slots.get(&k).filter(|s| !s.nzo_id.is_empty());
+    let own = filled(state_key(item_id, slot));
+    let pack = match slot_parts(slot) {
+        Some((season, Some(_))) => filled(state_key(item_id, &pack_slot(season))),
+        _ => None,
+    };
+    match (own, pack) {
+        (Some(o), Some(p)) => Some(if p.rank > o.rank { p } else { o }),
+        (o, p) => o.or(p),
+    }
 }
 
 /// Extra episode slots a multi-episode release covers beyond its primary
@@ -580,10 +671,160 @@ pub fn extra_slots(item: &WatchItem, p: &Parsed) -> Vec<String> {
     }
     match (p.season, p.episode, p.episode2) {
         (Some(s), Some(e1), Some(e2)) if e2 > e1 && e2 - e1 <= 10 => {
-            (e1 + 1..=e2).map(|e| format!("s{s:02}e{e:02}")).collect()
+            (e1 + 1..=e2).map(|e| episode_slot(s, e)).collect()
         }
         _ => Vec::new(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Season packs
+// ---------------------------------------------------------------------------
+
+/// How many episodes a pack has to bring before it beats going on
+/// collecting singles. One is never worth it (that is just a single
+/// episode wrapped in a season's worth of bytes); two is.
+pub const PACK_MIN_EPISODES: u32 = 2;
+
+/// What the watcher knows about one season of one item at the moment a
+/// pack candidate turns up. Counts are of IN-SCOPE episodes only - an
+/// item watching episodes 1-13 does not care that the season ran to 22.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SeasonState {
+    /// Episodes of this season the watcher can see exist at all: a slot,
+    /// a candidate this pass, or an episode list from a metadata
+    /// provider. Zero means the season is simply unknown - which is not
+    /// the same as empty.
+    pub known: u32,
+    /// ...of which this many already have a grab of their own.
+    pub have: u32,
+    /// Best `quality_rank` among those grabs (0 when there are none).
+    pub best_rank: u32,
+    /// `quality_rank` of the pack already tracked for this season, or 0.
+    pub pack_rank: u32,
+}
+
+/// Gather [`SeasonState`] from what the watcher has: this item's slots,
+/// the slot names it found candidates for this pass, and the episode
+/// numbers a provider says the season has (empty when nobody knows).
+pub fn season_state(
+    item: &WatchItem,
+    season: u32,
+    slots: &HashMap<String, Slot>,
+    candidates: &[String],
+    listed: &[u32],
+) -> SeasonState {
+    let prefix = format!("{}:", item.id);
+    let mut known: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    let mut have: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    let mut st = SeasonState::default();
+    for e in listed {
+        if in_range_spec(&item.episodes, *e) {
+            known.insert(*e);
+        }
+    }
+    for slot in candidates {
+        if let Some((s, Some(e))) = slot_parts(slot) {
+            if s == season {
+                known.insert(e);
+            }
+        }
+    }
+    for (key, slot) in slots {
+        let Some(name) = key.strip_prefix(&prefix) else { continue };
+        match slot_parts(name) {
+            Some((s, Some(e))) if s == season => {
+                known.insert(e);
+                if !slot.nzo_id.is_empty() {
+                    have.insert(e);
+                    st.best_rank = st.best_rank.max(slot.rank);
+                }
+            }
+            Some((s, None)) if s == season && !slot.nzo_id.is_empty() => {
+                st.pack_rank = st.pack_rank.max(slot.rank);
+            }
+            _ => {}
+        }
+    }
+    SeasonState { known: known.len() as u32, have: have.len() as u32, ..st }
+}
+
+/// How many values a range spec names, when it names a bounded set:
+/// "1-13" → 13, "1,3,5-7" → 5. None when the spec constrains nothing
+/// (empty / "all" / junk), matching [`in_range_spec`]'s permissive
+/// reading. Overlapping chunks are counted twice - it is used as an
+/// upper bound on "how much did you ask for", where over-counting only
+/// ever errs towards allowing a pack.
+pub fn spec_count(spec: &str) -> Option<u32> {
+    let s = spec.trim().to_ascii_lowercase();
+    if s.is_empty() || s == "all" || s == "*" {
+        return None;
+    }
+    let mut n: u32 = 0;
+    let mut any_valid = false;
+    for chunk in s.split(',') {
+        let c = chunk.trim();
+        if let Some((a, b)) = c.split_once('-') {
+            if let (Ok(a), Ok(b)) = (a.trim().parse::<u32>(), b.trim().parse::<u32>()) {
+                any_valid = true;
+                n = n.saturating_add(a.max(b) - a.min(b) + 1);
+            }
+        } else if c.parse::<u32>().is_ok() {
+            any_valid = true;
+            n = n.saturating_add(1);
+        }
+    }
+    any_valid.then_some(n)
+}
+
+/// Is a season pack the right way to get this season, or should the
+/// watcher go on collecting single episodes?
+///
+/// A pack is one post covering a whole season, so it is the efficient
+/// choice at the start and a wasteful one near the end - it re-downloads
+/// everything already on the shelf. The rules, in order:
+///
+/// 1. Scope decides first: a pack for a season the item does not watch
+///    is not this item's, and neither is one for an item that asked for
+///    a handful of specific episodes (`episodes = "5"` means episode 5,
+///    not the 22 around it).
+/// 2. A season already tracking a pack keeps using packs - whether the
+///    new one is actually better is [`decide`]'s question, not this one.
+/// 3. With nothing of the season in hand, take the pack: it is the whole
+///    season in one grab, and there is nothing for it to duplicate.
+/// 4. Otherwise a pack must be at least as good as the best single
+///    already grabbed. A worse pack never displaces better episodes.
+/// 5. ...and it must bring at least [`PACK_MIN_EPISODES`] missing
+///    episodes, and at least as many as it repeats. Two missing out of
+///    three is a pack; two missing out of twenty is nine downloads of
+///    nothing.
+///
+/// Note what this deliberately does NOT do: grabbing a pack never
+/// deletes the singles it covers, and a single that later upgrades one
+/// episode never deletes the pack (the pack is still the only copy of
+/// every other episode). `upgrade_supersedes_all` in the daemon enforces
+/// that from the reach of each release, so nothing here has to.
+pub fn pack_eligible(item: &WatchItem, season: u32, pack_rank: u32, st: SeasonState) -> bool {
+    if item.kind == "movie" {
+        return false;
+    }
+    if !in_range_spec(&item.seasons, season) {
+        return false;
+    }
+    if spec_count(&item.episodes).is_some_and(|n| n < PACK_MIN_EPISODES) {
+        return false;
+    }
+    if st.pack_rank > 0 {
+        return true;
+    }
+    if st.have == 0 {
+        return true;
+    }
+    if pack_rank < st.best_rank {
+        return false;
+    }
+    let missing = st.known.saturating_sub(st.have);
+    missing >= PACK_MIN_EPISODES && missing >= st.have
 }
 
 // ---------------------------------------------------------------------------
@@ -872,8 +1113,11 @@ mod tests {
             slot_of(&tv, &parse_release("Severance.S02E03.1080p.WEB-GRP")).as_deref(),
             Some("s02e03")
         );
-        // Season pack → no episode slot (skipped).
-        assert_eq!(slot_of(&tv, &parse_release("Severance.S02.1080p.WEB-GRP")), None);
+        // A season pack fills the SEASON's slot, not an episode's.
+        assert_eq!(
+            slot_of(&tv, &parse_release("Severance.S02.1080p.WEB-GRP")).as_deref(),
+            Some("s02")
+        );
         assert_eq!(
             slot_of(&mv, &parse_release("Dune.2021.1080p.WEB-GRP")).as_deref(),
             Some("movie")
@@ -1060,7 +1304,7 @@ mod tests {
         assert_eq!(a, fs("EPL.2026.08.22.Arsenal.vs.Spurs.720p.WEB.h264-OTHER"));
 
         // An episodic custom tracks per episode, like TV, and its bare
-        // season pack is skipped for the same reason TV's is.
+        // season post fills that season's pack slot, like TV's.
         let wcats = vec![CustomCategory { slug: "wrestling".into(), name: "Wrestling".into(),
             pattern: "wwe".into(), not_match: String::new(), base: BaseBehavior::Tv }];
         let w = item("wrestling", "WWE Raw");
@@ -1068,7 +1312,10 @@ mod tests {
         let e15 = classify(E15, &wcats);
         assert!(matches(&w, E15, &e15));
         assert_eq!(slot_of(&w, &e15).as_deref(), Some("s2026e15"));
-        assert_eq!(slot_of(&w, &classify("WWE.Raw.S12.1080p.WEB-GRP", &wcats)), None);
+        assert_eq!(
+            slot_of(&w, &classify("WWE.Raw.S12.1080p.WEB-GRP", &wcats)).as_deref(),
+            Some("s12")
+        );
         // Doubles own both slots, as they do for TV.
         let dbl = classify("WWE.Raw.S2026E015E016.1080p.WEB-GRP", &wcats);
         assert_eq!(extra_slots(&w, &dbl), ["s2026e16"]);
@@ -1099,6 +1346,304 @@ mod tests {
         assert!(!is_custom_kind("tv") && !is_custom_kind("movie") && !is_custom_kind(""));
     }
 
+
+    // -----------------------------------------------------------------
+    // Season packs
+    // -----------------------------------------------------------------
+
+    /// A grabbed slot, for the state maps the pack tests build.
+    fn slot(rank: u32, stem: &str) -> Slot {
+        Slot {
+            rank,
+            stem: stem.into(),
+            quality: String::new(),
+            nzo_id: format!("nzo-{stem}"),
+            grabbed_at: 0,
+            failed: Vec::new(),
+        }
+    }
+
+    fn state_of(item_id: u64, entries: &[(&str, Slot)]) -> HashMap<String, Slot> {
+        entries.iter().map(|(k, s)| (state_key(item_id, k), s.clone())).collect()
+    }
+
+    #[test]
+    fn slot_keys_parse_back_to_season_and_episode() {
+        assert_eq!(slot_parts("s01e05"), Some((1, Some(5))));
+        assert_eq!(slot_parts("s01"), Some((1, None)));
+        // Year-as-season posts (annual sport, soaps) read the same way.
+        assert_eq!(slot_parts("s2026e15"), Some((2026, Some(15))));
+        assert_eq!(slot_parts("s2026"), Some((2026, None)));
+        // Everything that is not part of a season answers None, so no
+        // pack is ever thought to cover it.
+        for other in ["movie", "d:20260721", "c:formula-1:formula1:2026:round11", "", "sxx"] {
+            assert_eq!(slot_parts(other), None, "{other}");
+            assert!(!is_pack_slot(other), "{other}");
+        }
+        assert!(is_pack_slot("s01") && !is_pack_slot("s01e05"));
+        // The two builders and the parser agree, which is what lets the
+        // pack of a season be found from any episode of it.
+        assert_eq!(slot_parts(&pack_slot(3)), Some((3, None)));
+        assert_eq!(slot_parts(&episode_slot(3, 7)), Some((3, Some(7))));
+    }
+
+    #[test]
+    fn range_spec_counts() {
+        // No constraint = no count, matching in_range_spec's reading.
+        for all in ["", "all", "*", " ", "wat"] {
+            assert_eq!(spec_count(all), None, "{all:?}");
+        }
+        assert_eq!(spec_count("5"), Some(1));
+        assert_eq!(spec_count("1-13"), Some(13));
+        assert_eq!(spec_count("13-1"), Some(13)); // reversed, same span
+        assert_eq!(spec_count("1,3,5-7"), Some(5));
+    }
+
+    /// The pack preference rule, case by case. A pack is the efficient
+    /// way to get a season you have none of, and a wasteful way to get
+    /// the last episode of one.
+    #[test]
+    fn pack_eligibility_follows_what_the_season_already_has() {
+        let tv = item("tv", "Show Name");
+        let webdl = quality_rank(&parse_release("Show.Name.S01.1080p.WEB-GRP"));
+        let hdtv = quality_rank(&parse_release("Show.Name.S01.720p.HDTV-GRP"));
+        let bluray = quality_rank(&parse_release("Show.Name.S01.1080p.BluRay-GRP"));
+
+        // Nothing of the season in hand: take the pack, whether or not
+        // anything is known about how long the season is.
+        let nothing = SeasonState::default();
+        assert!(pack_eligible(&tv, 1, webdl, nothing));
+        assert!(pack_eligible(&tv, 1, webdl, SeasonState { known: 10, ..nothing }));
+
+        // Half a season already grabbed: the pack brings as much as it
+        // repeats, so it is still worth it...
+        let half = SeasonState { known: 10, have: 5, best_rank: hdtv, pack_rank: 0 };
+        assert!(pack_eligible(&tv, 1, webdl, half));
+        // ...but not when it repeats more than it brings.
+        let mostly = SeasonState { known: 10, have: 8, best_rank: hdtv, pack_rank: 0 };
+        assert!(!pack_eligible(&tv, 1, webdl, mostly));
+        // ...nor for a single missing episode, however little we hold.
+        let one_left = SeasonState { known: 2, have: 1, best_rank: hdtv, pack_rank: 0 };
+        assert!(!pack_eligible(&tv, 1, webdl, one_left));
+
+        // A pack WORSE than the episodes already collected never
+        // displaces them, however much of the season is missing.
+        let good_singles = SeasonState { known: 10, have: 4, best_rank: bluray, pack_rank: 0 };
+        assert!(!pack_eligible(&tv, 1, hdtv, good_singles));
+        assert!(pack_eligible(&tv, 1, bluray, good_singles), "equal quality is enough");
+
+        // A season already tracked as a pack keeps using packs: whether
+        // this one is actually better is decide()'s question.
+        let packed = SeasonState { known: 10, have: 10, best_rank: bluray, pack_rank: hdtv };
+        assert!(pack_eligible(&tv, 1, webdl, packed));
+
+        // Scope gates it: a season the item does not watch, and an item
+        // that asked for one specific episode (a pack is not that).
+        let mut scoped = item("tv", "Show Name");
+        scoped.seasons = "2-4".into();
+        assert!(!pack_eligible(&scoped, 1, webdl, nothing));
+        assert!(pack_eligible(&scoped, 3, webdl, nothing));
+        scoped.seasons.clear();
+        scoped.episodes = "5".into();
+        assert!(!pack_eligible(&scoped, 1, webdl, nothing));
+        scoped.episodes = "5-9".into();
+        assert!(pack_eligible(&scoped, 1, webdl, nothing));
+
+        // A film has no seasons to pack.
+        assert!(!pack_eligible(&item("movie", "Film"), 1, webdl, nothing));
+    }
+
+    /// `season_state` counts only IN-SCOPE episodes, from every source
+    /// the watcher has, and keeps the pack's own rank apart from the
+    /// singles'.
+    #[test]
+    fn season_state_counts_scope_only() {
+        let mut tv = item("tv", "Show Name");
+        tv.episodes = "1-4".into();
+        let slots = state_of(
+            1,
+            &[
+                ("s01e01", slot(4200, "Show.Name.S01E01.1080p.WEB-GRP")),
+                // An emptied slot (its grab failed) is known, not had.
+                ("s01e02", Slot { nzo_id: String::new(), ..slot(0, "") }),
+                // Another season's slots never count towards this one.
+                ("s02e01", slot(4200, "Show.Name.S02E01.1080p.WEB-GRP")),
+                ("movie", slot(9999, "irrelevant")),
+            ],
+        );
+        // A candidate this pass, and an episode list that runs past the
+        // item's scope (episode 9 is not wanted, so it is not missing).
+        let st = season_state(&tv, 1, &slots, &["s01e03".into()], &[1, 2, 3, 4, 9]);
+        assert_eq!((st.known, st.have), (4, 1));
+        assert_eq!(st.best_rank, 4200);
+        assert_eq!(st.pack_rank, 0);
+
+        // The season's own pack is tracked separately from the singles.
+        let mut with_pack = slots.clone();
+        with_pack.insert(state_key(1, "s01"), slot(3200, "Show.Name.S01.720p.HDTV-GRP"));
+        let st = season_state(&tv, 1, &with_pack, &[], &[1, 2, 3, 4]);
+        assert_eq!(st.pack_rank, 3200);
+        assert_eq!(st.have, 1, "a pack is not counted as an episode grab");
+
+        // Another item's slots are not this item's, even at the same
+        // season and episode numbers.
+        let other = season_state(&item("tv", "Show Name"), 1, &state_of(2, &[
+            ("s01e01", slot(4200, "x")),
+        ]), &[], &[]);
+        assert_eq!((other.known, other.have), (0, 0));
+    }
+
+    /// What a pack means for the episodes under it: they read as "have
+    /// it" without the pack ever being written into their slots.
+    #[test]
+    fn a_pack_covers_the_episodes_of_its_season() {
+        let pack = slot(4200, "Show.Name.S01.1080p.WEB-GRP");
+        let slots = state_of(1, &[("s01", pack.clone())]);
+        // Any episode of that season, including ones nobody has heard of
+        // yet - which is the point of not enumerating them.
+        for ep in [1u32, 5, 22] {
+            let got = covering(&slots, 1, &episode_slot(1, ep));
+            assert_eq!(got.map(|s| s.stem.as_str()), Some(pack.stem.as_str()), "e{ep}");
+        }
+        // Not another season, not the film slot, not another item.
+        assert!(covering(&slots, 1, "s02e01").is_none());
+        assert!(covering(&slots, 1, "movie").is_none());
+        assert!(covering(&slots, 2, "s01e01").is_none());
+
+        // Own grab vs pack: the better copy answers, whichever it is.
+        let mut mixed = slots.clone();
+        mixed.insert(state_key(1, "s01e01"), slot(5200, "Show.Name.S01E01.2160p.WEB-GRP"));
+        mixed.insert(state_key(1, "s01e02"), slot(3200, "Show.Name.S01E02.720p.HDTV-GRP"));
+        assert_eq!(covering(&mixed, 1, "s01e01").map(|s| s.rank), Some(5200));
+        assert_eq!(covering(&mixed, 1, "s01e02").map(|s| s.rank), Some(4200), "the pack is better");
+
+        // An emptied slot has nothing, and falls back to the pack.
+        let mut emptied = slots.clone();
+        emptied.insert(state_key(1, "s01e03"), Slot { nzo_id: String::new(), ..slot(5200, "dead") });
+        assert_eq!(covering(&emptied, 1, "s01e03").map(|s| s.rank), Some(4200));
+        // ...and with no pack either, nothing at all.
+        assert!(covering(&state_of(1, &[("s01e03", Slot { nzo_id: String::new(), ..slot(5200, "dead") })]), 1, "s01e03").is_none());
+    }
+
+    /// The decision an episode faces once a pack covers it: an equal or
+    /// worse encode is already had, a better one is a genuine upgrade.
+    #[test]
+    fn a_pack_settles_the_episodes_it_covers() {
+        let tv = item("tv", "Show Name");
+        let min = threshold_rank("any");
+        let target = threshold_rank("2160p");
+        let pack = quality_rank(&parse_release("Show.Name.S01.1080p.WEB-GRP"));
+        let slots = state_of(1, &[("s01", slot(pack, "Show.Name.S01.1080p.WEB-GRP"))]);
+        let cur = covering(&slots, 1, "s01e04").map(|s| s.rank);
+        let ep = |stem: &str| quality_rank(&parse_release(stem));
+        assert_eq!(
+            decide(cur, ep("Show.Name.S01E04.720p.HDTV-GRP"), min, target, tv.upgrade),
+            Decision::Skip,
+            "a worse single of an episode the pack already covers"
+        );
+        assert_eq!(
+            decide(cur, ep("Show.Name.S01E04.1080p.WEB-GRP"), min, target, tv.upgrade),
+            Decision::Skip,
+            "an equal single is not worth a second copy"
+        );
+        assert_eq!(
+            decide(cur, ep("Show.Name.S01E04.2160p.WEB-GRP"), min, target, tv.upgrade),
+            Decision::Upgrade
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Daily-dated posts
+    // -----------------------------------------------------------------
+
+    /// A daily show has no SxxEyy: the date is the episode. Both parser
+    /// conventions land on one slot key, so the same show posted either
+    /// way is not grabbed twice.
+    #[test]
+    fn daily_shows_key_on_their_date() {
+        let tv = item("tv", "The Daily Show");
+        let s = |stem: &str| slot_of(&tv, &parse_release(stem));
+        let mon = "The.Daily.Show.2026.07.21.1080p.WEB.h264-GRP";
+        let tue = "The.Daily.Show.2026.07.22.1080p.WEB.h264-GRP";
+        assert_eq!(s(mon).as_deref(), Some("d:20260721"));
+        assert_ne!(s(mon), s(tue), "two nights of a daily shared one slot");
+        // Better encode of the SAME night is the same slot - an upgrade,
+        // not a second download.
+        assert_eq!(s(mon), s("The.Daily.Show.2026.07.21.2160p.WEB.h265-GRP"));
+        // The YYMMDD convention normalizes to the same key as YYYY.MM.DD.
+        let short = item("tv", "At Midnight");
+        assert_eq!(
+            slot_of(&short, &parse_release("At.Midnight.150615.720p.HDTV.x264-GRP")).as_deref(),
+            Some("d:20150615")
+        );
+        // A dated post is not part of any season, so no pack covers it
+        // and it never collides with an episode key.
+        assert_eq!(slot_parts("d:20260721"), None);
+        // A show that posts BOTH ways keeps the episode key when it has
+        // one: the marker is the better identity where it exists.
+        assert_eq!(
+            slot_of(&tv, &parse_release("The.Daily.Show.S2026E140.1080p.WEB-GRP")).as_deref(),
+            Some("s2026e140")
+        );
+    }
+
+    /// The 24D collision, closed: a daily-dated CUSTOM post keys on its
+    /// date through the classified identity key, so a season of fixtures
+    /// no longer shares one slot. (The pure parser carries the date;
+    /// `categories::classify` folds it into the key.)
+    #[test]
+    fn daily_custom_posts_do_not_share_a_slot() {
+        let cats = vec![CustomCategory {
+            slug: "talk".into(),
+            name: "Talk".into(),
+            pattern: "(?i)^the.daily.show".into(),
+            not_match: String::new(),
+            base: BaseBehavior::Tv,
+        }];
+        let it = item("talk", "The Daily Show");
+        let s = |stem: &str| slot_of(&it, &classify(stem, &cats)).unwrap();
+        let mon = s("The.Daily.Show.2026.07.21.1080p.WEB.h264-GRP");
+        let tue = s("The.Daily.Show.2026.07.22.1080p.WEB.h264-GRP");
+        assert_ne!(mon, tue, "two nights of a custom daily shared one slot");
+        assert!(mon.contains("20260721"), "{mon}");
+        assert_eq!(mon, s("The.Daily.Show.2026.07.21.2160p.WEB.h265-GRP"));
+    }
+
+    /// State written before packs and dated slots existed must load, and
+    /// keep meaning what it meant: the file is the user's grab history
+    /// and a rejected one re-downloads their whole watchlist.
+    #[test]
+    fn old_state_files_still_load() {
+        // A v1 file: slots and pending only, no ext_checked, no `failed`
+        // list on the slot, and only episode / movie / custom keys.
+        const OLD: &str = r#"{
+          "slots": {
+            "1:s02e03": {"rank": 4200, "stem": "Severance.S02E03.1080p.WEB-GRP",
+                         "quality": "1080p WEB", "nzo_id": "SABnzbd_nzo_a", "grabbed_at": 1750000000},
+            "2:movie": {"rank": 5500, "stem": "Dune.2021.2160p.BluRay.REMUX-GRP",
+                        "quality": "2160p REMUX", "nzo_id": "SABnzbd_nzo_b", "grabbed_at": 1750000001}
+          },
+          "pending": []
+        }"#;
+        let st: WatchState = serde_json::from_str(OLD).unwrap();
+        assert_eq!(st.slots.len(), 2);
+        assert!(st.ext_checked.is_empty() && st.pending.is_empty());
+        assert!(st.slots["1:s02e03"].failed.is_empty());
+        // The old keys still answer as they always did...
+        assert_eq!(covering(&st.slots, 1, "s02e03").map(|s| s.rank), Some(4200));
+        assert_eq!(covering(&st.slots, 2, "movie").map(|s| s.rank), Some(5500));
+        // ...and an episode of a season with no pack is still empty,
+        // rather than being read as covered by one.
+        assert!(covering(&st.slots, 1, "s02e04").is_none());
+        // A season the old file knows episodes of reads back correctly,
+        // so the first pack decision after an upgrade is well-founded.
+        let st2 = season_state(&item("tv", "Severance"), 2, &st.slots, &[], &[]);
+        assert_eq!((st2.known, st2.have, st2.pack_rank), (1, 1, 0));
+        // And the new state round-trips through the same file format.
+        let round: WatchState =
+            serde_json::from_str(&serde_json::to_string(&st).unwrap()).unwrap();
+        assert_eq!(round.slots.len(), 2);
+    }
 
     #[test]
     fn age_specs_and_gate() {

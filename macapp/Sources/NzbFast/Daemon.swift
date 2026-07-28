@@ -74,6 +74,37 @@ final class Daemon {
         return k.isEmpty ? nil : k
     }
 
+    /// The dashboard port saved in settings.json, if the user has set one.
+    /// Read with the same approach as the apikey fallback above.
+    ///
+    /// The dashboard's Port setting is restart-only: it is persisted here
+    /// and the engine's own apply_saved_settings overrides its `--port`
+    /// with it at startup. So a saved port is the port the engine WILL
+    /// bind whatever we ask for, and the wrapper has to follow it.
+    private func savedPort() -> Int? {
+        let settings = dataDir.appendingPathComponent("settings.json")
+        guard let data = try? Data(contentsOf: settings),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return Daemon.savedPort(inSettings: obj)
+    }
+
+    /// Pull a usable port out of a decoded settings.json. Split out so the
+    /// rule is testable without a file.
+    ///
+    /// Matches what the daemon accepts: a JSON number, and the same 1-65535
+    /// range the config writer validates. Anything else (absent, null, a
+    /// string, out of range) means "no saved port", which is exactly the
+    /// case where the engine keeps the `--port` we pass it.
+    static func savedPort(inSettings obj: [String: Any]) -> Int? {
+        guard let n = obj["port"] as? NSNumber else { return nil }
+        // JSON true bridges to NSNumber too and would read as port 1. The
+        // daemon's as_u64 rejects a bool, so we reject it as well.
+        guard CFGetTypeID(n as CFTypeRef) != CFBooleanGetTypeID() else { return nil }
+        let p = n.intValue
+        return (1...65535).contains(p) ? p : nil
+    }
+
     /// Percent-encode a query value. The daemon urldecodes every query
     /// value and reads a bare `+` as a space, so a key with punctuation in
     /// it has to arrive encoded; the dashboard's URLSearchParams adoption
@@ -178,22 +209,61 @@ final class Daemon {
         case failed(String)     // couldn't start; message + log tail
     }
 
-    /// Shared rule 4: attach to the persisted port if an nzbfast answers
-    /// there; otherwise scan for a free port from 6789 and spawn.
+    /// Shared rule 4: attach to a port one of our engines already answers
+    /// on; otherwise scan for a free port from 6789 and spawn.
     /// Never touches daemons on other ports.
     func start() async -> StartResult {
-        if port > 0, await isNzbfast(port: port) {
+        // Resolve the port FIRST, before the spawn and the scan. A port
+        // the user changed in the dashboard is applied by the engine at
+        // startup no matter what `--port` says, so the value we
+        // remembered in UserDefaults is stale the moment they change it.
+        // Following it here is what keeps every later consumer - the
+        // spawn argument, the health poll, the dashboard and API URLs,
+        // and the shutdown POST - pointed at the one port the engine
+        // actually binds. Without it start() reported failure against a
+        // perfectly healthy child, and the quit sweep then killed that
+        // child by executable path.
+        let saved = savedPort()
+        // Probe for a LIVE engine before any of that, over every port one
+        // of ours could still be answering on: the saved settings.json
+        // port first, then the port we last used when it differs.
+        //
+        // The saved port is restart-only - the engine reads it once at
+        // startup - so right after a port change the engine that is still
+        // running is on the PREVIOUS port. Attaching to it is the
+        // single-engine-preserving choice: spawning on the new port
+        // instead would leave two engines sharing config.local.json, the
+        // index db and the watch folder. The new port applies on the next
+        // restart, through the wrapper's normal stop/start path.
+        var candidates: [Int] = []
+        for p in [saved ?? 0, port] where p > 0 && !candidates.contains(p) {
+            candidates.append(p)
+        }
+        for candidate in candidates {
+            guard await isNzbfast(port: candidate) else { continue }
+            // Every consumer follows the port we ACTUALLY attached to.
+            port = candidate
+            UserDefaults.standard.set(candidate, forKey: "daemonPort")
             spawnedByUs = false
             return .attached
         }
-        // Free-port scan from 6789 (the shipped launchers' rule). A port
-        // with ANY listener - nzbfast or not - is skipped: on first run
-        // an existing daemon on 6789 is somebody else's (there is no
-        // persisted claim on it), and we must not touch it.
-        var chosen = 0
-        for p in 6789..<6889 where !portTaken(p) {
-            chosen = p
-            break
+        // Nothing of ours is answering, so we spawn. A saved port wins
+        // over the scan below: the engine binds it regardless of the
+        // argument we pass, so a scanned port would just be ignored by
+        // the child and strand us again. If something unrelated holds
+        // that port the child can't bind it and says so in the log,
+        // which is the honest outcome - the setting is the user's.
+        //
+        // Otherwise: free-port scan from 6789 (the shipped launchers'
+        // rule). A port with ANY listener - nzbfast or not - is skipped:
+        // on first run an existing daemon on 6789 is somebody else's
+        // (there is no persisted claim on it), and we must not touch it.
+        var chosen = saved ?? 0
+        if chosen == 0 {
+            for p in 6789..<6889 where !portTaken(p) {
+                chosen = p
+                break
+            }
         }
         guard chosen > 0 else { return .failed("no free port between 6789 and 6889") }
         port = chosen

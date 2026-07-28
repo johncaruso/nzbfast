@@ -1,8 +1,9 @@
 //! Regression tests pinning three confirmed index defects found by a
 //! correctness review of the index (the C3, D3 and D2 cases).
 //! Each test is written to FAIL against the defective code and pass
-//! once the finding is fixed; they ship `#[ignore]`d so the suite stays
-//! green while the findings are open.
+//! once the finding is fixed; an open finding ships `#[ignore]`d so the
+//! suite stays green while it is open, and the `#[ignore]` comes off
+//! when it is fixed. All three are fixed and running.
 
 use nzbkit::index::{BrowseQuery, BrowseSort, Credit, Index};
 use nzbkit::nntp::OverEntry;
@@ -134,38 +135,49 @@ fn rerar_with_reused_filenames_must_not_mark_a_mixed_generation_complete() {
     );
 }
 
-/// Finding D2: `person_upsert`'s name fallback only refuses rows whose
-/// SAME handle type differs, so a person already pinned by one handle
-/// type (a Wikidata Q-id) absorbs a same-named different person arriving
+/// Finding D2: `person_upsert`'s name fallback only refused rows whose
+/// SAME handle type differed, so a person already pinned by one handle
+/// type (a Wikidata Q-id) absorbed a same-named different person arriving
 /// with the other handle type (a TVmaze id). The blank-fill UPDATE then
-/// stamps the TVmaze id onto the wrong person, and every future credit
-/// for that TVmaze id lands on the merged row: the person page shows one
-/// human wearing two people's filmographies, and nothing in the UI can
-/// split them apart again.
+/// stamped the TVmaze id onto the wrong person, and every future credit
+/// for that TVmaze id landed on the merged row: the person page showed
+/// one human wearing two people's filmographies, and nothing in the UI
+/// could split them apart again.
+///
+/// Fixed by giving the two id spaces something in common to disagree
+/// about rather than by tightening the query - which could only have
+/// forked the one person the merge exists for. `born` is that fact: it is
+/// what BOTH cast providers publish (TVmaze in the cast payload,
+/// Wikidata as P569), so it is the one that fires on this exact shape.
+///
+/// The IMDb id is matched too and is the stronger claim where it exists,
+/// but only Wikidata can supply one for a person - measured 27 Jul 2026,
+/// TVmaze exposes no person-level IMDb id by any route. See
+/// `person_upsert`'s doc comment.
 #[test]
-#[ignore = "finding D2 is a DESIGN LIMIT, not a bug - see person_upsert's doc \
-comment. Merging across different handle types is required for one person seen \
-by two providers (people_identity_credits_and_the_search_leg pins it), and the \
-same rule necessarily merges two different same-named people. Fixing needs a \
-disambiguator, not a tighter query. Kept as the spec for that future work."]
 fn person_upsert_keeps_two_people_apart_once_each_has_a_different_handle_type() {
     let (ix, _dir) = temp_index("d2");
-    // "Chris Evans" the actor, identified by Wikidata.
+    // "Chris Evans" the actor, from a film's cast: a Wikidata Q-id, and
+    // the IMDb id and birthday that ride along with it.
     let actor = ix
         .person_upsert(&Credit {
             name: "Chris Evans".into(),
             role: "actor".into(),
-            wikidata_qid: "Q3564164".into(),
+            wikidata_qid: "Q170572".into(),
+            imdb: "nm0262635".into(),
+            born: "1981-06-13".into(),
             ..Default::default()
         })
         .unwrap();
-    // "Chris Evans" the TV presenter, identified by TVmaze - a different
-    // human, carrying a handle the actor's row does not have.
+    // "Chris Evans" the TV presenter, from a show's cast: a different
+    // human, carrying a handle the actor's row does not have and no IMDb
+    // id at all, because TVmaze has none to give.
     let presenter = ix
         .person_upsert(&Credit {
             name: "Chris Evans".into(),
             role: "presenter".into(),
             tvmaze_id: 42,
+            born: "1966-04-01".into(),
             ..Default::default()
         })
         .unwrap();
@@ -180,4 +192,92 @@ fn person_upsert_keeps_two_people_apart_once_each_has_a_different_handle_type() 
         row.tvmaze_id, 0,
         "the Wikidata-identified actor absorbed the presenter's TVmaze id"
     );
+    assert_eq!(row.born, "1981-06-13", "the birth date was not stored");
+
+    // The other half of the same rule: a credit that contradicts nothing
+    // still merges. This is the shape the fix must not break - one human
+    // whose TV credit and film credit share only a name and a birthday.
+    let (ix, _dir) = temp_index("d2-merge");
+    let film = ix
+        .person_upsert(&Credit {
+            name: "Tom Cruise".into(),
+            role: "actor".into(),
+            wikidata_qid: "Q37079".into(),
+            imdb: "nm0000129".into(),
+            born: "1962-07-03".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let tv = ix
+        .person_upsert(&Credit {
+            name: "Tom Cruise".into(),
+            role: "actor".into(),
+            tvmaze_id: 555,
+            born: "1962-07-03".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(film, tv, "one human seen by two providers forked into two rows");
+    let row = ix.person_get(film).unwrap().unwrap();
+    assert_eq!(
+        (row.tvmaze_id, row.wikidata_qid.as_str(), row.imdb.as_str()),
+        (555, "Q37079", "nm0000129"),
+        "the merged row did not collect both handles"
+    );
+}
+
+/// The IMDb id is an identity claim in its own right, in both
+/// directions: two people who differ on one are different people even
+/// when everything else about the credit matches, and one person is
+/// found by it even when the providers agree on nothing else.
+///
+/// This is the join the `people.imdb` column was always shaped for. It
+/// only fires between providers that both publish an `nm…` id, which
+/// today means Wikidata and anything added later - see `person_upsert`
+/// for why TVmaze is not one of them, and why `born` carries the
+/// cross-provider case instead.
+#[test]
+fn person_upsert_separates_two_people_who_differ_on_the_imdb_id() {
+    let (ix, _dir) = temp_index("d2-imdb");
+    let a = ix
+        .person_upsert(&Credit {
+            name: "Michael Jordan".into(),
+            role: "actor".into(),
+            imdb: "nm0001392".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let b = ix
+        .person_upsert(&Credit {
+            name: "Michael Jordan".into(),
+            role: "actor".into(),
+            imdb: "nm2027656".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_ne!(a, b, "two different IMDb ids are two different people");
+    // …and the same id is the same person, arriving with a handle the
+    // first credit never had.
+    let again = ix
+        .person_upsert(&Credit {
+            name: "Michael Jordan".into(),
+            role: "actor".into(),
+            imdb: "nm0001392".into(),
+            tvmaze_id: 77,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(again, a, "the IMDb id did not identify the person it names");
+    let row = ix.person_get(a).unwrap().unwrap();
+    assert_eq!(row.tvmaze_id, 77, "the second provider's handle was not filled in");
+    // A credit that knows only the name still lands on one of them
+    // rather than forking a third row: a blank never contradicts.
+    let bare = ix
+        .person_upsert(&Credit {
+            name: "Michael Jordan".into(),
+            role: "actor".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(bare == a || bare == b, "a handle-less credit forked a new row");
 }

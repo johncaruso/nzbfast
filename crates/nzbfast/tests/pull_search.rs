@@ -1,0 +1,541 @@
+//! M35 gate: pull search end to end, with no network beyond loopback.
+//!
+//! Our own Newznab facade is a spec-true server, so one nzbfast plays
+//! the indexer (daemon A: seeded index, apikey-protected) and a second
+//! nzbfast plays the client (daemon B: A configured as an external
+//! indexer). B's `indexer_search` must find A's release, hand back an
+//! opaque token WITHOUT leaking A's apikey or NZB links to the caller,
+//! and `indexer_grab` must fetch the NZB from A and enqueue it. Budgets
+//! gate visibly, and expired/unknown tokens refuse cleanly.
+
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+
+use nzbkit::nntp::OverEntry;
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// (status, body) of a GET; connection refusals retried, answers never.
+/// (See tests/newznab.rs for why zero-bytes-back is retried.)
+fn http_get(port: u16, req: &str) -> (u16, String) {
+    let mut last = String::new();
+    for attempt in 0..5u32 {
+        match http_once(port, &format!(
+            "GET {req} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        )) {
+            Ok(out) => return out,
+            Err(e) => {
+                last = e.to_string();
+                std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(attempt) + 50));
+            }
+        }
+    }
+    panic!("daemon on :{port} never served {req}: {last}");
+}
+
+fn http_post_json(port: u16, req: &str, body: &str) -> (u16, String) {
+    let msg = format!(
+        "POST {req} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let mut last = String::new();
+    for attempt in 0..5u32 {
+        match http_once(port, &msg) {
+            Ok(out) => return out,
+            Err(e) => {
+                last = e.to_string();
+                std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(attempt) + 50));
+            }
+        }
+    }
+    panic!("daemon on :{port} never served POST {req}: {last}");
+}
+
+fn http_once(port: u16, msg: &str) -> std::io::Result<(u16, String)> {
+    let mut s = TcpStream::connect(("127.0.0.1", port))?;
+    s.write_all(msg.as_bytes())?;
+    let mut out = String::new();
+    let read = s.read_to_string(&mut out);
+    if out.is_empty() {
+        return Err(read.err().unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "closed without answering")
+        }));
+    }
+    let status: u16 =
+        out.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    Ok((status, out.split("\r\n\r\n").nth(1).unwrap_or("").to_string()))
+}
+
+fn pct(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+struct KillOnDrop(Child);
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+struct Daemon {
+    _child: KillOnDrop,
+    port: u16,
+}
+
+async fn serve(dir: &Path, build: impl Fn(u16) -> Command) -> Daemon {
+    for attempt in 0..3 {
+        let port = free_port();
+        let logfile = dir.join(format!("daemon-{port}.log"));
+        let out = std::fs::File::create(&logfile).unwrap();
+        let err = out.try_clone().unwrap();
+        let mut cmd = build(port);
+        cmd.stdout(Stdio::from(out)).stderr(Stdio::from(err));
+        let child = KillOnDrop(cmd.spawn().unwrap());
+        let log = logfile.clone();
+        let (child, ready) = tokio::task::spawn_blocking(move || {
+            let mut child = child;
+            let ready = wait_ready(&mut child, port, &log);
+            (child, ready)
+        })
+        .await
+        .unwrap();
+        if ready {
+            return Daemon { _child: child, port };
+        }
+        let tail = std::fs::read_to_string(&logfile).unwrap_or_default();
+        assert!(attempt < 2, "daemon exited without binding :{port}\n--- log ---\n{tail}");
+    }
+    unreachable!()
+}
+
+fn wait_ready(child: &mut KillOnDrop, port: u16, logfile: &Path) -> bool {
+    let banner = format!("open the dashboard at  http://localhost:{port}/");
+    for _ in 0..600 {
+        if std::fs::read_to_string(logfile).unwrap_or_default().contains(&banner)
+            && TcpStream::connect(("127.0.0.1", port)).is_ok()
+        {
+            return true;
+        }
+        if child.0.try_wait().ok().flatten().is_some() {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let tail = std::fs::read_to_string(logfile).unwrap_or_default();
+    panic!("daemon never came up on :{port}\n--- log ---\n{tail}");
+}
+
+fn over(number: u64, subject: &str, msgid: &str, bytes: u64) -> OverEntry {
+    OverEntry {
+        number,
+        subject: subject.into(),
+        from: "poster@x".into(),
+        message_id: msgid.into(),
+        bytes,
+        date: 1_700_000_000,
+    }
+}
+
+/// Standard daemon command against a dead news server.
+fn daemon_cmd(dir: &Path, cfg: &Path, db: &Path, port: u16, extra: &[&str]) -> Command {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+    c.env("NZBFAST_OPEN", "1")
+        .env("NZBFAST_NO_ENRICH", "1")
+        .arg("--config")
+        .arg(cfg)
+        .arg("serve")
+        // Loopback only - see tests/newznab.rs on the macOS firewall.
+        .arg("--bind")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--out")
+        .arg(dir.join("complete"))
+        .arg("--index-db")
+        .arg(db);
+    for a in extra {
+        c.arg(a);
+    }
+    c
+}
+
+/// A stand-in indexer that records the request lines it is asked for.
+///
+/// Our own facade cannot play this part: it deliberately does NOT
+/// advertise `imdbid` in its caps, so a client is right to never send it
+/// one - which is exactly the behaviour under test here, from the other
+/// side. This one DOES advertise it, so the id path can be proven end to
+/// end without touching a real indexer.
+struct MockIndexer {
+    port: u16,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+fn mock_indexer() -> MockIndexer {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for stream in l.incoming() {
+            let Ok(mut s) = stream else { break };
+            let mut buf = [0u8; 2048];
+            let n = s.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let line = req.lines().next().unwrap_or("").to_string();
+            log.lock().unwrap().push(line.clone());
+            let body = if line.contains("t=caps") {
+                r#"<?xml version="1.0"?><caps><server title="MockDex"/>
+<limits max="100" default="100"/>
+<searching><search available="yes" supportedParams="q"/>
+<tv-search available="yes" supportedParams="q,season,ep"/>
+<movie-search available="yes" supportedParams="q,imdbid"/></searching>
+<categories><category id="2000" name="Movies"/></categories></caps>"#
+                    .to_string()
+            } else {
+                r#"<?xml version="1.0"?><rss xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/"><channel>
+<item><title>Kill.Bill.Vol.1.2003.1080p.BluRay.x264</title><guid>mock-1</guid>
+<enclosure url="http://127.0.0.1:1/nzb/mock-1" length="8000000000" type="application/x-nzb"/>
+<newznab:attr name="category" value="2000"/></item></channel></rss>"#
+                    .to_string()
+            };
+            let _ = write!(
+                s,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    MockIndexer { port, seen }
+}
+
+/// M35 phase 2: a film searched from its title page is matched on its
+/// IMDb id, not on the words in its name - and the id is resolved by the
+/// DAEMON from the title key, never supplied by the browser.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_title_page_search_uses_the_imdb_id() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-pullid-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // A local title row carrying the id the search must pick up.
+    let db = dir.join("index.db");
+    {
+        let ix = nzbkit::index::Index::open(&db).unwrap();
+        ix.title_seed("m:kill bill:2003", "movie", "Kill Bill", 2003).unwrap();
+        ix.title_fill(
+            "m:kill bill:2003",
+            &nzbkit::index::TitleFill { imdb: "tt0266697", ..Default::default() },
+            1_700_000_000,
+        )
+        .unwrap();
+    }
+    let mock = mock_indexer();
+    let cfg = dir.join("config.json");
+    std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
+        .unwrap();
+    // The id is resolved from the LOCAL titles table, which the daemon
+    // will not open while the built-in indexer's master switch is off
+    // (its default). A title page only exists when that switch is on
+    // anyway, so this is the honest configuration for this test.
+    std::fs::write(cfg.with_file_name("settings.json"), "{\"index_enabled\": true}").unwrap();
+    let d = serve(&dir, |port| daemon_cmd(&dir, &cfg, &db, port, &[])).await;
+    let port = d.port;
+    let mport = mock.port;
+    let seen = mock.seen.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let entry =
+            format!(r#"[{{"name":"mock","url":"http://127.0.0.1:{mport}/api","apikey":"k"}}]"#);
+        let (_, r) = http_get(
+            port,
+            &format!("/api?mode=config&name=indexers&value={}&output=json", pct(&entry)),
+        );
+        assert!(r.contains("true"), "{r}");
+
+        // The browser sends the TITLE KEY, never an id.
+        let (_, s) = http_get(
+            port,
+            "/api?mode=indexer_search&q=Kill+Bill&kind=movie&title_key=m%3Akill+bill%3A2003&output=json",
+        );
+        let sv: serde_json::Value = serde_json::from_str(&s).unwrap_or_default();
+        assert_eq!(sv["status"], true, "{s}");
+        assert_eq!(sv["results"].as_array().map(Vec::len), Some(1), "{s}");
+
+        let lines = seen.lock().unwrap().clone();
+        // Caps were probed, then the search went out as t=movie carrying
+        // the bare id - "tt" stripped, per the protocol.
+        assert!(lines.iter().any(|l| l.contains("t=caps")), "{lines:?}");
+        let search = lines.iter().find(|l| l.contains("t=movie")).unwrap_or_else(|| {
+            panic!("no t=movie request; the id was not used:\n{lines:?}")
+        });
+        assert!(search.contains("imdbid=0266697"), "{search}");
+
+        // A title we hold no id for degrades to a plain free-text
+        // search rather than sending a bogus id.
+        seen.lock().unwrap().clear();
+        let (_, s2) = http_get(
+            port,
+            "/api?mode=indexer_search&q=Nothing&kind=movie&title_key=m%3Anothing%3A1999&output=json",
+        );
+        assert!(s2.contains("\"status\":true"), "{s2}");
+        let lines = seen.lock().unwrap().clone();
+        assert!(
+            lines.iter().any(|l| l.contains("t=search")) && !lines.iter().any(|l| l.contains("imdbid=")),
+            "an unknown title should not carry an id: {lines:?}"
+        );
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// M35 phase 2: the watchlist's external leg. A watched show with
+/// NOTHING in the local index finds its episode on the peer indexer and
+/// grabs it - but only once the user has turned the leg on, because an
+/// unattended search spends a metered third-party account.
+#[tokio::test(flavor = "multi_thread")]
+async fn watchlist_asks_indexers_only_when_switched_on() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-pullwl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Peer A carries the episode; our own index (B) is empty.
+    let dir_a = dir.join("a");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    let db_a = dir_a.join("index.db");
+    {
+        let mut ix = nzbkit::index::Index::open(&db_a).unwrap();
+        ix.ingest(
+            "alt.binaries.teevee",
+            &[
+                over(1, "\"Wanted.Show.S02E05.1080p.WEB.rar\" yEnc (1/1)", "<w1@x>", 4000),
+                over(2, "\"Wanted.Show.S02E05.1080p.WEB.par2\" yEnc (1/1)", "<w2@x>", 400),
+            ],
+            1_700_000_000,
+        )
+        .unwrap();
+    }
+    let cfg_a = dir_a.join("config.json");
+    std::fs::write(&cfg_a, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
+        .unwrap();
+    // A publishes its index over newznab, so its built-in indexer is on.
+    // B deliberately leaves the switch at its default OFF: this test is
+    // then also the regression for the watchlist's external leg working
+    // with no local index at all, which is the ordinary new install.
+    std::fs::write(cfg_a.with_file_name("settings.json"), "{\"index_enabled\": true}").unwrap();
+    let a = serve(&dir_a, |port| daemon_cmd(&dir_a, &cfg_a, &db_a, port, &[])).await;
+    let port_a = a.port;
+
+    let dir_b = dir.join("b");
+    std::fs::create_dir_all(&dir_b).unwrap();
+    let cfg_b = dir_b.join("config.json");
+    std::fs::write(&cfg_b, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
+        .unwrap();
+    let db_b = dir_b.join("index.db");
+    let b = serve(&dir_b, |port| daemon_cmd(&dir_b, &cfg_b, &db_b, port, &[])).await;
+    let port_b = b.port;
+
+    tokio::task::spawn_blocking(move || {
+        let entry = format!(
+            r#"[{{"name":"peer","url":"http://127.0.0.1:{port_a}/api","apikey":"x"}}]"#
+        );
+        let (_, r) = http_get(
+            port_b,
+            &format!("/api?mode=config&name=indexers&value={}&output=json", pct(&entry)),
+        );
+        assert!(r.contains("true"), "{r}");
+
+        // Watch the show. The local index has nothing, so without the
+        // external leg there is nothing to grab.
+        let wl = r#"[{"id":1,"kind":"tv","title":"Wanted Show","seasons":"","episodes":"","min_quality":"any","target_quality":"1080p","enabled":true}]"#;
+        let (_, r) = http_get(
+            port_b,
+            &format!("/api?mode=config&name=watchlist&value={}&output=json", pct(wl)),
+        );
+        assert!(r.contains("true"), "{r}");
+
+        // Default OFF: a check now must NOT queue anything, and must not
+        // spend a search either.
+        http_get(port_b, "/api?mode=watchlist_check_now&output=json");
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let (_, q) = http_get(port_b, "/api?mode=queue&output=json");
+        assert!(
+            !q.contains("Wanted.Show"),
+            "the watchlist reached an indexer while the toggle was off:\n{q}"
+        );
+
+        // Turn it on, and the same item now finds the episode on the peer.
+        let (_, r) =
+            http_get(port_b, "/api?mode=config&name=watchlist_external&value=1&output=json");
+        assert!(r.contains("true"), "{r}");
+        http_get(port_b, "/api?mode=watchlist_check_now&output=json");
+        let mut queued = String::new();
+        for _ in 0..60 {
+            let (_, q) = http_get(port_b, "/api?mode=queue&output=json");
+            if q.contains("Wanted.Show.S02E05") {
+                queued = q;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        assert!(!queued.is_empty(), "watchlist never grabbed from the indexer");
+        // Attributed to the watchlist, not to a click.
+        assert!(queued.contains("watchlist"), "{queued}");
+
+        // The setting survives a get_config round-trip as a real bool.
+        let (_, cfg) = http_get(port_b, "/api?mode=get_config&output=json");
+        assert!(cfg.contains("\"watchlist_external\":true"), "{cfg}");
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pull_search_grabs_from_a_second_nzbfast() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-pull-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Daemon A: the "commercial indexer". Seeded index, key-protected.
+    let dir_a = dir.join("a");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    let db_a = dir_a.join("index.db");
+    {
+        let mut ix = nzbkit::index::Index::open(&db_a).unwrap();
+        ix.ingest(
+            "alt.binaries.teevee",
+            &[
+                over(1, "\"Pull.Show.S01E02.1080p.rar\" yEnc (1/1)", "<p1@x>", 1000),
+                over(2, "\"Pull.Show.S01E02.1080p.par2\" yEnc (1/1)", "<p2@x>", 200),
+            ],
+            1_700_000_000,
+        )
+        .unwrap();
+    }
+    let cfg_a = dir_a.join("config.json");
+    std::fs::write(&cfg_a, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
+        .unwrap();
+    // A is playing the role of a third-party indexer, so its built-in
+    // indexer has to be switched on - that switch defaults OFF and
+    // closes the newznab facade with it. B deliberately leaves it off,
+    // which is the case this whole feature exists for: pull search
+    // works with no local index at all.
+    std::fs::write(cfg_a.with_file_name("settings.json"), "{\"index_enabled\": true}").unwrap();
+    let a = serve(&dir_a, |port| {
+        daemon_cmd(&dir_a, &cfg_a, &db_a, port, &["--apikey", "sekrit"])
+    })
+    .await;
+    let port_a = a.port;
+
+    // Daemon B: the client under test. Keyless-open, empty index.
+    let dir_b = dir.join("b");
+    std::fs::create_dir_all(&dir_b).unwrap();
+    let cfg_b = dir_b.join("config.json");
+    std::fs::write(&cfg_b, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
+        .unwrap();
+    let db_b = dir_b.join("index.db");
+    let b = serve(&dir_b, |port| daemon_cmd(&dir_b, &cfg_b, &db_b, port, &[])).await;
+    let port_b = b.port;
+
+    tokio::task::spawn_blocking(move || {
+        // Configure A as an external indexer on B, with a 2-hit budget.
+        let entry = format!(
+            r#"[{{"name":"peer","url":"http://127.0.0.1:{port_a}/api","apikey":"sekrit","hits_per_day":2}}]"#
+        );
+        let (code, body) = http_get(
+            port_b,
+            &format!("/api?mode=config&name=indexers&value={}&output=json", pct(&entry)),
+        );
+        assert_eq!(code, 200, "{body}");
+        assert!(body.contains("true"), "saving indexers failed: {body}");
+
+        // get_config reports the entry but never echoes the key.
+        let (_, cfgout) = http_get(port_b, "/api?mode=get_config&output=json");
+        assert!(cfgout.contains("\"peer\""), "{cfgout}");
+        assert!(cfgout.contains("\"has_key\":true"), "{cfgout}");
+        assert!(!cfgout.contains("sekrit"), "apikey echoed to the UI:\n{cfgout}");
+
+        // Test button: blank key borrows the stored one, caps answer.
+        let (_, t) = http_post_json(
+            port_b,
+            "/api?mode=indexer_test&output=json",
+            r#"{"indexer":{"name":"peer","url":"","apikey":""}}"#,
+        );
+        assert!(t.contains("needs a URL"), "{t}");
+        let url = format!("http://127.0.0.1:{port_a}/api");
+        let (_, t) = http_post_json(
+            port_b,
+            "/api?mode=indexer_test&output=json",
+            &format!(r#"{{"indexer":{{"name":"peer","url":"{url}","apikey":""}}}}"#),
+        );
+        let tv: serde_json::Value = serde_json::from_str(&t).unwrap_or_default();
+        assert_eq!(tv["status"], true, "indexer_test failed: {t}");
+        assert_eq!(tv["server"], "nzbfast", "{t}");
+
+        // Search B: the result comes from A, tokenized, nothing leaked.
+        let (_, s) = http_get(port_b, "/api?mode=indexer_search&q=pull+show&output=json");
+        let sv: serde_json::Value = serde_json::from_str(&s).unwrap_or_default();
+        assert_eq!(sv["status"], true, "{s}");
+        let results = sv["results"].as_array().expect("results array");
+        assert_eq!(results.len(), 1, "{s}");
+        let r = &results[0];
+        assert_eq!(r["indexer"], "peer", "{s}");
+        assert!(r["title"].as_str().unwrap().contains("Pull.Show.S01E02"), "{s}");
+        assert_eq!(r["kind"], "tv", "{s}");
+        assert!(!s.contains("sekrit"), "apikey leaked into search results:\n{s}");
+        assert!(!s.contains("getnzb"), "raw NZB link leaked into search results:\n{s}");
+        let token = r["token"].as_str().expect("token").to_string();
+
+        // Grab by token: B fetches the NZB from A and enqueues it.
+        let (_, g) = http_get(
+            port_b,
+            &format!("/api?mode=indexer_grab&token={token}&priority=1&output=json"),
+        );
+        let gv: serde_json::Value = serde_json::from_str(&g).unwrap_or_default();
+        assert_eq!(gv["status"], true, "indexer_grab failed: {g}");
+        assert!(gv["nzo_ids"][0].as_str().is_some(), "{g}");
+
+        // The job really is queued, attributed to the pull search.
+        let (_, q) = http_get(port_b, "/api?mode=queue&output=json");
+        assert!(q.contains("Pull.Show.S01E02"), "{q}");
+
+        // An unknown token refuses cleanly - the grab surface accepts
+        // nothing the search did not mint.
+        let (_, bad) = http_get(port_b, "/api?mode=indexer_grab&token=doesnotexist&output=json");
+        assert!(bad.contains("expired"), "{bad}");
+
+        // Budget: hits_per_day=2, one spent. The second search works,
+        // the third is skipped VISIBLY.
+        let (_, s2) = http_get(port_b, "/api?mode=indexer_search&q=pull+show&output=json");
+        assert!(s2.contains("\"results\""), "{s2}");
+        let (_, s3) = http_get(port_b, "/api?mode=indexer_search&q=pull+show&output=json");
+        let s3v: serde_json::Value = serde_json::from_str(&s3).unwrap_or_default();
+        assert_eq!(s3v["results"].as_array().map(Vec::len), Some(0), "{s3}");
+        assert!(s3.contains("daily API budget reached"), "{s3}");
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

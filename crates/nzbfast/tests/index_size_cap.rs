@@ -64,17 +64,37 @@ fn over(number: u64, subject: &str, msgid: &str, date: i64) -> OverEntry {
     }
 }
 
-/// A scratch install. `settings` is written verbatim as settings.json,
-/// which ALSO marks this as an existing install so no first-run API key
-/// is minted behind the test's back.
+/// A scratch install. `settings` is written as settings.json, which ALSO
+/// marks this as an existing install so no first-run API key is minted
+/// behind the test's back.
+///
+/// `index_enabled` is stamped in unless the caller set it: the indexer's
+/// master switch defaults OFF, and every test in this file is about the
+/// index database, which the daemon will not even open while it is off.
 fn scratch(name: &str, settings: &str) -> PathBuf {
     let dir = std::env::temp_dir()
         .join(format!("nzbfast-sizecap-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("config.json"), "{\"servers\":[]}").unwrap();
-    std::fs::write(dir.join("settings.json"), settings).unwrap();
+    std::fs::write(dir.join("settings.json"), with_indexer_on(settings)).unwrap();
     dir
+}
+
+/// Add `"index_enabled": true` to a settings.json literal, leaving an
+/// explicit choice alone. Textual rather than a serde round-trip so the
+/// tests' hand-written JSON stays exactly as written in the diff.
+fn with_indexer_on(settings: &str) -> String {
+    if settings.contains("index_enabled") {
+        return settings.to_string();
+    }
+    let t = settings.trim();
+    let inner = t.strip_prefix('{').and_then(|s| s.strip_suffix('}')).unwrap_or("").trim();
+    if inner.is_empty() {
+        "{\"index_enabled\": true}".to_string()
+    } else {
+        format!("{{\"index_enabled\": true, {inner}}}")
+    }
 }
 
 /// Put `stems` into the index db as real releases, newest first. Returns

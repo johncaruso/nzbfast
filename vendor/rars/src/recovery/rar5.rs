@@ -1,6 +1,6 @@
 const CRC64_XZ_POLY: u64 = 0xc96c_5795_d787_0f42;
 const CRC64_XZ_INIT: u64 = 0xffff_ffff_ffff_ffff;
-const FIELD_SIZE: usize = 65_535;
+pub(crate) const FIELD_SIZE: usize = 65_535;
 const FIELD_MASK: u32 = 0xffff;
 const PRIMITIVE_POLYNOMIAL: u32 = 0x1100b;
 const ZERO_LOG_SENTINEL: u32 = (FIELD_SIZE * 2) as u32;
@@ -15,8 +15,17 @@ const RAR5_RECOVERY_CHUNK_FIXED_HEADER_SIZE: u64 = 0x48;
 /// could serve anyway: reconstruction below holds the whole grid in RAM, so
 /// past the byte bound it cannot run inside any sane memory budget - raising
 /// the numbers is not the fix, stripe reconstruction is.
-const MAX_RECONSTRUCTION_SHARDS: usize = 4_096;
+pub(crate) const MAX_RECONSTRUCTION_SHARDS: usize = 4_096;
 const MAX_RECONSTRUCTION_BYTES: u64 = 8 * KIB * KIB * KIB;
+/// Ceiling on a striped plan's `damaged * data_count` encoder cells (u16s),
+/// i.e. 64 MB of matrix at 32M cells. The striped path holds only the
+/// selected rows, so `data_count` alone costs nothing grid-shaped any more -
+/// a 100 GB release split into 15 MB volumes is ~6,800 data volumes and must
+/// plan - but a crafted header can still pair a wide slot count with a huge
+/// damage list, and rows * columns is what that declaration actually
+/// allocates. Any real repair is tens of damaged volumes against tens of
+/// thousands of slots at most, orders of magnitude under this line.
+const MAX_STRIPE_PLAN_CELLS: usize = 32 * 1024 * 1024;
 /// Most parity one recovery record stores. A data shard is `group_count`
 /// bytes, so once the protected region passes `data_shards * this` - about
 /// 13 MB - a shard's parity row no longer fits one record and is split across
@@ -679,7 +688,17 @@ fn repair_prefix_with_chunks(
 ///
 /// `read_range` receives byte ranges relative to the protected prefix and must
 /// return the current bytes for each requested range. The returned pairs contain
-/// only the damaged prefix ranges that need to be written back.
+/// only the damaged prefix ranges that need to be written back, in ascending
+/// order and never overlapping, which is what lets a caller stream the repaired
+/// file out in one pass.
+///
+/// Group-by-group, for the same reason [`repair_prefix_with_chunks`] is: the
+/// parity rows and the CRC table both describe ONE GROUP's slice of each data
+/// shard. This used to take the first record's table for the whole set and
+/// stride by `plan.group_count` - a whole shard - so on any archive with more
+/// than one group (over ~13 MB) every shard's CRC disagreed and the repair
+/// reported damage it could not fund. The daemon reaches the streaming path
+/// instead, so the cost here was a missed repair, never wrong bytes.
 pub fn repair_inline_recovery_prefix_shards<F>(
     protected_size: usize,
     recovery_data: &[u8],
@@ -688,49 +707,144 @@ pub fn repair_inline_recovery_prefix_shards<F>(
 where
     F: FnMut(std::ops::Range<usize>) -> Result<Vec<u8>>,
 {
-    let chunks = parse_available_inline_recovery_chunks(recovery_data)?;
-    let first = chunks.first().ok_or(Error::BadRecoveryChunk)?;
-    if first.protected_size != protected_size as u64 {
+    // Found, not parsed: which group a record carries the parity for is
+    // decided by where it sits in the file, so its offset has to survive to
+    // here. Compacting the records first would shift every survivor after a
+    // CRC-failed one into the wrong group.
+    let found = find_inline_recovery_chunks(recovery_data)?;
+    let first = found.first().ok_or(Error::BadRecoveryChunk)?;
+    let plan = first.chunk.plan;
+    let protected = protected_size as u64;
+    if first.chunk.protected_size != protected {
         return Err(Error::BadRecoveryChunk);
     }
-    if chunks
+    if found
         .iter()
-        .any(|chunk| chunk.plan != first.plan || chunk.protected_size != first.protected_size)
+        .any(|entry| entry.chunk.plan != plan || entry.chunk.protected_size != protected)
     {
         return Err(Error::BadRecoveryChunk);
     }
 
-    let plan = first.plan;
-    let shard_len = usize::try_from(plan.group_count).map_err(|_| Error::PlanOverflow)?;
-    if !shard_len.is_multiple_of(2) {
-        return Err(Error::OddShardSize);
-    }
-    let shard_ranges = split_prefix_shard_ranges(protected_size, plan)?;
-    let mut damaged = Vec::new();
-    for (index, range) in shard_ranges.iter().enumerate() {
-        let shard = read_range(range.clone())?;
-        if crc64_rar_state(&shard) != first.data_shard_states[index] {
-            damaged.push(index);
+    let data_shards = usize::try_from(plan.data_shards).map_err(|_| Error::PlanOverflow)?;
+    let groups = recovery_groups(plan)?;
+    let by_group = group_records(&found, plan)?;
+
+    let mut patches: Vec<(std::ops::Range<usize>, Vec<u8>)> = Vec::new();
+    for (group, rows) in groups.iter().zip(&by_group) {
+        let Some(reference) = rows.first() else {
+            // No surviving parity for this group, so nothing here can repair
+            // it. The caller's own verification is what reports the file still
+            // broken.
+            continue;
+        };
+        if reference.data_shard_states.len() != data_shards {
+            return Err(Error::BadRecoveryChunk);
+        }
+        // Every record of one group carries the same table. Disagreement is an
+        // inconsistent set rather than a damaged one, and repairing on either
+        // table would be a guess.
+        if rows
+            .iter()
+            .any(|row| row.data_shard_states != reference.data_shard_states)
+        {
+            return Err(Error::BadRecoveryChunk);
+        }
+        // The GF16 kernel walks two-byte symbols, so an odd shard length would
+        // read one past the end. Group lengths come from an even `group_count`
+        // capped at 64 KiB, so this only fires on a forged plan.
+        let shard_len = usize::try_from(group.len).map_err(|_| Error::PlanOverflow)?;
+        if !shard_len.is_multiple_of(2) {
+            return Err(Error::OddShardSize);
+        }
+
+        let mut ranges = Vec::with_capacity(data_shards);
+        for shard in 0..data_shards {
+            ranges.push(group_shard_range(plan, *group, shard, protected)?);
+        }
+        let mut damaged = Vec::new();
+        for (index, range) in ranges.iter().enumerate() {
+            let state = if range.is_empty() {
+                0
+            } else {
+                let shard = read_range(range.clone())?;
+                if shard.len() != range.len() {
+                    return Err(Error::ShardSizeMismatch);
+                }
+                crc64_rar_state(&shard)
+            };
+            if state != reference.data_shard_states[index] {
+                damaged.push(index);
+            }
+        }
+        if damaged.is_empty() {
+            continue;
+        }
+        if damaged.len() > rows.len() {
+            return Err(Error::TooManyDamagedShards);
+        }
+
+        let recovery_rows: Vec<_> = rows[..damaged.len()]
+            .iter()
+            .map(|row| (row.shard_index, row.parity.as_slice()))
+            .collect();
+        if recovery_rows
+            .iter()
+            .any(|(_, parity)| parity.len() != shard_len)
+        {
+            return Err(Error::ShardSizeMismatch);
+        }
+        let repaired = solve_damaged_group_shards(
+            plan,
+            &ranges,
+            shard_len,
+            &damaged,
+            &recovery_rows,
+            &mut read_range,
+        )?;
+        for (&index, data) in damaged.iter().zip(repaired) {
+            if ranges[index].is_empty() {
+                continue;
+            }
+            patches.push((ranges[index].clone(), data));
         }
     }
-    if damaged.is_empty() {
-        return Ok(Vec::new());
-    }
-    if damaged.len() > chunks.len() {
-        return Err(Error::TooManyDamagedShards);
-    }
 
-    let recovery_rows: Vec<_> = chunks[..damaged.len()]
-        .iter()
-        .map(|chunk| (chunk.shard_index, chunk.parity.as_slice()))
-        .collect();
-    if recovery_rows
-        .iter()
-        .any(|(_, shard)| shard.len() != shard_len)
+    // Groups are walked outermost, so the patches come out shard-minor within
+    // each group rather than in file order. Sorting is what keeps the caller's
+    // single forward pass valid; the ranges are disjoint slices of the prefix,
+    // so the order is total.
+    patches.sort_by_key(|(range, _)| range.start);
+    Ok(patches)
+}
+
+/// Solves one group's damaged shards from that group's parity rows, reading
+/// the surviving shards through `read_range` rather than holding them.
+///
+/// `ranges` is every data shard's slice of this group, `shard_len` the group's
+/// padded shard length. Returns one buffer per entry of `damaged`, trimmed to
+/// the real (unpadded) bytes of that shard's range.
+fn solve_damaged_group_shards<F>(
+    plan: InlineRecoveryPlan,
+    ranges: &[std::ops::Range<usize>],
+    shard_len: usize,
+    damaged: &[usize],
+    recovery_rows: &[(usize, &[u8])],
+    read_range: &mut F,
+) -> Result<Vec<Vec<u8>>>
+where
+    F: FnMut(std::ops::Range<usize>) -> Result<Vec<u8>>,
+{
+    // Defence in depth: `parse_inline_recovery_chunk` refuses these counts
+    // before a plan exists, but the whole encoder grid below is sized from
+    // them and this kernel serves every in-memory repair entry point, so it
+    // refuses on its own account rather than trusting its callers (the same
+    // lesson `recover_damaged_shards` already learned).
+    if ranges.len() > MAX_RECONSTRUCTION_SHARDS
+        || plan.recovery_shards > MAX_RECONSTRUCTION_SHARDS as u64
     {
-        return Err(Error::ShardSizeMismatch);
+        return Err(Error::ReconstructionTooLarge);
     }
-    let matrix = make_encoder_matrix(shard_ranges.len(), plan.recovery_shards as usize)?;
+    let matrix = make_encoder_matrix(ranges.len(), plan.recovery_shards as usize)?;
     let equations: Vec<Vec<u16>> = recovery_rows
         .iter()
         .map(|&(row_index, _)| {
@@ -752,13 +866,13 @@ where
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    let damaged_lookup = damaged_lookup(shard_ranges.len(), &damaged)?;
+    let damaged_lookup = damaged_lookup(ranges.len(), damaged)?;
 
-    for (data_index, range) in shard_ranges.iter().enumerate() {
+    for (data_index, range) in ranges.iter().enumerate() {
         if damaged_lookup[data_index] {
             continue;
         }
-        let shard = read_padded_prefix_shard(range.clone(), shard_len, &mut read_range)?;
+        let shard = read_padded_prefix_shard(range.clone(), shard_len, read_range)?;
         for (row_index, rhs) in rhs_by_row.iter_mut().enumerate() {
             let coeff = matrix[recovery_rows[row_index].0][data_index];
             if coeff == 0 {
@@ -773,7 +887,7 @@ where
 
     let mut repaired = damaged
         .iter()
-        .map(|&index| vec![0; shard_ranges[index].len()])
+        .map(|&index| vec![0; ranges[index].len()])
         .collect::<Vec<_>>();
     for word_index in 0..word_count {
         let rhs = rhs_by_row
@@ -790,12 +904,7 @@ where
             }
         }
     }
-
-    Ok(damaged
-        .into_iter()
-        .zip(repaired)
-        .map(|(index, data)| (shard_ranges[index].clone(), data))
-        .collect())
+    Ok(repaired)
 }
 
 fn damaged_lookup(data_count: usize, damaged: &[usize]) -> Result<Vec<bool>> {
@@ -1007,15 +1116,6 @@ pub fn reconstruct_data_shards(
     Ok(out)
 }
 
-fn parse_available_inline_recovery_chunks(
-    recovery_data: &[u8],
-) -> Result<Vec<InlineRecoveryChunk>> {
-    Ok(find_inline_recovery_chunks(recovery_data)?
-        .into_iter()
-        .map(|found| found.chunk)
-        .collect())
-}
-
 /// `hashed` accumulates the bytes this scan has CRC64'd, so the caller can
 /// stop a hostile file from driving quadratic hashing (see
 /// `find_inline_recovery_chunks`).
@@ -1059,6 +1159,17 @@ fn parse_inline_recovery_chunk(input: &[u8], hashed: &mut u64) -> Result<InlineR
     if shard_index >= recovery_shards as usize
         || header_size_usize != 0x48 + data_shards as usize * 8
         || total_size_usize < header_size_usize
+    {
+        return Err(Error::BadRecoveryChunk);
+    }
+    // Shard counts past the reconstruction cap describe a grid no plan can
+    // ever act on, so the record dies here at parse time - the same rule the
+    // streaming scanner's `read_chunk_at` applies. Real WinRAR writes at most
+    // 200 data shards; only a crafted record asks for more, and letting one
+    // through meant `solve_damaged_group_shards` sized a multi-GiB encoder
+    // matrix from a ~262 KB file on the in-memory repair path.
+    if data_shards > MAX_RECONSTRUCTION_SHARDS as u64
+        || recovery_shards > MAX_RECONSTRUCTION_SHARDS as u64
     {
         return Err(Error::BadRecoveryChunk);
     }
@@ -1425,15 +1536,19 @@ pub const MIN_STRIPE_LEN: usize = 8 * 1024;
 /// `(2 * damaged + 1) * stripe_len` - one right-hand-side row and one output
 /// row per damaged shard, plus a single read buffer.
 ///
-/// The plan itself (the encoder matrix and its inverse) is `O(data_count *
-/// recovery_count)` 16-bit cells and is built once, outside the stripe loop.
+/// The plan itself (the selected encoder rows and the system's inverse) is
+/// `O(damaged * data_count)` 16-bit cells and is built once, outside the
+/// stripe loop.
 #[derive(Debug, Clone)]
 pub struct StripeRepairPlan {
     data_count: usize,
     shard_len: usize,
     damaged: Vec<usize>,
-    rows: Vec<usize>,
     damaged_lookup: Vec<bool>,
+    // One encoder row per selected recovery equation, in `rows` order -
+    // indexed by SLOT, not by recovery-row number. Only these rows are ever
+    // read back, so the full recovery_count x data_count grid is never
+    // materialized (see `new`).
     matrix: Vec<Vec<u16>>,
     inverse: Vec<Vec<u16>>,
 }
@@ -1455,6 +1570,27 @@ impl StripeRepairPlan {
         rows: &[usize],
     ) -> Result<Self> {
         if data_count == 0 {
+            return Err(Error::TooManyShards);
+        }
+        // Both counts come raw off the wire, and what is sized from them must
+        // be refused before anything is reserved - but they no longer cost
+        // the same thing. Since the rows-only rewrite the matrix is
+        // `damaged * data_count` cells and the inversion is
+        // `O(damaged^3)`, so the hard cap belongs on `recovery_count` (which
+        // bounds `rows`, and through the square-system requirement `damaged`
+        // too), NOT on `data_count`: a legitimate `.rev` set over a 100 GB
+        // release in 15 MB volumes declares ~6,800 data volumes, and capping
+        // the slot count refused repairs this crate used to perform. The
+        // slot count is bounded only by the field itself, exactly as
+        // `make_encoder_matrix` bounds it; what a wide-and-damaged crafted
+        // header can still ask for is policed by the cell budget below.
+        if recovery_count > MAX_RECONSTRUCTION_SHARDS {
+            return Err(Error::ReconstructionTooLarge);
+        }
+        if data_count
+            .checked_add(recovery_count)
+            .is_none_or(|total| total > FIELD_SIZE)
+        {
             return Err(Error::TooManyShards);
         }
         if shard_len == 0 || !shard_len.is_multiple_of(2) {
@@ -1479,18 +1615,43 @@ impl StripeRepairPlan {
         if rows.iter().any(|row| *row >= recovery_count) {
             return Err(Error::TooManyShards);
         }
+        // What the plan actually allocates is `damaged * data_count` matrix
+        // cells (`damaged` itself is already <= MAX_RECONSTRUCTION_SHARDS via
+        // the recovery cap, which also bounds the O(damaged^3) inversion), so
+        // that product is what gets a budget. Only a crafted header pairing
+        // thousands of damaged shards with a u16-scale slot count reaches it.
+        if damaged
+            .len()
+            .checked_mul(data_count)
+            .is_none_or(|cells| cells > MAX_STRIPE_PLAN_CELLS)
+        {
+            return Err(Error::ReconstructionTooLarge);
+        }
 
-        let matrix = make_encoder_matrix(data_count, recovery_count)?;
-        let equations: Vec<Vec<u16>> = rows
+        // Only the selected rows, never the whole grid: the stripe loop reads
+        // the matrix per equation and nowhere else, so building the full
+        // recovery_count x data_count Cauchy matrix cost recovery_count /
+        // rows.len() times the memory the repair uses. Each cell is exactly
+        // what `make_encoder_matrix` computes for that (row, column).
+        let gf = shared_gf16();
+        let mut matrix = Vec::with_capacity(rows.len());
+        for &row in rows {
+            let mut cells = vec![0u16; data_count];
+            for (column, cell) in cells.iter_mut().enumerate() {
+                let denominator = ((row + data_count) ^ column) as u16;
+                *cell = gf.inv(denominator)?;
+            }
+            matrix.push(cells);
+        }
+        let equations: Vec<Vec<u16>> = matrix
             .iter()
-            .map(|&row| damaged.iter().map(|&data| matrix[row][data]).collect())
+            .map(|cells| damaged.iter().map(|&data| cells[data]).collect())
             .collect();
-        let inverse = invert_linear_system_matrix(shared_gf16(), &equations)?;
+        let inverse = invert_linear_system_matrix(gf, &equations)?;
         Ok(Self {
             data_count,
             shard_len,
             damaged: damaged.to_vec(),
-            rows: rows.to_vec(),
             damaged_lookup,
             matrix,
             inverse,
@@ -1590,8 +1751,8 @@ where
                 continue;
             }
             let mut needed = false;
-            for &row in &plan.rows {
-                if plan.matrix[row][data_index] != 0 {
+            for cells in &plan.matrix {
+                if cells[data_index] != 0 {
                     needed = true;
                     break;
                 }
@@ -1600,8 +1761,8 @@ where
                 continue;
             }
             read_data(data_index, offset, &mut scratch[..len])?;
-            for (slot, &row) in plan.rows.iter().enumerate() {
-                let coeff = plan.matrix[row][data_index];
+            for (slot, cells) in plan.matrix.iter().enumerate() {
+                let coeff = cells[data_index];
                 if coeff == 0 {
                     continue;
                 }
@@ -1644,13 +1805,15 @@ mod tests {
     use super::{
         apply_inverse_matrix, build_structural_inline_recovery_data, crc64_rar_state, crc64_xz,
         encode_inline_recovery_parity, encode_parity_shards, invert_linear_system_matrix,
-        make_encoder_matrix, parse_available_inline_recovery_chunks, plan_inline_recovery,
+        find_inline_recovery_chunks, make_encoder_matrix, parse_inline_recovery_chunk,
+        plan_inline_recovery,
         reconstruct_data_shards, recover_damaged_shards, recovery_groups,
         repair_inline_recovery_archive,
         repair_inline_recovery_prefix, repair_inline_recovery_prefix_shards,
-        repair_shards_striped, shared_gf16, split_prefix_shard_ranges, split_prefix_shards,
-        Error, Gf16, InlineRecoveryPlan, StripeRepairPlan, MAX_RECONSTRUCTION_SHARDS,
-        MAX_WINRAR602_DATA_SHARDS,
+        repair_shards_striped, shared_gf16, shard_record_span, solve_damaged_group_shards,
+        split_prefix_shard_ranges, split_prefix_shards,
+        Error, Gf16, InlineRecoveryPlan, StripeRepairPlan, FIELD_SIZE,
+        MAX_RECONSTRUCTION_SHARDS, MAX_WINRAR602_DATA_SHARDS,
     };
 
     #[test]
@@ -2108,6 +2271,88 @@ mod tests {
         assert_eq!(repaired, prefix);
     }
 
+    /// The buffered shard api ACROSS GROUPS, damaged outside the first one.
+    ///
+    /// A group is at most 200 x 64 KiB, so anything under ~13 MB has exactly
+    /// one and every earlier test of this api sat inside it. With two groups
+    /// the second one's CRC table is a different table: taking the first
+    /// record's for the whole set called all 200 shards damaged and the repair
+    /// failed for want of parity it did not need.
+    #[test]
+    fn rar5_inline_recovery_shards_repair_damage_in_a_later_group() {
+        // 200 * 64 KiB is exactly one group, so a little past it is two.
+        let prefix_len = (MAX_WINRAR602_DATA_SHARDS * 0x10000) as usize + 300_000;
+        let prefix: Vec<u8> = (0..prefix_len).map(|index| (index * 7) as u8).collect();
+        let recovery_data = build_structural_inline_recovery_data(&prefix, 10).unwrap();
+
+        let plan = plan_inline_recovery(prefix.len() as u64, 10).unwrap();
+        let groups = recovery_groups(plan).unwrap();
+        assert!(
+            groups.len() >= 2,
+            "this test is pointless with a single group"
+        );
+        assert!(prefix.len() as u64 > 13_107_200, "must exceed one group");
+
+        // One shard in the LAST group and, on a different shard, one in the
+        // first: the two groups have to be solved independently for both to
+        // come back.
+        let last = *groups.last().unwrap();
+        let late_hit = 3 * plan.group_count as usize + last.offset as usize + 128;
+        let early_hit = 11 * plan.group_count as usize + 64;
+        assert!(late_hit < prefix.len() && early_hit < prefix.len());
+        let mut damaged = prefix.clone();
+        damaged[late_hit..late_hit + 512].fill(0x5a);
+        damaged[early_hit..early_hit + 512].fill(0xa5);
+
+        let patches = repair_inline_recovery_prefix_shards(prefix.len(), &recovery_data, |range| {
+            Ok(damaged[range].to_vec())
+        })
+        .unwrap();
+        assert!(!patches.is_empty(), "the damage must be found at all");
+
+        // The caller streams these out in one forward pass, so they must be
+        // ascending and disjoint.
+        let mut cursor = 0usize;
+        for (range, data) in &patches {
+            assert_eq!(range.len(), data.len());
+            assert!(
+                range.start >= cursor,
+                "patches must be ascending and disjoint: {range:?} after {cursor}"
+            );
+            cursor = range.end;
+        }
+
+        let mut repaired = damaged;
+        for (range, data) in patches {
+            repaired[range].copy_from_slice(&data);
+        }
+        assert_eq!(
+            repaired, prefix,
+            "a multi-group buffered repair must be byte-exact"
+        );
+    }
+
+    /// The same shape with NO damage: a multi-group archive must come back
+    /// with nothing to patch. Before the per-group fix this reported every
+    /// shard of every group past the first as damaged.
+    #[test]
+    fn rar5_inline_recovery_shards_report_a_clean_multi_group_prefix_as_clean() {
+        let prefix_len = (MAX_WINRAR602_DATA_SHARDS * 0x10000) as usize + 300_000;
+        let prefix: Vec<u8> = (0..prefix_len).map(|index| (index * 7) as u8).collect();
+        let recovery_data = build_structural_inline_recovery_data(&prefix, 10).unwrap();
+        assert!(recovery_groups(plan_inline_recovery(prefix.len() as u64, 10).unwrap())
+            .unwrap()
+            .len()
+            >= 2);
+
+        let patches = repair_inline_recovery_prefix_shards(prefix.len(), &recovery_data, |range| {
+            Ok(prefix[range].to_vec())
+        })
+        .unwrap();
+
+        assert!(patches.is_empty(), "an intact prefix needs no patches");
+    }
+
     #[test]
     fn rar5_inline_recovery_archive_scans_chunks_and_repairs_prefix() {
         let prefix: Vec<u8> = (0..32_000).map(|index| (index * 13) as u8).collect();
@@ -2299,7 +2544,7 @@ mod tests {
         assert!(capacity <= prefix.len() as u64 + 2 * plan.data_shards);
 
         let recovery_data = build_structural_inline_recovery_data(&prefix, 1).unwrap();
-        assert!(parse_available_inline_recovery_chunks(&recovery_data).is_ok());
+        assert!(find_inline_recovery_chunks(&recovery_data).is_ok());
     }
 
     /// The GF16 kernel walks two-byte symbols, so an odd shard length reads
@@ -2727,4 +2972,135 @@ mod tests {
         assert_eq!(err(&[1], &[3], 64, 1), Error::TooManyShards);
     }
 
+    #[test]
+    fn rar5_striped_plan_refuses_a_wire_scale_grid() {
+        // Hostile declarations arrive raw off the wire as u16s. Every one of
+        // these refusals must come before anything is sized from the
+        // declaration, so together they also have to be instant.
+        let started = std::time::Instant::now();
+        // 32768 recovery shards is past the hard recovery cap.
+        assert_eq!(
+            StripeRepairPlan::new(32_767, 32_768, 4096, &[7], &[0]).unwrap_err(),
+            Error::ReconstructionTooLarge
+        );
+        assert_eq!(
+            StripeRepairPlan::new(8, MAX_RECONSTRUCTION_SHARDS + 1, 4096, &[7], &[0])
+                .unwrap_err(),
+            Error::ReconstructionTooLarge
+        );
+        // The two counts together cannot exceed the GF(2^16) code word.
+        assert_eq!(
+            StripeRepairPlan::new(FIELD_SIZE, 4096, 4096, &[7], &[0]).unwrap_err(),
+            Error::TooManyShards
+        );
+        // A wide slot count paired with a huge damage list blows the cell
+        // budget: 4096 damaged rows x 61439 slots is ~252M matrix cells.
+        let damaged: Vec<usize> = (0..MAX_RECONSTRUCTION_SHARDS).collect();
+        let rows: Vec<usize> = (0..MAX_RECONSTRUCTION_SHARDS).collect();
+        assert_eq!(
+            StripeRepairPlan::new(
+                FIELD_SIZE - MAX_RECONSTRUCTION_SHARDS,
+                MAX_RECONSTRUCTION_SHARDS,
+                4096,
+                &damaged,
+                &rows
+            )
+            .unwrap_err(),
+            Error::ReconstructionTooLarge
+        );
+        assert!(
+            started.elapsed().as_millis() < 500,
+            "a refused grid must not be built first"
+        );
+        // The caps sit far above anything real. WinRAR tops out at 200 data
+        // shards per inline record, and a plan that size must still build -
+        // as must the `.rev` shape the old data_count cap wrongly refused: a
+        // 100 GB release in 15 MB volumes is ~6,800 data volumes, more than
+        // MAX_RECONSTRUCTION_SHARDS, and it repaired before that cap landed.
+        StripeRepairPlan::new(200, 10, 4096, &[7], &[0]).unwrap();
+        StripeRepairPlan::new(6_800, 5, 4096, &[7, 11], &[0, 3]).unwrap();
+    }
+
+    /// Builds the ~262 KB record that used to sail through the in-memory
+    /// parser: internally consistent in every field the parser checks -
+    /// sizes, version bytes, CRC64, capacity arithmetic, record span - while
+    /// declaring a 32767 x 32768 grid, which is ~2 GiB of encoder matrix the
+    /// moment `solve_damaged_group_shards` acts on it.
+    fn wire_scale_consistent_record() -> Vec<u8> {
+        let data_shards: u64 = 32_767;
+        let recovery_shards: u64 = 32_768;
+        let group_count: u64 = 2;
+        let header_size = 0x48 + data_shards * 8;
+        let total_size = header_size + group_count;
+        let protected_size = data_shards * group_count;
+        let plan = InlineRecoveryPlan {
+            data_shards,
+            recovery_shards,
+            group_count,
+            header_size,
+            shard_size: 0,
+        };
+        let shard_size = shard_record_span(plan).unwrap();
+
+        let mut record = vec![0u8; total_size as usize];
+        record[..4].copy_from_slice(b"{RB}");
+        record[0x0c..0x10].copy_from_slice(&(total_size as u32).to_le_bytes());
+        record[0x10..0x14].copy_from_slice(&(header_size as u32).to_le_bytes());
+        record[0x14] = 1;
+        record[0x15] = 1;
+        record[0x22..0x2a].copy_from_slice(&protected_size.to_le_bytes());
+        record[0x2a..0x32].copy_from_slice(&group_count.to_le_bytes());
+        record[0x32..0x3a].copy_from_slice(&shard_size.to_le_bytes());
+        record[0x3a..0x3c].copy_from_slice(&(data_shards as u16).to_le_bytes());
+        record[0x3c..0x3e].copy_from_slice(&(recovery_shards as u16).to_le_bytes());
+        let crc = crc64_xz(&record[0x0c..]);
+        record[0x04..0x0c].copy_from_slice(&crc.to_le_bytes());
+        record
+    }
+
+    /// The in-memory scan's twin of the streaming scanner's shard-count cap.
+    /// `read_chunk_at` gained the cap; `parse_inline_recovery_chunk` - the
+    /// parser behind `ArchiveReader::repair_recovery()` - did not, so the
+    /// public in-memory repair path still accepted the grid the streaming
+    /// path refused.
+    #[test]
+    fn rar5_inline_parse_rejects_a_wire_scale_grid() {
+        let record = wire_scale_consistent_record();
+        assert!(record.len() < 300 * 1024, "the fixture stays tiny");
+        let started = std::time::Instant::now();
+        let mut hashed = 0u64;
+        assert_eq!(
+            parse_inline_recovery_chunk(&record, &mut hashed).unwrap_err(),
+            Error::BadRecoveryChunk
+        );
+        assert!(
+            started.elapsed().as_millis() < 500,
+            "the refusal must not size anything first"
+        );
+    }
+
+    /// Defence in depth for the same grid: even handed a pre-parsed plan,
+    /// the group solver must refuse to size the encoder matrix from it.
+    #[test]
+    fn rar5_group_solver_refuses_a_wire_scale_grid() {
+        let plan = InlineRecoveryPlan {
+            data_shards: 32_767,
+            recovery_shards: 32_768,
+            group_count: 2,
+            header_size: 0x48 + 32_767 * 8,
+            shard_size: 0,
+        };
+        let ranges = vec![0..0usize; 32_767];
+        let parity = [0u8; 2];
+        let rows = [(0usize, &parity[..])];
+        let started = std::time::Instant::now();
+        let result = solve_damaged_group_shards(plan, &ranges, 2, &[0], &rows, &mut |_| {
+            Ok(Vec::new())
+        });
+        assert_eq!(result.unwrap_err(), Error::ReconstructionTooLarge);
+        assert!(
+            started.elapsed().as_millis() < 500,
+            "the refusal must not size anything first"
+        );
+    }
 }

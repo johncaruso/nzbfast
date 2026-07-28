@@ -97,6 +97,20 @@ convenience packages (DMG, Windows installer, platform zips) are built
 and signed through separate channels; grab a target-triple tarball when
 you want a binary you can verify against source.
 
+Container images are attested the same way once they are pushed by the
+public workflow rather than by hand - the workflow assembles the image
+from the release's own binaries (after checking them against
+`SHA256SUMS.txt`) and attests the pushed manifest digest:
+
+```sh
+gh attestation verify oci://ghcr.io/nzbfast/nzbfast:<version> --repo nzbfast/nzbfast
+```
+
+The Docker Hub tags (`nzbfast/nzbfast`) are pushed from the same build
+and carry the identical manifest digest. Images pushed before the
+attestation pipeline existed predate it, and `gh attestation verify`
+will simply report that no attestation is found for those digests.
+
 That covers the binary. For the data it downloads,
 [docs/INTEGRITY.md](docs/INTEGRITY.md) documents every integrity check the
 engine performs and when, each claim citing the source line that implements it,

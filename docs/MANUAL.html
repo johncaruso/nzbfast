@@ -616,8 +616,20 @@ and <code>SAB_*</code> environment; existing SAB scripts work unchanged),
 and <b>TV filing</b> (see <a href="#automation">§10</a>).</p>
 
 <h3>Indexing <span class="pill live">live</span></h3>
+<div class="note"><b>The built-in indexer is off by default.</b> It finds posts made
+under a real filename, and a large and growing share of Usenet is deliberately posted
+without one: random subject, random filenames inside, dropped into a catch-all group.
+The real name lives only in an NZB the uploader publishes elsewhere, so it was never
+on Usenet for any scanner to read. Measured on our own index, 14.8 million scanned
+posts produced about 31,000 browsable releases, roughly one in five hundred. Keep using
+commercial indexers, and add them under Settings → Search indexers so you can search
+them from the wall. Turn this on if you follow specific groups where people still post
+under real names, or you want to see what your provider actually carries. With the
+switch off nothing is scanned or fetched, no database is created, and the wall, Browse,
+the watchlist and the newznab feed are hidden.</div>
 <table>
 <tr><th>Setting</th><th>What it does</th></tr>
+<tr><td>Built-in indexer</td><td>The master switch, <b>off unless you turn it on</b>. Off means no scanning, no metadata lookups, no availability sampling and no newznab feed; an index already on disk is kept (there is a delete button) so switching back on resumes rather than rescanning.</td></tr>
 <tr><td>Groups</td><td>Newsgroups the built-in indexer scans (e.g. <code>alt.binaries.teevee</code>).</td></tr>
 <tr><td>Scan interval</td><td>Seconds between passes (default 900).</td></tr>
 <tr><td>Backfill articles</td><td>Headers fetched on a group's very first scan.</td></tr>
@@ -703,8 +715,14 @@ all behave as the *arrs expect.</p>
 <code>movie</code> queries from its own index of your watched groups, and
 <code>/getnzb/&lt;id&gt;</code> hands back the NZB.</li>
 </ol>
-<div class="note"><b>Why bother?</b>A self-hosted indexer of exactly the groups you
-care about: no accounts, no API hit limits, retention as deep as you let it scan.</div>
+<div class="note"><b>Switch the built-in indexer on first</b> (Settings → Indexing). It is
+off by default, and while it is off this facade answers every query with
+<code>&lt;error code="101"&gt;</code> rather than an empty result, so a mistake shows up
+when you add the indexer instead of weeks later.<br><br>
+<b>Why bother?</b> A self-hosted indexer of exactly the groups you care about: no
+accounts, no API hit limits, retention as deep as you let it scan. It is an addition to
+your usual indexers rather than a replacement, because it only finds what was posted
+under a real filename.</div>
 
 <h2 id="remotes">12 · Phone &amp; remote apps</h2>
 <p>nzbfast implements <em>both</em> major remote-control protocols, so nearly every

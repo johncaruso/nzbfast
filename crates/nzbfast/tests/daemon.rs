@@ -201,6 +201,49 @@ fn wait_ready(child: &mut KillOnDrop, port: u16, log: &Path) -> bool {
     panic!("daemon never came up on :{port}\n--- log ---\n{tail}");
 }
 
+/// Seed the settings.json beside `cfg` so the daemon this test spawns
+/// deletes permanently instead of moving to the Trash.
+///
+/// `smart::TRASH` defaults ON everywhere except a `cfg(test)` build, and
+/// these suites drive the REAL binary: the child is a normal build, so the
+/// default it picks up is the user-facing one. Every fixture its cleanup
+/// sweeps or its watch poller delete therefore landed in the DEVELOPER's
+/// own ~/.Trash, once per `cargo test` run, with nothing to tell them
+/// apart from files they deleted themselves.
+///
+/// settings.json is the only lever that reaches the child - there is no
+/// flag for this - and the daemon applies the key on startup (see serve's
+/// `delete_to_trash` arm). Call it after writing the config and before
+/// `serve`, for any daemon that will delete a fixture. Merges rather than
+/// overwrites, so a test that seeds settings of its own keeps them.
+///
+/// The file existing at all is itself a signal the daemon reads: a
+/// settings.json carrying anything but the wizard's own answers means
+/// "existing install" (serve::settings_beyond_setup_answers), which flips
+/// the two rename-punctuation defaults to the pre-upgrade shape. So on a
+/// first run - no spool beside the config yet - the fresh-install values
+/// are pinned back explicitly, and this helper changes exactly the one
+/// behaviour it is for. A second launch against the same directory has a
+/// spool, so the daemon reaches the same verdict with or without us.
+fn delete_without_the_trash(cfg: &Path) {
+    let path = cfg.with_file_name("settings.json");
+    let mut saved = std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| match v {
+            serde_json::Value::Object(m) => Some(m),
+            _ => None,
+        })
+        .unwrap_or_default();
+    saved.insert("delete_to_trash".to_string(), serde_json::Value::Bool(false));
+    if !cfg.with_file_name(".spool").exists() {
+        for key in ["rename_year_parens", "rename_quality_brackets"] {
+            saved.entry(key).or_insert(serde_json::Value::Bool(false));
+        }
+    }
+    std::fs::write(&path, serde_json::Value::Object(saved).to_string()).unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sonarr_style_cycle() {
     let dir = std::env::temp_dir().join(format!("nzbfast-daemon-{}", std::process::id()));
@@ -2434,6 +2477,9 @@ async fn smart_folders_and_cleanup() {
         ),
     )
     .unwrap();
+    // The .sfv below is a real delete by the real binary: keep it out of
+    // the developer's Trash.
+    delete_without_the_trash(&cfg);
     let d = serve(&dir, |port| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
         c.env("NZBFAST_OPEN", "1")
@@ -2531,6 +2577,37 @@ async fn smart_folders_and_cleanup() {
             "original job dir should be gone"
         );
         assert!(hist.contains("Season 01"), "history path not updated: {hist}");
+
+        // N7: Play on this finished row must serve THIS episode. A filed
+        // job's out_dir is the SHARED season folder, and the completed
+        // branch used to serve "the biggest media file in out_dir" - so a
+        // larger sibling sitting beside it (the user's own E03 here) was
+        // what came back when you pressed play on E02.
+        let sibling = dest.join("My Show - S01E03 1080p.mkv");
+        std::fs::write(&sibling, payload(900_000, 13)).unwrap();
+        let id = hist
+            .split("\"nzo_id\":\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .unwrap_or_else(|| panic!("no nzo_id in history: {hist}"))
+            .to_string();
+        let resp = raw(
+            port,
+            format!("GET /stream/{id}?apikey=sekrit HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        );
+        let cut = resp.windows(4).position(|w| w == b"\r\n\r\n").expect("no headers") + 4;
+        let (head, served) = resp.split_at(cut);
+        let head = String::from_utf8_lossy(head).to_string();
+        assert!(head.contains("200 OK"), "{head}");
+        assert_eq!(
+            served.len(),
+            300_000,
+            "served the wrong file - {} bytes is the sibling episode",
+            served.len()
+        );
+        assert_eq!(served, &payload(300_000, 7)[..], "served bytes are not this episode's");
+        assert!(sibling.exists(), "playing must not disturb the sibling");
     })
     .await
     .unwrap();
@@ -4801,5 +4878,392 @@ async fn jsonrpc_delete_stops_a_prefetching_job() {
         !log.contains(&format!("[prefetch] {deleted} completed")),
         "the delete did not stop the prefetch:\n{log}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// §44: an API-added job records WHICH client sent it, not just that
+/// some automation did. The Sonarr string here is one a real Sonarr
+/// sent during download-client certification, captured off a live
+/// test rather than assumed.
+///
+/// The browser leg matters as much as the Sonarr one: our own dashboard
+/// uploads to this very endpoint, so a UA that names no automation must
+/// leave the old parameter heuristic untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_client_that_added_a_job_is_named() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-origin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Nothing is ever fetched - the daemon is paused throughout - so an
+    // empty server is enough to satisfy startup.
+    let srv = MockServer::start(HashMap::new(), Chaos::default()).await;
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--connections")
+            .arg("2");
+        c
+    })
+    .await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        let xml = "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  \
+             <file poster=\"x\" date=\"0\" subject=\"&quot;o.rar&quot; yEnc (1/1)\">\n    \
+             <groups><group>g</group></groups>\n    <segments>\n      \
+             <segment bytes=\"100\" number=\"1\">nosuchseg</segment>\n    \
+             </segments>\n  </file>\n</nzb>\n";
+        // `http` cannot set a User-Agent, and the header IS the evidence
+        // under test, so the request is written out by hand.
+        let add = |ua: &str, fname: &str| -> String {
+            let boundary = "----originb";
+            let mut body = Vec::new();
+            body.extend_from_slice(
+                format!("--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"{fname}\"\r\n\r\n").as_bytes(),
+            );
+            body.extend_from_slice(xml.as_bytes());
+            body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+            let mut request = Vec::new();
+            write!(
+                request,
+                "POST /api?mode=addfile&output=json HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\
+                 User-Agent: {ua}\r\nContent-Type: multipart/form-data; boundary={boundary}\r\n\
+                 Content-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            request.extend_from_slice(&body);
+            String::from_utf8_lossy(&raw(port, &request)).to_string()
+        };
+
+        // Paused, so both jobs are still in the queue to be read back.
+        http(port, "/api?mode=pause&output=json", None);
+        let r = add("Sonarr/4.0.19.2979 (macos 10.0)", "Named.Client.S01E01.nzb");
+        assert!(r.contains("\"status\":true"), "{r}");
+        let r = add(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            "Browser.Upload.S01E02.nzb",
+        );
+        assert!(r.contains("\"status\":true"), "{r}");
+
+        let q = http(port, "/api?mode=queue&output=json", None);
+        assert!(q.contains("\"origin\":\"arr:sonarr\""), "the client was not named: {q}");
+        assert!(
+            q.contains("\"origin\":\"dashboard\""),
+            "a browser upload was misread as an automation: {q}"
+        );
+        // The bare `arr` bucket is what this replaces for a named client.
+        assert!(!q.contains("\"origin\":\"arr\""), "{q}");
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Categories are configuration, not a side effect of what has been
+/// downloaded.
+///
+/// They used to live only in memory as "the built-ins plus whatever an
+/// add call happened to carry", rebuilt at startup from the categories
+/// still present in queue.json. Two consequences, both of which meet a
+/// user before they can download anything: a fresh install offered only
+/// `tv` and `movies`, and Sonarr/Radarr REFUSE to connect when their
+/// configured category is missing from the list ("Category does not
+/// exist"), so the category could never be registered by the add that
+/// would have registered it. And a category did not outlive the last job
+/// carrying it - clear history, lose the category.
+#[tokio::test(flavor = "multi_thread")]
+async fn categories_are_configurable_and_survive_a_restart() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-cats-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!("{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}", free_port()),
+    )
+    .unwrap();
+    let launch = {
+        let cfg = cfg.clone();
+        let dir = dir.clone();
+        move |port: u16| {
+            let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+            c.env("NZBFAST_NO_ENRICH", "1")
+                .arg("--config")
+                .arg(&cfg)
+                .arg("serve")
+                .arg("--bind")
+                .arg("127.0.0.1")
+                .arg("--port")
+                .arg(port.to_string())
+                .arg("--apikey")
+                .arg("sekrit")
+                .arg("--out")
+                .arg(dir.join("complete"));
+            c
+        }
+    };
+    let d = serve(&dir, &launch).await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        // Out of the box we answer for the *arr family's OWN defaults -
+        // Sonarr tv, Radarr movies, Lidarr music, Readarr books - so a
+        // default install of any of them passes its connection test
+        // against a default install of ours.
+        let r = http(port, "/api?mode=get_cats&apikey=sekrit&output=json", None);
+        for c in ["tv", "movies", "music", "books"] {
+            assert!(r.contains(&format!("\"{c}\"")), "default category {c} missing: {r}");
+        }
+
+        // A user whose Sonarr is set to a category of its own can add it,
+        // with no job needed to teach us the name.
+        let r = http(
+            port,
+            "/api?mode=config&name=categories&value=sonarr,%20radarr&apikey=sekrit&output=json",
+            None,
+        );
+        assert!(r.contains("\"status\":true"), "{r}");
+        let r = http(port, "/api?mode=get_cats&apikey=sekrit&output=json", None);
+        assert!(r.contains("\"sonarr\""), "{r}");
+        assert!(r.contains("\"radarr\""), "{r}");
+        // The built-ins are a floor: editing the list cannot strand a
+        // client that was already configured against one of them.
+        assert!(r.contains("\"tv\""), "editing the list dropped a built-in: {r}");
+
+        // The NZBGet facade's category table is what Sonarr's nzbget-mode
+        // Test validates against, so it must agree with get_cats.
+        let body = br#"{"method":"config","params":[],"id":1}"#;
+        let mut request = Vec::new();
+        write!(
+            request,
+            "POST /jsonrpc HTTP/1.1\r\nHost: x\r\nConnection: close\r\nAuthorization: Basic eDpzZWtyaXQ=\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        request.extend_from_slice(body);
+        let r = String::from_utf8_lossy(&raw(port, &request)).to_string();
+        assert!(r.contains("sonarr"), "nzbget config table has no sonarr category: {r}");
+    })
+    .await
+    .unwrap();
+
+    // Restart: the category must still be there. Nothing was ever
+    // downloaded, so the old queue-derived list would have lost it.
+    drop(d);
+    let d = serve(&dir, &launch).await;
+    let port = d.port;
+    tokio::task::spawn_blocking(move || {
+        let r = http(port, "/api?mode=get_cats&apikey=sekrit&output=json", None);
+        assert!(r.contains("\"sonarr\""), "category did not survive the restart: {r}");
+        assert!(r.contains("\"radarr\""), "{r}");
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The NZBGet facade answers with NZBGet's own vocabulary.
+///
+/// Two gaps this pins. Every failure used to report `FAILURE/PAR` with
+/// `ParStatus: FAILURE` - one bit, so "needs a password", "the disk
+/// filled up" and "the post is missing articles" were indistinguishable
+/// to a client, and all three were blamed on a repair that in two of the
+/// three cases never ran. And an unimplemented method returned a null
+/// RESULT, which on the wire is what "succeeded, nothing to report"
+/// looks like, so a client could not tell the two apart.
+#[tokio::test(flavor = "multi_thread")]
+async fn nzbget_facade_reports_real_statuses_and_real_errors() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-nzbgstat-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!("{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}", free_port()),
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"));
+        c
+    })
+    .await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        let rpc = |method: &str, params: &str| -> String {
+            let body = format!("{{\"method\":\"{method}\",\"params\":{params},\"id\":1}}");
+            let mut request = Vec::new();
+            write!(
+                request,
+                "POST /jsonrpc HTTP/1.1\r\nHost: x\r\nConnection: close\r\nAuthorization: Basic eDpzZWtyaXQ=\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            request.extend_from_slice(body.as_bytes());
+            String::from_utf8_lossy(&raw(port, &request)).to_string()
+        };
+
+        // A method we do not implement is an ERROR, not an empty success.
+        let r = rpc("makecoffee", "[]");
+        assert!(r.contains("\"error\""), "{r}");
+        assert!(r.contains("no such method"), "{r}");
+        assert!(!r.contains("\"error\":null"), "unknown method answered as success: {r}");
+
+        // Same for an editqueue command we do not implement - `false`
+        // was also the answer for "that job does not exist".
+        let r = rpc("editqueue", "[\"GroupSetDupeKey\",\"x\",[1]]");
+        assert!(r.contains("unsupported editqueue command"), "{r}");
+
+        // Implemented ones still answer as results, error null.
+        let r = rpc("version", "[]");
+        assert!(r.contains("\"error\":null"), "{r}");
+        let r = rpc("status", "[]");
+        assert!(r.contains("\"error\":null"), "{r}");
+        // Including the ones that are honest no-ops for us: we have one
+        // pause covering the whole pipeline, not a separate post queue.
+        let r = rpc("pausepost", "[]");
+        assert!(r.contains("\"error\":null"), "{r}");
+
+        // Sonarr rejects a client reporting KeepHistory 0, so the config
+        // dump must keep carrying a non-zero one.
+        let r = rpc("config", "[]");
+        assert!(r.contains("KeepHistory"), "{r}");
+        assert!(!r.contains("\"Value\":\"0\""), "KeepHistory went to 0, which Sonarr refuses: {r}");
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The SAB surface a remote app and an *arr actually poll.
+///
+/// Four gaps, each one a thing a client asks for and used to be told
+/// nothing about: `mode=warnings` was a permanent empty list, so "no
+/// server configured" was invisible in every app that has a warnings
+/// pane; there was no `mode=status` or `mode=get_scripts` at all, which
+/// is what the mobile remotes poll rather than `fullstatus`; and
+/// `change_cat` existed only on the NZBGet side, so which client type
+/// the user picked decided whether recategorizing a queued job worked.
+#[tokio::test(flavor = "multi_thread")]
+async fn sab_facade_status_warnings_and_change_cat() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-sabstat-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // A config with NO servers: the first-run state, and the one a user
+    // wiring up Sonarr is most likely to be sitting in.
+    let cfg = dir.join("config.json");
+    std::fs::write(&cfg, "{\"servers\":[]}").unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"));
+        c
+    })
+    .await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        // The condition is real and currently stopping all work, so it
+        // must reach a client that shows warnings.
+        let r = http(port, "/api?mode=warnings&apikey=sekrit&output=json", None);
+        assert!(r.contains("No Usenet server"), "warnings stayed empty: {r}");
+
+        // mode=status carries the same warning, plus what a remote app
+        // badges: the count, the pause state, free space.
+        let r = http(port, "/api?mode=status&apikey=sekrit&output=json", None);
+        assert!(r.contains("\"have_warnings\":\"1\""), "{r}");
+        assert!(r.contains("No Usenet server"), "{r}");
+        assert!(r.contains("\"paused\""), "{r}");
+        assert!(r.contains("\"diskspace1\""), "{r}");
+        assert!(r.contains("\"completedir\""), "{r}");
+
+        // An empty script list makes a client show no dropdown at all,
+        // so "None" is the honest floor.
+        let r = http(port, "/api?mode=get_scripts&apikey=sekrit&output=json", None);
+        assert!(r.contains("\"None\""), "{r}");
+
+        // Queue a job (no server, so it will never start) and move it to
+        // another category. Nothing has been written, so this re-derives
+        // the output directory rather than moving files.
+        let nzb = "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"&quot;chg.bin&quot; yEnc (1/1)\">\n    <groups><group>g</group></groups>\n    <segments><segment bytes=\"100\" number=\"1\">&lt;a@x&gt;</segment></segments>\n  </file>\n</nzb>\n";
+        let body = format!(
+            "--BB\r\nContent-Disposition: form-data; name=\"nzbfile\"; filename=\"Chg.Show.S01E01.1080p.nzb\"\r\nContent-Type: application/xml\r\n\r\n{nzb}\r\n--BB--\r\n"
+        );
+        let r = http(
+            port,
+            "/api?mode=addfile&apikey=sekrit&cat=tv&output=json",
+            Some(("multipart/form-data; boundary=BB", body.as_bytes())),
+        );
+        let id = r
+            .split("\"nzo_ids\":[\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("no nzo_id in addfile response")
+            .to_string();
+
+        let r = http(
+            port,
+            &format!("/api?mode=change_cat&value={id}&value2=movies&apikey=sekrit&output=json"),
+            None,
+        );
+        assert!(r.contains("\"status\":true"), "change_cat refused: {r}");
+        let q = http(port, "/api?mode=queue&apikey=sekrit&output=json", None);
+        assert!(q.contains("\"cat\":\"movies\""), "category did not change: {q}");
+
+        // An unknown id is an error, not a silent success.
+        let r = http(
+            port,
+            "/api?mode=change_cat&value=nope&value2=tv&apikey=sekrit&output=json",
+            None,
+        );
+        assert!(r.contains("\"status\":false"), "{r}");
+    })
+    .await
+    .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

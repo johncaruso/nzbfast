@@ -29,6 +29,8 @@ on:
 
 permissions:
   contents: read
+  id-token: write       # Sigstore keyless signing (OIDC) for the attestation
+  attestations: write   # write the attestation to the GH attestations API
 
 jobs:
   windows-installer:
@@ -79,6 +81,21 @@ jobs:
           cd packaging\windows
           ISCC /DAppVersion=%APPVER% /DStageDir=stage /Oout installer.iss
 
+      # SLSA build provenance for the installer, same trust chain as the
+      # provenance-release.yml tarballs: binds this exe's SHA-256 to this
+      # workflow @ commit, keyless via Sigstore. Verify with
+      #   gh attestation verify nzbfast-<ver>-windows-x64-setup.exe --repo nzbfast/nzbfast
+      # Public repo only: attestations on private repos need an Enterprise
+      # plan, so a private test dispatch would fail on this step.
+      # NOTE this attests the exe AS BUILT. SignPath signing rewrites the
+      # file (embeds the signature), so the SIGNED exe has a different
+      # digest and needs its own attestation - see the Phase C block.
+      - name: Attest installer provenance
+        if: ${{ github.repository == 'nzbfast/nzbfast' }}
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: packaging/windows/out/nzbfast-*-windows-x64-setup.exe
+
       - name: Upload UNSIGNED installer
         id: upload
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -109,6 +126,15 @@ jobs:
       #       github-artifact-id: ${{ steps.upload.outputs.artifact-id }}
       #       wait-for-completion: true
       #       output-artifact-directory: packaging/windows/out-signed
+      #
+      #   # The signed exe is a different file from the one attested above
+      #   # (Authenticode signing embeds the signature), so it gets its own
+      #   # attestation - this is the digest users actually download.
+      #   - name: Attest SIGNED installer provenance
+      #     if: ${{ inputs.sign }}
+      #     uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+      #     with:
+      #       subject-path: packaging/windows/out-signed/*.exe
       #
       #   - name: Upload SIGNED installer
       #     if: ${{ inputs.sign }}

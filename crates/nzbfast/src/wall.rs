@@ -11,6 +11,9 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
+// Every provider call in this file is paced by a per-provider bucket.
+use crate::ratelimit::{self, Provider};
+
 // Release-name parsing moved to nzbkit::release (the indexer
 // classifies at ingest - M25 browse view); re-exported so existing
 // call sites keep their wall:: paths.
@@ -127,28 +130,6 @@ pub fn media_lookup(kind: &Kind, title: &str) -> Option<TitleMeta> {
     }
 }
 
-/// Keyless providers have stricter (unofficial) rate limits - the
-/// enricher sleeps this long after each lookup.
-pub fn lookup_delay_ms(api_key: Option<&str>, kind: &Kind) -> u64 {
-    match (api_key, kind) {
-        (Some(_), _) => 250,
-        // Music and books are paced by a real per-provider token bucket
-        // (see `ratelimit`), applied to each REQUEST rather than to the
-        // gap between titles. Sleeping here as well would double-pace
-        // them: the bucket has already made the caller wait for its
-        // turn by the time this is read.
-        (None, Kind::Music) | (None, Kind::Book) => 0,
-        (None, Kind::Tv) => 600,     // TVmaze: 20 req / 10 s
-        // Wikimedia publishes no anonymous-read limit but does enforce
-        // one: probing at ~3 req/s earned an HTTP 429 within a dozen
-        // calls, and a 429 costs a title its whole card. A movie is 2-3
-        // Wikidata calls plus 1-3 Wikipedia ones, all serial, so this
-        // window holds the peak under ~1 req/s. Still half the old
-        // iTunes crawl, and unlike iTunes it answers.
-        (None, _) => 2500,
-    }
-}
-
 fn percent_encode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
@@ -213,6 +194,7 @@ pub fn tmdb_lookup(api_key: &str, kind: &Kind, title: &str, year: u32) -> Option
     if year > 0 {
         let _ = write!(url, "&{year_param}={year}");
     }
+    ratelimit::acquire(Provider::Tmdb);
     let resp = match crate::serve::shared_enrich_agent().get(&url).timeout(std::time::Duration::from_secs(10)).call() {
         Ok(r) => r,
         Err(e) => {
@@ -258,10 +240,30 @@ pub fn tmdb_lookup(api_key: &str, kind: &Kind, title: &str, year: u32) -> Option
     })
 }
 
-fn get_json(url: &str) -> Option<serde_json::Value> {
+/// Paced JSON GET. Every provider call in this file goes through a
+/// bucket - see `ratelimit` for why the numbers are what they are.
+fn get_json(p: Provider, url: &str) -> Option<serde_json::Value> {
+    ratelimit::acquire(p);
     let resp = match crate::serve::shared_enrich_agent().get(url).timeout(std::time::Duration::from_secs(10)).call() {
         Ok(r) => r,
         Err(e) => {
+            // A 429/503 is the provider saying the bucket is too fast.
+            // Slow the whole lane, not just this call: the next title is
+            // about to ask the same service the same way.
+            if let ureq::Error::Status(code @ (429 | 503), r) = &e {
+                let wait = r
+                    .header("Retry-After")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(if *code == 429 { 30 } else { 5 });
+                ratelimit::penalise(p, wait);
+                // Both codes are "ask again later", not an answer, and
+                // this helper has no retry to ask with. `note_http_err`
+                // would count the 429 as a real reply (it is a 4xx), so
+                // one TVmaze or OMDb 429 would stamp the title checked
+                // and blank the row for good. Make the caller skip it.
+                note_unreachable();
+                return None;
+            }
             note_http_err(&e);
             return None;
         }
@@ -317,7 +319,7 @@ fn parse_tvmaze(v: &serde_json::Value) -> Option<TitleMeta> {
 /// the enricher uses `tvmaze_lookup_full`, which gets cast and crew in
 /// this same request.
 pub fn tvmaze_lookup(title: &str) -> Option<TitleMeta> {
-    let v = get_json(&format!(
+    let v = get_json(Provider::Tvmaze, &format!(
         "https://api.tvmaze.com/singlesearch/shows?q={}",
         percent_encode(title)
     ))?;
@@ -333,7 +335,7 @@ pub fn tvmaze_lookup(title: &str) -> Option<TitleMeta> {
 /// with real roles) is the whole point. Measured live on 26 Jul 2026:
 /// Severance answers in 35 KB with 11 cast and 71 crew.
 pub fn tvmaze_lookup_full(title: &str) -> Option<TitleMeta> {
-    let v = get_json(&format!(
+    let v = get_json(Provider::Tvmaze, &format!(
         "https://api.tvmaze.com/singlesearch/shows?q={}&embed[]=cast&embed[]=crew",
         percent_encode(title)
     ))?;
@@ -382,25 +384,37 @@ fn crew_rank(role: &str) -> u8 {
 /// asked for.
 fn parse_tvmaze_credits(emb: &serde_json::Value) -> Vec<Credit> {
     const CREW_CAP: usize = 12;
-    let person = |p: &serde_json::Value| -> Option<(i64, String, String)> {
+    struct Person {
+        id: i64,
+        name: String,
+        photo: String,
+        born: String,
+    }
+    let person = |p: &serde_json::Value| -> Option<Person> {
         let name = p["name"].as_str().filter(|n| !n.trim().is_empty())?;
-        Some((
-            p["id"].as_i64().unwrap_or(0),
-            name.to_string(),
+        Some(Person {
+            id: p["id"].as_i64().unwrap_or(0),
+            name: name.to_string(),
             // `medium` is a portrait crop, which is the shape a headshot
             // is displayed in - `original` is an uncropped still that can
             // be several MB.
-            p["image"]["medium"].as_str().unwrap_or("").to_string(),
-        ))
+            photo: p["image"]["medium"].as_str().unwrap_or("").to_string(),
+            // TVmaze publishes no IMDb id for a person (measured: no
+            // `externals` here or on /people/:id, and /lookup/people is
+            // 404), so the birthday it does publish is the only fact a
+            // TVmaze credit can be told apart from a same-named Wikidata
+            // one by. `null` for the many people it has no date for.
+            born: iso_date(p["birthday"].as_str().unwrap_or("")),
+        })
     };
     let mut out: Vec<Credit> = Vec::new();
     if let Some(list) = emb["cast"].as_array() {
         for (i, c) in list.iter().enumerate() {
-            let Some((id, name, photo)) = person(&c["person"]) else {
+            let Some(p) = person(&c["person"]) else {
                 continue;
             };
             out.push(Credit {
-                name,
+                name: p.name,
                 role: "actor".into(),
                 // A voice role is a real distinction on an animated show
                 // and the flag is right there; folding it into the
@@ -414,8 +428,9 @@ fn parse_tvmaze_credits(emb: &serde_json::Value) -> Vec<Credit> {
                 // nothing, so position IS the billing order. 1-based, so
                 // 0 keeps meaning "unranked" everywhere else.
                 ord: i as i64 + 1,
-                tvmaze_id: id,
-                photo,
+                tvmaze_id: p.id,
+                photo: p.photo,
+                born: p.born,
                 ..Default::default()
             });
         }
@@ -423,14 +438,21 @@ fn parse_tvmaze_credits(emb: &serde_json::Value) -> Vec<Credit> {
     let mut crew: Vec<Credit> = Vec::new();
     if let Some(list) = emb["crew"].as_array() {
         for c in list {
-            let Some((id, name, photo)) = person(&c["person"]) else {
+            let Some(p) = person(&c["person"]) else {
                 continue;
             };
             let role = c["type"].as_str().unwrap_or("").trim().to_lowercase();
             if role.is_empty() {
                 continue;
             }
-            crew.push(Credit { name, role, tvmaze_id: id, photo, ..Default::default() });
+            crew.push(Credit {
+                name: p.name,
+                role,
+                tvmaze_id: p.id,
+                photo: p.photo,
+                born: p.born,
+                ..Default::default()
+            });
         }
     }
     crew.sort_by_key(|c| crew_rank(&c.role));
@@ -494,7 +516,7 @@ fn parse_tvmaze_episodes(v: &serde_json::Value) -> Vec<EpInfo> {
 
 /// Full episode list (with airdates) for a TVmaze show id.
 pub fn tvmaze_episodes(show_id: i64) -> Vec<EpInfo> {
-    get_json(&format!("https://api.tvmaze.com/shows/{show_id}/episodes"))
+    get_json(Provider::Tvmaze, &format!("https://api.tvmaze.com/shows/{show_id}/episodes"))
         .map(|v| parse_tvmaze_episodes(&v))
         .unwrap_or_default()
 }
@@ -612,6 +634,18 @@ fn parse_tvmaze_search(v: &serde_json::Value) -> Vec<Candidate> {
 /// provider (TMDB with a key, else TVmaze for tv / iTunes for movies);
 /// `year` is a hint passed to TMDB only (keyless providers return the
 /// full list and the user picks).
+/// Which bucket `search_candidates` will spend from, without spending
+/// anything. The fix-match UI is interactive, so its handler asks first
+/// and skips the lookup when the answer would mean queueing - see
+/// `ratelimit::try_acquire`.
+pub fn search_provider(api_key: Option<&str>, kind: &Kind) -> Provider {
+    match (api_key, kind) {
+        (Some(_), _) => Provider::Tmdb,
+        (None, Kind::Tv) => Provider::Tvmaze,
+        (None, _) => Provider::Wikidata,
+    }
+}
+
 pub fn search_candidates(
     api_key: Option<&str>,
     kind: &Kind,
@@ -631,9 +665,9 @@ pub fn search_candidates(
             if year > 0 {
                 let _ = write!(url, "&{year_param}={year}");
             }
-            get_json(&url).map(|v| parse_tmdb_search(&v, kind)).unwrap_or_default()
+            get_json(Provider::Tmdb, &url).map(|v| parse_tmdb_search(&v, kind)).unwrap_or_default()
         }
-        (None, Kind::Tv) => get_json(&format!(
+        (None, Kind::Tv) => get_json(Provider::Tvmaze, &format!(
             "https://api.tvmaze.com/search/shows?q={}",
             percent_encode(query)
         ))
@@ -692,13 +726,13 @@ pub fn omdb_lookup(key: &str, title: &str, year: u32) -> Option<TitleMeta> {
     if year > 0 {
         let _ = write!(url, "&y={year}");
     }
-    get_json(&url).as_ref().and_then(parse_omdb)
+    get_json(Provider::Omdb, &url).as_ref().and_then(parse_omdb)
 }
 
 /// OMDb: exact lookup by IMDb tconst (Wikidata resolves those keyless,
 /// so an OMDb title-miss often still lands via the id).
 pub fn omdb_lookup_imdb(key: &str, tconst: &str) -> Option<TitleMeta> {
-    get_json(&format!("https://www.omdbapi.com/?apikey={key}&i={tconst}"))
+    get_json(Provider::Omdb, &format!("https://www.omdbapi.com/?apikey={key}&i={tconst}"))
         .as_ref()
         .and_then(parse_omdb)
 }
@@ -740,7 +774,7 @@ fn parse_omdb_search(v: &serde_json::Value) -> Vec<Candidate> {
 
 /// OMDb candidate search for the wall's fix-match UI.
 pub fn omdb_search(key: &str, query: &str) -> Vec<Candidate> {
-    get_json(&format!(
+    get_json(Provider::Omdb, &format!(
         "https://www.omdbapi.com/?apikey={key}&type=movie&s={}",
         percent_encode(query)
     ))
@@ -925,15 +959,25 @@ pub fn omdb_signup(email: &str) -> Result<(), String> {
 // Wikimedia asks for a descriptive User-Agent; ureq's default is not one.
 const WIKI_UA: &str = "nzbfast/0.1 (personal media indexer; wall metadata)";
 
-/// Wikimedia rate-limits anonymous reads hard enough to matter: probing
-/// the API at ~3 requests/second earned an HTTP 429 after a dozen calls.
-/// One patient retry on 429 (honouring Retry-After when it is sent)
-/// keeps a burst from silently costing a title its whole card, which is
-/// the failure mode that matters - the enricher has no other chance at
-/// that row until something re-queues it.
-fn get_json_ua(url: &str) -> Option<serde_json::Value> {
+/// Wikimedia reads, paced by the caller's bucket and carrying the
+/// descriptive User-Agent Wikimedia asks for.
+///
+/// The provider is a parameter because Wikidata and Wikipedia do NOT
+/// share an allowance - see `ratelimit::Provider::Wikipedia` for the
+/// measurement that settled it.
+///
+/// Wikidata's limit is a quota rather than a rate: ten requests, then
+/// 429 until the window turns over ~60 s later. The bucket is sized to
+/// stay inside it, so a 429 here now means something else is spending
+/// the same allowance from this IP. The retries stay, because a 429
+/// costs a title its whole card and the enricher has no other chance at
+/// that row until something re-queues it - but the wait goes into the
+/// BUCKET rather than into a private sleep, so the whole lane backs off
+/// instead of just this one call.
+fn get_json_ua(p: Provider, url: &str) -> Option<serde_json::Value> {
     const BACKOFF_SECS: [u64; 2] = [5, 15];
     for attempt in 0..=BACKOFF_SECS.len() {
+        ratelimit::acquire(p);
         match crate::serve::shared_enrich_agent().get(url)
             .set("User-Agent", WIKI_UA)
             .timeout(std::time::Duration::from_secs(10))
@@ -948,13 +992,23 @@ fn get_json_ua(url: &str) -> Option<serde_json::Value> {
                     }
                 };
             }
-            Err(ureq::Error::Status(429, r)) if attempt < BACKOFF_SECS.len() => {
+            Err(ureq::Error::Status(429, r)) => {
                 let wait = r
                     .header("Retry-After")
                     .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(BACKOFF_SECS[attempt])
-                    .clamp(1, 30);
-                std::thread::sleep(std::time::Duration::from_secs(wait));
+                    .unwrap_or(BACKOFF_SECS[attempt.min(BACKOFF_SECS.len() - 1)])
+                    .clamp(1, 60);
+                ratelimit::penalise(p, wait);
+                if attempt == BACKOFF_SECS.len() {
+                    // Out of retries, and the whole failure was pacing.
+                    // A 429 is a 4xx, so falling into the arm below would
+                    // have `note_http_err` call it a real answer and the
+                    // caller stamp the title checked for good - an empty
+                    // card, permanently, because we were rate-limited.
+                    // "We could not ask": leave the row for a later pass.
+                    note_unreachable();
+                    return None;
+                }
             }
             Err(e) => {
                 note_http_err(&e);
@@ -1071,7 +1125,7 @@ fn pick_wikidata_imdb(
 /// Wikidata: resolve a movie title(+year) to an IMDb tconst - the join
 /// key for the IMDb ratings snapshot. Two keyless calls.
 pub fn wikidata_imdb(title: &str, year: u32) -> Option<String> {
-    let search = get_json_ua(&format!(
+    let search = get_json_ua(Provider::Wikidata, &format!(
         "https://www.wikidata.org/w/api.php?action=wbsearchentities&format=json\
          &language=en&type=item&limit=5&search={}",
         percent_encode(title)
@@ -1084,7 +1138,7 @@ pub fn wikidata_imdb(title: &str, year: u32) -> Option<String> {
     if ids.is_empty() {
         return None;
     }
-    let entities = get_json_ua(&format!(
+    let entities = get_json_ua(Provider::Wikidata, &format!(
         "https://www.wikidata.org/w/api.php?action=wbgetentities&format=json\
          &props=claims&ids={}",
         ids.join("|")
@@ -1351,7 +1405,7 @@ pub fn parse_wikidata_credits(
 /// `descriptions` ride along because the candidate list needs them and
 /// they cost nothing extra.
 fn wikidata_search(title: &str) -> Option<(serde_json::Value, serde_json::Value)> {
-    let search = get_json_ua(&format!(
+    let search = get_json_ua(Provider::Wikidata, &format!(
         "https://www.wikidata.org/w/api.php?action=wbsearchentities&format=json\
          &language=en&type=item&limit=10&search={}",
         percent_encode(title)
@@ -1364,7 +1418,7 @@ fn wikidata_search(title: &str) -> Option<(serde_json::Value, serde_json::Value)
     if ids.is_empty() {
         return None;
     }
-    let entities = get_json_ua(&format!(
+    let entities = get_json_ua(Provider::Wikidata, &format!(
         "https://www.wikidata.org/w/api.php?action=wbgetentities&format=json\
          &props=claims|labels|descriptions&languages=en|mul&ids={}",
         ids.join("|")
@@ -1427,9 +1481,14 @@ pub fn parse_wikidata_candidates(
     out
 }
 
-/// Wikidata: the keyless movie provider. Three calls - search, claims,
-/// then labels for the genre/cast entities the claims reference (skipped
-/// when there are none).
+/// Wikidata: the keyless movie provider. Four calls - search, claims,
+/// labels for the genre/cast entities the claims reference (skipped when
+/// there are none), and the cast's own IMDb ids and birth dates. The
+/// fourth is what stops a credit from being a name with a Q-id attached:
+/// without it two same-named people from different providers have
+/// nothing to disagree about and merge into one row (see
+/// `person_upsert`). Every one of them is cached process-wide, so a wall
+/// filling in makes far fewer than four per film.
 pub fn wikidata_movie(title: &str, year: u32) -> Option<TitleMeta> {
     let (search, entities) = wikidata_search(title)?;
     let picked = pick_wikidata_film(&search, &entities, year)?;
@@ -1446,7 +1505,9 @@ pub fn wikidata_movie(title: &str, year: u32) -> Option<TitleMeta> {
     }
     refs.sort();
     refs.dedup();
-    Some(parse_wikidata_film(ent, &resolve_labels(&refs)))
+    let mut meta = parse_wikidata_film(ent, &resolve_labels(&refs));
+    fill_person_facts(&mut meta.credits);
+    Some(meta)
 }
 
 /// The P453 (character role) Q-ids qualifying a film's cast claims -
@@ -1497,7 +1558,7 @@ fn resolve_labels(ids: &[String]) -> HashMap<String, String> {
     if want.is_empty() {
         return out;
     }
-    let Some(v) = get_json_ua(&format!(
+    let Some(v) = get_json_ua(Provider::Wikidata, &format!(
         "https://www.wikidata.org/w/api.php?action=wbgetentities&format=json\
          &props=labels&languages=en|mul&ids={}",
         want.join("|")
@@ -1513,6 +1574,166 @@ fn resolve_labels(ids: &[String]) -> HashMap<String, String> {
         }
     }
     out
+}
+
+/// What Wikidata knows about a credited person beyond their name: the
+/// two facts that let `person_upsert` decide whether a same-named credit
+/// is the same human.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct PersonFacts {
+    /// P345, and only when it is an `nm…` id - see `parse_person_facts`.
+    pub imdb: String,
+    /// P569 at day precision, ISO `YYYY-MM-DD`.
+    pub born: String,
+}
+
+/// Is this a Q-id we are willing to put in a query? Everything here
+/// comes from a provider response, and a Q-id is interpolated into
+/// SPARQL rather than bound.
+fn is_qid(q: &str) -> bool {
+    q.len() >= 2 && q.starts_with('Q') && q[1..].bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Pure parse of the person-facts SPARQL result set (tested).
+///
+/// One measured guard: **P345 is not person-only.** It is "IMDb ID" for
+/// every kind of entity, so an entity that turns out to be a film hands
+/// back a `tt…` title id - Q3564164, used as an actor in the D2
+/// regression test, really returns `tt0034354`. Storing that in
+/// `people.imdb` would put a film's id in a person's identity column and
+/// let two unrelated people match on it, so anything that is not an
+/// `nm…` id is dropped.
+///
+/// Birth dates arrive already filtered to day precision by the query:
+/// Wikidata models "some time in 1962" as `1962-01-01` with a precision
+/// of 9, which is indistinguishable from a real New Year's Day birthday
+/// once the precision is thrown away - and a fake disagreement is how a
+/// disambiguator splits one real person into two.
+pub fn parse_person_facts(v: &serde_json::Value) -> HashMap<String, PersonFacts> {
+    let mut out: HashMap<String, PersonFacts> = HashMap::new();
+    for row in v["results"]["bindings"].as_array().into_iter().flatten() {
+        let Some(qid) = row["p"]["value"].as_str().and_then(|u| u.rsplit('/').next()) else {
+            continue;
+        };
+        if !is_qid(qid) {
+            continue;
+        }
+        let e = out.entry(qid.to_string()).or_default();
+        if let Some(id) = row["imdb"]["value"].as_str().filter(|s| s.starts_with("nm")) {
+            e.imdb = id.to_string();
+        }
+        let born = wikidata_iso(row["dob"]["value"].as_str().unwrap_or(""));
+        if !born.is_empty() {
+            e.born = born;
+        }
+    }
+    out
+}
+
+/// Facts already asked about are not asked about again: a prolific actor
+/// recurs across a whole filmography, exactly like their label does.
+/// A Q-id that came back with nothing is cached as nothing, so an actor
+/// Wikidata holds no dates for costs one lookup per process, not one per
+/// film.
+fn facts_cache() -> &'static std::sync::Mutex<HashMap<String, PersonFacts>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, PersonFacts>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Q-ids → `PersonFacts`, in one batched SPARQL call.
+///
+/// SPARQL rather than `wbgetentities`, because `props=claims` has no
+/// property filter: measured 27 Jul 2026, one person's claims are ~190
+/// KB (Tom Cruise carries 242 properties), so a film's cast would be
+/// several MB per enrichment to read two fields. The same 20 people
+/// through the query service is one ~2 KB response in ~0.4 s.
+fn person_facts(qids: &[String]) -> HashMap<String, PersonFacts> {
+    let mut out = HashMap::new();
+    let mut want: Vec<String> = Vec::new();
+    {
+        let cache = facts_cache().lock().unwrap();
+        for q in qids.iter().filter(|q| is_qid(q)) {
+            match cache.get(q) {
+                Some(f) => {
+                    out.insert(q.clone(), f.clone());
+                }
+                None => want.push(q.clone()),
+            }
+        }
+    }
+    want.sort();
+    want.dedup();
+    // One call is all this is worth, exactly as `resolve_labels` decided:
+    // a cast longer than this just goes unenriched, which costs a
+    // disambiguator and never a credit.
+    want.truncate(50);
+    if want.is_empty() {
+        return out;
+    }
+    let values = want.iter().map(|q| format!("wd:{q}")).collect::<Vec<_>>().join(" ");
+    let query = format!(
+        "SELECT ?p ?imdb ?dob WHERE {{ \
+           VALUES ?p {{ {values} }} \
+           OPTIONAL {{ ?p wdt:P345 ?imdb }} \
+           OPTIONAL {{ \
+             ?p p:P569/psv:P569 ?dv . \
+             ?dv wikibase:timePrecision ?prec . \
+             ?dv wikibase:timeValue ?dob . \
+             FILTER(?prec >= 11) }} \
+         }}"
+    );
+    // The query service is a third Wikimedia service with its own
+    // bucket, and every other network call in this file is paced.
+    ratelimit::acquire(Provider::WikidataSparql);
+    let Some(body) = crate::serve::shared_enrich_agent()
+        .get(&format!("https://query.wikidata.org/sparql?query={}", percent_encode(&query)))
+        .set("User-Agent", WIKI_UA)
+        .set("Accept", "application/sparql-results+json")
+        .timeout(std::time::Duration::from_secs(30))
+        .call()
+        .ok()
+        .and_then(|r| r.into_string().ok())
+    else {
+        // Not marked unreachable: the title's own metadata is complete
+        // without this, and the next enrichment of any film this person
+        // appears in fills the blanks (`person_upsert` only ever writes
+        // into empty columns). The cost of a refusal is that credits
+        // landing in this window merge on name alone, as they did
+        // before this lane existed.
+        return out;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return out;
+    };
+    let got = parse_person_facts(&v);
+    let mut cache = facts_cache().lock().unwrap();
+    for q in want {
+        let f = got.get(&q).cloned().unwrap_or_default();
+        cache.insert(q.clone(), f.clone());
+        out.insert(q, f);
+    }
+    out
+}
+
+/// Stamp the IMDb id and birth date onto Wikidata-sourced credits.
+///
+/// Kept out of `parse_wikidata_credits` so that stays a pure parse of one
+/// response; this is the one part of the credit that needs a second
+/// service to answer.
+fn fill_person_facts(credits: &mut [Credit]) {
+    let qids: Vec<String> =
+        credits.iter().map(|c| c.wikidata_qid.clone()).filter(|q| !q.is_empty()).collect();
+    if qids.is_empty() {
+        return;
+    }
+    let facts = person_facts(&qids);
+    for c in credits.iter_mut() {
+        if let Some(f) = facts.get(&c.wikidata_qid) {
+            c.imdb = f.imdb.clone();
+            c.born = f.born.clone();
+        }
+    }
 }
 
 /// What one Wikipedia page summary gives us.
@@ -1580,7 +1801,7 @@ pub fn wikipedia_page(title: &str, year: u32) -> Option<WikiPage> {
             "https://en.wikipedia.org/api/rest_v1/page/summary/{}",
             percent_encode(&name.replace(' ', "_"))
         );
-        if let Some(v) = get_json_ua(&url) {
+        if let Some(v) = get_json_ua(Provider::Wikipedia, &url) {
             if v["type"].as_str() == Some("standard")
                 && (self_describing || describes_a_screen_work(&v))
             {
@@ -1599,7 +1820,6 @@ pub fn wikipedia_page(title: &str, year: u32) -> Option<WikiPage> {
                 }
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(300));
     }
     None
 }
@@ -1654,12 +1874,37 @@ pub fn anilist_lookup(title: &str) -> Option<TitleMeta> {
                   startDate{year month day}}}",
         "variables": {"s": title},
     });
-    let resp = ureq::post("https://graphql.anilist.co")
+    ratelimit::acquire(Provider::AniList);
+    let resp = match ureq::post("https://graphql.anilist.co")
         .set("Content-Type", "application/json")
         .timeout(std::time::Duration::from_secs(10))
         .send_string(&body.to_string())
-        .ok()?;
-    let v: serde_json::Value = serde_json::from_str(&resp.into_string().ok()?).ok()?;
+    {
+        Ok(r) => r,
+        Err(e) => {
+            // Same treatment as `get_json`: slow the lane on a 429/503
+            // and never let one count as "there is no such anime".
+            if let ureq::Error::Status(code @ (429 | 503), r) = &e {
+                let wait = r
+                    .header("Retry-After")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(if *code == 429 { 30 } else { 5 });
+                ratelimit::penalise(Provider::AniList, wait);
+                note_unreachable();
+                return None;
+            }
+            note_http_err(&e);
+            return None;
+        }
+    };
+    let body = match resp.into_string() {
+        Ok(b) => b,
+        Err(_) => {
+            note_unreachable();
+            return None;
+        }
+    };
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
     parse_anilist(&v)
 }
 
@@ -1688,8 +1933,6 @@ pub fn anilist_lookup(title: &str) -> Option<TitleMeta> {
 //
 // Anyone reading `actors` on a music row and assuming a bug: it is not.
 // ---------------------------------------------------------------------------
-
-use crate::ratelimit::{self, Provider};
 
 /// `TitleMeta.tmdb_id` is an i64 and doubles as the "a provider matched
 /// this" flag (`titles_missing_date` filters on `tmdb_id <> 0`, and the
@@ -2222,7 +2465,7 @@ fn parse_tvmaze_castcredits(v: &serde_json::Value) -> Vec<FilmoEntry> {
 /// Every TV show a TVmaze person id has acted in. `None` = the service
 /// did not answer, which is NOT the same as "they have no TV credits".
 pub fn tvmaze_filmography(person_id: i64) -> Option<Vec<FilmoEntry>> {
-    get_json(&format!(
+    get_json(Provider::Tvmaze, &format!(
         "https://api.tvmaze.com/people/{person_id}/castcredits?embed=show"
     ))
     .map(|v| parse_tvmaze_castcredits(&v))
@@ -2307,6 +2550,7 @@ pub fn wikidata_filmography(qid: &str) -> Option<Vec<FilmoEntry>> {
            SERVICE wikibase:label {{ bd:serviceParam wikibase:language \"en,mul\" }} \
          }} LIMIT 400"
     );
+    ratelimit::acquire(Provider::WikidataSparql);
     let resp = crate::serve::shared_enrich_agent().get(&format!(
         "https://query.wikidata.org/sparql?query={}",
         percent_encode(&query)
@@ -2461,6 +2705,44 @@ mod tests {
     }
 
     #[test]
+    fn person_facts_parse() {
+        // The live shape, probed 27 Jul 2026 against query.wikidata.org
+        // with the query `person_facts` sends. Row 3 is the measured
+        // hazard: Q3564164 is a FILM, and P345 is "IMDb ID" for any
+        // entity, so it answers with a `tt…` title id.
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"results":{"bindings":[
+                 {"p":{"value":"http://www.wikidata.org/entity/Q37079"},
+                  "imdb":{"value":"nm0000129"},
+                  "dob":{"value":"1962-07-03T00:00:00Z"}},
+                 {"p":{"value":"http://www.wikidata.org/entity/Q129429"},
+                  "imdb":{"value":"nm0000046"}},
+                 {"p":{"value":"http://www.wikidata.org/entity/Q3564164"},
+                  "imdb":{"value":"tt0034354"}},
+                 {"p":{"value":"http://www.wikidata.org/entity/Q23844838"}},
+                 {"p":{"value":"http://www.wikidata.org/entity/P31"},
+                  "imdb":{"value":"nm9999999"}}]}}"#,
+        )
+        .unwrap();
+        let f = parse_person_facts(&v);
+        assert_eq!(f["Q37079"], PersonFacts {
+            imdb: "nm0000129".into(),
+            born: "1962-07-03".into()
+        });
+        // No date is not a missing person - the row still carries an id.
+        assert_eq!(f["Q129429"].imdb, "nm0000046");
+        assert_eq!(f["Q129429"].born, "");
+        // A title id must never reach `people.imdb`: two unrelated
+        // people credited on the same film would then match on it.
+        assert_eq!(f["Q3564164"], PersonFacts::default());
+        // Asked about, nothing known: still an entry, so the cache does
+        // not ask again on every film they appear in.
+        assert!(f.contains_key("Q23844838"));
+        // Only Q-ids. Nothing else belongs in a people column.
+        assert!(!f.contains_key("P31"));
+    }
+
+    #[test]
     fn art_names_are_flat_and_safe() {
         assert_eq!(art_name("m:the matrix:1999", false), "m_the_matrix_1999.jpg");
         assert_eq!(art_name("t:severance", true), "t_severance.bd.jpg");
@@ -2525,16 +2807,17 @@ mod tests {
         // and crew with a free-text `type`.
         let emb: serde_json::Value = serde_json::from_str(
             r#"{"cast":[
-                  {"person":{"id":29657,"name":"Adam Scott",
+                  {"person":{"id":29657,"name":"Adam Scott","birthday":"1973-04-03",
                              "image":{"medium":"https://static.tvmaze.com/a.jpg"}},
                    "character":{"name":"Mark Scout"},"voice":false},
-                  {"person":{"id":1,"name":"Britt Lower"},
+                  {"person":{"id":1,"name":"Britt Lower","birthday":null},
                    "character":{"name":"Helly R"},"voice":true},
                   {"person":{"id":2,"name":"Zach Cherry"},"character":{"name":"Dylan G"}},
                   {"person":{"name":"   "},"character":{"name":"Nobody"}}],
                 "crew":[
                   {"type":"Unit Production Manager","person":{"id":90,"name":"U P M"}},
-                  {"type":"Creator","person":{"id":91,"name":"Dan Erickson"}},
+                  {"type":"Creator","person":{"id":91,"name":"Dan Erickson",
+                                              "birthday":"1980-01-02"}},
                   {"type":"","person":{"id":92,"name":"No Role"}}]}"#,
         )
         .unwrap();
@@ -2546,6 +2829,12 @@ mod tests {
         assert_eq!(cast[0].tvmaze_id, 29657);
         assert_eq!(cast[0].character, "Mark Scout");
         assert_eq!(cast[0].photo, "https://static.tvmaze.com/a.jpg");
+        // The birthday is the only thing TVmaze publishes that can tell
+        // this person apart from a same-named one seen by Wikidata, so
+        // it has to survive the parse. `null` and absent both mean
+        // "unknown", which must read as empty rather than as a date.
+        assert_eq!(cast[0].born, "1973-04-03");
+        assert_eq!((cast[1].born.as_str(), cast[2].born.as_str()), ("", ""));
         // Billing order is position, 1-based so 0 still means "unranked".
         assert_eq!((cast[0].ord, cast[2].ord), (1, 3));
         // A voice role stays visible without a schema column for it.
@@ -2557,6 +2846,7 @@ mod tests {
         let crew: Vec<&Credit> = cr.iter().filter(|c| c.role != "actor").collect();
         assert_eq!(crew.len(), 2);
         assert_eq!((crew[0].name.as_str(), crew[0].role.as_str()), ("Dan Erickson", "creator"));
+        assert_eq!(crew[0].born, "1980-01-02", "crew are people too");
         let show: serde_json::Value = serde_json::from_str(
             r#"{"id":431,"externals":{"imdb":"tt11280740"},"summary":"<p>x</p>"}"#,
         )
@@ -3096,9 +3386,185 @@ mod tests {
             assert!(!m.air_date.is_empty(), "{title}: no release date");
             assert!(!m.actors.is_empty(), "{title}: no cast");
             assert!(w.image.contains("upload.wikimedia.org"), "{title}: no poster");
+            // The person-facts leg fails the same silent way: the query
+            // service can answer 200 with an empty result set, and
+            // without these two fields every same-named credit merges
+            // on the name alone again (see `person_upsert`). Asserted as
+            // "most of the cast", not all, because Wikidata genuinely
+            // holds no birthday for some people.
+            let with_imdb = m.credits.iter().filter(|c| c.imdb.starts_with("nm")).count();
+            let with_born = m.credits.iter().filter(|c| !c.born.is_empty()).count();
+            println!("  facts: {with_imdb} imdb / {with_born} born of {}", m.credits.len());
+            assert!(
+                with_imdb * 2 > m.credits.len(),
+                "{title}: person IMDb ids did not land ({with_imdb}/{})",
+                m.credits.len()
+            );
+            assert!(
+                with_born * 2 > m.credits.len(),
+                "{title}: person birth dates did not land ({with_born}/{})",
+                m.credits.len()
+            );
             // Stay well inside Wikimedia's anonymous rate limit.
             std::thread::sleep(std::time::Duration::from_secs(3));
         }
+    }
+
+    /// Live pacing benchmark for the movie and TV lanes, in seconds per
+    /// title against the real providers. `#[ignore]`d - it is a
+    /// measurement, not an assertion:
+    ///   cargo test -p nzbfast enrichment_pacing -- --ignored --nocapture
+    ///
+    /// The title list deliberately mixes hits with misses. A miss is the
+    /// expensive shape (Wikidata answers nothing, then all three
+    /// Wikipedia title variants are tried), so a benchmark of hits only
+    /// would flatter any pacing change.
+    #[test]
+    #[ignore]
+    fn enrichment_pacing_benchmark() {
+        const MOVIES: [(&str, u32); 10] = [
+            ("The Matrix", 1999),
+            ("Top Gun Maverick", 2022),
+            ("Dune Part Two", 2024),
+            ("Inception", 2010),
+            ("Jaws", 1975),
+            ("Arrival", 2016),
+            ("Blade Runner 2049", 2017),
+            ("Sicario", 2015),
+            ("Qwertzuiop Nonesuch", 2021),
+            ("Zzyzx Roadhouse Nowhere", 2019),
+        ];
+        const SHOWS: [&str; 10] = [
+            "Breaking Bad",
+            "Severance",
+            "Slow Horses",
+            "Foundation",
+            "Andor",
+            "Silo",
+            "Shogun",
+            "The Bear",
+            "Qwertzuiop Nonesuch Show",
+            "Zzyzx Roadhouse Nowhere Show",
+        ];
+
+        // Mirrors wall_enrich_lane's keyless movie chain: Wikidata, then
+        // Wikipedia for whatever it left empty.
+        let t0 = std::time::Instant::now();
+        let mut movie_hits = 0;
+        for (title, year) in MOVIES {
+            let paced_from = std::time::Instant::now();
+            let m = wikidata_movie(title, year);
+            let wd = paced_from.elapsed();
+            let need_wiki = match &m {
+                Some(meta) => meta.overview.is_empty() || meta.poster_url.is_empty(),
+                None => true,
+            };
+            let w = if need_wiki { wikipedia_page(title, year) } else { None };
+            println!(
+                "  {title}: wikidata {:.2}s, wikipedia {:.2}s",
+                wd.as_secs_f64(),
+                (paced_from.elapsed() - wd).as_secs_f64()
+            );
+            if m.is_some() || w.is_some() {
+                movie_hits += 1;
+            }
+        }
+        let movie = t0.elapsed();
+
+        let t1 = std::time::Instant::now();
+        let mut show_hits = 0;
+        for title in SHOWS {
+            if tvmaze_lookup_full(title).is_some() {
+                show_hits += 1;
+            }
+        }
+        let show = t1.elapsed();
+
+        println!(
+            "movie lane: {:?} for {} titles ({:.2} s/title, {movie_hits}/10 matched)",
+            movie,
+            MOVIES.len(),
+            movie.as_secs_f64() / MOVIES.len() as f64
+        );
+        println!(
+            "tv lane:    {:?} for {} titles ({:.2} s/title, {show_hits}/10 matched)",
+            show,
+            SHOWS.len(),
+            show.as_secs_f64() / SHOWS.len() as f64
+        );
+    }
+
+    /// The tool the `ratelimit` numbers came out of: fire 24 requests at
+    /// a fixed spacing and report what the provider does about it.
+    /// `#[ignore]`d, and it deliberately provokes refusals - run it to
+    /// re-derive a limit, not as part of a suite.
+    ///
+    ///   PROBE=wikidata SPACING_MS=1000 \
+    ///     cargo test -p nzbfast provider_rate_probe -- --ignored --nocapture
+    ///
+    /// Reading the output: a provider enforcing a RATE refuses whenever
+    /// you go too fast and accepts when you slow down. One enforcing a
+    /// QUOTA lets exactly N through at any spacing and then refuses the
+    /// rest of the run - which is how Wikidata's 10-per-minute window
+    /// was found, and it is not a distinction the old
+    /// sleep-between-titles pacing could have surfaced.
+    #[test]
+    #[ignore]
+    fn provider_rate_probe() {
+        let ms: u64 = std::env::var("SPACING_MS").unwrap_or("1000".into()).parse().unwrap();
+        // Let any standing penalty from an earlier run expire first.
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        let t0 = std::time::Instant::now();
+        let mut ok = 0;
+        for i in 0..24 {
+            let at = std::time::Instant::now();
+            let url = match std::env::var("PROBE").unwrap_or_default().as_str() {
+                "tvmaze" => format!(
+                    "https://api.tvmaze.com/singlesearch/shows?q={}",
+                    percent_encode(["lost", "friends", "house", "the office"][i % 4])
+                ),
+                "wikipedia" => format!(
+                    "https://en.wikipedia.org/api/rest_v1/page/summary/{}",
+                    percent_encode(
+                        &["The_Matrix", "Inception", "Jaws_(film)", "Arrival_(film)"][i % 4]
+                    )
+                ),
+                _ if i % 2 == 0 => format!(
+                    "https://www.wikidata.org/w/api.php?action=wbsearchentities&format=json\
+                     &language=en&type=item&limit=10&search={}",
+                    percent_encode(&format!("probe{i}"))
+                ),
+                _ => "https://www.wikidata.org/w/api.php?action=wbgetentities&format=json\
+                      &props=claims|labels|descriptions&languages=en|mul&ids=Q83495|Q42|Q1|Q2|Q3"
+                    .to_string(),
+            };
+            match crate::serve::shared_enrich_agent()
+                .get(&url)
+                .set("User-Agent", WIKI_UA)
+                .timeout(std::time::Duration::from_secs(10))
+                .call()
+            {
+                Ok(_) => ok += 1,
+                Err(ureq::Error::Status(code, r)) => {
+                    let ra = r.header("Retry-After").unwrap_or("-").to_string();
+                    let body: String = r
+                        .into_string()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(180)
+                        .collect();
+                    println!(
+                        "  request {i} at {:.1}s: HTTP {code} retry-after={ra} body={body:?}",
+                        t0.elapsed().as_secs_f64()
+                    );
+                }
+                Err(e) => println!("  request {i} at {:.1}s: {e}", t0.elapsed().as_secs_f64()),
+            }
+            std::thread::sleep(
+                std::time::Duration::from_millis(ms).saturating_sub(at.elapsed()),
+            );
+        }
+        println!("spacing {ms}ms: {ok}/24 ok in {:.1}s", t0.elapsed().as_secs_f64());
     }
 
     // ---- music + books --------------------------------------------------

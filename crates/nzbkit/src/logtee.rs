@@ -7,9 +7,23 @@
 //! and the ring stays empty (the dashboard says so).
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 const CAP: usize = 2000;
+
+/// Handshake line [`drain`] writes down the pipe. Control bytes, so it
+/// cannot collide with anything a program or a child process prints; the
+/// reader swallows it rather than echoing it or ringing it.
+const DRAIN_MARK: &[u8] = b"\x01nzbfast-logtee-drain\x01";
+
+/// Count of drain marks the reader has swallowed, plus the condvar it
+/// notifies. Present only while the tee is installed.
+static DRAIN: OnceLock<(Mutex<u64>, Condvar)> = OnceLock::new();
+
+/// Longest [`drain`] waits for the reader to catch up. Echoing whatever
+/// a pipe can hold takes microseconds; the cap only exists so a reader
+/// thread that has already died cannot hold an exiting process open.
+const DRAIN_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// M32: size cap for a REDIRECTED stdout log file, bytes.
 /// Every packaging surface except the Mac app (which rotates its own
@@ -49,6 +63,11 @@ pub fn active() -> bool {
 /// old `lines()` reader returned Err on the first non-UTF-8 byte, which
 /// killed the tee thread and silently took the daemon down with it.)
 fn ring_line(buf: &[u8]) -> String {
+    String::from_utf8_lossy(trim_newline(buf)).into_owned()
+}
+
+/// One captured line without its trailing CR/LF.
+fn trim_newline(buf: &[u8]) -> &[u8] {
     let mut end = buf.len();
     if end > 0 && buf[end - 1] == b'\n' {
         end -= 1;
@@ -56,7 +75,7 @@ fn ring_line(buf: &[u8]) -> String {
     if end > 0 && buf[end - 1] == b'\r' {
         end -= 1;
     }
-    String::from_utf8_lossy(&buf[..end]).into_owned()
+    &buf[..end]
 }
 
 /// Install the tee. Call once, early; further calls are no-ops.
@@ -79,6 +98,9 @@ pub fn install() {
                 return;
             }
             libc::close(wr);
+            // Only once the pipe is really in place: a drain with no
+            // reader behind it would print its own handshake.
+            let _ = DRAIN.set((Mutex::new(0), Condvar::new()));
             let ring2 = ring.clone();
             std::thread::spawn(move || {
                 use std::io::{BufRead, BufReader, Write};
@@ -106,6 +128,15 @@ pub fn install() {
                     match src.read_until(b'\n', &mut buf) {
                         Ok(0) | Err(_) => break, // pipe closed, or read error
                         Ok(_) => {}
+                    }
+                    if trim_newline(&buf) == DRAIN_MARK {
+                        // A drain handshake, not output: everything
+                        // written before it has now been echoed.
+                        if let Some((n, cv)) = DRAIN.get() {
+                            *n.lock().unwrap() += 1;
+                            cv.notify_all();
+                        }
+                        continue;
                     }
                     if echo_is_file {
                         since_check += buf.len() as u64;
@@ -145,9 +176,53 @@ pub fn install() {
                     g.push_back(line);
                 }
             });
+            // Every exit path drains, including the ones nobody writes:
+            // a panic, a bail out of main, `process::exit` in a handler.
+            // atexit runs on all of them (never on a signal, where there
+            // is nothing to be done anyway).
+            libc::atexit(drain_at_exit);
         }
         let _ = RING.set(ring);
     }
+}
+
+#[cfg(unix)]
+extern "C" fn drain_at_exit() {
+    drain();
+}
+
+/// Wait until the reader has echoed everything written to stdout/stderr
+/// so far.
+///
+/// Without this the last thing a process says is the thing most likely to
+/// be lost: the bytes sit in the pipe, unread, and exiting takes the
+/// reader thread down with the process. A fatal error printed on the way
+/// out (an empty API key file, a panic) reached the terminal only if the
+/// reader happened to be scheduled in time - under load it usually was
+/// not, so the user saw a failed start with no reason given.
+pub fn drain() {
+    use std::io::Write;
+    // Ordinary buffered output first: it is not in the pipe yet.
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    let Some((count, cv)) = DRAIN.get() else {
+        return;
+    };
+    // Read the count before the mark goes down the pipe. Nothing is held
+    // across the write: a full pipe would block us there, and the reader
+    // needs this lock to bump the count. A bump we miss in the gap is not
+    // a lost wakeup either - the wait tests the counter, not an event.
+    let before = *count.lock().unwrap();
+    {
+        let mut out = std::io::stdout().lock();
+        if out.write_all(DRAIN_MARK).is_err() || writeln!(out).is_err() || out.flush().is_err() {
+            return;
+        }
+    }
+    // The pipe is FIFO: once the mark comes back, so has everything
+    // written before it.
+    let seen = count.lock().unwrap();
+    let _ = cv.wait_timeout_while(seen, DRAIN_WAIT, |n| *n == before);
 }
 
 #[cfg(test)]

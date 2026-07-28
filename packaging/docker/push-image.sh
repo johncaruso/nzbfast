@@ -23,7 +23,7 @@
 #   DOCKERHUB_TOKEN=dckr_pat_xxx \
 #     ./push-image.sh 1.0.0
 #
-# Sanity rules (see .claude/skills/publish-release):
+# Sanity rules:
 #   - docker inspect of the pushed image must contain no personal names,
 #     paths or hostnames - only nzbfast.com / github.com/nzbfast.
 #   - The ghcr package must end up PUBLIC and linked to nzbfast/nzbfast

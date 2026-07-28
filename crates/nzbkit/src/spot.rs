@@ -556,16 +556,18 @@ pub struct SpotScanSummary {
 
 /// Incremental OVER scan of a Spotnet group into the index DB. Resumes from
 /// the stored high-water mark (keyed `spots:<group>` so it never collides
-/// with a release-index scan of the same group).
+/// with a release-index scan of the same group; `server_host` is the host
+/// `conn` talks to - article numbers are per server, A8).
 pub async fn scan_spots(
     conn: &mut Connection,
     ix: &mut Index,
     group: &str,
+    server_host: &str,
     backfill: u64,
 ) -> Result<SpotScanSummary, SpotError> {
     let g = conn.group(group).await?;
     let mark_key = format!("spots:{group}");
-    let mark = ix.high_water(&mark_key);
+    let mark = ix.high_water(&mark_key, server_host);
     // Article numbers come from the untrusted GROUP line; saturating math plus a
     // break on the final chunk stop a near-u64::MAX `high` from overflowing
     // (debug panic; in release it wraps to 0, rescans forever, and persists a
@@ -611,7 +613,7 @@ pub async fn scan_spots(
                 sum.new += 1;
             }
         }
-        ix.set_high_water(&mark_key, hi)?;
+        ix.set_high_water(&mark_key, server_host, hi)?;
         if hi >= g.high {
             break;
         }
@@ -1019,11 +1021,11 @@ mod tests {
         let mut ix = Index::open(&dir.join("index.db")).unwrap();
 
         // Scan: one header, one valid spot.
-        let sum = scan_spots(&mut conn, &mut ix, "free.pt", 1000).await.unwrap();
+        let sum = scan_spots(&mut conn, &mut ix, "free.pt", "mock", 1000).await.unwrap();
         assert_eq!((sum.scanned, sum.valid, sum.invalid, sum.new), (1, 1, 0, 1));
         assert_eq!(sum.hashcash_warn, 0);
         // Re-scan is a no-op (high-water mark).
-        let sum2 = scan_spots(&mut conn, &mut ix, "free.pt", 1000).await.unwrap();
+        let sum2 = scan_spots(&mut conn, &mut ix, "free.pt", "mock", 1000).await.unwrap();
         assert_eq!(sum2.scanned, 0);
 
         // Search.

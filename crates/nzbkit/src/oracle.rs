@@ -392,6 +392,24 @@ impl Snapshot {
         hi <= RED_HIGH
     }
 
+    /// Soft scheduling signal (A8 gap-fill): the measured hit fraction
+    /// of this EXACT cell when it holds enough samples. None = a blind
+    /// spot - callers must treat it as unknown, never as gone: the
+    /// ledger measures BODY availability (STAT), while indexing needs
+    /// headers, so this may only ever RANK candidates, not skip them.
+    pub fn carry_rate(&self, backbone: &str, family: &str, bucket: u8) -> Option<f64> {
+        let (h, m) = self
+            .cells
+            .get(&(backbone.to_string(), family.to_string(), bucket))
+            .copied()
+            .unwrap_or((0, 0));
+        let n = h + m;
+        if n < MIN_SAMPLES {
+            return None;
+        }
+        Some(h as f64 / n as f64)
+    }
+
     /// Predicted verdict for a release in `family`, `age_days` old, given
     /// the user's enabled backbones. None = ledger too thin to say.
     pub fn verdict(

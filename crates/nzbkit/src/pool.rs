@@ -1868,15 +1868,32 @@ async fn worker(
     // reintroducing the burst in the one case the pool is nearly empty.
     // `take` is atomic, so exactly as many workers skip the ramp as
     // there are connections to skip it with.
+    //
+    // The claim must yield to the run finishing, for the same reason the
+    // dial in `session_loop` does (§35): `take` validates its candidate
+    // with a DATE round-trip bounded by VALIDATE_TIMEOUT, and that bound
+    // is 8 s against EXIT_GRACE's 5 s. A worker validating a peer that
+    // has gone mute therefore CANNOT return before `join_fleet` gives up
+    // on it, so the run pays the whole grace window - the exact tail §35
+    // was about, re-entered through the warm path. Losing the candidate
+    // on cancellation is already this code's contract: a validation that
+    // runs out of time leaves its DATE unanswered on the socket, so the
+    // connection is dropped rather than returned or re-parked.
+    let mut fin = shared.finished.subscribe();
     let warm_conn = match &cfg.warm {
-        Some(w) => w.take(server).await,
+        Some(w) => tokio::select! {
+            c = w.take(server) => c,
+            // Nothing left to claim it for. Fall through as if the pool
+            // were empty rather than returning: `life.retire()` below is
+            // what seals the run, and no path may skip it.
+            _ = run_over(&mut fin, &shared) => None,
+        },
         None => None,
     };
     // The ramp sleep must yield to abort/finish: at 100 connections ×
     // 150 ms a still-ramping worker would otherwise outlive an aborted
     // run by up to 15 s.
     let ramped = warm_conn.is_some() || {
-        let mut fin = shared.finished.subscribe();
         tokio::select! {
             _ = tokio::time::sleep(ramp) => true,
             _ = fin.wait_for(|f| *f) => false,
@@ -1982,7 +1999,14 @@ async fn session_loop(
         let warm = match preclaimed.take() {
             Some(c) => Some(c),
             None => match &cfg.warm {
-                Some(w) => w.take(server).await,
+                // Raced for the same reason as the dial below: the
+                // claim's DATE validation is bounded at 8 s against
+                // EXIT_GRACE's 5 s, so a mute peer here holds the whole
+                // run open exactly as an unanswered SYN used to (§35).
+                Some(w) => tokio::select! {
+                    c = w.take(server) => c,
+                    _ = run_over(&mut finished, &shared) => return,
+                },
                 None => None,
             },
         };
@@ -2004,7 +2028,28 @@ async fn session_loop(
                 if let Some(w) = &cfg.warm {
                     w.miss();
                 }
-                match Connection::connect(server).await {
+                // §35: the dial is the one blocking call in this loop that
+                // never watched the run. The session backoff above selects
+                // on `finished`, `backoff_or_finish` slices its sleep - but
+                // `connect` ran to its own CONNECT_TIMEOUT (20 s) whatever
+                // had happened to the job meanwhile, so a worker inside a
+                // dial when the last article went terminal kept the WHOLE
+                // run alive until `join_fleet` gave up on it after
+                // EXIT_GRACE.
+                //
+                // That cost a flat 5.0 s and it needed no dead server: 40
+                // of 40 farm runs paid it, the healthy six-server config
+                // included, because a provider bouncing a redundant
+                // connection off its simultaneous-IP cap (`502 max number
+                // of simultaneous IP addresses reached`) leaves a worker
+                // redialling exactly like an unreachable one. A 0.35 GB
+                // job whose bytes were all in at 0.65 s returned at 5.65 s.
+                // Racing the dial: same job, same box, 0.74 s.
+                let dialed = tokio::select! {
+                    r = Connection::connect(server) => r,
+                    _ = run_over(&mut finished, &shared) => return,
+                };
+                match dialed {
             Ok((c, _)) => {
                 connects.fetch_add(1, Ordering::Relaxed);
                 if ever_connected {
@@ -2538,6 +2583,25 @@ async fn shed_pipeline(shared: &Shared, inflight: &mut VecDeque<Work>) {
 /// connection and requeue free. Articles over budget report Failed. Tail
 /// duplicates are dropped silently - the original dispatch owns the
 /// outcome (and if the dup had already won, `done` protects the original).
+/// Resolves once this worker is no longer needed: every article terminal
+/// (`finished`), or a graceful drain under way.
+///
+/// Used to race blocking work that has no business outliving the run.
+/// `drain()` deliberately does not send `finished`, so draining has to be
+/// polled rather than awaited - same 250 ms slice as [`backoff_or_finish`],
+/// which is the resolution a human notices and far below any dial timeout.
+async fn run_over(finished: &mut tokio::sync::watch::Receiver<bool>, shared: &Shared) {
+    loop {
+        if shared.draining.load(Ordering::Acquire) {
+            return;
+        }
+        tokio::select! {
+            _ = finished.wait_for(|f| *f) => return,
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+        }
+    }
+}
+
 /// Wait out a connect backoff, but give up the moment the RUN is done.
 ///
 /// Returns false if the work finished while we slept, meaning this worker
@@ -4000,11 +4064,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mute_greeting_straggler_is_abandoned_after_grace() {
-        // A server that accepts and never greets parks its worker inside
-        // connect() with no timeout. Once the healthy server finishes the
-        // run, join_fleet must abandon the straggler after EXIT_GRACE
-        // instead of waiting on its join forever.
+    async fn mute_greeting_straggler_does_not_hold_a_finished_run() {
+        // §35: a server that accepts and never greets parks its worker
+        // inside the dial. This used to cost the run a full EXIT_GRACE -
+        // join_fleet's backstop was the ONLY thing that ended it, because
+        // the dial itself never watched the run. Measured on the farm at
+        // 5.0 s added to a 1.1 s job, on every job, for as long as the
+        // unreachable entry stayed in the config. The dial now races the
+        // finish, so the straggler leaves with everyone else and the
+        // grace window is never entered.
         use crate::mock::{Chaos, MockServer, make_file_articles};
         let mut articles = std::collections::HashMap::new();
         let payload: Vec<u8> = (0..40_000u32).map(|i| (i * 7) as u8).collect();
@@ -4041,7 +4109,12 @@ mod tests {
         .await
         .expect("run hung on a never-greeting server");
         let el = t0.elapsed();
-        assert!(el >= EXIT_GRACE, "returned before the grace window: {el:?}");
+        // Comfortably inside the grace window, not at the end of it: the
+        // straggler is released by the finish, not abandoned by the join.
+        assert!(
+            el < EXIT_GRACE,
+            "run waited out the dial of a server nobody needed: {el:?}"
+        );
         let mut done = 0;
         while let Ok(o) = rx.try_recv() {
             if matches!(o, FetchOutcome::Done { .. }) {
@@ -4049,6 +4122,100 @@ mod tests {
             }
         }
         assert_eq!(done, n);
+    }
+
+    /// §35, reached through the WARM path instead of the dial.
+    ///
+    /// Claiming a parked connection validates it with a DATE round-trip
+    /// bounded by `warmpool::VALIDATE_TIMEOUT` - 8 s, against EXIT_GRACE's
+    /// 5 s. A worker validating a peer that has gone mute therefore could
+    /// not return before `join_fleet` gave up on it, so the run paid the
+    /// whole grace window exactly as an unanswered SYN used to make it.
+    /// Latent while the warm pool ships off by default, which is the
+    /// reason to pin it now: TODO 36 turns it on per server.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mute_parked_connection_does_not_hold_a_finished_run() {
+        use crate::mock::{Chaos, MockServer, make_file_articles};
+        // Greets, then never another word, every socket held open with no
+        // RST or FIN - the shape a CGNAT idle eviction leaves behind, and
+        // the one DATE validation exists to catch. Blocking std sockets on
+        // their own thread so the peer keeps working regardless of what
+        // the async runtime is doing.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            let mut held = Vec::new();
+            while let Ok((mut s, _)) = listener.accept() {
+                let _ = s.write_all(b"200 mock ready\r\n");
+                let _ = s.flush();
+                held.push(s);
+            }
+        });
+        let mute = ServerConfig {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            tls: false,
+            username: None,
+            password: None,
+            connections: 1,
+            rcvbuf: None,
+            level: 0,
+            group: None,
+            retention_days: 0,
+            block_bytes: None,
+            bind_ip: None,
+            socks5: None,
+            enabled: true,
+            warm_pool: false,
+        };
+
+        let mut articles = std::collections::HashMap::new();
+        let payload: Vec<u8> = (0..40_000u32).map(|i| (i * 3) as u8).collect();
+        make_file_articles("w.bin", &payload, 8_000, "wp", &mut articles);
+        let n = articles.len();
+        let healthy = MockServer::start(articles.clone(), Chaos::default()).await;
+
+        // Park a live connection to the mute peer, exactly as the previous
+        // job in a queue would have left one.
+        let warm = crate::warmpool::WarmPool::new(crate::warmpool::DEFAULT_MAX_IDLE, 4);
+        let (c, _) = Connection::connect(&mute).await.expect("greeting");
+        warm.give(&mute, c).await;
+        assert_eq!(warm.idle_count().await, 1, "the claim must have something to claim");
+
+        let fast = PoolConfig {
+            connections: 2,
+            ramp_delay: Duration::ZERO,
+            ..Default::default()
+        };
+        let warmed = PoolConfig {
+            connections: 1,
+            ramp_delay: Duration::ZERO,
+            warm: Some(warm.clone()),
+            ..Default::default()
+        };
+        let reqs: Vec<ArticleReq> =
+            articles.keys().map(|id| ArticleReq::fresh(id.clone())).collect();
+        let (tx, mut rx) = mpsc::channel(64);
+        let t0 = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            fetch_all_multi(&[(healthy.server_config(), fast), (mute, warmed)], reqs, tx),
+        )
+        .await
+        .expect("run hung claiming a parked connection from a mute peer");
+        let el = t0.elapsed();
+        assert!(
+            el < EXIT_GRACE,
+            "run waited out the validation of a connection nobody needed: {el:?}"
+        );
+        let mut done = 0;
+        while let Ok(o) = rx.try_recv() {
+            if matches!(o, FetchOutcome::Done { .. }) {
+                done += 1;
+            }
+        }
+        assert_eq!(done, n, "the healthy server still had to deliver every article");
     }
 
     #[test]

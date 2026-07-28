@@ -90,11 +90,45 @@ if [ -n "$waived" ]; then
     printf '%s' "$waived" >&2
 fi
 
+# ---- Anti-rollback serial ---------------------------------------------
+# A monotonic integer INSIDE the signed body. Clients keep the highest one
+# they have ever seen, so a replayed old-but-validly-signed manifest is
+# recognisable as stale. Signing alone cannot catch that: a replay really
+# was signed by us.
+#
+# The value is generation time in epoch seconds. That needs no counter
+# state to lose, and it is only ever compared against a client's own
+# stored value - never against a client's clock - so a user with a wrong
+# clock is never locked out. It is a serial that happens to be a
+# timestamp, not a `not_before`.
+#
+# THE ONE WAY THIS GOES WRONG is a serial that goes backwards (a release
+# manager's clock set back, or a manifest rebuilt from an old checkout).
+# Clients ratchet one way and there is no server-side reset, so once
+# enforcement lands, a regressed serial would wedge the update channel on
+# every install that recorded the higher one - permanently, and no later
+# release could fix it. So the last shipped serial is committed here and
+# a regression is fatal at generation time, where it is still cheap.
+SERIAL_FILE="$ROOT/packaging/update-serial.txt"
+SERIAL=$(date +%s)
+if [ -f "$SERIAL_FILE" ]; then
+    PREV=$(tr -dc '0-9' < "$SERIAL_FILE")
+    if [ -n "$PREV" ] && [ "$SERIAL" -le "$PREV" ]; then
+        echo "ERROR: update serial would go BACKWARDS: $SERIAL <= $PREV" >&2
+        echo "       ($SERIAL_FILE holds the last shipped serial.)" >&2
+        echo "       Clients keep the highest serial they have seen and" >&2
+        echo "       never lower it, so publishing this would wedge the" >&2
+        echo "       update channel for everyone who saw $PREV." >&2
+        echo "       Check this machine's clock before doing anything else." >&2
+        exit 1
+    fi
+fi
+
 OUT="$DIST/latest.json"
 first=1
 {
-    printf '{\n  "version": "%s",\n  "notes": %s,\n  "platforms": {' \
-        "$VERSION" "$(printf '%s' "$NOTES" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
+    printf '{\n  "version": "%s",\n  "serial": %s,\n  "notes": %s,\n  "platforms": {' \
+        "$VERSION" "$SERIAL" "$(printf '%s' "$NOTES" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
     for plat in $PLATFORMS; do
         # Absence is already decided above: anything still missing here
         # was explicitly waived via ALLOW_MISSING.
@@ -135,3 +169,10 @@ if [ ! -x "$SIGNER" ]; then
 fi
 "$SIGNER" sign "$NZBFAST_UPDATE_SIGNING_KEY" "$OUT" || { echo "signing failed" >&2; exit 1; }
 echo "signed $OUT -> $OUT.sig"
+
+# Only now, once a signed manifest actually exists, record the serial as
+# shipped. Doing it earlier would raise the floor on a run that died before
+# producing anything - harmless with timestamps, but it would mean the file
+# no longer says what it claims to say.
+printf '%s\n' "$SERIAL" > "$SERIAL_FILE"
+echo "recorded serial $SERIAL in $SERIAL_FILE - COMMIT THIS with the release" >&2
