@@ -1,0 +1,43 @@
+# nzbfast daemon - systemd unit (Linux seedbox / home server).
+# Install:
+#   sudo cp target/release/nzbfast /usr/local/bin/
+#   sudo useradd -r -s /usr/sbin/nologin nzbfast || true
+#   sudo mkdir -p /etc/nzbfast /var/lib/nzbfast/downloads /var/lib/nzbfast/watch
+#   sudo chmod 750 /etc/nzbfast
+#   # config.json holds your provider username and password. `cp` would give
+#   # it the example file's 0644 and leave it world-readable in a directory
+#   # every local account can search; install it 0600 from the start.
+#   sudo install -m600 -o nzbfast -g nzbfast packaging/config.example.json \
+#        /etc/nzbfast/config.json  # then edit
+#   sudo chown -R nzbfast:nzbfast /etc/nzbfast /var/lib/nzbfast
+#   sudo cp packaging/systemd/nzbfast.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now nzbfast
+[Unit]
+Description=nzbfast Usenet downloader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nzbfast
+Group=nzbfast
+ExecStart=/usr/local/bin/nzbfast serve \
+    --config /etc/nzbfast/config.json \
+    --port 6789 \
+    --out /var/lib/nzbfast/downloads \
+    --watch /var/lib/nzbfast/watch
+Restart=on-failure
+RestartSec=5
+
+# Hardening - the daemon only needs its own data dirs.
+# The spool holds the API key, provider credentials and job state, so keep
+# anything the daemon creates owner-only rather than inheriting 0022.
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/nzbfast /etc/nzbfast
+
+[Install]
+WantedBy=multi-user.target

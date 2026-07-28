@@ -1,0 +1,190 @@
+//! PAR2 parser tests against real par2cmdline 1.2.0 output.
+//! Fixture provenance: tests/fixtures/par2/README.txt
+//! (`par2 create -s4096 -r34 -n1 -a testset alpha.bin beta.bin`)
+
+use nzbkit::par2::{verify_file, verify_file_blocks, Par2Set};
+
+const MAIN: &[u8] = include_bytes!("fixtures/par2/testset.par2");
+const VOL: &[u8] = include_bytes!("fixtures/par2/testset.vol0+4.par2");
+const ALPHA: &[u8] = include_bytes!("fixtures/par2/alpha.bin"); // 10 KiB
+const BETA: &[u8] = include_bytes!("fixtures/par2/beta.bin"); // 33 KiB
+
+fn parse_set() -> Par2Set {
+    Par2Set::parse(&[MAIN, VOL]).expect("fixture set parses")
+}
+
+fn file<'a>(set: &'a Par2Set, name: &str) -> &'a nzbkit::par2::Par2File {
+    set.files
+        .iter()
+        .find(|f| f.name == name)
+        .unwrap_or_else(|| panic!("file {name} present"))
+}
+
+#[test]
+fn parses_fixture_set_metadata() {
+    let set = parse_set();
+    assert_eq!(set.block_size, 4096);
+    assert_eq!(set.files.len(), 2);
+    assert_eq!(set.recovery_blocks_seen, 4);
+
+    let alpha = file(&set, "alpha.bin");
+    assert_eq!(alpha.length, 10240);
+    assert_eq!(alpha.blocks.len(), 3); // ceil(10240/4096)
+    let beta = file(&set, "beta.bin");
+    assert_eq!(beta.length, 33792);
+    assert_eq!(beta.blocks.len(), 9); // ceil(33792/4096)
+
+    // par2cmdline sorts the recovery set by file id; the Main packet order is
+    // what we expose. For this fixture beta.bin sorts first.
+    assert_eq!(set.files[0].name, "beta.bin");
+    assert_eq!(set.files[1].name, "alpha.bin");
+}
+
+#[test]
+fn main_par2_alone_parses_without_recovery_blocks() {
+    let set = Par2Set::parse(&[MAIN]).expect("index alone parses");
+    assert_eq!(set.block_size, 4096);
+    assert_eq!(set.files.len(), 2);
+    assert_eq!(set.recovery_blocks_seen, 0);
+}
+
+#[test]
+fn pristine_data_verifies_fully() {
+    let set = parse_set();
+    for (name, data) in [("alpha.bin", ALPHA), ("beta.bin", BETA)] {
+        let f = file(&set, name);
+        let blocks = verify_file_blocks(f, set.block_size, data);
+        assert!(blocks.iter().all(|&ok| ok), "{name}: all blocks good");
+        let v = verify_file(f, set.block_size, data);
+        assert!(v.md5_ok, "{name}: whole-file MD5");
+        assert!(v.md5_16k_ok, "{name}: MD5-16k");
+    }
+}
+
+#[test]
+fn corrupt_byte_flags_exactly_its_block() {
+    let set = parse_set();
+    let f = file(&set, "beta.bin");
+    let mut data = BETA.to_vec();
+    // Flip a byte in block 5 (offsets 5*4096 .. 6*4096).
+    data[5 * 4096 + 123] ^= 0xff;
+    let v = verify_file(f, set.block_size, &data);
+    let expected: Vec<bool> = (0..9).map(|i| i != 5).collect();
+    assert_eq!(v.blocks, expected, "only block 5 flagged");
+    assert!(!v.md5_ok, "whole-file MD5 fails");
+    // Corruption is past the first 16 KiB, so md5-16k still passes.
+    assert!(v.md5_16k_ok);
+}
+
+#[test]
+fn corrupt_last_padded_block_detected() {
+    let set = parse_set();
+    let f = file(&set, "beta.bin");
+    let mut data = BETA.to_vec();
+    let last = data.len() - 1; // inside the final, zero-padded block (index 8)
+    data[last] ^= 0x01;
+    let blocks = verify_file_blocks(f, set.block_size, &data);
+    let expected: Vec<bool> = (0..9).map(|i| i != 8).collect();
+    assert_eq!(blocks, expected);
+}
+
+#[test]
+fn truncated_data_fails_missing_blocks() {
+    let set = parse_set();
+    let f = file(&set, "beta.bin");
+    let v = verify_file(f, set.block_size, &BETA[..2 * 4096 + 100]);
+    assert_eq!(v.blocks.len(), 9);
+    assert!(v.blocks[0] && v.blocks[1]);
+    assert!(v.blocks[2..].iter().all(|&ok| !ok));
+    assert!(!v.md5_ok);
+    // Only ~8 KiB present, so the first-16k hash fails too.
+    assert!(!v.md5_16k_ok);
+}
+
+#[test]
+fn recovery_block_count_matches_volume_filename() {
+    // testset.vol0+4.par2 carries 4 recovery slices - the "+4".
+    assert_eq!(Par2Set::recovery_block_count(VOL), 4);
+    assert_eq!(Par2Set::recovery_block_count(MAIN), 0);
+}
+
+#[test]
+fn corrupt_packet_skipped_and_recovered_via_duplicates() {
+    let set_ref = parse_set();
+    // Corrupt one byte inside the FIRST packet body of the main .par2 -
+    // its packet MD5 no longer verifies, so the parser must skip it. The
+    // volume file duplicates every critical packet, so the parse still
+    // succeeds with identical metadata.
+    let mut broken = MAIN.to_vec();
+    broken[70] ^= 0xff; // inside first packet's body (header is 64 bytes)
+    let set = Par2Set::parse(&[&broken, VOL]).expect("duplicates rescue the parse");
+    assert_eq!(set.block_size, set_ref.block_size);
+    assert_eq!(set.files.len(), set_ref.files.len());
+    for (a, b) in set.files.iter().zip(set_ref.files.iter()) {
+        assert_eq!(a.name, b.name);
+        assert_eq!(a.length, b.length);
+        assert_eq!(a.md5, b.md5);
+        assert_eq!(a.blocks, b.blocks);
+    }
+    assert_eq!(set.recovery_blocks_seen, 4);
+}
+
+#[test]
+fn corrupt_index_alone_degrades_gracefully() {
+    // Same corruption, but with no volume to rescue it: parse either fails
+    // with NoMainPacket (if the Main packet was hit) or succeeds partially.
+    let mut broken = MAIN.to_vec();
+    broken[70] ^= 0xff;
+    match Par2Set::parse(&[&broken]) {
+        Ok(set) => assert!(set.files.len() <= 2),
+        Err(e) => assert_eq!(e, nzbkit::par2::Par2Error::NoMainPacket),
+    }
+}
+
+#[test]
+fn tolerates_leading_and_trailing_garbage() {
+    let mut noisy = b"garbage garbage PAR2\0PK not-quite ".to_vec();
+    noisy.extend_from_slice(MAIN);
+    noisy.extend_from_slice(b"trailing junk PAR2\0PKT\x03\x00\x00");
+    let set = Par2Set::parse(&[&noisy, VOL]).expect("garbage tolerated");
+    assert_eq!(set.block_size, 4096);
+    assert_eq!(set.files.len(), 2);
+}
+
+#[test]
+fn duplicate_inputs_do_not_double_count() {
+    // Feeding the same volume twice must not inflate recovery_blocks_seen.
+    let set = Par2Set::parse(&[MAIN, VOL, VOL, MAIN]).expect("parses");
+    assert_eq!(set.recovery_blocks_seen, 4);
+    assert_eq!(set.files.len(), 2);
+}
+
+#[test]
+fn short_file_md5_16k_is_unpadded_whole_file_md5() {
+    // alpha.bin is 10 KiB < 16 KiB. par2cmdline 1.2.0 hashes only the bytes
+    // that exist (min(len, 16384)) - NO zero-padding - so for a short file
+    // md5_16k equals the whole-file md5. Verified against the FileDesc
+    // packet in the fixture (see fixtures/par2/README.txt).
+    let set = parse_set();
+    let alpha = file(&set, "alpha.bin");
+    assert_eq!(alpha.md5, alpha.md5_16k);
+    let v = verify_file(alpha, set.block_size, ALPHA);
+    assert!(v.md5_ok && v.md5_16k_ok);
+
+    // And the padded interpretation would be WRONG:
+    use md5::{Digest, Md5};
+    let mut padded = ALPHA.to_vec();
+    padded.resize(16384, 0);
+    let padded_md5: [u8; 16] = Md5::digest(&padded).into();
+    assert_ne!(padded_md5, alpha.md5_16k);
+}
+
+#[test]
+fn no_main_packet_errors() {
+    use nzbkit::par2::Par2Error;
+    assert!(matches!(
+        Par2Set::parse(&[b"not a par2 file at all".as_slice()]),
+        Err(Par2Error::NoMainPacket)
+    ));
+    assert!(matches!(Par2Set::parse(&[]), Err(Par2Error::NoMainPacket)));
+}

@@ -1,0 +1,55 @@
+[package]
+name = "nzbkit-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nzbkit = { path = ".." }
+rars = { path = "../../../vendor/rars" }
+
+# Detach from the parent workspace: cargo-fuzz builds this crate on its own
+# (nightly + sanitizer), and it must not perturb the main workspace build.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "yenc_decode"
+path = "fuzz_targets/yenc_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nzb_parse"
+path = "fuzz_targets/nzb_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "par2_parse"
+path = "fuzz_targets/par2_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rar_extract"
+path = "fuzz_targets/rar_extract.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rar_recovery_scan"
+path = "fuzz_targets/rar_recovery_scan.rs"
+test = false
+doc = false
+bench = false

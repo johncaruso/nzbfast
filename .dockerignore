@@ -1,0 +1,8 @@
+target/
+macapp/.build/
+macapp/build/
+research/
+*.nzb
+config.local.json
+.git/
+downloads/

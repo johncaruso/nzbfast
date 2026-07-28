@@ -1,0 +1,56 @@
+# nzbfast - release image for ghcr.io/nzbfast/nzbfast.
+#
+# Runtime-only: COPYs the prebuilt static musl release binaries (the same
+# bits attached to the GitHub Release) instead of compiling under qemu.
+# Build context layout (assembled by packaging/docker/push-image.sh):
+#   bin/amd64/nzbfast   - nzbfast-<ver>-linux-x64 release binary
+#   bin/arm64/nzbfast   - nzbfast-<ver>-linux-arm64 release binary
+#   docker-entrypoint.sh
+#
+# Build + push (multi-arch):
+#   docker buildx build --platform linux/amd64,linux/arm64 \
+#     -f Dockerfile.release --provenance=false --sbom=false \
+#     -t ghcr.io/nzbfast/nzbfast:<ver> -t ghcr.io/nzbfast/nzbfast:latest \
+#     --push .
+
+FROM debian:bookworm-slim
+ARG TARGETARCH
+ARG VERSION=0.0.0
+
+# RAR extraction and PAR2 verify/repair are fully native (no unrar or
+# par2 package). 7z covers other archive types.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        p7zip-full ca-certificates tini curl gosu \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY bin/${TARGETARCH}/nzbfast /usr/local/bin/nzbfast
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/nzbfast /usr/local/bin/docker-entrypoint.sh
+
+LABEL org.opencontainers.image.title="nzbfast" \
+      org.opencontainers.image.description="Fast Usenet downloader - single-binary daemon with web dashboard, SABnzbd/NZBGet-compatible API and built-in indexer" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.source="https://github.com/nzbfast/nzbfast" \
+      org.opencontainers.image.url="https://github.com/nzbfast/nzbfast" \
+      org.opencontainers.image.documentation="https://github.com/nzbfast/nzbfast" \
+      org.opencontainers.image.vendor="nzbfast" \
+      org.opencontainers.image.authors="nzbfast <releases@nzbfast.com>"
+
+# Config + data mount points (compose/NAS bind them). WORKDIR /config so
+# relative state (index.db) lands on the persisted config volume.
+ENV NZBFAST_CONFIG=/config/config.json \
+    NZBFAST_PORT=6789 \
+    NZBFAST_OUT=/downloads \
+    NZBFAST_WATCH=/watch
+RUN mkdir -p /config /downloads /watch /incomplete
+WORKDIR /config
+VOLUME ["/config", "/downloads", "/watch"]
+EXPOSE 6789
+
+# Liveness probe: any HTTP answer is healthy (with an API key set the
+# body is an auth error but the status is still 200).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
+    CMD curl -fsS "http://127.0.0.1:${NZBFAST_PORT:-6789}/api?mode=version&output=json" >/dev/null || exit 1
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]

@@ -1,0 +1,1147 @@
+//! M23 watchlist: automated grabbing straight off the index.
+//!
+//! The user names shows and films they want (including ones that haven't
+//! been posted yet) with a quality window; the daemon's watcher loop then
+//! matches every indexed release against the list, enqueues the best
+//! candidate the moment one appears in a scanned group, and keeps
+//! upgrading as better encodes arrive - until the target quality is
+//! reached. Optionally the superseded download is deleted once the
+//! upgrade COMPLETES (never before: the old copy is the fallback if the
+//! new one dies).
+//!
+//! This module is the pure half - item model, quality ranking over
+//! `wall::Parsed`, matching, and the grab/upgrade/skip decision - so it
+//! is unit-testable without a daemon. The loop lives in serve.rs.
+//!
+//! 24D: an item may also target a user category by slug. Nothing here
+//! runs category rules - the loop classifies each candidate through
+//! `categories::classify`, exactly as ingest does, and matching reads
+//! the classified `kind` and `key` off the parse. One rule engine, and a
+//! release belongs to exactly one kind.
+
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+use crate::wall::{norm_title, Kind, Parsed};
+
+// ---------------------------------------------------------------------------
+// Item model (what the user edits; persisted as the `watchlist` setting)
+// ---------------------------------------------------------------------------
+
+fn default_true() -> bool {
+    true
+}
+fn default_target() -> String {
+    "1080p".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchItem {
+    /// Stable id assigned by the UI (slot state is keyed on it, so edits
+    /// to other fields don't orphan what's already been grabbed).
+    pub id: u64,
+    /// "tv", "movie", or a user category's slug ("formula-1"). A slug
+    /// item matches releases that same category claimed at ingest -
+    /// see [`kind_ok`].
+    pub kind: String,
+    pub title: String,
+    /// Films (and custom items whose year is a season): pin the year to
+    /// disambiguate remakes ("Dune") or seasons.
+    #[serde(default)]
+    pub year: Option<u32>,
+    /// Anything episodic: which series/seasons to grab - "", "all", "3",
+    /// "1-4", "2,4". Empty = every season.
+    #[serde(default)]
+    pub seasons: String,
+    /// Anything episodic: which episodes within those seasons - "",
+    /// "all", "1-13", "1,3,5-7". Empty = every episode.
+    #[serde(default)]
+    pub episodes: String,
+    /// Floor: never grab below this ("any" / "480p" … "2160p" / "remux").
+    #[serde(default)]
+    pub min_quality: String,
+    /// Ceiling: stop upgrading once a grab reaches this.
+    #[serde(default = "default_target")]
+    pub target_quality: String,
+    /// Keep grabbing better versions until target_quality is reached.
+    #[serde(default = "default_true")]
+    pub upgrade: bool,
+    /// After an upgrade COMPLETES, delete the superseded download.
+    #[serde(default)]
+    pub delete_old: bool,
+    #[serde(default)]
+    pub category: String,
+    /// M32: only grab posts at least this old - "2h",
+    /// "1d" etc. Skips fresh posts still propagating (empty = no floor).
+    #[serde(default)]
+    pub min_age: String,
+    /// M32: only grab posts at most this old - "400d", "1y" etc. Skips
+    /// stale reposts (empty = no ceiling).
+    #[serde(default)]
+    pub max_age: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Watcher state (what's been grabbed; persisted to watchlist-state.json)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Slot {
+    /// quality_rank of the best version grabbed so far.
+    pub rank: u32,
+    pub stem: String,
+    /// "1080p WEB" - stamped at grab time for the status UI.
+    pub quality: String,
+    pub nzo_id: String,
+    pub grabbed_at: i64,
+    /// Stems of upgrade attempts that FAILED for this slot - never
+    /// retried, or a dead post would be re-grabbed every pass forever.
+    #[serde(default)]
+    pub failed: Vec<String>,
+}
+
+/// An upgrade was enqueued over `old_nzo`; once `new_nzo` COMPLETES the
+/// old download is deleted (delete_old items only). If the new one FAILS
+/// the slot reverts to `prev_*` so a later candidate can retry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingDelete {
+    /// "itemid:slot" key this pending upgrade belongs to.
+    pub slot: String,
+    pub new_nzo: String,
+    #[serde(default)]
+    pub new_stem: String,
+    pub old_nzo: String,
+    pub prev_rank: u32,
+    pub prev_stem: String,
+    pub prev_quality: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WatchState {
+    /// "itemid:movie" / "itemid:s01e05" → best grab so far.
+    #[serde(default)]
+    pub slots: HashMap<String, Slot>,
+    #[serde(default)]
+    pub pending: Vec<PendingDelete>,
+}
+
+// ---------------------------------------------------------------------------
+// Quality ranking
+// ---------------------------------------------------------------------------
+
+fn res_points(res: Option<&str>) -> u32 {
+    match res {
+        Some("2160p") => 5,
+        Some("1080p") => 4,
+        Some("720p") => 3,
+        Some("576p") => 2,
+        Some("480p") => 1,
+        _ => 0,
+    }
+}
+
+/// Points for the things that separate two encodes at the SAME
+/// resolution and source: dynamic range, audio, then video codec.
+///
+/// The whole budget is deliberately small. `quality_rank` promises that
+/// resolution dominates and that `threshold_rank` boundaries hold, so
+/// these must never lift a release into another resolution's band, nor
+/// push a non-remux 2160p up to the "remux" floor of 5500. Ceiling here
+/// is 60+60+40 = 160, against 199 of headroom (remux 500 + BluRay 300
+/// leaves 5300 for the best non-remux 2160p).
+fn extras_points(p: &Parsed) -> u32 {
+    let hdr = match p.hdr.as_deref() {
+        Some("DV") => 60,
+        Some("HDR10+") => 45,
+        Some("HDR10") => 40,
+        Some("HDR") => 30,
+        Some("HLG") => 15,
+        _ => 0,
+    };
+    let audio = match p.acodec.as_deref() {
+        Some("Atmos") => 60,
+        Some("TrueHD") => 50,
+        Some("DTS-X") => 45,
+        Some("DTS-HD") => 40,
+        Some("DTS") => 30,
+        Some("DDP") => 20,
+        Some("AC3") | Some("FLAC") => 15,
+        Some("AAC") => 10,
+        Some("Opus") => 8,
+        Some("MP3") => 3,
+        _ => 0,
+    };
+    // Efficiency at a given resolution, not raw preference: a modern
+    // codec at the same res is the better encode of the two.
+    let video = match p.vcodec.as_deref() {
+        Some("AV1") | Some("x265") => 40,
+        Some("x264") => 20,
+        Some("VC-1") => 5,
+        _ => 0,
+    };
+    hdr + audio + video
+}
+
+/// Total order over releases of one title: resolution dominates, then
+/// remux, then source, then the encode's own qualities. A rank is only
+/// meaningful relative to other ranks and to `threshold_rank` values.
+pub fn quality_rank(p: &Parsed) -> u32 {
+    let src = match p.source.as_deref() {
+        Some("BluRay") => 300,
+        Some("WEB") => 200,
+        Some("HDTV") => 100,
+        Some("DVD") => 50,
+        _ => 0,
+    };
+    res_points(p.res.as_deref()) * 1000
+        + if p.remux { 500 } else { 0 }
+        + src
+        + extras_points(p)
+}
+
+/// What the user would rather have when one title has several encodes.
+/// Every field is opt-in: an empty string means "no opinion", which
+/// scores nothing either way rather than penalising anything. Values are
+/// the parser's own friendly forms ("2160p", "x265", "Atmos", "DV").
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QualityPrefs {
+    pub res: String,
+    pub vcodec: String,
+    pub acodec: String,
+    pub hdr: String,
+}
+
+/// Accepted values per field, in the parser's friendly spelling. A typo
+/// that silently matched nothing would look exactly like a preference
+/// that never gets satisfied, so unknown values are rejected at the
+/// settings boundary rather than stored.
+const PREF_RES: &[&str] = &["2160p", "1080p", "720p", "576p", "480p"];
+const PREF_VCODEC: &[&str] = &["AV1", "x265", "x264", "VC-1", "XviD", "DivX"];
+const PREF_ACODEC: &[&str] = &[
+    "Atmos", "TrueHD", "DTS-X", "DTS-HD", "DTS", "DDP", "AC3", "FLAC", "AAC", "Opus", "MP3",
+];
+const PREF_HDR: &[&str] = &["DV", "HDR10+", "HDR10", "HDR", "HLG"];
+
+impl QualityPrefs {
+    pub fn is_empty(&self) -> bool {
+        self.res.is_empty()
+            && self.vcodec.is_empty()
+            && self.acodec.is_empty()
+            && self.hdr.is_empty()
+    }
+
+    /// Parse the setting as it arrives from the API: a JSON string like
+    /// `{"res":"2160p","acodec":"Atmos"}`. Absent or empty fields mean
+    /// "no opinion"; an unrecognised value is an error, and the caller
+    /// keeps whatever was set before.
+    pub fn from_json(s: &str) -> Result<QualityPrefs, String> {
+        if s.trim().is_empty() {
+            return Ok(QualityPrefs::default());
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(s).map_err(|e| format!("not valid JSON: {e}"))?;
+        QualityPrefs::from_value(&v)
+    }
+
+    /// Parse the setting as it comes back OUT of settings.json, where it
+    /// is a real object rather than a string - `apply_setting` stores the
+    /// parsed form. Reading it back with `as_str` silently yielded None
+    /// and dropped the preference on every restart.
+    pub fn from_value(v: &serde_json::Value) -> Result<QualityPrefs, String> {
+        if let Some(s) = v.as_str() {
+            return QualityPrefs::from_json(s);
+        }
+        let field = |name: &str, allowed: &[&str]| -> Result<String, String> {
+            let raw = v.get(name).and_then(|x| x.as_str()).unwrap_or("").trim();
+            if raw.is_empty() {
+                return Ok(String::new());
+            }
+            allowed
+                .iter()
+                .find(|a| a.eq_ignore_ascii_case(raw))
+                .map(|a| (*a).to_string())
+                .ok_or_else(|| format!("{name}: unknown value {raw:?} (expected one of {allowed:?}, or empty)"))
+        };
+        Ok(QualityPrefs {
+            res: field("res", PREF_RES)?,
+            vcodec: field("vcodec", PREF_VCODEC)?,
+            acodec: field("acodec", PREF_ACODEC)?,
+            hdr: field("hdr", PREF_HDR)?,
+        })
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "res": self.res, "vcodec": self.vcodec,
+            "acodec": self.acodec, "hdr": self.hdr,
+        })
+    }
+}
+
+/// How much each satisfied preference is worth. Resolution outweighs the
+/// rest together, so "I want 4K" is not overturned by a 1080p release
+/// that happens to tick the other three.
+fn pref_weight(field: PrefField) -> i64 {
+    match field {
+        // Strictly greater than HDR + audio + video (4 + 4 + 2).
+        PrefField::Res => 11,
+        PrefField::Hdr => 4,
+        PrefField::Acodec => 4,
+        PrefField::Vcodec => 2,
+    }
+}
+
+enum PrefField {
+    Res,
+    Vcodec,
+    Acodec,
+    Hdr,
+}
+
+/// Rank a release against what the user asked for. Releases that satisfy
+/// more of the preference always sort above ones that satisfy less, and
+/// `quality_rank` breaks ties inside each group - so the order reads
+/// "what you asked for, best first, then everything else, best first".
+///
+/// This never HIDES anything: scene names omit tags all the time (plenty
+/// of Atmos releases never say "Atmos"), so a preference biases the order
+/// and nothing more. With no preference set it degrades to quality_rank.
+pub fn preference_score(p: &Parsed, prefs: &QualityPrefs) -> i64 {
+    // 10_000 clears the whole quality_rank range (max 5_960), so a
+    // preference match can never be outvoted by raw quality.
+    pref_matches(p, prefs).0 * 10_000 + quality_rank(p) as i64
+}
+
+/// Which of the user's preferences this release actually satisfies, as
+/// field names ("res" / "vcodec" / "acodec" / "hdr"). The UI marks these
+/// so it is obvious WHY a release is at the top, rather than presenting
+/// an unexplained order.
+pub fn preference_hits(p: &Parsed, prefs: &QualityPrefs) -> Vec<&'static str> {
+    pref_matches(p, prefs).1
+}
+
+fn pref_matches(p: &Parsed, prefs: &QualityPrefs) -> (i64, Vec<&'static str>) {
+    let mut weight = 0;
+    let mut hits = Vec::new();
+    let mut check = |want: &str, got: Option<&str>, field: PrefField, name: &'static str| {
+        if !want.is_empty() && got.is_some_and(|g| g.eq_ignore_ascii_case(want)) {
+            weight += pref_weight(field);
+            hits.push(name);
+        }
+    };
+    check(&prefs.res, p.res.as_deref(), PrefField::Res, "res");
+    check(&prefs.vcodec, p.vcodec.as_deref(), PrefField::Vcodec, "vcodec");
+    check(&prefs.acodec, p.acodec.as_deref(), PrefField::Acodec, "acodec");
+    check(&prefs.hdr, p.hdr.as_deref(), PrefField::Hdr, "hdr");
+    (weight, hits)
+}
+
+/// User threshold string → rank floor. "remux" means a 2160p remux
+/// (5500 sits above every plain 2160p encode, below any 2160p remux).
+pub fn threshold_rank(q: &str) -> u32 {
+    match q.trim().to_ascii_lowercase().as_str() {
+        "" | "any" => 0,
+        "remux" => 5500,
+        other => res_points(Some(other)) * 1000,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Matching
+// ---------------------------------------------------------------------------
+
+/// Age spec → seconds: "90m", "2h", "10d", "3w", "6mo", "1y"; a bare
+/// number is DAYS (the unit people mean for retention). Empty or
+/// unparseable = None (no constraint) - permissive with typed input,
+/// like in_range_spec.
+pub fn parse_age_spec(spec: &str) -> Option<u64> {
+    let s = spec.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let n: u64 = s[..split].parse().ok()?;
+    let mult = match s[split..].trim() {
+        "m" | "min" => 60,
+        "h" => 3600,
+        "" | "d" => 86_400,
+        "w" => 7 * 86_400,
+        "mo" => 30 * 86_400,
+        "y" => 365 * 86_400,
+        _ => return None,
+    };
+    // Saturate rather than multiply. The number is user-typed and
+    // unbounded, and the release profile builds with overflow checks
+    // off - so "9000000000000y", meaning "no practical limit", wrapped
+    // to a small window and the item silently stopped grabbing
+    // anything. A debug build panicked the pass instead. Saturating
+    // gives the value the user was reaching for: a ceiling nothing hits.
+    Some(n.saturating_mul(mult))
+}
+
+/// M32 age gate: is a post's age (seconds since upload) inside the
+/// item's min/max window? Posts with an unknown upload date (0) are
+/// never age-rejected - the gate exists to shape choice, not to hide
+/// index gaps.
+pub fn age_ok(item: &WatchItem, posted_unix: i64, now_unix: i64) -> bool {
+    if posted_unix <= 0 {
+        return true;
+    }
+    let age = (now_unix - posted_unix).max(0) as u64;
+    if let Some(min) = parse_age_spec(&item.min_age) {
+        if age < min {
+            return false;
+        }
+    }
+    if let Some(max) = parse_age_spec(&item.max_age) {
+        if age > max {
+            return false;
+        }
+    }
+    true
+}
+
+/// Does `n` fall inside a user range spec ("3", "1-4", "1,3,5-7")?
+/// Empty / "all" / "*" match everything, and a spec with nothing
+/// parseable in it is treated as no constraint rather than "match
+/// nothing" - permissive with hand-typed input.
+pub fn in_range_spec(spec: &str, n: u32) -> bool {
+    let s = spec.trim().to_ascii_lowercase();
+    if s.is_empty() || s == "all" || s == "*" {
+        return true;
+    }
+    let mut any_valid = false;
+    for chunk in s.split(',') {
+        let c = chunk.trim();
+        if let Some((a, b)) = c.split_once('-') {
+            if let (Ok(a), Ok(b)) = (a.trim().parse::<u32>(), b.trim().parse::<u32>()) {
+                any_valid = true;
+                if (a.min(b)..=a.max(b)).contains(&n) {
+                    return true;
+                }
+            }
+        } else if let Ok(v) = c.parse::<u32>() {
+            any_valid = true;
+            if v == n {
+                return true;
+            }
+        }
+    }
+    !any_valid
+}
+
+/// Is this item's kind a user category rather than a built-in?
+pub fn is_custom_kind(kind: &str) -> bool {
+    !kind.trim().is_empty() && !matches!(kind, "tv" | "movie")
+}
+
+/// The item's kind against the release's CLASSIFIED kind. A custom item
+/// names its category's slug, and classification is authoritative: once
+/// a category claims a stem it no longer answers to "movie", the same
+/// rule the kinds gate follows (`gates::allows_with`). So a release
+/// belongs to one item's kind, never two.
+pub fn kind_ok(item: &WatchItem, p: &Parsed) -> bool {
+    match (item.kind.as_str(), &p.kind) {
+        ("tv", _) => p.kind == Kind::Tv,
+        ("movie", _) => p.kind == Kind::Movie,
+        (slug, Kind::Custom(claimed)) => slug == claimed,
+        _ => false,
+    }
+}
+
+/// Does the item's title claim this release?
+///
+/// A film or a show has a title the parser can isolate, so those compare
+/// exactly - "Severance" must not match "Severance Pay".
+///
+/// Nothing else does. Measured against a corpus of real posts, the
+/// parsed "title" of a music, sport, combat, audiobook, comic or anime
+/// release swallows most of the stem: "metallica 72 seasons cd flac
+/// 2023", "ufc 310 jones vs miocic ppv", "one piece 1085". Exact
+/// matching meant a user typing "Metallica" or "UFC" matched NOTHING -
+/// the feature looked wired up and grabbed nothing forever. So a custom
+/// item matches on containment against the raw stem, the same text the
+/// category's own rule matched, with two guards keeping it honest: the
+/// category has already narrowed the field to releases the user
+/// described, and the comparison is word-boundary aligned, so "Rush"
+/// never matches "Rushmore".
+///
+/// An EMPTY title on a custom item means the whole category - the rule
+/// is the filter, and "grab every F1 session" needs no title at all. An
+/// empty title on a film or show still matches nothing, as before.
+fn title_ok(item: &WatchItem, stem: &str, p: &Parsed) -> bool {
+    let want = norm_title(&item.title);
+    if !is_custom_kind(&item.kind) {
+        return !want.is_empty() && want == norm_title(&p.title);
+    }
+    if want.is_empty() {
+        return true;
+    }
+    let hay = format!(" {} ", norm_title(stem));
+    hay.contains(&format!(" {want} "))
+}
+
+/// Does a parsed release satisfy this watch item? Titles compare per
+/// [`title_ok`]; an item with a pinned year rejects releases naming a
+/// DIFFERENT year (year-less stems still match - many posts omit it).
+/// Audio-language tags other than English / multi are rejected for the
+/// built-in kinds; untagged means English by scene convention.
+pub fn matches(item: &WatchItem, stem: &str, p: &Parsed) -> bool {
+    if !kind_ok(item, p) || !title_ok(item, stem, p) {
+        return false;
+    }
+    // A film's year is its release date; a custom event post's year is
+    // its season ("Formula1.2026.Round11"). Both are worth pinning, and
+    // an episodic post carries no year to compare against anyway.
+    if item.kind != "tv" {
+        if let (Some(want), Some(got)) = (item.year, p.year) {
+            if want != got {
+                return false;
+            }
+        }
+    }
+    // Episodic scope: "series 3, episodes 1-13" etc. Applied against the
+    // parsed marker; posts without one never reach a slot anyway. Custom
+    // categories can be episodic too (wrestling, a sports season), so
+    // the scope is only skipped for films.
+    if item.kind != "movie" {
+        if let Some(s) = p.season {
+            if !in_range_spec(&item.seasons, s) {
+                return false;
+            }
+        }
+        if let Some(e) = p.episode {
+            if !in_range_spec(&item.episodes, e) {
+                return false;
+            }
+        }
+    }
+    // The language gate is a heuristic for English-speaking users
+    // browsing the general index. A user category is an explicit "I want
+    // this" rule the user wrote themselves - a Bundesliga or Tour de
+    // France category would otherwise match nothing, since those posts
+    // are tagged German or French. Same reading as the default gate,
+    // which lets every custom release through.
+    if is_custom_kind(&item.kind) {
+        return true;
+    }
+    if !p.langs.is_empty() && !p.langs.iter().any(|l| l == "english" || l == "multi") {
+        return false;
+    }
+    true
+}
+
+/// Which slot of the item a release fills: movies have one ("movie"),
+/// TV tracks per-episode ("s01e05"). Season packs and bare-season posts
+/// return None - episode-level tracking would double-download them.
+///
+/// A custom category is either shape, so it takes both: an episode
+/// marker tracks per episode, and everything else tracks on the
+/// classified identity key (`c:<slug>:formula1:2026:round11 hungary
+/// qualifying`). That key is the F1 lesson made load-bearing - a
+/// "movie"-style single slot would grab one session and call the whole
+/// season done.
+///
+/// Known limit: a daily-dated custom post ("The.Daily.Show.2026.07.21")
+/// keeps no date in the parse, so its key is title-only and every
+/// episode shares one slot. One grab, not a duplicate storm; giving the
+/// parser a date field is the fix, and it belongs there, not here.
+pub fn slot_of(item: &WatchItem, p: &Parsed) -> Option<String> {
+    let episode_slot = || match (p.season, p.episode) {
+        (Some(s), Some(e)) => Some(format!("s{s:02}e{e:02}")),
+        _ => None,
+    };
+    match item.kind.as_str() {
+        "movie" => Some("movie".into()),
+        "tv" => episode_slot(),
+        _ => match p.season {
+            Some(_) => episode_slot(),
+            None => Some(p.key.clone()),
+        },
+    }
+}
+
+/// Full state key for a slot of an item.
+pub fn state_key(item_id: u64, slot: &str) -> String {
+    format!("{item_id}:{slot}")
+}
+
+/// Extra episode slots a multi-episode release covers beyond its primary
+/// one - "s01e02" for S01E01E02. Empty for single episodes, movies and
+/// packs. Recording these stops the watchlist re-grabbing a standalone
+/// E02 it already owns inside a double-episode post. Range capped so a
+/// mis-parse can't flood the state with phantom slots.
+pub fn extra_slots(item: &WatchItem, p: &Parsed) -> Vec<String> {
+    // Episodic customs (wrestling, a sports season) post doubles too.
+    if item.kind == "movie" {
+        return Vec::new();
+    }
+    match (p.season, p.episode, p.episode2) {
+        (Some(s), Some(e1), Some(e2)) if e2 > e1 && e2 - e1 <= 10 => {
+            (e1 + 1..=e2).map(|e| format!("s{s:02}e{e:02}")).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The decision
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Decision {
+    /// First acceptable version of this slot - grab it.
+    Grab,
+    /// Strictly better than what we have, and we're below target - grab
+    /// it as a replacement (bypasses duplicate-hold).
+    Upgrade,
+    Skip,
+}
+
+pub fn decide(
+    current_rank: Option<u32>,
+    candidate_rank: u32,
+    min_rank: u32,
+    target_rank: u32,
+    upgrade: bool,
+) -> Decision {
+    if candidate_rank < min_rank {
+        return Decision::Skip;
+    }
+    match current_rank {
+        None => Decision::Grab,
+        Some(cur) if upgrade && cur < target_rank && candidate_rank > cur => Decision::Upgrade,
+        Some(_) => Decision::Skip,
+    }
+}
+
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wall::parse_release;
+    use nzbkit::categories::{classify, BaseBehavior, CustomCategory};
+
+    /// The two categories the custom tests classify through - the same
+    /// shape a user types into settings.
+    fn f1_cats() -> Vec<CustomCategory> {
+        vec![
+            CustomCategory {
+                slug: "formula-1".into(),
+                name: "Formula 1".into(),
+                pattern: r"^formula\.?1\.".into(),
+                not_match: String::new(),
+                base: BaseBehavior::Movie,
+            },
+            CustomCategory {
+                slug: "motogp".into(),
+                name: "MotoGP".into(),
+                pattern: "^motogp".into(),
+                not_match: String::new(),
+                base: BaseBehavior::Movie,
+            },
+        ]
+    }
+
+    fn item(kind: &str, title: &str) -> WatchItem {
+        WatchItem {
+            id: 1,
+            kind: kind.into(),
+            title: title.into(),
+            year: None,
+            seasons: String::new(),
+            episodes: String::new(),
+            min_quality: "any".into(),
+            target_quality: "1080p".into(),
+            upgrade: true,
+            delete_old: false,
+            category: String::new(),
+            min_age: String::new(),
+            max_age: String::new(),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn multi_episode_covers_extra_slots() {
+        let tv = item("tv", "Show Name");
+        // §7b: a double episode owns both slots so a standalone E02 alt
+        // is never re-grabbed.
+        let p = parse_release("Show.Name.S01E01E02.1080p.WEB.h264-GRP");
+        assert_eq!(slot_of(&tv, &p).as_deref(), Some("s01e01"));
+        assert_eq!(extra_slots(&tv, &p), ["s01e02"]);
+        // Single episode / movie / pack → no extras.
+        let single = parse_release("Show.Name.S01E03.1080p.WEB-GRP");
+        assert!(extra_slots(&tv, &single).is_empty());
+        assert!(extra_slots(&item("movie", "Film"), &p).is_empty());
+        let pack = parse_release("Show.Name.S01.1080p.WEB-GRP");
+        assert!(extra_slots(&tv, &pack).is_empty());
+    }
+
+    #[test]
+    fn rank_ordering() {
+        let r = |stem: &str| quality_rank(&parse_release(stem));
+        let webdl_1080 = r("Show.Name.S01E02.1080p.WEB-DL.x264-GRP");
+        let bluray_1080 = r("Show.Name.S01E02.1080p.BluRay.x264-GRP");
+        let remux_1080 = r("Show.Name.S01E02.1080p.BluRay.REMUX-GRP");
+        let webdl_2160 = r("Show.Name.S01E02.2160p.WEB-DL.x265-GRP");
+        let remux_2160 = r("Show.Name.S01E02.2160p.BluRay.REMUX-GRP");
+        let hdtv_720 = r("Show.Name.S01E02.720p.HDTV.x264-GRP");
+        assert!(hdtv_720 < webdl_1080);
+        assert!(webdl_1080 < bluray_1080);
+        assert!(bluray_1080 < remux_1080);
+        assert!(remux_1080 < webdl_2160);
+        assert!(webdl_2160 < remux_2160);
+        assert!(remux_2160 >= threshold_rank("remux"));
+        assert!(webdl_2160 < threshold_rank("remux"));
+    }
+
+    /// The encode tie-break orders releases that used to rank identically,
+    /// without ever disturbing the resolution bands or the remux floor
+    /// that `threshold_rank` depends on.
+    #[test]
+    fn encode_extras_break_ties_without_crossing_bands() {
+        let r = |stem: &str| quality_rank(&parse_release(stem));
+        let plain = r("Film.2024.2160p.WEB-DL.x264-GRP");
+        let hevc = r("Film.2024.2160p.WEB-DL.x265-GRP");
+        let atmos = r("Film.2024.2160p.WEB-DL.x265.Atmos-GRP");
+        let dv = r("Film.2024.2160p.WEB-DL.x265.Atmos.DV.HDR-GRP");
+        assert!(plain < hevc, "a modern codec is the better encode");
+        assert!(hevc < atmos);
+        assert!(atmos < dv);
+        // The band below stays below, however loaded it is.
+        let best_1080 = r("Film.2024.1080p.BluRay.REMUX.x265.Atmos.DV.HDR-GRP");
+        assert!(best_1080 < r("Film.2024.2160p.HDTV.x264-GRP"));
+        // And the fully-loaded non-remux 2160p still fails a remux floor.
+        assert!(dv < threshold_rank("remux"));
+        assert!(r("Film.2024.2160p.BluRay.REMUX.x265.Atmos.DV-GRP") >= threshold_rank("remux"));
+    }
+
+    #[test]
+    fn preference_puts_what_you_asked_for_first() {
+        let prefs = QualityPrefs {
+            acodec: "Atmos".into(),
+            hdr: "DV".into(),
+            ..Default::default()
+        };
+        let s = |stem: &str| preference_score(&parse_release(stem), &prefs);
+        let plain_4k = s("Film.2024.2160p.WEB-DL.x265-GRP");
+        let atmos_1080 = s("Film.2024.1080p.WEB-DL.x265.Atmos-GRP");
+        let atmos_dv_1080 = s("Film.2024.1080p.WEB-DL.x265.Atmos.DV-GRP");
+        // Asking for Atmos and DV means a 1080p that has both outranks a
+        // 4K that has neither - that is what stating a preference means.
+        assert!(atmos_1080 > plain_4k);
+        assert!(atmos_dv_1080 > atmos_1080);
+        // Resolution outweighs the rest COMBINED when it is asked for.
+        let want4k = QualityPrefs { res: "2160p".into(), ..prefs.clone() };
+        let t = |stem: &str| preference_score(&parse_release(stem), &want4k);
+        assert!(t("Film.2024.2160p.WEB-DL.x265-GRP") > t("Film.2024.1080p.WEB.x265.Atmos.DV-GRP"));
+        let every_field = QualityPrefs {
+            res: "2160p".into(),
+            vcodec: "x265".into(),
+            acodec: "Atmos".into(),
+            hdr: "DV".into(),
+        };
+        let e = |stem: &str| preference_score(&parse_release(stem), &every_field);
+        assert!(
+            e("Film.2024.2160p.WEB-DL.x264-GRP")
+                > e("Film.2024.1080p.WEB-DL.x265.Atmos.DV-GRP"),
+            "a requested resolution must outweigh every other preference combined"
+        );
+        // No preference set ⇒ plain quality order, nothing distorted.
+        let none = QualityPrefs::default();
+        assert!(none.is_empty());
+        let q = |stem: &str| preference_score(&parse_release(stem), &none);
+        assert_eq!(q("Film.2024.2160p.WEB-DL.x265-GRP") as u32,
+                   quality_rank(&parse_release("Film.2024.2160p.WEB-DL.x265-GRP")));
+        assert!(q("Film.2024.2160p.WEB-DL.x265-GRP") > q("Film.2024.1080p.WEB.x265.Atmos.DV-GRP"));
+    }
+
+    #[test]
+    fn quality_prefs_parse_and_validate() {
+        let p = QualityPrefs::from_json(
+            r#"{"res":"2160p","vcodec":"x265","acodec":"atmos","hdr":"dv"}"#,
+        )
+        .unwrap();
+        // Stored in the parser's spelling whatever case was typed, so it
+        // compares equal to what a release parses to.
+        assert_eq!((p.acodec.as_str(), p.hdr.as_str()), ("Atmos", "DV"));
+        // Absent, empty, and no-JSON-at-all all mean "no opinion".
+        assert!(QualityPrefs::from_json("").unwrap().is_empty());
+        assert!(QualityPrefs::from_json("{}").unwrap().is_empty());
+        assert_eq!(QualityPrefs::from_json(r#"{"res":""}"#).unwrap().res, "");
+        // settings.json stores the parsed OBJECT, not the string the API
+        // sent, so a restart reads this shape back. Getting this wrong
+        // dropped the preference on every restart.
+        let stored = p.to_json();
+        assert_eq!(QualityPrefs::from_value(&stored).unwrap(), p);
+        assert!(QualityPrefs::from_value(&serde_json::json!({})).unwrap().is_empty());
+        // A typo is an error, not a preference that silently never matches.
+        assert!(QualityPrefs::from_json(r#"{"acodec":"atoms"}"#).is_err());
+        assert!(QualityPrefs::from_json(r#"{"res":"4k"}"#).is_err());
+        assert!(QualityPrefs::from_json("not json").is_err());
+    }
+
+    #[test]
+    fn thresholds() {
+        assert_eq!(threshold_rank("any"), 0);
+        assert_eq!(threshold_rank(""), 0);
+        assert_eq!(threshold_rank("720p"), 3000);
+        assert_eq!(threshold_rank("1080p"), 4000);
+        assert_eq!(threshold_rank("2160p"), 5000);
+        // A 720p release passes a 720p floor regardless of source.
+        let p = parse_release("Show.S01E01.720p.HDTV.x264-GRP");
+        assert!(quality_rank(&p) >= threshold_rank("720p"));
+        assert!(quality_rank(&p) < threshold_rank("1080p"));
+    }
+
+    #[test]
+    fn matching_titles_and_kinds() {
+        let tv = item("tv", "Severance");
+        assert!(matches(&tv, "Severance.S02E03.1080p.WEB.h264-GRP", &parse_release("Severance.S02E03.1080p.WEB.h264-GRP")));
+        // Separator/case-insensitive.
+        assert!(matches(&tv, "severance_S02E03_720p_HDTV-x", &parse_release("severance_S02E03_720p_HDTV-x")));
+        // Different show, movie kind, and superset titles all miss.
+        assert!(!matches(&tv, "Severance.Pay.S01E01.1080p.WEB-GRP", &parse_release("Severance.Pay.S01E01.1080p.WEB-GRP")));
+        assert!(!matches(&tv, "Severance.2024.1080p.BluRay.x264-GRP", &parse_release("Severance.2024.1080p.BluRay.x264-GRP")));
+
+        let mv = item("movie", "Dune Part Two");
+        assert!(matches(&mv, "Dune.Part.Two.2024.2160p.WEB-DL-GRP", &parse_release("Dune.Part.Two.2024.2160p.WEB-DL-GRP")));
+        assert!(!matches(&mv, "Dune.Part.Two.S01E01.1080p.WEB-GRP", &parse_release("Dune.Part.Two.S01E01.1080p.WEB-GRP")));
+    }
+
+    #[test]
+    fn matching_year_pin() {
+        let mut mv = item("movie", "Dune");
+        mv.year = Some(2021);
+        assert!(matches(&mv, "Dune.2021.2160p.BluRay.REMUX-GRP", &parse_release("Dune.2021.2160p.BluRay.REMUX-GRP")));
+        assert!(!matches(&mv, "Dune.1984.1080p.BluRay.x264-GRP", &parse_release("Dune.1984.1080p.BluRay.x264-GRP")));
+    }
+
+    #[test]
+    fn matching_language() {
+        let tv = item("tv", "Dark");
+        // Tagged German-only audio: rejected. MULTI: accepted. Untagged:
+        // accepted (scene convention = English).
+        assert!(!matches(&tv, "Dark.S01E01.German.1080p.WEB.x264-GRP", &parse_release("Dark.S01E01.German.1080p.WEB.x264-GRP")));
+        assert!(matches(&tv, "Dark.S01E01.MULTI.1080p.WEB.x264-GRP", &parse_release("Dark.S01E01.MULTI.1080p.WEB.x264-GRP")));
+        assert!(matches(&tv, "Dark.S01E01.1080p.WEB.x264-GRP", &parse_release("Dark.S01E01.1080p.WEB.x264-GRP")));
+    }
+
+    #[test]
+    fn range_specs() {
+        for all in ["", "all", "ALL", "*", " "] {
+            assert!(in_range_spec(all, 7), "{all:?} should match everything");
+        }
+        assert!(in_range_spec("3", 3));
+        assert!(!in_range_spec("3", 4));
+        assert!(in_range_spec("1-13", 1));
+        assert!(in_range_spec("1-13", 13));
+        assert!(!in_range_spec("1-13", 14));
+        assert!(in_range_spec("1,3,5-7", 6));
+        assert!(!in_range_spec("1,3,5-7", 4));
+        // Reversed range still works; junk = no constraint.
+        assert!(in_range_spec("13-1", 5));
+        assert!(in_range_spec("wat", 5));
+    }
+
+    #[test]
+    fn matching_tv_scope() {
+        let mut tv = item("tv", "Severance");
+        tv.seasons = "3".into();
+        tv.episodes = "1-13".into();
+        assert!(matches(&tv, "Severance.S03E01.1080p.WEB-GRP", &parse_release("Severance.S03E01.1080p.WEB-GRP")));
+        assert!(matches(&tv, "Severance.S03E13.1080p.WEB-GRP", &parse_release("Severance.S03E13.1080p.WEB-GRP")));
+        // Wrong season / episode outside the window.
+        assert!(!matches(&tv, "Severance.S02E03.1080p.WEB-GRP", &parse_release("Severance.S02E03.1080p.WEB-GRP")));
+        assert!(!matches(&tv, "Severance.S03E14.1080p.WEB-GRP", &parse_release("Severance.S03E14.1080p.WEB-GRP")));
+        // "All" scope takes anything.
+        tv.seasons = "all".into();
+        tv.episodes.clear();
+        assert!(matches(&tv, "Severance.S02E03.1080p.WEB-GRP", &parse_release("Severance.S02E03.1080p.WEB-GRP")));
+    }
+
+    #[test]
+    fn slots() {
+        let tv = item("tv", "Severance");
+        let mv = item("movie", "Dune");
+        assert_eq!(
+            slot_of(&tv, &parse_release("Severance.S02E03.1080p.WEB-GRP")).as_deref(),
+            Some("s02e03")
+        );
+        // Season pack → no episode slot (skipped).
+        assert_eq!(slot_of(&tv, &parse_release("Severance.S02.1080p.WEB-GRP")), None);
+        assert_eq!(
+            slot_of(&mv, &parse_release("Dune.2021.1080p.WEB-GRP")).as_deref(),
+            Some("movie")
+        );
+        assert_eq!(state_key(7, "s02e03"), "7:s02e03");
+    }
+
+    #[test]
+    fn decisions() {
+        let min = threshold_rank("720p");
+        let target = threshold_rank("1080p");
+        let hdtv480 = quality_rank(&parse_release("X.S01E01.480p.HDTV-G"));
+        let hdtv720 = quality_rank(&parse_release("X.S01E01.720p.HDTV-G"));
+        let web1080 = quality_rank(&parse_release("X.S01E01.1080p.WEB-G"));
+        let blu1080 = quality_rank(&parse_release("X.S01E01.1080p.BluRay-G"));
+        // Below the floor: never grabbed, even with nothing on hand.
+        assert_eq!(decide(None, hdtv480, min, target, true), Decision::Skip);
+        // First acceptable version.
+        assert_eq!(decide(None, hdtv720, min, target, true), Decision::Grab);
+        // Better version while below target → upgrade.
+        assert_eq!(decide(Some(hdtv720), web1080, min, target, true), Decision::Upgrade);
+        // Already at target: a better encode no longer triggers.
+        assert_eq!(decide(Some(web1080), blu1080, min, target, true), Decision::Skip);
+        // Upgrades disabled: first grab is final.
+        assert_eq!(decide(Some(hdtv720), web1080, min, target, false), Decision::Skip);
+        // Same or worse rank is never an upgrade.
+        assert_eq!(decide(Some(web1080), web1080, min, target, true), Decision::Skip);
+        assert_eq!(decide(Some(web1080), hdtv720, min, target, true), Decision::Skip);
+    }
+
+    /// 24D: a custom-category item matches through the SAME classify
+    /// path ingest uses, and refuses everything that path did not claim.
+    #[test]
+    fn custom_category_items_match_their_own_releases() {
+        let cats = f1_cats();
+        let mut it = item("formula-1", "Formula1");
+        const QUALI: &str =
+            "Formula1.2026.Round11.Hungary.Qualifying.F1TV.WEB-DL.1080p.H264.English-MWR";
+        let quali = classify(QUALI, &cats);
+        assert!(matches(&it, QUALI, &quali));
+        // A film the category did not claim is not this item's, even
+        // though it parses as a perfectly good release.
+        const MATRIX: &str = "The.Matrix.1999.1080p.BluRay.x264-GRP";
+        assert!(!matches(&it, MATRIX, &classify(MATRIX, &cats)));
+        // Another category's release: right shape, wrong slug.
+        const GP: &str = "MotoGP.2026.Round05.France.Race.1080p.WEB-DL-GRP";
+        let motogp = classify(GP, &cats);
+        assert_eq!(motogp.kind, Kind::Custom("motogp".into()));
+        assert!(!matches(&it, GP, &motogp));
+        // With no categories configured the stem is a plain Movie, so
+        // the slug item declines it - classification is what decides.
+        assert!(!matches(&it, QUALI, &parse_release(QUALI)));
+        // A "movie" item no longer claims what a category took: exactly
+        // one kind owns a release.
+        assert!(!matches(&item("movie", "Formula1"), QUALI, &quali));
+        // Wrong title still misses.
+        assert!(!matches(&item("formula-1", "MotoGP"), QUALI, &quali));
+        // The year pin works on an event post, whose year IS its season.
+        it.year = Some(2026);
+        assert!(matches(&it, QUALI, &quali));
+        it.year = Some(2025);
+        assert!(!matches(&it, QUALI, &quali));
+        // Non-English audio is kept: a user category is an explicit want.
+        const DE: &str = "Formula1.2026.Round12.Spa.Race.German.1080p.WEB-DL-MWR";
+        assert!(matches(&item("formula-1", "Formula1"), DE, &classify(DE, &cats)));
+    }
+
+    /// The item the wall's ☆ button writes for a user category, exactly
+    /// as it writes it: the card's title, no year pin, no episode scope.
+    /// It has to keep matching next season - a card year pinned from the
+    /// UI would quietly retire the watch on 1 January.
+    #[test]
+    fn starring_a_category_card_keeps_watching_next_season() {
+        let cats = f1_cats();
+        let it = item("formula-1", "Formula1");
+        const RACE26: &str = "Formula1.2026.Round11.Hungary.Race.F1TV.WEB-DL.1080p.H264-MWR";
+        const RACE27: &str = "Formula1.2027.Round03.Australia.Race.F1TV.WEB-DL.1080p.H264-MWR";
+        assert!(matches(&it, RACE26, &classify(RACE26, &cats)));
+        assert!(matches(&it, RACE27, &classify(RACE27, &cats)));
+        // ...and each session keeps its own slot, so grabbing one does
+        // not mark the season done.
+        assert_ne!(
+            slot_of(&it, &classify(RACE26, &cats)),
+            slot_of(&it, &classify(RACE27, &cats))
+        );
+    }
+
+    /// Why the ☆ button is NOT offered on a built-in music/book/software
+    /// card: a non-tv/movie kind only ever answers to a CUSTOM slug, so
+    /// such an item would sit there matching nothing forever. If these
+    /// ever should be watchable, the fix is here, not in the wall.
+    #[test]
+    fn builtin_non_video_kinds_match_nothing() {
+        const ALBUM: &str = "Metallica-72.Seasons-CD-FLAC-2023-PERFECT";
+        const APP: &str = "Sketch.v99.4.1.macOS-TNT";
+        let album = parse_release(ALBUM);
+        assert_eq!(album.kind, Kind::Music);
+        assert!(!matches(&item("music", "Metallica"), ALBUM, &album));
+        assert!(!matches(&item("music", ""), ALBUM, &album));
+        assert!(!matches(&item("software", "Sketch"), APP, &parse_release(APP)));
+    }
+
+    /// The shapes that made the feature look wired-up and grab nothing:
+    /// content whose parsed "title" is most of the stem. Exact title
+    /// equality matched none of these (measured over a corpus of real
+    /// post names), so a custom item matches by containment on the stem.
+    #[test]
+    fn custom_items_match_the_shapes_a_parser_cannot_title() {
+        let cats = vec![
+            CustomCategory { slug: "music".into(), name: "Music".into(),
+                pattern: "(?i)(flac|mp3|-cd-)".into(), not_match: String::new(),
+                base: BaseBehavior::None },
+            CustomCategory { slug: "combat".into(), name: "Combat".into(),
+                pattern: "(?i)^ufc".into(), not_match: String::new(),
+                base: BaseBehavior::Movie },
+            CustomCategory { slug: "anime".into(), name: "Anime".into(),
+                pattern: "(?i)(one.piece|subsplease)".into(), not_match: String::new(),
+                base: BaseBehavior::Tv },
+        ];
+        let hit = |kind: &str, title: &str, stem: &str| {
+            matches(&item(kind, title), stem, &classify(stem, &cats))
+        };
+        // Music: the album, the rip format and the year all end up in
+        // the "title"; the artist is what the user types.
+        assert!(hit("music", "Metallica", "Metallica-72.Seasons-CD-FLAC-2023-PERFECT"));
+        assert!(hit("music", "Metallica", "Metallica-Ride.The.Lightning-Remastered-2016-FLAC"));
+        assert!(!hit("music", "Metallica", "Radiohead-OK.Computer-1997-MP3-320"));
+        // Combat sports: numbered events, no year, no episode.
+        assert!(hit("combat", "UFC", "UFC.310.Jones.vs.Miocic.PPV.1080p.WEB-DL-GRP"));
+        assert!(hit("combat", "UFC 310", "UFC.310.Jones.vs.Miocic.PPV.1080p.WEB-DL-GRP"));
+        // Anime: the episode number lands inside the title.
+        assert!(hit("anime", "One Piece", "One.Piece.1085.1080p.WEB.x264-VARYG"));
+        assert!(hit("anime", "Frieren", "[SubsPlease] Frieren - 15 (1080p) [ABCD1234]"));
+        // Word-boundary aligned, so a shorter name is not a prefix match
+        // on a longer one.
+        assert!(!hit("music", "Metal", "Metallica-72.Seasons-CD-FLAC-2023-PERFECT"));
+        // An empty title on a custom item means the whole category: the
+        // rule already said what the user wants.
+        assert!(hit("music", "", "Radiohead-OK.Computer-1997-MP3-320"));
+        assert!(hit("combat", "  ", "UFC.311.Makhachev.vs.Tsarukyan.PPV.1080p-GRP"));
+        // ...but an empty title on a film or show still matches nothing,
+        // or one blank row would grab the entire index.
+        assert!(!matches(&item("movie", ""), MOVIE, &parse_release(MOVIE)));
+        assert!(!matches(&item("tv", ""), SHOW, &parse_release(SHOW)));
+        // And built-in titles stay EXACT: no containment creep.
+        assert!(matches(&item("tv", "Severance"), SHOW, &parse_release(SHOW)));
+        assert!(!matches(&item("tv", "Sever"), SHOW, &parse_release(SHOW)));
+        assert!(!matches(
+            &item("tv", "Severance"),
+            "Severance.Pay.S01E01.1080p.WEB-GRP",
+            &parse_release("Severance.Pay.S01E01.1080p.WEB-GRP")
+        ));
+    }
+
+    const MOVIE: &str = "The.Matrix.1999.1080p.BluRay.x264-GRP";
+    const SHOW: &str = "Severance.S02E03.1080p.WEB.h264-GRP";
+
+    /// The F1 lesson, at the watchlist layer: sessions of one season get
+    /// their own slots, so grabbing the qualifying does not mark the
+    /// whole category "have it".
+    #[test]
+    fn custom_slots_follow_the_identity_key() {
+        let cats = f1_cats();
+        let it = item("formula-1", "Formula1");
+        let s = |stem: &str| slot_of(&it, &classify(stem, &cats)).unwrap();
+        let qs = s("Formula1.2026.Round11.Hungary.Qualifying.WEB-DL.1080p-MWR");
+        let rs = s("Formula1.2026.Round11.Hungary.Race.WEB-DL.1080p-MWR");
+        assert_ne!(qs, rs, "two sessions collapsed into one slot");
+        assert!(qs.starts_with("c:formula-1:"), "{qs}");
+        // A better encode of the SAME session is the same slot - that is
+        // what makes it an upgrade rather than a second download.
+        assert_eq!(s("Formula1.2026.Round11.Hungary.Qualifying.WEB-DL.2160p-GRP"), qs);
+
+        // Dated events: a whole matchday is not one thing to grab.
+        let foot = vec![CustomCategory { slug: "football".into(), name: "Football".into(),
+            pattern: "^epl".into(), not_match: String::new(), base: BaseBehavior::None }];
+        let f = item("football", "EPL");
+        let fs = |stem: &str| slot_of(&f, &classify(stem, &foot)).unwrap();
+        let a = fs("EPL.2026.08.22.Arsenal.vs.Spurs.1080p.WEB.h264-VERUM");
+        let b = fs("EPL.2026.08.22.Liverpool.vs.Everton.1080p.WEB.h264-VERUM");
+        let c = fs("EPL.2026.08.15.Arsenal.vs.Chelsea.1080p.WEB.h264-VERUM");
+        assert_ne!(a, b, "two fixtures on one Saturday shared a slot");
+        assert_ne!(a, c, "two matchdays shared a slot");
+        assert_eq!(a, fs("EPL.2026.08.22.Arsenal.vs.Spurs.720p.WEB.h264-OTHER"));
+
+        // An episodic custom tracks per episode, like TV, and its bare
+        // season pack is skipped for the same reason TV's is.
+        let wcats = vec![CustomCategory { slug: "wrestling".into(), name: "Wrestling".into(),
+            pattern: "wwe".into(), not_match: String::new(), base: BaseBehavior::Tv }];
+        let w = item("wrestling", "WWE Raw");
+        const E15: &str = "WWE.Raw.S2026E015.1080p.WEB.h264-GRP";
+        let e15 = classify(E15, &wcats);
+        assert!(matches(&w, E15, &e15));
+        assert_eq!(slot_of(&w, &e15).as_deref(), Some("s2026e15"));
+        assert_eq!(slot_of(&w, &classify("WWE.Raw.S12.1080p.WEB-GRP", &wcats)), None);
+        // Doubles own both slots, as they do for TV.
+        let dbl = classify("WWE.Raw.S2026E015E016.1080p.WEB-GRP", &wcats);
+        assert_eq!(extra_slots(&w, &dbl), ["s2026e16"]);
+        // Episode scope applies to customs too.
+        let mut scoped = w.clone();
+        scoped.episodes = "1-14".into();
+        assert!(!matches(&scoped, E15, &e15));
+    }
+
+
+    #[test]
+    fn custom_item_settings_round_trip() {
+        let mut it = item("formula-1", "Formula1");
+        it.year = Some(2026);
+        it.category = "sport".into();
+        let json = serde_json::to_string(&it).unwrap();
+        let back: WatchItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.kind, "formula-1");
+        assert_eq!(back.year, Some(2026));
+        assert_eq!(back.category, "sport");
+        // Minimal hand-written form (what an older UI or a hand edit
+        // sends): a slug kind needs no other new field.
+        let min: WatchItem =
+            serde_json::from_str(r#"{"id":9,"kind":"formula-1","title":"Formula1"}"#).unwrap();
+        assert_eq!(min.kind, "formula-1");
+        assert!(min.enabled && min.upgrade);
+        assert!(is_custom_kind(&min.kind));
+        assert!(!is_custom_kind("tv") && !is_custom_kind("movie") && !is_custom_kind(""));
+    }
+
+
+    #[test]
+    fn age_specs_and_gate() {
+        // Units; bare number = days.
+        assert_eq!(parse_age_spec("90m"), Some(90 * 60));
+        assert_eq!(parse_age_spec("2h"), Some(2 * 3600));
+        assert_eq!(parse_age_spec("10d"), Some(10 * 86_400));
+        assert_eq!(parse_age_spec("10"), Some(10 * 86_400));
+        assert_eq!(parse_age_spec("3w"), Some(3 * 7 * 86_400));
+        assert_eq!(parse_age_spec("6mo"), Some(6 * 30 * 86_400));
+        assert_eq!(parse_age_spec("1y"), Some(365 * 86_400));
+        // Empty / garbage = no constraint.
+        assert_eq!(parse_age_spec(""), None);
+        assert_eq!(parse_age_spec("soon"), None);
+        assert_eq!(parse_age_spec("5parsecs"), None);
+
+        let mut item = WatchItem {
+            id: 1,
+            kind: "movie".into(),
+            title: "X".into(),
+            year: None,
+            seasons: String::new(),
+            episodes: String::new(),
+            min_quality: String::new(),
+            target_quality: "any".into(),
+            upgrade: false,
+            delete_old: false,
+            category: String::new(),
+            min_age: "2h".into(),
+            max_age: "10d".into(),
+            enabled: true,
+        };
+        let now = 1_800_000_000i64;
+        let hours = |h: i64| now - h * 3600;
+        assert!(!age_ok(&item, hours(1), now), "1h-old post is inside the 2h floor");
+        assert!(age_ok(&item, hours(3), now));
+        assert!(age_ok(&item, hours(9 * 24), now));
+        assert!(!age_ok(&item, hours(11 * 24), now), "11d-old post crosses the 10d ceiling");
+        // Unknown upload date is never rejected.
+        assert!(age_ok(&item, 0, now));
+        // No constraints = everything passes.
+        item.min_age.clear();
+        item.max_age.clear();
+        assert!(age_ok(&item, hours(1), now) && age_ok(&item, hours(1000 * 24), now));
+    }
+}

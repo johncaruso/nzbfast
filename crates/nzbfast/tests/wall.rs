@@ -1,0 +1,879 @@
+//! M13 gate seed: the poster wall - releases parse into title cards,
+//! encodes of one film dedupe onto one card, TV seasons group under one
+//! show, obfuscated stems stay hidden, /wall serves the UI, /m3u hands a
+//! playlist to an external player.
+
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+
+use nzbkit::nntp::OverEntry;
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn http_get(port: u16, req: &str) -> (u16, String) {
+    let mut request = Vec::new();
+    write!(request, "GET {req} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    split_response(&raw(port, &request))
+}
+
+fn http_post(port: u16, req: &str, content_type: &str, body: &[u8]) -> (u16, String) {
+    let mut request = Vec::new();
+    write!(
+        request,
+        "POST {req} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: {content_type}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .unwrap();
+    request.extend_from_slice(body);
+    split_response(&raw(port, &request))
+}
+
+/// (status, body) off the wire. Lossy because /art bodies are binary.
+fn split_response(bytes: &[u8]) -> (u16, String) {
+    let out = String::from_utf8_lossy(bytes).into_owned();
+    let status: u16 = out
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    (status, out.split("\r\n\r\n").nth(1).unwrap_or("").to_string())
+}
+
+/// A request to the daemon, response headers and all.
+///
+/// A connection REFUSED before it produced a single byte is retried. That
+/// is not the same as tolerating a bad answer: tiny_http's honest reply
+/// when it cannot start a thread for a new connection is to drop the
+/// socket unread, and with our request still in its receive buffer the
+/// kernel turns that into an RST - which arrives here as ECONNRESET. A
+/// full `cargo test` runs these suites in parallel, each test with a whole
+/// daemon behind it, so `thread::Builder::spawn` really does hit EAGAIN,
+/// and a test then failed on a refusal to serve rather than on anything it
+/// asserts. Once a byte has come back it is an answer, and it is returned
+/// (or fails) exactly as it arrived - a truncated response must never be
+/// retried away.
+fn raw(port: u16, request: &[u8]) -> Vec<u8> {
+    let mut last = String::new();
+    for attempt in 0..5u32 {
+        match raw_once(port, request) {
+            Ok(out) => return out,
+            Err(e) => {
+                last = e.to_string();
+                std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(attempt) + 50));
+            }
+        }
+    }
+    let line = String::from_utf8_lossy(request).lines().next().unwrap_or("").to_string();
+    panic!("daemon on :{port} never answered {line:?}: {last}");
+}
+
+/// One attempt. Returns Err ONLY when the daemon produced nothing at all;
+/// a partial or malformed response is data, and is handed back for the
+/// caller's assertions to judge.
+fn raw_once(port: u16, request: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut s = TcpStream::connect(("127.0.0.1", port))?;
+    s.write_all(request)?;
+    let mut out = Vec::new();
+    // Zero bytes back is a refusal to serve, however the peer
+    // phrased it: an RST (Err) when our request was never read off
+    // the receive buffer, a plain FIN (Ok) when it was read and then
+    // dropped unanswered. Neither carries anything to judge, so both
+    // are retried. The moment ANY byte arrives it is an answer and is
+    // returned exactly as it came - errors included - because a
+    // truncated body must never be retried away.
+    let read = s.read_to_end(&mut out);
+    if out.is_empty() {
+        return Err(read.err().unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "closed without answering",
+            )
+        }));
+    }
+    Ok(out)
+}
+
+/// One-file multipart body for wall_art uploads.
+fn multipart(boundary: &str, fname: &str, bytes: &[u8]) -> Vec<u8> {
+    let mut mp = Vec::new();
+    mp.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
+             filename=\"{fname}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    mp.extend_from_slice(bytes);
+    mp.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    mp
+}
+
+struct KillOnDrop(Child);
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        // ...and reap it. kill() alone leaves a zombie holding its pid for
+        // the rest of the binary's run.
+        let _ = self.0.wait();
+    }
+}
+
+/// A daemon under test: killed and reaped on drop.
+struct Daemon {
+    _child: KillOnDrop,
+    port: u16,
+}
+
+/// Launch a daemon under `dir` and return once OUR daemon is serving.
+///
+/// `build` is handed the port to serve on and returns the fully
+/// configured command; it may be called again on a fresh port, so it must
+/// not consume anything.
+async fn serve(dir: &Path, build: impl Fn(u16) -> Command) -> Daemon {
+    for attempt in 0..3 {
+        let port = free_port();
+        let logfile = dir.join(format!("daemon-{port}.log"));
+        let out = std::fs::File::create(&logfile).unwrap();
+        let err = out.try_clone().unwrap();
+        let mut cmd = build(port);
+        cmd.stdout(Stdio::from(out)).stderr(Stdio::from(err));
+        let child = KillOnDrop(cmd.spawn().unwrap());
+        let log = logfile.clone();
+        // The readiness wait blocks; keep it off the runtime's workers.
+        let (child, ready) = tokio::task::spawn_blocking(move || {
+            let mut child = child;
+            let ready = wait_ready(&mut child, port, &log);
+            (child, ready)
+        })
+        .await
+        .unwrap();
+        if ready {
+            return Daemon { _child: child, port };
+        }
+        // The daemon exited instead of binding: `free_port()` handed :port
+        // to a parallel test between our bind(:0) and the daemon's bind,
+        // and that test's daemon won it. Try a fresh port.
+        let tail = std::fs::read_to_string(&logfile).unwrap_or_default();
+        assert!(attempt < 2, "daemon exited without binding :{port}\n--- log ---\n{tail}");
+    }
+    unreachable!()
+}
+
+/// Wait for OUR daemon's own listener banner, not for "something answers
+/// on :port". A bare connect cannot tell the two apart, and under a full
+/// parallel run they diverge: `free_port()` can hand :port to a second
+/// test between our bind(:0) and our daemon's bind, that test's daemon
+/// wins the port, ours exits, and a plain connect then succeeds against
+/// the OTHER daemon. The test would run against a stranger and, when that
+/// stranger's owner finished and killed it, fail mid-request with
+/// ConnectionReset. The banner is read from this daemon's own log, so it
+/// can only be ours, and it is printed immediately after the bind returns.
+///
+/// False means the child exited first (the port race above); a genuine
+/// hang panics with the log.
+fn wait_ready(child: &mut KillOnDrop, port: u16, logfile: &Path) -> bool {
+    let banner = format!("open the dashboard at  http://localhost:{port}/");
+    for _ in 0..600 {
+        if std::fs::read_to_string(logfile).unwrap_or_default().contains(&banner)
+            && TcpStream::connect(("127.0.0.1", port)).is_ok()
+        {
+            return true;
+        }
+        if child.0.try_wait().ok().flatten().is_some() {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let tail = std::fs::read_to_string(logfile).unwrap_or_default();
+    panic!("daemon never came up on :{port}\n--- log ---\n{tail}");
+}
+
+fn over(number: u64, subject: &str, msgid: &str, bytes: u64) -> OverEntry {
+    OverEntry {
+        number,
+        subject: subject.into(),
+        from: "poster@x".into(),
+        message_id: msgid.into(),
+        bytes,
+        date: 0,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wall_groups_dedupes_and_serves() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-wall-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let db = dir.join("index.db");
+    {
+        let mut ix = nzbkit::index::Index::open(&db).unwrap();
+        ix.ingest(
+            "alt.binaries.teevee",
+            &[
+                // Two encodes of ONE movie → one card, two releases.
+                over(1, "\"The.Matrix.1999.2160p.BluRay.REMUX-GRP.rar\" yEnc (1/1)", "<m1@x>", 5000),
+                over(2, "\"The.Matrix.1999.1080p.WEB.x264-OTHER.rar\" yEnc (1/1)", "<m2@x>", 2000),
+                // Two episodes + a season pack of ONE show → one TV card.
+                over(3, "\"Severance.S01E01.1080p.WEB-DL-NTb.rar\" yEnc (1/1)", "<t1@x>", 1000),
+                over(4, "\"Severance.S02E03.2160p.WEB-DL-NTb.rar\" yEnc (1/1)", "<t2@x>", 1200),
+                over(5, "\"Severance.S01.2160p.ATVP.WEB-DL-Cas.rar\" yEnc (1/1)", "<t3@x>", 8000),
+                // Obfuscated → hidden unless all=1.
+                over(6, "\"2137d880a074fa4075a65ce4e21d2f95.rar\" yEnc (1/1)", "<o1@x>", 999),
+                // Software → kind=software, hidden unless all=1.
+                over(7, "\"CCleaner.Professional.Plus.v6.36.11041.x64.Setup.rar\" yEnc (1/1)", "<s1@x>", 500),
+                // ROT13-obfuscated ("The.Wire.3x07.720p.HDTV.x264-BATV"
+                // letter-rotated) → rescued onto the wall decoded.
+                over(8, "\"Gur.Jver.3k07.720c.UQGI.k264-ONGI.rar\" yEnc (1/1)", "<r1@x>", 800),
+            ],
+            1_700_000_000,
+        )
+        .unwrap();
+    }
+
+    let cfg = dir.join("config.json");
+    std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
+        .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        // The daemon mints an API key on a genuinely first run (see
+        // serve::first_run_apikey). These suites drive it keyless on purpose,
+        // so they take the same deliberate opt-out an operator would.
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            // Loopback only. These suites never need LAN reach, and binding
+            // 0.0.0.0 makes the macOS firewall raise a prompt for every freshly
+            // built test binary, which is a new path on every run.
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--index-db")
+            .arg(&db);
+        c
+    })
+    .await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        // Cards come from wall2 now (the legacy mode=wall was removed in
+        // 3b). No enrichment in this test, so read unmatched cards
+        // (matched=0). The seed's tiny sizes score as junk, so the curated
+        // view hides them all - the junk gate working - and all=1 reveals
+        // the real grouping.
+        let cards_of = |q: &str| -> Vec<serde_json::Value> {
+            let (code, body) = http_get(port, q);
+            assert_eq!(code, 200, "{body}");
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["cards"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        };
+        let by_title = |cs: &[serde_json::Value], t: &str| -> Option<serde_json::Value> {
+            cs.iter().find(|c| c["title"] == t).cloned()
+        };
+        // Curated (junk-gated) view hides the low-evidence junk posts.
+        let curated = cards_of("/api?mode=wall2&matched=0&apikey=sekrit");
+        assert!(by_title(&curated, "The Matrix").is_none(), "junk-gated: {curated:?}");
+
+        // all=1 reveals the grouped cards. Two Matrix encodes → one movie
+        // card; three Severance postings (2 eps + a season pack) → one TV
+        // card; the ROT13 post is rescued onto the wall decoded.
+        let all = cards_of("/api?mode=wall2&matched=0&all=1&apikey=sekrit");
+        let matrix = by_title(&all, "The Matrix").expect("movie card");
+        assert_eq!(matrix["kind"], "movie");
+        assert_eq!(matrix["year"], 1999);
+        assert_eq!(matrix["n"], 2, "two encodes group onto one card: {all:?}");
+        let sev = by_title(&all, "Severance").expect("tv card");
+        assert_eq!(sev["kind"], "tv");
+        assert_eq!(sev["n"], 3, "episodes+pack under one show: {all:?}");
+        let wire = by_title(&all, "The Wire").expect("rot13 rescue");
+        assert_eq!(wire["kind"], "tv");
+        let sw = by_title(&all, "CCleaner Professional Plus").expect("software card");
+        assert_eq!(sw["kind"], "software");
+
+        // Per-release detail is the card sheet: index_browse by title_key
+        // (key-scoped listings skip the junk gate). Reuse the card keys.
+        let enc = |k: &str| k.replace(':', "%3A").replace(' ', "%20");
+        let sheet = |key: &serde_json::Value| -> Vec<serde_json::Value> {
+            let q = format!(
+                "/api?mode=index_browse&all=1&title_key={}&apikey=sekrit",
+                enc(key.as_str().unwrap())
+            );
+            let (_c, body) = http_get(port, &q);
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["results"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        };
+        let sev_rows = sheet(&sev["key"]);
+        assert_eq!(sev_rows.len(), 3, "three Severance releases: {sev_rows:?}");
+        let mut seasons: Vec<u64> =
+            sev_rows.iter().filter_map(|r| r["season"].as_u64()).filter(|&s| s > 0).collect();
+        seasons.sort_unstable();
+        seasons.dedup();
+        assert_eq!(seasons, vec![1, 2], "two seasons under the card: {sev_rows:?}");
+        // The ROT13 post surfaces under its DECODED quality.
+        let wire_rows = sheet(&wire["key"]);
+        assert_eq!(wire_rows.len(), 1, "{wire_rows:?}");
+        assert_eq!(wire_rows[0]["quality"], "720p HDTV", "{wire_rows:?}");
+
+        // 24C: wall2&key= is a card-scoped fetch - the Releases
+        // surface's hover preview and group-by-title rows pull ONE
+        // title's card (total agrees, no page scan).
+        let (code, body) = http_get(
+            port,
+            &format!(
+                "/api?mode=wall2&matched=0&all=1&key={}&apikey=sekrit",
+                enc(sev["key"].as_str().unwrap())
+            ),
+        );
+        assert_eq!(code, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["total"], 1, "{body}");
+        assert_eq!(v["cards"][0]["title"], "Severance", "{body}");
+        assert_eq!(v["cards"][0]["n"], 3, "{body}");
+        // ...and the new browse sorts parse and page (ordering itself is
+        // unit-tested against distinct values in nzbkit::index).
+        for sort in ["files", "seen", "kind"] {
+            let (code, body) = http_get(
+                port,
+                &format!("/api?mode=index_browse&all=1&sort={sort}&apikey=sekrit"),
+            );
+            assert_eq!(code, 200, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert!(
+                v["results"].as_array().is_some_and(|r| !r.is_empty()),
+                "sort={sort}: {body}"
+            );
+        }
+
+        // M21 custom artwork: upload a poster for The Matrix; it lands
+        // in the art cache, the card links it (cache-busted), and the
+        // row is stamped checked so the enricher leaves it alone.
+        let key = "m%3Athe%20matrix%3A1999";
+        let png = b"\x89PNG\r\n\x1a\nfake-poster-bytes";
+        let (code, body) = http_post(
+            port,
+            &format!("/api?mode=wall_art&key={key}&apikey=sekrit"),
+            "multipart/form-data; boundary=artb",
+            &multipart("artb", "p.png", png),
+        );
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["status"],
+            true,
+            "{body}"
+        );
+        // After the upload the movie card is "matched" (has art), so it
+        // shows in the default matched-only view (all=1 bypasses the
+        // size-junk gate); its poster_full links the cache-busted image.
+        let matched = cards_of("/api?mode=wall2&all=1&apikey=sekrit");
+        let movie = by_title(&matched, "The Matrix").expect("matched movie card");
+        let poster = movie["poster_full"].as_str().unwrap();
+        assert!(poster.starts_with("/art/m_the_matrix_1999.jpg?v="), "{poster}");
+        let (code, art) = http_get(port, "/art/m_the_matrix_1999.jpg");
+        assert_eq!(code, 200);
+        assert!(art.contains("fake-poster-bytes"));
+        // Non-image bytes are refused before touching the cache.
+        let (_, body) = http_post(
+            port,
+            &format!("/api?mode=wall_art&key={key}&apikey=sekrit"),
+            "multipart/form-data; boundary=artb",
+            &multipart("artb", "evil.html", b"<html>not art</html>"),
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["status"], false, "{body}");
+        // Unknown title keys are refused.
+        let (_, body) = http_post(
+            port,
+            "/api?mode=wall_art&key=m%3Anope%3A1900&apikey=sekrit",
+            "multipart/form-data; boundary=artb",
+            &multipart("artb", "p.png", png),
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["status"], false, "{body}");
+
+        // OMDb key: live setting round-trip (masked in get_config as
+        // has_omdb) and signup email validation.
+        let (_, body) =
+            http_get(port, "/api?mode=config&name=omdb_key&value=k123&apikey=sekrit");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!((v["status"].as_bool(), v["live"].as_bool()), (Some(true), Some(true)), "{body}");
+        let (_, body) = http_get(port, "/api?mode=get_config&apikey=sekrit");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["config"]["nzbfast"]["has_omdb"], true, "{body}");
+        assert!(!body.contains("k123"), "omdb key must not leak in get_config");
+        let (_, body) = http_post(
+            port,
+            "/api?mode=omdb_signup&apikey=sekrit",
+            "application/json",
+            br#"{"email":"not-an-email"}"#,
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["status"], false, "bad email must be rejected before any network");
+        // The wall page itself and the player handoff.
+        let (code, html) = http_get(port, "/wall");
+        assert_eq!(code, 200);
+        assert!(html.contains("nzbfast · wall"), "wall html served");
+        // Grouped view, "Added" column: that has to ask the server for
+        // arrival order, not upload order. The two genuinely disagree -
+        // a set that only finishes arriving now can have been posted
+        // hours ago - so mapping it to `latest` silently sorts the
+        // grouped view by something the column does not say.
+        //
+        // Asserted against the served source because the wall's logic is
+        // inline JavaScript and this repo has no JS test runner; the
+        // mapping is the smallest thing that still means the behaviour.
+        // Whitespace-normalized so reformatting cannot fail it.
+        let js: String = html.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            js.contains("seen:'arrived'"),
+            "the grouped view's Added sort must map to the index's arrival order"
+        );
+        // The handoff mints the per-job stream token, so with an apikey
+        // set the keyless form is refused.
+        let (code, _) = http_get(port, "/m3u/SABnzbd_nzo_test");
+        assert_eq!(code, 401, "keyless /m3u must be rejected when an apikey is set");
+        let (code, m3u) = http_get(port, "/m3u/SABnzbd_nzo_test?apikey=sekrit");
+        assert_eq!(code, 200);
+        assert!(m3u.starts_with("#EXTM3U"), "{m3u}");
+        assert!(m3u.contains("/stream/SABnzbd_nzo_test?t="), "{m3u}");
+        // Unknown art 404s (and traversal is refused).
+        assert_eq!(http_get(port, "/art/nope.jpg").0, 404);
+        assert_eq!(http_get(port, "/art/../index.db").0, 404);
+    })
+    .await
+    .unwrap();
+}
+
+/// 24D: the watcher grabs for a user category.
+///
+/// The wiring is the point. The matcher is unit-tested; what can rot
+/// here is the loop classifying candidates with a DIFFERENT rule engine
+/// than ingest used, at which point a custom item matches nothing (or,
+/// worse, a built-in item grabs a release the category claimed). So this
+/// drives the real daemon: two categories and a watchlist entry go in
+/// through the settings API, and the queue is what answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn watchlist_grabs_for_a_user_category() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-wlcat-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let quali = "Formula1.2026.Round11.Hungary.Qualifying.F1TV.WEB-DL.1080p.H265-MWR";
+    let race = "Formula1.2026.Round11.Hungary.Race.F1TV.WEB-DL.1080p.H265-MWR";
+    let matrix = "The.Matrix.1999.1080p.BluRay.x264-GRP";
+    let motogp = "MotoGP.2026.Round05.France.Race.1080p.WEB-DL-GRP";
+
+    let db = dir.join("index.db");
+    {
+        let mut ix = nzbkit::index::Index::open(&db).unwrap();
+        let posts: Vec<OverEntry> = [quali, race, matrix, motogp]
+            .iter()
+            .enumerate()
+            .map(|(i, stem)| {
+                over(
+                    i as u64 + 1,
+                    &format!("\"{stem}.rar\" yEnc (1/1)"),
+                    &format!("<f{i}@x>"),
+                    50 << 20,
+                )
+            })
+            .collect();
+        ix.ingest("alt.binaries.teevee", &posts, 1_700_000_000).unwrap();
+    }
+
+    let cfg = dir.join("config.json");
+    std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
+        .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--index-db")
+            .arg(&db);
+        c
+    })
+    .await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        let set = |name: &str, value: &str| {
+            let q = format!(
+                "/api?mode=config&name={name}&value={}&apikey=sekrit",
+                urlencoding(value)
+            );
+            let (code, body) = http_get(port, &q);
+            assert_eq!(code, 200, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["status"], true, "set {name}: {body}");
+        };
+        // Two categories, so "first match wins" is exercised and MotoGP
+        // is a custom kind the F1 item must still decline.
+        set(
+            "custom_categories",
+            r#"[{"slug":"formula-1","name":"Formula 1","match":"^formula\\.?1\\.","base":"movie"},
+                {"slug":"motogp","name":"MotoGP","match":"^motogp","base":"movie"}]"#,
+        );
+        set(
+            "watchlist",
+            r#"[{"id":1,"kind":"formula-1","title":"Formula1","min_quality":"any",
+                 "target_quality":"1080p","upgrade":true,"enabled":true}]"#,
+        );
+        let (_, body) = http_get(port, "/api?mode=watchlist_check_now&apikey=sekrit");
+        assert!(body.contains("true"), "{body}");
+
+        // A grab enqueues; with a dead server the job may fail through to
+        // history, so both are read. Poll rather than sleep a fixed time.
+        let grabbed = || -> String {
+            let (_, q) = http_get(port, "/api?mode=queue&apikey=sekrit");
+            let (_, h) = http_get(port, "/api?mode=history&apikey=sekrit");
+            format!("{q}{h}")
+        };
+        let mut seen = String::new();
+        for _ in 0..100 {
+            seen = grabbed();
+            if seen.contains("Hungary.Qualifying") && seen.contains("Hungary.Race") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // Both sessions of the round are grabbed: they are separate
+        // slots, keyed on the category identity key. A "movie"-shaped
+        // single slot would have taken one and called the season done.
+        assert!(seen.contains("Hungary.Qualifying"), "qualifying not grabbed: {seen}");
+        assert!(seen.contains("Hungary.Race"), "race not grabbed: {seen}");
+        // And nothing else was: not the film (a built-in kind), and not
+        // the other category's release (right shape, wrong slug).
+        assert!(!seen.contains("The.Matrix"), "a non-matching film was grabbed: {seen}");
+        assert!(!seen.contains("MotoGP"), "another category's release was grabbed: {seen}");
+
+        // ...and the job says where it came from. A watchlist grab
+        // stamped "wall" takes wall-job behaviour with it and answers
+        // "why is this here" with the wrong story - which is not visible
+        // anywhere else, because the grab itself looks identical.
+        let slots = |body: &str, envelope: &str| -> Vec<serde_json::Value> {
+            serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|v| v[envelope]["slots"].as_array().cloned())
+                .unwrap_or_default()
+        };
+        let (_, q) = http_get(port, "/api?mode=queue&apikey=sekrit");
+        let (_, h) = http_get(port, "/api?mode=history&apikey=sekrit");
+        let grabs: Vec<serde_json::Value> =
+            slots(&q, "queue").into_iter().chain(slots(&h, "history")).collect();
+        let f1: Vec<&serde_json::Value> = grabs
+            .iter()
+            .filter(|s| {
+                let name = s["filename"].as_str().or_else(|| s["name"].as_str()).unwrap_or("");
+                name.contains("Hungary")
+            })
+            .collect();
+        assert_eq!(f1.len(), 2, "expected both sessions as jobs: {q}{h}");
+        for slot in f1 {
+            assert_eq!(slot["origin"], "watchlist", "{slot}");
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// The two server contracts an open wall page depends on, probed through
+/// the API rather than through the browser: the arrivals cursor and the
+/// completeness predicate on a card's expanded rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn wall_arrivals_and_expanded_rows_answer_the_page_honestly() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-wallapi-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Arrivals are recent uploads only (a backfilled old post is not an
+    // arrival), so these have to be dated now, not at the epoch.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let db = dir.join("index.db");
+    {
+        let mut ix = nzbkit::index::Index::open(&db).unwrap();
+        let mut post = |n: u64, subject: &str, id: &str| {
+            let mut e = over(n, subject, id, 400 << 20);
+            e.date = now - 3600;
+            e
+        };
+        ix.ingest(
+            "alt.binaries.teevee",
+            &[
+                // One episode whole...
+                post(1, "\"Arrival.Show.S01E01.1080p.WEB-DL-GRP.mkv\" yEnc (1/1)", "<a1@x>"),
+                // ...and one that is still missing a part. Same show, so
+                // both land under one card and one title key.
+                post(2, "\"Arrival.Show.S01E02.1080p.WEB-DL-GRP.mkv\" yEnc (1/2)", "<a2@x>"),
+            ],
+            now,
+        )
+        .unwrap();
+    }
+
+    let cfg = dir.join("config.json");
+    std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
+        .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--index-db")
+            .arg(&db);
+        c
+    })
+    .await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        let json = |q: &str| -> serde_json::Value {
+            let (code, body) = http_get(port, q);
+            assert_eq!(code, 200, "{body}");
+            serde_json::from_str(&body).unwrap_or_else(|e| panic!("{q}: {e}\n{body}"))
+        };
+
+        // 26 Jul finding 28. A wall that opened on an empty index holds
+        // cursor 0, and 0 is a REAL cursor - "I have seen nothing yet" -
+        // not a synonym for "this is my first poll". Conflating the two
+        // is why the first release to arrive on a fresh install was
+        // never announced: every poll after it looked like a first poll.
+        let opened = json("/api?mode=wall_tip&apikey=sekrit");
+        assert_eq!(opened["new"], 0, "a first poll must not cry 'everything is new': {opened}");
+        assert!(opened["latest"].as_i64().unwrap_or(0) > 0, "{opened}");
+        let polled = json("/api?mode=wall_tip&since=0&apikey=sekrit");
+        assert_eq!(
+            polled["new"], 1,
+            "a cursor of zero must be honoured as a cursor, not read as an \
+             uninitialized page: {polled}"
+        );
+        assert!(
+            polled["keys"].as_array().is_some_and(|k| !k.is_empty()),
+            "the arrival's key must come back with the count: {polled}"
+        );
+
+        // 26 Jul finding 18. Expanding a card asks for that title's rows
+        // with the current completeness filter attached; the server has
+        // to apply it to a key-scoped query, or the browser's filter
+        // silently does nothing on exactly the view that shows releases.
+        let cards = json("/api?mode=wall2&matched=0&all=1&apikey=sekrit");
+        let key = cards["cards"]
+            .as_array()
+            .and_then(|cs| cs.iter().find(|c| c["title"] == "Arrival Show"))
+            .map(|c| c["key"].as_str().unwrap_or_default().to_string())
+            .unwrap_or_else(|| panic!("no card for the seeded show: {cards}"));
+        let enc = key.replace(':', "%3A").replace(' ', "%20");
+        let rows = |complete: u8| -> Vec<serde_json::Value> {
+            json(&format!(
+                "/api?mode=index_browse&all=1&title_key={enc}&complete={complete}&apikey=sekrit"
+            ))["results"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert_eq!(rows(0).len(), 2, "unfiltered, the card holds both releases");
+        let only_complete = rows(1);
+        assert_eq!(only_complete.len(), 1, "the filter must reach a key-scoped query");
+        assert_eq!(only_complete[0]["complete"], true, "{only_complete:?}");
+    })
+    .await
+    .unwrap();
+}
+
+/// Grabbing from the wall has to name the job after the release, however
+/// deep in the index the row sits. The name is not cosmetic: it becomes
+/// the output directory, the spool file, the history label and - through
+/// the duplicate key derived from it - the duplicate hold, the
+/// watchlist's "already have it" check and the wall's have-badge. The old
+/// lookup swept the newest rows for the id and called anything it could
+/// not find in that window "release-<id>", which has no duplicate key at
+/// all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_grab_names_the_job_from_the_index_however_deep_the_row_is() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-grabname-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let buried = "Buried.Movie.2011.1080p.BluRay.x264-GRP";
+    let recent = "Recent.Show.S01E02.1080p.WEB-DL-GRP";
+    let db = dir.join("index.db");
+    {
+        let mut ix = nzbkit::index::Index::open(&db).unwrap();
+        // Indexed first, so it sits at the very bottom of a newest-first
+        // sweep...
+        ix.ingest(
+            "alt.binaries.moovee",
+            &[over(1, &format!("\"{buried}.rar\" yEnc (1/1)"), "<b1@x>", 50 << 20)],
+            1_700_000_000,
+        )
+        .unwrap();
+        // ...under more rows than that sweep ever read. Nothing stops an
+        // index growing this far: the byte cap is unlimited by default
+        // and eviction ships switched off.
+        let filler: Vec<OverEntry> = (0..100_001u64)
+            .map(|i| {
+                over(
+                    i + 2,
+                    &format!("\"Filler.Show.S01E{i:06}.1080p.WEB-DL-GRP.rar\" yEnc (1/1)"),
+                    &format!("<f{i}@x>"),
+                    50 << 20,
+                )
+            })
+            .collect();
+        ix.ingest("alt.binaries.teevee", &filler, 1_700_010_000).unwrap();
+        ix.ingest(
+            "alt.binaries.teevee",
+            &[over(200_000, &format!("\"{recent}.rar\" yEnc (1/1)"), "<r1@x>", 50 << 20)],
+            1_700_020_000,
+        )
+        .unwrap();
+    }
+
+    let cfg = dir.join("config.json");
+    std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
+        .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--index-db")
+            .arg(&db);
+        c
+    })
+    .await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        let json = |q: &str| -> serde_json::Value {
+            let (code, body) = http_get(port, q);
+            assert_eq!(code, 200, "{body}");
+            serde_json::from_str(&body).unwrap_or_else(|e| panic!("{q}: {e}\n{body}"))
+        };
+        // Ids the way the wall gets them: off a search page.
+        let id_of = |stem: &str| -> i64 {
+            let term = stem.split('.').next().unwrap();
+            let page = json(&format!("/api?mode=index_browse&all=1&q={term}&apikey=sekrit"));
+            page["results"]
+                .as_array()
+                .and_then(|rs| rs.iter().find(|r| r["name"].as_str() == Some(stem)))
+                .and_then(|r| r["id"].as_i64())
+                .unwrap_or_else(|| panic!("{stem} not on the search page: {page}"))
+        };
+        // The grab, then the job it made. A dead server can fail the job
+        // through to history, so both lists are read.
+        let grab = |id: i64| -> serde_json::Value {
+            let r = json(&format!("/api?mode=index_get&id={id}&priority=1&apikey=sekrit"));
+            assert_eq!(r["status"], true, "grab of {id}: {r}");
+            let nzo = r["nzo_ids"][0].as_str().expect("a job id").to_string();
+            for _ in 0..100 {
+                let q = json("/api?mode=queue&apikey=sekrit");
+                let h = json("/api?mode=history&apikey=sekrit");
+                let slots: Vec<serde_json::Value> = q["queue"]["slots"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .chain(h["history"]["slots"].as_array().cloned().unwrap_or_default())
+                    .collect();
+                if let Some(s) = slots.iter().find(|s| s["nzo_id"] == nzo.as_str()) {
+                    return s.clone();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            panic!("job {nzo} never showed up in the queue or history");
+        };
+        let name_of = |slot: &serde_json::Value| -> String {
+            slot["filename"]
+                .as_str()
+                .or_else(|| slot["name"].as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        let deep = grab(id_of(buried));
+        assert_eq!(name_of(&deep), buried, "the buried row's grab lost its name: {deep}");
+        assert_ne!(
+            deep["duplicate_key"], "",
+            "a named job must carry a duplicate key, or the duplicate hold \
+             and the have-badge go quiet for it: {deep}"
+        );
+        // The ordinary case still works.
+        let near = grab(id_of(recent));
+        assert_eq!(name_of(&near), recent, "{near}");
+        assert_ne!(near["duplicate_key"], "", "{near}");
+
+        // And an id with no row behind it is still refused, rather than
+        // enqueuing an empty job called release-999999999.
+        let missing = json("/api?mode=index_get&id=999999999&apikey=sekrit");
+        assert_eq!(missing["status"], false, "{missing}");
+        assert_eq!(missing["error"], "release not found", "{missing}");
+    })
+    .await
+    .unwrap();
+}
+
+/// Percent-encode a settings value for the GET config API.
+fn urlencoding(v: &str) -> String {
+    v.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}

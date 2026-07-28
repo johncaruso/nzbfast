@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- D "refined": the same silhouette drawn with more care. Steeper rake so
+     it reads as motion rather than a static zigzag; the waist is widened to
+     ~150 units (about 2.3 px at 16 px) so the middle never breaks; joins are
+     softened with stroke-linejoin:round on a stroked-and-filled path, which
+     antialiases cleaner than bare points. Optically centred, not
+     box-centred: a bolt's visual mass sits below and left of its bounding
+     box, so it is nudged to compensate. -->
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs><linearGradient id="t" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#5aa8ff"/><stop offset="1" stop-color="#6d47e6"/>
+  </linearGradient></defs>
+  <rect x="60" y="60" width="904" height="904" rx="196" fill="url(#t)"/>
+  <path d="M 700 132 L 356 556 L 540 556 L 404 892 L 764 460 L 566 460 Z"
+        fill="#fff" stroke="#fff" stroke-width="34" stroke-linejoin="round"/>
+</svg>

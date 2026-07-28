@@ -1,0 +1,20 @@
+{
+  "servers": [
+    {
+      "host": "news.example.com",
+      "port": 563,
+      "tls": true,
+      "username": "YOUR_USERNAME",
+      "password": "YOUR_PASSWORD",
+      "connections": 20
+    },
+    {
+      "host": "news.backup-provider.com",
+      "port": 563,
+      "tls": true,
+      "username": "YOUR_USERNAME",
+      "password": "YOUR_PASSWORD",
+      "connections": 10
+    }
+  ]
+}

@@ -1,0 +1,860 @@
+<!doctype html>
+<html lang="sv">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>nzbfast - Användarhandbok</title>
+<!-- Shared design tokens + the pre-paint theme script, substituted by
+     serve.rs from web/ui-tokens.html. This page used to follow the OS
+     light/dark setting only, so an explicit theme choice in Settings
+     did not reach it. -->
+__NZBFAST_UI_TOKENS__
+<style>
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
+.wrap{display:grid;grid-template-columns:250px minmax(0,1fr);max-width:1160px;margin:0 auto;gap:0}
+nav{position:sticky;top:0;align-self:start;height:100vh;overflow-y:auto;
+  padding:28px 18px 40px 22px;border-right:1px solid var(--line);font-size:13px}
+nav .brand{font-size:19px;font-weight:700;margin-bottom:2px}
+nav a.brand{display:block;color:inherit;text-decoration:none}
+nav a.brand:hover{opacity:.72}
+nav .brand small{color:var(--dim);font-weight:400;font-size:12px}
+nav ol{list-style:none;padding:0;margin:14px 0 0}
+nav li{margin:1px 0}
+nav a{display:block;padding:3.5px 8px;border-radius:6px;color:var(--fg)}
+/* the language row is inline: nav a is display:block for the contents list */
+nav .langsw a{display:inline;padding:0;border-radius:0}
+nav a:hover{background:var(--code);text-decoration:none}
+nav .sub{margin-left:12px;color:var(--dim)}
+main{padding:34px 42px 90px;min-width:0}
+h1{font-size:31px;margin:0 0 4px;letter-spacing:-.02em}
+.subtitle{color:var(--dim);margin:0 0 30px;font-size:16px}
+h2{font-size:22px;margin:52px 0 10px;padding-top:18px;border-top:1px solid var(--line);letter-spacing:-.01em}
+h2:first-of-type{border-top:none;margin-top:8px}
+h3{font-size:16.5px;margin:28px 0 6px}
+h4{font-size:14.5px;margin:20px 0 4px}
+p{margin:8px 0}
+li{margin:3px 0}
+code,kbd{background:var(--code);border:1px solid var(--line);border-radius:5px;
+  padding:1px 6px;font:12.5px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+pre{background:var(--code);border:1px solid var(--line);border-radius:9px;
+  padding:12px 15px;overflow-x:auto;font:12.5px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+pre code{background:none;border:none;padding:0}
+table{border-collapse:collapse;width:100%;margin:12px 0;font-size:13.5px}
+th{text-align:left;color:var(--dim);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+th,td{padding:7px 12px 7px 0;border-bottom:1px solid var(--line);vertical-align:top}
+td code{white-space:nowrap}
+.tip,.note,.warn-box{border-left:3px solid var(--acc);background:var(--surface);
+  border-radius:0 9px 9px 0;padding:10px 16px;margin:14px 0;font-size:14px}
+.note{border-left-color:var(--dim)}
+.warn-box{border-left-color:var(--warn)}
+.tip b:first-child,.note b:first-child,.warn-box b:first-child{display:block;font-size:12px;
+  text-transform:uppercase;letter-spacing:.05em;color:var(--dim);margin-bottom:2px}
+.pill{display:inline-block;background:var(--code);border:1px solid var(--line);
+  border-radius:20px;padding:1px 10px;font-size:11.5px;color:var(--dim);vertical-align:1px}
+.pill.live{color:var(--ok)}
+.pill.restart{color:var(--warn)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px 26px}
+hr{border:none;border-top:1px solid var(--line);margin:30px 0}
+.dim{color:var(--dim)}
+@media(max-width:860px){
+  .wrap{grid-template-columns:1fr}
+  nav{position:static;height:auto;border-right:none;border-bottom:1px solid var(--line)}
+  main{padding:24px 20px 60px}
+  .grid2{grid-template-columns:1fr}
+}
+@media print{
+  nav{display:none}
+  .wrap{grid-template-columns:1fr}
+  body{background:#fff;color:#000;font-size:11.5pt}
+  h2{page-break-after:avoid}
+  pre{white-space:pre-wrap}
+  a{color:inherit}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav>
+  <a class="brand" href="/index.html">⚡ nzbfast <small>Användarhandbok</small></a>
+  <!-- i18n switcher: same markup in every language; hrefs never change -->
+  <div class="langsw" style="font-size:11.5px;margin-top:6px;color:var(--dim)"><a href="/manual">EN</a> · <a href="/manual/fr">FR</a> · <a href="/manual/de">DE</a> · <a href="/manual/it">IT</a> · <a href="/manual/es">ES</a> · <a href="/manual/nl">NL</a> · <a href="/manual/pt">PT</a> · <a href="/manual/sv">SV</a> · <a href="/manual/da">DA</a> · <a href="/manual/nb">NB</a> · <a href="/manual/fi">FI</a> · <a href="/manual/tr">TR</a> · <a href="/manual/ro">RO</a> · <a href="/manual/he">HE</a> · <a href="/manual/ar">AR</a> · <a href="/manual/fa">FA</a></div>
+  <ol>
+    <li><a href="#intro">1 · Välkommen</a></li>
+    <li><a href="#quickstart">2 · Snabbstart</a></li>
+    <li><a href="#concepts">3 · Så fungerar nzbfast</a></li>
+    <li><a href="#dashboard">4 · Instrumentpanelen</a></li>
+    <li><a href="#adding">5 · Lägga till nedladdningar</a></li>
+    <li><a href="#wall">6 · Posterväggen</a></li>
+    <li><a href="#preview">7 · Förhandsgranskning &amp; verifiering</a></li>
+    <li><a href="#servers">8 · Usenet-servrar</a></li>
+    <li><a href="#settings">9 · Inställningsreferens</a></li>
+    <li><a href="#automation">10 · Automatisering</a></li>
+    <li><a href="#arr">11 · Sonarr, Radarr &amp; vänner</a></li>
+    <li><a href="#remotes">12 · Telefon &amp; fjärrappar</a></li>
+    <li><a href="#performance">13 · Prestandaverktyg</a></li>
+    <li><a href="#updates">14 · Uppdateringar</a></li>
+    <li><a href="#cli">15 · Kommandoraden</a></li>
+    <li><a href="#api">16 · API-översikt</a></li>
+    <li><a href="#files">17 · Filer &amp; platser</a></li>
+    <li><a href="#troubleshooting">18 · Felsökning</a></li>
+  </ol>
+</nav>
+<main>
+
+<h1>⚡ nzbfast</h1>
+<p class="subtitle">Den snabba Usenet-nedladdaren - användarhandbok</p>
+
+<h2 id="intro">1 · Välkommen</h2>
+<p>nzbfast laddar ner från Usenet så snabbt som din linje, dina providers och din
+maskin tillåter - och oftast betyder det <em>så snabbt som din linje</em>. Det är ett enda
+fristående program: motorn, en webbaserad instrumentpanel, en postervägg för mediabläddring,
+en inbyggd indexerare, förhandsgranskning i realtid, native PAR2-reparation och native RAR-uppackning ligger alla inuti en och samma körbara fil. Det finns inget annat att installera.</p>
+<p>Det som gör den snabb är arkitektur, inte trixande:</p>
+<ul>
+  <li><b>Pipelinead NNTP</b> - många artikelförfrågningar rider på varje anslutning rygg mot rygg,
+  så att varje anslutning hålls i full fart i stället för att vänta ut tur-och-retur-tider.</li>
+  <li><b>En enpassrörledning</b> - nedladdning, verifiering och uppackning överlappar.
+  Arkivvolymer packas upp <em>i strömmen</em>; på ett typiskt store-mode-inlägg rör
+  RAR-filerna aldrig din disk, så jobbet behöver 1× releasens storlek, inte 2×,
+  och blir klart när nedladdningen blir klar.</li>
+  <li><b>Union över flera providers</b> - varje konfigurerad server bidrar; en artikel
+  som saknas på en backbone hämtas från en annan. Långsamma eller döda servrar stoppar
+  aldrig upp kön.</li>
+  <li><b>En minnesbudget</b> - motorn anpassar sig till en begränsad RAM-tilldelning och
+  faller tillbaka på disk vid behov. Den swappar aldrig din maskin.</li>
+</ul>
+<p>Mätt mot fältet på identisk hårdvara, samma jobb och providers har nzbfast
+gjort klart en 190&nbsp;GB nedladdning på omkring 5 minuter på en 10&nbsp;GbE-linje - med de
+ledande alternativen 30–220 % efter på samma tester, där de överhuvudtaget slutförde dem.
+Siffrorna finns i <a href="#concepts">§3</a>.</p>
+
+<h2 id="quickstart">2 · Snabbstart</h2>
+<h3>macOS</h3>
+<ol>
+  <li>Öppna <code>nzbfast-&lt;version&gt;-macos.dmg</code> och dra
+  <b>NzbFast</b> till <b>Program</b> (universell: Apple Silicon + Intel).</li>
+  <li>Första starten: macOS varnar för att nzbfast ännu inte är Apple-notariserad.
+  Högerklicka på appen → <b>Öppna</b> - eller öppna Systeminställningar →
+  <b>Integritet&nbsp;&amp;&nbsp;säkerhet</b>, scrolla ner och klicka
+  <b>Öppna&nbsp;ändå</b>. Detta är ett engångssteg.</li>
+  <li>Appfönstret visar instrumentpanelen med ett välkomstkort - klicka på det och lägg
+  till minst en Usenet-server (host, port 563, användarnamn, lösenord). Du kan lägga
+  till fler senare i Inställningar.</li>
+  <li>Släpp en <code>.nzb</code> var som helst på instrumentpanelen - eller dubbelklicka
+  bara på <code>.nzb</code>-filer i Finder. Nedladdningar hamnar i
+  <code>~/Downloads/nzbfast</code>. Avsluta från menyn; nedladdningar återupptas där
+  de slutade.</li>
+</ol>
+<p class="dim" style="font-size:0.92em">Föredrar du ingen app? Det vanliga zip-arkivet (binär +
+<code>Start nzbfast.command</code>-startare, samma motor) fungerar fortfarande som förr -
+stegen nedan under "Från en terminal".</p>
+<h3>Windows</h3>
+<ol>
+  <li>Kör <code>nzbfast-&lt;version&gt;-windows-x64-setup.exe</code>. Den installerar bara för din
+  användare (inget administratörslösenord). Eftersom den här utgåvan ännu inte är kodsignerad
+  kan SmartScreen visa "Windows skyddade din dator" - klicka <b>Mer information</b> →
+  <b>Kör ändå</b>.</li>
+  <li>nzbfast bor i systemfältet: dubbelklicka på fältikonen (eller använd
+  <b>Öppna instrumentpanelen</b> i dess högerklicksmeny) för att öppna instrumentpanelen, och lägg
+  sedan till din Usenet-server från välkomstkortet. Fältmenyn har också Pausa/Återuppta,
+  din nedladdningsmapp och Avsluta.</li>
+  <li>Att dubbelklicka på en <code>.nzb</code>-fil lägger den i kön. Windows Defender kan
+  fråga en gång om att tillåta lokal nätverkslyssning - tillåt det.</li>
+</ol>
+<p>Föredrar du en portabel kopia? <code>-windows-x64.zip</code> fungerar fortfarande: packa upp
+var som helst och dubbelklicka på <code>nzbfast.exe</code> (eller <code>Start nzbfast.bat</code>)
+för terminalguiden.</p>
+<h3>Från en terminal (valfri plattform)</h3>
+<pre><code>nzbfast setup            # interactive server setup (writes config.local.json)
+nzbfast serve --open     # start the daemon and open the dashboard</code></pre>
+<div class="tip"><b>Tips</b>Kör du redan SABnzbd eller NZBGet? Slipp skriva in inloggningsuppgifter:
+Inställningar → Usenet-servrar → <b>Importera från SABnzbd / NZBGet…</b> hittar din befintliga
+installation och kopierar över dess servrar. Det finns också <code>nzbfast import-sab</code>
+på kommandoraden.</div>
+
+<h3 id="firstrun-key">Din API-nyckel</h3>
+<p>Vid en verkligt ny installation skapar nzbfast en API-nyckel åt sig själv första
+gången daemonen startar, och skriver ut den en gång i en banner precis under
+instrumentpanelens adress. Från och med då kräver varje förfrågan den nyckeln, så att
+instrumentpanelen och API:et inte står öppna för allt som kan nå maskinen.</p>
+<p>Vad du gör med den beror på hur du startade nzbfast:</p>
+<ul>
+  <li><b>macOS-appen, Windows-fältikonen eller <code>serve --open</code></b>: ingenting.
+  De skickar nyckeln till webbläsarfönstret de öppnar, instrumentpanelen kommer ihåg
+  den, och du är redan inloggad.</li>
+  <li><b>En webbläsare du öppnat själv</b>, eller instrumentpanelen på en telefon eller
+  en annan dator: sidan frågar efter nyckeln en gång och kommer ihåg den efter det.</li>
+  <li><b>Sonarr, Radarr, nzb360 med flera</b>: klistra in den som deras SABnzbd- eller
+  NZBGet-nyckel (<a href="#arr">§11</a>, <a href="#remotes">§12</a>).</li>
+</ul>
+<p>Nyckeln sparas i en fil som heter <code>apikey</code> bredvid din konfigurationsfil,
+så den är densamma efter omstarter och du kan läsa tillbaka den när du behöver.
+På macOS och Linux är den filen läsbar endast för kontot som kör nzbfast. Den finns
+också i daemonens egen utskrift, så instrumentpanelens Logg-kort har den om
+terminalen redan rullat förbi.</p>
+<div class="note"><b>Uppgradering ändrar ingenting.</b>En installation som redan
+finns lämnas exakt som den var, med eller utan nyckel. En nyckel skapas bara vid en
+första körning - en utan inställningar på instrumentpanelen och utan sparad kö -
+eftersom en nyckel som dök upp under en fungerande installation skulle stänga ute
+varje Sonarr, Radarr och telefonapp du redan kopplat in, vid en omstart som du aldrig
+kopplade ihop med en ändrad inställning.</div>
+<p>Vill du använda en egen nyckel i stället skriver du in den under Inställningar →
+Säkerhet; den gäller direkt. Den panelen ändrar nyckeln men visar aldrig den
+nuvarande, så läs filen <code>apikey</code> om du behöver få tillbaka det genererade
+värdet. Vill du köra helt utan nyckel, för att något framför nzbfast redan sköter
+inloggningen, startar du den med <code>NZBFAST_OPEN=1</code> i miljön. nzbfast förblir
+då öppen och säger det rakt ut vid start.</p>
+<p>Vilka maskiner som över huvud taget kan nå daemonen är ett separat val:
+<code>serve --bind</code>. Standard är <code>0.0.0.0</code>, alltså varje
+nätverksgränssnitt, eftersom en NAS-låda, en telefon och en Sonarr på en annan dator
+alla måste kunna ansluta. <code>--bind 127.0.0.1</code> smalnar av det till maskinen
+som nzbfast kör på, vilket är vad du vill ha på ett enskilt skrivbord där inget annat
+behöver åtkomst.</p>
+
+<h2 id="concepts">3 · Så fungerar nzbfast</h2>
+<p>En snabb ordlista så att resten av handboken blir lätt att läsa:</p>
+<table>
+<tr><th>Term</th><th>Betydelse</th></tr>
+<tr><td><b>Provider / server</b></td><td>En Usenet-tjänst du har ett konto hos
+(Newshosting, Eweka, XS News…). Var och en tillåter ett visst antal samtidiga anslutningar.</td></tr>
+<tr><td><b>Backbone</b></td><td>Infrastrukturen bakom en provider. Flera varumärken
+återförsäljer ofta samma backbone - bra att veta, eftersom två providers på en backbone
+saknar <em>samma</em> artiklar. Se <a href="#performance">Serverdiversitet</a>.</td></tr>
+<tr><td><b>NZB</b></td><td>En liten XML-fil som listar artiklarna som utgör ett inlägg.
+Det är detta du matar nzbfast med.</td></tr>
+<tr><td><b>PAR2</b></td><td>Återställningsdata som postas vid sidan av en release. nzbfast verifierar
+mot den <em>under</em> nedladdningen och reparerar automatiskt när artiklar är
+skadade eller saknas.</td></tr>
+<tr><td><b>Store-mode-RAR</b></td><td>De flesta releaser packas i RAR-volymer utan
+komprimering. nzbfast känner igen detta och skriver <em>innerfilen</em> direkt till dess
+slutliga plats under nedladdningen - inget uppackningssteg efteråt.</td></tr>
+</table>
+<p>Rörledningen kör nedladdning → avkodning → verifiering → uppackning <em>samtidigt</em>.
+Pipeline-kortet på instrumentpanelen visar alla tre banor röra sig på en gång. När den sista
+byten anländer är verifieringen redan klar och filen redan uppackad; ett
+typiskt jobbs "efterbehandlingstid" är noll. Om reparation behövs materialiseras först då
+volymer till disk, repareras på plats av den native GF(2¹⁶)-motorn
+(omdöpt eller byteförskjuten obfuskerad data hittas och adopteras av en glidande
+blockskanning) och packas upp på nytt - allt automatiskt.</p>
+<p>Avbrutna nedladdningar (krasch, strömavbrott, <kbd>kill&nbsp;-9</kbd>) återupptas från
+<b>artikeljournalen</b>: byte som redan finns på disken hämtas aldrig två gånger. Journalen
+registrerar var varje artikels byte fysiskt landade - även byte som blev
+direktuppackade till slutfilen - så en återupptagning bygger om från lokal disk och
+verifierar allt den återställde mot PAR2-blockkartan innan den litar på det.</p>
+<h3>Hur det står sig i jämförelse</h3>
+<p>Mätt mot SABnzbd 5.0.4 och NZBGet 26.2 på samma maskin, samma
+providers och samma NZB:er, tidsatt till en <em>användbar fil</em> - nedladdning, verifiering,
+reparation och uppackning inräknade, för det är då jobbet faktiskt är klart:</p>
+<table>
+<tr><th>Jobbstorlek</th><th>nzbfast</th><th>NZBGet 26.2</th><th>SABnzbd 5.0.4</th></tr>
+<tr><td>7 GB</td><td><b>13.7 s</b></td><td>+26%</td><td>+39%</td></tr>
+<tr><td>35 GB</td><td><b>67 s</b></td><td>+61%</td><td>+325%</td></tr>
+<tr><td>87 GB</td><td><b>272 s</b></td><td>+36%</td><td>+160%</td></tr>
+<tr><td>190 GB</td><td><b>9 m 00 s</b></td><td>+30%</td><td>+111%</td></tr>
+</table>
+<p>Glappet är efterbehandlingen som de andra fortfarande måste göra efter att den sista byten
+landat. Båda konkurrenterna trimmades inför jämförelsen, inte lämnade på standardvärden -
+SABnzbd i synnerhet levereras med request-pipelining <em>av</em>, vilket kostar den
+dyrt, så den slogs på.</p>
+<p>Två skillnader betyder lika mycket som tiderna:</p>
+<ul>
+<li><b>Diskutrymme.</b> Ett pass behöver <b>1× releasens storlek</b>; klienter som skriver
+arkivvolymer och sedan packar upp dem behöver <b>2×</b>. På en testmaskin med 97 GB
+ledigt blev ett 87 GB-jobb klart här på 3 m 08 s och de andra två <em>kunde inte köra alls</em>.</li>
+<li><b>Minne.</b> På 190 GB-jobbet var toppanvändningen 3.9 GB mot SABnzbds 9.3 GB
+- och nzbfast klarar samma jobb i ungefär 1 GB om man säger till den (se
+<a href="#memory">Minnesbudget</a>).</li>
+</ul>
+<div class="note"><b>Kraschåterupptagning, uppmätt</b>Döda en nedladdning mitt i
+(<kbd>kill&nbsp;-9</kbd> vid 15 GB av ett 34.5 GB-jobb) och återupptagningen hämtar om
+<b>~0.3 GB</b> - bara artiklarna som faktiskt var i luften vid dödandet - mot
+NZBGets 0.2 GB i samma test. Detta brukade vara en förlust vi publicerade (15.3 GB
+hämtat om, när journalen inte kunde redogöra för direktuppackade byte);
+placeringsjournalen fixade det: återupptagningen återställer de bytena från de lokala utfilerna
+och verifierar varje återställd byte mot PAR2-blockkartan innan den
+litar på den. Varje scenario vi förlorar publiceras vid sidan av vinsterna, med hela
+metoden och råa siffror.</div>
+
+<h2 id="dashboard">4 · Instrumentpanelen</h2>
+<p>Öppna <code>http://localhost:6789</code> (eller din maskins adress från en annan
+enhet - telefonlayouten anpassar sig automatiskt). Allt uppdateras live, en gång i
+sekunden. Korten, uppifrån och ner:</p>
+<h3>Rubrikrad</h3>
+<ul>
+<li><b>Hastighetsgräns</b>-meny - fasta tak, <i>auto · ge plats åt LAN</i> (ett RTT-styrt
+läge som backar när någon annan i huset behöver linjen) eller obegränsat.</li>
+<li><b>Pausa i…</b> - pausa allt i 15&nbsp;min/30&nbsp;min/1&nbsp;h/3&nbsp;h med
+automatisk återupptagning, eller använd Pausa-knappen för en öppen paus. Paus är
+omedelbar: den aktiva överföringen stoppar inom sekunder och återupptas senare från
+journalen utan att förlora något. (Jobb med Tvinga-prioritet fortsätter ladda ner, SABnzbd-stil.)</li>
+<li>En <b>uppdateringsbanner</b> dyker upp här när en ny version är tillgänglig
+(se <a href="#updates">Uppdateringar</a>).</li>
+</ul>
+<h3>Hastighet</h3>
+<p>Live MB/s med ett rullande diagram; de streckade vattenmärkena markerar sessionens
+högsta/lägsta, den svaga linjen är ett glidande medelvärde. Under det visar ett histogram hur
+sessionens hastighetsmätningar fördelar sig - typiskt vs topp. Bredda fönstret så visar
+diagrammen mer historik (upp till en timme).</p>
+<h3>Statistikrutor</h3>
+<p>Nedladdat denna session, ködjup, antal klara/misslyckade, sessionens toppfart.</p>
+<h3 id="dash-resources">Resurser - en maskin, fyra tak</h3>
+<p>CPU, RAM (mot nzbfasts minnesbudget), diskskrivhastighet och nätverk på ett
+normaliserat diagram, med verkliga värden i teckenförklaringen och en varning för lite disk. Ingen annan
+NZB-klient visar dig detta; det finns för att bevisa en poäng - nzbfast maxar din
+<em>linje</em>, inte din maskin.</p>
+<h3 id="dash-pipeline">Pipeline - stegen överlappar</h3>
+<p>Tre banor: nedladdning, verifiering (PAR2-block kontrollerade), uppackning. På ett friskt jobb
+rör sig alla tre tillsammans.</p>
+<h3 id="dash-providers">Providers</h3>
+<p>Live-hastighet per server, anslutningsutnyttjande, andel av trafiken, sessionens GB och en
+livstidspoäng för artikelkomplettering (färgad när en server faller under 98 %). Ett staplat
+areadiagram visar varje providers bidrag över tid. Rader ordnas om efter live-
+prestanda var 10:e&nbsp;s (konfigurerbart i Inställningar → Gränssnitt) så att din snabbaste
+provider alltid ligger överst.</p>
+<h3 id="dash-queue">Kö</h3>
+<ul>
+<li><b>Dra rader för att ändra ordning</b> (inom ett prioritetsband - Tvinga/Hög körs ändå först);
+ändra prioritet direkt i raden.</li>
+<li><b>Klicka på en rad</b> för detaljlådan: förloppsstaplar per fil, verifieringsblockantal
+och vilken server som bidrog med hur mycket till <em>detta</em> jobb.</li>
+<li>Märken visar specialtillstånd: <i>uppskjuten (långsam)</i>, <i>prefetchar</i>,
+<i>pausad</i> (se <a href="#performance">Prestandaverktyg</a>).</li>
+<li>Ett nedräkningsdiagram spårar totalt GB kvar i hela kön.</li>
+</ul>
+<h3 id="dash-browse">Bläddra i indexet</h3>
+<p>Sök i allt den inbyggda indexeraren katalogiserat från dina bevakade grupper
+(se <a href="#automation">Automatisering</a>) och ladda ner med ett klick - ingen extern
+indexerare behövs. Statusraden visar skanningsförloppet; <b>Skanna nu</b> tvingar fram ett pass.</p>
+<h3>Bevakningslista</h3>
+<p>Lägg till titlar efter namn - inklusive sådana som inte postats än. När en matchande release
+dyker upp i indexet hämtas den automatiskt, med kvalitetspreferenser och
+uppgraderingsregler (en bättre kopia ersätter en sämre).</p>
+<h3 id="dash-history">Historik</h3>
+<p>Senaste nedladdningarna, en rad var. Misslyckade jobb erbjuder <b>Försök igen</b>
+(återupptar från journalen). Krypterade arkiv visar en 🔑 upplåsningskontroll - ange
+lösenordet så blir jobbet klart på plats. Verifieringshälsoremsan diagramlägger dåliga PAR2-
+block per nedladdning - en stigande svans betyder att artiklar kommer in skadade.</p>
+<p>Kortet listar tio nedladdningar som standard och resten är ett klick bort, på knappen ▤. Status, plats och orsaken till ett misslyckande ligger bakom ett klick på själva raden, så att det vanliga fallet - vad som blev klart, hur stort, när - förblir läsbart utan att scrolla. Dra i kortets nederkant för att låta listan scrolla på en höjd du väljer i stället. <b>History rows</b> under Inställningar → Gränssnitt ändrar tian; eftersom det är en egenskap hos daemonen och inte hos din webbläsare gäller det varje enhet som tittar på den här installationen. <b>Colour History names</b> bredvid färgar klara namn gröna och misslyckade röda; avstängt blir namnen neutrala, och den färgade pricken och radens egna detaljer säger fortfarande vilket som är vilket.</p>
+<h3 id="dash-usage">Dataförbrukning</h3>
+<p>Dagliga staplar per provider och Idag / 7-dagars / 30-dagars totaler - nödvändigt för mätade
+konton och blockkonton. Blockkonton visar livstidsförbrukning mot sin storlek.</p>
+<h3>Logg, Systembenchmark, Anslutningstrimning, Serverdiversitet</h3>
+<p>En loggvisare på sidan, och de tre självmätande verktygen som beskrivs i
+<a href="#performance">Prestandaverktyg</a>.</p>
+
+<h2 id="adding">5 · Lägga till nedladdningar</h2>
+<table>
+<tr><th>Metod</th><th>Så här</th></tr>
+<tr><td><b>Dra &amp; släpp</b></td><td>Släpp en eller flera <code>.nzb</code>-filer var som helst på instrumentpanelen.</td></tr>
+<tr><td><b>Bevakningsmapp</b></td><td>Ange en mapp i Inställningar; varje <code>.nzb</code> som sparas i den
+plockas upp inom 5 sekunder och filen tas bort. Rikta din webbläsares nedladdnings-
+mapp mot den för grabbar med ett klick från indexersidor.</td></tr>
+<tr><td><b>Från en URL</b></td><td>Klistra in en NZB-länk (API <code>mode=addurl</code>, eller via valfri ansluten app).</td></tr>
+<tr><td><b>Bläddra i indexet</b></td><td>Klicka på valfri komplett release i Bläddra-kortet.</td></tr>
+<tr><td><b>Bevakningslista / RSS</b></td><td>Automatiskt - se <a href="#automation">Automatisering</a>.</td></tr>
+<tr><td><b>Sonarr/Radarr m.fl.</b></td><td>De skickar grabbar rakt till kön - se <a href="#arr">§11</a>.</td></tr>
+<tr><td><b>Kommandoraden</b></td><td><code>nzbfast get file.nzb</code> laddar ner utan daemonen.</td></tr>
+</table>
+<h3>Kategorier, prioriteter, lösenord</h3>
+<ul>
+<li><b>Kategorier</b> är fritt formulerade etiketter; var och en blir en undermapp i din nedladdnings-
+mapp, och Smarta mappar (se <a href="#automation">§10</a>) kan tilldela dem per regel.</li>
+<li><b>Prioriteter</b>: Tvinga &gt; Hög &gt; Normal &gt; Låg. Tvinga kringgår paus och kvot.</li>
+<li><b>Lösenord</b> för krypterade arkiv plockas upp automatiskt från
+<code>&lt;meta type="password"&gt;</code> inuti NZB:en eller ett
+<code>Name{{password}}.nzb</code>-filnamn, och kan anges per jobb via
+API:et eller efteråt från Historik (🔑).</li>
+</ul>
+
+<h2 id="wall">6 · Posterväggen</h2>
+<p>Klicka på <b>🎬 vägg</b> i rubriken. Väggen förvandlar ditt index till en media-
+bläddrare: varje igenkänd film- och TV-release som en posterruta med betyg, år,
+genrer, skådespelare och synopsis - dina newsgroups, bläddringsbara som en katalog.</p>
+<ul>
+<li><b>Flikar</b> för Filmer / Serier / Övrigt, direktsökning och sju sorteringar:
+<b>För dig</b>, Nyaste posterna, Utgivningsår, Högst betyg, Titel A–Ö, Största och
+Mest postade.</li>
+<li><b>Endast matchade</b> är på som standard och döljer oidentifierat skräp; ett "+N omatchade"-
+märke visar det.</li>
+<li>Klicka på en ruta för detaljbladet: synopsis, IMDb-betyg och röster, skådespelare -
+och <b>▶ Spela</b> (förhandsgranska den direkt, se <a href="#preview">§7</a>) eller
+<b>⬇ Ladda ner</b>.</li>
+<li><b>✎ Korrigera matchning</b> - om en titel matchade fel serie eller film, välj rätt
+en från kandidatposters, eller mata in titel/år/typ manuellt. Manuell text
+skrivs aldrig över av berikaren. <b>↻ Uppdatera metadata</b> hämtar om en titel;
+Inställningar → Indexering kan uppdatera alla eller radera/bygga om hela indexet.</li>
+<li>Metadata är <b>nyckellös som standard</b> - TVmaze, iTunes, IMDb-dataset, Wikidata,
+Wikipedia och AniList kräver inga konton. En OMDb-nyckel (gratis, registrering med bara e-post -
+det finns en registreringshjälp i Inställningar → Indexering) förbättrar filmmatchning; en TMDB-nyckel
+respekteras om du redan har en.</li>
+<li><b>För dig</b> rangordnar väggen efter en smakprofil som byggs på den här datorn
+utifrån din egen färdiga historik och din bevakningslista: favoritgenrer, om du lutar
+åt film eller serier, och ungefär vilken epok. Titlar du redan har sjunker till botten
+i stället för att försvinna, och en bildtext ”Eftersom du tittar på …” säger vad den
+tog fasta på. Utan historik faller den tillbaka på Mest postade, så fliken är aldrig
+tom. Inget av detta lämnar daemonen.</li>
+<li><b>Inte intresserad</b> på en bricka döljer den titeln, och att dölja några
+liknande lär väggen något: den föreslår ett filter du godtar med ett klick (”Dölj alla
+Reality-titlar från och med nu?”). Allt du dolt, och varje inlärt filter, finns under
+<b>Dolda &amp; filter</b> och kan ångras där.</li>
+<li>En liten <b>tillgänglighetsprick</b> på en bricka är oraklets utlåtande
+(<a href="#performance">§13</a>): ett gult ”?” betyder osäkert hos dina leverantörer,
+rött att delarna gång på gång saknas. Hela grupper som just rensas får en
+<b>rensad</b>-markering.</li>
+</ul>
+
+<h2 id="preview">7 · Förhandsgranskning &amp; verifiering</h2>
+<p>Du behöver inte vänta på att en nedladdning blir klar för att veta att det är rätt fil.
+Öppna den medan den laddas ner, kontrollera att innehåll, språk och kvalitet är vad du
+väntade dig, och avbryt tidigt om de inte är det - i stället för att upptäcka det efter
+hela nedladdningen.</p>
+<ul>
+<li><b>▶ Spela</b> på väggen (eller <code>/m3u/&lt;id&gt;</code>) ger din mediespelare
+en URL; daemonen startar eller återanvänder nedladdningen bakom den.</li>
+<li>Slutpunkten <code>/stream/&lt;nzo_id&gt;</code> serverar filen med fullt HTTP-
+range-stöd <em>medan den laddas ner</em>. <b>Att kontrollera valfri punkt fungerar</b>: stickprovskolla minut 40 så
+flyttas artiklarna för det området fram i nedladdningskön -
+den öppnas där typiskt på ett par sekunder i stället för minuter. Filens huvud och
+svans hämtas först så att spelare hittar sin indexdata direkt.</li>
+<li><b>Biblioteksläge</b>: kategorier som listas i <i>library_cats</i> blir direkta
+poster med enbart metadata - en <code>.strm</code>-fil dyker upp direkt, tillgängligheten
+verifieras i bakgrunden och den riktiga nedladdningen startar när du öppnar den första gången.</li>
+</ul>
+<div class="note"><b>Spelarnotis</b>VLC, IINA, mpv och Infuse öppnar alla
+<code>/stream</code>-URL:er. För att kontrollera från en annan maskin, använd din maskins LAN-adress i
+stället för <code>localhost</code>.</div>
+<div class="note"><b>Autentiseringsnotis</b>Med en API-nyckel satt kräver öppning av en parkerad biblioteks-
+post över <code>/stream/&lt;id&gt;</code> en token per jobb
+(<code>?t=…</code>) - spelare kan inte skicka API-nycklar, så <code>/m3u</code>-överlämningen
+och <code>.strm</code>-pekaren bäddar in den åt dig; att skapa den (<code>/m3u</code>)
+kräver nyckeln. Rå byte-servering av en redan aktiv nedladdning förblir öppen, och
+nyckellösa installationer beter sig som förr.</div>
+
+<h2 id="servers">8 · Usenet-servrar</h2>
+<p>Inställningar → <b>Usenet-servrar</b> är den fullständiga redigeraren: lägga till, redigera, ta bort, ordna om och
+ta in eller ur poolen vilken server som helst. Varje server har:</p>
+<table>
+<tr><th>Fält</th><th>Anmärkningar</th></tr>
+<tr><td>Host / port</td><td>Använd SSL-port <b>563</b>. TLS kostar inget mätbart - nzbfast krypterar alltid.</td></tr>
+<tr><td>Användarnamn / lösenord</td><td>Lagras lokalt i <code>config.local.json</code>, visas aldrig tillbaka till webbläsaren. Att lämna lösenordet tomt vid redigering behåller det sparade.</td></tr>
+<tr><td>Anslutningar</td><td>Samtidiga anslutningar per server. Använd <b>Anslutningstrimning</b> (<a href="#performance">§13</a>) för att hitta varje providers optimala punkt i stället för att gissa högt.</td></tr>
+<tr><td>Nivå (tier)</td><td>0 = primär; högre nivåer är fyllnadsservrar, som bara tillfrågas om artiklar varje lägre nivå missat. Sätt obegränsade konton på 0, blockkonton på 1+.</td></tr>
+<tr><td>Blockstorlek (GB)</td><td>För block-konton (betala per GB): nzbfast spårar livstidsförbrukning mot detta och slutar använda servern när den är slut (varning vid 85 %).</td></tr>
+</table>
+<p>Två ytterligare alternativ per server har ännu ingen kontroll i panelen: lägg in
+dem för hand i serverns post i <code>config.local.json</code>
+(se <a href="#files">§17</a>) och starta om.</p>
+<table>
+<tr><th>Nyckel</th><th>Noteringar</th></tr>
+<tr><td><code>bind_ip</code></td><td>Binder den här serverns utgående anslutningar till en bestämd lokal adress, för maskiner med flera utgångar och delade VPN-tunnlar. Adressfamiljen väljer också målfamiljen: en v4-bindning ansluter till serverns v4-adress.</td></tr>
+<tr><td><code>socks5</code></td><td>Skickar den här serverns NNTP-trafik genom en SOCKS5-proxy: <code>host:port</code>, eller <code>user:pass@host:port</code>. Värdnamnet slås upp <em>av proxyn</em>, så det blir ingen lokal DNS-läcka.</td></tr>
+</table>
+<ul>
+<li><b>Bocken</b> bredvid varje server är dess på/av-reglage: ibockad betyder att
+servern är med i nedladdningspoolen, urbockad betyder inaktiverad. En inaktiverad server
+behåller sina inloggningsuppgifter och inställningar och går fortfarande att testa; den
+blir bara aldrig tillfrågad om artiklar. Raden tonas ned, räknaren i rubriken
+(2 av 3 aktiva) sjunker och ändringen gäller från <em>nästa</em> nedladdning. Bra för att
+spara på ett blockkonto, eller för att bevisa att en leverantör ligger bakom ett problem
+utan att ta bort den.</li>
+<li><b>Testa</b> gör en riktig anslutning + TLS + inloggning och rapporterar tur-och-retur-tiden.</li>
+<li><b>Importera från SABnzbd / NZBGet…</b> skannar de vanliga installationsplatserna, visar vad
+den hittade och kopierar in servrar (hoppar över dubbletter).</li>
+<li>Serverändringar gäller från <em>nästa</em> nedladdning - ingen omstart.</li>
+</ul>
+<div class="tip"><b>Rekommendation</b>Två providers på <em>olika</em> backbones
+slår tre på samma. Kör <b>Serverdiversitet</b> (<a href="#performance">§13</a>)
+för att se vilka av dina providers som faktiskt breddar din täckning och vilka som är
+redundanta kopior av varandra.</div>
+
+<h2 id="settings">9 · Inställningsreferens</h2>
+<p>Nästan allt går att ställa in från panelen, under ⚙ Inställningar; de fyra
+undantagen listas i slutet av det här avsnittet. Värden märkta
+<span class="pill live">live</span> gäller direkt,
+<span class="pill restart">restart</span>-värden vid nästa start. Varje ändring som
+görs här sparas i <code>settings.json</code> och överlever omstarter (värden från
+gränssnittet slår flaggor på kommandoraden).</p>
+
+<h3>Hastighet &amp; schemaläggning <span class="pill live">live</span></h3>
+<table>
+<tr><th>Inställning</th><th>Vad den gör</th></tr>
+<tr><td>Hastighetsgräns</td><td>Tak i byte/sek (<code>50M</code>, <code>1G</code>, 0 = obegränsat). Fjärrappar kan skicka procenttal - sätt <i>Linjehastighet</i> så att de översätts korrekt.</td></tr>
+<tr><td>Auto-hastighet</td><td>RTT-styrt tak som ger plats åt annan hushållstrafik och breder ut sig igen när linjen är tyst.</td></tr>
+<tr><td>Skjut upp långsamma nedladdningar automatiskt</td><td>Ett jobb som fastnat på en långsam server medan andra väntar flyttas sist i kön (förloppet behålls). Se <a href="#performance">§13</a>.</td></tr>
+<tr><td>Prefetch på lediga servrar</td><td>Servrar som är onyttiga för det aktiva jobbet startar nästa köade. Se <a href="#performance">§13</a>.</td></tr>
+<tr><td>Auto-uppdatering / URL för uppdateringskontroll</td><td>Se <a href="#updates">§14</a>.</td></tr>
+<tr><td>Linjehastighet</td><td>Din anslutnings nominella hastighet - möjliggör procentuella gränser från SABnzbd-kompatibla appar.</td></tr>
+<tr><td>Veckoschema</td><td>Radredigerare för regler per veckotid: pausa, återuppta eller sätt en hastighetsgräns vid givna dagar/tider (lokal tid). T.ex. begränsa till 20&nbsp;MB/s vardagar 9–17, obegränsat annars.</td></tr>
+</table>
+
+<h3>Nästa nedladdning <span class="pill live">live</span></h3>
+<p><b>Anslutningar</b> (per server), <b>fönster</b> (pipelining-djup per anslutning),
+<b>avkodare</b> (parallella avkodartrådar). Provtas när varje jobb startar. Standardvärden
+är rätt för de flesta linjer; använd trimningsverktygen innan du höjer blint.</p>
+
+<p><b>Snabbverifiering (CRC32)</b> (på som standard) gör anspråk på PAR2-block via
+CRC32 medan nedladdningen fortfarande pågår, vilket är 2-3x snabbare på en långsam
+processor. Varje artikels egen kontrollsumma verifieras ändå, och den avslutande
+omgången använder alltid full MD5: ingenting offras i korrekthet. Kryssa ur för att
+räkna MD5 per block även under nedladdningen.</p>
+<h3>Disk &amp; kvot <span class="pill live">live</span></h3>
+<p><b>Minsta lediga utrymme</b> (pausa nya jobb under det), <b>nedladdningskvot</b> per
+dag eller månad (UTC; Tvinga-jobb kringgår), <b>minnesgräns</b> - motorns RAM-budget
+(standard: ¼ av RAM, begränsad; höj den på en maskin med mycket RAM för maximal fart på stora
+jobb, och se <a href="#memory">vad lite minne kostar</a> innan du sänker den)
+<span class="pill restart">restart</span>.</p>
+<p><b>Flytta färdiga till</b>: efter uppackning, städning och namnbyte flyttas
+färdiga nedladdningar hit - en NAS-utdelning, en mediadisk, där ditt bibliotek
+finns. Kategoristrukturen behålls (ett jobb som blev klart under
+<code>tv/</code> hamnar under <code>tv/</code> på målet), och historiken följer
+med flytten, så anslutna appar importerar och raderar på den nya platsen. Är
+målet onåbart när ett jobb blir klart (utdelningen nere, slut på utrymme)
+stannar filerna i nedladdningsmappen och jobbet slutförs ändå som vanligt.
+Tomt = av. <b>Mål per kategori</b> skickar enskilda kategorier någon annanstans
+(<code>tv=/Volumes/NAS/TV, movies=/Volumes/NAS/Movies</code>); varje listad sökväg <em>är</em> den kategorins mapp, så ingen extra
+kategoriundermapp skapas i den. Olistade kategorier följer <b>Flytta färdiga
+till</b>.</p>
+
+<p><b>Djup för nästlade arkiv</b> (standard 5) är hur många lager av arkiv-i-arkiv
+som packas upp automatiskt: en RAR-uppsättning som innehåller en 7z som innehåller
+ännu en RAR är normalt på Usenet, och nzbfast följer kedjan utan en andra omgång. Vid
+gränsen lämnas det djupaste arkivet helt enkelt kvar, inte vidare uppackat, och
+nedladdningen blir ändå färdig. Höj bara för ovanligt djupa releaser.</p>
+
+<h3>Auto-namnbyte &amp; städning <span class="pill live">live</span></h3>
+<p><b>Byt namn på färdiga nedladdningar</b> (på som standard) ger mappen och
+huvudfilen ett rent, informativt namn: en film blir <code>Example Movie (2024)</code>,
+serier behåller <code>Show - S01E02</code>. Obfuskerade eller okända namn lämnas exakt
+som de postades i stället för att gissas.</p>
+<table>
+<tr><th>Inställning</th><th>Vad den gör</th></tr>
+<tr><td>Ta med upplösning</td><td>Lägger <code>1080p</code>, <code>2160p</code>… i namnet. <b>På som standard</b>; de andra fyra märkena är av.</td></tr>
+<tr><td>Ta med videocodec</td><td><code>x265</code>, <code>x264</code>, <code>AV1</code>…</td></tr>
+<tr><td>Ta med ljudcodec</td><td><code>Atmos</code>, <code>DTS-HD</code>, <code>AC3</code>…</td></tr>
+<tr><td>Ta med källa</td><td><code>BluRay</code>, <code>WEB</code>, <code>REMUX</code>…</td></tr>
+<tr><td>Ta med releasegrupp</td><td>Märket <code>-GROUP</code> på slutet.</td></tr>
+<tr><td>Ta bort skräpfiler</td><td><b>På som standard.</b> Raderar kvarblivna <code>.par2</code>, <code>.nzb</code>, <code>.sfv</code>, <code>.nfo</code> och samplingsklipp ur färdiga film- och seriemappar. Aldrig videon eller dess undertexter.</td></tr>
+<tr><td>Behåll bara mediefilen</td><td><b>Av som standard, och destruktiv:</b> raderar permanent allt i mappen utom videon (eller videorna) och undertexterna. Varje avsnitt i ett säsongspaket behålls. Går före <b>Ta bort skräpfiler</b> när båda är på.</td></tr>
+<tr><td>Keep the other words in the name</td><td><b>På som standard.</b> Sport, tävlingar och andra evenemang är ofta en och samma titel upprepad hela säsongen, och bara ett ord eller två isär - "Round11 Hungary Race" mot "Round11 Hungary Qualifying". Att behålla de orden är det som hindrar en hel säsong från att falla ihop till samma namn. Gäller bara där namnet inte kunde städas upp på annat sätt, så vanliga filmer och avsnitt lämnas orörda.</td></tr>
+</table>
+<p class="dim">Hela gruppen körs efter reparation och uppackning och före <b>Flytta
+färdiga till</b>, och hoppas över helt för ett jobb som fortfarande väntar på lösenord.
+Båda raderingsstegen gäller <em>bara</em> releaser som känts igen som film eller serie:
+en programvarulast eller en oklassificerbar (obfuskerad) uppsättning städas
+aldrig.</p>
+
+<h3>Mappar &amp; behandling</h3>
+<p><b>Nedladdningsmapp</b> <span class="pill restart">restart</span>, <b>bevakningsmapp</b>,
+<b>efterbehandlingsskript</b> (körs efter varje jobb med SABnzbd-kompatibla argument
+och <code>SAB_*</code>-miljö - befintliga SAB-skript fungerar oförändrade),
+<b>städtillägg</b> (skräpfiler som raderas efter slutförande), <b>Smarta mappar</b>
+och <b>TV-arkivering</b> (se <a href="#automation">§10</a>).</p>
+
+<h3>Indexering <span class="pill live">live</span></h3>
+<table>
+<tr><th>Inställning</th><th>Vad den gör</th></tr>
+<tr><td>Grupper</td><td>Newsgroups som den inbyggda indexeraren skannar (t.ex. <code>alt.binaries.teevee</code>).</td></tr>
+<tr><td>Skanningsintervall</td><td>Sekunder mellan pass (standard 900).</td></tr>
+<tr><td>Backfill-artiklar</td><td>Headers som hämtas vid en grupps allra första skanning.</td></tr>
+<tr><td>Fördjupa per skanning</td><td>Varje pass indexerar även så här många <em>äldre</em> artiklar och bygger ut din sökbara historik i bakgrunden tills Max ålder nås (standard 200 000 per pass ≈ tiotals miljoner artiklar per dygns drifttid).</td></tr>
+<tr><td>Max ålder</td><td>Ignorera poster äldre än detta (<code>90d</code>, <code>6m</code>, <code>2y</code>) - begränsar indexstorlek och skanningstid.</td></tr>
+<tr><td>Gallra till åldersfönstret</td><td><b>På som standard.</b> Raderar även redan lagrade releaser när de blir äldre än Max ålder, så att indexet håller ungefär det fönstret i stället för att växa för alltid. Av = bara nya poster filtreras och det som redan lagrats blir kvar. Döda skräpfragment (dolda, fortfarande ofullständiga efter en vecka) rensas i vilket fall.</td></tr>
+<tr><td>Ingest-filter</td><td>JSON-regler som filtrerar vad som kommer in i indexet: typer (obfuskerat skräp släpps som standard), år/upplösning/språk, storleksgränser.</td></tr>
+<tr><td>Skanna nu / djup omskanning</td><td>Kör ett pass direkt; med ett djup, skanna om så här många färska headers.</td></tr>
+<tr><td>OMDb-nyckel / metadatauppdatering / radera</td><td>Berikningskontroller för väggen (<a href="#wall">§6</a>). Radera bygger om databasen från grunden - återställningsvägen om den någonsin blir korrupt.</td></tr>
+</table>
+
+<h3>Bibliotek, Säkerhet, Gränssnitt</h3>
+<p><b>Bibliotek</b>: kategorier som behandlas som direkta biblioteksposter + omkontrollintervall.
+<b>Säkerhet</b>: den fullständiga API-nyckeln (allt) och NZB-nyckeln (enbart tillägg - säker att ge till indexersidor), båda roterbara live. Vardera rutan ersätter den nyckel den hör till så snart du lämnar fältet, och lämnar du en ruta tom behåller den nyckeln den redan har. API-nyckeln har dessutom <b>Show</b>, som visar och kopierar den nuvarande nyckeln så att du kan klistra in den i Sonarr, Radarr eller NZB360 när det passar dig, och <b>Create new</b>, som präglar en ersättare - den gamla nyckeln slutar fungera omedelbart, så allt som redan är anslutet måste få den nya. Båda är beroende av själva API-nyckeln: NZB-nyckeln för enbart tillägg kan inte läsa den, vilket är hela poängen med den nyckeln. Var nyckeln kommer ifrån på en ny installation, se <a href="#firstrun-key">§2</a>. <b>Gränssnitt</b>: klickljud, skrivbords-
+aviseringar vid slutförande, omsorteringsintervall för providers.</p>
+
+<p><b>Hastighetsenheter</b> <span class="pill live">live</span> avgör hur varje
+hastighet visas i panelen: megabyte (MB/s, normen bland nedladdningsprogram,
+standardvalet) eller megabit (Mb/s, som operatörer anger linjer). Filstorlekar står
+kvar i byte. Det är en egenskap hos daemonen, inte hos din webbläsare, så det gäller
+varje enhet som tittar på den här installationen.</p>
+<h3>Avancerat: inställningar utan kontroll i panelen</h3>
+<p>Fyra inställningar har varken en kontroll i gränssnittet eller en flagga på
+kommandoraden. Sätt dem via API:et (<a href="#api">§16</a>), t.ex.
+<code>/api?mode=config&amp;name=verify_mode&amp;value=lean&amp;apikey=…</code>. Precis
+som alla andra sparas de i <code>settings.json</code>.</p>
+<table>
+<tr><th>Namn</th><th>Vad den gör</th></tr>
+<tr><td><code>verify_mode</code></td><td><code>full</code> | <code>fast</code> | <code>lean</code> (standard <code>fast</code>). <code>lean</code> är knuffen för långsamma processorer: som fast, men hoppar dessutom över yEnc-CRC per artikel så snart PAR2 täcker en fil, vilket ger ett CRC32-lager i stället för två. Nedladdningar utan PAR2 behåller sina artikel-CRC:er, och verifiering och reparation i slutet av jobbet är oförändrade i båda fallen. <b>Snabbverifiering</b> ovan är samma kontroll för full mot fast.</td></tr>
+<tr><td><code>auto_retry_mins</code></td><td>Väntetid före det <em>enda</em> automatiska omförsök som ett första misslyckande med saknade artiklar får (standard 20). Propagationsfördröjning är en verklig orsak till saknade artiklar och löser sig själv; tack vare journalen hämtar omkörningen bara det som fortfarande saknas. Misslyckanden på grund av lösenord eller takedown kvalificerar sig aldrig.</td></tr>
+<tr><td><code>index_scan_par</code></td><td>Hur många grupper indexeraren skannar parallellt (standard 3, begränsat till 1-8).</td></tr>
+<tr><td><code>oracle_sample</code></td><td>Tillgänglighetsoraklets STAT-budget i vila (<a href="#oracle">§13</a>), sonderingar per timme och server. Standard 300, max 3600, <code>0</code> stänger av samplingen helt.</td></tr>
+</table>
+<h2 id="automation">10 · Automatisering</h2>
+<h3>Bevakningslista</h3>
+<p>Den enklaste automatiseringen: lägg till en titel på instrumentpanelen, sätt kvalitetspreferenser,
+klart. Nya releaser grabbas när de dyker upp i dina indexerade grupper;
+kopior med bättre kvalitet uppgraderar tidigare grabbar; en kalendervy visar vad som är på väg.</p>
+<h3 id="auto-rss">RSS-flöden</h3>
+<p>Inställningar → RSS: valfri newznab/indexer-RSS-URL med intervall per flöde, kategori och
+filterregler (titelmönster, storleksgränser). Matchande objekt laddas ner
+automatiskt.</p>
+<h3 id="auto-smart">Smarta mappar</h3>
+<p>Regler som utvärderas när ett jobb läggs till: matcha på mönster/nyckelord och storlek, tilldela en
+kategori (första träffen vinner). Med <b>TV-arkivering</b> på döps färdiga TV-avsnitt om
+och arkiveras som <code>Show/Season 01/Show&nbsp;-&nbsp;S01E02.mkv</code> -
+Plex/Jellyfin-redo utan ett externt verktyg.</p>
+<h3>Schemaläggare</h3>
+<p>Veckoschemat (se <a href="#settings">§9</a>) automatiserar pausa/återuppta/hastighet
+efter tid på dygnet.</p>
+<h3>Skript</h3>
+<p>Ett efterbehandlingsskript tar emot SABnzbds positionsargument och
+<code>SAB_*</code>-miljövariabler - det stora ekosystemet av SAB-skript körs
+som det är.</p>
+
+<h2 id="arr">11 · Sonarr, Radarr &amp; vänner</h2>
+<p>nzbfast talar SABnzbd-API:et native, så varje *arr fungerar direkt -
+och den kan agera som deras <em>indexerare</em> också.</p>
+<h3>Som nedladdningsklient</h3>
+<ol>
+<li>I Sonarr/Radarr: Settings → Download Clients → lägg till <b>SABnzbd</b>.</li>
+<li>Host: din nzbfast-maskin · Port: <b>6789</b> · API-nyckel: din fullständiga API-nyckel
+(var du hittar den: <a href="#firstrun-key">§2</a>).</li>
+<li>Kategori efter önskemål (t.ex. <code>tv</code> / <code>movies</code>). Test → grön bock → Save.</li>
+</ol>
+<p>Kö, historik, status per jobb, "remove &amp; delete", nytt försök och kategoriroutning
+beter sig alla som *arr-verktygen förväntar sig.</p>
+<h3>Som en indexerare (newznab)</h3>
+<ol>
+<li>Settings → Indexers → lägg till <b>Newznab</b>.</li>
+<li>URL: <code>http://&lt;host&gt;:6789/</code> · API-sökväg: <code>/api</code> · nyckel: din API-nyckel.</li>
+<li>nzbfast serverar <code>caps</code>-, <code>search</code>-, <code>tvsearch</code>- och
+<code>movie</code>-frågor från sitt eget index över dina bevakade grupper, och
+<code>/getnzb/&lt;id&gt;</code> lämnar tillbaka NZB:en.</li>
+</ol>
+<div class="note"><b>Varför bry sig?</b>En självhostad indexerare av exakt de grupper du
+bryr dig om: inga konton, inga gränser för API-anrop, retention så djup som du låter den skanna.</div>
+
+<h2 id="remotes">12 · Telefon &amp; fjärrappar</h2>
+<p>nzbfast implementerar <em>båda</em> de stora fjärrstyrningsprotokollen, så nästan varje
+mobil-/surfplatteapp fungerar. Välj det protokoll din app stödjer:</p>
+<h3>Appar som talar NZBGet (nzb360, LunaSea, NZB Unity…)</h3>
+<table>
+<tr><th>Fält i appen</th><th>Värde</th></tr>
+<tr><td>Typ</td><td>NZBGet</td></tr>
+<tr><td>Host / port</td><td>din maskin : <b>6789</b></td></tr>
+<tr><td>Användarnamn</td><td>vad som helst (t.ex. <code>nzbfast</code>)</td></tr>
+<tr><td>Lösenord</td><td>din <b>API-nyckel</b></td></tr>
+</table>
+<p>Hela JSON-RPC-ytan som dessa appar använder serveras: status, kö med
+omordning/paus/radering, historik, add-NZB, hastighetsgräns, paus/återuppta, logg.</p>
+<h3>Appar som talar SABnzbd</h3>
+<table>
+<tr><th>Fält i appen</th><th>Värde</th></tr>
+<tr><td>Typ</td><td>SABnzbd</td></tr>
+<tr><td>Host / port</td><td>din maskin : <b>6789</b></td></tr>
+<tr><td>API-nyckel</td><td>din API-nyckel (eller NZB-nyckeln för åtkomst med enbart tillägg)</td></tr>
+</table>
+<h3>Instrumentpanelen på din telefon</h3>
+<p>Öppna bara <code>http://&lt;machine&gt;:6789</code> i en mobilwebbläsare - hela
+instrumentpanelen och väggen har en touchlayout. Panelen Inställningar → Fjärråtkomst visar
+de exakta URL:erna och en QR-kod att skanna.</p>
+
+<h2 id="performance">13 · Prestandaverktyg</h2>
+<h3 id="perf-benchmark">Systembenchmark</h3>
+<p>Ett klick mäter dina tre tak - nätverkshastighet (en riktig 8-sekunders
+multi-anslutningsprob), CPU-verifieringshastighet och diskskrivhastighet - och leder
+med svaret: <b>din förväntade maximala nedladdningshastighet och vilket tak som är
+gränsen</b>. Den kortaste stapeln är din flaskhals; de andra visar sin marginal.
+Schemalägg den (var 6:e h → veckovis) så loggas varje körning till en historiktabell, så att du
+kan se när din provider, ISP eller hårdvara ändrade beteende. Schemalagda körningar sker
+bara medan kön är i vila.</p>
+<h3 id="perf-tuning">Anslutningstrimning</h3>
+<p>Mäter en provider vid stigande antal anslutningar och rekommenderar inställningen -
+fler sockets hjälper tills providern eller din linje mättas, och vissa providers
+bestraffar överbegäran. <b>Testa alla</b> jämför varje provider och kör dem sedan alla
+ihop för att kontrollera att poolen mättar din linje.</p>
+<h3 id="perf-diversity">Serverdiversitet</h3>
+<p>STAT-provtar artiklar över olika åldrar på varje server och klustrar providers efter
+gemensamma luckor: providers med ~100 % gemensamma saknade artiklar är samma backbone
+(redundanta för återställning); oberoende sådana breddar verkligen din täckning. Slutar
+med en rekommendation i klartext.</p>
+<h3>Automatisk köintelligens</h3>
+<ul>
+<li><b>Auto-uppskjutning</b>: en nedladdning som stapplar på en enda långsam server medan andra jobb
+väntar parkeras sist (journalen behåller dess förlopp) och försöks igen när kön
+är fri.</li>
+<li><b>Prefetch på lediga servrar</b>: servrar som inte kan hjälpa det aktiva jobbet (deras
+kopior är borta) börjar under tiden ladda ner <em>nästa</em> köade jobb. Ingen annan
+klient gör överlappning mellan jobb.</li>
+<li><b>Överlappning mellan jobb</b>: medan ett färdigt jobbs svans (verifiering/uppackning) blir klar på
+disken äger nästa jobbs nedladdning redan linjen.</li>
+</ul>
+<h3 id="oracle">Tillgänglighetsoraklet</h3>
+<p>Takedowns är det främsta skälet till att en Usenet-nedladdning misslyckas, och de
+går att förutse: samma release försvinner hos en backbone medan en annan fortfarande
+har den. nzbfast för ett litet register över vad dina egna leverantörer faktiskt har
+svarat för, och lägger en pytteliten vilobudget på STAT-sonderingar (några hundra i
+timmen per server, aldrig under en nedladdning) för att hålla det aktuellt. Den laddar
+aldrig ner nyttolast för att ta reda på det.</p>
+<p>Vad du får ut av det:</p>
+<ul>
+<li>Ett <b>tillgänglighetsutlåtande</b> på väggens brickor och indexets rader
+(<a href="#wall">§6</a>): gult ”?” för osäkert hos dina leverantörer, rött för säkert
+borta. Ingen markering betyder att det ser bra ut.</li>
+<li>En <b>rensad</b>-markering på grupper där färska poster redan tas bort, så att du
+kan skilja en döende grupp från en otursförföljd release.</li>
+<li><b>Hoppa över providers som oraklet dömt ut</b> (Inställningar, <b>av som standard,
+experimentell</b>): när kontrollen är säker på att en leverantörs backbone har tappat
+en release hoppas den över direkt för den nedladdningen i stället för att man väntar in
+misslyckandet. Din sista kvarvarande leverantör hoppas aldrig över.</li>
+</ul>
+<p class="dim">Utlåtandet är en förutsägelse från indicier, inte en garanti. För ett
+hårt svar om en enskild NZB räknar <code>nzbfast check</code>
+(<a href="#cli">§15</a>) de faktiska artiklarna.</p>
+<h3 id="memory">Minnesbudget - och vad lite minne kostar</h3>
+<p>Alla motorns cachar delar en budget (standard ¼ av fysiskt RAM, begränsad till
+256 MB–16 GB). Sätt den uttryckligen med <i>Minnesgräns</i> i Inställningar, eller
+<code>--mem-limit</code> på kommandoraden.</p>
+<p>nzbfast är byggd för att suga upp ditt nätverk och din disk samtidigt, och RAM är
+det som låter den göra båda i <em>ett pass</em>: artiklar avkodas, verifieras och skrivs
+rakt till sina slutliga offset, så arkivvolymer behöver aldrig röra disken alls.
+Svält den på minne och inget går sönder - varje cache har en spill-väg, och motorn
+degraderar till mer disk-I/O i stället för att swappa eller misslyckas. Men det spillet är inte
+gratis, och på stora jobb kan du mäta det.</p>
+<p>Uppmätt på en maskin och en linje (M1 Ultra, 10 GbE), samma filer vid varje
+budget. Varje körning gav ett korrekt, fullt verifierat, uppackat resultat:</p>
+<table>
+<tr><th>Jobbstorlek</th><th>Gott om RAM</th><th>2 GB budget<br><span class="dim">≈ 8 GB maskin</span></th><th>1 GB budget<br><span class="dim">≈ 4 GB maskin</span></th><th>256 MB budget<br><span class="dim">≈ 2 GB NAS</span></th></tr>
+<tr><td>7 GB</td><td>15 s</td><td>15 s</td><td>15 s</td><td>15 s</td></tr>
+<tr><td>35 GB</td><td>65 s</td><td>70 s</td><td>70 s</td><td>65 s</td></tr>
+<tr><td>87 GB</td><td>148 s</td><td>206 s <span class="dim">+39%</span></td><td>196 s <span class="dim">+32%</span></td><td>180 s <span class="dim">+22%</span></td></tr>
+<tr><td>190 GB</td><td>330 s</td><td>427 s <span class="dim">+29%</span></td><td>402 s <span class="dim">+22%</span></td><td>411 s <span class="dim">+25%</span></td></tr>
+</table>
+<p>Toppminnet följer <em>budgeten</em>, inte jobbet: den 190 GB-nedladdningen blir klar
+i ungefär 1.1 GB RAM. Det du byter mot det är tid - och bara på stora jobb.</p>
+<ul>
+<li><b>Upp till ~35 GB är lite minne gratis.</b> Arbetsuppsättningen får plats oavsett, så en
+4 GB-maskin blir klar med ett sådant jobb lika snabbt som en 64 GB-maskin.</li>
+<li><b>Förbi ~87 GB betalar du 20–40 % - men bara när din linje springer om din disk.</b>
+Verifieringsblock och arkivvolymer som skulle ha stannat i RAM skrivs ut
+och läses tillbaka i stället, och det kostar bara tid om nätverket kan leverera snabbare än
+disken hinner absorbera den extra trafiken. De 20–40 % ovan mättes på 10 GbE; samma
+87 GB-jobb vid samma budgetar på en ~2.4 Gbps-linje visade ingen straffavgift alls (−1 till +7 %,
+inom brus mellan körningar). Straffet är en funktion av hur långt linjen springer om
+disken, <em>inte</em> av jobbstorleken - på en typisk hemuppkoppling är en liten budget
+nära gratis även på mycket stora jobb.</li>
+<li><b>Straffet planar ut.</b> När ett jobb är stort nog att spilla spiller varje begränsad
+budget ungefär lika mycket - 2 GB-, 1 GB- och 256 MB-körningarna läser tillbaka
+i stort sett samma antal block från disk, och blir klara inom brus av varandra.
+Så lite mer RAM under tröskeln som helt undviker spill köper inte tillbaka
+kostnaden: ge den nog för att hålla jobbet i minnet, annars spelar den exakta siffran knappt någon roll.</li>
+</ul>
+<div class="tip"><b>Rekommendation</b>Ge nzbfast ungefär <b>2 GB budget per
+100 GB</b> av det största jobb du laddar ner, och lämna standardvärdet i fred annars -
+¼ av RAM är redan rätt svar på de flesta maskiner. I praktiken: <b>4 GB RAM</b>
+täcker jobb upp till ~35 GB i full fart; <b>8–16 GB</b> håller även 100 GB-plus-jobb där;
+en <b>2 GB NAS</b> blir klar med vad du än kastar på den, men behandla den som en
+bakgrundsnedladdare snarare än något som mättar en snabb linje.</div>
+<p>På en liten NAS, sänk även <i>Anslutningar</i> (2–4) tillsammans med budgeten. Vid en
+256 MB budget och 2 anslutningar stannar toppminnet nära <b>190 MB</b> - bekvämt
+inom vad en 2 GB NAS har till övers. Var medveten om att det då är antalet anslutningar,
+inte minnet, som begränsar dig: samma 35 GB-jobb tog 286 s i stället för 65 s.
+Det är den ärliga formen på avvägningen - den blir alltid klar, och korrekt;
+den kommer bara inte att mätta linjen.</p>
+<p class="dim">Benchmarks körs om för varje utgåva; metod och siffror per maskin
+publiceras vid sidan av resultaten.</p>
+
+<h2 id="updates">14 · Uppdateringar</h2>
+<ul>
+<li>Uppdateringar är <b>endast avisering</b>: nzbfast laddar aldrig ner eller
+byter ut sin egen binär, och det finns ingen kod i den som kan. När en ny
+version finns visar sidhuvudet <b>⬆ v X tillgänglig - ladda ner</b>; chippen
+länkar till den officiella nedladdningssidan (länken är fast i appen, den
+kommer aldrig från uppdateringsmanifestet). Installera den nya versionen på
+samma sätt som du installerade den nuvarande.</li>
+<li>nzbfast söker efter nya versioner två gånger om dagen. Stäng av <b>Sök
+efter uppdateringar</b> (Inställningar) så kontaktar den aldrig
+uppdateringsmanifestet; en tom URL för uppdateringskontroll gör detsamma.</li>
+</ul>
+
+<h2 id="cli">15 · Kommandoraden</h2>
+<p>Allt daemonen gör går också att skripta. De vardagliga kommandona:</p>
+<table>
+<tr><th>Kommando</th><th>Syfte</th></tr>
+<tr><td><code>nzbfast setup</code></td><td>Interaktiv serverkonfiguration.</td></tr>
+<tr><td><code>nzbfast serve</code></td><td>Kör daemonen (instrumentpanel + API + automatisering). <code>--open</code> öppnar webbläsaren; <code>--apikey</code> sätter nyckeln för hand (<a href="#firstrun-key">§2</a>); <code>--bind</code> väljer lyssningsadressen, standard <code>0.0.0.0</code> (varje gränssnitt), <code>127.0.0.1</code> för bara den här maskinen. Se <code>--help</code> för hela flagglistan; varje inställning på instrumentpanelen har en flaggtvilling.</td></tr>
+<tr><td><code>nzbfast get file.nzb</code></td><td>Ladda ner en NZB, hela rörledningen, ingen daemon. <code>--preflight</code> avbryter tidigt om inlägget inte kan slutföras; <code>--password</code> för krypterade set.</td></tr>
+<tr><td><code>nzbfast check file.nzb</code></td><td>Tillgänglighetsutlåtande - COMPLETE / REPAIRABLE / IMPOSSIBLE - utan att ladda ner nyttolast.</td></tr>
+<tr><td><code>nzbfast verify DIR</code></td><td>Verifiera filer mot PAR2-setet i en katalog.</td></tr>
+<tr><td><code>nzbfast sysbench</code></td><td>Systembenchmarken + diversitetsrapporten, i terminalen.</td></tr>
+<tr><td><code>nzbfast index / search</code></td><td>Skanna grupper till indexet / sök i det, utan daemonen.</td></tr>
+<tr><td><code>nzbfast import-sab</code></td><td>Importera servrar från en SABnzbd-ini.</td></tr>
+</table>
+<p class="dim">Även tillgängliga: <code>inspect</code>, <code>probe</code>,
+<code>bench</code>, <code>bench-cpu</code>, <code>soak</code>, <code>fetch</code>,
+<code>spots</code>/<code>spot-search</code>/<code>spot-get</code> (Spotnet),
+<code>make-release-nzb</code>/<code>make-test-nzb</code> (testfixturer). Varje
+kommando tar <code>--config</code> och <code>--help</code>. Till dem kommer <code>post</code>: den laddar upp filer som
+yEnc-artiklar och skriver den matchande NZB:n. Ett driftverktyg; det kräver ett
+uttryckligt <code>--post-server</code> och väljer aldrig server åt dig.</p>
+
+<h2 id="api">16 · API-översikt</h2>
+<p>Bas-slutpunkt: <code>http://host:6789/api?mode=…&amp;apikey=…&amp;output=json</code> -
+SABnzbd-kompatibel, så befintliga SAB-integrationer fungerar oförändrade. Två nycklar:
+<b>API-nyckeln</b> (full kontroll) och <b>NZB-nyckeln</b> (enbart tillägg:
+<code>addfile</code>/<code>addurl</code>).</p>
+<table>
+<tr><th>Område</th><th>Lägen</th></tr>
+<tr><td>Kö</td><td><code>queue</code> (med <code>name=delete/pause/resume/priority/switch</code>), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>retry</code>, <code>set_password</code></td></tr>
+<tr><td>Info</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code></td></tr>
+<tr><td>Konfig</td><td><code>get_config</code>, <code>config&amp;name=&lt;setting&gt;&amp;value=…</code> (varje inställningsfält), <code>server_save/delete/test/enable/reorder</code>, <code>import_probe/apply</code></td></tr>
+<tr><td>Index &amp; vägg</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, plus newznab på <code>/api?t=caps|search|tvsearch|movie</code> och <code>/getnzb/&lt;id&gt;</code></td></tr>
+<tr><td>Automatisering</td><td><code>watchlist</code>, <code>watchlist_check_now</code>, <code>watch_calendar</code>, <code>feeds</code>, <code>smart_folders</code>, <code>schedule</code></td></tr>
+<tr><td>Diagnostik</td><td><code>sysbench</code>, <code>bench_history</code>, <code>connladder</code>, <code>pooltest</code>, <code>diversity</code>, <code>update_check</code>, <code>update_apply</code></td></tr>
+<tr><td>NZBGet JSON-RPC</td><td><code>/jsonrpc</code> - status, listgroups, history, append, editqueue, rate, pause, log (Basic auth: valfri användare, API-nyckel som lösenord)</td></tr>
+<tr><td>Förhandsgranskning / uppspelning</td><td><code>/stream/&lt;nzo_id&gt;</code> (HTTP-ranges; att starta ett parkerat biblioteksjobb kräver <code>?t=</code>-token eller nyckel), <code>/m3u/&lt;id&gt;</code> (kräver nyckel; skapar token), <code>/wall</code>, <code>/art/…</code></td></tr>
+</table>
+
+<h2 id="files">17 · Filer &amp; platser</h2>
+<table>
+<tr><th>Fil</th><th>Innehåll</th></tr>
+<tr><td><code>config.local.json</code></td><td>Serverinloggningar och alternativ per server. Skapas av guiden; redigerbar i Inställningar. Håll den privat.</td></tr>
+<tr><td><code>settings.json</code></td><td>Varje inställning som ändrats på instrumentpanelen. Ligger bredvid config; UI-värden åsidosätter kommandoradsflaggor. Radera en nyckel (eller filen) för att falla tillbaka på flaggor/standardvärden.</td></tr>
+<tr><td><code>apikey</code></td><td>API-nyckeln nzbfast skapade åt sig själv vid en första körning (<a href="#firstrun-key">§2</a>). Ligger bredvid config; läsbar endast för kontot som kör nzbfast på macOS och Linux. Radera den inte för att få en ny nyckel: på en installation som redan körts ersätts den inte av något, och daemonen kommer tillbaka helt utan nyckel. Sätt en ny under Inställningar → Säkerhet i stället.</td></tr>
+<tr><td><code>index.db</code></td><td>Releaseindexet (SQLite) + väggmetadata. Säkert att radera - det byggs om från skanning (Inställningar → Indexering → Radera gör detta åt dig).</td></tr>
+<tr><td><code>&lt;config&gt;/.spool/</code></td><td>Kötillstånd (överlever omstarter), NZB:er per jobb, förbrukningsjournal, benchmark-historik, cache för posteromslag.</td></tr>
+<tr><td>Artikeljournal</td><td>Inuti varje jobbs utmapp medan det är ofullständigt - driver kraschåterupptagning och nytt försök. Tas bort vid framgång.</td></tr>
+<tr><td>Externa verktyg</td><td>Inga behövs - RAR-uppackning och PAR2-reparation är native. Om ett exotiskt set någonsin behöver en extern <code>unrar</code> eller <code>par2</code> som reserv letar nzbfast bredvid sin körbara fil, sedan på <code>$PATH</code>.</td></tr>
+</table>
+
+<h2 id="troubleshooting">18 · Felsökning</h2>
+<table>
+<tr><th>Symptom</th><th>Kontrollera</th></tr>
+<tr><td>Långsamma nedladdningar</td><td>Kör <b>Systembenchmark</b> - den namnger flaskhalsen rakt av. Om det är nätverket: kör <b>Anslutningstrimning</b>, kontrollera antalet anslutningar per server och bekräfta att dina providers inte alla är en och samma backbone (<b>Serverdiversitet</b>).</td></tr>
+<tr><td>Långsam bara på mycket stora jobb<br>(NAS eller maskin med lite RAM)</td><td>Förväntat, och mätbart: en svält minnesbudget spiller cachar till disk och kostar 20–40 % förbi ~87 GB. Se <a href="#memory">Minnesbudget</a> för siffrorna och hur mycket RAM du ska ge den. Mindre jobb påverkas inte.</td></tr>
+<tr><td>Nedladdning misslyckas "articles missing"</td><td>Inlägget har gått ut eller togs ner på dina providers. En andra provider på en annan backbone räddar de flesta av dessa. <code>nzbfast check</code> förutsäger detta innan nedladdning. Och väggen märker ut de sannolikt borttagna i förväg med sin
+tillgänglighetsprick (<a href="#oracle">§13</a>). Ett första misslyckande av den här
+formen görs om en gång av sig självt efter en väntetid, eftersom
+propagationsfördröjning ser likadan ut och löser sig själv.</td></tr>
+<tr><td>Färdigt arkiv vill ha ett lösenord</td><td>Historikraden visar 🔑 - ange lösenordet där; jobbet blir klart på plats. </td></tr>
+<tr><td>Sonarr/Radarr kan inte ansluta</td><td>Port 6789 nåbar? API-nyckel korrekt (full nyckel, inte NZB-nyckel)? Klienttyp satt till SABnzbd?</td></tr>
+<tr><td>Instrumentpanelen frågar efter en API-nyckel jag aldrig satt</td><td>En ny installation skapar en åt sig själv och skriver ut den en gång vid start (<a href="#firstrun-key">§2</a>). Den finns i filen <code>apikey</code> bredvid din config, och i startutskriften. Eller skriv in en egen nyckel under Inställningar → Säkerhet från en webbläsare som redan är inloggad.</td></tr>
+<tr><td>Ingenting på nätverket når daemonen</td><td>Kontrollera <code>--bind</code>: <code>127.0.0.1</code> betjänar bara maskinen som nzbfast kör på. Standarden, <code>0.0.0.0</code>, betjänar varje gränssnitt. Kontrollera sedan maskinens egen brandvägg för port 6789.</td></tr>
+<tr><td>Bläddra-kortet förblir litet</td><td>Indexeraren växer i bakgrunden - kontrollera att grupper är satta i Inställningar → Indexering, och ge Fördjupa per skanning tid att samla historik. "Skanna nu" tvingar fram ett pass; statusraden visar live-förlopp.</td></tr>
+<tr><td>Väggen visar fel/inget omslag</td><td>Detaljblad → ✎ Korrigera matchning eller ↻ Uppdatera metadata. Filmuppslag blir bättre med en gratis OMDb-nyckel.</td></tr>
+<tr><td>Daemonen vill inte starta: porten upptagen</td><td>En annan instans körs - eller ändra <code>--port</code>.</td></tr>
+<tr><td>Var finns loggarna?</td><td>Logg-kortet på instrumentpanelen, eller terminalen/loggfilen du startade <code>serve</code> med.</td></tr>
+</table>
+<div class="note"><b>Fortfarande fast?</b>Logg-kortet namnger oftast boven -
+inkludera dess svans när du rapporterar ett problem, tillsammans med din
+<code>nzbfast --version</code>.</div>
+
+<hr>
+<p class="dim">nzbfast - den här handboken följer med varje utgåva. Inställningar, slutpunkter
+och standardvärden som refereras här matchar den version den levererades med.</p>
+
+</main>
+</div>
+</body>
+</html>

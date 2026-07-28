@@ -1,0 +1,98 @@
+[package]
+name = "nzbfast"
+version = "1.0.10"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Speed-focused NZB downloader"
+
+[dependencies]
+nzbkit = { path = "../nzbkit" }
+# `parallel` turns on rars' multithreaded RAR5 block decode (unrar-parity
+# extraction wall speed; members >=16MB fan symbol decode across 4 workers).
+rars = { path = "../../vendor/rars", features = ["parallel"] }
+# Native 7z extraction (Apache-2.0, pure Rust - keeps the zero-external-tools
+# stance). Decode-only: no `compress` encoder, no wasm; aes256/bzip2/ppmd
+# cover the encrypted + non-LZMA methods real posts use.
+sevenz-rust2 = { version = "0.21", default-features = false, features = ["aes256", "bzip2", "ppmd"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+# Vendored + hardened: upstream 0.12.0 (the newest release) has two
+# unauthenticated one-request permanent kills and no way to set a socket
+# timeout. See vendor/tiny_http/VENDORING.md.
+tiny_http = { path = "../../vendor/tiny_http" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.150"
+ureq = "2"
+# Update-manifest binary verification (auto-update): sha256 for payload
+# integrity, ed25519 for manifest authenticity (a signature the update
+# origin cannot forge without the offline signing key).
+sha2 = "0.10"
+ed25519-dalek = "2"
+hex = "0.4"
+# OS entropy for the first-run API key. That key is the only thing
+# standing between a LAN and the daemon's full control API, so it must
+# come from the platform CSPRNG - not from RandomState (see fresh_secret,
+# which is fine for a capability URL and is NOT used here).
+getrandom = "0.2"
+# IMDb datasets ratings file is gzip'd TSV (keyless nightly download).
+flate2 = "1"
+# M28 wall thumbnails: decode cached posters (jpeg/png/webp sources),
+# resize, re-encode jpeg. No default features - just the codecs.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+libc = "0.2"
+md-5 = "0.11.0"
+crc32fast = "1.5.0"
+rpassword = "7"
+qrcodegen = "1.8.0"
+notify = "8.2.0"
+trash = "5.2.6"
+
+# mimalloc as the global allocator on macOS + Linux (the two platforms we
+# ship as native binaries and Docker/NAS images; the Windows cross-build
+# keeps the system allocator - mingw + mimalloc is unvalidated, see below).
+# Two independent reasons it earns its place:
+#   - macOS: the system allocator (xzone malloc) never returns freed
+#     pipeline buffers to the OS - malloc_zone_pressure_relief is a
+#     measured no-op - so a finished job leaves GBs resident forever.
+#     mi_collect(true) marks them reusable (phys_footprint drops to
+#     ~nothing, next job flips the same pages back in ~140 ms).
+#   - Linux (the constrained-CPU target: 4-core ARM NAS, Celeron, Pi):
+#     under the pipeline's per-article alloc/free churn plus the
+#     extractor's hold buffers, mimalloc beats both musl malloc (slow,
+#     lock-heavy) and glibc malloc (arena fragmentation) on throughput
+#     and RSS. The shipped Linux binaries are glibc/-gnu today, so this
+#     lands on the real NAS artifact, not a hypothetical musl one.
+# The idle-trim in serve.rs calls mi_collect(true) under the same cfg;
+# nzbkit::mem::trim() (glibc malloc_trim) stays as a harmless no-op once
+# mimalloc owns the heap.
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+mimalloc = "0.1"
+libmimalloc-sys = { version = "0.1", features = ["extended"] }
+
+# GetDiskFreeSpaceExW for disk_stat - the min-free download guard and the
+# dashboard's free-space readout both go dark without it. Same crate and
+# version nzbtray already links, so the windows build gains no new
+# dependency. libc has no statvfs on windows.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
+
+# Signing tooling for the update manifest (keygen + detached sign) lives
+# in examples/update_sign.rs so the daemon and the release pipeline use
+# the exact same ed25519 implementation. getrandom seeds keygen.
+[dev-dependencies]
+getrandom = "0.2"
+# The 7z ENCODER, for building container fixtures in the extraction tests.
+# Dev-only on purpose: resolver 2 does not unify dev-dependency features
+# into a normal build, so `cargo build` still links the decode-only
+# configuration declared above and the shipped binary gains no encoder.
+sevenz-rust2 = { version = "0.21", default-features = false, features = [
+    "aes256",
+    "bzip2",
+    "ppmd",
+    "compress",
+] }

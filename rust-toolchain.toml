@@ -1,0 +1,15 @@
+# Pin the toolchain so local dev, CI release builds, and the Windows
+# signing workflow all use one rustc. This is the base for attestable /
+# reproducible release builds: two builds on different days can't drift
+# to different compiler versions. Bump deliberately, in lockstep with a
+# verified release build.
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "x86_64-pc-windows-gnu",
+]

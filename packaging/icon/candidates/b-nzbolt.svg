@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Candidate B "bolt-through-N": keeps a letterform for brand recall
+     (Gary's taskbar already showed a fallback "N", so an N reads as us)
+     but cuts it with a bolt-shaped notch so it is never mistaken for a
+     generic letter tile. One glyph, not two - "nz" was the part that
+     turned to mush at small sizes. -->
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="tileg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4da3ff"/>
+      <stop offset="1" stop-color="#7c5cff"/>
+    </linearGradient>
+    <mask id="cut">
+      <rect x="100" y="100" width="824" height="824" fill="#fff"/>
+      <path d="M 654 150 L 470 560 L 560 560 L 448 880 L 700 505 L 596 505 Z"
+            fill="#000" stroke="#000" stroke-width="54" stroke-linejoin="round"/>
+    </mask>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#tileg)"/>
+  <g mask="url(#cut)">
+    <!-- heavy sans N: three strokes, no thin joints to disappear -->
+    <path d="M 300 745 V 300 H 400 L 620 590 V 300 H 720 V 745 H 620 L 400 455 V 745 Z" fill="#fff"/>
+  </g>
+  <path d="M 654 150 L 470 560 L 560 560 L 448 880 L 700 505 L 596 505 Z" fill="#fff"/>
+</svg>

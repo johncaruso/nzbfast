@@ -1,0 +1,49 @@
+# nzbfast - NAS / seedbox deployment.
+#   1. docker compose up -d
+#   2. open http://<host>:6789 and add your Usenet server in the
+#      Welcome panel (no file to edit - it applies live)
+# Web UI + SABnzbd/NZBGet-compatible API at http://<host>:6789
+# Synology walkthrough: docs/SYNOLOGY.md
+services:
+  nzbfast:
+    image: nzbfast/nzbfast:latest        # Docker Hub (searchable in Synology/Unraid GUIs)
+    # ghcr equivalent (identical image): ghcr.io/nzbfast/nzbfast:latest
+    # Or build locally instead of pulling:
+    # build: .
+    container_name: nzbfast
+    restart: unless-stopped
+    ports:
+      - "6789:6789"
+    environment:
+      # PUID/PGID = the host user that should own downloads.
+      # On Synology run `id <dsm-user>` (often uid 1026, gid 100/users).
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+      # API key: the control API is published on your LAN (below), so on
+      # first run nzbfast GENERATES a key and prints it in the logs
+      # (`docker logs nzbfast`) - use that in Sonarr/Radarr. To pin your
+      # own, set it here. To run keyless on a trusted network, NZBFAST_OPEN=1.
+      # - NZBFAST_APIKEY=change-me
+      # - NZBFAST_OPEN=1
+    volumes:
+      - ./config:/config            # settings + index database
+      - ./downloads:/downloads      # finished files
+      - ./watch:/watch              # drop an .nzb here to auto-download
+
+  # Auto-update. Watches for a newer nzbfast image and recreates the
+  # container when one ships (your config/downloads persist - they live on
+  # the volumes above). Scoped to the nzbfast container only, so it never
+  # touches your other containers. Remove this service to pin your version.
+  # Note: it needs the Docker socket to manage containers.
+  watchtower:
+    image: containrrr/watchtower
+    container_name: nzbfast-watchtower
+    restart: unless-stopped
+    environment:
+      # Same timezone as nzbfast above, so the schedule below means your
+      # 04:00 and not 04:00 UTC.
+      - TZ=Etc/UTC
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --cleanup --schedule "0 0 4 * * *" nzbfast   # daily 04:00, nzbfast only

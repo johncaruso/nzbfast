@@ -1,0 +1,57 @@
+# Bounded fuzz smoke on every PR: a short libFuzzer burst over each
+# untrusted-input parser (yEnc, NZB, PAR2, RAR). This is NOT a full
+# campaign - long campaigns run offline - just enough to catch a change
+# that makes a parser panic/OOB/hang on the seed corpus plus fresh
+# mutations. A crash fails the job and uploads the reproducing input.
+name: fuzz-smoke
+on:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: fuzz-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  fuzz:
+    if: github.repository == 'nzbfast/nzbfast'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: nightly toolchain
+        run: rustup toolchain install nightly --profile minimal && rustup default nightly
+      - name: cache cargo (+ cargo-fuzz binary + fuzz target dir)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            crates/nzbkit/fuzz/target
+          key: fuzz-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: install cargo-fuzz
+        # No-op (exit 0) when the cached binary already matches.
+        run: cargo install cargo-fuzz --locked
+      - name: seed corpora from in-tree fixtures
+        working-directory: crates/nzbkit/fuzz
+        run: |
+          mkdir -p corpus/rar_extract corpus/par2_parse
+          cp ../../../vendor/rars/tests/fixtures/rar*/*.rar corpus/rar_extract/ 2>/dev/null || true
+          cp ../tests/fixtures/par2/*.par2 corpus/par2_parse/ 2>/dev/null || true
+      - name: fuzz burst (60s per target)
+        working-directory: crates/nzbkit/fuzz
+        run: |
+          set -e
+          for t in yenc_decode nzb_parse par2_parse rar_extract; do
+            echo "::group::fuzz $t"
+            cargo +nightly fuzz run "$t" -- \
+              -max_total_time=60 -rss_limit_mb=4096 -timeout=10
+            echo "::endgroup::"
+          done
+      - name: upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-artifacts
+          path: crates/nzbkit/fuzz/artifacts/
+          if-no-files-found: ignore

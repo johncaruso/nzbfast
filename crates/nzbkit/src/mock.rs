@@ -1,0 +1,740 @@
+//! Mock NNTP server for the chaos suite (design: M4): a minimal in-memory
+//! NNTP test server. Serves yEnc articles from memory over plain TCP with
+//! injectable failure modes: missing articles (430), corrupt payloads,
+//! truncated bodies, mid-response stalls, and periodic connection drops.
+//!
+//! Runs on a real socket so the full client stack - TLS-less connect,
+//! AUTHINFO, pipelining, timeouts, reconnects - is exercised end to end.
+
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
+
+/// Failure injection for one mock server.
+#[derive(Default, Clone)]
+pub struct Chaos {
+    /// Message-ids (with angle brackets) answered with 430.
+    pub missing: HashSet<String>,
+    /// Ids whose decoded payload gets a byte flipped (yEnc CRC fails).
+    pub corrupt: HashSet<String>,
+    /// Ids whose body is cut off mid-payload (connection then closed).
+    pub truncate: HashSet<String>,
+    /// Ids that hang after the status line (stall detection). Each id
+    /// stalls only its FIRST request - retries succeed, so tests prove
+    /// recovery rather than permanent failure.
+    pub stall: HashSet<String>,
+    /// Drop the connection after this many successful BODY responses
+    /// (0 = never). Tests reconnect + requeue.
+    pub drop_after: u64,
+    /// Fixed delay before every successful BODY response (a "slow
+    /// server" - per-connection throughput ≈ article_size / delay).
+    pub delay_ms: u64,
+    /// Swallow QUIT silently: no goodbye, connection held open. Models a
+    /// provider that ACKs the QUIT at TCP level but never answers it
+    /// (seen live; used to park the exit path forever).
+    pub mute_quit: bool,
+    /// Accept connections but never send the greeting - the connection
+    /// just sits. Models a mute/half-dead frontend; a worker stuck in
+    /// connect() must not hang a finished run's join.
+    pub mute_greeting: bool,
+    /// Reject OVER (but serve XOVER) with "400 Unrecognized command" -
+    /// models XOVER-only providers (Newshosting) for the client's
+    /// over_supported latch.
+    pub xover_only: bool,
+    /// Answer every OVER *and* XOVER with "411 no such newsgroup" - a
+    /// genuine failure, as opposed to the empty-range 423 the mock serves
+    /// on its own. The client must keep telling the two apart.
+    pub over_rejected: bool,
+    /// Accept `XFEATURE COMPRESS GZIP` (290) and serve subsequent
+    /// OVER/XOVER bodies as one gzip stream followed by a plain-text
+    /// ".\r\n" terminator (the Highwinds TERMINATOR variant).
+    pub gzip_headers: bool,
+    /// Reject POST with "440 posting not allowed" - models providers
+    /// that only accept peer-fed articles, forcing the IHAVE fallback.
+    pub post_rejected: bool,
+    /// Answer the first `n` BODY requests (counted across ALL connections)
+    /// with "502 byte limit exceeded" instead of a body - a non-BODY status
+    /// the client can only treat as a protocol error, so it drops the
+    /// session and reconnects. `Some(u64::MAX)` models the broken-account
+    /// shape: connect and AUTH always succeed, every BODY fails, forever.
+    /// A finite `n` models an account that starts working again.
+    pub body_error: Option<u64>,
+    /// Answer AUTHINFO PASS with "481 authentication failed" - models a
+    /// wrong password or an expired account. TCP connects fine every
+    /// time, so without a per-server circuit break the worker burns its
+    /// whole connect budget on a session it can use for nothing.
+    pub auth_rejected: bool,
+    /// Replace the refusal line `auth_rejected` sends. The point is the
+    /// TEXT: a capacity refusal and a bad credential share reply code
+    /// 481, and only the wording tells them apart, so the tests drive
+    /// the real thing (`481 max simultaneous IP addresses reached`)
+    /// rather than a code.
+    pub auth_refusal_text: Option<String>,
+    /// Upload-side failure injection (POST/IHAVE).
+    pub post: PostChaos,
+}
+
+/// Failure injection for the POSTING path. Grouped because these only
+/// ever matter together and only to the upload tests: the posting path
+/// writes to the operator's real account, so every shape it has to
+/// survive is modelled here rather than tried against a provider.
+#[derive(Default, Clone)]
+pub struct PostChaos {
+    /// Answer the first `n` POST/IHAVE command lines (counted across all
+    /// connections) with a try-again-later status - "503 service
+    /// temporarily unavailable" for POST, "436 transfer failed, try again
+    /// later" for IHAVE. RFC 3977 means these as "ask again", not "give
+    /// up", and nothing is stored.
+    pub try_later: u64,
+    /// Read the first `n` POSTed articles off the wire and then close the
+    /// connection without ever sending the 240/441 - the acknowledgement
+    /// that never arrives (a dead session, or a read the client had to
+    /// time out).
+    pub ack_lost: u64,
+    /// Whether an `ack_lost` article was actually filed. True models "it
+    /// landed, only the acknowledgement was lost"; false models "it never
+    /// landed at all". The two look identical to the client and must not
+    /// be guessed at.
+    pub ack_lost_keeps: bool,
+    /// Answer the first `n` STATs with 430 even for a filed article. Large
+    /// providers commonly separate posting and read farms, so an accepted
+    /// article can be duplicate-rejected on resend before STAT propagation.
+    pub stat_miss: u64,
+    /// Drop the connection when a STAT arrives, so it is never ANSWERED at
+    /// all. This is the posting-only account (no read access, so nothing
+    /// can STAT) and the severed read path - distinct from `stat_miss`,
+    /// which is a decisive "not here". The client must not let an
+    /// unanswerable STAT erase what the server already said.
+    pub stat_dies: bool,
+    /// Wording for the 441 a server gives when it ALREADY HOLDS the
+    /// resent article. Defaults to INN's `441 435 Duplicate article
+    /// rejected`. 441 is free-form, so a server is free to say it any
+    /// other way, and the client must not treat an unfamiliar spelling as
+    /// proof the article is absent.
+    pub duplicate_text: Option<String>,
+    /// Once `reject_after` articles have been received, answer every
+    /// POSTed article with `441 <text>` and store nothing - a genuine
+    /// rejection, whose free-form text is whatever the server feels like
+    /// saying.
+    pub reject_441: Option<String>,
+    /// How many articles are accepted before `reject_441` starts.
+    pub reject_after: u64,
+}
+
+/// Shared POST-path counters (across every connection of one server):
+/// POST/IHAVE command lines seen, and articles actually read off the wire.
+#[derive(Default)]
+struct PostCounters {
+    commands: AtomicU64,
+    articles: AtomicU64,
+    stats: AtomicU64,
+}
+
+/// One overview row served for OVER/XOVER (spot-ingestion tests).
+#[derive(Debug, Clone)]
+pub struct OverRow {
+    pub number: u64,
+    pub subject: String,
+    pub from: String,
+    /// With angle brackets.
+    pub message_id: String,
+    pub bytes: u64,
+}
+
+/// Header-plane data (HEAD + OVER); empty for the classic body-only mock.
+#[derive(Default)]
+struct HeaderPlane {
+    /// Message-id (with angle brackets) → raw header block (CRLF lines).
+    headers: HashMap<String, Vec<u8>>,
+    overview: Vec<OverRow>,
+}
+
+/// One article on the wire: the raw dot-stuffed yEnc body.
+fn wire_body(article: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(article.len() + 16);
+    for line in article.split_inclusive(|&b| b == b'\n') {
+        if line.first() == Some(&b'.') {
+            out.push(b'.');
+        }
+        out.extend_from_slice(line);
+    }
+    out.extend_from_slice(b".\r\n");
+    out
+}
+
+pub struct MockServer {
+    pub addr: SocketAddr,
+    /// Total BODY requests served (across all connections).
+    pub served: Arc<AtomicU64>,
+    /// Total TCP connections accepted, ever. The pacing tests assert on
+    /// this: a broken account must not be reconnected to at full rate.
+    pub accepted: Arc<AtomicU64>,
+    /// Every BODY request's message-id (with angle brackets) in arrival
+    /// order, across all connections - the M11 tests assert queue-order
+    /// effects (head/tail burst, seek promotion) against this.
+    pub body_log: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Test-controllable serving gate: while true, every connection stops
+    /// reading (and thus logging/serving) commands at its next loop turn.
+    /// Lets ordering tests freeze the world, land a queue reorder at a
+    /// known point in `body_log`, and then release - no wall-clock races.
+    pub pause: Arc<std::sync::atomic::AtomicBool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for MockServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+impl MockServer {
+    /// `articles`: message-id (WITH angle brackets) → yEnc article body
+    /// (un-stuffed; stuffing happens at the wire).
+    pub async fn start(articles: HashMap<String, Vec<u8>>, chaos: Chaos) -> MockServer {
+        Self::start_full(articles, HashMap::new(), Vec::new(), chaos).await
+    }
+
+    /// Like [`MockServer::start`], plus a header plane: per-article HEAD
+    /// responses and OVER/XOVER overview rows (spot-ingestion E2E). With a
+    /// non-empty overview, GROUP reports its real low/high range.
+    pub async fn start_full(
+        articles: HashMap<String, Vec<u8>>,
+        headers: HashMap<String, Vec<u8>>,
+        overview: Vec<OverRow>,
+        chaos: Chaos,
+    ) -> MockServer {
+        Self::start_bound("127.0.0.1:0", articles, headers, overview, chaos).await
+    }
+
+    /// Like [`MockServer::start_full`] on a caller-chosen bind address -
+    /// the standalone `mockserv` example needs a stable port so an
+    /// installed daemon can be pointed at it (installer acceptance runs
+    /// on boxes with no Usenet account).
+    pub async fn start_bound(
+        bind: &str,
+        articles: HashMap<String, Vec<u8>>,
+        headers: HashMap<String, Vec<u8>>,
+        overview: Vec<OverRow>,
+        chaos: Chaos,
+    ) -> MockServer {
+        let listener = TcpListener::bind(bind).await.expect("bind mock");
+        let addr = listener.local_addr().unwrap();
+        // Mutex (not plain Arc): POST/IHAVE insert articles at runtime.
+        let articles = Arc::new(std::sync::Mutex::new(articles));
+        let plane = Arc::new(HeaderPlane { headers, overview });
+        let served = Arc::new(AtomicU64::new(0));
+        let served2 = served.clone();
+        let body_log: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let body_log2 = body_log.clone();
+        let stall_once: Arc<std::sync::Mutex<HashSet<String>>> =
+            Arc::new(std::sync::Mutex::new(chaos.stall.clone()));
+        let pause: Arc<std::sync::atomic::AtomicBool> = Default::default();
+        let pause2 = pause.clone();
+        let accepted = Arc::new(AtomicU64::new(0));
+        let accepted2 = accepted.clone();
+        let post_counters: Arc<PostCounters> = Default::default();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    return;
+                };
+                accepted2.fetch_add(1, Ordering::Relaxed);
+                let articles = articles.clone();
+                let plane = plane.clone();
+                let chaos = chaos.clone();
+                let served = served2.clone();
+                let body_log = body_log2.clone();
+                let stall_once = stall_once.clone();
+                let pause = pause2.clone();
+                let post_counters = post_counters.clone();
+                tokio::spawn(async move {
+                    let _ = serve_conn(
+                        sock,
+                        articles,
+                        plane,
+                        chaos,
+                        served,
+                        body_log,
+                        stall_once,
+                        pause,
+                        post_counters,
+                    )
+                    .await;
+                });
+            }
+        });
+        MockServer {
+            addr,
+            served,
+            accepted,
+            body_log,
+            pause,
+            handle,
+        }
+    }
+
+    /// A ServerConfig pointing at this mock (plain TCP, no auth).
+    pub fn server_config(&self) -> crate::config::ServerConfig {
+        crate::config::ServerConfig {
+            host: self.addr.ip().to_string(),
+            port: self.addr.port(),
+            tls: false,
+            username: None,
+            password: None,
+            connections: 50,
+            rcvbuf: None,
+            level: 0,
+            group: None,
+            retention_days: 0,
+            block_bytes: None,
+            bind_ip: None,
+            socks5: None,
+            enabled: true,
+        warm_pool: false,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_conn(
+    sock: tokio::net::TcpStream,
+    articles: Arc<std::sync::Mutex<HashMap<String, Vec<u8>>>>,
+    plane: Arc<HeaderPlane>,
+    chaos: Chaos,
+    served: Arc<AtomicU64>,
+    body_log: Arc<std::sync::Mutex<Vec<String>>>,
+    stall_once: Arc<std::sync::Mutex<HashSet<String>>>,
+    pause: Arc<std::sync::atomic::AtomicBool>,
+    post_counters: Arc<PostCounters>,
+) -> std::io::Result<()> {
+    sock.set_nodelay(true)?;
+    let (r, mut w) = sock.into_split();
+    let mut reader = BufReader::new(r);
+    if chaos.mute_greeting {
+        // Hold the connection open, saying nothing, discarding everything.
+        use tokio::io::AsyncReadExt;
+        let mut sink = [0u8; 1024];
+        loop {
+            if reader.read(&mut sink).await? == 0 {
+                return Ok(());
+            }
+        }
+    }
+    w.write_all(b"200 mock ready\r\n").await?;
+
+    let mut line = String::new();
+    let mut bodies_served = 0u64;
+    // Per-connection header-compression state (XFEATURE COMPRESS GZIP).
+    let mut gzip_on = false;
+    loop {
+        while pause.load(Ordering::Acquire) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        line.clear();
+        if reader.read_line(&mut line).await? == 0 {
+            return Ok(());
+        }
+        let cmd = line.trim_end();
+        let upper = cmd.to_ascii_uppercase();
+        if upper.starts_with("AUTHINFO USER") {
+            w.write_all(b"381 password required\r\n").await?;
+        } else if upper.starts_with("AUTHINFO PASS") {
+            if chaos.auth_rejected {
+                let line = chaos
+                    .auth_refusal_text
+                    .as_deref()
+                    .unwrap_or("481 authentication failed");
+                w.write_all(format!("{line}\r\n").as_bytes()).await?;
+                return Ok(());
+            }
+            w.write_all(b"281 welcome\r\n").await?;
+        } else if upper.starts_with("QUIT") {
+            if chaos.mute_quit {
+                continue; // no goodbye, connection stays up - client's problem
+            }
+            w.write_all(b"205 bye\r\n").await?;
+            return Ok(());
+        } else if upper.starts_with("GROUP") {
+            if plane.overview.is_empty() {
+                w.write_all(b"211 100 1 100 mock.group\r\n").await?;
+            } else {
+                let low = plane.overview.iter().map(|r| r.number).min().unwrap_or(1);
+                let high = plane.overview.iter().map(|r| r.number).max().unwrap_or(1);
+                let name = cmd.split_whitespace().nth(1).unwrap_or("mock.group");
+                w.write_all(
+                    format!("211 {} {low} {high} {name}\r\n", plane.overview.len()).as_bytes(),
+                )
+                .await?;
+            }
+        } else if upper.starts_with("XFEATURE COMPRESS GZIP") {
+            if chaos.gzip_headers {
+                gzip_on = true;
+                w.write_all(b"290 Feature Enabled\r\n").await?;
+            } else {
+                w.write_all(b"400 Unrecognized command\r\n").await?;
+            }
+        } else if upper.starts_with("OVER") && !upper.starts_with("XOVER") && chaos.xover_only {
+            // XOVER-only provider: OVER is an unknown command
+            // (Newshosting's exact wording).
+            w.write_all(b"400 Unrecognized command\r\n").await?;
+        } else if (upper.starts_with("OVER") || upper.starts_with("XOVER")) && chaos.over_rejected {
+            w.write_all(b"411 no such newsgroup\r\n").await?;
+        } else if upper.starts_with("OVER") || upper.starts_with("XOVER") {
+            // "OVER a-b" / "OVER a" - overview rows within the range.
+            let range = cmd.split_whitespace().nth(1).unwrap_or("");
+            let (a, b) = match range.split_once('-') {
+                Some((a, b)) => (
+                    a.trim().parse().unwrap_or(0),
+                    b.trim().parse().unwrap_or(u64::MAX),
+                ),
+                None => {
+                    let n = range.trim().parse().unwrap_or(0);
+                    (n, n)
+                }
+            };
+            let rows: Vec<&OverRow> = plane
+                .overview
+                .iter()
+                .filter(|r| r.number >= a && r.number <= b)
+                .collect();
+            if rows.is_empty() {
+                // RFC 3977: a valid range holding no articles is 423, not an
+                // empty 224 body - INN answers exactly this. Serving 224 for
+                // every range is what let an empty-range bug ship unnoticed.
+                w.write_all(b"423 no articles in that range\r\n").await?;
+            } else {
+                w.write_all(b"224 overview follows\r\n").await?;
+                let mut body = Vec::new();
+                for r in rows {
+                    body.extend_from_slice(
+                        format!(
+                            "{}\t{}\t{}\tThu, 1 Jan 2026 00:00:00 GMT\t{}\t\t{}\t1\r\n",
+                            r.number, r.subject, r.from, r.message_id, r.bytes
+                        )
+                        .as_bytes(),
+                    );
+                }
+                if gzip_on {
+                    // Highwinds TERMINATOR variant: one gzip stream, then a
+                    // plain-text dot line on the wire.
+                    use std::io::Write as _;
+                    let mut enc = flate2::write::GzEncoder::new(
+                        Vec::new(),
+                        flate2::Compression::fast(),
+                    );
+                    enc.write_all(&body)?;
+                    w.write_all(&enc.finish()?).await?;
+                } else {
+                    w.write_all(&body).await?;
+                }
+                w.write_all(b".\r\n").await?;
+            }
+        } else if let Some(id) = cmd
+            .strip_prefix("HEAD ")
+            .or_else(|| cmd.strip_prefix("head "))
+        {
+            match plane.headers.get(id.trim()) {
+                Some(h) => {
+                    w.write_all(format!("221 0 {}\r\n", id.trim()).as_bytes())
+                        .await?;
+                    w.write_all(&wire_body(h)).await?;
+                }
+                None => w.write_all(b"430 no such article\r\n").await?,
+            }
+        } else if upper == "POST" {
+            if chaos.post_rejected {
+                w.write_all(b"440 posting not allowed\r\n").await?;
+            } else if post_counters.commands.fetch_add(1, Ordering::Relaxed)
+                < chaos.post.try_later
+            {
+                w.write_all(b"503 service temporarily unavailable\r\n").await?;
+            } else {
+                w.write_all(b"340 send article to be posted\r\n").await?;
+                w.flush().await?;
+                match read_posted_article(&mut reader).await? {
+                    Some((id, body)) => {
+                        let nth = post_counters.articles.fetch_add(1, Ordering::Relaxed) + 1;
+                        if nth <= chaos.post.ack_lost {
+                            // Article read, nothing said back, socket gone.
+                            if chaos.post.ack_lost_keeps {
+                                articles.lock().unwrap().insert(id, body);
+                            }
+                            return Ok(());
+                        }
+                        let reject = chaos
+                            .post
+                            .reject_441
+                            .as_deref()
+                            .filter(|_| nth > chaos.post.reject_after);
+                        let duplicate = articles.lock().unwrap().contains_key(&id);
+                        if let Some(text) = reject {
+                            w.write_all(format!("441 {text}\r\n").as_bytes()).await?;
+                        } else if duplicate {
+                            // A real server keeps the copy it already has and
+                            // refuses the resend, quoting the reason code in
+                            // the free-form part (INN's shape). Only a STAT
+                            // distinguishes this from a rejection that merely
+                            // mentions duplicates.
+                            let line = chaos
+                                .post
+                                .duplicate_text
+                                .as_deref()
+                                .unwrap_or("441 435 Duplicate article rejected");
+                            w.write_all(format!("{line}\r\n").as_bytes()).await?;
+                        } else {
+                            articles.lock().unwrap().insert(id, body);
+                            w.write_all(b"240 article received\r\n").await?;
+                        }
+                    }
+                    None => w.write_all(b"441 posting failed\r\n").await?,
+                }
+            }
+        } else if let Some(id) = cmd
+            .strip_prefix("IHAVE ")
+            .or_else(|| cmd.strip_prefix("ihave "))
+        {
+            let claimed = id.trim().to_string();
+            if post_counters.commands.fetch_add(1, Ordering::Relaxed) < chaos.post.try_later {
+                w.write_all(b"436 transfer failed, try again later\r\n").await?;
+            } else if articles.lock().unwrap().contains_key(&claimed) {
+                w.write_all(b"435 article not wanted\r\n").await?;
+            } else {
+                w.write_all(b"335 send it\r\n").await?;
+                w.flush().await?;
+                match read_posted_article(&mut reader).await? {
+                    Some((_, body)) => {
+                        let nth = post_counters.articles.fetch_add(1, Ordering::Relaxed) + 1;
+                        if nth <= chaos.post.ack_lost {
+                            // Article read, nothing said back, socket gone.
+                            if chaos.post.ack_lost_keeps {
+                                articles.lock().unwrap().insert(claimed, body);
+                            }
+                            return Ok(());
+                        }
+                        // File under the id the client CLAIMED - that is
+                        // the id its NZB will carry.
+                        articles.lock().unwrap().insert(claimed, body);
+                        w.write_all(b"235 article transferred\r\n").await?;
+                    }
+                    None => w.write_all(b"436 transfer failed\r\n").await?,
+                }
+            }
+        } else if upper.starts_with("CAPABILITIES") {
+            w.write_all(b"101 capabilities\r\nVERSION 2\r\nPIPELINING\r\n.\r\n")
+                .await?;
+        } else if upper.starts_with("DATE") {
+            w.write_all(b"111 20260719000000\r\n").await?;
+        } else if let Some(id) = cmd
+            .strip_prefix("STAT ")
+            .or_else(|| cmd.strip_prefix("stat "))
+        {
+            let id = id.trim();
+            let nth = post_counters.stats.fetch_add(1, Ordering::Relaxed) + 1;
+            if chaos.post.stat_dies {
+                return Ok(());
+            }
+            if nth > chaos.post.stat_miss
+                && articles.lock().unwrap().contains_key(id)
+                && !chaos.missing.contains(id)
+            {
+                w.write_all(format!("223 0 {id}\r\n").as_bytes()).await?;
+            } else {
+                w.write_all(b"430 no such article\r\n").await?;
+            }
+        } else if let Some(id) = cmd
+            .strip_prefix("BODY ")
+            .or_else(|| cmd.strip_prefix("body "))
+        {
+            let id = id.trim().to_string();
+            let nth = {
+                let mut log = body_log.lock().unwrap();
+                log.push(id.clone());
+                log.len() as u64
+            };
+            if chaos.body_error.is_some_and(|n| nth <= n) {
+                // Not a BODY status at all: the client can only treat this
+                // as a protocol error and drop the session.
+                w.write_all(b"502 byte limit exceeded\r\n").await?;
+                w.flush().await?;
+                continue;
+            }
+            if chaos.missing.contains(&id) {
+                w.write_all(b"430 no such article\r\n").await?;
+                continue;
+            }
+            let Some(article) = articles.lock().unwrap().get(&id).cloned() else {
+                w.write_all(b"430 no such article\r\n").await?;
+                continue;
+            };
+            if chaos.delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(chaos.delay_ms)).await;
+            }
+            w.write_all(format!("222 0 {id}\r\n").as_bytes()).await?;
+            if stall_once.lock().unwrap().remove(&id) {
+                // Status sent, body never comes - the client's per-response
+                // timeout must fire; the NEXT request for this id succeeds.
+                w.flush().await?;
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                return Ok(());
+            }
+            let mut body = article;
+            if chaos.corrupt.contains(&id) {
+                // Flip a byte in the middle of the payload region.
+                let mid = body.len() / 2;
+                body[mid] ^= 0x01;
+            }
+            let mut wire = wire_body(&body);
+            if chaos.truncate.contains(&id) {
+                wire.truncate(wire.len() / 2);
+                w.write_all(&wire).await?;
+                return Ok(()); // cut the connection mid-body
+            }
+            w.write_all(&wire).await?;
+            served.fetch_add(1, Ordering::Relaxed);
+            bodies_served += 1;
+            if chaos.drop_after > 0 && bodies_served >= chaos.drop_after {
+                return Ok(()); // abrupt close; client must reconnect/requeue
+            }
+        } else if let Some(id) = cmd
+            .strip_prefix("ARTICLE ")
+            .or_else(|| cmd.strip_prefix("article "))
+        {
+            // ARTICLE = headers + body in one response. Some clients
+            // fetch via ARTICLE rather than BODY. Mirror the BODY
+            // path with a 220 status and a minimal synthetic header block;
+            // the yEnc body is byte-for-byte identical, so a decoder that
+            // scans for =ybegin is unaffected. Same chaos hooks as BODY.
+            let id = id.trim().to_string();
+            body_log.lock().unwrap().push(id.clone());
+            if chaos.missing.contains(&id) {
+                w.write_all(b"430 no such article\r\n").await?;
+                continue;
+            }
+            let Some(article) = articles.lock().unwrap().get(&id).cloned() else {
+                w.write_all(b"430 no such article\r\n").await?;
+                continue;
+            };
+            if chaos.delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(chaos.delay_ms)).await;
+            }
+            w.write_all(format!("220 0 {id}\r\n").as_bytes()).await?;
+            if stall_once.lock().unwrap().remove(&id) {
+                w.flush().await?;
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                return Ok(());
+            }
+            let mut body = article;
+            if chaos.corrupt.contains(&id) {
+                let mid = body.len() / 2;
+                body[mid] ^= 0x01;
+            }
+            // Minimal header block, blank line, then the dot-stuffed yEnc
+            // body (which already carries the terminating ".\r\n").
+            let mut wire = format!(
+                "Message-ID: {id}\r\nNewsgroups: alt.binaries.bench\r\nSubject: bench article\r\n\r\n"
+            )
+            .into_bytes();
+            wire.extend_from_slice(&wire_body(&body));
+            if chaos.truncate.contains(&id) {
+                wire.truncate(wire.len() / 2);
+                w.write_all(&wire).await?;
+                return Ok(());
+            }
+            w.write_all(&wire).await?;
+            served.fetch_add(1, Ordering::Relaxed);
+            bodies_served += 1;
+            if chaos.drop_after > 0 && bodies_served >= chaos.drop_after {
+                return Ok(());
+            }
+        } else {
+            w.write_all(b"500 what\r\n").await?;
+        }
+        w.flush().await?;
+    }
+}
+
+/// Read one POST/IHAVE continuation article off the wire: headers, blank
+/// line, dot-stuffed body, lone-dot terminator. Returns the Message-ID
+/// (with angle brackets) and the UN-stuffed body - the same shape the
+/// `articles` map holds, so BODY re-stuffs it on the way back out.
+/// Byte-oriented on purpose: yEnc payload lines are not valid UTF-8.
+async fn read_posted_article<R>(reader: &mut R) -> std::io::Result<Option<(String, Vec<u8>)>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut msgid: Option<String> = None;
+    let mut body: Vec<u8> = Vec::new();
+    let mut in_body = false;
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line).await? == 0 {
+            return Ok(None); // connection died mid-article
+        }
+        let trimmed: &[u8] = {
+            let mut t = &line[..];
+            while t.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
+                t = &t[..t.len() - 1];
+            }
+            t
+        };
+        if trimmed == b"." {
+            break;
+        }
+        if !in_body {
+            if trimmed.is_empty() {
+                in_body = true;
+                continue;
+            }
+            let text = String::from_utf8_lossy(trimmed);
+            if let Some(v) = text
+                .strip_prefix("Message-ID:")
+                .or_else(|| text.strip_prefix("Message-Id:"))
+            {
+                msgid = Some(v.trim().to_string());
+            }
+            continue;
+        }
+        // Un-dot-stuff and store with CRLF endings.
+        let payload = if trimmed.starts_with(b"..") { &trimmed[1..] } else { trimmed };
+        body.extend_from_slice(payload);
+        body.extend_from_slice(b"\r\n");
+    }
+    match msgid {
+        Some(id) if !id.is_empty() && !body.is_empty() => Ok(Some((id, body))),
+        _ => Ok(None),
+    }
+}
+
+/// Build the articles for one file: split `data` into `art_size` pieces and
+/// yEnc-encode each as `<stem>-partNN@mock`. Returns (segments for the NZB:
+/// (message-id-sans-brackets, encoded-size, part-no), articles map entries).
+pub fn make_file_articles(
+    name: &str,
+    data: &[u8],
+    art_size: usize,
+    idtag: &str,
+    out: &mut HashMap<String, Vec<u8>>,
+) -> Vec<(String, u64, u32)> {
+    let total = data.len().div_ceil(art_size).max(1) as u32;
+    let mut segs = Vec::new();
+    for (i, chunk) in data.chunks(art_size.max(1)).enumerate() {
+        let part = i as u32 + 1;
+        let begin = (i * art_size) as u64 + 1;
+        let article = crate::yenc::encode(
+            name,
+            data.len() as u64,
+            Some((part, total)),
+            begin,
+            chunk,
+        );
+        let id = format!("{idtag}-{part}@mock");
+        segs.push((id.clone(), article.len() as u64, part));
+        out.insert(format!("<{id}>"), article);
+    }
+    segs
+}

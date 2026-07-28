@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Candidate A2: A with a heavier bolt. The 16 px test showed A's bolt
+     thinning out at the waist, so the strokes are widened and the whole
+     glyph sits larger in the tile. Slipstream lines shortened so they
+     read as motion rather than as stripes. -->
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="tileg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5aa8ff"/>
+      <stop offset="1" stop-color="#6d47e6"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#tileg)"/>
+  <g fill="#fff">
+    <rect x="168" y="332" width="196" height="52" rx="26" opacity=".32"/>
+    <rect x="168" y="486" width="272" height="52" rx="26" opacity=".48"/>
+    <rect x="168" y="640" width="196" height="52" rx="26" opacity=".32"/>
+  </g>
+  <!-- Wider waist: the mid bar spans 250px so it survives a 16px downscale. -->
+  <path d="M 742 142 L 396 552 L 578 552 L 452 882 L 796 462 L 606 462 Z" fill="#fff"/>
+</svg>

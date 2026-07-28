@@ -1,0 +1,2794 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>nzbfast · wall</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Same real PNG icons as the dashboard - see the note there. The wall is
+     the same app on the same origin, so it takes the app mark rather than
+     its own emoji. -->
+<link rel="icon" type="image/png" sizes="32x32" href="/icons/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="/icons/favicon-16.png">
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+<link rel="manifest" href="/site.webmanifest">
+<!--
+  nzbfast poster wall (M13) - browse the built-in index like a movie wall
+  (the Zidoo/Kaleidescape/DMB experience, not a file list). Self-contained:
+  data from /api?mode=wall2, posters from the daemon's /art cache; without a
+  TMDB key every card renders a deterministic art-deco placeholder instead.
+  Themed from the shared tokens below, like every other page: the wall used
+  to force its own dark palette, which is why choosing Light left it black.
+  The scrims that sit ON poster artwork stay dark on purpose - they are read
+  against the image, not against the page.
+-->
+<!-- Shared design tokens + the pre-paint theme script, substituted by
+     serve.rs from web/ui-tokens.html. The wall used to be dark-only with
+     its own palette, so a user who chose Light got a light dashboard and
+     a pitch-black wall. -->
+__NZBFAST_UI_TOKENS__
+<style>
+*{box-sizing:border-box}
+html{scrollbar-color:color-mix(in srgb,var(--fg) 26%,transparent) var(--bg)}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font:14px/1.5 -apple-system,BlinkMacSystemFont,system-ui,Segoe UI,sans-serif;
+  -webkit-font-smoothing:antialiased}
+/* §5 2c CJK: <html lang> is stamped by the i18n loader - CJK-only rules,
+   Latin locales untouched. Same stacks as the dashboard. */
+:root[lang=ja] body{font-family:-apple-system,BlinkMacSystemFont,system-ui,"Hiragino Kaku Gothic ProN","Hiragino Sans","Yu Gothic UI",YuGothic,Meiryo,"Noto Sans CJK JP","Noto Sans JP","Segoe UI",sans-serif}
+:root[lang=zh] body{font-family:-apple-system,BlinkMacSystemFont,system-ui,"PingFang SC","Microsoft YaHei UI","Microsoft YaHei","Noto Sans CJK SC","Noto Sans SC","Segoe UI",sans-serif}
+:root[lang=ko] body{font-family:-apple-system,BlinkMacSystemFont,system-ui,"Apple SD Gothic Neo","Malgun Gothic","Noto Sans CJK KR","Noto Sans KR","Segoe UI",sans-serif}
+/* Full kinsoku (no break before small kana / 々 / closing brackets).
+   Deliberately NOT word-break:break-all - that would chop embedded Latin
+   release stems mid-token. See dashboard.html for the long note. */
+:root[lang=ja],:root[lang=zh],:root[lang=ko]{line-break:strict}
+/* §5 2b RTL: dir="rtl" is stamped by the i18n loader (he/ar/fa); layout
+   mirrors via flex/grid + the logical properties below (byte-identical
+   under ltr). Kept physical on purpose: the centered #toast, and the
+   phone @media layer (untouched, v1 scope). The ‹/› pager chevrons are
+   bidi-mirrored glyphs, so they flip by themselves. See dashboard.html
+   for the full RTL notes (charts, overlays). */
+/* <code> always holds CLI/LTR tokens - isolate so leading "--" flags
+   don't wander in RTL prose. */
+[dir=rtl] code{direction:ltr;unicode-bidi:isolate}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+
+/* ---- top bar ---- */
+.bar{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:12px;
+  flex-wrap:wrap;row-gap:8px;
+  padding:12px 22px;background:color-mix(in srgb,var(--bg) 82%,transparent);
+  backdrop-filter:blur(14px);border-bottom:1px solid var(--line)}
+/* The nav travels as one block and is pushed to the end, so the four
+   pills wrap together onto a second row rather than the last one
+   (manual) being cut off the right edge - which is what happened the
+   moment the wall gained the dashboard's full nav. */
+.bar .nav{display:flex;align-items:center;gap:8px;margin-inline-start:auto;flex-wrap:wrap}
+.bar h1{font-size:16px;margin:0;font-weight:650;white-space:nowrap}
+.bar h1 a{color:var(--fg);text-decoration:none}
+.tabs{display:flex;gap:2px;background:var(--surface);border:1px solid var(--line);
+  border-radius:var(--radius-sm);padding:3px}
+.tabs button{background:transparent;border:none;color:var(--dim);font-size:12.5px;
+  padding:5px 12px;border-radius:7px;cursor:pointer;font-weight:550}
+.tabs button.on{background:var(--surface-2);color:var(--fg)}
+#q{flex:1;min-width:120px;max-width:420px;padding:8px 13px;border-radius:var(--radius-sm);
+  border:1px solid var(--line);background:var(--surface);color:var(--fg);font-size:13.5px;outline:none}
+#q:focus{border-color:var(--acc)}
+select{background:var(--surface);color:var(--fg);border:1px solid var(--line);
+  border-radius:var(--radius-sm);padding:7px 9px;font-size:12.5px;cursor:pointer}
+.count{color:var(--dim);font-size:12px;white-space:nowrap}
+.mtog{display:flex;align-items:center;gap:5px;color:var(--dim);font-size:12px;
+  white-space:nowrap;cursor:pointer;user-select:none}
+.mtog input{accent-color:var(--acc);margin:0}
+.chip{background:var(--surface);border:1px solid var(--line);color:var(--dim);
+  font-size:11.5px;padding:4px 10px;border-radius:999px;cursor:pointer;white-space:nowrap}
+.chip:hover{color:var(--fg);border-color:var(--acc)}
+.bar .dash{color:var(--dim);font-size:12.5px;text-decoration:none;white-space:nowrap}
+.bar .dash:hover{color:var(--fg)}
+/* Navigation pills, identical to the dashboard's: same four destinations
+   in the same order on both pages, with the current one marked. Before
+   this, getting back to the dashboard was a differently-worded link in a
+   different place depending on which screen you were on. */
+.bar .pill{font-size:12px;color:var(--dim);border:1px solid var(--line);border-radius:99px;
+  padding:4px 11px;text-decoration:none;white-space:nowrap;
+  transition:color .12s,border-color .12s,background .12s}
+.bar .pill:hover{color:var(--fg);border-color:color-mix(in srgb,var(--fg) 28%,transparent)}
+.bar .pill.on{color:var(--fg);border-color:var(--acc);
+  background:color-mix(in srgb,var(--acc) 14%,transparent)}
+.bar .pill:focus-visible{outline:1px solid var(--acc);outline-offset:2px}
+
+/* §Stage4 View popover. The bar held 29 controls across three visual
+   idioms (segmented tabs, chips, pills) and, being sticky, took 40% of an
+   812px phone viewport for good. Search, categories, Wall/Releases and
+   sort stay out here; layout and filters moved in here. */
+.viewpop{position:relative;display:flex;align-items:center}
+.vpbtn{display:inline-flex;align-items:center;gap:5px}
+.vpbtn.on{color:var(--fg);border-color:var(--acc);background:color-mix(in srgb,var(--acc) 14%,transparent)}
+/* A count of what is switched on in there. Without it, "Matched only"
+   (on by default) silently hides cards from behind a closed panel. */
+.vpbtn .vpn{display:inline-grid;place-items:center;min-width:16px;height:16px;padding:0 4px;
+  border-radius:99px;background:var(--acc);color:#fff;font-size:10px;font-weight:700}
+.vpmenu{position:fixed;z-index:30;
+  width:min(330px,92vw);background:var(--surface);border:1px solid var(--line);
+  border-radius:var(--radius);box-shadow:0 18px 50px rgba(0,0,0,.45);padding:12px 14px 14px}
+.vpmenu[hidden]{display:none}
+.vphead{display:flex;align-items:center;gap:8px;margin-bottom:11px;font-size:13.5px}
+.vphead .grow{flex:1}
+.vpbody{display:flex;flex-direction:column;gap:11px;align-items:stretch}
+.vpbody .tabs{width:100%}
+.vpbody .tabs button{flex:1}
+.vpbody .zoom{width:100%}
+.vpbody .zoom input{flex:1;width:auto}
+.vpbody .mtog{justify-content:flex-start}
+.vpbody .chip{align-self:flex-start}
+.vpback{position:fixed;inset:0;z-index:29;display:none}
+.vpback.on{display:block}
+.sortwrap{display:flex;align-items:center;gap:8px}
+#dir .ic{transition:transform .15s}
+#dir.up .ic{transform:rotate(180deg)}
+.vpbody .sortwrap{width:100%}
+.vpbody .sortwrap select{flex:1;min-width:0}
+.vpbody .count{align-self:flex-start}
+.vpbody .nav{flex-wrap:wrap;gap:8px;margin:2px 0 0}
+@media(max-width:640px){
+  /* A bottom sheet, so the panel is reachable one-handed and the bar
+     stays short. */
+  .vpmenu{inset:auto 0 0 0!important;width:auto;max-height:78vh;overflow-y:auto;
+    border-radius:16px 16px 0 0;
+    padding:14px 16px calc(18px + env(safe-area-inset-bottom,0px));
+    box-shadow:0 -14px 44px rgba(0,0,0,.5)}
+  .vpback.on{background:rgba(0,0,0,.4)}
+}
+
+/* ---- grid ----
+   Poster size is one inherited variable so the density presets and the
+   zoom slider can drive the whole grid (columns, and the placeholder
+   size content-visibility needs) from a single property. 24C: the old
+   grid/dense pair was this same grid at two --tile values; .small is now
+   stamped by JS whenever the EFFECTIVE tile drops under 120px, however
+   it got there (preset or slider), and drops the caption's second line. */
+.wall.small{gap:14px 10px}
+.wall.small .cap .sub{display:none}
+.wall{--tile:152px;display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(var(--tile),1fr));
+  gap:18px 14px;padding:20px 22px 60px;max-width:1660px;margin:0 auto}
+.card{cursor:pointer;border-radius:10px;outline:none;content-visibility:auto;
+  contain-intrinsic-size:var(--tile) calc(var(--tile) * 1.78)}
+/* Zoom slider, next to the view buttons it fine-tunes. */
+.zoom{display:flex;align-items:center;gap:6px;color:var(--dim);font-size:12px}
+.zoom input{width:88px;accent-color:var(--acc);cursor:pointer;margin:0}
+.zoom input:focus-visible{outline:1px solid var(--acc);outline-offset:3px}
+.poster{position:relative;aspect-ratio:2/3;border-radius:var(--radius-sm);overflow:hidden;
+  background:var(--surface);box-shadow:0 2px 10px rgba(0,0,0,.5);
+  transition:transform .16s ease,box-shadow .16s ease}
+.card:hover .poster,.card:focus-visible .poster{transform:scale(1.045);
+  box-shadow:0 8px 26px rgba(0,0,0,.65),0 0 0 2px var(--acc)}
+.poster img{width:100%;height:100%;object-fit:cover;display:block}
+.ph{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;
+  justify-content:center;text-align:center;padding:12px;gap:6px}
+.ph .t{font-weight:650;font-size:14.5px;line-height:1.25;text-shadow:0 1px 4px rgba(0,0,0,.5)}
+.ph .y{font-size:12px;opacity:.75}
+.badge{position:absolute;top:7px;inset-inline-start:7px;background:rgba(0,0,0,.62);color:#fff;
+  font-size:10px;font-weight:650;letter-spacing:.03em;padding:2.5px 7px;border-radius:6px;
+  backdrop-filter:blur(4px)}
+.badge.tv{inset-inline-start:auto;inset-inline-end:7px;background:rgba(77,163,255,.85)}
+.dotrow{position:absolute;bottom:7px;inset-inline-start:7px;display:flex;gap:4px}
+/* M30: hover-reveal "Not interested" on each card. Bottom corner so it
+   never collides with the quality/TV badges up top. */
+.hidebtn{position:absolute;bottom:7px;inset-inline-end:7px;display:none;
+  align-items:center;justify-content:center;width:24px;height:24px;border-radius:50%;
+  background:rgba(0,0,0,.62);border:none;color:#fff;font-size:12px;cursor:pointer;
+  backdrop-filter:blur(4px)}
+.card:hover .hidebtn,.card:focus-visible .hidebtn{display:flex}
+.hidebtn:hover{background:rgba(236,90,90,.9)}
+@media(pointer:coarse){.hidebtn{display:flex;opacity:.75}}
+/* M30: filter chips row + category section headers. */
+/* §Stage4: the row scrolls with the scrollbar hidden, so at any width
+   where it overflowed it was simply cut off mid-glyph with nothing to say
+   more existed. Fade whichever end still has chips behind it. */
+#chips{max-width:1660px;margin:0 auto;padding:10px 22px 0;display:flex;gap:7px;
+  overflow-x:auto;scrollbar-width:none;white-space:nowrap;
+  --fadeL:transparent 0,#000 0;--fadeR:#000 calc(100% - 0px),transparent 100%;
+  -webkit-mask-image:linear-gradient(to right,var(--fadeL)),linear-gradient(to right,var(--fadeR));
+  -webkit-mask-composite:source-in;mask-image:linear-gradient(to right,var(--fadeL)),linear-gradient(to right,var(--fadeR));
+  mask-composite:intersect}
+#chips::-webkit-scrollbar{display:none}
+#chips.fadeL{--fadeL:transparent 0,#000 46px}
+#chips.fadeR{--fadeR:#000 calc(100% - 46px),transparent 100%}
+#chips .chip.on{background:var(--acc);border-color:var(--acc);color:#fff}
+#chips .gsep{flex:none;width:1px;background:var(--line);margin:2px 4px}
+.wallhead{grid-column:1/-1;font-size:12px;text-transform:uppercase;
+  letter-spacing:.08em;color:var(--dim);font-weight:650;padding:10px 2px 0;
+  border-bottom:1px solid var(--line);margin-bottom:2px}
+.wallhead:first-child{padding-top:0}
+/* M30: suggest-confirm banner ("hide all German releases?"). */
+#suggest{max-width:1660px;margin:0 auto;padding:10px 22px 0;display:none}
+#suggest .sgin{display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+  background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:10px 16px}
+#suggest .sgtxt{flex:1;min-width:200px;font-size:13px}
+#suggest .sgtxt b{color:var(--acc)}
+#suggest .sgtxt .dim{font-size:11.5px}
+/* M31b: "Because you watch …" affinity caption. */
+#affnote{max-width:1660px;margin:0 auto;padding:10px 22px 0;display:none;
+  font-size:12.5px;color:var(--dim)}
+#affnote b{color:var(--acc);font-weight:600}
+/* M30: rows in the Hidden & filters panel. */
+.hidrow{display:flex;align-items:center;gap:12px;padding:7px 0;border-top:1px solid var(--line)}
+.hidrow img,.hidrow .hph{width:34px;height:50px;object-fit:cover;border-radius:5px;flex:none;background:var(--surface-2)}
+.hidrow .ht{flex:1;min-width:0;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hidrow .dim{font-size:11.5px}
+.rulechip{display:inline-flex;align-items:center;gap:7px;background:var(--surface-2);
+  border:1px solid var(--line);border-radius:999px;padding:5px 7px 5px 12px;font-size:12px;
+  margin:0 8px 8px 0}
+.rulechip button{background:transparent;border:none;color:var(--dim);cursor:pointer;
+  font-size:13px;padding:2px 5px}
+.rulechip button:hover{color:var(--bad)}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 5px rgba(0,0,0,.6)}
+.dot.part{background:var(--warn)}
+/* M30: "you have this" badge (library dupe-key match). */
+.havechip{width:16px;height:16px;border-radius:50%;background:var(--ok);color:#06120b;
+  font-size:10px;font-weight:800;display:flex;align-items:center;justify-content:center;
+  box-shadow:0 0 5px rgba(0,0,0,.6)}
+.epchip.own{border-color:var(--ok);color:var(--ok)}
+.hv{color:var(--ok);font-weight:700}
+.cap{margin:8px 2px 0;font-size:12.5px;line-height:1.3}
+.cap .ttl{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:560}
+.cap .sub{color:var(--dim);font-size:11.5px}
+.empty{grid-column:1/-1;color:var(--dim);text-align:center;padding:80px 0;font-size:14px}
+.empty code{background:var(--surface);padding:2px 7px;border-radius:6px}
+
+/* ---- Releases surface (24C; grew out of the M25 browse view) ---- */
+#list{max-width:1660px;margin:0 auto;padding:10px 22px 60px}
+.ltools{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:0 2px 8px;min-height:30px}
+.ltools .lspring{flex:1}
+#selbar{display:flex;align-items:center;gap:8px}
+.lwrap{overflow-x:auto;background:var(--surface);border:1px solid var(--line);border-radius:12px}
+#ltable td.name{max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#ltable .stem{color:var(--fg);font-weight:550}
+#ltable tr:hover td{background:var(--surface-2)}
+#ltable th.sortable{cursor:pointer;user-select:none;white-space:nowrap}
+#ltable th.sortable:hover{color:var(--fg)}
+#ltable th.sortable.on{color:var(--acc)}
+#ltable th.sortable.on::after{content:' ↓'}
+#ltable th.sortable.on.asc::after{content:' ↑'}
+#ltable .selcol{width:26px;padding-inline-end:0}
+#ltable input[type=checkbox]{accent-color:var(--acc);margin:0;vertical-align:middle}
+/* Under-name badge row: only facts the index holds (par2, source group,
+   decoded). DrunkenSlug's pattern - extras ride as badges, not columns. */
+#ltable .brow{display:flex;gap:5px;margin-top:2px;overflow:hidden}
+.nbadge{background:var(--surface-2);border:1px solid var(--line);color:var(--dim);
+  font-size:9.5px;font-weight:600;letter-spacing:.02em;padding:1px 6px;border-radius:5px;
+  white-space:nowrap;max-width:220px;overflow:hidden;text-overflow:ellipsis}
+/* Group-by-title: one row per title, releases nested under the expander. */
+#ltable .exp{background:transparent;border:none;color:var(--dim);cursor:pointer;
+  font-size:12px;padding:2px 6px;border-radius:6px}
+#ltable .exp:hover{color:var(--fg)}
+#ltable tr.sub td{background:color-mix(in srgb,var(--surface-2) 55%,var(--surface))}
+#ltable tr.sub td.name{padding-inline-start:30px}
+.catchip{background:var(--surface-2);border:1px solid var(--line);color:var(--dim);
+  font-size:10.5px;font-weight:600;padding:2px 8px;border-radius:999px;white-space:nowrap}
+.catchip.movie{color:var(--acc);border-color:rgba(77,163,255,.4)}
+.catchip.tv{color:var(--ok);border-color:rgba(53,200,138,.4)}
+.catchip .qsep{opacity:.55;font-weight:400}
+.hlth{font-variant-numeric:tabular-nums;white-space:nowrap}
+.lpage{display:flex;align-items:center;justify-content:center;gap:14px;padding:16px 0 0}
+.lpage .chip:disabled{opacity:.35;cursor:default;pointer-events:none}
+/* Hover preview popup (NZBFinder pattern): follows the pointer, never
+   catches it, flips at screen edges. Poster + title + overview, all
+   served from our own index. */
+#hovpop{position:fixed;z-index:25;display:none;width:290px;pointer-events:none;
+  background:var(--surface);border:1px solid var(--line);border-radius:12px;
+  padding:10px;box-shadow:0 14px 44px rgba(0,0,0,.55)}
+#hovpop img{width:100%;max-height:200px;object-fit:cover;border-radius:8px;
+  display:block;margin-bottom:8px;background:var(--surface-2)}
+#hovpop .ht{font-size:13px;line-height:1.35}
+#hovpop .ho{font-size:12px;color:var(--dim);line-height:1.45;margin-top:4px;
+  display:-webkit-box;-webkit-line-clamp:6;-webkit-box-orient:vertical;overflow:hidden}
+
+/* ---- detail overlay ---- */
+#ovl{position:fixed;inset:0;z-index:20;display:none;background:rgba(5,6,10,.72);
+  backdrop-filter:blur(10px);overflow-y:auto}
+#ovl.open{display:block}
+/* Duplicate-grab dialog: over the card sheet, so its own z-index. */
+#dupeovl{position:fixed;inset:0;z-index:30;display:none;background:rgba(5,6,10,.66);
+  backdrop-filter:blur(6px);place-items:center;padding:20px}
+#dupeovl.open{display:grid}
+#dupeovl .dlg{max-width:460px;background:var(--surface);border:1px solid var(--line);
+  border-radius:var(--radius);padding:20px 22px;box-shadow:0 30px 80px rgba(0,0,0,.7)}
+#dupeovl h3{margin:0 0 8px;font-size:16px}
+#dupeovl p{margin:0 0 16px;color:var(--dim);font-size:13px;line-height:1.5;overflow-wrap:anywhere}
+#dupeovl .acts{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end}
+.sheet{max-width:880px;margin:5vh auto 6vh;background:var(--surface);border:1px solid var(--line);
+  border-radius:var(--radius);overflow:hidden;box-shadow:0 30px 80px rgba(0,0,0,.7)}
+.hero{position:relative;min-height:160px;background:var(--surface-2)}
+.hero img{width:100%;height:240px;object-fit:cover;display:block;
+  -webkit-mask-image:linear-gradient(#000 55%,transparent);mask-image:linear-gradient(#000 55%,transparent)}
+.hero .x{position:absolute;top:12px;inset-inline-end:14px;background:rgba(0,0,0,.55);border:none;color:#fff;
+  width:32px;height:32px;border-radius:50%;font-size:15px;cursor:pointer}
+.body{display:flex;gap:22px;padding:0 24px 24px;margin-top:-64px;position:relative}
+.body .pst{flex:none;width:150px;aspect-ratio:2/3;border-radius:10px;overflow:hidden;
+  position:relative; /* anchors the absolute .ph placeholder art */
+  background:var(--surface-2);box-shadow:0 8px 24px rgba(0,0,0,.6)}
+.body .pst img{width:100%;height:100%;object-fit:cover}
+.info{flex:1;min-width:0;padding-top:70px}
+.info h2{margin:0 0 4px;font-size:22px;letter-spacing:-.01em}
+.info h2 small{color:var(--dim);font-weight:400;font-size:15px}
+.meta{color:var(--dim);font-size:12.5px;margin-bottom:10px}
+.meta .star{color:var(--gold)}
+/* Synopsis: a token, not a fixed light grey. The hardcoded #c6cbd8 was
+   readable only because the wall was always dark - on the light theme it
+   fell to about 1.6:1. */
+.plot{font-size:13.5px;line-height:1.55;color:var(--fg);opacity:.82;max-height:7.8em;overflow:auto}
+.rels{padding:6px 24px 26px}
+.rels h3{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:12px 0 6px}
+/* ---- cast and crew, and the person page ---- */
+.castwrap{padding:2px 24px 0}
+.castwrap h3{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:12px 0 8px}
+.castrow{display:flex;gap:10px;overflow-x:auto;padding-bottom:6px;scrollbar-width:thin}
+.person{flex:none;width:92px;background:none;border:none;padding:0;cursor:pointer;text-align:center;color:inherit}
+.person .face{width:72px;height:72px;margin:0 auto 6px;border-radius:50%;overflow:hidden;
+  background:var(--surface-2);border:1px solid var(--line);display:flex;align-items:center;
+  justify-content:center;font-weight:700;font-size:20px;color:var(--dim)}
+.person .face img{width:100%;height:100%;object-fit:cover}
+.person b{display:block;font-size:11.5px;font-weight:600;line-height:1.25;
+  overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.person span{display:block;font-size:10.5px;color:var(--dim);line-height:1.25;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.person:hover .face{border-color:var(--acc)}
+/* The person page reuses the detail sheet, so it inherits its width,
+   scroll and close behaviour rather than being a second overlay. */
+/* No backdrop to show, so the hero is just the strip the close button
+   sits in - .hero's 160px minimum would leave a grey slab. */
+.phero{min-height:0;height:56px}
+.pbody{display:flex;gap:22px;padding:14px 24px 8px;align-items:flex-start}
+.pbody .face{flex:none;width:120px;height:120px;border-radius:50%;overflow:hidden;
+  background:var(--surface-2);border:1px solid var(--line);display:flex;align-items:center;
+  justify-content:center;font-weight:700;font-size:34px;color:var(--dim)}
+.pbody .face img{width:100%;height:100%;object-fit:cover}
+.prow{display:flex;flex-wrap:wrap;gap:10px;padding:0 24px 4px}
+.ptile{display:flex;gap:9px;align-items:center;width:250px;padding:7px;border-radius:10px;
+  border:1px solid var(--line);background:var(--surface-2);cursor:pointer;text-align:start;color:inherit}
+.ptile:hover{border-color:var(--acc)}
+.ptile img,.ptile .noimg{flex:none;width:36px;height:54px;border-radius:5px;object-fit:cover;background:var(--surface)}
+.ptile b{display:block;font-size:12.5px;font-weight:600;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.ptile span{display:block;font-size:11px;color:var(--dim);overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.ptile.off{cursor:default;opacity:.85}
+.ptile.off:hover{border-color:var(--line)}
+/* The people strip above search results. */
+#peoplebar{display:none;gap:10px;overflow-x:auto;padding:2px 0 10px}
+#peoplebar.show{display:flex}
+@media (max-width:640px){
+  .pbody{padding:16px 14px 6px;gap:14px}
+  .pbody .face{width:84px;height:84px;font-size:26px}
+  .castwrap,.prow{padding-inline:14px}
+  .ptile{width:100%}
+}
+/* M23c: per-season episode grid on show pages */
+.epwrap h3{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:14px 0 4px}
+.season{margin:8px 0 12px}
+.shead{font-size:13px;font-weight:600;margin-bottom:7px;display:flex;gap:10px;align-items:center}
+.shead .mini{font-size:11px;padding:3px 9px}
+.epchips{display:flex;flex-wrap:wrap;gap:6px}
+.epchip{display:flex;flex-direction:column;align-items:center;gap:1px;padding:5px 10px;border-radius:9px;
+  border:1px solid var(--line);background:var(--surface-2);color:var(--fg);cursor:pointer;font-size:12px;font-weight:600}
+.epchip span{font-size:10px;font-weight:400;color:var(--dim)}
+.epchip:hover:not(:disabled){border-color:var(--acc)}
+.epchip:disabled{opacity:.4;cursor:default}
+.epchip.pack{border-style:dashed}
+/* M23d discovery strips */
+#strips{max-width:1660px;margin:0 auto;padding:14px 22px 0}
+.strip h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);margin:6px 0 10px;font-weight:650}
+.striprow{display:flex;gap:13px;overflow-x:auto;padding:2px 2px 14px;scrollbar-width:thin}
+.striprow .card{flex:0 0 118px;width:118px;contain-intrinsic-size:118px 220px}
+.striprow .cap .sub{display:none}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+td,th{padding:7px 8px;text-align:start;border-top:1px solid var(--line);vertical-align:middle}
+th{color:var(--dim);border-top:none;font-size:10.5px;text-transform:uppercase;letter-spacing:.05em}
+td.mono{font-variant-numeric:tabular-nums}
+.q{background:var(--surface-2);padding:2px 7px;border-radius:6px;font-size:11px;font-weight:600;white-space:nowrap}
+/* Codec / audio / dynamic-range tags on a release row. Quieter than the
+   resolution badge next to them: they qualify it, they don't replace it.
+   `.on` marks a tag the user asked for in their quality preference. */
+.tag{display:inline-block;background:var(--surface-2);border:1px solid var(--line);
+  color:var(--dim);font-size:10px;font-weight:600;padding:1px 6px;border-radius:999px;
+  white-space:nowrap;margin-inline-start:4px;vertical-align:1px}
+.tag.on{color:var(--acc);border-color:color-mix(in srgb,var(--acc) 45%,transparent);
+  background:color-mix(in srgb,var(--acc) 12%,transparent)}
+/* The release best matching the preference, at the top of the list. */
+.pick{color:var(--ok);font-size:10px;font-weight:700;letter-spacing:.03em;
+  white-space:nowrap;margin-inline-start:6px}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.dim{color:var(--dim)}
+button.act{background:var(--acc);color:#fff;border:none;border-radius:7px;padding:6px 12px;
+  cursor:pointer;font-size:12px;font-weight:600;margin-inline-start:6px}
+button.act.ghost{background:transparent;border:1px solid var(--line);color:var(--fg)}
+button.act:hover{filter:brightness(1.1)}
+button.act:disabled{opacity:.35;cursor:default;pointer-events:none}
+/* Press acknowledgment (matches the dashboard). */
+button{transition:transform .06s,filter .1s}
+button:active:not(:disabled){transform:scale(.94);filter:brightness(1.35)}
+.clickflash{animation:clickflash .3s ease-out}
+@keyframes clickflash{0%{box-shadow:0 0 0 3px var(--acc);filter:brightness(1.4)}100%{box-shadow:0 0 0 7px rgba(0,0,0,0)}}
+/* ---- fix-match panel (M16) ---- */
+#fixpanel{border-top:1px solid var(--line);margin:14px 24px 0;padding:14px 0 4px}
+#fixpanel h4{margin:0 0 8px;font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim)}
+#fixpanel .frow{display:flex;gap:8px;margin:8px 0;flex-wrap:wrap;align-items:center}
+#fixpanel input,#fixpanel textarea{background:var(--surface-2);border:1px solid var(--line);
+  color:var(--fg);border-radius:8px;padding:7px 10px;font-size:12.5px;outline:none}
+#fixpanel input:focus,#fixpanel textarea:focus{border-color:var(--acc)}
+#fixpanel textarea{width:100%;min-height:52px;resize:vertical;font-family:inherit}
+#fixres{display:flex;flex-direction:column;gap:6px;max-height:300px;overflow-y:auto;margin:8px 0}
+.cand{display:flex;gap:10px;align-items:center;padding:6px 8px;border:1px solid var(--line);
+  border-radius:9px;cursor:pointer;background:var(--surface-2)}
+.cand:hover{border-color:var(--acc)}
+.cand img,.cand .cph{width:38px;height:56px;object-fit:cover;border-radius:5px;flex:none;background:var(--surface)}
+.cand .ct{font-size:12.5px;line-height:1.35;min-width:0}
+/* ---- arrivals (the tip watcher's user-visible half) ----
+   The wall must never reflow under the cursor uninvited, so a card that
+   lands while you are reading waits behind this pill instead. */
+#newpill{position:fixed;left:50%;top:64px;transform:translateX(-50%) translateY(-70px);
+  background:var(--acc);color:#0d1220;border:none;padding:8px 16px;border-radius:999px;
+  font-size:13px;font-weight:650;cursor:pointer;z-index:25;opacity:0;
+  transition:transform .28s cubic-bezier(.2,.9,.3,1.2),opacity .28s;
+  box-shadow:0 6px 24px rgba(0,0,0,.5)}
+#newpill.show{transform:translateX(-50%) translateY(0);opacity:1}
+/* Arrived-since-you-last-looked. The ring decays on its own so the wall
+   settles back to normal without a timer per card. */
+.card.fresh{animation:arrive .45s cubic-bezier(.2,.9,.3,1.2)}
+.card.fresh .poster{animation:freshring 60s ease-out forwards}
+@keyframes arrive{from{opacity:0;transform:translateY(-10px) scale(.97)}to{opacity:1}}
+@keyframes freshring{0%,55%{box-shadow:0 0 0 2px var(--acc)}100%{box-shadow:0 0 0 0 rgba(0,0,0,0)}}
+.badge.new{background:var(--acc);color:#0d1220;font-weight:700;letter-spacing:.04em}
+#toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(80px);
+  background:var(--surface-2);border:1px solid var(--line);color:var(--fg);padding:10px 18px;
+  border-radius:10px;font-size:13px;transition:transform .25s ease;z-index:30;
+  box-shadow:0 8px 30px rgba(0,0,0,.55)}
+#toast.show{transform:translateX(-50%) translateY(0)}
+/* ================= phone + touch layer - purely additive ================= */
+/* Tap targets ≥44px on touch screens (and in any phone-width window). */
+@media(pointer:coarse),(max-width:640px){
+  .tabs button{min-height:40px;padding:8px 13px}
+  #q,select{min-height:44px}
+  button.act{min-height:44px;padding:8px 15px}
+  .hero .x{width:44px;height:44px;font-size:18px}
+  .bar .dash{padding:10px 4px}
+  .cand{min-height:56px}
+  #fixpanel input{min-height:44px}
+}
+/* Phone layout (≤640px). */
+@media(max-width:640px){
+  /* §Stage4: the phone bar keeps the logo, the search box and the View
+     button. Everything else is in the sheet - including the category tabs
+     and the nav, which JS moves in at this width. Measured before: 291px
+     of bar + 34px of chips on an 812px screen, sticky, i.e. 40% gone
+     before a single poster. */
+  /* One row: the mark, the search box, and the way into everything else. */
+  .bar{flex-wrap:nowrap;gap:9px;padding:9px 12px}
+  #densctl{display:none}
+  .bar h1{font-size:15px}
+  .bar h1 a span,.bar h1 a::after{display:none}
+  #q{flex:1 1 auto;min-width:0;max-width:none}
+  .viewpop{flex:none}
+  /* The sheet's own controls stack full-width and stay tappable. */
+  .vpbody .tabs button{padding:9px 10px}
+  /* Navigation stays visible: it is not a view option, and nobody looks
+     for "settings" inside a menu called View. Icon-only at this width so
+     four destinations cost one short row. */
+  .bar{flex-wrap:wrap;row-gap:9px}
+  .bar .nav{order:3;flex:1 1 100%;justify-content:space-between;margin-inline-start:0}
+  .bar .nav .pill{flex:1;justify-content:center;display:inline-flex;align-items:center;
+    min-height:40px;padding:4px 6px}
+  .bar .nav .pill span{display:none}
+  /* 3 posters across a phone, 2 on the narrowest - until the slider
+     says otherwise (an explicit zoom sets --tile inline). */
+  .wall{--tile:102px;gap:12px 9px;padding:12px 12px 48px}
+  /* Narrow posters: smaller badges; TV moves to the bottom corner so it
+     never collides with the quality badge. */
+  .badge{font-size:9px;padding:2px 5px;max-width:calc(100% - 14px);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .badge.tv{top:auto;bottom:7px;max-width:none}
+  .ph .t{font-size:12.5px}
+  .cap{font-size:11.5px}
+  /* Detail overlay becomes a full-width bottom sheet. */
+  .sheet{margin:16px 0 0;max-width:none;border-radius:16px 16px 0 0;min-height:calc(100vh - 16px)}
+  .hero img{height:190px}
+  .body{flex-direction:column;gap:12px;padding:0 14px 16px;margin-top:-70px}
+  .body .pst{width:104px}
+  .info{padding-top:6px}
+  .info h2{font-size:19px}
+  #fixpanel{margin:14px 14px 0}
+  .rels{padding:6px 14px 26px}
+  /* Releases table → stacked rows (block table so nowrap stems clip
+     instead of widening the sheet). */
+  .rels table,.rels tbody{display:block}
+  .rels thead{display:none}
+  .rels tr{display:block;padding:10px 0;border-top:1px solid var(--line)}
+  .rels td{display:inline-block;border:none;padding:2px 10px 2px 0;vertical-align:middle}
+  .rels td:nth-child(2){display:block;max-width:100%!important;padding:2px 0}
+  .rels td:last-child{display:block;text-align:right;padding:8px 0 0}
+  .rels td:last-child .act{margin-left:8px}
+  #toast{max-width:calc(100vw - 28px);bottom:calc(18px + env(safe-area-inset-bottom,0px))}
+}
+</style></head><body>
+
+<div class="bar">
+  <h1><a href="/" data-i18n-title="wall.home.title" title="Downloads and status"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-bolt"/></svg> nzbfast</a></h1>
+  <!-- 24C: two surfaces, not three zoom levels. Wall = the title-grouped
+       poster grid (discover); Releases = the per-release table (search).
+       The old grid/dense pair was the SAME wall at two tile sizes - that
+       job now belongs to the density control next door. -->
+  <div class="tabs" id="views" data-i18n-title="wall.view.title" title="Choose how titles are laid out">
+    <button data-v="wall" class="on" data-i18n-title="wall.view.wall.title"
+      title="Browse titles as a poster wall" aria-label="Browse titles as a poster wall"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-grid"/></svg> <span data-i18n="wall.view.wall.lbl">Wall</span></button>
+    <button data-v="releases" data-i18n-title="wall.view.releases.title"
+      title="Every release in a sortable table" aria-label="Every release in a sortable table"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-list"/></svg> <span data-i18n="wall.view.releases.lbl">Releases</span></button>
+  </div>
+  <div class="tabs" id="tabs">
+    <button data-k="" class="on" data-i18n="wall.tab.all">All</button>
+    <button data-k="movie" data-i18n="wall.tab.movies">Movies</button>
+    <button data-k="tv">TV</button>
+    <button data-k="music" data-i18n="wall.tab.music">Music</button>
+    <button data-k="book" data-i18n="wall.tab.books">Books</button>
+    <button data-k="4k">4K</button>
+    <button data-k="other" data-i18n="wall.tab.other">Other</button>
+  </div>
+  <input id="q" data-i18n-placeholder="wall.q.ph" placeholder="Search titles…  ( / )" autocomplete="off">
+  <span id="sortwrap" class="sortwrap">
+  <select id="sort">
+    <option value="affinity" data-i18n="wall.sort.affinity">For you</option>
+    <option value="latest" data-i18n="wall.sort.newest">Newest posts</option>
+    <option value="arrived" data-i18n="wall.sort.arrived">Just arrived</option>
+    <option value="aired" data-i18n="wall.sort.aired">Release date</option>
+    <option value="rating" data-i18n="wall.sort.rating">Top rated</option>
+    <option value="title" data-i18n="wall.sort.title">Title A–Z</option>
+    <option value="size" data-i18n="wall.sort.size">Largest</option>
+    <option value="releases" data-i18n="wall.sort.releases">Most posted</option>
+  </select>
+  <select id="lsort" style="display:none">
+    <option value="posted" data-i18n="wall.lsort.posted">Newest</option>
+    <option value="seen" data-i18n="wall.lsort.seen">Recently added</option>
+    <option value="size" data-i18n="wall.sort.size">Largest</option>
+    <option value="name" data-i18n="wall.sort.title">Name A–Z</option>
+    <option value="files" data-i18n="wall.lsort.files">Most files</option>
+    <option value="kind" data-i18n="wall.lcol.cat">Category</option>
+    <option value="completeness" data-i18n="wall.lsort.comp">Most complete</option>
+  </select>
+  <button class="chip" id="dir" data-i18n-title="wall.dir.title"
+    title="Reverse the order - oldest, smallest or lowest first"
+    aria-label="Reverse the order - oldest, smallest or lowest first"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-arrow-down"/></svg></button>
+  <!-- §Stage4: the bar carried 29 controls in three visual idioms and ate
+       40% of a phone screen, permanently, because it is sticky. The
+       tertiary ones live in here now: same controls, same ids, same
+       handlers - only their container changed. On a phone this is a
+       bottom sheet and the category tabs join it. -->
+  </span>
+  <div class="viewpop" id="viewPop">
+    <button class="chip vpbtn" id="viewBtn" aria-expanded="false" aria-controls="viewMenu"
+      onclick="toggleViewMenu()" data-i18n-title="wall.viewmenu.title"
+      title="Layout, sorting and filters"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-settings"/></svg> <span data-i18n="wall.viewmenu">View</span></button>
+    <div class="vpmenu" id="viewMenu" role="dialog" aria-modal="false" hidden>
+      <div class="vphead"><b data-i18n="wall.viewmenu">View</b><span class="grow"></span>
+        <button class="chip vpx" onclick="toggleViewMenu(false)" data-i18n-title="btn.close.title"
+          title="Close this panel" aria-label="Close this panel"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-close"/></svg></button></div>
+      <div class="vpbody" id="viewBody">
+  <div class="tabs" id="densctl" data-i18n-title="wall.dens.title" title="Poster density">
+    <button data-d="s" data-i18n="wall.dens.s" data-i18n-title="wall.dens.s.title"
+      title="Small posters, more on screen" aria-label="Small posters, more on screen">S</button>
+    <button data-d="m" data-i18n="wall.dens.m" data-i18n-title="wall.dens.m.title"
+      title="Medium posters" aria-label="Medium posters">M</button>
+    <button data-d="l" data-i18n="wall.dens.l" data-i18n-title="wall.dens.l.title"
+      title="Large posters" aria-label="Large posters">L</button>
+  </div>
+  <label class="zoom" id="zoomwrap" data-i18n-title="wall.zoom.title"
+    title="Poster size - drag for more or fewer per row (+ and - do it too)">
+    <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-search"/></svg>
+    <input type="range" id="zoom" min="84" max="320" step="2"
+      data-i18n-title="wall.zoom.title" aria-label="Poster size"
+      title="Poster size - drag for more or fewer per row (+ and - do it too)"></label>
+  <label class="mtog" data-i18n-title="wall.group.title" title="Cluster the wall by category (TV / Movies / Apps) - the sort applies within each section">
+    <input type="checkbox" id="catGroup"> <span data-i18n="wall.group">Group</span></label>
+  <label class="mtog listonly" style="display:none" data-i18n-title="wall.onlycomplete.title"
+    title="Only releases with every part present on the provider">
+    <input type="checkbox" id="onlyComplete" checked> <span data-i18n="wall.onlycomplete">Complete only</span></label>
+  <label class="mtog" data-i18n-title="wall.matched.title" title="Hide cards with no artwork and no metadata - the unenriched junk">
+    <input type="checkbox" id="matchedOnly"> <span data-i18n="wall.matched">Matched only</span></label>
+  <button class="chip" id="unmChip" style="display:none"
+    data-i18n-title="wall.unm.title" title="Show the hidden unmatched entries"></button>
+  <button class="chip" id="hidChip" style="display:none"
+    data-i18n-title="wall.hid.title" title="Titles you marked not interested, and your hide filters"></button>
+      </div>
+    </div>
+  </div>
+  <span class="count" id="count"></span>
+  <nav class="nav">
+  <a class="pill" href="/" data-i18n-title="hdr.dash.title" title="Downloads and status"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-dash"/></svg> <span data-i18n="hdr.dash">dashboard</span></a>
+  <a class="pill on" href="/wall" data-i18n-title="hdr.wall.title" title="Poster wall"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-wall"/></svg> <span data-i18n="hdr.wall">wall</span></a>
+  <a class="pill" href="/#settings" data-i18n-title="hdr.settings.title" title="Settings"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-settings"/></svg> <span data-i18n="hdr.settings">settings</span></a>
+  <a class="pill" href="/manual#wall" target="_blank" rel="noopener" data-i18n-title="hdr.manual.title" title="User manual"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-manual"/></svg> <span data-i18n="hdr.manual">manual</span></a>
+  </nav>
+</div>
+
+<!-- M30: genre + quality filter chips (grid views only). -->
+<div id="chips"></div>
+<div id="suggest"></div>
+<!-- M31b: "Because you watch …" caption, shown under the bar while the
+     For-you (affinity) sort is active and a taste profile exists. -->
+<div id="affnote"></div>
+<div id="strips"></div>
+<!-- People matching the search. The results below already include their
+     titles (the search has a people leg server-side); this strip is the
+     way IN to a person page. -->
+<div id="peoplebar"></div>
+<div class="wall" id="wall"></div>
+<!-- M28: infinite-scroll sentinel - crossing it pulls the next page. -->
+<div id="more" style="height:1px"></div>
+<!-- 24C Releases surface: per-release rows from mode=index_browse
+     (server-side filter/sort/pagination), the survey-consensus table:
+     name, one kind>quality category chip, age, size, files, and
+     availability + REAPED sitting where other indexers put grabs.
+     Table-level affordances (also the unanimous pattern): checkbox bulk
+     queue, hover previews, group-by-title with nested releases. -->
+<div id="list" style="display:none">
+  <div class="ltools">
+    <div id="selbar" style="display:none">
+      <span class="count" id="selcount"></span>
+      <button class="act" id="selQueue" data-i18n="wall.sel.queue">Queue selected</button>
+      <button class="act ghost" id="selClear" data-i18n="wall.sel.clear">Clear</button>
+    </div>
+    <span class="lspring"></span>
+    <label class="mtog" id="hovtog" data-i18n-title="wall.hover.title"
+      title="Rest the pointer on a row for a poster and synopsis popup - everything from your own index">
+      <input type="checkbox" id="hovPrev"> <span data-i18n="wall.hover">Hover previews</span></label>
+    <label class="mtog" data-i18n-title="wall.grpby.title"
+      title="One row per title, its releases nested underneath">
+      <input type="checkbox" id="grpTitle"> <span data-i18n="wall.grpby">Group by title</span></label>
+  </div>
+  <div class="lwrap"><table id="ltable">
+    <thead><tr>
+      <th class="selcol"><input type="checkbox" id="selAll" data-i18n-title="wall.selall.title"
+        title="Select every release on this page" aria-label="Select every release on this page"></th>
+      <th class="sortable" data-lsort="name" data-i18n="wall.col.release">Release</th>
+      <th class="sortable" data-lsort="kind" data-i18n="wall.lcol.cat">Category</th>
+      <th class="sortable" data-lsort="posted" data-i18n="wall.col.age">Age</th>
+      <th class="sortable" data-lsort="size" data-i18n="wall.col.size">Size</th>
+      <th class="sortable" data-lsort="files" id="lhFiles" data-i18n="wall.col.files">Files</th>
+      <th class="sortable" data-lsort="completeness" data-i18n="wall.lcol.avail">Availability</th>
+      <th style="text-align:end"></th>
+    </tr></thead>
+    <tbody id="lbody"></tbody>
+  </table></div>
+  <div class="lpage">
+    <button class="chip" id="lprev">‹ <span data-i18n="wall.prev">prev</span></button>
+    <span class="count" id="lrange"></span>
+    <button class="chip" id="lnext"><span data-i18n="wall.next">next</span> ›</button>
+  </div>
+</div>
+<div dir="ltr" style="text-align:center;color:var(--dim);font-size:11px;padding:0 0 28px;line-height:1.7">
+  Metadata &amp; artwork courtesy of <a href="https://www.tvmaze.com" style="color:var(--dim)">TVmaze</a>,
+  the iTunes Search API, <a href="https://www.wikidata.org" style="color:var(--dim)">Wikidata</a>,
+  <a href="https://en.wikipedia.org" style="color:var(--dim)">Wikipedia</a> (CC&nbsp;BY-SA),
+  <a href="https://anilist.co" style="color:var(--dim)">AniList</a>,
+  and the <a href="https://www.omdbapi.com" style="color:var(--dim)">OMDb API</a> (CC&nbsp;BY-NC)
+  or <a href="https://www.themoviedb.org" style="color:var(--dim)">TMDB</a> when configured.<br>
+  Rating information courtesy of IMDb (<a href="https://www.imdb.com" style="color:var(--dim)">imdb.com</a>). Used with permission.
+</div>
+
+<div id="ovl"><div class="sheet" id="sheet"></div></div>
+<!-- Asked before a hand-picked grab that would duplicate something the
+     user already has. Its own overlay, stacked over the card sheet it is
+     usually launched from. -->
+<div id="dupeovl" role="dialog" aria-modal="true" aria-labelledby="dupeTitle">
+  <div class="dlg">
+    <h3 id="dupeTitle"></h3>
+    <p id="dupeBody"></p>
+    <div class="acts" id="dupeActs"></div>
+  </div>
+</div>
+<div class="vpback" id="vpBack" onclick="toggleViewMenu(false)"></div>
+<button id="newpill" onclick="showArrivals()"></button>
+<div id="toast"></div>
+<!-- 24C: hover-preview popup for the Releases table. -->
+<div id="hovpop" aria-hidden="true"></div>
+
+<script>
+"use strict";
+// ---- i18n (§5 phase 1) - same contract as the dashboard: English lives
+// inline (data-i18n markup + t() defaults), /i18n/<lang>.json overrides,
+// locale = browser choice → daemon default (serve-time token) →
+// navigator.language. Loader at the end of the script.
+const DAEMON_LOCALE='__NZBFAST_LOCALE__';
+const LOCALES=['en','fr','de','it','es','nl','pt','sv','da','nb','fi','tr','ro','ru','pl','cs','uk','el','ja','he','ar','fa','hu','sk','hr','sr','bg','sl'];
+// §5 2b: RTL locales - loader stamps dir="rtl" for Hebrew/Arabic/Persian.
+const RTL_LOCALES=['he','ar','fa'];
+const LOCALE=(()=>{
+  // Norwegian reports as nb/nn/no depending on OS - all map to our Bokmål
+  // catalogue. (pt-BR, en-GB… already reduce to their primary subtag.)
+  const ALIAS={no:'nb',nn:'nb',sh:'sr'};
+  const norm=v=>{ const p=String(v||'').toLowerCase().split(/[-_]/)[0]; return ALIAS[p]||p; };
+  for(const c of [localStorage.nzbfastLocale,
+                  DAEMON_LOCALE.startsWith('__')?'':DAEMON_LOCALE,
+                  navigator.language])
+    { const p=norm(c); if(LOCALES.includes(p)) return p; }
+  return 'en';
+})();
+let I18N={};
+function t(k,en,p){
+  let s=I18N[k]??en;
+  if(p) for(const [a,b] of Object.entries(p)) s=s.split('{'+a+'}').join(b);
+  return s;
+}
+// Plural via CLDR categories (Intl.PluralRules): English one|other, Slavic
+// one|few|many, Slovenian one|two|few|many. The lookup is category-generic,
+// so a catalogue supplies whatever its grammar needs; an unmatched category
+// (Latin 'other', Czech 0/5+, fractions) falls back to the .many bucket.
+const _pr=new Intl.PluralRules(LOCALE);
+function tn(base,n,enOne,enMany){
+  const cat=_pr.select(n);
+  const suf=I18N[base+'.'+cat]!=null?cat:'many';
+  return t(base+'.'+suf, cat==='one'?enOne:enMany, {n});
+}
+// Daemon error strings are an API contract - translate at display time.
+function tErr(m){ return m==null?m:(I18N['err.'+m]??m); }
+const _nf={};
+function num(v,d){
+  (_nf[d]??=new Intl.NumberFormat(LOCALE,{minimumFractionDigits:d,
+    maximumFractionDigits:d,useGrouping:false}));
+  return _nf[d].format(v);
+}
+function applyI18n(){
+  document.querySelectorAll('[data-i18n]').forEach(el=>{
+    const tr=I18N[el.dataset.i18n]; if(tr==null) return;
+    const n=el.firstChild;
+    if(n && n.nodeType===3 && el.children.length)
+      n.nodeValue=n.nodeValue.replace(/\S(?:[\s\S]*\S)?/, tr);
+    else el.textContent=tr;
+  });
+  document.querySelectorAll('[data-i18n-title]').forEach(el=>{
+    const tr=I18N[el.dataset.i18nTitle]; if(tr==null) return;
+    el.title=tr;
+    // Icon-only controls carry the same sentence as their accessible
+    // name; keep the two in step so a screen reader doesn't keep reading
+    // the English one after a locale switch.
+    if(el.hasAttribute('aria-label')) el.setAttribute('aria-label',tr);
+  });
+  document.querySelectorAll('[data-i18n-placeholder]').forEach(el=>{
+    const tr=I18N[el.dataset.i18nPlaceholder]; if(tr!=null) el.placeholder=tr;
+  });
+}
+// Click acknowledgment: blip + accent pulse on press (matches the
+// dashboard; shares its localStorage sound preference).
+let sndOn=localStorage.nzbfastSounds!=='off', AC=null;
+function clickBlip(){
+  if(!sndOn) return;
+  try{
+    AC=AC||new (window.AudioContext||window.webkitAudioContext)();
+    if(AC.state==='suspended') AC.resume();
+    const t=AC.currentTime, o=AC.createOscillator(), g=AC.createGain();
+    o.type='sine';
+    o.frequency.setValueAtTime(1750,t);
+    o.frequency.exponentialRampToValueAtTime(650,t+.05);
+    g.gain.setValueAtTime(.1,t);
+    g.gain.exponentialRampToValueAtTime(.001,t+.07);
+    o.connect(g); g.connect(AC.destination);
+    o.start(t); o.stop(t+.08);
+  }catch(e){}
+}
+addEventListener('pointerdown', e=>{
+  const el=e.target.closest('button,select,a,[onclick],.card');
+  if(!el||el.disabled) return;
+  clickBlip();
+  el.classList.remove('clickflash'); void el.offsetWidth;
+  el.classList.add('clickflash');
+}, true);
+let key = localStorage.nzbfastKey || '';
+// M31b: the sort is persisted so "For you" (affinity) sticks across
+// reloads; it also keeps the select's value in sync with sortBy given
+// affinity now leads the option list.
+let cards = [], tab = '', sortBy = localStorage.nzbfastWallSort || 'latest', hasTmdb = false, openKey = null;
+// 'year' became 'aired' (same ordering, now to the day where a provider
+// gave us one). Migrate rather than leaving the select blank on the
+// reload after an upgrade.
+if(sortBy==='year'){ sortBy='aired'; localStorage.nzbfastWallSort=sortBy; }
+// One-time heal: an earlier build's automatic arrivals catch-up wrote
+// sortBy='arrived' into localStorage without the user ever choosing it,
+// which sticks across restarts and hides the affinity strips. Anyone who
+// genuinely wants it can pick it from the menu, which sets the flag below.
+if(sortBy==='arrived' && localStorage.nzbfastWallSortChosen!=='1'){
+  sortBy=localStorage.nzbfastWallSort='latest';
+}
+// Sort direction. Each sort has a natural direction - names read A-Z,
+// everything else leads with newest/biggest/best - so this stores the
+// FLIP, not the direction, and resets when the sort changes: picking a
+// new sort should never inherit a reversal you set for the last one.
+let dirFlip = localStorage.nzbfastWallDirFlip === 'on';
+// M28: the grid is server-paged (mode=wall2) - these track the window.
+let wtotal = 0, wseq = 0, wloading = false, wsig = '';
+// Matched-only filter (default ON): hide cards with no artwork AND no
+// enriched metadata - the unmatched/obfuscated clutter. Persisted.
+let matchedOnly = localStorage.nzbfastWallMatched !== 'off';
+let hiddenCount = 0;
+// M30: category grouping + genre/quality chips (browser-local prefs).
+let catGroup = localStorage.nzbfastWallGroup === 'on';
+let genreSel = localStorage.nzbfastWallGenre || '';
+let resSel = '', decSel = ''; // decade: 'min-max' ('0-1979' = older)
+// 24D: user-defined categories ({slug,name}), served on wall2/browse
+// responses - each gets its own tab chip and section label.
+let customCats = [], _catsSig = '';
+
+// Cancelling this prompt used to do two harmful things at once: it wrote
+// the empty string over a key that may have been perfectly good, and it
+// re-entered api() immediately, so Cancel produced another prompt with no
+// delay at all and the page could not be escaped. Declining now sticks
+// for the session and leaves the request failed, which the callers
+// already render as an empty wall rather than a loop.
+let keyDeclined = false;
+async function askKey(){
+  if (keyDeclined) return false;
+  const v = prompt(t('prompt.apikey','API key:')) || '';
+  if (!v){ keyDeclined = true; return false; }   // never clobber a good key on cancel
+  key = v; localStorage.nzbfastKey = v;
+  return true;
+}
+async function api(mode, extra){
+  const r = await fetch(`/api?mode=${mode}&apikey=${encodeURIComponent(key)}${extra||''}`);
+  const j = await r.json();
+  if (j.error === 'API Key Incorrect' && await askKey()) return api(mode, extra);
+  return j;
+}
+// Escapes <, >, & AND both quote characters. Release names/stems come
+// straight from attacker-controlled Usenet subjects and are interpolated
+// into double-quoted title= / data-* attributes; textContent alone leaves
+// " and ' intact, so a subject with a " could break out of the attribute
+// and inject an event handler (XSS on hover). Escaping quotes here is
+// harmless in text context (&quot;/&#39; render as the literal characters)
+// and closes every double-quoted attribute breakout at once.
+const esc = s => {
+  const d=document.createElement('span');
+  d.textContent=s==null?'':s;
+  return d.innerHTML.replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+};
+// Unit SYMBOLS are localisable, same contract as the dashboard: a locale that
+// writes data units differently (French octet → Go/To; Cyrillic → ГБ/ТБ)
+// overrides these keys in its catalogue; everyone else falls back to the SI
+// English symbols. Decimals come from num(), never from the symbol string.
+const UNIT_EN={GB:'GB',TB:'TB'};
+function unit(k){ return t('unit.'+k, UNIT_EN[k]); }
+const gb = n => n>=1e12 ? num(n/1e12,2)+' '+unit('TB') : num(n/1e9,n<10e9?2:1)+' '+unit('GB');
+const fmtVotes = n => n>=1e6 ? (n/1e6).toFixed(1)+'M' : n>=1e3 ? Math.round(n/1e3)+'k' : String(n);
+// An enriched ISO release date, in the reader's locale. Pinned to UTC on
+// the way in and out: parsed as local time, "2026-01-05" becomes the 4th
+// of January for anyone west of Greenwich.
+function fmtDate(iso){
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(iso||'')) return '';
+  const d=new Date(iso+'T00:00:00Z');
+  if(isNaN(d)) return '';
+  try{
+    return new Intl.DateTimeFormat(LOCALE,{dateStyle:'medium',timeZone:'UTC'}).format(d);
+  }catch(e){ return iso; }
+}
+const age = ts => { if(!ts) return '-'; const s=Date.now()/1e3-ts;
+  if(s<3600) return Math.max(1,Math.round(s/60))+'m';
+  if(s<86400) return Math.round(s/3600)+'h';
+  if(s<86400*365) return Math.round(s/86400)+'d';
+  return (s/86400/365).toFixed(1)+'y'; };
+
+// Deterministic placeholder art: hue from a title hash → each card gets
+// its own poster-like gradient, so a key-less wall still looks designed.
+function hue(s){ let h=0; for(const c of s) h=(h*31+c.charCodeAt(0))>>>0; return h%360; }
+function phStyle(t){ const h=hue(t);
+  return `background:linear-gradient(160deg,hsl(${h} 42% 26%),hsl(${(h+40)%360} 50% 14%) 70%,hsl(${(h+70)%360} 40% 9%))`; }
+
+function bestQuality(c){
+  const order=['2160p REMUX','2160p','1080p REMUX','1080p','720p'];
+  const qs=c.releases.map(r=>r.quality).filter(Boolean);
+  for(const o of order) if(qs.some(q=>q.startsWith(o.split(' ')[0])&&(o.includes('REMUX')?q.includes('REMUX'):true))) return o;
+  return qs[0]||'';
+}
+
+// "Matched" = the enricher (or the user) attached something real.
+const isMatched = c => !!(c.poster || c.overview || c.rating);
+
+// Which kinds the ☆ button is offered for. The watchlist stores a kind
+// of 'movie', 'tv' or a user category's slug (24D), and matching reads
+// the kind the classifier stamped on each release - so a slug item only
+// ever claims releases that same category claimed at ingest.
+//
+// The built-in non-video kinds are deliberately left out: the watcher
+// compares anything that is not 'tv' or 'movie' against a CUSTOM slug
+// only, so a watch on 'music', 'book', 'software' or 'other' would sit
+// there matching nothing forever. A hidden button beats a star that
+// silently never fires; a user who wants albums watched defines a Music
+// category, and then the slug card offers it.
+//
+// An unknown slug (its category was deleted) is not offered either -
+// nothing classifies as that kind any more.
+const canWatch = k => k==='tv' || k==='movie' || customName(k)!==null;
+// What the ☆ button promises, per kind. A category watch is scoped by
+// the category's own rule, so it is described by the category's name.
+function watchTip(k){
+  if(k==='tv') return t('wall.watch.tv','auto-grab new episodes as they appear, upgrading quality automatically');
+  if(k==='movie') return t('wall.watch.movie',"auto-grab this film when it appears (or a better version than what's here)");
+  return t('wall.watch.cat','auto-grab new {cat} releases matching this title as they appear, upgrading quality automatically',
+    {cat:customName(k)||k});
+}
+
+// M28: filter/sort/search all happen server-side now (mode=wall2) -
+// the grid renders exactly what the server sent, in order.
+function filtered(){ return cards; }
+
+// M30: category section labels for the grouped grid.
+const KINDLBL={tv:['wall.cat.tv','TV shows'],movie:['wall.cat.movies','Movies'],
+  music:['wall.tab.music','Music'],book:['wall.tab.books','Books'],
+  software:['wall.cat.apps','Apps'],other:['wall.cat.other','Other']};
+// 24D: a user category's display name (user text, shown as-is), or null
+// when the kind is not a known custom slug.
+function customName(k){
+  const c=customCats.find(c=>c.slug===k);
+  return c?(c.name||c.slug):null;
+}
+// 24D: keep the tab strip in sync with the served category set. Custom
+// chips sit between the built-in tabs and "Other"; the delegated #tabs
+// click handler picks them up with no extra wiring.
+function updateCats(list){
+  const cats=Array.isArray(list)?list:[];
+  const sig=JSON.stringify(cats);
+  if(sig===_catsSig) return;
+  _catsSig=sig; customCats=cats;
+  document.querySelectorAll('#tabs button.custom').forEach(b=>b.remove());
+  const other=document.querySelector('#tabs button[data-k="other"]');
+  for(const c of cats){
+    const b=document.createElement('button');
+    b.className='custom'; b.dataset.k=c.slug;
+    b.setAttribute('data-i18n-skip','');
+    b.textContent=c.name||c.slug;
+    other.parentNode.insertBefore(b,other);
+  }
+  // A deleted category can leave the active tab orphaned - fall back
+  // to All rather than filtering on a kind that no longer exists.
+  if(tab && !document.querySelector(`#tabs button[data-k="${CSS.escape(tab)}"]`)){
+    tab=''; syncTabs();
+  } else syncTabs();
+}
+let _lastKind=null;
+function kindHead(k){
+  const custom=customName(k);
+  if(custom!==null) return `<div class="wallhead">${esc(custom)}</div>`;
+  const [key,en]=KINDLBL[k]||KINDLBL.other;
+  return `<div class="wallhead">${t(key,en)}</div>`;
+}
+// Cards → HTML, inserting a section header whenever the kind changes
+// (grouped mode only). _lastKind carries across infinite-scroll pages.
+function cardsHtml(list){
+  if(!catGroup) return list.map(cardHtml).join('');
+  let out='';
+  for(const c of list){
+    const k=(KINDLBL[c.kind]||customName(c.kind)!==null)?c.kind:'other';
+    if(k!==_lastKind){ out+=kindHead(k); _lastKind=k; }
+    out+=cardHtml(c);
+  }
+  return out;
+}
+function render(){
+  const list=filtered();
+  const wall=document.getElementById('wall');
+  document.getElementById('count').textContent =
+    wtotal ? tn('wall.count',wtotal,'{n} title','{n} titles') : '';
+  document.getElementById('matchedOnly').checked = matchedOnly;
+  _lastKind=null;
+  if(!list.length){
+    const q=document.getElementById('q').value.trim();
+    wall.innerHTML=`<div class="empty">${q||tab||genreSel||resSel||decSel?t('wall.nomatch','No matches.')
+      // A wall with nothing on it used to answer with a CLI flag, on a
+      // page whose whole point is not needing one. The indexing settings
+      // (and the newsgroup browser inside them) are two clicks away, so
+      // point there instead.
+      :`${t('wall.empty.none','Nothing indexed yet. Choose which newsgroups to index and the wall fills itself.')}`+
+       `<div style="margin-top:14px"><a class="chip" style="padding:7px 14px;font-size:13px" href="/#settings/indexing">`+
+       `${t('wall.empty.cta','Choose newsgroups')}</a></div>`}</div>`;
+    return;
+  }
+  wall.innerHTML=cardsHtml(list);
+}
+
+function cardHtml(c){
+  // Works on both shapes: v2 server cards (complete/res/n flat) and
+  // old-style cards with a releases array (detail-sheet refreshes).
+  const complete=c.releases?c.releases.some(r=>r.complete):!!c.complete;
+  const q=c.releases?bestQuality(c):(c.res||'');
+  const img=c.poster
+    ? `<img loading="lazy" decoding="async" src="${esc(c.poster)}" alt="">`
+    : `<div class="ph" style="${phStyle(c.title)}"><div class="t">${esc(c.title)}</div>${c.year?`<div class="y">${c.year}</div>`:''}</div>`;
+  const sub=c.kind==='tv'
+    ? (c.seasons&&c.seasons.length
+        ? (c.seasons.length>1?t('wall.seasons','{n} seasons',{n:c.seasons.length}):t('wall.season','Season {n}',{n:c.seasons[0]??1}))
+        : tn('wall.lcount',c.n||1,'{n} release','{n} releases'))
+    : (c.year||'');
+  // Arrived since this page last caught up - see freshKeys.
+  const fresh=freshKeys.has(c.key);
+  return `<div class="card${fresh?' fresh':''}" tabindex="0" data-key="${esc(c.key)}">
+    <div class="poster">${img}
+      ${fresh?`<span class="badge new" data-i18n-skip>${esc(t('wall.new.badge','NEW'))}</span>`:''}
+      ${q?`<span class="badge">${esc(q)}</span>`:''}
+      ${c.kind==='tv'?`<span class="badge tv">TV</span>`:''}
+      ${c.kind==='software'?`<span class="badge tv" style="background:rgba(245,180,69,.85);color:#1a1207">APP</span>`:''}
+      ${c.kind==='music'?`<span class="badge tv" style="background:rgba(158,206,106,.85);color:#0d1608" data-i18n-skip>${esc(t('wall.badge.music','MUSIC'))}</span>`:''}
+      ${c.kind==='book'?`<span class="badge tv" style="background:rgba(224,175,104,.85);color:#1a1207" data-i18n-skip>${esc(t('wall.badge.book','BOOK'))}</span>`:''}
+      ${customName(c.kind)!==null?`<span class="badge tv" style="background:rgba(122,162,247,.85);color:#0d1220">${esc(customName(c.kind).toUpperCase())}</span>`:''}
+      ${c.reaped?`<span class="badge" style="background:rgba(214,69,69,.9);color:#fff" data-i18n-skip title="${esc(t('wall.reaped','This group is being reaped - fresh posts are already being taken down'))}">${esc(t('wall.reaped.tag','REAPED'))}</span>`:''}
+      <span class="dotrow">${c.have?`<span class="havechip" title="${esc(t('wall.have','In your library'))}">✓</span>`:''}<span class="dot${complete?'':' part'}" title="${complete?t('wall.complete','complete'):t('wall.partial','partial')}"></span>${
+        c.verdict==='gone'?`<span class="dot" style="background:var(--bad)" title="${esc(t('wall.vd.gone','Probably taken down: the availability check keeps missing its parts'))}"></span>`
+        :c.verdict==='maybe'?`<span class="dot part" title="${esc(t('wall.vd.maybe','Availability uncertain on your providers'))}"></span>`:''
+      }</span>
+      <button class="hidebtn" data-hide-key="${esc(c.key)}" data-i18n-skip
+        title="${esc(t('wall.hide','Not interested: hide this title'))}"
+        aria-label="${esc(t('wall.hide','Not interested: hide this title'))}">✕</button>
+    </div>
+    <div class="cap"><div class="ttl">${esc(c.title)}</div><div class="sub">${esc(String(sub))}${c.rating?` · ★ ${c.rating.toFixed(1)}`:''}</div></div>
+  </div>`;
+}
+
+// M23d discovery strips, revived on the M28 server-paged API (the old
+// version read whole-index release arrays that v2 cards no longer
+// carry, so it silently rendered nothing). "Hot right now" = most
+// posted (post frequency is the popularity proxy a local index has).
+// Hidden while searching, on a filtered tab, or when the grid isn't
+// sorted newest-first - they never fight the grid.
+// M30: genre + quality chips. Genre values are LIKE substrings chosen
+// to match BOTH provider vocabularies ("Sci" hits TVmaze's
+// "Science-Fiction" and OMDb's "Sci-Fi").
+const GENRES=[['Action','Action'],['Animation','Animation'],['Comedy','Comedy'],
+  ['Crime','Crime'],['Documentary','Documentary'],['Drama','Drama'],
+  ['Family','Family'],['Fantasy','Fantasy'],['Horror','Horror'],
+  ['Music','Music'],['Mystery','Mystery'],['Romance','Romance'],
+  ['Sci-Fi','Sci'],['Thriller','Thriller'],['War','War'],['Western','Western']];
+function renderChips(){ setTimeout(chipFades,0);
+  const box=document.getElementById('chips');
+  if(view==='releases'){ box.style.display='none'; return; }
+  box.style.display='flex';
+  const DECADES=[['2020s','2020-2029'],['2010s','2010-2019'],['2000s','2000-2009'],
+    ['90s','1990-1999'],['80s','1980-1989'],[t('wall.dec.older','Older'),'0-1979']];
+  box.innerHTML=
+    GENRES.map(([lab,val])=>`<button class="chip${genreSel===val?' on':''}" data-genre="${val}">${lab}</button>`).join('')
+    +`<span class="gsep"></span>`
+    +['2160p','1080p','720p'].map(r=>`<button class="chip${resSel===r?' on':''}" data-res="${r}">${r}</button>`).join('')
+    +`<span class="gsep"></span>`
+    +DECADES.map(([lab,val])=>`<button class="chip${decSel===val?' on':''}" data-dec="${val}">${lab}</button>`).join('');
+}
+document.getElementById('chips').addEventListener('click',e=>{
+  const b=e.target.closest('button'); if(!b) return;
+  if(b.dataset.genre!=null){
+    genreSel=genreSel===b.dataset.genre?'':b.dataset.genre;
+    localStorage.nzbfastWallGenre=genreSel;
+  }
+  if(b.dataset.res!=null) resSel=resSel===b.dataset.res?'':b.dataset.res;
+  if(b.dataset.dec!=null) decSel=decSel===b.dataset.dec?'':b.dataset.dec;
+  renderChips(); wallFetch(true);
+});
+document.getElementById('catGroup').addEventListener('change',e=>{ viewBadge();
+  catGroup=e.target.checked;
+  localStorage.nzbfastWallGroup=catGroup?'on':'off';
+  wallFetch(true);
+});
+// M31b: "Because you watch …" caption under the bar, shown only while
+// the For-you (affinity) sort is active and a taste profile exists.
+async function renderAffNote(){
+  const box=document.getElementById('affnote');
+  const hide=()=>{ box.style.display='none'; box.innerHTML=''; };
+  if(sortBy!=='affinity'||view==='releases'){ hide(); return; }
+  try{
+    const j=await api('taste','');
+    const gs=(j.genres||[]).slice(0,3).map(g=>g.name).filter(Boolean);
+    if(!(j.n_signals>0)||!gs.length){ hide(); return; }
+    const list=gs.map(g=>`<b>${esc(g)}</b>`).join(', ');
+    box.innerHTML=t('wall.affinity.because','Because you watch {genres}',{genres:list});
+    // Explicit 'block' - the CSS default is display:none, so clearing the
+    // inline style ('') would just re-hide it.
+    box.style.display='block';
+  }catch(e){ hide(); }
+}
+let stripSeq=0;
+async function renderStrips(){
+  const box=document.getElementById('strips');
+  const q=document.getElementById('q').value.trim();
+  if(q||tab||sortBy!=='latest'||view==='releases'||genreSel||resSel||decSel||catGroup){ box.innerHTML=''; return; }
+  const seq=++stripSeq;
+  const toCard=c=>({
+    key:c.key, kind:c.kind, title:c.title, year:c.year||0, aired:c.aired||'',
+    poster:c.poster, complete:c.complete, res:c.res, n:c.n,
+    rating:c.rating, verdict:c.verdict, have:c.have, seasons:[],
+  });
+  try{
+    let html='';
+    // M31b: a "Recommended for you" row leads the default view when a
+    // taste profile exists (cold start has none, so it's skipped and only
+    // "Hot right now" shows - no duplicate "most posted" strip).
+    const taste=await api('taste','').catch(()=>({}));
+    if(seq!==stripSeq) return;
+    if((taste.n_signals>0)&&(taste.genres||[]).length){
+      const ja=await api('wall2','&sort=affinity&limit=14&matched=1&all=0');
+      if(seq!==stripSeq) return;
+      const recs=(ja.cards||[]).map(toCard);
+      if(recs.length) html+=`<div class="strip">
+        <h2>${t('wall.strip.foryou','Recommended for you')}</h2>
+        <div class="striprow">${recs.map(cardHtml).join('')}</div></div>`;
+    }
+    const j=await api('wall2','&sort=releases&limit=14&matched=1&all=0');
+    if(seq!==stripSeq) return;
+    const hot=(j.cards||[]).filter(c=>(c.n||0)>=3).map(toCard);
+    if(hot.length) html+=`<div class="strip">
+      <h2>${t('wall.strip.hot','Hot right now · most posted')}</h2>
+      <div class="striprow">${hot.map(cardHtml).join('')}</div></div>`;
+    box.innerHTML=html;
+  }catch(e){ if(seq===stripSeq) box.innerHTML=''; }
+}
+
+function toast(msg){
+  const t=document.getElementById('toast');
+  t.textContent=msg; t.classList.add('show');
+  clearTimeout(t._h); t._h=setTimeout(()=>t.classList.remove('show'), 2600);
+}
+
+// ---- "you already have this" ----------------------------------------
+//
+// The daemon holds a duplicate as a paused alternative, which is right
+// for an RSS or watchlist grab nobody is watching, and wrong for a click:
+// Play became a paused row that never started, the player opened on
+// nothing, and the only clue was a "held (duplicate)" label on a queue
+// row. So the wall asks first, and the answer decides.
+let dupeResolve=null;
+function dupeClose(v){
+  document.getElementById('dupeovl').classList.remove('open');
+  const r=dupeResolve; dupeResolve=null; if(r) r(v);
+}
+// Returns 'existing' (play what we already downloaded), 'again'
+// (download a second copy anyway), or null (cancel / dismissed).
+function askDupe(info, play){
+  const queued=info.where==='queue';
+  document.getElementById('dupeTitle').textContent = queued
+    ? t('wall.dupe.title.queued','This is already in your queue')
+    : t('wall.dupe.title.have','You already have this');
+  document.getElementById('dupeBody').textContent = queued
+    ? t('wall.dupe.body.queued','{name} is already queued to download.',{name:info.name||''})
+    : t('wall.dupe.body.have','{name} is already in your completed downloads.',{name:info.name||''});
+  // Playing the copy we have is only on offer when there IS one: a
+  // queued collision has not finished downloading yet.
+  const acts=[];
+  if(!queued&&play) acts.push([t('wall.dupe.playhave','Play the copy you have'),'existing','act']);
+  acts.push([t('wall.dupe.again','Download another copy'),'again','act ghost']);
+  acts.push([t('btn.cancel','Cancel'),'','act ghost']);
+  document.getElementById('dupeActs').innerHTML=acts.map(([label,v,cls])=>
+    `<button class="${cls}" data-v="${v}">${esc(label)}</button>`).join('');
+  document.getElementById('dupeovl').classList.add('open');
+  return new Promise(res=>{ dupeResolve=res; });
+}
+document.getElementById('dupeActs').addEventListener('click', e=>{
+  const b=e.target.closest('button[data-v]'); if(!b) return;
+  dupeClose(b.dataset.v||null);
+});
+document.getElementById('dupeovl').addEventListener('click', e=>{
+  if(e.target.id==='dupeovl') dupeClose(null);
+});
+
+async function grab(id, play){
+  // Ask before adding a second copy of something we already have - the
+  // daemon would otherwise hold it silently (see askDupe).
+  let dupeOk='';
+  const chk=await api('index_dupe',`&id=${id}`);
+  if(chk.status&&chk.dupe){
+    const choice=await askDupe(chk, play);
+    if(!choice) return;
+    if(choice==='existing'){
+      // The same player handoff ▶ Play uses, pointed at the copy that is
+      // already on disk: /stream serves a finished job's file straight
+      // from the output folder, so this works from any browser, not just
+      // one sitting at the daemon's own screen.
+      toast(t('toast.handoff','Handing playback to your player…'));
+      location.href=`/m3u/${encodeURIComponent(chk.nzo_id)}?apikey=${encodeURIComponent(key)}`;
+      return;
+    }
+    dupeOk='&dupe_ok=1';
+  }
+  // Hand-picked grabs skip the queue: Play = Force (starts even while
+  // something else downloads), Download = High.
+  const j=await api('index_get',`&id=${id}&priority=${play?2:1}${dupeOk}`);
+  if(!j.status){ toast(t('wall.failed','Failed: {err}',{err:tErr(j.error)||t('wall.unknown','unknown')})); return; }
+  const nzo=(j.nzo_ids||[])[0];
+  toast(play?t('wall.queuedPlay','Queued: opening player…'):t('wall.queued','Queued for download'));
+  if(play&&nzo) location.href=`/m3u/${nzo}?apikey=${encodeURIComponent(key)}`;
+}
+
+// ---- 24C: two surfaces - wall (discover) and releases (the table) ----
+// The survey verdict: every indexer keeps a title-grouped covers surface
+// and a per-release table DISTINCT, and the old grid/dense/list trio was
+// two views wearing three buttons (grid and dense were the same wall at
+// two tile sizes). v2 prefs, with the legacy mode mapped so nobody lands
+// on a reset view after the upgrade: grid -> wall at medium density,
+// dense -> wall at small, list -> the Releases table.
+const DENS={s:108,m:152,l:210};
+let view, density, zoomPx;
+{
+  const v2=localStorage.nzbfastWallView2, old=localStorage.nzbfastWallView;
+  view = (v2==='wall'||v2==='releases') ? v2 : (old==='list'?'releases':'wall');
+  const d2=localStorage.nzbfastWallDensity2;
+  density = DENS[d2] ? d2 : (old==='dense'?'s':'m');
+  // The slider's fine-tune rides ON TOP of the presets. One-shot legacy
+  // migration: the per-view zoom of the mapped old view carries over,
+  // and the new key is written back so clearing it later (picking a
+  // preset stores '') can never resurrect the legacy value.
+  if(localStorage.nzbfastWallZoom2==null){
+    localStorage.nzbfastWallZoom2 =
+      (+(old==='dense'?localStorage.nzbfastWallZoomDense
+                      :localStorage.nzbfastWallZoomGrid)||'');
+  }
+  zoomPx = +localStorage.nzbfastWallZoom2||0;
+}
+// lrows keeps the page currently on screen so a late i18n catalogue can
+// repaint the rows locally; null = nothing rendered yet.
+let lpage=0, ltotal=0, lseq=0, lrows=null;
+const LPAGE=50;
+// ---- poster density + zoom ------------------------------------------
+const ZOOM_MIN=84, ZOOM_MAX=320;
+const PHONE_MQ=matchMedia('(max-width:640px)');
+const phoneUi = () => PHONE_MQ.matches;
+// Crossing the breakpoint swaps which default rules (density preset vs
+// the phone stylesheet) should be in charge - and embedded panes can
+// even measure phone-narrow for the first paint, so re-apply on change.
+PHONE_MQ.addEventListener('change', ()=>applyZoom());
+
+// ---- §Stage4: the View popover -------------------------------------
+// The controls inside are the originals, moved: same ids, same handlers.
+// Only the container changed, so nothing here re-implements behaviour.
+// THE TRAP: .bar carries backdrop-filter, and a filtered element becomes
+// the containing block for position:fixed DESCENDANTS. Left inside the
+// bar, the phone bottom sheet pinned itself to the bar instead of the
+// viewport and rendered at the top of the screen, clipped. So the menu
+// lives on <body>, and the desktop anchoring is done in script.
+document.body.appendChild(document.getElementById('viewMenu'));
+function toggleViewMenu(want){
+  const m=document.getElementById('viewMenu'), b=document.getElementById('viewBtn');
+  const open = want===undefined ? m.hidden : want;
+  m.hidden=!open;
+  b.setAttribute('aria-expanded', open?'true':'false');
+  document.getElementById('vpBack').classList.toggle('on', open);
+  if(open){
+    if(PHONE_MQ.matches){ m.style.top=m.style.left=m.style.right=''; }
+    else{
+      // Anchor under the button, right edges aligned, clamped to the window.
+      const r=b.getBoundingClientRect();
+      m.style.top=(r.bottom+9)+'px';
+      m.style.right=Math.max(8, innerWidth-r.right)+'px';
+      m.style.left='auto';
+    }
+    m.querySelector('button,input,select')?.focus();
+  }
+  return false;
+}
+addEventListener('resize', ()=>{ if(!document.getElementById('viewMenu').hidden) toggleViewMenu(true); });
+// What is switched on in there, so a closed panel never silently explains
+// why cards are missing. "Matched only" ships ON, so it is counted from
+// its own default, not from false.
+function viewBadge(){
+  const n=[
+    document.getElementById('catGroup').checked,
+    !document.getElementById('matchedOnly').checked,   // default is on
+    view==='releases' && !document.getElementById('onlyComplete').checked,
+    density!=='m',
+  ].filter(Boolean).length;
+  const b=document.getElementById('viewBtn');
+  b.classList.toggle('on', n>0);
+  const old=b.querySelector('.vpn'); if(old) old.remove();
+  if(n){ const s=document.createElement('span'); s.className='vpn'; s.textContent=n; b.appendChild(s); }
+}
+addEventListener('click', e=>{
+  const m=document.getElementById('viewMenu');
+  if(m.hidden) return;
+  if(!e.target.closest('#viewPop') && !e.target.closest('#viewMenu')) toggleViewMenu(false);
+});
+addEventListener('keydown', e=>{
+  if(e.key==='Escape' && !document.getElementById('viewMenu').hidden) toggleViewMenu(false);
+});
+// On a phone the category tabs and the nav join the sheet, so the bar can
+// stay one short row. Moving the elements keeps their handlers, which are
+// bound to the elements themselves rather than delegated from the bar.
+function reflowBar(){
+  const phone=PHONE_MQ.matches, body=document.getElementById('viewBody'),
+        bar=document.querySelector('.bar');
+  // Order matters: this is the sheet's reading order on a phone, and the
+  // bar's left-to-right order back on the desktop.
+  const MOVE=['tabs','views','sortwrap','count'];
+  if(phone){
+    // Insert ahead of the controls that live in the sheet at every width,
+    // so categories and the view switch come first.
+    let at=body.firstChild;
+    for(const id of MOVE){
+      const el=document.getElementById(id);
+      if(el && el.parentElement!==body) body.insertBefore(el, at);
+    }
+  }else{
+    const q=document.getElementById('q');
+    for(const id of ['views','tabs']){
+      const el=document.getElementById(id);
+      if(el && el.parentElement===body) bar.insertBefore(el, q);
+    }
+    const sw=document.getElementById('sortwrap');
+    if(sw && sw.parentElement===body) bar.insertBefore(sw, document.getElementById('viewPop'));
+    const cnt=document.getElementById('count');
+    if(cnt && cnt.parentElement===body) bar.insertBefore(cnt, document.getElementById('viewPop'));
+    toggleViewMenu(false);
+  }
+}
+PHONE_MQ.addEventListener('change', reflowBar);
+
+// ---- §Stage4: the filter chips say when more are off-screen ---------
+function chipFades(){
+  const el=document.getElementById('chips');
+  if(!el) return;
+  const max=el.scrollWidth-el.clientWidth;
+  el.classList.toggle('fadeL', el.scrollLeft>4);
+  el.classList.toggle('fadeR', max>4 && el.scrollLeft<max-4);
+}
+document.getElementById('chips')?.addEventListener('scroll', chipFades, {passive:true});
+addEventListener('resize', ()=>{ chipFades(); });
+// The size the grid is actually using: an explicit fine-tune wins, then
+// the density preset - except on a phone, where the stylesheet's own
+// 102px 3-across default stands unless the user really dragged the
+// slider (density presets are a desktop affordance).
+const effTile = () => zoomPx || (phoneUi() ? 102 : DENS[density]);
+function applyZoom(){
+  const w=document.getElementById('wall');
+  const z = zoomPx || (phoneUi() ? 0 : DENS[density]);
+  if(z) w.style.setProperty('--tile', z+'px'); else w.style.removeProperty('--tile');
+  // Small tiles drop the caption's second line - what the old dense
+  // mode did, now keyed off the effective size however it was chosen.
+  w.classList.toggle('small', effTile()<120);
+  document.getElementById('zoom').value = effTile();
+  document.querySelectorAll('#densctl button').forEach(b=>
+    b.classList.toggle('on', !zoomPx && b.dataset.d===density));
+  const grid = view==='wall';
+  document.getElementById('zoomwrap').style.display = grid?'':'none';
+  document.getElementById('densctl').style.display = grid?'':'none';
+}
+function setDensity(d){
+  density=d; zoomPx=0;
+  localStorage.nzbfastWallDensity2=d;
+  localStorage.nzbfastWallZoom2='';
+  applyZoom();
+}
+function setZoom(px){
+  zoomPx=Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, Math.round(px)));
+  localStorage.nzbfastWallZoom2=zoomPx;
+  applyZoom();
+}
+
+// ---- sort direction --------------------------------------------------
+// Ascending is natural only for the A-Z sorts; everywhere else the useful
+// end is newest/biggest/highest.
+const naturalDesc = s => s!=='title' && s!=='name';
+const curSort = () =>
+  view==='releases' ? document.getElementById('lsort').value : sortBy;
+const curDesc = () => naturalDesc(curSort()) !== dirFlip;
+function renderDir(){
+  const b=document.getElementById('dir');
+  // One arrow, rotated. Was two glyphs written with textContent, which
+  // would now wipe the icon out of the button on the first render.
+  b.classList.toggle('up', !curDesc());
+  b.classList.toggle('on', dirFlip);
+}
+function setSortDir(flip){
+  dirFlip=flip;
+  localStorage.nzbfastWallDirFlip = flip?'on':'off';
+  renderDir();
+  if(view==='releases'){ lpage=0; browseFetch(); } else wallFetch(true);
+}
+
+function setView(v){
+  view=v; localStorage.nzbfastWallView2=v;
+  document.querySelectorAll('#views button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));
+  const rel=v==='releases';
+  applyZoom();
+  renderDir();
+  document.getElementById('strips').style.display=rel?'none':'';
+  document.getElementById('wall').style.display=rel?'none':'';
+  document.getElementById('list').style.display=rel?'':'none';
+  document.getElementById('sort').style.display=rel?'none':'';
+  document.getElementById('lsort').style.display=rel?'':'none';
+  // Wall-only / table-only bar controls swap with the surface.
+  document.getElementById('matchedOnly').parentElement.style.display=rel?'none':'';
+  document.getElementById('catGroup').parentElement.style.display=rel?'none':'';
+  document.querySelectorAll('.listonly').forEach(el=>el.style.display=rel?'':'none');
+  viewBadge();
+  renderChips();
+  renderAffNote();
+  if(rel){ lpage=0; browseFetch(); } else wallFetch(true);
+}
+function syncTabs(){
+  document.querySelectorAll('#tabs button').forEach(x=>x.classList.toggle('on',x.dataset.k===tab));
+}
+// M30: friendly display name for a ROT13-rescued row - the raw stem is
+// rotated gibberish; the parser's decoded title/marker facts read fine.
+function rotName(r){
+  let n=r.title||r.name;
+  if(r.season!=null&&r.episode!=null)
+    n+=` S${String(r.season).padStart(2,'0')}E${String(r.episode).padStart(2,'0')}`;
+  else if(r.year) n+=` (${r.year})`;
+  return n;
+}
+// 24C: ONE chip carrying kind > quality (the NZBFinder "TV › HD"
+// pattern) - custom categories slot in as the kind, quality comes from
+// the parse the index already serves per row.
+function catChip(r){
+  const custom=customName(r.kind);
+  const label=custom!==null?custom
+    :r.kind==='movie'?t('wall.tab.movies','Movies')
+    :r.kind==='tv'?'TV'
+    :r.kind==='music'?t('wall.tab.music','Music')
+    :r.kind==='book'?t('wall.tab.books','Books')
+    :r.kind==='software'?t('wall.cat.apps','Apps')
+    :t('wall.tab.other','Other');
+  const cls=r.kind==='movie'||r.kind==='tv'?r.kind:'';
+  const q=r.quality||r.res||'';
+  return `<span class="catchip ${cls}">${esc(label)}${q?` <span class="qsep">›</span> ${esc(q)}`:''}</span>`;
+}
+// Dynamic range / audio / video tags for one release row, richest first.
+// A tag the user asked for is marked, so the ordering explains itself
+// instead of looking arbitrary. Empty when the release name said nothing,
+// which is common and not worth a placeholder.
+function relTags(r){
+  const hit=r.prefhit||[];
+  return [['hdr',r.hdr],['acodec',r.acodec],['vcodec',r.vcodec]]
+    .filter(([,v])=>v)
+    .map(([f,v])=>`<span class="tag${hit.includes(f)?' on':''}"${hit.includes(f)
+      ?` title="${esc(t('wall.tag.wanted','You asked for this'))}"`:''}>${esc(v)}</span>`)
+    .join('');
+}
+function healthCell(r){
+  const pct=r.need_parts?100*r.have_parts/r.need_parts:0;
+  const cls=r.complete?'ok':pct>=95?'warn':'bad';
+  const txt=r.complete?'✓ 100%':num(Math.min(pct,99.9),1)+'%';
+  const tip=t('wall.health.tip','{have}/{need} parts{par2}',
+    {have:r.have_parts,need:r.need_parts,
+     par2:r.par2?' · par2 '+t('wall.health.repair','present, repairable'):''});
+  return `<span class="hlth" style="color:var(--${cls==='ok'?'ok':cls==='warn'?'warn':'bad'})" title="${esc(tip)}">${txt}</span>`;
+}
+// ---- 24C: group by title (DrunkenSlug pattern) ----------------------
+// One row per title_key with that title's releases nested inline under
+// an expander. Driven by the data that already exists: wall2 is
+// title-grouped server-side, and index_browse's title_key filter is the
+// same per-title fetch the detail sheet uses.
+let grpTitle=localStorage.nzbfastWallGrpTitle==='on';
+let lgroups=null;
+const gexp=new Set(), relCache=new Map();
+// The table's flat sorts, mapped onto the grouped (wall2) vocabulary;
+// the ones with no grouped equivalent fall back to newest-first.
+// Grouped mode has no server-side equivalent for `kind` or
+// `completeness`, so both fall back to `latest`. That fallback is fine;
+// what was not fine is that markSortHeads still drew the active-sort
+// arrow on whichever header the dropdown named, so the Availability
+// column claimed to be sorting rows that were actually newest-first, and
+// clicking it again "reversed" a sort that was never running.
+const GRP_SORT={posted:'latest',seen:'arrived',size:'size',name:'title',
+  files:'releases',kind:'latest',completeness:'latest'};
+// The dropdown values grouped mode can genuinely honour.
+const GRP_REAL=new Set(['posted','seen','size','name','files']);
+function grpAvail(c){
+  return `<span class="${c.complete?'ok':'warn'}">${c.complete?'✓ '+t('wall.complete','complete'):t('wall.partial','partial')}</span>${
+    c.verdict==='gone'?` <span style="color:var(--bad)" title="${esc(t('wall.vd.gone','Probably taken down: the availability check keeps missing its parts'))}">✗</span>`
+    :c.verdict==='maybe'?` <span style="color:var(--warn)" title="${esc(t('wall.vd.maybe','Availability uncertain on your providers'))}">?</span>`:''
+  }${c.reaped?` <span style="color:var(--bad);font-size:10px;font-weight:700" data-i18n-skip title="${esc(t('wall.reaped','This group is being reaped - fresh posts are already being taken down'))}">${esc(t('wall.reaped.tag','REAPED'))}</span>`:''}`;
+}
+function grpRow(c){
+  const open=gexp.has(c.key);
+  return `<tr class="grp" data-key="${esc(c.key)}" data-exp="${esc(c.key)}">
+    <td class="selcol"><button class="exp" data-i18n-skip aria-expanded="${open}"
+      title="${esc(t('wall.exp.title',"Show this title's releases"))}"
+      aria-label="${esc(t('wall.exp.title',"Show this title's releases"))}">${open?'▾':'▸'}</button></td>
+    <td class="name"><span class="stem">${esc(c.title)}</span>${c.year?` <span class="dim">(${c.year})</span>`:''}</td>
+    <td>${catChip({kind:c.kind, quality:c.res||''})}</td>
+    <td class="mono dim">${age(c.latest)}</td>
+    <td class="mono">${gb(c.size||0)}</td>
+    <td class="mono dim">${c.n||0}</td>
+    <td>${grpAvail(c)}</td>
+    <td style="text-align:end;white-space:nowrap">
+      <button class="act ghost" data-info-key="${esc(c.key)}" data-i18n-skip
+        title="${esc(t('wall.info.title','Show details and every release of this title'))}"
+        aria-label="${esc(t('wall.info.title','Show details and every release of this title'))}">ⓘ</button>
+    </td>
+  </tr>`;
+}
+function renderGroups(){
+  const body=document.getElementById('lbody');
+  hovHide();
+  // The Files column counts releases per title in grouped mode.
+  document.getElementById('lhFiles').firstChild.nodeValue=t('wall.lcol.rels','Releases');
+  document.getElementById('count').textContent=
+    ltotal?tn('wall.count',ltotal,'{n} title','{n} titles'):'';
+  if(!lgroups||!lgroups.length){
+    body.innerHTML=`<tr><td colspan="8" class="dim">${t('wall.nomatch','No matches.')}</td></tr>`;
+  } else {
+    // Same composite key toggleExp caches under, so nested rows always
+    // match the filter the parent rows were fetched with.
+    const ck=k=>`${k}|${document.getElementById('onlyComplete').checked?1:0}`;
+    body.innerHTML=lgroups.map(c=>grpRow(c)
+      +(gexp.has(c.key)&&relCache.get(ck(c.key))
+        ?relCache.get(ck(c.key)).map(r=>relRow(r,true)).join(''):'')).join('');
+  }
+  markSortHeads();
+  updateSelBar();
+  pageFoot();
+}
+async function toggleExp(k){
+  if(gexp.has(k)){ gexp.delete(k); renderGroups(); return; }
+  gexp.add(k);
+  // Key the cache by the FILTER as well as the title. It used to be
+  // keyed by title alone and never invalidated, so toggling "Only
+  // complete" re-queried the parent rows but re-rendered the expanded
+  // group's nested rows from the old answer: an incomplete release stayed
+  // visible under a filter that excludes it, with its Download button
+  // disabled by the same filter - a row the UI says cannot exist and
+  // cannot be acted on. It also meant nested availability never refreshed
+  // for the session while the parents kept updating on the 45 s tick.
+  const complete=document.getElementById('onlyComplete').checked?1:0;
+  const ck=`${k}|${complete}`;
+  if(!relCache.has(ck)){
+    try{
+      const j=await api('index_browse',
+        `&title_key=${encodeURIComponent(k)}&all=1&complete=${complete}&limit=200`);
+      relCache.set(ck, j.results||[]);
+    }catch(e){
+      // Do not leave the row claiming to be open with nothing under it.
+      relCache.delete(ck);
+      gexp.delete(k);
+      renderGroups();
+      return;
+    }
+  }
+  renderGroups();
+}
+async function groupFetch(){
+  const seq=++lseq;
+  try{
+    const q=document.getElementById('q').value.trim();
+    const sort=GRP_SORT[document.getElementById('lsort').value]||'latest';
+    const complete=document.getElementById('onlyComplete').checked?1:0;
+    // matched=0 keeps unenriched titles (this is still the honest
+    // table, not the curated wall); all=0 keeps the junk gate the flat
+    // list applies too.
+    const j=await api('wall2',
+      `&cat=${encodeURIComponent(tab||'all')}&q=${encodeURIComponent(q)}`+
+      `&sort=${sort}&dir=${curDesc()?'desc':'asc'}&complete=${complete}`+
+      `&limit=${LPAGE}&offset=${lpage*LPAGE}&matched=0&all=0`);
+    if(seq!==lseq) return;
+    if(j.error){ toast(tErr(j.error)); return; }
+    updateCats(j.cats);
+    ltotal=j.total||0;
+    lgroups=j.cards||[];
+    renderGroups();
+  }catch(e){
+    if(seq!==lseq) return;
+    document.getElementById('lbody').innerHTML=
+      `<tr><td colspan="8" class="dim">${t('status.daemonDown','daemon unreachable')}</td></tr>`;
+  }
+}
+async function browseFetch(){
+  // Never drop a request (a dropped page-turn desyncs lpage from the
+  // table); instead let only the LATEST response render, so a slow
+  // earlier reply can't overwrite a newer page.
+  if(grpTitle) return groupFetch();
+  const seq=++lseq;
+  try{
+    const q=document.getElementById('q').value.trim();
+    const sort=document.getElementById('lsort').value;
+    const complete=document.getElementById('onlyComplete').checked?1:0;
+    const dir=curDesc()?'desc':'asc';
+    const j=await api('index_browse',
+      `&cat=${encodeURIComponent(tab||'all')}&q=${encodeURIComponent(q)}`+
+      `&sort=${sort}&dir=${dir}&complete=${complete}&limit=${LPAGE}&offset=${lpage*LPAGE}`);
+    if(seq!==lseq) return;
+    if(j.error){ toast(tErr(j.error)); return; }
+    updateCats(j.cats);
+    ltotal=j.total||0;
+    lrows=j.results||[];
+    renderList(lrows);
+  }catch(e){
+    if(seq!==lseq) return;
+    document.getElementById('lbody').innerHTML=
+      `<tr><td colspan="8" class="dim">${t('status.daemonDown','daemon unreachable')}</td></tr>`;
+  }
+}
+// Availability cell: the checked-the-articles answer to other indexers'
+// grabs column - completeness %, oracle verdict, and the REAPED badge.
+function availCell(r){
+  return `${healthCell(r)}${
+    r.verdict==='gone'?` <span style="color:var(--bad)" title="${esc(t('wall.vd.gone','Probably taken down: the availability check keeps missing its parts'))}">✗</span>`
+    :r.verdict==='maybe'?` <span style="color:var(--warn)" title="${esc(t('wall.vd.maybe','Availability uncertain on your providers'))}">?</span>`:''
+  }${r.reaped?` <span style="color:var(--bad);font-size:10px;font-weight:700" data-i18n-skip title="${esc(t('wall.reaped','This group is being reaped - fresh posts are already being taken down'))}">${esc(t('wall.reaped.tag','REAPED'))}</span>`:''}`;
+}
+// Under-name badges: only facts the index holds - repair data present,
+// the source newsgroup, a decoded-obfuscation marker.
+function nameBadges(r){
+  const b=[];
+  if(r.par2) b.push(`<span class="nbadge" data-i18n-skip title="${esc(t('wall.badge.par2.title','Repair data posted alongside: damaged parts can be rebuilt'))}">PAR2</span>`);
+  if(r.rescued) b.push(`<span class="nbadge">${t('wall.rot.decoded','decoded')}</span>`);
+  if(r.group) b.push(`<span class="nbadge" dir="ltr" title="${esc(r.group)}">${esc(r.group)}</span>`);
+  return b.length?`<div class="brow">${b.join('')}</div>`:'';
+}
+function actCell(r){
+  return `<td style="text-align:end;white-space:nowrap">
+    <button class="act ghost" data-info-key="${esc(r.key)}" data-i18n-skip
+       title="${esc(t('wall.info.title','Show details and every release of this title'))}"
+       aria-label="${esc(t('wall.info.title','Show details and every release of this title'))}">ⓘ</button>
+    <a class="act ghost" style="text-decoration:none"
+       href="/getnzb/${r.id}.nzb?apikey=${encodeURIComponent(key)}"
+       title="${esc(t('wall.getnzb.title','Download the .nzb file'))}">⬇ .nzb</a>
+    <button class="act" ${r.complete||!document.getElementById('onlyComplete').checked?'':'disabled'}
+       onclick="grab(${r.id},false)">${t('wall.download','Download')}</button>
+  </td>`;
+}
+// One per-release row; sub=true renders it nested under a title row.
+function relRow(r,sub){
+  return `<tr data-key="${esc(r.key)}"${sub?' class="sub"':''}>
+    <td class="selcol"><input type="checkbox" data-sel="${r.id}"${lsel.has(r.id)?' checked':''}
+      aria-label="${esc(t('wall.sel.row','Select this release'))}"></td>
+    <td class="name" title="${esc(r.rescued?t('wall.rot.tip','Obfuscated post (decoded name shown); raw: {raw}',{raw:r.name}):r.name)}">
+      ${r.have?`<span class="hv" title="${esc(t('wall.have','In your library'))}">✓</span> `:''}<span class="stem">${esc(r.rescued?rotName(r):r.name)}</span>
+      ${nameBadges(r)}</td>
+    <td>${catChip(r)}${relTags(r)}</td>
+    <td class="mono dim">${age(r.first_posted)}</td>
+    <td class="mono">${gb(r.size||0)}</td>
+    <td class="mono dim">${r.files||0}</td>
+    <td>${availCell(r)}</td>
+    ${actCell(r)}
+  </tr>`;
+}
+function pageFoot(){
+  const last=Math.min((lpage+1)*LPAGE,ltotal);
+  document.getElementById('lrange').textContent=
+    ltotal?`${ltotal?lpage*LPAGE+1:0}–${last} / ${ltotal}`:'';
+  document.getElementById('lprev').disabled=lpage===0;
+  document.getElementById('lnext').disabled=last>=ltotal;
+}
+function renderList(rows){
+  const body=document.getElementById('lbody');
+  // A re-render pulls the rows out from under the pointer - never leave
+  // yesterday's preview floating over the new page.
+  hovHide();
+  document.getElementById('lhFiles').firstChild.nodeValue=t('wall.col.files','Files');
+  document.getElementById('count').textContent=
+    ltotal?tn('wall.lcount',ltotal,'{n} release','{n} releases'):'';
+  if(!rows.length){
+    body.innerHTML=`<tr><td colspan="8" class="dim">${t('wall.nomatch','No matches.')}</td></tr>`;
+  } else {
+    body.innerHTML=rows.map(r=>relRow(r,false)).join('');
+  }
+  markSortHeads();
+  updateSelBar();
+  pageFoot();
+}
+// Sorted-column indicator on the clickable headers.
+function markSortHeads(){
+  let cur=document.getElementById('lsort').value;
+  // In grouped mode a sort the server cannot run is silently mapped to
+  // `latest`, so mark the header that is REALLY in effect rather than
+  // the one the dropdown names.
+  if(grpTitle && !GRP_REAL.has(cur)) cur='posted';
+  document.querySelectorAll('#ltable th.sortable').forEach(th=>{
+    th.classList.toggle('on', th.dataset.lsort===cur
+      // Age answers for both date sorts - posted is the column, seen
+      // (recently added) rides the same header.
+      || (th.dataset.lsort==='posted' && cur==='seen'));
+    th.classList.toggle('asc', !curDesc());
+  });
+}
+// ---- 24C: checkbox selection + bulk queue ---------------------------
+// Selection survives page turns (a Set of release ids); the header
+// checkbox covers the visible page.
+const lsel=new Set();
+function updateSelBar(){
+  const n=lsel.size;
+  document.getElementById('selbar').style.display=n?'flex':'none';
+  document.getElementById('selcount').textContent=
+    n?tn('wall.sel.n',n,'{n} selected','{n} selected'):'';
+  const boxes=[...document.querySelectorAll('#lbody [data-sel]')];
+  const all=boxes.length>0&&boxes.every(c=>lsel.has(+c.dataset.sel));
+  const some=boxes.some(c=>lsel.has(+c.dataset.sel));
+  const h=document.getElementById('selAll');
+  h.checked=all; h.indeterminate=!all&&some;
+}
+document.getElementById('lbody').addEventListener('change',e=>{
+  const c=e.target.closest('[data-sel]'); if(!c) return;
+  const id=+c.dataset.sel;
+  if(c.checked) lsel.add(id); else lsel.delete(id);
+  updateSelBar();
+});
+document.getElementById('selAll').addEventListener('change',e=>{
+  document.querySelectorAll('#lbody [data-sel]').forEach(c=>{
+    c.checked=e.target.checked;
+    const id=+c.dataset.sel;
+    if(e.target.checked) lsel.add(id); else lsel.delete(id);
+  });
+  updateSelBar();
+});
+document.getElementById('selClear').addEventListener('click',()=>{
+  lsel.clear();
+  document.querySelectorAll('#lbody [data-sel]').forEach(c=>{ c.checked=false; });
+  updateSelBar();
+});
+// Bulk queue reuses the per-row endpoint (index_get, High priority),
+// one call per release - same path, same protections.
+document.getElementById('selQueue').addEventListener('click',async e=>{
+  const btn=e.target, ids=[...lsel];
+  if(!ids.length) return;
+  btn.disabled=true;
+  let ok=0, fail=0;
+  try{
+    for(const id of ids){
+      try{
+        const j=await api('index_get',`&id=${id}&priority=1`);
+        if(j.status) ok++; else fail++;
+      }catch(err){ fail++; }
+    }
+  } finally { btn.disabled=false; }
+  toast(tn('wall.sel.queued',ok,'{n} release queued','{n} releases queued')
+    +(fail?' · '+tn('wall.sel.fail',fail,'{n} failed','{n} failed'):''));
+  lsel.clear();
+  document.querySelectorAll('#lbody [data-sel]').forEach(c=>{ c.checked=false; });
+  updateSelBar();
+});
+// Sortable headers drive the same server-side sort as the dropdown.
+document.querySelector('#ltable thead').addEventListener('click',e=>{
+  if(e.target.closest('#selAll')) return;
+  const th=e.target.closest('th.sortable'); if(!th) return;
+  const sel=document.getElementById('lsort');
+  if(sel.value===th.dataset.lsort||
+     (th.dataset.lsort==='posted'&&sel.value==='seen')){ setSortDir(!dirFlip); return; }
+  sel.value=th.dataset.lsort;
+  dirFlip=false; localStorage.nzbfastWallDirFlip='off'; renderDir();
+  lpage=0; browseFetch();
+});
+// Info: open the wall's detail sheet when this release has a card
+// (obfuscated/junk rows may not - the wall api hides pure noise).
+function listInfo(k){ openCard(k); }
+
+// Per-season episode grid: one chip per episode (best encode wins),
+// dashed chips for season packs. Click = download that episode now;
+// ☆ watch series = auto-grab the season from now on.
+function epGridHtml(c){
+  const bySeason={};
+  for(const r of c.releases){
+    if(r.season==null) continue;
+    const b=bySeason[r.season]=bySeason[r.season]||{packs:[],eps:{}};
+    if(r.episode==null){ b.packs.push(r); continue; }
+    const cur=b.eps[r.episode];
+    // `pref` is the daemon's complete quality score (resolution, source,
+    // remux, codec, audio, HDR and the user's live preferences). Using a
+    // smaller client-side approximation here made the only episode chip
+    // disagree with the correctly ranked releases immediately below it.
+    if(!cur||(r.pref||0)>(cur.pref||0)
+      ||((r.pref||0)===(cur.pref||0)&&(r.size||0)>(cur.size||0))) b.eps[r.episode]=r;
+  }
+  const seasons=Object.keys(bySeason).map(Number).sort((a,b)=>a-b);
+  if(!seasons.length) return '';
+  return `<div class="epwrap"><h3>${t('wall.eps.title','Episodes on Usenet')}</h3>`+seasons.map(s=>{
+    const b=bySeason[s], eps=Object.keys(b.eps).map(Number).sort((x,y)=>x-y);
+    return `<div class="season"><div class="shead">${t('wall.series','Series {n}',{n:s})}
+      <button class="act ghost mini" onclick="watchThis(${s})"
+        title="${esc(t('wall.watchseries.title','auto-grab every episode of series {n} as it appears, upgrading quality automatically',{n:s}))}">☆ ${t('wall.watchseries','watch series {n}',{n:s})}</button></div>
+      <div class="epchips">
+        ${b.packs.map(p=>`<button class="epchip pack" ${p.complete?'':'disabled'}
+            title="${esc(p.stem)} - ${gb(p.size||0)}${p.complete?'':' - '+t('wall.incomplete','incomplete')}"
+            onclick="grab(${p.id},false)">${t('wall.pack','Season pack')}<span>${esc(p.quality||'-')}</span></button>`).join('')}
+        ${eps.map(e=>{const r=b.eps[e];
+          return `<button class="epchip${r.have?' own':''}" ${r.complete?'':'disabled'}
+            title="${esc(r.stem)} - ${gb(r.size||0)}${r.have?' - '+t('wall.have','In your library'):''}${r.complete?'':' - '+t('wall.incomplete','incomplete')}"
+            onclick="grab(${r.id},false)">${r.have?'✓ ':''}E${String(e).padStart(2,'0')}<span>${esc(r.quality||'-')}</span></button>`;}).join('')}
+      </div></div>`;
+  }).join('')+`</div>`;
+}
+// ☆ Watch from a card sheet: merge into the daemon's watchlist. With a
+// season, an existing item's scope widens instead of duplicating.
+async function watchThis(season){
+  const c=cards.find(x=>x.key===openKey); if(!c) return;
+  const cfg=await api('get_config');
+  const list=((cfg.config||{}).nzbfast||{}).watchlist||[];
+  const norm=s=>String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+  const kind=c.kind||'movie';
+  const ex=list.find(w=>w.kind===kind&&norm(w.title)===norm(c.title));
+  if(ex){
+    const covers=!ex.seasons||ex.seasons.toLowerCase()==='all'
+      ||ex.seasons.split(',').some(x=>x.trim()==String(season));
+    if(season==null||covers){ toast(t('wall.already','Already watching {title}',{title:c.title})); return; }
+    ex.seasons+=`,${season}`;
+  } else {
+    const w={id:Date.now(), kind, title:c.title, seasons:season!=null?String(season):'',
+      episodes:'', min_quality:'any', target_quality:'1080p', upgrade:true,
+      delete_old:false, category:'', enabled:true};
+    // Pin the year for FILMS only, to tell remakes apart. A custom
+    // card's year is its season ("Formula1.2026.Round11"), and the
+    // watcher applies the same year gate to custom items - pinning it
+    // from a card would quietly retire the watch on 1 January. Starring
+    // a category means "from now on"; a season can still be pinned by
+    // hand in Settings.
+    if(kind==='movie'&&c.year) w.year=c.year;
+    list.push(w);
+  }
+  const j=await api('config',`&name=watchlist&value=${encodeURIComponent(JSON.stringify(list))}`);
+  toast(j.status?'☆ '+t('wall.watching','Watching {title}{series}: grabs happen automatically',
+      {title:c.title, series:season!=null?' '+t('wall.serieslc','series {n}',{n:season}):''})
+    :t('wall.failed','Failed: {err}',{err:tErr(j.error)||t('wall.rejected','rejected')}));
+}
+async function openCard(k){
+  // v2 cards arrive without their release list - fetch it on open
+  // (card-scoped server query; junk included so nothing is missing
+  // from its own sheet). Unknown keys get a stub so the list view's
+  // ⓘ works even for cards outside the fetched window.
+  let c=cards.find(x=>x.key===k);
+  if(!c){
+    const custom=k.match(/^c:([^:]+):/);
+    c={key:k, kind:k.startsWith('t:')?'tv':custom?custom[1]:'movie', title:'', year:0,
+            genres:'', overview:'', rating:0, actors:'', poster:'', poster_full:'',
+            backdrop:'', releases:null, votes:0}; cards.push(c);
+  }
+  if(!c.releases){
+    const j=await api('index_browse',
+      `&title_key=${encodeURIComponent(k)}&all=1&limit=200&sort=size`);
+    c.releases=(j.results||[]).map(r=>({
+      id:r.id, stem:r.name, grp:r.group, size:r.size, complete:r.complete,
+      posted:r.first_posted, seen:r.first_seen, quality:r.quality,
+      season:r.season, episode:r.episode,
+      vcodec:r.vcodec, acodec:r.acodec, hdr:r.hdr,
+      pref:r.pref, prefhit:r.prefhit,
+      have:r.have, rescued:r.rescued, rtitle:r.title, ryear:r.year,
+    }));
+    c.seasons=[...new Set(c.releases.map(r=>r.season).filter(s=>s!=null))].sort((a,b)=>a-b);
+    if(c.releases.length){
+      c.kind=j.results[0].kind||c.kind;
+      if(!c.title){
+        c.title=j.results[0].title||c.releases[0].stem; c.year=j.results[0].year||0;
+      }
+    }
+  }
+  openKey=k;
+  // Ordered by how well each release matches the quality preference
+  // (server-scored), biggest-first within equal matches - size alone put
+  // a bloated x264 above the lean x265 encode people actually wanted.
+  const rels=[...c.releases].sort((a,b)=>
+    (b.pref||0)-(a.pref||0) || (b.size||0)-(a.size||0));
+  const seasons=c.kind==='tv'&&c.seasons.length
+    ?`<span> · ${c.seasons.length>1?t('wall.seasons','{n} seasons',{n:c.seasons.length}):t('wall.season','Season {n}',{n:c.seasons[0]})}</span>`:'';
+  document.getElementById('sheet').innerHTML=`
+    <div class="hero">${c.backdrop?`<img src="${esc(c.backdrop)}" alt="">`:`<div style="height:120px"></div>`}
+      <button class="x" onclick="closeOvl()" title="${esc(t('btn.close.title','Close this panel'))}"
+        aria-label="${esc(t('btn.close.title','Close this panel'))}">✕</button></div>
+    <div class="body">
+      <div class="pst">${c.poster?`<img src="${esc(c.poster)}" alt="">`:`<div class="ph" style="height:100%;${phStyle(c.title)}"><div class="t">${esc(c.title)}</div></div>`}</div>
+      <div class="info">
+        <h2>${esc(c.title)} ${c.year?`<small>(${c.year})</small>`:''}
+          ${canWatch(c.kind)?`<button class="act ghost" style="margin-inline-start:8px;vertical-align:3px" onclick="watchThis()"
+            title="${esc(watchTip(c.kind))}">☆ ${t('wall.watch','Watch')}</button>`:''}</h2>
+        <div class="meta">${c.rating?`<span class="star">★</span> ${num(c.rating,1)}${c.votes?` <span style="opacity:.7">${t('wall.votes','({n} on IMDb)',{n:fmtVotes(c.votes)})}</span>`:''} · `:''}${esc(c.genres||'')}${seasons}</div>
+        ${fmtDate(c.aired)?`<div class="meta" style="margin-top:-4px">${t('wall.aired','Released {d}',{d:fmtDate(c.aired)})}</div>`:''}
+        ${c.actors?`<div class="meta" style="margin-top:-4px">${esc(c.actors)}</div>`:''}
+        <div class="plot">${esc(c.overview||t('wall.nosynopsis','No synopsis available.'))}</div>
+        <div style="margin-top:10px">
+          <button class="act ghost" onclick="findTrailer()" title="${esc(t('wall.trailer.title','Search YouTube for a trailer in a new tab - nothing is fetched or stored here'))}">▶ ${t('wall.trailer','Find trailer')}</button>
+          <button class="act ghost" onclick="fixToggle()">✎ ${t('wall.fix','Fix match')}</button>
+          <button class="act ghost" onclick="metaRefresh(this)" title="${esc(t('wall.refresh.title',"Wipe this title's cached metadata and artwork and fetch it fresh - releases are untouched"))}">↻ ${t('wall.refresh','Refresh metadata')}</button>
+          <button class="act ghost" onclick="notInterested()" title="${esc(t('wall.hide.title','Hide this title from the wall; undo any time under “Hidden”'))}">🚫 ${t('wall.hide.btn','Not interested')}</button>
+        </div>
+      </div>
+    </div>
+    <div id="fixpanel" style="display:none">
+      <h4>${t('wall.fx.title','Wrong match? Search again and pick the right one')}</h4>
+      <div class="frow">
+        <select id="fx_kind"><option value="movie">${t('wall.fx.movie','Movie')}</option><option value="tv">${t('watch.kind.tv','TV show')}</option></select>
+        <input id="fx_q" style="flex:1;min-width:160px" placeholder="${esc(t('wall.fx.q.ph','Search title…'))}"
+               onkeydown="if(event.key==='Enter')fixSearch(document.getElementById('fx_go'))">
+        <button class="act" id="fx_go" onclick="fixSearch(this)">${t('wall.fx.search','Search')}</button>
+      </div>
+      <div id="fixres"></div>
+      <h4 style="margin-top:14px">${t('wall.fx.manual','…or enter the details yourself')}</h4>
+      <div class="frow">
+        <input id="fx_title" style="flex:2;min-width:160px" placeholder="${esc(t('wall.fx.t.ph','Title'))}">
+        <input id="fx_year" style="width:80px" placeholder="${esc(t('wall.fx.y.ph','Year'))}">
+        <input id="fx_genres" style="flex:1;min-width:120px" placeholder="${esc(t('wall.fx.g.ph','Genres (comma-separated)'))}">
+      </div>
+      <textarea id="fx_overview" placeholder="${esc(t('wall.fx.o.ph','Synopsis (optional)'))}"></textarea>
+      <div class="frow">
+        <button class="act" onclick="manualSave(false)">${t('wall.fx.save','Save manual details')}</button>
+        <button class="act ghost" onclick="manualSave(true)"
+                title="${esc(t('wall.fx.refetch.title','Save the corrected name, wipe the cached metadata and let the enricher look it up fresh under the new name'))}">${t('wall.fx.refetch','Save name &amp; re-fetch')}</button>
+        <span class="dim" style="font-size:11.5px">${t('wall.fx.kept',"Manual details are kept: the enricher won't overwrite them.")}</span>
+      </div>
+      <h4 style="margin-top:14px">${t('wall.fx.merge','…or merge this card into another title')}</h4>
+      <div class="frow">
+        <input id="fx_mq" style="flex:1;min-width:160px" placeholder="${esc(t('wall.fx.mq.ph','Search your wall for the right card…'))}"
+               onkeydown="if(event.key==='Enter')mergeSearch(document.getElementById('fx_mgo'))">
+        <button class="act" id="fx_mgo" onclick="mergeSearch(this)">${t('wall.fx.search','Search')}</button>
+        <span class="dim" style="font-size:11.5px">${t('wall.fx.merge.hint','Fixes a split card: all releases move over.')}</span>
+      </div>
+      <div id="mergeres" style="display:flex;flex-direction:column;gap:6px;max-height:240px;overflow-y:auto;margin:8px 0"></div>
+      <h4 style="margin-top:14px">${t('wall.fx.art','…or set the artwork yourself')}</h4>
+      <div class="frow">
+        <input id="fx_art" style="flex:1;min-width:180px" placeholder="${esc(t('wall.fx.art.ph','Poster image URL (https://…)'))}"
+               onkeydown="if(event.key==='Enter')artFromUrl(document.getElementById('fx_artgo'))">
+        <button class="act" id="fx_artgo" onclick="artFromUrl(this)">${t('wall.fx.setposter','Set poster')}</button>
+        <input type="file" id="fx_artfile" accept="image/*" style="display:none" onchange="artFromFile(this)">
+        <button class="act ghost" onclick="document.getElementById('fx_artfile').click()">${t('wall.fx.upload','Upload file…')}</button>
+        <span class="dim" style="font-size:11.5px">${t('wall.fx.artkept','Hand-picked art is kept too.')}</span>
+      </div>
+    </div>
+    <div class="castwrap" id="castwrap"></div>
+    ${c.kind==='tv'?epGridHtml(c):''}
+    <div class="rels"><h3>${tn('wall.rels',rels.length,'{n} release','{n} releases')}</h3>
+      <table><thead><tr><th>${t('wall.col.quality','Quality')}</th><th>${t('wall.col.release','Release')}</th><th>${t('wall.col.size','Size')}</th><th>${t('wall.col.age','Age')}</th><th></th><th style="text-align:end"></th></tr></thead>
+      <tbody>${rels.map(r=>`
+        <tr>
+          <td style="white-space:nowrap">${r.quality?`<span class="q">${esc(r.quality)}</span>`:'<span class="dim">-</span>'}${relTags(r)}${r===rels[0]&&(r.prefhit||[]).length?`<span class="pick" title="${esc(t('wall.pick.title','Closest match to your quality preference (Settings)'))}">${t('wall.pick','best match')}</span>`:''}</td>
+          <td class="dim" style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+              title="${esc(r.rescued?t('wall.rot.tip','Obfuscated post (decoded name shown); raw: {raw}',{raw:r.stem}):r.stem)}">${r.have?`<span class="hv" title="${esc(t('wall.have','In your library'))}">✓</span> `:''}${esc(r.rescued?rotName({title:r.rtitle,name:r.stem,season:r.season,episode:r.episode,year:r.ryear}):r.stem)}</td>
+          <td class="mono">${gb(r.size||0)}</td>
+          <td class="mono dim">${age(r.posted)}</td>
+          <td class="${r.complete?'ok':'warn'}">${r.complete?'✓ '+t('wall.complete','complete'):t('wall.partial','partial')}</td>
+          <td style="text-align:end;white-space:nowrap">
+            <button class="act ghost" ${r.complete?'':'disabled'} onclick="grab(${r.id},true)"
+              title="${esc(t('wall.play.title','Check it is the right file before downloading all of it'))}">▶ ${t('wall.play','Test')}</button>
+            <button class="act" ${r.complete?'':'disabled'} onclick="grab(${r.id},false)">${t('wall.download','Download')}</button>
+          </td>
+        </tr>`).join('')}
+      </tbody></table></div>`;
+  document.getElementById('ovl').classList.add('open');
+  document.body.style.overflow='hidden';
+  loadCredits(k);
+}
+function closeOvl(){
+  openKey=null;
+  document.getElementById('ovl').classList.remove('open');
+  document.body.style.overflow='';
+}
+
+// ---- cast, crew and person pages ------------------------------------
+// Provider text renders straight onto these chips, and character names
+// are the newest untrusted string on the page - everything below goes
+// through esc() for the same reason release stems do.
+
+// A string safe to drop into a double-quoted onclick= as a JS argument.
+// JSON.stringify alone is NOT enough: its output is wrapped in double
+// quotes, which close the attribute, and a title key ultimately derives
+// from a Usenet subject. esc() turns those quotes into entities the HTML
+// parser resolves back before the JS is parsed, so the handler sees a
+// correctly quoted string and nothing can break out of the attribute.
+const jsArg = v => esc(JSON.stringify(v));
+// A headshot, or the person's initials. Both providers leave plenty of
+// people without a photo, and the cache evicts under its size cap, so
+// "no image" is the normal case rather than the error case.
+function faceHtml(name, photo){
+  if(photo) return `<img loading="lazy" decoding="async" src="${esc(photo)}" alt="">`;
+  const ini=(name||'?').split(/\s+/).filter(Boolean).slice(0,2)
+    .map(w=>w[0]).join('').toUpperCase();
+  return esc(ini||'?');
+}
+// Roles come from the provider as free text ("executive producer",
+// "director of photography"), so they are Title Cased for display rather
+// than mapped through a fixed vocabulary that would drop the useful ones.
+// A person page sends a comma-joined list, because one person can star in
+// a show and also produce it; "actor" drops out because the character
+// name it comes with already says so.
+function roleLabel(r){
+  return (r||'').split(',').map(x=>x.trim()).filter(x=>x&&x!=='actor')
+    .map(x=>x.replace(/\b\w/g, c=>c.toUpperCase())).join(' · ');
+}
+async function loadCredits(k){
+  const box=document.getElementById('castwrap');
+  if(!box) return;
+  const j=await api('title_credits',`&key=${encodeURIComponent(k)}`);
+  // Still looking at the same card? A slow response for a card the user
+  // has already closed (or replaced) must not paint over the new one.
+  if(openKey!==k) return;
+  const cr=j.credits||[];
+  const cur=document.getElementById('castwrap');
+  if(!cur) return;
+  if(!cr.length){ cur.innerHTML=''; return; }
+  cur.innerHTML=`<h3>${t('wall.cast','Cast &amp; crew')}</h3>
+    <div class="castrow">${cr.map(p=>`
+      <button class="person" onclick="openPerson(${p.id},${jsArg(k)})"
+        title="${esc(p.name)}${p.character?' - '+esc(p.character):''}">
+        <div class="face">${faceHtml(p.name,p.photo)}</div>
+        <b>${esc(p.name)}</b>
+        <span>${esc(p.character||roleLabel(p.role))}</span>
+      </button>`).join('')}</div>`;
+}
+
+// The card to come back to when a person page was opened from one.
+let personBack=null;
+async function openPerson(id, backKey){
+  personBack=backKey||null;
+  openKey=null;
+  const sheet=document.getElementById('sheet');
+  sheet.innerHTML=`<div class="pbody"><div class="dim">${t('wall.person.loading','Loading…')}</div></div>`;
+  document.getElementById('ovl').classList.add('open');
+  document.body.style.overflow='hidden';
+  document.getElementById('ovl').scrollTop=0;
+  const j=await api('person',`&value=${encodeURIComponent(id)}`);
+  if(!j.status){
+    sheet.innerHTML=`<div class="pbody"><div class="dim">${t('wall.person.gone','That person is no longer in the index.')}</div></div>`;
+    return;
+  }
+  const yours=j.titles||[];
+  const group=kind=>yours.filter(x=>kind==='tv'?x.kind==='tv':x.kind!=='tv');
+  const tile=x=>`<button class="ptile" onclick="openCard(${jsArg(x.key)})">
+      ${x.poster?`<img loading="lazy" decoding="async" src="${esc(x.poster)}" alt="">`
+                :`<div class="noimg" style="${phStyle(x.title)}"></div>`}
+      <div style="min-width:0">
+        <b>${esc(x.title)}</b>
+        <span>${[x.aired?fmtDate(x.aired):(x.year||''),
+                 esc(x.character), esc(roleLabel(x.role))].filter(Boolean).join(' · ')}</span>
+      </div></button>`;
+  const section=(label,rows)=>rows.length
+    ? `<h3 style="font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:14px 24px 8px">${label}</h3>
+       <div class="prow">${rows.map(tile).join('')}</div>` : '';
+  sheet.innerHTML=`
+    <div class="hero phero">
+      <button class="x" onclick="closeOvl()" title="${esc(t('btn.close.title','Close this panel'))}"
+        aria-label="${esc(t('btn.close.title','Close this panel'))}">✕</button></div>
+    <div class="pbody">
+      <div class="face">${faceHtml(j.name,j.photo)}</div>
+      <div style="min-width:0;flex:1">
+        <h2 style="margin:0 0 4px;font-size:22px">${esc(j.name)}</h2>
+        <div class="meta">${tn('wall.person.n',yours.length,'{n} title in your index','{n} titles in your index')}${
+          j.born?' · '+esc(j.born):''}</div>
+        ${j.bio?`<div class="plot">${esc(j.bio)}</div>`:''}
+        <div style="margin-top:8px">
+          ${personBack?`<button class="act ghost" onclick="openCard(${jsArg(personBack)})">← ${t('wall.person.back','Back to title')}</button>`:''}
+          ${(j.tv_filmography||j.film_filmography)
+            ? `<button class="act ghost" id="filmo_go" onclick="loadFilmography(${id},this)"
+                 title="${esc(t('wall.person.more.title','Look up everything else they are in - this asks TVmaze and Wikidata now, so it takes a moment'))}">${t('wall.person.more','Show full filmography')}</button>`
+            : ''}
+        </div>
+      </div>
+    </div>
+    ${section(t('wall.person.films','Films in your index'),group('movie'))}
+    ${section(t('wall.person.tv','TV in your index'),group('tv'))}
+    ${yours.length?'':`<div class="prow"><span class="dim" style="font-size:12.5px">${t('wall.person.none','Nothing of theirs is in your index yet.')}</span></div>`}
+    <div id="filmo" class="prow"></div>`;
+}
+// The off-index half. Live provider calls, so it is a click and not
+// something the page does on its own.
+async function loadFilmography(id, btn){
+  btn.disabled=true;
+  const old=btn.textContent;
+  btn.textContent=t('wall.busy.fetching','Fetching…');
+  try{
+    const j=await api('person_more',`&value=${encodeURIComponent(id)}`);
+    const box=document.getElementById('filmo');
+    if(!box) return;
+    // Only what the index does NOT already have: the halves above
+    // already answered "what of theirs do I have", and this surface's
+    // job is the gap - which is also what makes it worth watchlisting.
+    const rest=(j.credits||[]).filter(c=>!c.have);
+    if(!rest.length){
+      // "Nothing more" and "the provider would not answer" are different
+      // answers, and only one of them means the button is done. Wikidata's
+      // SPARQL service is rate-limited and refuses calls in normal use, so
+      // this is the common case, not a rare one.
+      box.innerHTML=`<span class="dim" style="font-size:12.5px">${
+        j.complete===false
+          ? t('wall.person.partial','Could not reach the filmography sources just now - try again in a moment.')
+          : t('wall.person.allhave','Nothing else found - you already have everything these sources list.')}</span>`;
+      if(j.complete===false) return;  // leave the button so it can be retried
+      btn.style.display='none';
+      return;
+    }
+    box.innerHTML=`<h3 style="width:100%;font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:14px 0 8px">${
+        t('wall.person.notyours','Not in your index')}${j.complete===false
+          ? ` <span style="text-transform:none;letter-spacing:0">${t('wall.person.someonly','(partial - one source did not answer)')}</span>` : ''}</h3>`+
+      rest.map(c=>`<div class="ptile off" title="${esc(c.title)}">
+        <div class="noimg" style="${phStyle(c.title)}"></div>
+        <div style="min-width:0">
+          <b>${esc(c.title)}</b>
+          <span>${[c.year||'', c.kind==='tv'?'TV':t('wall.fx.movie','Movie'),
+                   esc(c.character||'')].filter(Boolean).join(' · ')}</span>
+        </div></div>`).join('');
+    // A partial answer keeps the button, so the missing source can be
+    // asked again.
+    if(j.complete!==false) btn.style.display='none';
+  } finally { btn.disabled=false; btn.textContent=old; }
+}
+
+// ---- M16 fix-match: re-search, pick a candidate, or scrub by hand ----
+let fixCands=[];
+async function apiPost(mode, body){
+  const r=await fetch(`/api?mode=${mode}&apikey=${encodeURIComponent(key)}`,
+    {method:'POST', body:JSON.stringify(body)});
+  const j=await r.json();
+  if(j.error==='API Key Incorrect' && await askKey()) return apiPost(mode,body);
+  return j;
+}
+function fixToggle(){
+  const c=cards.find(x=>x.key===openKey); if(!c) return;
+  const p=document.getElementById('fixpanel');
+  const opening=p.style.display==='none';
+  p.style.display=opening?'':'none';
+  if(opening){
+    document.getElementById('fx_kind').value=c.kind==='tv'?'tv':'movie';
+    document.getElementById('fx_q').value=c.title;
+    document.getElementById('fx_title').value=c.title;
+    document.getElementById('fx_year').value=c.year||'';
+    document.getElementById('fx_genres').value=c.genres||'';
+    document.getElementById('fx_overview').value=c.overview||'';
+    document.getElementById('fixres').innerHTML='';
+    document.getElementById('fx_q').focus();
+  }
+}
+async function fixSearch(btn){
+  const q=document.getElementById('fx_q').value.trim(); if(!q) return;
+  const kind=document.getElementById('fx_kind').value;
+  btn.disabled=true; const old=btn.textContent; btn.textContent=t('wall.busy.searching','Searching…');
+  try{
+    const j=await api('wall_search',`&q=${encodeURIComponent(q)}&kind=${kind}`);
+    fixCands=j.candidates||[];
+    document.getElementById('fixres').innerHTML=fixCands.length?fixCands.map((c,i)=>`
+      <div class="cand" onclick="applyCand(${i})" title="${esc(t('wall.fx.use','Use this match'))}">
+        ${c.poster_url?`<img src="${esc(c.poster_url)}" loading="lazy" alt="">`:`<div class="cph"></div>`}
+        <div class="ct"><b>${esc(c.title)}</b>${c.year?` (${c.year})`:''}${c.rating?` · <span class="star">★</span> ${num(c.rating,1)}`:''}<br>
+          <span class="dim">${esc(c.genres||c.provider)}${c.overview?` - ${esc(c.overview.slice(0,110))}${c.overview.length>110?'…':''}`:''}</span></div>
+      </div>`).join('')
+      :`<div class="dim" style="padding:6px 2px">${t('wall.fx.nomatch','No matches: try another spelling or kind, or use manual entry below.')}</div>`;
+  }catch(e){ toast(t('wall.searchfail','Search failed: {err}',{err:e.message})); }
+  finally{ btn.disabled=false; btn.textContent=old; }
+}
+async function applyCand(i){
+  const cand=fixCands[i]; if(!cand||!openKey) return;
+  toast(t('wall.applying','Applying match…'));
+  const j=await apiPost('wall_fix',{key:openKey, kind:cand.kind, title:cand.title, year:cand.year,
+    meta:{id:cand.id, overview:cand.overview, rating:cand.rating, genres:cand.genres,
+          poster_url:cand.poster_url, backdrop_url:cand.backdrop_url, imdb:cand.imdb||'',
+          air_date:cand.air_date||''}});
+  if(!j.status){ toast(t('wall.failed','Failed: {err}',{err:tErr(j.error)||t('wall.unknown','unknown')})); return; }
+  toast(t('wall.matchupdated','Match updated.'));
+  lastPayload=''; await refresh();
+}
+async function manualSave(refetch){
+  if(!openKey) return;
+  const g=id=>document.getElementById(id).value.trim();
+  const body={key:openKey, kind:document.getElementById('fx_kind').value,
+    title:g('fx_title'), year:parseInt(g('fx_year'))||0};
+  if(refetch) body.refetch=true;
+  else{ body.overview=g('fx_overview'); body.genres=g('fx_genres'); }
+  if(!body.title){ toast(t('wall.titlereq','A title is required.')); return; }
+  const j=await apiPost('wall_fix',body);
+  if(!j.status){ toast(t('wall.failed','Failed: {err}',{err:tErr(j.error)||t('wall.unknown','unknown')})); return; }
+  toast(refetch?t('wall.savedfetch','Saved: fresh metadata arrives within ~30 s.'):t('wall.saved','Saved.'));
+  lastPayload=''; await refresh();
+  if(refetch) setTimeout(()=>{ lastPayload=''; refresh(); }, 25000);
+}
+// ---- M30 merge: move this card's releases under another title ----
+let mergeCands=[];
+async function mergeSearch(btn){
+  const q=document.getElementById('fx_mq').value.trim(); if(!q||!openKey) return;
+  btn.disabled=true; const old=btn.textContent; btn.textContent=t('wall.busy.searching','Searching…');
+  try{
+    const j=await api('wall2',`&q=${encodeURIComponent(q)}&limit=8&matched=0&all=1&sort=releases`);
+    mergeCands=(j.cards||[]).filter(c=>c.key!==openKey);
+    document.getElementById('mergeres').innerHTML=mergeCands.length?mergeCands.map((c,i)=>`
+      <div class="cand" onclick="applyMerge(${i})" title="${esc(t('wall.fx.merge.use','Move all releases into this card'))}">
+        ${c.poster?`<img src="${esc(c.poster)}" loading="lazy" alt="">`:`<div class="cph"></div>`}
+        <div class="ct"><b>${esc(c.title)}</b>${c.year?` (${c.year})`:''}<br>
+          <span class="dim">${esc(c.kind)} · ${tn('wall.lcount',c.n||0,'{n} release','{n} releases')}</span></div>
+      </div>`).join('')
+      :`<div class="dim" style="padding:6px 2px">${t('wall.nomatch','No matches.')}</div>`;
+  }catch(e){ toast(t('wall.searchfail','Search failed: {err}',{err:e.message})); }
+  finally{ btn.disabled=false; btn.textContent=old; }
+}
+async function applyMerge(i){
+  const c=mergeCands[i]; if(!c||!openKey) return;
+  const j=await api('wall_merge',`&value=${encodeURIComponent(openKey)}&value2=${encodeURIComponent(c.key)}`);
+  if(!j.status){ toast(t('wall.failed','Failed: {err}',{err:tErr(j.error)||t('wall.unknown','unknown')})); return; }
+  toast(t('wall.merged','Merged: {n} releases moved.',{n:j.moved}));
+  closeOvl(); wsig=''; await wallFetch(true); openCard(c.key);
+}
+// ---- custom artwork: paste a URL (daemon fetches it) or upload ----
+async function artDone(j){
+  if(!j.status){ toast(t('wall.failed','Failed: {err}',{err:tErr(j.error)||t('wall.unknown','unknown')})); return; }
+  toast(t('wall.posterupdated','Poster updated.'));
+  lastPayload=''; await refresh();
+  // Re-render the sheet so the new poster shows immediately (this
+  // collapses the fix panel, which is fine - the job is done).
+  if(openKey) openCard(openKey);
+}
+async function artFromUrl(btn){
+  const url=document.getElementById('fx_art').value.trim();
+  if(!url||!openKey) return;
+  btn.disabled=true; const old=btn.textContent; btn.textContent=t('wall.busy.fetching','Fetching…');
+  try{ await artDone(await apiPost('wall_art',{key:openKey,url})); }
+  catch(e){ toast(t('wall.failed','Failed: {err}',{err:e.message})); }
+  finally{ btn.disabled=false; btn.textContent=old; }
+}
+async function artFromFile(inp){
+  const f=inp.files[0]; inp.value='';
+  if(!f||!openKey) return;
+  toast(t('wall.uploading','Uploading…'));
+  const fd=new FormData(); fd.append('file', f, f.name||'poster');
+  try{
+    const r=await fetch(`/api?mode=wall_art&apikey=${encodeURIComponent(key)}&key=${encodeURIComponent(openKey)}`,
+      {method:'POST', body:fd});
+    await artDone(await r.json());
+  }catch(e){ toast(t('wall.failed','Failed: {err}',{err:e.message})); }
+}
+
+async function metaRefresh(btn){
+  if(!openKey) return;
+  btn.disabled=true;
+  try{
+    const j=await api('wall_refresh',`&value=${encodeURIComponent(openKey)}`);
+    if(!j.status){ toast(t('wall.failed','Failed: {err}',{err:tErr(j.error)||t('wall.unknown','unknown')})); return; }
+    toast(t('wall.metacleared','Metadata cleared: fresh fetch within ~30 s.'));
+    wsig=''; await refresh();
+    setTimeout(()=>{ wsig=''; refresh(); }, 25000);
+  } finally { btn.disabled=false; }
+}
+
+// M28: server-paged grid fetch. reset=true replaces the window (tab/
+// search/sort change or the periodic poll); false appends the next
+// page (infinite scroll). Latest-response-wins, like browseFetch.
+const WPAGE=60;
+async function wallFetch(reset){
+  const seq=++wseq;
+  if(reset===undefined) reset=true;
+  wloading=true;
+  try{
+    const q=document.getElementById('q').value.trim();
+    const offset=reset?0:cards.length;
+    // Matched only OFF = show everything, junk included (all=1).
+    const j=await api('wall2',
+      `&cat=${encodeURIComponent(tab||'all')}&q=${encodeURIComponent(q)}`+
+      `&sort=${sortBy}&dir=${curDesc()?'desc':'asc'}&limit=${WPAGE}&offset=${offset}`+
+      `&matched=${matchedOnly?1:0}&all=${matchedOnly?0:1}`+
+      `&catgroup=${catGroup?1:0}`+
+      (genreSel?`&genre=${encodeURIComponent(genreSel)}`:'')+
+      (resSel?`&res=${encodeURIComponent(resSel)}`:'')+
+      (decSel?`&year_min=${decSel.split('-')[0]}&year_max=${decSel.split('-')[1]}`:''));
+    if(seq!==wseq) return;
+    if(j.error){ toast(tErr(j.error)); return; }
+    updateCats(j.cats);
+    wtotal=j.total||0;
+    const page=(j.cards||[]).map(c=>({
+      key:c.key, kind:c.kind, title:c.title, year:c.year||0, aired:c.aired||'',
+      genres:c.genres, overview:c.overview, rating:c.rating,
+      actors:c.actors, poster:c.poster, poster_full:c.poster_full,
+      backdrop:c.backdrop, n:c.n, newest:c.latest, complete:c.complete,
+      res:c.res, size:c.size, stem:c.stem, releases:null, votes:0,
+      verdict:c.verdict, have:c.have,
+    }));
+    if(reset){
+      // Unchanged first page ⇒ no re-render: never yank cards out from
+      // under a hovering cursor for nothing.
+      const sig=JSON.stringify(page);
+      if(sig===wsig && cards.length>=page.length) return;
+      wsig=sig; cards=page;
+      render();
+      renderStrips();
+    } else {
+      // Infinite-scroll append: ONLY the new cards enter the DOM. A
+      // full render() here re-parsed the entire grid's innerHTML on
+      // every page - O(n²) HTML churn by page 10, and it yanked
+      // hover/focus state mid-scroll.
+      cards=cards.concat(page);
+      appendCards(page);
+    }
+    // Refresh art/meta inside an open sheet - but never while the user
+    // is mid-correction: re-rendering would close the fix panel and
+    // throw away their search results.
+    const fp=document.getElementById('fixpanel');
+    if(reset && openKey && (!fp || fp.style.display==='none')) openCard(openKey);
+  }catch(e){
+    if(seq!==wseq) return;
+    document.getElementById('wall').innerHTML=
+      `<div class="empty">${t('status.daemonDown','daemon unreachable')}</div>`;
+  } finally {
+    if(seq===wseq) wloading=false;
+  }
+  maybeMore();
+}
+function appendCards(page){
+  document.getElementById('wall')
+    .insertAdjacentHTML('beforeend', cardsHtml(page));
+  document.getElementById('count').textContent =
+    wtotal ? tn('wall.count',wtotal,'{n} title','{n} titles') : '';
+}
+// Back-compat shim: everything that called refresh() now resets page 1.
+const refresh=()=>wallFetch(true);
+// Infinite scroll: crossing the sentinel pulls the next page. The
+// observer only fires on crossings, so after every fetch maybeMore()
+// re-checks - a sentinel that was already in view (short first page)
+// would otherwise never trigger again.
+function maybeMore(){
+  if(view==='releases'||wloading||cards.length>=wtotal) return;
+  const vh=innerHeight||document.documentElement.clientHeight||800;
+  const r=document.getElementById('more').getBoundingClientRect();
+  // top can go negative when the sentinel sits above a shrunk viewport
+  // (embedded panes) - any position at-or-before vh+600 means "near".
+  if(r.top<vh+600) wallFetch(false);
+}
+new IntersectionObserver(()=>maybeMore(), {rootMargin:'600px'})
+  .observe(document.getElementById('more'));
+addEventListener('scroll', ()=>maybeMore(), {passive:true});
+// Belt and braces: embedded/throttled viewports can swallow scroll and
+// observer callbacks - a slow tick keeps pagination alive everywhere
+// (guards make it a no-op unless the sentinel is actually near).
+setInterval(()=>maybeMore(), 2000);
+
+// ---- M30 curation: "Not interested" hides + suggest-confirm rules ----
+let hidCount=0, curSug=null;
+const H4S='margin:18px 0 8px;font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim)';
+async function hideKey(k){
+  const j=await api('wall_hide',`&value=${encodeURIComponent(k)}`);
+  if(!j.status){ toast(t('wall.failed','Failed: {err}',{err:tErr(j.error)||t('wall.unknown','unknown')})); return; }
+  toast(t('wall.hidden.done','Hidden: find it under “Hidden”.'));
+  if(openKey===k) closeOvl();
+  hidCount++; updateHidChip();
+  wsig=''; wallFetch(true);
+  fetchSuggest();
+}
+function notInterested(){ if(openKey) hideKey(openKey); }
+// Trailers without ingesting anything: no API, no stored video id, no
+// embed, and nothing phones home from this page. Just hand the query to
+// YouTube in a new tab and let the user pick. Works for every title,
+// including the ones no metadata provider has ever heard of.
+function findTrailer(){
+  const c=cards.find(x=>x.key===openKey); if(!c) return;
+  // Prefer the enriched title; an unmatched card only has its stem, and
+  // a stem full of dots and tags searches badly, so tidy it first.
+  const name=c.title||String(c.stem||'').replace(/[._]+/g,' ').trim();
+  if(!name) return;
+  const q=[name, c.year||'', 'trailer'].filter(Boolean).join(' ');
+  // noopener: an untrusted-content tab must never get a handle on ours.
+  open('https://www.youtube.com/results?search_query='+encodeURIComponent(q),
+       '_blank','noopener,noreferrer');
+}
+async function unhideKey(k){
+  await api('wall_unhide',`&value=${encodeURIComponent(k)}`);
+  wsig=''; wallFetch(true);
+  openHidden();
+}
+function updateHidChip(){
+  const c=document.getElementById('hidChip');
+  c.style.display=hidCount>0?'':'none';
+  c.textContent=t('wall.hid.chip','Hidden ({n})',{n:hidCount});
+}
+async function loadHidCount(){
+  try{ const j=await api('wall_hidden'); hidCount=(j.hidden||[]).length; updateHidChip(); }catch(e){}
+}
+// Learning loop: the daemon watches what you hide; when a pattern
+// emerges it proposes ONE rule at a time, you confirm or dismiss.
+async function fetchSuggest(){
+  try{ const j=await api('wall_suggest'); curSug=(j.suggestions||[])[0]||null; renderSuggest(); }catch(e){}
+}
+function renderSuggest(){
+  const box=document.getElementById('suggest');
+  if(!curSug){ box.style.display='none'; box.innerHTML=''; return; }
+  const s=curSug;
+  const what=s.field==='lang'
+    ? t('wall.sug.lang','Hide all <b>{v}</b>-tagged releases from now on?',{v:esc(s.value)})
+    : s.field==='word'
+    ? t('wall.sug.word','Hide everything containing “<b>{v}</b>” from now on?',{v:esc(s.value)})
+    : s.field==='genre'
+    ? t('wall.sug.genre','Hide all <b>{v}</b> titles from now on?',{v:esc(s.value)})
+    : t('wall.sug.other','Hide all <b>{v}</b> entries from now on?',{v:esc(s.value)});
+  box.innerHTML=`<div class="sgin">
+    <div class="sgtxt">${what}<br><span class="dim">${esc(t('wall.sug.why','You hid {n} matching titles: {list}',{n:s.n,list:(s.sample||[]).join(' · ')}))}</span></div>
+    <button class="act" onclick="acceptSug()">${t('wall.sug.yes','Yes, hide them')}</button>
+    <button class="act ghost" onclick="dismissSug()">${t('wall.sug.no','No thanks')}</button>
+  </div>`;
+  // The stylesheet default is display:none - '' would fall back to it.
+  box.style.display='block';
+}
+async function acceptSug(){
+  if(!curSug) return;
+  const j=await api('wall_rule_add',`&name=${encodeURIComponent(curSug.field)}&value=${encodeURIComponent(curSug.value)}&value2=auto`);
+  if(!j.status){ toast(t('wall.failed','Failed: {err}',{err:tErr(j.error)||t('wall.unknown','unknown')})); return; }
+  toast(t('wall.sug.added','Filter added: manage it under “Hidden”.'));
+  curSug=null; renderSuggest();
+  wsig=''; wallFetch(true); fetchSuggest();
+}
+async function dismissSug(){
+  if(!curSug) return;
+  await api('wall_suggest_no',`&name=${encodeURIComponent(curSug.field)}&value=${encodeURIComponent(curSug.value)}`);
+  curSug=null; renderSuggest(); fetchSuggest();
+}
+// The Hidden & filters panel - reuses the detail-sheet overlay.
+async function openHidden(){
+  openKey=null;
+  const [hj,rj]=await Promise.all([api('wall_hidden'),api('wall_rules')]);
+  const hid=hj.hidden||[], rules=rj.rules||[];
+  hidCount=hid.length; updateHidChip();
+  const fieldName=f=>({lang:t('wall.rule.lang','Language'),word:t('wall.rule.word','Word'),
+    kind:t('wall.rule.kind','Category'),group:t('wall.rule.group','Group'),
+    genre:t('wall.rule.genre','Genre')}[f]||f);
+  document.getElementById('sheet').innerHTML=`
+    <div class="hero"><div style="height:64px"></div>
+      <button class="x" onclick="closeOvl()" title="${esc(t('btn.close.title','Close this panel'))}"
+        aria-label="${esc(t('btn.close.title','Close this panel'))}">✕</button></div>
+    <div style="padding:0 24px 26px">
+      <h2 style="margin:0 0 6px">${t('wall.hid.h','Hidden & filters')}</h2>
+      <div class="dim" style="font-size:12.5px;margin-bottom:8px">${t('wall.hid.sub','Hide a few similar titles and the wall learns: it will suggest a filter you can accept with one click.')}</div>
+      <h4 style="${H4S}">${t('wall.rule.h','Active filters')}</h4>
+      <div>${rules.map(r=>`<span class="rulechip">${fieldName(r.field)}: <b>${esc(r.value)}</b>
+        <button onclick="delRule(${Number(r.id)||0})" title="${esc(t('wall.rule.del','Remove this filter'))}"
+          aria-label="${esc(t('wall.rule.del','Remove this filter'))}">✕</button></span>`).join('')
+        ||`<span class="dim" style="font-size:12px">${t('wall.rule.none','No filters yet.')}</span>`}</div>
+      <div style="display:flex;gap:8px;margin:12px 0 4px;flex-wrap:wrap;align-items:center">
+        <select id="nr_field">
+          <option value="word">${t('wall.rule.word','Word')}</option>
+          <option value="lang">${t('wall.rule.lang','Language')}</option>
+          <option value="genre">${t('wall.rule.genre','Genre')}</option>
+          <option value="group">${t('wall.rule.group','Group')}</option>
+        </select>
+        <input id="nr_val" placeholder="${esc(t('wall.rule.ph','e.g. wwe, german, alt.binaries.…'))}"
+          style="flex:1;min-width:160px;background:var(--surface-2);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:7px 10px;outline:none"
+          onkeydown="if(event.key==='Enter')addRule()">
+        <button class="act" onclick="addRule()">${t('wall.rule.add','Add filter')}</button>
+      </div>
+      <h4 style="${H4S}">${t('wall.hid.titles','Hidden titles')}</h4>
+      ${hid.map(h=>`<div class="hidrow">
+        ${h.poster?`<img src="${h.poster}" loading="lazy" decoding="async" alt="">`:`<div class="hph"></div>`}
+        <div class="ht">${esc(h.title)} <span class="dim">· ${esc(h.kind)} · ${tn('wall.lcount',h.n||0,'{n} release','{n} releases')}</span></div>
+        <button class="act ghost" data-unhide="${esc(h.key)}">${t('wall.unhide','Unhide')}</button>
+      </div>`).join('')||`<div class="dim" style="font-size:12px">${t('wall.hid.none','Nothing hidden.')}</div>`}
+    </div>`;
+  document.getElementById('ovl').classList.add('open');
+  document.body.style.overflow='hidden';
+}
+async function addRule(){
+  const f=document.getElementById('nr_field').value, v=document.getElementById('nr_val').value.trim();
+  if(!v) return;
+  const j=await api('wall_rule_add',`&name=${encodeURIComponent(f)}&value=${encodeURIComponent(v)}`);
+  if(!j.status){ toast(t('wall.failed','Failed: {err}',{err:tErr(j.error)||t('wall.unknown','unknown')})); return; }
+  wsig=''; wallFetch(true); openHidden();
+}
+async function delRule(id){
+  await api('wall_rule_del',`&value=${id}`);
+  wsig=''; wallFetch(true); openHidden();
+}
+document.getElementById('hidChip').addEventListener('click', ()=>openHidden());
+// Unhide buttons render inside the sheet - delegated so title keys
+// travel as data attributes, never inline JS strings.
+document.getElementById('sheet').addEventListener('click', e=>{
+  const b=e.target.closest('[data-unhide]'); if(b) unhideKey(b.dataset.unhide);
+});
+
+// Interactions.
+document.getElementById('views').addEventListener('click', e=>{
+  const b=e.target.closest('button'); if(b&&b.dataset.v!==view) setView(b.dataset.v);
+});
+document.getElementById('tabs').addEventListener('click', e=>{
+  const b=e.target.closest('button'); if(!b) return;
+  tab=b.dataset.k;
+  syncTabs();
+  if(view==='releases'){ lpage=0; browseFetch(); } else wallFetch(true);
+});
+let _qT=null;
+document.getElementById('q').addEventListener('input', ()=>{
+  clearTimeout(_qT);
+  _qT=setTimeout(()=>{
+    renderPeopleBar();
+    if(view==='releases'){ lpage=0; browseFetch(); } else wallFetch(true);
+  },250);
+});
+// People matching the search box. Runs alongside the card fetch rather
+// than inside it: a slow or empty people leg must never delay or blank
+// the results the user came for.
+let _peopleSeq=0;
+async function renderPeopleBar(){
+  const bar=document.getElementById('peoplebar');
+  const q=document.getElementById('q').value.trim();
+  // Two characters is where a name search stops matching half the index.
+  if(q.length<2){ bar.className=''; bar.innerHTML=''; return; }
+  const seq=++_peopleSeq;
+  const j=await api('people_search',`&q=${encodeURIComponent(q)}`).catch(()=>({}));
+  if(seq!==_peopleSeq) return;
+  const people=j.people||[];
+  if(!people.length){ bar.className=''; bar.innerHTML=''; return; }
+  bar.className='show';
+  bar.innerHTML=people.map(p=>`
+    <button class="person" onclick="openPerson(${p.id})"
+      title="${esc(p.name)} - ${esc(tn('wall.person.n',p.n,'{n} title in your index','{n} titles in your index'))}">
+      <div class="face">${faceHtml(p.name,p.photo)}</div>
+      <b>${esc(p.name)}</b>
+      <span>${p.n}</span>
+    </button>`).join('');
+}
+// A new sort starts in its own natural direction.
+document.getElementById('lsort').addEventListener('change', ()=>{
+  dirFlip=false; localStorage.nzbfastWallDirFlip='off'; renderDir();
+  lpage=0; browseFetch();
+});
+document.getElementById('dir').addEventListener('click', ()=>setSortDir(!dirFlip));
+document.getElementById('zoom').addEventListener('input', e=>setZoom(+e.target.value));
+document.getElementById('densctl').addEventListener('click', e=>{ setTimeout(viewBadge,0);
+  const b=e.target.closest('button'); if(b) setDensity(b.dataset.d);
+});
+document.getElementById('onlyComplete').addEventListener('change', ()=>{
+  // Expanded rows are cached per title. Their completeness predicate is
+  // part of the current view, so a filter change invalidates that cache.
+  relCache.clear(); viewBadge(); lpage=0; browseFetch();
+});
+document.getElementById('lprev').addEventListener('click', ()=>{ if(lpage>0){ lpage--; browseFetch(); } });
+document.getElementById('lnext').addEventListener('click', ()=>{ lpage++; browseFetch(); });
+document.getElementById('matchedOnly').addEventListener('change', e=>{ viewBadge();
+  matchedOnly=e.target.checked;
+  localStorage.nzbfastWallMatched=matchedOnly?'on':'off';
+  wallFetch(true);
+});
+document.getElementById('unmChip').addEventListener('click', ()=>{
+  matchedOnly=false;
+  document.getElementById('matchedOnly').checked=false;
+  localStorage.nzbfastWallMatched='off';
+  viewBadge();
+  wallFetch(true);
+});
+document.getElementById('sort').addEventListener('change', e=>{
+  sortBy=e.target.value; localStorage.nzbfastWallSort=sortBy;
+  localStorage.nzbfastWallSortChosen='1';
+  dirFlip=false; localStorage.nzbfastWallDirFlip='off'; renderDir();
+  renderAffNote(); wallFetch(true);
+});
+for(const id of ['wall','strips']) document.getElementById(id).addEventListener('click', e=>{
+  // M30: the hover ✕ hides instead of opening the sheet.
+  const hb=e.target.closest('[data-hide-key]');
+  if(hb){ e.stopPropagation(); hideKey(hb.dataset.hideKey); return; }
+  const c=e.target.closest('.card'); if(c) openCard(c.dataset.key);
+});
+// List-view info button: delegated so the release key travels as a data
+// attribute (dataset decodes it back to the literal value) instead of being
+// interpolated into an inline onclick JS-string, where an attacker-supplied
+// key with a quote could break out.
+document.getElementById('lbody').addEventListener('click', e=>{
+  const b=e.target.closest('[data-info-key]'); if(b) listInfo(b.dataset.infoKey);
+});
+// Group-by-title expander: the ▸ button or anywhere on the title row
+// that isn't a control.
+document.getElementById('lbody').addEventListener('click', e=>{
+  const x=e.target.closest('.exp');
+  if(x){ toggleExp(x.closest('[data-exp]').dataset.exp); return; }
+  if(e.target.closest('button,a,input')) return;
+  const g=e.target.closest('tr[data-exp]');
+  if(g) toggleExp(g.dataset.exp);
+});
+// ---- 24C: hover previews (the NZBFinder popup) ----------------------
+// Poster + title + overview from our own index, following the pointer.
+// Debounced so travel across rows never fires a request per row; cached
+// per title; desktop-only (no hover on touch); flips at screen edges.
+const FINE=matchMedia('(hover:hover) and (pointer:fine)');
+let hovPrev=localStorage.nzbfastWallHovPrev!=='off';
+const hovOn=()=>FINE.matches&&hovPrev&&view==='releases';
+const hovCache=new Map();
+let hovKey=null, _hovT=null, hovXY=[0,0], hovShown=false;
+function hovFetch(k){
+  // A rejection used to be cached as null and never evicted, so ONE
+  // dropped request - a daemon restart, a blipped connection - killed
+  // that title's preview for the rest of the session. Drop the entry on
+  // failure so the next hover retries; a real "no card" answer still
+  // caches, because that is an answer.
+  if(!hovCache.has(k))
+    hovCache.set(k, api('wall2',`&key=${encodeURIComponent(k)}&matched=0&all=1&limit=1`)
+      .then(j=>(j.cards||[])[0]||null)
+      .catch(e=>{ hovCache.delete(k); throw e; }));
+  return hovCache.get(k);
+}
+function hovHide(){
+  hovKey=null; hovShown=false; clearTimeout(_hovT);
+  document.getElementById('hovpop').style.display='none';
+}
+function hovPlace(){
+  const el=document.getElementById('hovpop');
+  const r=el.getBoundingClientRect(), x=hovXY[0], y=hovXY[1];
+  let px=x+18, py=y+16;
+  if(px+r.width>innerWidth-8) px=x-r.width-14;
+  if(py+r.height>innerHeight-8) py=Math.max(4, innerHeight-8-r.height);
+  el.style.left=Math.max(4,px)+'px';
+  el.style.top=py+'px';
+}
+function hovShow(c){
+  const el=document.getElementById('hovpop');
+  el.innerHTML=`${c.poster?`<img src="${esc(c.poster)}" alt="">`:''}
+    <div class="ht"><b>${esc(c.title)}</b>${c.year?` <span class="dim">(${c.year})</span>`:''}${
+      c.rating?` · <span style="color:var(--gold)">★</span> ${num(c.rating,1)}`:''}</div>
+    ${c.overview?`<div class="ho">${esc(c.overview)}</div>`:''}`;
+  el.style.display='block'; hovShown=true;
+  hovPlace();
+}
+document.getElementById('lbody').addEventListener('pointerover', e=>{
+  if(!hovOn()) return;
+  hovXY=[e.clientX,e.clientY];
+  const tr=e.target.closest('tr[data-key]');
+  const k=tr?tr.dataset.key:null;
+  if(!k){ hovHide(); return; }
+  if(k===hovKey) return;
+  hovKey=k; hovShown=false;
+  document.getElementById('hovpop').style.display='none';
+  clearTimeout(_hovT);
+  _hovT=setTimeout(async()=>{
+    // A failed fetch now rejects (so it is not cached as "no card"),
+    // which just means no preview this time.
+    let c=null;
+    try{ c=await hovFetch(k); }catch(e){ hovHide(); return; }
+    // The pointer may have moved on (or the toggle flipped) while the
+    // card loaded - never pop a stale preview.
+    if(hovKey!==k||!hovOn()) return;
+    if(c) hovShow(c); else hovHide();
+  },140);
+});
+document.getElementById('lbody').addEventListener('pointermove', e=>{
+  hovXY=[e.clientX,e.clientY];
+  if(hovShown) hovPlace();
+});
+document.getElementById('list').addEventListener('pointerleave', ()=>hovHide());
+addEventListener('scroll', ()=>{ if(hovShown) hovHide(); }, {passive:true});
+// Table-level toggles, both persisted browser-locally.
+document.getElementById('hovPrev').checked=hovPrev;
+document.getElementById('grpTitle').checked=grpTitle;
+if(!FINE.matches) document.getElementById('hovtog').style.display='none';
+document.getElementById('hovPrev').addEventListener('change', e=>{
+  hovPrev=e.target.checked;
+  localStorage.nzbfastWallHovPrev=hovPrev?'on':'off';
+  if(!hovPrev) hovHide();
+});
+document.getElementById('grpTitle').addEventListener('change', e=>{
+  grpTitle=e.target.checked;
+  localStorage.nzbfastWallGrpTitle=grpTitle?'on':'off';
+  lpage=0; browseFetch();
+});
+document.getElementById('wall').addEventListener('keydown', e=>{
+  if(e.key==='Enter'){ const c=e.target.closest('.card'); if(c) openCard(c.dataset.key); }
+});
+document.getElementById('ovl').addEventListener('click', e=>{
+  if(e.target.id==='ovl') closeOvl();
+});
+addEventListener('keydown', e=>{
+  // The duplicate dialog sits over the card sheet: Escape dismisses it
+  // first, and leaves the sheet where it was.
+  if(e.key==='Escape' && dupeResolve){ dupeClose(null); return; }
+  if(e.key==='Escape') closeOvl();
+  if(/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName)) return;
+  if(e.key==='/'){ e.preventDefault(); document.getElementById('q').focus(); return; }
+  // +/- resize the posters, the way every other grid of images does.
+  // '=' is the unshifted '+' key; the numpad sends 'Add'/'Subtract'.
+  if(view==='wall' && ['+','=','Add'].includes(e.key)){
+    e.preventDefault(); setZoom(effTile()+16);
+  } else if(view==='wall' && ['-','_','Subtract'].includes(e.key)){
+    e.preventDefault(); setZoom(effTile()-16);
+  }
+});
+
+document.getElementById('matchedOnly').checked=matchedOnly;
+document.getElementById('catGroup').checked=catGroup;
+// ---- Arrivals ----
+// The daemon's tip watcher indexes new posts within seconds, so the wall
+// can finally show them landing. Two rules shape this:
+//   - nothing reflows under the cursor uninvited. A card that arrives
+//     while you are reading waits behind the pill until you ask for it;
+//   - `tipMark` is the daemon's opaque release-row cursor, handed straight
+//     back next poll. It advances even when two releases land in the same
+//     whole second and never depends on the browser's clock.
+let tipMark=-1, freshKeys=new Set(), pendKeys=[], pendNew=0, pendLatest=0, freshTimer=0;
+const ovlOpen=()=>document.getElementById('ovl').classList.contains('open');
+const REDUCED=matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+async function tipPoll(){
+  try{
+    const j=await api('wall_tip',`&since=${tipMark}`);
+    // A daemon that could not read the index answers `latest: null`, and
+    // that must never be latched as a cursor: 0 is a REAL cursor value
+    // (an empty index), so latching a failure as 0 makes the next good
+    // poll count the whole last week as arrivals. Skip the tick instead
+    // and let the next one establish the mark.
+    if(typeof j.latest!=='number'||j.latest<0) return;
+    // The first poll only establishes where "now" is: everything already
+    // indexed predates this page being opened and is not an arrival.
+    if(tipMark<0){ tipMark=j.latest; return; }
+    if(!j.new) return;
+    // Cumulative since the last catch-up, so ignoring the pill for ten
+    // minutes still reads correctly rather than showing the last 5s.
+    pendNew=j.new; pendKeys=j.keys||[]; pendLatest=j.latest;
+    // Auto-catch-up at the top of an idle wall brings the cards in, but
+    // it is NOT a user asking for them: it must not switch or persist
+    // their sort. Only the pill (an actual click) may do that.
+    if(scrollY<400 && !ovlOpen()) showArrivals(false); else renderPill();
+  }catch(e){ /* daemon blip - the next tick retries */ }
+}
+function renderPill(){
+  const p=document.getElementById('newpill');
+  if(!pendNew){ p.classList.remove('show'); return; }
+  p.textContent=tn('wall.new.pill',pendNew,'↑ {n} new arrival','↑ {n} new arrivals');
+  p.classList.add('show');
+}
+// `explicit` = the user clicked the pill. Switching the wall to the
+// arrival order is right when they asked to see arrivals, and wrong when
+// a background poll happened to fire while they were at the top: that
+// path used to overwrite sortBy AND write it to localStorage, so a
+// preference nobody chose survived restarts, silently disabled the
+// affinity strips and "Because you watch" (they only render for
+// sortBy==='latest'/'affinity'), and re-clobbered any sort the user
+// re-picked within one 5 s poll.
+function showArrivals(explicit){
+  if(explicit===undefined) explicit=true;
+  if(!pendNew) return;
+  freshKeys=new Set(pendKeys);
+  tipMark=pendLatest||tipMark;
+  pendNew=0; pendKeys=[]; renderPill();
+  // The ring is a 60 s CSS animation and then it is over. Drop the marks
+  // after it so a later render - infinite scroll, a filter change - does
+  // not re-flash cards that stopped being new several minutes ago.
+  clearTimeout(freshTimer);
+  freshTimer=setTimeout(()=>{ freshKeys=new Set(); }, 60000);
+  // Send the user to the order the arrivals are actually IN. Under the
+  // default "Newest posts" they often are not near the top at all: a
+  // release is posted-dated by its FIRST article, so a set that only
+  // finished arriving now can be hours old. Measured on a live index,
+  // just-arrived releases sat past position 400 of 5,718 - the pill
+  // announced them and then showed a wall with nothing new on it.
+  if(explicit && sortBy!=='arrived'){
+    sortBy='arrived';
+    localStorage.nzbfastWallSort=sortBy;
+    localStorage.nzbfastWallSortChosen='1';
+    document.getElementById('sort').value=sortBy;
+    renderAffNote();
+  }
+  if(view==='releases'){ lpage=0; browseFetch(); }
+  else { wsig=''; refresh(); }
+  // Only jump the viewport when they asked. An automatic catch-up at the
+  // top has nowhere to scroll to anyway.
+  if(explicit) scrollTo({top:0,behavior:REDUCED?'auto':'smooth'});
+}
+function initArrivals(){ tipPoll(); setInterval(tipPoll, 5000); }
+
+// M31b: reflect the persisted sort (affinity leads the option list, so
+// without this the select would show "For you" while sortBy is 'latest').
+document.getElementById('sort').value=sortBy;
+applyZoom();
+renderDir();
+renderChips();
+// §Stage4: put the bar in the right shape for this width, and show what
+// the View panel is holding, before anything is painted.
+reflowBar();
+viewBadge();
+initArrivals();
+// setView drives its own fetch; the wall surface boots straight into
+// refresh() (its markup defaults are already wall-shaped).
+if(view==='releases') setView(view); else refresh();
+renderAffNote();
+setInterval(()=>{
+  if(view==='releases'){ browseFetch(); return; }
+  // The periodic refresh replaces the window with page 1 - correct at
+  // the top (fresh posts land there), a scroll-position wipe when the
+  // user is 10 pages deep or reading a sheet. Skip it then; the next
+  // top-of-page tick catches up.
+  if(scrollY<400 && !document.getElementById('ovl').classList.contains('open')) refresh();
+}, 45000);
+// M30: hidden-count chip + any pending rule suggestion.
+loadHidCount(); fetchSuggest();
+// Manual link: English at /manual, translations at /manual/<lang> (#wall anchor).
+// Selector follows the nav unification: the manual pill is now keyed
+// hdr.manual, shared with the dashboard.
+if(LOCALE!=='en'){ const m=document.querySelector('a[href^="/manual"]'); if(m) m.href='/manual/'+LOCALE+'#wall'; }
+// i18n loader - last, mirroring the dashboard: apply the catalogue to
+// the static markup, then re-render the wall (t() feeds every card).
+if(LOCALE!=='en'){
+  document.documentElement.lang=LOCALE;
+  // Synchronous during initial execution - first paint is already mirrored.
+  if(RTL_LOCALES.includes(LOCALE)) document.documentElement.dir='rtl';
+  fetch('/i18n/'+LOCALE+'.json').then(r=>r.ok?r.json():{}).then(d=>{
+    I18N=d||{};
+    applyI18n();
+    // The chip bar is a one-shot render that painted before the catalogue
+    // arrived, and applyI18n can't reach it (the chips carry no data-i18n
+    // markup) - rebuild it. render() runs whatever the view: in list mode the
+    // grid is merely hidden, and wallFetch's unchanged-page short-circuit
+    // would otherwise leave it in English until the wall's contents change.
+    // List rows repaint from the page we already hold rather than re-asking
+    // the daemon; renderList is synchronous, so its count still lands last.
+    renderChips();
+    render();
+    if(view==='releases'){
+      if(grpTitle && lgroups) renderGroups();
+      else if(lrows) renderList(lrows);
+    }
+    if(openKey) openCard(openKey);
+  }).catch(()=>{});
+}
+</script></body></html>

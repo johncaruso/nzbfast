@@ -1,0 +1,15 @@
+[workspace]
+members = ["crates/nzbkit", "crates/nzbfast", "crates/nzbtray", "vendor/rars", "vendor/tiny_http"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/nzbfast/nzbfast"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+# Drop symbol tables: smaller binaries, and removes build-host-varying
+# symbol data - part of making release builds attestable/reproducible.
+strip = "symbols"

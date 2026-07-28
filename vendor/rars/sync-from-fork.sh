@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+#
+# sync-from-fork.sh — re-vendor the rars perf-fork crate into vendor/rars/.
+#
+# The fork (github.com/bitplane/rars, perf branch) keeps the crate under
+# crates/rars/; the vendored copy here is that crate's root. This script
+# mirrors exactly the pieces nzbfast builds and tests against, so a fresh
+# `cargo test -p rars --lib` is green on any clean checkout:
+#
+#   <fork>/crates/rars/src/            -> vendor/rars/src/            (mirror)
+#   <fork>/crates/rars/tests/fixtures/ -> vendor/rars/tests/fixtures/ (mirror)
+#   <fork>/COPYING                     -> vendor/rars/COPYING
+#
+# WHY tests/fixtures/** IS NOT OPTIONAL
+# ------------------------------------
+# The rars unit tests live INLINE in src/lib.rs and read their inputs via
+#   env!("CARGO_MANIFEST_DIR")/tests/fixtures/rar15_40/...
+# so `cargo test -p rars --lib` fails with NotFound on a clean checkout the
+# moment a referenced fixture is missing. Hand-picking "just the fixtures the
+# current tests use" is exactly what regressed before (only two were carried
+# by hand; four tests broke). This script copies the WHOLE fixtures tree so
+# the next inline test that references another fixture can't regress. Do not
+# "optimise" it down to a subset.
+#
+# NOT synced (intentionally):
+#   - Cargo.toml : hand-maintained here. The vendored manifest de-workspaces
+#     the deps, pins version "0.4.6+nzbfast", adds the forbid-unsafe lints, and
+#     drops dev-dependencies/benches. Reconcile it BY HAND after a sync only if
+#     the fork's [dependencies] set changed — see VENDORING.md.
+#   - tests/*.rs : the fork's integration tests are not vendored (only the
+#     inline --lib tests run here), so only their fixtures are needed.
+#   - benches/, fuzz/, python/, scripts/, target/, ... : fork-only tooling.
+#
+# Usage:
+#   RARS_FORK=/path/to/rars/checkout ./vendor/rars/sync-from-fork.sh
+#   # RARS_FORK defaults to $HOME/Claude/rars
+#
+set -euo pipefail
+
+fork="${RARS_FORK:-$HOME/Claude/rars}"
+crate="$fork/crates/rars"
+# The directory this script lives in is the vendored crate root.
+dest="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [ ! -d "$crate/src" ]; then
+  echo "error: '$crate/src' not found." >&2
+  echo "       Point RARS_FORK at your rars fork checkout, e.g.:" >&2
+  echo "       RARS_FORK=~/src/rars $0" >&2
+  exit 1
+fi
+# Guard the exact regression this script exists to prevent: never vendor a
+# crate whose fixtures went missing upstream.
+if [ ! -d "$crate/tests/fixtures" ] || [ -z "$(find "$crate/tests/fixtures" -type f -print -quit)" ]; then
+  echo "error: '$crate/tests/fixtures' is missing or empty — refusing to vendor" >&2
+  echo "       a crate with no test fixtures (the inline --lib tests need them)." >&2
+  exit 1
+fi
+
+rev="(unknown)"
+if git -C "$fork" rev-parse --short HEAD >/dev/null 2>&1; then
+  rev="$(git -C "$fork" rev-parse --short HEAD)"
+fi
+echo "Vendoring rars"
+echo "  from : $crate"
+echo "  rev  : $rev"
+echo "  into : $dest"
+
+# src/ and tests/fixtures/ are exact mirrors (--delete drops files removed
+# upstream). tests/*.rs is deliberately excluded from the fixtures sync scope
+# because we sync tests/fixtures/ specifically, not tests/.
+rsync -a --delete "$crate/src/" "$dest/src/"
+mkdir -p "$dest/tests/fixtures"
+rsync -a --delete "$crate/tests/fixtures/" "$dest/tests/fixtures/"
+
+# COPYING lives at the fork repo root (the crate dir has none); prefer a
+# crate-local copy if the upstream layout ever grows one.
+if   [ -f "$crate/COPYING" ]; then cp "$crate/COPYING" "$dest/COPYING"
+elif [ -f "$fork/COPYING"  ]; then cp "$fork/COPYING"  "$dest/COPYING"
+else echo "warning: no COPYING found in fork — leaving vendor/rars/COPYING as-is" >&2
+fi
+
+n_src=$(find "$dest/src" -type f | wc -l | tr -d ' ')
+n_fix=$(find "$dest/tests/fixtures" -type f | wc -l | tr -d ' ')
+echo "Synced: $n_src source file(s), $n_fix fixture file(s), COPYING."
+echo
+echo "NEXT STEPS"
+echo "  1. Reconcile vendor/rars/Cargo.toml by hand IF the fork's [dependencies]"
+echo "     changed. This script never touches it — see vendor/rars/VENDORING.md."
+echo "  2. cargo test -p rars --lib     # must stay green"
+echo "  3. git add -A vendor/rars"
+echo "     git commit -m 'vendor/rars: sync to fork rev $rev'"

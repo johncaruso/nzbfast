@@ -1,0 +1,102 @@
+name: release
+
+# Manual or tag-triggered. Builds cross-platform binaries + a multi-arch
+# container image, attaches everything to a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Read-only by default; the two jobs that publish escalate for themselves.
+# A workflow-wide `contents: write, packages: write` handed the same
+# push-anything token to the four binary build runners, which only ever
+# check out and compile.
+permissions:
+  contents: read
+
+jobs:
+  binaries:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Rust
+        # rust-toolchain.toml pins the exact rustc; just add the target to
+        # the pinned toolchain (no `rustup update stable`, which would build
+        # the shipped bits with an unpinned compiler - inconsistent with the
+        # attested provenance-release.yml build).
+        run: rustup target add ${{ matrix.target }}
+      - name: Cross toolchain (aarch64 linux)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++" >> "$GITHUB_ENV"
+      - name: Build
+        # --locked: build the committed dependency graph, or fail.
+        run: cargo build --release --locked -p nzbfast --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          BIN=target/${{ matrix.target }}/release/nzbfast
+          tar czf nzbfast-${{ matrix.target }}.tar.gz -C "$(dirname "$BIN")" nzbfast
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nzbfast-${{ matrix.target }}
+          path: nzbfast-${{ matrix.target }}.tar.gz
+
+  image:
+    # Tags only - the same guard `release` carries. Without it a
+    # workflow_dispatch from ANY branch pushed that branch's build to
+    # `:latest`, and every `docker pull nzbfast:latest` got it. The
+    # `:${{ github.ref_name }}` tag was just as wrong (a branch name).
+    # workflow_dispatch still builds the binaries for a smoke test; it
+    # just no longer publishes.
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkout
+      packages: write # ghcr push
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+
+  release:
+    needs: [binaries, image]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub release
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with: { path: dist, merge-multiple: true }
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: dist/*.tar.gz
+          generate_release_notes: true

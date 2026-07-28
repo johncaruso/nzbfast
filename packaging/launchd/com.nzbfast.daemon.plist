@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  nzbfast daemon - macOS launchd agent (runs at login).
+  Install:
+    cp packaging/launchd/com.nzbfast.daemon.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.nzbfast.daemon.plist
+  Edit the paths below first. Config at ~/.config/nzbfast/config.json.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nzbfast.daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/nzbfast</string>
+        <string>serve</string>
+        <string>--config</string>
+        <string>REPLACE_HOME/.config/nzbfast/config.json</string>
+        <string>--port</string>
+        <string>6789</string>
+        <string>--out</string>
+        <string>REPLACE_HOME/Downloads/nzbfast</string>
+        <string>--watch</string>
+        <string>REPLACE_HOME/Downloads/nzbfast/watch</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>REPLACE_HOME/Library/Logs/nzbfast.log</string>
+    <key>StandardErrorPath</key>
+    <string>REPLACE_HOME/Library/Logs/nzbfast.log</string>
+</dict>
+</plist>

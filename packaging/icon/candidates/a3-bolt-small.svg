@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A3: the SMALL-SIZE variant of A2 (16/32 px). The slipstream lines and
+     the bolt compete for the same few pixels down there, so the small art
+     drops the lines and scales the bolt up to fill the tile. .ico and
+     .icns both carry per-size images, so this is a normal split: A2 art
+     for 128 px and up, A3 for 16/32. -->
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="tileg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5aa8ff"/>
+      <stop offset="1" stop-color="#6d47e6"/>
+    </linearGradient>
+  </defs>
+  <rect x="60" y="60" width="904" height="904" rx="196" fill="url(#tileg)"/>
+  <path d="M 774 108 L 330 570 L 556 570 L 400 916 L 826 452 L 588 452 Z" fill="#fff"/>
+</svg>

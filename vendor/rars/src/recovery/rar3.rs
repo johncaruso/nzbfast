@@ -1,0 +1,779 @@
+const MAX_PARITY: usize = 255;
+const MAX_POLYNOMIAL: usize = 512;
+const PRIMITIVE_POLYNOMIAL: u16 = 0x11d;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Error {
+    InvalidParitySize,
+    InvalidCodewordSize,
+    TooManyErasures,
+    DecodeFailed,
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidParitySize => f.write_str("RAR 3 recovery parity size is invalid"),
+            Self::InvalidCodewordSize => f.write_str("RAR 3 recovery codeword size is invalid"),
+            Self::TooManyErasures => {
+                f.write_str("RAR 3 recovery data cannot repair this many erasures")
+            }
+            Self::DecodeFailed => f.write_str("RAR 3 recovery decode failed"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug, Clone)]
+pub(crate) struct RSCoder8 {
+    parity_size: usize,
+    gf_exp: [u8; MAX_POLYNOMIAL],
+    gf_log: [u16; MAX_PARITY + 1],
+    generator: Vec<u8>,
+}
+
+impl RSCoder8 {
+    pub(crate) fn new(parity_size: usize) -> Result<Self> {
+        if parity_size == 0 || parity_size > MAX_PARITY {
+            return Err(Error::InvalidParitySize);
+        }
+        let mut coder = Self {
+            parity_size,
+            gf_exp: [0; MAX_POLYNOMIAL],
+            gf_log: [0; MAX_PARITY + 1],
+            generator: vec![0; parity_size],
+        };
+        coder.init_field();
+        coder.init_generator();
+        Ok(coder)
+    }
+
+    #[cfg(test)]
+    fn encode(&self, data: &[u8]) -> Vec<u8> {
+        let mut shift = vec![0u8; self.parity_size + 1];
+        for &byte in data {
+            let feedback = byte ^ shift[self.parity_size - 1];
+            for index in (1..self.parity_size).rev() {
+                shift[index] = shift[index - 1] ^ self.mul(self.generator[index], feedback);
+            }
+            shift[0] = self.mul(self.generator[0], feedback);
+        }
+        (0..self.parity_size)
+            .map(|index| shift[self.parity_size - index - 1])
+            .collect()
+    }
+
+    pub(crate) fn correct_erasures(&self, codeword: &mut [u8], erasures: &[usize]) -> Result<()> {
+        if codeword.is_empty() || codeword.len() > MAX_PARITY {
+            return Err(Error::InvalidCodewordSize);
+        }
+        if erasures.len() > self.parity_size {
+            return Err(Error::TooManyErasures);
+        }
+        if erasures.iter().any(|&index| index >= codeword.len()) {
+            return Err(Error::InvalidCodewordSize);
+        }
+
+        let mut syndromes = vec![0u8; self.parity_size];
+        let mut all_zero = true;
+        for (index, syndrome) in syndromes.iter_mut().enumerate() {
+            let factor = self.gf_exp[index + 1];
+            let mut sum = 0;
+            for &byte in codeword.iter() {
+                sum = byte ^ self.mul(factor, sum);
+            }
+            *syndrome = sum;
+            all_zero &= sum == 0;
+        }
+        if all_zero {
+            return Ok(());
+        }
+        if erasures.is_empty() {
+            return Err(Error::DecodeFailed);
+        }
+
+        let mut locator = vec![0u8; self.parity_size + 1];
+        locator[0] = 1;
+        for &erasure in erasures {
+            let multiplier = self.gf_exp[codeword.len() - erasure - 1];
+            for index in (1..=self.parity_size).rev() {
+                locator[index] ^= self.mul(multiplier, locator[index - 1]);
+            }
+        }
+
+        let mut error_locs = Vec::new();
+        let mut denominators = Vec::new();
+        for root in (MAX_PARITY - codeword.len())..=MAX_PARITY {
+            let mut sum = 0;
+            for (power, &coefficient) in locator.iter().enumerate() {
+                sum ^= self.mul(self.gf_exp[(power * root) % MAX_PARITY], coefficient);
+            }
+            if sum == 0 {
+                let loc = MAX_PARITY - root;
+                error_locs.push(loc);
+                let mut denominator = 0;
+                for index in (1..=self.parity_size).step_by(2) {
+                    denominator ^= self.mul(
+                        locator[index],
+                        self.gf_exp[(root * (index - 1)) % MAX_PARITY],
+                    );
+                }
+                denominators.push(denominator);
+            }
+        }
+        if error_locs.is_empty() || error_locs.len() > self.parity_size {
+            return Err(Error::DecodeFailed);
+        }
+
+        let evaluator = self.multiply_polynomials(&locator, &syndromes);
+        for (&loc, &denominator) in error_locs.iter().zip(&denominators) {
+            if denominator == 0 {
+                return Err(Error::DecodeFailed);
+            }
+            let data_pos = codeword
+                .len()
+                .checked_sub(loc + 1)
+                .ok_or(Error::DecodeFailed)?;
+            let dloc = MAX_PARITY - loc;
+            let mut numerator = 0;
+            for (index, &coefficient) in evaluator.iter().enumerate() {
+                numerator ^= self.mul(coefficient, self.gf_exp[(dloc * index) % MAX_PARITY]);
+            }
+            let correction = self.mul(
+                numerator,
+                self.gf_exp[MAX_PARITY - usize::from(self.gf_log[denominator as usize])],
+            );
+            codeword[data_pos] ^= correction;
+        }
+        Ok(())
+    }
+
+    fn init_field(&mut self) {
+        let mut value = 1u16;
+        for index in 0..MAX_PARITY {
+            self.gf_log[value as usize] = index as u16;
+            self.gf_exp[index] = value as u8;
+            value <<= 1;
+            if value > 0xff {
+                value ^= PRIMITIVE_POLYNOMIAL;
+            }
+        }
+        for index in MAX_PARITY..MAX_POLYNOMIAL {
+            self.gf_exp[index] = self.gf_exp[index - MAX_PARITY];
+        }
+    }
+
+    fn init_generator(&mut self) {
+        let mut current = vec![0u8; self.parity_size];
+        current[0] = 1;
+        for index in 1..=self.parity_size {
+            let mut factor = vec![0u8; self.parity_size];
+            factor[0] = self.gf_exp[index];
+            if self.parity_size > 1 {
+                factor[1] = 1;
+            }
+            self.generator = self.multiply_polynomials(&factor, &current);
+            current.clone_from(&self.generator);
+        }
+    }
+
+    fn multiply_polynomials(&self, left: &[u8], right: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8; self.parity_size];
+        for left_index in 0..self.parity_size {
+            if left.get(left_index).copied().unwrap_or(0) == 0 {
+                continue;
+            }
+            for right_index in 0..(self.parity_size - left_index) {
+                out[left_index + right_index] ^= self.mul(
+                    left[left_index],
+                    right.get(right_index).copied().unwrap_or(0),
+                );
+            }
+        }
+        out
+    }
+
+    fn mul(&self, left: u8, right: u8) -> u8 {
+        if left == 0 || right == 0 {
+            0
+        } else {
+            self.gf_exp[usize::from(self.gf_log[left as usize] + self.gf_log[right as usize])]
+        }
+    }
+
+    /// Multiply-by-constant lookup, so bulk reconstruction costs one indexed
+    /// load per byte instead of two log lookups, an add, and a branch.
+    fn mul_table(&self, coefficient: u8) -> [u8; 256] {
+        let mut table = [0u8; 256];
+        for (value, slot) in table.iter_mut().enumerate() {
+            *slot = self.mul(coefficient, value as u8);
+        }
+        table
+    }
+}
+
+/// Bytes of one output volume rebuilt per pass, so the destination slice stays
+/// in cache while every source volume streams past it.
+const RECONSTRUCT_CHUNK: usize = 64 * 1024;
+
+/// Solve the full Forney decode once per byte offset.
+///
+/// This is the original reconstruction loop. It is quadratic in the volume
+/// count and allocates about half a dozen vectors per output byte, so it now
+/// runs only for erasure sets the decoder cannot derive coefficients for at
+/// all -- where it is the definition of the expected answer.
+fn reconstruct_per_symbol(
+    data_volumes: &[Option<&[u8]>],
+    recovery_by_index: &[Option<&[u8]>],
+    coder: &RSCoder8,
+    erasures: &[usize],
+    missing_data: &[usize],
+    shard_len: usize,
+    mut out: Vec<Vec<u8>>,
+) -> Result<Vec<Vec<u8>>> {
+    for offset in 0..shard_len {
+        let mut codeword = vec![0; data_volumes.len() + recovery_by_index.len()];
+        for (index, data) in data_volumes.iter().enumerate() {
+            if let Some(data) = data {
+                codeword[index] = data.get(offset).copied().unwrap_or(0);
+            }
+        }
+        for (index, data) in recovery_by_index.iter().enumerate() {
+            if let Some(data) = data {
+                codeword[data_volumes.len() + index] = data[offset];
+            }
+        }
+        coder.correct_erasures(&mut codeword, erasures)?;
+        for &index in missing_data {
+            out[index][offset] = codeword[index];
+        }
+    }
+    Ok(out)
+}
+
+/// Derive the erasure-correction coefficients once for a fixed erasure set.
+///
+/// `correct_erasures` is linear in the codeword, and everything it derives
+/// from the erasure positions alone -- locator, roots, Forney denominators --
+/// is identical at every byte offset. The whole decode therefore collapses to
+/// a fixed matrix: the value recovered at erased position `e` is the XOR over
+/// known positions `k` of `matrix[e][k] * codeword[k]`.
+///
+/// The coefficients are read out of `correct_erasures` itself, by decoding
+/// unit codewords, so the bulk path cannot drift from the reference decoder.
+/// A unit codeword always has non-zero syndromes, so no probe can take the
+/// clean-codeword early return and silently yield an all-zero column.
+fn erasure_correction_matrix(
+    coder: &RSCoder8,
+    codeword_len: usize,
+    erasures: &[usize],
+    known: &[(usize, &[u8])],
+) -> Result<Vec<Vec<u8>>> {
+    let mut matrix = vec![vec![0u8; codeword_len]; erasures.len()];
+    let mut probe = vec![0u8; codeword_len];
+    for &(position, _) in known {
+        probe.iter_mut().for_each(|byte| *byte = 0);
+        probe[position] = 1;
+        // Distinct, non-empty erasures always give a full root set and
+        // non-zero denominators, so a probe failure means the erasure set
+        // itself is undecodable -- exactly what the serial loop reported.
+        coder.correct_erasures(&mut probe, erasures)?;
+        for (row, &erasure) in matrix.iter_mut().zip(erasures) {
+            row[position] = probe[erasure];
+        }
+    }
+    Ok(matrix)
+}
+
+pub fn reconstruct_data_volumes(
+    data_volumes: &[Option<&[u8]>],
+    recovery_count: usize,
+    recovery_volumes: &[(usize, &[u8])],
+) -> Result<Vec<Vec<u8>>> {
+    if data_volumes.is_empty() || data_volumes.len() + recovery_count > MAX_PARITY {
+        return Err(Error::InvalidCodewordSize);
+    }
+    if recovery_volumes.is_empty() || recovery_count == 0 || recovery_count > MAX_PARITY {
+        return Err(Error::InvalidParitySize);
+    }
+    let shard_len = recovery_volumes[0].1.len();
+    if recovery_volumes
+        .iter()
+        .any(|&(index, data)| index >= recovery_count || data.len() != shard_len)
+    {
+        return Err(Error::InvalidCodewordSize);
+    }
+    if data_volumes
+        .iter()
+        .flatten()
+        .any(|data| data.len() > shard_len)
+    {
+        return Err(Error::InvalidCodewordSize);
+    }
+
+    let mut recovery_by_index = vec![None; recovery_count];
+    for &(index, data) in recovery_volumes {
+        if recovery_by_index[index].replace(data).is_some() {
+            return Err(Error::InvalidCodewordSize);
+        }
+    }
+
+    let missing_data: Vec<_> = data_volumes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, data)| data.is_none().then_some(index))
+        .collect();
+    if missing_data.is_empty() {
+        return Ok(data_volumes
+            .iter()
+            .map(|data| {
+                let mut out = vec![0; shard_len];
+                if let Some(data) = data {
+                    out[..data.len()].copy_from_slice(data);
+                }
+                out
+            })
+            .collect());
+    }
+
+    let missing_recovery: Vec<_> = recovery_by_index
+        .iter()
+        .enumerate()
+        .filter_map(|(index, data)| data.is_none().then_some(data_volumes.len() + index))
+        .collect();
+    let mut erasures = missing_data.clone();
+    erasures.extend(missing_recovery);
+    if erasures.len() > recovery_count {
+        return Err(Error::TooManyErasures);
+    }
+
+    let coder = RSCoder8::new(recovery_count)?;
+    let mut out: Vec<Vec<u8>> = data_volumes
+        .iter()
+        .map(|data| {
+            let mut shard = vec![0; shard_len];
+            if let Some(data) = data {
+                shard[..data.len()].copy_from_slice(data);
+            }
+            shard
+        })
+        .collect();
+
+    // Every surviving symbol of the codeword, in codeword order: the data
+    // volumes we still have, then the recovery volumes we still have.
+    let mut known: Vec<(usize, &[u8])> = Vec::with_capacity(data_volumes.len() + recovery_count);
+    for (index, data) in data_volumes.iter().enumerate() {
+        if let Some(data) = data {
+            known.push((index, data));
+        }
+    }
+    for (index, data) in recovery_by_index.iter().enumerate() {
+        if let Some(data) = data {
+            known.push((data_volumes.len() + index, data));
+        }
+    }
+
+    let codeword_len = data_volumes.len() + recovery_count;
+    let matrix = match erasure_correction_matrix(&coder, codeword_len, &erasures, &known) {
+        Ok(matrix) => matrix,
+        // The erasure set defeats the decoder itself, so there are no
+        // coefficients to derive. `correct_erasures` can still return Ok for
+        // an individual codeword that needs no correction, so hand the whole
+        // job to the per-symbol path rather than answer differently from it.
+        Err(_) => {
+            return reconstruct_per_symbol(
+                data_volumes,
+                &recovery_by_index,
+                &coder,
+                &erasures,
+                &missing_data,
+                shard_len,
+                out,
+            )
+        }
+    };
+
+    // One multiply-by-constant table per (rebuilt volume, surviving volume).
+    // `erasures` starts with `missing_data`, so matrix row `i` is the
+    // correction for `missing_data[i]`; the missing recovery rows that follow
+    // are never read back, since recovery volumes are not outputs.
+    let tables: Vec<Vec<Option<[u8; 256]>>> = (0..missing_data.len())
+        .map(|row| {
+            known
+                .iter()
+                .map(|&(position, _)| {
+                    let coefficient = matrix[row][position];
+                    (coefficient != 0).then(|| coder.mul_table(coefficient))
+                })
+                .collect()
+        })
+        .collect();
+
+    // Accumulate one chunk of one rebuilt volume: every surviving volume's
+    // matching bytes, each scaled by its coefficient and folded in. The
+    // destination stays in cache while the sources stream past it.
+    let fold_chunk = |destination: &mut [u8], row: usize, start: usize| {
+        let end = start + destination.len();
+        for (slot, &(_, data)) in known.iter().enumerate() {
+            let Some(table) = &tables[row][slot] else {
+                continue;
+            };
+            // A volume shorter than the shard reads as zero past its end, and
+            // `table[0]` is zero, so the tail contributes nothing.
+            let available = data.len().min(end);
+            if available <= start {
+                continue;
+            }
+            for (byte, &symbol) in destination.iter_mut().zip(&data[start..available]) {
+                *byte ^= table[usize::from(symbol)];
+            }
+        }
+    };
+
+    for (row, &target) in missing_data.iter().enumerate() {
+        // `out[target]` starts zeroed: a missing volume contributed no bytes
+        // to the copy above, so this accumulates the correction in place.
+        // Chunks touch disjoint output and only read shared input.
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            out[target]
+                .par_chunks_mut(RECONSTRUCT_CHUNK)
+                .enumerate()
+                .for_each(|(index, destination)| {
+                    fold_chunk(destination, row, index * RECONSTRUCT_CHUNK);
+                });
+        }
+        #[cfg(not(feature = "parallel"))]
+        for (index, destination) in out[target].chunks_mut(RECONSTRUCT_CHUNK).enumerate() {
+            fold_chunk(destination, row, index * RECONSTRUCT_CHUNK);
+        }
+    }
+
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{reconstruct_data_volumes, Error, RSCoder8, MAX_PARITY};
+
+    /// Drive the original per-byte Forney loop directly, as the differential
+    /// reference the bulk matrix path must agree with byte for byte.
+    fn reconstruct_reference(
+        data_volumes: &[Option<&[u8]>],
+        recovery_count: usize,
+        recovery_volumes: &[(usize, &[u8])],
+    ) -> super::Result<Vec<Vec<u8>>> {
+        let shard_len = recovery_volumes[0].1.len();
+        let mut recovery_by_index = vec![None; recovery_count];
+        for &(index, data) in recovery_volumes {
+            recovery_by_index[index] = Some(data);
+        }
+        let missing_data: Vec<_> = data_volumes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, data)| data.is_none().then_some(index))
+            .collect();
+        let missing_recovery: Vec<_> = recovery_by_index
+            .iter()
+            .enumerate()
+            .filter_map(|(index, data)| data.is_none().then_some(data_volumes.len() + index))
+            .collect();
+        let mut erasures = missing_data.clone();
+        erasures.extend(missing_recovery);
+
+        let coder = RSCoder8::new(recovery_count)?;
+        let out: Vec<Vec<u8>> = data_volumes
+            .iter()
+            .map(|data| {
+                let mut shard = vec![0; shard_len];
+                if let Some(data) = data {
+                    shard[..data.len()].copy_from_slice(data);
+                }
+                shard
+            })
+            .collect();
+        super::reconstruct_per_symbol(
+            data_volumes,
+            &recovery_by_index,
+            &coder,
+            &erasures,
+            &missing_data,
+            shard_len,
+            out,
+        )
+    }
+
+    /// Build the correction matrix the same way `reconstruct_data_volumes`
+    /// does, so a test can tell whether production took the matrix path or
+    /// the per-byte fallback.
+    fn correction_matrix_for(
+        data_volumes: &[Option<&[u8]>],
+        recovery_count: usize,
+        recovery_volumes: &[(usize, &[u8])],
+    ) -> super::Result<Vec<Vec<u8>>> {
+        let mut recovery_by_index = vec![None; recovery_count];
+        for &(index, data) in recovery_volumes {
+            recovery_by_index[index] = Some(data);
+        }
+        let mut erasures: Vec<usize> = data_volumes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, data)| data.is_none().then_some(index))
+            .collect();
+        erasures.extend(
+            recovery_by_index
+                .iter()
+                .enumerate()
+                .filter_map(|(index, data)| data.is_none().then_some(data_volumes.len() + index)),
+        );
+        let mut known: Vec<(usize, &[u8])> = Vec::new();
+        for (index, data) in data_volumes.iter().enumerate() {
+            if let Some(data) = data {
+                known.push((index, data));
+            }
+        }
+        for (index, data) in recovery_by_index.iter().enumerate() {
+            if let Some(data) = data {
+                known.push((data_volumes.len() + index, data));
+            }
+        }
+        super::erasure_correction_matrix(
+            &RSCoder8::new(recovery_count)?,
+            data_volumes.len() + recovery_count,
+            &erasures,
+            &known,
+        )
+    }
+
+    /// Column-wise RS(255) parity over the same generator `RSCoder8` builds,
+    /// i.e. the shape a real .rev set carries.
+    fn encode_columns(data: &[Vec<u8>], recovery_count: usize, shard_len: usize) -> Vec<Vec<u8>> {
+        let coder = RSCoder8::new(recovery_count).unwrap();
+        let mut parity = vec![vec![0u8; shard_len]; recovery_count];
+        for offset in 0..shard_len {
+            let column: Vec<u8> = data
+                .iter()
+                .map(|shard| shard.get(offset).copied().unwrap_or(0))
+                .collect();
+            for (row, byte) in parity.iter_mut().zip(coder.encode(&column)) {
+                row[offset] = byte;
+            }
+        }
+        parity
+    }
+
+    fn pseudorandom(len: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) as u8
+            })
+            .collect()
+    }
+
+    /// The bulk matrix path must reproduce the per-byte Forney decode exactly,
+    /// across volume counts, erasure counts, ragged final volumes, shards that
+    /// straddle the chunking boundary, and all-zero input.
+    #[test]
+    fn bulk_reconstruction_matches_per_byte_reference() {
+        let chunk = super::RECONSTRUCT_CHUNK;
+        let cases: &[(usize, usize, usize, usize)] = &[
+            // (data volumes, recovery count, missing data, shard length)
+            (3, 2, 1, 12),
+            (3, 2, 2, 257),
+            (8, 4, 4, 1000),
+            (16, 3, 1, chunk - 1),
+            (16, 3, 1, chunk),
+            (16, 3, 2, chunk + 1),
+            (16, 3, 3, 2 * chunk + 37),
+            (50, 5, 5, 4096),
+            (1, 1, 1, 64),
+            (200, 55, 2, 512),
+        ];
+        for &(volumes, recovery_count, missing, shard_len) in cases {
+            let mut data: Vec<Vec<u8>> = (0..volumes)
+                .map(|index| pseudorandom(shard_len, 0x9e37 + index as u64))
+                .collect();
+            // Ragged tail: real sets end on a short volume.
+            if shard_len > 3 {
+                data[volumes - 1].truncate(shard_len - 3);
+            }
+            let parity = encode_columns(&data, recovery_count, shard_len);
+
+            let mut present: Vec<Option<&[u8]>> =
+                data.iter().map(|shard| Some(shard.as_slice())).collect();
+            for slot in present.iter_mut().take(missing) {
+                *slot = None;
+            }
+            let recovery: Vec<(usize, &[u8])> = (0..missing)
+                .map(|index| (index, parity[index].as_slice()))
+                .collect();
+
+            // Production falls back to the per-byte loop when (and only when)
+            // the coefficients cannot be derived, so this pins which path the
+            // case below actually took -- without it, a case that quietly fell
+            // back would compare the reference against itself and pass.
+            let took_matrix_path =
+                correction_matrix_for(&present, recovery_count, &recovery).is_ok();
+            assert_eq!(
+                took_matrix_path,
+                !(volumes + recovery_count == MAX_PARITY),
+                "unexpected path for {volumes}+{recovery_count}, {missing} missing"
+            );
+
+            let fast = reconstruct_data_volumes(&present, recovery_count, &recovery);
+            let reference = reconstruct_reference(&present, recovery_count, &recovery);
+            // Success or failure, the two paths must answer identically.
+            assert_eq!(
+                fast, reference,
+                "fast path diverged for {volumes}+{recovery_count}, {missing} missing, {shard_len} B"
+            );
+            let Ok(fast) = fast else {
+                continue;
+            };
+            // And where it succeeds it must rebuild the original bytes.
+            for index in 0..missing {
+                assert_eq!(
+                    &fast[index][..data[index].len()],
+                    data[index].as_slice(),
+                    "wrong bytes for volume {index} of {volumes}+{recovery_count}"
+                );
+            }
+        }
+    }
+
+    /// A run of zero bytes makes the codeword self-consistent, which the
+    /// per-byte decoder handled by an early return. The matrix path must land
+    /// on the same zeros rather than diverging there.
+    #[test]
+    fn all_zero_shards_reconstruct_as_zero() {
+        let data: Vec<Vec<u8>> = vec![vec![0u8; 300]; 6];
+        let parity = encode_columns(&data, 3, 300);
+        let mut present: Vec<Option<&[u8]>> =
+            data.iter().map(|shard| Some(shard.as_slice())).collect();
+        present[2] = None;
+        let recovery = [(0usize, parity[0].as_slice())];
+
+        let fast = reconstruct_data_volumes(&present, 3, &recovery).unwrap();
+        let reference = reconstruct_reference(&present, 3, &recovery).unwrap();
+
+        assert_eq!(fast, reference);
+        assert!(fast[2].iter().all(|&byte| byte == 0));
+    }
+
+    /// Recovery volumes may themselves be missing; they count against the
+    /// erasure budget but are never emitted.
+    #[test]
+    fn missing_recovery_volumes_count_as_erasures() {
+        let data: Vec<Vec<u8>> = (0..5).map(|i| pseudorandom(600, 0x5151 + i)).collect();
+        let parity = encode_columns(&data, 4, 600);
+        let mut present: Vec<Option<&[u8]>> =
+            data.iter().map(|shard| Some(shard.as_slice())).collect();
+        present[1] = None;
+        present[4] = None;
+        // Only recovery rows 1 and 3 survive: rows 0 and 2 are erasures too.
+        let recovery = [(1usize, parity[1].as_slice()), (3usize, parity[3].as_slice())];
+
+        let fast = reconstruct_data_volumes(&present, 4, &recovery).unwrap();
+        let reference = reconstruct_reference(&present, 4, &recovery).unwrap();
+
+        assert_eq!(fast, reference);
+        assert_eq!(fast[1], data[1]);
+        assert_eq!(fast[4], data[4]);
+    }
+
+    #[test]
+    fn max_parity_bound_is_unchanged() {
+        assert_eq!(MAX_PARITY, 255);
+    }
+
+    #[test]
+    fn rs8_encoder_matches_unrar_generator_shape() {
+        let coder = RSCoder8::new(11).unwrap();
+        assert_eq!(
+            coder.generator,
+            vec![97, 180, 203, 151, 195, 196, 219, 7, 113, 50, 69]
+        );
+    }
+
+    #[test]
+    fn rs8_reconstructs_single_erased_data_symbol() {
+        let coder = RSCoder8::new(4).unwrap();
+        let data = b"rar recovery data";
+        let parity = coder.encode(data);
+        let mut codeword = [data.as_slice(), parity.as_slice()].concat();
+        let original = codeword.clone();
+        codeword[3] ^= 0xa5;
+
+        coder.correct_erasures(&mut codeword, &[3]).unwrap();
+
+        assert_eq!(codeword, original);
+    }
+
+    #[test]
+    fn rs8_reconstructs_multiple_erased_symbols_including_parity() {
+        let coder = RSCoder8::new(5).unwrap();
+        let data = b"rar3-rs8";
+        let parity = coder.encode(data);
+        let mut codeword = [data.as_slice(), parity.as_slice()].concat();
+        let original = codeword.clone();
+        codeword[1] = 0;
+        codeword[7] = 0;
+        codeword[10] = 0;
+
+        coder.correct_erasures(&mut codeword, &[1, 7, 10]).unwrap();
+
+        assert_eq!(codeword, original);
+    }
+
+    #[test]
+    fn rs8_rejects_more_erasures_than_parity_symbols() {
+        let coder = RSCoder8::new(2).unwrap();
+        let mut codeword = b"abcde".to_vec();
+
+        assert_eq!(
+            coder.correct_erasures(&mut codeword, &[0, 1, 2]),
+            Err(Error::TooManyErasures)
+        );
+    }
+
+    #[test]
+    fn rev3_reconstructs_missing_data_volume_from_recovery_volume() {
+        let data = [
+            b"volume-one".as_slice(),
+            b"volume-two".as_slice(),
+            b"volume-three".as_slice(),
+        ];
+        let recovery_count = 2;
+        let coder = RSCoder8::new(recovery_count).unwrap();
+        let shard_len = data.iter().map(|shard| shard.len()).max().unwrap();
+        let mut recovery = vec![vec![0; shard_len]; recovery_count];
+        for offset in 0..shard_len {
+            let column: Vec<_> = data
+                .iter()
+                .map(|shard| shard.get(offset).copied().unwrap_or(0))
+                .collect();
+            let encoded = coder.encode(&column);
+            for (row, byte) in recovery.iter_mut().zip(encoded) {
+                row[offset] = byte;
+            }
+        }
+
+        let repaired = reconstruct_data_volumes(
+            &[Some(data[0]), None, Some(data[2])],
+            recovery_count,
+            &[(0, recovery[0].as_slice())],
+        )
+        .unwrap();
+
+        assert_eq!(&repaired[1][..data[1].len()], data[1]);
+    }
+}

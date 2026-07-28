@@ -1,0 +1,31 @@
+[package]
+name = "nzbtray"
+# Keep in lockstep with crates/nzbfast (the version source of truth) -
+# the installer stamps that string on both exes' packaging.
+version = "1.0.10"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# Plain-HTTP only (the daemon is always 127.0.0.1) - no TLS stack.
+ureq = { version = "2", default-features = false }
+serde_json = "1"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+# The tray itself is Windows-only, but the probe-body classifier that
+# decides attach-vs-spawn is compiled and tested on every host, so its
+# JSON parser has to be reachable off Windows too. Dev-only: nothing is
+# added to what actually ships.
+serde_json = "1"

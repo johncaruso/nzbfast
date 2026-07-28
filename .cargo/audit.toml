@@ -1,0 +1,11 @@
+# cargo-audit configuration.
+
+[advisories]
+# RUSTSEC-2023-0071 (rsa: "Marvin" timing sidechannel, no upstream fix):
+# not exploitable in nzbfast. The rsa crate is used solely for Spotnet
+# header SIGNATURE VERIFICATION with public keys (crates/nzbkit/src/
+# spot.rs) - the Marvin attack recovers private keys by timing
+# private-key operations (decryption/signing), which nzbfast never
+# performs. No private keys exist in the process. Re-evaluate if an
+# upstream fix ships or if rsa usage ever expands.
+ignore = ["RUSTSEC-2023-0071"]

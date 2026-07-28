@@ -1,0 +1,130 @@
+name: provenance-release
+
+# Build verifiable release binaries ON a GitHub-hosted runner, from the
+# public source, and attach a signed SLSA build-provenance attestation
+# to each - so anyone can confirm a downloaded binary was built from
+# this repository, without trusting the maintainers to hold any key.
+#
+# The attestation binds artifact-SHA256 -> this workflow @ commit ->
+# this repo, signed keyless via Sigstore (GitHub OIDC -> Fulcio cert ->
+# Rekor public transparency log). Verify with:
+#
+#     gh attestation verify <file> --repo nzbfast/nzbfast
+#
+# SCOPE: the per-target tar.gz binaries this workflow uploads
+# (nzbfast-<target-triple>.tar.gz). The platform installers (.dmg,
+# setup.exe) are packaged and signed through separate channels and are
+# not covered here.
+#
+# DISPATCH-ONLY: run from Actions -> provenance-release -> Run workflow
+# with the tag of an existing release to attach the artifacts to.
+#
+# The build happens at THAT TAG, not at the ref picked in the dispatch UI.
+# It used to be the other way round: the tag input only chose which release
+# received the artifacts, so dispatching from `main` with tag=v1.0.7 built
+# current main and uploaded it (with --clobber) over v1.0.7's assets. The
+# attestation stayed truthful about the commit it built, but the thing
+# ordinary downloaders rely on - that a release tag's binaries were built
+# from that tag - was silently false.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to attach attested binaries to (e.g. v1.0.5)"
+        required: true
+
+permissions:
+  id-token: write       # Sigstore keyless signing (OIDC identity token)
+  attestations: write   # write the attestation to the GH attestations API
+  contents: write       # attach artifacts to the release
+
+jobs:
+  binaries:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu }
+          - { os: macos-latest,  target: aarch64-apple-darwin }
+          - { os: macos-latest,  target: x86_64-apple-darwin }
+    runs-on: ${{ matrix.os }}
+    steps:
+      # Check out the TAG being attached to, so the binaries and the release
+      # they land on are the same source. `ref` is a tag name from the
+      # dispatch input, never interpolated into a shell line.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+
+      # Prove the checkout really is that tag before spending a build on it:
+      # a missing tag, or a ref that resolved to something else, must fail
+      # here rather than produce mislabelled assets.
+      - name: Verify the checkout matches the tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          want=$(git rev-parse "refs/tags/$TAG^{commit}")
+          have=$(git rev-parse HEAD)
+          if [ "$want" != "$have" ]; then
+            echo "checkout is $have but tag $TAG is $want" >&2
+            exit 1
+          fi
+          echo "building $TAG at $have"
+
+      # rust-toolchain.toml pins the exact rustc; just add the target.
+      # Do NOT `rustup update` - that would defeat the version pin.
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Cross toolchain (aarch64 linux)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++" >> "$GITHUB_ENV"
+
+      # --locked: build exactly the pinned dependency graph or fail.
+      # CARGO_INCREMENTAL=0 keeps codegen deterministic.
+      - name: Build
+        env:
+          CARGO_INCREMENTAL: "0"
+        run: cargo build --release --locked -p nzbfast --target ${{ matrix.target }}
+
+      - name: Package + checksum
+        run: |
+          BIN=target/${{ matrix.target }}/release/nzbfast
+          ART=nzbfast-${{ matrix.target }}.tar.gz
+          tar czf "$ART" -C "$(dirname "$BIN")" nzbfast
+          shasum -a 256 "$ART" > "$ART.sha256"
+
+      # THE provenance step: signs a SLSA statement over the artifact,
+      # publishes it to the repo's Attestations tab + the Rekor log.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: nzbfast-${{ matrix.target }}.tar.gz
+
+      # Attach to the existing release. Never touches the release notes.
+      # Target-triple filenames can't collide with the human-download
+      # assets (nzbfast-X.Y.Z-<platform>.*) on the same release.
+      - name: Attach to release
+        # inputs.tag flows through an env var, never interpolated directly
+        # into the shell line, so a crafted tag can't inject a command.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
+          TARGET: ${{ matrix.target }}
+        # No --clobber: re-running must not silently replace assets already
+        # published under this tag. Delete the old asset deliberately if a
+        # genuine re-upload is intended.
+        run: |
+          gh release upload "$TAG" \
+            "nzbfast-$TARGET.tar.gz" \
+            "nzbfast-$TARGET.tar.gz.sha256" \
+            --repo "$REPO"

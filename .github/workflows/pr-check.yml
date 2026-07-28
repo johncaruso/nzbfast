@@ -1,0 +1,43 @@
+# PR validation: build + test every pull request. Read-only, publishes
+# nothing (releases are cut by maintainers; release.yml stays disabled).
+name: pr-check
+on:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  build-and-test:
+    if: github.repository == 'nzbfast/nzbfast'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: test deps (par2 for repair e2e)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq par2
+      - name: cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: pr-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: build
+        run: cargo build --workspace --locked
+      - name: test
+        env:
+          NZBFAST_NO_ENRICH: "1"
+          # Opens an all-interfaces listener to prove the wide bind still
+          # reaches the LAN (NAS boxes and remote *arrs depend on it).
+          # Off by default because on a developer's macOS it means a
+          # firewall prompt on every rebuild; a Linux runner has no such
+          # prompt, so CI is where this belongs.
+          NZBFAST_LAN_TESTS: "1"
+        run: cargo test --workspace --locked
+      - name: fmt (advisory)
+        run: cargo fmt --all --check || echo "::warning::cargo fmt differences (not blocking)"

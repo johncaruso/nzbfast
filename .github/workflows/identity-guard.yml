@@ -1,0 +1,38 @@
+# Tripwire: direct pushes to this repo must carry the project's release
+# identity. Local hooks + publish tooling enforce this before push; this
+# is the after-the-fact alarm if anything slips through (a failed run
+# emails the repo owner).
+#
+# Contributor-aware since v1.0.1: pull-request commits keep their
+# authors' own identities (attribution is the point), and PR merges are
+# committed by GitHub itself. So the invariant is scoped to the
+# FIRST-PARENT line of history - the commits maintainers push directly -
+# which must be committed by the release identity or by GitHub's merge
+# machinery. Contributor commits live in PR subtrees and are exempt.
+name: commit-identity
+on: [push]
+
+# This job only reads history. Without a block it runs on the repository
+# default scope, which can be write-all.
+permissions:
+  contents: read
+
+jobs:
+  check:
+    # Public repo only - the private working repo has normal authorship.
+    if: github.repository == 'nzbfast/nzbfast'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: first-parent commits carry the release identity
+        run: |
+          ok='releases@nzbfast.com|noreply@github.com'
+          bad=$(git log --first-parent --pretty='%h %ce' | awk -v ok="$ok" '$2 !~ "^(" ok ")$"')
+          if [ -n "$bad" ]; then
+            echo "::error::direct commits with unexpected committer identity:"
+            echo "$bad"
+            exit 1
+          fi
+          echo "OK: $(git rev-list --first-parent --count HEAD) first-parent commits clean"

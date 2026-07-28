@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- E "chisel": flat-sided wedges instead of a thin zigzag. Each arm is a
+     broad triangle, so the mark is two heavy masses meeting at a shared
+     waist - the most downscale-tolerant way to draw a bolt. Reads as a
+     bolt at 128 px and as a confident diagonal at 16 px, which is the most
+     any mark can do at that size. -->
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs><linearGradient id="t" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#5aa8ff"/><stop offset="1" stop-color="#6d47e6"/>
+  </linearGradient></defs>
+  <rect x="60" y="60" width="904" height="904" rx="196" fill="url(#t)"/>
+  <path d="M 716 128 L 320 566 L 512 566 L 512 470 Z" fill="#fff"/>
+  <path d="M 396 896 L 792 458 L 600 458 L 600 554 Z" fill="#fff"/>
+  <path d="M 512 470 L 600 458 L 600 554 L 512 566 Z" fill="#fff"/>
+</svg>

@@ -1,0 +1,1053 @@
+//! Spotnet spot ingestion (design: M14j) - the decentralized index where
+//! usenet itself carries the metadata. Spots live in `free.pt` headers: the
+//! whole record is smuggled into the From address (category, size, RSA
+//! modulus + signature - all visible via OVER without fetching bodies), the
+//! full spot XML rides in `X-XML` continuation headers, and the NZB payload
+//! is posted to `alt.binaries.ftd` as deflated, escape-armored text chunks.
+//!
+//! Wire format (per the competitor survey / spotweb's
+//! `Services_Format_Parsing.php` + `Services_Signing_Base.php`):
+//!
+//! ```text
+//! From: [Nickname] <[modulus].[signature]@[cat][keyid][subcats].[size].
+//!        [random].[date].[custom-id].[custom-value].[server-signature]>
+//! ```
+//!
+//! - base64 fields use a URL-safe variant: `/`→`-s`, `+`→`-p`, `=` stripped.
+//! - The user signature is RSA PKCS#1 v1.5 / SHA-1 over
+//!   `title + header-without-server-signature + poster` (raw bytes - the
+//!   ISO-8859-1 gotcha: never re-encode).
+//! - Key-id 7 (self-signed keys) additionally requires the V2 hashcash
+//!   proof-of-work: sha1(message-id) starts with hex `0000`. Per spotweb we
+//!   verify the signature strictly but treat hashcash failure as a warning
+//!   flag, not a rejection.
+//! - The NZB payload is raw-deflated then escape-armored: NUL→`=A`,
+//!   CR→`=B`, LF→`=C`, `=`→`=D`.
+//!
+//! Defensive limits (copied from spotweb): From records over 8 KB and spot
+//! XML over 50 KB are rejected outright; inflated NZBs cap at 32 MB.
+
+use std::io::Read;
+
+use sha1::{Digest, Sha1};
+
+use crate::index::{Index, Spot};
+use crate::nntp::Connection;
+
+/// From-record hard cap: anything bigger is garbage or an attack.
+const MAX_FROM_RECORD: usize = 8 * 1024;
+/// Spot XML hard cap (spotweb's X-XML limit).
+const MAX_SPOT_XML: usize = 50 * 1024;
+/// Inflated NZB payload cap.
+const MAX_NZB_INFLATED: u64 = 32 * 1024 * 1024;
+
+#[derive(Debug, thiserror::Error)]
+pub enum SpotError {
+    #[error("nntp: {0}")]
+    Nntp(#[from] crate::nntp::NntpError),
+    #[error("db: {0}")]
+    Db(#[from] rusqlite::Error),
+    #[error("{0}")]
+    Spot(String),
+}
+
+fn err(msg: impl Into<String>) -> SpotError {
+    SpotError::Spot(msg.into())
+}
+
+// ---------------------------------------------------------------------------
+// From-header record
+// ---------------------------------------------------------------------------
+
+/// A parsed spot From-header record.
+#[derive(Debug, Clone)]
+pub struct SpotHeader {
+    /// Poster nickname (the display-name part before `<`).
+    pub poster: String,
+    /// RSA public-key modulus, big-endian bytes (exponent is always 65537).
+    pub modulus: Vec<u8>,
+    /// PKCS#1 v1.5 signature bytes.
+    pub signature: Vec<u8>,
+    /// Category digit as posted (1-based, matching the XML `<Category>`).
+    pub category: u8,
+    /// Key regime: 1–6 are the distributed Spotnet keys, 7 is self-signed.
+    pub key_id: u8,
+    /// Subcategory runs, e.g. `["a09", "b04"]`.
+    pub subcats: Vec<String>,
+    pub size: u64,
+    /// Unix timestamp from the record.
+    pub date: i64,
+    pub custom_id: String,
+    pub custom_value: String,
+    /// The portion after `@` minus the trailing server-signature field -
+    /// the exact bytes covered by the user signature.
+    pub signed_part: String,
+}
+
+/// Parse a spot From header. Returns `None` on anything malformed or
+/// oversized - never panics, tolerates arbitrary garbage.
+pub fn parse_spot_from(from_header: &str) -> Option<SpotHeader> {
+    if from_header.len() > MAX_FROM_RECORD {
+        return None;
+    }
+    let lt = from_header.find('<')?;
+    let gt = from_header.rfind('>')?;
+    if gt <= lt {
+        return None;
+    }
+    let poster = from_header[..lt].trim().trim_matches('"').to_string();
+    let inner = &from_header[lt + 1..gt];
+    let (user_part, header) = inner.split_once('@')?;
+    let (mod_s, sig_s) = user_part.split_once('.')?;
+    let modulus = spot_b64_decode(mod_s)?;
+    let signature = spot_b64_decode(sig_s)?;
+    if modulus.is_empty() || signature.is_empty() {
+        return None;
+    }
+
+    // [cat][keyid][subcats].[size].[random].[date].[custom-id].[custom-value]
+    // .[server-signature]
+    let fields: Vec<&str> = header.split('.').collect();
+    if fields.len() < 6 {
+        return None;
+    }
+    // The user signature covers everything up to (not including) the final
+    // server-signature field.
+    let signed_part = if fields.len() >= 7 {
+        &header[..header.rfind('.')?]
+    } else {
+        header
+    };
+
+    let mut chars = fields[0].chars();
+    let category = chars.next()?.to_digit(10)? as u8;
+    let key_id = chars.next()?.to_digit(10)? as u8;
+    let subcats = parse_subcats(chars.as_str())?;
+    let size = fields[1].parse().ok()?;
+    let date = fields[3].parse().ok()?;
+
+    Some(SpotHeader {
+        poster,
+        modulus,
+        signature,
+        category,
+        key_id,
+        subcats,
+        size,
+        date,
+        custom_id: fields[4].to_string(),
+        custom_value: fields[5].to_string(),
+        signed_part: signed_part.to_string(),
+    })
+}
+
+/// Subcats are letter+digit runs concatenated: `a09b04` → `["a09","b04"]`.
+fn parse_subcats(s: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for c in s.chars() {
+        if c.is_ascii_alphabetic() {
+            if !cur.is_empty() {
+                if cur.len() < 2 {
+                    return None; // a letter with no digits
+                }
+                out.push(std::mem::take(&mut cur));
+            }
+            cur.push(c.to_ascii_lowercase());
+        } else if c.is_ascii_digit() {
+            if cur.is_empty() {
+                return None; // digits before any letter
+            }
+            cur.push(c);
+        } else {
+            return None;
+        }
+    }
+    if !cur.is_empty() {
+        if cur.len() < 2 {
+            return None;
+        }
+        out.push(cur);
+    }
+    Some(out)
+}
+
+// ---------------------------------------------------------------------------
+// Signature + hashcash verification
+// ---------------------------------------------------------------------------
+
+/// Result of [`verify_spot`]: signature strictly, hashcash as a warning.
+#[derive(Debug, Clone, Copy)]
+pub struct SpotVerify {
+    pub signature_ok: bool,
+    /// `false` only for key-id 7 spots whose message-id fails the V2
+    /// hashcash proof-of-work - a warning flag, never a rejection.
+    pub hashcash_ok: bool,
+}
+
+/// Verify a spot header: RSA PKCS#1 v1.5 / SHA-1 over
+/// `title + signed_part + poster` against the embedded modulus (e = 65537),
+/// plus the V2 hashcash check for self-signed (key-id 7) spots:
+/// sha1(message-id) must start with hex `0000`.
+pub fn verify_spot(header: &SpotHeader, title: &str, message_id: &str) -> SpotVerify {
+    let signature_ok = (|| {
+        let n = rsa::BigUint::from_bytes_be(&header.modulus);
+        let e = rsa::BigUint::from(65537u32);
+        let key = rsa::RsaPublicKey::new(n, e).ok()?;
+        let mut h = Sha1::new();
+        h.update(title.as_bytes());
+        h.update(header.signed_part.as_bytes());
+        h.update(header.poster.as_bytes());
+        let digest = h.finalize();
+        key.verify(rsa::Pkcs1v15Sign::new::<Sha1>(), &digest, &header.signature)
+            .ok()
+    })()
+    .is_some();
+
+    let hashcash_ok = if header.key_id == 7 {
+        let d = Sha1::digest(normalize_msgid(message_id).as_bytes());
+        d[0] == 0 && d[1] == 0
+    } else {
+        true
+    };
+
+    SpotVerify {
+        signature_ok,
+        hashcash_ok,
+    }
+}
+
+/// Spotter id: base64 of the big-endian crc32 of the modulus bytes, with
+/// `=`, `/` and `+` stripped (spotweb's `calculateSpotterId`).
+pub fn spotter_id(modulus_bytes: &[u8]) -> String {
+    let crc = crc32fast::hash(modulus_bytes);
+    b64_encode(&crc.to_be_bytes())
+        .chars()
+        .filter(|c| !matches!(c, '=' | '/' | '+'))
+        .collect()
+}
+
+fn normalize_msgid(id: &str) -> String {
+    let id = id.trim();
+    if id.starts_with('<') {
+        id.to_string()
+    } else {
+        format!("<{id}>")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// base64 (standard alphabet + the Spotnet URL-safe variant)
+// ---------------------------------------------------------------------------
+
+/// Decode Spotnet's URL-safe base64: `-s`→`/`, `-p`→`+`, padding stripped.
+pub fn spot_b64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut std = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '-' {
+            match chars.next() {
+                Some('s') => std.push('/'),
+                Some('p') => std.push('+'),
+                _ => return None,
+            }
+        } else {
+            std.push(c);
+        }
+    }
+    let std = std.trim_end_matches('=').to_string();
+    b64_decode(&std)
+}
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn b64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(B64[(n >> 18) as usize & 63] as char);
+        out.push(B64[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            B64[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Standard base64 decode, tolerant of missing padding.
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let s = s.trim_end_matches('=').as_bytes();
+    if s.len() % 4 == 1 {
+        return None; // impossible length
+    }
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    for chunk in s.chunks(4) {
+        let mut n = 0u32;
+        for (i, &c) in chunk.iter().enumerate() {
+            n |= val(c)? << (18 - 6 * i);
+        }
+        out.push((n >> 16) as u8);
+        if chunk.len() > 2 {
+            out.push((n >> 8) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
+// ---------------------------------------------------------------------------
+// NZB payload armor: special-zip escaping + raw deflate
+// ---------------------------------------------------------------------------
+
+/// Reverse the spot payload armor: un-escape `=A`/`=B`/`=C`/`=D` →
+/// NUL/CR/LF/`=`, then inflate (raw deflate first, zlib-wrapped fallback -
+/// posters disagree). `None` on corrupt data or output over the 32 MB cap.
+pub fn unspecial_zip(data: &[u8]) -> Option<Vec<u8>> {
+    let mut raw = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        let b = data[i];
+        if b == b'=' && i + 1 < data.len() {
+            let mapped = match data[i + 1] {
+                b'A' => Some(0),
+                b'B' => Some(b'\r'),
+                b'C' => Some(b'\n'),
+                b'D' => Some(b'='),
+                _ => None, // tolerate stray '=' literally
+            };
+            if let Some(m) = mapped {
+                raw.push(m);
+                i += 2;
+                continue;
+            }
+        }
+        raw.push(b);
+        i += 1;
+    }
+    inflate_capped(&raw)
+}
+
+fn inflate_capped(raw: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let ok = flate2::read::DeflateDecoder::new(raw)
+        .take(MAX_NZB_INFLATED + 1)
+        .read_to_end(&mut out)
+        .is_ok();
+    if !(ok && !out.is_empty()) {
+        out.clear();
+        let ok = flate2::read::ZlibDecoder::new(raw)
+            .take(MAX_NZB_INFLATED + 1)
+            .read_to_end(&mut out)
+            .is_ok();
+        if !(ok && !out.is_empty()) {
+            return None;
+        }
+    }
+    (out.len() as u64 <= MAX_NZB_INFLATED).then_some(out)
+}
+
+/// Forward armor (raw deflate + escape) - used by tests and, later, spot
+/// posting.
+pub fn special_zip(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut enc =
+        flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(data).expect("deflate to memory");
+    let deflated = enc.finish().expect("deflate to memory");
+    let mut out = Vec::with_capacity(deflated.len() + deflated.len() / 8);
+    for &b in &deflated {
+        match b {
+            0 => out.extend_from_slice(b"=A"),
+            b'\r' => out.extend_from_slice(b"=B"),
+            b'\n' => out.extend_from_slice(b"=C"),
+            b'=' => out.extend_from_slice(b"=D"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Spot XML (string-scan; spot XML in the wild is often broken - no XML dep)
+// ---------------------------------------------------------------------------
+
+/// The interesting parts of a full spot's XML payload.
+#[derive(Debug, Clone, Default)]
+pub struct SpotXml {
+    pub title: String,
+    pub description: String,
+    pub poster: String,
+    pub category: u32,
+    /// Raw `<Sub>` values, e.g. `["01a09", "01b04"]`.
+    pub subcats: Vec<String>,
+    pub size: u64,
+    /// NZB payload segment message-ids (no angle brackets), in order.
+    pub nzb_segments: Vec<String>,
+}
+
+/// Tolerant string-scan parse of the spot XML. Returns `None` only when the
+/// payload is oversized or has no `<Title>` at all.
+pub fn parse_spot_xml(xml: &str) -> Option<SpotXml> {
+    if xml.len() > MAX_SPOT_XML {
+        return None;
+    }
+    let title = xml_unescape(tag_text(xml, "Title")?);
+    let description = tag_text(xml, "Description")
+        .map(xml_unescape)
+        .unwrap_or_default();
+    let poster = tag_text(xml, "Poster").map(xml_unescape).unwrap_or_default();
+    let cat_scope = tag_text(xml, "Category").unwrap_or("");
+    let category = cat_scope
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0);
+    let subcats = all_tag_texts(cat_scope, "Sub")
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .collect();
+    let size = tag_text(xml, "Size")
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    let nzb_segments = all_tag_texts(tag_text(xml, "NZB").unwrap_or(""), "Segment")
+        .into_iter()
+        .map(|s| xml_unescape(s.trim()))
+        .filter(|s| !s.is_empty())
+        .collect();
+    Some(SpotXml {
+        title,
+        description,
+        poster,
+        category,
+        subcats,
+        size,
+        nzb_segments,
+    })
+}
+
+/// First `<tag>…</tag>` inner text (attributes on the open tag tolerated).
+fn tag_text<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+    let mut search = 0;
+    let open = format!("<{tag}");
+    loop {
+        let p = search + xml[search..].find(&open)?;
+        let after = p + open.len();
+        // Must be followed by '>' or whitespace+attrs, not a longer tag name.
+        match xml[after..].chars().next() {
+            Some('>') => {
+                let start = after + 1;
+                let end = start + xml[start..].find(&format!("</{tag}>"))?;
+                return Some(&xml[start..end]);
+            }
+            Some(c) if c.is_whitespace() => {
+                let gt = after + xml[after..].find('>')?;
+                if xml[after..gt].ends_with('/') {
+                    return None; // self-closing
+                }
+                let start = gt + 1;
+                let end = start + xml[start..].find(&format!("</{tag}>"))?;
+                return Some(&xml[start..end]);
+            }
+            _ => search = after, // e.g. <NZBx…> while looking for <NZB>
+        }
+    }
+}
+
+/// All `<tag>…</tag>` inner texts within `scope`, in order.
+fn all_tag_texts<'a>(scope: &'a str, tag: &str) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut rest = scope;
+    while let Some(inner) = tag_text(rest, tag) {
+        out.push(inner);
+        // Advance past this close tag.
+        let close = format!("</{tag}>");
+        let end = inner.as_ptr() as usize - rest.as_ptr() as usize + inner.len() + close.len();
+        if end >= rest.len() {
+            break;
+        }
+        rest = &rest[end..];
+    }
+    out
+}
+
+fn xml_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(p) = rest.find('&') {
+        out.push_str(&rest[..p]);
+        let tail = &rest[p..];
+        let known = [
+            ("&amp;", '&'),
+            ("&lt;", '<'),
+            ("&gt;", '>'),
+            ("&quot;", '"'),
+            ("&apos;", '\''),
+        ];
+        if let Some((ent, ch)) = known.iter().find(|(e, _)| tail.starts_with(e)) {
+            out.push(*ch);
+            rest = &tail[ent.len()..];
+        } else if let Some(semi) = tail
+            .as_bytes()[..tail.len().min(8)]
+            .iter()
+            .position(|&b| b == b';')
+        {
+            // Byte scan, not a &str slice: index 8 of attacker-supplied
+            // XML can split a multi-byte char and panic.
+            // &#NN; / &#xNN;
+            let body = &tail[1..semi];
+            let code = body
+                .strip_prefix("#x")
+                .or_else(|| body.strip_prefix("#X"))
+                .and_then(|h| u32::from_str_radix(h, 16).ok())
+                .or_else(|| body.strip_prefix('#').and_then(|d| d.parse().ok()));
+            match code.and_then(char::from_u32) {
+                Some(c) => out.push(c),
+                None => out.push_str(&tail[..semi + 1]),
+            }
+            rest = &tail[semi + 1..];
+        } else {
+            out.push('&');
+            rest = &tail[1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Scanner: OVER-pass over a spot group (header-only, no bodies)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SpotScanSummary {
+    /// OVER entries examined.
+    pub scanned: u64,
+    /// Parsed + signature-verified spots.
+    pub valid: u64,
+    /// Failed to parse or failed signature verification.
+    pub invalid: u64,
+    /// Valid spots newly inserted (not already in the DB).
+    pub new: u64,
+    /// Valid key-id-7 spots whose hashcash PoW failed (warning only).
+    pub hashcash_warn: u64,
+}
+
+/// Incremental OVER scan of a Spotnet group into the index DB. Resumes from
+/// the stored high-water mark (keyed `spots:<group>` so it never collides
+/// with a release-index scan of the same group).
+pub async fn scan_spots(
+    conn: &mut Connection,
+    ix: &mut Index,
+    group: &str,
+    backfill: u64,
+) -> Result<SpotScanSummary, SpotError> {
+    let g = conn.group(group).await?;
+    let mark_key = format!("spots:{group}");
+    let mark = ix.high_water(&mark_key);
+    // Article numbers come from the untrusted GROUP line; saturating math plus a
+    // break on the final chunk stop a near-u64::MAX `high` from overflowing
+    // (debug panic; in release it wraps to 0, rescans forever, and persists a
+    // poisoned high-water mark that re-triggers next run).
+    let mut low = if mark > 0 {
+        mark.saturating_add(1)
+    } else {
+        g.high.saturating_sub(backfill).max(g.low)
+    };
+    let mut sum = SpotScanSummary::default();
+    while low <= g.high {
+        let hi = low.saturating_add(9_999).min(g.high);
+        let entries = conn.over(low, hi).await?;
+        for e in &entries {
+            sum.scanned += 1;
+            let Some(h) = parse_spot_from(&e.from) else {
+                sum.invalid += 1;
+                continue;
+            };
+            let v = verify_spot(&h, &e.subject, &e.message_id);
+            if !v.signature_ok {
+                sum.invalid += 1;
+                continue;
+            }
+            sum.valid += 1;
+            if !v.hashcash_ok {
+                sum.hashcash_warn += 1;
+            }
+            let spot = Spot {
+                id: 0,
+                msgid: e.message_id.clone(),
+                title: e.subject.clone(),
+                category: h.category,
+                subcats: h.subcats.join(","),
+                size: h.size,
+                date: h.date,
+                spotter_id: spotter_id(&h.modulus),
+                verified: true,
+                hashcash_ok: v.hashcash_ok,
+                nzb_msgids: Vec::new(),
+            };
+            if ix.insert_spot(&spot)? {
+                sum.new += 1;
+            }
+        }
+        ix.set_high_water(&mark_key, hi)?;
+        if hi >= g.high {
+            break;
+        }
+        low = hi + 1;
+    }
+    Ok(sum)
+}
+
+// ---------------------------------------------------------------------------
+// Fetch: full spot (X-XML headers) → NZB payload articles → NZB bytes
+// ---------------------------------------------------------------------------
+
+/// Fetch a spot's full XML (concatenated `X-XML` continuation headers, body
+/// fallback for ancient spots) and its NZB payload (armored deflate chunks
+/// posted to alt.binaries.ftd), returning the parsed XML and the inflated
+/// NZB bytes.
+pub async fn fetch_spot_nzb(
+    conn: &mut Connection,
+    msgid: &str,
+) -> Result<(SpotXml, Vec<u8>), SpotError> {
+    let mid = normalize_msgid(msgid);
+    let head = conn
+        .head(&mid)
+        .await?
+        .ok_or_else(|| err(format!("spot article {mid} not found")))?;
+    let mut xml = xml_from_headers(&head);
+    if xml.is_empty() {
+        // Pre-X-XML spots carry the XML in the article body.
+        let body = conn
+            .body(&mid)
+            .await?
+            .ok_or_else(|| err(format!("spot article {mid} has no body")))?;
+        xml = String::from_utf8_lossy(&unstuff(&body, false)).into_owned();
+    }
+    if xml.len() > MAX_SPOT_XML {
+        return Err(err(format!("spot XML exceeds the {MAX_SPOT_XML} byte cap")));
+    }
+    let sx = parse_spot_xml(&xml).ok_or_else(|| err("unparseable spot XML"))?;
+    if sx.nzb_segments.is_empty() {
+        return Err(err("spot XML lists no NZB segments"));
+    }
+
+    let mut packed = Vec::new();
+    for seg in &sx.nzb_segments {
+        let sid = normalize_msgid(seg);
+        let body = conn
+            .body(&sid)
+            .await?
+            .ok_or_else(|| err(format!("NZB payload segment {sid} missing")))?;
+        // The armor escapes every real CR/LF, so any newlines on the wire
+        // are transport line-wrapping - strip them all.
+        packed.extend_from_slice(&unstuff(&body, true));
+        // Cap the COMPRESSED payload too: MAX_NZB_INFLATED only bounds the
+        // inflate output (checked after the whole payload is resident), so
+        // without this a hostile spot listing thousands of large garbage
+        // segments buffers gigabytes in RAM before inflation ever runs.
+        if packed.len() as u64 > MAX_NZB_INFLATED {
+            return Err(err(format!(
+                "spot NZB payload exceeds the {MAX_NZB_INFLATED} byte cap"
+            )));
+        }
+    }
+    let nzb = unspecial_zip(&packed).ok_or_else(|| err("could not inflate the NZB payload"))?;
+    Ok((sx, nzb))
+}
+
+/// Concatenate the values of every `X-XML:` header (in order). Spotweb eats
+/// exactly one space after the colon; so do we.
+fn xml_from_headers(raw: &[u8]) -> String {
+    let mut xml = String::new();
+    for line in raw.split_inclusive(|&b| b == b'\n') {
+        let line = if line.first() == Some(&b'.') {
+            &line[1..]
+        } else {
+            line
+        };
+        let text = String::from_utf8_lossy(line);
+        let t = text.trim_end_matches(['\r', '\n']);
+        // Byte compare: t[..6] on a header whose byte 6 splits a
+        // multi-byte char panics (attacker-controlled HEAD line). If the
+        // first 6 bytes match the ASCII prefix, 6 is a char boundary.
+        if t.len() >= 6 && t.as_bytes()[..6].eq_ignore_ascii_case(b"x-xml:") {
+            let v = &t[6..];
+            xml.push_str(v.strip_prefix(' ').unwrap_or(v));
+        }
+    }
+    xml
+}
+
+/// Undo NNTP dot-stuffing; optionally strip all line terminators.
+fn unstuff(raw: &[u8], strip_newlines: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    for line in raw.split_inclusive(|&b| b == b'\n') {
+        let line = if line.first() == Some(&b'.') {
+            &line[1..]
+        } else {
+            line
+        };
+        if strip_newlines {
+            let mut end = line.len();
+            while end > 0 && (line[end - 1] == b'\r' || line[end - 1] == b'\n') {
+                end -= 1;
+            }
+            out.extend_from_slice(&line[..end]);
+        } else {
+            out.extend_from_slice(line);
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    use rsa::traits::PublicKeyParts;
+    use rsa::{RsaPrivateKey, RsaPublicKey};
+
+    use crate::mock::{Chaos, MockServer, OverRow};
+
+    /// Fixed small key: 512-bit keygen keeps the suite fast; PKCS#1 v1.5
+    /// with SHA-1 needs only 368+ bits.
+    fn test_key() -> RsaPrivateKey {
+        RsaPrivateKey::new(&mut rand::thread_rng(), 512).expect("keygen")
+    }
+
+    /// Spotnet-encode base64: strip padding, `/`→`-s`, `+`→`-p`.
+    fn spot_b64_encode(data: &[u8]) -> String {
+        b64_encode(data)
+            .trim_end_matches('=')
+            .replace('/', "-s")
+            .replace('+', "-p")
+    }
+
+    struct TestSpot {
+        from: String,
+        msgid: String,
+        title: String,
+        modulus: Vec<u8>,
+    }
+
+    /// Build a fully signed spot: header record, PKCS#1 v1.5/SHA-1 user
+    /// signature, and a hashcash-mined message-id (16 bits - fast).
+    fn make_spot(key: &RsaPrivateKey, title: &str, key_id: u8, mine: bool) -> TestSpot {
+        let poster = "TestPoster";
+        let modulus = RsaPublicKey::from(key).n().to_bytes_be();
+        // [cat][keyid][subcats].[size].[random].[date].[custom-id].[custom-value]
+        let signed_part = format!("1{key_id}a09b04.1048576.31337.1700000000.0.0");
+        let mut h = Sha1::new();
+        h.update(title.as_bytes());
+        h.update(signed_part.as_bytes());
+        h.update(poster.as_bytes());
+        let digest = h.finalize();
+        let sig = key
+            .sign(rsa::Pkcs1v15Sign::new::<Sha1>(), &digest)
+            .expect("sign");
+        let from = format!(
+            "{poster} <{}.{}@{signed_part}.{}>",
+            spot_b64_encode(&modulus),
+            spot_b64_encode(&sig),
+            spot_b64_encode(b"server-signature-not-checked"),
+        );
+        let msgid = if mine {
+            // Mine the V2 hashcash: sha1("<...>") starts with 0x0000.
+            (0u64..)
+                .map(|i| format!("<spot{i}@spot.net>"))
+                .find(|m| {
+                    let d = Sha1::digest(m.as_bytes());
+                    d[0] == 0 && d[1] == 0
+                })
+                .unwrap()
+        } else {
+            "<unmined@spot.net>".to_string()
+        };
+        TestSpot {
+            from,
+            msgid,
+            title: title.to_string(),
+            modulus,
+        }
+    }
+
+    #[test]
+    fn parse_verify_spotter_roundtrip() {
+        let key = test_key();
+        let spot = make_spot(&key, "Test Title", 7, true);
+
+        let h = parse_spot_from(&spot.from).expect("parse");
+        assert_eq!(h.poster, "TestPoster");
+        assert_eq!(h.category, 1);
+        assert_eq!(h.key_id, 7);
+        assert_eq!(h.subcats, vec!["a09", "b04"]);
+        assert_eq!(h.size, 1_048_576);
+        assert_eq!(h.date, 1_700_000_000);
+        assert_eq!(h.modulus, spot.modulus);
+
+        let v = verify_spot(&h, &spot.title, &spot.msgid);
+        assert!(v.signature_ok && v.hashcash_ok);
+
+        // Tampered title → signature fails.
+        let v = verify_spot(&h, "Evil Title", &spot.msgid);
+        assert!(!v.signature_ok);
+
+        // Unmined message-id → warning flag only, signature still fine.
+        let unmined = make_spot(&key, "Test Title", 7, false);
+        let h2 = parse_spot_from(&unmined.from).unwrap();
+        let v = verify_spot(&h2, &unmined.title, &unmined.msgid);
+        assert!(v.signature_ok && !v.hashcash_ok);
+
+        // Non-self-signed regimes skip hashcash entirely.
+        let k1 = make_spot(&key, "Test Title", 1, false);
+        let h3 = parse_spot_from(&k1.from).unwrap();
+        let v = verify_spot(&h3, &k1.title, &k1.msgid);
+        assert!(v.signature_ok && v.hashcash_ok);
+
+        // Spotter id is deterministic and stripped of /+=.
+        let sid = spotter_id(&spot.modulus);
+        assert!(!sid.is_empty());
+        assert!(sid.chars().all(|c| !matches!(c, '/' | '+' | '=')));
+        assert_eq!(sid, spotter_id(&spot.modulus));
+    }
+
+    #[test]
+    fn spotter_id_known_value() {
+        // crc32("abc") = 0x352441c2 → base64(35 24 41 c2) = "NSRBwg==".
+        assert_eq!(spotter_id(b"abc"), "NSRBwg");
+    }
+
+    #[test]
+    fn malformed_from_headers_never_panic() {
+        let key = test_key();
+        let good = make_spot(&key, "T", 7, false).from;
+        let cases: Vec<String> = vec![
+            String::new(),
+            "no brackets at all".into(),
+            "nick <>".into(),
+            "nick <mod.sig>".into(),                       // no @
+            "nick <modsig@17a09.1.2.3.4.5.6>".into(),      // no '.' in user part
+            "nick <!!!.???@17a09.1.2.3.4.5.6>".into(),     // bad base64
+            "nick <QUJD.QUJD@x7a09.1.2.3.4.5.6>".into(),   // non-digit category
+            "nick <QUJD.QUJD@1xa09.1.2.3.4.5.6>".into(),   // non-digit key-id
+            "nick <QUJD.QUJD@1709x.1.2.3.4.5.6>".into(),   // garbage subcats
+            "nick <QUJD.QUJD@17a09.NaN.2.3.4.5.6>".into(), // bad size
+            "nick <QUJD.QUJD@17a09.1.2.NaN.4.5.6>".into(), // bad date
+            "nick <QUJD.QUJD@17a09.1.2>".into(),           // truncated fields
+            good[..good.len() / 2].to_string(),            // truncated record
+            format!("nick <{}.QUJD@17a09.1.2.3.4.5.6>", "QUJD".repeat(3000)), // >8KB
+            "nick > reversed < QUJD.QUJD@17a09.1.2.3.4.5.6".into(),
+            "nick <-x.QUJD@17a09.1.2.3.4.5.6>".into(),     // bad -x escape
+        ];
+        for c in &cases {
+            assert!(
+                parse_spot_from(c).is_none(),
+                "should reject: {}",
+                &c[..c.len().min(80)]
+            );
+        }
+        // And the good one still parses (guard against over-tightening),
+        // including with trailing comment junk after the closing bracket.
+        assert!(parse_spot_from(&good).is_some());
+        assert!(parse_spot_from(&format!("{good} (comment)")).is_some());
+    }
+
+    #[test]
+    fn special_zip_roundtrip() {
+        // Cover every escaped byte class plus plain data.
+        let mut data = b"<nzb>\r\n\0 = test</nzb>".to_vec();
+        data.extend((0u8..=255).cycle().take(4096));
+        let packed = special_zip(&data);
+        assert!(
+            !packed.iter().any(|&b| matches!(b, 0 | b'\r' | b'\n')),
+            "armor must not contain NUL/CR/LF"
+        );
+        assert_eq!(unspecial_zip(&packed).unwrap(), data);
+
+        // zlib-wrapped variant is accepted too.
+        use std::io::Write;
+        let mut enc =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&data).unwrap();
+        let zlib = enc.finish().unwrap();
+        let escaped: Vec<u8> = zlib
+            .iter()
+            .flat_map(|&b| match b {
+                0 => b"=A".to_vec(),
+                b'\r' => b"=B".to_vec(),
+                b'\n' => b"=C".to_vec(),
+                b'=' => b"=D".to_vec(),
+                other => vec![other],
+            })
+            .collect();
+        assert_eq!(unspecial_zip(&escaped).unwrap(), data);
+
+        // Garbage doesn't inflate.
+        assert!(unspecial_zip(b"definitely not deflate").is_none());
+        assert!(unspecial_zip(b"").is_none());
+    }
+
+    /// Char-boundary hardening on attacker-controlled text: neither the
+    /// entity scanner (fixed 8-byte lookahead) nor the X-XML header
+    /// prefix check (fixed 6-byte slice) may panic on multi-byte chars
+    /// straddling those offsets.
+    #[test]
+    fn non_ascii_never_panics_boundary_slices() {
+        // '€' (3 bytes) straddling the 8-byte entity lookahead boundary:
+        // tail = "&xxxxx€y;b" puts byte 8 mid-char - the old &str slice
+        // panicked here.
+        assert_eq!(xml_unescape("a&xxxxx€y;b"), "a&xxxxx€y;b");
+        assert_eq!(xml_unescape("&€;"), "&€;");
+        // Header line whose byte 6 splits the '€' - and a valid one.
+        let raw = b"abcd\xe2\x82\xacf: nope\r\nX-XML: <a/>\r\n";
+        assert_eq!(xml_from_headers(raw), "<a/>");
+    }
+
+    #[test]
+    fn spot_xml_parsing() {
+        let xml = "<?xml version=\"1.0\" encoding=\"utf-8\"?><Spotnet><Posting>\
+            <Key>7</Key><Created>1700000000</Created><Poster>Nick</Poster>\
+            <Title>Great &amp; Small &#33;</Title>\
+            <Description>Multi&lt;br&gt;line</Description>\
+            <Image Width=\"10\" Height=\"10\"><Segment>img@ftd</Segment></Image>\
+            <Size>12345</Size>\
+            <Category>01<Sub>01a09</Sub><Sub>01b04</Sub></Category>\
+            <NZB><Segment>seg1@ftd</Segment><Segment>seg2@ftd</Segment></NZB>\
+            </Posting></Spotnet>";
+        let sx = parse_spot_xml(xml).unwrap();
+        assert_eq!(sx.title, "Great & Small !");
+        assert_eq!(sx.description, "Multi<br>line");
+        assert_eq!(sx.poster, "Nick");
+        assert_eq!(sx.category, 1);
+        assert_eq!(sx.subcats, vec!["01a09", "01b04"]);
+        assert_eq!(sx.size, 12345);
+        // The <Image> segment must NOT leak into the NZB segment list.
+        assert_eq!(sx.nzb_segments, vec!["seg1@ftd", "seg2@ftd"]);
+
+        // Broken XML tolerated as long as a Title exists.
+        let broken = "<Title>Still here</Title><NZB><Segment>a@b</Segment>";
+        let sx = parse_spot_xml(broken).unwrap();
+        assert_eq!(sx.title, "Still here");
+        assert!(sx.nzb_segments.is_empty()); // unclosed NZB scope → none
+
+        // No title → None; oversized → None.
+        assert!(parse_spot_xml("<NZB></NZB>").is_none());
+        let big = format!("<Title>x</Title>{}", "y".repeat(MAX_SPOT_XML));
+        assert!(parse_spot_xml(&big).is_none());
+    }
+
+    /// Full pipeline against the mock NNTP server: OVER scan → SQLite →
+    /// search → HEAD (X-XML) → payload BODYs → byte-identical NZB.
+    #[tokio::test]
+    async fn spot_e2e_scan_search_get() {
+        let key = test_key();
+        let title = "Ubuntu 26.04 LTS amd64 DVD";
+        let spot = make_spot(&key, title, 7, true);
+
+        // The NZB payload: armored deflate split across two ftd articles.
+        let nzb_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+            <nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file \
+            poster=\"p@x\" date=\"0\" subject=\"&quot;ubuntu.iso&quot; yEnc \
+            (1/1)\">\n    <groups><group>alt.binaries.ftd</group></groups>\n\
+            \x20   <segments>\n      <segment bytes=\"1000\" number=\"1\">\
+            data1@x</segment>\n    </segments>\n  </file>\n</nzb>\n";
+        let packed = special_zip(nzb_xml.as_bytes());
+        let cut = packed.len() / 2; // safe: unescape happens after re-concat
+        let mut articles = HashMap::new();
+        let seg_ids = ["nzbseg1@ftd", "nzbseg2@ftd"];
+        for (id, chunk) in seg_ids.iter().zip([&packed[..cut], &packed[cut..]]) {
+            let mut body = chunk.to_vec();
+            body.extend_from_slice(b"\r\n");
+            articles.insert(format!("<{id}>"), body);
+        }
+
+        // The spot article: headers only, XML split across X-XML lines.
+        let spot_xml = format!(
+            "<Spotnet><Posting><Title>{title}</Title><Size>1048576</Size>\
+             <Category>01<Sub>01a09</Sub></Category><NZB>\
+             <Segment>{}</Segment><Segment>{}</Segment></NZB>\
+             </Posting></Spotnet>",
+            seg_ids[0], seg_ids[1]
+        );
+        let mut head = format!("From: {}\r\nSubject: {title}\r\n", spot.from);
+        for chunk in spot_xml.as_bytes().chunks(60) {
+            head.push_str(&format!("X-XML: {}\r\n", std::str::from_utf8(chunk).unwrap()));
+        }
+        let headers = HashMap::from([(spot.msgid.clone(), head.into_bytes())]);
+        let overview = vec![OverRow {
+            number: 1,
+            subject: title.to_string(),
+            from: spot.from.clone(),
+            message_id: spot.msgid.clone(),
+            bytes: 500,
+        }];
+
+        let srv = MockServer::start_full(articles, headers, overview, Chaos::default()).await;
+        let (mut conn, _) = Connection::connect(&srv.server_config()).await.unwrap();
+
+        let dir = std::env::temp_dir().join(format!("nzbfast-spot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ix = Index::open(&dir.join("index.db")).unwrap();
+
+        // Scan: one header, one valid spot.
+        let sum = scan_spots(&mut conn, &mut ix, "free.pt", 1000).await.unwrap();
+        assert_eq!((sum.scanned, sum.valid, sum.invalid, sum.new), (1, 1, 0, 1));
+        assert_eq!(sum.hashcash_warn, 0);
+        // Re-scan is a no-op (high-water mark).
+        let sum2 = scan_spots(&mut conn, &mut ix, "free.pt", 1000).await.unwrap();
+        assert_eq!(sum2.scanned, 0);
+
+        // Search.
+        let hits = ix.spot_search("ubuntu", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        let s = &hits[0];
+        assert_eq!(s.title, title);
+        assert_eq!(s.category, 1);
+        assert_eq!(s.subcats, "a09,b04");
+        assert_eq!(s.size, 1_048_576);
+        assert!(s.verified && s.hashcash_ok);
+        assert_eq!(s.spotter_id, spotter_id(&spot.modulus));
+
+        // Get: byte-identical NZB out the other end.
+        let (sx, nzb) = fetch_spot_nzb(&mut conn, &s.msgid).await.unwrap();
+        assert_eq!(sx.nzb_segments, seg_ids);
+        assert_eq!(nzb, nzb_xml.as_bytes());
+
+        // Cache the segment list back into the DB.
+        ix.set_spot_nzb(&s.msgid, &sx.nzb_segments).unwrap();
+        let again = ix.spot_by_msgid(&s.msgid).unwrap().unwrap();
+        assert_eq!(again.nzb_msgids, seg_ids);
+
+        conn.quit().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

@@ -1,0 +1,35 @@
+rapidyenc — vendored snapshot
+=============================
+
+Upstream:   https://github.com/animetosho/rapidyenc
+Commit:     27f435afa0a3a15995001219beca08de29f87a0f (shallow clone, 2026-07-18)
+Version:    1.1.1 (RAPIDYENC_VERSION 0x010101 in rapidyenc.h)
+
+The .git directory (and .github/.gitignore) were removed — this is a plain
+source snapshot, not a submodule.
+
+License
+-------
+rapidyenc itself is **Public Domain, or CC0 (or equivalent) where public
+domain is not recognised** (stated in README.md "License" section). This is
+maximally permissive; no attribution or notice obligations.
+
+Third-party components inside this tree:
+- crcutil-1.0/ — Apache License 2.0 (see crcutil-1.0/LICENSE). NOTE: our
+  build (crates/nzbkit/build.rs) compiles with YENC_DISABLE_CRCUTIL=1, so
+  crcutil is NOT compiled into nzbfast binaries. It is only used by upstream
+  as the generic CRC32 fallback on x86; rapidyenc has its own generic
+  slice-by-4 fallback when crcutil is disabled. Directory kept for
+  completeness / future re-enable.
+- The CRC32 folding kernels (src/crc_folding*.cc) derive from zlib-ng
+  (zlib license) per upstream README.
+
+Build notes
+-----------
+Built by crates/nzbkit/build.rs using the `cc` crate (cmake is not installed
+on this machine; the cc route replicates the per-file -march flags from
+upstream CMakeLists.txt). Encoder is excluded (RAPIDYENC_DISABLE_ENCODE=1 and
+encoder_*.cc not compiled) — we only need decode + CRC.
+
+Pruned: nothing beyond the .git/.github metadata. The tree is small (~950 KB);
+tool/ (CLI + bench sources, not compiled by us) and crcutil-1.0/ were kept.

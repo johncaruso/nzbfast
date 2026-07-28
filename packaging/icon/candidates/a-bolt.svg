@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Candidate A "bolt + slipstream": saturated tile so the icon has a
+     silhouette on a DARK taskbar (the old near-black tile vanished into
+     one), white bolt for maximum contrast either way, and three trailing
+     speed lines. No wordmark - lowercase "nz" was an illegible smudge at
+     16 px, which is the size that actually matters. -->
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="tileg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5aa8ff"/>
+      <stop offset="1" stop-color="#6d47e6"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#tileg)"/>
+  <!-- slipstream: motion lines entering from the trailing edge -->
+  <g fill="#fff">
+    <rect x="150" y="330" width="250" height="42" rx="21" opacity=".30"/>
+    <rect x="150" y="491" width="330" height="42" rx="21" opacity=".45"/>
+    <rect x="150" y="652" width="250" height="42" rx="21" opacity=".30"/>
+  </g>
+  <!-- forward-raked bolt, heavy enough to survive downscaling -->
+  <path d="M 690 150 L 404 545 L 556 545 L 430 874 L 742 470 L 578 470 Z" fill="#fff"/>
+</svg>

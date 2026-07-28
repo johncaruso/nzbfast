@@ -1,0 +1,28 @@
+[package]
+name = "rars"
+version = "0.4.6+nzbfast"
+description = "Pure-Rust RAR reader/extractor (decode paths used by nzbfast); perf fork of github.com/bitplane/rars"
+edition = "2021"
+rust-version = "1.87"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[features]
+fast = []
+parallel = ["dep:rayon"]
+
+[dependencies]
+aes = { version = "0.9", features = ["zeroize"] }
+aho-corasick = "1.1"
+blake2s_simd = "1.0"
+crc32fast = "1.4"
+getrandom = "0.4"
+hmac = "0.13"
+rayon = { version = "1.12", optional = true }
+sha1 = "0.11"
+sha2 = "0.11"
+zeroize = { version = "1.8", default-features = false, features = ["alloc", "zeroize_derive"] }

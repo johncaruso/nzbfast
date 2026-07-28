@@ -1,0 +1,22 @@
+# libFuzzer dictionary for the yenc_decode target.
+# Without these the fuzzer essentially never guesses a yEnc header, so it
+# only ever exercises the header-absent early return (which is exactly how
+# three silent-truncation bugs in the `=y` control-line handling survived).
+# Use with: cargo +nightly fuzz run yenc_decode -- -dict=yenc.dict
+begin_hdr="=ybegin "
+part_hdr="=ypart "
+end_hdr="=yend"
+ctl="\x0d\x0a=y"
+pcrc="pcrc32="
+crc="crc32="
+begin="begin="
+end="end="
+size="size="
+name="name="
+line="line="
+part="part="
+total="total="
+crlf="\x0d\x0a"
+esc="="
+dot_stuff="\x0d\x0a.."
+dot_term="\x0d\x0a.\x0d\x0a"

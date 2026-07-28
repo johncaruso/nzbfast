@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- DMG window background. The Finder window is 660x400 pt; the canvas
+     is a 660x660 SQUARE (all design in the top 400) because qlmanage
+     pads non-square thumbnails with white - a square canvas renders
+     edge-to-edge dark. Palette = the dashboard dark theme. The bottom
+     band narrates the unsigned-app Gatekeeper path (shared rule 7). -->
+<svg width="660" height="660" viewBox="0 0 660 660" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#171a21"/>
+      <stop offset="0.6" stop-color="#0e1014"/>
+      <stop offset="1" stop-color="#0e1014"/>
+    </linearGradient>
+    <linearGradient id="bolt" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4da3ff"/>
+      <stop offset="1" stop-color="#7c5cff"/>
+    </linearGradient>
+  </defs>
+  <rect width="660" height="660" fill="url(#bg)"/>
+
+  <!-- header -->
+  <g transform="translate(28,26)">
+    <path d="M 16 0 L 6 20 L 12.5 20 L 5 40 L 23 15 L 15 15 L 22 0 Z"
+          fill="url(#bolt)"/>
+    <text x="32" y="21" font-family="-apple-system, 'Helvetica Neue', Helvetica, Arial, sans-serif"
+          font-size="21" font-weight="700" fill="#e8eaf0">nzbfast</text>
+    <text x="32" y="38" font-family="-apple-system, 'Helvetica Neue', Helvetica, Arial, sans-serif"
+          font-size="12" fill="#8991a5">the fast Usenet downloader</text>
+  </g>
+
+  <!-- drag arrow between the two icon slots (icons at x=165 and x=495, y≈185) -->
+  <g stroke="#4da3ff" stroke-width="4" fill="none" opacity="0.85" stroke-linecap="round">
+    <path d="M 245 185 L 400 185"/>
+    <path d="M 400 185 L 382 173 M 400 185 L 382 197"/>
+  </g>
+  <text x="330" y="164" text-anchor="middle"
+        font-family="-apple-system, 'Helvetica Neue', Helvetica, Arial, sans-serif"
+        font-size="12.5" fill="#8991a5">drag to install</text>
+
+  <!-- unsigned-app narration band -->
+  <rect x="24" y="306" width="612" height="70" rx="10"
+        fill="#1e222b" stroke="rgba(140,150,175,.22)"/>
+  <text x="40" y="330" font-family="-apple-system, 'Helvetica Neue', Helvetica, Arial, sans-serif"
+        font-size="13" font-weight="700" fill="#f5b445">First launch: macOS will warn - nzbfast isn't Apple-notarized yet.</text>
+  <text x="40" y="350" font-family="-apple-system, 'Helvetica Neue', Helvetica, Arial, sans-serif"
+        font-size="12.5" fill="#e8eaf0">Right-click NzbFast in Applications and choose Open - or open System Settings →</text>
+  <text x="40" y="367" font-family="-apple-system, 'Helvetica Neue', Helvetica, Arial, sans-serif"
+        font-size="12.5" fill="#e8eaf0">Privacy &amp; Security, scroll down, and click “Open Anyway”.</text>
+</svg>

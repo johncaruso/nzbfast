@@ -1,0 +1,32 @@
+# Vendored from crates.io tiny_http 0.12.0 - see VENDORING.md for WHY and for
+# the exact local patches. Trimmed vs the published manifest: the crate's own
+# dev-dependencies (fdlimit / rustc-serialize / sha1) and tests are not vendored,
+# and the optional TLS backends stay optional-and-unused (we terminate TLS
+# nowhere in this listener; NNTP TLS is rustls in nzbkit).
+[package]
+edition = "2018"
+name = "tiny_http"
+version = "0.12.0"
+authors = [
+    "pierre.krieger1708@gmail.com",
+    "Corey Farwell <coreyf@rwell.org>",
+]
+description = "Low level HTTP server library (vendored + hardened for nzbfast)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tiny-http/tiny-http"
+
+[dependencies]
+ascii = "1.0"
+chunked_transfer = "1"
+httpdate = "1.0.2"
+log = "0.4.4"
+
+[features]
+default = []
+# Declared but deliberately empty: the optional TLS backends are NOT vendored
+# (this listener terminates no TLS - NNTP TLS is rustls, in nzbkit). The names
+# exist only so the crate's own `cfg(feature = "ssl-*")` checks are recognised
+# rather than warned about as unexpected cfg values. Do not enable them; the
+# code they gate references crates that are no longer dependencies.
+ssl-openssl = []
+ssl-rustls = []

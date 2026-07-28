@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Candidate C "fast-forward": double chevron, the universal "fast"
+     mark. Reads as speed with no lightning cliche and stays legible at
+     16 px because it is two solid wedges with a wide gap. -->
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="tileg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#35c88a"/>
+      <stop offset="1" stop-color="#1f8fd6"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#tileg)"/>
+  <g fill="#fff">
+    <path d="M 300 285 L 300 739 L 545 512 Z"/>
+    <path d="M 530 285 L 530 739 L 775 512 Z"/>
+  </g>
+</svg>

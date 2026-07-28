@@ -1,0 +1,119 @@
+name: sign-windows
+
+# Build the Windows installer (nzbfast.exe + nzbtray.exe inside an Inno
+# Setup exe) entirely in CI, from public source, so it can be signed by
+# the SignPath Foundation's free OSS code-signing pipeline.
+#
+# WHY CI (and not the local mingw cross-build): SignPath requires that a
+# signed binary be built from source "in a verifiable way". Building on a
+# GitHub-hosted runner ties the artifact to a public commit AND - bonus -
+# the runner has no personal paths, so the release binary can't leak
+# /Users/... strings (the v1.0.0 leak class) regardless of remap flags.
+#
+# Two-phase rollout:
+#   Phase B (now): build + compile the installer + upload it UNSIGNED as a
+#     workflow artifact. Fully testable on the PRIVATE repo before the
+#     SignPath project exists. Manual dispatch only - never auto-runs.
+#   Phase C (after SignPath approval): paste the signing step that the
+#     SignPath console generates for this project into the marked slot,
+#     and add the SIGNPATH_API_TOKEN secret + SIGNPATH_ORGANIZATION_ID
+#     variable to the PUBLIC repo. Then `sign: true` submits for signing.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sign:
+        description: "Submit the installer to SignPath for signing (needs a provisioned project + secrets)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  windows-installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust + windows-gnu target
+        shell: bash
+        run: rustup update stable && rustup target add x86_64-pc-windows-gnu
+
+      # -static link-arg + the source path-remap both come from
+      # .cargo/config.toml. Do NOT set CARGO_TARGET_*_RUSTFLAGS here - it
+      # would REPLACE the config flags (that is how v1.0.0 shipped -static
+      # off / paths leaked). The remap is a harmless no-op on the runner
+      # (checkout lives under D:\a\..., no /Users paths to rewrite).
+      - name: Build nzbfast.exe + nzbtray.exe
+        shell: bash
+        run: cargo build --release --target x86_64-pc-windows-gnu -p nzbfast -p nzbtray
+
+      - name: Read version from Cargo.toml
+        id: ver
+        shell: bash
+        run: echo "v=$(grep '^version' crates/nzbfast/Cargo.toml | head -1 | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+
+      - name: Stage installer payload
+        shell: bash
+        run: |
+          STAGE=packaging/windows/stage
+          rm -rf "$STAGE" && mkdir -p "$STAGE" packaging/windows/out
+          cp target/x86_64-pc-windows-gnu/release/nzbfast.exe "$STAGE/"
+          cp target/x86_64-pc-windows-gnu/release/nzbtray.exe "$STAGE/"
+          cp docs/MANUAL.html LICENSE COPYRIGHT.md "$STAGE/"
+
+      # Inno Setup isn't preinstalled on windows-latest; choco is. Running
+      # ISCC from packaging/windows/ reproduces make-installer.sh exactly
+      # (StageDir=stage, ..\icon\nzbfast.ico, OutputDir=out all resolve
+      # relative to the .iss dir).
+      - name: Compile Inno Setup installer
+        shell: cmd
+        # The version reaches ISCC via an env var (%APPVER%), not direct
+        # ${{ }} interpolation into the command line, so a malformed
+        # Cargo.toml version string can't inject into the cmd shell.
+        env:
+          APPVER: ${{ steps.ver.outputs.v }}
+        run: |
+          choco install innosetup -y --no-progress
+          cd packaging\windows
+          ISCC /DAppVersion=%APPVER% /DStageDir=stage /Oout installer.iss
+
+      - name: Upload UNSIGNED installer
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nzbfast-setup-unsigned
+          path: packaging/windows/out/nzbfast-*-windows-x64-setup.exe
+          if-no-files-found: error
+
+      # ------------------------------------------------------------------
+      # PHASE C - SignPath signing. Paste the exact step the SignPath
+      # console generates for project `nzbfast` here (it pins the action
+      # version + the org-id / project-slug / signing-policy-slug /
+      # artifact-configuration-slug for this project). It consumes the
+      # `nzbfast-setup-unsigned` artifact uploaded above
+      # (github-artifact-id: ${{ steps.upload.outputs.artifact-id }}),
+      # blocks on a manual approval in the SignPath UI, and writes the
+      # signed exe back. Gate it on the `sign` input, e.g.:
+      #
+      #   - name: Sign installer via SignPath Foundation
+      #     if: ${{ inputs.sign }}
+      #     uses: signpath/github-action-submit-signing-request@ced31329c0317e779dad2eec2a7c3bb46ea1343e # v1
+      #     with:
+      #       api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+      #       organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+      #       project-slug: nzbfast
+      #       signing-policy-slug: release-signing
+      #       artifact-configuration-slug: installer
+      #       github-artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      #       wait-for-completion: true
+      #       output-artifact-directory: packaging/windows/out-signed
+      #
+      #   - name: Upload SIGNED installer
+      #     if: ${{ inputs.sign }}
+      #     uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      #     with:
+      #       name: nzbfast-setup-signed
+      #       path: packaging/windows/out-signed/*.exe
+      # ------------------------------------------------------------------
