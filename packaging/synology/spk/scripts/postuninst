@@ -1,0 +1,5 @@
+#!/bin/sh
+# Deliberately leaves /var/packages/nzbfast/var and any downloads in
+# place. Uninstalling a downloader is not a request to delete the
+# downloads, and DSM gives no undo.
+exit 0

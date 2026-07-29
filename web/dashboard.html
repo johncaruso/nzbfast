@@ -71,6 +71,9 @@ header{display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wra
 header .nav{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 header h1{font-size:19px;margin:0;display:flex;align-items:center;gap:9px;font-weight:650}
 header .v{color:var(--dim);font-weight:400;font-size:12px}
+/* The logo is a step-through: each click lands on the next screen. It
+   keeps the h1's icon/text gap because wrapping them broke it. */
+header .logo{display:inline-flex;align-items:center;gap:9px;cursor:pointer}
 header .grow{flex:1}
 .pill{font-size:12px;color:var(--dim);border:1px solid var(--line);border-radius:99px;padding:4px 11px}
 /* Navigation pills: hoverable, and the current destination is marked
@@ -860,7 +863,9 @@ input.txt.sm{max-width:120px}
 </head><body><div class="wrap">
 
 <header>
-  <h1><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-bolt"/></svg> nzbfast <span class="v" id="ver" role="button" tabindex="0"
+  <h1><span class="logo" role="button" tabindex="0" data-i18n-title="hdr.logo.title" title="Next screen" aria-label="Next screen"
+    onclick="logoCycle()"
+    onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();logoCycle()}"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-bolt"/></svg> nzbfast</span> <span class="v" id="ver" role="button" tabindex="0"
     data-i18n-title="hdr.ver.title" title="Check for updates" aria-label="Check for updates"
     onclick="jumpToUpdates()"
     onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();jumpToUpdates()}"></span></h1>
@@ -924,6 +929,21 @@ input.txt.sm{max-width:120px}
        again. -->
   <ol class="setupsteps" id="setupSteps"></ol>
   <p class="dim" id="welcomeDirs" style="margin:12px 0 0;display:none"></p>
+  <!-- First-run look chooser: minimal or the works, per card. The boxes
+       call the same hideCard() the ✕ buttons do, so this is one
+       preference system with two doors - what is unticked here is what
+       the Hidden bar can restore later. Unlike the firstrun body class
+       above, writing layoutPrefs here is CORRECT: these are the user's
+       own answers, not a transient state. -->
+  <div id="welcomeLook" style="margin:16px 0 4px">
+    <p style="margin:0 0 8px"><b data-i18n="welcome.look.title">Your dashboard</b><br>
+    <span class="dim" data-i18n="welcome.look.hint">Untick anything you would rather not see - the graphs and extra cards are optional. Any of them can be brought back later from the Hidden bar at the bottom of the dashboard.</span></p>
+    <p style="margin:0 0 10px;display:flex;gap:8px;flex-wrap:wrap">
+      <button class="ghost" onclick="applyPreset('classic')" data-i18n="welcome.look.classic">Classic - plain and minimal</button>
+      <button class="ghost" onclick="applyPreset('full')" data-i18n="welcome.look.full">Full - graphs and all</button>
+    </p>
+    <div id="welcomeLookBoxes" style="display:flex;flex-wrap:wrap;gap:6px 18px"></div>
+  </div>
   <button id="showAll" onclick="showAllCards()" data-i18n="setup.showall">Show the full dashboard anyway</button>
 </div>
 
@@ -1079,6 +1099,11 @@ input.txt.sm{max-width:120px}
 <div class="card set" data-sg="look" data-sk="appearance">
   <h3 data-i18n="set.look.title">Appearance
     <span class="badge scope" data-i18n="badge.thisbrowser">this browser only</span></h3>
+  <div class="row"><label data-i18n="set.look.preset">Preset<span class="hint" data-i18n="set.look.preset.hint">Classic is a plain, light, compact dashboard with just the queue and history - the graphs and extra cards are hidden. Full brings the default back: auto theme, regular spacing, everything shown. Both simply set the controls on this page and the dashboard cards, so any part can be adjusted afterwards; stored in this browser</span></label>
+    <span style="display:flex;gap:8px">
+      <button class="ghost" onclick="applyPreset('classic')" data-i18n="set.look.classic">Classic</button>
+      <button class="ghost" onclick="applyPreset('full')" data-i18n="set.look.full">Full</button>
+    </span></div>
   <div class="row"><label data-i18n="set.look.theme">Theme<span class="hint" data-i18n="set.look.theme.hint">Auto follows your system's light or dark setting</span></label>
     <select class="sel" id="s_theme" onchange="setTheme(this.value)">
       <option value="auto" data-i18n="set.look.auto">Auto</option>
@@ -2192,7 +2217,7 @@ function openApiNotice(open){
   if (open === openBarShown) return;   // poll runs every second; only touch the DOM on a change
   openBarShown = open;
   if (!open){ el.classList.remove('on'); el.innerHTML = ''; return; }
-  el.innerHTML = esc(t('open.notice','No API key is set, so anything that can reach this machine can control nzbfast: add and delete downloads, change settings, read your provider password.'))
+  el.innerHTML = esc(t('open.notice','No API key is set. The key is how apps like Sonarr and Radarr connect to hand nzbfast their downloads, and it also keeps everyone else out - right now anything on your network can control nzbfast.'))
     + ' <button class="ghost mini" onclick="openApiFix(this)">' + esc(t('open.generate','Create a key')) + '</button>'
     + ' <button class="ghost mini" onclick="openApiHush()">' + esc(t('open.later','Not now')) + '</button>';
   el.classList.add('on');
@@ -3009,6 +3034,23 @@ function identSource(src){ return IDENT_SRC[src]||''; }
 function identName(s){
   return s.identity_name ? ` <span class="dim">· ${esc(s.identity_name)}</span>` : '';
 }
+// When the job finished, kept short in the row - time alone for today,
+// day+month this year, day+month+year beyond - with the full stamp on
+// hover; the drawer spells it out. `completed` is unix seconds and 0
+// means the daemon does not know (a spool entry from before the field
+// existed), which must show as nothing, never as 1970.
+function histWhen(s, full){
+  if(!s.completed) return '';
+  const d=new Date(s.completed*1000);
+  if(full) return d.toLocaleString(LOCALE,{dateStyle:'full',timeStyle:'short'});
+  const now=new Date();
+  const o=d.toDateString()===now.toDateString()
+    ? {timeStyle:'short'}
+    : (d.getFullYear()===now.getFullYear()
+        ? {day:'numeric',month:'short',hour:'numeric',minute:'2-digit'}
+        : {day:'numeric',month:'short',year:'numeric'});
+  return d.toLocaleString(LOCALE,o);
+}
 function renderHistory(slots){
   if(slots) lastHistSlots=slots;
   const all=lastHistSlots, cur=histFilter();
@@ -3031,8 +3073,15 @@ function renderHistory(slots){
       const ctl=(s.password_required?`<button class="ghost mini" title="${escA(t('hist.unlock.title','Archive is password-protected: enter the password to unpack the verified volumes'))}" onclick="event.stopPropagation();unlockJob('${s.nzo_id}')">🔑 ${t('hist.unlock','unlock')}</button>`:'')+
         (failed?`<button class="ghost mini" title="${escA(t('hist.retry.title','Retry: the journal resumes from what already downloaded'))}" onclick="event.stopPropagation();retryJob('${s.nzo_id}')">↻ ${t('hist.retry','retry')}</button>`:'')+
         `<button class="ghost mini" title="${escA(t('hist.del.title','Remove this entry from history (files stay on disk)'))}" aria-label="${escA(t('hist.del.title','Remove this entry from history (files stay on disk)'))}" onclick="event.stopPropagation();delHist('${s.nzo_id}')">✕</button>`;
-      const st=s.elapsed_secs>0.5&&s.downloaded_bytes>0
-        ? `<br><span class="dim">${fmtEta(s.elapsed_secs)} · ${fmtRate(s.downloaded_bytes/1e6/s.elapsed_secs)}</span>`:'';
+      // The sub-line under the size: when it finished, then how long it
+      // took and how fast. The when carries its full stamp on hover -
+      // the row has no room for a spelled-out date.
+      const sub=[];
+      const when=histWhen(s);
+      if(when) sub.push(`<span title="${escA(histWhen(s,true))}">${esc(when)}</span>`);
+      if(s.elapsed_secs>0.5&&s.downloaded_bytes>0)
+        sub.push(esc(`${fmtEta(s.elapsed_secs)} · ${fmtRate(s.downloaded_bytes/1e6/s.elapsed_secs)}`));
+      const st=sub.length?`<br><span class="dim">${sub.join(' · ')}</span>`:'';
       // Completed, but something in it is still packed (no unpacker for
       // the format). Not a failure - every byte arrived - but the folder
       // does not hold what the user expects, so it is neither green nor
@@ -3071,6 +3120,12 @@ function toggleHistRow(tr){
     `<span class="${failed?'bad':'ok'}">${esc(tStatus(s.status))}</span>`
     + (s.unpack_blocked_by&&!failed
         ? ` <span class="warn">· ${esc(t('hist.packed','still packed: {name}',{name:s.unpack_blocked_by}))}</span>`:'')]];
+  if(s.completed) rows.push([t('hist.finished','Finished'), esc(histWhen(s,true))]);
+  // The category, changeable right here. The right-click menu has had
+  // this for a while; the drawer is where people actually look for it.
+  rows.push([t('col.category','Category'),
+    esc(s.category||'*')
+    +` <button class="ghost mini" onclick="event.stopPropagation();changeCat('${s.nzo_id}')">${esc(t('hist.cat.change','change…'))}</button>`]);
   if(s.fail_message) rows.push([t('hist.why','Reason'), esc(s.fail_message)]);
   if(s.unpack_blocked_by&&!failed)
     rows.push([t('hist.why','Reason'),
@@ -4583,7 +4638,14 @@ async function changeCat(id){
   const cat=prompt(t('prompt.cat',"Move to category - the files move to that category's folder.\nExisting: {cats}\n(leave empty for no category)",{cats:cats.join(', ')||t('drawer.nocat','none')}));
   if(cat===null) return;
   const j=await api('history',`&name=set_cat&value=${id}&value2=${encodeURIComponent(cat.trim())}`);
-  if(j.status){ toast(t('toast.movedto','Moved to {p}.',{p:j.path||t('toast.newfolderword','its new folder')})); tick(); }
+  // A TV-filed job relabels without moving (its files share a season
+  // folder); the daemon says so in `note`, and the toast must not claim
+  // a move that never happened.
+  if(j.status){
+    toast(j.note ? t('toast.catlabeled','Category changed - the files stayed in their shared TV folder.')
+                 : t('toast.movedto','Moved to {p}.',{p:j.path||t('toast.newfolderword','its new folder')}));
+    tick();
+  }
   else toast(tErr(j.error)||t('toast.catfail','Move failed.'), true);
 }
 // Right-click menu on history rows.
@@ -5484,6 +5546,17 @@ function setView(which){
 // Kept because other call sites (and the welcome banner) say "show me
 // settings"; it is now unambiguous rather than a toggle.
 function showSettings(){ return setView('settings'); }
+
+// The logo steps to the next screen: dashboard, settings, then the wall
+// when its pill is visible (the wall's own logo links back home, closing
+// the loop). An extra affordance only - the nav pills stay the canonical
+// way around, so this never has to be discovered.
+function logoCycle(){
+  if(!inSettings) return setView('settings');
+  const w=document.getElementById('navWall');
+  if(w && w.style.display!=='none'){ location.href='/wall'; return false; }
+  return setView('dash');
+}
 
 // ---- §Stage2: getting around Settings -------------------------------
 // Twenty cards, 88 rows and 100 controls used to be one flat scroll with
@@ -6689,12 +6762,62 @@ function renderSetupSteps(c){
     `</span></li>`).join('');
 }
 
+// The first-run look chooser. The list is the optional cards themselves
+// and the boxes drive the same hideCard() the ✕ buttons do - one
+// preference system with two doors. Labels come straight from each
+// card's (translated) h3, so a card renamed or added later shows up
+// here by existing, with no second list to keep in sync.
+const LOOK_CARDS=['rescard','provcard','pipecard','usageCard','benchCard','setupCard','watchCard','browseCard'];
+function welcomeLookIds(){
+  return LOOK_CARDS.filter(id=>document.getElementById(id))
+    // Cards a body class already suppresses (indexer off) stay out of
+    // the list: a tick that visibly does nothing reads as broken.
+    .filter(id=>!(id==='browseCard'&&document.body.classList.contains('noidx')))
+    .filter(id=>!(id==='watchCard'&&document.body.classList.contains('nowatch')));
+}
+function renderWelcomeLook(){
+  const host=document.getElementById('welcomeLookBoxes');
+  if(!host) return;
+  const p=layoutPrefs(), ids=welcomeLookIds();
+  const box=(on,fn,lbl)=>`<label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer">`
+    +`<input type="checkbox" ${on?'checked':''} onchange="${fn}"> ${esc(lbl)}</label>`;
+  host.innerHTML =
+    box(ids.every(id=>!p.hidden.includes(id)), 'welcomeLookAll(this.checked)',
+        t('welcome.look.all','Show everything'))
+    +'<span style="flex-basis:100%"></span>'
+    +ids.map(id=>box(!p.hidden.includes(id), `welcomeLookOne('${id}',this.checked)`,
+        cardLabel(document.getElementById(id)))).join('');
+}
+function welcomeLookOne(id,on){ hideCard(id,!on); renderWelcomeLook(); }
+function welcomeLookAll(on){ welcomeLookIds().forEach(id=>hideCard(id,!on)); renderWelcomeLook(); }
+
+// The Classic preset: a plain, light, compact dashboard - queue, history
+// and the headline only - for people who want a downloader that looks
+// like a downloader. One function composing three EXISTING knobs (theme,
+// density, hidden cards), so there is no preset state stored anywhere:
+// pressing it is exactly ticking those settings by hand, and every part
+// can be changed back individually afterwards. Full is the shipped
+// default spelled out: auto theme, regular spacing, everything shown.
+function applyPreset(which){
+  const classic = which==='classic';
+  setTheme(classic?'light':'auto');
+  setUiCompact(classic);
+  // Both settings controls exist whether or not Settings is open; keep
+  // them honest so flipping views never shows a stale checkbox.
+  const cb=document.getElementById('uiCompact'); if(cb) cb.checked=classic;
+  const st=document.getElementById('s_theme'); if(st) st.value=classic?'light':'auto';
+  LOOK_CARDS.filter(id=>document.getElementById(id)).forEach(id=>hideCard(id,classic));
+  renderWelcomeLook();
+  toast(classic?t('preset.classic.done','Classic look applied: light, compact, queue and history only.')
+               :t('preset.full.done','Full dashboard restored: graphs and extra cards are back.'));
+}
+
 async function checkWelcome(){
   try{
     const c=((await api('get_config')).config||{}).nzbfast||{};
     const first = c.servers_configured===false;
     document.getElementById('welcomeCard').style.display = first ? '' : 'none';
-    if(first) renderSetupSteps(c);
+    if(first){ renderSetupSteps(c); renderWelcomeLook(); }
     // Only ADD the class here. showAllCards() removes it for the session,
     // and a re-poll must not undo that while the user is looking around.
     if(!first) document.body.classList.remove('firstrun');

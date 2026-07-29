@@ -160,8 +160,26 @@ set -- serve --config "$CONFIG" --port "$PORT" --out "$OUT" --watch "$WATCH"
 # owned by the target uid so a large /downloads isn't re-walked each start.
 if [ "$(id -u)" = "0" ]; then
     if [ -z "$PUID" ]; then
-        _cfg_owner="$(stat -c %u /config 2>/dev/null || echo 0)"
-        [ "$_cfg_owner" != "0" ] && PUID="$_cfg_owner" || PUID=1000
+        # Prefer /config, then the other bind mounts. Docker creates a
+        # bind-mount source that does not exist yet as root, and the
+        # container cannot see the host directory ABOVE a mount, so when
+        # every folder is freshly created there is genuinely nothing to
+        # read an owner from and 1000 is the only answer left. Checking
+        # all three still helps the common case where a user made the
+        # folders themselves first (which is what the NAS guides tell
+        # them to do) and only some of them ended up owned by Docker.
+        PUID=""
+        for _d in /config /downloads /watch; do
+            [ -d "$_d" ] || continue
+            _owner="$(stat -c %u "$_d" 2>/dev/null || echo 0)"
+            if [ "$_owner" != "0" ]; then
+                PUID="$_owner"
+                _gowner="$(stat -c %g "$_d" 2>/dev/null || echo '')"
+                [ -n "$_gowner" ] && [ -z "$PGID" ] && PGID="$_gowner"
+                break
+            fi
+        done
+        [ -n "$PUID" ] || PUID=1000
     fi
     PGID="${PGID:-$PUID}"
     # The daemon reads the key file itself now, as PUID rather than as root.

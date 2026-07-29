@@ -1,0 +1,14 @@
+#!/bin/sh
+# DSM 7 runs the service from conf/systemd/pkg-nzbfast.service; these are
+# the hooks Package Center's Start / Stop buttons call.
+case $1 in
+    start)
+        synosystemctl start pkg-nzbfast
+        ;;
+    stop)
+        synosystemctl stop pkg-nzbfast
+        ;;
+    status)
+        systemctl is-active pkg-nzbfast
+        ;;
+esac

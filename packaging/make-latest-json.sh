@@ -33,19 +33,24 @@ fi
 
 sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
 
-# Updater payloads carry the product name + version so a human who
-# stumbles on the raw binary can tell what it is, while `autoupdate`
-# (and the lack of a .dmg/.zip/.tar.gz extension) keeps it visibly
-# distinct from the human download. Renamed from bare `autoupdate-*`
-# (v1.0.4) - the manifest URL follows the file's basename, so the
-# updater, which reads the URL from here, needs no change.
+# Updater payloads carry the product name + `updater` + version so a
+# human who stumbles on the raw binary can tell what it is, while the
+# lack of a .dmg/.zip/.tar.gz extension keeps it visibly distinct from
+# the human download. The word order is load-bearing: GitHub sorts the
+# assets box alphabetically and collapses it to ten rows, and the older
+# `nzbfast-X.Y.Z-autoupdate-*` names sorted ABOVE every human download
+# (`autoupdate` < `linux/macos/windows`), burying the Windows installer
+# behind "Show all". `nzbfast-updater-...` sorts after `nzbfast-X.Y.Z-*`
+# (digits before letters), so the payloads sit below the fold where they
+# belong. Renaming is safe for deployed clients: the updater reads full
+# URLs from this manifest, and latest.json itself keeps its name.
 # NOTE: no `v` in the asset name. The tag is vX.Y.Z; the files are not.
 PLATFORMS='macos-universal windows-x64 linux-x64 linux-arm64'
 payload() {   # $1 = platform key -> path of its autoupdate payload
     if [ "$1" = windows-x64 ]; then
-        printf '%s' "$DIST/nzbfast-$VERSION-autoupdate-$1.exe"
+        printf '%s' "$DIST/nzbfast-updater-$VERSION-$1.exe"
     else
-        printf '%s' "$DIST/nzbfast-$VERSION-autoupdate-$1"
+        printf '%s' "$DIST/nzbfast-updater-$VERSION-$1"
     fi
 }
 

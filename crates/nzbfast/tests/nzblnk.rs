@@ -419,3 +419,72 @@ async fn a_failed_grab_must_not_echo_the_indexer_apikey() {
     .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The add-only `nzbkey` must not reach `addnzblnk`.
+///
+/// This is a security property expressed as an ABSENCE - `addnzblnk` is
+/// simply not in serve.rs's `add_only` list - so nothing fails if a
+/// later refactor "helpfully" adds it beside `addfile|addurl|version`.
+/// The reason it is excluded: resolving a header spends the user's
+/// metered indexer quota, which an add-only credential has no business
+/// doing.
+///
+/// The addurl leg is what makes this test mean anything: it proves the
+/// nzbkey is live and correct, so the addnzblnk refusal is the tier
+/// rule and not a typo in the fixture.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_add_only_key_cannot_spend_indexer_quota() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-lnk-tier-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = dir.join("config.json");
+    std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
+        .unwrap();
+    let db = dir.join("index.db");
+    let d = serve(&dir, |port| {
+        let mut c = daemon_cmd(&dir, &cfg, &db, port, &[]);
+        c.arg("--apikey").arg("fullkey").arg("--nzbkey").arg("addkey");
+        c
+    })
+    .await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        let link = "nzblnk%3A%3Fh%3Dtierprobe99%26t%3DTier+Probe";
+
+        // The add-only key is REFUSED, in the exact SAB phrasing.
+        let (_, denied) = http_get(
+            port,
+            &format!("/api?mode=addnzblnk&apikey=addkey&link={link}&output=json"),
+        );
+        assert!(
+            denied.contains("API Key Incorrect"),
+            "the add-only key reached addnzblnk:\n{denied}"
+        );
+
+        // ...but it IS a working add-only key, or the assertion above
+        // would pass for the wrong reason.
+        let (_, allowed) = http_get(
+            port,
+            "/api?mode=addurl&apikey=addkey&name=http%3A%2F%2F127.0.0.1%3A1%2Fx.nzb&output=json",
+        );
+        assert!(
+            !allowed.contains("API Key Incorrect"),
+            "the fixture's nzbkey is not actually valid:\n{allowed}"
+        );
+
+        // The full key gets through to the ladder - which then answers
+        // honestly that it found nothing, having no index and no
+        // indexers. Any auth phrase here would mean the mode is gated
+        // wrongly in the other direction.
+        let (_, full) = http_get(
+            port,
+            &format!("/api?mode=addnzblnk&apikey=fullkey&link={link}&output=json"),
+        );
+        assert!(!full.contains("API Key"), "the full key was refused:\n{full}");
+        assert!(full.contains("nothing found"), "{full}");
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

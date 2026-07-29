@@ -37,7 +37,9 @@ fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
-/// One request, returning the response BODY.
+/// One attempt, returning the response BODY. Err ONLY when the daemon
+/// produced nothing at all; anything that produced a byte is an answer,
+/// and is handed back for the caller's assertions to judge.
 ///
 /// Reads BYTES and de-chunks, rather than `read_to_string` over the raw
 /// stream. tiny_http switches to `Transfer-Encoding: chunked` for any
@@ -54,20 +56,58 @@ fn free_port() -> u16 {
 /// nothing wrong in the daemon at all. The panic also killed the daemon
 /// through `KillOnDrop`, which made every other thread's request look
 /// like an empty body and buried the cause.
-fn http(port: u16, req: &str) -> String {
-    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect daemon");
-    write!(s, "GET {req} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+fn http_once(port: u16, req: &str) -> std::io::Result<String> {
+    let mut s = TcpStream::connect(("127.0.0.1", port))?;
+    write!(s, "GET {req} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")?;
     let mut raw = Vec::new();
-    s.read_to_end(&mut raw).expect("read response");
+    // Zero bytes back is a refusal to serve, however the peer phrased
+    // it: ECONNREFUSED when the accept never happened, an RST or a bare
+    // FIN when it did and the socket was dropped unread. None of those
+    // carry anything to judge. A read that failed AFTER bytes landed is
+    // an answer, and is used exactly as it arrived - a truncated body
+    // must never be retried away.
+    let read = s.read_to_end(&mut raw);
+    if raw.is_empty() {
+        return Err(read.err().unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "closed without answering")
+        }));
+    }
     let Some(at) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
-        return String::new(); // no headers at all - the caller asserts
+        return Ok(String::new()); // no headers at all - the caller asserts
     };
     let (head, body) = raw.split_at(at + 4);
     let chunked = String::from_utf8_lossy(head)
         .to_ascii_lowercase()
         .contains("transfer-encoding: chunked");
     let body = if chunked { dechunk(body) } else { body.to_vec() };
-    String::from_utf8(body).expect("response body is UTF-8")
+    Ok(String::from_utf8(body).expect("response body is UTF-8"))
+}
+
+/// Same terms as the daemon suite's helper, and for the same reason: a
+/// refusal that arrives before a single byte does is the machine being
+/// out of capacity, not the daemon answering wrongly. This file's own
+/// `connect(..).expect("connect daemon")` failed with ECONNREFUSED about
+/// one full-suite run in ten on a box also running another checkout's
+/// suite - four daemons here, eight HTTP workers each, plus everything
+/// else `cargo test` has in flight.
+///
+/// This cannot hide the wedge the file exists to catch. A wedged daemon
+/// ACCEPTS and then never answers, so `connect` succeeds and the read
+/// blocks - no retry is reachable - and the elapsed-time bounds around
+/// these calls (3s, against a total retry budget of 0.8s) still fail.
+/// Only a pre-byte refusal is retried, and only five times.
+fn http(port: u16, req: &str) -> String {
+    let mut last = String::new();
+    for attempt in 0..5u32 {
+        match http_once(port, req) {
+            Ok(out) => return out,
+            Err(e) => {
+                last = e.to_string();
+                std::thread::sleep(Duration::from_millis(100 * u64::from(attempt) + 50));
+            }
+        }
+    }
+    panic!("daemon on :{port} never served {req}: {last}");
 }
 
 /// Minimal `Transfer-Encoding: chunked` decoder - enough for what
@@ -154,14 +194,29 @@ fn seed_index(dir: &Path, n: usize) {
 }
 
 fn serve(dir: &Path) -> Running {
+    serve_with_hooks(dir, true)
+}
+
+/// `hooks` gates NZBFAST_DEBUG_HOOKS. Every daemon in this file goes
+/// through here, including the one that must run WITHOUT the hook:
+/// launching inline instead cost that test the port-race handling below,
+/// and it failed with ECONNREFUSED under a loaded box - it waited 30s for
+/// a banner that a daemon which had already lost :port and exited was
+/// never going to print, then talked to nothing.
+fn serve_with_hooks(dir: &Path, hooks: bool) -> Running {
     for attempt in 0..3 {
         let port = free_port();
         let log = dir.join("daemon.log");
         let out = std::fs::File::create(&log).unwrap();
         let err = out.try_clone().unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_nzbfast"))
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        if hooks {
+            cmd.env("NZBFAST_DEBUG_HOOKS", "1");
+        } else {
+            cmd.env_remove("NZBFAST_DEBUG_HOOKS");
+        }
+        let child = cmd
             .env("NZBFAST_NO_ENRICH", "1")
-            .env("NZBFAST_DEBUG_HOOKS", "1")
             .env_remove("NZBFAST_OPEN")
             .arg("--config")
             .arg(dir.join("config.json"))
@@ -326,37 +381,8 @@ fn held_index_lock_does_not_wedge_the_api() {
 #[test]
 fn debug_hook_absent_without_env() {
     let dir = scratch("nohook");
-    let port = free_port();
-    let log = dir.join("daemon.log");
-    let out = std::fs::File::create(&log).unwrap();
-    let err = out.try_clone().unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_nzbfast"))
-        .env("NZBFAST_NO_ENRICH", "1")
-        .env_remove("NZBFAST_DEBUG_HOOKS")
-        .env_remove("NZBFAST_OPEN")
-        .arg("--config")
-        .arg(dir.join("config.json"))
-        .arg("serve")
-        .arg("--bind")
-        .arg("127.0.0.1")
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("--out")
-        .arg(dir.join("complete"))
-        .arg("--index-db")
-        .arg(dir.join("index.db"))
-        .stdout(Stdio::from(out))
-        .stderr(Stdio::from(err))
-        .spawn()
-        .unwrap();
-    let _kill = KillOnDrop(child);
-    let banner = format!("open the dashboard at  http://localhost:{port}/");
-    for _ in 0..300 {
-        if std::fs::read_to_string(&log).unwrap_or_default().contains(&banner) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    let d = serve_with_hooks(&dir, false);
+    let port = d.port;
     let t = Instant::now();
     let r = api(port, "mode=debug_hold_index&value=30");
     // An unknown mode's error answer, immediately - not a 30s stall.

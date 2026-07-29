@@ -15464,6 +15464,17 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                     // the new directory goes through `dir_claim`, which
                     // locks the queue itself, so computing it while
                     // holding that lock deadlocks the daemon.
+                    //
+                    // Queued, stated positively. `!= Downloading` also
+                    // matched a job that had just finished and was still
+                    // in the queue waiting for `park` to file it - the
+                    // state flip and the queue removal are not one step.
+                    // Re-deriving out_dir for a job whose bytes are
+                    // already on disk points its history entry at a
+                    // directory the files were never written to, and the
+                    // caller is told `true` for a move nothing performed.
+                    // Held, deferred and duplicate jobs are all Queued,
+                    // so none of them lose the ability to be refiled.
                     let target = d
                         .queue
                         .lock()
@@ -15471,12 +15482,15 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                         .iter()
                         .find_map(|j| {
                             let g = j.lock().unwrap();
-                            (g.nzo_id == id && g.state != JobState::Downloading)
+                            (g.nzo_id == id && g.state == JobState::Queued)
                                 .then(|| (j.clone(), g.name.clone(), g.category.clone()))
                         });
                     match target {
-                        None => json!({"status": false,
-                            "error": "no queued job with that nzo_id (a job already downloading keeps its category)"}),
+                        // Not queued - it may already be in history. A
+                        // download in the wrong category used to be
+                        // unfixable the moment it finished, which is
+                        // exactly when people notice.
+                        None => history_change_cat(&d, &id, &cat),
                         // Already there: don't re-derive, or the job's own
                         // directory reads as taken and the name climbs .2.
                         Some((_, _, current)) if current == cat => json!({"status": true}),
@@ -18558,53 +18572,14 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                             } else {
                                 nzbkit::disk::sanitize_filename(&cat)
                             };
-                            match find(&value) {
-                                None => json!({"status": false, "error": "unknown nzo_id"}),
-                                Some(job) => {
-                                    let (old_dir, stem, filed) = {
-                                        let g = job.lock().unwrap();
-                                        let stem = g
-                                            .out_dir
-                                            .file_name()
-                                            .map(|s| s.to_string_lossy().into_owned())
-                                            .unwrap_or_else(|| g.name.clone());
-                                        // Same guard as remove_job_files: once
-                                        // a TV-filed job's out_dir is a shared
-                                        // `Season NN` folder, renaming it drags
-                                        // every sibling episode into the new
-                                        // category and orphans their records.
-                                        (g.out_dir.clone(), stem, g.filed)
-                                    };
-                                    let new_dir = if cat.is_empty() {
-                                        d.out_dir().join(&stem)
-                                    } else {
-                                        d.out_dir().join(&cat).join(&stem)
-                                    };
-                                    if filed {
-                                        // Refuse rather than move a shared
-                                        // season folder; the per-episode move
-                                        // isn't modelled, so this is safe.
-                                        json!({"status": false,
-                                            "error": "cannot recategorize a TV-filed episode: it shares a season folder with its siblings"})
-                                    } else if new_dir == old_dir {
-                                        json!({"status": true, "path": new_dir.to_string_lossy()})
-                                    } else if let Some(p) = new_dir.parent()
-                                        && std::fs::create_dir_all(p).is_ok()
-                                        && std::fs::rename(&old_dir, &new_dir).is_ok()
-                                    {
-                                        let mut g = job.lock().unwrap();
-                                        g.category = cat.clone();
-                                        g.out_dir = new_dir.clone();
-                                        if !cat.is_empty() {
-                                            d.cats.lock().unwrap().insert(cat);
-                                        }
-                                        json!({"status": true, "path": new_dir.to_string_lossy()})
-                                    } else {
-                                        json!({"status": false,
-                                            "error": "move failed (files in use, or target exists?)"})
-                                    }
-                                }
-                            }
+                            // One implementation with change_cat's history
+                            // leg. This used to rename under the download
+                            // root only - ignoring the completed-move
+                            // destinations, failing across filesystems
+                            // (fs::rename cannot cross onto a NAS), and
+                            // never persisting - so a recategorized job
+                            // forgot its category on restart.
+                            history_change_cat(&d, &value, &cat)
                         }
                         Some("delete") => {
                             let del_files = params.get("del_files").map(String::as_str) == Some("1");
@@ -22055,6 +22030,111 @@ fn largest_media_file(dir: &std::path::Path) -> Option<PathBuf> {
     best.map(|(_, p)| p)
 }
 
+/// Change the category of a job that already finished: relabel the
+/// history entry and, when the payload sits in a folder of its own, move
+/// that folder to where the new category would have put it - the
+/// per-category override first, then the global completed destination,
+/// then the download root, mirroring `relocate_completed`'s ladder.
+///
+/// A Failed job moves too - retry reuses `out_dir` when it is free, so
+/// the article journal travels with the partial payload and the rerun
+/// both resumes AND completes into the right place - but only under the
+/// download root: the completed-move destinations are for finished
+/// payloads, not in-progress state. One case relabels WITHOUT moving,
+/// said out loud in the reply: a TV-filed job, whose files are
+/// interleaved with other jobs' in a shared Show/Season folder, so
+/// moving `out_dir` would drag innocent siblings along. The move
+/// happens with no locks held - `move_tree` on a NAS is seconds, and
+/// the queue must not stall behind it.
+fn history_change_cat(d: &Daemon, id: &str, cat: &str) -> Value {
+    let target = d.history.lock().unwrap().iter().find_map(|j| {
+        let g = j.lock().unwrap();
+        (g.nzo_id == id).then(|| {
+            (j.clone(), g.state, g.category.clone(), g.out_dir.clone(), g.filed, g.finalizing)
+        })
+    });
+    let Some((job, state, current, out_dir, filed, finalizing)) = target else {
+        return json!({"status": false,
+            "error": "no job with that nzo_id (a job still downloading keeps its category until it finishes)"});
+    };
+    if finalizing {
+        return json!({"status": false,
+            "error": "post-processing is still running for this job - try again when it settles"});
+    }
+    if current == cat {
+        return json!({"status": true});
+    }
+    let moved = if !filed {
+        let base = if state == JobState::Completed {
+            let cat_root = d
+                .move_completed_cats
+                .read()
+                .unwrap()
+                .iter()
+                .find(|(c, _)| *c == cat)
+                .map(|(_, p)| p.clone());
+            match (cat_root, d.move_completed.read().unwrap().clone()) {
+                // The override IS that category's root - no repeated component.
+                (Some(root), _) => root,
+                (None, Some(root)) if !cat.is_empty() => root.join(cat),
+                (None, Some(root)) => root,
+                (None, None) if !cat.is_empty() => d.out_dir().join(cat),
+                (None, None) => d.out_dir(),
+            }
+        } else if cat.is_empty() {
+            d.out_dir()
+        } else {
+            d.out_dir().join(cat)
+        };
+        let dest = base.join(out_dir.file_name().unwrap_or_default());
+        // Same aliasing guard as relocate_completed: a dest that IS the
+        // current folder through case or symlinks must not self-merge.
+        let same = dest == out_dir
+            || matches!((dest.canonicalize(), out_dir.canonicalize()),
+                        (Ok(a), Ok(b)) if a == b);
+        if same {
+            None
+        } else {
+            match crate::smart::move_tree(&out_dir, &dest) {
+                Ok(()) => {
+                    println!("[move] recategorized → {}", dest.display());
+                    Some(dest)
+                }
+                // Category unchanged on a failed move: a label that says
+                // "movies" over files still sitting in tv/ is a lie that
+                // outlives the error message.
+                Err(e) => {
+                    return json!({"status": false,
+                        "error": format!("could not move the files: {e}")});
+                }
+            }
+        }
+    } else {
+        None
+    };
+    {
+        let mut g = job.lock().unwrap();
+        g.category = cat.to_string();
+        if let Some(p) = &moved {
+            g.out_dir = p.clone();
+        }
+    }
+    d.register_cat(cat);
+    d.save_queue();
+    let note = if filed {
+        "relabeled only: the files were filed into a shared TV folder and stayed there"
+    } else {
+        ""
+    };
+    // `path` is what the dashboard's toast names; kept even when nothing
+    // moved so the message can still say where the files live.
+    let path = moved.clone().unwrap_or(out_dir);
+    json!({"status": true,
+           "moved": moved.map(|p| p.to_string_lossy().to_string()),
+           "path": path.to_string_lossy(),
+           "note": note})
+}
+
 fn history_json(d: &Daemon, params: &std::collections::HashMap<String, String>) -> Value {
     let h = d.history.lock().unwrap();
     let failed_only = params.get("failed_only").map(String::as_str) == Some("1");
@@ -22088,6 +22168,11 @@ fn history_json(d: &Daemon, params: &std::collections::HashMap<String, String>) 
                 // is the average network speed for this job.
                 "downloaded_bytes": j.downloaded_bytes,
                 "elapsed_secs": (j.elapsed_secs * 10.0).round() / 10.0,
+                // SAB's native key for "when did this finish", unix
+                // seconds. 0 for spool entries that predate
+                // `finished_unix` - clients treat that as "unknown",
+                // never as 1970.
+                "completed": j.finished_unix.unwrap_or(0),
                 "bad_blocks": j.bad_blocks,
                 // M24: the value never leaves the daemon - only the facts.
                 "password_required": j.password_required,

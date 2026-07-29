@@ -1,0 +1,30 @@
+[Unit]
+Description=nzbfast
+Documentation=https://nzbfast.github.io/nzbfast/
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+
+# Written by scripts/postinst from the install wizard's answers. Keeping
+# the paths here rather than in ExecStart means a user can move their
+# downloads later by editing one file, and an upgrade that replaces this
+# unit does not silently move their data back.
+EnvironmentFile=/var/packages/nzbfast/var/nzbfast.env
+
+# index.db and other relative state land next to the config, matching the
+# container image's WORKDIR /config.
+WorkingDirectory=/var/packages/nzbfast/var
+
+ExecStart=/var/packages/nzbfast/target/bin/nzbfast serve \
+    --config /var/packages/nzbfast/var/config.json \
+    --port ${NZBFAST_PORT} \
+    --out ${NZBFAST_OUT} \
+    --watch ${NZBFAST_WATCH}
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

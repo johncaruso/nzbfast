@@ -1,0 +1,5 @@
+corpus/
+corpus-run/
+nzbserve/target/
+bin/
+*.log

@@ -5227,9 +5227,20 @@ async fn sab_facade_status_warnings_and_change_cat() {
         let r = http(port, "/api?mode=get_scripts&apikey=sekrit&output=json", None);
         assert!(r.contains("\"None\""), "{r}");
 
-        // Queue a job (no server, so it will never start) and move it to
-        // another category. Nothing has been written, so this re-derives
-        // the output directory rather than moving files.
+        // Pause before queueing, and it has to be before: "no server, so
+        // it never starts" is not true. With an empty server list the job
+        // IS picked up, fails "config has no servers" inside half a
+        // second, and parks to history. In isolation the three round
+        // trips below beat that; under the full suite's load they did not,
+        // and the queue read found an empty slot list perhaps one run in
+        // six. A paused queue is never picked from, so the job stays
+        // Queued for as long as this test needs it.
+        let r = http(port, "/api?mode=pause&apikey=sekrit&output=json", None);
+        assert!(r.contains("\"status\":true"), "pause refused: {r}");
+
+        // Queue a job and move it to another category. Nothing has been
+        // written, so this re-derives the output directory rather than
+        // moving files.
         let nzb = "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"&quot;chg.bin&quot; yEnc (1/1)\">\n    <groups><group>g</group></groups>\n    <segments><segment bytes=\"100\" number=\"1\">&lt;a@x&gt;</segment></segments>\n  </file>\n</nzb>\n";
         let body = format!(
             "--BB\r\nContent-Disposition: form-data; name=\"nzbfile\"; filename=\"Chg.Show.S01E01.1080p.nzb\"\r\nContent-Type: application/xml\r\n\r\n{nzb}\r\n--BB--\r\n"

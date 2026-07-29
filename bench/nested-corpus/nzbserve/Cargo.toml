@@ -1,0 +1,17 @@
+[package]
+name = "nzbserve"
+version = "0.1.0"
+edition = "2024"
+description = "Nested-corpus loopback rig: builds the leg NZB and serves the leg's files as real yEnc articles over plain-TCP NNTP, reusing nzbkit's mock server."
+publish = false
+
+[dependencies]
+nzbkit = { path = "../../../crates/nzbkit" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
+
+# Standalone crate on purpose: the repo workspace must not pick this up
+# (bench tooling, not a shipped crate).
+[workspace]
+
+[profile.release]
+debug = false

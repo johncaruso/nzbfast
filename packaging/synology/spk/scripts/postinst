@@ -1,0 +1,196 @@
+#!/bin/sh
+# Pick the download location and write the service's environment file.
+#
+# The whole point of this package is that a DSM user answers no questions
+# and edits no files, so this script has to choose well without asking.
+set -e
+
+PKG=nzbfast
+VAR="${SYNOPKG_PKGVAR:-/var/packages/$PKG/var}"
+DEST="${SYNOPKG_PKGDEST:-/var/packages/$PKG/target}"
+ENVFILE="$VAR/nzbfast.env"
+PORT="@@PORT@@"
+
+# Refuse to install on top of something already serving this port, rather
+# than installing a package whose service then fails to bind every time
+# with the reason only in a log the GUI does not surface.
+#
+# The likely cause is nzbfast already running as a Container Manager
+# container, and that case deserves more than "port in use": two nzbfast
+# instances pointed at one download folder would both claim the same jobs
+# and write over each other, which is worse than either a clash or a clean
+# refusal. Migrating means stopping the container first, on purpose.
+if [ -z "${SPK_TEST_SKIP_PORTCHECK:-}" ] \
+   && command -v curl >/dev/null 2>&1 \
+   && curl -s -m 3 -o /dev/null "http://127.0.0.1:$PORT/"; then
+    echo "nzbfast: something is already serving port $PORT on this NAS." >&2
+    echo "nzbfast: if that is nzbfast running under Container Manager," >&2
+    echo "nzbfast: stop and remove that container first - running both" >&2
+    echo "nzbfast: against the same download folder would have them" >&2
+    echo "nzbfast: fighting over the same jobs." >&2
+    echo "nzbfast: your settings and downloads are not touched by this." >&2
+    exit 1
+fi
+
+# The package is built noarch and carries a binary for each supported
+# architecture, so there is ONE download and one package-source URL for
+# every model - DSM's package feed protocol filters by arch server-side,
+# which a static host cannot do, and asking a user to know whether their
+# NAS is ARM or Intel is exactly the friction this package exists to
+# remove. The cost is carrying one unused binary; the benefit is that
+# nobody can pick the wrong file.
+#
+# noarch also means DSM will happily install this on an architecture we do
+# not ship, so refuse clearly here rather than leaving a package that
+# installs and then dies at every start with nothing explaining why.
+if [ -d "$DEST/bin" ]; then
+    # SPK_TEST_UNAME lets the test harness pretend to be another model.
+    # DSM never sets it.
+    machine="${SPK_TEST_UNAME:-$(uname -m 2>/dev/null || echo unknown)}"
+    case "$machine" in
+        x86_64|amd64)   want=nzbfast-x86_64 ;;
+        aarch64|arm64)  want=nzbfast-aarch64 ;;
+        *)
+            echo "nzbfast: this NAS reports architecture '$machine', which" >&2
+            echo "nzbfast: this package does not support. nzbfast ships" >&2
+            echo "nzbfast: 64-bit builds only (x86_64 and aarch64)." >&2
+            exit 1
+            ;;
+    esac
+    if [ ! -f "$DEST/bin/$want" ]; then
+        echo "nzbfast: package is missing $want - build is broken." >&2
+        exit 1
+    fi
+    ln -sf "$want" "$DEST/bin/nzbfast"
+    # Drop the binary we cannot run, so the installed package does not sit
+    # on twice the disk it needs for the rest of its life.
+    for other in nzbfast-x86_64 nzbfast-aarch64; do
+        [ "$other" = "$want" ] || rm -f "$DEST/bin/$other"
+    done
+fi
+
+# An upgrade must never move somebody's downloads. If they already have an
+# env file, it is the source of truth and we leave it exactly alone.
+if [ -f "$ENVFILE" ]; then
+    exit 0
+fi
+
+# Find the volume with the most free space. A NAS with one volume gets
+# /volume1 either way; a multi-volume box gets the roomy one rather than
+# whichever sorts first, because downloads are the large thing here.
+#
+# Only SHARED FOLDERS appear in File Station. A bare directory under
+# /volume1 is invisible there, so a user who cannot find their downloads
+# would reasonably conclude nothing downloaded. That makes "is there a
+# share I can use" the primary question and free space only a tie-break:
+# picking the roomiest volume first would happily land on a big empty
+# second volume with no shares on it, which is the worst answer available.
+#
+# SPK_TEST_ROOT exists so packaging/tests can exercise this against a fake
+# volume layout. DSM never sets it, so on a real NAS it is empty and the
+# paths below are the literal /volumeN.
+best_vol=""
+best_free=0
+best_share=""
+fallback_vol=""
+fallback_free=0
+for v in "${SPK_TEST_ROOT:-}"/volume1 "${SPK_TEST_ROOT:-}"/volume2 \
+         "${SPK_TEST_ROOT:-}"/volume3 "${SPK_TEST_ROOT:-}"/volume4 \
+         "${SPK_TEST_ROOT:-}"/volume5 "${SPK_TEST_ROOT:-}"/volume6 \
+         "${SPK_TEST_ROOT:-}"/volume7 "${SPK_TEST_ROOT:-}"/volume8; do
+    [ -d "$v" ] || continue
+    free=$(df -k "$v" 2>/dev/null | awk 'NR==2 {print $4}')
+    case "$free" in ''|*[!0-9]*) free=0 ;; esac
+
+    # Roomiest volume overall, used only if nothing has a usable share.
+    if [ "$free" -gt "$fallback_free" ]; then
+        fallback_free="$free"
+        fallback_vol="$v"
+    fi
+
+    # DSM filesystems are case-sensitive and the stock share is
+    # capitalised ("Downloads"), so both spellings have to be listed.
+    for share in downloads Downloads download Download media Media video Video; do
+        if [ -d "$v/$share" ] && [ "$free" -gt "$best_free" ]; then
+            best_free="$free"
+            best_vol="$v"
+            best_share="$share"
+            break
+        fi
+    done
+done
+[ -n "$fallback_vol" ] || fallback_vol="${SPK_TEST_ROOT:-}/volume1"
+
+# A non-default port means a second instance built deliberately, so give
+# it its own folder. Sharing a download folder between two running
+# instances is not a port clash, it is two daemons claiming the same jobs.
+DIRNAME=nzbfast
+[ "$PORT" = "6789" ] || DIRNAME="nzbfast-port$PORT"
+
+BASE=""
+if [ -n "$best_share" ]; then
+    BASE="$best_vol/$best_share/$DIRNAME"
+else
+    best_vol="$fallback_vol"
+fi
+if [ -z "$BASE" ]; then
+    BASE="$VAR"
+    echo "nzbfast: no downloads/media shared folder found on $best_vol." >&2
+    echo "nzbfast: downloads will go to $BASE/downloads for now." >&2
+    echo "nzbfast: to put them somewhere you can browse in File Station," >&2
+    echo "nzbfast: make a shared folder, then change the download folder" >&2
+    echo "nzbfast: in the nzbfast dashboard under Settings." >&2
+fi
+
+OUT="$BASE/downloads"
+WATCH="$BASE/watch"
+
+# Only ever chown a directory this script CREATED. The obvious candidate
+# path, <share>/nzbfast, is exactly what an existing Container Manager
+# install already uses - config, index.db, apikey, downloads and watch all
+# live under it - so anyone migrating from Docker has one sitting there,
+# full of data, owned by them. Recursively chowning that to the package
+# service account would take their running install's files away from it,
+# to fix a permission problem they did not have. Adopt what is already
+# there instead, and say so.
+reused=""
+for d in "$OUT" "$WATCH"; do
+    [ -d "$d" ] && reused="$reused $d"
+done
+
+# DSM creates var/ owned by this package's service account, whose name
+# differs between DSM builds and package origins. Reading it off the
+# directory DSM just made is more reliable than hardcoding a guess.
+owner=$(stat -c %U "$VAR" 2>/dev/null || echo "")
+group=$(stat -c %G "$VAR" 2>/dev/null || echo "")
+
+for d in "$OUT" "$WATCH"; do
+    if [ -d "$d" ]; then
+        continue
+    fi
+    mkdir -p "$d"
+    if [ -n "$owner" ] && [ "$owner" != "UNKNOWN" ]; then
+        chown -R "$owner:${group:-$owner}" "$d" 2>/dev/null || true
+    fi
+done
+
+if [ -n "$reused" ]; then
+    echo "nzbfast: reusing existing folders, ownership left as it is:" >&2
+    for d in $reused; do echo "nzbfast:   $d" >&2; done
+    echo "nzbfast: if nzbfast cannot write there, grant the package user" >&2
+    echo "nzbfast: access to that shared folder in DSM rather than" >&2
+    echo "nzbfast: changing the folder's owner." >&2
+fi
+
+umask 077
+cat > "$ENVFILE" <<EOF
+# nzbfast service settings. Edit and restart the package to change them.
+NZBFAST_PORT=$PORT
+NZBFAST_OUT=$OUT
+NZBFAST_WATCH=$WATCH
+EOF
+if [ -n "$owner" ] && [ "$owner" != "UNKNOWN" ]; then
+    chown "$owner:${group:-$owner}" "$ENVFILE" 2>/dev/null || true
+fi
+
+exit 0
