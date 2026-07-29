@@ -1,0 +1,76 @@
+# nzbfast on a Synology NAS, as a Container Manager Project.
+#
+#   1. Put this file in a folder on your NAS, e.g. /docker/nzbfast.
+#   2. Edit PUID, PGID and TZ below. SSH in and run `id <your-dsm-user>`
+#      to get the two numbers (often uid 1026, gid 100).
+#   3. Container Manager -> Project -> Create. Name it nzbfast, set the
+#      path to that folder, and choose the option that uses the
+#      docker-compose.yml already there.
+#   4. Open http://YOUR_NAS_IP:6789 and add your Usenet server in the
+#      Welcome panel. There is no config file to edit.
+#
+# Full walkthrough: https://nzbfast.github.io/nzbfast/synology.html
+#
+# Keep the :latest tag. A container created from a version tag such as
+# :1.0.3 never moves to a newer release, no matter what you do later:
+# Watchtower and a manual re-pull both fetch the tag the container was
+# created with.
+services:
+  nzbfast:
+    image: nzbfast/nzbfast:latest        # searchable in Container Manager
+    # Identical image on GitHub, if you prefer it:
+    # image: ghcr.io/nzbfast/nzbfast:latest
+    container_name: nzbfast
+    restart: unless-stopped
+    ports:
+      - "6789:6789"
+    environment:
+      - PUID=1026                # your uid  (id your_dsm_username)
+      - PGID=100                 # your gid
+      - TZ=Europe/London         # your timezone
+      # nzbfast generates an API key on first start and prints it in the
+      # container log, so the dashboard is not open to your whole
+      # network. To pick your own instead, uncomment this:
+      # - NZBFAST_APIKEY=change-me
+    volumes:
+      - ./config:/config            # settings + index database
+      - ./downloads:/downloads      # finished files
+      - ./watch:/watch              # drop an .nzb here to auto-download
+
+  # Keeps nzbfast up to date. It checks nightly at 04:00 for a newer
+  # nzbfast image and recreates the container when one ships. Your
+  # settings and downloads survive, because they live in the folders
+  # above rather than inside the container.
+  #
+  # Read this before you keep it: Watchtower needs the Docker socket to
+  # recreate containers, and mounting /var/run/docker.sock gives this
+  # container root-equivalent control of your NAS. That is a real trade,
+  # convenience against handing one container broad power. If you would
+  # rather not make it, delete this whole watchtower block and use the
+  # DSM scheduled task at the bottom of this file instead.
+  #
+  # As written it is scoped to nzbfast by the name at the end of the
+  # command line, so it never touches your other containers.
+  watchtower:
+    image: containrrr/watchtower
+    container_name: nzbfast-watchtower
+    restart: unless-stopped
+    environment:
+      - TZ=Europe/London   # same timezone, so the schedule below is your 04:00
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --cleanup --schedule "0 0 4 * * *" nzbfast
+
+# Auto-update without the Docker socket
+# ------------------------------------
+# If you deleted the watchtower service, DSM can do the same job on a
+# schedule and nothing needs the socket mounted:
+#
+#   Control Panel -> Task Scheduler -> Create -> Scheduled Task ->
+#   User-defined script. Run it as root, daily, with:
+#
+#     cd /volume1/docker/nzbfast && docker compose pull && docker compose up -d
+#
+# Adjust the path to the folder holding this file. On DSM 7.1 and older
+# the command is `docker-compose` (with the hyphen) rather than
+# `docker compose`.
