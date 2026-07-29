@@ -3442,3 +3442,56 @@ async fn top_level_7z_over_the_cap_demotes_cleanly_when_it_cannot_trim() {
         "the demoted archive did not reconstruct"
     );
 }
+
+/// TODO 37 step 3: a `.7z.001` SPLIT SET posted as three files streams
+/// as one container. 7z multipart is a raw byte split, so the set is a
+/// single archive with seams in it: part 1's start header sizes the
+/// whole thing, and the continuation parts - which carry no signature
+/// whatsoever - join by name. Nothing lands on disk.
+///
+/// Before this, the parts materialized and the post-pass concatenated
+/// them into a scratch container before unpacking, which is a full extra
+/// copy of the archive on top of the download.
+#[tokio::test(flavor = "multi_thread")]
+async fn top_level_7z_split_set_extracts_one_pass() {
+    if !have_par2() {
+        eprintln!("skipping: par2 not installed");
+        return;
+    }
+    let mut fx = Fixture::new("top7zsplit");
+    let movie = incompressible(6 << 20, 45);
+    let arch = sevenz_store_container(&[("movie.mkv", &movie)]);
+    // Exactly how `7z -v` splits: every part the split size, last one
+    // the remainder.
+    let split = arch.len().div_ceil(3);
+    let parts: Vec<&[u8]> = arch.chunks(split).collect();
+    assert_eq!(parts.len(), 3, "fixture must really split");
+    let names: Vec<String> = (1..=3).map(|i| format!("release.7z.{i:03}")).collect();
+    for (i, name) in names.iter().enumerate() {
+        fx.add_file(name, parts[i], 200_000);
+    }
+    let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    assert!(fx.add_par2(5, &refs, 200_000));
+    let srv = MockServer::start(fx.articles.clone(), Chaos::default()).await;
+    let cfg = fx.write_config(&[&srv]);
+    let nzb = fx.write_nzb();
+    let out = fx.dir.join("out");
+
+    let (log, ok) = tokio::task::spawn_blocking(move || run_get(&cfg, &nzb, &out, &[]))
+        .await
+        .unwrap();
+    assert!(ok, "get failed:\n{log}");
+    assert!(log.contains("extracted 1 file(s) in-stream"), "{log}");
+    assert!(log.contains("7z · one-pass"), "the set did not stream:\n{log}");
+    assert_eq!(
+        std::fs::read(fx.dir.join("out/movie.mkv")).expect("extracted file"),
+        movie,
+        "extracted bytes differ"
+    );
+    for name in &names {
+        assert!(
+            !fx.dir.join("out").join(name).exists(),
+            "{name} must not touch disk"
+        );
+    }
+}

@@ -355,6 +355,7 @@ anlatılan üç kendini ölçme aracı.</p>
 5 saniye içinde alınır ve dosya kaldırılır. Dizinleyici sitelerinden tek tıkla yakalamalar
 için tarayıcının indirme dizinini buna yönlendir.</td></tr>
 <tr><td><b>Bir URL'den</b></td><td>Bir NZB bağlantısı yapıştır (API <code>mode=addurl</code> ya da bağlı herhangi bir uygulama üzerinden).</td></tr>
+<tr><td><b>nzblnk: bağlantıları</b></td><td>Bir <code>nzblnk:</code> bağlantısını panonun herhangi bir yerine yapıştırın ya da içine sürükleyin. macOS DMG'sinden veya Windows kurulumundan kurduysanız bir board üzerinde doğrudan tıklayabilirsiniz de. Aşağıdaki <a href="#nzblnk">nzblnk bağlantıları</a> bölümüne bakın.</td></tr>
 <tr><td><b>Dizine göz at</b></td><td>Göz at kartındaki tam bir sürüme tıkla.</td></tr>
 <tr><td><b>İzleme listesi / RSS</b></td><td>Otomatik - bkz. <a href="#automation">Otomasyon</a>.</td></tr>
 <tr><td><b>Sonarr/Radarr vb.</b></td><td>Yakalamaları doğrudan kuyruğa gönderir - bkz. <a href="#arr">§11</a>.</td></tr>
@@ -367,10 +368,37 @@ klasörü olur ve Akıllı Klasörler (bkz. <a href="#automation">§10</a>) onla
 atayabilir.</li>
 <li><b>Öncelikler</b>: Zorla &gt; Yüksek &gt; Normal &gt; Düşük. Zorla, duraklamayı ve kotayı
 atlar.</li>
-<li>Şifreli arşivler için <b>parolalar</b> NZB içindeki
-<code>&lt;meta type="password"&gt;</code>'dan ya da bir
-<code>Name{{password}}.nzb</code> dosya adından otomatik alınır ve API üzerinden iş
-başına ya da sonradan Geçmiş'ten (🔑) sağlanabilir.</li>
+<li><b>Şifreli arşivlerin parolaları</b> NZB içindeki
+<code>&lt;meta type="password"&gt;</code> alanından, bir
+<code>Name{{password}}.nzb</code> dosya adından ya da bir
+<a href="#nzblnk">nzblnk bağlantısının</a> <code>p=</code> alanından otomatik alınır;
+ayrıca iş başına API üzerinden veya sonradan Geçmiş'ten (🔑) verilebilir.</li>
+</ul>
+
+<h3 id="nzblnk">nzblnk bağlantıları</h3>
+<p>Bazı board'lar, çoğunlukla Alman ve Hollanda kaynaklı olanlar, NZB dosyası yerine bir
+<code>nzblnk:</code> bağlantısı yayımlar. Gönderi belirsizleştirilmiştir, dolayısıyla
+bağlanılacak bir dosya adı yoktur. Bağlantı bunun yerine bir başlık taşır,
+<code>h=</code>; bu bir konum değil, bir arama anahtarıdır. Yanında isteğe bağlı bir
+başlık <code>t=</code>, bir parola <code>p=</code> ve bir grup <code>g=</code> bulunur.
+Gönderiyi önce birinin gidip bulması gerekir.</p>
+<p>nzbfast başlığı önce kendi dizininde arar, bunun için hiç ağ gerekmez; ancak orada
+bulunamazsa yapılandırdığınız arama dizinleyicilerine sorar (Ayarlar → Arama
+dizinleyicileri, <a href="#settings">§9</a>) ve bunu her aramada geçerli olan aynı günlük
+bütçeler ve aynı geri çekilmeyle yapar. Başlık işin adı olur, parola ise işe otomatik
+uygulanır.</p>
+<ul>
+<li><b>Yapıştırmak veya sürüklemek</b> her kurulumda çalışır, Docker ve NAS kutuları
+dahil: bağlantıyı board'dan kopyalayın ve panonun herhangi bir yerine yapıştırın.</li>
+<li><b>Tıklamak</b> için şemanın masaüstünüze kayıtlı olması gerekir. <b>macOS DMG</b>
+uygulaması bunu kaydeder, <b>Windows kurulumu</b> ise bir görev olarak sunar: önce sorar
+ve şemayı NZB Monkey ya da NZBDonkey zaten tutuyorsa ona dokunmaz. Düz macOS tarball'ı,
+Homebrew ve Linux kurulumlarının masaüstü işleyicisi yoktur; oralarda giriş yolu
+yapıştırmaktır.</li>
+<li>Çözümleme bilerek hız sınırlıdır. Kayıtlı bir şema, ziyaret ettiğiniz her sayfadan
+yalnızca bir tarayıcı sorusu uzaktadır; bu yüzden bağlantılar dakika başına
+sınırlandırılır ve bir dakikanın yalnızca ilk birkaçı dizinleyicilerinize ulaşabilir,
+ondan sonrası yalnızca yerel dizinden yanıtlanır.</li>
 </ul>
 
 <h2 id="wall">6 · Poster duvarı</h2>
@@ -443,11 +471,43 @@ bir sunucuyu havuza alıp havuzdan çıkarma. Her sunucuda şunlar bulunur:</p>
 <table>
 <tr><th>Alan</th><th>Notlar</th></tr>
 <tr><td>Adres / port</td><td>SSL portu <b>563</b>'ü kullan. TLS ölçülebilir hiçbir maliyet getirmez - nzbfast her zaman şifreler.</td></tr>
-<tr><td>Kullanıcı adı / parola</td><td><code>config.local.json</code> içinde yerel olarak saklanır, tarayıcıya asla geri gösterilmez. Düzenlemede parolayı boş bırakmak saklananı korur.</td></tr>
+<tr><td>Kullanıcı adı / parola</td><td><code>config.local.json</code> içinde yerel olarak saklanır, tarayıcıya asla geri gösterilmez. Düzenlemede parolayı boş bırakmak saklananı korur. Parolalar diskte <a href="#passwords">şifrelenmez, gizlenir</a>.</td></tr>
 <tr><td>Bağlantılar</td><td>Sunucu başına eşzamanlı bağlantı. Yükseği tahmin etmek yerine her sağlayıcının en uygun noktasını bulmak için <b>Bağlantı ayarı</b>'nı (<a href="#performance">§13</a>) kullan.</td></tr>
 <tr><td>Düzey (katman)</td><td>0 = birincil; daha yüksek düzeyler yalnızca her alt düzeyin kaçırdığı makaleler için istenen dolum sunucularıdır. Sınırsız hesapları 0'a, blok hesaplarını 1+'a koy.</td></tr>
 <tr><td>Blok boyutu (GB)</td><td>Blok (GB başına ücret) hesaplar için: nzbfast ömür boyu kullanımı buna karşı izler ve bittiğinde sunucuyu kullanmayı bırakır (%85'te uyarı).</td></tr>
 </table>
+<h3 id="passwords">Sağlayıcı parolalarınız nasıl saklanıyor</h3>
+<p><code>config.local.json</code> içindeki sağlayıcı parolaları <b>gizlenmiştir,
+şifrelenmemiştir</b>. <code>obf1:</code> ve ardından kodlanmış bir biçim olarak
+saklanırlar; böylece dosya bir ekran görüntüsünde, bir forum iletisinde, bir hata
+raporunda ya da başkasının görebileceği bir ekranda belirdiğinde düz metin olarak
+okunmaz.</p>
+<p>Bunun size ne kazandırdığı ve ne kazandırmadığı açık olsun:</p>
+<ul>
+<li><b>Bu şifreleme değildir ve dosyayı eline geçiren kimseye karşı hiçbir koruma
+sağlamaz.</b> Yöntem açık kaynağımızda duruyor ve çözücü nzbfast'ın içinde geliyor;
+dosyayı elinde tutan parolayı saniyeler içinde geri çıkarır. Dosyayı, parolalar
+okunabilir olsaydı nasıl saklardıysanız tam olarak öyle gizli tutun.</li>
+<li><b>Sıradan sızıntıyı ortadan kaldırır</b>, ki yaygın olan odur. Yapılandırmalar
+destek başlıklarına yapıştırılıyor ve ekran görüntülerine takılıyor; diskten
+çalınmalarından çok daha sık.</li>
+<li>Kendi elinizle düz metin yazdığınız bir parola yine çalışır. nzbfast her iki biçimi
+de okur, böylece elle düzenlenmiş yapılandırmalar ve başka istemcilerden içe aktarımlar
+asla bozulmaz; bir sonraki kayıtta gizlenmiş biçimi yazar.</li>
+<li>Dosya ayrıca yalnızca nzbfast'ı çalıştıran hesabın okuyabileceği şekilde yazılır
+(macOS ve Linux'ta 0600 kipi).</li>
+</ul>
+<p>Karşılaştırma olsun: <b>NZBGet ve SABnzbd sağlayıcı parolalarını yapılandırma
+dosyalarında okunabilir düz metin olarak saklar</b>. Gizlemeyi bunun üzerine küçük bir
+iyileştirme sayıyoruz, bir güvenlik özelliği değil.</p>
+<p><b>Neden sistem anahtar zinciri değil?</b> macOS Keychain, Windows Kimlik Bilgileri
+Yöneticisi ve Linux gizli servisleri gerçek koruma verirdi ve buna yeniden bakabiliriz.
+Bugün iki şey engelliyor. Anahtar zinciri erişimi uygulama kimliğine bağlıdır ve
+nzbfast henüz kod imzalı değil; dolayısıyla her güncellemeden sonraki sorular ve davranış
+kötü oluyor. Ayrıca kurulumların büyük bir bölümü Docker, ekransız sunucular ve NAS
+kutuları; oralarda anahtar zinciri diye bir şey yok, bu da doğru tutulması gereken iki
+ayrı saklama yolu bırakırdı. Her yerde aynı davranan tek ve iyi anlaşılmış bir biçim
+şimdilik daha iyi bir takas.</p>
 <p>Sunucu başına iki seçeneğin panoda henüz bir denetimi yok: bunları o sunucunun
 <code>config.local.json</code> içindeki girdisine elle ekleyin
 (bkz. <a href="#files">§17</a>) ve yeniden başlatın.</p>
@@ -560,8 +620,21 @@ klasörü</b>, <b>son işlem betiği</b> (her işten sonra SABnzbd uyumlu argüm
 Klasörler</b> ve <b>TV dosyalama</b> (bkz. <a href="#automation">§10</a>).</p>
 
 <h3>Dizinleme <span class="pill live">canlı</span></h3>
+<div class="note"><b>Dahili dizinleyici varsayılan olarak kapalıdır.</b> Gerçek bir
+dosya adıyla atılmış gönderileri bulur; Usenet'in büyük ve büyüyen bir bölümü ise
+bilerek böyle bir ad olmadan atılır: rastgele konu, içeride rastgele dosya adları,
+her şeyin atıldığı bir gruba bırakılmış. Gerçek ad yalnızca yükleyicinin başka bir yerde
+yayımladığı bir NZB'de yaşar, yani hiçbir tarayıcının okuyabileceği biçimde Usenet'te
+hiç bulunmadı. Kendi dizinimizde ölçtük: taranan 14,8 milyon gönderi yaklaşık 31.000
+göz atılabilir yayın verdi, kabaca beş yüzde bir. Ticari dizinleyicileri kullanmayı
+sürdürün ve onları Ayarlar → Arama dizinleyicileri altına ekleyin ki duvardan
+arayabilesiniz. İnsanların hâlâ gerçek adlarla attığı belirli grupları izliyorsanız ya
+da sağlayıcınızın gerçekte ne taşıdığını görmek istiyorsanız bunu açın. Anahtar
+kapalıyken hiçbir şey taranmaz veya çekilmez, veritabanı oluşturulmaz; duvar, Göz at,
+izleme listesi ve newznab beslemesi gizlenir.</div>
 <table>
 <tr><th>Ayar</th><th>Ne yapar</th></tr>
+<tr><td>Dahili dizinleyici</td><td>Ana anahtar, <b>siz açmadıkça kapalı</b>. Kapalı demek: tarama yok, meta veri sorgusu yok, erişilebilirlik örneklemesi yok, newznab beslemesi yok; diskte hâlihazırda duran bir dizin korunur (silme düğmesi vardır), dolayısıyla yeniden açmak baştan taramak yerine kaldığı yerden sürdürür.</td></tr>
 <tr><td>Gruplar</td><td>Gömülü dizinleyicinin taradığı haber grupları (örn. <code>alt.binaries.teevee</code>).</td></tr>
 <tr><td>Tarama aralığı</td><td>Geçişler arasındaki saniye (varsayılan 900).</td></tr>
 <tr><td>Geriye doldurma makaleleri</td><td>Bir grubun ilk taramasında getirilen başlıklar.</td></tr>
@@ -636,9 +709,14 @@ yönlendirmesinin hepsi *arr'ların beklediği gibi davranır.</p>
 <code>tvsearch</code> ve <code>movie</code> sorgularını sunar ve
 <code>/getnzb/&lt;id&gt;</code> NZB'yi geri verir.</li>
 </ol>
-<div class="note"><b>Neden zahmet?</b>Tam olarak önem verdiğin grupların kendi kendine
-barındırılan bir dizinleyicisi: hesap yok, API isabet sınırı yok, taramasına izin verdiğin
-kadar derin saklama.</div>
+<div class="note"><b>Önce dahili dizinleyiciyi açın</b> (Ayarlar → Dizinleme). Varsayılan
+olarak kapalıdır ve kapalı olduğu sürece bu cephe her sorguya boş sonuç yerine
+<code>&lt;error code="101"&gt;</code> yanıtı verir; böylece bir yanlış, dizinleyiciyi
+eklediğiniz anda görünür, haftalar sonra değil.<br><br>
+<b>Neden zahmet edilsin?</b> Tam olarak önemsediğiniz grupların kendi barındırdığınız
+dizinleyicisi: hesap yok, API çağrı sınırı yok, taramasına izin verdiğiniz kadar derin
+saklama. Bu, alışılmış dizinleyicilerinizin yerine değil onlara ek olarak durur, çünkü
+yalnızca gerçek bir dosya adıyla atılanı bulur.</div>
 
 <h2 id="remotes">12 · Telefon &amp; uzaktan uygulamalar</h2>
 <p>nzbfast iki büyük uzaktan kumanda protokolünün <em>ikisini de</em> uygular, bu yüzden
@@ -804,10 +882,10 @@ olarak yükler ve eşleşen NZB'yi yazar. Bir işletim aracıdır; açık bir
 <p>Temel uç nokta: <code>http://host:6789/api?mode=…&amp;apikey=…&amp;output=json</code> -
 SABnzbd uyumlu, bu yüzden mevcut SAB tümleştirmeleri değişmeden çalışır. İki anahtar:
 <b>API anahtarı</b> (tam denetim) ve <b>NZB anahtarı</b> (yalnızca ekleme:
-<code>addfile</code>/<code>addurl</code>).</p>
+<code>addfile</code>/<code>addurl</code>). <code>addnzblnk</code> bilerek yalnızca ekleme kümesinde değildir: bir bağlantıyı çözümlemek ölçülen dizinleyici kotası harcayabilir, ki bu yalnızca ekleme yetkisinin işi değildir.</p>
 <table>
 <tr><th>Alan</th><th>Modlar</th></tr>
-<tr><td>Kuyruk</td><td><code>queue</code> (<code>name=delete/pause/resume/priority/switch</code> ile), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>retry</code>, <code>set_password</code></td></tr>
+<tr><td>Kuyruk</td><td><code>queue</code> (<code>name=delete/pause/resume/priority/switch</code> ile), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>addnzblnk</code>, <code>retry</code>, <code>set_password</code></td></tr>
 <tr><td>Bilgi</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code></td></tr>
 <tr><td>Yapılandırma</td><td><code>get_config</code>, <code>config&amp;name=&lt;setting&gt;&amp;value=…</code> (her Ayarlar alanı), <code>server_save/delete/test/enable/reorder</code>, <code>import_probe/apply</code></td></tr>
 <tr><td>Dizin &amp; duvar</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, ayrıca <code>/api?t=caps|search|tvsearch|movie</code> ve <code>/getnzb/&lt;id&gt;</code>'de newznab</td></tr>
@@ -820,7 +898,7 @@ SABnzbd uyumlu, bu yüzden mevcut SAB tümleştirmeleri değişmeden çalışır
 <h2 id="files">17 · Dosyalar &amp; konumlar</h2>
 <table>
 <tr><th>Dosya</th><th>İçerik</th></tr>
-<tr><td><code>config.local.json</code></td><td>Sunucu kimlik bilgileri ve sunucu başına seçenekler. Sihirbaz tarafından oluşturulur; Ayarlar'da düzenlenebilir. Onu gizli tut.</td></tr>
+<tr><td><code>config.local.json</code></td><td>Sunucu kimlik bilgileri ve sunucu başına seçenekler. Sihirbaz tarafından oluşturulur; Ayarlar'da düzenlenebilir. Onu gizli tut. Parolalar <a href="#passwords">gizlenir, şifrelenmez</a>.</td></tr>
 <tr><td><code>settings.json</code></td><td>Panelde değiştirilen her ayar. Yapılandırmanın yanında yaşar; arayüz değerleri komut satırı bayraklarını geçersiz kılar. Bayraklara/varsayılanlara dönmek için bir anahtarı (ya da dosyayı) sil.</td></tr>
 <tr><td><code>apikey</code></td><td>nzbfast'in ilk çalıştırmada kendine ürettiği API anahtarı (<a href="#firstrun-key">§2</a>). Yapılandırmanın yanında yaşar; macOS ve Linux'ta yalnızca nzbfast'i çalıştıran hesap tarafından okunabilir. Yeni bir anahtar almak için onu silme: zaten çalışmış bir kurulumda yerine hiçbir şey gelmez ve arka plan süreci hiç anahtarsız geri açılır. Bunun yerine Ayarlar → Güvenlik'ten yeni bir tane ayarla.</td></tr>
 <tr><td><code>index.db</code></td><td>Sürüm dizini (SQLite) + duvar meta verisi. Silmek güvenli - taramadan yeniden inşa olur (Ayarlar → Dizinleme → Sil bunu senin için yapar).</td></tr>

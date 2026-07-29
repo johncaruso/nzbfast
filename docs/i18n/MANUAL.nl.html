@@ -369,6 +369,7 @@ in <a href="#performance">Prestatietools</a>.</p>
 opslaat wordt binnen 5 seconden opgepikt en het bestand verwijderd. Zet de downloadmap
 van je browser erop voor één-klik-grabs vanaf indexersites.</td></tr>
 <tr><td><b>Vanaf een URL</b></td><td>Plak een NZB-link (API <code>mode=addurl</code>, of via elke gekoppelde app).</td></tr>
+<tr><td><b>nzblnk:-links</b></td><td>Plak een <code>nzblnk:</code>-link ergens op het dashboard, of sleep hem erin. Heb je geïnstalleerd vanaf de macOS-DMG of het Windows-installatieprogramma, dan kun je er ook rechtstreeks een aanklikken op een board. Zie <a href="#nzblnk">nzblnk-links</a> hieronder.</td></tr>
 <tr><td><b>Index doorzoeken</b></td><td>Klik op een complete release in de kaart Index doorzoeken.</td></tr>
 <tr><td><b>Watchlist / RSS</b></td><td>Automatisch - zie <a href="#automation">Automatisering</a>.</td></tr>
 <tr><td><b>Sonarr/Radarr e.d.</b></td><td>Die sturen grabs rechtstreeks de wachtrij in - zie <a href="#arr">§11</a>.</td></tr>
@@ -381,9 +382,35 @@ downloadmap, en Slimme mappen (zie <a href="#automation">§10</a>) kunnen ze op 
 toewijzen.</li>
 <li><b>Prioriteiten</b>: Geforceerd &gt; Hoog &gt; Normaal &gt; Laag. Geforceerd negeert pauze en quotum.</li>
 <li><b>Wachtwoorden</b> voor versleutelde archieven worden automatisch opgepikt uit
-<code>&lt;meta type="password"&gt;</code> in de NZB of uit een bestandsnaam
-<code>Name{{password}}.nzb</code>, en kunnen per taak via de API worden meegegeven of
-achteraf vanuit Geschiedenis (🔑).</li>
+<code>&lt;meta type="password"&gt;</code> in de NZB, uit een bestandsnaam
+<code>Name{{password}}.nzb</code> of uit het veld <code>p=</code> van een
+<a href="#nzblnk">nzblnk-link</a>, en kunnen per klus via de API of achteraf vanuit
+Geschiedenis (🔑) worden meegegeven.</li>
+</ul>
+
+<h3 id="nzblnk">nzblnk-links</h3>
+<p>Sommige boards, vooral Duitse en Nederlandse, publiceren een <code>nzblnk:</code>-link
+in plaats van een NZB-bestand. De post is versluierd, dus er is geen bestandsnaam om
+naar te linken. De link draagt in plaats daarvan een header, <code>h=</code>, die een
+zoeksleutel is en geen locatie, plus een optionele titel <code>t=</code>, wachtwoord
+<code>p=</code> en groep <code>g=</code>. Iemand moet de post eerst gaan vinden.</p>
+<p>nzbfast zoekt de header eerst op in zijn eigen index, waarvoor helemaal geen netwerk
+nodig is, en pas als dat misgaat vraagt het de zoekindexers die je hebt ingesteld
+(Instellingen → Zoekindexers, <a href="#settings">§9</a>), onder dezelfde dagbudgetten
+en dezelfde terugval als elke andere zoekopdracht. De titel wordt de klusnaam en het
+wachtwoord wordt automatisch aan de klus meegegeven.</p>
+<ul>
+<li><b>Plakken of slepen</b> werkt op elke installatie, Docker en NAS inbegrepen: kopieer
+de link van het board en plak hem ergens op het dashboard.</li>
+<li><b>Aanklikken</b> vereist dat het schema bij je bureaublad geregistreerd is. De app
+uit de <b>macOS-DMG</b> registreert het, en het <b>Windows-installatieprogramma</b> biedt
+het aan als taak: het vraagt eerst, en laat het schema met rust als NZB Monkey of
+NZBDonkey het al heeft. Het kale macOS-tarball, Homebrew en de Linux-installaties hebben
+geen bureaubladafhandeling: daar is plakken de weg naar binnen.</li>
+<li>Het oplossen is met opzet in snelheid begrensd. Een geregistreerd schema ligt één
+browserprompt verwijderd van elke pagina die je bezoekt, dus links zijn per minuut
+begrensd en alleen de eerste paar van een minuut mogen je indexers bereiken; daarna
+wordt er alleen uit de lokale index geantwoord.</li>
 </ul>
 
 <h2 id="wall">6 · De posterwall</h2>
@@ -461,11 +488,45 @@ server in of uit de pool halen. Elke server heeft:</p>
 <table>
 <tr><th>Veld</th><th>Toelichting</th></tr>
 <tr><td>Host / poort</td><td>Gebruik SSL-poort <b>563</b>. TLS kost niets meetbaars - nzbfast versleutelt altijd.</td></tr>
-<tr><td>Gebruikersnaam / wachtwoord</td><td>Lokaal opgeslagen in <code>config.local.json</code>, nooit terug naar de browser gestuurd. Laat je het wachtwoord bij bewerken leeg, dan blijft het opgeslagen wachtwoord staan.</td></tr>
+<tr><td>Gebruikersnaam / wachtwoord</td><td>Lokaal opgeslagen in <code>config.local.json</code>, nooit terug naar de browser gestuurd. Laat je het wachtwoord bij bewerken leeg, dan blijft het opgeslagen wachtwoord staan. Wachtwoorden zijn <a href="#passwords">op schijf versluierd, niet versleuteld</a>.</td></tr>
 <tr><td>Verbindingen</td><td>Gelijktijdige verbindingen per server. Gebruik <b>Verbindingstuning</b> (<a href="#performance">§13</a>) om de sweet spot van elke provider te vinden in plaats van hoog te gokken.</td></tr>
 <tr><td>Niveau (tier)</td><td>0 = primair; hogere niveaus zijn fill-servers, die alleen artikelen gevraagd worden die elk lager niveau miste. Zet onbeperkte accounts op 0, blokaccounts op 1+.</td></tr>
 <tr><td>Blokgrootte (GB)</td><td>Voor blokaccounts (betalen per GB): nzbfast houdt hiertegen het totale verbruik bij en stopt met de server zodra het blok op is (waarschuwing bij 85%).</td></tr>
 </table>
+<h3 id="passwords">Hoe je providerwachtwoorden worden bewaard</h3>
+<p>Providerwachtwoorden in <code>config.local.json</code> zijn <b>versluierd, niet
+versleuteld</b>. Ze worden opgeslagen als <code>obf1:</code> gevolgd door een
+gecodeerde vorm, zodat het bestand niet als platte tekst leest als het opduikt in een
+schermafbeelding, een forumbericht, een bugrapport of op een scherm dat iemand anders
+kan zien.</p>
+<p>Wees duidelijk over wat dat je wel en niet oplevert:</p>
+<ul>
+<li><b>Het is geen versleuteling en biedt geen enkele bescherming tegen wie het
+bestand heeft.</b> De methode staat in onze publieke broncode en de decoder zit in
+nzbfast zelf, dus wie het bestand heeft haalt het wachtwoord er in seconden uit.
+Behandel het bestand precies zo geheim als je zou doen wanneer de wachtwoorden
+leesbaar waren.</li>
+<li><b>Het haalt het achteloze lek weg</b>, en dat is het gewone lek. Configs worden
+veel vaker in supportdraadjes geplakt en op schermafbeeldingen vastgelegd dan dat ze
+van schijf worden gestolen.</li>
+<li>Een wachtwoord dat je zelf als platte tekst hebt ingetypt werkt gewoon. nzbfast
+leest beide vormen, dus met de hand bewerkte configs en imports uit andere clients
+gaan nooit stuk; bij de volgende keer opslaan schrijft het de versluierde vorm.</li>
+<li>Het bestand wordt bovendien alleen leesbaar geschreven voor het account waaronder
+nzbfast draait (modus 0600 op macOS en Linux).</li>
+</ul>
+<p>Ter vergelijking: <b>NZBGet en SABnzbd bewaren providerwachtwoorden allebei als
+leesbare platte tekst</b> in hun configuratiebestanden. Wij vinden versluiering daar
+een kleine verbetering op, geen beveiligingsfunctie.</p>
+<p><b>Waarom niet de systeemsleutelbos?</b> macOS Keychain, Windows Credential Manager
+en de Linux secret services zouden echte bescherming geven, en misschien komen we er
+nog op terug. Twee dingen houden ons vandaag tegen. Toegang tot de sleutelbos hangt
+aan de identiteit van de applicatie, en nzbfast is nog niet ondertekend, dus de
+prompts en het gedrag na elke update zijn slecht. En een groot deel van de installaties
+is Docker, servers zonder scherm en NAS-apparaten waar helemaal geen sleutelbos
+bestaat, wat twee verschillende opslagpaden zou opleveren die correct moeten blijven.
+Eén goed begrepen formaat dat zich overal hetzelfde gedraagt is voorlopig de betere
+ruil.</p>
 <p>Twee andere opties per server hebben nog geen bediening in het dashboard: zet ze
 met de hand bij de vermelding van die server in <code>config.local.json</code>
 (zie <a href="#files">§17</a>) en herstart.</p>
@@ -579,8 +640,21 @@ film of serie zijn herkend: een softwarepayload of een niet te classificeren
 en <b>tv-opbergen</b> (zie <a href="#automation">§10</a>).</p>
 
 <h3>Indexeren <span class="pill live">live</span></h3>
+<div class="note"><b>De ingebouwde indexer staat standaard uit.</b> Hij vindt posts die
+onder een echte bestandsnaam zijn geplaatst, en een groot en groeiend deel van Usenet
+wordt bewust zonder zo'n naam geplaatst: willekeurig onderwerp, willekeurige
+bestandsnamen erin, gedumpt in een verzamelgroep. De echte naam leeft alleen in een NZB
+die de uploader elders publiceert, dus hij stond nooit op Usenet waar een scanner hem
+kon lezen. Gemeten op onze eigen index leverden 14,8 miljoen gescande posts ongeveer
+31.000 doorzoekbare releases op, grofweg één op de vijfhonderd. Blijf commerciële
+indexers gebruiken en voeg ze toe onder Instellingen → Zoekindexers, zodat je ze vanaf
+de wall kunt doorzoeken. Zet dit aan als je specifieke groepen volgt waar mensen nog
+onder echte namen posten, of als je wilt zien wat je provider werkelijk draagt. Met de
+schakelaar uit wordt er niets gescand of opgehaald, wordt er geen database aangemaakt,
+en zijn de wall, Index doorzoeken, de watchlist en de newznab-feed verborgen.</div>
 <table>
 <tr><th>Instelling</th><th>Wat het doet</th></tr>
+<tr><td>Ingebouwde indexer</td><td>De hoofdschakelaar, <b>uit tenzij je hem aanzet</b>. Uit betekent geen scannen, geen metadata-opvragingen, geen beschikbaarheidssteekproeven en geen newznab-feed; een index die al op schijf staat blijft bewaard (er is een verwijderknop), dus weer aanzetten hervat in plaats van opnieuw te scannen.</td></tr>
 <tr><td>Groepen</td><td>Nieuwsgroepen die de ingebouwde indexer scant (bijv. <code>alt.binaries.teevee</code>).</td></tr>
 <tr><td>Scaninterval</td><td>Seconden tussen rondes (standaard 900).</td></tr>
 <tr><td>Backfill-artikelen</td><td>Headers die bij de allereerste scan van een groep worden opgehaald.</td></tr>
@@ -658,9 +732,14 @@ proberen en categorierouting gedragen zich allemaal zoals de *arrs verwachten.</
 <code>movie</code>-queries uit zijn eigen index van je gescande groepen, en
 <code>/getnzb/&lt;id&gt;</code> levert de NZB terug.</li>
 </ol>
-<div class="note"><b>Waarom zou je?</b>Een zelfgehoste indexer van precies de groepen
-die jou interesseren: geen accounts, geen API-hit-limieten, retentie zo diep als je
-hem laat scannen.</div>
+<div class="note"><b>Zet eerst de ingebouwde indexer aan</b> (Instellingen → Indexeren).
+Hij staat standaard uit, en zolang dat zo is beantwoordt deze façade elke query met
+<code>&lt;error code="101"&gt;</code> in plaats van met een leeg resultaat, zodat een fout
+opvalt op het moment dat je de indexer toevoegt en niet pas weken later.<br><br>
+<b>Waarom zou je?</b> Een zelfgehoste indexer van precies de groepen waar je om geeft:
+geen accounts, geen API-limieten, retentie zo diep als je hem laat scannen. Het is een
+aanvulling op je gebruikelijke indexers en geen vervanging, want hij vindt alleen wat
+onder een echte bestandsnaam is geplaatst.</div>
 
 <h2 id="remotes">12 · Telefoon &amp; remote-apps</h2>
 <p>nzbfast implementeert <em>beide</em> grote afstandsbedieningsprotocollen, dus
@@ -836,10 +915,10 @@ vereist een expliciete <code>--post-server</code> en kiest nooit zelf een server
 <p>Basis-endpoint: <code>http://host:6789/api?mode=…&amp;apikey=…&amp;output=json</code> -
 SABnzbd-compatibel, dus bestaande SAB-integraties werken ongewijzigd. Twee sleutels:
 de <b>API-sleutel</b> (volledige controle) en de <b>NZB-sleutel</b> (alleen toevoegen:
-<code>addfile</code>/<code>addurl</code>).</p>
+<code>addfile</code>/<code>addurl</code>). <code>addnzblnk</code> zit met opzet niet in de alleen-toevoegen set: een link oplossen kan afgerekende indexerquota kosten, en daar gaat een alleen-toevoegen sleutel niet over.</p>
 <table>
 <tr><th>Gebied</th><th>Modes</th></tr>
-<tr><td>Wachtrij</td><td><code>queue</code> (met <code>name=delete/pause/resume/priority/switch</code>), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>retry</code>, <code>set_password</code></td></tr>
+<tr><td>Wachtrij</td><td><code>queue</code> (met <code>name=delete/pause/resume/priority/switch</code>), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>addnzblnk</code>, <code>retry</code>, <code>set_password</code></td></tr>
 <tr><td>Info</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code></td></tr>
 <tr><td>Config</td><td><code>get_config</code>, <code>config&amp;name=&lt;setting&gt;&amp;value=…</code> (elk veld uit Instellingen), <code>server_save/delete/test/enable/reorder</code>, <code>import_probe/apply</code></td></tr>
 <tr><td>Index &amp; wall</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, plus newznab op <code>/api?t=caps|search|tvsearch|movie</code> en <code>/getnzb/&lt;id&gt;</code></td></tr>
@@ -852,7 +931,7 @@ de <b>API-sleutel</b> (volledige controle) en de <b>NZB-sleutel</b> (alleen toev
 <h2 id="files">17 · Bestanden &amp; locaties</h2>
 <table>
 <tr><th>Bestand</th><th>Inhoud</th></tr>
-<tr><td><code>config.local.json</code></td><td>Serverinloggegevens en opties per server. Aangemaakt door de wizard; te bewerken in Instellingen. Houd hem privé.</td></tr>
+<tr><td><code>config.local.json</code></td><td>Serverinloggegevens en opties per server. Aangemaakt door de wizard; te bewerken in Instellingen. Houd hem privé. Wachtwoorden zijn <a href="#passwords">versluierd, niet versleuteld</a>.</td></tr>
 <tr><td><code>settings.json</code></td><td>Elke instelling die in het dashboard is gewijzigd. Staat naast de config; UI-waarden overschrijven commandoregelvlaggen. Verwijder een sleutel (of het bestand) om terug te vallen op vlaggen/standaardwaarden.</td></tr>
 <tr><td><code>apikey</code></td><td>De API-sleutel die nzbfast bij een eerste start voor zichzelf aanmaakte (<a href="#firstrun-key">§2</a>). Staat naast de config; op macOS en Linux alleen leesbaar voor het account waaronder nzbfast draait. Verwijder hem niet om een verse sleutel te krijgen: bij een installatie die al gedraaid heeft komt er niets voor in de plaats en start de daemon weer op zonder enige sleutel. Stel er in plaats daarvan een nieuwe in bij Instellingen → Beveiliging.</td></tr>
 <tr><td><code>index.db</code></td><td>De release-index (SQLite) + wall-metadata. Veilig te verwijderen - hij wordt door het scannen opnieuw opgebouwd (Instellingen → Indexeren → Wissen doet dit voor je).</td></tr>

@@ -54,7 +54,21 @@ for a in linux-x64 linux-arm64; do
     curl -fsSL -o "$DIR/nzbfast-$VER-$a.tar.gz" "$REL/nzbfast-$VER-$a.tar.gz"
 done
 curl -fsSL -o "$DIR/SHA256SUMS.txt" "$REL/SHA256SUMS.txt"
-(cd "$DIR" && grep -E 'linux-(x64|arm64)\.tar\.gz' SHA256SUMS.txt | $SHA256C)
+# Each archive is verified against its OWN line, and the line has to
+# exist. One `grep | sha256sum -c` over both names was not that check: it
+# only required the pipeline to succeed, so a SHA256SUMS.txt carrying the
+# x64 entry alone passed - and the arm64 archive nobody had verified was
+# still unpacked into the image, pushed, and then attested. An
+# attestation over an unverified layer is worse than no attestation.
+for a in linux-x64 linux-arm64; do
+    art="nzbfast-$VER-$a.tar.gz"
+    n=$(grep -c "[ *]$art\$" "$DIR/SHA256SUMS.txt" || true)
+    if [ "$n" != "1" ]; then
+        echo "✗ SHA256SUMS.txt has $n checksum lines for $art (need exactly 1)" >&2
+        exit 1
+    fi
+    (cd "$DIR" && grep "[ *]$art\$" SHA256SUMS.txt | $SHA256C)
+done
 
 # Context: bin/<TARGETARCH>/nzbfast + entrypoint + Dockerfile.release.
 mkdir -p "$DIR/ctx/bin/amd64" "$DIR/ctx/bin/arm64"

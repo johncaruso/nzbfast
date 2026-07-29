@@ -354,6 +354,7 @@ defecte per descărcare - o coadă în creștere înseamnă că articolele soses
 preluat în 5 secunde, iar fișierul e eliminat. Îndreaptă directorul de descărcări al browserului tău
 spre el pentru preluări cu un singur clic de pe site-urile de indexer.</td></tr>
 <tr><td><b>Dintr-un URL</b></td><td>Lipește un link NZB (API <code>mode=addurl</code>, sau prin orice aplicație conectată).</td></tr>
+<tr><td><b>Legături nzblnk:</b></td><td>Lipește o legătură <code>nzblnk:</code> oriunde pe panou, sau trage-o înăuntru. Dacă ai instalat din DMG-ul macOS sau din instalatorul Windows, poți și să dai clic pe una direct pe un board. Vezi <a href="#nzblnk">legăturile nzblnk</a> mai jos.</td></tr>
 <tr><td><b>Răsfoiește indexul</b></td><td>Dă clic pe orice release complet din cardul Răsfoiește.</td></tr>
 <tr><td><b>Watchlist / RSS</b></td><td>Automat - vezi <a href="#automation">Automatizare</a>.</td></tr>
 <tr><td><b>Sonarr/Radarr etc.</b></td><td>Trimit preluările direct în coadă - vezi <a href="#arr">§11</a>.</td></tr>
@@ -364,10 +365,37 @@ spre el pentru preluări cu un singur clic de pe site-urile de indexer.</td></tr
 <li><b>Categoriile</b> sunt etichete libere; fiecare devine un subfolder al directorului tău de
 descărcare, iar Folderele inteligente (vezi <a href="#automation">§10</a>) le pot atribui după reguli.</li>
 <li><b>Priorități</b>: Forțată &gt; Ridicată &gt; Normală &gt; Scăzută. Forțata ignoră pauza și cota.</li>
-<li><b>Parolele</b> pentru arhivele criptate sunt preluate automat din
-<code>&lt;meta type="password"&gt;</code> din interiorul NZB-ului sau dintr-un
-nume de fișier <code>Name{{password}}.nzb</code> și pot fi furnizate per job prin
-API sau ulterior din Istoric (🔑).</li>
+<li><b>Parolele</b> arhivelor criptate sunt preluate automat din
+<code>&lt;meta type="password"&gt;</code> din NZB, dintr-un nume de fișier
+<code>Name{{password}}.nzb</code> sau din câmpul <code>p=</code> al unei
+<a href="#nzblnk">legături nzblnk</a>, și pot fi date per sarcină prin API sau ulterior
+din Istoric (🔑).</li>
+</ul>
+
+<h3 id="nzblnk">Legăturile nzblnk</h3>
+<p>Unele board-uri, mai ales germane și olandeze, publică o legătură
+<code>nzblnk:</code> în loc de un fișier NZB. Postarea este ofuscată, deci nu există
+niciun nume de fișier către care s-ar putea trimite. Legătura duce în schimb un antet,
+<code>h=</code>, care este o cheie de căutare și nu o locație, plus un titlu
+<code>t=</code>, o parolă <code>p=</code> și un grup <code>g=</code> opționale. Cineva
+trebuie mai întâi să se ducă și să găsească postarea.</p>
+<p>nzbfast caută antetul mai întâi în propriul index, ceea ce nu cere deloc rețea, și
+abia dacă acolo nu îl găsește întreabă indexatoarele de căutare pe care le-ai configurat
+(Setări → Indexatoare de căutare, <a href="#settings">§9</a>), sub aceleași bugete
+zilnice și aceeași retragere ca orice altă căutare. Titlul devine numele sarcinii, iar
+parola se aplică automat.</p>
+<ul>
+<li><b>Lipirea sau tragerea</b> merge pe orice instalare, Docker și cutii NAS incluse:
+copiază legătura de pe board și lipește-o oriunde pe panou.</li>
+<li><b>Clicul</b> pe o legătură cere ca schema să fie înregistrată la desktopul tău.
+Aplicația din <b>DMG-ul macOS</b> o înregistrează, iar <b>instalatorul Windows</b> o
+oferă ca sarcină: întreabă mai întâi și lasă schema în pace dacă NZB Monkey sau
+NZBDonkey o deține deja. Arhiva macOS simplă, Homebrew și instalările Linux nu au
+niciun handler de desktop, acolo calea de intrare este lipirea.</li>
+<li>Rezolvarea este limitată ca ritm intenționat. O schemă înregistrată stă la o singură
+solicitare de browser distanță de orice pagină pe care o vizitezi, deci legăturile au un
+plafon pe minut și doar primele câteva dintr-un minut pot ajunge la indexatoarele tale;
+dincolo de asta se răspunde doar din indexul local.</li>
 </ul>
 
 <h2 id="wall">6 · Peretele de postere</h2>
@@ -440,11 +468,43 @@ sau excluderea oricărui server din pool. Fiecare server are:</p>
 <table>
 <tr><th>Câmp</th><th>Note</th></tr>
 <tr><td>Host / port</td><td>Folosește portul SSL <b>563</b>. TLS nu costă nimic măsurabil - nzbfast criptează întotdeauna.</td></tr>
-<tr><td>Nume de utilizator / parolă</td><td>Stocate local în <code>config.local.json</code>, nearătate niciodată înapoi browserului. Lăsând parola goală la editare, se păstrează cea stocată.</td></tr>
+<tr><td>Nume de utilizator / parolă</td><td>Stocate local în <code>config.local.json</code>, nearătate niciodată înapoi browserului. Lăsând parola goală la editare, se păstrează cea stocată. Parolele sunt <a href="#passwords">ofuscate pe disc, nu criptate</a>.</td></tr>
 <tr><td>Conexiuni</td><td>Conexiuni simultane per server. Folosește <b>Reglarea conexiunilor</b> (<a href="#performance">§13</a>) pentru a găsi punctul optim al fiecărui provider în loc să ghicești mare.</td></tr>
 <tr><td>Nivel (treaptă)</td><td>0 = primar; nivelurile mai mari sunt servere de umplere, întrebate doar pentru articolele pe care le-a ratat fiecare nivel inferior. Pune conturile nelimitate la 0, conturile cu bloc la 1+.</td></tr>
 <tr><td>Dimensiunea blocului (GB)</td><td>Pentru conturile cu bloc (plată-per-GB): nzbfast urmărește utilizarea pe toată durata față de aceasta și nu mai folosește serverul când e consumat (avertisment la 85%).</td></tr>
 </table>
+<h3 id="passwords">Cum sunt păstrate parolele furnizorilor tăi</h3>
+<p>Parolele de furnizor din <code>config.local.json</code> sunt <b>ofuscate, nu
+criptate</b>. Sunt scrise ca <code>obf1:</code> urmat de o formă codificată, așa încât
+fișierul să nu se citească drept text simplu dacă apare într-o captură de ecran,
+într-un mesaj de forum, într-un raport de eroare sau pe un ecran pe care îl vede
+altcineva.</p>
+<p>Să fim limpezi cu ce îți aduce și ce nu:</p>
+<ul>
+<li><b>Nu este criptare și nu oferă nicio protecție față de cine are fișierul.</b>
+Metoda se află în sursele noastre publice, iar decodorul vine chiar în nzbfast, deci
+oricine ține fișierul scoate parola în câteva secunde. Tratează fișierul ca pe un
+secret exact cum ai face-o dacă parolele ar fi lizibile.</li>
+<li><b>Elimină scurgerea din neatenție</b>, care este cea obișnuită. Configurațiile
+ajung lipite în fire de suport și prinse în capturi de ecran mult mai des decât sunt
+furate de pe disc.</li>
+<li>O parolă pe care ai scris-o tu ca text simplu funcționează în continuare. nzbfast
+citește ambele forme, deci configurațiile editate de mână și importurile din alți
+clienți nu se strică niciodată; scrie forma ofuscată la următoarea salvare.</li>
+<li>Fișierul este scris, în plus, lizibil doar pentru contul care rulează nzbfast
+(mod 0600 pe macOS și Linux).</li>
+</ul>
+<p>Prin comparație, <b>NZBGet și SABnzbd păstrează amândouă parolele de furnizor ca
+text lizibil</b> în fișierele lor de configurare. Considerăm ofuscarea o mică
+îmbunătățire față de asta, nu o funcție de securitate.</p>
+<p><b>De ce nu inelul de chei al sistemului?</b> Keychain pe macOS, Managerul de
+credențiale din Windows și serviciile de secrete din Linux ar da o protecție reală și
+poate revenim asupra ei. Astăzi ne opresc două lucruri. Accesul la inelul de chei ține
+de identitatea aplicației, iar nzbfast încă nu este semnat, așa că solicitările și
+comportamentul după fiecare actualizare sunt proaste. Și o parte mare a instalărilor
+sunt Docker, servere fără ecran și cutii NAS unde nu există niciun inel de chei, ceea
+ce ar lăsa două căi diferite de stocare de ținut corecte. Un singur format bine
+înțeles, care se poartă la fel peste tot, este deocamdată târgul mai bun.</p>
 <p>Alte două opțiuni per server nu au încă un control în panou: adaugă-le manual în
 intrarea acelui server din <code>config.local.json</code>
 (vezi <a href="#files">§17</a>) și repornește.</p>
@@ -557,8 +617,21 @@ curățat.</p>
 și <b>arhivare TV</b> (vezi <a href="#automation">§10</a>).</p>
 
 <h3>Indexare <span class="pill live">live</span></h3>
+<div class="note"><b>Indexatorul încorporat este oprit implicit.</b> Găsește postările
+făcute sub un nume de fișier real, iar o parte mare și în creștere din Usenet este
+postată intenționat fără unul: subiect aleator, nume de fișiere aleatoare înăuntru,
+aruncate într-un grup de-a valma. Numele adevărat trăiește doar într-un NZB pe care
+uploaderul îl publică în altă parte, deci nu a fost niciodată pe Usenet ca vreun scaner
+să îl citească. Măsurat pe propriul nostru index, 14,8 milioane de postări scanate au
+dat cam 31.000 de release-uri de răsfoit, aproximativ unul din cinci sute. Folosește
+mai departe indexatoare comerciale și adaugă-le la Setări → Indexatoare de căutare, ca
+să le poți interoga din perete. Pornește asta dacă urmărești grupuri anume în care lumea
+încă postează sub nume reale, sau dacă vrei să vezi ce duce de fapt furnizorul tău. Cu
+comutatorul oprit nu se scanează și nu se descarcă nimic, nu se creează nicio bază de
+date, iar peretele, Răsfoiește, Watchlist și fluxul newznab sunt ascunse.</div>
 <table>
 <tr><th>Setare</th><th>Ce face</th></tr>
+<tr><td>Indexator încorporat</td><td>Comutatorul principal, <b>oprit până nu îl pornești</b>. Oprit înseamnă fără scanare, fără căutări de metadate, fără eșantionare a disponibilității și fără flux newznab; un index deja aflat pe disc este păstrat (există un buton de ștergere), așa că repornirea reia în loc să rescaneze.</td></tr>
 <tr><td>Grupuri</td><td>Newsgroup-urile pe care le scanează indexerul integrat (ex. <code>alt.binaries.teevee</code>).</td></tr>
 <tr><td>Interval de scanare</td><td>Secunde între treceri (implicit 900).</td></tr>
 <tr><td>Articole de backfill</td><td>Antete preluate la prima scanare a unui grup.</td></tr>
@@ -635,8 +708,14 @@ se comportă toate cum se așteaptă *arr-urile.</p>
 <code>movie</code> din propriul index al grupurilor tale urmărite, iar
 <code>/getnzb/&lt;id&gt;</code> returnează NZB-ul.</li>
 </ol>
-<div class="note"><b>De ce să te obosești?</b>Un indexer auto-găzduit exact al grupurilor care te
-interesează: fără conturi, fără limite de accesări API, retenție atât de adâncă pe cât o lași să scaneze.</div>
+<div class="note"><b>Pornește mai întâi indexatorul încorporat</b> (Setări → Indexare).
+Este oprit implicit, iar cât timp este oprit această fațadă răspunde la orice
+interogare cu <code>&lt;error code="101"&gt;</code> în loc de un rezultat gol, așa că o
+greșeală se vede când adaugi indexatorul, nu peste săptămâni.<br><br>
+<b>De ce să te obosești?</b> Un indexator găzduit de tine exact peste grupurile care te
+interesează: fără conturi, fără limite de apeluri API, cu retenție atât de adâncă pe cât
+îl lași să scaneze. Este un adaos la indexatoarele tale obișnuite, nu un înlocuitor,
+pentru că găsește doar ce a fost postat sub un nume de fișier real.</div>
 
 <h2 id="remotes">12 · Telefon și aplicații la distanță</h2>
 <p>nzbfast implementează <em>ambele</em> protocoale majore de control la distanță, așa că aproape fiecare
@@ -807,10 +886,10 @@ yEnc și scrie NZB-ul corespunzător. Este o unealtă de operare, cere un
 <p>Endpoint de bază: <code>http://host:6789/api?mode=…&amp;apikey=…&amp;output=json</code> -
 compatibil SABnzbd, așa că integrările SAB existente funcționează neschimbate. Două chei:
 <b>cheia API</b> (control complet) și <b>cheia NZB</b> (doar adăugare:
-<code>addfile</code>/<code>addurl</code>).</p>
+<code>addfile</code>/<code>addurl</code>). <code>addnzblnk</code> lipsește intenționat din setul de doar adăugare: rezolvarea unei legături poate consuma cotă contorizată de indexator, ceea ce nu este treaba unei credențiale de doar adăugare.</p>
 <table>
 <tr><th>Zonă</th><th>Moduri</th></tr>
-<tr><td>Coadă</td><td><code>queue</code> (cu <code>name=delete/pause/resume/priority/switch</code>), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>retry</code>, <code>set_password</code></td></tr>
+<tr><td>Coadă</td><td><code>queue</code> (cu <code>name=delete/pause/resume/priority/switch</code>), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>addnzblnk</code>, <code>retry</code>, <code>set_password</code></td></tr>
 <tr><td>Info</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code></td></tr>
 <tr><td>Config</td><td><code>get_config</code>, <code>config&amp;name=&lt;setting&gt;&amp;value=…</code> (fiecare câmp din Setări), <code>server_save/delete/test/enable/reorder</code>, <code>import_probe/apply</code></td></tr>
 <tr><td>Index și perete</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, plus newznab la <code>/api?t=caps|search|tvsearch|movie</code> și <code>/getnzb/&lt;id&gt;</code></td></tr>
@@ -823,7 +902,7 @@ compatibil SABnzbd, așa că integrările SAB existente funcționează neschimba
 <h2 id="files">17 · Fișiere și locații</h2>
 <table>
 <tr><th>Fișier</th><th>Conținut</th></tr>
-<tr><td><code>config.local.json</code></td><td>Credențiale de server și opțiuni per server. Creat de asistent; editabil în Setări. Păstrează-l privat.</td></tr>
+<tr><td><code>config.local.json</code></td><td>Credențiale de server și opțiuni per server. Creat de asistent; editabil în Setări. Păstrează-l privat. Parolele sunt <a href="#passwords">ofuscate, nu criptate</a>.</td></tr>
 <tr><td><code>settings.json</code></td><td>Fiecare setare schimbată în panou. Se află lângă config; valorile din interfață au prioritate față de flagurile din linia de comandă. Șterge o cheie (sau fișierul) pentru a reveni la flaguri/valori implicite.</td></tr>
 <tr><td><code>apikey</code></td><td>Cheia API pe care nzbfast și-a făcut-o singur la o primă rulare (<a href="#firstrun-key">§2</a>). Se află lângă config; pe macOS și Linux poate fi citită doar de contul care rulează nzbfast. Nu îl șterge ca să obții o cheie nouă: pe o instalare care a rulat deja, nimic nu o înlocuiește, iar daemonul revine fără nicio cheie. Setează una nouă din Setări → Securitate în schimb.</td></tr>
 <tr><td><code>index.db</code></td><td>Indexul de release-uri (SQLite) + metadatele peretelui. Sigur de șters - se reconstruiește prin scanare (Setări → Indexare → Golire face asta pentru tine).</td></tr>

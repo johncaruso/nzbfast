@@ -12,6 +12,10 @@ Needs nightly + `cargo install cargo-fuzz`.
   scalar reference (`yenc::decode`) on RAW bytes. Complements the in-repo
   round-trip lite fuzzer, which never feeds the decoder malformed input.
 - `nzb_parse`    - `Nzb::parse` (XML).
+- `nzblnk_parse` - `nzblnk::parse` + `looks_like` on pasted text. Also
+  asserts the two agree about whether a string IS a link: the dashboard
+  gates on `looks_like` and the daemon then runs `parse`, so a
+  disagreement is a link the UI accepts and the API refuses.
 - `par2_parse`   - `Par2Set::parse`, single- and split-input framing.
 - `rar_extract`  - `ArchiveReader::read_with_options` + `extract_to`
   (the RAR13/15-40/50 decompressor). Window and output are bounded so a

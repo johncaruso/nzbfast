@@ -80,6 +80,14 @@ cat > "$APP/Contents/Info.plist" <<PLIST
       <key>LSItemContentTypes</key><array><string>com.nzbfast.nzb</string></array>
     </dict>
   </array>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key><string>com.nzbfast.nzblnk</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>CFBundleURLSchemes</key><array><string>nzblnk</string></array>
+    </dict>
+  </array>
   <key>UTImportedTypeDeclarations</key>
   <array>
     <dict>

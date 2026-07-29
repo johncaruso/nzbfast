@@ -379,6 +379,7 @@ gespeicherte <code>.nzb</code> wird binnen 5 Sekunden aufgegriffen und die Datei
 entfernt. Richte den Download-Ordner deines Browsers dorthin - für Ein-Klick-Grabs
 von Indexer-Seiten.</td></tr>
 <tr><td><b>Von einer URL</b></td><td>Füge einen NZB-Link ein (API <code>mode=addurl</code>, oder über jede verbundene App).</td></tr>
+<tr><td><b>nzblnk:-Links</b></td><td>Füge einen <code>nzblnk:</code>-Link irgendwo im Dashboard ein oder zieh ihn hinein. Aus dem macOS-DMG oder dem Windows-Installer installiert, kannst du auch direkt auf einem Board einen anklicken. Siehe <a href="#nzblnk">nzblnk-Links</a> weiter unten.</td></tr>
 <tr><td><b>Index durchsuchen</b></td><td>Klick ein vollständiges Release in der Durchsuchen-Karte an.</td></tr>
 <tr><td><b>Watchlist / RSS</b></td><td>Automatisch - siehe <a href="#automation">Automatisierung</a>.</td></tr>
 <tr><td><b>Sonarr/Radarr etc.</b></td><td>Sie schicken Grabs direkt in die Warteschlange - siehe <a href="#arr">§11</a>.</td></tr>
@@ -390,10 +391,37 @@ von Indexer-Seiten.</td></tr>
 Download-Ordners, und Smarte Ordner (siehe <a href="#automation">§10</a>) können sie
 per Regel zuweisen.</li>
 <li><b>Prioritäten</b>: Erzwingen &gt; Hoch &gt; Normal &gt; Niedrig. Erzwingen umgeht Pause und Quota.</li>
-<li><b>Passwörter</b> für verschlüsselte Archive werden automatisch aus
-<code>&lt;meta type="password"&gt;</code> in der NZB oder einem Dateinamen
-<code>Name{{password}}.nzb</code> übernommen und lassen sich pro Job über die API
-oder nachträglich im Verlauf (🔑) angeben.</li>
+<li><b>Passwörter</b> für verschlüsselte Archive werden automatisch übernommen aus
+<code>&lt;meta type="password"&gt;</code> in der NZB, einem Dateinamen
+<code>Name{{password}}.nzb</code> oder dem Feld <code>p=</code> eines
+<a href="#nzblnk">nzblnk-Links</a>, und lassen sich pro Job über die API oder
+nachträglich aus dem Verlauf (🔑) angeben.</li>
+</ul>
+
+<h3 id="nzblnk">nzblnk-Links</h3>
+<p>Manche Boards, vor allem deutsche und niederländische, geben einen
+<code>nzblnk:</code>-Link statt einer NZB-Datei heraus. Der Beitrag ist verschleiert,
+es gibt also gar keinen Dateinamen, auf den man verlinken könnte. Der Link trägt
+stattdessen einen Header, <code>h=</code>, der ein Suchschlüssel ist und kein Ort,
+dazu optional einen Titel <code>t=</code>, ein Passwort <code>p=</code> und eine
+Gruppe <code>g=</code>. Irgendwer muss den Beitrag also erst suchen gehen.</p>
+<p>nzbfast schlägt den Header zunächst im eigenen Index nach, wofür überhaupt kein
+Netz nötig ist, und fragt erst bei einem Fehlschlag die von dir eingerichteten
+Suchindexer (Einstellungen → Suchindexer, <a href="#settings">§9</a>), unter denselben
+Tagesbudgets und demselben Backoff wie jede andere Suche. Der Titel wird zum Job-Namen,
+das Passwort wird dem Job automatisch mitgegeben.</p>
+<ul>
+<li><b>Einfügen oder Ziehen</b> geht auf jeder Installation, Docker und NAS
+eingeschlossen: Link vom Board kopieren und irgendwo im Dashboard einfügen.</li>
+<li><b>Anklicken</b> setzt voraus, dass das Schema bei deinem Desktop registriert ist.
+Die App aus dem <b>macOS-DMG</b> registriert es, und der <b>Windows-Installer</b> bietet
+es als Aufgabe an: er fragt vorher und lässt das Schema in Ruhe, wenn NZB Monkey oder
+NZBDonkey es schon hält. Das reine macOS-Tarball, Homebrew und die Linux-Installationen
+haben keinen Desktop-Handler, dort ist Einfügen der Weg hinein.</li>
+<li>Das Auflösen ist absichtlich ratenbegrenzt. Ein registriertes Schema liegt eine
+Browser-Abfrage von jeder Seite entfernt, die du besuchst, also sind Links pro Minute
+gedeckelt und nur die ersten paar einer Minute dürfen deine Indexer erreichen; danach
+wird allein aus dem lokalen Index geantwortet.</li>
 </ul>
 
 <h2 id="wall">6 · Die Posterwand</h2>
@@ -474,11 +502,47 @@ jeden Server in den Pool holen oder aus ihm herausnehmen. Jeder Server hat:</p>
 <table>
 <tr><th>Feld</th><th>Hinweise</th></tr>
 <tr><td>Host / Port</td><td>Nimm den SSL-Port <b>563</b>. TLS kostet nichts Messbares - nzbfast verschlüsselt immer.</td></tr>
-<tr><td>Benutzername / Passwort</td><td>Lokal in <code>config.local.json</code> gespeichert, nie zurück an den Browser gezeigt. Das Passwort beim Bearbeiten leer lassen behält das gespeicherte.</td></tr>
+<tr><td>Benutzername / Passwort</td><td>Lokal in <code>config.local.json</code> gespeichert, nie zurück an den Browser gezeigt. Das Passwort beim Bearbeiten leer lassen behält das gespeicherte. Passwörter werden <a href="#passwords">auf der Platte verschleiert, nicht verschlüsselt</a>.</td></tr>
 <tr><td>Verbindungen</td><td>Gleichzeitige Verbindungen pro Server. Nutz <b>Verbindungs-Tuning</b> (<a href="#performance">§13</a>), um den Sweet Spot jedes Providers zu finden, statt einfach hoch zu raten.</td></tr>
 <tr><td>Level (Tier)</td><td>0 = primär; höhere Level sind Fill-Server und werden nur nach Artikeln gefragt, die alle niedrigeren Level verpasst haben. Flatrate-Konten auf 0, Block-Konten auf 1+.</td></tr>
 <tr><td>Blockgröße (GB)</td><td>Für Block-Konten (Bezahlung pro GB): nzbfast zählt die Lebenszeitnutzung dagegen und lässt den Server aus, sobald der Block aufgebraucht ist (Warnung bei 85 %).</td></tr>
 </table>
+<h3 id="passwords">Wie deine Provider-Passwörter gespeichert werden</h3>
+<p>Provider-Passwörter in <code>config.local.json</code> sind <b>verschleiert, nicht
+verschlüsselt</b>. Sie werden als <code>obf1:</code> gefolgt von einer kodierten Form
+abgelegt, damit die Datei sich nicht als Klartext liest, wenn sie in einem Screenshot,
+einem Forenbeitrag, einem Fehlerbericht oder auf einem Bildschirm auftaucht, den
+jemand anderes sehen kann.</p>
+<p>Sagen wir klar, was das bringt und was nicht:</p>
+<ul>
+<li><b>Es ist keine Verschlüsselung und schützt in keiner Weise vor jemandem, der die
+Datei hat.</b> Das Verfahren steht in unserem öffentlichen Quelltext und der Dekoder
+steckt in nzbfast selbst, wer die Datei hat, holt das Passwort in Sekunden heraus.
+Behandle die Datei genau so geheim, wie du es tätest, wenn die Passwörter lesbar
+wären.</li>
+<li><b>Es beseitigt das beiläufige Leck</b>, und das ist das häufige. Configs werden
+weit öfter in Support-Threads eingefügt und in Screenshots festgehalten, als sie von
+der Platte gestohlen werden.</li>
+<li>Ein Passwort, das du selbst im Klartext eingetragen hast, funktioniert weiterhin.
+nzbfast liest beide Formen, von Hand bearbeitete Configs und Importe aus anderen
+Clients gehen also nie kaputt; beim nächsten Speichern schreibt es die verschleierte
+Form.</li>
+<li>Die Datei wird außerdem nur für das Konto lesbar geschrieben, unter dem nzbfast
+läuft (Modus 0600 auf macOS und Linux).</li>
+</ul>
+<p>Zum Vergleich: <b>NZBGet und SABnzbd speichern Provider-Passwörter beide als
+lesbaren Klartext</b> in ihren Konfigurationsdateien. Wir halten Verschleierung für
+eine kleine Verbesserung darüber, nicht für ein Sicherheitsmerkmal.</p>
+<p><b>Warum nicht der System-Schlüsselbund?</b> macOS Keychain, die Windows-
+Anmeldeinformationsverwaltung und die Linux-Secret-Dienste würden echten Schutz
+bieten, und wir schauen uns das vielleicht noch einmal an. Zwei Dinge halten uns
+heute davon ab. Der Zugriff auf den Schlüsselbund hängt an der Identität der
+Anwendung, und nzbfast ist noch nicht signiert, also sind die Abfragen und das
+Verhalten nach jedem Update schlecht. Und ein großer Teil der Installationen sind
+Docker, Server ohne Bildschirm und NAS-Geräte, wo es überhaupt keinen Schlüsselbund
+gibt, was zwei verschiedene Speicherpfade hinterließe, die korrekt bleiben müssen.
+Ein einziges, gut verstandenes Format, das sich überall gleich verhält, ist vorerst
+der bessere Handel.</p>
 <p>Zwei weitere Optionen pro Server haben noch kein Bedienelement im Dashboard:
 trage sie von Hand beim Eintrag dieses Servers in <code>config.local.json</code> ein
 (siehe <a href="#files">§17</a>) und starte neu.</p>
@@ -595,8 +659,22 @@ werden), <b>Smarte Ordner</b> und <b>TV-Ablage</b> (siehe
 <a href="#automation">§10</a>).</p>
 
 <h3>Indexierung <span class="pill live">live</span></h3>
+<div class="note"><b>Der eingebaute Indexer ist standardmäßig aus.</b> Er findet
+Beiträge, die unter einem echten Dateinamen gepostet wurden, und ein großer und
+wachsender Teil des Usenet wird absichtlich ohne einen solchen gepostet: zufälliger
+Betreff, zufällige Dateinamen darin, abgelegt in einer Sammelgruppe. Der echte Name
+lebt nur in einer NZB, die der Uploader anderswo veröffentlicht, er war also nie im
+Usenet, wo ein Scanner ihn hätte lesen können. An unserem eigenen Index gemessen
+ergaben 14,8 Millionen gescannte Beiträge etwa 31.000 durchsuchbare Releases, also
+ungefähr einer von fünfhundert. Nutze weiter kommerzielle Indexer und trage sie unter
+Einstellungen → Suchindexer ein, damit du sie von der Wand aus durchsuchen kannst.
+Schalte das hier ein, wenn du bestimmten Gruppen folgst, in denen noch unter echten
+Namen gepostet wird, oder wenn du sehen willst, was dein Provider tatsächlich führt.
+Bei ausgeschaltetem Schalter wird nichts gescannt oder geholt, keine Datenbank
+angelegt, und Wand, Durchsuchen, Watchlist und der newznab-Feed sind ausgeblendet.</div>
 <table>
 <tr><th>Einstellung</th><th>Was sie bewirkt</th></tr>
+<tr><td>Eingebauter Indexer</td><td>Der Hauptschalter, <b>aus, solange du ihn nicht einschaltest</b>. Aus heißt: kein Scannen, keine Metadaten-Abfragen, keine Verfügbarkeitsstichproben und kein newznab-Feed; ein bereits auf der Platte liegender Index bleibt erhalten (es gibt einen Löschknopf), das Wiedereinschalten setzt also fort statt neu zu scannen.</td></tr>
 <tr><td>Gruppen</td><td>Newsgroups, die der eingebaute Indexer scannt (z.&nbsp;B. <code>alt.binaries.teevee</code>).</td></tr>
 <tr><td>Scan-Intervall</td><td>Sekunden zwischen den Durchläufen (Standard 900).</td></tr>
 <tr><td>Backfill-Artikel</td><td>Header, die beim allerersten Scan einer Gruppe geholt werden.</td></tr>
@@ -674,9 +752,14 @@ Kategorie-Routing verhalten sich alle so, wie die *arrs es erwarten.</p>
 und <code>movie</code>-Abfragen aus seinem eigenen Index deiner beobachteten Gruppen,
 und <code>/getnzb/&lt;id&gt;</code> reicht die NZB zurück.</li>
 </ol>
-<div class="note"><b>Wozu das?</b>Ein selbst gehosteter Indexer für genau die Gruppen,
-die dich interessieren: keine Konten, keine API-Limits, Retention so tief, wie du ihn
-scannen lässt.</div>
+<div class="note"><b>Schalte zuerst den eingebauten Indexer ein</b> (Einstellungen →
+Indexierung). Er ist standardmäßig aus, und solange er aus ist, beantwortet diese Fassade
+jede Anfrage mit <code>&lt;error code="101"&gt;</code> statt mit einem leeren Ergebnis, ein
+Fehler fällt also beim Hinzufügen des Indexers auf und nicht erst Wochen später.<br><br>
+<b>Warum das Ganze?</b> Ein selbst gehosteter Indexer genau der Gruppen, die dich
+interessieren: keine Konten, keine API-Limits, Rückreichweite so tief, wie du ihn scannen
+lässt. Er ist eine Ergänzung zu deinen üblichen Indexern und kein Ersatz, denn er findet
+nur, was unter einem echten Dateinamen gepostet wurde.</div>
 
 <h2 id="remotes">12 · Handy &amp; Fernsteuer-Apps</h2>
 <p>nzbfast implementiert <em>beide</em> großen Fernsteuer-Protokolle, also
@@ -860,10 +943,10 @@ ausdrückliches <code>--post-server</code> und wählt nie selbst einen Server au
 <p>Basis-Endpunkt: <code>http://host:6789/api?mode=…&amp;apikey=…&amp;output=json</code> -
 SABnzbd-kompatibel, bestehende SAB-Integrationen funktionieren also unverändert. Zwei
 Keys: der <b>API-Key</b> (volle Kontrolle) und der <b>NZB-Key</b> (nur Hinzufügen:
-<code>addfile</code>/<code>addurl</code>).</p>
+<code>addfile</code>/<code>addurl</code>). <code>addnzblnk</code> gehört absichtlich nicht zum Nur-Hinzufügen-Satz: einen Link aufzulösen kann bezahltes Indexer-Kontingent verbrauchen, und das geht einen Nur-Hinzufügen-Zugang nichts an.</p>
 <table>
 <tr><th>Bereich</th><th>Modes</th></tr>
-<tr><td>Warteschlange</td><td><code>queue</code> (mit <code>name=delete/pause/resume/priority/switch</code>), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>retry</code>, <code>set_password</code></td></tr>
+<tr><td>Warteschlange</td><td><code>queue</code> (mit <code>name=delete/pause/resume/priority/switch</code>), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>addnzblnk</code>, <code>retry</code>, <code>set_password</code></td></tr>
 <tr><td>Info</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code></td></tr>
 <tr><td>Konfiguration</td><td><code>get_config</code>, <code>config&amp;name=&lt;setting&gt;&amp;value=…</code> (jedes Einstellungs-Feld), <code>server_save/delete/test/enable/reorder</code>, <code>import_probe/apply</code></td></tr>
 <tr><td>Index &amp; Wand</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, dazu newznab unter <code>/api?t=caps|search|tvsearch|movie</code> und <code>/getnzb/&lt;id&gt;</code></td></tr>
@@ -876,7 +959,7 @@ Keys: der <b>API-Key</b> (volle Kontrolle) und der <b>NZB-Key</b> (nur Hinzufüg
 <h2 id="files">17 · Dateien &amp; Speicherorte</h2>
 <table>
 <tr><th>Datei</th><th>Inhalt</th></tr>
-<tr><td><code>config.local.json</code></td><td>Server-Zugangsdaten und Optionen pro Server. Vom Assistenten angelegt; in den Einstellungen bearbeitbar. Halte sie privat.</td></tr>
+<tr><td><code>config.local.json</code></td><td>Server-Zugangsdaten und Optionen pro Server. Vom Assistenten angelegt; in den Einstellungen bearbeitbar. Halte sie privat. Passwörter sind <a href="#passwords">verschleiert, nicht verschlüsselt</a>.</td></tr>
 <tr><td><code>settings.json</code></td><td>Jede im Dashboard geänderte Einstellung. Liegt neben der Config; UI-Werte übersteuern Kommandozeilen-Flags. Lösche einen Key (oder die Datei), um auf Flags/Standardwerte zurückzufallen.</td></tr>
 <tr><td><code>apikey</code></td><td>Der API-Key, den nzbfast sich bei einem ersten Start selbst gemacht hat (<a href="#firstrun-key">§2</a>). Liegt neben der Config; auf macOS und Linux nur für das Konto lesbar, das nzbfast ausführt. Lösch sie nicht, um einen frischen Key zu bekommen: Auf einer schon gelaufenen Installation ersetzt sie nichts, und der Daemon kommt ganz ohne Key wieder hoch. Setz stattdessen unter Einstellungen → Sicherheit einen neuen.</td></tr>
 <tr><td><code>index.db</code></td><td>Der Release-Index (SQLite) + Wand-Metadaten. Kann gefahrlos gelöscht werden - er baut sich durchs Scannen neu auf (Einstellungen → Indexierung → Index löschen erledigt das für dich).</td></tr>

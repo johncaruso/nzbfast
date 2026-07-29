@@ -1569,17 +1569,38 @@ const SH_ONE_PASS: u32 = 1 << 7;
 /// At least one group/slot fell back to volumes on disk.
 const SH_MATERIALIZED: u32 = 1 << 8;
 
-/// Shared observation word for one extractor chain (see the section note).
+/// Shared observations for one extractor chain (see the section note).
 #[derive(Default)]
 struct ShapeLatch {
     outer: AtomicU32,
     nested: AtomicU32,
+    /// The first whole-file CRC32 an inner entry's header stated, with
+    /// the entry's name. Latched from the same parse the shape bits come
+    /// from, because it is the same fact: what the archive says it
+    /// contains.
+    ///
+    /// It rides here rather than in a field of its own so a nested level
+    /// contributes to it without a second Arc through `build` - and
+    /// because a naming oracle wants the OUTERMOST content it can get, a
+    /// first-writer-wins latch is the right shape as well as the cheap
+    /// one.
+    crc: Mutex<Option<(String, u32)>>,
 }
 
 impl ShapeLatch {
     fn note(&self, depth: usize, bits: u32) {
         let w = if depth == 0 { &self.outer } else { &self.nested };
         w.fetch_or(bits, Ordering::Relaxed);
+    }
+
+    /// First writer wins: the volumes of one set repeat their entries in
+    /// every header, and re-latching would just churn the lock at line
+    /// rate for the same answer.
+    fn note_crc(&self, name: &str, crc: u32) {
+        let mut g = self.crc.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_none() {
+            *g = Some((name.to_string(), crc));
+        }
     }
 
     fn snapshot(&self) -> (u32, u32) {
@@ -2176,6 +2197,7 @@ impl FrontierBuffer {
     }
 
     /// One past the last contiguous byte, in volume offsets.
+    #[cfg(test)]
     fn frontier(&self) -> u64 {
         self.state.lock().unwrap().frontier()
     }
@@ -2271,40 +2293,358 @@ impl FrontierBuffer {
     }
 }
 
-/// Blocking Read+Seek over a chased slot's frontier buffer - the view
-/// the 7z engine parses and decodes through. Reads block until the
-/// requested bytes arrive (the initial footer reads block only until
-/// the promoted tail lands); Seek is pure position arithmetic against
-/// the declared size, so seeking never blocks.
-struct BlockingSeekReader {
+/// `<base>.7z.<NNN>` - a 7-Zip container split across parts. Returns the
+/// shared base and the 1-based part index.
+///
+/// 7z multipart is a RAW BYTE SPLIT: the parts concatenate back into the
+/// container with nothing added, which is what makes chasing a set the
+/// same problem as chasing one file with a seam in it. (The disk
+/// post-pass groups the same way, in `split_7z_part` - two copies
+/// because that one lives in the daemon crate, and the rule is four
+/// lines of string matching.)
+fn sevenz_part_name(name: &str) -> Option<(String, u32)> {
+    let (head, tail) = name.rsplit_once('.')?;
+    // 7-Zip names volumes `%s.%03d`, so a genuine part is three digits
+    // (four once a set passes 999). Accepting one and two digits let
+    // `foo.7z.1` parse as part 1 of the same base as `foo.7z.001`, i.e.
+    // two files each claiming to be the container's first part.
+    if tail.len() < 3 || tail.len() > 4 || !tail.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    if !head.to_lowercase().ends_with(".7z") {
+        return None;
+    }
+    let idx: u32 = tail.parse().ok()?;
+    (idx >= 1).then(|| (head.to_lowercase(), idx))
+}
+
+/// Most parts a split container may claim. 7-Zip names volumes `%s.%03d`
+/// and the live-index census topped out at 255 parts; the bound exists so
+/// a corrupt or hostile part-1 start header cannot declare a container so
+/// large that every `.7z.NNN` in the job is held in RAM waiting for parts
+/// that do not exist.
+const SEVENZ_MAX_PARTS: u32 = 9999;
+
+/// One part of a chased 7z container: its own frontier buffer, its own
+/// slot, its declared size.
+struct SetPart {
     buf: Arc<FrontierBuffer>,
+    slot: usize,
+    size: u64,
+}
+
+/// The byte space a 7z chase decodes over: one part for a plain `.7z`,
+/// N for a `.7z.001` split set. Parts register as their slots classify,
+/// in any order; [`ChainedSeekReader`] joins them and blocks on one that
+/// has not arrived yet, exactly as the single-part reader blocks on
+/// bytes that have not arrived yet.
+///
+/// Kept deliberately as a map of per-slot buffers rather than one global
+/// buffer, because two seams need per-part byte records: a demotion
+/// writes `take_spans()` back into that part's OWN file at that buffer's
+/// own offsets, and verify/repair read-back serves `peek` in per-slot
+/// offsets.
+struct SevenZSet {
+    state: Mutex<SevenZSetState>,
+    arrived: Condvar,
+}
+
+#[derive(Default)]
+struct SevenZSetState {
+    /// 1-based part index -> part.
+    parts: BTreeMap<u32, SetPart>,
+    /// The split size: part 1's own size. `7z -v` writes every part at
+    /// exactly this size except the last, so it is the whole mapping
+    /// from a container offset to a part. A part that arrives claiming a
+    /// different size is not a `7z -v` split, and the set forfeits
+    /// rather than guess (the disk post-pass joins it instead).
+    part_size: u64,
+    /// Size of the whole container. For a split set this comes from part
+    /// 1's start header and nothing else: the end header is the last
+    /// thing in a 7z container, so `32 + offset + size` IS the end.
+    total: u64,
+    aborted: bool,
+}
+
+impl SevenZSet {
+    fn new(part_size: u64, total: u64) -> SevenZSet {
+        SevenZSet {
+            state: Mutex::new(SevenZSetState {
+                part_size,
+                total,
+                ..Default::default()
+            }),
+            arrived: Condvar::new(),
+        }
+    }
+
+    /// A set opened by a continuation part, before part 1 has been seen.
+    /// Nothing about the container's shape is known yet - only part 1
+    /// carries the start header - so parts are taken on trust and
+    /// checked when [`Self::resolve`] arrives. Nothing reads from an
+    /// unresolved set: the worker is spawned by part 1.
+    fn new_pending() -> SevenZSet {
+        SevenZSet {
+            state: Mutex::new(SevenZSetState::default()),
+            arrived: Condvar::new(),
+        }
+    }
+
+    fn resolved(&self) -> bool {
+        self.state.lock().unwrap().part_size > 0
+    }
+
+    /// Part 1 has landed: fix the split size and the container size, then
+    /// re-check every part taken on trust before now. False if any of
+    /// them does not fit, which forfeits the set.
+    fn resolve(&self, part_size: u64, total: u64) -> bool {
+        let mut st = self.state.lock().unwrap();
+        // Already resolved means a SECOND file is claiming to be part 1
+        // - a duplicated NZB entry, or two spellings that lower-case to
+        // one base. Refuse rather than re-shape a container the worker
+        // is already decoding through: overwriting `part_size`/`total`
+        // under a live reader re-maps every container offset mid-flight.
+        if st.part_size > 0 {
+            return false;
+        }
+        // Validate against LOCALS and commit only on success, so a set
+        // that does not line up is never left half-resolved.
+        let n = Self::count_of(total, part_size);
+        let ok = st.parts.iter().all(|(&i, p)| {
+            let expected = if i >= n {
+                total - (n as u64 - 1) * part_size
+            } else {
+                part_size
+            };
+            i <= n && p.size == expected
+        });
+        if !ok {
+            return false;
+        }
+        st.part_size = part_size;
+        st.total = total;
+        drop(st);
+        self.arrived.notify_all();
+        true
+    }
+
+    /// How many parts a container of `total` bytes splits into.
+    fn count_of(total: u64, part_size: u64) -> u32 {
+        if part_size == 0 {
+            return 1;
+        }
+        total.div_ceil(part_size).max(1).min(u32::MAX as u64) as u32
+    }
+
+    /// The size part `idx` must declare if this really is a `7z -v`
+    /// split: the split size, or the remainder for the last part.
+    fn expected_size(&self, idx: u32) -> u64 {
+        let st = self.state.lock().unwrap();
+        let n = Self::count_of(st.total, st.part_size);
+        if idx >= n {
+            st.total - (n as u64 - 1) * st.part_size
+        } else {
+            st.part_size
+        }
+    }
+
+    /// Register a part. False if it does not fit the split (wrong size,
+    /// index past the end, duplicate) - the caller forfeits the set.
+    fn register(&self, idx: u32, part: SetPart) -> bool {
+        let resolved = self.resolved();
+        let expected = self.expected_size(idx);
+        let mut st = self.state.lock().unwrap();
+        let n = Self::count_of(st.total, st.part_size);
+        if st.parts.contains_key(&idx) {
+            return false;
+        }
+        // An unresolved set has no shape to check against yet; `resolve`
+        // re-checks everything taken on trust here.
+        if resolved && (idx > n || part.size != expected) {
+            return false;
+        }
+        st.parts.insert(idx, part);
+        drop(st);
+        self.arrived.notify_all();
+        true
+    }
+
+    fn abort(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.aborted = true;
+        let bufs: Vec<Arc<FrontierBuffer>> = st.parts.values().map(|p| p.buf.clone()).collect();
+        drop(st);
+        for b in bufs {
+            b.abort("7z set abandoned");
+        }
+        self.arrived.notify_all();
+    }
+
+    fn total(&self) -> u64 {
+        self.state.lock().unwrap().total
+    }
+
+    /// Which part is this slot, and what is the split size? Used to turn
+    /// the engine's CONTAINER-space watermark into the part-space one a
+    /// drop-behind trim needs.
+    fn part_of(&self, slot: usize) -> Option<(u32, u64)> {
+        let st = self.state.lock().unwrap();
+        st.parts
+            .iter()
+            .find(|(_, p)| p.slot == slot)
+            .map(|(&i, _)| (i, st.part_size))
+    }
+
+    /// Every registered part's slot, for demoting a set as a whole.
+    fn member_slots(&self) -> Vec<usize> {
+        self.state.lock().unwrap().parts.values().map(|p| p.slot).collect()
+    }
+
+    /// Have all the parts arrived AND filled? An incomplete set can
+    /// never decode, so finish aborts it.
+    fn is_complete(&self) -> bool {
+        let st = self.state.lock().unwrap();
+        // Unresolved: part 1 never arrived, so the container's shape is
+        // unknown and it cannot be complete by definition. Without this
+        // `count_of(0, 0)` answers 1 and a lone `.7z.002` reads as a
+        // whole container.
+        if st.part_size == 0 {
+            return false;
+        }
+        let n = Self::count_of(st.total, st.part_size);
+        st.parts.len() as u32 == n && st.parts.values().all(|p| p.buf.is_complete())
+    }
+
+    /// The parts covering container range `[from, to)`, as
+    /// `(slot, local_start, local_end)` - the tail prefetch asks in
+    /// container offsets and the promote ladder answers in slot ones.
+    fn map_range(&self, from: u64, to: u64) -> Vec<(usize, u64, u64)> {
+        let st = self.state.lock().unwrap();
+        if st.part_size == 0 || from >= to {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for (&i, p) in &st.parts {
+            let base = (i as u64 - 1) * st.part_size;
+            let a = from.max(base);
+            let b = to.min(base + p.size);
+            if a < b {
+                out.push((p.slot, a - base, b - base));
+            }
+        }
+        out
+    }
+
+    /// Blocking container-view read. Never crosses a part boundary in
+    /// one call (the caller loops), and blocks on a part that has not
+    /// registered yet as readily as on bytes that have not arrived.
+    fn read_blocking(&self, at: u64, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let (part, room, local) = {
+            let mut st = self.state.lock().unwrap();
+            loop {
+                if st.aborted {
+                    return Err(io::Error::other("7z set aborted"));
+                }
+                // Unresolved: the container's size is not known yet, so
+                // "past the end" cannot be answered. Wait rather than
+                // report EOF at offset 0.
+                if st.part_size == 0 {
+                    st = self.arrived.wait(st).unwrap();
+                    continue;
+                }
+                if at >= st.total {
+                    return Ok(0);
+                }
+                // Mapped INSIDE the loop, against the geometry that is
+                // live now: computing it before the wait meant a read
+                // issued against an unresolved set kept the placeholder
+                // mapping after the set resolved underneath it.
+                let idx = (at / st.part_size).checked_add(1);
+                let Some(idx) = idx.and_then(|i| u32::try_from(i).ok()) else {
+                    return Err(io::Error::other("7z container offset has no part"));
+                };
+                let local = at % st.part_size;
+                let room = (st.total - at).min(st.part_size - local);
+                if let Some(p) = st.parts.get(&idx) {
+                    break (p.buf.clone(), room, local);
+                }
+                st = self.arrived.wait(st).unwrap();
+            }
+        };
+        let take = buf.len().min(room as usize);
+        part.read_covered_blocking(local, &mut buf[..take])
+    }
+}
+
+impl SevenZCtl {
+    /// Arm (or refuse) drop-behind now that the archive map has parsed.
+    ///
+    /// The watermark is RESET first, and that is the whole point of this
+    /// existing as one step. The parse ends having just read the end
+    /// header, so the reader's position - and therefore the published
+    /// watermark - is sitting at EOF (measured: exactly `total`). Arming
+    /// the trim against that value opens a window, until the engine
+    /// seeks back down to the first pack stream, in which a budget
+    /// breach would release the ENTIRE buffer and the next read would
+    /// land behind the trim point. That forfeits the chase and demotes -
+    /// safely and byte-exactly, but it defeats the feature on precisely
+    /// the large archives it exists for, intermittently and only under
+    /// memory pressure. Zero means "the engine needs everything from the
+    /// start", which is true until it says otherwise by reading.
+    ///
+    /// Same thread as the reader, so the two stores cannot interleave
+    /// with a read; the only other party is the routing thread, which
+    /// reads both.
+    fn arm_trim(&self, needs_history: bool) {
+        self.low_water.store(0, Ordering::Relaxed);
+        self.trim_ok.store(!needs_history, Ordering::Relaxed);
+    }
+
+    /// A container opened by a continuation part, waiting for the `.001`
+    /// that will say how big it is and where its map lives. No worker
+    /// yet - there is nothing it could read.
+    fn pending(key: String) -> SevenZCtl {
+        SevenZCtl {
+            set: Arc::new(SevenZSet::new_pending()),
+            key,
+            low_water: Arc::new(AtomicU64::new(0)),
+            tail: Mutex::new(None),
+            trim_ok: std::sync::atomic::AtomicBool::new(false),
+            worker: Mutex::new(None),
+            sink_slots: Mutex::new(Vec::new()),
+            outcome: Mutex::new(None),
+        }
+    }
+}
+
+/// Blocking Read+Seek over a chased 7z container - the view the engine
+/// parses and decodes through, whether that container is one posted file
+/// or a `.7z.001` split set. Reads block until the requested bytes
+/// arrive (the initial footer reads block only until the promoted tail
+/// lands); Seek is pure position arithmetic against the declared size,
+/// so seeking never blocks.
+struct ChainedSeekReader {
+    set: Arc<SevenZSet>,
     pos: u64,
     total: u64,
-    /// Lowest offset the engine may still ask for - the drop-behind trim
-    /// watermark, published for the routing thread. Deliberately the
-    /// READ position and not decode progress: MT-LZMA2 runs its source
-    /// reads tens of MB ahead of what it has decoded, so a watermark
-    /// keyed to decode would trim bytes the prefetcher still wants.
-    ///
-    /// A seek REPLACES it rather than raising it, which is what makes
-    /// the open phase safe without any phase detection of its own: the
-    /// parse seeks to the tail, reads the end header, then seeks back to
-    /// 32, and the watermark follows it straight back down.
+    /// Lowest CONTAINER offset the engine may still ask for - see
+    /// [`BlockingSeekReader::low_water`], which this replaces.
     low_water: Arc<AtomicU64>,
 }
 
-impl io::Read for BlockingSeekReader {
+impl io::Read for ChainedSeekReader {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        let n = self.buf.read_covered_blocking(self.pos, out)?;
+        let n = self.set.read_blocking(self.pos, out)?;
         self.pos += n as u64;
-        // The bytes are in the engine's own buffer now; the source does
-        // not own them any more.
         self.low_water.store(self.pos, Ordering::Relaxed);
         Ok(n)
     }
 }
 
-impl io::Seek for BlockingSeekReader {
+impl io::Seek for ChainedSeekReader {
     fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
         let target = match pos {
             io::SeekFrom::Start(o) => o as i128,
@@ -2474,10 +2814,22 @@ impl ChaseCtl {
 /// its own bytes, so multipart sets never attach (v1 limitation: the
 /// parts materialize and the disk post-pass joins and extracts them).
 struct SevenZCtl {
-    buf: Arc<FrontierBuffer>,
-    /// Drop-behind watermark, published by [`BlockingSeekReader`]: the
-    /// lowest offset the engine may still ask for.
+    /// The container's byte space: one part for a plain `.7z`, N for a
+    /// `.7z.001` split set. Every member slot of a set shares this one
+    /// ctl, so the worker is spawned, joined and torn down once.
+    set: Arc<SevenZSet>,
+    /// `sevenz_part_name` base that keys this in `Inner.sevenz_sets`;
+    /// empty for a single-file container, which needs no key because
+    /// nothing else can join it.
+    key: String,
+    /// Drop-behind watermark, published by [`ChainedSeekReader`]: the
+    /// lowest CONTAINER offset the engine may still ask for.
     low_water: Arc<AtomicU64>,
+    /// The end header's container range, once part 1 has been read.
+    /// Held here so a part joining AFTER the worker started still gets
+    /// its slice of the tail front-loaded - on a split set the map
+    /// lives in the last part, which is usually the last to classify.
+    tail: Mutex<Option<(u64, u64)>>,
     /// May this chase trim? False until the archive map has been parsed
     /// (before that the watermark means nothing - the open phase is
     /// still seeking around), and false forever if the map contains a
@@ -2613,6 +2965,11 @@ struct Inner {
     /// Child forwards queued by under-the-lock re-feed paths; delivered
     /// by `flush_pending_fwd` after the lock drops.
     pending_fwd: Vec<FwdJob>,
+    /// Tail-prefetch promotes raised while the routing lock is held (a
+    /// 7z part joining its set). `promote_file` walks UP the chain
+    /// taking each level's own lock, so it can never be called from
+    /// under one - these are queued here and flushed off-lock.
+    pending_promote: Vec<(usize, Vec<(u64, u64)>)>,
     /// Nested routing gate (env escape hatch / rollout setting). With it
     /// off, level-1 inner files write directly to disk as before the
     /// child path existed.
@@ -2633,6 +2990,10 @@ struct Inner {
     /// Off: a 7z chase retains everything and an archive over the
     /// retention cap demotes, as it did before trimming existed.
     sevenz_trim_on: bool,
+    /// Live split-7z sets, keyed by `sevenz_part_name` base, so a
+    /// `.7z.002` classifying later can find the container `.7z.001`
+    /// opened and join it. Cleared as each set settles.
+    sevenz_sets: HashMap<String, Arc<SevenZCtl>>,
     /// Nested depth cap for this chain: the child created AT this depth is
     /// disabled, so the deepest layer materializes (never a hard failure).
     /// Resolved from the daemon setting / env at construction and inherited
@@ -2935,6 +3296,7 @@ impl Extractor {
                 fold_names,
                 child: None,
                 pending_fwd: Vec::new(),
+                pending_promote: Vec::new(),
                 nested_on,
                 chase_on,
                 sevenz_on,
@@ -2944,6 +3306,7 @@ impl Extractor {
                 // latching as every other gate.
                 top_sevenz_on: !top_sevenz_env_off(),
                 sevenz_trim_on: !sevenz_trim_env_off(),
+                sevenz_sets: HashMap::new(),
                 nested_max_depth: nested_max_depth.max(1),
                 verify_output_crc,
                 promote: None,
@@ -2977,6 +3340,19 @@ impl Extractor {
     pub fn archive_shape(&self) -> Option<ArchiveShape> {
         let (outer, nested) = self.shape.snapshot();
         ArchiveShape::from_bits(outer, nested)
+    }
+
+    /// `(inner file name, CRC32)` for the first inner file whose header
+    /// stated one - an exact identity key for the open release
+    /// databases, available for free because the mappers read those
+    /// headers anyway.
+    ///
+    /// `None` for a set with no readable archive headers, which includes
+    /// every header-encrypted (`-hp`) post. Same lifetime as
+    /// [`Self::archive_shape`]: readable during the download and still
+    /// true after finish().
+    pub fn inner_crc(&self) -> Option<(String, u32)> {
+        self.shape.crc.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Drain the chain's pending resume-journal crypto events (`E`/`K`/
@@ -3272,6 +3648,11 @@ impl Extractor {
                 pending = std::mem::take(&mut inner.pending_fwd);
             }
         }
+        // The routing lock is down: a 7z part that joined its set above
+        // can have its tail articles front-loaded now (the promote walk
+        // takes locks up the chain and must not be called from under
+        // one). Cheap and usually empty.
+        self.flush_pending_promote();
         for j in &jobs {
             let part = &data[j.src_start..j.src_start + j.len];
             match &j.crypto {
@@ -3605,7 +3986,19 @@ impl Extractor {
     /// Take and deliver any queued child forwards (public entry points
     /// that may have re-fed holds under the lock call this after it
     /// drops).
+    /// Run the tail-prefetch promotes queued under the routing lock.
+    /// Off-lock by construction: `promote_file` walks up the chain
+    /// taking one level's lock at a time, so calling it from under this
+    /// level's own lock self-deadlocks.
+    fn flush_pending_promote(&self) {
+        let queued = std::mem::take(&mut self.inner.lock().unwrap().pending_promote);
+        for (slot, spans) in queued {
+            self.promote_slot_spans(slot, &spans);
+        }
+    }
+
     fn flush_pending_fwd(&self) -> io::Result<()> {
+        self.flush_pending_promote();
         let pending = std::mem::take(&mut self.inner.lock().unwrap().pending_fwd);
         if pending.is_empty() {
             return Ok(());
@@ -3655,6 +4048,16 @@ impl Extractor {
                 };
                 if e.encrypted {
                     bits |= SH_ENCRYPTED;
+                }
+                // The identity fact in the same header: the whole-file
+                // CRC32 of an inner file, which is an exact key into the
+                // open release databases (see `srrdb`). Encrypted
+                // entries are skipped - RAR5 may tweak the stored CRC so
+                // it cannot fingerprint the plaintext, and a header-
+                // encrypted archive never reaches here at all, which is
+                // precisely the `-hp` case the oracle cannot serve.
+                if let (false, Some(crc)) = (e.encrypted, e.file_crc) {
+                    self.shape.note_crc(&e.name, crc);
                 }
             }
             self.shape.note(self.depth, bits);
@@ -4000,13 +4403,15 @@ impl Extractor {
             // volume out of it is exact and the disk pass re-extracts it;
             // carrying on would ship what was decoded from the stale
             // bytes, with every CRC on the path still passing.
-            return self.fallback_slot_or_group(inner, slot, "repair rewrote chased bytes");
+            return self.chase_forfeit(inner, slot, "repair rewrote chased bytes");
         }
-        if inner.budget.over() {
+        if inner.budget.over()
+            && let Some(ctl) = inner.slots[slot].sevenz.clone()
+        {
             // Drop-behind first: an archive whose decode is keeping up
             // has a long prefix nobody will read again, and releasing it
-            // is what lets a set larger than the cap stream at all.
-            self.sevenz_trim_slot(inner, slot)?;
+            // is what lets a container larger than the cap stream at all.
+            self.sevenz_trim_set(inner, &ctl)?;
         }
         if inner.budget.over() {
             // Same shared budget as the holds cap, so the reason carries
@@ -4014,9 +4419,31 @@ impl Extractor {
             // off "held-bytes cap", and the bare wording this used to have
             // matched nothing, demoting the volumes and then shipping the
             // job with no payload and exit 0.
-            self.fallback_slot_or_group(inner, slot, "held-bytes cap: chase memory")?;
+            self.chase_forfeit(inner, slot, "held-bytes cap: chase memory")?;
         }
         Ok(())
+    }
+
+    /// Give up on whatever CONTAINER this slot belongs to.
+    ///
+    /// A 7z slot is one part of a container, and a byte split has no
+    /// useful half - so a part failing is the container failing, and the
+    /// demote has to take every member with it. Routing these two
+    /// forfeits through the single-slot path instead was a silent
+    /// data-loss bug, not just untidy: `fallback_slot` drains the
+    /// container's WHOLE sink list (every member shares one ctl), so the
+    /// payload output was deleted while the other members stayed in
+    /// `SevenZ` mode with the set un-aborted. The worker then read on
+    /// from parts nobody had touched, wrote into a slot that had become
+    /// `Discard` (which swallows writes), and returned `Ok` - at which
+    /// point `sevenz_finish` took the survivors' success path, dropped
+    /// their retained bytes and unlinked their spilled prefixes. Output
+    /// directory: one orphaned `.7z.002`, no payload, exit 0.
+    fn chase_forfeit(&self, inner: &mut Inner, slot: usize, reason: &str) -> io::Result<()> {
+        match inner.slots[slot].sevenz.clone() {
+            Some(ctl) => self.sevenz_fallback_set(inner, &ctl, reason),
+            None => self.fallback_slot_or_group(inner, slot, reason),
+        }
     }
 
     /// Drop-behind trim (TODO 37 step 2): release the bytes of a chased
@@ -4037,26 +4464,52 @@ impl Extractor {
     /// be too small to be worth a `Vec::drain` of what is still live -
     /// which is also the honest answer when arrivals have run so far
     /// ahead of decode that the live window alone fills the cap.
-    fn sevenz_trim_slot(&self, inner: &mut Inner, slot: usize) -> io::Result<()> {
-        if !inner.sevenz_trim_on {
+    fn sevenz_trim_set(&self, inner: &mut Inner, ctl: &Arc<SevenZCtl>) -> io::Result<()> {
+        if !inner.sevenz_trim_on || !ctl.trim_ok.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let Some(ctl) = inner.slots[slot].sevenz.clone() else {
+        // Every part, not just the one whose span breached the budget:
+        // on a split set the arrivals are typically running on a LATER
+        // part than the one the engine is reading, so the bytes worth
+        // releasing belong to a different slot entirely.
+        for slot in ctl.set.member_slots() {
+            self.sevenz_trim_part(inner, ctl, slot)?;
+        }
+        Ok(())
+    }
+
+    fn sevenz_trim_part(
+        &self,
+        inner: &mut Inner,
+        ctl: &Arc<SevenZCtl>,
+        slot: usize,
+    ) -> io::Result<()> {
+        // The watermark is a CONTAINER offset; this slot is one part of
+        // that container, so translate before trimming its buffer. A
+        // part the engine has read straight past releases whole.
+        let Some((idx, part_size)) = ctl.set.part_of(slot) else {
             return Ok(());
         };
-        if !ctl.trim_ok.load(Ordering::Relaxed) {
+        let Some(buf) = inner.slots[slot].chase.as_ref().map(|ch| ch.buf.clone()) else {
             return Ok(());
-        }
+        };
+        let base = (idx as u64 - 1) * part_size;
+        let watermark = ctl.low_water.load(Ordering::Relaxed).saturating_sub(base);
         // Half the cap: bounds the drain's memmove to a constant amount
         // of work per arriving byte, since two trims cannot be closer
-        // together than that many bytes of arrival.
-        let min_release = (inner.budget.cap() / 2) as u64;
-        let watermark = ctl.low_water.load(Ordering::Relaxed);
-        let Some((at, bytes)) = ctl.buf.trim_to(watermark, min_release) else {
+        // together than that many bytes of arrival. A part the engine is
+        // wholly past is released regardless of size - it is finished
+        // with, and holding it buys nothing.
+        let min_release = if watermark >= buf.total() {
+            1
+        } else {
+            (inner.budget.cap() / 2) as u64
+        };
+        let Some((at, bytes)) = buf.trim_to(watermark, min_release) else {
             return Ok(());
         };
         self.plain_span(inner, slot, at, &bytes)?;
-        let now = ctl.buf.stored();
+        let now = buf.stored();
         let released = match inner.slots[slot].chase.as_mut() {
             Some(ch) => {
                 let d = ch.charged.saturating_sub(now);
@@ -4201,19 +4654,22 @@ impl Extractor {
     /// asks the chain above to front-load the footer's articles (tail
     /// prefetch), then parses and decodes through a blocking Read+Seek
     /// view as bytes arrive. Returns false when ineligible - the slot
-    /// then classifies Plain and materializes exactly as before. A
-    /// multipart `.7z.001` part never attaches (its end header lies
-    /// past its own bytes - the v1 limitation): the parts materialize
-    /// and the disk post-pass joins them.
+    /// then classifies Plain and materializes exactly as before.
     ///
     /// TODO 37 step 1: this runs at depth 0 too, so a POSTED single-file
     /// `.7z` joins the chase and its payload streams out while the
     /// archive downloads. Nothing about the engine is depth-specific -
     /// the guard predated the root promote wiring (see
-    /// [`Self::promote_slot_spans`]). An archive the retention budget
-    /// cannot hold demotes to a materialized `.7z` for the disk
-    /// post-pass, exactly as every top-level 7z did before; without
-    /// drop-behind trimming that is the intended outcome, not a gap.
+    /// [`Self::promote_slot_spans`]).
+    ///
+    /// TODO 37 step 3: a `.7z.001` SPLIT SET joins too. 7z multipart is
+    /// a raw byte split, so the set is one container with seams in it:
+    /// part 1 carries the start header, and because a 7z end header is
+    /// the last thing in a container, `32 + offset + size` reads off as
+    /// the size of the WHOLE set - which is how a chase that has only
+    /// seen part 1 already knows how far the container runs and where
+    /// its map lives. Parts `.002+` carry no signature at all and are
+    /// recognized by name; they join the set their base names them into.
     fn try_attach_sevenz(&self, inner: &mut Inner, slot: usize, data: &[u8]) -> io::Result<bool> {
         if (self.depth == 0 && !inner.top_sevenz_on)
             || !inner.nested_on
@@ -4224,22 +4680,141 @@ impl Extractor {
         {
             return Ok(false);
         }
+        let size = inner.slots[slot].size;
+        let part = sevenz_part_name(&inner.slots[slot].name);
+        // A continuation part: no signature to sniff, so its name is the
+        // only thing that identifies it. It joins the container open
+        // under its base, or opens a PENDING one - nothing guarantees
+        // `.001` classifies first, and a part that materialized because
+        // it arrived early can never be taken back.
+        if let Some((base, idx)) = part.clone()
+            && idx > 1
+        {
+            let ctl = match inner.sevenz_sets.get(&base) {
+                Some(c) => c.clone(),
+                None => {
+                    let c = Arc::new(SevenZCtl::pending(base.clone()));
+                    inner.sevenz_sets.insert(base, c.clone());
+                    c
+                }
+            };
+            return self.sevenz_join_set(inner, slot, ctl, idx);
+        }
         let Some((ho, hs)) = sevenz_start_header(data) else {
             return Ok(false);
         };
-        let size = inner.slots[slot].size;
         let tail = 32u64
             .checked_add(ho)
             .and_then(|s| s.checked_add(hs).map(|e| (s, e)));
         let Some((tail_start, tail_end)) = tail else {
             return Ok(false);
         };
-        if hs == 0 || tail_end > size {
+        if hs == 0 {
             return Ok(false);
         }
-        // Commit.
-        inner.slots[slot].mode = SlotMode::SevenZ;
+        // Split only when the end header genuinely lies past this file:
+        // a `.7z.001` whose map fits inside itself is a self-contained
+        // container that merely got a part-numbered name.
+        let split = matches!(part, Some((_, 1))) && tail_end > size;
+        // A split's whole geometry comes from ONE attacker-controlled
+        // start header, so bound it before anything downstream trusts
+        // it. 7-Zip's own naming tops out well below this; a header
+        // declaring a container of 2^62 would otherwise park every
+        // `.7z.NNN` in the job in RAM until the retention cap tripped.
+        if split && tail_end.div_ceil(size.max(1)) > SEVENZ_MAX_PARTS as u64 {
+            return Ok(false);
+        }
+        if !split && tail_end > size {
+            // Not a split (no part name) and the map is past the end:
+            // truncated, or not a container we can drive. Materialize.
+            return Ok(false);
+        }
+        let (part_size, total) = if split { (size, tail_end) } else { (size, size) };
+        let key = if split {
+            part.as_ref().map(|(b, _)| b.clone()).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        // Parts that arrived ahead of this one are already waiting under
+        // the base name; resolving their set is what turns them from
+        // bytes-on-trust into a mapped container.
+        let ctl = match inner.sevenz_sets.get(&key) {
+            Some(c) if !key.is_empty() => {
+                let c = c.clone();
+                if !c.set.resolve(part_size, total) {
+                    self.sevenz_fallback_set(inner, &c, "7z split parts do not line up")?;
+                    return Ok(false);
+                }
+                c
+            }
+            _ => {
+                let c = Arc::new(SevenZCtl {
+                    set: Arc::new(SevenZSet::new(part_size, total)),
+                    key: key.clone(),
+                    low_water: Arc::new(AtomicU64::new(0)),
+                    tail: Mutex::new(None),
+                    trim_ok: std::sync::atomic::AtomicBool::new(false),
+                    worker: Mutex::new(None),
+                    sink_slots: Mutex::new(Vec::new()),
+                    outcome: Mutex::new(None),
+                });
+                if !key.is_empty() {
+                    inner.sevenz_sets.insert(key.clone(), c.clone());
+                }
+                c
+            }
+        };
+        *ctl.tail.lock().unwrap() = Some((tail_start, tail_end));
+        // Commit part 1. The worker starts now: it has the whole map's
+        // location, and blocks on the parts it has not been given yet
+        // exactly as it blocks on bytes that have not arrived.
+        let joined = self.sevenz_join_set(inner, slot, ctl.clone(), 1)?;
+        if !joined {
+            if !ctl.key.is_empty() {
+                inner.sevenz_sets.remove(&ctl.key);
+            }
+            return Ok(false);
+        }
+        let weak = inner.self_weak.clone();
+        let pw = inner.password.clone();
+        let ctl2 = ctl.clone();
+        let handle = std::thread::Builder::new()
+            .name("nzb-7z-chase".into())
+            .spawn(move || Self::sevenz_worker(weak, ctl2, (tail_start, tail_end), pw))
+            .map_err(io::Error::other)?;
+        *ctl.worker.lock().unwrap() = Some(handle);
+        Ok(true)
+    }
+
+    /// Attach `slot` to a 7z container as its part `idx`: flip the slot
+    /// to SevenZ, seed a frontier buffer with everything held so far,
+    /// and register it with the set. Shared by the single-part case
+    /// (which is just part 1 of a one-part container) and the split one.
+    fn sevenz_join_set(
+        &self,
+        inner: &mut Inner,
+        slot: usize,
+        ctl: Arc<SevenZCtl>,
+        idx: u32,
+    ) -> io::Result<bool> {
+        let size = inner.slots[slot].size;
         let buf = Arc::new(FrontierBuffer::new(size));
+        if !ctl.set.register(
+            idx,
+            SetPart {
+                buf: buf.clone(),
+                slot,
+                size,
+            },
+        ) {
+            // Not a `7z -v` split after all - a part of the wrong size,
+            // a duplicate, or an index past the container's end. Refuse
+            // the whole set rather than guess at the mapping; the disk
+            // post-pass joins the parts and extracts them.
+            self.sevenz_fallback_set(inner, &ctl, "7z split parts do not line up")?;
+            return Ok(false);
+        }
+        inner.slots[slot].mode = SlotMode::SevenZ;
         let holds = std::mem::take(&mut inner.slots[slot].holds);
         inner.slots[slot].pre_bytes = 0;
         let mut stored = 0usize;
@@ -4252,29 +4827,36 @@ impl Extractor {
         // mean a repair already landed, and nothing has decoded yet.
         let seeded_conflict = buf.conflicted();
         inner.slots[slot].chase = Some(ChaseSlot {
-            buf: buf.clone(),
+            buf,
             charged: stored,
         });
-        let ctl = Arc::new(SevenZCtl {
-            buf,
-            low_water: Arc::new(AtomicU64::new(0)),
-            trim_ok: std::sync::atomic::AtomicBool::new(false),
-            worker: Mutex::new(None),
-            sink_slots: Mutex::new(Vec::new()),
-            outcome: Mutex::new(None),
-        });
         inner.slots[slot].sevenz = Some(ctl.clone());
-        let weak = inner.self_weak.clone();
-        let pw = inner.password.clone();
-        let ctl2 = ctl.clone();
-        let handle = std::thread::Builder::new()
-            .name("nzb-7z-chase".into())
-            .spawn(move || Self::sevenz_worker(weak, ctl2, slot, (tail_start, tail_end), pw))
-            .map_err(io::Error::other)?;
-        *ctl.worker.lock().unwrap() = Some(handle);
+        // Tail prefetch for a part that joined after the worker started:
+        // on a split set the end header lives in the LAST part, which is
+        // usually the last to classify, so the promote that matters most
+        // is this one rather than the worker's opening call. QUEUED, not
+        // called: the promote walk takes every level's routing lock on
+        // the way up and we are holding this one.
+        let tail = *ctl.tail.lock().unwrap();
+        if let Some((a, b)) = tail {
+            // EVERY part carrying the tail, not just this one. Filtering
+            // to `slot` stranded the common case: on a split container
+            // the end header lives in the LAST part, and if that part
+            // classified before `.7z.001` did, it joined a set that had
+            // no tail range yet - and part 1's own join then skipped it.
+            // The map never parsed, the trim never armed, and the whole
+            // set demoted on the retention cap. Re-promoting a range is
+            // harmless: the ladder ranks by first occurrence.
+            for (s, ls, le) in ctl.set.map_range(a, b) {
+                inner.pending_promote.push((s, vec![(ls, le)]));
+            }
+        }
         if seeded_conflict {
-            self.fallback_slot_or_group(inner, slot, "repair rewrote chased bytes")?;
+            self.sevenz_fallback_set(inner, &ctl, "repair rewrote chased bytes")?;
             return Ok(true);
+        }
+        if inner.budget.over() {
+            self.sevenz_trim_set(inner, &ctl)?;
         }
         if inner.budget.over() {
             // Same shared budget as the holds cap, so the reason carries
@@ -4282,9 +4864,30 @@ impl Extractor {
             // off "held-bytes cap", and the bare wording this used to have
             // matched nothing, demoting the volumes and then shipping the
             // job with no payload and exit 0.
-            self.fallback_slot_or_group(inner, slot, "held-bytes cap: chase memory")?;
+            self.sevenz_fallback_set(inner, &ctl, "held-bytes cap: chase memory")?;
         }
         Ok(true)
+    }
+
+    /// Demote a whole 7z container: every part that has registered
+    /// materializes as its own `.7z.NNN` on disk, which is precisely
+    /// what the disk post-pass joins and extracts. One part failing is
+    /// the container failing - there is no useful half of a byte split.
+    fn sevenz_fallback_set(
+        &self,
+        inner: &mut Inner,
+        ctl: &Arc<SevenZCtl>,
+        reason: &str,
+    ) -> io::Result<()> {
+        if !ctl.key.is_empty() {
+            inner.sevenz_sets.remove(&ctl.key);
+        }
+        ctl.set.abort();
+        self.sevenz_abandon_sinks(inner, ctl);
+        for member in ctl.set.member_slots() {
+            self.fallback_slot_or_group(inner, member, reason)?;
+        }
+        Ok(())
     }
 
     /// The 7z chase worker: front-load the footer, then let the engine
@@ -4297,14 +4900,16 @@ impl Extractor {
     fn sevenz_worker(
         me: Weak<Extractor>,
         ctl: Arc<SevenZCtl>,
-        slot: usize,
         tail: (u64, u64),
         password: Option<std::sync::Arc<str>>,
     ) {
-        if let Some(ex) = me.upgrade() {
-            ex.promote_slot_spans(slot, &[tail]);
-        }
-        let result = Self::sevenz_run(&me, &ctl, slot, password).map_err(|e| match e {
+        // The tail promote is raised by each PART as it joins the set
+        // (`sevenz_join_set`), not from here. On a split container the
+        // end header lives in the last part, which is typically the last
+        // to classify, so a single call at open would reach only the
+        // parts already registered - and would double up with theirs.
+        let _ = tail;
+        let result = Self::sevenz_run(&me, &ctl, password).map_err(|e| match e {
             sevenz_rust2::Error::PasswordRequired => {
                 "inner 7z is encrypted (no password)".to_string()
             }
@@ -4353,12 +4958,11 @@ impl Extractor {
     fn sevenz_run(
         me: &Weak<Extractor>,
         ctl: &SevenZCtl,
-        slot: usize,
         password: Option<std::sync::Arc<str>>,
     ) -> Result<(), sevenz_rust2::Error> {
-        let total = ctl.buf.total();
-        let src = BlockingSeekReader {
-            buf: ctl.buf.clone(),
+        let total = ctl.set.total();
+        let src = ChainedSeekReader {
+            set: ctl.set.clone(),
             pos: 0,
             total,
             low_water: ctl.low_water.clone(),
@@ -4371,10 +4975,8 @@ impl Extractor {
         // Drop-behind is decided HERE and only here, between the parse
         // and the first payload read: the coder chains come from the end
         // header, so they are all known before a single payload byte is
-        // touched, and the watermark below is meaningful from here on
-        // (the open phase's seek to the tail and back is over).
-        ctl.trim_ok
-            .store(!Self::sevenz_needs_history(reader.archive()), Ordering::Relaxed);
+        // touched.
+        ctl.arm_trim(Self::sevenz_needs_history(reader.archive()));
         reader.for_each_entries(|entry, rd| {
             if entry.is_directory {
                 return Ok(true);
@@ -4389,7 +4991,15 @@ impl Extractor {
             let (child, cslot) = {
                 let mut g = ex.inner.lock().unwrap();
                 let inner = &mut *g;
-                if !matches!(inner.slots[slot].mode, SlotMode::SevenZ) {
+                // Every part of the container has to still be chased: a
+                // demotion takes them all together, so any one of them
+                // having left SevenZ mode means this output is stale.
+                let members = ctl.set.member_slots();
+                if members.is_empty()
+                    || !members
+                        .iter()
+                        .all(|&m| matches!(inner.slots[m].mode, SlotMode::SevenZ))
+                {
                     return Err(io::Error::other("7z chase demoted").into());
                 }
                 let child = ex.ensure_child(inner);
@@ -4442,19 +5052,28 @@ impl Extractor {
     /// slot to a materialized level-N .7z (the disk post-pass input); a
     /// successful one releases the retained bytes - its outputs already
     /// live in the child chain.
+    /// One CONTAINER is joined once, however many slots it spans: every
+    /// part of a split set shares the ctl, so the worker is taken and
+    /// joined by whichever member reaches it first and the rest settle
+    /// off the same outcome.
     fn sevenz_finish(&self) -> io::Result<()> {
-        let pending: Vec<(usize, Arc<SevenZCtl>)> = {
+        let pending: Vec<Arc<SevenZCtl>> = {
             let inner = self.inner.lock().unwrap();
-            inner
-                .slots
-                .iter()
-                .enumerate()
-                .filter_map(|(i, s)| s.sevenz.clone().map(|c| (i, c)))
-                .collect()
+            let mut seen: Vec<Arc<SevenZCtl>> = Vec::new();
+            for s in &inner.slots {
+                if let Some(c) = s.sevenz.clone()
+                    && !seen.iter().any(|o| Arc::ptr_eq(o, &c))
+                {
+                    seen.push(c);
+                }
+            }
+            seen
         };
-        for (slot, ctl) in pending {
-            if !ctl.buf.is_complete() {
-                ctl.buf.abort("bytes never arrived");
+        for ctl in pending {
+            // Missing a part, or a part that never filled, is the same
+            // thing to a byte split: the container cannot be read.
+            if !ctl.set.is_complete() {
+                ctl.set.abort();
             }
             let handle = ctl.worker.lock().unwrap().take();
             if let Some(h) = handle {
@@ -4465,32 +5084,54 @@ impl Extractor {
             let outcome = ctl.outcome.lock().unwrap().clone();
             let mut g = self.inner.lock().unwrap();
             let inner = &mut *g;
-            inner.slots[slot].sevenz = None;
-            if !matches!(inner.slots[slot].mode, SlotMode::SevenZ) {
+            if !ctl.key.is_empty() {
+                inner.sevenz_sets.remove(&ctl.key);
+            }
+            let members = ctl.set.member_slots();
+            for &m in &members {
+                inner.slots[m].sevenz = None;
+            }
+            let live: Vec<usize> = members
+                .iter()
+                .copied()
+                .filter(|&m| matches!(inner.slots[m].mode, SlotMode::SevenZ))
+                .collect();
+            if live.is_empty() {
                 continue; // demoted earlier (budget breach / abandon)
             }
             match outcome {
                 Some(Ok(())) => {
-                    // The archive decoded: this is where one-pass is
+                    // The container decoded: this is where one-pass is
                     // earned (see the attach site's note).
                     self.shape.note(self.depth, SH_ONE_PASS);
-                    if let Some(ch) = inner.slots[slot].chase.take() {
-                        inner.budget.sub(ch.charged);
+                    for m in live {
+                        if let Some(ch) = inner.slots[m].chase.take() {
+                            inner.budget.sub(ch.charged);
+                        }
+                        // A trim may have spilled a prefix into the part's
+                        // file on the way past. The payload came out the
+                        // other way, so that file is a truncated archive
+                        // nobody wants - shipping it beside the payload
+                        // would look like a second, broken download.
+                        Self::drop_slot_file(inner, m);
                     }
-                    // A trim may have spilled a prefix into the archive
-                    // file on the way past. The payload came out the
-                    // other way, so that file is a truncated archive
-                    // nobody wants - shipping it beside the payload
-                    // would look like a second, broken download.
-                    Self::drop_slot_file(inner, slot);
                 }
                 other => {
                     let why = match other {
                         Some(Err(e)) => e,
+                        // No outcome and no worker means the container
+                        // never opened: a pending split set whose
+                        // `.7z.001` never classified, so nothing ever
+                        // learned how big it was or where its map lived.
+                        None if !ctl.set.resolved() => {
+                            "7z split set never found its first part".to_string()
+                        }
                         _ => "7z worker panicked".to_string(),
                     };
                     self.sevenz_abandon_sinks(inner, &ctl);
-                    self.fallback_slot_or_group(inner, slot, &why)?;
+                    for m in live {
+                        self.fallback_slot_or_group(inner, m, &why)?;
+                    }
                 }
             }
         }
@@ -5954,23 +6595,23 @@ impl Extractor {
         let inner = self.inner_read();
         // Plain slot file: identity mapping on that slot.
         for (si, s) in inner.slots.iter().enumerate() {
-            if let Some(w) = &s.writer {
-                let fname = w.path.file_name().unwrap_or_default().to_string_lossy();
-                if fname == name {
-                    return vec![(si, start.min(w.size), end.min(w.size), w.size)];
-                }
-                continue;
-            }
-            // Chased slot: identity too, but keyed by NAME - a chase
-            // holds its bytes in a frontier buffer and never opens a
-            // writer, so the match above can never see it. Without this
-            // a top-level 7z's tail promote resolved to nothing and fell
-            // back to the coarse NZB-ladder estimate.
+            // Chased slot FIRST, keyed by name. A chase holds its bytes
+            // in a frontier buffer, but since drop-behind trimming it
+            // can also own a writer for the prefix it has spilled - and
+            // that writer's filename may have been disambiguated, so
+            // testing it first made this branch unreachable for exactly
+            // the slots that need it.
             if matches!(s.mode, SlotMode::RarChase | SlotMode::SevenZ)
                 && !s.name.is_empty()
                 && sanitize_filename(&s.name) == name
             {
                 return vec![(si, start.min(s.size), end.min(s.size), s.size)];
+            }
+            if let Some(w) = &s.writer {
+                let fname = w.path.file_name().unwrap_or_default().to_string_lossy();
+                if fname == name {
+                    return vec![(si, start.min(w.size), end.min(w.size), w.size)];
+                }
             }
         }
         // Extracted inner file: walk every resolved (volume-slot, entry)
@@ -6367,7 +7008,20 @@ impl Extractor {
                 inner.slots[slot].mode,
                 SlotMode::Rar | SlotMode::RarChase | SlotMode::SevenZ
             ) {
-                self.fallback_slot_or_group(inner, slot, "materialized for repair")?;
+                // chase_forfeit, NOT fallback_slot_or_group: a 7z slot is one
+                // part of a container and a byte split has no useful half, so
+                // demoting one member has to take every member with it. See
+                // that function's own comment for what the single-slot route
+                // costs - it drains the container's shared sink list, so the
+                // payload is deleted while the siblings stay in SevenZ with
+                // the set un-aborted, and sevenz_finish then takes the
+                // SURVIVORS' success path and drops their retained bytes.
+                //
+                // The in-crate demote routes were moved onto chase_forfeit;
+                // this public entry point was left behind, and PAR2 repair
+                // reaches it whenever a set's parts are not all claimed by
+                // the recovery set (multi-par2 NZB, or a part outside it).
+                self.chase_forfeit(inner, slot, "materialized for repair")?;
             }
         }
         self.flush_pending_fwd()
@@ -7310,8 +7964,11 @@ impl Drop for Extractor {
             }
         }
         for s in inner.slots.iter_mut() {
+            // A split set's parts share one ctl, so `take()` on the
+            // worker yields a handle for the first member only - which
+            // is exactly right, there is one thread per container.
             if let Some(ctl) = s.sevenz.take() {
-                ctl.buf.abort("extractor dropped");
+                ctl.set.abort();
                 if let Some(h) = ctl.worker.lock().unwrap().take() {
                     handles.push(h);
                 }
@@ -8625,6 +9282,46 @@ mod tests {
             ex.archive_shape().unwrap().display(),
             "RAR5 · stored · one-pass"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The naming oracle's key (Tier C item 4): the inner file's stated
+    /// CRC32, latched off the same header parse the shape badge uses.
+    /// Available DURING the download for the same reason the badge is.
+    #[test]
+    fn the_inner_file_crc_is_latched_for_the_naming_oracle() {
+        let dir = tmpdir("crc-latch");
+        let data = payload(200_000, 1);
+        let want = crc32fast::hash(&data);
+        // With the data CRC the way a real archiver always writes it.
+        let vol = fixtures::rar5_volume_n_crc(
+            &[("movie.mkv", 200_000, &data, false, false, Some(want))],
+            0,
+        );
+        let ex = Extractor::new(&dir, 1, true);
+        assert_eq!(ex.inner_crc(), None, "nothing fed yet");
+        feed(&ex, 0, "v.rar", &vol, 7000, 3);
+        assert_eq!(ex.inner_crc(), Some(("movie.mkv".to_string(), want)));
+        ex.finish().unwrap();
+        assert_eq!(ex.inner_crc(), Some(("movie.mkv".to_string(), want)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A header-encrypted set is the case the oracle cannot serve, and
+    /// it must say so rather than offering a CRC of something else: the
+    /// headers never parse, so there is no entry and no key. This is the
+    /// `-hp` floor, pinned.
+    #[test]
+    fn a_header_encrypted_set_yields_no_crc_key() {
+        let dir = tmpdir("crc-hdr");
+        // Encrypted headers and no password: nothing parses, exactly as
+        // for an obfuscated `-hp` post nobody has the key to.
+        let vol = fixtures::rar4_encrypted_headers(200_000);
+        let ex = Extractor::new(&dir, 1, true);
+        feed(&ex, 0, "v.rar", &vol, 7000, 3);
+        ex.finish().unwrap();
+        assert!(shape_of(&ex).contains(&"encrypted"), "{:?}", shape_of(&ex));
+        assert_eq!(ex.inner_crc(), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -12369,12 +13066,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Multipart `.7z.001` inner set (v1 limitation): the part's start
-    /// header points past its own bytes, so the chase declines and the
-    /// part materializes Plain - today's output, the disk post-pass
-    /// joins and extracts the set.
+    /// A `.7z.001` whose siblings never turn up. The chase now opens a
+    /// SET on it - part 1's start header sizes the whole container, so
+    /// it knows there is more coming - and when nothing else registers,
+    /// the container cannot be read and every part it holds materializes
+    /// byte-exact for the disk post-pass to join. The reason is recorded
+    /// where it used to be silent; the file on disk is unchanged.
     #[test]
-    fn sevenz_multipart_part_declines_to_materialize() {
+    fn sevenz_multipart_part_without_its_siblings_materializes() {
         let f = payload(200_000, 112);
         let arch = sevenz_archive(&[("F.bin", &f)], None, false);
         let half = arch.len() / 2;
@@ -12383,7 +13082,11 @@ mod tests {
         let ex = Extractor::new(&dir, 1, true);
         feed(&ex, 0, "v.rar", &outer, 7000, 48);
         let rep = ex.finish().unwrap();
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert!(
+            rep.fallbacks.iter().any(|(_, w)| w.starts_with("nested fallback:")),
+            "{:?}",
+            rep.fallbacks
+        );
         assert_eq!(std::fs::read(dir.join("inner.7z.001")).unwrap(), &arch[..half]);
         assert_eq!(dir_files(&dir), vec!["inner.7z.001".to_string()]);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -12514,13 +13217,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Multipart stays excluded AT DEPTH 0 too. The nested pin for this
-    /// (`sevenz_multipart_part_declines_to_materialize`) runs below the
-    /// root, where the old depth guard declined first, so it could not
-    /// have caught a regression here. What holds the line is the
-    /// arithmetic - a part's end header lies past its own bytes.
+    /// The same lone-part case at depth 0: a set opens, nothing else
+    /// joins it, and the part materializes byte-exact under the marker
+    /// that keeps a lone `.7z` out of the RAR unpack ladder.
     #[test]
-    fn sevenz_top_level_multipart_declines_to_materialize() {
+    fn sevenz_top_level_multipart_without_its_siblings_materializes() {
         let f = payload(200_000, 124);
         let arch = sevenz_archive(&[("F.bin", &f)], None, false);
         let half = arch.len() / 2;
@@ -12529,7 +13230,11 @@ mod tests {
         ex.anchor();
         feed(&ex, 0, "release.7z.001", &arch[..half], 7000, 51);
         let rep = ex.finish().unwrap();
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert!(
+            rep.fallbacks.iter().any(|(_, w)| w.starts_with(SEVENZ_DISK_FALLBACK_PREFIX)),
+            "{:?}",
+            rep.fallbacks
+        );
         assert_eq!(
             std::fs::read(dir.join("release.7z.001")).unwrap(),
             &arch[..half]
@@ -12582,6 +13287,312 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    // -- TODO 37 step 3: `.7z.001` split sets --
+
+    /// Cut a container into `n` parts the way `7z -v` does: every part
+    /// exactly the split size, the last one the remainder.
+    fn split_7z(arch: &[u8], n: usize) -> Vec<Vec<u8>> {
+        let part = arch.len().div_ceil(n);
+        arch.chunks(part).map(|c| c.to_vec()).collect()
+    }
+
+    /// A `.7z.001` split set streams as ONE container. Part 1's start
+    /// header sizes the whole thing (a 7z end header is the last thing
+    /// in a container, so `32 + offset + size` is the end), which is how
+    /// a chase that has only seen part 1 knows how far the container
+    /// runs and where its map lives; the other parts carry no signature
+    /// at all and join by name. Feed orders include parts arriving
+    /// backwards, because nothing guarantees `.001` classifies first.
+    #[test]
+    fn sevenz_multipart_set_extracts_one_pass() {
+        let f = payload(600_000, 140);
+        let arch = sevenz_archive(&[("F.bin", &f)], None, false);
+        let parts = split_7z(&arch, 3);
+        assert_eq!(parts.len(), 3, "fixture must really split");
+        for (t, order) in [vec![0, 1, 2], vec![2, 1, 0], vec![1, 2, 0]].iter().enumerate() {
+            let dir = tmpdir(&format!("7z-split{t}"));
+            let ex = Arc::new(Extractor::new(&dir, 3, true));
+            ex.anchor();
+            for &i in order {
+                feed(
+                    &ex,
+                    i,
+                    &format!("big.7z.{:03}", i + 1),
+                    &parts[i],
+                    7000,
+                    60 + i as u64,
+                );
+            }
+            let rep = ex.finish().unwrap();
+            assert!(rep.fallbacks.is_empty(), "order {t}: {:?}", rep.fallbacks);
+            assert_eq!(std::fs::read(dir.join("F.bin")).unwrap(), f, "order {t}");
+            // No part on disk: the whole set streamed.
+            assert_eq!(dir_files(&dir), vec!["F.bin".to_string()], "order {t}");
+            assert_eq!(shape_of(&ex), ["7z", "one-pass"], "order {t}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// A part missing entirely: the container has a hole in it, so it
+    /// cannot be read at all and EVERY part that did arrive materializes
+    /// byte-exact for the disk post-pass. Half a byte split is worth
+    /// nothing on its own, which is why the demote is all-or-nothing.
+    #[test]
+    fn sevenz_multipart_set_missing_a_part_materializes_the_rest() {
+        let f = payload(600_000, 141);
+        let arch = sevenz_archive(&[("F.bin", &f)], None, false);
+        let parts = split_7z(&arch, 3);
+        let dir = tmpdir("7z-split-hole");
+        let ex = Arc::new(Extractor::new(&dir, 3, true));
+        ex.anchor();
+        for i in [0usize, 2] {
+            feed(&ex, i, &format!("big.7z.{:03}", i + 1), &parts[i], 7000, 70 + i as u64);
+        }
+        let rep = ex.finish().unwrap();
+        assert!(!rep.fallbacks.is_empty(), "the set must demote");
+        assert!(!dir.join("F.bin").exists(), "partial output survived");
+        assert_eq!(std::fs::read(dir.join("big.7z.001")).unwrap(), parts[0]);
+        assert_eq!(std::fs::read(dir.join("big.7z.003")).unwrap(), parts[2]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A set whose parts are not a uniform `7z -v` split cannot be
+    /// mapped from a container offset to a part at all, so the chase
+    /// refuses the whole set rather than guess. Everything materializes
+    /// and the disk post-pass joins it, which is what happened to every
+    /// split set before this existed.
+    #[test]
+    fn sevenz_multipart_uneven_parts_refuse_the_set() {
+        let f = payload(600_000, 142);
+        let arch = sevenz_archive(&[("F.bin", &f)], None, false);
+        let cut = arch.len() / 3;
+        // Deliberately not a uniform split: part 2 is short.
+        let parts = [
+            arch[..cut].to_vec(),
+            arch[cut..cut + cut / 2].to_vec(),
+            arch[cut + cut / 2..].to_vec(),
+        ];
+        let dir = tmpdir("7z-split-uneven");
+        let ex = Arc::new(Extractor::new(&dir, 3, true));
+        ex.anchor();
+        for i in 0..3 {
+            feed(&ex, i, &format!("big.7z.{:03}", i + 1), &parts[i], 7000, 80 + i as u64);
+        }
+        let rep = ex.finish().unwrap();
+        assert!(!rep.fallbacks.is_empty(), "the set must refuse");
+        assert!(!dir.join("F.bin").exists(), "partial output survived");
+        for i in 0..3 {
+            assert_eq!(
+                std::fs::read(dir.join(format!("big.7z.{:03}", i + 1))).unwrap(),
+                parts[i],
+                "part {} not byte-exact",
+                i + 1
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The case step 3 exists for, and the reason it had to wait for
+    /// step 2: a split set BIGGER than the retention cap. Every part
+    /// drops behind independently into its own `.7z.NNN` path, and a
+    /// part the engine has read straight past releases whole. Without
+    /// trimming this could only ever demote - which is why multipart was
+    /// worth 0.04% of posted bytes before it and ~4% after.
+    #[test]
+    fn sevenz_multipart_set_over_the_cap_trims_and_streams() {
+        let f = noisy(24 << 20, 143);
+        let arch = sevenz_archive(
+            &[("F.bin", &f)],
+            Some(vec![sevenz_rust2::EncoderConfiguration::new(
+                sevenz_rust2::EncoderMethod::COPY,
+            )]),
+            false,
+        );
+        let parts = split_7z(&arch, 3);
+        assert_eq!(parts.len(), 3);
+        let dir = tmpdir("7z-split-trim");
+        let ex = Arc::new(Extractor::new(&dir, 3, true));
+        ex.anchor();
+        ex.set_holds_cap(1); // floors at 8 MB, against a 24 MB container
+        let chunk = 256 << 10;
+        let put = |i: usize, off: usize, end: usize| {
+            ex.write(
+                i,
+                &format!("big.7z.{:03}", i + 1),
+                parts[i].len() as u64,
+                off as u64,
+                &parts[i][off..end.min(parts[i].len())],
+            )
+            .unwrap();
+        };
+        // Classify every part first, then deliver the tail. On a split
+        // container the end header lives in the LAST part, so the parse
+        // cannot even start until that part has registered - which is
+        // exactly why the promote ladder front-loads it in the field.
+        for i in 0..3 {
+            put(i, 0, chunk);
+        }
+        let last = parts[2].len();
+        put(2, last.saturating_sub(chunk * 2).max(chunk), last);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            match sevenz_ctl(&ex, 0) {
+                Some(c) if c.trim_ok.load(Ordering::Relaxed) => break,
+                Some(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                None => break,
+            }
+        }
+        // Now the bodies, in container order, paced against the engine's
+        // read position so the decoder stays in touch with the arrivals.
+        let part_size = parts[0].len();
+        let mut high = 0u64;
+        for i in 0..3 {
+            let mut off = chunk;
+            while off < parts[i].len() {
+                put(i, off, off + chunk);
+                off += chunk;
+                let fed = (i * part_size + off) as u64;
+                let wait = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                loop {
+                    let Some(c) = sevenz_ctl(&ex, i) else { break };
+                    high = high.max(
+                        ex.inner.lock().unwrap().slots[0]
+                            .chase
+                            .as_ref()
+                            .map_or(0, |ch| ch.buf.base()),
+                    );
+                    if c.low_water.load(Ordering::Relaxed) + (2 << 20) >= fed
+                        || std::time::Instant::now() > wait
+                    {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        }
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert!(high > 0, "part 1 was never trimmed - the test proved nothing");
+        assert_eq!(std::fs::read(dir.join("F.bin")).unwrap(), f);
+        assert_eq!(dir_files(&dir), vec!["F.bin".to_string()], "a part survived");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Arming the trim must RESET the watermark, not just flip the flag.
+    /// The parse ends having read the end header, so the reader's
+    /// position is at EOF when the map becomes known - measured exactly
+    /// `total` on a real fixture. Arming against that leaves a window,
+    /// until the engine seeks back to the first pack stream, in which a
+    /// budget breach releases the whole buffer and the next read lands
+    /// behind the trim point: a forfeit, and a spurious demote of
+    /// precisely the large archive drop-behind exists for.
+    #[test]
+    fn arming_the_trim_forgets_the_open_phase_watermark() {
+        let ctl = SevenZCtl::pending("x.7z".to_string());
+        ctl.low_water.store(25_165_914, Ordering::Relaxed);
+        ctl.arm_trim(false);
+        assert_eq!(
+            ctl.low_water.load(Ordering::Relaxed),
+            0,
+            "an EOF watermark survived into the trim path"
+        );
+        assert!(ctl.trim_ok.load(Ordering::Relaxed));
+        // And a coder chain that needs history is refused outright.
+        ctl.low_water.store(999, Ordering::Relaxed);
+        ctl.arm_trim(true);
+        assert_eq!(ctl.low_water.load(Ordering::Relaxed), 0);
+        assert!(!ctl.trim_ok.load(Ordering::Relaxed));
+    }
+
+    /// A forfeit raised on ONE part must take the whole container.
+    ///
+    /// This is the shape of a silent total-data-loss bug: routing the
+    /// budget/conflict forfeits through the single-slot demote let
+    /// `fallback_slot` drain the container's whole sink list (every
+    /// member shares one ctl), deleting the payload, while the other
+    /// members stayed in `SevenZ` with the set un-aborted. The worker
+    /// read on, wrote into a slot that had become `Discard` (which
+    /// swallows writes), and returned Ok - so `sevenz_finish` took the
+    /// survivors' SUCCESS path, dropped their retained bytes and
+    /// unlinked their spilled prefixes. What survived was one orphaned
+    /// `.7z.002`, no payload, and a job reporting completion.
+    ///
+    /// The assertion that matters is the last one: whatever else
+    /// happens, every posted byte has to be somewhere.
+    #[test]
+    fn sevenz_multipart_forfeit_on_one_part_demotes_the_whole_container() {
+        let f = payload(600_000, 144);
+        let arch = sevenz_archive(&[("F.bin", &f)], None, false);
+        let parts = split_7z(&arch, 3);
+        let dir = tmpdir("7z-split-forfeit");
+        let ex = Arc::new(Extractor::new(&dir, 3, true));
+        ex.anchor();
+        ex.set_sevenz_trim(false); // force the breach to demote, not trim
+        for i in 0..3 {
+            feed(&ex, i, &format!("big.7z.{:03}", i + 1), &parts[i], 7000, 90 + i as u64);
+        }
+        // Wait for the worker to have finished SUCCESSFULLY. That is the
+        // window the bug lives in: a forfeit arriving afterwards is never
+        // seen by the worker (its liveness check only runs at the start
+        // of each entry), so finish() would take the success path for
+        // every member that was not the one named below.
+        let ctl = sevenz_ctl(&ex, 0).expect("chase attached");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            if matches!(*ctl.outcome.lock().unwrap(), Some(Ok(()))) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            matches!(*ctl.outcome.lock().unwrap(), Some(Ok(()))),
+            "worker did not finish - the test never reaches the window"
+        );
+        // Forfeit through the same route a retention-cap breach takes,
+        // naming only ONE member.
+        {
+            let mut g = ex.inner.lock().unwrap();
+            let inner = &mut *g;
+            ex.chase_forfeit(inner, 1, "held-bytes cap: chase memory").unwrap();
+        }
+        let rep = ex.finish().unwrap();
+        assert!(!rep.fallbacks.is_empty(), "the container must demote");
+        // Every part on disk, byte-exact: the container is recoverable
+        // by the disk post-pass exactly as it was before the chase.
+        // (The payload is gone - the forfeit abandoned it - which is
+        // correct; what must never happen is losing the parts too.)
+        for i in 0..3 {
+            assert_eq!(
+                std::fs::read(dir.join(format!("big.7z.{:03}", i + 1))).unwrap(),
+                parts[i],
+                "part {} did not materialize",
+                i + 1
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The part-name rule, which is the only thing that recognizes a
+    /// continuation part - they carry no signature of their own.
+    #[test]
+    fn sevenz_part_names_parse() {
+        assert_eq!(
+            sevenz_part_name("Some.Release.7z.001"),
+            Some(("some.release.7z".to_string(), 1))
+        );
+        assert_eq!(
+            sevenz_part_name("Some.Release.7Z.012"),
+            Some(("some.release.7z".to_string(), 12))
+        );
+        // Not split parts.
+        assert_eq!(sevenz_part_name("plain.7z"), None);
+        assert_eq!(sevenz_part_name("movie.mkv"), None);
+        assert_eq!(sevenz_part_name("set.rar.001"), None);
+        assert_eq!(sevenz_part_name("set.7z.000"), None);
+        assert_eq!(sevenz_part_name("set.7z.abc"), None);
+        assert_eq!(sevenz_part_name("set.7z.12345"), None);
+    }
+
     // -- TODO 37 step 2: drop-behind trimming --
 
     /// A chased slot's live 7z control, for the trim tests.
@@ -12618,6 +13629,24 @@ mod tests {
         put(0, chunk);
         let tail_from = n.saturating_sub(chunk * 2).max(chunk);
         put(tail_from, n);
+        // Wait for the container to OPEN before feeding the body. In
+        // production the promote ladder front-loads the end header and
+        // the parse happens in the first seconds; here the feed would
+        // otherwise outrun a worker that has not been scheduled yet, and
+        // the test would be measuring the race rather than the trim.
+        //
+        // `trim_ok` is the signal because it is set exactly between the
+        // parse and the first payload read. Watching the watermark
+        // instead does not work: the open seeks to the tail, which parks
+        // it at EOF (the trap recorded in the scope's method notes).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            match sevenz_ctl(ex, slot) {
+                Some(c) if c.trim_ok.load(Ordering::Relaxed) => break,
+                Some(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                None => break,
+            }
+        }
         // Leaving a gap short of the tail keeps the chase LIVE and
         // trimmed at the end of the feed, which is the state the demote
         // and read-back tests need to look at.

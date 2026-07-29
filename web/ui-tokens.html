@@ -81,6 +81,11 @@
   --line:rgba(140,150,175,.14);--acc:#4da3ff;--acc2:#8d71ff;
   --ok:#35c88a;--warn:#f5b445;--bad:#ec5a5a;
   --p0:#4da3ff;--p1:#35c88a;--p2:#f5b445;--p3:#ec5a5a;--p4:#7c5cff;--p5:#22c3d6;
+  /* Identity colours: things that ARE something (a provider, a server),
+     not things that MEAN something. Deliberately avoids the exact
+     ok/warn/bad hues so a healthy provider is never painted error-red
+     just because it is fourth in the list. */
+  --id0:#4da3ff;--id1:#22c3d6;--id2:#8d71ff;--id3:#e07ab8;--id4:#7cb87c;--id5:#c9a15a;
   --gold:#f0c33c;--code:#1d222d;--mark:#4a3f14;
 }
 /* The light theme used to override only the neutrals and accents, so it
@@ -125,6 +130,7 @@
   --line:rgba(255,255,255,.34);--acc:#7ac2ff;--acc2:#c0a8ff;
   --ok:#5ce0a4;--warn:#ffd166;--bad:#ff8b8b;
   --p0:#7ac2ff;--p1:#5ce0a4;--p2:#ffd166;--p3:#ff8b8b;--p4:#c0a8ff;--p5:#63dcec;
+  --id0:#7ac2ff;--id1:#63dcec;--id2:#c0a8ff;--id3:#f2a5d2;--id4:#a4d6a4;--id5:#e0c08a;
   --gold:#ffd166;--code:#16161a;--mark:#5a4a12;
 }
 /* A user-set accent overrides whatever the theme chose. Kept as its own
@@ -146,9 +152,11 @@
    distinguishable under deuteranopia and protanopia - the common cases,
    and the ones a red/green pair fails. */
 :root[data-palette="cb"]{--p0:#56b4e9;--p1:#009e73;--p2:#e69f00;--p3:#d55e00;
-  --p4:#cc79a7;--p5:#0072b2}
+  --p4:#cc79a7;--p5:#0072b2;
+  --id0:#56b4e9;--id1:#0072b2;--id2:#cc79a7;--id3:#e69f00;--id4:#009e73;--id5:#d55e00}
 :root[data-palette="warm"]{--p0:#f0894a;--p1:#e5c04a;--p2:#d9605e;--p3:#b07cc6;
-  --p4:#5ea9c9;--p5:#7cb87c}
+  --p4:#5ea9c9;--p5:#7cb87c;
+  --id0:#f0894a;--id1:#e5c04a;--id2:#b07cc6;--id3:#5ea9c9;--id4:#7cb87c;--id5:#d9605e}
 /* Motion. The OS setting is honoured by default (the media query above);
    these let someone override it per browser in either direction. */
 :root[data-motion="none"] *{animation:none!important;transition:none!important;
@@ -203,6 +211,9 @@ button,input.txt,select.sel,input.search,.chip{border-radius:var(--radius-sm)}
   <g id="i-density"><path d="M4 6.5h16M4 12h16M4 17.5h16"/></g>
   <g id="i-close"><path d="M6 6l12 12M18 6 6 18"/></g>
   <g id="i-help"><circle cx="12" cy="12" r="9"/><path d="M9.5 9.3a2.6 2.6 0 1 1 3.3 2.5c-.6.2-.8.7-.8 1.4v.5"/><circle cx="12" cy="17" r=".9" fill="currentColor" stroke="none"/></g>
+  <g id="i-lock"><rect x="5" y="10.5" width="14" height="10" rx="2"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/><circle cx="12" cy="15.5" r="1.1" fill="currentColor" stroke="none"/></g>
+  <g id="i-gauge"><path d="M4 16.5a8.5 8.5 0 1 1 16 0"/><path d="M12 16.5 16 10"/><circle cx="12" cy="16.5" r="1.2" fill="currentColor" stroke="none"/></g>
+  <g id="i-clock"><circle cx="12" cy="12" r="8.5"/><path d="M12 7v5l3.5 2"/></g>
 </defs></svg>
 <style>
 /* One icon class. 1em so an icon scales with the text it sits beside,

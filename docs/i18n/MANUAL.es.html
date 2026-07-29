@@ -356,6 +356,7 @@ y de bloque. Las cuentas de bloque muestran el uso acumulado contra su tamaño.<
 se recoge en menos de 5 segundos y el archivo se elimina. Apunta el directorio de descargas de tu
 navegador hacia ella para capturas con un clic desde los sitios de indexadores.</td></tr>
 <tr><td><b>Desde una URL</b></td><td>Pega un enlace NZB (API <code>mode=addurl</code>, o mediante cualquier app conectada).</td></tr>
+<tr><td><b>Enlaces nzblnk:</b></td><td>Pega un enlace <code>nzblnk:</code> en cualquier parte del panel, o arrástralo dentro. Si instalaste desde el DMG de macOS o el instalador de Windows también puedes hacer clic en uno directamente en un board. Consulta <a href="#nzblnk">los enlaces nzblnk</a> más abajo.</td></tr>
 <tr><td><b>Explorar índice</b></td><td>Haz clic en cualquier lanzamiento completo de la tarjeta Explorar.</td></tr>
 <tr><td><b>Lista de seguimiento / RSS</b></td><td>Automático - ver <a href="#automation">Automatización</a>.</td></tr>
 <tr><td><b>Sonarr/Radarr etc.</b></td><td>Envían las capturas directamente a la cola - ver <a href="#arr">§11</a>.</td></tr>
@@ -366,10 +367,37 @@ navegador hacia ella para capturas con un clic desde los sitios de indexadores.<
 <li>Las <b>categorías</b> son etiquetas libres; cada una se convierte en una subcarpeta de tu carpeta
 de descargas, y las Carpetas inteligentes (ver <a href="#automation">§10</a>) pueden asignarlas por regla.</li>
 <li><b>Prioridades</b>: Forzar &gt; Alta &gt; Normal &gt; Baja. Forzar se salta la pausa y la cuota.</li>
-<li>Las <b>contraseñas</b> de los archivos cifrados se recogen automáticamente de
-<code>&lt;meta type="password"&gt;</code> dentro del NZB o de un nombre de archivo
-<code>Name{{password}}.nzb</code>, y pueden facilitarse por trabajo a través de la
-API o después desde el Historial (🔑).</li>
+<li><b>Las contraseñas</b> de archivos cifrados se recogen automáticamente de
+<code>&lt;meta type="password"&gt;</code> dentro del NZB, de un nombre de archivo
+<code>Name{{password}}.nzb</code> o del campo <code>p=</code> de un
+<a href="#nzblnk">enlace nzblnk</a>, y pueden indicarse por trabajo a través de la API
+o después desde el Historial (🔑).</li>
+</ul>
+
+<h3 id="nzblnk">Los enlaces nzblnk</h3>
+<p>Algunos boards, sobre todo alemanes y neerlandeses, publican un enlace
+<code>nzblnk:</code> en lugar de un archivo NZB. La publicación está ofuscada, así que
+no hay ningún nombre de archivo al que enlazar. El enlace lleva en su lugar una
+cabecera, <code>h=</code>, que es una clave de búsqueda y no una ubicación, además de
+un título <code>t=</code>, una contraseña <code>p=</code> y un grupo <code>g=</code>
+opcionales. Alguien tiene que ir a encontrar la publicación primero.</p>
+<p>nzbfast busca la cabecera primero en su propio índice, lo que no necesita red
+alguna, y solo si eso falla pregunta a los indexadores de búsqueda que tengas
+configurados (Ajustes → Indexadores de búsqueda, <a href="#settings">§9</a>), bajo los
+mismos presupuestos diarios y el mismo retroceso que cualquier otra búsqueda. El título
+pasa a ser el nombre del trabajo y la contraseña se aplica automáticamente.</p>
+<ul>
+<li><b>Pegar o arrastrar</b> funciona en cualquier instalación, Docker y NAS incluidos:
+copia el enlace del board y pégalo en cualquier parte del panel.</li>
+<li><b>Hacer clic</b> en un enlace exige que el esquema esté registrado en tu escritorio.
+La app del <b>DMG de macOS</b> lo registra, y el <b>instalador de Windows</b> lo ofrece
+como tarea: pregunta antes, y deja el esquema en paz si NZB Monkey o NZBDonkey ya lo
+tiene. El tarball simple de macOS, Homebrew y las instalaciones Linux no tienen
+manejador de escritorio: ahí la vía de entrada es pegar.</li>
+<li>La resolución tiene límite de frecuencia a propósito. Registrar un esquema lo deja a
+un aviso del navegador de cualquier página que visites, así que los enlaces están topados
+por minuto y solo los primeros de cada minuto pueden llegar a tus indexadores; a partir
+de ahí se responde solo con el índice local.</li>
 </ul>
 
 <h2 id="wall">6 · El muro de pósteres</h2>
@@ -442,11 +470,45 @@ del pool cualquier servidor. Cada servidor tiene:</p>
 <table>
 <tr><th>Campo</th><th>Notas</th></tr>
 <tr><td>Host / puerto</td><td>Usa el puerto SSL <b>563</b>. TLS no cuesta nada medible - nzbfast siempre cifra.</td></tr>
-<tr><td>Usuario / contraseña</td><td>Se guardan localmente en <code>config.local.json</code>, nunca se devuelven al navegador. Dejar la contraseña en blanco al editar conserva la guardada.</td></tr>
+<tr><td>Usuario / contraseña</td><td>Se guardan localmente en <code>config.local.json</code>, nunca se devuelven al navegador. Dejar la contraseña en blanco al editar conserva la guardada. Las contraseñas están <a href="#passwords">ofuscadas en disco, no cifradas</a>.</td></tr>
 <tr><td>Conexiones</td><td>Conexiones simultáneas por servidor. Usa el <b>Ajuste de conexiones</b> (<a href="#performance">§13</a>) para hallar el punto óptimo de cada proveedor en lugar de apostar alto.</td></tr>
 <tr><td>Nivel (tier)</td><td>0 = primario; los niveles superiores son servidores de relleno, a los que solo se piden los artículos que todos los niveles inferiores no tenían. Pon las cuentas ilimitadas en 0 y las de bloque en 1+.</td></tr>
 <tr><td>Tamaño del bloque (GB)</td><td>Para cuentas de bloque (pago por GB): nzbfast registra el uso acumulado contra este valor y deja de usar el servidor cuando se agota (aviso al 85%).</td></tr>
 </table>
+<h3 id="passwords">Cómo se guardan las contraseñas de tus proveedores</h3>
+<p>Las contraseñas de proveedor en <code>config.local.json</code> están <b>ofuscadas,
+no cifradas</b>. Se guardan como <code>obf1:</code> seguido de una forma codificada,
+de modo que el archivo no se lee como texto plano si aparece en una captura de
+pantalla, en un mensaje de foro, en un informe de error o en una pantalla que otra
+persona puede ver.</p>
+<p>Seamos claros sobre lo que eso te da y lo que no:</p>
+<ul>
+<li><b>No es cifrado y no protege en absoluto de quien tenga el archivo.</b> El
+método está en nuestro código público y el decodificador viaja dentro de nzbfast:
+quien tenga el archivo recupera la contraseña en segundos. Trata el archivo como un
+secreto exactamente igual que si las contraseñas fueran legibles.</li>
+<li><b>Elimina la fuga casual</b>, que es la habitual. Las configuraciones acaban
+pegadas en hilos de soporte y capturadas en pantallazos mucho más a menudo de lo que
+se roban del disco.</li>
+<li>Una contraseña que escribiste tú en texto plano sigue funcionando. nzbfast lee
+ambas formas, así que las configuraciones editadas a mano y las importaciones desde
+otros clientes nunca se rompen; escribe la forma ofuscada la próxima vez que
+guarde.</li>
+<li>El archivo además se escribe legible solo por la cuenta que ejecuta nzbfast
+(modo 0600 en macOS y Linux).</li>
+</ul>
+<p>Para comparar, <b>NZBGet y SABnzbd guardan ambos las contraseñas de proveedor como
+texto legible</b> en sus archivos de configuración. Creemos que la ofuscación es una
+pequeña mejora sobre eso, no una función de seguridad.</p>
+<p><b>¿Por qué no el llavero del sistema?</b> El llavero de macOS, el Administrador de
+credenciales de Windows y los servicios de secretos de Linux darían protección real, y
+puede que volvamos a ello. Hoy nos lo impiden dos cosas. El acceso al llavero está
+atado a la identidad de la aplicación, y nzbfast todavía no está firmado, así que los
+avisos y el comportamiento tras cada actualización son malos. Y una parte grande de
+las instalaciones son Docker, servidores sin pantalla y NAS donde no existe llavero
+alguno, lo que dejaría dos rutas de almacenamiento distintas que mantener correctas.
+Un único formato bien entendido que se comporta igual en todas partes es, por ahora,
+el mejor trato.</p>
 <p>Otras dos opciones por servidor todavía no tienen control en el panel: añádelas a
 mano en la entrada de ese servidor dentro de <code>config.local.json</code>
 (véase <a href="#files">§17</a>) y reinicia.</p>
@@ -560,8 +622,22 @@ y entorno <code>SAB_*</code> - los scripts de SAB existentes funcionan sin cambi
 y <b>archivado de TV</b> (ver <a href="#automation">§10</a>).</p>
 
 <h3>Indexación <span class="pill live">en directo</span></h3>
+<div class="note"><b>El indexador integrado está apagado por defecto.</b> Encuentra
+publicaciones hechas con un nombre de archivo real, y una parte grande y creciente de
+Usenet se publica deliberadamente sin él: asunto aleatorio, nombres de archivo
+aleatorios dentro, soltados en un grupo cajón de sastre. El nombre real vive solo en un
+NZB que el uploader publica en otro sitio, así que nunca estuvo en Usenet para que
+ningún escáner lo leyera. Medido sobre nuestro propio índice, 14,8 millones de
+publicaciones escaneadas produjeron unas 31.000 releases explorables, aproximadamente
+una de cada quinientas. Sigue usando indexadores comerciales, y añádelos en Ajustes →
+Indexadores de búsqueda para poder consultarlos desde el muro. Enciende esto si sigues
+grupos concretos donde la gente todavía publica con nombres reales, o si quieres ver
+qué lleva realmente tu proveedor. Con el interruptor apagado no se escanea ni se
+descarga nada, no se crea base de datos alguna, y el muro, Explorar, la watchlist y el
+feed newznab quedan ocultos.</div>
 <table>
 <tr><th>Ajuste</th><th>Qué hace</th></tr>
+<tr><td>Indexador integrado</td><td>El interruptor maestro, <b>apagado mientras no lo enciendas</b>. Apagado significa sin escaneo, sin búsquedas de metadatos, sin muestreo de disponibilidad y sin feed newznab; un índice que ya esté en disco se conserva (hay un botón para borrarlo), así que volver a encenderlo reanuda en lugar de reescanear.</td></tr>
 <tr><td>Grupos</td><td>Newsgroups que escanea el indexador integrado (p. ej. <code>alt.binaries.teevee</code>).</td></tr>
 <tr><td>Intervalo de escaneo</td><td>Segundos entre pasadas (por defecto 900).</td></tr>
 <tr><td>Artículos de relleno</td><td>Cabeceras obtenidas en el primer escaneo de un grupo.</td></tr>
@@ -637,8 +713,14 @@ todo se comporta como esperan los *arr.</p>
 <code>movie</code> desde su propio índice de tus grupos vigilados, y
 <code>/getnzb/&lt;id&gt;</code> devuelve el NZB.</li>
 </ol>
-<div class="note"><b>¿Para qué molestarse?</b>Un indexador autoalojado exactamente de los grupos que te
-importan: sin cuentas, sin límites de peticiones a la API, con la retención tan profunda como le dejes escanear.</div>
+<div class="note"><b>Enciende primero el indexador integrado</b> (Ajustes → Indexación).
+Está apagado por defecto, y mientras lo esté esta fachada responde a cada consulta con
+<code>&lt;error code="101"&gt;</code> en lugar de con un resultado vacío, así que un fallo
+se ve al añadir el indexador y no semanas después.<br><br>
+<b>¿Para qué molestarse?</b> Un indexador autoalojado exactamente de los grupos que te
+importan: sin cuentas, sin límites de llamadas API, con la retención tan profunda como le
+dejes escanear. Es una suma a tus indexadores habituales, no un reemplazo, porque solo
+encuentra lo que se publicó con un nombre de archivo real.</div>
 
 <h2 id="remotes">12 · Móvil y apps remotas</h2>
 <p>nzbfast implementa <em>los dos</em> grandes protocolos de control remoto, así que casi cualquier
@@ -809,10 +891,10 @@ un <code>--post-server</code> explícito y nunca elige un servidor por ti.</p>
 <p>Endpoint base: <code>http://host:6789/api?mode=…&amp;apikey=…&amp;output=json</code> -
 compatible con SABnzbd, así que las integraciones SAB existentes funcionan sin cambios. Dos claves:
 la <b>clave API</b> (control total) y la <b>clave NZB</b> (solo añadir:
-<code>addfile</code>/<code>addurl</code>).</p>
+<code>addfile</code>/<code>addurl</code>). <code>addnzblnk</code> queda deliberadamente fuera del conjunto de solo añadir: resolver un enlace puede gastar cuota medida de indexador, algo que no le corresponde a una credencial de solo añadir.</p>
 <table>
 <tr><th>Área</th><th>Modos</th></tr>
-<tr><td>Cola</td><td><code>queue</code> (con <code>name=delete/pause/resume/priority/switch</code>), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>retry</code>, <code>set_password</code></td></tr>
+<tr><td>Cola</td><td><code>queue</code> (con <code>name=delete/pause/resume/priority/switch</code>), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>addnzblnk</code>, <code>retry</code>, <code>set_password</code></td></tr>
 <tr><td>Información</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code></td></tr>
 <tr><td>Configuración</td><td><code>get_config</code>, <code>config&amp;name=&lt;setting&gt;&amp;value=…</code> (cada campo de Ajustes), <code>server_save/delete/test/enable/reorder</code>, <code>import_probe/apply</code></td></tr>
 <tr><td>Índice y muro</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, más newznab en <code>/api?t=caps|search|tvsearch|movie</code> y <code>/getnzb/&lt;id&gt;</code></td></tr>
@@ -825,7 +907,7 @@ la <b>clave API</b> (control total) y la <b>clave NZB</b> (solo añadir:
 <h2 id="files">17 · Archivos y ubicaciones</h2>
 <table>
 <tr><th>Archivo</th><th>Contenido</th></tr>
-<tr><td><code>config.local.json</code></td><td>Credenciales de servidores y opciones por servidor. Lo crea el asistente; editable en Ajustes. Mantenlo privado.</td></tr>
+<tr><td><code>config.local.json</code></td><td>Credenciales de servidores y opciones por servidor. Lo crea el asistente; editable en Ajustes. Mantenlo privado. Las contraseñas están <a href="#passwords">ofuscadas, no cifradas</a>.</td></tr>
 <tr><td><code>settings.json</code></td><td>Cada ajuste cambiado en el panel. Vive junto a la configuración; los valores de la interfaz anulan las opciones de línea de comandos. Borra una clave (o el archivo) para volver a las opciones/valores por defecto.</td></tr>
 <tr><td><code>apikey</code></td><td>La clave API que nzbfast se creó en el primer arranque (<a href="#firstrun-key">§2</a>). Vive junto a la configuración; en macOS y Linux solo la puede leer la cuenta que ejecuta nzbfast. No lo borres para conseguir una clave nueva: en una instalación que ya ha arrancado alguna vez, nada la sustituye y el daemon vuelve a levantarse sin clave ninguna. Pon una nueva en Ajustes → Seguridad.</td></tr>
 <tr><td><code>index.db</code></td><td>El índice de lanzamientos (SQLite) + los metadatos del muro. Se puede borrar sin peligro - se reconstruye con el escaneo (Ajustes → Indexación → Borrar lo hace por ti).</td></tr>

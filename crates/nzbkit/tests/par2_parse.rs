@@ -188,3 +188,25 @@ fn no_main_packet_errors() {
     ));
     assert!(matches!(Par2Set::parse(&[]), Err(Par2Error::NoMainPacket)));
 }
+
+/// The repost fingerprint (Tier C item 5): the sidecar's per-member
+/// hash16k, which describes the OUTER volumes and so survives RAR header
+/// encryption. Short members are excluded on purpose - under 16 KiB the
+/// field is just the whole-file MD5 of an nfo or a sample, which
+/// collides across unrelated releases and would name a post after the
+/// wrong film.
+#[test]
+fn member_hash16k_fingerprints_the_long_members_only() {
+    let set = parse_set();
+    let hashes = set.member_hash16k();
+    // beta.bin is 33 KiB and qualifies; alpha.bin is 10 KiB and does not.
+    assert_eq!(hashes.len(), 1, "got {hashes:?}");
+    assert_eq!(hashes[0].1, "beta.bin");
+    assert_eq!(hashes[0].0, nzbkit::par2::hex16(&file(&set, "beta.bin").md5_16k));
+    assert_eq!(hashes[0].0.len(), 32);
+    assert!(hashes[0].0.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    // The fingerprint is the file's own bytes, so an independent hash of
+    // the first 16 KiB has to agree with what the sidecar declared.
+    let want: [u8; 16] = <md5::Md5 as md5::Digest>::digest(&BETA[..16384]).into();
+    assert_eq!(hashes[0].0, nzbkit::par2::hex16(&want));
+}

@@ -4,7 +4,7 @@
 # One command to move every version reference in lockstep:
 #   crates/nzbfast/Cargo.toml   (source of truth)
 #   crates/nzbtray/Cargo.toml   (installer stamps both exes)
-#   packaging/homebrew/nzbfast.rb
+#   (NOT the homebrew formula - see bump-tap.sh, it needs published shas)
 #   Cargo.lock                  (via cargo, if available)
 set -eu
 
@@ -22,8 +22,12 @@ bump_toml() {
 
 bump_toml "$ROOT/crates/nzbfast/Cargo.toml"
 bump_toml "$ROOT/crates/nzbtray/Cargo.toml"
-sed -i '' "s/^  version \"[^\"]*\"/  version \"$NEW\"/" "$ROOT/packaging/homebrew/nzbfast.rb" 2>/dev/null \
-    || sed -i "s/^  version \"[^\"]*\"/  version \"$NEW\"/" "$ROOT/packaging/homebrew/nzbfast.rb"
+
+# The Homebrew formula is NOT bumped here. It needs the sha256 of each
+# published archive, which does not exist until the release is uploaded, and a
+# formula carrying a new version with last release's hashes fails every user's
+# checksum. packaging/homebrew/bump-tap.sh does the whole job after the
+# release is published, and pushes it to the tap.
 
 if command -v cargo >/dev/null 2>&1; then
     (cd "$ROOT" && cargo update -q -p nzbfast -p nzbtray 2>/dev/null) || true
@@ -40,4 +44,4 @@ done
 
 echo "bumped to $NEW:"
 grep -Hn '^version' "$ROOT/crates/nzbfast/Cargo.toml" "$ROOT/crates/nzbtray/Cargo.toml"
-grep -Hn 'version "' "$ROOT/packaging/homebrew/nzbfast.rb" | head -1
+echo "reminder: run packaging/homebrew/bump-tap.sh --push AFTER the release is published"

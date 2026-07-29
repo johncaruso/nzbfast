@@ -1,60 +1,127 @@
-# Homebrew formula for nzbfast (tap: brew install nzbfast/tap/nzbfast).
-# SHA256s + version are filled in by the release workflow; the template
-# lives here so the tap can be regenerated deterministically.
+# Homebrew formula for nzbfast (brew install nzbfast/tap/nzbfast).
+#
+# THIS FILE IS THE SOURCE OF TRUTH. packaging/homebrew/bump-tap.sh rewrites
+# the download URLs and the sha256 lines at release time and pushes a copy to
+# the public tap repo (nzbfast/homebrew-tap). Edit here, never in the tap.
+# It rewrites only lines carrying a release-download URL and the sha256 line
+# under each, so do not put a version number anywhere else in this file: it
+# would not be updated and would rot.
+#
+# It points at the same archives a person downloads by hand from the release
+# page, on purpose. The per-target-triple tarballs on the same release come
+# from a manually dispatched CI workflow, so they are not guaranteed to exist
+# for every tag, and their Linux builds link glibc 2.39, which will not start
+# on Debian 12 or Ubuntu 22.04. The release archives below are static musl on
+# Linux and a universal binary on macOS, so they run everywhere.
 class Nzbfast < Formula
-  desc "Fastest Usenet (NZB) downloader - pipelined, one-pass verify + extract"
+  desc "Fast Usenet (NZB) downloader with one-pass verify, repair and extract"
   homepage "https://github.com/nzbfast/nzbfast"
-  version "1.0.10"
   license "GPL-3.0-or-later"
 
+  livecheck do
+    url :stable
+    strategy :github_latest
+  end
+
+  # There is deliberately no `version` stanza. Homebrew derives the version
+  # from the URL, and every URL here is written so that it derives the right
+  # one. Declaring it as well is what `brew audit` calls redundant, and that
+  # fails the audit on macOS.
+  #
+  # The `#/...` suffixes on the Linux URLs are load-bearing, not decoration.
+  # Homebrew parses a `...-linux-x64.tar.gz` filename as version **64**, off
+  # the `-x64`, and would install to Cellar/nzbfast/64. The fragment renames
+  # the download locally (curl never sends it) and is what the version parser
+  # reads, so it puts the version last where nothing can be mistaken for it.
+  # macOS needs no fragment: `-macos-universal.zip` parses correctly already.
+  #
+  # macOS ships one universal binary rather than a per-architecture build, so
+  # both arches point at the same archive. It has to be spelled out per arch
+  # because `on_macos` itself may not contain a `url`.
   on_macos do
     on_arm do
-      url "https://github.com/nzbfast/nzbfast/releases/download/v#{version}/nzbfast-aarch64-apple-darwin.tar.gz"
-      sha256 "REPLACE_ARM64_MACOS_SHA"
+      url "https://github.com/nzbfast/nzbfast/releases/download/v1.0.10/nzbfast-1.0.10-macos-universal.zip"
+      sha256 "8734b4373c0844d3d6b3279868a9e26dacb20b4af82dbb2b7e7760c417ceb197"
     end
     on_intel do
-      url "https://github.com/nzbfast/nzbfast/releases/download/v#{version}/nzbfast-x86_64-apple-darwin.tar.gz"
-      sha256 "REPLACE_X86_MACOS_SHA"
+      url "https://github.com/nzbfast/nzbfast/releases/download/v1.0.10/nzbfast-1.0.10-macos-universal.zip"
+      sha256 "8734b4373c0844d3d6b3279868a9e26dacb20b4af82dbb2b7e7760c417ceb197"
     end
   end
 
   on_linux do
-    on_arm do
-      url "https://github.com/nzbfast/nzbfast/releases/download/v#{version}/nzbfast-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "REPLACE_ARM64_LINUX_SHA"
-    end
     on_intel do
-      url "https://github.com/nzbfast/nzbfast/releases/download/v#{version}/nzbfast-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "REPLACE_X86_LINUX_SHA"
+      url "https://github.com/nzbfast/nzbfast/releases/download/v1.0.10/nzbfast-1.0.10-linux-x64.tar.gz#/nzbfast-linux-x64-1.0.10.tar.gz"
+      sha256 "25b69dfff10585fa678cde876013361626e9a6ce5791776d68e6f99595cc23dd"
+    end
+    on_arm do
+      url "https://github.com/nzbfast/nzbfast/releases/download/v1.0.10/nzbfast-1.0.10-linux-arm64.tar.gz#/nzbfast-linux-arm64-1.0.10.tar.gz"
+      sha256 "e36fc60a2ba41a7602a18a708c0eb162e2d6857382d51bfba92abb200f6d4e0d"
     end
   end
 
-  # PAR2 repair and RAR extraction are fully native - no tool
-  # dependencies. (A user-installed par2/unrar on PATH is still honored
-  # as a fallback, but nothing requires one.)
+  # No runtime dependencies on purpose: PAR2 repair and RAR extraction are
+  # native to the binary. A par2 or unrar already on PATH is still honoured
+  # as a fallback, but nothing here requires one.
 
   def install
     bin.install "nzbfast"
+    doc.install "MANUAL.html"
   end
 
+  # Nothing creates directories here because nothing needs to: the daemon
+  # creates its config directory and its download directory on demand, and
+  # `brew services` creates working_dir and the log parent before it starts
+  # anything. A watch folder that does not exist yet is polled without error
+  # and picked up as soon as it appears.
+  #
+  # etc/nzbfast and var/nzbfast mirror the /etc/nzbfast + /var/lib/nzbfast
+  # split of packaging/systemd/nzbfast.service. The daemon keeps its API key,
+  # settings and job spool beside the config file, and its index database in
+  # the working directory.
   service do
-    run [opt_bin/"nzbfast", "serve", "--config", etc/"nzbfast/config.json",
-         "--out", var/"nzbfast/downloads", "--watch", var/"nzbfast/watch"]
+    run [opt_bin/"nzbfast", "serve",
+         "--config", etc/"nzbfast/config.json",
+         "--out", var/"nzbfast/downloads",
+         "--watch", var/"nzbfast/watch"]
     keep_alive true
+    working_dir var/"nzbfast"
     log_path var/"log/nzbfast.log"
     error_log_path var/"log/nzbfast.log"
   end
 
   def caveats
     <<~EOS
-      Add your Usenet server(s) to:
-        #{etc}/nzbfast/config.json
-      (copy the template from the repo's packaging/config.example.json)
-      Then: brew services start nzbfast - UI at http://localhost:6789
+      There is no config file to edit. Start the daemon, then add your
+      Usenet server through the web UI:
+
+        brew services start nzbfast
+        open http://localhost:6789
+
+      Settings, API key and job state live in #{etc}/nzbfast; downloads and
+      the watch folder in #{var}/nzbfast. Both survive upgrade and uninstall.
+
+      Prefer the terminal? "nzbfast setup" does the same thing.
+      Sonarr and Radarr connect to http://localhost:6789/api as a SABnzbd or
+      NZBGet download client; the API key is on the Settings page.
     EOS
   end
 
   test do
-    assert_match "nzbfast", shell_output("#{bin}/nzbfast --help")
+    assert_match version.to_s, shell_output("#{bin}/nzbfast --version")
+
+    # Parse a hand-written NZB end to end. Exercises the real XML parser and
+    # the segment accounting offline, with no network and no config.
+    (testpath/"demo.nzb").write <<~XML
+      <?xml version="1.0" encoding="iso-8859-1" ?>
+      <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+      <file poster="p@example.com" date="1700000000" subject="&quot;demo.rar&quot; yEnc (1/1)">
+      <groups><group>alt.binaries.test</group></groups>
+      <segments><segment bytes="100" number="1">abc@example</segment></segments>
+      </file>
+      </nzb>
+    XML
+
+    assert_match "demo.rar", shell_output("#{bin}/nzbfast inspect #{testpath}/demo.nzb")
   end
 end

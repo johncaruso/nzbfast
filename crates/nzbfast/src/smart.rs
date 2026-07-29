@@ -840,12 +840,19 @@ fn prune_empty_dirs(dir: &Path, depth: u32) -> usize {
 /// (see `finalize_names`). One bounded head read; anything unreadable
 /// returns None and the claim stands.
 pub fn measured_res(dir: &Path) -> Option<&'static str> {
-    let video = largest_video(dir).filter(|v| !is_sample_clip(v))?;
+    let video = main_video(dir)?;
     if !matches!(ext_of(&video).as_str(), "mkv" | "webm") {
         return None;
     }
     let i = nzbkit::mkv::probe(&video)?;
     Some(nzbkit::mkv::res_bucket(i.width?, i.height?))
+}
+
+/// The job's feature: the biggest video in the finished directory, with
+/// the sample clip ruled out. What every "ask the payload itself"
+/// question is asked of, so they all agree on which file they mean.
+pub fn main_video(dir: &Path) -> Option<PathBuf> {
+    largest_video(dir).filter(|v| !is_sample_clip(v))
 }
 
 fn largest_video(dir: &Path) -> Option<PathBuf> {
@@ -1809,27 +1816,66 @@ pub fn rename_obfuscated_video(out_dir: &Path, base: &str) -> bool {
     if !names_the_release(base) {
         return false; // too little in the release name to trust it
     }
+    rename_nameless_video(out_dir, base)
+}
+
+/// The lone still-nameless feature video in `dir`, or `None`.
+///
+/// "Nameless" is the exact condition [`rename_obfuscated_video`] fires
+/// on - one non-sample video whose stem is either obfuscated or one of
+/// the encoder defaults that say nothing - factored out because
+/// synthesised naming has to ask the same question BEFORE it spends any
+/// network: there is no point identifying a film whose file already
+/// carries a name a human chose.
+pub fn nameless_video(dir: &Path) -> Option<PathBuf> {
+    let videos: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file() && VIDEO_EXTS.contains(&ext_of(p).as_str()) && !is_sample_clip(p)
+        })
+        .collect();
+    // More than one and we cannot tell which is the feature; renaming
+    // either would be a guess, and CD1/CD2 sets collide.
+    let [video] = videos.as_slice() else { return None };
+    let name = video.file_name()?.to_string_lossy().into_owned();
+    let stem = name
+        .strip_suffix(&format!(".{}", ext_of(video)))
+        .unwrap_or(&name)
+        .to_string();
+    // The poster named it something: that name stands, whatever a
+    // catalogue might have offered.
+    (nzbkit::release::looks_obfuscated(&stem) || is_generic_stem(&stem))
+        .then(|| video.clone())
+}
+
+/// Put `base` on the lone still-nameless video in `out_dir`, carrying
+/// its subtitle sidecars.
+///
+/// Split from [`rename_obfuscated_video`] so that synthesised naming
+/// reaches the same apply path. The two differ only in where the name
+/// came from and therefore in what has to be proven about it first: a
+/// release name has to earn the job by carrying provenance facts (see
+/// [`names_the_release`]), while an identified film's name has already
+/// been earned by the acceptance gate - which is a far higher bar, and
+/// one a title like "Supergirl 2026" could never clear by grammar
+/// alone.
+pub fn rename_nameless_video(out_dir: &Path, base: &str) -> bool {
     let files: Vec<PathBuf> = match std::fs::read_dir(out_dir) {
         Ok(rd) => rd.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect(),
         Err(_) => return false,
     };
-    let videos: Vec<&PathBuf> = files
-        .iter()
-        .filter(|p| VIDEO_EXTS.contains(&ext_of(p).as_str()) && !is_sample_clip(p))
-        .collect();
-    if videos.len() != 1 {
+    let Some(video) = nameless_video(out_dir) else {
         return false;
-    }
-    let video = videos[0];
+    };
+    let video = &video;
     let ext = ext_of(video);
     let Some(old_name) = video.file_name().map(|n| n.to_string_lossy().into_owned()) else {
         return false;
     };
     let old_stem =
         old_name.strip_suffix(&format!(".{ext}")).unwrap_or(&old_name).to_string();
-    if !nzbkit::release::looks_obfuscated(&old_stem) && !is_generic_stem(&old_stem) {
-        return false; // the poster named it something; that name stands
-    }
     let clean = nzbkit::release::sanitize_name(base);
     if clean.is_empty() {
         return false; // nothing nameable survived sanitisation
@@ -3944,6 +3990,80 @@ mod tests {
         std::fs::write(out.join(long), b"v").unwrap();
         assert!(!rename_obfuscated_video(out, rel));
         assert!(out.join(long).exists());
+    }
+
+    /// The question synthesised naming asks BEFORE it spends a disk read
+    /// or a request: is there anything here still wearing a hash?
+    ///
+    /// It has to answer exactly what `rename_obfuscated_video` fires on,
+    /// because the two now share an apply path - a disagreement would
+    /// mean the identifier looked up a film it could never rename, or
+    /// skipped one it could.
+    #[test]
+    fn nameless_video_finds_only_what_is_actually_nameless() {
+        // Obfuscated stem: nameless.
+        let out = &scratch("nameless-hash");
+        std::fs::write(out.join("n1iY94U6fTpMVY9GPD.mkv"), b"v").unwrap();
+        assert_eq!(
+            nameless_video(out).unwrap().file_name().unwrap(),
+            "n1iY94U6fTpMVY9GPD.mkv"
+        );
+
+        // Encoder default: nameless too.
+        let out = &scratch("nameless-generic");
+        std::fs::write(out.join("movie.mp4"), b"v").unwrap();
+        assert!(nameless_video(out).is_some());
+
+        // A name a human chose stands, whatever a catalogue might offer.
+        let out = &scratch("nameless-named");
+        std::fs::write(out.join("Example.Movie.2024.1080p.WEB.x264-GRP.mkv"), b"v").unwrap();
+        assert_eq!(nameless_video(out), None);
+
+        // Two videos: we cannot tell which is the feature, so neither is
+        // renamed and no lookup is worth making.
+        let out = &scratch("nameless-two");
+        std::fs::write(out.join("aaaaaaaaaaaaaaaaaa.mkv"), b"v").unwrap();
+        std::fs::write(out.join("bbbbbbbbbbbbbbbbbb.mkv"), b"v").unwrap();
+        assert_eq!(nameless_video(out), None);
+
+        // A sample clip is not the feature and never counts as one.
+        let out = &scratch("nameless-sample");
+        std::fs::write(out.join("n1iY94U6fTpMVY9GPD.mkv"), b"v").unwrap();
+        std::fs::write(out.join("sample.mkv"), b"v").unwrap();
+        assert!(nameless_video(out).is_some());
+
+        // Nothing video-shaped at all.
+        let out = &scratch("nameless-none");
+        std::fs::write(out.join("readme.nfo"), b"n").unwrap();
+        assert_eq!(nameless_video(out), None);
+    }
+
+    /// An identified film's name reaches the payload through the bare
+    /// apply path, NOT through the release-name one - "Supergirl 2026"
+    /// carries no resolution, source or group, so `names_the_release`
+    /// refuses it and always would. The gate is what earned it.
+    #[test]
+    fn an_identified_title_renames_where_a_release_name_could_not() {
+        let title = "Supergirl 2026";
+        let out = &scratch("identified");
+        std::fs::write(out.join("n1iY94U6fTpMVY9GPD.mkv"), b"v").unwrap();
+        std::fs::write(out.join("n1iY94U6fTpMVY9GPD.en.srt"), b"s").unwrap();
+
+        // The release-name path declines it, as designed.
+        assert!(!rename_obfuscated_video(out, title));
+        assert!(out.join("n1iY94U6fTpMVY9GPD.mkv").exists(), "nothing moved");
+
+        // The identified path applies it, sidecar and all.
+        assert!(rename_nameless_video(out, title));
+        assert!(out.join("Supergirl 2026.mkv").exists());
+        assert!(out.join("Supergirl 2026.en.srt").exists(), "sidecar follows");
+
+        // ...and it still refuses a payload that was never nameless, so
+        // a wrong verdict cannot overwrite a name the poster gave.
+        let out = &scratch("identified-named");
+        std::fs::write(out.join("Example.Movie.2024.1080p.WEB-GRP.mkv"), b"v").unwrap();
+        assert!(!rename_nameless_video(out, title));
+        assert!(out.join("Example.Movie.2024.1080p.WEB-GRP.mkv").exists());
     }
 
     /// A stem that is not obfuscated but says nothing - the encoder's

@@ -77,6 +77,14 @@ Name: "desktopicon"; Description: "Create a &desktop icon"; Flags: unchecked
 ; silently steal an existing handler (SABnzbd et al).
 Name: "nzbassoc"; Description: "Open .nzb files with nzbfast"; Check: not NzbAssociated
 Name: "nzbassoc"; Description: "Open .nzb files with nzbfast (currently handled by another app)"; Flags: unchecked; Check: NzbAssociated
+; nzblnk: links (nzblnk.info) - a board hands out a header instead of an
+; NZB file and the client resolves it. Its own task, and unchecked when
+; something else already holds the scheme: the people who click these
+; links are exactly the people most likely to have NZB Monkey or
+; NZBDonkey installed, and taking their handler away silently is not
+; ours to do.
+Name: "lnkassoc"; Description: "Open nzblnk links with nzbfast"; Check: not LnkAssociated
+Name: "lnkassoc"; Description: "Open nzblnk links with nzbfast (currently handled by another app)"; Flags: unchecked; Check: LnkAssociated
 
 [Files]
 Source: "{#StageDir}\nzbfast.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -114,6 +122,14 @@ Root: HKCU; Subkey: "Software\Classes\.nzb"; ValueType: string; ValueData: "nzbf
 Root: HKCU; Subkey: "Software\Classes\nzbfast.nzb"; ValueType: string; ValueData: "NZB download"; Flags: uninsdeletekey; Tasks: nzbassoc
 Root: HKCU; Subkey: "Software\Classes\nzbfast.nzb\DefaultIcon"; ValueType: string; ValueData: """{app}\nzbtray.exe"",0"; Tasks: nzbassoc
 Root: HKCU; Subkey: "Software\Classes\nzbfast.nzb\shell\open\command"; ValueType: string; ValueData: """{app}\nzbtray.exe"" ""%1"""; Tasks: nzbassoc
+; The nzblnk: URL scheme. A protocol key is an ordinary ProgID plus the
+; empty-valued "URL Protocol" marker - that marker is the whole
+; difference, and Windows ignores the key without it. Same hive and same
+; uninstall flags as the .nzb association above, for the same reasons.
+Root: HKCU; Subkey: "Software\Classes\nzblnk"; ValueType: string; ValueData: "URL:nzblnk Protocol"; Flags: uninsdeletekey; Tasks: lnkassoc
+Root: HKCU; Subkey: "Software\Classes\nzblnk"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""; Tasks: lnkassoc
+Root: HKCU; Subkey: "Software\Classes\nzblnk\DefaultIcon"; ValueType: string; ValueData: """{app}\nzbtray.exe"",0"; Tasks: lnkassoc
+Root: HKCU; Subkey: "Software\Classes\nzblnk\shell\open\command"; ValueType: string; ValueData: """{app}\nzbtray.exe"" ""%1"""; Tasks: lnkassoc
 
 [Run]
 ; --open: the tray waits until the daemon answers, then opens the
@@ -128,6 +144,17 @@ var s: string;
 begin
   Result := (RegQueryStringValue(HKEY_CURRENT_USER, 'Software\Classes\.nzb', '', s) and (s <> '') and (s <> 'nzbfast.nzb'))
     or (RegQueryStringValue(HKEY_CLASSES_ROOT, '.nzb', '', s) and (s <> '') and (s <> 'nzbfast.nzb'));
+end;
+
+{ Does something OTHER than us already handle nzblnk: links? A protocol
+  has no extension key to read, so the question is whether the scheme's
+  own open command exists and points somewhere that is not our tray. }
+function LnkAssociated: Boolean;
+var s: string;
+begin
+  Result := ((RegQueryStringValue(HKEY_CURRENT_USER, 'Software\Classes\nzblnk\shell\open\command', '', s)
+              or RegQueryStringValue(HKEY_CLASSES_ROOT, 'nzblnk\shell\open\command', '', s))
+             and (s <> '') and (Pos('nzbtray.exe', LowerCase(s)) = 0));
 end;
 
 { The oldest nzbtray that understands --quit. Anything below this treats

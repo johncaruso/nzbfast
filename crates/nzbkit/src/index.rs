@@ -73,6 +73,12 @@ const REL_COLS: &str = "id, stem, poster, grp, total_bytes, files, has_par2, com
      first_posted, first_seen, kind, res, have_parts, need_parts,
      vcodec, acodec, hdr";
 
+/// How many candidate rows an NZBLNK header lookup will look at per
+/// rung before giving up. Bounds both the FTS verification pass and the
+/// unindexed filename scan; a header that matches this many things was
+/// never distinctive enough to identify one posting.
+const FIND_SCAN_CAP: u32 = 500;
+
 fn release_from_row(r: &rusqlite::Row) -> rusqlite::Result<Release> {
     Ok(Release {
         id: r.get(0)?,
@@ -801,7 +807,29 @@ impl Index {
              CREATE TABLE IF NOT EXISTS wall_dismissed(
                 field TEXT NOT NULL,
                 value TEXT NOT NULL,
-                PRIMARY KEY(field, value));",
+                PRIMARY KEY(field, value));
+             -- Repost fingerprints: the PAR2 hash16k of a member file
+             -- (an OUTER volume) of a download we managed to name,
+             -- against the name we gave it. A later obfuscated post
+             -- whose sidecar presents the same hash is the same bytes,
+             -- so it can be told what it is. The identity is read from
+             -- the .par2 sidecar and never from the archive, which is
+             -- why it survives RAR header encryption - the one naming
+             -- path in the pipeline that does.
+             --
+             -- Only names REPOSTS, so the yield grows with the age of
+             -- the table and is zero on a fresh install. It costs ~80
+             -- bytes per volume of every named download, which is why
+             -- there is no expiry: an old fingerprint is exactly the
+             -- one worth having.
+             CREATE TABLE IF NOT EXISTS par_hashes(
+                hash16k TEXT PRIMARY KEY NOT NULL,
+                -- The release name we knew this by.
+                name TEXT NOT NULL,
+                -- The wall's identity for it, when the name parsed to
+                -- one ('' when it did not).
+                title_key TEXT NOT NULL DEFAULT '',
+                at INTEGER NOT NULL);",
         )?;
         // Columns added after the titles table first shipped - ALTER has
         // no IF NOT EXISTS, so failed re-adds are expected and harmless.
@@ -1378,6 +1406,56 @@ impl Index {
         }
         // M29 availability oracle: (backbone, family, age-bucket) ledger.
         let _ = crate::oracle::ensure_schema(&db);
+        Ok(Index { db, gate: None, fts, people_fts, custom: Vec::new() })
+    }
+
+    /// A read-only connection for query handlers, so an interactive
+    /// wall/search/browse request never queues behind whoever is holding
+    /// a read-write connection through a long ingest or maintenance
+    /// pass. The database is WAL, so this connection's reads run
+    /// concurrently with the writer and each query begins a fresh read
+    /// transaction - it always sees the latest committed data without
+    /// being reopened.
+    ///
+    /// Skips every migration `open` runs (a read-only handle cannot run
+    /// them, and must not need to): callers open this only after a
+    /// read-write `open` has brought the schema up to date. Fails if the
+    /// database file does not exist yet - it must never be the call that
+    /// creates the file.
+    pub fn open_read_only(path: &Path) -> rusqlite::Result<Index> {
+        let db = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        // Readers in WAL only ever wait on the brief WAL-reset window of
+        // a checkpoint, but "brief" still deserves a timeout rather than
+        // an instant "database is locked".
+        db.busy_timeout(std::time::Duration::from_secs(10))?;
+        // The per-connection tuning half of open()'s pragmas; query_only
+        // makes any write that sneaks onto this connection fail loudly
+        // instead of contending for the write lock.
+        db.execute_batch(
+            "PRAGMA query_only=ON;
+             PRAGMA temp_store=MEMORY;
+             PRAGMA cache_size=-262144;
+             PRAGMA mmap_size=1073741824;",
+        )?;
+        // FTS availability is detected, not created: the tables exist iff
+        // the read-write open that ran the schema managed to create them.
+        let has = |name: &str| {
+            db.query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                [name],
+                |_| Ok(()),
+            )
+            .is_ok()
+        };
+        let fts = has("rel_fts");
+        let people_fts = fts && has("people_fts");
+        // No gate and no custom categories: both are ingest-time policy,
+        // and ingest cannot happen on a query_only connection.
         Ok(Index { db, gate: None, fts, people_fts, custom: Vec::new() })
     }
 
@@ -2024,6 +2102,144 @@ impl Index {
         rows.collect()
     }
 
+    /// Find the release an NZBLNK header names, best candidate first.
+    ///
+    /// An NZBLNK carries no article ids: `h` is a string distinctive
+    /// enough to identify one posting in a raw-header index, which is
+    /// exactly what we are. The header is usually the obfuscated release
+    /// name itself, so it turns up as a release stem; on posts whose
+    /// subject was scrambled per-file it turns up as a FILENAME instead.
+    /// Both surfaces are tried, cheapest first:
+    ///
+    /// 1. `stem` equality, which `idx_rel_stem` answers outright;
+    /// 2. the FTS index, verified afterwards by normalized containment
+    ///    (FTS matches by token prefix, so an unverified hit would let
+    ///    "abc" claim "abcdefgh");
+    /// 3. `files.filename`, anchored at the start.
+    ///
+    /// Rung 3 is a table scan - no index covers `filename` alone - so it
+    /// only ever runs when the two indexed rungs missed, and a header
+    /// too short to identify anything (< 4 characters) is refused before
+    /// it can pay for one.
+    ///
+    /// Callers get whole [`Release`] rows and decide for themselves;
+    /// [`Self::make_nzb`] then emits a complete NZB from the segment
+    /// ids the scan already stored.
+    pub fn find_by_header(&self, header: &str, limit: u32) -> rusqlite::Result<Vec<Release>> {
+        let header = header.trim();
+        if header.chars().count() < 4 {
+            return Ok(Vec::new());
+        }
+        // Same normalization `search` uses: stems are stored dotted and
+        // a header may be spelled with spaces (or the other way round).
+        let norm = |s: &str| {
+            s.to_ascii_lowercase()
+                .replace(['.', '_', '-'], " ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let want = norm(header);
+        let mut out: Vec<Release> = Vec::new();
+        let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut push = |rows: Vec<Release>, out: &mut Vec<Release>| {
+            for r in rows {
+                if seen.insert(r.id) {
+                    out.push(r);
+                }
+            }
+        };
+
+        // Every rung below stops the ladder the moment ANYTHING answers.
+        // The gates used to be `out.len() >= limit` with the caller passing
+        // limit=8, and a distinctive header resolves to exactly one row, so
+        // one was never eight and EVERY lookup ran every rung - on a hit as
+        // well as a miss. Measured on a 16.5M-release / 17.7M-file index:
+        // 1.7 s for a SUCCESSFUL resolution, 2.4 s warm and 4.3 s cold for
+        // one that matches nothing, all of it holding the single shared
+        // read connection that every other index reader queues behind.
+        // A hit is now sub-millisecond on that same index (the indexed
+        // equality alone); only a genuine miss pays for the scans.
+        //
+        // 1a. Exact stem, served from idx_rel_stem.
+        let mut stmt = self
+            .db
+            .prepare(&format!("SELECT {REL_COLS} FROM releases WHERE stem = ?1 LIMIT ?2"))?;
+        let rows: Vec<Release> = stmt
+            .query_map(rusqlite::params![header, limit], release_from_row)?
+            .collect::<Result<_, _>>()?;
+        push(rows, &mut out);
+        if !out.is_empty() {
+            out.truncate(limit as usize);
+            return Ok(out);
+        }
+
+        // 1b. Case-insensitively, so a board that SHOUTS the header still
+        //     finds the row. Its own statement rather than a UNION ALL arm:
+        //     idx_rel_stem is BINARY so this cannot use it, and inside a
+        //     UNION ALL under `LIMIT 8` SQLite must evaluate it to look for
+        //     the other seven even when the exact arm already matched - so
+        //     the full scan ran on every hit. Now it runs only when 1a
+        //     found nothing, which is the case the comment always claimed.
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT {REL_COLS} FROM releases WHERE stem = ?1 COLLATE NOCASE LIMIT ?2"
+        ))?;
+        let rows: Vec<Release> = stmt
+            .query_map(rusqlite::params![header, limit], release_from_row)?
+            .collect::<Result<_, _>>()?;
+        push(rows, &mut out);
+        if !out.is_empty() {
+            out.truncate(limit as usize);
+            return Ok(out);
+        }
+
+        // 2. FTS (or the LIKE fallback on a database without it), then
+        //    verify: only a stem that really contains the header counts.
+        let m = if self.fts { fts_match(header) } else { String::new() };
+        let cands: Vec<Release> = if !m.is_empty() {
+            let mut stmt = self.db.prepare(&format!(
+                "SELECT {REL_COLS} FROM releases
+                  WHERE id IN (SELECT rowid FROM rel_fts WHERE rel_fts MATCH ?1)
+                  ORDER BY first_seen DESC LIMIT ?2"
+            ))?;
+            stmt.query_map(rusqlite::params![m, FIND_SCAN_CAP], release_from_row)?
+                .collect::<Result<_, _>>()?
+        } else {
+            const NS: &str = "REPLACE(REPLACE(REPLACE(LOWER(stem),'.',' '),'_',' '),'-',' ')";
+            let mut stmt = self.db.prepare(&format!(
+                "SELECT {REL_COLS} FROM releases WHERE {NS} LIKE '%' || ?1 || '%'
+                  ORDER BY first_seen DESC LIMIT ?2"
+            ))?;
+            stmt.query_map(rusqlite::params![want, FIND_SCAN_CAP], release_from_row)?
+                .collect::<Result<_, _>>()?
+        };
+        push(cands.into_iter().filter(|r| norm(&r.stem).contains(&want)).collect(), &mut out);
+        // Same reasoning as rung 1: rung 3 is a full scan of `files`, which
+        // is the bigger table, so it must run only when nothing at all has
+        // answered - not merely when fewer than `limit` things have.
+        if !out.is_empty() {
+            out.truncate(limit as usize);
+            return Ok(out);
+        }
+
+        // 3. Filenames, anchored. The header's own LIKE metacharacters
+        //    are escaped - an obfuscated name is allowed to contain `_`,
+        //    and unescaped that is a single-character wildcard.
+        let esc = header.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT {REL_COLS} FROM releases WHERE id IN (
+                 SELECT release_id FROM files
+                  WHERE filename LIKE ?1 || '%' ESCAPE '\\' LIMIT ?2)
+              ORDER BY first_seen DESC"
+        ))?;
+        let rows: Vec<Release> = stmt
+            .query_map(rusqlite::params![esc, FIND_SCAN_CAP], release_from_row)?
+            .collect::<Result<_, _>>()?;
+        push(rows, &mut out);
+        out.truncate(limit as usize);
+        Ok(out)
+    }
+
     /// Resolve a newznab `imdbid` to the parse-key its releases carry,
     /// so an id-based Radarr search can be answered from the enriched
     /// `titles` table instead of a title substring.
@@ -2052,13 +2268,25 @@ impl Index {
     /// Resolve a newznab `tmdbid` to its parse-key - the
     /// [`Self::title_key_for_imdb`] counterpart for the id Radarr sends
     /// when it has no IMDb id for a title.
+    ///
+    /// MOVIE rows only, and that is the whole point. `titles.tmdb_id`
+    /// carries a TMDB movie id on a movie row and a TVmaze SHOW id on a
+    /// TV row - two unrelated numbering schemes sharing one column, both
+    /// small dense integers, so collisions are not a corner case but the
+    /// expected state of a populated index. Unfiltered, a Radarr
+    /// `t=movie&tmdbid=N` could resolve a TV series that merely happens
+    /// to be TVmaze #N and answer with its episodes; with both rows
+    /// present, `LIMIT 1` picked between them arbitrarily.
+    ///
+    /// An id we hold no MOVIE for answers None, which the caller turns
+    /// into an empty feed - never a fall-through to the other namespace.
     pub fn title_key_for_tmdb(&self, tmdb: i64) -> rusqlite::Result<Option<String>> {
         if tmdb <= 0 {
             return Ok(None);
         }
         self.db
             .query_row(
-                "SELECT key FROM titles WHERE tmdb_id=?1 LIMIT 1",
+                "SELECT key FROM titles WHERE tmdb_id=?1 AND kind='movie' LIMIT 1",
                 rusqlite::params![tmdb],
                 |r| r.get(0),
             )
@@ -2689,6 +2917,60 @@ impl Index {
             }
         }
         Ok(())
+    }
+
+    /// Remember what a set of PAR2 member fingerprints was called, so a
+    /// later repost of the same bytes under an obfuscated name can be
+    /// told. `pairs` is `(hash16k hex, member name)` from
+    /// [`Par2Set::member_hash16k`](crate::par2::Par2Set::member_hash16k);
+    /// the member names are not stored (they are volume names, not
+    /// identities) - `name` is the release the whole set belongs to.
+    ///
+    /// First writer wins. A fingerprint already on file was recorded
+    /// when we named that release, and the later download of the same
+    /// bytes has no better claim - overwriting would let one badly
+    /// named repost erase the good name for every future one.
+    pub fn par_hash_remember(
+        &self,
+        pairs: &[(String, String)],
+        name: &str,
+        title_key: &str,
+        now: i64,
+    ) -> rusqlite::Result<usize> {
+        if name.trim().is_empty() {
+            return Ok(0);
+        }
+        let mut stmt = self.db.prepare_cached(
+            "INSERT INTO par_hashes(hash16k, name, title_key, at) VALUES(?1, ?2, ?3, ?4)
+             ON CONFLICT(hash16k) DO NOTHING",
+        )?;
+        let mut n = 0;
+        for (hash, _member) in pairs {
+            n += stmt.execute(rusqlite::params![hash, name, title_key, now])?;
+        }
+        Ok(n)
+    }
+
+    /// What we last called a release carrying any of these member
+    /// fingerprints. Returns `(name, title_key)` for the first hash that
+    /// is on file, in the order given - a set's volumes all belong to
+    /// one release, so one hit answers for the set.
+    pub fn par_hash_lookup(
+        &self,
+        pairs: &[(String, String)],
+    ) -> rusqlite::Result<Option<(String, String)>> {
+        let mut stmt = self
+            .db
+            .prepare_cached("SELECT name, title_key FROM par_hashes WHERE hash16k = ?1")?;
+        for (hash, _member) in pairs {
+            let hit = stmt
+                .query_row([hash], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .optional()?;
+            if hit.is_some() {
+                return Ok(hit);
+            }
+        }
+        Ok(None)
     }
 
     /// "Not interested": hide one title (all its releases) from every
@@ -4280,6 +4562,52 @@ impl Index {
         rows.collect()
     }
 
+    /// A Browse page of spots: newest first, with paging and a total.
+    ///
+    /// `include_adult` is off by default because a third of free.pt is
+    /// erotica (4,884 of 15,258 spots measured on a live scan) and it
+    /// would otherwise be most of what a first search returns. The
+    /// marker is the `d75` subcategory, which separates cleanly - it is
+    /// what the poster themselves filed the spot under.
+    pub fn spot_browse(&self, q: &SpotQuery) -> rusqlite::Result<(Vec<Spot>, u64)> {
+        let mut where_sql = String::from(" WHERE 1=1");
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if !q.q.trim().is_empty() {
+            where_sql.push_str(" AND title LIKE '%' || ? || '%'");
+            args.push(Box::new(q.q.trim().to_string()));
+        }
+        if let Some(c) = q.category {
+            where_sql.push_str(" AND category = ?");
+            args.push(Box::new(c));
+        }
+        if !q.include_adult {
+            where_sql.push_str(&format!(" AND ',' || subcats || ',' NOT LIKE '%,{ADULT_SUBCAT},%'"));
+        }
+        // Moderation records are no longer stored (nzbkit::spot::is_moderation),
+        // but a database scanned before that are still full of them, and they
+        // read like releases. Cheaper to exclude here than to migrate.
+        where_sql.push_str(" AND title NOT LIKE 'DISPOSE %'");
+        let params: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
+
+        let total: i64 = self.db.query_row(
+            &format!("SELECT COUNT(*) FROM spots{where_sql}"),
+            params.as_slice(),
+            |r| r.get(0),
+        )?;
+
+        let mut page = params.clone();
+        let (limit, offset) = (q.limit.clamp(1, 500) as i64, q.offset as i64);
+        page.push(&limit);
+        page.push(&offset);
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT id, msgid, title, category, subcats, size, date,
+                    spotter_id, verified, hashcash_ok, nzb_msgids
+             FROM spots{where_sql} ORDER BY date DESC, id DESC LIMIT ? OFFSET ?"
+        ))?;
+        let rows = stmt.query_map(page.as_slice(), spot_from_row)?;
+        Ok((rows.collect::<rusqlite::Result<Vec<_>>>()?, total as u64))
+    }
+
     pub fn spot_by_msgid(&self, msgid: &str) -> rusqlite::Result<Option<Spot>> {
         let mut stmt = self.db.prepare(
             "SELECT id, msgid, title, category, subcats, size, date,
@@ -4451,6 +4779,39 @@ pub struct TitleRow {
     pub air_date: String,
 }
 
+/// The Spotnet subcategory a poster files erotica under. Hidden from
+/// Browse unless asked for; see [`Index::spot_browse`].
+pub const ADULT_SUBCAT: &str = "d75";
+
+/// A Browse query over the spots table.
+#[derive(Debug, Clone, Default)]
+pub struct SpotQuery {
+    pub q: String,
+    /// 0-based Spotnet category: 0 video, 1 music, 2 game, 3 application.
+    pub category: Option<u8>,
+    pub include_adult: bool,
+    pub limit: u32,
+    pub offset: u32,
+}
+
+/// Does this spot carry the adult subcategory?
+pub fn spot_is_adult(subcats: &str) -> bool {
+    subcats.split(',').any(|s| s.trim() == ADULT_SUBCAT)
+}
+
+/// The four Spotnet categories as our own content kinds. Spotnet does not
+/// separate film from television - both are category 0 - so video maps to
+/// the generic kind and the title parser does the rest downstream.
+pub fn spot_kind(category: u8) -> &'static str {
+    match category {
+        0 => "video",
+        1 => "music",
+        2 => "game",
+        3 => "app",
+        _ => "other",
+    }
+}
+
 /// One ingested Spotnet spot (M14j).
 #[derive(Debug, Clone)]
 pub struct Spot {
@@ -4458,7 +4819,7 @@ pub struct Spot {
     /// With angle brackets, as seen in OVER.
     pub msgid: String,
     pub title: String,
-    /// Category digit as posted (1-based).
+    /// Spotnet category, 0-based: 0 video, 1 music, 2 game, 3 application.
     pub category: u8,
     /// Comma-joined subcategory runs, e.g. `a09,b04`.
     pub subcats: String,
@@ -4789,6 +5150,141 @@ mod tests {
         // Size fragments and version dots are not filenames.
         assert_eq!(quoted_name("Big Release 4.2GB yEnc"), None);
         assert_eq!(quoted_name("Release v1.0 done"), None);
+    }
+
+    /// The repost table: remember once, recognise later, and never let a
+    /// second download rewrite what the first one taught us.
+    #[test]
+    fn par_hashes_remember_first_and_recognise_reposts() {
+        let dir =
+            std::env::temp_dir().join(format!("nzbfast-index-ph-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ix = Index::open(&dir.join("index.db")).unwrap();
+        let pairs = |hs: &[&str]| -> Vec<(String, String)> {
+            hs.iter().map(|h| ((*h).to_string(), format!("{h}.r00"))).collect()
+        };
+
+        // Nothing known yet.
+        assert_eq!(ix.par_hash_lookup(&pairs(&["aa", "bb"])).unwrap(), None);
+
+        let named = pairs(&["aa", "bb", "cc"]);
+        assert_eq!(
+            ix.par_hash_remember(&named, "Example.Movie.2019.1080p-GRP", "m:example movie:2019", 100)
+                .unwrap(),
+            3
+        );
+        // A repost whose sidecar shares ONE volume fingerprint is the
+        // same bytes, and one hit answers for the whole set.
+        assert_eq!(
+            ix.par_hash_lookup(&pairs(&["zz", "cc"])).unwrap(),
+            Some(("Example.Movie.2019.1080p-GRP".into(), "m:example movie:2019".into()))
+        );
+
+        // The obfuscated repost must NOT overwrite the good name: the
+        // first writer knew what it was, and every future repost depends
+        // on that answer staying put.
+        assert_eq!(
+            ix.par_hash_remember(&named, "8a7f2c1b9d0e4f", "", 200).unwrap(),
+            0,
+            "a later download rewrote a fingerprint it did not name"
+        );
+        assert_eq!(
+            ix.par_hash_lookup(&pairs(&["aa"])).unwrap().unwrap().0,
+            "Example.Movie.2019.1080p-GRP"
+        );
+
+        // A nameless job records nothing at all rather than a blank row
+        // that would then shadow the real name forever.
+        assert_eq!(ix.par_hash_remember(&pairs(&["dd"]), "  ", "", 300).unwrap(), 0);
+        assert_eq!(ix.par_hash_lookup(&pairs(&["dd"])).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `titles.tmdb_id` holds a TMDB movie id on a movie row and a
+    /// TVmaze SHOW id on a TV row. Both namespaces are small dense
+    /// integers, so a collision is the expected state of a populated
+    /// index rather than a corner case - and unfiltered, a Radarr
+    /// `t=movie&tmdbid=N` resolved whichever row `LIMIT 1` happened to
+    /// reach and could answer a movie search with a TV series.
+    #[test]
+    fn a_tmdb_lookup_never_crosses_into_the_tv_namespace() {
+        let dir =
+            std::env::temp_dir().join(format!("nzbfast-index-tmdb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ix = Index::open(&dir.join("index.db")).unwrap();
+        let put = |key: &str, kind: &str, id: i64| {
+            ix.db
+                .execute(
+                    "INSERT INTO titles(key, kind, title, year, tmdb_id)
+                     VALUES(?1, ?2, ?3, 0, ?4)",
+                    rusqlite::params![key, kind, "x", id],
+                )
+                .unwrap();
+        };
+        // The collision: TMDB movie 1399 and TVmaze show 1399 are
+        // completely unrelated titles sharing one column.
+        put("t:a series", "tv", 1399);
+        put("m:a film", "movie", 1399);
+        assert_eq!(
+            ix.title_key_for_tmdb(1399).unwrap().as_deref(),
+            Some("m:a film"),
+            "the movie row is the only one a tmdbid may resolve to"
+        );
+
+        // An id we hold only a TV row for is NOT a movie we have. The
+        // caller turns None into an empty feed; falling through to the
+        // TV row would answer a movie search with episodes.
+        put("t:another series", "tv", 82856);
+        assert_eq!(ix.title_key_for_tmdb(82856).unwrap(), None);
+
+        // A movie-only id still resolves, which is the ordinary case.
+        put("m:another film", "movie", 603);
+        assert_eq!(
+            ix.title_key_for_tmdb(603).unwrap().as_deref(),
+            Some("m:another film")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The read-only connection behind the daemon's interactive query
+    /// endpoints: it reads what the writer commits WITHOUT being
+    /// reopened (WAL - each query is a fresh read transaction), and any
+    /// write that sneaks onto it fails instead of contending for the
+    /// write lock.
+    #[test]
+    fn read_only_connection_sees_fresh_commits_and_refuses_writes() {
+        let dir =
+            std::env::temp_dir().join(format!("nzbfast-index-ro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("index.db");
+        let mut rw = Index::open(&db).unwrap();
+        rw.ingest(
+            "alt.binaries.test",
+            &[entry(r#""First.Release.S01E01.720p-GRP.rar" yEnc (1/1)"#, "p@x", "ro1", 900)],
+            1000,
+        )
+        .unwrap();
+
+        let ro = Index::open_read_only(&db).unwrap();
+        assert_eq!(ro.search("first", 10).unwrap().len(), 1);
+
+        // A commit AFTER the read-only open, visible without a reopen.
+        rw.ingest(
+            "alt.binaries.test",
+            &[entry(r#""Second.Release.S01E02.720p-GRP.rar" yEnc (1/1)"#, "p@x", "ro2", 900)],
+            1000,
+        )
+        .unwrap();
+        assert_eq!(ro.search("second", 10).unwrap().len(), 1);
+
+        // query_only: the connection refuses writes rather than taking
+        // the write lock.
+        assert!(ro.kv_set("k", "v").is_err());
+        // And it must never be the open that CREATES a database.
+        assert!(Index::open_read_only(&dir.join("absent.db")).is_err());
     }
 
     #[test]
@@ -6048,6 +6544,81 @@ mod tests {
         assert!(ix.db_bytes().unwrap() > 0, "the connection still works after the abort");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The NZBLNK ladder's first rung: a header the board handed out,
+    /// resolved against our own scan data and turned back into an NZB.
+    #[test]
+    fn find_by_header_resolves_a_link_from_our_own_scan() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-hdr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ix = Index::open(&dir.join("index.db")).unwrap();
+
+        // The common shape: the whole posting is named after the header,
+        // so the header IS the release stem.
+        ix.ingest(
+            "alt.binaries.boneless",
+            &[
+                entry("\"7f3ac91e88.part01.rar\" yEnc (1/2)", "p@x", "s1", 1000),
+                entry("\"7f3ac91e88.part01.rar\" yEnc (2/2)", "p@x", "s2", 1000),
+                entry("\"7f3ac91e88.part02.rar\" yEnc (1/1)", "p@x", "s3", 800),
+                entry("\"7f3ac91e88.par2\" yEnc (1/1)", "p@x", "s4", 200),
+            ],
+            1000,
+        )
+        .unwrap();
+        // A decoy that shares the header's leading characters: an
+        // unverified FTS prefix hit would hand the user this instead.
+        ix.ingest(
+            "alt.binaries.boneless",
+            &[entry("\"7f3ac91e88ff00.mkv\" yEnc (1/1)", "q@x", "d1", 4000)],
+            1000,
+        )
+        .unwrap();
+
+        let hits = ix.find_by_header("7f3ac91e88", 10).unwrap();
+        assert_eq!(hits[0].stem, "7f3ac91e88", "exact stem must win: {hits:?}");
+        assert!(hits[0].complete && hits[0].has_par2);
+
+        // And it emits a whole NZB from the segments the scan stored.
+        let nzb = ix.make_nzb(hits[0].id).unwrap();
+        let parsed = crate::nzb::Nzb::parse(nzb.as_bytes()).unwrap();
+        assert_eq!(parsed.files.len(), 3);
+        assert_eq!(parsed.files.iter().map(|f| f.segments.len()).sum::<usize>(), 4);
+
+        // Case and separator spelling do not matter.
+        assert_eq!(ix.find_by_header("7F3AC91E88", 10).unwrap()[0].stem, "7f3ac91e88");
+
+        // The other shape: per-file obfuscation, where the header names
+        // a FILE inside a release whose stem is something else.
+        ix.db
+            .execute(
+                "INSERT INTO releases(stem, poster, grp, files, complete, first_posted,
+                                      first_seen)
+                 VALUES('Die.Hard.Umlaut.German','p2@x','alt.binaries.misc',1,1,50,50)",
+                [],
+            )
+            .unwrap();
+        let rid = ix.db.last_insert_rowid();
+        ix.db
+            .execute(
+                "INSERT INTO files(release_id, filename, total_parts, bytes, segments, nsegs)
+                 VALUES(?1, 'ab_cd%ef-9911.part1.rar', 1, 500, '[[1,\"f1\",500]]', 1)",
+                [rid],
+            )
+            .unwrap();
+        // LIKE metacharacters in the header are escaped, not honoured.
+        let hits = ix.find_by_header("ab_cd%ef-9911", 10).unwrap();
+        assert_eq!(hits.len(), 1, "filename rung missed: {hits:?}");
+        assert_eq!(hits[0].stem, "Die.Hard.Umlaut.German");
+        assert!(ix.find_by_header("ab-cd-ef-9911", 10).unwrap().is_empty(),
+            "the wildcards were live");
+
+        // Nothing to resolve, and nothing distinctive enough to try.
+        assert!(ix.find_by_header("nosuchheaderatall", 10).unwrap().is_empty());
+        assert!(ix.find_by_header("7f3", 10).unwrap().is_empty(), "too short to identify");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -149,6 +149,11 @@ select{background:var(--surface);color:var(--fg);border:1px solid var(--line);
   gap:18px 14px;padding:20px 22px 60px;max-width:1660px;margin:0 auto}
 .card{cursor:pointer;border-radius:10px;outline:none;content-visibility:auto;
   contain-intrinsic-size:var(--tile) calc(var(--tile) * 1.78)}
+/* First-paint skeleton tiles: poster-shaped, quietly pulsing. */
+.skel{aspect-ratio:2/3;border-radius:var(--radius-sm);background:var(--surface-2);
+  animation:skelpulse 1.4s ease-in-out infinite}
+@keyframes skelpulse{0%,100%{opacity:.55}50%{opacity:1}}
+@media (prefers-reduced-motion:reduce){.skel{animation:none;opacity:.7}}
 /* Zoom slider, next to the view buttons it fine-tunes. */
 .zoom{display:flex;align-items:center;gap:6px;color:var(--dim);font-size:12px}
 .zoom input{width:88px;accent-color:var(--acc);cursor:pointer;margin:0}
@@ -263,7 +268,9 @@ select{background:var(--surface);color:var(--fg);border:1px solid var(--line);
 .catchip{background:var(--surface-2);border:1px solid var(--line);color:var(--dim);
   font-size:10.5px;font-weight:600;padding:2px 8px;border-radius:999px;white-space:nowrap}
 .catchip.movie{color:var(--acc);border-color:rgba(77,163,255,.4)}
-.catchip.tv{color:var(--ok);border-color:rgba(53,200,138,.4)}
+/* Not --ok: green means "complete/success" one column to the right of
+   this chip, and a category is not a status. */
+.catchip.tv{color:var(--acc2);border-color:rgba(141,113,255,.4)}
 .catchip .qsep{opacity:.55;font-weight:400}
 .hlth{font-variant-numeric:tabular-nums;white-space:nowrap}
 .lpage{display:flex;align-items:center;justify-content:center;gap:14px;padding:16px 0 0}
@@ -296,6 +303,9 @@ select{background:var(--surface);color:var(--fg);border:1px solid var(--line);
 .sheet{max-width:880px;margin:5vh auto 6vh;background:var(--surface);border:1px solid var(--line);
   border-radius:var(--radius);overflow:hidden;box-shadow:0 30px 80px rgba(0,0,0,.7)}
 .hero{position:relative;min-height:160px;background:var(--surface-2)}
+/* No backdrop: don't reserve a full hero band of empty surface - just
+   enough for the close button and the poster overlap. */
+.hero.nobd{min-height:84px}
 .hero img{width:100%;height:240px;object-fit:cover;display:block;
   -webkit-mask-image:linear-gradient(#000 55%,transparent);mask-image:linear-gradient(#000 55%,transparent)}
 .hero .x{position:absolute;top:12px;inset-inline-end:14px;background:rgba(0,0,0,.55);border:none;color:#fff;
@@ -398,6 +408,10 @@ td.mono{font-variant-numeric:tabular-nums}
 button.act{background:var(--acc);color:#fff;border:none;border-radius:7px;padding:6px 12px;
   cursor:pointer;font-size:12px;font-weight:600;margin-inline-start:6px}
 button.act.ghost{background:transparent;border:1px solid var(--line);color:var(--fg)}
+/* Table rows: an accent OUTLINE that fills on hover. Twenty-five filled
+   primaries per page made every row shout; one visual weight per view. */
+button.act.quiet{background:transparent;border:1px solid var(--acc);color:var(--acc)}
+button.act.quiet:hover{background:var(--acc);color:#fff}
 button.act:hover{filter:brightness(1.1)}
 button.act:disabled{opacity:.35;cursor:default;pointer-events:none}
 /* Press acknowledgment (matches the dashboard). */
@@ -517,6 +531,9 @@ body.noidx #suggest,body.noidx #chips,body.noidx #affnote,
 body.noidx #scope,body.noidx #sort,body.noidx #lsort,
 body.noidx #densctl,body.noidx #zoomwrap,body.noidx #unmChip,body.noidx #hidChip,
 body.noidx #viewPop{display:none!important}
+/* ...unless spots are on: then the scope control has a second real
+   answer to offer and hiding it would take the spot list away with it. */
+body.noidx.hasspots #scope{display:inline-block!important}
 /* Nothing to search at all: built-in indexer off AND no indexer account.
    A class rather than inline styles because setView() runs after the
    boot block and sets #list's display itself - this has to outrank it,
@@ -560,7 +577,11 @@ body.nosearch #sortwrap,body.nosearch #more{display:none!important}
     <option value="mine" data-i18n="wall.scope.mine">This index</option>
     <option value="idx" data-i18n="wall.scope.idx">Indexers</option>
     <option value="both" data-i18n="wall.scope.both">Both</option>
+    <option value="spots" id="scopeSpots" style="display:none" data-i18n="wall.scope.spots">Spots</option>
   </select>
+  <label class="mtog spotonly" style="display:none" data-i18n-title="wall.spot.adult.title"
+    title="Spots are filed by the person who posted them. Roughly a third of them are filed as adult.">
+    <input type="checkbox" id="spotAdult"> <span data-i18n="wall.spot.adult">Include adult</span></label>
   <select id="sort">
     <option value="affinity" data-i18n="wall.sort.affinity">For you</option>
     <option value="latest" data-i18n="wall.sort.newest">Newest posts</option>
@@ -738,7 +759,12 @@ const DAEMON_LOCALE='__NZBFAST_LOCALE__';
 // "on", the state that hides nothing.
 const IDX_ON='__NZBFAST_INDEX__'!=='0';
 const IDX_COUNT=+'__NZBFAST_INDEXERS__'||0;
+// Spotnet: a third thing this page can search, switched on separately
+// from the built-in indexer. An unreplaced token means off - spots are
+// new, so there is no install anywhere that should assume otherwise.
+const SPOT_ON='__NZBFAST_SPOTS__'==='1';
 if(!IDX_ON) document.body.classList.add('noidx');
+if(SPOT_ON) document.body.classList.add('hasspots');
 const LOCALES=['en','fr','de','it','es','nl','pt','sv','da','nb','fi','tr','ro','ru','pl','cs','uk','el','ja','he','ar','fa','hu','sk','hr','sr','bg','sl'];
 // §5 2b: RTL locales - loader stamps dir="rtl" for Hebrew/Arabic/Persian.
 const RTL_LOCALES=['he','ar','fa'];
@@ -889,6 +915,18 @@ const esc = s => {
   d.textContent=s==null?'':s;
   return d.innerHTML.replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 };
+// Cosmetic repair for titles the parser's old all-caps fold stored with
+// mangled numerals and acronyms ("Planet Earth Ii", "The Office Us").
+// The parser is fixed for NEW scans; this covers the rows already in the
+// index without a re-scan. Multi-word only, same reason as the parser:
+// the film "Us" stays "Us". Display-time and deliberately narrow.
+const fixCase = s => {
+  s = s==null?'':String(s);
+  if(!s.includes(' ')) return s;
+  return s
+    .replace(/\b(Ii|Iii|Iv|Vi|Vii|Viii|Ix|Xi|Xii|Xiii|Xiv|Xv)\b/g, m=>m.toUpperCase())
+    .replace(/\b(Us|Uk|Usa|Wwe|Nhl|Nba|Nfl|Ufc|Fbi|Cia|Swat|Nasa|Bbc|Cnn|Espn|Uefa)\b/g, m=>m.toUpperCase());
+};
 // Unit SYMBOLS are localisable, same contract as the dashboard: a locale that
 // writes data units differently (French octet → Go/To; Cyrillic → ГБ/ТБ)
 // overrides these keys in its catalogue; everyone else falls back to the SI
@@ -919,6 +957,41 @@ const age = ts => { if(!ts) return '-'; const s=Date.now()/1e3-ts;
 function hue(s){ let h=0; for(const c of s) h=(h*31+c.charCodeAt(0))>>>0; return h%360; }
 function phStyle(t){ const h=hue(t);
   return `background:linear-gradient(160deg,hsl(${h} 42% 26%),hsl(${(h+40)%360} 50% 14%) 70%,hsl(${(h+70)%360} 40% 9%))`; }
+
+// A poster URL that 404s (art cache pruned, source vanished) used to
+// leave a black rectangle with badges floating on it: the styled
+// placeholder only covered poster=="" at render time. error events do
+// not bubble, so this listens in the CAPTURE phase, once, for every
+// current and future <img> on the page.
+document.addEventListener('error', e=>{
+  const img=e.target;
+  if(!img || img.tagName!=='IMG') return;
+  const holder=img.closest('.poster,.pst');
+  if(holder){
+    const card=img.closest('.card');
+    const k=card&&card.dataset.key;
+    const c=k?cards.find(x=>x.key===k):null;
+    const title=fixCase((c&&c.title)
+      || (card&&card.querySelector('.cap .ttl')?.textContent)
+      || document.querySelector('#sheet h2')?.childNodes[0]?.textContent?.trim() || '');
+    holder.innerHTML=`<div class="ph" style="height:100%;${phStyle(title)}"><div class="t">${esc(title)}</div></div>`;
+    return;
+  }
+  // Anything else (the sheet's hero backdrop, a candidate thumb in
+  // fix-match): losing the image beats showing the broken-image glyph.
+  if(img.closest('#sheet,#fixres,#ovl')){
+    const hero=img.closest('.hero');
+    if(hero) hero.classList.add('nobd');   // and give back the empty band
+    img.remove();
+  }
+}, true);
+
+// "( / )" is a keyboard hint; on a touch screen it is noise. Strips the
+// suffix wherever a placeholder carries it (boot, locale apply, and the
+// external-scope swap all funnel through here).
+function phq(s){ return matchMedia('(pointer:coarse)').matches ? s.replace(/\s*\( \/ \)\s*$/,'') : s; }
+function stripKbdHint(){ const q=document.getElementById('q'); if(q) q.placeholder=phq(q.placeholder); }
+stripKbdHint();
 
 function bestQuality(c){
   const order=['2160p REMUX','2160p','1080p REMUX','1080p','720p'];
@@ -1039,7 +1112,7 @@ function cardHtml(c){
   const q=c.releases?bestQuality(c):(c.res||'');
   const img=c.poster
     ? `<img loading="lazy" decoding="async" src="${esc(c.poster)}" alt="">`
-    : `<div class="ph" style="${phStyle(c.title)}"><div class="t">${esc(c.title)}</div>${c.year?`<div class="y">${c.year}</div>`:''}</div>`;
+    : `<div class="ph" style="${phStyle(c.title)}"><div class="t">${esc(fixCase(c.title))}</div>${c.year?`<div class="y">${c.year}</div>`:''}</div>`;
   const sub=c.kind==='tv'
     ? (c.seasons&&c.seasons.length
         ? (c.seasons.length>1?t('wall.seasons','{n} seasons',{n:c.seasons.length}):t('wall.season','Season {n}',{n:c.seasons[0]??1}))
@@ -1065,7 +1138,7 @@ function cardHtml(c){
         title="${esc(t('wall.hide','Not interested: hide this title'))}"
         aria-label="${esc(t('wall.hide','Not interested: hide this title'))}">✕</button>
     </div>
-    <div class="cap"><div class="ttl">${esc(c.title)}</div><div class="sub">${esc(String(sub))}${c.rating?` · ★ ${c.rating.toFixed(1)}`:''}</div></div>
+    <div class="cap"><div class="ttl">${esc(fixCase(c.title))}</div><div class="sub">${esc(String(sub))}${c.rating?` · ★ ${c.rating.toFixed(1)}`:''}</div></div>
   </div>`;
 }
 
@@ -1274,6 +1347,9 @@ let view, density, zoomPx;
 let lpage=0, ltotal=0, lseq=0, lrows=null;
 // M35 pull search: external-indexer results ride below the local rows.
 let extRows=[], extNotes=[];
+// Spot results. Never mixed with the two above - the Spots scope
+// replaces the list rather than adding to it.
+let spotRows=[];
 // Set when results were just fetched by something OTHER than the search
 // box (the title drawer's "Search my indexers", which asks by IMDb id).
 // The next browseFetch keeps them instead of re-running the query as
@@ -1454,6 +1530,7 @@ function setView(v){
   document.getElementById('matchedOnly').parentElement.style.display=rel?'none':'';
   document.getElementById('catGroup').parentElement.style.display=rel?'none':'';
   document.querySelectorAll('.listonly').forEach(el=>el.style.display=rel?'':'none');
+  spotCtl();
   viewBadge();
   renderChips();
   renderAffNote();
@@ -1540,7 +1617,7 @@ function grpRow(c){
     <td class="selcol"><button class="exp" data-i18n-skip aria-expanded="${open}"
       title="${esc(t('wall.exp.title',"Show this title's releases"))}"
       aria-label="${esc(t('wall.exp.title',"Show this title's releases"))}">${open?'▾':'▸'}</button></td>
-    <td class="name"><span class="stem">${esc(c.title)}</span>${c.year?` <span class="dim">(${c.year})</span>`:''}</td>
+    <td class="name"><span class="stem">${esc(fixCase(c.title))}</span>${c.year?` <span class="dim">(${c.year})</span>`:''}</td>
     <td>${catChip({kind:c.kind, quality:c.res||''})}</td>
     <td class="mono dim">${age(c.latest)}</td>
     <td class="mono">${gb(c.size||0)}</td>
@@ -1639,6 +1716,12 @@ async function browseFetch(){
     const complete=document.getElementById('onlyComplete').checked?1:0;
     const dir=curDesc()?'desc':'asc';
     const scope=(document.getElementById('scope')||{value:'mine'}).value;
+    // Spots are their own scope, never merged into the local rows: a
+    // spot is somebody's signed claim that they posted a thing, and the
+    // index is what this machine saw on usenet. Mixing them would put
+    // two different kinds of evidence in one list with no way to tell
+    // them apart.
+    if(scope==='spots') return spotFetch(seq,q);
     // M35: 'idx'/'both' also asks the configured external indexers.
     // External search needs a query (an empty q would burn API-hit
     // budgets browsing) and is unpaged - it renders on the first page.
@@ -1661,6 +1744,7 @@ async function browseFetch(){
     if(wantLocal) updateCats(j.cats);
     ltotal=j.total||0;
     lrows=j.results||[];
+    spotRows=[];   // leaving the Spots scope clears its page
     if(extPinned){
       // Keep the pinned results exactly as they were; the pin is spent.
       extPinned=false;
@@ -1712,7 +1796,7 @@ function actCell(r){
     <a class="act ghost" style="text-decoration:none"
        href="/getnzb/${r.id}.nzb?apikey=${encodeURIComponent(key)}"
        title="${esc(t('wall.getnzb.title','Download the .nzb file'))}">⬇ .nzb</a>
-    <button class="act" ${r.complete||!document.getElementById('onlyComplete').checked?'':'disabled'}
+    <button class="act quiet" ${r.complete||!document.getElementById('onlyComplete').checked?'':'disabled'}
        onclick="grab(${r.id},false)">${t('wall.download','Download')}</button>
   </td>`;
 }
@@ -1740,16 +1824,84 @@ function extRow(x){
   return `<tr class="ext">
     <td class="selcol"></td>
     <td class="name" title="${esc(x.title)}"><span class="stem">${esc(x.title)}</span>
-      <div class="brow"><span class="nbadge" data-i18n-skip title="${esc(t('wall.ext.src','Found on your indexer account'))}">${esc(x.indexer)}</span></div></td>
+      <div class="brow"><span class="nbadge" data-i18n-skip title="${esc(t('wall.ext.src','Found on your indexer account'))}">${esc(x.indexer)}</span>${
+        // An IMDb id for a release the indexer listed without one -
+        // the true-P2P groups scene sources never carry. Only ever
+        // present on an exact release-name match.
+        x.imdb?`<a class="nbadge" data-i18n-skip href="https://www.imdb.com/title/${esc(x.imdb)}/" target="_blank" rel="noopener noreferrer">${esc(x.imdb)}</a>`:''
+      }</div></td>
     <td>${esc(x.kind||'')}</td>
     <td class="mono dim">${age(ts)}</td>
     <td class="mono">${gb(x.size||0)}</td>
     <td class="mono dim">–</td>
     <td class="mono dim" title="${esc(t('wall.ext.grabs','How often this indexer’s users grabbed it'))}">${x.grabs?x.grabs+'↓':''}</td>
     <td style="text-align:end;white-space:nowrap">
-      <button class="act" onclick="grabExt('${esc(x.token)}',this)">${t('wall.download','Download')}</button>
+      <button class="act quiet" onclick="grabExt('${esc(x.token)}',this)">${t('wall.download','Download')}</button>
     </td>
   </tr>`;
+}
+// The Spots scope: only offered once the spot scanner is on, and the
+// adult toggle only while it is the scope in view.
+function spotCtl(){
+  const opt=document.getElementById('scopeSpots');
+  if(opt&&!SPOT_ON) opt.remove();
+  const sc=document.getElementById('scope');
+  const on=SPOT_ON && sc && sc.value==='spots' &&
+    document.getElementById('list').style.display!=='none';
+  document.querySelectorAll('.spotonly').forEach(el=>el.style.display=on?'':'none');
+}
+// One page of spots. Paged in SQL like the local list (so the footer's
+// range and page buttons keep working), and the ONLY thing on the page
+// while this scope is selected.
+async function spotFetch(seq,q){
+  const adult=document.getElementById('spotAdult').checked?1:0;
+  const kindMap={movie:'0',tv:'0',music:'1',other:''};
+  const cat=kindMap[tab]!=null?kindMap[tab]:'';
+  const j=await api('spot_search',
+    `&q=${encodeURIComponent(q)}&adult=${adult}&cat=${encodeURIComponent(cat)}`+
+    `&limit=${LPAGE}&offset=${lpage*LPAGE}`).catch(e=>({status:false,error:String(e)}));
+  if(seq!==lseq) return;
+  if(!j.status){ toast(tErr(j.error)); return; }
+  ltotal=j.total||0;
+  lrows=[]; extRows=[]; extNotes=[];
+  spotRows=j.results||[];
+  renderList([]);
+}
+// One spot row. No checkbox and no .nzb link: the NZB does not exist as
+// a file anywhere yet - the daemon assembles it from the articles the
+// spot points at, when you press Download.
+function spotRow(x){
+  const ts=x.age_days==null?0:Math.floor(Date.now()/1e3)-x.age_days*86400;
+  return `<tr class="ext">
+    <td class="selcol"></td>
+    <td class="name" title="${esc(x.title)}"><span class="stem">${esc(x.title)}</span>
+      <div class="brow"><span class="nbadge" data-i18n-skip
+        title="${esc(t('wall.spot.src','Posted by {who}, who signed this spot',{who:x.spotter}))}"
+        >${esc(t('wall.spot.tag','spot'))}</span>${
+        x.adult?`<span class="nbadge" data-i18n-skip>${esc(t('wall.spot.adulttag','adult'))}</span>`:''}${
+        x.hashcash_ok?'':`<span class="nbadge" data-i18n-skip title="${esc(t('wall.spot.pow.title','Signed, but the proof-of-work stamp does not check out'))}">${esc(t('wall.spot.pow','odd stamp'))}</span>`}</div></td>
+    <td>${esc(x.kind||'')}</td>
+    <td class="mono dim">${age(ts)}</td>
+    <td class="mono">${gb(x.size||0)}</td>
+    <td class="mono dim">–</td>
+    <td class="mono dim">–</td>
+    <td style="text-align:end;white-space:nowrap">
+      <button class="act" onclick="grabSpot('${esc(x.msgid)}',this)">${t('wall.download','Download')}</button>
+    </td>
+  </tr>`;
+}
+// Grab a spot: the daemon fetches the NZB the spot points at and queues
+// it. The message-id is one it indexed itself, which is what makes it
+// safe to hand back.
+async function grabSpot(msgid,btn){
+  if(btn) btn.disabled=true;
+  const j=await api('spot_grab',`&msgid=${encodeURIComponent(msgid)}&priority=1`);
+  if(!j.status){
+    if(btn) btn.disabled=false;
+    toast(t('wall.failed','Failed: {err}',{err:tErr(j.error)||t('wall.unknown','unknown')}));
+    return;
+  }
+  toast(t('wall.queued','Queued for download'));
 }
 // Grab an external result: the daemon spends the indexer grab, fetches
 // the NZB server-side and queues it (origin "indexer").
@@ -1777,7 +1929,9 @@ function renderList(rows){
   hovHide();
   document.getElementById('lhFiles').firstChild.nodeValue=t('wall.col.files','Files');
   document.getElementById('count').textContent=
-    ltotal?tn('wall.lcount',ltotal,'{n} release','{n} releases'):'';
+    !ltotal?''
+    :spotRows.length?tn('wall.spot.count',ltotal,'{n} spot','{n} spots')
+    :tn('wall.lcount',ltotal,'{n} release','{n} releases');
   let html=rows.map(r=>relRow(r,false)).join('');
   // M35: external-indexer results and their notes ride below the local
   // rows; quota skips and per-indexer errors render, never vanish.
@@ -1786,6 +1940,7 @@ function renderList(rows){
     html+=`<tr><td colspan="8" class="dim">${msg}</td></tr>`;
   }
   html+=extRows.map(extRow).join('');
+  html+=spotRows.map(spotRow).join('');
   body.innerHTML=html||`<tr><td colspan="8" class="dim">${t('wall.nomatch','No matches.')}</td></tr>`;
   markSortHeads();
   updateSelBar();
@@ -1958,6 +2113,21 @@ async function openCard(k){
     c={key:k, kind:k.startsWith('t:')?'tv':custom?custom[1]:'movie', title:'', year:0,
             genres:'', overview:'', rating:0, actors:'', poster:'', poster_full:'',
             backdrop:'', releases:null, votes:0}; cards.push(c);
+    // The stub used to stay blank beyond a title scraped from the
+    // release list: a strip card outside the loaded page opened a sheet
+    // with no art, no synopsis, no rating - while the card-scoped wall2
+    // query had all of it. Hydrate in parallel with the release fetch;
+    // the sheet re-renders below either way.
+    api('wall2', `&key=${encodeURIComponent(k)}&limit=1`).then(j=>{
+      const m=j&&j.cards&&j.cards[0];
+      if(!m || seq!==openSeq) return;
+      for(const f of ['title','year','kind','genres','overview','rating',
+                      'actors','poster','poster_full','backdrop','aired'])
+        if(m[f]!=null && m[f]!=='') c[f]=m[f];
+      // Repaint only if this sheet is still the open one; openCard is
+      // idempotent over a hydrated card (releases are kept).
+      if(openKey===k) openCard(k);
+    }).catch(()=>{});
   }
   if(!c.releases){
     const j=await api('index_browse',
@@ -1989,13 +2159,13 @@ async function openCard(k){
   const seasons=c.kind==='tv'&&c.seasons.length
     ?`<span> · ${c.seasons.length>1?t('wall.seasons','{n} seasons',{n:c.seasons.length}):t('wall.season','Season {n}',{n:c.seasons[0]})}</span>`:'';
   document.getElementById('sheet').innerHTML=`
-    <div class="hero">${c.backdrop?`<img src="${esc(c.backdrop)}" alt="">`:`<div style="height:120px"></div>`}
+    <div class="hero${c.backdrop?'':' nobd'}">${c.backdrop?`<img src="${esc(c.backdrop)}" alt="">`:''}
       <button class="x" onclick="closeOvl()" title="${esc(t('btn.close.title','Close this panel'))}"
         aria-label="${esc(t('btn.close.title','Close this panel'))}">✕</button></div>
     <div class="body">
-      <div class="pst">${c.poster?`<img src="${esc(c.poster)}" alt="">`:`<div class="ph" style="height:100%;${phStyle(c.title)}"><div class="t">${esc(c.title)}</div></div>`}</div>
+      <div class="pst">${c.poster?`<img src="${esc(c.poster)}" alt="">`:`<div class="ph" style="height:100%;${phStyle(c.title)}"><div class="t">${esc(fixCase(c.title))}</div></div>`}</div>
       <div class="info">
-        <h2>${esc(c.title)} ${c.year?`<small>(${c.year})</small>`:''}
+        <h2>${esc(fixCase(c.title))} ${c.year?`<small>(${c.year})</small>`:''}
           ${canWatch(c.kind)?`<button class="act ghost" style="margin-inline-start:8px;vertical-align:3px" onclick="watchThis()"
             title="${esc(watchTip(c.kind))}">☆ ${t('wall.watch','Watch')}</button>`:''}</h2>
         <div class="meta">${c.rating?`<span class="star">★</span> ${num(c.rating,1)}${c.votes?` <span style="opacity:.7">${t('wall.votes','({n} on IMDb)',{n:fmtVotes(c.votes)})}</span>`:''} · `:''}${esc(c.genres||'')}${seasons}</div>
@@ -2069,7 +2239,7 @@ async function openCard(k){
             <button class="act" ${r.complete?'':'disabled'} onclick="grab(${r.id},false)">${t('wall.download','Download')}</button>
           </td>
         </tr>`).join('')}
-      </tbody></table></div>`;
+      </tbody></table>${rels.length?'':`<div class="dim" style="padding:6px 2px 2px;font-size:12.5px">${t('wall.norel','No releases indexed for this title yet.')}</div>`}</div>`;
   document.getElementById('ovl').classList.add('open');
   document.body.style.overflow='hidden';
   loadCredits(k);
@@ -2377,6 +2547,11 @@ async function wallFetch(reset){
   const seq=++wseq;
   if(reset===undefined) reset=true;
   wloading=true;
+  // First paint: the grid used to sit silently empty until the first
+  // wall2 answer, which reads as "the wall has nothing" - and during
+  // heavy index catch-up that first answer can take a minute. Skeleton
+  // tiles say "loading"; past 8 s a line says why it is slow.
+  showSkeleton(seq);
   try{
     const q=document.getElementById('q').value.trim();
     const offset=reset?0:cards.length;
@@ -2443,9 +2618,32 @@ async function wallFetch(reset){
     document.getElementById('wall').innerHTML=
       `<div class="empty">${t('status.daemonDown','daemon unreachable')}</div>`;
   } finally {
-    if(seq===wseq) wloading=false;
+    if(seq===wseq){ wloading=false; clearSkeleton(); }
   }
   maybeMore();
+}
+// Skeleton first-paint. Only when the grid is genuinely empty (a page-2
+// append or a filter change over live cards keeps the real tiles); the
+// 8-second note is keyed to the SAME fetch via wseq so a stale timer
+// can never label fresh data as slow.
+let skelTimer=0;
+function showSkeleton(seq){
+  const wall=document.getElementById('wall');
+  if(cards.length || view==='releases' || wall.querySelector('.card,.skel')) return;
+  wall.innerHTML=Array.from({length:18},()=>`<div class="skel"></div>`).join('');
+  clearTimeout(skelTimer);
+  skelTimer=setTimeout(()=>{
+    if(seq!==wseq || !document.querySelector('#wall .skel')) return;
+    const n=document.createElement('div');
+    n.id='slowNote'; n.className='dim';
+    n.style.cssText='grid-column:1/-1;font-size:12.5px;padding:2px 2px 6px';
+    n.textContent=t('wall.slow','The index is busy - this can take a minute right after a restart.');
+    wall.prepend(n);
+  }, 8000);
+}
+function clearSkeleton(){
+  clearTimeout(skelTimer); skelTimer=0;
+  document.querySelectorAll('#wall .skel, #slowNote').forEach(e=>e.remove());
 }
 function appendCards(page){
   document.getElementById('wall')
@@ -2713,17 +2911,26 @@ document.getElementById('onlyComplete').addEventListener('change', ()=>{
 {
   const sc=document.getElementById('scope');
   const saved=localStorage.nzbfastWallScope;
-  if(saved==='idx'||saved==='both') sc.value=saved;
+  if(saved==='idx'||saved==='both'||(saved==='spots'&&SPOT_ON)) sc.value=saved;
   // With the built-in indexer off, "this index" and "both" are the same
   // as "indexers" with a wasted query, and a three-way choice with one
   // real answer is just a control to read and dismiss. Pin it and hide
   // it (see body.noidx in the stylesheet); the saved preference is left
   // untouched, so it comes back when the indexer does.
-  if(!IDX_ON) sc.value='idx';
+  //
+  // Spots change that sum: with the indexer off but spots on, there IS
+  // a second real answer, so the control stays.
+  if(!IDX_ON && !SPOT_ON) sc.value='idx';
+  else if(!IDX_ON && sc.value!=='spots') sc.value=IDX_COUNT?'idx':'spots';
   sc.addEventListener('change', ()=>{
     localStorage.nzbfastWallScope=sc.value;
+    spotCtl();
     lpage=0; browseFetch();
   });
+  document.getElementById('spotAdult').addEventListener('change', ()=>{
+    lpage=0; browseFetch();
+  });
+  spotCtl();
 }
 // The built-in indexer is off. Say what this page is now, and - when
 // there is no indexer account either - say that instead of showing a
@@ -2741,8 +2948,14 @@ function idxOffPage(){
     pill.title=t('hdr.search.title','Search your indexer accounts');
   }
   const q=document.getElementById('q');
-  if(q) q.placeholder=t('wall.q.ph.ext','Search your indexers…  ( / )');
-  if(!IDX_COUNT){
+  // phq() drops the keyboard hint on touch devices - it applies to
+  // whichever placeholder this state calls for.
+  if(q) q.placeholder=phq(SPOT_ON&&!IDX_COUNT
+    ? t('wall.q.ph.spots','Search spots…  ( / )')
+    : t('wall.q.ph.ext','Search your indexers…  ( / )'));
+  // Spots are something to search, so the "nothing here" note is not
+  // true while they are on.
+  if(!IDX_COUNT&&!SPOT_ON){
     document.body.classList.add('nosearch');   // see the stylesheet
     const n=document.getElementById('noidxnote');
     n.style.display='';
@@ -2829,7 +3042,7 @@ function hovPlace(){
 function hovShow(c){
   const el=document.getElementById('hovpop');
   el.innerHTML=`${c.poster?`<img src="${esc(c.poster)}" alt="">`:''}
-    <div class="ht"><b>${esc(c.title)}</b>${c.year?` <span class="dim">(${c.year})</span>`:''}${
+    <div class="ht"><b>${esc(fixCase(c.title))}</b>${c.year?` <span class="dim">(${c.year})</span>`:''}${
       c.rating?` · <span style="color:var(--gold)">★</span> ${num(c.rating,1)}`:''}</div>
     ${c.overview?`<div class="ho">${esc(c.overview)}</div>`:''}`;
   el.style.display='block'; hovShown=true;
@@ -3018,6 +3231,7 @@ if(LOCALE!=='en'){
   fetch('/i18n/'+LOCALE+'.json').then(r=>r.ok?r.json():{}).then(d=>{
     I18N=d||{};
     applyI18n();
+    stripKbdHint();   // the catalogue restored the "( / )" hint; touch drops it again
     // The chip bar is a one-shot render that painted before the catalogue
     // arrived, and applyI18n can't reach it (the chips carry no data-i18n
     // markup) - rebuild it. render() runs whatever the view: in list mode the

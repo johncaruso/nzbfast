@@ -1,0 +1,21 @@
+# Real XOVER lines from free.pt, captured 2026-07-28 (Eweka), verbatim.
+#
+# Verbatim is the point: a Spotnet header signature covers the exact wire
+# bytes of the subject, the From record and the poster nickname, so there is
+# no sanitized form of these that still verifies. They are public usenet
+# overview lines and the nicknames are public Spotnet handles.
+#
+# Format is the raw OVER response line:
+#   number \t subject \t from \t date \t message-id \t references \t bytes \t lines
+#
+# Lines 0-7 verify, line 8 does not (server-signed spot whose From carries a
+# random number instead of a public key - nothing to check it against).
+4403038	DISPOSE 1H6sDpxW6gsd4biaQrhcf@spot.net - Céline Dion - Dansons (Single)	Labello <47iCGV9D4UGF25ZP5Pv-syY14OxcSy1X0wkQ3QVwcxwRNJQfnCgsiGxgyEXTPxTX5.bx5epLnFfEeSSSc3-sMgIEWNXmbA0G-pDQhqmYOIUtkCGx20NpEga7i-p5MImbcTXGW@12a01.999.10.1776453436.1.NL.T9TbFciSoZ8WDjgwRBJGnjUc84qxj5ipYA-p5TihsYlIoP-s5BAi3dOEQkeWSI0csp>	Fri, 17 Apr 2026 19:17:16 GMT	<1H6sDpxW6gsd4biaQrhcf.0.QMJBD4WAEFYPIfiaQ.muwK@spot.net>		938	1	Xref: news.eweka.nl free.pt:4403038
+4414246	DISPOSE  - Master of the Universe 2026 1080p WEB DL DDP5 1 x264 GP M NLsubs mkv	fopje <svh1zzjunIwA6+6138tgfrOz+Qi4IN98Obr80AaiphZYwje/tkEwfpKc6CPFA1cZ.IIHDjpvXugpE7jjXQD9HMSupCm2tlJOTPiKEAYAG51uF0wd0juu20lcf2eYDLY21@12a01.999.10.1780999309.1.NL.lzZpkOyneH5Nog6w1vASodBeSKmdSgi83-piXARlDMlYHjm4q41IYl58k14l4L4LR>	Tue, 09 Jun 2026 10:01:50 GMT	<HO8DrYwUsNQjeQnagijBK@spot.net>		886	1	Xref: news.eweka.nl free.pt:4414246
+4412790	DISPOSE vhgFSYhXodc7C8eagALoP@spot.net - Vous avez un patient pendant la détection	Afzender <10@12a01.1.10.1780372979.6AZ.mod.bC8TpuyRx0sEqlojvf3nC8MoSaNIFOSc2OM63c61ECm7hJN0tOknsj8hu571chHR>	Tue, 02 Jun 2026 04:03:00 GMT	<6rQ1YbEAfNk6hYeagoDrc@spot.net>		699	1	Xref: news.eweka.nl free.pt:4412790
+4418880	DISPOSE i86S23Yj4qs6dQvagoJfx@spot.net - NCIS	Afzender <10@12a01.1.10.1781520193.1W1.mod.nhW7Z81gbkrCjvqscB03NZ1x7YMGnz6CaZ0i7YK6RGzhzTrDpGeqQAnCpzUG0AYX>	Mon, 15 Jun 2026 10:43:14 GMT	<o0522DD8fY8QdcvagLX6F@spot.net>		588	1	Xref: news.eweka.nl free.pt:4418880
+4409160	Süskind (2012)	sander <utn6K6quThfnPAEqk1FPcBTWfcw8IFIo42wRtjkE4ntaXnqR-srKh6dwrS7ASCCPJ.gaUM40LI6BKvY-paWh3JxqN6p5cYIqOR-sszgkQ-pf6s4twcPpRRR7BVLZFmR2NdZsZ@17a06c01z00.16156744666.20.1778955072.1.NL.OMgGNTWufmTZAaIU3-pIathC08KDqweSlNOkgvSnegkt6fY-scDmdc-sYbS-pHYUGANf>	Sat, 16 May 2026 18:11:11 GMT	<opkzKBSGFLwRLMIagMPRF@spot.net>		1732	7	Xref: news.eweka.nl free.pt:4409160
+4403588	Oscar Peterson Trio At Bakerâ€™s Keyboard Lounge Complete 2026	SapperDeFlap <r9N2B2fgvpvpUoY2TXI5OPGydGm0ef0GmtgnsYEpC4vD20YtEuo1GHRTrHaLQ0C9.l4t2KMubxPIw0wY-sLJ-pQxUBIpwbHjRLzP57UBQUmtD0env1dgQSxDjhfpGZDLEis@27a08c08d07z00.1034867039.20.1776667716.1.NL.p1vw3xaEcSZG9giqczA7zXfBI-sAGUjrwu03kdp-s8d2eXhcUpsUpw8SoCdL1ufjZO>	Mon, 20 Apr 2026 06:48:35 GMT	<lvAOazFy4kIQczlaQ3HmZ@spot.net>		4400	42	Xref: news.eweka.nl free.pt:4403588
+4426070	Garmin tools	Garmin1 <zsaT2ViLkzylnfakNoFJS7VAm9Uj1M-p3o8YDi9ug5lWUpIcj6FIQNyrsFLIBlU3F.WUAudKRedi6khuAgtHTb9fj8bPSL2SWeLojbyG0DNXWt81QFpaIf21p0K0o-sDZi6@47a05b24.57546784.20.1784796663.1.NL.Nbtwzbj6mBwMLfiiWxv-p5qzenaDJ1IL6tvhglibprVmV0S5U0c6pSr-shvgQ6dd5v>	Thu, 23 Jul 2026 08:51:03 GMT	<k0nfuy5jh5E7dVhageFDJ@spot.net>		1639	2	Xref: news.eweka.nl free.pt:4426070
+4422904	Testspot 4 | ClubNZB	ClubNZB <vPkkRxayxK56jhiwxR4ySPlXKAjdpOQcGbqLQP30apDkavQTlKuxRtMsIYBW6HIDA1JMnbTKEoGV5QvruzJTI-sF3wZhddXjHuLdxmOnCPqBR8W7In1vO6WTIAtmemXhC8rzi-sEZgddNEMhMkCIQnn8yPnuu-s5QviCJLiylfW2Zk=.gFFYC8Nh5vTHEcWAeH6SWDuU17mMQBKdw3HNGxIxUbDf3CI7cFTJ0QuDIVfhvZgtjFnpk6nkfgzKAbSV8PutHXLkDnk9UPw4ZvW5uaHYzBmDmmC9uU7M0AtxLhvH6Gak8nvS9dmOt7OBmPys304t-s9X8cKYL8rmJKGCMdZI7N94=@17a00d75z03.1000.10.1783133520.Rlyf.RIi.cnpjwFeswUA4Z7vTxD-szleDHe6MtHMmaHo2Ve-sVuFk8jqPtfs-sDr-pr3vA0r8CI9ZeF0pnpwj5v5XyvqWiA62plyZjn2w9E-skNqd8sUcU1qAQMt4QzjcSL9APFbxpwVNsoTWONcCfQVOLO3TNI86JdBH-sNWiyMO3wTccR-pUMvp2g=>	Sat, 04 Jul 2026 02:52:00 GMT	<6a48754ccd3ff3.66609427@clubnzb.nl>		2756	1	Xref: news.eweka.nl free.pt:4422904
+4402344	HPI Seizoen.02 - 1080p.DSNP.WEB-DL.DD+5.1.H.264 (Retail NLsub) | NLsub	Savales <595735375@17a09b03c06c07c13d11.20447427354.595735375.1776147287.TFk.fJ8.dVJ2p9S09c9fkJcDqWd-pviuwXcjy6NYv1tFBqZ-sl6yxdeNvotxukOlzcR8nJz1yH>	Tue, 14 Apr 2026 06:14:46 GMT	<JRdrPcx0LBkStvdaQAI53@spot.net>		5954	44	Xref: news.eweka.nl free.pt:4402344

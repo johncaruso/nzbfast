@@ -77,6 +77,19 @@ pub enum Provider {
     /// the Wikidata bucket: a person page must not queue behind the
     /// enricher's crawl.
     WikidataSparql,
+    /// The QLever Wikidata mirror at qlever.cs.uni-freiburg.de, which
+    /// serves the same graph as WikidataSparql from an entirely
+    /// different operator - a university research group, not the
+    /// Wikimedia Foundation. Post-download identification queries it
+    /// because WDQS has been answering 502 for this class of query.
+    ///
+    /// Its own bucket for the reason the Wikipedia doc comment gives:
+    /// separate operator, separate allowance. Rate is courtesy, not a
+    /// probed figure. It is deliberately slow because nothing waits on
+    /// it - a completed job's rename is not a click - and because a
+    /// free academic endpoint answering a query that scans every film
+    /// in Wikidata deserves a wide berth.
+    WikidataQlever,
     /// TVmaze. Publishes 20 requests / 10 seconds and means it; probed
     /// 27 Jul at 2 req/s for 24 consecutive calls with no refusal.
     Tvmaze,
@@ -93,6 +106,18 @@ pub enum Provider {
     /// it is a rare fallback, so a live calibration run would have spent
     /// more of their capacity than the enricher does.
     AniList,
+    /// srrdb's keyless search API. They publish no rate, and their terms
+    /// ask callers to use it rather than scrape it - so this is a
+    /// courtesy figure and the CALL SITE is where the politeness really
+    /// lives: at most one lookup per finished download, cached, and
+    /// silent on any error.
+    Srrdb,
+    /// xREL's v2 API. Two published limits, and the tighter one governs:
+    /// 900 calls/hour overall, but SEARCH methods are capped at 2 calls
+    /// per 5 seconds. See the quota test - one call per 5 s is what fits
+    /// inside that window with a burst of 1, and 720/hour is comfortably
+    /// under the hourly ceiling as well.
+    Xrel,
 }
 
 impl Provider {
@@ -127,6 +152,11 @@ impl Provider {
             Provider::Wikidata => (8.0 / 60.0, 1.0),
             Provider::Wikipedia => (2.0, 2.0),
             Provider::WikidataSparql => (1.0, 2.0),
+            // One query every 4 seconds, no burst. A single completed
+            // job makes exactly one of these, so this only ever paces a
+            // queue draining several obfuscated jobs in a row - which is
+            // precisely when a courtesy limit matters.
+            Provider::WikidataQlever => (0.25, 1.0),
             // 20 requests / 10 s published. A leaky bucket emits
             // `burst + rate*T` in a window of length T, so 2 req/s with
             // a burst of 2 is 22 in their window - over the line every
@@ -137,6 +167,11 @@ impl Provider {
             // 90/minute published; 1.5 with a burst of 2 is 92. Same
             // arithmetic as TVmaze above, and see the quota test.
             Provider::AniList => (1.4, 2.0),
+            Provider::Srrdb => (1.0, 1.0),
+            // 2 calls / 5 s on search methods. Same leaky-bucket
+            // arithmetic as TVmaze: with the minimum burst of 1, the
+            // rate has to be 0.2 to keep `burst + 5*rate` at 2.
+            Provider::Xrel => (0.2, 1.0),
         }
     }
 }
@@ -301,10 +336,15 @@ mod tests {
         // (provider, window seconds, requests allowed in that window).
         // Wikidata's is measured (see the module header); TVmaze's and
         // AniList's are the figures they publish.
-        const QUOTAS: [(Provider, f64, f64); 3] = [
+        const QUOTAS: [(Provider, f64, f64); 5] = [
             (Provider::Wikidata, 60.0, 10.0),
             (Provider::Tvmaze, 10.0, 20.0),
             (Provider::AniList, 60.0, 90.0),
+            // xREL publishes two, and BOTH have to hold: the search
+            // window is the binding one, the hourly ceiling is the one a
+            // future rate rise would breach first.
+            (Provider::Xrel, 5.0, 2.0),
+            (Provider::Xrel, 3600.0, 900.0),
         ];
         for (p, window, quota) in QUOTAS {
             let (rate, burst) = p.limit();

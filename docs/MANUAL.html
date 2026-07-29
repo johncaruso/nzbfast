@@ -371,6 +371,7 @@ and block accounts. Block accounts show lifetime usage against their size.</p>
 picked up within 5 seconds and the file removed. Point your browser's download
 directory at it for one-click grabs from indexer sites.</td></tr>
 <tr><td><b>From a URL</b></td><td>Paste an NZB link (API <code>mode=addurl</code>, or via any connected app).</td></tr>
+<tr><td><b>nzblnk: links</b></td><td>Paste an <code>nzblnk:</code> link anywhere on the dashboard, or drag it in. If you installed from the macOS DMG or the Windows installer you can also click one straight from a board. See <a href="#nzblnk">nzblnk links</a> below.</td></tr>
 <tr><td><b>Browse index</b></td><td>Click any complete release in the Browse card.</td></tr>
 <tr><td><b>Watchlist / RSS</b></td><td>Automatic; see <a href="#automation">Automation</a>.</td></tr>
 <tr><td><b>Sonarr/Radarr etc.</b></td><td>They send grabs straight to the queue; see <a href="#arr">§11</a>.</td></tr>
@@ -382,9 +383,36 @@ directory at it for one-click grabs from indexer sites.</td></tr>
 directory, and Smart Folders (see <a href="#automation">§10</a>) can assign them by rule.</li>
 <li><b>Priorities</b>: Force &gt; High &gt; Normal &gt; Low. Force bypasses pause and quota.</li>
 <li><b>Passwords</b> for encrypted archives are picked up automatically from
-<code>&lt;meta type="password"&gt;</code> inside the NZB or a
-<code>Name{{password}}.nzb</code> filename, and can be supplied per-job through the
+<code>&lt;meta type="password"&gt;</code> inside the NZB, a
+<code>Name{{password}}.nzb</code> filename, or the <code>p=</code> field of an
+<a href="#nzblnk">nzblnk link</a>, and can be supplied per-job through the
 API or afterwards from History (🔑).</li>
+</ul>
+
+<h3 id="nzblnk">nzblnk links</h3>
+<p>Some boards, mostly German and Dutch ones, publish an <code>nzblnk:</code> link
+instead of an NZB file. The posting is obfuscated, so there is no filename anyone
+could link to. The link carries a header, <code>h=</code>, which is a search key
+rather than a location, plus an optional title <code>t=</code>, password
+<code>p=</code> and newsgroup <code>g=</code>. Something has to go and find the
+posting first.</p>
+<p>nzbfast looks the header up in its own index to begin with, which needs no network
+at all, and only if that misses does it ask the search indexers you have configured
+(Settings → Search indexers, <a href="#settings">§9</a>) under the same daily budgets
+and backoff as any other search. The title becomes the job name and the password is
+applied to the job automatically.</p>
+<ul>
+<li><b>Paste or drag</b> works on every install, Docker and NAS boxes included: copy
+the link off the board and paste it anywhere on the dashboard.</li>
+<li><b>Clicking</b> a link needs the scheme registered with your desktop. The
+<b>macOS DMG</b> app registers it, and the <b>Windows installer</b> offers it as a
+task: it asks first, and leaves the scheme alone if NZB Monkey or NZBDonkey already
+holds it. The plain macOS tarball, Homebrew and Linux installs have no desktop
+handler, so paste is the way in there.</li>
+<li>Resolving is rate-limited on purpose. Registering a scheme puts it one browser
+prompt away from any page you visit, so links are capped per minute and only the
+first few in a minute may reach your indexers; past that they are answered from the
+local index alone.</li>
 </ul>
 
 <h2 id="wall">6 · The poster wall</h2>
@@ -891,10 +919,10 @@ a server for you). Every command takes <code>--config</code> and
 <p>Base endpoint: <code>http://host:6789/api?mode=…&amp;apikey=…&amp;output=json</code>. It is
 SABnzbd-compatible, so existing SAB integrations work unchanged. Two keys:
 the <b>API key</b> (full control) and the <b>NZB key</b> (add-only:
-<code>addfile</code>/<code>addurl</code>).</p>
+<code>addfile</code>/<code>addurl</code>). <code>addnzblnk</code> is deliberately not in the add-only set: resolving one can spend metered indexer quota, which an add-only credential has no business doing.</p>
 <table>
 <tr><th>Area</th><th>Modes</th></tr>
-<tr><td>Queue</td><td><code>queue</code> (with <code>name=delete/pause/resume/priority/switch</code>), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>retry</code>, <code>set_password</code></td></tr>
+<tr><td>Queue</td><td><code>queue</code> (with <code>name=delete/pause/resume/priority/switch</code>), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>addnzblnk</code>, <code>retry</code>, <code>set_password</code></td></tr>
 <tr><td>Info</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code></td></tr>
 <tr><td>Config</td><td><code>get_config</code>, <code>config&amp;name=&lt;setting&gt;&amp;value=…</code> (every Settings field), <code>server_save/delete/test/enable/reorder</code>, <code>import_probe/apply</code></td></tr>
 <tr><td>Index &amp; wall</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, plus newznab at <code>/api?t=caps|search|tvsearch|movie</code> and <code>/getnzb/&lt;id&gt;</code></td></tr>

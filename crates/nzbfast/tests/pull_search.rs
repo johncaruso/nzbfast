@@ -312,10 +312,16 @@ async fn a_title_page_search_uses_the_imdb_id() {
 
 /// M35 phase 2: the watchlist's external leg. A watched show with
 /// NOTHING in the local index finds its episode on the peer indexer and
-/// grabs it - but only once the user has turned the leg on, because an
-/// unattended search spends a metered third-party account.
+/// grabs it.
+///
+/// M35b changed WHEN: the leg is on by default once an indexer account
+/// exists, because a watchlist that can only see the local index cannot
+/// see an obfuscated post at all. The guard rails are the per-item
+/// cadence and the per-indexer daily budgets, not an off switch - and an
+/// explicit off still wins, forever, including across a later change to
+/// the indexer list. All three of those are asserted here.
 #[tokio::test(flavor = "multi_thread")]
-async fn watchlist_asks_indexers_only_when_switched_on() {
+async fn watchlist_external_defaults_on_but_an_explicit_off_wins() {
     let dir = std::env::temp_dir().join(format!("nzbfast-pullwl-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -366,8 +372,27 @@ async fn watchlist_asks_indexers_only_when_switched_on() {
         );
         assert!(r.contains("true"), "{r}");
 
-        // Watch the show. The local index has nothing, so without the
-        // external leg there is nothing to grab.
+        // Nobody has answered the question, and an indexer now exists, so
+        // the effective setting is ON - and get_config must report the
+        // EFFECTIVE value or the dashboard checkbox would disagree with
+        // what the watcher actually does.
+        let (_, cfg) = http_get(port_b, "/api?mode=get_config&output=json");
+        assert!(
+            cfg.contains("\"watchlist_external\":true"),
+            "an indexer is configured and nobody said otherwise, so the leg should be on:\n{cfg}"
+        );
+
+        // Now answer it explicitly OFF, BEFORE there is anything to grab.
+        // (The config write answers with a status envelope, so the value
+        // itself is read back through get_config.)
+        let (_, r) =
+            http_get(port_b, "/api?mode=config&name=watchlist_external&value=0&output=json");
+        assert!(r.contains("\"status\":true"), "{r}");
+        let (_, cfg) = http_get(port_b, "/api?mode=get_config&output=json");
+        assert!(cfg.contains("\"watchlist_external\":false"), "{cfg}");
+
+        // Watch the show. The local index has nothing, so the external
+        // leg is the only way this could ever be grabbed.
         let wl = r#"[{"id":1,"kind":"tv","title":"Wanted Show","seasons":"","episodes":"","min_quality":"any","target_quality":"1080p","enabled":true}]"#;
         let (_, r) = http_get(
             port_b,
@@ -375,14 +400,32 @@ async fn watchlist_asks_indexers_only_when_switched_on() {
         );
         assert!(r.contains("true"), "{r}");
 
-        // Default OFF: a check now must NOT queue anything, and must not
-        // spend a search either.
+        // Explicitly off: a check now must NOT queue anything, and must
+        // not spend a search either.
         http_get(port_b, "/api?mode=watchlist_check_now&output=json");
         std::thread::sleep(std::time::Duration::from_millis(1500));
         let (_, q) = http_get(port_b, "/api?mode=queue&output=json");
         assert!(
             !q.contains("Wanted.Show"),
-            "the watchlist reached an indexer while the toggle was off:\n{q}"
+            "the watchlist reached an indexer while the toggle was explicitly off:\n{q}"
+        );
+
+        // Editing the indexer list must not resurrect the leg. This is
+        // the regression that the tri-state exists for: deriving the
+        // default from "has indexers" without remembering the answer
+        // would turn it back on here.
+        let two = format!(
+            r#"[{{"name":"peer","url":"http://127.0.0.1:{port_a}/api","apikey":"x"}},{{"name":"peer2","url":"http://127.0.0.1:{port_a}/api","apikey":"y"}}]"#
+        );
+        let (_, r) = http_get(
+            port_b,
+            &format!("/api?mode=config&name=indexers&value={}&output=json", pct(&two)),
+        );
+        assert!(r.contains("true"), "{r}");
+        let (_, cfg) = http_get(port_b, "/api?mode=get_config&output=json");
+        assert!(
+            cfg.contains("\"watchlist_external\":false"),
+            "adding an indexer overrode an explicit off:\n{cfg}"
         );
 
         // Turn it on, and the same item now finds the episode on the peer.

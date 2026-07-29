@@ -723,9 +723,17 @@ pub fn season_state(
             known.insert(*e);
         }
     }
+    // Every episode counted here is filtered through the item's CURRENT
+    // range, persisted slots included. Editing a watch item replaces its
+    // requested range but keeps the slots it already filled, so an item
+    // narrowed from E01-E10 to E11-E20 still had ten held episodes on
+    // file: the season read as have=10 when the requested scope held
+    // none of them, and `pack_eligible` then turned a season pack away
+    // as redundant.
+    let wanted = |e: u32| in_range_spec(&item.episodes, e);
     for slot in candidates {
         if let Some((s, Some(e))) = slot_parts(slot) {
-            if s == season {
+            if s == season && wanted(e) {
                 known.insert(e);
             }
         }
@@ -733,7 +741,7 @@ pub fn season_state(
     for (key, slot) in slots {
         let Some(name) = key.strip_prefix(&prefix) else { continue };
         match slot_parts(name) {
-            Some((s, Some(e))) if s == season => {
+            Some((s, Some(e))) if s == season && wanted(e) => {
                 known.insert(e);
                 if !slot.nzo_id.is_empty() {
                     have.insert(e);
@@ -1491,6 +1499,40 @@ mod tests {
             ("s01e01", slot(4200, "x")),
         ]), &[], &[]);
         assert_eq!((other.known, other.have), (0, 0));
+    }
+
+    /// Narrowing an item's episode range leaves the slots it already
+    /// filled on disk. Those are no longer episodes it wants, so they
+    /// must stop counting - `known` and `have` describe the CURRENT
+    /// scope. Counting them made a freshly-narrowed item look fully
+    /// served, and `pack_eligible` refused the pack that would actually
+    /// have delivered the episodes now being asked for.
+    #[test]
+    fn a_narrowed_scope_drops_the_slots_it_no_longer_wants() {
+        let mut tv = item("tv", "Show Name");
+        tv.episodes = "1-10".into();
+        let slots = state_of(
+            1,
+            &[
+                ("s01e01", slot(4200, "Show.Name.S01E01.1080p.WEB-GRP")),
+                ("s01e02", slot(4200, "Show.Name.S01E02.1080p.WEB-GRP")),
+                ("s01e03", slot(4200, "Show.Name.S01E03.1080p.WEB-GRP")),
+            ],
+        );
+        let listed: Vec<u32> = (1..=20).collect();
+        let before = season_state(&tv, 1, &slots, &[], &listed);
+        assert_eq!((before.known, before.have), (10, 3));
+
+        // The user now wants only the back half. Nothing on disk
+        // changed - but nothing on disk is in scope either.
+        tv.episodes = "11-20".into();
+        let after = season_state(&tv, 1, &slots, &[], &listed);
+        assert_eq!(
+            (after.known, after.have),
+            (10, 0),
+            "ten episodes wanted, none of them held"
+        );
+        assert_eq!(after.best_rank, 0, "a rank from out of scope is not this scope's");
     }
 
     /// What a pack means for the episodes under it: they read as "have

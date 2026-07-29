@@ -5267,3 +5267,299 @@ async fn sab_facade_status_warnings_and_change_cat() {
     .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Post-download synthesised naming is ON out of the box, is visible in
+/// the config the dashboard reads, and survives a restart once turned
+/// off.
+///
+/// Default-on is only defensible because the ladder's acceptance gate
+/// renames on certainty rather than on a best guess. A user who would
+/// rather nothing at all reached the network after a download must be
+/// able to turn it off and have that stick - a toggle that silently came
+/// back on at the next restart would be worse than no toggle.
+#[tokio::test(flavor = "multi_thread")]
+async fn synthesised_naming_defaults_on_and_its_off_switch_persists() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-identify-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!("{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}", free_port()),
+    )
+    .unwrap();
+    let launch = {
+        let cfg = cfg.clone();
+        let dir = dir.clone();
+        move |port: u16| {
+            let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+            c.env("NZBFAST_NO_ENRICH", "1")
+                .arg("--config")
+                .arg(&cfg)
+                .arg("serve")
+                .arg("--bind")
+                .arg("127.0.0.1")
+                .arg("--port")
+                .arg(port.to_string())
+                .arg("--apikey")
+                .arg("sekrit")
+                .arg("--out")
+                .arg(dir.join("complete"));
+            c
+        }
+    };
+    let d = serve(&dir, &launch).await;
+    let port = d.port;
+    tokio::task::spawn_blocking(move || {
+        let cfg = http(port, "/api?mode=get_config&apikey=sekrit&output=json", None);
+        assert!(cfg.contains("\"rename_identify\":true"), "should default on: {cfg}");
+        let r = http(
+            port,
+            "/api?mode=config&name=rename_identify&value=0&apikey=sekrit&output=json",
+            None,
+        );
+        assert!(r.contains("\"status\":true"), "{r}");
+        let cfg = http(port, "/api?mode=get_config&apikey=sekrit&output=json", None);
+        assert!(cfg.contains("\"rename_identify\":false"), "{cfg}");
+    })
+    .await
+    .unwrap();
+
+    drop(d);
+    let d = serve(&dir, &launch).await;
+    let port = d.port;
+    tokio::task::spawn_blocking(move || {
+        let cfg = http(port, "/api?mode=get_config&apikey=sekrit&output=json", None);
+        assert!(
+            cfg.contains("\"rename_identify\":false"),
+            "the off switch did not survive the restart: {cfg}"
+        );
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The container Title rung of the identity ladder, end to end and
+/// entirely offline: a post whose subject line says nothing carries the
+/// real release name inside the Matroska header, and the finished job
+/// is both LABELLED with it and RENAMED off it.
+///
+/// The interesting half is that the posted name stays on the record.
+/// History reports `name` exactly as submitted - every SAB client and
+/// every *arr matches on it - with the discovered name in its own field
+/// beside it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_obfuscated_post_is_named_by_its_own_container() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-ident-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // What the poster called it: nothing at all.
+    let stem = "a4f9c2e1b7d048395166cf20";
+    // What the muxer called it, repacker credit and all.
+    const REAL: &str = "Example.Movie.2019.1080p.BluRay.x264-GRP";
+    let mut video = nzbkit::mkv::test_mux_titled(
+        Some(5400.0),
+        Some((1920, 1080)),
+        Some(&format!("{REAL}, RMZ.cr")),
+    );
+    // Void padding, the way a real mux carries it, to a plausible size.
+    while video.len() < 200_000 {
+        video.extend(nzbkit::mkv::el(&[0xEC], &vec![0u8; 8000]));
+    }
+
+    let mut articles = HashMap::new();
+    let vsegs = make_file_articles(&format!("{stem}.mkv"), &video, 40_000, "vid", &mut articles);
+    let srv = MockServer::start(articles, Chaos::default()).await;
+
+    let mut xml = String::from(
+        "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n",
+    );
+    xml.push_str(&format!(
+        "  <file poster=\"x\" date=\"0\" subject=\"&quot;{stem}.mkv&quot; yEnc (1/{})\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+        vsegs.len()
+    ));
+    for (id, bytes, num) in vsegs.iter() {
+        xml.push_str(&format!("      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"));
+    }
+    xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        // NO_ENRICH keeps the two networked rungs (srrdb, xREL) off the
+        // wire; the container rung is local and runs regardless, which
+        // is the whole point of gating them separately.
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"));
+        c
+    })
+    .await;
+    let port = d.port;
+
+    let dir2 = dir.clone();
+    tokio::task::spawn_blocking(move || {
+        let boundary = "----nzbfastboundary";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"{stem}.nzb\"\r\nContent-Type: application/x-nzb\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(xml.as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let ctype = format!("multipart/form-data; boundary={boundary}");
+        let r = http(port, "/api?mode=addfile&apikey=sekrit&cat=movies&output=json", Some((&ctype, &body)));
+        assert!(r.contains("nzo_ids"), "{r}");
+
+        let mut hist = String::new();
+        for _ in 0..150 {
+            hist = http(port, "/api?mode=history&apikey=sekrit&output=json", None);
+            if hist.contains("\"Completed\"") || hist.contains("\"Failed\"") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        assert!(hist.contains("\"Completed\""), "never completed: {hist}");
+
+        // The discovered name is recorded, attributed, and beside - not
+        // instead of - the name the job was submitted under.
+        assert!(
+            hist.contains(&format!("\"identity_name\":\"{REAL}\"")),
+            "container name not recorded: {hist}"
+        );
+        assert!(hist.contains("\"identity_src\":\"mkv-title\""), "{hist}");
+        assert!(hist.contains(&format!("\"name\":\"{stem}\"")), "posted name was overwritten: {hist}");
+
+        // …and the payload on disk is filed under it, which is what the
+        // user actually sees. Auto-rename is on by default, so the movie
+        // folder and its video both take the discovered title.
+        let root = dir2.join("complete/movies");
+        let found: Vec<String> = std::fs::read_dir(&root)
+            .expect("category dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            found.iter().any(|f| f.starts_with("Example Movie")),
+            "payload was not filed under the discovered name: {found:?}"
+        );
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Security regression: the add-only `nzbkey` must not reach arbitrary
+/// config through the first-key bootstrap hatch.
+///
+/// The hatch exists so an admin who set the NZB key first is not locked
+/// out of ever setting a full API key. It authorises `mode=config` for the
+/// add-only key when it sees `name=apikey` - but it read that name from the
+/// QUERY string while the handler prefers the POST BODY, so
+/// `?name=apikey` + `{"name":"script"}` authorised one setting and wrote a
+/// different one. `script` is executed on the job tail and `addfile` is
+/// itself add-only, so that was an add-only credential escalating to code
+/// execution. Reproduced against the published 1.0.10 image before the fix.
+#[tokio::test(flavor = "multi_thread")]
+async fn bootstrap_hatch_cannot_write_a_setting_other_than_the_apikey() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-bootstrap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!("{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}", free_port()),
+    )
+    .unwrap();
+    // NZBFAST_OPEN keeps first_run_apikey from minting one, which is what
+    // puts the daemon in the exact state the hatch serves: an add-only key
+    // set, no full apikey yet.
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--nzbkey")
+            .arg("addkey")
+            .arg("--out")
+            .arg(dir.join("complete"));
+        c
+    })
+    .await;
+    let port = d.port;
+
+    let cfg2 = cfg.clone();
+    tokio::task::spawn_blocking(move || {
+        // POST /api?<query> with a JSON body; return the response body.
+        let post = |query: &str, body: &str| -> String {
+            let mut request = Vec::new();
+            write!(
+                request,
+                "POST /api?{query} HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            request.extend_from_slice(body.as_bytes());
+            String::from_utf8_lossy(&raw(port, &request)).to_string()
+        };
+
+        // The escalation: the query names the one authorised setting, the
+        // body names a different one.
+        let out = post(
+            "mode=config&name=apikey&apikey=addkey",
+            "{\"name\":\"script\",\"value\":\"/tmp/pwn.sh\"}",
+        );
+        assert!(
+            !out.contains("\"status\":true"),
+            "add-only key wrote a non-apikey setting through the bootstrap hatch: {out}"
+        );
+
+        // ...and it really did not land.
+        let settings = cfg2.with_file_name("settings.json");
+        let saved = std::fs::read_to_string(&settings).unwrap_or_default();
+        assert!(
+            !saved.contains("pwn.sh"),
+            "the escalated setting was persisted anyway: {saved}"
+        );
+
+        // The hatch itself must still work, or an admin who set the NZB key
+        // first is locked out of ever setting a full key.
+        let ok = post(
+            "mode=config&name=apikey&apikey=addkey",
+            "{\"name\":\"apikey\",\"value\":\"thefullkey123\"}",
+        );
+        assert!(ok.contains("\"status\":true"), "the legitimate bootstrap broke: {ok}");
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

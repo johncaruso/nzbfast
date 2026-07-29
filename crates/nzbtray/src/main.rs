@@ -346,7 +346,7 @@ mod app {
             .build()
     }
 
-    use crate::probe_body::{dash_url, keyed_url};
+    use crate::probe_body::{dash_url, keyed_url, query_value};
 
     /// GET an API mode; None on any transport/JSON failure.
     fn api_get(port: u16, data_dir: &Path, mode: &str, timeout_ms: u64) -> Option<Value> {
@@ -574,6 +574,33 @@ mod app {
             .map_err(|e| format!("addfile parse: {e}"))?;
         if v.get("status").and_then(Value::as_bool) == Some(true) {
             Ok(name)
+        } else {
+            Err(v.get("error").and_then(Value::as_str).unwrap_or("rejected").to_string())
+        }
+    }
+
+    /// Hand a clicked `nzblnk:` link to mode=addnzblnk. Returns the
+    /// queued name.
+    ///
+    /// The link crosses VERBATIM as one query value: `nzbkit::nzblnk` in
+    /// the daemon is the only parser, and the only one that is fuzzed.
+    ///
+    /// A longer timeout than post_nzb's: resolving a header can mean a
+    /// round of searches against the user's indexers, where posting an
+    /// .nzb is a local write.
+    fn post_nzblnk(port: u16, data_dir: &Path, link: &str) -> Result<String, String> {
+        let url = keyed_url(
+            format!(
+                "http://127.0.0.1:{port}/api?mode=addnzblnk&output=json&link={}",
+                query_value(link)
+            ),
+            data_dir,
+        );
+        let resp = agent(45_000).get(&url).call().map_err(|e| format!("addnzblnk: {e}"))?;
+        let v: Value = serde_json::from_str(&resp.into_string().unwrap_or_default())
+            .map_err(|e| format!("addnzblnk parse: {e}"))?;
+        if v.get("status").and_then(Value::as_bool) == Some(true) {
+            Ok(v.get("name").and_then(Value::as_str).unwrap_or("download").to_string())
         } else {
             Err(v.get("error").and_then(Value::as_str).unwrap_or("rejected").to_string())
         }
@@ -1047,6 +1074,24 @@ mod app {
                 p.extension().is_some_and(|e| e.eq_ignore_ascii_case("nzb")) && p.exists()
             })
             .collect();
+        // nzblnk: links, from the URL-scheme association the installer
+        // writes. They cannot ride `args`: that filter demands a .nzb
+        // extension AND that the path exists on disk, and a link is
+        // neither a file nor a path. They survive the unknown-flag guard
+        // above only because a link starts with neither `-` nor `/`.
+        //
+        // A scheme TEST, not a parse. The daemon owns the only NZBLNK
+        // parser (nzbkit::nzblnk) and the tray deliberately does not
+        // depend on nzbkit - pulling the engine crate in for a prefix
+        // check would drag rusqlite and tokio into a tray that ships
+        // with plain-HTTP ureq and nothing else. This is strictly
+        // narrower than the daemon's own `looks_like`, which also peels
+        // wrapping quotes and brackets; argv from the registry's "%1"
+        // never has them. Narrower is the safe direction.
+        let links: Vec<String> = std::env::args()
+            .skip(1)
+            .filter(|a| a.len() >= 7 && a.as_bytes()[..7].eq_ignore_ascii_case(b"nzblnk:"))
+            .collect();
 
         let local = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
         let data_dir = PathBuf::from(local).join("nzbfast");
@@ -1081,12 +1126,17 @@ mod app {
             CreateMutexW(std::ptr::null(), 0, w("Local\\nzbfast-tray-single").as_ptr());
             if GetLastError() == ERROR_ALREADY_EXISTS {
                 let port = load_port(&data_dir).unwrap_or(BASE_PORT);
-                if args.is_empty() {
+                if args.is_empty() && links.is_empty() {
                     open_url(&dash_url(port, &data_dir));
                 } else {
                     for p in &args {
                         if let Err(e) = post_nzb(port, &data_dir, p) {
                             message_box(&format!("Couldn't queue {}:\n{e}", p.display()), MB_ICONERROR);
+                        }
+                    }
+                    for l in &links {
+                        if let Err(e) = post_nzblnk(port, &data_dir, l) {
+                            message_box(&format!("Couldn't add that link:\n{e}"), MB_ICONERROR);
                         }
                     }
                 }
@@ -1151,6 +1201,15 @@ mod app {
                 Ok(name) => balloon(hwnd, "nzbfast", &format!("Queued {name}")),
                 Err(e) => {
                     message_box(&format!("Couldn't queue {}:\n{e}", p.display()), MB_ICONERROR);
+                }
+            }
+        }
+        // Same, for a link clicked while nothing was running yet.
+        for l in &links {
+            match post_nzblnk(port, &data_dir, l) {
+                Ok(name) => balloon(hwnd, "nzbfast", &format!("Queued {name}")),
+                Err(e) => {
+                    message_box(&format!("Couldn't add that link:\n{e}"), MB_ICONERROR);
                 }
             }
         }

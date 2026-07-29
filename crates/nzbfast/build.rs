@@ -14,6 +14,23 @@
 fn main() {
     println!("cargo:rerun-if-changed=../../packaging/icon/nzbfast.ico");
     println!("cargo:rerun-if-changed=../../packaging/windows/nzbfast.manifest");
+    // Beta serial: local deploys and tester builds carry "beta N" after
+    // the version so anyone can tell a between-releases build from the
+    // published release it grew out of. packaging/beta-serial.txt is
+    // bumped by the deploy-daemon / release-bundle workflows and RESET
+    // TO 0 by publish-release, so a release build shows a bare version.
+    // Missing file or 0 (or a public-repo build, which has no file)
+    // means "not a beta": the suffix simply never appears.
+    println!("cargo:rerun-if-changed=../../packaging/beta-serial.txt");
+    let beta = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../packaging/beta-serial.txt");
+    let beta = std::fs::read_to_string(beta)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .map(|n| n.to_string())
+        .unwrap_or_default();
+    println!("cargo:rustc-env=NZBFAST_BETA={beta}");
     if std::env::var("CARGO_CFG_WINDOWS").is_err() {
         return;
     }

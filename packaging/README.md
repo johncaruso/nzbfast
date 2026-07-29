@@ -34,6 +34,14 @@ has run before but has no key. Each message names the fix, and
 
 Multi-arch image (amd64 + arm64) is built by `.github/workflows/release.yml`.
 
+`synology/docker-compose.yml` is the ready-to-run version of the root
+compose for a Synology Container Manager Project: Synology defaults for
+`PUID`/`PGID`, the Watchtower sidecar, and the socket-free scheduled-task
+alternative written out in the comments. The website serves a byte-copy
+of it as `website/nzbfast-synology.yml` so the download link on
+`download.html` is one click; `tests/synology-compose-parity.sh` fails if
+the two drift.
+
 ## Linux (systemd, bare metal)
 
 ```sh

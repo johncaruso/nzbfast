@@ -127,6 +127,43 @@ pub struct OverEntry {
     pub date: i64,
 }
 
+/// Decode one raw header line. Usenet headers are supposed to be ASCII
+/// (RFC 2047 for anything else), but a real share of them are raw
+/// ISO-8859-1: measured over 40,000 `free.pt` OVER lines, 1.0% are
+/// non-ASCII and 99.5% of those are latin-1, not UTF-8.
+///
+/// `from_utf8_lossy` turns every one of those bytes into U+FFFD, which
+/// both mangles the indexed title and destroys the exact bytes a Spotnet
+/// signature covers (see [`crate::spot`]). A latin-1 fallback is lossless
+/// and reversible - collapsing each char back to one byte recovers the
+/// wire bytes exactly.
+pub fn decode_header_line(line: &[u8]) -> std::borrow::Cow<'_, str> {
+    match std::str::from_utf8(line) {
+        Ok(s) => std::borrow::Cow::Borrowed(s),
+        Err(_) => std::borrow::Cow::Owned(line.iter().map(|&b| b as char).collect()),
+    }
+}
+
+/// Parse one raw OVER/XOVER response line. `None` for a line with too few
+/// fields (including the empty tail a trailing newline leaves behind).
+pub fn parse_over_line(line: &[u8]) -> Option<OverEntry> {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let text = decode_header_line(line);
+    // number \t subject \t from \t date \t message-id \t refs \t bytes \t lines
+    let f: Vec<&str> = text.split('\t').collect();
+    if f.len() < 7 {
+        return None;
+    }
+    Some(OverEntry {
+        number: f[0].trim().parse().unwrap_or(0),
+        subject: f[1].to_string(),
+        from: f[2].to_string(),
+        message_id: f[4].trim().to_string(),
+        bytes: f[6].trim().parse().unwrap_or(0),
+        date: parse_nntp_date(f[3]).unwrap_or(0),
+    })
+}
+
 /// One row of a `LIST ACTIVE` response: the group plus the server's
 /// current article-number range (high - low ≈ articles on the server).
 #[derive(Debug, Clone)]
@@ -1662,20 +1699,10 @@ impl Connection {
         }
 
         let mut entries = Vec::new();
-        for line in String::from_utf8_lossy(&raw).lines() {
-            // number \t subject \t from \t date \t message-id \t refs \t bytes \t lines
-            let f: Vec<&str> = line.split('\t').collect();
-            if f.len() < 7 {
-                continue;
+        for line in raw.split(|&b| b == b'\n') {
+            if let Some(e) = parse_over_line(line) {
+                entries.push(e);
             }
-            entries.push(OverEntry {
-                number: f[0].trim().parse().unwrap_or(0),
-                subject: f[1].to_string(),
-                from: f[2].to_string(),
-                message_id: f[4].trim().to_string(),
-                bytes: f[6].trim().parse().unwrap_or(0),
-                date: parse_nntp_date(f[3]).unwrap_or(0),
-            });
         }
         Ok(entries)
     }

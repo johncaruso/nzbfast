@@ -11,6 +11,13 @@ set -e
 # newer image (or via Watchtower). See docs/SYNOLOGY.md.
 export NZBFAST_BUNDLED=1
 
+# Bundled is also true for the Mac .app and the Windows tray, and those
+# want completely different update advice. This says which one we are, so
+# the dashboard can offer the container recipe (pull a newer image) and
+# not the download page. nzbfast also infers it from /.dockerenv, which is
+# what covers images already in the field; this just makes it explicit.
+export NZBFAST_CONTAINER=1
+
 CONFIG="${NZBFAST_CONFIG:-/config/config.json}"
 PORT="${NZBFAST_PORT:-6789}"
 OUT="${NZBFAST_OUT:-/downloads}"
@@ -99,17 +106,29 @@ if [ -z "$NZBFAST_APIKEY" ] && [ "${NZBFAST_OPEN:-0}" != "1" ]; then
         # and used to be unable to start at all.
         :
     elif [ -e "$SETTINGS" ] || [ -e "$(dirname "$CONFIG")/.spool" ]; then
-        # No key file, but this install has run before. The daemon mints only
-        # on a genuinely first run - deliberately, so a key can never appear
-        # under a desktop install and lock out remotes the user already wired
-        # up. In a container that same restraint means starting open on
-        # 0.0.0.0, so refuse and let the operator choose which they meant.
-        echo "nzbfast: ERROR - no API key at $KEYFILE, and this install has" >&2
-        echo "         already run, so the daemon will not create one." >&2
-        echo "         Refusing to publish the control API keyless. Pass" >&2
-        echo "         -e NZBFAST_APIKEY=... to set a key, or -e NZBFAST_OPEN=1" >&2
-        echo "         to deliberately run without one." >&2
-        exit 1
+        # An install that has run before and has never had a key: it was
+        # already serving the control API open to the network, and has been
+        # for as long as it has existed.
+        #
+        # 1.0.10 refused to start here, and that was wrong. Through 1.0.9
+        # this case started keyless on purpose - "existing keyless installs
+        # are left keyless, no breakage on upgrade" - because until 1.0.10
+        # this script also minted the key file itself, so the refusal was
+        # always satisfiable. 1.0.10 dropped the minting (the daemon does
+        # it now) and left the refusal standing with nothing to satisfy it,
+        # which turned every keyless container into a restart loop on
+        # update, with the reason readable only over SSH.
+        #
+        # A patch release must not change a running box's security posture
+        # underneath it. So: start, and say what is true. The daemon prints
+        # its own unmissable open-API banner moments later and mirrors it
+        # into the dashboard log, which is somewhere the operator can act
+        # on it - unlike a container that will not boot.
+        echo "nzbfast: WARNING - no API key at $KEYFILE, and this install has" >&2
+        echo "         already run, so one will not be created for it now." >&2
+        echo "         The control API stays open to your network, exactly as" >&2
+        echo "         it was before this update. To close it: set a key in" >&2
+        echo "         Settings > Security, or pass -e NZBFAST_APIKEY=..." >&2
     elif ! ( umask 077; : > "$KEYFILE.probe.$$" ) 2>/dev/null; then
         # A first run, but the directory that should hold the key is not
         # writable (read-only mount, ENOSPC, no inodes). The daemon would mint

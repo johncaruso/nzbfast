@@ -45,6 +45,13 @@ You'll drop those two numbers into `PUID` and `PGID` below.
 One file you can back up, re-use, and update with a single click. Take
 this route if you want nzbfast to keep itself current.
 
+**The quickest version:** download
+[`docker-compose.yml`](https://nzbfast.github.io/nzbfast/nzbfast-synology.yml),
+upload it into a folder on your NAS with File Station (e.g.
+`/docker/nzbfast`), edit the three values at the top, and create a
+Project pointing at that folder. The steps below are the same thing done
+by hand.
+
 1. File Station → create the project folder, e.g. `/docker/nzbfast`.
 2. Container Manager → **Project** → **Create**.
    - **Project name:** `nzbfast`
@@ -70,8 +77,9 @@ this route if you want nzbfast to keep itself current.
          - ./downloads:/downloads    # finished files
          - ./watch:/watch            # drop an .nzb here to auto-download
 
-     # Optional: checks nightly for a newer nzbfast image and recreates the
-     # container when one ships. Delete this service to update by hand.
+     # Optional: checks nightly for a newer nzbfast image and recreates
+     # the container when one ships. Needs the Docker socket; delete this
+     # service to update by hand, or on a DSM schedule instead.
      watchtower:
        image: containrrr/watchtower
        container_name: nzbfast-watchtower
@@ -89,12 +97,37 @@ this route if you want nzbfast to keep itself current.
    them. Then jump to [First run](#first-run-add-your-provider).
 
 **About that last service.** Watchtower is what keeps nzbfast current,
-and it needs the Docker socket to recreate containers. That access is
-root-equivalent on your NAS, so it is a real trade: convenience against
-handing one container broad control. If you would rather not, delete the
-`watchtower` block and update by hand (see [Updating](#updating)). As
+and it needs the Docker socket to recreate containers. Mounting
+`/var/run/docker.sock` gives that container root-equivalent control of
+your NAS, so it is a real trade: convenience against handing one
+container broad power. If you would rather not make it, delete the
+`watchtower` block and take the scheduled-task route below instead. As
 written it is scoped to the `nzbfast` container by the name at the end of
 the `command` line, so it will never touch your other containers.
+
+### Auto-update without the Docker socket
+
+DSM can do the same job on a schedule, and nothing needs the socket
+mounted. Delete the `watchtower` service from the compose file, then:
+
+1. Control Panel → **Task Scheduler** → **Create** → **Scheduled Task**
+   → **User-defined script**.
+2. **General:** name it something like `nzbfast update`, and set **User**
+   to `root` (Docker commands need it).
+3. **Schedule:** daily, at a quiet hour.
+4. **Task Settings → Run command:**
+
+   ```sh
+   cd /volume1/docker/nzbfast && docker compose pull && docker compose up -d
+   ```
+
+   Adjust the path to your project folder. On DSM 7.1 and older the
+   command is `docker-compose` (with the hyphen) rather than
+   `docker compose`.
+
+The trade here runs the other way: the task itself runs as root, but
+nothing gains standing access to the Docker socket, and you can read
+exactly what it does.
 
 ---
 
@@ -201,6 +234,9 @@ they live in your NAS folders and not inside the container.
 - **Automatically**, if you took Route A and kept the `watchtower`
   service: nothing to do. It checks nightly at 04:00 and recreates the
   container when a new version ships.
+- **Automatically, without the Docker socket:** the DSM scheduled task
+  described under
+  [Auto-update without the Docker socket](#auto-update-without-the-docker-socket).
 - **By hand, in a Project:** Container Manager → **Project** → `nzbfast`
   → **Stop**, then **Build** (this re-pulls `latest`), then **Start**.
 - **By hand, Route B:** Container Manager → **Registry** → re-download
@@ -217,6 +253,21 @@ fetch the tag the container was created with. Container Manager →
 
 ## Troubleshooting
 
+- **It will not start after an update, or Container Manager says
+  "stopped unexpectedly"** - the container prints the reason and exits,
+  so the reason is in its log, not in DSM's. Container Manager →
+  **Container** → `nzbfast` → **Details** → the **Log** tab. DSM's own
+  **Log** page in the left-hand menu is a different thing: it records who
+  pressed start and stop, and will never show you why a container died.
+  Over SSH the same thing, more reliably:
+
+  ```sh
+  sudo docker logs --tail 50 nzbfast
+  ```
+
+  A container that quits a second or two after starting, over and over,
+  is nearly always refusing on purpose rather than crashing, and the log
+  says which case it is and how to fix it.
 - **Downloads folder "permission denied" / files owned by root** - your
   `PUID`/`PGID` don't match the folder's owner. Re-check them with
   `id your_dsm_username` and fix the Environment values. This is the

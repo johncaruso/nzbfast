@@ -493,4 +493,23 @@ final class Daemon {
         if (obj["status"] as? Bool) == true { return nil }
         return (obj["error"] as? String) ?? "rejected"
     }
+
+    /// Hand a clicked `nzblnk:` link to mode=addnzblnk. Returns nil on
+    /// success, or a message to show.
+    ///
+    /// The link goes over VERBATIM, percent-encoded as one query value:
+    /// `nzbkit::nzblnk` in the daemon is the only parser, and it is the
+    /// one that is fuzzed. Nothing here inspects the link.
+    ///
+    /// Resolving a header can mean a round of searches against the
+    /// user's indexers, so this waits longer than the status probes do.
+    func addNzblnk(_ link: String) async -> String? {
+        var req = URLRequest(url: apiURL("addnzblnk", "output=json&link=\(queryEscaped(link))"))
+        req.timeoutInterval = 30
+        guard let (data, _) = try? await URLSession.shared.data(for: req),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return "the daemon didn't answer" }
+        if (obj["status"] as? Bool) == true { return nil }
+        return (obj["error"] as? String) ?? "rejected"
+    }
 }

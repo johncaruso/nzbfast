@@ -533,6 +533,51 @@ pub fn looks_obfuscated(stem: &str) -> bool {
             || toks[0].chars().all(|c| c.is_ascii_uppercase()))
 }
 
+/// Does this string read as a RELEASE NAME rather than a human title or
+/// a muxer's own furniture?
+///
+/// The question is asked of strings that arrive from outside the posted
+/// name - a container's Title tag, a naming oracle's canonical name -
+/// and the bar is deliberately high, because a wrong answer renames the
+/// user's file. "Sintel" and "Episode 3" are titles, not releases;
+/// "Big.Buck.Bunny.2008.1080p.BluRay.x264-GRP" is a release.
+///
+/// The test is the parser's own furniture, counted: a release name
+/// carries at least two independent scene signals, and the muxers that
+/// write a plain human title carry none of them. `looks_obfuscated`
+/// keeps out the hash-shaped strings a reposter may have written there
+/// instead.
+pub fn looks_like_release_name(s: &str) -> bool {
+    let s = s.trim();
+    // Long enough to be a name, short enough to be a filename stem.
+    if !(6..=180).contains(&s.len()) || looks_obfuscated(s) {
+        return false;
+    }
+    // A path, or a filename with its extension still on it, is not a
+    // release name - it is a member of one, and using it would file the
+    // payload under a container name.
+    if s.contains('/') || s.contains('\\') {
+        return false;
+    }
+    let p = parse_release(s);
+    if p.title.trim().is_empty() {
+        return false;
+    }
+    let signals = [
+        p.year.is_some(),
+        p.res.is_some(),
+        p.source.is_some(),
+        p.group.is_some(),
+        p.season.is_some() || p.episode.is_some() || p.date.is_some(),
+        p.vcodec.is_some(),
+        p.remux,
+    ]
+    .iter()
+    .filter(|b| **b)
+    .count();
+    signals >= 2
+}
+
 /// Software / non-video posts ("CCleaner Professional Plus v6.36.11041
 /// x64 Setup"): returns the index of the first software marker, which
 /// doubles as the title cut point. A version token or a strong keyword
@@ -1327,9 +1372,25 @@ fn parse_one(stem: &str) -> Parsed {
         && !(title.chars().any(|c| c.is_ascii_lowercase())
             && title.chars().any(|c| c.is_ascii_uppercase()))
     {
+        // Words the plain fold mangles: roman numerals ("PLANET.EARTH.II"
+        // became "Planet Earth Ii") and household acronyms ("THE.OFFICE.US"
+        // became "The Office Us"). Only multi-word titles qualify - the
+        // 2019 film "Us" must stay "Us", and there a lone "us"/"ii" token
+        // IS the title, not a suffix. I, V and X are left out on purpose:
+        // as single letters they are far more often initials than numerals.
+        const KEEP_UPPER: [&str; 28] = [
+            "ii", "iii", "iv", "vi", "vii", "viii", "ix", "xi", "xii", "xiii", "xiv", "xv",
+            "us", "uk", "usa", "wwe", "nhl", "nba", "nfl", "ufc", "fbi", "cia", "swat",
+            "nasa", "bbc", "cnn", "espn", "uefa",
+        ];
+        let multi = title_toks.len() > 1;
         title = title
             .split(' ')
             .map(|w| {
+                let lower = w.to_ascii_lowercase();
+                if multi && KEEP_UPPER.contains(&lower.as_str()) {
+                    return lower.to_ascii_uppercase();
+                }
                 let mut cs = w.chars();
                 match cs.next() {
                     Some(f) => f.to_ascii_uppercase().to_string() + &cs.as_str().to_ascii_lowercase(),
@@ -1522,11 +1583,30 @@ pub fn air_date_parts(date: &str) -> Option<(String, String)> {
     }
     let (year, md) = date.split_at(4);
     let (month, day) = md.split_at(2);
-    let in_range = |s: &str, max: u32| s.parse::<u32>().is_ok_and(|v| (1..=max).contains(&v));
-    if !in_range(month, 12) || !in_range(year, 9999) || !in_range(day, 31) {
+    let num = |s: &str| s.parse::<u32>().ok().filter(|v| *v >= 1);
+    let (y, m, d) = (num(year)?, num(month)?, num(day)?);
+    if m > 12 || d > days_in_month(y, m) {
         return None;
     }
     Some((year.to_string(), format!("{year}.{month}.{day}")))
+}
+
+/// Length of a Gregorian month. The day check used to be a flat
+/// `1..=31`, so `Show.2026.02.31` was filed as a daily episode under
+/// `Show/Season 2026/Show - 2026.02.31` - a date that does not exist,
+/// written into a library, from a name this function's own contract
+/// promises to have read as a real calendar date.
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        // Proleptic Gregorian, which is what a four-digit year in a
+        // release name means: every 4th year, except centuries, except
+        // every 400th.
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => 0,
+    }
 }
 
 /// Friendly base name (no extension) for a movie / loose file:
@@ -2087,6 +2167,20 @@ mod tests {
                   "20260700", "20260021", "00000101"] {
             assert_eq!(air_date_parts(s), None, "{s:?} is not an air date");
         }
+        // And declines dates that pass a flat 1..=31 day check but do
+        // not exist. These were filed as real episodes, under a season
+        // folder named after a day that never happened.
+        for s in ["20260231", "20260431", "20260631", "20260931", "20261131", "20260230"] {
+            assert_eq!(air_date_parts(s), None, "{s:?} is not a day that exists");
+        }
+        // February is the leap rule, in all three of its cases.
+        assert!(air_date_parts("20240229").is_some(), "2024 is a leap year");
+        assert_eq!(air_date_parts("20260229"), None, "2026 is not");
+        assert_eq!(air_date_parts("19000229"), None, "a century is not, unless…");
+        assert!(air_date_parts("20000229").is_some(), "…it divides by 400");
+        // The month lengths themselves, at their real boundaries.
+        assert!(air_date_parts("20260430").is_some());
+        assert!(air_date_parts("20261231").is_some());
     }
 
     #[test]
@@ -2375,6 +2469,22 @@ mod tests {
     #[test]
     fn allcaps_folds_to_title_case() {
         assert_eq!(p("KILL.BILL.VOL.1.2003.2160p-iVy").title, "Kill Bill Vol 1");
+    }
+
+    #[test]
+    fn fold_preserves_numerals_and_acronyms() {
+        // Roman numerals and household acronyms survive the fold...
+        assert_eq!(p("PLANET.EARTH.II.2016.2160p.WEB-GRP").title, "Planet Earth II");
+        assert_eq!(p("the.office.us.s01e01.720p.web-grp").title, "The Office US");
+        assert_eq!(p("WWE.MONDAY.NIGHT.RAW.2026.720p.WEB-GRP").title, "WWE Monday Night Raw");
+        assert_eq!(p("US.MARSHALS.1998.1080p.BluRay-GRP").title, "US Marshals");
+        // ...but a single-word title is a TITLE, not a suffix: Peele's
+        // "Us" must not become "US". (The fold's own >3-letters gate
+        // already leaves a lone lowercase "us" untouched - pinned here
+        // so a widened fold can't quietly turn it into an acronym.)
+        assert_eq!(p("us.2019.1080p.web-grp").title, "us");
+        // Mixed-case stems still pass through byte-for-byte.
+        assert_eq!(p("Us.2019.1080p.WEB-GRP").title, "Us");
     }
 
     #[test]
@@ -2775,4 +2885,40 @@ mod tests {
         assert_eq!(d("Show.Name.2024.20260721.1080p.WEB-GRP").as_deref(), Some("20260721"));
     }
 
+    /// The gate every out-of-band name has to pass before it may rename
+    /// a user's file: a container Title, a naming oracle's answer. The
+    /// NO cases are the ones that matter - each of them is a string a
+    /// real muxer or a real API has handed back.
+    #[test]
+    fn release_names_are_told_from_human_titles() {
+        for s in [
+            "Example.Movie.2019.1080p.BluRay.x264-GRP",
+            "Show.Name.S01E02.1080p.WEB.h264-POKE",
+            "Example Movie 2019 1080p BluRay x264-GRP",
+            "Dune.Part.Two.2024.1080p.WEB.h264-ETHEL",
+            "Example.Movie.2019.2160p.WEB-DL.DDP5.1.HDR.H.265-BYNDR",
+        ] {
+            assert!(looks_like_release_name(s), "{s} should read as a release");
+        }
+        for s in [
+            "",
+            "Sintel",
+            "Episode 3",
+            "The Movie",           // a human title: no furniture at all
+            "Big Buck Bunny",
+            "encoded by Handbrake",
+            "video",
+            // A member of a release, not the release.
+            "Example.Movie.2019.1080p.BluRay.x264-GRP/movie.mkv",
+            // Hash-shaped: what a reposter writes when it writes anything.
+            "d41d8cd98f00b204e9800998ecf8427e",
+            "n1iY94U6fTpMVY9GPD",
+        ] {
+            assert!(!looks_like_release_name(s), "{s:?} should NOT read as a release");
+        }
+        // One signal is not enough - a year alone is how plenty of
+        // muxers title a film, and renaming on it would lose the name
+        // the poster actually gave.
+        assert!(!looks_like_release_name("The Movie 2019"));
+    }
 }

@@ -7,14 +7,19 @@
 //! within a minute ONE open dashboard tab left the daemon serving
 //! nothing at all - a curl to / hung indefinitely.
 //!
-//! The fix has two halves, and this file pins both:
+//! The fix has three parts, and this file pins all of them:
 //!
 //!  * index_stats is served from a try_lock + cached figures and never
 //!    blocks on the index mutex (stale-by-seconds counts are fine for a
 //!    status pill);
-//!  * the worker pool is big enough that the endpoints which DO still
-//!    take the index lock (wall2, search) cannot consume every worker
-//!    the moment a handful queue up behind a scan batch.
+//!  * the interactive query endpoints (wall2, search, browse, getnzb,
+//!    the newznab facade) run on a dedicated READ-ONLY connection - the
+//!    database is WAL, so they answer while an ingest holds the
+//!    read-write connection (measured pre-fix: a wall2 curl queued
+//!    62.4s behind a deepening pass);
+//!  * the worker pool is big enough that the rare handlers which DO
+//!    still take the index lock (the mutating ones) cannot consume
+//!    every worker the moment a handful queue up behind a scan batch.
 //!
 //! The long lock hold is synthesized with the NZBFAST_DEBUG_HOOKS-gated
 //! mode=debug_hold_index, which sleeps inside with_index - the same
@@ -32,12 +37,60 @@ fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
+/// One request, returning the response BODY.
+///
+/// Reads BYTES and de-chunks, rather than `read_to_string` over the raw
+/// stream. tiny_http switches to `Transfer-Encoding: chunked` for any
+/// response at or above its 32 KB `chunked_threshold`, and the dashboard
+/// at `/` is ~450 KB - so `/` has always come back chunked here.
+///
+/// Reading that stream as a String is not merely untidy, it is
+/// intermittently WRONG: a chunk header lands every 8192 bytes wherever
+/// that falls, including in the middle of a multi-byte character, and
+/// `read_to_string` then fails the whole read with "stream did not
+/// contain valid UTF-8". Whether it does is decided by the page's byte
+/// layout, so the test passed for as long as no boundary happened to
+/// split one - and a UI change that shifted the bytes broke it with
+/// nothing wrong in the daemon at all. The panic also killed the daemon
+/// through `KillOnDrop`, which made every other thread's request look
+/// like an empty body and buried the cause.
 fn http(port: u16, req: &str) -> String {
     let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect daemon");
     write!(s, "GET {req} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
-    let mut out = String::new();
-    s.read_to_string(&mut out).unwrap();
-    out.split("\r\n\r\n").nth(1).unwrap_or("").to_string()
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).expect("read response");
+    let Some(at) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return String::new(); // no headers at all - the caller asserts
+    };
+    let (head, body) = raw.split_at(at + 4);
+    let chunked = String::from_utf8_lossy(head)
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked");
+    let body = if chunked { dechunk(body) } else { body.to_vec() };
+    String::from_utf8(body).expect("response body is UTF-8")
+}
+
+/// Minimal `Transfer-Encoding: chunked` decoder - enough for what
+/// tiny_http emits (hex length, CRLF, bytes, CRLF, terminated by a
+/// zero-length chunk). Chunk extensions after a `;` are tolerated.
+fn dechunk(mut b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    while let Some(nl) = b.windows(2).position(|w| w == b"\r\n") {
+        let line = String::from_utf8_lossy(&b[..nl]);
+        let size = line.split(';').next().unwrap_or("").trim();
+        let n = usize::from_str_radix(size, 16).unwrap_or(0);
+        if n == 0 {
+            break; // terminating chunk
+        }
+        let (start, end) = (nl + 2, nl + 2 + n);
+        if end > b.len() {
+            out.extend_from_slice(&b[start.min(b.len())..]); // truncated
+            break;
+        }
+        out.extend_from_slice(&b[start..end]);
+        b = &b[(end + 2).min(b.len())..]; // skip the chunk's trailing CRLF
+    }
+    out
 }
 
 fn api(port: u16, q: &str) -> serde_json::Value {
@@ -193,6 +246,47 @@ fn held_index_lock_does_not_wedge_the_api() {
         }
     });
 
+    // The index-backed QUERY endpoints answer during the hold too, with
+    // real rows, via the read-only connection - not "busy", not empty,
+    // not a 62s queue behind the held read-write connection.
+    let querier = std::thread::spawn(move || {
+        for _ in 0..8 {
+            let t = Instant::now();
+            let s = api(port, "mode=index_search&q=wedge");
+            assert!(
+                t.elapsed() < Duration::from_secs(3),
+                "index_search blocked {}ms behind the held index lock",
+                t.elapsed().as_millis()
+            );
+            let hits = s["results"].as_array().expect("results array").len();
+            assert_eq!(hits, 8, "search finds the seed during the hold: {s}");
+            let id = s["results"][0]["id"].as_i64().expect("hit id");
+
+            let t = Instant::now();
+            let w = api(port, "mode=wall2&all=1&matched=0");
+            assert!(
+                t.elapsed() < Duration::from_secs(3),
+                "wall2 blocked {}ms behind the held index lock",
+                t.elapsed().as_millis()
+            );
+            assert!(
+                w["cards"].as_array().is_some_and(|c| !c.is_empty()),
+                "wall2 serves cards during the hold: {w}"
+            );
+
+            // The newznab facade's NZB fetch - make_nzb is a read.
+            let t = Instant::now();
+            let nzb = http(port, &format!("/getnzb/{id}.nzb"));
+            assert!(
+                t.elapsed() < Duration::from_secs(3),
+                "getnzb blocked {}ms behind the held index lock",
+                t.elapsed().as_millis()
+            );
+            assert!(nzb.contains("<nzb"), "getnzb serves the NZB during the hold: {nzb}");
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    });
+
     // Meanwhile the daemon as a whole stays alive: / (the curl of the
     // incident report) and a non-index API mode answer promptly.
     for _ in 0..8 {
@@ -216,6 +310,7 @@ fn held_index_lock_does_not_wedge_the_api() {
     }
 
     poller.join().expect("poller thread");
+    querier.join().expect("querier thread");
     let held = holder.join().expect("holder thread");
     assert_eq!(held["held"], true, "the hook really held the lock: {held}");
 
@@ -271,4 +366,122 @@ fn debug_hook_absent_without_env() {
         "unknown-mode answer took {}ms - did the hook run?",
         t.elapsed().as_millis()
     );
+}
+
+/// Watches a socket we have gone silent on: the DAEMON must be the one to
+/// let go. Returns how long that took; fails if it is still open at `bound`.
+///
+/// Ok(0) is the daemon's FIN; a reset also counts (either way the daemon's
+/// side has left ESTABLISHED). Bytes before that (a 408, say) are fine -
+/// they are the daemon acting, not retention.
+fn assert_daemon_closes(mut s: TcpStream, what: &str, bound: Duration) -> Duration {
+    let t = Instant::now();
+    s.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    let mut buf = [0u8; 4096];
+    loop {
+        match s.read(&mut buf) {
+            Ok(0) => return t.elapsed(),
+            Ok(_) => {}
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                assert!(
+                    t.elapsed() < bound,
+                    "{what}: daemon still holds the socket after {:?}",
+                    t.elapsed()
+                );
+            }
+            Err(_) => return t.elapsed(),
+        }
+    }
+}
+
+/// The other observation from the 28 Jul investigation: the daemon retained
+/// ESTABLISHED sockets for HTTP clients that died mid-request. A peer that
+/// vanishes without a FIN (power loss, network drop, kill -9 behind a
+/// dead NAT) is indistinguishable from these two probes, so the daemon must
+/// cut both loose on its own - the vendored tiny_http's 30s socket timeout
+/// (patch 4) is the mechanism, and this pins that the released binary
+/// actually applies it on its accept path.
+#[test]
+fn a_client_that_vanishes_mid_request_is_released() {
+    let dir = scratch("vanish");
+    let d = serve(&dir);
+    let port = d.port;
+
+    // Half a request, then silence.
+    let mut half = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write!(half, "GET /api?output=json&mode=queue HTTP/1.1\r\nHost: x").unwrap();
+    // And its connect-and-say-nothing sibling.
+    let silent = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+    // The socket timeout is 30s; anything near it is compliance, 45s is
+    // retention.
+    let bound = Duration::from_secs(45);
+    let h = std::thread::spawn(move || assert_daemon_closes(half, "half-request socket", bound));
+    let s = std::thread::spawn(move || assert_daemon_closes(silent, "silent socket", bound));
+
+    // Meanwhile the abandoned sockets cost nobody else anything.
+    std::thread::sleep(Duration::from_secs(2));
+    let q = api(port, "mode=queue");
+    assert!(q.get("queue").is_some(), "daemon healthy beside dead clients: {q}");
+
+    let half_took = h.join().expect("half-request watcher");
+    let silent_took = s.join().expect("silent watcher");
+
+    // And afterwards, with both sockets reclaimed, still healthy.
+    let q = api(port, "mode=queue");
+    assert!(q.get("queue").is_some(), "daemon healthy after reclaiming: {q}");
+    eprintln!(
+        "daemon released: half-request in {half_took:?}, silent in {silent_took:?}"
+    );
+}
+
+/// One keep-alive GET on an already-open connection; the response must
+/// arrive on THAT connection (an EOF mid-response is the daemon having
+/// dropped a keep-alive peer it should have kept).
+fn keepalive_get(s: &mut TcpStream, path: &str) -> serde_json::Value {
+    write!(s, "GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    let mut head = Vec::new();
+    let mut b = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match s.read(&mut b) {
+            Ok(1) => head.push(b[0]),
+            Ok(_) => panic!("daemon closed a live keep-alive connection mid-response"),
+            Err(e) => panic!("keep-alive read failed: {e}"),
+        }
+        assert!(head.len() < 64 * 1024, "unterminated response header");
+    }
+    let head = String::from_utf8_lossy(&head);
+    let len: usize = head
+        .lines()
+        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap()))
+        .expect("response carries a Content-Length");
+    let mut body = vec![0u8; len];
+    s.read_exact(&mut body).expect("full keep-alive body");
+    serde_json::from_slice(&body).unwrap_or_else(|e| panic!("bad JSON over keep-alive: {e}"))
+}
+
+/// The flip side of cutting dead sockets loose: the dashboard's slowest
+/// poll (the index_stats pill, every 15s) rides one keep-alive connection.
+/// Whatever closes abandoned sockets must not close a connection that is
+/// merely between polls - so a second request 16s after the first still
+/// gets its answer on the same connection.
+#[test]
+fn dashboard_keepalive_outlives_its_poll_interval() {
+    let dir = scratch("keepalive");
+    let d = serve(&dir);
+    let port = d.port;
+
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+
+    let first = keepalive_get(&mut s, "/api?output=json&mode=queue");
+    assert!(first.get("queue").is_some(), "first poll on the connection: {first}");
+
+    std::thread::sleep(Duration::from_secs(16));
+
+    let second = keepalive_get(&mut s, "/api?output=json&mode=queue");
+    assert!(second.get("queue").is_some(), "poll after 16s idle: {second}");
 }

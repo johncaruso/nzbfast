@@ -19,7 +19,10 @@ name: provenance-release
 # channels and are not covered here.
 #
 # DISPATCH-ONLY: run from Actions -> provenance-release -> Run workflow
-# with the tag of an existing release to attach the artifacts to.
+# with the tag of an existing release to attach the artifacts to, AND with
+# the workflow ref set to that same tag:
+#
+#     gh workflow run provenance-release.yml --ref "$TAG" -f tag="$TAG" ...
 #
 # The build happens at THAT TAG, not at the ref picked in the dispatch UI.
 # It used to be the other way round: the tag input only chose which release
@@ -28,6 +31,16 @@ name: provenance-release
 # attestation stayed truthful about the commit it built, but the thing
 # ordinary downloaders rely on - that a release tag's binaries were built
 # from that tag - was silently false.
+#
+# `--ref` is why the guard below exists, and it is not optional. The
+# attestation's source identity does NOT come from the checkout: the
+# signed SLSA predicate is built from the OIDC workflow claims, which
+# carry the dispatch ref and its SHA. So dispatching from `main` with an
+# older tag input checked out, built and packaged the TAG while the
+# signed statement named MAIN's commit as the source - a provenance
+# claim pointing at code that never produced the artifact. Checking out
+# the tag fixed which bytes get built; only binding the dispatch ref
+# fixes what the signature says about them.
 
 on:
   workflow_dispatch:
@@ -67,7 +80,14 @@ jobs:
       # Prove the checkout really is that tag before spending a build on it:
       # a missing tag, or a ref that resolved to something else, must fail
       # here rather than produce mislabelled assets.
-      - name: Verify the checkout matches the tag
+      #
+      # And prove the same of GITHUB_SHA, which is what the attestation
+      # will actually name as its source. The two can disagree - dispatch
+      # from `main` with an old tag input and they do - and only this
+      # check notices, because the checkout guard below it passes either
+      # way. See the header for why the signature reads the dispatch ref
+      # rather than the checkout.
+      - name: Verify the checkout and the attested source are both the tag
         env:
           TAG: ${{ inputs.tag }}
         run: |
@@ -76,6 +96,13 @@ jobs:
           have=$(git rev-parse HEAD)
           if [ "$want" != "$have" ]; then
             echo "checkout is $have but tag $TAG is $want" >&2
+            exit 1
+          fi
+          if [ "$want" != "$GITHUB_SHA" ]; then
+            echo "this run's ref is $GITHUB_SHA but tag $TAG is $want." >&2
+            echo "The attestation would name $GITHUB_SHA as the source of" >&2
+            echo "binaries built from $want. Re-dispatch at the tag:" >&2
+            echo "  gh workflow run provenance-release.yml --ref $TAG -f tag=$TAG" >&2
             exit 1
           fi
           echo "building $TAG at $have"
@@ -211,8 +238,10 @@ jobs:
           ref: refs/tags/${{ inputs.tag }}
 
       # Same guard as the binaries job: the Dockerfile + entrypoint used to
-      # assemble the image must come from the tag being attested.
-      - name: Verify the checkout matches the tag
+      # assemble the image must come from the tag being attested, and the
+      # ref this run was dispatched at is what the image attestation will
+      # name as its source.
+      - name: Verify the checkout and the attested source are both the tag
         env:
           TAG: ${{ inputs.tag }}
         run: |
@@ -221,6 +250,12 @@ jobs:
           have=$(git rev-parse HEAD)
           if [ "$want" != "$have" ]; then
             echo "checkout is $have but tag $TAG is $want" >&2
+            exit 1
+          fi
+          if [ "$want" != "$GITHUB_SHA" ]; then
+            echo "this run's ref is $GITHUB_SHA but tag $TAG is $want." >&2
+            echo "Re-dispatch at the tag:" >&2
+            echo "  gh workflow run provenance-release.yml --ref $TAG -f tag=$TAG -f image=true" >&2
             exit 1
           fi
           echo "building image for $TAG at $have"

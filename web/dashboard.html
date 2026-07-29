@@ -305,6 +305,14 @@ body.compact #dashview .legend,#dashview .card.compact .legend{gap:7px;margin-bo
 body.compact #dashview table,#dashview .card.compact table{font-size:12px}
 body.compact #dashview th,body.compact #dashview td,
 #dashview .card.compact th,#dashview .card.compact td{padding-top:3px;padding-bottom:3px}
+/* Idle auto-compaction: after a minute with nothing downloading, the two
+   chart cards stop reserving a full canvas for flat lines and the Queue
+   card rises above the fold. Applied by tick(), never persisted, and
+   never while the user has chosen a density themselves (uiCompact or a
+   per-card ▤) - an explicit choice always outranks an automatic one. */
+#dashview .card.idlecompact .chartwrap{height:38px!important}
+#dashview .card.idlecompact .legend{margin-bottom:4px}
+#dashview .card.idlecompact .chgrip{display:none}
 /* The density tool sits beside ⠿ and ×; lit when this card is compact. */
 .carddense{cursor:pointer;color:var(--dim);font-size:13px;line-height:1;background:none;border:0;padding:0 2px}
 .carddense:hover{color:var(--fg)}
@@ -364,6 +372,13 @@ input.search{flex:1;padding:8px 12px;border-radius:var(--radius-sm);border:1px s
 select.ctl{background:transparent;color:var(--fg);border:1px solid var(--line);border-radius:var(--radius-sm);
   padding:6px 8px;font-size:12.5px;cursor:pointer}
 select.ctl:focus{outline:1px solid var(--acc)}
+/* The two header selects name their subject only on hover ("no limit" -
+   of what?). A quiet icon inside the frame says it at a glance, and on
+   touch, where there is no hover at all. */
+.selwrap{position:relative;display:inline-flex;align-items:center}
+.selwrap .selic{position:absolute;inset-inline-start:8px;pointer-events:none;color:var(--dim);
+  width:1em;height:1em}
+.selwrap select.ctl{padding-inline-start:26px}
 /* Card-header toolbar (Connection tuning): floats right on desktop. */
 .h3tools{float:inline-end;margin-top:-4px;display:flex;gap:8px}
 /* Contextual help: a quiet ? on a card header deep-links into the manual. */
@@ -462,6 +477,25 @@ select.ctl:focus{outline:1px solid var(--acc)}
 .fsfoot{display:flex;align-items:center;gap:10px;padding:12px 16px;border-top:1px solid var(--line)}
 #fswrite.ok{color:var(--ok)}#fswrite.warn{color:var(--warn)}
 @media(max-width:560px){.fsbody{grid-template-columns:1fr}.fsroots{display:none}}
+/* Container update recipe (fs modal skeleton, scrolling prose body) */
+#cuov{position:fixed;inset:0;z-index:70;display:none;place-items:center;
+  background:color-mix(in srgb,#000 55%,transparent);backdrop-filter:blur(2px);padding:16px}
+#cuov.on{display:grid}
+#cumodal{background:var(--surface);border:1px solid var(--line);border-radius:14px;
+  width:min(680px,96vw);max-height:88vh;display:flex;flex-direction:column;
+  box-shadow:0 24px 70px rgba(0,0,0,.5);overflow:hidden}
+.cubody{overflow-y:auto;padding:4px 18px 16px;font-size:13.5px;line-height:1.55}
+.cubody h4{margin:18px 0 6px;font-size:13.5px}
+.cubody p,.cubody .cup{margin:8px 0;color:var(--dim)}
+.cubody ol{margin:8px 0;padding-inline-start:20px;color:var(--dim)}
+.cubody li{margin:4px 0}
+.cubody .cunote{border-inline-start:2px solid var(--warn);padding-inline-start:11px}
+/* A compose file is an LTR block even in an RTL UI, and its indentation
+   is load-bearing, so it scrolls rather than wraps. */
+.cuyaml{direction:ltr;text-align:start;white-space:pre;overflow-x:auto;
+  background:var(--surface-2);border:1px solid var(--line);border-radius:10px;
+  padding:11px 13px;margin:8px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  font-size:12px;line-height:1.5}
 /* Newsgroup browser modal (fs modal skeleton, list instead of tree) */
 #gbov{position:fixed;inset:0;z-index:70;display:none;place-items:center;
   background:color-mix(in srgb,#000 55%,transparent);backdrop-filter:blur(2px);padding:16px}
@@ -591,6 +625,19 @@ body.histcolor #hist tbody tr.fail .nmtxt{color:var(--bad)}
 #keynotice{display:none;padding:8px 16px;border-bottom:1px solid var(--line);font-size:12px;color:var(--dim)}
 #keynotice.on{display:block}
 #keynotice button{margin-inline-start:6px}
+/* Open-API notice. The mirror image of #keynotice, and they can never be
+   up together: a daemon with no key never asks anyone for one. Warm-toned
+   rather than dim, because this one is about exposure rather than a
+   credential this browser happens to be missing. */
+#opennotice{display:none;padding:8px 16px;border-bottom:1px solid var(--line);
+  font-size:12px;color:var(--fg);background:color-mix(in srgb,var(--warn) 13%,transparent)}
+#opennotice.on{display:block}
+#opennotice button{margin-inline-start:6px}
+/* A key is an LTR token, and it is about to be pasted into Sonarr: one
+   click should select the whole thing, including in an RTL UI. */
+#opennotice .k{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  direction:ltr;unicode-bidi:isolate;user-select:all;padding:1px 6px;
+  border-radius:6px;background:var(--surface-2)}
 /* Narrow: drop the measured columns rather than crushing the name. The
    detail panel still carries every number, so nothing is unreachable. */
 @media(max-width:900px){
@@ -702,6 +749,10 @@ input.txt.sm{max-width:120px}
 .badge.live{color:var(--ok);border-color:var(--ok)}
 .badge.next{color:var(--acc);border-color:var(--acc)}
 .badge.restart{color:var(--warn);border-color:var(--warn)}
+/* Scope, not liveness: "this browser only" borrowed the green "live"
+   pill and read as a state. Neutral outline keeps it informational. */
+.badge.scope{color:var(--dim);border-color:var(--line)}
+.badge.open{color:var(--warn);border-color:var(--warn)}
 .pendnote{display:block;font-size:11.5px;color:var(--warn);margin-top:3px;font-weight:600}
 .pendnote::before{content:"⟳ ";}
 /* name/details | on-tick | Test | Edit | Remove - one column per child.
@@ -762,7 +813,11 @@ input.txt.sm{max-width:120px}
   .wrap{padding:14px 12px 60px}
   header{flex-wrap:wrap;gap:8px}
   header .grow{display:none}
-  select.ctl{flex:1 1 auto;min-width:0}
+  /* The wrapper now carries the flex so the selects still stretch; the
+     Pause button rides the same row instead of orphaning on its own. */
+  .selwrap{flex:1 1 auto;min-width:0}
+  .selwrap select.ctl{flex:1 1 auto;min-width:0;width:100%}
+  #pauseBtn{flex:0 0 auto}
   .hero{flex-direction:column;align-items:stretch;gap:10px}
   .hero>div:first-child{width:auto}
   .hero .num{font-size:34px}
@@ -809,7 +864,10 @@ input.txt.sm{max-width:120px}
     data-i18n-title="hdr.ver.title" title="Check for updates" aria-label="Check for updates"
     onclick="jumpToUpdates()"
     onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();jumpToUpdates()}"></span></h1>
-  <span class="pill" id="updChip" style="display:none;cursor:pointer" data-i18n-title="hdr.upd.title" title="Open the download page for the new version"></span>
+  <!-- Title is set by the poll, not by applyI18n: it says one thing in a
+       container and another everywhere else, so a static key here would
+       flip it to the wrong wording on every locale change. -->
+  <span class="pill" id="updChip" style="display:none;cursor:pointer"></span>
   <!-- One nav, same four destinations in the same order, on this page and
        on the wall. The current one is marked .on rather than renamed or
        removed: a nav that changes shape as you use it is why "go to the
@@ -826,6 +884,7 @@ input.txt.sm{max-width:120px}
   <a href="/manual" target="_blank" class="pill" style="text-decoration:none" data-i18n-title="hdr.manual.title" title="User manual"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-manual"/></svg> <span data-i18n="hdr.manual">manual</span></a>
   </nav>
   <span class="grow"></span>
+  <span class="selwrap"><svg class="ic selic" aria-hidden="true"><use href="#i-gauge"/></svg>
   <select class="ctl" id="limitSel" data-i18n-title="hdr.limit.title" title="Speed limit" onchange="setLimit(this.value)">
     <option value="0" data-i18n="hdr.limit.none">no limit</option>
     <option value="auto" data-i18n="hdr.limit.auto">auto · yield to LAN</option>
@@ -835,14 +894,15 @@ input.txt.sm{max-width:120px}
     <option value="500000000">500 MB/s</option>
     <option value="1000000000">1 GB/s</option>
     <option value="custom" data-i18n="hdr.limit.setcustom">custom…</option>
-  </select>
+  </select></span>
+  <span class="selwrap"><svg class="ic selic" aria-hidden="true"><use href="#i-clock"/></svg>
   <select class="ctl" id="pauseSel" data-i18n-title="hdr.pausefor.title" title="Pause for…" onchange="pauseFor(this.value)">
     <option value="" data-i18n="hdr.pausefor">pause for…</option>
     <option value="15" data-i18n="hdr.pausefor.15">15 min</option>
     <option value="30" data-i18n="hdr.pausefor.30">30 min</option>
     <option value="60" data-i18n="hdr.pausefor.60">1 hour</option>
     <option value="180" data-i18n="hdr.pausefor.180">3 hours</option>
-  </select>
+  </select></span>
   <!-- Indexing state belongs where it can be SEEN. It was paused for a
        benchmark, and the only sign was a card most of the way down the
        Browse view - so a whole morning of posts went unindexed with
@@ -853,6 +913,7 @@ input.txt.sm{max-width:120px}
   <button class="ghost mini" id="pauseNowBtn" onclick="pauseNow()" style="display:none" data-i18n-title="hdr.pausenow.title" title="Pause now - stops instantly and frees the line; the few in-flight articles re-download on resume." data-i18n="hdr.pausenow">now</button>
 </header>
 <div id="keynotice"></div>
+<div id="opennotice"></div>
 
 <div id="dashview">
 
@@ -904,7 +965,7 @@ input.txt.sm{max-width:120px}
 
 <div class="card" id="queueCard">
   <h3 data-i18n="queue.title">Queue <span class="dim mono" id="qcount"></span>
-    <span class="dim" style="float:inline-end;text-transform:none;letter-spacing:0;font-weight:400" data-i18n="queue.hint">click a row for detail · drag to reorder; Force/High still download first</span></h3>
+</h3>
   <div class="chartwrap" style="height:52px;margin-bottom:8px;display:none"><canvas id="burnChart" data-i18n-title="queue.burn.title" title="GB remaining across the queue - the burn-down to zero"></canvas></div>
   <div id="watchFailed" class="dim" style="display:none;font-size:12.5px;margin-bottom:8px"></div>
   <div class="cardscroll"><table id="queue"><thead><tr><th data-i18n="col.name">Name</th><th data-i18n="col.size">Size</th><th data-i18n="col.left">Left</th><th data-i18n="col.eta">ETA</th><th style="width:120px" data-i18n="col.progress">Progress</th><th style="width:110px"></th></tr></thead><tbody></tbody></table></div>
@@ -1017,7 +1078,7 @@ input.txt.sm{max-width:120px}
 
 <div class="card set" data-sg="look" data-sk="appearance">
   <h3 data-i18n="set.look.title">Appearance
-    <span class="badge live" data-i18n="badge.thisbrowser">this browser only</span></h3>
+    <span class="badge scope" data-i18n="badge.thisbrowser">this browser only</span></h3>
   <div class="row"><label data-i18n="set.look.theme">Theme<span class="hint" data-i18n="set.look.theme.hint">Auto follows your system's light or dark setting</span></label>
     <select class="sel" id="s_theme" onchange="setTheme(this.value)">
       <option value="auto" data-i18n="set.look.auto">Auto</option>
@@ -1266,6 +1327,8 @@ input.txt.sm{max-width:120px}
     <input type="checkbox" id="s_rename_quality_brackets" onchange="setCfg('rename_quality_brackets',this.checked?1:0);renameExample()"></div>
   <div class="row rename-sub" style="padding-left:16px"><label data-i18n="set.rename.extrawords">Keep the other words in the name<span class="hint" data-i18n="set.rename.extrawords.hint">sport, races and other events are often one title repeated all season, and only a word or two apart: "Round11 Hungary Race" vs "Round11 Hungary Qualifying". Keeping those words is what stops them all becoming the same name. Only applies where the name could not be tidied up otherwise, so ordinary films are untouched</span></label>
     <input type="checkbox" id="s_rename_extra_words" onchange="setCfg('rename_extra_words',this.checked?1:0);renameExample()"></div>
+  <div class="row rename-sub" style="padding-left:16px"><label data-i18n="set.rename.identify">Work out what a hidden film is<span class="hint" data-i18n="set.rename.identify.hint">some posts arrive with the name stripped off them, so the video lands as a string of random characters. When that happens, read the film's own running time, picture and sound formats and subtitle languages, then look those up in public film databases. Films only, and only once the download has finished. It renames the file ONLY when two separate databases agree on exactly one film, which needs a TMDB key in your config - without one it never renames, it just writes what it found into History so you can see what the file probably is</span></label>
+    <input type="checkbox" id="s_rename_identify" onchange="setCfg('rename_identify',this.checked?1:0)"></div>
   <div class="row" style="grid-template-columns:1fr"><span class="hint" id="renameExample" style="font-style:italic"></span></div>
   <div class="row"><label data-i18n="set.rename.junk">Remove junk files<span class="hint" data-i18n="set.rename.junk.hint">delete leftover .par2, .nzb, .sfv, .nfo and sample clips from finished movie/TV folders, never the video or its subtitles</span></label>
     <input type="checkbox" id="s_rename_junk" onchange="setCfg('rename_junk',this.checked?1:0)"></div>
@@ -1422,6 +1485,34 @@ input.txt.sm{max-width:120px}
     <span><button class="ghost" style="color:var(--bad);border-color:var(--bad)" onclick="wipeIndex(this)" data-i18n="set.idx.dropdb.btn">Delete the index database…</button></span></div>
 </div>
 
+<!-- A second content source, and deliberately NOT inside .idxon: spots
+     work with the built-in indexer switched off, which is most of the
+     point of them. A header scan reads what usenet happens to say about
+     a posting; a spot is somebody publishing what they posted. -->
+<div class="card set" data-sg="organise" data-sk="spots">
+  <h3 data-i18n="set.spot.title">Spotnet spots</h3>
+  <div class="row"><label data-i18n="set.spot.enabled">Scan spots<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.spot.enabled.hint">off unless you turn it on. Spotnet is a public feed where people announce what they have posted and sign it with their own key. Each spot carries the real title and the NZB, so it names releases a header scan cannot see. It works with the built-in indexer off.</span></label>
+    <input type="checkbox" id="s_spot_enabled" onchange="setCfg('spot_enabled',this.checked?1:0)"></div>
+  <div class="idxnote">
+    <div data-i18n-html="set.spot.what"><b>What it finds:</b> around 170 to 200 new spots a day.
+    Most are Dutch or Belgian, with a steady minority of English scene releases. Every spot is
+    checked against the signature of the person who posted it before it is stored, and one that
+    does not check out is thrown away.</div>
+    <div data-i18n-html="set.spot.cant"><b>What it is not:</b> a replacement for an indexer
+    account. It is a small feed with no back catalogue, so it holds what has been spotted recently
+    rather than everything ever posted. Spots also only cover what somebody chose to announce.</div>
+    <div data-i18n-html="set.spot.adult">Roughly a third of spots are filed as adult by the people
+    who posted them. Those are left out of Browse unless you tick <b>Include adult</b> there.</div>
+    <div data-i18n-html="set.spot.where">Spots appear in <b>Browse</b> under their own
+    <b>Spots</b> option, kept separate from your own index so it is always clear which is which.
+    Downloading one fetches the NZB it points at and queues it like any other download.</div>
+  </div>
+  <div class="row"><label data-i18n="set.spot.groups">Spot groups<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.spot.groups.hint">comma-separated. free.pt is the one active Spotnet group; there is rarely a reason to change this</span></label>
+    <input class="txt" id="s_spot_groups" onchange="setCfg('spot_groups',this.value)"></div>
+  <div class="row" data-adv="1"><label data-i18n="set.spot.backfill">Backfill articles<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.spot.backfill.hint">how far back to read on the first pass. Later passes carry on from where the last one stopped, so this is paid once</span></label>
+    <input class="txt sm" type="number" min="1000" max="1000000" id="s_spot_backfill" onchange="setCfg('spot_backfill',this.value)"></div>
+</div>
+
 <!-- .idxon: this whole card is about the index database, so it goes with
      the indexer. The off state keeps one button from it (delete the
      database) on the Indexing card, which stays visible. -->
@@ -1470,6 +1561,7 @@ input.txt.sm{max-width:120px}
 <div class="card set" data-sg="system" data-sk="remote">
   <h3 data-i18n="set.remote.title">Remote access <span class="dim" style="text-transform:none;letter-spacing:0;font-weight:400" data-i18n="set.remote.sub">· phone &amp; away-from-home</span></h3>
   <div id="remoteUrls" style="display:flex;gap:22px;flex-wrap:wrap;margin:4px 0 10px"></div>
+  <div class="warn" id="remoteOpenNote" style="display:none;font-size:12.5px;margin:0 0 10px" data-i18n="set.remote.opennote">No API key is set: anyone on your network can control nzbfast at these addresses. Set one in Security below.</div>
   <div class="dim" style="font-size:12.5px;line-height:1.55" data-i18n-html="set.remote.body">
     Point your phone's camera at a code, or type the address - same Wi-Fi works immediately.
     For access from anywhere, the painless answer is <b>Tailscale</b> (free, no router changes):
@@ -1569,7 +1661,7 @@ input.txt.sm{max-width:120px}
 </div>
 
 <div class="card set" data-sg="system" data-sk="security">
-  <h3 data-i18n="set.sec.title">Security</h3>
+  <h3 data-i18n="set.sec.title">Security<span class="badge open" id="secOpenBadge" style="display:none" data-i18n="set.sec.open" data-i18n-title="set.sec.open.title" title="No API key is set, so every device on your network - and any web page you visit, via CSRF - can control this daemon. Type a key below to require auth.">open to your network</span></h3>
   <div class="row"><label data-i18n="set.sec.apikey">API key<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.sec.apikey.hint">Sonarr, Radarr, NZB360 and anything else that connects to nzbfast needs this. Show it to copy it across, or create a new one (then paste the new one into those apps). Typing your own here replaces it; leaving it blank keeps the current one</span></label>
     <span style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
       <input class="txt" id="s_apikey" autocomplete="off" onchange="saveKey('apikey',this)">
@@ -1636,6 +1728,61 @@ input.txt.sm{max-width:120px}
     <span id="fswrite" class="dim"></span><span class="grow"></span>
     <button class="ghost" onclick="fsClose()" data-i18n="btn.cancel">Cancel</button>
     <button id="fschoose" onclick="fsChoose()" data-i18n="fs.choose">Choose this folder</button>
+  </div>
+</div></div>
+<!-- Container update recipe. A container cannot replace its own binary,
+     so "download the new version" is the wrong advice inside one: the
+     image is the update channel. Shown instead of the download page when
+     the daemon reports it is running in a container. -->
+<div id="cuov" onclick="if(event.target===this)cuClose()"><div id="cumodal" role="dialog" aria-modal="true" aria-labelledby="cutitle">
+  <div class="fshead"><b id="cutitle"></b><span class="grow"></span>
+    <button class="ghost mini" onclick="cuClose()" data-i18n-title="btn.close.title"
+      title="Close this panel" aria-label="Close this panel">✕</button></div>
+  <div class="cubody">
+    <p data-i18n="cu.intro">nzbfast is running in a container, so it never replaces its own files: you
+    move it forward by pulling a newer image. Your settings, queue and downloads live in the folders you
+    mounted, and survive the swap.</p>
+
+    <h4 data-i18n="cu.now">Update it now</h4>
+    <p data-i18n="cu.now.project">If you created it as a Project (Container Manager or Portainer):</p>
+    <ol>
+      <li data-i18n="cu.now.p1">Container Manager → Project → nzbfast → Stop.</li>
+      <li data-i18n="cu.now.p2">Build (this pulls the new image), then Start.</li>
+    </ol>
+    <div class="cup" data-i18n-html="cu.now.click">If you created it by searching the Registry and clicking Run: Registry →
+    re-download the <b>latest</b> tag, then Container → stop nzbfast → Action → Reset.</div>
+
+    <h4 data-i18n="cu.auto">Keep it up to date by itself</h4>
+    <p data-i18n="cu.auto.lead">Add this service to your Project's compose file, alongside the nzbfast
+    service, and it checks nightly at 04:00 for a newer image. Set the timezone to yours.</p>
+    <pre class="cuyaml" id="cuyaml">  watchtower:
+    image: containrrr/watchtower
+    container_name: nzbfast-watchtower
+    restart: unless-stopped
+    environment:
+      - TZ=Europe/London
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --cleanup --schedule "0 0 4 * * *" nzbfast</pre>
+    <p><button class="ghost mini" onclick="cuCopy()" data-i18n="cu.copy">Copy this block</button></p>
+    <div class="cup cunote" data-i18n-html="cu.socket">Worth knowing before you paste it: this needs the Docker socket,
+    and mounting <b>/var/run/docker.sock</b> gives that container root-equivalent control of the machine.
+    If you would rather not, skip it and have your NAS run
+    <b>docker compose pull &amp;&amp; docker compose up -d</b> on a schedule instead. On Synology that is
+    Control Panel → Task Scheduler → Create → Scheduled Task → User-defined script, run as root.</div>
+    <div class="cup cunote" data-i18n-html="cu.pinned">One thing that catches people out: none of this moves a container
+    that was created from a version tag such as <b>:1.0.3</b>. Both Watchtower and a manual re-pull fetch
+    the tag the container was created with, so use <b>:latest</b> if you want updates to arrive.</div>
+    <div class="cup cunote" data-i18n-html="cu.stuck">If it does not come back after updating, the container prints why it
+    stopped and the reason is in its own log: Container Manager, then Container, nzbfast, Details, and the
+    <b>Log</b> tab. Over SSH that is <b>docker logs nzbfast</b>. Nothing is lost while it is stopped, and
+    deleting the container or your config folder will not help.</div>
+  </div>
+  <div class="fsfoot">
+    <a class="pill" id="cuguide" target="_blank" rel="noopener" style="text-decoration:none"
+      href="https://nzbfast.github.io/nzbfast/synology.html" data-i18n="cu.guide">Synology guide ↗</a>
+    <span class="grow"></span>
+    <button onclick="cuClose()" data-i18n="cu.close">Close</button>
   </div>
 </div></div>
 <div id="gbov" onclick="if(event.target===this)gbClose()"><div id="gbmodal">
@@ -1866,6 +2013,14 @@ function applyI18n(){
   document.querySelectorAll('[data-i18n-placeholder]').forEach(el=>{
     const tr=I18N[el.dataset.i18nPlaceholder]; if(tr!=null) el.placeholder=tr;
   });
+  // Strips built in JS carry no data-i18n attributes, so nothing above
+  // reaches them. They are drawn from a poll that starts BEFORE the
+  // catalogue finishes loading, so without this they keep the English
+  // they were first drawn in - on every non-English dashboard, for the
+  // whole session. Clearing the cached state makes the next poll redraw.
+  if(typeof openBarShown!=='undefined' && openBarShown!==null && !openBarLatched){
+    const was=openBarShown; openBarShown=null; openApiNotice(was);
+  }
 }
 // Contextual help: drop a quiet ? on each card header (and each settings
 // section) that deep-links into the embedded manual (/manual) at the
@@ -1901,7 +2056,12 @@ function injectHelp(){
     // a plain click opens the in-page drawer instead.
     a.className='hlp'; a.href=manualUrl(anchor); a.rel='noopener';
     a.textContent='?'; a.title=title; a.setAttribute('aria-label',title);
-    a.dataset.i18nTitle='hlp.title';
+    if(k==='queueCard'){
+      // The reorder/priority hint used to sit in the card header full-time;
+      // it lives here now, one hover away instead of always-on.
+      a.title=t('queue.hint','click a row for detail · drag to reorder; Force/High still download first')+'\n'+title;
+      a.setAttribute('aria-label',a.title);
+    } else a.dataset.i18nTitle='hlp.title';
     a.onclick=e=>{ if(e.metaKey||e.ctrlKey||e.shiftKey||e.button) return;
       e.preventDefault(); openHelp(anchor); };
     (h3.querySelector('.h3tools')||h3).appendChild(a);
@@ -1937,7 +2097,10 @@ function closeHelp(){
   document.removeEventListener('keydown',helpEsc);
 }
 function helpEsc(e){ if(e.key==='Escape') closeHelp(); }
-const PC = ['--p0','--p1','--p2','--p3','--p4','--p5'].map(v=>getComputedStyle(document.documentElement).getPropertyValue(v).trim());
+// Identity palette (providers, servers): --id*, not --p*. The chart set
+// doubles as ok/warn/bad, and PC used to hand the error red to whichever
+// provider happened to be fourth in the list.
+const PC = ['--id0','--id1','--id2','--id3','--id4','--id5'].map(v=>getComputedStyle(document.documentElement).getPropertyValue(v).trim());
 let key = localStorage.nzbfastKey || '';
 // First run: the daemon mints an API key and the launcher opens this page
 // with ?apikey=<it>, so a double-click user isn't met by a prompt for a
@@ -2005,6 +2168,76 @@ function keyNotice(on){
   el.classList.add('on');
 }
 function reenterKey(){ keyDeclined = false; keyNotice(false); ensureKey(key); }
+
+// ---- Open-API notice ---------------------------------------------------
+// A daemon with no API key authorizes every request it receives, and the
+// listener is 0.0.0.0 by default. The daemon has always said so on stdout,
+// which nobody reads on a NAS. This says it where the owner is, and offers
+// the one-click fix - which matters because the alternative, refusing to
+// start until a key exists, is what bricked every keyless container on the
+// 1.0.10 update. Fix it where someone can also go and update Sonarr, not
+// by taking the box away.
+//
+// NOT shown when the operator opted in with NZBFAST_OPEN=1: a warning that
+// cannot be satisfied is a warning everyone learns to scroll past.
+let openBarShown = null;
+// Latched while the freshly minted key is on screen: the very act of
+// creating it flips open_api false, and the next poll (a second later)
+// would otherwise wipe the one copy of the key the user has ever seen.
+let openBarLatched = false;
+function openApiNotice(open){
+  const el = document.getElementById('opennotice');
+  if (!el || openBarLatched) return;
+  if (sessionStorage.nzbfastOpenHushed === '1') open = false;
+  if (open === openBarShown) return;   // poll runs every second; only touch the DOM on a change
+  openBarShown = open;
+  if (!open){ el.classList.remove('on'); el.innerHTML = ''; return; }
+  el.innerHTML = esc(t('open.notice','No API key is set, so anything that can reach this machine can control nzbfast: add and delete downloads, change settings, read your provider password.'))
+    + ' <button class="ghost mini" onclick="openApiFix(this)">' + esc(t('open.generate','Create a key')) + '</button>'
+    + ' <button class="ghost mini" onclick="openApiHush()">' + esc(t('open.later','Not now')) + '</button>';
+  el.classList.add('on');
+}
+// Session-scoped on purpose. Dismissing it forever would be a setting, and
+// this is a state that ought to nag a little.
+function openApiHush(){
+  sessionStorage.nzbfastOpenHushed = '1';
+  openBarShown = null;
+  openApiNotice(false);
+}
+async function openApiFix(btn){ await busy(btn, t('busy.working','Working…'), async()=>{
+  const j = await api('apikey_new');
+  if (!j || j.status === false || !j.apikey){
+    toast(tErr(j && j.error) || t('open.fail','Could not create a key.'), true); return;
+  }
+  // This page authenticates with the key too from the next request on.
+  key = j.apikey; localStorage.nzbfastKey = j.apikey;
+  const el = document.getElementById('opennotice');
+  openBarLatched = true;
+  el.innerHTML = esc(t('open.done','Key created. Paste it into Sonarr, Radarr and any phone app, and they will connect again.'))
+    + ' <span class="k" id="openkey"></span>'
+    + ' <button class="ghost mini" onclick="openApiCopy()">' + esc(t('open.copy','Copy')) + '</button>'
+    + ' <button class="ghost mini" onclick="openApiDone()">' + esc(t('open.dismiss','Done')) + '</button>';
+  document.getElementById('openkey').textContent = j.apikey;
+  el.classList.add('on');
+  loadSettings();
+}); }
+async function openApiCopy(){
+  const k = document.getElementById('openkey');
+  if (!k) return;
+  try{ await navigator.clipboard.writeText(k.textContent); toast(t('open.copied','Copied.')); }
+  catch(e){
+    // Plain-HTTP origins and embedded webviews refuse clipboard writes,
+    // which is exactly where a NAS dashboard lives. Select it instead so
+    // the manual copy is one keystroke.
+    try{ const r=document.createRange(); r.selectNodeContents(k);
+         const s=getSelection(); s.removeAllRanges(); s.addRange(r); }catch(_){}
+    toast(t('open.copyfail','Could not reach the clipboard - the key is selected, copy it by hand.'), true);
+  }
+}
+function openApiDone(){
+  openBarLatched = false; openBarShown = null;
+  openApiNotice(false);
+}
 function ensureKey(failedKey){
   if (key !== failedKey) return Promise.resolve(true);   // another call already rotated it - just retry
   if (keyDeclined) return Promise.resolve(false);        // asked once, told no - the strip is the way back
@@ -2150,12 +2383,16 @@ async function refreshIdxPill(){
     const s=await api('index_stats');
     const groups=(s.groups||[]).length;
     if(!groups){ el.style.display='none'; return; }   // indexing not set up
-    el.style.display='';
     IDX_PAUSED=!!s.paused;
     const scanning=!!s.scanning;
+    // Only states that SAY something get header space. "indexing idle"
+    // sat beside the engine's own "Idle" pill and the pair read as a
+    // stutter; the quiet state now stays off the header (the Browse
+    // index card still reports it). Paused - the state the comment
+    // above exists for - and actively-scanning still show.
+    el.style.display=(IDX_PAUSED||scanning)?'':'none';
     el.textContent = IDX_PAUSED ? t('hdr.idx.paused','indexing off')
-                   : scanning   ? t('hdr.idx.scanning','indexing')
-                                : t('hdr.idx.idle','indexing idle');
+                   : t('hdr.idx.scanning','indexing');
     el.classList.toggle('warn', IDX_PAUSED);
     el.title = IDX_PAUSED
       ? t('hdr.idx.paused.title','Indexing is OFF. Anything posted while it is off is not picked up later - click to resume.')
@@ -2401,20 +2638,25 @@ function drawRes(frac=0){
   const ramScale=Math.max(H.rss_budget||0, ...resHist.ram, 1);
   const netScale=Math.max(...resHist.net, 1);
   const dwScale=Math.max(...resHist.dw, 1);
+  // Series colours are picked by ROLE, not palette order: --p2/--p3 are
+  // also the warn/error hues, and drawing Disk in amber and Net in red
+  // made the busiest lines on a DOWNLOADER read as trouble. Net is the
+  // hero metric here, so it takes --p0 (the accent family, and the slot a
+  // user's custom accent recolours first).
   drawLines(document.getElementById('resChart'),[
-    {data:resHist.cpu, color:css('--p0'), cap:'100%'},
+    {data:resHist.cpu, color:css('--p5'), cap:'100%'},
     {data:resHist.ram.map(v=>100*v/ramScale), color:css('--p1'), cap:fmtBytes(ramScale)},
-    {data:resHist.dw.map(v=>100*v/dwScale), color:css('--p2'), cap:fmtRate(dwScale)},
-    {data:resHist.net.map(v=>100*v/netScale), color:css('--p3'), cap:fmtRate(netScale)},
+    {data:resHist.dw.map(v=>100*v/dwScale), color:css('--p4'), cap:fmtRate(dwScale)},
+    {data:resHist.net.map(v=>100*v/netScale), color:css('--p0'), cap:fmtRate(netScale)},
   ], frac);
   const freePct=H.disk_total_bytes?100*H.disk_free_bytes/H.disk_total_bytes:100;
   // No stats at all (disk_stat stubbed, e.g. Windows) must not cry wolf.
   const dcls=!H.disk_total_bytes?'':(H.disk_free_bytes<25e9||freePct<5)?'bad':(freePct<15?'warn':'');
   setHtml('resLegend',
-    `<span><i style="background:${css('--p0')}"></i>CPU ${(H.cpu_pct||0).toFixed(0)}%</span>`+
+    `<span><i style="background:${css('--p5')}"></i>CPU ${(H.cpu_pct||0).toFixed(0)}%</span>`+
     `<span><i style="background:${css('--p1')}"></i>RAM ${fmtBytes(H.rss_bytes||0)}${H.rss_budget?' / '+fmtBytes(H.rss_budget)+' '+t('res.budget','budget'):''}</span>`+
-    `<span><i style="background:${css('--p2')}"></i>${t('res.diskwrite','Disk write')} ${fmtRate(resHist.dw[resHist.dw.length-1]||0)}</span>`+
-    `<span><i style="background:${css('--p3')}"></i>${t('res.net','Net')} ${fmtRate(resHist.net[resHist.net.length-1]||0)}</span>`+
+    `<span><i style="background:${css('--p4')}"></i>${t('res.diskwrite','Disk write')} ${fmtRate(resHist.dw[resHist.dw.length-1]||0)}</span>`+
+    `<span><i style="background:${css('--p0')}"></i>${t('res.net','Net')} ${fmtRate(resHist.net[resHist.net.length-1]||0)}</span>`+
     (H.disk_total_bytes?`<span class="${dcls}" style="margin-inline-start:auto">${t('res.free','{n} free on disk',{n:fmtBytes(H.disk_free_bytes||0)})}${dcls?' - '+t('res.lowspace','low space'):''}</span>`:''));
 }
 
@@ -2532,6 +2774,26 @@ function drawVerifyHealth(slots){
 }
 
 let ticking=false;
+// Idle auto-compaction state (see the .idlecompact CSS). Sixty seconds of
+// nothing downloading squashes the two chart cards; the first live sample
+// restores them instantly. The user's own density choices win: a global
+// compact mode or a per-card ▤ means we keep our hands off that card.
+let idleSince=0;
+function updateIdleCompact(downloading){
+  if(downloading) idleSince=0;
+  else if(!idleSince) idleSince=Date.now();
+  const on = !downloading && (Date.now()-idleSince>=60_000);
+  let changed=false;
+  const dens=layoutPrefs().density;
+  for(const id of ['heroCard','rescard']){
+    const c=document.getElementById(id); if(!c) continue;
+    const want = on && !uiCompact() && dens[id]!=='compact';
+    if(c.classList.contains('idlecompact')!==want){
+      c.classList.toggle('idlecompact', want); changed=true;
+    }
+  }
+  if(changed) redrawCanvases();
+}
 async function tick(){
   if(ticking) return;                 // never stack overlapping polls
   ticking=true;
@@ -2557,6 +2819,7 @@ async function tick(){
     // "Pause now" only helps mid-transfer - hide it when paused or idle.
     document.getElementById('pauseNowBtn').style.display =
       (downloading && !paused) ? '' : 'none';
+    updateIdleCompact(downloading);
     // Update banner: rides the queue poll. Notify-only - the chip just
     // links to the download page; nzbfast never installs updates itself.
     const uc=document.getElementById('updChip');
@@ -2569,9 +2832,23 @@ async function tick(){
         updAttnFor=q.update_version;
         uc.classList.remove('attn'); void uc.offsetWidth; uc.classList.add('attn');
       }
-      uc.textContent='⬆ '+t('upd.download','v{v} available - download',{v:q.update_version});
-      uc.onclick=()=>window.open('https://github.com/nzbfast/nzbfast/releases/latest','_blank');
-    } else uc.style.display='none';
+      updVersion=q.update_version;
+      // In a container the download page is a dead end: nzbfast cannot
+      // replace its own files there, and the image is the update channel.
+      // Same chip, different destination - the recipe that applies.
+      if(q.container){
+        uc.textContent='⬆ '+t('upd.container','v{v} available - how to update',{v:q.update_version});
+        uc.title=t('hdr.upd.container.title','Show how to update the container');
+        uc.onclick=cuOpen;
+      }else{
+        uc.textContent='⬆ '+t('upd.download','v{v} available - download',{v:q.update_version});
+        uc.title=t('hdr.upd.title','Open the download page for the new version');
+        uc.onclick=()=>window.open('https://github.com/nzbfast/nzbfast/releases/latest','_blank');
+      }
+    } else { uc.style.display='none'; updVersion=''; }
+    // Rides the same poll as the update chip: no key set, and not the
+    // operator's deliberate choice.
+    openApiNotice(!!q.open_api && !q.open_optin);
     // Reflect the daemon's limit state unless the user has the menu open.
     // A custom limit (e.g. set via the settings page or API) gets its own
     // option instead of a silently blank select.
@@ -2717,6 +2994,21 @@ function shapeBadge(tag){
     : t('shape.why.onepass','The files are written straight out as the archive downloads - the archive parts never land on your disk.');
   return `<span class="qbadge shape" title="${escA(t('shape.title','What this download turned out to be.')+(why?' '+why:''))}">${esc(label)}</span>`;
 }
+// Which oracle named a release, as a label. Deliberately NOT translated
+// and deliberately not the internal token: these are a service name and
+// two file formats, which read the same in every language, and "the
+// par-hash said so" is not a sentence anybody should have to meet.
+const IDENT_SRC={srrdb:'srrdb', xrel:'xREL', 'par-hash':'PAR2', 'mkv-title':'MKV'};
+function identSource(src){ return IDENT_SRC[src]||''; }
+
+// The canonical name beside the posted one, in the history row itself.
+// This is the whole payoff for an obfuscated post: the row reads
+// "8a7f2c1b… · Example.Movie.2019.1080p-GRP" instead of a hash alone.
+// No label - a second name after a separator needs no explaining, and
+// the drawer says where it came from.
+function identName(s){
+  return s.identity_name ? ` <span class="dim">· ${esc(s.identity_name)}</span>` : '';
+}
 function renderHistory(slots){
   if(slots) lastHistSlots=slots;
   const all=lastHistSlots, cur=histFilter();
@@ -2750,7 +3042,7 @@ function renderHistory(slots){
       return `<tr class="item ${cls}" data-id="${escA(s.nzo_id)}" onclick="toggleHistRow(this)"
         ondblclick="openItem('${s.nzo_id}','file')" oncontextmenu="return histMenu(event,'${s.nzo_id}',${failed})"
         title="${escA(t('hist.row.title2','click: details · double-click: play · right-click: options'))}">
-        <td><span class="nm"><span class="caret">▶</span><span class="sdot"></span><span class="nmtxt">${esc(s.name)}${shapeBadge(s.archive_shape)}</span></span></td>
+        <td><span class="nm"><span class="caret">▶</span><span class="sdot"></span><span class="nmtxt">${esc(s.name)}${identName(s)}${shapeBadge(s.archive_shape)}</span></span></td>
         <td class="nowrap">${s.size}${st}</td>
         <td class="nowrap" style="text-align:end">${ctl}</td></tr>`;
     }).join('')
@@ -2784,6 +3076,27 @@ function toggleHistRow(tr){
     rows.push([t('hist.why','Reason'),
       esc(t('hist.packed.title','{name} could not be unpacked - this format is not built in. The verified archive is in the output folder; unpack it with your own tool.',{name:s.unpack_blocked_by}))]);
   rows.push([t('col.location','Location'), esc(s.storage||s.path||'')]);
+  // What an identity oracle said this release is. Only present when one
+  // answered, and always attributed - "srrdb says" and "the video file
+  // says" are different degrees of confidence.
+  if(s.identity_name||s.identity_imdb){
+    const src=identSource(s.identity_src);
+    const bits=[];
+    if(s.identity_name) bits.push(esc(s.identity_name));
+    if(s.identity_imdb) bits.push(`<a href="https://www.imdb.com/title/${escA(s.identity_imdb)}/" target="_blank" rel="noopener noreferrer">${esc(s.identity_imdb)}</a>`);
+    if(src) bits.push(`<span class="dim">${esc(src)}</span>`);
+    rows.push([t('hist.identity','Identified as'), bits.join(' · ')]);
+  }
+  // ...and when no oracle could name it, what the file itself said plus
+  // the films it might be. The two are complementary: the row above is a
+  // NAME, this one is why we could not commit to one. Escaped then
+  // line-broken, never innerHTML'd raw - the film titles in it come from
+  // a public database, so they are somebody else's text.
+  if(s.identify){
+    const lines=String(s.identify).split('\n').filter(x=>x.trim());
+    rows.push([t('hist.identify','What this looks like'),
+      lines.map(l=>esc(l)).join('<br>')]);
+  }
   const d=document.createElement('tr');
   d.className='drawer';
   d.innerHTML=`<td colspan="3"><dl class="histdet">${
@@ -3130,7 +3443,8 @@ function renderQueue(){
       <td class="nowrap" style="text-align:end">${ctl}</td></tr>`+
       (open?`<tr class="drawer"><td colspan="6">${drawerHtml(s)}</td></tr>`:'');
   }).join('')||`<tr><td colspan="6" class="dim"><span id="idlepick" style="cursor:pointer;text-decoration:underline dotted">${
-      t('queue.empty.drop','Nothing downloading. Drop a .nzb anywhere, or click here to choose one.')}</span></td></tr>`);
+      t('queue.empty.drop','Nothing downloading. Drop a .nzb anywhere, or click here to choose one.')}</span><br><span class="dim">${
+      t('queue.empty.nzblnk','An nzblnk link works too: paste it anywhere on this page.')}</span></td></tr>`);
 }
 // Detail drawer body: live per-file progress + verify + per-server
 // contribution for the ACTIVE download; identity + priority control for
@@ -3458,6 +3772,7 @@ function originLabel(o){
     arr:t('origin.arr','Sonarr, Radarr or similar'),
     url:t('origin.url','a link you opened'),
     wall:t('origin.wall','the wall'),
+    nzblnk:t('origin.nzblnk','an nzblnk link you pasted'),
     watchlist:t('origin.watchlist','your watchlist'),
     'failure-link':t('origin.failurelink','automatic replacement for a failed download')}[o]||o;
 }
@@ -4274,7 +4589,34 @@ async function changeCat(id){
 // Right-click menu on history rows.
 function closeMenu(){ document.getElementById('ctxmenu')?.remove(); }
 addEventListener('click', closeMenu);
-addEventListener('keydown', e=>{ if(e.key==='Escape'){ closeMenu(); fsClose(); gbClose(); } });
+addEventListener('keydown', e=>{ if(e.key==='Escape'){ closeMenu(); fsClose(); gbClose(); cuClose(); } });
+
+// ---- Container update recipe -------------------------------------------
+// A container never swaps its own binary, so the generic "download the new
+// version" line sends people to a page that cannot help them. When the
+// daemon says it is in a container, the update chip opens this instead:
+// the two clicks that actually update it, plus the sidecar that does it
+// nightly, plus the two things that quietly stop either from working.
+function cuOpen(){
+  const ov=document.getElementById('cuov');
+  document.getElementById('cutitle').textContent =
+    updVersion ? t('cu.title.v','Update to v{v}',{v:updVersion}) : t('cu.title','Update nzbfast');
+  ov.classList.add('on');
+}
+function cuClose(){ document.getElementById('cuov').classList.remove('on'); }
+async function cuCopy(){
+  const pre=document.getElementById('cuyaml');
+  try{ await navigator.clipboard.writeText(pre.textContent); toast(t('cu.copied','Copied. Paste it into your compose file.')); }
+  catch(e){
+    // Clipboard writes are denied outright in some embedded webviews and
+    // on plain-HTTP origins, which is exactly where a NAS dashboard
+    // lives. Select the block so the manual copy the toast asks for is
+    // one keystroke rather than a careful drag over nine indented lines.
+    try{ const r=document.createRange(); r.selectNodeContents(pre);
+         const s=getSelection(); s.removeAllRanges(); s.addRange(r); }catch(_){}
+    toast(t('cu.copyfail','Could not reach the clipboard - select the block and copy it by hand.'), true);
+  }
+}
 function histMenu(e, id, failed){
   e.preventDefault(); closeMenu();
   const m=document.createElement('div'); m.id='ctxmenu';
@@ -4829,6 +5171,9 @@ let qSeen=null, prevPaused2=null, wasOffline=false, lastCompleteAt=0, updToldFor
 // Separate from updToldFor: the spoken/sound cue is gated on the sound
 // setting, the visual ring must fire regardless.
 let updAttnFor='';
+// The version the chip is currently advertising, so the container recipe
+// can title itself with it without re-reading the queue.
+let updVersion='';
 function sndQueueEvents(q){
   const ids=new Set(q.slots.map(s=>s.nzo_id));
   if(qSeen!==null){
@@ -5052,6 +5397,58 @@ if(_pick) _pick.addEventListener('change', async ()=>{
   _pick.value='';
 });
 addEventListener('click', e=>{ if(e.target && (e.target.id==='idlepick'||e.target.id==='addNzbBtn')) _pick.click(); });
+
+// NZBLNK links (nzblnk.info). Some boards hand out a "nzblnk:?h=..."
+// link instead of an .nzb file, because the post's own names are
+// scrambled and there is no file to link to yet. The link carries a
+// header to look up; the daemon does the looking, in its own index
+// first and then in the indexers you have set up.
+//
+// The same page that takes a dropped .nzb takes one of these, so there
+// is nothing new to learn: paste it, or drag the link onto the window.
+function isNzblnk(s){ return /^\s*[<"']*nzblnk:/i.test(s||''); }
+async function addNzblnk(link){
+  toast(t('toast.lnkLooking','Looking that link up…'));
+  const sent=key;
+  try{
+    const r=await fetch(`/api?mode=addnzblnk&output=json&apikey=${encodeURIComponent(sent)}`
+      +`&link=${encodeURIComponent(link.trim())}`);
+    const j=await r.json().catch(()=>({}));
+    if(authFail(j)){ if(await ensureKey(sent)) return addNzblnk(link); return; }
+    if(!j.status){
+      const why = j.reason==='badlink' ? t('toast.lnkBad','That does not look like an nzblnk link.')
+        : j.reason==='notfound' ? t('toast.lnkNone','Nothing found for that link. The post may be too new to have been indexed, or too old to still be on your server.')
+        : j.reason==='toofast' ? t('toast.lnkFast','Too many links at once. Wait a moment and try again.')
+        : (tErr(j.error)||t('err.rejected','rejected'));
+      toast(why, true);
+      return;
+    }
+    (j.nzo_ids||[]).forEach(id=>qSeen&&qSeen.add(id));
+    snd('added'); say('added', t('say.added','Download added: {name}.',{name:sayShort(j.name||'')}));
+    toast(j.partial ? t('toast.lnkPartial','Added, but parts are missing so it may not finish.')
+      : t('toast.lnkAdded','Found it. Added to the queue.'));
+    tick();
+  }catch(e){ toast(e.message, true); }
+}
+// Paste anywhere that is not a field the user is typing into.
+addEventListener('paste', e=>{
+  const el=e.target;
+  if(el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName||''))) return;
+  const text=(e.clipboardData||window.clipboardData)?.getData('text')||'';
+  if(!isNzblnk(text)) return;
+  e.preventDefault();
+  addNzblnk(text);
+});
+// A link dragged off a board page arrives as text, not as a file, so
+// the .nzb drop handler above never sees it.
+addEventListener('dragover', e=>{ if(e.dataTransfer&&[...e.dataTransfer.types].includes('text/uri-list')) e.preventDefault(); });
+addEventListener('drop', e=>{
+  if(!e.dataTransfer||[...e.dataTransfer.types].includes('Files')) return;
+  const text=e.dataTransfer.getData('text/uri-list')||e.dataTransfer.getData('text')||'';
+  if(!isNzblnk(text)) return;
+  e.preventDefault(); _dragN=0; _dz.classList.remove('on');
+  addNzblnk(text);
+});
 
 // --- Settings view (M16): read get_config, write mode=config / server_* ---
 let inSettings=false, srvList=[], srvEditIdx=-1, srvTuned={}, srvAutoConn=false;
@@ -5413,7 +5810,7 @@ async function loadSettings(){
    ['s_rename_vcodec',c.rename_vcodec],['s_rename_acodec',c.rename_acodec],
    ['s_rename_source',c.rename_source],['s_rename_group',c.rename_group],
    ['s_rename_year_parens',c.rename_year_parens],['s_rename_quality_brackets',c.rename_quality_brackets],
-   ['s_rename_extra_words',c.rename_extra_words],
+   ['s_rename_extra_words',c.rename_extra_words],['s_rename_identify',c.rename_identify],
    ['s_rename_junk',c.rename_junk],['s_rename_media_only',c.rename_media_only]]
     .forEach(([id,v])=>{const el=document.getElementById(id);if(el&&document.activeElement!==el)el.checked=!!v;});
   renameToggles();
@@ -5447,6 +5844,11 @@ async function loadSettings(){
   const iEn=document.getElementById('s_index_enabled');
   if(iEn&&document.activeElement!==iEn) iEn.checked=!!c.index_enabled;
   put('s_index_groups', (c.index_groups||[]).join(', '));
+  // Spotnet: its own switch, same focus guard.
+  const spEn=document.getElementById('s_spot_enabled');
+  if(spEn&&document.activeElement!==spEn) spEn.checked=!!c.spot_enabled;
+  put('s_spot_groups', (c.spot_groups||[]).join(', '));
+  put('s_spot_backfill', c.spot_backfill);
   if(!document.querySelector('#interestRows :focus')) loadInterests();
   // Same focus guard as the other checkboxes: a poll must not yank a
   // control out from under someone mid-click.
@@ -5498,6 +5900,11 @@ async function loadSettings(){
   const ak=document.getElementById('s_apikey'), nk=document.getElementById('s_nzbkey');
   if(document.activeElement!==ak){ ak.value=''; ak.placeholder=c.has_apikey?t('ph.rotate','set: type a new key to rotate'):t('ph.apiunset','not set: type a key to require auth'); }
   if(document.activeElement!==nk){ nk.value=''; nk.placeholder=c.has_nzbkey?t('ph.rotate','set: type a new key to rotate'):t('ph.unset','not set'); }
+  // The terminal shouts about an open API; until now the page whispered
+  // (an empty input) while the Remote access card above it handed out
+  // LAN URLs and QR codes. Same fact, same volume, in both places.
+  const ob=document.getElementById('secOpenBadge'); if(ob) ob.style.display=c.has_apikey?'none':'';
+  const on=document.getElementById('remoteOpenNote'); if(on) on.style.display=c.has_apikey?'none':'';
   srvList=c.servers||[]; srvTuned=c.conntune||{}; srvAutoConn=!!c.auto_connections; renderServers(); renderSetup(c);
   if(!document.querySelector('#schedrows :focus')) renderSched(parseSchedText(c.schedule));
   if(!document.querySelector('#feedrows :focus')) renderFeeds(c.feeds||[]);
@@ -5847,6 +6254,13 @@ async function loadSetup(){
   const c=((await api('get_config')).config||{}).nzbfast;
   if(c) renderSetup(c);
 }
+// Boot call, like every other one-shot loader on this page. Without it
+// the strip was populated only by the non-English i18n re-render and by
+// opening Settings, so an English dashboard showed the card empty until
+// you happened to visit Settings. (Invisible until now: renderSetup was
+// shadowed by the first-run checklist's renderer, so the strip's own
+// callers were rendering the wrong thing anyway.)
+loadSetup();
 // Server editor.
 function renderServers(){
   const on=srvList.filter(s=>s.enabled!==false).length;
@@ -5878,17 +6292,26 @@ function renderServers(){
       }else{
         // Primary-load server: completion is a fair reliability signal -
         // but wait for a real sample before recommending anything.
-        const enough=(s.tried||0)>=2000, poor=enough&&c<90, cls=poor?'bad':(enough&&c<96?'warn':'dim');
-        comp=` <span class="${cls}" title="${escA(t('set.srv.comp.title','of all articles requested from this server over its lifetime, how many it actually had'))}">· ${t('set.srv.comp','{n}% completion',{n})}${poor?' - '+t('set.srv.comp.poor','poor completion, consider replacing'):''}</span>`;
+        // Tiered, not binary: 85% and 69% used to get the same red
+        // "replace it" verdict, and a settings page with three red rows
+        // teaches people to ignore red. Only a genuinely bad primary
+        // (<75%) gets the replacement advice; 75-89 is flagged amber
+        // without a prescription; 90+ is just a number.
+        const enough=(s.tried||0)>=2000, poor=enough&&c<75, low=enough&&!poor&&c<90;
+        const cls=poor?'bad':(low?'warn':'dim');
+        const note=poor?' - '+t('set.srv.comp.poor','poor completion, consider replacing')
+                  :(low?' - '+t('set.srv.comp.low','below par'):'');
+        comp=` <span class="${cls}" title="${escA(t('set.srv.comp.title','of all articles requested from this server over its lifetime, how many it actually had'))}">· ${t('set.srv.comp','{n}% completion',{n})}${note}</span>`;
       }
     }
     // Effective connections: auto-connections may cap below the configured
     // count (the measured knee - over-asking a provider was slower).
     const tv=(srvAutoConn&&srvTuned[s.host]&&srvTuned[s.host].connections>0)?srvTuned[s.host].connections:0;
-    const tuneNote=(tv&&tv<s.connections)?` · <span class="warn" title="${escA(t('set.srv.tuned.title','auto-connections measured this provider is fastest at {n} sockets: more were slower. Turn off auto-connections (Connection tuning) to use your set value.',{n:tv}))}">${t('set.srv.tuned','auto-tuned to {n}',{n:tv})}</span>`:'';
+    // dim, not warn: a measured optimum is a fact, not a problem to fix.
+    const tuneNote=(tv&&tv<s.connections)?` · <span class="dim" title="${escA(t('set.srv.tuned.title','auto-connections measured this provider is fastest at {n} sockets: more were slower. Turn off auto-connections (Connection tuning) to use your set value.',{n:tv}))}">${t('set.srv.tuned','auto-tuned to {n}',{n:tv})}</span>`:'';
     return `
     <div class="srvrow"${en?'':' style="opacity:.45"'}>
-      <span>${esc(s.host)}:${s.port}${s.tls?` <span title="${escA(t('set.srv.tls.title','Encrypted connection to this server'))}">🔒</span>`:''}${en?'':` <span class="warn">· ${t('set.srv.disabled','disabled')}</span>`}${s.level>0?` <span class="dim">· ${t('set.srv.fill','fill level {n}',{n:s.level})}</span>`:''}${s.group?` <span class="dim">· ${esc(s.group)}</span>`:''}${block}${comp}
+      <span>${esc(s.host)}:${s.port}${s.tls?` <span class="dim" title="${escA(t('set.srv.tls.title','Encrypted connection to this server'))}"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg></span>`:''}${en?'':` <span class="warn">· ${t('set.srv.disabled','disabled')}</span>`}${s.level>0?` <span class="dim">· ${t('set.srv.fill','fill level {n}',{n:s.level})}</span>`:''}${s.group?` <span class="dim">· ${esc(s.group)}</span>`:''}${block}${comp}
         <span class="hint">${tn('set.srv.connsN',s.connections,'{n} connection','{n} connections')}${tuneNote}${s.username?' · '+esc(s.username):''}${s.retention_days>0?' · '+t('set.srv.retention','{n}d retention',{n:s.retention_days}):''}</span><span class="hint" id="srvtest${i}"></span></span>
       <label class="srvon" title="${escA(en?t('set.srv.disable.title','Take this server out of the pool without removing it'):t('set.srv.enable.title','Put this server back in the pool'))}"><input type="checkbox"${en?' checked':''} aria-label="${escA(t('set.srv.enable','Enable'))}" onchange="toggleServer(${i},this.checked?1:0,this)"></label>
       <button class="ghost" title="${escA(t('set.srv.test.title','Connect and authenticate to check this server is reachable'))}" onclick="testServerRow(${i},this)">${t('set.srv.test','Test')}</button>
@@ -6209,7 +6632,9 @@ document.getElementById('ui_lang').value=LOCALES.includes(localStorage.nzbfastLo
 // Version never changes while the page is open - fetch it once, not per tick.
 // Show OUR version, not the SABnzbd-compatibility string in `version`
 // (that one exists so Sonarr/Radarr feature-gate correctly).
-api('version').then(v=>{ document.getElementById('ver').textContent='v'+(v.nzbfast||v.version); }).catch(()=>{});
+// "beta N" marks a between-releases build (local deploy or tester
+// bundle); a published release comes back with beta:"" and shows bare.
+api('version').then(v=>{ document.getElementById('ver').textContent='v'+(v.nzbfast||v.version)+(v.beta?' beta '+v.beta:''); }).catch(()=>{});
 // First-run welcome card: shown until a Usenet server is configured.
 // Re-checked when the user comes back from Settings (where servers are
 // added), so it disappears the moment setup is done.
@@ -6224,7 +6649,12 @@ function showAllCards(){ showAllCards.used=true; document.body.classList.remove(
 
 // The first-run checklist, built from the daemon's real config so a step
 // that is already satisfied reads as done instead of nagging.
-function renderSetup(c){
+//
+// NOT renderSetup: that name is already taken by the "Setup at a glance"
+// strip further up, and two function declarations of one name means the
+// later wins - so every caller of the strip's renderer was silently
+// running this one, and #setupGrid rendered blank.
+function renderSetupSteps(c){
   const groups=(c.index_groups||[]).length;
   const steps=[
     {done:!!c.servers_configured,
@@ -6264,7 +6694,7 @@ async function checkWelcome(){
     const c=((await api('get_config')).config||{}).nzbfast||{};
     const first = c.servers_configured===false;
     document.getElementById('welcomeCard').style.display = first ? '' : 'none';
-    if(first) renderSetup(c);
+    if(first) renderSetupSteps(c);
     // Only ADD the class here. showAllCards() removes it for the session,
     // and a re-poll must not undo that while the user is looking around.
     if(!first) document.body.classList.remove('firstrun');
@@ -6708,6 +7138,9 @@ function persistChartH(){
   if(document.hidden || innerHeight<300) return;
   const p=layoutPrefs();
   document.querySelectorAll('.chartwrap>canvas[id]').forEach(cv=>{
+    // Idle auto-compaction squashes wrappers temporarily; persisting that
+    // height would turn a transient state into the user's saved size.
+    if(cv.closest('.idlecompact')) return;
     const h=cv.parentElement.offsetHeight;
     if(h>=34) p.chartH[cv.id]=Math.min(h, 800);
   });

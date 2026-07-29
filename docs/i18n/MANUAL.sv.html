@@ -354,6 +354,7 @@ konton och blockkonton. Blockkonton visar livstidsförbrukning mot sin storlek.<
 plockas upp inom 5 sekunder och filen tas bort. Rikta din webbläsares nedladdnings-
 mapp mot den för grabbar med ett klick från indexersidor.</td></tr>
 <tr><td><b>Från en URL</b></td><td>Klistra in en NZB-länk (API <code>mode=addurl</code>, eller via valfri ansluten app).</td></tr>
+<tr><td><b>nzblnk:-länkar</b></td><td>Klistra in en <code>nzblnk:</code>-länk var som helst på panelen, eller dra in den. Har du installerat från macOS-DMG:en eller Windows-installeraren kan du också klicka på en direkt på ett board. Se <a href="#nzblnk">nzblnk-länkar</a> nedan.</td></tr>
 <tr><td><b>Bläddra i indexet</b></td><td>Klicka på valfri komplett release i Bläddra-kortet.</td></tr>
 <tr><td><b>Bevakningslista / RSS</b></td><td>Automatiskt - se <a href="#automation">Automatisering</a>.</td></tr>
 <tr><td><b>Sonarr/Radarr m.fl.</b></td><td>De skickar grabbar rakt till kön - se <a href="#arr">§11</a>.</td></tr>
@@ -364,10 +365,36 @@ mapp mot den för grabbar med ett klick från indexersidor.</td></tr>
 <li><b>Kategorier</b> är fritt formulerade etiketter; var och en blir en undermapp i din nedladdnings-
 mapp, och Smarta mappar (se <a href="#automation">§10</a>) kan tilldela dem per regel.</li>
 <li><b>Prioriteter</b>: Tvinga &gt; Hög &gt; Normal &gt; Låg. Tvinga kringgår paus och kvot.</li>
-<li><b>Lösenord</b> för krypterade arkiv plockas upp automatiskt från
-<code>&lt;meta type="password"&gt;</code> inuti NZB:en eller ett
-<code>Name{{password}}.nzb</code>-filnamn, och kan anges per jobb via
-API:et eller efteråt från Historik (🔑).</li>
+<li><b>Lösenord</b> till krypterade arkiv plockas upp automatiskt från
+<code>&lt;meta type="password"&gt;</code> inuti NZB:n, från ett filnamn
+<code>Name{{password}}.nzb</code> eller från fältet <code>p=</code> i en
+<a href="#nzblnk">nzblnk-länk</a>, och kan anges per jobb via API:et eller efteråt från
+Historik (🔑).</li>
+</ul>
+
+<h3 id="nzblnk">nzblnk-länkar</h3>
+<p>Vissa board, mest tyska och nederländska, publicerar en <code>nzblnk:</code>-länk
+i stället för en NZB-fil. Inlägget är fördunklat, så det finns inget filnamn att länka
+till. Länken bär i stället ett huvud, <code>h=</code>, som är en söknyckel och inte en
+plats, plus en valfri titel <code>t=</code>, ett lösenord <code>p=</code> och en grupp
+<code>g=</code>. Någon måste först gå och hitta inlägget.</p>
+<p>nzbfast slår upp huvudet i sitt eget index först, vilket inte kräver något nätverk
+alls, och bara om det missar frågar det sökindexerarna du har ställt in (Inställningar →
+Sökindexerare, <a href="#settings">§9</a>), under samma dagsbudgetar och samma backoff
+som varje annan sökning. Titeln blir jobbets namn och lösenordet läggs på jobbet
+automatiskt.</p>
+<ul>
+<li><b>Klistra in eller dra</b> fungerar på varje installation, Docker och NAS
+inräknade: kopiera länken från boardet och klistra in den var som helst på panelen.</li>
+<li><b>Att klicka</b> på en länk kräver att schemat är registrerat hos ditt skrivbord.
+Appen från <b>macOS-DMG:en</b> registrerar det, och <b>Windows-installeraren</b> erbjuder
+det som en uppgift: den frågar först och lämnar schemat i fred om NZB Monkey eller
+NZBDonkey redan håller det. Den rena macOS-tarbollen, Homebrew och Linux-installationerna
+har ingen skrivbordshanterare, där är inklistring vägen in.</li>
+<li>Uppslagningen är hastighetsbegränsad med flit. Ett registrerat schema ligger en
+webbläsarfråga bort från varje sida du besöker, så länkar har ett tak per minut och bara
+de första under en minut får nå dina indexerare; därefter besvaras de enbart ur det
+lokala indexet.</li>
 </ul>
 
 <h2 id="wall">6 · Posterväggen</h2>
@@ -440,11 +467,42 @@ ta in eller ur poolen vilken server som helst. Varje server har:</p>
 <table>
 <tr><th>Fält</th><th>Anmärkningar</th></tr>
 <tr><td>Host / port</td><td>Använd SSL-port <b>563</b>. TLS kostar inget mätbart - nzbfast krypterar alltid.</td></tr>
-<tr><td>Användarnamn / lösenord</td><td>Lagras lokalt i <code>config.local.json</code>, visas aldrig tillbaka till webbläsaren. Att lämna lösenordet tomt vid redigering behåller det sparade.</td></tr>
+<tr><td>Användarnamn / lösenord</td><td>Lagras lokalt i <code>config.local.json</code>, visas aldrig tillbaka till webbläsaren. Att lämna lösenordet tomt vid redigering behåller det sparade. Lösenord är <a href="#passwords">fördunklade på disk, inte krypterade</a>.</td></tr>
 <tr><td>Anslutningar</td><td>Samtidiga anslutningar per server. Använd <b>Anslutningstrimning</b> (<a href="#performance">§13</a>) för att hitta varje providers optimala punkt i stället för att gissa högt.</td></tr>
 <tr><td>Nivå (tier)</td><td>0 = primär; högre nivåer är fyllnadsservrar, som bara tillfrågas om artiklar varje lägre nivå missat. Sätt obegränsade konton på 0, blockkonton på 1+.</td></tr>
 <tr><td>Blockstorlek (GB)</td><td>För block-konton (betala per GB): nzbfast spårar livstidsförbrukning mot detta och slutar använda servern när den är slut (varning vid 85 %).</td></tr>
 </table>
+<h3 id="passwords">Så lagras dina leverantörslösenord</h3>
+<p>Leverantörslösenord i <code>config.local.json</code> är <b>fördunklade, inte
+krypterade</b>. De sparas som <code>obf1:</code> följt av en kodad form, så att filen
+inte läses som klartext om den dyker upp i en skärmbild, ett foruminlägg, en
+felrapport eller på en skärm som någon annan kan se.</p>
+<p>Låt oss vara tydliga med vad det ger dig och vad det inte ger:</p>
+<ul>
+<li><b>Det är inte kryptering och skyddar inte alls mot någon som har filen.</b>
+Metoden finns i vår öppna källkod och avkodaren följer med inuti nzbfast, så den som
+har filen får fram lösenordet på några sekunder. Behandla filen som hemlig precis som
+du skulle gjort om lösenorden var läsbara.</li>
+<li><b>Det tar bort den slarviga läckan</b>, som är den vanliga. Konfigurationer
+klistras in i supporttrådar och fastnar på skärmbilder betydligt oftare än de stjäls
+från disk.</li>
+<li>Ett lösenord du själv skrivit in som klartext fungerar fortfarande. nzbfast läser
+båda formerna, så handredigerade konfigurationer och import från andra klienter går
+aldrig sönder; nästa gång det sparar skriver det den fördunklade formen.</li>
+<li>Filen skrivs dessutom läsbar endast för kontot som kör nzbfast (läge 0600 på macOS
+och Linux).</li>
+</ul>
+<p>Som jämförelse: <b>NZBGet och SABnzbd lagrar båda leverantörslösenord som läsbar
+klartext</b> i sina konfigurationsfiler. Vi tycker att fördunkling är en liten
+förbättring på det, inte en säkerhetsfunktion.</p>
+<p><b>Varför inte systemets nyckelring?</b> macOS Keychain, Windows Credential Manager
+och Linux hemlighetstjänster skulle ge verkligt skydd, och vi kan komma att återvända
+till det. Två saker hindrar oss i dag. Åtkomst till nyckelringen hänger på programmets
+identitet, och nzbfast är ännu inte kodsignerat, så dialogerna och beteendet efter
+varje uppdatering blir dåliga. Och en stor andel av installationerna är Docker,
+skärmlösa servrar och NAS-lådor där det inte finns någon nyckelring alls, vilket skulle
+lämna två olika lagringsvägar att hålla korrekta. Ett enda välförstått format som
+beter sig likadant överallt är tills vidare den bättre affären.</p>
 <p>Två ytterligare alternativ per server har ännu ingen kontroll i panelen: lägg in
 dem för hand i serverns post i <code>config.local.json</code>
 (se <a href="#files">§17</a>) och starta om.</p>
@@ -555,8 +613,21 @@ och <code>SAB_*</code>-miljö - befintliga SAB-skript fungerar oförändrade),
 och <b>TV-arkivering</b> (se <a href="#automation">§10</a>).</p>
 
 <h3>Indexering <span class="pill live">live</span></h3>
+<div class="note"><b>Den inbyggda indexeraren är avstängd som standard.</b> Den hittar
+inlägg som postats under ett riktigt filnamn, och en stor och växande del av Usenet
+postas medvetet utan ett: slumpmässigt ämne, slumpmässiga filnamn inuti, nedsläppt i en
+samlingsgrupp. Det riktiga namnet finns bara i en NZB som uppladdaren publicerar
+någon annanstans, alltså fanns det aldrig på Usenet för någon skanner att läsa. Mätt på
+vårt eget index gav 14,8 miljoner skannade inlägg omkring 31 000 bläddringsbara
+releaser, ungefär en på femhundra. Fortsätt använda kommersiella indexerare och lägg in
+dem under Inställningar → Sökindexerare, så att du kan söka i dem från väggen. Slå på
+det här om du följer bestämda grupper där folk fortfarande postar under riktiga namn,
+eller om du vill se vad din leverantör faktiskt bär. Med reglaget av skannas eller
+hämtas ingenting, ingen databas skapas, och väggen, Bläddra, bevakningslistan och
+newznab-flödet är dolda.</div>
 <table>
 <tr><th>Inställning</th><th>Vad den gör</th></tr>
+<tr><td>Inbyggd indexerare</td><td>Huvudreglaget, <b>av tills du slår på det</b>. Av innebär ingen skanning, inga metadatasökningar, ingen tillgänglighetsprovtagning och inget newznab-flöde; ett index som redan finns på disk behålls (det finns en raderaknapp), så att slå på igen återupptar i stället för att skanna om.</td></tr>
 <tr><td>Grupper</td><td>Newsgroups som den inbyggda indexeraren skannar (t.ex. <code>alt.binaries.teevee</code>).</td></tr>
 <tr><td>Skanningsintervall</td><td>Sekunder mellan pass (standard 900).</td></tr>
 <tr><td>Backfill-artiklar</td><td>Headers som hämtas vid en grupps allra första skanning.</td></tr>
@@ -632,8 +703,14 @@ beter sig alla som *arr-verktygen förväntar sig.</p>
 <code>movie</code>-frågor från sitt eget index över dina bevakade grupper, och
 <code>/getnzb/&lt;id&gt;</code> lämnar tillbaka NZB:en.</li>
 </ol>
-<div class="note"><b>Varför bry sig?</b>En självhostad indexerare av exakt de grupper du
-bryr dig om: inga konton, inga gränser för API-anrop, retention så djup som du låter den skanna.</div>
+<div class="note"><b>Slå på den inbyggda indexeraren först</b> (Inställningar →
+Indexering). Den är avstängd som standard, och så länge den är det svarar den här
+fasaden på varje fråga med <code>&lt;error code="101"&gt;</code> i stället för ett tomt
+resultat, så ett misstag syns när du lägger till indexeraren och inte veckor senare.<br><br>
+<b>Varför bry sig?</b> En egen indexerare över precis de grupper du bryr dig om: inga
+konton, inga API-taktgränser, retention så djup som du låter den skanna. Den är ett
+tillägg till dina vanliga indexerare snarare än en ersättning, eftersom den bara hittar
+det som postats under ett riktigt filnamn.</div>
 
 <h2 id="remotes">12 · Telefon &amp; fjärrappar</h2>
 <p>nzbfast implementerar <em>båda</em> de stora fjärrstyrningsprotokollen, så nästan varje
@@ -803,10 +880,10 @@ uttryckligt <code>--post-server</code> och väljer aldrig server åt dig.</p>
 <p>Bas-slutpunkt: <code>http://host:6789/api?mode=…&amp;apikey=…&amp;output=json</code> -
 SABnzbd-kompatibel, så befintliga SAB-integrationer fungerar oförändrade. Två nycklar:
 <b>API-nyckeln</b> (full kontroll) och <b>NZB-nyckeln</b> (enbart tillägg:
-<code>addfile</code>/<code>addurl</code>).</p>
+<code>addfile</code>/<code>addurl</code>). <code>addnzblnk</code> ingår med flit inte i uppsättningen för enbart tillägg: att lösa upp en länk kan förbruka mätt indexerarkvot, vilket en nyckel för enbart tillägg inte har med att göra.</p>
 <table>
 <tr><th>Område</th><th>Lägen</th></tr>
-<tr><td>Kö</td><td><code>queue</code> (med <code>name=delete/pause/resume/priority/switch</code>), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>retry</code>, <code>set_password</code></td></tr>
+<tr><td>Kö</td><td><code>queue</code> (med <code>name=delete/pause/resume/priority/switch</code>), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>addnzblnk</code>, <code>retry</code>, <code>set_password</code></td></tr>
 <tr><td>Info</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code></td></tr>
 <tr><td>Konfig</td><td><code>get_config</code>, <code>config&amp;name=&lt;setting&gt;&amp;value=…</code> (varje inställningsfält), <code>server_save/delete/test/enable/reorder</code>, <code>import_probe/apply</code></td></tr>
 <tr><td>Index &amp; vägg</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, plus newznab på <code>/api?t=caps|search|tvsearch|movie</code> och <code>/getnzb/&lt;id&gt;</code></td></tr>
@@ -819,7 +896,7 @@ SABnzbd-kompatibel, så befintliga SAB-integrationer fungerar oförändrade. Tv�
 <h2 id="files">17 · Filer &amp; platser</h2>
 <table>
 <tr><th>Fil</th><th>Innehåll</th></tr>
-<tr><td><code>config.local.json</code></td><td>Serverinloggningar och alternativ per server. Skapas av guiden; redigerbar i Inställningar. Håll den privat.</td></tr>
+<tr><td><code>config.local.json</code></td><td>Serverinloggningar och alternativ per server. Skapas av guiden; redigerbar i Inställningar. Håll den privat. Lösenord är <a href="#passwords">fördunklade, inte krypterade</a>.</td></tr>
 <tr><td><code>settings.json</code></td><td>Varje inställning som ändrats på instrumentpanelen. Ligger bredvid config; UI-värden åsidosätter kommandoradsflaggor. Radera en nyckel (eller filen) för att falla tillbaka på flaggor/standardvärden.</td></tr>
 <tr><td><code>apikey</code></td><td>API-nyckeln nzbfast skapade åt sig själv vid en första körning (<a href="#firstrun-key">§2</a>). Ligger bredvid config; läsbar endast för kontot som kör nzbfast på macOS och Linux. Radera den inte för att få en ny nyckel: på en installation som redan körts ersätts den inte av något, och daemonen kommer tillbaka helt utan nyckel. Sätt en ny under Inställningar → Säkerhet i stället.</td></tr>
 <tr><td><code>index.db</code></td><td>Releaseindexet (SQLite) + väggmetadata. Säkert att radera - det byggs om från skanning (Inställningar → Indexering → Radera gör detta åt dig).</td></tr>

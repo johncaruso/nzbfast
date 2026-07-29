@@ -43,7 +43,7 @@ jobs:
         working-directory: crates/nzbkit/fuzz
         run: |
           set -e
-          for t in yenc_decode nzb_parse par2_parse rar_extract mkv_parse; do
+          for t in yenc_decode nzb_parse nzblnk_parse par2_parse rar_extract mkv_parse; do
             echo "::group::fuzz $t"
             cargo +nightly fuzz run "$t" -- \
               -max_total_time=60 -rss_limit_mb=4096 -timeout=10

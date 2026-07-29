@@ -39,14 +39,52 @@ fn http_post(port: u16, req: &str, content_type: &str, body: &[u8]) -> (u16, Str
 }
 
 /// (status, body) off the wire. Lossy because /art bodies are binary.
+///
+/// De-chunks, because tiny_http sends `Transfer-Encoding: chunked` for
+/// any response at or above its 32 KB `chunked_threshold` - which /wall
+/// (~175 KB) is. Without this the "body" carries a `\r\n<hex>\r\n` chunk
+/// header every 8192 bytes, wherever that falls: the substring
+/// assertions below then hold only for as long as no boundary happens to
+/// land inside the string being searched for, and an ordinary edit to
+/// the page can move one there. (http_wedge.rs had the same helper and
+/// the same latent break, but read strictly rather than lossily, so it
+/// failed outright the day a boundary split a multi-byte character.)
 fn split_response(bytes: &[u8]) -> (u16, String) {
-    let out = String::from_utf8_lossy(bytes).into_owned();
-    let status: u16 = out
-        .split_whitespace()
-        .nth(1)
-        .and_then(|c| c.parse().ok())
-        .unwrap_or(0);
-    (status, out.split("\r\n\r\n").nth(1).unwrap_or("").to_string())
+    let head_end = bytes.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4);
+    let head = String::from_utf8_lossy(&bytes[..head_end.unwrap_or(bytes.len())]).into_owned();
+    let status: u16 =
+        head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    let Some(at) = head_end else { return (status, String::new()) };
+    let body = &bytes[at..];
+    let body = if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+        dechunk(body)
+    } else {
+        body.to_vec()
+    };
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// Minimal `Transfer-Encoding: chunked` decoder - enough for what
+/// tiny_http emits (hex length, CRLF, bytes, CRLF, terminated by a
+/// zero-length chunk). Chunk extensions after a `;` are tolerated.
+fn dechunk(mut b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    while let Some(nl) = b.windows(2).position(|w| w == b"\r\n") {
+        let line = String::from_utf8_lossy(&b[..nl]);
+        let n = usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
+            .unwrap_or(0);
+        if n == 0 {
+            break; // terminating chunk
+        }
+        let (start, end) = (nl + 2, nl + 2 + n);
+        if end > b.len() {
+            out.extend_from_slice(&b[start.min(b.len())..]); // truncated
+            break;
+        }
+        out.extend_from_slice(&b[start..end]);
+        b = &b[(end + 2).min(b.len())..]; // skip the chunk's trailing CRLF
+    }
+    out
 }
 
 /// A request to the daemon, response headers and all.

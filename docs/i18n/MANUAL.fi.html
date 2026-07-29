@@ -354,6 +354,7 @@ mitatuille ja lohkotileille. Lohkotilit näyttävät elinaikaisen käytön kokoa
 poimitaan 5 sekunnin sisällä ja tiedosto poistetaan. Ohjaa selaimesi latauskansio
 siihen saadaksesi yhden napsautuksen nappaukset indeksoijasivustoilta.</td></tr>
 <tr><td><b>URL:sta</b></td><td>Liitä NZB-linkki (API <code>mode=addurl</code> tai minkä tahansa yhdistetyn sovelluksen kautta).</td></tr>
+<tr><td><b>nzblnk:-linkit</b></td><td>Liitä <code>nzblnk:</code>-linkki mihin tahansa kohtaan hallintapaneelia tai raahaa se sisään. Jos asensit macOS-DMG:stä tai Windows-asennusohjelmasta, voit myös napsauttaa linkkiä suoraan boardilla. Katso <a href="#nzblnk">nzblnk-linkit</a> alempaa.</td></tr>
 <tr><td><b>Selaa indeksiä</b></td><td>Napsauta mitä tahansa täydellistä julkaisua Selaa-kortissa.</td></tr>
 <tr><td><b>Seurantalista / RSS</b></td><td>Automaattinen - katso <a href="#automation">Automaatio</a>.</td></tr>
 <tr><td><b>Sonarr/Radarr yms.</b></td><td>Ne lähettävät nappaukset suoraan jonoon - katso <a href="#arr">§11</a>.</td></tr>
@@ -364,10 +365,38 @@ siihen saadaksesi yhden napsautuksen nappaukset indeksoijasivustoilta.</td></tr>
 <li><b>Kategoriat</b> ovat vapaamuotoisia nimilappuja; kustakin tulee latauskansiosi
 alikansio, ja Älykkäät kansiot (katso <a href="#automation">§10</a>) voivat määrittää ne säännöllä.</li>
 <li><b>Prioriteetit</b>: Pakota &gt; Korkea &gt; Normaali &gt; Matala. Pakota ohittaa keskeytyksen ja kiintiön.</li>
-<li><b>Salasanat</b> salatuille arkistoille poimitaan automaattisesti
-<code>&lt;meta type="password"&gt;</code>-kentästä NZB:n sisältä tai
-<code>Name{{password}}.nzb</code>-tiedostonimestä, ja ne voidaan antaa työkohtaisesti
-API:n kautta tai jälkikäteen Historiasta (🔑).</li>
+<li><b>Salatun arkiston salasanat</b> poimitaan automaattisesti NZB:n sisältä kohdasta
+<code>&lt;meta type="password"&gt;</code>, tiedostonimestä
+<code>Name{{password}}.nzb</code> tai <a href="#nzblnk">nzblnk-linkin</a> kentästä
+<code>p=</code>, ja ne voi antaa työkohtaisesti API:n kautta tai jälkikäteen
+Historiasta (🔑).</li>
+</ul>
+
+<h3 id="nzblnk">nzblnk-linkit</h3>
+<p>Osa boardeista, etenkin saksalaiset ja hollantilaiset, julkaisee
+<code>nzblnk:</code>-linkin NZB-tiedoston sijaan. Postaus on hämärretty, joten
+tiedostonimeä, johon linkittää, ei ole. Linkki kantaa sen sijaan otsikkoa
+<code>h=</code>, joka on hakuavain eikä sijainti, sekä valinnaisen otsikon
+<code>t=</code>, salasanan <code>p=</code> ja ryhmän <code>g=</code>. Postaus on siis
+ensin etsittävä.</p>
+<p>nzbfast hakee otsikkoa ensin omasta indeksistään, mikä ei vaadi verkkoa lainkaan, ja
+vasta jos se ei osu, se kysyy määrittämiltäsi hakuindeksoijilta (Asetukset →
+Hakuindeksoijat, <a href="#settings">§9</a>) samoilla päivittäisillä budjeteilla ja
+samalla perääntymisellä kuin mikä tahansa muu haku. Otsikosta tulee työn nimi ja
+salasana liitetään työhön automaattisesti.</p>
+<ul>
+<li><b>Liittäminen tai raahaaminen</b> toimii jokaisessa asennuksessa, Docker ja
+NAS-laitteet mukaan lukien: kopioi linkki boardilta ja liitä se mihin tahansa kohtaan
+hallintapaneelia.</li>
+<li><b>Napsauttaminen</b> edellyttää, että skeema on rekisteröity työpöydällesi.
+<b>macOS-DMG:n</b> sovellus rekisteröi sen, ja <b>Windows-asennusohjelma</b> tarjoaa
+sitä tehtävänä: se kysyy ensin ja jättää skeeman rauhaan, jos NZB Monkey tai NZBDonkey
+pitää sitä jo hallussaan. Pelkällä macOS-tarballilla, Homebrew'llä ja Linux-asennuksilla
+ei ole työpöytäkäsittelijää, niissä liittäminen on tie sisään.</li>
+<li>Ratkaisu on tarkoituksella nopeusrajoitettu. Rekisteröity skeema on yhden
+selainkyselyn päässä jokaiselta sivulta, jolla käyt, joten linkeillä on minuuttikatto ja
+vain minuutin ensimmäiset saavat tavoittaa indeksoijasi; sen jälkeen vastaus tulee
+pelkästä paikallisesta indeksistä.</li>
 </ul>
 
 <h2 id="wall">6 · Julisteseinä</h2>
@@ -441,11 +470,42 @@ tahansa palvelin mukaan pooliin tai pois siitä. Jokaisella palvelimella on:</p>
 <table>
 <tr><th>Kenttä</th><th>Huomiot</th></tr>
 <tr><td>Osoite / portti</td><td>Käytä SSL-porttia <b>563</b>. TLS ei maksa mitattavasti mitään - nzbfast salaa aina.</td></tr>
-<tr><td>Käyttäjänimi / salasana</td><td>Tallennetaan paikallisesti tiedostoon <code>config.local.json</code>, ei koskaan näytetä takaisin selaimelle. Salasanan jättäminen tyhjäksi muokatessa säilyttää tallennetun.</td></tr>
+<tr><td>Käyttäjänimi / salasana</td><td>Tallennetaan paikallisesti tiedostoon <code>config.local.json</code>, ei koskaan näytetä takaisin selaimelle. Salasanan jättäminen tyhjäksi muokatessa säilyttää tallennetun. Salasanat ovat <a href="#passwords">levyllä hämärrettyjä, ei salattuja</a>.</td></tr>
 <tr><td>Yhteydet</td><td>Palvelinkohtaiset samanaikaiset yhteydet. Käytä <b>Yhteyksien viritystä</b> (<a href="#performance">§13</a>) löytääksesi kunkin palveluntarjoajan makeimman kohdan sen sijaan, että arvaisit korkealta.</td></tr>
 <tr><td>Taso / porras</td><td>0 = ensisijainen; korkeammat tasot ovat täyttöpalvelimia, joilta kysytään vain artikkeleita, jotka jokainen alempi taso jätti väliin. Aseta rajoittamattomat tilit tasolle 0, lohkotilit tasolle 1+.</td></tr>
 <tr><td>Lohkon koko (GB)</td><td>Lohko- (maksa-per-GB) tileille: nzbfast seuraa elinaikaista käyttöä tätä vasten ja lakkaa käyttämästä palvelinta, kun se on käytetty loppuun (varoitus 85%:ssa).</td></tr>
 </table>
+<h3 id="passwords">Miten palveluntarjoajien salasanat tallennetaan</h3>
+<p>Palvelinsalasanat tiedostossa <code>config.local.json</code> ovat <b>hämärrettyjä,
+eivät salattuja</b>. Ne tallennetaan muodossa <code>obf1:</code> ja sen perässä
+koodattu esitys, jotta tiedosto ei lue selväkielisenä, jos se päätyy kuvakaappaukseen,
+foorumiviestiin, vikailmoitukseen tai näytölle, jonka joku muu näkee.</p>
+<p>Sanotaan selvästi, mitä se antaa ja mitä ei:</p>
+<ul>
+<li><b>Se ei ole salausta eikä suojaa lainkaan siltä, jolla tiedosto on.</b> Menetelmä
+on julkisessa lähdekoodissamme ja purkaja kulkee nzbfastin sisällä, joten tiedoston
+haltija saa salasanan esiin sekunneissa. Kohtele tiedostoa salaisena täsmälleen niin
+kuin kohtelisit, jos salasanat olisivat luettavissa.</li>
+<li><b>Se poistaa huolimattoman vuodon</b>, ja juuri se on yleinen. Asetustiedostoja
+liimataan tukiketjuihin ja jää kuvakaappauksiin paljon useammin kuin niitä varastetaan
+levyltä.</li>
+<li>Itse selväkielisenä kirjoittamasi salasana toimii yhä. nzbfast lukee molemmat
+muodot, joten käsin muokatut asetukset ja tuonnit muista ohjelmista eivät koskaan
+hajoa; se kirjoittaa hämärretyn muodon seuraavalla tallennuksella.</li>
+<li>Tiedosto kirjoitetaan lisäksi luettavaksi vain sille tilille, joka ajaa nzbfastia
+(tila 0600 macOSissa ja Linuxissa).</li>
+</ul>
+<p>Vertailun vuoksi: <b>NZBGet ja SABnzbd tallentavat molemmat palvelinsalasanat
+luettavana selväkielenä</b> asetustiedostoihinsa. Pidämme hämärrystä pienenä
+parannuksena siihen, emme tietoturvaominaisuutena.</p>
+<p><b>Miksei järjestelmän avainnippu?</b> macOSin avainnippu, Windowsin
+tunnistetietojen hallinta ja Linuxin salaisuuspalvelut antaisivat todellista suojaa, ja
+saatamme palata asiaan. Kaksi asiaa estää sen tänään. Avainnipun käyttö on sidottu
+sovelluksen identiteettiin, eikä nzbfastia ole vielä allekirjoitettu, joten kyselyt ja
+käytös jokaisen päivityksen jälkeen ovat huonoja. Ja iso osa asennuksista on Dockeria,
+näytöttömiä palvelimia ja NAS-laitteita, joissa avainnippua ei ole lainkaan, mikä
+jättäisi kaksi eri tallennuspolkua pidettäväksi oikeina. Yksi hyvin ymmärretty muoto,
+joka käyttäytyy kaikkialla samoin, on toistaiseksi parempi kauppa.</p>
 <p>Kahdelle muulle palvelinkohtaiselle asetukselle ei vielä ole hallintaa
 koontinäytössä: lisää ne käsin kyseisen palvelimen kohtaan tiedostossa
 <code>config.local.json</code> (katso <a href="#files">§17</a>) ja käynnistä
@@ -560,8 +620,21 @@ ja <code>SAB_*</code>-ympäristöllä - olemassa olevat SAB-komentosarjat toimiv
 ja <b>TV-arkistointi</b> (katso <a href="#automation">§10</a>).</p>
 
 <h3>Indeksointi <span class="pill live">live</span></h3>
+<div class="note"><b>Sisäänrakennettu indeksoija on oletuksena pois päältä.</b> Se
+löytää postaukset, jotka on julkaistu oikealla tiedostonimellä, ja iso ja kasvava osa
+Usenetistä julkaistaan tarkoituksella ilman sellaista: satunnainen aihe, satunnaiset
+tiedostonimet sisällä, pudotettuna kaatoryhmään. Oikea nimi elää vain NZB-tiedostossa,
+jonka lataaja julkaisee muualla, joten se ei koskaan ollut Usenetissä minkään skannerin
+luettavaksi. Omalla indeksillämme mitattuna 14,8 miljoonaa skannattua postausta tuotti
+noin 31 000 selattavaa julkaisua, karkeasti yksi viidestäsadasta. Jatka kaupallisten
+indeksoijien käyttöä ja lisää ne kohtaan Asetukset → Hakuindeksoijat, jotta voit hakea
+niistä seinältä. Kytke tämä päälle, jos seuraat tiettyjä ryhmiä, joissa yhä
+julkaistaan oikeilla nimillä, tai jos haluat nähdä, mitä palveluntarjoajasi oikeasti
+kantaa. Kytkin pois päältä: mitään ei skannata eikä haeta, tietokantaa ei luoda, ja
+seinä, Selaa, seurantalista ja newznab-syöte ovat piilossa.</div>
 <table>
 <tr><th>Asetus</th><th>Mitä se tekee</th></tr>
+<tr><td>Sisäänrakennettu indeksoija</td><td>Pääkytkin, <b>pois päältä ellet kytke sitä</b>. Pois tarkoittaa: ei skannausta, ei metatietohakuja, ei saatavuusotantaa eikä newznab-syötettä; levyllä jo oleva indeksi säilytetään (poistopainike on olemassa), joten päälle kytkeminen jatkaa sen sijaan että skannaisi uudelleen.</td></tr>
 <tr><td>Ryhmät</td><td>Keskusteluryhmät, joita sisäänrakennettu indeksoija skannaa (esim. <code>alt.binaries.teevee</code>).</td></tr>
 <tr><td>Skannausväli</td><td>Sekunteja kierrosten välillä (oletus 900).</td></tr>
 <tr><td>Täydennysartikkelit</td><td>Otsakkeet, jotka haetaan ryhmän aivan ensimmäisellä skannauksella.</td></tr>
@@ -637,8 +710,14 @@ käyttäytyvät kaikki niin kuin *arrit odottavat.</p>
 <code>movie</code>-kyselyt omasta indeksistään valvotuista ryhmistäsi, ja
 <code>/getnzb/&lt;id&gt;</code> palauttaa NZB:n.</li>
 </ol>
-<div class="note"><b>Miksi vaivautua?</b>Itse ylläpidetty indeksoija juuri niistä ryhmistä, joista
-välität: ei tilejä, ei API-kutsurajoja, säilytys niin syvälle kuin annat sen skannata.</div>
+<div class="note"><b>Kytke sisäänrakennettu indeksoija ensin päälle</b> (Asetukset →
+Indeksointi). Se on oletuksena pois päältä, ja niin kauan kuin se on, tämä julkisivu
+vastaa jokaiseen kyselyyn <code>&lt;error code="101"&gt;</code> tyhjän tuloksen sijaan,
+joten virhe näkyy silloin kun lisäät indeksoijan eikä viikkoja myöhemmin.<br><br>
+<b>Miksi vaivautua?</b> Itse ylläpidetty indeksoija juuri niistä ryhmistä, jotka sinua
+kiinnostavat: ei tilejä, ei API-kutsurajoja, säilyvyys niin syvälle kuin annat sen
+skannata. Se on lisä tavanomaisiin indeksoijiisi eikä korvaaja, koska se löytää vain
+sen, mikä julkaistiin oikealla tiedostonimellä.</div>
 
 <h2 id="remotes">12 · Puhelin- &amp; etäsovellukset</h2>
 <p>nzbfast toteuttaa <em>molemmat</em> suuret etäohjausprotokollat, joten lähes jokainen
@@ -811,10 +890,10 @@ puolestasi.</p>
 <p>Peruspäätepiste: <code>http://host:6789/api?mode=…&amp;apikey=…&amp;output=json</code> -
 SABnzbd-yhteensopiva, joten olemassa olevat SAB-integraatiot toimivat muuttumatta. Kaksi avainta:
 <b>API-avain</b> (täysi hallinta) ja <b>NZB-avain</b> (vain lisäävä:
-<code>addfile</code>/<code>addurl</code>).</p>
+<code>addfile</code>/<code>addurl</code>). <code>addnzblnk</code> ei tarkoituksella kuulu pelkän lisäyksen joukkoon: linkin ratkaiseminen voi kuluttaa mitattua indeksoijakiintiötä, mikä ei kuulu pelkkään lisäykseen tarkoitetulle tunnukselle.</p>
 <table>
 <tr><th>Alue</th><th>Tilat</th></tr>
-<tr><td>Jono</td><td><code>queue</code> (nimellä <code>name=delete/pause/resume/priority/switch</code>), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>retry</code>, <code>set_password</code></td></tr>
+<tr><td>Jono</td><td><code>queue</code> (nimellä <code>name=delete/pause/resume/priority/switch</code>), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>addnzblnk</code>, <code>retry</code>, <code>set_password</code></td></tr>
 <tr><td>Tiedot</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code></td></tr>
 <tr><td>Määritys</td><td><code>get_config</code>, <code>config&amp;name=&lt;setting&gt;&amp;value=…</code> (jokainen Asetukset-kenttä), <code>server_save/delete/test/enable/reorder</code>, <code>import_probe/apply</code></td></tr>
 <tr><td>Indeksi &amp; seinä</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, sekä newznab osoitteessa <code>/api?t=caps|search|tvsearch|movie</code> ja <code>/getnzb/&lt;id&gt;</code></td></tr>
@@ -827,7 +906,7 @@ SABnzbd-yhteensopiva, joten olemassa olevat SAB-integraatiot toimivat muuttumatt
 <h2 id="files">17 · Tiedostot &amp; sijainnit</h2>
 <table>
 <tr><th>Tiedosto</th><th>Sisältö</th></tr>
-<tr><td><code>config.local.json</code></td><td>Palvelintunnukset ja palvelinkohtaiset valinnat. Velhon luoma; muokattavissa Asetuksissa. Pidä se yksityisenä.</td></tr>
+<tr><td><code>config.local.json</code></td><td>Palvelintunnukset ja palvelinkohtaiset valinnat. Velhon luoma; muokattavissa Asetuksissa. Pidä se yksityisenä. Salasanat ovat <a href="#passwords">hämärrettyjä, ei salattuja</a>.</td></tr>
 <tr><td><code>settings.json</code></td><td>Jokainen koontinäytöllä muutettu asetus. Asuu määrityksen vieressä; käyttöliittymäarvot voittavat komentorivilliput. Poista avain (tai tiedosto) palataksesi lippuihin/oletuksiin.</td></tr>
 <tr><td><code>apikey</code></td><td>API-avain, jonka nzbfast teki itselleen ensimmäisellä ajolla (<a href="#firstrun-key">§2</a>). Asuu määrityksen vieressä; macOS:llä ja Linuxilla luettavissa vain sillä tilillä, joka ajaa nzbfastia. Älä poista sitä saadaksesi tuoreen avaimen: jo kertaalleen ajetussa asennuksessa mikään ei tule tilalle, ja daemon nousee takaisin täysin ilman avainta. Aseta uusi sen sijaan kohdassa Asetukset → Suojaus.</td></tr>
 <tr><td><code>index.db</code></td><td>Julkaisuindeksi (SQLite) + seinän metatiedot. Turvallista poistaa - se rakentuu uudelleen skannauksesta (Asetukset → Indeksointi → Pyyhi tekee tämän puolestasi).</td></tr>

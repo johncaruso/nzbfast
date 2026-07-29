@@ -35,7 +35,17 @@ services:
   # container when one ships (your config/downloads persist - they live on
   # the volumes above). Scoped to the nzbfast container only, so it never
   # touches your other containers. Remove this service to pin your version.
-  # Note: it needs the Docker socket to manage containers.
+  #
+  # Read this before you keep it: recreating containers needs the Docker
+  # socket, and mounting /var/run/docker.sock gives this container
+  # root-equivalent control of the host. If you would rather not make that
+  # trade, delete the service and run `docker compose pull && docker
+  # compose up -d` from cron (or, on a Synology, from Task Scheduler)
+  # instead - same effect, no standing socket access.
+  #
+  # Either way, keep the :latest tag above. A container created from a
+  # version tag such as :1.0.3 never moves: both Watchtower and a manual
+  # re-pull fetch the tag the container was created with.
   watchtower:
     image: containrrr/watchtower
     container_name: nzbfast-watchtower

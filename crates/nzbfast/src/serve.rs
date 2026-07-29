@@ -164,6 +164,23 @@ pub struct Job {
     /// recorded the new release as owned, so it was never re-grabbed.
     /// See [`delete_suffix`].
     pub filed_suffix: Option<String>,
+    /// The STEM TV filing keyed on, when it was not this job's own name.
+    ///
+    /// Filing derives `Show/Season NN/Show - S01E02` from a release
+    /// stem, and since the identity ladder landed that stem is not
+    /// always `name`: an obfuscated post identified by an oracle is
+    /// filed under the name the oracle gave, because "a4f9c2e1" is not
+    /// a show. Every later operation on a filed job - delete this
+    /// episode without its siblings, play this episode out of a shared
+    /// season folder - has to look for the files that were actually
+    /// written, so it needs the same stem back.
+    ///
+    /// Persisted for exactly the reason [`Job::filed_suffix`] is: the
+    /// oracle's answer is not reproducible from the record, and a
+    /// restart that forgot it would leave a filed episode findable by
+    /// nothing. `None` on an unfiled job, and on any record written
+    /// before this existed - both of which mean "the name".
+    pub filed_base: Option<String>,
     /// M24: completion found password-protected volumes and no (or a
     /// wrong) password - the dashboard offers "unlock" on this job.
     pub password_required: bool,
@@ -195,6 +212,31 @@ pub struct Job {
     /// live extractor instead (see `queue_json`) - this field is the
     /// latched copy that survives into history.
     pub archive_shape: String,
+    /// CRC32 of the first inner file this job's RAR headers named, as
+    /// the extractor latched it (see `Extractor::inner_crc`). 0 = the
+    /// headers were encrypted, or the set was not RAR-wrapped at all.
+    ///
+    /// Kept because it is an exact key into the open release databases
+    /// and the headers it came from do not survive the download: the
+    /// volumes are usually never written to disk. Persisted so a
+    /// restart does not have to re-derive it, and so a job whose lookup
+    /// failed offline can be asked about later.
+    pub inner_crc: u32,
+    /// What an identity oracle said this release actually is: the
+    /// canonical name, and the IMDb id that came with it. Empty when
+    /// nothing was asked or nothing answered.
+    ///
+    /// This is a SECOND opinion beside `name`, never a replacement for
+    /// it: `name` is what the user (or the *arr) submitted and every
+    /// client matches on it, so overwriting it would break the round
+    /// trip. Rename reads this; the API reports both.
+    pub identity_name: String,
+    pub identity_imdb: String,
+    /// Which oracle answered ("srrdb", "xrel", "par-hash", "mkv-title").
+    /// Shown beside the name, because "srrdb says" and "the container
+    /// says" are different degrees of confidence and the user is
+    /// entitled to tell them apart.
+    pub identity_src: String,
     /// M32: a first failure with missing articles
     /// schedules ONE automatic retry - propagation lag often fills the
     /// gaps in. Unix seconds when the retry is due; the article journal
@@ -233,6 +275,72 @@ pub struct Job {
     /// a long list of dead posts would otherwise walk the whole list
     /// unattended. See `FAILURE_REGRAB_MAX`.
     pub failure_depth: u8,
+    /// What post-download synthesised naming concluded about an
+    /// obfuscated payload: the container facts on the first line, then
+    /// one candidate film per line. Empty for every job the ladder did
+    /// not run on, which is nearly all of them.
+    ///
+    /// Recorded on the DECLINING outcomes above all, because that is
+    /// where it earns its place: the gate refuses to rename unless one
+    /// film survives, so the usual answer is "here is what your file is,
+    /// and here is the shortlist" and the user finishes the job. On the
+    /// accepting outcome the filename already says it, and this is the
+    /// audit trail for why.
+    ///
+    /// Free text in ENGLISH, unlike [`Job::unpack_blocked_by`]: it is
+    /// evidence (runtimes, codecs, film titles), not a status the
+    /// dashboard composes a sentence from, and the film titles inside it
+    /// are not ours to translate.
+    pub identify: String,
+}
+
+/// What [`Daemon::finalize_names`] needs to know about the job it is
+/// filing. A struct rather than more positional parameters because the
+/// list had reached four same-typed strings and bools, and a caller
+/// swapping `name` and `cat` would have compiled.
+pub struct FinalizeJob<'a> {
+    pub name: &'a str,
+    pub cat: &'a str,
+    pub tv_sort: bool,
+    /// The year this release was POSTED, which bounds an identified
+    /// film's release year from above. From the NZB's own article dates
+    /// (see [`post_year_of`]), not from the clock: a back-catalogue grab
+    /// of a 2019 film downloaded today is a 2019 post.
+    pub post_year: u32,
+}
+
+/// Everything post-processing learned that the durable job record has to
+/// keep. Replaced a tuple when the third field arrived - see the field
+/// docs for why each one can only be known here.
+pub struct Finalized {
+    /// The job's new directory, when renaming or the move-completed
+    /// destination changed it.
+    pub moved: Option<PathBuf>,
+    /// The quality suffix filing actually wrote. See [`Job::filed_suffix`].
+    pub suffix: String,
+    /// What synthesised naming concluded, for [`Job::identify`]. Empty
+    /// when the ladder did not run.
+    pub identify: String,
+}
+
+/// The year a release was posted, from the newest article date in its
+/// NZB. Zero when the NZB is unreadable or carries no dates - callers
+/// fall back to the current year, which is right for a fresh grab and is
+/// the only guess available.
+///
+/// NEWEST rather than oldest: a repost or a fill tops up an old NZB with
+/// recent articles, and it is the most recent posting that bounds how
+/// new the film can be.
+pub fn post_year_of(nzb_path: &std::path::Path) -> u32 {
+    let Ok(bytes) = std::fs::read(nzb_path) else { return 0 };
+    let Ok(nzb) = nzbkit::nzb::Nzb::parse(&bytes) else { return 0 };
+    let newest = nzb.files.iter().map(|f| f.date).max().unwrap_or(0);
+    if newest <= 0 {
+        return 0;
+    }
+    // Same epoch-to-civil-year arithmetic the identifier uses; there is
+    // no chrono in the tree.
+    crate::identify::year_of_unix(newest)
 }
 
 /// Keeps the index paused for the entire lifetime of a foreground job,
@@ -473,7 +581,7 @@ fn spawn_sidecar(
 /// that does not come through here is the M14i library metadata-only pick,
 /// which writes a .strm pointer and has nothing to unlock, rename or move.
 async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
-    let (done_ok, out2, name2, cat2, tv2, pw2, repl2) = {
+    let (done_ok, out2, name2, cat2, tv2, pw2, repl2, crc2, nzb2) = {
         let j = job.lock().unwrap();
         (
             // A tombstoned job was deleted by the user while it ran. If
@@ -490,6 +598,8 @@ async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
             j.tv_sort,
             j.password.clone(),
             j.replaces.clone(),
+            j.inner_crc,
+            j.nzb_path.clone(),
         )
     };
     let exts = d.cleanup_exts.lock().unwrap().clone();
@@ -506,7 +616,8 @@ async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
         // Cloned handle for the blocking finalize (the caller still
         // needs its own for park()/script).
         let d3 = d.clone();
-        let (needs_pw, blocked_by, moved, filed_sfx) = tokio::task::spawn_blocking(move || {
+        let (needs_pw, blocked_by, moved, filed_sfx, ident, identified) =
+            tokio::task::spawn_blocking(move || {
             // A6: this job downloaded beside a previous
             // successful result of the same name. It verified,
             // so it takes the canonical directory over now -
@@ -549,6 +660,18 @@ async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
                 .filter(|u| !u.blocking)
                 .map(|u| u.display)
                 .unwrap_or_default();
+            // BEFORE the sweeps: the .par2 sidecars the fingerprint
+            // rung reads are exactly what a cleanup rule deletes, and
+            // `keep_media_only` inside finalize_names deletes them
+            // whether or not one is configured.
+            let ident = if needs_pw {
+                // A still-locked job has no unpacked payload to inspect
+                // and no name to teach anything, and its archive headers
+                // never parsed - so there is nothing to ask about.
+                crate::identity::Identity::default()
+            } else {
+                d3.resolve_identity(&out2, &name2, crc2)
+            };
             if !exts.is_empty() {
                 crate::smart::cleanup(&out2, &exts);
             }
@@ -564,15 +687,44 @@ async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
             // it. A still-locked job never got that far, so it
             // has none to record (None, not "").
             let mut filed_sfx = None;
+            let mut identify = String::new();
             if !needs_pw {
-                let (renamed, sfx) = d3.finalize_names(&out2, &name2, &cat2, tv2);
-                moved = renamed.or(moved);
-                filed_sfx = Some(sfx);
+                // Rename off the canonical name when an oracle supplied
+                // one: `name2` is what the submitter called this and
+                // stays on the record, but it is not necessarily what
+                // the release IS.
+                let naming =
+                    if ident.name.is_empty() { name2.as_str() } else { ident.name.as_str() };
+                let post_year = match post_year_of(&nzb2) {
+                    0 => crate::identify::current_year(),
+                    y => y,
+                };
+                let done = d3.finalize_names(
+                    &out2,
+                    &FinalizeJob {
+                        name: naming,
+                        cat: &cat2,
+                        tv_sort: tv2,
+                        post_year,
+                    },
+                );
+                moved = done.moved.or(moved);
+                filed_sfx = Some(done.suffix);
+                identify = done.identify;
             }
-            (needs_pw, blocked_by, moved, filed_sfx)
-        })
+            (needs_pw, blocked_by, moved, filed_sfx, ident, identify)
+            })
         .await
-        .unwrap_or((false, String::new(), None, None));
+        .unwrap_or_else(|_| {
+            (
+                false,
+                String::new(),
+                None,
+                None,
+                crate::identity::Identity::default(),
+                String::new(),
+            )
+        });
         {
             let mut j = job.lock().unwrap();
             j.password_required = needs_pw;
@@ -580,6 +732,20 @@ async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
                 j.fail_message = "password required to unpack".into();
             }
             j.unpack_blocked_by = blocked_by;
+            // Recorded even when it changed no filename: an IMDb id with
+            // no better name is still the thing that lets the history
+            // row link to what it actually is.
+            if !ident.is_empty() {
+                j.identity_name = ident.name;
+                j.identity_imdb = ident.imdb;
+                j.identity_src = ident.src.to_string();
+            }
+            // Only ever SET, never cleared: a job whose ladder did not
+            // run this time (unlock re-runs post-processing) must not
+            // lose the note the first pass wrote.
+            if !identified.is_empty() {
+                j.identify = identified;
+            }
             if let Some(dest) = moved {
                 // Record whether the new home is the SHARED season folder, so
                 // every later "delete this job's files" knows not to take the
@@ -588,6 +754,13 @@ async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
                 // ...and, with it, the suffix those files now carry. Only an
                 // actually-filed job has one to remember.
                 j.filed_suffix = if j.filed { filed_sfx } else { None };
+                // Only when it is NOT the job's own name: `filed_stem`
+                // falls back to `name`, so storing a copy of it would
+                // just be a second thing to keep in step.
+                j.filed_base = j
+                    .filed
+                    .then(|| j.identity_name.clone())
+                    .filter(|n| !n.is_empty());
                 j.out_dir = dest;
             }
             // Cleared in the same breath as the corrected out_dir: from
@@ -931,6 +1104,18 @@ fn delete_suffix(j: &Job, legacy: impl FnOnce() -> String) -> String {
     j.filed_suffix.clone().unwrap_or_else(legacy)
 }
 
+/// The stem a filed job's episode files on disk were built from, which
+/// is [`Job::filed_base`] when an identity oracle renamed the release
+/// and the job's own name otherwise.
+///
+/// Every filed-job lookup goes through here rather than reaching for
+/// `name` directly: an obfuscated post filed under an oracle's name has
+/// no file anywhere called after its hash, so a `name`-keyed delete
+/// leaves the episode behind and a `name`-keyed play cannot find it.
+fn filed_stem(j: &Job) -> &str {
+    j.filed_base.as_deref().filter(|s| !s.is_empty()).unwrap_or(&j.name)
+}
+
 /// One history record's fate under a `mode=history&name=delete` call.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct HistoryDelete {
@@ -1214,6 +1399,12 @@ pub struct Daemon {
     /// `move_completed` is unset (only listed categories move then).
     pub move_completed_cats: std::sync::RwLock<Vec<(String, PathBuf)>>,
     pub spool: PathBuf,
+    /// The config file this daemon was started with. Held so the rename
+    /// pipeline can read a bring-your-own-key value (the TMDB key) at
+    /// the moment it needs one: the enrichment worker reads its copy
+    /// once at startup, but a user who adds a key later should not have
+    /// to restart for the identifier to gain its second source.
+    pub cfg_path: PathBuf,
     /// Categories offered to the *arrs via `get_cats` and the NZBGet
     /// `config` category table. Seeded from [`DEFAULT_CATS`], extended by
     /// the `categories` setting, and by every category ever seen on an
@@ -1226,11 +1417,32 @@ pub struct Daemon {
     pub active_stream: Mutex<Option<String>>,
     /// M12: index database path.
     pub index_db: PathBuf,
-    /// M12: the single shared Index connection (scan loop + all query
-    /// handlers), opened lazily. One connection avoids cross-connection
-    /// WAL races; None until first use (the index is an optional feature
-    /// and must never block the daemon from starting).
+    /// M12: the shared read-WRITE Index connection (tip watcher, wall
+    /// enricher, IMDb refresher, eviction, and every handler that
+    /// mutates), opened lazily - None until first use, because the index
+    /// is an optional feature and must never block the daemon from
+    /// starting. The original single-connection rule ("one connection
+    /// avoids cross-connection WAL races") stopped being literal at M28:
+    /// each scan task ingests through its own scratch connection and the
+    /// busy timeout arbitrates the writers, so cross-connection use
+    /// against this WAL database is the daily norm, not a hazard.
     pub index: Mutex<Option<nzbkit::index::Index>>,
+    /// The read-ONLY sibling for interactive query handlers (wall2,
+    /// search, browse, make_nzb, the newznab facade). WAL readers never
+    /// wait on the writer, so these endpoints answer during a catch-up
+    /// ingest or maintenance pass that holds the connection above for a
+    /// minute straight - measured 28 Jul: a wall2 curl queued 62.4s
+    /// behind a deepening pass. Guarded by its own mutex whose holds are
+    /// all short queries; opened lazily via `with_index_read` (only ever
+    /// AFTER the read-write side has run the migrations), and dropped at
+    /// every point that drops or republishes the write connection.
+    pub index_read: Mutex<Option<nzbkit::index::Index>>,
+    /// Whether a read-write `Index::open` has succeeded in this process
+    /// - i.e. schema creation and migrations have run. Until then
+    /// `with_index_read` routes through `with_index`, so a query handler
+    /// can never open the read-only connection against a database an
+    /// older binary wrote and trip over a missing column.
+    pub index_migrated: std::sync::atomic::AtomicBool,
     /// Last computed index_stats figures (releases, complete, db_bytes,
     /// live_bytes), served whenever the connection above is busy. The
     /// dashboard's 15s status poll must never park an HTTP worker on
@@ -1330,14 +1542,34 @@ pub struct Daemon {
     /// get_config (`has_key`), never logged, never sent to a browser.
     pub indexers: Mutex<Vec<crate::newznab::IndexerConfig>>,
     /// M35 phase 2: may the WATCHLIST spend the user's indexer accounts
-    /// looking for wanted items? Default OFF, and deliberately so - it
-    /// is the only path that queries a metered third-party account with
-    /// nobody at the keyboard.
+    /// looking for wanted items? Read it through
+    /// [`Daemon::watchlist_external_on`], never directly: the stored bool
+    /// only counts once `watchlist_external_set` says the user answered.
     pub watchlist_external: std::sync::atomic::AtomicBool,
+    /// Did the user ever answer that question? The pair is a tri-state:
+    /// unset falls back to "on iff at least one indexer is configured",
+    /// which is the M35b posture (the local index cannot see obfuscated
+    /// posts, so the accounts are the real search surface). An explicit
+    /// answer - in EITHER direction - is stored and always wins, so
+    /// somebody who turned this off does not get it turned back on by
+    /// adding an indexer later.
+    pub watchlist_external_set: std::sync::atomic::AtomicBool,
     /// M35 runtime state for the pull-search client: caps cache, daily
     /// hit/grab counters, limit backoffs and the token->result cache
     /// that keeps NZB links (which embed the apikey) server-side.
     indexer_rt: Mutex<IndexerRuntime>,
+    /// When `mode=addnzblnk` last ran, newest last, trimmed to the last
+    /// [`NZBLNK_WINDOW`].
+    ///
+    /// This endpoint is the one an OS protocol handler exposes to the
+    /// open web: once `nzblnk:` is registered, any page can navigate to
+    /// one and, past the browser's own "Open nzbfast?" prompt, reach it.
+    /// A link cannot name a location - `h` is a search key, so the
+    /// daemon only ever reads its own index or the user's own indexers -
+    /// but a page in a loop can still spend two things that are not
+    /// free: the unindexed filename scan, and the user's metered
+    /// indexer quota. Sliding window, so both are bounded.
+    nzblnk_recent: Mutex<std::collections::VecDeque<Instant>>,
     /// M23 Smart Folders - a live setting: rules evaluated at enqueue
     /// (first match wins) to pick the category, and remembered per-job
     /// for TV filing at completion.
@@ -1355,6 +1587,18 @@ pub struct Daemon {
     /// re-classification pass; the scan loop consumes it (same pattern
     /// as `scan_deep`).
     pub reclassify_pending: std::sync::atomic::AtomicBool,
+    /// Ask the open naming oracles what a finished download actually is
+    /// (see `crate::identity`). Default on, and the only outbound
+    /// traffic it can produce is at most one srrdb request and at most
+    /// one xREL request per completed job, both keyless and both
+    /// silent when they fail.
+    ///
+    /// A switch rather than an assumption: it is the user's line, the
+    /// requests name a release they downloaded, and somebody who does
+    /// not want their daemon talking to third parties about that is
+    /// entitled to say so. No dashboard control - it is an API setting,
+    /// like the other things nobody should have to think about.
+    pub identity_lookup: std::sync::atomic::AtomicBool,
     /// Auto-rename: on completion, rename the folder + main media file to a
     /// friendly "Title (Year)[ quality]" form (TV keeps Show - S01E02).
     /// Master switch (default on); the five below tune what the quality
@@ -1382,6 +1626,17 @@ pub struct Daemon {
     /// On by default: it only ever fires where the renamer would
     /// otherwise refuse to build a name at all.
     pub rename_extra_words: std::sync::atomic::AtomicBool,
+    /// Post-download synthesised naming for obfuscated FILMS: when every
+    /// other pass has left the feature wearing a hash, read the
+    /// container's own facts and ask a film catalogue what it is.
+    ///
+    /// On by default, which is only defensible because the acceptance
+    /// gate renames on certainty rather than on a best guess (see
+    /// [`crate::identify`]) - the usual outcome is a note, not a rename.
+    /// Visible next to the other rename settings so a user who would
+    /// rather nothing reached the network after a download can turn it
+    /// off.
+    pub rename_identify: std::sync::atomic::AtomicBool,
     /// Remove usenet junk (.par2/.nzb/.sfv/.nfo/… + sample clips) from a
     /// finished movie/TV folder (default on).
     pub rename_junk: std::sync::atomic::AtomicBool,
@@ -1430,6 +1685,35 @@ pub struct Daemon {
     /// in `serve()`): an upgrade that silently stopped somebody's
     /// working index would be a data-shaped surprise, not a default.
     index_enabled: std::sync::atomic::AtomicBool,
+    /// Spotnet spot ingestion, OFF by default and independent of
+    /// `index_enabled`.
+    ///
+    /// A separate switch because it is a separate kind of source. The
+    /// header indexer reads what usenet happens to say about a posting,
+    /// which is nothing at all when the poster obfuscated it. A spot is
+    /// somebody publishing a signed record of what they posted, name and
+    /// NZB included, so it reaches exactly the releases the scanner
+    /// cannot see. Making it a sub-option of the weaker source would
+    /// mean running a header scan nobody asked for to get it.
+    ///
+    /// It shares the database, the pass gate and the pause rules with
+    /// indexing (one SQLite file, one writer at a time, and a download
+    /// still outranks both) - it just does not need the other switch on.
+    spot_enabled: std::sync::atomic::AtomicBool,
+    /// Spot groups to scan. free.pt is the one live Spotnet group.
+    spot_groups: Mutex<Vec<String>>,
+    /// Articles to walk back on the first pass; later passes resume from
+    /// the stored `spots:<group>` high-water mark.
+    spot_backfill: AtomicU64,
+    /// Bumped every time the database underneath the index is
+    /// invalidated - switched off, or wiped. A scan pass owns a
+    /// DEDICATED `Index::open` connection and republishes a fresh shared
+    /// one when it finishes, so without a generation to check against it
+    /// reopened (and, after a wipe, RECREATED) the database that had
+    /// just been taken away. The switch then read as off while a live
+    /// connection sat behind it, and a wipe reported success over files
+    /// an exiting scan put back.
+    index_generation: AtomicU64,
     /// Number of foreground jobs whose pipeline has not reached its
     /// terminal park yet. Job N's tail can overlap job N+1's network
     /// phase, so `started_at` cannot represent this lifetime.
@@ -2068,6 +2352,53 @@ impl Daemon {
             return Some("downloading");
         }
         None
+    }
+
+    /// The same question for the spot leg. Everything after the master
+    /// switch is shared with indexing - a paused index means "stop
+    /// scanning", and a download outranks every background scan
+    /// regardless of which source it feeds - but the switches are
+    /// independent, so "off" is asked separately.
+    fn spot_pause_reason(&self) -> Option<&'static str> {
+        if !self.spot_enabled.load(Ordering::Relaxed) {
+            return Some("off");
+        }
+        if self.index_paused.load(Ordering::Relaxed) {
+            return Some("paused");
+        }
+        if self.index_pause_on_download.load(Ordering::Relaxed)
+            && self.index_jobs_active.load(Ordering::Acquire) > 0
+        {
+            return Some("downloading");
+        }
+        None
+    }
+
+    /// Does anything want the index database open? The file backs both
+    /// sources, so it is created and held for as long as EITHER switch
+    /// is on - and with both off it is never opened, never created on a
+    /// fresh install, exactly as when indexing was the only source.
+    fn index_db_wanted(&self) -> bool {
+        self.index_enabled.load(Ordering::Relaxed) || self.spot_enabled.load(Ordering::Relaxed)
+    }
+
+    /// How many of the user's indexer accounts are configured and on.
+    /// The posture question the UI asks in several places: with none of
+    /// these there is nothing to search but the local index, and with one
+    /// or more the local index is the optional extra.
+    pub fn enabled_indexers(&self) -> usize {
+        self.indexers.lock().unwrap().iter().filter(|i| i.enabled).count()
+    }
+
+    /// May the watchlist spend the user's indexer accounts? See
+    /// `watchlist_external_set` for why this is a tri-state rather than
+    /// the plain bool it reads like.
+    pub fn watchlist_external_on(&self) -> bool {
+        if self.watchlist_external_set.load(Ordering::Relaxed) {
+            self.watchlist_external.load(Ordering::Relaxed)
+        } else {
+            self.enabled_indexers() > 0
+        }
     }
 
     /// Safe to run heavy index maintenance (prune, reseed, compact) right
@@ -3134,7 +3465,7 @@ impl Daemon {
         // One batched lookup of the enriched rows for the distinct keys.
         let keys: Vec<String> = freq.keys().cloned().collect();
         let rows = self
-            .with_index(|ix| ix.titles_for_keys(&keys).ok())
+            .with_index_read(|ix| ix.titles_for_keys(&keys).ok())
             .unwrap_or_default();
         let mut genre_w: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
         let mut kind_w: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
@@ -3233,18 +3564,100 @@ impl Daemon {
         if !self.cats.lock().unwrap().insert(cat.to_string()) {
             return;
         }
-        save_setting(&self.settings_path, "categories", json!(self.cat_list()));
+        // ADDITIVE, because this is a first-seen registration and the
+        // list it appends to is not this worker's to replace. The old
+        // code took `cat_list()` after dropping the lock and wrote that
+        // snapshot whole, so two workers registering different new
+        // categories could interleave: B wrote {a,b}, then A overwrote
+        // it with {a}. Live memory still held both, so nothing looked
+        // wrong until a restart - and then category B was simply gone,
+        // and an *arr configured against it failed its category test.
+        //
+        // Merging inside the settings critical section makes the write
+        // order stop mattering: whatever else has landed on disk stays.
+        let mine = self.cat_list();
+        update_settings(&self.settings_path, |map| {
+            let on_disk = map.get("categories").and_then(Value::as_str).unwrap_or("");
+            map.insert("categories".into(), json!(merge_cat_list(on_disk, &mine)));
+        });
     }
 
     fn with_index<T>(&self, f: impl FnOnce(&nzbkit::index::Index) -> Option<T>) -> Option<T> {
-        if !self.index_enabled.load(Ordering::Relaxed) {
+        if !self.index_db_wanted() {
             return None;
         }
         let mut guard = self.index.lock().unwrap();
         if guard.is_none() {
             *guard = nzbkit::index::Index::open(&self.index_db).ok();
+            if guard.is_some() {
+                self.index_migrated.store(true, Ordering::Release);
+            }
         }
         guard.as_ref().and_then(f)
+    }
+
+    /// Read-only access for the interactive query endpoints (wall2,
+    /// search, browse, make_nzb, the newznab facade). Runs on the
+    /// dedicated read-only connection, so a long ingest batch or
+    /// maintenance pass holding the read-write connection above cannot
+    /// park an HTTP worker here: WAL readers run concurrently with the
+    /// writer, and every hold of THIS mutex is a short query. Falls back
+    /// to `with_index` until a read-write open has run the migrations,
+    /// and when the read-only open itself fails (no database file yet) -
+    /// both are startup-shaped moments where nothing holds a long lock.
+    fn with_index_read<T>(
+        &self,
+        f: impl FnOnce(&nzbkit::index::Index) -> Option<T>,
+    ) -> Option<T> {
+        if !self.index_db_wanted() {
+            return None;
+        }
+        if !self.index_migrated.load(Ordering::Acquire) {
+            return self.with_index(f);
+        }
+        {
+            let mut guard = self.index_read.lock().unwrap();
+            if guard.is_none() {
+                *guard = nzbkit::index::Index::open_read_only(&self.index_db).ok();
+            }
+            if let Some(ix) = guard.as_ref() {
+                return f(ix);
+            }
+        }
+        self.with_index(f)
+    }
+
+    /// Best-effort write access: run `f` on the read-write connection if
+    /// it is free RIGHT NOW, skip entirely if anything holds it. For
+    /// side-writes an interactive endpoint can shrug off (wall2's title
+    /// seeding) - the point of the read-only path is that those handlers
+    /// never park behind an ingest, so their embedded writes must not
+    /// park either.
+    fn try_with_index<T>(&self, f: impl FnOnce(&nzbkit::index::Index) -> Option<T>) -> Option<T> {
+        if !self.index_db_wanted() {
+            return None;
+        }
+        let Ok(mut guard) = self.index.try_lock() else {
+            return None;
+        };
+        if guard.is_none() {
+            *guard = nzbkit::index::Index::open(&self.index_db).ok();
+            if guard.is_some() {
+                self.index_migrated.store(true, Ordering::Release);
+            }
+        }
+        guard.as_ref().and_then(f)
+    }
+
+    /// Drop the read-only connection so the next `with_index_read`
+    /// reopens it. Called wherever the write side republishes or drops
+    /// its own connection. For committed data this is belt-and-braces (a
+    /// WAL reader picks up every commit on its next query anyway), but
+    /// it is what keeps the reader correct across index_wipe deleting
+    /// the file out from under it - a read-only handle would otherwise
+    /// serve the deleted inode forever.
+    fn drop_index_read(&self) {
+        *self.index_read.lock().unwrap() = None;
     }
 
     /// index_stats' database figures (releases, complete, db_bytes,
@@ -3255,12 +3668,15 @@ impl Daemon {
     /// status pill - four HTTP workers queued behind a 62s lock hold
     /// is how one dashboard tab wedged the whole daemon.
     fn index_stats_snapshot(&self) -> (u64, u64, u64, u64) {
-        if !self.index_enabled.load(Ordering::Relaxed) {
+        if !self.index_db_wanted() {
             return (0, 0, 0, 0);
         }
         if let Ok(mut guard) = self.index.try_lock() {
             if guard.is_none() {
                 *guard = nzbkit::index::Index::open(&self.index_db).ok();
+                if guard.is_some() {
+                    self.index_migrated.store(true, Ordering::Release);
+                }
             }
             if let Some(ix) = guard.as_ref() {
                 let (total, complete) = ix.stats().unwrap_or((0, 0));
@@ -3284,32 +3700,71 @@ impl Daemon {
         &self,
         f: impl FnOnce(&mut nzbkit::index::Index) -> Option<T>,
     ) -> Option<T> {
-        if !self.index_enabled.load(Ordering::Relaxed) {
+        if !self.index_db_wanted() {
             return None;
         }
         let mut guard = self.index.lock().unwrap();
         if guard.is_none() {
             *guard = nzbkit::index::Index::open(&self.index_db).ok();
+            if guard.is_some() {
+                self.index_migrated.store(true, Ordering::Release);
+            }
         }
         guard.as_mut().and_then(f)
     }
 
-    /// Every path to the index database goes through `with_index`, so the
-    /// switch above is the whole "no disk" story: with the indexer off,
-    /// the file is never opened - never CREATED, on a fresh install - and
-    /// every caller (wall, browse, watchlist, oracle, the newznab facade)
-    /// sees the same empty answer it would see before a first scan. The
-    /// two `Index::open` calls in the scan loops are not exceptions: they
-    /// only run inside a pass, which `indexing_pause_reason` has already
-    /// stopped.
+    /// Every path to the index database goes through `with_index` or its
+    /// read-only sibling `with_index_read` (which checks the same switches,
+    /// and can never create the file - its open is READ_ONLY), so the
+    /// switches above are the whole "no disk" story: with both sources
+    /// off, the file is never opened - never CREATED, on a fresh install
+    /// - and every caller (wall, browse, watchlist, oracle, the newznab
+    /// facade) sees the same empty answer it would see before a first
+    /// scan. The `Index::open` calls in the scan loops are not
+    /// exceptions: they only run inside a pass, which the matching pause
+    /// predicate has already stopped.
     ///
-    /// Turning the switch off also drops the handle we are holding, so
-    /// the connection, its page cache and the WAL go with it rather than
-    /// sitting resident until restart.
+    /// Turning a switch off also drops the handle we are holding - once
+    /// the OTHER source no longer wants it - so the connection, its page
+    /// cache and the WAL go with it rather than sitting resident until
+    /// restart.
     fn close_index(&self) {
-        if self.index.lock().unwrap().take().is_some() {
-            println!("[index] closed the database - the indexer is switched off");
+        // Still wanted by the other source: nothing to close.
+        if self.index_db_wanted() {
+            return;
         }
+        self.drop_index_read();
+        // Retire the generation under the same lock the republish takes:
+        // a scan task that reads it after this point sees the new one
+        // and declines, and one that read the old one is already waiting
+        // on the lock we hold.
+        let mut guard = self.index.lock().unwrap();
+        self.index_generation.fetch_add(1, Ordering::SeqCst);
+        if guard.take().is_some() {
+            println!("[index] closed the database - no content source is switched on");
+        }
+    }
+
+    /// The generation a scan pass must still be running under to publish
+    /// its connection. See [`Self::index_generation`].
+    fn index_era(&self) -> u64 {
+        self.index_generation.load(Ordering::SeqCst)
+    }
+
+    /// Publish a freshly-opened shared connection on behalf of a scan
+    /// pass that started at `era` - unless the index was switched off or
+    /// wiped while that pass ran, in which case the pass's connection is
+    /// simply dropped and the index stays closed.
+    fn publish_index(&self, era: u64, fresh: nzbkit::index::Index) {
+        let mut guard = self.index.lock().unwrap();
+        // `index_db_wanted`, not `index_enabled`: a spot pass republishes
+        // the same shared connection, and on a spots-only install the
+        // indexer switch is off by definition. Asking the narrower
+        // question would leave that install publishing nothing.
+        if !may_publish_index(self.index_era(), era, self.index_db_wanted()) {
+            return;
+        }
+        *guard = Some(fresh);
     }
 
     /// The master switch, for the workers that are not scan passes.
@@ -3345,7 +3800,9 @@ impl Daemon {
         &self,
         cfg_path: &std::path::Path,
     ) -> Option<(nzbkit::oracle::Snapshot, Vec<String>)> {
-        let snap = self.with_index(|ix| ix.oracle_snapshot().ok())?;
+        // with_index_read: every caller is an interactive handler (wall2,
+        // index_browse, oracle_takedowns) - none may park behind ingest.
+        let snap = self.with_index_read(|ix| ix.oracle_snapshot().ok())?;
         if snap.is_empty() {
             return None;
         }
@@ -3619,6 +4076,7 @@ impl Daemon {
             failure_host: String::new(),
             failure_https: false,
             failure_depth: 0,
+            identify: String::new(),
             retries: 0,
             dupe_key: key,
             library: self.library_cats.lock().unwrap().iter().any(|c| *c == category),
@@ -3636,11 +4094,16 @@ impl Daemon {
             tv_sort,
             filed: false,
             filed_suffix: None,
+            filed_base: None,
             password,
             password_required: false,
             zip_packed,
             unpack_blocked_by: String::new(),
             archive_shape: String::new(),
+            inner_crc: 0,
+            identity_name: String::new(),
+            identity_imdb: String::new(),
+            identity_src: String::new(),
             auto_retry_at: None,
             pp_params: Vec::new(),
             replaces,
@@ -3913,7 +4376,9 @@ impl Daemon {
                 if s.contains("404") {
                     println!("[failurelink] {name}: reported, no other release available");
                 } else {
-                    eprintln!("[failurelink] {name}: {s}");
+                    // Same reason as the watch leg above: the X-DNZB-Failure
+                    // endpoint is the indexer's own URL and carries the key.
+                    eprintln!("[failurelink] {name}: {}", redact_url_creds(&s));
                 }
                 return;
             }
@@ -4049,8 +4514,8 @@ impl Daemon {
         {
             let g = job.lock().unwrap();
             if g.del_on_drop {
-                let suffix = delete_suffix(&g, || self.job_suffix(&g.name));
-                remove_job_files(&g.out_dir, &g.name, g.filed, &suffix);
+                let suffix = delete_suffix(&g, || self.job_suffix(filed_stem(&g)));
+                remove_job_files(&g.out_dir, filed_stem(&g), g.filed, &suffix);
             }
             if tombstone {
                 let _ = std::fs::remove_file(&g.nzb_path);
@@ -4193,6 +4658,92 @@ impl Daemon {
         crate::wall::quality_suffix(&crate::wall::parse_release(name), &self.rename_style())
     }
 
+    /// Ask what this finished download actually is, and remember what we
+    /// learn (the `identity` ladder). Blocking: reads the finished
+    /// directory and may make up to two third-party requests.
+    ///
+    /// Called before the cleanup sweep, because the sweep is what
+    /// deletes the `.par2` sidecars this reads. Every rung is optional
+    /// and every failure is silence: an offline daemon resolves nothing
+    /// and files the job exactly as it would have before.
+    fn resolve_identity(
+        &self,
+        out_dir: &std::path::Path,
+        posted: &str,
+        inner_crc: u32,
+    ) -> crate::identity::Identity {
+        use nzbkit::release;
+        let mut id = crate::identity::Identity::default();
+        if !self.identity_lookup.load(Ordering::Relaxed) {
+            return id;
+        }
+        // The local facts first - they cost a directory read and no
+        // request, and the fingerprints are needed either way (a job we
+        // CAN name is one this table wants to learn from).
+        let prints = crate::identity::par_fingerprints(out_dir);
+        let obfuscated = release::looks_obfuscated(posted);
+        let facts = crate::identity::Facts {
+            posted: posted.to_string(),
+            // Only an unnameable job asks these two: they can improve on
+            // nothing else, and `decide_name` would decline them anyway.
+            // Reads go on the read-only connection: this runs on a job
+            // tail, and parking it behind a long ingest batch would
+            // hold the finished job's rename and move behind the
+            // scanner.
+            remembered: obfuscated
+                .then(|| self.with_index_read(|ix| ix.par_hash_lookup(&prints).ok().flatten()))
+                .flatten(),
+            mkv_title: obfuscated.then(|| crate::identity::container_title(out_dir)).flatten(),
+            // One request per completed job, cached for the process, and
+            // impossible at all on a header-encrypted set (no CRC).
+            srr: (inner_crc != 0).then(|| crate::srrdb::archive_crc(inner_crc)).flatten(),
+        };
+        if let Some((name, src)) = crate::identity::decide_name(&facts) {
+            id.name = name;
+            id.src = src;
+        }
+        id.imdb = facts.srr.as_ref().map(|h| h.imdb.clone()).unwrap_or_default();
+        // Whatever we now believe this release is called is what the id
+        // hunt and the repost table both key on.
+        let best = if id.name.is_empty() { posted } else { &id.name };
+        let parsed = release::parse_release(best);
+        // Our own index may already hold the id, in which case xREL must
+        // not be asked - see `xrel_query`.
+        if id.imdb.is_empty() {
+            id.imdb = self
+                .with_index_read(|ix| ix.title_get(&parsed.key).ok().flatten())
+                .map(|t| t.imdb)
+                .unwrap_or_default();
+        }
+        if let Some(q) = crate::identity::xrel_query(best, &id.imdb) {
+            let hits = crate::xrel::search_p2p(&q);
+            let found = crate::xrel::imdb_for_release(best, &hits);
+            if !found.is_empty() {
+                id.imdb = found;
+                // Only xREL's own doing when nothing else spoke; a name
+                // from srrdb keeps its attribution.
+                if id.src.is_empty() {
+                    id.src = "xrel";
+                }
+            }
+        }
+        // Teach the repost table. Only from a job we can actually name -
+        // filing a fingerprint under an obfuscated stem would hand every
+        // future repost of these bytes the same non-answer, permanently.
+        if !prints.is_empty() && !release::looks_obfuscated(best) {
+            self.with_index(|ix| {
+                ix.par_hash_remember(&prints, best, &parsed.key, unix_now()).ok()
+            });
+        }
+        if !id.is_empty() {
+            println!(
+                "[identity] {posted:?} -> {:?} {} (via {})",
+                id.name, id.imdb, id.src
+            );
+        }
+        id
+    }
+
     /// Post-unpack naming & cleanup for a completed, unlocked job (blocking
     /// file ops - call from `spawn_blocking`). Removes junk / keeps only
     /// media (movie & TV only), then auto-renames: a movie's folder + main
@@ -4204,13 +4755,8 @@ impl Daemon {
     /// knows it: the settings behind it are live, and by the time a delete
     /// needs to match the files on disk they may say something else. The
     /// caller stores it as [`Job::filed_suffix`].
-    fn finalize_names(
-        &self,
-        out_dir: &std::path::Path,
-        name: &str,
-        cat: &str,
-        tv_sort: bool,
-    ) -> (Option<PathBuf>, String) {
+    fn finalize_names(&self, out_dir: &std::path::Path, job: &FinalizeJob<'_>) -> Finalized {
+        let (name, cat, tv_sort) = (job.name, job.cat, job.tv_sort);
         let auto_rename = self.auto_rename.load(Ordering::Relaxed);
         let style = self.rename_style();
         // TODO 24D: user categories classify ahead of the built-ins, and
@@ -4293,7 +4839,9 @@ impl Daemon {
                 },
                 // No declared base behaviour: we do not reshape the
                 // payload, but an obfuscated video can still take the
-                // release name.
+                // release name. This is also where a FULLY obfuscated
+                // post lands - it parses to no kind at all - so it is
+                // the arm synthesised naming actually fires in.
                 Base::None => {
                     crate::smart::rename_obfuscated_video(out_dir, name);
                     None
@@ -4302,7 +4850,92 @@ impl Daemon {
         } else {
             None
         };
-        (self.relocate_completed(out_dir, cat, renamed), suffix)
+        // Last rung, and the only one that asks anything outside this
+        // machine: when every pass above has left the feature wearing a
+        // hash, the file's own facts may still identify it. Never for
+        // TV - see `identify_video` and the module docs.
+        //
+        // LAST on purpose, and that ordering is the whole relationship
+        // with `crate::identity`. Those four oracles read an exact key -
+        // an archive CRC, a PAR2 fingerprint, the muxer's own Title -
+        // and when one answers, `naming` above is already the canonical
+        // release name and the video has been renamed off it. This rung
+        // infers from runtime and year, which is the weakest evidence
+        // here, so it only ever speaks when they were all silent:
+        // `nameless_video` returns None the moment any of them landed a
+        // name, and no request goes out.
+        let identified = if auto_rename && !tv_sort && !matches!(base, Base::Tv) {
+            self.identify_video(out_dir, job)
+        } else {
+            String::new()
+        };
+        Finalized {
+            moved: self.relocate_completed(out_dir, cat, renamed),
+            suffix,
+            identify: identified,
+        }
+    }
+
+    /// Post-download synthesised naming (films): if the main video is
+    /// STILL nameless after every pass above, read its container facts
+    /// and ask a film catalogue what it is.
+    ///
+    /// Returns the note to record on the job - what the file said about
+    /// itself and what the catalogues offered - which is written whether
+    /// or not the rename happened. That is the point: the common outcome
+    /// is a decline, and a decline that tells the user "108 min, h264,
+    /// audio en, and here are the eight films it could be" is worth far
+    /// more than a silent one.
+    ///
+    /// Empty string means the ladder did not run at all (toggle off, or
+    /// nothing nameless to rename), which is not worth a note.
+    fn identify_video(&self, out_dir: &std::path::Path, job: &FinalizeJob<'_>) -> String {
+        if !self.rename_identify.load(Ordering::Relaxed) {
+            return String::new();
+        }
+        // Cheapest question first: is there anything to fix? A payload
+        // whose video already carries a human's name is left alone, and
+        // costs no disk read and no request.
+        let Some(video) = crate::smart::nameless_video(out_dir) else {
+            return String::new();
+        };
+        let Some(facts) = nzbkit::media::probe(&video) else {
+            return String::new();
+        };
+        let tmdb = self.tmdb_key();
+        let outcome =
+            crate::identify::identify(&facts, job.post_year, tmdb.as_deref());
+        let line = outcome.log_line();
+        match outcome.accepted_name() {
+            Some(title) => {
+                // The gate accepted, so the name has been earned by
+                // evidence rather than by grammar - which is why this
+                // takes the bare apply path rather than
+                // `rename_obfuscated_video`'s release-name one.
+                if crate::smart::rename_nameless_video(out_dir, &title) {
+                    println!("[identify] {} -> {title}", video.display());
+                } else {
+                    println!("[identify] {line} (but the rename could not be applied)");
+                }
+            }
+            None => println!("[identify] {}: {line}", video.display()),
+        }
+        let mut note = line;
+        for c in &outcome.shortlist {
+            note.push_str("\n");
+            note.push_str(c);
+        }
+        note
+    }
+
+    /// The user's TMDB key, when they configured one. Read per call
+    /// rather than cached: it is a config-file value the user may add at
+    /// any time, and this is not a hot path (once per obfuscated job).
+    fn tmdb_key(&self) -> Option<String> {
+        nzbkit::config::Config::load(&self.cfg_path)
+            .ok()?
+            .tmdb_key
+            .filter(|k| !k.is_empty())
     }
 
     /// M33: relocate a finished job to the `move_completed` destination
@@ -5142,10 +5775,18 @@ fn job_json(j: &Job) -> Value {
         // the naming settings are live and this is history: recomputing
         // it later answers about today, not about the files on disk.
         "filed_suffix": j.filed_suffix,
+        "filed_base": j.filed_base,
         "password_required": j.password_required,
         "zip_packed": j.zip_packed,
         "unpack_blocked_by": j.unpack_blocked_by,
         "archive_shape": j.archive_shape,
+        // The identity facts an oracle supplied. Persisted rather than
+        // recomputed: every one of them cost a third-party request, and
+        // the headers the CRC came from are long gone by restart.
+        "inner_crc": j.inner_crc,
+        "identity_name": j.identity_name,
+        "identity_imdb": j.identity_imdb,
+        "identity_src": j.identity_src,
         "auto_retry_at": j.auto_retry_at,
         "pp_params": j.pp_params,
         "replaces": j.replaces.as_ref().map(|p| p.to_string_lossy()),
@@ -5156,6 +5797,7 @@ fn job_json(j: &Job) -> Value {
         "failure_host": j.failure_host,
         "failure_https": j.failure_https,
         "failure_depth": j.failure_depth,
+        "identify": j.identify,
     })
 }
 
@@ -5226,10 +5868,15 @@ fn job_from_json(v: &Value) -> Option<Job> {
         // Legacy records say None and fall back to a recompute, which is
         // what all of them did before this field existed.
         filed_suffix: v.get("filed_suffix").and_then(Value::as_str).map(str::to_string),
+        filed_base: v.get("filed_base").and_then(Value::as_str).map(str::to_string),
         password_required: v.get("password_required").and_then(Value::as_bool).unwrap_or(false),
         zip_packed: v.get("zip_packed").and_then(Value::as_bool).unwrap_or(false),
         unpack_blocked_by: s("unpack_blocked_by").unwrap_or_default(),
         archive_shape: s("archive_shape").unwrap_or_default(),
+        inner_crc: v.get("inner_crc").and_then(Value::as_u64).unwrap_or(0) as u32,
+        identity_name: s("identity_name").unwrap_or_default(),
+        identity_imdb: s("identity_imdb").unwrap_or_default(),
+        identity_src: s("identity_src").unwrap_or_default(),
         auto_retry_at: v.get("auto_retry_at").and_then(Value::as_u64),
         pp_params: v
             .get("pp_params")
@@ -5257,6 +5904,7 @@ fn job_from_json(v: &Value) -> Option<Job> {
         // truth would - and only until the job's next fetch restamps it.
         failure_https: v.get("failure_https").and_then(Value::as_bool).unwrap_or(false),
         failure_depth: v.get("failure_depth").and_then(Value::as_u64).unwrap_or(0) as u8,
+        identify: s("identify").unwrap_or_default(),
     })
 }
 
@@ -5426,11 +6074,30 @@ fn spool_dir(config: &std::path::Path, out_root: &std::path::Path) -> PathBuf {
     // start the daemon on an empty queue while the real one sat in `old`.
     // `remove_dir` refuses a non-empty directory, so this can only ever drop
     // an empty one, and the migration below then runs as it should.
-    if new.exists() && std::fs::remove_dir(&new).is_err() {
+    // Decide by what the directory CONTAINS, not by whether it can be
+    // removed. `remove_dir` also fails on EACCES/EPERM, and on Windows for
+    // an empty directory someone still holds a handle to - and reading that
+    // failure as "a real migrated spool" is not a harmless mistake: it sends
+    // the user's actual queue at `old` off to legacy-spool/ and starts the
+    // daemon on the empty `new`, which then SAVES that empty queue over it.
+    // An unreadable `new` is treated as occupied, which is the safe way to
+    // be wrong: it declines to migrate rather than moving live state aside.
+    let new_is_empty = match std::fs::read_dir(&new) {
+        Ok(mut rd) => rd.next().is_none(),
+        Err(_) if new.exists() => false,
+        Err(_) => true,
+    };
+    if new.exists() && !new_is_empty {
         // A real, migrated spool. Whatever is still at `old` is the residue
         // of that move, and it is sitting in the user's download folder.
         retire_legacy_spool(&old, &new);
         return new;
+    }
+    // Empty placeholder: drop it so the migration below can publish into
+    // its place. A failure here is not fatal - the rename simply lands on
+    // an existing empty directory, or the migration declines.
+    if new.exists() {
+        let _ = std::fs::remove_dir(&new);
     }
     // Beside `new`, so the publishing rename is same-filesystem and atomic.
     let staging = config.with_file_name(".spool.migrating");
@@ -5584,18 +6251,45 @@ fn load_settings(path: &std::path::Path) -> serde_json::Map<String, Value> {
 /// removes a key. Returning false lets multi-step live state avoid
 /// recording a completion marker that never reached disk.
 fn save_settings(path: &std::path::Path, values: &[(&str, Value)]) -> bool {
+    update_settings(path, |map| {
+        for (key, v) in values {
+            if v.is_null() {
+                map.remove(*key);
+            } else {
+                map.insert((*key).to_string(), v.clone());
+            }
+        }
+    })
+}
+
+/// Union two comma-separated category lists, in the settings file's own
+/// shape. Order is stable (on-disk entries first, then anything new) so
+/// a registration that adds nothing rewrites the same bytes.
+fn merge_cat_list(on_disk: &str, mine: &str) -> String {
+    let mut all: Vec<&str> = Vec::new();
+    for c in on_disk.split(',').chain(mine.split(',')).map(str::trim) {
+        if !c.is_empty() && !all.contains(&c) {
+            all.push(c);
+        }
+    }
+    all.join(", ")
+}
+
+/// The read-modify-write behind [`save_settings`], with the modify step
+/// left to the caller. Use this when the new value DEPENDS on what is
+/// already on disk: `f` runs inside the same critical section as the
+/// read and the write, so it sees the current file rather than a
+/// snapshot taken before some other worker's save.
+fn update_settings(
+    path: &std::path::Path,
+    f: impl FnOnce(&mut serde_json::Map<String, Value>),
+) -> bool {
     // API requests are handled on a worker pool - serialize the
     // read-modify-write so concurrent saves can't drop each other's keys.
     static IO: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _g = IO.lock().unwrap();
     let mut map = load_settings(path);
-    for (key, v) in values {
-        if v.is_null() {
-            map.remove(*key);
-        } else {
-            map.insert((*key).to_string(), v.clone());
-        }
-    }
+    f(&mut map);
     match serde_json::to_string_pretty(&Value::Object(map)) {
         Ok(text) => {
             if let Err(e) = crate::persist::write_atomic(path, text.as_bytes()) {
@@ -6435,6 +7129,27 @@ const DOWNLOAD_URL: &str = "https://github.com/nzbfast/nzbfast/releases/latest";
 /// binary: it sets NZBFAST_BUNDLED=1 at spawn.
 fn bundled_install() -> bool {
     std::env::var("NZBFAST_BUNDLED").is_ok_and(|v| v == "1")
+}
+
+/// True when we are running inside a container image.
+///
+/// Deliberately NOT `bundled_install()`: the Mac .app and the Windows
+/// tray set NZBFAST_BUNDLED=1 too, and telling a Mac user to open
+/// Container Manager would be nonsense. The runtime's own marker files
+/// are the signal, and they are the only one that works for the images
+/// already in the field - an env var we add to the entrypoint today only
+/// exists after the update it is meant to explain how to install.
+/// Cached: the answer cannot change while the process runs, and this is
+/// read on every queue poll (once a second per open dashboard).
+fn container_install() -> bool {
+    static IN_CONTAINER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *IN_CONTAINER.get_or_init(|| {
+        std::path::Path::new("/.dockerenv").exists()              // Docker
+            || std::path::Path::new("/run/.containerenv").exists() // Podman
+            // Escape hatch for runtimes that drop neither marker file,
+            // and the only way to exercise the container UI off a NAS.
+            || std::env::var("NZBFAST_CONTAINER").is_ok_and(|v| v == "1")
+    })
 }
 
 
@@ -7399,6 +8114,9 @@ const SPEED: &[Setting] = &[
 /// Auto-rename, and how a finished download is labelled.
 const RENAME: &[Setting] = &[
     rw("auto_rename", |c| json!(c.d.auto_rename.load(Ordering::Relaxed))),
+    rw("identity_lookup", |c| {
+        json!(c.d.identity_lookup.load(Ordering::Relaxed))
+    }),
     rw("rename_resolution", |c| {
         json!(c.d.rename_resolution.load(Ordering::Relaxed))
     }),
@@ -7415,6 +8133,9 @@ const RENAME: &[Setting] = &[
     rw("rename_extra_words", |c| {
         json!(c.d.rename_extra_words.load(Ordering::Relaxed))
     }),
+    rw("rename_identify", |c| {
+        json!(c.d.rename_identify.load(Ordering::Relaxed))
+    }),
     rw("rename_junk", |c| json!(c.d.rename_junk.load(Ordering::Relaxed))),
     rw("rename_media_only", |c| {
         json!(c.d.rename_media_only.load(Ordering::Relaxed))
@@ -7430,6 +8151,12 @@ const INDEXING: &[Setting] = &[
     // The master switch. Everything else in this table is inert while it
     // is off, and the UI hides the lot - so it is read first by both.
     rw("index_enabled", |c| json!(c.d.index_enabled.load(Ordering::Relaxed))),
+    // Spotnet: its own switch, not a sub-option of the one above.
+    rw("spot_enabled", |c| json!(c.d.spot_enabled.load(Ordering::Relaxed))),
+    rw("spot_groups", |c| json!(c.d.spot_groups.lock().unwrap().clone())),
+    rw("spot_backfill", |c| {
+        json!(c.d.spot_backfill.load(Ordering::Relaxed))
+    }),
     rw("library_cats", |c| json!(c.d.library_cats.lock().unwrap().clone())),
     rw("library_recheck_secs", |c| {
         json!(c.d.library_recheck_secs.load(Ordering::Relaxed))
@@ -7521,9 +8248,10 @@ const AUTOMATION: &[Setting] = &[
     rw_opaque("watchlist", |c| {
         serde_json::to_value(&*c.d.watchlist.lock().unwrap()).unwrap_or(json!([]))
     }),
-    rw("watchlist_external", |c| {
-        json!(c.d.watchlist_external.load(Ordering::Relaxed))
-    }),
+    // The EFFECTIVE answer, not the raw bool: the dashboard checkbox has
+    // to show what the watcher will actually do, and while the user has
+    // not answered that is derived from whether any indexer exists.
+    rw("watchlist_external", |c| json!(c.d.watchlist_external_on())),
     rw_opaque("smart_folders", |c| {
         serde_json::to_value(&*c.d.smart_folders.lock().unwrap()).unwrap_or(json!([]))
     }),
@@ -7844,6 +8572,11 @@ fn apply_setting(
             d.auto_rename.store(on, Ordering::Relaxed);
             (true, json!(on))
         }
+        "identity_lookup" => {
+            let on = flag();
+            d.identity_lookup.store(on, Ordering::Relaxed);
+            (true, json!(on))
+        }
         "rename_resolution" => {
             let on = flag();
             d.rename_resolution.store(on, Ordering::Relaxed);
@@ -7882,6 +8615,11 @@ fn apply_setting(
         "rename_extra_words" => {
             let on = flag();
             d.rename_extra_words.store(on, Ordering::Relaxed);
+            (true, json!(on))
+        }
+        "rename_identify" => {
+            let on = flag();
+            d.rename_identify.store(on, Ordering::Relaxed);
             (true, json!(on))
         }
         "script_timeout_secs" => {
@@ -8185,6 +8923,45 @@ fn apply_setting(
             }
             (true, json!(on))
         }
+        "spot_enabled" => {
+            let on = v == "1" || v.eq_ignore_ascii_case("true");
+            d.spot_enabled.store(on, Ordering::Relaxed);
+            if on {
+                // Same reasoning as the indexer switch: scan now rather
+                // than after a full interval of an empty list.
+                d.scan_now.notify_one();
+                println!("[spots] Spotnet spots switched on");
+            } else {
+                // A no-op while the indexer still wants the database.
+                d.close_index();
+                println!("[spots] Spotnet spots switched off - no spot group is scanned");
+            }
+            (true, json!(on))
+        }
+        "spot_groups" => {
+            let groups: Vec<String> = v
+                .split(&[',', ' ', '\n'][..])
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            *d.spot_groups.lock().unwrap() = groups.clone();
+            d.scan_now.notify_one();
+            (true, json!(groups))
+        }
+        "spot_backfill" => {
+            // A first pass walks back this many articles; later passes
+            // resume from the high-water mark, so this only ever costs
+            // once per group. Capped: free.pt holds ~4.4M articles and
+            // asking for all of them is minutes of OVER for spots that
+            // are years stale.
+            let n: u64 = v
+                .trim()
+                .parse()
+                .map_err(|_| "spot_backfill: expected a number".to_string())?;
+            let n = n.clamp(1_000, 1_000_000);
+            d.spot_backfill.store(n, Ordering::Relaxed);
+            (true, json!(n))
+        }
         // M34 size cap. Four settings, and only the last of them can
         // delete anything - see index_evict.
         "index_max_bytes" => {
@@ -8387,10 +9164,15 @@ fn apply_setting(
         }
         "watchlist_external" => {
             // M35 phase 2: let the watcher ask the user's indexer
-            // accounts for wanted items. Off by default; each item then
-            // spends at most one search per WATCH_EXT_INTERVAL_SECS,
-            // and per-indexer daily budgets still apply on top.
+            // accounts for wanted items. Each item then spends at most
+            // one search per WATCH_EXT_INTERVAL_SECS, and per-indexer
+            // daily budgets still apply on top.
+            //
+            // M35b: writing here is the user ANSWERING, which pins the
+            // value against the indexers-configured default - including
+            // an explicit off, which must survive adding an indexer.
             d.watchlist_external.store(flag(), Ordering::Relaxed);
+            d.watchlist_external_set.store(true, Ordering::Relaxed);
             (true, json!(d.watchlist_external.load(Ordering::Relaxed)))
         }
         "watchlist" => {
@@ -8754,8 +9536,14 @@ fn watchlist_pass(d: &Arc<Daemon>) {
                         // FILED, so a filed delete cannot reach the upgrade
                         // that has just landed in the same season folder
                         // under the same episode base.
-                        let sfx = delete_suffix(&g, || d.job_suffix(&g.name));
-                        (g.out_dir.clone(), g.nzb_path.clone(), g.name.clone(), g.filed, sfx)
+                        let sfx = delete_suffix(&g, || d.job_suffix(filed_stem(&g)));
+                        (
+                            g.out_dir.clone(),
+                            g.nzb_path.clone(),
+                            filed_stem(&g).to_string(),
+                            g.filed,
+                            sfx,
+                        )
                     };
                     remove_job_files(&dir, &name, filed, &suffix);
                     let _ = std::fs::remove_file(&nzb);
@@ -8778,8 +9566,14 @@ fn watchlist_pass(d: &Arc<Daemon>) {
                         // Same as above: this is the SUPERSEDED release's
                         // own filed suffix, and the replacement's files do
                         // not carry it.
-                        let sfx = delete_suffix(&g, || d.job_suffix(&g.name));
-                        (g.out_dir.clone(), g.nzb_path.clone(), g.name.clone(), g.filed, sfx)
+                        let sfx = delete_suffix(&g, || d.job_suffix(filed_stem(&g)));
+                        (
+                            g.out_dir.clone(),
+                            g.nzb_path.clone(),
+                            filed_stem(&g).to_string(),
+                            g.filed,
+                            sfx,
+                        )
                     };
                     remove_job_files(&dir, &name, filed, &suffix);
                     let _ = std::fs::remove_file(&nzb);
@@ -8963,13 +9757,17 @@ fn watchlist_pass(d: &Arc<Daemon>) {
         }
         // M35 phase 2: ask the user's indexer accounts for this item, on
         // its own slow cadence, and let anything they offer compete as
-        // an ordinary candidate. OFF unless the user turned it on: this
-        // is the one path that spends a metered third-party account
-        // without a click. Results run through the SAME classify /
+        // an ordinary candidate. This is the one path that spends a
+        // metered third-party account without a click, so it is fenced
+        // by WATCH_EXT_INTERVAL_SECS and the per-indexer daily budgets
+        // rather than by being off - a watchlist that cannot see
+        // obfuscated posts and will not ask the accounts that CAN sees
+        // nothing at all. An explicit off still wins, always.
+        // Results run through the SAME classify /
         // matches / slot_of / age_ok pipeline as local rows, so quality
         // ranking, the failed-stem memory and every decide() rule apply
         // unchanged - an external candidate is just a candidate.
-        if d.watchlist_external.load(Ordering::Relaxed) {
+        if d.watchlist_external_on() {
             let due = state
                 .ext_checked
                 .get(&item.id)
@@ -9360,7 +10158,12 @@ fn watchlist_grab(
             let fetched = match fetch_url(url) {
                 Ok(f) => f,
                 Err(e) => {
-                    eprintln!("[watch] fetching {stem} from {indexer}: {e}");
+                    // redact_url_creds: fetch_url names the URL it failed
+                    // on, and here that is the indexer's enclosure link,
+                    // which carries the user's account apikey. logtee
+                    // mirrors stdout/stderr into the dashboard log, so an
+                    // unscrubbed line is not merely "in a file on the NAS".
+                    eprintln!("[watch] fetching {stem} from {indexer}: {}", redact_url_creds(&e.to_string()));
                     return None;
                 }
             };
@@ -9815,12 +10618,15 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
         move_completed: std::sync::RwLock::new(None),
         move_completed_cats: std::sync::RwLock::new(Vec::new()),
         spool: spool.clone(),
+        cfg_path: config.clone(),
         cats: Mutex::new(DEFAULT_CATS.iter().map(|s| s.to_string()).collect()),
         port,
         library_cats: Mutex::new(library_cats),
         active_stream: Mutex::new(None),
         index_db: index_db.clone(),
         index: Mutex::new(None),
+        index_read: Mutex::new(None),
+        index_migrated: std::sync::atomic::AtomicBool::new(false),
         index_stats_cache: Mutex::new(None),
         auto_speed: std::sync::atomic::AtomicBool::new(auto_speed),
         auto_connections: std::sync::atomic::AtomicBool::new(true),
@@ -9852,7 +10658,9 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
         feeds: Mutex::new(Vec::new()),
         indexers: Mutex::new(Vec::new()),
         watchlist_external: std::sync::atomic::AtomicBool::new(false),
+        watchlist_external_set: std::sync::atomic::AtomicBool::new(false),
         indexer_rt: Mutex::new(IndexerRuntime::default()),
+        nzblnk_recent: Mutex::new(std::collections::VecDeque::new()),
         smart_folders: Mutex::new(Vec::new()),
         cleanup_exts: Mutex::new(Vec::new()),
         // Loaded from settings.json below (next to smart_folders); the
@@ -9864,6 +10672,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
         // Auto-rename defaults: on, with resolution in the name; codecs /
         // source / group off; junk sweep on; keep-media-only off. Saved
         // settings replay over these below.
+        identity_lookup: std::sync::atomic::AtomicBool::new(true),
         auto_rename: std::sync::atomic::AtomicBool::new(true),
         rename_resolution: std::sync::atomic::AtomicBool::new(true),
         rename_vcodec: std::sync::atomic::AtomicBool::new(false),
@@ -9873,6 +10682,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
         rename_year_parens: std::sync::atomic::AtomicBool::new(legacy_rename_punctuation),
         rename_quality_brackets: std::sync::atomic::AtomicBool::new(legacy_rename_punctuation),
         rename_extra_words: std::sync::atomic::AtomicBool::new(true),
+        rename_identify: std::sync::atomic::AtomicBool::new(true),
         history_rows: AtomicU64::new(10),
         history_color_names: std::sync::atomic::AtomicBool::new(true),
         rename_junk: std::sync::atomic::AtomicBool::new(true),
@@ -9902,6 +10712,34 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                 .unwrap_or(false),
         ),
         index_enabled: std::sync::atomic::AtomicBool::new(index_enabled),
+        // Spots are new, so there is no existing-install case to seed
+        // from: nobody has one running today. Straight off until asked.
+        spot_enabled: std::sync::atomic::AtomicBool::new(
+            load_settings(&settings_path)
+                .get("spot_enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ),
+        spot_groups: Mutex::new(
+            load_settings(&settings_path)
+                .get("spot_groups")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_else(|| vec!["free.pt".to_string()]),
+        ),
+        spot_backfill: AtomicU64::new(
+            load_settings(&settings_path)
+                .get("spot_backfill")
+                .and_then(Value::as_u64)
+                .unwrap_or(50_000)
+                .clamp(1_000, 1_000_000),
+        ),
+        index_generation: AtomicU64::new(0),
         index_jobs_active: Arc::new(AtomicUsize::new(0)),
         // M34 size cap. UI-only settings (no CLI flags), read straight
         // off settings.json like index_retention above.
@@ -10185,6 +11023,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
         }
         for (key, field) in [
             ("auto_rename", &daemon.auto_rename),
+            ("identity_lookup", &daemon.identity_lookup),
             ("rename_resolution", &daemon.rename_resolution),
             ("rename_vcodec", &daemon.rename_vcodec),
             ("rename_acodec", &daemon.rename_acodec),
@@ -10193,6 +11032,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
             ("rename_year_parens", &daemon.rename_year_parens),
             ("rename_quality_brackets", &daemon.rename_quality_brackets),
             ("rename_extra_words", &daemon.rename_extra_words),
+            ("rename_identify", &daemon.rename_identify),
             ("history_color_names", &daemon.history_color_names),
             ("rename_junk", &daemon.rename_junk),
             ("rename_media_only", &daemon.rename_media_only),
@@ -10271,8 +11111,11 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
         if let Some(v) = saved.get("index_coverage").and_then(Value::as_bool) {
             daemon.index_coverage.store(v, Ordering::Relaxed);
         }
+        // Present in settings.json == the user answered the question, so
+        // the stored value wins over the indexers-configured default.
         if let Some(v) = saved.get("watchlist_external").and_then(Value::as_bool) {
             daemon.watchlist_external.store(v, Ordering::Relaxed);
+            daemon.watchlist_external_set.store(true, Ordering::Relaxed);
         }
         if let Some(v) = saved.get("index_gapfill").and_then(Value::as_u64) {
             daemon.index_gapfill.store(v.min(100), Ordering::Relaxed);
@@ -10945,11 +11788,21 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                 // the default parallelism - plus SQLite writes on the same
                 // box the download is using. Re-check every 5 s so
                 // indexing resumes promptly when the queue drains.
-                if daemon2.indexing_pause_reason().is_some() {
+                //
+                // The two sources are switched independently, so this
+                // waits only while BOTH are stopped, and each leg below
+                // re-asks for itself. A spots-only install runs this
+                // loop with an empty group list.
+                let scan_groups = daemon2.indexing_pause_reason().is_none();
+                if !scan_groups && daemon2.spot_pause_reason().is_some() {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     continue;
                 }
-                let groups = daemon2.index_groups.lock().unwrap().clone();
+                let groups = if scan_groups {
+                    daemon2.index_groups.lock().unwrap().clone()
+                } else {
+                    Vec::new()
+                };
                 let backfill = daemon2.index_backfill.load(Ordering::Relaxed);
                 let deepen = daemon2.index_deepen.load(Ordering::Relaxed);
                 let coverage = daemon2.index_coverage.load(Ordering::Relaxed);
@@ -10963,10 +11816,72 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                 // the tip watcher or VACUUM. The foreground worker raises
                 // its guard before waiting for this same gate, so this
                 // recheck hands the gate over without starting a pass.
-                if daemon2.indexing_pause_reason().is_some() {
+                // Both legs are re-asked: whatever started applies to
+                // both, and a pass with nothing left to do should give
+                // the gate straight back.
+                let scan_groups = scan_groups && daemon2.indexing_pause_reason().is_none();
+                let scan_spots = daemon2.spot_pause_reason().is_none();
+                if !scan_groups && !scan_spots {
                     drop(index_pass);
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     continue;
+                }
+                let groups = if scan_groups { groups } else { Vec::new() };
+
+                // Spotnet first. It is short (a 20k-article OVER walk is
+                // ~20 s against a live server) and a spots-only install
+                // should not sit behind a group pass that is not even
+                // running. Same gate, same preemption contract as the
+                // scans below: dropped promptly when a download starts,
+                // with the high-water mark left on the last whole chunk.
+                if scan_spots {
+                    let spot_groups = daemon2.spot_groups.lock().unwrap().clone();
+                    let backfill = daemon2.spot_backfill.load(Ordering::Relaxed);
+                    for g in &spot_groups {
+                        if daemon2.spot_pause_reason().is_some() {
+                            break;
+                        }
+                        // The generation this pass runs under: if the
+                        // database is switched off or wiped while the
+                        // scan is in flight, its connection must be
+                        // dropped rather than handed back (which would
+                        // reopen, and after a wipe RECREATE, the file).
+                        let era = daemon2.index_era();
+                        let mut scratch = match nzbkit::index::Index::open(&db) {
+                            Ok(ix) => ix,
+                            Err(e) => {
+                                eprintln!("[spots] open {}: {e}", db.display());
+                                break;
+                            }
+                        };
+                        let scan = crate::spot_scan_pass(&config, &mut scratch, g, backfill);
+                        let pause = async {
+                            loop {
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                if daemon2.spot_pause_reason().is_some() {
+                                    break;
+                                }
+                            }
+                        };
+                        match tokio::select! {
+                            result = scan => Some(result),
+                            _ = pause => None,
+                        } {
+                            Some(Ok(sum)) if sum.new > 0 => println!(
+                                "[spots] {g}: {} new spots ({} scanned, {} verified)",
+                                sum.new, sum.scanned, sum.valid
+                            ),
+                            Some(Ok(_)) => {}
+                            Some(Err(e)) => eprintln!("[spots] {g}: {e}"),
+                            None => println!("[spots] {g} paused for foreground job"),
+                        }
+                        drop(scratch);
+                        // Republish so queries see this pass's writes.
+                        if let Ok(fresh) = nzbkit::index::Index::open(&db) {
+                            daemon2.publish_index(era, fresh);
+                        }
+                        daemon2.drop_index_read();
+                    }
                 }
                 // 24D: the category config changed (or first run since
                 // start) - reconcile stored rows before this pass, so a
@@ -11001,9 +11916,11 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                         // Freshly re-keyed cards need titles rows for the
                         // wall; the seeder below only covers recent posts,
                         // so republish + seed now.
+                        let era = daemon2.index_era();
                         if let Ok(fresh) = nzbkit::index::Index::open(&db) {
-                            *daemon2.index.lock().unwrap() = Some(fresh);
+                            daemon2.publish_index(era, fresh);
                         }
+                        daemon2.drop_index_read();
                         let _ = daemon2.with_index(|ix| ix.seed_missing_titles(3650, 2000).ok());
                     }
                 }
@@ -11045,6 +11962,12 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                     let preempted2 = preempted.clone();
                     set.spawn(async move {
                         let _permit = sem.acquire_owned().await.expect("scan semaphore");
+                        // The generation this pass belongs to. A pass runs
+                        // for minutes; the switch and the wipe are one
+                        // click. Publishing without checking this is how a
+                        // switched-off indexer got a live connection back
+                        // and a wiped database got recreated.
+                        let era = daemon3.index_era();
                         // Scan into a dedicated connection, then republish
                         // - keeps the OVER round-trips off the lock that
                         // query handlers need.
@@ -11104,10 +12027,16 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                         daemon3.scan_progress.lock().unwrap().retain(|p| p.group != g);
                         drop(scratch);
                         // Re-open the shared connection so it sees this
-                        // task's now-committed writes (fresh read snapshot).
-                        if let Ok(fresh) = nzbkit::index::Index::open(&db) {
-                            *daemon3.index.lock().unwrap() = Some(fresh);
+                        // task's now-committed writes (fresh read snapshot)
+                        // - unless the index was switched off or wiped
+                        // while we ran, in which case there is nothing to
+                        // publish to.
+                        if daemon3.index_era() == era
+                            && let Ok(fresh) = nzbkit::index::Index::open(&db)
+                        {
+                            daemon3.publish_index(era, fresh);
                         }
+                        daemon3.drop_index_read();
                     });
                 }
                 while set.join_next().await.is_some() {}
@@ -11125,7 +12054,14 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                 // A job that interrupted this pass is waiting for the
                 // gate. Skip every post-pass SQLite task and release it
                 // immediately; indexing resumes from its marks later.
-                if daemon2.indexing_pause_reason().is_some() {
+                //
+                // `scan_groups &&` matters on a spots-only install: with
+                // the indexer switched off this reason is permanently
+                // "off", and short-circuiting on it would skip the
+                // interval sleep at the bottom of the loop and re-scan
+                // free.pt as fast as the server would answer. Every
+                // post-pass task below is already a no-op with no groups.
+                if scan_groups && daemon2.indexing_pause_reason().is_some() {
                     drop(index_pass);
                     continue;
                 }
@@ -11153,6 +12089,11 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                 {
                     let gates2 = daemon2.index_gates.lock().unwrap().1.clone();
                     let cats2 = daemon2.custom_categories.read().unwrap().clone();
+                    // Same contract as the scan tasks above: this owns a
+                    // dedicated connection for the length of the pass, so
+                    // it may only publish if the index it belongs to is
+                    // still the current one.
+                    let era = daemon2.index_era();
                     match nzbkit::index::Index::open(&db) {
                         Ok(mut scratch) => {
                             install_live_ingest_policy(&mut scratch, gates2, cats2);
@@ -11194,9 +12135,12 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                                 }
                             }
                             drop(scratch);
-                            if let Ok(fresh) = nzbkit::index::Index::open(&db) {
-                                *daemon2.index.lock().unwrap() = Some(fresh);
+                            if daemon2.index_era() == era
+                                && let Ok(fresh) = nzbkit::index::Index::open(&db)
+                            {
+                                daemon2.publish_index(era, fresh);
                             }
+                            daemon2.drop_index_read();
                         }
                         Err(e) => eprintln!("[gapfill] open {}: {e}", db.display()),
                     }
@@ -11243,9 +12187,11 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                                 "[index] retention pruned {aged} old + {stale} stale-partial rows"
                             );
                             // Republish so queries see the smaller db.
+                            let era = daemon2.index_era();
                             if let Ok(fresh) = nzbkit::index::Index::open(&index_db) {
-                                *daemon2.index.lock().unwrap() = Some(fresh);
+                                daemon2.publish_index(era, fresh);
                             }
+                            daemon2.drop_index_read();
                         }
                     }
                 }
@@ -11268,9 +12214,11 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                         // Republish so queries see the smaller db (the
                         // file is still big - the pages are free, not
                         // returned - but the rows are gone).
+                        let era = daemon2.index_era();
                         if let Ok(fresh) = nzbkit::index::Index::open(&index_db) {
-                            *daemon2.index.lock().unwrap() = Some(fresh);
+                            daemon2.publish_index(era, fresh);
                         }
+                        daemon2.drop_index_read();
                     }
                 }
                 drop(index_pass);
@@ -11280,8 +12228,11 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                 // returns at once, so a mid-pass click still lands).
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(
-                        // Idle (no groups): just re-check the setting soon.
-                        if groups.is_empty() { 15 } else { interval },
+                        // Idle (nothing scanned): just re-check the
+                        // setting soon. A spot pass IS work, so it waits
+                        // out the real interval - the 15 s re-check would
+                        // otherwise walk free.pt four times a minute.
+                        if groups.is_empty() && !scan_spots { 15 } else { interval },
                     )) => {}
                     _ = daemon2.scan_now.notified() => {}
                 }
@@ -12371,6 +13322,13 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                         if let Some(tag) = shaper.as_ref().and_then(|e| e.archive_shape()) {
                             j.archive_shape = tag.tag();
                         }
+                        // Same latch-don't-downgrade rule, same reason:
+                        // a resumed run maps nothing in-stream, and the
+                        // headers this key came from are not on disk to
+                        // read again.
+                        if let Some((_, crc)) = shaper.as_ref().and_then(|e| e.inner_crc()) {
+                            j.inner_crc = crc;
+                        }
                         j.finished_at = Some(Instant::now());
                         j.finished_unix = Some(unix_now());
                         j.demote
@@ -13405,7 +14363,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                     continue;
                 }
                 let id: i64 = rest.trim_end_matches(".nzb").parse().unwrap_or(-1);
-                let r = d.with_index(|ix| ix.make_nzb(id).ok());
+                let r = d.with_index_read(|ix| ix.make_nzb(id).ok());
                 match r {
                     Some(xml) => {
                         // M34: pulling the NZB is the strongest "I want
@@ -13527,10 +14485,15 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
             let body = match mode.as_str() {
                 // `version` stays the SAB-compat string (the *arrs
                 // feature-gate on it); `nzbfast` is our real release
-                // version, which is what the UI shows.
+                // version, which is what the UI shows. `beta` is the
+                // between-releases build serial (build.rs, from
+                // packaging/beta-serial.txt) - "" on a real release.
+                // KEPT OUT of `nzbfast` itself: the update check and
+                // every wrapper parse that field as a bare semver.
                 "version" => json!({
                     "version": SAB_VERSION,
                     "nzbfast": env!("CARGO_PKG_VERSION"),
+                    "beta": env!("NZBFAST_BETA"),
                 }),
                 // Show the caller the key they already have, so setting up
                 // Sonarr later does not mean digging through %LOCALAPPDATA%
@@ -13880,7 +14843,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                     for item in items.iter().filter(|i| i.enabled && i.kind == "tv") {
                         let key = format!("eplist:{}", crate::wall::norm_title(&item.title));
                         let eps: Vec<crate::wall::EpInfo> = d
-                            .with_index(|ix| ix.kv_get(&key))
+                            .with_index_read(|ix| ix.kv_get(&key))
                             .and_then(|s| serde_json::from_str::<Value>(&s).ok())
                             .and_then(|v| serde_json::from_value(v["episodes"].clone()).ok())
                             .unwrap_or_default();
@@ -14563,7 +15526,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                         match found {
                             None => json!({"status": false, "error": "unknown nzo_id"}),
                             Some(job) => {
-                                let (locked, out_dir, name, cat, tv) = {
+                                let (locked, out_dir, name, cat, tv, nzb) = {
                                     let mut j = job.lock().unwrap();
                                     j.password = Some(pw.clone());
                                     (
@@ -14572,6 +15535,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                                         j.name.clone(),
                                         j.category.clone(),
                                         j.tv_sort,
+                                        j.nzb_path.clone(),
                                     )
                                 };
                                 if locked {
@@ -14579,20 +15543,35 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                                     let job2 = job.clone();
                                     tokio::task::spawn_blocking(move || {
                                         if crate::smart::unlock(&out_dir, &pw) {
-                                            let (moved, sfx) =
-                                                d2.finalize_names(&out_dir, &name, &cat, tv);
+                                            let post_year = match post_year_of(&nzb) {
+                                                0 => crate::identify::current_year(),
+                                                y => y,
+                                            };
+                                            let done = d2.finalize_names(
+                                                &out_dir,
+                                                &FinalizeJob {
+                                                    name: &name,
+                                                    cat: &cat,
+                                                    tv_sort: tv,
+                                                    post_year,
+                                                },
+                                            );
                                             let mut j = job2.lock().unwrap();
                                             j.password_required = false;
                                             if j.fail_message == "password required to unpack" {
                                                 j.fail_message.clear();
                                             }
-                                            if let Some(dest) = moved {
+                                            if !done.identify.is_empty() {
+                                                j.identify = done.identify;
+                                            }
+                                            if let Some(dest) = done.moved {
                                                 j.filed =
                                                     j.tv_sort && is_season_dir(&dest);
                                                 // The suffix filing just
                                                 // used, kept for the delete
                                                 // that will need it later.
-                                                j.filed_suffix = j.filed.then_some(sfx);
+                                                j.filed_suffix =
+                                                    j.filed.then_some(done.suffix);
                                                 j.out_dir = dest;
                                             }
                                             drop(j);
@@ -14792,6 +15771,25 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                     };
                     let name = from_body("name").or_else(|| params.get("name").cloned());
                     let value = from_body("value").or_else(|| params.get("value").cloned());
+                    // The bootstrap hatch authorised exactly ONE setting, and
+                    // it decided that from the `name` in the QUERY string -
+                    // but the body wins two lines up. Without this check a
+                    // holder of the add-only NZB key could present
+                    // `?mode=config&name=apikey` to pass the gate and then
+                    // write `{"name":"script"}` in the body: an add-only
+                    // credential escalating to arbitrary config, and from
+                    // there to code execution, because `script` is run on the
+                    // job tail and `addfile` is itself add-only. Refuse with
+                    // the same phrase the gate uses, so nothing downstream
+                    // learns that the request got this far.
+                    if bootstrap_apikey && name.as_deref() != Some("apikey") {
+                        let _ = req.respond(json_resp(json!({
+                            "status": false,
+                            "error": "API Key Incorrect",
+                            "nzbfast": env!("CARGO_PKG_VERSION"),
+                        })));
+                        continue;
+                    }
                     match (name.as_deref(), value.as_deref()) {
                         (Some("set_pause"), Some(v)) => {
                             // SAB parity: config&name=set_pause&value=<minutes>.
@@ -15135,12 +16133,21 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                                     });
                                     // A Test click is the freshest caps
                                     // answer there is - let searches use
-                                    // it instead of re-probing.
+                                    // it instead of re-probing. Under the
+                                    // ENDPOINT's identity, never the
+                                    // name: this cfg may be an unsaved
+                                    // draft, and a draft that borrowed a
+                                    // saved entry's name used to publish
+                                    // its caps over the saved entry's -
+                                    // which then planned id searches
+                                    // against a site it never pointed at,
+                                    // for the full 24 h TTL, even if the
+                                    // user cancelled the edit.
                                     d.indexer_rt
                                         .lock()
                                         .unwrap()
                                         .caps
-                                        .insert(cfg.name.clone(), (Instant::now(), Some(caps)));
+                                        .insert(cfg.identity(), (Instant::now(), Some(caps)));
                                     out
                                 }
                                 Err(e) => json!({"status": false, "error": e.to_string()}),
@@ -15228,6 +16235,52 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                             Err(e) => json!({"status": false, "error": e.to_string()}),
                         },
                         Err(e) => json!({"status": false, "error": e.to_string()}),
+                    }
+                }
+                // NZBLNK: a link with no NZB behind it. The German and
+                // Dutch boards hand out `nzblnk:?h=…` instead of a file
+                // because the posting is obfuscated - there is nothing
+                // to link to until somebody has scanned the group - and
+                // the client is expected to resolve the header itself.
+                //
+                // We own both halves already, so the ladder is short and
+                // in cost order:
+                //   1. our own header index, which needs no network at
+                //      all and can emit the NZB from stored segment ids;
+                //   2. the user's configured indexers over the M35
+                //      client, under the same daily budgets and backoff
+                //      every other pull search obeys.
+                // Deliberately NOT in the add-only key's allowlist: rung
+                // 2 spends the user's indexer quota, which an add-only
+                // credential has no business doing.
+                //
+                // `p` becomes the job password, so the existing
+                // password-chain unlock opens the archive without the
+                // user pasting it anywhere; `t` becomes the job name.
+                "addnzblnk" => {
+                    // `link` is ours; `name` is where addurl puts its
+                    // URL, so a caller that treats the two modes alike
+                    // still works.
+                    let raw = params
+                        .get("link")
+                        .or_else(|| params.get("name"))
+                        .cloned()
+                        .unwrap_or_default();
+                    match nzbkit::nzblnk::parse(&raw) {
+                        // `reason` is the stable, machine-readable half:
+                        // the dashboard says these two in the user's own
+                        // language rather than echoing English back.
+                        Err(e) => {
+                            json!({"status": false, "reason": "badlink", "error": e.to_string()})
+                        }
+                        Ok(l) => {
+                            let cat = params.get("cat").cloned().unwrap_or_default();
+                            let cat = if cat == "*" { String::new() } else { cat };
+                            let prio = param_priority(&params);
+                            let dupe_ok = params.get("dupe_ok").map(String::as_str) == Some("1");
+                            let pw = (!l.password.is_empty()).then(|| l.password.clone());
+                            resolve_nzblnk(&d, &l, &cat, prio, pw.as_deref(), dupe_ok)
+                        }
                     }
                 }
                 // M16 fix-match: candidate list for a re-search. Network
@@ -15663,7 +16716,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                     // propagation and for a post whose first article
                     // predates the rest of its set.
                     let posted_after = epoch_secs() as i64 - 7 * 86_400;
-                    let tip = d.with_index(|ix| {
+                    let tip = d.with_index_read(|ix| {
                         ix.wall_tip(if initialized { since } else { i64::MAX }, posted_after, 60)
                             .ok()
                     });
@@ -15677,7 +16730,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                 "title_credits" => {
                     let key = params.get("key").cloned().unwrap_or_default();
                     let rows = d
-                        .with_index(|ix| ix.title_credits(&key, 40).ok())
+                        .with_index_read(|ix| ix.title_credits(&key, 40).ok())
                         .unwrap_or_default();
                     let art_dir = d.spool.join("art");
                     json!({"credits": rows.iter().map(|c| json!({
@@ -15692,7 +16745,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                     let id: i64 =
                         params.get("value").and_then(|v| v.parse().ok()).unwrap_or(-1);
                     let art_dir = d.spool.join("art");
-                    match d.with_index(|ix| {
+                    match d.with_index_read(|ix| {
                         let p = ix.person_get(id).ok()??;
                         Some((p, ix.person_titles(id).unwrap_or_default()))
                     }) {
@@ -15729,7 +16782,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                 "person_more" => {
                     let id: i64 =
                         params.get("value").and_then(|v| v.parse().ok()).unwrap_or(-1);
-                    match d.with_index(|ix| ix.person_get(id).ok().flatten()) {
+                    match d.with_index_read(|ix| ix.person_get(id).ok().flatten()) {
                         Some(p) => {
                             let (filmo, complete) = crate::wall::person_filmography(
                                 p.tvmaze_id,
@@ -15740,7 +16793,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                             // normalized title match, which is the same
                             // key the wall groups cards by.
                             let have: std::collections::HashSet<String> = d
-                                .with_index(|ix| ix.person_titles(id).ok())
+                                .with_index_read(|ix| ix.person_titles(id).ok())
                                 .unwrap_or_default()
                                 .iter()
                                 .map(|t| crate::wall::norm_title(&t.title))
@@ -15770,7 +16823,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                 "people_search" => {
                     let q = params.get("q").cloned().unwrap_or_default();
                     let rows = d
-                        .with_index(|ix| ix.people_search(&q, 12).ok())
+                        .with_index_read(|ix| ix.people_search(&q, 12).ok())
                         .unwrap_or_default();
                     let art_dir = d.spool.join("art");
                     json!({"people": rows.iter().map(|p| json!({
@@ -15779,7 +16832,8 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                     })).collect::<Vec<_>>()})
                 }
                 "wall_hidden" => {
-                    let rows = d.with_index(|ix| ix.hidden_titles().ok()).unwrap_or_default();
+                    let rows =
+                        d.with_index_read(|ix| ix.hidden_titles().ok()).unwrap_or_default();
                     let art_dir = d.spool.join("art");
                     json!({"hidden": rows.iter().map(|h| {
                         // Same thumb resolution as wall2 cards.
@@ -15794,7 +16848,8 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                     }).collect::<Vec<_>>()})
                 }
                 "wall_rules" => {
-                    let rules = d.with_index(|ix| ix.rules_list().ok()).unwrap_or_default();
+                    let rules =
+                        d.with_index_read(|ix| ix.rules_list().ok()).unwrap_or_default();
                     json!({"rules": rules.iter().map(|r| json!({
                         "id": r.id, "field": r.field, "value": r.value,
                         "added": r.added, "auto": r.auto,
@@ -15840,24 +16895,60 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                     if params.get("value").map(String::as_str) != Some("wipe") {
                         json!({"status": false, "error": "pass value=wipe to confirm"})
                     } else {
+                        // Retire the generation FIRST. A scan pass holds a
+                        // dedicated connection and reopens the shared one
+                        // when it exits; without this it recreated the
+                        // database we just deleted, moments after the API
+                        // said it was gone.
+                        let mut failed: Vec<String> = Vec::new();
                         {
                             let mut guard = d.index.lock().unwrap();
+                            d.index_generation.fetch_add(1, Ordering::SeqCst);
                             *guard = None;
                             for suffix in ["", "-wal", "-shm"] {
                                 let p = PathBuf::from(format!(
                                     "{}{suffix}",
                                     d.index_db.display()
                                 ));
-                                let _ = std::fs::remove_file(p);
+                                // Report what did not go. On Windows an
+                                // open handle makes this fail outright,
+                                // and answering `true` over a database
+                                // still sitting on disk is the one thing
+                                // a corruption-recovery button must not
+                                // do.
+                                if let Err(e) = std::fs::remove_file(&p) {
+                                    if e.kind() != std::io::ErrorKind::NotFound {
+                                        failed.push(format!("{}: {e}", p.display()));
+                                    }
+                                }
                             }
+                            // AFTER the removes: a query re-opening the
+                            // read-only handle a beat earlier would pin
+                            // the deleted inode and keep serving the
+                            // wiped rows; dropping it last closes any
+                            // such straggler too.
+                            d.drop_index_read();
                         }
                         let art = d.spool.join("art");
-                        let _ = std::fs::remove_dir_all(&art);
-                        println!(
-                            "[index] {} wiped by request - rescan starts next cycle",
-                            d.index_db.display()
-                        );
-                        json!({"status": true})
+                        if let Err(e) = std::fs::remove_dir_all(&art) {
+                            if e.kind() != std::io::ErrorKind::NotFound {
+                                failed.push(format!("{}: {e}", art.display()));
+                            }
+                        }
+                        if failed.is_empty() {
+                            println!(
+                                "[index] {} wiped by request - rescan starts next cycle",
+                                d.index_db.display()
+                            );
+                            json!({"status": true})
+                        } else {
+                            let why = failed.join("; ");
+                            eprintln!("[index] wipe incomplete: {why}");
+                            json!({
+                                "status": false,
+                                "error": format!("the index was not fully removed - {why}"),
+                            })
+                        }
                     }
                 }
                 // M31a: reclaim disk after retention pruning (VACUUM). Only
@@ -16276,7 +17367,8 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                 }
                 "index_search" => {
                     let q = params.get("q").cloned().unwrap_or_default();
-                    let hits = d.with_index(|ix| ix.search(&q, 60).ok()).unwrap_or_default();
+                    let hits =
+                        d.with_index_read(|ix| ix.search(&q, 60).ok()).unwrap_or_default();
                     {
                         // Parsed name facts ride along so the UI can show
                         // quality badges and offer one-click watchlisting.
@@ -16373,7 +17465,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                     let aff_ctx = (sort == nzbkit::index::CardSort::Affinity)
                         .then(|| d.affinity_ctx(&d.taste_profile()))
                         .flatten();
-                    match d.with_index(|ix| {
+                    match d.with_index_read(|ix| {
                         ix.browse_cards(&bq, sort, matched_only, catgroup, aff_ctx.as_ref())
                             .ok()
                     }) {
@@ -16390,7 +17482,13 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                             // enricher at all - and (b) a slot in the
                             // hot queue, so on-screen titles get art
                             // first.
-                            d.with_index(|ix| {
+                            // try_with_index, not with_index: the seed is
+                            // a shrug-off side-write, and parking here
+                            // would hand back the very ingest-holds-the-
+                            // lock wait the read-only path just avoided.
+                            // A busy connection skips the seed; the next
+                            // wall poll re-offers the same cards.
+                            d.try_with_index(|ix| {
                                 for c in cards.iter().filter(|c| c.checked == 0) {
                                     let p = crate::wall::parse_release(&c.rep_stem);
                                     let _ = ix.title_seed(
@@ -16616,7 +17714,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                     // Rust function, and mirroring them in JS would let the
                     // two drift apart.
                     let qprefs = d.quality_prefs.lock().unwrap().clone();
-                    match d.with_index(|ix| ix.browse(&bq).ok()) {
+                    match d.with_index_read(|ix| ix.browse(&bq).ok()) {
                         Some((rows, total)) => {
                             json!({
                                 "total": total,
@@ -16694,7 +17792,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                 // colliding job so the UI can offer it directly.
                 "index_dupe" => {
                     let id: i64 = params.get("id").and_then(|v| v.parse().ok()).unwrap_or(-1);
-                    let stem = d.with_index(|ix| {
+                    let stem = d.with_index_read(|ix| {
                         let hits = ix.search("", 100000).ok()?;
                         hits.iter().find(|r| r.id == id).map(|r| r.stem.clone())
                     });
@@ -16713,7 +17811,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                         .get("id")
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(-1);
-                    let r = d.with_index(|ix| {
+                    let r = d.with_index_read(|ix| {
                         // Read the name by id. Scanning the newest rows
                         // for it instead missed anything the index had
                         // since buried, and the "release-<id>" fallback
@@ -16783,7 +17881,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                     let ep = params.get("ep").and_then(|v| v.parse::<u32>().ok());
                     let imdbid = match params.get("title_key") {
                         Some(k) if !k.is_empty() => d
-                            .with_index(|ix| ix.title_get(k).ok().flatten())
+                            .with_index_read(|ix| ix.title_get(k).ok().flatten())
                             .map(|t| t.imdb)
                             .unwrap_or_default(),
                         _ => String::new(),
@@ -16835,28 +17933,51 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                         let wants_caps = !query.imdbid.is_empty()
                             || !query.tvdbid.is_empty()
                             || query.season.is_some();
+                        // One xREL P2P search alongside the fan-out, and
+                        // only when the query carries no IMDb id of its
+                        // own: it is the id source for the true-P2P
+                        // "tagger" groups that scene predbs never list,
+                        // which is exactly the content a plain text
+                        // query turns up with no identity attached.
+                        //
+                        // Never a reason for the search to be slower: it
+                        // runs beside the indexers rather than after
+                        // them, and it declines its own slot rather than
+                        // queueing for one.
+                        let xrel_q = (query.imdbid.is_empty()
+                            && d.identity_lookup.load(Ordering::Relaxed))
+                        .then(|| q.trim().to_string());
                         // Fan out on plain threads: user-clicked, each
                         // call capped at the agent's 15 s, so the search
                         // costs one slow indexer, not their sum.
                         let d_ref = &d;
-                        let outcomes: Vec<_> = std::thread::scope(|s| {
-                            let handles: Vec<_> = runnable
-                                .into_iter()
-                                .map(|i| {
-                                    let query = query.clone();
+                        let (outcomes, xrel_hits): (Vec<_>, Vec<crate::xrel::XrelRelease>) =
+                            std::thread::scope(|s| {
+                                let xh = xrel_q.as_deref().map(|q| {
                                     s.spawn(move || {
-                                        let caps = wants_caps
-                                            .then(|| indexer_caps_cached(d_ref, &i))
-                                            .flatten();
-                                        let planned =
-                                            crate::newznab::plan_query(caps.as_ref(), &query);
-                                        let r = indexer_search_one(&i, &planned);
-                                        (i, r)
+                                        crate::xrel::try_search_p2p(q, XREL_UI_WAIT)
                                     })
-                                })
-                                .collect();
-                            handles.into_iter().filter_map(|h| h.join().ok()).collect()
-                        });
+                                });
+                                let handles: Vec<_> = runnable
+                                    .into_iter()
+                                    .map(|i| {
+                                        let query = query.clone();
+                                        s.spawn(move || {
+                                            let caps = wants_caps
+                                                .then(|| indexer_caps_cached(d_ref, &i))
+                                                .flatten();
+                                            let planned =
+                                                crate::newznab::plan_query(caps.as_ref(), &query);
+                                            let r = indexer_search_one(&i, &planned);
+                                            (i, r)
+                                        })
+                                    })
+                                    .collect();
+                                let outs =
+                                    handles.into_iter().filter_map(|h| h.join().ok()).collect();
+                                (outs, xh.and_then(|h| h.join().ok()).unwrap_or_default())
+                            });
+                        let xrel_ids = crate::xrel::by_dirname(&xrel_hits);
                         // Merge: same release listed by several indexers
                         // collapses to the highest-priority (lowest
                         // number) copy; ties keep the first seen.
@@ -16951,6 +18072,13 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                                     "token": token,
                                     "indexer": m.indexer,
                                     "title": m.item.title,
+                                    // '' unless xREL named this exact
+                                    // release. Exact only - see
+                                    // `by_dirname`.
+                                    "imdb": xrel_ids
+                                        .get(&m.item.title.to_ascii_lowercase())
+                                        .cloned()
+                                        .unwrap_or_default(),
                                     "size": m.item.size,
                                     "kind": kind_for_cat(m.item.cat).unwrap_or("other"),
                                     "age_days": (m.item.posted > 0)
@@ -16965,6 +18093,150 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                             }
                         }
                         json!({"status": true, "results": out, "notes": notes})
+                    }
+                }
+                // Spotnet: search what the spot scanner has stored. A
+                // separate mode rather than a merge into the wall, because
+                // a spot is a different kind of claim - somebody signed a
+                // statement that they posted this - and folding the two
+                // together would leave no way to say which is which.
+                "spot_search" => {
+                    let get = |k: &str| params.get(k).map(String::as_str).unwrap_or("");
+                    let q = nzbkit::index::SpotQuery {
+                        q: get("q").to_string(),
+                        category: get("cat").parse().ok(),
+                        include_adult: matches!(get("adult"), "1" | "true"),
+                        limit: get("limit").parse().unwrap_or(60),
+                        offset: get("offset").parse().unwrap_or(0),
+                    };
+                    let now = unix_now();
+                    match d.with_index_read(|ix| ix.spot_browse(&q).ok()) {
+                        None => json!({"status": true, "results": [], "total": 0,
+                            "on": d.spot_enabled.load(Ordering::Relaxed)}),
+                        Some((hits, total)) => {
+                            let rows: Vec<Value> = hits
+                                .iter()
+                                .map(|s| {
+                                    json!({
+                                        "msgid": s.msgid,
+                                        "title": s.title,
+                                        "size": s.size,
+                                        "kind": nzbkit::index::spot_kind(s.category),
+                                        "cat": s.category,
+                                        "age_days": (s.date > 0)
+                                            // saturating: the spot date is an
+                                            // unbounded i64 out of an
+                                            // attacker-mintable self-signed
+                                            // From record, and a huge positive
+                                            // one underflows this subtraction
+                                            // (debug panic on the API thread,
+                                            // silent wrap in release).
+                                            .then(|| now.saturating_sub(s.date).max(0) / 86_400),
+                                        "spotter": s.spotter_id,
+                                        "adult": nzbkit::index::spot_is_adult(&s.subcats),
+                                        // A verified signature with a failed
+                                        // proof-of-work is worth showing: it
+                                        // is the one thing about a spot that
+                                        // is odd rather than wrong.
+                                        "hashcash_ok": s.hashcash_ok,
+                                    })
+                                })
+                                .collect();
+                            json!({"status": true, "results": rows, "total": total,
+                                "on": d.spot_enabled.load(Ordering::Relaxed)})
+                        }
+                    }
+                }
+                // Grab a spot: fetch the NZB the spot points at and queue
+                // it like any other add.
+                //
+                // The message-id must already be in our own spots table.
+                // That is the whole authorization story: the daemon only
+                // ever fetches articles its own scanner verified and
+                // stored, so a browser cannot aim it at an arbitrary
+                // message-id, and a spot whose signature failed was never
+                // written in the first place.
+                "spot_grab" => {
+                    let msgid = params
+                        .get("msgid")
+                        .or_else(|| params.get("value"))
+                        .cloned()
+                        .unwrap_or_default();
+                    let prio: i32 = params
+                        .get("priority")
+                        .and_then(|v| v.parse().ok())
+                        .filter(|p| (-2..=2).contains(p))
+                        .unwrap_or(-100);
+                    let cat = params.get("cat_name").cloned().unwrap_or_default();
+                    let dupe_ok = params.get("dupe_ok").map(String::as_str) == Some("1");
+                    let spot = d.with_index_read(|ix| ix.spot_by_msgid(&msgid).ok().flatten());
+                    match spot {
+                        None => json!({"status": false,
+                            "error": "no such spot - rescan and try again"}),
+                        Some(spot) => {
+                            let cfg_path2 = cfg_path.clone();
+                            // block_on + a hard ceiling, like warm_bench:
+                            // a spot NZB is one HEAD plus a handful of
+                            // BODYs, but a black-holed server must not
+                            // wedge the API thread. Big spots are real -
+                            // one measured NZB was 929 KB over 2 payload
+                            // articles - so the ceiling is generous.
+                            let fetched = tokio::runtime::Handle::current().block_on(async {
+                                tokio::time::timeout(
+                                    std::time::Duration::from_secs(120),
+                                    async {
+                                        let cfg = nzbkit::config::Config::load(&cfg_path2)
+                                            .map_err(|e| e.to_string())?;
+                                        let server = crate::scan_servers(&cfg)
+                                            .into_iter()
+                                            .next()
+                                            .ok_or_else(|| "no enabled server".to_string())?;
+                                        let (mut conn, _) =
+                                            nzbkit::nntp::Connection::connect(&server)
+                                                .await
+                                                .map_err(|e| e.to_string())?;
+                                        let r = nzbkit::spot::fetch_spot_nzb(&mut conn, &msgid)
+                                            .await
+                                            .map_err(|e| e.to_string());
+                                        conn.quit().await;
+                                        r
+                                    },
+                                )
+                                .await
+                            });
+                            match fetched {
+                                Err(_) => json!({"status": false,
+                                    "error": "timed out fetching that spot"}),
+                                Ok(Err(e)) => json!({"status": false, "error": e}),
+                                Ok(Ok((sx, nzb))) => {
+                                    // Remember the payload segments so a
+                                    // second grab of the same spot does
+                                    // not re-walk the XML.
+                                    d.with_index(|ix| {
+                                        ix.set_spot_nzb(&spot.msgid, &sx.nzb_segments).ok()
+                                    });
+                                    // The spot's own title is the name:
+                                    // it is signed, and it is the reason
+                                    // this source exists at all.
+                                    let name = if sx.title.is_empty() {
+                                        spot.title.clone()
+                                    } else {
+                                        sx.title.clone()
+                                    };
+                                    match d.enqueue(
+                                        &nzb, &name, &cat, prio, None, "spot", dupe_ok,
+                                    ) {
+                                        Ok(id) => {
+                                            println!("[spots] grabbed {name}");
+                                            json!({"status": true, "nzo_ids": [id]})
+                                        }
+                                        Err(e) => {
+                                            json!({"status": false, "error": e.to_string()})
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 // M35: grab one cached external result by token. The
@@ -17023,7 +18295,14 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                                             json!({"status": false, "error": e.to_string()})
                                         }
                                     },
-                                    Err(e) => json!({"status": false, "error": e.to_string()}),
+                                    // Same leak the nzblnk ladder had:
+                                    // fetch_url names the URL it failed
+                                    // on, and h.url is the enclosure link
+                                    // whose whole reason for living behind
+                                    // a token is that it carries the
+                                    // user's account credential.
+                                    Err(e) => json!({"status": false,
+                                        "error": redact_url_creds(&e.to_string())}),
                                 }
                             }
                         }
@@ -17109,9 +18388,12 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                                             g.del_on_drop = true;
                                         } else {
                                             let suffix =
-                                                delete_suffix(&g, || d.job_suffix(&g.name));
+                                                delete_suffix(&g, || d.job_suffix(filed_stem(&g)));
                                             remove_job_files(
-                                                &g.out_dir, &g.name, g.filed, &suffix,
+                                                &g.out_dir,
+                                                filed_stem(&g),
+                                                g.filed,
+                                                &suffix,
                                             );
                                         }
                                     }
@@ -17362,9 +18644,13 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                                 let _ = std::fs::remove_file(&g.nzb_path);
                                 if del_files {
                                     if p.may_remove_files {
-                                        let suffix = delete_suffix(&g, || d.job_suffix(&g.name));
+                                        let suffix =
+                                            delete_suffix(&g, || d.job_suffix(filed_stem(&g)));
                                         remove_job_files(
-                                            &g.out_dir, &g.name, g.filed, &suffix,
+                                            &g.out_dir,
+                                            filed_stem(&g),
+                                            g.filed,
+                                            &suffix,
                                         );
                                     } else {
                                         // A verified re-download published
@@ -18011,12 +19297,12 @@ fn stream_request(d: Arc<Daemon>, req: tiny_http::Request, want: Option<String>,
                 // there" is a sibling episode as often as not.
                 let (done, dir, filed, stem, suffix) = {
                     let j = job.lock().unwrap();
-                    let sfx = delete_suffix(&j, || d.job_suffix(&j.name));
+                    let sfx = delete_suffix(&j, || d.job_suffix(filed_stem(&j)));
                     (
                         j.state == JobState::Completed && j.fetched && !j.tombstone,
                         j.out_dir.clone(),
                         j.filed,
-                        j.name.clone(),
+                        filed_stem(&j).to_string(),
                         sfx,
                     )
                 };
@@ -18203,6 +19489,20 @@ fn json_resp(v: Value) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
     )
 }
 
+/// May a scan pass that began at `pass_era` hand its freshly-opened
+/// connection to the daemon, given the current `era` and switch state?
+///
+/// Both conditions, because they fail differently. A stale era means the
+/// database itself was replaced (wiped) under the pass, so the
+/// connection points at a file nobody wants back. `!enabled` means no
+/// source wants the database any more - the user switched the last one
+/// off during the pass: the era may well still match - switching off
+/// does bump it, but a pass could equally have started while off - and
+/// "closed" has to stay closed.
+fn may_publish_index(era: u64, pass_era: u64, enabled: bool) -> bool {
+    era == pass_era && enabled
+}
+
 /// Version we report to API clients. The *arrs feature-gate on the SAB
 /// version string, so claim parity with the release whose API we match.
 const SAB_VERSION: &str = "4.5.0";
@@ -18215,56 +19515,138 @@ const SAB_VERSION: &str = "4.5.0";
 /// deadline was hit and the child killed; `secs == 0` waits forever,
 /// which is what someone running a multi-hour transcode wants.
 ///
-/// stdout and stderr are drained by their own threads rather than polled:
-/// a child that fills the 64 KB pipe buffer blocks on the write, so
-/// waiting on the process alone would turn any chatty script into a
-/// timeout.
+/// stderr is drained by its own thread rather than polled: a child that
+/// fills the 64 KB pipe buffer blocks on the write, so waiting on the
+/// process alone would turn any chatty script into a timeout. stdout is
+/// drained too, and thrown away - nothing reads it, and a script that
+/// prints for a living should not be able to spend the daemon's memory
+/// proving it.
+///
+/// Only the LAST [`SCRIPT_ERR_TAIL`] bytes of stderr are kept. The whole
+/// stream used to accumulate in a `String`, so an accidental
+/// `while true; do echo …; done` grew the daemon until it died - well
+/// before any deadline could stop it.
+///
+/// Two things the deadline has to survive, both of them ordinary
+/// post-script shapes rather than hostile ones:
+///
+///  - A script that backgrounds work (`transcode & `) and exits. The
+///    descendant INHERITS stdout/stderr, so the pipes stay open after
+///    the direct child is gone and a `join` on the drain threads blocked
+///    until the descendant finished. That join ran on the daemon's
+///    blocking pool, one leaked worker per completed job, and the pool
+///    is finite. The drains are therefore never joined - they are given
+///    a short grace and then abandoned, holding nothing but a bounded
+///    ring.
+///  - The same script when the deadline expires. `Child::kill` signals
+///    the direct child alone, so on unix the child is given its own
+///    process group and the whole group is signalled. Windows keeps the
+///    single-process kill (a job object is the equivalent, and is a
+///    bigger change than this fix warrants).
 fn run_capped(
     mut cmd: std::process::Command,
     secs: u64,
 ) -> std::io::Result<(Option<std::process::ExitStatus>, String)> {
-    use std::io::Read as _;
     use std::process::Stdio;
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let drain = |mut r: Option<std::process::ChildStdout>| {
-        std::thread::spawn(move || {
-            let mut s = String::new();
-            if let Some(r) = r.as_mut() {
-                let _ = r.read_to_string(&mut s);
-            }
-            s
-        })
-    };
-    let out_h = drain(child.stdout.take());
-    let err_h = std::thread::spawn({
-        let mut r = child.stderr.take();
-        move || {
-            let mut s = String::new();
-            if let Some(r) = r.as_mut() {
-                let _ = r.read_to_string(&mut s);
-            }
-            s
-        }
-    });
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Own process group, so the deadline can reach what the script
+    // spawned. Inherited by every descendant that does not deliberately
+    // leave it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn()?;
+    let tail = Arc::new(Mutex::new(BoundedTail::default()));
+    // Detached on purpose: see the doc comment. Each thread owns its pipe
+    // and exits when the last writer closes it, whenever that is.
+    if let Some(r) = child.stdout.take() {
+        std::thread::spawn(move || drain_to_nowhere(r));
+    }
+    if let Some(r) = child.stderr.take() {
+        let tail = tail.clone();
+        std::thread::spawn(move || drain_into(r, &tail));
+    }
     let deadline = (secs > 0).then(|| Instant::now() + std::time::Duration::from_secs(secs));
     let status = loop {
         if let Some(st) = child.try_wait()? {
             break Some(st);
         }
         if deadline.is_some_and(|d| Instant::now() >= d) {
+            #[cfg(unix)]
+            unsafe {
+                // Negative pid = the whole group. The direct child is
+                // killed by the same signal, so no separate kill needed;
+                // fall back to it if the group send fails.
+                if libc::kill(-(child.id() as i32), libc::SIGKILL) != 0 {
+                    let _ = child.kill();
+                }
+            }
+            #[cfg(not(unix))]
             let _ = child.kill();
             let _ = child.wait();
             break None;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
-    let _ = out_h.join();
-    let stderr = err_h.join().unwrap_or_default();
+    // The child is gone; its own writes are already in the ring or in
+    // flight. A short grace collects the tail end without waiting on any
+    // descendant that may still hold the pipe open.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let stderr = tail.lock().unwrap().tail_text();
     Ok((status, stderr))
+}
+
+/// How much of a script's stderr is worth keeping. Enough for a stack
+/// trace or a usage message, which is all the log line quotes.
+const SCRIPT_ERR_TAIL: usize = 8 << 10;
+
+/// The last [`SCRIPT_ERR_TAIL`] bytes written to it, and nothing else.
+#[derive(Default)]
+struct BoundedTail {
+    buf: std::collections::VecDeque<u8>,
+    dropped: usize,
+}
+
+impl BoundedTail {
+    fn push(&mut self, bytes: &[u8]) {
+        self.buf.extend(bytes);
+        while self.buf.len() > SCRIPT_ERR_TAIL {
+            self.buf.pop_front();
+            self.dropped += 1;
+        }
+    }
+
+    /// The kept tail as text, prefixed with what was dropped. Not a
+    /// `Display` impl: this is a lossy read-out of a byte ring for one
+    /// log line, not a rendering of the value.
+    fn tail_text(&self) -> String {
+        let text = String::from_utf8_lossy(&self.buf.iter().copied().collect::<Vec<u8>>())
+            .into_owned();
+        if self.dropped == 0 {
+            text
+        } else {
+            // Say what was cut, or a truncated trace reads as the whole
+            // story - the interesting line may be the one that went.
+            format!("[…{} earlier bytes dropped…]{text}", self.dropped)
+        }
+    }
+}
+
+fn drain_into(mut r: impl std::io::Read, tail: &Mutex<BoundedTail>) {
+    let mut buf = [0u8; 8192];
+    while let Ok(n) = r.read(&mut buf) {
+        if n == 0 {
+            return;
+        }
+        tail.lock().unwrap().push(&buf[..n]);
+    }
+}
+
+fn drain_to_nowhere(mut r: impl std::io::Read) {
+    let mut buf = [0u8; 8192];
+    while matches!(r.read(&mut buf), Ok(n) if n > 0) {}
 }
 
 /// Minutes until a timed pause auto-resumes (SAB's `pause_int`).
@@ -18519,7 +19901,17 @@ fn newznab_xml(
     let kinds: Vec<&str> = cats.iter().filter_map(|c| kind_for_cat(*c)).collect();
     let kind = match kinds.as_slice() {
         [first, rest @ ..] if rest.iter().all(|k| k == first) => Some(first.to_string()),
-        _ => None,
+        // No usable `cat`, so let the OPERATION speak. `t=movie` and
+        // `t=tvsearch` are each already a statement about which half of
+        // the index is being asked for, and an id-only query - Radarr's
+        // primary lookup - routinely carries no cat at all. Without
+        // this, such a query was answered with no kind filter whatever,
+        // so a movie search could come back holding TV.
+        _ => match t {
+            "movie" => Some("movie".to_string()),
+            "tvsearch" => Some("tv".to_string()),
+            _ => None,
+        },
     };
     // Every requested id names a category we do not carry (audio, books,
     // console, xxx): the honest answer is an empty feed. Falling through
@@ -18548,7 +19940,7 @@ fn newznab_xml(
         if raw.is_empty() {
             return None;
         }
-        let found = d.with_index(|ix| {
+        let found = d.with_index_read(|ix| {
             if *p == "imdbid" {
                 ix.title_key_for_imdb(&raw).ok().flatten()
             } else {
@@ -18574,7 +19966,7 @@ fn newznab_xml(
     let (hits, total) = if unavailable || id_missing {
         (Vec::new(), 0)
     } else {
-        d.with_index(|ix| ix.browse(&bq).ok()).unwrap_or_default()
+        d.with_index_read(|ix| ix.browse(&bq).ok()).unwrap_or_default()
     };
     let mut items = String::new();
     for r in hits.iter() {
@@ -19050,8 +20442,17 @@ struct IndexerRuntime {
     /// FAILED probe is cached too (as None) - an indexer that cannot
     /// answer caps must not be re-probed on every keystroke-driven
     /// search - just for much less time than a success.
+    ///
+    /// Keyed by [`IndexerConfig::identity`] - the far end - and NOT by
+    /// name: caps describe a site and an account, while the name is a
+    /// label the user edits, reuses and types into unsaved drafts.
+    /// See that method for what keying on the name cost.
+    ///
+    /// [`IndexerConfig::identity`]: crate::newznab::IndexerConfig::identity
     caps: std::collections::HashMap<String, (Instant, Option<crate::newznab::Caps>)>,
-    /// Indexers backing off after a limit error, by name.
+    /// Indexers backing off after a limit error, by name. The name is
+    /// right here: a budget/backoff belongs to the configured ENTRY the
+    /// user set limits on, and only a saved entry ever runs a search.
     penalty_until: std::collections::HashMap<String, Instant>,
     usage: crate::newznab::Usage,
     results: std::collections::HashMap<String, IndexerHit>,
@@ -19068,8 +20469,26 @@ struct IndexerHit {
     at: Instant,
 }
 
+/// How far back the `addnzblnk` rate gate looks.
+const NZBLNK_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+/// Link resolutions allowed per window before the endpoint refuses. A
+/// person clicking board links does a handful a minute; a page in a loop
+/// does not stop.
+const NZBLNK_MAX: usize = 20;
+/// ...and how many of those may reach the user's indexers. Lower,
+/// because this is the threshold that guards a metered account rather
+/// than our own CPU. Past it the ladder still runs, local-only.
+const NZBLNK_EXTERNAL_MAX: usize = 6;
+
 /// A grab token stays valid this long after its search.
 const INDEXER_HIT_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// How long a pull search will wait for an xREL slot before giving up on
+/// the id enrichment. Their search budget is 2 calls per 5 s, so a
+/// second search inside that window finds the bucket empty - and a
+/// search that returns its releases a beat sooner without an IMDb id is
+/// a better answer than one that returns everything late.
+const XREL_UI_WAIT: std::time::Duration = std::time::Duration::from_millis(400);
 /// Ceiling on cached external results across all searches.
 const INDEXER_HIT_CAP: usize = 5000;
 /// Ceiling on one search/caps response body. A 100-item page of XML is
@@ -19097,6 +20516,81 @@ fn shared_indexer_agent() -> ureq::Agent {
 /// GET one indexer API URL, capped. Transport-level limit answers (a
 /// real HTTP 429/503) map to `Limit` here; protocol errors ship as
 /// HTTP 200 XML and are the caller's `parse_error` pass.
+/// Blank the `apikey=` value anywhere in a string. A transport error's
+/// Display carries the URL it failed on, and that URL carries the user's
+/// key - which then rode into a toast, a rendered error row and anything
+/// the user pasted into a bug report. M35's contract is that the key
+/// never reaches a browser or a log, so it is scrubbed at the one choke
+/// point every indexer error passes through.
+fn redact_apikey(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(p) = rest.find("apikey=") {
+        out.push_str(&rest[..p + "apikey=".len()]);
+        out.push_str("***");
+        // The value runs to the next query separator or to whatever ends
+        // the URL inside a longer sentence.
+        let tail = &rest[p + "apikey=".len()..];
+        let end = tail
+            .find(|c: char| c == '&' || c == '#' || c.is_whitespace())
+            .unwrap_or(tail.len());
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Cut every URL in a message down to `scheme://host`, dropping userinfo,
+/// path and query.
+///
+/// [`redact_apikey`] guards the SEARCH path, where we built the URL and
+/// therefore know the credential is spelled `apikey=`. The GRAB path has
+/// no such guarantee: the NZB link comes out of the indexer's own XML,
+/// and sites spell their credential `apikey`, `api_key`, `r`, `i`, or
+/// put it in the path. Blanking one parameter name there is a guess.
+/// The host is the only part of such a URL worth showing a user anyway -
+/// it names who failed - so everything after it goes.
+fn redact_url_creds(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        let Some(p) = rest.find("http://").or_else(|| rest.find("https://")).map(|_| {
+            // Whichever comes first, when both appear.
+            match (rest.find("http://"), rest.find("https://")) {
+                (Some(a), Some(b)) => a.min(b),
+                (Some(a), None) => a,
+                (None, Some(b)) => b,
+                (None, None) => unreachable!(),
+            }
+        }) else {
+            break;
+        };
+        out.push_str(&rest[..p]);
+        let url = &rest[p..];
+        let scheme_len = if url.starts_with("https://") { 8 } else { 7 };
+        // The authority ends at the first path/query/fragment character,
+        // or at whatever ends the URL inside a longer sentence.
+        let after = &url[scheme_len..];
+        let end = after
+            .find(|c: char| c == '/' || c == '?' || c == '#' || c.is_whitespace())
+            .unwrap_or(after.len());
+        let authority = &after[..end];
+        // Userinfo (user:pass@host) is a credential too.
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        out.push_str(&url[..scheme_len]);
+        out.push_str(host);
+        // Anything else attached to the URL is dropped, up to whitespace.
+        let tail = &after[end..];
+        let stop = tail.find(char::is_whitespace).unwrap_or(tail.len());
+        if stop > 0 {
+            out.push_str("/...");
+        }
+        rest = &tail[stop..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn indexer_fetch(url: &str) -> std::result::Result<String, crate::newznab::NewznabError> {
     use crate::newznab::NewznabError;
     use std::io::Read as _;
@@ -19108,13 +20602,13 @@ fn indexer_fetch(url: &str) -> std::result::Result<String, crate::newznab::Newzn
         Err(ureq::Error::Status(code, _)) => {
             return Err(NewznabError::Api(code, format!("HTTP {code}")));
         }
-        Err(e) => return Err(NewznabError::Api(0, e.to_string())),
+        Err(e) => return Err(NewznabError::Api(0, redact_apikey(&e.to_string()))),
     };
     let mut bytes = Vec::new();
     resp.into_reader()
         .take(INDEXER_BODY_MAX + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| NewznabError::Api(0, e.to_string()))?;
+        .map_err(|e| NewznabError::Api(0, redact_apikey(&e.to_string())))?;
     if bytes.len() as u64 > INDEXER_BODY_MAX {
         return Err(NewznabError::Api(0, "response too large".into()));
     }
@@ -19145,18 +20639,15 @@ fn indexer_caps_cached(
     d: &Daemon,
     cfg: &crate::newznab::IndexerConfig,
 ) -> Option<crate::newznab::Caps> {
-    if let Some((at, caps)) = d.indexer_rt.lock().unwrap().caps.get(&cfg.name) {
+    let id = cfg.identity();
+    if let Some((at, caps)) = d.indexer_rt.lock().unwrap().caps.get(&id) {
         let ttl = if caps.is_some() { INDEXER_CAPS_TTL } else { INDEXER_CAPS_FAIL_TTL };
         if at.elapsed() < ttl {
             return caps.clone();
         }
     }
     let got = indexer_caps_one(cfg).ok();
-    d.indexer_rt
-        .lock()
-        .unwrap()
-        .caps
-        .insert(cfg.name.clone(), (Instant::now(), got.clone()));
+    d.indexer_rt.lock().unwrap().caps.insert(id, (Instant::now(), got.clone()));
     got
 }
 
@@ -19178,11 +20669,257 @@ fn indexer_caps_one(
 }
 
 /// Persist the day's hit/grab counters; best-effort, tiny file.
+/// Persist the day's indexer hit/grab counters.
+///
+/// The snapshot and the write are ONE critical section, and the write is
+/// atomic. Both matter, and neither used to hold: the clone happened
+/// under the runtime lock, the lock was then released, and a bare
+/// `fs::write` followed. Two concurrent grabs could therefore snapshot 1
+/// and 2 and land in that order or the other, so the file could end up
+/// recording 1 after 2 was already counted - and a same-day restart
+/// reloads whatever is on disk, handing back budget the user's paid
+/// account had already spent. The bare write could also leave a
+/// half-truncated file that reloads as no counters at all.
 fn save_indexer_usage(d: &Daemon) {
+    // Separate from indexer_rt: this is held across file I/O, and
+    // indexer_rt is on the search path.
+    static IO: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = IO.lock().unwrap();
     let u = d.indexer_rt.lock().unwrap().usage.clone();
     if let Ok(b) = serde_json::to_vec(&u) {
-        let _ = std::fs::write(d.spool.join("indexer-usage.json"), b);
+        if let Err(e) = crate::persist::write_atomic(&d.spool.join("indexer-usage.json"), &b) {
+            eprintln!("[indexer] could not persist usage counters: {e}");
+        }
     }
+}
+
+/// Turn one parsed NZBLNK into a queued job, or say why not.
+///
+/// The ladder is our own index first (free, offline, and it can emit the
+/// NZB straight from the segment ids the scan stored) and the user's
+/// configured indexers second (one API hit each, under the same daily
+/// budgets and limit backoff the pull search obeys).
+///
+/// A local hit that is INCOMPLETE does not short-circuit the ladder: a
+/// synthesized NZB missing parts downloads and then fails repair, so the
+/// indexers get their turn first and the partial release is only used
+/// when nothing else answered - with a note saying so, because "queued,
+/// and we already know parts are missing" is not the same promise as
+/// "queued".
+fn resolve_nzblnk(
+    d: &Daemon,
+    l: &nzbkit::nzblnk::NzbLnk,
+    cat: &str,
+    prio: i32,
+    password: Option<&str>,
+    dupe_ok: bool,
+) -> serde_json::Value {
+    let mut notes: Vec<serde_json::Value> = Vec::new();
+
+    // ---- The rate gate. ---------------------------------------------
+    // Two thresholds off one sliding window, because the two things a
+    // loop can spend are not equally scarce. Local resolution costs CPU
+    // (rung 3 of find_by_header is an unindexed scan); asking the
+    // indexers costs the user's metered account. So the cheap half stays
+    // available far longer than the expensive one, and passing the
+    // second threshold DEGRADES to local-only rather than failing - a
+    // link our own index can answer is answered.
+    let recent = {
+        let mut q = d.nzblnk_recent.lock().unwrap();
+        let now = Instant::now();
+        while q.front().is_some_and(|t| now.duration_since(*t) > NZBLNK_WINDOW) {
+            q.pop_front();
+        }
+        if q.len() >= NZBLNK_MAX {
+            return json!({"status": false, "reason": "toofast",
+                "error": "too many links at once - wait a moment and try again"});
+        }
+        q.push_back(now);
+        q.len()
+    };
+    let may_ask_indexers = recent <= NZBLNK_EXTERNAL_MAX;
+
+    // ---- Rung 1: our own header index. ------------------------------
+    // Ranking, strongest first: complete beats partial, a release in a
+    // group the link named beats one somewhere else, then size. `>` and
+    // not `>=`, so ties keep find_by_header's own ordering (exact stem
+    // ahead of a filename match).
+    let rank = |r: &nzbkit::index::Release| {
+        (
+            r.complete,
+            l.groups.is_empty() || l.groups.iter().any(|g| g.eq_ignore_ascii_case(&r.grp)),
+            r.total_bytes,
+        )
+    };
+    // with_index_read on both index calls: this is an interactive
+    // handler, and rung 3 of find_by_header is a table scan. On the
+    // read-write connection a catch-up ingest or maintenance pass would
+    // park the paste for as long as it holds the mutex (measured at 62s
+    // for wall2 before the read-only connection existed).
+    let local = d.with_index_read(|ix| {
+        let mut best: Option<nzbkit::index::Release> = None;
+        for r in ix.find_by_header(&l.header, 8).ok()? {
+            if best.as_ref().is_none_or(|b| rank(&r) > rank(b)) {
+                best = Some(r);
+            }
+        }
+        best
+    });
+    let queue_local = |r: &nzbkit::index::Release, partial: bool, notes: &Vec<serde_json::Value>| {
+        let xml = match d.with_index_read(|ix| ix.make_nzb(r.id).ok()) {
+            Some(x) => x,
+            None => return json!({"status": false, "error": "the index could not rebuild that post"}),
+        };
+        let name = if l.title.is_empty() { r.stem.clone() } else { l.title.clone() };
+        match d.enqueue(xml.as_bytes(), &name, cat, prio, password, "nzblnk", dupe_ok) {
+            Ok(nzo) => {
+                // Same protection a wall grab gets: the row this job came
+                // from must survive the index size cap.
+                d.touch_opened_release(r.id);
+                json!({"status": true, "nzo_ids": [nzo], "name": name, "via": "index",
+                       "partial": partial, "notes": notes})
+            }
+            Err(e) => json!({"status": false, "error": e.to_string()}),
+        }
+    };
+    if let Some(r) = local.as_ref().filter(|r| r.complete) {
+        return queue_local(r, false, &notes);
+    }
+    if local.is_some() {
+        notes.push(json!({"index": "found the post, but parts are still missing"}));
+    }
+
+    // ---- Rung 2: the user's indexers, over the M35 client. -----------
+    // A header is free text, so this is a plain `t=search` - no caps
+    // probe (an id-less query never needs one) and no category filter,
+    // because an obfuscated release name tells nobody what it is.
+    let list: Vec<crate::newznab::IndexerConfig> = if may_ask_indexers {
+        d.indexers.lock().unwrap().iter().filter(|i| i.enabled).cloned().collect()
+    } else {
+        notes.push(json!({"indexers":
+            "skipped: too many link lookups just now, so only the local index was searched"}));
+        Vec::new()
+    };
+    let mut runnable = Vec::new();
+    {
+        let mut rt = d.indexer_rt.lock().unwrap();
+        rt.usage.roll(unix_now());
+        let now = Instant::now();
+        for i in list {
+            if rt.penalty_until.get(&i.name).is_some_and(|t| *t > now) {
+                notes.push(json!({"indexer": i.name,
+                    "skipped": "backing off after a limit error"}));
+            } else if !rt.usage.hit_allowed(&i) {
+                notes.push(json!({"indexer": i.name, "skipped": "daily API budget reached"}));
+            } else {
+                rt.usage.count_hit(&i.name);
+                runnable.push(i);
+            }
+        }
+    }
+    if !runnable.is_empty() {
+        save_indexer_usage(d);
+    }
+    let query = crate::newznab::SearchQuery {
+        q: l.header.clone(),
+        limit: 100,
+        ..Default::default()
+    };
+    let outcomes: Vec<_> = std::thread::scope(|s| {
+        let handles: Vec<_> = runnable
+            .into_iter()
+            .map(|i| {
+                let query = query.clone();
+                s.spawn(move || {
+                    let r = indexer_search_one(&i, &query);
+                    (i, r)
+                })
+            })
+            .collect();
+        handles.into_iter().filter_map(|h| h.join().ok()).collect()
+    });
+    // A header identifies ONE posting, so this picks a single winner
+    // rather than building a result list: a title that actually contains
+    // the header beats one that merely matched some token of it, then
+    // indexer priority, then the newest upload.
+    let norm = |s: &str| {
+        s.to_ascii_lowercase().replace(['.', '_', '-'], " ").split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    let want = norm(&l.header);
+    let mut best: Option<(u8, i32, i64, crate::newznab::SearchResult, String)> = None;
+    {
+        let mut rt = d.indexer_rt.lock().unwrap();
+        let now = Instant::now();
+        for (cfg, outcome) in outcomes {
+            match outcome {
+                Ok(items) => {
+                    for item in items {
+                        let k = (
+                            u8::from(!norm(&item.title).contains(&want)),
+                            cfg.priority,
+                            -item.posted,
+                        );
+                        if best.as_ref().is_none_or(|b| k < (b.0, b.1, b.2)) {
+                            best = Some((k.0, k.1, k.2, item, cfg.name.clone()));
+                        }
+                    }
+                }
+                Err(e) => {
+                    if matches!(e, crate::newznab::NewznabError::Limit(..)) {
+                        rt.penalty_until.insert(cfg.name.clone(), now + INDEXER_LIMIT_BACKOFF);
+                    }
+                    notes.push(json!({"indexer": cfg.name, "error": e.to_string()}));
+                }
+            }
+        }
+    }
+    if let Some((_, _, _, item, indexer)) = best {
+        let allowed = {
+            let mut rt = d.indexer_rt.lock().unwrap();
+            rt.usage.roll(unix_now());
+            d.indexers
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|i| i.name == indexer)
+                .is_none_or(|c| rt.usage.grab_allowed(c))
+        };
+        if !allowed {
+            notes.push(json!({"indexer": indexer, "skipped": "daily grab budget reached"}));
+        } else {
+            let name = if l.title.is_empty() { item.title.clone() } else { l.title.clone() };
+            match fetch_url(&item.link)
+                .map_err(|e| e.to_string())
+                .and_then(|f| {
+                    d.enqueue_fetched(&f, &name, cat, prio, password, 0, "nzblnk", dupe_ok)
+                        .map_err(|e| e.to_string())
+                }) {
+                Ok(nzo) => {
+                    d.indexer_rt.lock().unwrap().usage.count_grab(&indexer);
+                    save_indexer_usage(d);
+                    return json!({"status": true, "nzo_ids": [nzo], "name": name,
+                                  "via": indexer, "partial": false, "notes": notes});
+                }
+                // The NZB link itself failed. Not fatal to the ladder -
+                // a partial local copy may still be better than nothing.
+                //
+                // redact_url_creds: fetch_url names the URL it failed on,
+                // and that URL is the enclosure link out of the indexer's
+                // XML, which carries the user's account credential. This
+                // string goes straight into the dashboard's notes.
+                Err(e) => notes
+                    .push(json!({"indexer": indexer, "error": redact_url_creds(&e)})),
+            }
+        }
+    }
+
+    // ---- Last resort: the partial local hit, honestly labelled. ------
+    if let Some(r) = local.as_ref() {
+        return queue_local(r, true, &notes);
+    }
+    json!({"status": false, "reason": "notfound", "notes": notes,
+           "error": "nothing found for that link - the post may be too new to be indexed, \
+                     or too old to still be on your server"})
 }
 
 /// SABnzbd's `timeleft`, in the shape its own API emits.
@@ -19358,6 +21095,21 @@ fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, String>) ->
         // Notify-only since 1.0.5: the update chip always links to the
         // download page; no install offered anywhere.
         "bundled": bundled_install(),
+        // In a container the download page is the wrong advice - the
+        // image is the update channel. The dashboard shows the container
+        // recipe instead when this is set.
+        "container": container_install(),
+        // Keyless state, for the dashboard's open-API notice. Telling an
+        // unauthenticated caller "there is no key here" leaks nothing:
+        // when it is true every endpoint is already answering them, and
+        // when it is false this response needed a key to reach.
+        //
+        // The opt-in half matters as much as the flag. An operator who
+        // set NZBFAST_OPEN=1 chose this, usually behind another auth
+        // layer, and nagging them forever would teach everyone to ignore
+        // the notice - including the people who did not choose it.
+        "open_api": d.apikey.lock().unwrap().is_none(),
+        "open_optin": std::env::var("NZBFAST_OPEN").is_ok_and(|v| v == "1"),
         "diskspace1": format!("{:.2}", free_bytes(&d.out_dir()).unwrap_or(0) as f64 / 1e9),
         "speedlimit_abs": d.hub.rate.get(),
         "auto_speed": d.auto_speed.load(Ordering::Relaxed),
@@ -19969,7 +21721,14 @@ fn handle_jsonrpc(
                             ok = true;
                         }
                     }
-                    d.register_cat(&cat);
+                    // Only when it actually landed on a job, matching the SAB
+                    // change_cat precedent. Unconditional, a loop of
+                    // editqueue calls naming ids that do not exist grows the
+                    // persisted category list without bound and pollutes the
+                    // list the *arrs validate against.
+                    if ok {
+                        d.register_cat(&cat);
+                    }
                 }
                 "GroupSetPriority" => {
                     // The SAB facade has had this since M26 and this side
@@ -20342,6 +22101,20 @@ fn history_json(d: &Daemon, params: &std::collections::HashMap<String, String>) 
                 // existing clients already surface beside the status.
                 "unpack_blocked_by": j.unpack_blocked_by,
                 "archive_shape": j.archive_shape,
+                // What an identity oracle said this release is, beside
+                // the name it was posted under. Additive keys: `name`
+                // stays exactly what every SAB client already matches
+                // on, and a client that does not know these ignores
+                // them.
+                "identity_name": j.identity_name,
+                "identity_imdb": j.identity_imdb,
+                "identity_src": j.identity_src,
+                // ...and when no oracle could name it, what synthesised
+                // naming made of the payload: the file's own facts, then
+                // the shortlist. English, and deliberately so - film
+                // titles are not ours to translate, and the runtimes and
+                // codecs in it are not words. See Job::identify.
+                "identify": j.identify,
                 "script_line": if j.unpack_blocked_by.is_empty() {
                     String::new()
                 } else {
@@ -20541,6 +22314,167 @@ fn apply_action(d: &Arc<Daemon>, a: SchedAction) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A post-script that prints without stopping must cost a bounded
+    /// amount of memory. The drain used to `read_to_string` into an
+    /// unbounded `String`, so the daemon grew until it died - and it did
+    /// so BEFORE the deadline could stop it, because the deadline only
+    /// ever checked the process, never the pipe.
+    #[cfg(unix)]
+    #[test]
+    fn a_script_that_never_stops_talking_is_bounded_and_still_killed() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg("while :; do printf 'noise noise noise\\n' >&2; done");
+        let t0 = Instant::now();
+        let (status, err) = run_capped(cmd, 1).unwrap();
+        assert!(status.is_none(), "the deadline must have killed it");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(10), "returned late");
+        assert!(
+            err.len() <= SCRIPT_ERR_TAIL + 64,
+            "kept {} bytes of stderr; the ring is {SCRIPT_ERR_TAIL}",
+            err.len()
+        );
+        assert!(err.contains("noise"), "the tail is what a log line quotes");
+        assert!(err.contains("dropped"), "truncation has to be visible");
+    }
+
+    /// The shape that leaked a blocking-pool worker per completed job: a
+    /// script that backgrounds something and exits happily. The
+    /// descendant inherits stdout/stderr, so the pipes stay open long
+    /// after the direct child is reaped - and the drain threads used to
+    /// be JOINED, which parked the caller for the descendant's lifetime
+    /// however short the configured deadline was.
+    #[cfg(unix)]
+    #[test]
+    fn a_backgrounded_descendant_cannot_outlive_the_deadline() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg("sleep 60 & exit 0");
+        let t0 = Instant::now();
+        let (status, _) = run_capped(cmd, 5).unwrap();
+        let took = t0.elapsed();
+        assert!(status.is_some_and(|s| s.success()), "the script itself exited fine");
+        assert!(
+            took < std::time::Duration::from_secs(5),
+            "waited {took:?} on a descendant holding the pipe"
+        );
+    }
+
+    /// Two workers registering different first-seen categories used to
+    /// race: each took a `cat_list()` snapshot after dropping the
+    /// category lock, and the later WRITE could carry the earlier
+    /// snapshot - so B's category was written and then overwritten away.
+    /// Live memory held both, so it only surfaced after a restart, with
+    /// an *arr suddenly failing its category test.
+    #[test]
+    fn registering_a_category_never_drops_one_already_on_disk() {
+        // B landed {tv, movies} while A was still holding {tv, anime}.
+        assert_eq!(merge_cat_list("tv, movies", "tv, anime"), "tv, movies, anime");
+        // Idempotent: re-registering something already recorded rewrites
+        // the same list.
+        assert_eq!(merge_cat_list("tv, movies", "tv, movies"), "tv, movies");
+        // First category on a fresh install, and the empty-side cases.
+        assert_eq!(merge_cat_list("", "tv"), "tv");
+        assert_eq!(merge_cat_list("tv", ""), "tv");
+        assert_eq!(merge_cat_list("", ""), "");
+        // Whitespace and empty members in a hand-edited file.
+        assert_eq!(merge_cat_list("tv ,, movies", " anime "), "tv, movies, anime");
+    }
+
+    /// A scan pass owns a dedicated connection for minutes; the switch
+    /// and the wipe button are one click. The pass used to republish
+    /// unconditionally when it exited, so switching the indexer OFF
+    /// mid-scan got a live shared connection back, and wiping got the
+    /// database recreated seconds after the API reported it gone.
+    #[test]
+    fn a_scan_pass_may_only_publish_into_the_index_it_started_in() {
+        // The ordinary case: same era, still on.
+        assert!(may_publish_index(7, 7, true));
+        // Switched off while the pass ran.
+        assert!(!may_publish_index(8, 8, false));
+        // Wiped while the pass ran - the era moved on, and a wipe that
+        // gets its files recreated by an exiting scan was never a wipe.
+        assert!(!may_publish_index(9, 8, true));
+        // Both, which is what switching off actually looks like (the
+        // close bumps the era too).
+        assert!(!may_publish_index(9, 8, false));
+    }
+
+    /// The ordinary case still has to work: exit status and stderr are
+    /// what the caller logs.
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_script_reports_its_status_and_stderr() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg("echo ignored; echo boom >&2; exit 3");
+        let (status, err) = run_capped(cmd, 30).unwrap();
+        assert_eq!(status.and_then(|s| s.code()), Some(3));
+        assert_eq!(err.trim(), "boom");
+    }
+
+    /// An indexer transport error carries the URL it failed on, and that
+    /// URL carries the user's API key. It reached a rendered error row on
+    /// two surfaces before this scrubber existed.
+    #[test]
+    fn apikey_never_rides_an_error_string() {
+        let msg = "https://idx.example/api?t=search&apikey=SECRET123&q=x: Dns Failed";
+        let got = redact_apikey(msg);
+        assert!(!got.contains("SECRET123"), "{got}");
+        assert_eq!(
+            got,
+            "https://idx.example/api?t=search&apikey=***&q=x: Dns Failed"
+        );
+        // Key last in the query, so the value runs to the end of the URL
+        // rather than to an '&'.
+        let tail = redact_apikey("https://idx/api?t=caps&apikey=abc def");
+        assert_eq!(tail, "https://idx/api?t=caps&apikey=*** def");
+        // Two of them (a message that quotes the URL twice) and a string
+        // with none at all.
+        assert_eq!(
+            redact_apikey("a apikey=1&b apikey=2&c"),
+            "a apikey=***&b apikey=***&c"
+        );
+        assert_eq!(redact_apikey("plain error"), "plain error");
+    }
+
+    /// The GRAB path needs more than [`redact_apikey`]. That scrubber
+    /// knows the credential is spelled `apikey=` because WE built the
+    /// search URL. An NZB enclosure link comes out of the indexer's own
+    /// XML and can spell it anything, so the whole URL past the host goes.
+    ///
+    /// Regression for a real leak: `fetch_url` names the URL it failed
+    /// on, and both `indexer_grab` and the nzblnk ladder put that string
+    /// straight into a response the dashboard renders.
+    #[test]
+    fn a_grab_error_shows_the_host_and_nothing_else() {
+        let got = redact_url_creds(
+            "http://idx.example/getnzb/abc?r=SECRET123&i=42: 999 bytes is too large for an NZB",
+        );
+        assert!(!got.contains("SECRET123"), "{got}");
+        // The `:` that separated the URL from the sentence goes with the
+        // URL - it is attached to it, and telling sentence punctuation
+        // apart from URL punctuation is a rabbit hole with a credential
+        // at the bottom of it. Dropping is the safe direction, and the
+        // message still reads.
+        assert_eq!(got, "http://idx.example/... 999 bytes is too large for an NZB");
+        // Userinfo is a credential too.
+        assert_eq!(
+            redact_url_creds("https://user:pw@idx.example/x?k=1 failed"),
+            "https://idx.example/... failed"
+        );
+        // A bare origin keeps its shape; two URLs in one sentence both go.
+        assert_eq!(redact_url_creds("https://idx.example refused"), "https://idx.example refused");
+        assert_eq!(
+            redact_url_creds("http://a/x?k=1 then https://b/y?k=2 done"),
+            "http://a/... then https://b/... done"
+        );
+        assert_eq!(redact_url_creds("plain error"), "plain error");
+        // https must not be matched as http:// + "s..." when both appear
+        // and the https one comes first.
+        assert_eq!(
+            redact_url_creds("https://b/y?k=2 and http://a/x?k=1"),
+            "https://b/... and http://a/..."
+        );
+    }
 
     /// §4 C2: the enricher's requests must REUSE a connection.
     ///
@@ -21543,6 +23477,66 @@ mod tests {
             "the replacement we just downloaded must survive its own upgrade"
         );
         assert!(season.join(sibling).exists(), "a sibling episode is never touched");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An obfuscated post identified by an oracle is FILED under the
+    /// oracle's name - "a4f9c2e1" is not a show - so every later
+    /// operation on it has to look for the files that were really
+    /// written. Keyed on `Job::name`, the delete below finds nothing:
+    /// the episode is left in the season folder forever, and the "play"
+    /// route cannot find it either.
+    #[test]
+    fn a_job_filed_under_an_oracles_name_is_deleted_by_that_name() {
+        let root = std::env::temp_dir().join(format!("nzbfast-fbase-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let season = root.join("tv").join("The Bear").join("Season 03");
+        std::fs::create_dir_all(&season).unwrap();
+        std::fs::write(season.join("The Bear - S03E05 [1080p].mkv"), b"x").unwrap();
+        std::fs::write(season.join("The Bear - S03E06 [1080p].mkv"), b"x").unwrap();
+
+        let j = job(json!({
+            "nzo_id": "n1",
+            // What usenet called it, and what the *arr still matches on.
+            "name": "a4f9c2e1b7d048395166cf20",
+            "nzb_path": "/spool/x.nzb",
+            "category": "tv",
+            "state": "Completed",
+            "out_dir": season.to_string_lossy(),
+            "tv_sort": true,
+            "filed": true,
+            "filed_suffix": " [1080p]",
+            // What it turned out to be, and what filing used.
+            "identity_name": "The.Bear.S03E05.1080p.WEB.h264-GRP",
+            "identity_src": "srrdb",
+            "filed_base": "The.Bear.S03E05.1080p.WEB.h264-GRP",
+        }));
+        assert_eq!(super::filed_stem(&j), "The.Bear.S03E05.1080p.WEB.h264-GRP");
+
+        let suffix = super::delete_suffix(&j, String::new);
+        super::remove_job_files(&j.out_dir, super::filed_stem(&j), j.filed, &suffix);
+        assert!(
+            !season.join("The Bear - S03E05 [1080p].mkv").exists(),
+            "the filed episode was not found by the name it was filed under"
+        );
+        assert!(
+            season.join("The Bear - S03E06 [1080p].mkv").exists(),
+            "a sibling episode is never touched"
+        );
+
+        // A record with no filed_base - every record written before the
+        // identity ladder, and every job whose own name was fine - still
+        // answers with its own name.
+        let plain = job(json!({
+            "nzo_id": "n2",
+            "name": "The.Bear.S03E06.1080p.WEB.h264-GRP",
+            "nzb_path": "/spool/x.nzb",
+            "state": "Completed",
+            "out_dir": season.to_string_lossy(),
+            "tv_sort": true,
+            "filed": true,
+        }));
+        assert_eq!(super::filed_stem(&plain), "The.Bear.S03E06.1080p.WEB.h264-GRP");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -23653,11 +25647,15 @@ fn ui_themed(page: &str) -> String {
 /// because with the built-in indexer off that count is what decides
 /// whether /wall is still worth a nav pill: it is the pull-search
 /// surface too, and hiding it would take the commercial indexers away
-/// with it.
+/// with it. `__NZBFAST_SPOTS__` is there for the same reason - spots
+/// are a third thing /wall can search, switched on independently.
 fn ui_shell_state(d: &Daemon, page: String) -> String {
-    let indexers = d.indexers.lock().unwrap().iter().filter(|i| i.enabled).count();
     page.replace("__NZBFAST_INDEX__", if d.indexer_off() { "0" } else { "1" })
-        .replace("__NZBFAST_INDEXERS__", &indexers.to_string())
+        .replace(
+            "__NZBFAST_SPOTS__",
+            if d.spot_enabled.load(Ordering::Relaxed) { "1" } else { "0" },
+        )
+        .replace("__NZBFAST_INDEXERS__", &d.enabled_indexers().to_string())
 }
 
 const WALL_HTML: &str =

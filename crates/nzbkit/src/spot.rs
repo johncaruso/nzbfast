@@ -9,18 +9,28 @@
 //! `Services_Format_Parsing.php` + `Services_Signing_Base.php`):
 //!
 //! ```text
-//! From: [Nickname] <[modulus].[signature]@[cat][keyid][subcats].[size].
-//!        [random].[date].[custom-id].[custom-value].[server-signature]>
+//! From: [Nickname] <[modulus].[user-signature]@[cat][keyid][subcats].[size].
+//!        [random].[date].[custom-id].[custom-value].[header-signature]>
 //! ```
 //!
 //! - base64 fields use a URL-safe variant: `/`→`-s`, `+`→`-p`, `=` stripped.
-//! - The user signature is RSA PKCS#1 v1.5 / SHA-1 over
-//!   `title + header-without-server-signature + poster` (raw bytes - the
-//!   ISO-8859-1 gotcha: never re-encode).
-//! - Key-id 7 (self-signed keys) additionally requires the V2 hashcash
-//!   proof-of-work: sha1(message-id) starts with hex `0000`. Per spotweb we
-//!   verify the signature strictly but treat hashcash failure as a warning
-//!   flag, not a rejection.
+//! - The signature that guards the header is the LAST dot-field of the part
+//!   after `@` (spotweb's `headersign`), NOT the field before it in the
+//!   user-part - that one signs the message-id, and is only used for the
+//!   separate full-spot check. It is RSA PKCS#1 v1.5 / SHA-1 over
+//!   `title + header-without-that-last-field + poster`, over the raw wire
+//!   bytes (the ISO-8859-1 gotcha: never re-encode).
+//! - `title` is the subject up to the first `|` for modern keys and the
+//!   whole subject on older encodings. Neither rule covers the group on its
+//!   own, so both are tried (measured over 21,384 verified `free.pt` spots:
+//!   17,114 first-part, 4,270 whole subject).
+//! - The key is the modulus embedded in the From for self-signed spots, and
+//!   one of the distributed Spotnet master keys otherwise.
+//! - Self-signed spots additionally carry the V2 hashcash proof-of-work:
+//!   sha1(message-id) starts with hex `0000`. Per spotweb we verify the
+//!   signature strictly but treat hashcash failure as a warning flag, not a
+//!   rejection - at least one client in the wild posts valid spots with an
+//!   unmined message-id.
 //! - The NZB payload is raw-deflated then escape-armored: NUL→`=A`,
 //!   CR→`=B`, LF→`=C`, `=`→`=D`.
 //!
@@ -40,6 +50,21 @@ const MAX_FROM_RECORD: usize = 8 * 1024;
 const MAX_SPOT_XML: usize = 50 * 1024;
 /// Inflated NZB payload cap.
 const MAX_NZB_INFLATED: u64 = 32 * 1024 * 1024;
+
+/// The distributed Spotnet master public keys, verbatim from spotweb's
+/// `Services_Upgrade_Settings::createRsaKeys` (base64 modulus; the exponent
+/// is 65537 for every one of them). Key-id 1 predates signing and has no
+/// key, 5 and 6 were never issued, and 7 means "self-signed" - the modulus
+/// travels in the From record instead.
+const MASTER_KEYS: [(u8, &str); 3] = [
+    (2, "ys8WSlqonQMWT8ubG0tAA2Q07P36E+CJmb875wSR1XH7IFhEi0CCwlUzNqBFhC+P"),
+    (3, "uiyChPV23eguLAJNttC/o0nAsxXgdjtvUvidV2JL+hjNzc4Tc/PPo2JdYvsqUsat"),
+    (4, "1k6RNDVD6yBYWR6kHmwzmSud7JkNV4SMigBrs+jFgOK5Ldzwl17mKXJhl+su/GR9"),
+];
+
+/// Below this a decoded modulus is a random number, not a public key -
+/// server-signed spots put a plain integer where the key would go.
+const MIN_MODULUS_BYTES: usize = 20;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SpotError {
@@ -62,15 +87,24 @@ fn err(msg: impl Into<String>) -> SpotError {
 /// A parsed spot From-header record.
 #[derive(Debug, Clone)]
 pub struct SpotHeader {
-    /// Poster nickname (the display-name part before `<`).
+    /// Poster nickname, exactly as the signature covers it: everything
+    /// before the `<` minus the single separating space, quotes and all.
+    /// spotweb signs `substr($from, 0, strpos($from, '<') - 1)`, so this is
+    /// deliberately not trimmed.
     pub poster: String,
-    /// RSA public-key modulus, big-endian bytes (exponent is always 65537).
+    /// Self-signed RSA public-key modulus from the From record, big-endian
+    /// (exponent is always 65537). Empty on server-signed spots, which put
+    /// a random number there and rely on a master key instead.
     pub modulus: Vec<u8>,
-    /// PKCS#1 v1.5 signature bytes.
+    /// PKCS#1 v1.5 signature over the header - the LAST dot-field of the
+    /// part after `@` (spotweb's `headersign`).
     pub signature: Vec<u8>,
-    /// Category digit as posted (1-based, matching the XML `<Category>`).
+    /// Signature over `<message-id>` made with [`Self::modulus`]; the
+    /// full-spot check uses it, the header check never does. Optional.
+    pub user_signature: Vec<u8>,
+    /// Category, 0-based as spotweb stores it (the wire digit minus one).
     pub category: u8,
-    /// Key regime: 1–6 are the distributed Spotnet keys, 7 is self-signed.
+    /// Key regime: 1–6 select a distributed Spotnet key, 7 is self-signed.
     pub key_id: u8,
     /// Subcategory runs, e.g. `["a09", "b04"]`.
     pub subcats: Vec<String>,
@@ -79,8 +113,8 @@ pub struct SpotHeader {
     pub date: i64,
     pub custom_id: String,
     pub custom_value: String,
-    /// The portion after `@` minus the trailing server-signature field -
-    /// the exact bytes covered by the user signature.
+    /// The portion after `@` minus the trailing signature field - the exact
+    /// bytes [`Self::signature`] covers.
     pub signed_part: String,
 }
 
@@ -95,32 +129,42 @@ pub fn parse_spot_from(from_header: &str) -> Option<SpotHeader> {
     if gt <= lt {
         return None;
     }
-    let poster = from_header[..lt].trim().trim_matches('"').to_string();
+    // The signed poster string drops exactly one byte before the '<' - the
+    // space of `Nickname <addr>`. Falling back to a trim keeps a nickname
+    // whose last char is multi-byte from being a hard parse failure.
+    let poster = from_header
+        .get(..lt.saturating_sub(1))
+        .unwrap_or_else(|| from_header[..lt].trim_end())
+        .to_string();
     let inner = &from_header[lt + 1..gt];
     let (user_part, header) = inner.split_once('@')?;
-    let (mod_s, sig_s) = user_part.split_once('.')?;
-    let modulus = spot_b64_decode(mod_s)?;
-    let signature = spot_b64_decode(sig_s)?;
-    if modulus.is_empty() || signature.is_empty() {
-        return None;
-    }
+    // [modulus] or [modulus].[user-signature] - or, on server-signed spots,
+    // a plain random number. Both are optional: only the master key regimes
+    // can verify without a modulus, and nothing here needs the user
+    // signature, so neither absence rejects the record.
+    let mut user_fields = user_part.split('.');
+    let modulus = user_fields.next().and_then(spot_b64_decode).unwrap_or_default();
+    let user_signature = user_fields.next().and_then(spot_b64_decode).unwrap_or_default();
 
     // [cat][keyid][subcats].[size].[random].[date].[custom-id].[custom-value]
-    // .[server-signature]
+    // .[header-signature]
     let fields: Vec<&str> = header.split('.').collect();
     if fields.len() < 6 {
         return None;
     }
-    // The user signature covers everything up to (not including) the final
-    // server-signature field.
-    let signed_part = if fields.len() >= 7 {
-        &header[..header.rfind('.')?]
-    } else {
-        header
-    };
+    // The header signature is the LAST field, and covers everything before
+    // it - always, however many fields there are.
+    let last = fields[fields.len() - 1];
+    let signature = spot_b64_decode(last)?;
+    if signature.is_empty() {
+        return None;
+    }
+    let signed_part = &header[..header.len() - last.len() - 1];
 
     let mut chars = fields[0].chars();
-    let category = chars.next()?.to_digit(10)? as u8;
+    // spotweb stores `substr($fields[0], 0, 1) - 1`: the wire digit is
+    // 1-based, everything downstream of it is 0-based.
+    let category = (chars.next()?.to_digit(10)? as u8).saturating_sub(1);
     let key_id = chars.next()?.to_digit(10)? as u8;
     let subcats = parse_subcats(chars.as_str())?;
     let size = fields[1].parse().ok()?;
@@ -130,13 +174,20 @@ pub fn parse_spot_from(from_header: &str) -> Option<SpotHeader> {
         poster,
         modulus,
         signature,
+        user_signature,
         category,
         key_id,
         subcats,
         size,
         date,
         custom_id: fields[4].to_string(),
-        custom_value: fields[5].to_string(),
+        // With the bare six fields spotweb tolerates, field 5 IS the
+        // signature, not a custom value.
+        custom_value: if fields.len() > 6 {
+            fields[5].to_string()
+        } else {
+            String::new()
+        },
         signed_part: signed_part.to_string(),
     })
 }
@@ -176,35 +227,58 @@ fn parse_subcats(s: &str) -> Option<Vec<String>> {
 // Signature + hashcash verification
 // ---------------------------------------------------------------------------
 
+/// Which public key a spot's signature verified against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpotKeySource {
+    /// One of the distributed Spotnet keys - the spot was signed by the
+    /// central signing server, so the poster identity is vouched for.
+    Master,
+    /// The modulus the poster put in their own From record. Proves only
+    /// that one person posted the whole record; the hashcash is what makes
+    /// that cost something.
+    SelfSigned,
+}
+
 /// Result of [`verify_spot`]: signature strictly, hashcash as a warning.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SpotVerify {
     pub signature_ok: bool,
-    /// `false` only for key-id 7 spots whose message-id fails the V2
+    /// `false` only for self-signed spots whose message-id fails the V2
     /// hashcash proof-of-work - a warning flag, never a rejection.
     pub hashcash_ok: bool,
+    /// Which key verified, `None` when nothing did.
+    pub key_source: Option<SpotKeySource>,
+    /// The title the signature actually covered, `None` when nothing
+    /// verified. Two conventions are live and the verifier has to try
+    /// both, so which one won is the only evidence of where the spotter
+    /// meant the title to end - a trailing `| ClubNZB` is part of the
+    /// title for one poster and a tag appended after it for another.
+    /// Store this rather than the raw subject.
+    pub title: Option<String>,
 }
 
 /// Verify a spot header: RSA PKCS#1 v1.5 / SHA-1 over
-/// `title + signed_part + poster` against the embedded modulus (e = 65537),
-/// plus the V2 hashcash check for self-signed (key-id 7) spots:
+/// `title + signed_part + poster` (see the module header for the title and
+/// key rules), plus the V2 hashcash check when the key was self-signed:
 /// sha1(message-id) must start with hex `0000`.
-pub fn verify_spot(header: &SpotHeader, title: &str, message_id: &str) -> SpotVerify {
-    let signature_ok = (|| {
-        let n = rsa::BigUint::from_bytes_be(&header.modulus);
-        let e = rsa::BigUint::from(65537u32);
-        let key = rsa::RsaPublicKey::new(n, e).ok()?;
-        let mut h = Sha1::new();
-        h.update(title.as_bytes());
-        h.update(header.signed_part.as_bytes());
-        h.update(header.poster.as_bytes());
-        let digest = h.finalize();
-        key.verify(rsa::Pkcs1v15Sign::new::<Sha1>(), &digest, &header.signature)
-            .ok()
-    })()
-    .is_some();
+///
+/// `subject` is the raw OVER subject, not a pre-split title.
+pub fn verify_spot(header: &SpotHeader, subject: &str, message_id: &str) -> SpotVerify {
+    let digests = signed_digests(header, subject);
+    let scheme = rsa::Pkcs1v15Sign::new::<Sha1>();
+    let mut key_source = None;
+    let mut title = None;
+    'search: for (source, key) in candidate_keys(header) {
+        for (t, d) in &digests {
+            if key.verify(scheme.clone(), d, &header.signature).is_ok() {
+                key_source = Some(source);
+                title = Some((*t).to_string());
+                break 'search;
+            }
+        }
+    }
 
-    let hashcash_ok = if header.key_id == 7 {
+    let hashcash_ok = if key_source == Some(SpotKeySource::SelfSigned) {
         let d = Sha1::digest(normalize_msgid(message_id).as_bytes());
         d[0] == 0 && d[1] == 0
     } else {
@@ -212,9 +286,84 @@ pub fn verify_spot(header: &SpotHeader, title: &str, message_id: &str) -> SpotVe
     };
 
     SpotVerify {
-        signature_ok,
+        signature_ok: key_source.is_some(),
         hashcash_ok,
+        key_source,
+        title,
     }
+}
+
+/// The public keys worth trying for a record, best first.
+fn candidate_keys(header: &SpotHeader) -> Vec<(SpotKeySource, rsa::RsaPublicKey)> {
+    let e = rsa::BigUint::from(65537u32);
+    let mut out = Vec::with_capacity(2);
+    let master = (header.key_id != 7)
+        .then(|| MASTER_KEYS.iter().find(|(id, _)| *id == header.key_id))
+        .flatten()
+        .and_then(|(_, m)| b64_decode(m))
+        .map(|n| rsa::BigUint::from_bytes_be(&n))
+        .and_then(|n| rsa::RsaPublicKey::new(n, e.clone()).ok());
+    if let Some(key) = master {
+        out.push((SpotKeySource::Master, key));
+    }
+    // Key-id 7 is self-signed by design. Key-id 2 also is when the record
+    // carries a real modulus - spotweb's "personal dispose" branch, and not
+    // a rarity: 1,246 of the 1,606 key-id 2 spots in a 40,000-line free.pt
+    // sample verify this way and only 360 against the master key.
+    if header.modulus.len() >= MIN_MODULUS_BYTES {
+        let n = rsa::BigUint::from_bytes_be(&header.modulus);
+        if let Ok(key) = rsa::RsaPublicKey::new(n, e) {
+            out.push((SpotKeySource::SelfSigned, key));
+        }
+    }
+    out
+}
+
+/// Every SHA-1 digest the header signature might legitimately cover: two
+/// title rules crossed with the two ways a raw header line could have been
+/// decoded. Ordered by how often each wins in the wild.
+///
+/// Each digest is paired with the title it was built from, so the caller
+/// can report which rule won; the two decodings of one title share it.
+fn signed_digests<'a>(header: &SpotHeader, subject: &'a str) -> Vec<(&'a str, [u8; 20])> {
+    let first = subject.split('|').next().unwrap_or(subject).trim();
+    let mut titles: Vec<&str> = vec![first];
+    if subject != first {
+        titles.push(subject);
+    }
+    let poster_l1 = latin1_bytes(&header.poster);
+    let mut out = Vec::with_capacity(titles.len() * 2);
+    for title in titles {
+        let title_l1 = latin1_bytes(title);
+        let mut pairs: Vec<(&[u8], &[u8])> = vec![(title.as_bytes(), header.poster.as_bytes())];
+        if title_l1.is_some() || poster_l1.is_some() {
+            pairs.push((
+                title_l1.as_deref().unwrap_or(title.as_bytes()),
+                poster_l1.as_deref().unwrap_or(header.poster.as_bytes()),
+            ));
+        }
+        for (t, p) in pairs {
+            let mut h = Sha1::new();
+            h.update(t);
+            h.update(header.signed_part.as_bytes());
+            h.update(p);
+            out.push((title, h.finalize().into()));
+        }
+    }
+    out
+}
+
+/// The wire bytes behind a latin-1-decoded header field (see
+/// [`crate::nntp::decode_header_line`]) - one byte per char. `None` when
+/// the field is plain ASCII (its UTF-8 bytes are already the wire bytes)
+/// or holds a char that no single byte could have produced.
+fn latin1_bytes(s: &str) -> Option<Vec<u8>> {
+    if s.is_ascii() {
+        return None;
+    }
+    s.chars()
+        .map(|c| (c as u32 <= 0xFF).then_some(c as u8))
+        .collect()
 }
 
 /// Spotter id: base64 of the big-endian crc32 of the modulus bytes, with
@@ -548,6 +697,15 @@ pub struct SpotScanSummary {
     pub valid: u64,
     /// Failed to parse or failed signature verification.
     pub invalid: u64,
+    /// The subset of `invalid` that parsed as a spot record but whose
+    /// signature did not check out. The rest are ordinary articles: a spot
+    /// group carries plenty of traffic that was never a spot, so folding
+    /// the two together hides the number that actually measures the
+    /// verifier (99.5% of parsed records on `free.pt`).
+    pub unverified: u64,
+    /// Verified records that are Spotnet moderation traffic rather than
+    /// content, and so are not stored. See [`is_moderation`].
+    pub moderation: u64,
     /// Valid spots newly inserted (not already in the DB).
     pub new: u64,
     /// Valid key-id-7 spots whose hashcash PoW failed (warning only).
@@ -558,6 +716,18 @@ pub struct SpotScanSummary {
 /// the stored high-water mark (keyed `spots:<group>` so it never collides
 /// with a release-index scan of the same group; `server_host` is the host
 /// `conn` talks to - article numbers are per server, A8).
+/// Is this subject a Spotnet moderation record rather than a spot about
+/// a posting? These carry `DISPOSE <message-id> - <the spot's title>`,
+/// which is why they read like releases if they are stored.
+///
+/// We deliberately do not ACT on them either. spotweb checks a dispose
+/// against the distributed master keys; the majority here are the
+/// self-signed branch, which any poster can mint. Honouring one on that
+/// basis would be a free "delete this from someone's index" button.
+pub fn is_moderation(subject: &str) -> bool {
+    subject.trim_start().starts_with("DISPOSE ")
+}
+
 pub async fn scan_spots(
     conn: &mut Connection,
     ix: &mut Index,
@@ -590,21 +760,48 @@ pub async fn scan_spots(
             let v = verify_spot(&h, &e.subject, &e.message_id);
             if !v.signature_ok {
                 sum.invalid += 1;
+                sum.unverified += 1;
                 continue;
             }
             sum.valid += 1;
             if !v.hashcash_ok {
                 sum.hashcash_warn += 1;
             }
+            // Spotnet's moderation traffic is posted to the same group in
+            // the same envelope, and it verifies exactly like content
+            // does - it is a takedown request naming another spot, not a
+            // description of a posting. There is no NZB behind one, so a
+            // stored moderation record is a row that reads like a release
+            // and cannot be downloaded. 1,345 of 16,603 verified records
+            // in a live 20,000-header pass, so it is 8% of the table.
+            //
+            // Matched on spotweb's own marker rather than the key regime:
+            // most of these are the self-signed "personal dispose" branch
+            // (see candidate_keys), so key-id alone does not separate them.
+            if is_moderation(&e.subject) {
+                sum.moderation += 1;
+                continue;
+            }
             let spot = Spot {
                 id: 0,
                 msgid: e.message_id.clone(),
-                title: e.subject.clone(),
+                // The title the signature covered, not the raw subject.
+                // Some spotters sign the subject whole, `| ClubNZB` and
+                // all; others sign up to the `|` and append a tag after
+                // it. Only the verifier knows which, so storing the
+                // subject put one poster's tag inside everyone's title.
+                title: v.title.clone().unwrap_or_else(|| e.subject.clone()),
                 category: h.category,
                 subcats: h.subcats.join(","),
                 size: h.size,
                 date: h.date,
-                spotter_id: spotter_id(&h.modulus),
+                // Only a self-signed key identifies a spotter; a master-key
+                // spot's user-part is a random number, so hashing it would
+                // mint a fresh "identity" for every post.
+                spotter_id: match v.key_source {
+                    Some(SpotKeySource::SelfSigned) => spotter_id(&h.modulus),
+                    _ => String::new(),
+                },
                 verified: true,
                 hashcash_ok: v.hashcash_ok,
                 nzb_msgids: Vec::new(),
@@ -758,10 +955,12 @@ mod tests {
         msgid: String,
         title: String,
         modulus: Vec<u8>,
+        header_sig: Vec<u8>,
     }
 
-    /// Build a fully signed spot: header record, PKCS#1 v1.5/SHA-1 user
-    /// signature, and a hashcash-mined message-id (16 bits - fast).
+    /// Build a fully signed spot: header record, PKCS#1 v1.5/SHA-1 header
+    /// signature in the LAST header field, and a hashcash-mined message-id
+    /// (16 bits - fast).
     fn make_spot(key: &RsaPrivateKey, title: &str, key_id: u8, mine: bool) -> TestSpot {
         let poster = "TestPoster";
         let modulus = RsaPublicKey::from(key).n().to_bytes_be();
@@ -778,8 +977,8 @@ mod tests {
         let from = format!(
             "{poster} <{}.{}@{signed_part}.{}>",
             spot_b64_encode(&modulus),
+            spot_b64_encode(b"user-signature-signs-the-msgid"),
             spot_b64_encode(&sig),
-            spot_b64_encode(b"server-signature-not-checked"),
         );
         let msgid = if mine {
             // Mine the V2 hashcash: sha1("<...>") starts with 0x0000.
@@ -798,6 +997,7 @@ mod tests {
             msgid,
             title: title.to_string(),
             modulus,
+            header_sig: sig,
         }
     }
 
@@ -808,7 +1008,8 @@ mod tests {
 
         let h = parse_spot_from(&spot.from).expect("parse");
         assert_eq!(h.poster, "TestPoster");
-        assert_eq!(h.category, 1);
+        // Wire digit 1, stored 0-based (spotweb parity).
+        assert_eq!(h.category, 0);
         assert_eq!(h.key_id, 7);
         assert_eq!(h.subcats, vec!["a09", "b04"]);
         assert_eq!(h.size, 1_048_576);
@@ -817,10 +1018,31 @@ mod tests {
 
         let v = verify_spot(&h, &spot.title, &spot.msgid);
         assert!(v.signature_ok && v.hashcash_ok);
+        assert_eq!(v.key_source, Some(SpotKeySource::SelfSigned));
 
         // Tampered title → signature fails.
         let v = verify_spot(&h, "Evil Title", &spot.msgid);
         assert!(!v.signature_ok);
+        assert_eq!(v.key_source, None);
+
+        // The signature the OLD code checked - the user-part field before
+        // the '@' - must not be mistaken for the header signature.
+        let swapped = spot.from.replace(
+            &format!(".{}>", spot_b64_encode(&spot.header_sig)),
+            &format!(".{}>", spot_b64_encode(b"not-the-signature")),
+        );
+        let h_swapped = parse_spot_from(&swapped).unwrap();
+        assert!(!verify_spot(&h_swapped, &spot.title, &spot.msgid).signature_ok);
+
+        // A subject that carries a `| tag` suffix verifies on the title
+        // rule that keeps only the part before the first '|'.
+        let tagged = make_spot(&key, "Tagged Title", 7, true);
+        let h_tag = parse_spot_from(&tagged.from).unwrap();
+        let v_tag = verify_spot(&h_tag, "Tagged Title | NLsub", &tagged.msgid);
+        assert!(v_tag.signature_ok);
+        // And the title it reports is the signed one, so the tag does not
+        // get stored as part of it (see `stored_title_is_the_signed_one`).
+        assert_eq!(v_tag.title.as_deref(), Some("Tagged Title"));
 
         // Unmined message-id → warning flag only, signature still fine.
         let unmined = make_spot(&key, "Test Title", 7, false);
@@ -828,11 +1050,13 @@ mod tests {
         let v = verify_spot(&h2, &unmined.title, &unmined.msgid);
         assert!(v.signature_ok && !v.hashcash_ok);
 
-        // Non-self-signed regimes skip hashcash entirely.
+        // A key-id with no master key falls back to the record's own
+        // modulus, which makes the hashcash apply just as it does for 7.
         let k1 = make_spot(&key, "Test Title", 1, false);
         let h3 = parse_spot_from(&k1.from).unwrap();
         let v = verify_spot(&h3, &k1.title, &k1.msgid);
-        assert!(v.signature_ok && v.hashcash_ok);
+        assert!(v.signature_ok && !v.hashcash_ok);
+        assert_eq!(v.key_source, Some(SpotKeySource::SelfSigned));
 
         // Spotter id is deterministic and stripped of /+=.
         let sid = spotter_id(&spot.modulus);
@@ -851,23 +1075,26 @@ mod tests {
     fn malformed_from_headers_never_panic() {
         let key = test_key();
         let good = make_spot(&key, "T", 7, false).from;
+        // `SIG` stands in for the trailing header signature: decodable
+        // base64, so every case below fails on the field it is named for
+        // and not on the signature check that guards them all.
+        const SIG: &str = "QUJDQUJD";
         let cases: Vec<String> = vec![
             String::new(),
             "no brackets at all".into(),
             "nick <>".into(),
-            "nick <mod.sig>".into(),                       // no @
-            "nick <modsig@17a09.1.2.3.4.5.6>".into(),      // no '.' in user part
-            "nick <!!!.???@17a09.1.2.3.4.5.6>".into(),     // bad base64
-            "nick <QUJD.QUJD@x7a09.1.2.3.4.5.6>".into(),   // non-digit category
-            "nick <QUJD.QUJD@1xa09.1.2.3.4.5.6>".into(),   // non-digit key-id
-            "nick <QUJD.QUJD@1709x.1.2.3.4.5.6>".into(),   // garbage subcats
-            "nick <QUJD.QUJD@17a09.NaN.2.3.4.5.6>".into(), // bad size
-            "nick <QUJD.QUJD@17a09.1.2.NaN.4.5.6>".into(), // bad date
-            "nick <QUJD.QUJD@17a09.1.2>".into(),           // truncated fields
-            good[..good.len() / 2].to_string(),            // truncated record
-            format!("nick <{}.QUJD@17a09.1.2.3.4.5.6>", "QUJD".repeat(3000)), // >8KB
-            "nick > reversed < QUJD.QUJD@17a09.1.2.3.4.5.6".into(),
-            "nick <-x.QUJD@17a09.1.2.3.4.5.6>".into(),     // bad -x escape
+            "nick <mod.sig>".into(),                             // no @
+            format!("nick <QUJD.QUJD@x7a09.1.2.3.4.{SIG}>"),     // non-digit category
+            format!("nick <QUJD.QUJD@1xa09.1.2.3.4.{SIG}>"),     // non-digit key-id
+            format!("nick <QUJD.QUJD@1709x.1.2.3.4.{SIG}>"),     // garbage subcats
+            format!("nick <QUJD.QUJD@17a09.NaN.2.3.4.{SIG}>"),   // bad size
+            format!("nick <QUJD.QUJD@17a09.1.2.NaN.4.{SIG}>"),   // bad date
+            format!("nick <QUJD.QUJD@17a09.1.{SIG}>"),           // truncated fields
+            "nick <QUJD.QUJD@17a09.1.2.3.4.5.6>".into(),         // undecodable signature
+            "nick <QUJD.QUJD@17a09.1.2.3.4.5.>".into(),          // empty signature
+            good[..good.len() / 2].to_string(),                  // truncated record
+            format!("nick <{}.QUJD@17a09.1.2.3.4.{SIG}>", "QUJD".repeat(3000)), // >8KB
+            format!("nick > reversed < QUJD.QUJD@17a09.1.2.3.4.{SIG}"),
         ];
         for c in &cases {
             assert!(
@@ -880,6 +1107,157 @@ mod tests {
         // including with trailing comment junk after the closing bracket.
         assert!(parse_spot_from(&good).is_some());
         assert!(parse_spot_from(&format!("{good} (comment)")).is_some());
+
+        // A server-signed record puts a random number where the modulus
+        // goes and has no user-signature field at all. It must still parse:
+        // a master key, not the From, is what verifies it.
+        let server_signed = parse_spot_from("nick <10@12a01.1.10.1776489039.c41.mod.QUJDQUJD>")
+            .expect("server-signed record parses");
+        assert!(server_signed.modulus.len() < MIN_MODULUS_BYTES);
+        assert!(server_signed.user_signature.is_empty());
+        assert_eq!(server_signed.key_id, 2);
+        assert_eq!(server_signed.signed_part, "12a01.1.10.1776489039.c41.mod");
+        assert!(candidate_keys(&server_signed)
+            .iter()
+            .all(|(s, _)| *s == SpotKeySource::Master));
+    }
+
+    /// Real captured `free.pt` OVER lines, one per way a spot can verify.
+    /// Every one of these failed before the header-signature fix (the code
+    /// checked the user-part field, which signs the message-id, not the
+    /// header), so this is the regression that matters: nothing synthetic
+    /// can catch a "verifies the right bytes against the wrong signature"
+    /// bug, because a synthetic spot is signed by the same code that
+    /// checks it.
+    #[test]
+    fn live_spot_headers_verify() {
+        const FIXTURE: &[u8] = include_bytes!("../testdata/spot/free.pt.over.tsv");
+        // (subject fragment, key source, hashcash, category, key-id)
+        let want: [(&str, Option<SpotKeySource>, bool, u8, u8); 9] = [
+            // Key-id 2 "personal dispose", self-signed, latin-1 subject.
+            ("Dansons", Some(SpotKeySource::SelfSigned), true, 0, 2),
+            // Key-id 2 "personal dispose", self-signed, plain ASCII.
+            ("Master of the Universe", Some(SpotKeySource::SelfSigned), true, 0, 2),
+            // Key-id 2 against the distributed master key, latin-1 subject.
+            ("pendant la", Some(SpotKeySource::Master), true, 0, 2),
+            // Key-id 2 against the distributed master key, plain ASCII.
+            ("NCIS", Some(SpotKeySource::Master), true, 0, 2),
+            // Self-signed key-id 7, latin-1 subject.
+            ("skind (2012)", Some(SpotKeySource::SelfSigned), true, 0, 7),
+            // Self-signed key-id 7, non-ASCII subject that really is UTF-8.
+            ("Oscar Peterson", Some(SpotKeySource::SelfSigned), true, 1, 7),
+            // Self-signed key-id 7, plain ASCII.
+            ("Garmin tools", Some(SpotKeySource::SelfSigned), true, 3, 7),
+            // Self-signed key-id 7 signed over the WHOLE subject, '|' and
+            // all - the rule that splits on '|' misses this one.
+            ("Testspot 4 | ClubNZB", Some(SpotKeySource::SelfSigned), true, 0, 7),
+            // Server-signed: the From carries a random number, not a key,
+            // so there is nothing to verify against. Parses, never valid.
+            ("HPI Seizoen.02", None, true, 0, 7),
+        ];
+
+        let entries: Vec<_> = FIXTURE
+            .split(|&b| b == b'\n')
+            .filter(|l| !l.starts_with(b"#"))
+            .filter_map(crate::nntp::parse_over_line)
+            .collect();
+        assert_eq!(entries.len(), want.len(), "fixture/expectation drift");
+
+        for (e, (fragment, source, hashcash, category, key_id)) in entries.iter().zip(want) {
+            assert!(
+                e.subject.contains(fragment),
+                "fixture order changed: {:?} is not {fragment}",
+                e.subject
+            );
+            let h = parse_spot_from(&e.from).unwrap_or_else(|| panic!("parse {fragment}"));
+            assert_eq!(h.category, category, "category of {fragment}");
+            assert_eq!(h.key_id, key_id, "key-id of {fragment}");
+            let v = verify_spot(&h, &e.subject, &e.message_id);
+            assert_eq!(v.key_source, source, "key source of {fragment}");
+            assert_eq!(v.signature_ok, source.is_some(), "signature of {fragment}");
+            assert_eq!(v.hashcash_ok, hashcash, "hashcash of {fragment}");
+            // A one-byte change anywhere in the signed bytes must break it.
+            let mut tampered = h.clone();
+            tampered.signed_part.push('x');
+            assert!(!verify_spot(&tampered, &e.subject, &e.message_id).signature_ok);
+            assert!(!verify_spot(&h, &format!("x{}", e.subject), &e.message_id).signature_ok);
+        }
+    }
+
+    /// Moderation records verify exactly like content does - that is the
+    /// point of signing them - so verification cannot be what separates
+    /// them. Against the same captured fixture: its four `DISPOSE` rows
+    /// are moderation (both key-id 2 branches, self-signed AND master
+    /// key), and its five real spots are not.
+    /// The stored title is the one the signature covered, which is not
+    /// always the subject. Both live conventions are in the fixture:
+    /// "Testspot 4 | ClubNZB" is signed whole, so the tag IS the title;
+    /// every other row is signed up to the `|`, so a trailing tag is not.
+    #[test]
+    fn stored_title_is_the_signed_one() {
+        const FIXTURE: &[u8] = include_bytes!("../testdata/spot/free.pt.over.tsv");
+        let entries: Vec<_> = FIXTURE
+            .split(|&b| b == b'\n')
+            .filter(|l| !l.starts_with(b"#"))
+            .filter_map(crate::nntp::parse_over_line)
+            .collect();
+        let (mut tagged_kept, mut tagged_cut) = (0, 0);
+        for e in &entries {
+            let h = parse_spot_from(&e.from).unwrap();
+            let v = verify_spot(&h, &e.subject, &e.message_id);
+            let Some(title) = v.title else {
+                assert!(!v.signature_ok, "a verified spot must report its title");
+                continue;
+            };
+            // Whatever it reports came out of the subject, never invented.
+            assert!(
+                e.subject.contains(title.as_str()),
+                "reported title {title:?} is not part of {:?}",
+                e.subject
+            );
+            if !e.subject.contains('|') {
+                assert_eq!(title, e.subject.trim(), "an untagged subject IS the title");
+            } else if title == e.subject {
+                tagged_kept += 1;
+            } else {
+                tagged_cut += 1;
+                assert!(!title.contains('|'), "a cut title keeps nothing after the bar");
+            }
+        }
+        // "Testspot 4 | ClubNZB" is the fixture's one barred subject, and
+        // it is signed whole - so the tag IS its title and must survive.
+        // The other rule (sign up to the bar, tag appended after) has no
+        // live example here; `parse_verify_spotter_roundtrip` covers it
+        // with a spot signed on the cut title, and it is the majority
+        // rule in the wild (17,114 of 21,384 verified in the sample the
+        // verifier was measured on).
+        assert_eq!((tagged_kept, tagged_cut), (1, 0), "the barred row signs whole");
+    }
+
+    #[test]
+    fn moderation_records_are_not_content() {
+        const FIXTURE: &[u8] = include_bytes!("../testdata/spot/free.pt.over.tsv");
+        let entries: Vec<_> = FIXTURE
+            .split(|&b| b == b'\n')
+            .filter(|l| !l.starts_with(b"#"))
+            .filter_map(crate::nntp::parse_over_line)
+            .collect();
+        let flagged: Vec<bool> = entries.iter().map(|e| is_moderation(&e.subject)).collect();
+        assert_eq!(
+            flagged,
+            vec![true, true, true, true, false, false, false, false, false],
+            "the four DISPOSE rows are moderation, the five spots are not"
+        );
+        // And they DO verify - so anything that stored "verified" rows
+        // without this check stored them.
+        for e in entries.iter().take(4) {
+            let h = parse_spot_from(&e.from).unwrap();
+            assert!(verify_spot(&h, &e.subject, &e.message_id).signature_ok);
+        }
+        // Not a substring match: a release whose title merely contains the
+        // word must not be swallowed.
+        assert!(!is_moderation("How To DISPOSE Of A Body 2026 1080p"));
+        assert!(!is_moderation("DISPOSED.2026.1080p"));
     }
 
     #[test]
@@ -1033,7 +1411,8 @@ mod tests {
         assert_eq!(hits.len(), 1);
         let s = &hits[0];
         assert_eq!(s.title, title);
-        assert_eq!(s.category, 1);
+        assert_eq!(s.category, 0); // wire digit 1, stored 0-based
+
         assert_eq!(s.subcats, "a09,b04");
         assert_eq!(s.size, 1_048_576);
         assert!(s.verified && s.hashcash_ok);

@@ -8,6 +8,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var windowController: DashboardWindowController!
     /// .nzb files that arrived (open-with) before the daemon was up.
     private var pendingNzbs: [URL] = []
+    /// nzblnk: links clicked before the daemon was up. Kept apart from
+    /// pendingNzbs because they take a different endpoint, not because
+    /// they arrive differently - both come through application(_:open:).
+    private var pendingLinks: [String] = []
     private var stackReady = false
     private var quitting = false
 
@@ -38,6 +42,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             let files = pendingNzbs
             pendingNzbs = []
             for f in files { await postNzb(f) }
+            let links = pendingLinks
+            pendingLinks = []
+            for l in links { await postNzblnk(l) }
         case .failed(let why):
             windowController.setOverlay(visible: true, text: "nzbfast couldn't start")
             let alert = NSAlert()
@@ -98,16 +105,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         return true
     }
 
-    // MARK: .nzb open-with
+    // MARK: .nzb open-with, and nzblnk: links
 
+    /// One delegate method serves both: macOS routes an "open with" file
+    /// and a clicked `nzblnk:` URL here alike, so the branch is on what
+    /// the URL IS, not on how it arrived.
     func application(_ application: NSApplication, open urls: [URL]) {
-        let nzbs = urls.filter { $0.pathExtension.lowercased() == "nzb" }
-        guard !nzbs.isEmpty else { return }
+        let nzbs = urls.filter { $0.isFileURL && $0.pathExtension.lowercased() == "nzb" }
+        // absoluteString, deliberately: the daemon owns the only NZBLNK
+        // parser, and re-forming the link through URLComponents here
+        // would normalise the `+` and `%` escapes that its decoder reads.
+        let links = urls
+            .filter { $0.scheme?.lowercased() == "nzblnk" }
+            .map(\.absoluteString)
+        guard !nzbs.isEmpty || !links.isEmpty else { return }
         if stackReady {
-            Task { for f in nzbs { await postNzb(f) } }
+            Task {
+                for f in nzbs { await postNzb(f) }
+                for l in links { await postNzblnk(l) }
+            }
         } else {
             // Cold start: the stack is coming up; post once it answers.
             pendingNzbs.append(contentsOf: nzbs)
+            pendingLinks.append(contentsOf: links)
         }
     }
 
@@ -115,6 +135,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         if let err = await daemon.addNzb(file) {
             let alert = NSAlert()
             alert.messageText = "Couldn't add \(file.lastPathComponent)"
+            alert.informativeText = err
+            alert.runModal()
+        }
+    }
+
+    private func postNzblnk(_ link: String) async {
+        if let err = await daemon.addNzblnk(link) {
+            let alert = NSAlert()
+            alert.messageText = "Couldn't add that link"
             alert.informativeText = err
             alert.runModal()
         }

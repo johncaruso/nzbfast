@@ -58,6 +58,20 @@ impl IndexerConfig {
             format!("{base}/api")
         }
     }
+
+    /// What makes this entry a distinct FAR END, for keying per-endpoint
+    /// runtime state (caps, limit backoffs).
+    ///
+    /// Deliberately not the name. The name is a label the user types and
+    /// retypes, and Settings tests a DRAFT entry before saving it - so a
+    /// draft that borrowed a saved entry's name published its caps under
+    /// that name, and cancelling the edit left the saved entry planning
+    /// its searches against a site it never pointed at. The apikey is in
+    /// the key because the same host answers different caps per account
+    /// (a VIP tier advertising id search that the free tier does not).
+    pub fn identity(&self) -> String {
+        format!("{}\u{1}{}", self.endpoint(), self.apikey.trim())
+    }
 }
 
 /// What `t=caps` said this indexer can do.
@@ -186,7 +200,13 @@ impl std::fmt::Display for NewznabError {
 /// counts - a description mentioning "error" inside a result feed does
 /// not.
 pub fn parse_error(xml: &str) -> Option<NewznabError> {
-    let mut t = xml.trim_start();
+    // trim_start uses Unicode White_Space, which does NOT include U+FEFF, and
+    // a PHP-stack indexer emitting a BOM before <?xml made every <error>
+    // document unparseable here. That is not cosmetic: parse_error is what
+    // raises NewznabError::Limit, so without it the daily-quota answer reads
+    // as an empty result set, the backoff never engages, and we keep hammering
+    // an account that is already over quota.
+    let mut t = xml.trim_start_matches('\u{feff}').trim_start();
     if let Some(rest) = t.strip_prefix("<?xml") {
         t = rest.split_once("?>").map(|(_, r)| r).unwrap_or(rest).trim_start();
     }
@@ -421,7 +441,12 @@ pub fn parse_rfc2822(s: &str) -> Option<i64> {
     let h: i64 = hms.next()?.parse().ok()?;
     let mi: i64 = hms.next()?.parse().ok()?;
     let sec: i64 = hms.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-    if h > 23 || mi > 59 || sec > 60 {
+    // Lower bounds as well as upper: these are i64s parsed straight out of
+    // an indexer's `usenetdate`, and a negative hour sails past an
+    // upper-bound-only check and then overflows `h * 3600` below (a debug
+    // panic inside the thread::scope search fan-out, a wrong timestamp in
+    // release). The contract is that anything unparseable is None.
+    if !(0..=23).contains(&h) || !(0..=59).contains(&mi) || !(0..=60).contains(&sec) {
         return None;
     }
     let off = match it.next().unwrap_or("+0000") {

@@ -1,3 +1,10 @@
+// `job_json` is one `json!` literal per persisted Job field, and the
+// macro expands one recursion level per key - so the default limit of
+// 128 is a cap on how many facts a job record may carry, which is not a
+// design constraint anybody chose. Raised once here rather than
+// splitting the literal at every field that happens to cross the line.
+#![recursion_limit = "256"]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,6 +25,8 @@ mod conntune;
 mod gates;
 mod groups;
 mod groupstats;
+mod identify;
+mod identity;
 mod import_sab;
 mod interests;
 mod newznab;
@@ -29,9 +38,11 @@ mod rss;
 mod serve;
 mod setup;
 mod smart;
+mod srrdb;
 mod tools;
 mod wall;
 mod watchlist;
+mod xrel;
 use nzbkit::config::{Config, ServerConfig};
 use nzbkit::nntp::Connection;
 use nzbkit::nzb::{FileKind, Nzb};
@@ -58,6 +69,20 @@ struct Cli {
 enum Command {
     /// Parse an NZB and print its contents + minimality accounting.
     Inspect { nzb: PathBuf },
+    /// Read a video file's own facts and work out which film it is, the
+    /// way post-download synthesised naming does - without renaming it.
+    ///
+    /// Prints the container facts, the catalogue shortlist, and whether
+    /// the acceptance gate would have accepted a name. Films only.
+    Identify {
+        /// The video file to read. Local bytes only; nothing is fetched
+        /// from a news server.
+        file: PathBuf,
+        /// Year the release was posted, which bounds the film's release
+        /// year from above. Defaults to this year.
+        #[arg(long)]
+        year: Option<u32>,
+    },
     /// Connection + TLS + AUTHINFO smoke test; reports RTT and capabilities.
     Probe,
     /// Throughput A/B: pipelined vs serial article fetching.
@@ -506,6 +531,7 @@ async fn main() -> Result<()> {
     nzbkit::mem::set_process_budget(budget);
     match cli.command {
         Command::Inspect { nzb } => inspect(&nzb),
+        Command::Identify { file, year } => identify_cmd(&cli.config, &file, year),
         Command::Probe => probe(&cli.config).await,
         Command::Stream {
             nzb,
@@ -1929,6 +1955,31 @@ fn extract_one_level(
         );
         return Ok(Some(NestOutcome::ZipGap));
     }
+    // Nothing above claimed it, but something here still has an archive's
+    // head. `Ok(None)` means "there was nothing to unpack", and the
+    // caller turns that into a COMPLETED job - so a file we can identify
+    // and cannot route must not leave by this door. It went out that door
+    // once: a 7z posted under an obfuscated name with an extension
+    // (`hash.bin`) was sniffed as an archive everywhere EXCEPT the
+    // collector that decides what to extract, so the pass reported
+    // nothing to do and the job completed holding one unopened container.
+    //
+    // Zip is excluded because the branch above already spoke for it (its
+    // gap is forgivable when the zip is a sidecar, and only the top level
+    // can judge that). Both sniffs here read a head signature, so a
+    // legitimate SFX installer - whose RAR marker sits past its stub - is
+    // not caught by this.
+    let stray = std::fs::read_dir(dir)?.flatten().find(|e| {
+        let p = e.path();
+        e.file_type().is_ok_and(|t| t.is_file()) && (rar_magic(&p) || sevenz_magic(&p))
+    });
+    if let Some(e) = stray {
+        println!(
+            "⚠ {} looks like an archive but no extractor claimed it",
+            e.file_name().to_string_lossy()
+        );
+        return Ok(Some(NestOutcome::Failed));
+    }
     Ok(None)
 }
 
@@ -2590,6 +2641,39 @@ fn extract_sfx(dir: &std::path::Path, archives: &[PathBuf], password: Option<&st
 }
 
 /// Does the file start with the 7-Zip signature (`7z\xBC\xAF\x27\x1C`)?
+/// Publish a PAR2-verified slot file under the name the FileDesc gives
+/// it, replacing whatever sits there. No-op when it is already correct.
+///
+/// A previous run's copy may already sit at the real name (re-download
+/// into the same folder). The bytes we just PAR2-verified are
+/// authoritative - REPLACE, never strand this download under its
+/// obfuscated post name.
+///
+/// Rename straight over it: `fs::rename` replaces atomically on unix AND
+/// windows (MOVEFILE_REPLACE_EXISTING), so there is never a moment with
+/// neither file. The old code removed the target first and then ignored
+/// the rename's result, so a failed rename left the good previous copy
+/// deleted and the verified bytes still under the obfuscated name.
+fn publish_verified_name(path: &std::path::Path, pname: &str, out_dir: &std::path::Path) {
+    let real = nzbkit::disk::sanitize_filename(pname);
+    if path.file_name().and_then(|n| n.to_str()) == Some(real.as_str()) {
+        return;
+    }
+    let target = out_dir.join(&real);
+    let existed = target.exists();
+    match std::fs::rename(path, &target) {
+        Ok(()) => println!(
+            "  » renamed {} → {real}{}",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            if existed { " (replaced the previous copy)" } else { "" }
+        ),
+        Err(e) => eprintln!(
+            "  ✘ could not publish {real}: {e} - the verified file is still at {}",
+            path.display()
+        ),
+    }
+}
+
 fn sevenz_magic(path: &std::path::Path) -> bool {
     use std::io::Read;
     let mut b = [0u8; 6];
@@ -2604,9 +2688,7 @@ fn sevenz_magic(path: &std::path::Path) -> bool {
 /// callers that ask about one file rather than scanning a directory.
 pub(crate) fn sevenz_archive_part(path: &std::path::Path) -> bool {
     let name = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-    name.ends_with(".7z")
-        || split_7z_part(&name).is_some()
-        || (path.extension().is_none() && sevenz_magic(path))
+    name.ends_with(".7z") || split_7z_part(&name).is_some() || sevenz_magic(path)
 }
 
 fn verify_dir(dir: &std::path::Path) -> Result<bool> {
@@ -3951,6 +4033,12 @@ pub(crate) async fn get_with_progress(
                                     "  ✔ {} → extracting in-stream{shape}",
                                     slot.hint
                                 );
+                            } else if extractor.is_chased(sidx) {
+                                // A chased slot may own a file since
+                                // drop-behind trimming - but it is a
+                                // partial spill, not a finished download,
+                                // and announcing it as one is a lie.
+                                println!("  ✔ {} → extracting in-stream", slot.hint);
                             } else if let Some(p) = extractor.slot_path(sidx) {
                                 println!(
                                     "  ✔ {}",
@@ -4381,6 +4469,12 @@ pub(crate) async fn get_with_progress(
     // on jobs that never needed (or ran) a PAR2 repair at all, so the
     // reason travels with the flag rather than being assumed at the end.
     let mut reextract_failed: Option<&'static str> = None;
+    // Deobfuscated names a CHASED slot could not take while its writer was
+    // live (see the rename below). Applied after `extractor.finish()`,
+    // when nothing holds an fd on the partial file any more - otherwise
+    // the slot keeps the posted name for good, and an obfuscated
+    // `hash.bin` is what the user is left looking at.
+    let mut deferred_renames: Vec<(usize, String)> = Vec::new();
     match verifier.set() {
         Some(set) => {
             let vt0 = Instant::now();
@@ -4467,45 +4561,19 @@ pub(crate) async fn get_with_progress(
                         // the path out from under a live writer's open
                         // fd, so the rest of the spill lands in a file
                         // nothing points at.
-                        if !mapped && !extractor.is_chased(sidx) {
-                            if let Some(path) = extractor.slot_path(sidx) {
-                                let real = nzbkit::disk::sanitize_filename(pname);
-                                if path.file_name().and_then(|n| n.to_str())
-                                    != Some(real.as_str())
-                                {
-                                    // A previous run's copy may already sit
-                                    // at the real name (re-download into the
-                                    // same folder). The bytes we just PAR2-
-                                    // verified are authoritative - REPLACE,
-                                    // never strand this download under its
-                                    // obfuscated post name.
-                                    //
-                                    // Rename straight over it: `fs::rename`
-                                    // replaces atomically on unix AND windows
-                                    // (MOVEFILE_REPLACE_EXISTING), so there is
-                                    // never a moment with neither file. The
-                                    // old code removed the target first and
-                                    // then ignored the rename's result, so a
-                                    // failed rename left the good previous
-                                    // copy deleted and the verified bytes
-                                    // still under the obfuscated name.
-                                    let target = out_dir.join(&real);
-                                    let existed = target.exists();
-                                    match std::fs::rename(&path, &target) {
-                                        Ok(()) => println!(
-                                            "  » renamed {} → {real}{}",
-                                            path.file_name()
-                                                .unwrap_or_default()
-                                                .to_string_lossy(),
-                                            if existed { " (replaced the previous copy)" } else { "" }
-                                        ),
-                                        Err(e) => eprintln!(
-                                            "  ✘ could not publish {real}: {e} - the verified \
-                                             file is still at {}",
-                                            path.display()
-                                        ),
-                                    }
-                                }
+                        //
+                        // Deferred, not dropped. The chase may still
+                        // demote, and then that partial file IS the
+                        // archive: leaving it under the posted name meant
+                        // the deobfuscated name was lost for good, since
+                        // `Extractor::rename` also declines once a writer
+                        // exists. Queue it for after finish(), when the
+                        // writer is gone.
+                        if !mapped {
+                            if extractor.is_chased(sidx) {
+                                deferred_renames.push((sidx, pname.clone()));
+                            } else if let Some(path) = extractor.slot_path(sidx) {
+                                publish_verified_name(&path, pname, out_dir);
                             }
                         }
                     }
@@ -4690,6 +4758,18 @@ pub(crate) async fn get_with_progress(
 
     // --- extraction summary ---
     let ex_report = extractor.finish()?;
+    // Now that no writer holds the partial file, a chased slot that
+    // demoted can take the deobfuscated name after all. A slot whose
+    // chase SUCCEEDED has no file left to rename (sevenz_finish deletes
+    // the partial - the payload came out the other way), so slot_path is
+    // None and this skips it.
+    for (sidx, pname) in &deferred_renames {
+        if let Some(path) = extractor.slot_path(*sidx) {
+            if path.exists() {
+                publish_verified_name(&path, pname, out_dir);
+            }
+        }
+    }
     // Named-RAR volume files of the DOWNLOADED set sitting in the output
     // dir at end-of-download (fallback groups' materialized volumes,
     // resumed runs' on-disk sets). Direct-extraction payload is subtracted
@@ -6046,9 +6126,17 @@ fn split_7z_part(name: &str) -> Option<(String, u32)> {
         .then(|| (head.to_string(), tail.parse().ok().unwrap_or(u32::MAX)))
 }
 
-/// Every 7-Zip job in `dir`: single `.7z` (or extensionless 7z-magic)
-/// containers, plus `.7z.NNN` split sets grouped and ordered by part index.
-/// Each job is the ordered list of on-disk parts that form one container.
+/// Every 7-Zip job in `dir`: single `.7z` (or 7z-magic) containers, plus
+/// `.7z.NNN` split sets grouped and ordered by part index. Each job is
+/// the ordered list of on-disk parts that form one container.
+///
+/// The magic sniff ignores the extension entirely, the way the RAR
+/// detection beside it always has (`nested_inner_kind` takes any file
+/// with a RAR head). It used to require an EMPTY extension, so an
+/// obfuscated container posted as `hash.bin` was invisible here: the
+/// disk post-pass walked past it, nothing extracted, and the job
+/// reported Completed holding one unopened archive. Obfuscation strips
+/// the meaning from an extension, not the extension itself.
 fn collect_sevenz_archives(dir: &std::path::Path) -> Result<Vec<Vec<PathBuf>>> {
     use std::collections::BTreeMap;
     let mut singles: Vec<PathBuf> = Vec::new();
@@ -6061,10 +6149,8 @@ fn collect_sevenz_archives(dir: &std::path::Path) -> Result<Vec<Vec<PathBuf>>> {
         let name = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
         if let Some((base, num)) = split_7z_part(&name) {
             splits.entry(base).or_default().insert(num, path);
-        } else if name.ends_with(".7z") {
-            singles.push(path);
-        } else if path.extension().is_none() && sevenz_magic(&path) {
-            // Obfuscated single-container 7z (extension stripped).
+        } else if name.ends_with(".7z") || sevenz_magic(&path) {
+            // Named, or obfuscated under any name at all.
             singles.push(path);
         }
     }
@@ -8432,6 +8518,58 @@ mod repair_tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// An obfuscated 7z keeps whatever extension the poster gave it, and
+    /// `.bin` is a common one. The collector used to sniff magic ONLY on
+    /// extensionless files, so this container was invisible to the disk
+    /// post-pass: nothing extracted, the pass reported "nothing to
+    /// unpack", and the job completed holding one unopened archive.
+    #[test]
+    fn an_obfuscated_7z_is_found_under_any_extension() {
+        let dir = reex_dir("obf-7z-ext");
+        let payload: Vec<u8> = (0..120_000u32)
+            .map(|i| (i as u8).wrapping_mul(13).wrapping_add(7))
+            .collect();
+        let container = {
+            let mut w =
+                sevenz_rust2::ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+            w.push_archive_entry(
+                sevenz_rust2::ArchiveEntry::new_file("feature.mkv"),
+                Some(payload.as_slice()),
+            )
+            .unwrap();
+            w.finish().unwrap().into_inner()
+        };
+        // The name a fully-obfuscated post lands under: a hash, and an
+        // extension that says nothing about the contents.
+        let path = dir.join("a3f19c04e8b2.bin");
+        std::fs::write(&path, &container).unwrap();
+        assert!(sevenz_archive_part(&path), "magic outranks the extension");
+        let jobs = collect_sevenz_archives(&dir).unwrap();
+        assert_eq!(jobs, vec![vec![path.clone()]]);
+        // And the whole pass now delivers, where it used to report
+        // Produced ("nothing to unpack") over an untouched container.
+        assert!(extract_nested(&dir, None, 0).unwrap().produced());
+        assert_eq!(std::fs::read(dir.join("feature.mkv")).unwrap(), payload);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The door `Ok(None)` opens is a COMPLETED job, so nothing that
+    /// still has an archive's head may leave through it. Detection and
+    /// routing drifted apart once already (the `.bin` case above); this
+    /// pins the disagreement itself as a failure rather than a silent
+    /// success.
+    #[test]
+    fn an_archive_no_extractor_claims_fails_the_pass() {
+        let dir = reex_dir("stray-archive");
+        // A 7z signature over bytes no reader can parse: sniffed as an
+        // archive, routed by nothing, extracted by nobody.
+        let mut bytes = vec![0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C];
+        bytes.extend(std::iter::repeat_n(0u8, 4096));
+        std::fs::write(dir.join("payload.bin"), &bytes).unwrap();
+        assert_eq!(extract_one_level(&dir, None, 0).unwrap(), Some(NestOutcome::Failed));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Sweep finding A6 (the directory half): the collision walk steps
     /// around a directory whose payload belongs to a COMPLETED job and
     /// records the canonical name to publish over. A FAILED job maps to
@@ -10155,13 +10293,27 @@ async fn spots_scan(config: &PathBuf, group: &str, backfill: u64, db: &PathBuf) 
     let sum = nzbkit::spot::scan_spots(&mut conn, &mut ix, group, &server.host, backfill).await?;
     conn.quit().await;
     let total = ix.spot_stats()?;
+    let records = sum.valid + sum.unverified;
     println!(
-        "scanned {} headers in {:.1?}: {} valid spots ({} new), {} invalid{} - index now {total} spots",
+        "scanned {} headers in {:.1?}: {} spot records, {} verified{} ({} new), {} unverified, \
+         {} not spots{}{} - index now {total} spots",
         sum.scanned,
         t0.elapsed(),
+        records,
         sum.valid,
+        if records > 0 {
+            format!(" ({:.1}%)", 100.0 * sum.valid as f64 / records as f64)
+        } else {
+            String::new()
+        },
         sum.new,
-        sum.invalid,
+        sum.unverified,
+        sum.invalid - sum.unverified,
+        if sum.moderation > 0 {
+            format!(", {} moderation records", sum.moderation)
+        } else {
+            String::new()
+        },
         if sum.hashcash_warn > 0 {
             format!(", {} hashcash warnings", sum.hashcash_warn)
         } else {
@@ -10169,6 +10321,30 @@ async fn spots_scan(config: &PathBuf, group: &str, backfill: u64, db: &PathBuf) 
         },
     );
     Ok(())
+}
+
+/// One daemon spot pass over one group, into an already-open index.
+///
+/// Spots ride a single server: the feed is one decentralized group that
+/// every backbone carries the same way, so a second server would re-scan
+/// the same 200-odd records a day for nothing. Marks are per-server (A8),
+/// so switching servers later just costs one backfill.
+pub(crate) async fn spot_scan_pass(
+    config: &PathBuf,
+    ix: &mut nzbkit::index::Index,
+    group: &str,
+    backfill: u64,
+) -> Result<nzbkit::spot::SpotScanSummary> {
+    let cfg = Config::load(config)?;
+    let server = scan_servers(&cfg)
+        .into_iter()
+        .next()
+        .context("no enabled server to scan spots from")?;
+    let (mut conn, _) = Connection::connect(&server).await?;
+    let _ = ix.adopt_legacy_marks(&server.host);
+    let sum = nzbkit::spot::scan_spots(&mut conn, ix, group, &server.host, backfill).await;
+    conn.quit().await;
+    Ok(sum?)
 }
 
 fn spot_search(query: &str, db: &PathBuf) -> Result<()> {
@@ -11200,6 +11376,66 @@ fn stream_cmd(nzb: &str, host: &str, port: u16, apikey: Option<&str>, no_open: b
             Ok(st) if st.success() => println!("  handed to the default player"),
             _ => println!("  (couldn't launch a player - open the link above manually)"),
         }
+    }
+    Ok(())
+}
+
+/// `nzbfast identify <file>`: the synthesised-naming ladder, end to end,
+/// with the verdict printed instead of applied. The same fact
+/// extraction, the same catalogue queries and the same acceptance gate
+/// the renamer runs after a completed job.
+fn identify_cmd(config: &std::path::Path, file: &std::path::Path, year: Option<u32>) -> Result<()> {
+    let facts = nzbkit::media::probe(file).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{}: no container facts (not a Matroska or MP4 head we could read)",
+            file.display()
+        )
+    })?;
+    let show = |v: &[String]| if v.is_empty() { "-".to_string() } else { v.join(", ") };
+    println!("container      {}", facts.container);
+    println!(
+        "runtime        {}",
+        match (facts.duration_secs, facts.runtime_minutes()) {
+            (Some(s), Some(m)) => format!("{s:.1}s ({m} min)"),
+            (Some(s), None) => format!("{s:.1}s (not a feature runtime)"),
+            _ => "-".into(),
+        }
+    );
+    println!(
+        "dimensions     {}",
+        match (facts.width, facts.height) {
+            (Some(w), Some(h)) => format!("{w}x{h} ({})", nzbkit::mkv::res_bucket(w, h)),
+            _ => "-".into(),
+        }
+    );
+    println!("video codec    {}", facts.video_codec.as_deref().unwrap_or("-"));
+    println!("audio codecs   {}", show(&facts.audio_codecs));
+    println!("audio langs    {}", show(&facts.audio_langs));
+    println!("subtitle langs {}", show(&facts.sub_langs));
+    println!(
+        "original lang  {}",
+        facts.original_language().unwrap_or("(not asserted: no language filter)")
+    );
+
+    let post_year = year.unwrap_or_else(identify::current_year);
+    let tmdb_key = Config::load(config).ok().and_then(|c| c.tmdb_key).filter(|k| !k.is_empty());
+    println!("\npost year      {post_year}");
+    println!(
+        "sources        wikidata{}",
+        if tmdb_key.is_some() { " + tmdb" } else { " (no tmdb_key configured)" }
+    );
+
+    let outcome = identify::identify(&facts, post_year, tmdb_key.as_deref());
+    println!("\nverdict        {}", outcome.log_line());
+    if !outcome.shortlist.is_empty() {
+        println!("\nshortlist ({} shown):", outcome.shortlist.len());
+        for c in &outcome.shortlist {
+            println!("  {c}");
+        }
+    }
+    match outcome.accepted_name() {
+        Some(name) => println!("\nWOULD RENAME TO: {name}"),
+        None => println!("\nWOULD NOT RENAME - the filename is left exactly as posted"),
     }
     Ok(())
 }

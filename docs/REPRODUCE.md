@@ -30,11 +30,26 @@ pinned by `rust-toolchain.toml`; dependencies are pinned by
 For tags where the workflow sets `SOURCE_DATE_EPOCH` and the remap flag
 (see the ledger for which tags that covers):
 
+Build each target on the same kind of host the workflow used: the Linux
+targets on x86_64 Ubuntu, the mac targets on macOS. Building a target on
+a different host than CI did is not a rebuild of that asset.
+
 ```sh
 git clone https://github.com/nzbfast/nzbfast
 cd nzbfast
 git checkout vX.Y.Z                 # rustup picks up the pinned toolchain
 rustup target add <target-triple>
+
+# aarch64-unknown-linux-gnu ONLY. CI cross-compiles this target from an
+# x86_64 runner, so it installs a cross toolchain and points cargo and
+# the `cc` crate at it. `rustup target add` alone gives you the Rust
+# std for the target and no linker, and the build fails at link time -
+# closed, not wrong, but it will not get you an artifact.
+sudo apt-get update
+sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
 
 # Pin the clock the same way the workflow does (the tag's commit time),
 # and remap the builder's home the same way. RUSTFLAGS must match the

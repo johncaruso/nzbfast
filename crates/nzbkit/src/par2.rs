@@ -287,6 +287,27 @@ impl Par2Set {
         })
     }
 
+    /// The set's member files as `(hash16k hex, member name)`.
+    ///
+    /// `hash16k` is the MD5 of the first 16 KiB of a member file, and
+    /// the member files of a usenet post are its OUTER volumes - so this
+    /// fingerprints a release without reading a byte of its payload and
+    /// without needing an archive to open. That is what makes it the one
+    /// identity in the pipeline that survives RAR header encryption: the
+    /// sidecar describes the `.r00` files, not what is inside them.
+    ///
+    /// Recovery volumes are excluded (they are not in the recovery set),
+    /// and so are members shorter than 16 KiB, whose hash16k is just the
+    /// whole-file MD5 of a sample or an nfo and would collide across
+    /// unrelated releases.
+    pub fn member_hash16k(&self) -> Vec<(String, String)> {
+        self.files
+            .iter()
+            .filter(|f| f.length >= HASH16K_LEN as u64)
+            .map(|f| (hex16(&f.md5_16k), f.name.clone()))
+            .collect()
+    }
+
     /// Count the recovery slices (RecvSlic packets) present in one volume's
     /// bytes - e.g. to confirm a `.volNN+MM.par2` really carries MM slices
     /// before relying on it for exact-fit recovery fetching. Corrupt packets
@@ -301,6 +322,15 @@ impl Par2Set {
         });
         n
     }
+}
+
+/// Lowercase hex of a 16-byte digest - the storage form of a hash16k.
+pub fn hex16(d: &[u8; 16]) -> String {
+    use std::fmt::Write as _;
+    d.iter().fold(String::with_capacity(32), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }
 
 pub(crate) fn parse_main(body: &[u8]) -> Option<(u64, Vec<[u8; 16]>)> {
