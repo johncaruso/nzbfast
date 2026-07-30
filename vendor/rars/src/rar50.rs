@@ -465,6 +465,7 @@ impl Archive {
             sig.offset,
             ArchiveSource::File(path),
             password,
+            &mut Rar50KeyCache::default(),
         )
     }
 
@@ -480,6 +481,25 @@ impl Archive {
         path: impl AsRef<Path>,
         signature: ArchiveSignature,
         password: Option<&[u8]>,
+    ) -> Result<Self> {
+        Self::parse_path_with_signature_in_session(
+            path,
+            signature,
+            password,
+            &mut Rar50KeyCache::default(),
+        )
+    }
+
+    /// Like [`Self::parse_path_with_signature_and_password`], with the key
+    /// derivation cache supplied by the caller - a multi-volume set parsed
+    /// through one session derives each (salt, kdf count) once instead of
+    /// once per volume (the PBKDF2 ladder dwarfs the parse itself on
+    /// 500-volume encrypted sets).
+    pub(crate) fn parse_path_with_signature_in_session(
+        path: impl AsRef<Path>,
+        signature: ArchiveSignature,
+        password: Option<&[u8]>,
+        key_cache: &mut Rar50KeyCache,
     ) -> Result<Self> {
         if signature.family != ArchiveFamily::Rar50Plus {
             return Err(Error::UnsupportedSignature);
@@ -497,6 +517,7 @@ impl Archive {
             signature.offset,
             ArchiveSource::File(path),
             password,
+            key_cache,
         )
     }
 
@@ -527,9 +548,11 @@ impl Archive {
         }
 
         let archive_len = input.len();
+        let mut key_cache = Rar50KeyCache::default();
         let (main, blocks) = parse_archive_blocks(
             archive_len,
             password,
+            &mut key_cache,
             |offset| parse_block_header_bytes(input, offset, archive_len, sfx_offset),
             |offset, keys| {
                 parse_encrypted_block_header_bytes(input, offset, archive_len, sfx_offset, keys)
@@ -586,9 +609,11 @@ impl Archive {
             return Err(Error::UnsupportedSignature);
         }
         let password = options.password;
+        let mut key_cache = Rar50KeyCache::default();
         let (main, blocks) = parse_archive_blocks(
             archive_len,
             password,
+            &mut key_cache,
             |offset| read_block_header_from_source(&source, offset, archive_len, 0),
             |offset, keys| {
                 read_encrypted_block_header_from_source(&source, offset, archive_len, 0, keys)
@@ -609,6 +634,7 @@ impl Archive {
         sfx_offset: usize,
         source: ArchiveSource,
         password: Option<&[u8]>,
+        key_cache: &mut Rar50KeyCache,
     ) -> Result<Self> {
         let signature = read_exact_at(file, sfx_offset, RAR50_SIGNATURE.len())?;
         if signature != *RAR50_SIGNATURE {
@@ -619,6 +645,7 @@ impl Archive {
         let (main, blocks) = parse_archive_blocks(
             archive_len,
             password,
+            key_cache,
             |offset| {
                 read_block_header_at(&mut file_cell.borrow_mut(), offset, archive_len, sfx_offset)
             },
@@ -1672,6 +1699,7 @@ fn parse_file_encryption_record(input: &[u8], range: Range<usize>) -> Result<Fil
 fn parse_archive_encryption_header(
     parsed: &ParsedBlockHeader,
     password: Option<&[u8]>,
+    key_cache: &mut Rar50KeyCache,
 ) -> Result<Rar50Keys> {
     let password = password.ok_or(Error::NeedPassword)?;
     let mut reader = HeaderReader::new(&parsed.header, parsed.type_specific_range.clone())?;
@@ -1695,7 +1723,7 @@ fn parse_archive_encryption_header(
             "RAR 5 archive encryption header has trailing bytes",
         ));
     }
-    let keys = Rar50Keys::derive(password, salt, kdf_count).map_err(map_rar50_crypto_error)?;
+    let keys = key_cache.get_or_derive(password, salt, kdf_count)?;
     if let Some(check_value) = check_value {
         keys.check_password(&check_value)
             .map_err(map_rar50_crypto_error)?;
@@ -1703,7 +1731,59 @@ fn parse_archive_encryption_header(
     Ok(keys)
 }
 
-fn attach_file_crypto(file: &mut FileHeader, password: Option<&[u8]>) -> Result<()> {
+/// Parse-scoped memo for derived file keys. Every member of an archive
+/// normally shares one (salt, kdf count), yet the PBKDF2 ladder ran once per
+/// encrypted member; a thousand-member encrypted archive paid a thousand
+/// 2^15-iteration derivations for one key. The cache lives for a single
+/// `parse_blocks` walk, so keys never outlive the parse that needed them.
+/// Per-member password checks still run against each member's own
+/// check value.
+#[derive(Default)]
+pub(crate) struct Rar50KeyCache {
+    /// Keys are BOXED, not stored inline. `Rar50Keys` is ZeroizeOnDrop, but
+    /// that only clears the live value: growing a Vec of them memcpys the
+    /// AES-256 file and MAC keys into a new allocation and frees the old one
+    /// with the key material intact. A session that derives two or more
+    /// distinct (salt, kdf_count) pairs - scanning a directory holding two
+    /// different encrypted sets - reallocates and leaves the first set's keys
+    /// in freed heap. Boxing moves only the pointer, so the keys never move.
+    entries: Vec<([u8; 16], u8, Box<Rar50Keys>)>,
+    /// Actual PBKDF2 runs (cache misses) - the session tests assert a
+    /// multi-volume set derives once, by count rather than by timing.
+    #[cfg(test)]
+    pub(crate) derives: usize,
+}
+
+impl Rar50KeyCache {
+    pub(crate) fn get_or_derive(
+        &mut self,
+        password: &[u8],
+        salt: [u8; 16],
+        kdf_count: u8,
+    ) -> Result<Rar50Keys> {
+        if let Some((_, _, keys)) = self
+            .entries
+            .iter()
+            .find(|&&(cached_salt, cached_count, _)| cached_salt == salt && cached_count == kdf_count)
+        {
+            return Ok((**keys).clone());
+        }
+        #[cfg(test)]
+        {
+            self.derives += 1;
+        }
+        let keys =
+            Rar50Keys::derive(password, salt, kdf_count).map_err(map_rar50_crypto_error)?;
+        self.entries.push((salt, kdf_count, Box::new(keys.clone())));
+        Ok(keys)
+    }
+}
+
+fn attach_file_crypto(
+    file: &mut FileHeader,
+    password: Option<&[u8]>,
+    key_cache: &mut Rar50KeyCache,
+) -> Result<()> {
     if !file.encrypted || file.crypto.is_some() {
         return Ok(());
     }
@@ -1719,8 +1799,7 @@ fn attach_file_crypto(file: &mut FileHeader, password: Option<&[u8]>) -> Result<
             feature: "RAR 5 unknown file encryption version",
         });
     }
-    let keys = Rar50Keys::derive(password, encryption.salt, encryption.kdf_count)
-        .map_err(map_rar50_crypto_error)?;
+    let keys = key_cache.get_or_derive(password, encryption.salt, encryption.kdf_count)?;
     if let Some(check_value) = encryption.check_value {
         keys.check_password(&check_value)
             .map_err(map_rar50_crypto_error)?;
@@ -1732,7 +1811,11 @@ fn attach_file_crypto(file: &mut FileHeader, password: Option<&[u8]>) -> Result<
     Ok(())
 }
 
-fn attach_service_crypto(service: &mut FileHeader, password: Option<&[u8]>) -> Result<()> {
+fn attach_service_crypto(
+    service: &mut FileHeader,
+    password: Option<&[u8]>,
+    key_cache: &mut Rar50KeyCache,
+) -> Result<()> {
     // WinRAR can emit encrypted QO metadata whose service-local password
     // check does not validate with the archive password. QuickOpen is an
     // optional cache, so keep archive parsing and file extraction independent
@@ -1740,7 +1823,7 @@ fn attach_service_crypto(service: &mut FileHeader, password: Option<&[u8]>) -> R
     if service.name == b"QO" {
         return Ok(());
     }
-    attach_file_crypto(service, password)
+    attach_file_crypto(service, password, key_cache)
 }
 
 fn map_rar50_crypto_error(error: crate::crypto::rar50::Error) -> Error {
@@ -1769,6 +1852,7 @@ fn read_array_at<const N: usize>(input: &[u8], pos: &mut usize, end: usize) -> R
 fn parse_archive_blocks<F, G>(
     archive_len: usize,
     password: Option<&[u8]>,
+    key_cache: &mut Rar50KeyCache,
     mut read_block: F,
     mut read_encrypted_block: G,
 ) -> Result<(MainHeader, Vec<Block>)>
@@ -1780,7 +1864,7 @@ where
     let first = read_block(pos).map_err(|error| error.at_archive_offset(pos))?;
     let header_keys = if first.block.header_type == HEAD_CRYPT {
         pos = first.next_offset;
-        Some(parse_archive_encryption_header(&first, password)?)
+        Some(parse_archive_encryption_header(&first, password, key_cache)?)
     } else {
         None
     };
@@ -1812,14 +1896,14 @@ where
             HEAD_FILE => {
                 let mut file = parse_file_header_bytes(&parsed)
                     .map_err(|error| error.at_archive_offset(pos))?;
-                attach_file_crypto(&mut file, password)
+                attach_file_crypto(&mut file, password, key_cache)
                     .map_err(|error| error.at_archive_offset(pos))?;
                 blocks.push(Block::File(file));
             }
             HEAD_SERVICE => {
                 let mut service = parse_file_header_bytes(&parsed)
                     .map_err(|error| error.at_archive_offset(pos))?;
-                attach_service_crypto(&mut service, password)
+                attach_service_crypto(&mut service, password, key_cache)
                     .map_err(|error| error.at_archive_offset(pos))?;
                 blocks.push(Block::Service(service));
             }
@@ -2414,6 +2498,33 @@ fn decode_compression_info(raw: u64) -> Result<CompressionInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The parse-scoped key cache must hand back the same keys `derive` would
+    /// have produced, hit on a repeated (salt, kdf count), and keep distinct
+    /// salts or counts on distinct derivations.
+    #[test]
+    fn key_cache_matches_direct_derivation_and_discriminates_inputs() {
+        let mut cache = Rar50KeyCache::default();
+        let password = b"hunter2";
+        let salt_a = [0x11; 16];
+        let salt_b = [0x22; 16];
+
+        let first = cache.get_or_derive(password, salt_a, 4).unwrap();
+        assert_eq!(first, Rar50Keys::derive(password, salt_a, 4).unwrap());
+        assert_eq!(cache.entries.len(), 1);
+
+        // Same salt and count: served from the cache, identical keys.
+        let repeat = cache.get_or_derive(password, salt_a, 4).unwrap();
+        assert_eq!(repeat, first);
+        assert_eq!(cache.entries.len(), 1);
+
+        // A different salt or a different count is a different derivation.
+        let other_salt = cache.get_or_derive(password, salt_b, 4).unwrap();
+        assert_ne!(other_salt, first);
+        let other_count = cache.get_or_derive(password, salt_a, 5).unwrap();
+        assert_ne!(other_count, first);
+        assert_eq!(cache.entries.len(), 3);
+    }
 
     #[test]
     fn read_vint_at_honors_logical_end_before_decoding() {

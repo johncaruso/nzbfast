@@ -54,7 +54,8 @@ fn main() -> anyhow::Result<()> {
 fn extract_volumes(dir: &Path, first: &Path) -> anyhow::Result<()> {
     use nzbkit::extract::{release_stem, vol_sort_key};
     let first_name = first.file_name().unwrap_or_default().to_string_lossy().to_string();
-    let stem = release_stem(&first_name);
+    // Lowercased to match the `name` side below - see `stem_volume_set`.
+    let stem = release_stem(&first_name.to_lowercase());
     let mut volumes: Vec<PathBuf> = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();

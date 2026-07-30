@@ -25,6 +25,8 @@ pub enum YencError {
     CrcMismatch { computed: u32, header: u32 },
     #[error("article ended without a =yend trailer (truncated)")]
     Truncated,
+    #[error("=ypart begin={begin} end={end} cannot hold {len} decoded bytes")]
+    PartGeometry { begin: u64, end: u64, len: u64 },
 }
 
 /// A decoded yEnc article (one part of a file, or a whole small file).
@@ -96,6 +98,7 @@ pub fn decode_checked(body: &[u8]) -> Result<(Decoded, bool), YencError> {
     let mut expected_len: Option<u64> = None;
     let mut seen_begin = false;
     let mut seen_yend = false;
+    let mut seen_ypart = false;
     let mut data = Vec::with_capacity(body.len());
 
     for raw_line in body.split(|&b| b == b'\n') {
@@ -130,6 +133,7 @@ pub fn decode_checked(body: &[u8]) -> Result<(Decoded, bool), YencError> {
             // Until/unless =ypart overrides, a single-part post spans the file.
             end = file_size;
         } else if line.starts_with(b"=ypart ") {
+            seen_ypart = true;
             let kv = parse_header(&line[7..]);
             // yEnc `begin` is 1-based; a hostile/broken `begin=0` would
             // underflow offset() to u64::MAX. Clamp to the valid floor.
@@ -168,6 +172,7 @@ pub fn decode_checked(body: &[u8]) -> Result<(Decoded, bool), YencError> {
             actual: len,
         });
     }
+    check_part_geometry(seen_ypart, begin, end, data.len() as u64)?;
     let mut crc_verified = false;
     if let Some(header) = expected_crc {
         let computed = crc32fast::hash(&data);
@@ -188,6 +193,41 @@ pub fn decode_checked(body: &[u8]) -> Result<(Decoded, bool), YencError> {
         },
         crc_verified,
     ))
+}
+
+/// Reject a multipart article whose declared range cannot hold what it
+/// decoded to. Shared by both decoders - a divergence here is a divergence
+/// the differential fuzzer would (rightly) call a bug.
+///
+/// `begin`/`end` are 1-based inclusive, so the range holds `end - begin + 1`
+/// bytes and the payload must be exactly that. Without this, a CRC-valid
+/// article could declare `=ypart begin=<1 TiB> end=<1 TiB>` and have its few
+/// bytes written a terabyte into the output: positioned writes extend a file,
+/// so a PAR2-less job finished "complete" with a huge sparse hole and an
+/// output nothing in the post ever described.
+///
+/// Deliberately NOT checked: `end` against `=ybegin size`. Real posters do get
+/// the total size field wrong on otherwise perfectly good articles, and the
+/// authoritative length (`=yend size`) is already compared above. This test
+/// only rejects geometry that contradicts ITSELF.
+pub(crate) fn check_part_geometry(
+    seen_ypart: bool,
+    begin: u64,
+    end: u64,
+    len: u64,
+) -> Result<(), YencError> {
+    // No `=ypart`: `end` came from the (untrusted, unchecked) `=ybegin size`
+    // field rather than a range declaration, so there is nothing to
+    // contradict. `end == 0` means the part declared no end at all - a
+    // malformed header the two decoders already agree on, and one an empty
+    // part legitimately produces; leave both as they were.
+    if !seen_ypart || end == 0 {
+        return Ok(());
+    }
+    if begin > end || end - begin + 1 != len {
+        return Err(YencError::PartGeometry { begin, end, len });
+    }
+    Ok(())
 }
 
 /// Decode one payload line (yEnc unescaping) onto `out`. `pub(crate)` because
@@ -435,6 +475,57 @@ mod tests {
         let dec1 = decode(&encode("f.bin", 300_000, Some((1, 2)), 1, a)).unwrap();
         assert_eq!(dec1.offset(), 0);
         assert_eq!(dec1.data, a);
+    }
+
+    /// A part whose declared range cannot hold what it decoded to is
+    /// rejected, on BOTH decoders. The attack it closes: a CRC-valid article
+    /// declaring `begin` a terabyte in and a handful of bytes of payload,
+    /// which the positioned write happily placed there - leaving a job that
+    /// "completed" with a sparse output nothing in the post described.
+    #[test]
+    fn impossible_part_geometry_is_rejected_on_both_paths() {
+        let payload = test_data(4096);
+        // A multipart article with an arbitrary declared range, carrying the
+        // reference encoder's own payload lines and (valid) `=yend` trailer.
+        let article = |begin: u64, end: u64| -> Vec<u8> {
+            let mut body = format!(
+                "=ybegin part=1 total=2 line=128 size=1099511631872 name=g.bin\r\n\
+                 =ypart begin={begin} end={end}\r\n"
+            )
+            .into_bytes();
+            let single = encode("g.bin", payload.len() as u64, None, 1, &payload);
+            let payload_starts = single.windows(2).position(|w| w == b"\r\n").unwrap() + 2;
+            body.extend_from_slice(&single[payload_starts..]);
+            body
+        };
+
+        // A huge offset alone is not the defect: this range holds exactly the
+        // 4096 bytes that arrived, so it stays valid.
+        let ok = article(1_099_511_627_777, 1_099_511_631_872);
+        assert!(decode(&ok).is_ok());
+        assert!(crate::yenc_simd::decode(&ok).is_ok());
+
+        // One declared byte, 4 KiB of payload - the shape that let a CRC-valid
+        // article place bytes anywhere it liked.
+        let short = article(1_099_511_627_777, 1_099_511_627_777);
+        assert!(matches!(
+            decode(&short),
+            Err(YencError::PartGeometry { len: 4096, .. })
+        ));
+        assert!(matches!(
+            crate::yenc_simd::decode(&short),
+            Err(YencError::PartGeometry { len: 4096, .. })
+        ));
+
+        // begin > end is impossible whatever the payload.
+        let inverted = article(1_099_511_631_873, 1_099_511_627_777);
+        assert!(decode(&inverted).is_err());
+        assert!(crate::yenc_simd::decode(&inverted).is_err());
+
+        // Ordinary multipart posts are untouched.
+        let good = encode("f.bin", 8192, Some((2, 2)), 4097, &payload);
+        assert_eq!(decode(&good).unwrap().data, payload);
+        assert_eq!(crate::yenc_simd::decode(&good).unwrap().data, payload);
     }
 
     #[test]

@@ -1903,7 +1903,13 @@ struct Huffman {
     first_code: [u16; 16],
     first_index: [usize; 16],
     counts: [u16; 16],
+    // Primary decode LUT, the RAR 2.9 layout: top HUFF20_LUT_BITS of the
+    // stream -> packed (symbol << 8) | code_len, 0 = miss (long code).
+    lut: Vec<u32>,
 }
+
+/// Same width as the RAR 2.9 LUT: covers virtually every real code.
+const HUFF20_LUT_BITS: usize = 12;
 
 #[derive(Debug, Clone)]
 struct HuffmanSymbol {
@@ -1919,6 +1925,7 @@ impl Huffman {
             first_code: [0; 16],
             first_index: [0; 16],
             counts: [0; 16],
+            lut: Vec::new(),
         }
     }
 
@@ -1963,19 +1970,59 @@ impl Huffman {
             symbols.push(HuffmanSymbol { code, len, symbol });
         }
         symbols.sort_by_key(|item| (item.len, item.code, item.symbol));
+        let mut lut = vec![0u32; 1 << HUFF20_LUT_BITS];
+        for item in &symbols {
+            let len = usize::from(item.len);
+            if len <= HUFF20_LUT_BITS {
+                let shift = HUFF20_LUT_BITS - len;
+                let start = usize::from(item.code) << shift;
+                let entry = ((item.symbol as u32) << 8) | u32::from(item.len);
+                lut[start..start + (1 << shift)].fill(entry);
+            }
+        }
         Ok(Self {
             symbols,
             first_code,
             first_index,
             counts: count,
+            lut,
         })
     }
 
     fn decode(&self, bits: &mut BitReader) -> Result<usize> {
-        let mut code = 0u16;
         if self.symbols.is_empty() {
             return Err(Error::InvalidData("RAR 2.0 empty Huffman table"));
         }
+        // LUT-first, per-length fallback, then the bit-serial tail walk -
+        // the RAR 2.9 decode shape, which replaced a bit-at-a-time loop
+        // that paid up to 15 bounds-checked reads per symbol.
+        if let Ok(peek) = bits.peek_bits(15) {
+            let entry = self.lut[(peek >> (15 - HUFF20_LUT_BITS)) as usize];
+            if entry != 0 {
+                bits.consume((entry & 0xff) as u8);
+                return Ok((entry >> 8) as usize);
+            }
+            for len in (HUFF20_LUT_BITS + 1)..=15 {
+                let count = self.counts[len];
+                if count != 0 {
+                    let code = (peek >> (15 - len)) as u16;
+                    let offset = code.wrapping_sub(self.first_code[len]);
+                    if offset < count {
+                        bits.consume(len as u8);
+                        let index = self.first_index[len] + usize::from(offset);
+                        return Ok(self.symbols[index].symbol);
+                    }
+                }
+            }
+            return Err(Error::InvalidData("RAR 2.0 invalid Huffman code"));
+        }
+        self.decode_slow(bits)
+    }
+
+    // Bit-by-bit canonical walk for the input tail, where fewer than 15
+    // peekable bits remain but a shorter valid code may still complete.
+    fn decode_slow(&self, bits: &mut BitReader) -> Result<usize> {
+        let mut code = 0u16;
         for len in 1..=15 {
             code = (code << 1) | bits.read_bit()? as u16;
             let count = self.counts[len];
@@ -2045,6 +2092,17 @@ impl BitReader {
         if count > 24 {
             return Err(Error::InvalidData("RAR 2.0 bit read is too wide"));
         }
+        // One 32-bit load replaces up to 24 bounds-checked single-bit
+        // reads; the byte-wise tail keeps the exact NeedMoreInput behavior
+        // when fewer than four whole bytes remain.
+        let byte_pos = self.bit_pos / 8;
+        let bit_offset = self.bit_pos % 8;
+        if count != 0 {
+            if let Some(window) = self.input.get(byte_pos..byte_pos + 4) {
+                let word = u32::from_be_bytes(window.try_into().expect("window is 4 bytes"));
+                return Ok((word << bit_offset) >> (32 - u32::from(count)));
+            }
+        }
         let mut value = 0u32;
         for i in 0..count as usize {
             let bit_index = self.bit_pos + i;
@@ -2053,6 +2111,11 @@ impl BitReader {
             value = (value << 1) | bit as u32;
         }
         Ok(value)
+    }
+
+    #[inline]
+    fn consume(&mut self, count: u8) {
+        self.bit_pos += usize::from(count);
     }
 
     fn remaining_bytes_from_current(&self) -> usize {

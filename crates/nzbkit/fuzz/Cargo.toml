@@ -67,3 +67,10 @@ path = "fuzz_targets/mkv_parse.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "zip_parse"
+path = "fuzz_targets/zip_parse.rs"
+test = false
+doc = false
+bench = false

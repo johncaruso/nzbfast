@@ -38,8 +38,22 @@ echo "============================================================"
 echo
 echo "This window sets up nzbfast and starts it. It shows each step"
 echo "as it goes and stays open at the end so you can read what"
-echo "happened. Nothing here changes anything outside this folder."
+echo "happened. Settings and the download queue are kept safe in"
+echo "~/Library/Application Support/nzbfast, so tidying the folder"
+echo "you unzipped into can never delete them."
 echo
+
+# ---- Where nzbfast keeps its own records --------------------------------
+# Settings, the queue record and spooled NZBs live in Application
+# Support (the same place the Mac app wrapper uses), NOT next to the
+# binary: people unzip into Downloads, and data that lives beside the
+# app gets deleted with the next Downloads tidy-up (a tester lost his
+# spool exactly that way on Windows). An older setup that already has
+# config.local.json next to this launcher keeps using it - continuity
+# beats tidiness.
+DATA="$HOME/Library/Application Support/nzbfast"
+[ -f "./config.local.json" ] && DATA="$(pwd)"
+mkdir -p "$DATA"
 echo "These files came from the internet and are not yet signed, so"
 echo "macOS may refuse the first launch. If it does: System Settings >"
 echo "Privacy & Security, then click \"Open Anyway\"."
@@ -76,7 +90,7 @@ echo
 # reports as 137 (SIGKILL). Do not narrate that as "you chose to quit":
 # telling someone they quit when the OS shot the process is how a
 # blocked launch turns into "the app is broken".
-./nzbfast setup
+./nzbfast --config "$DATA/config.local.json" setup
 rc=$?
 if [ "$rc" -eq 3 ]; then
     echo
@@ -158,7 +172,7 @@ echo
 
 # NOT 'exec' - control returns here when the daemon stops, so we can
 # tell you what happened and keep the window open. --open pops the browser.
-./nzbfast serve --watch "$WATCH" --out "$OUT" --port "$PORT" --open
+./nzbfast --config "$DATA/config.local.json" serve --watch "$WATCH" --out "$OUT" --port "$PORT" --open
 code=$?
 
 echo

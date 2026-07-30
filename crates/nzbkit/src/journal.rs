@@ -214,8 +214,11 @@ impl Journal {
     /// Record one terminal article the v1 way (bytes at final offsets in
     /// the slot's own file) - used for par2-main slots.
     pub fn record(&self, id: &str) {
+        let mut line = String::with_capacity(id.len() + 1);
+        line.push_str(id);
+        line.push('\n');
         let mut st = self.state.lock().unwrap();
-        let _ = writeln!(st.file, "{id}");
+        let _ = st.file.write_all(line.as_bytes());
     }
 
     /// Record one terminal article with its physical placement.
@@ -268,6 +271,13 @@ impl Journal {
         if frags.is_empty() {
             return;
         }
+        // Compose the record's lines (S table entry, new F entries, the
+        // placement itself) into ONE buffer and land them with ONE
+        // write(2): the kill-safety contract is per-record, and writeln!
+        // on a raw File issues a syscall per format fragment - several
+        // per article, all inside this mutex the decoders share.
+        use std::fmt::Write as _;
+        let mut out = String::new();
         let mut st = self.state.lock().unwrap();
         if !st.slots_emitted.contains(&slot) {
             let (dest, dsize) = match slot_file {
@@ -282,7 +292,7 @@ impl Journal {
             };
             st.used_names.insert(dest.clone());
             st.slots_emitted.insert(slot);
-            let _ = writeln!(st.file, "S {slot} {dsize} {dest}");
+            let _ = writeln!(out, "S {slot} {dsize} {dest}");
         }
         let mut list = String::new();
         for (i, f) in frags.iter().enumerate() {
@@ -291,7 +301,7 @@ impl Journal {
                 None => {
                     let i = st.files.len();
                     st.files.insert(f.file.clone(), i);
-                    let _ = writeln!(st.file, "F {i} {}", f.file);
+                    let _ = writeln!(out, "F {i} {}", f.file);
                     i
                 }
             };
@@ -303,7 +313,8 @@ impl Journal {
                 list.push_str(if mask.get(i).copied().unwrap_or(true) { ":1" } else { ":0" });
             }
         }
-        let _ = writeln!(st.file, "{letter} {slot} {list} {id}");
+        let _ = writeln!(out, "{letter} {slot} {list} {id}");
+        let _ = st.file.write_all(out.as_bytes());
     }
 
     /// Write the drained [`CryptoJournalEvent`]s as `E`/`K`/`T` lines.
@@ -311,27 +322,32 @@ impl Journal {
         if events.is_empty() {
             return;
         }
-        let mut st = self.state.lock().unwrap();
+        // Formatted entirely outside the lock (nothing here reads the
+        // write state), landed as one write.
+        use std::fmt::Write as _;
+        let mut out = String::new();
         for ev in events {
             match ev {
                 CryptoJournalEvent::Params { name, salt, lg2, iv, unp, check } => {
                     let ck = check.map(|c| to_hex(&c)).unwrap_or_else(|| "-".into());
                     let _ = writeln!(
-                        st.file,
+                        out,
                         "E {} {lg2} {} {unp} {ck} {name}",
                         to_hex(salt),
                         to_hex(iv)
                     );
                 }
                 CryptoJournalEvent::Checkpoint { name, off, block } => {
-                    let _ = writeln!(st.file, "K {off} {} {name}", to_hex(block));
+                    let _ = writeln!(out, "K {off} {} {name}", to_hex(block));
                 }
                 CryptoJournalEvent::TailPad { name, pad } => {
                     let p = if pad.is_empty() { "-".to_string() } else { to_hex(pad) };
-                    let _ = writeln!(st.file, "T {p} {name}");
+                    let _ = writeln!(out, "T {p} {name}");
                 }
             }
         }
+        let mut st = self.state.lock().unwrap();
+        let _ = st.file.write_all(out.as_bytes());
     }
 
     /// Retire this journal's claim over `files` - call it BEFORE their
@@ -821,6 +837,20 @@ pub fn restore(out_dir: &Path, resume: &ResumeState, password: Option<&str>) -> 
     for a in meta_missing {
         article_ok[a] = false;
     }
+    // Which destinations already existed, taken BEFORE phase A: phase A
+    // opens every crypto slot's destination with `create(true)` + `set_len`,
+    // so a file that was deleted between runs (user cleanup, or a spent-
+    // volume sweep) is recreated as a hole and phase B's `dest_existed`
+    // probe then reads true. Its identity fragments - "the bytes are already
+    // where the resume expects them" - are zeros, and they are accepted
+    // instead of refetched, so with no PAR2 behind the job those zeros ship.
+    // `identity_without_existing_file_refetches` is the test for the intent.
+    let pre_existing: std::collections::HashSet<&str> = resume
+        .slots
+        .values()
+        .filter(|r| !r.name.is_empty() && out_dir.join(&r.name).exists())
+        .map(|r| r.name.as_str())
+        .collect();
     restore_crypto(out_dir, resume, password, jobs_by_file, &mut article_ok);
     let crypto_verdict: HashMap<(usize, &str), bool> = article_ids
         .iter()
@@ -833,7 +863,7 @@ pub fn restore(out_dir: &Path, resume: &ResumeState, password: Option<&str>) -> 
             continue;
         }
         let dest_path = out_dir.join(&rec.name);
-        let dest_existed = dest_path.exists();
+        let dest_existed = pre_existing.contains(rec.name.as_str());
         let mut dest: Option<File> = None; // opened lazily, only for copies
         let mut srcs: HashMap<&str, Option<File>> = HashMap::new();
         let mut spans: Vec<(u64, u64)> = Vec::new();

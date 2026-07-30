@@ -62,6 +62,47 @@ pub struct ArchiveReadOptions<'a> {
     /// `Rar50WindowLimitExceeded` instead of attempting the allocation. `None`
     /// uses a built-in default (see `DEFAULT_STREAM_WINDOW_LIMIT`).
     pub rar50_max_window: Option<u64>,
+    /// Optional RAR 5 execution policy: how much working memory and worker
+    /// parallelism extraction may use. `None` keeps the library's built-in
+    /// behavior (a fixed 256 MiB solid-chain flat budget, worker counts from
+    /// the host CPU count). Applications with their own memory accounting
+    /// pass a policy so a memory-constrained host never selects a flat plan
+    /// it cannot afford, and a large host may exceed the built-in flat cap.
+    pub rar50_execution_policy: Option<Rar50ExecutionPolicy>,
+}
+
+/// Memory and parallelism allowances for RAR 5 extraction.
+///
+/// The policy is advisory in the sense that it selects between decode
+/// strategies (flat buffers vs the bounded streaming ring, worker counts);
+/// it never changes output bytes or error semantics, and it does not
+/// override the separate `rar50_max_window` safety valve - a match that
+/// genuinely needs a wider window than that limit still errors rather than
+/// silently truncating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Rar50ExecutionPolicy {
+    /// Total decoder working-memory allowance in bytes: flat output buffers,
+    /// the retained solid window, in-flight tapes, and pipe scratch are
+    /// estimated against this before a flat plan is admitted.
+    pub working_memory_limit: u64,
+    /// Largest output held in one flat allocation (a member or a whole
+    /// solid chain group); larger outputs stream through the bounded ring.
+    pub flat_output_limit: u64,
+    /// Cap on decode workers (tape workers and the member pool).
+    pub max_workers: usize,
+}
+
+impl Rar50ExecutionPolicy {
+    /// A policy from a total working-memory allowance: half of it may sit in
+    /// one flat allocation, and constrained allowances also shed workers.
+    pub fn from_working_memory(working_memory_limit: u64) -> Self {
+        Self {
+            working_memory_limit,
+            flat_output_limit: working_memory_limit / 2,
+            max_workers: if working_memory_limit < 256 << 20 { 2 } else { 8 },
+        }
+    }
 }
 
 impl<'a> ArchiveReadOptions<'a> {
@@ -95,6 +136,12 @@ impl<'a> ArchiveReadOptions<'a> {
     /// Sets the RAR 5/7 streaming match-window ceiling (bytes).
     pub fn with_rar50_max_window(mut self, limit: u64) -> Self {
         self.rar50_max_window = Some(limit);
+        self
+    }
+
+    /// Sets the RAR 5 execution policy (memory and worker allowances).
+    pub fn with_rar50_execution_policy(mut self, policy: Rar50ExecutionPolicy) -> Self {
+        self.rar50_execution_policy = Some(policy);
         self
     }
 }
@@ -588,6 +635,40 @@ fn rar50_member_hash(hash: &rar50::FileHash) -> ArchiveMemberHash {
 /// Archive reader facade with signature-based dispatch.
 pub struct ArchiveReader;
 
+/// A parse session over one password/options set: every archive read
+/// through it shares one RAR 5 key-derivation cache, so a multi-volume
+/// encrypted set derives each (salt, kdf count) once for the whole set
+/// instead of once per volume - on a 500-volume set the repeated PBKDF2
+/// dwarfs the parsing itself. Per-member and per-header password checks
+/// still run for every volume; the cache holds keys only as long as the
+/// session lives (Rar50Keys zeroize on drop), and sessions never share
+/// state with each other or any global.
+pub struct ReadSession<'a> {
+    options: ArchiveReadOptions<'a>,
+    key_cache: rar50::Rar50KeyCache,
+}
+
+impl<'a> ReadSession<'a> {
+    pub fn new(options: ArchiveReadOptions<'a>) -> Self {
+        Self {
+            options,
+            key_cache: rar50::Rar50KeyCache::default(),
+        }
+    }
+
+    /// Parse one archive; repeated (salt, kdf count) derivations are
+    /// served from the session cache.
+    pub fn read_path(&mut self, path: impl AsRef<Path>) -> Result<Archive> {
+        ArchiveReader::read_path_dispatch(path, self.options, &mut self.key_cache)
+    }
+
+    /// Actual PBKDF2 runs this session performed (cache misses).
+    #[cfg(test)]
+    fn derive_count(&self) -> usize {
+        self.key_cache.derives
+    }
+}
+
 impl ArchiveReader {
     /// Detects the archive signature in a byte slice.
     pub fn detect(input: &[u8]) -> Result<ArchiveSignature> {
@@ -647,6 +728,14 @@ impl ArchiveReader {
         path: impl AsRef<Path>,
         options: ArchiveReadOptions<'_>,
     ) -> Result<Archive> {
+        ReadSession::new(options).read_path(path)
+    }
+
+    fn read_path_dispatch(
+        path: impl AsRef<Path>,
+        options: ArchiveReadOptions<'_>,
+        key_cache: &mut rar50::Rar50KeyCache,
+    ) -> Result<Archive> {
         let path = path.as_ref();
         let mut file = std::fs::File::open(path)?;
         let len = file.metadata()?.len();
@@ -662,7 +751,12 @@ impl ArchiveReader {
                 rar15_40::Archive::parse_path_with_signature(path, signature, options)?,
             )),
             ArchiveFamily::Rar50Plus => Ok(Archive::Rar50Plus(
-                rar50::Archive::parse_path_with_signature(path, signature, options)?,
+                rar50::Archive::parse_path_with_signature_in_session(
+                    path,
+                    signature,
+                    options.password,
+                    key_cache,
+                )?,
             )),
         }
     }
@@ -4662,6 +4756,284 @@ mod tests {
         assert!(!serial.is_empty());
         assert_eq!(streaming, serial, "streaming chain diverged from serial");
         assert_eq!(flat, serial, "flat chain diverged from serial");
+    }
+
+    /// The RAR4 budgeted pool survives a panic in the coordinator too.
+    ///
+    /// Same defect and same guard as the RAR5 twin's
+    /// `a_coordinator_panic_does_not_hang_the_member_pool`, reached through the
+    /// public facade. Also reproduces: revert the `PoolAbortGuard` in
+    /// `rar15_40::extract_to_parallel_buffered` and this fails on the timeout.
+    /// Two 8 KiB members against the `cfg(test)` 8 KiB budget is what parks the
+    /// feeder on the condvar - it charges the first member, then has to wait for
+    /// the coordinator to write it, and the coordinator panics instead.
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn rar4_parallel_pool_coordinator_panic_does_not_hang() {
+        let member = vec![b'x'; 8 << 10];
+        let entries: Vec<_> = [b"a.bin", b"b.bin"]
+            .iter()
+            .map(|name| rar15_40::StoredEntry {
+                name: *name,
+                data: &member,
+                file_time: 0,
+                file_attr: 0x20,
+                host_os: 3,
+                password: None,
+                file_comment: None,
+            })
+            .collect();
+        let bytes =
+            rar15_40::write_stored_archive(&entries, rar15_options(ArchiveVersion::Rar15)).unwrap();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let archive = ArchiveReader::read(&bytes).unwrap();
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                archive.extract_to_parallel_buffered(None, |_meta| -> Result<Box<dyn Write>> {
+                    panic!("open panicked")
+                })
+            }))
+            .is_err();
+            let _ = done_tx.send(panicked);
+        });
+
+        match done_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(panicked) => assert!(panicked, "the coordinator panic must propagate"),
+            Err(_) => panic!(
+                "RAR4 parallel extraction did not return within 30s - the feeder is parked on \
+                 the budget condvar and the scoped join is deadlocked"
+            ),
+        }
+    }
+
+    /// A failing writer surfaces an error and returns.
+    ///
+    /// HONEST SCOPE: this is a smoke test, NOT a regression test for the
+    /// parked-producer hang fixed alongside it. It was written for that and
+    /// does not achieve it - `solid.rar` decodes to less than the pipeline's
+    /// 3 x 1 MiB pool, so the producer finishes before it can park on the
+    /// drained pool channel, and this passes with the fix reverted. Making
+    /// it bite needs a fixture whose decoded output exceeds the pool, or a
+    /// test-only pool size - and shrinking constants under cfg(test) is
+    /// what hid the equivalent rar15_40 deadlock, so that trade was
+    /// declined. The timeout is kept because it costs nothing and a hang
+    /// here would at least fail loudly rather than wedging the suite.
+    #[test]
+    fn solid_chain_writer_failure_does_not_hang() {
+        struct FailingWriter;
+        impl Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("writer failed"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let archive = ArchiveReader::read_path(rar50_fixture("solid.rar")).unwrap();
+            let volumes = vec![archive];
+            let result = extract_volumes_to(&volumes, None, |_entry| {
+                Ok(Box::new(FailingWriter) as Box<dyn Write>)
+            });
+            let _ = tx.send(result.is_err());
+        });
+
+        match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+            Ok(errored) => assert!(errored, "a failing writer must surface an error"),
+            Err(_) => panic!(
+                "solid chain did not return within 20s - the producer is parked on the \
+                 drained pool channel and the scoped join is deadlocked"
+            ),
+        }
+    }
+
+    /// One session, many volumes: the (salt, kdf count) ladder runs once
+    /// for the whole set, per-member checks still run per archive, a fresh
+    /// session derives again, and a wrong-password session fails even
+    /// after another session succeeded.
+    #[test]
+    fn read_session_shares_key_derivations_across_archives() {
+        let password: &[u8] = b"testpass";
+        let mut session = ReadSession::new(ArchiveReadOptions::with_password(password));
+        let first = session.read_path(rar50_fixture("encrypted_solid.rar")).unwrap();
+        let second = session.read_path(rar50_fixture("encrypted_solid.rar")).unwrap();
+        assert_eq!(session.derive_count(), 1, "shared salt must derive once");
+        assert_eq!(collect_extract(&first, Some(password)).unwrap().len(), 6);
+        assert_eq!(collect_extract(&second, Some(password)).unwrap().len(), 6);
+
+        let mut fresh = ReadSession::new(ArchiveReadOptions::with_password(password));
+        fresh.read_path(rar50_fixture("encrypted_solid.rar")).unwrap();
+        assert_eq!(fresh.derive_count(), 1, "sessions do not share caches");
+
+        let mut wrong = ReadSession::new(ArchiveReadOptions::with_password(b"nottheone"));
+        assert!(
+            wrong.read_path(rar50_fixture("encrypted_solid.rar")).is_err(),
+            "wrong password must fail its own session"
+        );
+
+        // No password: parse succeeds (visible headers), nothing derives.
+        let mut bare = ReadSession::new(ArchiveReadOptions::new());
+        bare.read_path(rar50_fixture("encrypted_solid.rar")).unwrap();
+        assert_eq!(bare.derive_count(), 0);
+    }
+
+    /// Encrypted solid archives were the one chain shape still fully serial:
+    /// with the password supplied, both chain modes must reproduce the
+    /// serial per-member decode (the scan thread decrypts, workers see
+    /// plaintext, the consumer MACs digests with the parse-time keys), and
+    /// with no password the set must fail with the serial path's error.
+    #[test]
+    fn encrypted_solid_chain_matches_serial() {
+        let password: &[u8] = b"testpass";
+        let archive = ArchiveReader::read_path_with_options(
+            rar50_fixture("encrypted_solid.rar"),
+            ArchiveReadOptions::with_password(password),
+        )
+        .unwrap();
+        let serial: Vec<(Vec<u8>, Vec<u8>)> = collect_extract(&archive, Some(password))
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.name, e.data))
+            .collect();
+        assert_eq!(serial.len(), 6);
+
+        let volumes = vec![archive];
+        for limit in [512 * 1024u64, 512 * 1024 * 1024] {
+            let got = collect_volumes_with_options(
+                &volumes,
+                ArchiveReadOptions::with_password(password)
+                    .with_rar50_buffered_decode_limit(limit),
+            )
+            .unwrap();
+            assert_eq!(got, serial, "encrypted solid chain diverged at limit {limit}");
+        }
+
+        // Corruption parity: a flipped payload byte must fail through the
+        // chain path with the serial path's outcome (the chain retries the
+        // group serially after restoring the snapshot).
+        let clean = std::fs::read(rar50_fixture("encrypted_solid.rar")).unwrap();
+        let mut damaged = clean.clone();
+        let pos = clean.len() / 2;
+        damaged[pos] ^= 0xFF;
+        if let Ok(archive) = ArchiveReader::read_owned_with_options(
+            damaged,
+            ArchiveReadOptions::with_password(password),
+        ) {
+            let serial_result = collect_extract(&archive, Some(password));
+            let chain_result = collect_volumes_with_options(
+                &vec![archive.clone()],
+                ArchiveReadOptions::with_password(password)
+                    .with_rar50_buffered_decode_limit(512 * 1024 * 1024),
+            );
+            assert_eq!(
+                serial_result.is_ok(),
+                chain_result.is_ok(),
+                "outcome diverged on corruption at {pos}"
+            );
+        }
+
+        // No password: parsing succeeds, extraction reports NeedPassword
+        // (serial semantics) rather than a chain artifact.
+        let no_password =
+            ArchiveReader::read_path(rar50_fixture("encrypted_solid.rar")).unwrap();
+        let result = collect_volumes_with_options(
+            &vec![no_password],
+            ArchiveReadOptions::new().with_rar50_buffered_decode_limit(512 * 1024 * 1024),
+        );
+        assert!(result.is_err(), "missing password must fail");
+    }
+
+    /// The execution policy selects strategies (flat vs ring, worker
+    /// counts), never bytes: every policy corner must produce the same
+    /// entries as the default configuration on both a solid archive (chain
+    /// paths) and a pooled non-solid one.
+    #[test]
+    fn execution_policy_never_changes_output() {
+        for fixture in ["solid.rar", "pool_members.rar"] {
+            let volumes = vec![ArchiveReader::read_path(rar50_fixture(fixture)).unwrap()];
+            let baseline = collect_volumes_with_options(
+                &volumes,
+                ArchiveReadOptions::new().with_rar50_buffered_decode_limit(512 * 1024 * 1024),
+            )
+            .unwrap();
+            let policies = [
+                // Tiny allowance: nothing admits flat, workers shed to 1.
+                Rar50ExecutionPolicy {
+                    working_memory_limit: 1 << 20,
+                    flat_output_limit: 0,
+                    max_workers: 1,
+                },
+                // Flat allowed but only two workers.
+                Rar50ExecutionPolicy {
+                    working_memory_limit: 1 << 30,
+                    flat_output_limit: 512 << 20,
+                    max_workers: 2,
+                },
+                // Generous: everything admitted.
+                Rar50ExecutionPolicy::from_working_memory(4 << 30),
+            ];
+            for policy in policies {
+                let got = collect_volumes_with_options(
+                    &volumes,
+                    ArchiveReadOptions::new()
+                        .with_rar50_buffered_decode_limit(512 * 1024 * 1024)
+                        .with_rar50_execution_policy(policy),
+                )
+                .unwrap();
+                assert_eq!(got, baseline, "{fixture} diverged under {policy:?}");
+            }
+        }
+    }
+
+    /// A mixed set (a solid archive alongside a poolable non-solid one) used
+    /// to lose the member pool entirely - one solid volume disabled it for
+    /// the whole set. Now the non-solid volume pools, the solid volume
+    /// chains inside the pooled coordinator, and the result must match the
+    /// per-archive extractions exactly, in both volume orders and in both
+    /// chain modes (streaming under the tiny cfg(test) limit, flat under a
+    /// large one).
+    #[test]
+    fn mixed_solid_and_pooled_set_extracts_both_fast_paths() {
+        let pool = ArchiveReader::read_path(rar50_fixture("pool_members.rar")).unwrap();
+        let solid = ArchiveReader::read_path(rar50_fixture("solid.rar")).unwrap();
+        let per_archive = |archive: &Archive| -> Vec<(Vec<u8>, Vec<u8>)> {
+            collect_extract(archive, None)
+                .unwrap()
+                .into_iter()
+                .map(|e| (e.name, e.data))
+                .collect()
+        };
+        let pool_expected = per_archive(&pool);
+        let solid_expected = per_archive(&solid);
+
+        for (volumes, expected) in [
+            (
+                vec![
+                    ArchiveReader::read_path(rar50_fixture("pool_members.rar")).unwrap(),
+                    ArchiveReader::read_path(rar50_fixture("solid.rar")).unwrap(),
+                ],
+                [pool_expected.clone(), solid_expected.clone()].concat(),
+            ),
+            (
+                vec![
+                    ArchiveReader::read_path(rar50_fixture("solid.rar")).unwrap(),
+                    ArchiveReader::read_path(rar50_fixture("pool_members.rar")).unwrap(),
+                ],
+                [solid_expected.clone(), pool_expected.clone()].concat(),
+            ),
+        ] {
+            for limit in [512 * 1024u64, 512 * 1024 * 1024] {
+                let got = collect_volumes_with_options(
+                    &volumes,
+                    ArchiveReadOptions::new().with_rar50_buffered_decode_limit(limit),
+                )
+                .unwrap();
+                assert_eq!(got, expected, "mixed set diverged at limit {limit}");
+            }
+        }
     }
 
     /// Corruption differential: flipping a byte at several positions in the

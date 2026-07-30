@@ -23,6 +23,18 @@ const DEFAULT_STREAM_WINDOW_LIMIT: u64 = 1024 * 1024 * 1024;
 
 impl FileHeader {
     fn crypto_with_password(&self, password: Option<&[u8]>) -> Result<Option<Rar50Keys>> {
+        self.crypto_with_password_cached(password, &mut super::Rar50KeyCache::default())
+    }
+
+    /// Like [`Self::crypto_with_password`], but repeated (salt, kdf count)
+    /// pairs derive once through `cache` - a solid chain or member walk
+    /// over an archive parsed WITHOUT its password would otherwise pay the
+    /// full PBKDF2 ladder per member. Per-member password checks still run.
+    fn crypto_with_password_cached(
+        &self,
+        password: Option<&[u8]>,
+        cache: &mut super::Rar50KeyCache,
+    ) -> Result<Option<Rar50Keys>> {
         if !self.encrypted {
             return Ok(None);
         }
@@ -39,13 +51,38 @@ impl FileHeader {
                 feature: "RAR 5 unknown file encryption version",
             });
         }
-        let keys = Rar50Keys::derive(password, encryption.salt, encryption.kdf_count)
-            .map_err(super::map_rar50_crypto_error)?;
+        let keys = cache.get_or_derive(password, encryption.salt, encryption.kdf_count)?;
         if let Some(check_value) = encryption.check_value {
             keys.check_password(&check_value)
                 .map_err(super::map_rar50_crypto_error)?;
         }
         Ok(Some(keys))
+    }
+
+    /// Packed reader from already-derived keys (or `None` for plaintext) -
+    /// the chain pre-derives once per member set instead of once per open.
+    fn packed_reader_with_keys<'a>(
+        &self,
+        archive: &'a Archive,
+        keys: Option<&Rar50Keys>,
+    ) -> Result<Box<dyn Read + Send + 'a>> {
+        let reader = archive.range_reader(self.block.data_range.clone())?;
+        if !self.encrypted {
+            return Ok(reader);
+        }
+        if !self.packed_size().is_multiple_of(16) {
+            return Err(Error::InvalidHeader(
+                "RAR 5 encrypted file payload is not block aligned",
+            ));
+        }
+        let keys = keys.ok_or(Error::InvalidHeader(
+            "RAR 5 encrypted file is missing encryption keys",
+        ))?;
+        Ok(Box::new(Rar50DecryptingReader::new(
+            reader,
+            keys.key,
+            self.encryption_iv()?,
+        )))
     }
 
     fn encryption_iv(&self) -> Result<[u8; 16]> {
@@ -475,6 +512,17 @@ impl FileHeader {
             // Receiver is dropped here (loop finished or broke), which
             // unblocks a producer stuck on send; it then errors out and
             // the join below collects it.
+            //
+            // Dropping the data receiver is NOT sufficient on its own: the
+            // producer can equally be parked on `pool_rx.recv()` with the
+            // pool drained, and nothing above wakes that. The `Repeated`
+            // arm holds no pooled buffer, so it recycles nothing - a
+            // `Repeated` chunk plus POOL_BUFFERS queued `Data` buffers
+            // exactly fills this channel and empties the pool, and if
+            // `write_repeated_chunk` then fails (the bomb guard tripping,
+            // ENOSPC, EPIPE) the break below would join a producer that can
+            // never return. Dropping the pool sender fails its recv.
+            drop(pool_tx);
             handle.join().expect("streaming decode thread panicked")
         });
 
@@ -510,63 +558,12 @@ impl FileHeader {
             streaming_hash_verifier(self).map_err(|error| self.entry_error("decoding", error))?;
         let mut written = 0u64;
 
-        // Pipeline: reading (and decrypting) runs on a spawned thread;
-        // padding checks, checksums, and writing stay on the calling thread.
-        const STORED_PIPE_BUF: usize = 1 << 20;
-        const STORED_POOL: usize = 3;
-        let (data_tx, data_rx) =
-            std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(STORED_POOL + 1);
-        let (pool_tx, pool_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-        for _ in 0..STORED_POOL {
-            let _ = pool_tx.send(vec![0u8; STORED_PIPE_BUF]);
-        }
-
-        let mut stage_error: Option<Error> = None;
-        let mut stage_operation = "decoding";
-        std::thread::scope(|scope| {
-            scope.spawn(move || {
-                loop {
-                    let Ok(mut buf) = pool_rx.recv() else {
-                        return;
-                    };
-                    buf.resize(STORED_PIPE_BUF, 0);
-                    match reader.read(&mut buf) {
-                        Ok(0) => return,
-                        Ok(count) => {
-                            buf.truncate(count);
-                            if data_tx.send(Ok(buf)).is_err() {
-                                return;
-                            }
-                        }
-                        Err(error) => {
-                            let _ = data_tx.send(Err(error));
-                            return;
-                        }
-                    }
-                }
-            });
-
-            for received in data_rx {
-                let buf = match received {
-                    Ok(buf) => buf,
-                    Err(error) => {
-                        stage_error = Some(Error::from(error));
-                        stage_operation = "decoding";
-                        break;
-                    }
-                };
-                if let Err((operation, error)) =
-                    self.consume_stored_chunk(&buf, &mut written, &mut crc, &mut hash, writer)
-                {
-                    stage_error = Some(error);
-                    stage_operation = operation;
-                    break;
-                }
-                let _ = pool_tx.send(buf);
-            }
-        });
-        if let Some(error) = stage_error {
-            return Err(self.entry_error(stage_operation, error));
+        if let Err((operation, error)) = pipe_stored_chunks(
+            &mut *reader,
+            |error| ("decoding", Error::from(error)),
+            |buf| self.consume_stored_chunk(buf, &mut written, &mut crc, &mut hash, writer),
+        ) {
+            return Err(self.entry_error(operation, error));
         }
 
         if written != self.unpacked_size {
@@ -593,10 +590,31 @@ impl FileHeader {
             usize::try_from(self.unpacked_size.saturating_sub(*written)).unwrap_or(usize::MAX);
         let chunk_len = buf.len().min(remaining);
         let chunk = &buf[..chunk_len];
-        if self.encrypted && buf[chunk_len..].iter().any(|&byte| byte != 0) {
+        if self.encrypted {
+            // Encrypted stored data is padded up to the AES block, so a tail
+            // past unpacked_size is expected - but it must be zero.
+            if buf[chunk_len..].iter().any(|&byte| byte != 0) {
+                return Err((
+                    "decoding",
+                    Error::InvalidHeader("RAR 5 encrypted stored file has non-zero padding"),
+                ));
+            }
+        } else if buf.len() > remaining {
+            // Unencrypted stored data has no padding, so extra bytes mean the
+            // headers disagree with the payload. Rejecting here restores a
+            // check that clamping silently removed: the split path used to
+            // write the whole buffer, overshoot `written`, and get caught by
+            // the `written != unpacked_size` comparison afterwards. Once the
+            // clamp applied to both branches, `written` could never exceed
+            // unpacked_size, so that comparison could only ever catch SHORT
+            // data and an over-supplying entry extracted truncated and
+            // reported success - silently, when the archive carries neither a
+            // data_crc32 nor a BLAKE2sp record, both of which are optional.
             return Err((
                 "decoding",
-                Error::InvalidHeader("RAR 5 encrypted stored file has non-zero padding"),
+                Error::InvalidHeader(
+                    "RAR 5 stored file supplies more data than its unpacked size",
+                ),
             ));
         }
         *written = written
@@ -617,6 +635,75 @@ impl FileHeader {
     fn entry_error(&self, operation: &'static str, error: Error) -> Error {
         error.at_entry(self.name.clone(), operation)
     }
+}
+
+/// Bounded stored-data pipeline: a scoped producer thread reads (and
+/// decrypts) into pooled buffers while `consume` runs each chunk's padding
+/// check, checksums, and write on the calling thread - the writer is a
+/// borrowed `dyn Write` and must stay there. The data channel holds one
+/// slot more than the pool has buffers, so a producer send can never
+/// block on a full channel; when the consumer stops early, dropping the
+/// pool sender wakes the producer's recv and the scoped thread joins.
+const STORED_PIPE_BUF: usize = 1 << 20;
+const STORED_POOL: usize = 3;
+
+fn pipe_stored_chunks<E>(
+    reader: &mut (dyn Read + Send),
+    read_error: impl Fn(std::io::Error) -> E,
+    mut consume: impl FnMut(&[u8]) -> std::result::Result<(), E>,
+) -> std::result::Result<(), E> {
+    let (data_tx, data_rx) =
+        std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(STORED_POOL + 1);
+    let (pool_tx, pool_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    for _ in 0..STORED_POOL {
+        let _ = pool_tx.send(vec![0u8; STORED_PIPE_BUF]);
+    }
+
+    let mut outcome = Ok(());
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            loop {
+                let Ok(mut buf) = pool_rx.recv() else {
+                    return;
+                };
+                buf.resize(STORED_PIPE_BUF, 0);
+                match reader.read(&mut buf) {
+                    Ok(0) => return,
+                    Ok(count) => {
+                        buf.truncate(count);
+                        if data_tx.send(Ok(buf)).is_err() {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = data_tx.send(Err(error));
+                        return;
+                    }
+                }
+            }
+        });
+
+        for received in data_rx {
+            let buf = match received {
+                Ok(buf) => buf,
+                Err(error) => {
+                    outcome = Err(read_error(error));
+                    break;
+                }
+            };
+            if let Err(error) = consume(&buf) {
+                outcome = Err(error);
+                break;
+            }
+            let _ = pool_tx.send(buf);
+        }
+        // Consumption has stopped (EOF, read error, or consume error) and
+        // the data receiver is gone. A producer parked on the drained pool
+        // would otherwise never wake, and the scope would wait on it
+        // forever - dropping the pool sender fails its recv instead.
+        drop(pool_tx);
+    });
+    outcome
 }
 
 struct CountingWriter<'a> {
@@ -701,12 +788,34 @@ impl Archive {
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
         R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
     {
+        // Single archives get the same member pool as volume sets (they were
+        // the one entry point with no cross-member parallelism at all). The
+        // split guard preserves this method's distinct error for split
+        // members, which the volume walk would report differently.
+        #[cfg(feature = "parallel")]
+        if !self
+            .files()
+            .any(|file| file.is_split_before() || file.is_split_after())
+        {
+            if let Some(plan) = member_pool_plan(std::slice::from_ref(self), options) {
+                return extract_volumes_pooled(
+                    std::slice::from_ref(self),
+                    options,
+                    open,
+                    redirect,
+                    emit_redirections,
+                    plan,
+                );
+            }
+        }
+
         let buffered_decode_limit = rar50_buffered_decode_limit(options);
         let mut session = DecoderSession::new_with_password(
             options.password,
             buffered_decode_limit,
             rar50_max_window(options),
-        );
+        )
+        .with_policy(rar50_execution_policy(options));
         for file in self.files() {
             if let Some(redirection) = &file.redirection {
                 if emit_redirections {
@@ -839,6 +948,26 @@ struct DecoderSession<'a> {
     decoder: Unpack50Decoder,
     password: Option<&'a [u8]>,
     buffered_decode_limit: u64,
+    policy: Option<crate::Rar50ExecutionPolicy>,
+    /// Retained so a RESET decoder gets the caller's window limit back.
+    /// `Unpack50Decoder::new()` defaults it to `usize::MAX`, so replacing the
+    /// session's decoder with a bare one silently dropped the safety limit
+    /// for that member and every member after it.
+    max_window: u64,
+}
+
+/// Fixed part of a flat plan's peak beyond output + retained dictionary:
+/// pipe scratch (~4 MiB), in-flight tapes, and headroom. Deliberately
+/// generous - admission failing just means the bounded ring runs instead.
+const FLAT_OVERHEAD_ESTIMATE: u64 = 24 << 20;
+
+/// Whether a flat allocation of `output` bytes (retaining up to `dictionary`
+/// of window afterwards) fits the policy's working-memory allowance.
+fn flat_admitted(output: u64, dictionary: u64, policy: &crate::Rar50ExecutionPolicy) -> bool {
+    output
+        .saturating_add(dictionary)
+        .saturating_add(FLAT_OVERHEAD_ESTIMATE)
+        <= policy.working_memory_limit
 }
 
 impl<'a> DecoderSession<'a> {
@@ -853,7 +982,55 @@ impl<'a> DecoderSession<'a> {
             decoder,
             password,
             buffered_decode_limit,
+            policy: None,
+            max_window,
         }
+    }
+
+    /// A fresh decoder carrying this session's policy - window limit and
+    /// worker cap both reapplied.
+    ///
+    /// Every reset inside the session goes through here. A bare
+    /// `Unpack50Decoder::new()` defaults `window_limit` and `mt_workers_cap`
+    /// to `usize::MAX`, so the two reset paths (the zero-output
+    /// streaming-filter fallback on a split member, and the LzNoFilters
+    /// retry with no checkpoint to restore) handed the rest of the archive a
+    /// decoder that answers to no caller-supplied resource limit at all - a
+    /// match beyond the configured window stopped being rejected.
+    fn fresh_decoder(&self) -> Unpack50Decoder {
+        let mut decoder = Unpack50Decoder::new();
+        decoder.set_window_limit(usize::try_from(self.max_window).unwrap_or(usize::MAX));
+        if let Some(policy) = self.policy {
+            decoder.set_mt_workers_cap(policy.max_workers.max(1));
+        }
+        decoder
+    }
+
+    /// Attaches an execution policy: strategy selection (flat vs ring,
+    /// worker counts) honors its allowances. Output bytes and error
+    /// semantics never depend on it.
+    fn with_policy(mut self, policy: Option<crate::Rar50ExecutionPolicy>) -> Self {
+        self.policy = policy;
+        if let Some(policy) = policy {
+            self.decoder.set_mt_workers_cap(policy.max_workers.max(1));
+        }
+        self
+    }
+
+    /// Flat gate for one member under the policy: the flat allocation is
+    /// capped and admitted against the working-memory estimate; without a
+    /// policy the buffered limit alone gates, exactly as before.
+    fn member_flat_limit(&self, file: &FileHeader) -> u64 {
+        let Some(policy) = &self.policy else {
+            return self.buffered_decode_limit;
+        };
+        let dictionary = file
+            .decoded_compression_info()
+            .map_or(0, |info| info.dictionary_size);
+        if !flat_admitted(file.unpacked_size, dictionary, policy) {
+            return 0;
+        }
+        self.buffered_decode_limit.min(policy.flat_output_limit)
     }
 
     fn write_file_to(
@@ -905,7 +1082,7 @@ impl<'a> DecoderSession<'a> {
                     )
                     .map_err(|error| file.entry_error("decoding", error))?
                 } else {
-                    let mut fresh = Unpack50Decoder::new();
+                    let mut fresh = self.fresh_decoder();
                     let unfiltered = file
                         .decoded_data_with_mode(
                             archive,
@@ -952,17 +1129,18 @@ impl<'a> DecoderSession<'a> {
                 &mut packed,
                 keys.as_ref(),
                 &mut streaming_decoder,
-                self.buffered_decode_limit,
+                self.member_flat_limit(file),
                 writer,
             )
             .map_err(|error| file.entry_error("decoding", error))?;
             self.decoder = streaming_decoder;
         } else {
+            let flat_limit = self.member_flat_limit(file);
             file.stream_packed_with_decoder(
                 &mut packed,
                 keys.as_ref(),
                 &mut self.decoder,
-                self.buffered_decode_limit,
+                flat_limit,
                 writer,
             )
             .map_err(|error| file.entry_error("decoding", error))?;
@@ -1003,6 +1181,12 @@ impl FileHeader {
     fn should_stream_decode(&self, buffered_decode_limit: u64) -> bool {
         !self.is_stored() && self.unpacked_size > buffered_decode_limit.min(STREAMING_PREFERRED_MIN)
     }
+}
+
+fn rar50_execution_policy(
+    options: crate::ArchiveReadOptions<'_>,
+) -> Option<crate::Rar50ExecutionPolicy> {
+    options.rar50_execution_policy
 }
 
 fn rar50_buffered_decode_limit(options: crate::ArchiveReadOptions<'_>) -> u64 {
@@ -1072,14 +1256,12 @@ where
         password,
         buffered_decode_limit,
         rar50_max_window(options),
-    );
-    // Members already extracted as part of a solid chain group, and the
-    // kill-switch a failed chain flips (the group then retries serially,
-    // and no further chains are attempted for this set).
+    )
+    .with_policy(rar50_execution_policy(options));
+    // Solid archives: a run of chainable members decodes as ONE stream
+    // through the MT pipeline instead of member-by-member on one thread.
     #[cfg(feature = "parallel")]
-    let mut chained: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
-    #[cfg(feature = "parallel")]
-    let mut chain_disabled = false;
+    let mut chain = SolidChainDriver::new();
 
     for (volume_index, archive) in volumes.iter().enumerate() {
         for (file_index, file) in archive.files().enumerate() {
@@ -1092,43 +1274,15 @@ where
                         continue;
                     }
                     #[cfg(feature = "parallel")]
-                    {
-                        if chained.contains(&(volume_index, file_index)) {
-                            continue;
-                        }
-                        // Solid archives: a run of chainable members decodes
-                        // as ONE stream through the MT pipeline instead of
-                        // member-by-member on one thread. Any chain failure
-                        // restores the pre-group state and falls through to
-                        // the serial path, which re-decodes the group with
-                        // its exact error semantics (writers are re-opened,
-                        // so partially chained output is rewritten).
-                        if !chain_disabled && archive.main.is_solid() && chain_member_shape(file)
-                        {
-                            let members =
-                                collect_solid_chain(volumes, (volume_index, file_index));
-                            let total: usize =
-                                members.iter().map(|m| m.output_size).sum();
-                            if members.len() >= 2
-                                && Unpack50Decoder::solid_chain_worthwhile(total)
-                            {
-                                let snapshot = session.decoder.snapshot_solid_state();
-                                match stream_solid_chain(&mut session, volumes, &members, open)
-                                {
-                                    Ok(()) => {
-                                        for member in &members {
-                                            chained
-                                                .insert((member.volume_index, member.file_index));
-                                        }
-                                        continue;
-                                    }
-                                    Err(_) => {
-                                        session.decoder.restore_solid_state(snapshot);
-                                        chain_disabled = true;
-                                    }
-                                }
-                            }
-                        }
+                    if chain.claim(
+                        &mut session,
+                        volumes,
+                        archive,
+                        (volume_index, file_index),
+                        file,
+                        open,
+                    ) {
+                        continue;
                     }
                     let meta = file.metadata();
                     let mut writer = open(&meta)?;
@@ -1201,7 +1355,8 @@ where
         password,
         rar50_buffered_decode_limit(options),
         rar50_max_window(options),
-    );
+    )
+    .with_policy(rar50_execution_policy(options));
     let mut volumes: Vec<Archive> = Vec::new();
 
     loop {
@@ -1284,15 +1439,97 @@ struct ChainMember<'a> {
 /// directories, redirections, encrypted members (keyed digest MACs stay on
 /// the serial path), and zero-size members all cut the chain.
 #[cfg(feature = "parallel")]
-fn chain_member_shape(file: &FileHeader) -> bool {
+fn chain_member_shape(file: &FileHeader, password_available: bool) -> bool {
     file.redirection.is_none()
         && !file.is_split_before()
         && !file.is_split_after()
         && !file.is_directory()
         && !file.is_stored()
-        && !file.encrypted
+        // Encrypted members chain when keys exist or can be derived (the
+        // chain pre-derives once per member set): the scan thread owns
+        // sequential decryption through the member's packed reader, workers
+        // only ever see plaintext, and the consumer MACs digests with the
+        // pre-derived keys. Without a password the member stays on the
+        // serial path, which raises NeedPassword exactly as before.
+        && (!file.encrypted || file.crypto.is_some() || password_available)
         && file.unpacked_size > 0
         && usize::try_from(file.unpacked_size).is_ok()
+}
+
+/// Chain attempts per set that may fail before chaining is disabled. A
+/// failed chain restores the pre-group snapshot and retries that group
+/// serially; the budget lets LATER groups still try the pipeline (a failure
+/// is usually specific to one group's data), while repeated failures stop a
+/// pathological archive from paying chain-then-serial on every group.
+#[cfg(feature = "parallel")]
+const SOLID_CHAIN_FAILURE_BUDGET: u32 = 2;
+
+/// Shared solid-chain bookkeeping for the serial and pooled walks: which
+/// members a chained group already emitted, and how many chains have failed.
+#[cfg(feature = "parallel")]
+struct SolidChainDriver {
+    chained: std::collections::HashSet<(usize, usize)>,
+    failures: u32,
+}
+
+#[cfg(feature = "parallel")]
+impl SolidChainDriver {
+    fn new() -> Self {
+        Self {
+            chained: std::collections::HashSet::new(),
+            failures: 0,
+        }
+    }
+
+    /// Returns true when the walk should skip this member: it was already
+    /// emitted by a chained group, or a chain starting here just decoded
+    /// (and emitted) a whole group through the MT pipeline. A failed chain
+    /// restores the pre-group state, counts against the failure budget, and
+    /// returns false so the caller's serial path re-decodes the group with
+    /// its exact error semantics (writers are re-opened, so partially
+    /// chained output is rewritten).
+    fn claim<F>(
+        &mut self,
+        session: &mut DecoderSession<'_>,
+        volumes: &[Archive],
+        archive: &Archive,
+        coords: (usize, usize),
+        file: &FileHeader,
+        open: &mut F,
+    ) -> bool
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    {
+        if self.chained.contains(&coords) {
+            return true;
+        }
+        let password_available = session.password.is_some();
+        if self.failures >= SOLID_CHAIN_FAILURE_BUDGET
+            || !archive.main.is_solid()
+            || !chain_member_shape(file, password_available)
+        {
+            return false;
+        }
+        let members = collect_solid_chain(volumes, coords, password_available);
+        let total: usize = members.iter().map(|m| m.output_size).sum();
+        if members.len() < 2 || !session.decoder.solid_chain_worthwhile(total) {
+            return false;
+        }
+        let snapshot = session.decoder.snapshot_solid_state();
+        match stream_solid_chain(session, volumes, &members, open) {
+            Ok(()) => {
+                for member in &members {
+                    self.chained.insert((member.volume_index, member.file_index));
+                }
+                true
+            }
+            Err(_) => {
+                session.decoder.restore_solid_state(snapshot);
+                self.failures += 1;
+                false
+            }
+        }
+    }
 }
 
 /// Collect the maximal solid chain group starting at `start` (inclusive):
@@ -1303,6 +1540,7 @@ fn chain_member_shape(file: &FileHeader) -> bool {
 fn collect_solid_chain<'a>(
     volumes: &'a [Archive],
     start: (usize, usize),
+    password_available: bool,
 ) -> Vec<ChainMember<'a>> {
     let mut members: Vec<ChainMember<'a>> = Vec::new();
     let mut base: Option<(u8, u64)> = None; // (algorithm_version, dictionary)
@@ -1311,7 +1549,7 @@ fn collect_solid_chain<'a>(
             if volume_index == start.0 && file_index < start.1 {
                 continue;
             }
-            if !chain_member_shape(file) {
+            if !chain_member_shape(file, password_available) {
                 break 'volumes;
             }
             let Ok(info) = file.decoded_compression_info() else {
@@ -1356,10 +1594,21 @@ where
     // The window must persist for members after the group.
     session.decoder.set_retain_history(true);
     // A group under this budget takes the flat-apply fast path; larger
-    // groups stream through the ring. Bounded separately from the member
-    // flat limit so one solid group never holds more than this in memory.
+    // groups stream through the ring. Without a policy, a fixed cap bounds
+    // what one solid group may hold in memory; a policy replaces the cap
+    // with its own allowance and admission estimate, so a large host may
+    // hold a bigger group flat and a constrained one refuses sooner.
     const CHAIN_FLAT_LIMIT: u64 = 256 << 20;
-    let flat_limit = session.buffered_decode_limit.min(CHAIN_FLAT_LIMIT);
+    let flat_limit = match &session.policy {
+        Some(policy) => {
+            if flat_admitted(total as u64, first_info.dictionary_size, policy) {
+                session.buffered_decode_limit.min(policy.flat_output_limit)
+            } else {
+                0
+            }
+        }
+        None => session.buffered_decode_limit.min(CHAIN_FLAT_LIMIT),
+    };
 
     // Same pipe as stream_packed_with_decoder: decode on a spawned thread,
     // checksum + write on this thread (writers are not Send).
@@ -1379,9 +1628,26 @@ where
         let _ = pool_tx.send(Vec::with_capacity(PIPE_BUF));
     }
 
+    // Pre-derive every encrypted member's keys, one PBKDF2 ladder per
+    // distinct (salt, kdf count) rather than one per member: the scan
+    // thread builds decrypting readers from these, and the consumer MACs
+    // digests with them. A derive or check failure fails the chain here,
+    // before any state moves; the serial retry then reproduces the exact
+    // per-member error.
+    let member_keys: Vec<Option<Rar50Keys>> = {
+        let mut key_cache = super::Rar50KeyCache::default();
+        members
+            .iter()
+            .map(|member| {
+                member
+                    .file
+                    .crypto_with_password_cached(session.password, &mut key_cache)
+            })
+            .collect::<Result<_>>()?
+    };
     let decoder = &mut session.decoder;
-    let password = session.password;
     let mut consume_error: Option<Error> = None;
+    let member_keys_ref = &member_keys;
     let scope_outcome = std::thread::scope(|scope| {
         let handle = scope.spawn(move || {
             // Member readers, yielded to the scan in order. An open failure
@@ -1389,14 +1655,16 @@ where
             // NeedMoreInput); the real error rides back beside the result.
             let mut next = 0usize;
             let mut reader_error: Option<Error> = None;
+            let member_keys = member_keys_ref;
             let mut next_input = || {
                 let member = members.get(next)?;
+                let keys = member_keys[next].as_ref();
                 next += 1;
                 match member
                     .file
-                    .packed_reader_with_password(&volumes[member.volume_index], password)
+                    .packed_reader_with_keys(&volumes[member.volume_index], keys)
                 {
-                    Ok((reader, _keys)) => Some(reader),
+                    Ok(reader) => Some(reader),
                     Err(error) => {
                         reader_error = Some(error);
                         None
@@ -1525,10 +1793,11 @@ where
                 if *remaining == 0 {
                     let (_writer, crc, hash, _) =
                         member_state.take().expect("member state present");
-                    if let Err(error) = members[cursor]
-                        .file
-                        .verify_streaming_integrity(crc, hash, None)
-                    {
+                    if let Err(error) = members[cursor].file.verify_streaming_integrity(
+                        crc,
+                        hash,
+                        member_keys[cursor].as_ref(),
+                    ) {
                         consume_error =
                             Some(members[cursor].file.entry_error("verifying", error));
                         break 'consume;
@@ -1544,6 +1813,15 @@ where
         }
         // Dropping the receiver here unblocks a producer stuck on send.
         drop(data_rx);
+        // ...but a producer parked on `pool_rx.recv()` with the pool drained
+        // is not waiting on the data channel, so that alone would hang the
+        // join. Every `break 'consume` above jumps PAST the recycle at the
+        // foot of the loop, so the buffer in hand is dropped rather than
+        // returned - and the breaks are the ordinary failures, not exotic
+        // ones: a member CRC32/BLAKE2sp mismatch from a damaged payload, a
+        // write failure, a rejected entry path. Dropping the pool sender
+        // fails the producer's recv so it can exit and be joined.
+        drop(pool_tx);
         let (decode, reader_error) =
             handle.join().expect("solid chain decode thread panicked");
         (decode, reader_error, cursor)
@@ -1644,11 +1922,12 @@ struct MemberPoolPlan<'a> {
 }
 
 /// A member decodes on the pool when it is a regular compressed file that
-/// would take the buffered serial path today: not split, not stored, not a
-/// directory or redirection, and under the streaming threshold. Stored
-/// members stay inline (their cost is I/O, not decode); streaming/MT members
-/// stay inline (MT already uses the cores; trap: a big member must not be
-/// stolen from inline-MT by the pool).
+/// does not engage the inline MT pipeline: not split, not stored, not a
+/// directory or redirection, and either under the streaming threshold or in
+/// the streaming band below the MT floor. Stored members stay inline (their
+/// cost is I/O, not decode); MT-sized members stay inline (MT already uses
+/// the cores; trap: a big member must not be stolen from inline-MT by the
+/// pool).
 #[cfg(feature = "parallel")]
 fn member_pool_eligible(file: &FileHeader, buffered_decode_limit: u64) -> bool {
     file.redirection.is_none()
@@ -1656,31 +1935,52 @@ fn member_pool_eligible(file: &FileHeader, buffered_decode_limit: u64) -> bool {
         && !file.is_split_after()
         && !file.is_directory()
         && !file.is_stored()
-        && !file.should_stream_decode(buffered_decode_limit)
+        && (!file.should_stream_decode(buffered_decode_limit)
+            || pool_streaming_band(file.unpacked_size, buffered_decode_limit))
 }
 
-/// Build the pool plan, or None when the set must take the serial path:
-/// solid archives (members chain through the window), any per-file solid
-/// flag, or fewer than two eligible members (a one-file archive must not
-/// pay any pool cost).
+/// The streaming band the pool rescues: members that would stream SERIALLY
+/// inline (above the buffered threshold, below the MT pipeline floor - 4 to
+/// 16 MiB in release builds). They were the one size class with no
+/// parallelism at all; a buffered pool decode under the in-flight budget is
+/// strictly better than a serial inline stream. Members the MT pipeline
+/// engages, and members too big to buffer at all, stay inline.
+#[cfg(feature = "parallel")]
+fn pool_streaming_band(unpacked_size: u64, buffered_decode_limit: u64) -> bool {
+    unpacked_size <= buffered_decode_limit
+        && usize::try_from(unpacked_size)
+            .is_ok_and(|size| !Unpack50Decoder::mt_pipeline_engages(size))
+}
+
+/// Build the pool plan, or None when nothing pools: fewer than two eligible
+/// members means a one-file archive must not pay any pool cost.
+///
+/// Solid ARCHIVES contribute no pooled members - their members share the
+/// window and are handled by the chain/serial walk - but they no longer
+/// disable the pool for the rest of a mixed set. Likewise a per-file solid
+/// flag inside a non-solid archive makes THAT member ineligible (the serial
+/// session decodes it against an empty window, exactly as the serial path
+/// does, since history retention keys on the archive flag), not the whole
+/// set: one stray solid member in a thousand-file set used to cost every
+/// other member its parallelism.
 #[cfg(feature = "parallel")]
 fn member_pool_plan<'a>(
     volumes: &'a [Archive],
     options: crate::ArchiveReadOptions<'_>,
 ) -> Option<MemberPoolPlan<'a>> {
-    if volumes.iter().any(|archive| archive.main.is_solid()) {
-        return None;
-    }
     let buffered_decode_limit = rar50_buffered_decode_limit(options);
     let mut seq_of = std::collections::HashMap::new();
     let mut order = Vec::new();
     for (volume_index, archive) in volumes.iter().enumerate() {
+        if archive.main.is_solid() {
+            continue;
+        }
         for (file_index, file) in archive.files().enumerate() {
             if file
                 .decoded_compression_info()
                 .is_ok_and(|info| info.solid)
             {
-                return None;
+                continue;
             }
             if member_pool_eligible(file, buffered_decode_limit) {
                 seq_of.insert((volume_index, file_index), order.len());
@@ -1755,11 +2055,22 @@ where
     let password = options.password;
     let buffered_decode_limit = rar50_buffered_decode_limit(options);
     let max_window = rar50_max_window(options);
+    let policy = rar50_execution_policy(options);
     let workers = std::thread::available_parallelism()
         .map_or(4, |n| n.get())
         .saturating_sub(1)
         .clamp(1, 8)
+        .min(policy.map_or(usize::MAX, |p| p.max_workers.max(1)))
         .min(plan.order.len());
+    // A constrained policy also shrinks the in-flight allowance; it never
+    // grows past the built-in budget, and the floor keeps one decoded
+    // member of any admitted size able to make progress. The floor tracks
+    // the cfg(test) shrunken budget so policy-carrying tests still exercise
+    // constant backpressure.
+    let inflight_budget = policy.map_or(POOL_INFLIGHT_BUDGET, |p| {
+        let floor = POOL_INFLIGHT_BUDGET.min(8 << 20);
+        POOL_INFLIGHT_BUDGET.min((p.working_memory_limit / 4).max(floor))
+    });
 
     // in-flight budget: (bytes enqueued-or-decoded but not yet written, abort)
     let budget = Arc::new((Mutex::new((0u64, false)), Condvar::new()));
@@ -1783,7 +2094,7 @@ where
                     let size = entry.unpacked_size;
                     let (lock, cvar) = &*budget;
                     let mut state = lock.lock().expect("pool budget lock");
-                    while !state.1 && state.0 > 0 && state.0 + size > POOL_INFLIGHT_BUDGET {
+                    while !state.1 && state.0 > 0 && state.0 + size > inflight_budget {
                         state = cvar.wait(state).expect("pool budget wait");
                     }
                     if state.1 {
@@ -1801,6 +2112,11 @@ where
         // Workers: decode + verify, results rejoin the coordinator. A panic
         // inside decode surfaces as an error result instead of deadlocking
         // the coordinator's recv.
+        // Armed BEFORE the workers are spawned, not after: a `scope.spawn`
+        // that panics (the OS refusing a thread) used to unwind out of this
+        // closure with no guard in place at all, leaving the feeder parked on
+        // the byte budget with nothing left to wake it.
+        let _abort = crate::parallel::PoolAbortGuard::new(&budget);
         for _ in 0..workers {
             let work_rx = Arc::clone(&work_rx);
             let result_tx = result_tx.clone();
@@ -1825,6 +2141,15 @@ where
             });
         }
         drop(result_tx);
+        // ...and the work RECEIVER, the fifth instance of the pool-hang class
+        // (181d06b8, 419c00ae, 48b21a0b). The feeder parks in TWO places and
+        // the abort guard only covers one: it wakes a budget-condvar wait, but
+        // a feeder blocked in `work_tx.send` on the full channel is woken only
+        // by the channel disconnecting. Held here in the function frame, this
+        // `Arc<Mutex<Receiver>>` outlives every worker, so if they all exit
+        // (or die) the send never returns and `thread::scope` joins forever.
+        // rar15_40's twin drops it inside the scope for exactly this reason.
+        drop(work_rx);
 
         // Coordinator: the exact serial walk, with pooled members' bytes
         // pulled from the reorder map instead of decoded inline. Inline
@@ -1832,7 +2157,11 @@ where
         let mut pending: BTreeMap<usize, Result<Vec<u8>>> = BTreeMap::new();
         let mut split = SplitVolumeState::new();
         let mut session =
-            DecoderSession::new_with_password(password, buffered_decode_limit, max_window);
+            DecoderSession::new_with_password(password, buffered_decode_limit, max_window)
+                .with_policy(rar50_execution_policy(options));
+        // A mixed set can hold solid archives alongside the pooled ones;
+        // their groups still chain through the MT pipeline here.
+        let mut chain = SolidChainDriver::new();
         let mut run = || -> Result<()> {
             for (volume_index, archive) in volumes.iter().enumerate() {
                 for (file_index, file) in archive.files().enumerate() {
@@ -1842,6 +2171,16 @@ where
                                 if emit_redirections {
                                     redirect(&file.metadata(), redirection)?;
                                 }
+                                continue;
+                            }
+                            if chain.claim(
+                                &mut session,
+                                volumes,
+                                archive,
+                                (volume_index, file_index),
+                                file,
+                                &mut *open,
+                            ) {
                                 continue;
                             }
                             let meta = file.metadata();
@@ -1918,13 +2257,10 @@ where
             }
             Ok(())
         };
-        let outcome = run();
-        // Wake the feeder out of any budget wait and let every thread drain;
-        // dropping result_rx (on scope exit) unblocks workers mid-send.
-        let (lock, cvar) = &*budget;
-        lock.lock().expect("pool budget lock").1 = true;
-        cvar.notify_all();
-        outcome
+        // `_abort` wakes the feeder out of any budget wait and lets every
+        // thread drain; dropping result_rx (on scope exit) unblocks workers
+        // mid-send.
+        run()
     });
     outcome
 }
@@ -2040,7 +2376,7 @@ impl PendingSplitRefs {
                     &mut reader,
                     keys,
                     &mut streaming_decoder,
-                    session.buffered_decode_limit,
+                    session.member_flat_limit(final_file),
                     &mut counting,
                 );
                 if result.is_ok() {
@@ -2048,11 +2384,12 @@ impl PendingSplitRefs {
                 }
                 result
             } else {
+                let flat_limit = session.member_flat_limit(final_file);
                 final_file.stream_packed_with_decoder(
                     &mut reader,
                     keys,
                     &mut session.decoder,
-                    session.buffered_decode_limit,
+                    flat_limit,
                     &mut counting,
                 )
             };
@@ -2064,9 +2401,11 @@ impl PendingSplitRefs {
                         && is_streaming_filter_bail(&error) =>
                 {
                     // Buffered retry below; a non-solid member must not see
-                    // state the failed stream may have left behind.
+                    // state the failed stream may have left behind. Through
+                    // `fresh_decoder` so the retry (and every later member)
+                    // keeps the caller's window and worker limits.
                     if !solid {
-                        session.decoder = Unpack50Decoder::new();
+                        session.decoder = session.fresh_decoder();
                     }
                 }
                 Err(error) => return Err(final_file.entry_error("decoding", error)),
@@ -2097,35 +2436,19 @@ impl PendingSplitRefs {
         let mut crc = Crc32::new();
         let mut hash = streaming_hash_verifier(final_file)?;
         let mut written = 0u64;
-        let mut buf = [0u8; 64 * 1024];
 
-        loop {
-            let count = reader.read(&mut buf)?;
-            if count == 0 {
-                break;
-            }
-            let chunk = if final_file.encrypted {
-                let remaining = usize::try_from(final_file.unpacked_size.saturating_sub(written))
-                    .unwrap_or(usize::MAX);
-                let chunk_len = count.min(remaining);
-                if buf[chunk_len..count].iter().any(|&byte| byte != 0) {
-                    return Err(Error::InvalidHeader(
-                        "RAR 5 encrypted stored split file has non-zero padding",
-                    ));
-                }
-                &buf[..chunk_len]
-            } else {
-                &buf[..count]
-            };
-            written = written
-                .checked_add(chunk.len() as u64)
-                .ok_or(Error::InvalidHeader("RAR 5 stored split size overflows"))?;
-            crc.update(chunk);
-            if let Some((_, hasher)) = &mut hash {
-                hasher.update(chunk);
-            }
-            writer.write_all(chunk)?;
-        }
+        // Same bounded pipeline as the non-split stored path; the split
+        // caller wraps every error as "extracting", so the per-chunk
+        // operation label is dropped rather than double-wrapped.
+        pipe_stored_chunks(
+            &mut *reader,
+            Error::from,
+            |buf| {
+                final_file
+                    .consume_stored_chunk(buf, &mut written, &mut crc, &mut hash, writer)
+                    .map_err(|(_operation, error)| error)
+            },
+        )?;
 
         if written != final_file.unpacked_size {
             return Err(Error::InvalidHeader(
@@ -2199,7 +2522,14 @@ impl PendingSplitRefs {
         volumes: &'a [Archive],
         decryptor: Option<&SplitDecryptor>,
     ) -> Result<Box<dyn Read + Send + 'a>> {
-        let mut readers = Vec::with_capacity(self.fragments.len());
+        // Fragment METADATA validates eagerly (a missing volume or entry
+        // still surfaces before any output is written), but at most ONE
+        // fragment is OPEN at a time: a file-backed range reader holds a
+        // descriptor, and opening every fragment up front exhausted the
+        // default 256-descriptor limit on real p99 sets (500-1,200
+        // volumes). The single decrypting reader stays OUTSIDE the lazy
+        // sequence so CBC state runs unbroken across fragment seams.
+        let mut fragments = Vec::with_capacity(self.fragments.len());
         for &(volume_index, file_index) in &self.fragments {
             let archive = volumes
                 .get(volume_index)
@@ -2208,9 +2538,14 @@ impl PendingSplitRefs {
                 .files()
                 .nth(file_index)
                 .ok_or(Error::InvalidHeader("RAR 5 split entry is missing"))?;
-            readers.push(archive.range_reader(file.block.data_range.clone())?);
+            fragments.push((volume_index, file.block.data_range.clone()));
         }
-        let chained = ChainedReader::new(readers);
+        let chained = LazyChainedReader {
+            volumes,
+            fragments,
+            next: 0,
+            current: None,
+        };
         if let Some(decryptor) = decryptor {
             Ok(Box::new(Rar50DecryptingReader::new(
                 chained,
@@ -2219,6 +2554,41 @@ impl PendingSplitRefs {
             )))
         } else {
             Ok(Box::new(chained))
+        }
+    }
+}
+
+/// Sequential reader over a split entry's fragments that opens each
+/// fragment only when the previous one is exhausted, and drops it before
+/// opening the next - one descriptor in flight regardless of volume
+/// count. An open failure surfaces at the seam it belongs to, as an
+/// ordinary read error.
+struct LazyChainedReader<'a> {
+    volumes: &'a [Archive],
+    /// (volume index, data range), validated at construction.
+    fragments: Vec<(usize, std::ops::Range<usize>)>,
+    next: usize,
+    current: Option<Box<dyn Read + Send + 'a>>,
+}
+
+impl Read for LazyChainedReader<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if let Some(reader) = self.current.as_mut() {
+                let read = reader.read(out)?;
+                if read != 0 {
+                    return Ok(read);
+                }
+                self.current = None;
+            }
+            let Some((volume_index, range)) = self.fragments.get(self.next) else {
+                return Ok(0);
+            };
+            self.next += 1;
+            let reader = self.volumes[*volume_index]
+                .range_reader(range.clone())
+                .map_err(std::io::Error::other)?;
+            self.current = Some(reader);
         }
     }
 }
@@ -2324,30 +2694,21 @@ impl<R: Read> Rar50DecryptingReader<R> {
     }
 
     fn fill_buffer(&mut self) -> std::io::Result<bool> {
-        let mut read = 0;
-        while read < self.buffer.len() {
-            let count = self.inner.read(&mut self.buffer[read..])?;
-            if count == 0 {
-                break;
-            }
-            read += count;
-        }
+        let read = fill_ciphertext(&mut self.inner, &mut self.buffer)?;
         if read == 0 {
             return Ok(false);
         }
-        if !read.is_multiple_of(16) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "truncated RAR 5 encrypted stream",
-            ));
-        }
-        self.cipher
-            .decrypt_in_place(&mut self.buffer[..read])
-            .map_err(super::map_rar50_crypto_error)
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+        decrypt_slice(&mut self.cipher, &mut self.buffer[..read])?;
         self.pos = 0;
         self.len = read;
         Ok(true)
+    }
+
+    fn drain_buffered(&mut self, out: &mut [u8]) -> usize {
+        let count = out.len().min(self.len - self.pos);
+        out[..count].copy_from_slice(&self.buffer[self.pos..self.pos + count]);
+        self.pos += count;
+        count
     }
 }
 
@@ -2356,14 +2717,57 @@ impl<R: Read> Read for Rar50DecryptingReader<R> {
         if out.is_empty() {
             return Ok(0);
         }
-        if self.pos == self.len && !self.fill_buffer()? {
+        // Leftover plaintext from an earlier sub-block request goes out
+        // first, so direct reads never reorder against the window.
+        if self.pos < self.len {
+            return Ok(self.drain_buffered(out));
+        }
+        let direct = out.len() & !15;
+        if direct == 0 {
+            // Sub-block request: decrypt a whole window internally and
+            // serve from it.
+            if !self.fill_buffer()? {
+                return Ok(0);
+            }
+            return Ok(self.drain_buffered(out));
+        }
+        // Whole AES blocks decrypt straight into the caller's buffer - the
+        // internal window would only add a plaintext copy per byte.
+        let read = fill_ciphertext(&mut self.inner, &mut out[..direct])?;
+        if read == 0 {
             return Ok(0);
         }
-        let count = out.len().min(self.len - self.pos);
-        out[..count].copy_from_slice(&self.buffer[self.pos..self.pos + count]);
-        self.pos += count;
-        Ok(count)
+        decrypt_slice(&mut self.cipher, &mut out[..read])?;
+        Ok(read)
     }
+}
+
+fn decrypt_slice(cipher: &mut Rar50Cipher, data: &mut [u8]) -> std::io::Result<()> {
+    cipher
+        .decrypt_in_place(data)
+        .map_err(super::map_rar50_crypto_error)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+}
+
+/// Read ciphertext into `target` until it is full or the stream ends,
+/// riding across short reads (fragment seams deliver them). The total must
+/// end AES-block aligned; a trailing partial block is a truncated stream.
+fn fill_ciphertext(inner: &mut dyn Read, target: &mut [u8]) -> std::io::Result<usize> {
+    let mut read = 0;
+    while read < target.len() {
+        let count = inner.read(&mut target[read..])?;
+        if count == 0 {
+            break;
+        }
+        read += count;
+    }
+    if read != 0 && !read.is_multiple_of(16) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "truncated RAR 5 encrypted stream",
+        ));
+    }
+    Ok(read)
 }
 
 #[cfg(test)]
@@ -2421,6 +2825,263 @@ mod tests {
         }
 
         assert_eq!(out, plain);
+    }
+
+    /// Delivers its data in caller-visible chunks of at most the scheduled
+    /// sizes, cycling the schedule - a stand-in for fragment seams and
+    /// short network reads, including seams inside an AES block.
+    struct ShortReader {
+        data: Vec<u8>,
+        pos: usize,
+        sizes: Vec<usize>,
+        next: usize,
+    }
+
+    impl Read for ShortReader {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos == self.data.len() {
+                return Ok(0);
+            }
+            let step = self.sizes[self.next % self.sizes.len()];
+            self.next += 1;
+            let count = out.len().min(step).min(self.data.len() - self.pos);
+            out[..count].copy_from_slice(&self.data[self.pos..self.pos + count]);
+            self.pos += count;
+            Ok(count)
+        }
+    }
+
+    fn cipher_fixture(len: usize) -> (Vec<u8>, Vec<u8>, [u8; 32], [u8; 16]) {
+        assert!(len.is_multiple_of(16));
+        let key = [7u8; 32];
+        let iv = [9u8; 16];
+        let plain: Vec<u8> = (0..len).map(|index| (index * 31 % 251) as u8).collect();
+        let mut encrypted = plain.clone();
+        Rar50Cipher::new(key, iv)
+            .encrypt_in_place(&mut encrypted)
+            .unwrap();
+        (plain, encrypted, key, iv)
+    }
+
+    fn read_with_pattern(reader: &mut dyn Read, pattern: &[usize]) -> std::io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut next = 0;
+        loop {
+            let size = pattern[next % pattern.len()];
+            next += 1;
+            let mut buf = vec![0u8; size];
+            let count = reader.read(&mut buf)?;
+            if count == 0 {
+                return Ok(out);
+            }
+            out.extend_from_slice(&buf[..count]);
+        }
+    }
+
+    #[test]
+    fn decrypting_reader_matches_reference_across_read_patterns() {
+        let (plain, encrypted, key, iv) = cipher_fixture(160 * 16);
+        let patterns: &[&[usize]] = &[
+            &[1],
+            &[2],
+            &[15],
+            &[16],
+            &[20],
+            &[33],
+            &[64],
+            &[1024],
+            &[plain.len()],
+            // Mixed sub-block and direct requests: leftovers from the
+            // internal window must drain before any direct decryption.
+            &[5, 1024, 3, 64, 1, 16],
+            &[15, 4096, 7],
+        ];
+        for pattern in patterns {
+            let mut reader =
+                Rar50DecryptingReader::new(Cursor::new(encrypted.clone()), key, iv);
+            let out = read_with_pattern(&mut reader, pattern).unwrap();
+            assert_eq!(out, plain, "pattern {pattern:?}");
+        }
+    }
+
+    #[test]
+    fn decrypting_reader_survives_short_reads_and_mid_block_seams() {
+        let (plain, encrypted, key, iv) = cipher_fixture(64 * 16);
+        for sizes in [vec![1], vec![7], vec![10, 7, 1, 30], vec![15, 17]] {
+            let inner = ShortReader {
+                data: encrypted.clone(),
+                pos: 0,
+                sizes: sizes.clone(),
+                next: 0,
+            };
+            let mut reader = Rar50DecryptingReader::new(inner, key, iv);
+            let out = read_with_pattern(&mut reader, &[600]).unwrap();
+            assert_eq!(out, plain, "underlying sizes {sizes:?}");
+        }
+    }
+
+    #[test]
+    fn decrypting_reader_rejects_truncated_ciphertext_on_both_paths() {
+        let (_, encrypted, key, iv) = cipher_fixture(16 * 16);
+        let truncated = &encrypted[..encrypted.len() - 8];
+
+        // Direct path: whole-block request.
+        let mut reader = Rar50DecryptingReader::new(Cursor::new(truncated.to_vec()), key, iv);
+        let err = read_with_pattern(&mut reader, &[4096]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+
+        // Buffered path: sub-block requests.
+        let mut reader = Rar50DecryptingReader::new(Cursor::new(truncated.to_vec()), key, iv);
+        let err = read_with_pattern(&mut reader, &[5]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn decrypting_reader_returns_zero_at_eof_on_both_paths() {
+        let (plain, encrypted, key, iv) = cipher_fixture(4 * 16);
+        let mut reader = Rar50DecryptingReader::new(Cursor::new(encrypted), key, iv);
+        let out = read_with_pattern(&mut reader, &[32]).unwrap();
+        assert_eq!(out, plain);
+        assert_eq!(reader.read(&mut [0u8; 64]).unwrap(), 0);
+        assert_eq!(reader.read(&mut [0u8; 5]).unwrap(), 0);
+    }
+
+    fn two_fragment_split(
+        payload: &[u8],
+        encrypted: bool,
+        unpacked_size: u64,
+        crc: Option<u32>,
+    ) -> (PendingSplitRefs, FileHeader, Vec<Archive>) {
+        let half = payload.len() / 2;
+        let mut first = split_fragment_file(b"a.txt", HFL_SPLIT_AFTER);
+        first.block.data_range = 0..half;
+        first.block.data_size = Some(half as u64);
+        first.encrypted = encrypted;
+        let mut second = split_fragment_file(b"a.txt", HFL_SPLIT_BEFORE);
+        second.block.data_range = 0..payload.len() - half;
+        second.block.data_size = Some((payload.len() - half) as u64);
+        second.encrypted = encrypted;
+        second.unpacked_size = unpacked_size;
+        second.data_crc32 = crc;
+        let final_file = second.clone();
+        let mut pending = PendingSplitRefs::new(&first, 0, 0);
+        pending.append(1, 0);
+        let volumes = vec![
+            archive_with_blocks(vec![Block::File(first)], payload[..half].to_vec()),
+            archive_with_blocks(vec![Block::File(second)], payload[half..].to_vec()),
+        ];
+        (pending, final_file, volumes)
+    }
+
+    #[test]
+    fn stored_split_pipeline_reports_writer_failure_without_deadlock() {
+        struct FailingWriter;
+
+        impl Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("sink failed"))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // Larger than the whole buffer pool, so the producer is still
+        // sending when the consumer stops on the first write failure. A
+        // producer blocked on a full data channel would deadlock the
+        // thread-scope teardown; the timeout turns that into a failure.
+        let payload = vec![0x5Au8; 8 << 20];
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (pending, final_file, volumes) =
+                two_fragment_split(&payload, false, payload.len() as u64, None);
+            let outcome = pending
+                .write_stored_to(&volumes, &final_file, None, &mut FailingWriter)
+                .map_err(|error| error.to_string());
+            let _ = done_tx.send(outcome);
+        });
+
+        let outcome = done_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("split stored pipeline deadlocked on early writer failure");
+        let error = outcome.expect_err("writer failure must surface");
+        assert!(error.contains("sink failed"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn stored_pipeline_reports_writer_failure_without_deadlock() {
+        struct FailingWriter;
+
+        impl Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("sink failed"))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // The non-split twin of the split test below: same pipeline, same
+        // parked-producer hazard on an early writer failure.
+        let payload = vec![0xA5u8; 8 << 20];
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut file = plain_file(b"big.bin", &payload, None);
+            file.block.data_range = 0..payload.len();
+            file.block.data_size = Some(payload.len() as u64);
+            let archive = archive_with_blocks(vec![Block::File(file.clone())], payload);
+            let outcome = file
+                .write_stored_to(&archive, None, &mut FailingWriter)
+                .map_err(|error| error.to_string());
+            let _ = done_tx.send(outcome);
+        });
+
+        let outcome = done_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("stored pipeline deadlocked on early writer failure");
+        let error = outcome.expect_err("writer failure must surface");
+        assert!(error.contains("sink failed"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn stored_split_rejects_nonzero_encrypted_padding() {
+        let mut payload = b"encrypted split payload!".repeat(4);
+        let logical = payload.len() as u64 - 6;
+        let last = payload.len() - 1;
+        payload[last] = 1; // non-zero pad byte
+        let (pending, final_file, volumes) =
+            two_fragment_split(&payload, true, logical, None);
+
+        let mut out: Vec<u8> = Vec::new();
+        let err = pending
+            .write_stored_to(&volumes, &final_file, None, &mut out)
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidHeader(msg) if msg.contains("non-zero padding")),
+            "expected padding rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn stored_split_trims_zero_encrypted_padding_and_verifies_crc() {
+        let payload = b"encrypted split payload!".repeat(4);
+        let logical = payload.len() - 6;
+        let mut padded = payload[..logical].to_vec();
+        padded.resize(payload.len(), 0);
+        let (pending, final_file, volumes) = two_fragment_split(
+            &padded,
+            true,
+            logical as u64,
+            Some(crc32(&padded[..logical])),
+        );
+
+        let mut out: Vec<u8> = Vec::new();
+        pending
+            .write_stored_to(&volumes, &final_file, None, &mut out)
+            .unwrap();
+        assert_eq!(out, &padded[..logical]);
     }
 
     #[test]
@@ -3120,6 +3781,55 @@ mod tests {
         file.compression_info = 0x180;
         file.unpacked_size = unpacked_size;
         file
+    }
+
+    /// A panic in the coordinator still lets `thread::scope` return.
+    ///
+    /// This one DOES reproduce: revert the `PoolAbortGuard` and it fails on the
+    /// timeout below rather than passing. The feeder charges the first member,
+    /// parks in `cvar.wait` because the budget is now full, and the panic
+    /// unwinds past the abort-and-notify that used to sit at the foot of the
+    /// scope - so nothing ever wakes it and the join never completes. The panic
+    /// is raised from the caller's `open`, which is the shortest route to it;
+    /// the `Write` impl and the coordinator's own inline decode reach the same
+    /// place.
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn a_coordinator_panic_does_not_hang_the_member_pool() {
+        let member = BUFFERED_DECODE_LIMIT;
+        let count = (POOL_INFLIGHT_BUDGET / member + 2) as usize;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let blocks = (0..count)
+                .map(|index| {
+                    Block::File(truncated_pooled_file(
+                        format!("m{index}.bin").as_bytes(),
+                        member,
+                    ))
+                })
+                .collect();
+            let volumes = vec![archive_with_blocks(blocks, Vec::new())];
+            // Deliberate panic inside the coordinator, standing in for any of
+            // open / Write / inline decode blowing up. AssertUnwindSafe: the
+            // borrows do not outlive the catch.
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                extract_volumes_to(
+                    &volumes,
+                    crate::ArchiveReadOptions::default(),
+                    |_meta| -> Result<Box<dyn Write>> { panic!("open panicked") },
+                )
+            }))
+            .is_err();
+            let _ = done_tx.send(panicked);
+        });
+
+        match done_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(panicked) => assert!(panicked, "the coordinator panic must propagate"),
+            Err(_) => panic!(
+                "pooled extraction did not return within 30s - the feeder is parked on the \
+                 budget condvar and the scoped join is deadlocked"
+            ),
+        }
     }
 
     #[test]

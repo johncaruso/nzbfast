@@ -13,7 +13,19 @@
 //! line, so the budget is further capped at half of it. The `--mem-limit`
 //! flag overrides.
 
-/// Physical RAM in bytes (unix: sysconf pages × page size).
+/// Physical RAM in bytes (unix: sysconf pages × page size; Windows:
+/// GlobalMemoryStatusEx).
+///
+/// The Windows arm is not cosmetic. This returning None is what
+/// [`MemBudget::auto_total`] falls back to, and its fallback is a flat
+/// 1 GB - so for as long as this was unix-only, EVERY Windows install ran
+/// the whole pipeline on a 1 GB budget no matter how much RAM the machine
+/// had, where a 32 GB box should get 8. The budget only decides when each
+/// tier spills to disk, so nothing broke; Windows just did far more disk
+/// I/O than it needed to, silently, and `concurrency_caps_for` could not
+/// see a small box either. `ullTotalPhys` is the right analogue of
+/// `_SC_PHYS_PAGES`: both report USABLE physical memory rather than what is
+/// physically installed.
 pub fn physical_ram() -> Option<u64> {
     #[cfg(unix)]
     unsafe {
@@ -21,6 +33,75 @@ pub fn physical_ram() -> Option<u64> {
         let page = libc::sysconf(libc::_SC_PAGE_SIZE);
         if pages > 0 && page > 0 {
             return Some(pages as u64 * page as u64);
+        }
+    }
+    #[cfg(windows)]
+    unsafe {
+        // MEMORYSTATUSEX (sysinfoapi.h): two DWORD then seven DWORDLONG.
+        // `dwLength` must be the struct's own size before the call.
+        #[repr(C)]
+        struct MemoryStatusEx {
+            length: u32,
+            memory_load: u32,
+            total_phys: u64,
+            avail_phys: u64,
+            total_page_file: u64,
+            avail_page_file: u64,
+            total_virtual: u64,
+            avail_virtual: u64,
+            avail_extended_virtual: u64,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+        }
+        let mut st: MemoryStatusEx = std::mem::zeroed();
+        st.length = std::mem::size_of::<MemoryStatusEx>() as u32;
+        if GlobalMemoryStatusEx(&mut st) != 0 && st.total_phys > 0 {
+            return Some(st.total_phys);
+        }
+    }
+    None
+}
+
+/// This process's memory counters from kernel32, in bytes: (peak working
+/// set, current working set).
+///
+/// The Windows stand-in for `getrusage`'s `ru_maxrss` and `/proc/self/statm`.
+/// `K32GetProcessMemoryInfo` is the kernel32 export of psapi's
+/// `GetProcessMemoryInfo`, used so this needs no extra import library -
+/// same reasoning as [`opt_out_of_power_throttling`] linking kernel32
+/// directly.
+#[cfg(windows)]
+fn process_memory_counters() -> Option<(u64, u64)> {
+    // PROCESS_MEMORY_COUNTERS (psapi.h): two DWORD then eight SIZE_T.
+    #[repr(C)]
+    struct ProcessMemoryCounters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn K32GetProcessMemoryInfo(
+            process: isize,
+            counters: *mut ProcessMemoryCounters,
+            cb: u32,
+        ) -> i32;
+    }
+    unsafe {
+        let mut c: ProcessMemoryCounters = std::mem::zeroed();
+        c.cb = std::mem::size_of::<ProcessMemoryCounters>() as u32;
+        if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) != 0 {
+            return Some((c.peak_working_set_size as u64, c.working_set_size as u64));
         }
     }
     None
@@ -172,6 +253,28 @@ impl MemBudget {
     pub fn repair_cap(&self) -> u64 {
         (self.total / 4).clamp(8 << 20, 512 << 20)
     }
+
+    /// RAR extraction's execution policy: how much working memory the rars
+    /// decode pipelines may plan with (flat buffers vs the bounded ring,
+    /// worker counts). A quarter of the budget, floored so ordinary archives
+    /// keep their fast paths on small hosts and capped because flat buffers
+    /// beyond a few GB stop paying. Extraction overlaps the download
+    /// pipeline (chase extraction decodes while later volumes arrive), so
+    /// this deliberately shares the budget rather than assuming the cache
+    /// tiers have drained.
+    pub fn rar_execution_policy(&self) -> rars::Rar50ExecutionPolicy {
+        rars::Rar50ExecutionPolicy::from_working_memory((self.total / 4).clamp(96 << 20, 6 << 30))
+    }
+}
+
+/// Read options for a production RAR extraction: the caller's password plus
+/// the process budget's execution policy. Every nzbfast/nzbkit extraction
+/// entry point goes through this so a memory-constrained host never selects
+/// a flat plan it cannot afford and a big host may exceed rars' built-in
+/// flat cap.
+pub fn rar_read_options(password: Option<&[u8]>) -> rars::ArchiveReadOptions<'_> {
+    rars::ArchiveReadOptions::with_optional_password(password)
+        .with_rar50_execution_policy(process_budget().rar_execution_policy())
 }
 
 /// The budget this process resolved at startup, in bytes; 0 until set.
@@ -247,7 +350,8 @@ fn concurrency_caps_for(ram: Option<u64>, cgroup_limit: Option<u64>) -> Option<C
 }
 
 /// Peak resident set size of this process in bytes (getrusage; Linux
-/// reports KB, macOS bytes). The number benchmarks quote.
+/// reports KB, macOS bytes; Windows: peak working set). The number
+/// benchmarks quote.
 pub fn peak_rss() -> Option<u64> {
     #[cfg(unix)]
     unsafe {
@@ -257,13 +361,27 @@ pub fn peak_rss() -> Option<u64> {
             return Some(if cfg!(target_os = "linux") { raw * 1024 } else { raw });
         }
     }
+    #[cfg(windows)]
+    {
+        return process_memory_counters().map(|(peak, _)| peak);
+    }
+    #[cfg(not(windows))]
     None
 }
 
 /// CURRENT resident set size in bytes - the live number the dashboard's
 /// resource chart tracks (peak_rss only ever goes up). macOS: mach
-/// task_info; Linux: /proc/self/statm; elsewhere falls back to the peak.
+/// task_info; Linux: /proc/self/statm; Windows: current working set;
+/// elsewhere falls back to the peak.
 pub fn current_rss() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        // Not `peak_rss()`'s fallback: the chart is a LIVE reading, and the
+        // peak never comes back down.
+        if let Some((_, cur)) = process_memory_counters() {
+            return Some(cur);
+        }
+    }
     #[cfg(target_os = "macos")]
     unsafe {
         // struct mach_task_basic_info (mach/task_info.h): three
@@ -400,6 +518,38 @@ pub fn cpu_time_secs() -> Option<f64> {
             );
         }
     }
+    #[cfg(windows)]
+    unsafe {
+        // FILETIME pairs, 100-nanosecond units. Creation and exit times are
+        // wall clock and not what this wants; kernel + user is the charge.
+        #[repr(C)]
+        #[derive(Default)]
+        struct FileTime {
+            low: u32,
+            high: u32,
+        }
+        impl FileTime {
+            fn secs(&self) -> f64 {
+                (((self.high as u64) << 32) | self.low as u64) as f64 / 1e7
+            }
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> isize;
+            fn GetProcessTimes(
+                process: isize,
+                creation: *mut FileTime,
+                exit: *mut FileTime,
+                kernel: *mut FileTime,
+                user: *mut FileTime,
+            ) -> i32;
+        }
+        let (mut c, mut e, mut k, mut u) =
+            (FileTime::default(), FileTime::default(), FileTime::default(), FileTime::default());
+        if GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u) != 0 {
+            return Some(k.secs() + u.secs());
+        }
+    }
     None
 }
 
@@ -509,6 +659,34 @@ mod tests {
         assert!(a >= 0.0 && b >= a);
     }
 
+    /// Qualitative pins for the RAR execution policy, not exact numbers: a
+    /// small host must stay on bounded modes, a big one must be allowed
+    /// past rars' built-in 256 MiB flat cap, and more budget never yields a
+    /// strictly smaller allowance.
+    #[test]
+    fn rar_execution_policy_scales_with_budget() {
+        // A 256 MiB total budget must not admit a ~245 MiB flat plan: the
+        // flat cap lands well under the plan.
+        let small = MemBudget::with_total(256 << 20).rar_execution_policy();
+        assert!(small.flat_output_limit < 200 << 20, "{small:?}");
+        assert!(small.max_workers <= 2, "{small:?}");
+
+        // A 16 GB budget clears the built-in 256 MiB chain cap.
+        let large = MemBudget::with_total(16 << 30).rar_execution_policy();
+        assert!(large.flat_output_limit > 256 << 20, "{large:?}");
+        assert!(large.max_workers >= 8, "{large:?}");
+
+        // Monotone: more budget never shrinks the allowances.
+        let mut previous = MemBudget::with_total(MemBudget::MIN).rar_execution_policy();
+        for shift in 27..36 {
+            let policy = MemBudget::with_total(1u64 << shift).rar_execution_policy();
+            assert!(policy.working_memory_limit >= previous.working_memory_limit);
+            assert!(policy.flat_output_limit >= previous.flat_output_limit);
+            assert!(policy.max_workers >= previous.max_workers);
+            previous = policy;
+        }
+    }
+
     #[test]
     fn trim_links_and_survives() {
         // Smoke: the platform symbol resolves and a burst of freed
@@ -520,3 +698,54 @@ mod tests {
         trim(); // idempotent on an already-trimmed heap
     }
 }
+
+/// Opt this process out of Windows 11 power throttling (EcoQoS).
+///
+/// Windows demotes sustained "background" CPU work - anything without a
+/// foreground window, which is exactly a daemon or an ssh-launched
+/// process - onto efficiency cores at reduced QoS a few seconds in.
+/// Measured on the i7-1280P: the GF(2^16) repair fold ran at 111 GB/s
+/// for ~3 s and then 13 GB/s for the rest of a heavy repair (the whole
+/// machine sat 66% idle). This opts out of execution-speed throttling
+/// while leaving priority CLASS alone, so we schedule normally instead
+/// of being parked, without starving anyone the way a raised priority
+/// would. No-op off Windows and on Windows versions without the API.
+#[cfg(windows)]
+pub fn opt_out_of_power_throttling() {
+    #[repr(C)]
+    struct PowerThrottlingState {
+        version: u32,
+        control_mask: u32,
+        state_mask: u32,
+    }
+    const VERSION: u32 = 1; // PROCESS_POWER_THROTTLING_CURRENT_VERSION
+    const EXECUTION_SPEED: u32 = 0x1; // PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+    const PROCESS_POWER_THROTTLING: i32 = 4; // PROCESS_INFORMATION_CLASS
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn SetProcessInformation(
+            process: isize,
+            class: i32,
+            info: *const core::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+    let state = PowerThrottlingState {
+        version: VERSION,
+        control_mask: EXECUTION_SPEED,
+        state_mask: 0, // control it, and set it OFF
+    };
+    // Failure (older Windows) just leaves the OS default in place.
+    unsafe {
+        SetProcessInformation(
+            GetCurrentProcess(),
+            PROCESS_POWER_THROTTLING,
+            &state as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<PowerThrottlingState>() as u32,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+pub fn opt_out_of_power_throttling() {}

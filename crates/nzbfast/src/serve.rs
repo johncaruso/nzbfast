@@ -602,7 +602,17 @@ async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
             j.nzb_path.clone(),
         )
     };
-    let exts = d.cleanup_exts.lock().unwrap().clone();
+    let exts = {
+        let mut e = d.cleanup_exts.lock().unwrap().clone();
+        // Spent recovery files go with the sidecar junk by default. Added
+        // here rather than swept separately so it inherits the sweep's
+        // ordering guarantees - in particular that the identity rungs
+        // read the .par2 sidecars BEFORE anything deletes them.
+        if d.par_cleanup.load(Ordering::Relaxed) && !e.iter().any(|x| x == "par2") {
+            e.push("par2".to_string());
+        }
+        e
+    };
     if done_ok {
         // Write the intent down BEFORE touching anything. Everything
         // below can move the payload out from under the recorded
@@ -1412,6 +1422,18 @@ pub struct Daemon {
     /// is now written through to settings.
     pub cats: Mutex<std::collections::BTreeSet<String>>,
     pub port: u16,
+    /// Per-start secret shared with the desktop wrapper through
+    /// `runtime.json` - see [`write_runtime_file`]. Never logged, never
+    /// sent: it is only ever hashed with a caller-supplied nonce, which is
+    /// what lets a wrapper tell this daemon from anything else holding the
+    /// port before it hands over the API key.
+    pub launcher_token: String,
+    /// The launcher owns the port, not the dashboard (see
+    /// [`port_locked`]). Set for a container, a compose service and the
+    /// Synology package, where the listening port is baked into a
+    /// published mapping, a healthcheck or DSM's own Open button, and a
+    /// saved override just makes the install unreachable.
+    pub port_locked: bool,
     pub library_cats: Mutex<Vec<String>>,
     /// nzo_id whose extractor the hub holds (the last real download started).
     pub active_stream: Mutex<Option<String>>,
@@ -1574,6 +1596,13 @@ pub struct Daemon {
     /// (first match wins) to pick the category, and remembered per-job
     /// for TV filing at completion.
     pub smart_folders: Mutex<Vec<crate::smart::Rule>>,
+    /// Delete a job's .par2 recovery files once it completes and
+    /// verifies. Default ON: recovery data is spent the moment the
+    /// payload proves intact, and both major clients remove it, so
+    /// leaving it reads as a bug ("this NZB is leaving PAR files
+    /// behind"). Implemented as an implicit extra entry in the
+    /// `cleanup_exts` sweep, so it inherits that sweep's guards.
+    pub par_cleanup: AtomicBool,
     /// M23 cleanup rules - file extensions deleted from a job's folder
     /// after successful completion. Empty = off.
     pub cleanup_exts: Mutex<Vec<String>>,
@@ -2993,12 +3022,25 @@ fn timed_pause(d: &Arc<Daemon>, mins: u64, graceful: bool) {
     d.paused.store(true, Ordering::Relaxed);
     // M23e: also stop the transfer that's in flight, not just new jobs.
     d.suspend_active(graceful);
-    let my_gen = d.pause_gen.fetch_add(1, Ordering::Relaxed) + 1;
     if mins == 0 {
+        // Still bump the generation: a plain pause has to cancel any
+        // auto-resume a previous timed pause left pending.
+        d.pause_gen.fetch_add(1, Ordering::Relaxed);
         *d.pause_until.lock().unwrap() = None;
-        return;
+    } else {
+        arm_pause_timer(d, std::time::Duration::from_secs(mins * 60));
     }
-    let dur = std::time::Duration::from_secs(mins * 60);
+    persist_pause(d);
+}
+
+/// Arm the auto-resume timer for a pause that is ALREADY in effect.
+///
+/// Split out of `timed_pause` so a pause restored at startup can run out
+/// the time it has left rather than a fresh full interval, and so it can
+/// take a Duration - a pause with 90 seconds to go does not round to a
+/// whole number of minutes.
+fn arm_pause_timer(d: &Arc<Daemon>, dur: std::time::Duration) {
+    let my_gen = d.pause_gen.fetch_add(1, Ordering::Relaxed) + 1;
     *d.pause_until.lock().unwrap() = Some(Instant::now() + dur);
     let d = d.clone();
     std::thread::spawn(move || {
@@ -3006,9 +3048,79 @@ fn timed_pause(d: &Arc<Daemon>, mins: u64, graceful: bool) {
         if d.pause_gen.load(Ordering::Relaxed) == my_gen {
             d.paused.store(false, Ordering::Relaxed);
             *d.pause_until.lock().unwrap() = None;
+            persist_pause(&d);
             println!("[pause] timed pause over - resumed");
         }
     });
+}
+
+/// Record the queue's pause state so it survives a restart.
+///
+/// A pause is a deliberate act - a metered week, a call in progress, a
+/// benchmark running - and an update or a crash-restart used to undo it
+/// silently, with the queue back at full speed and nothing on screen
+/// saying the user's choice had been dropped.
+///
+/// A timed pause is stored as an ABSOLUTE deadline, not "N minutes left".
+/// "Pause for 30 minutes" is a statement about when downloading may start
+/// again, so a daemon that is down for an hour must come back running,
+/// not sit out another half hour. `restore_pause` handles the deadline
+/// that passed while we were gone.
+///
+/// Called only from the paths that carry the user's intent. Notably NOT
+/// from `shutdown`/`restart_daemon`, which pause the queue as part of
+/// winding down - persisting that would mean every clean quit came back
+/// paused.
+fn persist_pause(d: &Daemon) {
+    let paused = d.paused.load(Ordering::Relaxed);
+    let until = d.pause_until.lock().unwrap().map(|deadline| {
+        // Instant is monotonic and process-local, so convert through the
+        // time REMAINING to get a wall-clock deadline we can write down.
+        unix_now() + deadline.saturating_duration_since(Instant::now()).as_secs() as i64
+    });
+    // Null removes the key: a running queue leaves nothing behind, so
+    // settings.json keeps holding only what the user actually changed.
+    save_settings(
+        &d.settings_path,
+        &[
+            ("paused", if paused { json!(true) } else { Value::Null }),
+            (
+                "pause_until_unix",
+                match until.filter(|_| paused) {
+                    Some(u) => json!(u),
+                    None => Value::Null,
+                },
+            ),
+        ],
+    );
+}
+
+/// Put back the pause the last run was in, at startup.
+///
+/// Runs BEFORE the scheduler's own startup evaluation, which is allowed
+/// to overrule it: a schedule is a standing rule about what should be
+/// true at this hour, and it already re-evaluates the whole week on boot
+/// for exactly that reason.
+fn restore_pause(d: &Arc<Daemon>, saved: &serde_json::Map<String, Value>) {
+    if saved.get("paused").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
+    let Some(deadline) = saved.get("pause_until_unix").and_then(Value::as_i64) else {
+        d.paused.store(true, Ordering::Relaxed);
+        println!("[pause] restored: queue paused");
+        return;
+    };
+    let left = deadline - unix_now();
+    if left <= 0 {
+        // The auto-resume fell due while the daemon was down. Honour it:
+        // start running, and clear the keys so we don't re-read them.
+        println!("[pause] timed pause expired while stopped - resumed");
+        persist_pause(d);
+        return;
+    }
+    d.paused.store(true, Ordering::Relaxed);
+    arm_pause_timer(d, std::time::Duration::from_secs(left as u64));
+    println!("[pause] restored: paused, {} min left", (left + 59) / 60);
 }
 
 /// M14g3: one 1 Hz auto-speed control step (LEDBAT-flavoured AIMD).
@@ -3979,8 +4091,8 @@ impl Daemon {
             .any(nzbkit::zip::name_is_zip_shaped);
         if zip_packed {
             println!(
-                "[queue] {nzo_id} looks zip-packed - zip extraction is not built in, \
-                 so this post will arrive still packed"
+                "[queue] {nzo_id} looks zip-packed - store and deflate zips unpack \
+                 natively; an encrypted one, or an exotic codec, will arrive packed"
             );
         }
         // Named after the release as well as the job id. A folder of
@@ -4249,7 +4361,12 @@ impl Daemon {
         let mut best: Option<((bool, i32), Arc<Mutex<Job>>)> = None;
         for j in q.iter() {
             let g = j.lock().unwrap();
-            if g.paused || g.state != JobState::Queued {
+            // A tombstoned job is deleted; nothing may start it again. The
+            // delete paths remove it from the queue themselves, so this is
+            // the defensive invariant behind them rather than the mechanism -
+            // it is what stops a job whose payload and spooled .nzb have
+            // already been unlinked from running one more time.
+            if g.paused || g.tombstone || g.state != JobState::Queued {
                 continue;
             }
             if queue_paused && g.priority < 2 {
@@ -4353,7 +4470,14 @@ impl Daemon {
                 eprintln!(
                     "[failurelink] {}: refusing {} - it does not point back at {} (the indexer that supplied it)",
                     j.name,
-                    j.failure_link,
+                    // The X-DNZB-Failure endpoint is the indexer's own URL and
+                    // carries its key - and this line fires exactly on a host
+                    // mismatch, which in practice is an indexer serving the
+                    // link from a CDN alias with ?apikey= attached. stdout is
+                    // not private (logtee mirrors it into mode=log, the
+                    // JSON-RPC log methods and `docker logs`), so redact here
+                    // like the accept path below already does.
+                    redact_url_creds(&j.failure_link),
                     if j.failure_host.is_empty() { "the origin" } else { &j.failure_host }
                 );
                 return;
@@ -4497,13 +4621,12 @@ impl Daemon {
     /// not lost - mode=retry sends them back through the queue and the
     /// journal resumes from what already landed).
     fn park(&self, job: Arc<Mutex<Job>>) {
-        let (id, failed, key, tombstone, demote) = {
+        let (id, failed, key, demote) = {
             let g = job.lock().unwrap();
             (
                 g.nzo_id.clone(),
                 g.state == JobState::Failed,
                 g.dupe_key.clone(),
-                g.tombstone,
                 g.demote,
             )
         };
@@ -4517,16 +4640,29 @@ impl Daemon {
                 let suffix = delete_suffix(&g, || self.job_suffix(filed_stem(&g)));
                 remove_job_files(&g.out_dir, filed_stem(&g), g.filed, &suffix);
             }
-            if tombstone {
+            if g.tombstone {
                 let _ = std::fs::remove_file(&g.nzb_path);
             }
         }
         self.queue.lock().unwrap().retain(|j| j.lock().unwrap().nzo_id != id);
+        // Read LIVE, not from the snapshot above: everything between the two
+        // is unlocked, and file removal is slow. A queue or JSON-RPC delete
+        // landing in that window used to be decided against a stale
+        // `tombstone == false`, so the deleted job was requeued (demote arm),
+        // filed into history, or had an alternative promoted for a cancel the
+        // user had just made. Every terminal branch below re-reads it.
+        let tombstone = job.lock().unwrap().tombstone;
         // Watchdog demotion: back into the queue (deferred, at the end)
         // instead of history - the abort was ours, not a failure. The
         // journal keeps everything already landed, so the eventual rerun
         // fetches only what's still missing.
-        if demote {
+        // `!tombstone`: a deleted job stays deleted. Both flags together is
+        // an ordinary race - the slow-job watchdog demotes at T, the user (or
+        // an *arr) deletes at T+ε - and the demote arm used to win, pushing
+        // the just-deleted job back onto the queue with its payload removed
+        // and its spooled .nzb already unlinked above. It then reappeared in
+        // the *arr, ran, and failed.
+        if demote && !tombstone {
             {
                 let mut g = job.lock().unwrap();
                 g.state = JobState::Queued;
@@ -4564,6 +4700,9 @@ impl Daemon {
                 secs.div_ceil(60)
             );
         }
+        // Re-read once more: the demote arm above returns, so this is the
+        // first point the history/promotion decisions are actually taken.
+        let tombstone = job.lock().unwrap().tombstone;
         if !tombstone {
             self.history.lock().unwrap().push(job);
         }
@@ -6327,6 +6466,73 @@ fn random_apikey() -> Option<String> {
     Some(hex::encode(buf))
 }
 
+/// `runtime.json`, beside `settings.json`: how a LAUNCHER tells this
+/// daemon apart from anything else that answers on the port.
+///
+/// The Mac wrapper and the Windows tray probe a port without a key (they
+/// must: sending it would hand the key, and with it `mode=server_secret`,
+/// to whatever bound the port first) and identify us from the reply
+/// alone. But an unauthenticated product string is not identity - any
+/// local process can print it, and on a shared desktop a second account
+/// can bind an unprivileged loopback port before we do, then receive the
+/// stored key on the next dashboard open.
+///
+/// So the wrapper reads a secret only OUR user can read, and the daemon
+/// proves it holds the same one: `mode=version&hs=<nonce>` answers with
+/// `hs_proof = sha256(token:nonce)`. The token never crosses the wire in
+/// either direction, so sending the challenge to an impostor tells it
+/// nothing, and a wrapper that gets no proof (or a wrong one) knows not
+/// to hand over the key.
+///
+/// `pid` is recorded for diagnostics and for a spawning wrapper that
+/// wants to bind its attach to the exact child it started. The file is
+/// 0600 through [`crate::persist::write_atomic`] (LocalAppData and
+/// Application Support are already user-only on the other two), and
+/// rewritten on every start, so a stale one from a crashed run is
+/// replaced rather than trusted - and the port it names is checked too.
+fn write_runtime_file(settings_path: &std::path::Path, port: u16, token: &str) {
+    let path = settings_path.with_file_name("runtime.json");
+    let body = json!({
+        "pid": std::process::id(),
+        "port": port,
+        "token": token,
+        "version": env!("CARGO_PKG_VERSION"),
+    });
+    // Best-effort, like every other state write here: a daemon that cannot
+    // write it still runs, and the wrappers fall back to the old
+    // reply-shape check (which is what an older daemon gives them anyway).
+    if let Err(e) = crate::persist::write_atomic(
+        &path,
+        serde_json::to_string(&body).unwrap_or_default().as_bytes(),
+    ) {
+        eprintln!(
+            "⚠ could not write {} ({e}) - the desktop wrapper will fall back to \
+             identifying this daemon by its reply alone",
+            path.display()
+        );
+    }
+}
+
+/// The launcher-handshake answer for a challenge, or None if the caller
+/// did not send one.
+///
+/// The nonce is bounded and charset-checked before it is hashed: it lands
+/// in a JSON response and comes from an unauthenticated caller.
+fn launcher_proof(token: &str, nonce: Option<&str>) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    if token.is_empty() {
+        return None; // see the mint site: no token, no answer
+    }
+    let nonce = nonce.filter(|n| {
+        (8..=128).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_alphanumeric())
+    })?;
+    let mut h = Sha256::new();
+    h.update(token.as_bytes());
+    h.update(b":");
+    h.update(nonce.as_bytes());
+    Some(hex::encode(h.finalize()))
+}
+
 /// First-run API key generation, for every launcher including the
 /// container. The Docker entrypoint used to carry a second copy of this
 /// (same file, same path, same resolution order); it now only pre-flights
@@ -6805,7 +7011,22 @@ fn apply_saved_settings(opts: &mut ServeOpts, path: &std::path::Path) {
     // validates 1-65535 before it connects) can never find. An
     // out-of-range value is ignored, keeping the CLI or default port.
     if let Some(v) = n("port").filter(|v| (1..=65535).contains(v)) {
-        opts.port = v as u16;
+        // Unless the launcher owns the port. The API refuses to save one
+        // in that case, so this only fires for a file carried over from a
+        // desktop install or hand-edited - and honouring it would move the
+        // listener away from a published mapping, a healthcheck or DSM's
+        // Open button, with nothing in the UI to explain where it went.
+        if port_locked() {
+            if v as u16 != opts.port {
+                println!(
+                    "[settings] ignoring saved port {v}: this installation's port is set by \
+                     how it was started ({}). Change the published/mapped port instead.",
+                    opts.port
+                );
+            }
+        } else {
+            opts.port = v as u16;
+        }
     }
     if let Some(v) = s("bind").filter(|v| !v.is_empty()) {
         opts.bind = v.to_string();
@@ -7150,6 +7371,29 @@ fn container_install() -> bool {
             // and the only way to exercise the container UI off a NAS.
             || std::env::var("NZBFAST_CONTAINER").is_ok_and(|v| v == "1")
     })
+}
+
+/// True when the LAUNCHER owns the listening port and the dashboard must
+/// not move it.
+///
+/// A saved `port` otherwise beats the `--port` flag on every later start,
+/// which is right for a desktop or a plain CLI install and wrong
+/// everywhere the port is baked in somewhere we cannot reach:
+///
+/// - a container publishes `6789:6789` and healthchecks that port, so an
+///   internal move makes the service unreachable AND unhealthy;
+/// - the Synology package bakes `adminport` at install time, so a move
+///   takes the listener away from DSM's own Open button;
+/// - a fixed system service or firewall rule has the same shape.
+///
+/// Detected from the environment rather than inferred from
+/// `container_install()`: an operator running the image with
+/// `--network host` and no published mapping legitimately owns their own
+/// port, and the entrypoint knows which case it is. The images and the
+/// SPK set it; nothing else does.
+fn port_locked() -> bool {
+    static LOCKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LOCKED.get_or_init(|| std::env::var("NZBFAST_PORT_LOCKED").is_ok_and(|v| v == "1"))
 }
 
 
@@ -8259,6 +8503,7 @@ const AUTOMATION: &[Setting] = &[
         serde_json::to_value(&*c.d.custom_categories.read().unwrap()).unwrap_or(json!([]))
     }),
     rw("cleanup_exts", |c| json!(c.d.cleanup_exts.lock().unwrap().clone())),
+    rw("par_cleanup", |c| json!(c.d.par_cleanup.load(Ordering::Relaxed))),
     // Never the token itself: it is the Plex token / Jellyfin API key /
     // Kodi `user:password`, and get_config is a read anyone with the key
     // can make from a browser. Same contract as has_password/has_apikey -
@@ -9208,6 +9453,11 @@ fn apply_setting(
             *d.cleanup_exts.lock().unwrap() = list.clone();
             (true, json!(list))
         }
+        "par_cleanup" => {
+            let on = flag();
+            d.par_cleanup.store(on, Ordering::Relaxed);
+            (true, json!(on))
+        }
         "custom_categories" => {
             // TODO 24D: JSON array of user categories (slug, name, match
             // rules, base behavior). Validated as a whole - a reserved or
@@ -9281,6 +9531,18 @@ fn apply_setting(
             let p = uint()?;
             if !(1..=65535).contains(&p) {
                 return Err("port must be 1-65535".into());
+            }
+            // Refused, not silently ignored: saving a port this
+            // installation will never bind is how a container ends up
+            // unreachable through its published mapping with the UI still
+            // claiming the change took.
+            if d.port_locked {
+                return Err(
+                    "this installation's port is set by how it was started (a container's \
+                     published port, or the Synology package's own setting), so it can't be \
+                     changed here. Change it where the port is published instead."
+                        .into(),
+                );
             }
             (false, json!(p))
         }
@@ -9397,6 +9659,36 @@ fn apply_setting(
     })
 }
 
+/// [`apply_setting`] and its persistence as ONE transaction.
+///
+/// An API key lives in three places - the live mutex, the sibling `apikey`
+/// file, and `settings.json` - and `apply_setting` writes the first two while
+/// the CALLER writes the third. Two authenticated clients rotating the key at
+/// once could therefore interleave as
+///
+/// ```text
+/// A: live/keyfile = A ; B: live/keyfile = B ; B: settings = B ; A: settings = A
+/// ```
+///
+/// with both answering success. The live key is B, `settings.json` says A, and
+/// settings wins at load - so the key the user just pasted into Sonarr stops
+/// working at the next restart, with nothing in the logs. Credential changes
+/// take the transaction lock so the three stores can never disagree; every
+/// other setting is a single value and needs no ordering.
+fn apply_and_save(
+    d: &Arc<Daemon>,
+    name: &str,
+    v: &str,
+) -> std::result::Result<bool, String> {
+    static CREDENTIAL_TX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _tx = matches!(name, "apikey" | "nzbkey")
+        // A poisoned lock here would mean a panic mid-rotation; the data it
+        // guards is the ordering, not an invariant a panic can corrupt.
+        .then(|| CREDENTIAL_TX.lock().unwrap_or_else(|p| p.into_inner()));
+    let (live, persist) = apply_setting(d, name, v)?;
+    save_setting(&d.settings_path, name, persist);
+    Ok(live)
+}
 
 /// M23d: keep TVmaze episode lists (with airdates) cached for watched
 /// shows - the "coming up" calendar's data. One kv blob per show
@@ -10621,6 +10913,13 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
         cfg_path: config.clone(),
         cats: Mutex::new(DEFAULT_CATS.iter().map(|s| s.to_string()).collect()),
         port,
+        // A failed mint leaves an EMPTY token, and `launcher_proof` then
+        // answers a challenge with sha256(":nonce") - a value any process
+        // could compute. Refuse to answer at all instead: the wrappers
+        // treat "no proof" as "an older daemon" and fall back, which is
+        // strictly better than a proof anyone can forge.
+        launcher_token: random_apikey().unwrap_or_default(),
+        port_locked: port_locked(),
         library_cats: Mutex::new(library_cats),
         active_stream: Mutex::new(None),
         index_db: index_db.clone(),
@@ -10662,6 +10961,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
         indexer_rt: Mutex::new(IndexerRuntime::default()),
         nzblnk_recent: Mutex::new(std::collections::VecDeque::new()),
         smart_folders: Mutex::new(Vec::new()),
+        par_cleanup: AtomicBool::new(true),
         cleanup_exts: Mutex::new(Vec::new()),
         // Loaded from settings.json below (next to smart_folders); the
         // reclassify flag starts set so startup reconciles the stored
@@ -10919,6 +11219,9 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                 Err(e) => eprintln!("[cleanup] ignoring saved cleanup_exts: {e}"),
             }
         }
+        if let Some(on) = saved.get("par_cleanup").and_then(Value::as_bool) {
+            daemon.par_cleanup.store(on, Ordering::Relaxed);
+        }
         // TODO 24D user categories: validated on save, but re-validated
         // here so a hand-edited settings.json can't smuggle a reserved
         // or duplicate slug into the classifier.
@@ -11141,6 +11444,11 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
             println!("[config] speedlimit {:.1} KB/s", bps as f64 / 1e3);
         }
     }
+
+    // A pause the user set is part of the state a restart has to land in,
+    // the same as the queue itself. Before the scheduler below, which may
+    // overrule it.
+    restore_pause(&daemon, &load_settings(&settings_path));
 
     // M14g scheduler: JSON list of {days, time, action, value} entries,
     // evaluated once per minute in the machine's LOCAL timezone. On
@@ -12840,7 +13148,16 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                                     0,
                                     // The feed's own name, so history says
                                     // WHICH feed grabbed this.
-                                    &format!("rss:{}", feed.url),
+                                    // REDACTED at the store: an RSS feed URL
+                                    // is `https://indexer/rss?apikey=…`, and
+                                    // `origin` is emitted verbatim by
+                                    // `job_json`, the SAB queue and history
+                                    // endpoints (which every *arr polls, and
+                                    // logs) and persisted to the history file.
+                                    // The dashboard already reduces an `rss:`
+                                    // origin to its hostname; the API never
+                                    // got the same treatment.
+                                    &format!("rss:{}", redact_url_creds(&feed.url)),
                                     false,
                                 ) {
                                     // Enqueue failures are content errors
@@ -13864,6 +14181,9 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("bind {bind}:{port}: {e}"))?;
     println!("nzbfast is running - open the dashboard at  http://localhost:{port}/");
     println!("(SABnzbd-compatible API for Sonarr/Radarr at  http://localhost:{port}/api)");
+    // Written only once the listener EXISTS, so its presence means this
+    // daemon really did get the port (see `write_runtime_file`).
+    write_runtime_file(&settings_path, port, &daemon.launcher_token);
     if let Some((key, keyfile)) = &minted_key {
         // Printed exactly once, on the first run that generated it. It is
         // the credential the user must paste into Sonarr/Radarr, so it
@@ -14287,7 +14607,12 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                             .filter(|g| g.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')))
                             .map(|k| format!("?apikey={k}"))
                             .unwrap_or_default();
-                        println!("[watch] {url} → {id} (streaming)");
+                        // A get-NZB link carries the indexer credential in
+                        // its query (`apikey=`, `api_key=`, `r=`, …), and
+                        // this line lands in stdout, container logs and the
+                        // in-UI log viewer. Same treatment the failure-link
+                        // and RSS-origin paths already give a remote URL.
+                        println!("[watch] {} → {id} (streaming)", redact_url_creds(&url));
                         tiny_http::Response::from_string("")
                             .with_status_code(303)
                             .with_header(
@@ -14448,6 +14773,13 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                     && cur_nzbkey.as_deref().is_some_and(|k| given.is_some_and(|g| ct_eq(g, k))))
                 || bootstrap_apikey;
             if !authed {
+                // Accounted like every other credentialed door (/m3u, /watch,
+                // /newznab, /getnzb, /stream, /jsonrpc all do this): the key
+                // is 192 bits so brute force is not the worry, but this is the
+                // busiest endpoint and a key-spraying host was leaving no
+                // trace on it at all. Rate-limiting decisions stay with
+                // `note_auth_failure`; the answer below is unchanged.
+                let _ = d.note_auth_failure(peer_ip(&req), "api");
                 // Exact SAB phrases - the *arrs substring-match these to
                 // tell "wrong key" from "no key" in their Test() dialog.
                 let msg = if given.is_none() { "API Key Required" } else { "API Key Incorrect" };
@@ -14459,11 +14791,23 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                 // means attach-and-never-kill. `nzbfast` is the same field
                 // the version body carries, so both wrappers already accept
                 // it and neither can mistake a real SABnzbd for us.
-                let _ = req.respond(json_resp(json!({
+                // ...and, when the caller sent a challenge, the proof that
+                // we hold the token in runtime.json. This is the reply a
+                // wrapper's probe actually gets (it deliberately carries no
+                // key), so the proof has to ride the REFUSAL, not the
+                // authenticated version body. Nothing here leaks: the
+                // answer is a hash, and a caller that cannot read the token
+                // file cannot check or forge it.
+                let mut refusal = json!({
                     "status": false,
                     "error": msg,
                     "nzbfast": env!("CARGO_PKG_VERSION"),
-                })));
+                });
+                if let Some(proof) = launcher_proof(&d.launcher_token, params.get("hs").map(String::as_str))
+                {
+                    refusal["hs_proof"] = json!(proof);
+                }
+                let _ = req.respond(json_resp(refusal));
                 continue;
             }
             // For stream-mode adds: absolute player-handoff links need the
@@ -14490,11 +14834,22 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                 // packaging/beta-serial.txt) - "" on a real release.
                 // KEPT OUT of `nzbfast` itself: the update check and
                 // every wrapper parse that field as a bare semver.
-                "version" => json!({
-                    "version": SAB_VERSION,
-                    "nzbfast": env!("CARGO_PKG_VERSION"),
-                    "beta": env!("NZBFAST_BETA"),
-                }),
+                "version" => {
+                    let mut v = json!({
+                        "version": SAB_VERSION,
+                        "nzbfast": env!("CARGO_PKG_VERSION"),
+                        "beta": env!("NZBFAST_BETA"),
+                    });
+                    // Same handshake as the keyless refusal above answers,
+                    // for a keyless install (where this arm IS what a
+                    // wrapper's probe reaches).
+                    if let Some(proof) =
+                        launcher_proof(&d.launcher_token, params.get("hs").map(String::as_str))
+                    {
+                        v["hs_proof"] = json!(proof);
+                    }
+                    v
+                }
                 // Show the caller the key they already have, so setting up
                 // Sonarr later does not mean digging through %LOCALAPPDATA%
                 // or the browser's URL bar. get_config deliberately masks
@@ -14527,15 +14882,12 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                 // masked logging are identical - a second write path for a
                 // credential is how the two drift.
                 "apikey_new" => match random_apikey() {
-                    Some(k) => match apply_setting(&d, "apikey", &k) {
-                        // save_setting is the CALLER's job everywhere else
-                        // (see the `config` arm), so it has to happen here
-                        // too. Without it the new key lives only in memory:
-                        // the user pastes it into Sonarr, restarts, and the
-                        // daemon comes back on the OLD key with no sign
-                        // anything went wrong.
-                        Ok((_, persist)) => {
-                            save_setting(&d.settings_path, "apikey", persist);
+                    // Live state, key file and settings.json in one ordered
+                    // transaction (see `apply_and_save`) - persisting
+                    // separately let two rotations leave the three
+                    // disagreeing, and the loser's key came back on restart.
+                    Some(k) => match apply_and_save(&d, "apikey", &k) {
+                        Ok(_) => {
                             println!("[config] apikey regenerated");
                             json!({ "status": true, "apikey": k })
                         }
@@ -14559,6 +14911,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                     d.paused.store(false, Ordering::Relaxed);
                     d.pause_gen.fetch_add(1, Ordering::Relaxed);
                     *d.pause_until.lock().unwrap() = None;
+                    persist_pause(&d);
                     json!({"status": true})
                 }
                 "get_config" => {
@@ -15555,7 +15908,30 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                                 if locked {
                                     let d2 = d.clone();
                                     let job2 = job.clone();
+                                    // Mark the job busy for the whole task.
+                                    // unlock + finalize_names rewrite out_dir
+                                    // for many seconds on a large encrypted
+                                    // set, and history_change_cat's only
+                                    // interlock is this flag - without it a
+                                    // category change moves the directory out
+                                    // from under the running extractor, and
+                                    // the two then race to write j.out_dir
+                                    // with whichever lands second winning.
+                                    job.lock().unwrap().finalizing = true;
                                     tokio::task::spawn_blocking(move || {
+                                        // Cleared on EVERY exit below,
+                                        // including the unlock-failed path,
+                                        // or a wrong password would wedge the
+                                        // job as permanently finalizing.
+                                        struct ClearFinalizing(Arc<Mutex<Job>>);
+                                        impl Drop for ClearFinalizing {
+                                            fn drop(&mut self) {
+                                                if let Ok(mut j) = self.0.lock() {
+                                                    j.finalizing = false;
+                                                }
+                                            }
+                                        }
+                                        let _clear = ClearFinalizing(job2.clone());
                                         if crate::smart::unlock(&out_dir, &pw) {
                                             let post_year = match post_year_of(&nzb) {
                                                 0 => crate::identify::current_year(),
@@ -15810,9 +16186,8 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                             timed_pause(&d, v.parse().unwrap_or(0), true);
                             json!({"status": true})
                         }
-                        (Some(name), Some(v)) => match apply_setting(&d, name, v) {
-                            Ok((live, persist)) => {
-                                save_setting(&d.settings_path, name, persist);
+                        (Some(name), Some(v)) => match apply_and_save(&d, name, v) {
+                            Ok(live) => {
                                 println!(
                                     "[config] {name} → {}{}",
                                     log_value(name, v),
@@ -17307,11 +17682,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                         // The clone above releases its guard at the end of
                         // its own statement: holding it across this call
                         // would deadlock on the same Mutex.
-                        if let Ok((_, persist)) =
-                            apply_setting(&d, "index_groups", &groups.join(","))
-                        {
-                            save_setting(&d.settings_path, "index_groups", persist);
-                        }
+                        let _ = apply_and_save(&d, "index_groups", &groups.join(","));
                         json!({"status": true, "added": added,
                                "matched": total, "capped": total > MAX_BULK})
                     }
@@ -21074,6 +21445,9 @@ fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, String>) ->
         // image is the update channel. The dashboard shows the container
         // recipe instead when this is set.
         "container": container_install(),
+        // The launcher owns the port: the settings field is disabled and
+        // says where to change it instead (see `port_locked`).
+        "port_locked": d.port_locked,
         // Keyless state, for the dashboard's open-API notice. Telling an
         // unauthenticated caller "there is no key here" leaks nothing:
         // when it is true every endpoint is already answering them, and
@@ -21461,6 +21835,7 @@ fn handle_jsonrpc(
             d.paused.store(false, Ordering::Relaxed);
             d.pause_gen.fetch_add(1, Ordering::Relaxed);
             *d.pause_until.lock().unwrap() = None;
+            persist_pause(d);
             json!(true)
         }
         "rate" => {
@@ -22064,7 +22439,17 @@ fn history_change_cat(d: &Daemon, id: &str, cat: &str) -> Value {
     if current == cat {
         return json!({"status": true});
     }
-    let moved = if !filed {
+    let mut split_error: Option<String> = None;
+    // Nothing on disk to move: relabel and stop. Otherwise move_tree fails
+    // (read_dir on a missing source is ENOENT) and the category could never
+    // be corrected at all - for a job whose pre-flight verdict failed it
+    // before out_dir was ever created, a folder the user tidied by hand, or
+    // a move_completed share that is not mounted right now. Worse, every
+    // attempt left a stray empty category directory behind, because
+    // move_tree's first act is create_dir_all(dst.parent()). Relabelling is
+    // the one part that needs no filesystem work, so do just that.
+    let source_missing = !filed && !out_dir.is_dir();
+    let moved = if !filed && !source_missing {
         let base = if state == JobState::Completed {
             let cat_root = d
                 .move_completed_cats
@@ -22086,7 +22471,18 @@ fn history_change_cat(d: &Daemon, id: &str, cat: &str) -> Value {
         } else {
             d.out_dir().join(cat)
         };
-        let dest = base.join(out_dir.file_name().unwrap_or_default());
+        // Pick a free name rather than merging blind. The queued-job arm
+        // goes through refile_out_dir with dir_claim, and retry does the
+        // same, for the reason its comment gives: re-using a claimed
+        // directory would put two live jobs in it. Without this, re-adding
+        // the same NZB under another category (which claims the folder while
+        // held as a duplicate) and then recategorising the finished one
+        // merges a whole payload into the claimed directory - and both
+        // history records then name it, so plan_history_delete marks each as
+        // the other's claimant and "Remove and delete files" silently
+        // refuses for both, leaving a folder undeletable from the UI.
+        let stem = out_dir.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let (dest, _) = choose_out_dir(&base.join(&stem), &stem, &|p| d.dir_claim(p));
         // Same aliasing guard as relocate_completed: a dest that IS the
         // current folder through case or symlinks must not self-merge.
         let same = dest == out_dir
@@ -22095,17 +22491,61 @@ fn history_change_cat(d: &Daemon, id: &str, cat: &str) -> Value {
         if same {
             None
         } else {
+            // Count first: move_tree's same-filesystem merge moves entry by
+            // entry and propagates the first error, so a failure can leave
+            // the payload split across both folders. Without this the whole
+            // failure is indistinguishable from "nothing happened".
+            let before = file_count(&out_dir);
             match crate::smart::move_tree(&out_dir, &dest) {
                 Ok(()) => {
                     println!("[move] recategorized → {}", dest.display());
                     Some(dest)
                 }
-                // Category unchanged on a failed move: a label that says
-                // "movies" over files still sitting in tv/ is a lie that
-                // outlives the error message.
                 Err(e) => {
-                    return json!({"status": false,
-                        "error": format!("could not move the files: {e}")});
+                    // Same split detection relocate_completed does. A
+                    // partial move is the ordinary Windows case: the
+                    // whole-directory rename is refused while a child is
+                    // open, the merge path runs, and it stops at the open
+                    // file having already moved the siblings.
+                    let moved_some = file_count(&out_dir) < before;
+                    eprintln!(
+                        "[move] {} → {}: {e}\n[move] {}",
+                        out_dir.display(),
+                        dest.display(),
+                        if moved_some {
+                            format!(
+                                "the payload is now SPLIT - some files moved before this \
+                                 failed. Check both {} and {} before deleting either.",
+                                out_dir.display(),
+                                dest.display()
+                            )
+                        } else {
+                            format!("nothing moved - the download is still at {}", out_dir.display())
+                        }
+                    );
+                    if moved_some {
+                        // The files that moved exist nowhere else, so the
+                        // record has to follow the bytes even though the
+                        // call failed - leaving it on the half-emptied
+                        // source points the dashboard, a later delete and
+                        // the *arr import at a folder they have left.
+                        // Reported as a failure below, after the state is
+                        // updated, so the user is told rather than shown a
+                        // success over a split payload.
+                        split_error = Some(format!(
+                            "the files are now SPLIT between {} and {} because the move \
+                             failed part way ({e}). Check both before deleting either.",
+                            out_dir.display(),
+                            dest.display()
+                        ));
+                        Some(dest)
+                    } else {
+                        // Nothing moved: leave the category alone too. A
+                        // label saying "movies" over files still sitting in
+                        // tv/ is a lie that outlives the error message.
+                        return json!({"status": false,
+                            "error": format!("could not move the files: {e}")});
+                    }
                 }
             }
         }
@@ -22121,6 +22561,14 @@ fn history_change_cat(d: &Daemon, id: &str, cat: &str) -> Value {
     }
     d.register_cat(cat);
     d.save_queue();
+    // Reported only now: the record above had to be updated first so it
+    // points at where the bytes actually are, but the caller must still be
+    // told this failed rather than shown a success over a split payload.
+    if let Some(msg) = split_error {
+        return json!({"status": false,
+            "error": msg,
+            "path": moved.map(|p| p.to_string_lossy().to_string())});
+    }
     let note = if filed {
         "relabeled only: the files were filed into a shared TV folder and stayed there"
     } else {
@@ -22204,8 +22652,9 @@ fn history_json(d: &Daemon, params: &std::collections::HashMap<String, String>) 
                     String::new()
                 } else {
                     format!(
-                        "{} could not be unpacked: zip extraction is not built in. \
-                         The verified archive is in the output folder.",
+                        "{} could not be unpacked: it is damaged, encrypted, or uses \
+                         a compression method this build does not carry. The verified \
+                         archive is in the output folder.",
                         j.unpack_blocked_by
                     )
                 },
@@ -22834,7 +23283,14 @@ mod tests {
     /// arms are string literals at a fixed indent inside one function, so
     /// this is a two-line scan rather than a parser.
     fn apply_setting_arms() -> std::collections::BTreeSet<String> {
-        let src = include_str!("serve.rs");
+        // CR stripped because the splits below are byte-exact. A Windows
+        // clone made before `.gitattributes` landed has this source in CRLF
+        // (git's own core.autocrlf default), and `"\n}\n"` cannot match
+        // "\r\n}\r\n" - so the guard failed with "no recognisable end"
+        // rather than reporting drift, which is the one way a guard must
+        // never fail. `.gitattributes` pins LF now; this keeps the scan
+        // working in a checkout that predates it.
+        let src = include_str!("serve.rs").replace('\r', "");
         let body = src
             .split_once("\nfn apply_setting(")
             .expect("apply_setting moved or was renamed")

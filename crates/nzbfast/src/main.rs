@@ -515,10 +515,48 @@ enum Command {
     },
 }
 
+/// Every subcommand runs on a thread we size ourselves, never on the
+/// process's own main thread.
+///
+/// `#[tokio::main]` is `block_on` on the calling thread, so the whole async
+/// body's state machine lives on that thread's stack - and Windows reserves
+/// 1 MB for the main thread, against 8 MB on Linux and macOS. A debug build
+/// of `serve` overflowed it and the process died before it bound its port,
+/// with no panic message beyond "thread 'main' has overflowed its stack" and
+/// no backtrace, because a Windows stack overflow aborts without unwinding.
+/// That took the ENTIRE daemon e2e suite - 39 integration tests, the only
+/// coverage of the queue, the SAB/NZBGet facades, streaming and
+/// post-processing - with it on Windows, and it also meant no Windows
+/// contributor could run the daemon they had just built. It was invisible
+/// because `cargo test` stops at the first failing target, so the suite
+/// never got as far as `tests/daemon.rs` (see pr-check.yml's
+/// `--no-fail-fast`).
+///
+/// 16 MB, and the same on every platform so the stack a release build gets
+/// is the stack the tests proved. It costs no memory: a thread stack is
+/// reserved address space, committed by the page as it is touched.
+fn main() -> Result<()> {
+    std::thread::Builder::new()
+        .name("nzbfast-main".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(run)
+        .expect("spawn the main thread")
+        .join()
+        // Re-raise rather than repackage: this keeps a panic's own message,
+        // location and exit status exactly as it would have been had the
+        // body run on the main thread.
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn run() -> Result<()> {
     let cli = Cli::parse();
     nzbkit::disk::raise_fd_limit();
+    // Windows 11 parks sustained background CPU work on E-cores a few
+    // seconds in (EcoQoS) - a daemon downloading or repairing IS
+    // background work, and the measured cliff is 8x (see
+    // mem::opt_out_of_power_throttling).
+    nzbkit::mem::opt_out_of_power_throttling();
     let budget = match &cli.mem_limit {
         Some(v) => nzbkit::mem::MemBudget::with_total(
             serve::parse_size(v)
@@ -1947,12 +1985,15 @@ fn extract_one_level(
     //    beside a landed feature is not the same problem as a post whose
     //    entire payload is still packed - so it reports uniformly and the
     //    top-level caller decides (`unsupported_archive_present`).
-    if let Some(found) = nzbkit::zip::first(dir) {
-        println!(
-            "⚠ {} present ({}) - zip extraction is not supported",
-            found.shape.label(),
-            found.name
-        );
+    let zips = nzbkit::zip::scan(dir);
+    if !zips.is_empty() {
+        // Store and deflate cover ~99% of real zips and are built in.
+        // Anything else - an exotic codec, an encrypted entry - still
+        // reports as a gap rather than a failure to open, so the message
+        // names what was hit and the caller can still forgive a sidecar.
+        if extract_zip(dir, &zips) {
+            return Ok(Some(NestOutcome::Produced));
+        }
         return Ok(Some(NestOutcome::ZipGap));
     }
     // Nothing above claimed it, but something here still has an archive's
@@ -2309,10 +2350,14 @@ fn extract_obfuscated_rar(
     password: Option<&str>,
     depth: usize,
 ) -> bool {
-    let options = rars::ArchiveReadOptions::with_optional_password(password.map(str::as_bytes));
+    let options = nzbkit::mem::rar_read_options(password.map(str::as_bytes));
+    // One parse session for the whole candidate set: an encrypted set
+    // shares one salt across its volumes, and the per-volume PBKDF2
+    // ladder dwarfed the parse itself on p99-sized sets.
+    let mut parse = rars::ReadSession::new(options);
     let mut parsed: Vec<(Option<u64>, PathBuf, rars::Archive)> = Vec::new();
     for path in candidates {
-        match rars::ArchiveReader::read_path_with_options(path, options.clone()) {
+        match parse.read_path(path) {
             Ok(archive) => parsed.push((archive_volume_number(&archive), path.clone(), archive)),
             // A Rar!-magic file that will not parse is not a usable volume;
             // skip it rather than abort the whole set.
@@ -2619,7 +2664,7 @@ fn collect_sfx_archives(dir: &std::path::Path) -> Result<Vec<PathBuf>> {
 /// Extract each SFX archive standalone (rars locates the archive past the
 /// stub itself).
 fn extract_sfx(dir: &std::path::Path, archives: &[PathBuf], password: Option<&str>) -> bool {
-    let options = rars::ArchiveReadOptions::with_optional_password(password.map(str::as_bytes));
+    let options = nzbkit::mem::rar_read_options(password.map(str::as_bytes));
     let mut all_ok = true;
     for path in archives {
         println!(
@@ -2761,6 +2806,10 @@ struct FileSlot {
     total_segments: usize,
     remaining: std::sync::atomic::AtomicUsize,
     missing: std::sync::atomic::AtomicUsize,
+    /// Decode or write failures charged to THIS slot. The global
+    /// `decode_errors` counter says a job hit one; only a per-slot count can
+    /// say whether the file a PAR2 repair just healed is the one that hit it.
+    errors: std::sync::atomic::AtomicUsize,
     /// Par2-main slots capture decoded bytes in memory so the recovery set
     /// activates mid-download without re-reading from disk.
     capture: Option<std::sync::Mutex<Vec<u8>>>,
@@ -3366,6 +3415,7 @@ pub(crate) async fn get_with_progress(
             total_segments: f.segments.len(),
             remaining: AtomicUsize::new(f.segments.len()),
             missing: AtomicUsize::new(0),
+            errors: AtomicUsize::new(0),
             capture: is_par2_main.then(|| std::sync::Mutex::new(Vec::new())),
         }));
         let mut arts: Vec<(u64, String)> = Vec::new();
@@ -3882,6 +3932,7 @@ pub(crate) async fn get_with_progress(
                                     Err(e) => {
                                         eprintln!("write {name}: {e}");
                                         decode_errors.fetch_add(1, Ordering::Relaxed);
+                                        slot.errors.fetch_add(1, Ordering::Relaxed);
                                     }
                                     Ok(persist) => {
                                     match &persist {
@@ -4015,6 +4066,7 @@ pub(crate) async fn get_with_progress(
                             Err(e) => {
                                 eprintln!("decode error ({id}): {e}");
                                 decode_errors.fetch_add(1, Ordering::Relaxed);
+                                slot.errors.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                         out_pool.give(out);
@@ -4619,6 +4671,54 @@ pub(crate) async fn get_with_progress(
                 }
             }
             let needed = damage.saturating_sub(on_hand);
+            // Slots the recovery set does NOT cover. A PAR2 repair proves the
+            // files in its own set and says nothing whatever about the rest,
+            // but the repair branches below set `all_good` from the repair
+            // alone: a covered RAR with one repairable block plus a `.nfo`
+            // (or a second payload file) posted outside the set whose
+            // articles all 430'd finished Completed, journal deleted, with
+            // that file never having arrived. The clean-PAR2 and no-PAR2
+            // branches already apply the equivalent test.
+            //
+            // Requiring the GLOBAL counters to be zero would be wrong - a
+            // covered slot's missing bytes are exactly what the repair just
+            // healed - so the test is per slot, and a slot counts as covered
+            // only when the verifier actually produced a report for it.
+            let uncovered_bad: Vec<&str> = {
+                let covered: std::collections::HashSet<usize> =
+                    reports.iter().map(|(s, _)| *s).collect();
+                slots
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, s)| {
+                        !s.is_par2_main
+                            && !covered.contains(i)
+                            && (s.missing.load(Ordering::Relaxed) > 0
+                                || s.remaining.load(Ordering::Relaxed) > 0
+                                || s.errors.load(Ordering::Relaxed) > 0)
+                    })
+                    .map(|(_, s)| s.hint.as_str())
+                    .collect()
+            };
+            // Covered slots that hit a WRITE or decode error. Their bytes
+            // were verified in flight, not off disk - so an ENOSPC (or any
+            // other failed pwrite) on a file the recovery set covers leaves
+            // no trace in `damage` at all, and the mapped repair re-reads
+            // only the files it rebuilt blocks into. Cheap to catch here
+            // because the error is already counted per slot; the residual
+            // case (bytes that were written and then went bad silently)
+            // needs a full re-read of the payload, which is a separate
+            // perf-vs-assurance call.
+            let covered_write_errors: Vec<&str> = {
+                let covered: std::collections::HashSet<usize> =
+                    reports.iter().map(|(s, _)| *s).collect();
+                slots
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, s)| covered.contains(i) && s.errors.load(Ordering::Relaxed) > 0)
+                    .map(|(_, s)| s.hint.as_str())
+                    .collect()
+            };
             println!(
                 "verified {} file(s): {} blocks in-stream, {} by read-back, {} bad - settled in {:.0} ms",
                 reports.len(),
@@ -4645,6 +4745,11 @@ pub(crate) async fn get_with_progress(
                         &extractor,
                         &reports,
                         &missing_files,
+                        // Fast verify is the default and CRC32 is what the
+                        // in-stream path trusts too; an operator who turned
+                        // it off is asking for MD5 everywhere, including
+                        // here.
+                        !fast_verify,
                     )
                     .await?
                 } else {
@@ -4657,7 +4762,20 @@ pub(crate) async fn get_with_progress(
                 // stale pre-repair K/T records.
                 journal.record_crypto_events(&extractor.drain_crypto_events());
                 if mapped_ok {
-                    all_good = true;
+                    // The mapped repair re-verifies the files it rebuilt
+                    // blocks into, and only those. A covered file that
+                    // failed a WRITE therefore passes through it untouched
+                    // and unnoticed - the disk path below cannot have that
+                    // problem, because par2 verifies the whole set off disk.
+                    all_good = covered_write_errors.is_empty();
+                    if !all_good {
+                        println!(
+                            "  ✘ repaired in place, but {} covered file(s) hit a write error \
+                             that repair never re-read: {}",
+                            covered_write_errors.len(),
+                            covered_write_errors.join(", ")
+                        );
+                    }
                 } else {
                 // PAR2 repair operates on volume FILES - materialize every
                 // mapped slot of the set (complete ones too: par2 verifies
@@ -4706,6 +4824,7 @@ pub(crate) async fn get_with_progress(
                     main_par2,
                     &already,
                     buf_pool.clone(),
+                    &extractor,
                 )
                 .await?;
                 // Repaired volume files on disk → re-extract them cleanly.
@@ -4738,9 +4857,30 @@ pub(crate) async fn get_with_progress(
                     }
                 }
                 } // mapped_ok else
+                // Whatever the repair did, it did it inside the recovery set.
+                if all_good && !uncovered_bad.is_empty() {
+                    all_good = false;
+                    println!(
+                        "  ✘ repair succeeded, but {} file(s) outside the PAR2 set are still \
+                         incomplete: {}",
+                        uncovered_bad.len(),
+                        uncovered_bad.join(", ")
+                    );
+                }
             } else {
                 println!("clean download - no repair, no post-verify pass ✔");
-                all_good = true;
+                // PAR2 verifying clean is NOT the same as the download being
+                // whole: `damage` only ever counts files the recovery set
+                // covers (`unclaimed_files` walks `set.files`), and the
+                // in-stream verifier hashes bytes as they ARRIVE, not off
+                // disk. So a .nfo/sample/.sfv posted outside the par2 set
+                // whose articles all 430'd, or a covered file whose write hit
+                // ENOSPC after its blocks verified in flight, both land here
+                // with damage == 0. Reporting success then deletes the
+                // journal - the only record of what is still missing - and
+                // hands an *arr an incomplete directory to import. Same test
+                // the no-PAR2 branch below already applies.
+                all_good = incomplete == 0 && derrs == 0;
             }
         }
         None => {
@@ -4848,6 +4988,16 @@ pub(crate) async fn get_with_progress(
         .filter(|(_, w)| !sevenz_disk_fallback(w))
         .collect();
     // Compressed (non-encrypted) archives can't stream-extract, but a
+    // Set when the set is locked and no password was found: the verified
+    // volumes ARE the deliverable until one arrives, so the nested pass must
+    // not then try (and fail) to unpack them. A NAMED encrypted set was
+    // already safe by accident - its stems are in `outer_vol_stems`, so the
+    // pass skipped it - but an obfuscated one has no stem to match (hash
+    // names carry no extension), so the pass ran, `extract_obfuscated_rar`
+    // failed for want of the password, and the job came out FAILED with no
+    // password prompt, where the identical named set finishes Completed and
+    // offers the unlock.
+    let mut locked_no_password = false;
     // bundled unrar unpacks the verified volumes. Encrypted sets join in
     // when a password is known; without one they stay on disk.
     let enc_fallback = vol_fallbacks
@@ -4866,20 +5016,30 @@ pub(crate) async fn get_with_progress(
     {
         // The unrar outcome IS the job outcome here: a corrupt compressed
         // set (or a wrong password) must not exit 0 with loose volumes.
-        if !try_unrar(out_dir, password.as_deref()) {
-            all_good = false;
-            reextract_failed = Some(
-                "the verified volumes could not be unpacked \
-                 (compressed set, or the password is wrong)",
-            );
+        // On success the volumes are spent (Part B of the 2026-07-29
+        // one-pass spec): a demoted 57.8 GB job used to finish holding
+        // both the movie AND its full volume set.
+        match try_unrar_spent(out_dir, password.as_deref()) {
+            Some(spent) => remove_spent_volumes(&spent),
+            None => {
+                all_good = false;
+                reextract_failed = Some(
+                    "the verified volumes could not be unpacked \
+                     (compressed set, or the password is wrong)",
+                );
+            }
         }
     } else if all_good && unowned_fallback && !enc_fallback {
-        if !try_unrar(out_dir, password.as_deref()) {
-            all_good = false;
-            reextract_failed =
-                Some("the verified volumes could not be unpacked after a fallback");
+        match try_unrar_spent(out_dir, password.as_deref()) {
+            Some(spent) => remove_spent_volumes(&spent),
+            None => {
+                all_good = false;
+                reextract_failed =
+                    Some("the verified volumes could not be unpacked after a fallback");
+            }
         }
     } else if all_good && enc_fallback {
+        locked_no_password = true;
         println!(
             "🔒 archive is password-protected and no password was found - \
              verified volumes kept in the output directory. Supply one with \
@@ -4911,6 +5071,9 @@ pub(crate) async fn get_with_progress(
         }
     };
     let nested_hold: Option<Option<OuterHold>> = if !(all_good && !no_extract) {
+        None
+    } else if locked_no_password {
+        // The volumes are the deliverable; nothing here can unpack them.
         None
     } else if !outer_vols_on_disk() {
         Some(None) // run the pass, nothing to park
@@ -4966,7 +5129,8 @@ pub(crate) async fn get_with_progress(
                         println!("{}", u.message());
                         all_good = false;
                         reextract_failed = Some(
-                            "the payload is a zip and zip extraction is not built in",
+                            "the payload is a zip that could not be unpacked \
+                             (damaged, encrypted, or an unsupported compression method)",
                         );
                     }
                     _ => {
@@ -5061,15 +5225,16 @@ impl UnsupportedArchive {
     fn message(&self) -> String {
         if self.blocking {
             format!(
-                "⚠ unsupported archive format: {} ({}) - zip extraction is not built in, \
-                 so the payload is still packed. The verified archive is in the output \
-                 directory; unpack it with your own tool.",
+                "⚠ {} ({}) could not be unpacked - it is damaged, encrypted, or uses a \
+                 compression method this build does not carry, so the payload is still \
+                 packed. The verified archive is in the output directory; unpack it \
+                 with your own tool.",
                 self.display, self.shape
             )
         } else {
             format!(
-                "note: {} ({}) left packed beside the payload - zip extraction is not \
-                 built in. The rest of the download is complete.",
+                "note: {} ({}) left packed beside the payload - it could not be \
+                 unpacked. The rest of the download is complete.",
                 self.display, self.shape
             )
         }
@@ -5256,12 +5421,33 @@ fn first_rar_volume(rars: &[PathBuf]) -> Option<PathBuf> {
 }
 
 pub(crate) fn try_unrar(dir: &std::path::Path, password: Option<&str>) -> bool {
+    try_unrar_spent(dir, password).is_some()
+}
+
+/// [`try_unrar`] that also names the volume files a SUCCESSFUL unpack
+/// consumed, so the finalize flows can delete exactly those (Part B,
+/// research/SPEC-onepass-obfuscated-store-sets-2026-07-29.md: a demoted
+/// set left its full volume set beside the extracted payload - observed
+/// live at 144 volumes / ~57 GB - and only this function knows which
+/// on-disk set the unpack actually read).
+///
+/// `None` is failure - every volume stays, it is the only recovery.
+/// `Some(vec![])` is success with nothing for the caller to remove:
+/// either the obfuscated path already swept its own spent volumes (with
+/// its refusals - a memberless `.rev` shape survives), or the before/after
+/// diff could not prove the unpack published anything new, and no proof
+/// means no delete. A file the unpack itself just published is never
+/// reported as spent.
+pub(crate) fn try_unrar_spent(
+    dir: &std::path::Path,
+    password: Option<&str>,
+) -> Option<Vec<PathBuf>> {
     // Test canary: encrypted-store e2e jobs must complete WITHOUT unrar
     // (native decryption); reaching here with the canary set fails the
     // job loudly instead of quietly proving nothing.
     if std::env::var_os("NZBFAST_TEST_FORBID_UNRAR").is_some() {
         println!("⚠ unrar invocation forbidden by NZBFAST_TEST_FORBID_UNRAR");
-        return false;
+        return None;
     }
     // Sibling binary, else the copy embedded in this executable, else
     // PATH (see tools.rs).
@@ -5322,7 +5508,7 @@ pub(crate) fn try_unrar(dir: &std::path::Path, password: Option<&str>) -> bool {
         // named set, which is all it was ever about.
         let obf = collect_obfuscated_rar_volumes(dir).unwrap_or_default();
         if obf.is_empty() {
-            return false;
+            return None;
         }
         // Depth 1, deliberately, where a named set here keeps its volumes:
         // every caller hands this SAME directory to the depth-1 nested pass
@@ -5334,58 +5520,123 @@ pub(crate) fn try_unrar(dir: &std::path::Path, password: Option<&str>) -> bool {
         // today, and it is `sweep_spent_obfuscated` doing it, so its three
         // refusals (a memberless `.rev`-shaped set, no before-snapshot,
         // nothing published) still decide each set on their own.
-        return extract_obfuscated_rar(dir, &obf, password, 1);
+        return extract_obfuscated_rar(dir, &obf, password, 1).then(Vec::new);
+    };
+    // Taken before anything unpacks: the after-diff is the proof-of-output
+    // a spent-volume deletion needs, and the filter that keeps a file the
+    // unpack itself just published from ever counting as spent.
+    let before = snapshot_recursive(dir).ok();
+    let spent = |consumed: Vec<PathBuf>| -> Vec<PathBuf> {
+        let Some(before) = before.as_ref() else { return Vec::new() };
+        let Ok(after) = snapshot_recursive(dir) else { return Vec::new() };
+        let published: std::collections::HashSet<&PathBuf> = after.difference(before).collect();
+        if published.is_empty() {
+            return Vec::new();
+        }
+        consumed.into_iter().filter(|p| !published.contains(p)).collect()
+    };
+    // EVERY stem group in the directory, the caller's chosen first volume
+    // leading - not just that one group. `first_rar_volume` picks a single
+    // volume across the whole directory and `try_rars_native` then scopes
+    // itself to that volume's stem, so returning on its success reported
+    // "the directory is unpacked" having unpacked ONE set. A demoted post
+    // with two top-level sets (`extras.rar/.r00…` beside
+    // `s01e01.rar/.r00…`, no `.part`, so the lexically first wins) then
+    // finished Completed with the whole episode still packed: the nested
+    // pass skips it too, because its stem IS an outer stem and no foreign
+    // archive sits beside it.
+    //
+    // This also subsumes the decoy retry it replaces (a same-size random
+    // `.rar`, or SABnzbd's `par2test.part1.11.rar` shadowing
+    // `par2test.part1.rar`): a decoy is simply a group that produces
+    // nothing. Success is unchanged - at least one group produced - so a
+    // decoy that fails cannot now fail a job that used to pass.
+    //
+    // The group list is built from ONE directory read taken before any
+    // extraction, so a set published by an earlier group (RAR-in-RAR)
+    // never enters it; the nested pass owns that layer as it always did.
+    //
+    // BOTH engines walk this list. Scoping only the native pass to it left
+    // the unrar fallback - the path a compressed set takes when the native
+    // extractor declines - unpacking the lead group and reporting the whole
+    // directory done, which is the same bug one layer down.
+    let mut groups: Vec<(String, Vec<PathBuf>)> = Vec::new();
+    {
+        use nzbkit::extract::release_stem;
+        // Lowercase both sides - `release_stem` returns a slice of what it
+        // was handed, so a mixed-case stem groups against itself only when
+        // every input had the same case treatment (78a5640f).
+        let key = |p: &std::path::Path| {
+            release_stem(&p.file_name().unwrap_or_default().to_string_lossy().to_lowercase())
+        };
+        let mut by_stem: std::collections::BTreeMap<String, Vec<PathBuf>> = Default::default();
+        by_stem.entry(key(&first)).or_default().push(first.clone());
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p != first
+                    && p.extension().is_some_and(|x| x.eq_ignore_ascii_case("rar"))
+                    && rar_magic(&p)
+                {
+                    by_stem.entry(key(&p)).or_default().push(p);
+                }
+            }
+        }
+        let lead = key(&first);
+        if let Some(g) = by_stem.remove(&lead) {
+            groups.push((lead, g));
+        }
+        groups.extend(by_stem);
+    }
+    // Said ONCE, at the end, naming every set still packed - and only when
+    // something else did unpack, which is the case that finishes the job
+    // Completed. Per-group warnings scroll past mid-extraction and read
+    // like routine noise ("a decoy failed, as decoys do"); the whole point
+    // here is that a legitimate second set may be sitting in the output
+    // directory, still packed, on a job that reported success.
+    let report_leftovers = |failed: &[String]| {
+        if failed.is_empty() {
+            return;
+        }
+        println!(
+            "⚠ {} of {} archive set(s) in this directory did not unpack and are still \
+             packed: {}. If one of those is the release (rather than a decoy or a \
+             sample), it needs a password, a repair, or a newer unpacker.",
+            failed.len(),
+            groups.len(),
+            failed.join(", ")
+        );
     };
     // Native in-process extraction first (vendored rars fork - measured
     // faster than unrar on every compressed-RAR bench leg); the embedded
     // unrar subprocess stays as the escape hatch for one release.
     if std::env::var_os("NZBFAST_NO_NATIVE_UNRAR").is_none() {
         println!("unpacking archive natively…");
-        match try_rars_native(dir, &first, password) {
-            Ok(()) => {
-                println!("native unpack complete ✔");
-                return true;
+        let mut consumed_all: Vec<PathBuf> = Vec::new();
+        let mut produced = false;
+        let mut failed: Vec<String> = Vec::new();
+        for (stem, group) in &groups {
+            let Some(group_first) = first_rar_volume(group) else { continue };
+            let what = if stem.is_empty() {
+                group_first.display().to_string()
+            } else {
+                stem.clone()
+            };
+            match try_rars_native(dir, &group_first, password) {
+                Ok(consumed) => {
+                    println!("native unpack complete ✔ ({})", group_first.display());
+                    consumed_all.extend(consumed);
+                    produced = true;
+                }
+                Err(e) => {
+                    println!("⚠ native unpack failed for '{what}' ({e})");
+                    failed.push(what);
+                }
             }
-            Err(e) => println!("⚠ native unpack failed ({e})"),
         }
-        // Real download dirs can hold decoys beside the true set: same-size
-        // random `.rar` files, truncated misnamed volumes (a real gauntlet
-        // from SABnzbd's suite has `par2test.part1.11.rar` shadowing
-        // `par2test.part1.rar`). When the chosen first volume fails, try
-        // each OTHER stem group's first volume (magic-gated) before giving
-        // up on native extraction.
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            use nzbkit::extract::release_stem;
-            let mut by_stem: std::collections::HashMap<String, Vec<PathBuf>> = Default::default();
-            for e in entries.flatten() {
-                let p = e.path();
-                if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("rar"))
-                    && rar_magic(&p)
-                {
-                    let stem = p
-                        .file_name()
-                        .map(|n| release_stem(&n.to_string_lossy()))
-                        .unwrap_or_default();
-                    by_stem.entry(stem).or_default().push(p);
-                }
-            }
-            let first_stem = first
-                .file_name()
-                .map(|n| release_stem(&n.to_string_lossy()))
-                .unwrap_or_default();
-            let mut stems: Vec<_> = by_stem.into_iter().collect();
-            stems.sort_by(|a, b| a.0.cmp(&b.0));
-            for (stem, group) in stems {
-                if stem == first_stem {
-                    continue;
-                }
-                let Some(group_first) = first_rar_volume(&group) else { continue };
-                println!("  retrying native unpack from {}…", group_first.display());
-                if try_rars_native(dir, &group_first, password).is_ok() {
-                    println!("native unpack complete ✔");
-                    return true;
-                }
-            }
+        if produced {
+            report_leftovers(&failed);
+            return Some(spent(consumed_all));
         }
         println!("falling back to unrar…");
     }
@@ -5395,62 +5646,111 @@ pub(crate) fn try_unrar(dir: &std::path::Path, password: Option<&str>) -> bool {
         Some(p) if !p.is_empty() => format!("-p{p}"),
         _ => "-p-".to_string(),
     };
-    // Same staging discipline as the native path: `-o+` overwrites without
-    // asking, and unrar reads the volume set by path as it goes, so a member
-    // named after a volume would destroy the set mid-extraction. The
-    // trailing positional argument is unrar's destination directory; it is
-    // relative because cwd is `dir`, and it must end in a separator.
-    let staging = match ExtractStaging::new(dir) {
-        Ok(s) => s,
-        Err(e) => {
-            println!("⚠ could not create a staging directory ({e})");
-            return false;
-        }
-    };
-    let dest_arg = {
-        let mut a = std::ffi::OsString::from(
-            staging.path().file_name().unwrap_or_default(),
-        );
-        a.push(std::path::MAIN_SEPARATOR_STR);
-        a
-    };
-    match std::process::Command::new(&unrar)
-        .args(["x", "-y", "-o+", &parg, "-idq"])
-        // `first` is dir-prefixed but cwd is already `dir`; passing it verbatim
-        // makes unrar resolve `dir/dir/name` and report the archive missing (a
-        // spurious "wrong password / damaged" failure). Pass `./name` instead.
-        .arg(std::path::Path::new(".").join(first.file_name().unwrap_or_default()))
-        .arg(&dest_arg)
-        .stdin(std::process::Stdio::null())
-        .current_dir(dir)
-        .status()
-    {
-        Ok(st) if st.success() && !staging.produced_anything() => {
-            println!("⚠ unrar exited 0 but extracted nothing - treating as a failure");
-            false
-        }
-        Ok(st) if st.success() => match staging.publish_into(dir) {
-            Ok(()) => {
-                println!("unrar complete ✔");
-                true
+    // One subprocess per stem group, on the same list and the same success
+    // rule as the native pass above.
+    let unrar_group = |group_first: &PathBuf| -> Option<Vec<PathBuf>> {
+        // The volume set the subprocess is about to read, listed BEFORE it
+        // runs - the unpack can publish rar-named members of its own, and
+        // those must never be mistaken for input volumes.
+        let consumed = stem_volume_set(dir, group_first).unwrap_or_default();
+        // Same staging discipline as the native path: `-o+` overwrites without
+        // asking, and unrar reads the volume set by path as it goes, so a member
+        // named after a volume would destroy the set mid-extraction. The
+        // trailing positional argument is unrar's destination directory; it is
+        // relative because cwd is `dir`, and it must end in a separator.
+        let staging = match ExtractStaging::new(dir) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("⚠ could not create a staging directory ({e})");
+                return None;
+            }
+        };
+        let dest_arg = {
+            let mut a = std::ffi::OsString::from(
+                staging.path().file_name().unwrap_or_default(),
+            );
+            a.push(std::path::MAIN_SEPARATOR_STR);
+            a
+        };
+        match std::process::Command::new(&unrar)
+            .args(["x", "-y", "-o+", &parg, "-idq"])
+            // The volume is dir-prefixed but cwd is already `dir`; passing it
+            // verbatim makes unrar resolve `dir/dir/name` and report the archive
+            // missing (a spurious "wrong password / damaged" failure). Pass
+            // `./name` instead.
+            .arg(std::path::Path::new(".").join(group_first.file_name().unwrap_or_default()))
+            .arg(&dest_arg)
+            .stdin(std::process::Stdio::null())
+            .current_dir(dir)
+            .status()
+        {
+            Ok(st) if st.success() && !staging.produced_anything() => {
+                println!("⚠ unrar exited 0 but extracted nothing - treating as a failure");
+                None
+            }
+            Ok(st) if st.success() => match staging.publish_into(dir) {
+                Ok(()) => {
+                    println!("unrar complete ✔ ({})", group_first.display());
+                    Some(consumed)
+                }
+                Err(e) => {
+                    println!("⚠ {e}");
+                    None
+                }
+            },
+            Ok(st) if password.is_some() => {
+                println!("⚠ unrar exited with {st} - wrong password, or damaged volumes");
+                None
+            }
+            Ok(st) => {
+                println!("⚠ unrar exited with {st} (encrypted or damaged?)");
+                None
             }
             Err(e) => {
-                println!("⚠ {e}");
-                false
+                println!("⚠ unrar not runnable ({e}) - volumes left on disk");
+                None
             }
-        },
-        Ok(st) if password.is_some() => {
-            println!("⚠ unrar exited with {st} - wrong password, or damaged volumes");
-            false
         }
-        Ok(st) => {
-            println!("⚠ unrar exited with {st} (encrypted or damaged?)");
-            false
+    };
+    let mut consumed_all: Vec<PathBuf> = Vec::new();
+    let mut produced = false;
+    let mut failed: Vec<String> = Vec::new();
+    for (stem, group) in &groups {
+        let Some(group_first) = first_rar_volume(group) else { continue };
+        match unrar_group(&group_first) {
+            Some(consumed) => {
+                consumed_all.extend(consumed);
+                produced = true;
+            }
+            None => failed.push(if stem.is_empty() {
+                group_first.display().to_string()
+            } else {
+                stem.clone()
+            }),
         }
-        Err(e) => {
-            println!("⚠ unrar not runnable ({e}) - volumes left on disk");
-            false
+    }
+    if produced {
+        report_leftovers(&failed);
+    }
+    produced.then(|| spent(consumed_all))
+}
+
+/// Part B of the 2026-07-29 one-pass spec: a set that just unpacked has
+/// spent its volumes - they are our own working files, removed in place
+/// (`fs::remove_file`, never the trash path). Callers hand this exactly
+/// what [`try_unrar_spent`] reported, so every deliberate keep (a failed
+/// or partial unpack, an encrypted set still waiting for its password,
+/// the obfuscated sweep's refusals) never reaches here.
+fn remove_spent_volumes(vols: &[PathBuf]) {
+    let mut removed = 0usize;
+    for p in vols {
+        match std::fs::remove_file(p) {
+            Ok(()) => removed += 1,
+            Err(e) => println!("⚠ could not remove spent volume {}: {e}", p.display()),
         }
+    }
+    if removed > 0 {
+        println!("  removed {removed} volume file(s) after extraction");
     }
 }
 
@@ -6012,22 +6312,28 @@ fn collect_rar_volumes(dir: &std::path::Path) -> Result<Vec<PathBuf>> {
     Ok(volumes)
 }
 
-/// Post-repair: run the store-mode extraction over repaired volume files
-/// on disk (a straight remap copy - repair already verified the bytes).
-fn try_rars_native(
-    dir: &std::path::Path,
-    first: &std::path::Path,
-    password: Option<&str>,
-) -> Result<()> {
+/// The named RAR volumes in `dir` sharing `first`'s release stem, natural
+/// volume order - the on-disk set an unpack starting at `first` reads.
+/// Same volume-name grammar as reextract_dir: .rar/.rNN by name, rollover
+/// (.sNN..) and numeric (.001) only with the Rar! magic.
+fn stem_volume_set(dir: &std::path::Path, first: &std::path::Path) -> Result<Vec<PathBuf>> {
     use nzbkit::extract::{release_stem, vol_sort_key};
     let first_name = first.file_name().unwrap_or_default().to_string_lossy().to_string();
-    let stem = release_stem(&first_name);
+    // `release_stem` matches suffixes case-insensitively but returns a slice
+    // of the name it was GIVEN, so two stems only compare equal when both
+    // sides went in with the same case. Every `name` below is lowercased for
+    // the extension grammar, so this side must be too. Taken from the
+    // original case, the comparison failed for EVERY file whose stem had a
+    // capital in it: a live 144-volume `raRjHaZZ…partNNN.rar` remux matched
+    // zero volumes, which failed the native unpack (a wasted external-unrar
+    // pass, and an outright failure on a box with no unrar) and left all
+    // 55 GB of spent volumes on disk, because the caller deletes exactly
+    // what this reports.
+    let stem = release_stem(&first_name.to_lowercase());
     let mut volumes: Vec<PathBuf> = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
         let name = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-        // Same volume-name grammar as reextract_dir: .rar/.rNN by name,
-        // rollover (.sNN..) and numeric (.001) only with the Rar! magic.
         let by_name = name.ends_with(".rar")
             || (name.rfind('.').is_some_and(|p| {
                 let t = &name[p + 1..];
@@ -6049,19 +6355,39 @@ fn try_rars_native(
     volumes.sort_by_cached_key(|p| {
         vol_sort_key(&p.file_name().unwrap_or_default().to_string_lossy())
     });
+    Ok(volumes)
+}
+
+/// Post-repair: run the store-mode extraction over repaired volume files
+/// on disk (a straight remap copy - repair already verified the bytes).
+/// A success also returns the volume files it read, so a finalize caller
+/// can delete exactly the spent set.
+fn try_rars_native(
+    dir: &std::path::Path,
+    first: &std::path::Path,
+    password: Option<&str>,
+) -> Result<Vec<PathBuf>> {
+    let volumes = stem_volume_set(dir, first)?;
     if volumes.is_empty() {
-        anyhow::bail!("no volumes found for {first_name}");
+        anyhow::bail!(
+            "no volumes found for {}",
+            first.file_name().unwrap_or_default().to_string_lossy()
+        );
     }
     // Parse WITH the password: header-encrypted (-hp) volumes need it just
     // to read their headers - without it every -hp set silently fell back
     // to the unrar subprocess (and failed outright where unrar is absent).
-    let options = rars::ArchiveReadOptions::with_optional_password(password.map(str::as_bytes));
+    let options = nzbkit::mem::rar_read_options(password.map(str::as_bytes));
+    // One parse session for the whole set: repeated (salt, kdf count)
+    // derivations run once instead of once per volume.
+    let mut parse = rars::ReadSession::new(options);
     let archives = volumes
         .iter()
-        .map(|path| rars::ArchiveReader::read_path_with_options(path, options))
+        .map(|path| parse.read_path(path))
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| anyhow::anyhow!("parsing volumes: {e}"))?;
-    write_archives_to(dir, &archives, password)
+    write_archives_to(dir, &archives, password)?;
+    Ok(volumes)
 }
 
 /// Stream a parsed RAR volume set out to `dir` under each entry's real
@@ -6275,6 +6601,91 @@ fn extract_one_sevenz(
     Ok(())
 }
 
+/// Extract every zip container in `dir`. Returns true only if every one
+/// produced its payload.
+///
+/// Mirrors [`extract_sevenz`] with one deliberate difference: there is no
+/// join step. `nzbkit::zip::Archive` reads a multi-part set through one
+/// logical byte-space, so a split zip never needs a second copy on disk -
+/// which also means no scratch container can collide with a member of the
+/// archive it came from.
+fn extract_zip(dir: &std::path::Path, jobs: &[nzbkit::zip::Finding]) -> bool {
+    let mut all_ok = true;
+    for job in jobs {
+        let out = match ExtractStaging::new(dir) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("⚠ {e}");
+                all_ok = false;
+                continue;
+            }
+        };
+        println!("unpacking {} natively…", job.shape.label());
+        match extract_one_zip(out.path(), &job.parts)
+            .and_then(|()| {
+                if out.produced_anything() {
+                    Ok(())
+                } else {
+                    // "Succeeded" having written nothing is the silent
+                    // success this codebase refuses everywhere else: the
+                    // user would get a green job and an empty folder.
+                    anyhow::bail!("the archive produced no files")
+                }
+            })
+            .and_then(|()| out.publish_into(dir))
+        {
+            Ok(()) => println!("zip unpack complete ✔"),
+            Err(e) => {
+                println!("⚠ zip unpack failed ({e})");
+                all_ok = false;
+            }
+        }
+    }
+    all_ok
+}
+
+/// Extract one zip container (given its parts in read order) into `out`,
+/// an `ExtractStaging` dir - never the directory holding the container.
+///
+/// Every entry goes through the same guards as the 7z path:
+/// `sanitized_entry_path` for zip-slip, and `BombGuardWriter` against a
+/// decompression bomb, with one budget shared across the whole archive.
+/// Symlink entries are refused outright - their payload is a path, and
+/// materializing one plants a link pointing wherever the archive likes.
+fn extract_one_zip(out: &std::path::Path, parts: &[PathBuf]) -> Result<()> {
+    let archive = nzbkit::zip::Archive::open(parts)
+        .map_err(|e| anyhow::anyhow!("opening zip: {e}"))?;
+    let budget = crate::serve::free_bytes(out)
+        .map(|free| free.saturating_sub(EXTRACT_RESERVE))
+        .unwrap_or(u64::MAX);
+    let written = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    for e in archive.entries() {
+        let target = sanitized_entry_path(out, &e.name)
+            .ok_or_else(|| anyhow::anyhow!("entry {:?} escapes the output directory", e.name))?;
+        if e.is_symlink() {
+            anyhow::bail!("entry {:?} is a symlink, which is not extracted", e.name);
+        }
+        if e.is_dir {
+            std::fs::create_dir_all(&target)?;
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut w = BombGuardWriter {
+            inner: std::io::BufWriter::new(std::fs::File::create(&target)?),
+            written: written.clone(),
+            budget,
+        };
+        archive
+            .read_entry_to(e, &mut w)
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+        use std::io::Write as _;
+        w.flush()?;
+    }
+    Ok(())
+}
+
 /// Headroom the decompression-bomb guard leaves free on the target
 /// volume: extraction may use everything but this. Shared by the disk
 /// sink, the 7z sink and the in-stream extractor so all three read the
@@ -6425,6 +6836,47 @@ pub(crate) fn reextract_dir(dir: &std::path::Path, password: Option<&str>) -> Re
         let name = p.file_name().unwrap_or_default().to_string_lossy();
         (release_stem(&name), vol_sort_key(&name))
     });
+    // A RAR4 `-hp` set is opaque to the streaming extractor whatever
+    // password we hold: the main header's MHD_PASSWORD flag is an
+    // unconditional blocker in the in-stream parser, so every volume below
+    // would be read off disk in full only to demote, printing one
+    // "not re-extractable (encrypted headers (password required))" line
+    // per group with a VALID password in hand - 135 of them in the
+    // v1.0.11 report this came from - before the unrar fallback did the
+    // work. The rars fork DOES read those headers with the password
+    // (`try_rars_native` passes it into the parse session), so hand the
+    // set straight there. Gated on a single-set directory because
+    // `try_rars_native` extracts one stem group: with a second set beside
+    // it, the streaming path below is still the one that sees everything.
+    // A native failure just falls through to it, having published nothing
+    // (`write_archives_to` stages and publishes only on full success).
+    let one_set = {
+        // Lowercase both sides - `release_stem` returns a slice of what it
+        // was handed, so a mixed-case stem compares unequal otherwise
+        // (78a5640f).
+        let lower_stem = |p: &PathBuf| {
+            release_stem(&p.file_name().unwrap_or_default().to_string_lossy().to_lowercase())
+        };
+        let stem0 = lower_stem(&rars[0]);
+        rars.iter().all(|p| lower_stem(p) == stem0)
+    };
+    if one_set
+        && password.is_some()
+        && nzbkit::rar::headers_encrypted_to(&rars[0], password)
+    {
+        println!(
+            "re-extracting {} header-encrypted volume(s) natively…",
+            rars.len()
+        );
+        match try_rars_native(dir, &rars[0], password) {
+            Ok(consumed) => {
+                println!("native re-extract complete ✔");
+                remove_spent_volumes(&consumed);
+                return Ok(true);
+            }
+            Err(e) => println!("⚠ native re-extract failed ({e})"),
+        }
+    }
     println!("re-extracting {} repaired volume(s)…", rars.len());
     let ex = Extractor::new(dir, rars.len(), true);
     ex.set_protect_sources();
@@ -6489,7 +6941,16 @@ pub(crate) fn reextract_dir(dir: &std::path::Path, password: Option<&str>) -> Re
         return Ok(true);
     }
     println!("  falling back to unrar on the verified volumes…");
-    Ok(try_unrar(dir, password))
+    // A successful disk unpack spends the volumes exactly like the clean
+    // path above - leaving them behind doubled a job's disk footprint
+    // (Part B, research/SPEC-onepass-obfuscated-store-sets-2026-07-29.md).
+    match try_unrar_spent(dir, password) {
+        Some(spent) => {
+            remove_spent_volumes(&spent);
+            Ok(true)
+        }
+        None => Ok(false),
+    }
 }
 
 /// `.volNNN+MM.par2` / `.volNNN-MMM.par2` → declared recovery-slice count.
@@ -6895,6 +7356,10 @@ async fn try_mapped_repair(
     extractor: &nzbkit::extract::Extractor,
     reports: &[(usize, nzbkit::live::SlotReport)],
     missing_files: &[String],
+    // The operator asked for FULL verification rather than fast: the
+    // self-prove re-reads untouched files with MD5 too, not just their
+    // per-block CRC32s.
+    full_verify: bool,
 ) -> Result<bool> {
     use nzbkit::par2repair::{VolumeIo, recovery_slice_locators, repair_mapped};
     // Gate: no whole-file losses, every set file has a verified slot
@@ -6985,7 +7450,7 @@ async fn try_mapped_repair(
         ex: extractor,
         slot_of: &slot_of,
     };
-    match repair_mapped(&files, bs, &recovery, &io) {
+    match repair_mapped(&files, bs, &recovery, &io, full_verify) {
         Ok(n) => {
             println!(
                 "repair complete in {:.2?} ✔ (native, mapped: {n} block(s) rebuilt directly into the output)",
@@ -6998,6 +7463,65 @@ async fn try_mapped_repair(
             Ok(false)
         }
     }
+}
+
+/// Run the external par2 binary over `out_dir` with OUR handles released.
+///
+/// par2cmdline opens every target and every extra file with no sharing, so a
+/// handle we still hold makes its open fail - and it does not treat that as an
+/// error to report, it treats the file as ABSENT. Measured on Windows before
+/// this parked anything, on a set with one corrupt article:
+///
+/// ```text
+/// Could not open ".\testset.par2": ...used by another process.
+/// Could not open ".\payload.bin":  ...used by another process.
+/// Target: "payload.bin" - missing.
+/// Repair is required. Repair is not possible.
+/// You need 1600 more recovery blocks to be able to repair.
+/// ```
+///
+/// A whole-file "missing" verdict needs the entire file's worth of recovery
+/// blocks, so the fallback could never repair anything on Windows no matter
+/// how much recovery the poster shipped. Unix does not enforce sharing, which
+/// is why this went unnoticed until the suite first ran on Windows.
+///
+/// The writers are unparked on EVERY path - including a failed park and a
+/// failed spawn - because `finish()` still has to settle groups, verify inner
+/// CRCs and run the decrypt pass through these same writers. Returning early
+/// from a half-parked extractor would instead fail each of those writes one by
+/// one, a long way from the cause.
+///
+/// The two failure kinds are kept apart deliberately. The OUTER result is a
+/// handle-discipline failure and aborts the job: a park failure is a SYNC
+/// failure (buffered pwrites never reached disk, so par2 would "repair"
+/// against a stale file and overwrite bytes we were about to land), and an
+/// unpark failure means our own outputs are no longer openable. Neither is
+/// something to continue past. The INNER result is just "did the tool run",
+/// which the caller already handles - a missing par2 binary is an ordinary
+/// outcome here, and folding it in with the above would report a broken sync
+/// as "no par2 installed".
+fn run_external_par2(
+    par2_bin: &std::path::Path,
+    par2_arg: &std::path::Path,
+    extra_args: &[std::path::PathBuf],
+    out_dir: &std::path::Path,
+    extractor: &nzbkit::extract::Extractor,
+) -> Result<std::io::Result<std::process::ExitStatus>> {
+    let parked = extractor.park_outputs();
+    let status = parked.is_ok().then(|| {
+        std::process::Command::new(par2_bin)
+            .arg("repair")
+            .arg("-q")
+            .arg(par2_arg)
+            .args(extra_args)
+            .current_dir(out_dir)
+            .status()
+    });
+    // Unconditional, and BEFORE either `?` below.
+    let unparked = extractor.unpark_outputs();
+    parked.context("releasing our output handles for the external par2")?;
+    unparked.context("reopening our output handles after the external par2")?;
+    Ok(status.expect("status is Some whenever the park succeeded"))
 }
 
 /// Damaged path: fetch the cheapest set of recovery volumes covering
@@ -7013,6 +7537,10 @@ async fn fetch_and_repair(
     main_par2: Option<PathBuf>,
     already_fetched: &[usize],
     buf_pool: Arc<nzbkit::pool::BufPool>,
+    // Parked around every EXTERNAL par2 invocation - par2cmdline cannot open
+    // a file we hold (see `run_external_par2`). Native repair never needs
+    // this: it is in-process and reads through our own handles.
+    extractor: &nzbkit::extract::Extractor,
 ) -> Result<bool> {
     let mut fetched_files: Vec<usize> = Vec::new();
     if needed > 0 {
@@ -7120,17 +7648,26 @@ async fn fetch_and_repair(
     // Every non-par2 file in the dir rides along as an extra file so
     // par2cmdline's sliding scan can adopt misnamed/shifted data - bare
     // `par2 repair <set>` never looks at files it wasn't told about.
+    //
+    // Our OWN bookkeeping is excluded (`.nzbfast*`, the house convention for
+    // internal names - see disk.rs). `.nzbfast.journal` is the live record of
+    // what is still missing and it is held open for the whole download: naming
+    // it here made par2 try to open it, fail on Windows, and print a scary
+    // "could not access" line about a file that was never a repair candidate.
+    // It cannot contribute blocks either - it is not in the recovery set.
     let extra_files: Vec<std::ffi::OsString> = std::fs::read_dir(out_dir)
         .into_iter()
         .flatten()
         .filter_map(|e| {
             let e = e.ok()?;
             let p = e.path();
+            let name = p.file_name()?.to_owned();
             (e.file_type().ok()?.is_file()
+                && !name.to_string_lossy().starts_with(".nzbfast")
                 && !p
                     .extension()
                     .is_some_and(|x| x.eq_ignore_ascii_case("par2")))
-            .then(|| p.file_name().map(|n| n.to_owned()))?
+            .then_some(name)
         })
         .take(1000)
         .collect();
@@ -7143,14 +7680,7 @@ async fn fetch_and_repair(
     let dot = std::path::Path::new(".");
     let par2_arg = dot.join(&par2_name);
     let extra_args: Vec<std::path::PathBuf> = extra_files.iter().map(|f| dot.join(f)).collect();
-    match std::process::Command::new(&par2_bin)
-        .arg("repair")
-        .arg("-q")
-        .arg(&par2_arg)
-        .args(&extra_args)
-        .current_dir(out_dir)
-        .status()
-    {
+    match run_external_par2(&par2_bin, &par2_arg, &extra_args, out_dir, extractor)? {
         Ok(st) if st.success() => {
             println!("repair complete in {:.2?} ✔", t0.elapsed());
             return Ok(true);
@@ -7184,14 +7714,7 @@ async fn fetch_and_repair(
     if native_repair() {
         return Ok(true);
     }
-    match std::process::Command::new(&par2_bin)
-        .arg("repair")
-        .arg("-q")
-        .arg(&par2_arg)
-        .args(&extra_args)
-        .current_dir(out_dir)
-        .status()
-    {
+    match run_external_par2(&par2_bin, &par2_arg, &extra_args, out_dir, extractor)? {
         Ok(st) if st.success() => {
             println!("repair complete (second pass) ✔");
             Ok(true)
@@ -8097,6 +8620,86 @@ mod repair_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `park`'s SELECTION had no direct coverage: it was exercised only
+    /// through the three `compressed_*` e2e tests, and Part B of the
+    /// one-pass spec deletes spent volumes BEFORE the nested pass, so
+    /// `outer_vols_on_disk()` is false there now and those tests park
+    /// nothing. The path is still live in production (encrypted-no-password
+    /// keeps its volumes; a `spent()` that reports nothing leaves them), and
+    /// getting the selection wrong in either direction is bad: park too
+    /// little and the nested pass re-extracts the outer set beside the
+    /// payload, park too much and the payload itself vanishes mid-pass.
+    #[test]
+    fn outer_hold_parks_only_the_outer_volume_set() {
+        let dir = reex_dir("holdpark");
+        let stems: std::collections::HashSet<String> =
+            ["Release.Name.2015.2160p-GRP".to_string()].into_iter().collect();
+        let vols = ["Release.Name.2015.2160p-GRP.part001.rar", "Release.Name.2015.2160p-GRP.part002.rar"];
+        for v in vols {
+            std::fs::write(dir.join(v), v.as_bytes()).unwrap();
+        }
+        // Produced BY the outer unpack - a different stem, so the nested pass
+        // must still see it.
+        std::fs::write(dir.join("inner.rar"), b"nested archive").unwrap();
+        // Not a RAR at all, and a subdirectory: neither is park's business.
+        std::fs::write(dir.join("movie.mkv"), b"payload").unwrap();
+        std::fs::create_dir_all(dir.join("Sub")).unwrap();
+        std::fs::write(dir.join("Sub/Release.Name.2015.2160p-GRP.part003.rar"), b"deeper").unwrap();
+
+        let hold = {
+            let parked = super::OuterHold::park(&dir, &stems).unwrap();
+            let hold = dir.join(".nzbfast-outer-hold");
+            for v in vols {
+                assert!(hold.join(v).is_file(), "{v} was not parked");
+                assert!(!dir.join(v).exists(), "{v} left behind in the job dir");
+            }
+            assert!(dir.join("inner.rar").is_file(), "the nested archive was parked");
+            assert!(dir.join("movie.mkv").is_file(), "the payload was parked");
+            assert!(
+                dir.join("Sub/Release.Name.2015.2160p-GRP.part003.rar").is_file(),
+                "park reached into a subdirectory"
+            );
+            drop(parked);
+            hold
+        };
+
+        // Drop puts the set back byte-exact and takes the hold with it.
+        for v in vols {
+            assert_eq!(std::fs::read(dir.join(v)).unwrap(), v.as_bytes(), "{v} not restored");
+        }
+        assert!(!hold.exists(), "an emptied hold should be removed");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A crashed run can leave volumes parked. The next `park` must fold
+    /// them back before it starts, or the second park's hold silently
+    /// shadows the first one's contents and the restore returns only half
+    /// the set to the job dir.
+    #[test]
+    fn outer_hold_park_folds_back_a_crashed_runs_hold_first() {
+        let dir = reex_dir("holdcrash");
+        let stems: std::collections::HashSet<String> =
+            ["x".to_string()].into_iter().collect();
+        // Left behind by a run that died mid-pass.
+        let stale = dir.join(".nzbfast-outer-hold");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("x.part001.rar"), b"vol one").unwrap();
+        // ...while volume two is still sitting in the job dir.
+        std::fs::write(dir.join("x.part002.rar"), b"vol two").unwrap();
+
+        let parked = super::OuterHold::park(&dir, &stems).unwrap();
+        assert!(
+            stale.join("x.part001.rar").is_file() && stale.join("x.part002.rar").is_file(),
+            "park did not fold the stale hold back before re-parking"
+        );
+        drop(parked);
+
+        assert_eq!(std::fs::read(dir.join("x.part001.rar")).unwrap(), b"vol one");
+        assert_eq!(std::fs::read(dir.join("x.part002.rar")).unwrap(), b"vol two");
+        assert!(!stale.exists(), "an emptied hold should be removed");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// ...and the ordinary path still cleans up after itself.
     #[test]
     fn outer_hold_restores_and_removes_itself_when_it_can() {
@@ -8322,6 +8925,146 @@ mod repair_tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Part B (research/SPEC-onepass-obfuscated-store-sets-2026-07-29.md):
+    /// a set the streaming extractor DEMOTES (two compressed entries in
+    /// one volume, so the chase cannot own it) unpacks through the
+    /// `try_unrar` fallback - and that success must spend the volumes
+    /// exactly like the clean path above does, instead of leaving the
+    /// full set beside the payload (observed live: 144 volumes, ~57 GB,
+    /// beside a 58.76 GB extracted movie).
+    #[test]
+    fn reextract_dir_demoted_set_removes_spent_volumes() {
+        use rars::rar50::{CompressedEntry, Rar50Writer, WriterOptions};
+        let dir = reex_dir("spent-demoted");
+        let a: Vec<u8> = (0..150_000u32)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(1))
+            .collect();
+        let b: Vec<u8> = (0..120_000u32)
+            .map(|i| (i as u8).wrapping_mul(19).wrapping_add(5))
+            .collect();
+        let archive = Rar50Writer::new(WriterOptions::default())
+            .compressed_entries(&[
+                CompressedEntry { name: b"a.bin", data: &a, mtime: None, attributes: 0, host_os: 0 },
+                CompressedEntry { name: b"b.bin", data: &b, mtime: None, attributes: 0, host_os: 0 },
+            ])
+            .finish()
+            .unwrap();
+        std::fs::write(dir.join("set.rar"), &archive).unwrap();
+        assert!(reextract_dir(&dir, None).unwrap(), "the fallback unpack failed");
+        assert_eq!(std::fs::read(dir.join("a.bin")).unwrap(), a);
+        assert_eq!(std::fs::read(dir.join("b.bin")).unwrap(), b);
+        assert_eq!(
+            names_in(&dir),
+            vec!["a.bin".to_string(), "b.bin".to_string()],
+            "spent volumes survived the fallback unpack"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// KEEP (Part B): an encrypted set with no password. The verified
+    /// volumes ARE the deliverable until a password arrives, and the
+    /// unlock flow re-reads them - a successful "password required" pass
+    /// must leave every volume in place. Once the password shows up, the
+    /// unlock spends them like any other successful unpack.
+    #[test]
+    fn reextract_dir_encrypted_no_password_keeps_volumes() {
+        use nzbkit::rar::fixtures;
+        let dir = reex_dir("spent-enc-keep");
+        let plain: Vec<u8> = (0..90_000u32)
+            .map(|i| (i as u8).wrapping_mul(41).wrapping_add(7))
+            .collect();
+        let f = fixtures::encrypt_file("sesame", &plain, 9);
+        let vol = fixtures::rar5_volume_enc_headers(
+            &[("film.mkv", &f, 0..f.cipher.len(), false, false)],
+            None,
+            "sesame",
+            9,
+        );
+        std::fs::write(dir.join("x.rar"), &vol).unwrap();
+        assert!(
+            reextract_dir(&dir, None).unwrap(),
+            "verified encrypted volumes are a deliverable, not a failure"
+        );
+        assert!(
+            dir.join("x.rar").exists(),
+            "encrypted volumes must survive until a password arrives"
+        );
+        assert!(!dir.join("film.mkv").exists());
+
+        // ...and the unlock that follows (same entry point smart::unlock
+        // uses) both produces the payload and spends the volumes.
+        assert!(reextract_dir(&dir, Some("sesame")).unwrap(), "unlock failed");
+        assert_eq!(std::fs::read(dir.join("film.mkv")).unwrap(), plain);
+        assert!(
+            !dir.join("x.rar").exists(),
+            "volumes are spent once the unlock succeeds"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A RAR4 `-hp` set with the password in hand. The streaming
+    /// extractor can never map this shape (the MHD_PASSWORD blocker is
+    /// unconditional - see `nzbkit::rar::headers_encrypted_to`, which
+    /// carries the discriminator's own test), so `reextract_dir` hands it
+    /// to the native disk path instead of reading every volume off disk
+    /// to demote. What is asserted here is the ladder's end state: the
+    /// payload is out and the volume is spent, with no unrar in the story.
+    #[test]
+    fn reextract_dir_unpacks_a_rar4_header_encrypted_set() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../vendor/rars/tests/fixtures/rar15_40/encrypted/header_rar420_password.rar",
+        );
+        let dir = reex_dir("rar4-hp");
+        std::fs::copy(&fixture, dir.join("x.rar")).unwrap();
+        assert!(
+            reextract_dir(&dir, Some("password")).unwrap(),
+            "a RAR4 -hp set with its password must unpack"
+        );
+        let out = std::fs::read(dir.join("hello.txt")).unwrap();
+        assert_eq!(
+            crc32fast::hash(&out),
+            0xa538_535e,
+            "decrypted payload CRC (fixture README oracle)"
+        );
+        assert!(!dir.join("x.rar").exists(), "the volume is spent once the payload is out");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// KEEP (Part B): a failed unpack. The volumes are the only recovery,
+    /// so `try_unrar_spent` answers None and nothing may be deleted.
+    #[test]
+    fn failed_unpack_reports_none_and_keeps_volumes() {
+        let dir = reex_dir("spent-fail-keep");
+        let mut junk = b"Rar!\x1a\x07\x01\x00".to_vec();
+        junk.extend(std::iter::repeat(0xA5u8).take(4096));
+        std::fs::write(dir.join("x.rar"), &junk).unwrap();
+        assert_eq!(try_unrar_spent(&dir, None), None);
+        assert!(dir.join("x.rar").exists(), "a failed unpack must keep its volumes");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// KEEP (Part B): the offline `nzbfast extract` flow (depth 0 of the
+    /// nested pass) unpacks over the USER'S OWN directory - retention
+    /// there is finalize/policy's call, and spent-volume deletion belongs
+    /// to the daemon finalize and reextract flows alone.
+    #[test]
+    fn offline_extract_keeps_named_volumes_at_depth_zero() {
+        let dir = reex_dir("spent-offline-keep");
+        let total: Vec<u8> = (0..250_000u32)
+            .map(|i| (i as u8).wrapping_mul(11).wrapping_add(3))
+            .collect();
+        let vols = reex_vols(&total);
+        std::fs::write(dir.join("x.rar"), &vols[0]).unwrap();
+        std::fs::write(dir.join("x.r00"), &vols[1]).unwrap();
+        assert!(extract_nested(&dir, None, 0).unwrap().produced());
+        assert_eq!(std::fs::read(dir.join("film.mkv")).unwrap(), total);
+        assert!(
+            dir.join("x.rar").exists() && dir.join("x.r00").exists(),
+            "the offline flow must never delete volumes in the user's own directory"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Phase 0(b): the disk post-pass classifies and tallies a nested
     /// layer. `nested_inner_kind` names the shape from the head (store vs
     /// compressed), and `extract_one_level` at depth 1 (a nested level)
@@ -8478,6 +9221,62 @@ mod repair_tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(left.len(), 2, "staging leaked into the job dir: {left:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Live 1.0.11b8 failure (Avengers remux, 57.8 GB): a 144-volume set
+    /// renamed out of obfuscation to `raRjHaZZ…partNNN.rar` reported "no
+    /// volumes found for …part001.rar", and the external unrar then
+    /// unpacked the very same directory. `release_stem` compares suffixes
+    /// case-insensitively but returns a slice of the name it was HANDED, so
+    /// the stem taken from the original-case first volume never equalled
+    /// the stem of a lowercased directory entry - zero matches for any
+    /// mixed-case stem. Two costs, both observed: a whole wasted
+    /// external-unrar pass (an outright failure where unrar is absent), and
+    /// 55 GB of spent volumes left on disk, since the caller deletes
+    /// exactly the set this reports.
+    #[test]
+    fn stem_volume_set_matches_a_mixed_case_obfuscated_part_set() {
+        let dir = reex_dir("stem-case");
+        // The real stem from the live job, capitals and all.
+        let stem = "raRjHaZZWXEY9fdmj3bofuaWRrAbj1n";
+        let magic = b"Rar!\x1a\x07\x01\x00";
+        for n in 1..=5u32 {
+            std::fs::write(dir.join(format!("{stem}.part{n:03}.rar")), magic).unwrap();
+        }
+        // A second, unrelated set must stay out of the reported group.
+        std::fs::write(dir.join("OtherRelease.part001.rar"), magic).unwrap();
+
+        let first = dir.join(format!("{stem}.part001.rar"));
+        let found = stem_volume_set(&dir, &first).unwrap();
+        let names: Vec<String> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            (1..=5u32).map(|n| format!("{stem}.part{n:03}.rar")).collect::<Vec<_>>(),
+            "a mixed-case .partNNN set must resolve in volume order"
+        );
+
+        // The same set with the capitals in the OTHER direction: a
+        // lowercased first volume against mixed-case entries on disk. The
+        // pre-fix code got this one right by accident, and it must stay
+        // right - the comparison has to be case-insensitive both ways.
+        let lower_first = dir.join(format!("{}.part001.rar", stem.to_lowercase()));
+        assert_eq!(
+            stem_volume_set(&dir, &lower_first).unwrap().len(),
+            5,
+            "the stem comparison must be case-insensitive in both directions"
+        );
+
+        // A stem with no sibling is still its own group, and picking it must
+        // not drag in the 5-volume set next to it.
+        assert_eq!(
+            stem_volume_set(&dir, &dir.join("OtherRelease.part001.rar")).unwrap().len(),
+            1,
+            "the foreign stem is its own one-volume group"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -11485,6 +12284,23 @@ mod scan_pass_tests {
         (dir, ix)
     }
 
+    /// Tear the fixture down, closing the index BEFORE removing its
+    /// directory.
+    ///
+    /// The drop is load-bearing, not tidiness. `Index` holds an open SQLite
+    /// connection to `dir/index.db`, and SQLite opens its files without
+    /// FILE_SHARE_DELETE, so Windows refuses to remove the directory
+    /// underneath it: "The process cannot access the file because it is
+    /// being used by another process" (os error 32). Unix unlinks an open
+    /// file quite happily, which is why leaving the connection alive was
+    /// invisible here for as long as the suite only ever ran on Linux and
+    /// macOS. Every product assertion in these tests passed first - the
+    /// teardown was the only thing Windows objected to.
+    fn teardown(dir: PathBuf, ix: nzbkit::index::Index) {
+        drop(ix);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// BUG (HIGH): one wedged scan worker froze ALL indexing for the
     /// process lifetime. Each worker held a clone of the result sender and
     /// the collector was a bare `while let Some(..) = rx.recv().await`, so
@@ -11532,7 +12348,7 @@ mod scan_pass_tests {
         // off as scanned forever.
         assert_eq!(ix.high_water("alt.test", "srv1"), 199);
         drop(wedged);
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(dir, ix);
     }
 
     /// The control: a healthy pass must still report complete, so the
@@ -11571,7 +12387,7 @@ mod scan_pass_tests {
         assert!(pass.complete);
         assert_eq!(pass.scanned, 200);
         assert_eq!(ix.high_water("alt.test", "srv1"), 299);
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(dir, ix);
     }
 
     /// A HOLE in the middle must not let the mark jump the gap, abandoned
@@ -11615,7 +12431,7 @@ mod scan_pass_tests {
             "the mark must stop at the hole, not follow the last chunk in"
         );
         drop(wedged);
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(dir, ix);
     }
 }
 
@@ -11697,5 +12513,146 @@ mod main_tests {
         assert!(!local.starts_with("download incomplete"), "{local}");
         assert!(local.contains("5 decode/write error"));
         assert!(local.contains("no missing segments"));
+    }
+}
+
+/// Zip disk extraction (the 7z path's twin). The reader itself is tested
+/// in `nzbkit::zip`; these cover the WIRING - what lands in the output
+/// directory, and the refusals that keep a hostile archive out of it.
+#[cfg(test)]
+mod zip_extract_tests {
+    use nzbkit::zip::fixtures::Spec;
+    use std::path::PathBuf;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("nzbfast-zipx-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn payload(n: usize, seed: u8) -> Vec<u8> {
+        (0..n).map(|i| (i as u8).wrapping_mul(23).wrapping_add(seed)).collect()
+    }
+
+    /// The headline change: a zip payload used to FAIL the job with
+    /// "zip extraction is not built in". It now unpacks, and the
+    /// container is gone from the output because its payload replaced it.
+    #[test]
+    fn a_zip_payload_unpacks_into_the_output_directory() {
+        let dir = tmp("payload");
+        let movie = payload(120_000, 3);
+        let nfo = b"release info".to_vec();
+        let z = nzbkit::zip::fixtures::zip_of(&[
+            Spec::deflated("Some.Movie/movie.mkv", &movie),
+            Spec::stored("Some.Movie/info.nfo", &nfo),
+        ]);
+        std::fs::write(dir.join("payload.zip"), &z).unwrap();
+
+        let found = nzbkit::zip::scan(&dir);
+        assert_eq!(found.len(), 1);
+        assert!(super::extract_zip(&dir, &found), "zip should unpack");
+        assert_eq!(std::fs::read(dir.join("Some.Movie/movie.mkv")).unwrap(), movie);
+        assert_eq!(std::fs::read(dir.join("Some.Movie/info.nfo")).unwrap(), nfo);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Zip-slip: an entry naming its way out of the output directory must
+    /// be refused, and nothing may be written outside it.
+    #[test]
+    fn an_entry_escaping_the_output_directory_is_refused() {
+        let dir = tmp("slip");
+        let inner = dir.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        let z = nzbkit::zip::fixtures::zip_of(&[Spec::stored(
+            "../../escaped.txt",
+            b"should never land",
+        )]);
+        std::fs::write(inner.join("evil.zip"), &z).unwrap();
+
+        let found = nzbkit::zip::scan(&inner);
+        assert!(!super::extract_zip(&inner, &found), "zip-slip must not succeed");
+        assert!(!dir.join("escaped.txt").exists(), "wrote outside the output dir");
+        assert!(!inner.join("escaped.txt").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A symlink entry's payload is a PATH. Materializing one plants a
+    /// link pointing wherever the archive likes, so it is refused.
+    #[test]
+    fn a_symlink_entry_is_refused() {
+        let dir = tmp("link");
+        let z = nzbkit::zip::fixtures::zip_of(&[Spec {
+            external: 0xA1FF_0000,
+            ..Spec::stored("link", b"/etc/passwd")
+        }]);
+        std::fs::write(dir.join("l.zip"), &z).unwrap();
+        let found = nzbkit::zip::scan(&dir);
+        assert!(!super::extract_zip(&dir, &found), "symlink entry must not extract");
+        assert!(!dir.join("link").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Damaged bytes must not be published: a wrong CRC fails the job
+    /// rather than landing a corrupt file that looks like success.
+    #[test]
+    fn a_damaged_entry_fails_instead_of_publishing() {
+        let dir = tmp("crc");
+        let data = payload(40_000, 7);
+        let z = nzbkit::zip::fixtures::zip_of(&[Spec {
+            crc_override: Some(0x1234_5678),
+            ..Spec::stored("movie.mkv", &data)
+        }]);
+        std::fs::write(dir.join("d.zip"), &z).unwrap();
+        let found = nzbkit::zip::scan(&dir);
+        assert!(!super::extract_zip(&dir, &found), "a bad CRC must fail the unpack");
+        assert!(!dir.join("movie.mkv").exists(), "corrupt output was published");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A method we decline still reports honestly rather than opening
+    /// and producing nothing - and it names the codec.
+    #[test]
+    fn a_declined_method_fails_with_the_codec_named() {
+        let dir = tmp("bz");
+        let z = nzbkit::zip::fixtures::zip_of(&[Spec {
+            method: 12,
+            ..Spec::stored("movie.mkv", &payload(2_000, 9))
+        }]);
+        std::fs::write(dir.join("b.zip"), &z).unwrap();
+        let found = nzbkit::zip::scan(&dir);
+        assert!(!super::extract_zip(&dir, &found));
+        // The container survives for the user to unpack by hand.
+        assert!(dir.join("b.zip").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `.cbz` and friends ARE zip containers but are the deliverable.
+    /// The collector must never hand one to the extractor.
+    #[test]
+    fn a_cbz_payload_is_never_unpacked() {
+        let dir = tmp("cbz");
+        let z = nzbkit::zip::fixtures::zip_of(&[Spec::stored("page01.jpg", b"jpegbytes")]);
+        std::fs::write(dir.join("comic.cbz"), &z).unwrap();
+        assert!(nzbkit::zip::scan(&dir).is_empty(), "a .cbz must not be collected");
+        assert!(dir.join("comic.cbz").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A byte-split set extracts without a join step - and without ever
+    /// writing a second copy of the container to disk.
+    #[test]
+    fn a_split_zip_set_unpacks_without_a_scratch_copy() {
+        let dir = tmp("split");
+        let data = payload(90_000, 11);
+        let z = nzbkit::zip::fixtures::zip_of(&[Spec::deflated("movie.mkv", &data)]);
+        let cut = z.len() / 2;
+        std::fs::write(dir.join("m.zip.001"), &z[..cut]).unwrap();
+        std::fs::write(dir.join("m.zip.002"), &z[cut..]).unwrap();
+        let found = nzbkit::zip::scan(&dir);
+        assert_eq!(found.len(), 1);
+        assert!(super::extract_zip(&dir, &found));
+        assert_eq!(std::fs::read(dir.join("movie.mkv")).unwrap(), data);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

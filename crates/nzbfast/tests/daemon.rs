@@ -279,17 +279,42 @@ async fn sonarr_style_cycle() {
     )
     .unwrap();
     // Post-proc hook (M14d): records SAB-contract args + env for assert.
-    let hook = dir.join("hook.sh");
-    std::fs::write(
-        &hook,
-        "#!/bin/sh\nprintf 'args:%s|%s|%s|%s\\nenv:%s|%s|%s\\n' \"$1\" \"$3\" \"$5\" \"$7\" \"$SAB_PP_STATUS\" \"$SAB_FINAL_NAME\" \"$SAB_CAT\" > \"$(dirname \"$0\")/hook.out\"\n",
-    )
-    .unwrap();
+    //
+    // Written in the host's own script language, because `run_script` spawns
+    // the file directly and a `#!/bin/sh` shebang means nothing on Windows -
+    // there is no /bin/sh to honour it, so the hook simply never ran and this
+    // suite reported "hook never ran" the first time it was run there. Rust
+    // CAN spawn a .cmd (std applies cmd.exe's own argument escaping to
+    // .bat/.cmd since the BatBadBut fix), so the Windows leg exercises the
+    // real post-processing contract rather than skipping it.
     #[cfg(unix)]
-    {
+    let hook = {
+        let hook = dir.join("hook.sh");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\nprintf 'args:%s|%s|%s|%s\\nenv:%s|%s|%s\\n' \"$1\" \"$3\" \"$5\" \"$7\" \"$SAB_PP_STATUS\" \"$SAB_FINAL_NAME\" \"$SAB_CAT\" > \"$(dirname \"$0\")/hook.out\"\n",
+        )
+        .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+        hook
+    };
+    #[cfg(windows)]
+    let hook = {
+        let hook = dir.join("hook.cmd");
+        // `%~dp0` carries its own trailing separator. `|` is a pipe to cmd
+        // even inside a parenthesised block, hence `^|`, and `%~1` strips the
+        // quotes Windows leaves around a path argument containing spaces.
+        std::fs::write(
+            &hook,
+            "@echo off\r\n> \"%~dp0hook.out\" (\r\n\
+             echo args:%~1^|%~3^|%~5^|%~7\r\n\
+             echo env:%SAB_PP_STATUS%^|%SAB_FINAL_NAME%^|%SAB_CAT%\r\n\
+             )\r\n",
+        )
+        .unwrap();
+        hook
+    };
     let d = serve(&dir, |port| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
         // The daemon mints an API key on a genuinely first run (see
@@ -391,7 +416,9 @@ async fn sonarr_style_cycle() {
         assert!(!rec.is_empty(), "hook never ran");
         assert!(rec.contains("|episode|tv|0"), "{rec}"); // clean name, cat, pp=OK
         assert!(rec.contains("env:0|episode|tv"), "{rec}");
-        assert!(rec.contains("complete/tv/episode"), "{rec}"); // $1 final dir
+        // $1 final dir, separator-normalised: the daemon hands the script a
+        // NATIVE path, so this is "complete\\tv\\episode" on Windows.
+        assert!(rec.replace('\\', "/").contains("complete/tv/episode"), "{rec}");
     })
     .await
     .unwrap();
@@ -2096,7 +2123,10 @@ async fn queue_survives_restart() {
         assert!(h.contains(&keeper_id), "history lost across restart: {h}");
         assert!(h.contains("\"Completed\""), "{h}");
         // The restored category survives too (out_dir under complete/tv).
-        assert!(h.contains("complete/tv/j"), "{h}");
+        // Compared with the separator normalised: the daemon reports NATIVE
+        // paths, so on Windows this reads "complete\\tv\\j" (JSON-escaped)
+        // and a literal "complete/tv/j" could never match.
+        assert!(h.replace("\\\\", "/").contains("complete/tv/j"), "{h}");
 
         // Resume the restored job - it must actually download.
         http(
@@ -3756,6 +3786,140 @@ async fn live_settings_survive_restart() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A pause is a deliberate act, and a restart used to undo it silently:
+/// the queue came back at full speed with nothing on screen saying the
+/// user's choice had been dropped. An update, a crash or a reboot all hit
+/// this, and a metered connection pays for it.
+///
+/// Four cases, because the naive fix breaks two of them:
+///  - a plain pause survives a kill -9 (persistence cannot depend on a
+///    graceful shutdown - a crash is exactly when it matters);
+///  - a resume is not "no news", it clears the pause for good;
+///  - a timed pause whose deadline passed while the daemon was down comes
+///    back RUNNING - "pause for 30 minutes" is a statement about when
+///    downloading may start again, not a fresh 30 minutes on every boot;
+///  - `mode=shutdown` pauses the queue as part of winding down, and that
+///    internal pause must NOT be recorded, or every clean quit would come
+///    back paused.
+#[tokio::test(flavor = "multi_thread")]
+async fn pause_survives_restart() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-pausep-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Nothing connects to it (no jobs are queued), so a dead port is fine.
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!("{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}", free_port()),
+    )
+    .unwrap();
+    let build = |port: u16| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--out")
+            .arg(dir.join("complete"));
+        c
+    };
+    let settings = dir.join("settings.json");
+    let paused_now = |port: u16| {
+        let q = http(port, "/api?mode=queue&output=json", None);
+        assert!(q.contains("\"paused\":"), "no queue paused flag: {q}");
+        q.contains("\"paused\":true")
+    };
+
+    // 1. PAUSE, then kill -9.
+    let a = serve(&dir, &build).await;
+    let port_a = a.port;
+    tokio::task::spawn_blocking(move || {
+        let r = http(port_a, "/api?mode=pause&output=json", None);
+        assert!(r.contains("\"status\":true"), "{r}");
+        assert!(paused_now(port_a), "pause did not take effect");
+    })
+    .await
+    .unwrap();
+    drop(a);
+
+    // Still paused on the next boot - the whole point.
+    let b = serve(&dir, &build).await;
+    let port_b = b.port;
+    tokio::task::spawn_blocking(move || {
+        assert!(paused_now(port_b), "pause was lost across a restart");
+        // 2. RESUME, so the next boot must come back running.
+        let r = http(port_b, "/api?mode=resume&output=json", None);
+        assert!(r.contains("\"status\":true"), "{r}");
+        assert!(!paused_now(port_b), "resume did not take effect");
+    })
+    .await
+    .unwrap();
+    drop(b);
+    let s = std::fs::read_to_string(&settings).unwrap_or_default();
+    assert!(!s.contains("\"paused\""), "resume left a pause behind: {s}");
+
+    let c = serve(&dir, &build).await;
+    let port_c = c.port;
+    tokio::task::spawn_blocking(move || {
+        assert!(!paused_now(port_c), "came back paused after a resume");
+        // 3. A timed pause, forced to look like one that fell due while
+        // the daemon was down. Set it live so the deadline is written by
+        // the daemon, then wind the deadline back on disk.
+        let r = http(port_c, "/api?mode=pause&value=30&output=json", None);
+        assert!(r.contains("\"status\":true"), "{r}");
+        assert!(paused_now(port_c), "timed pause did not take effect");
+    })
+    .await
+    .unwrap();
+    drop(c);
+    let s = std::fs::read_to_string(&settings).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&s).unwrap();
+    let deadline = v["pause_until_unix"].as_i64().expect("timed pause wrote no deadline");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert!(
+        deadline > now + 25 * 60 && deadline <= now + 30 * 60,
+        "deadline is not ~30 min out ({deadline} vs now {now}) - stored as an interval?"
+    );
+    v["pause_until_unix"] = serde_json::json!(now - 5);
+    std::fs::write(&settings, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+
+    let d = serve(&dir, &build).await;
+    let port_d = d.port;
+    tokio::task::spawn_blocking(move || {
+        assert!(!paused_now(port_d), "an expired timed pause came back paused");
+        // 4. A clean shutdown pauses internally; that must not be saved.
+        let r = http(port_d, "/api?mode=shutdown&output=json", Some(("text/plain", b"")));
+        assert!(r.contains("\"status\":true"), "{r}");
+    })
+    .await
+    .unwrap();
+    // Let the daemon finish exiting before reading what it left on disk.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    drop(d);
+    let s = std::fs::read_to_string(&settings).unwrap_or_default();
+    assert!(
+        !s.contains("\"paused\""),
+        "a clean shutdown recorded its own internal pause: {s}"
+    );
+
+    let e = serve(&dir, &build).await;
+    let port_e = e.port;
+    tokio::task::spawn_blocking(move || {
+        assert!(!paused_now(port_e), "came back paused after a clean shutdown");
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The two rename-punctuation toggles replaced behaviour that used to be
 /// hard-coded ON. Fresh installs get the new default, but an install that
 /// already has state has to keep the old shape: history cleanup recomputes
@@ -3937,8 +4101,11 @@ async fn auto_retry_fires_once_after_cooldown() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A zip-packed post, end to end - the shape a user reported as "it
-/// downloaded and there was nothing there".
+/// A zip post whose container cannot be READ (here: zip magic over
+/// bytes that are not an archive) - the shape a user reported as "it
+/// downloaded and there was nothing there". Store/deflate zips now
+/// unpack natively (see `zip_payload_post_unpacks_natively` below); this
+/// pins what happens when one still cannot be produced.
 ///
 /// Three things have to hold at once, and each of them was broken:
 /// the queue warns BEFORE the download (the NZB's file list is enough
@@ -4062,7 +4229,7 @@ async fn zip_payload_post_fails_with_a_reason() {
         // release instead.
         assert!(hist.contains("\"Failed\""), "a zip payload must fail the job: {hist}");
         assert!(
-            hist.contains("zip extraction is not built in"),
+            hist.contains("could not be unpacked"),
             "history must say why, not just that it failed: {hist}"
         );
         assert!(warned || hist.contains("\"zip_packed\":true"), "no zip warning anywhere: {hist}");
@@ -4088,6 +4255,151 @@ async fn zip_payload_post_fails_with_a_reason() {
     .await
     .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The other half, and the behaviour change: a REAL store+deflate zip
+/// payload now unpacks natively, so the job COMPLETES with the payload
+/// on disk instead of failing with the archive left for the user.
+///
+/// Keep-media-only is on, as in the failing twin - the sweep must keep
+/// the extracted media and must not trip over the container it replaced.
+#[tokio::test(flavor = "multi_thread")]
+async fn zip_payload_post_unpacks_natively() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-zipok-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let stem = "Some.Movie.2021.1080p.BluRay.x264-TEST";
+    let movie: Vec<u8> = (0..300_000u32).map(|i| (i as u8).wrapping_mul(37)).collect();
+    let zip = nzbkit::zip::fixtures::zip_of(&[
+        nzbkit::zip::fixtures::Spec::deflated("Some.Movie.2021.mkv", &movie),
+        nzbkit::zip::fixtures::Spec::stored("readme.nfo", b"scene info"),
+    ]);
+    let mut articles = HashMap::new();
+    let segs = make_file_articles(&format!("{stem}.zip"), &zip, 40_000, "zipok", &mut articles);
+    let srv = MockServer::start(articles, Chaos::default()).await;
+
+    let mut xml = String::from(
+        "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n",
+    );
+    xml.push_str(&format!(
+        "  <file poster=\"x\" date=\"0\" subject=\"&quot;{stem}.zip&quot; yEnc (1/{})\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+        segs.len()
+    ));
+    for (id, bytes, num) in segs.iter() {
+        xml.push_str(&format!(
+            "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+        ));
+    }
+    xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"));
+        c
+    })
+    .await;
+    let port = d.port;
+
+    let dir2 = dir.clone();
+    tokio::task::spawn_blocking(move || {
+        let r = http(
+            port,
+            "/api?mode=config&name=rename_media_only&value=1&apikey=sekrit&output=json",
+            None,
+        );
+        assert!(r.contains("\"status\":true"), "{r}");
+
+        let boundary = "----nzbfastboundary";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"{stem}.nzb\"\r\nContent-Type: application/x-nzb\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(xml.as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let ctype = format!("multipart/form-data; boundary={boundary}");
+        let r = http(port, "/api?mode=addfile&apikey=sekrit&output=json", Some((&ctype, &body)));
+        assert!(r.contains("nzo_ids"), "{r}");
+
+        let mut hist = String::new();
+        for _ in 0..200 {
+            hist = http(port, "/api?mode=history&apikey=sekrit&output=json", None);
+            if hist.contains("\"Completed\"") || hist.contains("\"Failed\"") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        assert!(hist.contains("\"Completed\""), "a store/deflate zip must complete: {hist}");
+
+        let out = std::fs::read_dir(dir2.join("complete"))
+            .expect("complete dir")
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.is_dir())
+            .expect("job output dir");
+        // The payload landed, byte-exact, and the container it came from
+        // is gone (its bytes are the payload now). The auto-renamer gives
+        // the media file the release name, so match on the extension.
+        let mkv = walk_find_ext(&out, "mkv").unwrap_or_else(|| {
+            panic!("no extracted payload under {}", out.display())
+        });
+        assert_eq!(std::fs::read(&mkv).unwrap(), movie, "extracted bytes differ");
+        let left: Vec<String> = std::fs::read_dir(&out)
+            .expect("output dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !left.iter().any(|n| n.ends_with(".zip")),
+            "the container should be gone once its payload landed: {left:?}"
+        );
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Find a file by EXTENSION anywhere under `root`. The auto-renamer both
+/// renames the payload to the release name and may tidy it into a
+/// subfolder, so neither the name nor the depth is fixed.
+fn walk_find_ext(root: &std::path::Path, ext: &str) -> Option<std::path::PathBuf> {
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(d) = dirs.pop() {
+        for e in std::fs::read_dir(&d).ok()?.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                dirs.push(p);
+            } else if p.extension().is_some_and(|x| x == ext) {
+                return Some(p);
+            }
+        }
+    }
+    None
 }
 
 /// The other half of the zip story: a zip that is NOT the payload.

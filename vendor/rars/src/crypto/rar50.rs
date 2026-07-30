@@ -64,14 +64,27 @@ impl Rar50Keys {
         first_input.extend_from_slice(&salt);
         first_input.extend_from_slice(&1u32.to_be_bytes());
 
-        let mut u = hmac_sha256(password, &first_input);
+        // Key the HMAC once and clone the pre-keyed state per iteration: the
+        // clone carries the already-absorbed ipad/opad key schedule, so the
+        // 2^kdf_count_log iterations each cost two SHA-256 blocks instead of
+        // re-deriving the key schedule (two extra compressions plus key
+        // preparation) every time.
+        let hmac_template =
+            <HmacSha256 as KeyInit>::new_from_slice(password).expect("HMAC accepts keys of any size");
+        let prf = |data: &[u8]| -> [u8; 32] {
+            let mut hmac = hmac_template.clone();
+            hmac.update(data);
+            hmac.finalize().into_bytes().into()
+        };
+
+        let mut u = prf(&first_input);
         let mut accumulator = u;
         let mut taps = [[0u8; 32]; 3];
         let mut iterations = (1u32 << kdf_count_log) - 1;
 
         for tap in &mut taps {
             for _ in 0..iterations {
-                u = hmac_sha256(password, &u);
+                u = prf(&u);
                 for (acc, byte) in accumulator.iter_mut().zip(u) {
                     *acc ^= byte;
                 }

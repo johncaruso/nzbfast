@@ -252,6 +252,20 @@ pub fn parse_nntp_date(s: &str) -> Option<i64> {
     let h: i64 = hms.next()?.parse().ok()?;
     let m: i64 = hms.next()?.parse().ok()?;
     let sec: i64 = hms.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    // Bound before the arithmetic below: year, hour, minute and second come
+    // from a POSTER-controlled Date header on every OVER row, and the civil-
+    // days maths multiplies them (`era * 146097`, `days * 86400`, `h * 3600`).
+    // A year of 300000000000 overflows i64 - a panic in a debug/test build,
+    // and in release a wrapped timestamp that is stored as `first_posted` and
+    // then drives retention masking and the oracle's age bucket.
+    // `newznab::parse_rfc2822` already range-checks for exactly this reason.
+    if !(1970..=3000).contains(&year)
+        || !(0..=23).contains(&h)
+        || !(0..=59).contains(&m)
+        || !(0..=60).contains(&sec)
+    {
+        return None;
+    }
     let offset = match toks.get(mi + 3).copied().unwrap_or("+0000") {
         // is_ascii guard: len() counts BYTES but z[1..3] slices a &str -
         // a Usenet-controlled zone like "+€x" panicked the OVER consumer.
@@ -1290,10 +1304,16 @@ where
             idle_bounded(reader.read_exact(&mut skip)).await?;
         }
         for bit in [8u8, 16] {
-            // FNAME / FCOMMENT: null-terminated strings.
+            // FNAME / FCOMMENT: null-terminated strings. BOUNDED, like every
+            // other read in this function: `idle_bounded` wraps the WHOLE
+            // future, so a peer that keeps sending non-NUL bytes never trips
+            // a no-progress deadline - it just grows this Vec for the full
+            // stream timeout (~15 GB at 1 Gbps, an OOM kill on a NAS). A
+            // gzip FNAME is a filename; the terminator search below already
+            // uses this same `take` idiom for the same reason.
             if flags & bit != 0 {
                 let mut z = Vec::new();
-                idle_bounded(reader.read_until(0, &mut z)).await?;
+                idle_bounded(reader.take(MAX_STATUS_BYTES as u64).read_until(0, &mut z)).await?;
             }
         }
         if flags & 2 != 0 {

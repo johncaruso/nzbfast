@@ -126,7 +126,125 @@ pub(crate) struct RawPacket<'a> {
 /// garbage and corrupt packets: any packet whose own MD5 doesn't verify is
 /// skipped (the scan resumes just past its magic, so a corrupt length field
 /// can't make us jump over later good packets).
-pub(crate) fn scan_packets<'a>(input: &'a [u8], mut f: impl FnMut(RawPacket<'a>)) {
+///
+/// Buffers past [`PAR_SCAN_MIN`] take the parallel path: the structural
+/// walk is the same, but the per-packet MD5s - the entire cost of scanning
+/// a recovery volume, and until now a serial pass over ~all of its bytes -
+/// verify across threads first. Any MD5 failure abandons the optimistic
+/// walk and re-runs the sequential scan (its +1 resume can surface packets
+/// the length-hopping walk never visited), so damaged volumes keep the
+/// exact historical behavior and clean ones - the overwhelming case - scan
+/// at aggregate hash speed.
+pub(crate) fn scan_packets<'a>(input: &'a [u8], f: impl FnMut(RawPacket<'a>)) {
+    scan_packets_counted(input, f);
+}
+
+/// [`scan_packets`], returning the total bytes fed to MD5 across both paths.
+/// That total - not elapsed time - is what the serial scan's hash budget
+/// bounds, so it is what the hostile-input test asserts on: a deterministic
+/// figure that does not move when the machine running the test is loaded.
+fn scan_packets_counted<'a>(input: &'a [u8], f: impl FnMut(RawPacket<'a>)) -> u64 {
+    let mut hashed = 0u64;
+    if input.len() >= PAR_SCAN_MIN {
+        match scan_packets_parallel(input, f, &mut hashed) {
+            Ok(()) => return hashed,
+            // The optimistic walk hashed its spans before abandoning; those
+            // bytes count toward the total just as the serial scan's do.
+            Err(f) => return hashed.saturating_add(scan_packets_serial(input, f)),
+        }
+    }
+    scan_packets_serial(input, f)
+}
+
+/// Below this the thread fan-out costs more than the hashing it spreads.
+const PAR_SCAN_MIN: usize = 4 << 20;
+
+/// The optimistic walk behind [`scan_packets`]: hop packet-to-packet by
+/// declared length (identical traversal to the serial scan whenever every
+/// MD5 verifies), verify all packet MD5s in parallel, then emit in order.
+/// The first bad MD5 returns `Err(f)` - the caller falls back to the
+/// serial scan, because the serial +1 resume can find overlapping packets
+/// inside a corrupt packet's claimed extent that this walk hops over.
+fn scan_packets_parallel<'a, F: FnMut(RawPacket<'a>)>(
+    input: &'a [u8],
+    mut f: F,
+    hashed: &mut u64,
+) -> Result<(), F> {
+    // (start, end) of each structurally valid packet, in walk order.
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut off = 0usize;
+    while off + (HEADER_LEN as usize) <= input.len() {
+        let Some(rel) = find_magic(&input[off..]) else {
+            break;
+        };
+        let start = off + rel;
+        if start + HEADER_LEN as usize > input.len() {
+            break;
+        }
+        let len = u64::from_le_bytes(input[start + 8..start + 16].try_into().unwrap());
+        let valid_len = len >= HEADER_LEN
+            && len % 4 == 0
+            && (start as u64)
+                .checked_add(len)
+                .is_some_and(|end| end <= input.len() as u64);
+        if !valid_len {
+            off = start + 1;
+            continue;
+        }
+        spans.push((start, start + len as usize));
+        off = start + len as usize;
+    }
+    if spans.is_empty() {
+        return Ok(());
+    }
+    // The serial scan's hash budget exists to stop crafted overlapping-magic
+    // quadratics; this walk hashes each span exactly once and never overlaps,
+    // so total hashing is already bounded by the input length.
+    let threads = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(spans.len());
+    let ok = std::sync::atomic::AtomicBool::new(true);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    // Bytes actually digested, for the caller's running total. Spans never
+    // overlap, so this cannot exceed `input.len()`; one relaxed add per
+    // packet is noise beside the MD5 it accompanies.
+    let bytes = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= spans.len() || !ok.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                let (start, end) = spans[i];
+                let stored: [u8; 16] = input[start + 16..start + 32].try_into().unwrap();
+                bytes.fetch_add(end - (start + 32), std::sync::atomic::Ordering::Relaxed);
+                if Md5::digest(&input[start + 32..end]).as_slice() != stored {
+                    ok.store(false, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+            });
+        }
+    });
+    *hashed = hashed.saturating_add(bytes.into_inner() as u64);
+    if !ok.into_inner() {
+        return Err(f);
+    }
+    for &(start, end) in &spans {
+        f(RawPacket {
+            md5: input[start + 16..start + 32].try_into().unwrap(),
+            set_id: input[start + 32..start + 48].try_into().unwrap(),
+            ptype: input[start + 48..start + 64].try_into().unwrap(),
+            body: &input[start + 64..end],
+            body_offset: start + 64,
+        });
+    }
+    Ok(())
+}
+
+/// Returns the total bytes fed to MD5, which is the quantity `budget` below
+/// bounds; callers other than [`scan_packets_counted`] may ignore it.
+fn scan_packets_serial<'a>(input: &'a [u8], mut f: impl FnMut(RawPacket<'a>)) -> u64 {
     // Budget on total bytes MD5'd, because the bad-MD5 resume below is
     // `start + 1`: a packet with a structurally valid length but a wrong MD5
     // costs a hash over its whole declared length and then advances one byte,
@@ -164,13 +282,16 @@ pub(crate) fn scan_packets<'a>(input: &'a [u8], mut f: impl FnMut(RawPacket<'a>)
         }
         let end = start + len as usize;
         let stored_md5: [u8; 16] = input[start + 16..start + 32].try_into().unwrap();
-        hashed = hashed.saturating_add((end - (start + 32)) as u64);
-        if hashed > budget {
+        let charge = (end - (start + 32)) as u64;
+        if hashed.saturating_add(charge) > budget {
             // Hostile framing, not a real (even badly damaged) set. Stop with
             // whatever verified so far; the caller then sees an incomplete set
-            // and declines, rather than burning hours on hashes.
-            return;
+            // and declines, rather than burning hours on hashes. Charge only
+            // for what is actually digested, so the returned total is a true
+            // count and not budget + one unhashed packet.
+            return hashed;
         }
+        hashed = hashed.saturating_add(charge);
         let computed = Md5::digest(&input[start + 32..end]);
         if computed.as_slice() != stored_md5 {
             // Corrupt packet: resume the search right after this magic so a
@@ -187,6 +308,7 @@ pub(crate) fn scan_packets<'a>(input: &'a [u8], mut f: impl FnMut(RawPacket<'a>)
         });
         off = end;
     }
+    hashed
 }
 
 fn find_magic(hay: &[u8]) -> Option<usize> {
@@ -465,7 +587,14 @@ mod tests {
     /// the rest of the file and then advanced ONE byte. `.par2` files come off
     /// the wire and are read whole with no size cap, so this was an hours-long
     /// CPU burn (an effective hang) from one downloaded file. The hash budget
-    /// bounds it; the scan must return promptly and simply find no packets.
+    /// bounds it; the scan must find no packets and digest a linear number of
+    /// bytes doing so.
+    ///
+    /// Asserted on bytes hashed, never on elapsed time: hashed bytes are
+    /// exactly what the budget controls and are identical on every machine,
+    /// whereas a wall-clock bound says nothing on a box where this process
+    /// holds a fraction of a core - a 5s bound here failed reproducibly on a
+    /// fully loaded machine while the budget was working perfectly.
     #[test]
     fn hostile_overlapping_magics_do_not_hash_quadratically() {
         const N: usize = 4 << 20; // 4 MiB: ~275 GB of MD5 before the fix
@@ -480,12 +609,60 @@ mod tests {
             input[start + 8..start + 16].copy_from_slice(&len.to_le_bytes());
             start += 16;
         }
-        let t0 = std::time::Instant::now();
         let mut seen = 0usize;
-        scan_packets(&input, |_| seen += 1);
-        let dt = t0.elapsed();
+        let hashed = scan_packets_counted(&input, |_| seen += 1);
         assert_eq!(seen, 0, "no cell has a valid MD5, so none may be yielded");
-        assert!(dt.as_secs() < 5, "scan_packets took {dt:?} - the hash budget is not bounding it");
+        // The optimistic parallel walk hashes each span once and its spans
+        // never overlap, so it digests at most N; the serial scan it falls
+        // back to stops the moment its budget (4N, here also the 16 MiB
+        // floor) would be exceeded. 5N is therefore the true ceiling and 6N
+        // is a margin - against ~65536N had the budget been removed.
+        assert!(
+            hashed <= 6 * N as u64,
+            "scan_packets hashed {hashed} bytes over a {N}-byte input \
+             - the hash budget is not bounding it"
+        );
+        // Guard the guard: a bound nothing reaches would pass even if the
+        // scan silently stopped doing any work at all.
+        assert!(hashed >= N as u64, "the hostile input must actually be scanned");
+    }
+
+    /// The parallel scan (buffers ≥ PAR_SCAN_MIN) must agree with the
+    /// serial scan packet-for-packet, in order - on a clean buffer, on one
+    /// with inter-packet garbage, and on one with a corrupt packet (which
+    /// makes the parallel walk abandon and fall back). A divergence here
+    /// is silent data corruption in repair, so compare full packet
+    /// identity, not just counts.
+    #[test]
+    fn parallel_scan_matches_serial_scan() {
+        let set_id = [3u8; 16];
+        let body = |i: u32| {
+            // Recovery-slice-shaped: exponent + ~256 KiB payload, so a
+            // handful of packets crosses the parallel threshold.
+            let mut b = i.to_le_bytes().to_vec();
+            b.extend((0..256 << 10).map(|j| (i as usize * 31 + j) as u8));
+            b
+        };
+        for corrupt_one in [false, true] {
+            let mut buf = Vec::new();
+            for i in 0..24u32 {
+                if i == 7 {
+                    buf.extend_from_slice(b"garbage between packets");
+                }
+                buf.extend(pkt(set_id, TYPE_RECVSLIC, &body(i)));
+            }
+            assert!(buf.len() >= PAR_SCAN_MIN, "fixture must take the parallel path");
+            if corrupt_one {
+                let mid = buf.len() / 2;
+                buf[mid] ^= 0xFF;
+            }
+            let mut serial: Vec<([u8; 16], usize, usize)> = Vec::new();
+            scan_packets_serial(&buf, |p| serial.push((p.md5, p.body_offset, p.body.len())));
+            let mut both: Vec<([u8; 16], usize, usize)> = Vec::new();
+            scan_packets(&buf, |p| both.push((p.md5, p.body_offset, p.body.len())));
+            assert_eq!(both, serial, "corrupt_one={corrupt_one}");
+            assert_eq!(both.len(), if corrupt_one { 23 } else { 24 });
+        }
     }
 
     /// Build a Main-packet body: block_size ‖ nfiles ‖ nfiles×16 id bytes.

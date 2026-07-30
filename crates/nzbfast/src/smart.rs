@@ -1240,9 +1240,7 @@ pub fn move_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
                 // has not been touched yet at this point, so dropping our
                 // half-written copy can never cost the only copy - the file
                 // simply has not moved.
-                let copied = std::fs::copy(&from, &target)
-                    .and_then(|_| std::fs::File::open(&target))
-                    .and_then(|f| f.sync_all());
+                let copied = std::fs::copy(&from, &target).and_then(|_| sync_written_file(&target));
                 if let Err(e) = copied {
                     if let Err(rm) = std::fs::remove_file(&target) {
                         // Whatever broke the copy can break the unlink too
@@ -1411,7 +1409,7 @@ fn copy_tree_into(
             copy_tree_into(&from, &to, copied)?;
         } else if is_real_file(&from) {
             std::fs::copy(&from, &to)?;
-            std::fs::File::open(&to)?.sync_all()?;
+            sync_written_file(&to)?;
             copied.insert(from);
         }
     }
@@ -1434,6 +1432,57 @@ pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
     {
         let _ = dir;
         Ok(())
+    }
+}
+
+/// fsync a file we have just written, addressed by its path.
+///
+/// The handle has to be WRITABLE. Unix flushes a read-only descriptor quite
+/// happily, so `File::open(p)?.sync_all()` looked correct here for as long
+/// as this code existed - but Windows answers `FlushFileBuffers` on a
+/// read-only handle with ERROR_ACCESS_DENIED, and that one difference broke
+/// every cross-device move and the spool migration on Windows. `copy_tree`
+/// failed on the FIRST file it copied, so `staged_move` returned "Access is
+/// denied." having moved nothing, and `spool_dir` logged that it could not
+/// move the daemon state out of the download folder and carried on using
+/// the old location. Neither ever lost a byte - both are written to fail
+/// with the source still whole - but on Windows neither could ever succeed,
+/// and a download folder and a library on two different drives is the
+/// ordinary Windows setup.
+///
+/// Measured directly on x86-64 Windows (rustc 1.97.1): a read-only handle
+/// gives os error 5, a writable one gives Ok(()).
+fn sync_written_file(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        // Deliberately unchanged: a read-only descriptor is a valid fsync
+        // target here, and it flushes a mode-444 file, which opening for
+        // write would not even be allowed to touch.
+        std::fs::File::open(path)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        match std::fs::OpenOptions::new().write(true).open(path) {
+            Ok(f) => return f.sync_all(),
+            // `fs::copy` reproduces the source's read-only ATTRIBUTE, and
+            // such a file cannot be flushed through ANY handle on Windows.
+            // Clear the bit, flush, put it back: we own this copy, and
+            // skipping the flush instead would hand the caller an
+            // undurable destination to delete the source against, which is
+            // the one failure staging exists to prevent.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Err(e) => return Err(e),
+        }
+        let md = std::fs::metadata(path)?;
+        let mut relaxed = md.permissions();
+        relaxed.set_readonly(false);
+        std::fs::set_permissions(path, relaxed)?;
+        let flushed = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .and_then(|f| f.sync_all());
+        std::fs::set_permissions(path, md.permissions())?;
+        flushed
     }
 }
 
@@ -1976,11 +2025,69 @@ pub fn rename_movie(parent: &Path, out_dir: &Path, base: &str) -> Option<PathBuf
             println!("[smart] renamed {} → {}", out_dir.display(), target.display());
             Some(target)
         }
-        Err(e) => {
-            eprintln!("[smart] rename dir {} → {}: {e}", out_dir.display(), target.display());
-            None
-        }
+        // Windows refuses to rename a DIRECTORY while any file inside it is
+        // open, and at this point the extractor still holds the payload: it
+        // keeps its output writers for the streaming endpoint and stays alive
+        // past completion. So this failed with "Access is denied." on every
+        // Windows install, and because the payload FILE had already been
+        // renamed above (Rust opens with FILE_SHARE_DELETE, which permits
+        // renaming a file but not its parent), an obfuscated download was
+        // left as `complete/movies/<hash>/Example Movie 2019 1080p.mkv` -
+        // half-renamed, which is the worst of both.
+        //
+        // Moving the CONTENTS across works where moving the container does
+        // not, for that same reason: each entry is renamed individually and an
+        // open handle does not stop it - proven by the payload rename above
+        // succeeding. Handles stay valid afterwards (they follow the file, not
+        // the path), so streaming a job whose folder was just renamed keeps
+        // working, which is why this is done here rather than by closing the
+        // writers: closing them makes a /stream request that is waiting for
+        // them hang instead (`stream_of_library_job_triggers_download`).
+        //
+        // Unix renames directories around open descriptors happily, so it
+        // takes the branch above and never reaches this.
+        Err(e) => match move_dir_contents(out_dir, &target) {
+            Ok(()) => {
+                println!(
+                    "[smart] renamed {} → {} (entry by entry: {e})",
+                    out_dir.display(),
+                    target.display()
+                );
+                Some(target)
+            }
+            Err(e2) => {
+                eprintln!(
+                    "[smart] rename dir {} → {}: {e} (and entry by entry: {e2})",
+                    out_dir.display(),
+                    target.display()
+                );
+                None
+            }
+        },
     }
+}
+
+/// Move everything in `from` into a fresh `to`, then drop the empty `from`.
+///
+/// The fallback for a directory rename that the platform will not do as one
+/// operation - see the call site. `to` must not already exist; the caller
+/// picked a free name.
+///
+/// Every entry moves with a plain rename, so this stays same-filesystem and
+/// never copies payload: `to` is a sibling of `from`. A partial failure
+/// leaves entries in BOTH places and reports the error, which the caller
+/// turns into "the folder was not renamed" - the files are all still present
+/// under one name or the other, and nothing is deleted here except the
+/// emptied directory itself.
+fn move_dir_contents(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        std::fs::rename(entry.path(), to.join(entry.file_name()))?;
+    }
+    // Only removes it if it really is empty, so a missed entry surfaces as a
+    // leftover directory rather than as a deletion.
+    std::fs::remove_dir(from)
 }
 
 // ---------------------------------------------------------------------------
@@ -2011,28 +2118,52 @@ pub fn unlock(dir: &Path, password: &str) -> bool {
     // norm) re-extract and AES-decrypt without unrar, deleting their
     // volumes on success. Compressed or RAR4-encrypted sets fall through
     // to unrar inside reextract_dir; a wrong password fails both.
+    // Volume deletion belongs to the extraction, not to this function.
+    // `reextract_dir` removes exactly what it CONSUMED on every success path
+    // (the streaming pass sweeps the set it fed, the native and unrar paths
+    // sweep against a proof-of-output snapshot), so a RAR-named file still
+    // present afterwards is one of three things, and deleting any of them is
+    // wrong:
+    //
+    //   - a file the extraction just PUBLISHED - an encrypted outer set whose
+    //     payload is the release's own inner RAR set unlocks to
+    //     `inner.partNN.rar`, and sweeping them left a Completed job with no
+    //     payload at all;
+    //   - a volume the spent-proof deliberately refused to delete;
+    //   - the volumes of ANOTHER top-level set in the same directory that
+    //     this password did not unlock. `reextract_dir`'s directory-level
+    //     answer is existential - one set unpacking makes it true - so with
+    //     encrypted sets A and B and a password for A only, the sweep deleted
+    //     B's only copy. That is the shape this whole path exists to protect.
+    //
+    // So: count what the extraction removed, delete nothing.
+    let vol_snapshot = |dir: &Path| -> std::collections::HashSet<PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        let name =
+                            p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+                        // .rar plus split continuations (.r00, .r01, …).
+                        name.ends_with(".rar")
+                            || name.rfind('.').is_some_and(|i| {
+                                let t = &name[i + 1..];
+                                t.len() >= 3
+                                    && t.starts_with('r')
+                                    && t[1..].bytes().all(|c| c.is_ascii_digit())
+                            })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let before = vol_snapshot(dir);
     if !crate::reextract_dir(dir, Some(password)).unwrap_or(false) {
         return false;
     }
-    let mut removed = 0usize;
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for entry in rd.flatten() {
-            let path = entry.path();
-            let name = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-            // .rar plus split continuations (.r00, .r01, …).
-            let is_vol = name.ends_with(".rar")
-                || name.rfind('.').is_some_and(|p| {
-                    let t = &name[p + 1..];
-                    t.len() >= 3
-                        && t.starts_with('r')
-                        && t[1..].bytes().all(|c| c.is_ascii_digit())
-                });
-            if is_vol && path.is_file() && std::fs::remove_file(&path).is_ok() {
-                removed += 1;
-            }
-        }
-    }
-    println!("[unlock] {} unpacked - removed {removed} volume file(s)", dir.display());
+    let removed = before.difference(&vol_snapshot(dir)).count();
+    println!("[unlock] {} unpacked - {removed} volume file(s) spent", dir.display());
     true
 }
 
@@ -4205,6 +4336,74 @@ mod tests {
 mod trash_tests {
     use super::*;
 
+    /// Did a file this test just deleted actually reach the Trash, under
+    /// the name it had? Purges it when it did, so the suite never leaves
+    /// fixtures in the developer's real Trash. `None` on a platform with no
+    /// way to look.
+    ///
+    /// Asked per platform because "the Trash" is three different
+    /// mechanisms, and the old version of this test assumed one of them:
+    /// `std::env::var("HOME").unwrap()` joined with `.Trash`. HOME is not
+    /// set on Windows - USERPROFILE is, which is why the product itself
+    /// reads that - so the test panicked with `NotPresent` there before it
+    /// asserted anything, and `~/.Trash` would have been the wrong place to
+    /// look anyway. Windows has a real recoverable delete: `trash::delete`
+    /// moves the file to the Recycle Bin, verified on x86-64 Windows, where
+    /// `os_limited::list()` returns it with its original_parent intact. So
+    /// this checks the behaviour there rather than gating the test away.
+    /// `os_limited` covers the freedesktop platforms too, which makes the
+    /// Linux leg a real assertion instead of the vacuous one it was.
+    fn still_recoverable(name: &str) -> Option<bool> {
+        // macOS: `trash` has no enumeration API there, so read the folder.
+        #[cfg(target_os = "macos")]
+        {
+            let trashed = std::path::PathBuf::from(std::env::var("HOME").expect("HOME on macOS"))
+                .join(".Trash")
+                .join(name);
+            let found = trashed.exists();
+            let _ = std::fs::remove_file(&trashed);
+            Some(found)
+        }
+        // Windows' Recycle Bin and the freedesktop trash directories, read
+        // through the real thing. The cfg mirrors `trash::os_limited`'s own.
+        #[cfg(any(
+            target_os = "windows",
+            all(
+                unix,
+                not(target_os = "macos"),
+                not(target_os = "ios"),
+                not(target_os = "android")
+            )
+        ))]
+        {
+            // `expect`, not `.ok()?`: a platform that HAS an enumeration
+            // API and cannot answer is a finding, not a reason to skip. We
+            // have already asserted the delete succeeded, so the trash
+            // exists - swallowing an error here would make the assertion
+            // below silently vacuous, which is the failure mode this whole
+            // test is guarding against.
+            let items = trash::os_limited::list().expect("enumerate the trash");
+            let mine: Vec<_> = items.into_iter().filter(|i| i.name == *name).collect();
+            let found = !mine.is_empty();
+            let _ = trash::os_limited::purge_all(mine);
+            Some(found)
+        }
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "windows",
+            all(
+                unix,
+                not(target_os = "macos"),
+                not(target_os = "ios"),
+                not(target_os = "android")
+            )
+        )))]
+        {
+            let _ = name;
+            None
+        }
+    }
+
     /// Both halves in ONE test, and neither touches the process-global.
     ///
     /// `remove_user_file` takes the flag as an argument now, so the two
@@ -4219,7 +4418,6 @@ mod trash_tests {
         let dir = std::env::temp_dir().join(format!("nzbfast-trash-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".Trash");
 
         // Recoverable: the file leaves the download folder but is still
         // there to be put back. Asserting only that it is GONE would pass
@@ -4229,10 +4427,11 @@ mod trash_tests {
         std::fs::write(&f, b"junk").unwrap();
         remove_user_file(&f, true).expect("trash delete");
         assert!(!f.exists(), "the file must leave the download folder");
-        if cfg!(target_os = "macos") {
-            let trashed = home.join(&name);
-            assert!(trashed.exists(), "not recoverable: nothing at {}", trashed.display());
-            let _ = std::fs::remove_file(&trashed);
+        if let Some(found) = still_recoverable(&name) {
+            // `remove_user_file` falls back to a hard delete when the Trash
+            // refuses, and reports Ok either way - so this is the only thing
+            // standing between "recoverable" and a permanent delete.
+            assert!(found, "not recoverable: nothing named {name} reached the Trash");
         }
 
         // Opted out: a real delete, not a silent Trash.
@@ -4241,7 +4440,9 @@ mod trash_tests {
         std::fs::write(&g, b"junk").unwrap();
         remove_user_file(&g, false).unwrap();
         assert!(!g.exists());
-        assert!(!home.join(&name2).exists(), "opt-out still used the Trash");
+        if let Some(found) = still_recoverable(&name2) {
+            assert!(!found, "opt-out still used the Trash");
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

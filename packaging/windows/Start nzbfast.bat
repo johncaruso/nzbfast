@@ -31,8 +31,21 @@ echo ============================================================
 echo.
 echo This window sets up nzbfast and starts it. It shows each step
 echo as it goes and stays open at the end so you can read what
-echo happened. Nothing here changes anything outside this folder.
+echo happened. Settings and the download queue are kept safe in
+echo %%LOCALAPPDATA%%\nzbfast, so tidying your Downloads folder can
+echo never delete them.
 echo.
+
+rem ---- Where nzbfast keeps its own records --------------------------------
+rem Settings, the queue record and spooled NZBs live in
+rem %LOCALAPPDATA%\nzbfast, NOT next to the app: people unzip into their
+rem Downloads folder, and data that lives beside the app gets deleted with
+rem the next Downloads tidy-up (a tester lost his spool exactly that way).
+rem An older setup that already has config.local.json next to this
+rem launcher keeps using it - continuity beats tidiness.
+set "DATA=%LOCALAPPDATA%\nzbfast"
+if exist "%~dp0config.local.json" set "DATA=%~dp0."
+if not exist "%DATA%" mkdir "%DATA%" >nul 2>&1
 echo Because these files came from the internet and are not yet
 echo code-signed, Windows may show "Windows protected your PC".
 echo That is SmartScreen being cautious about an unknown publisher,
@@ -65,7 +78,7 @@ rem narrate that as "you chose to quit". Note that "if errorlevel N"
 rem means "N or higher", so the code is captured and compared exactly.
 rem (No redirection characters in these rem lines - cmd still processes
 rem those on a rem line and would silently create a stray file.)
-nzbfast.exe setup
+nzbfast.exe --config "%DATA%\config.local.json" setup
 set RC=%errorlevel%
 if "%RC%"=="3" (
     echo.
@@ -156,7 +169,7 @@ echo.
 
 rem Control returns here when the daemon stops, so we can say what
 rem happened and keep the window open. --open pops the browser.
-nzbfast.exe serve --watch "%WATCH%" --out "%OUT%" --port %PORT% --open
+nzbfast.exe --config "%DATA%\config.local.json" serve --watch "%WATCH%" --out "%OUT%" --port %PORT% --open
 set CODE=%errorlevel%
 
 echo.

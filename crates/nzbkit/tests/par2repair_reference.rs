@@ -60,7 +60,7 @@ fn reconstruct_and_check(missing: &[usize]) {
             if !missing.contains(&g) {
                 let start = i * bs;
                 let end = (start + bs).min(data.len());
-                rec.feed(g, data[start..end].to_vec());
+                rec.feed(g, &data[start..end]);
             }
         }
     }

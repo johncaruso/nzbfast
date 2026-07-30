@@ -165,6 +165,7 @@ pub fn decode_into_integrity(
     let mut expected_len: Option<u64> = None;
     let mut seen_begin = false;
     let mut seen_yend = false;
+    let mut seen_ypart = false;
     let data = out;
 
     let mut pos = 0usize;
@@ -208,6 +209,7 @@ pub fn decode_into_integrity(
                 end = file_size;
                 pos = next;
             } else if line.starts_with(b"=ypart ") {
+                seen_ypart = true;
                 let h = &line[7..];
                 // Clamp `begin` to its 1-based floor: a hostile `begin=0`
                 // would underflow Meta::offset() to u64::MAX (see yenc.rs).
@@ -390,6 +392,8 @@ pub fn decode_into_integrity(
             actual: len,
         });
     }
+    // Same test, same shared implementation as the scalar oracle.
+    crate::yenc::check_part_geometry(seen_ypart, begin, end, data.len() as u64)?;
     let mut crc_checked = false;
     let mut verified_article_crc = None;
     if let Some(header) = expected_crc {

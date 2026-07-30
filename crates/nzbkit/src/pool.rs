@@ -1984,9 +1984,28 @@ async fn session_loop(
             }
         }
         if shared.pending.load(Ordering::Acquire) == 0 {
+            // A worker that claimed a parked connection before the ramp and
+            // then found the queue already empty is holding a DRAINED,
+            // freshly validated session - `take` sent its DATE and read the
+            // answer, and nothing has been written since. Dropping it here
+            // closed it, so the pool SHRANK every time a fleet outran its
+            // work: measured over six back-to-back jobs, three parked
+            // connections eroded to two and the fourth job dialled again
+            // despite a hit on every claim. That is the warm pool paying to
+            // destroy exactly what it exists to keep, and it bites hardest
+            // under load, which is when a fleet is most likely to have one
+            // worker finish everything before its siblings start.
+            if let Some(c) = preclaimed.take() {
+                park_or_quit(cfg, server, c).await;
+            }
             return; // every article is terminal
         }
         if shared.aborted.load(Ordering::Acquire) {
+            // Aborts close, per the module rule every other abort exit
+            // follows - the user is done with this server, not pausing.
+            if let Some(c) = preclaimed.take() {
+                c.quit().await;
+            }
             return; // user abort
         }
 

@@ -843,6 +843,12 @@ pub async fn fetch_spot_nzb(
             .body(&mid)
             .await?
             .ok_or_else(|| err(format!("spot article {mid} has no body")))?;
+        // Check the raw body against the cap BEFORE the lossy conversion: a
+        // 256 MiB body of invalid UTF-8 expands to ~768 MiB of U+FFFD on top
+        // of the raw copy and the unstuff copy, ~1.3 GB for one spot.
+        if body.len() > MAX_SPOT_XML {
+            return Err(err(format!("spot XML exceeds the {MAX_SPOT_XML} byte cap")));
+        }
         xml = String::from_utf8_lossy(&unstuff(&body, false)).into_owned();
     }
     if xml.len() > MAX_SPOT_XML {
@@ -895,6 +901,14 @@ fn xml_from_headers(raw: &[u8]) -> String {
         if t.len() >= 6 && t.as_bytes()[..6].eq_ignore_ascii_case(b"x-xml:") {
             let v = &t[6..];
             xml.push_str(v.strip_prefix(' ').unwrap_or(v));
+            // Enforce the module's stated cap HERE, not after the whole
+            // string is built: `head()` returns up to MAX_MULTILINE_BYTES
+            // (256 MiB), so a spot whose HEAD is nothing but X-XML lines
+            // grew this String to that size before the caller's check could
+            // reject it. One byte over is enough for the caller to refuse.
+            if xml.len() > MAX_SPOT_XML {
+                return xml;
+            }
         }
     }
     xml
@@ -1429,6 +1443,11 @@ mod tests {
         assert_eq!(again.nzb_msgids, seg_ids);
 
         conn.quit().await;
+        // The index must close before its directory goes: SQLite opens
+        // without FILE_SHARE_DELETE, so Windows refuses to remove a
+        // directory that still holds an open connection (os error 32) where
+        // unix unlinks it quite happily.
+        drop(ix);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

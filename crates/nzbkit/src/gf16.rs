@@ -128,20 +128,7 @@ impl MulTable {
             (nl, nh)
         };
         #[cfg(target_arch = "x86_64")]
-        let affine = {
-            let mut lo_basis = [0u16; 8];
-            let mut hi_basis = [0u16; 8];
-            for j in 0..8 {
-                lo_basis[j] = mul(c, 1 << j);
-                hi_basis[j] = mul(c, 1 << (8 + j));
-            }
-            [
-                affine_matrix(&lo_basis, |p| p as u8),
-                affine_matrix(&hi_basis, |p| p as u8),
-                affine_matrix(&lo_basis, |p| (p >> 8) as u8),
-                affine_matrix(&hi_basis, |p| (p >> 8) as u8),
-            ]
-        };
+        let affine = affine_matrices(c);
         MulTable {
             lo,
             hi,
@@ -439,6 +426,386 @@ impl MulTable {
     }
 }
 
+/// How many sources [`xor_mul_multi_into`] fuses per pass on this
+/// build, or 0 when no multi kernel exists and callers should stay on
+/// the per-source [`MulTable`] path.
+pub fn multi_fold_width() -> usize {
+    #[cfg(target_arch = "aarch64")]
+    {
+        8
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2") {
+            return 8;
+        }
+        0
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        0
+    }
+}
+
+/// Multi-source fused fold: `dst[i] ^= Σ_s coeffs[s] · src_s[i]`, the
+/// technique that makes ParPar's fold fast at high row counts (ours
+/// previously re-loaded and re-stored `dst` once per source; this loads
+/// each 32-byte chunk once, streams every source's contribution through
+/// registers, and stores once - accumulator memory traffic divided by
+/// the group width).
+///
+/// The aarch64 kernel is a port of ParPar's GF16_CLMUL method (public
+/// domain, github.com/animetosho/ParPar, gf16_clmul_neon*): per source,
+/// a Karatsuba carry-less multiply - lo·c_lo, hi·c_hi and
+/// (lo^hi)·(c_lo^c_hi) via `pmull` - accumulated across all sources in
+/// six vector registers, then ONE Barrett reduction mod 0x1100B per
+/// chunk. No lookup tables at all: a coefficient is three splatted
+/// bytes, so the per-(row, source) table builds (and their cache
+/// footprint) vanish from the fold entirely.
+///
+/// Every source must cover `dst`'s full byte length (the fold windows
+/// sources per tile and routes short tails through the single-source
+/// path). Zero coefficients are fine (they just waste the multiplies).
+/// Processes whole 32-byte chunks; returns u16 WORDS processed - the
+/// caller runs the remainder per source.
+pub fn xor_mul_multi_into(dst: &mut [u16], srcs: &[&[u8]], coeffs: &[u16]) -> usize {
+    debug_assert_eq!(srcs.len(), coeffs.len());
+    debug_assert!(srcs.iter().all(|s| s.len() >= dst.len() * 2 - 1));
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("sha3") {
+            return unsafe { xor_mul_multi_neon_sha3(dst, srcs, coeffs) };
+        }
+        return unsafe { xor_mul_multi_neon(dst, srcs, coeffs) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2") {
+            return unsafe { xor_mul_multi_gfni(dst, srcs, coeffs) };
+        }
+        let _ = (dst, srcs, coeffs);
+        0
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let _ = (dst, srcs, coeffs);
+        0
+    }
+}
+
+/// The four `gf2p8affineqb` matrices for multiply-by-`c` (see
+/// [`MulTable::affine`]) without building the rest of the table - the
+/// multi-source fold needs ONLY these 32 bytes per (row, source), not
+/// the 1.2 KB split tables.
+#[cfg(target_arch = "x86_64")]
+fn affine_matrices(c: u16) -> [u64; 4] {
+    let mut lo_basis = [0u16; 8];
+    let mut hi_basis = [0u16; 8];
+    for j in 0..8 {
+        lo_basis[j] = mul(c, 1 << j);
+        hi_basis[j] = mul(c, 1 << (8 + j));
+    }
+    [
+        affine_matrix(&lo_basis, |p| p as u8),
+        affine_matrix(&hi_basis, |p| p as u8),
+        affine_matrix(&lo_basis, |p| (p >> 8) as u8),
+        affine_matrix(&hi_basis, |p| (p >> 8) as u8),
+    ]
+}
+
+/// GFNI+AVX2 multi-source fold: the multi-source twin of
+/// [`MulTable::xor_mul_into_gfni`], mirroring ParPar's GF16_AFFINE
+/// default inside its gf16_muladd_multi framework (public domain,
+/// github.com/animetosho/ParPar, gf16_affine*.c). Per 64-byte chunk the
+/// destination is loaded and stored ONCE for the whole source group;
+/// each source contributes 2 loads, the lo/hi byte split, and four
+/// `gf2p8affineqb`s XORed into two running accumulators. Coefficients
+/// are four 8x8 bit-matrices per source ([`affine_matrices`]) - no
+/// lookup tables are built at all.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "gfni,avx2")]
+unsafe fn xor_mul_multi_gfni(dst: &mut [u16], srcs: &[&[u8]], coeffs: &[u16]) -> usize {
+    use std::arch::x86_64::*;
+    let chunks = (dst.len() * 2) / 64;
+    if chunks == 0 || srcs.is_empty() {
+        return 0;
+    }
+    let n = srcs.len().min(16);
+    // 32 bytes of matrix per source, broadcast from L1 inside the chunk
+    // loop (holding them all in ymm registers would spill past 3-4
+    // sources; broadcast loads are cheap and off the critical path).
+    let mut mats = [[0u64; 4]; 16];
+    for s in 0..n {
+        mats[s] = affine_matrices(coeffs[s]);
+    }
+    unsafe {
+        let lo8 = _mm256_set1_epi16(0x00ff);
+        let dst_bytes = dst.as_mut_ptr() as *mut u8;
+        for ch in 0..chunks {
+            let off = ch * 64;
+            let mut plo = _mm256_setzero_si256();
+            let mut phi = _mm256_setzero_si256();
+            for (s, &src) in srcs[..n].iter().enumerate() {
+                let sp = src.as_ptr().add(off) as *const __m256i;
+                let v0 = _mm256_loadu_si256(sp);
+                let v1 = _mm256_loadu_si256(sp.add(1));
+                let slo =
+                    _mm256_packus_epi16(_mm256_and_si256(v0, lo8), _mm256_and_si256(v1, lo8));
+                let shi =
+                    _mm256_packus_epi16(_mm256_srli_epi16(v0, 8), _mm256_srli_epi16(v1, 8));
+                let mll = _mm256_set1_epi64x(mats[s][0] as i64);
+                let mhl = _mm256_set1_epi64x(mats[s][1] as i64);
+                let mlh = _mm256_set1_epi64x(mats[s][2] as i64);
+                let mhh = _mm256_set1_epi64x(mats[s][3] as i64);
+                plo = _mm256_xor_si256(
+                    plo,
+                    _mm256_xor_si256(
+                        _mm256_gf2p8affine_epi64_epi8::<0>(slo, mll),
+                        _mm256_gf2p8affine_epi64_epi8::<0>(shi, mhl),
+                    ),
+                );
+                phi = _mm256_xor_si256(
+                    phi,
+                    _mm256_xor_si256(
+                        _mm256_gf2p8affine_epi64_epi8::<0>(slo, mlh),
+                        _mm256_gf2p8affine_epi64_epi8::<0>(shi, mhh),
+                    ),
+                );
+            }
+            let dp = dst_bytes.add(off) as *mut __m256i;
+            let d0 = _mm256_loadu_si256(dp);
+            let d1 = _mm256_loadu_si256(dp.add(1));
+            _mm256_storeu_si256(dp, _mm256_xor_si256(d0, _mm256_unpacklo_epi8(plo, phi)));
+            _mm256_storeu_si256(
+                dp.add(1),
+                _mm256_xor_si256(d1, _mm256_unpackhi_epi8(plo, phi)),
+            );
+        }
+    }
+    chunks * 32
+}
+
+/// The pmull Karatsuba fold, plain-NEON form (no sha3): same Q-register
+/// coefficients and direct `pmull2` high-half multiplies as the sha3
+/// kernel, with plain XOR accumulation. NEON (incl. pmull on poly8) is
+/// baseline on aarch64.
+#[cfg(target_arch = "aarch64")]
+unsafe fn xor_mul_multi_neon(dst: &mut [u16], srcs: &[&[u8]], coeffs: &[u16]) -> usize {
+    use std::arch::aarch64::*;
+    let chunks = (dst.len() * 2) / 32;
+    if chunks == 0 || srcs.is_empty() {
+        return 0;
+    }
+    unsafe {
+        let mut c_lo = [vdupq_n_p8(0); 16];
+        let mut c_hi = [vdupq_n_p8(0); 16];
+        let mut c_mid = [vdupq_n_p8(0); 16];
+        let n = srcs.len().min(16);
+        for s in 0..n {
+            c_lo[s] = vdupq_n_p8(coeffs[s] as u8);
+            c_hi[s] = vdupq_n_p8((coeffs[s] >> 8) as u8);
+            c_mid[s] = vreinterpretq_p8_u8(veorq_u8(
+                vreinterpretq_u8_p8(c_lo[s]),
+                vreinterpretq_u8_p8(c_hi[s]),
+            ));
+        }
+        let xr = |a: poly16x8_t, b: uint16x8_t| -> poly16x8_t {
+            vreinterpretq_p16_u16(veorq_u16(vreinterpretq_u16_p16(a), b))
+        };
+        let pml = |d: poly8x16_t, c: poly8x16_t| -> uint16x8_t {
+            vreinterpretq_u16_p16(vmull_p8(vget_low_p8(d), vget_low_p8(c)))
+        };
+        let pmh = |d: poly8x16_t, c: poly8x16_t| -> uint16x8_t {
+            vreinterpretq_u16_p16(vmull_high_p8(d, c))
+        };
+        let dst_bytes = dst.as_mut_ptr() as *mut u8;
+        for ch in 0..chunks {
+            let off = ch * 32;
+            let mut low1 = vdupq_n_p16(0);
+            let mut low2 = vdupq_n_p16(0);
+            let mut mid1 = vdupq_n_p16(0);
+            let mut mid2 = vdupq_n_p16(0);
+            let mut high1 = vdupq_n_p16(0);
+            let mut high2 = vdupq_n_p16(0);
+            for (s, &src) in srcs[..n].iter().enumerate() {
+                let d = vld2q_u8(src.as_ptr().add(off));
+                let dlo = vreinterpretq_p8_u8(d.0);
+                let dhi = vreinterpretq_p8_u8(d.1);
+                let dmid = vreinterpretq_p8_u8(veorq_u8(d.0, d.1));
+                low1 = xr(low1, pml(dlo, c_lo[s]));
+                low2 = xr(low2, pmh(dlo, c_lo[s]));
+                mid1 = xr(mid1, pml(dmid, c_mid[s]));
+                mid2 = xr(mid2, pmh(dmid, c_mid[s]));
+                high1 = xr(high1, pml(dhi, c_hi[s]));
+                high2 = xr(high2, pmh(dhi, c_hi[s]));
+            }
+            let (out_lo, out_hi) = clmul_reduce(low1, low2, mid1, mid2, high1, high2);
+            let dp = dst_bytes.add(off);
+            let mut vb = vld2q_u8(dp);
+            vb.0 = veorq_u8(vb.0, out_lo);
+            vb.1 = veorq_u8(vb.1, out_hi);
+            vst2q_u8(dp, vb);
+        }
+    }
+    chunks * 16
+}
+
+/// The sha3 twin of [`xor_mul_multi_neon`]: sources are folded in PAIRS
+/// with EOR3 merging both contributions into an accumulator per op
+/// (ParPar 581af3e "Allow EOR3 accumulation in ARM CLMul kernels") -
+/// a third of the accumulate XORs disappear. Apple Silicon has sha3.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,sha3")]
+unsafe fn xor_mul_multi_neon_sha3(dst: &mut [u16], srcs: &[&[u8]], coeffs: &[u16]) -> usize {
+    // Monomorphize the full-width case: a compile-time source count lets
+    // LLVM fully unroll the inner loop and pin the coefficient array in
+    // registers (ParPar generates its kernels per srcCount for the same
+    // reason).
+    if srcs.len() == 8 {
+        return unsafe { xor_mul_multi_neon_sha3_n::<8>(dst, srcs, coeffs) };
+    }
+    unsafe { xor_mul_multi_neon_sha3_n::<0>(dst, srcs, coeffs) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,sha3")]
+unsafe fn xor_mul_multi_neon_sha3_n<const NC: usize>(
+    dst: &mut [u16],
+    srcs: &[&[u8]],
+    coeffs: &[u16],
+) -> usize {
+    use std::arch::aarch64::*;
+    let chunks = (dst.len() * 2) / 32;
+    if chunks == 0 || srcs.is_empty() {
+        return 0;
+    }
+    unsafe {
+        // Q-register coefficient splats: the LOW-half multiply reads the
+        // D register aliasing the low half (free), and the HIGH half goes
+        // through `vmull_high_p8` (pmull2) directly - extracting high
+        // halves into D registers costs a real move per multiply, six per
+        // source per chunk, and that was measurably the kernel's drag.
+        let mut c_lo = [vdupq_n_p8(0); 16];
+        let mut c_hi = [vdupq_n_p8(0); 16];
+        let mut c_mid = [vdupq_n_p8(0); 16];
+        let n = if NC > 0 { NC } else { srcs.len().min(16) };
+        for s in 0..n {
+            c_lo[s] = vdupq_n_p8(coeffs[s] as u8);
+            c_hi[s] = vdupq_n_p8((coeffs[s] >> 8) as u8);
+            c_mid[s] = vreinterpretq_p8_u8(veorq_u8(
+                vreinterpretq_u8_p8(c_lo[s]),
+                vreinterpretq_u8_p8(c_hi[s]),
+            ));
+        }
+        let eor3 = |a: poly16x8_t, b: uint16x8_t, c: uint16x8_t| -> poly16x8_t {
+            vreinterpretq_p16_u16(veor3q_u16(vreinterpretq_u16_p16(a), b, c))
+        };
+        let pml = |d: poly8x16_t, c: poly8x16_t| -> uint16x8_t {
+            vreinterpretq_u16_p16(vmull_p8(vget_low_p8(d), vget_low_p8(c)))
+        };
+        let pmh = |d: poly8x16_t, c: poly8x16_t| -> uint16x8_t {
+            vreinterpretq_u16_p16(vmull_high_p8(d, c))
+        };
+        let dst_bytes = dst.as_mut_ptr() as *mut u8;
+        for ch in 0..chunks {
+            let off = ch * 32;
+            let mut low1 = vdupq_n_p16(0);
+            let mut low2 = vdupq_n_p16(0);
+            let mut mid1 = vdupq_n_p16(0);
+            let mut mid2 = vdupq_n_p16(0);
+            let mut high1 = vdupq_n_p16(0);
+            let mut high2 = vdupq_n_p16(0);
+            let mut s = 0usize;
+            while s + 1 < n {
+                let da = vld2q_u8(srcs[s].as_ptr().add(off));
+                let db = vld2q_u8(srcs[s + 1].as_ptr().add(off));
+                let dalo = vreinterpretq_p8_u8(da.0);
+                let dahi = vreinterpretq_p8_u8(da.1);
+                let damid = vreinterpretq_p8_u8(veorq_u8(da.0, da.1));
+                let dblo = vreinterpretq_p8_u8(db.0);
+                let dbhi = vreinterpretq_p8_u8(db.1);
+                let dbmid = vreinterpretq_p8_u8(veorq_u8(db.0, db.1));
+                low1 = eor3(low1, pml(dalo, c_lo[s]), pml(dblo, c_lo[s + 1]));
+                low2 = eor3(low2, pmh(dalo, c_lo[s]), pmh(dblo, c_lo[s + 1]));
+                mid1 = eor3(mid1, pml(damid, c_mid[s]), pml(dbmid, c_mid[s + 1]));
+                mid2 = eor3(mid2, pmh(damid, c_mid[s]), pmh(dbmid, c_mid[s + 1]));
+                high1 = eor3(high1, pml(dahi, c_hi[s]), pml(dbhi, c_hi[s + 1]));
+                high2 = eor3(high2, pmh(dahi, c_hi[s]), pmh(dbhi, c_hi[s + 1]));
+                s += 2;
+            }
+            if s < n {
+                let d = vld2q_u8(srcs[s].as_ptr().add(off));
+                let dlo = vreinterpretq_p8_u8(d.0);
+                let dhi = vreinterpretq_p8_u8(d.1);
+                let dmid = vreinterpretq_p8_u8(veorq_u8(d.0, d.1));
+                let xr = |a: poly16x8_t, b: uint16x8_t| -> poly16x8_t {
+                    vreinterpretq_p16_u16(veorq_u16(vreinterpretq_u16_p16(a), b))
+                };
+                low1 = xr(low1, pml(dlo, c_lo[s]));
+                low2 = xr(low2, pmh(dlo, c_lo[s]));
+                mid1 = xr(mid1, pml(dmid, c_mid[s]));
+                mid2 = xr(mid2, pmh(dmid, c_mid[s]));
+                high1 = xr(high1, pml(dhi, c_hi[s]));
+                high2 = xr(high2, pmh(dhi, c_hi[s]));
+            }
+            let (out_lo, out_hi) = clmul_reduce(low1, low2, mid1, mid2, high1, high2);
+            let dp = dst_bytes.add(off);
+            let mut vb = vld2q_u8(dp);
+            vb.0 = veorq_u8(vb.0, out_lo);
+            vb.1 = veorq_u8(vb.1, out_hi);
+            vst2q_u8(dp, vb);
+        }
+    }
+    chunks * 16
+}
+
+/// Barrett reduction of the accumulated Karatsuba terms mod 0x1100B,
+/// ported from ParPar's `gf16_clmul_neon_reduction` (public domain)
+/// including its late-2024 refinements (the 0x18 shift trick and the
+/// shortened dependency chains). Returns the reduced product's
+/// (low bytes, high bytes) for 16 words.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn clmul_reduce(
+    low1: std::arch::aarch64::poly16x8_t,
+    low2: std::arch::aarch64::poly16x8_t,
+    mid1: std::arch::aarch64::poly16x8_t,
+    mid2: std::arch::aarch64::poly16x8_t,
+    high1: std::arch::aarch64::poly16x8_t,
+    high2: std::arch::aarch64::poly16x8_t,
+) -> (std::arch::aarch64::uint8x16_t, std::arch::aarch64::uint8x16_t) {
+    use std::arch::aarch64::*;
+    unsafe {
+        // Repack the 16-bit pmull lanes into (low byte, high byte)
+        // planes across all 16 words.
+        let hi = vuzpq_u8(vreinterpretq_u8_p16(high1), vreinterpretq_u8_p16(high2));
+        let lo = vuzpq_u8(vreinterpretq_u8_p16(low1), vreinterpretq_u8_p16(low2));
+        let mid = vuzpq_u8(vreinterpretq_u8_p16(mid1), vreinterpretq_u8_p16(mid2));
+        // Merge the Karatsuba middle term into the low/high planes.
+        let libytes = veorq_u8(hi.0, lo.1);
+        let l1 = veorq_u8(veorq_u8(libytes, lo.0), mid.0);
+        let h0 = veorq_u8(veorq_u8(libytes, hi.1), mid.1);
+        let h1 = hi.1;
+        // Barrett: first coefficient 0x1111a; multiply (h1:h0) by 0x11110.
+        let mut th0 = vsriq_n_u8(vshlq_n_u8(h1, 4), h0, 4);
+        let th1 = veorq_u8(h1, vshrq_n_u8(h1, 4));
+        th0 = veorq_u8(veorq_u8(th0, th1), h0);
+        let th0_hi3 = vshrq_n_u8(th0, 5);
+        let th0_hi1 = vshrq_n_u8(th0_hi3, 2);
+        // The 0x1a tail: h1 has only 7 significant bits, so 0x18 works
+        // and the 0x8 part is a plain shift.
+        th0 = veorq_u8(th0, vshrq_n_u8(h1, 5));
+        // Multiply the quotient by the polynomial's low bits (0x0b).
+        let red_l = vdupq_n_p8(0x0b);
+        let new_h1 = vsliq_n_u8(th0_hi3, th0, 4);
+        let th1m = vreinterpretq_u8_p8(vmulq_p8(vreinterpretq_p8_u8(th1), red_l));
+        let th0m = vreinterpretq_u8_p8(vmulq_p8(vreinterpretq_p8_u8(th0), red_l));
+        let out_lo = veorq_u8(lo.0, th0m);
+        let out_hi = veorq_u8(veorq_u8(new_h1, th0_hi1), veorq_u8(th1m, l1));
+        (out_lo, out_hi)
+    }
+}
+
 /// View a u16 word slice as its PAR2 wire bytes. PAR2 reads slices as
 /// little-endian words, so on the LE targets we ship this is a free
 /// cast. (A big-endian port would need a byte-swapping copy instead -
@@ -528,6 +895,90 @@ mod tests {
         assert_eq!(dst[1], mul(c, u16::from_le_bytes([3, 4])));
         assert_eq!(dst[2], mul(c, 5));
         assert_eq!(dst[3], 0, "beyond src stays untouched (zero pad)");
+    }
+
+    /// The multi-source fused kernel must equal per-source table folds
+    /// exactly: every group width up to the platform maximum, coefficient
+    /// classes incl. 0/1/low-byte-only/high-byte-only, random data, and
+    /// a non-zero starting dst so the accumulate is exercised. This is
+    /// the differential oracle for the ParPar-style pmull port - a wrong
+    /// Barrett reduction silently corrupts every repair.
+    #[test]
+    fn xor_mul_multi_matches_single_source_folds() {
+        let width = multi_fold_width();
+        if width == 0 {
+            return; // no multi kernel on this arch (yet)
+        }
+        let mut state = 0x0123456789ABCDEFu64;
+        let mut rng = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let coeff_pool = [
+            0u16, 1, 2, 0x00FF, 0xFF00, 0x0101, 0x100B, 0x8000, 0xFFFF, 0x1234, 0xABCD,
+        ];
+        for n in 1..=width {
+            for words in [16usize, 32, 48, 160, 4096] {
+                let srcs_owned: Vec<Vec<u8>> = (0..n)
+                    .map(|_| (0..words * 2).map(|_| rng() as u8).collect())
+                    .collect();
+                let srcs: Vec<&[u8]> = srcs_owned.iter().map(|v| v.as_slice()).collect();
+                let coeffs: Vec<u16> =
+                    (0..n).map(|i| coeff_pool[(rng() as usize + i) % coeff_pool.len()]).collect();
+                let base: Vec<u16> = (0..words).map(|_| rng() as u16).collect();
+                let mut want = base.clone();
+                for (s, c) in srcs.iter().zip(&coeffs) {
+                    MulTable::new(*c).xor_mul_into(&mut want, s);
+                }
+                let mut got = base.clone();
+                let done = xor_mul_multi_into(&mut got, &srcs, &coeffs);
+                // Kernels work in whole chunks (16 words on aarch64, 32
+                // on x86); whatever they leave is finished per-source.
+                assert!(
+                    done <= words && done % 16 == 0,
+                    "chunk accounting n={n} words={words} done={done}"
+                );
+                for (s, c) in srcs.iter().zip(&coeffs) {
+                    MulTable::new(*c).xor_mul_into(&mut got[done..], &s[done * 2..]);
+                }
+                assert_eq!(got, want, "n={n} words={words} coeffs={coeffs:x?}");
+                // Drive BOTH aarch64 kernels directly - runtime dispatch
+                // only ever exercises the best one this CPU has.
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let mut got = base.clone();
+                    let done = unsafe { xor_mul_multi_neon(&mut got, &srcs, &coeffs) };
+                    for (s, c) in srcs.iter().zip(&coeffs) {
+                        MulTable::new(*c).xor_mul_into(&mut got[done..], &s[done * 2..]);
+                    }
+                    assert_eq!(got, want, "plain-neon n={n} words={words}");
+                    if std::arch::is_aarch64_feature_detected!("sha3") {
+                        let mut got = base.clone();
+                        let done =
+                            unsafe { xor_mul_multi_neon_sha3(&mut got, &srcs, &coeffs) };
+                        for (s, c) in srcs.iter().zip(&coeffs) {
+                            MulTable::new(*c).xor_mul_into(&mut got[done..], &s[done * 2..]);
+                        }
+                        assert_eq!(got, want, "sha3 n={n} words={words}");
+                    }
+                }
+                // Same forcing for the x86 GFNI multi kernel (dispatch
+                // covers it only on gfni+avx2 hardware, which is also
+                // the only place it can run - but force it so the test
+                // name pins WHICH kernel failed).
+                #[cfg(target_arch = "x86_64")]
+                if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2") {
+                    let mut got = base.clone();
+                    let done = unsafe { xor_mul_multi_gfni(&mut got, &srcs, &coeffs) };
+                    for (s, c) in srcs.iter().zip(&coeffs) {
+                        MulTable::new(*c).xor_mul_into(&mut got[done..], &s[done * 2..]);
+                    }
+                    assert_eq!(got, want, "gfni-multi n={n} words={words}");
+                }
+            }
+        }
     }
 
     /// `xor_mul_into` must match a straight per-word GF multiply for every

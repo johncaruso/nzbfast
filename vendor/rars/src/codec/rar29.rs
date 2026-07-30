@@ -2048,6 +2048,27 @@ impl Unpack29 {
 
     fn decode_lz(&mut self, output_size: usize) -> Result<()> {
         while self.current_pos() < output_size {
+            // Literal burst on the LUT fast path: literals dominate most
+            // streams, and the generic `decode()` pays its empty-table and
+            // fallback checks per symbol. Mirrors the RAR 5 burst loops;
+            // LUT misses (long codes) and the sub-15-bit tail fall through
+            // to the generic path below, which handles them identically.
+            // An `empty()` table has no LUT at all - the generic path owns
+            // that error.
+            while !self.main.lut.is_empty() && self.current_pos() < output_size {
+                let Ok(peek) = self.bits.peek_bits(15) else {
+                    break;
+                };
+                let entry = self.main.lut[(peek >> (15 - HUFF29_LUT_BITS)) as usize];
+                if entry == 0 || (entry >> 8) > 255 {
+                    break;
+                }
+                self.bits.consume((entry & 0xff) as u8);
+                self.output.push((entry >> 8) as u8);
+            }
+            if self.current_pos() >= output_size {
+                break;
+            }
             let symbol = self.main.decode(&mut self.bits)?;
             match symbol {
                 0..=255 => self.output.push(symbol as u8),

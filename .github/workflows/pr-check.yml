@@ -32,12 +32,89 @@ jobs:
       - name: test
         env:
           NZBFAST_NO_ENRICH: "1"
+          # par2 is installed above, so a PAR2 test that cannot find it is a
+          # broken job. Without this they SKIP, and a broken install reads as
+          # a green run with silently reduced coverage.
+          NZBFAST_REQUIRE_PAR2: "1"
           # Opens an all-interfaces listener to prove the wide bind still
           # reaches the LAN (NAS boxes and remote *arrs depend on it).
           # Off by default because on a developer's macOS it means a
           # firewall prompt on every rebuild; a Linux runner has no such
           # prompt, so CI is where this belongs.
           NZBFAST_LAN_TESTS: "1"
-        run: cargo test --workspace --locked
+        # --no-fail-fast is not tidiness: cargo stops at the first failing
+        # TARGET, so a single red test in the nzbfast bin used to mean
+        # nzbkit's suites - yEnc, PAR2, RAR - never ran at all, and the run
+        # reported one binary's result as if it had covered the workspace.
+        run: cargo test --workspace --locked --no-fail-fast
       - name: fmt (advisory)
         run: cargo fmt --all --check || echo "::warning::cargo fmt differences (not blocking)"
+
+  # Windows, x64. The workspace suite had NEVER run on Windows on any
+  # architecture until a Windows-on-ARM build probe added a job that ran
+  # it, and eight tests failed - three of them on real product code, in
+  # `copy_tree`'s fsync, which made every cross-device move and the spool
+  # migration fail with "Access is denied." on the x64 binary we ship
+  # today. A download folder and a library on two different drives is the
+  # ordinary Windows setup, so that gap was reaching users. This job exists
+  # so it cannot come back unnoticed.
+  #
+  # Same gate as the Linux job above, deliberately: pr-check runs on the
+  # PUBLIC repo only. Windows runners bill at 2x on private repos, and the
+  # private dev repo runs no pr-check at all by design - so this executes
+  # on public-repo pull requests, exactly where the Linux leg already does,
+  # and nowhere else.
+  build-and-test-windows:
+    if: github.repository == 'nzbfast/nzbfast'
+    runs-on: windows-latest
+    # Windows compiles this workspace a good deal slower than Linux does:
+    # a cold-cache release build of it measured 38 minutes.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # The same test dependency the Linux job installs with apt, for the
+      # same reason: the e2e fixtures CREATE the PAR2 recovery sets they then
+      # damage and repair, and `par2` is the creator. nzbfast itself needs no
+      # external par2 - verify and repair are built in - so this is a fixture
+      # tool, not a runtime one. Pinned by tag and checked by SHA256 rather
+      # than trusted, since it is fetched from a third party and put on PATH.
+      - name: test deps (par2 for repair e2e)
+        shell: pwsh
+        run: |
+          $ver = "1.4.0"
+          $url = "https://github.com/animetosho/par2cmdline-turbo/releases/download/v$ver/par2cmdline-turbo-$ver-win-x64.zip"
+          Invoke-WebRequest -Uri $url -OutFile par2.zip
+          $want = "7905d1d6aced2b2ca30d824b4954e6bf740dc9d6cfec718b0ab146b5fc0d6327"
+          $got = (Get-FileHash par2.zip -Algorithm SHA256).Hash.ToLower()
+          Write-Host "par2 zip sha256 = $got"
+          if ($got -ne $want) { throw "par2 zip sha256 mismatch: got $got, expected $want" }
+          New-Item -ItemType Directory -Force -Path C:\par2 | Out-Null
+          Expand-Archive par2.zip -DestinationPath C:\par2 -Force
+          "C:\par2" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      # No toolchain step: rust-toolchain.toml pins 1.97.0 and rustup
+      # installs it for the msvc host on the first cargo invocation. An
+      # explicit `rustup default stable` would be overridden by that pin
+      # anyway - which is already what happens on the Linux job.
+      - name: cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # runner.os is in the key, so this cannot collide with the Linux
+          # job's cache.
+          key: pr-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: build
+        run: cargo build --workspace --locked
+      - name: test
+        env:
+          NZBFAST_NO_ENRICH: "1"
+          # As on the Linux leg: par2 is fetched above, so a skip here means
+          # the install or the PATH broke and the run must say so.
+          NZBFAST_REQUIRE_PAR2: "1"
+          # NZBFAST_LAN_TESTS is deliberately NOT set here. It belongs to
+          # the Linux runner: it opens an all-interfaces listener, which on
+          # Windows is exactly what raises the Defender Firewall dialog,
+          # and a hosted runner has nobody to click it.
+        run: cargo test --workspace --locked --no-fail-fast

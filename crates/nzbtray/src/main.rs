@@ -146,6 +146,123 @@ mod probe_body {
             )
     }
 
+    /// The port to look for first: what the DAEMON will bind, then what we
+    /// last spawned it on.
+    ///
+    /// `settings.json` wins because the daemon's own precedence puts it
+    /// above the `--port` flag we pass. Reading only `tray.json` meant that
+    /// after a port change in the dashboard the tray probed the old port,
+    /// found it free, spawned a daemon that bound the NEW one, then polled
+    /// the old port for 15 s and gave up - leaving the daemon it had just
+    /// started running with nothing attached to it. The Mac wrapper has
+    /// always resolved the saved port this way.
+    ///
+    /// Out here rather than in `mod app` so the precedence is tested on
+    /// every host, not only when someone builds for Windows.
+    pub fn load_port(data_dir: &Path) -> Option<u16> {
+        let from_settings = || -> Option<u16> {
+            let s = std::fs::read_to_string(data_dir.join("settings.json")).ok()?;
+            let v: Value = serde_json::from_str(&s).ok()?;
+            // Settings values arrive as numbers or strings depending on which
+            // path wrote them; accept both, reject anything out of range.
+            let port = v.get("port")?;
+            port.as_u64()
+                .or_else(|| port.as_str()?.trim().parse().ok())
+                .and_then(|p| u16::try_from(p).ok())
+                .filter(|p| *p != 0)
+        };
+        let from_tray = || -> Option<u16> {
+            let v: Value =
+                serde_json::from_str(&std::fs::read_to_string(data_dir.join("tray.json")).ok()?)
+                    .ok()?;
+            u16::try_from(v.get("port")?.as_u64()?).ok().filter(|p| *p != 0)
+        };
+        from_settings().or_else(from_tray)
+    }
+
+    /// What `runtime.json` tells us about the daemon we expect to find:
+    /// the port it bound and the per-start secret it will prove it holds.
+    /// Absent for an older daemon, or a data dir it never started from.
+    pub struct Runtime {
+        pub port: u16,
+        pub token: String,
+    }
+
+    pub fn runtime(data_dir: &Path) -> Option<Runtime> {
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(data_dir.join("runtime.json")).ok()?)
+                .ok()?;
+        let port = u16::try_from(v.get("port")?.as_u64()?).ok().filter(|p| *p != 0)?;
+        let token = stored_key(v.get("token")?.as_str()?)?;
+        Some(Runtime { port, token })
+    }
+
+    /// A nonce for one probe. Not a secret and not a key - it only has to
+    /// differ between probes so a recorded answer cannot be replayed - so
+    /// process id, address entropy and a counter are enough, and this stays
+    /// free of a random-number dependency.
+    pub fn probe_nonce() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let counter = N.fetch_add(1, Ordering::Relaxed);
+        let stack = &counter as *const _ as usize as u64;
+        let clock = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        format!("{:016x}{:016x}", clock ^ stack, counter ^ std::process::id() as u64)
+    }
+
+    /// Does this reply prove the listener is the daemon `runtime.json`
+    /// describes?
+    ///
+    /// The daemon answers `mode=version&hs=<nonce>` with
+    /// `sha256(token:nonce)`. The token itself never travels, so a probe
+    /// sent to an impostor teaches it nothing, and only a process that can
+    /// read our user-only `runtime.json` can produce the answer.
+    ///
+    /// `false` for a reply with no proof at all, which is what an OLDER
+    /// daemon returns - the caller decides what to do about that (see
+    /// `probe`), because refusing outright would break attaching to a
+    /// daemon from the release before this one.
+    pub fn proof_matches(body: &str, token: &str, nonce: &str) -> bool {
+        use sha2::{Digest, Sha256};
+        let Ok(v) = serde_json::from_str::<Value>(body) else {
+            return false;
+        };
+        let Some(got) = v.get("hs_proof").and_then(Value::as_str) else {
+            return false;
+        };
+        let mut h = Sha256::new();
+        h.update(token.as_bytes());
+        h.update(b":");
+        h.update(nonce.as_bytes());
+        let want = h.finalize();
+        // Constant-time-ish: the token is not guessable from a comparison
+        // here anyway (an attacker who can see this process's memory has
+        // already won), but there is no reason to leak the prefix length.
+        let want_hex = want.iter().fold(String::new(), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        });
+        want_hex.len() == got.len()
+            && want_hex
+                .bytes()
+                .zip(got.bytes())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0
+    }
+
+    /// Whether a reply carried a launcher proof at all - i.e. whether the
+    /// far side is new enough to be held to it.
+    pub fn has_proof(body: &str) -> bool {
+        serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|v| v.get("hs_proof").and_then(Value::as_str).map(str::to_string))
+            .is_some()
+    }
+
     #[cfg(test)]
     mod tests {
         use super::{apikey, dash_url, is_nzbfast, keyed_url, query_value, stored_key};
@@ -263,6 +380,116 @@ mod probe_body {
             );
             assert_eq!(dash_url(6789, &d), "http://127.0.0.1:6789/");
         }
+
+        /// The launcher handshake, which is what stands between "something
+        /// answers on 6789 in our shape" and handing that something the API
+        /// key (and with it `mode=server_secret`).
+        #[test]
+        fn only_the_daemon_holding_our_token_can_prove_it() {
+            use super::{has_proof, proof_matches, runtime};
+            use sha2::{Digest, Sha256};
+
+            let token = "3c2f0f9a5e1d4b8f7a6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e";
+            let nonce = "0123456789abcdef";
+            let proof = |t: &str| {
+                let mut h = Sha256::new();
+                h.update(t.as_bytes());
+                h.update(b":");
+                h.update(nonce.as_bytes());
+                h.finalize().iter().fold(String::new(), |mut s, b| {
+                    use std::fmt::Write;
+                    let _ = write!(s, "{b:02x}");
+                    s
+                })
+            };
+
+            let real = format!(
+                r#"{{"status":false,"error":"API Key Required","nzbfast":"1.0.12","hs_proof":"{}"}}"#,
+                proof(token)
+            );
+            assert!(has_proof(&real));
+            assert!(proof_matches(&real, token, nonce));
+
+            // An impostor can print our JSON - it cannot read the token file,
+            // so it cannot answer the challenge.
+            let impostor = r#"{"status":false,"error":"API Key Required","nzbfast":"1.0.12"}"#;
+            assert!(!has_proof(impostor), "a reply with no proof must not pass as proven");
+            assert!(!proof_matches(impostor, token, nonce));
+
+            // Nor can it guess one, or replay another nonce's answer.
+            let forged = format!(
+                r#"{{"status":false,"error":"API Key Required","hs_proof":"{}"}}"#,
+                proof("some other token")
+            );
+            assert!(has_proof(&forged));
+            assert!(!proof_matches(&forged, token, nonce));
+            assert!(!proof_matches(&real, token, "a-different-nonce"));
+
+            // The daemon's own runtime.json is what supplies the pair.
+            let d = data_dir("runtime", None, None);
+            assert!(runtime(&d).is_none(), "no file means no expectation to hold it to");
+            std::fs::write(
+                d.join("runtime.json"),
+                format!(r#"{{"pid":42,"port":6790,"token":"{token}","version":"1.0.12"}}"#),
+            )
+            .unwrap();
+            let rt = runtime(&d).expect("a written runtime.json is read back");
+            assert_eq!(rt.port, 6790);
+            assert!(proof_matches(&real, &rt.token, nonce));
+
+            // Truncated or tokenless files are treated as absent rather than
+            // as an empty token that everything matches.
+            std::fs::write(d.join("runtime.json"), r#"{"pid":42,"port":6790}"#).unwrap();
+            assert!(runtime(&d).is_none());
+            std::fs::write(d.join("runtime.json"), r#"{"port":6790,"token":"  "}"#).unwrap();
+            assert!(runtime(&d).is_none());
+        }
+
+        /// Which port the tray looks for first. Reading only `tray.json`
+        /// is what made it probe the OLD port after a dashboard port
+        /// change, spawn a daemon that bound the new one, and then exit on
+        /// timeout leaving that daemon orphaned.
+        #[test]
+        fn the_daemon_port_beats_the_one_we_last_spawned_on() {
+            use super::load_port;
+
+            let write = |dir: &std::path::Path, name: &str, body: &str| {
+                std::fs::write(dir.join(name), body).unwrap();
+            };
+
+            // Nothing saved anywhere: the caller's scan range decides.
+            let d = data_dir("port-none", None, None);
+            assert_eq!(load_port(&d), None);
+
+            // Only the tray's own note - the pre-dashboard case.
+            let d = data_dir("port-tray", None, None);
+            write(&d, "tray.json", r#"{"port": 6789}"#);
+            assert_eq!(load_port(&d), Some(6789));
+
+            // Both: settings.json wins, because that is what the daemon
+            // itself applies over the --port we pass it.
+            write(&d, "settings.json", r#"{"port": 6790}"#);
+            assert_eq!(load_port(&d), Some(6790));
+
+            // A port saved as a string still counts (different writers,
+            // different JSON types), and 0 or out of range does not.
+            write(&d, "settings.json", r#"{"port": "6791"}"#);
+            assert_eq!(load_port(&d), Some(6791));
+            for bad in [r#"{"port": 0}"#, r#"{"port": 70000}"#, r#"{"port": true}"#, "{}", "not json"] {
+                write(&d, "settings.json", bad);
+                assert_eq!(load_port(&d), Some(6789), "fell through to tray.json for {bad}");
+            }
+        }
+
+        /// Two probes must not share a nonce, or a recorded answer replays.
+        #[test]
+        fn probe_nonces_differ() {
+            use super::probe_nonce;
+            let a = probe_nonce();
+            let b = probe_nonce();
+            assert_ne!(a, b);
+            assert!(a.len() >= 16 && a.bytes().all(|c| c.is_ascii_alphanumeric()), "{a}");
+        }
     }
 }
 
@@ -368,15 +595,44 @@ mod app {
     /// `probe_body::is_nzbfast` recognises (the version answer OR the
     /// daemon's own auth refusal) is one of ours; anything else is a
     /// stranger. Sent WITHOUT the API key - see `probe_body::is_nzbfast`.
-    fn probe(port: u16) -> Probe {
+    ///
+    /// A reply shape is not identity, though, and `Probe::Nzbfast` means
+    /// attach-and-then-hand-over-the-API-key. So when `runtime.json` names
+    /// THIS port, the listener must also prove it holds that file's
+    /// per-start token (`probe_body::proof_matches`): any local account can
+    /// print our JSON, but only our own user can read that file. A daemon
+    /// too old to answer the challenge is accepted as before - refusing
+    /// would break attaching across the upgrade - and everything else that
+    /// fails the proof is a stranger.
+    fn probe(port: u16, data_dir: &Path) -> Probe {
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
         if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_err() {
             return Probe::Free;
         }
-        let url = format!("http://127.0.0.1:{port}/api?mode=version&output=json");
-        match agent(900).get(&url).call().ok().and_then(|r| r.into_string().ok()) {
-            Some(b) if crate::probe_body::is_nzbfast(&b) => Probe::Nzbfast,
-            _ => Probe::Other,
+        let rt = crate::probe_body::runtime(data_dir).filter(|r| r.port == port);
+        let nonce = crate::probe_body::probe_nonce();
+        let url =
+            format!("http://127.0.0.1:{port}/api?mode=version&output=json&hs={nonce}");
+        let Some(body) = agent(900).get(&url).call().ok().and_then(|r| r.into_string().ok())
+        else {
+            return Probe::Other;
+        };
+        if !crate::probe_body::is_nzbfast(&body) {
+            return Probe::Other;
+        }
+        match rt {
+            // We know what should be here. Hold it to the proof, unless it
+            // gave none at all (pre-handshake daemon).
+            Some(rt) if crate::probe_body::has_proof(&body) => {
+                if crate::probe_body::proof_matches(&body, &rt.token, &nonce) {
+                    Probe::Nzbfast
+                } else {
+                    Probe::Other
+                }
+            }
+            // No runtime.json for this port: an older daemon, or one started
+            // from a different data dir. Unchanged behaviour.
+            _ => Probe::Nzbfast,
         }
     }
 
@@ -414,12 +670,6 @@ mod app {
 
     fn prefs_path(data_dir: &Path) -> PathBuf {
         data_dir.join("tray.json")
-    }
-
-    fn load_port(data_dir: &Path) -> Option<u16> {
-        let v: Value =
-            serde_json::from_str(&std::fs::read_to_string(prefs_path(data_dir)).ok()?).ok()?;
-        u16::try_from(v.get("port")?.as_u64()?).ok()
     }
 
     fn save_port(data_dir: &Path, port: u16) {
@@ -495,12 +745,12 @@ mod app {
     /// (port, spawned child). Shows an error box and exits on failure.
     fn ensure_daemon(exe_dir: &Path, data_dir: &Path, out_dir: &Path) -> (u16, Option<Child>) {
         // Persisted port first (the attach contract), then the scan range.
-        let saved = load_port(data_dir);
+        let saved = crate::probe_body::load_port(data_dir);
         let candidates =
             saved.into_iter().chain((BASE_PORT..BASE_PORT + SCAN_SPAN).filter(|p| Some(*p) != saved));
         let mut spawn_at = None;
         for p in candidates {
-            match probe(p) {
+            match probe(p, data_dir) {
                 Probe::Nzbfast => return (p, None), // attach - not ours to manage
                 Probe::Free => {
                     spawn_at = Some(p);
@@ -529,12 +779,20 @@ mod app {
         // The daemon opens its index db and binds before answering; give
         // it 15 s of 250 ms polls like the Mac wrapper.
         let t0 = Instant::now();
+        let mut child = child;
         while t0.elapsed() < Duration::from_secs(15) {
-            if matches!(probe(port), Probe::Nzbfast) {
+            if matches!(probe(port, data_dir), Probe::Nzbfast) {
                 return (port, Some(child));
             }
             std::thread::sleep(Duration::from_millis(250));
         }
+        // Timed out: the daemon we started is still ours, and exiting without
+        // it leaves an orphan holding the spool, the queue and a listening
+        // socket - with no tray to stop it and nothing to attach to it.
+        // Whatever the timeout was caused by, it is not a reason to walk away
+        // from a child process.
+        let _ = child.kill();
+        let _ = child.wait();
         message_box(
             &format!(
                 "nzbfast didn't come up on port {port} within 15 s.\n\nLast log lines:\n{}",
@@ -667,8 +925,8 @@ mod app {
     /// tray's window so its process exits and its image file unlocks.
     /// Both halves are cooperative - nothing here terminates a process.
     fn legacy_shutdown(data_dir: &Path) {
-        if let Some(port) = load_port(data_dir) {
-            if matches!(probe(port), Probe::Nzbfast) {
+        if let Some(port) = crate::probe_body::load_port(data_dir) {
+            if matches!(probe(port, data_dir), Probe::Nzbfast) {
                 let url = keyed_url(
                     format!("http://127.0.0.1:{port}/api?mode=shutdown&output=json"),
                     data_dir,
@@ -676,7 +934,7 @@ mod app {
                 let _ = agent(2000).post(&url).send_string("");
                 let t0 = Instant::now();
                 while t0.elapsed() < Duration::from_secs(8) {
-                    if matches!(probe(port), Probe::Free) {
+                    if matches!(probe(port, data_dir), Probe::Free) {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(200));
@@ -1125,7 +1383,7 @@ mod app {
         unsafe {
             CreateMutexW(std::ptr::null(), 0, w("Local\\nzbfast-tray-single").as_ptr());
             if GetLastError() == ERROR_ALREADY_EXISTS {
-                let port = load_port(&data_dir).unwrap_or(BASE_PORT);
+                let port = crate::probe_body::load_port(&data_dir).unwrap_or(BASE_PORT);
                 if args.is_empty() && links.is_empty() {
                     open_url(&dash_url(port, &data_dir));
                 } else {

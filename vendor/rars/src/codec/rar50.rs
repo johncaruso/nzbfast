@@ -1479,6 +1479,10 @@ pub struct Unpack50Decoder {
     history_compactions: u64,
     retain_history: bool,
     window_limit: usize,
+    // Execution-policy cap on tape-decode workers; usize::MAX = uncapped.
+    // A cap of 1 keeps every MT gate below its >=2 threshold, so decode
+    // stays fully serial. Never changes output bytes or errors.
+    mt_workers_cap: usize,
     // Test-only override forcing the parallel flat-apply path on regardless of
     // member size, so the dedicated flat differential tests exercise it on the
     // large multi-block shapes; never set on the production gate (see 2.2).
@@ -1525,6 +1529,7 @@ impl Unpack50Decoder {
             history_zero_prefix: 0,
             history_compactions: 0,
             window_limit: usize::MAX,
+            mt_workers_cap: usize::MAX,
             #[cfg(test)]
             test_force_flat: false,
         }
@@ -1541,6 +1546,7 @@ impl Unpack50Decoder {
     fn history_window_len(&self) -> usize {
         self.history.len() - self.history_start
     }
+
 
     /// Trim the window to `limit` bytes - O(1), no bytes move.
     #[inline]
@@ -1620,6 +1626,18 @@ impl Unpack50Decoder {
     /// host may not afford. `usize::MAX` (the default) imposes no cap.
     pub fn set_window_limit(&mut self, limit: usize) {
         self.window_limit = limit.max(1);
+    }
+
+    /// Caps the parallel tape-decode workers (execution policy). 1 disables
+    /// the MT pipelines entirely; the default is uncapped.
+    pub fn set_mt_workers_cap(&mut self, cap: usize) {
+        self.mt_workers_cap = cap.max(1);
+    }
+
+    /// Host-derived worker count, bounded by the execution policy's cap.
+    #[cfg(feature = "parallel")]
+    fn capped_workers(&self, output_size: usize) -> usize {
+        mt_worker_count(output_size).min(self.mt_workers_cap)
     }
 
     pub fn decode_member(
@@ -1911,7 +1929,7 @@ impl Unpack50Decoder {
         );
 
         #[cfg(feature = "parallel")]
-        let mt_done = if mt_worker_count(output_size) >= 2 {
+        let mt_done = if self.capped_workers(output_size) >= 2 {
             self.run_blocks_parallel(input, algorithm_version, output_size, &mut output, &mut sink)?;
             true
         } else {
@@ -2009,16 +2027,23 @@ impl Unpack50Decoder {
         // A group that fits the flat budget decodes through the flat-apply
         // fast path (wild copies, no ring masking, scan on its own thread)
         // - the same pipeline that put big non-solid members ahead of
-        // unrar. Needs an empty window (group starts at the archive's
-        // first member); groups seeded mid-archive stream instead. A carried
-        // sparse zero run counts as window here: `FlatOutput` knows nothing
-        // of the run, so taking this path would silently drop it and reject
-        // any match reaching into it - the streaming path below honors it.
-        if self.history_window_len() == 0
-            && self.history_zero_prefix == 0
-            && total_output_size as u64 <= flat_limit
+        // unrar. A group starting mid-archive seeds the flat buffer with
+        // the carried window (matches reach into the prefix exactly as the
+        // ring's history), so second and later groups keep the fast path
+        // too; the seed counts against the flat budget. A carried sparse
+        // zero run still streams: `FlatOutput` knows nothing of the run,
+        // so taking this path would silently drop it and reject any match
+        // reaching into it - the streaming path below honors it.
+        if self.history_zero_prefix == 0
+            && (total_output_size as u64).saturating_add(self.history_window_len() as u64)
+                <= flat_limit
         {
-            let mut flat = FlatOutput::new(total_output_size, dictionary_size, history_limit);
+            let mut flat = FlatOutput::new_seeded(
+                self.history_window(),
+                total_output_size,
+                dictionary_size,
+                history_limit,
+            );
             self.run_blocks_flat_chain(
                 first,
                 next_input,
@@ -2032,8 +2057,8 @@ impl Unpack50Decoder {
                 if self.retain_history {
                     self.history = flat.into_history(history_limit);
                     self.history_start = 0;
-                    // Flat chains start on an empty window; everything the
-                    // next member can reach is materialized in `history`.
+                    // Seed and output are both materialized in `history`;
+                    // nothing ahead of the window is provably zero.
                     self.history_zero_prefix = 0;
                 }
                 Ok(())
@@ -2072,8 +2097,19 @@ impl Unpack50Decoder {
 
     /// Is a solid chain of this total size worth the MT pipeline?
     #[cfg(feature = "parallel")]
-    pub fn solid_chain_worthwhile(total_output_size: usize) -> bool {
-        mt_worker_count(total_output_size) >= 2
+    pub fn solid_chain_worthwhile(&self, total_output_size: usize) -> bool {
+        self.capped_workers(total_output_size) >= 2
+    }
+
+    /// Would an inline decode of a member this size engage the MT block
+    /// pipeline? Pool planning must not steal such members from inline MT;
+    /// anything below this streams serially inline, where the member pool
+    /// is strictly better. Deliberately unaffected by the per-decoder
+    /// worker cap: pool planning has no decoder in hand, and the pool
+    /// applies the policy's cap to its own workers.
+    #[cfg(feature = "parallel")]
+    pub fn mt_pipeline_engages(output_size: usize) -> bool {
+        mt_worker_count(output_size) >= 2
     }
 
     /// Owned snapshot of the full solid state, letting a caller retry a
@@ -2236,6 +2272,13 @@ struct StreamingOutput {
     // Once a filter is seen, every ring growth reserves filter hold-back
     // headroom (see `reserve`); most members never declare one.
     has_filters: bool,
+    // Largest `window` the current ring already satisfies, so the common
+    // call is one comparison. `reserve` runs per emitted literal and per
+    // match, and recomputing headroom + min + next_power_of_two() on each
+    // of those made it the second-hottest symbol in the decoder (20% of
+    // decode-thread samples on a 128 MiB-dictionary member) long after the
+    // ring had stopped growing. Invalidated wherever headroom changes.
+    reserve_ok_upto: usize,
     pending_filters: std::collections::VecDeque<StreamFilter>,
     filter_scratch: Vec<u8>,
     next_flush_check: usize,
@@ -2279,6 +2322,7 @@ impl StreamingOutput {
             dictionary_size,
             history_limit,
             has_filters: false,
+            reserve_ok_upto: 0,
             pending_filters: std::collections::VecDeque::new(),
             filter_scratch: Vec::new(),
         }
@@ -2296,6 +2340,7 @@ impl StreamingOutput {
         // From here on every ring growth reserves filter hold-back headroom;
         // grow now so the pending range fits ahead of head.
         self.has_filters = true;
+        self.reserve_ok_upto = 0; // headroom grew; recompute on next reserve
         self.reserve(self.head);
         // filter.start >= written (read_filter adds a non-negative offset),
         // so the materialized-space start is always at or ahead of head.
@@ -2326,7 +2371,20 @@ impl StreamingOutput {
     /// dictionary. The live span is re-placed at its positions under the new
     /// mask. A no-op in the steady state, where the ring is already large
     /// enough.
+    /// Hot path: one comparison, always inlined. This runs per emitted
+    /// literal and per match, and leaving it out of line still cost ~18%
+    /// of decode-thread samples in pure call overhead even once the guard
+    /// was short-circuiting every call.
+    #[inline(always)]
     fn reserve(&mut self, window: usize) {
+        if window > self.reserve_ok_upto {
+            self.reserve_grow(window);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn reserve_grow(&mut self, window: usize) {
         let headroom = 2 * STREAM_FLUSH_THRESHOLD
             + if self.has_filters {
                 STREAM_FILTER_HOLD_LIMIT
@@ -2338,8 +2396,21 @@ impl StreamingOutput {
             .saturating_add(headroom)
             .next_power_of_two();
         if self.ring.len() >= needed {
+            self.note_reserve_ok(headroom);
             return;
         }
+        // Grow straight to the largest ring this member can ever need
+        // rather than doubling into it. The cap is known up front
+        // (history_limit, itself bounded by the declared dictionary), and
+        // every intermediate size costs a full zeroing allocation plus a
+        // copy of the live window - on a 128 MiB dictionary that was
+        // ~256 MiB of memset and ~256 MiB of memmove spread over eight
+        // doublings, with both rings resident across each one.
+        let ceiling = self
+            .history_limit
+            .saturating_add(headroom)
+            .next_power_of_two();
+        let needed = needed.max(ceiling.min(Self::growth_ceiling(self.output_limit, headroom)));
         let mut ring = vec![0u8; needed].into_boxed_slice();
         let new_mask = needed - 1;
         let live = self.head.min(self.ring.len());
@@ -2355,6 +2426,28 @@ impl StreamingOutput {
         }
         self.ring = ring;
         self.mask = new_mask;
+        self.note_reserve_ok(headroom);
+    }
+
+    /// Record the largest `window` the current ring satisfies. Once the
+    /// ring covers `history_limit + headroom` no window can ever need
+    /// more, so the guard short-circuits for the rest of the member.
+    fn note_reserve_ok(&mut self, headroom: usize) {
+        let full = self
+            .history_limit
+            .saturating_add(headroom)
+            .next_power_of_two();
+        self.reserve_ok_upto = if self.ring.len() >= full {
+            usize::MAX
+        } else {
+            self.ring.len().saturating_sub(headroom)
+        };
+    }
+
+    /// A member never needs window past its own output, so a small member
+    /// declaring a huge dictionary still allocates only what it can use.
+    fn growth_ceiling(output_limit: usize, headroom: usize) -> usize {
+        output_limit.saturating_add(headroom).next_power_of_two()
     }
 
     /// Bytes materialized but not yet flushed to the sink.
@@ -2968,10 +3061,60 @@ enum TapeOp {
     Filter(RawFilter),
 }
 
+/// Huffman table set whose LUT construction is deferred to the first worker
+/// that needs it. The scanner was building all four LUTs serially per table
+/// block (~half its critical-path time on solid chains, starving the
+/// workers); now it only parses `TableLengths` and the first worker to
+/// receive a block of the set pays the build, concurrently with other
+/// workers building other sets. Blocks that reuse a set share the same
+/// `Arc`, so every set still builds exactly once, and a build failure is
+/// cloned to every dependent block (raised only when the ordered apply
+/// semantically reaches it - see `decode_block_tape`).
+#[cfg(feature = "parallel")]
+struct LazyDecodeTables {
+    /// `None` only for a set seeded from already-built tables
+    /// (`Self::prebuilt`), whose `built` cell is pre-populated.
+    lengths: Option<TableLengths>,
+    built: std::sync::OnceLock<Result<std::sync::Arc<DecodeTables>>>,
+}
+
+#[cfg(feature = "parallel")]
+impl LazyDecodeTables {
+    fn new(lengths: TableLengths) -> Self {
+        Self {
+            lengths: Some(lengths),
+            built: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Wrap tables that already exist (the decoder's carried state seeding a
+    /// chain, or a test fixture) so the pipeline sees one type.
+    fn prebuilt(tables: std::sync::Arc<DecodeTables>) -> Self {
+        let built = std::sync::OnceLock::new();
+        built.set(Ok(tables)).expect("fresh OnceLock accepts a value");
+        Self {
+            lengths: None,
+            built,
+        }
+    }
+
+    fn get(&self) -> Result<std::sync::Arc<DecodeTables>> {
+        self.built
+            .get_or_init(|| {
+                let lengths = self
+                    .lengths
+                    .as_ref()
+                    .expect("unbuilt lazy tables always carry lengths");
+                DecodeTables::from_lengths(lengths).map(std::sync::Arc::new)
+            })
+            .clone()
+    }
+}
+
 #[cfg(feature = "parallel")]
 struct TapeJob {
     seq: usize,
-    tables: std::sync::Arc<DecodeTables>,
+    tables: std::sync::Arc<LazyDecodeTables>,
     payload: Vec<u8>,
     start_bit: usize,
     payload_bits: usize,
@@ -2980,7 +3123,7 @@ struct TapeJob {
 #[cfg(feature = "parallel")]
 struct BlockTape {
     seq: usize,
-    tables: std::sync::Arc<DecodeTables>,
+    tables: std::sync::Arc<LazyDecodeTables>,
     payload: Vec<u8>,
     payload_bits: usize,
     lits: Vec<u8>,
@@ -2999,7 +3142,28 @@ struct BlockTape {
 /// no window, no rep state, no sink).
 #[cfg(feature = "parallel")]
 fn decode_block_tape(job: TapeJob) -> BlockTape {
-    let tables = &*job.tables;
+    // First use of a table set builds it here, off the scanner's critical
+    // path. A build failure yields an empty tape carrying the error: the
+    // ordered apply raises it only if the member still needs output when it
+    // reaches this block - the serial decoder would have built (and failed)
+    // these tables at exactly that point in the stream, and never at all if
+    // the output completed first.
+    let tables = match job.tables.get() {
+        Ok(tables) => tables,
+        Err(error) => {
+            return BlockTape {
+                seq: job.seq,
+                tables: job.tables,
+                payload: job.payload,
+                payload_bits: job.payload_bits,
+                lits: Vec::new(),
+                ops: Vec::new(),
+                resume_bit: None,
+                tail_error: Some(error),
+            }
+        }
+    };
+    let tables = &*tables;
     let mut bits = BitReader::new_at(&job.payload, job.start_bit);
     let mut lits: Vec<u8> = Vec::new();
     let mut ops: Vec<TapeOp> = Vec::new();
@@ -3190,10 +3354,13 @@ impl Unpack50Decoder {
         }
         if let Some(resume_bit) = tape.resume_bit {
             // Worker parked at a tape cap: finish this block serially in
-            // place - the rep state is live here, so this is exact.
+            // place - the rep state is live here, so this is exact. A parked
+            // tape implies its worker built the tables, so this is a cache
+            // read, never a build.
+            let tables = tape.tables.get()?;
             let mut bits = BitReader::new_at(&tape.payload, resume_bit);
             decode_block_serial(
-                &tape.tables,
+                &tables,
                 &mut bits,
                 tape.payload_bits,
                 &mut self.reps,
@@ -3254,7 +3421,7 @@ impl Unpack50Decoder {
         use std::sync::mpsc;
         use std::sync::Arc;
 
-        let workers = mt_worker_count(output_size).max(2);
+        let workers = self.capped_workers(output_size).max(2);
         let max_in_flight = workers * 3;
 
         let (result_tx, result_rx) = mpsc::sync_channel::<BlockTape>(workers * 2);
@@ -3274,8 +3441,11 @@ impl Unpack50Decoder {
         }
         drop(result_tx);
 
-        let mut scan_tables = self.tables.clone();
-        let mut applied_tables: Option<Arc<DecodeTables>> = None;
+        let mut scan_tables = self
+            .tables
+            .clone()
+            .map(|tables| Arc::new(LazyDecodeTables::prebuilt(tables)));
+        let mut applied_tables: Option<Arc<LazyDecodeTables>> = None;
         let mut reorder: BTreeMap<usize, BlockTape> = BTreeMap::new();
         let mut held: Option<TapeJob> = None;
         let mut dispatched = 0usize; // blocks read off the input
@@ -3306,14 +3476,13 @@ impl Unpack50Decoder {
                         Ok(header) => {
                         let mut start_bit = 0;
                         if header.has_tables {
-                            match read_table_lengths(&payload, algorithm_version).and_then(
-                                |(lengths, table_bits)| {
-                                    DecodeTables::from_lengths(&lengths)
-                                        .map(|tables| (tables, table_bits))
-                                },
-                            ) {
-                                Ok((tables, table_bits)) => {
-                                    scan_tables = Some(Arc::new(tables));
+                            // Parse the lengths here (they position the
+                            // symbol start); the LUT build itself is lazy -
+                            // the first worker that needs the set pays it.
+                            match read_table_lengths(&payload, algorithm_version) {
+                                Ok((lengths, table_bits)) => {
+                                    scan_tables =
+                                        Some(Arc::new(LazyDecodeTables::new(lengths)));
                                     start_bit = table_bits;
                                 }
                                 Err(error) => {
@@ -3425,8 +3594,11 @@ impl Unpack50Decoder {
 
         // Leave the decoder's table state as the serial path would: the
         // tables of the last block actually applied (scan may have read
-        // further ahead than the member needed).
-        if let Some(tables) = applied_tables {
+        // further ahead than the member needed). An applied tape's tables are
+        // normally already built; an all-literal empty tape may build here.
+        // If the last applied tape carried a failed build the decode errored,
+        // so there is no state worth carrying.
+        if let Some(tables) = applied_tables.and_then(|lazy| lazy.get().ok()) {
             self.tables = Some(tables);
         }
         result
@@ -3444,7 +3616,7 @@ impl Unpack50Decoder {
         if self.test_force_flat {
             return true;
         }
-        mt_worker_count(output_size) >= 2 && output_size as u64 <= flat_limit
+        self.capped_workers(output_size) >= 2 && output_size as u64 <= flat_limit
     }
 
     /// Flat-buffer analogue of `apply_tape`: identical op semantics, deferred
@@ -3579,7 +3751,7 @@ impl Unpack50Decoder {
         use std::sync::mpsc;
         use std::sync::Arc;
 
-        let workers = mt_worker_count(output_size).max(2);
+        let workers = self.capped_workers(output_size).max(2);
 
         let (result_tx, result_rx) = mpsc::sync_channel::<BlockTape>(workers * 2);
         let mut job_txs: Vec<mpsc::SyncSender<TapeJob>> = Vec::with_capacity(workers);
@@ -3598,8 +3770,11 @@ impl Unpack50Decoder {
         }
         drop(result_tx);
 
-        let scan_tables = self.tables.clone();
-        let mut applied_tables: Option<Arc<DecodeTables>> = None;
+        let scan_tables = self
+            .tables
+            .clone()
+            .map(|tables| Arc::new(LazyDecodeTables::prebuilt(tables)));
+        let mut applied_tables: Option<Arc<LazyDecodeTables>> = None;
 
         let worker_exited =
             || StreamDecodeError::Decode(Error::InvalidData("RAR 5 parallel decode worker exited"));
@@ -3629,14 +3804,10 @@ impl Unpack50Decoder {
                     };
                     let mut start_bit = 0;
                     if header.has_tables {
-                        match read_table_lengths(&payload, algorithm_version).and_then(
-                            |(lengths, table_bits)| {
-                                DecodeTables::from_lengths(&lengths)
-                                    .map(|tables| (tables, table_bits))
-                            },
-                        ) {
-                            Ok((new_tables, table_bits)) => {
-                                tables = Some(Arc::new(new_tables));
+                        // Parse only; the LUT build is lazy on the workers.
+                        match read_table_lengths(&payload, algorithm_version) {
+                            Ok((lengths, table_bits)) => {
+                                tables = Some(Arc::new(LazyDecodeTables::new(lengths)));
                                 start_bit = table_bits;
                             }
                             Err(error) => {
@@ -3730,8 +3901,9 @@ impl Unpack50Decoder {
         }
 
         // Leave the decoder's table state as the serial path would: the
-        // tables of the last block actually applied (trap 3).
-        if let Some(tables) = applied_tables {
+        // tables of the last block actually applied (trap 3). See the ring
+        // pipeline for why a failed build is not carried.
+        if let Some(tables) = applied_tables.and_then(|lazy| lazy.get().ok()) {
             self.tables = Some(tables);
         }
 
@@ -3769,8 +3941,13 @@ impl Unpack50Decoder {
 #[cfg(feature = "parallel")]
 struct FlatOutput {
     buf: Vec<u8>,
-    /// Bytes materialized (== logical output written).
+    /// Physical write position in `buf`. With a seeded prefix this is NOT
+    /// the logical output count - see `base` and `written()`.
     pos: usize,
+    /// Seeded-window prefix length: `buf[..base]` is the solid window
+    /// carried into this group, never emitted, reachable by matches. Zero
+    /// for a group starting on an empty window (the original flat mode).
+    base: usize,
     /// Bytes already emitted to the sink.
     emitted: usize,
     dictionary_size: usize,
@@ -3791,21 +3968,42 @@ const FLAT_EMIT_THRESHOLD: usize = 1 << 20;
 #[cfg(feature = "parallel")]
 impl FlatOutput {
     fn new(output_size: usize, dictionary_size: usize, history_limit: usize) -> Self {
+        Self::new_seeded(&[], output_size, dictionary_size, history_limit)
+    }
+
+    /// Flat buffer whose prefix is a carried solid window: matches reach
+    /// into it exactly as the ring path's history, output positions and
+    /// emits stay logical to the group. This is what lets the SECOND and
+    /// later chain groups of a solid archive keep the flat fast path - the
+    /// empty-window-only gate cost them ~50% (ring 0.74s vs flat 0.49s on
+    /// the 200 MB solid corpus).
+    fn new_seeded(
+        seed: &[u8],
+        output_size: usize,
+        dictionary_size: usize,
+        history_limit: usize,
+    ) -> Self {
+        let mut buf = vec![0u8; seed.len() + output_size];
+        buf[..seed.len()].copy_from_slice(seed);
         Self {
-            buf: vec![0u8; output_size],
-            pos: 0,
-            emitted: 0,
+            buf,
+            pos: seed.len(),
+            base: seed.len(),
+            emitted: seed.len(),
             dictionary_size,
             history_limit,
             pending_filters: std::collections::VecDeque::new(),
             filter_scratch: Vec::new(),
-            next_emit_check: FLAT_EMIT_THRESHOLD,
+            next_emit_check: seed.len() + FLAT_EMIT_THRESHOLD,
         }
     }
 
+    /// Logical bytes of THIS GROUP's output (the seeded prefix is not
+    /// output). Every output-limit and member-boundary computation runs on
+    /// this; `pos` stays physical.
     #[inline]
     fn written(&self) -> usize {
-        self.pos
+        self.pos - self.base
     }
 
     /// Append a literal run: one straight copy into `buf`, then attempt an
@@ -3946,6 +4144,13 @@ impl FlatOutput {
         if self.pending_filters.len() >= STREAM_MAX_PENDING_FILTERS {
             return Err(StreamDecodeError::FilteredMember);
         }
+        // Filter starts arrive logical (resolved against `written()`);
+        // everything downstream (emit gating, scratch slicing) is physical.
+        let mut filter = filter;
+        filter.start = filter
+            .start
+            .checked_add(self.base)
+            .ok_or(Error::InvalidData("RAR 5 filter range overflows"))?;
         if let Some(back) = self.pending_filters.back() {
             let back_end = back.start.saturating_add(back.length);
             let identical_range = filter.start == back.start && filter.length == back.length;
@@ -6877,6 +7082,201 @@ mod tests {
                         }
                         Err(_) => panic!("{name}/{prefix}: unexpected error variant"),
                     },
+                }
+            }
+        }
+    }
+
+    /// Two chain groups on one decoder: the second group starts with a
+    /// non-empty carried window, which used to force the ring path; now it
+    /// takes the SEEDED flat path. Both groups (and the ring variant, via
+    /// flat_limit 0) must reproduce the serial member-by-member decode,
+    /// including matches from group B reaching back into group A's bytes
+    /// through the seeded prefix, and final rep/window state.
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn seeded_flat_second_chain_group_matches_serial() {
+        // Four solid members; later members repeat earlier members' data so
+        // the encoder emits cross-member (and cross-GROUP) matches.
+        let base: Vec<u8> = (0u32..6000)
+            .map(|i| (i.wrapping_mul(2654435761) >> 11) as u8)
+            .collect();
+        let members: Vec<Vec<u8>> = vec![
+            base.clone(),
+            base[..4000].to_vec(),
+            base[1000..5000].to_vec(),
+            base.iter().rev().copied().chain(base[..2000].iter().copied()).collect(),
+        ];
+        let mut history = Vec::new();
+        let encoded: Vec<Vec<u8>> = members
+            .iter()
+            .map(|data| {
+                let packed = encode_lz_member_with_history_and_options(
+                    data,
+                    &history,
+                    0,
+                    EncodeOptions::new(4),
+                )
+                .unwrap();
+                history.extend_from_slice(data);
+                packed
+            })
+            .collect();
+
+        // Serial oracle: one decoder, members decoded in order, solid.
+        let mut serial = Unpack50Decoder::new();
+        let mut serial_out = Vec::new();
+        for (data, packed) in members.iter().zip(&encoded) {
+            serial_out.extend(
+                serial
+                    .decode_member(packed, 0, data.len(), true, DecodeMode::Lz)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(serial_out, members.concat(), "oracle disagrees with encoder");
+
+        // Chain in two groups of two; the second call sees a carried window.
+        for flat_limit in [u64::MAX, 0] {
+            let mut chained = Unpack50Decoder::new();
+            let mut chain_out: Vec<u8> = Vec::new();
+            for group in [[0usize, 1], [2, 3]] {
+                let total: usize = group.iter().map(|&i| members[i].len()).sum();
+                let mut next = 0usize;
+                let readers: Vec<&[u8]> =
+                    group.iter().map(|&i| encoded[i].as_slice()).collect();
+                let mut next_input = || -> Option<Box<dyn std::io::Read + Send>> {
+                    let reader = readers.get(next)?;
+                    next += 1;
+                    Some(Box::new(std::io::Cursor::new(reader.to_vec())))
+                };
+                if group[0] != 0 {
+                    assert!(
+                        chained.history_window_len() > 0,
+                        "second group must start seeded"
+                    );
+                }
+                chained
+                    .decode_solid_chain_to_sink(
+                        &mut next_input,
+                        0,
+                        total,
+                        DEFAULT_DICTIONARY_SIZE,
+                        false,
+                        flat_limit,
+                        |chunk| -> std::result::Result<(), std::convert::Infallible> {
+                            match chunk {
+                                DecodedChunk::Bytes(bytes) => chain_out.extend_from_slice(bytes),
+                                DecodedChunk::Repeated { byte, len } => {
+                                    chain_out.extend(std::iter::repeat(byte).take(len))
+                                }
+                            }
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+            }
+            assert_eq!(
+                chain_out, serial_out,
+                "chained output diverged at flat_limit {flat_limit}"
+            );
+            assert_eq!(chained.reps, serial.reps, "rep state diverged");
+            assert_eq!(chained.last_length, serial.last_length);
+        }
+    }
+
+    /// Lazy table builds move `DecodeTables::from_lengths` failures from the
+    /// scanner to the workers; the deferred-error contract must survive the
+    /// move. A read-ahead block whose table set parses but fails to BUILD
+    /// must be swallowed when the member's output completed before it (the
+    /// serial decoder never builds those tables), and must surface the exact
+    /// serial error when the member still needs output from it.
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn parallel_decode_defers_read_ahead_table_build_failure() {
+        // Block 1: valid tables, emits "ABAB" (2 literals + a match).
+        let mut lengths = TableLengths {
+            main: vec![0; MAIN_TABLE_SIZE],
+            distance: vec![0; DISTANCE_TABLE_SIZE_50],
+            align: vec![0; ALIGN_TABLE_SIZE],
+            length: vec![0; LENGTH_TABLE_SIZE],
+        };
+        lengths.main[b'A' as usize] = 2;
+        lengths.main[b'B' as usize] = 2;
+        lengths.main[257] = 2;
+        lengths.main[262] = 2;
+        lengths.distance[1] = 1;
+        lengths.length[0] = 1;
+        let (bytes, bit_pos) = encode_table_lengths_with_bit_count(&lengths, 0).unwrap();
+        let mut writer = BitWriter { bytes, bit_pos };
+        writer.write_bits(0b00, 2); // 'A'
+        writer.write_bits(0b01, 2); // 'B'
+        writer.write_bits(0b11, 2); // symbol 262: new match, length 2
+        writer.write_bits(0, 1); // distance slot 1 -> distance 2
+        let bits1 = writer.bit_pos;
+        let payload1 = writer.finish();
+        let block1 = encode_compressed_block(&payload1, bits1, true, false).unwrap();
+
+        // Block 2: table lengths that PARSE but cannot BUILD (three length-1
+        // main codes oversubscribe the tree).
+        let mut bad_lengths = TableLengths {
+            main: vec![0; MAIN_TABLE_SIZE],
+            distance: vec![0; DISTANCE_TABLE_SIZE_50],
+            align: vec![0; ALIGN_TABLE_SIZE],
+            length: vec![0; LENGTH_TABLE_SIZE],
+        };
+        bad_lengths.main[0] = 1;
+        bad_lengths.main[1] = 1;
+        bad_lengths.main[2] = 1;
+        assert!(
+            DecodeTables::from_lengths(&bad_lengths).is_err(),
+            "fixture tables must fail to build"
+        );
+        let (bad_bytes, bad_bits) =
+            encode_table_lengths_with_bit_count(&bad_lengths, 0).unwrap();
+        let block2 = encode_compressed_block(&bad_bytes, bad_bits, true, true).unwrap();
+
+        let mut stream = block1;
+        stream.extend_from_slice(&block2);
+
+        // Case A: output completes inside block 1 -> every path succeeds and
+        // never surfaces the read-ahead build failure.
+        // Case B: output needs block 2 -> every path fails with the exact
+        // error the serial decoder raises at that table build.
+        for output_size in [4usize, 6] {
+            let mut reference = Unpack50Decoder::new();
+            let ref_result =
+                reference.decode_member(&stream, 0, output_size, false, DecodeMode::Lz);
+
+            let mut mt_decoder = Unpack50Decoder::new();
+            let mt_result = mt_sink_decode(&stream, output_size, &mut mt_decoder);
+            let mut flat_decoder = Unpack50Decoder::new();
+            let flat_result = flat_sink_decode(&stream, output_size, &mut flat_decoder);
+
+            match ref_result {
+                Ok(ref_out) => {
+                    assert_eq!(ref_out, b"ABAB", "reference disagrees with test setup");
+                    assert_eq!(
+                        mt_result.expect("ring path must swallow the read-ahead build error"),
+                        ref_out
+                    );
+                    assert_eq!(
+                        flat_result.expect("flat path must swallow the read-ahead build error"),
+                        ref_out
+                    );
+                }
+                Err(ref_error) => {
+                    for (name, result) in [("ring", mt_result), ("flat", flat_result)] {
+                        match result {
+                            Err(StreamDecodeError::Decode(error)) => assert_eq!(
+                                error, ref_error,
+                                "{name}: build-failure error must match serial"
+                            ),
+                            Ok(_) => panic!(
+                                "{name}: succeeded where the serial decoder fails the table build"
+                            ),
+                            Err(_) => panic!("{name}: unexpected error variant"),
+                        }
+                    }
                 }
             }
         }

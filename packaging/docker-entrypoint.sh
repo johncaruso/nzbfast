@@ -18,6 +18,19 @@ export NZBFAST_BUNDLED=1
 # what covers images already in the field; this just makes it explicit.
 export NZBFAST_CONTAINER=1
 
+# The port belongs to whoever ran the image, not to the dashboard. It is
+# named in the published mapping (`-p 6789:6789`), in the healthcheck
+# above, and in every compose file and NAS project built from them - none
+# of which nzbfast can reach. A port saved in the UI would move the
+# listener away from all three: unreachable through the mapping, and
+# unhealthy on the next restart. With this set the setting is refused with
+# an explanation instead, and the field says where the port really lives.
+#
+# Deliberately overridable: `-e NZBFAST_PORT_LOCKED=0` gives the field back
+# to an operator who knows their run has no mapping to break (`--network
+# host`, say) and would rather manage it from the UI.
+export NZBFAST_PORT_LOCKED="${NZBFAST_PORT_LOCKED:-1}"
+
 CONFIG="${NZBFAST_CONFIG:-/config/config.json}"
 PORT="${NZBFAST_PORT:-6789}"
 OUT="${NZBFAST_OUT:-/downloads}"

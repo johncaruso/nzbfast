@@ -209,6 +209,15 @@ fn scratch(name: &str) -> PathBuf {
 /// Launch `nzbfast serve` against `dir` and wait until it is serving.
 /// Called twice per restart test, against the same directory.
 fn serve(dir: &Path) -> Running {
+    serve_env(dir, &[])
+}
+
+/// `serve` as a launcher that owns the port (container / Synology package).
+fn serve_locked(dir: &Path) -> Running {
+    serve_env(dir, &[("NZBFAST_PORT_LOCKED", "1")])
+}
+
+fn serve_env(dir: &Path, env: &[(&str, &str)]) -> Running {
     for attempt in 0..3 {
         let port = free_port();
         // Per-port, so the restart cannot read the FIRST daemon's banner
@@ -216,7 +225,11 @@ fn serve(dir: &Path) -> Running {
         let logfile = dir.join(format!("daemon-{port}.log"));
         let out = std::fs::File::create(&logfile).unwrap();
         let err = out.try_clone().unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_nzbfast"))
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let child = cmd
             .env("NZBFAST_NO_ENRICH", "1")
             .env_remove("NZBFAST_OPEN")
             .arg("--config")
@@ -438,6 +451,129 @@ fn turning_fast_verify_off_survives_a_restart_after_lean_was_chosen() {
         assert_eq!(s["verify_mode"], "fast", "fast verify did not survive the restart");
         assert_eq!(s["fast_verify"], true, "fast verify came back off: {s:?}");
     }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A launcher that owns the port keeps it: the API refuses to save one,
+/// and a `port` already in settings.json does not move the listener.
+///
+/// This is the container/SPK contract. Their port is named in a published
+/// mapping, a healthcheck and DSM's own Open button - none of which
+/// nzbfast can rewrite - so a port saved in the dashboard used to leave
+/// the service unreachable through its mapping and unhealthy on restart,
+/// with the UI reporting the change took.
+#[test]
+fn a_locked_port_cannot_be_moved_from_the_dashboard() {
+    let dir = scratch("portlock");
+
+    // `port` is a restart-only setting, so `get_config` reports the LIVE
+    // port either way - settings.json is where the saved value shows up.
+    let saved_port = || -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(dir.join("settings.json")).unwrap_or_default(),
+        )
+        .map(|v| v["port"].clone())
+        .unwrap_or(serde_json::Value::Null)
+    };
+
+    // Unlocked (a desktop or plain CLI install): the setting is accepted
+    // and saved, which is the behaviour this must not break.
+    {
+        let d = serve(&dir);
+        let r = api(d.port, "mode=config&name=port&value=6999");
+        assert_eq!(r["status"].as_bool(), Some(true), "port rejected while unlocked: {r}");
+        assert_eq!(saved_port(), 6999, "an accepted port was not saved");
+    }
+
+    // Locked: refused with an explanation, and settings.json still holds
+    // the 6999 written above - which the daemon must now ignore.
+    {
+        let d = serve_locked(&dir);
+        let r = api(d.port, "mode=config&name=port&value=7001");
+        assert_eq!(r["status"].as_bool(), Some(false), "a locked port was accepted: {r}");
+        let err = r["error"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("how it was started"),
+            "the refusal has to say WHERE the port lives, got: {err:?}"
+        );
+        // The refusal must not rewrite what is already saved either.
+        assert_eq!(saved_port(), 6999, "a refused write still touched settings.json");
+        // `get_config` reports the LIVE port, so this is the assertion that
+        // the saved 6999 was ignored at startup rather than applied.
+        assert_eq!(
+            settings_block(d.port)["port"].as_u64(),
+            Some(d.port as u64),
+            "the saved port won over the one this install was started with"
+        );
+        let q = api(d.port, "mode=queue");
+        assert_eq!(
+            q["queue"]["port_locked"].as_bool(),
+            Some(true),
+            "the dashboard is never told to disable the field: {q}"
+        );
+        // The listener answering us IS d.port - the saved 6999 did not win.
+        assert_ne!(d.port, 6999);
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The launcher handshake: `runtime.json` plus a challenge is what lets a
+/// desktop wrapper tell this daemon from anything else that grabbed the
+/// port, BEFORE it hands over the stored API key.
+///
+/// Not a settings test, but it needs exactly this file's daemon harness:
+/// a real listener, started from a known data dir.
+#[test]
+fn the_daemon_proves_its_identity_to_a_launcher() {
+    use sha2::{Digest, Sha256};
+
+    let dir = scratch("handshake");
+    let d = serve(&dir);
+
+    // Written only once the listener exists, and only readable by us.
+    let rt: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("runtime.json")).expect("no runtime.json"),
+    )
+    .unwrap();
+    assert_eq!(rt["port"].as_u64(), Some(d.port as u64), "runtime.json names another port");
+    let token = rt["token"].as_str().unwrap_or_default().to_string();
+    assert!(token.len() >= 32, "the token is not a credential: {token:?}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir.join("runtime.json")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "runtime.json is readable by other accounts: {mode:o}");
+    }
+
+    let proof_of = |token: &str, nonce: &str| {
+        let mut h = Sha256::new();
+        h.update(token.as_bytes());
+        h.update(b":");
+        h.update(nonce.as_bytes());
+        h.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>()
+    };
+
+    // The challenge rides the keyless probe - which is the ONLY reply a
+    // wrapper gets, since sending the key to an unidentified listener is
+    // the thing being prevented.
+    let r = api(d.port, "mode=version&hs=0123456789abcdef");
+    assert_eq!(
+        r["hs_proof"].as_str(),
+        Some(proof_of(&token, "0123456789abcdef").as_str()),
+        "the daemon did not prove it holds its own token: {r}"
+    );
+    // A different nonce is a different answer - no replay.
+    let again = api(d.port, "mode=version&hs=fedcba9876543210");
+    assert_ne!(again["hs_proof"], r["hs_proof"]);
+    // No challenge, no proof field - nothing leaks into ordinary replies.
+    let plain = api(d.port, "mode=version");
+    assert!(plain.get("hs_proof").is_none(), "a proof appeared unasked: {plain}");
+    // And a nonce that could not have come from a launcher is ignored
+    // rather than hashed into the response.
+    let junk = api(d.port, "mode=version&hs=short");
+    assert!(junk.get("hs_proof").is_none(), "an out-of-shape nonce was answered: {junk}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

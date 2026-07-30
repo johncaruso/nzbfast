@@ -86,6 +86,31 @@ struct Parked {
     parked_at: Instant,
 }
 
+/// Close a whole set of parked sessions at once.
+///
+/// A fleet-wide goodbye is the same shape as the keepalive's fleet-wide
+/// ping, and needs the same treatment for the same reason. `quit` is
+/// bounded at 500 ms, so a black-holed path costs that per session and
+/// SERIALLY it multiplies: measured 8.0 s for 16 sessions on a mute peer,
+/// linear in the count. Production parks 64 PER SERVER, so one server
+/// costs 32 s and a six-server config over three minutes - more than
+/// three times the interval `tick` is due again in, so the reaper could
+/// never catch up with itself, which is the exact stall the batched ping
+/// exists to stop. `retain_servers` is worse: the daemon awaits it on the
+/// way into EVERY job, so a credential change could stall the next
+/// download's first byte by half a minute.
+///
+/// Concurrently the whole batch costs one bound. Nothing here is ordered
+/// and nothing reads a result - these sessions are already out of the map
+/// and their only remaining job is to say goodbye.
+async fn quit_all(parked: Vec<Parked>) {
+    let mut set = tokio::task::JoinSet::new();
+    for p in parked {
+        set.spawn(async move { p.conn.quit().await });
+    }
+    while set.join_next().await.is_some() {}
+}
+
 #[derive(Default)]
 pub struct WarmStats {
     pub hits: AtomicU64,
@@ -239,9 +264,7 @@ impl WarmPool {
             self.generation.fetch_add(1, Ordering::AcqRel);
             idle.drain().flat_map(|(_, v)| v).collect()
         };
-        for p in drained {
-            p.conn.quit().await;
-        }
+        quit_all(drained).await;
     }
 
     /// Keep only sessions whose complete server identity still exists in
@@ -273,9 +296,7 @@ impl WarmPool {
             }
             drained
         };
-        for p in drained {
-            p.conn.quit().await;
-        }
+        quit_all(drained).await;
     }
 
     /// Number of parked connections, for the dashboard.
@@ -309,10 +330,8 @@ impl WarmPool {
                 *v = keep;
             }
         }
-        for p in expired {
-            self.stats.evicted.fetch_add(1, Ordering::Relaxed);
-            p.conn.quit().await;
-        }
+        self.stats.evicted.fetch_add(expired.len() as u64, Ordering::Relaxed);
+        quit_all(expired).await;
         // Ping the whole batch at once. One black-holed flow costs a
         // VALIDATE_TIMEOUT, and serially a pool of 64 of them would take
         // far longer to reap than the KEEPALIVE_EVERY interval this tick
@@ -762,6 +781,20 @@ mod tests {
     /// handshake and an already-open congestion window - is invisible over
     /// loopback where the RTT is ~0. Connection count is the thing that
     /// actually changed; the latency follows from it on a real path.
+    ///
+    /// The second job is sized to what the first job actually PARKED,
+    /// which is not the same as its `connections` budget. A worker whose
+    /// siblings have already emptied the queue returns at the `pending ==
+    /// 0` guard without ever dialling, so a job opens only as many
+    /// connections as its work needed - and under load a starved fleet
+    /// degenerates to one busy worker, so a three-connection job routinely
+    /// parks one. Letting the second job out-demand the parked set does
+    /// not test the pool: the surplus workers find it empty and correctly
+    /// dial, which is a cache miss behaving exactly as designed. Reading
+    /// `idle_count` as the second job's budget makes the premise a
+    /// measured fact instead of a timing accident. (This is why the test
+    /// was load-flaky on Windows: the `> 0` check it used to make passed
+    /// on a pool of one while three workers went looking.)
     #[tokio::test(flavor = "multi_thread")]
     async fn a_second_job_opens_no_new_connections() {
         use crate::pool::{ArticleReq, FetchOutcome, PoolConfig, fetch_all_multi};
@@ -772,7 +805,7 @@ mod tests {
         let srv = MockServer::start(articles, Chaos::default()).await;
         let pool = WarmPool::new(DEFAULT_MAX_IDLE, 8);
 
-        let run = |pool: Arc<WarmPool>| {
+        let run = |pool: Arc<WarmPool>, connections: usize| {
             let sc = srv.server_config();
             let reqs: Vec<ArticleReq> = segs
                 .iter()
@@ -781,7 +814,7 @@ mod tests {
             let n = reqs.len();
             async move {
                 let cfg = PoolConfig {
-                    connections: 3,
+                    connections,
                     ramp_delay: Duration::from_millis(0),
                     warm: Some(pool),
                     ..PoolConfig::default()
@@ -801,18 +834,119 @@ mod tests {
             }
         };
 
-        run(pool.clone()).await;
+        run(pool.clone(), 3).await;
         let after_first = srv.accepted.load(Ordering::Relaxed);
+        let misses_after_first = pool.stats.misses.load(Ordering::Relaxed);
         assert!(after_first > 0, "the first job must actually connect");
-        assert!(pool.idle_count().await > 0, "the first job must park its connections");
+        let parked = pool.idle_count().await;
+        assert!(parked > 0, "the first job must park its connections");
 
-        run(pool.clone()).await;
+        run(pool.clone(), parked).await;
         assert_eq!(
             srv.accepted.load(Ordering::Relaxed),
             after_first,
             "the second job must reuse parked connections, not dial again"
         );
+        // The same statement in the pool's own words, and the one that
+        // names the mechanism when it breaks: a worker records a miss on
+        // exactly the path that goes on to dial.
+        assert_eq!(
+            pool.stats.misses.load(Ordering::Relaxed),
+            misses_after_first,
+            "the second job must not record a single cache miss"
+        );
         assert!(pool.stats.hits.load(Ordering::Relaxed) > 0);
+    }
+
+    /// A worker claims a parked connection BEFORE the ramp - deliberately,
+    /// so a reuse pays no ramp latency - and only then discovers whether
+    /// there is any work left for it. When there is not, the session it is
+    /// holding is drained and freshly validated, and it must go back in the
+    /// pool: dropping it made the pool shrink every time a fleet outran its
+    /// work, which is precisely what a loaded machine does to it. Six
+    /// back-to-back jobs eroded three parked connections to two, and the
+    /// fourth job dialled again with a hit on every single claim.
+    ///
+    /// Driven by a job with NOTHING to fetch, which is the same state a
+    /// straggler wakes into and needs no timing to arrange: every worker
+    /// claims, finds `pending == 0`, and retires.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_worker_that_finds_no_work_returns_its_claim_to_the_pool() {
+        use crate::pool::{ArticleReq, PoolConfig, fetch_all_multi};
+
+        let srv = server().await;
+        let sc = srv.server_config();
+        let pool = WarmPool::new(DEFAULT_MAX_IDLE, 8);
+        for _ in 0..3 {
+            let (conn, _) = Connection::connect(&sc).await.unwrap();
+            pool.give(&sc, conn).await;
+        }
+        let dialed = srv.accepted.load(Ordering::Relaxed);
+
+        let cfg = PoolConfig {
+            connections: 3,
+            ramp_delay: Duration::from_millis(0),
+            warm: Some(pool.clone()),
+            ..PoolConfig::default()
+        };
+        let servers = vec![(sc.clone(), cfg)];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let fetch = tokio::spawn(async move {
+            fetch_all_multi(&servers, Vec::<ArticleReq>::new(), tx).await
+        });
+        while rx.recv().await.is_some() {}
+        fetch.await.unwrap();
+
+        assert_eq!(
+            pool.idle_count().await,
+            3,
+            "a claim the run had no work for must be parked again, not closed - \
+             the warm pool exists to keep these sessions, not to spend them"
+        );
+        assert_eq!(
+            srv.accepted.load(Ordering::Relaxed),
+            dialed,
+            "and nothing may have been dialled to replace them"
+        );
+        // Still usable, not merely counted: a re-parked claim has to be a
+        // live session or the next job's checkout reaps it right back out.
+        let mut got = pool.take(&sc).await.expect("a re-parked claim");
+        got.date().await.expect("re-parked connection still speaks NNTP");
+    }
+
+    /// The goodbye half of the same argument the batched ping makes above.
+    /// `quit` is bounded at 500 ms, so a set of black-holed sessions closed
+    /// one at a time costs that PER SESSION: measured 8.0 s for 16, linear.
+    /// Production parks 64 per server, so one server was 32 s and a
+    /// six-server config over three minutes - and `retain_servers`, which
+    /// runs this same drain, is awaited on the way into EVERY daemon job,
+    /// so a credential change stalled the next download's first byte.
+    ///
+    /// Real clock, and a mute peer so every goodbye costs the full bound:
+    /// what is under test is that the batch costs ONE of them, not N.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fleet_of_goodbyes_costs_one_bound_not_one_each() {
+        const N: usize = 12;
+        let sc = bare_config(mute_provider());
+        let pool = WarmPool::new(DEFAULT_MAX_IDLE, 64);
+        for _ in 0..N {
+            let (conn, _) = Connection::connect(&sc).await.unwrap();
+            pool.give(&sc, conn).await;
+        }
+        assert_eq!(pool.idle_count().await, N);
+
+        let t0 = std::time::Instant::now();
+        pool.clear().await;
+        let took = t0.elapsed();
+
+        assert_eq!(pool.idle_count().await, 0, "clear must close everything");
+        // One 500 ms bound plus slack, against N x 500 ms = 6 s serially.
+        assert!(
+            took < Duration::from_millis(2500),
+            "closing {N} black-holed sessions took {took:?}: the goodbyes must \
+             run together, or a 64-per-server pool spends half a minute per \
+             server saying them - on the path a config reload blocks"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

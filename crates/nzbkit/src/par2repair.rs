@@ -62,7 +62,7 @@ use std::path::{Path, PathBuf};
 /// PAR2 hard limit: number of naturals below 65535 coprime to it.
 const MAX_INPUT_SLICES: usize = 32768;
 /// Present-slice bytes buffered between threaded syndrome flushes.
-const BATCH_BYTES: usize = 32 << 20;
+const BATCH_BYTES: usize = 64 << 20;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RepairError {
@@ -130,11 +130,11 @@ pub struct Reconstructor {
     /// Batches travel to a worker thread that owns the syndrome rows, so
     /// the caller's disk reads overlap the GF math (bounded channel:
     /// one batch queued while one folds).
-    tx: Option<std::sync::mpsc::SyncSender<Vec<(u32, Vec<u8>)>>>,
+    tx: Option<std::sync::mpsc::SyncSender<FeedBatch>>,
     worker: Option<std::thread::JoinHandle<Vec<Vec<u16>>>>,
-    /// Pending present slices: (base log, data).
-    batch: Vec<(u32, Vec<u8>)>,
-    batch_bytes: usize,
+    /// Pending present slices, packed into the next batch's arena.
+    batch: FeedBatch,
+    batch_capacity: usize,
 }
 
 /// One thread's share of a multi-accumulate: `dsts[j] ^= Σ_i
@@ -164,6 +164,9 @@ fn fold_chunk_tiled(
 ) {
     if dsts.is_empty() || srcs.is_empty() {
         return;
+    }
+    if gf16::multi_fold_width() > 0 {
+        return fold_chunk_multi(dsts, srcs, coeff, row_base, tile_words);
     }
     let words = dsts[0].len();
     debug_assert!(dsts.iter().all(|d| d.len() == words));
@@ -218,6 +221,106 @@ fn fold_chunk_tiled(
     }
 }
 
+/// The multi-source twin of [`fold_chunk_tiled`], used when the
+/// platform has a fused kernel ([`gf16::multi_fold_width`] > 0): per
+/// destination tile, per row, sources are folded in fused groups - each
+/// dst chunk is loaded/stored once per GROUP instead of once per source,
+/// and no split tables are built at all (the old path built one 1.2 KB
+/// table per (row, source): 23M of them on a heavy repair, all fighting
+/// the destination tiles for L2). Sources that don't cover a full tile
+/// (zero-padded tails) and sub-chunk tile remainders take the scalar
+/// single-source path; both are rare edges of a fold that is otherwise
+/// whole blocks.
+fn fold_chunk_multi(
+    dsts: &mut [&mut [u16]],
+    srcs: &[&[u8]],
+    coeff: &(dyn Fn(usize, usize) -> u16 + Sync),
+    row_base: usize,
+    tile_words: usize,
+) {
+    let width = gf16::multi_fold_width().min(16);
+    let words = dsts[0].len();
+    debug_assert!(dsts.iter().all(|d| d.len() == words));
+    // Same residency math as the table path (a tile is walked across
+    // every row this thread owns), with one extra constraint: a multiple
+    // of 16 words, so the fused kernel covers whole tiles and the
+    // per-source remainder path stays out of the steady state.
+    let ceiling = tile_words.max(16);
+    let tile_words = ((L2_TARGET_WORDS / dsts.len())
+        .clamp(MIN_TILE_WORDS.min(ceiling), ceiling))
+        & !15;
+    let tile_words = tile_words.max(16);
+    // Coefficients hoisted per (row, group) sweep, exactly as the table
+    // path hoists them. Zero coefficients ride along (a pmull by zero
+    // contributes nothing and they are far too rare to branch on).
+    let mut coeffs: Vec<u16> = Vec::with_capacity(dsts.len() * width);
+    let mut g0 = 0usize;
+    while g0 < srcs.len() {
+        let g1 = (g0 + width).min(srcs.len());
+        coeffs.clear();
+        for j in 0..dsts.len() {
+            for i in g0..g1 {
+                coeffs.push(coeff(row_base + j, i));
+            }
+        }
+        let mut w0 = 0usize;
+        while w0 < words {
+            let w1 = (w0 + tile_words).min(words);
+            let tile_bytes = (w1 - w0) * 2;
+            // Window this group's sources to the tile. Full-coverage
+            // sources take the fused kernel; short ones (zero-padded
+            // tails) are folded singly afterwards.
+            let mut full: [&[u8]; 16] = [&[]; 16];
+            let mut full_idx: [usize; 16] = [0; 16];
+            let mut n = 0usize;
+            let mut partial: [(usize, &[u8]); 16] = [(0, &[]); 16];
+            let mut np = 0usize;
+            for (gi, src) in srcs[g0..g1].iter().enumerate() {
+                let sb = (w0 * 2).min(src.len());
+                let eb = (w1 * 2).min(src.len());
+                if sb == eb {
+                    continue;
+                }
+                if eb - sb == tile_bytes {
+                    full[n] = &src[sb..eb];
+                    full_idx[n] = gi;
+                    n += 1;
+                } else {
+                    partial[np] = (gi, &src[sb..eb]);
+                    np += 1;
+                }
+            }
+            for (j, d) in dsts.iter_mut().enumerate() {
+                let dtile = &mut d[w0..w1];
+                if n > 0 {
+                    let mut gc: [u16; 16] = [0; 16];
+                    for (k, &gi) in full_idx[..n].iter().enumerate() {
+                        gc[k] = coeffs[j * (g1 - g0) + gi];
+                    }
+                    let done = gf16::xor_mul_multi_into(dtile, &full[..n], &gc[..n]);
+                    if done < dtile.len() {
+                        // Only a non-32-byte-aligned FINAL tile lands here.
+                        for (s, c) in full[..n].iter().zip(&gc[..n]) {
+                            if *c != 0 {
+                                MulTable::new(*c)
+                                    .xor_mul_into(&mut dtile[done..], &s[done * 2..]);
+                            }
+                        }
+                    }
+                }
+                for &(gi, s) in &partial[..np] {
+                    let c = coeffs[j * (g1 - g0) + gi];
+                    if c != 0 {
+                        MulTable::new(c).xor_mul_into(&mut dtile[..s.len().div_ceil(2)], s);
+                    }
+                }
+            }
+            w0 = w1;
+        }
+        g0 = g1;
+    }
+}
+
 /// Destination tile size for [`fold_chunk_tiled`]: the ceiling, used
 /// when a thread owns few enough rows that 64 KiB each still fits.
 const TILE_WORDS: usize = 32 << 10;
@@ -232,7 +335,7 @@ const MIN_TILE_WORDS: usize = 2 << 10;
 const TABLE_BUDGET: usize = 2 << 20;
 /// Do not split a column range finer than this: below it the thread and
 /// table-build overheads dominate the fold itself.
-const MIN_COL_WORDS: usize = 8 << 10;
+const MIN_COL_WORDS: usize = 2 << 10;
 
 /// Run `dsts[j] ^= Σ_i coeff(j, i) · srcs[i]` across the whole machine.
 ///
@@ -277,15 +380,28 @@ fn fold_parallel(
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get()).max(1);
     let row_threads = cores.min(rows);
     let row_chunk = rows.div_ceil(row_threads);
-    let col_threads = (cores / row_threads)
-        .max(1)
-        .min(words.div_ceil(MIN_COL_WORDS).max(1));
-    let col_chunk = words.div_ceil(col_threads);
+    // Columns split past the leftover-core count on purpose: units are
+    // WORK-STOLEN, not statically owned. A static grid handed each
+    // thread one fixed cell, so on hybrid parts every fold waited for
+    // the slowest E-core to finish a P-core-sized share (measured: the
+    // straggler set the wall on both the i7 and the M3 at high m).
+    // Oversplitting columns a few times per thread gives fast cores
+    // more units and the tail shrinks to one small unit's length.
+    let col_splits = if rows >= cores {
+        (8usize).min(words.div_ceil(MIN_COL_WORDS).max(1))
+    } else {
+        // Few rows: columns are the only parallelism, so they carry
+        // both the fan-out AND the oversplit.
+        (cores / row_threads * 4)
+            .max(1)
+            .min(words.div_ceil(MIN_COL_WORDS).max(1))
+    };
+    let col_chunk = words.div_ceil(col_splits);
 
     // A view of every row restricted to each column range, built by
     // repeated split_at_mut so the borrows are provably disjoint.
     let mut cols: Vec<Vec<&mut [u16]>> =
-        (0..col_threads).map(|_| Vec::with_capacity(rows)).collect();
+        (0..col_splits).map(|_| Vec::with_capacity(rows)).collect();
     for row in dsts.iter_mut() {
         let mut rest: &mut [u16] = row.as_mut_slice();
         for col in cols.iter_mut() {
@@ -296,46 +412,112 @@ fn fold_parallel(
         }
     }
 
+    // The unit grid: (row range x column range) cells, each owning its
+    // destination region outright, pulled off one atomic counter.
+    struct Unit<'a> {
+        rows: Vec<&'a mut [u16]>,
+        row_base: usize,
+        col_off: usize,
+    }
+    let mut units: Vec<Unit> = Vec::with_capacity(col_splits * row_threads);
+    for (ci, col) in cols.into_iter().enumerate() {
+        let mut row_base = 0usize;
+        let mut col = col;
+        while !col.is_empty() {
+            let take = col.len().min(row_chunk);
+            let rest = col.split_off(take);
+            units.push(Unit {
+                rows: col,
+                row_base,
+                col_off: ci * col_chunk,
+            });
+            row_base += take;
+            col = rest;
+        }
+    }
+    let units = std::sync::Mutex::new(units);
+    let workers = cores.min(row_threads * col_splits);
     std::thread::scope(|s| {
-        for (ci, col) in cols.iter_mut().enumerate() {
-            let off = ci * col_chunk;
-            // Each column range sees only its own bytes of every source;
-            // a source that ends before this range contributes nothing
-            // (PAR2 tail slices are zero-padded).
-            let sub: Vec<&[u8]> = srcs
-                .iter()
-                .map(|src| {
-                    let b0 = (off * 2).min(src.len());
-                    let b1 = ((off + col_chunk) * 2).min(src.len());
-                    &src[b0..b1]
-                })
-                .collect();
-            for (ri, rowchunk) in col.chunks_mut(row_chunk).enumerate() {
-                let sub = sub.clone();
-                let row_base = ri * row_chunk;
-                s.spawn(move || {
+        for _ in 0..workers {
+            s.spawn(|| {
+                loop {
+                    let unit = units.lock().unwrap().pop();
+                    let Some(unit) = unit else { return };
+                    // Each unit sees only its own bytes of every source;
+                    // a source that ends before this range contributes
+                    // nothing (PAR2 tail slices are zero-padded).
+                    let sub: Vec<&[u8]> = srcs
+                        .iter()
+                        .map(|src| {
+                            let b0 = (unit.col_off * 2).min(src.len());
+                            let b1 = ((unit.col_off + col_chunk) * 2).min(src.len());
+                            &src[b0..b1]
+                        })
+                        .collect();
+                    let mut rows = unit.rows;
                     fold_chunk_tiled(
-                        rowchunk,
+                        &mut rows,
                         &sub,
                         coeff,
-                        row_base,
+                        unit.row_base,
                         TILE_WORDS,
                         TABLE_BUDGET,
                     );
-                });
-            }
+                }
+            });
         }
     });
 }
 
-/// Fold one batch of present slices into every syndrome row.
-fn fold_batch(exponents: &[u32], syndromes: &mut [Vec<u16>], batch: &[(u32, Vec<u8>)]) {
-    if syndromes.is_empty() || batch.is_empty() {
+/// One feeder's assembled batch: slices PACKED into a single arena
+/// instead of one heap allocation each. The per-slice `Vec<u8>` design
+/// allocated and freed tens of thousands of block-sized buffers across
+/// threads per heavy repair; on Windows every 64 KiB+ allocation is a
+/// direct VirtualAlloc, and the cross-thread VirtualFree storm (TLB
+/// shootdowns interrupt every core) collapsed the fold from 105 GB/s to
+/// 13 GB/s a few seconds into the run (measured, i7-1280P, m=1500). An
+/// arena per batch is ~two allocations per 32 MiB instead of ~512.
+struct FeedBatch {
+    arena: Vec<u8>,
+    /// (base log k, arena offset, len) per slice.
+    slices: Vec<(u32, usize, usize)>,
+}
+
+impl FeedBatch {
+    fn with_capacity(bytes: usize) -> FeedBatch {
+        FeedBatch {
+            arena: Vec::with_capacity(bytes),
+            slices: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, k: u32, data: &[u8]) {
+        let off = self.arena.len();
+        self.arena.extend_from_slice(data);
+        self.slices.push((k, off, data.len()));
+    }
+}
+
+/// Fold queued batches of present slices into every syndrome row - one
+/// row sweep for the whole set, however many feeder batches it arrived
+/// as.
+fn fold_batches(exponents: &[u32], syndromes: &mut [Vec<u16>], batches: &[FeedBatch]) {
+    if syndromes.is_empty() {
         return;
     }
-    let srcs: Vec<&[u8]> = batch.iter().map(|(_, d)| d.as_slice()).collect();
+    let mut srcs: Vec<&[u8]> = Vec::new();
+    let mut logs: Vec<u32> = Vec::new();
+    for b in batches {
+        for &(k, off, len) in &b.slices {
+            srcs.push(&b.arena[off..off + len]);
+            logs.push(k);
+        }
+    }
+    if srcs.is_empty() {
+        return;
+    }
     fold_parallel(syndromes, &srcs, &|j, i| {
-        gf16::pow2(batch[i].0 as u64 * exponents[j] as u64)
+        gf16::pow2(logs[i] as u64 * exponents[j] as u64)
     });
 }
 
@@ -378,17 +560,43 @@ impl Reconstructor {
                 "missing index {j} out of range ({n_inputs} inputs)"
             )));
         }
-        // A[r][c] = g_{missing[c]}^{e_r} = 2^{k·e mod 65535}
-        let a: Vec<Vec<u16>> = recovery
-            .iter()
-            .map(|&(e, _)| {
-                missing
+        let t_inv = std::time::Instant::now();
+        // Consecutive exponents (both repair paths pick the SMALLEST
+        // available, so this is the norm - gaps mean recovery packets
+        // were themselves lost) make A a Vandermonde in the bases times
+        // a diagonal, whose explicit inverse costs O(m²) instead of
+        // Gauss-Jordan's O(m³).
+        let consecutive =
+            !recovery.is_empty() && recovery.windows(2).all(|w| w[1].0 == w[0].0 + 1);
+        let structured = if consecutive {
+            let ks: Vec<u32> = missing.iter().map(|&j| base_logs[j]).collect();
+            invert_vandermonde(&ks, recovery[0].0)
+        } else {
+            None
+        };
+        let (label, inverse) = match structured {
+            Some(inv) => ("vandermonde", inv),
+            None => {
+                // A[r][c] = g_{missing[c]}^{e_r} = 2^{k·e mod 65535}
+                let a: Vec<Vec<u16>> = recovery
                     .iter()
-                    .map(|&j| gf16::pow2(base_logs[j] as u64 * e as u64))
-                    .collect()
-            })
-            .collect();
-        let inverse = invert(a)?;
+                    .map(|&(e, _)| {
+                        missing
+                            .iter()
+                            .map(|&j| gf16::pow2(base_logs[j] as u64 * e as u64))
+                            .collect()
+                    })
+                    .collect();
+                ("gauss-jordan", invert(a)?)
+            }
+        };
+        if std::env::var_os("NZBFAST_REPAIR_TIMING").is_some() {
+            eprintln!(
+                "[repair-timing] matrix invert ({}x{0}, {label}): {:.2?}",
+                missing.len(),
+                t_inv.elapsed()
+            );
+        }
         let words = block_size / 2;
         let mut exponents = Vec::with_capacity(recovery.len());
         let mut syndromes = Vec::with_capacity(recovery.len());
@@ -410,11 +618,63 @@ impl Reconstructor {
         // carries a BATCH_BYTES/N-sized batch, so a slightly deeper
         // queue keeps disks busy while a batch folds without growing
         // worst-case in-flight memory beyond the old single-feeder cap.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<(u32, Vec<u8>)>>(4);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<FeedBatch>(8);
+        let fold_trace = std::env::var_os("NZBFAST_FOLD_TRACE").is_some();
         let worker = std::thread::spawn(move || {
             let mut syndromes = syndromes;
-            while let Ok(batch) = rx.recv() {
-                fold_batch(&exponents, &mut syndromes, &batch);
+            let mut waited = std::time::Duration::ZERO;
+            let mut folded = std::time::Duration::ZERO;
+            let mut calls = 0usize;
+            let mut bytes = 0usize;
+            loop {
+                let t_w = std::time::Instant::now();
+                let Ok(first) = rx.recv() else { break };
+                waited += t_w.elapsed();
+                let mut merged = vec![first];
+                // Coalesce whatever the feeders have already queued: the
+                // tiled fold walks EVERY syndrome row once per call, so N
+                // small batches cost N row sweeps where one merged batch
+                // costs one. Parallel feeders split BATCH_BYTES across
+                // handles for memory control (M2c.2), which shrank fold
+                // units 8x - measured as a repair regression on
+                // small-L3 parts.
+                //
+                // The bound is channel capacity PLUS live senders, not
+                // capacity alone: each try_recv that frees a buffered slot
+                // immediately unblocks a sender, whose message lands in the
+                // buffer and is drained on the next iteration. With
+                // sync_channel(4) and up to 8 feeders that is up to 12
+                // batches merged, not 5. Harmless at typical block sizes
+                // (~48 MB vs the 32 MB BATCH_BYTES design cap), but a feeder
+                // batch is one whole block when block_size is large - a set
+                // with 16 MB blocks holds ~192 MB in the merged batch. The
+                // fold is XOR accumulation, so merging and reordering are
+                // exact; this is a memory bound, not a correctness one.
+                while let Ok(more) = rx.try_recv() {
+                    merged.push(more);
+                }
+                let t_f = std::time::Instant::now();
+                fold_batches(&exponents, &mut syndromes, &merged);
+                folded += t_f.elapsed();
+                calls += 1;
+                let mb: usize = merged.iter().map(|b| b.arena.len()).sum();
+                bytes += mb;
+                if fold_trace {
+                    eprintln!(
+                        "[fold-trace] call {calls}: {} srcs, {:.1} MB, {:.2?}",
+                        merged.iter().map(|b| b.slices.len()).sum::<usize>(),
+                        mb as f64 / 1e6,
+                        t_f.elapsed()
+                    );
+                }
+            }
+            if fold_trace {
+                eprintln!(
+                    "[fold-trace] total: {calls} calls, {:.1} MB, fold {:.2?}, recv-wait {:.2?}",
+                    bytes as f64 / 1e6,
+                    folded,
+                    waited
+                );
             }
             syndromes
         });
@@ -425,22 +685,26 @@ impl Reconstructor {
             inverse,
             tx: Some(tx),
             worker: Some(worker),
-            batch: Vec::new(),
-            batch_bytes: 0,
+            batch: FeedBatch::with_capacity(BATCH_BYTES),
+            batch_capacity: BATCH_BYTES,
         })
     }
 
-    /// Accumulate one present input slice. `data` may be shorter than the
-    /// block size (file tail) - the zero padding contributes nothing.
-    pub fn feed(&mut self, input_index: usize, data: Vec<u8>) {
+    /// Accumulate one present input slice (borrowed - it is packed into
+    /// the batch arena, so callers can reuse one read buffer instead of
+    /// allocating per slice). `data` may be shorter than the block size
+    /// (file tail) - the zero padding contributes nothing.
+    pub fn feed(&mut self, input_index: usize, data: &[u8]) {
         debug_assert!(
             !self.missing.contains(&input_index),
             "fed a slice declared missing"
         );
         debug_assert!(data.len() <= self.block_size);
-        self.batch_bytes += data.len();
-        self.batch.push((self.base_logs[input_index], data));
-        if self.batch_bytes >= BATCH_BYTES {
+        if self.batch.arena.len() + data.len() > self.batch_capacity {
+            self.flush();
+        }
+        self.batch.push(self.base_logs[input_index], data);
+        if self.batch.arena.len() >= self.batch_capacity {
             self.flush();
         }
     }
@@ -448,11 +712,13 @@ impl Reconstructor {
     /// Hand the pending batch to the fold worker. Blocks only when a
     /// batch is already queued behind the one being folded.
     fn flush(&mut self) {
-        if self.batch.is_empty() {
+        if self.batch.slices.is_empty() {
             return;
         }
-        let batch = std::mem::take(&mut self.batch);
-        self.batch_bytes = 0;
+        let batch = std::mem::replace(
+            &mut self.batch,
+            FeedBatch::with_capacity(self.batch_capacity),
+        );
         // The worker outlives every sender; send can't fail.
         let _ = self.tx.as_ref().expect("finish() not yet called").send(batch);
     }
@@ -467,12 +733,12 @@ impl Reconstructor {
     /// flush on drop) BEFORE calling [`finish`], or finish blocks on
     /// the channel.
     pub fn feeder(&self, max_batch: usize) -> Feeder {
+        let max_batch = max_batch.max(1 << 20);
         Feeder {
             tx: self.tx.as_ref().expect("finish() not yet called").clone(),
             base_logs: self.base_logs.clone(),
-            batch: Vec::new(),
-            batch_bytes: 0,
-            max_batch: max_batch.max(1 << 20),
+            batch: FeedBatch::with_capacity(max_batch),
+            max_batch,
         }
     }
 
@@ -501,7 +767,11 @@ impl Reconstructor {
             let syn_bytes: Vec<&[u8]> =
                 syndromes.iter().map(|s| gf16::words_as_bytes(s)).collect();
             let inverse = &self.inverse;
+            let t_bs = std::time::Instant::now();
             fold_parallel(&mut out, &syn_bytes, &|j, i| inverse[j][i]);
+            if std::env::var_os("NZBFAST_REPAIR_TIMING").is_some() {
+                eprintln!("[repair-timing] back-substitution: {:.2?}", t_bs.elapsed());
+            }
         }
         // On little-endian a word slice already IS its PAR2 byte view,
         // so this is a memcpy per block rather than a per-byte iterator
@@ -516,29 +786,29 @@ impl Reconstructor {
 /// parallel feed reads). Same batching as the built-in feed path, but
 /// clonable across reader threads; flushes its tail batch on drop.
 pub struct Feeder {
-    tx: std::sync::mpsc::SyncSender<Vec<(u32, Vec<u8>)>>,
+    tx: std::sync::mpsc::SyncSender<FeedBatch>,
     base_logs: std::sync::Arc<Vec<u32>>,
-    batch: Vec<(u32, Vec<u8>)>,
-    batch_bytes: usize,
+    batch: FeedBatch,
     max_batch: usize,
 }
 
 impl Feeder {
     /// Same contract as [`Reconstructor::feed`].
-    pub fn feed(&mut self, input_index: usize, data: Vec<u8>) {
-        self.batch_bytes += data.len();
-        self.batch.push((self.base_logs[input_index], data));
-        if self.batch_bytes >= self.max_batch {
+    pub fn feed(&mut self, input_index: usize, data: &[u8]) {
+        if self.batch.arena.len() + data.len() > self.max_batch {
+            self.flush();
+        }
+        self.batch.push(self.base_logs[input_index], data);
+        if self.batch.arena.len() >= self.max_batch {
             self.flush();
         }
     }
 
     fn flush(&mut self) {
-        if self.batch.is_empty() {
+        if self.batch.slices.is_empty() {
             return;
         }
-        let batch = std::mem::take(&mut self.batch);
-        self.batch_bytes = 0;
+        let batch = std::mem::replace(&mut self.batch, FeedBatch::with_capacity(self.max_batch));
         // The worker outlives every sender; send can't fail.
         let _ = self.tx.send(batch);
     }
@@ -550,12 +820,233 @@ impl Drop for Feeder {
     }
 }
 
+/// Explicit inverse of the CONSECUTIVE-exponent repair matrix in O(m²),
+/// via Lagrange basis polynomials - Gauss-Jordan is O(m³) and was the
+/// true ceiling at extreme damage (0.55 s at m = 1400 even fanned out;
+/// ~two minutes extrapolated at the m = 8192 repair cap).
+///
+/// With exponents e0..e0+m-1 the matrix factors: A[r][c] = g_c^{e0+r} =
+/// g_c^{e0} · g_c^r, so A = V · diag(g_c^{e0}) with V[r][c] = g_c^r a
+/// classic Vandermonde in the bases g_c = 2^{k_c}. V is the transpose of
+/// the evaluation matrix whose inverse rows are the Lagrange basis
+/// polynomials of the nodes, so
+///
+/// ```text
+///     A⁻¹[c][r] = g_c^{-e0} · [z^r] L_c(z),
+///     L_c(z) = Π_{k≠c}(z + g_k) / Π_{k≠c}(g_c + g_k)
+/// ```
+///
+/// (char 2: subtraction is XOR). Build the master polynomial P(z) =
+/// Π(z + g_c) once in O(m²); each column is then one synthetic division
+/// P/(z + g_c), one Horner evaluation for the denominator, and one
+/// scalar-vector scale - O(m) each, columns independent, so the whole
+/// inverse is O(m²), which is optimal (it HAS m² entries). Everything is
+/// exact field arithmetic: no conditioning concerns. `ks` are the base
+/// logs k_c; distinct ks (guaranteed - they are distinct naturals
+/// coprime to 65535) make V nonsingular ALWAYS, so this path cannot
+/// fail; `None` is returned only on the theoretically-impossible
+/// duplicate base, and the caller falls back to Gauss-Jordan.
+fn invert_vandermonde(ks: &[u32], e0: u32) -> Option<Vec<Vec<u16>>> {
+    let m = ks.len();
+    let bases: Vec<u16> = ks.iter().map(|&k| gf16::pow2(k as u64)).collect();
+    // P(z) = Π (z + g_c), degree m: p[i] is the z^i coefficient.
+    let mut p = vec![0u16; m + 1];
+    p[0] = 1;
+    for (deg, &g) in bases.iter().enumerate() {
+        // p ← p·(z + g): new[i] = old[i-1] + g·old[i], walked downward
+        // so it runs in place.
+        let t = MulTable::new(g);
+        p[deg + 1] = p[deg];
+        for i in (1..=deg).rev() {
+            p[i] = p[i - 1] ^ t.mul(p[i]);
+        }
+        p[0] = t.mul(p[0]);
+    }
+    // Columns are independent - fan out for the big heavy-damage case.
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(m / 64)
+        .max(1);
+    let mut rows: Vec<Option<Vec<u16>>> = vec![None; m];
+    let build_row = |c: usize| -> Option<Vec<u16>> {
+        let g = bases[c];
+        let t = MulTable::new(g);
+        // Synthetic division: Q_c = P / (z + g), degree m-1.
+        let mut q = vec![0u16; m];
+        q[m - 1] = p[m];
+        for i in (1..m).rev() {
+            q[i - 1] = p[i] ^ t.mul(q[i]);
+        }
+        // Denominator d_c = Q_c(g) = Π_{k≠c}(g + g_k), by Horner.
+        let mut d = 0u16;
+        for &coef in q.iter().rev() {
+            d = t.mul(d) ^ coef;
+        }
+        if d == 0 {
+            return None; // duplicate base - cannot happen for valid ks
+        }
+        // Row c of A⁻¹: (g^{-e0} / d_c) · Q_c, one SIMD scalar-vector
+        // product (xor into zeros = plain multiply).
+        let neg_e0 = gf16::ORDER as u64 - (ks[c] as u64 * e0 as u64) % gf16::ORDER as u64;
+        let scale = gf16::mul(gf16::inv(d), gf16::pow2(neg_e0));
+        let mut row = vec![0u16; m];
+        MulTable::new(scale).xor_mul_words(&mut row, &q);
+        Some(row)
+    };
+    if threads < 2 {
+        for (c, slot) in rows.iter_mut().enumerate() {
+            *slot = build_row(c);
+        }
+    } else {
+        let chunk = m.div_ceil(threads);
+        std::thread::scope(|s| {
+            for (w, slice) in rows.chunks_mut(chunk).enumerate() {
+                let build_row = &build_row;
+                s.spawn(move || {
+                    for (i, slot) in slice.iter_mut().enumerate() {
+                        *slot = build_row(w * chunk + i);
+                    }
+                });
+            }
+        });
+    }
+    rows.into_iter().collect()
+}
+
 /// Gauss-Jordan inversion over GF(2^16) (addition = XOR, so no sign
 /// bookkeeping). Distinct bases and exponents make singularity
 /// essentially theoretical, but a generalized Vandermonde over a finite
 /// field carries no guarantee - the caller treats it as unrepairable
 /// with this slice set.
-fn invert(mut a: Vec<Vec<u16>>) -> Result<Vec<Vec<u16>>, RepairError> {
+///
+/// Past [`PAR_INVERT_MIN`] rows the elimination fans out: the serial
+/// loop is O(m²) split-table builds plus O(m³) field work on ONE thread,
+/// and at heavy damage that was the single largest piece of the solve
+/// (measured 1.9 s of a 6.3 s repair at m = 1400).
+fn invert(a: Vec<Vec<u16>>) -> Result<Vec<Vec<u16>>, RepairError> {
+    let m = a.len();
+    // Each worker should own enough rows that a column's elimination
+    // outweighs its two barrier crossings.
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(m / 32)
+        .max(1);
+    if m < PAR_INVERT_MIN || threads < 2 {
+        return invert_serial(a);
+    }
+    invert_parallel(a, threads)
+}
+
+/// Below this the barrier choreography costs more than the elimination.
+const PAR_INVERT_MIN: usize = 128;
+
+/// The fan-out behind [`invert`]. Rows are dealt to workers round-robin
+/// and NEVER move - pivoting is tracked as a permutation instead of the
+/// serial path's row swaps, so every worker keeps `&mut` to its own rows
+/// for the whole solve. Each column runs two barrier-separated phases:
+/// scan (every worker offers its lowest eligible pivot row; atomic min
+/// picks the winner), publish (the owner normalizes the pivot row and
+/// copies it into a shared buffer), then every worker eliminates its own
+/// rows against the copy. The published inverse is reassembled through
+/// the pivot permutation at the end.
+fn invert_parallel(mut a: Vec<Vec<u16>>, threads: usize) -> Result<Vec<Vec<u16>>, RepairError> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let m = a.len();
+    let mut inv: Vec<Vec<u16>> = (0..m)
+        .map(|i| {
+            let mut row = vec![0u16; m];
+            row[i] = 1;
+            row
+        })
+        .collect();
+    // piv[col] = row index chosen as that column's pivot (usize::MAX =
+    // none found = singular).
+    let piv: Vec<AtomicUsize> = (0..m).map(|_| AtomicUsize::new(usize::MAX)).collect();
+    let used: Vec<AtomicBool> = (0..m).map(|_| AtomicBool::new(false)).collect();
+    let singular = AtomicBool::new(false);
+    let pivot_rows = std::sync::RwLock::new((vec![0u16; m], vec![0u16; m]));
+    let barrier = std::sync::Barrier::new(threads);
+    let mut shards: Vec<Vec<(usize, &mut [u16], &mut [u16])>> =
+        (0..threads).map(|_| Vec::new()).collect();
+    for (r, (ar, ir)) in a.iter_mut().zip(inv.iter_mut()).enumerate() {
+        shards[r % threads].push((r, ar.as_mut_slice(), ir.as_mut_slice()));
+    }
+    std::thread::scope(|s| {
+        for shard in shards {
+            let (piv, used, singular, pivot_rows, barrier) =
+                (&piv, &used, &singular, &pivot_rows, &barrier);
+            s.spawn(move || {
+                let mut shard = shard;
+                for col in 0..m {
+                    // Scan: offer this shard's lowest unused row with a
+                    // nonzero in the pivot column. Rows were dealt in
+                    // ascending order, so the first hit is the lowest.
+                    for (r, ar, _) in shard.iter() {
+                        if !used[*r].load(Ordering::Relaxed) && ar[col] != 0 {
+                            piv[col].fetch_min(*r, Ordering::AcqRel);
+                            break;
+                        }
+                    }
+                    barrier.wait();
+                    let p = piv[col].load(Ordering::Acquire);
+                    if p == usize::MAX {
+                        // Every worker reads the same verdict right
+                        // after the same barrier, so all of them leave
+                        // on this column together.
+                        singular.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                    if p % threads == shard[0].0 % threads {
+                        // This shard owns the pivot row: normalize it
+                        // and publish a copy for everyone to fold with.
+                        used[p].store(true, Ordering::Relaxed);
+                        let (_, ar, ir) = shard
+                            .iter_mut()
+                            .find(|(r, _, _)| *r == p)
+                            .expect("owner shard holds the pivot row");
+                        let f = gf16::inv(ar[col]);
+                        if f != 1 {
+                            for x in ar.iter_mut().chain(ir.iter_mut()) {
+                                *x = gf16::mul(*x, f);
+                            }
+                        }
+                        let mut g = pivot_rows.write().unwrap();
+                        g.0.copy_from_slice(ar);
+                        g.1.copy_from_slice(ir);
+                    }
+                    barrier.wait();
+                    let g = pivot_rows.read().unwrap();
+                    for (r, ar, ir) in shard.iter_mut() {
+                        if *r == p {
+                            continue;
+                        }
+                        let f = ar[col];
+                        if f == 0 {
+                            continue;
+                        }
+                        let t = MulTable::new(f);
+                        t.xor_mul_words(ar, &g.0);
+                        t.xor_mul_words(ir, &g.1);
+                    }
+                    // No third barrier: the next scan touches only this
+                    // shard's rows and a fresh piv slot, and the next
+                    // publisher's write lock can't be granted until every
+                    // reader has dropped `g` at its next barrier.
+                }
+            });
+        }
+    });
+    if singular.load(Ordering::Relaxed) {
+        return Err(RepairError::SingularMatrix);
+    }
+    // inv[piv[col]] is column `col`'s row of A⁻¹.
+    Ok(piv
+        .into_iter()
+        .map(|p| std::mem::take(&mut inv[p.into_inner()]))
+        .collect())
+}
+
+fn invert_serial(mut a: Vec<Vec<u16>>) -> Result<Vec<Vec<u16>>, RepairError> {
     let m = a.len();
     let mut inv: Vec<Vec<u16>> = (0..m)
         .map(|i| {
@@ -628,17 +1119,37 @@ pub trait VolumeIo: Sync {
 /// Present slices are streamed through the syndromes via `io.read`,
 /// missing ones are reconstructed and written back via `io.write`
 /// (tails trimmed to the file length), and then - the self-proving
-/// contract - every file that received a rebuilt block is re-hashed
-/// whole via `io.read` and must match its PAR2 MD5, or the whole call
-/// fails with [`RepairError::VerifyFailed`] and the caller falls back
-/// to the materialize + `repair_dir` path. Returns the number of
-/// blocks rebuilt. No adoption here: misnamed/shifted sets take the
-/// directory path.
+/// contract - the set is re-read via `io.read` and must check out, or
+/// the whole call fails with [`RepairError::VerifyFailed`] and the
+/// caller falls back to the materialize + `repair_dir` path. Returns the
+/// number of blocks rebuilt. No adoption here: misnamed/shifted sets
+/// take the directory path.
+///
+/// EVERY file is re-read, not only the ones that received a rebuilt
+/// block. The blocks this function trusts were verified as they ARRIVED,
+/// off the wire, never off disk, so a covered file whose bytes went bad
+/// after they were written - a failed pwrite, a bad sector, anything
+/// between - passed straight through a "successful" repair and out into
+/// a Completed job. The directory path never had this hole, because
+/// par2 verifies the whole set from disk before and after.
+///
+/// The digest differs by what the file has been through, which is what
+/// keeps the added cost near a plain read:
+///
+/// - a file that received rebuilt blocks is re-hashed WHOLE against its
+///   PAR2 MD5, exactly as before: those bytes are new, and MD5 is what
+///   proves them;
+/// - an untouched file is checked per block against the IFSC CRC32s,
+///   ~5-10x cheaper than MD5 and the same answer for the corruption this
+///   is looking for. `full_verify` (the operator asking for full rather
+///   than fast verification) puts it on MD5 too, as does a set that
+///   carries no per-block checksums to use.
 pub fn repair_mapped(
     files: &[(Par2File, Vec<bool>)],
     block_size: usize,
     recovery: &[(u32, Vec<u8>)],
     io: &dyn VolumeIo,
+    full_verify: bool,
 ) -> Result<usize, RepairError> {
     if block_size == 0 || block_size % 2 != 0 {
         return Err(RepairError::Malformed(format!(
@@ -746,10 +1257,13 @@ pub fn repair_mapped(
             let mut feeder = rec.feeder(per_reader_batch);
             s.spawn(move || {
                 *res = (|| {
+                    // One reusable read buffer per reader: slices are
+                    // packed into the feeder's arena, so per-slice
+                    // allocations are gone (see FeedBatch).
+                    let mut buf = vec![0u8; block_size];
                     for &(g, fi, off, take) in wchunk {
-                        let mut data = vec![0u8; take];
-                        io.read(fi, off, &mut data)?;
-                        feeder.feed(g, data);
+                        io.read(fi, off, &mut buf[..take])?;
+                        feeder.feed(g, &buf[..take]);
                     }
                     Ok(())
                 })();
@@ -777,12 +1291,16 @@ pub fn repair_mapped(
         io.write(fi, off, &rebuilt[mi][..take])?;
     }
 
-    // Self-prove: whole-file MD5 via io.read for every touched file -
-    // files are independent, so verify across threads.
-    let touched: Vec<usize> = {
-        let set: HashSet<usize> = missing.iter().map(|&g| owner[g]).collect();
-        set.into_iter().collect()
-    };
+    // Self-prove: re-read the WHOLE SET via io.read - files are
+    // independent, so verify across threads.
+    let rebuilt_files: HashSet<usize> = missing.iter().map(|&g| owner[g]).collect();
+    // Sorted, because the results below are collected in this order and
+    // `for r in results { r?; }` reports the FIRST error: HashSet order
+    // meant a repair leaving two files failing their MD5 named a
+    // different one on each run from identical inputs. repair_dir_set
+    // sorts for the same reason. Also makes the chunk split
+    // size-independent of hash order.
+    let touched: Vec<usize> = (0..files.len()).collect();
     let threads = std::thread::available_parallelism()
         .map_or(4, |n| n.get())
         .min(touched.len())
@@ -792,22 +1310,74 @@ pub fn repair_mapped(
         (0..touched.len()).map(|_| None).collect();
     std::thread::scope(|s| {
         for (tchunk, rchunk) in touched.chunks(chunk).zip(results.chunks_mut(chunk)) {
+            let rebuilt_files = &rebuilt_files;
             s.spawn(move || {
                 let mut buf = vec![0u8; 1 << 20];
                 for (&fi, r) in tchunk.iter().zip(rchunk) {
                     let (f, _) = &files[fi];
+                    // MD5 for the bytes this call just wrote, and for a set
+                    // with no IFSC to check against; CRC32 per block for the
+                    // rest. See the function docs.
+                    let md5_this = full_verify
+                        || rebuilt_files.contains(&fi)
+                        || f.blocks.len() as u64 != f.length.div_ceil(bs);
                     let one = (|| {
                         let mut hasher = Md5::new();
+                        let mut crc = crc32fast::Hasher::new();
+                        let mut filled = 0usize; // bytes of the current block
+                        let mut bidx = 0usize;
                         let mut off = 0u64;
                         while off < f.length {
                             let take = (f.length - off).min(buf.len() as u64) as usize;
                             io.read(fi, off, &mut buf[..take])?;
-                            hasher.update(&buf[..take]);
+                            if md5_this {
+                                hasher.update(&buf[..take]);
+                            } else {
+                                // Blocks straddle reads freely; the CRC
+                                // accumulates across them and closes at each
+                                // boundary. The tail block is zero-padded to
+                                // the block size per spec, which
+                                // `crc32_zeros` does without allocating.
+                                let mut p = 0usize;
+                                while p < take {
+                                    let seg = (block_size - filled).min(take - p);
+                                    crc.update(&buf[p..p + seg]);
+                                    filled += seg;
+                                    p += seg;
+                                    if filled == block_size {
+                                        let done = std::mem::replace(
+                                            &mut crc,
+                                            crc32fast::Hasher::new(),
+                                        );
+                                        if f.blocks.get(bidx).map(|b| b.crc32)
+                                            != Some(done.finalize())
+                                        {
+                                            return Err(RepairError::VerifyFailed(
+                                                f.name.clone(),
+                                            ));
+                                        }
+                                        filled = 0;
+                                        bidx += 1;
+                                    }
+                                }
+                            }
                             off += take as u64;
                         }
-                        let md5: [u8; 16] = hasher.finalize().into();
-                        if md5 != f.md5 {
-                            return Err(RepairError::VerifyFailed(f.name.clone()));
+                        if md5_this {
+                            let md5: [u8; 16] = hasher.finalize().into();
+                            if md5 != f.md5 {
+                                return Err(RepairError::VerifyFailed(f.name.clone()));
+                            }
+                            return Ok(());
+                        }
+                        if filled > 0 {
+                            let padded = crate::yenc_simd::crc32_zeros(
+                                crc.finalize(),
+                                (block_size - filled) as u64,
+                            );
+                            if f.blocks.get(bidx).map(|b| b.crc32) != Some(padded) {
+                                return Err(RepairError::VerifyFailed(f.name.clone()));
+                            }
                         }
                         Ok(())
                     })();
@@ -1368,12 +1938,35 @@ pub fn repair_present_sets(
 /// are ignored, exactly as foreign-set packets always were); `None`
 /// keeps the historical first-seen binding.
 fn repair_dir_set(dir: &Path, want: Option<[u8; 16]>) -> Result<RepairStatus, RepairError> {
+    let timing = std::env::var_os("NZBFAST_REPAIR_TIMING").is_some();
+    let t0 = std::time::Instant::now();
+    let mut mark = {
+        let mut last = t0;
+        move |label: &str| {
+            if timing {
+                let now = std::time::Instant::now();
+                eprintln!(
+                    "[repair-timing] {label}: +{:.2?} (total {:.2?})",
+                    now - last,
+                    now - t0
+                );
+                last = now;
+            }
+        }
+    };
     let (packet_files, mut sniffed) = collect_packet_files(dir)?;
     if packet_files.is_empty() {
         return Err(RepairError::NoMainPacket);
     }
 
     // --- incremental packet scan (one file's bytes in memory at a time) ---
+    // Critical packets (Main + every FileDesc + IFSC) are duplicated in
+    // every volume, so they normally all come out of the FIRST (index)
+    // file. The loop stops as soon as the critical set is complete; the
+    // remaining files - the recovery volumes, i.e. almost all the bytes -
+    // carry only RecvSlic locations we still need, and that scan runs in
+    // the background UNDER the target-verify pass below (disjoint files:
+    // .par2 volumes here, data files there).
     let mut set_id: Option<[u8; 16]> = want;
     let mut main: Option<(u64, Vec<[u8; 16]>)> = None;
     let mut descs: HashMap<[u8; 16], par2::Desc> = HashMap::new();
@@ -1381,6 +1974,7 @@ fn repair_dir_set(dir: &Path, want: Option<[u8; 16]>) -> Result<RepairStatus, Re
     let mut seen: HashSet<[u8; 16]> = HashSet::new();
     // (packet file idx, data offset, exponent, data len)
     let mut rec_locs: Vec<(usize, usize, u32, usize)> = Vec::new();
+    let mut scanned = 0usize;
     for (pfi, path) in packet_files.iter().enumerate() {
         let bytes = std::fs::read(path)?;
         par2::scan_packets(&bytes, |pkt| {
@@ -1417,7 +2011,19 @@ fn repair_dir_set(dir: &Path, want: Option<[u8; 16]>) -> Result<RepairStatus, Re
                 _ => {}
             }
         });
+        scanned = pfi + 1;
+        let critical_complete = main.as_ref().is_some_and(|(_, ids)| {
+            ids.iter()
+                .all(|fid| descs.contains_key(fid) && ifscs.contains_key(fid))
+        });
+        if critical_complete {
+            break;
+        }
+        // Sets whose files carry no IFSC never look "complete", so they
+        // scan everything here and skip the background leg - exactly the
+        // historical behavior.
     }
+    mark("packet scan (critical)");
     let (block_size, file_ids) = main.ok_or(RepairError::NoMainPacket)?;
     let bs = block_size as usize;
     // Whether two destination paths that differ only in case name ONE file is
@@ -1449,15 +2055,16 @@ fn repair_dir_set(dir: &Path, want: Option<[u8; 16]>) -> Result<RepairStatus, Re
             )));
         }
         let n_slices = n_slices_u64 as usize;
-        let blocks = ifscs.remove(fid).unwrap_or_default();
-        if !blocks.is_empty() && blocks.len() != n_slices {
-            return Err(RepairError::Malformed(format!(
-                "{}: IFSC has {} blocks, length implies {}",
-                d.name,
-                blocks.len(),
-                n_slices
-            )));
-        }
+        // A disagreeing IFSC packet is DROPPED, not fatal - `par2.rs` handles
+        // the identical case the same way, for the same reason: an empty
+        // `blocks` routes the file to the whole-file MD5, which covers every
+        // byte. Failing the call instead abandoned every other file in the
+        // set (19 repairable files lost to one malformed packet) when the
+        // recovery blocks to fix them were sitting right there.
+        let blocks = ifscs
+            .remove(fid)
+            .filter(|b| b.len() == n_slices)
+            .unwrap_or_default();
         // Wire-supplied names never touch the filesystem raw.
         let path = dir.join(crate::disk::sanitize_filename(&d.name));
         targets.push(Target {
@@ -1524,39 +2131,60 @@ fn repair_dir_set(dir: &Path, want: Option<[u8; 16]>) -> Result<RepairStatus, Re
     }
 
     // A sniffed packet file that is also a recovery-set target is data
-    // first - keep it eligible for the adoption scan.
-    sniffed.retain(|p| !targets.iter().any(|t| &t.path == p));
+    // first - keep it eligible for the adoption scan. Compared through
+    // `path_identity_key` like every other destination compare in this file:
+    // on a case-insensitive volume `Movie.R00` and `movie.r00` name one
+    // object, and an exact compare left the file in `exclude`, so the
+    // adoption scan never looked at the one file holding the missing blocks
+    // and the set reported Unrepairable when it was repairable.
+    sniffed.retain(|p| {
+        !targets
+            .iter()
+            .any(|t| path_identity_key(fold, &t.path) == path_identity_key(fold, p))
+    });
 
-    // --- verify every target from disk (files are independent - chunk
-    //     them across threads so the pass runs at disk speed) ---
-    if !targets.is_empty() {
-        let threads = std::thread::available_parallelism()
-            .map_or(4, |n| n.get())
-            .min(targets.len())
-            .max(1);
-        let chunk = targets.len().div_ceil(threads);
-        let mut results: Vec<Result<(), RepairError>> = Vec::new();
+    // --- verify every target from disk, overlapped with the recovery-
+    //     volume scan (they touch disjoint files: data files here, .par2
+    //     volumes there) ---
+    let remaining = &packet_files[scanned..];
+    if remaining.is_empty() {
+        verify_all_targets(&mut targets, bs)?;
+    } else {
+        let seen_bg = std::mem::take(&mut seen);
+        let sid = set_id;
+        let mut verify_res: Result<(), RepairError> = Ok(());
+        let mut bg_res: Result<Vec<(usize, usize, u32, usize)>, RepairError> = Ok(Vec::new());
         std::thread::scope(|s| {
-            let handles: Vec<_> = targets
-                .chunks_mut(chunk)
-                .map(|ch| {
-                    s.spawn(move || {
-                        for t in ch {
-                            verify_target(t, bs)?;
+            let h = s.spawn(move || {
+                let mut seen = seen_bg;
+                let mut locs = Vec::new();
+                for (i, path) in remaining.iter().enumerate() {
+                    let pfi = scanned + i;
+                    let bytes = std::fs::read(path)?;
+                    par2::scan_packets(&bytes, |pkt| {
+                        if !seen.insert(pkt.md5) {
+                            return;
                         }
-                        Ok(())
-                    })
-                })
-                .collect();
-            results = handles
-                .into_iter()
-                .map(|h| h.join().expect("verify worker panicked"))
-                .collect();
+                        // Criticals are already complete, so only the
+                        // recovery-slice locations are still wanted here.
+                        if Some(pkt.set_id) == sid
+                            && pkt.ptype == *par2::TYPE_RECVSLIC
+                            && pkt.body.len() >= 4
+                        {
+                            let e = u32::from_le_bytes(pkt.body[0..4].try_into().unwrap());
+                            locs.push((pfi, pkt.body_offset + 4, e, pkt.body.len() - 4));
+                        }
+                    });
+                }
+                Ok(locs)
+            });
+            verify_res = verify_all_targets(&mut targets, bs);
+            bg_res = h.join().expect("volume scan worker panicked");
         });
-        for r in results {
-            r?;
-        }
+        verify_res?;
+        rec_locs.extend(bg_res?);
     }
+    mark("verify targets + volume scan");
     let mut missing: Vec<usize> = Vec::new();
     for t in &targets {
         for (i, ok) in t.present.iter().enumerate() {
@@ -1627,6 +2255,7 @@ fn repair_dir_set(dir: &Path, want: Option<[u8; 16]>) -> Result<RepairStatus, Re
             missing.retain(|g| !adopted.contains_key(g));
         }
     }
+    mark("adoption");
     let cands = cands;
     let adopted = adopted;
     let missing = missing;
@@ -1664,22 +2293,72 @@ fn repair_dir_set(dir: &Path, want: Option<[u8; 16]>) -> Result<RepairStatus, Re
     } else {
         Vec::new()
     };
+    mark("load recovery");
 
     // --- syndrome pass: stream every present slice once ---
     let blocks_rebuilt = missing.len();
     let rebuilt: Vec<Vec<u8>> = if blocks_rebuilt > 0 {
         let mut rec = Reconstructor::new(bs, n_inputs, &missing, &recovery)?;
-        for t in &targets {
-            if !t.exists || t.present.iter().all(|&p| !p) {
-                continue;
-            }
-            let f = File::open(&t.path)?;
-            for (i, _) in t.present.iter().enumerate().filter(|&(_, &p)| p) {
-                let off = i as u64 * block_size;
-                let take = (t.file.length - off).min(block_size) as usize;
-                let mut data = vec![0u8; take];
-                crate::disk::read_exact_at(&f, &mut data, off)?;
-                rec.feed(t.first_slice + i, data);
+        // `Reconstructor::new` has copied every recovery slice into its own
+        // u16 syndrome buffers, so this second payload-sized copy (missing x
+        // block_size - 537 MB on a 128-block/4 MiB repair) is dead weight for
+        // the rest of the solve. Peak RSS on that repair measured ~2 GB
+        // against a 268 MB resolved budget; this is one of the four live
+        // buffers and the only one that is redundant.
+        drop(recovery);
+        // Present-slice reads fan out exactly as in `repair_mapped`
+        // (M2c.2): contiguous chunks of the flattened work list per
+        // reader (sequential read patterns), each with its own Feeder
+        // into the one fold worker. This loop used to run single-file,
+        // single-threaded - the only serial data pass left in the
+        // disk repair path.
+        let work: Vec<(usize, usize, u64, usize)> = targets
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.exists)
+            .flat_map(|(ti, t)| {
+                t.present.iter().enumerate().filter(|&(_, &p)| p).map(move |(i, _)| {
+                    let off = i as u64 * block_size;
+                    (t.first_slice + i, ti, off, (t.file.length - off).min(block_size) as usize)
+                })
+            })
+            .collect();
+        if !work.is_empty() {
+            let readers = std::thread::available_parallelism()
+                .map_or(4, |n| n.get())
+                .min(8)
+                .min(work.len())
+                .max(1);
+            let per_reader_batch = (BATCH_BYTES / readers).max(1 << 20);
+            let chunk = work.len().div_ceil(readers);
+            let targets_ref = &targets;
+            let mut read_results: Vec<Result<(), RepairError>> =
+                (0..readers).map(|_| Ok(())).collect();
+            std::thread::scope(|s| {
+                for (wchunk, res) in work.chunks(chunk).zip(read_results.iter_mut()) {
+                    let mut feeder = rec.feeder(per_reader_batch);
+                    s.spawn(move || {
+                        *res = (|| {
+                            let mut open: Option<(usize, File)> = None;
+                            // One reusable read buffer per reader (see
+                            // FeedBatch - per-slice allocs are the trap).
+                            let mut buf = vec![0u8; bs];
+                            for &(g, ti, off, take) in wchunk {
+                                if open.as_ref().is_none_or(|(oi, _)| *oi != ti) {
+                                    open = Some((ti, File::open(&targets_ref[ti].path)?));
+                                }
+                                let f = &open.as_ref().expect("just opened").1;
+                                crate::disk::read_exact_at(f, &mut buf[..take], off)?;
+                                feeder.feed(g, &buf[..take]);
+                            }
+                            Ok(())
+                        })();
+                        // feeder drops here → tail batch flushes.
+                    });
+                }
+            });
+            for r in read_results {
+                r?;
             }
         }
         // Adopted blocks are present data too - fed from their source.
@@ -1692,10 +2371,12 @@ fn repair_dir_set(dir: &Path, want: Option<[u8; 16]>) -> Result<RepairStatus, Re
             for (g, off) in list {
                 let take = bs.min(cands[ci].1.saturating_sub(off) as usize);
                 let data = cand_reader.read(AdoptSrc { cand: ci, offset: off }, take)?;
-                rec.feed(g, data);
+                rec.feed(g, &data);
             }
         }
-        rec.finish()
+        let r = rec.finish();
+        mark("feed+fold+solve");
+        r
     } else {
         Vec::new()
     };
@@ -1854,6 +2535,7 @@ fn repair_dir_set(dir: &Path, want: Option<[u8; 16]>) -> Result<RepairStatus, Re
             renames.push((tmp, ti));
         }
     }
+    mark("patch");
     // Whole-file MD5 for everything written - files are independent, so
     // verify across threads.
     if !checks.is_empty() {
@@ -1888,6 +2570,7 @@ fn repair_dir_set(dir: &Path, want: Option<[u8; 16]>) -> Result<RepairStatus, Re
             }
         }
     }
+    mark("final verify");
     // Every adopted read and every verify is done - land the rebuilds.
     let temp_set: HashSet<usize> = renames.iter().map(|&(_, ti)| ti).collect();
     for &ti in &damaged {
@@ -1913,72 +2596,166 @@ fn repair_dir_set(dir: &Path, want: Option<[u8; 16]>) -> Result<RepairStatus, Re
     Ok(RepairStatus::Repaired(report))
 }
 
-/// Stream-verify one target from disk: per-block IFSC MD5+CRC32 (blocks
-/// zero-padded per spec) plus the whole-file MD5 over the declared
-/// length. Fills `present`, `intact`, `exists`.
-fn verify_target(t: &mut Target, bs: usize) -> Result<(), RepairError> {
-    t.present = vec![false; t.n_slices];
-    let mut f = match File::open(&t.path) {
+/// What the verify pass learned about one target file.
+struct Pass1Out {
+    exists: bool,
+    intact: bool,
+    /// Whole-file MD5 matched over the declared length: every block is
+    /// present even if trailing junk keeps `intact` false.
+    clean: bool,
+    /// Per-block presence from the in-stream block CRC32s, for a
+    /// damaged file with IFSC data (None when clean, absent, or the
+    /// set has no IFSC packets - those fall back to all-false).
+    present: Option<Vec<bool>>,
+}
+
+/// Target verification in ONE streaming pass: the whole-file MD5 and
+/// the per-block IFSC CRC32s are computed from the same buffered read.
+/// The old shape hashed every damaged file twice (whole-file MD5, then
+/// a second full pass of per-block MD5+CRC); the CRC costs a few
+/// percent on top of the MD5 and deletes that second pass outright.
+///
+/// Presence is decided by the block CRC32 ALONE. The block MD5s are
+/// deliberately not consulted: a corrupt block that collides CRC32
+/// (2⁻³² per damaged block, and damage is honest randomness) would
+/// poison the syndromes and make the repair produce wrong bytes for
+/// OTHER blocks - and that is exactly what the mandatory whole-file
+/// self-prove after patching catches, so the failure mode is a FAILED
+/// repair, never a wrong "Repaired". Same trade par2cmdline's own
+/// scanning makes, with a stronger backstop.
+fn verify_pass1(path: &Path, file: &Par2File, bs: usize) -> Result<Pass1Out, RepairError> {
+    let mut f = match File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            t.exists = false;
-            t.intact = false;
-            return Ok(());
+            return Ok(Pass1Out {
+                exists: false,
+                intact: false,
+                clean: false,
+                present: None,
+            });
         }
         Err(e) => return Err(e.into()),
     };
-    t.exists = true;
     let disk_len = f.metadata()?.len();
-    // Pass 1: whole-file MD5 alone. A matching prefix proves every
-    // block bytewise, so the per-block IFSC pass (a second MD5 plus a
-    // CRC over every byte) is only paid by files that actually fail -
-    // on a clean set this halves the hashing, which is the whole
-    // verify wall clock.
+    let n_slices = file.length.div_ceil(bs as u64) as usize;
+    let track = !file.blocks.is_empty();
     let mut whole = Md5::new();
-    let mut buf = vec![0u8; bs.max(1 << 20)];
-    let mut remaining = t.file.length.min(disk_len);
-    while remaining > 0 {
-        let take = (remaining as usize).min(buf.len());
+    let mut blocks_ok = track.then(|| vec![false; n_slices]);
+    let mut crc = crc32fast::Hasher::new();
+    let mut bfill = 0usize;
+    let mut bidx = 0usize;
+    // The buffer is bounded regardless of the slice size - `bs` is
+    // wire-supplied up to MAX_BLOCK_SIZE (256 MiB), and this allocates
+    // once per parallel worker. The in-stream block CRC accumulates
+    // across reads (`bfill`), so blocks may straddle buffers freely.
+    let mut buf = vec![0u8; bs.clamp(1 << 20, 8 << 20)];
+    let limit = file.length.min(disk_len);
+    let mut pos = 0u64;
+    while pos < limit {
+        let take = ((limit - pos) as usize).min(buf.len());
         read_full(&mut f, &mut buf[..take])?;
         whole.update(&buf[..take]);
-        remaining -= take as u64;
-    }
-    let md5: [u8; 16] = whole.finalize().into();
-    let md5_ok = disk_len >= t.file.length && md5 == t.file.md5;
-    t.intact = md5_ok && disk_len == t.file.length;
-    if md5_ok {
-        // Bytewise-correct prefix of declared length: every block is
-        // present even if trailing junk keeps `intact` false.
-        t.present = vec![true; t.n_slices];
-        return Ok(());
-    }
-    // No per-block checksums (IFSC absent): all-or-nothing on the MD5.
-    if t.file.blocks.is_empty() {
-        return Ok(());
-    }
-    // Pass 2, damaged files only: per-block IFSC to locate the good
-    // blocks. The file was just read, so this re-read is page-cache
-    // warm.
-    use std::io::Seek;
-    f.seek(std::io::SeekFrom::Start(0))?;
-    let mut remaining = t.file.length.min(disk_len);
-    let mut block = 0usize;
-    while remaining > 0 && block < t.n_slices {
-        let expect = (t.file.length - block as u64 * bs as u64).min(bs as u64) as usize;
-        let take = (remaining as usize).min(expect);
-        read_full(&mut f, &mut buf[..take])?;
-        // Only a fully-read block can verify; a truncated tail read
-        // (disk shorter than declared) is damage by definition.
-        if take == expect {
-            if let Some(check) = t.file.blocks.get(block) {
-                buf[take..bs].fill(0);
-                let md5: [u8; 16] = Md5::digest(&buf[..bs]).into();
-                t.present[block] =
-                    md5 == check.md5 && crc32fast::hash(&buf[..bs]) == check.crc32;
+        if let Some(ok) = blocks_ok.as_mut() {
+            let mut p = 0usize;
+            while p < take {
+                let seg = (bs - bfill).min(take - p);
+                crc.update(&buf[p..p + seg]);
+                bfill += seg;
+                p += seg;
+                if bfill == bs {
+                    let done = std::mem::replace(&mut crc, crc32fast::Hasher::new());
+                    if let Some(check) = file.blocks.get(bidx) {
+                        ok[bidx] = done.finalize() == check.crc32;
+                    }
+                    bfill = 0;
+                    bidx += 1;
+                }
             }
         }
-        remaining -= take as u64;
-        block += 1;
+        pos += take as u64;
+    }
+    if bfill > 0 {
+        if let Some(ok) = blocks_ok.as_mut() {
+            // Tail block, zero-padded to the block size per spec - but
+            // only when the declared bytes were all on disk (a tail cut
+            // short by a truncated file is damage by definition).
+            let off = bidx as u64 * bs as u64;
+            let expect = (file.length - off).min(bs as u64);
+            if limit - off >= expect {
+                // Extended through the padding in O(log n) rather than by
+                // hashing a zero buffer: `bs` is wire-supplied up to 256 MiB,
+                // and a set of many one-byte targets made every parallel
+                // worker allocate one of those at its tail block - a
+                // metadata-driven `targets x block_size` memory spike on a
+                // file that could be a few KB. The read buffer above is
+                // already clamped for exactly this reason.
+                let padded = crate::yenc_simd::crc32_zeros(
+                    crc.clone().finalize(),
+                    (bs - bfill) as u64,
+                );
+                if let Some(check) = file.blocks.get(bidx) {
+                    ok[bidx] = padded == check.crc32;
+                }
+            }
+        }
+    }
+    let md5: [u8; 16] = whole.finalize().into();
+    let md5_ok = disk_len >= file.length && md5 == file.md5;
+    Ok(Pass1Out {
+        exists: true,
+        intact: md5_ok && disk_len == file.length,
+        clean: md5_ok,
+        present: if md5_ok { None } else { blocks_ok },
+    })
+}
+
+/// Verify every target from a size-descending work queue (biggest file
+/// first, so no fixed-chunk straggler). One streaming pass per file
+/// does everything - see [`verify_pass1`].
+fn verify_all_targets(targets: &mut [Target], bs: usize) -> Result<(), RepairError> {
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let mut order: Vec<usize> = (0..targets.len()).collect();
+    order.sort_by_key(|&ti| targets[ti].file.length); // pop() takes the largest
+    let queue = std::sync::Mutex::new(order);
+    let cores = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(targets.len());
+    let targets_ref: &[Target] = targets;
+    let mut results: Vec<Result<Vec<(usize, Pass1Out)>, RepairError>> = Vec::new();
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..cores)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut out: Vec<(usize, Pass1Out)> = Vec::new();
+                    loop {
+                        let Some(ti) = queue.lock().unwrap().pop() else {
+                            return Ok(out);
+                        };
+                        let t = &targets_ref[ti];
+                        out.push((ti, verify_pass1(&t.path, &t.file, bs)?));
+                    }
+                })
+            })
+            .collect();
+        results = handles
+            .into_iter()
+            .map(|h| h.join().expect("verify worker panicked"))
+            .collect();
+    });
+    let mut p1s: Vec<(usize, Pass1Out)> = Vec::with_capacity(targets.len());
+    for r in results {
+        p1s.extend(r?);
+    }
+    for (ti, out) in p1s {
+        let t = &mut targets[ti];
+        t.exists = out.exists;
+        t.intact = out.intact;
+        t.present = match out.present {
+            Some(p) => p,
+            None => vec![out.clean; t.n_slices],
+        };
     }
     Ok(())
 }
@@ -2178,7 +2955,7 @@ mod tests {
         let mut rec = Reconstructor::new(bs, n, &missing, &recovery).unwrap();
         for (i, s) in slices.iter().enumerate() {
             if !missing.contains(&i) {
-                rec.feed(i, s.clone());
+                rec.feed(i, s);
             }
         }
         let rebuilt = rec.finish();
@@ -2202,7 +2979,7 @@ mod tests {
         let mut rec = Reconstructor::new(bs, n, &missing, &recovery).unwrap();
         for (i, s) in slices.iter().enumerate() {
             if !missing.contains(&i) {
-                rec.feed(i, s.clone()); // short tails fed unpadded
+                rec.feed(i, s); // short tails fed unpadded
             }
         }
         let rebuilt = rec.finish();
@@ -2260,12 +3037,29 @@ mod tests {
         /// backing store) get flipped - simulates a broken write path,
         /// which the whole-file MD5 must catch.
         corrupt_write_at: Option<(usize, usize)>,
+        /// When set, this (file, offset) is flipped on the FIRST write to
+        /// any file - i.e. after every syndrome read has happened, so the
+        /// rot cannot poison the reconstruction and the only thing that
+        /// can catch it is the self-prove re-reading a file it did not
+        /// rebuild.
+        rot_on_first_write: Option<(usize, usize)>,
+        rotted: std::sync::atomic::AtomicBool,
     }
     impl MemIo {
         fn new(files: Vec<Vec<u8>>, corrupt_write_at: Option<(usize, usize)>) -> MemIo {
             MemIo {
                 files: std::sync::Mutex::new(files),
                 corrupt_write_at,
+                rot_on_first_write: None,
+                rotted: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+        fn rotting(files: Vec<Vec<u8>>, at: (usize, usize)) -> MemIo {
+            MemIo {
+                files: std::sync::Mutex::new(files),
+                corrupt_write_at: None,
+                rot_on_first_write: Some(at),
+                rotted: std::sync::atomic::AtomicBool::new(false),
             }
         }
         fn snapshot(&self) -> Vec<Vec<u8>> {
@@ -2283,6 +3077,11 @@ mod tests {
             let mut files = self.files.lock().unwrap();
             let off = off as usize;
             files[file][off..off + data.len()].copy_from_slice(data);
+            if let Some((rf, ro)) = self.rot_on_first_write {
+                if !self.rotted.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    files[rf][ro] ^= 0xFF;
+                }
+            }
             if let Some((cf, co)) = self.corrupt_write_at {
                 if cf == file && (off..off + data.len()).contains(&co) {
                     files[file][co] ^= 0xFF;
@@ -2353,6 +3152,70 @@ mod tests {
             .collect()
     }
 
+    /// The self-prove covers the WHOLE SET, not just the files that
+    /// received a rebuilt block.
+    ///
+    /// The present-block ledger comes from verification done as the bytes
+    /// ARRIVED, off the wire - never off disk. So a covered file whose
+    /// bytes went bad after they were written (a failed pwrite, a bad
+    /// sector) is "present" as far as this driver knows, is never
+    /// rebuilt, and used to sail through a successful repair into a
+    /// Completed job. The directory path never had that hole because par2
+    /// reads the whole set off disk.
+    #[test]
+    fn mapped_driver_rereads_files_it_did_not_rebuild() {
+        // IFSC checksums present, so an untouched file takes the cheap
+        // per-block CRC32 path rather than MD5.
+        let with_ifsc = |files: &mut Vec<(Par2File, Vec<bool>)>, pristine: &[Vec<u8>], bs: usize| {
+            for ((f, _), data) in files.iter_mut().zip(pristine) {
+                f.blocks = data
+                    .chunks(bs)
+                    .map(|c| {
+                        let mut padded = c.to_vec();
+                        padded.resize(bs, 0);
+                        BlockCheck {
+                            md5: Md5::digest(&padded).into(),
+                            crc32: crc32fast::hash(&padded),
+                        }
+                    })
+                    .collect();
+            }
+        };
+
+        for full_verify in [false, true] {
+            let damage = [(0usize, 1usize)];
+            let (mut files, bs, recovery, pristine) = mapped_fixture(&damage);
+            with_ifsc(&mut files, &pristine, bs);
+
+            // File 0 is damaged and will be rebuilt. File 1 is untouched by
+            // the repair, and goes bad on disk once the syndrome reads are
+            // done - so nothing but the self-prove can notice. (Rotting it
+            // up front instead would poison the reconstruction itself,
+            // which is a different, already-covered failure.)
+            let mut on_disk = pristine.clone();
+            on_disk[0][bs..2 * bs].fill(0);
+            let io = MemIo::rotting(on_disk, (1, 3));
+
+            let got = repair_mapped(&files, bs, &recovery, &io, full_verify);
+            assert!(
+                matches!(&got, Err(RepairError::VerifyFailed(n)) if n == "f1.bin"),
+                "a repair that left a corrupt covered file did not fail on it \
+                 (full_verify={full_verify}): {got:?}"
+            );
+        }
+
+        // ...and the same set with an intact file 1 still repairs, so the
+        // new read is a check and not a blocker.
+        let damage = [(0usize, 1usize)];
+        let (mut files, bs, recovery, pristine) = mapped_fixture(&damage);
+        with_ifsc(&mut files, &pristine, bs);
+        let mut on_disk = pristine.clone();
+        on_disk[0][bs..2 * bs].fill(0);
+        let io = MemIo::new(on_disk, None);
+        assert_eq!(repair_mapped(&files, bs, &recovery, &io, false).expect("repairs"), 1);
+        assert_eq!(io.snapshot(), pristine, "byte-identical restoration");
+    }
+
     #[test]
     fn mapped_driver_rebuilds_and_self_verifies() {
         let damage = [(0usize, 1usize), (0, 3), (1, 1)]; // incl. both tails
@@ -2377,7 +3240,7 @@ mod tests {
                 .collect(),
             None,
         );
-        let n = repair_mapped(&files, bs, &recovery, &io).expect("repairs");
+        let n = repair_mapped(&files, bs, &recovery, &io, false).expect("repairs");
         assert_eq!(n, 3);
         assert_eq!(io.snapshot(), pristine, "byte-identical restoration");
     }
@@ -2448,7 +3311,7 @@ mod tests {
                 .collect(),
             None,
         );
-        let n = repair_mapped(&files, bs, &recovery, &io).expect("repairs");
+        let n = repair_mapped(&files, bs, &recovery, &io, false).expect("repairs");
         assert_eq!(n, damage.len());
         assert_eq!(io.snapshot(), pristine, "byte-identical restoration");
     }
@@ -2458,7 +3321,7 @@ mod tests {
         let damage = [(0usize, 1usize)];
         let (files, bs, recovery, pristine) = mapped_fixture(&damage);
         let io = MemIo::new(pristine.clone(), Some((0, bs + 5))); // inside the rebuilt block
-        match repair_mapped(&files, bs, &recovery, &io) {
+        match repair_mapped(&files, bs, &recovery, &io, false) {
             Err(RepairError::VerifyFailed(name)) => assert_eq!(name, "f0.bin"),
             other => panic!("expected VerifyFailed, got {other:?}"),
         }
@@ -2470,14 +3333,14 @@ mod tests {
         let io = MemIo::new(pristine.clone(), None);
         // 5 missing, only 4 recovery slices.
         assert!(matches!(
-            repair_mapped(&files, bs, &recovery, &io),
+            repair_mapped(&files, bs, &recovery, &io, false),
             Err(RepairError::Malformed(_))
         ));
         // Present-vector length mismatch.
         let mut bad = files.clone();
         bad[0].1.push(true);
         assert!(matches!(
-            repair_mapped(&bad, bs, &recovery, &io),
+            repair_mapped(&bad, bs, &recovery, &io, false),
             Err(RepairError::Malformed(_))
         ));
         // No damage at all is a no-op success.
@@ -2485,7 +3348,7 @@ mod tests {
             .iter()
             .map(|(f, p)| (f.clone(), vec![true; p.len()]))
             .collect();
-        assert_eq!(repair_mapped(&clean, bs, &recovery, &io).unwrap(), 0);
+        assert_eq!(repair_mapped(&clean, bs, &recovery, &io, false).unwrap(), 0);
         assert_eq!(io.snapshot(), pristine, "no-op wrote nothing");
     }
 
@@ -2519,7 +3382,7 @@ mod tests {
             vec![false; slices.len()],
         )];
         let io = MemIo::new(vec![vec![0u8; pristine.len()]], None);
-        match repair_mapped(&files, bs, &recovery, &io) {
+        match repair_mapped(&files, bs, &recovery, &io, false) {
             Err(RepairError::Malformed(m)) => assert!(m.contains("declining"), "{m}"),
             other => panic!("expected a graceful decline, got {other:?}"),
         }
@@ -2565,5 +3428,63 @@ mod tests {
         // Duplicate rows are singular by construction.
         let a = vec![vec![1u16, 2], vec![1u16, 2]];
         assert!(matches!(invert(a), Err(RepairError::SingularMatrix)));
+    }
+
+    /// The structured Vandermonde inverse must equal the Gauss-Jordan
+    /// inverse EXACTLY (the inverse is unique) for consecutive
+    /// exponents, at small and fanned-out sizes, with and without an
+    /// exponent offset e0, and on non-prefix missing sets (scattered
+    /// bases). This is the differential oracle for the O(m²) path.
+    #[test]
+    fn vandermonde_inverse_matches_gauss_jordan() {
+        for (m, e0, scatter) in [
+            (1usize, 0u32, false),
+            (2, 0, false),
+            (5, 3, true),
+            (37, 0, true),
+            (PAR_INVERT_MIN + 16, 2, true),
+        ] {
+            // Scattered missing sets exercise non-contiguous bases.
+            let logs = input_base_logs(if scatter { m * 3 } else { m }).unwrap();
+            let ks: Vec<u32> = (0..m)
+                .map(|i| logs[if scatter { i * 3 + 1 } else { i }])
+                .collect();
+            let a: Vec<Vec<u16>> = (0..m)
+                .map(|r| {
+                    ks.iter()
+                        .map(|&k| gf16::pow2(k as u64 * (e0 as u64 + r as u64)))
+                        .collect()
+                })
+                .collect();
+            let want = invert(a).expect("PAR2-shaped matrix inverts");
+            let got = invert_vandermonde(&ks, e0).expect("distinct bases cannot fail");
+            assert_eq!(got, want, "m={m} e0={e0} scatter={scatter}");
+        }
+    }
+
+    /// The fanned-out inversion must agree with the serial one exactly
+    /// (the inverse is unique, so pivot-order differences must wash
+    /// out), at a size past PAR_INVERT_MIN so the parallel path really
+    /// runs. Also: a singular matrix that large must still be REPORTED,
+    /// not solved wrong or deadlocked on - every worker has to leave the
+    /// barrier dance on the same column.
+    #[test]
+    fn parallel_invert_matches_serial_and_reports_singular() {
+        let m = PAR_INVERT_MIN + 32;
+        let logs = input_base_logs(m).unwrap();
+        let a: Vec<Vec<u16>> = (0..m)
+            .map(|e| {
+                (0..m)
+                    .map(|j| gf16::pow2(logs[j] as u64 * e as u64))
+                    .collect()
+            })
+            .collect();
+        let par = invert(a.clone()).expect("PAR2-shaped matrix inverts");
+        let ser = invert_serial(a.clone()).expect("serial agrees it inverts");
+        assert_eq!(par, ser, "parallel and serial inverses must be identical");
+
+        let mut sing = a;
+        sing[m - 1] = sing[0].clone(); // duplicate row: singular
+        assert!(matches!(invert(sing), Err(RepairError::SingularMatrix)));
     }
 }

@@ -236,7 +236,7 @@ fn clear_interests(config_path: &Path) {
     let Ok(Value::Object(mut map)) = serde_json::from_slice::<Value>(&bytes) else { return };
     map.remove("index_interests");
     if let Ok(text) = serde_json::to_string_pretty(&Value::Object(map)) {
-        let _ = std::fs::write(&settings, text);
+        let _ = crate::persist::write_atomic(&settings, text.as_bytes());
     }
 }
 
@@ -299,7 +299,14 @@ Enter the numbers you want, separated by commas (e.g. 1,3).");
     };
     map.insert("index_interests".into(), Value::String(value.clone()));
     let text = serde_json::to_string_pretty(&Value::Object(map))?;
-    std::fs::write(&settings, text)?;
+    // Through `write_atomic`, like every other writer of this file: the
+    // wizard rewrites the WHOLE settings map, apikey included, and a plain
+    // `fs::write` truncates in place. A crash mid-write leaves a truncated
+    // settings.json, which `json_store_unreadable` (serve.rs) sees on the
+    // next start - the daemon mints a FRESH apikey and every *arr
+    // connection stops working. It also gets the 0600 creation mode the
+    // credential-bearing stores are supposed to have.
+    crate::persist::write_atomic(&settings, text.as_bytes())?;
     if chosen.is_empty() {
         println!("
 Nothing will be indexed. Nothing else changes.");

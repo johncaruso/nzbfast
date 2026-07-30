@@ -107,7 +107,12 @@ impl RSCoder8 {
 
         let mut error_locs = Vec::new();
         let mut denominators = Vec::new();
-        for root in (MAX_PARITY - codeword.len())..=MAX_PARITY {
+        // Exponents are taken mod MAX_PARITY, so root 0 and root MAX_PARITY
+        // evaluate identically. A full-length codeword would scan both and
+        // record the same true root twice -- once as the valid loc 0 and once
+        // as the impossible loc MAX_PARITY, failing the decode. Start at 1 so
+        // alpha^0 is scanned exactly once; shorter codewords already do.
+        for root in (MAX_PARITY - codeword.len()).max(1)..=MAX_PARITY {
             let mut sum = 0;
             for (power, &coefficient) in locator.iter().enumerate() {
                 sum ^= self.mul(self.gf_exp[(power * root) % MAX_PARITY], coefficient);
@@ -620,13 +625,14 @@ mod tests {
             // Production falls back to the per-byte loop when (and only when)
             // the coefficients cannot be derived, so this pins which path the
             // case below actually took -- without it, a case that quietly fell
-            // back would compare the reference against itself and pass.
+            // back would compare the reference against itself and pass. Every
+            // decodable erasure set derives, including the full-length
+            // 255-symbol codeword since the root-scan alias fix.
             let took_matrix_path =
                 correction_matrix_for(&present, recovery_count, &recovery).is_ok();
-            assert_eq!(
+            assert!(
                 took_matrix_path,
-                !(volumes + recovery_count == MAX_PARITY),
-                "unexpected path for {volumes}+{recovery_count}, {missing} missing"
+                "unexpected fallback for {volumes}+{recovery_count}, {missing} missing"
             );
 
             let fast = reconstruct_data_volumes(&present, recovery_count, &recovery);
@@ -693,6 +699,46 @@ mod tests {
     #[test]
     fn max_parity_bound_is_unchanged() {
         assert_eq!(MAX_PARITY, 255);
+    }
+
+    /// Full-length codeword, last position erased: root 0 and root 255 are
+    /// aliases in the Chien scan (exponents are taken mod 255), and before
+    /// the range clamp the scan recorded the same true root twice -- the
+    /// valid loc 0 plus the impossible loc 255 -- and refused to repair.
+    #[test]
+    fn full_length_codeword_repairs_last_position() {
+        let data_count = 250;
+        let recovery_count = 5;
+        assert_eq!(data_count + recovery_count, MAX_PARITY);
+        let coder = RSCoder8::new(recovery_count).unwrap();
+
+        let data = pseudorandom(data_count, 0xC0DE);
+        let parity = coder.encode(&data);
+        let mut codeword: Vec<u8> = data.clone();
+        codeword.extend_from_slice(&parity);
+
+        // Erase the last data symbol (position 254 of the codeword is parity;
+        // exercise both the last data position and the very last position).
+        for &erased in &[data_count - 1, MAX_PARITY - 1] {
+            let mut damaged = codeword.clone();
+            damaged[erased] = damaged[erased].wrapping_add(1);
+            coder.correct_erasures(&mut damaged, &[erased]).unwrap();
+            assert_eq!(damaged, codeword, "position {erased} did not repair");
+        }
+
+        // And the bulk volume path over the same full-length geometry.
+        let shard_len = 400;
+        let volumes: Vec<Vec<u8>> = (0..data_count)
+            .map(|index| pseudorandom(shard_len, 0xFEED + index as u64))
+            .collect();
+        let volume_parity = encode_columns(&volumes, recovery_count, shard_len);
+        let mut present: Vec<Option<&[u8]>> =
+            volumes.iter().map(|shard| Some(shard.as_slice())).collect();
+        present[data_count - 1] = None;
+        let recovery = [(0usize, volume_parity[0].as_slice())];
+
+        let rebuilt = reconstruct_data_volumes(&present, recovery_count, &recovery).unwrap();
+        assert_eq!(rebuilt[data_count - 1], volumes[data_count - 1]);
     }
 
     #[test]

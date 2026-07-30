@@ -381,7 +381,15 @@ select.ctl:focus{outline:1px solid var(--acc)}
 .selwrap{position:relative;display:inline-flex;align-items:center}
 .selwrap .selic{position:absolute;inset-inline-start:8px;pointer-events:none;color:var(--dim);
   width:1em;height:1em}
-.selwrap select.ctl{padding-inline-start:26px}
+/* appearance:none, not just padding. A native menulist select in WebKit
+   discards author padding on the leading edge, so the label stayed put and
+   the icon printed straight over its first letter. Dropping the native
+   look is what makes the reserved room real on every engine - which then
+   costs us the platform's own indicator, so .selcaret draws one back. */
+.selwrap select.ctl{-webkit-appearance:none;appearance:none;
+  padding-inline-start:26px;padding-inline-end:24px}
+.selwrap .selcaret{position:absolute;inset-inline-end:7px;pointer-events:none;color:var(--dim);
+  width:.9em;height:.9em}
 /* Card-header toolbar (Connection tuning): floats right on desktop. */
 .h3tools{float:inline-end;margin-top:-4px;display:flex;gap:8px}
 /* Contextual help: a quiet ? on a card header deep-links into the manual. */
@@ -745,6 +753,9 @@ body.setsearching .setmore{display:none}
 input.txt,select.sel{width:100%;max-width:360px;padding:7px 10px;border-radius:var(--radius-sm);
   border:1px solid var(--line);background:var(--surface-2);color:var(--fg);font-size:13px}
 input.txt:focus,select.sel:focus{outline:1px solid var(--acc)}
+/* A control this installation does not own (see portLockNotice) has to
+   LOOK unavailable, not just refuse when you type in it. */
+input.txt:disabled,select.sel:disabled{opacity:.55;cursor:not-allowed}
 input.txt.sm{max-width:120px}
 .badge{display:inline-block;font-size:10.5px;padding:2px 8px;border-radius:99px;margin-inline-start:8px;
   border:1px solid var(--line);color:var(--dim);text-transform:none;letter-spacing:0;
@@ -889,7 +900,8 @@ input.txt.sm{max-width:120px}
   <a href="/manual" target="_blank" class="pill" style="text-decoration:none" data-i18n-title="hdr.manual.title" title="User manual"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-manual"/></svg> <span data-i18n="hdr.manual">manual</span></a>
   </nav>
   <span class="grow"></span>
-  <span class="selwrap"><svg class="ic selic" aria-hidden="true"><use href="#i-gauge"/></svg>
+  <span class="selwrap"><svg class="ic selic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-gauge"/></svg>
+  <svg class="ic selcaret" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-caret"/></svg>
   <select class="ctl" id="limitSel" data-i18n-title="hdr.limit.title" title="Speed limit" onchange="setLimit(this.value)">
     <option value="0" data-i18n="hdr.limit.none">no limit</option>
     <option value="auto" data-i18n="hdr.limit.auto">auto · yield to LAN</option>
@@ -900,7 +912,8 @@ input.txt.sm{max-width:120px}
     <option value="1000000000">1 GB/s</option>
     <option value="custom" data-i18n="hdr.limit.setcustom">custom…</option>
   </select></span>
-  <span class="selwrap"><svg class="ic selic" aria-hidden="true"><use href="#i-clock"/></svg>
+  <span class="selwrap"><svg class="ic selic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-clock"/></svg>
+  <svg class="ic selcaret" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-caret"/></svg>
   <select class="ctl" id="pauseSel" data-i18n-title="hdr.pausefor.title" title="Pause for…" onchange="pauseFor(this.value)">
     <option value="" data-i18n="hdr.pausefor">pause for…</option>
     <option value="15" data-i18n="hdr.pausefor.15">15 min</option>
@@ -1313,8 +1326,10 @@ input.txt.sm{max-width:120px}
     <div class="pathrow"><input class="txt" id="s_watch" onchange="setCfg('watch',this.value)"><button class="mini" onclick="browseDir('watch','dir')" data-i18n-title="btn.browse.title" title="Browse for a folder - including other drives" data-i18n="btn.browse">Browse…</button><button class="mini" onclick="openDir('watch')" data-i18n-title="btn.openfolder.title" title="Open this folder" aria-label="Open this folder">📂</button></div></div>
   <div class="row"><label data-i18n="set.watchdir.script">Post-processing script<span class="hint" data-i18n="set.watchdir.script.hint">runs after every job with SABnzbd's args + SAB_* env vars; empty = off</span></label>
     <div class="pathrow"><input class="txt" id="s_script" onchange="setCfg('script',this.value)"><button class="mini" onclick="browseDir('script','file')" data-i18n-title="btn.browsefile.title" title="Browse for a script file" data-i18n="btn.browse">Browse…</button><button class="mini" onclick="openDir('script')" data-i18n-title="set.watchdir.openscript.title" title="Open the folder containing this script" aria-label="Open the folder containing this script">📂</button></div></div>
-  <div class="row"><label data-i18n="set.watchdir.cleanup">Cleanup after download<span class="hint" data-i18n="set.watchdir.cleanup.hint">file extensions deleted from a job's folder once it completes successfully, e.g. par2, sfv, srr, url; empty = off</span></label>
-    <input class="txt" id="s_cleanup_exts" placeholder="par2, sfv, srr" onchange="setCfg('cleanup_exts',this.value)"></div>
+  <div class="row"><label data-i18n="set.watchdir.parclean">Delete recovery files<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.watchdir.parclean.hint">a download's .par2 repair files have done their job once everything verifies, so they are removed when it completes successfully. Turn off to keep them in the download folder</span></label>
+    <input type="checkbox" id="s_par_cleanup" onchange="setCfg('par_cleanup',this.checked?1:0)"></div>
+  <div class="row"><label data-i18n="set.watchdir.cleanup">Cleanup after download<span class="hint" data-i18n="set.watchdir.cleanup.hint">file extensions deleted from a job's folder once it completes successfully, e.g. sfv, srr, url; empty = off. Recovery files have their own switch above</span></label>
+    <input class="txt" id="s_cleanup_exts" placeholder="sfv, srr, url" onchange="setCfg('cleanup_exts',this.value)"></div>
   <div class="row"><label data-i18n="set.watchdir.faillink">When a download fails<span class="hint" data-i18n="set.watchdir.faillink.hint">some indexers attach a report link to every NZB they serve. Telling them a post is dead is how they learn to stop offering it, and they usually answer with another copy of the same title. Only works for NZBs fetched by URL (RSS, Add-by-URL, your indexer's "send to" button) - a file you dropped in yourself carries no link. Off by default: it tells a third party what failed for you</span></label>
     <select class="sel" id="s_failure_link" style="max-width:260px" onchange="setCfg('failure_link',this.value)">
       <option value="off" data-i18n="set.watchdir.faillink.off">do nothing</option>
@@ -1695,7 +1710,7 @@ input.txt.sm{max-width:120px}
     </span></div>
   <div class="row"><label data-i18n="set.sec.nzbkey">NZB key<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.sec.nzbkey.hint">add-only key: may submit NZBs but not read or change anything</span></label>
     <input class="txt" id="s_nzbkey" autocomplete="off" onchange="saveKey('nzbkey',this)"></div>
-  <div class="row"><label data-i18n="set.sec.port">Port<span class="badge restart" data-i18n="badge.restart">applies after restart</span></label>
+  <div class="row"><label data-i18n="set.sec.port">Port<span class="badge restart" id="s_portbadge" data-i18n="badge.restart">applies after restart</span></label>
     <input class="txt sm" type="number" min="1" max="65535" id="s_port" onchange="setCfg('port',this.value)"></div>
 </div>
 
@@ -2221,6 +2236,30 @@ function openApiNotice(open){
     + ' <button class="ghost mini" onclick="openApiFix(this)">' + esc(t('open.generate','Create a key')) + '</button>'
     + ' <button class="ghost mini" onclick="openApiHush()">' + esc(t('open.later','Not now')) + '</button>';
   el.classList.add('on');
+}
+// The launcher owns the port on a container, a compose service or the
+// Synology package: the mapping, the healthcheck and DSM's Open button all
+// name it, and nothing in here can move those. The field would otherwise
+// accept a number this installation will never bind - the API refuses it,
+// so this is the half that says WHY before anyone types one.
+//
+// The i18n key moves with the text: applyI18n() re-reads data-i18n on every
+// locale change and would otherwise put the wrong badge back.
+let portLockShown = null;
+function portLockNotice(locked){
+  locked = !!locked;
+  if (locked === portLockShown) return;   // poll runs every second
+  portLockShown = locked;
+  const inp = document.getElementById('s_port'), b = document.getElementById('s_portbadge');
+  if (!inp || !b) return;
+  inp.disabled = locked;
+  b.dataset.i18n = locked ? 'badge.portlocked' : 'badge.restart';
+  b.textContent = locked
+    ? t('badge.portlocked','set where this was started')
+    : t('badge.restart','applies after restart');
+  b.title = locked
+    ? t('badge.portlocked.title','This installation was started with its port fixed - by a container’s published port, or by the Synology package. Change it there, not here.')
+    : '';
 }
 // Session-scoped on purpose. Dismissing it forever would be a setting, and
 // this is a state that ought to nag a little.
@@ -2874,6 +2913,7 @@ async function tick(){
     // Rides the same poll as the update chip: no key set, and not the
     // operator's deliberate choice.
     openApiNotice(!!q.open_api && !q.open_optin);
+    portLockNotice(q.port_locked);
     // Reflect the daemon's limit state unless the user has the menu open.
     // A custom limit (e.g. set via the settings page or API) gets its own
     // option instead of a silently blank select.
@@ -2920,7 +2960,7 @@ async function tick(){
       const left=parseFloat(act.mbleft)||0, eta=mbps>0?left/mbps:Infinity;
       setHtml('active',
         `<div style="display:flex;justify-content:space-between;font-size:13px">
-           <span>${esc(act.filename||act.name)}</span>
+           <span style="min-width:0">${esc(act.filename||act.name)}${shapeBadge(act.archive_shape)}</span>
            <span class="dim mono">${act.percentage}% · ${t('queue.timeleft','{t} left',{t:fmtEta(eta)})}</span></div>
          <div class="bar" style="margin-top:6px"><i style="width:${act.percentage}%"></i></div>`);
     } else setHtml('active',`<span class="dim" id="idlepick" style="cursor:pointer;text-decoration:underline dotted">${t('queue.idle.drop','idle: drop a .nzb anywhere, or click here to choose one')}</span>`);
@@ -3487,7 +3527,7 @@ function renderQueue(){
       // Spotted in the NZB's file list at add time: this post is packed
       // in a format we have no unpacker for, so it will arrive complete
       // and still packed. Better said now than after the download.
-      (s.zip_packed?` <span class="warn" title="${escA(t('queue.zip.title','This post is zip-packed. It will download and verify, but zip extraction is not built in: the job ends as failed and the archive is left in the output folder for you to unpack.'))}">· ${t('queue.zip','zip-packed')}</span>`:'')+
+      (s.zip_packed?` <span class="warn" title="${escA(t('queue.zip.title','This post is zip-packed. Store and deflate zips are unpacked automatically; an encrypted one, or an unusual compression method, is left in the output folder for you to unpack.'))}">· ${t('queue.zip','zip-packed')}</span>`:'')+
       (s.prefetching?` <span class="ok" title="${escA(t('queue.prefetch.title',"Servers the active download can't use are already fetching this job - it finishes here or hands its progress over via the journal"))}">· ${t('queue.prefetching','prefetching')}${s.prefetched_mb?' '+s.prefetched_mb+' '+unit('MB'):''}</span>`:'');
     const pzLabel=s.priority==='Duplicate'
       ? `<span class="dim" title="${escA(t('queue.dup.title','An equivalent release is already downloaded or queued: this copy is held, not stuck. Raise its priority to download it anyway.'))}">· ${t('queue.dup','held (duplicate)')}</span>`
@@ -4642,8 +4682,14 @@ async function changeCat(id){
   // folder); the daemon says so in `note`, and the toast must not claim
   // a move that never happened.
   if(j.status){
+    // `moved` is null on the two no-op paths - the category was already the
+    // requested one, or the destination resolved to the current folder. The
+    // note covers the TV-filed case; otherwise only claim a move when one
+    // actually happened, since "Moved to its new folder" over an unchanged
+    // folder is the kind of small lie that costs someone a search.
     toast(j.note ? t('toast.catlabeled','Category changed - the files stayed in their shared TV folder.')
-                 : t('toast.movedto','Moved to {p}.',{p:j.path||t('toast.newfolderword','its new folder')}));
+        : j.moved ? t('toast.movedto','Moved to {p}.',{p:j.path||t('toast.newfolderword','its new folder')})
+                  : t('toast.catchanged','Category changed.'));
     tick();
   }
   else toast(tErr(j.error)||t('toast.catfail','Move failed.'), true);
@@ -5904,6 +5950,13 @@ async function loadSettings(){
   put('s_nested_max_depth', c.nested_max_depth??5);
   put('s_watch', c.watch); put('s_script', c.script);
   put('s_cleanup_exts', (c.cleanup_exts||[]).join(', '));
+  // Same focus guard as every sibling checkbox: setCfg calls loadSettings()
+  // after each successful write, so a save triggered by another control can
+  // resolve against a pre-write snapshot and flip this back under the
+  // cursor - the daemon keeps the right value while the UI shows the
+  // opposite.
+  const pcl=document.getElementById('s_par_cleanup');
+  if(document.activeElement!==pcl) pcl.checked = c.par_cleanup!==false;
   put('s_failure_link', c.failure_link||'off');
   {
     // The four preferred-version pickers are one setting; the daemon
@@ -6384,7 +6437,7 @@ function renderServers(){
     const tuneNote=(tv&&tv<s.connections)?` · <span class="dim" title="${escA(t('set.srv.tuned.title','auto-connections measured this provider is fastest at {n} sockets: more were slower. Turn off auto-connections (Connection tuning) to use your set value.',{n:tv}))}">${t('set.srv.tuned','auto-tuned to {n}',{n:tv})}</span>`:'';
     return `
     <div class="srvrow"${en?'':' style="opacity:.45"'}>
-      <span>${esc(s.host)}:${s.port}${s.tls?` <span class="dim" title="${escA(t('set.srv.tls.title','Encrypted connection to this server'))}"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg></span>`:''}${en?'':` <span class="warn">· ${t('set.srv.disabled','disabled')}</span>`}${s.level>0?` <span class="dim">· ${t('set.srv.fill','fill level {n}',{n:s.level})}</span>`:''}${s.group?` <span class="dim">· ${esc(s.group)}</span>`:''}${block}${comp}
+      <span>${esc(s.host)}:${s.port}${s.tls?` <span class="dim" title="${escA(t('set.srv.tls.title','Encrypted connection to this server'))}"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-lock"/></svg></span>`:''}${en?'':` <span class="warn">· ${t('set.srv.disabled','disabled')}</span>`}${s.level>0?` <span class="dim">· ${t('set.srv.fill','fill level {n}',{n:s.level})}</span>`:''}${s.group?` <span class="dim">· ${esc(s.group)}</span>`:''}${block}${comp}
         <span class="hint">${tn('set.srv.connsN',s.connections,'{n} connection','{n} connections')}${tuneNote}${s.username?' · '+esc(s.username):''}${s.retention_days>0?' · '+t('set.srv.retention','{n}d retention',{n:s.retention_days}):''}</span><span class="hint" id="srvtest${i}"></span></span>
       <label class="srvon" title="${escA(en?t('set.srv.disable.title','Take this server out of the pool without removing it'):t('set.srv.enable.title','Put this server back in the pool'))}"><input type="checkbox"${en?' checked':''} aria-label="${escA(t('set.srv.enable','Enable'))}" onchange="toggleServer(${i},this.checked?1:0,this)"></label>
       <button class="ghost" title="${escA(t('set.srv.test.title','Connect and authenticate to check this server is reachable'))}" onclick="testServerRow(${i},this)">${t('set.srv.test','Test')}</button>

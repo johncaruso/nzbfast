@@ -57,7 +57,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
 use crate::disk::{FileWriter, sanitize_filename};
-use crate::rar::{ArchiveMap, EntryCrypt, MapBlocker, Method, RarVersion, VolumeMapper};
+use crate::rar::{ArchiveMap, ArithGate, EntryCrypt, MapBlocker, Method, RarVersion, VolumeMapper};
 use crate::rarcrypt;
 
 // ---------------------------------------------------------------------------
@@ -1412,6 +1412,10 @@ struct Slot {
     mode: SlotMode,
     name: String,
     size: u64,
+    /// `vol_sort_key(&name)`, computed once - `reresolve` runs per volume
+    /// arrival over EVERY group slot, and recomputing the key allocated
+    /// 2-3 Strings per slot per call (quadratic on many-volume sets).
+    sort_key: Option<(u64, String)>,
     /// Pre-sniff / unmappable spans.
     holds: Vec<(u64, Vec<u8>)>,
     /// Bytes held while still Unknown (pre-classification). Bounded by
@@ -1447,6 +1451,27 @@ struct Group {
     slots: Vec<usize>,
     /// (slot, entry) → inner-file base offset, rebuilt as mappers progress.
     bases: HashMap<(usize, usize), u64>,
+    /// (slot count, numbered-mapper count, total parsed entries) at the
+    /// last `reresolve` recompute. Order and bases are pure functions of
+    /// these, so an unchanged stamp skips the sort + resolve entirely -
+    /// `reresolve` fires on every parse progression, roughly twice per
+    /// volume, and recomputing from scratch each time was O(V^2) per set.
+    resolve_stamp: Option<(usize, usize, u64)>,
+    /// (slot, entry) bases placed by the ARITHMETIC gate (uniform
+    /// single-file store sets, `ArchiveMap::resolve_arithmetic`) that
+    /// nothing else has confirmed yet: valid under the uniform premise,
+    /// but beyond what chain resolution has reached. Confirmed (removed)
+    /// when the chain independently derives the same value or when the
+    /// complete set closes at settle; a contradiction, or leftovers at
+    /// settle, demote the whole group ("non-uniform store set"). Bytes
+    /// may already sit at these offsets, so an entry here must keep its
+    /// value in `bases` until confirmed or demoted - fallback read-back
+    /// reconstructs volumes through the base each byte was WRITTEN under.
+    arith_provisional: HashMap<(usize, usize), u64>,
+    /// Latched when the arithmetic gate ever placed beyond the chain -
+    /// test introspection (the multi-file regression asserts it stays
+    /// unset on the chain path).
+    arith_ever: bool,
     fallback: bool,
     fallback_reason: Option<String>,
     /// sanitized inner-file name → actual output filename. Output files
@@ -1454,6 +1479,15 @@ struct Group {
     /// an inner name gets its own (disambiguated) file, and a fallback
     /// deletes only the files listed here - never another group's.
     out_names: HashMap<String, String>,
+    /// raw inner-file name → the child's stable Plain writer (Finding 4):
+    /// once a routed child classifies as Plain that mode never changes, so
+    /// later articles write straight to its file from the parent's job
+    /// drain instead of walking the parent-lock / child-lock /
+    /// revalidation ladder per article. `routed` stays authoritative for
+    /// fallback, finish, and merge; this cache is cleared whenever those
+    /// paths touch the route, and the post-write RarFallback recheck in
+    /// write_impl still guards the race.
+    routed_plain: HashMap<String, (usize, Arc<FileWriter>)>,
     /// sanitized inner-file name → CHILD slot, for inner files routed
     /// into the nested child extractor. Group-owned for the same reason
     /// as `out_names`: two archives reusing an inner name must not share
@@ -3016,6 +3050,11 @@ struct Inner {
     /// aborts the buffers and the worker's next upgrade fails.
     self_weak: Weak<Extractor>,
     extracted_bytes: u64,
+    /// Reusable buffer for `map_span_into` - one heap allocation per
+    /// ARTICLE under the routing lock otherwise. Taken (empty) during
+    /// `extract_span`, returned cleared; a re-entrant taker just works
+    /// on a fresh empty vector.
+    map_scratch: Vec<(usize, u64, u64, u64)>,
     /// Fallbacks of slots that never joined a group (blocker before any
     /// entry parsed) - reported alongside group fallbacks.
     slot_fallbacks: Vec<(String, String)>,
@@ -3119,6 +3158,41 @@ impl Extractor {
     /// mem summary (M15).
     pub fn holds_peak(&self) -> usize {
         self.inner.lock().unwrap().budget.peak()
+    }
+
+    /// Test hook: is every parsed piece of each named inner file placed
+    /// (a base derived for it)? Distinguishes "resolution reached these
+    /// bytes" from "the job happened to succeed".
+    #[cfg(test)]
+    pub(crate) fn bases_known(&self, names: &[&str]) -> bool {
+        let inner = self.inner.lock().unwrap();
+        for si in 0..inner.slots.len() {
+            let Some(m) = inner.slots[si].mapper.as_ref() else { continue };
+            for (ei, e) in m.entries.iter().enumerate() {
+                if !names.contains(&e.name.as_str()) || e.is_dir {
+                    continue;
+                }
+                if Self::base_for(&inner, si, ei).is_none() {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Test hook: keys of groups whose pieces the arithmetic gate ever
+    /// placed beyond what chain resolution had confirmed. The multi-file
+    /// regressions assert this stays empty - those sets must live and
+    /// die on the chain path.
+    #[cfg(test)]
+    pub(crate) fn arith_engaged_groups(&self) -> Vec<String> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .groups
+            .iter()
+            .filter(|(_, g)| g.arith_ever)
+            .map(|(k, _)| k.clone())
+            .collect()
     }
 
     /// Nested-routing gate (see `NZBFAST_NO_NESTED_ONEPASS`, latched at
@@ -3312,6 +3386,7 @@ impl Extractor {
                 promote: None,
                 self_weak: Weak::new(),
                 extracted_bytes: 0,
+                map_scratch: Vec::new(),
                 slot_fallbacks: Vec::new(),
                 protect_sources: false,
                 password,
@@ -3399,6 +3474,7 @@ impl Extractor {
             mode: SlotMode::Unknown,
             name: String::new(),
             size: 0,
+            sort_key: None,
             holds: Vec::new(),
             pre_bytes: 0,
             writer: None,
@@ -3524,8 +3600,47 @@ impl Extractor {
         repair: bool,
         article_crc: Option<u32>,
     ) -> io::Result<Persist> {
-        let mut jobs: Vec<WriteJob> = Vec::new();
-        let mut fwd: Vec<FwdSpan> = Vec::new();
+        // Per-thread scratch for the span's job/forward queues - filled
+        // under the routing lock, so their per-article allocation was
+        // lock-held. A STACK of pairs, not one pair: a forwarded span
+        // re-enters write_impl on the child extractor from this same
+        // thread, and each nesting level needs its own buffers.
+        thread_local! {
+            static SPAN_SCRATCH: std::cell::RefCell<Vec<(Vec<WriteJob>, Vec<FwdSpan>)>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let (mut jobs, mut fwd) =
+            SPAN_SCRATCH.with(|s| s.borrow_mut().pop()).unwrap_or_default();
+        let result = self.write_impl_scratched(
+            &mut jobs,
+            &mut fwd,
+            slot,
+            name,
+            size,
+            offset,
+            data,
+            repair,
+            article_crc,
+        );
+        jobs.clear();
+        fwd.clear();
+        SPAN_SCRATCH.with(|s| s.borrow_mut().push((jobs, fwd)));
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_impl_scratched(
+        &self,
+        jobs: &mut Vec<WriteJob>,
+        fwd: &mut Vec<FwdSpan>,
+        slot: usize,
+        name: &str,
+        size: u64,
+        offset: u64,
+        data: &[u8],
+        repair: bool,
+        article_crc: Option<u32>,
+    ) -> io::Result<Persist> {
         let mut pending: Vec<FwdJob> = Vec::new();
         let mut routed_rar = false;
         {
@@ -3548,7 +3663,7 @@ impl Extractor {
                         // offset-0 sniff (crucial on resume, where segment
                         // 1 may never be refetched).
                         inner.slots[slot].mode = SlotMode::Plain;
-                        self.plain_job(inner, slot, offset, data, &mut jobs)?;
+                        self.plain_job(inner, slot, offset, data, &mut *jobs)?;
                         self.drain_holds(inner, slot)?;
                     } else if offset != 0 {
                         inner.budget.add(data.len());
@@ -3585,7 +3700,7 @@ impl Extractor {
                                 slot,
                                 offset,
                                 data,
-                                Some((&mut jobs, &mut fwd)),
+                                Some((&mut *jobs, &mut *fwd)),
                                 repair,
                                 article_crc,
                             )?;
@@ -3616,13 +3731,13 @@ impl Extractor {
                                 self.shape.note(self.depth, SH_7Z | SH_MATERIALIZED);
                             }
                             inner.slots[slot].mode = SlotMode::Plain;
-                            self.plain_job(inner, slot, offset, data, &mut jobs)?;
+                            self.plain_job(inner, slot, offset, data, &mut *jobs)?;
                         }
                         self.drain_holds(inner, slot)?;
                     }
                 }
                 SlotMode::Plain | SlotMode::RarFallback => {
-                    self.plain_job(inner, slot, offset, data, &mut jobs)?;
+                    self.plain_job(inner, slot, offset, data, &mut *jobs)?;
                 }
                 SlotMode::Rar => {
                     routed_rar = true;
@@ -3631,7 +3746,7 @@ impl Extractor {
                         slot,
                         offset,
                         data,
-                        Some((&mut jobs, &mut fwd)),
+                        Some((&mut *jobs, &mut *fwd)),
                         repair,
                         article_crc,
                     )?;
@@ -3653,7 +3768,7 @@ impl Extractor {
         // takes locks up the chain and must not be called from under
         // one). Cheap and usually empty.
         self.flush_pending_promote();
-        for j in &jobs {
+        for j in jobs.iter() {
             let part = &data[j.src_start..j.src_start + j.len];
             match &j.crypto {
                 // The AES runs here, outside the routing lock, under the
@@ -3671,7 +3786,7 @@ impl Extractor {
             self.deliver_fwd(pending)?;
         }
         let mut fwd_persist: Vec<Persist> = Vec::with_capacity(fwd.len());
-        for f in &fwd {
+        for f in fwd.iter() {
             fwd_persist.push(self.deliver_routed(
                 slot,
                 offset + f.src_start as u64,
@@ -3959,6 +4074,9 @@ impl Extractor {
                     // sub-ranges of OUR span, and the child's own article
                     // boundaries are its own.
                     let p = c.write_impl(cs, name, size, file_off, bytes, repair, None)?;
+                    // Promotion probe BEFORE re-taking our lock (child and
+                    // parent locks are never nested, in either order).
+                    let promote = c.stable_plain_writer(cs);
                     let mut g = self.inner.lock().unwrap();
                     let inner = &mut *g;
                     match inner.slots[parent_slot].mode {
@@ -3968,6 +4086,16 @@ impl Extractor {
                                 Some(Dest::Child(ref c2, cs2)) if Arc::ptr_eq(c2, &c) && cs2 == cs
                             );
                             if live {
+                                // The route still points at this child and
+                                // its slot is stably Plain: later articles
+                                // skip the whole ladder (Finding 4).
+                                if let Some(w) = promote
+                                    && let Some(gk) = inner.slots[parent_slot].group.clone()
+                                    && let Some(grp) = inner.groups.get_mut(&gk)
+                                    && grp.routed.get(name) == Some(&cs)
+                                {
+                                    grp.routed_plain.insert(name.to_string(), (cs, w));
+                                }
                                 return Ok(p);
                             }
                             // Displaced mid-delivery - resolve again.
@@ -4128,10 +4256,14 @@ impl Extractor {
             let grp = inner.groups.entry(key.clone()).or_insert_with(|| Group {
                 slots: Vec::new(),
                 bases: HashMap::new(),
+                resolve_stamp: None,
+                arith_provisional: HashMap::new(),
+                arith_ever: false,
                 fallback: false,
                 fallback_reason: None,
                 out_names: HashMap::new(),
                 routed: HashMap::new(),
+                routed_plain: HashMap::new(),
                 chase: None,
             });
             grp.slots.push(slot);
@@ -4153,6 +4285,14 @@ impl Extractor {
         }
         if inner.slots[slot].mode == SlotMode::Rar {
             self.extract_span(inner, slot, offset, data, sink, repair, article_crc)?;
+        } else if matches!(inner.slots[slot].mode, SlotMode::RarFallback) {
+            // The reresolve above demoted this very group (arithmetic
+            // premise contradicted by the parse progression THIS span
+            // caused). The fallback drained the holds and read back the
+            // extracted bytes, but the current span is in neither -
+            // write it through, same as the blocker routes above (the
+            // already-stashed header part rewrites identical bytes).
+            self.plain_span(inner, slot, offset, data)?;
         }
         Ok(())
     }
@@ -4251,10 +4391,14 @@ impl Extractor {
         let grp = inner.groups.entry(key.clone()).or_insert_with(|| Group {
             slots: Vec::new(),
             bases: HashMap::new(),
+            resolve_stamp: None,
+            arith_provisional: HashMap::new(),
+            arith_ever: false,
             fallback: false,
             fallback_reason: None,
             out_names: HashMap::new(),
             routed: HashMap::new(),
+            routed_plain: HashMap::new(),
             chase: None,
         });
         if grp.fallback {
@@ -4537,7 +4681,7 @@ impl Extractor {
         let pw: Option<Vec<u8>> = password.map(|p| p.as_bytes().to_vec());
         let result = rars::rar50::extract_volume_sequence_to(
             |index| Self::chase_next_volume(&ctl, index, pw.as_deref()),
-            rars::ArchiveReadOptions::with_optional_password(pw.as_deref()),
+            crate::mem::rar_read_options(pw.as_deref()),
             |meta| Self::chase_open_sink(&me, &ctl, &key, meta),
         );
         let mut st = ctl.shared.lock().unwrap();
@@ -4574,7 +4718,7 @@ impl Extractor {
         let archive = rars::rar50::Archive::parse_stream(
             buf as Arc<dyn rars::BlockingRangeSource>,
             len,
-            rars::ArchiveReadOptions::with_optional_password(password),
+            crate::mem::rar_read_options(password),
         )?;
         // Record member sizes: the engine's open callback carries no
         // size, the parsed headers do (split parts repeat the total -
@@ -5225,14 +5369,38 @@ impl Extractor {
         slot: usize,
         offset: u64,
         data: &[u8],
-        mut sink: Option<(&mut Vec<WriteJob>, &mut Vec<FwdSpan>)>,
+        sink: Option<(&mut Vec<WriteJob>, &mut Vec<FwdSpan>)>,
         repair: bool,
         article_crc: Option<u32>,
     ) -> io::Result<()> {
-        let hits = {
+        // Reuse the Inner-owned hit buffer: this runs under the routing
+        // lock for every article, and the per-article Vec was measurable
+        // allocator traffic. A re-entrant call (fallback re-feed) takes
+        // an empty fresh vector and simply allocates like before.
+        let mut hits = std::mem::take(&mut inner.map_scratch);
+        {
             let m = inner.slots[slot].mapper.as_ref().unwrap();
-            m.map_span(offset, data.len() as u64)
-        };
+            m.map_span_into(offset, data.len() as u64, &mut hits);
+        }
+        let result =
+            self.extract_span_hits(inner, slot, offset, data, sink, repair, article_crc, &hits);
+        hits.clear();
+        inner.map_scratch = hits;
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn extract_span_hits(
+        &self,
+        inner: &mut Inner,
+        slot: usize,
+        offset: u64,
+        data: &[u8],
+        mut sink: Option<(&mut Vec<WriteJob>, &mut Vec<FwdSpan>)>,
+        repair: bool,
+        article_crc: Option<u32>,
+        hits: &[(usize, u64, u64, u64)],
+    ) -> io::Result<()> {
         // The yEnc decode already computed and CHECKED this article's
         // CRC32 over exactly these bytes. When the article maps to a
         // single STORE data range covering the whole buffer, that value
@@ -5252,12 +5420,12 @@ impl Extractor {
         // single hit spanning the whole buffer is what makes the mapped
         // range byte-for-byte the decoded output.
         let single_whole_hit = matches!(
-            hits.as_slice(),
+            hits,
             [(_, _, 0, len)] if *len == data.len() as u64
         );
         let whole_article = single_whole_hit && !repair && article_crc.is_some();
         let mut covered_end = offset;
-        for (ei, piece_off, span_off, len) in hits {
+        for &(ei, piece_off, span_off, len) in hits {
             covered_end = covered_end.max(offset + span_off + len);
             let base = match Self::base_for(inner, slot, ei) {
                 Some(b) => b,
@@ -5271,11 +5439,15 @@ impl Extractor {
                     continue;
                 }
             };
-            let (name, total, encrypted, checkable) = {
+            // POD fields only - the entry NAME stays in the mapper and the
+            // routing lookups borrow it in place (route_dest/crypto_for key
+            // by (slot, ei)). Cloning it here cost a String per article
+            // under the routing lock; only the child-forward arms, which
+            // queue owned work, still materialize one.
+            let (total, encrypted, checkable) = {
                 let m = inner.slots[slot].mapper.as_ref().unwrap();
                 let e = &m.entries[ei];
                 (
-                    e.name.clone(),
                     e.unpacked_size,
                     e.encrypted,
                     matches!(e.method, Method::Store) && !e.encrypted && !e.is_dir,
@@ -5302,7 +5474,7 @@ impl Extractor {
                     runs.add(piece_off, part);
                 }
             }
-            match self.route_dest(inner, slot, &name, total, encrypted)? {
+            match self.route_dest(inner, slot, ei, total, encrypted)? {
                 Dest::Writer(w) => {
                     // Plaintext-once: an encrypted store span decrypts at
                     // write time instead of assembling ciphertext for the
@@ -5310,7 +5482,7 @@ impl Extractor {
                     // parameters; a continuation piece racing its head
                     // volume's headers holds like an unresolved base.
                     let crypto = if encrypted && inner.instream_decrypt {
-                        match Self::crypto_for(inner, slot, &name, &w) {
+                        match Self::crypto_for(inner, slot, ei, &w) {
                             Some(cs) => {
                                 // Plaintext-once is live for this set:
                                 // the badge says "one-pass", not
@@ -5359,29 +5531,32 @@ impl Extractor {
                         }
                     }
                 }
-                Dest::Child(..) => match sink.as_mut() {
-                    Some((_, fwd)) => fwd.push(FwdSpan {
-                        name,
-                        size: total,
-                        file_off: base + piece_off,
-                        src_start: span_off as usize,
-                        len: len as usize,
-                        repair,
-                    }),
-                    // Under-the-lock re-feed: the child cannot be called
-                    // here (it defers pwrites behind its own lock), so
-                    // queue an owned copy for flush_pending_fwd. Cold
-                    // paths only - the hot write path always has a sink.
-                    None => inner.pending_fwd.push(FwdJob {
-                        parent_slot: slot,
-                        vol_off: offset + span_off,
-                        name,
-                        size: total,
-                        file_off: base + piece_off,
-                        bytes: data[span_off as usize..(span_off + len) as usize].to_vec(),
-                        repair,
-                    }),
-                },
+                Dest::Child(..) => {
+                    let name = Self::entry_name(inner, slot, ei).to_string();
+                    match sink.as_mut() {
+                        Some((_, fwd)) => fwd.push(FwdSpan {
+                            name,
+                            size: total,
+                            file_off: base + piece_off,
+                            src_start: span_off as usize,
+                            len: len as usize,
+                            repair,
+                        }),
+                        // Under-the-lock re-feed: the child cannot be called
+                        // here (it defers pwrites behind its own lock), so
+                        // queue an owned copy for flush_pending_fwd. Cold
+                        // paths only - the hot write path always has a sink.
+                        None => inner.pending_fwd.push(FwdJob {
+                            parent_slot: slot,
+                            vol_off: offset + span_off,
+                            name,
+                            size: total,
+                            file_off: base + piece_off,
+                            bytes: data[span_off as usize..(span_off + len) as usize].to_vec(),
+                            repair,
+                        }),
+                    }
+                }
             }
             inner.extracted_bytes += len;
         }
@@ -5406,16 +5581,26 @@ impl Extractor {
     /// headers have not been seen (the caller holds the span) or when no
     /// usable key exists - the latter cannot normally happen, because an
     /// encrypted entry only maps after the stored password check passed.
+    /// The RAW entry name behind `(slot, ei)` - the routing key. Borrowed
+    /// in place: the article hot path must not clone a String per span.
+    fn entry_name(inner: &Inner, slot: usize, ei: usize) -> &str {
+        &inner.slots[slot].mapper.as_ref().unwrap().entries[ei].name
+    }
+
     fn crypto_for(
         inner: &mut Inner,
         slot: usize,
-        name: &str,
+        ei: usize,
         w: &Arc<FileWriter>,
     ) -> Option<Arc<CryptoState>> {
-        let key = w.path.file_name()?.to_string_lossy().into_owned();
-        if let Some(cs) = inner.crypto_files.get(&key) {
+        // Borrowed lookup first: the state exists for every span after
+        // the first, and owning the key cost a String per encrypted span.
+        let key = w.path.file_name()?.to_string_lossy();
+        if let Some(cs) = inner.crypto_files.get(key.as_ref()) {
             return Some(cs.clone());
         }
+        let key = key.into_owned();
+        let name = Self::entry_name(inner, slot, ei);
         // Find the head piece (split_before == false) of this file - it
         // may live in another volume's mapper within the same group.
         let head_of = |m: &VolumeMapper| {
@@ -5482,7 +5667,7 @@ impl Extractor {
         &self,
         inner: &mut Inner,
         slot: usize,
-        name: &str,
+        ei: usize,
         total: u64,
         encrypted: bool,
     ) -> io::Result<Dest> {
@@ -5497,30 +5682,54 @@ impl Extractor {
         // Reaching here means the fast path owns this inner file - its
         // bytes go straight to their destination and the volumes never
         // land. That is what "one-pass" on the badge means.
+        //
+        // This runs per span under the routing lock: the lookups below
+        // borrow the group key and entry name in place (cloning them cost
+        // two Strings per article); only the once-per-file route insert
+        // owns anything.
         self.shape.note(self.depth, SH_ONE_PASS);
-        let key = name;
-        if let Some(gk) = inner.slots[slot].group.clone() {
-            if let Some(&cs) = inner.groups.get(&gk).and_then(|g| g.routed.get(key)) {
+        let mut route_new = None;
+        if let Some(gk) = inner.slots[slot].group.as_ref() {
+            let key = Self::entry_name(inner, slot, ei);
+            // Promoted plain child: write straight to its file. The route
+            // still exists in `routed` for fallback/finish; only the hot
+            // path skips the child extractor.
+            // `!encrypted` is load-bearing, not belt-and-braces. Under the
+            // pre-promotion ladder a name in `routed` returned Dest::Child,
+            // and the Child arm has no crypto handling at all, so an
+            // encrypted span could never reach a decrypt path through a
+            // routed name. Promotion turns the same name into Dest::Writer,
+            // which DOES run the in-stream decrypt arm (instream_decrypt
+            // defaults on). An archive where one raw name appears as a plain
+            // STORE piece in one volume and an encrypted one in another would
+            // then have the parent create a CryptoState keyed by a
+            // child-owned filename, journal E/K/T records for a file it does
+            // not own, and AES-decrypt into the child's plain output. Falling
+            // through to the Child arm keeps the old structural exclusion.
+            if !encrypted {
+                if let Some((_, w)) = inner.groups.get(gk).and_then(|g| g.routed_plain.get(key)) {
+                    return Ok(Dest::Writer(Arc::clone(w)));
+                }
+            }
+            if let Some(&cs) = inner.groups.get(gk).and_then(|g| g.routed.get(key)) {
                 let c = inner.child.clone().expect("routed name without a child");
                 return Ok(Dest::Child(c, cs));
             }
             let already_written = inner
                 .groups
-                .get(&gk)
+                .get(gk)
                 .is_some_and(|g| g.out_names.contains_key(key));
             if !already_written && inner.nested_on && !encrypted {
-                let child = self.ensure_child(inner);
-                let cs = child.alloc_slot();
-                inner
-                    .groups
-                    .get_mut(&gk)
-                    .unwrap()
-                    .routed
-                    .insert(key.to_string(), cs);
-                return Ok(Dest::Child(child, cs));
+                route_new = Some((gk.clone(), key.to_string()));
             }
         }
-        Ok(Dest::Writer(self.inner_writer(inner, slot, name, total)?))
+        if let Some((gk, key)) = route_new {
+            let child = self.ensure_child(inner);
+            let cs = child.alloc_slot();
+            inner.groups.get_mut(&gk).unwrap().routed.insert(key, cs);
+            return Ok(Dest::Child(child, cs));
+        }
+        Ok(Dest::Writer(self.inner_writer(inner, slot, ei, total)?))
     }
 
     /// The output writer for `name` as seen by `slot`'s group. Output
@@ -5533,16 +5742,19 @@ impl Extractor {
         &self,
         inner: &mut Inner,
         slot: usize,
-        name: &str,
+        ei: usize,
         total: u64,
     ) -> io::Result<Arc<FileWriter>> {
         // Keyed on the RAW name (see route_dest); the sanitized form is only
         // the on-disk filename. Distinct raw names that sanitize alike get
         // distinct writers (claim_name disambiguates the on-disk name).
-        let key = name;
-        let fname = sanitize_filename(name);
-        let gkey = inner.slots[slot].group.clone();
-        match &gkey {
+        //
+        // The existing-writer lookups run per span under the routing lock
+        // (encrypted sets never route to a child, so THIS is their hot
+        // path) and borrow the key and group in place; only the
+        // once-per-file creation below owns strings.
+        let key = Self::entry_name(inner, slot, ei);
+        match inner.slots[slot].group.as_ref() {
             Some(gk) => {
                 if let Some(out) = inner.groups.get(gk).and_then(|g| g.out_names.get(key)) {
                     if let Some(w) = inner.inner_writers.get(out) {
@@ -5551,12 +5763,15 @@ impl Extractor {
                 }
             }
             None => {
-                if let Some(w) = inner.inner_writers.get(&fname) {
+                if let Some(w) = inner.inner_writers.get(sanitize_filename(key).as_str()) {
                     return Ok(w.clone());
                 }
             }
         }
-        let mut out = fname.clone();
+        let key = key.to_string();
+        let fname = sanitize_filename(&key);
+        let gkey = inner.slots[slot].group.clone();
+        let mut out = fname;
         Self::claim_name(inner, slot, &mut out);
         let path = self.out_dir.join(&out);
         // `total` is the entry's declared `unpacked_size` - an untrusted
@@ -5578,7 +5793,7 @@ impl Extractor {
         inner.inner_writers.insert(out.clone(), w.clone());
         if let Some(gk) = gkey {
             if let Some(g) = inner.groups.get_mut(&gk) {
-                g.out_names.insert(key.to_string(), out);
+                g.out_names.insert(key, out);
             }
         }
         Ok(w)
@@ -5612,10 +5827,13 @@ impl Extractor {
     /// group alone.
     fn delete_group_out_files(inner: &mut Inner, key: &str) {
         let (outs, routed): (Vec<String>, Vec<usize>) = match inner.groups.get_mut(key) {
-            Some(g) => (
-                g.out_names.drain().map(|(_, v)| v).collect(),
-                g.routed.drain().map(|(_, v)| v).collect(),
-            ),
+            Some(g) => {
+                g.routed_plain.clear();
+                (
+                    g.out_names.drain().map(|(_, v)| v).collect(),
+                    g.routed.drain().map(|(_, v)| v).collect(),
+                )
+            }
             None => return,
         };
         for out in outs {
@@ -5780,6 +5998,11 @@ impl Extractor {
             // still read back what the moved slots already extracted;
             // reresolve rebuilds them anyway on the next progress.
             g.bases.extend(old.bases);
+            // Arithmetic exposure travels with the slots: bytes the
+            // moved group placed under the uniform premise still need
+            // confirming - or demoting - in the merged group.
+            g.arith_provisional.extend(old.arith_provisional);
+            g.arith_ever |= old.arith_ever;
             for (k, v) in old.out_names {
                 g.out_names.entry(k).or_insert(v);
             }
@@ -5787,6 +6010,9 @@ impl Extractor {
             // routed the same inner name (they were one archive all
             // along), the loser's partial child slot is abandoned so no
             // stray half-file survives the merge.
+            // Promotions do not survive a merge: the winning route may
+            // differ, and repromotion after the next delivery is cheap.
+            g.routed_plain.clear();
             for (k, v) in old.routed {
                 match g.routed.entry(k) {
                     std::collections::hash_map::Entry::Occupied(_) => displaced.push(v),
@@ -5831,59 +6057,45 @@ impl Extractor {
     /// naming (.partNN / .rar,.rNN); resolution walks the sorted list only
     /// while the indexes stay consecutive.
     fn reresolve(&self, inner: &mut Inner, key: &str) -> io::Result<()> {
+        // A fallen-back group has nothing left to resolve: every slot is
+        // materialized (drain below would no-op) and recomputing bases
+        // would only churn the arithmetic gate against a dead group.
+        if inner.groups[key].fallback {
+            return Ok(());
+        }
         let slots = inner.groups[key].slots.clone();
-        let all_numbered = slots.iter().all(|&si| {
-            inner.slots[si]
-                .mapper
-                .as_ref()
-                .is_some_and(|m| m.volume_number.is_some())
-        });
-        let mut keyed: Vec<(Option<u64>, (u64, String), usize)> = slots
-            .iter()
-            .map(|&si| {
-                let s = &inner.slots[si];
-                let name_key = vol_sort_key(&s.name);
-                let idx = if all_numbered {
-                    s.mapper.as_ref().unwrap().volume_number
-                } else if name_key.0 != u64::MAX {
-                    Some(name_key.0)
-                } else {
-                    None
-                };
-                (idx, name_key, si)
-            })
-            .collect();
-        keyed.sort();
-
-        // Longest consecutive-index prefix (must have known indexes).
-        let mut prefix: Vec<usize> = Vec::new();
-        let mut prev: Option<u64> = None;
-        for (idx, _, si) in &keyed {
-            match (idx, prev) {
-                (Some(k), None) => {
-                    prefix.push(*si);
-                    prev = Some(*k);
+        // Order and bases are pure functions of the slot set, which
+        // mappers carry volume numbers, and how many entries have parsed;
+        // when none of that moved since the last recompute (this fires on
+        // every parse progression, roughly twice per volume), only the
+        // held-span re-feed below still has work to do.
+        let mut numbered = 0usize;
+        let mut total_entries = 0u64;
+        for &si in &slots {
+            if let Some(m) = inner.slots[si].mapper.as_ref() {
+                if m.volume_number.is_some() {
+                    numbered += 1;
                 }
-                (Some(k), Some(p)) if *k == p + 1 => {
-                    prefix.push(*si);
-                    prev = Some(*k);
-                }
-                _ => break,
+                total_entries += m.entries.len() as u64;
             }
         }
-        let mappers: Vec<&VolumeMapper> = prefix
-            .iter()
-            .map(|&si| inner.slots[si].mapper.as_ref().unwrap())
-            .collect();
-        let resolved = ArchiveMap::resolve(&mappers);
-        let mut bases = HashMap::new();
-        for ((vi, ei), b) in resolved.bases {
-            bases.insert((prefix[vi], ei), b);
+        let stamp = (slots.len(), numbered, total_entries);
+        if inner.groups[key].resolve_stamp != Some(stamp) {
+            // Either contradiction demotes, and the reason distinguishes
+            // them: an arithmetic placement the chain has now disproved,
+            // or headers that disagree with THEMSELVES about where a
+            // piece sits. `group.bases` still holds the offsets any
+            // written bytes went to, which is exactly what the fallback
+            // read-back reconstructs the volumes through.
+            if let Some(why) = self.reresolve_recompute(inner, key, &slots, stamp) {
+                return self.fallback_group(inner, key, why);
+            }
         }
-        inner.groups.get_mut(key).unwrap().bases = bases;
 
         for si in slots {
-            if inner.slots[si].mode == SlotMode::Rar {
+            if inner.slots[si].mode == SlotMode::Rar
+                && (!inner.slots[si].holds.is_empty() || inner.slots[si].pre_bytes != 0)
+            {
                 // Full re-feed, not just re-extraction: a held span may
                 // carry block-HEADER bytes that arrived while the parse
                 // window was elsewhere (the mapper's stash only keeps
@@ -5893,6 +6105,196 @@ impl Extractor {
             }
         }
         Ok(())
+    }
+
+    /// The recompute half of [`Self::reresolve`]: arithmetic placement
+    /// first (uniform single-file store sets are placeable under any
+    /// arrival order), else sort the volumes, find the consecutive
+    /// prefix, resolve split bases across it.
+    ///
+    /// Returns the demote reason when the group must fall back, or None.
+    /// (The caller demotes; this half only computes.)
+    ///
+    /// One invariant carries the whole safety argument: a base that was
+    /// EXPOSED - installed in `group.bases`, where a span may have been
+    /// written through it - never changes value and never disappears
+    /// while the group can still demote. Arithmetic values inside the
+    /// consecutive-from-0 volume run equal what chain resolution derives
+    /// (uniform `data_len` makes both `volnum * data_len`), so switching
+    /// between the two modes never moves an exposed base; placements
+    /// BEYOND the run are tracked in `arith_provisional` until the chain
+    /// confirms them, the closed set proves them (settle), or a
+    /// contradiction demotes the group with the bases still intact for
+    /// read-back.
+    fn reresolve_recompute(
+        &self,
+        inner: &mut Inner,
+        key: &str,
+        slots: &[usize],
+        stamp: (usize, usize, u64),
+    ) -> Option<&'static str> {
+        // Arithmetic mode: every group slot has parsed entries (group
+        // membership starts at first-entry parse), so `slots` IS the
+        // parsed set; the gate re-checks the full premise on every
+        // recompute as volumes arrive.
+        let gate = {
+            let mappers: Vec<&VolumeMapper> = slots
+                .iter()
+                .filter_map(|&si| inner.slots[si].mapper.as_ref())
+                .filter(|m| !m.entries.is_empty())
+                .collect();
+            if mappers.len() == slots.len() {
+                ArchiveMap::resolve_arithmetic(&mappers)
+            } else {
+                ArithGate::Shape
+            }
+        };
+        match gate {
+            ArithGate::Place { bases, .. } => {
+                // Pieces inside the consecutive-from-0 volume run carry
+                // the same base the chain would derive; only pieces
+                // beyond it rest on the (unconfirmed) uniform premise.
+                let vols: Vec<u64> = slots
+                    .iter()
+                    .map(|&si| {
+                        inner.slots[si].mapper.as_ref().unwrap().volume_number.unwrap()
+                    })
+                    .collect();
+                let mut sorted = vols.clone();
+                sorted.sort_unstable();
+                let mut run_end = 0u64;
+                for v in sorted {
+                    if v == run_end {
+                        run_end += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let mut new_bases = HashMap::new();
+                let mut provisional = HashMap::new();
+                for (i, &si) in slots.iter().enumerate() {
+                    // The gate guarantees exactly one entry per volume.
+                    new_bases.insert((si, 0), bases[i]);
+                    if vols[i] >= run_end {
+                        provisional.insert((si, 0), bases[i]);
+                    }
+                }
+                let group = inner.groups.get_mut(key).unwrap();
+                group.bases = new_bases;
+                group.arith_ever |= !provisional.is_empty();
+                group.arith_provisional = provisional;
+                group.resolve_stamp = Some(stamp);
+                return None;
+            }
+            // The set looked uniform single-file, bytes were placed on
+            // that premise, and the numbers now contradict it: those
+            // placements are suspect and nothing can confirm them.
+            // Demote whole (never a partial mix of placements) - the
+            // volumes hold the truth and unrar takes over. With no
+            // provisional placements the premise never mattered: fall
+            // through to the chain, today's behavior.
+            ArithGate::Numbers if !inner.groups[key].arith_provisional.is_empty() => {
+                return Some("non-uniform store set");
+            }
+            ArithGate::Numbers | ArithGate::Shape => {}
+        }
+        let all_numbered = stamp.1 == slots.len();
+        let mut keyed: Vec<(Option<u64>, (u64, &str), usize)> = slots
+            .iter()
+            .map(|&si| {
+                if inner.slots[si].sort_key.is_none() {
+                    let computed = vol_sort_key(&inner.slots[si].name);
+                    inner.slots[si].sort_key = Some(computed);
+                }
+                (si, inner.slots[si].mapper.as_ref().and_then(|m| m.volume_number))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|(si, volume_number)| {
+                let (num, lower) = inner.slots[si].sort_key.as_ref().unwrap();
+                let idx = if all_numbered {
+                    volume_number
+                } else if *num != u64::MAX {
+                    Some(*num)
+                } else {
+                    None
+                };
+                (idx, (*num, lower.as_str()), si)
+            })
+            .collect();
+        keyed.sort();
+
+        // EVERY volume that has an index, not just a consecutive run
+        // from the first one. Resolution decides adjacency per
+        // neighbouring pair, so an island of volumes away from volume 0
+        // now resolves on its own - which is what lets a season pack's
+        // later episodes place before its opening volumes have arrived.
+        // Slots with no index (unnumbered, dotless RAR4) still place
+        // their file-STARTING pieces: `base_for` answers 0 for those
+        // without consulting this map at all.
+        let placed: Vec<usize> = keyed.iter().filter_map(|(i, _, si)| i.map(|_| *si)).collect();
+        let indexed: Vec<(u64, &VolumeMapper)> = keyed
+            .iter()
+            .filter_map(|(i, _, si)| {
+                i.map(|idx| (idx, inner.slots[*si].mapper.as_ref().unwrap()))
+            })
+            .collect();
+        let resolved = ArchiveMap::resolve_indexed(&indexed);
+        let chain_contradiction = resolved.contradiction;
+        let mut bases = HashMap::new();
+        for ((vi, ei), b) in resolved.bases {
+            bases.insert((placed[vi], ei), b);
+        }
+        let group = inner.groups.get_mut(key).unwrap();
+        // Arithmetic afterlife: earlier arithmetic placements the chain
+        // has now independently derived are confirmed; a differing chain
+        // value contradicts them (demote - and keep the WRITTEN base in
+        // `bases` so fallback read-back stays byte-exact); the rest stay
+        // provisional, their exposed base preserved, until the chain
+        // reaches them or settle rules on the leftovers.
+        let mut contradicted = false;
+        group.arith_provisional.retain(|k, pv| match bases.get(k) {
+            Some(cv) if cv == pv => false,
+            Some(_) => {
+                contradicted = true;
+                true
+            }
+            None => true,
+        });
+        for (k, pv) in &group.arith_provisional {
+            bases.insert(*k, *pv);
+        }
+        group.bases = bases;
+        group.resolve_stamp = Some(stamp);
+        if contradicted {
+            return Some("non-uniform store set");
+        }
+        if chain_contradiction {
+            // A piece was reachable from both neighbours and the two
+            // answers differed: the headers cannot all be true, so no
+            // offset here is trustworthy.
+            return Some("inconsistent volume chain");
+        }
+        None
+    }
+
+    /// The slot's writer, if it has stably classified as a plain file:
+    /// mode Plain, writer created, no held spans, no chase or 7z engine.
+    /// Plain is terminal for a slot, so a caller may cache the writer
+    /// (Finding 4); takes only OUR lock, so callers must not hold any
+    /// other extractor's lock (parent<->child nesting deadlocks).
+    fn stable_plain_writer(&self, slot: usize) -> Option<Arc<FileWriter>> {
+        let inner = self.inner.lock().unwrap();
+        let s = inner.slots.get(slot)?;
+        if s.mode == SlotMode::Plain
+            && s.holds.is_empty()
+            && s.chase.is_none()
+            && s.sevenz.is_none()
+        {
+            s.writer.clone()
+        } else {
+            None
+        }
     }
 
     /// Flush held spans through the slot's current mode.
@@ -6995,6 +7397,14 @@ impl Extractor {
         let mut inner = self.inner.lock().unwrap();
         if inner.slots[slot].writer.is_none() {
             inner.slots[slot].name = new_name.to_string();
+            // `sort_key` caches vol_sort_key(name), so renaming without
+            // clearing it freezes the PRE-rename ordering for the life of the
+            // slot - and `resolve_stamp` does not include the name either, so
+            // a later parse progression would not recompute it. Latent today
+            // (an obfuscated name sorts as u64::MAX, so the group has already
+            // fallen back to materialize+unrar by the time PAR2 renames it),
+            // but the cache is only safe if every mutator invalidates.
+            inner.slots[slot].sort_key = None;
         }
     }
 
@@ -7046,6 +7456,82 @@ impl Extractor {
             c.settle_unclassified()?;
         }
         Ok(())
+    }
+
+    /// Close the OS handle on every output file this extractor holds, at this
+    /// level and every nested one, so an EXTERNAL process can open them
+    /// exclusively. Pair with [`unpark_outputs`] - always, and on every exit
+    /// path - and see [`FileWriter::park`] for what parking does and does not
+    /// disturb.
+    ///
+    /// This exists for the external-par2 repair fallback: par2cmdline opens
+    /// its targets with share mode 0, so on Windows any handle we still hold
+    /// makes its open fail and it reports the file missing and declines to
+    /// repair (measured: `Could not open "payload.bin"` → `Target: missing` →
+    /// `Repair is not possible`). Nested levels wrote into the same tree and
+    /// pin it too, hence the recursion.
+    ///
+    /// Needed because [`finish`] syncs the writers but KEEPS them: the
+    /// extractor holds output handles for the streaming endpoint's benefit,
+    /// and it stays alive well past completion (the daemon leaves it installed
+    /// for post-completion streaming, and the fetch task holds its own `Arc`
+    /// until it returns). So the handles are still there at repair time, which
+    /// runs BEFORE `finish` - and that ordering is why these park rather than
+    /// close: `finish` has yet to settle groups, verify inner CRCs and run the
+    /// decrypt pass, all of which need live writers.
+    ///
+    /// Deliberately NOT used for the Windows folder rename that first
+    /// motivated closing handles at all: that went in as
+    /// `smart::move_dir_contents`, which moves the directory's CONTENTS and
+    /// needs no handles closed. Parking is visible to a concurrent /stream
+    /// read (it gets `NotConnected` instead of bytes), which is the honest
+    /// answer while an external tool rewrites those very bytes, but it is not
+    /// something to inflict on a path that has a handle-free alternative.
+    ///
+    /// [`unpark_outputs`]: Extractor::unpark_outputs
+    /// [`FileWriter::park`]: crate::disk::FileWriter::park
+    pub fn park_outputs(&self) -> io::Result<()> {
+        self.each_output(&|w| w.park())
+    }
+
+    /// Reopen everything [`park_outputs`] closed, at this level and every
+    /// nested one. Idempotent, so it is safe to call on an error path that may
+    /// or may not have parked.
+    ///
+    /// [`park_outputs`]: Extractor::park_outputs
+    pub fn unpark_outputs(&self) -> io::Result<()> {
+        self.each_output(&|w| w.unpark())
+    }
+
+    /// Apply `f` to every live output writer at this level and below,
+    /// attempting ALL of them and returning the first error. Attempting all
+    /// matters on the unpark side: bailing at the first failure would leave
+    /// the rest of the tree parked and every later write to them failing.
+    fn each_output(&self, f: &dyn Fn(&FileWriter) -> io::Result<()>) -> io::Result<()> {
+        let (writers, child) = {
+            let g = self.inner.lock().unwrap();
+            let mut ws: Vec<Arc<FileWriter>> = g.inner_writers.values().cloned().collect();
+            ws.extend(g.slots.iter().filter_map(|s| s.writer.clone()));
+            (ws, g.child.clone())
+        };
+        // Cloned out from under the lock: park/unpark do file I/O (an fsync on
+        // a multi-GB output is not instant), and holding the routing lock
+        // across it would block the daemon's stats and stream calls.
+        let mut first_err: Option<io::Error> = None;
+        for w in &writers {
+            if let Err(e) = f(w) {
+                first_err.get_or_insert(e);
+            }
+        }
+        if let Some(c) = child {
+            if let Err(e) = c.each_output(f) {
+                first_err.get_or_insert(e);
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// End-of-download: settle groups that never finished mapping, flush
@@ -7587,6 +8073,37 @@ impl Extractor {
             });
             if (has_holds || incomplete) && !inner.groups[key].fallback {
                 self.fallback_group(inner, key, "incomplete mapping at end of download")?;
+            }
+        }
+        // Arithmetic placements still provisional at end of download:
+        // the CLOSED set (volumes 0..=last all parsed, uniform, ending
+        // in the declared final piece) is itself the proof the premise
+        // demanded - confirm and clear. Anything else means bytes sit at
+        // offsets only an unproven premise justifies (a volume missing
+        // from the NZB, or shape-fail leftovers the chain never
+        // reached): demote whole, the volumes hold the truth.
+        for key in &keys {
+            if inner.groups[key].fallback || inner.groups[key].arith_provisional.is_empty() {
+                continue;
+            }
+            let closed = {
+                let g = &inner.groups[key];
+                let mappers: Vec<&VolumeMapper> = g
+                    .slots
+                    .iter()
+                    .filter_map(|&si| inner.slots[si].mapper.as_ref())
+                    .filter(|m| !m.entries.is_empty())
+                    .collect();
+                mappers.len() == g.slots.len()
+                    && matches!(
+                        ArchiveMap::resolve_arithmetic(&mappers),
+                        ArithGate::Place { closed: true, .. }
+                    )
+            };
+            if closed {
+                inner.groups.get_mut(key).unwrap().arith_provisional.clear();
+            } else {
+                self.fallback_group(inner, key, "non-uniform store set")?;
             }
         }
         for si in 0..inner.slots.len() {
@@ -8710,6 +9227,9 @@ mod tests {
         feed(&ex, 0, "bbb.bin", &vols[0], 9000, 52);
         feed(&ex, 1, "aaa.bin", &vols[1], 9000, 53);
         let rep = ex.finish().unwrap();
+        // Multi-file sets live and die on the CHAIN path: the arithmetic
+        // gate must never have placed beyond it here.
+        assert!(ex.arith_engaged_groups().is_empty(), "{:?}", ex.arith_engaged_groups());
         assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
         assert_eq!(
             rep.extracted,
@@ -8821,6 +9341,12 @@ mod tests {
                 feed(&ex, vi, &name, &vols[vi], 7000, 40 + vi as u64);
             }
             let rep = ex.finish().unwrap();
+            // No engagement assert here (unlike the §7 test above): when
+            // the boundary volume's E01-tail parses alone, it is a lone
+            // FINAL piece and the gate may transiently place it at
+            // `total - data_len` - which is the true base of any split
+            // file's final piece, so the chain confirms it and the
+            // one-pass outcome below is what actually matters.
             assert!(rep.fallbacks.is_empty(), "order {order:?}: {:?}", rep.fallbacks);
             assert_eq!(
                 rep.extracted,
@@ -8841,6 +9367,645 @@ mod tests {
             assert_eq!(files.len(), 2, "order {order:?}: {files:?}");
             std::fs::remove_dir_all(&dir).unwrap();
         }
+    }
+
+    /// Uniform single-file RAR5 STORE set for the arithmetic-gate tests
+    /// (SPEC-onepass-obfuscated-store-sets Part A): `n_full` volumes of
+    /// `dl` payload bytes plus a smaller final piece, dotless
+    /// hash-garbage volume names whose lexical order is unrelated to
+    /// volume order, per-piece CRCs the way real archivers write them.
+    fn uniform_store_set(
+        inner_name: &str,
+        dl: usize,
+        n_full: usize,
+        tail: usize,
+        seed: u8,
+    ) -> (Vec<u8>, Vec<Vec<u8>>, Vec<String>) {
+        // WinRAR-true geometry: the VOLUME size is constant, so volume 0
+        // (whose main header has no volume-number field) carries one
+        // byte MORE data than volumes 1..127. The gate validates exactly
+        // this, so the fixture must honor it.
+        let total = (dl + 1) + (n_full - 1) * dl + tail;
+        let data = payload(total, seed);
+        let mut vols = Vec::new();
+        let mut pos = 0usize;
+        for k in 0..n_full {
+            let len = if k == 0 { dl + 1 } else { dl };
+            let piece = &data[pos..pos + len];
+            pos += len;
+            vols.push(fixtures::rar5_volume_n_crc(
+                &[(inner_name, total as u64, piece, k > 0, true, Some(crc32fast::hash(piece)))],
+                k as u64,
+            ));
+        }
+        vols.push(fixtures::rar5_volume_n_crc(
+            &[(
+                inner_name,
+                total as u64,
+                &data[pos..],
+                true,
+                false,
+                Some(crc32fast::hash(&data)),
+            )],
+            n_full as u64,
+        ));
+        let names = (0..vols.len())
+            .map(|k| format!("{:06x}NoDotGarbage{k}", (k as u64 * 2654435761) & 0xffffff))
+            .collect();
+        (data, vols, names)
+    }
+
+    /// Deterministic volume-order shuffle with volume 0 forced LAST, so
+    /// the consecutive-from-0 chain can close nothing until the very end
+    /// of the download - the arrival shape that demoted the live 143-
+    /// volume remux.
+    fn shuffled_zero_last(n: usize, seed: u64) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..n).collect();
+        let mut state = seed;
+        for i in (1..order.len()).rev() {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            order.swap(i, (state >> 33) as usize % (i + 1));
+        }
+        let z = order.iter().position(|&v| v == 0).unwrap();
+        let last = order.len() - 1;
+        order.swap(z, last);
+        order
+    }
+
+    /// SPEC Part A acceptance 1 + 7: a 45-volume uniform single-file
+    /// store set with dotless obfuscated names, fed in a shuffled order
+    /// that keeps the chain short for the whole download, extracts
+    /// one-pass under a tight holds budget - the arithmetic gate places
+    /// every volume the moment its own headers parse. This exact fixture
+    /// demotes with "held-bytes cap" without the gate (the ~13 MB of
+    /// unplaceable spans overrun the 8 MB floor).
+    #[test]
+    fn obfuscated_uniform_store_set_streams_one_pass_any_order() {
+        let dir = tmpdir("arith-onepass");
+        let inner = "qCNsampBzXuv9m9z.mkv";
+        let (data, vols, names) = uniform_store_set(inner, 300_000, 44, 200_000, 31);
+        let ex = Extractor::new(&dir, vols.len(), true);
+        ex.set_holds_cap(8 << 20);
+        // Volume 0 arrives LAST, and the set's final volume early. Either
+        // one is enough: volume 0 proves the file starts where the
+        // arithmetic assumes, and the final piece proves the same thing
+        // through the closure identity (and separately seeds the chain's
+        // backward walk). One of the two is all a set needs to place
+        // every other volume off its own headers.
+        let mut order = shuffled_zero_last(vols.len(), 0xC0FFEE);
+        let tail = vols.len() - 1;
+        let at = order.iter().position(|&v| v == tail).unwrap();
+        order.remove(at);
+        order.insert(0, tail);
+        for vi in order {
+            feed(&ex, vi, &names[vi], &vols[vi], 9000, 60 + vi as u64);
+        }
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(rep.extracted, vec![(inner.to_string(), data.len() as u64)]);
+        assert_eq!(std::fs::read(dir.join(inner)).unwrap(), data);
+        assert_eq!(shape_of(&ex), ["rar5", "store", "one-pass"]);
+        assert!(!ex.arith_engaged_groups().is_empty(), "the gate never engaged");
+        // Memory acceptance: holds never accumulated the set - only the
+        // in-flight volume's pre-parse spans.
+        assert!(ex.holds_peak() < data.len() / 2, "holds peak {}", ex.holds_peak());
+        for n in &names {
+            assert!(!dir.join(n).exists(), "volume {n} materialized");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The honest limit of the same shape: when NEITHER the file's first
+    /// nor its last volume has parsed, no offset is derivable from any
+    /// header, so the bytes must be held. (The offsets are only knowable
+    /// relative to one of those two ends - anything else would be placing
+    /// on an unproven premise, which is exactly what mis-placed a season
+    /// pack's continuation volumes.) A production-sized holds budget
+    /// absorbs that window and the set still one-passes; a budget smaller
+    /// than the window demotes, correctly.
+    #[test]
+    fn a_set_with_neither_end_parsed_holds_then_places() {
+        let inner = "late.mkv";
+        let (data, vols, names) = uniform_store_set(inner, 300_000, 44, 200_000, 31);
+        // Feed order that keeps both ends late: this is the case the
+        // arithmetic gate used to guess its way through.
+        let mut order = shuffled_zero_last(vols.len(), 0xC0FFEE);
+        let tail = vols.len() - 1;
+        let at = order.iter().position(|&v| v == tail).unwrap();
+        order.remove(at);
+        order.insert(order.len() - 1, tail);
+
+        // Budget above the window: one-pass, byte-exact.
+        let dir = tmpdir("arith-lateends-ok");
+        let ex = Extractor::new(&dir, vols.len(), true);
+        ex.set_holds_cap(64 << 20);
+        for &vi in &order {
+            feed(&ex, vi, &names[vi], &vols[vi], 9000, 70 + vi as u64);
+        }
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(std::fs::read(dir.join(inner)).unwrap(), data);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // Budget below it: demotes on the holds cap, and every volume
+        // still reconstructs byte-exact for the disk path.
+        let dir = tmpdir("arith-lateends-tight");
+        let ex = Extractor::new(&dir, vols.len(), true);
+        ex.set_holds_cap(8 << 20);
+        for &vi in &order {
+            feed(&ex, vi, &names[vi], &vols[vi], 9000, 70 + vi as u64);
+        }
+        let rep = ex.finish().unwrap();
+        assert!(
+            rep.fallbacks.iter().any(|(_, w)| w.contains("held-bytes cap")),
+            "{:?}",
+            rep.fallbacks
+        );
+        for (vi, vol) in vols.iter().enumerate() {
+            assert_eq!(&std::fs::read(dir.join(&names[vi])).unwrap(), vol, "volume {vi}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// SPEC Part A acceptance 2: the same shape with ONE mid-set volume
+    /// declaring a different `data_len`. The gate engages on the uniform
+    /// majority; the odd volume's parse contradicts the premise while
+    /// unconfirmed placements exist, so the WHOLE group demotes with the
+    /// distinct reason - and every volume reconstructs byte-exact (the
+    /// unrar path's input), with no half-extracted inner file left.
+    #[test]
+    fn uniform_store_set_with_odd_mid_volume_demotes_whole() {
+        let dir = tmpdir("arith-nonuniform");
+        let inner = "inner.bin";
+        let dl = 60_000usize;
+        let n_full = 44usize;
+        let tail = 40_000usize;
+        let total = ((dl + 1) + (n_full - 1) * dl + tail) as u64; // as declared; vol 20 lies
+        let data = payload((dl + 1) + (n_full - 1) * dl + tail, 33);
+        let mut vols: Vec<Vec<u8>> = Vec::new();
+        let mut pos = 0usize;
+        for k in 0..n_full {
+            let len = if k == 0 {
+                dl + 1
+            } else if k == 20 {
+                30_000 // the odd one out
+            } else {
+                dl
+            };
+            let piece = &data[pos..pos + len];
+            pos += len;
+            vols.push(fixtures::rar5_volume_n_crc(
+                &[(inner, total, piece, k > 0, true, Some(crc32fast::hash(piece)))],
+                k as u64,
+            ));
+        }
+        vols.push(fixtures::rar5_volume_n_crc(
+            &[(inner, total, &data[pos..pos + tail], true, false, Some(crc32fast::hash(&data)))],
+            n_full as u64,
+        ));
+        let ex = Extractor::new(&dir, vols.len(), true);
+        // Everything but the odd volume first (volume 0 late, so the
+        // gate engages with provisional placements), the odd one last.
+        let mut order: Vec<usize> = (1..=19).chain(21..=44).chain([0, 20]).collect();
+        assert_eq!(order.len(), vols.len());
+        for vi in order.drain(..) {
+            feed(&ex, vi, &format!("g{vi:02}NoDot"), &vols[vi], 9000, 80 + vi as u64);
+        }
+        let rep = ex.finish().unwrap();
+        assert_eq!(
+            rep.fallbacks,
+            vec![(inner.to_string(), "non-uniform store set".to_string())]
+        );
+        for (vi, vol) in vols.iter().enumerate() {
+            assert_eq!(
+                &std::fs::read(dir.join(format!("g{vi:02}NoDot"))).unwrap(),
+                vol,
+                "volume {vi} must reconstruct byte-exact"
+            );
+        }
+        assert!(!dir.join(inner).exists(), "no partial inner file may survive");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// SPEC Part A acceptance 4: an encrypted uniform single-file set
+    /// must never engage the arithmetic gate - in-stream decryption was
+    /// built and verified against chained placement, and behavior stays
+    /// exactly as before (this set still one-passes: it completes, so
+    /// the chain closes at the end).
+    #[test]
+    fn encrypted_uniform_store_set_stays_on_chain_path() {
+        let dir = tmpdir("arith-enc");
+        let plain = payload(900_000, 35);
+        let f = fixtures::encrypt_file("hunter2", &plain, 5);
+        let n = f.cipher.len();
+        let (a, b) = (300_000, 600_000);
+        // Uniform piece sizes on purpose: were encryption not excluded,
+        // this shape would qualify.
+        let vols = [
+            fixtures::rar5_volume_enc(&[("movie.mkv", &f, 0..a, false, true)], Some(0)),
+            fixtures::rar5_volume_enc(&[("movie.mkv", &f, a..b, true, true)], Some(1)),
+            fixtures::rar5_volume_enc(&[("movie.mkv", &f, b..n, true, false)], Some(2)),
+        ];
+        let ex = Extractor::new(&dir, 3, true);
+        ex.set_password("hunter2");
+        feed(&ex, 2, "zzNoDot", &vols[2], 8000, 91);
+        feed(&ex, 0, "aaNoDot", &vols[0], 8000, 92);
+        feed(&ex, 1, "mmNoDot", &vols[1], 8000, 93);
+        let rep = ex.finish().unwrap();
+        assert!(
+            ex.arith_engaged_groups().is_empty(),
+            "arithmetic gate engaged on an encrypted set"
+        );
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(std::fs::read(dir.join("movie.mkv")).unwrap(), plain);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The gate's bet is right for a multi-file set's FIRST file (it
+    /// really does start at volume 0, offset 0): continuation volumes
+    /// arriving early engage provisionally, the chain confirms each
+    /// placement as the head volumes fill in, and the boundary volume
+    /// then reveals the multi-file truth WITHOUT a demote - both files
+    /// extract one-pass.
+    #[test]
+    fn provisional_placements_confirmed_by_chain_survive_multifile_reveal() {
+        let dir = tmpdir("arith-confirm");
+        // WinRAR-true: volume 0 carries one byte more (see uniform_store_set).
+        let a = payload(450_001, 41); // spans vols 0..=4, boundary in vol 4
+        let b = payload(120_000, 42); // head 50k in vol 4, final 70k in vol 5
+        let vols = vec![
+            fixtures::rar5_volume_n(&[("A.mkv", 450_001, &a[..100_001], false, true)], 0),
+            fixtures::rar5_volume_n(&[("A.mkv", 450_001, &a[100_001..200_001], true, true)], 1),
+            fixtures::rar5_volume_n(&[("A.mkv", 450_001, &a[200_001..300_001], true, true)], 2),
+            fixtures::rar5_volume_n(&[("A.mkv", 450_001, &a[300_001..400_001], true, true)], 3),
+            fixtures::rar5_volume_n(
+                &[
+                    ("A.mkv", 450_001, &a[400_001..], true, false),
+                    ("B.mkv", 120_000, &b[..50_000], false, true),
+                ],
+                4,
+            ),
+            fixtures::rar5_volume_n(&[("B.mkv", 120_000, &b[50_000..], true, false)], 5),
+        ];
+        let ex = Extractor::new(&dir, 6, true);
+        for vi in [2usize, 3, 5, 0, 1, 4] {
+            feed(&ex, vi, &format!("c{vi}NoDot"), &vols[vi], 9000, 70 + vi as u64);
+        }
+        let rep = ex.finish().unwrap();
+        assert!(
+            !ex.arith_engaged_groups().is_empty(),
+            "vols 2+3 arriving first must have engaged the gate"
+        );
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(std::fs::read(dir.join("A.mkv")).unwrap(), a);
+        assert_eq!(std::fs::read(dir.join("B.mkv")).unwrap(), b);
+        for vi in 0..6 {
+            assert!(!dir.join(format!("c{vi}NoDot")).exists(), "volume {vi} materialized");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The shape that USED to expose a wrong bet: a big second file
+    /// behind a small first one. Its continuation volumes look
+    /// arithmetically plausible (the file is large, so `volnum * data_len`
+    /// fits inside it) but the true bases are shifted by the first file's
+    /// share of volume 0.
+    ///
+    /// The gate no longer bets on it at all: with neither a volume 0 that
+    /// starts this file nor a closure identity that holds, the premise is
+    /// unproven and the group goes to chain resolution - which places it
+    /// correctly. So the set now extracts ONE-PASS where it previously
+    /// wrote bytes at wrong offsets and demoted to recover. The old
+    /// demote-and-reconstruct path is still exercised by
+    /// `uniform_store_set_with_odd_mid_volume_demotes_whole`.
+    #[test]
+    fn a_big_second_file_now_places_instead_of_mis_betting() {
+        let dir = tmpdir("arith-contradict");
+        let f1 = payload(30_000, 43); // wholly inside vol 0
+        let f2 = payload(520_000, 44); // 50k in vol 0, then 4 x 100k, tail 70k
+        let vols = vec![
+            fixtures::rar5_volume_n(
+                &[
+                    ("f1.bin", 30_000, &f1, false, false),
+                    ("f2.bin", 520_000, &f2[..50_000], false, true),
+                ],
+                0,
+            ),
+            fixtures::rar5_volume_n(&[("f2.bin", 520_000, &f2[50_000..150_000], true, true)], 1),
+            fixtures::rar5_volume_n(&[("f2.bin", 520_000, &f2[150_000..250_000], true, true)], 2),
+            fixtures::rar5_volume_n(&[("f2.bin", 520_000, &f2[250_000..350_000], true, true)], 3),
+            fixtures::rar5_volume_n(&[("f2.bin", 520_000, &f2[350_000..450_000], true, true)], 4),
+            fixtures::rar5_volume_n(&[("f2.bin", 520_000, &f2[450_000..], true, false)], 5),
+        ];
+        let ex = Extractor::new(&dir, 6, true);
+        // Vols 3+4 first: the gate engages and places them at 300k/400k
+        // (true bases 250k/350k). Vol 0 reveals the second entry; the
+        // chain then reaches vol 3 when vols 1+2 parse and contradicts.
+        for vi in [3usize, 4, 0, 1, 2, 5] {
+            feed(&ex, vi, &format!("x{vi}NoDot"), &vols[vi], 9000, 50 + vi as u64);
+        }
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(std::fs::read(dir.join("f1.bin")).unwrap(), f1);
+        assert_eq!(std::fs::read(dir.join("f2.bin")).unwrap(), f2);
+        for vi in 0..vols.len() {
+            assert!(
+                !dir.join(format!("x{vi}NoDot")).exists(),
+                "volume {vi} materialized"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A volume missing from the NZB entirely: the gate placed the rest
+    /// arithmetically (no holds, mappers complete), so only the closure
+    /// ruling at settle can notice the set never proved itself - it must
+    /// demote rather than ship a file with a silent hole.
+    #[test]
+    fn unclosed_arithmetic_set_demotes_at_finish() {
+        let dir = tmpdir("arith-unclosed");
+        let inner = "gap.bin";
+        let (_data, vols, names) = uniform_store_set(inner, 60_000, 9, 40_000, 37);
+        let ex = Extractor::new(&dir, vols.len(), true);
+        // Volume 4 never arrives; 0 arrives last among those that do.
+        for vi in [7usize, 2, 9, 5, 1, 8, 3, 6, 0] {
+            feed(&ex, vi, &names[vi], &vols[vi], 9000, 40 + vi as u64);
+        }
+        let rep = ex.finish().unwrap();
+        assert_eq!(
+            rep.fallbacks,
+            vec![(inner.to_string(), "non-uniform store set".to_string())]
+        );
+        assert!(!dir.join(inner).exists(), "no holed inner file may survive");
+        for vi in [7usize, 2, 9, 5, 1, 8, 3, 6, 0] {
+            assert_eq!(
+                &std::fs::read(dir.join(&names[vi])).unwrap(),
+                &vols[vi],
+                "volume {vi} must reconstruct byte-exact"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The failure the first LIVE run of the gate exposed (Ant-Man, 134
+    /// volumes): the volume-number vint in the main header grows a byte
+    /// at volume 128, and real archivers keep the VOLUME size constant,
+    /// so the data area shrinks by that byte - `data_len` is NOT
+    /// uniform. A >127-volume set must still qualify and place every
+    /// band correctly (vol 0: D bytes; 1..127: D-1; 128+: D-2).
+    #[test]
+    fn store_set_crossing_the_volnum_vint_band_still_one_passes() {
+        let dir = tmpdir("arith-band");
+        let inner = "band.mkv";
+        let d = 5_001usize; // vol 0's data bytes
+        let n_full = 131usize; // vols 0..=130 non-final, 131 final
+        let tail = 3_000usize;
+        let total = d + 127 * (d - 1) + 3 * (d - 2) + tail;
+        let data = payload(total, 39);
+        let mut vols: Vec<Vec<u8>> = Vec::new();
+        let mut pos = 0usize;
+        for k in 0..n_full {
+            let len = if k == 0 {
+                d
+            } else if k < 128 {
+                d - 1
+            } else {
+                d - 2
+            };
+            let piece = &data[pos..pos + len];
+            pos += len;
+            vols.push(fixtures::rar5_volume_n_crc(
+                &[(inner, total as u64, piece, k > 0, true, Some(crc32fast::hash(piece)))],
+                k as u64,
+            ));
+        }
+        vols.push(fixtures::rar5_volume_n_crc(
+            &[(inner, total as u64, &data[pos..], true, false, Some(crc32fast::hash(&data)))],
+            n_full as u64,
+        ));
+        let names: Vec<String> = (0..vols.len()).map(|k| format!("bx{k:03}NoDot")).collect();
+        let ex = Extractor::new(&dir, vols.len(), true);
+        for vi in shuffled_zero_last(vols.len(), 0xBAD5EED) {
+            feed(&ex, vi, &names[vi], &vols[vi], 1_500, 30 + vi as u64);
+        }
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert!(!ex.arith_engaged_groups().is_empty(), "the gate never engaged");
+        assert_eq!(std::fs::read(dir.join(inner)).unwrap(), data);
+        for n in &names {
+            assert!(!dir.join(n).exists(), "volume {n} materialized");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// PLAN-multifile acceptance 1: a season-pack-shaped store set - six
+    /// inner files across 60 volumes, boundaries mid-volume, dotless
+    /// obfuscated names - fed in a shuffled order with volume 0 arriving
+    /// LAST, extracts one-pass under a tight holds budget.
+    ///
+    /// This is the 25%-of-multivol-bytes shape the census found (92% of
+    /// bytes above 60 GB). Before tail anchoring it demoted: forward-only
+    /// resolution could place nothing until volume 0 parsed, so the
+    /// unplaceable spans overran the cap.
+    #[test]
+    fn obfuscated_season_pack_streams_one_pass_with_volume_zero_last() {
+        let dir = tmpdir("multifile-pack");
+        // Six episodes, each spanning several volumes, boundaries landing
+        // mid-volume so volumes carry two entries.
+        let eps: Vec<Vec<u8>> = (0..6).map(|k| payload(1_400_000 + k * 9_000, 40 + k as u8)).collect();
+        // Lay the episodes end to end, then cut at a fixed volume size:
+        // exactly how a real archiver fills volumes.
+        let mut stream: Vec<(usize, usize)> = Vec::new(); // (episode, byte)
+        for (i, e) in eps.iter().enumerate() {
+            for b in 0..e.len() {
+                stream.push((i, b));
+            }
+        }
+        const VOL: usize = 150_000;
+        let mut vols: Vec<Vec<u8>> = Vec::new();
+        let mut at = 0usize;
+        let mut vol_no = 0u64;
+        while at < stream.len() {
+            let end = (at + VOL).min(stream.len());
+            // Which episodes does this volume touch, and how much of each?
+            let mut pieces: Vec<(usize, usize, usize)> = Vec::new(); // (ep, from, to)
+            let mut i = at;
+            while i < end {
+                let (ep, off) = stream[i];
+                let run_end = (i..end).take_while(|&j| stream[j].0 == ep).count() + i;
+                pieces.push((ep, off, off + (run_end - i)));
+                i = run_end;
+            }
+            let specs: Vec<(String, u64, Vec<u8>, bool, bool)> = pieces
+                .iter()
+                .map(|&(ep, from, to)| {
+                    (
+                        format!("Show.S01E{:02}.mkv", ep + 1),
+                        eps[ep].len() as u64,
+                        eps[ep][from..to].to_vec(),
+                        from > 0,
+                        to < eps[ep].len(),
+                    )
+                })
+                .collect();
+            let refs: Vec<(&str, u64, &[u8], bool, bool)> = specs
+                .iter()
+                .map(|(n, t, d, b, a)| (n.as_str(), *t, d.as_slice(), *b, *a))
+                .collect();
+            vols.push(fixtures::rar5_volume_n(&refs, vol_no));
+            vol_no += 1;
+            at = end;
+        }
+        assert!(vols.len() >= 55, "expected a season-pack-scale set, got {}", vols.len());
+        let names: Vec<String> =
+            (0..vols.len()).map(|k| format!("{:06x}SeasonNoDot{k}", (k as u64 * 2654435761) & 0xffffff)).collect();
+
+        let ex = Extractor::new(&dir, vols.len(), true);
+        ex.set_holds_cap(8 << 20);
+        for vi in shuffled_zero_last(vols.len(), 0x5EA5_0DE7) {
+            feed(&ex, vi, &names[vi], &vols[vi], 9000, 100 + vi as u64);
+        }
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        for (i, e) in eps.iter().enumerate() {
+            let p = dir.join(format!("Show.S01E{:02}.mkv", i + 1));
+            assert_eq!(&std::fs::read(&p).unwrap(), e, "episode {} differs", i + 1);
+        }
+        for n in &names {
+            assert!(!dir.join(n).exists(), "volume {n} materialized");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// PLAN-multifile acceptance 2: an ISLAND of volumes away from volume
+    /// 0 places its pieces. Each inner file needs a parsed run containing
+    /// its own head or tail, not one reaching back to the start of the
+    /// set - that is the whole point of the tail seed.
+    #[test]
+    fn a_mid_set_island_resolves_without_volume_zero() {
+        let dir = tmpdir("multifile-island");
+        let a = payload(400_000, 61);
+        let b = payload(300_000, 62);
+        // A ends in volume 3; B starts there and ends in volume 5.
+        let vols = vec![
+            fixtures::rar5_volume_n(&[("A.mkv", 400_000, &a[..100_000], false, true)], 0),
+            fixtures::rar5_volume_n(&[("A.mkv", 400_000, &a[100_000..200_000], true, true)], 1),
+            fixtures::rar5_volume_n(&[("A.mkv", 400_000, &a[200_000..300_000], true, true)], 2),
+            fixtures::rar5_volume_n(
+                &[
+                    ("A.mkv", 400_000, &a[300_000..], true, false),
+                    ("B.mkv", 300_000, &b[..50_000], false, true),
+                ],
+                3,
+            ),
+            fixtures::rar5_volume_n(&[("B.mkv", 300_000, &b[50_000..150_000], true, true)], 4),
+            fixtures::rar5_volume_n(&[("B.mkv", 300_000, &b[150_000..], true, false)], 5),
+        ];
+        // Feed ONLY volumes 3-5: an island with no path back to volume 0.
+        let ex = Extractor::new(&dir, 6, true);
+        for vi in [4usize, 5, 3] {
+            feed(&ex, vi, &format!("isl{vi}NoDot"), &vols[vi], 9000, 10 + vi as u64);
+        }
+        // Before finish, B's pieces are PLACED: volume 3 starts B (base
+        // 0) and volume 5 ends it (base = total - data_len), so the whole
+        // island resolves with no path back to volume 0. Forward-only
+        // resolution placed nothing here.
+        assert!(ex.bases_known(&["B.mkv"]), "island pieces must be placed");
+        let rep = ex.finish().unwrap();
+        // The SET is still incomplete - A's head never arrived - so the
+        // group demotes at settle and its partial output is removed. The
+        // point of this test is the placement above, not the verdict.
+        assert!(!rep.fallbacks.is_empty(), "an incomplete set still demotes");
+        assert!(!dir.join("B.mkv").exists(), "a demote removes partial output");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// PLAN-multifile acceptance 5: headers that disagree with THEMSELVES.
+    /// The middle volume claims a piece that does not fit the gap its two
+    /// neighbours leave, so the piece resolves to different offsets from
+    /// each side. No offset here is trustworthy, so the group demotes
+    /// with its own reason - and every volume still reconstructs
+    /// byte-exact for the disk path.
+    #[test]
+    fn a_self_contradictory_chain_demotes_with_its_own_reason() {
+        let dir = tmpdir("chain-contradict");
+        let f = payload(300_000, 71);
+        let vols = vec![
+            fixtures::rar5_volume_n(&[("f.bin", 300_000, &f[..100_000], false, true)], 0),
+            // Overlaps: claims 150 KB where 100 KB fits.
+            fixtures::rar5_volume_n(&[("f.bin", 300_000, &f[..150_000], true, true)], 1),
+            fixtures::rar5_volume_n(&[("f.bin", 300_000, &f[200_000..], true, false)], 2),
+        ];
+        let ex = Extractor::new(&dir, 3, true);
+        for vi in [0usize, 1, 2] {
+            feed(&ex, vi, &format!("cc{vi}NoDot"), &vols[vi], 9000, 80 + vi as u64);
+        }
+        let rep = ex.finish().unwrap();
+        assert!(
+            rep.fallbacks.iter().any(|(_, w)| w == "inconsistent volume chain"),
+            "{:?}",
+            rep.fallbacks
+        );
+        for (vi, vol) in vols.iter().enumerate() {
+            assert_eq!(
+                &std::fs::read(dir.join(format!("cc{vi}NoDot"))).unwrap(),
+                vol,
+                "volume {vi} must reconstruct byte-exact"
+            );
+        }
+        assert!(!dir.join("f.bin").exists(), "no partial output may survive");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// SPEC Part A trap: under protect_sources (offline `nzbfast
+    /// extract`), an arithmetic demote must DISCARD like the chain path
+    /// does - never materialize a "volume" over the source file it is
+    /// reading.
+    #[test]
+    fn protect_sources_arithmetic_demote_discards() {
+        let dir = tmpdir("arith-protect");
+        let inner = "film.mkv";
+        let dl = 60_000usize;
+        let total = ((dl + 1) + 4 * dl + 40_000) as u64; // declared; vol 3 lies
+        let data = payload((dl + 1) + 4 * dl + 40_000, 45);
+        let mut vols: Vec<Vec<u8>> = Vec::new();
+        let mut pos = 0usize;
+        for k in 0..5usize {
+            let len = if k == 0 {
+                dl + 1
+            } else if k == 3 {
+                30_000
+            } else {
+                dl
+            };
+            let piece = &data[pos..pos + len];
+            pos += len;
+            vols.push(fixtures::rar5_volume_n(&[(inner, total, piece, k > 0, true)], k as u64));
+        }
+        vols.push(fixtures::rar5_volume_n(&[(inner, total, &data[pos..pos + 40_000], true, false)], 5));
+        let names: Vec<String> = (0..6).map(|k| format!("src{k}NoDot")).collect();
+        for (n, v) in names.iter().zip(&vols) {
+            std::fs::write(dir.join(n), v).unwrap();
+        }
+        let ex = Extractor::new(&dir, vols.len(), true);
+        ex.set_protect_sources();
+        // Engage on the uniform majority (vol 0 late), then the odd
+        // volume contradicts and the whole group demotes - to Discard.
+        for vi in [1usize, 2, 4, 5, 0, 3] {
+            feed(&ex, vi, &names[vi], &vols[vi], 9000, 20 + vi as u64);
+        }
+        let rep = ex.finish().unwrap();
+        assert!(
+            rep.fallbacks.iter().any(|(_, why)| why == "non-uniform store set"),
+            "{:?}",
+            rep.fallbacks
+        );
+        // Sources byte-identical, and no output was left behind.
+        for (n, v) in names.iter().zip(&vols) {
+            assert_eq!(&std::fs::read(dir.join(n)).unwrap(), v, "source {n} touched");
+        }
+        assert!(!dir.join(inner).exists(), "partial output must not survive");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Fallback read-back must skip sparse holes: an unwritten inner-file
@@ -9050,27 +10215,35 @@ mod tests {
     #[test]
     fn protect_sources_fallback_never_touches_source_files() {
         let dir = tmpdir("protect-fb");
-        let total = payload(20_000_000, 13);
+        // THREE volumes, unequal, and the MIDDLE one is fed first. A
+        // middle piece is neither its file's head nor its tail, so it
+        // has no seed of its own and cannot resolve until a neighbour
+        // parses - the only remaining shape that piles up holds now that
+        // tail anchoring places final pieces on sight. (The arithmetic
+        // gate also stays out: the sizes are not uniform.)
+        let total = payload(30_000_000, 13);
         let vols = vec![
             fixtures::rar5_volume_n(
-                &[("film.mkv", 20_000_000, &total[..10_000_000], false, true)],
+                &[("film.mkv", 30_000_000, &total[..7_000_000], false, true)],
                 0,
             ),
             fixtures::rar5_volume_n(
-                &[("film.mkv", 20_000_000, &total[10_000_000..], true, false)],
+                &[("film.mkv", 30_000_000, &total[7_000_000..22_000_000], true, true)],
                 1,
+            ),
+            fixtures::rar5_volume_n(
+                &[("film.mkv", 30_000_000, &total[22_000_000..], true, false)],
+                2,
             ),
         ];
         // The volume files exist on disk, as in reextract_dir.
         std::fs::write(dir.join("x.part1.rar"), &vols[0]).unwrap();
         std::fs::write(dir.join("x.part2.rar"), &vols[1]).unwrap();
+        std::fs::write(dir.join("x.part3.rar"), &vols[2]).unwrap();
 
-        let ex = Extractor::new(&dir, 2, true);
+        let ex = Extractor::new(&dir, 3, true);
         ex.set_protect_sources();
         ex.set_holds_cap(1); // floors at 8 MB - part2's data area exceeds it
-        // Sequential in-file order, as reextract_dir feeds. part2 first:
-        // its split piece can't base-resolve, so every span holds until
-        // the cap trips the group fallback.
         let mut feed_seq = |slot: usize, name: &str, vol: &[u8]| {
             for (i, chunk) in vol.chunks(65_000).enumerate() {
                 ex.write(slot, name, vol.len() as u64, (i * 65_000) as u64, chunk)
@@ -9079,21 +10252,24 @@ mod tests {
         };
         feed_seq(1, "x.part2.rar", &vols[1]);
         feed_seq(0, "x.part1.rar", &vols[0]);
+        feed_seq(2, "x.part3.rar", &vols[2]);
         let rep = ex.finish().unwrap();
         assert!(!rep.fallbacks.is_empty(), "expected a holds-cap fallback");
 
         // Source volumes byte-identical - NOT truncated/rewritten.
         assert_eq!(std::fs::read(dir.join("x.part1.rar")).unwrap(), vols[0]);
         assert_eq!(std::fs::read(dir.join("x.part2.rar")).unwrap(), vols[1]);
+        assert_eq!(std::fs::read(dir.join("x.part3.rar")).unwrap(), vols[2]);
         // No slot writers, no half-written inner file masquerading as output.
         assert!(ex.slot_path(0).is_none());
         assert!(ex.slot_path(1).is_none());
+        assert!(ex.slot_path(2).is_none());
         assert!(!dir.join("film.mkv").exists());
         let extra: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n != "x.part1.rar" && n != "x.part2.rar")
+            .filter(|n| n != "x.part1.rar" && n != "x.part2.rar" && n != "x.part3.rar")
             .collect();
         assert!(extra.is_empty(), "unexpected files: {extra:?}");
         std::fs::remove_dir_all(&dir).unwrap();
@@ -10521,7 +11697,8 @@ mod tests {
             ("B.mkv", 150_000, &b, false, false),
         ]);
         let n = inner_arch.len();
-        let (c1, c2) = (n / 3, 2 * n / 3);
+        // WinRAR-true: vol 0's piece is one byte longer than vol 1's.
+        let (c1, c2) = (n / 3 + 1, n / 3 + 1 + n / 3);
         let vols: Vec<Vec<u8>> = vec![
             fixtures::rar5_volume_n(
                 &[("inner.rar", n as u64, &inner_arch[..c1], false, true)],
@@ -10707,18 +11884,20 @@ mod tests {
         let f = payload(400_000, 86);
         let whole = crc32fast::hash(&f);
         let iv = [
+            // WinRAR-true geometry: volume 0 carries one byte more (its
+            // main header has no volume-number field).
             fixtures::rar5_volume_n_crc(
-                &[("F.mkv", 400_000, &f[..150_000], false, true,
-                   Some(crc32fast::hash(&f[..150_000])))],
+                &[("F.mkv", 400_000, &f[..150_001], false, true,
+                   Some(crc32fast::hash(&f[..150_001])))],
                 0,
             ),
             fixtures::rar5_volume_n_crc(
-                &[("F.mkv", 400_000, &f[150_000..300_000], true, true,
-                   Some(crc32fast::hash(&f[150_000..300_000])))],
+                &[("F.mkv", 400_000, &f[150_001..300_001], true, true,
+                   Some(crc32fast::hash(&f[150_001..300_001])))],
                 1,
             ),
             fixtures::rar5_volume_n_crc(
-                &[("F.mkv", 400_000, &f[300_000..], true, false, Some(whole))],
+                &[("F.mkv", 400_000, &f[300_001..], true, false, Some(whole))],
                 2,
             ),
         ];
@@ -10785,18 +11964,20 @@ mod tests {
         let f = payload(400_000, 86);
         let whole = crc32fast::hash(&f);
         let iv = [
+            // WinRAR-true geometry: volume 0 carries one byte more (its
+            // main header has no volume-number field).
             fixtures::rar5_volume_n_crc(
-                &[("F.mkv", 400_000, &f[..150_000], false, true,
-                   Some(crc32fast::hash(&f[..150_000])))],
+                &[("F.mkv", 400_000, &f[..150_001], false, true,
+                   Some(crc32fast::hash(&f[..150_001])))],
                 0,
             ),
             fixtures::rar5_volume_n_crc(
-                &[("F.mkv", 400_000, &f[150_000..300_000], true, true,
-                   Some(crc32fast::hash(&f[150_000..300_000])))],
+                &[("F.mkv", 400_000, &f[150_001..300_001], true, true,
+                   Some(crc32fast::hash(&f[150_001..300_001])))],
                 1,
             ),
             fixtures::rar5_volume_n_crc(
-                &[("F.mkv", 400_000, &f[300_000..], true, false, Some(whole))],
+                &[("F.mkv", 400_000, &f[300_001..], true, false, Some(whole))],
                 2,
             ),
         ];
@@ -10829,18 +12010,20 @@ mod tests {
         let f = payload(400_000, 87);
         let whole = crc32fast::hash(&f);
         let mut iv = vec![
+            // WinRAR-true geometry: volume 0 carries one byte more (its
+            // main header has no volume-number field).
             fixtures::rar5_volume_n_crc(
-                &[("F.mkv", 400_000, &f[..150_000], false, true,
-                   Some(crc32fast::hash(&f[..150_000])))],
+                &[("F.mkv", 400_000, &f[..150_001], false, true,
+                   Some(crc32fast::hash(&f[..150_001])))],
                 0,
             ),
             fixtures::rar5_volume_n_crc(
-                &[("F.mkv", 400_000, &f[150_000..300_000], true, true,
-                   Some(crc32fast::hash(&f[150_000..300_000])))],
+                &[("F.mkv", 400_000, &f[150_001..300_001], true, true,
+                   Some(crc32fast::hash(&f[150_001..300_001])))],
                 1,
             ),
             fixtures::rar5_volume_n_crc(
-                &[("F.mkv", 400_000, &f[300_000..], true, false, Some(whole))],
+                &[("F.mkv", 400_000, &f[300_001..], true, false, Some(whole))],
                 2,
             ),
         ];
@@ -11166,18 +12349,20 @@ mod tests {
         let f = payload(400_000, 97);
         let whole = crc32fast::hash(&f);
         let iv = [
+            // WinRAR-true geometry: volume 0 carries one byte more (its
+            // main header has no volume-number field).
             fixtures::rar5_volume_n_crc(
-                &[("F.mkv", 400_000, &f[..150_000], false, true,
-                   Some(crc32fast::hash(&f[..150_000])))],
+                &[("F.mkv", 400_000, &f[..150_001], false, true,
+                   Some(crc32fast::hash(&f[..150_001])))],
                 0,
             ),
             fixtures::rar5_volume_n_crc(
-                &[("F.mkv", 400_000, &f[150_000..300_000], true, true,
-                   Some(crc32fast::hash(&f[150_000..300_000])))],
+                &[("F.mkv", 400_000, &f[150_001..300_001], true, true,
+                   Some(crc32fast::hash(&f[150_001..300_001])))],
                 1,
             ),
             fixtures::rar5_volume_n_crc(
-                &[("F.mkv", 400_000, &f[300_000..], true, false, Some(whole))],
+                &[("F.mkv", 400_000, &f[300_001..], true, false, Some(whole))],
                 2,
             ),
         ];
@@ -11196,7 +12381,7 @@ mod tests {
         );
         // Damage 64 bytes of iv[1]'s DATA area as it sits in the outer
         // volume: iv[1] starts at the third RAR5 signature, its data
-        // area holds f[150_000..300_000] verbatim before the 8-byte end
+        // area holds f[150_001..300_001] verbatim before the 8-byte end
         // block. Verify the arithmetic before flipping.
         let sig_at: Vec<usize> = (0..outer.len().saturating_sub(8))
             .filter(|&i| outer[i..].starts_with(b"Rar!\x1a\x07\x01\x00"))
@@ -11204,7 +12389,7 @@ mod tests {
         assert_eq!(sig_at.len(), 4, "outer + three inner signatures");
         let iv1_data = sig_at[2] + (iv[1].len() - 150_000 - 8);
         let (ds, de) = (iv1_data + 70_000, iv1_data + 70_064);
-        assert_eq!(&outer[ds..de], &f[220_000..220_064], "fixture layout moved");
+        assert_eq!(&outer[ds..de], &f[220_001..220_065], "fixture layout moved");
         let mut wire = outer.clone();
         for b in &mut wire[ds..de] {
             *b ^= 0x3C;
@@ -11494,18 +12679,20 @@ mod tests {
         let f = payload(400_000, 177);
         let whole = crc32fast::hash(&f);
         let mut iv = vec![
+            // WinRAR-true geometry: volume 0 carries one byte more (its
+            // main header has no volume-number field).
             fixtures::rar5_volume_n_crc(
-                &[("F.mkv", 400_000, &f[..150_000], false, true,
-                   Some(crc32fast::hash(&f[..150_000])))],
+                &[("F.mkv", 400_000, &f[..150_001], false, true,
+                   Some(crc32fast::hash(&f[..150_001])))],
                 0,
             ),
             fixtures::rar5_volume_n_crc(
-                &[("F.mkv", 400_000, &f[150_000..300_000], true, true,
-                   Some(crc32fast::hash(&f[150_000..300_000])))],
+                &[("F.mkv", 400_000, &f[150_001..300_001], true, true,
+                   Some(crc32fast::hash(&f[150_001..300_001])))],
                 1,
             ),
             fixtures::rar5_volume_n_crc(
-                &[("F.mkv", 400_000, &f[300_000..], true, false, Some(whole))],
+                &[("F.mkv", 400_000, &f[300_001..], true, false, Some(whole))],
                 2,
             ),
         ];

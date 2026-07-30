@@ -21,7 +21,7 @@
 //! bytes at its header positions - usually all inside article 1 for
 //! single-file volumes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::rarcrypt;
 
@@ -73,6 +73,10 @@ pub struct FileEntry {
     /// carried so a CRC-less entry is not silently treated as verified.
     pub hash: Option<(u64, Vec<u8>)>,
     pub is_dir: bool,
+    /// RAR5 "unpacked size unknown" file flag (0x08): `unpacked_size` is
+    /// a placeholder, not a real length - nothing may derive offsets
+    /// from it.
+    pub size_unknown: bool,
     /// Piece continues from the previous volume.
     pub split_before: bool,
     /// Piece continues into the next volume.
@@ -230,6 +234,13 @@ pub fn crypt_probe(path: &std::path::Path) -> Option<CryptProbe> {
 /// 512 KiB prefix probe missed (finding 17). Stops as soon as enough is
 /// known (complete / blocked / a crypt record or encrypted entry seen), at
 /// EOF, or after a bounded number of reads on hostile input.
+/// Diagnostic wrapper over [`feed_headers_incrementally`] for the
+/// `rarprobe` example - maps an on-disk volume's headers.
+#[doc(hidden)]
+pub fn feed_headers_incrementally_pub(f: &mut std::fs::File, size: u64, m: &mut VolumeMapper) {
+    feed_headers_incrementally(f, size, m);
+}
+
 fn feed_headers_incrementally(f: &mut std::fs::File, size: u64, m: &mut VolumeMapper) {
     use std::io::{Read, Seek, SeekFrom};
     const CHUNK: usize = 64 * 1024;
@@ -612,8 +623,32 @@ impl VolumeMapper {
     /// holds those bytes until more headers parse.
     pub fn map_span(&self, off: u64, len: u64) -> Vec<(usize, u64, u64, u64)> {
         let mut out = Vec::new();
+        self.map_span_into(off, len, &mut out);
+        out
+    }
+
+    /// [`Self::map_span`] into a caller-owned buffer - the article hot
+    /// path reuses one scratch vector instead of allocating per article
+    /// under the routing lock. Appends; the caller clears.
+    pub fn map_span_into(&self, off: u64, len: u64, out: &mut Vec<(usize, u64, u64, u64)>) {
         let span_end = off + len;
-        for (i, e) in self.entries.iter().enumerate() {
+        // Entries come off a forward-only parse cursor, so data areas are
+        // ordered and disjoint; skip straight to the first one this span can
+        // touch instead of scanning every parsed entry per article (this runs
+        // under the routing lock for EVERY article of a many-member volume).
+        debug_assert!(
+            self.entries
+                .windows(2)
+                .all(|w| w[0].data_off + w[0].data_len <= w[1].data_off),
+            "RAR entry data areas must be ordered and disjoint"
+        );
+        let start = self
+            .entries
+            .partition_point(|e| e.data_off + e.data_len <= off);
+        for (i, e) in self.entries.iter().enumerate().skip(start) {
+            if e.data_off >= span_end {
+                break;
+            }
             let ds = e.data_off;
             let de = e.data_off + e.data_len;
             let s = off.max(ds);
@@ -622,7 +657,6 @@ impl VolumeMapper {
                 out.push((i, s - ds, s - off, x - s));
             }
         }
-        out
     }
 
     /// The volume offset below which every byte is either header (parsed)
@@ -940,6 +974,7 @@ fn parse_v5_body(hdr: &[u8], base: u64, envelope: u64) -> BlockResult {
                     file_crc,
                     hash,
                     is_dir,
+                    size_unknown: file_flags & 0x08 != 0,
                     split_before: hflags & 0x08 != 0,
                     split_after: hflags & 0x10 != 0,
                     data_off: base + envelope,
@@ -1195,6 +1230,8 @@ fn parse_block_v4(a: &[u8], base: u64) -> BlockResult {
                     },
                     hash: None,
                     is_dir,
+                    // RAR4 has no unknown-size flag this parser honors.
+                    size_unknown: false,
                     split_before: flags & 0x0001 != 0,
                     split_after: flags & 0x0002 != 0,
                     data_off: base + hsize as u64,
@@ -1246,11 +1283,39 @@ pub fn needs_password(path: &std::path::Path) -> bool {
         || m.entries.iter().any(|e| e.encrypted)
 }
 
+/// Are this volume's headers opaque to the streaming mapper even WITH
+/// `password` in hand? True says the in-stream path cannot map the set at
+/// all, so extracting it means reading the volumes off disk through the
+/// rars fork (which does decrypt RAR4 headers) or unrar.
+///
+/// The shape this exists for is RAR4 `-hp`: the main header's
+/// MHD_PASSWORD flag is an unconditional blocker here (see
+/// `parse_block_v4`), because RAR4 header decryption is not implemented in
+/// this parser - a password changes nothing. RAR5's encryption block, by
+/// contrast, parses on with a check-passing password, so a RAR5 `-hp` set
+/// answers false and keeps its in-stream route.
+///
+/// Distinct from [`needs_password`], which asks "is a password needed"
+/// with none supplied; this asks "is the password we have any use to the
+/// streaming path".
+pub fn headers_encrypted_to(path: &std::path::Path, password: Option<&str>) -> bool {
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut m = VolumeMapper::with_password(size, password.map(std::sync::Arc::from));
+    feed_headers_incrementally(&mut f, size, &mut m);
+    matches!(m.blocker, Some(MapBlocker::EncryptedHeaders))
+}
+
 /// in earlier volumes has a known length - resolution is re-run as
 /// volumes parse (cheap: O(total pieces)).
 pub struct ArchiveMap {
     /// (volume, entry) → inner-file base offset.
     pub bases: HashMap<(usize, usize), u64>,
+    /// A piece's offset was derived from BOTH neighbours and the two
+    /// disagreed. Impossible for a healthy set - the headers contradict
+    /// themselves - so the caller demotes rather than writing bytes at
+    /// an offset it cannot justify.
+    pub contradiction: bool,
 }
 
 impl ArchiveMap {
@@ -1265,31 +1330,463 @@ impl ArchiveMap {
     /// volume's final article and blew the holds cap on a 79-volume 35 GB
     /// set (holds grew at line rate for the whole download).
     pub fn resolve(vols: &[&VolumeMapper]) -> ArchiveMap {
-        let mut bases = HashMap::new();
-        // name → (volume index of the file's latest resolved piece,
-        //         cumulative bytes through that piece)
-        let mut cum: HashMap<String, (usize, u64)> = HashMap::new();
-        for (vi, m) in vols.iter().enumerate() {
+        let indexed: Vec<(u64, &VolumeMapper)> =
+            vols.iter().enumerate().map(|(i, m)| (i as u64, *m)).collect();
+        Self::resolve_indexed(&indexed)
+    }
+
+    /// Base offsets for every parsed piece, from volumes that need NOT be
+    /// a consecutive run - each carries its own volume index and
+    /// adjacency is decided per neighbouring pair.
+    ///
+    /// Resolution is a propagation from two kinds of certain seed:
+    ///
+    /// - a piece with `!split_before` STARTS its file, so its base is 0;
+    /// - a piece with `split_before && !split_after` ENDS its file, so its
+    ///   base is `unpacked_size - data_len` - a fact from that one
+    ///   volume's own header, needing no other volume at all.
+    ///
+    /// From any seeded piece the offsets walk BOTH ways along consecutive
+    /// parsed volumes carrying the same inner file: forward by adding the
+    /// earlier piece's length, backward by subtracting the earlier
+    /// piece's own. Repeat to a fixpoint.
+    ///
+    /// The tail seed is what makes multi-file (season-pack) sets place
+    /// under a partial or out-of-order arrival: instead of one run
+    /// reaching back to volume 0, each inner file needs only a run
+    /// containing its own first or last volume. Forward-only resolution
+    /// from volume 0 was why an obfuscated season pack could hold
+    /// unplaceable bytes until the whole set had parsed.
+    ///
+    /// Every base here is DERIVED from a header that actually parsed, so
+    /// unlike the arithmetic gate there is no premise to be wrong about
+    /// and nothing to withdraw later. A piece reached from both
+    /// directions must agree; disagreement means self-contradictory
+    /// headers and sets [`ArchiveMap::contradiction`].
+    pub fn resolve_indexed(vols: &[(u64, &VolumeMapper)]) -> ArchiveMap {
+        let mut bases: HashMap<(usize, usize), u64> = HashMap::new();
+        let mut contradiction = false;
+
+        // 1. Seeds.
+        for (pos, (_, m)) in vols.iter().enumerate() {
             for (ei, e) in m.entries.iter().enumerate() {
                 if e.is_dir {
                     continue;
                 }
-                let base = if e.split_before {
-                    // Valid only when the previous volume's piece of this
-                    // file resolved (no gap in the chain).
-                    match cum.get(&e.name) {
-                        Some(&(last_vi, sum)) if last_vi + 1 == vi => sum,
-                        _ => continue,
+                if !e.split_before {
+                    bases.insert((pos, ei), 0);
+                } else if !e.split_after && tail_anchorable(e) {
+                    // Checked: a piece longer than the file it ends is a
+                    // broken header, not a base.
+                    if let Some(b) = e.unpacked_size.checked_sub(e.data_len) {
+                        bases.insert((pos, ei), b);
                     }
-                } else {
-                    0
-                };
-                bases.insert((vi, ei), base);
-                cum.insert(e.name.clone(), (vi, base + e.data_len));
+                }
             }
         }
-        ArchiveMap { bases }
+
+        // 2. Links between adjacent parsed volumes that continue one
+        //    inner file. A split file has at most ONE piece per volume;
+        //    a volume naming the same file twice is malformed, so that
+        //    name simply does not link (never a guess).
+        let mut links: Vec<(usize, usize, usize, usize, u64)> = Vec::new();
+        for i in 0..vols.len().saturating_sub(1) {
+            if vols[i + 1].0 != vols[i].0 + 1 {
+                continue; // not adjacent volumes - no chain across a gap
+            }
+            let (ma, mb) = (vols[i].1, vols[i + 1].1);
+            for (ea_i, ea) in ma.entries.iter().enumerate() {
+                if ea.is_dir || !ea.split_after {
+                    continue;
+                }
+                let once_a = ma.entries.iter().filter(|x| !x.is_dir && x.name == ea.name).count();
+                if once_a != 1 {
+                    continue;
+                }
+                let Some((eb_i, eb)) = mb
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .find(|(_, x)| !x.is_dir && x.name == ea.name)
+                else {
+                    continue;
+                };
+                if !eb.split_before {
+                    continue;
+                }
+                let once_b = mb.entries.iter().filter(|x| !x.is_dir && x.name == ea.name).count();
+                if once_b != 1 {
+                    continue;
+                }
+                links.push((i, ea_i, i + 1, eb_i, ea.data_len));
+            }
+        }
+
+        // 3. Propagate to a fixpoint. Sweeping forward then backward in
+        //    volume order carries a seed the length of its chain per
+        //    iteration, so this converges in a couple of passes rather
+        //    than one pass per volume.
+        for _ in 0..vols.len().max(1) {
+            let mut changed = false;
+            let mut step = |from: Option<u64>,
+                            to_key: (usize, usize),
+                            bases: &mut HashMap<(usize, usize), u64>,
+                            contradiction: &mut bool| {
+                let Some(want) = from else { return };
+                match bases.get(&to_key) {
+                    None => {
+                        bases.insert(to_key, want);
+                        changed = true;
+                    }
+                    Some(&have) if have != want => *contradiction = true,
+                    _ => {}
+                }
+            };
+            for &(pa, ea, pb, eb, len) in links.iter() {
+                let a = bases.get(&(pa, ea)).copied();
+                step(a.and_then(|b| b.checked_add(len)), (pb, eb), &mut bases, &mut contradiction);
+            }
+            for &(pa, ea, pb, eb, len) in links.iter().rev() {
+                let b = bases.get(&(pb, eb)).copied();
+                if let Some(bv) = b {
+                    match bv.checked_sub(len) {
+                        Some(want) => {
+                            step(Some(want), (pa, ea), &mut bases, &mut contradiction)
+                        }
+                        // The earlier piece would start before the file
+                        // does: the two headers cannot both be true.
+                        None => contradiction = true,
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        ArchiveMap { bases, contradiction }
     }
+
+    /// Arithmetic placement for uniform single-file RAR5 STORE sets:
+    /// when every parsed volume carries exactly one piece of one file
+    /// and the volume geometry is consistent, volume N's piece base is
+    /// computable from N and the geometry alone - every volume is
+    /// placeable the moment ITS OWN headers parse, under any arrival
+    /// order. This is the obfuscated-remux headline shape that chain
+    /// resolution (above) demotes when arrival order keeps the
+    /// consecutive-from-0 run short.
+    ///
+    /// The geometry is NOT "uniform data_len" (the trap that demoted the
+    /// first live set this ran against): real archivers keep the VOLUME
+    /// size constant, so the data area shrinks by a byte wherever the
+    /// main header's volume-number vint grows - at volume 128, again at
+    /// 16384 - and volume 0, whose number field is absent entirely,
+    /// carries one byte MORE than volumes 1..127. The true invariants,
+    /// validated against every parsed volume:
+    ///
+    ///   data_off(k) == off_base + volnum_field_len(k)
+    ///   data_off(k) + data_len(k) == data_end          (non-final k)
+    ///
+    /// from which any volume's base follows in closed form:
+    ///
+    ///   D = data_end - off_base                      (= volume 0's dl)
+    ///   base(N) = sum of dl(k) for k < N = N*D - S(N)
+    ///
+    /// with S(N) the total volume-number field bytes across volumes
+    /// 0..N-1 ([`volnum_field_bytes_before`]). A set whose non-final
+    /// pieces all share one data_len regardless of header size (some
+    /// custom packers) does NOT fit this model and stays on the chain
+    /// path - business as usual, never a demote.
+    ///
+    /// `vols` is every parsed mapper of the group, in ANY order. The
+    /// distinction between the two failure modes matters to the caller:
+    /// [`ArithGate::Shape`] says "not this kind of set" (multi-file,
+    /// RAR4, encrypted, unnumbered...) - chain territory - while
+    /// [`ArithGate::Numbers`] says the set LOOKS like this shape but its
+    /// numbers contradict the premise, so any bytes placed under it are
+    /// suspect.
+    pub fn resolve_arithmetic(vols: &[&VolumeMapper]) -> ArithGate {
+        use ArithGate::{Numbers, Shape};
+        if vols.is_empty() {
+            return Shape;
+        }
+        let mut geom: Option<(u64, u64)> = None; // (off_base, data_end) from non-finals
+        let mut fin: Option<(u64, u64, u64)> = None; // final (volnum, data_len, data_off)
+        let mut total: Option<u64> = None;
+        let mut name: Option<&str> = None;
+        let mut seen: HashSet<u64> = HashSet::with_capacity(vols.len());
+        // Did a parsed volume 0 actually START this file? (Half of the
+        // premise proof below.)
+        let mut starts_at_zero = false;
+        for m in vols {
+            if m.version != Some(RarVersion::V5) || m.blocker.is_some() {
+                return Shape;
+            }
+            let Some(vn) = m.volume_number else { return Shape };
+            let [e] = m.entries.as_slice() else { return Shape };
+            // Encrypted entries (with OR without a usable password) stay
+            // on the chain path - the in-stream decrypt machinery was
+            // built and verified against chained placement.
+            if e.is_dir
+                || e.encrypted
+                || e.crypt.is_some()
+                || e.size_unknown
+                || !matches!(e.method, Method::Store)
+                || e.unpacked_size == 0
+            {
+                return Shape;
+            }
+            match &name {
+                None => name = Some(e.name.as_str()),
+                Some(n) if *n == e.name => {}
+                Some(_) => return Shape,
+            }
+            // A piece that STARTS anywhere but volume 0 means a second
+            // file begins mid-set: multi-file territory, the chain's job.
+            if vn > 0 && !e.split_before {
+                return Shape;
+            }
+            match total {
+                None => total = Some(e.unpacked_size),
+                Some(t) if t == e.unpacked_size => {}
+                Some(_) => return Numbers,
+            }
+            if vn == 0 && e.split_before {
+                return Numbers; // a continuation at the archive head
+            }
+            if vn == 0 {
+                starts_at_zero = true;
+            }
+            if !seen.insert(vn) {
+                return Numbers; // duplicate volume number
+            }
+            // Header-base consistency: this volume's data offset must sit
+            // exactly volnum_field_len(vn) past the shared base.
+            let Some(off_base) = e.data_off.checked_sub(volnum_field_len(vn)) else {
+                return Numbers;
+            };
+            if e.split_after {
+                if e.data_len == 0 {
+                    return Shape;
+                }
+                let Some(dend) = e.data_off.checked_add(e.data_len) else {
+                    return Numbers;
+                };
+                match geom {
+                    None => geom = Some((off_base, dend)),
+                    Some((ob, de)) if ob == off_base && de == dend => {}
+                    Some(_) => return Numbers, // volume geometry contradicts
+                }
+            } else {
+                if let Some(&(ob, _)) = geom.as_ref() {
+                    if ob != off_base {
+                        return Numbers;
+                    }
+                }
+                if fin.replace((vn, e.data_len, e.data_off)).is_some() {
+                    return Numbers; // two declared-final pieces of one file
+                }
+            }
+        }
+        // A final parsed before any non-final: its off_base still has to
+        // agree once geometry is known - re-check it here (the loop only
+        // compared when geom was already set).
+        if let (Some((fvn, _, foff)), Some((ob, _))) = (fin, geom) {
+            if foff.checked_sub(volnum_field_len(fvn)) != Some(ob) {
+                return Numbers;
+            }
+        }
+        let total = total.unwrap();
+        // Per-volume capacity D (volume 0's data_len): from geometry, or
+        // derived from the final piece when only IT has parsed - the
+        // premise fixes base(fvn) == total - fdl, so D must divide out
+        // exactly.
+        let d = match (geom, fin) {
+            (Some((ob, de)), _) => {
+                let Some(d) = de.checked_sub(ob) else { return Numbers };
+                d
+            }
+            (None, Some((fvn, fdl, _))) if fvn > 0 => {
+                let Some(head) = total.checked_sub(fdl) else { return Numbers };
+                let Some(s) = volnum_field_bytes_before(fvn) else { return Numbers };
+                let Some(num) = head.checked_add(s) else { return Numbers };
+                if num % fvn != 0 {
+                    return Numbers;
+                }
+                let d = num / fvn;
+                if d == 0 || fdl > d {
+                    return Numbers;
+                }
+                d
+            }
+            // Only a volnum-0 piece parsed; D is unused below.
+            _ => 0,
+        };
+        // PROOF that the premise holds, before a single byte is placed on
+        // it. The premise is "this file begins at volume 0", and headers
+        // establish it exactly two ways: a parsed volume 0 whose piece
+        // STARTS the file, or the closure identity against a parsed FINAL
+        // piece (base(fvn) == total - fdl). Without one, this is not a
+        // shape we may place - and that is `Shape`, not `Numbers`.
+        //
+        // Both halves matter. Refusing to bet without proof is what stops
+        // a season pack's continuation-only group - locally uniform,
+        // single-name, single-entry, but with absolute volume numbers and
+        // a file that starts far into the set - from being placed at
+        // offsets that are simply wrong. And reporting it as a different
+        // shape rather than a contradiction is what keeps it streaming:
+        // chain resolution places it correctly, so there is nothing to
+        // demote.
+        //
+        // The proof costs nothing against the alternative: the tail seed
+        // that chain resolution needs is the SAME fact as closure proof
+        // here, so a set that could have been placed eagerly can be
+        // placed by propagation at the same moment.
+        //
+        // The distinction is load-bearing. A group holding only the
+        // CONTINUATION volumes of a middle file - a season pack before
+        // its per-file groups merge - looks locally uniform, single-name
+        // and single-entry, and satisfies every per-volume rule above.
+        // What it cannot satisfy is the premise that its file begins at
+        // volume 0: its volume numbers are absolute while its file starts
+        // far into the set, so the closure identity fails. Reporting that
+        // as a contradiction demoted healthy season packs (the whole
+        // shape this path exists to keep streaming); reporting it as a
+        // different shape costs nothing, because the chain handles it.
+        let mut proven = starts_at_zero;
+        if let Some((fvn, fdl, _)) = fin {
+            if seen.iter().any(|&v| v > fvn) {
+                return Shape; // pieces past the declared last volume
+            }
+            let Some(head) = total.checked_sub(fdl) else {
+                return Shape;
+            };
+            if fvn == 0 {
+                if head != 0 {
+                    return Shape; // an unsplit volume must hold the whole file
+                }
+            } else if arith_base(fvn, d) != Some(head) || fdl > d {
+                return Shape; // the set does not close from volume 0
+            }
+            proven = true;
+        }
+        if !proven {
+            return Shape;
+        }
+        let mut bases = Vec::with_capacity(vols.len());
+        for m in vols {
+            let e = &m.entries[0];
+            let vn = m.volume_number.unwrap();
+            let base = if !e.split_before {
+                0
+            } else if !e.split_after {
+                total - e.data_len // final piece; fits by checked_sub above
+            } else {
+                match arith_base(vn, d) {
+                    Some(b) => b,
+                    None => return Numbers,
+                }
+            };
+            // A piece landing outside the declared file means the
+            // premise (this file starts at volume 0, uniform capacity)
+            // does not describe this set - most often a continuation-only
+            // group whose absolute volume numbers run far past its own
+            // file. Not a contradiction: hand it to the chain.
+            if base.checked_add(e.data_len).map_or(true, |end| end > total) {
+                return Shape;
+            }
+            bases.push(base);
+        }
+        // Volume numbers are distinct and all <= fvn, so a count of
+        // fvn + 1 means exactly {0..=fvn}: the complete set, closed.
+        // `saturating_add`, like every other arithmetic in this function:
+        // `fvn` is a header vint, and a crafted volume number of u64::MAX
+        // satisfies every guard above (a zero-length FINAL piece is accepted
+        // - the data_len reject lives in the split_after arm). Release wraps
+        // to 0 and answers "not closed", which is safe; debug and test builds
+        // panicked here while holding the routing lock, poisoning it for the
+        // rest of the job.
+        let closed = fin.is_some_and(|(fvn, _, _)| seen.len() as u64 == fvn.saturating_add(1));
+        ArithGate::Place { bases, closed }
+    }
+}
+
+/// Bytes the RAR5 main header spends on the volume-number field for
+/// volume `vn`: absent on volume 0 (MHD_VOLUME implies "first"), else
+/// the vint length of the number - 1 byte through volume 127, 2 through
+/// 16383, and so on.
+fn volnum_field_len(vn: u64) -> u64 {
+    if vn == 0 {
+        return 0;
+    }
+    let mut n = vn;
+    let mut l = 0u64;
+    while n > 0 {
+        n >>= 7;
+        l += 1;
+    }
+    l
+}
+
+/// S(N): total volume-number field bytes across volumes 0..N-1 - the
+/// closed-form band sum behind `base(N) = N*D - S(N)`.
+fn volnum_field_bytes_before(n: u64) -> Option<u64> {
+    let mut s = 0u64;
+    let mut band_start = 1u64; // volume 0 contributes nothing
+    let mut len = 1u64;
+    while band_start < n {
+        let band_end = if len >= 10 {
+            u64::MAX
+        } else {
+            (1u64 << (7 * len)) - 1
+        };
+        let hi = band_end.min(n - 1);
+        s = s.checked_add((hi - band_start + 1).checked_mul(len)?)?;
+        if band_end >= n.saturating_sub(1) {
+            break;
+        }
+        band_start = band_end + 1;
+        len += 1;
+    }
+    Some(s)
+}
+
+/// base(N) = N*D - S(N): the inner-file offset where volume N's piece
+/// starts, under the constant-volume-size geometry. None on overflow or
+/// an impossible (S > N*D) combination - hostile headers fail closed.
+fn arith_base(n: u64, d: u64) -> Option<u64> {
+    n.checked_mul(d)?.checked_sub(volnum_field_bytes_before(n)?)
+}
+
+/// May this piece's base be derived from `unpacked_size - data_len`?
+///
+/// Only for a plain stored, unencrypted member. For a COMPRESSED entry
+/// `data_len` is the packed length while `unpacked_size` is the unpacked
+/// one, so the subtraction is meaningless. For an ENCRYPTED one the
+/// pieces tile block-padded CIPHER space whose total is `sum(data_len)`
+/// and can exceed `unpacked_size` (the finish pass truncates to it), so
+/// the same subtraction is wrong - those keep resolving by summing
+/// lengths forward, which is correct in cipher space.
+fn tail_anchorable(e: &FileEntry) -> bool {
+    matches!(e.method, Method::Store)
+        && !e.encrypted
+        && e.crypt.is_none()
+        && !e.size_unknown
+        && !e.is_dir
+        && e.data_len <= e.unpacked_size
+}
+
+/// Outcome of [`ArchiveMap::resolve_arithmetic`].
+pub enum ArithGate {
+    /// Gate passed: `bases[i]` is the inner-file base offset of
+    /// `vols[i]`'s single entry. `closed` means the parsed volumes form
+    /// the complete set 0..=last, ending in the declared final piece -
+    /// the premise is proven, not just unrefuted.
+    Place { bases: Vec<u64>, closed: bool },
+    /// Not this shape at all - chain resolution territory.
+    Shape,
+    /// The shape matched but the numbers contradict the uniform
+    /// single-file premise.
+    Numbers,
 }
 
 // ---------------------------------------------------------------------------
@@ -1745,6 +2242,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The discriminator the extraction ladder's RAR4 shortcut rests on:
+    /// "is the password we hold any use to the STREAMING path". RAR4 `-hp`
+    /// answers yes-still-opaque whatever we pass, because header
+    /// decryption is not implemented here; RAR5 `-hp` with a
+    /// check-passing password parses on and must keep its in-stream route.
+    #[test]
+    fn headers_encrypted_to_separates_rar4_hp_from_rar5_hp() {
+        let dir = std::env::temp_dir().join(format!("nzbkit-hdrenc-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let write = |name: &str, bytes: &[u8]| {
+            let p = dir.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            p
+        };
+        let rar4 = write("hp4.rar", &fixtures::rar4_encrypted_headers(64));
+        assert!(headers_encrypted_to(&rar4, None));
+        assert!(
+            headers_encrypted_to(&rar4, Some("whatever")),
+            "RAR4 -hp is opaque to the mapper with a password too"
+        );
+
+        let rar5 = write("hp5.rar", ENC_HDRS);
+        assert!(headers_encrypted_to(&rar5, None));
+        assert!(
+            !headers_encrypted_to(&rar5, Some(PW)),
+            "RAR5 -hp decrypts in-stream - it must not be diverted to disk"
+        );
+        // A wrong password is a BadPassword blocker, not an opaque one:
+        // reading the volumes off disk would not help either, so the
+        // streaming path keeps it and reports the real reason.
+        assert!(!headers_encrypted_to(&rar5, Some("nope")));
+
+        // Nothing encrypted, and a non-archive: never divert.
+        let store = fixtures::rar4_volume(&[("a.bin", 4, b"data", false, false)]);
+        assert!(!headers_encrypted_to(&write("plain.rar", &store), Some(PW)));
+        assert!(!headers_encrypted_to(&write("junk.rar", b"not a rar"), Some(PW)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Feed a volume to a mapper in shuffled article-sized chunks.
     fn feed_shuffled(m: &mut VolumeMapper, vol: &[u8], art: usize, seed: u64) {
         let mut idx: Vec<usize> = (0..vol.len().div_ceil(art)).collect();
@@ -1859,15 +2395,76 @@ mod tests {
 
     #[test]
     fn v5_bases_wait_for_missing_volume() {
-        let total = payload(200_000, 4);
-        let v1 = fixtures::rar5_volume(&[("x.bin", 200_000, &total[..100_000], false, true)]);
-        let v2 = fixtures::rar5_volume(&[("x.bin", 200_000, &total[100_000..], true, false)]);
+        // Three volumes, only the LAST parsed. Its piece ends the file,
+        // so its base is `unpacked_size - data_len` from its own header
+        // alone - no chain, no neighbours. (This used to assert the
+        // opposite: forward-only resolution could place nothing until
+        // volume 1 arrived, which is what stalled obfuscated season
+        // packs.)
+        let total = payload(300_000, 4);
+        let v1 = fixtures::rar5_volume(&[("x.bin", 300_000, &total[..100_000], false, true)]);
+        let v2 =
+            fixtures::rar5_volume(&[("x.bin", 300_000, &total[100_000..200_000], true, true)]);
+        let v3 = fixtures::rar5_volume(&[("x.bin", 300_000, &total[200_000..], true, false)]);
         let m1 = VolumeMapper::new(v1.len() as u64); // never fed!
+        let m2 = VolumeMapper::new(v2.len() as u64); // never fed!
+        let mut m3 = VolumeMapper::new(v3.len() as u64);
+        m3.feed(0, &v3);
+        let map = ArchiveMap::resolve(&[&m1, &m2, &m3]);
+        assert_eq!(map.bases.get(&(2, 0)).copied(), Some(200_000));
+        assert!(!map.contradiction);
+        // The MIDDLE piece is still unplaceable on its own - it is
+        // neither the file's head nor its tail, so it genuinely needs a
+        // neighbour. That is the limit the tail seed does not remove.
         let mut m2 = VolumeMapper::new(v2.len() as u64);
         m2.feed(0, &v2);
-        let map = ArchiveMap::resolve(&[&m1, &m2]);
-        // Volume 2's base must NOT resolve while volume 1 is unparsed.
-        assert!(map.bases.is_empty());
+        let m3_empty = VolumeMapper::new(v3.len() as u64); // never fed!
+        let map = ArchiveMap::resolve(&[&m1, &m2, &m3_empty]);
+        assert!(map.bases.is_empty(), "{:?}", map.bases);
+    }
+
+    /// The tail seed walks BACKWARD: once the final piece is anchored,
+    /// each earlier piece of the same file follows from it, so a set
+    /// resolves from its end even with volume 0 still missing.
+    #[test]
+    fn v5_bases_walk_backward_from_the_final_piece() {
+        let total = payload(300_000, 6);
+        let v1 = fixtures::rar5_volume(&[("x.bin", 300_000, &total[..100_000], false, true)]);
+        let v2 =
+            fixtures::rar5_volume(&[("x.bin", 300_000, &total[100_000..200_000], true, true)]);
+        let v3 = fixtures::rar5_volume(&[("x.bin", 300_000, &total[200_000..], true, false)]);
+        let m1 = VolumeMapper::new(v1.len() as u64); // never fed!
+        let mut m2 = VolumeMapper::new(v2.len() as u64);
+        let mut m3 = VolumeMapper::new(v3.len() as u64);
+        m2.feed(0, &v2);
+        m3.feed(0, &v3);
+        let map = ArchiveMap::resolve(&[&m1, &m2, &m3]);
+        assert_eq!(map.bases.get(&(2, 0)).copied(), Some(200_000));
+        assert_eq!(map.bases.get(&(1, 0)).copied(), Some(100_000), "backward step");
+        assert!(!map.contradiction);
+    }
+
+    /// Headers that disagree with themselves: the piece in volume 2 is
+    /// reachable forward from volume 1 and backward from volume 3, and
+    /// the two answers differ. Nothing may be placed on a guess, so the
+    /// map reports the contradiction and the caller demotes.
+    #[test]
+    fn v5_bases_flag_a_self_contradictory_chain() {
+        let total = payload(300_000, 8);
+        // Volume 2 claims a piece longer than the gap the other two
+        // leave for it.
+        let v1 = fixtures::rar5_volume(&[("x.bin", 300_000, &total[..100_000], false, true)]);
+        let v2 = fixtures::rar5_volume(&[("x.bin", 300_000, &total[..150_000], true, true)]);
+        let v3 = fixtures::rar5_volume(&[("x.bin", 300_000, &total[200_000..], true, false)]);
+        let mut ms = Vec::new();
+        for v in [&v1, &v2, &v3] {
+            let mut m = VolumeMapper::new(v.len() as u64);
+            m.feed(0, v);
+            ms.push(m);
+        }
+        let refs: Vec<&VolumeMapper> = ms.iter().collect();
+        let map = ArchiveMap::resolve(&refs);
+        assert!(map.contradiction, "disagreeing neighbours must be reported");
     }
 
     #[test]
@@ -2440,6 +3037,52 @@ mod tests {
 
     /// The no-password check-value probe: harvest crypt params off an
     /// on-disk archive and rule a candidate in or out without decrypting.
+    /// Volume 0's main header carries no volume-number field, so the SAME
+    /// pieces produce a file exactly one byte shorter at `vol_no` 0 than at
+    /// 1. Pinned here, where the asymmetry originates, because every
+    /// multi-volume fixture in the workspace has to compensate for it and
+    /// each one was re-deriving it by hand - or, more often, not.
+    ///
+    /// A store set is "uniform" when the volume FILES are the same size, so
+    /// a fixture that splits its payload into equal pieces is NOT uniform:
+    /// volume 0 comes out a byte short. That matters because the extractor's
+    /// arithmetic gate speculates bases under a uniform premise and demotes
+    /// the group when headers contradict it - which made
+    /// `nested_inner_par2_repairs_data_damaged_store_layer` a race between
+    /// two correct demotion reasons, passing under load and failing on a
+    /// slower runner (it reproduced 8 times in 30 on macOS). A fixture that
+    /// wants a uniform set gives volume 0 one byte MORE data; one that wants
+    /// a non-uniform set can keep equal pieces, which is a legitimate shape
+    /// real posters produce.
+    ///
+    /// If this test fails, the helper's header layout moved and every
+    /// multi-volume fixture's geometry needs re-checking.
+    #[test]
+    fn volume_zero_header_is_one_byte_shorter_than_the_rest() {
+        let body = vec![b'x'; 4096];
+        let piece = |crc: Option<u32>| {
+            vec![("v.bin", 8192u64, &body[..], false, true, crc)]
+        };
+        let v0 = fixtures::rar5_volume_n_crc(&piece(Some(1)), 0);
+        let v1 = fixtures::rar5_volume_n_crc(&piece(Some(1)), 1);
+        assert_eq!(
+            v1.len(),
+            v0.len() + 1,
+            "vol 0 must be exactly one byte shorter for the same pieces \
+             (got {} at vol 0, {} at vol 1) - every multi-volume fixture's \
+             uniformity depends on this",
+            v0.len(),
+            v1.len()
+        );
+        // ...so equal pieces are NOT a uniform set, and one extra byte in
+        // volume 0 IS - the two facts fixtures actually need.
+        let mut long = body.clone();
+        long.push(b'x');
+        let v0_plus =
+            fixtures::rar5_volume_n_crc(&[("v.bin", 8192, &long[..], false, true, Some(1))], 0);
+        assert_eq!(v0_plus.len(), v1.len(), "one extra data byte in vol 0 evens the files up");
+    }
+
     #[test]
     fn crypt_probe_verifies_without_decrypt() {
         let dir = std::env::temp_dir().join(format!("nzbkit-cryptprobe-{}", std::process::id()));

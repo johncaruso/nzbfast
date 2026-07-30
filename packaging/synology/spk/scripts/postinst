@@ -142,44 +142,73 @@ if [ -z "$BASE" ]; then
     echo "nzbfast: in the nzbfast dashboard under Settings." >&2
 fi
 
-OUT="$BASE/downloads"
-WATCH="$BASE/watch"
-
-# Only ever chown a directory this script CREATED. The obvious candidate
-# path, <share>/nzbfast, is exactly what an existing Container Manager
-# install already uses - config, index.db, apikey, downloads and watch all
-# live under it - so anyone migrating from Docker has one sitting there,
-# full of data, owned by them. Recursively chowning that to the package
-# service account would take their running install's files away from it,
-# to fix a permission problem they did not have. Adopt what is already
-# there instead, and say so.
-reused=""
-for d in "$OUT" "$WATCH"; do
-    [ -d "$d" ] && reused="$reused $d"
-done
-
 # DSM creates var/ owned by this package's service account, whose name
 # differs between DSM builds and package origins. Reading it off the
 # directory DSM just made is more reliable than hardcoding a guess.
 owner=$(stat -c %U "$VAR" 2>/dev/null || echo "")
 group=$(stat -c %G "$VAR" 2>/dev/null || echo "")
 
-for d in "$OUT" "$WATCH"; do
-    if [ -d "$d" ]; then
-        continue
-    fi
-    mkdir -p "$d"
-    if [ -n "$owner" ] && [ "$owner" != "UNKNOWN" ]; then
-        chown -R "$owner:${group:-$owner}" "$d" 2>/dev/null || true
-    fi
-done
+# Create the pair under $1, chowning ONLY what we actually create.
+#
+# Never chown something that was already there. The obvious path,
+# <share>/nzbfast, is exactly what an existing Container Manager install
+# uses - config, index.db, apikey, downloads and watch all live under it -
+# so anyone migrating from Docker has one sitting there full of live data.
+# Recursively chowning that to the package account would take a running
+# install's files away from it, to fix a problem they did not have.
+#
+# Returns non-zero without side effects if the location is unusable.
+make_dirs() {
+    _base="$1"
+    _reused=""
+    for _d in "$_base/downloads" "$_base/watch"; do
+        if [ -d "$_d" ]; then
+            _reused="$_reused $_d"
+            continue
+        fi
+        mkdir -p "$_d" 2>/dev/null || return 1
+        if [ -n "$owner" ] && [ "$owner" != "UNKNOWN" ]; then
+            chown -R "$owner:${group:-$owner}" "$_d" 2>/dev/null || true
+        fi
+    done
+    REUSED="$_reused"
+    return 0
+}
 
-if [ -n "$reused" ]; then
+# A DSM 7 package runs as its own internal user, and that user has NO
+# access to shared folders until an administrator grants it in DSM. A
+# shared folder visible from a root shell is therefore not one this script
+# can write to: /volume1/Downloads exists and is mode 777, and mkdir still
+# failed with "cannot create directory '/volume1/Downloads'" because the
+# path is not visible from in here at all.
+#
+# So install must never DEPEND on a shared folder. Falling back to the
+# package's own storage keeps the one-click install working on every NAS,
+# and moving downloads somewhere browsable becomes a deliberate choice
+# made afterwards in DSM, where granting that permission is a supported
+# operation rather than something an install script forces.
+REUSED=""
+if ! make_dirs "$BASE"; then
+    echo "nzbfast: cannot write to $BASE." >&2
+    echo "nzbfast: this package's user has not been granted access to" >&2
+    echo "nzbfast: that shared folder. That is normal on DSM 7, not a" >&2
+    echo "nzbfast: fault - using the package's own storage instead." >&2
+    echo "nzbfast: to keep downloads in a shared folder: Control Panel >" >&2
+    echo "nzbfast: Shared Folder > Edit > Permissions > System internal" >&2
+    echo "nzbfast: user, give 'nzbfast' read/write, then set the download" >&2
+    echo "nzbfast: folder in the nzbfast dashboard." >&2
+    BASE="$VAR"
+    if ! make_dirs "$BASE"; then
+        echo "nzbfast: cannot write to its own storage at $BASE either." >&2
+        exit 1
+    fi
+fi
+OUT="$BASE/downloads"
+WATCH="$BASE/watch"
+
+if [ -n "$REUSED" ]; then
     echo "nzbfast: reusing existing folders, ownership left as it is:" >&2
-    for d in $reused; do echo "nzbfast:   $d" >&2; done
-    echo "nzbfast: if nzbfast cannot write there, grant the package user" >&2
-    echo "nzbfast: access to that shared folder in DSM rather than" >&2
-    echo "nzbfast: changing the folder's owner." >&2
+    for d in $REUSED; do echo "nzbfast:   $d" >&2; done
 fi
 
 umask 077

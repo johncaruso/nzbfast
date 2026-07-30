@@ -1212,13 +1212,140 @@ impl Archive {
         if files.len() < 2 {
             return self.extract_to(options, open);
         }
-        let entries = crate::parallel::map_collect(files, |file| {
-            decode_parallel_entry(self, file, password)
-        })?;
-        for entry in entries {
-            write_parallel_entry(entry, &mut open)?;
-        }
-        Ok(())
+
+        // Budgeted worker pool (the rar50 member-pool shape): the old
+        // rayon map_collect buffered EVERY member's bytes at once, so peak
+        // memory was the whole unpacked archive. Workers now decode under
+        // an in-flight byte budget and the coordinator writes in archive
+        // order as members complete - which also matches the serial path's
+        // incremental write semantics (first failing member in archive
+        // order wins, earlier members are already written).
+        use std::collections::BTreeMap;
+        use std::sync::mpsc;
+        use std::sync::{Arc, Condvar, Mutex};
+
+        #[cfg(not(test))]
+        const INFLIGHT_BUDGET: u64 = 64 << 20;
+        #[cfg(test)]
+        const INFLIGHT_BUDGET: u64 = 8 * 1024;
+
+        let workers = std::thread::available_parallelism()
+            .map_or(4, |n| n.get())
+            .saturating_sub(1)
+            .clamp(1, 8)
+            .min(files.len());
+        let budget = Arc::new((Mutex::new((0u64, false)), Condvar::new()));
+        let (work_tx, work_rx) = mpsc::sync_channel::<usize>(workers * 2);
+        let work_rx = Arc::new(Mutex::new(work_rx));
+        let (result_tx, result_rx) =
+            mpsc::channel::<(usize, Result<ParallelExtractedEntry>)>();
+
+        let outcome = std::thread::scope(|scope| {
+            {
+                let budget = Arc::clone(&budget);
+                let files = &files;
+                scope.spawn(move || {
+                    for (index, file) in files.iter().enumerate() {
+                        let size = file.unp_size;
+                        let (lock, cvar) = &*budget;
+                        let mut state = lock.lock().expect("pool budget lock");
+                        while !state.1 && state.0 > 0 && state.0 + size > INFLIGHT_BUDGET {
+                            state = cvar.wait(state).expect("pool budget wait");
+                        }
+                        if state.1 {
+                            return;
+                        }
+                        state.0 += size;
+                        drop(state);
+                        if work_tx.send(index).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+            for _ in 0..workers {
+                let work_rx = Arc::clone(&work_rx);
+                let result_tx = result_tx.clone();
+                let files = &files;
+                scope.spawn(move || loop {
+                    let index = match work_rx.lock().expect("pool work lock").recv() {
+                        Ok(index) => index,
+                        Err(_) => return,
+                    };
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        decode_parallel_entry(self, files[index], password)
+                    }))
+                    .unwrap_or(Err(Error::InvalidHeader(
+                        "RAR member decode worker panicked",
+                    )));
+                    if result_tx.send((index, result)).is_err() {
+                        return;
+                    }
+                });
+            }
+            drop(result_tx);
+            // Drop the outer receiver handle so the workers hold the ONLY
+            // ones. This is what frees a feeder blocked on a full
+            // `work_tx.send`: `drop(result_rx)` below makes every worker return
+            // WITHOUT draining the work channel, so while an Arc clone stayed
+            // alive in the enclosing frame that send could never fail and
+            // `thread::scope` never returned.
+            //
+            // Narrower than it looks, and measured rather than reasoned about:
+            // an ordinary Err from the coordinator never hung here, even before
+            // this drop existed. The worker that delivers the failing result
+            // pops one more item on its way out, which frees the very slot the
+            // blocked send wants, and the feeder re-checks the abort flag at
+            // the top of its next iteration. What hangs is a coordinator PANIC,
+            // which unwinds past every explicit wake-up - and covering it takes
+            // BOTH this drop and `_abort` below, because the feeder parks in
+            // two different places and each ignores the other's signal.
+            //
+            // The rar50 twin (extract_volumes_pooled) terminates without this
+            // only because it never drops its result receiver, so its workers
+            // keep draining the work queue.
+            drop(work_rx);
+            // The feeder's other parking spot: `cvar.wait` on the byte budget,
+            // which only a notify frees. `write_parallel_entry` calls the
+            // caller's `open` and then its `Write`, either of which can panic,
+            // and the explicit abort-and-notify this replaces sat below the
+            // coordinator where an unwind skipped it.
+            let _abort = crate::parallel::PoolAbortGuard::new(&budget);
+
+            let mut pending: BTreeMap<usize, Result<ParallelExtractedEntry>> = BTreeMap::new();
+            let mut run = || -> Result<()> {
+                for (index, file) in files.iter().enumerate() {
+                    let result = loop {
+                        if let Some(result) = pending.remove(&index) {
+                            break result;
+                        }
+                        match result_rx.recv() {
+                            Ok((got, result)) if got == index => break result,
+                            Ok((got, result)) => {
+                                pending.insert(got, result);
+                            }
+                            Err(_) => {
+                                return Err(Error::InvalidHeader(
+                                    "RAR member decode pool disconnected",
+                                ));
+                            }
+                        }
+                    };
+                    write_parallel_entry(result?, &mut open)?;
+                    let (lock, cvar) = &*budget;
+                    let mut state = lock.lock().expect("pool budget lock");
+                    state.0 = state.0.saturating_sub(file.unp_size);
+                    drop(state);
+                    cvar.notify_all();
+                }
+                Ok(())
+            };
+            let outcome = run();
+            // Unblock a worker mid-send; `_abort` handles the feeder.
+            drop(result_rx);
+            outcome
+        });
+        outcome
     }
 
     pub fn archive_comment(&self) -> Result<Option<Vec<u8>>> {

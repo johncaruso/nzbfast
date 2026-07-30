@@ -1,4 +1,7 @@
 import Foundation
+// Launcher handshake only (see `isNzbfast`): the engine proves it holds the
+// token in runtime.json before this wrapper hands it the stored API key.
+import CryptoKit
 
 /// Owns the bundled `nzbfast serve` engine: attach to an already-running
 /// daemon on the persisted port, or spawn our own as a managed child.
@@ -140,9 +143,43 @@ final class Daemon {
 
     // MARK: probing
 
+    /// What `runtime.json` says about the engine we expect to find: the
+    /// port it bound, and the per-start secret it can prove it holds.
+    /// Written by the engine once its listener exists; absent for an
+    /// engine older than the handshake, or one started elsewhere.
+    private func runtimeToken(forPort port: Int) -> String? {
+        guard let data = try? Data(contentsOf: dataDir.appendingPathComponent("runtime.json")),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let filePort = obj["port"] as? Int, filePort == port,
+              let token = (obj["token"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !token.isEmpty
+        else { return nil }
+        return token
+    }
+
+    /// sha256("token:nonce") as lowercase hex - the answer the engine
+    /// returns for `hs=<nonce>`, computed here to compare with it.
+    static func launcherProof(token: String, nonce: String) -> String {
+        let digest = SHA256.hash(data: Data("\(token):\(nonce)".utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
     /// Does `port` answer /api?mode=version as an nzbfast daemon?
     /// A keyed daemon's refusal counts too: only nzbfast answers in that
     /// shape, and the dashboard is handed the key (or prompts) after attach.
+    ///
+    /// A reply shape is not identity, though, and a true answer here means
+    /// attach-and-then-hand-over-the-API-key. So when `runtime.json` names
+    /// THIS port, the listener must also prove it holds that file's token:
+    /// any local account can print our JSON, but only this user can read
+    /// that file (Application Support is user-only). The token never
+    /// travels in either direction - the engine returns
+    /// sha256(token:nonce) for a nonce we make up per probe - so probing an
+    /// impostor teaches it nothing.
+    ///
+    /// An engine that answers with no proof at all is accepted as before:
+    /// that is what an engine older than this handshake does, and refusing
+    /// it would break attaching across the upgrade.
     func isNzbfast(port: Int, timeout: TimeInterval = 1.5) async -> Bool {
         // Probe WITHOUT the key. Nothing has authenticated the far side yet, so
         // any unprivileged local process that binds this port first (6789 is
@@ -151,14 +188,38 @@ final class Daemon {
         // get_config/server_secret, i.e. the Usenet provider password in
         // cleartext. The key isn't needed here: the refusal phrases below are
         // signature enough, and only nzbfast answers in that shape.
-        let q = "mode=version"
+        // The challenge rides the same keyless probe: a fresh nonce per
+        // call, so a recorded answer cannot be replayed at us later.
+        let nonce = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        let q = "mode=version&hs=\(nonce)"
         guard let url = URL(string: "http://127.0.0.1:\(port)/api?\(q)") else { return false }
         var req = URLRequest(url: url)
         req.timeoutInterval = timeout
         guard let (data, _) = try? await URLSession.shared.data(for: req),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return false }
-        return Daemon.isNzbfastReply(obj)
+        guard Daemon.isNzbfastReply(obj) else { return false }
+        return Daemon.provesIdentity(obj, token: runtimeToken(forPort: port), nonce: nonce)
+    }
+
+    /// The identity half of the probe, split out so it is testable without
+    /// a socket. See `isNzbfast` for why each arm is what it is.
+    static func provesIdentity(_ obj: [String: Any], token: String?, nonce: String) -> Bool {
+        guard let token else {
+            // Nothing to hold it to: no runtime.json for this port.
+            return true
+        }
+        guard let proof = obj["hs_proof"] as? String else {
+            // An engine older than the handshake. Accepting it is what keeps
+            // the upgrade working; it is also exactly the pre-handshake
+            // behaviour, not a new hole.
+            return true
+        }
+        let want = launcherProof(token: token, nonce: nonce)
+        // Length first, then a full-width compare - no early exit on the
+        // first differing byte.
+        guard want.utf8.count == proof.utf8.count else { return false }
+        return zip(want.utf8, proof.utf8).reduce(UInt8(0)) { $0 | ($1.0 ^ $1.1) } == 0
     }
 
     /// Classify a decoded /api?mode=version reply. Split out so the rule is

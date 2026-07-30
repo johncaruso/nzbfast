@@ -155,10 +155,21 @@ fn unix_now() -> i64 {
 }
 
 fn have_par2() -> bool {
-    Command::new("par2")
+    let ok = Command::new("par2")
         .arg("-V")
         .output()
-        .is_ok_and(|o| o.status.success())
+        .is_ok_and(|o| o.status.success());
+    // CI installs par2 on purpose (see pr-check.yml, both legs), so there a
+    // missing one is a broken job, not a reason to quietly cover less. Every
+    // caller of this SKIPS when it is false, which is exactly the shape that
+    // reads as a green run with silently reduced coverage - the failure mode
+    // this whole Windows pass kept turning up.
+    assert!(
+        ok || std::env::var_os("NZBFAST_REQUIRE_PAR2").is_none(),
+        "NZBFAST_REQUIRE_PAR2 is set but `par2 -V` does not run - the PAR2 tests \
+         would have skipped and the run would have looked green"
+    );
+    ok
 }
 
 /// Run `nzbfast get` and return (stdout+stderr, success).
@@ -220,14 +231,16 @@ fn run_get_win(
 /// volumes. Returns (fixture, inner file bytes, volume names).
 fn rar_release(tag: &str, with_par2: bool) -> (Fixture, Vec<u8>, Vec<String>) {
     let mut fx = Fixture::new(tag);
+    // WinRAR-true geometry: volume 0 (no volume-number field in its main
+    // header) carries one byte more data than volume 1.
     let inner = payload(900_000, 7);
     let vols = [
-        fixtures::rar5_volume_n(&[("movie.mkv", 900_000, &inner[..350_000], false, true)], 0),
+        fixtures::rar5_volume_n(&[("movie.mkv", 900_000, &inner[..350_001], false, true)], 0),
         fixtures::rar5_volume_n(
-            &[("movie.mkv", 900_000, &inner[350_000..700_000], true, true)],
+            &[("movie.mkv", 900_000, &inner[350_001..700_001], true, true)],
             1,
         ),
-        fixtures::rar5_volume_n(&[("movie.mkv", 900_000, &inner[700_000..], true, false)], 2),
+        fixtures::rar5_volume_n(&[("movie.mkv", 900_000, &inner[700_001..], true, false)], 2),
     ];
     let names = ["r.part1.rar", "r.part2.rar", "r.part3.rar"];
     for (name, vol) in names.iter().zip(&vols) {
@@ -263,6 +276,120 @@ async fn clean_store_rar_one_pass() {
         assert!(
             !fx.dir.join("out").join(v).exists(),
             "volume {v} must not touch disk"
+        );
+    }
+}
+
+/// SPEC-onepass-obfuscated-store-sets Part A, acceptance 5: a uniform
+/// single-file store set whose volume names are dotless hash garbage and
+/// whose NZB file order is unrelated to volume order (the obfuscated-
+/// remux norm - the live 143-volume case arrived effectively randomly).
+/// Volume 0 is LAST in the NZB, so chain resolution can close nothing
+/// until the end; under a tight --mem-limit the whole set used to demote
+/// with "held-bytes cap" and unpack post-download. The arithmetic gate
+/// places every volume off its own headers: one-pass, ~1x payload disk.
+#[tokio::test(flavor = "multi_thread")]
+async fn obfuscated_uniform_store_set_one_pass_shuffled_order() {
+    if !have_par2() {
+        eprintln!("skipping: par2 not installed");
+        return;
+    }
+    let mut fx = Fixture::new("arith-obf");
+    // WinRAR-true geometry: constant volume size, so volume 0 (no
+    // volume-number field in its main header) carries one byte more
+    // data than the rest - the arithmetic gate validates exactly this.
+    let dl = 500_000usize;
+    let n_full = 99usize;
+    let inner = payload((dl + 1) + (n_full - 1) * dl + 300_000, 47);
+    let total = inner.len() as u64;
+    let mut pos = 0usize;
+    let mut vols: Vec<Vec<u8>> = (0..n_full)
+        .map(|k| {
+            let len = if k == 0 { dl + 1 } else { dl };
+            let piece = &inner[pos..pos + len];
+            pos += len;
+            fixtures::rar5_volume_n_crc(
+                &[("bTqmovie9m9z.mkv", total, piece, k > 0, true, Some(crc32fast::hash(piece)))],
+                k as u64,
+            )
+        })
+        .collect();
+    vols.push(fixtures::rar5_volume_n_crc(
+        &[(
+            "bTqmovie9m9z.mkv",
+            total,
+            &inner[pos..],
+            true,
+            false,
+            Some(crc32fast::hash(&inner)),
+        )],
+        n_full as u64,
+    ));
+    let names: Vec<String> = (0..vols.len())
+        .map(|k| format!("{:06x}fDakqqryd{k}", (k as u64 * 2654435761) & 0xffffff))
+        .collect();
+    // NZB order: seeded shuffle with volume 0 forced last.
+    let mut order: Vec<usize> = (0..vols.len()).collect();
+    let mut state = 0xDECAFu64;
+    for i in (1..order.len()).rev() {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        order.swap(i, (state >> 33) as usize % (i + 1));
+    }
+    let z = order.iter().position(|&v| v == 0).unwrap();
+    let last = order.len() - 1;
+    order.swap(z, last);
+    for &vi in &order {
+        fx.add_file(&names[vi], &vols[vi], 60_000);
+    }
+    let par2_names: Vec<&str> = order.iter().map(|&vi| names[vi].as_str()).collect();
+    assert!(fx.add_par2(10, &par2_names, 60_000), "par2 create failed");
+    // Synthesized segment numbering, the fully-obfuscated norm: the NZB
+    // lists each volume's segments in a scrambled order with sequential
+    // numbers slapped on, so "segment 1" is NOT the offset-0 article and
+    // the head prefetch (M3) cannot parse any volume's headers early -
+    // each volume classifies only when its true offset-0 article arrives
+    // in natural order, exactly like the live 143-volume case.
+    for (fi, (name, segs)) in fx.nzb_files.iter_mut().enumerate() {
+        if name.ends_with(".par2") {
+            continue;
+        }
+        let mut st = 0xBADC0DEu64 ^ (fi as u64) << 7;
+        for i in (1..segs.len()).rev() {
+            st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
+            segs.swap(i, (st >> 33) as usize % (i + 1));
+        }
+        for (i, seg) in segs.iter_mut().enumerate() {
+            seg.2 = i as u32 + 1;
+        }
+    }
+    // A server that delivers at a plausible pace, not memcpy speed: the
+    // decoders then keep up with arrivals, so pre-fix the unplaceable
+    // spans really do pile up against the holds cap the way the live
+    // 143-volume case did (at loopback speed the whole backlog drains
+    // after volume 0's headers parse and nothing ever holds).
+    let chaos = Chaos { delay_ms: 10, ..Default::default() };
+    let srv = MockServer::start(fx.articles.clone(), chaos).await;
+    let cfg = fx.write_config(&[&srv]);
+    let nzb = fx.write_nzb();
+    let out = fx.dir.join("out");
+
+    let (log, ok) = tokio::task::spawn_blocking(move || {
+        run_get_args(&cfg, &nzb, &out, &[], &["--mem-limit", "32M"])
+    })
+    .await
+    .unwrap();
+    assert!(ok, "get failed:\n{log}");
+    assert!(log.contains("clean download"), "no clean verdict:\n{log}");
+    assert!(log.contains("extracted 1 file(s) in-stream"), "{log}");
+    assert!(log.contains("one-pass"), "shape must say one-pass:\n{log}");
+    assert!(!log.contains("partly on disk"), "set demoted:\n{log}");
+    assert!(!log.contains("held-bytes cap"), "the pre-fix failure is back:\n{log}");
+    let extracted = std::fs::read(fx.dir.join("out/bTqmovie9m9z.mkv")).expect("extracted file");
+    assert_eq!(extracted, inner, "extracted bytes differ");
+    for n in &names {
+        assert!(
+            !fx.dir.join("out").join(n).exists(),
+            "volume {n} must not touch disk"
         );
     }
 }
@@ -461,11 +588,12 @@ async fn multi_file_store_set_extracts_both_files() {
     let e01 = payload(500_000, 11);
     let e02 = payload(300_000, 12);
     let vols = [
-        fixtures::rar5_volume_n(&[("E01.mkv", 500_000, &e01[..200_000], false, true)], 0),
-        fixtures::rar5_volume_n(&[("E01.mkv", 500_000, &e01[200_000..400_000], true, true)], 1),
+        // WinRAR-true: volume 0's piece is one byte longer than volume 1's.
+        fixtures::rar5_volume_n(&[("E01.mkv", 500_000, &e01[..200_001], false, true)], 0),
+        fixtures::rar5_volume_n(&[("E01.mkv", 500_000, &e01[200_001..400_001], true, true)], 1),
         fixtures::rar5_volume_n(
             &[
-                ("E01.mkv", 500_000, &e01[400_000..], true, false),
+                ("E01.mkv", 500_000, &e01[400_001..], true, false),
                 ("E02.mkv", 300_000, &e02[..100_000], false, true),
             ],
             2,
@@ -655,10 +783,11 @@ async fn store_rar_in_rar_chases_compressed_inner() {
     }
 }
 
-/// Compressed set: direct extraction falls back, the on-disk unpack runs
-/// once, and the volumes deliberately REMAIN on disk. The nested
-/// post-pass must NOT re-process those leftover outer volumes (that
-/// guard is what the RAR-in-RAR fix above refined, not removed).
+/// Compressed set: direct extraction falls back and the on-disk unpack
+/// runs exactly once - the nested post-pass must NOT re-process the
+/// fallback volumes (that guard is what the RAR-in-RAR fix above
+/// refined, not removed). Since spec Part B the successfully-unpacked
+/// volumes are spent and deleted rather than left beside the payload.
 #[tokio::test(flavor = "multi_thread")]
 async fn compressed_fallback_leftovers_not_reprocessed() {
     if !have_par2() {
@@ -688,11 +817,11 @@ async fn compressed_fallback_leftovers_not_reprocessed() {
         1,
         "outer volumes re-processed:\n{log}"
     );
-    // The leftover volume stays byte-exact, payload arrived beside it.
-    assert_eq!(
-        std::fs::read(fx.dir.join("out/c.rar")).expect("volume kept on disk"),
-        arch,
-        "leftover volume modified:\n{log}"
+    // Part B: the unpack succeeded, so the volume is spent and deleted -
+    // only the payload remains.
+    assert!(
+        !fx.dir.join("out/c.rar").exists(),
+        "spent volume must not survive the unpack:\n{log}"
     );
     assert!(
         fx.dir.join("out/bigtext_64k.bin").exists(),
@@ -787,12 +916,11 @@ async fn compressed_outer_wrapping_rar_denests_beside_leftovers() {
         b"the payload rides one level down",
         "sibling payload damaged:\n{log}"
     );
-    // The leftover outer volume is restored byte-exact, and the scratch
-    // hold is gone.
-    assert_eq!(
-        std::fs::read(fx.dir.join("out/c.rar")).expect("leftover volume restored"),
-        outer,
-        "leftover volume modified:\n{log}"
+    // Part B: the outer volume was spent by its successful unpack and
+    // deleted; the scratch hold is gone too.
+    assert!(
+        !fx.dir.join("out/c.rar").exists(),
+        "spent outer volume must not survive the unpack:\n{log}"
     );
     assert!(
         !fx.dir.join("out/.nzbfast-outer-hold").exists(),
@@ -863,10 +991,10 @@ async fn compressed_outer_with_subfolder_rar_payload_denests() {
     let got = std::fs::read(fx.dir.join("out/Sub/movie.bin"))
         .expect("subfoldered payload denested");
     assert_eq!(got, doc, "denested payload bytes differ");
-    assert_eq!(
-        std::fs::read(fx.dir.join("out/c.rar")).expect("leftover volume restored"),
-        outer,
-        "leftover volume modified:\n{log}"
+    // Part B: the outer volume was spent by its successful unpack.
+    assert!(
+        !fx.dir.join("out/c.rar").exists(),
+        "spent outer volume must not survive the unpack:\n{log}"
     );
     assert!(
         !fx.dir.join("out/.nzbfast-outer-hold").exists(),
@@ -1062,6 +1190,22 @@ async fn cross_server_union_completes() {
     assert_eq!(std::fs::read(fx.dir.join("out/data.bin")).unwrap(), data);
 }
 
+/// The one test that forces the EXTERNAL par2cmdline fallback
+/// (`NZBFAST_NO_NATIVE_REPAIR`), and therefore the regression guard for the
+/// handle discipline that fallback needs on Windows.
+///
+/// par2cmdline opens its targets with no sharing, so until `run_external_par2`
+/// parked our writers this could not pass on Windows at all - par2 reported
+///
+///     Could not open ".\testset.par2": The process cannot access the file
+///       because it is being used by another process.
+///     Could not open "...\out\payload.bin": ...
+///     Target: "payload.bin" - missing.  Repair is not possible.
+///
+/// and asked for 1600 more recovery blocks, because a whole-file "missing"
+/// verdict needs the whole file's worth of recovery. It ran everywhere else
+/// (Unix does not enforce sharing), which is exactly why the assertions here
+/// were never weakened while the gate was on.
 #[tokio::test(flavor = "multi_thread")]
 async fn corrupt_article_detected_and_repaired() {
     if !have_par2() {
@@ -1685,8 +1829,18 @@ async fn kill9_resume_direct_extract_refetches_little() {
     let n_vols = 4;
     let per = inner.len() / n_vols;
     let mut vol_names: Vec<String> = Vec::new();
+    // WinRAR-true: volume 0's piece is one byte longer than the rest.
+    let mut pos = 0usize;
     for i in 0..n_vols {
-        let part = &inner[i * per..(i + 1) * per];
+        let len = if i == 0 {
+            per + 1
+        } else if i < n_vols - 1 {
+            per
+        } else {
+            inner.len() - pos
+        };
+        let part = &inner[pos..pos + len];
+        pos += len;
         let vol = fixtures::rar5_volume_n(
             &[("movie.mkv", inner.len() as u64, part, i > 0, i < n_vols - 1)],
             i as u64,
@@ -2902,22 +3056,50 @@ async fn nested_inner_par2_repairs_data_damaged_store_layer() {
     // Header CRCs the way real archivers write them: earlier split
     // pieces carry their own bytes' CRC32, the last carries the whole
     // unpacked file's (the one the verifier checks).
+    // WinRAR-true geometry, and it is load-bearing for what this test
+    // asserts: volume 0's main header has no volume-number field, so it is
+    // one byte shorter and must carry one byte MORE data for the volume
+    // FILES to come out the same size. Three equal 100_000-byte pieces
+    // (what this used to do) make volume 0's file a byte short, i.e. a
+    // NON-uniform set - and then the arithmetic gate's uniform premise gets
+    // contradicted and the group demotes with "non-uniform store set"
+    // instead of reaching the stored-CRC gate this test is about. Both
+    // demotions are correct and both end in the same repaired payload, so
+    // which one fires was decided by how far parsing had progressed when
+    // `reresolve` ran - i.e. by timing, which made the assertion below
+    // host- and load-dependent (it flipped when the daemon moved onto a
+    // sized main thread, and it passed under full-suite load while failing
+    // in isolation on Windows). A genuinely uniform set cannot take the
+    // arithmetic path's failure branch, so the CRC gate is the only
+    // demotion left and the assertion is deterministic everywhere. The last
+    // volume is allowed to be short, as in any real set.
+    const DL: usize = 100_000;
+    let (a, b) = (DL + 1, DL + 1 + DL);
     let mut iv = vec![
         fixtures::rar5_volume_n_crc(
-            &[("show.mkv", 300_000, &show[..100_000], false, true,
-               Some(crc32fast::hash(&show[..100_000])))],
+            &[("show.mkv", 300_000, &show[..a], false, true,
+               Some(crc32fast::hash(&show[..a])))],
             0,
         ),
         fixtures::rar5_volume_n_crc(
-            &[("show.mkv", 300_000, &show[100_000..200_000], true, true,
-               Some(crc32fast::hash(&show[100_000..200_000])))],
+            &[("show.mkv", 300_000, &show[a..b], true, true,
+               Some(crc32fast::hash(&show[a..b])))],
             1,
         ),
         fixtures::rar5_volume_n_crc(
-            &[("show.mkv", 300_000, &show[200_000..], true, false, Some(whole))],
+            &[("show.mkv", 300_000, &show[b..], true, false, Some(whole))],
             2,
         ),
     ];
+    // The premise above, checked rather than assumed: if the fixture helper
+    // ever changes its header layout this must fail loudly here, not turn
+    // back into a timing-dependent assertion further down.
+    assert_eq!(
+        iv[0].len(),
+        iv[1].len(),
+        "fixture is not a uniform store set - volume 0 and 1 files must be the same size, \
+         or the arithmetic gate demotes before the CRC gate this test is about"
+    );
     // The inner par2 set is created over the INTACT volumes...
     let scratch = fx.dir.join("innerset");
     std::fs::create_dir_all(&scratch).unwrap();

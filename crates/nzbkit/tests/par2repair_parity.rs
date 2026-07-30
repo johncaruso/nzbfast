@@ -15,11 +15,21 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn have_par2() -> bool {
-    Command::new("par2")
+    let ok = Command::new("par2")
         .arg("-V")
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success());
+    // CI installs par2 on purpose (see pr-check.yml, both legs), so there a
+    // missing one is a broken job, not a reason to quietly cover less. Every
+    // caller of this SKIPS when it is false, which is exactly the shape that
+    // reads as a green run with silently reduced coverage - the failure mode
+    // this whole Windows pass kept turning up.
+    assert!(
+        ok || std::env::var_os("NZBFAST_REQUIRE_PAR2").is_none(),
+        "NZBFAST_REQUIRE_PAR2 is set but `par2 -V` does not run - the PAR2 tests \
+         would have skipped and the run would have looked green"
+    );
+    ok
 }
 
 struct TempDir(PathBuf);

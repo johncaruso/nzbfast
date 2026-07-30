@@ -9,6 +9,7 @@ use crate::features::FeatureSet;
 use crate::io_util::{read_exact_at, read_u16, read_u32};
 pub(crate) use crate::source::ArchiveSource;
 use crate::version::{ArchiveFamily, ArchiveVersion};
+use crate::volume_extract::{FragmentOpener, LazyChainedReader};
 use crate::write_progress::{ProgressReporter, WorkTracker};
 use crate::{WriteOperation, WriteProgress, WriteProgressEvent};
 use std::fs::File;
@@ -973,12 +974,21 @@ impl PendingSplitRefs {
         }
     }
 
+    /// The chain over this member's fragments, one volume open at a time.
+    ///
+    /// Every fragment is RESOLVED here - missing volume, missing entry and a
+    /// missing password for an encrypted fragment all still fail before a
+    /// byte is read - but the file itself is opened only when the chain
+    /// reaches it. Building 300 live `File`s up front is how a large split
+    /// member hit `EMFILE` before extraction started (see
+    /// [`LazyChainedReader`]). Per-fragment cipher initialisation is
+    /// preserved: RAR 1.3 keys each fragment on its own.
     fn fragment_reader<'a>(
         &self,
         volumes: &'a [Archive],
         password: Option<&'a [u8]>,
-    ) -> Result<ChainedReader<'a>> {
-        let mut readers = Vec::with_capacity(self.fragments.len());
+    ) -> Result<LazyChainedReader<'a>> {
+        let mut openers: Vec<FragmentOpener<'a>> = Vec::with_capacity(self.fragments.len());
         for &(volume_index, entry_index) in &self.fragments {
             let archive = volumes
                 .get(volume_index)
@@ -987,36 +997,26 @@ impl PendingSplitRefs {
                 .entries
                 .get(entry_index)
                 .ok_or(Error::InvalidHeader("RAR 1.3 split entry is missing"))?;
-            let reader = archive.range_reader(entry.packed_range.clone())?;
-            if entry.is_encrypted() {
-                let password = password.ok_or(Error::NeedPassword)?;
-                readers.push(
-                    Box::new(Rar13DecryptReader::new(reader, Rar13Cipher::new(password)))
-                        as Box<dyn Read + Send + 'a>,
-                );
+            let range = entry.packed_range.clone();
+            let fragment_password = if entry.is_encrypted() {
+                Some(password.ok_or(Error::NeedPassword)?)
             } else {
-                readers.push(reader);
-            }
+                None
+            };
+            openers.push(Box::new(move || {
+                let reader = archive
+                    .range_reader(range)
+                    .map_err(std::io::Error::other)?;
+                Ok(match fragment_password {
+                    Some(password) => {
+                        Box::new(Rar13DecryptReader::new(reader, Rar13Cipher::new(password)))
+                            as Box<dyn Read + Send + 'a>
+                    }
+                    None => reader,
+                })
+            }));
         }
-        Ok(ChainedReader { readers, index: 0 })
-    }
-}
-
-struct ChainedReader<'a> {
-    readers: Vec<Box<dyn Read + Send + 'a>>,
-    index: usize,
-}
-
-impl Read for ChainedReader<'_> {
-    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        while let Some(reader) = self.readers.get_mut(self.index) {
-            let read = reader.read(out)?;
-            if read != 0 {
-                return Ok(read);
-            }
-            self.index += 1;
-        }
-        Ok(0)
+        Ok(LazyChainedReader::new(openers))
     }
 }
 

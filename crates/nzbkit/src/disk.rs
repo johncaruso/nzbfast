@@ -24,6 +24,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///
 /// macOS rejects RLIM_INFINITY here, so step down through candidate targets
 /// rather than asking for the hard limit directly.
+///
+/// Returns the soft limit now in force, or 0 where there is no such limit to
+/// raise - which is every non-unix target. On Windows a `File` is a Win32
+/// HANDLE bounded by kernel memory rather than by a per-process soft cap, so
+/// 0 means "unlimited as far as this matters", NOT "no descriptors": callers
+/// must not size the spill path off this number.
 pub fn raise_fd_limit() -> u64 {
     #[cfg(unix)]
     unsafe {
@@ -308,7 +314,15 @@ impl WriteBudget {
 }
 
 pub struct FileWriter {
-    file: File,
+    /// `None` while PARKED - the handle is closed but the writer (and every
+    /// `Arc` clone of it) stays alive and reopens on [`FileWriter::unpark`].
+    /// See [`FileWriter::park`] for why the handle has to be droppable at
+    /// all; ordinary writers are `Some` for their whole life.
+    ///
+    /// `RwLock` rather than a bare `File` costs one uncontended read
+    /// acquisition per `write_at`, which handles a whole article/span - tens
+    /// of nanoseconds against a pwrite of tens to hundreds of KB.
+    file: std::sync::RwLock<Option<File>>,
     pub path: PathBuf,
     pub size: u64,
     written: AtomicU64,
@@ -408,7 +422,7 @@ impl FileWriter {
             .open(path)?;
         preallocate_capped(&file, size, prealloc_cap)?;
         Ok(FileWriter {
-            file,
+            file: std::sync::RwLock::new(Some(file)),
             path: path.to_path_buf(),
             size,
             written: AtomicU64::new(0),
@@ -442,7 +456,7 @@ impl FileWriter {
             .open(path)?;
         preallocate_capped(&file, size, prealloc_cap)?;
         Ok(FileWriter {
-            file,
+            file: std::sync::RwLock::new(Some(file)),
             path: path.to_path_buf(),
             size,
             written: AtomicU64::new(0),
@@ -461,7 +475,7 @@ impl FileWriter {
     }
 
     pub fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
-        write_all_at(&self.file, data, offset)?;
+        write_all_at(self.handle()?.as_ref().unwrap(), data, offset)?;
         let fresh = self.note_written(offset, data.len() as u64);
         self.maybe_drop_cache();
         // Decompression-bomb budget (extraction outputs only). The bytes
@@ -505,7 +519,12 @@ impl FileWriter {
             return;
         }
         use std::os::unix::io::AsRawFd;
-        let fd = self.file.as_raw_fd();
+        // Parked: the handle is gone and its pages were synced on the way
+        // down, so there is nothing to write back or evict.
+        let g = self.file.read().unwrap_or_else(|e| e.into_inner());
+        let Some(fd) = g.as_ref().map(|f| f.as_raw_fd()) else {
+            return;
+        };
         unsafe {
             // Start writeback for everything dirty, then drop what's
             // clean. Repeated calls sweep up what writeback finished.
@@ -521,7 +540,70 @@ impl FileWriter {
     /// open() per read (the mapped-repair path reads thousands of
     /// blocks back through the volume view).
     pub fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-        read_exact_at(&self.file, buf, offset)
+        read_exact_at(self.handle()?.as_ref().unwrap(), buf, offset)
+    }
+
+    /// The live handle, or `NotConnected` when the writer is parked.
+    ///
+    /// Parked is never a state a caller should paper over: it means someone
+    /// deliberately handed this file to an external process, so a write that
+    /// lands now would be silently overwritten (or would corrupt what that
+    /// process is rebuilding). Failing is the honest answer.
+    fn handle(&self) -> io::Result<std::sync::RwLockReadGuard<'_, Option<File>>> {
+        let g = self.file.read().unwrap_or_else(|e| e.into_inner());
+        if g.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("{} is parked for an external tool", self.path.display()),
+            ));
+        }
+        Ok(g)
+    }
+
+    /// Close this file's OS handle, keeping the writer itself alive.
+    ///
+    /// Windows opens are share-negotiated: par2cmdline opens its targets with
+    /// share mode 0, so ANY handle we still hold makes its open fail and it
+    /// concludes the file is missing ("Repair is not possible"). Unix does not
+    /// care, but parking there too keeps one code path and makes the external
+    /// tool the sole writer on every platform - which it must be, since it
+    /// rewrites these bytes underneath us.
+    ///
+    /// Syncs first: buffered pwrites that never reached disk would otherwise
+    /// hand par2 a stale file and it would "repair" bytes we were about to
+    /// write. A sync failure is returned, not swallowed - same contract as
+    /// [`Extractor::finish`](crate::extract::Extractor::finish).
+    ///
+    /// Parking works through the writer's own shared state, NOT by dropping an
+    /// `Arc`: releasing one reference cannot close anything while the daemon's
+    /// stream picker or a settle reader still holds a clone.
+    pub fn park(&self) -> io::Result<()> {
+        let mut g = self.file.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(f) = g.as_ref() {
+            f.sync_data()?;
+        }
+        *g = None;
+        Ok(())
+    }
+
+    /// Reopen a parked writer at its original path, without truncating and
+    /// without preallocating: the bytes on disk now are the external tool's
+    /// repaired output and must survive verbatim. Idempotent - unparking a
+    /// live writer is a no-op, so a caller may pair it with [`park`] on a path
+    /// that bailed out early.
+    ///
+    /// `written`/`intervals` are deliberately untouched: they describe which
+    /// spans of the file are populated, which is exactly as true after a
+    /// repair as before it (repair fills bytes in, it never unwrites them).
+    ///
+    /// [`park`]: FileWriter::park
+    pub fn unpark(&self) -> io::Result<()> {
+        let mut g = self.file.write().unwrap_or_else(|e| e.into_inner());
+        if g.is_some() {
+            return Ok(());
+        }
+        *g = Some(OpenOptions::new().read(true).write(true).open(&self.path)?);
+        Ok(())
     }
 
     /// Record `[offset, offset+len)` as on-disk without writing - crash
@@ -599,8 +681,17 @@ impl FileWriter {
         self.written.load(Ordering::Relaxed)
     }
 
+    /// A PARKED writer syncs nothing and reports success: [`park`] synced it
+    /// on the way down and closed the handle, so there is no buffered state
+    /// left to lose. Erroring here instead would fail a job whose bytes are
+    /// all safely on disk.
+    ///
+    /// [`park`]: FileWriter::park
     pub fn sync(&self) -> io::Result<()> {
-        self.file.sync_data()
+        match self.file.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            Some(f) => f.sync_data(),
+            None => Ok(()),
+        }
     }
 }
 
@@ -707,7 +798,17 @@ pub fn sanitize_filename_for(name: &str, windows: bool) -> String {
     // Windows strips trailing dots and spaces, so "evil. " -> "evil"; strip
     // them ourselves for a stable, portable name (leading dots too: hidden).
     let trimmed = cleaned.trim().trim_matches('.').trim().to_string();
-    if trimmed.is_empty() {
+    // The trim chain above is NOT a fixed point: `trim_matches('.')` peels the
+    // outer dots, the following `.trim()` then exposes INTERIOR dots as the
+    // new ends, and ". .. ." comes out as ".." (". . ." as "."). Both are
+    // non-empty, so they used to be returned verbatim - a single path
+    // component that escapes its parent. Every caller joins this straight
+    // onto a root (`out_dir/<category>/<stem>`) and nothing re-checks
+    // containment, so a category or NZB name of ". .. ." put the payload
+    // outside the download root, and "Remove + delete files" then ran
+    // `remove_dir_all` on that parent. A name that is nothing but dots has no
+    // meaning worth preserving.
+    if trimmed.is_empty() || trimmed.chars().all(|c| c == '.') {
         return "unnamed".to_string();
     }
     // Reserved DOS device names match case-insensitively on the stem before
@@ -787,6 +888,66 @@ mod case_probe_tests {
 mod tests {
     use super::*;
 
+    /// A parked writer keeps its bytes and its identity, refuses writes while
+    /// it is parked, and comes back usable. The refusal is the point: a write
+    /// that landed while an external par2 owned the file would be overwritten
+    /// by the repair without a word.
+    #[test]
+    fn park_refuses_writes_then_unpark_restores_the_writer() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-park-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("payload.bin");
+        let w = FileWriter::create(&path, 8).unwrap();
+        w.write_at(0, b"abcd").unwrap();
+
+        w.park().unwrap();
+        let e = w.write_at(4, b"efgh").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotConnected, "{e}");
+        let mut buf = [0u8; 4];
+        assert_eq!(
+            w.read_at(&mut buf, 0).unwrap_err().kind(),
+            io::ErrorKind::NotConnected
+        );
+        // Parked syncs are a no-op, not a failure: park() already synced, so
+        // erroring here would fail a job whose bytes are all safely on disk.
+        w.sync().unwrap();
+        // The bytes written before parking reached disk, and the file itself
+        // is untouched - that is what the external tool repairs against.
+        assert_eq!(&std::fs::read(&path).unwrap()[..4], b"abcd");
+
+        w.unpark().unwrap();
+        w.unpark().unwrap(); // idempotent - error paths may double-unpark
+        w.write_at(4, b"efgh").unwrap();
+        w.read_at(&mut buf, 4).unwrap();
+        assert_eq!(&buf, b"efgh");
+        assert_eq!(&std::fs::read(&path).unwrap()[..8], b"abcdefgh");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The whole point on Windows: while parked, an EXCLUSIVE open of the file
+    /// succeeds. That is exactly what par2cmdline does, and a handle we still
+    /// held made it report the target missing and decline to repair.
+    #[cfg(windows)]
+    #[test]
+    fn a_parked_file_can_be_opened_exclusively() {
+        use std::os::windows::fs::OpenOptionsExt;
+        // share mode 0 - what par2cmdline asks for.
+        let exclusive = |p: &Path| OpenOptions::new().read(true).share_mode(0).open(p);
+
+        let dir = std::env::temp_dir().join(format!("nzbfast-excl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("payload.bin");
+        let w = FileWriter::create(&path, 4).unwrap();
+        w.write_at(0, b"abcd").unwrap();
+
+        assert!(exclusive(&path).is_err(), "a live writer must block par2");
+        w.park().unwrap();
+        drop(exclusive(&path).expect("a parked writer must let par2 in"));
+        w.unpark().unwrap();
+        assert!(exclusive(&path).is_err(), "unpark must retake the handle");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The probe must never answer `Rotational` for something it could not
     /// identify - an unknown answer clamps nothing, a wrong "spinning"
     /// answer would throttle an SSD, a RAID array or an SMB share.
@@ -840,12 +1001,31 @@ mod tests {
 
     /// The spill path needs room for one writer per volume; the stock macOS
     /// 256 is not enough for a 431-volume job.
+    ///
+    /// Unix only, because the limit it is about is. Windows has no
+    /// RLIMIT_NOFILE: `std::fs::File` there is a Win32 HANDLE from
+    /// `CreateFileW`, and handles are bounded by kernel memory (millions),
+    /// not by a per-process soft cap anyone can raise. The CRT's own
+    /// 512-descriptor table is a different thing that Rust does not use. So
+    /// there is nothing to raise and `raise_fd_limit` reports 0 - which this
+    /// test asserted was "too low for the spill path", the reading that made
+    /// it fail the first time the suite ran on Windows.
+    #[cfg(unix)]
     #[test]
     fn fd_limit_is_raised_above_the_stock_soft_cap() {
         let got = raise_fd_limit();
         assert!(got >= 1024, "fd limit {got} too low for the spill path");
         // Idempotent: a second call must not lower what we already have.
         assert!(raise_fd_limit() >= got);
+    }
+
+    /// The other half of the contract above: on Windows the call must be a
+    /// harmless no-op rather than something that reports a limit the caller
+    /// might then size the spill path against.
+    #[cfg(windows)]
+    #[test]
+    fn fd_limit_is_a_no_op_where_there_is_no_such_limit() {
+        assert_eq!(raise_fd_limit(), 0, "nothing to raise on Windows - say so, don't invent one");
     }
 
     /// Whichever branch `preallocate` takes (raw fallocate where the
@@ -1118,6 +1298,20 @@ mod tests {
             let out = sanitize_filename(s);
             assert!(!out.contains('/') && !out.contains('\\'), "{s:?} -> {out:?}");
             assert!(!out.starts_with('.'), "{s:?} -> {out:?}");
+        }
+        // Dots separated by spaces. The trim chain is not a fixed point:
+        // stripping the outer dots exposes whitespace, and trimming THAT
+        // exposes interior dots, so these used to come out as ".." and "." -
+        // a component that escapes its parent, with `remove_dir_all` on the
+        // delete-with-files path pointed at it. No separator is involved, so
+        // the loop above never caught them.
+        for s in [". .. .", ".. .. ..", ". . .", " .. ", "...", ". ."] {
+            assert_eq!(sanitize_filename(s), "unnamed", "{s:?} escaped");
+        }
+        // ...and the same names as an on-disk path component stay contained.
+        for s in [". .. .", ". . ."] {
+            let joined = std::path::Path::new("/srv/dl").join(sanitize_filename(s));
+            assert_eq!(joined, std::path::Path::new("/srv/dl/unnamed"), "{s:?}");
         }
         // A drive prefix is a separator too, on Windows. `Path::join` DISCARDS
         // the base when the joined name carries a prefix, so "C:evil.dll" wrote

@@ -19,24 +19,41 @@ of updating by hand.
 
 ---
 
-## Before you start: your PUID / PGID (30 seconds)
+## Before you start: make three folders (1 minute, no SSH)
 
-The container writes your downloads as a specific user ID so the files
-belong to *you*, not to root. Find yours once:
+In **File Station**, create a folder for nzbfast - `/docker/nzbfast` is
+the convention - and then three folders **inside** it, named exactly:
 
-1. Control Panel → **Terminal & SNMP** → tick **Enable SSH service**.
-2. SSH in and run:
+```
+config      settings + index database
+downloads   finished files
+watch       drop an .nzb here and it downloads
+```
 
-   ```sh
-   id your_dsm_username
-   ```
+That is the whole preparation, and it replaces the SSH session that used
+to be needed here.
 
-   Note the `uid=` and `gid=` numbers. On most Synology boxes the first
-   user is `uid=1026` and the primary group is `users` `gid=100` - but
-   use whatever `id` prints.
-3. Turn SSH back off afterwards if you like; you won't need it again.
+**Why it matters.** nzbfast writes your downloads as a real user so the
+files belong to *you* rather than to root, and it works out which user
+from the folders it is given: folders you make in File Station belong to
+you, so it adopts your user and group automatically.
 
-You'll drop those two numbers into `PUID` and `PGID` below.
+If you skip this, Docker creates those folders itself and they belong to
+root. nzbfast then has nothing to read an owner from and falls back to
+uid 1000 - a user your NAS does not know - so your downloads arrive
+owned by nobody you can see, and File Station will not let you move or
+delete them. A container cannot see the folder *above* a mount, so this
+is not something it can work out for itself.
+
+If you would rather not make the folders, or you want the files owned by
+somebody else, the compose file has commented-out `PUID`/`PGID` lines and
+the old `id your_dsm_username` method still works.
+
+> **On 1.0.11 and earlier**, only the *user* is picked up this way, not the
+> group: files come out owned by your user but with a group matching it
+> rather than the folder's. You own them either way, so File Station can
+> still manage them. Adopting the group needs 1.0.12 or later, or set
+> `PGID` explicitly until then.
 
 ---
 
@@ -47,12 +64,12 @@ this route if you want nzbfast to keep itself current.
 
 **The quickest version:** download
 [`docker-compose.yml`](https://nzbfast.github.io/nzbfast/nzbfast-synology.yml),
-upload it into a folder on your NAS with File Station (e.g.
-`/docker/nzbfast`), edit the three values at the top, and create a
-Project pointing at that folder. The steps below are the same thing done
-by hand.
+put it in `/docker/nzbfast` with File Station, and create a Project
+pointing at that folder. **Nothing in the file needs editing.** The steps
+below are the same thing done by hand.
 
-1. File Station → create the project folder, e.g. `/docker/nzbfast`.
+1. Make the folders, if you have not already: `/docker/nzbfast` with
+   `config`, `downloads` and `watch` inside it.
 2. Container Manager → **Project** → **Create**.
    - **Project name:** `nzbfast`
    - **Path:** `/docker/nzbfast`
@@ -66,16 +83,13 @@ by hand.
        restart: unless-stopped
        ports:
          - "6789:6789"
-       environment:
-         - PUID=1026          # ← your uid  (id your_dsm_username)
-         - PGID=100           # ← your gid
-         - TZ=Europe/London   # ← your timezone
-         # - NZBFAST_APIKEY=change-me   # optional: pick your own key instead
-         #                              # of the one nzbfast generates
        volumes:
          - ./config:/config          # settings + index database
          - ./downloads:/downloads    # finished files
          - ./watch:/watch            # drop an .nzb here to auto-download
+       # No PUID/PGID needed: nzbfast adopts the owner and group of the
+       # folders you made above. No TZ either - times are stored as UTC
+       # and shown in your browser's timezone.
 
      # Optional: checks nightly for a newer nzbfast image and recreates
      # the container when one ships. Needs the Docker socket; delete this
@@ -85,16 +99,18 @@ by hand.
        container_name: nzbfast-watchtower
        restart: unless-stopped
        environment:
-         - TZ=Europe/London   # same timezone, so the schedule below is your 04:00
+         - TZ=Etc/UTC   # your timezone, so the schedule below is your 04:00
        volumes:
          - /var/run/docker.sock:/var/run/docker.sock
        command: --cleanup --schedule "0 0 4 * * *" nzbfast   # daily 04:00, nzbfast only
    ```
 
-   The `./config`, `./downloads`, `./watch` paths are created for you
-   inside the project folder.
 3. Finish the wizard - Container Manager pulls the images and starts
    them. Then jump to [First run](#first-run-add-your-provider).
+
+The one value worth changing is `TZ` on the **watchtower** service, and
+only so that "04:00" means 04:00 where you live. It does nothing on the
+nzbfast container, which is why it is not there.
 
 **About that last service.** Watchtower is what keeps nzbfast current,
 and it needs the Docker socket to recreate containers. Mounting
@@ -138,8 +154,8 @@ auto-update**, because Container Manager's volume picker only browses
 shared folders and so cannot mount the Docker socket that Watchtower
 needs. You update it by hand, a few clicks each release.
 
-1. **Make the folders.** File Station → create a shared folder or a
-   sub-tree to hold the container's data, e.g.:
+1. **Make the folders** - the same three as above, if you have not
+   already:
 
    ```
    /docker/nzbfast/config       ← settings + index database
@@ -165,13 +181,10 @@ needs. You update it by hand, a few clicks each release.
      | `/docker/nzbfast/downloads`   | `/downloads`            |
      | `/docker/nzbfast/watch`       | `/watch`                |
 
-   - **Environment:** add these variables:
-
-     | Variable | Value                         |
-     | -------- | ----------------------------- |
-     | `PUID`   | your uid (e.g. `1026`)        |
-     | `PGID`   | your gid (e.g. `100`)         |
-     | `TZ`     | your timezone, e.g. `Europe/London` |
+   - **Environment:** nothing to add. Because you made the folders
+     yourself, nzbfast takes its user and group from them. `TZ` is not
+     needed either - times are stored as UTC and displayed in your
+     browser's timezone.
 
 4. **Run it**, then jump to [First run](#first-run-add-your-provider).
 

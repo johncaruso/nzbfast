@@ -157,6 +157,28 @@ else
     fail=$((fail + 1)); echo "  FAIL existing contents disturbed" >&2
 fi
 
+# --- an unwritable share must fall back, not fail the install -----------
+#
+# This is the real DSM 7 behaviour, not a hypothetical: a package's
+# internal user has no access to shared folders until an admin grants it,
+# so /volume1/Downloads can be mode 777 and still be unwritable - and
+# unlistable - from postinst. Install failed outright on a real NAS this
+# way. Install must never depend on a shared folder.
+r="$T/l"; mkdir -p "$r/volume1/downloads" "$r/var"
+chmod 500 "$r/volume1/downloads"          # readable, not writable
+SPK_TEST_ROOT="$r" SYNOPKG_PKGVAR="$r/var" SPK_TEST_SKIP_PORTCHECK=1 \
+    sh "$POSTINST" >/dev/null 2>&1
+rc=$?
+chmod 700 "$r/volume1/downloads"          # so the cleanup trap can remove it
+if [ "$rc" = 0 ]; then
+    pass=$((pass + 1)); echo "  ok   unwritable share does not fail install"
+else
+    fail=$((fail + 1)); echo "  FAIL unwritable share failed install (rc=$rc)" >&2
+fi
+check "unwritable share falls back to package storage" \
+    "$r/var/downloads" \
+    "$(grep '^NZBFAST_OUT=' "$r/var/nzbfast.env" 2>/dev/null | cut -d= -f2-)"
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]

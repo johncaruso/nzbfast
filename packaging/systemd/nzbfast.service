@@ -21,11 +21,20 @@ Wants=network-online.target
 Type=simple
 User=nzbfast
 Group=nzbfast
+# ProtectSystem=strict makes everything outside ReadWritePaths read-only, and
+# systemd starts a service in `/`. Anything the daemon opens by a RELATIVE
+# path therefore lands somewhere it cannot write: the built-in index defaults
+# to `index.db`, and its lazy open paths swallow the error, so enabling
+# indexing from the dashboard looked like a feature that just stays empty.
+# Both halves are set here - the working directory for any future relative
+# default, and the index path explicitly.
+WorkingDirectory=/var/lib/nzbfast
 ExecStart=/usr/local/bin/nzbfast serve \
     --config /etc/nzbfast/config.json \
     --port 6789 \
     --out /var/lib/nzbfast/downloads \
-    --watch /var/lib/nzbfast/watch
+    --watch /var/lib/nzbfast/watch \
+    --index-db /var/lib/nzbfast/index.db
 Restart=on-failure
 RestartSec=5
 

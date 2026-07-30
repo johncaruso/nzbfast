@@ -1,5 +1,5 @@
 use super::*;
-use crate::volume_extract::{ChainedReader, SplitVolumeState, SplitVolumeStep};
+use crate::volume_extract::{FragmentOpener, LazyChainedReader, SplitVolumeState, SplitVolumeStep};
 use std::io::{Read, Write};
 
 enum CodecState {
@@ -504,7 +504,13 @@ impl PendingSplitRefs {
         volumes: &'a [Archive],
         password: Option<&[u8]>,
     ) -> Result<Box<dyn Read + Send + 'a>> {
-        let mut readers = Vec::with_capacity(self.fragments.len());
+        // Fragments are RESOLVED here (a missing volume or entry still fails
+        // before a byte is read) but opened one at a time as the chain
+        // advances - see [`LazyChainedReader`]. A ~300-volume split member
+        // used to want 300 file descriptors at once. The whole-chain
+        // decryptor below is unchanged: RAR 1.5-4 keys the member, not the
+        // fragment.
+        let mut openers: Vec<FragmentOpener<'a>> = Vec::with_capacity(self.fragments.len());
         for &(volume_index, file_index) in &self.fragments {
             let archive = volumes
                 .get(volume_index)
@@ -513,9 +519,12 @@ impl PendingSplitRefs {
                 .files()
                 .nth(file_index)
                 .ok_or(Error::InvalidHeader("RAR 1.5 split entry is missing"))?;
-            readers.push(archive.range_reader(file.packed_range.clone())?);
+            let range = file.packed_range.clone();
+            openers.push(Box::new(move || {
+                archive.range_reader(range).map_err(std::io::Error::other)
+            }));
         }
-        let reader = ChainedReader::new(readers);
+        let reader = LazyChainedReader::new(openers);
         if !self.encrypted {
             return Ok(Box::new(reader));
         }

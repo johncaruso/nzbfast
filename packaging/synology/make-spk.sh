@@ -93,9 +93,8 @@ build_spk() {
     # Bake the port in. Anything still holding the placeholder afterwards
     # is a file someone added without wiring it up, so fail loudly rather
     # than shipping a package with "@@PORT@@" in its firewall rule.
-    for f in "$work/scripts/postinst" "$work/conf/nzbfast.sc"; do
-        sed "s/@@PORT@@/$PORT/g" "$f" > "$f.tmp" && mv "$f.tmp" "$f"
-    done
+    sed "s/@@PORT@@/$PORT/g" "$work/scripts/postinst" > "$work/scripts/postinst.tmp"
+    mv "$work/scripts/postinst.tmp" "$work/scripts/postinst"
     chmod 755 "$work/scripts/"*
     if grep -rl "@@PORT@@" "$work" 2>/dev/null | grep -q .; then
         echo "✗ unsubstituted @@PORT@@ left in:" >&2

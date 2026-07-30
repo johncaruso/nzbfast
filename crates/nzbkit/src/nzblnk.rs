@@ -217,7 +217,14 @@ pub fn parse(s: &str) -> Result<NzbLnk, NzbLnkError> {
     out.header = clip(&header, MAX_HEADER);
     out.title = match title {
         Some(t) if !t.is_empty() => clip(&t, MAX_TITLE),
-        _ => out.header.clone(),
+        // Clipped to MAX_TITLE too. The header's own cap is MAX_HEADER
+        // (1024), so a link with a long header and no `t` - the common
+        // shape, since boards label the link with their thread title -
+        // handed back a 1024-char title, twice the documented cap the
+        // resolution ladder and the UI rely on. It reaches a filesystem
+        // stem, and nothing in the naming path caps length. Found by
+        // `nzblnk_parse` fuzzing, 30 Jul.
+        _ => clip(&out.header, MAX_TITLE),
     };
     out.password = clip(&password.unwrap_or_default(), MAX_PASSWORD);
     Ok(out)
@@ -379,6 +386,17 @@ mod tests {
         let many: String =
             (0..80).map(|i| format!("&g=alt.binaries.g{i}")).collect::<Vec<_>>().join("");
         assert_eq!(parse(&format!("nzblnk:?h=abc{many}")).unwrap().groups.len(), MAX_GROUPS);
+        // The title FALLBACK is capped too, not just an explicit `t`. A long
+        // header with no title used to hand back MAX_HEADER (1024) chars of
+        // title - twice the cap - which reaches the UI and a filesystem stem.
+        // Both fuzz artifacts on 30 Jul were this. Multi-byte chars because
+        // the cap counts chars, not bytes.
+        let l = parse(&format!("nzblnk:?h={long}")).unwrap();
+        assert_eq!(l.title.chars().count(), MAX_TITLE);
+        let wide = "ü".repeat(4000);
+        let l = parse(&format!("nzblnk:?h={wide}")).unwrap();
+        assert_eq!(l.title.chars().count(), MAX_TITLE);
+        assert_eq!(l.header.chars().count(), MAX_HEADER);
     }
 
     #[test]

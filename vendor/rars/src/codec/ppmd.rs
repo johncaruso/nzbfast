@@ -308,16 +308,18 @@ impl Suballocator {
         // Step 1: thread free blocks into the reference's list order.
         // list[k] = (offset, nu). Reference prepends; we emulate with a
         // front-growing build then it is naturally bucket-37-first.
-        let mut list: Vec<(u32, u32)> = Vec::new();
-        for bucket in 0..N_BUCKETS {
+        // Reference walks each bucket list head-first (recent->oldest) and
+        // prepends each node, which lands every bucket back in its own
+        // insertion order with later buckets in front. Building by walking
+        // the buckets in REVERSE and appending produces the identical
+        // sequence in O(n) - the old literal emulation front-inserted per
+        // node, and its quadratic memmove was ~90% of PPMd decode wall time
+        // on multi-MB streams (the glue pass runs from the ALLOC hot path).
+        let mut list: Vec<(u32, u32)> =
+            Vec::with_capacity(self.free_lists.iter().map(Vec::len).sum());
+        for bucket in (0..N_BUCKETS).rev() {
             let nu = Self::bucket_units(bucket) as u32;
-            // Reference walks the bucket list head-first (recent->oldest) and
-            // prepends each node. Iterating our Vec recent->oldest and
-            // prepending reproduces that; doing it per-bucket with the whole
-            // bucket prepended keeps later buckets in front.
-            for &off in self.free_lists[bucket].iter().rev() {
-                list.insert(0, (off, nu));
-            }
+            list.extend(self.free_lists[bucket].iter().map(|&off| (off, nu)));
             self.free_lists[bucket].clear();
         }
         if list.is_empty() {

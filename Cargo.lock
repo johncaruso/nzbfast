@@ -1274,7 +1274,7 @@ dependencies = [
 
 [[package]]
 name = "nzbfast"
-version = "1.0.11"
+version = "1.0.12"
 dependencies = [
  "anyhow",
  "clap",
@@ -1338,9 +1338,10 @@ dependencies = [
 
 [[package]]
 name = "nzbtray"
-version = "1.0.11"
+version = "1.0.12"
 dependencies = [
  "serde_json",
+ "sha2 0.10.9",
  "ureq",
  "windows-sys 0.59.0",
 ]

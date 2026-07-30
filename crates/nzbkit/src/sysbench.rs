@@ -779,9 +779,29 @@ mod tests {
         assert!(gbps > 0.0 && gbps < 1000.0);
     }
 
+    /// `verdict` is arithmetic - it picks the min of three numbers - so the
+    /// compute figure is STATED here, not measured.
+    ///
+    /// It used to call `compute(16)`, which benchmarks this machine for real,
+    /// and the test then assumed the answer would land above the 1.0 Gbps
+    /// network figure it was comparing against. On a debug build that is not
+    /// a safe assumption: the compute kernels are unoptimized, and on Windows
+    /// x64 the measured ceiling came in UNDER 1.0, so `verdict` correctly
+    /// answered "compute" and the test called it a failure. It was asserting
+    /// the host was fast, not that the min-picking works. A stated ceiling
+    /// tests the logic on every machine and takes ~16 MB of benchmarking per
+    /// run out of the suite.
     #[test]
     fn verdict_picks_min() {
-        let c = compute(16);
+        let flat = StageRate { one_core: 1.0, all_core: 8.0 };
+        let c = ComputeReport {
+            cores: 8,
+            decode_simd: flat,
+            crc32: flat,
+            md5: flat,
+            verify: flat,
+            ceiling_gbps: 40.0,
+        };
         // Network tiny → network is the bottleneck.
         let v = verdict(1.0, &c, 5.0);
         assert_eq!(v.bottleneck, "network");
@@ -789,6 +809,11 @@ mod tests {
         // Disk tiny (0.05 GB/s = 0.4 Gbps) → disk bottleneck.
         let v = verdict(50.0, &c, 0.05);
         assert_eq!(v.bottleneck, "disk");
+        // ...and compute when it is genuinely the floor, which the measured
+        // version could never pin because it did not know its own value.
+        let v = verdict(50.0, &c, 100.0);
+        assert_eq!(v.bottleneck, "compute");
+        assert!((v.expected_gbps - 40.0).abs() < 1e-9);
     }
 
     /// Regression (East Coast bench box, 5 Gbps): a fixed article supply drained in

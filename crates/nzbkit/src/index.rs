@@ -5091,6 +5091,31 @@ fn evict_order_sql(order: EvictOrder) -> &'static str {
 mod tests {
     use super::*;
 
+    /// Tear a fixture down, closing the index BEFORE removing its directory.
+    ///
+    /// Taking `ix` by value is the whole point: it makes the close
+    /// impossible to forget, because the directory cannot be named for
+    /// removal until the index has been surrendered.
+    ///
+    /// The close is load-bearing, not tidiness. `Index` holds an open SQLite
+    /// connection to `dir/index.db` (plus its -wal and -shm), and SQLite
+    /// opens its files without FILE_SHARE_DELETE, so Windows refuses to
+    /// remove the directory underneath it: "The process cannot access the
+    /// file because it is being used by another process" (os error 32). Unix
+    /// unlinks an open file quite happily, which is why 29 tests in this
+    /// module carried this invisibly for as long as the suite only ever ran
+    /// on Linux and macOS. Every product assertion in all of them passed
+    /// first - the teardown line was the only thing Windows objected to.
+    ///
+    /// Beware a SHADOWED index: `let mut ix = ...; let ix = ...;` leaves the
+    /// first connection open until the end of the block, so a fixture that
+    /// reopens must either scope the first one in an inner block or drop it
+    /// by name.
+    pub(super) fn teardown(dir: &Path, ix: Index) {
+        drop(ix);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn entry(subject: &str, from: &str, id: &str, bytes: u64) -> OverEntry {
         OverEntry {
             number: 0,
@@ -5819,7 +5844,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(orphans, 0, "no orphan files rows");
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(&dir, ix);
     }
 
     #[test]
@@ -5861,7 +5886,7 @@ mod tests {
         assert_eq!(ix.search("zzq9x2m7v5t8k1n3b6h4j0w2e5r7y9", 10).unwrap().len(), 1, "in settle window");
         assert_eq!(ix.search("real show", 10).unwrap().len(), 1, "wall-visible spared");
         assert_eq!(ix.search("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3", 10).unwrap().len(), 1, "complete junk spared");
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(&dir, ix);
     }
 
     #[test]
@@ -6618,7 +6643,7 @@ mod tests {
         // Nothing to resolve, and nothing distinctive enough to try.
         assert!(ix.find_by_header("nosuchheaderatall", 10).unwrap().is_empty());
         assert!(ix.find_by_header("7f3", 10).unwrap().is_empty(), "too short to identify");
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(&dir, ix);
     }
 
     #[test]
@@ -6669,7 +6694,7 @@ mod tests {
         assert_eq!(ix.high_water("alt.test", "news.example.com"), 42);
         assert_eq!(ix.high_water("alt.test", "other.example.com"), 0);
         assert_eq!(ix.stats().unwrap(), (1, 1));
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(&dir, ix);
     }
 
     #[test]
@@ -6769,7 +6794,7 @@ mod tests {
         // The partition must be total: no pending row belongs to none.
         let all = ix.titles_pending(10).unwrap().len();
         assert_eq!(all, lane(Lane::Movies).len() + media.len() + shows.len());
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(&dir, ix);
     }
 
     /// Enrichment is the scarcest resource here, and 75% of it was going
@@ -6833,7 +6858,7 @@ mod tests {
             pending.contains(&"m:hidden:2024".to_string()),
             "a title that became visible was skipped for good: {pending:?}"
         );
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(&dir, ix);
     }
 
     #[test]
@@ -6952,7 +6977,7 @@ mod tests {
         assert_eq!((big.kind.as_str(), big.res.as_str()), ("movie", "2160p"));
         let show = all.iter().find(|r| r.stem.starts_with("Show.")).unwrap();
         assert_eq!((show.have_parts, show.need_parts), (1, 2));
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(&dir, ix);
     }
 
     /// Codec / audio / dynamic range land on ingest, and rows indexed
@@ -6995,7 +7020,7 @@ mod tests {
             ("x265", "Atmos", "DV"),
             "re-open should have backfilled from the stem"
         );
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(&dir, ix);
     }
 
     /// 24C Releases surface: the added (first_seen), files and kind
@@ -7080,7 +7105,7 @@ mod tests {
         assert_eq!((one.len(), total), (1, 1), "{one:?}");
         assert_eq!(one[0].title_key, alpha.title_key);
         assert_eq!(one[0].n_releases, 1);
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(&dir, ix);
     }
 
     /// N9: a card's representative (rep_stem / rep_grp - what drives the
@@ -7169,7 +7194,7 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].grp, "alt.binaries.good");
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(&dir, ix);
     }
 
     #[test]
@@ -7214,7 +7239,7 @@ mod tests {
         assert_eq!(ix.search("old film", 10).unwrap().len(), 1);
         assert_eq!(ix.prune_size(601, 0).unwrap(), 1);
         assert_eq!(ix.search("old film", 10).unwrap().len(), 0);
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(&dir, ix);
     }
 
     // ===== M32: size cap + eviction =====
@@ -7339,7 +7364,7 @@ mod tests {
         assert_eq!(rep.bytes_after, before);
         assert!(!rep.needs_compact);
         assert_eq!(ev_ids(&ix).len(), 8, "no row may be touched when unlimited");
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(&dir, ix);
     }
 
     #[test]
@@ -7364,7 +7389,7 @@ mod tests {
             assert_eq!(rep.removed, 8 - left.len(), "{order:?} removed count");
             assert!(rep.needs_compact, "{order:?} deleted rows, so compact is due");
             assert_prefix_evicted(&expected, &left);
-            std::fs::remove_dir_all(&dir).unwrap();
+            teardown(&dir, ix);
         }
     }
 
@@ -7399,7 +7424,7 @@ mod tests {
         // The ladder's whole point: junk goes before real content does.
         assert!(!left.contains(&1), "junk+incomplete must go first");
         assert!(left.contains(&8), "unknown-date real content goes last");
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(&dir, ix);
     }
 
     #[test]
@@ -7431,7 +7456,7 @@ mod tests {
         assert_eq!(again.removed, 0);
         assert!(!again.needs_compact);
         assert_eq!(ev_ids(&ix), vec![4, 6]);
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(&dir, ix);
     }
 
     #[test]
@@ -7463,7 +7488,7 @@ mod tests {
             "post-compact size {} must fit the cap {target}",
             ix.db_bytes().unwrap()
         );
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(&dir, ix);
     }
 
     #[test]
@@ -7484,7 +7509,7 @@ mod tests {
         let rep = ix.evict_to(1, &policy, &Protected::default()).unwrap();
         assert_eq!(rep.removed, 4);
         assert_eq!(ev_ids(&ix), vec![5, 6, 7, 8, 9], "only tv rows were eligible");
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(&dir, ix);
     }
 
     #[test]
@@ -7519,7 +7544,7 @@ mod tests {
         let rep2 = ix.evict_to(1, &EvictPolicy::default(), &prot2).unwrap();
         assert_eq!(rep2.removed, 1);
         assert_eq!(ev_ids(&ix), vec![1, 2, 3, 4, 5, 6, 7]);
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(&dir, ix);
     }
 
     /// THE size-cap blocker, pinned. `db_bytes()` cannot fall after a
@@ -7557,7 +7582,7 @@ mod tests {
         assert_eq!(rep.live_before, live_before);
         assert_eq!(rep.live_after, ix.live_bytes().unwrap());
         assert!(rep.live_after < rep.bytes_after, "the gap a compact would reclaim");
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(&dir, ix);
     }
 
     /// `blocked` is the difference between "done" and "stopped", and the
@@ -7590,7 +7615,7 @@ mod tests {
         let rep = ix.evict_to(0, &EvictPolicy::default(), &Protected::default()).unwrap();
         assert!(!rep.blocked);
         assert_eq!(rep.live_before, rep.live_after);
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(&dir, ix);
     }
 
     /// Not a behaviour gate so much as a standing measurement: how close
@@ -7646,7 +7671,7 @@ mod tests {
             "over-eviction: only {} of 4000 rows left to free half the file",
             left.len()
         );
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(&dir, ix);
     }
 
     #[test]
@@ -7697,8 +7722,8 @@ mod tests {
             "over-eviction: stopping one row earlier ({one_fewer}) would already \
              have been under the low water mark ({low})"
         );
-        std::fs::remove_dir_all(&dir).unwrap();
-        std::fs::remove_dir_all(&dir2).unwrap();
+        teardown(&dir, ix);
+        teardown(&dir2, ix2);
     }
 
     fn f1_cats() -> Vec<crate::categories::CustomCategory> {
@@ -7777,7 +7802,7 @@ mod tests {
             pretty_key("c:formula-1:formula1:2026:round11 hungary qualifying f1tv"),
             "Formula1 2026 Round11 Hungary Qualifying F1tv"
         );
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(&dir, ix);
     }
 
     /// 24D reclassification: rows indexed BEFORE a category existed move
@@ -7821,7 +7846,7 @@ mod tests {
             .browse(&BrowseQuery { kind: Some("movie".into()), ..Default::default() })
             .unwrap();
         assert_eq!(rows.len(), 2);
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(&dir, ix);
     }
 
     /// `Index::open`'s quality_v8 backfill re-parses every stem, and it
@@ -7872,15 +7897,22 @@ mod tests {
         // The next open runs the pass with no categories installed, which
         // is the only state `Index::open` can be in.
         let ix = Index::open(&path).unwrap();
-        let mut stmt = ix
-            .db
-            .prepare("SELECT kind, title_key FROM releases WHERE stem LIKE 'Formula1%' ORDER BY id")
-            .unwrap();
-        let rows: Vec<(String, String)> = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
+        // Scoped: a live `Statement` borrows the connection, so `teardown`
+        // could not take the index while this was still in hand - and the
+        // statement holds SQLite resources of its own that want releasing
+        // before the connection anyway.
+        let rows: Vec<(String, String)> = {
+            let mut stmt = ix
+                .db
+                .prepare(
+                    "SELECT kind, title_key FROM releases WHERE stem LIKE 'Formula1%' ORDER BY id",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
         assert_eq!(rows.len(), 2);
         for (kind, key) in &rows {
             assert_eq!(kind, "formula-1", "the backfill unclassified a custom row");
@@ -7901,7 +7933,7 @@ mod tests {
             .unwrap();
         assert_eq!(res, "1080p", "the backfill must still fill built-in rows");
 
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(&dir, ix);
     }
 
     /// The fingerprint and the cursor are ONE state transition, and this
@@ -7959,7 +7991,7 @@ mod tests {
             .browse(&BrowseQuery { kind: Some("formula-1".into()), ..Default::default() })
             .unwrap();
         assert_eq!(rows.len(), 2);
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(&dir, ix);
     }
 }
 
@@ -8013,6 +8045,7 @@ mod obfuscated_posts_are_unindexable {
 
 #[cfg(test)]
 mod multi_server_indexing {
+    use super::tests::teardown;
     use crate::index::{BrowseQuery, Index};
     use crate::nntp::OverEntry;
 
@@ -8075,7 +8108,7 @@ mod multi_server_indexing {
         drop(ix);
         let ix2 = Index::open(&db_path).unwrap();
         assert_eq!(ix2.high_water("alt.old", "news.first.example"), 900);
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(&dir, ix2);
     }
 
     /// A8: two servers scanning the same group merge into one release -
@@ -8116,7 +8149,7 @@ mod multi_server_indexing {
             3,
             "the overlapping part must not be emitted twice"
         );
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(&dir, ix);
     }
 
     /// A8 gap-fill pick: only incomplete, junk-gated, settled releases
@@ -8158,5 +8191,5 @@ mod multi_server_indexing {
         let picks2 = ix.gapfill_pick(1, now).unwrap();
         assert_eq!(picks2.len(), 1);
         assert_ne!(picks2[0].0, *id, "the stamped release rotates to the back");
-        std::fs::remove_dir_all(&dir).unwrap();
+        teardown(&dir, ix);
     }}

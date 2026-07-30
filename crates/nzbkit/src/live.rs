@@ -880,18 +880,33 @@ impl LiveVerifier {
                 ReadAt::Path(p) => std::fs::File::open(p).ok(),
                 _ => None,
             };
-            let mut buf = vec![0u8; bs];
+            // One block-sized buffer per slot was `block_size` resident, and
+            // the caller settles slots on up to 12 threads: the accepted wire
+            // block size runs to 256 MiB, so a small, valid PAR2 metadata set
+            // naming a dozen targets with one pending block each asked for
+            // ~3 GiB at once. Bounded above 8 MiB, where the block is read
+            // and hashed in chunks instead (`read_block_chunked`); at or
+            // below it - every real-world set - the single-buffer path with
+            // its CRC-before-MD5 short circuit is unchanged.
+            const READBACK_CHUNK: usize = 8 << 20;
+            let mut buf = vec![0u8; bs.min(READBACK_CHUNK)];
             for bi in pending {
                 readback += 1;
                 let blen = block_len(file.length, bs, bi);
-                let got = match (&src, &f) {
-                    (ReadAt::Path(_), Some(f)) => {
-                        crate::disk::read_exact_at(f, &mut buf[..blen], (bi * bs) as u64).is_ok()
-                    }
-                    (ReadAt::Reader(r), _) => r((bi * bs) as u64, &mut buf[..blen]).is_ok(),
-                    _ => false,
+                let ok = if bs <= READBACK_CHUNK {
+                    let got = match (&src, &f) {
+                        (ReadAt::Path(_), Some(f)) => {
+                            crate::disk::read_exact_at(f, &mut buf[..blen], (bi * bs) as u64)
+                                .is_ok()
+                        }
+                        (ReadAt::Reader(r), _) => r((bi * bs) as u64, &mut buf[..blen]).is_ok(),
+                        _ => false,
+                    };
+                    got && check_block(&file.blocks[bi], bs, &buf[..blen])
+                } else {
+                    read_block_chunked(&src, f.as_ref(), (bi * bs) as u64, blen, &mut buf)
+                        .is_some_and(|check| check.finish(&file.blocks[bi], bs))
                 };
-                let ok = got && check_block(&file.blocks[bi], bs, &buf[..blen]);
                 s.blocks[bi] = if ok { BlockState::Ok } else { BlockState::Bad };
             }
         }
@@ -1043,6 +1058,71 @@ pub fn check_block_crc(check: &BlockCheck, block_size: usize, bytes: &[u8]) -> b
     crc.update(bytes);
     pad_to(block_size, bytes.len(), |z| crc.update(z));
     crc.finalize() == check.crc32
+}
+
+/// [`check_block`] fed in pieces, for a block too big to hold at once.
+///
+/// Both digests run together, so the CRC-before-MD5 short circuit is gone -
+/// which is why the caller only uses this above the chunking threshold, where
+/// holding the whole block is the larger cost by far.
+struct StreamedBlock {
+    crc: crc32fast::Hasher,
+    md5: Md5,
+    len: usize,
+}
+
+impl StreamedBlock {
+    fn new() -> Self {
+        Self { crc: crc32fast::Hasher::new(), md5: Md5::new(), len: 0 }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        self.crc.update(bytes);
+        self.md5.update(bytes);
+        self.len += bytes.len();
+    }
+
+    /// Pad to `block_size` per spec and compare both digests.
+    fn finish(mut self, check: &BlockCheck, block_size: usize) -> bool {
+        // O(log n) through the padding rather than hashing it: the padding on
+        // a 256 MiB block is itself most of a block.
+        if crate::yenc_simd::crc32_zeros(self.crc.finalize(), (block_size - self.len) as u64)
+            != check.crc32
+        {
+            return false;
+        }
+        pad_to(block_size, self.len, |z| self.md5.update(z));
+        <[u8; 16]>::from(self.md5.finalize()) == check.md5
+    }
+}
+
+/// Read one block through `buf` in `buf.len()` pieces, hashing as it goes.
+/// `None` if any read failed - a block that cannot be read is damage.
+fn read_block_chunked(
+    src: &ReadAt<'_>,
+    file: Option<&std::fs::File>,
+    base: u64,
+    blen: usize,
+    buf: &mut [u8],
+) -> Option<StreamedBlock> {
+    let mut check = StreamedBlock::new();
+    let mut done = 0usize;
+    while done < blen {
+        let n = (blen - done).min(buf.len());
+        let ok = match (src, file) {
+            (ReadAt::Path(_), Some(f)) => {
+                crate::disk::read_exact_at(f, &mut buf[..n], base + done as u64).is_ok()
+            }
+            (ReadAt::Reader(r), _) => r(base + done as u64, &mut buf[..n]).is_ok(),
+            _ => false,
+        };
+        if !ok {
+            return None;
+        }
+        check.update(&buf[..n]);
+        done += n;
+    }
+    Some(check)
 }
 
 /// Feed `block_size - len` zero-padding bytes to a hasher, chunk-wise.

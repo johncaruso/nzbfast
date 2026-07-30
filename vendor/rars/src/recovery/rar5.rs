@@ -222,9 +222,15 @@ fn group_shard_range(
 /// records as they are discovered would shift every record after a damaged
 /// one into the wrong group and repair it against another group's parity -
 /// silent corruption rather than a failed repair.
+///
+/// `area_floor` is the lowest offset the recovery area can possibly start at,
+/// in the same coordinates as `records`: the end of the protected prefix when
+/// the offsets are file-absolute, and 0 when they are relative to a recovery
+/// buffer. It is what usually resolves the ambiguity described below.
 pub fn assign_recovery_groups(
     plan: InlineRecoveryPlan,
     records: &[(u64, usize, u64)],
+    area_floor: u64,
 ) -> Result<Vec<Option<usize>>> {
     let groups = recovery_groups(plan)?;
     let span = shard_record_span(plan)?;
@@ -249,23 +255,69 @@ pub fn assign_recovery_groups(
         .min()
         .ok_or(Error::BadRecoveryChunk)?;
 
-    Ok(records
-        .iter()
-        .map(|&(offset, shard_index, parity_len)| {
-            let shard_base = (shard_index as u64)
-                .checked_mul(span)
-                .and_then(|value| base.checked_add(value))?;
-            let within = offset.checked_sub(shard_base)?;
-            let index = boundaries.iter().position(|&value| value == within)?;
-            (groups[index].len == parity_len).then_some(index)
-        })
-        .collect())
+    let assign = |anchor: u64| -> Vec<Option<usize>> {
+        records
+            .iter()
+            .map(|&(offset, shard_index, parity_len)| {
+                let shard_base = (shard_index as u64)
+                    .checked_mul(span)
+                    .and_then(|value| anchor.checked_add(value))?;
+                let within = offset.checked_sub(shard_base)?;
+                let index = boundaries.iter().position(|&value| value == within)?;
+                (groups[index].len == parity_len).then_some(index)
+            })
+            .collect()
+    };
+    let assigned = assign(base);
+
+    // The base above is inferred from the earliest SURVIVING record, and a
+    // record only survives if its CRC64 checks out. If every group-0 record
+    // in the set is damaged, the first survivors are group-1 records, the
+    // inferred base shifts forward by exactly one record boundary, and those
+    // records are assigned to group 0. Nothing downstream can tell: in a set
+    // of two or more FULL groups the parity lengths are equal, so the length
+    // check above passes, and the repair then compares group 1's CRC table
+    // against group 0's data, calls group 0 damaged, and rebuilds group 0's
+    // ranges out of group 1's parity. With enough surviving rows to fund it
+    // (a 100% recovery record is the clear case) both the buffered and the
+    // streaming API return success having written the wrong bytes.
+    //
+    // Verifying the rebuilt shards afterwards does not catch it - they match
+    // the table the repair used. So the ambiguity is settled here, before any
+    // parity is applied: if shifting the base back by whole boundaries is
+    // equally consistent with every surviving record, the layout is genuinely
+    // undecidable and this fails closed. A healthy set is never ambiguous -
+    // the last group's records pin it, since they cannot shift any further.
+    let explained = |assignment: &[Option<usize>]| assignment.iter().filter(|g| g.is_some()).count();
+    let here = explained(&assigned);
+    if here > 0 {
+        for shift in boundaries.iter().skip(1) {
+            let Some(alternative) = base.checked_sub(*shift) else {
+                break;
+            };
+            if alternative < area_floor {
+                // The recovery area cannot start before the data it protects,
+                // so this shift and every larger one are ruled out.
+                break;
+            }
+            // An earlier base that accounts for at least as many surviving
+            // records as this one is not distinguishable from it. A healthy
+            // set is never in that position: shifting the whole layout back
+            // pushes the LAST group's records off the end of the group table,
+            // so the alternative always explains strictly fewer.
+            if explained(&assign(alternative)) >= here {
+                return Err(Error::BadRecoveryChunk);
+            }
+        }
+    }
+    Ok(assigned)
 }
 
 /// Places each found record in the group whose parity it carries.
 fn group_records<'a>(
     found: &'a [FoundInlineRecoveryChunk],
     plan: InlineRecoveryPlan,
+    area_floor: u64,
 ) -> Result<Vec<Vec<&'a InlineRecoveryChunk>>> {
     let groups = recovery_groups(plan)?;
     let records: Vec<(u64, usize, u64)> = found
@@ -278,7 +330,7 @@ fn group_records<'a>(
             )
         })
         .collect();
-    let assigned = assign_recovery_groups(plan, &records)?;
+    let assigned = assign_recovery_groups(plan, &records, area_floor)?;
 
     let mut by_group: Vec<Vec<&InlineRecoveryChunk>> = vec![Vec::new(); groups.len()];
     for (entry, group) in found.iter().zip(assigned) {
@@ -297,6 +349,48 @@ pub fn crc64_xz(data: &[u8]) -> u64 {
 /// XOR-ing this value back out.
 pub const CRC64_XZ_SEED: u64 = CRC64_XZ_INIT;
 
+/// Slice-by-8 tables: table 0 is the classic one-byte table and table `n`
+/// advances a state byte through `n` additional zero bytes, so eight input
+/// bytes fold with eight independent lookups per iteration. Stored as eight
+/// flat arrays rather than one nested one so each lookup is a single
+/// bounds-checked index even in unoptimized builds.
+const CRC64_TABLES: [[u64; 256]; 8] = build_crc64_table();
+const CRC64_TABLE_0: [u64; 256] = CRC64_TABLES[0];
+const CRC64_TABLE_1: [u64; 256] = CRC64_TABLES[1];
+const CRC64_TABLE_2: [u64; 256] = CRC64_TABLES[2];
+const CRC64_TABLE_3: [u64; 256] = CRC64_TABLES[3];
+const CRC64_TABLE_4: [u64; 256] = CRC64_TABLES[4];
+const CRC64_TABLE_5: [u64; 256] = CRC64_TABLES[5];
+const CRC64_TABLE_6: [u64; 256] = CRC64_TABLES[6];
+const CRC64_TABLE_7: [u64; 256] = CRC64_TABLES[7];
+
+const fn build_crc64_table() -> [[u64; 256]; 8] {
+    let mut table = [[0u64; 256]; 8];
+    let mut index = 0;
+    while index < 256 {
+        let mut crc = index as u64;
+        let mut bit = 0;
+        while bit < 8 {
+            let mask = 0u64.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (CRC64_XZ_POLY & mask);
+            bit += 1;
+        }
+        table[0][index] = crc;
+        index += 1;
+    }
+    let mut slice = 1;
+    while slice < 8 {
+        let mut index = 0;
+        while index < 256 {
+            let previous = table[slice - 1][index];
+            table[slice][index] = (previous >> 8) ^ table[0][(previous & 0xff) as usize];
+            index += 1;
+        }
+        slice += 1;
+    }
+    table
+}
+
 /// Folds `data` into a running CRC64 state.
 ///
 /// Public so the streaming paths can hash a multi-gigabyte volume through a
@@ -304,6 +398,38 @@ pub const CRC64_XZ_SEED: u64 = CRC64_XZ_INIT;
 /// would need the volume resident to be called at all. Seed with
 /// [`CRC64_XZ_SEED`] for the XZ variant, or 0 for the RAR shard state.
 pub fn crc64_update(data: &[u8], initial: u64) -> u64 {
+    let mut crc = initial;
+    let mut chunks = data.chunks_exact(8);
+    for chunk in &mut chunks {
+        // Destructure instead of `try_into` and index each slice-by table
+        // directly: this keeps the loop cheap even in unoptimized builds,
+        // where the generic conversion and nested-array indexing cost more
+        // than the fold itself (a debug-build wall-clock guard in the test
+        // suite watches exactly that).
+        let [b0, b1, b2, b3, b4, b5, b6, b7] = *chunk else {
+            unreachable!("chunks_exact(8) yields 8-byte chunks");
+        };
+        let low = (crc as u32).to_le_bytes();
+        let high = ((crc >> 32) as u32).to_le_bytes();
+        crc = CRC64_TABLE_7[usize::from(b0 ^ low[0])]
+            ^ CRC64_TABLE_6[usize::from(b1 ^ low[1])]
+            ^ CRC64_TABLE_5[usize::from(b2 ^ low[2])]
+            ^ CRC64_TABLE_4[usize::from(b3 ^ low[3])]
+            ^ CRC64_TABLE_3[usize::from(b4 ^ high[0])]
+            ^ CRC64_TABLE_2[usize::from(b5 ^ high[1])]
+            ^ CRC64_TABLE_1[usize::from(b6 ^ high[2])]
+            ^ CRC64_TABLE_0[usize::from(b7 ^ high[3])];
+    }
+    for &byte in chunks.remainder() {
+        crc = (crc >> 8) ^ CRC64_TABLE_0[usize::from((crc as u8) ^ byte)];
+    }
+    crc
+}
+
+/// The original bit-serial fold, kept as the differential reference for the
+/// table implementation.
+#[cfg(test)]
+fn crc64_update_bitwise(data: &[u8], initial: u64) -> u64 {
     let mut crc = initial;
     for &byte in data {
         crc ^= byte as u64;
@@ -579,7 +705,8 @@ pub fn repair_inline_recovery_prefix(
     recovery_data: &[u8],
 ) -> Result<Vec<u8>> {
     let found = find_inline_recovery_chunks(recovery_data)?;
-    repair_prefix_with_chunks(archive_prefix, &found)
+    // Offsets are relative to `recovery_data`, so the area starts at 0.
+    repair_prefix_with_chunks(archive_prefix, &found, 0)
 }
 
 /// Repairs `archive_prefix` one storage group at a time.
@@ -597,6 +724,7 @@ pub fn repair_inline_recovery_prefix(
 fn repair_prefix_with_chunks(
     archive_prefix: &[u8],
     found: &[FoundInlineRecoveryChunk],
+    area_floor: u64,
 ) -> Result<Vec<u8>> {
     let first = found.first().ok_or(Error::BadRecoveryChunk)?;
     let plan = first.chunk.plan;
@@ -613,7 +741,7 @@ fn repair_prefix_with_chunks(
 
     let data_shards = usize::try_from(plan.data_shards).map_err(|_| Error::PlanOverflow)?;
     let groups = recovery_groups(plan)?;
-    let by_group = group_records(found, plan)?;
+    let by_group = group_records(found, plan, area_floor)?;
 
     let mut repaired = archive_prefix.to_vec();
     for (group, rows) in groups.iter().zip(&by_group) {
@@ -727,7 +855,7 @@ where
 
     let data_shards = usize::try_from(plan.data_shards).map_err(|_| Error::PlanOverflow)?;
     let groups = recovery_groups(plan)?;
-    let by_group = group_records(&found, plan)?;
+    let by_group = group_records(&found, plan, 0)?;
 
     let mut patches: Vec<(std::ops::Range<usize>, Vec<u8>)> = Vec::new();
     for (group, rows) in groups.iter().zip(&by_group) {
@@ -948,7 +1076,10 @@ pub fn repair_inline_recovery_archive(input: &[u8]) -> Result<Vec<u8>> {
     // by any record that failed its CRC, and record position is what decides
     // which group a record belongs to - a compacted buffer would silently
     // shift survivors into the wrong group.
-    let repaired_prefix = repair_prefix_with_chunks(&input[..protected_size], &chunks)?;
+    // Whole-archive offsets: the recovery area sits after the protected
+    // prefix, which is the floor that resolves an ambiguous base.
+    let repaired_prefix =
+        repair_prefix_with_chunks(&input[..protected_size], &chunks, protected_size as u64)?;
     if repaired_prefix == input[..protected_size] {
         return Ok(input.to_vec());
     }
@@ -1293,26 +1424,119 @@ fn recover_damaged_shards(
         .collect();
     let inverse = invert_linear_system_matrix(gf, &equations)?;
 
-    for word_offset in (0..shard_len).step_by(2) {
-        let mut rhs = Vec::with_capacity(recovery_shards.len());
-        for &(row_index, parity) in recovery_shards {
-            let mut value = u16::from_le_bytes([parity[word_offset], parity[word_offset + 1]]);
-            for (data_index, shard) in data_shards.iter().enumerate() {
-                if damaged_lookup[data_index] {
+    // The per-word solve is linear in the codeword, so it collapses to one
+    // fixed coefficient per (rebuilt shard, surviving source):
+    //
+    //   rebuilt_i = XOR_j inverse[i][j] * parity_j
+    //             ^ XOR_k (XOR_j inverse[i][j] * matrix[row_j][k]) * shard_k
+    //
+    // which turns the kernel from two heap allocations and a strided
+    // column-major walk per 2-byte symbol into a table-driven row-major fold
+    // (the same shape `recovery/rar3.rs` uses, lifted to GF(2^16)).
+    let sources: Vec<&[u8]> = recovery_shards
+        .iter()
+        .map(|&(_, parity)| &parity[..shard_len])
+        .chain(
+            data_shards
+                .iter()
+                .enumerate()
+                .filter(|&(data_index, _)| !damaged_lookup[data_index])
+                .map(|(_, shard)| shard.as_slice()),
+        )
+        .collect();
+    let intact: Vec<usize> = (0..data_count)
+        .filter(|&data_index| !damaged_lookup[data_index])
+        .collect();
+
+    let mut rebuilt = vec![vec![0u8; shard_len]; damaged.len()];
+    for (inverse_row, rebuilt_row) in inverse.iter().zip(rebuilt.iter_mut()) {
+        // Combined coefficient per source, tables built per output row so the
+        // resident table set stays bounded by the source count, not the grid.
+        let tables: Vec<Option<Gf16MulTable>> = sources
+            .iter()
+            .enumerate()
+            .map(|(slot, _)| {
+                let coefficient = if slot < recovery_shards.len() {
+                    inverse_row[slot]
+                } else {
+                    let data_index = intact[slot - recovery_shards.len()];
+                    recovery_shards
+                        .iter()
+                        .zip(inverse_row)
+                        .fold(0u16, |sum, (&(row_index, _), &weight)| {
+                            sum ^ gf.mul(weight, matrix[row_index][data_index])
+                        })
+                };
+                (coefficient != 0).then(|| Gf16MulTable::new(gf, coefficient))
+            })
+            .collect();
+
+        let fold_chunk = |destination: &mut [u8], start: usize| {
+            for (source, table) in sources.iter().zip(&tables) {
+                let Some(table) = table else {
                     continue;
-                }
-                let data_symbol = u16::from_le_bytes([shard[word_offset], shard[word_offset + 1]]);
-                value ^= gf.mul(matrix[row_index][data_index], data_symbol);
+                };
+                table.fold_into(destination, &source[start..start + destination.len()]);
             }
-            rhs.push(value);
+        };
+
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            rebuilt_row
+                .par_chunks_mut(RECOVER_FOLD_CHUNK)
+                .enumerate()
+                .for_each(|(index, destination)| {
+                    fold_chunk(destination, index * RECOVER_FOLD_CHUNK);
+                });
         }
-        let solved = apply_inverse_matrix(gf, &inverse, &rhs)?;
-        for (&data_index, &symbol) in damaged.iter().zip(&solved) {
-            data_shards[data_index][word_offset..word_offset + 2]
-                .copy_from_slice(&symbol.to_le_bytes());
+        #[cfg(not(feature = "parallel"))]
+        for (index, destination) in rebuilt_row.chunks_mut(RECOVER_FOLD_CHUNK).enumerate() {
+            fold_chunk(destination, index * RECOVER_FOLD_CHUNK);
         }
     }
+
+    for (&data_index, rebuilt_row) in damaged.iter().zip(rebuilt) {
+        data_shards[data_index] = rebuilt_row;
+    }
     Ok(())
+}
+
+/// One chunk of a table-driven fold; even so chunk starts stay on symbol
+/// boundaries. 64 KiB keeps the destination L2-resident while sources stream.
+const RECOVER_FOLD_CHUNK: usize = 64 * 1024;
+
+/// Multiply-by-constant over GF(2^16), split into low-byte and high-byte
+/// halves: `c * x == lo[x & 0xff] ^ hi[x >> 8]`, since multiplication
+/// distributes over XOR and `x = (x & 0xff) ^ ((x >> 8) << 8)`. 1 KiB per
+/// coefficient, so a fold reads two small tables instead of the log/exp
+/// tables' three dependent loads and a branch per symbol.
+struct Gf16MulTable {
+    lo: [u16; 256],
+    hi: [u16; 256],
+}
+
+impl Gf16MulTable {
+    fn new(gf: &Gf16, coefficient: u16) -> Self {
+        let mut lo = [0u16; 256];
+        let mut hi = [0u16; 256];
+        for byte in 0..256u16 {
+            lo[byte as usize] = gf.mul(coefficient, byte);
+            hi[byte as usize] = gf.mul(coefficient, byte << 8);
+        }
+        Self { lo, hi }
+    }
+
+    /// XORs `coefficient * source` into `destination`, both little-endian
+    /// 2-byte symbol streams of equal, even length.
+    fn fold_into(&self, destination: &mut [u8], source: &[u8]) {
+        for (destination, source) in destination.chunks_exact_mut(2).zip(source.chunks_exact(2)) {
+            let product =
+                self.lo[usize::from(source[0])] ^ self.hi[usize::from(source[1])];
+            destination[0] ^= (product & 0xff) as u8;
+            destination[1] ^= (product >> 8) as u8;
+        }
+    }
 }
 
 fn invert_linear_system_matrix(gf: &Gf16, matrix: &[Vec<u16>]) -> Result<Vec<Vec<u16>>> {
@@ -1497,6 +1721,51 @@ fn encode_parity_shards_with_progress(
     let gf = shared_gf16();
     let mut parity = vec![vec![0u8; first.len()]; recovery_shards];
     for (recovery_index, row) in matrix.iter().enumerate() {
+        // Same table-driven fold as `recover_damaged_shards`: one
+        // multiply-by-constant table per data shard, row-major accumulation.
+        let tables: Vec<Option<Gf16MulTable>> = row
+            .iter()
+            .map(|&coefficient| (coefficient != 0).then(|| Gf16MulTable::new(gf, coefficient)))
+            .collect();
+        let parity_row = &mut parity[recovery_index];
+
+        let fold_chunk = |destination: &mut [u8], start: usize| {
+            for (shard, table) in data.iter().zip(&tables) {
+                let Some(table) = table else {
+                    continue;
+                };
+                table.fold_into(destination, &shard[start..start + destination.len()]);
+            }
+        };
+
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            parity_row
+                .par_chunks_mut(RECOVER_FOLD_CHUNK)
+                .enumerate()
+                .for_each(|(index, destination)| {
+                    fold_chunk(destination, index * RECOVER_FOLD_CHUNK);
+                });
+        }
+        #[cfg(not(feature = "parallel"))]
+        for (index, destination) in parity_row.chunks_mut(RECOVER_FOLD_CHUNK).enumerate() {
+            fold_chunk(destination, index * RECOVER_FOLD_CHUNK);
+        }
+        progress(((recovery_index + 1) * first.len()) as u64);
+    }
+    Ok(parity)
+}
+
+/// The original per-symbol encode, kept as the differential reference for the
+/// table-driven fold.
+#[cfg(test)]
+fn encode_parity_shards_reference(data: &[&[u8]], recovery_shards: usize) -> Result<Vec<Vec<u8>>> {
+    let first = data.first().ok_or(Error::TooManyShards)?;
+    let matrix = make_encoder_matrix(data.len(), recovery_shards)?;
+    let gf = shared_gf16();
+    let mut parity = vec![vec![0u8; first.len()]; recovery_shards];
+    for (recovery_index, row) in matrix.iter().enumerate() {
         for word_offset in (0..first.len()).step_by(2) {
             let mut symbol = 0u16;
             for (data_index, shard) in data.iter().enumerate() {
@@ -1506,9 +1775,62 @@ fn encode_parity_shards_with_progress(
             parity[recovery_index][word_offset..word_offset + 2]
                 .copy_from_slice(&symbol.to_le_bytes());
         }
-        progress(((recovery_index + 1) * first.len()) as u64);
     }
     Ok(parity)
+}
+
+/// The original per-word solve, kept as the differential reference for the
+/// table-driven `recover_damaged_shards`.
+#[cfg(test)]
+fn recover_damaged_shards_reference(
+    data_shards: &mut [Vec<u8>],
+    damaged: &[usize],
+    recovery_shards: &[(usize, &[u8])],
+) -> Result<()> {
+    let shard_len = data_shards.first().ok_or(Error::TooManyShards)?.len();
+    let data_count = data_shards.len();
+    let mut damaged_lookup = vec![false; data_count];
+    for &data_index in damaged {
+        damaged_lookup[data_index] = true;
+    }
+    let recovery_count = recovery_shards
+        .iter()
+        .map(|(row, _)| row + 1)
+        .max()
+        .ok_or(Error::TooManyDamagedShards)?;
+    let matrix = make_encoder_matrix(data_count, recovery_count)?;
+    let gf = shared_gf16();
+    let equations: Vec<Vec<u16>> = recovery_shards
+        .iter()
+        .map(|&(row_index, _)| {
+            damaged
+                .iter()
+                .map(|&data_index| matrix[row_index][data_index])
+                .collect()
+        })
+        .collect();
+    let inverse = invert_linear_system_matrix(gf, &equations)?;
+
+    for word_offset in (0..shard_len).step_by(2) {
+        let mut rhs = Vec::with_capacity(recovery_shards.len());
+        for &(row_index, parity) in recovery_shards {
+            let mut value = u16::from_le_bytes([parity[word_offset], parity[word_offset + 1]]);
+            for (data_index, shard) in data_shards.iter().enumerate() {
+                if damaged_lookup[data_index] {
+                    continue;
+                }
+                let data_symbol = u16::from_le_bytes([shard[word_offset], shard[word_offset + 1]]);
+                value ^= gf.mul(matrix[row_index][data_index], data_symbol);
+            }
+            rhs.push(value);
+        }
+        let solved = apply_inverse_matrix(gf, &inverse, &rhs)?;
+        for (&data_index, &symbol) in damaged.iter().zip(&solved) {
+            data_shards[data_index][word_offset..word_offset + 2]
+                .copy_from_slice(&symbol.to_le_bytes());
+        }
+    }
+    Ok(())
 }
 
 /// Smallest stripe worth running: below this the per-stripe seek and
@@ -1803,11 +2125,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_inverse_matrix, build_structural_inline_recovery_data, crc64_rar_state, crc64_xz,
+        apply_inverse_matrix, assign_recovery_groups, build_structural_inline_recovery_data,
+        crc64_rar_state, RAR5_RECOVERY_PARITY_PER_RECORD_MAX,
+        crc64_update, crc64_update_bitwise, crc64_xz, CRC64_XZ_SEED,
         encode_inline_recovery_parity, encode_parity_shards, invert_linear_system_matrix,
         find_inline_recovery_chunks, make_encoder_matrix, parse_inline_recovery_chunk,
         plan_inline_recovery,
-        reconstruct_data_shards, recover_damaged_shards, recovery_groups,
+        reconstruct_data_shards, recover_damaged_shards, recover_damaged_shards_reference,
+        recovery_groups,
         repair_inline_recovery_archive,
         repair_inline_recovery_prefix, repair_inline_recovery_prefix_shards,
         repair_shards_striped, shared_gf16, shard_record_span, solve_damaged_group_shards,
@@ -1926,6 +2251,107 @@ mod tests {
     fn raw_crc64_state_matches_reference_vector() {
         assert_eq!(crc64_rar_state(b""), 0);
         assert_eq!(crc64_rar_state(b"te\x80st"), 0xb5db_f958_3a6e_ed4a);
+    }
+
+    /// The table-driven fold must reproduce the per-word solve exactly:
+    /// across damage patterns, non-contiguous recovery rows, shard lengths
+    /// that straddle the fold-chunk boundary, and all-zero coefficients.
+    #[test]
+    fn bulk_recover_matches_per_word_reference() {
+        let chunk = super::RECOVER_FOLD_CHUNK;
+        let cases: &[(usize, &[usize], &[usize], usize)] = &[
+            // (data shards, damaged indices, recovery rows, shard length)
+            (4, &[1], &[0], 8),
+            (4, &[0, 3], &[0, 1], 500),
+            (10, &[2, 5, 9], &[1, 3, 7], 1024),
+            (1, &[0], &[0], 2),
+            (30, &[0, 15, 29], &[0, 1, 2], chunk - 2),
+            (30, &[7], &[4], chunk),
+            (30, &[7, 8], &[2, 6], chunk + 38),
+            (30, &[7, 8, 9], &[0, 5, 11], 2 * chunk + 66),
+        ];
+        for &(data_count, damaged, rows, shard_len) in cases {
+            let originals: Vec<Vec<u8>> = (0..data_count)
+                .map(|index| {
+                    (0..shard_len)
+                        .map(|offset| {
+                            ((offset as u64)
+                                .wrapping_mul(0x9E3779B97F4A7C15)
+                                .wrapping_add(index as u64 * 0x1234567)
+                                >> 29) as u8
+                        })
+                        .collect()
+                })
+                .collect();
+            let data_refs: Vec<&[u8]> = originals.iter().map(Vec::as_slice).collect();
+            let recovery_count = rows.iter().max().unwrap() + 1;
+            let parity = encode_parity_shards(&data_refs, recovery_count).unwrap();
+            let recovery: Vec<(usize, &[u8])> =
+                rows.iter().map(|&row| (row, parity[row].as_slice())).collect();
+
+            let damage = |shards: &mut [Vec<u8>]| {
+                for &index in damaged {
+                    shards[index].fill(0xAA);
+                }
+            };
+            let mut fast = originals.clone();
+            damage(&mut fast);
+            let mut reference = originals.clone();
+            damage(&mut reference);
+
+            let fast_result = recover_damaged_shards(&mut fast, damaged, &recovery);
+            let reference_result =
+                recover_damaged_shards_reference(&mut reference, damaged, &recovery);
+            assert_eq!(fast_result.is_ok(), reference_result.is_ok());
+            assert_eq!(
+                fast, reference,
+                "kernels diverged: {data_count} shards, {damaged:?} damaged, rows {rows:?}, len {shard_len}"
+            );
+            if fast_result.is_ok() {
+                assert_eq!(fast, originals, "repair did not restore the originals");
+            }
+        }
+    }
+
+    /// The table-driven encoder must match the per-symbol encoder bit for bit.
+    #[test]
+    fn bulk_encode_matches_per_symbol_reference() {
+        for &(data_count, recovery_count, shard_len) in
+            &[(1usize, 1usize, 2usize), (5, 3, 998), (12, 7, 70_000)]
+        {
+            let shards: Vec<Vec<u8>> = (0..data_count)
+                .map(|index| {
+                    (0..shard_len)
+                        .map(|offset| (offset.wrapping_mul(31).wrapping_add(index * 97) >> 3) as u8)
+                        .collect()
+                })
+                .collect();
+            let refs: Vec<&[u8]> = shards.iter().map(Vec::as_slice).collect();
+            assert_eq!(
+                encode_parity_shards(&refs, recovery_count).unwrap(),
+                super::encode_parity_shards_reference(&refs, recovery_count).unwrap(),
+                "{data_count}+{recovery_count} at {shard_len} B"
+            );
+        }
+    }
+
+    /// The slice-by-8 tables must match the bit-serial fold at every length
+    /// around the 8-byte chunk boundary and from any running state.
+    #[test]
+    fn crc64_table_fold_matches_bitwise_reference() {
+        let data: Vec<u8> = (0u32..4096).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        for len in [0, 1, 7, 8, 9, 15, 16, 17, 63, 64, 255, 256, 1024, 4096] {
+            for seed in [0u64, CRC64_XZ_SEED, 0x0123_4567_89ab_cdef] {
+                assert_eq!(
+                    crc64_update(&data[..len], seed),
+                    crc64_update_bitwise(&data[..len], seed),
+                    "diverged at len {len}, seed {seed:#x}"
+                );
+            }
+        }
+        // Incremental folding across an arbitrary split must equal one pass.
+        let split = crc64_update(&data[1000..], crc64_update(&data[..1000], CRC64_XZ_SEED));
+        assert_eq!(split, crc64_update(&data, CRC64_XZ_SEED));
     }
 
     #[test]
@@ -2489,6 +2915,123 @@ mod tests {
             plan.group_count,
             "a shard's groups must tile its whole parity row"
         );
+    }
+
+    /// A two-full-group plan: both groups carry 64 KiB of parity, so parity
+    /// length cannot tell one from the other.
+    fn two_full_group_plan() -> InlineRecoveryPlan {
+        let plan = InlineRecoveryPlan {
+            data_shards: 4,
+            recovery_shards: 4,
+            group_count: 2 * RAR5_RECOVERY_PARITY_PER_RECORD_MAX,
+            header_size: 0x48 + 4 * 8,
+            shard_size: 0,
+        };
+        let plan = InlineRecoveryPlan {
+            shard_size: shard_record_span(plan).unwrap(),
+            ..plan
+        };
+        assert_eq!(recovery_groups(plan).unwrap().len(), 2);
+        plan
+    }
+
+    /// Records as they sit in the file: shard-index-major, every group of
+    /// shard 0, then every group of shard 1, starting at `base`.
+    fn laid_out_records(plan: InlineRecoveryPlan, base: u64) -> Vec<(u64, usize, u64)> {
+        let groups = recovery_groups(plan).unwrap();
+        let span = shard_record_span(plan).unwrap();
+        let mut records = Vec::new();
+        for shard in 0..plan.recovery_shards as usize {
+            let mut cursor = base + shard as u64 * span;
+            for group in &groups {
+                records.push((cursor, shard, group.len));
+                cursor += plan.header_size + group.len;
+            }
+        }
+        records
+    }
+
+    /// The recovery-area base is inferred from the earliest SURVIVING record.
+    /// Lose every group-0 record to CRC damage and the group-1 records look
+    /// exactly like group-0 records one boundary further on - same offset
+    /// arithmetic, same parity length. Assigning them to group 0 would repair
+    /// group 0's ranges out of group 1's parity and return success, so an
+    /// undecidable layout has to fail closed instead.
+    #[test]
+    fn rar5_recovery_base_refuses_an_ambiguous_layout() {
+        let plan = two_full_group_plan();
+        // Far enough in that an earlier base is arithmetically possible -
+        // otherwise the guard has nothing to weigh.
+        let base = 200_000;
+        let all = laid_out_records(plan, base);
+
+        // Healthy: every record present, every group correctly identified.
+        let assigned = assign_recovery_groups(plan, &all, 0).unwrap();
+        assert_eq!(
+            assigned,
+            (0..plan.recovery_shards as usize)
+                .flat_map(|_| [Some(0), Some(1)])
+                .collect::<Vec<_>>()
+        );
+
+        // Every group-0 record CRC-damaged (so absent), every group-1 record
+        // intact: the base is no longer decidable from what survived.
+        let survivors: Vec<_> = all.iter().copied().skip(1).step_by(2).collect();
+        assert_eq!(survivors.len(), plan.recovery_shards as usize);
+        assert_eq!(
+            assign_recovery_groups(plan, &survivors, 0),
+            Err(Error::BadRecoveryChunk),
+            "assigning the survivors to group 0 would rebuild it from the wrong parity"
+        );
+
+        // The floor settles it when the caller knows one: with no room for a
+        // record before them, the survivors can only BE group 0 - which is
+        // also the ordinary healthy case, where the recovery area starts
+        // immediately after the data it protects.
+        let assigned = assign_recovery_groups(plan, &survivors, base + 1).unwrap();
+        assert!(assigned.iter().all(|group| *group == Some(0)));
+
+        // Losing only SOME group-0 records leaves the base pinned, and every
+        // survivor keeps its true group.
+        let mut partial = all.clone();
+        partial.remove(2); // shard 1's group-0 record
+        let assigned = assign_recovery_groups(plan, &partial, 0).unwrap();
+        assert_eq!(assigned[0], Some(0));
+        assert_eq!(assigned[1], Some(1));
+        assert_eq!(assigned[2], Some(1));
+    }
+
+    /// The guard must stay silent on healthy sets, including the ordinary
+    /// shape: several full groups and a short tail.
+    #[test]
+    fn rar5_recovery_base_accepts_a_healthy_three_group_set() {
+        let plan = InlineRecoveryPlan {
+            data_shards: 4,
+            recovery_shards: 4,
+            group_count: 2 * RAR5_RECOVERY_PARITY_PER_RECORD_MAX + 4096,
+            header_size: 0x48 + 4 * 8,
+            shard_size: 0,
+        };
+        let plan = InlineRecoveryPlan {
+            shard_size: shard_record_span(plan).unwrap(),
+            ..plan
+        };
+        assert_eq!(recovery_groups(plan).unwrap().len(), 3);
+        let all = laid_out_records(plan, 200_000);
+        let assigned = assign_recovery_groups(plan, &all, 0).unwrap();
+        assert!(assigned.chunks(3).all(|shard| shard == [Some(0), Some(1), Some(2)]));
+
+        // Damage that takes out records WITHIN a group leaves the base pinned
+        // by the survivors of the others.
+        let survivors: Vec<_> = all
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(index, _)| *index != 4 && *index != 8)
+            .map(|(_, record)| record)
+            .collect();
+        let assigned = assign_recovery_groups(plan, &survivors, 0).unwrap();
+        assert_eq!(assigned[..3], [Some(0), Some(1), Some(2)]);
     }
 
     /// Damage in a group OTHER than the first, which is the case the old

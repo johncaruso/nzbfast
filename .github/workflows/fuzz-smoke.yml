@@ -1,5 +1,5 @@
 # Bounded fuzz smoke on every PR: a short libFuzzer burst over each
-# untrusted-input parser (yEnc, NZB, PAR2, RAR). This is NOT a full
+# untrusted-input parser (yEnc, NZB, PAR2, RAR, zip). This is NOT a full
 # campaign - long campaigns run offline - just enough to catch a change
 # that makes a parser panic/OOB/hang on the seed corpus plus fresh
 # mutations. A crash fails the job and uploads the reproducing input.
@@ -35,15 +35,16 @@ jobs:
       - name: seed corpora from in-tree fixtures
         working-directory: crates/nzbkit/fuzz
         run: |
-          mkdir -p corpus/rar_extract corpus/par2_parse corpus/mkv_parse
+          mkdir -p corpus/rar_extract corpus/par2_parse corpus/mkv_parse corpus/zip_parse
           cp ../../../vendor/rars/tests/fixtures/rar*/*.rar corpus/rar_extract/ 2>/dev/null || true
           cp ../tests/fixtures/par2/*.par2 corpus/par2_parse/ 2>/dev/null || true
           cp ../tests/fixtures/mkv/*.mkv corpus/mkv_parse/ 2>/dev/null || true
+          cp ../tests/fixtures/zip/*.zip corpus/zip_parse/ 2>/dev/null || true
       - name: fuzz burst (60s per target)
         working-directory: crates/nzbkit/fuzz
         run: |
           set -e
-          for t in yenc_decode nzb_parse nzblnk_parse par2_parse rar_extract mkv_parse; do
+          for t in yenc_decode nzb_parse nzblnk_parse par2_parse rar_extract mkv_parse zip_parse; do
             echo "::group::fuzz $t"
             cargo +nightly fuzz run "$t" -- \
               -max_total_time=60 -rss_limit_mb=4096 -timeout=10

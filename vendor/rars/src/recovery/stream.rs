@@ -188,7 +188,13 @@ impl InlineRecoveryScan {
                 )
             })
             .collect();
-        let assigned = rar5::assign_recovery_groups(plan, &records)?;
+        // Floor: the recovery area cannot begin before the end of the data
+        // it protects. A conservative lower bound is enough here - the
+        // protected prefix may itself start at a non-zero source offset - and
+        // it is what keeps an ambiguous base from failing closed on a set
+        // whose layout is in fact decidable.
+        let floor = self.chunks.first().map_or(0, |chunk| chunk.protected_size);
+        let assigned = rar5::assign_recovery_groups(plan, &records, floor)?;
         let mut by_group = vec![Vec::new(); groups.len()];
         for (slot, group) in assigned.iter().enumerate() {
             if let Some(index) = group {
@@ -307,7 +313,8 @@ pub fn scan_inline_recovery_chunks_in(
             )
         })
         .collect();
-    let assigned = rar5::assign_recovery_groups(plan, &records)?;
+    let floor = chunks.first().map_or(0, |chunk| chunk.protected_size);
+    let assigned = rar5::assign_recovery_groups(plan, &records, floor)?;
 
     let mut group_states: Vec<Vec<u64>> = vec![Vec::new(); groups.len()];
     let mut poisoned = vec![false; groups.len()];
