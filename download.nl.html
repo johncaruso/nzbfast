@@ -56,7 +56,7 @@
         <p>De NzbFast-app: sleep naar Programma's en klaar. Universal (Apple Silicon en
         Intel), dashboard in een eigen venster, .nzb-dubbelklik, starten bij inloggen.</p>
         <p class="meta">macOS 12+ · ~16 MB DMG · app + engine</p>
-        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-macos.dmg">Download de Mac-app</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-macos-universal.zip">draagbare .zip</a></p>
+        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-macos.dmg">Download de Mac-app</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-macos-universal.zip">draagbare .zip</a></p>
       </div>
       <div class="card">
         <h3>🪟 Windows <span class="tag now">beschikbaar</span></h3>
@@ -64,14 +64,14 @@
         optioneel starten met Windows en .nzb-dubbelklik. Volledig statisch, geen runtime
         te installeren; hij kan ook je bestaande SABnzbd-config overnemen.</p>
         <p class="meta">Windows 10/11 x64 · ~8 MB installer</p>
-        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-windows-x64-setup.exe">Download de installer</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-windows-x64.zip">draagbare .zip</a></p>
+        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-windows-x64-setup.exe">Download de installer</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-windows-x64.zip">draagbare .zip</a></p>
       </div>
       <div class="card">
         <h3>🐧 Linux <span class="tag now">beschikbaar</span></h3>
         <p>Statische musl-builds voor x86_64 en arm64: seedboxes, VPS'en, elke NAS met SSH,
         Raspberry Pi 4/5. Geen glibc-versieroulette.</p>
         <p class="meta">x86_64 · arm64 · systemd-unit meegeleverd</p>
-        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-linux-arm64.tar.gz">arm64</a></p>
+        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-linux-arm64.tar.gz">arm64</a></p>
       </div>
       <div class="card">
         <h3>🐳 Docker <span class="tag now">beschikbaar</span></h3>
@@ -83,13 +83,20 @@
       <div class="card">
         <h3>📦 Synology <span class="tag now">beschikbaar</span></h3>
         <p>Draait op DSM 7 via <b>Container Manager</b>: zoek <code>nzbfast</code> in de Registry, download, koppel drie mappen en poort 6789. Geen configuratiebestand om te bewerken: voeg je provider toe in het welkomstpaneel van het dashboard.</p>
+        <p class="get"><a class="btn ghost" href="nzbfast-synology.yml" download="docker-compose.yml">Compose-bestand, met auto-update</a></p>
         <p class="meta">DSM 7 · Intel- + ARM-modellen · <a href="synology.html">stapsgewijze handleiding →</a></p>
       </div>
       <div class="card">
         <h3>🍺 Homebrew <span class="tag now">beschikbaar</span></h3>
-        <p>Formule met een serviceblok (<code>brew services start nzbfast</code>).</p>
+        <p>Eén commando op macOS en Linux, met een serviceblok zodat het start bij
+        inloggen (<code>brew services start nzbfast</code>). Upgraden is
+        <code>brew upgrade nzbfast</code>, en je instellingen en wachtrij staan buiten
+        de installatie, dus ze overleven het.</p>
+        <p class="meta">macOS (Apple Silicon + Intel) · Linux x86_64 + arm64</p>
         <pre class="cmd">brew install nzbfast/tap/nzbfast</pre>
       </div>
+    
+      <p class="note nzbfast-releases-fallback" style="text-align:center;margin-top:20px">Deze knoppen verwijzen naar de huidige versie. Werkt een link niet meer, of wil je een oudere build, de checksums of de release-notities, dan staat alles op de <a href="https://github.com/nzbfast/nzbfast/releases">GitHub-releasespagina</a>.</p>
     </div>
 
     <div class="callout" style="margin-top:26px"><b>Downloads verifiëren:</b> elke release levert sha256-sommen naast de artifacts op de releasespagina. macOS-zips behouden de executable-bits; de builds zijn nog niet ondertekend, dus macOS vraagt om bevestiging bij de eerste start: rechtsklik op de app en kies Open.</div>

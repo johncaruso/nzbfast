@@ -56,7 +56,7 @@
         <p>اپ NzbFast: به Applications بکشید و شروع کنید. یونیورسال (Apple Silicon و
         Intel)، داشبورد در پنجرهٔ خودش، دوکلیک ‎.nzb، شروع هنگام ورود.</p>
         <p class="meta">macOS 12+ · ~16 MB DMG · اپ + موتور</p>
-        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-macos.dmg">دانلود اپ مک</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-macos-universal.zip">‎.zip قابل حمل</a></p>
+        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-macos.dmg">دانلود اپ مک</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-macos-universal.zip">‎.zip قابل حمل</a></p>
       </div>
       <div class="card">
         <h3>🪟 Windows <span class="tag now">در دسترس</span></h3>
@@ -64,14 +64,14 @@
         شروع-با-Windows اختیاری و دوکلیک ‎.nzb راه‌اندازی می‌کند. کاملاً ایستا، بدون زمان‌اجرا
         برای نصب؛ می‌تواند پیکربندی موجود SABnzbd شما را هم بپذیرد.</p>
         <p class="meta">Windows 10/11 x64 · ~8 MB نصاب</p>
-        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-windows-x64-setup.exe">دانلود نصاب</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-windows-x64.zip">‎.zip قابل حمل</a></p>
+        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-windows-x64-setup.exe">دانلود نصاب</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-windows-x64.zip">‎.zip قابل حمل</a></p>
       </div>
       <div class="card">
         <h3>🐧 Linux <span class="tag now">در دسترس</span></h3>
         <p>بیلدهای ایستای musl برای x86_64 و arm64: سیدباکس‌ها، VPSها، هر NAS با SSH،
         Raspberry Pi 4/5. بدون رولت نسخهٔ glibc.</p>
         <p class="meta">x86_64 · arm64 · واحد systemd گنجانده شده</p>
-        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-linux-arm64.tar.gz">arm64</a></p>
+        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-linux-arm64.tar.gz">arm64</a></p>
       </div>
       <div class="card">
         <h3>🐳 Docker <span class="tag now">در دسترس</span></h3>
@@ -83,13 +83,20 @@
       <div class="card">
         <h3>📦 Synology <span class="tag now">در دسترس</span></h3>
         <p>روی DSM 7 از طریق <b>Container Manager</b> اجرا می‌شود: در Registry عبارت <code>nzbfast</code> را جست‌وجو کنید، دانلود کنید، سه پوشه و پورت 6789 را نگاشت کنید. هیچ فایل پیکربندی‌ای برای ویرایش نیست: ارائه‌دهنده‌تان را از پنل خوش‌آمدگویی داشبورد اضافه کنید.</p>
+        <p class="get"><a class="btn ghost" href="nzbfast-synology.yml" download="docker-compose.yml">فایل compose، با به‌روزرسانی خودکار</a></p>
         <p class="meta">DSM 7 · مدل‌های Intel + ARM · <a href="synology.html">راهنمای گام‌به‌گام →</a></p>
       </div>
       <div class="card">
         <h3>🍺 Homebrew <span class="tag now">در دسترس</span></h3>
-        <p>فرمول با یک بلوک سرویس (<code>brew services start nzbfast</code>).</p>
+        <p>یک فرمان روی macOS و Linux، همراه با یک بلوک سرویس تا هنگام ورود اجرا شود
+        (<code>brew services start nzbfast</code>). ارتقا با
+        <code>brew upgrade nzbfast</code> انجام می‌شود و تنظیمات و صف شما بیرون از
+        محل نصب می‌مانند، پس از ارتقا جان به در می‌برند.</p>
+        <p class="meta">macOS (Apple Silicon + Intel) · Linux x86_64 + arm64</p>
         <pre class="cmd">brew install nzbfast/tap/nzbfast</pre>
       </div>
+    
+      <p class="note nzbfast-releases-fallback" style="text-align:center;margin-top:20px">این دکمه‌ها به نسخهٔ فعلی اشاره می‌کنند. اگر پیوندی از کار افتاد، یا نسخهٔ قدیمی‌تر، جمع‌های کنترلی یا یادداشت‌های انتشار را می‌خواهید، همه در <a href="https://github.com/nzbfast/nzbfast/releases">صفحهٔ انتشارهای GitHub</a> موجود است.</p>
     </div>
 
     <div class="callout" style="margin-top:26px"><b>تأیید دانلودها:</b> هر انتشار جمع‌های sha256 را کنار مصنوعات در صفحهٔ انتشارها عرضه می‌کند. زیپ‌های macOS بیت‌های اجرایی را حفظ می‌کنند؛ نسخه‌ها هنوز امضا نشده‌اند، بنابراین macOS پیش از اولین اجرا می‌پرسد: روی برنامه راست‌کلیک کنید و «باز کردن» را انتخاب کنید.</div>

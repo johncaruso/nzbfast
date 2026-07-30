@@ -56,7 +56,7 @@
         <p>La app NzbFast: arrástrala a Aplicaciones y listo. Universal (Apple Silicon e
         Intel), panel en su propia ventana, doble clic en .nzb, inicio al iniciar sesión.</p>
         <p class="meta">macOS 12+ · DMG de ~16 MB · app + motor</p>
-        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-macos.dmg">Descargar la app de Mac</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-macos-universal.zip">.zip portátil</a></p>
+        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-macos.dmg">Descargar la app de Mac</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-macos-universal.zip">.zip portátil</a></p>
       </div>
       <div class="card">
         <h3>🪟 Windows <span class="tag now">disponible</span></h3>
@@ -64,14 +64,14 @@
         arranque con Windows opcional y doble clic en .nzb. Totalmente estático, sin runtime
         que instalar; también puede adoptar tu configuración existente de SABnzbd.</p>
         <p class="meta">Windows 10/11 x64 · instalador de ~8 MB</p>
-        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-windows-x64-setup.exe">Descargar el instalador</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-windows-x64.zip">.zip portátil</a></p>
+        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-windows-x64-setup.exe">Descargar el instalador</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-windows-x64.zip">.zip portátil</a></p>
       </div>
       <div class="card">
         <h3>🐧 Linux <span class="tag now">disponible</span></h3>
         <p>Compilaciones estáticas con musl para x86_64 y arm64: seedboxes, VPS, cualquier NAS con SSH,
         Raspberry Pi 4/5. Sin ruleta de versiones de glibc.</p>
         <p class="meta">x86_64 · arm64 · unidad systemd incluida</p>
-        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-linux-arm64.tar.gz">arm64</a></p>
+        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-linux-arm64.tar.gz">arm64</a></p>
       </div>
       <div class="card">
         <h3>🐳 Docker <span class="tag now">disponible</span></h3>
@@ -83,13 +83,20 @@
       <div class="card">
         <h3>📦 Synology <span class="tag now">disponible</span></h3>
         <p>Funciona en DSM 7 mediante <b>Container Manager</b>: busca <code>nzbfast</code> en el Registro, descárgala, asigna tres carpetas y el puerto 6789. Sin archivo de configuración que editar: añade tu proveedor en el panel de bienvenida del panel de control.</p>
+        <p class="get"><a class="btn ghost" href="nzbfast-synology.yml" download="docker-compose.yml">Archivo compose, con autoactualización</a></p>
         <p class="meta">DSM 7 · modelos Intel + ARM · <a href="synology.html">guía paso a paso →</a></p>
       </div>
       <div class="card">
         <h3>🍺 Homebrew <span class="tag now">disponible</span></h3>
-        <p>Fórmula con un bloque de servicio (<code>brew services start nzbfast</code>).</p>
+        <p>Un solo comando en macOS y Linux, con un bloque de servicio para que arranque
+        al iniciar sesión (<code>brew services start nzbfast</code>). Para actualizar,
+        <code>brew upgrade nzbfast</code>, y tus ajustes y tu cola viven fuera de la
+        instalación, así que sobreviven a la actualización.</p>
+        <p class="meta">macOS (Apple Silicon + Intel) · Linux x86_64 + arm64</p>
         <pre class="cmd">brew install nzbfast/tap/nzbfast</pre>
       </div>
+    
+      <p class="note nzbfast-releases-fallback" style="text-align:center;margin-top:20px">Estos botones apuntan a la versión actual. Si algún enlace deja de funcionar, o quieres una versión anterior, las sumas de verificación o las notas de la versión, está todo en la <a href="https://github.com/nzbfast/nzbfast/releases">página de releases de GitHub</a>.</p>
     </div>
 
     <div class="callout" style="margin-top:26px"><b>Verificar las descargas:</b> cada versión incluye sumas sha256 junto a los artefactos en la página de versiones. Los zip de macOS conservan los bits de ejecución; las versiones aún no están firmadas, así que macOS pregunta antes del primer arranque: haz clic derecho en la app y elige Abrir.</div>

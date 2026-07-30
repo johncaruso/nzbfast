@@ -56,7 +56,7 @@
         <p>Aplicația NzbFast: trage în Applications și gata. Universală (Apple Silicon și
         Intel), panou în propria fereastră, dublu-clic pe .nzb, pornire la autentificare.</p>
         <p class="meta">macOS 12+ · DMG ~16 MB · aplicație + motor</p>
-        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-macos.dmg">Descarcă aplicația Mac</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-macos-universal.zip">.zip portabil</a></p>
+        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-macos.dmg">Descarcă aplicația Mac</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-macos-universal.zip">.zip portabil</a></p>
       </div>
       <div class="card">
         <h3>🪟 Windows <span class="tag now">disponibil</span></h3>
@@ -64,14 +64,14 @@
         pornire opțională odată cu Windows și dublu-clic pe .nzb. Complet static, fără runtime
         de instalat; poate adopta și configurația ta SABnzbd existentă.</p>
         <p class="meta">Windows 10/11 x64 · installer ~8 MB</p>
-        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-windows-x64-setup.exe">Descarcă installerul</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-windows-x64.zip">.zip portabil</a></p>
+        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-windows-x64-setup.exe">Descarcă installerul</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-windows-x64.zip">.zip portabil</a></p>
       </div>
       <div class="card">
         <h3>🐧 Linux <span class="tag now">disponibil</span></h3>
         <p>Build-uri musl statice pentru x86_64 și arm64: seedbox-uri, VPS-uri, orice NAS cu SSH,
         Raspberry Pi 4/5. Fără ruletă de versiuni glibc.</p>
         <p class="meta">x86_64 · arm64 · unitate systemd inclusă</p>
-        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-linux-arm64.tar.gz">arm64</a></p>
+        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-linux-arm64.tar.gz">arm64</a></p>
       </div>
       <div class="card">
         <h3>🐳 Docker <span class="tag now">disponibil</span></h3>
@@ -83,13 +83,20 @@
       <div class="card">
         <h3>📦 Synology <span class="tag now">disponibil</span></h3>
         <p>Rulează pe DSM 7 prin <b>Container Manager</b>: caută <code>nzbfast</code> în Registry, descarcă, mapează trei foldere și portul 6789. Niciun fișier de configurare de editat: adaugă furnizorul în panoul de bun venit al tabloului de bord.</p>
+        <p class="get"><a class="btn ghost" href="nzbfast-synology.yml" download="docker-compose.yml">Fișier compose, cu actualizare automată</a></p>
         <p class="meta">DSM 7 · modele Intel + ARM · <a href="synology.html">ghid pas cu pas →</a></p>
       </div>
       <div class="card">
         <h3>🍺 Homebrew <span class="tag now">disponibil</span></h3>
-        <p>Formulă cu un bloc de serviciu (<code>brew services start nzbfast</code>).</p>
+        <p>O singură comandă pe macOS și Linux, cu un bloc de serviciu ca să pornească
+        la autentificare (<code>brew services start nzbfast</code>). Upgrade-ul se face cu
+        <code>brew upgrade nzbfast</code>, iar setările și coada ta stau în afara
+        instalării, așa că îi supraviețuiesc.</p>
+        <p class="meta">macOS (Apple Silicon + Intel) · Linux x86_64 + arm64</p>
         <pre class="cmd">brew install nzbfast/tap/nzbfast</pre>
       </div>
+    
+      <p class="note nzbfast-releases-fallback" style="text-align:center;margin-top:20px">Aceste butoane trimit către versiunea curentă. Dacă un link nu mai funcționează sau doriți o versiune mai veche, sumele de control ori notele de lansare, toate se află pe <a href="https://github.com/nzbfast/nzbfast/releases">pagina de lansări GitHub</a>.</p>
     </div>
 
     <div class="callout" style="margin-top:26px"><b>Verificarea descărcărilor:</b> fiecare release vine cu sume sha256 lângă artefacte pe pagina de release-uri. Zip-urile macOS păstrează biții de execuție; build-urile nu sunt încă semnate, așa că macOS cere confirmare înainte de prima lansare: clic dreapta pe aplicație și alege Deschide.</div>

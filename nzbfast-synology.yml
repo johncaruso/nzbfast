@@ -1,13 +1,24 @@
 # nzbfast on a Synology NAS, as a Container Manager Project.
 #
-#   1. Put this file in a folder on your NAS, e.g. /docker/nzbfast.
-#   2. Edit PUID, PGID and TZ below. SSH in and run `id <your-dsm-user>`
-#      to get the two numbers (often uid 1026, gid 100).
+#   1. File Station: make a folder for nzbfast, e.g. /docker/nzbfast, and
+#      THREE folders inside it named exactly: config, downloads, watch.
+#   2. Put this file in /docker/nzbfast.
 #   3. Container Manager -> Project -> Create. Name it nzbfast, set the
 #      path to that folder, and choose the option that uses the
 #      docker-compose.yml already there.
 #   4. Open http://YOUR_NAS_IP:6789 and add your Usenet server in the
-#      Welcome panel. There is no config file to edit.
+#      Welcome panel.
+#
+# There is nothing in this file you need to edit, and you do not need SSH.
+#
+# Step 1 is what replaces the old PUID/PGID hunt. Folders you make in File
+# Station belong to you, and nzbfast adopts the owner AND group of the
+# folders it is given, so downloads come out owned by you and manageable in
+# File Station. Let Docker create those folders instead and they belong to
+# root, nzbfast has nothing to read an owner from, and it falls back to uid
+# 1000 - a user your NAS does not know, whose files you then cannot manage.
+# A container cannot see the folder ABOVE a mount, so it genuinely cannot
+# work this out for itself; making three folders up front is the whole fix.
 #
 # Full walkthrough: https://nzbfast.github.io/nzbfast/synology.html
 #
@@ -24,18 +35,24 @@ services:
     restart: unless-stopped
     ports:
       - "6789:6789"
-    environment:
-      - PUID=1026                # your uid  (id your_dsm_username)
-      - PGID=100                 # your gid
-      - TZ=Europe/London         # your timezone
-      # nzbfast generates an API key on first start and prints it in the
-      # container log, so the dashboard is not open to your whole
-      # network. To pick your own instead, uncomment this:
-      # - NZBFAST_APIKEY=change-me
     volumes:
       - ./config:/config            # settings + index database
       - ./downloads:/downloads      # finished files
       - ./watch:/watch              # drop an .nzb here to auto-download
+    # Nothing below is needed for a normal install.
+    #
+    # environment:
+    #   # Only if you did NOT make the folders yourself, or you want the
+    #   # files owned by somebody other than their owner. SSH in and run
+    #   # `id your_dsm_username` to get the two numbers.
+    #   - PUID=1026
+    #   - PGID=100
+    #   # Pick your own API key instead of the one nzbfast generates.
+    #   - NZBFAST_APIKEY=change-me
+    #
+    # TZ is deliberately absent here: nzbfast keeps times as UTC and the
+    # dashboard renders them in whatever timezone your BROWSER is in, so
+    # setting it on this container changes nothing you can see.
 
   # Keeps nzbfast up to date. It checks nightly at 04:00 for a newer
   # nzbfast image and recreates the container when one ships. Your
@@ -56,7 +73,9 @@ services:
     container_name: nzbfast-watchtower
     restart: unless-stopped
     environment:
-      - TZ=Europe/London   # same timezone, so the schedule below is your 04:00
+      # This one DOES matter: it is what makes the schedule below 04:00
+      # your time rather than 04:00 UTC. Change it to your timezone.
+      - TZ=Etc/UTC
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     command: --cleanup --schedule "0 0 4 * * *" nzbfast

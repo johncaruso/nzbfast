@@ -56,7 +56,7 @@
         <p>The NzbFast app: drag to Applications and go. Universal (Apple Silicon and
         Intel), dashboard in its own window, .nzb double-click, Start at Login.</p>
         <p class="meta">macOS 12+ · ~16 MB DMG · app + engine</p>
-        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-macos.dmg">Download the Mac app</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-macos-universal.zip">portable .zip</a></p>
+        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-macos.dmg">Download the Mac app</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-macos-universal.zip">portable .zip</a></p>
       </div>
       <div class="card">
         <h3>🪟 Windows <span class="tag now">available</span></h3>
@@ -64,14 +64,14 @@
         optional start-with-Windows and .nzb double-click. Fully static, no runtime
         to install; it can also adopt your existing SABnzbd config.</p>
         <p class="meta">Windows 10/11 x64 · ~8 MB installer</p>
-        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-windows-x64-setup.exe">Download the installer</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-windows-x64.zip">portable .zip</a></p>
+        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-windows-x64-setup.exe">Download the installer</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-windows-x64.zip">portable .zip</a></p>
       </div>
       <div class="card">
         <h3>🐧 Linux <span class="tag now">available</span></h3>
         <p>Static musl builds for x86_64 and arm64: seedboxes, VPSes, any NAS with SSH,
         Raspberry Pi 4/5. No glibc-version roulette.</p>
         <p class="meta">x86_64 · arm64 · systemd unit included</p>
-        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-linux-arm64.tar.gz">arm64</a></p>
+        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-linux-arm64.tar.gz">arm64</a></p>
       </div>
       <div class="card">
         <h3>🐳 Docker <span class="tag now">available</span></h3>
@@ -87,6 +87,7 @@
         <p>Runs on DSM 7 through <b>Container Manager</b>: search <code>nzbfast</code> in
         the Registry, download, map three folders and port 6789. No config file to edit:
         add your provider in the dashboard's Welcome panel.</p>
+        <p class="get"><a class="btn ghost" href="nzbfast-synology.yml" download="docker-compose.yml">Compose file, with auto-update</a></p>
         <p class="meta">DSM 7 · Intel + ARM models · <a href="synology.html">step-by-step guide →</a></p>
       </div>
       <div class="card">
@@ -98,6 +99,8 @@
         <p class="meta">macOS (Apple Silicon + Intel) · Linux x86_64 + arm64</p>
         <pre class="cmd">brew install nzbfast/tap/nzbfast</pre>
       </div>
+    
+      <p class="note nzbfast-releases-fallback" style="text-align:center;margin-top:20px">Those buttons point at the current release. If a link ever fails, or you want an older build, the checksums or the release notes, they are all on the <a href="https://github.com/nzbfast/nzbfast/releases">GitHub releases page</a>.</p>
     </div>
 
     <div class="callout" style="margin-top:26px"><b>Verifying downloads:</b> every release ships

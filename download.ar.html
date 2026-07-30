@@ -56,7 +56,7 @@
         <p>تطبيق NzbFast: اسحبه إلى Applications وانطلق. عالمي (Apple Silicon
         وIntel)، لوحة التحكم في نافذتها الخاصة، نقرة مزدوجة على ملف .nzb، والتشغيل عند تسجيل الدخول.</p>
         <p class="meta">macOS 12+ · ‏DMG بحجم ~16 MB · التطبيق + المحرّك</p>
-        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-macos.dmg">نزّل تطبيق Mac</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-macos-universal.zip">‏.zip محمول</a></p>
+        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-macos.dmg">نزّل تطبيق Mac</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-macos-universal.zip">‏.zip محمول</a></p>
       </div>
       <div class="card">
         <h3>🪟 Windows <span class="tag now">متاح</span></h3>
@@ -64,14 +64,14 @@
         وخيارًا للتشغيل مع Windows ونقرة مزدوجة على ملف .nzb. ثابت بالكامل، لا زمن تشغيل
         لتثبيته؛ ويمكنه أيضًا تبنّي إعدادات SABnzbd الحالية لديك.</p>
         <p class="meta">Windows 10/11 x64 · مُثبِّت بحجم ~8 MB</p>
-        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-windows-x64-setup.exe">نزّل المُثبِّت</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-windows-x64.zip">‏.zip محمول</a></p>
+        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-windows-x64-setup.exe">نزّل المُثبِّت</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-windows-x64.zip">‏.zip محمول</a></p>
       </div>
       <div class="card">
         <h3>🐧 Linux <span class="tag now">متاح</span></h3>
         <p>نسخ musl الثابتة لـ x86_64 وarm64: خوادم البذر، وخوادم VPS، وأي NAS مزوّد بـ SSH،
         وRaspberry Pi 4/5. بلا معاناة إصدارات glibc.</p>
         <p class="meta">x86_64 · arm64 · وحدة systemd مضمّنة</p>
-        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-linux-arm64.tar.gz">arm64</a></p>
+        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-linux-arm64.tar.gz">arm64</a></p>
       </div>
       <div class="card">
         <h3>🐳 Docker <span class="tag now">متاح</span></h3>
@@ -83,13 +83,20 @@
       <div class="card">
         <h3>📦 Synology <span class="tag now">متاح</span></h3>
         <p>يعمل على DSM 7 عبر <b>Container Manager</b>: ابحث عن <code>nzbfast</code> في Registry، ونزّله، واربط ثلاثة مجلدات والمنفذ 6789. لا يوجد ملف إعداد لتحريره. أضِف مزوّدك من لوحة الترحيب في لوحة التحكم.</p>
+        <p class="get"><a class="btn ghost" href="nzbfast-synology.yml" download="docker-compose.yml">ملف compose، مع تحديث تلقائي</a></p>
         <p class="meta">DSM 7 · طُرز Intel + ARM · <a href="synology.html">دليل خطوة بخطوة →</a></p>
       </div>
       <div class="card">
         <h3>🍺 Homebrew <span class="tag now">متاح</span></h3>
-        <p>صيغة مع كتلة خدمة (<code>brew services start nzbfast</code>).</p>
+        <p>أمر واحد على macOS وLinux، مع كتلة خدمة لبدء التشغيل عند تسجيل الدخول
+        (<code>brew services start nzbfast</code>). الترقية هي
+        <code>brew upgrade nzbfast</code>، وتعيش إعداداتك وقائمة الانتظار خارج
+        التثبيت، فتبقى بعدها.</p>
+        <p class="meta">macOS (Apple Silicon + Intel) · Linux x86_64 + arm64</p>
         <pre class="cmd">brew install nzbfast/tap/nzbfast</pre>
       </div>
+    
+      <p class="note nzbfast-releases-fallback" style="text-align:center;margin-top:20px">تشير هذه الأزرار إلى الإصدار الحالي. إذا توقف أحد الروابط عن العمل، أو أردت إصدارًا أقدم أو المجاميع الاختبارية أو ملاحظات الإصدار، فكل ذلك متاح في <a href="https://github.com/nzbfast/nzbfast/releases">صفحة إصدارات GitHub</a>.</p>
     </div>
 
     <div class="callout" style="margin-top:26px"><b>التحقق من التنزيلات:</b> يُرفق كل إصدار مجاميع sha256 بجوار الملفات في صفحة الإصدارات. تحافظ ملفات zip الخاصة بـ macOS على بتات التنفيذ؛ الإصدارات غير موقّعة بعد، لذا يسأل macOS قبل التشغيل الأول: انقر بزر الفأرة الأيمن على التطبيق واختر «فتح».</div>

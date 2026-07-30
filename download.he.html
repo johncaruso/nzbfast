@@ -56,7 +56,7 @@
         <p>אפליקציית NzbFast: גרור ל-Applications וקדימה. אוניברסלי (Apple Silicon ו-
         Intel), לוח מחוונים בחלון משלו, לחיצה כפולה על ‎.nzb, הפעלה בכניסה.</p>
         <p class="meta">macOS 12+ · ~16 MB DMG · אפליקציה + מנוע</p>
-        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-macos.dmg">הורד את אפליקציית ה-Mac</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-macos-universal.zip">‎.zip נייד</a></p>
+        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-macos.dmg">הורד את אפליקציית ה-Mac</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-macos-universal.zip">‎.zip נייד</a></p>
       </div>
       <div class="card">
         <h3>🪟 Windows <span class="tag now">זמין</span></h3>
@@ -64,14 +64,14 @@
         הפעלה-עם-Windows אופציונלית ולחיצה כפולה על ‎.nzb. סטטי מלא, בלי סביבת ריצה
         להתקין; הוא גם יכול לאמץ את תצורת ה-SABnzbd הקיימת שלך.</p>
         <p class="meta">Windows 10/11 x64 · מתקין ~8 MB</p>
-        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-windows-x64-setup.exe">הורד את המתקין</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-windows-x64.zip">‎.zip נייד</a></p>
+        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-windows-x64-setup.exe">הורד את המתקין</a> <a class="btn ghost" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-windows-x64.zip">‎.zip נייד</a></p>
       </div>
       <div class="card">
         <h3>🐧 Linux <span class="tag now">זמין</span></h3>
         <p>בניות musl סטטיות ל-x86_64 ו-arm64: seedboxes, שרתי VPS, כל NAS עם SSH,
         Raspberry Pi 4/5. בלי רולטת גרסאות glibc.</p>
         <p class="meta">x86_64 · arm64 · יחידת systemd כלולה</p>
-        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.10-linux-arm64.tar.gz">arm64</a></p>
+        <p class="get"><a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-linux-x64.tar.gz">x86_64</a> <a class="btn" href="https://github.com/nzbfast/nzbfast/releases/latest/download/nzbfast-1.0.12-linux-arm64.tar.gz">arm64</a></p>
       </div>
       <div class="card">
         <h3>🐳 Docker <span class="tag now">זמין</span></h3>
@@ -83,13 +83,20 @@
       <div class="card">
         <h3>📦 Synology <span class="tag now">זמין</span></h3>
         <p>רץ על DSM 7 דרך <b>Container Manager</b>: חפשו <code>nzbfast</code> ב-Registry, הורידו, מפו שלוש תיקיות ואת פורט 6789. אין קובץ הגדרות לערוך: הוסיפו את הספק שלכם בלוח קבלת הפנים של לוח הבקרה.</p>
+        <p class="get"><a class="btn ghost" href="nzbfast-synology.yml" download="docker-compose.yml">קובץ compose, עם עדכון אוטומטי</a></p>
         <p class="meta">DSM 7 · דגמי Intel + ARM · <a href="synology.html">מדריך שלב אחר שלב →</a></p>
       </div>
       <div class="card">
         <h3>🍺 Homebrew <span class="tag now">זמין</span></h3>
-        <p>נוסחה עם בלוק שירות (<code>brew services start nzbfast</code>).</p>
+        <p>פקודה אחת ב-macOS וב-Linux, עם בלוק שירות כדי שיופעל בכניסה
+        (<code>brew services start nzbfast</code>). שדרוג הוא
+        <code>brew upgrade nzbfast</code>, וההגדרות והתור שלך נמצאים מחוץ
+        להתקנה, ולכן הם שורדים אותו.</p>
+        <p class="meta">macOS (Apple Silicon + Intel) · Linux x86_64 + arm64</p>
         <pre class="cmd">brew install nzbfast/tap/nzbfast</pre>
       </div>
+    
+      <p class="note nzbfast-releases-fallback" style="text-align:center;margin-top:20px">הכפתורים מפנים לגרסה הנוכחית. אם קישור מפסיק לעבוד, או שדרושה לכם גרסה ישנה יותר, סכומי הביקורת או הערות הגרסה, הכול נמצא ב<a href="https://github.com/nzbfast/nzbfast/releases">עמוד השחרורים ב-GitHub</a>.</p>
     </div>
 
     <div class="callout" style="margin-top:26px"><b>אימות הורדות:</b> כל מהדורה נשלחת עם סכומי sha256 ליד הפריטים בעמוד המהדורות. קובצי zip של macOS משמרים ביטי הפעלה; הגרסאות עדיין אינן חתומות, ולכן macOS שואל לפני ההפעלה הראשונה: לחצו לחיצה ימנית על האפליקציה ובחרו ״פתח״.</div>
