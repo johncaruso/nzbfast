@@ -389,6 +389,14 @@
       <li><b>Gegendruck-Beweis</b>: deckle die Schreibstufe 4× unter das Netzwerk, und der Input rastet innerhalb von 2 s auf ±1% genau auf dem Deckel ein, der RAM <i>sinkt</i>, null Swaps. Eine langsame Platte kann den Speicher nie aufblähen.</li>
       <li><b>Rechen-Reserve</b>: gemessene Decode-+-Prüf-Obergrenzen von 86–165 Gbps auf Apple Silicon. Das Netzwerk ist auf jeder getesteten Maschine um 4–50× der Flaschenhals.</li>
     </ul>
+    <p class="note" style="text-align:start"><b>Neu gemessen am 31. Juli 2026 auf dem aktuellen Build</b>,
+    auf einem lokalen Rig, das Artikel aus dem RAM ausliefert, sodass nur der Client gemessen wird:
+    Herunterladen kostet <b>0.64 CPU-Sekunden pro GB</b> auf dem M3 Ultra („US-Ostküste“) und 0.74 auf
+    dem M1 Ultra („Europa“), mit TLS steigen die Werte auf 0.83 und 1.06 - und die Pipeline läuft
+    weiterhin am eigenen ~32 Gbps-Limit des Betriebssystems für lokale Sockets, TLS inklusive. Auf
+    einem Intel-Laptop von 2022 (i7-1280P, Windows 11) liegt die eigene Arbeit des Clients bei etwa
+    denselben 0.7 CPU-Sekunden pro GB; der Windows-Kernel und das Antivirus legen grob 1.6 obendrauf,
+    und der lokale Socket-Pfad dieser Plattform endet bei knapp 8 Gbps.</p>
     <div class="callout"><b>Stehende Regel: jede Leistungsbehauptung nennt die Bedingungen, unter denen sie lief</b>, negative Ergebnisse und Irrwege inklusive.</div>
   </div>
 </section>

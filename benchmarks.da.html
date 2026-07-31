@@ -383,6 +383,14 @@
       <li><b>Modtryks-bevis</b>: begræns skrivefasen 4× under netværket, og input låser til loftet ±1% inden for 2 s, RAM <i>falder</i>, nul swaps. En langsom disk kan aldrig få hukommelsen til at eksplodere.</li>
       <li><b>CPU-reserve</b>: målte afkodnings+verificerings-lofter på 86–165 Gbps på Apple silicon. Netværket er flaskehalsen med 4–50× på hver testet maskine.</li>
     </ul>
+    <p class="note" style="text-align:start"><b>Målt igen 31. juli 2026 på den nuværende build</b>,
+    på et lokalt rig, der serverer artikler fra RAM, så det kun er klienten, der bliver målt:
+    download koster <b>0.64 CPU-sekunder pr. GB</b> på M3 Ultra på østkysten og 0.74 på M1 Ultra i
+    Europa, stigende til 0.83 og 1.06 med TLS slået til - og pipelinen kører stadig ved
+    operativsystemets eget ~32 Gbps-loft for lokale sockets, TLS inklusive. På en Intel-bærbar fra
+    2022 (i7-1280P, Windows 11) er klientens eget arbejde omtrent de samme 0.7 CPU-sekunder pr. GB;
+    Windows-kernen og antivirus lægger groft regnet 1.6 oveni, og den platforms lokale socket-vej
+    topper nær 8 Gbps.</p>
     <div class="callout"><b>Stående regel: hver ydelsespåstand angiver de betingelser, den kørte under</b>, inklusive negative resultater og forkerte drejninger.</div>
   </div>
 </section>

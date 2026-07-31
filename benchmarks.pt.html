@@ -388,6 +388,14 @@
       <li><b>Prova de contrapressão</b>: limite a etapa de escrita 4× abaixo da rede e a entrada trava no teto ±1% em 2 s, a RAM <i>cai</i>, zero swaps. Um disco lento nunca pode inflar a memória.</li>
       <li><b>Folga de cálculo</b>: tetos medidos de decodificação+verificação de 86–165 Gbps em Apple silicon. A rede é o gargalo por 4–50× em cada máquina testada.</li>
     </ul>
+    <p class="note" style="text-align:start"><b>Medido novamente em 31 de julho de 2026 na versão atual</b>,
+    em uma bancada local que serve os artigos da RAM, de modo que só o cliente é cronometrado:
+    baixar custa <b>0,64 CPU-segundos por GB</b> no M3 Ultra da costa leste e 0,74 no M1 Ultra
+    da Europa, subindo para 0,83 e 1,06 com TLS ligado - e o pipeline continua rodando no limite
+    de socket local do próprio sistema operacional, ~32 Gbps, TLS incluído. Em um laptop Intel
+    de 2022 (i7-1280P, Windows 11), o trabalho próprio do cliente fica nos mesmos 0,7 CPU-segundos
+    por GB; o kernel do Windows e o antivírus somam cerca de 1,6 por cima, e o caminho de socket
+    local dessa plataforma chega no máximo perto de 8 Gbps.</p>
     <div class="callout"><b>Regra permanente: cada afirmação de desempenho cita as condições em que rodou</b>, resultados negativos e caminhos errados incluídos.</div>
   </div>
 </section>

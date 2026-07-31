@@ -390,6 +390,14 @@
       <li><b>Dovadă de contrapresiune</b>: limitează etapa de scriere de 4× sub rețea și intrarea se blochează la plafon ±1% în 2 s, RAM-ul <i>scade</i>, zero swap-uri. Un disc lent nu poate umfla niciodată memoria.</li>
       <li><b>Marjă de calcul</b>: plafoane măsurate de decodare+verificare de 86–165 Gbps pe Apple silicon. Rețeaua este strangularea cu 4–50× pe fiecare mașină testată.</li>
     </ul>
+    <p class="note" style="text-align:start"><b>Re-măsurat pe 31 iulie 2026 pe versiunea curentă</b>,
+    pe un banc local care servește articolele din RAM, astfel încât doar clientul este cronometrat:
+    descărcarea costă <b>0.64 CPU-secunde per GB</b> pe M3 Ultra de pe Coasta de Est și 0.74 pe
+    M1 Ultra din Europa, urcând la 0.83 și 1.06 cu TLS activat - iar pipeline-ul rulează în
+    continuare la limita proprie de ~32 Gbps a socket-urilor locale a sistemului de operare,
+    inclusiv cu TLS. Pe un laptop Intel din 2022 (i7-1280P, Windows 11) munca proprie a clientului
+    este cam aceeași, 0.7 CPU-secunde per GB; kernelul Windows și antivirusul adaugă aproximativ
+    1.6 în plus, iar calea de socket-uri locale a acelei platforme se oprește pe la 8 Gbps.</p>
     <div class="callout"><b>Regulă permanentă: fiecare afirmație de performanță citează condițiile în care a rulat</b>, inclusiv rezultatele negative și pașii greșiți.</div>
   </div>
 </section>

@@ -385,6 +385,14 @@
       <li><b>Mottrykksbevis</b>: sett et tak på skrivestadiet 4× under nettverket, og inndata låses til taket ±1 % innen 2 s, RAM <i>faller</i>, null swaps. En treg disk kan aldri blåse opp minnet.</li>
       <li><b>CPU-margin</b>: målte dekode+verifiser-tak på 86–165 Gbps på Apple-silisium. Nettverket er flaskehalsen med 4–50× på hver maskin som er testet.</li>
     </ul>
+    <p class="note" style="text-align:start"><b>Målt på nytt 31. juli 2026 på gjeldende build</b>,
+    på en lokal rigg som serverer artikler fra RAM, slik at bare klienten blir målt: nedlasting
+    koster <b>0.64 CPU-sekunder per GB</b> på østkysten-M3 Ultra og 0.74 på Europa-M1 Ultra,
+    stigende til 0.83 og 1.06 med TLS på - og pipelinen kjører fortsatt på operativsystemets
+    egen grense for lokale sockets på ~32 Gbps, TLS inkludert. På en Intel-laptop fra 2022 (i7-1280P,
+    Windows 11) er klientens eget arbeid omtrent de samme 0.7 CPU-sekundene per GB; Windows-kjernen
+    og antivirusprogrammet legger på rundt 1.6 til, og den plattformens lokale socket-bane topper
+    ut nær 8 Gbps.</p>
     <div class="callout"><b>Stående regel: hvert ytelsesutsagn oppgir betingelsene det kjørte under</b>, negative resultater og feilspor inkludert.</div>
   </div>
 </section>

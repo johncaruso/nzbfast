@@ -390,6 +390,14 @@
       <li><b>Preuve de contre-pression</b> : plafonnez l’étape d’écriture 4× sous le réseau et l’entrée se verrouille sur le plafond à ±1% en 2 s, la RAM <i>baisse</i>, zéro swap. Un disque lent ne peut jamais faire exploser la mémoire.</li>
       <li><b>Marge de calcul</b> : plafonds décodage+vérification mesurés à 86–165 Gbps sur Apple silicon. Le réseau est le goulet d’étranglement par 4–50× sur chaque machine testée.</li>
     </ul>
+    <p class="note" style="text-align:start"><b>Remesuré le 31 juillet 2026 sur la version actuelle</b>,
+    sur un banc local qui sert les articles depuis la RAM afin de ne chronométrer que le client :
+    le téléchargement coûte <b>0.64 seconde de temps processeur par GB</b> sur le M3 Ultra côte Est
+    et 0.74 sur le M1 Ultra Europe, et monte à 0.83 et 1.06 avec TLS activé - et le pipeline tourne
+    toujours à la limite de ~32 Gbps des sockets locaux du système d’exploitation, TLS compris.
+    Sur un portable Intel de 2022 (i7-1280P, Windows 11), le travail propre du client reste
+    d’environ 0.7 seconde de temps processeur par GB ; le noyau Windows et l’antivirus ajoutent
+    environ 1.6 de plus, et le chemin socket local de cette plateforme plafonne près de 8 Gbps.</p>
     <div class="callout"><b>Règle permanente : chaque affirmation de performance cite les conditions dans lesquelles elle a tourné</b>, résultats négatifs et fausses pistes compris.</div>
   </div>
 </section>

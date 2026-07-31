@@ -387,6 +387,14 @@
       <li><b>Prova di backpressure</b>: limita la fase di scrittura a 4× sotto la rete e l'input si aggancia al limite entro ±1% in 2 s, la RAM <i>scende</i>, zero swap. Un disco lento non può mai gonfiare la memoria.</li>
       <li><b>Margine di calcolo</b>: tetti di decodifica+verifica misurati tra 86–165 Gbps su Apple silicon. La rete è il collo di bottiglia di 4–50× su ogni macchina testata.</li>
     </ul>
+    <p class="note" style="text-align:start"><b>Rimisurato il 31 luglio 2026 sulla build attuale</b>,
+    su un banco locale che serve gli articoli dalla RAM, così da cronometrare solo il client:
+    scaricare costa <b>0.64 secondi di CPU per GB</b> sull'M3 Ultra costa est e 0.74 sull'M1 Ultra
+    Europa, che salgono a 0.83 e 1.06 con TLS attivo - e la pipeline gira comunque al limite di
+    ~32 Gbps dei socket locali del sistema operativo, TLS incluso. Su un portatile Intel del 2022
+    (i7-1280P, Windows 11) il lavoro proprio del client è più o meno lo stesso, 0.7 secondi di CPU
+    per GB; il kernel di Windows e l'antivirus ne aggiungono circa altri 1.6, e il percorso dei
+    socket locali di quella piattaforma si ferma vicino a 8 Gbps.</p>
     <div class="callout"><b>Regola fissa: ogni affermazione sulle prestazioni cita le condizioni in cui è stata eseguita</b>, risultati negativi e strade sbagliate compresi.</div>
   </div>
 </section>

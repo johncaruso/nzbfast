@@ -666,6 +666,14 @@
       <li><b>Backpressure proof</b>: cap the write stage 4× below the network and input locks to the cap ±1% within 2 s, RAM <i>falls</i>, zero swaps. A slow disk can never balloon memory.</li>
       <li><b>Compute headroom</b>: measured decode+verify ceilings of 86–165 Gbps on Apple silicon. The network is the bottleneck by 4–50× on every machine tested.</li>
     </ul>
+    <p class="note" style="text-align:start"><b>Re-measured 31 July 2026 on the current build</b>,
+    on a local rig that serves articles from RAM so only the client is being timed: downloading
+    costs <b>0.64 CPU-seconds per GB</b> on the East Coast M3 Ultra and 0.74 on the Europe
+    M1 Ultra, rising to 0.83 and 1.06 with TLS on - and the pipeline still runs at the operating
+    system's own ~32 Gbps local-socket limit, TLS included. On a 2022 Intel laptop (i7-1280P,
+    Windows 11) the client's own work is about the same 0.7 CPU-seconds per GB; the Windows
+    kernel and antivirus add roughly 1.6 more on top, and that platform's local-socket path tops
+    out near 8 Gbps.</p>
     <div class="callout">Standing rule: <b>every performance claim cites the conditions it ran
     under</b>, negative results and wrong turns included.</div>
   </div>
