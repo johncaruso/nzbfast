@@ -385,14 +385,28 @@
       <li><b>Mottrykksbevis</b>: sett et tak på skrivestadiet 4× under nettverket, og inndata låses til taket ±1 % innen 2 s, RAM <i>faller</i>, null swaps. En treg disk kan aldri blåse opp minnet.</li>
       <li><b>CPU-margin</b>: målte dekode+verifiser-tak på 86–165 Gbps på Apple-silisium. Nettverket er flaskehalsen med 4–50× på hver maskin som er testet.</li>
     </ul>
-    <p class="note" style="text-align:start"><b>Målt på nytt 31. juli 2026 på gjeldende build</b>,
-    på en lokal rigg som serverer artikler fra RAM, slik at bare klienten blir målt: nedlasting
-    koster <b>0.64 CPU-sekunder per GB</b> på østkysten-M3 Ultra og 0.74 på Europa-M1 Ultra,
-    stigende til 0.83 og 1.06 med TLS på - og pipelinen kjører fortsatt på operativsystemets
-    egen grense for lokale sockets på ~32 Gbps, TLS inkludert. På en Intel-laptop fra 2022 (i7-1280P,
-    Windows 11) er klientens eget arbeid omtrent de samme 0.7 CPU-sekundene per GB; Windows-kjernen
-    og antivirusprogrammet legger på rundt 1.6 til, og den plattformens lokale socket-bane topper
-    ut nær 8 Gbps.</p>
+    <p class="note" style="text-align:start"><b>Hva nedlasting koster i CPU.</b> Én lokal rigg
+    serverer artikler fra RAM slik at bare klienten blir målt, og hver rad oppgir sin kjøring.
+    Konkurrentradene er uendret fra runden 22. juli - samme versjoner på samme maskin, målt med
+    Linux-cgroup på én CPU-kjerne - og blir stående til en ny utgivelse endrer en av dem.
+    nzbfast-radene ble målt på nytt 31. juli 2026 på gjeldende build.</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>klient</th><th>CPU-sekunder per GB</th><th>med TLS</th><th>kjøring</th></tr></thead>
+      <tbody>
+        <tr><td><b>nzbfast</b></td><td class="win num">0.64</td><td class="num">0.83</td><td>østkysten-M3 Ultra, 31. juli, gjeldende build</td></tr>
+        <tr><td><b>nzbfast</b></td><td class="num">0.74</td><td class="num">1.06</td><td>Europa-M1 Ultra, 31. juli, gjeldende build</td></tr>
+        <tr><td><b>nzbfast</b></td><td class="num">0.72</td><td class="num">&ndash;</td><td>Linux-container med én kjerne, 22. juli</td></tr>
+        <tr><td>SABnzbd 5.0.4</td><td class="num">1.5</td><td class="num">&ndash;</td><td>Linux-container med én kjerne, 22. juli</td></tr>
+        <tr><td>NZBGet 26.2</td><td class="num">3.0</td><td class="num">&ndash;</td><td>Linux-container med én kjerne, 22. juli</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">TLS koster hver klient CPU; vår er målt til +30%
+    per GB på M3 Ultra og +44% på M1 Ultra, og pipelinen kjører fortsatt på operativsystemets
+    egen grense for lokale sockets på ~32 Gbps med TLS på. Ingen konkurrent er kjørt på
+    TLS-etappen ennå, så de cellene står tomme i stedet for å bli estimert. På en Intel-laptop
+    fra 2022 (i7-1280P, Windows 11) er nzbfasts eget arbeid de samme ~0.7 CPU-sekundene per GB;
+    Windows-kjernen og antivirusprogrammet omtrent tredobler totalen, og den plattformens lokale
+    socket-bane topper ut nær 8 Gbps.</p>
     <div class="callout"><b>Stående regel: hvert ytelsesutsagn oppgir betingelsene det kjørte under</b>, negative resultater og feilspor inkludert.</div>
   </div>
 </section>

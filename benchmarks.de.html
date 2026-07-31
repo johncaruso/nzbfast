@@ -389,14 +389,30 @@
       <li><b>Gegendruck-Beweis</b>: deckle die Schreibstufe 4× unter das Netzwerk, und der Input rastet innerhalb von 2 s auf ±1% genau auf dem Deckel ein, der RAM <i>sinkt</i>, null Swaps. Eine langsame Platte kann den Speicher nie aufblähen.</li>
       <li><b>Rechen-Reserve</b>: gemessene Decode-+-Prüf-Obergrenzen von 86–165 Gbps auf Apple Silicon. Das Netzwerk ist auf jeder getesteten Maschine um 4–50× der Flaschenhals.</li>
     </ul>
-    <p class="note" style="text-align:start"><b>Neu gemessen am 31. Juli 2026 auf dem aktuellen Build</b>,
-    auf einem lokalen Rig, das Artikel aus dem RAM ausliefert, sodass nur der Client gemessen wird:
-    Herunterladen kostet <b>0.64 CPU-Sekunden pro GB</b> auf dem M3 Ultra („US-Ostküste“) und 0.74 auf
-    dem M1 Ultra („Europa“), mit TLS steigen die Werte auf 0.83 und 1.06 - und die Pipeline läuft
-    weiterhin am eigenen ~32 Gbps-Limit des Betriebssystems für lokale Sockets, TLS inklusive. Auf
-    einem Intel-Laptop von 2022 (i7-1280P, Windows 11) liegt die eigene Arbeit des Clients bei etwa
-    denselben 0.7 CPU-Sekunden pro GB; der Windows-Kernel und das Antivirus legen grob 1.6 obendrauf,
-    und der lokale Socket-Pfad dieser Plattform endet bei knapp 8 Gbps.</p>
+    <p class="note" style="text-align:start"><b>Was Herunterladen an CPU kostet.</b> Ein lokales
+    Rig liefert Artikel aus dem RAM aus, sodass nur der Client gemessen wird, und jede Zeile nennt
+    ihren Lauf. Die Konkurrenz-Zeilen sind unverändert aus der Runde vom 22. Juli - gleiche
+    Versionen auf derselben Maschine, gemessen per Linux-cgroup auf einem CPU-Kern - und gelten,
+    bis ein neues Release eine davon ändert. Die nzbfast-Zeilen wurden am 31. Juli 2026 auf dem
+    aktuellen Build neu gemessen.</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>Client</th><th>CPU-Sekunden pro GB</th><th>mit TLS</th><th>Lauf</th></tr></thead>
+      <tbody>
+        <tr><td><b>nzbfast</b></td><td class="win num">0.64</td><td class="num">0.83</td><td>M3 Ultra („US-Ostküste“), 31. Juli, aktueller Build</td></tr>
+        <tr><td><b>nzbfast</b></td><td class="num">0.74</td><td class="num">1.06</td><td>M1 Ultra („Europa“), 31. Juli, aktueller Build</td></tr>
+        <tr><td><b>nzbfast</b></td><td class="num">0.72</td><td class="num">&ndash;</td><td>Ein-Kern-Linux-Container, 22. Juli</td></tr>
+        <tr><td>SABnzbd 5.0.4</td><td class="num">1.5</td><td class="num">&ndash;</td><td>Ein-Kern-Linux-Container, 22. Juli</td></tr>
+        <tr><td>NZBGet 26.2</td><td class="num">3.0</td><td class="num">&ndash;</td><td>Ein-Kern-Linux-Container, 22. Juli</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">TLS kostet jeden Client CPU; bei uns gemessen mit
+    +30% pro GB auf dem M3 Ultra und +44% auf dem M1 Ultra, und die Pipeline läuft mit TLS
+    weiterhin am eigenen ~32 Gbps-Limit des Betriebssystems für lokale Sockets. Kein Konkurrent
+    wurde bisher auf der TLS-Etappe gemessen, deshalb bleiben diese Zellen leer, statt geschätzt
+    zu werden. Auf einem Intel-Laptop von 2022 (i7-1280P, Windows 11) bleibt die eigene Arbeit
+    von nzbfast bei denselben ~0.7 CPU-Sekunden pro GB; der Windows-Kernel und das Antivirus
+    verdreifachen die Summe ungefähr, und der lokale Socket-Pfad dieser Plattform endet bei
+    knapp 8 Gbps.</p>
     <div class="callout"><b>Stehende Regel: jede Leistungsbehauptung nennt die Bedingungen, unter denen sie lief</b>, negative Ergebnisse und Irrwege inklusive.</div>
   </div>
 </section>

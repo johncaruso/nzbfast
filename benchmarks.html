@@ -666,14 +666,28 @@
       <li><b>Backpressure proof</b>: cap the write stage 4× below the network and input locks to the cap ±1% within 2 s, RAM <i>falls</i>, zero swaps. A slow disk can never balloon memory.</li>
       <li><b>Compute headroom</b>: measured decode+verify ceilings of 86–165 Gbps on Apple silicon. The network is the bottleneck by 4–50× on every machine tested.</li>
     </ul>
-    <p class="note" style="text-align:start"><b>Re-measured 31 July 2026 on the current build</b>,
-    on a local rig that serves articles from RAM so only the client is being timed: downloading
-    costs <b>0.64 CPU-seconds per GB</b> on the East Coast M3 Ultra and 0.74 on the Europe
-    M1 Ultra, rising to 0.83 and 1.06 with TLS on - and the pipeline still runs at the operating
-    system's own ~32 Gbps local-socket limit, TLS included. On a 2022 Intel laptop (i7-1280P,
-    Windows 11) the client's own work is about the same 0.7 CPU-seconds per GB; the Windows
-    kernel and antivirus add roughly 1.6 more on top, and that platform's local-socket path tops
-    out near 8 Gbps.</p>
+    <p class="note" style="text-align:start"><b>What downloading costs in CPU.</b> One local rig
+    serves articles from RAM so only the client is being timed, and every row cites its run. The
+    competitor rows are unchanged from the 22 July round - same versions on the same machine,
+    metered by Linux cgroup on one CPU core - and stand until a new release changes one of them.
+    The nzbfast rows were re-measured 31 July 2026 on the current build.</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>client</th><th>CPU-seconds per GB</th><th>with TLS</th><th>run</th></tr></thead>
+      <tbody>
+        <tr><td><b>nzbfast</b></td><td class="win num">0.64</td><td class="num">0.83</td><td>East Coast M3 Ultra, 31 July, current build</td></tr>
+        <tr><td><b>nzbfast</b></td><td class="num">0.74</td><td class="num">1.06</td><td>Europe M1 Ultra, 31 July, current build</td></tr>
+        <tr><td><b>nzbfast</b></td><td class="num">0.72</td><td class="num">&ndash;</td><td>one-core Linux container, 22 July</td></tr>
+        <tr><td>SABnzbd 5.0.4</td><td class="num">1.5</td><td class="num">&ndash;</td><td>one-core Linux container, 22 July</td></tr>
+        <tr><td>NZBGet 26.2</td><td class="num">3.0</td><td class="num">&ndash;</td><td>one-core Linux container, 22 July</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">TLS costs every client CPU; ours is measured at +30%
+    per GB on the M3 Ultra and +44% on the M1 Ultra, and the pipeline still runs at the operating
+    system's own ~32 Gbps local-socket limit with TLS on. No competitor has been run on the TLS
+    leg yet, so those cells stay empty rather than estimated. On a 2022 Intel laptop (i7-1280P,
+    Windows 11) nzbfast's own work is the same ~0.7 CPU-seconds per GB; the Windows kernel and
+    antivirus roughly triple the total, and that platform's local-socket path tops out near
+    8 Gbps.</p>
     <div class="callout">Standing rule: <b>every performance claim cites the conditions it ran
     under</b>, negative results and wrong turns included.</div>
   </div>

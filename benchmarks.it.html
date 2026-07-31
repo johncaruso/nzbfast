@@ -387,13 +387,28 @@
       <li><b>Prova di backpressure</b>: limita la fase di scrittura a 4× sotto la rete e l'input si aggancia al limite entro ±1% in 2 s, la RAM <i>scende</i>, zero swap. Un disco lento non può mai gonfiare la memoria.</li>
       <li><b>Margine di calcolo</b>: tetti di decodifica+verifica misurati tra 86–165 Gbps su Apple silicon. La rete è il collo di bottiglia di 4–50× su ogni macchina testata.</li>
     </ul>
-    <p class="note" style="text-align:start"><b>Rimisurato il 31 luglio 2026 sulla build attuale</b>,
-    su un banco locale che serve gli articoli dalla RAM, così da cronometrare solo il client:
-    scaricare costa <b>0.64 secondi di CPU per GB</b> sull'M3 Ultra costa est e 0.74 sull'M1 Ultra
-    Europa, che salgono a 0.83 e 1.06 con TLS attivo - e la pipeline gira comunque al limite di
-    ~32 Gbps dei socket locali del sistema operativo, TLS incluso. Su un portatile Intel del 2022
-    (i7-1280P, Windows 11) il lavoro proprio del client è più o meno lo stesso, 0.7 secondi di CPU
-    per GB; il kernel di Windows e l'antivirus ne aggiungono circa altri 1.6, e il percorso dei
+    <p class="note" style="text-align:start"><b>Quanto costa scaricare in CPU.</b> Un banco locale
+    serve gli articoli dalla RAM, così da cronometrare solo il client, e ogni riga cita la sua prova.
+    Le righe dei concorrenti sono invariate dal giro del 22 luglio - stesse versioni sulla stessa
+    macchina, misurate dal cgroup di Linux su un solo core di CPU - e restano valide finché una nuova
+    release non ne cambia una. Le righe di nzbfast sono state rimisurate il 31 luglio 2026 sulla
+    build attuale.</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>client</th><th>secondi di CPU per GB</th><th>con TLS</th><th>prova</th></tr></thead>
+      <tbody>
+        <tr><td><b>nzbfast</b></td><td class="win num">0.64</td><td class="num">0.83</td><td>M3 Ultra costa est, 31 luglio, build attuale</td></tr>
+        <tr><td><b>nzbfast</b></td><td class="num">0.74</td><td class="num">1.06</td><td>M1 Ultra Europa, 31 luglio, build attuale</td></tr>
+        <tr><td><b>nzbfast</b></td><td class="num">0.72</td><td class="num">&ndash;</td><td>container Linux a un core, 22 luglio</td></tr>
+        <tr><td>SABnzbd 5.0.4</td><td class="num">1.5</td><td class="num">&ndash;</td><td>container Linux a un core, 22 luglio</td></tr>
+        <tr><td>NZBGet 26.2</td><td class="num">3.0</td><td class="num">&ndash;</td><td>container Linux a un core, 22 luglio</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">Il TLS costa CPU a ogni client; il nostro è misurato a
+    +30% per GB sull'M3 Ultra e +44% sull'M1 Ultra, e la pipeline gira comunque al limite di ~32 Gbps
+    dei socket locali del sistema operativo con TLS attivo. Nessun concorrente è ancora stato eseguito
+    sulla prova TLS, quindi quelle celle restano vuote invece che stimate. Su un portatile Intel del
+    2022 (i7-1280P, Windows 11) il lavoro proprio di nzbfast è più o meno lo stesso, ~0.7 secondi di
+    CPU per GB; il kernel di Windows e l'antivirus fanno circa triplicare il totale, e il percorso dei
     socket locali di quella piattaforma si ferma vicino a 8 Gbps.</p>
     <div class="callout"><b>Regola fissa: ogni affermazione sulle prestazioni cita le condizioni in cui è stata eseguita</b>, risultati negativi e strade sbagliate compresi.</div>
   </div>

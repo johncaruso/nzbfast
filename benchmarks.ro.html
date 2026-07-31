@@ -390,14 +390,30 @@
       <li><b>Dovadă de contrapresiune</b>: limitează etapa de scriere de 4× sub rețea și intrarea se blochează la plafon ±1% în 2 s, RAM-ul <i>scade</i>, zero swap-uri. Un disc lent nu poate umfla niciodată memoria.</li>
       <li><b>Marjă de calcul</b>: plafoane măsurate de decodare+verificare de 86–165 Gbps pe Apple silicon. Rețeaua este strangularea cu 4–50× pe fiecare mașină testată.</li>
     </ul>
-    <p class="note" style="text-align:start"><b>Re-măsurat pe 31 iulie 2026 pe versiunea curentă</b>,
-    pe un banc local care servește articolele din RAM, astfel încât doar clientul este cronometrat:
-    descărcarea costă <b>0.64 CPU-secunde per GB</b> pe M3 Ultra de pe Coasta de Est și 0.74 pe
-    M1 Ultra din Europa, urcând la 0.83 și 1.06 cu TLS activat - iar pipeline-ul rulează în
-    continuare la limita proprie de ~32 Gbps a socket-urilor locale a sistemului de operare,
-    inclusiv cu TLS. Pe un laptop Intel din 2022 (i7-1280P, Windows 11) munca proprie a clientului
-    este cam aceeași, 0.7 CPU-secunde per GB; kernelul Windows și antivirusul adaugă aproximativ
-    1.6 în plus, iar calea de socket-uri locale a acelei platforme se oprește pe la 8 Gbps.</p>
+    <p class="note" style="text-align:start"><b>Cât costă descărcarea în CPU.</b> Un banc local
+    servește articolele din RAM astfel încât doar clientul este cronometrat, iar fiecare rând își
+    citează rularea. Rândurile concurenților sunt neschimbate din runda de pe 22 iulie - aceleași
+    versiuni pe aceeași mașină, măsurate prin cgroup Linux pe un singur nucleu de CPU - și rămân
+    valabile până când o versiune nouă schimbă unul dintre ele. Rândurile nzbfast au fost
+    re-măsurate pe 31 iulie 2026 pe versiunea curentă.</p>
+    <div class="tblwrap"><table>
+      <thead><tr><th>client</th><th>CPU-secunde per GB</th><th>cu TLS</th><th>rulare</th></tr></thead>
+      <tbody>
+        <tr><td><b>nzbfast</b></td><td class="win num">0.64</td><td class="num">0.83</td><td>M3 Ultra de pe Coasta de Est, 31 iulie, versiunea curentă</td></tr>
+        <tr><td><b>nzbfast</b></td><td class="num">0.74</td><td class="num">1.06</td><td>M1 Ultra din Europa, 31 iulie, versiunea curentă</td></tr>
+        <tr><td><b>nzbfast</b></td><td class="num">0.72</td><td class="num">&ndash;</td><td>container Linux cu un singur nucleu, 22 iulie</td></tr>
+        <tr><td>SABnzbd 5.0.4</td><td class="num">1.5</td><td class="num">&ndash;</td><td>container Linux cu un singur nucleu, 22 iulie</td></tr>
+        <tr><td>NZBGet 26.2</td><td class="num">3.0</td><td class="num">&ndash;</td><td>container Linux cu un singur nucleu, 22 iulie</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note" style="text-align:start">TLS costă CPU la fiecare client; al nostru este
+    măsurat la +30% per GB pe M3 Ultra și la +44% pe M1 Ultra, iar pipeline-ul rulează în
+    continuare la limita proprie de ~32 Gbps a socket-urilor locale a sistemului de operare, cu
+    TLS activat. Niciun concurent nu a fost încă rulat pe proba TLS, așa că acele celule rămân
+    goale în loc să fie estimate. Pe un laptop Intel din 2022 (i7-1280P, Windows 11) munca
+    proprie a nzbfast este aceeași, ~0.7 CPU-secunde per GB; kernelul Windows și antivirusul cam
+    triplează totalul, iar calea de socket-uri locale a acelei platforme se oprește pe la
+    8 Gbps.</p>
     <div class="callout"><b>Regulă permanentă: fiecare afirmație de performanță citează condițiile în care a rulat</b>, inclusiv rezultatele negative și pașii greșiți.</div>
   </div>
 </section>
