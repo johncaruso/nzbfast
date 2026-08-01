@@ -4627,6 +4627,17 @@ async fn zip_payload_post_unpacks_natively() {
         ),
     )
     .unwrap();
+    // This job COMPLETES, so it is the one zip test that reaches
+    // post-processing, and keep-media-only below really deletes the
+    // extracted `readme.nfo` through the real binary. Without this the
+    // delete goes to the developer's Trash via Finder/AppleScript, which
+    // on macOS is a SYNCHRONOUS call that blocks until Finder answers -
+    // up to the ~2 minute AppleEvent timeout (see smart::remove_user_file,
+    // whose latch only engages AFTER the first call returns). A job is not
+    // filed to history until its cleanup returns, so a slow Finder blew
+    // this test's 40 s history poll and looked exactly like a wedged job.
+    // The failing twin never needs this: a failed job skips finalize.
+    delete_without_the_trash(&cfg);
     let d = serve(&dir, |port| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
         c.env("NZBFAST_OPEN", "1")
