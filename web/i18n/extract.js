@@ -86,7 +86,7 @@ Object.assign(out, {
   'hist.vh.bad.many': '{n} bad blocks across the last {m}',
   // Archive-shape badge tokens: rendered via t('shape.'+tok, SHAPE_EN[tok])
   // from the daemon's token list, so the key is computed at the call site.
-  'shape.rar5': 'RAR5', 'shape.rar4': 'RAR4', 'shape.7z': '7z',
+  'shape.rar5': 'RAR5', 'shape.rar4': 'RAR4', 'shape.7z': '7z', 'shape.zip': 'zip',
   'shape.store': 'stored', 'shape.compressed': 'compressed', 'shape.mixed': 'mixed',
   'shape.encrypted': 'encrypted',
   'shape.one-pass': 'one-pass', 'shape.unlock-at-end': 'unlocked at the end',

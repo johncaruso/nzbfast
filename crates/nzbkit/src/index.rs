@@ -4919,8 +4919,23 @@ pub fn quoted_name(s: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Escape for XML - and DROP what XML 1.0 cannot carry at all.
+///
+/// The emitted NZB's `poster=` is the raw OVER `From:` header and
+/// `subject=`/filename come from the article, so a single C0 control
+/// byte makes `/getnzb/<id>.nzb` unparseable to whatever consumes it -
+/// SABnzbd/expat, NZBGet/libxml2, any XML tooling. Escaping cannot help:
+/// `&#1;` is illegal too, and emitting one breaks our own quick-xml
+/// reader. See the twin `esc_xml` in nzbfast's serve.rs.
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
+    let clean: String = s
+        .chars()
+        .filter(|&c| {
+            matches!(c, '\t' | '\n' | '\r') || (c >= ' ' && c != '\u{FFFE}' && c != '\u{FFFF}')
+        })
+        .collect();
+    clean
+        .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")

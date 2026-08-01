@@ -290,6 +290,17 @@ pub fn decode_into_integrity(
                         end = file_size;
                     } else if rest.starts_with(b"part ") {
                         let h = &rest[5..];
+                        // Set it here too, exactly as the line-mode twin
+                        // does. `seen_ypart` is read at one site - the
+                        // `check_part_geometry` short-circuit - so leaving
+                        // it false silently DISABLED the geometry check on
+                        // the production decoder whenever `=ypart` arrived
+                        // after the first payload line, making the SIMD
+                        // path strictly more permissive than its own
+                        // scalar oracle (and a latent panic for the
+                        // differential fuzz target, which compares
+                        // acceptance).
+                        seen_ypart = true;
                         // Same 1-based clamp as the line-mode arm above and the
                         // oracle (yenc.rs): `begin=0` must not underflow offset().
                         begin = field_u64(h, b"begin").filter(|&b| b >= 1).unwrap_or(1);

@@ -1,6 +1,6 @@
 [package]
 name = "nzbfast"
-version = "1.0.12"
+version = "1.0.13"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -16,8 +16,14 @@ rars = { path = "../../vendor/rars", features = ["parallel"] }
 # cover the encrypted + non-LZMA methods real posts use.
 sevenz-rust2 = { version = "0.21", default-features = false, features = ["aes256", "bzip2", "ppmd"] }
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+# `env` backs `--config`'s NZBFAST_CONFIG fallback: the container sets that
+# variable for the daemon, and without it a `docker exec … import-sab` wrote
+# a config.local.json the daemon never reads (issue #8).
+clap = { version = "4", features = ["derive", "env"] }
+# `signal`: SIGTERM/SIGINT reach the same wind-down the tray's Quit item
+# uses, so `docker stop` hands the provider's sessions back with a QUIT
+# instead of orphaning them until its idle timeout (issue #13).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
 # Vendored + hardened: upstream 0.12.0 (the newest release) has two
 # unauthenticated one-request permanent kills and no way to set a socket
 # timeout. See vendor/tiny_http/VENDORING.md.

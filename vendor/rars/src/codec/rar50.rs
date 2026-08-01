@@ -1994,11 +1994,13 @@ impl Unpack50Decoder {
 
     /// Decode a SOLID CHAIN - several consecutive solid members treated as
     /// the one continuous compressed stream they are - through the MT
-    /// scan/tape pipeline, emitting `total_output_size` bytes to `sink` in
-    /// order. The caller cuts the emitted stream at member boundaries (it
-    /// knows each member's unpacked size) and verifies each member's
-    /// digests as the bytes stream past. `next_input` yields each member's
-    /// packed reader in order (the first call supplies the first member);
+    /// scan/tape pipeline, emitting `member_sizes.iter().sum()` bytes to
+    /// `sink` in order. The caller cuts the emitted stream at member
+    /// boundaries (`member_sizes`, in the same order) and verifies each
+    /// member's digests as the bytes stream past; the decoder needs the
+    /// same boundaries because a filter's address origin is member-local.
+    /// `next_input` yields each member's packed reader in order (the first
+    /// call supplies the first member);
     /// `reset_first` mirrors the serial path's state reset when the chain
     /// starts at a non-solid (first-of-archive) member. Parallel-only: the
     /// serial build keeps the per-member path.
@@ -2007,7 +2009,7 @@ impl Unpack50Decoder {
         &mut self,
         next_input: &mut (dyn FnMut() -> Option<Box<dyn Read + Send + 'a>> + Send),
         algorithm_version: u8,
-        total_output_size: usize,
+        member_sizes: &[usize],
         dictionary_size: usize,
         reset_first: bool,
         flat_limit: u64,
@@ -2015,6 +2017,19 @@ impl Unpack50Decoder {
     ) -> std::result::Result<(), StreamDecodeError<E>> {
         if dictionary_size == 0 {
             return Err(Error::InvalidData("RAR 5 dictionary size is zero").into());
+        }
+        // The group's members, as cumulative ends. The outputs count the
+        // whole group, so this is the only thing that tells a filter which
+        // member it belongs to - an address filter's origin is member-local
+        // (see `member_base_of`). Taking the sizes rather than the total
+        // means the two can never disagree.
+        let mut member_ends = Vec::with_capacity(member_sizes.len());
+        let mut total_output_size = 0usize;
+        for size in member_sizes {
+            total_output_size = total_output_size
+                .checked_add(*size)
+                .ok_or(Error::InvalidData("RAR 5 solid chain output size overflows"))?;
+            member_ends.push(total_output_size);
         }
         if reset_first {
             self.reset();
@@ -2043,7 +2058,8 @@ impl Unpack50Decoder {
                 total_output_size,
                 dictionary_size,
                 history_limit,
-            );
+            )
+            .with_member_ends(member_ends);
             self.run_blocks_flat_chain(
                 first,
                 next_input,
@@ -2072,7 +2088,8 @@ impl Unpack50Decoder {
             total_output_size,
             dictionary_size,
             history_limit,
-        );
+        )
+        .with_member_ends(member_ends);
         self.run_blocks_chain(
             first,
             next_input,
@@ -2240,8 +2257,10 @@ impl Unpack50Decoder {
 /// tracks materialized bytes, `written` tracks logical output, and
 /// `zero_prefix` counts the sparse zeroes so matches may still reach them.
 /// A declared filter waiting for its range to materialize in the ring.
-/// `filter.start` is the member-output ("file") position; `ring_start` is
-/// the same position in materialized-byte space (the two differ by however
+/// `filter.start` is the output position this ring counts (the member's,
+/// or the whole group's when it streams a chain - `filter.file_start`
+/// carries the member-local origin the filter itself needs); `ring_start`
+/// is the same position in materialized-byte space (the two differ by however
 /// many sparse zero bytes were emitted without materialization — while
 /// filters are pending, sparse runs are materialized so the mapping made at
 /// declaration time stays valid).
@@ -2280,6 +2299,9 @@ struct StreamingOutput {
     // ring had stopped growing. Invalidated wherever headroom changes.
     reserve_ok_upto: usize,
     pending_filters: std::collections::VecDeque<StreamFilter>,
+    /// Group-relative end of each chained member, in order. Empty when the
+    /// ring streams a single member; see `member_base_of`.
+    member_ends: Vec<usize>,
     filter_scratch: Vec<u8>,
     next_flush_check: usize,
 }
@@ -2324,8 +2346,18 @@ impl StreamingOutput {
             has_filters: false,
             reserve_ok_upto: 0,
             pending_filters: std::collections::VecDeque::new(),
+            member_ends: Vec::new(),
             filter_scratch: Vec::new(),
         }
+    }
+
+    /// Declare the member boundaries of a chained group (group-relative
+    /// cumulative ends). Only filter origins depend on them, and only a
+    /// chain has more than one member, so a single-member ring leaves them
+    /// empty.
+    fn with_member_ends(mut self, member_ends: Vec<usize>) -> Self {
+        self.member_ends = member_ends;
+        self
     }
 
     fn add_filter<E>(
@@ -2337,6 +2369,12 @@ impl StreamingOutput {
         {
             return Err(StreamDecodeError::FilteredMember);
         }
+        // `written` counts the whole GROUP when this ring streams a chain,
+        // but the filter translates addresses against its own member's
+        // output start; pin that origin now, while the declaration position
+        // is known.
+        let mut filter = filter;
+        filter.file_start = filter.start - member_base_of(&self.member_ends, filter.start);
         // From here on every ring growth reserves filter hold-back headroom;
         // grow now so the pending range fits ahead of head.
         self.has_filters = true;
@@ -2727,6 +2765,29 @@ impl StreamingOutput {
         }
 
         self.reserve(self.head + length);
+        // Short non-overlapping matches are the overwhelmingly common case,
+        // and a `memmove` call per 2-32 byte copy is mostly call overhead.
+        // Copy a fixed 32 bytes through a register temporary instead: the
+        // over-copy past `length` lands in [head+length, head+32), which is
+        // unmaterialized space the next emit overwrites. Requires both the
+        // source and destination 32-byte spans to sit inside the ring
+        // without wrapping, and `distance >= length` so the true bytes read
+        // are match-window content (the over-read past the source span may
+        // see anything materialized, which is fine - only garbage bytes
+        // land in the don't-care tail).
+        if length <= 32 && distance >= length {
+            let src_off = (self.head - distance) & self.mask;
+            let dst_off = self.head & self.mask;
+            if src_off + 32 <= self.ring.len() && dst_off + 32 <= self.ring.len() {
+                let tmp: [u8; 32] = self.ring[src_off..src_off + 32]
+                    .try_into()
+                    .expect("32-byte span");
+                self.ring[dst_off..dst_off + 32].copy_from_slice(&tmp);
+                self.head += length;
+                self.written += length;
+                return self.maybe_flush(sink);
+            }
+        }
         // Short-period overlapped repeats (length exceeding a small distance)
         // take a period-doubling loop: each full-period run makes [head-2p,
         // head) periodic, so the run cap grows geometrically and
@@ -2848,7 +2909,14 @@ impl StreamingOutput {
                     .pending_filters
                     .pop_front()
                     .expect("pending filter chain underflow");
-                apply_filter_to_range(&mut self.filter_scratch, &held.filter, held.filter.start)?;
+                // `filter.start` is a group position in a chain; the filter
+                // wants the offset inside its own member, pinned at
+                // declaration by `add_filter`.
+                apply_filter_to_range(
+                    &mut self.filter_scratch,
+                    &held.filter,
+                    held.filter.file_start,
+                )?;
                 match self.pending_filters.front() {
                     Some(next)
                         if next.ring_start == held.ring_start
@@ -3955,6 +4023,9 @@ struct FlatOutput {
     /// Declared filters awaiting their range to finish materializing, in
     /// declaration (== non-decreasing start) order.
     pending_filters: std::collections::VecDeque<PendingFilter>,
+    /// Group-relative end of each chained member, in order. Empty when this
+    /// buffer holds a single member; see `member_base_of`.
+    member_ends: Vec<usize>,
     filter_scratch: Vec<u8>,
     /// Emit is attempted once per `FLAT_EMIT_THRESHOLD` of new bytes.
     next_emit_check: usize,
@@ -3993,9 +4064,19 @@ impl FlatOutput {
             dictionary_size,
             history_limit,
             pending_filters: std::collections::VecDeque::new(),
+            member_ends: Vec::new(),
             filter_scratch: Vec::new(),
             next_emit_check: seed.len() + FLAT_EMIT_THRESHOLD,
         }
+    }
+
+    /// Declare the member boundaries of a chained group (group-relative
+    /// cumulative ends). Only filter origins depend on them, and only a
+    /// chain has more than one member, so a single-member buffer leaves
+    /// them empty.
+    fn with_member_ends(mut self, member_ends: Vec<usize>) -> Self {
+        self.member_ends = member_ends;
+        self
     }
 
     /// Logical bytes of THIS GROUP's output (the seeded prefix is not
@@ -4147,6 +4228,10 @@ impl FlatOutput {
         // Filter starts arrive logical (resolved against `written()`);
         // everything downstream (emit gating, scratch slicing) is physical.
         let mut filter = filter;
+        // `written()` counts the whole GROUP, so pin the origin the filter
+        // itself needs - the offset inside the declaring member - while the
+        // start is still group-logical.
+        filter.file_start = filter.start - member_base_of(&self.member_ends, filter.start);
         filter.start = filter
             .start
             .checked_add(self.base)
@@ -4221,7 +4306,16 @@ impl FlatOutput {
                     .pending_filters
                     .pop_front()
                     .expect("pending filter chain underflow");
-                apply_filter_to_range(&mut self.filter_scratch, &held, held.start)?;
+                // `held.start` indexes `buf` physically: it carries both a
+                // seeded window prefix (`self.base`) and, in a chain, every
+                // earlier member of the group. The FILTER wants neither -
+                // it wants the offset within its own member, which is what
+                // the encoder bakes in and what the buffered oracle passes,
+                // and both shifts moved E8/E8E9/ARM addresses off the
+                // serial walk. `add_filter` pinned that origin at
+                // declaration; slice with the physical index, translate
+                // with the member-local one.
+                apply_filter_to_range(&mut self.filter_scratch, &held, held.file_start)?;
                 match self.pending_filters.front() {
                     Some(next) if next.start == held.start && next.length == held.length => {
                         continue;
@@ -4321,10 +4415,30 @@ impl Default for Unpack50Decoder {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PendingFilter {
+    /// Where the range lives in the buffer that will be sliced for it. The
+    /// flat and streaming outputs shift this into their own address space.
     start: usize,
+    /// Offset of the range within its own MEMBER's output, which is what an
+    /// address-translating filter mixes into every translated address (see
+    /// `apply_filter_to_range`). Equal to `start` for a single-member
+    /// decode; the chain outputs recompute it, because their positions
+    /// count a whole solid group.
+    file_start: usize,
     length: usize,
     filter_type: FilterType,
     channels: usize,
+}
+
+/// Group-relative output offset where the member containing `start` begins.
+/// `member_ends` holds the group-relative end of each member in order and is
+/// empty for a single-member decode, where the base is always zero.
+fn member_base_of(member_ends: &[usize], start: usize) -> usize {
+    let index = member_ends.partition_point(|&end| end <= start);
+    if index == 0 {
+        0
+    } else {
+        member_ends[index - 1]
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4347,10 +4461,16 @@ struct RawFilter {
 
 impl RawFilter {
     fn resolve(self, current_pos: usize) -> Result<PendingFilter> {
+        let start = current_pos
+            .checked_add(self.offset as usize)
+            .ok_or(Error::InvalidData("RAR 5 filter start overflows"))?;
         Ok(PendingFilter {
-            start: current_pos
-                .checked_add(self.offset as usize)
-                .ok_or(Error::InvalidData("RAR 5 filter start overflows"))?,
+            start,
+            // Correct as-is whenever `current_pos` is a member-output
+            // position (the buffered path and every single-member decode).
+            // A chain output resolves against the whole group, so it
+            // rewrites this in `add_filter`.
+            file_start: start,
             length: self.length as usize,
             filter_type: self.filter_type,
             channels: usize::from(self.channels),
@@ -5931,6 +6051,7 @@ mod tests {
     fn streaming_decode_bails_on_overlong_filter_hold_span() {
         let filter = PendingFilter {
             start: 0,
+            file_start: 0,
             length: STREAM_FILTER_HOLD_LIMIT + 1,
             filter_type: FilterType::E8,
             channels: 0,
@@ -7092,7 +7213,10 @@ mod tests {
     /// takes the SEEDED flat path. Both groups (and the ring variant, via
     /// flat_limit 0) must reproduce the serial member-by-member decode,
     /// including matches from group B reaching back into group A's bytes
-    /// through the seeded prefix, and final rep/window state.
+    /// through the seeded prefix, and final rep/window state. Group B's
+    /// SECOND member carries a mid-member E8 range, so the filter origin
+    /// has to shed both shifts at once: the seeded prefix AND the earlier
+    /// member of its own group.
     #[test]
     #[cfg(feature = "parallel")]
     fn seeded_flat_second_chain_group_matches_serial() {
@@ -7101,25 +7225,40 @@ mod tests {
         let base: Vec<u8> = (0u32..6000)
             .map(|i| (i.wrapping_mul(2654435761) >> 11) as u8)
             .collect();
+        let mut last: Vec<u8> = base
+            .iter()
+            .rev()
+            .copied()
+            .chain(base[..2000].iter().copied())
+            .collect();
+        let filter_start = last.len();
+        last.extend_from_slice(&address_filter_payload(2048));
+        let filter_range = filter_start..last.len();
         let members: Vec<Vec<u8>> = vec![
             base.clone(),
             base[..4000].to_vec(),
             base[1000..5000].to_vec(),
-            base.iter().rev().copied().chain(base[..2000].iter().copied()).collect(),
+            last,
         ];
-        let mut history = Vec::new();
+        let mut encoder = Unpack50Encoder::with_options(EncodeOptions::new(4));
         let encoded: Vec<Vec<u8>> = members
             .iter()
-            .map(|data| {
-                let packed = encode_lz_member_with_history_and_options(
-                    data,
-                    &history,
-                    0,
-                    EncodeOptions::new(4),
-                )
-                .unwrap();
-                history.extend_from_slice(data);
-                packed
+            .enumerate()
+            .map(|(index, data)| {
+                if index == 3 {
+                    encoder
+                        .encode_member_with_filters(
+                            data,
+                            0,
+                            &[Rar50FilterSpec::range(
+                                Rar50FilterKind::E8,
+                                filter_range.clone(),
+                            )],
+                        )
+                        .unwrap()
+                } else {
+                    encoder.encode_member(data, 0).unwrap()
+                }
             })
             .collect();
 
@@ -7140,7 +7279,7 @@ mod tests {
             let mut chained = Unpack50Decoder::new();
             let mut chain_out: Vec<u8> = Vec::new();
             for group in [[0usize, 1], [2, 3]] {
-                let total: usize = group.iter().map(|&i| members[i].len()).sum();
+                let sizes: Vec<usize> = group.iter().map(|&i| members[i].len()).collect();
                 let mut next = 0usize;
                 let readers: Vec<&[u8]> =
                     group.iter().map(|&i| encoded[i].as_slice()).collect();
@@ -7159,7 +7298,7 @@ mod tests {
                     .decode_solid_chain_to_sink(
                         &mut next_input,
                         0,
-                        total,
+                        &sizes,
                         DEFAULT_DICTIONARY_SIZE,
                         false,
                         flat_limit,
@@ -7181,6 +7320,119 @@ mod tests {
             );
             assert_eq!(chained.reps, serial.reps, "rep state diverged");
             assert_eq!(chained.last_length, serial.last_length);
+        }
+    }
+
+    /// Data an address-translating filter actually rewrites: `e8 <rel32>`
+    /// calls for E8/E8E9 and 4-aligned words ending in 0xeb for ARM, so a
+    /// wrong filter origin shows up as different bytes rather than a no-op.
+    #[cfg(feature = "parallel")]
+    fn address_filter_payload(len: usize) -> Vec<u8> {
+        let mut data = Vec::with_capacity(len + 8);
+        let mut word = 0u32;
+        while data.len() < len {
+            data.push(0xe8);
+            data.extend_from_slice(&word.wrapping_mul(3).to_le_bytes()[..3]);
+            data.push(0x00);
+            data.push(0x00);
+            data.push(0xeb);
+            word = word.wrapping_add(1);
+        }
+        data.truncate(len);
+        data
+    }
+
+    /// An address filter declared by a member that is NOT the first of its
+    /// chain group. E8/E8E9/ARM mix the filtered range's origin into every
+    /// translated address, and that origin is the offset within the MEMBER
+    /// (what the encoder bakes in, what unrar's per-file WrittenFileSize
+    /// gives, what the serial walk passes). The chain outputs count the
+    /// whole group, so member 2's filter used to translate against
+    /// `prior members + local offset` and silently emitted shifted
+    /// addresses. Both legs - flat and, via flat_limit 0, the ring - must
+    /// reproduce the serial member-by-member decode.
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn chain_filter_in_non_first_member_matches_serial() {
+        for kind in [
+            Rar50FilterKind::E8,
+            Rar50FilterKind::E8E9,
+            Rar50FilterKind::Arm,
+        ] {
+            let lead: Vec<u8> = (0u32..4096)
+                .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+                .collect();
+            let filtered = address_filter_payload(4096);
+            let tail: Vec<u8> = lead.iter().rev().copied().collect();
+            let members = [lead, filtered, tail];
+            let filtered_index = 1usize;
+
+            let mut encoder = Unpack50Encoder::new();
+            let encoded: Vec<Vec<u8>> = members
+                .iter()
+                .enumerate()
+                .map(|(index, data)| {
+                    if index == filtered_index {
+                        encoder
+                            .encode_member_with_filter(data, 0, Rar50FilterSpec::new(kind))
+                            .unwrap()
+                    } else {
+                        encoder.encode_member(data, 0).unwrap()
+                    }
+                })
+                .collect();
+
+            // Serial oracle: one decoder, members in order, solid.
+            let mut serial = Unpack50Decoder::new();
+            let mut serial_out = Vec::new();
+            for (index, (data, packed)) in members.iter().zip(&encoded).enumerate() {
+                serial_out.extend(
+                    serial
+                        .decode_member(packed, 0, data.len(), index != 0, DecodeMode::Lz)
+                        .unwrap(),
+                );
+            }
+            assert_eq!(
+                serial_out,
+                members.concat(),
+                "{kind:?}: oracle disagrees with encoder"
+            );
+
+            for flat_limit in [u64::MAX, 0] {
+                let sizes: Vec<usize> = members.iter().map(|data| data.len()).collect();
+                let mut next = 0usize;
+                let readers: Vec<&[u8]> = encoded.iter().map(|packed| packed.as_slice()).collect();
+                let mut next_input = || -> Option<Box<dyn std::io::Read + Send>> {
+                    let reader = readers.get(next)?;
+                    next += 1;
+                    Some(Box::new(std::io::Cursor::new(reader.to_vec())))
+                };
+                let mut chained = Unpack50Decoder::new();
+                let mut chain_out: Vec<u8> = Vec::new();
+                chained
+                    .decode_solid_chain_to_sink(
+                        &mut next_input,
+                        0,
+                        &sizes,
+                        DEFAULT_DICTIONARY_SIZE,
+                        true,
+                        flat_limit,
+                        |chunk| -> std::result::Result<(), std::convert::Infallible> {
+                            match chunk {
+                                DecodedChunk::Bytes(bytes) => chain_out.extend_from_slice(bytes),
+                                DecodedChunk::Repeated { byte, len } => {
+                                    chain_out.extend(std::iter::repeat(byte).take(len))
+                                }
+                            }
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    chain_out, serial_out,
+                    "{kind:?}: chained output diverged at flat_limit {flat_limit}"
+                );
+            }
         }
     }
 

@@ -51,6 +51,17 @@ impl Fixture {
         self.nzb_files.push((name.to_string(), segs));
     }
 
+    /// `add_file` with the NZB subject decoupled from the yEnc-declared
+    /// name (the obfuscated norm: garbage subjects, real yEnc names).
+    /// The data lands on disk under the REAL name, so `add_par2` covers
+    /// the names the poster's PAR2 set would.
+    fn add_file_obfuscated(&mut self, subject: &str, yenc_name: &str, data: &[u8], art_size: usize) {
+        std::fs::write(self.dir.join(yenc_name), data).unwrap();
+        let tag = format!("{}-{}", subject.replace('.', "_"), self.nzb_files.len());
+        let segs = make_file_articles(yenc_name, data, art_size, &tag, &mut self.articles);
+        self.nzb_files.push((subject.to_string(), segs));
+    }
+
     /// Run `par2 create` over the named files and add the resulting .par2
     /// outputs as articles too. Returns false if par2 isn't available.
     fn add_par2(&mut self, redundancy: u32, files: &[&str], art_size: usize) -> bool {
@@ -97,6 +108,42 @@ impl Fixture {
             let segs = make_file_articles(&name, &data, art_size, &tag, &mut self.articles);
             self.nzb_files.push((name, segs));
             std::fs::remove_file(&p).unwrap();
+        }
+        true
+    }
+
+    /// `add_par2`, but the recovery set is posted the way an obfuscated
+    /// poster posts it: hash subjects AND hash yEnc names, so nothing
+    /// reaching the client - NZB subject or on-disk filename - carries a
+    /// `.par2` anywhere. Issue #9's shape exactly.
+    fn add_par2_obfuscated(&mut self, redundancy: u32, files: &[&str], art_size: usize) -> bool {
+        let st = Command::new("par2")
+            .arg("create")
+            .arg(format!("-r{redundancy}"))
+            .arg("-q")
+            .arg("testset")
+            .args(files)
+            .current_dir(&self.dir)
+            .status();
+        match st {
+            Ok(s) if s.success() => {}
+            _ => return false,
+        }
+        let mut par2s: Vec<PathBuf> = std::fs::read_dir(&self.dir)
+            .unwrap()
+            .filter_map(|e| {
+                let p = e.unwrap().path();
+                (p.extension().is_some_and(|x| x == "par2")).then_some(p)
+            })
+            .collect();
+        par2s.sort();
+        for (i, p) in par2s.iter().enumerate() {
+            let data = std::fs::read(p).unwrap();
+            let hash = format!("Qk7{i:02}zXm9rTb");
+            let tag = format!("obf-par2-{i}");
+            let segs = make_file_articles(&hash, &data, art_size, &tag, &mut self.articles);
+            self.nzb_files.push((hash, segs));
+            std::fs::remove_file(p).unwrap();
         }
         true
     }
@@ -394,6 +441,253 @@ async fn obfuscated_uniform_store_set_one_pass_shuffled_order() {
     }
 }
 
+/// Holds paging through the REAL `get` path: a split set whose big
+/// MIDDLE volume downloads first cannot resolve any base until the head
+/// volume's headers arrive - and the head's segment numbering is fully
+/// scrambled, so its offset-0 sniff comes late (the rotation probe has
+/// nothing to guess at on a true shuffle). The middle volume's window
+/// exceeds the holds cap (--mem-limit 64M -> 28.8 MB), which used to
+/// demote the whole set with "held-bytes cap"; now it pages to scratch
+/// (the daemon-wired ceiling), the set extracts ONE-PASS, and the
+/// scratch is gone at the end.
+#[tokio::test(flavor = "multi_thread")]
+async fn holds_over_the_cap_page_to_scratch_and_stay_one_pass() {
+    let mut fx = Fixture::new("holds-page");
+    let total_len = 6_000_000 + 36_000_000 + 5_000_000;
+    let film = payload(total_len, 83);
+    let vols = [
+        fixtures::rar5_volume_n(
+            &[("bigfilm.mkv", total_len as u64, &film[..6_000_000], false, true)],
+            0,
+        ),
+        fixtures::rar5_volume_n(
+            &[(
+                "bigfilm.mkv",
+                total_len as u64,
+                &film[6_000_000..42_000_000],
+                true,
+                true,
+            )],
+            1,
+        ),
+        fixtures::rar5_volume_n(
+            &[("bigfilm.mkv", total_len as u64, &film[42_000_000..], true, false)],
+            2,
+        ),
+    ];
+    // NZB order: the 36 MB middle volume FIRST, the anchors after - the
+    // middle bytes are all landed before anything can place them.
+    fx.add_file("x.part2.rar", &vols[1], 60_000);
+    fx.add_file("x.part3.rar", &vols[2], 60_000);
+    fx.add_file("x.part1.rar", &vols[0], 60_000);
+    // Scramble BOTH anchor volumes' segment numbering (the fully-
+    // obfuscated norm). The head's parse resolves forward, the tail's
+    // anchors the backward chain - either one arriving early (the head
+    // prefetch fetches every file's declared segment 1) would place the
+    // middle volume before it piles. Scrambled, each anchor classifies
+    // only when its true offset-0 arrives mid-stream, well after the
+    // middle volume has piled past the RAM cap. Both anchors stay under
+    // the ~7.2 MB per-slot unclassified spill, so neither goes Plain.
+    for (name, segs) in fx.nzb_files.iter_mut() {
+        if name != "x.part1.rar" && name != "x.part3.rar" {
+            continue;
+        }
+        let mut st = 0xFEEDBEEFu64;
+        for i in (1..segs.len()).rev() {
+            st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
+            segs.swap(i, (st >> 33) as usize % (i + 1));
+        }
+        for (i, seg) in segs.iter_mut().enumerate() {
+            seg.2 = i as u32 + 1;
+        }
+    }
+    // Paced arrivals so the download follows ladder order: at memcpy
+    // speed the head volume's offset-0 lands within the first moments
+    // and the middle volume drains as it decodes - nothing ever holds
+    // (the same loopback trap the obfuscated one-pass test documents).
+    let chaos = Chaos { delay_ms: 5, ..Default::default() };
+    let srv = MockServer::start(fx.articles.clone(), chaos).await;
+    let cfg = fx.write_config(&[&srv]);
+    let nzb = fx.write_nzb();
+    let out = fx.dir.join("out");
+
+    let (log, ok) = tokio::task::spawn_blocking(move || {
+        run_get_args(&cfg, &nzb, &out, &[], &["--mem-limit", "64M"])
+    })
+    .await
+    .unwrap();
+    assert!(ok, "get failed:\n{log}");
+    assert!(log.contains("paging to scratch"), "paging never engaged:\n{log}");
+    assert!(log.contains("extracted 1 file(s) in-stream"), "{log}");
+    assert!(log.contains("one-pass"), "shape must say one-pass:\n{log}");
+    assert!(!log.contains("partly on disk"), "set demoted:\n{log}");
+    assert!(!log.contains("held-bytes cap"), "the paged set still demoted:\n{log}");
+    let extracted = std::fs::read(fx.dir.join("out/bigfilm.mkv")).expect("extracted file");
+    assert_eq!(extracted, film, "extracted bytes differ");
+    for n in ["x.part1.rar", "x.part2.rar", "x.part3.rar"] {
+        assert!(
+            !fx.dir.join("out").join(n).exists(),
+            "volume {n} must not touch disk (one-pass)"
+        );
+    }
+    // The scratch died with the extractor - nothing internal left over.
+    let leftovers: Vec<String> = std::fs::read_dir(fx.dir.join("out"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".nzbfast-holds."))
+        .collect();
+    assert!(leftovers.is_empty(), "scratch left behind: {leftovers:?}");
+}
+
+/// Synthesized segment numbering that preserved posting order but
+/// started mid-sequence (the rotated shape): the NZB's declared order
+/// puts the yEnc offset-0 article dead LAST, so the M3 head prefetch
+/// fetches a mid-file article and the slot cannot classify. The
+/// extractor's offset-0 probe must front-load the true head through the
+/// promote ladder - the rotation guess (size-X) resolved against the
+/// slot's own article ladder - so the set classifies within a
+/// round-trip and extracts ONE-PASS. Pre-probe this run held until the
+/// per-slot spill and the volume materialized for the disk post-pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn rotated_segment_numbering_offset0_promoted_one_pass() {
+    if !have_par2() {
+        eprintln!("skipping: par2 not installed");
+        return;
+    }
+    let mut fx = Fixture::new("probe0-rot");
+    let inner = payload(12_000_000, 31);
+    let vol = fixtures::rar5_volume(&[("movie.mkv", 12_000_000, &inner, false, false)]);
+    fx.add_file("release.rar", &vol, 40_000);
+    assert!(fx.add_par2(10, &["release.rar"], 40_000), "par2 create failed");
+    // Rotate by one: declared segment k carries yEnc part k+1, and the
+    // offset-0 article lands at the very end of the declared ladder;
+    // sequential numbers slapped on, like the live post.
+    for (name, segs) in fx.nzb_files.iter_mut() {
+        if name.ends_with(".par2") {
+            continue;
+        }
+        segs.rotate_left(1);
+        for (i, seg) in segs.iter_mut().enumerate() {
+            seg.2 = i as u32 + 1;
+        }
+    }
+    // Paced arrivals, so holds really accumulate pre-classification the
+    // way a real line does (at memcpy speed the run is over before the
+    // probe's promote could matter either way).
+    let chaos = Chaos { delay_ms: 5, ..Default::default() };
+    let srv = MockServer::start(fx.articles.clone(), chaos).await;
+    let cfg = fx.write_config(&[&srv]);
+    let nzb = fx.write_nzb();
+    let out = fx.dir.join("out");
+
+    // --mem-limit 64M puts the per-slot spill at ~7.2 MB: without the
+    // probe the 12 MB slot trips it and demotes to a materialized
+    // volume long before its offset-0 article (dead last) arrives.
+    let (log, ok) = tokio::task::spawn_blocking(move || {
+        run_get_args(&cfg, &nzb, &out, &[], &["--mem-limit", "64M"])
+    })
+    .await
+    .unwrap();
+    assert!(ok, "get failed:\n{log}");
+    assert!(log.contains("clean download"), "no clean verdict:\n{log}");
+    assert!(log.contains("extracted 1 file(s) in-stream"), "{log}");
+    assert!(log.contains("one-pass"), "shape must say one-pass:\n{log}");
+    assert!(!log.contains("partly on disk"), "set demoted:\n{log}");
+    let extracted = std::fs::read(fx.dir.join("out/movie.mkv")).expect("extracted file");
+    assert_eq!(extracted, inner, "extracted bytes differ");
+    assert!(
+        !fx.dir.join("out/release.rar").exists(),
+        "volume must not touch disk (one-pass)"
+    );
+}
+
+/// Follow-up to the offset-0 probe, the obfuscated MULTI-volume shape:
+/// NZB subjects are garbage (no filename hint) while the yEnc names are
+/// real, and every volume's segment numbering is rotated by one, so each
+/// volume's offset-0 article lands dead LAST in its declared ladder. The
+/// probe's promote is keyed by the yEnc name (sanitize_filename of
+/// slot.name), which the subject-hint map cannot resolve; pre-fix the
+/// lookup fell to the every-volume ladder fallback, scaled each probe
+/// across the whole set's concatenation and front-loaded the wrong
+/// file's articles - each 12 MB slot then held past the ~7.2 MB per-slot
+/// spill (--mem-limit 64M) and the set demoted to a disk post-pass. The
+/// decode consumers now register each slot's observed yEnc name with
+/// SeekCtl before the write that fires the probe, so the promote
+/// resolves against the right slot's own ladder: one-pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn obfuscated_subjects_rotated_multivolume_one_pass() {
+    if !have_par2() {
+        eprintln!("skipping: par2 not installed");
+        return;
+    }
+    let mut fx = Fixture::new("probe0-obf-multi");
+    // WinRAR-true geometry: volume 0 carries one byte more data.
+    let total_len = 12_000_001 + 12_000_000 + 11_500_000;
+    let film = payload(total_len, 59);
+    let vols = [
+        fixtures::rar5_volume_n(
+            &[("realfilm.mkv", total_len as u64, &film[..12_000_001], false, true)],
+            0,
+        ),
+        fixtures::rar5_volume_n(
+            &[("realfilm.mkv", total_len as u64, &film[12_000_001..24_000_001], true, true)],
+            1,
+        ),
+        fixtures::rar5_volume_n(
+            &[("realfilm.mkv", total_len as u64, &film[24_000_001..], true, false)],
+            2,
+        ),
+    ];
+    let yenc_names = ["realpost.part1.rar", "realpost.part2.rar", "realpost.part3.rar"];
+    // Dotless hash garbage, like the live obfuscated posts.
+    let subjects = ["9f3ac1d2e4b5", "0817aa93c2fe", "5d64e0b17c88"];
+    for ((subject, yenc), vol) in subjects.iter().zip(&yenc_names).zip(&vols) {
+        fx.add_file_obfuscated(subject, yenc, vol, 40_000);
+    }
+    assert!(fx.add_par2(10, &yenc_names, 40_000), "par2 create failed");
+    // Rotate by one: declared segment k carries yEnc part k+1 and the
+    // offset-0 article lands at the very end of each declared ladder;
+    // sequential numbers slapped on, like the live posts.
+    for (name, segs) in fx.nzb_files.iter_mut() {
+        if name.ends_with(".par2") {
+            continue;
+        }
+        segs.rotate_left(1);
+        for (i, seg) in segs.iter_mut().enumerate() {
+            seg.2 = i as u32 + 1;
+        }
+    }
+    // Paced arrivals, so holds really accumulate pre-classification (at
+    // memcpy speed the run is over before the probe could matter).
+    let chaos = Chaos { delay_ms: 5, ..Default::default() };
+    let srv = MockServer::start(fx.articles.clone(), chaos).await;
+    let cfg = fx.write_config(&[&srv]);
+    let nzb = fx.write_nzb();
+    let out = fx.dir.join("out");
+
+    // --mem-limit 64M puts the per-slot spill at ~7.2 MB: a 12 MB slot
+    // that cannot classify until its natural tail trips it and demotes.
+    let (log, ok) = tokio::task::spawn_blocking(move || {
+        run_get_args(&cfg, &nzb, &out, &[], &["--mem-limit", "64M"])
+    })
+    .await
+    .unwrap();
+    assert!(ok, "get failed:\n{log}");
+    assert!(log.contains("clean download"), "no clean verdict:\n{log}");
+    assert!(log.contains("extracted 1 file(s) in-stream"), "{log}");
+    assert!(log.contains("one-pass"), "shape must say one-pass:\n{log}");
+    assert!(!log.contains("partly on disk"), "set demoted:\n{log}");
+    let extracted = std::fs::read(fx.dir.join("out/realfilm.mkv")).expect("extracted file");
+    assert_eq!(extracted, film, "extracted bytes differ");
+    for n in yenc_names.iter().chain(subjects.iter()) {
+        assert!(
+            !fx.dir.join("out").join(n).exists(),
+            "volume {n} must not touch disk (one-pass)"
+        );
+    }
+}
+
 /// Encrypted RAR5 store set (the obfuscated-release norm): with the
 /// password from the `Name{{pw}}.nzb` convention, the whole job must
 /// complete on the NATIVE path - in-stream ciphertext assembly, live
@@ -450,6 +744,119 @@ async fn encrypted_store_rar_decrypts_natively_without_unrar() {
     }
 }
 
+/// The same shape in RAR4 (`rar -m0 -p`, the AES-128 + SHA-1 schedule):
+/// posted split store set, password off the `Name{{pw}}.nzb` convention,
+/// unrar forbidden by canary. RAR4 stores no password check, so this whole
+/// job runs the UNVERIFIED route - ciphertext assembled at store offsets
+/// during the download, one AES pass at finish, and the extracted file
+/// published only because the archive's own plaintext CRC32 accepted it.
+/// The end state must still be full one-pass extraction: exact payload,
+/// not a volume on disk.
+#[tokio::test(flavor = "multi_thread")]
+async fn encrypted_rar4_store_set_decrypts_natively_without_unrar() {
+    if !have_par2() {
+        eprintln!("skipping: par2 not installed");
+        return;
+    }
+    let mut fx = Fixture::new("encstore4");
+    let inner = payload(900_001, 43); // odd length: end-padding truncate
+    let f = fixtures::encrypt_file_v4("s3cretpw", &inner, 13);
+    let n = f.cipher.len();
+    // One CBC stream carved at odd (non-16-aligned) points, exactly as the
+    // rars writer and WinRAR chunk a split RAR4 volume set.
+    let (a, b) = (350_003, 700_006);
+    let vols = [
+        fixtures::rar4_volume_enc(&[("movie.mkv", &f, 0..a, false, true)]),
+        fixtures::rar4_volume_enc(&[("movie.mkv", &f, a..b, true, true)]),
+        fixtures::rar4_volume_enc(&[("movie.mkv", &f, b..n, true, false)]),
+    ];
+    let names = ["r4.part1.rar", "r4.part2.rar", "r4.part3.rar"];
+    for (name, vol) in names.iter().zip(&vols) {
+        fx.add_file(name, vol, 60_000);
+    }
+    assert!(fx.add_par2(20, &names, 60_000), "par2 create failed");
+    let srv = MockServer::start(fx.articles.clone(), Chaos::default()).await;
+    let cfg = fx.write_config(&[&srv]);
+    let nzb = fx.write_nzb();
+    let locked = fx.dir.join("release{{s3cretpw}}.nzb");
+    std::fs::rename(&nzb, &locked).unwrap();
+    let out = fx.dir.join("out");
+
+    let (log, ok) = tokio::task::spawn_blocking(move || {
+        run_get(&cfg, &locked, &out, &[("NZBFAST_TEST_FORBID_UNRAR", "1")])
+    })
+    .await
+    .unwrap();
+    assert!(ok, "get failed (unrar canary tripped?):\n{log}");
+    assert!(log.contains("password taken from"), "{log}");
+    assert!(log.contains("decrypted"), "no native decrypt notice:\n{log}");
+    assert!(!log.contains("unpacking archive with unrar"), "{log}");
+    let extracted = std::fs::read(fx.dir.join("out/movie.mkv")).expect("extracted file");
+    assert_eq!(extracted.len(), inner.len(), "padding must be truncated");
+    assert_eq!(extracted, inner, "decrypted bytes differ");
+    for v in &names {
+        assert!(
+            !fx.dir.join("out").join(v).exists(),
+            "volume {v} must not touch disk"
+        );
+    }
+}
+
+/// The RAR4 `-hp` shape (encrypted HEADERS as well as data) end to end.
+/// Nothing in the volume is readable without the password - not even the
+/// file name - so this proves the mapper's header decryption, not just its
+/// data path.
+#[tokio::test(flavor = "multi_thread")]
+async fn encrypted_rar4_header_encrypted_set_decrypts_natively_without_unrar() {
+    if !have_par2() {
+        eprintln!("skipping: par2 not installed");
+        return;
+    }
+    let mut fx = Fixture::new("enchdrs4");
+    let inner = payload(500_003, 44);
+    let f = fixtures::encrypt_file_v4("hp4pass", &inner, 14);
+    let n = f.cipher.len();
+    let a = 260_001;
+    let vols = [
+        fixtures::rar4_volume_enc_headers(
+            &[("movie.mkv", &f, 0..a, false, true)],
+            "hp4pass",
+            5,
+        ),
+        fixtures::rar4_volume_enc_headers(&[("movie.mkv", &f, a..n, true, false)], "hp4pass", 5),
+    ];
+    let names = ["h4.part1.rar", "h4.part2.rar"];
+    for (name, vol) in names.iter().zip(&vols) {
+        fx.add_file(name, vol, 60_000);
+    }
+    assert!(fx.add_par2(20, &names, 60_000), "par2 create failed");
+    let srv = MockServer::start(fx.articles.clone(), Chaos::default()).await;
+    let cfg = fx.write_config(&[&srv]);
+    let nzb = fx.write_nzb();
+    let locked = fx.dir.join("release{{hp4pass}}.nzb");
+    std::fs::rename(&nzb, &locked).unwrap();
+    let out = fx.dir.join("out");
+
+    let (log, ok) = tokio::task::spawn_blocking(move || {
+        run_get(&cfg, &locked, &out, &[("NZBFAST_TEST_FORBID_UNRAR", "1")])
+    })
+    .await
+    .unwrap();
+    assert!(ok, "get failed (unrar canary tripped?):\n{log}");
+    assert!(log.contains("decrypted"), "no native decrypt notice:\n{log}");
+    assert!(!log.contains("unpacking archive with unrar"), "{log}");
+    assert_eq!(
+        std::fs::read(fx.dir.join("out/movie.mkv")).expect("extracted file"),
+        inner
+    );
+    for v in &names {
+        assert!(
+            !fx.dir.join("out").join(v).exists(),
+            "volume {v} must not touch disk"
+        );
+    }
+}
+
 /// Same set, WRONG password: the job must fail (not exit 0 with garbage),
 /// keep the verified volumes on disk for a retry, and still never touch
 /// unrar when the canary forbids it.
@@ -492,6 +899,62 @@ async fn encrypted_store_rar_wrong_password_keeps_volumes() {
             &std::fs::read(fx.dir.join("out").join(name)).expect("volume on disk"),
             vol,
             "volume {name} must be byte-exact for a retry"
+        );
+    }
+    assert!(!fx.dir.join("out/movie.mkv").exists(), "no garbage output");
+}
+
+/// Same set, NO password anywhere: the job must complete like an `-hp`
+/// (encrypted-headers) set does - verified volumes kept on disk and the
+/// 🔒 password prompt printed - NOT fail through an unrar attempt that
+/// cannot succeed without a key. The demote reason used to be NotStore's
+/// "compressed or encrypted entries", whose "compressed" substring steered
+/// the finish ladder's unrar arm; MapBlocker::EncryptedNoPassword now
+/// routes it to the locked-no-password arm.
+#[tokio::test(flavor = "multi_thread")]
+async fn encrypted_store_rar_no_password_keeps_volumes_and_prompts() {
+    if !have_par2() {
+        eprintln!("skipping: par2 not installed");
+        return;
+    }
+    let mut fx = Fixture::new("encnopw");
+    let inner = payload(400_000, 25);
+    let f = fixtures::encrypt_file("neverseen", &inner, 6);
+    let n = f.cipher.len();
+    let vols = [
+        fixtures::rar5_volume_enc(&[("movie.mkv", &f, 0..n / 2, false, true)], Some(0)),
+        fixtures::rar5_volume_enc(&[("movie.mkv", &f, n / 2..n, true, false)], Some(1)),
+    ];
+    let names = ["k.part1.rar", "k.part2.rar"];
+    for (name, vol) in names.iter().zip(&vols) {
+        fx.add_file(name, vol, 60_000);
+    }
+    assert!(fx.add_par2(20, &names, 60_000), "par2 create failed");
+    let srv = MockServer::start(fx.articles.clone(), Chaos::default()).await;
+    let cfg = fx.write_config(&[&srv]);
+    let nzb = fx.write_nzb();
+    let out = fx.dir.join("out");
+
+    let (log, ok) = tokio::task::spawn_blocking(move || {
+        run_get(&cfg, &nzb, &out, &[("NZBFAST_TEST_FORBID_UNRAR", "1")])
+    })
+    .await
+    .unwrap();
+    assert!(ok, "locked set with no password must complete, not fail:\n{log}");
+    assert!(
+        log.contains("password-protected and no password was found"),
+        "missing the 🔒 prompt:\n{log}"
+    );
+    assert!(
+        !log.contains("could not be unpacked"),
+        "the pre-fix unrar-arm failure is back:\n{log}"
+    );
+    // The PAR2-verified volumes are the deliverable until a password lands.
+    for (name, vol) in names.iter().zip(&vols) {
+        assert_eq!(
+            &std::fs::read(fx.dir.join("out").join(name)).expect("volume on disk"),
+            vol,
+            "volume {name} must be byte-exact for the unlock"
         );
     }
     assert!(!fx.dir.join("out/movie.mkv").exists(), "no garbage output");
@@ -549,7 +1012,13 @@ async fn nested_password_chain_auto_unlocks_end_to_end() {
         .unwrap();
     assert!(ok, "nested password chain must complete rc=0:\n{log}");
     let low = log.to_lowercase();
-    assert!(!low.contains("password required"), "must not park for a manual key:\n{log}");
+    // Key on the actual park messages (the 🔒 prompt, the daemon's unlock
+    // notice), not a bare "password required" - the nested-prevalence
+    // telemetry line legitimately prints the demote reason "encrypted
+    // entries (password required)" on a run that then auto-unlocks.
+    assert!(!log.contains("🔒"), "must not park for a manual key:\n{log}");
+    assert!(!low.contains("password required to unpack"), "must not park for a manual key:\n{log}");
+    assert!(!low.contains("no password was found"), "must not park for a manual key:\n{log}");
     assert!(!low.contains("set a password"), "must not park for a manual key:\n{log}");
     assert!(log.contains("auto-unlocked"), "expected auto-unlock notices:\n{log}");
 
@@ -788,6 +1257,9 @@ async fn store_rar_in_rar_chases_compressed_inner() {
 /// fallback volumes (that guard is what the RAR-in-RAR fix above
 /// refined, not removed). Since spec Part B the successfully-unpacked
 /// volumes are spent and deleted rather than left beside the payload.
+/// Pinned on the top-chase kill switch: with the depth-0 chase on this
+/// shape streams instead, but the disk path stays reachable (cap
+/// demote, gate off) and its mechanics are what this test guards.
 #[tokio::test(flavor = "multi_thread")]
 async fn compressed_fallback_leftovers_not_reprocessed() {
     if !have_par2() {
@@ -805,9 +1277,11 @@ async fn compressed_fallback_leftovers_not_reprocessed() {
     let nzb = fx.write_nzb();
     let out = fx.dir.join("out");
 
-    let (log, ok) = tokio::task::spawn_blocking(move || run_get(&cfg, &nzb, &out, &[]))
-        .await
-        .unwrap();
+    let (log, ok) = tokio::task::spawn_blocking(move || {
+        run_get(&cfg, &nzb, &out, &[("NZBFAST_NO_TOP_RAR_CHASE", "1")])
+    })
+    .await
+    .unwrap();
     assert!(ok, "get failed:\n{log}");
     assert!(log.contains("compressed"), "no fallback notice:\n{log}");
     // Exactly ONE unpack over the fallback volumes - a second one means
@@ -829,9 +1303,10 @@ async fn compressed_fallback_leftovers_not_reprocessed() {
     );
 }
 
-/// Compressed OUTER wrapping a named inner RAR: the top level can't
-/// stream (chase is inner-only), so the volumes fall back, the on-disk
-/// unpack produces inner.rar BESIDE the leftover c.rar - and the nested
+/// Compressed OUTER wrapping a named inner RAR, on the DISK path
+/// (pinned via the top-chase kill switch - with the depth-0 chase on,
+/// this shape streams): the volumes fall back, the on-disk unpack
+/// produces inner.rar BESIDE the leftover c.rar - and the nested
 /// pass must park the leftovers, denest the inner set, and put the
 /// leftovers back untouched. Regression: the leftover guard used to skip
 /// the whole pass, exiting 0 with the payload still packed.
@@ -898,9 +1373,11 @@ async fn compressed_outer_wrapping_rar_denests_beside_leftovers() {
     let nzb = fx.write_nzb();
     let out = fx.dir.join("out");
 
-    let (log, ok) = tokio::task::spawn_blocking(move || run_get(&cfg, &nzb, &out, &[]))
-        .await
-        .unwrap();
+    let (log, ok) = tokio::task::spawn_blocking(move || {
+        run_get(&cfg, &nzb, &out, &[("NZBFAST_NO_TOP_RAR_CHASE", "1")])
+    })
+    .await
+    .unwrap();
     assert!(ok, "get failed:\n{log}");
     assert!(log.contains("compressed"), "no fallback notice:\n{log}");
     // Two unpacks: the fallback over c.rar, the nested pass over inner.rar.
@@ -983,9 +1460,13 @@ async fn compressed_outer_with_subfolder_rar_payload_denests() {
     let nzb = fx.write_nzb();
     let out = fx.dir.join("out");
 
-    let (log, ok) = tokio::task::spawn_blocking(move || run_get(&cfg, &nzb, &out, &[]))
-        .await
-        .unwrap();
+    // Disk path pinned via the top-chase kill switch (see the sibling
+    // test above for why).
+    let (log, ok) = tokio::task::spawn_blocking(move || {
+        run_get(&cfg, &nzb, &out, &[("NZBFAST_NO_TOP_RAR_CHASE", "1")])
+    })
+    .await
+    .unwrap();
     assert!(ok, "get failed:\n{log}");
     assert!(log.contains("compressed"), "no fallback notice:\n{log}");
     let got = std::fs::read(fx.dir.join("out/Sub/movie.bin"))
@@ -1000,6 +1481,256 @@ async fn compressed_outer_with_subfolder_rar_payload_denests() {
         !fx.dir.join("out/.nzbfast-outer-hold").exists(),
         "scratch hold left behind:\n{log}"
     );
+}
+
+/// The top-level RAR chase (the RAR analogue of TODO 37 step 1): a
+/// POSTED multi-volume COMPRESSED RAR5 set streams at depth 0 - payload
+/// decoded in flight, volumes never on disk, unrar forbidden by canary.
+/// Before the depth-gate lift this shape demoted to materialized
+/// volumes and waited for the unrar ladder.
+#[tokio::test(flavor = "multi_thread")]
+async fn top_level_compressed_rar_extracts_one_pass() {
+    if !have_par2() {
+        eprintln!("skipping: par2 not installed");
+        return;
+    }
+    // Half-entropy payload: compressible enough that the writer keeps
+    // the compressed method (it silently stores incompressible entries,
+    // which would dodge the chase and test the store path instead).
+    let mut s = 0x9e3779b97f4a7c15u64;
+    let doc: Vec<u8> = (0..600_000usize)
+        .map(|i| {
+            if i % 2 == 0 {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 24) as u8
+            } else {
+                0
+            }
+        })
+        .collect();
+    let vols = rars::rar50::Rar50VolumeWriter::new(rars::rar50::WriterOptions::default())
+        .compressed_entries(&[rars::rar50::CompressedEntry {
+            name: b"movie.bin",
+            data: &doc,
+            mtime: None,
+            attributes: 0,
+            host_os: 0,
+        }])
+        .max_payload_per_volume(80_000)
+        .finish()
+        .unwrap();
+    assert!(vols.len() >= 3, "want a real multi-volume set, got {}", vols.len());
+    let mut fx = Fixture::new("toprarchase");
+    let names: Vec<String> =
+        (1..=vols.len()).map(|i| format!("c.part{i}.rar")).collect();
+    for (name, vol) in names.iter().zip(&vols) {
+        fx.add_file(name, vol, 9_000);
+    }
+    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    assert!(fx.add_par2(20, &name_refs, 9_000), "par2 create failed");
+    let srv = MockServer::start(fx.articles.clone(), Chaos::default()).await;
+    let cfg = fx.write_config(&[&srv]);
+    let nzb = fx.write_nzb();
+    let out = fx.dir.join("out");
+
+    let (log, ok) = tokio::task::spawn_blocking(move || {
+        run_get(&cfg, &nzb, &out, &[("NZBFAST_TEST_FORBID_UNRAR", "1")])
+    })
+    .await
+    .unwrap();
+    assert!(ok, "get failed (unrar canary tripped?):\n{log}");
+    assert!(log.contains("clean download"), "no clean verdict:\n{log}");
+    assert!(
+        log.contains("extracted 1 file(s) in-stream"),
+        "payload did not stream:\n{log}"
+    );
+    assert!(
+        !log.contains("unpacking archive"),
+        "disk unpack ran - the chase demoted:\n{log}"
+    );
+    assert_eq!(
+        std::fs::read(fx.dir.join("out/movie.bin")).expect("extracted file"),
+        doc,
+        "extracted bytes differ"
+    );
+    for n in &names {
+        assert!(
+            !fx.dir.join("out").join(n).exists(),
+            "volume {n} must not touch disk"
+        );
+    }
+}
+
+/// Half-entropy bytes (xorshift byte, zero byte, ...): compressible
+/// enough that the rars writer keeps the compressed method - it silently
+/// stores incompressible entries, which would dodge the chase and test
+/// the store path instead.
+fn half_entropy(n: usize, mut s: u64) -> Vec<u8> {
+    (0..n)
+        .map(|i| {
+            if i % 2 == 0 {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 24) as u8
+            } else {
+                0
+            }
+        })
+        .collect()
+}
+
+/// Encrypted AND compressed at depth 0 (Increment E's second shape): a
+/// posted multi-volume RAR5 whose single member is both deflated and
+/// AES-encrypted, password riding the `Name{{pw}}.nzb` convention. With
+/// the password in hand at start the chase gate admits the entry, and
+/// the whole job must stream one-pass: payload decoded+decrypted in
+/// flight, no volume ever on disk, unrar forbidden by canary.
+#[tokio::test(flavor = "multi_thread")]
+async fn encrypted_compressed_rar_extracts_one_pass() {
+    if !have_par2() {
+        eprintln!("skipping: par2 not installed");
+        return;
+    }
+    let doc = half_entropy(600_000, 0x9e3779b97f4a7c15);
+    let mut features = rars::FeatureSet::store_only();
+    features.file_encryption = true;
+    let opts = rars::rar50::WriterOptions::new(rars::ArchiveVersion::Rar50, features);
+    let vols = rars::rar50::Rar50VolumeWriter::new(opts)
+        .encrypted_compressed_entries(&[rars::rar50::EncryptedCompressedEntry {
+            name: b"movie.bin",
+            data: &doc,
+            mtime: None,
+            attributes: 0,
+            host_os: 0,
+            password: b"s3cretpw",
+        }])
+        .max_payload_per_volume(80_000)
+        .finish()
+        .unwrap();
+    assert!(vols.len() >= 3, "want a real multi-volume set, got {}", vols.len());
+    let mut fx = Fixture::new("topencchase");
+    let names: Vec<String> =
+        (1..=vols.len()).map(|i| format!("c.part{i}.rar")).collect();
+    for (name, vol) in names.iter().zip(&vols) {
+        fx.add_file(name, vol, 9_000);
+    }
+    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    assert!(fx.add_par2(20, &name_refs, 9_000), "par2 create failed");
+    let srv = MockServer::start(fx.articles.clone(), Chaos::default()).await;
+    let cfg = fx.write_config(&[&srv]);
+    let nzb = fx.write_nzb();
+    // Password rides the filename convention (SAB/NZBGet compatible).
+    let locked = fx.dir.join("release{{s3cretpw}}.nzb");
+    std::fs::rename(&nzb, &locked).unwrap();
+    let out = fx.dir.join("out");
+
+    let (log, ok) = tokio::task::spawn_blocking(move || {
+        run_get(&cfg, &locked, &out, &[("NZBFAST_TEST_FORBID_UNRAR", "1")])
+    })
+    .await
+    .unwrap();
+    assert!(ok, "get failed (unrar canary tripped?):\n{log}");
+    assert!(log.contains("password taken from"), "{log}");
+    assert!(log.contains("clean download"), "no clean verdict:\n{log}");
+    assert!(
+        log.contains("extracted 1 file(s) in-stream"),
+        "payload did not stream:\n{log}"
+    );
+    assert!(
+        !log.contains("unpacking archive"),
+        "disk unpack ran - the chase demoted:\n{log}"
+    );
+    assert_eq!(
+        std::fs::read(fx.dir.join("out/movie.bin")).expect("extracted file"),
+        doc,
+        "decrypted+decoded bytes differ"
+    );
+    for n in &names {
+        assert!(
+            !fx.dir.join("out").join(n).exists(),
+            "volume {n} must not touch disk"
+        );
+    }
+}
+
+/// A DAMAGED posted compressed set exits the chase through the
+/// materialize-for-repair door (the depth-0 twin of
+/// `damaged_post_repairs_and_reextracts`): a data article goes missing
+/// mid-volume, so the chased slots come down as byte-exact volume files
+/// ("materializing volumes for repair"), PAR2 repairs them on disk, and
+/// the re-extract pass must land the correct payload - rc=0 only for
+/// that end state.
+#[tokio::test(flavor = "multi_thread")]
+async fn top_level_compressed_rar_damaged_repairs_and_reextracts() {
+    if !have_par2() {
+        eprintln!("skipping: par2 not installed");
+        return;
+    }
+    let doc = half_entropy(600_000, 0xa076_1d64_78bd_642f);
+    let vols = rars::rar50::Rar50VolumeWriter::new(rars::rar50::WriterOptions::default())
+        .compressed_entries(&[rars::rar50::CompressedEntry {
+            name: b"movie.bin",
+            data: &doc,
+            mtime: None,
+            attributes: 0,
+            host_os: 0,
+        }])
+        .max_payload_per_volume(80_000)
+        .finish()
+        .unwrap();
+    assert!(vols.len() >= 3, "want a real multi-volume set, got {}", vols.len());
+    let mut fx = Fixture::new("toprardmg");
+    let names: Vec<String> =
+        (1..=vols.len()).map(|i| format!("c.part{i}.rar")).collect();
+    for (name, vol) in names.iter().zip(&vols) {
+        fx.add_file(name, vol, 9_000);
+    }
+    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    assert!(fx.add_par2(20, &name_refs, 9_000), "par2 create failed");
+    // Lose a DATA article inside part2's packed stream: the chase engine
+    // blocks at the gap, verification reads the hole back bad, and the
+    // mapped-repair gate declines the chased slot - forcing the
+    // materialize + repair_dir + re-extract path this test pins.
+    let victim = fx
+        .articles
+        .keys()
+        .find(|k| k.contains("c_part2_rar") && k.ends_with("-3@mock>"))
+        .expect("victim article")
+        .clone();
+    let chaos = Chaos {
+        missing: [victim].into(),
+        ..Default::default()
+    };
+    let srv = MockServer::start(fx.articles.clone(), chaos).await;
+    let cfg = fx.write_config(&[&srv]);
+    let nzb = fx.write_nzb();
+    let out = fx.dir.join("out");
+
+    let (log, ok) = tokio::task::spawn_blocking(move || run_get(&cfg, &nzb, &out, &[]))
+        .await
+        .unwrap();
+    assert!(ok, "get failed:\n{log}");
+    assert!(log.contains("materializing volumes for repair"), "{log}");
+    assert!(log.contains("repair complete"), "no repair:\n{log}");
+    // The re-extract pass runs in protect-sources mode, which never
+    // chases - a compressed set demotes there and exits through its
+    // unrar-ladder fallback. What matters is the end state: payload on
+    // disk, volumes spent.
+    assert!(log.contains("re-extracting"), "no re-extract pass:\n{log}");
+    assert_eq!(
+        std::fs::read(fx.dir.join("out/movie.bin")).expect("extracted file"),
+        doc,
+        "extracted bytes differ after repair"
+    );
+    for n in &names {
+        assert!(
+            !fx.dir.join("out").join(n).exists(),
+            "spent volume {n} must be cleaned up:\n{log}"
+        );
+    }
 }
 
 /// Build a real store-mode RAR5 (rars writer, whole-file CRC stored in
@@ -2350,6 +3081,91 @@ async fn missing_everywhere_reported_not_hung() {
     assert!(log.contains("download incomplete"), "{log}");
 }
 
+/// A wholly dead post must be DRIVEN to terminal-missing, not abandoned
+/// by the stall watchdog.
+///
+/// 31 Jul, live: a 30-day-old post whose every article was gone (a STAT
+/// probe found 0 of 306 alive on any of five servers) failed a manual
+/// retry as "the connection pool stalled ... this is a fault on THIS
+/// machine or its link, not evidence that anything is missing from the
+/// post - most of the outstanding articles were never requested". Both
+/// halves were wrong: the post really was missing, and the pool had not
+/// wedged. The watchdog had aborted a run that was working perfectly.
+///
+/// The watchdog's freeze signal is DECODED BYTES, and a dead post decodes
+/// zero bytes by definition - for as long as it takes to ask every server
+/// for every article. `outstanding` was falling the whole time, which is
+/// the pool making steady progress, but nothing reads it that way, so any
+/// dead post whose 430 ladder outlasts the window is aborted mid-queue
+/// and then described as a fault on the user's own machine.
+///
+/// Scaled down here (a short window, a 430 that costs a round trip like a
+/// real one) but identical in shape: the run must ask for every article
+/// and return the missing verdict, never the stall.
+#[tokio::test(flavor = "multi_thread")]
+async fn dead_post_is_driven_to_missing_not_abandoned_as_a_stall() {
+    let mut fx = Fixture::new("deadpost-stall");
+    let data = payload(2_000_000, 41);
+    fx.add_file("gone.bin", &data, 10_000); // 200 articles
+    // Old enough to be a takedown rather than a propagation gap.
+    fx.date = unix_now() - 30 * 86_400;
+    // Every article 430s everywhere, and each refusal costs a round trip.
+    // 200 articles at 80 ms, 4 connections 3 deep, is many seconds of pure
+    // refusals - well past the 1 s window set below, with zero bytes
+    // decoded throughout. That ratio is the live one: the real post's 430
+    // ladder simply outlasted the default 180 s.
+    let chaos = Chaos {
+        missing: fx.articles.keys().cloned().collect(),
+        missing_delay_ms: 80,
+        ..Default::default()
+    };
+    let srv = MockServer::start(fx.articles.clone(), chaos).await;
+    let cfg = fx.write_config(&[&srv]);
+    let nzb = fx.write_nzb();
+    let out = fx.dir.join("out");
+    let n_articles = fx.articles.len();
+
+    // Run twice: the second resumes from the journal, which is how the
+    // live case was hit (a manual retry of a job that already failed).
+    for pass in 1..=2 {
+        let (cfg, nzb, out) = (cfg.clone(), nzb.clone(), out.clone());
+        let (log, ok) = tokio::task::spawn_blocking(move || {
+            run_get(&cfg, &nzb, &out, &[("NZBFAST_STALL_ABORT_SECS", "1")])
+        })
+        .await
+        .unwrap();
+        assert!(!ok, "pass {pass}: a dead post must exit nonzero\n{log}");
+        assert!(
+            !log.contains("download stalled"),
+            "pass {pass}: the watchdog aborted a run that was resolving \
+             articles steadily - a dead post decodes zero bytes by \
+             definition, which is not a wedge:\n{log}"
+        );
+        assert!(
+            !log.contains("recovered from a stalled pool"),
+            "pass {pass}: the tail was abandoned:\n{log}"
+        );
+        // The verdict has to be about the post, not about this machine.
+        assert!(
+            !log.contains("fault on THIS machine"),
+            "pass {pass}: a genuinely dead post was blamed on the user's \
+             own link:\n{log}"
+        );
+    }
+    // Every article was actually ASKED for - the live message's "most of
+    // the outstanding articles were never requested" is the tell that the
+    // queue was abandoned rather than driven to terminal.
+    let asked: std::collections::HashSet<String> =
+        srv.body_log.lock().unwrap().iter().cloned().collect();
+    assert_eq!(
+        asked.len(),
+        n_articles,
+        "only {} of {n_articles} article(s) were ever requested - the run \
+         gave up on the rest",
+        asked.len()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn retention_routes_old_post_around_short_server() {
     // Both servers carry every article, but server A's retention (10 days)
@@ -3410,6 +4226,12 @@ async fn top_level_7z_extracts_one_pass() {
     assert!(ok, "get failed:\n{log}");
     assert!(log.contains("clean download"), "no clean verdict:\n{log}");
     assert!(log.contains("extracted 1 file(s) in-stream"), "{log}");
+    // The chase's byte count, which read "(0.0 MB)" here too until the
+    // zip work surfaced it on a live post (31 Jul).
+    assert!(
+        !log.contains("in-stream (0.0 MB)"),
+        "the in-stream summary lost its byte count:\n{log}"
+    );
     assert!(log.contains("7z · one-pass"), "badge still says on-disk:\n{log}");
     assert_eq!(
         std::fs::read(fx.dir.join("out/movie.mkv")).expect("extracted file"),
@@ -3702,4 +4524,526 @@ async fn top_level_7z_split_set_extracts_one_pass() {
             "{name} must not touch disk"
         );
     }
+}
+
+/// One-pass zip (phase 2): a POSTED store zip - the shape phase 1 sent
+/// to disk. The chase takes it at depth 0 now (the tail prefetch
+/// front-loads the central directory, which is the last thing in a
+/// zip), so its payload streams out while the archive downloads and the
+/// `.zip` itself never touches disk.
+#[tokio::test(flavor = "multi_thread")]
+async fn top_level_zip_extracts_one_pass() {
+    if !have_par2() {
+        eprintln!("skipping: par2 not installed");
+        return;
+    }
+    let mut fx = Fixture::new("topzip");
+    // Incompressible, like real payload, STORED in the container - the
+    // dominant zip shape and the one the store fast path exists for.
+    let movie = incompressible(900_000, 46);
+    let arch = nzbkit::zip::fixtures::zip_of(&[nzbkit::zip::fixtures::Spec::stored(
+        "movie.mkv",
+        &movie,
+    )]);
+    fx.add_file("release.zip", &arch, 60_000);
+    assert!(fx.add_par2(10, &["release.zip"], 60_000));
+    let srv = MockServer::start(fx.articles.clone(), Chaos::default()).await;
+    let cfg = fx.write_config(&[&srv]);
+    let nzb = fx.write_nzb();
+    let out = fx.dir.join("out");
+
+    let (log, ok) = tokio::task::spawn_blocking(move || run_get(&cfg, &nzb, &out, &[]))
+        .await
+        .unwrap();
+    assert!(ok, "get failed:\n{log}");
+    assert!(log.contains("clean download"), "no clean verdict:\n{log}");
+    assert!(log.contains("extracted 1 file(s) in-stream"), "{log}");
+    // The SIZE in that summary, not just the count. Every chase (7z and
+    // zip) reported "(0.0 MB)" under a correct per-file list, because
+    // the extractor's byte counter only advances on the RAR mapping
+    // path - invisible until a live 160 MB zip printed it (31 Jul).
+    assert!(
+        !log.contains("in-stream (0.0 MB)"),
+        "the in-stream summary lost its byte count:\n{log}"
+    );
+    assert!(log.contains("zip · one-pass"), "badge still says on-disk:\n{log}");
+    assert_eq!(
+        std::fs::read(fx.dir.join("out/movie.mkv")).expect("extracted file"),
+        movie,
+        "extracted bytes differ"
+    );
+    assert!(
+        !fx.dir.join("out/release.zip").exists(),
+        "the archive must not touch disk"
+    );
+}
+
+/// A `.zip.001` byte-split set posted as three files streams as one
+/// container. Unlike 7z, no zip part carries a header that sizes the
+/// set - the cut is arbitrary and only part 1 even has a signature -
+/// so the NZB's own file list declares the part count and the geometry
+/// resolves once every part's decoded size has arrived. Nothing lands
+/// on disk.
+#[tokio::test(flavor = "multi_thread")]
+async fn top_level_zip_split_set_extracts_one_pass() {
+    if !have_par2() {
+        eprintln!("skipping: par2 not installed");
+        return;
+    }
+    let mut fx = Fixture::new("topzipsplit");
+    let movie = incompressible(2 << 20, 49);
+    let arch = nzbkit::zip::fixtures::zip_of(&[nzbkit::zip::fixtures::Spec::stored(
+        "movie.mkv",
+        &movie,
+    )]);
+    // A uniform byte split: every part the split size, last the
+    // remainder - what hjsplit and `split -b` produce.
+    let split = arch.len().div_ceil(3);
+    let parts: Vec<&[u8]> = arch.chunks(split).collect();
+    assert_eq!(parts.len(), 3, "fixture must really split");
+    let names: Vec<String> = (1..=3).map(|i| format!("release.zip.{i:03}")).collect();
+    for (i, name) in names.iter().enumerate() {
+        fx.add_file(name, parts[i], 60_000);
+    }
+    let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    assert!(fx.add_par2(5, &refs, 60_000));
+    let srv = MockServer::start(fx.articles.clone(), Chaos::default()).await;
+    let cfg = fx.write_config(&[&srv]);
+    let nzb = fx.write_nzb();
+    let out = fx.dir.join("out");
+
+    let (log, ok) = tokio::task::spawn_blocking(move || run_get(&cfg, &nzb, &out, &[]))
+        .await
+        .unwrap();
+    assert!(ok, "get failed:\n{log}");
+    assert!(log.contains("extracted 1 file(s) in-stream"), "{log}");
+    assert!(log.contains("zip · one-pass"), "the set did not stream:\n{log}");
+    assert_eq!(
+        std::fs::read(fx.dir.join("out/movie.mkv")).expect("extracted file"),
+        movie,
+        "extracted bytes differ"
+    );
+    for name in &names {
+        assert!(
+            !fx.dir.join("out").join(name).exists(),
+            "{name} must not touch disk"
+        );
+    }
+}
+
+/// The same shape, damaged - the riskiest inherited seam. A chased slot
+/// cannot take a mapped repair (its bytes are in RAM, not a file par2
+/// can patch), so the ladder must materialize the zip first, repair it
+/// on disk, and let the zip step of the disk post-pass unpack it. The
+/// silent failure this pins: a chased zip missing from the materialize
+/// sweep reads back as "file missing entirely" and the repair rebuilds
+/// nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn damaged_top_level_zip_materializes_repairs_and_unpacks() {
+    if !have_par2() {
+        eprintln!("skipping: par2 not installed");
+        return;
+    }
+    let mut fx = Fixture::new("topzipdmg");
+    let movie = incompressible(900_000, 48);
+    let arch = nzbkit::zip::fixtures::zip_of(&[nzbkit::zip::fixtures::Spec::stored(
+        "movie.mkv",
+        &movie,
+    )]);
+    fx.add_file("release.zip", &arch, 60_000);
+    assert!(fx.add_par2(30, &["release.zip"], 60_000));
+    // Two mid-archive articles vanish: enough damage to need repair,
+    // well inside the 30% redundancy.
+    let victims: Vec<String> = ["-3@mock>", "-5@mock>"]
+        .iter()
+        .map(|suffix| {
+            fx.articles
+                .keys()
+                .find(|k| k.contains("release_zip") && k.ends_with(suffix))
+                .unwrap_or_else(|| panic!("no {suffix} article: {:?}", fx.articles.len()))
+                .clone()
+        })
+        .collect();
+    let chaos = Chaos {
+        missing: victims.into_iter().collect(),
+        ..Default::default()
+    };
+    let srv = MockServer::start(fx.articles.clone(), chaos).await;
+    let cfg = fx.write_config(&[&srv]);
+    let nzb = fx.write_nzb();
+    let out = fx.dir.join("out");
+
+    let (log, ok) = tokio::task::spawn_blocking(move || run_get(&cfg, &nzb, &out, &[]))
+        .await
+        .unwrap();
+    assert!(ok, "get failed:\n{log}");
+    assert!(
+        !log.contains("file missing entirely"),
+        "par2 could not see the chased archive:\n{log}"
+    );
+    assert!(log.contains("materializing volumes for repair"), "{log}");
+    assert!(log.contains("repair complete"), "no repair:\n{log}");
+    assert_eq!(
+        std::fs::read(fx.dir.join("out/movie.mkv")).expect("payload after repair"),
+        movie,
+        "payload differs after repair + post-pass"
+    );
+}
+
+/// Phase 3 end to end: an ENCRYPTED zip (WinZip AE-256) posted with its
+/// password riding the `Name{{pw}}.nzb` convention. The chase now
+/// decrypts IN STREAM, so the container never touches disk - it used to
+/// decline encrypted, materialize, and let the disk post-pass unpack it
+/// (and before that, fail the job outright with "the payload is a zip
+/// that could not be unpacked").
+#[tokio::test(flavor = "multi_thread")]
+async fn encrypted_zip_completes_with_a_braces_password() {
+    if !have_par2() {
+        eprintln!("skipping: par2 not installed");
+        return;
+    }
+    let mut fx = Fixture::new("topzipenc");
+    let movie = incompressible(400_000, 50);
+    let arch = nzbkit::zip::fixtures::zip_of(&[nzbkit::zip::fixtures::Spec {
+        encrypt: Some(nzbkit::zip::fixtures::Encrypt::Ae {
+            password: "s3cretpw",
+            strength: 3,
+            vendor_version: 2,
+        }),
+        ..nzbkit::zip::fixtures::Spec::stored("movie.mkv", &movie)
+    }]);
+    fx.add_file("release.zip", &arch, 60_000);
+    assert!(fx.add_par2(10, &["release.zip"], 60_000));
+    let srv = MockServer::start(fx.articles.clone(), Chaos::default()).await;
+    let cfg = fx.write_config(&[&srv]);
+    let nzb = fx.write_nzb();
+    let locked = fx.dir.join("release{{s3cretpw}}.nzb");
+    std::fs::rename(&nzb, &locked).unwrap();
+    let out = fx.dir.join("out");
+
+    let (log, ok) = tokio::task::spawn_blocking(move || run_get(&cfg, &locked, &out, &[]))
+        .await
+        .unwrap();
+    assert!(ok, "get failed:\n{log}");
+    assert_eq!(
+        std::fs::read(fx.dir.join("out/movie.mkv")).expect("decrypted payload"),
+        movie,
+        "decrypted bytes differ"
+    );
+    // The whole point: no container on disk at any moment, and the disk
+    // post-pass never needed. Its absence from the log is what says the
+    // chase did the work rather than declining to it.
+    assert!(
+        !fx.dir.join("out/release.zip").exists(),
+        "the container must never touch disk"
+    );
+    assert!(
+        !log.contains("zip unpack complete"),
+        "the disk pass ran - the chase declined instead of decrypting:\n{log}"
+    );
+}
+
+/// Demote parity: a zip the one-pass path DECLINES (here: an lzma
+/// entry, a method the tree does not carry) must land exactly where it
+/// lands today - container materialized byte-exact in the output
+/// directory, disk post-pass attempted and failing with the same
+/// method-naming message, job failed because the zip IS the payload.
+/// Run twice, gate on and gate off (`NZBFAST_NO_TOP_ZIP=1` = the
+/// phase-1 path verbatim), asserting the SAME end state; the demote
+/// marker in the log is what proves the gate-on run actually attached
+/// and declined rather than never chasing at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn declined_zip_lands_exactly_like_the_gate_off_path() {
+    if !have_par2() {
+        eprintln!("skipping: par2 not installed");
+        return;
+    }
+    for (t, env) in [
+        ("on", &[][..]),
+        ("off", &[("NZBFAST_NO_TOP_ZIP", "1")][..]),
+    ] {
+        let mut fx = Fixture::new(&format!("topzipdecline-{t}"));
+        let movie = incompressible(300_000, 47);
+        let arch = nzbkit::zip::fixtures::zip_of(&[nzbkit::zip::fixtures::Spec {
+            method: 14, // lzma: declined BY NAME, in-stream and on disk
+            ..nzbkit::zip::fixtures::Spec::stored("movie.mkv", &movie)
+        }]);
+        fx.add_file("release.zip", &arch, 60_000);
+        assert!(fx.add_par2(10, &["release.zip"], 60_000));
+        let srv = MockServer::start(fx.articles.clone(), Chaos::default()).await;
+        let cfg = fx.write_config(&[&srv]);
+        let nzb = fx.write_nzb();
+        let out = fx.dir.join("out");
+        let env: Vec<(&str, &str)> = env.to_vec();
+
+        let (log, ok) =
+            tokio::task::spawn_blocking(move || run_get(&cfg, &nzb, &out, &env))
+                .await
+                .unwrap();
+        assert!(!ok, "gate {t}: a packed payload must fail the job:\n{log}");
+        assert!(
+            log.contains("uses lzma compression"),
+            "gate {t}: the declined method must be named:\n{log}"
+        );
+        assert_eq!(
+            std::fs::read(fx.dir.join("out/release.zip")).expect("materialized container"),
+            arch,
+            "gate {t}: the container must land byte-exact"
+        );
+        assert!(
+            !fx.dir.join("out/movie.mkv").exists(),
+            "gate {t}: no payload may appear from a declined method"
+        );
+        // The runs differ in exactly one observable: with the gate on,
+        // the chase attached and DEMOTED under the zip marker; with it
+        // off, nothing ever chased.
+        let marked = log.contains("zip materialized for the disk pass");
+        assert_eq!(
+            marked,
+            t == "on",
+            "gate {t}: demote marker presence is the gate's own signature:\n{log}"
+        );
+    }
+}
+
+/// Increment A (one-pass encrypted plan, 2026-07-31): an encrypted RAR5
+/// store set whose password rides a TEXT SIDECAR in the same NZB - the
+/// wild shape for passworded posts - must complete on the native
+/// one-pass path with NO password supplied anywhere: the blocked set
+/// parks, the in-stream probe harvests the sidecar, and the verified
+/// candidate re-keys the mapper with every byte still in RAM. Unrar
+/// forbidden by canary; volumes must never touch disk.
+#[tokio::test(flavor = "multi_thread")]
+async fn encrypted_store_sidecar_password_probes_one_pass() {
+    if !have_par2() {
+        eprintln!("skipping: par2 not installed");
+        return;
+    }
+    let mut fx = Fixture::new("encprobe");
+    let inner = payload(900_001, 29);
+    let f = fixtures::encrypt_file("pr0be-pw!", &inner, 7);
+    let n = f.cipher.len();
+    let (a, b) = (350_003, 700_006);
+    let vols = [
+        fixtures::rar5_volume_enc(&[("movie.mkv", &f, 0..a, false, true)], Some(0)),
+        fixtures::rar5_volume_enc(&[("movie.mkv", &f, a..b, true, true)], Some(1)),
+        fixtures::rar5_volume_enc(&[("movie.mkv", &f, b..n, true, false)], Some(2)),
+    ];
+    let names = ["p.part1.rar", "p.part2.rar", "p.part3.rar"];
+    for (name, vol) in names.iter().zip(&vols) {
+        fx.add_file(name, vol, 60_000);
+    }
+    // The password note, poster-style: prose noise around a labeled line.
+    fx.add_file(
+        "readme.txt",
+        b"greetz to all\npassword: pr0be-pw!\nenjoy the show\n",
+        60_000,
+    );
+    assert!(fx.add_par2(20, &names, 60_000), "par2 create failed");
+    let srv = MockServer::start(fx.articles.clone(), Chaos::default()).await;
+    let cfg = fx.write_config(&[&srv]);
+    let nzb = fx.write_nzb();
+    let out = fx.dir.join("out");
+
+    let (log, ok) = tokio::task::spawn_blocking(move || {
+        run_get(&cfg, &nzb, &out, &[("NZBFAST_TEST_FORBID_UNRAR", "1")])
+    })
+    .await
+    .unwrap();
+    assert!(ok, "get failed (unrar canary tripped?):\n{log}");
+    assert!(log.contains("in-stream probe"), "probe never hit:\n{log}");
+    assert!(log.contains("decrypted"), "no native decrypt notice:\n{log}");
+    assert!(!log.contains("unpacking archive"), "set demoted to disk:\n{log}");
+    let extracted = std::fs::read(fx.dir.join("out/movie.mkv")).expect("extracted file");
+    assert_eq!(extracted.len(), inner.len(), "padding must be truncated");
+    assert!(extracted == inner, "decrypted bytes differ");
+    for v in &names {
+        assert!(
+            !fx.dir.join("out").join(v).exists(),
+            "volume {v} must not touch disk"
+        );
+    }
+}
+
+/// Same probe, `-hp` shape: headers encrypted too, so NOTHING parses
+/// until the probe finds the password - the type-4 crypt block's check
+/// is captured password-less and the sidecar candidate re-keys from the
+/// retained bytes. One pass, no volumes on disk.
+#[tokio::test(flavor = "multi_thread")]
+async fn encrypted_headers_sidecar_password_probes_one_pass() {
+    if !have_par2() {
+        eprintln!("skipping: par2 not installed");
+        return;
+    }
+    let mut fx = Fixture::new("enchpprobe");
+    let inner = payload(600_001, 31);
+    let f = fixtures::encrypt_file("hp-pr0be", &inner, 9);
+    let n = f.cipher.len();
+    let vols = [
+        fixtures::rar5_volume_enc_headers(
+            &[("movie.mkv", &f, 0..n / 2, false, true)],
+            Some(0),
+            "hp-pr0be",
+            11,
+        ),
+        fixtures::rar5_volume_enc_headers(
+            &[("movie.mkv", &f, n / 2..n, true, false)],
+            Some(1),
+            "hp-pr0be",
+            12,
+        ),
+    ];
+    let names = ["h.part1.rar", "h.part2.rar"];
+    for (name, vol) in names.iter().zip(&vols) {
+        fx.add_file(name, vol, 60_000);
+    }
+    fx.add_file("release.nfo", b"pass = hp-pr0be\n", 60_000);
+    assert!(fx.add_par2(20, &names, 60_000), "par2 create failed");
+    let srv = MockServer::start(fx.articles.clone(), Chaos::default()).await;
+    let cfg = fx.write_config(&[&srv]);
+    let nzb = fx.write_nzb();
+    let out = fx.dir.join("out");
+
+    let (log, ok) = tokio::task::spawn_blocking(move || {
+        run_get(&cfg, &nzb, &out, &[("NZBFAST_TEST_FORBID_UNRAR", "1")])
+    })
+    .await
+    .unwrap();
+    assert!(ok, "get failed (unrar canary tripped?):\n{log}");
+    assert!(log.contains("in-stream probe"), "probe never hit:\n{log}");
+    let extracted = std::fs::read(fx.dir.join("out/movie.mkv")).expect("extracted file");
+    assert!(extracted == inner, "decrypted bytes differ");
+    for v in &names {
+        assert!(
+            !fx.dir.join("out").join(v).exists(),
+            "volume {v} must not touch disk"
+        );
+    }
+}
+
+/// Probe MISS: an encrypted set whose sidecar holds only junk lands
+/// like any locked set without a password - the job completes with
+/// verified volumes on disk and the password prompt, no garbage
+/// output, no unrar (canary).
+#[tokio::test(flavor = "multi_thread")]
+async fn encrypted_store_probe_miss_demotes_like_before() {
+    if !have_par2() {
+        eprintln!("skipping: par2 not installed");
+        return;
+    }
+    let mut fx = Fixture::new("encprobemiss");
+    let inner = payload(400_000, 33);
+    let f = fixtures::encrypt_file("never-posted", &inner, 13);
+    let n = f.cipher.len();
+    let vols = [
+        fixtures::rar5_volume_enc(&[("movie.mkv", &f, 0..n / 2, false, true)], Some(0)),
+        fixtures::rar5_volume_enc(&[("movie.mkv", &f, n / 2..n, true, false)], Some(1)),
+    ];
+    let names = ["m.part1.rar", "m.part2.rar"];
+    for (name, vol) in names.iter().zip(&vols) {
+        fx.add_file(name, vol, 60_000);
+    }
+    fx.add_file("notes.txt", b"just a greeting\nno secrets here\n", 60_000);
+    assert!(fx.add_par2(20, &names, 60_000), "par2 create failed");
+    let srv = MockServer::start(fx.articles.clone(), Chaos::default()).await;
+    let cfg = fx.write_config(&[&srv]);
+    let nzb = fx.write_nzb();
+    let out = fx.dir.join("out");
+
+    let (log, ok) = tokio::task::spawn_blocking(move || {
+        run_get(&cfg, &nzb, &out, &[("NZBFAST_TEST_FORBID_UNRAR", "1")])
+    })
+    .await
+    .unwrap();
+    // A probe miss lands where every locked set lands: verified volumes
+    // kept, 🔒 prompt, job complete. (This used to pin the OLD behavior -
+    // NotStore's "compressed or encrypted entries" reason steered the
+    // finish ladder into the unpack-or-fail arm and the job FAILED; the
+    // MapBlocker::EncryptedNoPassword demote reason now routes a `-p`
+    // no-password set to the same prompt arm `-hp` sets always reached.)
+    assert!(ok, "a locked set with no password must complete, not fail:\n{log}");
+    assert!(
+        log.contains("password-protected and no password was found"),
+        "missing the 🔒 prompt:\n{log}"
+    );
+    assert!(
+        !log.contains("could not be unpacked"),
+        "the pre-fix unrar-arm failure is back:\n{log}"
+    );
+    assert!(!fx.dir.join("out/movie.mkv").exists(), "garbage output:\n{log}");
+    for (name, vol) in names.iter().zip(&vols) {
+        assert_eq!(
+            &std::fs::read(fx.dir.join("out").join(name)).expect("volume on disk"),
+            vol,
+            "verified volume {name} must stay byte-exact for the unlock"
+        );
+    }
+}
+
+/// Public issue #9: a fully obfuscated post whose recovery set we could
+/// not see, so a repairable download failed while SABnzbd repaired it.
+///
+/// Nothing here carries a `.par2`: not an NZB subject, not a yEnc name,
+/// not a filename on disk. That makes every file arrive classified as
+/// payload, `bootstrap_vol` (which only considers files already
+/// recognised as recovery volumes) never fires, and the whole in-stream
+/// repair ladder is unreachable - the run lands in the no-set arm with
+/// zero-filled holes where the missing articles were.
+///
+/// The bytes are all on disk by then, recovery volumes included, so that
+/// arm now asks the DIRECTORY rather than the NZB. This pins the
+/// end-to-end outcome: real damage, real recovery, repaired output.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_obfuscated_post_repairs_from_its_own_unnamed_par2() {
+    if !have_par2() {
+        eprintln!("skipping: par2 not installed");
+        return;
+    }
+    let mut fx = Fixture::new("obfpar2");
+    let data = payload(1_200_000, 33);
+    // Payload obfuscated too - hash subject AND hash yEnc name - so the
+    // repair has to adopt it by content hash, not by its name.
+    fx.add_file_obfuscated("Lp3vWq8xNc2", "Lp3vWq8xNc2", &data, 40_000);
+    assert!(fx.add_par2_obfuscated(30, &["Lp3vWq8xNc2"], 40_000));
+    assert!(
+        !fx.nzb_files.iter().any(|(n, _)| n.contains(".par2")),
+        "the test is void if any subject says par2"
+    );
+
+    // Drop three payload articles: real holes, well inside 30% recovery.
+    let mut victims: Vec<String> = fx
+        .articles
+        .keys()
+        .filter(|k| k.contains("Lp3vWq8xNc2"))
+        .cloned()
+        .collect();
+    victims.sort();
+    victims.truncate(3);
+    assert_eq!(victims.len(), 3, "expected payload articles to drop");
+    let chaos = Chaos {
+        missing: victims.into_iter().collect(),
+        ..Default::default()
+    };
+
+    let srv = MockServer::start(fx.articles.clone(), chaos).await;
+    let cfg = fx.write_config(&[&srv]);
+    let nzb = fx.write_nzb();
+    let out = fx.dir.join("out");
+    let (log, ok) = tokio::task::spawn_blocking({
+        let (cfg, nzb, out) = (cfg.clone(), nzb.clone(), out.clone());
+        move || run_get(&cfg, &nzb, &out, &[])
+    })
+    .await
+    .unwrap();
+
+    assert!(ok, "get failed on a repairable obfuscated post:\n{log}");
+    assert!(
+        log.contains("the downloaded files include one"),
+        "the disk-side fallback never ran:\n{log}"
+    );
+    // The payload is back, byte-exact, under the name PAR2 knows it by.
+    let repaired = std::fs::read(out.join("Lp3vWq8xNc2"))
+        .unwrap_or_else(|e| panic!("payload missing from {}: {e}\n{log}", out.display()));
+    assert_eq!(repaired.len(), data.len(), "wrong length after repair\n{log}");
+    assert!(repaired == data, "payload not byte-exact after repair\n{log}");
 }

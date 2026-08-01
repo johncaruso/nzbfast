@@ -171,7 +171,23 @@ pub fn import(ini_path: &Path, out_path: &Path, force: bool) -> Result<()> {
             out_path.display()
         );
     }
-    let cfg = serde_json::to_string_pretty(&json!({ "servers": json_servers }))?;
+    // Replace `servers` in place rather than the whole document. --force used
+    // to mean "write a file containing nothing but servers", which was
+    // survivable while the default target was a cwd-relative
+    // config.local.json that usually did not exist. It is not survivable now
+    // that the default follows $NZBFAST_CONFIG onto the config the daemon is
+    // actually serving from: re-running an import to pick up a new provider
+    // would silently drop tmdb_key and any hand-added key alongside it.
+    // Unparseable JSON is left to the wholesale write - there is nothing in
+    // it we could preserve, and refusing would strand the user on a file they
+    // asked us to overwrite.
+    let mut doc = std::fs::read_to_string(out_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| json!({}));
+    doc["servers"] = json!(json_servers);
+    let cfg = serde_json::to_string_pretty(&doc)?;
     // 0600 via write_atomic, not fs::write's 0644: `cfg` holds every imported
     // provider's cleartext password, and on a shared box or a bind-mounted
     // /config every local user could read it. Same rule persist.rs already
@@ -204,7 +220,12 @@ pub fn import(ini_path: &Path, out_path: &Path, force: bool) -> Result<()> {
     if skipped > 0 {
         println!("  ({skipped} disabled/empty server(s) skipped)");
     }
-    println!("wrote {} - verify with: nzbfast probe", out_path.display());
+    // Absolute, because the relative form is what made this land in the wrong
+    // place unnoticed: "wrote config.local.json" from a /config cwd reads
+    // exactly like success even when the daemon is serving another file.
+    let shown = std::fs::canonicalize(out_path).unwrap_or_else(|_| out_path.to_path_buf());
+    println!("wrote {} - verify with: nzbfast probe", shown.display());
+    println!("  a running nzbfast keeps its old servers until you restart it");
     Ok(())
 }
 
@@ -369,6 +390,45 @@ enable = 1
         // Refuses to clobber without --force.
         assert!(import(&ini, &out, false).is_err());
         assert!(import(&ini, &out, true).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #8, second half: with the default target now following
+    /// $NZBFAST_CONFIG onto the daemon's own config, a re-import must
+    /// replace `servers` without taking the rest of the document with it.
+    #[test]
+    fn reimport_preserves_other_config_keys() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-impsab-merge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ini = dir.join("sabnzbd.ini");
+        std::fs::write(&ini, INI).unwrap();
+        let out = dir.join("config.json");
+        std::fs::write(
+            &out,
+            r#"{"servers":[{"host":"stale.example","port":119}],"tmdb_key":"keepme"}"#,
+        )
+        .unwrap();
+
+        import(&ini, &out, true).unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+        assert_eq!(raw["tmdb_key"], "keepme", "--force must not drop sibling keys");
+        let arr = raw["servers"].as_array().unwrap();
+        assert_eq!(arr.len(), 2, "servers are replaced, not appended to");
+        assert!(
+            !arr.iter().any(|s| s["host"] == "stale.example"),
+            "the previous server list must not survive the import"
+        );
+
+        // A file that is not JSON at all still gets overwritten rather than
+        // erroring - there is nothing in it to preserve.
+        std::fs::write(&out, "not json").unwrap();
+        import(&ini, &out, true).unwrap();
+        assert_eq!(
+            nzbkit::config::Config::load(&out).unwrap().servers.len(),
+            2
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -2127,6 +2127,9 @@ mod quit_tests {
             socks5: None,
             enabled: true,
             warm_pool: false,
+            idle_release_secs: None,
+            idle_keep: None,
+            max_source_ips: None,
         };
         let r = Connection::connect(&server).await;
         assert!(r.is_err(), "connect to a mute server must error, got Ok");
@@ -2414,6 +2417,9 @@ mod quit_tests {
             socks5: Some(format!("127.0.0.1:{}", paddr.port())),
             enabled: true,
             warm_pool: false,
+            idle_release_secs: None,
+            idle_keep: None,
+            max_source_ips: None,
         };
         let (_conn, greeting) =
             Connection::connect(&server).await.expect("connect through proxy");
@@ -2491,6 +2497,9 @@ mod compress_tests {
             socks5: None,
             enabled: true,
             warm_pool: false,
+            idle_release_secs: None,
+            idle_keep: None,
+            max_source_ips: None,
         }
     }
 

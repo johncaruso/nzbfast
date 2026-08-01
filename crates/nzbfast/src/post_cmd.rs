@@ -417,7 +417,7 @@ async fn verify(
                     Err(e) => problems.push(format!("{id}: decode: {e}")),
                 }
             }
-            FetchOutcome::Missing { id } => problems.push(format!("{id}: missing (430)")),
+            FetchOutcome::Missing { id, .. } => problems.push(format!("{id}: missing (430)")),
             FetchOutcome::Failed { id, error } => problems.push(format!("{id}: {error}")),
         }
     }
@@ -479,6 +479,9 @@ mod tests {
             socks5: None,
             enabled,
             warm_pool: false,
+            idle_release_secs: None,
+            idle_keep: None,
+            max_source_ips: None,
         }
     }
 

@@ -353,6 +353,45 @@ async fn sonarr_style_cycle() {
         // Version probe (Sonarr's connection test).
         let r = http(port, "/api?mode=version&apikey=sekrit&output=json", None);
         assert!(r.contains("version"), "{r}");
+        // SAB-compat: browser addons (NZBDonkey, NZB Unity) send mode and
+        // apikey as POST form fields with an EMPTY query string. Both form
+        // encodings must authenticate - these used to log "[auth] rejected
+        // key for api" because only the query string was parsed.
+        let r = http(
+            port,
+            "/api",
+            Some((
+                "application/x-www-form-urlencoded",
+                b"mode=version&apikey=sekrit&output=json".as_slice(),
+            )),
+        );
+        assert!(r.contains("version"), "urlencoded form auth failed: {r}");
+        let fb = "----fieldsboundary";
+        let mut fbody = Vec::new();
+        for (n, v) in [("mode", "queue"), ("apikey", "sekrit"), ("output", "json")] {
+            fbody.extend_from_slice(
+                format!(
+                    "--{fb}\r\nContent-Disposition: form-data; name=\"{n}\"\r\n\r\n{v}\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+        fbody.extend_from_slice(format!("--{fb}--\r\n").as_bytes());
+        let fctype = format!("multipart/form-data; boundary={fb}");
+        let r = http(port, "/api", Some((&fctype, &fbody)));
+        assert!(!r.contains("API Key"), "multipart form auth failed: {r}");
+        assert!(r.contains("queue"), "multipart form mode ignored: {r}");
+        // The query still wins on conflict: a wrong key in the body must
+        // not override a valid one in the query.
+        let r = http(
+            port,
+            "/api?mode=version&apikey=sekrit&output=json",
+            Some((
+                "application/x-www-form-urlencoded",
+                b"apikey=wrong".as_slice(),
+            )),
+        );
+        assert!(r.contains("version"), "query key must win: {r}");
         let r = http(port, "/api?mode=get_config&apikey=sekrit&output=json", None);
         assert!(r.contains("complete_dir"), "{r}");
 
@@ -2364,6 +2403,85 @@ async fn apikey_reveal_and_rotate_need_the_api_key() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The other half of a rotation: the write that FAILS. On a full disk or a
+/// read-only settings folder the daemon is already on the new key (nothing
+/// can put the old one back) but settings.json still holds the old one, so
+/// the key dies at the next restart. The answer is `status: true` with the
+/// key AND `saved: false` - the dashboard needs the key to keep talking to
+/// this daemon, and the durability flag to say so on screen rather than in
+/// a stdout line nobody reads on a NAS.
+///
+/// Pins the producer side of the contract the dashboard now consumes. Root
+/// ignores the permission bits, so it can only run unprivileged.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rotation_that_cannot_be_persisted_says_so() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root writes into a read-only directory anyway");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("nzbfast-keyro-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!("{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}", free_port()),
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("fullkey")
+            .arg("--out")
+            .arg(dir.join("complete"));
+        c
+    })
+    .await;
+    let port = d.port;
+
+    let dir2 = dir.clone();
+    let (rot, ver, before, after) = tokio::task::spawn_blocking(move || {
+        // Everything the daemon still needs lives in .spool, whose own bits
+        // are untouched; only NEW files beside the config become impossible,
+        // which is exactly settings.json's atomic temp file.
+        let before = std::fs::read_to_string(dir2.join("settings.json")).unwrap_or_default();
+        std::fs::set_permissions(&dir2, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let rot = http(port, "/api?mode=apikey_new&apikey=fullkey&output=json", None);
+        let new = rot
+            .split("\"apikey\":\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .unwrap_or_default()
+            .to_string();
+        let ver = http(port, &format!("/api?mode=version&apikey={new}&output=json"), None);
+        let after = std::fs::read_to_string(dir2.join("settings.json")).unwrap_or_default();
+        // Restore before asserting, or the dir cannot be cleaned up.
+        let _ = std::fs::set_permissions(&dir2, std::fs::Permissions::from_mode(0o755));
+        (rot, ver, before, after)
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(rot.contains("\"status\":true"), "a live rotation reported failure: {rot}");
+    assert!(
+        rot.contains("\"saved\":false"),
+        "the un-persisted rotation claimed to be durable: {rot}"
+    );
+    assert!(ver.contains("\"nzbfast\""), "the daemon is not on the key it handed out: {ver}");
+    assert_eq!(before, after, "settings.json changed under a read-only directory");
+}
+
 /// Security regression: the add-only `nzbkey` must not gain full control
 /// through the NZBGet `/jsonrpc` facade. `append`/`version`/`status` are
 /// allowed for it; queue/rate/config mutation (editqueue GroupFinalDelete,
@@ -3501,6 +3619,212 @@ async fn idle_servers_prefetch_next_job() {
         std::fs::read(dir.join("complete/slowa/slowa.bin")).unwrap(),
         payload(3_000_000, 21),
         "slow job payload differs"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Connection borrowing when the ONLY idle server is dead: one healthy
+/// server carries job A while the second rejects authentication. The
+/// dead server moves no bytes, so by the byte test it looks idle - but a
+/// sidecar built on it alone prefetches nothing (seen live in a
+/// queue soak, 31 Jul, where this cost 34% line-idle), and simply
+/// skipping the spawn loses the tail-overlap entirely (49 s line-idle of
+/// a 144 s queue in that state). The monitor must instead borrow a
+/// BOUNDED slice of the healthy busy server - here 2 of the account's
+/// 8-connection headroom next to the active job's 4 - never the dead
+/// one, and B completes on that slice while A still downloads at its
+/// own full fleet.
+#[tokio::test(flavor = "multi_thread")]
+async fn prefetch_borrows_from_the_busy_server_when_no_healthy_idle() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-prefdead-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Healthy server: A's AND B's articles, 250 ms each so A's run is
+    // wide enough for the monitor's warmup+window to elapse. Dead
+    // server: no articles, rejects every AUTHINFO.
+    let mut articles = HashMap::new();
+    let a_segs =
+        make_file_articles("slowa.bin", &payload(4_000_000, 71), 20_000, "da", &mut articles);
+    let b_segs =
+        make_file_articles("afterb.bin", &payload(400_000, 73), 40_000, "db", &mut articles);
+    let good_srv =
+        MockServer::start(articles, Chaos { delay_ms: 250, ..Chaos::default() }).await;
+    let dead_srv =
+        MockServer::start(HashMap::new(), Chaos { auth_rejected: true, ..Chaos::default() })
+            .await;
+
+    let nzb_for = |name: &str, segs: &[(String, u64, u32)]| {
+        let mut xml = String::from(
+            "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n",
+        );
+        xml.push_str(&format!(
+            "  <file poster=\"x\" date=\"0\" subject=\"&quot;{name}&quot; yEnc (1/{})\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+            segs.len()
+        ));
+        for (id, bytes, num) in segs {
+            xml.push_str(&format!(
+                "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+            ));
+        }
+        xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+        xml
+    };
+
+    let cfg = dir.join("config.json");
+    // Credentials on the dead server so the client actually sends the
+    // AUTHINFO the mock refuses; distinct host strings as elsewhere.
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}},{{\"host\":\"localhost\",\"port\":{},\"tls\":false,\"username\":\"u\",\"password\":\"wrong\"}}]}}",
+            good_srv.addr.port(),
+            dead_srv.addr.port()
+        ),
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .env("NZBFAST_DEFER_WARMUP_SECS", "2")
+            .env("NZBFAST_DEFER_WINDOW_SECS", "3")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--connections")
+            .arg("4");
+        c
+    })
+    .await;
+    let port = d.port;
+    let log_path = d.log.clone();
+
+    let (a_xml, b_xml) = (nzb_for("slowa.bin", &a_segs), nzb_for("afterb.bin", &b_segs));
+    let b_id = tokio::task::spawn_blocking(move || {
+        let upload = |xml: &str, fname: &str| -> String {
+            let boundary = "----prefd";
+            let mut body = Vec::new();
+            body.extend_from_slice(
+                format!("--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"{fname}\"\r\n\r\n").as_bytes(),
+            );
+            body.extend_from_slice(xml.as_bytes());
+            body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+            let r = http(
+                port,
+                "/api?mode=addfile&apikey=sekrit&output=json",
+                Some((&format!("multipart/form-data; boundary={boundary}"), &body)),
+            );
+            assert!(r.contains("\"status\":true"), "{r}");
+            r.split("SABnzbd_nzo_").nth(1).unwrap().split('"').next()
+                .map(|s| format!("SABnzbd_nzo_{s}")).unwrap()
+        };
+        let poll = |pred: &dyn Fn(&str, &str) -> bool, what: &str| -> (String, String) {
+            for _ in 0..300 {
+                let q = http(port, "/api?mode=queue&apikey=sekrit&output=json", None);
+                let h = http(port, "/api?mode=history&apikey=sekrit&output=json", None);
+                if pred(&q, &h) {
+                    return (q, h);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            panic!("timed out waiting for {what}");
+        };
+
+        // A starts (only job); B queues behind it.
+        let a_id = upload(&a_xml, "slowa.nzb");
+        poll(&|q, _| q.contains(&a_id) && q.contains("Downloading"), "job A start");
+        let b_id = upload(&b_xml, "afterb.nzb");
+
+        // The monitor notes the dead idle server and borrows from the
+        // busy one instead - the log carries both decisions.
+        for i in 0..300 {
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            if log.contains("borrowing from the busy server(s) instead") {
+                break;
+            }
+            assert!(i < 299, "the monitor never noted the refused idle server:\n{log}");
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let borrow_line = log
+            .lines()
+            .find(|l| l.contains("borrowing connection(s) from busy server(s)"))
+            .unwrap_or_else(|| panic!("no borrow spawn in the log:\n{log}"))
+            .to_string();
+        // The slice is bounded (2 = headroom cap, not the fleet's 4) and
+        // built ONLY on the healthy busy host - never the refused one.
+        assert!(borrow_line.contains("127.0.0.1 x2"), "wrong borrow slice: {borrow_line}");
+        assert!(!borrow_line.contains("localhost"), "borrowed the dead server: {borrow_line}");
+
+        // B completes on the borrowed slice WHILE A still downloads.
+        let (q, _) = poll(
+            &|_, h| h.contains(&b_id) && h.contains("Completed"),
+            "B completion via borrowed sidecar",
+        );
+        assert!(
+            q.contains(&a_id) && q.contains("Downloading"),
+            "A should still be downloading when B lands: {q}"
+        );
+
+        // A still completes normally at its own pace: the borrow must
+        // not have cost A its fleet. 200 articles at 250 ms over 4
+        // connections is ~12.5 s connection-bound; a sidecar that stole
+        // half the fleet would push A toward 25 s. Generous margin for
+        // connect overhead and a loaded CI box, but well under starved.
+        let (_, h) = poll(
+            &|_, h| h.contains(&a_id) && h.matches("Completed").count() >= 2,
+            "A completion",
+        );
+        // Keys serialize alphabetically, so a slot's elapsed_secs sits
+        // BEFORE its nzo_id: the last one preceding A's id is A's.
+        let a_elapsed: f64 = h
+            .split(&a_id)
+            .next()
+            .and_then(|s| s.rsplit("\"elapsed_secs\":").next())
+            .and_then(|s| s.trim().split(',').next())
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no elapsed_secs for A in history: {h}"));
+        assert!(
+            a_elapsed < 19.0,
+            "active job slowed to {a_elapsed:.1}s (ideal ~12.5s) - the borrow starved it"
+        );
+        b_id
+    })
+    .await
+    .unwrap();
+
+    let log = std::fs::read_to_string(&d.log).unwrap_or_default();
+    assert!(
+        log.contains(&format!("[prefetch] {b_id} completed entirely on borrowed connections")),
+        "B was not finished by the borrowed sidecar:\n{log}"
+    );
+    // The budget never double-counted: the healthy server saw the active
+    // job's 4 connections plus at most the 2 borrowed ones - a sidecar
+    // that built a FULL second fleet (or a primary re-run of B) would
+    // push this to 8+.
+    let conns = good_srv.accepted.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        (4..=7).contains(&conns),
+        "healthy server saw {conns} connections, want the 4-conn fleet + ≤2 borrowed + slack"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("complete/afterb/afterb.bin")).unwrap(),
+        payload(400_000, 73),
+        "B payload differs"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("complete/slowa/slowa.bin")).unwrap(),
+        payload(4_000_000, 71),
+        "A payload differs"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -5881,6 +6205,860 @@ async fn bootstrap_hatch_cannot_write_a_setting_other_than_the_apikey() {
             "{\"name\":\"apikey\",\"value\":\"thefullkey123\"}",
         );
         assert!(ok.contains("\"status\":true"), "the legitimate bootstrap broke: {ok}");
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// C1 (one-pass encrypted plan, 2026-07-31): a password attached via
+/// mode=set_password WHILE the job is still downloading reaches the live
+/// run through the hub's late-password cell and unlocks the set in that
+/// same run - Completed, unlocked, no password_required parking, no
+/// manual retry. Since the probe-window extension (C2 step 1) the unlock
+/// normally happens IN-STREAM while the set is still parked; this test
+/// pins only the run-level contract, whichever route wins - the one-pass
+/// route itself is pinned by set_password_mid_download_goes_one_pass
+/// below. Before C1 the download task's start-time copy of j.password
+/// was stale forever, so the very password the user had already typed
+/// sat unread until the job failed.
+#[tokio::test(flavor = "multi_thread")]
+async fn set_password_mid_download_unlocks_in_same_run() {
+    use nzbkit::rar::fixtures;
+    let dir = std::env::temp_dir().join(format!("nzbfast-latepw-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Encrypted RAR5 STORE set, no password known at enqueue: every slot's
+    // mapper blocks (encrypted entry, no password) and the volumes demote
+    // to disk - the exact shape the redditor hit.
+    let inner = payload(24_000_003, 8);
+    let f = fixtures::encrypt_file("l4tepw", &inner, 5);
+    let n = f.cipher.len();
+    let (a, b) = (8_000_016, 16_000_000); // 16-aligned mid splits
+    let vols = [
+        fixtures::rar5_volume_enc(&[("movie.mkv", &f, 0..a, false, true)], Some(0)),
+        fixtures::rar5_volume_enc(&[("movie.mkv", &f, a..b, true, true)], Some(1)),
+        fixtures::rar5_volume_enc(&[("movie.mkv", &f, b..n, true, false)], Some(2)),
+    ];
+    let mut articles = HashMap::new();
+    let mut xml = String::from(
+        "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n",
+    );
+    for (i, vol) in vols.iter().enumerate() {
+        let name = format!("lp.part{}.rar", i + 1);
+        let segs = make_file_articles(&name, vol, 300_000, &format!("lp{i}"), &mut articles);
+        xml.push_str(&format!(
+            "  <file poster=\"x\" date=\"0\" subject=\"&quot;{name}&quot; yEnc (1/{})\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+            segs.len()
+        ));
+        for (id, bytes, num) in &segs {
+            xml.push_str(&format!(
+                "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+            ));
+        }
+        xml.push_str("    </segments>\n  </file>\n");
+    }
+    xml.push_str("</nzb>\n");
+    let srv = MockServer::start(articles, Chaos::default()).await;
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--connections")
+            .arg("2")
+            // ~8 s download window so set_password lands mid-download.
+            .env("NZBFAST_THROTTLE_WRITE_MBPS", "3");
+        c
+    })
+    .await;
+    let port = d.port;
+
+    let inner2 = inner.clone();
+    let dir2 = dir.clone();
+    tokio::task::spawn_blocking(move || {
+        // Plain filename: NO {{password}} convention, no NZB meta.
+        let boundary = "----latepwb";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"movie.nzb\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(xml.as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let r = http(
+            port,
+            "/api?mode=addfile&apikey=sekrit&output=json",
+            Some((&format!("multipart/form-data; boundary={boundary}"), &body)),
+        );
+        assert!(r.contains("\"status\":true"), "{r}");
+        let id = r
+            .split("SABnzbd_nzo_")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .map(|s| format!("SABnzbd_nzo_{s}"))
+            .unwrap();
+
+        // Wait for the download to actually start...
+        let mut started = false;
+        for _ in 0..150 {
+            let q = http(port, "/api?mode=queue&apikey=sekrit&output=json", None);
+            if q.contains(&id) && q.contains("Downloading") {
+                started = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(started, "job never reached Downloading");
+        // ...then attach the password mid-flight.
+        let r = http(
+            port,
+            &format!("/api?mode=set_password&value={id}&password=l4tepw&apikey=sekrit&output=json"),
+            None,
+        );
+        assert!(r.contains("\"status\":true"), "{r}");
+
+        // The job must complete UNLOCKED in this same run.
+        let mut slot = serde_json::Value::Null;
+        for _ in 0..300 {
+            let h = http(port, "/api?mode=history&apikey=sekrit&output=json", None);
+            if let Some(s) = serde_json::from_str::<serde_json::Value>(&h)
+                .ok()
+                .and_then(|v| v["history"]["slots"].as_array().cloned())
+                .and_then(|slots| slots.iter().find(|s| s["nzo_id"] == id.as_str()).cloned())
+            {
+                if s["status"] == "Completed" || s["status"] == "Failed" {
+                    slot = s;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        assert_eq!(slot["status"], "Completed", "{slot}");
+        assert_eq!(
+            slot["password_required"], false,
+            "late password must unlock in the same run: {slot}"
+        );
+
+        // Plaintext on disk, byte-exact; spent volumes swept.
+        let out = dir2.join("complete/movie");
+        let mkv = std::fs::read(out.join("movie.mkv")).expect("movie.mkv missing");
+        assert_eq!(mkv.len(), inner2.len());
+        assert!(mkv == inner2, "decrypted payload differs");
+        assert!(
+            !out.join("lp.part1.rar").exists(),
+            "spent volumes must be swept after the unlock"
+        );
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Any `lp.part*.rar` anywhere under `root` - a demoted volume
+/// materializing on disk. The one-pass tests below poll this the whole
+/// run: for their shape a sighting at ANY moment means the set demoted
+/// (a demoted volume stays on disk until the finish sweep, so a 200ms
+/// poll cannot miss it).
+fn find_lp_volume(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("lp.part"))
+            {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// C2 step 1 (probe-window extension): a password typed mid-download
+/// reaches the slots PARKED by try_pw_await while their bytes are still
+/// in RAM - the in-stream probe hook now collects the hub's late-password
+/// cell as a structured candidate - so the job goes ONE-PASS. Volumes
+/// never materialize on disk (no demote, no C1 unlock-from-disk at
+/// finish), and the daemon log carries the in-stream probe's unlock line
+/// naming set_password as the source.
+#[tokio::test(flavor = "multi_thread")]
+async fn set_password_mid_download_goes_one_pass() {
+    use nzbkit::rar::fixtures;
+    let dir = std::env::temp_dir().join(format!("nzbfast-latepw1p-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Same shape as set_password_mid_download_unlocks_in_same_run:
+    // encrypted RAR5 STORE set, no password known at enqueue.
+    let inner = payload(24_000_003, 8);
+    let f = fixtures::encrypt_file("l4tepw", &inner, 5);
+    let n = f.cipher.len();
+    let (a, b) = (8_000_016, 16_000_000); // 16-aligned mid splits
+    let vols = [
+        fixtures::rar5_volume_enc(&[("movie.mkv", &f, 0..a, false, true)], Some(0)),
+        fixtures::rar5_volume_enc(&[("movie.mkv", &f, a..b, true, true)], Some(1)),
+        fixtures::rar5_volume_enc(&[("movie.mkv", &f, b..n, true, false)], Some(2)),
+    ];
+    let mut articles = HashMap::new();
+    let mut xml = String::from(
+        "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n",
+    );
+    for (i, vol) in vols.iter().enumerate() {
+        let name = format!("lp.part{}.rar", i + 1);
+        let segs = make_file_articles(&name, vol, 300_000, &format!("lp{i}"), &mut articles);
+        xml.push_str(&format!(
+            "  <file poster=\"x\" date=\"0\" subject=\"&quot;{name}&quot; yEnc (1/{})\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+            segs.len()
+        ));
+        for (id, bytes, num) in &segs {
+            xml.push_str(&format!(
+                "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+            ));
+        }
+        xml.push_str("    </segments>\n  </file>\n");
+    }
+    xml.push_str("</nzb>\n");
+    let srv = MockServer::start(articles, Chaos::default()).await;
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--connections")
+            .arg("2")
+            // ~8 s download window so set_password lands mid-download
+            // with most of the set still undownloaded.
+            .env("NZBFAST_THROTTLE_WRITE_MBPS", "3");
+        c
+    })
+    .await;
+    let port = d.port;
+    let daemon_log = d.log.clone();
+
+    let inner2 = inner.clone();
+    let dir2 = dir.clone();
+    tokio::task::spawn_blocking(move || {
+        // Plain filename: NO {{password}} convention, no NZB meta.
+        let boundary = "----latepw1pb";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"movie.nzb\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(xml.as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let r = http(
+            port,
+            "/api?mode=addfile&apikey=sekrit&output=json",
+            Some((&format!("multipart/form-data; boundary={boundary}"), &body)),
+        );
+        assert!(r.contains("\"status\":true"), "{r}");
+        let id = r
+            .split("SABnzbd_nzo_")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .map(|s| format!("SABnzbd_nzo_{s}"))
+            .unwrap();
+
+        // Wait for actual BYTE progress, not just the Downloading status:
+        // the status publishes before the download task captures
+        // j.password, and a password landing in that gap is a start-time
+        // password (no park, no probe) - exactly what this test must NOT
+        // exercise. Bytes on the wire prove the capture already happened.
+        let mut started = false;
+        for _ in 0..300 {
+            let q = http(port, "/api?mode=queue&apikey=sekrit&output=json", None);
+            if let Some(s) = serde_json::from_str::<serde_json::Value>(&q)
+                .ok()
+                .and_then(|v| v["queue"]["slots"].as_array().cloned())
+                .and_then(|slots| slots.iter().find(|s| s["nzo_id"] == id.as_str()).cloned())
+            {
+                let mb: f64 = s["mb"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+                let mbleft: f64 = s["mbleft"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+                if mb > 0.0 && mbleft < mb - 0.5 {
+                    started = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(started, "job never showed download progress");
+        let r = http(
+            port,
+            &format!("/api?mode=set_password&value={id}&password=l4tepw&apikey=sekrit&output=json"),
+            None,
+        );
+        assert!(r.contains("\"status\":true"), "{r}");
+
+        // Wait for completion, checking the WHOLE way that no volume
+        // ever materializes - the set must stay parked in RAM until the
+        // probe re-keys it, then stream one-pass. A volume file at any
+        // point means the set demoted and took C1's disk route instead.
+        let mut slot = serde_json::Value::Null;
+        for _ in 0..300 {
+            if let Some(v) = find_lp_volume(&dir2.join("complete")) {
+                panic!("set demoted: volume materialized at {}", v.display());
+            }
+            let h = http(port, "/api?mode=history&apikey=sekrit&output=json", None);
+            if let Some(s) = serde_json::from_str::<serde_json::Value>(&h)
+                .ok()
+                .and_then(|v| v["history"]["slots"].as_array().cloned())
+                .and_then(|slots| slots.iter().find(|s| s["nzo_id"] == id.as_str()).cloned())
+            {
+                if s["status"] == "Completed" || s["status"] == "Failed" {
+                    slot = s;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        assert_eq!(slot["status"], "Completed", "{slot}");
+        assert_eq!(
+            slot["password_required"], false,
+            "late password must unlock in the same run: {slot}"
+        );
+
+        // Plaintext on disk, byte-exact; still no volumes anywhere.
+        let out = dir2.join("complete/movie");
+        let mkv = std::fs::read(out.join("movie.mkv")).expect("movie.mkv missing");
+        assert_eq!(mkv.len(), inner2.len());
+        assert!(mkv == inner2, "decrypted payload differs");
+        assert!(
+            find_lp_volume(&dir2.join("complete")).is_none(),
+            "one-pass run must never leave volume files"
+        );
+
+        // And the unlock route is the in-stream probe fed by the typed
+        // password - not a sidecar harvest, not the finish ladder.
+        let log = std::fs::read_to_string(&daemon_log).unwrap_or_default();
+        assert!(
+            log.contains("set_password (typed mid-download)"),
+            "expected the in-stream probe to credit set_password:\n{log}"
+        );
+        assert!(log.contains("(in-stream probe)"), "{log}");
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Wrong-then-right: a wrong password typed mid-download must not burn
+/// the corrected one. The probe hook's tried-set is keyed by
+/// (salt, value), so the wrong value is remembered per-archive but the
+/// correction is a NEW value and gets tested - the set still unlocks
+/// in-stream and goes one-pass. (Keying the tried-set by salt alone
+/// would skip the correction, demote the set, and fail this test with
+/// volumes on disk.)
+#[tokio::test(flavor = "multi_thread")]
+async fn set_password_wrong_then_right_mid_download_one_pass() {
+    use nzbkit::rar::fixtures;
+    let dir = std::env::temp_dir().join(format!("nzbfast-latepwwr-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let inner = payload(24_000_003, 8);
+    let f = fixtures::encrypt_file("l4tepw", &inner, 5);
+    let n = f.cipher.len();
+    let (a, b) = (8_000_016, 16_000_000); // 16-aligned mid splits
+    let vols = [
+        fixtures::rar5_volume_enc(&[("movie.mkv", &f, 0..a, false, true)], Some(0)),
+        fixtures::rar5_volume_enc(&[("movie.mkv", &f, a..b, true, true)], Some(1)),
+        fixtures::rar5_volume_enc(&[("movie.mkv", &f, b..n, true, false)], Some(2)),
+    ];
+    let mut articles = HashMap::new();
+    let mut xml = String::from(
+        "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n",
+    );
+    for (i, vol) in vols.iter().enumerate() {
+        let name = format!("lp.part{}.rar", i + 1);
+        let segs = make_file_articles(&name, vol, 300_000, &format!("lp{i}"), &mut articles);
+        xml.push_str(&format!(
+            "  <file poster=\"x\" date=\"0\" subject=\"&quot;{name}&quot; yEnc (1/{})\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+            segs.len()
+        ));
+        for (id, bytes, num) in &segs {
+            xml.push_str(&format!(
+                "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+            ));
+        }
+        xml.push_str("    </segments>\n  </file>\n");
+    }
+    xml.push_str("</nzb>\n");
+    let srv = MockServer::start(articles, Chaos::default()).await;
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--connections")
+            .arg("2")
+            .env("NZBFAST_THROTTLE_WRITE_MBPS", "3");
+        c
+    })
+    .await;
+    let port = d.port;
+    let daemon_log = d.log.clone();
+
+    let inner2 = inner.clone();
+    let dir2 = dir.clone();
+    tokio::task::spawn_blocking(move || {
+        let boundary = "----latepwwrb";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"movie.nzb\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(xml.as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let r = http(
+            port,
+            "/api?mode=addfile&apikey=sekrit&output=json",
+            Some((&format!("multipart/form-data; boundary={boundary}"), &body)),
+        );
+        assert!(r.contains("\"status\":true"), "{r}");
+        let id = r
+            .split("SABnzbd_nzo_")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .map(|s| format!("SABnzbd_nzo_{s}"))
+            .unwrap();
+
+        // Same progress-wait as the one-pass variant: bytes must be
+        // flowing before the first password lands, so BOTH passwords go
+        // through the probe rather than the start-time capture.
+        let mut started = false;
+        for _ in 0..300 {
+            let q = http(port, "/api?mode=queue&apikey=sekrit&output=json", None);
+            if let Some(s) = serde_json::from_str::<serde_json::Value>(&q)
+                .ok()
+                .and_then(|v| v["queue"]["slots"].as_array().cloned())
+                .and_then(|slots| slots.iter().find(|s| s["nzo_id"] == id.as_str()).cloned())
+            {
+                let mb: f64 = s["mb"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+                let mbleft: f64 = s["mbleft"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+                if mb > 0.0 && mbleft < mb - 0.5 {
+                    started = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(started, "job never showed download progress");
+
+        // The typo first. Two seconds is >2 probe cycles (750ms cadence,
+        // spans arriving continuously under the throttle), so the wrong
+        // value is genuinely tried and rejected - entering the tried-set
+        // under this archive's salt - before the correction lands.
+        let r = http(
+            port,
+            &format!("/api?mode=set_password&value={id}&password=wr0ngpw&apikey=sekrit&output=json"),
+            None,
+        );
+        assert!(r.contains("\"status\":true"), "{r}");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let r = http(
+            port,
+            &format!("/api?mode=set_password&value={id}&password=l4tepw&apikey=sekrit&output=json"),
+            None,
+        );
+        assert!(r.contains("\"status\":true"), "{r}");
+
+        let mut slot = serde_json::Value::Null;
+        for _ in 0..300 {
+            if let Some(v) = find_lp_volume(&dir2.join("complete")) {
+                panic!(
+                    "corrected password was skipped and the set demoted: \
+                     volume materialized at {}",
+                    v.display()
+                );
+            }
+            let h = http(port, "/api?mode=history&apikey=sekrit&output=json", None);
+            if let Some(s) = serde_json::from_str::<serde_json::Value>(&h)
+                .ok()
+                .and_then(|v| v["history"]["slots"].as_array().cloned())
+                .and_then(|slots| slots.iter().find(|s| s["nzo_id"] == id.as_str()).cloned())
+            {
+                if s["status"] == "Completed" || s["status"] == "Failed" {
+                    slot = s;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        assert_eq!(slot["status"], "Completed", "{slot}");
+        assert_eq!(slot["password_required"], false, "{slot}");
+
+        let out = dir2.join("complete/movie");
+        let mkv = std::fs::read(out.join("movie.mkv")).expect("movie.mkv missing");
+        assert_eq!(mkv.len(), inner2.len());
+        assert!(mkv == inner2, "decrypted payload differs");
+        assert!(
+            find_lp_volume(&dir2.join("complete")).is_none(),
+            "one-pass run must never leave volume files"
+        );
+        let log = std::fs::read_to_string(&daemon_log).unwrap_or_default();
+        assert!(
+            log.contains("set_password (typed mid-download)"),
+            "expected the in-stream probe to credit set_password:\n{log}"
+        );
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The `prefer_external_unrar` setting, applied live over the API (no
+/// restart), must hand a NAMED compressed set to the unrar subprocess:
+/// the top-level chase latches off (so the set materializes instead of
+/// streaming through the native decoder) and the disk unpack skips the
+/// native engine. Opt-in like the compressed e2e: needs a working
+/// `unrar` on PATH, which CI does not install.
+#[tokio::test(flavor = "multi_thread")]
+async fn prefer_external_unrar_setting_routes_unpack_to_subprocess() {
+    let have = |c: &str| {
+        std::env::var_os("PATH").is_some_and(|p| {
+            std::env::split_paths(&p)
+                .any(|d| d.join(c).is_file() || d.join(format!("{c}.exe")).is_file())
+        })
+    };
+    if !have("unrar") {
+        eprintln!("skipping: unrar not installed");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("nzbfast-extunrar-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Real WinRAR m3 fixture: compressed, so it can never one-pass as a
+    // store set - with the chase latched off it must reach the disk path.
+    let arch = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../vendor/rars/tests/fixtures/rar50/m3_default.rar"),
+    )
+    .unwrap();
+    let mut articles = HashMap::new();
+    let segs = make_file_articles("c.rar", &arch, 4000, "xu", &mut articles);
+    let srv = MockServer::start(articles, Chaos::default()).await;
+
+    let mut xml = String::from(
+        "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"&quot;c.rar&quot; yEnc (1/3)\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+    );
+    for (id, bytes, num) in &segs {
+        xml.push_str(&format!(
+            "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+        ));
+    }
+    xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    delete_without_the_trash(&cfg);
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"));
+        c
+    })
+    .await;
+    let port = d.port;
+    let daemon_log = d.log.clone();
+
+    let dir2 = dir.clone();
+    tokio::task::spawn_blocking(move || {
+        // Flip the setting over the API - the whole point is that it
+        // applies to the job added next, with no daemon restart.
+        let r = http(
+            port,
+            "/api?mode=config&name=prefer_external_unrar&value=1&apikey=sekrit&output=json",
+            None,
+        );
+        assert!(!r.contains("error"), "setting rejected: {r}");
+        let r = http(port, "/api?mode=get_config&apikey=sekrit&output=json", None);
+        assert!(
+            r.contains("\"prefer_external_unrar\":true"),
+            "get_config does not echo the setting: {r}"
+        );
+
+        let boundary = "----nzbfastboundary";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"compressed.nzb\"\r\nContent-Type: application/x-nzb\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(xml.as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let ctype = format!("multipart/form-data; boundary={boundary}");
+        let r = http(port, "/api?mode=addfile&apikey=sekrit&output=json", Some((&ctype, &body)));
+        assert!(r.contains("\"status\":true"), "{r}");
+
+        let mut done = false;
+        for _ in 0..300 {
+            let h = http(port, "/api?mode=history&apikey=sekrit&output=json", None);
+            if h.contains("\"Completed\"") {
+                done = true;
+                break;
+            }
+            assert!(!h.contains("\"Failed\""), "job failed:\n{h}");
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        let log = std::fs::read_to_string(&daemon_log).unwrap_or_default();
+        assert!(done, "download never completed\n--- daemon log ---\n{log}");
+
+        // The routing proof: the subprocess ran, the native engine did not.
+        assert!(
+            log.contains("unpacking archive with unrar"),
+            "unrar subprocess never chosen:\n{log}"
+        );
+        assert!(log.contains("unrar complete"), "unrar did not finish:\n{log}");
+        assert!(
+            !log.contains("unpacking archive natively"),
+            "native engine ran despite prefer_external_unrar:\n{log}"
+        );
+
+        // And the payload it published is really there.
+        fn find(dir: &Path, name: &str) -> bool {
+            std::fs::read_dir(dir).into_iter().flatten().flatten().any(|e| {
+                let p = e.path();
+                if p.is_dir() {
+                    find(&p, name)
+                } else {
+                    p.file_name().is_some_and(|n| n == name)
+                }
+            })
+        }
+        assert!(
+            find(&dir2.join("complete"), "bigtext_64k.bin"),
+            "unpacked payload missing:\n{log}"
+        );
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The counterpart guarantee: an OBFUSCATED hash-named set ignores
+/// `prefer_external_unrar` and unpacks natively - the unrar subprocess
+/// derives volume names from the first volume's, which for a hash name
+/// names nothing on disk, so the native header-order path is the only
+/// one that can unpack this shape. Needs no external tools at all, so
+/// it runs everywhere including CI.
+#[tokio::test(flavor = "multi_thread")]
+async fn prefer_external_unrar_setting_ignored_for_obfuscated_sets() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-extunrar-obf-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // The same compressed fixture under a hash name: compressed so the
+    // store path demotes it to disk, extensionless so only the
+    // obfuscated sniff can claim it there.
+    let arch = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../vendor/rars/tests/fixtures/rar50/m3_default.rar"),
+    )
+    .unwrap();
+    let mut articles = HashMap::new();
+    let segs = make_file_articles("a91f3c0d77b2e4", &arch, 4000, "xo", &mut articles);
+    let srv = MockServer::start(articles, Chaos::default()).await;
+
+    let mut xml = String::from(
+        "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"kDjq0 [1/1]\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+    );
+    for (id, bytes, num) in &segs {
+        xml.push_str(&format!(
+            "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+        ));
+    }
+    xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    delete_without_the_trash(&cfg);
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"));
+        c
+    })
+    .await;
+    let port = d.port;
+    let daemon_log = d.log.clone();
+
+    let dir2 = dir.clone();
+    tokio::task::spawn_blocking(move || {
+        let r = http(
+            port,
+            "/api?mode=config&name=prefer_external_unrar&value=1&apikey=sekrit&output=json",
+            None,
+        );
+        assert!(!r.contains("error"), "setting rejected: {r}");
+
+        let boundary = "----nzbfastboundary";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"obf.nzb\"\r\nContent-Type: application/x-nzb\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(xml.as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let ctype = format!("multipart/form-data; boundary={boundary}");
+        let r = http(port, "/api?mode=addfile&apikey=sekrit&output=json", Some((&ctype, &body)));
+        assert!(r.contains("\"status\":true"), "{r}");
+
+        let mut done = false;
+        for _ in 0..300 {
+            let h = http(port, "/api?mode=history&apikey=sekrit&output=json", None);
+            if h.contains("\"Completed\"") {
+                done = true;
+                break;
+            }
+            assert!(!h.contains("\"Failed\""), "job failed:\n{h}");
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        let log = std::fs::read_to_string(&daemon_log).unwrap_or_default();
+        assert!(done, "download never completed\n--- daemon log ---\n{log}");
+
+        // The hash-named set took the native obfuscated path, and the
+        // setting never routed it at the subprocess.
+        assert!(
+            log.contains("obfuscated RAR set"),
+            "obfuscated handoff never engaged:\n{log}"
+        );
+        assert!(
+            log.contains("native unpack complete"),
+            "native obfuscated unpack did not finish:\n{log}"
+        );
+        assert!(
+            !log.contains("unpacking archive with unrar"),
+            "obfuscated set was handed to the unrar subprocess:\n{log}"
+        );
+
+        fn find(dir: &Path, name: &str) -> bool {
+            std::fs::read_dir(dir).into_iter().flatten().flatten().any(|e| {
+                let p = e.path();
+                if p.is_dir() {
+                    find(&p, name)
+                } else {
+                    p.file_name().is_some_and(|n| n == name)
+                }
+            })
+        }
+        assert!(
+            find(&dir2.join("complete"), "bigtext_64k.bin"),
+            "unpacked payload missing:\n{log}"
+        );
     })
     .await
     .unwrap();

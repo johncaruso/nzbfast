@@ -125,16 +125,47 @@ pub struct Reconstructor {
     /// k_i per global input index (shared with [`Feeder`] handles).
     base_logs: std::sync::Arc<Vec<u32>>,
     missing: Vec<usize>,
+    /// Recovery exponents, in syndrome-row order (needed again at
+    /// finish() by the NTT path and its fold fallback).
+    exponents: Vec<u32>,
     /// A⁻¹, row-major: missing[c] = Σ_r inverse[c][r] · S_r.
     inverse: Vec<Vec<u16>>,
     /// Batches travel to a worker thread that owns the syndrome rows, so
     /// the caller's disk reads overlap the GF math (bounded channel:
     /// one batch queued while one folds).
     tx: Option<std::sync::mpsc::SyncSender<FeedBatch>>,
-    worker: Option<std::thread::JoinHandle<Vec<Vec<u16>>>>,
+    /// Worker returns (syndromes, retained batches) - retained is empty
+    /// on the streaming path, and holds the resident source corpus when
+    /// the experimental NTT dispatch selected retention.
+    worker: Option<std::thread::JoinHandle<(Vec<Vec<u16>>, Vec<FeedBatch>)>>,
     /// Pending present slices, packed into the next batch's arena.
     batch: FeedBatch,
     batch_capacity: usize,
+    /// The dispatcher selected NTT retention at construction (the
+    /// mid-flight budget/plan fallbacks can still land on the fold).
+    ntt_selected: bool,
+    /// TEST ONLY fault injection, from the `NttForce*` test paths.
+    ntt_fault: NttFault,
+}
+
+/// TEST ONLY fault injected after the NTT transform (see
+/// [`SyndromePath::NttForceCorrupt`] / [`SyndromePath::NttForcePanic`]).
+#[derive(Clone, Copy, PartialEq)]
+enum NttFault {
+    None,
+    Corrupt,
+    Panic,
+}
+
+/// What [`Reconstructor::finish_reported`] observed about the syndrome
+/// pass. Not part of the supported API surface.
+#[doc(hidden)]
+pub struct SyndromeReport {
+    /// The NTT transform computed the syndromes (false on the fold path
+    /// and on every mid-flight fallback).
+    pub ntt_used: bool,
+    /// Present slices fed to the transform (0 when it did not run).
+    pub n_present: usize,
 }
 
 /// One thread's share of a multi-accumulate: `dsts[j] ^= Σ_i
@@ -363,6 +394,47 @@ pub fn bench_fold(
     fold_parallel(dsts, srcs, coeff);
 }
 
+/// Physical core count on Windows (P and E cores, SMT siblings
+/// excluded), counted the way par2j counts fold workers: one
+/// `RelationProcessorCore` record per core. `None` on failure, and off
+/// Windows (Apple Silicon has no SMT, so `available_parallelism` IS the
+/// physical count there).
+#[cfg(all(target_arch = "x86_64", windows))]
+fn physical_cores() -> Option<usize> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetLogicalProcessorInformationEx(rel: u32, buf: *mut u8, len: *mut u32) -> i32;
+    }
+    const RELATION_PROCESSOR_CORE: u32 = 0;
+    unsafe {
+        let mut len: u32 = 0;
+        GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, std::ptr::null_mut(), &mut len);
+        if len < 8 {
+            return None;
+        }
+        let mut buf = vec![0u8; len as usize];
+        if GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, buf.as_mut_ptr(), &mut len)
+            == 0
+        {
+            return None;
+        }
+        // Variable-size SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX records:
+        // u32 relationship, u32 size, then the union. Every record here
+        // is a core (the call filtered on the relation).
+        let mut off = 0usize;
+        let mut cores = 0usize;
+        while off + 8 <= len as usize {
+            let size = u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap()) as usize;
+            if size < 8 {
+                return None;
+            }
+            cores += 1;
+            off += size;
+        }
+        (cores > 0).then_some(cores)
+    }
+}
+
 fn fold_parallel(
     dsts: &mut [Vec<u16>],
     srcs: &[&[u8]],
@@ -378,6 +450,14 @@ fn fold_parallel(
         return;
     }
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get()).max(1);
+    // Hybrid x86: fold on PHYSICAL cores only, SMT siblings idle (par2j
+    // runs 14 threads on the i7-1280P, never 20). Measured on that box:
+    // HT added nothing to the old kernel and REGRESSED the affine2x one
+    // (two siblings thrash the shuffle ports and 16 hoisted ymm each).
+    // min() keeps a process affinity mask authoritative when it is the
+    // smaller number (the pinned bench rows depend on that).
+    #[cfg(all(target_arch = "x86_64", windows))]
+    let cores = physical_cores().map_or(cores, |p| p.min(cores));
     let row_threads = cores.min(rows);
     let row_chunk = rows.div_ceil(row_threads);
     // Columns split past the leftover-core count on purpose: units are
@@ -388,7 +468,32 @@ fn fold_parallel(
     // Oversplitting columns a few times per thread gives fast cores
     // more units and the tail shrinks to one small unit's length.
     let col_splits = if rows >= cores {
-        (8usize).min(words.div_ceil(MIN_COL_WORDS).max(1))
+        #[cfg(target_arch = "x86_64")]
+        {
+            // TODO 58 item B rung 2: size units from cache geometry
+            // instead of a fixed 8-way split. A unit's dst slab
+            // (row_chunk x col_chunk words) must stay L2-resident per
+            // worker: 512 KiB = min(P-core L2 / 2, E-cluster L2 / 4) on
+            // the hybrid-x86 reference (i7-1280P). And the column
+            // stripe's source window (every source's slice of one
+            // column range, L3-shared by all workers via the
+            // column-major LIFO drain below) is capped at a
+            // conservative half-L3. The fixed 8-way split left 600 KiB
+            // units at m = 1500 - 20 workers' worth blew past both the
+            // E-cluster L2 and the L3, and the fold measurably fell off
+            // (267 -> 141 GB/s all-core) exactly there.
+            const UNIT_DST_BUDGET: usize = 512 << 10;
+            const STRIPE_SRC_BUDGET: usize = 8 << 20;
+            let by_dst = (UNIT_DST_BUDGET / 2 / row_chunk.max(1)).max(MIN_COL_WORDS);
+            let by_src = (STRIPE_SRC_BUDGET / 2 / srcs.len().max(1)).max(MIN_COL_WORDS);
+            words
+                .div_ceil(by_dst.min(by_src))
+                .clamp(1, words.div_ceil(MIN_COL_WORDS).max(1))
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            (8usize).min(words.div_ceil(MIN_COL_WORDS).max(1))
+        }
     } else {
         // Few rows: columns are the only parallelism, so they carry
         // both the fan-out AND the oversplit.
@@ -396,7 +501,15 @@ fn fold_parallel(
             .max(1)
             .min(words.div_ceil(MIN_COL_WORDS).max(1))
     };
-    let col_chunk = words.div_ceil(col_splits);
+    // A column boundary that is not a multiple of 16 words leaves every
+    // unit's tiles with a sub-32-byte-chunk remainder, and the remainder
+    // path builds a full MulTable per (row, group, source) - measured as
+    // a 7-25x fold COLLAPSE the first time a cache-derived col_chunk
+    // landed off-alignment (the old fixed 8-way split only survived
+    // because 32768/8 happened to be aligned). Align up: whole blocks
+    // are word-power-of-two sized, so every column - including the last
+    // - stays a multiple of 16 words.
+    let col_chunk = words.div_ceil(col_splits).next_multiple_of(16);
 
     // A view of every row restricted to each column range, built by
     // repeated split_at_mut so the borrows are provably disjoint.
@@ -414,6 +527,13 @@ fn fold_parallel(
 
     // The unit grid: (row range x column range) cells, each owning its
     // destination region outright, pulled off one atomic counter.
+    //
+    // LOAD-BEARING ORDER: units are built column-major and drained LIFO
+    // (`Vec::pop`), so all workers co-schedule on ONE column stripe at a
+    // time and the stripe's source window stays L3-shared instead of
+    // each worker streaming a different slice of every source. The
+    // STRIPE_SRC_BUDGET cap above sizes that window; changing the drain
+    // order breaks the cap's premise.
     struct Unit<'a> {
         rows: Vec<&'a mut [u16]>,
         row_base: usize,
@@ -521,12 +641,384 @@ fn fold_batches(exponents: &[u32], syndromes: &mut [Vec<u16>], batches: &[FeedBa
     });
 }
 
+/// How the syndrome pass runs. EXPERIMENTAL dispatch for the NTT path
+/// (merged NTT plan Stage 2); not part of the supported API surface.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub enum SyndromePath {
+    /// Setting- and environment-gated. `NZBFAST_NTT` set in the
+    /// environment takes precedence over the daemon's "fast par mode"
+    /// setting (the bench/test/ops escape hatch): `1` enables the NTT
+    /// behind the conservative dispatch gates from the Stage 0/1
+    /// measurements, `force` skips the shape gates (memory budget still
+    /// applies), `0`/`off` disables it outright. With the variable
+    /// unset, [`set_fast_par_enabled`] decides, behind the same shape
+    /// gates, unless a divergence has tripped the breaker
+    /// ([`fast_par_tripped`]). Default.
+    Auto,
+    /// The streaming fold, unconditionally (today's behavior).
+    Fold,
+    /// Resident-source NTT with this retention budget in bytes; falls
+    /// back to the fold if retention overflows the budget or the plan
+    /// is unbuildable. Test/bench hook.
+    NttForce(usize),
+    /// TEST ONLY: [`SyndromePath::NttForce`], then flip one syndrome
+    /// word after the transform - simulates an NTT correctness bug so
+    /// the verify-failure fold retry can be exercised end to end.
+    NttForceCorrupt(usize),
+    /// TEST ONLY: [`SyndromePath::NttForce`], then panic after the
+    /// transform - proves the fold retry survives an NTT panic.
+    NttForcePanic(usize),
+}
+
+// --- fast PAR mode (user-facing NTT control) -------------------------------
+//
+// The daemon's "fast par mode" setting lands here as a process-global
+// flag; the repair drivers below pair it with a verify-failure fold
+// retry and a trip-breaker so a misbehaving NTT can never surface a
+// failed repair the fold would have completed.
+
+/// Default for "fast par mode" across EVERY entry point - the daemon's
+/// `fast_par` setting AND non-daemon paths (the CLI's `get` repair, or
+/// any other embedder that never calls [`set_fast_par_enabled`]). ON
+/// since 2026-07-31: the verify-failure fold retry makes
+/// wrong output impossible to ship, the trip-breaker covers live
+/// disable, and the RAM/cgroup-scaled retention budget gates small
+/// machines onto the fold up front. Lives here (not in the daemon)
+/// precisely so the CLI cannot drift from the daemon default.
+pub const FAST_PAR_DEFAULT: bool = true;
+
+/// The "fast par mode" flag ([`FAST_PAR_DEFAULT`] until an embedder
+/// overrides it; the daemon mirrors its saved setting in at startup).
+/// `NZBFAST_NTT` in the environment overrides this in both directions.
+static FAST_PAR_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(FAST_PAR_DEFAULT);
+/// Trip-breaker: set when a repair that used the NTT path failed
+/// whole-file verification (or panicked) and the fold retry ran. Once
+/// tripped, setting-driven dispatch prefers the fold for the rest of
+/// the process; the explicit env override still works.
+static FAST_PAR_TRIPPED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static NTT_DIVERGENCES: std::sync::Mutex<Vec<NttDivergence>> = std::sync::Mutex::new(Vec::new());
+
+/// Set the process-wide "fast par mode" flag (the daemon's setting).
+pub fn set_fast_par_enabled(on: bool) {
+    FAST_PAR_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a verified NTT divergence has tripped the breaker this
+/// process (see [`NttDivergence`]).
+pub fn fast_par_tripped() -> bool {
+    FAST_PAR_TRIPPED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Field telemetry for one NTT divergence: a repair that ran the NTT
+/// syndrome path and then failed whole-file verification (or panicked)
+/// where the fold retry was invoked. Both paths are bit-identical by
+/// construction, so every one of these is an NTT bug; the geometry here
+/// is what a reproduction needs.
+#[derive(Debug, Clone)]
+pub struct NttDivergence {
+    /// True when the NTT attempt panicked rather than producing output
+    /// that failed verification.
+    pub panicked: bool,
+    /// Missing-block count (syndrome rows).
+    pub m: usize,
+    /// Present source slices fed to the transform (0 when unknown, e.g.
+    /// a panic before the transform ran).
+    pub n_present: usize,
+    pub block_size: usize,
+    /// Largest recovery exponent used.
+    pub max_exp: u32,
+    /// What was being repaired (set directory or first file name).
+    pub context: String,
+}
+
+/// Drain the recorded divergence events (the daemon appends them to the
+/// job log / history).
+pub fn take_ntt_divergences() -> Vec<NttDivergence> {
+    // Poison-proof: this log must never turn a caught panic elsewhere
+    // into a new one (the push/take critical sections cannot panic).
+    std::mem::take(&mut NTT_DIVERGENCES.lock().unwrap_or_else(|p| p.into_inner()))
+}
+
+/// Per-attempt observation of the NTT dispatch, filled by the repair
+/// drivers so the retry wrapper can tell an NTT failure from an
+/// ordinary one.
+#[derive(Default)]
+struct NttProbe {
+    /// The dispatcher selected retention at construction (the NTT was
+    /// live when the attempt ended, even if it ended in a panic).
+    selected: bool,
+    /// The transform actually computed the syndromes (no mid-flight
+    /// fold fallback).
+    used: bool,
+    m: usize,
+    n_present: usize,
+    block_size: usize,
+    max_exp: u32,
+    context: String,
+}
+
+fn record_ntt_divergence(probe: &NttProbe, panicked: bool) {
+    FAST_PAR_TRIPPED.store(true, std::sync::atomic::Ordering::Relaxed);
+    let d = NttDivergence {
+        panicked,
+        m: probe.m,
+        n_present: probe.n_present,
+        block_size: probe.block_size,
+        max_exp: probe.max_exp,
+        context: probe.context.clone(),
+    };
+    // Warning level on purpose: the fold and the NTT are bit-identical
+    // by construction, so this is an NTT bug by definition, not noise.
+    eprintln!(
+        "[par2] WARNING: NTT syndrome path diverged ({}) - retrying with the fold path \
+         (m={}, n_present={}, block_size={}, max_exp={}, context={})",
+        if panicked { "panic" } else { "repaired output failed verification" },
+        d.m,
+        d.n_present,
+        d.block_size,
+        d.max_exp,
+        d.context,
+    );
+    NTT_DIVERGENCES.lock().unwrap_or_else(|p| p.into_inner()).push(d);
+}
+
+/// Run a repair attempt, retrying once on the fold path when the NTT
+/// was live and the attempt ended in a whole-file verification failure
+/// or a panic. A non-NTT attempt's panic is re-raised untouched; every
+/// other error passes through.
+fn run_with_ntt_fallback<T>(
+    initial: SyndromePath,
+    mut attempt: impl FnMut(SyndromePath, &mut NttProbe) -> Result<T, RepairError>,
+) -> Result<T, RepairError> {
+    let mut probe = NttProbe::default();
+    // catch_unwind is the only boundary that lets the fold retry run
+    // after an NTT panic: the transform's scoped workers propagate a
+    // panic through finish(), and without the catch it would abort the
+    // whole repair the fold could have completed. AssertUnwindSafe is
+    // sound here because the retry rebuilds every missing block from
+    // scratch and re-verifies every file, so no state the panicking
+    // attempt half-wrote is ever trusted.
+    let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        attempt(initial, &mut probe)
+    }));
+    let (diverged, panicked) = match &first {
+        Ok(Err(RepairError::VerifyFailed(_))) => (probe.used, false),
+        Err(_) => (probe.selected, true),
+        _ => (false, false),
+    };
+    if !diverged {
+        return match first {
+            Ok(r) => r,
+            Err(p) => std::panic::resume_unwind(p),
+        };
+    }
+    record_ntt_divergence(&probe, panicked);
+    attempt(SyndromePath::Fold, &mut NttProbe::default())
+}
+
+/// Conservative static gates from the measured Stage 0/1 sweeps
+/// (research/NTT-STAGE0-crossover-2026-07-30.md): the hot-loop
+/// crossover sits near m~260-420 on the measured ARM boxes, and the
+/// small-n structural loss means the transform never pays on
+/// few-source sets. Thresholds sit comfortably above the crossover
+/// because Stage 2 integration overhead only pushes it up; revisit
+/// with end-to-end numbers, per the Stage 1 doc.
+const NTT_MIN_MISSING: usize = 512;
+const NTT_MIN_PRESENT: usize = 8192;
+const NTT_MAX_EXP_FACTOR: usize = 3;
+/// Flat ceiling on the default resident-corpus budget. The NTT is a
+/// big-machine feature; low-memory hosts stay on the streaming fold
+/// (amendment 2).
+const NTT_BUDGET_CEIL: u64 = 4 << 30;
+
+/// Default retention budget, scaled to the machine: an OOM kill is the
+/// one failure the verify-retry cannot rescue, so beyond the flat
+/// ceiling the budget is capped at a quarter of physical RAM and, in a
+/// container, a quarter of the cgroup limit (the process's hard
+/// OOM-kill line; the pipeline's own MemBudget::auto uses half, and
+/// repair retention must not claim that much on top). A small box
+/// thereby refuses the NTT up front - the budget is a dispatch gate,
+/// not a runtime failure. `NZBFAST_NTT_BUDGET` overrides absolutely.
+fn ntt_default_budget(ram: Option<u64>, cgroup_limit: Option<u64>) -> usize {
+    let mut b = NTT_BUDGET_CEIL;
+    if let Some(r) = ram {
+        b = b.min(r / 4);
+    }
+    if let Some(l) = cgroup_limit {
+        b = b.min(l / 4);
+    }
+    b as usize
+}
+
+/// The conservative shape gates, as a pure function so the tests pin
+/// them without touching the process environment.
+fn ntt_gates_pass(
+    block_size: usize,
+    n_present: usize,
+    n_missing: usize,
+    max_exp: usize,
+    budget: usize,
+) -> bool {
+    n_missing >= NTT_MIN_MISSING
+        && n_present >= NTT_MIN_PRESENT
+        && max_exp < NTT_MAX_EXP_FACTOR.saturating_mul(n_missing.max(1))
+        && n_present.saturating_mul(block_size) <= budget
+}
+
+fn ntt_budget_env() -> usize {
+    std::env::var("NZBFAST_NTT_BUDGET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            ntt_default_budget(crate::mem::physical_ram(), crate::mem::cgroup_mem_limit())
+        })
+}
+
+/// Stripe width and worker count the syndrome pass will use for this
+/// block size. Factored out of `Reconstructor::ntt_syndromes` so the
+/// admission gate prices the arenas with the SAME geometry the transform
+/// actually runs - an estimate derived independently would drift.
+fn ntt_stripe_geometry(block_size: usize) -> (usize, usize) {
+    let words = block_size / 2;
+    let w: usize = std::env::var("NZBFAST_NTT_W")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&v: &usize| v >= 16)
+        .unwrap_or(512)
+        .min(words.max(16));
+    let stripes = words.div_ceil(w);
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    // Same physical-core rule as fold_parallel on hybrid x86.
+    #[cfg(all(target_arch = "x86_64", windows))]
+    let cores = physical_cores().map_or(cores, |p| p.min(cores));
+    let threads = std::env::var("NZBFAST_NTT_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(cores)
+        .clamp(1, stripes.max(1));
+    (w, threads)
+}
+
+/// Everything the NTT allocates OUTSIDE the resident corpus: the
+/// per-worker arenas times the worker count.
+///
+/// This estimate counts ONLY the NTT's INCREMENTAL footprint - the
+/// retained corpus (priced by the caller), these per-worker Scratch
+/// pools and output rows, and the short-tail pad arena (charged at
+/// runtime by the fold worker, which is the first place the tail count
+/// is known). It deliberately does NOT count the syndrome rows, the
+/// inverse matrix or the reconstructed output: the streaming fold
+/// allocates every one of them identically, so they belong to the
+/// repair baseline that the quarter-of-the-OOM-line budget exists to
+/// leave room for. Charging them here would refuse the fast path for
+/// memory the process spends either way.
+fn ntt_worker_arenas(block_size: usize, needed: usize) -> usize {
+    let (w, threads) = ntt_stripe_geometry(block_size);
+    crate::par2ntt::FlatPlan::scratch_bytes(needed, w).saturating_mul(threads)
+}
+
+/// Resolve the syndrome path for this repair shape. Returns the
+/// retention budget when the NTT path is selected.
+fn resolve_syndrome_path(
+    path: SyndromePath,
+    block_size: usize,
+    n_inputs: usize,
+    n_missing: usize,
+    exponents: &[u32],
+) -> Option<usize> {
+    let max_exp = exponents.iter().copied().max().unwrap_or(0) as usize;
+    // Hard requirements in every mode: syndromes to compute, sources to
+    // transform, and a transform prefix that exists (max exponent
+    // within the group order).
+    if exponents.is_empty() || max_exp >= crate::par2ntt::N || n_inputs <= n_missing {
+        return None;
+    }
+    match path {
+        SyndromePath::Fold => None,
+        SyndromePath::NttForce(budget)
+        | SyndromePath::NttForceCorrupt(budget)
+        | SyndromePath::NttForcePanic(budget) => Some(budget),
+        SyndromePath::Auto => {
+            let mode = std::env::var("NZBFAST_NTT").unwrap_or_default();
+            let budget = ntt_budget_env();
+            // The budget has to cover the WHOLE footprint, not just the
+            // resident corpus. Every worker allocates a Scratch plus
+            // `needed * W` output rows, and the worker count is visible
+            // parallelism with no memory cap of its own - so a many-core
+            // memory-capped host (a container with --memory and no
+            // --cpus) could clear a corpus-only gate and then be
+            // OOM-killed mid-repair, which is the one failure the
+            // verify-and-retry cannot rescue: catch_unwind does not catch
+            // an aborting allocator. Priced up front instead, so an
+            // over-footprint shape quietly FOLDS. The fold is
+            // bit-identical, is already the unconditional fallback, and
+            // was the default until fast par mode landed - this can make
+            // a repair slower, never wrong and never refused.
+            //
+            // What this prices is the NTT's INCREMENTAL footprint only;
+            // see [`ntt_worker_arenas`] for what is deliberately left
+            // out and why.
+            let corpus_budget =
+                budget.saturating_sub(ntt_worker_arenas(block_size, max_exp + 1));
+            let gated = || {
+                ntt_gates_pass(
+                    block_size,
+                    n_inputs - n_missing,
+                    n_missing,
+                    max_exp,
+                    corpus_budget,
+                )
+                // The corpus budget, not the whole budget: what comes
+                // back is the RETENTION headroom the worker's runtime
+                // backstop compares against, and the arenas are already
+                // spoken for. Returning `budget` here let a shape whose
+                // actual retention landed between the two keep retaining
+                // past what was priced.
+                .then_some(corpus_budget)
+            };
+            match mode.as_str() {
+                // The environment is the bench/test/ops escape hatch: it
+                // overrides the daemon setting in both directions and
+                // ignores the trip-breaker.
+                "force" => Some(budget),
+                "1" => gated(),
+                "0" | "off" => None,
+                // Unset: the daemon's "fast par mode" setting decides,
+                // unless a divergence tripped the breaker this process.
+                _ => {
+                    if FAST_PAR_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+                        && !fast_par_tripped()
+                    {
+                        gated()
+                    } else {
+                        None
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl Reconstructor {
     pub fn new(
         block_size: usize,
         n_inputs: usize,
         missing: &[usize],
         recovery: &[(u32, Vec<u8>)],
+    ) -> Result<Reconstructor, RepairError> {
+        Self::new_with_path(block_size, n_inputs, missing, recovery, SyndromePath::Auto)
+    }
+
+    #[doc(hidden)]
+    pub fn new_with_path(
+        block_size: usize,
+        n_inputs: usize,
+        missing: &[usize],
+        recovery: &[(u32, Vec<u8>)],
+        path: SyndromePath,
     ) -> Result<Reconstructor, RepairError> {
         if block_size == 0 || block_size % 2 != 0 {
             return Err(RepairError::Malformed(format!(
@@ -614,6 +1106,16 @@ impl Reconstructor {
             exponents.push(*e);
             syndromes.push(w);
         }
+        // EXPERIMENTAL NTT dispatch (merged NTT plan Stage 2): when the
+        // repair shape clears the measured gates, the worker RETAINS the
+        // fed batches - the batch arenas ARE the resident source corpus -
+        // and finish() runs the output-pruned NTT instead of having
+        // folded along the way. Overflowing the retention budget folds
+        // everything retained and reverts to streaming: the fold remains
+        // the unconditional fallback, mid-flight.
+        let ntt_budget =
+            resolve_syndrome_path(path, block_size, n_inputs, missing.len(), &exponents);
+        let worker_exponents = exponents.clone();
         // Capacity 4 (was 1): with M2c.2's parallel readers each sender
         // carries a BATCH_BYTES/N-sized batch, so a slightly deeper
         // queue keeps disks busy while a batch folds without growing
@@ -621,7 +1123,11 @@ impl Reconstructor {
         let (tx, rx) = std::sync::mpsc::sync_channel::<FeedBatch>(8);
         let fold_trace = std::env::var_os("NZBFAST_FOLD_TRACE").is_some();
         let worker = std::thread::spawn(move || {
+            let exponents = worker_exponents;
             let mut syndromes = syndromes;
+            let mut retained: Vec<FeedBatch> = Vec::new();
+            let mut retained_bytes = 0usize;
+            let mut ntt_budget = ntt_budget;
             let mut waited = std::time::Duration::ZERO;
             let mut folded = std::time::Duration::ZERO;
             let mut calls = 0usize;
@@ -630,6 +1136,36 @@ impl Reconstructor {
                 let t_w = std::time::Instant::now();
                 let Ok(first) = rx.recv() else { break };
                 waited += t_w.elapsed();
+                if let Some(budget) = ntt_budget {
+                    // Charge the pad the NTT will need for this batch as
+                    // well as the batch itself: every SHORT slice (a file
+                    // tail) is copied into a zero-padded whole block in
+                    // `ntt_syndromes`, so a set of many small files - all
+                    // tails - costs up to a second copy of the corpus
+                    // that the fed bytes alone never show.
+                    let pad = first
+                        .slices
+                        .iter()
+                        .filter(|&&(_, _, len)| len != 0 && len != block_size)
+                        .count()
+                        * block_size;
+                    retained_bytes += first.arena.len() + pad;
+                    retained.push(first);
+                    if retained_bytes > budget {
+                        // Budget blown: fold what we held and stream on.
+                        if std::env::var_os("NZBFAST_REPAIR_TIMING").is_some() {
+                            eprintln!(
+                                "[repair-timing] ntt retention over budget \
+                                 ({retained_bytes} > {budget} bytes) - fold fallback"
+                            );
+                        }
+                        fold_batches(&exponents, &mut syndromes, &retained);
+                        retained.clear();
+                        retained_bytes = 0;
+                        ntt_budget = None;
+                    }
+                    continue;
+                }
                 let mut merged = vec![first];
                 // Coalesce whatever the feeders have already queued: the
                 // tiled fold walks EVERY syndrome row once per call, so N
@@ -676,18 +1212,32 @@ impl Reconstructor {
                     waited
                 );
             }
-            syndromes
+            (syndromes, retained)
         });
         Ok(Reconstructor {
             block_size,
             base_logs: std::sync::Arc::new(base_logs),
             missing: missing.to_vec(),
+            exponents,
             inverse,
             tx: Some(tx),
             worker: Some(worker),
             batch: FeedBatch::with_capacity(BATCH_BYTES),
             batch_capacity: BATCH_BYTES,
+            ntt_selected: ntt_budget.is_some(),
+            ntt_fault: match path {
+                SyndromePath::NttForceCorrupt(_) => NttFault::Corrupt,
+                SyndromePath::NttForcePanic(_) => NttFault::Panic,
+                _ => NttFault::None,
+            },
         })
+    }
+
+    /// Whether the dispatcher selected the NTT path at construction.
+    /// Not part of the supported API surface.
+    #[doc(hidden)]
+    pub fn ntt_selected(&self) -> bool {
+        self.ntt_selected
     }
 
     /// Accumulate one present input slice (borrowed - it is packed into
@@ -744,15 +1294,36 @@ impl Reconstructor {
 
     /// Solve: returns the reconstructed slices (full `block_size` bytes
     /// each, zero-padded past any file tail) in `missing` order.
-    pub fn finish(mut self) -> Vec<Vec<u8>> {
+    pub fn finish(self) -> Vec<Vec<u8>> {
+        self.finish_reported().0
+    }
+
+    /// [`finish`](Self::finish), also reporting what the syndrome pass
+    /// did - the repair drivers' verify-failure fallback needs to know
+    /// whether the NTT actually computed the syndromes. Not part of the
+    /// supported API surface.
+    #[doc(hidden)]
+    pub fn finish_reported(mut self) -> (Vec<Vec<u8>>, SyndromeReport) {
         self.flush();
         drop(self.tx.take());
-        let syndromes = self
+        let (mut syndromes, retained) = self
             .worker
             .take()
             .expect("finish() called once")
             .join()
             .expect("syndrome fold worker panicked");
+        let mut report = SyndromeReport { ntt_used: false, n_present: 0 };
+        if !retained.is_empty() {
+            (report.ntt_used, report.n_present) =
+                self.ntt_syndromes(&mut syndromes, &retained);
+        }
+        // The retained corpus is dead the moment the syndromes are
+        // computed, and it is the single biggest live allocation on the
+        // NTT path - it must not still be resident while the m x
+        // block_size output below is allocated and then copied out. The
+        // worker arenas are already gone (dropped when the scoped
+        // threads exited), so this window is the real NTT peak.
+        drop(retained);
         let m = self.missing.len();
         let words = self.block_size / 2;
         let mut out: Vec<Vec<u16>> = vec![vec![0u16; words]; m];
@@ -773,12 +1344,192 @@ impl Reconstructor {
                 eprintln!("[repair-timing] back-substitution: {:.2?}", t_bs.elapsed());
             }
         }
+        // Same reason as the retained corpus above: the syndrome rows
+        // are consumed by the back-substitution and nothing past it
+        // reads them, so they must not stay live across the byte
+        // conversion, which briefly holds two copies of the output.
+        drop(syndromes);
         // On little-endian a word slice already IS its PAR2 byte view,
         // so this is a memcpy per block rather than a per-byte iterator
         // chain over the whole repaired payload.
-        out.into_iter()
+        let out = out
+            .into_iter()
             .map(|w| gf16::words_as_bytes(&w).to_vec())
-            .collect()
+            .collect();
+        (out, report)
+    }
+
+    /// EXPERIMENTAL NTT syndrome pass over the retained source corpus
+    /// (merged NTT plan Stage 2). XORs each present slice's contribution
+    /// into the recovery-initialized syndrome rows via the output-pruned
+    /// transform; any shape the plan cannot represent (duplicate feeds,
+    /// out-of-range logs) falls back to folding the retained batches -
+    /// bit-identical semantics either way, since the fold is pure XOR
+    /// accumulation. Returns (ntt actually ran, present slices fed).
+    fn ntt_syndromes(
+        &self,
+        syndromes: &mut [Vec<u16>],
+        retained: &[FeedBatch],
+    ) -> (bool, usize) {
+        let timing = std::env::var_os("NZBFAST_REPAIR_TIMING").is_some();
+        let t0 = std::time::Instant::now();
+        let words = self.block_size / 2;
+        // Slice table: full-length slices point into the batch arenas
+        // (the resident corpus); short tails are copied once into a
+        // zero-padded side arena so every stripe pointer is readable.
+        let mut table: Vec<*const u8> = Vec::new();
+        let mut present: Vec<(u32, crate::par2ntt::SrcId)> = Vec::new();
+        // Counted up front rather than grown block by block: a set of
+        // many small files is nearly all tails, so the doubling Vec
+        // would hold up to twice the final pad during a reallocation -
+        // and that transient is exactly what the retention backstop's
+        // pad charge is trying to bound.
+        let n_short = retained
+            .iter()
+            .flat_map(|b| b.slices.iter())
+            .filter(|&&(_, _, len)| len != 0 && len != self.block_size)
+            .count();
+        let mut pad_arena: Vec<u8> = Vec::new();
+        pad_arena.reserve_exact(n_short * self.block_size);
+        let mut pads: Vec<(usize, usize, usize)> = Vec::new(); // (table idx, pad off, len)
+        pads.reserve_exact(n_short);
+        for b in retained {
+            for &(log, off, len) in &b.slices {
+                if len == 0 {
+                    continue;
+                }
+                let id = table.len() as crate::par2ntt::SrcId;
+                if len == self.block_size {
+                    table.push(b.arena[off..off + len].as_ptr());
+                } else {
+                    let poff = pad_arena.len();
+                    pad_arena.resize(poff + self.block_size, 0);
+                    pads.push((table.len(), poff, len));
+                    table.push(std::ptr::null()); // patched below
+                }
+                present.push((log, id));
+            }
+        }
+        // Second pass for the tail copies: pad_arena has its final size
+        // now, so pointers taken from it below are stable.
+        {
+            let mut pi = 0usize;
+            let mut ti = 0usize;
+            for b in retained {
+                for &(_, off, len) in &b.slices {
+                    if len == 0 {
+                        continue;
+                    }
+                    if len != self.block_size {
+                        let (idx, poff, plen) = pads[pi];
+                        debug_assert_eq!(idx, ti);
+                        pad_arena[poff..poff + plen].copy_from_slice(&b.arena[off..off + len]);
+                        table[ti] = pad_arena[poff..poff + self.block_size].as_ptr();
+                        pi += 1;
+                    }
+                    ti += 1;
+                }
+            }
+            debug_assert_eq!(pi, pads.len());
+        }
+        let needed = self.exponents.iter().copied().max().unwrap_or(0) as usize + 1;
+        let plan = match crate::par2ntt::FlatPlan::build(&present, needed) {
+            Ok(p) => p,
+            Err(why) => {
+                if timing {
+                    eprintln!("[repair-timing] ntt plan unbuildable ({why}) - fold fallback");
+                }
+                fold_batches(&self.exponents, syndromes, retained);
+                return (false, 0);
+            }
+        };
+        // Stripe width and worker count: W=512 (1 KiB stripes) holds the
+        // measured wall inside the scratch budget (Stage 1 doc); workers
+        // pull stripes from a shared queue and XOR their rows into
+        // disjoint column ranges of the shared syndrome rows.
+        let w: usize = std::env::var("NZBFAST_NTT_W")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v: &usize| v >= 16)
+            .unwrap_or(512)
+            .min(words.max(16));
+        let stripes = words.div_ceil(w);
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        // Same physical-core rule as fold_parallel on hybrid x86.
+        #[cfg(all(target_arch = "x86_64", windows))]
+        let cores = physical_cores().map_or(cores, |p| p.min(cores));
+        let threads = std::env::var("NZBFAST_NTT_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(cores)
+            .clamp(1, stripes.max(1));
+        struct SynPtrs(Vec<*mut u16>, Vec<usize>);
+        unsafe impl Send for SynPtrs {}
+        unsafe impl Sync for SynPtrs {}
+        let syn = SynPtrs(
+            syndromes.iter_mut().map(|s| s.as_mut_ptr()).collect(),
+            self.exponents.iter().map(|&e| e as usize).collect(),
+        );
+        struct SrcTable(Vec<*const u8>);
+        unsafe impl Send for SrcTable {}
+        unsafe impl Sync for SrcTable {}
+        let table = SrcTable(table);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            let plan = &plan;
+            let syn = &syn;
+            let table = &table;
+            let next = &next;
+            for _ in 0..threads {
+                s.spawn(move || {
+                    let mut scratch = plan.new_scratch(w);
+                    let mut out = vec![0u16; plan.needed * w];
+                    loop {
+                        let c =
+                            next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if c >= stripes {
+                            break;
+                        }
+                        let len = w.min(words - c * w);
+                        let src_of = |id: crate::par2ntt::SrcId| unsafe {
+                            table.0[id as usize].add(c * w * 2)
+                        };
+                        plan.transform(&src_of, len, &mut scratch, &mut out);
+                        for (j, &e) in syn.1.iter().enumerate() {
+                            let row = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    syn.0[j].add(c * w),
+                                    len,
+                                )
+                            };
+                            for (d, s) in row.iter_mut().zip(&out[e * len..(e + 1) * len]) {
+                                *d ^= *s;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        if timing {
+            eprintln!(
+                "[repair-timing] ntt syndromes (m={}, needed={}, n={}, W={w}, threads={threads}): {:.2?}",
+                self.exponents.len(),
+                plan.needed,
+                present.len(),
+                t0.elapsed()
+            );
+        }
+        match self.ntt_fault {
+            NttFault::None => {}
+            // TEST ONLY (NttForceCorrupt): a single flipped word models
+            // an NTT correctness bug; whole-file verification must catch
+            // it and the fold retry must rescue the repair.
+            NttFault::Corrupt => syndromes[0][0] ^= 1,
+            // TEST ONLY (NttForcePanic): the retry must survive a panic
+            // on the NTT path.
+            NttFault::Panic => panic!("injected NTT panic (NttForcePanic test path)"),
+        }
+        (true, present.len())
     }
 }
 
@@ -1151,6 +1902,39 @@ pub fn repair_mapped(
     io: &dyn VolumeIo,
     full_verify: bool,
 ) -> Result<usize, RepairError> {
+    repair_mapped_with_path(files, block_size, recovery, io, full_verify, SyndromePath::Auto)
+}
+
+/// [`repair_mapped`] with an explicit initial syndrome path (test hook
+/// for the NTT fallback machinery). Not part of the supported API
+/// surface. The verify-failure fold retry applies here too: a rerun on
+/// the fold path re-reads only PRESENT slices (the failed attempt only
+/// wrote MISSING ones, so its output never contaminates the retry's
+/// syndromes) and rewrites every missing block, so partially-written
+/// output from the failed attempt is fully overwritten.
+#[doc(hidden)]
+pub fn repair_mapped_with_path(
+    files: &[(Par2File, Vec<bool>)],
+    block_size: usize,
+    recovery: &[(u32, Vec<u8>)],
+    io: &dyn VolumeIo,
+    full_verify: bool,
+    path: SyndromePath,
+) -> Result<usize, RepairError> {
+    run_with_ntt_fallback(path, |path, probe| {
+        repair_mapped_inner(files, block_size, recovery, io, full_verify, path, probe)
+    })
+}
+
+fn repair_mapped_inner(
+    files: &[(Par2File, Vec<bool>)],
+    block_size: usize,
+    recovery: &[(u32, Vec<u8>)],
+    io: &dyn VolumeIo,
+    full_verify: bool,
+    path: SyndromePath,
+    probe: &mut NttProbe,
+) -> Result<usize, RepairError> {
     if block_size == 0 || block_size % 2 != 0 {
         return Err(RepairError::Malformed(format!(
             "block size {block_size} not a positive multiple of 2"
@@ -1220,7 +2004,12 @@ pub fn repair_mapped(
     // fold worker; XOR accumulation makes arrival order irrelevant.
     let timing = std::env::var_os("NZBFAST_REPAIR_TIMING").is_some();
     let t0 = std::time::Instant::now();
-    let rec = Reconstructor::new(block_size, n_inputs, &missing, &chosen)?;
+    let rec = Reconstructor::new_with_path(block_size, n_inputs, &missing, &chosen, path)?;
+    probe.selected = rec.ntt_selected();
+    probe.m = missing.len();
+    probe.block_size = block_size;
+    probe.max_exp = chosen.last().map_or(0, |&(e, _)| e);
+    probe.context = files.first().map(|(f, _)| f.name.clone()).unwrap_or_default();
     let work: Vec<(usize, usize, u64, usize)> = files
         .iter()
         .enumerate()
@@ -1277,7 +2066,9 @@ pub fn repair_mapped(
     if timing {
         eprintln!("[repair-timing] feed reads queued in {:.2?}", t0.elapsed());
     }
-    let rebuilt = rec.finish();
+    let (rebuilt, syn_report) = rec.finish_reported();
+    probe.used = syn_report.ntt_used;
+    probe.n_present = syn_report.n_present;
     if timing {
         eprintln!("[repair-timing] fold+solve done at {:.2?}", t0.elapsed());
     }
@@ -1938,6 +2729,23 @@ pub fn repair_present_sets(
 /// are ignored, exactly as foreign-set packets always were); `None`
 /// keeps the historical first-seen binding.
 fn repair_dir_set(dir: &Path, want: Option<[u8; 16]>) -> Result<RepairStatus, RepairError> {
+    // The NTT verify-failure retry is safe to run as a full re-attempt
+    // here: the rerun re-verifies every target from disk, so any block
+    // the failed attempt patched in place with wrong bytes fails its
+    // checksum again, lands back in `missing`, and is rebuilt by the
+    // fold; temp-file rebuilds were already cleaned up before the
+    // VerifyFailed returned.
+    run_with_ntt_fallback(SyndromePath::Auto, |path, probe| {
+        repair_dir_set_inner(dir, want, path, probe)
+    })
+}
+
+fn repair_dir_set_inner(
+    dir: &Path,
+    want: Option<[u8; 16]>,
+    path: SyndromePath,
+    probe: &mut NttProbe,
+) -> Result<RepairStatus, RepairError> {
     let timing = std::env::var_os("NZBFAST_REPAIR_TIMING").is_some();
     let t0 = std::time::Instant::now();
     let mut mark = {
@@ -2298,7 +3106,12 @@ fn repair_dir_set(dir: &Path, want: Option<[u8; 16]>) -> Result<RepairStatus, Re
     // --- syndrome pass: stream every present slice once ---
     let blocks_rebuilt = missing.len();
     let rebuilt: Vec<Vec<u8>> = if blocks_rebuilt > 0 {
-        let mut rec = Reconstructor::new(bs, n_inputs, &missing, &recovery)?;
+        let mut rec = Reconstructor::new_with_path(bs, n_inputs, &missing, &recovery, path)?;
+        probe.selected = rec.ntt_selected();
+        probe.m = missing.len();
+        probe.block_size = bs;
+        probe.max_exp = recovery.last().map_or(0, |&(e, _)| e);
+        probe.context = dir.display().to_string();
         // `Reconstructor::new` has copied every recovery slice into its own
         // u16 syndrome buffers, so this second payload-sized copy (missing x
         // block_size - 537 MB on a 128-block/4 MiB repair) is dead weight for
@@ -2374,7 +3187,9 @@ fn repair_dir_set(dir: &Path, want: Option<[u8; 16]>) -> Result<RepairStatus, Re
                 rec.feed(g, &data);
             }
         }
-        let r = rec.finish();
+        let (r, syn_report) = rec.finish_reported();
+        probe.used = syn_report.ntt_used;
+        probe.n_present = syn_report.n_present;
         mark("feed+fold+solve");
         r
     } else {
@@ -2942,6 +3757,242 @@ mod tests {
             .collect()
     }
 
+    /// The dispatch gates: light/medium damage (the 3- and 101-block
+    /// benchmark legs), small source sets, pathological exponent gaps,
+    /// and over-budget corpora must all stay on the fold. The heavy
+    /// benchmark shape must pass.
+    #[test]
+    fn ntt_gates_route_field_shapes_correctly() {
+        let gib = 1usize << 30;
+        // Heavy leg: 16384 x 64 KiB, 1500 missing -> NTT.
+        assert!(ntt_gates_pass(65536, 14884, 1500, 1499, 4 * gib));
+        // Light/medium damage: fold.
+        assert!(!ntt_gates_pass(65536, 16381, 3, 2, 4 * gib));
+        assert!(!ntt_gates_pass(65536, 16283, 101, 100, 4 * gib));
+        // Below the measured crossover margin: fold.
+        assert!(!ntt_gates_pass(65536, 15934, 450, 449, 4 * gib));
+        // Small source set (640 KiB / 1 MiB blocks at ~1 GiB): fold,
+        // regardless of damage fraction.
+        assert!(!ntt_gates_pass(655360, 870, 768, 767, 4 * gib));
+        // Pathological exponent gap (max exponent >= 3m): fold.
+        assert!(!ntt_gates_pass(65536, 14884, 1500, 4500, 4 * gib));
+        // Realistic gaps stay eligible (alt = 2m - 2).
+        assert!(ntt_gates_pass(65536, 14884, 1500, 2998, 4 * gib));
+        // Corpus over the memory budget: fold (amendment 2).
+        assert!(!ntt_gates_pass(65536, 14884, 1500, 1499, gib / 2));
+    }
+
+    /// Stage 2 gate (merged NTT plan): the experimental NTT syndrome
+    /// path must round-trip byte-identically with the fold path - same
+    /// slices, same damage, same recovery set - including gapped
+    /// exponents and a short (odd-length) tail slice.
+    #[test]
+    fn ntt_syndrome_path_matches_fold_path() {
+        let (n, bs, m) = (600usize, 64usize, 40usize);
+        let mut slices = demo_slices(n, bs);
+        // Missing set scattered through the range.
+        let missing: Vec<usize> = (0..m).map(|i| (i * 13 + 3) % n).collect::<Vec<_>>();
+        let mut missing = missing;
+        missing.sort_unstable();
+        missing.dedup();
+        let missing = missing;
+        // A short odd-length tail among the PRESENT slices (padded copy
+        // used for recovery generation, raw short bytes fed).
+        let tail_idx = (0..n).find(|i| !missing.contains(i)).unwrap();
+        let tail_len = bs - 5;
+        slices[tail_idx].truncate(tail_len);
+        let padded: Vec<Vec<u8>> = slices
+            .iter()
+            .map(|s| {
+                let mut p = s.clone();
+                p.resize(bs, 0);
+                p
+            })
+            .collect();
+        // Gapped exponents: every third, starting at 2 (max well within
+        // the 3m dispatch bound but far from consecutive).
+        let exps: Vec<u32> = (0..missing.len() as u32).map(|i| 2 + 3 * i).collect();
+        let recovery: Vec<(u32, Vec<u8>)> =
+            exps.iter().map(|&e| (e, generate_recovery(&padded, bs, e))).collect();
+        let mut outs: Vec<Vec<Vec<u8>>> = Vec::new();
+        for path in [SyndromePath::Fold, SyndromePath::NttForce(usize::MAX)] {
+            let mut rec =
+                Reconstructor::new_with_path(bs, n, &missing, &recovery, path).unwrap();
+            for (i, s) in slices.iter().enumerate() {
+                if !missing.contains(&i) {
+                    rec.feed(i, s);
+                }
+            }
+            outs.push(rec.finish());
+        }
+        assert_eq!(outs[0], outs[1], "NTT and fold paths disagree");
+        for (c, &j) in missing.iter().enumerate() {
+            assert_eq!(outs[1][c], padded[j], "missing slice {j} wrong via NTT");
+        }
+    }
+
+    /// The Auto arm's return value is the RETENTION budget, so it must
+    /// be what is left after the per-worker arenas are paid for - the
+    /// arenas are spoken for the moment the NTT is selected, and the
+    /// runtime backstop that consumes this number can only be honest if
+    /// it is comparing retained bytes against retained headroom. The
+    /// explicit force arms keep returning the caller's budget verbatim.
+    #[test]
+    fn ntt_auto_retention_budget_excludes_the_worker_arenas() {
+        if std::env::var_os("NZBFAST_NTT").is_some() {
+            return; // the env override is exercised manually, not here
+        }
+        let _g = NTT_STATE.lock().unwrap_or_else(|p| p.into_inner());
+        FAST_PAR_TRIPPED.store(false, std::sync::atomic::Ordering::Relaxed);
+        set_fast_par_enabled(true);
+        // The heavy benchmark leg, which clears every shape gate.
+        let exps: Vec<u32> = (0..1500).collect();
+        let arenas = ntt_worker_arenas(65536, 1500);
+        assert!(arenas > 0, "the arenas are never free");
+        assert_eq!(
+            resolve_syndrome_path(SyndromePath::Auto, 65536, 16384, 1500, &exps),
+            Some(ntt_budget_env().saturating_sub(arenas)),
+            "Auto must hand back the corpus budget, not the whole budget"
+        );
+        assert_eq!(
+            resolve_syndrome_path(
+                SyndromePath::NttForce(3 * 65536),
+                65536,
+                16384,
+                1500,
+                &exps
+            ),
+            Some(3 * 65536),
+            "the force arms pass the caller's budget through untouched"
+        );
+        set_fast_par_enabled(FAST_PAR_DEFAULT);
+    }
+
+    /// A set whose present slices are nearly all SHORT tails (many small
+    /// files, each just under one block) costs the NTT an extra
+    /// zero-padded block per slice, in a side arena nothing prices. Only
+    /// the fed bytes are visible in the retained batches, so the runtime
+    /// backstop has to charge the pad it knows is coming: a corpus that
+    /// fits the budget only because its tails are short must fold
+    /// mid-flight, bit-identically. Full-length slices pay no pad and
+    /// must still be admitted - the backstop must not over-tighten.
+    #[test]
+    fn ntt_short_tail_pad_counts_against_the_retention_budget() {
+        let (n, bs, m) = (200usize, 64usize, 8usize);
+        let full = demo_slices(n, bs);
+        let missing: Vec<usize> = (0..m).map(|i| i * 17).collect();
+        let present: Vec<usize> = (0..n).filter(|i| !missing.contains(i)).collect();
+        let tail_len = bs - 8;
+        // Every slice is a short tail: the pathological many-small-files
+        // shape, where the pad arena rivals the whole retained corpus.
+        let fed: Vec<Vec<u8>> = full.iter().map(|s| s[..tail_len].to_vec()).collect();
+        let padded: Vec<Vec<u8>> = fed
+            .iter()
+            .map(|s| {
+                let mut p = s.clone();
+                p.resize(bs, 0);
+                p
+            })
+            .collect();
+        let exps: Vec<u32> = (0..m as u32).collect();
+        let recovery: Vec<(u32, Vec<u8>)> =
+            exps.iter().map(|&e| (e, generate_recovery(&padded, bs, e))).collect();
+        // A budget the fed bytes clear on their own but the tail pads do not.
+        let arena_bytes = present.len() * tail_len;
+        let pad_bytes = present.len() * bs;
+        let budget = arena_bytes + pad_bytes / 2;
+        assert!(arena_bytes <= budget && arena_bytes + pad_bytes > budget);
+        let run = |slices: &[Vec<u8>], recovery: &[(u32, Vec<u8>)], path| {
+            let mut rec =
+                Reconstructor::new_with_path(bs, n, &missing, recovery, path).unwrap();
+            for &i in &present {
+                rec.feed(i, &slices[i]);
+            }
+            rec.finish_reported()
+        };
+        let (fold_out, _) = run(&fed, &recovery, SyndromePath::Fold);
+        let (out, report) = run(&fed, &recovery, SyndromePath::NttForce(budget));
+        assert!(
+            !report.ntt_used,
+            "the tail pad must count against the retention budget"
+        );
+        assert_eq!(out, fold_out, "the fold fallback must stay bit-identical");
+        for (c, &j) in missing.iter().enumerate() {
+            assert_eq!(out[c], padded[j], "missing slice {j} wrong after fallback");
+        }
+        // Control: the same corpus at full block length pays no pad, so
+        // the same budget still admits the NTT.
+        let recovery_full: Vec<(u32, Vec<u8>)> =
+            exps.iter().map(|&e| (e, generate_recovery(&full, bs, e))).collect();
+        let (out_full, report_full) =
+            run(&full, &recovery_full, SyndromePath::NttForce(budget));
+        assert!(
+            report_full.ntt_used,
+            "full-length slices pay no pad and must still run the NTT"
+        );
+        for (c, &j) in missing.iter().enumerate() {
+            assert_eq!(out_full[c], full[j], "missing slice {j} wrong via NTT");
+        }
+    }
+
+    /// Blowing the retention budget mid-feed must fall back to the fold
+    /// and still reconstruct correctly (the unconditional-fallback
+    /// requirement, exercised through the real worker path).
+    #[test]
+    fn ntt_budget_overflow_falls_back_to_fold() {
+        let (n, bs, m) = (200usize, 64usize, 8usize);
+        let slices = demo_slices(n, bs);
+        let missing: Vec<usize> = (0..m).map(|i| i * 17).collect();
+        let exps: Vec<u32> = (0..m as u32).collect();
+        let recovery: Vec<(u32, Vec<u8>)> =
+            exps.iter().map(|&e| (e, generate_recovery(&slices, bs, e))).collect();
+        // Budget far below the corpus: overflow is guaranteed.
+        let mut rec = Reconstructor::new_with_path(
+            bs,
+            n,
+            &missing,
+            &recovery,
+            SyndromePath::NttForce(3 * bs),
+        )
+        .unwrap();
+        for (i, s) in slices.iter().enumerate() {
+            if !missing.contains(&i) {
+                rec.feed(i, s);
+            }
+        }
+        let out = rec.finish();
+        for (c, &j) in missing.iter().enumerate() {
+            assert_eq!(out[c], slices[j], "missing slice {j} wrong after fallback");
+        }
+    }
+
+    /// A duplicate feed is representable by the XOR fold (the two
+    /// contributions cancel) but not by NTT coefficient slots - the plan
+    /// must refuse and the fold fallback must keep both paths
+    /// bit-identical.
+    #[test]
+    fn ntt_duplicate_feed_falls_back_and_matches_fold() {
+        let (n, bs, m) = (150usize, 64usize, 4usize);
+        let slices = demo_slices(n, bs);
+        let missing = [1usize, 30, 60, 90];
+        let exps: Vec<u32> = (0..m as u32).collect();
+        let recovery: Vec<(u32, Vec<u8>)> =
+            exps.iter().map(|&e| (e, generate_recovery(&slices, bs, e))).collect();
+        let mut outs: Vec<Vec<Vec<u8>>> = Vec::new();
+        for path in [SyndromePath::Fold, SyndromePath::NttForce(usize::MAX)] {
+            let mut rec =
+                Reconstructor::new_with_path(bs, n, &missing, &recovery, path).unwrap();
+            for (i, s) in slices.iter().enumerate() {
+                if !missing.contains(&i) {
+                    rec.feed(i, s);
+                }
+            }
+            rec.feed(0, &slices[0]); // duplicate: cancels its own contribution
+            outs.push(rec.finish());
+        }
+        assert_eq!(outs[0], outs[1], "paths disagree on duplicate feed");
+    }
+
     #[test]
     fn round_trip_reconstructs_scattered_missing_slices() {
         let (n, bs) = (11, 64);
@@ -3150,6 +4201,136 @@ mod tests {
                 (s >> 24) as u8
             })
             .collect()
+    }
+
+    /// The verify-failure fold retry (fast PAR mode's safety net): an
+    /// NTT that produces wrong syndromes fails whole-file verification,
+    /// and the driver must transparently redo the repair on the fold
+    /// path AND record the divergence for field telemetry. Same for an
+    /// NTT that panics outright. Both scenarios run inside ONE test
+    /// because the divergence log is process-global: draining it here
+    /// cannot race another test's events.
+    /// The default retention budget scales to the machine: the flat
+    /// 4 GiB ceiling holds on big RAM, small hosts get RAM/4, and a
+    /// cgroup limit (the OOM-kill line) caps at a quarter regardless of
+    /// host RAM - an OOM kill is the one failure the verify-retry
+    /// cannot rescue, so the budget must gate dispatch up front.
+    #[test]
+    fn ntt_default_budget_scales_to_the_machine() {
+        let gib = 1u64 << 30;
+        assert_eq!(ntt_default_budget(None, None), (4 * gib) as usize);
+        assert_eq!(ntt_default_budget(Some(64 * gib), None), (4 * gib) as usize);
+        assert_eq!(ntt_default_budget(Some(8 * gib), None), (2 * gib) as usize);
+        assert_eq!(ntt_default_budget(Some(4 * gib), None), gib as usize);
+        assert_eq!(
+            ntt_default_budget(Some(64 * gib), Some(2 * gib)),
+            (gib / 2) as usize,
+            "cgroup limit caps regardless of host RAM"
+        );
+        // The heavy benchmark corpus (~0.93 GiB) still clears the gate
+        // on a 16 GiB machine (budget 4 GiB) but not on a 2 GiB one.
+        assert!(ntt_gates_pass(65536, 14884, 1500, 1499, ntt_default_budget(Some(16 * gib), None)));
+        assert!(!ntt_gates_pass(65536, 14884, 1500, 1499, ntt_default_budget(Some(2 * gib), None)));
+    }
+
+    /// Serializes the tests that touch the process-global fast-par
+    /// state (breaker, setting, divergence log) against each other.
+    static NTT_STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn ntt_divergence_falls_back_to_fold_and_records() {
+        let _g = NTT_STATE.lock().unwrap_or_else(|p| p.into_inner());
+        FAST_PAR_TRIPPED.store(false, std::sync::atomic::Ordering::Relaxed);
+        let _ = take_ntt_divergences(); // start from a clean log
+        for (path, expect_panicked) in [
+            (SyndromePath::NttForceCorrupt(usize::MAX), false),
+            (SyndromePath::NttForcePanic(usize::MAX), true),
+        ] {
+            let damage = [(0usize, 1usize), (1usize, 0usize)];
+            let (files, bs, recovery, pristine) = mapped_fixture(&damage);
+            let io = MemIo::new(
+                files
+                    .iter()
+                    .zip(&pristine)
+                    .map(|((_, present), d)| {
+                        // Zero the damaged blocks so a "repair" that did
+                        // nothing cannot pass verification by accident.
+                        let mut v = d.clone();
+                        for (i, &p) in present.iter().enumerate() {
+                            if !p {
+                                let end = ((i + 1) * bs).min(v.len());
+                                v[i * bs..end].fill(0);
+                            }
+                        }
+                        v
+                    })
+                    .collect(),
+                None,
+            );
+            let n = repair_mapped_with_path(&files, bs, &recovery, &io, false, path)
+                .unwrap_or_else(|e| panic!("fold retry did not rescue {path:?}: {e}"));
+            assert_eq!(n, 2, "both damaged blocks rebuilt ({path:?})");
+            assert_eq!(io.snapshot(), pristine, "retry output pristine ({path:?})");
+            assert!(fast_par_tripped(), "divergence must trip the breaker");
+            let events: Vec<NttDivergence> = take_ntt_divergences()
+                .into_iter()
+                .filter(|d| d.context == "f0.bin" && d.panicked == expect_panicked)
+                .collect();
+            assert_eq!(events.len(), 1, "one recorded divergence ({path:?})");
+            let d = &events[0];
+            assert_eq!((d.m, d.block_size), (2, bs), "geometry recorded ({path:?})");
+            if !expect_panicked {
+                assert_eq!(d.n_present, 4, "present slices recorded");
+            }
+        }
+        // Reset the process-global breaker: dispatch-path tests elsewhere
+        // read it, and test order must not matter.
+        FAST_PAR_TRIPPED.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The daemon's "fast par mode" setting reaches the dispatcher, and
+    /// the trip-breaker overrides it; the explicit NttForce test hook
+    /// ignores both (it models the env escape hatch's precedence).
+    #[test]
+    fn fast_par_setting_gates_the_auto_path() {
+        if std::env::var_os("NZBFAST_NTT").is_some() {
+            return; // the env override is exercised manually, not here
+        }
+        let _g = NTT_STATE.lock().unwrap_or_else(|p| p.into_inner());
+        // A shape that passes every gate (the heavy benchmark leg).
+        let exps: Vec<u32> = (0..1500).collect();
+        let resolve = || resolve_syndrome_path(SyndromePath::Auto, 65536, 16384, 1500, &exps);
+        set_fast_par_enabled(false);
+        assert!(resolve().is_none(), "setting off: fold");
+        set_fast_par_enabled(true);
+        assert!(resolve().is_some(), "setting on + gates pass: NTT");
+        FAST_PAR_TRIPPED.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(resolve().is_none(), "tripped breaker forces fold");
+        assert!(
+            resolve_syndrome_path(SyndromePath::NttForce(usize::MAX), 65536, 16384, 1500, &exps)
+                .is_some(),
+            "explicit force path ignores the breaker"
+        );
+        FAST_PAR_TRIPPED.store(false, std::sync::atomic::Ordering::Relaxed);
+        set_fast_par_enabled(false);
+        // Gates still apply on the setting path: the 3-block shape folds.
+        set_fast_par_enabled(true);
+        let small: Vec<u32> = (0..3).collect();
+        assert!(
+            resolve_syndrome_path(SyndromePath::Auto, 65536, 16384, 3, &small).is_none(),
+            "small shapes stay on the fold even with the setting on"
+        );
+        set_fast_par_enabled(FAST_PAR_DEFAULT);
+    }
+
+    /// Non-daemon entry points (the CLI) never call
+    /// [`set_fast_par_enabled`]; they get [`FAST_PAR_DEFAULT`] because
+    /// it is the flag's initializer. This pins the default itself -
+    /// flipping it is a product decision (2026-07-31: ON), not a
+    /// side effect.
+    #[test]
+    fn fast_par_defaults_on_for_every_entry_point() {
+        assert!(FAST_PAR_DEFAULT, "fast par mode ships default ON");
     }
 
     /// The self-prove covers the WHOLE SET, not just the files that

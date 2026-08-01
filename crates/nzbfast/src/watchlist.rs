@@ -775,7 +775,15 @@ pub fn spec_count(spec: &str) -> Option<u32> {
         if let Some((a, b)) = c.split_once('-') {
             if let (Ok(a), Ok(b)) = (a.trim().parse::<u32>(), b.trim().parse::<u32>()) {
                 any_valid = true;
-                n = n.saturating_add(a.max(b) - a.min(b) + 1);
+                // The inner `+ 1` needs the saturation too: it is
+                // evaluated in u32 BEFORE saturating_add ever sees it, so
+                // `episodes = "0-4294967295"` wrapped the span to 0. That
+                // made spec_count Some(0) < PACK_MIN_EPISODES, so
+                // pack_eligible refused every season pack forever - while
+                // `in_range_spec` read the identical string as "every
+                // episode is in scope". Same saturating convention
+                // parse_age_spec adopted after its own field incident.
+                n = n.saturating_add((a.max(b) - a.min(b)).saturating_add(1));
             }
         } else if c.parse::<u32>().is_ok() {
             any_valid = true;

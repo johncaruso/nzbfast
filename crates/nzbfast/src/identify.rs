@@ -550,7 +550,27 @@ fn tmdb_candidates(
                         .unwrap_or(if *code == 429 { 30 } else { 5 });
                     ratelimit::penalise(Provider::Tmdb, wait);
                 }
-                eprintln!("[identify] tmdb: {e}");
+                // NEVER format the whole error: the request URL carries
+                // `api_key=<the user's key>` in its query string, and
+                // ureq's Display prints that URL for both Status and
+                // Transport errors. The log ring this lands in is served
+                // unscrubbed at mode=log and by JSON-RPC loadlog, and gets
+                // pasted into support threads. Rebuilt from the parts that
+                // describe the failure, exactly as notify.rs does for
+                // webhook URLs - which also keeps this correct if the
+                // key's spelling or position in the query ever changes.
+                // The trigger is not exotic: the 429/503 branch directly
+                // above exists because rate-limiting is expected.
+                match &e {
+                    ureq::Error::Status(code, _) => {
+                        eprintln!("[identify] tmdb: status code {code}")
+                    }
+                    ureq::Error::Transport(t) => eprintln!(
+                        "[identify] tmdb: {}{}",
+                        t.kind(),
+                        t.message().map(|m| format!(": {m}")).unwrap_or_default(),
+                    ),
+                }
                 any_failed = true;
                 continue;
             }

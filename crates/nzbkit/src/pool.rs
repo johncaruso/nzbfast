@@ -70,14 +70,20 @@ impl BufPool {
 /// asynchronously so runtime threads are never blocked.
 pub struct RateLimit {
     bytes_per_sec: AtomicU64,
-    window: std::sync::Mutex<(Instant, u64)>,
+    /// Virtual clock: the instant the next charged byte is allowed to
+    /// land. See [`RateLimit::throttle`].
+    next: std::sync::Mutex<Instant>,
+    /// Bumped whenever the cap changes, so a worker already sleeping
+    /// against the OLD cap stops waiting instead of stranding.
+    generation: AtomicU64,
 }
 
 impl Default for RateLimit {
     fn default() -> Self {
         RateLimit {
             bytes_per_sec: AtomicU64::new(0),
-            window: std::sync::Mutex::new((Instant::now(), 0)),
+            next: std::sync::Mutex::new(Instant::now()),
+            generation: AtomicU64::new(0),
         }
     }
 }
@@ -90,8 +96,17 @@ impl RateLimit {
     }
 
     /// Change the cap live. 0 = unlimited.
+    ///
+    /// A change restarts the virtual clock and bumps the generation:
+    /// reservations priced against the old cap are neither re-priced nor
+    /// left holding workers, which is what the old 5-second sleep clamp
+    /// was reaching for.
     pub fn set(&self, bytes_per_sec: u64) {
-        self.bytes_per_sec.store(bytes_per_sec, Ordering::Relaxed);
+        if self.bytes_per_sec.swap(bytes_per_sec, Ordering::Relaxed) == bytes_per_sec {
+            return;
+        }
+        *self.next.lock().unwrap() = Instant::now();
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn get(&self) -> u64 {
@@ -100,29 +115,53 @@ impl RateLimit {
 
     /// Charge `n` bytes against the cap and sleep off any debt so the
     /// aggregate rate stays under `bytes_per_sec`. No-op when unlimited.
+    ///
+    /// A virtual clock, not a byte window: each charge reserves the slice
+    /// of wall time its own bytes are worth AT THE CAP IN FORCE WHEN IT
+    /// IS CHARGED, and the caller waits out that slice. N workers
+    /// therefore queue behind one another and the aggregate rate is the
+    /// cap by construction, at any connection count or article size.
+    ///
+    /// The byte-window version this replaces could not do that. Its sleep
+    /// was clamped to 5 s so that a live cap decrease could not strand a
+    /// worker against stale debt - but nothing ever forgave that debt,
+    /// and its only discharge path (the re-anchor) required the window to
+    /// be paid off, which the clamp itself made unreachable. Once the
+    /// aggregate settled above the cap it stayed there: every call slept
+    /// exactly 5 s forever and the real floor was `connections *
+    /// article_size / 5 s` - about 1.28 MB/s at the shipped default of 8
+    /// connections, so any cap under ~10 Mbit/s was silently exceeded
+    /// with no log line. It also made the --auto-speed governor's whole
+    /// back-off range a no-op, since AUTO_SPEED_FLOOR sits inside it.
+    /// Forgiving the debt and enforcing the cap are mutually exclusive in
+    /// that formulation, which is why the clamp looks reasonable and is
+    /// nonetheless wrong; pricing each charge when it is charged removes
+    /// the need for either.
     pub async fn throttle(&self, n: u64) {
         let cap = self.bytes_per_sec.load(Ordering::Relaxed);
         if cap == 0 || n == 0 {
             return;
         }
-        let sleep = {
-            let mut w = self.window.lock().unwrap();
+        let generation = self.generation.load(Ordering::Relaxed);
+        let deadline = {
+            let mut next = self.next.lock().unwrap();
             let now = Instant::now();
-            let elapsed = now.duration_since(w.0).as_secs_f64();
-            // Re-anchor once the window is old and paid off: keeps the
-            // arithmetic bounded without banking idle-time credit.
-            if elapsed >= 1.0 && (w.1 as f64) <= cap as f64 * elapsed {
-                *w = (now, 0);
-            }
-            w.1 += n;
-            let elapsed = now.duration_since(w.0).as_secs_f64();
-            let owed = w.1 as f64 / cap as f64;
-            // Clamp so a live cap DECREASE never strands a worker in a
-            // multi-second sleep computed against stale window debt.
-            (owed > elapsed).then(|| Duration::from_secs_f64((owed - elapsed).min(5.0)))
+            // `.max(now)` is what stops an idle line banking credit: a
+            // clock left behind in the past resumes from now, not from
+            // where it stopped.
+            let start = (*next).max(now);
+            *next = start + Duration::from_secs_f64(n as f64 / cap as f64);
+            *next
         };
-        if let Some(d) = sleep {
-            tokio::time::sleep(d).await;
+        // Sliced rather than one long sleep so that a live cap change is
+        // noticed within a second even when the reservation is minutes
+        // long (a very low cap against a large article).
+        loop {
+            let now = Instant::now();
+            if now >= deadline || self.generation.load(Ordering::Relaxed) != generation {
+                return;
+            }
+            tokio::time::sleep((deadline - now).min(Duration::from_secs(1))).await;
         }
     }
 }
@@ -299,13 +338,27 @@ pub fn retention_mask(retention_days: &[u32], age_days: u32) -> u32 {
     mask
 }
 
+/// Why the pool declared an article Missing. The distinction is what the
+/// failure summary hangs its diagnosis on: `Retention` means WE never
+/// asked anyone (a configured `retention_days` ruled every server out),
+/// which is a settings problem, not a takedown - folding it into the
+/// generic "missing segments" sent users hunting propagation ghosts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingCause {
+    /// Every server still live was asked and answered 430/423.
+    Gone,
+    /// The article's age exceeds every configured server's
+    /// `retention_days` - no server was ever asked.
+    Retention,
+}
+
 /// Terminal outcome for one article.
 #[derive(Debug)]
 pub enum FetchOutcome {
     /// Raw dot-stuffed body, ready for `yenc::decode`.
     Done { id: String, raw: Vec<u8> },
-    /// Server says the article doesn't exist (430/423).
-    Missing { id: String },
+    /// No server can produce the article; `cause` says why.
+    Missing { id: String, cause: MissingCause },
     /// Transport failures exhausted the retry budget.
     Failed { id: String, error: String },
 }
@@ -315,6 +368,13 @@ pub struct PoolStats {
     pub bytes: u64,
     pub connects: u64,
     pub reconnects: u64,
+    /// Did ANY worker ever hold a usable connection to this server (fresh
+    /// dial or warm-pool hand-me-down)? False means the server sat out
+    /// the entire run - unreachable, or it refused the login - so every
+    /// "unanimous 430" verdict was reached without its vote. The failure
+    /// summary names such servers; without that, one dead backup silently
+    /// turns a single 430 into "missing segments".
+    pub ever_connected: bool,
 }
 
 /// M11 seek re-prioritization: a live handle to a running fetch's pending
@@ -352,13 +412,26 @@ impl QueueControl {
     /// the seek point.) Articles already fetched or in flight are
     /// unaffected. Returns how many were moved.
     pub fn promote(&self, ids: &[String]) -> usize {
+        self.promote_opts(ids, true)
+    }
+
+    /// [`Self::promote`] with the stream-mode side effect explicit.
+    /// `engage_stream: false` reorders the queue WITHOUT flipping the
+    /// pool into shallow pipelines: the extractor's offset-0 probe wants
+    /// its article sooner, but nothing blocks on it, and a scrambled
+    /// many-volume set probes once per slot - each 60 s stream-mode
+    /// linger would chain into the whole download running shallow.
+    pub fn promote_opts(&self, ids: &[String], engage_stream: bool) -> usize {
         let Some(sh) = self.shared.lock().unwrap().as_ref().and_then(std::sync::Weak::upgrade)
         else {
             return 0;
         };
-        // A promote only ever comes from the streaming layer - engage
-        // stream mode (shallow pipelines) even when nothing moves.
-        sh.note_stream();
+        // Streaming-layer promotes (and the 7z chase, whose worker
+        // blocks on the footer) engage stream mode (shallow pipelines)
+        // even when nothing moves.
+        if engage_stream {
+            sh.note_stream();
+        }
         if ids.is_empty() {
             return 0;
         }
@@ -666,6 +739,10 @@ struct Shared {
     /// primary (all its workers bowed out) never wedges the queue.
     levels: Vec<u32>,
     alive: Vec<AtomicUsize>,
+    /// Per-server: latched true the first time any worker holds a usable
+    /// connection (fresh dial or warm-pool). Read into
+    /// `PoolStats::ever_connected` when the run returns.
+    connected: Vec<AtomicBool>,
     /// §15e per-SERVER auth state, one slot per server index.
     ///
     /// A refusal to authenticate is a property of the server, not of the
@@ -987,6 +1064,7 @@ impl Shared {
             dup_wins: AtomicU64::new(0),
             levels: servers.iter().map(|(s, _)| s.level).collect(),
             alive: (0..n_servers).map(|_| AtomicUsize::new(0)).collect(),
+            connected: (0..n_servers).map(|_| AtomicBool::new(false)).collect(),
             auth: (0..n_servers).map(|_| AuthState::default()).collect(),
             workers_live: AtomicUsize::new(0),
             stream_until: AtomicU64::new(0),
@@ -1346,7 +1424,7 @@ pub async fn fetch_all_multi_ctl(
     }
     // Outside every server's retention: Missing without a single request.
     for id in unservable {
-        let _ = out.send(FetchOutcome::Missing { id }).await;
+        let _ = out.send(FetchOutcome::Missing { id, cause: MissingCause::Retention }).await;
     }
 
     let mut workers = Vec::new();
@@ -1405,10 +1483,12 @@ pub async fn fetch_all_multi_ctl(
 
     counters
         .into_iter()
-        .map(|(b, c, r)| PoolStats {
+        .enumerate()
+        .map(|(si, (b, c, r))| PoolStats {
             bytes: b.load(Ordering::Relaxed),
             connects: c.load(Ordering::Relaxed),
             reconnects: r.load(Ordering::Relaxed),
+            ever_connected: shared.connected[si].load(Ordering::Relaxed),
         })
         .collect()
 }
@@ -1648,7 +1728,7 @@ async fn next_work(
     }
     for id in unservable {
         if shared.claim_done(&id) {
-            let _ = out.send(FetchOutcome::Missing { id }).await;
+            let _ = out.send(FetchOutcome::Missing { id, cause: MissingCause::Gone }).await;
             shared.complete_one();
         }
     }
@@ -1698,7 +1778,7 @@ pub fn fetch_all_sharded(
     // Outside every server's retention: Missing without a single request.
     // (Blocking send is fine - this whole function is documented blocking.)
     for id in unservable {
-        let _ = out.blocking_send(FetchOutcome::Missing { id });
+        let _ = out.blocking_send(FetchOutcome::Missing { id, cause: MissingCause::Retention });
     }
 
     let counters: Vec<_> = servers
@@ -1793,10 +1873,12 @@ pub fn fetch_all_sharded(
 
     counters
         .iter()
-        .map(|(b, c, r)| PoolStats {
+        .enumerate()
+        .map(|(si, (b, c, r))| PoolStats {
             bytes: b.load(Ordering::Relaxed),
             connects: c.load(Ordering::Relaxed),
             reconnects: r.load(Ordering::Relaxed),
+            ever_connected: shared.connected[si].load(Ordering::Relaxed),
         })
         .collect()
 }
@@ -2033,6 +2115,7 @@ async fn session_loop(
             Some(c) => {
                 connect_failures = 0;
                 ever_connected = true;
+                shared.connected[ctx.idx].store(true, Ordering::Relaxed);
                 c
             }
             None => {
@@ -2075,6 +2158,7 @@ async fn session_loop(
                     reconnects.fetch_add(1, Ordering::Relaxed);
                 }
                 ever_connected = true;
+                shared.connected[ctx.idx].store(true, Ordering::Relaxed);
                 connect_failures = 0;
                 c
             }
@@ -2104,6 +2188,39 @@ async fn session_loop(
                                 "[pool] {}: authentication rejected, not retrying: {line}",
                                 server.host
                             );
+                            // A 502 is what a server says for a bad
+                            // password AND, on several providers, for
+                            // "too many addresses on this account" -
+                            // same code, opposite remedies. We must not
+                            // reclassify it (a genuinely wrong password
+                            // has to stay permanent, or every worker
+                            // would retry it forever), but a user
+                            // staring at "authentication rejected" on an
+                            // account they know is fine deserves the
+                            // other possibility spelled out. Especially
+                            // on a multi-WAN link, where this host
+                            // presents several public addresses and can
+                            // exhaust a 2-address allowance by itself.
+                            if server.source_ips_are_tight() {
+                                eprintln!(
+                                    "[pool] {}: this account limits how many addresses \
+                                     may connect at once, and that is refused with the \
+                                     same code as a bad password. If the credentials \
+                                     are known good, something else is using the \
+                                     account. Two shapes to check: another machine on \
+                                     the same account, or THIS one leaving by more \
+                                     than one public address. The second is the one \
+                                     that surprises people - a router balancing \
+                                     several WAN links makes one host look like \
+                                     several, and it cannot be fixed from here, \
+                                     because `bind_ip` picks a LOCAL address and the \
+                                     balancing happens after the packets leave. That \
+                                     needs a policy route on the router pinning this \
+                                     traffic to one WAN; bind_ip only helps when this \
+                                     machine itself is multi-homed.",
+                                    server.host
+                                );
+                            }
                         }
                         return;
                     }
@@ -2171,6 +2288,18 @@ async fn session_loop(
                 }
             }
         };
+
+        // An authenticated session supersedes any earlier refusal note: a
+        // capacity refusal (connection/IP cap) is a statement about THAT
+        // moment, and once the server accepts a session again the stale
+        // note would keep the dashboard warning and keep the idle-server
+        // prefetch treating the host as dead. A permanent refusal never
+        // reaches here - its workers all returned above.
+        if let Some(live) = &cfg.live
+            && let Some(sl) = live.servers.get(ctx.idx)
+        {
+            sl.refusal.lock().unwrap().take();
+        }
 
         // Dashboard gauge: this worker holds a session until the next
         // 'session iteration or return drops the guard.
@@ -2444,7 +2573,9 @@ async fn session_loop(
                             }
                         }
                         if unanimous && shared.claim_done(&w.id) {
-                            let _ = out.send(FetchOutcome::Missing { id: w.id }).await;
+                            let _ = out
+                                .send(FetchOutcome::Missing { id: w.id, cause: MissingCause::Gone })
+                                .await;
                             shared.complete_one();
                         }
                         continue;
@@ -2462,7 +2593,9 @@ async fn session_loop(
                     let live = shared.live_mask();
                     if w.tried_430 & live == live {
                         if shared.claim_done(&w.id) {
-                            let _ = out.send(FetchOutcome::Missing { id: w.id }).await;
+                            let _ = out
+                                .send(FetchOutcome::Missing { id: w.id, cause: MissingCause::Gone })
+                                .await;
                             shared.complete_one();
                         }
                     } else if w.promoted {
@@ -2769,6 +2902,9 @@ mod tests {
                     socks5: None,
                     enabled: true,
                     warm_pool: false,
+            idle_release_secs: None,
+            idle_keep: None,
+            max_source_ips: None,
                 },
                 PoolConfig::default(),
             )
@@ -2786,6 +2922,55 @@ mod tests {
             q[1].tried_430, 0b01,
             "30-day article pre-excluded from the 10-day server"
         );
+    }
+
+    /// The retention pre-filter's Missing must carry its own cause: the
+    /// article was never REQUESTED, and telling the user "missing
+    /// segments" for a settings exclusion sent them chasing takedowns
+    /// (Hblife's report was undiagnosable for exactly this reason).
+    #[tokio::test]
+    async fn retention_excluded_articles_report_cause_retention() {
+        use crate::mock::{Chaos, MockServer, make_file_articles};
+        let mut articles = std::collections::HashMap::new();
+        let payload: Vec<u8> = (0..20_000u32).map(|i| i as u8).collect();
+        let segs = make_file_articles("r.bin", &payload, 8_000, "ret", &mut articles);
+        let srv = MockServer::start(articles, Chaos::default()).await;
+        let mut server = srv.server_config();
+        server.retention_days = 10;
+
+        let mut reqs: Vec<ArticleReq> = segs
+            .iter()
+            .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
+            .collect();
+        let n_fresh = reqs.len();
+        reqs.push(ArticleReq { id: "<ancient@x>".into(), age_days: 400 });
+
+        let cfg = PoolConfig {
+            connections: 1,
+            ramp_delay: Duration::ZERO,
+            ..Default::default()
+        };
+        let (tx, mut rx) = mpsc::channel(64);
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            fetch_all_multi(&[(server, cfg)], reqs, tx),
+        )
+        .await
+        .expect("run hung");
+
+        let mut done = 0;
+        let mut retention: Vec<String> = Vec::new();
+        while let Ok(o) = rx.try_recv() {
+            match o {
+                FetchOutcome::Done { .. } => done += 1,
+                FetchOutcome::Missing { id, cause: MissingCause::Retention } => {
+                    retention.push(id)
+                }
+                other => panic!("unexpected outcome: {other:?}"),
+            }
+        }
+        assert_eq!(done, n_fresh, "fresh articles all served");
+        assert_eq!(retention, vec!["<ancient@x>".to_string()]);
     }
 
     #[test]
@@ -2824,6 +3009,9 @@ mod tests {
                 socks5: None,
                 enabled: true,
                 warm_pool: false,
+            idle_release_secs: None,
+            idle_keep: None,
+            max_source_ips: None,
             },
             PoolConfig::default(),
         );
@@ -2912,6 +3100,9 @@ mod tests {
                     socks5: None,
                     enabled: true,
                     warm_pool: false,
+            idle_release_secs: None,
+            idle_keep: None,
+            max_source_ips: None,
                 },
                 PoolConfig::default(),
             )
@@ -2976,6 +3167,9 @@ mod tests {
                     socks5: None,
                     enabled: true,
                     warm_pool: false,
+            idle_release_secs: None,
+            idle_keep: None,
+            max_source_ips: None,
                 },
                 PoolConfig::default(),
             )
@@ -3061,6 +3255,9 @@ mod tests {
                     socks5: None,
                     enabled: true,
                     warm_pool: false,
+            idle_release_secs: None,
+            idle_keep: None,
+            max_source_ips: None,
                 },
                 PoolConfig::default(),
             )
@@ -3133,6 +3330,9 @@ mod tests {
                     socks5: None,
                     enabled: true,
                     warm_pool: false,
+            idle_release_secs: None,
+            idle_keep: None,
+            max_source_ips: None,
                 },
                 PoolConfig::default(),
             )
@@ -3192,6 +3392,9 @@ mod tests {
                 socks5: None,
                 enabled: true,
                 warm_pool: false,
+            idle_release_secs: None,
+            idle_keep: None,
+            max_source_ips: None,
             },
             PoolConfig::default(),
         )];
@@ -3236,6 +3439,9 @@ mod tests {
                 socks5: None,
                 enabled: true,
                 warm_pool: false,
+            idle_release_secs: None,
+            idle_keep: None,
+            max_source_ips: None,
             },
             PoolConfig::default(),
         )]
@@ -3368,6 +3574,9 @@ mod tests {
                     socks5: None,
                     enabled: true,
                     warm_pool: false,
+            idle_release_secs: None,
+            idle_keep: None,
+            max_source_ips: None,
                 },
                 PoolConfig::default(),
             )
@@ -3519,6 +3728,9 @@ mod tests {
                 socks5: None,
                 enabled: true,
                 warm_pool: false,
+            idle_release_secs: None,
+            idle_keep: None,
+            max_source_ips: None,
             },
             PoolConfig::default(),
         )];
@@ -3564,6 +3776,55 @@ mod tests {
         assert!(el <= Duration::from_secs(2), "too slow: {el:?}");
     }
 
+    /// The shipped-default bug: with the old byte-window the per-call
+    /// sleep was clamped to 5 s and the debt was never forgiven, so the
+    /// aggregate could not be held below `connections * article / 5 s` -
+    /// ~1.28 MB/s at 8 connections, i.e. every cap under ~10 Mbit/s was
+    /// silently exceeded.
+    ///
+    /// Necessarily slower than a unit test wants: the clamp is 5 s of
+    /// WALL time, so nothing under that can observe it. 8 workers x
+    /// 150 KB at 150 KB/s owes 8 s; the old code answered in ~5.
+    #[tokio::test]
+    async fn rate_limit_holds_a_cap_below_the_old_clamp_floor() {
+        const CAP: u64 = 150_000;
+        const WORKERS: u64 = 8;
+        let rl = RateLimit::new(CAP);
+        let t0 = Instant::now();
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..WORKERS {
+            let rl = rl.clone();
+            set.spawn(async move { rl.throttle(CAP).await });
+        }
+        while set.join_next().await.is_some() {}
+        let el = t0.elapsed();
+        // Owed is WORKERS seconds (each charges exactly one second's
+        // worth). Generous lower bound: anything near 5 s is the clamp.
+        assert!(
+            el >= Duration::from_secs_f64(WORKERS as f64 * 0.8),
+            "the cap was exceeded - {el:?} for {WORKERS}s of charged bytes"
+        );
+        assert!(el <= Duration::from_secs(WORKERS * 3), "far too slow: {el:?}");
+    }
+
+    /// A live cap change must not leave a worker asleep against the old
+    /// one. The virtual clock prices each charge when it is charged, so a
+    /// decrease never re-prices old bytes; the generation bump is what
+    /// releases anyone already waiting.
+    #[tokio::test]
+    async fn a_live_cap_change_releases_a_sleeping_worker() {
+        let rl = RateLimit::new(1_000); // 1 KB/s: 100 KB owes 100 s
+        let t0 = Instant::now();
+        let waiter = {
+            let rl = rl.clone();
+            tokio::spawn(async move { rl.throttle(100_000).await })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        rl.set(0); // the user removed the limit
+        waiter.await.unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(5), "stranded against the old cap");
+    }
+
     #[tokio::test]
     async fn rate_limit_zero_is_unlimited() {
         let rl = RateLimit::new(0);
@@ -3588,7 +3849,7 @@ mod tests {
         while let Ok(o) = rx.try_recv() {
             let id = match o {
                 FetchOutcome::Done { id, .. }
-                | FetchOutcome::Missing { id }
+                | FetchOutcome::Missing { id, .. }
                 | FetchOutcome::Failed { id, .. } => id,
             };
             *seen.entry(id).or_default() += 1;
@@ -4013,7 +4274,7 @@ mod tests {
         let ids: Vec<String> = articles.keys().cloned().collect();
         let reqs: Vec<ArticleReq> = ids.iter().cloned().map(ArticleReq::fresh).collect();
         let (tx, mut rx) = mpsc::channel(256);
-        tokio::time::timeout(
+        let stats = tokio::time::timeout(
             Duration::from_secs(30),
             fetch_all_multi(
                 &[(healthy.server_config(), live_cfg), (dead, dead_cfg)],
@@ -4024,6 +4285,11 @@ mod tests {
         .await
         .expect("run hung with one dead server");
 
+        // The failure summary names servers that sat out the whole run;
+        // this is the bit it reads.
+        assert!(stats[0].ever_connected, "the healthy server served");
+        assert!(!stats[1].ever_connected, "the dead server never connected");
+
         let mut done = 0;
         let mut seen: HashMap<String, usize> = HashMap::new();
         while let Ok(o) = rx.try_recv() {
@@ -4032,7 +4298,7 @@ mod tests {
                     done += 1;
                     id
                 }
-                FetchOutcome::Missing { id } | FetchOutcome::Failed { id, .. } => id,
+                FetchOutcome::Missing { id, .. } | FetchOutcome::Failed { id, .. } => id,
             };
             *seen.entry(id).or_default() += 1;
         }
@@ -4187,6 +4453,9 @@ mod tests {
             socks5: None,
             enabled: true,
             warm_pool: false,
+            idle_release_secs: None,
+            idle_keep: None,
+            max_source_ips: None,
         };
 
         let mut articles = std::collections::HashMap::new();

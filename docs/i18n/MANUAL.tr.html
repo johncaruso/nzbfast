@@ -476,6 +476,7 @@ bir sunucuyu havuza alıp havuzdan çıkarma. Her sunucuda şunlar bulunur:</p>
 <tr><td>Düzey (katman)</td><td>0 = birincil; daha yüksek düzeyler yalnızca her alt düzeyin kaçırdığı makaleler için istenen dolum sunucularıdır. Sınırsız hesapları 0'a, blok hesaplarını 1+'a koy.</td></tr>
 <tr><td>Blok boyutu (GB)</td><td>Blok (GB başına ücret) hesaplar için: nzbfast ömür boyu kullanımı buna karşı izler ve bittiğinde sunucuyu kullanmayı bırakır (%85'te uyarı).</td></tr>
 </table>
+<p><b>Hesabının bağlantı sınırının altında biraz pay bırak.</b> Bağlantıları sınırın biraz altına ayarlamak hiçbir şeye mal olmaz: hız son bir iki bağlantıdan çok önce düzleşir ve <b>Bağlantı ayarı</b> (<a href="#performance">§13</a>) zaten sınırın altında kalır. İkinci bir cihazın, başka bir istemcinin ya da kopan bir soketten sonraki yeniden denemenin yine de girebilmesini sağlayan şey o boş yerlerdir; aksi hâlde bu taraf her yeri tutarken reddedilirler.</p>
 <h3 id="passwords">Sağlayıcı parolalarınız nasıl saklanıyor</h3>
 <p><code>config.local.json</code> içindeki sağlayıcı parolaları <b>gizlenmiştir,
 şifrelenmemiştir</b>. <code>obf1:</code> ve ardından kodlanmış bir biçim olarak
@@ -917,6 +918,7 @@ gitmiş olanları önceden işaretler. Bu biçimdeki ilk başarısızlık, bir b
 kendiliğinden bir kez yinelenir; çünkü yayılma gecikmesi tıpatıp aynı görünür ve
 kendiliğinden düzelir.</td></tr>
 <tr><td>Biten arşiv parola istiyor</td><td>Geçmiş satırı 🔑 gösterir - parolayı orada gir; iş yerinde biter. </td></tr>
+<tr><td>Bir arşiv çıkarılamıyor</td><td>Parola ve onarım hataları kendilerini Geçmiş satırında adlandırır. Geri kalan her şey için bir kaçış kapısı vardır: Ayarlar → İzleme klasörü &amp; son işlem → <b>Harici unrar ile çıkar</b> (gelişmiş bir ayar) çıkarma işini yerleşik çıkarıcı yerine makinende kurulu <code>unrar</code> programına devreder. Bunun dışında kapalı bırak: yerleşik yol ölçtüğümüz her biçimde daha hızlıdır ve hash adlı gizlenmiş gönderiler zaten her zaman onu kullanır, çünkü unrar onların yeniden adlandırmasını izleyemez. <code>nzbfast get</code> çalıştırmaları için aynı anahtar <code>NZBFAST_NO_NATIVE_UNRAR=1</code> ortam değişkenidir. Yerleşik çıkarıcının reddettiği bir arşivi unrar çıkarırsa, yerleşik yolu düzeltebilmemiz için lütfen bildir.</td></tr>
 <tr><td>Sonarr/Radarr bağlanamıyor</td><td>Port 6789 erişilebilir mi? API anahtarı doğru mu (tam anahtar, NZB anahtarı değil)? İstemci türü SABnzbd olarak mı ayarlı?</td></tr>
 <tr><td>Panel hiç ayarlamadığım bir API anahtarı istiyor</td><td>Yeni bir kurulum kendine bir tane üretir ve onu başlangıçta bir kez yazdırır (<a href="#firstrun-key">§2</a>). Yapılandırmanın yanındaki <code>apikey</code> dosyasında ve başlangıç çıktısındadır. Ya da zaten oturum açmış bir tarayıcıdan Ayarlar → Güvenlik'e kendi anahtarını yaz.</td></tr>
 <tr><td>Ağdaki hiçbir şey arka plan sürecine erişemiyor</td><td><code>--bind</code>'ı denetle: <code>127.0.0.1</code> yalnızca nzbfast'in çalıştığı makineye hizmet eder. Varsayılan olan <code>0.0.0.0</code> her arayüze hizmet eder. Sonra makinenin kendi güvenlik duvarını 6789 portu için denetle.</td></tr>

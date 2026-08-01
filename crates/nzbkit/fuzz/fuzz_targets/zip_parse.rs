@@ -28,6 +28,12 @@ fuzz_target!(|data: &[u8]| {
             // huge entry, and the fuzzer should not be measuring RAM.
             let mut sink = CappedSink { left: 1 << 20 };
             let _ = a.read_entry_to(e, &mut sink);
+            // Phase 3: drive the decrypt paths (ZipCrypto header check,
+            // AE framing/PBKDF2/HMAC) over hostile input too. A fixed
+            // password is fine - the attacker controls the archive, not
+            // the password.
+            let mut sink = CappedSink { left: 1 << 20 };
+            let _ = a.read_entry_to_with(e, &mut sink, Some("pw"));
         }
     }
     let _ = std::fs::remove_file(&path);

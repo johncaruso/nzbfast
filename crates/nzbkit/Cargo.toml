@@ -34,6 +34,10 @@ rusqlite = { version = "0.40.1", features = ["bundled", "functions"] }
 rsa = "0.9"
 sha1 = { version = "0.10", features = ["oid"] }
 flate2 = "1"
+# Already in the tree for 7z (sevenz-rust2's bzip2 feature); named
+# directly so the zip reader can use the same decoder. Cargo dedupes,
+# so this costs no binary size.
+bzip2 = "0.6"
 # RAR5 encrypted store-mode sets: AES-256-CBC + PBKDF2-HMAC-SHA256
 # (RustCrypto - pure Rust, no new C in the tree).
 aes = "0.8"
@@ -45,7 +49,11 @@ sha2 = "0.10"
 rars = { path = "../../vendor/rars" }
 # Nested one-pass phase 3: inner 7z archives parse + decode in-stream
 # through a blocking Read+Seek view of the arriving bytes.
-sevenz-rust2 = { version = "0.21", default-features = false, features = ["aes256", "bzip2", "ppmd"] }
+# `deflate` is free: flate2 is already a direct dependency above, so the
+# decoder is linked either way and a deflate-in-7z archive stops
+# declining. zstd/brotli/lz4 are the remaining codecs 7z permits; each
+# would add a real dependency, so they stay off until one is seen.
+sevenz-rust2 = { version = "0.21", default-features = false, features = ["aes256", "bzip2", "deflate", "ppmd"] }
 
 # PAR2 hashes every downloaded byte through MD5; the asm backend is
 # ~25% faster than the portable soft path - a slow-x86 win (docker
@@ -58,7 +66,7 @@ md-5 = { version = "0.10", features = ["asm"] }
 rand = "0.8"
 # 7z test fixtures are written in-process (the writer needs the encoder
 # half of the crate; release builds keep it off).
-sevenz-rust2 = { version = "0.21", default-features = false, features = ["aes256", "bzip2", "ppmd", "compress"] }
+sevenz-rust2 = { version = "0.21", default-features = false, features = ["aes256", "bzip2", "deflate", "ppmd", "compress"] }
 # test-util: paused-clock tests (the connect-timeout regression test
 # auto-advances past CONNECT_TIMEOUT instead of sleeping 20 s for real).
 tokio = { version = "1", features = ["test-util"] }

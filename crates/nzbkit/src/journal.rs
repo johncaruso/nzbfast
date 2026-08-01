@@ -695,7 +695,7 @@ fn restore_crypto(
                 {
                     return false;
                 }
-                let mut enc = crate::rarcrypt::CbcEncStream::new(&keys.key, &c);
+                let mut enc = crate::rarcrypt::CbcEncStream::new(&keys.aes(), &c);
                 enc.encrypt(&mut walk[..n]);
                 c = walk[n - 16..n].try_into().unwrap();
                 at += n as u64;
@@ -755,7 +755,7 @@ fn restore_crypto(
                 article_ok[j.article] = false;
                 continue;
             }
-            let mut enc = crate::rarcrypt::CbcEncStream::new(&keys.key, &chain);
+            let mut enc = crate::rarcrypt::CbcEncStream::new(&keys.aes(), &chain);
             enc.encrypt(&mut buf);
             let new_chain: [u8; 16] = buf[n - 16..].try_into().unwrap();
             let dest = dests.entry(j.dest.clone()).or_insert_with(|| {

@@ -437,7 +437,13 @@ pub fn multi_fold_width() -> usize {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2") {
-            return 8;
+            // The affine2x group width: 6 matrix PAIRS plus the two
+            // accumulators, the data register and the deinterleave mask
+            // fill the 16-ymm register file exactly (ParPar's
+            // AFFINE2X_AMD64_INTERLEAVE is 6 for the same reason).
+            // Wider groups would spill the hoisted matrices back to L1,
+            // which is precisely the traffic the layout removes.
+            return 6;
         }
         0
     }
@@ -513,76 +519,167 @@ fn affine_matrices(c: u16) -> [u64; 4] {
     ]
 }
 
-/// GFNI+AVX2 multi-source fold: the multi-source twin of
-/// [`MulTable::xor_mul_into_gfni`], mirroring ParPar's GF16_AFFINE
-/// default inside its gf16_muladd_multi framework (public domain,
-/// github.com/animetosho/ParPar, gf16_affine*.c). Per 64-byte chunk the
-/// destination is loaded and stored ONCE for the whole source group;
-/// each source contributes 2 loads, the lo/hi byte split, and four
-/// `gf2p8affineqb`s XORed into two running accumulators. Coefficients
-/// are four 8x8 bit-matrices per source ([`affine_matrices`]) - no
-/// lookup tables are built at all.
+/// The four multiply-by-`c` bit-matrices are GF(2)-LINEAR in `c`
+/// (`mul(a ^ b, w) = mul(a, w) ^ mul(b, w)`), so the matrices for any
+/// coefficient are the XOR of four table entries, one per nibble of `c`
+/// - ParPar's `gf16_bitdep_init256` trick. 64 entries x 32 bytes = 2 KiB,
+/// built once. The fold calls this once per (row, tile, source): the
+/// from-scratch [`affine_matrices`] build (~hundreds of scalar ops) was
+/// a measurable fraction of every small-tile fold call; this is 12 XORs.
+#[cfg(target_arch = "x86_64")]
+fn affine_bitdep() -> &'static [[[u64; 4]; 16]; 4] {
+    static T: OnceLock<[[[u64; 4]; 16]; 4]> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut t = [[[0u64; 4]; 16]; 4];
+        for (p, tp) in t.iter_mut().enumerate() {
+            for (v, e) in tp.iter_mut().enumerate() {
+                *e = affine_matrices((v as u16) << (4 * p));
+            }
+        }
+        t
+    })
+}
+
+/// [`affine_matrices`] via the nibble table: 4 lookups + 12 XORs.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn affine_matrices_fast(c: u16) -> [u64; 4] {
+    let t = affine_bitdep();
+    let a = &t[0][(c & 0xf) as usize];
+    let b = &t[1][((c >> 4) & 0xf) as usize];
+    let d = &t[2][((c >> 8) & 0xf) as usize];
+    let e = &t[3][(c >> 12) as usize];
+    [
+        a[0] ^ b[0] ^ d[0] ^ e[0],
+        a[1] ^ b[1] ^ d[1] ^ e[1],
+        a[2] ^ b[2] ^ d[2] ^ e[2],
+        a[3] ^ b[3] ^ d[3] ^ e[3],
+    ]
+}
+
+/// GFNI+AVX2 multi-source fold in ParPar's affine2x layout (public
+/// domain, github.com/animetosho/ParPar, gf16_affine2x_x86.h +
+/// gf16_affine_avx2.c - layout ported, code our own).
+///
+/// Each 32-byte chunk is deinterleaved ONCE on load (`vpshufb`, ParPar's
+/// `separate_low_high`): per 128-bit lane, qword 0 holds the 8 words'
+/// low bytes and qword 1 their high bytes. `gf2p8affineqb` applies one
+/// 8x8 bit-matrix per qword lane, so multiply-by-c is then TWO affines
+/// per source instead of four: matNorm = [lo→lo, hi→hi] computes the
+/// same-half contributions in place, matSwap = [lo→hi, hi→lo] the
+/// cross-half ones, which come home with a single qword swap. The swap
+/// and the re-interleave both distribute over XOR, so they hoist out of
+/// the source loop - per source the steady state is one load, one
+/// shuffle, two affines and two XORs, with the matrix pairs
+/// REGISTER-RESIDENT across the whole chunk loop (the monomorphized
+/// source count pins them, exactly like the aarch64 sha3 kernel).
+///
+/// The previous kernel re-broadcast four matrices per source per chunk
+/// from L1 and paid a packus deinterleave per source per chunk; it
+/// measured at half ParPar's per-core rate for exactly that reason
+/// (24.8 vs 48.3 GB/s on an i7-1280P P-core - the TODO 58 item B
+/// decomposition).
+///
+/// Everything here is 128-bit-LANE-LOCAL (the deinterleave, the qword
+/// swap, the matrix pattern): widening to zmm for full-width AVX-512
+/// GFNI parts (Zen 4/5) is just broadcasting the same 128-bit patterns
+/// wider, per the 2026-07-30 PAR SOTA survey. Keep it that way.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "gfni,avx2")]
 unsafe fn xor_mul_multi_gfni(dst: &mut [u16], srcs: &[&[u8]], coeffs: &[u16]) -> usize {
-    use std::arch::x86_64::*;
-    let chunks = (dst.len() * 2) / 64;
-    if chunks == 0 || srcs.is_empty() {
+    if srcs.is_empty() {
         return 0;
     }
-    let n = srcs.len().min(16);
-    // 32 bytes of matrix per source, broadcast from L1 inside the chunk
-    // loop (holding them all in ymm registers would spill past 3-4
-    // sources; broadcast loads are cheap and off the critical path).
-    let mut mats = [[0u64; 4]; 16];
-    for s in 0..n {
-        mats[s] = affine_matrices(coeffs[s]);
+    // Every group must fold the SAME chunk range: the caller finishes
+    // `dst[done..]` per source, so a group that ran further than another
+    // would leave its extra chunks double-folded. Clamp once, up front,
+    // to the shortest source (sources may legally be one byte short of
+    // an odd-length dst).
+    let usable = srcs.iter().fold(dst.len() * 2, |m, s| m.min(s.len()));
+    let chunks = usable / 32;
+    if chunks == 0 {
+        return 0;
     }
+    // Groups of `multi_fold_width` keep the matrix pairs
+    // register-resident; a wider call simply takes more passes over the
+    // dst tile, as the caller's own grouping would.
+    let mut g0 = 0usize;
+    while g0 < srcs.len() {
+        let g1 = (g0 + 6).min(srcs.len());
+        let s = &srcs[g0..g1];
+        let c = &coeffs[g0..g1];
+        unsafe {
+            match g1 - g0 {
+                1 => xor_mul_multi_gfni_n::<1>(dst, s, c, chunks),
+                2 => xor_mul_multi_gfni_n::<2>(dst, s, c, chunks),
+                3 => xor_mul_multi_gfni_n::<3>(dst, s, c, chunks),
+                4 => xor_mul_multi_gfni_n::<4>(dst, s, c, chunks),
+                5 => xor_mul_multi_gfni_n::<5>(dst, s, c, chunks),
+                _ => xor_mul_multi_gfni_n::<6>(dst, s, c, chunks),
+            }
+        }
+        g0 = g1;
+    }
+    chunks * 16
+}
+
+/// One register-resident group of the affine2x fold: see
+/// [`xor_mul_multi_gfni`]. `N` is the exact source count so LLVM
+/// unrolls the source loop and pins the `2·N` matrices in ymm registers
+/// (at N = 6 the register file is full - see [`multi_fold_width`]).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "gfni,avx2")]
+unsafe fn xor_mul_multi_gfni_n<const N: usize>(
+    dst: &mut [u16],
+    srcs: &[&[u8]],
+    coeffs: &[u16],
+    chunks: usize,
+) {
+    use std::arch::x86_64::*;
+    debug_assert_eq!(srcs.len(), N);
+    debug_assert!(srcs.iter().all(|s| s.len() >= chunks * 32));
     unsafe {
-        let lo8 = _mm256_set1_epi16(0x00ff);
+        // matNorm/matSwap per source, from the same four 8x8 bit-matrices
+        // the single-source path uses ([`affine_matrices`]: [ll, hl, lh,
+        // hh] = [lo→lo, hi→lo, lo→hi, hi→hi]). Qword lanes 0/2 act on
+        // low-byte qwords, lanes 1/3 on high-byte qwords.
+        let mut mat_n = [_mm256_setzero_si256(); N];
+        let mut mat_s = [_mm256_setzero_si256(); N];
+        let mut src_ptr = [std::ptr::null::<u8>(); N];
+        for s in 0..N {
+            let m = affine_matrices_fast(coeffs[s]);
+            mat_n[s] = _mm256_set_epi64x(m[3] as i64, m[0] as i64, m[3] as i64, m[0] as i64);
+            mat_s[s] = _mm256_set_epi64x(m[1] as i64, m[2] as i64, m[1] as i64, m[2] as i64);
+            src_ptr[s] = srcs[s].as_ptr();
+        }
+        // ParPar's separate_low_high / its inverse, per 128-bit lane.
+        let deint = _mm256_broadcastsi128_si256(_mm_setr_epi8(
+            0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15,
+        ));
+        let inter = _mm256_broadcastsi128_si256(_mm_setr_epi8(
+            0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15,
+        ));
         let dst_bytes = dst.as_mut_ptr() as *mut u8;
         for ch in 0..chunks {
-            let off = ch * 64;
-            let mut plo = _mm256_setzero_si256();
-            let mut phi = _mm256_setzero_si256();
-            for (s, &src) in srcs[..n].iter().enumerate() {
-                let sp = src.as_ptr().add(off) as *const __m256i;
-                let v0 = _mm256_loadu_si256(sp);
-                let v1 = _mm256_loadu_si256(sp.add(1));
-                let slo =
-                    _mm256_packus_epi16(_mm256_and_si256(v0, lo8), _mm256_and_si256(v1, lo8));
-                let shi =
-                    _mm256_packus_epi16(_mm256_srli_epi16(v0, 8), _mm256_srli_epi16(v1, 8));
-                let mll = _mm256_set1_epi64x(mats[s][0] as i64);
-                let mhl = _mm256_set1_epi64x(mats[s][1] as i64);
-                let mlh = _mm256_set1_epi64x(mats[s][2] as i64);
-                let mhh = _mm256_set1_epi64x(mats[s][3] as i64);
-                plo = _mm256_xor_si256(
-                    plo,
-                    _mm256_xor_si256(
-                        _mm256_gf2p8affine_epi64_epi8::<0>(slo, mll),
-                        _mm256_gf2p8affine_epi64_epi8::<0>(shi, mhl),
-                    ),
-                );
-                phi = _mm256_xor_si256(
-                    phi,
-                    _mm256_xor_si256(
-                        _mm256_gf2p8affine_epi64_epi8::<0>(slo, mlh),
-                        _mm256_gf2p8affine_epi64_epi8::<0>(shi, mhh),
-                    ),
-                );
+            let off = ch * 32;
+            let mut acc_n = _mm256_setzero_si256();
+            let mut acc_s = _mm256_setzero_si256();
+            for s in 0..N {
+                let data = _mm256_loadu_si256(src_ptr[s].add(off) as *const __m256i);
+                let data = _mm256_shuffle_epi8(data, deint);
+                acc_n =
+                    _mm256_xor_si256(acc_n, _mm256_gf2p8affine_epi64_epi8::<0>(data, mat_n[s]));
+                acc_s =
+                    _mm256_xor_si256(acc_s, _mm256_gf2p8affine_epi64_epi8::<0>(data, mat_s[s]));
             }
+            // 0x4E = _MM_SHUFFLE(1,0,3,2): swap the qwords of each lane,
+            // bringing the cross-half contributions home.
+            let res = _mm256_xor_si256(acc_n, _mm256_shuffle_epi32::<0x4E>(acc_s));
+            let res = _mm256_shuffle_epi8(res, inter);
             let dp = dst_bytes.add(off) as *mut __m256i;
-            let d0 = _mm256_loadu_si256(dp);
-            let d1 = _mm256_loadu_si256(dp.add(1));
-            _mm256_storeu_si256(dp, _mm256_xor_si256(d0, _mm256_unpacklo_epi8(plo, phi)));
-            _mm256_storeu_si256(
-                dp.add(1),
-                _mm256_xor_si256(d1, _mm256_unpackhi_epi8(plo, phi)),
-            );
+            _mm256_storeu_si256(dp, _mm256_xor_si256(_mm256_loadu_si256(dp), res));
         }
     }
-    chunks * 32
 }
 
 /// The pmull Karatsuba fold, plain-NEON form (no sha3): same Q-register
@@ -919,7 +1016,11 @@ mod tests {
         let coeff_pool = [
             0u16, 1, 2, 0x00FF, 0xFF00, 0x0101, 0x100B, 0x8000, 0xFFFF, 0x1234, 0xABCD,
         ];
-        for n in 1..=width {
+        // `width + 2` deliberately overshoots the group width: callers
+        // never do, but the kernels accept it (the x86 affine2x kernel
+        // splits internally into register-resident groups; the aarch64
+        // kernels loop sources), and the split path must stay correct.
+        for n in 1..=width + 2 {
             for words in [16usize, 32, 48, 160, 4096] {
                 let srcs_owned: Vec<Vec<u8>> = (0..n)
                     .map(|_| (0..words * 2).map(|_| rng() as u8).collect())

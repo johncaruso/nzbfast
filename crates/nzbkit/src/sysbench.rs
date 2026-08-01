@@ -502,6 +502,19 @@ pub struct SystemReport {
     /// Expected sustained download speed = min of the three.
     pub expected_gbps: f64,
     pub advice: String,
+    /// What the network figure was actually measured over: the provider
+    /// it pulled from and how many connections it opened. Without these
+    /// the row reads as a line-speed test and gets compared against one
+    /// (issue #12) - it is neither. Empty/0 when the caller does not
+    /// know, so the UI simply omits the qualifier.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub network_host: String,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub network_conns: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 pub fn verdict(network_gbps: f64, compute: &ComputeReport, disk_gbps: f64) -> SystemReport {
@@ -544,6 +557,10 @@ pub fn verdict(network_gbps: f64, compute: &ComputeReport, disk_gbps: f64) -> Sy
         bottleneck: bottleneck.to_string(),
         expected_gbps: expected,
         advice,
+        // Filled in by the caller, which is the one that knows what it
+        // pointed the probe at.
+        network_host: String::new(),
+        network_conns: 0,
     }
 }
 

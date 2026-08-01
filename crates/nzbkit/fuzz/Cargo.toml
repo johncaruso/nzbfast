@@ -55,6 +55,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "rar_map"
+path = "fuzz_targets/rar_map.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "rar_recovery_scan"
 path = "fuzz_targets/rar_recovery_scan.rs"
 test = false

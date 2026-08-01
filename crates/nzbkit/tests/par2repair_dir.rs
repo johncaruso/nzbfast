@@ -296,3 +296,69 @@ fn overlong_file_is_truncated_back_to_spec() {
     }
     assert_eq!(read(&t.0, "f.bin"), data);
 }
+
+/// The obfuscated post: NOTHING on disk is named `.par2`, and the data
+/// files carry hashes rather than the names PAR2 knows them by.
+///
+/// This is public issue #9. A post like that reaches the repair path with
+/// every file classified as payload, because classification runs off the
+/// NZB's subject lines and those say nothing. `repair_dir` itself has
+/// always been able to cope - it magic-sniffs packets and hash-matches
+/// obfuscated data files during its adoption scan - so the fix upstream
+/// is to CALL it, and this pins the capability it is being called for.
+#[test]
+fn a_fully_obfuscated_set_still_repairs() {
+    if !have_par2() {
+        eprintln!("skipping: par2 not installed");
+        return;
+    }
+    let t = TempDir::new("obfusc");
+    let a = payload(30_000, 11);
+    let b = payload(12_000, 12);
+    std::fs::write(t.0.join("a.bin"), &a).unwrap();
+    std::fs::write(t.0.join("b.bin"), &b).unwrap();
+    par2_create(&t.0, &["a.bin", "b.bin"], &["-r40"]);
+
+    // Damage BEFORE renaming: a corrupt run in a.bin, b.bin deleted
+    // outright. Deleting one is the important half - it can only come
+    // back if the set was understood well enough to recreate it under
+    // its real name.
+    let mut bytes = std::fs::read(t.0.join("a.bin")).unwrap();
+    bytes[200..900].fill(0xAB);
+    std::fs::write(t.0.join("a.bin"), bytes).unwrap();
+    std::fs::remove_file(t.0.join("b.bin")).unwrap();
+
+    // Now obfuscate everything: hash-ish stems, no extension anywhere.
+    // The index, every recovery volume and the surviving data file.
+    let mut renamed = 0;
+    let mut entries: Vec<_> = std::fs::read_dir(&t.0)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    entries.sort();
+    for (i, p) in entries.iter().enumerate() {
+        let to = t.0.join(format!("k7Xq{i:02}mZr9"));
+        std::fs::rename(p, &to).unwrap();
+        renamed += 1;
+    }
+    assert!(renamed >= 3, "expected an index, volumes and data");
+    assert!(
+        std::fs::read_dir(&t.0)
+            .unwrap()
+            .flatten()
+            .all(|e| e.path().extension().is_none()),
+        "the point of this test is that no name carries a hint"
+    );
+
+    match repair_dir(&t.0).expect("repair runs") {
+        RepairStatus::Repaired(r) => {
+            assert!(r.blocks_rebuilt > 0, "nothing was actually rebuilt");
+        }
+        other => panic!("expected Repaired, got {other:?}"),
+    }
+    // Both files back, byte-exact, under their true PAR2 names - the
+    // deleted one had to be recreated from the FileDesc packets.
+    assert_eq!(read(&t.0, "a.bin"), a, "corrupt file not restored");
+    assert_eq!(read(&t.0, "b.bin"), b, "deleted file not recreated");
+}

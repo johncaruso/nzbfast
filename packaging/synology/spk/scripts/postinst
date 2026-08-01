@@ -148,6 +148,31 @@ fi
 owner=$(stat -c %U "$VAR" 2>/dev/null || echo "")
 group=$(stat -c %G "$VAR" 2>/dev/null || echo "")
 
+# A directory can be searchable without being writable, and [ -d ] passes
+# on the x bit alone. A Container Manager migration leaves
+# <share>/nzbfast/downloads owned by the container's PUID at mode 0755, so
+# once the admin grants the package account access to the SHARE, the
+# pre-existing children are still read-only to us. Persisting one of those
+# as the download folder installs cleanly, starts cleanly, and then fails
+# every single job - with the reason only in a log the GUI does not
+# surface, which is the failure the rest of this script exists to prevent.
+#
+# Create, rename, then delete: DSM's ACLs make "delete" a right of its
+# own, so being able to create a file somewhere does not prove we can
+# finish a download and tidy up after it. This runs inside somebody's live
+# download folder, so it cleans up on every path.
+dir_writable() {
+    _p="$1/.nzbfast-write-test.$$"
+    ( umask 077; : > "$_p" ) 2>/dev/null || { rm -f "$_p" 2>/dev/null; return 1; }
+    if ! mv "$_p" "$_p.2" 2>/dev/null; then
+        rm -f "$_p" 2>/dev/null
+        return 1
+    fi
+    rm -f "$_p.2" 2>/dev/null || return 1
+    [ ! -e "$_p.2" ] || return 1
+    return 0
+}
+
 # Create the pair under $1, chowning ONLY what we actually create.
 #
 # Never chown something that was already there. The obvious path,
@@ -163,6 +188,7 @@ make_dirs() {
     _reused=""
     for _d in "$_base/downloads" "$_base/watch"; do
         if [ -d "$_d" ]; then
+            dir_writable "$_d" || return 1
             _reused="$_reused $_d"
             continue
         fi

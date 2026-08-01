@@ -763,6 +763,48 @@ fn bind_parses_and_defaults_to_all_interfaces() {
     );
 }
 
+/// A failed bind on a genuine FIRST run mints a key the user is never
+/// shown: the mint precedes the bind, the "API key:" banner follows it,
+/// so attempt 1 dies holding a fresh credential and a launcher's retry
+/// then takes the reuse path and prints nothing either (measured 28 Jul:
+/// fresh dir + held port, 48-byte apikey file, zero "API key:" lines on
+/// BOTH attempts). The failure path must disclose where the key landed;
+/// the happy-path banner placement is deliberate and unchanged.
+#[test]
+fn failed_bind_on_first_run_discloses_the_minted_keyfile() {
+    let dir = scratch("bindfail-mint");
+    // Hold the port so the daemon's bind fails after the mint.
+    let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = holder.local_addr().unwrap().port();
+    let log = expect_refusal(&dir, port, &["--bind", "127.0.0.1"]);
+    // The mint really happened: 48 hex chars beside the config...
+    let keyfile = dir.join("apikey");
+    let key = std::fs::read_to_string(&keyfile).expect("first run must have minted a key");
+    assert_eq!(key.trim().len(), 48, "not a minted key: {key:?}");
+    // ...and the refusal DISCLOSED it, pointing at the file (this exact
+    // exit used to print only the bind error).
+    assert!(
+        log.contains("created an API key"),
+        "failed first run exited without disclosing the mint:\n{log}"
+    );
+    assert!(
+        log.contains(&keyfile.display().to_string()),
+        "disclosure does not point at the keyfile:\n{log}"
+    );
+    // Attempt 2 with the port free: the reuse path serves with THAT key,
+    // silently as designed (nothing minted this run, nothing to
+    // disclose) - and the disclosed file is the credential that works.
+    drop(holder);
+    let r = serve(&dir, &[]);
+    let body = http(r.port, &format!("/api?mode=version&output=json&apikey={}", key.trim()));
+    assert!(body.contains("nzbfast"), "disclosed key does not authenticate: {body}");
+    assert!(
+        !r.log().contains("created an API key"),
+        "reuse path must not repeat the failure disclosure:\n{}",
+        r.log()
+    );
+}
+
 /// This host's routable IPv4, if it has one (no packets are sent).
 fn lan_ip() -> Option<std::net::Ipv4Addr> {
     let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;

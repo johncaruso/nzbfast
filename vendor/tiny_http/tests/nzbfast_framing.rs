@@ -825,3 +825,39 @@ fn a_drained_body_leaves_the_connection_usable() {
         got
     );
 }
+
+/// Patch 6 (addendum). Two DISAGREEING Content-Lengths are the CL.CL half
+/// of RFC 7230 3.3.3: we took the first with `.find` while a front end may
+/// take the last, so the declared body was served as a second request -
+/// with full API authority on a keyless origin behind an auth proxy.
+#[test]
+fn conflicting_content_lengths_do_not_become_a_second_request() {
+    let (addr, _server) = serve();
+    let smuggled = "GET /api?mode=shutdown HTTP/1.1\r\nHost: x\r\n\r\n";
+    let wire = format!(
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nContent-Length: {}\r\n\r\n{}",
+        smuggled.len(),
+        smuggled
+    );
+    let reply = send_raw_tolerant(&addr, wire.as_bytes());
+    assert!(reply.starts_with("HTTP/1.1 400"), "expected refusal, got: {reply:?}");
+    assert_eq!(
+        reply.matches("HTTP/1.1 ").count(),
+        1,
+        "the smuggled request must never be answered: {reply:?}"
+    );
+}
+
+/// ...and the deliberate limit of that check. Repeats that AGREE are framed
+/// identically by every recipient and the RFC allows collapsing them, so
+/// they stay served. Refusing these would be over-tightening.
+#[test]
+fn identical_repeated_content_lengths_are_still_served() {
+    let (addr, _server) = serve();
+    let wire = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    let reply = send_raw_tolerant(&addr, wire);
+    assert!(
+        reply.starts_with("HTTP/1.1 200"),
+        "identical repeats must still be served: {reply:?}"
+    );
+}

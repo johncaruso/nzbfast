@@ -30,6 +30,7 @@ pub mod nzb;
 pub mod nzblnk;
 pub mod oracle;
 pub mod par2;
+pub mod par2ntt;
 pub mod par2repair;
 pub mod pool;
 pub mod post;
@@ -44,5 +45,6 @@ pub mod warmpool;
 pub mod yenc;
 pub mod yenc_simd;
 pub mod zip;
+pub mod zipcrypt;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

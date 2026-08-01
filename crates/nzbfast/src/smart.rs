@@ -953,16 +953,45 @@ pub fn cleanup(dir: &Path, exts: &[String]) -> usize {
 /// change - or, in the test suite, another test's `set_delete_to_trash` -
 /// landed halfway through a sweep and split it between the two behaviours.
 pub fn remove_user_file(path: &Path, recoverable: bool) -> std::io::Result<()> {
-    if recoverable {
+    if recoverable && !trash_unresponsive() {
         match trash::delete(path) {
             Ok(()) => return Ok(()),
-            Err(e) => eprintln!(
-                "[cleanup] could not move {} to the Trash ({e}) - deleting it instead",
-                path.display()
-            ),
+            Err(e) => {
+                eprintln!(
+                    "[cleanup] could not move {} to the Trash ({e}) - deleting it instead",
+                    path.display()
+                );
+                // On a headless Mac the crate's Finder/AppleScript backend
+                // does not fail fast: every call blocks ~2 minutes before
+                // "AppleEvent timed out (-1712)". A queue of three jobs
+                // carries dozens of par2/nfo cleanup files, and those
+                // serialized stalls measured as 720 s of a 863 s job - the
+                // job is not done until its cleanup is. One timeout means
+                // every later call will stall the same way, so latch it and
+                // delete directly for the rest of the process. Ordinary
+                // failures (a volume with no trash dir) stay per-file:
+                // they are instant and the next file may live elsewhere.
+                let msg = e.to_string();
+                if msg.contains("timed out") || msg.contains("-1712") {
+                    eprintln!(
+                        "[cleanup] the Trash is not responding (headless session?) - \
+                         deleting directly from now on"
+                    );
+                    TRASH_UNRESPONSIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
         }
     }
     std::fs::remove_file(path)
+}
+
+/// Latched by `remove_user_file` on the first Finder-timeout failure;
+/// deliberately never reset - a Finder that timed out once will do it
+/// again, and each probe costs ~2 minutes of a live job.
+static TRASH_UNRESPONSIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub fn trash_unresponsive() -> bool {
+    TRASH_UNRESPONSIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Process-global so the free functions in here need no Daemon handle.
@@ -2170,6 +2199,24 @@ pub fn unlock(dir: &Path, password: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trash_latch_still_deletes_the_file() {
+        // With the Finder-unresponsive latch set, a recoverable delete must
+        // skip the Trash entirely (each probe costs ~2 minutes headless)
+        // and still remove the file. Restore the latch afterwards: it is
+        // process-global and this is the only test that touches it.
+        let dir = std::env::temp_dir().join(format!("trash-latch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("junk.par2");
+        std::fs::write(&f, b"x").unwrap();
+        TRASH_UNRESPONSIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let r = remove_user_file(&f, true);
+        TRASH_UNRESPONSIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+        r.unwrap();
+        assert!(!f.exists(), "file must be gone even with the Trash latched off");
+        let _ = std::fs::remove_dir(&dir);
+    }
 
     fn rule(pattern: &str) -> Rule {
         Rule {

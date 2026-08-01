@@ -197,10 +197,10 @@ where
         // the cap parses as "no Content-Length", so the handler simply sees an
         // empty body and there is nothing to drain.
         const MAX_CONTENT_LENGTH: usize = 1024 * 1024 * 1024;
-        match headers
+        let mut lengths = headers
             .iter()
-            .find(|h: &&Header| h.field.equiv("Content-Length"))
-        {
+            .filter(|h: &&Header| h.field.equiv("Content-Length"));
+        match lengths.next() {
             None => None,
             Some(h) => {
                 // nzbfast patch 6 (see VENDORING.md): a Content-Length we
@@ -221,10 +221,30 @@ where
                 // is that text; we see two requests and run the second on a
                 // keyless origin, behind whatever path policy the proxy
                 // believed it was enforcing.
-                match FromStr::from_str(h.value.as_str()) {
-                    Ok(len) if len <= MAX_CONTENT_LENGTH => Some(len),
+                let len: usize = match FromStr::from_str(h.value.as_str()) {
+                    Ok(len) if len <= MAX_CONTENT_LENGTH => len,
                     _ => return Err(RequestCreationError::BadFraming),
+                };
+                // nzbfast patch 6 (addendum): the SAME desync reached
+                // through two Content-Length headers rather than one bad
+                // one. `.find` took the FIRST while a front end may take
+                // the last, so
+                //     Content-Length: 0
+                //     Content-Length: 44
+                // let the declared body be parsed as the next request -
+                // the CL.CL half of RFC 7230 3.3.3, whose CL+TE half is
+                // already refused above. Repeats that AGREE are framed
+                // identically by every recipient and the RFC allows
+                // collapsing them, so only a DISAGREEMENT is refused:
+                // refusing the rest would be over-tightening against
+                // middleboxes that duplicate headers harmlessly.
+                for other in lengths {
+                    match other.value.as_str().parse::<usize>() {
+                        Ok(n) if n == len => {}
+                        _ => return Err(RequestCreationError::BadFraming),
+                    }
                 }
+                Some(len)
             }
         }
     };

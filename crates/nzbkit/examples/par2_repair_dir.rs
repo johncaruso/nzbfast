@@ -9,6 +9,25 @@ use std::time::Instant;
 
 fn main() {
     let dir = std::env::args().nth(1).expect("usage: par2_repair_dir <dir>");
+    // The daemon does this at startup (crates/nzbfast/src/main.rs), and a
+    // bench driver that skips it measures the Windows scheduler instead of the
+    // repair path: execution-speed throttling demotes sustained "background"
+    // work onto E-cores a few seconds in, which took a heavy repair leg from
+    // 16.6 s to 58 s on the laptop rig. No effect anywhere else.
+    nzbkit::mem::opt_out_of_power_throttling();
+    // Mirror the daemon's "fast par mode" setting, which serve.rs turns ON at
+    // startup (FAST_PAR_DEFAULT). The library flag defaults to OFF because it
+    // is the daemon's setting to own, so a driver that skips this call runs
+    // the streaming fold and reports a configuration nobody ships any more -
+    // the same class of mistake as benchmarking `ourrars` instead of
+    // `prodrar`. It cost a heavy-damage repair leg 3x in the 31 Jul round.
+    //
+    // MUST TRACK `nzbfast::serve::FAST_PAR_DEFAULT`; nzbkit cannot depend on
+    // the daemon crate to read it directly.
+    //
+    // `NZBFAST_NTT=0` still forces the fold (the env overrides the setting in
+    // both directions), which is how the fold comparison column is measured.
+    nzbkit::par2repair::set_fast_par_enabled(true);
     let t0 = Instant::now();
     let status = nzbkit::par2repair::repair_dir(std::path::Path::new(&dir));
     println!("total {:.3?}  status: {:?}", t0.elapsed(), status.map(|s| match s {

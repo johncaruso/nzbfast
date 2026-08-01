@@ -113,6 +113,191 @@ pub struct ServerConfig {
     /// guess:  measures THIS server and recommends.
     #[serde(default)]
     pub warm_pool: bool,
+    /// Seconds this server's connections may stay open with nothing
+    /// downloading, before the daemon hangs them up so the account is
+    /// usable from the operator's other machines.
+    ///
+    /// `None` = derive from the provider ([`caps_source_ips`]);
+    /// `Some(0)` = hold them open indefinitely, which is right when this
+    /// install is the account's only consumer (a NAS, a seedbox).
+    ///
+    /// PER SERVER, and for a stronger reason than `warm_pool` above: a
+    /// server is an ACCOUNT, and each provider counts its own limit
+    /// against its own account. Two servers share nothing. Letting a
+    /// strict provider's cap shorten a lax one's timeout would throw
+    /// away warm connections on a link that never had a problem, and
+    /// letting a lax one lengthen a strict one's would leave the lockout
+    /// in place - so there is no correct single answer for a mixed
+    /// config, only a per-account one.
+    ///
+    /// Independent of `warm_pool`: the background samplers (the M29
+    /// availability oracle and the tip watcher) hold one session per
+    /// server whether or not the pool is on, so this has to bind for a
+    /// server that never opted into pooling at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_release_secs: Option<u64>,
+    /// Connections to this server kept open through that release, so the
+    /// next download still starts warm. `None` = derive.
+    ///
+    /// Counted in CONNECTIONS, because connections are what the pool
+    /// controls. On a provider that limits ADDRESSES the useful
+    /// distinction is only none-or-some: this host is one address
+    /// whether it holds one connection or sixty, so any non-zero value
+    /// occupies exactly one of that account's address slots. Which is
+    /// why the derived default for those providers is zero - see
+    /// [`ServerConfig::idle_release_policy`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_keep: Option<u32>,
+    /// How many distinct source ADDRESSES this account may use at once,
+    /// as stated by the provider. `None` = not known.
+    ///
+    /// A different quantity from `connections`, and the two are easy to
+    /// confuse because providers print them side by side: `connections`
+    /// is how many sockets one machine may open, this is how many
+    /// PLACES may use the account at all. UsenetExpress allows 2,
+    /// Giganews and Newshosting 1, and plenty of providers set no limit.
+    ///
+    /// It exists because the hostname heuristic in [`caps_source_ips`]
+    /// can only recognise providers we happen to have heard of, and gets
+    /// resellers wrong in both directions. A number the user read off
+    /// their provider's control panel beats any guess we can make, so
+    /// when it is set it decides the idle-release default outright.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_source_ips: Option<u32>,
+}
+
+/// Does this host belong to a provider that caps concurrent distinct
+/// SOURCE IPS per account, rather than (or as well as) connections?
+///
+/// The distinction changes what an idle held connection costs. Against a
+/// connection cap, one parked session is one slot out of an allowance of
+/// twenty or a hundred. Against an IP cap - UsenetExpress allows 2
+/// concurrent source IPs, Giganews and Newshosting 1 - a single held
+/// session consumes a whole slot for the HOST, so an idle home daemon
+/// locks a laptop, a seedbox or a bench machine out of the account
+/// entirely, and trimming a fleet of 64 down to 1 frees exactly nothing.
+///
+/// A HINT, not a fact table, and deliberately used only to pick a
+/// DEFAULT that the operator can override:
+///
+/// - It under-detects. Resellers front the same backbones under their
+///   own hostnames, and a provider can change its policy without
+///   changing its hostname. Matching by substring cannot see either.
+/// - It never over-restricts anything that matters: a false positive
+///   costs a shorter idle timeout and a floor of zero, which is a small
+///   re-warm, not a broken download.
+///
+/// The setting is the real control; this only decides where it starts.
+pub fn caps_source_ips(host: &str) -> bool {
+    let h = host.to_ascii_lowercase();
+    // Tweaknews earned its place the hard way: on a multi-WAN link it
+    // refuses with "502 Authentication Failed", the same code as a bad
+    // password, so it read as a broken credential for hours before the
+    // pattern was recognised (31 Jul - the operator had already turned
+    // Giganews off for the same behaviour).
+    ["usenetexpress", "giganews", "newshosting", "tweaknews"]
+        .iter()
+        .any(|p| h.contains(p))
+}
+
+/// How long connections to ONE server may sit idle, and how many of
+/// them survive the release. `None` = never release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleasePolicy {
+    pub after: Option<std::time::Duration>,
+    pub keep: usize,
+}
+
+/// Shortest idle-release timeout that is worth honouring.
+///
+/// One keepalive interval, which is also the pool's own release
+/// granularity - below this the setting cannot be obeyed by the pool
+/// anyway, and the samplers WOULD obey it, reconnecting every tick.
+pub const MIN_IDLE_RELEASE_SECS: u64 = 60;
+
+/// Below this many allowed source addresses, one held by an idle
+/// install is a problem rather than a rounding error.
+///
+/// At 1 it is total: nothing else can touch the account. At 2 - the
+/// common paid-add-on shape - a home daemon plus a laptop already fills
+/// it, and any third place is locked out. At 3 there is one spare, which
+/// a phone or a second client takes. Past that, one address out of
+/// several is a slice of a generous allowance and the ordinary default
+/// applies.
+///
+/// A judgement, not a measurement, and only ever the source of a
+/// DEFAULT: both idle-release settings override it per server.
+const TIGHT_SOURCE_IPS: u32 = 3;
+
+impl ServerConfig {
+    /// Does this server's account limit distinct source addresses
+    /// tightly enough that an idle install holding one is a lockout?
+    ///
+    /// The operator's own number wins when they have supplied it - they
+    /// read it off the provider's control panel, we are pattern-matching
+    /// a hostname. `0` is treated as "no limit" rather than "no
+    /// addresses", since that is what a provider printing 0 means.
+    pub fn source_ips_are_tight(&self) -> bool {
+        match self.max_source_ips {
+            Some(0) | None => caps_source_ips(&self.host),
+            Some(n) => n <= TIGHT_SOURCE_IPS,
+        }
+    }
+
+    /// This server's effective idle-release policy: the configured
+    /// values, or a default derived from the provider.
+    ///
+    /// The two resolve independently, so lengthening the timeout does
+    /// not silently re-raise a floor the provider's address limit made
+    /// pointless.
+    pub fn idle_release_policy(&self) -> ReleasePolicy {
+        let capped = self.source_ips_are_tight();
+        ReleasePolicy {
+            after: match self.idle_release_secs {
+                // Sooner for an address-capped provider, because the
+                // cost of holding is different in kind: not a slice of a
+                // generous connection allowance but one of one or two
+                // address slots for the whole account, so the operator's
+                // other machines are locked out rather than slowed.
+                None => Some(match capped {
+                    true => crate::warmpool::CAPPED_IDLE_RELEASE,
+                    false => crate::warmpool::DEFAULT_IDLE_RELEASE,
+                }),
+                Some(0) => None,
+                // Floored, and floored HERE rather than at the settings
+                // handler, because the value arrives by three routes -
+                // the dashboard, the API, a hand-edited config.local.json
+                // - and only this one is common to all of them. An
+                // earlier cut clamped in the API handler; moving the
+                // setting per-server left the clamp behind and a
+                // one-second timeout became reachable.
+                //
+                // A short timeout is not merely useless, it is harmful.
+                // The pool exists because a cold fleet costs 4.5-14.3x
+                // on job start, and the background samplers consult this
+                // same value every tick - the tip watcher's is 20 s - so
+                // a timeout below the tick turns "hold nothing while
+                // idle" into "reconnect on every pass", against
+                // providers that punish connect bursts 3-4x.
+                Some(n) => Some(std::time::Duration::from_secs(n.max(MIN_IDLE_RELEASE_SECS))),
+            },
+            keep: match self.idle_keep {
+                // Floor of ZERO against an address cap: this host is one
+                // address whether it holds one connection or sixty, so a
+                // floor of one would free nothing and the operator's
+                // other machines would stay locked out. Elsewhere keep
+                // one warm - the next job starts on a live session while
+                // the rest of the fleet's slots go back to the account.
+                None => usize::from(!capped),
+                // Capped at what the pool will ever park per server. A
+                // floor ABOVE that is silently "never release", which is
+                // not what someone typing a big number is asking for -
+                // they want lots kept warm, and the honest answer is
+                // "all of them", not "the setting did nothing".
+                Some(n) => (n as usize).min(crate::warmpool::MAX_PER_SERVER),
+            },
+        }
+    }
 }
 
 fn default_port() -> u16 {
@@ -318,7 +503,10 @@ pub fn parse_sabnzbd_ini(text: &str) -> Result<Vec<ServerConfig>, ConfigError> {
             bind_ip: None,
             socks5: None,
             enabled: true,
-        warm_pool: false,
+            warm_pool: false,
+            idle_release_secs: None,
+            idle_keep: None,
+            max_source_ips: None,
         });
     }
 
@@ -407,7 +595,10 @@ pub fn parse_nzbget_conf(text: &str) -> Vec<ServerConfig> {
             bind_ip: None,
             socks5: None,
             enabled: true,
-        warm_pool: false,
+            warm_pool: false,
+            idle_release_secs: None,
+            idle_keep: None,
+            max_source_ips: None,
         });
     }
     out
@@ -437,6 +628,156 @@ mod warm_pool_default_tests {
         .unwrap();
         assert!(cfg.servers[0].warm_pool);
         assert!(!cfg.servers[1].warm_pool, "pooling must not leak between servers");
+    }
+
+    fn srv(json: &str) -> ServerConfig {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// The operator's own number beats our hostname guess, in BOTH
+    /// directions.
+    ///
+    /// The heuristic can only recognise providers we have heard of, and
+    /// resellers front the same backbones under their own names - so it
+    /// under-detects a strict provider and can over-detect a lax one
+    /// that merely shares a word with a strict one. A figure read off
+    /// the provider's control panel has neither problem, which is the
+    /// whole reason the field exists.
+    #[test]
+    fn a_stated_address_limit_overrides_the_hostname_guess() {
+        // Unknown host, but the user says two addresses: tight.
+        let s = srv(r#"{"host":"news.some-reseller.example","max_source_ips":2}"#);
+        assert!(s.source_ips_are_tight());
+        assert_eq!(s.idle_release_policy().keep, 0);
+
+        // A host the heuristic flags, but the user's plan is generous.
+        let s = srv(r#"{"host":"news.newshosting.com","max_source_ips":20}"#);
+        assert!(!s.source_ips_are_tight(), "a stated limit must beat the guess");
+        assert_eq!(s.idle_release_policy().keep, 1);
+
+        // 0 is how a provider prints "no limit", not "no addresses".
+        let s = srv(r#"{"host":"news.example.com","max_source_ips":0}"#);
+        assert!(!s.source_ips_are_tight());
+
+        // Nothing stated: fall back to the hostname hint.
+        assert!(srv(r#"{"host":"news.usenetexpress.com"}"#).source_ips_are_tight());
+        assert!(!srv(r#"{"host":"news.example.com"}"#).source_ips_are_tight());
+    }
+
+    /// The policy is PER SERVER, and that is the point: a server is an
+    /// account, and each provider counts its own limit against its own
+    /// account. Two servers share nothing.
+    ///
+    /// The mixed config is the case that makes it matter - a flatrate
+    /// primary that does not care, plus a block account allowing two
+    /// addresses. A single process-wide policy would either drag the
+    /// primary down to the block account's short timeout and zero floor,
+    /// throwing away warm connections on a link that never had a
+    /// problem, or leave the block account's lockout in place.
+    #[test]
+    fn one_strict_provider_does_not_drag_down_a_lax_one() {
+        let cfg: Config = serde_json::from_str(
+            r#"{"servers":[{"host":"news.example.com"},
+                           {"host":"news.usenetexpress.com"}]}"#,
+        )
+        .unwrap();
+        let lax = cfg.servers[0].idle_release_policy();
+        let strict = cfg.servers[1].idle_release_policy();
+
+        assert_eq!(lax.after, Some(crate::warmpool::DEFAULT_IDLE_RELEASE));
+        assert_eq!(lax.keep, 1, "the lax provider keeps a warm connection");
+        assert_eq!(strict.after, Some(crate::warmpool::CAPPED_IDLE_RELEASE));
+        assert_eq!(strict.keep, 0, "a floor of one frees nothing against an address cap");
+    }
+
+    /// Explicit settings win, and resolve INDEPENDENTLY: lengthening the
+    /// timeout must not silently re-raise a floor the address limit made
+    /// pointless. `0` seconds is the off switch (a NAS or seedbox that
+    /// is the account's only consumer), which is a different answer from
+    /// "not set".
+    #[test]
+    fn explicit_settings_win_and_do_not_drag_each_other() {
+        let s = srv(r#"{"host":"news.usenetexpress.com","idle_release_secs":900}"#);
+        let p = s.idle_release_policy();
+        assert_eq!(p.after, Some(std::time::Duration::from_secs(900)));
+        assert_eq!(p.keep, 0, "the derived floor still reflects the address limit");
+
+        let s = srv(r#"{"host":"news.example.com","idle_release_secs":0}"#);
+        assert_eq!(s.idle_release_policy().after, None, "0 = hold them open");
+
+        let s = srv(r#"{"host":"news.usenetexpress.com","idle_keep":2}"#);
+        let p = s.idle_release_policy();
+        assert_eq!(p.keep, 2, "an explicit floor is honoured even where it frees nothing");
+        assert_eq!(p.after, Some(crate::warmpool::CAPPED_IDLE_RELEASE));
+
+        // Absent from the JSON entirely = derive. A config written
+        // before any of this existed must not read as "hold forever".
+        let s = srv(r#"{"host":"news.example.com"}"#);
+        assert_eq!(s.idle_release_secs, None);
+        assert!(s.idle_release_policy().after.is_some(), "unset must not mean never");
+    }
+
+    /// A too-short timeout is not merely useless, it is harmful, and it
+    /// must be impossible to set by ANY route.
+    ///
+    /// The clamp used to live in the settings handler. Moving the
+    /// setting per-server left it behind, and one second became
+    /// reachable from the dashboard and from a hand-edited config - at
+    /// which point the tip watcher (20 s tick) and the availability
+    /// oracle, which consult this same value every pass, would hang up
+    /// and reconnect on every tick, against providers that punish
+    /// connect bursts 3-4x. So it is enforced at the single point every
+    /// route resolves through.
+    #[test]
+    fn a_pathologically_short_timeout_is_floored_whatever_route_it_came_by() {
+        for secs in [1, 5, 59] {
+            let s = srv(&format!(r#"{{"host":"h","idle_release_secs":{secs}}}"#));
+            assert_eq!(
+                s.idle_release_policy().after,
+                Some(std::time::Duration::from_secs(MIN_IDLE_RELEASE_SECS)),
+                "{secs}s must be floored: below one tick the samplers would \
+                 reconnect every pass"
+            );
+        }
+        // At and above the floor, the operator's number is honoured.
+        let s = srv(r#"{"host":"h","idle_release_secs":300}"#);
+        assert_eq!(s.idle_release_policy().after, Some(std::time::Duration::from_secs(300)));
+        // Zero keeps its own meaning - it is the off switch, not a
+        // timeout to be floored up to 60.
+        let s = srv(r#"{"host":"h","idle_release_secs":0}"#);
+        assert_eq!(s.idle_release_policy().after, None, "0 must stay 'never release'");
+    }
+
+    /// A floor above what the pool will ever park is silently "never
+    /// release". Someone typing a big number wants everything kept warm,
+    /// and that is what they get - not a setting that quietly does
+    /// nothing.
+    #[test]
+    fn a_keep_floor_above_the_pool_cap_is_clamped_not_ignored() {
+        let s = srv(r#"{"host":"h","idle_keep":100000}"#);
+        assert_eq!(s.idle_release_policy().keep, crate::warmpool::MAX_PER_SERVER);
+        let s = srv(r#"{"host":"h","idle_keep":2}"#);
+        assert_eq!(s.idle_release_policy().keep, 2);
+    }
+
+    /// The timeout has to be picked against the re-warm cost - a cold
+    /// fleet is 4.5-14.3x on job start - so neither default may drift
+    /// down into the seconds where releasing costs more than it frees.
+    #[test]
+    fn neither_default_releases_fast_enough_to_defeat_the_pool() {
+        for d in [crate::warmpool::DEFAULT_IDLE_RELEASE, crate::warmpool::CAPPED_IDLE_RELEASE] {
+            assert!(
+                d >= std::time::Duration::from_secs(60),
+                "{d:?} is short enough that a queue draining back to back would \
+                 pay the cold-start cost repeatedly, which is the pool's whole \
+                 reason to exist"
+            );
+            assert!(
+                d <= crate::warmpool::DEFAULT_MAX_IDLE,
+                "{d:?} is past max_idle, so the release would never be the thing \
+                 that frees the account and the setting would be inert"
+            );
+        }
     }
 }
 
@@ -537,9 +878,11 @@ mod obf_tests {
 
     #[test]
     fn roundtrips_including_punctuation_and_unicode() {
-        // The real password that prompted this work has a '!' in it, which is
-        // exactly the class of character rot13 would have left readable.
-        for pw in ["gnFr0gfr0g!2", "frogfrog", "a", "p@ss w/ spaces & £unicode✓"] {
+        // Provider passwords routinely carry '!' and other punctuation, which
+        // is exactly the class of character rot13 would have left readable.
+        // Every fixture here is synthetic on purpose: test data must never be
+        // a credential anyone actually uses.
+        for pw in ["Tr0ub4dor&3!", "correcthorse", "a", "p@ss w/ spaces & £unicode✓"] {
             let o = obfuscate(pw);
             assert!(o.starts_with(OBF_PREFIX), "{o}");
             assert!(!o.contains(pw), "obfuscated form still contains the secret: {o}");
@@ -561,7 +904,7 @@ mod obf_tests {
     #[test]
     fn cleartext_still_loads() {
         // Hand-edited configs and SAB/NZBGet imports must keep working.
-        assert_eq!(deobfuscate("frogfrog"), "frogfrog");
+        assert_eq!(deobfuscate("correcthorse"), "correcthorse");
         assert_eq!(deobfuscate(""), "");
     }
 
@@ -588,14 +931,14 @@ mod obf_tests {
 
     #[test]
     fn config_json_roundtrips_through_serde() {
-        let json = r#"{"servers":[{"host":"h","username":"u","password":"gnFr0gfr0g!2"}]}"#;
+        let json = r#"{"servers":[{"host":"h","username":"u","password":"Tr0ub4dor&3!"}]}"#;
         let c: Config = serde_json::from_str(json).unwrap();
-        assert_eq!(c.servers[0].password.as_deref(), Some("gnFr0gfr0g!2"));
+        assert_eq!(c.servers[0].password.as_deref(), Some("Tr0ub4dor&3!"));
         // Serializing must write the obfuscated form, not the secret.
         let out = serde_json::to_string(&c.servers[0]).unwrap();
-        assert!(!out.contains("gnFr0gfr0g"), "cleartext leaked on write: {out}");
+        assert!(!out.contains("Tr0ub4dor"), "cleartext leaked on write: {out}");
         assert!(out.contains("obf1:"), "{out}");
         let back: ServerConfig = serde_json::from_str(&out).unwrap();
-        assert_eq!(back.password.as_deref(), Some("gnFr0gfr0g!2"));
+        assert_eq!(back.password.as_deref(), Some("Tr0ub4dor&3!"));
     }
 }

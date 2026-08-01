@@ -19,7 +19,10 @@
 //! - Any blocker (compressed, encrypted, corrupt, holds cap) falls the
 //!   whole group back to materialized volumes - already-extracted bytes
 //!   are reconstructed into the volume files via the map, so nothing is
-//!   lost and PAR2 repair sees ordinary files.
+//!   lost and PAR2 repair sees ordinary files. The holds cap gets one
+//!   relief valve first: held spans page to a scratch file
+//!   ([`HoldSpan`]/[`HoldsScratch`]) and the set stays one-pass; only a
+//!   breach of the scratch ceiling too demotes.
 //! - [`Extractor::read_at`] serves byte-exact volume reads for the live
 //!   verifier's read-back path (header stash + inner-file pread), so
 //!   in-stream PAR2 verification of the *volume* blocks works even though
@@ -53,7 +56,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
 use crate::disk::{FileWriter, sanitize_filename};
@@ -69,7 +72,7 @@ use crate::rarcrypt;
 /// decrypt pass and any live /stream readers.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DecState {
-    /// On-disk bytes are AES-256-CBC ciphertext (during/after download,
+    /// On-disk bytes are AES-CBC ciphertext (during/after download,
     /// before the finish decrypt) - readers decrypt on the fly.
     Ciphertext,
     /// A plaintext file has been renamed over the name - readers read raw.
@@ -94,7 +97,7 @@ struct StreamState {
 /// while it exists, finish() will temp+rename rather than decrypt the
 /// file in place, so the reader's captured fd stays valid.
 pub struct StreamCrypt {
-    key: [u8; 32],
+    key: rarcrypt::AesKey,
     iv: [u8; 16],
     /// On-disk ciphertext length = align16(plain_len).
     pub cipher_len: u64,
@@ -217,17 +220,59 @@ type CryptoEventSink = Arc<Mutex<Vec<CryptoJournalEvent>>>;
 /// One encrypted store output being decrypted in-stream. Owned by the
 /// level's `Inner` (keyed by output name), shared into `WriteJob`s so
 /// the AES work runs outside the routing lock under this state's own
+/// How a decrypted file's stored checksum is compared against the CRC32
+/// composed from its plaintext (Increment B).
+///
+/// `hash_key` absent is WinRAR's default: the stored value IS a plain
+/// CRC32 of the plaintext. Present means the crypt record set the
+/// tweaked-checksum flag (0x02) and the stored value is the keyed fold
+/// of that CRC - which the download can still verify, because deriving
+/// `hash_key` needs only the password we are decrypting with. Folding
+/// the computed CRC and comparing checks the same two things a plain
+/// comparison does (the key is right, the plaintext is intact), so a
+/// tweaked entry is no longer un-verifiable and no longer has to be
+/// handed to unrar.
+#[derive(Clone, Copy)]
+struct CrcGate {
+    stored: u32,
+    hash_key: Option<[u8; 32]>,
+}
+
+impl CrcGate {
+    /// The stored checksum as this gate compares it: plain, or the
+    /// keyed fold of `computed`.
+    fn accepts(&self, computed: u32) -> bool {
+        match &self.hash_key {
+            None => computed == self.stored,
+            Some(hk) => rarcrypt::mac_crc32_with_key(hk, computed) == self.stored,
+        }
+    }
+}
+
+/// Build the gate for an encrypted entry: `None` when nothing is
+/// checkable (no stored CRC, or a split entry whose stored CRC covers
+/// only the last piece), else plain or keyed per the tweaked flag.
+fn crc_gate(file_crc: Option<u32>, c: &EntryCrypt, keys: &rarcrypt::EntryKeys) -> Option<CrcGate> {
+    file_crc.map(|stored| CrcGate {
+        stored,
+        // RAR4 has no tweaked-checksum flag: its header CRC is always the
+        // bare plaintext CRC32, so the gate compares it directly.
+        hash_key: c.tweaked_checksum().then_some(keys.hash_key).flatten(),
+    })
+}
+
 /// per-file mutex.
 struct CryptoState {
-    key: [u8; 32],
+    key: rarcrypt::AesKey,
     iv: [u8; 16],
     /// Plaintext length (the head entry's `unpacked_size`).
     unp: u64,
     /// Posted ciphertext length = align16(unp).
     cipher_len: u64,
-    /// Stored plaintext CRC32 when checkable (single-piece entry with an
-    /// untweaked checksum); verified at finish from the composed runs.
-    expect_crc: Option<u32>,
+    /// Stored plaintext checksum when checkable (single-piece entry);
+    /// verified at finish from the composed runs, through the keyed fold
+    /// when the entry's checksum is tweaked.
+    expect_crc: Option<CrcGate>,
     /// Output name + shared sink for the resume-journal events.
     out_name: String,
     events: CryptoEventSink,
@@ -280,10 +325,10 @@ impl CryptoRun {
 
 impl CryptoState {
     fn new(
-        key: [u8; 32],
+        key: rarcrypt::AesKey,
         iv: [u8; 16],
         unp: u64,
-        expect_crc: Option<u32>,
+        expect_crc: Option<CrcGate>,
         out_name: String,
         events: CryptoEventSink,
     ) -> CryptoState {
@@ -671,10 +716,10 @@ impl CryptoState {
     /// Some(false)=MISMATCH, None=nothing checkable (no stored CRC, or
     /// the file is not complete).
     fn crc_verdict(&self) -> Option<bool> {
-        let expected = self.expect_crc?;
+        let gate = self.expect_crc?;
         let st = self.st.lock().unwrap();
         let got = st.plain.whole(self.unp)?;
-        Some(got == expected)
+        Some(gate.accepts(got))
     }
 
     /// Repair rewrite of posted cipher `[at, at+data.len())` (mapped
@@ -1005,6 +1050,56 @@ fn top_sevenz_env_off_value(v: Option<&str>) -> bool {
     v == Some("1")
 }
 
+/// Soak isolation switch for the TOP-LEVEL RAR chase, one level finer
+/// than `NZBFAST_NO_NESTED_CHASE` and the exact analogue of
+/// `NZBFAST_NO_TOP_7Z`: with it set, an inner compressed RAR still
+/// chases but a POSTED compressed RAR materializes its volumes and
+/// waits for the unrar ladder exactly as it did before the depth guard
+/// came off. Latched at construction.
+fn top_chase_env_off() -> bool {
+    top_chase_env_off_value(std::env::var("NZBFAST_NO_TOP_RAR_CHASE").ok().as_deref())
+}
+
+/// Pure parse of the top-level RAR chase escape-hatch value (same
+/// rationale as [`nested_env_off_value`]).
+fn top_chase_env_off_value(v: Option<&str>) -> bool {
+    v == Some("1")
+}
+
+/// Process-global "prefer external unrar" - the daemon setting
+/// (`prefer_external_unrar`, via [`set_prefer_external_unrar`]) that
+/// routes RAR unpacking through the user's own unrar subprocess instead
+/// of the native extractor.
+static PREFER_EXTERNAL_UNRAR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Daemon knob: prefer the external unrar subprocess over the native
+/// (vendored rars) extractor. See [`prefer_external_unrar`].
+pub fn set_prefer_external_unrar(on: bool) {
+    PREFER_EXTERNAL_UNRAR.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Resolve the effective "prefer external unrar" answer: the
+/// `NZBFAST_NO_NATIVE_UNRAR` env override (presence, not value - it
+/// predates the `=1` convention of the later switches and is documented
+/// bare) forces it on, else the daemon setting decides.
+///
+/// ONE predicate on purpose, consulted from BOTH places that would
+/// otherwise unpack a RAR natively: the disk-path engine choice in the
+/// nzbfast binary (`try_unrar`), and the top-level RAR chase latch below
+/// - with the chase left on, a posted compressed set streams through the
+/// native decoder mid-download and the user's unrar never sees it, which
+/// is exactly what the switch promises to prevent. It deliberately does
+/// NOT reach the store path (a stored set is placed byte-for-byte and
+/// CRC-checked, no decompressor involved; anything that pass cannot
+/// finish demotes to disk, where this switch applies) or the obfuscated
+/// disk handoff (hash-named volumes follow naming no unrar subprocess
+/// can, so the native path is the only one that unpacks them).
+pub fn prefer_external_unrar() -> bool {
+    std::env::var_os("NZBFAST_NO_NATIVE_UNRAR").is_some()
+        || PREFER_EXTERNAL_UNRAR.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Escape hatch for drop-behind trimming (TODO 37 step 2): with it set,
 /// a 7z chase retains every byte it has taken and an archive over the
 /// retention cap demotes, which is exactly the behaviour before trimming
@@ -1019,6 +1114,20 @@ fn sevenz_trim_env_off_value(v: Option<&str>) -> bool {
     v == Some("1")
 }
 
+/// Escape hatch for the TOP-LEVEL zip chase (one-pass zip, phase 2):
+/// with it set, a posted `.zip` materializes and waits for the disk
+/// post-pass exactly as it did in phase 1. The exact analogue of
+/// `NZBFAST_NO_TOP_7Z`. Latched at construction.
+fn top_zip_env_off() -> bool {
+    top_zip_env_off_value(std::env::var("NZBFAST_NO_TOP_ZIP").ok().as_deref())
+}
+
+/// Pure parse of the top-level zip escape-hatch value (same rationale as
+/// [`nested_env_off_value`]).
+fn top_zip_env_off_value(v: Option<&str>) -> bool {
+    v == Some("1")
+}
+
 /// Reason prefix for a demote of a TOP-LEVEL 7z chase. The archive
 /// materializes into the output directory, which is precisely the disk
 /// post-pass's input, so the demote is owned - the caller must keep it
@@ -1026,6 +1135,12 @@ fn sevenz_trim_env_off_value(v: Option<&str>) -> bool {
 /// unrar fails a job that is fine). The underlying reason, "held-bytes
 /// cap: chase memory" included, stays readable inside the string.
 pub const SEVENZ_DISK_FALLBACK_PREFIX: &str = "7z materialized for the disk pass: ";
+
+/// [`SEVENZ_DISK_FALLBACK_PREFIX`]'s zip twin: a demoted top-level zip
+/// chase leaves a `.zip` the disk post-pass owns (its ladder step 5),
+/// and its reason text must stay out of the RAR unpack ladder for the
+/// same three-arms-all-wrong reason.
+pub const ZIP_DISK_FALLBACK_PREFIX: &str = "zip materialized for the disk pass: ";
 
 /// Escape hatch for the final-output CRC gate, mirroring the nested
 /// gates: with it set, the level-0 store payload ships unverified
@@ -1040,11 +1155,17 @@ fn output_crc_env_off_value(v: Option<&str>) -> bool {
     v == Some("1")
 }
 
-/// Article-promotion hook (nested 7z tail prefetch): `(output name,
-/// file size, byte spans)` of a file at THIS extractor's level - the
-/// daemon wires the root's hook to its seek/promote ladder, which
-/// front-loads the pending articles carrying those bytes.
-pub type PromoteHook = Arc<dyn Fn(&str, u64, &[(u64, u64)]) + Send + Sync>;
+/// Article-promotion hook (nested 7z tail prefetch, offset-0 probe):
+/// `(output name, file size, byte spans, urgent)` of a file at THIS
+/// extractor's level - the daemon wires the root's hook to its
+/// seek/promote ladder, which front-loads the pending articles carrying
+/// those bytes. `urgent` promotes may also flip the pool into stream
+/// mode (shallow pipelines, 60 s linger) because a worker is BLOCKED on
+/// the bytes (the 7z chase reading its footer); non-urgent ones (the
+/// offset-0 classification probe) just reorder the queue - a scrambled
+/// many-volume set probes once per slot, and stream mode for the whole
+/// download would cost real throughput on long links.
+pub type PromoteHook = Arc<dyn Fn(&str, u64, &[(u64, u64)], bool) + Send + Sync>;
 
 /// Permission to publish decrypted plaintext over the named outputs.
 ///
@@ -1100,6 +1221,288 @@ impl HoldsBudget {
     }
 }
 
+/// One held span's bytes: in RAM (charging [`HoldsBudget`]) or paged out
+/// to the chain's scratch file (charging [`HoldsScratch`]). Paging is the
+/// budget-breach relief valve: the span keeps its slot MAPPED - it stays
+/// visible to `covered`/`read_at` and re-feeds on drain exactly like a RAM
+/// span, with one pread - so a set that would have demoted on the cap
+/// still extracts one-pass.
+enum HoldSpan {
+    Ram(Vec<u8>),
+    Paged { off: u64, len: usize },
+}
+
+impl HoldSpan {
+    fn len(&self) -> usize {
+        match self {
+            HoldSpan::Ram(b) => b.len(),
+            HoldSpan::Paged { len, .. } => *len,
+        }
+    }
+}
+
+/// Same-directory scratch prefix for paged held spans. Like
+/// [`DEC_TMP_PREFIX`], the leading `.nzbfast` keeps the cleanup walkers
+/// and the keep-media-only sweep off it, and pid + counter make each name
+/// unique to one run of one process.
+const HOLDS_TMP_PREFIX: &str = ".nzbfast-holds.";
+
+/// Remove holds scratch left behind by a killed run. Root construction
+/// only - a child sweeping would unlink the root's live file.
+fn sweep_holds_scratch(dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        if e.file_name().to_string_lossy().starts_with(HOLDS_TMP_PREFIX) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+/// The chain's held-span scratch file, shared root-to-children like the
+/// [`HoldsBudget`] it relieves. Created lazily on first page; regions are
+/// append-only and WRITE-ONCE (a region is never rewritten while any
+/// span references it), which is what makes the deferred preads in
+/// `read_at` safe off the routing lock. Space reclaim is deliberately
+/// crude: when nothing live remains and no reader is pinned, the cursor
+/// resets and the file truncates - bounding the drain/re-hold/re-page
+/// ping-pong without a free-list.
+///
+/// EVERY piece of mutable state (file, cursor, live, pins) lives under
+/// the one `state` mutex, on purpose. "Under the routing lock" is not a
+/// synchronization boundary here: the scratch is CHAIN-shared while
+/// routing locks are per-level, so a parent release and a child append
+/// run concurrently. An earlier draft kept `live`/`pins` as Relaxed
+/// atomics checked partly outside the mutex - the 31 Jul race audit
+/// found a reachable interleaving where a reader pin born inside
+/// `release`'s check-to-truncate window was ignored and a planned pread
+/// read truncated (or reused) bytes. Every path that touches this state
+/// is cold (paging, drains, planning a paged read), so the mutex costs
+/// nothing and makes the gates sequentially consistent by construction.
+struct HoldsScratch {
+    dir: PathBuf,
+    state: Mutex<ScratchState>,
+    /// Bytes ever paged (diagnostics/tests; monotonic).
+    paged_total: AtomicU64,
+    /// Hard ceiling on the append cursor. 0 = auto (4x the holds RAM cap,
+    /// resolved at page time so a later `set_holds_cap` is respected).
+    cap: AtomicU64,
+    /// Latched on any scratch I/O error: paging is off for the rest of
+    /// the run and every breach demotes exactly as before paging existed.
+    dead: AtomicBool,
+    /// First-engage log line, once per run.
+    announced: AtomicBool,
+}
+
+struct ScratchState {
+    /// Lazily-created file. The `Arc` is what a deferred read plan
+    /// carries out from under the locks.
+    file: Option<Arc<(PathBuf, File)>>,
+    /// Append cursor; resets to 0 when idle (live == 0, pins == 0).
+    cursor: u64,
+    /// Bytes of live paged spans - every `HoldSpan::Paged` anywhere in
+    /// the chain holds exactly one charge here. Nonzero blocks the idle
+    /// reset, so a referenced region is never overwritten or truncated.
+    live: u64,
+    /// Readers holding deferred pread plans (pinned at plan time,
+    /// released after the preads land). Nonzero blocks the idle reset,
+    /// protecting a planned region whose span has since been released.
+    pins: usize,
+}
+
+impl HoldsScratch {
+    fn new(dir: &Path) -> HoldsScratch {
+        HoldsScratch {
+            dir: dir.to_path_buf(),
+            state: Mutex::new(ScratchState {
+                file: None,
+                cursor: 0,
+                live: 0,
+                pins: 0,
+            }),
+            paged_total: AtomicU64::new(0),
+            cap: AtomicU64::new(0),
+            dead: AtomicBool::new(false),
+            announced: AtomicBool::new(false),
+        }
+    }
+
+    /// Poison-tolerant state lock: the readers/releasers must keep
+    /// working after some other thread panicked mid-scratch (same
+    /// argument as [`Extractor::inner_read`]).
+    fn st(&self) -> std::sync::MutexGuard<'_, ScratchState> {
+        match self.state.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    /// Append one span's bytes; `cap` is the effective ceiling (the
+    /// caller resolves auto). Returns the region offset, or None when the
+    /// ceiling refuses (caller demotes with today's reason) - an I/O
+    /// error additionally latches the scratch dead.
+    fn append(&self, bytes: &[u8], cap: u64) -> Option<u64> {
+        if self.dead.load(Ordering::Relaxed) {
+            return None;
+        }
+        let mut st = self.st();
+        if st.file.is_none() {
+            match Self::create(&self.dir) {
+                Ok(pf) => st.file = Some(Arc::new(pf)),
+                Err(_) => {
+                    self.dead.store(true, Ordering::Relaxed);
+                    return None;
+                }
+            }
+        }
+        // Idle reset: nothing live and nobody reading - every byte below
+        // the cursor is dead, so reuse the space.
+        if st.live == 0 && st.pins == 0 {
+            st.cursor = 0;
+        }
+        if st.cursor.saturating_add(bytes.len() as u64) > cap {
+            return None;
+        }
+        let f = st.file.as_ref().unwrap().clone();
+        if crate::disk::write_all_at(&f.1, bytes, st.cursor).is_err() {
+            self.dead.store(true, Ordering::Relaxed);
+            return None;
+        }
+        let off = st.cursor;
+        st.cursor += bytes.len() as u64;
+        st.live += bytes.len() as u64;
+        self.paged_total.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        Some(off)
+    }
+
+    fn create(dir: &Path) -> io::Result<(PathBuf, File)> {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let pid = std::process::id();
+        for _ in 0..4096 {
+            let n = SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = dir.join(format!("{HOLDS_TMP_PREFIX}{pid}.{n}.tmp"));
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(f) => return Ok((path, f)),
+                // PermissionDenied too: on classic-delete-semantics
+                // Windows (pre-1903, FAT/exFAT, SMB) a swept-but-still-
+                // open stale file is delete-pending, and create_new on
+                // that name reports ERROR_ACCESS_DENIED rather than
+                // AlreadyExists - advance to the next seq instead of
+                // latching paging dead for the whole run.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::AlreadyExists | io::ErrorKind::PermissionDenied
+                    ) =>
+                {
+                    continue
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "no free holds scratch name in the output directory",
+        ))
+    }
+
+    /// The file handle for deferred reads, cloned out at plan time (pin
+    /// first - see `ScratchState::pins`).
+    fn handle(&self) -> Option<Arc<(PathBuf, File)>> {
+        self.st().file.clone()
+    }
+
+    /// Read a paged region back (drain paths, under some routing lock).
+    fn read(&self, off: u64, buf: &mut [u8]) -> io::Result<()> {
+        let f = self.handle().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "holds scratch file missing")
+        })?;
+        crate::disk::read_exact_at(&f.1, buf, off)
+    }
+
+    /// Transfer a rebind's live charge in (see `rebind_subranges`): the
+    /// subrange keeps referencing its region, so the region's protection
+    /// must be added BEFORE the original span's `release` subtracts.
+    fn add_live(&self, len: usize) {
+        self.st().live += len as u64;
+    }
+
+    /// A paged span was consumed (drained, discarded, abandoned). When
+    /// the last live byte goes and no reader is pinned, the file
+    /// truncates - space back, handle and name kept for a later page.
+    /// Both gates read under the state mutex: a pin is taken under this
+    /// same mutex, so a reader that planned before we got here is always
+    /// visible (the earlier outside-the-mutex pins check was the race
+    /// the 31 Jul audit caught).
+    fn release(&self, len: usize) {
+        let mut st = self.st();
+        st.live -= len as u64;
+        if st.live == 0 && st.pins == 0 {
+            st.cursor = 0;
+            if let Some(f) = st.file.as_ref() {
+                let _ = f.1.set_len(0);
+            }
+        }
+    }
+
+    /// Root finish/Drop: unlink the scratch NAME but keep the handle, so
+    /// a straggler read of a still-paged span (a healthy group's header
+    /// stash outlives settle) is served through the open file until the
+    /// extractor drops. The disk space goes with the last handle; the
+    /// construction-time sweep covers a killed run.
+    fn cleanup(&self) {
+        let st = self.st();
+        if let Some(f) = st.file.as_ref() {
+            let _ = std::fs::remove_file(&f.0);
+        }
+    }
+}
+
+/// Spans smaller than this stay in RAM at page time - not worth the
+/// syscall, and tiny spans are exactly the ones about to resolve.
+const HOLDS_PAGE_MIN: usize = 4 * 1024;
+
+/// Reader pin over the holds scratch: taken (under the state mutex) when
+/// `read_at` plans a pread of a paged span, released after the pread
+/// lands. While any pin is held the scratch never resets its cursor or
+/// truncates, so a planned region stays byte-stable off the locks.
+struct ScratchPin(Option<Arc<HoldsScratch>>);
+
+impl ScratchPin {
+    fn none() -> ScratchPin {
+        ScratchPin(None)
+    }
+
+    fn pin(&mut self, sc: &Arc<HoldsScratch>) {
+        if self.0.is_none() {
+            sc.st().pins += 1;
+            self.0 = Some(sc.clone());
+        }
+    }
+}
+
+impl Drop for ScratchPin {
+    fn drop(&mut self) {
+        if let Some(sc) = &self.0 {
+            sc.st().pins -= 1;
+        }
+    }
+}
+
+/// `NZBFAST_NO_HOLDS_PAGE=1` restores the pre-paging behavior: every
+/// budget breach demotes. Split for testability like the chase gates.
+fn holds_page_env_off_value(v: Option<&str>) -> bool {
+    v == Some("1")
+}
+
+fn holds_page_env_off() -> bool {
+    holds_page_env_off_value(std::env::var("NZBFAST_NO_HOLDS_PAGE").ok().as_deref())
+}
+
 /// Per-slot budget for spans held while a slot is still unclassified
 /// (waiting for its offset-0 sniff). Honest posts fetch each file's first
 /// segment within the first round-trips (M3 scheduling), so real holds
@@ -1110,6 +1513,15 @@ impl HoldsBudget {
 fn unclassified_spill(holds_cap: usize) -> usize {
     (holds_cap / 4).clamp(4 << 20, 64 << 20)
 }
+
+/// Increment A: how often the candidate-password probe re-runs while
+/// slots sit parked. The sidecar carrying the password usually lands
+/// within the head round, seconds after the archive blocks; probing on
+/// this cadence (piggybacked on span arrivals, off the routing lock)
+/// re-keys the mapper while the holds are still small. The hook itself
+/// dedupes candidates, so a quiet directory costs a directory scan, not
+/// repeated KDFs.
+const PW_REPROBE_EVERY: std::time::Duration = std::time::Duration::from_millis(750);
 
 /// Strip release-file suffixes down to the shared stem:
 /// `x.part01.rar`/`x.r00`/`x.vol000+01.par2`/`x.par2`/`x.rar` → `x`.
@@ -1204,6 +1616,29 @@ enum SlotMode {
     /// file the caller owns (re-extraction reads volumes off disk), so a
     /// fallback must never materialize - writes are dropped instead.
     Discard,
+}
+
+/// Which container format a `SlotMode::SevenZ` chase is actually
+/// driving. The chase machinery (frontier buffers, the one-part/N-part
+/// set, tail promote, trim, demote, finish joining) is format-agnostic;
+/// only the worker parsing the container differs - so zip rides the 7z
+/// mode rather than re-teaching a new mode to every `is_mapped` seam
+/// (the six TODO-37 findings all lived in those seams). This tag is
+/// what keeps the user-facing words honest: the demote prefix, the
+/// badge kind and the finish diagnostics read it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ChaseFormat {
+    SevenZ,
+    Zip,
+}
+
+impl ChaseFormat {
+    fn noun(self) -> &'static str {
+        match self {
+            ChaseFormat::SevenZ => "7z",
+            ChaseFormat::Zip => "zip",
+        }
+    }
 }
 
 /// Out-of-order CRC32 accumulator over one mapped store piece's data
@@ -1416,19 +1851,26 @@ struct Slot {
     /// arrival over EVERY group slot, and recomputing the key allocated
     /// 2-3 Strings per slot per call (quadratic on many-volume sets).
     sort_key: Option<(u64, String)>,
-    /// Pre-sniff / unmappable spans.
-    holds: Vec<(u64, Vec<u8>)>,
+    /// Pre-sniff / unmappable spans (RAM or paged to scratch).
+    holds: Vec<(u64, HoldSpan)>,
     /// Bytes held while still Unknown (pre-classification). Bounded by
     /// the per-slot spill: an NZB with synthesized segment numbering
     /// ("segment 1" is not the yEnc offset-0 article - seen live on a
     /// fully-obfuscated 9.6 GB single-file post) would otherwise hold the
     /// entire file in RAM waiting for a sniff that may come last.
     pre_bytes: usize,
+    /// The offset-0 probe already went out: the FIRST out-of-order span
+    /// asks the promote hook to front-load the article carrying offset 0
+    /// (see the hold branch in `write_impl_scratched`). Once per slot -
+    /// a wrong guess never re-arms; `spill_unclassified_slot` stays the
+    /// backstop for posts whose offset 0 genuinely never comes early.
+    probe0_sent: bool,
     /// Plain-file or materialized-volume writer.
     writer: Option<Arc<FileWriter>>,
     mapper: Option<VolumeMapper>,
-    /// Raw header/meta bytes (offset, bytes) kept for reconstruction.
-    header_spans: Vec<(u64, Vec<u8>)>,
+    /// Raw header/meta bytes (offset, bytes) kept for reconstruction
+    /// (RAM or paged to scratch, like `holds`).
+    header_spans: Vec<(u64, HoldSpan)>,
     /// Canonical group key (the archive's identity), set once entries
     /// parse. Groups start keyed by a volume's first inner-file name and
     /// merge when split pieces prove two keys are one archive.
@@ -1438,6 +1880,9 @@ struct Slot {
     chase: Option<ChaseSlot>,
     /// 7z chase control (mode SevenZ): the worker and its sink slots.
     sevenz: Option<Arc<SevenZCtl>>,
+    /// Which container format the SevenZ-mode chase is driving (see
+    /// [`ChaseFormat`]). Set at attach; meaningless outside that mode.
+    container_fmt: ChaseFormat,
     /// Entry index → composed CRC32 of the routed piece bytes, for the
     /// finish-time check against the RAR5 header CRC. That check is the
     /// only verifier a store payload has - the download's PAR2 vouches
@@ -1445,6 +1890,15 @@ struct Slot {
     /// included. Nested levels always compose; level 0 composes under
     /// the verify_output_crc gate.
     piece_crcs: HashMap<usize, CrcRuns>,
+    /// Increment A (one-pass encrypted plan): the mapper hit a
+    /// password-shaped blocker while a candidate probe may still find
+    /// the password (a sidecar in this very NZB, the release stem).
+    /// While set, spans park in `holds` (same budget, same read_at
+    /// visibility) instead of demoting; a Verified probe hit rebuilds
+    /// the mapper keyed and re-feeds them, a miss demotes through the
+    /// exact path this state deferred - the stored reason keeps the
+    /// finish ladder's remediation keyed the same either way.
+    pw_await: Option<&'static str>,
 }
 
 struct Group {
@@ -1602,6 +2056,8 @@ const SH_ENC_INSTREAM: u32 = 1 << 6;
 const SH_ONE_PASS: u32 = 1 << 7;
 /// At least one group/slot fell back to volumes on disk.
 const SH_MATERIALIZED: u32 = 1 << 8;
+/// The outer container is a zip (one-pass zip, phase 2).
+const SH_ZIP: u32 = 1 << 9;
 
 /// Shared observations for one extractor chain (see the section note).
 #[derive(Default)]
@@ -1666,6 +2122,8 @@ impl ArchiveShape {
             t.push("rar4");
         } else if outer & SH_7Z != 0 {
             t.push("7z");
+        } else if outer & SH_ZIP != 0 {
+            t.push("zip");
         } else {
             // Nothing archive-shaped has been recognized yet (or the job
             // is loose files) - no badge rather than a guess.
@@ -1730,6 +2188,7 @@ pub fn shape_word(token: &str) -> &str {
         "rar5" => "RAR5",
         "rar4" => "RAR4",
         "7z" => "7z",
+        "zip" => "zip",
         "store" => "stored",
         "compressed" => "compressed",
         "mixed" => "mixed",
@@ -2359,6 +2818,14 @@ fn sevenz_part_name(name: &str) -> Option<(String, u32)> {
 /// that do not exist.
 const SEVENZ_MAX_PARTS: u32 = 9999;
 
+/// Tail window the zip attach front-loads: the EOCD scan window (22-byte
+/// record + up to 64 KiB of comment = 65 557) plus the Zip64 locator (20)
+/// and end record (56+), rounded up to 128 KiB so a typical central
+/// directory (46 bytes + name per entry, so ~1000+ entries) arrives in
+/// the same promote. A directory that starts below the window is
+/// promoted separately once the EOCD says where it begins.
+const ZIP_TAIL_PREFETCH: u64 = 128 * 1024;
+
 /// One part of a chased 7z container: its own frontier buffer, its own
 /// slot, its declared size.
 struct SetPart {
@@ -2516,6 +2983,41 @@ impl SevenZSet {
 
     fn total(&self) -> u64 {
         self.state.lock().unwrap().total
+    }
+
+    /// Block until the set's geometry is known (the zip worker's first
+    /// step: a zip split resolves only once every declared part has
+    /// registered its decoded size, unlike a 7z split where part 1's
+    /// start header sizes the whole container up front). Returns the
+    /// container total; errors when the set aborts unresolved.
+    fn wait_resolved_total(&self) -> io::Result<u64> {
+        let mut st = self.state.lock().unwrap();
+        loop {
+            if st.aborted {
+                return Err(io::Error::other("chase set aborted before it resolved"));
+            }
+            if st.part_size > 0 {
+                return Ok(st.total);
+            }
+            st = self.arrived.wait(st).unwrap();
+        }
+    }
+
+    /// Geometry of a DECLARED zip split, once every part is in:
+    /// `(part 1's size, container total)`. None while parts are still
+    /// missing, or when the registered indices are not exactly `1..=n`
+    /// (a rogue index can register on trust before resolution - such a
+    /// set never resolves and finish demotes it).
+    fn zip_geometry(&self, n: u32) -> Option<(u64, u64)> {
+        let st = self.state.lock().unwrap();
+        if st.parts.len() as u32 != n
+            || st.parts.keys().next() != Some(&1)
+            || st.parts.keys().next_back() != Some(&n)
+        {
+            return None;
+        }
+        let part_size = st.parts.get(&1).map(|p| p.size)?;
+        Some((part_size, st.parts.values().map(|p| p.size).sum()))
     }
 
     /// Which part is this slot, and what is the split size? Used to turn
@@ -2691,6 +3193,113 @@ impl io::Seek for ChainedSeekReader {
         self.pos = target as u64;
         self.low_water.store(self.pos, Ordering::Relaxed);
         Ok(self.pos)
+    }
+}
+
+/// Blocking [`crate::zip::Source`] over a chased zip container - the
+/// view the zip worker parses the directory through. Reads block until
+/// the requested bytes arrive (the EOCD/central-directory reads block
+/// only until the promoted tail lands). Each read publishes the chase's
+/// drop-behind watermark, exactly like [`ChainedSeekReader`]: after the
+/// directory parse the worker's reads ascend (entries stream in
+/// local-offset order), so bytes behind the last read are never asked
+/// for again.
+struct BlockingZipSource {
+    set: Arc<SevenZSet>,
+    low_water: Arc<AtomicU64>,
+}
+
+impl crate::zip::Source for BlockingZipSource {
+    fn read_exact_at(&self, off: u64, buf: &mut [u8]) -> Result<(), crate::zip::ZipError> {
+        let mut done = 0usize;
+        while done < buf.len() {
+            let at = off + done as u64;
+            let n = self
+                .set
+                .read_blocking(at, &mut buf[done..])
+                .map_err(crate::zip::ZipError::Io)?;
+            if n == 0 {
+                return Err(crate::zip::ZipError::Malformed("read past end of container"));
+            }
+            done += n;
+            self.low_water.store(at + n as u64, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    fn total(&self) -> u64 {
+        self.set.total()
+    }
+}
+
+/// A read-only view of a [`BlockingZipSource`] that does NOT publish a
+/// drop-behind watermark.
+///
+/// `entry_crypto` resolves an entry's crypto framing before its body is
+/// streamed, and for WinZip-AE that means reading the authentication
+/// code at `end - 10` - ABOVE the body about to be read. Through the
+/// plain source that stored `low_water = end`, so between the crypto
+/// resolve and the first body read (which republishes the correct, much
+/// lower value) an arriving span could compute a drop-behind trim from
+/// the forward-jumped mark and cut above the worker's next read offset.
+/// The chase then failed "read behind the trim point" and the container
+/// demoted to disk - byte-exact, never corruption, but the one-pass win
+/// forfeited on exactly the large encrypted archive drop-behind exists
+/// for. `SevenZCtl::arm_trim` resets low_water to 0 to avoid precisely
+/// this hazard in the 7z open phase, with a named regression test.
+///
+/// Leaving the mark where the previous entry left it is conservative:
+/// lower can only mean trimming less.
+struct QuietZipSource<'a>(&'a BlockingZipSource);
+
+impl crate::zip::Source for QuietZipSource<'_> {
+    fn read_exact_at(&self, off: u64, buf: &mut [u8]) -> Result<(), crate::zip::ZipError> {
+        let mut done = 0usize;
+        while done < buf.len() {
+            let n = self
+                .0
+                .set
+                .read_blocking(off + done as u64, &mut buf[done..])
+                .map_err(crate::zip::ZipError::Io)?;
+            if n == 0 {
+                return Err(crate::zip::ZipError::Malformed("read past end of container"));
+            }
+            done += n;
+        }
+        Ok(())
+    }
+
+    fn total(&self) -> u64 {
+        self.0.set.total()
+    }
+}
+
+/// Bounded blocking `io::Read` over a chased zip entry's data range, so
+/// a decoder can never run past the entry it was given (the chase twin
+/// of zip.rs's `RangeReader`).
+struct BlockingRangeReader<'a> {
+    src: &'a BlockingZipSource,
+    pos: u64,
+    end: u64,
+}
+
+impl io::Read for BlockingRangeReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let left = self.end.saturating_sub(self.pos);
+        if left == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+        let take = (left as usize).min(buf.len());
+        let n = self.src.set.read_blocking(self.pos, &mut buf[..take])?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "zip entry data runs past the end of the container",
+            ));
+        }
+        self.pos += n as u64;
+        self.src.low_water.store(self.pos, Ordering::Relaxed);
+        Ok(n)
     }
 }
 
@@ -2981,6 +3590,12 @@ struct Inner {
     /// charge the same slice; beyond it groups spill to materialized
     /// volumes).
     budget: Arc<HoldsBudget>,
+    /// Held-span scratch file, SHARED down the child chain like the
+    /// budget it relieves (see [`HoldsScratch`]).
+    scratch: Arc<HoldsScratch>,
+    /// Holds-paging gate (`NZBFAST_NO_HOLDS_PAGE` / runtime setter).
+    /// Off: a budget breach demotes exactly as before paging existed.
+    holds_page_on: bool,
     /// Preallocation ceiling + extracted-byte budget, SHARED down the
     /// child chain (see [`Limits`]).
     limits: Arc<Limits>,
@@ -2999,11 +3614,12 @@ struct Inner {
     /// Child forwards queued by under-the-lock re-feed paths; delivered
     /// by `flush_pending_fwd` after the lock drops.
     pending_fwd: Vec<FwdJob>,
-    /// Tail-prefetch promotes raised while the routing lock is held (a
-    /// 7z part joining its set). `promote_file` walks UP the chain
-    /// taking each level's own lock, so it can never be called from
-    /// under one - these are queued here and flushed off-lock.
-    pending_promote: Vec<(usize, Vec<(u64, u64)>)>,
+    /// Promotes raised while the routing lock is held (a 7z part joining
+    /// its set, a held slot's offset-0 probe). `promote_file` walks UP
+    /// the chain taking each level's own lock, so it can never be called
+    /// from under one - these are queued here and flushed off-lock. The
+    /// bool is the hook's `urgent` flag (see [`PromoteHook`]).
+    pending_promote: Vec<(usize, Vec<(u64, u64)>, bool)>,
     /// Nested routing gate (env escape hatch / rollout setting). With it
     /// off, level-1 inner files write directly to disk as before the
     /// child path existed.
@@ -3020,14 +3636,34 @@ struct Inner {
     /// `.7z` materializes for the disk post-pass, the pre-TODO-37
     /// behaviour.
     top_sevenz_on: bool,
+    /// Top-level RAR chase gate (`NZBFAST_NO_TOP_RAR_CHASE` / the
+    /// `prefer_external_unrar` setting / runtime setter). Only depth 0
+    /// reads it, so children carry it unused. Off: a posted compressed
+    /// RAR materializes for the unrar ladder, the pre-lift behaviour.
+    top_chase_on: bool,
+    /// Top-level zip gate (`NZBFAST_NO_TOP_ZIP` / runtime setter). Only
+    /// depth 0 reads it, so children carry it unused. Off: a posted
+    /// `.zip` materializes for the disk post-pass, the phase-1
+    /// behaviour.
+    top_zip_on: bool,
     /// Drop-behind trim gate (`NZBFAST_NO_7Z_TRIM` / runtime setter).
     /// Off: a 7z chase retains everything and an archive over the
     /// retention cap demotes, as it did before trimming existed.
     sevenz_trim_on: bool,
     /// Live split-7z sets, keyed by `sevenz_part_name` base, so a
     /// `.7z.002` classifying later can find the container `.7z.001`
-    /// opened and join it. Cleared as each set settles.
+    /// opened and join it. Cleared as each set settles. Zip splits
+    /// share the map (the base grammars are disjoint: `.7z.NNN` vs
+    /// `.zip.NNN`).
     sevenz_sets: HashMap<String, Arc<SevenZCtl>>,
+    /// Byte-split zip sets the CALLER declared from the NZB's own file
+    /// list: `split_part_name` base -> part count. A zip split needs
+    /// this where a 7z split does not, because no zip part carries a
+    /// header that sizes the container - the count says when every
+    /// part's decoded size is in and the geometry can resolve. A part
+    /// whose base is not declared here never chases (it materializes
+    /// for the disk pass, the phase-1 behaviour).
+    zip_split_decl: HashMap<String, u32>,
     /// Nested depth cap for this chain: the child created AT this depth is
     /// disabled, so the deepest layer materializes (never a hard failure).
     /// Resolved from the daemon setting / env at construction and inherited
@@ -3092,7 +3728,30 @@ struct Inner {
     /// (children share it like the holds budget); drained by
     /// [`Extractor::drain_crypto_events`].
     crypto_events: CryptoEventSink,
+    /// Increment A: candidate-password probe hook, installed by the
+    /// caller (the daemon's harvest over the job's own sidecars and
+    /// stems). Called OFF the routing lock with the archive's crypt
+    /// parameters; a `Some` return is a check-VERIFIED password (the
+    /// hook does the KDFs and only surrenders a candidate the stored
+    /// check accepts). Root level only - a nested level's sidecars are
+    /// inner files the disk pass's password-chain already covers.
+    pw_probe: Option<PwProbeHook>,
+    /// True while any slot is `pw_await` and a probe attempt is due:
+    /// set at blocker onset and re-armed by the cadence check in
+    /// [`Extractor::flush_pw_probe`]; cleared by every flush.
+    pw_probe_due: bool,
+    /// Last probe attempt, for the re-probe cadence (a sidecar that
+    /// lands AFTER the archive blocked must still be seen mid-run, not
+    /// only at finish).
+    pw_probe_last: Option<std::time::Instant>,
 }
+
+/// Increment A: caller-supplied candidate probe. Given the blocked
+/// archive's RAR5 crypt parameters, harvest + test candidates and
+/// return one the stored check VERIFIES (never an unverified guess -
+/// a wrong password past this point writes garbage).
+pub type PwProbeHook =
+    std::sync::Arc<dyn Fn(&crate::rar::CryptProbe) -> Option<String> + Send + Sync>;
 
 impl Extractor {
     /// `n_slots` = number of slots in the download; `enabled=false` makes
@@ -3120,6 +3779,42 @@ impl Extractor {
             .budget
             .cap
             .store(cap.max(8 << 20), Ordering::Relaxed);
+    }
+
+    /// Holds-paging gate (see `NZBFAST_NO_HOLDS_PAGE`, latched at
+    /// construction; default on). Same set-before-spans discipline as the
+    /// other gates. Off: a holds-budget breach demotes exactly as before
+    /// paging existed.
+    pub fn set_holds_paging(&self, on: bool) {
+        self.inner.lock().unwrap().holds_page_on = on;
+    }
+
+    /// Hard ceiling on the held-span scratch file, shared down the chain
+    /// like the RAM cap it relieves. Unset (0) means auto: 4x the holds
+    /// RAM cap, resolved at page time. The daemon wires a free-space-
+    /// aware value here next to `set_extract_budget`. Exceeding the
+    /// ceiling demotes with the same "held-bytes cap" reasons as a RAM
+    /// breach with paging off.
+    pub fn set_holds_scratch_cap(&self, bytes: u64) {
+        self.inner
+            .lock()
+            .unwrap()
+            .scratch
+            .cap
+            .store(bytes, Ordering::Relaxed);
+    }
+
+    /// Bytes ever paged to the holds scratch (whole chain; monotonic).
+    /// Test/diagnostic hook.
+    pub fn holds_paged_total(&self) -> u64 {
+        self.inner.lock().unwrap().scratch.paged_total.load(Ordering::Relaxed)
+    }
+
+    /// Bytes of live paged spans right now. Test/diagnostic hook.
+    pub fn holds_paged_live(&self) -> u64 {
+        let scratch = self.inner.lock().unwrap().scratch.clone();
+        let live = scratch.st().live;
+        live
     }
 
     /// Ceiling on how much space an inner-file writer may RESERVE, shared
@@ -3233,6 +3928,40 @@ impl Extractor {
         self.inner.lock().unwrap().top_sevenz_on = on;
     }
 
+    /// Top-level RAR chase gate (see `NZBFAST_NO_TOP_RAR_CHASE`, latched
+    /// at construction). Same set-before-spans discipline as the other
+    /// gates: the blocker that attaches a chase fires on the archive's
+    /// first parsed entry.
+    pub fn set_top_level_chase(&self, on: bool) {
+        self.inner.lock().unwrap().top_chase_on = on;
+    }
+
+    /// Top-level zip gate (see `NZBFAST_NO_TOP_ZIP`, latched at
+    /// construction). Same set-before-spans discipline as the other
+    /// gates: a posted `.zip` is classified once, on its offset-0
+    /// article.
+    pub fn set_top_level_zip(&self, on: bool) {
+        self.inner.lock().unwrap().top_zip_on = on;
+    }
+
+    /// Declare a byte-split zip set from the NZB's own file list:
+    /// `base` is `zip::split_part_name`'s base, `parts` the count, and
+    /// the caller must have checked the indices run exactly `1..=n`.
+    /// A zip split cannot be sized from its own bytes (no part carries
+    /// a container-sizing header, unlike 7z), so this is what tells the
+    /// chase when every part's decoded size is in. Same set-before-
+    /// spans discipline as the gates: declare before the first write.
+    pub fn declare_zip_split(&self, base: &str, parts: u32) {
+        if parts == 0 {
+            return;
+        }
+        self.inner
+            .lock()
+            .unwrap()
+            .zip_split_decl
+            .insert(base.to_ascii_lowercase(), parts);
+    }
+
     /// Drop-behind trim gate (see `NZBFAST_NO_7Z_TRIM`, latched at
     /// construction). Unlike the other gates this one is safe to flip
     /// mid-download - it only decides whether a budget breach trims
@@ -3293,6 +4022,16 @@ impl Extractor {
         self.inner.lock().unwrap().password = Some(std::sync::Arc::from(pw));
     }
 
+    /// Install the candidate-password probe (Increment A). With it set,
+    /// a slot hitting a password-shaped blocker holds its spans (same
+    /// budget as every other hold) instead of demoting, while the hook
+    /// hunts the job's own sidecars/stems for a check-verified password:
+    /// a hit re-keys the mapper in place and the set streams one-pass; a
+    /// miss demotes at budget pressure or at finish, exactly as before.
+    pub fn set_password_probe(&self, hook: PwProbeHook) {
+        self.inner.lock().unwrap().pw_probe = Some(hook);
+    }
+
     /// Install the finish-decrypt publish gate (see [`DecryptBarrier`]).
     /// Set it before `finish()`; children created afterwards inherit it,
     /// and children created earlier are updated too, so wiring order at
@@ -3309,6 +4048,9 @@ impl Extractor {
     }
 
     pub fn with_resume(out_dir: &Path, n_slots: usize, enabled: bool, resume: bool) -> Extractor {
+        // Crash leftovers from a killed run: at most one extractor owns a
+        // job dir at a time, so a stale scratch here is provably dead.
+        sweep_holds_scratch(out_dir);
         Self::build(
             out_dir,
             n_slots,
@@ -3317,12 +4059,14 @@ impl Extractor {
             0,
             Weak::new(),
             Arc::new(HoldsBudget::new(HOLDS_DEFAULT_CAP)),
+            Arc::new(HoldsScratch::new(out_dir)),
             Arc::new(Limits::unlimited()),
             Arc::new(Mutex::new(Default::default())),
             crate::disk::case_insensitive_dir(out_dir),
             !nested_env_off(),
             !chase_env_off(),
             !sevenz_env_off(),
+            !holds_page_env_off(),
             nested_depth_cap(),
             !output_crc_env_off(),
             None,
@@ -3341,12 +4085,14 @@ impl Extractor {
         depth: usize,
         parent: Weak<Extractor>,
         budget: Arc<HoldsBudget>,
+        scratch: Arc<HoldsScratch>,
         limits: Arc<Limits>,
         names_taken: Arc<Mutex<std::collections::HashSet<String>>>,
         fold_names: bool,
         nested_on: bool,
         chase_on: bool,
         sevenz_on: bool,
+        holds_page_on: bool,
         nested_max_depth: usize,
         verify_output_crc: bool,
         password: Option<std::sync::Arc<str>>,
@@ -3365,6 +4111,8 @@ impl Extractor {
                 alias: HashMap::new(),
                 inner_writers: HashMap::new(),
                 budget,
+                scratch,
+                holds_page_on,
                 limits,
                 names_taken,
                 fold_names,
@@ -3379,8 +4127,15 @@ impl Extractor {
                 // public constructors make. Same construction-time
                 // latching as every other gate.
                 top_sevenz_on: !top_sevenz_env_off(),
+                // A user preferring their own unrar latches the RAR
+                // chase off too: the set materializes and the disk
+                // ladder (where that preference picks the engine) gets
+                // it, instead of the native decoder streaming it here.
+                top_chase_on: !top_chase_env_off() && !prefer_external_unrar(),
+                top_zip_on: !top_zip_env_off(),
                 sevenz_trim_on: !sevenz_trim_env_off(),
                 sevenz_sets: HashMap::new(),
+                zip_split_decl: HashMap::new(),
                 nested_max_depth: nested_max_depth.max(1),
                 verify_output_crc,
                 promote: None,
@@ -3401,6 +4156,9 @@ impl Extractor {
                     && std::env::var("NZBFAST_NO_INSTREAM_DECRYPT").map_or(true, |v| v != "1"),
                 crypto_files: HashMap::new(),
                 crypto_events: Arc::new(Mutex::new(Vec::new())),
+                pw_probe: None,
+                pw_probe_due: false,
+                pw_probe_last: None,
             }),
         }
     }
@@ -3477,13 +4235,16 @@ impl Extractor {
             sort_key: None,
             holds: Vec::new(),
             pre_bytes: 0,
+            probe0_sent: false,
             writer: None,
             mapper: None,
             header_spans: Vec::new(),
             group: None,
             chase: None,
             sevenz: None,
+            container_fmt: ChaseFormat::SevenZ,
             piece_crcs: HashMap::new(),
+            pw_await: None,
         }
     }
 
@@ -3510,12 +4271,14 @@ impl Extractor {
                 depth,
                 inner.self_weak.clone(),
                 inner.budget.clone(),
+                inner.scratch.clone(),
                 inner.limits.clone(),
                 inner.names_taken.clone(),
                 inner.fold_names,
                 inner.nested_on,
                 inner.chase_on,
                 inner.sevenz_on,
+                inner.holds_page_on,
                 inner.nested_max_depth,
                 inner.verify_output_crc,
                 inner.password.clone(),
@@ -3668,10 +4431,47 @@ impl Extractor {
                     } else if offset != 0 {
                         inner.budget.add(data.len());
                         inner.slots[slot].pre_bytes += data.len();
-                        inner.slots[slot].holds.push((offset, data.to_vec()));
+                        inner.slots[slot].holds.push((offset, HoldSpan::Ram(data.to_vec())));
+                        if !inner.slots[slot].probe0_sent {
+                            // The slot's very first span arrived out of
+                            // order, so the M3 head prefetch did NOT
+                            // deliver the offset-0 sniff - front-load it
+                            // instead of waiting (synthesized segment
+                            // numbering can put it anywhere in the
+                            // queue). Two guesses, one promote:
+                            //   (0, 1)  - offset 0 where the NZB ladder
+                            //     says it is; pulls a late/retried head
+                            //     article forward when the ladder is
+                            //     honest.
+                            //   (size-offset, +1) - the rotation guess,
+                            //     root only: if numbering preserved
+                            //     posting order but started mid-sequence
+                            //     (the indexer-synthesized norm), the
+                            //     article at declared byte 0 carrying
+                            //     actual offset X puts actual offset 0
+                            //     at declared byte size-X. The ladder's
+                            //     ±slack absorbs a couple articles of
+                            //     arrival jitter.
+                            // One shot per slot: a one-time promote
+                            // cannot fight the M11 stream reader, whose
+                            // newest-alive generation re-promotes its
+                            // rolling window every few MB (serve.rs
+                            // LiveRangeReader) and so always ends up in
+                            // front; a wrong guess for a genuinely
+                            // shuffled post costs a few articles once,
+                            // and `spill_unclassified_slot` stays the
+                            // backstop.
+                            inner.slots[slot].probe0_sent = true;
+                            let size = inner.slots[slot].size;
+                            let mut spans = vec![(0u64, 1u64)];
+                            if self.parent.upgrade().is_none() && offset < size {
+                                spans.push((size - offset, size - offset + 1));
+                            }
+                            inner.pending_promote.push((slot, spans, false));
+                        }
                         let spill =
                             inner.slots[slot].pre_bytes > unclassified_spill(inner.budget.cap());
-                        if inner.budget.over() {
+                        if inner.budget.over() && !self.page_out_holds(inner) {
                             self.overflow_to_plain(inner)?;
                         } else if spill {
                             // The offset-0 sniff hasn't arrived after this
@@ -3685,6 +4485,13 @@ impl Extractor {
                             // the journal.
                             self.spill_unclassified_slot(inner, slot)?;
                         }
+                        // This branch returns before the function's
+                        // shared off-lock flush, and the next write for
+                        // a still-Unknown slot lands right back here -
+                        // the probe would sit queued until the sniff it
+                        // exists to fetch. Flush it now, off the lock.
+                        drop(g);
+                        self.flush_pending_promote();
                         return Ok(Persist::No);
                     } else {
                         let is_rar = data.starts_with(b"Rar!\x1a\x07\x01\x00")
@@ -3715,6 +4522,13 @@ impl Extractor {
                             // disk" when every byte of it went to disk.
                             self.shape.note(self.depth, SH_7Z);
                             self.chase_span(inner, slot, offset, data)?;
+                        } else if self.try_attach_zip(inner, slot, data)? {
+                            // One-pass zip (phase 2): the same claim
+                            // discipline as 7z - only the FORMAT is
+                            // known yet; `one-pass` is claimed at
+                            // successful finish.
+                            self.shape.note(self.depth, SH_ZIP);
+                            self.chase_span(inner, slot, offset, data)?;
                         } else if inner.protect_sources {
                             // A supposed volume that isn't RAR: writing it
                             // out plain would truncate the source file.
@@ -3729,6 +4543,15 @@ impl Extractor {
                                 // disk for the post-pass, and the badge
                                 // should say so rather than say nothing.
                                 self.shape.note(self.depth, SH_7Z | SH_MATERIALIZED);
+                            } else if self.depth == 0
+                                && data.starts_with(b"PK\x03\x04")
+                                && crate::zip::chase_eligible_name(&inner.slots[slot].name)
+                            {
+                                // Same for a zip the chase can't take
+                                // (gate off, too small). The name gate
+                                // keeps phase 0's rules: a `.cbz` or a
+                                // named non-zip never reads as packaging.
+                                self.shape.note(self.depth, SH_ZIP | SH_MATERIALIZED);
                             }
                             inner.slots[slot].mode = SlotMode::Plain;
                             self.plain_job(inner, slot, offset, data, &mut *jobs)?;
@@ -3768,6 +4591,10 @@ impl Extractor {
         // takes locks up the chain and must not be called from under
         // one). Cheap and usually empty.
         self.flush_pending_promote();
+        // Candidate-password probe for parked encrypted slots (Increment
+        // A) - KDF work, so off the lock; cadence-gated to a no-op lock
+        // peek on the hot path.
+        self.flush_pw_probe(false)?;
         for j in jobs.iter() {
             let part = &data[j.src_start..j.src_start + j.len];
             match &j.crypto {
@@ -4120,8 +4947,8 @@ impl Extractor {
     /// level's own lock self-deadlocks.
     fn flush_pending_promote(&self) {
         let queued = std::mem::take(&mut self.inner.lock().unwrap().pending_promote);
-        for (slot, spans) in queued {
-            self.promote_slot_spans(slot, &spans);
+        for (slot, spans, urgent) in queued {
+            self.promote_slot_spans(slot, &spans, urgent);
         }
     }
 
@@ -4199,7 +5026,7 @@ impl Extractor {
         // with no password. Deferring cannot leave the budget over: both of
         // those routes release this same charge.
         let blocked = inner.slots[slot].mapper.as_ref().unwrap().blocker.is_some();
-        if stashed > 0 && !blocked && inner.budget.over() {
+        if stashed > 0 && !blocked && inner.budget.over() && !self.page_out_holds(inner) {
             // The header stash charges the same budget as holds, and it
             // grows on remote data: service blocks (a RAR recovery
             // record) and anything past the end-of-archive marker sit
@@ -4224,6 +5051,15 @@ impl Extractor {
             // reach: nothing parsed, so say "encrypted" from the blocker.
             if matches!(b, MapBlocker::EncryptedHeaders | MapBlocker::BadPassword) {
                 self.shape.note(self.depth, SH_ENCRYPTED);
+            }
+            // Increment A: a password-shaped blocker with the candidate
+            // probe installed parks instead of demoting - the password
+            // may be sitting in a sidecar of this very NZB, and a
+            // Verified hit re-keys the mapper with every byte still in
+            // RAM. A miss resolves through the exact demote below, at
+            // budget pressure or at finish.
+            if self.try_pw_await(inner, slot, &b, offset, data)? {
+                return Ok(());
             }
             // Phase 2: a compressed RAR5 inner archive gets a chase
             // instead of a demotion - the slot flips to RarChase, its
@@ -4337,7 +5173,7 @@ impl Extractor {
             if abs_e > abs_s {
                 let part = data[ks as usize..(abs_e - offset) as usize].to_vec();
                 stashed += part.len();
-                s.header_spans.push((abs_s, part));
+                s.header_spans.push((abs_s, HoldSpan::Ram(part)));
             }
         }
         inner.budget.add(stashed);
@@ -4353,14 +5189,27 @@ impl Extractor {
     /// then demotes exactly as before the chase existed. Eligible only
     /// when the blocker fired on the archive's FIRST entry: a mixed
     /// store/compressed set has already routed store members, and
-    /// re-extracting those through a chase is out of scope.
+    /// re-extracting those through a chase is out of scope. (An
+    /// all-compressed multi-entry archive is NOT excluded by the
+    /// single-entry check below: the blocker fires on the first parsed
+    /// entry, so exactly one entry exists at attach time, and the
+    /// sequence driver then decodes every member through its own sink.)
+    ///
+    /// Runs at depth 0 too (the top-level analogue of TODO 37 step 1):
+    /// a POSTED compressed RAR chases, its decoded members land in the
+    /// level-1 child and promote to the root output - the same rails
+    /// nested chases have always used. Nothing about the engine is
+    /// depth-specific; the old guard predated the root promote wiring.
+    /// No drop-behind trimming yet, so a set over the holds cap still
+    /// demotes to the unrar ladder (the pre-lift behaviour, exit path
+    /// unchanged).
     fn try_attach_chase(
         &self,
         inner: &mut Inner,
         slot: usize,
         b: &MapBlocker,
     ) -> io::Result<bool> {
-        if self.depth == 0
+        if (self.depth == 0 && !inner.top_chase_on)
             || !inner.nested_on
             || !inner.chase_on
             || inner.protect_sources
@@ -4436,14 +5285,14 @@ impl Extractor {
         // outside `SlotMode::Rar`, which this slot just left.
         let mut stored = 0usize;
         let headers = std::mem::take(&mut inner.slots[slot].header_spans);
-        for (off, bytes) in headers {
-            inner.budget.sub(bytes.len());
+        for (off, span) in headers {
+            let bytes = Self::reclaim_span(inner, span)?;
             stored = buf.write_span(off, &bytes);
         }
         let holds = std::mem::take(&mut inner.slots[slot].holds);
         inner.slots[slot].pre_bytes = 0;
-        for (off, bytes) in holds {
-            inner.budget.sub(bytes.len());
+        for (off, span) in holds {
+            let bytes = Self::reclaim_span(inner, span)?;
             stored = buf.write_span(off, &bytes);
         }
         inner.budget.add(stored);
@@ -4484,6 +5333,206 @@ impl Extractor {
             self.fallback_slot_or_group(inner, slot, "held-bytes cap: chase memory")?;
         }
         Ok(true)
+    }
+
+    /// Increment A: park a password-blocked slot instead of demoting it,
+    /// while the candidate probe may still turn up the password. Returns
+    /// true when the span was taken (held); false hands the blocker back
+    /// to the demote path unchanged.
+    ///
+    /// Eligible only when a probe hit could actually rescue the slot:
+    /// the hook is installed (root level - children never get one), the
+    /// blocker is password-shaped rather than structural, and the
+    /// archive carries a WELLFORMED stored check - without one no
+    /// candidate can ever verify (that shape needs the tweaked-MAC gate,
+    /// Increment B) and awaiting would just burn budget until finish.
+    ///
+    /// Held spans stay fully live: `read_at`/`covered` serve holds, so
+    /// settle read-back and mapped PAR2 repair see the bytes; a repair
+    /// span for a parked slot parks BEHIND the original in `holds`, and
+    /// the ordered re-feed keeps last-writer-wins intact.
+    fn try_pw_await(
+        &self,
+        inner: &mut Inner,
+        slot: usize,
+        b: &MapBlocker,
+        offset: u64,
+        data: &[u8],
+    ) -> io::Result<bool> {
+        if inner.slots[slot].pw_await.is_none() {
+            // First span since the blocker fired: decide eligibility once.
+            if self.depth != 0
+                || inner.pw_probe.is_none()
+                || inner.protect_sources
+                || !matches!(inner.slots[slot].mode, SlotMode::Rar)
+            {
+                return Ok(false);
+            }
+            let probeable = match b {
+                // Headers opaque, or the start password failed its check:
+                // the type-4 block's params are captured either way.
+                // Encrypted store entries with no password at all: the
+                // exact shape a found candidate rescues. (Compressed
+                // entries return NotStore before the encryption check, so
+                // this variant is store-method by construction; a RAR4
+                // encrypted entry also lands here but has no RAR5 crypt
+                // params, which the wellformed-check gate below filters.)
+                MapBlocker::EncryptedHeaders
+                | MapBlocker::BadPassword
+                | MapBlocker::EncryptedNoPassword => true,
+                // "Compressed or encrypted entries": only the encrypted
+                // STORE flavor is rescuable - a password makes it
+                // mappable. A compressed entry stays blocked with the
+                // password in hand, so it goes to the chase/demote path.
+                MapBlocker::NotStore => {
+                    inner.slots[slot].mapper.as_ref().is_some_and(|m| {
+                        m.entries
+                            .last()
+                            .is_some_and(|e| e.encrypted && matches!(e.method, Method::Store))
+                    })
+                }
+                _ => return Ok(false),
+            };
+            let has_check = probeable
+                && inner.slots[slot]
+                    .mapper
+                    .as_ref()
+                    .and_then(|m| m.crypt_probe_params())
+                    .and_then(|p| p.check)
+                    .is_some_and(|c| crate::rarcrypt::check_is_wellformed(&c));
+            if !has_check {
+                return Ok(false);
+            }
+            inner.slots[slot].pw_await = Some(blocker_reason(b));
+            inner.pw_probe_due = true;
+        }
+        // Park the span. The header-region part of it is already in the
+        // stash (retain_header_bytes ran before the blocker arm), so that
+        // overlap is briefly double-charged - headers only, released with
+        // whichever copy drops first, and both the fallback materialize
+        // and a re-keyed re-parse tolerate the duplicate bytes.
+        inner.budget.add(data.len());
+        inner.slots[slot].holds.push((offset, HoldSpan::Ram(data.to_vec())));
+        if inner.budget.over() && !self.page_out_holds(inner) {
+            // Same arbiter as every other hold. Demote with the ORIGINAL
+            // blocker's reason so the finish ladder's remediation (the
+            // "encrypted"/"password" keying) is exactly what it would
+            // have been without the wait.
+            let reason = inner.slots[slot].pw_await.take().unwrap();
+            self.fallback_slot_or_group(inner, slot, reason)?;
+        }
+        Ok(true)
+    }
+
+    /// Run the candidate probe for parked slots, off the routing lock
+    /// (the hook does PBKDF2 work). `force` ignores the re-probe cadence
+    /// - the finish path's last chance, when every sidecar has landed.
+    /// On a hit the password applies under the lock and the parked slots
+    /// re-key; the re-feeds may queue child forwards, so this flushes
+    /// them like every other public entry point that re-feeds holds.
+    fn flush_pw_probe(&self, force: bool) -> io::Result<()> {
+        let (hook, probes) = {
+            let mut g = self.inner.lock().unwrap();
+            let inner = &mut *g;
+            let Some(hook) = inner.pw_probe.clone() else { return Ok(()) };
+            let due = force
+                || inner.pw_probe_due
+                || inner
+                    .pw_probe_last
+                    .is_none_or(|t| t.elapsed() >= PW_REPROBE_EVERY);
+            if !due {
+                return Ok(());
+            }
+            let mut probes: Vec<crate::rar::CryptProbe> = Vec::new();
+            for s in &inner.slots {
+                if s.pw_await.is_none() {
+                    continue;
+                }
+                if let Some(p) = s.mapper.as_ref().and_then(|m| m.crypt_probe_params()) {
+                    // One salt per archive; a multi-set job contributes
+                    // one probe per distinct salt.
+                    if !probes.contains(&p) {
+                        probes.push(p);
+                    }
+                }
+            }
+            if probes.is_empty() {
+                return Ok(());
+            }
+            inner.pw_probe_due = false;
+            inner.pw_probe_last = Some(std::time::Instant::now());
+            (hook, probes)
+        };
+        for p in &probes {
+            if let Some(pw) = hook(p) {
+                self.apply_probed_password(&pw)?;
+                self.flush_pending_fwd()?;
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// A probe candidate VERIFIED against some parked archive: install
+    /// it and re-key every parked slot whose own stored check accepts it
+    /// (two encrypted sets in one job may want different passwords - the
+    /// others keep waiting for a later candidate). Re-keying is a fresh
+    /// mapper plus a re-feed of everything retained; the parse runs
+    /// exactly as if the password had been known at classification.
+    fn apply_probed_password(&self, pw: &str) -> io::Result<()> {
+        let mut g = self.inner.lock().unwrap();
+        let inner = &mut *g;
+        inner.password = Some(std::sync::Arc::from(pw));
+        for slot in 0..inner.slots.len() {
+            if inner.slots[slot].pw_await.is_none() {
+                continue;
+            }
+            let verified = inner.slots[slot]
+                .mapper
+                .as_ref()
+                .and_then(|m| m.crypt_probe_params())
+                .is_some_and(|p| p.verify(pw) == crate::rar::PwVerdict::Verified);
+            if !verified {
+                continue;
+            }
+            inner.slots[slot].pw_await = None;
+            let size = inner.slots[slot].size;
+            inner.slots[slot].mapper =
+                Some(VolumeMapper::with_password(size, inner.password.clone()));
+            // Feed the stash back through the keyed mapper. Uncharge
+            // first: the re-parse re-stashes whatever is still header
+            // (and maps the rest), so leaving the old charge would
+            // double-bill every stashed byte.
+            let headers = std::mem::take(&mut inner.slots[slot].header_spans);
+            for (off, span) in headers {
+                let bytes = Self::reclaim_span(inner, span)?;
+                self.rar_span(inner, slot, off, &bytes, None, false, None)?;
+            }
+            self.drain_holds(inner, slot)?;
+            println!(
+                "🔑 candidate password unlocked {} in-stream",
+                inner.slots[slot].name
+            );
+        }
+        Ok(())
+    }
+
+    /// Finish-time resolution for Increment A: one forced probe (every
+    /// sidecar is on disk by now), then any slot still parked demotes
+    /// with its original blocker reason - the exact outcome the await
+    /// deferred, so the report and the ladder see nothing new.
+    fn resolve_pw_awaits(&self) -> io::Result<()> {
+        self.flush_pw_probe(true)?;
+        {
+            let mut g = self.inner.lock().unwrap();
+            let inner = &mut *g;
+            for slot in 0..inner.slots.len() {
+                if let Some(reason) = inner.slots[slot].pw_await.take() {
+                    self.fallback_slot_or_group(inner, slot, reason)?;
+                }
+            }
+        }
+        self.flush_pending_fwd()
     }
 
     /// Route a chased slot's span into its frontier buffer, charging the
@@ -4930,6 +5979,163 @@ impl Extractor {
         Ok(true)
     }
 
+    /// One-pass zip (phase 2): attach a POSTED single-file zip to the
+    /// container chase. The central directory is the last thing in a
+    /// zip (behind at most a 64 KiB comment), so the slot joins a
+    /// one-part set whose tail promote front-loads the directory window,
+    /// and the zip worker parses it and streams each store/deflate entry
+    /// into a child slot as its bytes arrive - the same seam, budget,
+    /// trim and demote ladder as the 7z chase, driven by a different
+    /// parser (see [`ChaseFormat`]).
+    ///
+    /// Returns false when ineligible - the slot then classifies Plain
+    /// and materializes for the disk post-pass exactly as phase 1 left
+    /// it. Eligibility carries phase 0's naming rules into the stream:
+    /// a `.cbz`/`.epub` never attaches, a NAMED non-zip is never
+    /// magic-sniffed, and multi-part shapes wait for the disk pass
+    /// (see `zip::chase_eligible_name`).
+    fn try_attach_zip(&self, inner: &mut Inner, slot: usize, data: &[u8]) -> io::Result<bool> {
+        // Depth 0 only in v1: a nested zip (inside a store RAR) keeps
+        // the materialize-then-disk-pass path. The seam below is depth-
+        // agnostic; the guard is scope, not mechanism.
+        if self.depth != 0
+            || !inner.top_zip_on
+            || !inner.nested_on
+            || inner.protect_sources
+            || inner.slots[slot].size == 0
+            || inner.self_weak.upgrade().is_none()
+        {
+            return Ok(false);
+        }
+        let size = inner.slots[slot].size;
+        // A byte-split part (`name.zip.001`): the cut is arbitrary, so
+        // only part 1 has a signature to sniff and the CALLER's
+        // declaration (from the NZB file list) is what identifies the
+        // set and its part count - see `declare_zip_split`.
+        if let Some((base, idx)) = crate::zip::split_part_name(&inner.slots[slot].name) {
+            let Some(&n) = inner.zip_split_decl.get(&base) else {
+                return Ok(false);
+            };
+            if idx > n {
+                return Ok(false);
+            }
+            if idx == 1 && !data.starts_with(b"PK\x03\x04") {
+                // The declared set's first part is not a zip after all
+                // (a RAR numeric volume in a `.zip.001` costume, say).
+                // Forfeit whatever joined on trust and stop later parts
+                // joining; this slot classifies Plain, exactly as if
+                // nothing had been declared.
+                if let Some(c) = inner.sevenz_sets.get(&base).cloned() {
+                    self.sevenz_fallback_set(inner, &c, "zip split part 1 is not a zip")?;
+                }
+                inner.zip_split_decl.remove(&base);
+                return Ok(false);
+            }
+            let ctl = match inner.sevenz_sets.get(&base) {
+                Some(c) => c.clone(),
+                None => {
+                    let c = Arc::new(SevenZCtl::pending(base.clone()));
+                    inner.sevenz_sets.insert(base.clone(), c.clone());
+                    c
+                }
+            };
+            inner.slots[slot].container_fmt = ChaseFormat::Zip;
+            let joined = self.sevenz_join_set(inner, slot, ctl.clone(), idx)?;
+            if !joined {
+                return Ok(false);
+            }
+            self.zip_try_resolve(inner, &ctl, n)?;
+            if idx == 1 {
+                // Part 1 spawns the worker, like the 7z split: reads
+                // block until the set resolves (`wait_resolved_total`),
+                // exactly as they block on bytes that have not arrived.
+                self.zip_spawn_worker(inner, &ctl)?;
+            }
+            return Ok(true);
+        }
+        // Single container. 22 bytes is the smallest EOCD, i.e. the
+        // smallest thing that can be a zip at all.
+        if size < 22 {
+            return Ok(false);
+        }
+        if !crate::zip::chase_eligible_name(&inner.slots[slot].name) {
+            return Ok(false);
+        }
+        // Local-file-header magic only. The spanning markers (`PK00`,
+        // `PK\x07\x08`) open the FIRST segment of a spanned set, whose
+        // central directory lives in a different posted file - the disk
+        // pass owns that shape.
+        if !data.starts_with(b"PK\x03\x04") {
+            return Ok(false);
+        }
+        let ctl = Arc::new(SevenZCtl {
+            set: Arc::new(SevenZSet::new(size, size)),
+            key: String::new(),
+            low_water: Arc::new(AtomicU64::new(0)),
+            tail: Mutex::new(None),
+            trim_ok: std::sync::atomic::AtomicBool::new(false),
+            worker: Mutex::new(None),
+            sink_slots: Mutex::new(Vec::new()),
+            outcome: Mutex::new(None),
+        });
+        // Front-load the directory window: EOCD scan window (22 + 64 KiB
+        // comment) + Zip64 locator/record, rounded up so a typical
+        // central directory rides along in the same promote. A directory
+        // that starts below the window is promoted by the worker once
+        // the EOCD says where it is.
+        *ctl.tail.lock().unwrap() = Some((size.saturating_sub(ZIP_TAIL_PREFETCH), size));
+        inner.slots[slot].container_fmt = ChaseFormat::Zip;
+        let joined = self.sevenz_join_set(inner, slot, ctl.clone(), 1)?;
+        if !joined {
+            // Unreachable for a fresh one-part set (nothing to collide
+            // with), kept for symmetry with the 7z attach.
+            inner.slots[slot].container_fmt = ChaseFormat::SevenZ;
+            return Ok(false);
+        }
+        self.zip_spawn_worker(inner, &ctl)?;
+        Ok(true)
+    }
+
+    /// Resolve a declared zip split once every part has registered its
+    /// decoded size: fix the geometry, then front-load the directory
+    /// window - which could not be asked for earlier, because on a byte
+    /// split nothing says where the container ENDS until the last
+    /// part's size is in. Promotes are QUEUED (the caller holds the
+    /// routing lock; see `pending_promote`). A set whose parts do not
+    /// line up forfeits whole, like its 7z counterpart.
+    fn zip_try_resolve(&self, inner: &mut Inner, ctl: &Arc<SevenZCtl>, n: u32) -> io::Result<()> {
+        if ctl.set.resolved() {
+            return Ok(());
+        }
+        let Some((part_size, total)) = ctl.set.zip_geometry(n) else {
+            return Ok(());
+        };
+        if part_size == 0 || !ctl.set.resolve(part_size, total) {
+            return self.sevenz_fallback_set(inner, ctl, "zip split parts do not line up");
+        }
+        let tail = (total.saturating_sub(ZIP_TAIL_PREFETCH), total);
+        *ctl.tail.lock().unwrap() = Some(tail);
+        // Urgent, like every tail promote: the worker blocks on the
+        // directory read until these land.
+        for (s, ls, le) in ctl.set.map_range(tail.0, tail.1) {
+            inner.pending_promote.push((s, vec![(ls, le)], true));
+        }
+        Ok(())
+    }
+
+    /// Spawn the zip chase worker for `ctl` (single container or split
+    /// part 1) and store its handle where finish() joins it.
+    fn zip_spawn_worker(&self, inner: &Inner, ctl: &Arc<SevenZCtl>) -> io::Result<()> {
+        let weak = inner.self_weak.clone();
+        let ctl2 = ctl.clone();
+        let handle = std::thread::Builder::new()
+            .name("nzb-zip-chase".into())
+            .spawn(move || Self::zip_worker(weak, ctl2))
+            .map_err(io::Error::other)?;
+        *ctl.worker.lock().unwrap() = Some(handle);
+        Ok(())
+    }
+
     /// Attach `slot` to a 7z container as its part `idx`: flip the slot
     /// to SevenZ, seed a frontier buffer with everything held so far,
     /// and register it with the set. Shared by the single-part case
@@ -4951,19 +6157,21 @@ impl Extractor {
                 size,
             },
         ) {
-            // Not a `7z -v` split after all - a part of the wrong size,
+            // Not a uniform split after all - a part of the wrong size,
             // a duplicate, or an index past the container's end. Refuse
             // the whole set rather than guess at the mapping; the disk
             // post-pass joins the parts and extracts them.
-            self.sevenz_fallback_set(inner, &ctl, "7z split parts do not line up")?;
+            let why =
+                format!("{} split parts do not line up", inner.slots[slot].container_fmt.noun());
+            self.sevenz_fallback_set(inner, &ctl, &why)?;
             return Ok(false);
         }
         inner.slots[slot].mode = SlotMode::SevenZ;
         let holds = std::mem::take(&mut inner.slots[slot].holds);
         inner.slots[slot].pre_bytes = 0;
         let mut stored = 0usize;
-        for (off, bytes) in holds {
-            inner.budget.sub(bytes.len());
+        for (off, span) in holds {
+            let bytes = Self::reclaim_span(inner, span)?;
             stored = buf.write_span(off, &bytes);
         }
         inner.budget.add(stored);
@@ -4992,7 +6200,7 @@ impl Extractor {
             // set demoted on the retention cap. Re-promoting a range is
             // harmless: the ladder ranks by first occurrence.
             for (s, ls, le) in ctl.set.map_range(a, b) {
-                inner.pending_promote.push((s, vec![(ls, le)]));
+                inner.pending_promote.push((s, vec![(ls, le)], true));
             }
         }
         if seeded_conflict {
@@ -5163,6 +6371,234 @@ impl Extractor {
         })
     }
 
+    /// The zip chase worker (one-pass zip, phase 2): parse the central
+    /// directory through the blocking view (footer first, via the tail
+    /// prefetch), then stream every entry into a fresh child slot in
+    /// local-offset order - store entries as a straight copy, deflate
+    /// through the same flate2 decoder the disk path trusts. The
+    /// extractor is reached weakly so a cancelled job can drop; the
+    /// outcome is recorded for finish() to act on. Every error wording
+    /// here reaches the user through the demote reason, marked
+    /// [`ZIP_DISK_FALLBACK_PREFIX`] at the demote site.
+    fn zip_worker(me: Weak<Extractor>, ctl: Arc<SevenZCtl>) {
+        let result = Self::zip_run(&me, &ctl);
+        let mut st = ctl.outcome.lock().unwrap();
+        *st = Some(result);
+    }
+
+    /// The worker's engine drive. Declines - anything phase 1's disk
+    /// reader would refuse (encrypted entries, methods beyond
+    /// store/deflate, symlinks, spanned sets, empty archives) - error
+    /// out BEFORE any entry streams, so the demote materializes a
+    /// container the disk pass then fails with today's exact wording.
+    /// CRC32 and declared size are enforced per entry, same as the disk
+    /// reader: a mismatch demotes rather than publishing damaged bytes.
+    fn zip_run(me: &Weak<Extractor>, ctl: &SevenZCtl) -> Result<(), String> {
+        use crate::zip;
+        use std::io::{Read as _, Write as _};
+        let src = BlockingZipSource {
+            set: ctl.set.clone(),
+            low_water: ctl.low_water.clone(),
+        };
+        // A single container resolves at attach; a declared split
+        // resolves when its last part's decoded size registers - block
+        // until then, exactly as reads block on unarrived bytes.
+        let total = ctl.set.wait_resolved_total().map_err(|e| e.to_string())?;
+        let (cd, count, cd_size, multi_disk) =
+            zip::find_central_directory(&src).map_err(|e| e.to_string())?;
+        // The resolve promoted the last ZIP_TAIL_PREFETCH bytes. A
+        // directory starting below that window is front-loaded too -
+        // without this the parse would wait for the natural (front-to-
+        // back) arrival order to reach a tail-resident structure, i.e.
+        // for nearly the whole download. Container offsets translate to
+        // per-part slot ranges through the set, which is identity for a
+        // single container.
+        let window_start = total.saturating_sub(ZIP_TAIL_PREFETCH);
+        if cd < window_start {
+            let Some(ex) = me.upgrade() else {
+                return Err("extractor dropped".to_string());
+            };
+            // Off-lock by construction: the worker holds no routing
+            // lock, so the promote walk is safe to run directly (the
+            // attach path, which does hold it, queues instead). Urgent:
+            // this worker BLOCKS on the directory read, exactly the 7z
+            // footer case. Container offsets translate to per-part slot
+            // ranges through the set (identity for a single container).
+            for (s, ls, le) in ctl.set.map_range(cd, window_start) {
+                ex.promote_slot_spans(s, &[(ls, le)], true);
+            }
+        }
+        let entries =
+            zip::parse_central_directory(&src, cd, count, cd_size, multi_disk)
+                .map_err(|e| e.to_string())?;
+        if entries.is_empty() {
+            return Err("the zip archive contains no entries".to_string());
+        }
+        // Read the job's password HERE rather than at spawn: the tail
+        // has just resolved, which is later, so a key that arrived
+        // mid-download (daemon `set_password`) is still picked up.
+        let password: Option<String> = {
+            let Some(ex) = me.upgrade() else {
+                return Err("extractor dropped".to_string());
+            };
+            let pw = ex.inner.lock().unwrap().password.clone();
+            pw.map(|p| p.to_string())
+        };
+        for e in &entries {
+            if e.is_symlink() {
+                return Err(format!("entry {:?} is a symlink, which is not extracted", e.name));
+            }
+            if e.is_dir {
+                continue;
+            }
+            // An encrypted entry with no key cannot be streamed OR
+            // unpacked here; the demote hands the container to the disk
+            // pass, which says the same thing with the same wording.
+            if e.is_encrypted() && password.is_none() {
+                return Err(format!(
+                    "{} is password-protected and the job has no password",
+                    e.name
+                ));
+            }
+            // A WinZip AE entry stores 99 and the truth in its extra
+            // field, so the method gate has to ask for the REAL one or
+            // every AES zip declines as "unknown compression".
+            let m = zip::real_method(e);
+            if !zip::method_supported(m) {
+                return Err(format!(
+                    "{} uses {} compression, which is not built in",
+                    e.name,
+                    zip::method_name(m)
+                ));
+            }
+            // Stored entries pack 1:1 - but an encrypted one's
+            // `compressed_size` also carries its crypto framing (salt +
+            // verifier + auth code, or the 12-byte ZipCrypto header),
+            // so the comparison only holds for plaintext.
+            if m == zip::METHOD_STORE
+                && !e.is_encrypted()
+                && e.compressed_size != e.uncompressed_size
+            {
+                return Err("malformed zip (stored entry sizes disagree)".to_string());
+            }
+        }
+        let mut files: Vec<&zip::Entry> = entries.iter().filter(|e| !e.is_dir).collect();
+        if files.is_empty() {
+            // Directory-only archives produce nothing; "unpacked
+            // successfully" having produced nothing is the silent
+            // success this codebase refuses everywhere else.
+            return Err("the zip archive contains only directories".to_string());
+        }
+        // Ascending local offsets = the order the articles arrive in.
+        files.sort_by_key(|e| e.local_offset());
+        // Drop-behind is decided HERE, between the parse and the first
+        // payload read (see arm_trim for why the order matters). Zip has
+        // no BCJ2 analogue - a directory-driven read never revisits
+        // bytes behind the frontier - so the trim is always safe to arm.
+        ctl.arm_trim(false);
+        let mut buf = vec![0u8; 64 * 1024];
+        for e in files {
+            let data_at = zip::entry_data_offset(&src, e).map_err(|err| err.to_string())?;
+            let end = data_at
+                .checked_add(e.compressed_size)
+                .filter(|&v| v <= total)
+                .ok_or_else(|| format!("{} runs past the end of the container", e.name))?;
+            let Some(ex) = me.upgrade() else {
+                return Err("extractor dropped".to_string());
+            };
+            // Same single-lock-hold discipline as the 7z sink: the
+            // liveness check and the sink-slot registration must be
+            // atomic against a demotion draining sink_slots, or the
+            // fresh slot leaks a partial output.
+            let (child, cslot) = {
+                let mut g = ex.inner.lock().unwrap();
+                let inner = &mut *g;
+                let members = ctl.set.member_slots();
+                if members.is_empty()
+                    || !members
+                        .iter()
+                        .all(|&m| matches!(inner.slots[m].mode, SlotMode::SevenZ))
+                {
+                    return Err("zip chase demoted".to_string());
+                }
+                let child = ex.ensure_child(inner);
+                let cslot = child.alloc_slot();
+                ctl.sink_slots.lock().unwrap().push(cslot);
+                (child, cslot)
+            };
+            let mut sink = ChaseSink {
+                child,
+                slot: cslot,
+                name: e.name.clone(),
+                size: e.uncompressed_size,
+                pos: 0,
+            };
+            if e.uncompressed_size == 0 {
+                // An explicit empty write is what creates the output
+                // file - the copy loop below never calls the sink for
+                // zero bytes, and the disk path does land empty files.
+                sink.write(&[]).map_err(|err| format!("writing {}: {err}", e.name))?;
+            }
+            // Crypto framing + password check, shared verbatim with the
+            // disk reader (`zip::entry_crypto`). Plaintext entries get
+            // `EntryCipher::None`, so there is one path, not two.
+            // Through the quiet view: the AE authentication code lives at
+            // `end - 10`, above the body we are about to stream, and
+            // publishing a watermark there can strand the worker behind a
+            // drop-behind trim. See `QuietZipSource`.
+            let crypto =
+                zip::entry_crypto(&QuietZipSource(&src), e, data_at, end, password.as_deref())
+                    .map_err(|err| err.to_string())?;
+            let mut rd_src = crypto.cipher.wrap(BlockingRangeReader {
+                src: &src,
+                pos: data_at + crypto.head,
+                end: end - crypto.tail,
+            });
+            // One code path for both methods, like the disk reader:
+            // store is the identity decoder, so the CRC/size accounting
+            // cannot drift between them.
+            let mut rd = zip::decoder(zip::real_method(e), &mut rd_src);
+            let mut crc = crc32fast::Hasher::new();
+            let mut written = 0u64;
+            loop {
+                let n = rd.read(&mut buf).map_err(|err| format!("reading {}: {err}", e.name))?;
+                if n == 0 {
+                    break;
+                }
+                written += n as u64;
+                if written > e.uncompressed_size {
+                    return Err(format!("{} is longer than its declared size", e.name));
+                }
+                crc.update(&buf[..n]);
+                sink.write_all(&buf[..n])
+                    .map_err(|err| format!("writing {}: {err}", e.name))?;
+            }
+            // A deflate decoder stops at its own stream end, which can
+            // leave an AE entry's HMAC (raised at the SOURCE's EOF)
+            // unreached. Drain so authentication always runs before this
+            // entry is called good - same reason, same fix, as the disk
+            // reader.
+            drop(rd);
+            loop {
+                let n = rd_src.read(&mut buf).map_err(|err| format!("reading {}: {err}", e.name))?;
+                if n == 0 {
+                    break;
+                }
+            }
+            if written != e.uncompressed_size {
+                return Err(format!("{} is shorter than its declared size", e.name));
+            }
+            // AE-2 zeroes the CRC field BY SPEC - its HMAC, verified in
+            // the drain above, is the integrity check. Comparing against
+            // a stored zero would fail every AE-2 entry.
+            let check_crc = zip::crc_is_authoritative(e);
+            if check_crc && crc.finalize() != e.crc32 {
+                return Err(format!("{} failed its stored CRC - the archive is damaged", e.name));
+            }
+        }
+        Ok(())
+    }
+
     /// Unlink a slot's own file and release the name it claimed. Used
     /// when a trimmed 7z chase SUCCEEDS: the spilled prefix is a
     /// truncated archive whose payload already shipped by another route.
@@ -5261,6 +6697,7 @@ impl Extractor {
                     }
                 }
                 other => {
+                    let noun = inner.slots[live[0]].container_fmt.noun();
                     let why = match other {
                         Some(Err(e)) => e,
                         // No outcome and no worker means the container
@@ -5268,9 +6705,9 @@ impl Extractor {
                         // `.7z.001` never classified, so nothing ever
                         // learned how big it was or where its map lived.
                         None if !ctl.set.resolved() => {
-                            "7z split set never found its first part".to_string()
+                            format!("{noun} split set never found its first part")
                         }
-                        _ => "7z worker panicked".to_string(),
+                        _ => format!("{noun} worker panicked"),
                     };
                     self.sevenz_abandon_sinks(inner, &ctl);
                     for m in live {
@@ -5289,7 +6726,7 @@ impl Extractor {
     /// file promote. At the ROOT there is no parent and none is needed:
     /// the slot is a posted file already, so it goes straight to this
     /// level's own hook.
-    fn promote_slot_spans(&self, slot: usize, spans: &[(u64, u64)]) {
+    fn promote_slot_spans(&self, slot: usize, spans: &[(u64, u64)], urgent: bool) {
         let (name, size) = {
             let inner = self.inner.lock().unwrap();
             (inner.slots[slot].name.clone(), inner.slots[slot].size)
@@ -5299,14 +6736,14 @@ impl Extractor {
         }
         let name = sanitize_filename(&name);
         match self.parent.upgrade() {
-            Some(p) => p.promote_file(&name, size, spans),
+            Some(p) => p.promote_file(&name, size, spans, urgent),
             // The ROOT: a slot here is a POSTED file, so its byte space
             // is already the byte space the installed hook resolves to
             // articles - no translation left to do, hand it straight
             // over. This used to be `else { return }`, which silently
             // no-opped, which is why a top-level 7z never got its tail
             // front-loaded even after the depth guard came off.
-            None => self.promote_file(&name, size, spans),
+            None => self.promote_file(&name, size, spans, urgent),
         }
     }
 
@@ -5319,10 +6756,10 @@ impl Extractor {
     /// a chased (compressed) level yields no offset mapping, so the
     /// promote quietly stops there. Never called with any routing lock
     /// held; each level takes only its own lock, one at a time.
-    fn promote_file(&self, name: &str, size: u64, spans: &[(u64, u64)]) {
+    fn promote_file(&self, name: &str, size: u64, spans: &[(u64, u64)], urgent: bool) {
         let hook = self.inner.lock().unwrap().promote.clone();
         if let Some(h) = hook {
-            h(name, size, spans);
+            h(name, size, spans, urgent);
             return;
         }
         let Some(p) = self.parent.upgrade() else { return };
@@ -5345,7 +6782,7 @@ impl Extractor {
             if sname.is_empty() {
                 continue;
             }
-            p.promote_file(&sanitize_filename(&sname), ssize, &ranges);
+            p.promote_file(&sanitize_filename(&sname), ssize, &ranges, urgent);
         }
     }
 
@@ -5432,9 +6869,32 @@ impl Extractor {
                 None => {
                     let part = data[span_off as usize..(span_off + len) as usize].to_vec();
                     inner.budget.add(part.len());
-                    inner.slots[slot].holds.push((offset + span_off, part));
-                    if inner.budget.over() {
-                        return self.fallback_slot_or_group(inner, slot, "held-bytes cap");
+                    inner.slots[slot].holds.push((offset + span_off, HoldSpan::Ram(part)));
+                    if inner.budget.over() && !self.page_out_holds(inner) {
+                        // Write the whole article through after the
+                        // demote, exactly as the sibling demote routes do
+                        // (header-stash, blocker, joined-fallen-group).
+                        // This `return` is from INSIDE the hits loop, so
+                        // every remaining hit of a multi-entry span was
+                        // otherwise never queued, forwarded or held - and
+                        // the compensating whole-span rewrite in
+                        // write_impl_scratched is gated on there being
+                        // queued work, which there is not. The volume
+                        // then materialized with a sparse hole that
+                        // preads as zeros and failed the inner file's
+                        // CRC. "A lost span is silent corruption" is
+                        // stated a few hundred lines up; this was the one
+                        // route that broke it. plain_span writes at the
+                        // volume offset, which is what a materialized
+                        // volume wants; the already-drained holds rewrite
+                        // identical bytes, which the other routes accept
+                        // too. The Discard check keeps protect_sources
+                        // from opening a writer over a source file.
+                        self.fallback_slot_or_group(inner, slot, "held-bytes cap")?;
+                        if matches!(inner.slots[slot].mode, SlotMode::Discard) {
+                            return Ok(());
+                        }
+                        return self.plain_span(inner, slot, offset, data);
                     }
                     continue;
                 }
@@ -5481,7 +6941,28 @@ impl Extractor {
                     // finish pass. The state needs the HEAD entry's crypt
                     // parameters; a continuation piece racing its head
                     // volume's headers holds like an unresolved base.
-                    let crypto = if encrypted && inner.instream_decrypt {
+                    // An output that is already plaintext-once must STAY
+                    // plaintext-once, whatever the live password cell now
+                    // holds. The gate re-reads `inner.password` per span,
+                    // so a mid-download re-key - `apply_probed_password`
+                    // overwrites it unconditionally, and the probe is
+                    // installed on every job - flipped it false for a
+                    // file already being decrypted in-stream (one job may
+                    // legitimately carry two encrypted sets with
+                    // different passwords). Later spans then took the
+                    // `crypto == None` path and pwrote RAW CIPHERTEXT at
+                    // the offsets plaintext belonged at. Consulting the
+                    // writer-keyed state FIRST is strictly narrowing: it
+                    // changes behaviour only for a writer whose password
+                    // was already check-verified before its first byte
+                    // was written.
+                    let existing = Self::crypto_of(inner, &w);
+                    let crypto = if existing.is_some() {
+                        existing
+                    } else if encrypted
+                        && inner.instream_decrypt
+                        && Self::instream_decrypt_allowed(inner, slot, ei)
+                    {
                         match Self::crypto_for(inner, slot, ei, &w) {
                             Some(cs) => {
                                 // Plaintext-once is live for this set:
@@ -5494,13 +6975,23 @@ impl Extractor {
                                 let part =
                                     data[span_off as usize..(span_off + len) as usize].to_vec();
                                 inner.budget.add(part.len());
-                                inner.slots[slot].holds.push((offset + span_off, part));
-                                if inner.budget.over() {
-                                    return self.fallback_slot_or_group(
+                                inner.slots[slot]
+                                    .holds
+                                    .push((offset + span_off, HoldSpan::Ram(part)));
+                                if inner.budget.over() && !self.page_out_holds(inner) {
+                                    // Same write-through as the hold arm
+                                    // above - this return also leaves the
+                                    // rest of a multi-entry span
+                                    // unwritten. See the comment there.
+                                    self.fallback_slot_or_group(
                                         inner,
                                         slot,
                                         "held-bytes cap",
-                                    );
+                                    )?;
+                                    if matches!(inner.slots[slot].mode, SlotMode::Discard) {
+                                        return Ok(());
+                                    }
+                                    return self.plain_span(inner, slot, offset, data);
                                 }
                                 continue;
                             }
@@ -5567,8 +7058,8 @@ impl Extractor {
         if unmapped_from < span_end && !m.complete {
             let part = data[(unmapped_from - offset) as usize..].to_vec();
             inner.budget.add(part.len());
-            inner.slots[slot].holds.push((unmapped_from, part));
-            if inner.budget.over() {
+            inner.slots[slot].holds.push((unmapped_from, HoldSpan::Ram(part)));
+            if inner.budget.over() && !self.page_out_holds(inner) {
                 return self.fallback_slot_or_group(inner, slot, "held-bytes cap");
             }
         }
@@ -5585,6 +7076,53 @@ impl Extractor {
     /// in place: the article hot path must not clone a String per span.
     fn entry_name(inner: &Inner, slot: usize, ei: usize) -> &str {
         &inner.slots[slot].mapper.as_ref().unwrap().entries[ei].name
+    }
+
+    /// May this encrypted entry decrypt at WRITE time (plaintext-once),
+    /// or must it assemble ciphertext for the finish pass?
+    ///
+    /// Only when the entry's stored check verifies the password. Without
+    /// that proof (a check-less set, or one whose check is malformed and
+    /// so vetoes nothing) a wrong password would write plaintext-shaped
+    /// garbage straight into the output file, and the group could no
+    /// longer materialize its volumes - the inner file is supposed to BE
+    /// the volume bytes, and it would hold decrypted-with-the-wrong-key
+    /// noise instead. Assembling ciphertext keeps the bytes identical to
+    /// the posted volumes, so `decrypt_finished` can adjudicate against
+    /// the whole-file checksum and, on a miss, demote with nothing lost.
+    fn instream_decrypt_allowed(inner: &Inner, slot: usize, ei: usize) -> bool {
+        let Some(pw) = inner.password.as_ref() else { return false };
+        let Some(m) = inner.slots[slot].mapper.as_ref() else { return false };
+        let Some(e) = m.entries.get(ei) else { return false };
+        // An entry carrying only an FHEXTRA_HASH digest (BLAKE2sp, i.e.
+        // `rar a -htb`) and no CRC32 has nothing the finish pass can
+        // adjudicate: `crc_gate` returns None, so `crc_verdict` is None
+        // rather than Some(false), and the plaintext is published with NO
+        // integrity check at all. `verify_inner_crcs` already refuses the
+        // unencrypted twin of this shape for the same reason - its gate
+        // is `Store && !encrypted`, so an encrypted entry never reached
+        // it. Assembling ciphertext instead costs nothing: the volumes
+        // stay byte-exact and can still materialize, and the disk path
+        // verifies the BLAKE2sp properly. nzbkit has no BLAKE2sp of its
+        // own, so verifying in place is not an option here.
+        if e.hash.is_some() && e.file_crc.is_none() {
+            return false;
+        }
+        let Some(c) = e.crypt.as_ref() else {
+            return false;
+        };
+        // Always false for RAR4: the format stores no check value, so
+        // nothing can prove the password before a byte is decrypted. Such a
+        // set assembles ciphertext and is adjudicated by `decrypt_finished`
+        // against the header's plaintext CRC32 - the recoverable route a
+        // check-less RAR5 set takes for exactly the same reason.
+        //
+        // Answered without deriving, because this runs per SPAN: RAR4's
+        // schedule is 0x40000 SHA-1 rounds, and while the cache makes a
+        // repeat cheap, an archive with a fresh salt per entry would pay it
+        // again and again under the routing lock.
+        let Some(r5) = c.rar5() else { return false };
+        r5.check.is_some() && c.derive(pw).is_some_and(|keys| c.check_verifies(&keys))
     }
 
     fn crypto_for(
@@ -5623,14 +7161,20 @@ impl Extractor {
         }
         let (c, unp, file_crc, split_after) = head?;
         let pw = inner.password.as_ref()?;
-        let keys = rarcrypt::derive_keys(pw, &c.salt, c.lg2_count)?;
+        let keys = c.derive(pw)?;
+        // Plaintext-once requires a pre-decrypt password proof, which only
+        // RAR5's stored check can give (`instream_decrypt_allowed` gates
+        // every caller on it), so the resume journal's `E` record can
+        // safely assume RAR5 parameters here.
+        let r5 = c.rar5()?;
         // Only a single-piece entry's stored CRC covers the whole
-        // plaintext, and a tweaked checksum is keyed - same rules as the
-        // legacy finish pass.
-        let expect_crc = file_crc.filter(|_| !split_after && !c.tweaked_checksum);
+        // plaintext. A tweaked checksum is keyed rather than useless -
+        // the gate folds the computed CRC before comparing (Increment
+        // B), same rules as the legacy finish pass.
+        let expect_crc = crc_gate(file_crc.filter(|_| !split_after), &c, &keys);
         let cs = Arc::new(CryptoState::new(
-            keys.key,
-            c.iv,
+            keys.aes.clone(),
+            keys.iv,
             unp,
             expect_crc,
             key.clone(),
@@ -5638,11 +7182,11 @@ impl Extractor {
         ));
         inner.crypto_events.lock().unwrap().push(CryptoJournalEvent::Params {
             name: key.clone(),
-            salt: c.salt,
-            lg2: c.lg2_count,
-            iv: c.iv,
+            salt: r5.salt,
+            lg2: r5.lg2_count,
+            iv: r5.iv,
             unp,
-            check: c.check,
+            check: r5.check,
         });
         inner.crypto_files.insert(key, cs.clone());
         Some(cs)
@@ -5862,13 +7406,13 @@ impl Extractor {
             return;
         }
         let holds = std::mem::take(&mut inner.slots[slot].holds);
-        for (_, bytes) in &holds {
-            inner.budget.sub(bytes.len());
+        for (_, span) in &holds {
+            Self::uncharge_span(inner, span);
         }
         inner.slots[slot].pre_bytes = 0;
         let headers = std::mem::take(&mut inner.slots[slot].header_spans);
-        for (_, bytes) in &headers {
-            inner.budget.sub(bytes.len());
+        for (_, span) in &headers {
+            Self::uncharge_span(inner, span);
         }
         inner.slots[slot].piece_crcs = HashMap::new();
         if let Some(ch) = inner.slots[slot].chase.take() {
@@ -6297,12 +7841,110 @@ impl Extractor {
         }
     }
 
+    /// Budget-breach relief: move RAM-held spans - holds and header
+    /// stash alike, every slot - out to the chain's scratch file until
+    /// the budget sits at half its cap. Returns whether the budget is
+    /// back under the cap; `false` (gate off, ceiling refused, scratch
+    /// dead, or the remaining RAM belongs to spans this pass cannot
+    /// touch - a chase frontier, sub-4K slivers, another level's holds)
+    /// sends the caller down the exact demote it performs today, with
+    /// the same reason string.
+    fn page_out_holds(&self, inner: &mut Inner) -> bool {
+        if !inner.holds_page_on {
+            return false;
+        }
+        let budget = inner.budget.clone();
+        let scratch = inner.scratch.clone();
+        // Auto ceiling: 4x the RAM cap, resolved per pass so a later
+        // set_holds_cap is respected and an explicit ceiling wins.
+        let cap = match scratch.cap.load(Ordering::Relaxed) {
+            0 => 4 * budget.cap() as u64,
+            c => c,
+        };
+        let low_water = budget.cap() / 2;
+        let mut paged_any = false;
+        'outer: for si in 0..inner.slots.len() {
+            let s = &mut inner.slots[si];
+            for store in [&mut s.holds, &mut s.header_spans] {
+                for (_, span) in store.iter_mut() {
+                    let HoldSpan::Ram(bytes) = span else { continue };
+                    if bytes.len() < HOLDS_PAGE_MIN {
+                        continue;
+                    }
+                    let Some(off) = scratch.append(bytes, cap) else {
+                        // Ceiling or scratch death: whatever is still in
+                        // RAM stays there; the verdict below demotes.
+                        break 'outer;
+                    };
+                    let len = bytes.len();
+                    budget.sub(len);
+                    *span = HoldSpan::Paged { off, len };
+                    paged_any = true;
+                    if budget.bytes.load(Ordering::Relaxed) <= low_water {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        if paged_any && !scratch.announced.swap(true, Ordering::Relaxed) {
+            println!("💾 held spans over the RAM cap - paging to scratch, set stays one-pass");
+        }
+        !budget.over()
+    }
+
+    /// Take one held span's bytes back into RAM, releasing whichever
+    /// store held them (budget for RAM, scratch live-count for paged -
+    /// read BEFORE release, so an idle truncate can never beat the
+    /// pread). The caller feeds them onward; a re-hold re-charges as a
+    /// fresh RAM span. Routing lock held.
+    fn reclaim_span(inner: &Inner, span: HoldSpan) -> io::Result<Vec<u8>> {
+        match span {
+            HoldSpan::Ram(b) => {
+                inner.budget.sub(b.len());
+                Ok(b)
+            }
+            HoldSpan::Paged { off, len } => {
+                let mut b = vec![0u8; len];
+                inner.scratch.read(off, &mut b)?;
+                inner.scratch.release(len);
+                Ok(b)
+            }
+        }
+    }
+
+    /// Drop-only release (discard/abandon paths): uncharge a held span
+    /// without a read-back.
+    fn uncharge_span(inner: &Inner, span: &HoldSpan) {
+        match span {
+            HoldSpan::Ram(b) => inner.budget.sub(b.len()),
+            HoldSpan::Paged { len, .. } => inner.scratch.release(*len),
+        }
+    }
+
     /// Flush held spans through the slot's current mode.
     fn drain_holds(&self, inner: &mut Inner, slot: usize) -> io::Result<()> {
         let holds = std::mem::take(&mut inner.slots[slot].holds);
         inner.slots[slot].pre_bytes = 0;
-        for (off, bytes) in holds {
-            inner.budget.sub(bytes.len());
+        for (off, span) in holds {
+            // A paged span reads back but is NOT released until after the
+            // feed: whatever the feed re-holds is a subrange of these very
+            // bytes, and rebinding those to the still-valid scratch region
+            // (below) is what keeps a drain cycle from re-appending the
+            // same bytes - unbounded churn would eat the scratch ceiling
+            // on exactly the big-transient-window sets paging exists for.
+            let (bytes, paged_at) = match span {
+                HoldSpan::Ram(b) => {
+                    inner.budget.sub(b.len());
+                    (b, None)
+                }
+                HoldSpan::Paged { off: po, len } => {
+                    let mut b = vec![0u8; len];
+                    inner.scratch.read(po, &mut b)?;
+                    (b, Some((po, len)))
+                }
+            };
+            let held_before = inner.slots[slot].holds.len();
+            let stash_before = inner.slots[slot].header_spans.len();
             match inner.slots[slot].mode {
                 // No article CRC: a held span is a SUBSET of some earlier
                 // article's bytes, re-fed later, so that article's CRC does
@@ -6314,8 +7956,62 @@ impl Extractor {
                 SlotMode::Discard => {}
                 _ => self.plain_span(inner, slot, off, &bytes)?,
             }
+            if let Some((po, len)) = paged_at {
+                Self::rebind_subranges(inner, slot, held_before, stash_before, off, po, &bytes);
+                inner.scratch.release(len);
+            }
         }
         Ok(())
+    }
+
+    /// After re-feeding a PAGED span, point any re-held subrange of it
+    /// back at its scratch region instead of a fresh RAM copy: the
+    /// region is write-once and still live (released only after this
+    /// runs, so the live-count never falsely hits zero), and the re-held
+    /// bytes are subslices of the bytes read from it. Pure accounting -
+    /// no new appends, no I/O - which is what bounds the drain/re-hold
+    /// ping-pong at one scratch write per unique byte.
+    ///
+    /// The subslice premise is CHECKED, not assumed: a re-entrant drain
+    /// (reresolve firing inside the feed) can repopulate the vectors and
+    /// stale the `*_before` indices, and a repair span parked behind the
+    /// original may overlap the fed range with DIFFERENT bytes -
+    /// rebinding either would silently swap its bytes for the region's.
+    /// An entry only rebinds when its bytes equal the fed slice at its
+    /// offset; anything else stays in RAM with its charge (correct,
+    /// just unpaged until the next breach).
+    fn rebind_subranges(
+        inner: &mut Inner,
+        slot: usize,
+        held_before: usize,
+        stash_before: usize,
+        fed_off: u64,
+        po: u64,
+        fed: &[u8],
+    ) {
+        let budget = inner.budget.clone();
+        let scratch = inner.scratch.clone();
+        let s = &mut inner.slots[slot];
+        for (vec, from) in [
+            (&mut s.holds, held_before),
+            (&mut s.header_spans, stash_before),
+        ] {
+            for (ho, hs) in vec.iter_mut().skip(from) {
+                let HoldSpan::Ram(b) = hs else { continue };
+                let Some(rel) = ho.checked_sub(fed_off) else { continue };
+                let rel = rel as usize;
+                let Some(end) = rel.checked_add(b.len()) else { continue };
+                if end > fed.len() || fed[rel..end] != b[..] {
+                    continue;
+                }
+                scratch.add_live(b.len());
+                budget.sub(b.len());
+                *hs = HoldSpan::Paged {
+                    off: po + rel as u64,
+                    len: b.len(),
+                };
+            }
+        }
     }
 
     /// One Unknown slot exceeded the per-slot pre-classification budget -
@@ -6402,7 +8098,12 @@ impl Extractor {
                     let why = if self.depth == 0
                         && matches!(inner.slots[slot].mode, SlotMode::SevenZ)
                     {
-                        format!("{SEVENZ_DISK_FALLBACK_PREFIX}{reason}")
+                        match inner.slots[slot].container_fmt {
+                            ChaseFormat::SevenZ => {
+                                format!("{SEVENZ_DISK_FALLBACK_PREFIX}{reason}")
+                            }
+                            ChaseFormat::Zip => format!("{ZIP_DISK_FALLBACK_PREFIX}{reason}"),
+                        }
                     } else {
                         reason.to_string()
                     };
@@ -6444,12 +8145,12 @@ impl Extractor {
     fn discard_slot(&self, inner: &mut Inner, slot: usize) {
         let holds = std::mem::take(&mut inner.slots[slot].holds);
         inner.slots[slot].pre_bytes = 0;
-        for (_, bytes) in &holds {
-            inner.budget.sub(bytes.len());
+        for (_, span) in &holds {
+            Self::uncharge_span(inner, span);
         }
         let headers = std::mem::take(&mut inner.slots[slot].header_spans);
-        for (_, bytes) in &headers {
-            inner.budget.sub(bytes.len());
+        for (_, span) in &headers {
+            Self::uncharge_span(inner, span);
         }
         inner.slots[slot].piece_crcs = HashMap::new();
         inner.slots[slot].mode = SlotMode::Discard;
@@ -6510,18 +8211,38 @@ impl Extractor {
         inner.slots[slot].mode = SlotMode::RarFallback;
         inner.slots[slot].piece_crcs = HashMap::new();
 
-        // 1. Header bytes. The stash is released up front: a materialized
-        // slot answers every read from its volume file, so the RAM copy
-        // (and the budget it charges) buys nothing once the bytes are on
-        // disk - and the whole stash leaves RAM here either way, so a
-        // write error mid-loop must not leave the budget charged for
-        // bytes nobody owns any more.
+        // 1. Header bytes. The RAM stash is released up front: a
+        // materialized slot answers every read from its volume file, so
+        // the RAM copy (and the budget it charges) buys nothing once the
+        // bytes are on disk - and the whole stash leaves RAM here either
+        // way, so a write error mid-loop must not leave the budget
+        // charged for bytes nobody owns any more. Paged entries release
+        // per-entry AFTER their read-back instead (read-before-release is
+        // what keeps an idle truncate off a region still being read); on
+        // a mid-loop error the leftovers stay charged to the scratch
+        // live-count, which only delays its truncate - the run is failing
+        // anyway and finish/Drop unlink the file regardless.
         let headers = std::mem::take(&mut inner.slots[slot].header_spans);
-        inner
-            .budget
-            .sub(headers.iter().map(|(_, b)| b.len()).sum::<usize>());
-        for (off, bytes) in &headers {
-            self.plain_span(inner, slot, *off, bytes)?;
+        inner.budget.sub(
+            headers
+                .iter()
+                .filter_map(|(_, s)| match s {
+                    HoldSpan::Ram(b) => Some(b.len()),
+                    HoldSpan::Paged { .. } => None,
+                })
+                .sum::<usize>(),
+        );
+        for (off, span) in headers {
+            let bytes = match span {
+                HoldSpan::Ram(b) => b,
+                HoldSpan::Paged { off: po, len } => {
+                    let mut b = vec![0u8; len];
+                    inner.scratch.read(po, &mut b)?;
+                    inner.scratch.release(len);
+                    b
+                }
+            };
+            self.plain_span(inner, slot, off, &bytes)?;
         }
 
         // 2. Already-extracted data areas: read back from inner files.
@@ -6679,8 +8400,9 @@ impl Extractor {
                 // header leaves everything after it in holds) are real,
                 // exact volume bytes - mapped repair must be able to
                 // read them to rebuild the header blocks that free them.
-                for (hs, bytes) in s.header_spans.iter().chain(&s.holds) {
-                    let he = hs + bytes.len() as u64;
+                // Paged spans count identically (read_at preads them).
+                for (hs, span) in s.header_spans.iter().chain(&s.holds) {
+                    let he = hs + span.len() as u64;
                     let qs = off.max(*hs);
                     let qe = (off + len as u64).min(he);
                     if qs < qe {
@@ -6715,8 +8437,8 @@ impl Extractor {
             // Unclassified slot: pre-sniff holds are exact file bytes.
             SlotMode::Unknown => {
                 let mut filled = vec![false; len];
-                for (hs, bytes) in &s.holds {
-                    let he = hs + bytes.len() as u64;
+                for (hs, span) in &s.holds {
+                    let he = hs + span.len() as u64;
                     let qs = off.max(*hs);
                     let qe = (off + len as u64).min(he);
                     if qs < qe {
@@ -6741,7 +8463,12 @@ impl Extractor {
             /// Plaintext-once output: posted bytes come from the
             /// re-encrypt shim + cipher stashes, not a raw pread.
             X(Arc<CryptoState>, Arc<FileWriter>, usize, usize, u64),
+            /// Paged held span: pread from the holds scratch. Safe off
+            /// the lock because regions are write-once and the pin below
+            /// blocks the idle cursor reset/truncate until we're done.
+            S(Arc<(PathBuf, File)>, usize, usize, u64),
         }
+        let mut pin = ScratchPin::none();
         let mut reads: Vec<Plan> = Vec::new();
         {
             let inner = self.inner_read();
@@ -6757,16 +8484,33 @@ impl Extractor {
                     // Header stash first, then held spans: bytes parked
                     // behind an unparsed header are exact volume bytes,
                     // and mapped repair reads through here to rebuild
-                    // the very header blocks that will free them.
-                    for (hs, bytes) in s.header_spans.iter().chain(&s.holds) {
-                        let he = hs + bytes.len() as u64;
+                    // the very header blocks that will free them. A
+                    // paged span serves the same bytes via a deferred
+                    // pread of its scratch region.
+                    for (hs, span) in s.header_spans.iter().chain(&s.holds) {
+                        let he = hs + span.len() as u64;
                         let qs = off.max(*hs);
                         let qe = (off + buf.len() as u64).min(he);
                         if qs < qe {
                             let n = (qe - qs) as usize;
-                            buf[(qs - off) as usize..(qs - off) as usize + n].copy_from_slice(
-                                &bytes[(qs - hs) as usize..(qs - hs) as usize + n],
-                            );
+                            match span {
+                                HoldSpan::Ram(bytes) => {
+                                    buf[(qs - off) as usize..(qs - off) as usize + n]
+                                        .copy_from_slice(
+                                            &bytes[(qs - hs) as usize..(qs - hs) as usize + n],
+                                        );
+                                }
+                                HoldSpan::Paged { off: po, .. } => {
+                                    pin.pin(&inner.scratch);
+                                    let f = inner.scratch.handle().ok_or_else(nofile)?;
+                                    reads.push(Plan::S(
+                                        f,
+                                        (qs - off) as usize,
+                                        n,
+                                        po + (qs - hs),
+                                    ));
+                                }
+                            }
                             filled[(qs - off) as usize..(qs - off) as usize + n].fill(true);
                         }
                     }
@@ -6831,15 +8575,30 @@ impl Extractor {
                 // fully cover the range (see covered_intervals).
                 SlotMode::Unknown => {
                     let mut filled = vec![false; buf.len()];
-                    for (hs, bytes) in &s.holds {
-                        let he = hs + bytes.len() as u64;
+                    for (hs, span) in &s.holds {
+                        let he = hs + span.len() as u64;
                         let qs = off.max(*hs);
                         let qe = (off + buf.len() as u64).min(he);
                         if qs < qe {
                             let n = (qe - qs) as usize;
-                            buf[(qs - off) as usize..(qs - off) as usize + n].copy_from_slice(
-                                &bytes[(qs - hs) as usize..(qs - hs) as usize + n],
-                            );
+                            match span {
+                                HoldSpan::Ram(bytes) => {
+                                    buf[(qs - off) as usize..(qs - off) as usize + n]
+                                        .copy_from_slice(
+                                            &bytes[(qs - hs) as usize..(qs - hs) as usize + n],
+                                        );
+                                }
+                                HoldSpan::Paged { off: po, .. } => {
+                                    pin.pin(&inner.scratch);
+                                    let f = inner.scratch.handle().ok_or_else(nofile)?;
+                                    reads.push(Plan::S(
+                                        f,
+                                        (qs - off) as usize,
+                                        n,
+                                        po + (qs - hs),
+                                    ));
+                                }
+                            }
                             filled[(qs - off) as usize..(qs - off) as usize + n].fill(true);
                         }
                     }
@@ -6860,6 +8619,13 @@ impl Extractor {
                 }
                 Plan::X(cs, w, buf_start, len, file_off) => {
                     cs.read_posted(&w, file_off, &mut buf[buf_start..buf_start + len])?;
+                }
+                Plan::S(f, buf_start, len, file_off) => {
+                    crate::disk::read_exact_at(
+                        &f.1,
+                        &mut buf[buf_start..buf_start + len],
+                        file_off,
+                    )?;
                 }
             }
         }
@@ -6903,9 +8669,10 @@ impl Extractor {
                 let end = off + len;
                 let mut ivs: Vec<(u64, u64)> = Vec::new();
                 // Header stash + held spans (see read_at: held bytes are
-                // exact volume bytes awaiting a header parse).
-                for (hs, bytes) in s.header_spans.iter().chain(&s.holds) {
-                    let he = hs + bytes.len() as u64;
+                // exact volume bytes awaiting a header parse, RAM or
+                // paged alike).
+                for (hs, span) in s.header_spans.iter().chain(&s.holds) {
+                    let he = hs + span.len() as u64;
                     let a = off.max(*hs);
                     let b = end.min(he);
                     if a < b {
@@ -7277,6 +9044,18 @@ impl Extractor {
         )
     }
 
+    /// The RAR flavor of [`Self::is_chased`] alone. The distinction
+    /// matters to exactly one caller: a `.7z` materialized for repair is
+    /// the 7z post-pass's own input, but a RAR chase demoted the same
+    /// way has NO later owner - "materialized for repair" is excluded
+    /// from the unrar ladder on the promise that the PAR2 path
+    /// re-extracts what it materialized, so the repair path must claim
+    /// the set for `reextract_dir` or the job ships packed volumes as
+    /// its output with exit 0.
+    pub fn is_rar_chased(&self, slot: usize) -> bool {
+        matches!(self.inner.lock().unwrap().slots[slot].mode, SlotMode::RarChase)
+    }
+
 
     /// Open an output file for /stream. For an encrypted store output
     /// still on disk as ciphertext, this returns a [`StreamCrypt`] the
@@ -7313,10 +9092,7 @@ impl Extractor {
                 None => StreamOpen::Plain,
             };
         };
-        let aes = inner
-            .password
-            .as_ref()
-            .and_then(|pw| rarcrypt::derive_keys(pw, &crypt.salt, crypt.lg2_count));
+        let aes = inner.password.as_ref().and_then(|pw| crypt.derive(pw));
         let Some(aes) = aes else {
             // Verified encrypted output with an underivable password
             // shouldn't reach here (the group would have fallen back);
@@ -7342,8 +9118,8 @@ impl Extractor {
                     StreamOpen::Encrypted(
                         f,
                         StreamCrypt {
-                            key: aes.key,
-                            iv: crypt.iv,
+                            key: aes.aes,
+                            iv: aes.iv,
                             cipher_len: rarcrypt::align16(unp),
                             plain_len: unp,
                             st,
@@ -7540,6 +9316,12 @@ impl Extractor {
     /// unfinished child slot to a materialized level-1 file (today's
     /// output), and its report folds into ours.
     pub fn finish(&self) -> io::Result<ExtractReport> {
+        // Parked password-awaits resolve FIRST (Increment A): a hit here
+        // re-keys and re-feeds while every held byte is still in RAM -
+        // the set then settles/decrypts below like any start-time
+        // password job - and a miss demotes before the group settle
+        // reasons about volumes.
+        self.resolve_pw_awaits()?;
         // Chase workers join FIRST: their sink writes must have landed
         // before the child settles/finishes, and a chase still blocked
         // here (bytes never arrived) aborts and demotes. The 7z workers
@@ -7615,6 +9397,13 @@ impl Extractor {
             decrypted.sort();
         }
         extracted.sort();
+        // The chain's holds scratch has done its job: every hold drained
+        // at settle, and what is still paged (a healthy group's header
+        // stash) stays readable through the kept handle. Root only - the
+        // file is chain-shared.
+        if self.depth == 0 {
+            inner.scratch.cleanup();
+        }
         Ok(ExtractReport {
             extracted,
             fallbacks,
@@ -7657,7 +9446,7 @@ impl Extractor {
         // tallied under `disk` by the post-pass.
         for s in &inner.slots {
             if matches!(s.mode, SlotMode::SevenZ) && s.group.is_none() {
-                note_nested_level(self.depth, "7z", NestedDisposition::InStream);
+                note_nested_level(self.depth, s.container_fmt.noun(), NestedDisposition::InStream);
             }
         }
     }
@@ -7672,7 +9461,7 @@ impl Extractor {
     /// is defensive only.
     fn slot_inner_kind(inner: &Inner, slot: usize) -> Option<&'static str> {
         match inner.slots[slot].mode {
-            SlotMode::SevenZ => Some("7z"),
+            SlotMode::SevenZ => Some(inner.slots[slot].container_fmt.noun()),
             SlotMode::RarChase => Some("rar-compressed"),
             SlotMode::Rar => Some(
                 match inner.slots[slot].mapper.as_ref().and_then(|m| m.entries.first()) {
@@ -7743,6 +9532,45 @@ impl Extractor {
     /// verify_output_crc setting.
     fn verify_inner_crcs(&self) -> io::Result<()> {
         let mut g = self.inner.lock().unwrap();
+        // Structural, not a checksum. Only a NON-encrypted entry ever
+        // creates a child route (see `route_dest`), so a raw name that is
+        // in `routed` AND also appears as an encrypted entry describes a
+        // set whose same inner file is both plain and encrypted. That
+        // shape slipped through everything: the Child forward arm carries
+        // no crypto, `decrypt_finished` keys its jobs off `inner_writers`
+        // which never holds a child-owned output (so it silently found no
+        // work and returned success), and the per-name CRC gate below
+        // skips any bucket with a non-checkable member - the encrypted
+        // twin disabling a check that is a pure header property. The
+        // published file could be raw ciphertext, with the source volumes
+        // then discarded. No archiver produces this; demote to the disk
+        // path, which decrypts correctly.
+        //
+        // Ahead of the depth-0 early return on purpose: NZBFAST_NO_OUTPUT_CRC
+        // turns off a CRC gate, not a routing one. And the reason string
+        // must keep the "encrypted" substring - `fallback_needs_disk_unpack`
+        // routes on it, which is what sends this set to unrar WITH the
+        // job's password rather than to the generic ladder's `-p-`.
+        let conflicted: Vec<String> = {
+            let (groups, slots) = (&g.groups, &g.slots);
+            groups
+                .iter()
+                .filter(|(_, grp)| !grp.fallback && !grp.routed.is_empty())
+                .filter(|(_, grp)| {
+                    grp.slots.iter().any(|&si| {
+                        slots[si].mapper.as_ref().is_some_and(|m| {
+                            m.entries
+                                .iter()
+                                .any(|e| e.encrypted && !e.is_dir && grp.routed.contains_key(&e.name))
+                        })
+                    })
+                })
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
+        for key in conflicted {
+            self.fallback_group(&mut g, &key, "inner file is both plain and encrypted")?;
+        }
         if self.depth == 0 && !g.verify_output_crc {
             return Ok(());
         }
@@ -7846,9 +9674,13 @@ impl Extractor {
                     continue;
                 }
                 let Some(expected) = pieces.last().and_then(|p| p.hdr) else {
-                    // RAR4 file headers carry a CRC32 the mapper does
-                    // not consume, so a completed RAR4 store file can
-                    // never be verified in-stream. NESTED, that demotes
+                    // The mapper DOES read the RAR4 header CRC32 (it has
+                    // since 48e0d3c1, which landed hours after this gate
+                    // and left the note here saying otherwise). What
+                    // reaches this arm is the narrower case: a writer that
+                    // left the field zero, which the parser reads as "not
+                    // computed" rather than as a real CRC of 0. There is
+                    // then nothing to verify against. NESTED, that demotes
                     // to materialized volumes - the disk-path unrar
                     // checks the CRC there - instead of clean-passing
                     // the one family this gate cannot see. At level 0
@@ -8127,12 +9959,17 @@ impl Extractor {
     }
 
     /// Decrypt every encrypted store file of the healthy groups. During
-    /// the download those files accumulated the archive's AES-256-CBC
-    /// ciphertext at plain store offsets (RAR5 encrypts each inner file
-    /// as ONE stream across all volumes, so the assembled ciphertext is
-    /// contiguous); one sequential CBC pass + truncate to the unpacked
+    /// the download those files accumulated the archive's AES-CBC
+    /// ciphertext at plain store offsets (both formats encrypt each inner
+    /// file as ONE stream across all volumes, so the assembled ciphertext
+    /// is contiguous); one sequential CBC pass + truncate to the unpacked
     /// size turns each into the real output, and the plaintext CRC32 is
     /// checked against the header CRC when it isn't tweaked.
+    ///
+    /// For RAR4 that CRC check is not belt-and-braces but the ONLY
+    /// adjudicator there is: the format stores no password check, so every
+    /// RAR4 job arrives here `verified: false` and publishes nothing the
+    /// checksum has not accepted.
     ///
     /// NOTHING is decrypted in place. Every file is written to a fresh
     /// same-directory temp that this pass created with `create_new` (so
@@ -8187,14 +10024,22 @@ impl Extractor {
             out: String,
             path: PathBuf,
             unp: u64,
-            key_bytes: [u8; 32],
+            key_bytes: Option<rarcrypt::AesKey>,
             iv: [u8; 16],
-            aes_ok: bool,
             covered: bool,
-            /// Stored plaintext CRC32 to check after decryption, when the
-            /// crypt record's tweaked-checksum flag is clear (a tweaked CRC
-            /// is keyed and cannot be compared against a plain CRC32).
-            expect_crc: Option<u32>,
+            /// Stored plaintext checksum to check after decryption -
+            /// plain, or folded through the entry's keyed MAC when the
+            /// crypt record set the tweaked-checksum flag.
+            expect_crc: Option<CrcGate>,
+            /// Did the entry's stored check VERIFY the password before
+            /// any byte was decrypted? False for a check-less (or
+            /// malformed-check) set, which the mapper now admits on the
+            /// promise that this pass adjudicates it: such a job must
+            /// carry a checksum gate, and a gate it fails demotes the
+            /// group instead of failing the whole download - the
+            /// password is simply the wrong one, and the ciphertext (=
+            /// the volume bytes) is untouched.
+            verified: bool,
         }
         // Scratch from a killed earlier run. This pass is the only thing
         // that creates these names and every write of the job has landed
@@ -8222,6 +10067,25 @@ impl Extractor {
                 // (split_before == false - whose IV starts the stream).
                 let mut heads: HashMap<String, (EntryCrypt, u64, String, Option<u32>)> =
                     HashMap::new();
+                // The WHOLE-FILE checksum lives on the entry's LAST piece
+                // (`split_after == false`) - per the RAR5 spec, earlier
+                // pieces carry only their own volume's bytes. The head
+                // loop below therefore cannot see it for a split file,
+                // which is why a multi-volume encrypted set used to have
+                // no verifiable checksum at all. By finish every volume
+                // has arrived, so the tail is simply here to be read.
+                let mut tail_crcs: HashMap<&str, u32> = HashMap::new();
+                for &si in &grp.slots {
+                    let Some(m) = inner.slots[si].mapper.as_ref() else { continue };
+                    for e in &m.entries {
+                        if e.is_dir || !e.encrypted {
+                            continue;
+                        }
+                        if !e.split_after && let Some(crc) = e.file_crc {
+                            tail_crcs.insert(e.name.as_str(), crc);
+                        }
+                    }
+                }
                 for &si in &grp.slots {
                     let Some(m) = inner.slots[si].mapper.as_ref() else { continue };
                     for e in &m.entries {
@@ -8237,17 +10101,16 @@ impl Extractor {
                                 .get(&e.name)
                                 .cloned()
                                 .unwrap_or_else(|| sanitize_filename(&e.name));
-                            // Only a single-piece entry's stored CRC covers
-                            // the whole plaintext this decrypt pass produces.
-                            // Split volumes each carry a per-volume CRC (the
-                            // whole-file CRC lives on the last piece, keyed
-                            // there), so checking the head's value against the
-                            // assembled file would false-fail - leave split
-                            // encrypted files to the outer PAR2/yEnc gate.
-                            let single_crc = e.file_crc.filter(|_| !e.split_after);
+                            // The checksum that covers the whole plaintext
+                            // this pass produces: the entry's own when it is
+                            // unsplit, else its tail piece's (collected
+                            // above). Using the head's value on a split file
+                            // would false-fail - it describes only that
+                            // volume's bytes.
+                            let whole_crc = tail_crcs.get(e.name.as_str()).copied();
                             heads
                                 .entry(e.name.clone())
-                                .or_insert((c.clone(), e.unpacked_size, out, single_crc));
+                                .or_insert((c.clone(), e.unpacked_size, out, whole_crc));
                         }
                     }
                 }
@@ -8264,7 +10127,7 @@ impl Extractor {
                         if cs.crc_verdict() == Some(false) {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
-                                "encrypted RAR5 file failed its stored CRC after decryption",
+                                "encrypted RAR file failed its stored CRC after decryption",
                             ));
                         }
                         if unp == 0 || cs.complete() {
@@ -8274,24 +10137,24 @@ impl Extractor {
                         }
                         continue;
                     }
-                    let aes = inner
-                        .password
-                        .as_ref()
-                        .and_then(|pw| rarcrypt::derive_keys(pw, &c.salt, c.lg2_count));
+                    let aes = inner.password.as_ref().and_then(|pw| c.derive(pw));
                     jobs.push(Job {
                         key: key.clone(),
                         out,
                         path: w.path.clone(),
                         unp,
-                        key_bytes: aes.as_ref().map(|k| k.key).unwrap_or([0; 32]),
-                        iv: c.iv,
-                        aes_ok: aes.is_some(),
+                        key_bytes: aes.as_ref().map(|k| k.aes.clone()),
+                        // RAR5 stores the IV in the header; RAR4 derives it
+                        // with the key, so it comes off the key material.
+                        iv: aes.as_ref().map(|k| k.iv).unwrap_or([0; 16]),
                         covered: unp == 0 || w.covered(0, rarcrypt::align16(unp)),
-                        // A clear tweaked flag means the stored CRC is a plain
-                        // CRC32 of the plaintext (WinRAR's -hp default): verify
-                        // it after decryption. Password-check proves the KEY,
+                        // Verify the plaintext after decryption: a clear
+                        // tweaked flag stores a plain CRC32 (WinRAR's -hp
+                        // default), a set one stores its keyed fold, and the
+                        // gate handles both. Password-check proves the KEY,
                         // not that every ciphertext block survived the wire.
-                        expect_crc: file_crc.filter(|_| !c.tweaked_checksum),
+                        expect_crc: aes.as_ref().and_then(|k| crc_gate(file_crc, &c, k)),
+                        verified: aes.as_ref().is_some_and(|k| c.check_verifies(k)),
                     });
                 }
             }
@@ -8307,7 +10170,15 @@ impl Extractor {
         // condemns the whole group BEFORE any byte changes.
         let mut failed_groups: std::collections::HashSet<String> = jobs
             .iter()
-            .filter(|j| !j.aes_ok || !j.covered)
+            // An unverified password with nothing to check the plaintext
+            // against can never be adjudicated: decrypting would publish
+            // bytes no one has vouched for. Demote instead - the volumes
+            // materialize and the disk path (which validates the password
+            // itself) takes over, exactly where the mapper used to send
+            // this set the moment it saw a missing check.
+            .filter(|j| {
+                j.key_bytes.is_none() || !j.covered || (!j.verified && j.expect_crc.is_none())
+            })
             .map(|j| j.key.clone())
             .collect();
         failed_groups.extend(instream_failed);
@@ -8374,6 +10245,10 @@ impl Extractor {
         let next = AtomicUsize::new(0);
         let done: Mutex<Vec<String>> = Mutex::new(Vec::new());
         let first_err: Mutex<Option<io::Error>> = Mutex::new(None);
+        // Groups an unverified password turned out to be wrong for (a
+        // checksum miss after the decrypt pass) - demoted below rather
+        // than failing the job. See the outcome match.
+        let late_failed: Mutex<std::collections::HashSet<String>> = Default::default();
         let plans_ref = &plans;
         let barrier_ref = &barrier;
         std::thread::scope(|scope| {
@@ -8390,7 +10265,7 @@ impl Extractor {
                     let outcome = decrypt_pass(
                         &j.path,
                         wf,
-                        &j.key_bytes,
+                        j.key_bytes.as_ref().expect("pre-flight dropped keyless jobs"),
                         &j.iv,
                         j.unp,
                         j.expect_crc,
@@ -8423,9 +10298,22 @@ impl Extractor {
                             // was the failure the claim is already retired,
                             // which just costs the retry a refetch.
                             let _ = std::fs::remove_file(tmp);
-                            let mut fe = first_err.lock().unwrap();
-                            if fe.is_none() {
-                                *fe = Some(e);
+                            // A checksum miss on an UNVERIFIED password is
+                            // not a damaged download - it is the wrong
+                            // password, on a set whose header offered no way
+                            // to say so earlier. Demote that group (volumes
+                            // materialize, the disk path re-tries with the
+                            // password itself) rather than failing the whole
+                            // job, which is what a verified set's mismatch
+                            // still means: bytes that were damaged before
+                            // posting.
+                            if !j.verified && e.kind() == io::ErrorKind::InvalidData {
+                                late_failed.lock().unwrap().insert(j.key.clone());
+                            } else {
+                                let mut fe = first_err.lock().unwrap();
+                                if fe.is_none() {
+                                    *fe = Some(e);
+                                }
                             }
                         }
                     }
@@ -8435,6 +10323,9 @@ impl Extractor {
         if let Some(e) = first_err.into_inner().unwrap() {
             return Err(e);
         }
+        // Wrong-password groups join the demotion set before it is applied.
+        let late_failed = late_failed.into_inner().unwrap();
+        failed_groups.extend(late_failed.iter().cloned());
         // Renames are metadata: fsync the directory so a power cut can't
         // undo a publish the journal has already stopped vouching for.
         // Best-effort by design - the correctness guarantee comes from the
@@ -8447,7 +10338,19 @@ impl Extractor {
             let inner = &mut *g;
             for key in failed_groups {
                 if inner.groups.contains_key(&key) {
-                    self.fallback_group(inner, &key, "encrypted data incomplete")?;
+                    // Two very different demotes reach here, and the reason
+                    // is what the user reads. A late CRC miss on a password
+                    // nothing could verify up front (every RAR4 set, and a
+                    // check-less RAR5 one) is a WRONG PASSWORD on a complete
+                    // download - "incomplete" would send the reader hunting
+                    // for articles that all arrived. Both keep the
+                    // "encrypted" substring the finish ladder routes on.
+                    let why = if late_failed.contains(&key) {
+                        "encrypted data failed its checksum (wrong password)"
+                    } else {
+                        "encrypted data incomplete"
+                    };
+                    self.fallback_group(inner, &key, why)?;
                 }
             }
         }
@@ -8469,6 +10372,11 @@ impl Drop for Extractor {
             Ok(i) => i,
             Err(p) => p.into_inner(),
         };
+        // Cancel path for the holds scratch (finish() already unlinked on
+        // the normal path; a second unlink is a harmless miss).
+        if self.depth == 0 {
+            inner.scratch.cleanup();
+        }
         let mut handles = Vec::new();
         for g in inner.groups.values_mut() {
             if let Some(ctl) = g.chase.take() {
@@ -8545,15 +10453,15 @@ fn sweep_decrypt_temps(dir: &Path) {
     }
 }
 
-/// One AES-256-CBC pass over the ciphertext at `src` (length =
+/// One AES-CBC pass over the ciphertext at `src` (length =
 /// align16(`unp`)): decrypt into the caller's scratch handle `wf` and
 /// truncate it to `unp`. `src` is only ever READ - see
 /// [`Extractor::decrypt_finished`] for why nothing may mutate it before
 /// the journal has stopped vouching for it.
 ///
-/// When `expect_crc` is set (the crypt record's tweaked-checksum flag was
-/// clear, so the stored CRC is a plain CRC32 of the plaintext), the
-/// decrypted bytes are CRC32'd as they stream past and checked at the end.
+/// When `expect_crc` is set, the decrypted bytes are CRC32'd as they
+/// stream past and checked at the end - directly against a plain stored
+/// CRC32, or through the keyed fold for a tweaked checksum.
 /// This catches ciphertext that was damaged before posting - the outer
 /// yEnc/PAR2 verify the archive as-posted and the password-check only
 /// proves the key, so without this the corrupt plaintext would be written
@@ -8563,10 +10471,10 @@ fn sweep_decrypt_temps(dir: &Path) {
 fn decrypt_pass(
     src: &Path,
     wf: &File,
-    key: &[u8; 32],
+    key: &rarcrypt::AesKey,
     iv: &[u8; 16],
     unp: u64,
-    expect_crc: Option<u32>,
+    expect_crc: Option<CrcGate>,
     threads: usize,
 ) -> io::Result<()> {
     let rf = std::fs::File::open(src)?;
@@ -8625,10 +10533,10 @@ fn decrypt_pass(
     };
     wf.set_len(unp)?;
     wf.sync_data()?;
-    if expect_crc.is_some_and(|expected| crc != expected) {
+    if expect_crc.is_some_and(|gate| !gate.accepts(crc)) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "encrypted RAR5 file failed its stored CRC after decryption",
+            "encrypted RAR file failed its stored CRC after decryption",
         ));
     }
     Ok(())
@@ -8649,7 +10557,7 @@ const DECRYPT_MAX_SHARDS: usize = 8;
 fn decrypt_shard(
     rf: &File,
     wf: &File,
-    key: &[u8; 32],
+    key: &rarcrypt::AesKey,
     iv: &[u8; 16],
     start: u64,
     end: u64,
@@ -8729,6 +10637,12 @@ fn blocker_reason(b: &MapBlocker) -> &'static str {
         MapBlocker::NotRar => "not a RAR volume",
         MapBlocker::EncryptedHeaders => "encrypted headers (password required)",
         MapBlocker::NotStore => "compressed or encrypted entries",
+        // Deliberately free of "compressed": the finish ladder's first arm
+        // keys on that substring and would run an unrar attempt that cannot
+        // succeed without a password, failing a job whose volumes are fine.
+        // "encrypted"/"password" route it to the locked-no-password arm
+        // (volumes kept, 🔒 prompt), matching EncryptedHeaders sets.
+        MapBlocker::EncryptedNoPassword => "encrypted entries (password required)",
         MapBlocker::BadPassword => "wrong archive password",
         MapBlocker::Corrupt(w) => w,
     }
@@ -8825,6 +10739,58 @@ mod tests {
         assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
         assert_eq!(std::fs::read(dir.join("movie.mkv")).unwrap(), data);
         // The volume file must NOT exist (one-pass!).
+        assert!(!dir.join("v.rar").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A slot fed strictly out of order (offset 0 dead LAST - the
+    /// synthesized-segment-numbering shape) must ask the installed
+    /// promote hook to front-load the offset-0 article on its FIRST held
+    /// span, and exactly once: the honest-ladder span (0, 1) plus the
+    /// rotation guess (size-X, +1) derived from that first span's offset
+    /// X. Later out-of-order spans must not re-arm it. The set still
+    /// classifies when offset 0 lands and extracts one-pass.
+    #[test]
+    fn out_of_order_slot_probes_offset0_promote_once() {
+        let dir = tmpdir("probe0");
+        let data = payload(200_000, 11);
+        let vol = fixtures::rar5_volume(&[("movie.mkv", 200_000, &data, false, false)]);
+        let ex = Arc::new(Extractor::new(&dir, 1, true));
+        type Calls = Arc<Mutex<Vec<(String, u64, Vec<(u64, u64)>, bool)>>>;
+        let calls: Calls = Default::default();
+        let sink = calls.clone();
+        ex.set_promote_hook(Arc::new(move |n: &str, s: u64, sp: &[(u64, u64)], u: bool| {
+            sink.lock().unwrap().push((n.to_string(), s, sp.to_vec(), u));
+        }));
+        let art = 7000usize;
+        let n_arts = vol.len().div_ceil(art);
+        let size = vol.len() as u64;
+        for i in (1..n_arts).chain([0]) {
+            let s = i * art;
+            let e = (s + art).min(vol.len());
+            ex.write(0, "v.rar", size, s as u64, &vol[s..e]).unwrap();
+        }
+        // Asked once, on the first hold: offset 0 where the ladder says
+        // it is, and where a posting-order rotation would put it given
+        // that the first arrival carried offset `art`. The second call
+        // is the inner file's own one-shot probe: drain_holds re-feeds
+        // the held spans BEFORE the classifying span's own forward, so
+        // the child slot also starts out of order (no rotation guess
+        // below the root - rotation is a posting-layer phenomenon).
+        // Probes are NON-urgent: nothing blocks on them, so they must
+        // not flip the pool into stream mode.
+        let x = art as u64;
+        assert_eq!(
+            calls.lock().unwrap().clone(),
+            vec![
+                ("v.rar".to_string(), size, vec![(0, 1), (size - x, size - x + 1)], false),
+                ("movie.mkv".to_string(), 200_000, vec![(0, 1)], false),
+            ]
+        );
+        let rep = ex.finish().unwrap();
+        assert_eq!(rep.extracted, vec![("movie.mkv".to_string(), 200_000)]);
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(std::fs::read(dir.join("movie.mkv")).unwrap(), data);
         assert!(!dir.join("v.rar").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -9508,10 +11474,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
 
         // Budget below it: demotes on the holds cap, and every volume
-        // still reconstructs byte-exact for the disk path.
+        // still reconstructs byte-exact for the disk path. Paging OFF -
+        // with it on (the default) this window pages to scratch and the
+        // set one-passes instead (pinned separately below); this leg
+        // keeps the demote plumbing itself honest.
         let dir = tmpdir("arith-lateends-tight");
         let ex = Extractor::new(&dir, vols.len(), true);
         ex.set_holds_cap(8 << 20);
+        ex.set_holds_paging(false);
         for &vi in &order {
             feed(&ex, vi, &names[vi], &vols[vi], 9000, 70 + vi as u64);
         }
@@ -9524,6 +11494,216 @@ mod tests {
         for (vi, vol) in vols.iter().enumerate() {
             assert_eq!(&std::fs::read(dir.join(&names[vi])).unwrap(), vol, "volume {vi}");
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Holds paging (the budget-breach relief valve, default ON): the
+    /// same neither-end-parsed window that demotes with paging off pages
+    /// to scratch instead and the set still extracts one-pass,
+    /// byte-exact - no volume ever touches disk, and the scratch file
+    /// itself is gone after finish.
+    #[test]
+    fn paged_holds_keep_a_tight_budget_set_one_pass() {
+        let inner = "late2.mkv";
+        let (data, vols, names) = uniform_store_set(inner, 300_000, 44, 200_000, 31);
+        let mut order = shuffled_zero_last(vols.len(), 0xC0FFEE);
+        let tail = vols.len() - 1;
+        let at = order.iter().position(|&v| v == tail).unwrap();
+        order.remove(at);
+        order.insert(order.len() - 1, tail);
+        let dir = tmpdir("holds-paged-onepass");
+        let ex = Extractor::new(&dir, vols.len(), true);
+        ex.set_holds_cap(8 << 20);
+        for &vi in &order {
+            feed(&ex, vi, &names[vi], &vols[vi], 9000, 70 + vi as u64);
+        }
+        assert!(ex.holds_paged_total() > 0, "paging never engaged");
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(std::fs::read(dir.join(inner)).unwrap(), data);
+        for n in &names {
+            assert!(!dir.join(n).exists(), "volume {n} materialized");
+        }
+        // Close the scratch handle before asserting the name is gone:
+        // finish() unlinks with the handle deliberately open, and on
+        // classic-delete-semantics filesystems (pre-1903 Windows, SMB)
+        // the name stays listed until last close.
+        drop(ex);
+        // Only the payload survives - the scratch must not outlive finish.
+        assert_eq!(dir_files(&dir), vec![inner.to_string()]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Mapped PAR2 repair sees paged spans: bytes parked behind an
+    /// unresolvable base page out under the cap, and `covered`/`read_at`
+    /// still serve them byte-exactly - repair reads through exactly these
+    /// paths to rebuild the blocks that free the holds. The set then
+    /// completes one-pass once the neighbours land.
+    #[test]
+    fn mapped_repair_reads_a_paged_span() {
+        let dir = tmpdir("holds-paged-readat");
+        let total = payload(30_000_000, 13);
+        let vols = vec![
+            fixtures::rar5_volume_n(
+                &[("film.mkv", 30_000_000, &total[..7_000_000], false, true)],
+                0,
+            ),
+            fixtures::rar5_volume_n(
+                &[("film.mkv", 30_000_000, &total[7_000_000..22_000_000], true, true)],
+                1,
+            ),
+            fixtures::rar5_volume_n(
+                &[("film.mkv", 30_000_000, &total[22_000_000..], true, false)],
+                2,
+            ),
+        ];
+        let ex = Extractor::new(&dir, 3, true);
+        ex.set_holds_cap(1); // floors at 8 MB - part2's data area exceeds it
+        let feed_seq = |slot: usize, name: &str, vol: &[u8]| {
+            for (i, chunk) in vol.chunks(65_000).enumerate() {
+                ex.write(slot, name, vol.len() as u64, (i * 65_000) as u64, chunk)
+                    .unwrap();
+            }
+        };
+        // Middle volume first: a middle piece is neither its file's head
+        // nor its tail, so nothing resolves its base and the whole data
+        // area holds - and pages.
+        feed_seq(1, "x.part2.rar", &vols[1]);
+        assert!(ex.holds_paged_total() > 0, "paging never engaged");
+        // A mid-volume range that can only live in (paged) holds now.
+        let (off, len) = (5_000_000u64, 200_000usize);
+        assert!(ex.covered(1, off, len), "paged span invisible to covered");
+        let mut got = vec![0u8; len];
+        ex.read_at(1, off, &mut got).unwrap();
+        assert_eq!(&got[..], &vols[1][off as usize..off as usize + len]);
+        // The whole volume reconstructs too (headers + RAM + paged spans).
+        let mut whole = vec![0u8; vols[1].len()];
+        ex.read_at(1, 0, &mut whole).unwrap();
+        assert_eq!(whole, vols[1]);
+        // With the neighbours fed, the paged spans drain into place and
+        // the set finishes one-pass.
+        feed_seq(0, "x.part1.rar", &vols[0]);
+        feed_seq(2, "x.part3.rar", &vols[2]);
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(std::fs::read(dir.join("film.mkv")).unwrap(), total);
+        // Handle closed before the name-absence check (delete-pending
+        // filesystems keep the unlinked name listed until last close).
+        drop(ex);
+        assert_eq!(dir_files(&dir), vec!["film.mkv".to_string()]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The scratch has a hard ceiling of its own: exceeding it demotes
+    /// with the SAME "held-bytes cap" reason as a RAM breach with paging
+    /// off. The finish ladder keys volume-level remediation off that
+    /// substring, so the wording is load-bearing - a novel string would
+    /// demote the volumes and then ship the job with no payload, exit 0.
+    #[test]
+    fn scratch_ceiling_demotes_with_the_unchanged_reason() {
+        let dir = tmpdir("holds-paged-ceiling");
+        let total = payload(30_000_000, 13);
+        let vols = vec![
+            fixtures::rar5_volume_n(
+                &[("film.mkv", 30_000_000, &total[..7_000_000], false, true)],
+                0,
+            ),
+            fixtures::rar5_volume_n(
+                &[("film.mkv", 30_000_000, &total[7_000_000..22_000_000], true, true)],
+                1,
+            ),
+            fixtures::rar5_volume_n(
+                &[("film.mkv", 30_000_000, &total[22_000_000..], true, false)],
+                2,
+            ),
+        ];
+        let ex = Extractor::new(&dir, 3, true);
+        ex.set_holds_cap(1); // floors at 8 MB
+        ex.set_holds_scratch_cap(2 << 20); // far below part2's window
+        let feed_seq = |slot: usize, name: &str, vol: &[u8]| {
+            for (i, chunk) in vol.chunks(65_000).enumerate() {
+                ex.write(slot, name, vol.len() as u64, (i * 65_000) as u64, chunk)
+                    .unwrap();
+            }
+        };
+        feed_seq(1, "x.part2.rar", &vols[1]);
+        feed_seq(0, "x.part1.rar", &vols[0]);
+        feed_seq(2, "x.part3.rar", &vols[2]);
+        let rep = ex.finish().unwrap();
+        assert!(ex.holds_paged_total() > 0, "paging never engaged");
+        assert!(
+            rep.fallbacks
+                .iter()
+                .any(|(_, w)| w.contains("held-bytes cap") && !w.starts_with("nested fallback:")),
+            "{:?}",
+            rep.fallbacks
+        );
+        // Demoting is not losing: every volume byte-exact on disk, and
+        // the scratch gone with the demote (its spans all drained).
+        for (vi, vol) in vols.iter().enumerate() {
+            assert_eq!(
+                &std::fs::read(dir.join(format!("x.part{}.rar", vi + 1))).unwrap(),
+                vol,
+                "volume {vi}"
+            );
+        }
+        // Handle closed before the name-absence check (delete-pending
+        // filesystems keep the unlinked name listed until last close).
+        drop(ex);
+        assert!(
+            !dir_files(&dir).iter().any(|n| n.starts_with(HOLDS_TMP_PREFIX)),
+            "scratch left behind: {:?}",
+            dir_files(&dir)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The paging gate: NZBFAST_NO_HOLDS_PAGE=1 parses as off (asserted
+    /// on the pure helper for the parallel-runner reason the chase gates
+    /// established); the runtime setter drives the same latch and is
+    /// exercised by the paging-off legs above.
+    #[test]
+    fn holds_paging_env_parse() {
+        assert!(holds_page_env_off_value(Some("1")));
+        assert!(!holds_page_env_off_value(Some("0")));
+        assert!(!holds_page_env_off_value(None));
+    }
+
+    /// The scratch's reader-pin contract, pinned directly (the 31 Jul
+    /// race audit's finding was a gate that consulted `pins` outside
+    /// the state mutex): a pin taken at plan time must block BOTH
+    /// reclaim gates - the release-side truncate and the append-side
+    /// cursor reset - for a planned pread of a since-released region,
+    /// and must stop blocking once dropped.
+    #[test]
+    fn scratch_pin_blocks_idle_reclaim() {
+        let dir = tmpdir("scratch-pin");
+        let sc = Arc::new(HoldsScratch::new(&dir));
+        let payload = b"exact bytes a planned pread must still see";
+        let off = sc.append(payload, 1 << 20).expect("first append");
+        // A reader plans: pin, then the span is consumed (released)
+        // before the pread lands - the exact window of the race.
+        let mut pin = ScratchPin::none();
+        pin.pin(&sc);
+        sc.release(payload.len());
+        // live == 0, but the pin blocks the truncate: the planned pread
+        // still sees the bytes...
+        let mut buf = vec![0u8; payload.len()];
+        sc.read(off, &mut buf).unwrap();
+        assert_eq!(&buf, payload);
+        // ...and a new append must not reset the cursor onto the
+        // planned region either.
+        let off2 = sc.append(b"XXXX", 1 << 20).expect("append under pin");
+        assert_ne!(off2, off, "cursor reset under a live pin");
+        sc.read(off, &mut buf).unwrap();
+        assert_eq!(&buf, payload, "planned region overwritten under a live pin");
+        // Pin dropped and everything released: the idle reset may fire.
+        drop(pin);
+        sc.release(4);
+        let off3 = sc.append(b"YYYY", 1 << 20).expect("append after idle");
+        assert_eq!(off3, 0, "idle reset never fired once unpinned");
+        sc.release(4);
+        sc.cleanup();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -10244,6 +12424,10 @@ mod tests {
         let ex = Extractor::new(&dir, 3, true);
         ex.set_protect_sources();
         ex.set_holds_cap(1); // floors at 8 MB - part2's data area exceeds it
+        // Paging OFF: with it on this window pages and the set
+        // re-extracts one-pass; the subject here is the fallback
+        // discipline under budget pressure, so force the breach.
+        ex.set_holds_paging(false);
         let mut feed_seq = |slot: usize, name: &str, vol: &[u8]| {
             for (i, chunk) in vol.chunks(65_000).enumerate() {
                 ex.write(slot, name, vol.len() as u64, (i * 65_000) as u64, chunk)
@@ -10272,6 +12456,68 @@ mod tests {
             .filter(|n| n != "x.part1.rar" && n != "x.part2.rar" && n != "x.part3.rar")
             .collect();
         assert!(extra.is_empty(), "unexpected files: {extra:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The same shape with paging ON (the default): the re-extraction
+    /// that used to DISCARD on the holds cap - a real failure mode, the
+    /// 2026-07 damaged-post bench ran into exactly this - now pages the
+    /// middle volume's window to scratch and completes one-pass, sources
+    /// untouched and no scratch left behind.
+    #[test]
+    fn protect_sources_paged_holds_reextract_one_pass() {
+        let dir = tmpdir("protect-paged");
+        let total = payload(30_000_000, 13);
+        let vols = vec![
+            fixtures::rar5_volume_n(
+                &[("film.mkv", 30_000_000, &total[..7_000_000], false, true)],
+                0,
+            ),
+            fixtures::rar5_volume_n(
+                &[("film.mkv", 30_000_000, &total[7_000_000..22_000_000], true, true)],
+                1,
+            ),
+            fixtures::rar5_volume_n(
+                &[("film.mkv", 30_000_000, &total[22_000_000..], true, false)],
+                2,
+            ),
+        ];
+        std::fs::write(dir.join("x.part1.rar"), &vols[0]).unwrap();
+        std::fs::write(dir.join("x.part2.rar"), &vols[1]).unwrap();
+        std::fs::write(dir.join("x.part3.rar"), &vols[2]).unwrap();
+        let ex = Extractor::new(&dir, 3, true);
+        ex.set_protect_sources();
+        ex.set_holds_cap(1); // floors at 8 MB - part2's data area exceeds it
+        let feed_seq = |slot: usize, name: &str, vol: &[u8]| {
+            for (i, chunk) in vol.chunks(65_000).enumerate() {
+                ex.write(slot, name, vol.len() as u64, (i * 65_000) as u64, chunk)
+                    .unwrap();
+            }
+        };
+        feed_seq(1, "x.part2.rar", &vols[1]);
+        feed_seq(0, "x.part1.rar", &vols[0]);
+        feed_seq(2, "x.part3.rar", &vols[2]);
+        let rep = ex.finish().unwrap();
+        assert!(ex.holds_paged_total() > 0, "paging never engaged");
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(std::fs::read(dir.join("film.mkv")).unwrap(), total);
+        // Sources byte-identical, and nothing else in the directory -
+        // in particular no scratch outliving finish. Handle closed
+        // first (delete-pending filesystems keep the unlinked name
+        // listed until last close).
+        drop(ex);
+        assert_eq!(std::fs::read(dir.join("x.part1.rar")).unwrap(), vols[0]);
+        assert_eq!(std::fs::read(dir.join("x.part2.rar")).unwrap(), vols[1]);
+        assert_eq!(std::fs::read(dir.join("x.part3.rar")).unwrap(), vols[2]);
+        assert_eq!(
+            dir_files(&dir),
+            vec![
+                "film.mkv".to_string(),
+                "x.part1.rar".to_string(),
+                "x.part2.rar".to_string(),
+                "x.part3.rar".to_string()
+            ]
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -10381,6 +12627,11 @@ mod tests {
         vol.extend(payload(12 << 20, 3)); // junk past the end block
         let ex = Extractor::new(&dir, 1, true);
         ex.set_holds_cap(1); // floors at 8 MB
+        // Paging OFF: with it on the junk pages to scratch and the tiny
+        // archive extracts one-pass (bounded by the scratch ceiling,
+        // pinned separately) - this test keeps the charge-and-demote
+        // plumbing itself honest.
+        ex.set_holds_paging(false);
         let art = 64_000;
         let mut s = 0usize;
         while s < vol.len() {
@@ -10571,6 +12822,31 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The badge a RAR4 encrypted set earns. "unlock-at-end" is the
+    /// honest token for it and always will be: RAR4 can never take the
+    /// plaintext-once route (no password check to gate on), so it always
+    /// assembles ciphertext and unlocks in the finish pass. The user-facing
+    /// difference from before this landed is "one-pass at all" - it used to
+    /// materialize every volume and read "on-disk".
+    #[test]
+    fn shape_says_rar4_encrypted_unlocks_at_the_end() {
+        let dir = tmpdir("shape-enc4");
+        let plain = payload(120_007, 43);
+        let f = fixtures::encrypt_file_v4("hunter2", &plain, 51);
+        let vol = fixtures::rar4_volume_enc(&[("movie.mkv", &f, 0..f.cipher.len(), false, false)]);
+        let ex = Extractor::new(&dir, 1, true);
+        ex.set_password("hunter2");
+        feed(&ex, 0, "v.rar", &vol, 7000, 3);
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(
+            shape_of(&ex),
+            ["rar4", "store", "encrypted", "unlock-at-end"],
+            "RAR4 must not be badged as materialized any more"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn shape_says_encrypted_when_the_headers_are_locked() {
         let dir = tmpdir("shape-hdr");
@@ -10700,6 +12976,136 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Increment B: a TWEAKED-checksum entry stores the keyed fold of the
+    /// plaintext CRC32, which used to make it un-verifiable - `expect_crc`
+    /// was filtered to None and the decrypted output shipped with no
+    /// integrity check at all. The gate now folds the computed CRC the
+    /// same way before comparing, so a tweaked entry gets exactly the
+    /// protection an untweaked one has: clean bytes verify, damaged
+    /// ciphertext fails hard instead of masquerading as output.
+    #[test]
+    fn tweaked_checksum_entry_is_verified_through_the_keyed_fold() {
+        let plain = payload(140_003, 44);
+
+        // Clean, tweaked: must extract byte-exact.
+        let mut f = fixtures::encrypt_file("hunter2", &plain, 21);
+        f.with_crc = true;
+        f.tweaked = true;
+        let dir = tmpdir("enc-tweaked-ok");
+        let vol =
+            fixtures::rar5_volume_enc(&[("movie.mkv", &f, 0..f.cipher.len(), false, false)], None);
+        let ex = Extractor::new(&dir, 1, true);
+        ex.set_password("hunter2");
+        feed(&ex, 0, "v.rar", &vol, 7000, 21);
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(std::fs::read(dir.join("movie.mkv")).unwrap(), plain);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // Damaged ciphertext under the same tweaked entry: the folded
+        // comparison must catch it. Before this gate the mismatch was
+        // invisible and the corrupt file shipped as success.
+        let mut fbad = fixtures::encrypt_file("hunter2", &plain, 22);
+        fbad.with_crc = true;
+        fbad.tweaked = true;
+        fbad.cipher[70_000] ^= 0x5A;
+        let dir = tmpdir("enc-tweaked-bad");
+        let vol = fixtures::rar5_volume_enc(
+            &[("movie.mkv", &fbad, 0..fbad.cipher.len(), false, false)],
+            None,
+        );
+        let ex = Extractor::new(&dir, 1, true);
+        ex.set_password("hunter2");
+        feed(&ex, 0, "v.rar", &vol, 7000, 22);
+        let res = ex.finish();
+        assert!(res.is_err(), "damaged tweaked plaintext must not succeed");
+        let out = dir.join("movie.mkv");
+        assert!(
+            !out.exists() || std::fs::read(&out).unwrap() != plain,
+            "corrupt plaintext must not masquerade as the clean file"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Increment B2: a CHECK-LESS encrypted RAR5 store set - the crypt
+    /// record carries no password check, so nothing can verify the
+    /// password before data is decrypted - used to demote to disk on
+    /// sight. It now maps one-pass and is adjudicated at finish against
+    /// the whole-file checksum, which lives on the set's LAST piece (the
+    /// head's value describes only its own volume). Split across three
+    /// volumes so the tail lookup is what makes it work.
+    #[test]
+    fn checkless_encrypted_store_set_maps_and_verifies_at_finish() {
+        let plain = payload(300_007, 51);
+        let mut f = fixtures::encrypt_file("n0check", &plain, 31);
+        f.with_crc = true;
+        f.no_check = true;
+        let n = f.cipher.len();
+        let (a, b) = (100_016, 200_016);
+        let vols = [
+            fixtures::rar5_volume_enc(&[("movie.mkv", &f, 0..a, false, true)], Some(0)),
+            fixtures::rar5_volume_enc(&[("movie.mkv", &f, a..b, true, true)], Some(1)),
+            fixtures::rar5_volume_enc(&[("movie.mkv", &f, b..n, true, false)], Some(2)),
+        ];
+        let dir = tmpdir("enc-checkless-ok");
+        let ex = Extractor::new(&dir, 3, true);
+        ex.set_password("n0check");
+        for (i, v) in vols.iter().enumerate() {
+            feed(&ex, i, &format!("v{i}.rar"), v, 7000, 31 + i as u64);
+        }
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "must not demote: {:?}", rep.fallbacks);
+        assert_eq!(std::fs::read(dir.join("movie.mkv")).unwrap(), plain);
+        for i in 0..vols.len() {
+            assert!(
+                !dir.join(format!("v{i}.rar")).exists(),
+                "volume {i} must not touch disk (one-pass)"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The other half of B2's contract: the SAME check-less set with the
+    /// WRONG password must not publish garbage. Nothing could veto the
+    /// password up front, so the whole-file checksum is the verdict - it
+    /// misses, and the group demotes (volumes materialize byte-exact for
+    /// the disk path, which validates the password itself) instead of
+    /// either shipping noise or failing the whole download.
+    #[test]
+    fn checkless_encrypted_store_set_wrong_password_demotes_not_publishes() {
+        let plain = payload(300_007, 52);
+        let mut f = fixtures::encrypt_file("rightpw", &plain, 33);
+        f.with_crc = true;
+        f.no_check = true;
+        let n = f.cipher.len();
+        let vols = [
+            fixtures::rar5_volume_enc(&[("movie.mkv", &f, 0..n / 2, false, true)], Some(0)),
+            fixtures::rar5_volume_enc(&[("movie.mkv", &f, n / 2..n, true, false)], Some(1)),
+        ];
+        let dir = tmpdir("enc-checkless-wrongpw");
+        let ex = Extractor::new(&dir, 2, true);
+        ex.set_password("wrongpw");
+        for (i, v) in vols.iter().enumerate() {
+            feed(&ex, i, &format!("v{i}.rar"), v, 7000, 41 + i as u64);
+        }
+        let rep = ex.finish().expect("a wrong password must not fail the job");
+        assert!(!rep.fallbacks.is_empty(), "the group must demote");
+        let out = dir.join("movie.mkv");
+        assert!(
+            !out.exists() || std::fs::read(&out).unwrap() != plain,
+            "wrong-password output must never masquerade as the payload"
+        );
+        // The volumes are the deliverable now, and must be byte-exact -
+        // this is the property that assembling CIPHERTEXT (rather than
+        // decrypting in place) buys.
+        for (i, v) in vols.iter().enumerate() {
+            let got = std::fs::read(dir.join(format!("v{i}.rar")))
+                .unwrap_or_else(|e| panic!("volume {i} must materialize: {e}"));
+            assert!(got == *v, "volume {i} must materialize byte-exact");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// The decrypt pass shards a file across threads, seeding each shard's
     /// CBC chain from the ciphertext block before it and folding the shard
     /// CRCs back with `crc32_combine`. Every shard count must therefore
@@ -10711,7 +13117,7 @@ mod tests {
         // Over DECRYPT_PARALLEL_MIN so the sharded path actually engages,
         // and deliberately not a multiple of 16 or of the shard size.
         let plain = payload((36 << 20) + 7, 91);
-        let key = [0x3Cu8; 32];
+        let key = rarcrypt::AesKey::Aes256([0x3Cu8; 32]);
         let iv = [0x5Au8; 16];
         let mut cipher = plain.clone();
         cipher.resize(rarcrypt::align16(plain.len() as u64) as usize, 0);
@@ -10737,7 +13143,7 @@ mod tests {
                 &key,
                 &iv,
                 plain.len() as u64,
-                Some(expect_crc),
+                Some(CrcGate { stored: expect_crc, hash_key: None }),
                 threads,
             )
             .unwrap_or_else(|e| panic!("{threads} shards: {e}"));
@@ -10766,7 +13172,7 @@ mod tests {
             &key,
             &iv,
             plain.len() as u64,
-            Some(expect_crc ^ 1),
+            Some(CrcGate { stored: expect_crc ^ 1, hash_key: None }),
             8,
         );
         assert!(err.is_err(), "sharded pass must still enforce the CRC");
@@ -10781,7 +13187,7 @@ mod tests {
     #[ignore = "timing bench, not a correctness gate"]
     fn decrypt_shard_scaling_bench() {
         let plain = payload(256 << 20, 13);
-        let key = [0x11u8; 32];
+        let key = rarcrypt::AesKey::Aes256([0x11u8; 32]);
         let iv = [0x22u8; 16];
         let mut cipher = plain.clone();
         rarcrypt::CbcEncStream::new(&key, &iv).encrypt(&mut cipher);
@@ -10800,7 +13206,16 @@ mod tests {
                 .open(&out)
                 .unwrap();
             let t = std::time::Instant::now();
-            decrypt_pass(&src, &wf, &key, &iv, plain.len() as u64, Some(crc), threads).unwrap();
+            decrypt_pass(
+                &src,
+                &wf,
+                &key,
+                &iv,
+                plain.len() as u64,
+                Some(CrcGate { stored: crc, hash_key: None }),
+                threads,
+            )
+            .unwrap();
             let el = t.elapsed().as_secs_f64();
             println!(
                 "  {threads} shard(s): {el:6.3}s  {:7.1} MB/s",
@@ -11502,6 +13917,156 @@ mod tests {
             }
             std::fs::remove_dir_all(&dir).unwrap();
         }
+    }
+
+    /// The committed REAL RAR4 fixtures (`unrar t`-validated; see
+    /// testdata/rar4/README.md), driven through the full extractor.
+    /// RAR4 has no password check, so every one of these takes the
+    /// UNVERIFIED route - ciphertext assembled at store offsets, decrypted
+    /// at finish, and published only once the header's plaintext CRC32
+    /// accepts it - yet the outcome must be the same one-pass extraction
+    /// RAR5 gets: exact payload, no volume left on disk.
+    #[test]
+    fn real_rar4_fixtures_extract_and_decrypt() {
+        let secret = include_bytes!("../testdata/rar4/secret.bin").to_vec();
+        let cases: Vec<(&str, Vec<(&str, &[u8])>)> = vec![
+            ("store", vec![("enc-store.rar", include_bytes!("../testdata/rar4/enc-store.rar"))]),
+            ("hdrs", vec![("enc-hdrs.rar", include_bytes!("../testdata/rar4/enc-hdrs.rar"))]),
+            (
+                "vols",
+                vec![
+                    ("enc-vols.part1.rar", include_bytes!("../testdata/rar4/enc-vols.part1.rar")),
+                    ("enc-vols.part2.rar", include_bytes!("../testdata/rar4/enc-vols.part2.rar")),
+                    ("enc-vols.part3.rar", include_bytes!("../testdata/rar4/enc-vols.part3.rar")),
+                ],
+            ),
+            (
+                "hdrvols",
+                vec![
+                    (
+                        "enc-hdr-vols.part1.rar",
+                        include_bytes!("../testdata/rar4/enc-hdr-vols.part1.rar"),
+                    ),
+                    (
+                        "enc-hdr-vols.part2.rar",
+                        include_bytes!("../testdata/rar4/enc-hdr-vols.part2.rar"),
+                    ),
+                    (
+                        "enc-hdr-vols.part3.rar",
+                        include_bytes!("../testdata/rar4/enc-hdr-vols.part3.rar"),
+                    ),
+                ],
+            ),
+        ];
+        for (tag, vols) in cases {
+            let dir = tmpdir(&format!("enc-real4-{tag}"));
+            let ex = Extractor::new(&dir, vols.len(), true);
+            ex.set_password("testpw123");
+            for (si, (name, bytes)) in vols.iter().enumerate() {
+                feed(&ex, si, name, bytes, 137, 60 + si as u64);
+            }
+            let rep = ex.finish().unwrap();
+            assert!(rep.fallbacks.is_empty(), "{tag}: {:?}", rep.fallbacks);
+            assert_eq!(rep.decrypted, vec!["inner.bin".to_string()], "{tag}");
+            assert_eq!(std::fs::read(dir.join("inner.bin")).unwrap(), secret, "{tag}");
+            for (name, _) in &vols {
+                assert!(!dir.join(name).exists(), "{tag}: volume {name} materialized");
+            }
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// A RAR4 volume holding TWO inner files. RAR4 salts each file
+    /// separately (the writer draws a fresh one per entry), so each needs
+    /// its OWN derived key and its own IV - a single archive-wide key,
+    /// which is what a RAR5-shaped assumption would give, decrypts the
+    /// second file to noise. Both must come out, and the finish pass must
+    /// pair each output with the right head entry.
+    #[test]
+    fn rar4_multi_file_volume_derives_a_key_per_inner_file() {
+        let dir = tmpdir("enc4-multi");
+        let a_plain = payload(40_000, 51);
+        let b_plain = payload(25_003, 52); // odd: exercises the tail pad too
+        let fa = fixtures::encrypt_file_v4("pw", &a_plain, 41);
+        let fb = fixtures::encrypt_file_v4("pw", &b_plain, 42);
+        assert_ne!(fa.salt, fb.salt, "the fixture must give each file its own salt");
+        let vol = fixtures::rar4_volume_enc(&[
+            ("a.bin", &fa, 0..fa.cipher.len(), false, false),
+            ("b.bin", &fb, 0..fb.cipher.len(), false, false),
+        ]);
+        let ex = Extractor::new(&dir, 1, true);
+        ex.set_password("pw");
+        feed(&ex, 0, "v.rar", &vol, 4096, 8);
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(rep.decrypted, vec!["a.bin".to_string(), "b.bin".to_string()]);
+        assert_eq!(std::fs::read(dir.join("a.bin")).unwrap(), a_plain);
+        assert_eq!(std::fs::read(dir.join("b.bin")).unwrap(), b_plain);
+        assert!(!dir.join("v.rar").exists(), "volume must not materialize");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The wrong password on a RAR4 `-p` set. Nothing can catch it before
+    /// the decrypt pass, so this is the case the unverified route exists
+    /// for: the CRC gate must reject, the group must DEMOTE rather than
+    /// fail the job, and the assembled bytes must come back out as the
+    /// byte-exact posted volume for unrar or a corrected retry.
+    #[test]
+    fn rar4_wrong_password_demotes_to_a_byte_exact_volume() {
+        let dir = tmpdir("enc4-wrongpw");
+        let plain = payload(60_000, 46);
+        let f = fixtures::encrypt_file_v4("rightpw", &plain, 31);
+        let vol = fixtures::rar4_volume_enc(&[("a.bin", &f, 0..f.cipher.len(), false, false)]);
+        let ex = Extractor::new(&dir, 1, true);
+        ex.set_password("wrongpw");
+        feed(&ex, 0, "v.rar", &vol, 7000, 6);
+        let rep = ex.finish().unwrap();
+        assert!(rep.decrypted.is_empty(), "nothing may publish: {:?}", rep.decrypted);
+        assert!(
+            rep.fallbacks
+                .iter()
+                .any(|(_, w)| w.contains("wrong password")),
+            "the demote must name the real cause: {:?}",
+            rep.fallbacks
+        );
+        assert_eq!(
+            std::fs::read(dir.join("v.rar")).unwrap(),
+            vol,
+            "the demoted volume must be byte-exact for a retry"
+        );
+        assert!(!dir.join("a.bin").exists(), "no wrong-key garbage published");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A RAR4 encrypted entry whose header carries no CRC (a zero field,
+    /// which the parser reads as "not computed") has NOTHING to adjudicate
+    /// an unverifiable password against, so it must demote before
+    /// decrypting rather than publish bytes no one vouched for.
+    #[test]
+    fn rar4_encrypted_without_a_checksum_demotes() {
+        let dir = tmpdir("enc4-nocrc");
+        let plain = payload(50_000, 47);
+        let f = fixtures::encrypt_file_v4("pw", &plain, 32);
+        let mut vol = fixtures::rar4_volume_enc(&[("a.bin", &f, 0..f.cipher.len(), false, false)]);
+        // Blank the file header's CRC field (file header at 20, CRC at +16)
+        // and repair the header CRC16 so the block still parses.
+        let hdr = 20usize;
+        let hsize = u16::from_le_bytes(vol[hdr + 5..hdr + 7].try_into().unwrap()) as usize;
+        vol[hdr + 16..hdr + 20].fill(0);
+        let hc = (crc32fast::hash(&vol[hdr + 2..hdr + hsize]) & 0xffff) as u16;
+        vol[hdr..hdr + 2].copy_from_slice(&hc.to_le_bytes());
+        let ex = Extractor::new(&dir, 1, true);
+        ex.set_password("pw"); // the RIGHT password, but unverifiable
+        feed(&ex, 0, "v.rar", &vol, 7000, 5);
+        let rep = ex.finish().unwrap();
+        assert!(rep.decrypted.is_empty());
+        assert!(
+            rep.fallbacks.iter().any(|(_, w)| w.contains("encrypted")),
+            "{:?}",
+            rep.fallbacks
+        );
+        assert_eq!(std::fs::read(dir.join("v.rar")).unwrap(), vol);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A check-less encrypted archive can't have its password verified
@@ -13269,6 +15834,227 @@ mod tests {
         }
     }
 
+    /// TOP-LEVEL chase (the RAR analogue of TODO 37 step 1): a POSTED
+    /// compressed RAR5 - no store wrapper - chases at depth 0, its
+    /// payload promotes to the root output, and neither the volume nor
+    /// any intermediate archive ever exists on disk. Three arrival
+    /// orders, mirroring the 7z twin.
+    #[test]
+    fn top_level_compressed_rar_chases_one_pass() {
+        let f = payload(300_000, 131);
+        let arch = rars_compressed_volume(&[("F.bin", &f)]);
+        assert_not_store(&arch);
+        let art = 7000usize;
+        let n_arts = arch.len().div_ceil(art);
+        let orders: Vec<Vec<usize>> = vec![
+            (0..n_arts).collect(),
+            (0..n_arts).rev().collect(),
+            (0..n_arts).map(|i| (i * 7 + 3) % n_arts).collect(),
+        ];
+        for (t, order) in orders.iter().enumerate() {
+            let dir = tmpdir(&format!("rar-top-onepass{t}"));
+            let ex = Arc::new(Extractor::new(&dir, 1, true));
+            ex.anchor();
+            let mut seen = vec![false; n_arts];
+            for &i in order {
+                if std::mem::replace(&mut seen[i], true) {
+                    continue;
+                }
+                let s = i * art;
+                let e = (s + art).min(arch.len());
+                ex.write(0, "release.rar", arch.len() as u64, s as u64, &arch[s..e])
+                    .unwrap();
+            }
+            let rep = ex.finish().unwrap();
+            assert!(rep.fallbacks.is_empty(), "order {t}: {:?}", rep.fallbacks);
+            assert_eq!(std::fs::read(dir.join("F.bin")).unwrap(), f, "order {t}");
+            assert_eq!(dir_files(&dir), vec!["F.bin".to_string()], "order {t}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// The multi-volume shape at depth 0: each volume of a posted
+    /// compressed set is its own top-level file (own slot, own name),
+    /// registering with the group's chase at its header volume number.
+    /// Forward and reverse volume-arrival orders.
+    #[test]
+    fn top_level_compressed_rar_multivolume_chases_one_pass() {
+        let f = noisy(300_000, 132);
+        let vols = rars_compressed_volumes("F.bin", &f, 50_000);
+        assert!(vols.len() >= 3, "want a real multi-volume set, got {}", vols.len());
+        for v in &vols {
+            assert_not_store(v);
+        }
+        for (t, rev) in [false, true].iter().enumerate() {
+            let dir = tmpdir(&format!("rar-top-mv{t}"));
+            let ex = Arc::new(Extractor::new(&dir, vols.len(), true));
+            ex.anchor();
+            let order: Vec<usize> = if *rev {
+                (0..vols.len()).rev().collect()
+            } else {
+                (0..vols.len()).collect()
+            };
+            for &vi in &order {
+                feed(&ex, vi, &format!("release.part{}.rar", vi + 1), &vols[vi], 7000, 33 + vi as u64);
+            }
+            let rep = ex.finish().unwrap();
+            assert!(rep.fallbacks.is_empty(), "rev={rev}: {:?}", rep.fallbacks);
+            assert_eq!(std::fs::read(dir.join("F.bin")).unwrap(), f, "rev={rev}");
+            assert_eq!(dir_files(&dir), vec!["F.bin".to_string()], "rev={rev}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// The kill switch restores the pre-lift behaviour exactly: gate
+    /// off, a posted compressed RAR materializes byte-exact with the
+    /// NotStore demote reason and no partial output. Also pins the env
+    /// parse ("1" and nothing else).
+    #[test]
+    fn top_level_chase_gate_off_materializes() {
+        assert!(top_chase_env_off_value(Some("1")));
+        assert!(!top_chase_env_off_value(Some("0")));
+        assert!(!top_chase_env_off_value(None));
+        let f = noisy(300_000, 133);
+        let arch = rars_compressed_volume(&[("F.bin", &f)]);
+        assert_not_store(&arch);
+        let dir = tmpdir("rar-top-gateoff");
+        let ex = Arc::new(Extractor::new(&dir, 1, true));
+        ex.anchor();
+        ex.set_top_level_chase(false);
+        feed(&ex, 0, "release.rar", &arch, 7000, 34);
+        let rep = ex.finish().unwrap();
+        assert!(
+            rep.fallbacks
+                .iter()
+                .any(|(_, w)| w.contains("compressed or encrypted entries")),
+            "{:?}",
+            rep.fallbacks
+        );
+        assert_eq!(std::fs::read(dir.join("release.rar")).unwrap(), arch);
+        assert!(!dir.join("F.bin").exists(), "gate off must not stream");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A depth-0 chase over the holds cap demotes cleanly: the volume
+    /// materializes COMPLETE for the unrar ladder (whose "held-bytes
+    /// cap" keying the reason carries), and no partial payload survives.
+    /// This is the pre-lift exit path, reached through the chase.
+    #[test]
+    fn top_level_chase_budget_breach_demotes_to_volume() {
+        let f = noisy(2_400_000, 134);
+        let arch = rars_compressed_volume(&[("F.bin", &f)]);
+        assert_not_store(&arch);
+        assert!(arch.len() > 900_000, "packed too small: {}", arch.len());
+        let dir = tmpdir("rar-top-budget");
+        let ex = Arc::new(Extractor::new(&dir, 3, true));
+        ex.anchor();
+        ex.set_holds_cap(1); // floors at 8 MB
+        let junk = payload(65_000, 135);
+        for slot in [1usize, 2] {
+            for i in 0..60u64 {
+                ex.write(slot, &format!("dummy{slot}.bin"), 8_000_000, 64_000 + i * 65_000, &junk)
+                    .unwrap();
+            }
+        }
+        for (i, chunk) in arch.chunks(50_000).enumerate() {
+            ex.write(0, "release.rar", arch.len() as u64, (i * 50_000) as u64, chunk)
+                .unwrap();
+        }
+        let rep = ex.finish().unwrap();
+        assert!(
+            rep.fallbacks
+                .iter()
+                .any(|(_, w)| w.contains("held-bytes cap: chase memory")),
+            "{:?}",
+            rep.fallbacks
+        );
+        assert_eq!(std::fs::read(dir.join("release.rar")).unwrap(), arch);
+        assert!(!dir.join("F.bin").exists(), "partial chase output survived");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Encrypted + compressed at depth 0: with the password set the
+    /// chase attaches (the gate admits an encrypted compressed entry
+    /// when `inner.password` is some) and the worker decrypts through
+    /// `rar_read_options` - byte-exact payload, no volume on disk.
+    /// Without a password the same set must demote and materialize:
+    /// nothing can decode it anywhere, and a partial output would be
+    /// garbage. First test of the chase's decrypt path at ANY depth.
+    #[test]
+    fn top_level_encrypted_compressed_rar_chases_one_pass() {
+        use rars::rar50::{EncryptedCompressedEntry, Rar50VolumeWriter, WriterOptions};
+        let f = noisy(300_000, 137);
+        let mut features = rars::FeatureSet::store_only();
+        features.file_encryption = true;
+        let opts = WriterOptions::new(rars::ArchiveVersion::Rar50, features);
+        let vols = Rar50VolumeWriter::new(opts)
+            .encrypted_compressed_entries(&[EncryptedCompressedEntry {
+                name: b"F.bin",
+                data: &f,
+                mtime: None,
+                attributes: 0,
+                host_os: 0,
+                password: b"hunter2",
+            }])
+            .max_payload_per_volume(50_000)
+            .finish()
+            .unwrap();
+        assert!(vols.len() >= 3, "want a real multi-volume set, got {}", vols.len());
+        for v in &vols {
+            assert_not_store(v);
+        }
+        // Password in hand: one-pass.
+        let dir = tmpdir("rar-top-enccomp");
+        let ex = Arc::new(Extractor::new(&dir, vols.len(), true));
+        ex.anchor();
+        ex.set_password("hunter2");
+        for (vi, vol) in vols.iter().enumerate() {
+            feed(&ex, vi, &format!("release.part{}.rar", vi + 1), vol, 7000, 60 + vi as u64);
+        }
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(std::fs::read(dir.join("F.bin")).unwrap(), f);
+        assert_eq!(dir_files(&dir), vec!["F.bin".to_string()]);
+        std::fs::remove_dir_all(&dir).unwrap();
+        // No password: demote, volumes materialize byte-exact.
+        let dir = tmpdir("rar-top-enccomp-nopw");
+        let ex = Arc::new(Extractor::new(&dir, vols.len(), true));
+        ex.anchor();
+        for (vi, vol) in vols.iter().enumerate() {
+            feed(&ex, vi, &format!("release.part{}.rar", vi + 1), vol, 7000, 70 + vi as u64);
+        }
+        let rep = ex.finish().unwrap();
+        assert!(!rep.fallbacks.is_empty(), "no-password set must demote");
+        for (vi, vol) in vols.iter().enumerate() {
+            assert_eq!(
+                std::fs::read(dir.join(format!("release.part{}.rar", vi + 1))).unwrap(),
+                *vol,
+                "volume {vi} must materialize byte-exact"
+            );
+        }
+        assert!(!dir.join("F.bin").exists(), "no partial decrypt output");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A resumed run never chases at the top level (twin of the 7z
+    /// pin): the disabled extractor materializes the volume untouched
+    /// for the disk path.
+    #[test]
+    fn top_level_chase_never_runs_on_a_resumed_run() {
+        let f = noisy(200_000, 136);
+        let arch = rars_compressed_volume(&[("F.bin", &f)]);
+        assert_not_store(&arch);
+        let dir = tmpdir("rar-top-resume");
+        let ex = Arc::new(Extractor::with_resume(&dir, 1, false, true));
+        ex.anchor();
+        feed(&ex, 0, "release.rar", &arch, 7000, 55);
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(std::fs::read(dir.join("release.rar")).unwrap(), arch);
+        assert_eq!(dir_files(&dir), vec!["release.rar".to_string()]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Chase + repair at multi-volume scale (the multi-volume extension
     /// of `chase_unblocks_on_patched_volume_span`): a compressed member
     /// split across 3+ inner volumes, wrapped in a TWO-volume store
@@ -13998,11 +16784,11 @@ mod tests {
         for (t, forward) in [true, false].iter().enumerate() {
             let dir = tmpdir(&format!("7z-promote{t}"));
             let ex = Arc::new(Extractor::new(&dir, 1, true));
-            type Calls = Arc<Mutex<Vec<(String, u64, Vec<(u64, u64)>)>>>;
+            type Calls = Arc<Mutex<Vec<(String, u64, Vec<(u64, u64)>, bool)>>>;
             let calls: Calls = Default::default();
             let sink = calls.clone();
-            ex.set_promote_hook(Arc::new(move |n: &str, s: u64, sp: &[(u64, u64)]| {
-                sink.lock().unwrap().push((n.to_string(), s, sp.to_vec()));
+            ex.set_promote_hook(Arc::new(move |n: &str, s: u64, sp: &[(u64, u64)], u: bool| {
+                sink.lock().unwrap().push((n.to_string(), s, sp.to_vec(), u));
             }));
             let art = 6000usize;
             let n_arts = outer.len().div_ceil(art);
@@ -14020,10 +16806,16 @@ mod tests {
             let rep = ex.finish().unwrap();
             assert!(rep.fallbacks.is_empty(), "order {t}: {:?}", rep.fallbacks);
             assert_eq!(std::fs::read(dir.join("F.bin")).unwrap(), f, "order {t}");
-            let got = calls.lock().unwrap().clone();
+            // The reverse feed starts out of order, so the offset-0
+            // probe fires too (its shape is pinned by its own test) -
+            // this test is about the TAIL promote. Probe calls always
+            // lead with the (0, 1) span; a tail range never starts at 0.
+            // The tail is URGENT (the worker blocks on the footer read).
+            let mut got = calls.lock().unwrap().clone();
+            got.retain(|(_, _, sp, _)| sp.first() != Some(&(0, 1)));
             assert_eq!(
                 got,
-                vec![("inner.7z".to_string(), arch.len() as u64, vec![tail])],
+                vec![("inner.7z".to_string(), arch.len() as u64, vec![tail], true)],
                 "order {t}"
             );
             // The main.rs half of the wiring: the hook's (name, range)
@@ -14059,7 +16851,7 @@ mod tests {
         type Calls = Arc<Mutex<Vec<(String, u64, Vec<(u64, u64)>)>>>;
         let calls: Calls = Default::default();
         let sink = calls.clone();
-        ex.set_promote_hook(Arc::new(move |n: &str, s: u64, sp: &[(u64, u64)]| {
+        ex.set_promote_hook(Arc::new(move |n: &str, s: u64, sp: &[(u64, u64)], _u: bool| {
             sink.lock().unwrap().push((n.to_string(), s, sp.to_vec()));
         }));
         feed(&ex, 0, "v.rar", &outer, 7000, 44);
@@ -14067,7 +16859,11 @@ mod tests {
         assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
         assert_eq!(std::fs::read(dir.join("G.bin")).unwrap(), g);
         assert_eq!(dir_files(&dir), vec!["G.bin".to_string()]);
-        let got = calls.lock().unwrap().clone();
+        // Shuffled feed: offset-0 probes (root slot and held child slots
+        // alike) may fire; they always lead with the (0, 1) span, which
+        // no tail range does. This test pins the tail translation.
+        let mut got = calls.lock().unwrap().clone();
+        got.retain(|(_, _, sp)| sp.first() != Some(&(0, 1)));
         assert_eq!(
             got,
             vec![(
@@ -14343,17 +17139,19 @@ mod tests {
         type Calls = Arc<Mutex<Vec<(String, u64, Vec<(u64, u64)>)>>>;
         let calls: Calls = Default::default();
         let sink = calls.clone();
-        ex.set_promote_hook(Arc::new(move |n: &str, s: u64, sp: &[(u64, u64)]| {
+        ex.set_promote_hook(Arc::new(move |n: &str, s: u64, sp: &[(u64, u64)], _u: bool| {
             sink.lock().unwrap().push((n.to_string(), s, sp.to_vec()));
         }));
         feed(&ex, 0, "release.7z", &arch, 6000, 50);
         let rep = ex.finish().unwrap();
         assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
         assert_eq!(std::fs::read(dir.join("F.bin")).unwrap(), f);
-        assert_eq!(
-            calls.lock().unwrap().clone(),
-            vec![("release.7z".to_string(), arch.len() as u64, vec![tail])]
-        );
+        // Shuffled feed: the offset-0 probe may fire first (same slot
+        // name, spans always leading with (0, 1)); the subject here is
+        // the tail promote reaching the root hook.
+        let mut got = calls.lock().unwrap().clone();
+        got.retain(|(_, _, sp)| sp.first() != Some(&(0, 1)));
+        assert_eq!(got, vec![("release.7z".to_string(), arch.len() as u64, vec![tail])]);
         // The main.rs half: the hook's (name, range) resolves to this
         // slot's own bytes, identity - it IS the posted file.
         assert_eq!(
@@ -14472,6 +17270,631 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("F.bin")).unwrap(), f);
         assert_eq!(dir_files(&dir), vec!["F.bin".to_string()]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // -- one-pass zip (phase 2): the SAME chase, zip parser --
+
+    /// A posted store+deflate zip streams both entries out and the
+    /// container never touches disk. Three feed orders, including the
+    /// natural one where the central directory arrives dead last.
+    #[test]
+    fn zip_top_level_extracts_one_pass() {
+        let a = payload(180_000, 130);
+        let b = payload(60_000, 131);
+        let arch = crate::zip::fixtures::zip_of(&[
+            crate::zip::fixtures::Spec::stored("a.bin", &a),
+            crate::zip::fixtures::Spec::deflated("b.bin", &b),
+        ]);
+        let art = 7000usize;
+        let n_arts = arch.len().div_ceil(art);
+        let orders: Vec<Vec<usize>> = vec![
+            (0..n_arts).collect(),                               // tail last
+            (0..n_arts).rev().collect(),                         // tail first
+            (0..n_arts).map(|i| (i * 7 + 3) % n_arts).collect(), // scrambled
+        ];
+        for (t, order) in orders.iter().enumerate() {
+            let dir = tmpdir(&format!("zip-top-onepass{t}"));
+            let ex = Arc::new(Extractor::new(&dir, 1, true));
+            ex.anchor();
+            let mut seen = vec![false; n_arts];
+            for &i in order {
+                if std::mem::replace(&mut seen[i], true) {
+                    continue;
+                }
+                let s = i * art;
+                let e = (s + art).min(arch.len());
+                ex.write(0, "release.zip", arch.len() as u64, s as u64, &arch[s..e])
+                    .unwrap();
+            }
+            let rep = ex.finish().unwrap();
+            assert!(rep.fallbacks.is_empty(), "order {t}: {:?}", rep.fallbacks);
+            assert!(
+                rep.extracted
+                    .iter()
+                    .any(|(n, s)| n == "a.bin" && *s == a.len() as u64),
+                "order {t}: {:?}",
+                rep.extracted
+            );
+            assert_eq!(std::fs::read(dir.join("a.bin")).unwrap(), a, "order {t}");
+            assert_eq!(std::fs::read(dir.join("b.bin")).unwrap(), b, "order {t}");
+            // The point of the whole exercise: no materialized archive.
+            assert_eq!(
+                dir_files(&dir),
+                vec!["a.bin".to_string(), "b.bin".to_string()],
+                "order {t}"
+            );
+            assert_eq!(shape_of(&ex), ["zip", "one-pass"], "order {t}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// The root half of the zip tail-prefetch wiring: the posted `.zip`
+    /// reaches the installed hook by its own name with the directory
+    /// window, so the daemon front-loads the articles holding the EOCD
+    /// and central directory.
+    #[test]
+    fn zip_top_level_tail_promote_reaches_the_root_hook() {
+        let a = payload(200_000, 135);
+        let arch = crate::zip::fixtures::zip_of(&[crate::zip::fixtures::Spec::stored(
+            "a.bin", &a,
+        )]);
+        let len = arch.len() as u64;
+        let dir = tmpdir("zip-top-promote");
+        let ex = Arc::new(Extractor::new(&dir, 1, true));
+        type Calls = Arc<Mutex<Vec<(String, u64, Vec<(u64, u64)>)>>>;
+        let calls: Calls = Default::default();
+        let sink = calls.clone();
+        ex.set_promote_hook(Arc::new(move |n: &str, s: u64, sp: &[(u64, u64)], _u: bool| {
+            sink.lock().unwrap().push((n.to_string(), s, sp.to_vec()));
+        }));
+        feed(&ex, 0, "release.zip", &arch, 6000, 55);
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(std::fs::read(dir.join("a.bin")).unwrap(), a);
+        // A shuffled feed may raise the offset-0 probe first (lead span
+        // (0, 1) - pinned by its own test); the subject here is the
+        // directory-window promote.
+        let mut got = calls.lock().unwrap().clone();
+        got.retain(|(_, _, sp)| sp.first() != Some(&(0, 1)));
+        assert_eq!(
+            got.first(),
+            Some(&(
+                "release.zip".to_string(),
+                len,
+                vec![(len.saturating_sub(ZIP_TAIL_PREFETCH), len)]
+            ))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Entry names with directory components land FLAT (the established
+    /// one-pass semantic - 7z and RAR inners do the same), directory
+    /// entries produce nothing, and a zero-byte entry still lands as an
+    /// empty file (the disk path lands one, so the stream must too).
+    #[test]
+    fn zip_entries_land_flat_and_empty_files_land() {
+        let a = payload(50_000, 132);
+        let arch = crate::zip::fixtures::zip_of(&[
+            crate::zip::fixtures::Spec::stored("Pack/", b""),
+            crate::zip::fixtures::Spec::stored("Pack/a.bin", &a),
+            crate::zip::fixtures::Spec::stored("empty.txt", b""),
+        ]);
+        let dir = tmpdir("zip-top-flat");
+        let ex = Arc::new(Extractor::new(&dir, 1, true));
+        ex.anchor();
+        feed(&ex, 0, "release.zip", &arch, 7000, 56);
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(std::fs::read(dir.join("Pack_a.bin")).unwrap(), a);
+        assert_eq!(std::fs::read(dir.join("empty.txt")).unwrap(), b"");
+        assert_eq!(
+            dir_files(&dir),
+            vec!["Pack_a.bin".to_string(), "empty.txt".to_string()]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A method beyond store/deflate declines BEFORE anything streams:
+    /// the container materializes byte-exact under the zip marker (with
+    /// the method named in the reason), which is exactly the disk
+    /// A method the tree cannot decode declines BEFORE anything streams,
+    /// and the container lands byte-exact under the zip marker so the
+    /// disk pass owns the outcome. lzma (14) stands in for the class now
+    /// that bzip2 is decodable.
+    #[test]
+    fn zip_top_level_decline_materializes_under_the_zip_marker() {
+        let data = payload(40_000, 135);
+        let arch = crate::zip::fixtures::zip_of(&[crate::zip::fixtures::Spec {
+            method: 14,
+            ..crate::zip::fixtures::Spec::stored("a.bin", &data)
+        }]);
+        let dir = tmpdir("zip-top-decline");
+        let ex = Arc::new(Extractor::new(&dir, 1, true));
+        ex.anchor();
+        feed(&ex, 0, "release.zip", &arch, 7000, 57);
+        let rep = ex.finish().unwrap();
+        assert!(
+            rep.fallbacks
+                .iter()
+                .any(|(_, w)| w.starts_with(ZIP_DISK_FALLBACK_PREFIX) && w.contains("lzma")),
+            "{:?}",
+            rep.fallbacks
+        );
+        assert_eq!(std::fs::read(dir.join("release.zip")).unwrap(), arch);
+        assert_eq!(dir_files(&dir), vec!["release.zip".to_string()]);
+        assert_eq!(shape_of(&ex), ["zip", "on-disk"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A deflate-compressed 7z streams. 7z permits deflate and real
+    /// archives use it, but the codec was left off the feature list even
+    /// though flate2 - the decoder it needs - has always been a direct
+    /// dependency for zip, so it declined for nothing.
+    #[test]
+    fn sevenz_top_level_deflate_extracts_one_pass() {
+        let data: Vec<u8> = (0..150_000u32).map(|i| (i / 811 % 239) as u8).collect();
+        let arch = sevenz_archive(
+            &[("a.bin", &data)],
+            Some(vec![sevenz_rust2::EncoderConfiguration::new(
+                sevenz_rust2::EncoderMethod::DEFLATE,
+            )]),
+            false,
+        );
+        let dir = tmpdir("7z-deflate");
+        let ex = Arc::new(Extractor::new(&dir, 1, true));
+        ex.anchor();
+        feed(&ex, 0, "release.7z", &arch, 7000, 63);
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(std::fs::read(dir.join("a.bin")).unwrap(), data);
+        assert!(!dir.join("release.7z").exists(), "container materialized");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// bzip2 (method 12) streams like any other. It used to FAIL the job
+    /// outright - the chase declined it and the disk reader could not
+    /// open one either - so this is a dead shape brought to life, not
+    /// just a materialize avoided. Encrypted too, since the crypto layer
+    /// and the method decoder are independent and their combination is
+    /// where a wiring mistake would hide.
+    #[test]
+    fn zip_top_level_bzip2_extracts_one_pass() {
+        use crate::zip::fixtures::{Encrypt, Spec};
+        // Compressible on purpose: bzip2 on random bytes EXPANDS, and a
+        // stored-size disagreement is a different failure than the one
+        // under test.
+        let data: Vec<u8> = (0..180_000u32).map(|i| (i / 977 % 251) as u8).collect();
+        for (tag, enc) in [
+            ("plain", None),
+            ("zipcrypto", Some(Encrypt::ZipCrypto { password: "bz" })),
+            ("ae", Some(Encrypt::Ae { password: "bz", strength: 3, vendor_version: 2 })),
+        ] {
+            let arch = crate::zip::fixtures::zip_of(&[Spec {
+                encrypt: enc,
+                ..Spec::bzip2("a.bin", &data)
+            }]);
+            let dir = tmpdir(&format!("zip-bz-{tag}"));
+            let ex = Arc::new(Extractor::new(&dir, 1, true));
+            ex.anchor();
+            ex.set_password("bz");
+            feed(&ex, 0, "release.zip", &arch, 7000, 62);
+            let rep = ex.finish().unwrap();
+            assert!(rep.fallbacks.is_empty(), "{tag}: {:?}", rep.fallbacks);
+            assert_eq!(std::fs::read(dir.join("a.bin")).unwrap(), data, "{tag}");
+            assert!(!dir.join("release.zip").exists(), "{tag}: container materialized");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// Encrypted zip, IN STREAM. Both schemes and both AE vendor
+    /// versions, store and deflate: the container must never touch disk
+    /// and the payload must come out exact. AE-2 is the interesting one -
+    /// it zeroes the CRC field by spec, so its HMAC (verified when the
+    /// source drains, not when the decoder stops) is the only integrity
+    /// check there is.
+    #[test]
+    fn zip_top_level_encrypted_extracts_one_pass() {
+        use crate::zip::fixtures::{Encrypt, Spec};
+        let data = payload(140_003, 151);
+        let cases: Vec<(&str, Encrypt, bool)> = vec![
+            ("zipcrypto-store", Encrypt::ZipCrypto { password: "zpw" }, false),
+            ("zipcrypto-deflate", Encrypt::ZipCrypto { password: "zpw" }, true),
+            ("ae1-256", Encrypt::Ae { password: "zpw", strength: 3, vendor_version: 1 }, false),
+            ("ae2-256", Encrypt::Ae { password: "zpw", strength: 3, vendor_version: 2 }, false),
+            ("ae2-128-deflate", Encrypt::Ae { password: "zpw", strength: 1, vendor_version: 2 }, true),
+        ];
+        for (tag, enc, deflate) in cases {
+            let base = if deflate {
+                Spec::deflated("a.bin", &data)
+            } else {
+                Spec::stored("a.bin", &data)
+            };
+            let arch = crate::zip::fixtures::zip_of(&[Spec { encrypt: Some(enc), ..base }]);
+            let dir = tmpdir(&format!("zip-enc-{tag}"));
+            let ex = Arc::new(Extractor::new(&dir, 1, true));
+            ex.anchor();
+            ex.set_password("zpw");
+            feed(&ex, 0, "release.zip", &arch, 7000, 58);
+            let rep = ex.finish().unwrap();
+            assert!(rep.fallbacks.is_empty(), "{tag}: {:?}", rep.fallbacks);
+            assert_eq!(std::fs::read(dir.join("a.bin")).unwrap(), data, "{tag}");
+            assert!(!dir.join("release.zip").exists(), "{tag}: container materialized");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// No password at all still declines to the disk pass, which says
+    /// the same thing - streaming cannot invent a key either.
+    #[test]
+    fn zip_top_level_encrypted_without_a_password_declines() {
+        use crate::zip::fixtures::{Encrypt, Spec};
+        let data = payload(40_000, 136);
+        let arch = crate::zip::fixtures::zip_of(&[Spec {
+            encrypt: Some(Encrypt::ZipCrypto { password: "zpw" }),
+            ..Spec::stored("a.bin", &data)
+        }]);
+        let dir = tmpdir("zip-top-enc-nopw");
+        let ex = Arc::new(Extractor::new(&dir, 1, true));
+        ex.anchor();
+        feed(&ex, 0, "release.zip", &arch, 7000, 58);
+        let rep = ex.finish().unwrap();
+        assert!(
+            rep.fallbacks.iter().any(|(_, w)| {
+                w.starts_with(ZIP_DISK_FALLBACK_PREFIX) && w.contains("password-protected")
+            }),
+            "{:?}",
+            rep.fallbacks
+        );
+        assert_eq!(std::fs::read(dir.join("release.zip")).unwrap(), arch);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A WRONG password must demote with the container byte-exact, not
+    /// publish plausible-looking garbage. Both schemes: ZipCrypto's
+    /// one-byte check catches it 255/256 of the time and the CRC catches
+    /// the rest, AE's two-byte verifier then its HMAC.
+    #[test]
+    fn zip_top_level_encrypted_wrong_password_demotes() {
+        use crate::zip::fixtures::{Encrypt, Spec};
+        let data = payload(90_001, 152);
+        for (tag, enc) in [
+            ("zc", Encrypt::ZipCrypto { password: "rightpw" }),
+            ("ae", Encrypt::Ae { password: "rightpw", strength: 3, vendor_version: 2 }),
+        ] {
+            let arch = crate::zip::fixtures::zip_of(&[Spec {
+                encrypt: Some(enc),
+                ..Spec::stored("a.bin", &data)
+            }]);
+            let dir = tmpdir(&format!("zip-enc-wrong-{tag}"));
+            let ex = Arc::new(Extractor::new(&dir, 1, true));
+            ex.anchor();
+            ex.set_password("wrongpw");
+            feed(&ex, 0, "release.zip", &arch, 7000, 60);
+            let rep = ex.finish().unwrap();
+            assert!(
+                rep.fallbacks.iter().any(|(_, w)| w.starts_with(ZIP_DISK_FALLBACK_PREFIX)),
+                "{tag}: {:?}",
+                rep.fallbacks
+            );
+            assert_eq!(
+                std::fs::read(dir.join("release.zip")).unwrap(),
+                arch,
+                "{tag}: container must stay byte-exact for the disk pass"
+            );
+            assert!(!dir.join("a.bin").exists(), "{tag}: wrong-key garbage published");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// Tampered AE ciphertext with the RIGHT password: the HMAC is the
+    /// only thing that can catch this on an AE-2 entry (its CRC field is
+    /// zero by spec), and it must catch it before anything publishes.
+    #[test]
+    fn zip_top_level_ae_tampered_ciphertext_demotes() {
+        use crate::zip::fixtures::{Encrypt, Spec};
+        let data = payload(70_007, 153);
+        let arch = crate::zip::fixtures::zip_of(&[Spec {
+            encrypt: Some(Encrypt::Ae { password: "zpw", strength: 3, vendor_version: 2 }),
+            tamper: true,
+            ..Spec::stored("a.bin", &data)
+        }]);
+        let dir = tmpdir("zip-enc-tamper");
+        let ex = Arc::new(Extractor::new(&dir, 1, true));
+        ex.anchor();
+        ex.set_password("zpw");
+        feed(&ex, 0, "release.zip", &arch, 7000, 61);
+        let rep = ex.finish().unwrap();
+        assert!(
+            rep.fallbacks.iter().any(|(_, w)| w.starts_with(ZIP_DISK_FALLBACK_PREFIX)),
+            "{:?}",
+            rep.fallbacks
+        );
+        assert!(!dir.join("a.bin").exists(), "tampered bytes published");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Damaged-before-posting: a stored CRC that does not match the
+    /// bytes demotes rather than publishing them - the same "never
+    /// report success over damaged output" rule as everywhere else.
+    #[test]
+    fn zip_top_level_bad_crc_demotes() {
+        let data = payload(50_000, 137);
+        let arch = crate::zip::fixtures::zip_of(&[crate::zip::fixtures::Spec {
+            crc_override: Some(0xDEAD_BEEF),
+            ..crate::zip::fixtures::Spec::stored("a.bin", &data)
+        }]);
+        let dir = tmpdir("zip-top-crc");
+        let ex = Arc::new(Extractor::new(&dir, 1, true));
+        ex.anchor();
+        feed(&ex, 0, "release.zip", &arch, 7000, 59);
+        let rep = ex.finish().unwrap();
+        assert!(
+            rep.fallbacks
+                .iter()
+                .any(|(_, w)| w.starts_with(ZIP_DISK_FALLBACK_PREFIX)
+                    && w.contains("failed its stored CRC")),
+            "{:?}",
+            rep.fallbacks
+        );
+        assert_eq!(std::fs::read(dir.join("release.zip")).unwrap(), arch);
+        assert!(!dir.join("a.bin").exists(), "partial zip output survived");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Phase 0's naming rules hold at the streaming layer: a `.cbz` (a
+    /// zip container whose FILE is the deliverable) and a named non-zip
+    /// that happens to start with `PK` are never attached and never
+    /// badged - they land byte-exact, exactly as posted.
+    #[test]
+    fn zip_chase_never_takes_a_final_file_or_a_named_non_zip() {
+        let data = payload(40_000, 138);
+        let arch = crate::zip::fixtures::zip_of(&[crate::zip::fixtures::Spec::stored(
+            "page01.jpg",
+            &data,
+        )]);
+        for name in ["comic.cbz", "payload.bin"] {
+            let dir = tmpdir(&format!("zip-top-final-{}", name.replace('.', "_")));
+            let ex = Arc::new(Extractor::new(&dir, 1, true));
+            ex.anchor();
+            feed(&ex, 0, name, &arch, 7000, 60);
+            let rep = ex.finish().unwrap();
+            assert!(rep.fallbacks.is_empty(), "{name}: {:?}", rep.fallbacks);
+            assert_eq!(std::fs::read(dir.join(name)).unwrap(), arch, "{name}");
+            assert_eq!(dir_files(&dir), vec![name.to_string()], "{name}");
+            assert!(ex.archive_shape().is_none(), "{name} must not badge as packaging");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// The top-level gate: NZBFAST_NO_TOP_ZIP=1 parses as off, and the
+    /// runtime setter drives the same latch - with it off a posted .zip
+    /// materializes for the disk post-pass exactly as phase 1 left it.
+    /// The env PARSE is asserted on the pure helper for the same
+    /// parallel-runner reason as `nested_disabled_by_env`.
+    #[test]
+    fn top_level_zip_disabled_by_env() {
+        assert!(top_zip_env_off_value(Some("1")));
+        assert!(!top_zip_env_off_value(Some("0")));
+        assert!(!top_zip_env_off_value(None));
+
+        let data = payload(50_000, 139);
+        let arch = crate::zip::fixtures::zip_of(&[crate::zip::fixtures::Spec::stored(
+            "a.bin", &data,
+        )]);
+        let dir = tmpdir("zip-top-gate");
+        let ex = Arc::new(Extractor::new(&dir, 1, true));
+        ex.anchor();
+        assert!(ex.inner.lock().unwrap().top_zip_on, "gate must default on");
+        ex.set_top_level_zip(false);
+        feed(&ex, 0, "release.zip", &arch, 7000, 61);
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(std::fs::read(dir.join("release.zip")).unwrap(), arch);
+        assert_eq!(dir_files(&dir), vec!["release.zip".to_string()]);
+        assert_eq!(shape_of(&ex), ["zip", "on-disk"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // -- one-pass zip, byte-split `.zip.001` sets --
+
+    /// Cut a container the way a byte splitter does: every part the
+    /// split size, the last one the remainder.
+    fn split_zip(arch: &[u8], n: usize) -> Vec<Vec<u8>> {
+        let part = arch.len().div_ceil(n);
+        arch.chunks(part).map(|c| c.to_vec()).collect()
+    }
+
+    /// A DECLARED `.zip.001` split set streams as one container: no
+    /// part can size the set (the cut is arbitrary and only part 1 even
+    /// has a signature), so the caller's NZB-derived declaration says
+    /// when every part's decoded size is in and the geometry resolves.
+    /// Feed orders include parts arriving backwards - nothing
+    /// guarantees `.001` classifies first.
+    #[test]
+    fn zip_split_set_extracts_one_pass() {
+        let a = payload(400_000, 150);
+        let arch = crate::zip::fixtures::zip_of(&[crate::zip::fixtures::Spec::stored(
+            "a.bin", &a,
+        )]);
+        let parts = split_zip(&arch, 3);
+        assert_eq!(parts.len(), 3, "fixture must really split");
+        for (t, order) in [vec![0, 1, 2], vec![2, 1, 0], vec![1, 2, 0]].iter().enumerate() {
+            let dir = tmpdir(&format!("zip-split{t}"));
+            let ex = Arc::new(Extractor::new(&dir, 3, true));
+            ex.anchor();
+            ex.declare_zip_split("release.zip", 3);
+            for &p in order {
+                feed(
+                    &ex,
+                    p,
+                    &format!("release.zip.{:03}", p + 1),
+                    &parts[p],
+                    7000,
+                    62 + t as u64,
+                );
+            }
+            let rep = ex.finish().unwrap();
+            assert!(rep.fallbacks.is_empty(), "order {t}: {:?}", rep.fallbacks);
+            assert_eq!(std::fs::read(dir.join("a.bin")).unwrap(), a, "order {t}");
+            assert_eq!(dir_files(&dir), vec!["a.bin".to_string()], "order {t}");
+            assert_eq!(shape_of(&ex), ["zip", "one-pass"], "order {t}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// A declared part whose siblings never turn up: the set cannot
+    /// resolve, so the part materializes byte-exact under the zip
+    /// marker - exactly the disk post-pass's input.
+    #[test]
+    fn zip_split_part_without_its_siblings_materializes() {
+        let a = payload(200_000, 151);
+        let arch = crate::zip::fixtures::zip_of(&[crate::zip::fixtures::Spec::stored(
+            "a.bin", &a,
+        )]);
+        let parts = split_zip(&arch, 3);
+        let dir = tmpdir("zip-split-missing");
+        let ex = Arc::new(Extractor::new(&dir, 1, true));
+        ex.anchor();
+        ex.declare_zip_split("release.zip", 3);
+        feed(&ex, 0, "release.zip.001", &parts[0], 7000, 63);
+        let rep = ex.finish().unwrap();
+        assert!(
+            rep.fallbacks.iter().any(|(_, w)| w.starts_with(ZIP_DISK_FALLBACK_PREFIX)),
+            "{:?}",
+            rep.fallbacks
+        );
+        assert_eq!(std::fs::read(dir.join("release.zip.001")).unwrap(), parts[0]);
+        assert_eq!(dir_files(&dir), vec!["release.zip.001".to_string()]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// No declaration, no chase: parts of a set the caller did not (or
+    /// could not - a hole in the NZB itself) declare classify Plain and
+    /// land byte-exact, which is the phase-1 path verbatim.
+    #[test]
+    fn zip_split_undeclared_parts_never_chase() {
+        let a = payload(150_000, 152);
+        let arch = crate::zip::fixtures::zip_of(&[crate::zip::fixtures::Spec::stored(
+            "a.bin", &a,
+        )]);
+        let parts = split_zip(&arch, 2);
+        let dir = tmpdir("zip-split-undeclared");
+        let ex = Arc::new(Extractor::new(&dir, 2, true));
+        ex.anchor();
+        for (i, p) in parts.iter().enumerate() {
+            feed(&ex, i, &format!("release.zip.{:03}", i + 1), p, 7000, 64);
+        }
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(
+            dir_files(&dir),
+            vec!["release.zip.001".to_string(), "release.zip.002".to_string()]
+        );
+        assert_eq!(std::fs::read(dir.join("release.zip.001")).unwrap(), parts[0]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Parts that do not form a uniform split (a middle part smaller
+    /// than part 1) refuse the whole set rather than guess at the
+    /// mapping: every part materializes byte-exact for the disk pass.
+    #[test]
+    fn zip_split_uneven_parts_refuse_the_set() {
+        let a = payload(300_000, 153);
+        let arch = crate::zip::fixtures::zip_of(&[crate::zip::fixtures::Spec::stored(
+            "a.bin", &a,
+        )]);
+        // Deliberately non-uniform: 120k, 40k, rest.
+        let cuts = [&arch[..120_000], &arch[120_000..160_000], &arch[160_000..]];
+        let dir = tmpdir("zip-split-uneven");
+        let ex = Arc::new(Extractor::new(&dir, 3, true));
+        ex.anchor();
+        ex.declare_zip_split("release.zip", 3);
+        for (i, p) in cuts.iter().enumerate() {
+            feed(&ex, i, &format!("release.zip.{:03}", i + 1), p, 7000, 65);
+        }
+        let rep = ex.finish().unwrap();
+        assert!(
+            rep.fallbacks
+                .iter()
+                .any(|(_, w)| w.contains("zip split parts do not line up")),
+            "{:?}",
+            rep.fallbacks
+        );
+        for (i, p) in cuts.iter().enumerate() {
+            assert_eq!(
+                std::fs::read(dir.join(format!("release.zip.{:03}", i + 1))).unwrap(),
+                *p,
+                "part {} must land byte-exact",
+                i + 1
+            );
+        }
+        assert!(!dir.join("a.bin").exists(), "no payload from a refused set");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A declared set whose part 1 is not a zip (a RAR numeric volume
+    /// in a `.zip.001` costume): the set forfeits, part 1 classifies
+    /// Plain, and everything lands byte-exact as if nothing had been
+    /// declared.
+    #[test]
+    fn zip_split_part1_without_magic_forfeits_the_set() {
+        let junk1 = payload(60_000, 154); // no PK magic at offset 0
+        let junk2 = payload(60_000, 155);
+        let dir = tmpdir("zip-split-notzip");
+        let ex = Arc::new(Extractor::new(&dir, 2, true));
+        ex.anchor();
+        ex.declare_zip_split("release.zip", 2);
+        // Part 2 first: it joins the pending set on trust (a cut part
+        // has no signature to check). Part 1 then fails the magic.
+        feed(&ex, 1, "release.zip.002", &junk2, 7000, 66);
+        feed(&ex, 0, "release.zip.001", &junk1, 7000, 67);
+        let rep = ex.finish().unwrap();
+        assert!(
+            rep.fallbacks.iter().any(|(_, w)| w.contains("not a zip")),
+            "{:?}",
+            rep.fallbacks
+        );
+        assert_eq!(std::fs::read(dir.join("release.zip.001")).unwrap(), junk1);
+        assert_eq!(std::fs::read(dir.join("release.zip.002")).unwrap(), junk2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The strict part grammar: 3-4 digits after `.zip`/`.zipx`, so
+    /// `foo.zip.1` can never alias part 1 of `foo.zip.001`.
+    #[test]
+    fn zip_split_part_name_grammar() {
+        assert_eq!(
+            crate::zip::split_part_name("Release.ZIP.001"),
+            Some(("release.zip".to_string(), 1))
+        );
+        assert_eq!(
+            crate::zip::split_part_name("a.zipx.0042"),
+            Some(("a.zipx".to_string(), 42))
+        );
+        for n in ["a.zip.1", "a.zip.01", "a.zip.00001", "a.zip.000", "a.7z.001", "a.001"] {
+            assert!(crate::zip::split_part_name(n).is_none(), "{n}");
+        }
+    }
+
+    /// Eligible names, in one place: single containers and extensionless
+    /// (magic decides those); every multi-part, final-file and named
+    /// non-zip shape says no.
+    #[test]
+    fn zip_chase_name_eligibility() {
+        for n in ["Movie.ZIP", "movie.zipx", "a3f9c1d2e"] {
+            assert!(crate::zip::chase_eligible_name(n), "{n}");
+        }
+        for n in [
+            "comic.cbz",
+            "book.epub",
+            "payload.bin",
+            "movie.zip.001",
+            "movie.z01",
+            "movie.7z",
+            "movie.rar",
+        ] {
+            assert!(!crate::zip::chase_eligible_name(n), "{n}");
+        }
     }
 
     // -- TODO 37 step 3: `.7z.001` split sets --

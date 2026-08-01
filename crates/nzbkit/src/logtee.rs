@@ -7,6 +7,7 @@
 //! and the ring stays empty (the dashboard says so).
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 const CAP: usize = 2000;
@@ -42,6 +43,11 @@ fn log_cap_bytes() -> u64 {
 
 static RING: OnceLock<Arc<Mutex<VecDeque<String>>>> = OnceLock::new();
 
+/// Lines ever captured, counting the ones already evicted from the ring.
+/// Monotonic, so a caller can bracket a span of output (see [`mark`] and
+/// [`since`]) instead of guessing at a line count after the fact.
+static SEEN: AtomicU64 = AtomicU64::new(0);
+
 /// Last `n` captured lines, oldest first.
 pub fn tail(n: usize) -> Vec<String> {
     match RING.get() {
@@ -51,6 +57,40 @@ pub fn tail(n: usize) -> Vec<String> {
             g.iter().skip(g.len().saturating_sub(n)).cloned().collect()
         }
     }
+}
+
+/// A cursor into the captured output, to be paired with [`since`].
+///
+/// Taken BEFORE the work whose output a caller wants to keep. The ring is
+/// global stdout, so a plain `tail(n)` after the fact is a guess at both
+/// ends: too small a window truncates the block, too large a one drags in
+/// whatever the daemon's background lanes happened to print first.
+pub fn mark() -> u64 {
+    SEEN.load(Ordering::Relaxed)
+}
+
+/// Lines captured since `mark`, oldest first, at most `max` of them
+/// (keeping the LAST `max` - a failure block ends with its verdict).
+///
+/// Returns what survives: the ring holds only `CAP` lines, so a span that
+/// outran it comes back short rather than wrong.
+pub fn since(mark: u64, max: usize) -> Vec<String> {
+    let Some(r) = RING.get() else { return Vec::new() };
+    let g = r.lock().unwrap();
+    let want = span_len(mark, SEEN.load(Ordering::Relaxed), g.len(), max);
+    g.iter().skip(g.len() - want).cloned().collect()
+}
+
+/// How many of the ring's newest lines belong to the span `mark..seen`.
+///
+/// Split out because every term here can outrun another: a span longer
+/// than `CAP` has already lost its front, a caller's `max` may be
+/// smaller still, and a `mark` taken before a ring that has since been
+/// re-created (or simply a nonsense value) must not underflow into
+/// "everything". Clamped in that order, and never past what the ring
+/// actually holds - the result indexes it.
+fn span_len(mark: u64, seen: u64, held: usize, max: usize) -> usize {
+    seen.saturating_sub(mark).min(held as u64).min(max as u64) as usize
 }
 
 /// True when the tee is capturing on this platform.
@@ -174,6 +214,9 @@ pub fn install() {
                         g.pop_front();
                     }
                     g.push_back(line);
+                    // Bumped under the ring lock so `since` cannot read a
+                    // count that disagrees with the lines it can see.
+                    SEEN.fetch_add(1, Ordering::Relaxed);
                 }
             });
             // Every exit path drains, including the ones nobody writes:
@@ -227,7 +270,28 @@ pub fn drain() {
 
 #[cfg(test)]
 mod tests {
-    use super::ring_line;
+    use super::{ring_line, span_len, CAP};
+
+    /// The span a failed job snapshots has to survive every way its ends
+    /// can disagree - the ring is global, bounded, and older than any one
+    /// caller's mark.
+    #[test]
+    fn a_marked_span_never_outruns_the_ring() {
+        // The ordinary case: 40 lines printed since the mark, all held.
+        assert_eq!(span_len(100, 140, 500, 160), 40);
+        // Longer than the ring: only what survives comes back, not a
+        // count that would index past the front.
+        assert_eq!(span_len(0, 10_000, CAP, 160), 160);
+        assert_eq!(span_len(0, 10_000, CAP, 100_000), CAP);
+        // The caller's own ceiling wins when it is the smallest.
+        assert_eq!(span_len(100, 140, 500, 10), 10);
+        // A mark from the future (a re-created ring, a bogus value)
+        // saturates to zero instead of wrapping to "everything".
+        assert_eq!(span_len(500, 140, 500, 160), 0);
+        // Nothing printed since the mark: an empty snapshot, not the tail
+        // of somebody else's job.
+        assert_eq!(span_len(140, 140, 500, 160), 0);
+    }
 
     #[test]
     fn ring_line_survives_non_utf8_and_trims_newline() {

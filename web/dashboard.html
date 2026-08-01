@@ -257,6 +257,15 @@ body.nowatch #watchCard{display:none!important}
    natural displays are block and grid, and any rule that turns them back
    on has to pick one of those and gets the other wrong. */
 body:not(.noidx) .idxoff{display:none!important}
+/* Explanatory callout inside a settings form - for a field whose value
+   the user has to go and look up somewhere else. Same ink as .idxnote,
+   boxed so it reads as guidance rather than as another control. */
+.infobox{font-size:12.5px;line-height:1.6;color:var(--dim);
+  background:var(--surface);border:1px solid var(--line);border-radius:10px;
+  padding:11px 13px;margin:2px 0 10px}
+.infobox p{margin:7px 0 0}
+.infobox p:first-of-type{margin-top:4px}
+.infobox b{color:var(--fg);font-weight:600}
 .idxnote{font-size:12.5px;line-height:1.6;color:var(--dim);margin:2px 0 4px}
 .idxnote>div{margin:0 0 9px}
 .idxnote code{font-size:11.5px;word-break:break-all}
@@ -580,7 +589,19 @@ body.histcolor #hist tbody tr.fail .nmtxt{color:var(--bad)}
 #hist tr.warnrow .sdot{background:var(--warn)}
 .histdet{display:grid;grid-template-columns:auto 1fr;gap:5px 14px;font-size:12.5px}
 .histdet dt{color:var(--dim);font-size:10.5px;text-transform:uppercase;letter-spacing:.04em;padding-top:2px}
-.histdet dd{margin:0;word-break:break-all}
+/* min-width:0 because a grid item defaults to min-width:auto, so a <dd>
+   holding a wide, non-wrapping child (the failure log below) is sized by
+   its longest line and pushes the whole PAGE sideways instead of letting
+   the child scroll. */
+.histdet dd{margin:0;word-break:break-all;min-width:0}
+/* The captured console block of a failed attempt. Collapsed by default -
+   it is long, and it is for the moment you are actually debugging. Its
+   own scroller so a 160-line block cannot stretch the drawer, and
+   word-break reset because log lines are pre-formatted, not prose. */
+.faildet summary{cursor:pointer;color:var(--dim)}
+.faildet pre{margin:6px 0;max-width:100%;max-height:260px;overflow:auto;white-space:pre;word-break:normal;
+  font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--card2,rgba(127,127,127,.09));
+  border:1px solid var(--line);border-radius:6px;padding:8px}
 /* Drag the bottom edge to cap the card's height; past that it scrolls.
    Same idea as the chart grip, and the same reason it is a visible bar
    rather than a hit zone you have to know about. */
@@ -649,6 +670,14 @@ body.histcolor #hist tbody tr.fail .nmtxt{color:var(--bad)}
 #opennotice .k{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
   direction:ltr;unicode-bidi:isolate;user-select:all;padding:1px 6px;
   border-radius:6px;background:var(--surface-2)}
+/* Durability notice. Same strip, warm-toned, because it says the same
+   kind of thing as the open-API one: the daemon is fine right now and
+   will not be after a restart. It has to outlive a toast - the user is
+   about to walk over to Sonarr with a key that may not survive. */
+#durnotice{display:none;padding:8px 16px;border-bottom:1px solid var(--line);
+  font-size:12px;color:var(--fg);background:color-mix(in srgb,var(--warn) 13%,transparent)}
+#durnotice.on{display:block}
+#durnotice button{margin-inline-start:6px}
 /* Narrow: drop the measured columns rather than crushing the name. The
    detail panel still carries every number, so nothing is unreachable. */
 @media(max-width:900px){
@@ -832,6 +861,15 @@ input.txt.sm{max-width:120px}
   .selwrap{flex:1 1 auto;min-width:0}
   .selwrap select.ctl{flex:1 1 auto;min-width:0;width:100%}
   #pauseBtn{flex:0 0 auto}
+  /* Online/offline. The dot carries the state, the word confirms it:
+     colour alone is not a signal for a red-green colourblind user, and
+     this control decides whether downloads can run at all. */
+  #netBtn{flex:0 0 auto;display:inline-flex;align-items:center;gap:7px}
+  #netDot{width:8px;height:8px;border-radius:50%;flex:none;
+    background:var(--ok);box-shadow:0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent)}
+  body.offline #netDot{background:var(--bad);
+    box-shadow:0 0 0 3px color-mix(in srgb, var(--bad) 22%, transparent)}
+  body.offline #netBtn{border-color:color-mix(in srgb, var(--bad) 55%, var(--line))}
   .hero{flex-direction:column;align-items:stretch;gap:10px}
   .hero>div:first-child{width:auto}
   .hero .num{font-size:34px}
@@ -929,9 +967,18 @@ input.txt.sm{max-width:120px}
   <span class="pill live" id="statusPill" data-i18n="status.connecting">connecting</span>
   <button class="ghost" id="pauseBtn" onclick="togglePause()" data-i18n-title="hdr.pause.title" title="Pause - lets in-flight article downloads finish, then stops. Nothing is re-downloaded on resume." data-i18n="hdr.pause">Pause</button>
   <button class="ghost mini" id="pauseNowBtn" onclick="pauseNow()" style="display:none" data-i18n-title="hdr.pausenow.title" title="Pause now - stops instantly and frees the line; the few in-flight articles re-download on resume." data-i18n="hdr.pausenow">now</button>
+  <!-- Offline is not a louder Pause. Pause stops the QUEUE and leaves
+       indexing running, so the account stays occupied; offline hangs up
+       everything and touches no provider. Most usenet accounts allow
+       only one or two addresses at once, so "let me use this from my
+       laptop" needs the second one, and needs it without waiting out an
+       idle timeout. -->
+  <button class="ghost" id="netBtn" onclick="toggleOffline()" data-i18n-title="hdr.online.title" title="Online - connected to your providers. Click to go offline: hangs up every connection so you can use the account from another machine.">
+    <span class="dot" id="netDot"></span><span id="netTxt" data-i18n="hdr.online">Online</span></button>
 </header>
 <div id="keynotice"></div>
 <div id="opennotice"></div>
+<div id="durnotice"></div>
 
 <div id="dashview">
 
@@ -1039,7 +1086,9 @@ input.txt.sm{max-width:120px}
 </div>
 
 <div class="card" id="histCard">
-  <h3 data-i18n="hist.title">History <span class="dim" id="vhsum" style="text-transform:none;letter-spacing:0;font-weight:400"></span></h3>
+  <h3 data-i18n="hist.title">History <span class="dim" id="vhsum" style="text-transform:none;letter-spacing:0;font-weight:400"></span>
+    <button class="ghost" id="histClear" style="float:inline-end;margin-top:-4px;display:none"
+      onclick="clearHistDone(this)" data-i18n="hist.clear">Clear completed</button></h3>
   <div class="chartwrap" style="height:46px;margin-bottom:8px;display:none"><canvas id="vhChart" data-i18n-title="hist.vh.title" title="Bad PAR2 blocks per download, oldest → newest - a rising tail means articles are arriving damaged"></canvas></div>
   <div class="filterbar" id="histFilter"></div>
   <div class="cardscroll"><table id="hist"><thead><tr><th data-i18n="col.name">Name</th><th data-i18n="col.size">Size</th><th style="width:90px"></th></tr></thead><tbody></tbody></table>
@@ -1222,10 +1271,23 @@ input.txt.sm{max-width:120px}
       <input class="txt sm" type="number" min="0" id="sv_ret" value="0"></div>
     <div class="row"><label data-i18n="set.srv.block">Block size (GB)<span class="hint" data-i18n="set.srv.block.hint">prepaid block account: nzbfast tracks lifetime usage and stops using the server when the block is spent. 0 = flatrate. Pair with a tier ≥1 so the block only fills what primaries miss</span></label>
       <input class="txt sm" type="number" min="0" id="sv_block" value="0"></div>
-    <div class="row"><label data-i18n="set.srv.warm">Keep connections open<span class="hint" data-i18n="set.srv.warm.hint">reuse this server's connections between downloads instead of opening new ones. Whether it helps depends on your link, so it is off until you measure it: Measure runs a short paired test and tells you what it found. Leave it off for a provider that limits how many addresses you connect from</span></label>
+    <div class="row"><label data-i18n="set.srv.warm">Keep connections open<span class="hint" data-i18n="set.srv.warm.hint">reuse this server's connections between downloads instead of opening new ones, so the next one starts sooner. Whether it helps depends on your link, so it is off until you measure it: Measure runs a short paired test and tells you what it found</span></label>
       <span><input type="checkbox" id="sv_warm">
       <button class="ghost sm" onclick="benchWarm(this)" data-i18n="set.srv.warm.bench">Measure</button>
       <span class="hint" id="sv_warmres"></span></span></div>
+    <div class="row"><label data-i18n="set.srv.ips">Addresses allowed at once<span class="hint" data-i18n="set.srv.ips.hint">how many places may use this account at the same time, from your provider's plan. Not the same as connections above: that is how many sockets ONE machine opens, this is how many machines, sites or homes may connect at all. Leave blank if you do not know and nzbfast will use a safe guess</span></label>
+      <input class="txt sm" type="number" min="0" max="999" id="sv_maxips" data-i18n-placeholder="set.srv.ips.ph" placeholder="unknown"></div>
+    <div class="infobox" id="sv_ipsnote">
+      <b data-i18n="set.srv.ips.where.t">Where to find this</b>
+      <p data-i18n="set.srv.ips.where.b">Sign in to your provider's own website (the member area, control panel or "my account" page) and open the page for your plan or subscription. Look for wording like <i>IP addresses</i>, <i>locations</i>, <i>devices</i> or <i>simultaneous logins</i>. It is often printed next to the connection count and is a much smaller number: 1, 2 or 3 is common, and many providers set no limit at all. Your welcome email may say it too. If nothing mentions one, leave this blank.</p>
+      <p data-i18n="set.srv.ips.why.b"><b>Why it matters.</b> Holding a connection open makes the next download start faster, but it also keeps one of these address slots occupied while nothing is downloading. If you run nzbfast somewhere else too, or use this account from a laptop, a seedbox or another home, an idle machine can quietly lock the others out. With a limit of 1 or 2 that happens straight away. nzbfast uses this number to decide how soon to hang up when idle.</p>
+      <p data-i18n="set.srv.ips.wan.b"><b>More than one internet connection?</b> If this machine reaches the internet over several links (a router balancing two lines, or a multi-WAN setup), each connection can go out from a different address and use up several slots at once. Set a bind address on this server to pin it to one link.</p>
+    </div>
+    <div class="row"><label data-i18n="set.srv.idlerel">Hang up when idle after<span class="hint" data-i18n="set.srv.idlerel.hint">seconds with nothing downloading before nzbfast closes this server's connections, freeing the account for your other machines. The next download opens fresh ones, which costs a moment at the start. Blank = choose for me, based on the address limit above. 0 = never hang up, which is right when this machine is the only thing using the account</span></label>
+      <span><input class="txt sm" type="number" min="0" max="86400" id="sv_idlerel" data-i18n-placeholder="set.srv.auto" placeholder="auto">
+      <span class="hint" id="sv_idlereleff"></span></span></div>
+    <div class="row"><label data-i18n="set.srv.idlekeep">Connections to keep warm<span class="hint" data-i18n="set.srv.idlekeep.hint">how many connections survive that hang-up, so the next download still starts warm. Blank = choose for me. On a provider that limits ADDRESSES this makes no difference: this machine is one address whether it holds one connection or sixty, so keeping any at all leaves the account occupied and the sensible answer there is none</span></label>
+      <input class="txt sm" type="number" min="0" max="64" id="sv_idlekeep" data-i18n-placeholder="set.srv.auto" placeholder="auto"></div>
     <div style="display:flex;gap:8px;margin-top:8px">
       <button onclick="saveServer(this)" data-i18n="set.srv.save">Save server</button>
       <button class="ghost" onclick="testServer(this)" data-i18n="set.srv.testconn">Test connection</button>
@@ -1295,6 +1357,8 @@ input.txt.sm{max-width:120px}
     <input class="txt sm" type="number" min="1" max="128" id="s_decoders" onchange="setCfg('decoders',this.value)"></div>
   <div class="row" data-adv="1"><label data-i18n="set.perf.fastverify">Fast verify (CRC32)<span class="hint" data-i18n="set.perf.fastverify.hint">claim PAR2 blocks by CRC32 only while downloading: 2-3× faster on slow CPUs; every article's own CRC is still checked and final settle passes always use full MD5. Uncheck for per-block MD5 too</span></label>
     <input type="checkbox" id="s_fast_verify" onchange="setCfg('fast_verify',this.checked?1:0)"></div>
+  <div class="row"><label data-i18n="set.perf.fastpar">Fast PAR mode<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.perf.fastpar.hint">speeds up repair of badly damaged downloads. Turns itself off automatically if a repair does not verify</span></label>
+    <input type="checkbox" id="s_fast_par" onchange="setCfg('fast_par',this.checked?1:0)"></div>
   <div class="row" data-adv="1"><label data-i18n="set.perf.mem">Memory budget<span class="badge restart" data-i18n="badge.restart">applies after restart</span><span class="hint" data-i18n="set.perf.mem.hint">pipeline RAM cap, e.g. 8G; 0 = automatic (sized from this machine's RAM)</span></label>
     <input class="txt sm" id="s_mem_limit" onchange="setCfg('mem_limit',this.value)"></div>
 </div>
@@ -1330,6 +1394,8 @@ input.txt.sm{max-width:120px}
     <input type="checkbox" id="s_par_cleanup" onchange="setCfg('par_cleanup',this.checked?1:0)"></div>
   <div class="row"><label data-i18n="set.watchdir.cleanup">Cleanup after download<span class="hint" data-i18n="set.watchdir.cleanup.hint">file extensions deleted from a job's folder once it completes successfully, e.g. sfv, srr, url; empty = off. Recovery files have their own switch above</span></label>
     <input class="txt" id="s_cleanup_exts" placeholder="sfv, srr, url" onchange="setCfg('cleanup_exts',this.value)"></div>
+  <div class="row" data-adv="1"><label data-i18n="set.watchdir.extunrar">Unpack with external unrar<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.watchdir.extunrar.hint">use the unrar program installed on this machine instead of nzbfast's built-in extractor. An escape hatch for archives that fail to unpack: the built-in path is faster on every shape we have benchmarked, so leave this off unless one does. Hash-named obfuscated posts always use the built-in path, whose renaming unrar cannot follow. Needs unrar next to the nzbfast binary or on the system PATH</span></label>
+    <input type="checkbox" id="s_prefer_external_unrar" onchange="setCfg('prefer_external_unrar',this.checked?1:0)"></div>
   <div class="row"><label data-i18n="set.watchdir.faillink">When a download fails<span class="hint" data-i18n="set.watchdir.faillink.hint">some indexers attach a report link to every NZB they serve. Telling them a post is dead is how they learn to stop offering it, and they usually answer with another copy of the same title. Only works for NZBs fetched by URL (RSS, Add-by-URL, your indexer's "send to" button) - a file you dropped in yourself carries no link. Off by default: it tells a third party what failed for you</span></label>
     <select class="sel" id="s_failure_link" style="max-width:260px" onchange="setCfg('failure_link',this.value)">
       <option value="off" data-i18n="set.watchdir.faillink.off">do nothing</option>
@@ -2209,6 +2275,34 @@ function keyNotice(on){
 }
 function reenterKey(){ keyDeclined = false; keyNotice(false); ensureKey(key); }
 
+// ---- Durability notice -------------------------------------------------
+// `saved:false` from the daemon means the value is LIVE but settings.json
+// could not be written - a full disk, or a read-only settings folder. The
+// daemon says so on stdout, which on a NAS is nobody, and the page used to
+// answer with a flat "Saved." For a credential the cost is a key pasted
+// into Sonarr that stops working at the next restart, so this is a strip
+// rather than a toast: it has to still be on screen when they walk over to
+// their other apps. Cleared by the next write that does persist.
+// Which setting it is up for, so only a write of THAT setting takes it
+// down again: another setting saving fine says nothing about the key that
+// never reached the file, and clearing on any success would hide a warning
+// that is still true.
+let durFor = null;
+function durNotice(name, label){
+  const el = document.getElementById('durnotice');
+  if (!el) return;
+  durFor = name;
+  el.innerHTML = esc(t('dur.notice','“{n}” is in use now, but nzbfast could not write it to its settings file - the disk may be full, or the settings folder read-only. It goes back to the old value the next time nzbfast restarts.',{n:label||name}))
+    + ' <button class="ghost mini" onclick="durNoticeClear()">' + esc(t('dur.dismiss','Dismiss')) + '</button>';
+  el.classList.add('on');
+}
+function durNoticeSaved(name){ if (durFor === name) durNoticeClear(); }
+function durNoticeClear(){
+  const el = document.getElementById('durnotice');
+  if (!el || durFor === null) return;
+  durFor = null; el.classList.remove('on'); el.innerHTML = '';
+}
+
 // ---- Open-API notice ---------------------------------------------------
 // A daemon with no API key authorizes every request it receives, and the
 // listener is 0.0.0.0 by default. The daemon has always said so on stdout,
@@ -2283,6 +2377,9 @@ async function openApiFix(btn){ await busy(btn, t('busy.working','Working…'), 
     + ' <button class="ghost mini" onclick="openApiDone()">' + esc(t('open.dismiss','Done')) + '</button>';
   document.getElementById('openkey').textContent = j.apikey;
   el.classList.add('on');
+  // Its own strip, not this one: #opennotice is latched and holds the only
+  // copy of the key on screen, and the warning must not push it away.
+  if (j.saved === false) durNotice('apikey', t('set.sec.apikey','API key'));
   loadSettings();
 }); }
 async function openApiCopy(){
@@ -2362,6 +2459,33 @@ async function togglePause(){
   document.getElementById('pauseBtn').textContent = paused?t('hdr.resume','Resume'):t('hdr.pause','Pause');
   document.body.classList.toggle('paused', paused);
   await api(paused ? 'pause' : 'resume'); tick();
+}
+let offline=false;
+// Going offline hangs up every provider connection at once. It also
+// pauses, which is worth SAYING rather than letting the user discover:
+// without it the queue spends the outage starting jobs that cannot
+// connect and marking their articles missing, and they would come back
+// to a screen of red that explains nothing.
+async function toggleOffline(){
+  const going=!offline;
+  if(going && !confirm(t('hdr.offline.confirm',
+      'Go offline?\n\nEvery connection to your providers is closed, so you can use the account from another machine. Downloads pause and keep what they have already fetched - nothing is lost, and they carry on where they left off when you come back online.')))
+    return;
+  offline=going;
+  paintNet();
+  await api(going ? 'offline' : 'online');
+  tick();
+}
+// Single place that renders the state, so the optimistic flip above and
+// the poll below cannot disagree about it.
+function paintNet(){
+  const b=document.getElementById('netBtn'), x=document.getElementById('netTxt');
+  if(!b||!x) return;
+  document.body.classList.toggle('offline', offline);
+  x.textContent = offline?t('hdr.offline','Offline'):t('hdr.online','Online');
+  b.title = offline
+    ? t('hdr.offline.title','Offline - not connected to any provider, and your account is free for other machines. Click to come back online and resume.')
+    : t('hdr.online.title','Online - connected to your providers. Click to go offline: hangs up every connection so you can use the account from another machine.');
 }
 async function pauseNow(){
   // Immediate abort - free the line at once; in-flight articles re-download.
@@ -2490,14 +2614,43 @@ function applyUnitMode(bits){
 function setUnitMode(mode){ applyUnitMode(mode==='bits'); setCfg('unit_bits', mode==='bits'?1:0); }
 function fmtEta(sec){
   if(!isFinite(sec)||sec<=0) return '-';
-  if(sec<60) return Math.round(sec)+'s';
-  if(sec<3600) return Math.floor(sec/60)+'m '+Math.round(sec%60)+'s';
-  return Math.floor(sec/3600)+'h '+Math.round((sec%3600)/60)+'m';
+  // Round the TOTAL once, then split it. Rounding a remainder on its own
+  // prints the rollover it should have carried: 1319.7s came out "21m
+  // 60s", and the hour arm had the same "1h 60m" edge.
+  const s=Math.round(sec);
+  if(s<60) return s+'s';
+  if(s<3600) return Math.floor(s/60)+'m '+(s%60)+'s';
+  const m=Math.round(s/60);
+  return Math.floor(m/60)+'h '+(m%60)+'m';
 }
 function fmtBytes(n){
   if(n>=1e12) return num(n/1e12,2)+' '+unit('TB');
   if(n>=1e9) return num(n/1e9,1)+' '+unit('GB');
   return num(n/1e6,0)+' '+unit('MB');
+}
+// A job's own size, as opposed to fmtBytes' machine readouts (RAM, disk
+// free). Two deliberate differences from fmtBytes:
+//
+// - 1024, not 1000. This is the number someone checks against what their
+//   indexer said and against the same release in SABnzbd, and both of
+//   those are binary - the same measured convention API_MB pins the `mb`
+//   field to in serve.rs. Scaling it decimally would show a 42.2 GB
+//   release as 45.31 GB, which reads as nzbfast getting the size wrong.
+// - Two decimals at GB/TB, where fmtBytes' whole-MB rounding would turn
+//   a 700 MB file into "700 MB" and a 3.4 MB par2 into "3 MB".
+function fmtSize(n){ return isFinite(n) ? fmtMB(n/1048576) : '-'; }
+// Sizes reach the dashboard through the SAB-shaped API as an MB string
+// (MiB - see API_MB in serve.rs), and the queue used to print it
+// verbatim: a 1.8 GB job read "1727.39 MB". The field itself has to stay
+// MB for Sonarr/Radarr, so the scaling belongs here.
+function fmtMB(mb){
+  const v=typeof mb==='number'?mb:parseFloat(mb);
+  if(!isFinite(v)) return '-';
+  if(v>=1048576) return num(v/1048576,2)+' '+unit('TB');
+  if(v>=1024) return num(v/1024,2)+' '+unit('GB');
+  // Below 10 MB the second decimal is the difference between "0.35 MB"
+  // and a par2 volume that reads as "0 MB".
+  return num(v, v>=10?1:2)+' '+unit('MB');
 }
 
 // High-DPI canvas sizing.
@@ -2866,6 +3019,11 @@ async function tick(){
     const [qr,hr,st]=await Promise.all([api('queue'),api('history'),api('stats')]);
     const q=qr.queue;
     paused=q.paused;
+    // Server state wins. The daemon persists offline across restarts and
+    // a second browser tab can flip it, so the optimistic paint in
+    // toggleOffline is only ever a head start on this line.
+    offline=!!q.offline;
+    paintNet();
     const pill=document.getElementById('statusPill');
     const pmin=parseInt(q.pause_int)||0;
     // The queue's own `status` is the SABnzbd-compat field, and there a
@@ -2947,6 +3105,13 @@ async function tick(){
 
     // Whole-queue remaining + ETA in the tab title (useful when backgrounded).
     const totLeft=q.slots.reduce((a,s)=>a+(parseFloat(s.mbleft)||0),0);
+    // Bytes the current rate will actually work through. A paused item -
+    // and a duplicate held at Duplicate priority is paused - contributes
+    // size but never time, so counting it inflated the header ETA past
+    // the last row's own figure. renderQueue() already filters this way
+    // for the per-row ETAs; the two must not disagree.
+    const runLeft=q.slots.reduce((a,s)=>a+
+      (s.status==='Downloading'||s.status==='Queued'?(parseFloat(s.mbleft)||0):0),0);
     // Burn-down samples only while downloading; a drained queue resets it.
     burnLive = q.slots.some(s=>s.status==='Downloading');
     if(burnLive) push(burnHist, totLeft/1000);
@@ -2966,7 +3131,7 @@ async function tick(){
     } else setHtml('active',`<span class="dim" id="idlepick" style="cursor:pointer;text-decoration:underline dotted">${t('queue.idle.drop','idle: drop a .nzb anywhere, or click here to choose one')}</span>`);
 
     document.getElementById('qcount').textContent=q.slots.length
-      ?`${tn('queue.count',q.slots.length,'{n} item','{n} items')}${totLeft>0&&mbps>0?` · ${t('queue.timeleft','{t} left',{t:fmtEta(totLeft/mbps)})}`:''}`:'';
+      ?`${tn('queue.count',q.slots.length,'{n} item','{n} items')}${runLeft>0&&mbps>0?` · ${t('queue.timeleft','{t} left',{t:fmtEta(runLeft/mbps)})}`:''}`:'';
     lastQ=q; lastStats=st; lastMbps=mbps;
     // Per-job server contribution baseline: snapshot the cumulative
     // per-server byte counters when a job goes active; the drawer shows
@@ -3039,7 +3204,7 @@ function setHistFilter(v){ localStorage.histFilter=v; renderHistory(); }
 // badge reads in the user's own language. An unrecognized token (an older
 // queue.json, a newer daemon) still prints - just untranslated.
 const SHAPE_EN={
-  'rar5':'RAR5','rar4':'RAR4','7z':'7z',
+  'rar5':'RAR5','rar4':'RAR4','7z':'7z','zip':'zip',
   'store':'stored','compressed':'compressed','mixed':'mixed',
   'encrypted':'encrypted',
   'one-pass':'one-pass','unlock-at-end':'unlocked at the end',
@@ -3102,6 +3267,13 @@ function renderHistory(slots){
   setHtml('histFilter', HIST_BUCKETS.filter(([k])=>k==='all'||k===cur||count(k)>0)
     .map(([k])=>`<button class="ghost${k===cur?' on':''}" aria-pressed="${k===cur}"`
       +` onclick="setHistFilter('${k}')">${labels[k]} <span class="dim">${count(k)}</span></button>`).join(''));
+  // The header's one-click clear appears only when it has work to do -
+  // and counts exactly what the daemon's value=completed sweep will take,
+  // which is NOT the Completed chip's count: that chip includes the
+  // password-locked rows, and those stay (see clearHistDone).
+  const clearable=all.filter(s=>s.status==='Completed'&&!s.password_required).length;
+  const cb=document.getElementById('histClear');
+  if(cb) cb.style.display=clearable?'':'none';
   const shown=all.filter(histBucket(cur));
   // Collapsed shows HIST_ROWS; the ▤ button expands to the lot. Even
   // expanded keeps a ceiling: someone with 500 finished downloads does
@@ -3132,7 +3304,7 @@ function renderHistory(slots){
         ondblclick="openItem('${s.nzo_id}','file')" oncontextmenu="return histMenu(event,'${s.nzo_id}',${failed})"
         title="${escA(t('hist.row.title2','click: details · double-click: play · right-click: options'))}">
         <td><span class="nm"><span class="caret">▶</span><span class="sdot"></span><span class="nmtxt">${esc(s.name)}${identName(s)}${shapeBadge(s.archive_shape)}</span></span></td>
-        <td class="nowrap">${s.size}${st}</td>
+        <td class="nowrap">${s.bytes!=null?fmtSize(s.bytes):esc(s.size||'')}${st}</td>
         <td class="nowrap" style="text-align:end">${ctl}</td></tr>`;
     }).join('')
       ||`<tr><td colspan="3" class="dim">${all.length
@@ -3167,6 +3339,18 @@ function toggleHistRow(tr){
     esc(s.category||'*')
     +` <button class="ghost mini" onclick="event.stopPropagation();changeCat('${s.nzo_id}')">${esc(t('hist.cat.change','change…'))}</button>`]);
   if(s.fail_message) rows.push([t('hist.why','Reason'), esc(s.fail_message)]);
+  // The console block behind that one-line reason: the per-file segment
+  // tally, the per-server table, the first transport error. It used to
+  // live only in the daemon's memory-only log ring, so by the time
+  // anyone opened this drawer a restart had usually taken it. Escaped,
+  // never innerHTML'd raw - the lines carry filenames from the NZB.
+  if(s.fail_detail){
+    rows.push([t('hist.detail','Details'),
+      `<details class="faildet"><summary>${esc(t('hist.detail.show','log from this attempt'))}</summary>`
+      +`<pre>${esc(s.fail_detail)}</pre>`
+      +`<button class="ghost mini" onclick="event.stopPropagation();copyFailDetail(this)">${esc(t('hist.detail.copy','copy'))}</button>`
+      +`</details>`]);
+  }
   if(s.unpack_blocked_by&&!failed)
     rows.push([t('hist.why','Reason'),
       esc(t('hist.packed.title','{name} could not be unpacked - this format is not built in. The verified archive is in the output folder; unpack it with your own tool.',{name:s.unpack_blocked_by}))]);
@@ -3198,6 +3382,19 @@ function toggleHistRow(tr){
     rows.map(([k,v])=>`<dt>${esc(k)}</dt><dd>${v}</dd>`).join('')}</dl></td>`;
   tr.classList.add('open');
   tr.after(d);
+}
+
+// Put a failed attempt's log on the clipboard - this block is exactly
+// what a bug report wants, and selecting 160 lines out of a scroller by
+// hand is how people end up pasting four of them. Read back off the
+// <pre> rather than carried in an attribute: the text is somebody
+// else's filenames, and it is already safely escaped in the DOM.
+function copyFailDetail(btn){
+  const pre=btn.parentElement.querySelector('pre');
+  if(!pre) return;
+  navigator.clipboard.writeText(pre.textContent)
+    .then(()=>toast(t('toast.copied','Copied to clipboard')))
+    .catch(()=>toast(t('toast.copyfail','Could not copy'), true));
 }
 
 function lane(cls,label,done,total,note){
@@ -3527,13 +3724,13 @@ function renderQueue(){
       // Spotted in the NZB's file list at add time: this post is packed
       // in a format we have no unpacker for, so it will arrive complete
       // and still packed. Better said now than after the download.
-      (s.zip_packed?` <span class="warn" title="${escA(t('queue.zip.title','This post is zip-packed. Store and deflate zips are unpacked automatically; an encrypted one, or an unusual compression method, is left in the output folder for you to unpack.'))}">· ${t('queue.zip','zip-packed')}</span>`:'')+
-      (s.prefetching?` <span class="ok" title="${escA(t('queue.prefetch.title',"Servers the active download can't use are already fetching this job - it finishes here or hands its progress over via the journal"))}">· ${t('queue.prefetching','prefetching')}${s.prefetched_mb?' '+s.prefetched_mb+' '+unit('MB'):''}</span>`:'');
+      (s.zip_packed?` <span class="warn" title="${escA(t('queue.zip.title','This post is zip-packed. Store and deflate zips are unpacked automatically, an encrypted one too when the job has a password; an unusual compression method is left in the output folder for you to unpack.'))}">· ${t('queue.zip','zip-packed')}</span>`:'')+
+      (s.prefetching?` <span class="ok" title="${escA(t('queue.prefetch.title',"Servers the active download can't use are already fetching this job - it finishes here or hands its progress over via the journal"))}">· ${t('queue.prefetching','prefetching')}${s.prefetched_mb?' '+fmtMB(s.prefetched_mb):''}</span>`:'');
     const pzLabel=s.priority==='Duplicate'
       ? `<span class="dim" title="${escA(t('queue.dup.title','An equivalent release is already downloaded or queued: this copy is held, not stuck. Raise its priority to download it anyway.'))}">· ${t('queue.dup','held (duplicate)')}</span>`
       : `<span class="dim">· ${t('status.paused','paused')}</span>`;
-    return `<tr class="qrow${open?' open':''}" data-id="${s.nzo_id}" data-i="${i}" draggable="${dl?'false':'true'}"><td>${esc(s.filename||s.name)}${shapeBadge(s.archive_shape)}${pz?' '+pzLabel:''}${defer}</td><td class="nowrap">${s.mb} ${unit('MB')}</td>
-      <td class="nowrap dim">${s.mbleft} ${unit('MB')}</td><td class="nowrap mono" title="${escA(dl?t('queue.eta.active','time to finish this download'):t('queue.eta.queued','estimated finish, once the items ahead complete'))}">${pz?'-':fmtEta(eta)}</td>
+    return `<tr class="qrow${open?' open':''}" data-id="${s.nzo_id}" data-i="${i}" draggable="${dl?'false':'true'}"><td>${esc(s.filename||s.name)}${shapeBadge(s.archive_shape)}${pz?' '+pzLabel:''}${defer}</td><td class="nowrap">${fmtMB(s.mb)}</td>
+      <td class="nowrap dim">${fmtMB(s.mbleft)}</td><td class="nowrap mono" title="${escA(dl?t('queue.eta.active','time to finish this download'):t('queue.eta.queued','estimated finish, once the items ahead complete'))}">${pz?'-':fmtEta(eta)}</td>
       <td><div class="bar"><i style="width:${s.percentage}%"></i></div></td>
       <td class="nowrap" style="text-align:end">${ctl}</td></tr>`+
       (open?`<tr class="drawer"><td colspan="6">${drawerHtml(s)}</td></tr>`:'');
@@ -3889,7 +4086,7 @@ function drawerHtml(s){
   }
   const prios=[[2,'Force',t('prio.force','Force')],[1,'High',t('prio.high','High')],[0,'Normal',t('prio.normal','Normal')],[-1,'Low',t('prio.low','Low')]];
   return `<div class="dgrid">
-      <span class="dim">${t('drawer.size','size')}</span><span class="mono">${s.mb} ${unit('MB')}</span>
+      <span class="dim">${t('drawer.size','size')}</span><span class="mono">${fmtMB(s.mb)}</span>
       <span class="dim">${t('drawer.priority','priority')}</span><span><select class="ctl" onchange="setPrio('${s.nzo_id}',this.value)">${
         prios.map(([v,n,l])=>`<option value="${v}"${s.priority===n?' selected':''}>${l}</option>`).join('')}</select></span>
       <span class="dim">${t('drawer.category','category')}</span><span>${esc(s.cat==='*'?t('drawer.nocat','none'):s.cat)}</span>
@@ -3898,7 +4095,7 @@ function drawerHtml(s){
     </div>`+
     (s.deferred?`<div class="warn" style="font-size:12px;margin-top:7px">${t('drawer.deferred','Deferred as slow:')} ${esc(s.defer_reason||'')}<br>
       <span class="dim">${t('drawer.deferred.hint','Runs when nothing faster is queued; change its priority or drag it up to override.')}</span></div>`:'')+
-    (s.prefetching?`<div class="ok" style="font-size:12px;margin-top:7px">${t('drawer.prefetch','Prefetching on idle servers: {n} MB landed while the active download runs.',{n:s.prefetched_mb||'0'})}
+    (s.prefetching?`<div class="ok" style="font-size:12px;margin-top:7px">${t('drawer.prefetch2','Prefetching on idle servers: {s} landed while the active download runs.',{s:fmtMB(s.prefetched_mb||0)})}
       <span class="dim">${t('drawer.prefetch.hint',"If it can't finish there, the progress is kept and the normal download resumes from it.")}</span></div>`:'')+
     `<div class="dim" style="font-size:11.5px;margin-top:7px">${t('drawer.tiebreak','Queue order breaks ties within a priority: Force/High items download first regardless of position.')}</div>`;
 }
@@ -4003,7 +4200,10 @@ function wlKind(sel){
 let wlStatusById={}, wlSlotCounts=null;
 function renderWatchlist(list){
   setHtml('wlrows', list.map(watchRowHtml).join('')||
-    `<div class="dim">${t('watch.none','nothing watched yet: add a show or film below (even one that hasn’t aired); it’s grabbed automatically the moment a matching post lands in a scanned group.')}</div>`);
+    // "a scanned group" was the built-in indexer's framing, printed
+    // whether or not anything was scanning. Worded for both legs now:
+    // the card cannot know which one will find it first.
+    `<div class="dim">${t('watch.none','nothing watched yet: add a show or film below (even one that hasn’t aired); it’s grabbed automatically the moment a matching post turns up.')}</div>`);
   paintWatchStatus();
 }
 // What to call one grabbed slot in the status line: an episode reads as
@@ -4091,7 +4291,16 @@ async function loadWatchlist(){
     // Three states, not two: matching locally, matching only through
     // your indexer accounts (the built-in indexer is off, which is now
     // the default and NOT a warning), or nothing to match against.
-    setHtml('wlStatus', (s.groups||[]).length
+    //
+    // The groups list is NOT on its own the local state: index_groups
+    // survives the master switch being turned off (turning it back on
+    // must not lose the user's choice), so a card that keyed on the
+    // groups alone told someone with the indexer off that it "matches
+    // everything indexed from alt.binaries.moovee, ..." - newsgroups
+    // nothing is scanning. IDX_ON leads, and it is a page-load token
+    // rather than s.enabled on purpose: flipping the switch reloads
+    // (see setIndexEnabled), and every other card decides on the token.
+    setHtml('wlStatus', IDX_ON&&(s.groups||[]).length
       ?t('watch.status','matches everything indexed from <b>{groups}</b> (the watched newsgroups; edit them in ⚙ settings → Indexing) · min = floor · upgrade-to = ceiling',{groups:esc(s.groups.join(', '))})
       :!IDX_ON&&IDX_COUNT
       ?(c.watchlist_external
@@ -4121,7 +4330,7 @@ async function saveWatchlist(btn){ await busy(btn,t('busy.applying','Applying…
     return w;
   }).filter(w=>w.title);
   await setCfg('watchlist', rows.length?JSON.stringify(rows):'');
-  toast(t('toast.wlApplied','Watchlist applied. Checking the index now.'));
+  toast(t('toast.wlApplied','Watchlist applied. Checking now.'));
   setTimeout(refreshWatchStatus, 1500);
 }); }
 // Opt-in indexing (the "what should I index for you?" question the
@@ -4259,6 +4468,28 @@ async function delHist(id){
   await api('history',`&name=delete&value=${id}`);
   toast(t('toast.histRemoved','History entry removed.'));
   tick();
+}
+// One click to tidy the list once a batch has finished. Deliberately
+// NOT "clear history": what failed is what you retry from, and a
+// password-locked row carries the only 🔑 that unpacks its download, so
+// both stay and the button is only ever a housekeeping action. No
+// del_files either - same as the per-row ✕, the files stay on disk.
+//
+// The daemon picks the records (value=completed), not this list: history
+// is served unpaginated today, but a UI that posted the ids it happens
+// to be holding would quietly clear only the visible page the day that
+// changes - and would race any job finishing between paint and click.
+async function clearHistDone(btn){
+  if(!confirm(t('confirm.histclear','Clear the finished downloads out of this list?\nAnything that failed or is waiting for a password stays, and no files are deleted.'))) return;
+  await busy(btn, t('busy.clearing','Clearing…'), async()=>{
+    const j=await api('history','&name=delete&value=completed');
+    // Counted, not just acknowledged: "Cleared." over a list that still
+    // has rows in it (the failures, which is the whole point) reads as a
+    // button that did not work. Worded without a plural noun so one
+    // string covers 0, 1 and 20 in every locale.
+    toast(t('toast.histCleared','Cleared {n} from the list.',{n:num(j.removed||0,0)}));
+    tick();
+  });
 }
 async function delHistFiles(id){
   if(!confirm(t('confirm.delfiles','Remove this entry AND delete its downloaded files from disk?\nThis cannot be undone.'))) return;
@@ -4946,6 +5177,15 @@ async function runBench(btn){ await busy(btn,t('busy.running','Running…'), asy
   const rows=[[t('bench.network','Network'),'network',j.network_gbps],
               [t('bench.compute','Compute (verify)'),'compute',j.compute_gbps],
               [t('bench.disk','Disk write'),'disk',j.disk_gbps]];
+  // Issue #12: say what the network figure IS. It is a download from one
+  // Usenet provider over that provider's connections, not a line-speed
+  // test - and it was being read as one and compared against SABnzbd's,
+  // which pulls from a CDN over HTTP.
+  const netNote=j.network_host
+    ? `<div class="dim" style="font-size:12px;margin:-2px 0 6px">${
+        esc(t('bench.net.note','Network is a real Usenet download from {host} over {n} connections - not a line-speed test. Your ISP speed test measures a different thing.',
+              {host:j.network_host,n:j.network_conns}))}</div>`
+    : '';
   const mx=Math.max(...rows.map(r=>r[2]),0.01);
   o.innerHTML=`
     <div style="font-size:21px;font-weight:700;line-height:1.2">${g(j.expected_gbps)}
@@ -4960,6 +5200,7 @@ async function runBench(btn){ await busy(btn,t('busy.running','Running…'), asy
           ?' ⟵ '+t('bench.yourlimit','your limit')
           :' · ×'+num(v/(j.expected_gbps||1),(v/(j.expected_gbps||1))>=10?0:1)+' '+t('bench.headroom','headroom')}</span></div>`;
     }).join('')}</div>
+    ${netNote}
     <span class="dim">${esc(tErr(j.advice))}</span>`;
   tbl.style.display='none';
   loadBenchHist();
@@ -5845,7 +6086,15 @@ async function setCfg(name, value){
     ? await apiPost('config', {name, value})
     : await api('config',`&name=${encodeURIComponent(name)}&value=${encodeURIComponent(value)}`, auth);
   if(!j.status){ toast(`${name}: ${tErr(j.error)||t('err.rejected','rejected')}`, true); loadSettings(); return false; }
-  toast(j.live===false?t('toast.savedRestart','Saved: applies after restart.'):t('toast.saved','Saved.'));
+  // Strict === false: a daemon too old to report durability says nothing,
+  // and must keep the old behaviour rather than warn on every save.
+  if(j.saved === false){
+    durNotice(name, name);
+    toast(t('toast.savedNotDurable','“{n}” is live now, but it could not be written to disk - it reverts when nzbfast restarts.',{n:name}), true);
+  } else {
+    durNoticeSaved(name);
+    toast(j.live===false?t('toast.savedRestart','Saved: applies after restart.'):t('toast.saved','Saved.'));
+  }
   if(name!=='apikey'&&name!=='nzbkey') loadSettings();
   return true;
 }
@@ -5890,8 +6139,14 @@ async function newApiKey(){
   key=j.apikey; localStorage.nzbfastKey=j.apikey;
   const el=document.getElementById('s_apikey');
   el.value=j.apikey;
-  try{ await navigator.clipboard.writeText(j.apikey); toast(t('set.sec.apikey.newcopied','New API key created and copied. Paste it into Sonarr, Radarr or anything else that connects to nzbfast.')); }
-  catch(e){ toast(t('set.sec.apikey.new.ok','New API key created. Paste it into Sonarr, Radarr or anything else that connects to nzbfast.')); }
+  // The write failed, so this key is memory-only: say that instead of
+  // "paste it into Sonarr", which is exactly the advice that hurts here.
+  const lost = j.saved === false;
+  if(lost) durNotice('apikey', t('set.sec.apikey','API key')); else durNoticeSaved('apikey');
+  const ok = lost ? t('toast.savedNotDurable','“{n}” is live now, but it could not be written to disk - it reverts when nzbfast restarts.',{n:t('set.sec.apikey','API key')})
+                  : t('set.sec.apikey.new.ok','New API key created. Paste it into Sonarr, Radarr or anything else that connects to nzbfast.');
+  try{ await navigator.clipboard.writeText(j.apikey); toast(lost?ok:t('set.sec.apikey.newcopied','New API key created and copied. Paste it into Sonarr, Radarr or anything else that connects to nzbfast.'), lost); }
+  catch(e){ toast(ok, lost); }
   const b=document.getElementById('s_apikey_show');
   if(b){ b.dataset.shown='1'; setHtml(b, t('set.sec.apikey.hide','Hide')); }
   loadSettings();
@@ -5944,6 +6199,12 @@ async function loadSettings(){
   put('s_connections', c.connections); put('s_window', c.window); put('s_decoders', c.decoders);
   const fvp=document.getElementById('s_fast_verify');
   if(document.activeElement!==fvp) fvp.checked=c.fast_verify!==false&&c.fast_verify!==0;
+  // get_config always reports the live value, so no default is assumed
+  // here - the daemon's FAST_PAR_DEFAULT is the authority.
+  const fpp=document.getElementById('s_fast_par');
+  if(document.activeElement!==fpp) fpp.checked=c.fast_par===true||c.fast_par===1;
+  const peu=document.getElementById('s_prefer_external_unrar');
+  if(document.activeElement!==peu) peu.checked=c.prefer_external_unrar===true||c.prefer_external_unrar===1;
   put('s_mem_limit', sizeStr(c.mem_limit));
   put('s_out_dir', c.out_dir); put('s_move_completed', c.move_completed||''); put('s_categories', c.categories||''); put('s_move_completed_cats', c.move_completed_cats||''); put('s_min_free', sizeStr(c.min_free)); put('s_quota', sizeStr(c.quota));
   put('s_quota_period', c.quota_period||'d');
@@ -6513,8 +6774,33 @@ function editServer(i){
   put('sv_block',Math.round((s.block_bytes||0)/1e9));
   document.getElementById('sv_warm').checked=!!s.warm_pool;
   document.getElementById('sv_warmres').textContent='';
+  // All three are optional and blank means "derive it". Careful with
+  // ??: 0 is a REAL answer on two of them ("no limit", "never hang up"),
+  // so only null/undefined may become an empty box.
+  const opt=v=>v===null||v===undefined?'':String(v);
+  put('sv_maxips', opt(s.max_source_ips));
+  put('sv_idlerel', opt(s.idle_release_secs));
+  put('sv_idlekeep', opt(s.idle_keep));
+  showIdleEffective(s.idle_release_effective);
   document.getElementById('srvform').style.display='';
   document.getElementById('sv_host').focus();
+}
+// What the blank ("choose for me") fields currently resolve to. Shown
+// rather than pre-filled, so the boxes keep meaning "derive it" and a
+// later change of provider or address limit re-derives instead of
+// freezing today's answer into the config.
+function showIdleEffective(e){
+  const el=document.getElementById('sv_idlereleff');
+  if(!el) return;
+  if(!e){ el.textContent=''; return; }
+  if(e.secs===0){ el.textContent=t('set.srv.idlerel.off','never hangs up'); return; }
+  let s=t('set.srv.idlerel.eff','now: hangs up after {s}s, keeping {k}',{s:e.secs,k:e.keep});
+  // The one combination worth flagging: on an address-limited account,
+  // keeping any connection at all leaves the account occupied, so a
+  // non-zero floor quietly defeats the hang-up the user just asked for.
+  if(e.tight_ips&&e.keep>0)
+    s+=' · '+t('set.srv.idlerel.capwarn','this account limits addresses, so keeping any will not free it for your other machines');
+  el.textContent=s;
 }
 // Advanced: reveal the stored cleartext password so it can be copied to
 // another instance. The server list masks it; this is the explicit ask.
@@ -6534,8 +6820,20 @@ function srvFormData(){
     connections:+g('sv_conns')||8, level:+g('sv_level')||0,
     group:g('sv_group'), retention_days:+g('sv_ret')||0,
     block_bytes:(+g('sv_block')||0)*1e9,
-    warm_pool:document.getElementById('sv_warm').checked };
+    warm_pool:document.getElementById('sv_warm').checked,
+    // Send the empty box AS an empty string, which the daemon reads as
+    // "unset, derive it". NOT `||0` like the fields above: on these,
+    // zero is a deliberate answer ("no address limit", "never hang up")
+    // and is not what a blank box means, so coercing would turn "choose
+    // for me" into "hold connections open forever" the first time
+    // anyone opened this form.
+    max_source_ips:num(g('sv_maxips')),
+    idle_release_secs:num(g('sv_idlerel')),
+    idle_keep:num(g('sv_idlekeep')) };
 }
+// '' for a blank or non-numeric box (the daemon clears the key), the
+// number otherwise - including 0.
+function num(v){ return v===''||isNaN(+v) ? '' : Math.max(0,Math.floor(+v)); }
 async function saveServer(btn){ await busy(btn,t('busy.saving','Saving…'), async()=>{
   const j=await apiPost('server_save',{index:srvEditIdx, server:srvFormData()});
   if(!j.status){ toast(tErr(j.error)||t('err.rejected','rejected'), true); return; }

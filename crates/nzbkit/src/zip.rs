@@ -173,6 +173,49 @@ pub fn is_container(path: &Path) -> bool {
     sniffable && has_magic(path)
 }
 
+/// `<base>.zip.<NNN>` (or `.zipx`) - a byte-split zip container part,
+/// in the strict grammar the in-stream chase accepts. Returns the
+/// lowercased base and the 1-based part index.
+///
+/// Three or four digits only, mirroring `sevenz_part_name` exactly and
+/// for the same reason: accepting one and two digits lets `foo.zip.1`
+/// parse as part 1 of the same base as `foo.zip.001` - two files each
+/// claiming to be the container's first part. The disk-path collector's
+/// `split_part` stays looser on purpose (it reads what is already on
+/// disk; this decides what may stream).
+pub fn split_part_name(name: &str) -> Option<(String, u32)> {
+    let (head, tail) = name.rsplit_once('.')?;
+    if tail.len() < 3 || tail.len() > 4 || !tail.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let lower_head = head.to_ascii_lowercase();
+    if !(lower_head.ends_with(".zip") || lower_head.ends_with(".zipx")) {
+        return None;
+    }
+    let idx: u32 = tail.parse().ok()?;
+    (idx >= 1).then(|| (lower_head, idx))
+}
+
+/// May the in-stream chase consider this POSTED file a single zip
+/// container (subject to the magic check the caller performs)?
+///
+/// Carries phase 0's two standing rules into the streaming layer:
+/// a `.cbz`/`.epub`/office file is payload and never attaches, and a
+/// NAMED non-zip file (`payload.bin` that happens to start with `PK`)
+/// is never magic-sniffed - only an extensionless name earns the sniff.
+/// Multi-part shapes (`.z01`, `.zip.001`, bare `.001`) deliberately say
+/// no: v1 chases single containers only, and a lone part materializing
+/// is exactly what the disk path expects to find.
+pub fn chase_eligible_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if is_final_name(&lower) {
+        return false;
+    }
+    lower.ends_with(".zip")
+        || lower.ends_with(".zipx")
+        || Path::new(&lower).extension().is_none()
+}
+
 /// Name-only test, for deciding BEFORE anything is on disk whether a
 /// post is zip-packed (the NZB's file list at enqueue). Magic-only
 /// shapes - obfuscated containers, bare numeric parts - cannot be
@@ -306,6 +349,9 @@ pub enum ZipError {
     Unsupported(String),
     /// An entry's bytes did not match its stored CRC32.
     BadCrc { name: String },
+    /// An encrypted entry's password check refused the supplied
+    /// password (ZipCrypto check byte / AE verifier).
+    WrongPassword { name: String },
 }
 
 impl std::fmt::Display for ZipError {
@@ -316,6 +362,9 @@ impl std::fmt::Display for ZipError {
             ZipError::Unsupported(w) => write!(f, "{w}"),
             ZipError::BadCrc { name } => {
                 write!(f, "{name} failed its stored CRC - the archive is damaged")
+            }
+            ZipError::WrongPassword { name } => {
+                write!(f, "the password does not open {name}")
             }
         }
     }
@@ -330,10 +379,34 @@ impl From<std::io::Error> for ZipError {
 /// Compression methods this reader decodes. Everything else is declined
 /// BY NAME so the user learns which one they hit, instead of a blanket
 /// "not supported" (store + deflate is ~99% of real zips).
-const METHOD_STORE: u16 = 0;
-const METHOD_DEFLATE: u16 = 8;
+pub(crate) const METHOD_STORE: u16 = 0;
+pub(crate) const METHOD_DEFLATE: u16 = 8;
+/// bzip2 (method 12). Its decoder is already in the dependency tree for
+/// 7z, and a bzip2 zip used to FAIL the job outright - neither the
+/// streaming chase nor the disk reader could open one - so carrying it
+/// costs nothing and turns a dead shape into a working one.
+pub(crate) const METHOD_BZIP2: u16 = 12;
 
-fn method_name(m: u16) -> &'static str {
+/// Can the tree decode this method? One predicate, because the chase and
+/// the disk reader must agree: a method the chase declines but the disk
+/// pass accepts merely costs a materialize, but the reverse ships a job
+/// that streamed nothing and then failed.
+pub(crate) fn method_supported(m: u16) -> bool {
+    matches!(m, METHOD_STORE | METHOD_DEFLATE | METHOD_BZIP2)
+}
+
+/// The decoder for `m`, wrapping an already-decrypted byte source. Only
+/// ever called for a method [`method_supported`] accepted.
+pub(crate) fn decoder<'a, R: std::io::Read + 'a>(m: u16, src: R) -> Box<dyn std::io::Read + 'a> {
+    match m {
+        METHOD_STORE => Box::new(src),
+        METHOD_BZIP2 => Box::new(bzip2::read::BzDecoder::new(src)),
+        // Deflate by elimination - `method_supported` gates every caller.
+        _ => Box::new(flate2::read::DeflateDecoder::new(src)),
+    }
+}
+
+pub(crate) fn method_name(m: u16) -> &'static str {
     match m {
         0 => "store",
         1 => "shrink",
@@ -345,6 +418,7 @@ fn method_name(m: u16) -> &'static str {
         93 => "zstd",
         95 => "xz",
         98 => "ppmd",
+        99 => "AES",
         _ => "an unknown method",
     }
 }
@@ -372,11 +446,39 @@ pub struct Entry {
     pub is_dir: bool,
     /// General-purpose bit flags (bit 0 = encrypted).
     pub flags: u16,
+    /// DOS modification time - kept because it doubles as ZipCrypto's
+    /// password-check byte when bit 3 is set (the CRC was unknown when
+    /// the local header was written).
+    dos_time: u16,
+    /// WinZip AE parameters (method 99), from the 0x9901 extra field.
+    aes: Option<AesSpec>,
     /// Unix mode from the external attributes' high half, when the
     /// archive was written on a unix-ish host - `0xA000` marks a symlink.
     unix_mode: u16,
     /// Where this entry's LOCAL header starts, in logical byte-space.
     local_offset: u64,
+}
+
+/// WinZip AE (AES) parameters carried by the 0x9901 extra field of a
+/// method-99 entry.
+#[derive(Debug, Clone, Copy)]
+pub struct AesSpec {
+    /// 1 = AE-1 (CRC present and checked), 2 = AE-2 (CRC field is
+    /// zero BY SPEC; the HMAC is the integrity check).
+    pub vendor_version: u16,
+    /// 1 = AES-128, 2 = AES-192, 3 = AES-256.
+    pub strength: u8,
+    /// The REAL compression method of the plaintext (store/deflate/…).
+    pub method: u16,
+}
+
+impl AesSpec {
+    /// AE-2 zeroes the CRC field, so the post-decode CRC comparison
+    /// must be skipped for it - comparing against 0 would fail every
+    /// healthy entry.
+    pub fn skips_crc(self) -> bool {
+        self.vendor_version == 2
+    }
 }
 
 impl Entry {
@@ -387,11 +489,43 @@ impl Entry {
         self.flags & 0x0001 != 0
     }
 
+    /// Where this entry's LOCAL header starts, in logical byte-space.
+    /// The in-stream chase sorts entries by it (ascending = the order
+    /// the articles arrive in) and resolves the data offset through
+    /// [`entry_data_offset`].
+    pub(crate) fn local_offset(&self) -> u64 {
+        self.local_offset
+    }
+
     /// A symlink entry stores its TARGET as its payload; materializing
     /// one would plant a link pointing anywhere the archive likes, so
     /// they are refused outright (the plan's safety checklist).
     pub fn is_symlink(&self) -> bool {
         self.unix_mode & 0xF000 == 0xA000
+    }
+}
+
+/// A byte source the directory parser reads through. The disk path's
+/// [`Parts`] is one; the in-stream chase's blocking view (extract.rs) is
+/// the other - which is what lets ONE parser serve both, instead of the
+/// three hand-rolled detection copies this module exists to prevent.
+pub(crate) trait Source {
+    fn read_exact_at(&self, off: u64, buf: &mut [u8]) -> Result<(), ZipError>;
+    /// Total logical size of the container.
+    fn total(&self) -> u64;
+    /// Can this source resolve the per-disk offsets of a WinZip-spanned
+    /// set? Defaults to no: only a source holding the ordered parts (the
+    /// disk path) can; a single-file view declines the shape by name
+    /// instead of misreading its offsets.
+    fn spanning_supported(&self) -> bool {
+        false
+    }
+    /// Turn a central-directory (disk, offset) address into a logical
+    /// offset. See the [`Parts`] impl for the two multi-part shapes;
+    /// a single-file source never sees `multi_disk` (gated by
+    /// [`Self::spanning_supported`] before any address is resolved).
+    fn logical(&self, multi_disk: bool, _disk: u32, off: u64) -> Option<u64> {
+        (!multi_disk && off <= self.total()).then_some(off)
     }
 }
 
@@ -418,6 +552,43 @@ impl Parts {
         Ok(Parts { files, total: at })
     }
 
+    fn read_exact_at_impl(&self, off: u64, buf: &mut [u8]) -> Result<(), ZipError> {
+        if off.saturating_add(buf.len() as u64) > self.total {
+            return Err(ZipError::Malformed("read past end of container"));
+        }
+        let mut done = 0usize;
+        let mut pos = off;
+        while done < buf.len() {
+            let (f, start, len) = self
+                .files
+                .iter()
+                .find(|(_, s, l)| pos >= *s && pos < *s + *l)
+                .ok_or(ZipError::Malformed("gap in container parts"))?;
+            let within = pos - start;
+            let n = ((len - within) as usize).min(buf.len() - done);
+            crate::disk::read_exact_at(f, &mut buf[done..done + n], within)?;
+            done += n;
+            pos += n as u64;
+        }
+        Ok(())
+    }
+}
+
+impl Source for Parts {
+    fn read_exact_at(&self, off: u64, buf: &mut [u8]) -> Result<(), ZipError> {
+        self.read_exact_at_impl(off, buf)
+    }
+
+    fn total(&self) -> u64 {
+        self.total
+    }
+
+    fn spanning_supported(&self) -> bool {
+        // The parts of a spanned set are all on disk here, so the
+        // per-disk geometry below can answer.
+        true
+    }
+
     /// Turn a central-directory (disk, offset-within-disk) address into a
     /// logical offset.
     ///
@@ -438,27 +609,6 @@ impl Parts {
         }
         let (_, start, len) = self.files.get(disk as usize)?;
         (off <= *len).then_some(start + off)
-    }
-
-    fn read_exact_at(&self, off: u64, buf: &mut [u8]) -> Result<(), ZipError> {
-        if off.saturating_add(buf.len() as u64) > self.total {
-            return Err(ZipError::Malformed("read past end of container"));
-        }
-        let mut done = 0usize;
-        let mut pos = off;
-        while done < buf.len() {
-            let (f, start, len) = self
-                .files
-                .iter()
-                .find(|(_, s, l)| pos >= *s && pos < *s + *l)
-                .ok_or(ZipError::Malformed("gap in container parts"))?;
-            let within = pos - start;
-            let n = ((len - within) as usize).min(buf.len() - done);
-            crate::disk::read_exact_at(f, &mut buf[done..done + n], within)?;
-            done += n;
-            pos += n as u64;
-        }
-        Ok(())
     }
 }
 
@@ -484,8 +634,8 @@ impl Archive {
     /// set - exactly what [`Finding::parts`] holds).
     pub fn open(parts: &[PathBuf]) -> Result<Archive, ZipError> {
         let parts = Parts::open(parts)?;
-        let (cd_off, cd_entries, multi_disk) = find_central_directory(&parts)?;
-        let entries = parse_central_directory(&parts, cd_off, cd_entries, multi_disk)?;
+        let (cd_off, cd_entries, cd_size, multi_disk) = find_central_directory(&parts)?;
+        let entries = parse_central_directory(&parts, cd_off, cd_entries, cd_size, multi_disk)?;
         if entries.is_empty() {
             // A zero-entry archive is legal, but "unpacked successfully"
             // having produced nothing is the silent-success shape this
@@ -508,38 +658,65 @@ impl Archive {
     /// path enforces). A mismatch is an error, so the caller deletes the
     /// staged output instead of publishing it.
     pub fn read_entry_to(&self, e: &Entry, w: &mut dyn std::io::Write) -> Result<(), ZipError> {
+        self.read_entry_to_with(e, w, None)
+    }
+
+    /// [`Self::read_entry_to`] with a password (zip phase 3): ZipCrypto
+    /// and WinZip AE (AES) entries decrypt when it matches. Integrity
+    /// per scheme: ZipCrypto keeps the plaintext CRC32 check; AE
+    /// verifies the HMAC-SHA1 over the ciphertext, and AE-1 the CRC on
+    /// top, while AE-2 zeroes the CRC field BY SPEC and must skip that
+    /// comparison. A wrong password fails loudly (the check byte /
+    /// verifier first, the CRC or HMAC as the real gate) - ciphertext
+    /// is never published as output.
+    pub fn read_entry_to_with(
+        &self,
+        e: &Entry,
+        w: &mut dyn std::io::Write,
+        password: Option<&str>,
+    ) -> Result<(), ZipError> {
         use std::io::Read as _;
-        if e.is_encrypted() {
-            return Err(ZipError::Unsupported(format!(
-                "{} is password-protected and encrypted zip is not supported",
-                e.name
-            )));
+        // The REAL compression method: an AE entry stores 99 in the
+        // method field and the truth in its extra field.
+        let real_method = real_method(e);
+        if e.method == 99 && e.aes.is_none() {
+            return Err(ZipError::Malformed("AES entry without its AE extra field"));
         }
-        if e.method != METHOD_STORE && e.method != METHOD_DEFLATE {
+        if !method_supported(real_method) {
             return Err(ZipError::Unsupported(format!(
                 "{} uses {} compression, which is not built in",
                 e.name,
-                method_name(e.method)
+                method_name(real_method)
+            )));
+        }
+        if e.is_encrypted() && password.is_none() {
+            return Err(ZipError::Unsupported(format!(
+                "{} is password-protected and the job has no password",
+                e.name
             )));
         }
         let data = self.entry_data_offset(e)?;
-        let src = RangeReader {
-            parts: &self.parts,
-            pos: data,
-            end: data
-                .checked_add(e.compressed_size)
-                .ok_or(ZipError::Malformed("entry size overflows"))?,
-        };
+        let end = data
+            .checked_add(e.compressed_size)
+            .filter(|&v| v <= self.parts.total())
+            .ok_or(ZipError::Malformed("entry size overflows"))?;
+        // Build the (possibly decrypting) compressed-byte source.
+        // Crypto framing + password check, shared verbatim with the
+        // in-stream chase (see `entry_crypto`).
+        let crypto = entry_crypto(&self.parts, e, data, end, password)?;
+        let mut rd_src: Box<dyn std::io::Read + '_> =
+            Box::new(crypto.cipher.wrap(RangeReader {
+                parts: &self.parts,
+                pos: data + crypto.head,
+                end: end - crypto.tail,
+            }));
         let mut crc = crc32fast::Hasher::new();
         let mut written = 0u64;
         let mut buf = vec![0u8; 64 * 1024];
         // One code path for both methods: `store` is just the identity
         // decoder, so the CRC/size accounting below cannot drift between
         // them.
-        let mut rd: Box<dyn std::io::Read> = match e.method {
-            METHOD_STORE => Box::new(src),
-            _ => Box::new(flate2::read::DeflateDecoder::new(src)),
-        };
+        let mut rd = decoder(real_method, RdAdapter(&mut rd_src));
         loop {
             let n = rd.read(&mut buf)?;
             if n == 0 {
@@ -552,33 +729,51 @@ impl Archive {
             crc.update(&buf[..n]);
             w.write_all(&buf[..n])?;
         }
+        // A deflate decoder stops at its stream end, which for an AE
+        // entry can leave the HMAC verification (raised at the source's
+        // EOF) unreached - drain the source so authentication always
+        // runs before success is reported.
+        drop(rd);
+        loop {
+            let n = rd_src.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+        }
         if written != e.uncompressed_size {
             return Err(ZipError::Malformed("entry shorter than its declared size"));
         }
-        if crc.finalize() != e.crc32 {
+        // AE-2 zeroes the CRC field by spec - its HMAC is the check.
+        let check_crc = e.aes.map_or(true, |a| !a.skips_crc());
+        if check_crc && crc.finalize() != e.crc32 {
             return Err(ZipError::BadCrc { name: e.name.clone() });
         }
         Ok(())
     }
 
-    /// Where this entry's DATA begins: the local header tells us, and it
-    /// is the only thing we take from it. Its name and extra fields may
-    /// differ in LENGTH from the central directory's copy (writers pad
-    /// extra fields differently in the two places), so the lengths must
-    /// be read here rather than reused.
+    /// Where this entry's DATA begins - see [`entry_data_offset`].
     fn entry_data_offset(&self, e: &Entry) -> Result<u64, ZipError> {
-        let mut hdr = [0u8; 30];
-        self.parts.read_exact_at(e.local_offset, &mut hdr)?;
-        if &hdr[0..4] != b"PK\x03\x04" {
-            return Err(ZipError::Malformed("entry does not start with a local header"));
-        }
-        let name_len = rd_u16(&hdr[26..]) as u64;
-        let extra_len = rd_u16(&hdr[28..]) as u64;
-        e.local_offset
-            .checked_add(30 + name_len + extra_len)
-            .filter(|&o| o <= self.parts.total)
-            .ok_or(ZipError::Malformed("entry data starts past end of container"))
+        entry_data_offset(&self.parts, e)
     }
+}
+
+/// Where an entry's DATA begins: the local header tells us, and it is
+/// the only thing we take from it. Its name and extra fields may differ
+/// in LENGTH from the central directory's copy (writers pad extra
+/// fields differently in the two places), so the lengths must be read
+/// here rather than reused.
+pub(crate) fn entry_data_offset<S: Source + ?Sized>(parts: &S, e: &Entry) -> Result<u64, ZipError> {
+    let mut hdr = [0u8; 30];
+    parts.read_exact_at(e.local_offset, &mut hdr)?;
+    if &hdr[0..4] != b"PK\x03\x04" {
+        return Err(ZipError::Malformed("entry does not start with a local header"));
+    }
+    let name_len = rd_u16(&hdr[26..]) as u64;
+    let extra_len = rd_u16(&hdr[28..]) as u64;
+    e.local_offset
+        .checked_add(30 + name_len + extra_len)
+        .filter(|&o| o <= parts.total())
+        .ok_or(ZipError::Malformed("entry data starts past end of container"))
 }
 
 /// Reads a bounded logical range, so a decoder can never run past the
@@ -604,20 +799,245 @@ impl std::io::Read for RangeReader<'_> {
     }
 }
 
+/// ZipCrypto layer over an entry's data range (12-byte header already
+/// consumed and checked by the caller).
+pub(crate) struct ZipCryptoReader<R> {
+    src: R,
+    zc: crate::zipcrypt::ZipCrypto,
+}
+
+impl<R: std::io::Read> std::io::Read for ZipCryptoReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.src.read(buf)?;
+        self.zc.decrypt(&mut buf[..n]);
+        Ok(n)
+    }
+}
+
+/// WinZip AE layer over an entry's CIPHERTEXT range (salt/verifier
+/// before it, auth code after it - both handled by the caller). The
+/// HMAC accumulates over the ciphertext (encrypt-then-MAC) and is
+/// verified exactly once, at the source's end: a mismatch surfaces as
+/// a read error, so no caller can reach "success" past a bad tag.
+pub(crate) struct AeReader<R> {
+    src: R,
+    ctr: crate::zipcrypt::AeCtr,
+    mac: Option<crate::zipcrypt::AeMac>,
+    want: [u8; crate::zipcrypt::AE_AUTH_LEN],
+}
+
+impl<R: std::io::Read> std::io::Read for AeReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.src.read(buf)?;
+        if n == 0 {
+            if let Some(mac) = self.mac.take() {
+                if mac.finalize() != self.want {
+                    return Err(std::io::Error::other(
+                        "AES authentication failed (wrong password, or the archive is damaged)",
+                    ));
+                }
+            }
+            return Ok(0);
+        }
+        if let Some(mac) = self.mac.as_mut() {
+            mac.update(&buf[..n]);
+        }
+        self.ctr.xor(&mut buf[..n]);
+        Ok(n)
+    }
+}
+
+/// One encrypted entry's crypto layer, resolved and password-checked
+/// but not yet attached to a byte source.
+///
+/// This exists so the DISK reader and the in-stream chase share one
+/// implementation. They cannot share a range reader - the disk path
+/// reads through `Parts`, the chase blocks on arriving articles and
+/// tracks a low-water mark that drives its drop-behind trim - but the
+/// cipher, the framing arithmetic and the password check are identical,
+/// and those are the parts worth having exactly once.
+pub(crate) enum EntryCipher {
+    None,
+    ZipCrypto(crate::zipcrypt::ZipCrypto),
+    Ae {
+        ctr: crate::zipcrypt::AeCtr,
+        mac: crate::zipcrypt::AeMac,
+        want: [u8; crate::zipcrypt::AE_AUTH_LEN],
+    },
+}
+
+/// Where an entry's real payload sits inside its data range, and how to
+/// decrypt it. `head`/`tail` are the crypto framing bytes to skip at
+/// each end (salt + verifier, or the ZipCrypto header; and the AE
+/// authentication code), so the caller reads `[data + head, end - tail)`.
+pub(crate) struct EntryCrypto {
+    pub head: u64,
+    pub tail: u64,
+    pub cipher: EntryCipher,
+}
+
+impl EntryCipher {
+    /// Wrap a plaintext-or-ciphertext byte source in this layer.
+    pub(crate) fn wrap<R: std::io::Read>(self, src: R) -> CryptoReader<R> {
+        match self {
+            EntryCipher::None => CryptoReader::Plain(src),
+            EntryCipher::ZipCrypto(zc) => CryptoReader::Zc(ZipCryptoReader { src, zc }),
+            EntryCipher::Ae { ctr, mac, want } => {
+                CryptoReader::Ae(AeReader { src, ctr, mac: Some(mac), want })
+            }
+        }
+    }
+}
+
+/// The three decrypt layers as one concrete reader, so neither caller
+/// has to box (and so the AE authentication still fires at EOF through
+/// whatever decoder sits on top).
+pub(crate) enum CryptoReader<R> {
+    Plain(R),
+    Zc(ZipCryptoReader<R>),
+    Ae(AeReader<R>),
+}
+
+impl<R: std::io::Read> std::io::Read for CryptoReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            CryptoReader::Plain(r) => r.read(buf),
+            CryptoReader::Zc(r) => r.read(buf),
+            CryptoReader::Ae(r) => r.read(buf),
+        }
+    }
+}
+
+/// The compression method an entry REALLY uses: a WinZip AE entry stores
+/// 99 in the method field and the truth in its AE extra field.
+pub(crate) fn real_method(e: &Entry) -> u16 {
+    match &e.aes {
+        Some(a) => a.method,
+        None => e.method,
+    }
+}
+
+/// Does this entry's stored CRC32 vouch for anything? WinZip AE-2
+/// zeroes the field BY SPEC and relies on its HMAC instead, so comparing
+/// against it would fail every AE-2 entry; AE-1 and ZipCrypto keep the
+/// real CRC.
+pub(crate) fn crc_is_authoritative(e: &Entry) -> bool {
+    e.aes.map_or(true, |a| !a.skips_crc())
+}
+
+/// Resolve an entry's crypto framing and VERIFY the password, reading
+/// the salt/verifier (AE) or the 12-byte header (ZipCrypto) and the
+/// trailing authentication code through `src`.
+///
+/// The pre-checks here are cheap and wrong-password-shaped; neither is
+/// the real gate. ZipCrypto's check byte is ONE byte, so a wrong
+/// password survives it 1 time in 256, and AE's verifier is two. What
+/// actually vouches for the output is the CRC32 (ZipCrypto, AE-1) or the
+/// HMAC-SHA1 (AE), both raised before any caller can report success.
+pub(crate) fn entry_crypto<S: Source>(
+    src: &S,
+    e: &Entry,
+    data: u64,
+    end: u64,
+    password: Option<&str>,
+) -> Result<EntryCrypto, ZipError> {
+    if !e.is_encrypted() {
+        return Ok(EntryCrypto { head: 0, tail: 0, cipher: EntryCipher::None });
+    }
+    let Some(pw) = password else {
+        return Err(ZipError::Unsupported(format!(
+            "{} is password-protected and the job has no password",
+            e.name
+        )));
+    };
+    match &e.aes {
+        Some(spec) => {
+            let (key_len, salt_len) = crate::zipcrypt::ae_strength_lens(spec.strength)
+                .ok_or_else(|| {
+                    ZipError::Unsupported(format!(
+                        "{} uses an unknown AES strength ({})",
+                        e.name, spec.strength
+                    ))
+                })?;
+            let head = (salt_len + crate::zipcrypt::AE_VERIFY_LEN) as u64;
+            let overhead = head + crate::zipcrypt::AE_AUTH_LEN as u64;
+            if e.compressed_size < overhead {
+                return Err(ZipError::Malformed("AES entry too short for its framing"));
+            }
+            let mut hd = vec![0u8; head as usize];
+            src.read_exact_at(data, &mut hd)?;
+            let keys = crate::zipcrypt::ae_derive(pw.as_bytes(), &hd[..salt_len], key_len);
+            if hd[salt_len..] != keys.verify {
+                return Err(ZipError::WrongPassword { name: e.name.clone() });
+            }
+            let mut want = [0u8; crate::zipcrypt::AE_AUTH_LEN];
+            src.read_exact_at(end - crate::zipcrypt::AE_AUTH_LEN as u64, &mut want)?;
+            let ctr = crate::zipcrypt::AeCtr::new(&keys.enc_key)
+                .ok_or(ZipError::Malformed("AES key size"))?;
+            Ok(EntryCrypto {
+                head,
+                tail: crate::zipcrypt::AE_AUTH_LEN as u64,
+                cipher: EntryCipher::Ae {
+                    ctr,
+                    mac: crate::zipcrypt::AeMac::new(&keys.mac_key),
+                    want,
+                },
+            })
+        }
+        None => {
+            if e.compressed_size < 12 {
+                return Err(ZipError::Malformed("ZipCrypto entry too short for its header"));
+            }
+            let mut hdr = [0u8; 12];
+            src.read_exact_at(data, &mut hdr)?;
+            let mut zc = crate::zipcrypt::ZipCrypto::new(pw.as_bytes());
+            zc.decrypt(&mut hdr);
+            if hdr[11] != crate::zipcrypt::zipcrypto_check_byte(e.flags, e.crc32, e.dos_time) {
+                return Err(ZipError::WrongPassword { name: e.name.clone() });
+            }
+            Ok(EntryCrypto { head: 12, tail: 0, cipher: EntryCipher::ZipCrypto(zc) })
+        }
+    }
+}
+
+/// A `Read` view over a boxed reader the caller keeps ownership of, so
+/// the decode loop can hand the SAME source to either a deflate decoder
+/// or the store identity path and still drain it afterwards (the AE
+/// authentication fires at the source's EOF).
+struct RdAdapter<'a, 'b>(&'a mut Box<dyn std::io::Read + 'b>);
+
+impl std::io::Read for RdAdapter<'_, '_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
 /// Locate the end-of-central-directory record and return
-/// (central directory logical offset, entry count).
+/// (central directory logical offset, entry count, directory size).
 ///
 /// The EOCD sits at the very end, except for a trailing comment of up to
 /// 64 KiB - so it is found by scanning backwards over that window. The
 /// LAST match wins: a stored entry can contain the signature, and on a
 /// self-extracting or concatenated container so can earlier junk.
-fn find_central_directory(parts: &Parts) -> Result<(u64, u64, bool), ZipError> {
+///
+/// A comment is attacker-chosen bytes, so the LAST match can also be a
+/// forged record planted there, naming a shorter directory than the
+/// archive really holds. Every entry it does name still passes its CRC,
+/// so the omission would be completely silent - the shape this codebase
+/// refuses everywhere else, and one unzip, 7-Zip and bsdtar all reject.
+/// The defence is the record's own geometry: the directory it describes
+/// must end exactly where that record begins, and the record must agree
+/// with itself about how many entries there are.
+pub(crate) fn find_central_directory<S: Source + ?Sized>(
+    parts: &S,
+) -> Result<(u64, u64, u64, bool), ZipError> {
     const EOCD_MIN: u64 = 22;
-    if parts.total < EOCD_MIN {
+    let total = parts.total();
+    if total < EOCD_MIN {
         return Err(ZipError::Malformed("too small to be a zip"));
     }
-    let window = (EOCD_MIN + u16::MAX as u64).min(parts.total);
-    let start = parts.total - window;
+    let window = (EOCD_MIN + u16::MAX as u64).min(total);
+    let start = total - window;
     let mut buf = vec![0u8; window as usize];
     parts.read_exact_at(start, &mut buf)?;
     let pos = (0..=(buf.len() - EOCD_MIN as usize))
@@ -631,15 +1051,33 @@ fn find_central_directory(parts: &Parts) -> Result<(u64, u64, bool), ZipError> {
     // a genuinely spanned set (per-disk offsets) or a single-disk archive
     // that merely arrived as several files (logical offsets).
     let multi_disk = disk != 0 || cd_disk != 0;
+    if multi_disk && !parts.spanning_supported() {
+        // A single-file view of a spanned set (its trailing `.zip`
+        // segment read alone): every offset below is per-disk and would
+        // be misread as logical. Name the shape instead.
+        return Err(ZipError::Unsupported(
+            "a WinZip-spanned zip set is unpacked from disk".to_string(),
+        ));
+    }
+    let mut per_disk = rd_u16(&eocd[8..]) as u64;
     let mut entries = rd_u16(&eocd[10..]) as u64;
+    let mut cd_size = rd_u32(&eocd[12..]) as u64;
     let mut cd_off = rd_u32(&eocd[16..]) as u64;
     let mut cd_disk_no = cd_disk;
 
     // Zip64: any saturated field means the real ones live in the Zip64
     // record, found through a locator 20 bytes ahead of the EOCD. Never
-    // trust the 32-bit copies once that record exists.
+    // trust the 32-bit copies once that record exists - `cd_size` and
+    // the per-disk count included, since the checks below now read them
+    // and a saturated copy would fail every genuinely large archive.
     let eocd_at = start + pos as u64;
-    if entries == u16::MAX as u64 || cd_off == u32::MAX as u64 || disk == u16::MAX as u32 {
+    let mut anchor = eocd_at;
+    if entries == u16::MAX as u64
+        || per_disk == u16::MAX as u64
+        || cd_size == u32::MAX as u64
+        || cd_off == u32::MAX as u64
+        || disk == u16::MAX as u32
+    {
         if eocd_at < 20 {
             return Err(ZipError::Malformed("zip64 locator does not fit"));
         }
@@ -658,26 +1096,56 @@ fn find_central_directory(parts: &Parts) -> Result<(u64, u64, bool), ZipError> {
         if &z64[0..4] != b"PK\x06\x06" {
             return Err(ZipError::Malformed("zip64 end record not where the locator says"));
         }
+        per_disk = rd_u64(&z64[24..]);
         entries = rd_u64(&z64[32..]);
+        cd_size = rd_u64(&z64[40..]);
         cd_off = rd_u64(&z64[48..]);
         cd_disk_no = rd_u32(&z64[20..]);
+        // The zip64 record is what now describes the directory, so it,
+        // not the 22-byte EOCD, is what the directory must end at: the
+        // locator and the EOCD follow it.
+        anchor = z64_at;
     }
     if entries > MAX_ENTRIES {
         return Err(ZipError::Unsupported(format!(
             "the archive declares {entries} entries, more than this build will open"
         )));
     }
+    // Both checks are single-disk only. On a genuinely spanned set the
+    // directory legally lives on another disk than the record that
+    // describes it, and the per-disk count is legitimately a subset of
+    // the total - and there is no spanned-read test in the tree to catch
+    // a wrong guess, so do not guess.
+    if !multi_disk {
+        if cd_off.checked_add(cd_size) != Some(anchor) {
+            return Err(ZipError::Malformed(
+                "the central directory does not end at the end-of-central-directory record",
+            ));
+        }
+        if per_disk != entries {
+            return Err(ZipError::Malformed(
+                "the end-of-central-directory record disagrees with itself about the entry count",
+            ));
+        }
+    }
     let cd = parts
         .logical(multi_disk, cd_disk_no, cd_off)
         .ok_or(ZipError::Malformed("central directory outside the container"))?;
-    Ok((cd, entries, multi_disk))
+    Ok((cd, entries, cd_size, multi_disk))
 }
 
 /// Walk the central directory into [`Entry`] records.
-fn parse_central_directory(
-    parts: &Parts,
+///
+/// `count` and `cd_size` are two independent statements about the same
+/// directory, so the walk must land on exactly `cd_size` bytes or the
+/// record is describing a different directory than the one that is
+/// there - the other half of the forged-record defence above, and the
+/// check CPython's `zipfile` makes.
+pub(crate) fn parse_central_directory<S: Source + ?Sized>(
+    parts: &S,
     cd_off: u64,
     count: u64,
+    cd_size: u64,
     multi_disk: bool,
 ) -> Result<Vec<Entry>, ZipError> {
     let mut out = Vec::with_capacity(count.min(4096) as usize);
@@ -690,6 +1158,7 @@ fn parse_central_directory(
         }
         let flags = rd_u16(&hdr[8..]);
         let method = rd_u16(&hdr[10..]);
+        let dos_time = rd_u16(&hdr[12..]);
         let crc32 = rd_u32(&hdr[16..]);
         let mut csize = rd_u32(&hdr[20..]) as u64;
         let mut usize_ = rd_u32(&hdr[24..]) as u64;
@@ -708,8 +1177,10 @@ fn parse_central_directory(
 
         // Zip64 extra field (0x0001): present exactly when one of the
         // 32-bit fields above is saturated, and holds only the saturated
-        // ones, in this fixed order.
+        // ones, in this fixed order. The same walk picks up the WinZip
+        // AE field (0x9901) of a method-99 entry.
         let extra = &rest[name_len..name_len + extra_len];
+        let mut aes: Option<AesSpec> = None;
         let mut i = 0usize;
         while i + 4 <= extra.len() {
             let tag = rd_u16(&extra[i..]);
@@ -717,6 +1188,20 @@ fn parse_central_directory(
             let body_at = i + 4;
             if body_at + len > extra.len() {
                 break;
+            }
+            if tag == 0x9901 && len >= 7 {
+                let body = &extra[body_at..body_at + len];
+                // vendor version u16, vendor id "AE", strength u8,
+                // real method u16.
+                if &body[2..4] == b"AE" {
+                    aes = Some(AesSpec {
+                        vendor_version: rd_u16(&body[0..]),
+                        strength: body[4],
+                        method: rd_u16(&body[5..]),
+                    });
+                }
+                i = body_at + len;
+                continue;
             }
             if tag == 0x0001 {
                 let body = &extra[body_at..body_at + len];
@@ -743,13 +1228,25 @@ fn parse_central_directory(
                 if disk == u16::MAX as u32 && p + 4 <= body.len() {
                     disk = rd_u32(&body[p..]);
                 }
-                break;
+                // No break: the AE field (0x9901) may follow zip64, and
+                // stopping here would silently miss it.
             }
             i = body_at + len;
         }
 
+        // The DOS directory attribute is believed only when the entry
+        // also CLAIMS to be empty, which every real directory entry does.
+        // The bit is unauthenticated central-directory data: an entry
+        // describing 8 GiB of deflate with a CRC while carrying 0x10 is
+        // not a directory, and honouring the bit made the disk extractor
+        // create an empty directory of that name, skip the payload
+        // entirely, and still report the job Completed - the one field in
+        // this record whose corruption was SILENT, where a bad CRC, size
+        // or offset all fail loudly. Every mainstream writer emits the
+        // trailing slash, so the term costs nothing on real archives.
         let dos_dir = external & 0x10 != 0;
-        let is_dir = name.ends_with('/') || name.ends_with('\\') || dos_dir;
+        let is_dir =
+            name.ends_with('/') || name.ends_with('\\') || (dos_dir && usize_ == 0 && csize == 0);
         out.push(Entry {
             name,
             method,
@@ -758,6 +1255,8 @@ fn parse_central_directory(
             uncompressed_size: usize_,
             is_dir,
             flags,
+            dos_time,
+            aes,
             unix_mode: (external >> 16) as u16,
             local_offset: parts
                 .logical(multi_disk, disk, local_off)
@@ -766,6 +1265,13 @@ fn parse_central_directory(
         at = at
             .checked_add(46 + (name_len + extra_len + comment_len) as u64)
             .ok_or(ZipError::Malformed("central directory overflows"))?;
+    }
+    // A difference, so this holds in the single-disk and the per-disk
+    // address space alike.
+    if at.checked_sub(cd_off) != Some(cd_size) {
+        return Err(ZipError::Malformed(
+            "the central directory's entry count and size disagree",
+        ));
     }
     Ok(out)
 }
@@ -776,6 +1282,15 @@ fn parse_central_directory(
 /// malformed and declined shapes no real writer would produce.
 #[doc(hidden)]
 pub mod fixtures {
+    /// How a fixture entry is encrypted (phase 3 coverage).
+    pub enum Encrypt<'a> {
+        /// Legacy PKWARE stream cipher.
+        ZipCrypto { password: &'a str },
+        /// WinZip AE: `vendor_version` 1 (CRC kept) or 2 (CRC zeroed),
+        /// `strength` 1/2/3 for AES-128/192/256.
+        Ae { password: &'a str, strength: u8, vendor_version: u16 },
+    }
+
     /// One entry to encode: (name, payload, method, flags, external attrs).
     pub struct Spec<'a> {
         pub name: &'a str,
@@ -788,6 +1303,10 @@ pub mod fixtures {
         /// Write the 32-bit size fields saturated and add a Zip64 extra
         /// field carrying the real ones.
         pub zip64: bool,
+        pub encrypt: Option<Encrypt<'a>>,
+        /// Flip one ciphertext byte after encryption (tamper
+        /// simulation - the AE HMAC must catch it).
+        pub tamper: bool,
     }
 
     impl<'a> Spec<'a> {
@@ -800,10 +1319,15 @@ pub mod fixtures {
                 external: 0,
                 crc_override: None,
                 zip64: false,
+                encrypt: None,
+                tamper: false,
             }
         }
         pub fn deflated(name: &'a str, data: &'a [u8]) -> Spec<'a> {
             Spec { method: super::METHOD_DEFLATE, ..Spec::stored(name, data) }
+        }
+        pub fn bzip2(name: &'a str, data: &'a [u8]) -> Spec<'a> {
+            Spec { method: super::METHOD_BZIP2, ..Spec::stored(name, data) }
         }
     }
 
@@ -828,68 +1352,136 @@ pub mod fixtures {
                 e.write_all(s.data).unwrap();
                 e.finish().unwrap()
             }
+            super::METHOD_BZIP2 => {
+                use std::io::Write as _;
+                let mut e =
+                    bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+                e.write_all(s.data).unwrap();
+                e.finish().unwrap()
+            }
             _ => s.data.to_vec(),
+        }
+    }
+
+    /// Encrypt an entry's already-compressed bytes per its spec:
+    /// `(payload, stored method, stored crc, extra-field bytes)`.
+    fn encrypted(s: &Spec, comp: Vec<u8>, crc: u32) -> (Vec<u8>, u16, u32, Vec<u8>) {
+        match &s.encrypt {
+            None => (comp, s.method, crc, Vec::new()),
+            Some(Encrypt::ZipCrypto { password }) => {
+                // 12-byte header: 11 arbitrary (deterministic) bytes +
+                // the check byte (high byte of the CRC; fixtures never
+                // set bit 3).
+                let mut payload = vec![0u8; 12];
+                for (i, b) in payload.iter_mut().enumerate().take(11) {
+                    *b = (i as u8).wrapping_mul(73).wrapping_add(29);
+                }
+                payload[11] = (crc >> 24) as u8;
+                payload.extend_from_slice(&comp);
+                let mut z = crate::zipcrypt::ZipCrypto::new(password.as_bytes());
+                z.encrypt(&mut payload);
+                (payload, s.method, crc, Vec::new())
+            }
+            Some(Encrypt::Ae { password, strength, vendor_version }) => {
+                let (kl, sl) = crate::zipcrypt::ae_strength_lens(*strength).expect("strength");
+                let salt: Vec<u8> =
+                    (0..sl).map(|i| (i as u8).wrapping_mul(41).wrapping_add(7)).collect();
+                let keys = crate::zipcrypt::ae_derive(password.as_bytes(), &salt, kl);
+                let mut ct = comp;
+                crate::zipcrypt::AeCtr::new(&keys.enc_key).expect("key").xor(&mut ct);
+                let mut mac = crate::zipcrypt::AeMac::new(&keys.mac_key);
+                mac.update(&ct);
+                let auth = mac.finalize();
+                let mut payload = salt;
+                payload.extend_from_slice(&keys.verify);
+                payload.extend_from_slice(&ct);
+                payload.extend_from_slice(&auth);
+                let mut extra = Vec::new();
+                u16le(0x9901, &mut extra);
+                u16le(7, &mut extra);
+                u16le(*vendor_version, &mut extra);
+                extra.extend_from_slice(b"AE");
+                extra.push(*strength);
+                u16le(s.method, &mut extra);
+                // AE-2 zeroes the CRC field by spec.
+                let crc_field = if *vendor_version == 2 { 0 } else { crc };
+                (payload, 99, crc_field, extra)
+            }
         }
     }
 
     /// Build a complete single-container zip.
     pub fn zip_of(specs: &[Spec]) -> Vec<u8> {
+        zip_of_with_comment(specs, b"")
+    }
+
+    /// [`zip_of`] with a trailing archive comment. The comment is legal
+    /// container bytes the reader must scan PAST, so it is also how a
+    /// forged end-of-central-directory record gets appended after the
+    /// real one.
+    pub fn zip_of_with_comment(specs: &[Spec], comment: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         let mut cd = Vec::new();
         for s in specs {
             let comp = body(s);
             let crc = s.crc_override.unwrap_or_else(|| crc32fast::hash(s.data));
+            let (mut payload, method, crc_field, ae_extra) = encrypted(s, comp, crc);
+            if s.tamper {
+                // Flip one ciphertext byte mid-payload (past any
+                // salt/verifier framing).
+                let at = payload.len() / 2;
+                payload[at] ^= 0x40;
+            }
+            let flags = s.flags | if s.encrypt.is_some() { 0x0001 } else { 0 };
             let local_off = out.len() as u32;
             let (c32, u32_) = if s.zip64 {
                 (u32::MAX, u32::MAX)
             } else {
-                (comp.len() as u32, s.data.len() as u32)
+                (payload.len() as u32, s.data.len() as u32)
             };
-            let z64_extra = |out: &mut Vec<u8>| {
-                u16le(0x0001, out);
-                u16le(16, out);
-                u64le(s.data.len() as u64, out);
-                u64le(comp.len() as u64, out);
-            };
+            let mut extra = Vec::new();
+            if s.zip64 {
+                u16le(0x0001, &mut extra);
+                u16le(16, &mut extra);
+                u64le(s.data.len() as u64, &mut extra);
+                u64le(payload.len() as u64, &mut extra);
+            }
+            extra.extend_from_slice(&ae_extra);
             // Local header
             out.extend_from_slice(b"PK\x03\x04");
             u16le(if s.zip64 { 45 } else { 20 }, &mut out);
-            u16le(s.flags, &mut out);
-            u16le(s.method, &mut out);
+            u16le(flags, &mut out);
+            u16le(method, &mut out);
             u16le(0, &mut out); // time
             u16le(0, &mut out); // date
-            u32le(crc, &mut out);
+            u32le(crc_field, &mut out);
             u32le(c32, &mut out);
             u32le(u32_, &mut out);
             u16le(s.name.len() as u16, &mut out);
-            u16le(if s.zip64 { 20 } else { 0 }, &mut out);
+            u16le(extra.len() as u16, &mut out);
             out.extend_from_slice(s.name.as_bytes());
-            if s.zip64 {
-                z64_extra(&mut out);
-            }
-            out.extend_from_slice(&comp);
+            out.extend_from_slice(&extra);
+            out.extend_from_slice(&payload);
             // Central directory record
             cd.extend_from_slice(b"PK\x01\x02");
             u16le(if s.zip64 { 45 } else { 20 }, &mut cd);
             u16le(if s.zip64 { 45 } else { 20 }, &mut cd);
-            u16le(s.flags, &mut cd);
-            u16le(s.method, &mut cd);
+            u16le(flags, &mut cd);
+            u16le(method, &mut cd);
             u16le(0, &mut cd);
             u16le(0, &mut cd);
-            u32le(crc, &mut cd);
+            u32le(crc_field, &mut cd);
             u32le(c32, &mut cd);
             u32le(u32_, &mut cd);
             u16le(s.name.len() as u16, &mut cd);
-            u16le(if s.zip64 { 20 } else { 0 }, &mut cd);
+            u16le(extra.len() as u16, &mut cd);
             u16le(0, &mut cd); // comment len
             u16le(0, &mut cd); // disk
             u16le(0, &mut cd); // internal attrs
             u32le(s.external, &mut cd);
             u32le(local_off, &mut cd);
             cd.extend_from_slice(s.name.as_bytes());
-            if s.zip64 {
-                z64_extra(&mut cd);
-            }
+            cd.extend_from_slice(&extra);
         }
         let cd_off = out.len() as u32;
         let cd_size = cd.len() as u32;
@@ -901,7 +1493,8 @@ pub mod fixtures {
         u16le(specs.len() as u16, &mut out);
         u32le(cd_size, &mut out);
         u32le(cd_off, &mut out);
-        u16le(0, &mut out); // comment len
+        u16le(comment.len() as u16, &mut out);
+        out.extend_from_slice(comment);
         out
     }
 }
@@ -1102,10 +1695,12 @@ mod tests {
     #[test]
     fn declined_methods_and_encryption_say_which() {
         let data = payload(1000, 7);
-        let z = fixtures::zip_of(&[Spec { method: 12, ..Spec::stored("a.bin", &data) }]);
-        let (d, ar) = open_bytes("rd-bz", &z);
+        // lzma stands in for the undecodable class now that bzip2 is
+        // decoded (see `bzip2_entries_decode_on_the_disk_path`).
+        let z = fixtures::zip_of(&[Spec { method: 14, ..Spec::stored("a.bin", &data) }]);
+        let (d, ar) = open_bytes("rd-lzma", &z);
         let e = extract(&ar.unwrap(), 0).unwrap_err();
-        assert!(matches!(&e, ZipError::Unsupported(m) if m.contains("bzip2")), "{e}");
+        assert!(matches!(&e, ZipError::Unsupported(m) if m.contains("lzma")), "{e}");
         std::fs::remove_dir_all(&d).unwrap();
 
         let z = fixtures::zip_of(&[Spec { flags: 0x0001, ..Spec::stored("a.bin", &data) }]);
@@ -1114,6 +1709,19 @@ mod tests {
         assert!(ar.entries()[0].is_encrypted());
         let e = extract(&ar, 0).unwrap_err();
         assert!(matches!(&e, ZipError::Unsupported(m) if m.contains("password")), "{e}");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// bzip2 (method 12) decodes on the disk path too. The chase and the
+    /// disk reader share one decoder factory, but this is the fallback
+    /// every declined shape lands on, so it is worth pinning directly.
+    #[test]
+    fn bzip2_entries_decode_on_the_disk_path() {
+        // Compressible: bzip2 EXPANDS random bytes.
+        let data: Vec<u8> = (0..90_000u32).map(|i| (i / 613 % 241) as u8).collect();
+        let z = fixtures::zip_of(&[Spec::bzip2("a.bin", &data)]);
+        let (d, ar) = open_bytes("rd-bz-ok", &z);
+        assert_eq!(extract(&ar.unwrap(), 0).unwrap(), data);
         std::fs::remove_dir_all(&d).unwrap();
     }
 
@@ -1156,6 +1764,129 @@ mod tests {
         std::fs::remove_dir_all(&d).unwrap();
     }
 
+    /// Build a 22-byte end-of-central-directory record that describes
+    /// only the FIRST entry of `good`, to be parked in that archive's
+    /// comment. `stretch` inflates the declared directory size so that
+    /// the directory "ends" exactly where the forged record begins.
+    fn forged_eocd(good: &[u8], stretch: bool) -> Vec<u8> {
+        let real_at = good.len() - 22;
+        let cd_off = rd_u32(&good[real_at + 16..]);
+        let rec = cd_off as usize;
+        // One central-directory record: 46 + name + extra + comment.
+        let one = 46
+            + rd_u16(&good[rec + 28..]) as u32
+            + rd_u16(&good[rec + 30..]) as u32
+            + rd_u16(&good[rec + 32..]) as u32;
+        // The comment starts at `good.len()`, so that is where the
+        // forged record will sit once it is appended.
+        let cd_size = if stretch { good.len() as u32 - cd_off } else { one };
+        let mut f = Vec::new();
+        f.extend_from_slice(b"PK\x05\x06");
+        f.extend_from_slice(&0u16.to_le_bytes()); // this disk
+        f.extend_from_slice(&0u16.to_le_bytes()); // disk with the directory
+        f.extend_from_slice(&1u16.to_le_bytes()); // entries on this disk
+        f.extend_from_slice(&1u16.to_le_bytes()); // entries in total
+        f.extend_from_slice(&cd_size.to_le_bytes());
+        f.extend_from_slice(&cd_off.to_le_bytes());
+        f.extend_from_slice(&0u16.to_le_bytes()); // comment len
+        f
+    }
+
+    /// A forged end-of-central-directory record parked in the archive's
+    /// own (legal) comment sits AFTER the real one, so the last-match
+    /// scan picks it - and it can name fewer entries than the directory
+    /// really holds. Nothing downstream would notice: the entries it
+    /// does name still pass their CRC, so the job reports success having
+    /// silently dropped a file. unzip, 7z and bsdtar all read both
+    /// entries on these bytes; only geometry checks on the record catch
+    /// it here.
+    #[test]
+    fn a_forged_eocd_in_the_comment_never_wins() {
+        let a = payload(1_000, 5);
+        let b = payload(1_500, 7);
+        let specs = [Spec::stored("a.bin", &a), Spec::stored("b.bin", &b)];
+        let good = fixtures::zip_of(&specs);
+        let (d, ar) = open_bytes("rd-forge-clean", &good);
+        assert_eq!(ar.unwrap().entries().len(), 2, "the untouched archive still opens");
+        std::fs::remove_dir_all(&d).unwrap();
+        for (tag, stretch) in [("short", false), ("stretched", true)] {
+            let z = fixtures::zip_of_with_comment(&specs, &forged_eocd(&good, stretch));
+            let (d, ar) = open_bytes(&format!("rd-forge-{tag}"), &z);
+            match ar {
+                Err(_) => {}
+                Ok(a) => panic!(
+                    "{tag}: a forged directory opened with {} entries, b.bin vanished silently",
+                    a.entries().len()
+                ),
+            }
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+    }
+
+    /// Junk appended after the record is tolerated today and must stay
+    /// tolerated: the directory is anchored to the record's position,
+    /// not to the end of the file.
+    #[test]
+    fn appended_junk_after_the_record_still_opens() {
+        let a = payload(400, 3);
+        let b = payload(600, 4);
+        let mut z = fixtures::zip_of(&[Spec::stored("a.bin", &a), Spec::stored("b.bin", &b)]);
+        z.extend_from_slice(&payload(520, 99));
+        let (d, ar) = open_bytes("rd-junk", &z);
+        assert_eq!(ar.unwrap().entries().len(), 2);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// Once the 32-bit fields saturate, the zip64 end record is the
+    /// authority on the directory's SIZE and per-disk count too, not
+    /// just its offset and entry total. The committed zip64.zip never
+    /// reaches this branch (its EOCD fields all fit), so the shape is
+    /// hand-built here - getting the source of those two fields wrong
+    /// would refuse every genuinely large archive.
+    #[test]
+    fn a_zip64_end_record_supplies_the_directory_geometry() {
+        let a = payload(2_000, 11);
+        let b = payload(3_000, 12);
+        let specs = [Spec::stored("a.bin", &a), Spec::stored("b.bin", &b)];
+        let good = fixtures::zip_of(&specs);
+        let real_at = good.len() - 22;
+        let cd_size = rd_u32(&good[real_at + 12..]) as u64;
+        let cd_off = rd_u32(&good[real_at + 16..]) as u64;
+        let mut z = good[..real_at].to_vec();
+        let z64_at = z.len() as u64;
+        z.extend_from_slice(b"PK\x06\x06");
+        z.extend_from_slice(&44u64.to_le_bytes()); // size of the rest
+        z.extend_from_slice(&45u16.to_le_bytes()); // version made by
+        z.extend_from_slice(&45u16.to_le_bytes()); // version needed
+        z.extend_from_slice(&0u32.to_le_bytes()); // this disk
+        z.extend_from_slice(&0u32.to_le_bytes()); // disk with the directory
+        z.extend_from_slice(&2u64.to_le_bytes()); // entries on this disk
+        z.extend_from_slice(&2u64.to_le_bytes()); // entries in total
+        z.extend_from_slice(&cd_size.to_le_bytes());
+        z.extend_from_slice(&cd_off.to_le_bytes());
+        z.extend_from_slice(b"PK\x06\x07"); // locator
+        z.extend_from_slice(&0u32.to_le_bytes()); // disk holding the record
+        z.extend_from_slice(&z64_at.to_le_bytes());
+        z.extend_from_slice(&1u32.to_le_bytes()); // total disks
+        // Every field the zip64 record supersedes is written saturated,
+        // exactly as the spec requires, so a reader that reaches for the
+        // 32-bit copy of any of them gets a nonsense answer.
+        z.extend_from_slice(b"PK\x05\x06");
+        z.extend_from_slice(&0u16.to_le_bytes());
+        z.extend_from_slice(&0u16.to_le_bytes());
+        z.extend_from_slice(&u16::MAX.to_le_bytes());
+        z.extend_from_slice(&u16::MAX.to_le_bytes());
+        z.extend_from_slice(&u32::MAX.to_le_bytes());
+        z.extend_from_slice(&u32::MAX.to_le_bytes());
+        z.extend_from_slice(&0u16.to_le_bytes());
+        let (d, ar) = open_bytes("rd-z64-end", &z);
+        let ar = ar.unwrap();
+        assert_eq!(ar.entries().len(), 2);
+        assert_eq!(extract(&ar, 0).unwrap(), a);
+        assert_eq!(extract(&ar, 1).unwrap(), b);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
     #[test]
     fn a_directory_entry_is_flagged_and_not_payload() {
         let z = fixtures::zip_of(&[
@@ -1174,12 +1905,24 @@ mod tests {
     #[test]
     fn malformed_containers_are_refused_without_panicking() {
         let good = fixtures::zip_of(&[Spec::stored("a.bin", &payload(2_000, 17))]);
+        let a = payload(700, 19);
+        let b = payload(900, 23);
+        let two = [Spec::stored("a.bin", &a), Spec::stored("b.bin", &b)];
+        let two_bytes = fixtures::zip_of(&two);
         for (tag, bytes) in [
             ("empty", Vec::new()),
             ("tiny", b"PK".to_vec()),
             ("no-eocd", payload(3_000, 1)),
             ("head-only", good[..good.len() / 2].to_vec()),
             ("eocd-only", b"PK\x05\x06".iter().copied().chain([0u8; 18]).collect()),
+            (
+                "forged-eocd-short",
+                fixtures::zip_of_with_comment(&two, &forged_eocd(&two_bytes, false)),
+            ),
+            (
+                "forged-eocd-stretched",
+                fixtures::zip_of_with_comment(&two, &forged_eocd(&two_bytes, true)),
+            ),
         ] {
             let d = tmp(&format!("rd-bad-{tag}"));
             let p = write(&d, "c.zip", &bytes);
@@ -1253,6 +1996,125 @@ mod tests {
         // record sits ~900 bytes before the end of the file.
         let a = Archive::open(&[root.join("commented.zip")]).unwrap();
         assert_eq!(a.entries()[0].name, "a.bin");
+    }
+
+    /// Interop for phase 3: encrypted archives written by a REAL writer
+    /// (7-Zip; Python's zipfile cannot write encryption). Same payload,
+    /// same password, both schemes - ZipCrypto and WinZip AE.
+    /// Regenerate with `tools/gen-zip-fixtures.py` (needs 7zz).
+    #[test]
+    fn reads_encrypted_archives_written_by_a_real_zip_writer() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/zip");
+        let want: Vec<u8> = (0..20000u32).map(|i| ((i * 37 + 11) % 256) as u8).collect();
+        for name in ["zipcrypto.zip", "aes256.zip"] {
+            let a = Archive::open(&[root.join(name)]).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(a.entries().len(), 1, "{name}");
+            let e = &a.entries()[0];
+            assert!(e.is_encrypted(), "{name}");
+            let mut out = Vec::new();
+            a.read_entry_to_with(e, &mut out, Some("SECRET"))
+                .unwrap_or_else(|err| panic!("{name}: {err}"));
+            assert_eq!(out, want, "{name} payload");
+            let mut sink = Vec::new();
+            assert!(
+                matches!(
+                    a.read_entry_to_with(e, &mut sink, Some("wrong")),
+                    Err(ZipError::WrongPassword { .. })
+                ),
+                "{name} must refuse a wrong password"
+            );
+        }
+        // The AES fixture must actually be AE, not ZipCrypto in disguise.
+        let a = Archive::open(&[root.join("aes256.zip")]).unwrap();
+        assert!(a.entries()[0].aes.is_some(), "aes256.zip lacks the AE extra field");
+    }
+
+    // -- phase 3: encrypted entries ------------------------------------
+
+    fn extract_pw(a: &Archive, i: usize, pw: Option<&str>) -> Result<Vec<u8>, ZipError> {
+        let mut out = Vec::new();
+        a.read_entry_to_with(&a.entries()[i], &mut out, pw)?;
+        Ok(out)
+    }
+
+    /// ZipCrypto round-trips under both methods; the wrong password is
+    /// refused by the check byte, and no password declines by name.
+    #[test]
+    fn zipcrypto_entries_round_trip() {
+        let a_data = payload(40_000, 31);
+        let b_data = payload(25_000, 33);
+        let z = fixtures::zip_of(&[
+            Spec {
+                encrypt: Some(fixtures::Encrypt::ZipCrypto { password: "s3cret" }),
+                ..Spec::stored("a.bin", &a_data)
+            },
+            Spec {
+                encrypt: Some(fixtures::Encrypt::ZipCrypto { password: "s3cret" }),
+                ..Spec::deflated("b.bin", &b_data)
+            },
+        ]);
+        let (d, ar) = open_bytes("zc-ok", &z);
+        let ar = ar.unwrap();
+        assert!(ar.entries()[0].is_encrypted());
+        assert_eq!(extract_pw(&ar, 0, Some("s3cret")).unwrap(), a_data);
+        assert_eq!(extract_pw(&ar, 1, Some("s3cret")).unwrap(), b_data);
+        assert!(matches!(
+            extract_pw(&ar, 0, Some("wrong")),
+            Err(ZipError::WrongPassword { .. })
+        ));
+        let e = extract_pw(&ar, 0, None).unwrap_err();
+        assert!(
+            matches!(&e, ZipError::Unsupported(m) if m.contains("password-protected")),
+            "{e}"
+        );
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// WinZip AE round-trips at every strength and both vendor
+    /// versions; AE-2's zeroed CRC field must not fail the check, a
+    /// wrong password is refused by the verifier, and a tampered
+    /// ciphertext byte is caught by the HMAC even though CTR would
+    /// happily decrypt it.
+    #[test]
+    fn ae_entries_round_trip_verify_and_authenticate() {
+        let data = payload(50_000, 37);
+        for (strength, ver) in [(1u8, 1u16), (2, 1), (3, 1), (3, 2)] {
+            let z = fixtures::zip_of(&[Spec {
+                encrypt: Some(fixtures::Encrypt::Ae { password: "hunter2", strength, vendor_version: ver }),
+                ..Spec::deflated("a.bin", &data)
+            }]);
+            let (d, ar) = open_bytes(&format!("ae-{strength}-{ver}"), &z);
+            let ar = ar.unwrap();
+            let e = &ar.entries()[0];
+            assert!(e.is_encrypted(), "s{strength} v{ver}");
+            if ver == 2 {
+                assert_eq!(e.crc32, 0, "AE-2 zeroes the CRC field by spec");
+            }
+            assert_eq!(
+                extract_pw(&ar, 0, Some("hunter2")).unwrap(),
+                data,
+                "s{strength} v{ver}"
+            );
+            assert!(matches!(
+                extract_pw(&ar, 0, Some("wrong")),
+                Err(ZipError::WrongPassword { .. })
+            ));
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+        // Tamper: the verifier accepts (password is right), the HMAC
+        // must refuse - never publish unauthenticated plaintext.
+        let z = fixtures::zip_of(&[Spec {
+            encrypt: Some(fixtures::Encrypt::Ae { password: "hunter2", strength: 3, vendor_version: 2 }),
+            tamper: true,
+            ..Spec::stored("a.bin", &data)
+        }]);
+        let (d, ar) = open_bytes("ae-tamper", &z);
+        let e = extract_pw(&ar.unwrap(), 0, Some("hunter2")).unwrap_err();
+        assert!(
+            matches!(&e, ZipError::Io(err) if err.to_string().contains("authentication failed")),
+            "{e}"
+        );
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     /// An entry whose declared size disagrees with what actually decodes

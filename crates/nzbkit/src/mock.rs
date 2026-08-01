@@ -33,6 +33,13 @@ pub struct Chaos {
     /// Fixed delay before every successful BODY response (a "slow
     /// server" - per-connection throughput ≈ article_size / delay).
     pub delay_ms: u64,
+    /// Fixed delay before every 430. `delay_ms` deliberately does not
+    /// cover the refusal path, but a real 430 is a full round trip like
+    /// any other (~30-80 ms transatlantic), and a wholly-dead post is
+    /// nothing BUT refusals - so how long it takes to drive a dead queue
+    /// to terminal is set by exactly this number. Zero keeps every
+    /// existing test at localhost speed.
+    pub missing_delay_ms: u64,
     /// Swallow QUIT silently: no goodbye, connection held open. Models a
     /// provider that ACKs the QUIT at TCP level but never answers it
     /// (seen live; used to park the exit path forever).
@@ -151,6 +158,13 @@ struct HeaderPlane {
     /// Message-id (with angle brackets) → raw header block (CRLF lines).
     headers: HashMap<String, Vec<u8>>,
     overview: Vec<OverRow>,
+}
+
+/// Pause before a 430, so a refusal costs a round trip like a real one.
+async fn refuse_delay(chaos: &Chaos) {
+    if chaos.missing_delay_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(chaos.missing_delay_ms)).await;
+    }
 }
 
 /// One article on the wire: the raw dot-stuffed yEnc body.
@@ -295,6 +309,9 @@ impl MockServer {
             socks5: None,
             enabled: true,
         warm_pool: false,
+            idle_release_secs: None,
+            idle_keep: None,
+            max_source_ips: None,
         }
     }
 }
@@ -543,6 +560,7 @@ async fn serve_conn(
             {
                 w.write_all(format!("223 0 {id}\r\n").as_bytes()).await?;
             } else {
+                refuse_delay(&chaos).await;
                 w.write_all(b"430 no such article\r\n").await?;
             }
         } else if let Some(id) = cmd
@@ -563,10 +581,12 @@ async fn serve_conn(
                 continue;
             }
             if chaos.missing.contains(&id) {
+                refuse_delay(&chaos).await;
                 w.write_all(b"430 no such article\r\n").await?;
                 continue;
             }
             let Some(article) = articles.lock().unwrap().get(&id).cloned() else {
+                refuse_delay(&chaos).await;
                 w.write_all(b"430 no such article\r\n").await?;
                 continue;
             };
@@ -611,10 +631,12 @@ async fn serve_conn(
             let id = id.trim().to_string();
             body_log.lock().unwrap().push(id.clone());
             if chaos.missing.contains(&id) {
+                refuse_delay(&chaos).await;
                 w.write_all(b"430 no such article\r\n").await?;
                 continue;
             }
             let Some(article) = articles.lock().unwrap().get(&id).cloned() else {
+                refuse_delay(&chaos).await;
                 w.write_all(b"430 no such article\r\n").await?;
                 continue;
             };

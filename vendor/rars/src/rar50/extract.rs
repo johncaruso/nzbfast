@@ -412,15 +412,22 @@ impl FileHeader {
         })?;
         let output_size = usize::try_from(self.unpacked_size)
             .map_err(|_| Error::InvalidHeader("RAR 5 unpacked size overflows host address size"))?;
-        let mut crc = Crc32::new();
-        let mut hash = streaming_hash_verifier(self)?;
+        let crc = Crc32::new();
+        let hash = streaming_hash_verifier(self)?;
 
         // Pipeline: the decoder runs on a spawned thread and hands coalesced
-        // ~1 MB buffers over a bounded channel; checksumming and writing stay
-        // on the calling thread (so `writer` needs no Send bound). A small
-        // recycling pool bounds the extra memory and provides backpressure.
+        // ~1 MB buffers over a bounded channel; writing stays on the calling
+        // thread (so `writer` needs no Send bound), and checksumming runs on
+        // a third thread downstream of the writer. Splitting the digests off
+        // the write loop matters on shapes where decode is cheap: CRC32 and
+        // write() were each ~half of the writer thread's time on a highly
+        // repetitive archive, and running them serially made the writer the
+        // bottleneck while the decoder sat blocked on backpressure. A small
+        // recycling pool bounds the extra memory and provides backpressure;
+        // one extra buffer over the old three keeps the deeper pipeline from
+        // starving now that the writer and digester can each hold one.
         const PIPE_BUF: usize = 1 << 20;
-        const POOL_BUFFERS: usize = 3;
+        const POOL_BUFFERS: usize = 4;
         enum PipeChunk {
             Data(Vec<u8>),
             Repeated { byte: u8, len: usize },
@@ -430,6 +437,7 @@ impl FileHeader {
         }
 
         let (data_tx, data_rx) = std::sync::mpsc::sync_channel::<PipeChunk>(POOL_BUFFERS + 1);
+        let (digest_tx, digest_rx) = std::sync::mpsc::channel::<PipeChunk>();
         let (pool_tx, pool_rx) = std::sync::mpsc::channel::<Vec<u8>>();
         for _ in 0..POOL_BUFFERS {
             let _ = pool_tx.send(Vec::with_capacity(PIPE_BUF));
@@ -487,21 +495,52 @@ impl FileHeader {
                 result
             });
 
+            // The digester runs downstream of the writer: every chunk the
+            // writer accepted flows here in write order (a single FIFO
+            // carries both data buffers and repeated-run markers), gets
+            // hashed, and only then does its buffer return to the pool. The
+            // channel is unbounded but its depth is bounded by the pool:
+            // only POOL_BUFFERS data buffers exist.
+            let digester = scope.spawn(move || {
+                let mut crc = crc;
+                let mut hash = hash;
+                for chunk in digest_rx {
+                    match chunk {
+                        PipeChunk::Data(buffer) => {
+                            crc.update(&buffer);
+                            if let Some((_, hasher)) = &mut hash {
+                                hasher.update(&buffer);
+                            }
+                            let mut buffer = buffer;
+                            buffer.clear();
+                            let _ = pool_tx.send(buffer);
+                        }
+                        PipeChunk::Repeated { byte, len } => {
+                            digest_repeated_chunk(&mut crc, &mut hash, byte, len);
+                        }
+                    }
+                }
+                // The pool sender drops with the digester, which is what
+                // unblocks a producer parked on `pool_rx.recv()` after an
+                // error (see below).
+                (crc, hash)
+            });
+
             for chunk in data_rx {
                 let outcome = match chunk {
                     PipeChunk::Data(buffer) => {
-                        crc.update(&buffer);
-                        if let Some((_, hasher)) = &mut hash {
-                            hasher.update(&buffer);
-                        }
                         let outcome = writer.write_all(&buffer);
-                        let mut buffer = buffer;
-                        buffer.clear();
-                        let _ = pool_tx.send(buffer);
+                        if outcome.is_ok() {
+                            let _ = digest_tx.send(PipeChunk::Data(buffer));
+                        }
                         outcome
                     }
                     PipeChunk::Repeated { byte, len } => {
-                        write_repeated_chunk(writer, &mut crc, &mut hash, byte, len)
+                        let outcome = write_repeated_bytes(writer, byte, len);
+                        if outcome.is_ok() {
+                            let _ = digest_tx.send(PipeChunk::Repeated { byte, len });
+                        }
+                        outcome
                     }
                 };
                 if let Err(error) = outcome {
@@ -519,12 +558,17 @@ impl FileHeader {
             // arm holds no pooled buffer, so it recycles nothing - a
             // `Repeated` chunk plus POOL_BUFFERS queued `Data` buffers
             // exactly fills this channel and empties the pool, and if
-            // `write_repeated_chunk` then fails (the bomb guard tripping,
+            // the repeated write then fails (the bomb guard tripping,
             // ENOSPC, EPIPE) the break below would join a producer that can
-            // never return. Dropping the pool sender fails its recv.
-            drop(pool_tx);
-            handle.join().expect("streaming decode thread panicked")
+            // never return. The pool sender now lives in the digester, so
+            // dropping the digest sender ends the digester, whose exit drops
+            // the pool sender and fails that recv.
+            drop(digest_tx);
+            let digests = digester.join().expect("streaming digest thread panicked");
+            let decode = handle.join().expect("streaming decode thread panicked");
+            (decode, digests)
         });
+        let (decode_result, (crc, hash)) = decode_result;
 
         if let Some(error) = write_error {
             return Err(error);
@@ -553,18 +597,21 @@ impl FileHeader {
         let (mut reader, keys) = self
             .packed_reader_with_password(archive, password)
             .map_err(|error| self.entry_error("decoding", error))?;
-        let mut crc = Crc32::new();
-        let mut hash =
+        let crc = Crc32::new();
+        let hash =
             streaming_hash_verifier(self).map_err(|error| self.entry_error("decoding", error))?;
         let mut written = 0u64;
 
-        if let Err((operation, error)) = pipe_stored_chunks(
+        let (crc, hash) = match pipe_stored_chunks(
             &mut *reader,
             |error| ("decoding", Error::from(error)),
-            |buf| self.consume_stored_chunk(buf, &mut written, &mut crc, &mut hash, writer),
+            crc,
+            hash,
+            |buf| self.consume_stored_chunk(buf, &mut written, writer),
         ) {
-            return Err(self.entry_error(operation, error));
-        }
+            Ok(digests) => digests,
+            Err((operation, error)) => return Err(self.entry_error(operation, error)),
+        };
 
         if written != self.unpacked_size {
             return Err(self.entry_error(
@@ -576,16 +623,17 @@ impl FileHeader {
             .map_err(|error| self.entry_error("verifying", error))
     }
 
-    /// Padding check, checksum update, and write for one stored-file chunk.
-    /// Returns the failing operation label alongside the error.
+    /// Padding check and write for one stored-file chunk; the digest
+    /// stage downstream checksums the accepted content. Returns how many
+    /// leading bytes are file content (an encrypted stored tail past
+    /// unpacked_size is AES padding, verified zero here and not
+    /// digested), or the failing operation label alongside the error.
     fn consume_stored_chunk(
         &self,
         buf: &[u8],
         written: &mut u64,
-        crc: &mut Crc32,
-        hash: &mut Option<([u8; 32], blake2sp::Hasher)>,
         writer: &mut dyn Write,
-    ) -> std::result::Result<(), (&'static str, Error)> {
+    ) -> std::result::Result<usize, (&'static str, Error)> {
         let remaining =
             usize::try_from(self.unpacked_size.saturating_sub(*written)).unwrap_or(usize::MAX);
         let chunk_len = buf.len().min(remaining);
@@ -621,15 +669,11 @@ impl FileHeader {
             .checked_add(chunk.len() as u64)
             .ok_or(Error::InvalidHeader("RAR 5 stored size overflows"))
             .map_err(|error| ("decoding", error))?;
-        crc.update(chunk);
-        if let Some((_, hasher)) = hash {
-            hasher.update(chunk);
-        }
         writer
             .write_all(chunk)
             .map_err(Error::from)
             .map_err(|error| ("writing", error))?;
-        Ok(())
+        Ok(chunk_len)
     }
 
     fn entry_error(&self, operation: &'static str, error: Error) -> Error {
@@ -638,29 +682,40 @@ impl FileHeader {
 }
 
 /// Bounded stored-data pipeline: a scoped producer thread reads (and
-/// decrypts) into pooled buffers while `consume` runs each chunk's padding
-/// check, checksums, and write on the calling thread - the writer is a
-/// borrowed `dyn Write` and must stay there. The data channel holds one
-/// slot more than the pool has buffers, so a producer send can never
-/// block on a full channel; when the consumer stops early, dropping the
-/// pool sender wakes the producer's recv and the scoped thread joins.
+/// decrypts) into pooled buffers, `consume` runs each chunk's padding
+/// check and write on the calling thread - the writer is a borrowed
+/// `dyn Write` and must stay there - and a scoped digest thread
+/// downstream of the writer checksums the accepted bytes and recycles
+/// the buffers. `consume` returns how many leading bytes are file
+/// content (the encrypted stored path can carry AES padding past it);
+/// only those are digested. Splitting the digests off the write loop is
+/// the same fix the compressed streaming path got: a stored extraction
+/// is a straight copy, and CRC32 serial with write() made one thread
+/// the whole leg. The data channel holds one slot more than the pool
+/// has buffers, so a producer send can never block on a full channel;
+/// when the consumer stops early, dropping the digest sender ends the
+/// digester, whose exit drops the pool sender and wakes a producer
+/// parked on the drained pool.
 const STORED_PIPE_BUF: usize = 1 << 20;
-const STORED_POOL: usize = 3;
+const STORED_POOL: usize = 4;
 
 fn pipe_stored_chunks<E>(
     reader: &mut (dyn Read + Send),
     read_error: impl Fn(std::io::Error) -> E,
-    mut consume: impl FnMut(&[u8]) -> std::result::Result<(), E>,
-) -> std::result::Result<(), E> {
+    crc: Crc32,
+    hash: Option<([u8; 32], blake2sp::Hasher)>,
+    mut consume: impl FnMut(&[u8]) -> std::result::Result<usize, E>,
+) -> std::result::Result<(Crc32, Option<([u8; 32], blake2sp::Hasher)>), E> {
     let (data_tx, data_rx) =
         std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(STORED_POOL + 1);
+    let (digest_tx, digest_rx) = std::sync::mpsc::channel::<(Vec<u8>, usize)>();
     let (pool_tx, pool_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     for _ in 0..STORED_POOL {
         let _ = pool_tx.send(vec![0u8; STORED_PIPE_BUF]);
     }
 
     let mut outcome = Ok(());
-    std::thread::scope(|scope| {
+    let digests = std::thread::scope(|scope| {
         scope.spawn(move || {
             loop {
                 let Ok(mut buf) = pool_rx.recv() else {
@@ -683,6 +738,24 @@ fn pipe_stored_chunks<E>(
             }
         });
 
+        let digester = scope.spawn(move || {
+            let mut crc = crc;
+            let mut hash = hash;
+            for (buf, content_len) in digest_rx {
+                let chunk = &buf[..content_len];
+                crc.update(chunk);
+                if let Some((_, hasher)) = &mut hash {
+                    hasher.update(chunk);
+                }
+                let mut buf = buf;
+                buf.clear();
+                let _ = pool_tx.send(buf);
+            }
+            // The pool sender drops with the digester, which is what wakes
+            // a producer parked on the drained pool after an early stop.
+            (crc, hash)
+        });
+
         for received in data_rx {
             let buf = match received {
                 Ok(buf) => buf,
@@ -691,19 +764,26 @@ fn pipe_stored_chunks<E>(
                     break;
                 }
             };
-            if let Err(error) = consume(&buf) {
-                outcome = Err(error);
-                break;
+            match consume(&buf) {
+                Ok(content_len) => {
+                    let _ = digest_tx.send((buf, content_len));
+                }
+                Err(error) => {
+                    outcome = Err(error);
+                    break;
+                }
             }
-            let _ = pool_tx.send(buf);
         }
         // Consumption has stopped (EOF, read error, or consume error) and
-        // the data receiver is gone. A producer parked on the drained pool
-        // would otherwise never wake, and the scope would wait on it
-        // forever - dropping the pool sender fails its recv instead.
-        drop(pool_tx);
+        // the data receiver is gone, which unblocks a producer stuck on
+        // send. A producer parked on `pool_rx.recv()` with the pool
+        // drained needs more: dropping the digest sender ends the
+        // digester, whose exit drops the pool sender and fails that recv.
+        drop(digest_tx);
+        let digests = digester.join().expect("stored digest thread panicked");
+        digests
     });
-    outcome
+    outcome.map(|()| digests)
 }
 
 struct CountingWriter<'a> {
@@ -731,18 +811,31 @@ fn is_streaming_filter_bail(error: &Error) -> bool {
     }
 }
 
-fn write_repeated_chunk(
-    writer: &mut dyn Write,
-    crc: &mut Crc32,
-    hash: &mut Option<([u8; 32], blake2sp::Hasher)>,
-    byte: u8,
-    mut len: usize,
-) -> std::io::Result<()> {
+fn write_repeated_bytes(writer: &mut dyn Write, byte: u8, mut len: usize) -> std::io::Result<()> {
     let buffer = [byte; 64 * 1024];
     while len > 0 {
         let take = len.min(buffer.len());
+        writer.write_all(&buffer[..take])?;
+        len -= take;
+    }
+    Ok(())
+}
+
+fn digest_repeated_chunk(
+    crc: &mut Crc32,
+    hash: &mut Option<([u8; 32], blake2sp::Hasher)>,
+    byte: u8,
+    len: usize,
+) {
+    if byte == 0 && hash.is_none() {
+        crc.update_zeroes(len as u64);
+        return;
+    }
+    let buffer = [byte; 64 * 1024];
+    let mut len = len;
+    while len > 0 {
+        let take = len.min(buffer.len());
         let chunk = &buffer[..take];
-        writer.write_all(chunk)?;
         if byte == 0 {
             crc.update_zeroes(take as u64);
         } else {
@@ -753,6 +846,17 @@ fn write_repeated_chunk(
         }
         len -= take;
     }
+}
+
+fn write_repeated_chunk(
+    writer: &mut dyn Write,
+    crc: &mut Crc32,
+    hash: &mut Option<([u8; 32], blake2sp::Hasher)>,
+    byte: u8,
+    len: usize,
+) -> std::io::Result<()> {
+    write_repeated_bytes(writer, byte, len)?;
+    digest_repeated_chunk(crc, hash, byte, len);
     Ok(())
 }
 
@@ -1590,7 +1694,11 @@ where
     let first_info = members[0].file.decoded_compression_info()?;
     let dictionary_size = usize::try_from(first_info.dictionary_size)
         .map_err(|_| Error::InvalidHeader("RAR 5 dictionary size overflows host address size"))?;
-    let total: usize = members.iter().map(|m| m.output_size).sum();
+    // The decoder takes the sizes, not the total: it splits the group the
+    // same way the digester below does, so a filter declared by a member
+    // after the first translates addresses against that member's own start.
+    let member_sizes: Vec<usize> = members.iter().map(|m| m.output_size).collect();
+    let total: usize = member_sizes.iter().sum();
     // The window must persist for members after the group.
     session.decoder.set_retain_history(true);
     // A group under this budget takes the flat-apply fast path; larger
@@ -1611,9 +1719,15 @@ where
     };
 
     // Same pipe as stream_packed_with_decoder: decode on a spawned thread,
-    // checksum + write on this thread (writers are not Send).
+    // write on this thread (writers are not Send), and digest on a third
+    // thread downstream of the writer - the same split that fixed the
+    // repetitive shape, where CRC32 and write() running serially made this
+    // thread the pipeline's bottleneck while the decoder sat on
+    // backpressure. The digester re-splits the stream at member boundaries
+    // with its own byte count (the split is deterministic from the members'
+    // declared sizes) and performs each member's integrity check.
     const PIPE_BUF: usize = 1 << 20;
-    const POOL_BUFFERS: usize = 3;
+    const POOL_BUFFERS: usize = 4;
     enum PipeChunk {
         Data(Vec<u8>),
         Repeated { byte: u8, len: usize },
@@ -1623,6 +1737,7 @@ where
     }
 
     let (data_tx, data_rx) = std::sync::mpsc::sync_channel::<PipeChunk>(POOL_BUFFERS + 1);
+    let (digest_tx, digest_rx) = std::sync::mpsc::channel::<PipeChunk>();
     let (pool_tx, pool_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     for _ in 0..POOL_BUFFERS {
         let _ = pool_tx.send(Vec::with_capacity(PIPE_BUF));
@@ -1648,6 +1763,7 @@ where
     let decoder = &mut session.decoder;
     let mut consume_error: Option<Error> = None;
     let member_keys_ref = &member_keys;
+    let member_sizes_ref = &member_sizes;
     let scope_outcome = std::thread::scope(|scope| {
         let handle = scope.spawn(move || {
             // Member readers, yielded to the scan in order. An open failure
@@ -1680,7 +1796,7 @@ where
             let result = decoder.decode_solid_chain_to_sink(
                 &mut next_input,
                 first_info.algorithm_version,
-                total,
+                member_sizes_ref,
                 dictionary_size,
                 !first_info.solid,
                 flat_limit,
@@ -1725,26 +1841,101 @@ where
             (result, reader_error)
         });
 
-        // Consumer: route the byte stream across member boundaries.
+        // Digester: runs downstream of the writer in write order, re-splits
+        // the stream at member boundaries by its own byte count, digests,
+        // and verifies each member as its last byte passes. It owns the
+        // buffer pool: a chunk's buffer returns to the pool only once it is
+        // hashed. On a verification failure it exits early - the producer
+        // then wakes via the failed pool recv, the writer via the ended
+        // data stream, so nothing hangs (see the shutdown note below).
+        let digester = scope.spawn(move || {
+            let mut cursor = 0usize; // member index
+            let mut error: Option<Error> = None;
+            let mut member_state: Option<(Crc32, Option<([u8; 32], blake2sp::Hasher)>, usize)> =
+                None;
+            'digest: for chunk in digest_rx {
+                let mut chunk = match chunk {
+                    PipeChunk::Data(buffer) => ChunkCursor::Data(buffer, 0),
+                    PipeChunk::Repeated { byte, len } => ChunkCursor::Repeated { byte, len },
+                };
+                while chunk.remaining() > 0 {
+                    if member_state.is_none() {
+                        // The writer bounds the stream to the members'
+                        // declared total before forwarding, so running past
+                        // the last member is unreachable here.
+                        let Some(member) = members.get(cursor) else {
+                            break 'digest;
+                        };
+                        match streaming_hash_verifier(member.file) {
+                            Ok(hash) => {
+                                member_state = Some((Crc32::new(), hash, member.output_size))
+                            }
+                            Err(inner) => {
+                                error =
+                                    Some(member.file.entry_error("verifying", inner));
+                                break 'digest;
+                            }
+                        }
+                    }
+                    let (crc, hash, remaining) =
+                        member_state.as_mut().expect("member state just set");
+                    let take = (*remaining).min(chunk.remaining());
+                    match &mut chunk {
+                        ChunkCursor::Data(buffer, offset) => {
+                            let slice = &buffer[*offset..*offset + take];
+                            crc.update(slice);
+                            if let Some((_, hasher)) = hash {
+                                hasher.update(slice);
+                            }
+                            *offset += take;
+                        }
+                        ChunkCursor::Repeated { byte, len } => {
+                            digest_repeated_chunk(crc, hash, *byte, take);
+                            *len -= take;
+                        }
+                    }
+                    *remaining -= take;
+                    if *remaining == 0 {
+                        let (crc, hash, _) =
+                            member_state.take().expect("member state present");
+                        if let Err(inner) = members[cursor].file.verify_streaming_integrity(
+                            crc,
+                            hash,
+                            member_keys_ref[cursor].as_ref(),
+                        ) {
+                            error = Some(
+                                members[cursor].file.entry_error("verifying", inner),
+                            );
+                            break 'digest;
+                        }
+                        cursor += 1;
+                    }
+                }
+                // Recycle the hashed buffer so the producer never starves.
+                if let ChunkCursor::Data(mut buffer, _) = chunk {
+                    buffer.clear();
+                    let _ = pool_tx.send(buffer);
+                }
+            }
+            // The pool sender drops with the digester; an early exit above
+            // relies on that to wake a producer parked on the drained pool.
+            (cursor, error)
+        });
+
+        // Writer: open each member's writer in archive order and route the
+        // byte stream across member boundaries; every chunk the writer
+        // accepted is forwarded (whole) to the digester in write order.
         let mut cursor = 0usize; // member index
-        let mut member_state: Option<(Box<dyn Write>, Crc32, Option<([u8; 32], blake2sp::Hasher)>, usize)> =
-            None;
-        let mut begin_member = |cursor: usize,
-                                open: &mut F|
-         -> Result<(Box<dyn Write>, Crc32, Option<([u8; 32], blake2sp::Hasher)>, usize)> {
-            let member = &members[cursor];
-            let writer = open(&member.file.metadata())?;
-            Ok((
-                writer,
-                Crc32::new(),
-                streaming_hash_verifier(member.file)?,
-                member.output_size,
-            ))
-        };
+        let mut member_state: Option<(Box<dyn Write>, usize)> = None;
         'consume: for chunk in data_rx.iter() {
-            let mut chunk = match chunk {
-                PipeChunk::Data(buffer) => ChunkCursor::Data(buffer, 0),
-                PipeChunk::Repeated { byte, len } => ChunkCursor::Repeated { byte, len },
+            let (mut chunk, forward_len) = match chunk {
+                PipeChunk::Data(buffer) => {
+                    let len = buffer.len();
+                    (ChunkCursor::Data(buffer, 0), len)
+                }
+                PipeChunk::Repeated { byte, len } => {
+                    (ChunkCursor::Repeated { byte, len }, len)
+                }
             };
             while chunk.remaining() > 0 {
                 if member_state.is_none() {
@@ -1754,32 +1945,29 @@ where
                         ));
                         break 'consume;
                     }
-                    match begin_member(cursor, open) {
-                        Ok(state) => member_state = Some(state),
+                    let member = &members[cursor];
+                    match open(&member.file.metadata()) {
+                        Ok(writer) => member_state = Some((writer, member.output_size)),
                         Err(error) => {
                             consume_error = Some(error);
                             break 'consume;
                         }
                     }
                 }
-                let (writer, crc, hash, remaining) =
+                let (writer, remaining) =
                     member_state.as_mut().expect("member state just set");
                 let take = (*remaining).min(chunk.remaining());
                 let outcome = match &mut chunk {
                     ChunkCursor::Data(buffer, offset) => {
-                        let slice = &buffer[*offset..*offset + take];
-                        crc.update(slice);
-                        if let Some((_, hasher)) = hash {
-                            hasher.update(slice);
-                        }
-                        let outcome = writer.write_all(slice).map_err(Error::from);
+                        let outcome = writer
+                            .write_all(&buffer[*offset..*offset + take])
+                            .map_err(Error::from);
                         *offset += take;
                         outcome
                     }
                     ChunkCursor::Repeated { byte, len } => {
-                        let outcome =
-                            write_repeated_chunk(writer.as_mut(), crc, hash, *byte, take)
-                                .map_err(Error::from);
+                        let outcome = write_repeated_bytes(writer.as_mut(), *byte, take)
+                            .map_err(Error::from);
                         *len -= take;
                         outcome
                     }
@@ -1791,43 +1979,52 @@ where
                 }
                 *remaining -= take;
                 if *remaining == 0 {
-                    let (_writer, crc, hash, _) =
-                        member_state.take().expect("member state present");
-                    if let Err(error) = members[cursor].file.verify_streaming_integrity(
-                        crc,
-                        hash,
-                        member_keys[cursor].as_ref(),
-                    ) {
-                        consume_error =
-                            Some(members[cursor].file.entry_error("verifying", error));
-                        break 'consume;
-                    }
+                    member_state = None;
                     cursor += 1;
                 }
             }
-            // Recycle the drained buffer so the producer never starves.
-            if let ChunkCursor::Data(mut buffer, _) = chunk {
-                buffer.clear();
-                let _ = pool_tx.send(buffer);
+            // Forward the fully written chunk for digesting; the digester
+            // re-splits it with its own member cursor. A send failure means
+            // the digester already exited on a verification failure - keep
+            // writing, its recorded error surfaces after the join.
+            match chunk {
+                ChunkCursor::Data(buffer, _) => {
+                    let _ = digest_tx.send(PipeChunk::Data(buffer));
+                }
+                ChunkCursor::Repeated { byte, .. } => {
+                    let _ = digest_tx.send(PipeChunk::Repeated {
+                        byte,
+                        len: forward_len,
+                    });
+                }
             }
         }
         // Dropping the receiver here unblocks a producer stuck on send.
         drop(data_rx);
         // ...but a producer parked on `pool_rx.recv()` with the pool drained
         // is not waiting on the data channel, so that alone would hang the
-        // join. Every `break 'consume` above jumps PAST the recycle at the
+        // join. Every `break 'consume` above jumps PAST the forward at the
         // foot of the loop, so the buffer in hand is dropped rather than
-        // returned - and the breaks are the ordinary failures, not exotic
-        // ones: a member CRC32/BLAKE2sp mismatch from a damaged payload, a
-        // write failure, a rejected entry path. Dropping the pool sender
-        // fails the producer's recv so it can exit and be joined.
-        drop(pool_tx);
+        // recycled - and the breaks are the ordinary failures, not exotic
+        // ones: a write failure, a rejected entry path. The pool sender now
+        // lives in the digester, so dropping the digest sender ends the
+        // digester, whose exit drops the pool sender and fails that recv.
+        drop(digest_tx);
+        let (verified_members, digest_error) =
+            digester.join().expect("solid chain digest thread panicked");
         let (decode, reader_error) =
             handle.join().expect("solid chain decode thread panicked");
-        (decode, reader_error, cursor)
+        (decode, reader_error, verified_members, digest_error)
     });
 
-    let (decode_result, reader_error, verified_members) = scope_outcome;
+    let (decode_result, reader_error, verified_members, digest_error) = scope_outcome;
+    // A digest failure is the earliest failure in stream order: the
+    // digester runs strictly behind the writer, so its member index is
+    // never ahead of where any write error happened - the serial
+    // consumer would have reported it first.
+    if let Some(error) = digest_error {
+        return Err(error);
+    }
     if let Some(error) = consume_error {
         return Err(error);
     }
@@ -2433,19 +2630,21 @@ impl PendingSplitRefs {
         writer: &mut dyn Write,
     ) -> Result<()> {
         let mut reader = self.fragment_reader(volumes, decryptor)?;
-        let mut crc = Crc32::new();
-        let mut hash = streaming_hash_verifier(final_file)?;
+        let crc = Crc32::new();
+        let hash = streaming_hash_verifier(final_file)?;
         let mut written = 0u64;
 
         // Same bounded pipeline as the non-split stored path; the split
         // caller wraps every error as "extracting", so the per-chunk
         // operation label is dropped rather than double-wrapped.
-        pipe_stored_chunks(
+        let (crc, hash) = pipe_stored_chunks(
             &mut *reader,
             Error::from,
+            crc,
+            hash,
             |buf| {
                 final_file
-                    .consume_stored_chunk(buf, &mut written, &mut crc, &mut hash, writer)
+                    .consume_stored_chunk(buf, &mut written, writer)
                     .map_err(|(_operation, error)| error)
             },
         )?;

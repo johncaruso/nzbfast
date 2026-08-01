@@ -298,8 +298,26 @@ pub fn facts(b: &[u8]) -> Option<crate::media::MediaFacts> {
             break;
         }
 
-        let (id, id_len) = read_id(b, pos)?;
-        let (size, size_len) = read_size(b, pos + id_len)?;
+        // A head read that stops inside an element's id/size vint is the
+        // same truncation the leaf arm below already handles by breaking
+        // and KEEPING what the walk collected - Duration, dimensions,
+        // title, track layout. Returning None here threw all of it away
+        // purely because the 4 MiB cut landed in a 5-12 byte header
+        // rather than in a payload. Downstream, a missing duration reads
+        // as "no veto" in the sample sweeper, so a real episode with
+        // "sample" in its name could be deleted. The `return None` arms
+        // are kept for a structurally invalid vint, which is a different
+        // claim from "the buffer ended here".
+        let (id, id_len) = match read_id(b, pos) {
+            Some(v) => v,
+            None if b.len() - pos < 4 => break,
+            None => return None,
+        };
+        let (size, size_len) = match read_size(b, pos + id_len) {
+            Some(v) => v,
+            None if b.len() - (pos + id_len) < 8 => break,
+            None => return None,
+        };
         let body = pos + id_len + size_len;
         let end = match size {
             Some(s) => body.checked_add(usize::try_from(s).ok()?)?,

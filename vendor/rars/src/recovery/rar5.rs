@@ -2046,72 +2046,103 @@ where
     }
     let gf = shared_gf16();
     let damaged_count = plan.damaged.len();
-    let words = stripe_len / 2;
+
+    // The per-word solve is linear in the codeword, so it collapses to one
+    // fixed coefficient per (rebuilt shard, surviving source), exactly as
+    // `recover_damaged_shards` derives:
+    //
+    //   rebuilt_i = XOR_j inverse[i][j] * parity_j
+    //             ^ XOR_k (XOR_j inverse[i][j] * matrix[j][k]) * shard_k
+    //
+    // The previous shape here - a scalar `gf.mul` per 2-byte symbol to
+    // subtract every intact shard into an rhs, then a column-major inverse
+    // solve per word - ran the `.rev` rebuild at ~48 MB/s where the inline
+    // recovery path's table fold does 6x that before parallelism. Combined
+    // data coefficients first; damaged columns stay zero because those
+    // shards are never read.
+    let mut combined = vec![vec![0u16; plan.data_count]; damaged_count];
+    for (inverse_row, combined_row) in plan.inverse.iter().zip(combined.iter_mut()) {
+        for (&weight, matrix_row) in inverse_row.iter().zip(&plan.matrix) {
+            if weight == 0 {
+                continue;
+            }
+            for (cell, &coeff) in combined_row.iter_mut().zip(matrix_row.iter()) {
+                *cell ^= gf.mul(weight, coeff);
+            }
+        }
+    }
+
+    // One source window resident at a time, folded into every output row
+    // through that source's per-output tables. Chunked so the destination
+    // stays L2-resident; parallel per chunk when the feature allows, because
+    // with a single damaged shard the chunk axis is the only parallelism
+    // there is.
+    fn fold_source_into(out: &mut [Vec<u8>], tables: &[Option<Gf16MulTable>], window: &[u8]) {
+        for (destination, table) in out.iter_mut().zip(tables) {
+            let Some(table) = table else {
+                continue;
+            };
+            let destination = &mut destination[..window.len()];
+            #[cfg(feature = "parallel")]
+            {
+                use rayon::prelude::*;
+                destination
+                    .par_chunks_mut(RECOVER_FOLD_CHUNK)
+                    .zip(window.par_chunks(RECOVER_FOLD_CHUNK))
+                    .for_each(|(destination, source)| table.fold_into(destination, source));
+            }
+            #[cfg(not(feature = "parallel"))]
+            for (destination, source) in destination
+                .chunks_mut(RECOVER_FOLD_CHUNK)
+                .zip(window.chunks(RECOVER_FOLD_CHUNK))
+            {
+                table.fold_into(destination, source);
+            }
+        }
+    }
+
     let mut scratch = vec![0u8; stripe_len];
-    let mut rhs = vec![vec![0u16; words]; damaged_count];
     let mut out = vec![vec![0u8; stripe_len]; damaged_count];
-    let mut column = vec![0u16; damaged_count];
+    // Tables live inline in the Vec (1 KiB each), so clearing and refilling
+    // per source allocates nothing after the first stripe.
+    let mut tables: Vec<Option<Gf16MulTable>> = Vec::with_capacity(damaged_count);
 
     let mut offset = 0usize;
     while offset < plan.shard_len {
         let len = stripe_len.min(plan.shard_len - offset);
-        let words = len / 2;
-
-        // Seed each equation with its recovery row's parity for this window.
-        for (slot, rhs_row) in rhs.iter_mut().enumerate() {
-            read_recovery(slot, offset, &mut scratch[..len])?;
-            for (word, cell) in rhs_row[..words].iter_mut().enumerate() {
-                *cell = u16::from_le_bytes([scratch[word * 2], scratch[word * 2 + 1]]);
-            }
+        for row in out.iter_mut() {
+            row[..len].fill(0);
         }
 
-        // Subtract every intact shard's contribution. One pass over the set
-        // per stripe: the same total I/O the whole-grid path does, spread so
-        // that only one shard's window is resident at a time.
+        // Each recovery row's parity enters through the inverse directly.
+        for slot in 0..damaged_count {
+            read_recovery(slot, offset, &mut scratch[..len])?;
+            tables.clear();
+            tables.extend(plan.inverse.iter().map(|row| {
+                let coeff = row[slot];
+                (coeff != 0).then(|| Gf16MulTable::new(gf, coeff))
+            }));
+            fold_source_into(&mut out, &tables, &scratch[..len]);
+        }
+
+        // Every intact shard enters through its combined coefficient. One
+        // pass over the set per stripe: the same total I/O the whole-grid
+        // path does, spread so that only one shard's window is resident at
+        // a time.
         for data_index in 0..plan.data_count {
             if plan.damaged_lookup[data_index] {
                 continue;
             }
-            let mut needed = false;
-            for cells in &plan.matrix {
-                if cells[data_index] != 0 {
-                    needed = true;
-                    break;
-                }
-            }
-            if !needed {
+            if combined.iter().all(|row| row[data_index] == 0) {
                 continue;
             }
             read_data(data_index, offset, &mut scratch[..len])?;
-            for (slot, cells) in plan.matrix.iter().enumerate() {
-                let coeff = cells[data_index];
-                if coeff == 0 {
-                    continue;
-                }
-                let rhs_row = &mut rhs[slot];
-                for word in 0..words {
-                    let symbol =
-                        u16::from_le_bytes([scratch[word * 2], scratch[word * 2 + 1]]);
-                    rhs_row[word] ^= gf.mul(coeff, symbol);
-                }
-            }
-        }
-
-        // Solve each symbol column independently. Applied in place rather
-        // than through `apply_inverse_matrix`, which returns a fresh Vec: at
-        // one call per 2-byte symbol that is an allocation every two bytes of
-        // the volume, and this loop runs over the whole shard length.
-        for word in 0..words {
-            for (slot, cell) in column.iter_mut().enumerate() {
-                *cell = rhs[slot][word];
-            }
-            for (slot, row) in plan.inverse.iter().enumerate() {
-                let symbol = row
-                    .iter()
-                    .zip(&column)
-                    .fold(0u16, |sum, (&coeff, &value)| sum ^ gf.mul(coeff, value));
-                out[slot][word * 2..word * 2 + 2].copy_from_slice(&symbol.to_le_bytes());
-            }
+            tables.clear();
+            tables.extend(combined.iter().map(|row| {
+                let coeff = row[data_index];
+                (coeff != 0).then(|| Gf16MulTable::new(gf, coeff))
+            }));
+            fold_source_into(&mut out, &tables, &scratch[..len]);
         }
 
         for (slot, shard) in out.iter().enumerate() {

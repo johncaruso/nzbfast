@@ -35,6 +35,14 @@
 //!   against the account's connection limit, which the user's other
 //!   clients also draw on, so they are evicted after `max_idle`. The
 //!   keepalive tick doubles as the reaper.
+//!
+//! - **An idle POOL is released, not just an idle connection.** `max_idle`
+//!   ages out each session from its own park time; the release policy
+//!   below acts on the pool as a whole once no job has touched it for a
+//!   while, and trims every server down to a floor. The distinction
+//!   matters to a provider that caps CONCURRENT DISTINCT SOURCE IPS per
+//!   account rather than connections - see
+//!   [`WarmPool::set_release_policies`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -55,7 +63,46 @@ const KEEPALIVE_EVERY: Duration = Duration::from_secs(60);
 /// A parked connection older than this is closed rather than kept alive:
 /// it is occupying one of the account's connection slots that the user's
 /// other clients (and their *arr stack) also draw on.
+///
+/// This is the ABSOLUTE ceiling on how long any session is held, and the
+/// idle-release policy below only ever shortens it. Nothing the operator
+/// can configure makes the pool hold a connection for longer than this,
+/// so no setting here can create an indefinite hold.
 pub const DEFAULT_MAX_IDLE: Duration = Duration::from_secs(600);
+
+/// Release the pool down to its floor after this long with no job
+/// touching it.
+///
+/// Chosen against the re-warm cost, which is what the pool exists to
+/// avoid: a cold fleet costs 4.5-14.3x on job start, so a timeout of
+/// tens of seconds would spend that repeatedly and defeat the feature,
+/// while jobs arriving minutes apart are already a cold start from the
+/// user's point of view. Five minutes covers the case the pool actually
+/// pays for - a queue of NZBs draining back to back, an *arr grabbing a
+/// season - and gives the account back on any longer gap.
+pub const DEFAULT_IDLE_RELEASE: Duration = Duration::from_secs(300);
+
+/// The same timeout when the operator has configured a provider known to
+/// cap concurrent distinct SOURCE IPS - see
+/// [`crate::config::caps_source_ips`]. Shorter because the cost of
+/// holding is qualitatively different there: it is not a slice of a
+/// generous connection allowance, it is one of two or three IP slots for
+/// the whole account, so the user's other machines are locked out
+/// entirely rather than merely slowed.
+pub const CAPPED_IDLE_RELEASE: Duration = Duration::from_secs(120);
+
+/// Most connections the daemon parks per server.
+///
+/// Deliberately generous rather than tied to the configured
+/// `connections`: the fleet that parks them was already sized by the
+/// account limit so it cannot overshoot, while a cap read from a config
+/// that has since SHRUNK would evict live connections mid-run.
+///
+/// Public because it is also the ceiling on a meaningful idle-release
+/// FLOOR - keeping more than the pool will ever park is the same as
+/// keeping everything, and a setting that silently means nothing is
+/// worse than one that is clamped.
+pub const MAX_PER_SERVER: usize = 64;
 
 /// Bound on the DATE that validates a parked connection, instead of the
 /// protocol-wide 60 s command timeout it used to inherit.
@@ -118,6 +165,11 @@ pub struct WarmStats {
     pub parked: AtomicU64,
     pub evicted: AtomicU64,
     pub reaped: AtomicU64,
+    /// Closed by the idle-release policy, as opposed to aged out one by
+    /// one by `max_idle` (`evicted`). Separated because they answer
+    /// different questions: `evicted` says sessions are outliving their
+    /// usefulness, `released` says the account was handed back.
+    pub released: AtomicU64,
 }
 
 pub struct WarmPool {
@@ -129,6 +181,33 @@ pub struct WarmPool {
     /// it, but capped explicitly so a config that shrinks `connections`
     /// cannot leave a bigger old fleet parked.
     per_server: usize,
+    /// Per-server idle-release policy, keyed exactly as `idle` is.
+    ///
+    /// Keyed rather than global because a server is an ACCOUNT: each
+    /// provider counts its own limit against its own account, and two
+    /// servers share nothing. A single policy would either shorten a lax
+    /// provider's timeout for no benefit or leave a strict one's lockout
+    /// in place.
+    ///
+    /// Empty until the daemon installs one, so a pool built by a caller
+    /// that knows nothing about the setting (the CLI, a test) releases
+    /// nothing and behaves exactly as it did before.
+    ///
+    /// A std mutex, not the async one guarding `idle`: this is only ever
+    /// swapped wholesale or cloned, never held across an await, and it
+    /// has to be settable from the sync config paths (a server saved
+    /// from the dashboard runs on a blocking handler thread). Making it
+    /// async would have forced those to spawn a task just to store two
+    /// numbers.
+    release: std::sync::Mutex<HashMap<String, crate::config::ReleasePolicy>>,
+    /// Last time a job touched the pool, in either direction. A checkout
+    /// and a park are both "a job is using this account", and idleness
+    /// has to mean neither has happened - measuring only checkouts would
+    /// call a pool idle in the middle of the job that just filled it.
+    ///
+    /// A std mutex on an `Instant`: never held across an await, and the
+    /// tick reads it before taking the map lock.
+    last_activity: std::sync::Mutex<Instant>,
     pub stats: WarmStats,
 }
 
@@ -156,6 +235,8 @@ impl WarmPool {
             generation: AtomicU64::new(0),
             max_idle,
             per_server,
+            release: std::sync::Mutex::new(HashMap::new()),
+            last_activity: std::sync::Mutex::new(Instant::now()),
             stats: WarmStats::default(),
         });
         let weak = Arc::downgrade(&pool);
@@ -169,12 +250,64 @@ impl WarmPool {
         pool
     }
 
+    /// Install each server's idle-release policy, replacing whatever was
+    /// installed before.
+    ///
+    /// `policy.after` is how long the pool must go untouched before it
+    /// trims that server; `None` disables releasing for it, which is the
+    /// right answer for a NAS or seedbox that is the account's only
+    /// consumer - there is nobody to hand the slots back TO, and holding
+    /// them costs that install nothing.
+    ///
+    /// `policy.keep` is the floor the trim releases DOWN TO, not to
+    /// zero, so a job arriving after the timeout still starts on a warm
+    /// session while the rest of that server's slots are free.
+    ///
+    /// One caveat decides that floor, and it is the whole reason this
+    /// exists: a provider that caps concurrent distinct SOURCE IPS
+    /// (UsenetExpress at 2, Giganews and Newshosting at 1) counts the
+    /// HOST, not the socket. Against those, keeping one connection
+    /// occupies exactly as much of the cap as keeping sixty, so a floor
+    /// of 1 frees nothing at all and the floor must be 0. A floor above
+    /// zero is only meaningful where the limit being shared is a
+    /// connection COUNT.
+    ///
+    /// Note the interaction with `max_idle`, which still applies to
+    /// whatever survives: the floor is kept for the rest of that
+    /// session's `max_idle`, not forever. So this can only ever shorten
+    /// how long the account is occupied - there is no setting here that
+    /// makes the pool hold a connection indefinitely.
+    ///
+    /// A server absent from `servers` keeps no policy and is never
+    /// released by this path. That is deliberate rather than an
+    /// oversight: a server the config no longer lists is
+    /// `retain_servers`' business, which closes it outright instead of
+    /// trimming it to a floor.
+    pub fn set_release_policies(&self, servers: &[ServerConfig]) {
+        let next: HashMap<String, crate::config::ReleasePolicy> =
+            servers.iter().map(|s| (key(s), s.idle_release_policy())).collect();
+        *self.release.lock().unwrap() = next;
+    }
+
+    /// One server's installed policy, for the dashboard and for tests.
+    pub fn release_policy(&self, server: &ServerConfig) -> Option<crate::config::ReleasePolicy> {
+        self.release.lock().unwrap().get(&key(server)).copied()
+    }
+
+    fn touch(&self) {
+        *self.last_activity.lock().unwrap() = Instant::now();
+    }
+
     /// A live, validated session for `server`, or None to connect fresh.
     ///
     /// The DATE round-trip is the contract: callers get a connection that
     /// has just answered a command, so a checkout is interchangeable with
     /// a connect and no existing error path has to learn about staleness.
     pub async fn take(&self, server: &ServerConfig) -> Option<Connection> {
+        // Before the early `?` returns: a checkout that MISSES is still a
+        // job reaching for this account, and the release policy must not
+        // treat a pool that is being hammered with misses as idle.
+        self.touch();
         let k = key(server);
         loop {
             let mut candidate = {
@@ -231,6 +364,7 @@ impl WarmPool {
     /// Park a connection that has NO unread responses on its socket.
     /// Anything else must be closed instead - see the module docs.
     pub async fn give(&self, server: &ServerConfig, conn: Connection) {
+        self.touch();
         if self.per_server == 0 {
             conn.quit().await;
             return;
@@ -304,10 +438,77 @@ impl WarmPool {
         self.idle.lock().await.values().map(|v| v.len()).sum()
     }
 
-    /// Keepalive + reap. Evicts anything past `max_idle`, then pings
-    /// whatever has gone quiet for a keepalive interval and drops what
-    /// does not answer, so `take` almost always finds a live session.
+    /// How long since a job last used the pool.
+    pub fn idle_for(&self) -> Duration {
+        self.last_activity.lock().unwrap().elapsed()
+    }
+
+    /// Trim each server down to ITS OWN floor once the pool has gone
+    /// untouched for that server's release timeout, handing those
+    /// connection slots (and, for an address-capped provider, the
+    /// account itself) back to the operator's other machines.
+    ///
+    /// Per server throughout: a server is an account, and one provider's
+    /// limit says nothing about another's. A mixed config - a flatrate
+    /// primary that does not care, plus a block account at a provider
+    /// allowing two addresses - correctly releases the second on its own
+    /// short timeout while the first keeps its fleet warm.
+    ///
+    /// Runs BEFORE the keepalive pings in `tick`, so a session about to
+    /// be released does not first spend a round-trip being kept alive.
+    ///
+    /// Granularity is one keepalive interval, since this is the tick's
+    /// passenger: a 300 s timeout releases somewhere in 300-360 s. That
+    /// is well inside the tolerance of a setting whose whole purpose is
+    /// "a few minutes", and it costs no second timer.
+    async fn release_if_idle(&self) {
+        let idle_for = self.idle_for();
+        let policies = self.release.lock().unwrap().clone();
+        if policies.is_empty() {
+            return;
+        }
+        let surplus: Vec<Parked> = {
+            let mut idle = self.idle.lock().await;
+            let mut out = Vec::new();
+            for (k, v) in idle.iter_mut() {
+                // No policy for this key = not a server the daemon last
+                // installed one for; leave it to `retain_servers`.
+                let Some(p) = policies.get(k) else { continue };
+                let Some(after) = p.after else { continue };
+                if idle_for < after {
+                    continue;
+                }
+                let keep = p.keep;
+                if v.len() > keep {
+                    // Oldest first. `take` pops from the END, so the tail
+                    // holds the most recently parked - the warmest
+                    // congestion window and the longest left before the
+                    // provider's own idle timeout. Releasing from the
+                    // front keeps the best of what the floor allows.
+                    out.extend(v.drain(..v.len() - keep));
+                }
+            }
+            // A server trimmed to nothing leaves an empty Vec that `take`
+            // would treat as a hit-then-miss; drop the entry outright.
+            idle.retain(|_, v| !v.is_empty());
+            out
+        };
+        if surplus.is_empty() {
+            return;
+        }
+        self.stats.released.fetch_add(surplus.len() as u64, Ordering::Relaxed);
+        // Concurrently, for the reason in `quit_all`: a released fleet is
+        // the same shape as a cleared one, and serially a black-holed set
+        // of 64 would outlast the interval this tick is due again in.
+        quit_all(surplus).await;
+    }
+
+    /// Keepalive + reap. Releases an idle pool down to its floor, evicts
+    /// anything past `max_idle`, then pings whatever has gone quiet for a
+    /// keepalive interval and drops what does not answer, so `take`
+    /// almost always finds a live session.
     async fn tick(&self) {
+        self.release_if_idle().await;
         let now = Instant::now();
         // Take the connections that need work OUT of the map, so the lock
         // is never held across a network round-trip - a slow provider
@@ -401,6 +602,23 @@ mod tests {
             socks5: None,
             enabled: true,
             warm_pool: false,
+            idle_release_secs: None,
+            idle_keep: None,
+            max_source_ips: None,
+        }
+    }
+
+    /// `bare_config` with an explicit idle-release policy, since the
+    /// policy now travels ON the server rather than on the pool.
+    fn policy_config(
+        addr: std::net::SocketAddr,
+        secs: Option<u64>,
+        keep: u32,
+    ) -> ServerConfig {
+        ServerConfig {
+            idle_release_secs: Some(secs.unwrap_or(0)),
+            idle_keep: Some(keep),
+            ..bare_config(addr)
         }
     }
 
@@ -423,6 +641,301 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// A provider that answers normally AND counts how many sockets are
+    /// still open against it.
+    ///
+    /// The whole point of the release tests. The pool's own bookkeeping
+    /// saying a connection is gone proves nothing to a provider counting
+    /// slots against the account - and nothing to the user's laptop
+    /// being turned away - unless the socket is actually closed. A
+    /// `idle_count == 0` that left five ESTABLISHED sessions on the wire
+    /// is precisely the bug being tested for, and only an observer at
+    /// the other end can see the difference.
+    fn counting_provider() -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{BufRead, BufReader, Write as _};
+        use std::sync::atomic::AtomicUsize;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let live = Arc::new(AtomicUsize::new(0));
+        let counter = live.clone();
+        std::thread::spawn(move || {
+            while let Ok((mut s, _)) = listener.accept() {
+                let live = counter.clone();
+                live.fetch_add(1, Ordering::SeqCst);
+                // A thread per session, blocking std sockets: the peer
+                // has to keep answering while the test drives the pool,
+                // and has to notice a close the moment it happens.
+                std::thread::spawn(move || {
+                    let _ = s.write_all(b"200 mock ready\r\n");
+                    let _ = s.flush();
+                    let mut reader = BufReader::new(s.try_clone().expect("dup"));
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line) {
+                            Ok(0) | Err(_) => break, // FIN or RST: gone
+                            Ok(_) => {}
+                        }
+                        let quit = line.to_ascii_uppercase().starts_with("QUIT");
+                        let reply: &[u8] =
+                            if quit { b"205 bye\r\n" } else { b"111 20260731000000\r\n" };
+                        if s.write_all(reply).is_err() {
+                            break;
+                        }
+                        let _ = s.flush();
+                        if quit {
+                            break;
+                        }
+                    }
+                    live.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+        (addr, live)
+    }
+
+    /// Wait (briefly, on the real clock) for the peer's open-session
+    /// count to reach `want`, and report what it actually got to. The
+    /// close is observed on another thread, so polling for it is the
+    /// difference between testing the behaviour and racing it.
+    async fn live_settles(live: &std::sync::atomic::AtomicUsize, want: usize) -> usize {
+        for _ in 0..200 {
+            let n = live.load(Ordering::SeqCst);
+            if n == want {
+                return n;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        live.load(Ordering::SeqCst)
+    }
+
+    /// Age the pool's activity clock by hand. It is a real monotonic
+    /// `Instant`, which no test clock moves, so this is the only way to
+    /// reach a multi-minute timeout without waiting out minutes.
+    fn go_idle_for(pool: &WarmPool, d: Duration) {
+        let mut t = pool.last_activity.lock().unwrap();
+        *t = t.checked_sub(d).expect("monotonic clock older than the rewind");
+    }
+
+    /// The headline: an idle pool must hand the SOCKETS back, not merely
+    /// forget about them.
+    ///
+    /// This is the cost the warm pool never priced. Providers that cap
+    /// concurrent distinct source IPs per account - UsenetExpress at 2,
+    /// Giganews and Newshosting at 1 - count an idle daemon's IP as an
+    /// occupied slot for as long as the socket exists, so a home box
+    /// doing nothing at all locks the user's laptop, seedbox or bench
+    /// machine out of their own account. Internal state is not what the
+    /// provider counts, so it is not what this asserts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_idle_pool_closes_its_sockets_not_just_its_bookkeeping() {
+        const N: usize = 5;
+        let (addr, live) = counting_provider();
+        let sc = policy_config(addr, Some(300), 0);
+        let pool = WarmPool::new(DEFAULT_MAX_IDLE, 8);
+        pool.set_release_policies(std::slice::from_ref(&sc));
+
+        for _ in 0..N {
+            let (conn, _) = Connection::connect(&sc).await.unwrap();
+            pool.give(&sc, conn).await;
+        }
+        assert_eq!(live_settles(&live, N).await, N, "the provider sees {N} sessions");
+
+        // A pool that was in use a moment ago is not idle, and releasing
+        // it would spend the 4.5-14.3x cold-start cost this module
+        // exists to avoid.
+        pool.tick().await;
+        assert_eq!(pool.idle_count().await, N, "a pool still in use must be left alone");
+        assert_eq!(live.load(Ordering::SeqCst), N);
+
+        go_idle_for(&pool, Duration::from_secs(301));
+        pool.tick().await;
+
+        assert_eq!(pool.idle_count().await, 0);
+        assert_eq!(pool.stats.released.load(Ordering::Relaxed), N as u64);
+        assert_eq!(
+            live_settles(&live, 0).await,
+            0,
+            "the pool dropped {N} sessions from its map but left them ESTABLISHED \
+             on the wire: the account is still locked to this host's IP, which is \
+             the entire problem the idle release exists to solve"
+        );
+    }
+
+    /// Releasing DOWN TO a floor rather than to zero: the next job still
+    /// starts on a warm session per server while the rest of the fleet's
+    /// slots go back to the account.
+    ///
+    /// The survivor must be the most recently parked one - the warmest
+    /// congestion window, and the longest left before the provider's own
+    /// idle timeout - for the same reason `take` pops from the end.
+    ///
+    /// Worth stating plainly: a floor above zero is only meaningful
+    /// against a CONNECTION cap. A provider capping source IPs counts
+    /// this host once whether it holds one session or sixty, which is
+    /// why the derived default for those is a floor of zero.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_release_floor_keeps_the_warmest_and_frees_the_rest() {
+        let (addr, live) = counting_provider();
+        let sc = policy_config(addr, Some(120), 1);
+        let pool = WarmPool::new(DEFAULT_MAX_IDLE, 8);
+        pool.set_release_policies(std::slice::from_ref(&sc));
+
+        for _ in 0..4 {
+            let (conn, _) = Connection::connect(&sc).await.unwrap();
+            pool.give(&sc, conn).await;
+        }
+        let newest = {
+            let idle = pool.idle.lock().await;
+            idle.values().flatten().map(|p| p.parked_at).max().expect("four parked")
+        };
+
+        go_idle_for(&pool, Duration::from_secs(121));
+        pool.tick().await;
+
+        assert_eq!(pool.idle_count().await, 1, "released down to the floor, not to zero");
+        assert_eq!(pool.stats.released.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            live_settles(&live, 1).await,
+            1,
+            "three of the four sockets must actually be closed"
+        );
+        {
+            let idle = pool.idle.lock().await;
+            let kept = idle.values().flatten().map(|p| p.parked_at).next().expect("one left");
+            assert_eq!(
+                kept, newest,
+                "the floor kept the OLDEST session: it has the least of the warm \
+                 congestion window the pool exists to preserve and the least time \
+                 left before the provider reaps it anyway"
+            );
+        }
+        // And it is a session, not a placeholder: a floor that cannot be
+        // checked out has kept nothing.
+        let mut got = pool.take(&sc).await.expect("the kept session");
+        got.date().await.expect("a kept session still speaks NNTP");
+    }
+
+    /// The mixed config, and the reason the policy is per SERVER: a
+    /// flatrate primary that does not care about idle connections,
+    /// alongside a block account at a provider allowing two addresses.
+    ///
+    /// A server is an ACCOUNT. Each provider counts its own limit
+    /// against its own account and the two share nothing, so one
+    /// process-wide policy is wrong in both directions - it would either
+    /// drag the primary down to the strict account's short timeout and
+    /// zero floor, throwing away warm connections on a link that never
+    /// had a problem, or leave the strict account's lockout in place.
+    ///
+    /// Two separate peers, so the socket counts are independent and the
+    /// assertion is about real connections rather than bookkeeping.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_strict_server_releases_while_a_lax_one_keeps_its_fleet() {
+        let (lax_addr, lax_live) = counting_provider();
+        let (strict_addr, strict_live) = counting_provider();
+        // The lax one is not due to release for an hour; the strict one
+        // is due after two minutes and keeps nothing.
+        let lax = policy_config(lax_addr, Some(3600), 4);
+        let strict = policy_config(strict_addr, Some(120), 0);
+
+        let pool = WarmPool::new(DEFAULT_MAX_IDLE, 8);
+        pool.set_release_policies(&[lax.clone(), strict.clone()]);
+        for sc in [&lax, &strict] {
+            for _ in 0..3 {
+                let (conn, _) = Connection::connect(sc).await.unwrap();
+                pool.give(sc, conn).await;
+            }
+        }
+        assert_eq!(live_settles(&lax_live, 3).await, 3);
+        assert_eq!(live_settles(&strict_live, 3).await, 3);
+
+        // Idle past the strict server's timeout, nowhere near the lax
+        // one's.
+        go_idle_for(&pool, Duration::from_secs(300));
+        pool.tick().await;
+
+        assert_eq!(
+            live_settles(&strict_live, 0).await,
+            0,
+            "the address-capped account must be handed back on its own timeout"
+        );
+        assert_eq!(
+            lax_live.load(Ordering::SeqCst),
+            3,
+            "the other provider shares nothing with it and must keep its warm \
+             fleet: letting the strictest server in the config decide for all of \
+             them spends the cold-start cost on links that never had the problem"
+        );
+        assert_eq!(pool.idle_count().await, 3);
+        assert_eq!(pool.stats.released.load(Ordering::Relaxed), 3);
+    }
+
+    /// The off switch. A NAS or seedbox that is the account's only
+    /// consumer has nobody to hand the slots back to, so releasing them
+    /// is pure cost - it buys a cold start for nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn releasing_can_be_turned_off_entirely() {
+        let (addr, live) = counting_provider();
+        let sc = policy_config(addr, None, 0);
+        let pool = WarmPool::new(DEFAULT_MAX_IDLE, 8);
+        pool.set_release_policies(std::slice::from_ref(&sc));
+        assert_eq!(pool.release_policy(&sc).expect("installed").after, None);
+
+        for _ in 0..3 {
+            let (conn, _) = Connection::connect(&sc).await.unwrap();
+            pool.give(&sc, conn).await;
+        }
+        // Far past any timeout a policy could have set, but still inside
+        // `max_idle`, which is a separate mechanism and still applies.
+        go_idle_for(&pool, Duration::from_secs(3600));
+        pool.tick().await;
+
+        assert_eq!(pool.idle_count().await, 3, "nothing may be released with the policy off");
+        assert_eq!(pool.stats.released.load(Ordering::Relaxed), 0);
+        assert_eq!(live.load(Ordering::SeqCst), 3);
+    }
+
+    /// `max_idle` remains the ceiling on ANY held session, whatever the
+    /// release policy says. It is what makes the floor safe: "keep one
+    /// per server" keeps it for the rest of that session's `max_idle`,
+    /// not forever, so no setting reachable here can produce the
+    /// indefinite hold the whole change is meant to remove.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_floor_does_not_outlive_max_idle() {
+        let (addr, live) = counting_provider();
+        let sc = policy_config(addr, Some(120), 2);
+        let pool = WarmPool::new(Duration::from_secs(600), 8);
+        pool.set_release_policies(std::slice::from_ref(&sc));
+
+        for _ in 0..3 {
+            let (conn, _) = Connection::connect(&sc).await.unwrap();
+            pool.give(&sc, conn).await;
+        }
+        // Age the sessions themselves past max_idle, as an hour of
+        // sitting there would.
+        {
+            let mut idle = pool.idle.lock().await;
+            for p in idle.values_mut().flatten() {
+                p.parked_at = p
+                    .parked_at
+                    .checked_sub(Duration::from_secs(601))
+                    .expect("monotonic clock older than max_idle");
+            }
+        }
+        go_idle_for(&pool, Duration::from_secs(121));
+        pool.tick().await;
+
+        assert_eq!(
+            pool.idle_count().await,
+            0,
+            "a floor of 2 must not exempt those two from max_idle - that would \
+             turn a bounded 10-minute hold into a permanent one, which is worse \
+             than the behaviour this change replaces"
+        );
+        assert_eq!(live_settles(&live, 0).await, 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]

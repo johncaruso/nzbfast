@@ -179,6 +179,31 @@ check "unwritable share falls back to package storage" \
     "$r/var/downloads" \
     "$(grep '^NZBFAST_OUT=' "$r/var/nzbfast.env" 2>/dev/null | cut -d= -f2-)"
 
+# --- a reused folder we cannot write to must fall back too --------------
+#
+# A Container Manager migration leaves <share>/nzbfast/downloads owned by
+# the container's PUID at 0755: searchable by the package account, not
+# writable by it. [ -d ] alone accepts that, the install reports success,
+# and then every job dies at create_dir_all and every watch import fails,
+# with nothing in the GUI saying why. Existence is not permission.
+r="$T/m"
+mkdir -p "$r/volume1/downloads/nzbfast/downloads" \
+         "$r/volume1/downloads/nzbfast/watch" "$r/var"
+chmod 555 "$r/volume1/downloads/nzbfast/downloads"
+chmod 555 "$r/volume1/downloads/nzbfast/watch"
+SPK_TEST_ROOT="$r" SYNOPKG_PKGVAR="$r/var" SPK_TEST_SKIP_PORTCHECK=1 \
+    sh "$POSTINST" >/dev/null 2>&1
+chmod 755 "$r/volume1/downloads/nzbfast/downloads"   # for the cleanup trap
+chmod 755 "$r/volume1/downloads/nzbfast/watch"
+check "unwritable reused folder falls back to package storage" \
+    "$r/var/downloads" \
+    "$(grep '^NZBFAST_OUT=' "$r/var/nzbfast.env" 2>/dev/null | cut -d= -f2-)"
+# The probe runs inside somebody's live download folder, so it has to
+# leave it exactly as it found it, on the declining path as much as the
+# accepting one.
+check "probe leaves nothing behind" "" \
+    "$(ls -A "$r/volume1/downloads/nzbfast/downloads" 2>/dev/null)"
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]

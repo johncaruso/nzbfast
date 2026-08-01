@@ -289,3 +289,190 @@ async fn three_jobs_back_to_back_all_byte_identical() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The NZB xml the addfile tests post, from `make_file_articles` output.
+fn nzb_xml(inner_name: &str, segs: &[(String, u64, u32)]) -> String {
+    let mut xml = String::from(
+        "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n",
+    );
+    xml.push_str(&format!(
+        "  <file poster=\"x\" date=\"0\" subject=\"&quot;{inner_name}&quot; yEnc (1/{})\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+        segs.len()
+    ));
+    for (id, bytes, num) in segs {
+        xml.push_str(&format!(
+            "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+        ));
+    }
+    xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+    xml
+}
+
+fn addfile(port: u16, filename: &str, xml: &str) {
+    let boundary = "----qsoakb";
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!("--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"{filename}\"\r\n\r\n").as_bytes(),
+    );
+    body.extend_from_slice(xml.as_bytes());
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let r = http(
+        port,
+        "/api?mode=addfile&output=json",
+        Some((&format!("multipart/form-data; boundary={boundary}"), &body)),
+    );
+    assert!(r.contains("\"status\":true"), "{r}");
+}
+
+/// BUG (HIGH, 31 Jul queue soak): a COMPLETED and auto-RENAMED job
+/// re-queued itself and downloaded the whole release a second time into
+/// the renamed directory.
+///
+/// The shape: job N's tail stalls on disk work (in the field, a headless
+/// Finder-trash timeout), so job N+1 finishes its network phase but sits
+/// `Downloading` in the queue while the runner waits on that tail. The
+/// slow-job watchdog reads the drained pool over its window as "≥90% from
+/// one host at a fraction of the session-best rate, with others waiting"
+/// and demotes it - firing an abort at a pipeline that has already won.
+/// The fetch returns Ok, post-processing renames the directory, and
+/// park()'s demote arm then silently re-queued the finished job.
+///
+/// This test rebuilds that stage: two servers (one holding nothing, so
+/// the busy one's share is 100%), a first job whose finalize is held open
+/// by the test-only stall hook, a middle job slow enough for the watchdog
+/// window (per-article delay), auto-rename renaming its folder, and a
+/// third job waiting so `others_waiting` holds. The watchdog runs at
+/// test-compressed warmup/window. Each job must download exactly once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_completed_renamed_job_never_requeues() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-qrerun-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Server A holds every article, throttled so the middle job's network
+    // phase spans several watchdog ticks. Server B holds nothing and
+    // answers 430 - a live pool member contributing zero bytes, which is
+    // what pushes A's share to 100%.
+    let mut articles = HashMap::new();
+    let stall_payload = payload(1_000_000, 11);
+    let movie_payload = payload(45_000_000, 22);
+    let tail_payload = payload(300_000, 33);
+    let stall_segs =
+        make_file_articles("first.bin", &stall_payload, 60_000, "qr0", &mut articles);
+    let movie_segs =
+        make_file_articles("video.mkv", &movie_payload, 60_000, "qr1", &mut articles);
+    let tail_segs =
+        make_file_articles("last.bin", &tail_payload, 60_000, "qr2", &mut articles);
+    let srv_a = MockServer::start(articles, Chaos { delay_ms: 40, ..Chaos::default() }).await;
+    let srv_b = MockServer::start(HashMap::new(), Chaos::default()).await;
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}},{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv_a.addr.ip(),
+            srv_a.addr.port(),
+            srv_b.addr.ip(),
+            srv_b.addr.port()
+        ),
+    )
+    .unwrap();
+    let logdir = dir.clone();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            // Compressed watchdog timeline (the env hooks the watchdog
+            // documents for tests) plus the finalize stall that models
+            // the field's Finder-trash timeout.
+            .env("NZBFAST_DEFER_WARMUP_SECS", "1")
+            .env("NZBFAST_DEFER_WINDOW_SECS", "4")
+            .env("NZBFAST_TEST_STALL_FINALIZE_MS", "26000")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--connections")
+            .arg("2");
+        c
+    })
+    .await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        // No idle-server prefetch: its sidecar would suppress the defer
+        // verdict while it runs, and this test wants the verdict itself
+        // deterministic.
+        let r = http(port, "/api?mode=config&name=auto_prefetch&value=0&output=json", None);
+        assert!(r.contains("true"), "{r}");
+        addfile(port, "first-job.nzb", &nzb_xml("first.bin", &stall_segs));
+        addfile(
+            port,
+            "Test.Movie.2023.1080p.x264-BUG.nzb",
+            &nzb_xml("video.mkv", &movie_segs),
+        );
+        addfile(port, "last-job.nzb", &nzb_xml("last.bin", &tail_segs));
+
+        // All three must land Completed - through the stalled tails this
+        // takes a while, so the deadline is generous. A run that trips
+        // the bug still gets here (the re-download completes too); the
+        // banner count below is what convicts it.
+        let mut done = false;
+        for _ in 0..900 {
+            let h = http(port, "/api?mode=history&output=json", None);
+            if h.matches("\"Completed\"").count() >= 3 {
+                assert!(!h.contains("\"Failed\""), "{h}");
+                done = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        assert!(done, "queue never drained to 3 Completed");
+        let q = http(port, "/api?mode=queue&output=json", None);
+        assert!(q.contains("\"noofslots\":0"), "{q}");
+
+        // Single download per job: the runner prints one start banner
+        // ("<spool nzb>: N files ...") per pipeline launch, so a job
+        // whose banner appears twice downloaded twice. Give the daemon a
+        // beat first - the buggy re-queue happened AFTER history already
+        // showed the job Completed.
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let log = std::fs::read_dir(&logdir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("daemon-") && n.ends_with(".log"))
+            })
+            .map(|p| std::fs::read_to_string(p).unwrap_or_default())
+            .collect::<String>();
+        for stem in ["first-job.nzb:", "test.movie.2023.1080p.x264-bug.nzb:", "last-job.nzb:"] {
+            let starts = log
+                .to_ascii_lowercase()
+                .matches(&stem.to_ascii_lowercase())
+                .count();
+            assert_eq!(
+                starts, 1,
+                "{stem} started {starts} downloads - a completed job re-queued\n--- log ---\n{log}"
+            );
+        }
+        // The rename leg really ran: the movie job's folder left under
+        // its release name would mean the bug shape was never exercised.
+        assert!(
+            log.contains("[smart] renamed"),
+            "auto-rename never renamed the movie folder\n--- log ---\n{log}"
+        );
+    })
+    .await
+    .unwrap();
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -51,7 +51,20 @@ use nzbkit::nzb::{FileKind, Nzb};
 #[command(name = "nzbfast", version, about = "Speed-focused NZB downloader")]
 struct Cli {
     /// Path to config with server credentials.
-    #[arg(long, default_value = "config.local.json", global = true)]
+    ///
+    /// Falls back to $NZBFAST_CONFIG before the cwd-relative default, so
+    /// every subcommand lands on the same file the daemon is serving from.
+    /// The container sets that variable (ENV NZBFAST_CONFIG=/config/config.json)
+    /// and its entrypoint already honoured it, but the CLI did not: a
+    /// `docker exec … import-sab` wrote /config/config.local.json - a real
+    /// file, which `probe` then read back happily - while the daemon kept
+    /// serving from /config/config.json and showed no servers at all.
+    #[arg(
+        long,
+        env = "NZBFAST_CONFIG",
+        default_value = "config.local.json",
+        global = true
+    )]
     config: PathBuf,
 
     /// Memory budget for the pipeline's cache tiers (e.g. 512M, 2G).
@@ -653,8 +666,12 @@ async fn run() -> Result<()> {
             nzbkit::disk::set_drop_cache_default(true);
             if preflight {
                 let verdict = check(&cli.config, &nzb, 10, 4, 50).await?;
-                if let Verdict::Impossible { .. } = verdict {
-                    anyhow::bail!("aborting: pre-flight says this post cannot complete");
+                if let Verdict::Impossible { est_missing, recovery } = verdict {
+                    anyhow::bail!(
+                        "aborting: pre-flight says this post cannot complete - an \
+                         estimated {est_missing} segment(s) are unavailable on every \
+                         server against {recovery} recovery block(s) in the NZB"
+                    );
                 }
             }
             get_with_progress(
@@ -857,6 +874,7 @@ async fn run() -> Result<()> {
                 verify_lean: false,
                 min_free: size("min-free", min_free)?,
                 auto_retry_mins: 20,
+                preflight: false,
                 quota: size("quota", quota)?,
                 quota_period,
                 feeds,
@@ -1991,7 +2009,7 @@ fn extract_one_level(
         // Anything else - an exotic codec, an encrypted entry - still
         // reports as a gap rather than a failure to open, so the message
         // names what was hit and the caller can still forgive a sidecar.
-        if extract_zip(dir, &zips) {
+        if extract_zip(dir, &zips, password) {
             return Ok(Some(NestOutcome::Produced));
         }
         return Ok(Some(NestOutcome::ZipGap));
@@ -2063,30 +2081,35 @@ fn snapshot_recursive(dir: &std::path::Path) -> Result<std::collections::HashSet
     Ok(out)
 }
 
+/// Does this file open with the `PAR2\0PKT` packet magic?
+///
+/// The one test that recognises an obfuscated recovery volume, whose name
+/// carries nothing: the magic is unambiguous, no media container starts
+/// with it, and it decides where the extension cannot. Three callers had
+/// grown their own copy of these eight bytes; a fourth would have been
+/// one too many, since the whole class of bug this answers (issue #9) is
+/// a path that checked the NAME because the content test was somewhere
+/// else. `smart::par2_magic` is the same test on the extraction side.
+fn file_starts_with_par2_magic(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    if !std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() >= 8) {
+        return false;
+    }
+    let mut head = [0u8; 8];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut head))
+        .is_ok_and(|()| &head == b"PAR2\x00PKT")
+}
+
 /// Does `dir` hold a `.par2` set by name OR by the `PAR2\0PKT` magic
 /// (obfuscated recovery volumes lose their extension)?
 fn dir_has_par2(dir: &std::path::Path) -> Result<bool> {
-    use std::io::Read;
-    for e in std::fs::read_dir(dir)?.flatten() {
+    Ok(std::fs::read_dir(dir)?.flatten().any(|e| {
         let path = e.path();
-        if path
-            .extension()
+        path.extension()
             .is_some_and(|x| x.eq_ignore_ascii_case("par2"))
-        {
-            return Ok(true);
-        }
-        if e.metadata().is_ok_and(|m| m.is_file() && m.len() >= 8) {
-            let mut head = [0u8; 8];
-            if std::fs::File::open(&path)
-                .and_then(|mut f| f.read_exact(&mut head))
-                .is_ok()
-                && &head == b"PAR2\x00PKT"
-            {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
+            || file_starts_with_par2_magic(&path)
+    }))
 }
 
 /// Does `dir` hold anything the nested pass could try to extract? Named
@@ -2742,15 +2765,21 @@ fn verify_dir(dir: &std::path::Path) -> Result<bool> {
     let mut par2_bytes: Vec<Vec<u8>> = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
-        if path
+        // By name OR by the `PAR2\0PKT` packet magic. An obfuscated post
+        // ships its index and recovery volumes as extensionless hashes,
+        // and taking only the name meant this reported "no .par2 files"
+        // over a directory holding a complete recovery set (issue #9).
+        // Same rule `dir_has_par2` and `smart::par2_magic` use.
+        let by_name = path
             .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("par2"))
-        {
-            par2_bytes.push(std::fs::read(&path)?);
+            .is_some_and(|e| e.eq_ignore_ascii_case("par2"));
+        if !by_name && !file_starts_with_par2_magic(&path) {
+            continue;
         }
+        par2_bytes.push(std::fs::read(&path)?);
     }
     if par2_bytes.is_empty() {
-        println!("no .par2 files in {} - verification skipped", dir.display());
+        println!("no PAR2 files in {} - verification skipped", dir.display());
         return Ok(false);
     }
     let refs: Vec<&[u8]> = par2_bytes.iter().map(|v| v.as_slice()).collect();
@@ -2962,6 +2991,13 @@ pub(crate) struct StreamHub {
     /// Hosts the daemon has ruled out for the NEXT download (exhausted
     /// block accounts); get_with_progress skips them at pool build.
     pub excluded_hosts: std::sync::Mutex<Vec<String>>,
+    /// Per-host connection caps for THIS hub's pool build. Set only on a
+    /// prefetch sidecar's hub when it BORROWS a slice of a server that is
+    /// busy on the active job (no healthy idle server exists): the host
+    /// stays in the fleet but its pool opens at most this many
+    /// connections, so the active job keeps its budget. Exclusion stays
+    /// all-or-nothing (`excluded_hosts`); this is the bounded middle.
+    pub host_conn_caps: std::sync::Mutex<std::collections::HashMap<String, usize>>,
     /// M2c.5: may this run speculatively prefetch a recovery volume the
     /// moment an article goes terminally Missing? The daemon enables it
     /// per MAIN job when no quota is configured (mirrors the sidecar-
@@ -2981,6 +3017,16 @@ pub(crate) struct StreamHub {
     /// round-trips on takedown'd content. Never empties the pool, so a
     /// wrong verdict costs only latency, never the last path.
     pub route_gone: std::sync::Mutex<Option<nzbkit::oracle::Snapshot>>,
+    /// M24 late attach (C1): a password set via mode=set_password AFTER
+    /// the active download started, tagged with its owning nzo_id. The
+    /// download task captures `j.password` once at the Downloading
+    /// transition, so without this cell a mid-download password reached
+    /// nothing until the job had already failed. `get_with_progress`
+    /// re-reads it at the network-drain boundary and again at the
+    /// fallback ladder, so the finish tail unlocks with it in ONE run.
+    /// Owner-tagged for the same reason `extractor` is: a job
+    /// transition must never hand this to the next download.
+    pub late_password: std::sync::Mutex<Option<(String, String)>>,
 }
 
 impl StreamHub {
@@ -2998,6 +3044,17 @@ impl StreamHub {
             Some(id) if id != owner => None,
             _ => Some(ex.clone()),
         }
+    }
+
+    /// The late-attached password, when it belongs to `owner` - same
+    /// ownership rule as [`Self::extractor_for`]. A peek, not a take:
+    /// the finish tail consults it at two points (network drain and the
+    /// fallback ladder) and both must see it; the next job never can,
+    /// because its owner tag differs and job start clears the cell.
+    pub fn late_password_for(&self, owner: &str) -> Option<String> {
+        let g = self.late_password.lock().unwrap();
+        let (tag, pw) = g.as_ref()?;
+        (tag == owner).then(|| pw.clone())
     }
 
     /// The warm connection pool, created on first use (it spawns a
@@ -3023,7 +3080,7 @@ impl StreamHub {
                 .get_or_init(|| {
                     nzbkit::warmpool::WarmPool::new(
                         nzbkit::warmpool::DEFAULT_MAX_IDLE,
-                        64,
+                        nzbkit::warmpool::MAX_PER_SERVER,
                     )
                 })
                 .clone(),
@@ -3051,6 +3108,29 @@ pub(crate) struct SeekCtl {
     /// racing the header probes) would otherwise map to nothing - and a
     /// promote missing the tail displaces the tail-burst articles.
     vol_slots: Vec<usize>,
+    /// Sanitized NZB filename hint → slot, non-par2 slots only. A promote
+    /// for a slot FILE that hasn't classified (the extractor's offset-0
+    /// probe, a top-level chase) maps to nothing in `map_output_range`;
+    /// resolving it against that one slot's own article ladder beats the
+    /// zero-knowledge fallback, which scales the span across the
+    /// concatenation of EVERY volume and lands in the wrong file for any
+    /// multi-slot set. Hint-keyed; the promote's name is the yEnc one
+    /// (`sanitize_filename(slot.name)`), so an obfuscated post whose
+    /// yEnc names differ from its subject hints misses here and resolves
+    /// through `observed_by_name` instead.
+    slot_by_name: std::collections::HashMap<String, usize>,
+    /// Sanitized yEnc-declared name → slot, the obfuscated-post overlay
+    /// for the same lookup: garbage subjects, real yEnc names. The
+    /// decode consumers register each slot's observed name here via
+    /// [`Self::note_slot_name`] before the write that can fire the
+    /// slot's offset-0 probe, so a slot-FILE promote resolves against
+    /// the right slot's own ladder instead of the every-volume fallback.
+    observed_by_name: std::sync::RwLock<std::collections::HashMap<String, usize>>,
+    /// Per-slot latch for `note_slot_name` (aligned with
+    /// `slot_articles`): set (Release) only AFTER the name is in the
+    /// map, so a decoder that skips on the fast path can trust the map
+    /// is populated before its own write's probe fires.
+    observed: Vec<std::sync::atomic::AtomicBool>,
 }
 
 impl SeekCtl {
@@ -3072,7 +3152,16 @@ impl SeekCtl {
     /// tail-burst articles a player is about to ask for. `file_size`
     /// (the caller's writer knows it) anchors the NZB-ladder fallback
     /// for spans in volumes the extractor hasn't classified yet.
-    pub fn promote_output_spans(&self, name: &str, file_size: u64, spans: &[(u64, u64)]) -> usize {
+    /// `engage_stream` passes through to the pool: streaming readers and
+    /// blocked chase workers flip it into shallow pipelines; the
+    /// extractor's non-urgent offset-0 probes only reorder the queue.
+    pub fn promote_output_spans(
+        &self,
+        name: &str,
+        file_size: u64,
+        spans: &[(u64, u64)],
+        engage_stream: bool,
+    ) -> usize {
         let mut ids: Vec<String> = Vec::new();
         for &(start, end) in spans {
             if start >= end {
@@ -3080,6 +3169,35 @@ impl SeekCtl {
             }
             let mapped = self.extractor.map_output_range(name, start, end);
             if mapped.is_empty() {
+                // Not an output the extractor can map. When the name is a
+                // SLOT file (offset-0 probe / top-level chase before
+                // classification), its byte space is that one slot's -
+                // resolve against its own ladder.
+                let si = self.slot_by_name.get(name).copied().or_else(|| {
+                    // Obfuscated set: the promote's name is the yEnc-
+                    // declared one and the subject hints are garbage -
+                    // fall to the names the decode consumers observed.
+                    self.observed_by_name.read().unwrap().get(name).copied()
+                });
+                if let Some(si) = si {
+                    if let Some((arts, enc_total)) = self.slot_articles.get(si) {
+                        if !arts.is_empty() && *enc_total > 0 && file_size > 0 {
+                            let scale =
+                                |v: u64| (v as f64 / file_size as f64 * *enc_total as f64) as u64;
+                            let (es, ee) = (scale(start), scale(end.min(file_size)));
+                            let lo = arts.partition_point(|(o, _)| *o <= es).saturating_sub(2);
+                            // +3 of forward slack (one more than the
+                            // mapped path): the offset-0 probe's rotation
+                            // guess undershoots by however many articles
+                            // beat the head to the slot, never overshoots.
+                            let hi = (arts.partition_point(|(o, _)| *o < ee) + 3).min(arts.len());
+                            for (_, id) in &arts[lo..hi] {
+                                ids.push(id.clone());
+                            }
+                            continue;
+                        }
+                    }
+                }
                 // No volume covering this span has classified yet (its
                 // header article is still in flight - routine in the
                 // first seconds, exactly when the player probes the
@@ -3113,7 +3231,31 @@ impl SeekCtl {
         }
         // promote() ranks by first occurrence, so cross-span duplicates
         // are harmless.
-        self.ctl.promote(&ids)
+        self.ctl.promote_opts(&ids, engage_stream)
+    }
+
+    /// Register the yEnc-declared name observed for `slot`'s articles.
+    /// The decode consumers call this once per article BEFORE the
+    /// `write_verified` that can fire the slot's offset-0 probe (the
+    /// probe promotes by `sanitize_filename(slot.name)`, i.e. exactly
+    /// this name); the latch makes the steady-state cost one atomic
+    /// load. Without it, an obfuscated multi-volume set's probe missed
+    /// the hint-keyed map and scaled its span across EVERY volume -
+    /// promoting the wrong file's articles, so each slot classified
+    /// only when its true head arrived naturally and spilled first.
+    pub fn note_slot_name(&self, slot: usize, name: &str) {
+        let Some(flag) = self.observed.get(slot) else { return };
+        if flag.load(Ordering::Acquire) {
+            return;
+        }
+        let key = nzbkit::disk::sanitize_filename(name);
+        // Skip the overlay when the hint map already resolves this name
+        // to this slot (honest posts - the overlay stays empty). First
+        // insertion wins on a cross-slot duplicate, like the hint map.
+        if self.slot_by_name.get(&key) != Some(&slot) {
+            self.observed_by_name.write().unwrap().entry(key).or_insert(slot);
+        }
+        flag.store(true, Ordering::Release);
     }
 
     /// Zero-knowledge span mapping: scale output-file offsets onto the
@@ -3239,7 +3381,15 @@ pub(crate) async fn get_with_progress(
             cfg_all.servers.retain(|s| {
                 let keep = !excluded.contains(&s.host);
                 if !keep {
-                    println!("[block] {} exhausted - not using it for this download", s.host);
+                    // The exclusion list carries three different reasons
+                    // (busy with the active job, auth-refused, or a spent
+                    // block account) - saying "exhausted" for all of them
+                    // sent a bench investigation chasing a phantom quota
+                    // bug, so say what it means.
+                    println!(
+                        "[block] {} excluded for this download (busy with the active job, refused, or block-exhausted)",
+                        s.host
+                    );
                 }
                 keep
             });
@@ -3574,6 +3724,31 @@ pub(crate) async fn get_with_progress(
     // path, and `nzbfast get` chases the same archives.
     extractor.anchor();
     extractor.set_holds_cap(budget.holds_cap());
+    // One-pass zip, split sets: a byte-split zip cannot be sized from
+    // its own bytes (no part carries a container-sizing header, unlike
+    // 7z), so the NZB's file list - which we have and the extractor
+    // does not - declares each set's part count. Declared only when the
+    // indices run exactly 1..=n: a set the NZB itself has a hole in can
+    // never stream, and not declaring it keeps every part on the
+    // phase-1 disk path.
+    {
+        let mut sets: HashMap<String, Vec<u32>> = HashMap::new();
+        for s in slots.iter().filter(|s| !s.is_par2_main) {
+            if let Some((base, idx)) = nzbkit::zip::split_part_name(&s.hint) {
+                sets.entry(base).or_default().push(idx);
+            }
+        }
+        for (base, mut idxs) in sets {
+            idxs.sort_unstable();
+            let n = idxs.len() as u32;
+            if idxs.first() == Some(&1)
+                && idxs.last() == Some(&n)
+                && idxs.windows(2).all(|w| w[0] < w[1])
+            {
+                extractor.declare_zip_split(&base, n);
+            }
+        }
+    }
     // An inner file's declared `unpacked_size` is an attacker-controlled
     // RAR header vint, and on Linux preallocation is a real fallocate - so
     // a few-hundred-KB post declaring 8 TB used to genuinely reserve the
@@ -3595,12 +3770,99 @@ pub(crate) async fn get_with_progress(
     // level, so a bomb split over many outputs gets one allowance.
     if let Some(free) = crate::serve::free_bytes(out_dir) {
         extractor.set_extract_budget(free.saturating_sub(EXTRACT_RESERVE));
+        // Holds-paging scratch ceiling: transient relief for the RAM
+        // holds cap, not a second copy of the download - 4x the RAM cap,
+        // and never more than a quarter of post-reserve free space (the
+        // payload itself still has to fit). Exceeding it demotes with
+        // the same "held-bytes cap" reasons as a RAM breach.
+        extractor.set_holds_scratch_cap(
+            (4 * budget.holds_cap() as u64).min(free.saturating_sub(EXTRACT_RESERVE) / 4),
+        );
     }
     // With a password, RAR5 encrypted STORE sets stay on the in-stream
     // path: ciphertext assembles at plain store offsets and one AES pass
     // at finish decrypts it - no materialized volumes, no unrar.
     if let Some(pw) = &password {
         extractor.set_password(pw);
+    }
+    // Increment A (one-pass encrypted plan, 2026-07-31): candidate probe
+    // over the job's OWN files. Password sidecars ride the same NZB and
+    // land within the head round (M3 scheduling fetches every file's
+    // first segment up front, and a password note is one segment), so
+    // when an encrypted set blocks, the extractor parks it and asks this
+    // hook instead of demoting. Candidates are the 2nd-pass harvest
+    // (small .txt/.nfo/.diz lines, "password:" tails, file stems) plus
+    // the job directory's name - the release stem an obfuscated post
+    // carries nowhere else - plus, on daemon runs, a password the user
+    // typed mid-download (mode=set_password → the hub's owner-tagged
+    // cell; C2 step 1). Only a check-VERIFIED candidate is returned;
+    // the tried-set is keyed by (salt, value) so a value that failed one
+    // set's check is still tested against a second set's - which is also
+    // what lets a corrected password typed after a wrong one get its
+    // turn. Check-less sets never park (try_pw_await gates on a
+    // well-formed check), so an unverifiable typed password can never
+    // key a mapper here - those sets take the finish-adjudication route.
+    {
+        let dir = out_dir.clone();
+        let tried: std::sync::Mutex<std::collections::HashSet<([u8; 16], String)>> =
+            Default::default();
+        let hub_pw = hub.clone();
+        let owner = stream_owner.to_string();
+        extractor.set_password_probe(std::sync::Arc::new(move |probe| {
+            let t0 = std::time::Instant::now();
+            let mut cands = harvest_password_candidates(&dir, None);
+            if let Some(n) = dir.file_name().map(|n| n.to_string_lossy().to_string()) {
+                let stem = nzbkit::extract::release_stem(&n);
+                if stem != n {
+                    cands.push(PwCandidate {
+                        value: stem,
+                        source: "job name stem".into(),
+                        structured: false,
+                    });
+                }
+                cands.push(PwCandidate {
+                    value: n,
+                    source: "job name".into(),
+                    structured: false,
+                });
+            }
+            // The late-typed password outranks every harvested guess:
+            // first in line, and structured (operator-supplied) so the
+            // KDF-depth gate never blocks it. Re-read per invocation -
+            // the cell can change between probes. CLI runs have no hub.
+            if let Some(pw) = hub_pw.as_ref().and_then(|h| h.late_password_for(&owner)) {
+                cands.insert(
+                    0,
+                    PwCandidate {
+                        value: pw,
+                        source: "set_password (typed mid-download)".into(),
+                        structured: true,
+                    },
+                );
+            }
+            let mut tried = tried.lock().unwrap();
+            for c in cands {
+                if !tried.insert((probe.salt, c.value.clone())) {
+                    continue;
+                }
+                // Same KDF-depth gate as the 2nd-pass harvest: only the
+                // operator's own password may pay for a hostile-depth
+                // KDF, and no candidate sweep may exceed the wall-clock
+                // budget - a crafted post can stuff sidecars with
+                // thousands of lines.
+                if !kdf_candidate_allowed(probe.lg2_count, c.structured) {
+                    continue;
+                }
+                if t0.elapsed() > PW_PROBE_BUDGET {
+                    break;
+                }
+                if probe.verify(&c.value) == nzbkit::rar::PwVerdict::Verified {
+                    println!("🔑 archive password found in {} (in-stream probe)", c.source);
+                    return Some(c.value);
+                }
+            }
+            None
+        }));
     }
     // That AES pass replaces the ciphertext this journal's placement
     // records point INTO. Once a file holds plaintext it is no longer the
@@ -3666,21 +3928,42 @@ pub(crate) async fn get_with_progress(
             .map(|(i, _)| i)
             .collect();
         vol_slots.sort_by_key(|&i| nzbkit::extract::vol_sort_key(&slots[i].hint));
+        // First insertion wins on a duplicate hint - same article ladder
+        // either way for the split-volume sets where hints repeat.
+        let mut slot_by_name = std::collections::HashMap::new();
+        for &i in &vol_slots {
+            slot_by_name
+                .entry(nzbkit::disk::sanitize_filename(&slots[i].hint))
+                .or_insert(i);
+        }
+        let slot_articles = std::mem::take(&mut slot_arts);
+        let observed = slot_articles
+            .iter()
+            .map(|_| std::sync::atomic::AtomicBool::new(false))
+            .collect();
         Arc::new(SeekCtl {
-            slot_articles: std::mem::take(&mut slot_arts),
+            slot_articles,
             ctl: queue_ctl.clone(),
             extractor: extractor.clone(),
             vol_slots,
+            slot_by_name,
+            observed_by_name: std::sync::RwLock::new(std::collections::HashMap::new()),
+            observed,
         })
     };
+    // The decode consumers register observed yEnc names (obfuscated
+    // sets) - cloned HERE because `seek` itself moves into the hub.
+    let seek_names = seek.clone();
     // Weak - the hook must not pin the SeekCtl/Extractor pair into a
     // reference cycle.
     let weak_seek = Arc::downgrade(&seek);
-    extractor.set_promote_hook(Arc::new(move |name: &str, size: u64, spans: &[(u64, u64)]| {
-        if let Some(s) = weak_seek.upgrade() {
-            s.promote_output_spans(name, size, spans);
-        }
-    }));
+    extractor.set_promote_hook(Arc::new(
+        move |name: &str, size: u64, spans: &[(u64, u64)], urgent: bool| {
+            if let Some(s) = weak_seek.upgrade() {
+                s.promote_output_spans(name, size, spans, urgent);
+            }
+        },
+    ));
     if let Some(h) = &hub {
         *h.extractor.lock().unwrap() = Some((stream_owner.to_string(), extractor.clone()));
         *h.verifier.lock().unwrap() = Some(verifier.clone());
@@ -3734,12 +4017,27 @@ pub(crate) async fn get_with_progress(
     // address stop occupying the provider's connection cap immediately.
     if let Some(warm) = hub.as_ref().and_then(|h| h.warm()) {
         warm.retain_servers(&cfg_all.servers).await;
+        // Idle release is settled PER SERVER and read straight off the
+        // config this job is about to use, so a provider added, removed
+        // or re-tuned since the last job is reflected before any of its
+        // connections are parked.
+        warm.set_release_policies(&cfg_all.servers);
     }
+    // Sidecar connection borrowing: caps a host's pool below its normal
+    // budget when this hub is a prefetch sidecar borrowing from a server
+    // that is busy on the active job. Empty on every other hub.
+    let host_caps = hub
+        .as_ref()
+        .map(|h| h.host_conn_caps.lock().unwrap().clone())
+        .unwrap_or_default();
     let mut servers: Vec<_> = cfg_all
         .servers
         .iter()
         .map(|s| {
-            let base = connections.min(s.connections.max(1) as usize);
+            let mut base = connections.min(s.connections.max(1) as usize);
+            if let Some(cap) = host_caps.get(&s.host) {
+                base = base.min((*cap).max(1));
+            }
             let cfg = PoolConfig {
                 connections: match tuned.get(&s.host) {
                     Some(t) if t.connections > 0 => base.min(t.connections),
@@ -3815,6 +4113,21 @@ pub(crate) async fn get_with_progress(
     // The daemon shares this counter to report live queue progress.
     let decoded_bytes = progress.unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
     let decode_errors = Arc::new(AtomicU64::new(0));
+    // Segments the pool never asked anyone for: outside every configured
+    // server's retention window. Reported by cause in the failure summary
+    // - to the user these were indistinguishable from real takedowns.
+    let retention_excluded = Arc::new(AtomicU64::new(0));
+    // The other two loss ledgers the failure summary reads. A real 430
+    // verdict and a transport failure demand opposite responses (the
+    // post is dead vs the provider flaked), yet both used to land in the
+    // same per-slot "missing" count - a flaky provider read as a
+    // takedown, all the way to the indexer failure report.
+    let missing_430 = Arc::new(AtomicU64::new(0));
+    let transport_failed = Arc::new(AtomicU64::new(0));
+    // First error of each kind, verbatim, for the failure summary to
+    // quote - the counter alone says nothing a bug report can act on.
+    let transport_sample: Arc<std::sync::Mutex<Option<String>>> = Default::default();
+    let decode_error_sample: Arc<std::sync::Mutex<Option<String>>> = Default::default();
     // Test knob: cap the consumer (decode+write) stage to N MB/s to
     // simulate a slow disk. The correct systemic response - proven by the
     // backpressure test - is that the bounded channel fills, workers stop
@@ -3856,8 +4169,14 @@ pub(crate) async fn get_with_progress(
         let out_pool = out_pool.clone();
         let slots = slots.clone();
         let id_to_slot = id_to_slot.clone();
+        let seek_names = seek_names.clone();
         let decoded_bytes = decoded_bytes.clone();
         let decode_errors = decode_errors.clone();
+        let retention_excluded = retention_excluded.clone();
+        let missing_430 = missing_430.clone();
+        let transport_failed = transport_failed.clone();
+        let transport_sample = transport_sample.clone();
+        let decode_error_sample = decode_error_sample.clone();
         let verifier = verifier.clone();
         let extractor = extractor.clone();
         let shape_said = shape_said.clone();
@@ -3917,6 +4236,14 @@ pub(crate) async fn get_with_progress(
                                 } else {
                                     dec.name.clone()
                                 };
+                                // BEFORE the write: the offset-0 probe
+                                // fires from inside write_verified and
+                                // promotes by this yEnc name - on an
+                                // obfuscated set the hint-keyed lookup
+                                // alone would miss it.
+                                if !slot.is_par2_main {
+                                    seek_names.note_slot_name(sidx, &name);
+                                }
                                 match extractor.write_verified(
                                     sidx,
                                     &name,
@@ -3931,6 +4258,10 @@ pub(crate) async fn get_with_progress(
                                 ) {
                                     Err(e) => {
                                         eprintln!("write {name}: {e}");
+                                        decode_error_sample
+                                            .lock()
+                                            .unwrap()
+                                            .get_or_insert_with(|| format!("write {name}: {e}"));
                                         decode_errors.fetch_add(1, Ordering::Relaxed);
                                         slot.errors.fetch_add(1, Ordering::Relaxed);
                                     }
@@ -4065,6 +4396,10 @@ pub(crate) async fn get_with_progress(
                             }
                             Err(e) => {
                                 eprintln!("decode error ({id}): {e}");
+                                decode_error_sample
+                                    .lock()
+                                    .unwrap()
+                                    .get_or_insert_with(|| format!("decode error: {e}"));
                                 decode_errors.fetch_add(1, Ordering::Relaxed);
                                 slot.errors.fetch_add(1, Ordering::Relaxed);
                             }
@@ -4111,7 +4446,35 @@ pub(crate) async fn get_with_progress(
                             }
                         }
                     }
-                    FetchOutcome::Missing { id } | FetchOutcome::Failed { id, .. } => {
+                    FetchOutcome::Missing { id, cause } => {
+                        match cause {
+                            nzbkit::pool::MissingCause::Retention => {
+                                retention_excluded.fetch_add(1, Ordering::Relaxed);
+                            }
+                            nzbkit::pool::MissingCause::Gone => {
+                                missing_430.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        if let Some(&sidx) = id_to_slot.get(&id) {
+                            slots[sidx].missing.fetch_add(1, Ordering::Relaxed);
+                            if slots[sidx].remaining.fetch_sub(1, Ordering::AcqRel) == 1
+                                && slots[sidx].is_par2_main
+                                && maybe_activate_par2(&slots, &verifier, &par2_outstanding)
+                            {
+                                let v = verifier.clone();
+                                let ex = extractor.clone();
+                                let flags = par2_flags.clone();
+                                let n = slots.len();
+                                *backfill.lock().unwrap() =
+                                    Some(rt.spawn_blocking(move || {
+                                        backfill_pre_activation(&v, &ex, n, &flags)
+                                    }));
+                            }
+                        }
+                    }
+                    FetchOutcome::Failed { id, error } => {
+                        transport_failed.fetch_add(1, Ordering::Relaxed);
+                        transport_sample.lock().unwrap().get_or_insert(error);
                         if let Some(&sidx) = id_to_slot.get(&id) {
                             slots[sidx].missing.fetch_add(1, Ordering::Relaxed);
                             if slots[sidx].remaining.fetch_sub(1, Ordering::AcqRel) == 1
@@ -4174,12 +4537,25 @@ pub(crate) async fn get_with_progress(
     // wedges the whole job AFTER its bytes are downloaded: fetch_all_multi
     // never returns, silently, until something external kills it (seen on
     // a 190 GB low-memory run - 3 h frozen, download complete, no output).
-    // Pausing aborts the transfer rather than freezing it, and even a slow
-    // server keeps moving bytes, so a fully-frozen decode counter with
-    // segments still outstanding is unambiguously the deadlock. When that
-    // holds, dump the pool state and abort: the stuck slot's blocks then
-    // fall into PAR2 repair (usually recovered) or fail loud, and the
-    // journal makes either outcome resume cleanly.
+    // Pausing aborts the transfer rather than freezing it, so a job that
+    // is neither decoding NOR resolving articles, with segments still
+    // outstanding, is unambiguously the deadlock. When that holds, dump
+    // the pool state and abort: the stuck slot's blocks then fall into
+    // PAR2 repair (usually recovered) or fail loud, and the journal makes
+    // either outcome resume cleanly.
+    //
+    // BOTH signals, because decoded bytes alone do not mean "alive". An
+    // article that goes terminally Missing decodes nothing, and a post
+    // that is wholly gone decodes NOTHING AT ALL, for however long it
+    // takes to ask every server for every article - so a dead post is
+    // byte-frozen by definition while the pool works through its queue
+    // perfectly. Watching bytes alone, the watchdog aborted exactly that
+    // (31 Jul, live: a 30-day-old dead post killed mid-ladder, then
+    // reported as a fault on the user's own machine with most of its
+    // articles never requested). `remaining` counts down on Hit, Missing
+    // AND Failed, so it moves whenever the pool resolves anything by any
+    // route: it is the liveness signal a refusal-only run still has. A
+    // genuine wedge freezes both, and still fires.
     let stalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let watchdog = {
         let decoded = decoded_bytes.clone();
@@ -4195,7 +4571,11 @@ pub(crate) async fn get_with_progress(
         // override fires promptly in tests and production stays low-churn.
         let poll = (secs / 4).clamp(1, 15);
         tokio::spawn(async move {
+            let outstanding_now = |sl: &[Arc<FileSlot>]| -> usize {
+                sl.iter().map(|s| s.remaining.load(Ordering::Relaxed)).sum()
+            };
             let mut last = decoded.load(Ordering::Relaxed);
+            let mut last_outstanding = outstanding_now(&slots);
             let mut frozen = 0u64;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(poll)).await;
@@ -4203,20 +4583,21 @@ pub(crate) async fn get_with_progress(
                     return;
                 }
                 let now = decoded.load(Ordering::Relaxed);
-                if now != last {
+                let outstanding = outstanding_now(&slots);
+                if now != last || outstanding != last_outstanding {
                     last = now;
+                    last_outstanding = outstanding;
                     frozen = 0;
                     continue;
                 }
                 frozen += poll;
-                let outstanding: usize =
-                    slots.iter().map(|s| s.remaining.load(Ordering::Relaxed)).sum();
                 if frozen >= secs && outstanding > 0 {
                     eprintln!(
-                        "⚠ download stalled: no decode progress for {frozen}s with \
-                         {outstanding} segment(s) still outstanding - the connection \
-                         pool has wedged. Dumping state and aborting; the journal keeps \
-                         what landed, PAR2 fills any gap, and a retry resumes."
+                        "⚠ download stalled: no decode progress AND no article \
+                         resolved for {frozen}s with {outstanding} segment(s) still \
+                         outstanding - the connection pool has wedged. Dumping state \
+                         and aborting; the journal keeps what landed, PAR2 fills any \
+                         gap, and a retry resumes."
                     );
                     qc.dump_state();
                     stalled.store(true, Ordering::Relaxed);
@@ -4455,6 +4836,18 @@ pub(crate) async fn get_with_progress(
     if let Some(tx) = net_done {
         let _ = tx.send(());
     }
+    // M24 late attach (C1): a password set via mode=set_password while
+    // this job downloaded. The `password` binding above was resolved at
+    // start; without this re-read the whole disk tail (re-extraction,
+    // recovery-record repair, the unrar ladder, the nested pass) ran with
+    // the stale None, parked the job as password_required, and the very
+    // password the user had already supplied sat unread until a manual
+    // retry. Late wins over captured: a user re-typing mid-download is
+    // correcting the one the job started with.
+    let password: Option<String> = hub
+        .as_ref()
+        .and_then(|h| h.late_password_for(stream_owner))
+        .or(password);
     // Any pre-activation spans the backfill is still hashing belong to
     // this tail - wait so settle sees final block states (M15b).
     let bf = backfill.lock().unwrap().take();
@@ -4478,19 +4871,70 @@ pub(crate) async fn get_with_progress(
         total as f64 * 8.0 / 1e9 / elapsed.as_secs_f64(),
         decoded_bytes.load(Ordering::Relaxed) as f64 / 1e6,
     );
+    // Servers that never held a usable connection: their articles' fates
+    // were decided by the others alone, and the failure summary must say
+    // so - one dead backup silently turns a single 430 into "missing".
+    let mut dead_servers: Vec<String> = Vec::new();
     for ((s, _), st) in servers.iter().zip(&stats) {
-        println!(
-            "  {:<28} {:>8.1} MB · {} conns, {} reconnects",
-            s.host,
-            st.bytes as f64 / 1e6,
-            st.connects,
-            st.reconnects
-        );
+        if st.ever_connected {
+            println!(
+                "  {:<28} {:>8.1} MB · {} conns, {} reconnects",
+                s.host,
+                st.bytes as f64 / 1e6,
+                st.connects,
+                st.reconnects
+            );
+        } else {
+            println!(
+                "  {:<28} ⚠ no usable connection for the entire run \
+                 (unreachable, or it refused the login)",
+                s.host
+            );
+            dead_servers.push(s.host.clone());
+        }
     }
+    // Distinct BACKBONES that actually took part. Five resellers of one
+    // backbone are one opinion, not five, and "no server had it" reads
+    // like five independent votes - so the failure summary counts the
+    // opinions, not the hostnames.
+    let mut backbones: Vec<String> = servers
+        .iter()
+        .zip(&stats)
+        .filter(|(_, st)| st.ever_connected)
+        .map(|((s, _), _)| nzbkit::oracle::backbone_of(&s.host))
+        // A server addressed by IP (or any host that reduces to no
+        // letters) names no backbone - `backbone_of("127.0.0.1")` is the
+        // label "0". It cannot support a claim about independent
+        // opinions either way, so it sits the clause out rather than
+        // printing a digit as though it were a provider.
+        .filter(|b| b.chars().any(|c| c.is_ascii_alphabetic()))
+        .collect();
+    backbones.sort();
+    backbones.dedup();
+    // The post's own age - as young as its youngest article. A post
+    // nobody carries YET and a post nobody carries ANY MORE are the same
+    // picture from in here (every article 430, not a byte arrived), and
+    // only the calendar tells them apart: a release grabbed minutes after
+    // its pre routinely 430s everywhere while it propagates, and that is
+    // precisely the case the one automatic retry exists for. An NZB whose
+    // dates are missing or unusable reads as age 0, which keeps it out of
+    // the "gone" verdict - unknown is not old.
+    let post_age_days =
+        nzb.files.iter().map(|f| nzb_age_days(f.date)).min().unwrap_or(0);
     let mut incomplete = 0;
+    // Segment-level totals for the failure summary. A file count alone
+    // cannot tell "94 files short one segment each" (a repair away) from
+    // "94 files short every segment" (the post is gone) - and those are
+    // the two ends of what one user actually needs to know.
+    let mut missing_segments: u64 = 0;
+    let mut total_segments: u64 = 0;
     for slot in &slots {
         let miss = slot.missing.load(Ordering::Relaxed);
         let unresolved = slot.remaining.load(Ordering::Relaxed);
+        // Disjoint by construction: `remaining` counts down as articles
+        // resolve, `missing` counts the ones that resolved to nothing.
+        total_segments += slot.total_segments as u64;
+        missing_segments += (miss + unresolved) as u64;
         if miss > 0 || unresolved > 0 {
             incomplete += 1;
             println!(
@@ -4502,6 +4946,13 @@ pub(crate) async fn get_with_progress(
     let derrs = decode_errors.load(Ordering::Relaxed);
     if derrs > 0 {
         println!("  ⚠ {derrs} decode/write errors");
+    }
+    let retention_skipped = retention_excluded.load(Ordering::Relaxed);
+    if retention_skipped > 0 {
+        println!(
+            "  ⚠ {retention_skipped} segment(s) never requested: older than every \
+             server's configured retention (retention_days in the server settings)"
+        );
     }
     if incomplete == 0 && derrs == 0 {
         println!("all {} files complete ✔", slots.len());
@@ -4521,6 +4972,9 @@ pub(crate) async fn get_with_progress(
     // on jobs that never needed (or ran) a PAR2 repair at all, so the
     // reason travels with the flag rather than being assumed at the end.
     let mut reextract_failed: Option<&'static str> = None;
+    // (needed, have) when repair died on recovery-block arithmetic - the
+    // counts belong in the fail message, not just the console log.
+    let mut repair_shortfall: Option<(usize, usize)> = None;
     // Deobfuscated names a CHASED slot could not take while its writer was
     // live (see the rename below). Applied after `extractor.finish()`,
     // when nothing holds an fd on the partial file any more - otherwise
@@ -4785,13 +5239,20 @@ pub(crate) async fn get_with_progress(
                 // and tries to recreate a whole archive we are holding.
                 let any_mapped = reports.iter().any(|(s, _)| extractor.is_mapped(*s));
                 let any_chased = reports.iter().any(|(s, _)| extractor.is_chased(*s));
+                // A RAR chase (depth-0 compressed set) must be claimed for
+                // the post-repair re-extract too: its "materialized for
+                // repair" demote reason is excluded from the unrar ladder
+                // on the promise that this path re-extracts what it
+                // materialized, and no other pass owns the set - without
+                // the claim the job shipped repaired-but-packed volumes as
+                // its output with exit 0. A materialized .7z stays out:
+                // the 7z post-pass runs regardless and re-extracting here
+                // would only double the work.
+                let any_rar_chased =
+                    reports.iter().any(|(s, _)| extractor.is_rar_chased(*s));
                 if any_mapped || any_chased {
                     println!("materializing volumes for repair…");
-                    // Only a MAPPED set needs the post-repair re-extract:
-                    // a materialized .7z is the disk post-pass's input and
-                    // it runs regardless, so claiming it here would send
-                    // the set through reextract_dir for nothing.
-                    damage_in_mapped |= any_mapped;
+                    damage_in_mapped |= any_mapped || any_rar_chased;
                     for (sidx, r) in &reports {
                         if extractor.is_mapped(*sidx) || extractor.is_chased(*sidx) {
                             if let Some(pname) = &r.par2_name {
@@ -4825,6 +5286,7 @@ pub(crate) async fn get_with_progress(
                     &already,
                     buf_pool.clone(),
                     &extractor,
+                    &mut repair_shortfall,
                 )
                 .await?;
                 // Repaired volume files on disk → re-extract them cleanly.
@@ -4885,12 +5347,67 @@ pub(crate) async fn get_with_progress(
         }
         None => {
             // No PAR2 set in the NZB (or activation failed): best-effort
-            // post-download verify against whatever .par2 files landed.
+            // post-download verify against whatever par2 files landed.
             verify_dir(out_dir)?;
             all_good = incomplete == 0 && derrs == 0;
             if !all_good {
-                // Missing articles left zero-filled holes and there is no
-                // PAR2 to fill them - embedded RAR recovery records can.
+                // Public issue #9. Getting here with a damaged download
+                // does NOT mean the post shipped no recovery data - on a
+                // fully obfuscated post it usually means we could not SEE
+                // it. Classification runs off the NZB's subject lines, and
+                // when the index and every recovery volume is a hash with
+                // no extension there is nothing in a subject to read, so
+                // all of it arrives classified as payload and the whole
+                // repair ladder above is unreachable. That is why SABnzbd
+                // repaired posts we failed: it identifies par2 from the
+                // file contents instead.
+                //
+                // The bytes are on disk either way, so ask the directory
+                // rather than the NZB. `dir_has_par2` sniffs the
+                // `PAR2\0PKT` packet magic, and `repair_dir` is already
+                // obfuscation-complete underneath it: it magic-sniffs
+                // packets and hash-matches obfuscated data files during
+                // its adoption scan, restoring them under their true
+                // FileDesc names. `extract_local` has always driven it
+                // this way; this path simply never asked.
+                //
+                // Strictly a last resort, and it can only ever ADD an
+                // outcome: it runs exclusively where no set was activated,
+                // which is exactly the case that had no repair at all.
+                if dir_has_par2(out_dir).unwrap_or(false) {
+                    use nzbkit::par2repair::{RepairStatus, repair_dir};
+                    let t0 = Instant::now();
+                    println!(
+                        "no PAR2 set came from the NZB, but the downloaded files \
+                         include one - repairing from disk…"
+                    );
+                    match repair_dir(out_dir) {
+                        Ok(RepairStatus::NoDamage) => {
+                            println!("repair complete in {:.2?} ✔ (set verifies on disk)", t0.elapsed());
+                            all_good = true;
+                        }
+                        Ok(RepairStatus::Repaired(r)) => {
+                            println!(
+                                "repair complete in {:.2?} ✔ ({} block(s) rebuilt across {} file(s))",
+                                t0.elapsed(),
+                                r.blocks_rebuilt,
+                                r.files_patched.len(),
+                            );
+                            all_good = true;
+                        }
+                        Ok(RepairStatus::Unrepairable { needed, have }) => {
+                            println!(
+                                "PAR2: UNREPAIRABLE - need {needed} recovery block(s), have {have}"
+                            );
+                            repair_shortfall = Some((needed, have));
+                        }
+                        Err(e) => println!("PAR2: repair error - {e}"),
+                    }
+                }
+            }
+            if !all_good {
+                // Missing articles left zero-filled holes and no PAR2
+                // filled them - embedded RAR recovery records can.
                 all_good = try_rar_rr_repair(out_dir, password.as_deref());
             }
         }
@@ -4934,10 +5451,16 @@ pub(crate) async fn get_with_progress(
     };
     let final_shape = extractor.archive_shape();
     if !ex_report.extracted.is_empty() {
+        // Sum the per-file sizes printed right below rather than the
+        // extractor's `extracted_bytes` counter: that counter is only
+        // incremented on the RAR store mapping path, so every CHASE
+        // (7z and zip) reported "(0.0 MB)" under a list of files whose
+        // own sizes were right. Found on a live 160 MB zip, 31 Jul.
+        let extracted_mb: u64 = ex_report.extracted.iter().map(|(_, s)| *s).sum();
         println!(
             "extracted {} file(s) in-stream ({:.1} MB) - volumes never touched disk{}:",
             ex_report.extracted.len(),
-            ex_report.extracted_bytes as f64 / 1e6,
+            extracted_mb as f64 / 1e6,
             final_shape
                 .as_ref()
                 .map(|sh| format!(" [{}]", sh.display()))
@@ -4966,6 +5489,13 @@ pub(crate) async fn get_with_progress(
         println!("  ⚠ direct extraction fell back for {n} volume group(s): {why} - volumes on disk");
     }
 
+    // Second late-attach read (C1): the settle/repair phase between the
+    // network drain and this ladder runs for minutes on a big damaged
+    // set, and a password typed during it must not miss this job too.
+    let password: Option<String> = hub
+        .as_ref()
+        .and_then(|h| h.late_password_for(stream_owner))
+        .or(password);
     // Resumed runs skipped in-stream extraction - extract from the (now
     // verified) volume files on disk.
     if resuming && !no_extract && all_good {
@@ -5165,15 +5695,128 @@ pub(crate) async fn get_with_progress(
         if let Ok(j) = Arc::try_unwrap(journal) {
             j.remove();
         }
-        Ok(())
-    } else if let Some(why) = reextract_failed {
-        anyhow::bail!(
+        return Ok(());
+    }
+    // Failing: print the block a bug report can carry whole. The daemon
+    // mirrors stdout into the dashboard log ring, so this is what a user
+    // pastes when they say "every file failed".
+    print_failure_diagnostics(&servers, &stats);
+    if let Some(why) = reextract_failed {
+        anyhow::bail!(with_build(format!(
             "{why} - verified files left in the output directory (the log above names the archive)"
-        )
+        )))
     } else if incomplete > 0 || derrs > 0 {
-        anyhow::bail!("{}", incomplete_reason(incomplete, derrs))
+        let causes = LossCauses {
+            missing_430: missing_430.load(Ordering::Relaxed),
+            retention_excluded: retention_skipped,
+            transport_failed: transport_failed.load(Ordering::Relaxed),
+            transport_sample: transport_sample.lock().unwrap().clone(),
+            decode_sample: decode_error_sample.lock().unwrap().clone(),
+            dead_servers: &dead_servers,
+            par2_slots: n_par2_slots,
+            stalled: stalled.load(Ordering::Relaxed),
+            missing_segments,
+            total_segments,
+            bytes_arrived: total,
+            backbones: &backbones,
+            post_age_days,
+        };
+        anyhow::bail!(with_build(incomplete_reason(incomplete, derrs, &causes)))
+    } else if let Some((needed, have)) = repair_shortfall {
+        anyhow::bail!(with_build(format!(
+            "verification failed and PAR2 repair could not complete: {needed} recovery \
+             block(s) needed but the NZB only carries {have}"
+        )))
     } else {
-        anyhow::bail!("verification failed and PAR2 repair could not complete")
+        anyhow::bail!(with_build(
+            "verification failed and PAR2 repair could not complete".into()
+        ))
+    }
+}
+
+/// Lines of console output a failed job keeps for its history entry, and
+/// the byte ceiling that keeps history.json from growing without bound.
+///
+/// A job that lost every file prints one `⚠` line per file, so the line
+/// budget has to clear a full set (the 31 Jul report was 94) and still
+/// leave room for the per-server table and the diagnostics footer under
+/// it. The LAST lines are the ones kept: a failure block ends with its
+/// verdict.
+const FAIL_DETAIL_LINES: usize = 160;
+const FAIL_DETAIL_BYTES: usize = 24 * 1024;
+
+/// This job's console output since `mark`, as the block a failed history
+/// entry carries.
+///
+/// The one-line `fail_message` is a verdict; this is the evidence for it,
+/// and until now it existed only in a memory-only 2000-line ring that a
+/// restart wipes - which is exactly what happened to the 31 Jul job whose
+/// diagnosis had to be reconstructed by re-probing the servers by hand.
+pub(crate) fn fail_detail_snapshot(mark: u64) -> String {
+    let lines = nzbkit::logtee::since(mark, FAIL_DETAIL_LINES);
+    if lines.is_empty() {
+        return String::new();
+    }
+    let mut out = lines.join("\n");
+    if out.len() > FAIL_DETAIL_BYTES {
+        // Truncate from the FRONT on a line boundary, keeping the tail:
+        // the verdict and the server table are the last things printed.
+        let cut = out.len() - FAIL_DETAIL_BYTES;
+        let cut = out[cut..].find('\n').map_or(out.len(), |i| cut + i + 1);
+        out = format!("[…earlier lines dropped…]\n{}", &out[cut..]);
+    }
+    out
+}
+
+/// Tag a job-failure message with the build that produced it. Failure
+/// messages travel: history screenshots, Reddit posts, *arr logs - and
+/// they arrive with no other version context. Appended, never prefixed:
+/// the daemon's `fail_kind` classifies on the message OPENING.
+fn with_build(msg: String) -> String {
+    format!("{msg} [nzbfast {}]", env!("CARGO_PKG_VERSION"))
+}
+
+/// The block a bug report should contain, printed once when a job fails:
+/// build, platform, and a per-server table that is deliberately
+/// ANONYMOUS - level/connections/TLS/retention/outcome, never hostnames
+/// or accounts, because these logs get pasted on public forums.
+fn print_failure_diagnostics(
+    servers: &[(ServerConfig, nzbkit::pool::PoolConfig)],
+    stats: &[nzbkit::pool::PoolStats],
+) {
+    println!(
+        "diagnostics (safe to include in a bug report): nzbfast {} · {} {} · {} cores · {} GB RAM",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        std::thread::available_parallelism().map_or(0, |n| n.get()),
+        nzbkit::mem::physical_ram().map_or(0, |b| b / 1_000_000_000),
+    );
+    for (i, ((s, cfg), st)) in servers.iter().zip(stats).enumerate() {
+        let retention = if s.retention_days == 0 {
+            "unlimited".to_string()
+        } else {
+            format!("{}d", s.retention_days)
+        };
+        let outcome = if st.ever_connected {
+            format!(
+                "served {:.1} MB ({} connects, {} reconnects)",
+                st.bytes as f64 / 1e6,
+                st.connects,
+                st.reconnects
+            )
+        } else {
+            "NO USABLE CONNECTION for the entire run".to_string()
+        };
+        println!(
+            "  server {}: level {} · {} conns · tls={} · retention {} · {}",
+            i + 1,
+            s.level,
+            cfg.connections,
+            s.tls,
+            retention,
+            outcome
+        );
     }
 }
 
@@ -5189,18 +5832,252 @@ pub(crate) async fn get_with_progress(
 /// indexer a healthy release was dead and armed a retry straight back
 /// onto the same full disk. Both counts still appear when both happened;
 /// only the leading clause decides.
-fn incomplete_reason(incomplete: usize, derrs: u64) -> String {
+///
+/// Known causes ride along AFTER the classifying clause (the daemon's
+/// `fail_kind` and the tests pin the opening, so additions must append):
+/// segments excluded by a configured `retention_days`, transport-error
+/// losses with the first error quoted, servers that never held a usable
+/// connection for the whole run, and repair's block arithmetic. All of
+/// it turns "missing segments" from a dead-post verdict into something
+/// the user can act on - the Hblife report ("every file failed, SAB got
+/// them fine") was undiagnosable precisely because the summary never
+/// said WHY the pool gave up on an article.
+///
+/// One opening is special: when NOT ONE loss was a server saying 430
+/// (all transport, or transport plus retention exclusions), the message
+/// opens "download failed on connection errors" instead - the daemon
+/// classifies that `FailKind::Transport`, which still auto-retries but
+/// never reports the post to an indexer as dead. A flaky provider under
+/// load used to file takedown reports for healthy releases.
+struct LossCauses<'a> {
+    /// Segments where every live server was asked and said 430/423.
+    missing_430: u64,
+    /// Never requested: outside every server's configured retention.
+    retention_excluded: u64,
+    /// Lost to transport errors (timeouts, resets, exhausted retries).
+    transport_failed: u64,
+    /// First transport error, verbatim.
+    transport_sample: Option<String>,
+    /// First decode/write error, verbatim.
+    decode_sample: Option<String>,
+    /// Servers with no usable connection at any point in the run.
+    dead_servers: &'a [String],
+    /// PAR2 recovery slots the NZB carries. Zero means the post has no
+    /// parity at all, so a confirmed-missing segment can never be
+    /// reconstructed and no amount of retrying changes that.
+    par2_slots: usize,
+    /// The stall watchdog aborted the tail: no decode progress for its
+    /// whole window while segments were still outstanding.
+    ///
+    /// This one outranks every count below it, because when it is set
+    /// the counts describe a run that STOPPED rather than a post that is
+    /// short. The abandoned segments were never asked and refused - most
+    /// were never asked at all - so they arrive here as neither
+    /// `missing_430` nor `transport_failed`, and the ordinary opening
+    /// then reports the most alarming thing it can say ("N file(s) with
+    /// missing segments") about a release nobody has shown to be
+    /// missing anything. Observed 31 Jul on a 94-file post: the pool
+    /// wedged with 8851 segments outstanding, and the history entry read
+    /// exactly like a dead release.
+    stalled: bool,
+    /// Segments that never arrived - terminally missing, or still
+    /// unresolved when the run gave up - and how many the job asked for
+    /// in all. A file count cannot separate "short one segment each,
+    /// one repair away" from "short every segment, the post is gone";
+    /// these can. Both 0 when a caller has no per-slot accounting, which
+    /// suppresses every clause that reads them.
+    missing_segments: u64,
+    total_segments: u64,
+    /// Raw bytes the servers actually delivered. Zero is the single most
+    /// diagnostic number a failed job has: it says the run never got
+    /// anything, as opposed to getting most of it and falling short.
+    bytes_arrived: u64,
+    /// Distinct backbones behind the servers that took part. Five
+    /// resellers of one backbone are ONE opinion, and "no server had it"
+    /// otherwise reads like five independent votes.
+    backbones: &'a [String],
+    /// Age of the youngest article in the post, days. 0 when the NZB
+    /// carries no usable date - see `GONE_MIN_AGE_DAYS`.
+    post_age_days: u32,
+}
+
+/// How old a post must be before "every article 430" may be called DEAD
+/// rather than "not here yet".
+///
+/// Both look identical from the pool's side. Propagation across the
+/// backbones is normally minutes and occasionally hours; three days is
+/// far outside that and still well inside the window where a retry could
+/// plausibly have helped, so nothing that a retry would have fixed is
+/// classified away. Below it (and for a dateless NZB, which reads as age
+/// 0) the classic transient opening stands and the automatic retry runs.
+const GONE_MIN_AGE_DAYS: u32 = 3;
+
+fn incomplete_reason(incomplete: usize, derrs: u64, causes: &LossCauses) -> String {
     if incomplete > 0 {
-        format!(
-            "download incomplete: {incomplete} file(s) with missing segments, \
-             {derrs} decode/write errors"
-        )
+        // A stall is OUR failure and has to say so, before any count is
+        // read as evidence about the post. It opens with the connection
+        // errors clause deliberately: `fail_kind` maps that to
+        // `Transport`, which is exactly right here - retry freely, and
+        // never report the release to an indexer as dead.
+        if causes.stalled {
+            let mut msg = format!(
+                "download failed on connection errors: the connection pool stalled \
+                 and the download was cut short with {incomplete} file(s) still \
+                 incomplete, {derrs} decode/write errors."
+            );
+            // Do NOT claim the post is healthy when servers have said
+            // otherwise. A run can both stall AND collect real 430s, and
+            // the first version of this message told the user "not
+            // evidence that anything is missing" about a release where
+            // four providers had said exactly that, thousands of times.
+            match causes.missing_430 {
+                0 => msg.push_str(
+                    " No server said any article was missing, so this is a fault on \
+                     THIS machine or its link rather than evidence about the post - \
+                     most of the outstanding articles were never requested.",
+                ),
+                n => msg.push_str(&format!(
+                    " {n} segment(s) WERE confirmed missing by every server that has \
+                     the post, so this release is short as well as cut off; the rest \
+                     were never requested and say nothing either way.",
+                )),
+            }
+            msg.push_str(" Retrying resumes from the journal and refetches only the gaps");
+            if !causes.dead_servers.is_empty() {
+                // The usual reason a pool starves into a stall: a server
+                // in the fleet that never worked, so its share of the
+                // articles has nowhere to go.
+                msg.push_str(&format!(
+                    "; no usable connection was ever made to {} - a server that never \
+                     connects starves the pool of the articles routed to it",
+                    causes.dead_servers.join(", ")
+                ));
+            }
+            return msg;
+        }
+        // No server ever said "gone" - blaming the post would be a lie.
+        let all_transport = causes.missing_430 == 0
+            && causes.retention_excluded == 0
+            && causes.transport_failed > 0;
+        // Nothing whatsoever arrived, and every loss was a server saying
+        // 430 with all of them answering: the post is not damaged, it is
+        // GONE. Its own opening, because the daemon must treat it
+        // differently from a post that is merely short - `FailKind::Gone`
+        // still reports to an indexer but does NOT arm an automatic retry,
+        // which against a wholly dead post only spends the same minutes
+        // again. Positive evidence only (a segment census that accounts
+        // for every article asked for), never the mere ABSENCE of other
+        // causes - a caller with no per-slot accounting leaves the totals
+        // at 0 and must fall through to the classic opening.
+        let post_gone = causes.total_segments > 0
+            && causes.missing_segments >= causes.total_segments
+            && causes.bytes_arrived == 0
+            && causes.missing_430 > 0
+            && causes.transport_failed == 0
+            && causes.retention_excluded == 0
+            && causes.dead_servers.is_empty()
+            && causes.post_age_days >= GONE_MIN_AGE_DAYS;
+        let mut msg = if post_gone {
+            format!(
+                "post is gone: not one of the {} article(s) is on any server - all \
+                 {incomplete} file(s) came back empty and not a byte arrived, \
+                 {derrs} decode/write errors",
+                causes.total_segments
+            )
+        } else if all_transport {
+            format!(
+                "download failed on connection errors: {incomplete} file(s) lost segments \
+                 to transport failures ({} in all - no server said any article was \
+                 missing), {derrs} decode/write errors",
+                causes.transport_failed
+            )
+        } else {
+            format!(
+                "download incomplete: {incomplete} file(s) with missing segments, \
+                 {derrs} decode/write errors"
+            )
+        };
+        // The segment census, right behind the classifying clause. "94
+        // file(s) with missing segments" was the whole story a user got,
+        // and it is the same sentence whether one segment or twelve
+        // thousand went astray. Suppressed on the `post_gone` opening,
+        // which has already said every article of every file was absent.
+        if causes.total_segments > 0 && !post_gone {
+            msg.push_str(&format!(
+                "; {} of {} segment(s) never arrived ({:.0} MB did)",
+                causes.missing_segments,
+                causes.total_segments,
+                causes.bytes_arrived as f64 / 1e6
+            ));
+        }
+        // No parity in the post: a confirmed-missing segment cannot be
+        // rebuilt, so say so plainly. Deliberately a CLAUSE and not its
+        // own verdict - an earlier cut made this final and stopped the
+        // automatic retry, which broke the case the retry exists for: a
+        // freshly posted article 430s on every server until it
+        // propagates, and looks identical to one that is gone for good.
+        // `post_gone` is the properly-gated version of that verdict (it
+        // additionally requires nothing to have arrived and the post to
+        // be older than propagation explains), so this stands down when
+        // that fired rather than saying the same thing twice.
+        if causes.missing_430 > 0 && causes.par2_slots == 0 && !post_gone {
+            msg.push_str(&format!(
+                "; {} segment(s) were confirmed missing by every server AND this post \
+                 carries no PAR2 recovery data, so nothing can rebuild them. If the \
+                 post is not brand new (where the servers may simply not have it yet), \
+                 retrying will not help and another version is the answer",
+                causes.missing_430
+            ));
+        }
+        if causes.retention_excluded > 0 {
+            msg.push_str(&format!(
+                "; {} segment(s) were never requested because they are older than every \
+                 server's configured retention - check retention_days in the server \
+                 settings (0 = unlimited)",
+                causes.retention_excluded
+            ));
+        }
+        if causes.transport_failed > 0 && !all_transport {
+            msg.push_str(&format!(
+                "; {} segment(s) lost to transport/connection errors, not takedowns",
+                causes.transport_failed
+            ));
+        }
+        if causes.transport_failed > 0 {
+            if let Some(e) = &causes.transport_sample {
+                msg.push_str(&format!(" (first error: {e})"));
+            }
+        }
+        if !causes.dead_servers.is_empty() {
+            msg.push_str(&format!(
+                "; no usable connection to {} for the entire run (unreachable, or it \
+                 refused the login) - segments only that server carries were counted \
+                 as missing",
+                causes.dead_servers.join(", ")
+            ));
+        }
+        // How many INDEPENDENT opinions the verdict rests on. Only where
+        // a server actually said 430: on a transport-only failure nobody
+        // gave an opinion about the post at all, and naming the backbones
+        // there would dress a provider wobble up as a unanimous verdict.
+        if causes.missing_430 > 0 && !causes.backbones.is_empty() {
+            msg.push_str(&format!(
+                "; asked {} backbone(s): {} (resellers of one backbone answer alike)",
+                causes.backbones.len(),
+                causes.backbones.join(", ")
+            ));
+        }
+        msg
     } else {
-        format!(
+        let mut msg = format!(
             "could not write the download: {derrs} decode/write error(s) and no missing \
              segments - every article arrived, so check free space, permissions and the \
              log above"
-        )
+        );
+        if let Some(e) = &causes.decode_sample {
+            msg.push_str(&format!(" (first error: {e})"));
+        }
+        msg
     }
 }
 
@@ -5353,6 +6230,12 @@ fn braces_password(nzb_path: &std::path::Path) -> Option<String> {
 /// whose payload unpacks perfectly one pass later.
 pub(crate) fn sevenz_disk_fallback(why: &str) -> bool {
     why.starts_with(nzbkit::extract::SEVENZ_DISK_FALLBACK_PREFIX)
+        // A demoted top-level ZIP chase is the same story with a
+        // different ladder step: the materialized `.zip` is the disk
+        // post-pass's own input (its step 5), and its reason text -
+        // "encrypted", "held-bytes cap" - would steer the RAR arms just
+        // as wrongly.
+        || why.starts_with(nzbkit::extract::ZIP_DISK_FALLBACK_PREFIX)
 }
 
 /// Does a level-0 extraction fallback leave its volumes UNOWNED, i.e. is the
@@ -5502,10 +6385,11 @@ pub(crate) fn try_unrar_spent(
         // name names nothing on disk. Grouping by RAR header - what
         // `extract_obfuscated_rar` does - is the only thing that works on
         // this shape. For the same reason this sits AHEAD of the
-        // `NZBFAST_NO_NATIVE_UNRAR` escape hatch and ignores it: that switch
-        // exists to hand a set to the unrar subprocess instead, and there is
-        // no version of that which unpacks this one. It still governs every
-        // named set, which is all it was ever about.
+        // `prefer_external_unrar` escape hatch (the setting, or its
+        // `NZBFAST_NO_NATIVE_UNRAR` env override) and ignores it: that
+        // switch exists to hand a set to the unrar subprocess instead, and
+        // there is no version of that which unpacks this one. It still
+        // governs every named set, which is all it was ever about.
         let obf = collect_obfuscated_rar_volumes(dir).unwrap_or_default();
         if obf.is_empty() {
             return None;
@@ -5608,9 +6492,11 @@ pub(crate) fn try_unrar_spent(
         );
     };
     // Native in-process extraction first (vendored rars fork - measured
-    // faster than unrar on every compressed-RAR bench leg); the embedded
-    // unrar subprocess stays as the escape hatch for one release.
-    if std::env::var_os("NZBFAST_NO_NATIVE_UNRAR").is_none() {
+    // faster than unrar on every compressed-RAR bench leg); the unrar
+    // subprocess stays as the escape hatch, chosen by the daemon's
+    // `prefer_external_unrar` setting or its `NZBFAST_NO_NATIVE_UNRAR`
+    // env override.
+    if !nzbkit::extract::prefer_external_unrar() {
         println!("unpacking archive natively…");
         let mut consumed_all: Vec<PathBuf> = Vec::new();
         let mut produced = false;
@@ -6609,7 +7495,11 @@ fn extract_one_sevenz(
 /// logical byte-space, so a split zip never needs a second copy on disk -
 /// which also means no scratch container can collide with a member of the
 /// archive it came from.
-fn extract_zip(dir: &std::path::Path, jobs: &[nzbkit::zip::Finding]) -> bool {
+fn extract_zip(
+    dir: &std::path::Path,
+    jobs: &[nzbkit::zip::Finding],
+    password: Option<&str>,
+) -> bool {
     let mut all_ok = true;
     for job in jobs {
         let out = match ExtractStaging::new(dir) {
@@ -6621,7 +7511,7 @@ fn extract_zip(dir: &std::path::Path, jobs: &[nzbkit::zip::Finding]) -> bool {
             }
         };
         println!("unpacking {} natively…", job.shape.label());
-        match extract_one_zip(out.path(), &job.parts)
+        match extract_one_zip(out.path(), &job.parts, password)
             .and_then(|()| {
                 if out.produced_anything() {
                     Ok(())
@@ -6652,7 +7542,11 @@ fn extract_zip(dir: &std::path::Path, jobs: &[nzbkit::zip::Finding]) -> bool {
 /// decompression bomb, with one budget shared across the whole archive.
 /// Symlink entries are refused outright - their payload is a path, and
 /// materializing one plants a link pointing wherever the archive likes.
-fn extract_one_zip(out: &std::path::Path, parts: &[PathBuf]) -> Result<()> {
+fn extract_one_zip(
+    out: &std::path::Path,
+    parts: &[PathBuf],
+    password: Option<&str>,
+) -> Result<()> {
     let archive = nzbkit::zip::Archive::open(parts)
         .map_err(|e| anyhow::anyhow!("opening zip: {e}"))?;
     let budget = crate::serve::free_bytes(out)
@@ -6678,7 +7572,7 @@ fn extract_one_zip(out: &std::path::Path, parts: &[PathBuf]) -> Result<()> {
             budget,
         };
         archive
-            .read_entry_to(e, &mut w)
+            .read_entry_to_with(e, &mut w, password)
             .map_err(|err| anyhow::anyhow!("{err}"))?;
         use std::io::Write as _;
         w.flush()?;
@@ -6836,16 +7730,17 @@ pub(crate) fn reextract_dir(dir: &std::path::Path, password: Option<&str>) -> Re
         let name = p.file_name().unwrap_or_default().to_string_lossy();
         (release_stem(&name), vol_sort_key(&name))
     });
-    // A RAR4 `-hp` set is opaque to the streaming extractor whatever
-    // password we hold: the main header's MHD_PASSWORD flag is an
-    // unconditional blocker in the in-stream parser, so every volume below
-    // would be read off disk in full only to demote, printing one
-    // "not re-extractable (encrypted headers (password required))" line
-    // per group with a VALID password in hand - 135 of them in the
-    // v1.0.11 report this came from - before the unrar fallback did the
-    // work. The rars fork DOES read those headers with the password
-    // (`try_rars_native` passes it into the parse session), so hand the
-    // set straight there. Gated on a single-set directory because
+    // A header-encrypted set the in-stream parser cannot read with the
+    // password we hold: every volume below would be read off disk in full
+    // only to demote, printing one "not re-extractable (encrypted headers
+    // (password required))" line per group with a VALID password in hand -
+    // 135 of them in the v1.0.11 report this came from - before the unrar
+    // fallback did the work. The rars fork reads those headers
+    // (`try_rars_native` passes the password into the parse session), so
+    // hand the set straight there. Both RAR5 `-hp` and (since RAR4 header
+    // decryption landed) RAR4 `-hp` now parse in-stream, so this shortcut
+    // only fires for shapes the mapper still cannot open at all.
+    // Gated on a single-set directory because
     // `try_rars_native` extracts one stem group: with a second set beside
     // it, the streaming path below is still the one that sees everything.
     // A native failure just falls through to it, having published nothing
@@ -7541,6 +8436,10 @@ async fn fetch_and_repair(
     // a file we hold (see `run_external_par2`). Native repair never needs
     // this: it is in-process and reads through our own handles.
     extractor: &nzbkit::extract::Extractor,
+    // Set to (needed, have) when the NZB simply does not carry enough
+    // recovery blocks - the one repair failure whose arithmetic belongs
+    // in the job's fail message, not just the console.
+    shortfall: &mut Option<(usize, usize)>,
 ) -> Result<bool> {
     let mut fetched_files: Vec<usize> = Vec::new();
     if needed > 0 {
@@ -7550,6 +8449,7 @@ async fn fetch_and_repair(
             println!(
                 "⚠ unrepairable: {needed} blocks needed, only {have} recovery blocks in the NZB"
             );
+            *shortfall = Some((needed, have));
             return Ok(false);
         }
 
@@ -8452,9 +9352,11 @@ mod repair_tests {
         for why in [
             // The caller's own encrypted/password/compressed branches.
             "encrypted headers (password required)",
+            "encrypted entries (password required)",
             "wrong archive password",
             "compressed or encrypted entries",
             "encrypted data incomplete",
+            "encrypted data failed its checksum (wrong password)",
             // The nested post-pass repairs the inner layer before unpacking.
             "nested fallback: inner file failed its stored CRC",
             "nested fallback: inner mapping unfinished at end of download",
@@ -8498,6 +9400,23 @@ mod repair_tests {
         assert!(!sevenz_disk_fallback("nested fallback: inner 7z decode failed"));
     }
 
+    /// The zip twin: a demoted top-level zip chase leaves a `.zip` the
+    /// disk post-pass's own ladder step owns, and its reason text -
+    /// which carries "password"/"compression" wordings - must stay out
+    /// of the RAR ladder for the same reason.
+    #[test]
+    fn a_demoted_top_level_zip_stays_out_of_the_rar_ladder() {
+        for why in [
+            "held-bytes cap: chase memory",
+            "movie.mkv is password-protected and encrypted zip is not supported",
+            "movie.mkv uses bzip2 compression, which is not built in",
+        ] {
+            let marked = format!("{}{why}", nzbkit::extract::ZIP_DISK_FALLBACK_PREFIX);
+            assert!(sevenz_disk_fallback(&marked), "'{marked}'");
+            assert!(marked.contains(why));
+        }
+    }
+
     /// The speculative recovery prefetch promises "a tiny side pool (1
     /// conn/server)": the main pool already holds this account's grants, so
     /// a second full fleet mid-download runs the provider's connection cap
@@ -8522,6 +9441,9 @@ mod repair_tests {
             socks5: None,
             enabled: true,
             warm_pool: false,
+            idle_release_secs: None,
+            idle_keep: None,
+            max_source_ips: None,
         };
         let live = nzbkit::pool::LiveStats::for_servers(&[
             (server("a.example"), nzbkit::pool::PoolConfig::default()),
@@ -9002,13 +9924,12 @@ mod repair_tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A RAR4 `-hp` set with the password in hand. The streaming
-    /// extractor can never map this shape (the MHD_PASSWORD blocker is
-    /// unconditional - see `nzbkit::rar::headers_encrypted_to`, which
-    /// carries the discriminator's own test), so `reextract_dir` hands it
-    /// to the native disk path instead of reading every volume off disk
-    /// to demote. What is asserted here is the ladder's end state: the
-    /// payload is out and the volume is spent, with no unrar in the story.
+    /// A RAR4 `-hp` set with the password in hand. What is asserted here
+    /// is the ladder's end state, not which rung did the work: the payload
+    /// is out and the volume is spent, with no unrar in the story. Which
+    /// rung it is has moved - the streaming extractor could never map this
+    /// shape until RAR4 header decryption landed, so it used to be handed
+    /// straight to the native disk path by `headers_encrypted_to`.
     #[test]
     fn reextract_dir_unpacks_a_rar4_header_encrypted_set() {
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
@@ -10098,13 +11019,19 @@ async fn sysbench_cmd(config: &PathBuf, group: &str) -> Result<()> {
     // the diversity phase below hard-error - while also overriding the group
     // the user explicitly asked for.
     let grp = group.to_string();
-    print!("network: probing {} for 8s… ", srv.host);
+    // The configured connection count, not a fixed 8 - see measure_system
+    // in serve.rs for why (issue #12: eight connections cannot show more
+    // than a few hundred Mbps, whatever the line is capable of).
+    let conns = (srv.connections as usize).clamp(1, 100);
+    print!("network: probing {} for 8s on {conns} connections… ", srv.host);
     use std::io::Write as _;
     std::io::stdout().flush().ok();
     let (net, _probe_bytes) =
-        nzbkit::sysbench::network_probe(srv, &grp, 8, 8).await.unwrap_or((0.0, 0));
+        nzbkit::sysbench::network_probe(srv, &grp, conns, 8).await.unwrap_or((0.0, 0));
     println!("{:.2} Gbps", net);
-    let v = nzbkit::sysbench::verdict(net, &compute, disk);
+    let mut v = nzbkit::sysbench::verdict(net, &compute, disk);
+    v.network_host = srv.host.clone();
+    v.network_conns = conns;
     // The verdict leads: the sustainable speed, then a bar per subsystem -
     // the shortest bar is the limit; the others show their headroom.
     println!(
@@ -12491,6 +13418,138 @@ mod multi_server_selection {
 
 #[cfg(test)]
 mod main_tests {
+    use super::LossCauses;
+
+    /// The 31 Jul failure this exists for. The pool wedged with 8851
+    /// segments outstanding, the tail was aborted to recover, and the
+    /// job was filed as "94 file(s) with missing segments" - which says
+    /// the release is dead on every server the user has. It was not:
+    /// almost none of those articles had been ASKED for.
+    ///
+    /// The counts cannot catch this on their own, which is the trap.
+    /// Abandoned segments are neither `missing_430` (nobody said 430)
+    /// nor `transport_failed` (nothing failed in transit), so every
+    /// cause count is zero and the existing all-transport rule - which
+    /// needs `transport_failed > 0` - cannot fire. Zero evidence of
+    /// anything therefore produced the most damning message available.
+    ///
+    /// Two things have to hold: the text must not blame the post, and
+    /// the daemon's classifier must read it as Transport, which is what
+    /// keeps a healthy release from being reported to an indexer as dead
+    /// and what shortens the retry.
+
+    /// A run can BOTH stall and collect real 430s, and the first cut of
+    /// the stall message told the user "not evidence that anything is
+    /// missing" about a release four providers had just said was short -
+    /// thousands of times. Denying the inference is right only when
+    /// nothing was actually confirmed.
+    #[test]
+    fn a_stall_with_real_430s_reports_both_not_just_the_stall() {
+        let both = super::incomplete_reason(
+            94,
+            0,
+            &LossCauses { stalled: true, missing_430: 2031, par2_slots: 4, ..no_causes() },
+        );
+        assert!(both.contains("connection pool stalled"), "{both}");
+        assert!(both.contains("2031 segment(s) WERE confirmed missing"), "{both}");
+        assert!(
+            !both.contains("No server said any article was missing"),
+            "the stall must not vouch for a post that servers have called short: {both}"
+        );
+        // Still Transport: the run was cut off, and with parity present a
+        // retry can still finish it.
+        assert_eq!(crate::serve::fail_kind(&both), crate::serve::FailKind::Transport);
+    }
+
+    /// A post with confirmed-missing segments and NO parity cannot be
+    /// rebuilt, and the message has to say so - the user is otherwise
+    /// left retrying a release that arithmetic says will never complete.
+    ///
+    /// But it stays a CLAUSE, not a verdict. An earlier cut made this
+    /// final and stopped the automatic retry; the daemon suite caught
+    /// that it breaks the exact case the retry exists for, because a
+    /// freshly posted article 430s on every server until it propagates
+    /// and is indistinguishable from one that is gone for good. So the
+    /// classification - and the single cheap retry - must not change.
+    #[test]
+    fn no_parity_and_confirmed_missing_is_said_plainly_but_still_retries() {
+        let dead = super::incomplete_reason(
+            94,
+            0,
+            &LossCauses { missing_430: 2031, par2_slots: 0, ..no_causes() },
+        );
+        assert!(dead.contains("no PAR2 recovery data"), "{dead}");
+        assert!(dead.contains("another version is the answer"), "{dead}");
+        let kind = crate::serve::fail_kind(&dead);
+        assert_eq!(kind, crate::serve::FailKind::MissingArticles);
+        assert!(
+            kind.transient(),
+            "this must stay retryable: a brand-new post 430s everywhere until it \
+             propagates, and refusing to retry would strand it permanently"
+        );
+
+        // Parity present: no such clause, nothing to warn about.
+        let repairable = super::incomplete_reason(
+            2,
+            0,
+            &LossCauses { missing_430: 5, par2_slots: 4, ..no_causes() },
+        );
+        assert!(!repairable.contains("no PAR2 recovery data"), "{repairable}");
+    }
+
+    #[test]
+    fn a_stalled_pool_does_not_report_a_healthy_post_as_missing() {
+        let stalled = super::incomplete_reason(94, 0, &LossCauses { stalled: true, ..no_causes() });
+        assert!(
+            !stalled.starts_with("download incomplete"),
+            "a stall opened with the dead-post verdict: {stalled}"
+        );
+        assert!(stalled.contains("connection pool stalled"), "{stalled}");
+        assert!(
+            stalled.contains("rather than evidence about the post"),
+            "the message has to deny the inference it used to invite: {stalled}"
+        );
+        assert_eq!(
+            crate::serve::fail_kind(&stalled),
+            crate::serve::FailKind::Transport,
+            "a stall must classify as Transport - MissingArticles reports the release \
+             to the indexer as dead and makes the user sit out a propagation wait for \
+             a fault on their own machine"
+        );
+
+        // A server that never connected is the usual cause, and naming
+        // it turns the message into something actionable.
+        let dead = ["news.tweaknews.eu".to_string()];
+        let with_dead =
+            super::incomplete_reason(94, 0, &LossCauses { stalled: true, dead_servers: &dead, ..no_causes() });
+        assert!(with_dead.contains("news.tweaknews.eu"), "{with_dead}");
+
+        // And the ordinary path is untouched: real 430s still read as a
+        // short post, or the fix would hide genuine takedowns.
+        let real = super::incomplete_reason(3, 0, &LossCauses { missing_430: 9, ..no_causes() });
+        assert!(real.starts_with("download incomplete"), "{real}");
+        assert_eq!(crate::serve::fail_kind(&real), crate::serve::FailKind::MissingArticles);
+    }
+
+    /// A LossCauses with nothing known - each test overrides one field.
+    fn no_causes() -> LossCauses<'static> {
+        LossCauses {
+            missing_430: 0,
+            retention_excluded: 0,
+            transport_failed: 0,
+            transport_sample: None,
+            decode_sample: None,
+            dead_servers: &[],
+            par2_slots: 1,
+            stalled: false,
+            missing_segments: 0,
+            total_segments: 0,
+            bytes_arrived: 0,
+            backbones: &[],
+            post_age_days: 0,
+        }
+    }
+
     /// BUG (MEDIUM): a full disk, a permission error or a bad sector used
     /// to bail with a message that OPENED "download incomplete: 0 file(s)
     /// with missing segments" - which the daemon read as a dead post
@@ -12499,20 +13558,330 @@ mod main_tests {
     /// The leading clause now says which of the two it was.
     #[test]
     fn a_local_write_fault_does_not_claim_missing_segments() {
-        let missing = super::incomplete_reason(3, 0);
+        let c = LossCauses { missing_430: 3, ..no_causes() };
+        let missing = super::incomplete_reason(3, 0, &c);
         assert!(missing.starts_with("download incomplete"));
         assert!(missing.contains("3 file(s) with missing segments"));
+        // No known extra cause: nothing speculative appended.
+        assert!(!missing.contains("retention"), "{missing}");
+        assert!(!missing.contains("connection"), "{missing}");
 
         // Both happened: still the post's problem, and both counts show.
-        let both = super::incomplete_reason(2, 5);
+        let both = super::incomplete_reason(2, 5, &c);
         assert!(both.starts_with("download incomplete"));
         assert!(both.contains("5 decode/write errors"));
 
         // Nothing missing: the articles all arrived, so this is ours.
-        let local = super::incomplete_reason(0, 5);
+        let local = super::incomplete_reason(0, 5, &no_causes());
         assert!(!local.starts_with("download incomplete"), "{local}");
         assert!(local.contains("5 decode/write error"));
         assert!(local.contains("no missing segments"));
+
+        // The first decode error rides along - a daemon user has no
+        // console, and ENOSPC vs EACCES are different stories.
+        let sampled = super::incomplete_reason(
+            0,
+            5,
+            &LossCauses {
+                decode_sample: Some("write a.mkv: No space left on device".into()),
+                ..no_causes()
+            },
+        );
+        assert!(sampled.contains("No space left on device"), "{sampled}");
+    }
+
+    /// A run where NO server ever said 430 is a provider problem, not a
+    /// dead post: it must open with its own clause (FailKind::Transport
+    /// - auto-retried, never reported to an indexer), and quote the
+    /// first real error.
+    #[test]
+    fn all_transport_losses_do_not_blame_the_post() {
+        let all_transport = super::incomplete_reason(
+            5,
+            0,
+            &LossCauses {
+                transport_failed: 40,
+                transport_sample: Some("unexpected response to BODY: 999 huh".into()),
+                ..no_causes()
+            },
+        );
+        assert!(
+            all_transport.starts_with("download failed on connection errors"),
+            "{all_transport}"
+        );
+        assert!(!all_transport.starts_with("download incomplete"), "{all_transport}");
+        assert!(all_transport.contains("40 in all"), "{all_transport}");
+        assert!(all_transport.contains("999 huh"), "{all_transport}");
+
+        // One real 430 in the mix: the post IS damaged, so the classic
+        // opening stands and transport losses append as a clause.
+        let mixed = super::incomplete_reason(
+            5,
+            0,
+            &LossCauses {
+                missing_430: 2,
+                transport_failed: 38,
+                transport_sample: Some("read timed out".into()),
+                ..no_causes()
+            },
+        );
+        assert!(mixed.starts_with("download incomplete"), "{mixed}");
+        assert!(
+            mixed.contains("38 segment(s) lost to transport/connection errors"),
+            "{mixed}"
+        );
+        assert!(mixed.contains("read timed out"), "{mixed}");
+    }
+
+    /// Hblife (Reddit, v1.0.12): "every file failed - incomplete articles
+    /// - but SAB got them fine". The two silent ways an article goes
+    /// Missing WITHOUT every server saying 430 - a retention_days setting
+    /// excluding it pre-flight, and a server that never held a connection
+    /// shrinking the unanimity mask - now name themselves in the failure
+    /// summary. The opening clause must NOT move: the daemon's fail_kind
+    /// and the *arr health mapping key on it.
+    #[test]
+    fn known_missing_causes_are_named_after_the_classifying_clause() {
+        let ret = super::incomplete_reason(
+            4,
+            0,
+            &LossCauses { retention_excluded: 1200, ..no_causes() },
+        );
+        assert!(ret.starts_with("download incomplete: 4 file(s)"), "{ret}");
+        assert!(ret.contains("1200 segment(s) were never requested"), "{ret}");
+        assert!(ret.contains("retention_days"), "{ret}");
+
+        let hosts = ["news.eu.example".to_string()];
+        let dead = super::incomplete_reason(
+            2,
+            0,
+            &LossCauses { missing_430: 9, dead_servers: &hosts, ..no_causes() },
+        );
+        assert!(dead.starts_with("download incomplete: 2 file(s)"), "{dead}");
+        assert!(
+            dead.contains("no usable connection to news.eu.example for the entire run"),
+            "{dead}"
+        );
+
+        // Both causes, both named, both after the opening clause.
+        let two = ["a.example".to_string(), "b.example".to_string()];
+        let both = super::incomplete_reason(
+            1,
+            0,
+            &LossCauses {
+                missing_430: 1,
+                retention_excluded: 7,
+                dead_servers: &two,
+                ..no_causes()
+            },
+        );
+        assert!(both.starts_with("download incomplete: 1 file(s)"), "{both}");
+        assert!(both.contains("7 segment(s)"), "{both}");
+        assert!(both.contains("a.example, b.example"), "{both}");
+
+        // A decode/write-only failure never mentions network causes -
+        // every article arrived, so retention/server clauses would lie.
+        let one = ["a.example".to_string()];
+        let local = super::incomplete_reason(
+            0,
+            3,
+            &LossCauses { dead_servers: &one, ..no_causes() },
+        );
+        assert!(!local.contains("a.example"), "{local}");
+    }
+
+    /// Field report, 31 Jul: "94 file(s) with missing segments" for a post that
+    /// was in fact entirely gone. The file count is the same sentence
+    /// whether one segment or twelve thousand went astray, so the census
+    /// rides behind the classifying clause - and the clause itself does
+    /// not move, because `fail_kind` and the *arr health mapping key on
+    /// it.
+    #[test]
+    fn the_segment_census_rides_behind_the_opening() {
+        let short = super::incomplete_reason(
+            2,
+            0,
+            &LossCauses {
+                missing_430: 3,
+                missing_segments: 3,
+                total_segments: 12_018,
+                bytes_arrived: 8_100_000_000,
+                ..no_causes()
+            },
+        );
+        assert!(short.starts_with("download incomplete: 2 file(s)"), "{short}");
+        assert!(short.contains("3 of 12018 segment(s) never arrived"), "{short}");
+        assert!(short.contains("8100 MB did"), "{short}");
+        // Nearly everything arrived: nothing here may say "gone".
+        assert!(!short.starts_with("post is gone"), "{short}");
+
+        // No per-slot accounting (any caller that cannot census): the
+        // clause is suppressed rather than printing a bare "0 of 0".
+        let censusless = super::incomplete_reason(2, 0, &LossCauses { missing_430: 3, ..no_causes() });
+        assert!(!censusless.contains("segment(s) never arrived"), "{censusless}");
+    }
+
+    /// A post where NOTHING is retrievable is not a damaged post, and
+    /// treating it as one spends an automatic retry re-proving it. It
+    /// earns its own opening (`FailKind::Gone`: still reported to an
+    /// indexer, never auto-retried) - but ONLY on positive evidence,
+    /// never on the absence of other causes.
+    #[test]
+    fn a_wholly_dead_post_says_so() {
+        let backbones = ["omicron".to_string(), "usenetexpress".to_string()];
+        let gone = super::incomplete_reason(
+            94,
+            0,
+            &LossCauses {
+                missing_430: 12_018,
+                missing_segments: 12_018,
+                total_segments: 12_018,
+                bytes_arrived: 0,
+                backbones: &backbones,
+                post_age_days: 21,
+                ..no_causes()
+            },
+        );
+        assert!(gone.starts_with("post is gone"), "{gone}");
+        assert!(gone.contains("not one of the 12018 article(s)"), "{gone}");
+        assert!(gone.contains("all 94 file(s)"), "{gone}");
+        // Two providers of one backbone are ONE opinion; the count says so.
+        assert!(gone.contains("asked 2 backbone(s): omicron, usenetexpress"), "{gone}");
+        // Already said every article was absent - no census on top.
+        assert!(!gone.contains("segment(s) never arrived"), "{gone}");
+
+        // One byte arrived: the post is damaged, not dead.
+        let damaged = super::incomplete_reason(
+            94,
+            0,
+            &LossCauses {
+                missing_430: 12_017,
+                missing_segments: 12_017,
+                total_segments: 12_018,
+                bytes_arrived: 1,
+                post_age_days: 21,
+                ..no_causes()
+            },
+        );
+        assert!(damaged.starts_with("download incomplete"), "{damaged}");
+
+        // A server that never connected did not vote, so unanimity is
+        // unproven and "gone" would be a lie - the dead-server clause
+        // still owns this case.
+        let hosts = ["news.eu.example".to_string()];
+        let unproven = super::incomplete_reason(
+            94,
+            0,
+            &LossCauses {
+                missing_430: 12_018,
+                missing_segments: 12_018,
+                total_segments: 12_018,
+                bytes_arrived: 0,
+                dead_servers: &hosts,
+                post_age_days: 21,
+                ..no_causes()
+            },
+        );
+        assert!(unproven.starts_with("download incomplete"), "{unproven}");
+
+        // Transport losses in the mix: nobody proved anything about the
+        // post, so it must not be declared dead.
+        let flaky = super::incomplete_reason(
+            94,
+            0,
+            &LossCauses {
+                missing_430: 12_000,
+                transport_failed: 18,
+                missing_segments: 12_018,
+                total_segments: 12_018,
+                bytes_arrived: 0,
+                post_age_days: 21,
+                ..no_causes()
+            },
+        );
+        assert!(flaky.starts_with("download incomplete"), "{flaky}");
+    }
+
+    /// A post nobody carries YET is the same picture as a post nobody
+    /// carries ANY MORE - every article 430, not a byte arrived - and
+    /// calling the first one dead would skip the automatic retry that
+    /// exists precisely for it. (This is what the daemon's auto-retry
+    /// tests caught: a release grabbed off an indexer minutes after its
+    /// pre 430s everywhere until it propagates.)
+    #[test]
+    fn a_post_still_propagating_is_not_a_dead_one() {
+        let fresh = |age| {
+            super::incomplete_reason(
+                8,
+                0,
+                &LossCauses {
+                    missing_430: 900,
+                    missing_segments: 900,
+                    total_segments: 900,
+                    bytes_arrived: 0,
+                    post_age_days: age,
+                    ..no_causes()
+                },
+            )
+        };
+        // Hours old, then a day, then the day before the threshold: all
+        // still transient, all still eligible for the retry.
+        for age in 0..super::GONE_MIN_AGE_DAYS {
+            let m = fresh(age);
+            assert!(m.starts_with("download incomplete"), "age {age}: {m}");
+        }
+        // Old enough that propagation cannot be the explanation.
+        let old = fresh(super::GONE_MIN_AGE_DAYS);
+        assert!(old.starts_with("post is gone"), "{old}");
+
+        // An NZB with no usable date reads as age 0 - unknown is not old,
+        // so it keeps the retry rather than being written off.
+        assert_eq!(super::nzb_age_days(0), 0);
+        assert_eq!(super::nzb_age_days(-1), 0);
+    }
+
+    /// Backbones are named only where a server actually said 430. On a
+    /// transport-only failure nobody gave an opinion about the post, and
+    /// listing the backbones there dresses a provider wobble up as a
+    /// unanimous verdict.
+    #[test]
+    fn backbones_are_named_only_when_someone_voted() {
+        let backbones = ["omicron".to_string()];
+        let voted = super::incomplete_reason(
+            1,
+            0,
+            &LossCauses { missing_430: 5, backbones: &backbones, ..no_causes() },
+        );
+        assert!(voted.contains("asked 1 backbone(s): omicron"), "{voted}");
+
+        let no_vote = super::incomplete_reason(
+            1,
+            0,
+            &LossCauses { transport_failed: 5, backbones: &backbones, ..no_causes() },
+        );
+        assert!(!no_vote.contains("backbone"), "{no_vote}");
+
+        // A server addressed by IP names no backbone: `backbone_of` on a
+        // dotted quad reduces to the label "0", which the collector drops
+        // rather than printing a digit as though it were a provider.
+        // (Caught live on a scratch daemon: "asked 1 backbone(s): 0".)
+        assert_eq!(nzbkit::oracle::backbone_of("127.0.0.1"), "0");
+        let none = super::incomplete_reason(
+            1,
+            0,
+            &LossCauses { missing_430: 5, backbones: &[], ..no_causes() },
+        );
+        assert!(!none.contains("backbone"), "{none}");
+    }
+
+    /// The version tag appends and never disturbs the opening clause the
+    /// daemon classifies on.
+    #[test]
+    fn build_tag_appends_without_moving_the_opening() {
+        let tagged = super::with_build("download incomplete: 1 file(s)".into());
+        assert!(tagged.starts_with("download incomplete: 1 file(s)"), "{tagged}");
+        assert!(tagged.contains("[nzbfast "), "{tagged}");
+        assert!(tagged.ends_with(']'), "{tagged}");
     }
 }
 
@@ -12551,10 +13920,46 @@ mod zip_extract_tests {
 
         let found = nzbkit::zip::scan(&dir);
         assert_eq!(found.len(), 1);
-        assert!(super::extract_zip(&dir, &found), "zip should unpack");
+        assert!(super::extract_zip(&dir, &found, None), "zip should unpack");
         assert_eq!(std::fs::read(dir.join("Some.Movie/movie.mkv")).unwrap(), movie);
         assert_eq!(std::fs::read(dir.join("Some.Movie/info.nfo")).unwrap(), nfo);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Phase 3: an encrypted zip unpacks when the job carries the
+    /// password, in both schemes; without it (or with the wrong one)
+    /// the unpack fails and the container stays put for the user.
+    #[test]
+    fn an_encrypted_zip_unpacks_with_the_job_password() {
+        use nzbkit::zip::fixtures::Encrypt;
+        let movie = payload(80_000, 9);
+        for (tag, enc) in [
+            ("zc", Encrypt::ZipCrypto { password: "pw123" }),
+            ("ae", Encrypt::Ae { password: "pw123", strength: 3, vendor_version: 2 }),
+        ] {
+            let dir = tmp(&format!("enc-{tag}"));
+            let z = nzbkit::zip::fixtures::zip_of(&[Spec {
+                encrypt: Some(enc),
+                ..Spec::deflated("movie.mkv", &movie)
+            }]);
+            std::fs::write(dir.join("payload.zip"), &z).unwrap();
+            let found = nzbkit::zip::scan(&dir);
+            assert!(
+                !super::extract_zip(&dir, &found, None),
+                "{tag}: no password must not unpack"
+            );
+            assert!(
+                !super::extract_zip(&dir, &found, Some("wrong")),
+                "{tag}: a wrong password must not unpack"
+            );
+            assert!(!dir.join("movie.mkv").exists(), "{tag}: nothing published on failure");
+            assert!(
+                super::extract_zip(&dir, &found, Some("pw123")),
+                "{tag}: the right password must unpack"
+            );
+            assert_eq!(std::fs::read(dir.join("movie.mkv")).unwrap(), movie, "{tag}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
     }
 
     /// Zip-slip: an entry naming its way out of the output directory must
@@ -12571,7 +13976,7 @@ mod zip_extract_tests {
         std::fs::write(inner.join("evil.zip"), &z).unwrap();
 
         let found = nzbkit::zip::scan(&inner);
-        assert!(!super::extract_zip(&inner, &found), "zip-slip must not succeed");
+        assert!(!super::extract_zip(&inner, &found, None), "zip-slip must not succeed");
         assert!(!dir.join("escaped.txt").exists(), "wrote outside the output dir");
         assert!(!inner.join("escaped.txt").exists());
         std::fs::remove_dir_all(&dir).unwrap();
@@ -12588,7 +13993,7 @@ mod zip_extract_tests {
         }]);
         std::fs::write(dir.join("l.zip"), &z).unwrap();
         let found = nzbkit::zip::scan(&dir);
-        assert!(!super::extract_zip(&dir, &found), "symlink entry must not extract");
+        assert!(!super::extract_zip(&dir, &found, None), "symlink entry must not extract");
         assert!(!dir.join("link").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -12605,7 +14010,7 @@ mod zip_extract_tests {
         }]);
         std::fs::write(dir.join("d.zip"), &z).unwrap();
         let found = nzbkit::zip::scan(&dir);
-        assert!(!super::extract_zip(&dir, &found), "a bad CRC must fail the unpack");
+        assert!(!super::extract_zip(&dir, &found, None), "a bad CRC must fail the unpack");
         assert!(!dir.join("movie.mkv").exists(), "corrupt output was published");
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -12614,14 +14019,15 @@ mod zip_extract_tests {
     /// and producing nothing - and it names the codec.
     #[test]
     fn a_declined_method_fails_with_the_codec_named() {
-        let dir = tmp("bz");
+        let dir = tmp("lzma");
+        // lzma (14): bzip2 used to stand here and is now decoded.
         let z = nzbkit::zip::fixtures::zip_of(&[Spec {
-            method: 12,
+            method: 14,
             ..Spec::stored("movie.mkv", &payload(2_000, 9))
         }]);
         std::fs::write(dir.join("b.zip"), &z).unwrap();
         let found = nzbkit::zip::scan(&dir);
-        assert!(!super::extract_zip(&dir, &found));
+        assert!(!super::extract_zip(&dir, &found, None));
         // The container survives for the user to unpack by hand.
         assert!(dir.join("b.zip").exists());
         std::fs::remove_dir_all(&dir).unwrap();
@@ -12651,7 +14057,7 @@ mod zip_extract_tests {
         std::fs::write(dir.join("m.zip.002"), &z[cut..]).unwrap();
         let found = nzbkit::zip::scan(&dir);
         assert_eq!(found.len(), 1);
-        assert!(super::extract_zip(&dir, &found));
+        assert!(super::extract_zip(&dir, &found, None));
         assert_eq!(std::fs::read(dir.join("movie.mkv")).unwrap(), data);
         std::fs::remove_dir_all(&dir).unwrap();
     }

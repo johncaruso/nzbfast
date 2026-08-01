@@ -70,6 +70,16 @@ pub async fn stat_sweep(
     window: usize,
 ) -> SweepResult {
     let t0 = std::time::Instant::now();
+    // A zero here is not a configuration, it is a hang - the same reason
+    // pool.rs clamps its own window and connection counts in the library
+    // rather than at each CLI call site. `check --window 0` made the send
+    // loop's `sent - recv < window` guard false on the first iteration:
+    // not one STAT went out, every worker then blocked on a reply that
+    // could never come until the 20 s timeout, every cell stayed Unknown,
+    // and `union_missing` (which needs Missing on EVERY server) counted
+    // none of them - so a fully unavailable NZB was reported "COMPLETE -
+    // every sampled article present".
+    let window = window.max(1);
     let ids: Arc<Vec<String>> = Arc::new(ids.to_vec());
     let mut tasks = Vec::new();
     let mut cells: Vec<Arc<Vec<AtomicU8>>> = Vec::new();
