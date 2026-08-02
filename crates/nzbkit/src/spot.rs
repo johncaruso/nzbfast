@@ -57,9 +57,18 @@ const MAX_NZB_INFLATED: u64 = 32 * 1024 * 1024;
 /// key, 5 and 6 were never issued, and 7 means "self-signed" - the modulus
 /// travels in the From record instead.
 const MASTER_KEYS: [(u8, &str); 3] = [
-    (2, "ys8WSlqonQMWT8ubG0tAA2Q07P36E+CJmb875wSR1XH7IFhEi0CCwlUzNqBFhC+P"),
-    (3, "uiyChPV23eguLAJNttC/o0nAsxXgdjtvUvidV2JL+hjNzc4Tc/PPo2JdYvsqUsat"),
-    (4, "1k6RNDVD6yBYWR6kHmwzmSud7JkNV4SMigBrs+jFgOK5Ldzwl17mKXJhl+su/GR9"),
+    (
+        2,
+        "ys8WSlqonQMWT8ubG0tAA2Q07P36E+CJmb875wSR1XH7IFhEi0CCwlUzNqBFhC+P",
+    ),
+    (
+        3,
+        "uiyChPV23eguLAJNttC/o0nAsxXgdjtvUvidV2JL+hjNzc4Tc/PPo2JdYvsqUsat",
+    ),
+    (
+        4,
+        "1k6RNDVD6yBYWR6kHmwzmSud7JkNV4SMigBrs+jFgOK5Ldzwl17mKXJhl+su/GR9",
+    ),
 ];
 
 /// Below this a decoded modulus is a random number, not a public key -
@@ -143,8 +152,14 @@ pub fn parse_spot_from(from_header: &str) -> Option<SpotHeader> {
     // can verify without a modulus, and nothing here needs the user
     // signature, so neither absence rejects the record.
     let mut user_fields = user_part.split('.');
-    let modulus = user_fields.next().and_then(spot_b64_decode).unwrap_or_default();
-    let user_signature = user_fields.next().and_then(spot_b64_decode).unwrap_or_default();
+    let modulus = user_fields
+        .next()
+        .and_then(spot_b64_decode)
+        .unwrap_or_default();
+    let user_signature = user_fields
+        .next()
+        .and_then(spot_b64_decode)
+        .unwrap_or_default();
 
     // [cat][keyid][subcats].[size].[random].[date].[custom-id].[custom-value]
     // .[header-signature]
@@ -413,7 +428,11 @@ const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 fn b64_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(B64[(n >> 18) as usize & 63] as char);
         out.push(B64[(n >> 12) as usize & 63] as char);
@@ -519,8 +538,7 @@ fn inflate_capped(raw: &[u8]) -> Option<Vec<u8>> {
 /// posting.
 pub fn special_zip(data: &[u8]) -> Vec<u8> {
     use std::io::Write;
-    let mut enc =
-        flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
     enc.write_all(data).expect("deflate to memory");
     let deflated = enc.finish().expect("deflate to memory");
     let mut out = Vec::with_capacity(deflated.len() + deflated.len() / 8);
@@ -564,7 +582,9 @@ pub fn parse_spot_xml(xml: &str) -> Option<SpotXml> {
     let description = tag_text(xml, "Description")
         .map(xml_unescape)
         .unwrap_or_default();
-    let poster = tag_text(xml, "Poster").map(xml_unescape).unwrap_or_default();
+    let poster = tag_text(xml, "Poster")
+        .map(xml_unescape)
+        .unwrap_or_default();
     let cat_scope = tag_text(xml, "Category").unwrap_or("");
     let category = cat_scope
         .trim_start()
@@ -657,8 +677,7 @@ fn xml_unescape(s: &str) -> String {
         if let Some((ent, ch)) = known.iter().find(|(e, _)| tail.starts_with(e)) {
             out.push(*ch);
             rest = &tail[ent.len()..];
-        } else if let Some(semi) = tail
-            .as_bytes()[..tail.len().min(8)]
+        } else if let Some(semi) = tail.as_bytes()[..tail.len().min(8)]
             .iter()
             .position(|&b| b == b';')
         {
@@ -1097,16 +1116,16 @@ mod tests {
             String::new(),
             "no brackets at all".into(),
             "nick <>".into(),
-            "nick <mod.sig>".into(),                             // no @
-            format!("nick <QUJD.QUJD@x7a09.1.2.3.4.{SIG}>"),     // non-digit category
-            format!("nick <QUJD.QUJD@1xa09.1.2.3.4.{SIG}>"),     // non-digit key-id
-            format!("nick <QUJD.QUJD@1709x.1.2.3.4.{SIG}>"),     // garbage subcats
-            format!("nick <QUJD.QUJD@17a09.NaN.2.3.4.{SIG}>"),   // bad size
-            format!("nick <QUJD.QUJD@17a09.1.2.NaN.4.{SIG}>"),   // bad date
-            format!("nick <QUJD.QUJD@17a09.1.{SIG}>"),           // truncated fields
-            "nick <QUJD.QUJD@17a09.1.2.3.4.5.6>".into(),         // undecodable signature
-            "nick <QUJD.QUJD@17a09.1.2.3.4.5.>".into(),          // empty signature
-            good[..good.len() / 2].to_string(),                  // truncated record
+            "nick <mod.sig>".into(),                           // no @
+            format!("nick <QUJD.QUJD@x7a09.1.2.3.4.{SIG}>"),   // non-digit category
+            format!("nick <QUJD.QUJD@1xa09.1.2.3.4.{SIG}>"),   // non-digit key-id
+            format!("nick <QUJD.QUJD@1709x.1.2.3.4.{SIG}>"),   // garbage subcats
+            format!("nick <QUJD.QUJD@17a09.NaN.2.3.4.{SIG}>"), // bad size
+            format!("nick <QUJD.QUJD@17a09.1.2.NaN.4.{SIG}>"), // bad date
+            format!("nick <QUJD.QUJD@17a09.1.{SIG}>"),         // truncated fields
+            "nick <QUJD.QUJD@17a09.1.2.3.4.5.6>".into(),       // undecodable signature
+            "nick <QUJD.QUJD@17a09.1.2.3.4.5.>".into(),        // empty signature
+            good[..good.len() / 2].to_string(),                // truncated record
             format!("nick <{}.QUJD@17a09.1.2.3.4.{SIG}>", "QUJD".repeat(3000)), // >8KB
             format!("nick > reversed < QUJD.QUJD@17a09.1.2.3.4.{SIG}"),
         ];
@@ -1131,9 +1150,11 @@ mod tests {
         assert!(server_signed.user_signature.is_empty());
         assert_eq!(server_signed.key_id, 2);
         assert_eq!(server_signed.signed_part, "12a01.1.10.1776489039.c41.mod");
-        assert!(candidate_keys(&server_signed)
-            .iter()
-            .all(|(s, _)| *s == SpotKeySource::Master));
+        assert!(
+            candidate_keys(&server_signed)
+                .iter()
+                .all(|(s, _)| *s == SpotKeySource::Master)
+        );
     }
 
     /// Real captured `free.pt` OVER lines, one per way a spot can verify.
@@ -1151,7 +1172,13 @@ mod tests {
             // Key-id 2 "personal dispose", self-signed, latin-1 subject.
             ("Dansons", Some(SpotKeySource::SelfSigned), true, 0, 2),
             // Key-id 2 "personal dispose", self-signed, plain ASCII.
-            ("Master of the Universe", Some(SpotKeySource::SelfSigned), true, 0, 2),
+            (
+                "Master of the Universe",
+                Some(SpotKeySource::SelfSigned),
+                true,
+                0,
+                2,
+            ),
             // Key-id 2 against the distributed master key, latin-1 subject.
             ("pendant la", Some(SpotKeySource::Master), true, 0, 2),
             // Key-id 2 against the distributed master key, plain ASCII.
@@ -1159,12 +1186,24 @@ mod tests {
             // Self-signed key-id 7, latin-1 subject.
             ("skind (2012)", Some(SpotKeySource::SelfSigned), true, 0, 7),
             // Self-signed key-id 7, non-ASCII subject that really is UTF-8.
-            ("Oscar Peterson", Some(SpotKeySource::SelfSigned), true, 1, 7),
+            (
+                "Oscar Peterson",
+                Some(SpotKeySource::SelfSigned),
+                true,
+                1,
+                7,
+            ),
             // Self-signed key-id 7, plain ASCII.
             ("Garmin tools", Some(SpotKeySource::SelfSigned), true, 3, 7),
             // Self-signed key-id 7 signed over the WHOLE subject, '|' and
             // all - the rule that splits on '|' misses this one.
-            ("Testspot 4 | ClubNZB", Some(SpotKeySource::SelfSigned), true, 0, 7),
+            (
+                "Testspot 4 | ClubNZB",
+                Some(SpotKeySource::SelfSigned),
+                true,
+                0,
+                7,
+            ),
             // Server-signed: the From carries a random number, not a key,
             // so there is nothing to verify against. Parses, never valid.
             ("HPI Seizoen.02", None, true, 0, 7),
@@ -1235,7 +1274,10 @@ mod tests {
                 tagged_kept += 1;
             } else {
                 tagged_cut += 1;
-                assert!(!title.contains('|'), "a cut title keeps nothing after the bar");
+                assert!(
+                    !title.contains('|'),
+                    "a cut title keeps nothing after the bar"
+                );
             }
         }
         // "Testspot 4 | ClubNZB" is the fixture's one barred subject, and
@@ -1245,7 +1287,11 @@ mod tests {
         // with a spot signed on the cut title, and it is the majority
         // rule in the wild (17,114 of 21,384 verified in the sample the
         // verifier was measured on).
-        assert_eq!((tagged_kept, tagged_cut), (1, 0), "the barred row signs whole");
+        assert_eq!(
+            (tagged_kept, tagged_cut),
+            (1, 0),
+            "the barred row signs whole"
+        );
     }
 
     #[test]
@@ -1288,8 +1334,7 @@ mod tests {
 
         // zlib-wrapped variant is accepted too.
         use std::io::Write;
-        let mut enc =
-            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         enc.write_all(&data).unwrap();
         let zlib = enc.finish().unwrap();
         let escaped: Vec<u8> = zlib
@@ -1393,7 +1438,10 @@ mod tests {
         );
         let mut head = format!("From: {}\r\nSubject: {title}\r\n", spot.from);
         for chunk in spot_xml.as_bytes().chunks(60) {
-            head.push_str(&format!("X-XML: {}\r\n", std::str::from_utf8(chunk).unwrap()));
+            head.push_str(&format!(
+                "X-XML: {}\r\n",
+                std::str::from_utf8(chunk).unwrap()
+            ));
         }
         let headers = HashMap::from([(spot.msgid.clone(), head.into_bytes())]);
         let overview = vec![OverRow {
@@ -1413,11 +1461,15 @@ mod tests {
         let mut ix = Index::open(&dir.join("index.db")).unwrap();
 
         // Scan: one header, one valid spot.
-        let sum = scan_spots(&mut conn, &mut ix, "free.pt", "mock", 1000).await.unwrap();
+        let sum = scan_spots(&mut conn, &mut ix, "free.pt", "mock", 1000)
+            .await
+            .unwrap();
         assert_eq!((sum.scanned, sum.valid, sum.invalid, sum.new), (1, 1, 0, 1));
         assert_eq!(sum.hashcash_warn, 0);
         // Re-scan is a no-op (high-water mark).
-        let sum2 = scan_spots(&mut conn, &mut ix, "free.pt", "mock", 1000).await.unwrap();
+        let sum2 = scan_spots(&mut conn, &mut ix, "free.pt", "mock", 1000)
+            .await
+            .unwrap();
         assert_eq!(sum2.scanned, 0);
 
         // Search.

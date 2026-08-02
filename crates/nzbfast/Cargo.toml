@@ -1,10 +1,13 @@
 [package]
 name = "nzbfast"
-version = "1.0.13"
+version = "1.0.14"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Speed-focused NZB downloader"
+
+[lints]
+workspace = true
 
 [dependencies]
 nzbkit = { path = "../nzbkit" }
@@ -48,12 +51,27 @@ flate2 = "1"
 # resize, re-encode jpeg. No default features - just the codecs.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 libc = "0.2"
-md-5 = "0.11.0"
+# 0.10 to MATCH nzbkit: the download path hashes with md-5 0.10 (which
+# carries the asm backend on x86), and bench-cpu must measure the same
+# implementation. 0.11 here meant the bench timed a different MD5 than
+# downloads use.
+md-5 = "0.10"
 crc32fast = "1.5.0"
 rpassword = "7"
 qrcodegen = "1.8.0"
 notify = "8.2.0"
 trash = "5.2.6"
+# Structured logging. The subscriber writes to the process's own
+# stdout/stderr, which is what logtee tees into the dashboard's log pane -
+# so the viewer keeps working with no plumbing of its own (see logging.rs).
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+# `fmt` + `registry` only. NOT `env-filter`: that feature pulls
+# matchers/regex-automata in for its span-field syntax, which nothing here
+# uses - `filter::Targets` parses the same `info,queue=debug` grammar for
+# per-target levels and costs no new crates. `ansi` stays off: the output
+# goes to a pipe (logtee) and into an HTML <pre>, where escape codes are
+# garbage, not colour.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "registry"] }
 
 # mimalloc as the global allocator on macOS + Linux (the two platforms we
 # ship as native binaries and Docker/NAS images; the Windows cross-build
@@ -86,6 +104,12 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
 ] }
+
+# Kernel TLS, Linux only and off by default - see nzbkit's `ktls`
+# feature. Built in with `cargo build --features ktls`, then armed at
+# run time with NZBFAST_KTLS=1.
+[features]
+ktls = ["nzbkit/ktls"]
 
 # Signing tooling for the update manifest (keygen + detached sign) lives
 # in examples/update_sign.rs so the daemon and the release pipeline use

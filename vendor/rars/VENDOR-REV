@@ -1,0 +1,9 @@
+fork: github.com/bitplane/rars, branch perf
+last-synced-rev: 050758e
+last-synced-date: 2026-07-24
+local-drift: substantial. Since that sync the vendored copy has taken 57+
+  commits of decoder bug fixes, hang fixes and perf work directly (see
+  git log -- vendor/rars). The vendored copy is currently AHEAD of the
+  fork: running sync-from-fork.sh without pushing that work upstream
+  first would destroy it. sync-from-fork.sh now refuses to run while
+  unsynced local commits exist.

@@ -10,7 +10,7 @@
 //!
 //! Skips (like the nzbfast e2e suite) when no `par2` is on PATH.
 
-use nzbkit::par2repair::{repair_dir, RepairStatus};
+use nzbkit::par2repair::{RepairStatus, repair_dir};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -35,10 +35,8 @@ fn have_par2() -> bool {
 struct TempDir(PathBuf);
 impl TempDir {
     fn new(tag: &str) -> TempDir {
-        let p = std::env::temp_dir().join(format!(
-            "nzbkit-par2parity-{tag}-{}",
-            std::process::id()
-        ));
+        let p =
+            std::env::temp_dir().join(format!("nzbkit-par2parity-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         TempDir(p)
@@ -305,7 +303,10 @@ fn renamed_recovery_volumes_are_sniffed() {
         RepairStatus::Repaired(r) => r,
         other => panic!("expected Repaired, got {other:?}"),
     };
-    assert_eq!(r.blocks_rebuilt, 1, "recovery slices came from sniffed volumes");
+    assert_eq!(
+        r.blocks_rebuilt, 1,
+        "recovery slices came from sniffed volumes"
+    );
     assert_eq!(r.blocks_adopted, 0);
     for (n, d) in ["a.bin", "b.bin", "c.bin"].iter().zip(&pristine) {
         assert_eq!(&read(&ours.0, n), d, "{n}: native output not pristine");
@@ -341,7 +342,10 @@ fn mid_file_insertion_escalates_to_target_scan() {
     });
     let r = assert_parity(&ours, &theirs, &pristine);
     assert_eq!(r.blocks_adopted, 6, "blocks 3..8 found at +100 in a.bin");
-    assert_eq!(r.blocks_rebuilt, 1, "only the insertion-split block needs RS");
+    assert_eq!(
+        r.blocks_rebuilt, 1,
+        "only the insertion-split block needs RS"
+    );
     assert_eq!(r.adopted_from, vec!["a.bin"]);
 }
 

@@ -74,10 +74,18 @@ pub enum FileKind {
 /// A real message-id contains none of these (RFC 5536 forbids whitespace and
 /// the delimiters), so rejecting is free on legitimate input.
 pub(crate) fn is_wire_safe(s: &str) -> bool {
-    !s.chars().any(|c| c.is_control() || c.is_whitespace() || matches!(c, '<' | '>'))
+    !s.chars()
+        .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '<' | '>'))
 }
 
 impl Nzb {
+    // quick_xml deprecated `unescape_value` in favour of
+    // `normalized_value`, which ALSO applies XML attribute-value
+    // normalization (tabs and newlines become spaces). Subjects are
+    // matched byte-for-byte downstream, so rewriting whitespace inside
+    // them is a behaviour change this parser must not make; we keep the
+    // unescape-only call on purpose.
+    #[allow(deprecated)]
     pub fn parse(xml: &[u8]) -> Result<Nzb, NzbError> {
         let mut reader = Reader::from_reader(xml);
         reader.config_mut().trim_text(true);
@@ -146,12 +154,11 @@ impl Nzb {
                         seg.message_id.push_str(text);
                     } else if let Some((_, v)) = cur_meta.as_mut() {
                         v.push_str(text);
-                    } else if in_group {
-                        if let Some(f) = cur_file.as_mut() {
-                            if is_wire_safe(text) {
-                                f.groups.push(text.to_string());
-                            }
-                        }
+                    } else if in_group
+                        && let Some(f) = cur_file.as_mut()
+                        && is_wire_safe(text)
+                    {
+                        f.groups.push(text.to_string());
                     }
                 }
                 Event::CData(c) => {
@@ -168,12 +175,11 @@ impl Nzb {
                         seg.message_id.push_str(text);
                     } else if let Some((_, v)) = cur_meta.as_mut() {
                         v.push_str(text);
-                    } else if in_group {
-                        if let Some(f) = cur_file.as_mut() {
-                            if is_wire_safe(text) {
-                                f.groups.push(text.to_string());
-                            }
-                        }
+                    } else if in_group
+                        && let Some(f) = cur_file.as_mut()
+                        && is_wire_safe(text)
+                    {
+                        f.groups.push(text.to_string());
                     }
                 }
                 Event::GeneralRef(r) => {
@@ -212,17 +218,19 @@ impl Nzb {
                     }
                     b"group" => in_group = false,
                     b"meta" => {
-                        if let Some((ty, val)) = cur_meta.take() {
-                            if !ty.is_empty() && !val.is_empty() {
-                                meta.push((ty, val));
-                            }
+                        if let Some((ty, val)) = cur_meta.take()
+                            && !ty.is_empty()
+                            && !val.is_empty()
+                        {
+                            meta.push((ty, val));
                         }
                     }
                     b"segment" => {
-                        if let (Some(f), Some(seg)) = (cur_file.as_mut(), cur_segment.take()) {
-                            if !seg.message_id.is_empty() && is_wire_safe(&seg.message_id) {
-                                f.segments.push(seg);
-                            }
+                        if let (Some(f), Some(seg)) = (cur_file.as_mut(), cur_segment.take())
+                            && !seg.message_id.is_empty()
+                            && is_wire_safe(&seg.message_id)
+                        {
+                            f.segments.push(seg);
                         }
                     }
                     _ => {}
@@ -254,7 +262,10 @@ impl Nzb {
         // Saturating: the per-segment `bytes` come from an untrusted NZB
         // attribute (up to u64::MAX); a plain sum panics in debug and wraps
         // in release, corrupting size-based routing/display.
-        self.files.iter().map(NzbFile::bytes).fold(0u64, u64::saturating_add)
+        self.files
+            .iter()
+            .map(NzbFile::bytes)
+            .fold(0u64, u64::saturating_add)
     }
 
     /// Encoded bytes excluding PAR2 recovery volumes (what we download
@@ -270,7 +281,10 @@ impl Nzb {
 
 impl NzbFile {
     pub fn bytes(&self) -> u64 {
-        self.segments.iter().map(|s| s.bytes).fold(0u64, u64::saturating_add)
+        self.segments
+            .iter()
+            .map(|s| s.bytes)
+            .fold(0u64, u64::saturating_add)
     }
 
     /// The filename quoted in the subject, per the near-universal posting
@@ -367,13 +381,26 @@ POST]]></segment>
 </nzb>"#;
         let nzb = Nzb::parse(xml).expect("parses");
         let f = &nzb.files[0];
-        assert_eq!(f.segments.len(), 1, "only the clean segment may survive: {:?}", f.segments);
+        assert_eq!(
+            f.segments.len(),
+            1,
+            "only the clean segment may survive: {:?}",
+            f.segments
+        );
         assert_eq!(f.segments[0].message_id, "clean@example.com");
         for seg in &f.segments {
-            assert!(is_wire_safe(&seg.message_id), "unsafe id survived: {:?}", seg.message_id);
+            assert!(
+                is_wire_safe(&seg.message_id),
+                "unsafe id survived: {:?}",
+                seg.message_id
+            );
         }
         // The group name takes the same route into `GROUP {name}`.
-        assert!(f.groups.iter().all(|g| is_wire_safe(g)), "unsafe group survived: {:?}", f.groups);
+        assert!(
+            f.groups.iter().all(|g| is_wire_safe(g)),
+            "unsafe group survived: {:?}",
+            f.groups
+        );
     }
 
     fn sample() -> &'static [u8] {

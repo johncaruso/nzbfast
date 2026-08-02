@@ -11,10 +11,12 @@
 //! - Retry taxonomy from the NNTP response codes: transport failures retry (bounded); a 430
 //!   "no such article" is authoritative for this server - no retry.
 
+use crate::sync::MutexExt;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use tracing::{error, info, warn};
 
 use tokio::sync::{Mutex, mpsc};
 
@@ -56,7 +58,7 @@ impl BufPool {
         if buf.capacity() > KEEP_CAP {
             return;
         }
-        let mut bufs = self.bufs.lock().unwrap();
+        let mut bufs = self.bufs.lock_ok();
         if bufs.len() < self.max_held {
             bufs.push(buf);
         }
@@ -105,7 +107,7 @@ impl RateLimit {
         if self.bytes_per_sec.swap(bytes_per_sec, Ordering::Relaxed) == bytes_per_sec {
             return;
         }
-        *self.next.lock().unwrap() = Instant::now();
+        *self.next.lock_ok() = Instant::now();
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -144,7 +146,7 @@ impl RateLimit {
         }
         let generation = self.generation.load(Ordering::Relaxed);
         let deadline = {
-            let mut next = self.next.lock().unwrap();
+            let mut next = self.next.lock_ok();
             let now = Instant::now();
             // `.max(now)` is what stops an idle line banking credit: a
             // clock left behind in the past resumes from now, not from
@@ -273,14 +275,19 @@ impl ConnGauge {
         if let Some(l) = live {
             l.servers[idx].connected.fetch_add(1, Ordering::Relaxed);
         }
-        ConnGauge { live: live.clone(), idx }
+        ConnGauge {
+            live: live.clone(),
+            idx,
+        }
     }
 }
 
 impl Drop for ConnGauge {
     fn drop(&mut self) {
         if let Some(l) = &self.live {
-            l.servers[self.idx].connected.fetch_sub(1, Ordering::Relaxed);
+            l.servers[self.idx]
+                .connected
+                .fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
@@ -396,7 +403,7 @@ pub struct QueueControl {
 
 impl QueueControl {
     fn attach(&self, sh: &Arc<Shared>) {
-        *self.shared.lock().unwrap() = Some(Arc::downgrade(sh));
+        *self.shared.lock_ok() = Some(Arc::downgrade(sh));
         // A handle reused for a second run starts that run undrained; the
         // latch below describes the pool currently attached, not a past one.
         self.drained.store(false, Ordering::Release);
@@ -422,7 +429,12 @@ impl QueueControl {
     /// many-volume set probes once per slot - each 60 s stream-mode
     /// linger would chain into the whole download running shallow.
     pub fn promote_opts(&self, ids: &[String], engage_stream: bool) -> usize {
-        let Some(sh) = self.shared.lock().unwrap().as_ref().and_then(std::sync::Weak::upgrade)
+        let Some(sh) = self
+            .shared
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
         else {
             return 0;
         };
@@ -480,7 +492,7 @@ impl QueueControl {
             // non-promoted in-flight transfers yield the line.
             let total = q.iter().filter(|w| w.promoted).count();
             sh.promoted_pending.store(total, Ordering::Release);
-            *sh.promoted_ids.lock().unwrap() = ids.iter().cloned().collect();
+            *sh.promoted_ids.lock_ok() = ids.iter().cloned().collect();
             sh.promote_gen.send_modify(|g| *g += 1);
         }
         n
@@ -492,10 +504,169 @@ impl QueueControl {
     /// of queueing behind hundreds of MB of pipelined responses. Called
     /// on every reader read - cheap (one mutex + one atomic store).
     pub fn note_stream_active(&self) {
-        if let Some(sh) = self.shared.lock().unwrap().as_ref().and_then(std::sync::Weak::upgrade)
+        if let Some(sh) = self
+            .shared
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
         {
             sh.note_stream();
         }
+    }
+
+    /// In-stream PAR2 deferral (issue #14): permanently remove every
+    /// PENDING article whose message-id is in `ids` from the queue, and
+    /// mark each one terminal WITHOUT emitting a `FetchOutcome` - the
+    /// caller owns the accounting for exactly the ids returned. Articles
+    /// already in flight (or already resolved) are untouched and resolve
+    /// through their normal outcome; a duplicate call for an id already
+    /// cancelled is a no-op. Best-effort like `promote`: a missed lock
+    /// returns an empty list and the caller may retry.
+    pub fn cancel(&self, ids: &HashSet<String>) -> Vec<String> {
+        let Some(sh) = self
+            .shared
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        else {
+            return Vec::new();
+        };
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        // Same bounded try_lock discipline as `promote`: callers are the
+        // decode OS threads, and the queue is a tokio Mutex popped by
+        // workers.
+        let mut tries = 0;
+        let mut q = loop {
+            match sh.queue.try_lock() {
+                Ok(g) => break g,
+                Err(_) if tries < 20 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut removed: Vec<Work> = Vec::new();
+        let mut kept: VecDeque<Work> = VecDeque::with_capacity(q.len());
+        for w in q.drain(..) {
+            if ids.contains(w.id.as_str()) {
+                removed.push(w);
+            } else {
+                kept.push_back(w);
+            }
+        }
+        *q = kept;
+        // A cancelled item may have been seek-promoted; keep the promoted
+        // count honest so the shed immunity check stays accurate.
+        if removed.iter().any(|w| w.promoted) {
+            let total = q.iter().filter(|w| w.promoted).count();
+            sh.promoted_pending.store(total, Ordering::Release);
+        }
+        drop(q);
+        // Terminal bookkeeping OUTSIDE the queue lock (claim_done takes
+        // the done mutex; complete_one may fire the finished watch when
+        // the cancelled articles were the last pending work). The Work
+        // items are stashed whole so `requeue` can resurrect them.
+        let mut out = Vec::with_capacity(removed.len());
+        for w in removed {
+            if sh.claim_done(&w.id) {
+                sh.complete_one();
+                out.push(w.id.clone());
+                sh.cancelled.lock_ok().insert(w.id.clone(), w);
+            }
+        }
+        out
+    }
+
+    /// Undo a [`cancel`](Self::cancel): put previously-cancelled articles
+    /// back into the queue, un-terminal. All-or-nothing per call for the
+    /// ids it finds in the stash: on any obstacle (run already finished,
+    /// draining, queue lock unobtainable) everything is rolled back and 0
+    /// is returned - the caller keeps its deferred accounting. Only ids
+    /// a prior `cancel` returned can ever be requeued; unknown ids are
+    /// ignored (and do not count toward the return value).
+    pub fn requeue(&self, ids: &[String]) -> usize {
+        let Some(sh) = self
+            .shared
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        else {
+            return 0;
+        };
+        if sh.aborted.load(Ordering::Acquire) || sh.draining.load(Ordering::Acquire) {
+            return 0;
+        }
+        let works: Vec<Work> = {
+            let mut stash = sh.cancelled.lock_ok();
+            ids.iter().filter_map(|id| stash.remove(id)).collect()
+        };
+        if works.is_empty() {
+            return 0;
+        }
+        let put_back = |ws: Vec<Work>| {
+            let mut stash = sh.cancelled.lock_ok();
+            for w in ws {
+                stash.insert(w.id.clone(), w);
+            }
+        };
+        // Pending BEFORE the finished check: with the count raised, a
+        // concurrent complete_one cannot reach zero and fire finished
+        // under us. If finished already fired, the fleet is winding down
+        // and nothing would ever fetch these - roll back.
+        // A rollback's fetch_sub can be the one that lands pending on
+        // zero (a real completion slipped in between our add and sub, and
+        // saw an inflated count) - it must then fire `finished` exactly
+        // like complete_one, or the fleet waits forever.
+        let sub_pending = |n: usize| {
+            if sh.pending.fetch_sub(n, Ordering::AcqRel) == n {
+                *sh.drained_at.lock_ok() = Some(Instant::now());
+                let _ = sh.finished.send(true);
+            }
+        };
+        sh.pending.fetch_add(works.len(), Ordering::AcqRel);
+        if *sh.finished.borrow() {
+            sub_pending(works.len());
+            put_back(works);
+            return 0;
+        }
+        {
+            let mut done = sh.done.lock_ok();
+            for w in &works {
+                done.remove(&w.id);
+            }
+        }
+        let mut tries = 0;
+        let mut q = loop {
+            match sh.queue.try_lock() {
+                Ok(g) => break g,
+                Err(_) if tries < 20 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(_) => {
+                    // Roll back in reverse: re-terminal, drop pending
+                    // (firing finished if ours is the zeroing sub),
+                    // re-stash.
+                    let mut done = sh.done.lock_ok();
+                    for w in &works {
+                        done.insert(w.id.clone());
+                    }
+                    drop(done);
+                    sub_pending(works.len());
+                    put_back(works);
+                    return 0;
+                }
+            }
+        };
+        let n = works.len();
+        q.extend(works);
+        n
     }
 
     /// Force a pool-state dump (the stall watchdog, on a suspected
@@ -503,7 +674,12 @@ impl QueueControl {
     /// but on demand - so a hang in the field self-captures the queue /
     /// inflight state that pins the root cause.
     pub fn dump_state(&self) {
-        if let Some(sh) = self.shared.lock().unwrap().as_ref().and_then(std::sync::Weak::upgrade)
+        if let Some(sh) = self
+            .shared
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
         {
             sh.debug_dump_idle();
         }
@@ -518,7 +694,12 @@ impl QueueControl {
     /// to usize::MAX and the pool never returned). The fetch returns
     /// within seconds; the journal keeps what landed.
     pub fn abort(&self) -> bool {
-        let Some(sh) = self.shared.lock().unwrap().as_ref().and_then(std::sync::Weak::upgrade)
+        let Some(sh) = self
+            .shared
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
         else {
             return false;
         };
@@ -533,7 +714,12 @@ impl QueueControl {
     /// Contrast [`abort`](Self::abort), which drops in-flight reads (they
     /// re-download on resume) to free the line immediately.
     pub fn drain(&self) -> bool {
-        let Some(sh) = self.shared.lock().unwrap().as_ref().and_then(std::sync::Weak::upgrade)
+        let Some(sh) = self
+            .shared
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
         else {
             return false;
         };
@@ -644,7 +830,7 @@ impl AuthState {
         };
         let first = !flag.swap(true, Ordering::SeqCst);
         if first {
-            *self.reason.lock().unwrap() = Some(line.to_string());
+            *self.reason.lock_ok() = Some(line.to_string());
         }
         first
     }
@@ -689,8 +875,9 @@ impl AuthState {
         self.rejected.load(Ordering::Acquire)
     }
 
+    #[allow(dead_code)] // diagnostic accessor, kept for pool-debug dumps
     fn reason(&self) -> Option<String> {
-        self.reason.lock().unwrap().clone()
+        self.reason.lock_ok().clone()
     }
 }
 
@@ -732,6 +919,11 @@ struct Shared {
     draining: AtomicBool,
     /// When the last article went terminal (vs when the pool returned).
     drained_at: std::sync::Mutex<Option<Instant>>,
+    /// Work items removed by [`QueueControl::cancel`], kept whole (retry
+    /// budget, retention seed) so [`QueueControl::requeue`] can resurrect
+    /// them exactly as they were - the in-stream PAR2 sniff un-defers a
+    /// slot when activation reveals it was set-covered payload after all.
+    cancelled: std::sync::Mutex<HashMap<String, Work>>,
     /// Tail duplicates that won their race (emitted the outcome).
     dup_wins: AtomicU64,
     /// M14e tiers: per-server level and live-worker counts. A fill
@@ -941,7 +1133,11 @@ impl WorkerLife {
     fn birth(shared: &Arc<Shared>, idx: usize) -> WorkerLife {
         shared.alive[idx].fetch_add(1, Ordering::Relaxed);
         shared.workers_live.fetch_add(1, Ordering::AcqRel);
-        WorkerLife { shared: shared.clone(), idx, retired: false }
+        WorkerLife {
+            shared: shared.clone(),
+            idx,
+            retired: false,
+        }
     }
 
     /// Leave the fleet deliberately. True when this was the last live
@@ -1007,7 +1203,10 @@ impl Shared {
     /// whose retention can't cover it. Articles outside EVERY server's
     /// retention never enter the queue (no worker could pop them - they'd
     /// rotate forever); they're returned for an immediate Missing report.
-    fn new(reqs: Vec<ArticleReq>, servers: &[(ServerConfig, PoolConfig)]) -> (Arc<Shared>, Vec<String>) {
+    fn new(
+        reqs: Vec<ArticleReq>,
+        servers: &[(ServerConfig, PoolConfig)],
+    ) -> (Arc<Shared>, Vec<String>) {
         let n_servers = servers.len();
         let retentions: Vec<u32> = servers.iter().map(|(s, _)| s.retention_days).collect();
         let all = servers_mask(n_servers);
@@ -1044,7 +1243,10 @@ impl Shared {
             }
         }
         if dups > 0 {
-            eprintln!("[pool] dropped {dups} duplicate article request(s) - each id is fetched once");
+            info!(
+                target: "pool",
+                "dropped {dups} duplicate article request(s) - each id is fetched once"
+            );
         }
         let pending = AtomicUsize::new(queue.len());
         let shared = Arc::new(Shared {
@@ -1052,7 +1254,9 @@ impl Shared {
             pending,
             done: std::sync::Mutex::new(HashSet::new()),
             inflight: std::sync::Mutex::new(HashMap::new()),
-            bytes: (0..n_servers).map(|_| Arc::new(AtomicU64::new(0))).collect(),
+            bytes: (0..n_servers)
+                .map(|_| Arc::new(AtomicU64::new(0)))
+                .collect(),
             ages,
             start: Instant::now(),
             dups_issued: AtomicU64::new(0),
@@ -1061,6 +1265,7 @@ impl Shared {
             aborted: AtomicBool::new(false),
             draining: AtomicBool::new(false),
             drained_at: std::sync::Mutex::new(None),
+            cancelled: std::sync::Mutex::new(HashMap::new()),
             dup_wins: AtomicU64::new(0),
             levels: servers.iter().map(|(s, _)| s.level).collect(),
             alive: (0..n_servers).map(|_| AtomicUsize::new(0)).collect(),
@@ -1090,27 +1295,34 @@ impl Shared {
         {
             return;
         }
-        let alive: Vec<usize> = self.alive.iter().map(|a| a.load(Ordering::Relaxed)).collect();
-        eprintln!(
-            "[pool-debug] t={now}s pending={} alive={alive:?}",
+        let alive: Vec<usize> = self
+            .alive
+            .iter()
+            .map(|a| a.load(Ordering::Relaxed))
+            .collect();
+        info!(
+            target: "pool-debug",
+            "t={now}s pending={} alive={alive:?}",
             self.pending.load(Ordering::Relaxed)
         );
         if let Ok(q) = self.queue.try_lock() {
-            eprintln!("[pool-debug] queue={} item(s)", q.len());
+            info!(target: "pool-debug", "queue={} item(s)", q.len());
             for w in q.iter().take(30) {
-                eprintln!(
-                    "[pool-debug]   q {} tried_430={:06b} tried_fail={:06b} attempts={} dup={}",
+                info!(
+                    target: "pool-debug",
+                    "  q {} tried_430={:06b} tried_fail={:06b} attempts={} dup={}",
                     w.id, w.tried_430, w.tried_fail, w.attempts, w.dup
                 );
             }
         } else {
-            eprintln!("[pool-debug] queue lock busy");
+            info!(target: "pool-debug", "queue lock busy");
         }
-        let inf = self.inflight.lock().unwrap();
-        eprintln!("[pool-debug] inflight={} entr(ies)", inf.len());
+        let inf = self.inflight.lock_ok();
+        info!(target: "pool-debug", "inflight={} entr(ies)", inf.len());
         for (id, i) in inf.iter().take(30) {
-            eprintln!(
-                "[pool-debug]   inflight {} srv={} age={:.1}s dups={} tried_430={:06b}",
+            info!(
+                target: "pool-debug",
+                "  inflight {} srv={} age={:.1}s dups={} tried_430={:06b}",
                 id,
                 i.server,
                 i.dispatched.elapsed().as_secs_f64(),
@@ -1123,7 +1335,7 @@ impl Shared {
     /// Mark one article terminal; wakes every worker when the last lands.
     fn complete_one(&self) {
         if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
-            *self.drained_at.lock().unwrap() = Some(Instant::now());
+            *self.drained_at.lock_ok() = Some(Instant::now());
             let _ = self.finished.send(true);
         }
     }
@@ -1131,16 +1343,17 @@ impl Shared {
     fn report_diagnostics(&self) {
         let dups = self.dups_issued.load(Ordering::Relaxed);
         let wins = self.dup_wins.load(Ordering::Relaxed);
-        let ts = *self.tail_started.lock().unwrap();
-        let da = *self.drained_at.lock().unwrap();
+        let ts = *self.tail_started.lock_ok();
+        let da = *self.drained_at.lock_ok();
         let run = self.start.elapsed().as_secs_f64();
         match (ts, da) {
-            (Some(t), Some(d)) => eprintln!(
-                "[pool] run {run:.2}s · queue dry at {:.2}s · drained at {:.2}s · {dups} dups ({wins} won)",
+            (Some(t), Some(d)) => info!(
+                target: "pool",
+                "run {run:.2}s · queue dry at {:.2}s · drained at {:.2}s · {dups} dups ({wins} won)",
                 (t - self.start).as_secs_f64(),
                 (d - self.start).as_secs_f64(),
             ),
-            _ => eprintln!("[pool] run {run:.2}s · no tail · {dups} dups ({wins} won)"),
+            _ => info!(target: "pool", "run {run:.2}s · no tail · {dups} dups ({wins} won)"),
         }
     }
 
@@ -1176,7 +1389,11 @@ impl Shared {
             if w.tried_430 & bit != 0 || w.tried_fail & bit != 0 {
                 continue;
             }
-            let required = if level > 0 { self.required_mask(level) } else { 0 };
+            let required = if level > 0 {
+                self.required_mask(level)
+            } else {
+                0
+            };
             if w.tried_430 & required == required {
                 return true;
             }
@@ -1201,7 +1418,11 @@ impl Shared {
             if w.tried_430 & bit != 0 || w.tried_fail & bit != 0 {
                 continue;
             }
-            let required = if level > 0 { self.required_mask(level) } else { 0 };
+            let required = if level > 0 {
+                self.required_mask(level)
+            } else {
+                0
+            };
             if w.tried_430 & required != required {
                 continue;
             }
@@ -1214,14 +1435,14 @@ impl Shared {
 
     /// First-emitter check: true exactly once per id.
     fn claim_done(&self, id: &str) -> bool {
-        self.done.lock().unwrap().insert(id.to_string())
+        self.done.lock_ok().insert(id.to_string())
     }
 
     fn register_inflight(&self, w: &Work, server: usize) {
         if w.dup {
             return; // dups are tracked via the original's entry
         }
-        self.inflight.lock().unwrap().insert(
+        self.inflight.lock_ok().insert(
             w.id.clone(),
             Inflight {
                 server,
@@ -1235,13 +1456,14 @@ impl Shared {
 
     fn deregister_inflight(&self, w: &Work) {
         if !w.dup {
-            self.inflight.lock().unwrap().remove(&w.id);
+            self.inflight.lock_ok().remove(&w.id);
         }
     }
 
     /// B3 wire-cap: charge one dispatched BODY's estimated bytes.
     fn charge_wire(&self) {
-        self.inflight_body_bytes.fetch_add(EST_BODY_BYTES, Ordering::AcqRel);
+        self.inflight_body_bytes
+            .fetch_add(EST_BODY_BYTES, Ordering::AcqRel);
     }
 
     /// B3 wire-cap: release `n` pipeline items' charges - every exit
@@ -1256,10 +1478,9 @@ impl Shared {
     /// saturating floor degrades into "throttles slightly early" instead.
     fn release_wire(&self, n: usize) {
         let owed = EST_BODY_BYTES.saturating_mul(n as u64);
-        let _ = self.inflight_body_bytes.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |v| {
+        let _ = self
+            .inflight_body_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
                 // A worker only ever releases charges it holds, and the
                 // global is the sum of all live charges, so this holds for
                 // every value we can observe - concurrency included. It
@@ -1270,8 +1491,7 @@ impl Shared {
                     "wire-cap over-release: {v} charged, releasing {owed}"
                 );
                 Some(v.saturating_sub(owed))
-            },
-        );
+            });
     }
 
     /// B3 wire-cap: true when topping up past the one-in-flight floor
@@ -1302,7 +1522,7 @@ impl Shared {
         window_used: usize,
         level: u32,
     ) -> Option<Work> {
-        let endgame = self.pending.load(Ordering::Acquire) as usize <= ENDGAME_MAX;
+        let endgame = self.pending.load(Ordering::Acquire) <= ENDGAME_MAX;
         // PER-WORKER, like `faster_can_take` above. `rate()` is a server's
         // whole-run byte total over wall time, so it measures its share of
         // the job, and that share is set mostly by how many connections it
@@ -1313,8 +1533,8 @@ impl Shared {
         // live workers asks the question the heuristic means to ask: is
         // this article's owner actually slower.
         let my_rate = self.rate_per_worker(me);
-        let done = self.done.lock().unwrap();
-        let mut inflight = self.inflight.lock().unwrap();
+        let done = self.done.lock_ok();
+        let mut inflight = self.inflight.lock_ok();
         // (id, owner_rate, ladder-progress) - endgame prefers the article
         // CLOSEST to its verdict, normal phase the slowest owner.
         let mut best: Option<(&String, f64, u32)> = None;
@@ -1424,7 +1644,12 @@ pub async fn fetch_all_multi_ctl(
     }
     // Outside every server's retention: Missing without a single request.
     for id in unservable {
-        let _ = out.send(FetchOutcome::Missing { id, cause: MissingCause::Retention }).await;
+        let _ = out
+            .send(FetchOutcome::Missing {
+                id,
+                cause: MissingCause::Retention,
+            })
+            .await;
     }
 
     let mut workers = Vec::new();
@@ -1456,7 +1681,11 @@ pub async fn fetch_all_multi_ctl(
         };
         let connects = Arc::new(AtomicU64::new(0));
         let reconnects = Arc::new(AtomicU64::new(0));
-        counters.push((shared.bytes[si].clone(), connects.clone(), reconnects.clone()));
+        counters.push((
+            shared.bytes[si].clone(),
+            connects.clone(),
+            reconnects.clone(),
+        ));
         let ctx = ctx_for(servers, si);
         for i in 0..cfg.connections {
             let server = server.clone();
@@ -1470,7 +1699,10 @@ pub async fn fetch_all_multi_ctl(
             let life = WorkerLife::birth(&shared, si);
             let ramp = cfg.ramp_delay * i as u32;
             workers.push(tokio::spawn(async move {
-                worker(&server, &cfg, ctx, shared, out, connects, reconnects, life, ramp).await;
+                worker(
+                    &server, &cfg, ctx, shared, out, connects, reconnects, life, ramp,
+                )
+                .await;
             }));
         }
     }
@@ -1542,7 +1774,7 @@ async fn join_fleet(
             && e.is_panic()
         {
             panics += 1;
-            eprintln!("[pool] worker panicked - its articles are sealed Failed below: {e}");
+            error!(target: "pool", "worker panicked - its articles are sealed Failed below: {e}");
         }
     };
     for mut w in workers {
@@ -1551,8 +1783,9 @@ async fn join_fleet(
                 r = &mut w => Some(r),
                 _ = &mut deadline => {
                     expired = true;
-                    eprintln!(
-                        "[pool] worker still parked {}s after the run went terminal \
+                    warn!(
+                        target: "pool",
+                        "worker still parked {}s after the run went terminal \
                          (wedged connection?) - abandoning its goodbye",
                         EXIT_GRACE.as_secs()
                     );
@@ -1575,13 +1808,16 @@ async fn join_fleet(
     };
     seal_run(shared, &out, reason).await;
     let left = shared.pending.load(Ordering::Acquire);
-    if left > 0 && !shared.aborted.load(Ordering::Acquire) && !shared.draining.load(Ordering::Acquire)
+    if left > 0
+        && !shared.aborted.load(Ordering::Acquire)
+        && !shared.draining.load(Ordering::Acquire)
     {
         // Neither the queue nor the inflight map named these, so the pool
         // cannot report them itself. Loud, because it means an article
         // went missing from this module's own bookkeeping.
-        eprintln!(
-            "[pool] BUG: fleet joined with {left} article(s) non-terminal and unaccounted \
+        error!(
+            target: "pool",
+            "BUG: fleet joined with {left} article(s) non-terminal and unaccounted \
              for - the caller will see slots with no outcome"
         );
     }
@@ -1592,6 +1828,7 @@ async fn join_fleet(
 struct ServerCtx {
     idx: usize,
     bit: u32,
+    #[allow(dead_code)] // mask of every server bit; kept beside bit/group_bits
     all: u32,
     /// Bits of this server's whole mirror group (incl. itself): a 430
     /// here is authoritative for all of them (M14e Group).
@@ -1626,7 +1863,11 @@ fn server_bit(si: usize) -> u32 {
 }
 
 fn servers_mask(n: usize) -> u32 {
-    if n >= MAX_SERVERS { u32::MAX } else { (1u32 << n) - 1 }
+    if n >= MAX_SERVERS {
+        u32::MAX
+    } else {
+        (1u32 << n) - 1
+    }
 }
 
 fn ctx_for(servers: &[(ServerConfig, PoolConfig)], si: usize) -> ServerCtx {
@@ -1662,10 +1903,14 @@ async fn next_work(
     // answer a ladder probe in one RTT.
     window_used: usize,
 ) -> Option<Work> {
-    let endgame = shared.pending.load(Ordering::Acquire) as usize <= ENDGAME_MAX;
+    let endgame = shared.pending.load(Ordering::Acquire) <= ENDGAME_MAX;
     // Fill-server gate (M14e): a level-N server only takes queued work
     // that every LIVE lower-level server has already 430'd.
-    let required = if ctx.level > 0 { shared.required_mask(ctx.level) } else { 0 };
+    let required = if ctx.level > 0 {
+        shared.required_mask(ctx.level)
+    } else {
+        0
+    };
     // Scan throttle: this server's last full scan found nothing takeable
     // and re-shuffled the whole queue for the privilege. Sit out a tick
     // instead of burning the shared queue lock - at scale that burn
@@ -1673,7 +1918,14 @@ async fn next_work(
     let now_ms = shared.start.elapsed().as_millis() as u64;
     let futile_at = shared.scan_futile[ctx.idx].load(Ordering::Relaxed);
     if futile_at != u64::MAX && now_ms.saturating_sub(futile_at) < SCAN_RETRY_MS {
-        return shared.pick_dup(ctx.idx, ctx.bit, ctx.group_bits, required, window_used, ctx.level);
+        return shared.pick_dup(
+            ctx.idx,
+            ctx.bit,
+            ctx.group_bits,
+            required,
+            window_used,
+            ctx.level,
+        );
     }
     // An article every LIVE server has 430'd is terminal even if servers
     // whose workers bowed out never saw it - a dead server can't answer,
@@ -1711,9 +1963,11 @@ async fn next_work(
                 left_for_faster.push(w);
             } else {
                 if w.promoted {
-                    let _ = shared
-                        .promoted_pending
-                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1));
+                    let _ = shared.promoted_pending.fetch_update(
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                        |v| v.checked_sub(1),
+                    );
                 }
                 picked = Some(w);
                 break;
@@ -1728,7 +1982,12 @@ async fn next_work(
     }
     for id in unservable {
         if shared.claim_done(&id) {
-            let _ = out.send(FetchOutcome::Missing { id, cause: MissingCause::Gone }).await;
+            let _ = out
+                .send(FetchOutcome::Missing {
+                    id,
+                    cause: MissingCause::Gone,
+                })
+                .await;
             shared.complete_one();
         }
     }
@@ -1744,7 +2003,14 @@ async fn next_work(
             .unwrap()
             .get_or_insert_with(Instant::now);
     }
-    shared.pick_dup(ctx.idx, ctx.bit, ctx.group_bits, required, window_used, ctx.level)
+    shared.pick_dup(
+        ctx.idx,
+        ctx.bit,
+        ctx.group_bits,
+        required,
+        window_used,
+        ctx.level,
+    )
 }
 
 /// Sharded variant: split all servers' connections across `shards`
@@ -1778,7 +2044,10 @@ pub fn fetch_all_sharded(
     // Outside every server's retention: Missing without a single request.
     // (Blocking send is fine - this whole function is documented blocking.)
     for id in unservable {
-        let _ = out.blocking_send(FetchOutcome::Missing { id, cause: MissingCause::Retention });
+        let _ = out.blocking_send(FetchOutcome::Missing {
+            id,
+            cause: MissingCause::Retention,
+        });
     }
 
     let counters: Vec<_> = servers
@@ -1830,7 +2099,7 @@ pub fn fetch_all_sharded(
                     // started. Panicking here leaked that count and made
                     // every surviving shard believe work could still
                     // finish, suppressing terminal outcomes.
-                    eprintln!("[pool] shard runtime: {e}");
+                    warn!(target: "pool", "shard runtime: {e}");
                     shared.workers_live.fetch_sub(1, Ordering::AcqRel);
                     return;
                 }
@@ -1846,8 +2115,10 @@ pub fn fetch_all_sharded(
                     let life = WorkerLife::birth(&shared, si);
                     let ramp = cfg.ramp_delay * ramp_step;
                     tasks.push(tokio::spawn(async move {
-                        worker(&server, &cfg, ctx, shared, out, connects, reconnects, life, ramp)
-                            .await;
+                        worker(
+                            &server, &cfg, ctx, shared, out, connects, reconnects, life, ramp,
+                        )
+                        .await;
                     }));
                 }
                 // This shard's workers exist now - hand the live count over
@@ -1896,16 +2167,22 @@ fn seal_run_blocking(
         return 0;
     }
     let mut orphans: Vec<String> = {
-        let mut q = shared.queue.try_lock().expect("joined shards cannot hold queue");
+        let mut q = shared
+            .queue
+            .try_lock()
+            .expect("joined shards cannot hold queue");
         q.drain(..).map(|w| w.id).collect()
     };
-    orphans.extend(shared.inflight.lock().unwrap().drain().map(|(id, _)| id));
+    orphans.extend(shared.inflight.lock_ok().drain().map(|(id, _)| id));
     let mut sealed = 0;
     for id in orphans {
         if !shared.claim_done(&id) {
             continue;
         }
-        let _ = out.blocking_send(FetchOutcome::Failed { id, error: reason.to_string() });
+        let _ = out.blocking_send(FetchOutcome::Failed {
+            id,
+            error: reason.to_string(),
+        });
         shared.complete_one();
         sealed += 1;
     }
@@ -1995,7 +2272,12 @@ async fn worker(
         .await;
     }
     if life.retire() {
-        seal_run(&shared, &out, "no connection worker left to fetch this article").await;
+        seal_run(
+            &shared,
+            &out,
+            "no connection worker left to fetch this article",
+        )
+        .await;
     }
 }
 
@@ -2152,139 +2434,142 @@ async fn session_loop(
                     _ = run_over(&mut finished, &shared) => return,
                 };
                 match dialed {
-            Ok((c, _)) => {
-                connects.fetch_add(1, Ordering::Relaxed);
-                if ever_connected {
-                    reconnects.fetch_add(1, Ordering::Relaxed);
-                }
-                ever_connected = true;
-                shared.connected[ctx.idx].store(true, Ordering::Relaxed);
-                connect_failures = 0;
-                c
-            }
-            // §15e: an AUTHINFO refusal is the server's answer to this
-            // ACCOUNT, so it is settled once for every worker rather than
-            // rediscovered by each of them. The two kinds want opposite
-            // responses, and conflating them is what made a Giganews cap
-            // so expensive.
-            Err(crate::nntp::NntpError::AuthFailed { kind, line }) => {
-                let first = shared.auth[ctx.idx].note(kind, &line);
-                // Out to the dashboard, so the user is told which server
-                // stopped pulling its weight and in whose words.
-                if let Some(live) = &cfg.live
-                    && let Some(sl) = live.servers.get(ctx.idx)
-                {
-                    *sl.refusal.lock().unwrap() = Some(Refusal {
-                        permanent: kind == crate::nntp::AuthRefusal::Permanent,
-                        line: line.clone(),
-                    });
-                }
-                match kind {
-                    crate::nntp::AuthRefusal::Permanent => {
-                        // Retrying cannot fix a credential. Say it once,
-                        // per SERVER, and take every worker off it.
-                        if first {
-                            eprintln!(
-                                "[pool] {}: authentication rejected, not retrying: {line}",
-                                server.host
-                            );
-                            // A 502 is what a server says for a bad
-                            // password AND, on several providers, for
-                            // "too many addresses on this account" -
-                            // same code, opposite remedies. We must not
-                            // reclassify it (a genuinely wrong password
-                            // has to stay permanent, or every worker
-                            // would retry it forever), but a user
-                            // staring at "authentication rejected" on an
-                            // account they know is fine deserves the
-                            // other possibility spelled out. Especially
-                            // on a multi-WAN link, where this host
-                            // presents several public addresses and can
-                            // exhaust a 2-address allowance by itself.
-                            if server.source_ips_are_tight() {
-                                eprintln!(
-                                    "[pool] {}: this account limits how many addresses \
-                                     may connect at once, and that is refused with the \
-                                     same code as a bad password. If the credentials \
-                                     are known good, something else is using the \
-                                     account. Two shapes to check: another machine on \
-                                     the same account, or THIS one leaving by more \
-                                     than one public address. The second is the one \
-                                     that surprises people - a router balancing \
-                                     several WAN links makes one host look like \
-                                     several, and it cannot be fixed from here, \
-                                     because `bind_ip` picks a LOCAL address and the \
-                                     balancing happens after the packets leave. That \
-                                     needs a policy route on the router pinning this \
-                                     traffic to one WAN; bind_ip only helps when this \
-                                     machine itself is multi-homed.",
-                                    server.host
-                                );
+                    Ok((c, _)) => {
+                        connects.fetch_add(1, Ordering::Relaxed);
+                        if ever_connected {
+                            reconnects.fetch_add(1, Ordering::Relaxed);
+                        }
+                        ever_connected = true;
+                        shared.connected[ctx.idx].store(true, Ordering::Relaxed);
+                        connect_failures = 0;
+                        c
+                    }
+                    // §15e: an AUTHINFO refusal is the server's answer to this
+                    // ACCOUNT, so it is settled once for every worker rather than
+                    // rediscovered by each of them. The two kinds want opposite
+                    // responses, and conflating them is what made a Giganews cap
+                    // so expensive.
+                    Err(crate::nntp::NntpError::AuthFailed { kind, line }) => {
+                        let first = shared.auth[ctx.idx].note(kind, &line);
+                        // Out to the dashboard, so the user is told which server
+                        // stopped pulling its weight and in whose words.
+                        if let Some(live) = &cfg.live
+                            && let Some(sl) = live.servers.get(ctx.idx)
+                        {
+                            *sl.refusal.lock_ok() = Some(Refusal {
+                                permanent: kind == crate::nntp::AuthRefusal::Permanent,
+                                line: line.clone(),
+                            });
+                        }
+                        match kind {
+                            crate::nntp::AuthRefusal::Permanent => {
+                                // Retrying cannot fix a credential. Say it once,
+                                // per SERVER, and take every worker off it.
+                                if first {
+                                    warn!(
+                                        target: "pool",
+                                        "{}: authentication rejected, not retrying: {line}",
+                                        server.host
+                                    );
+                                    // A 502 is what a server says for a bad
+                                    // password AND, on several providers, for
+                                    // "too many addresses on this account" -
+                                    // same code, opposite remedies. We must not
+                                    // reclassify it (a genuinely wrong password
+                                    // has to stay permanent, or every worker
+                                    // would retry it forever), but a user
+                                    // staring at "authentication rejected" on an
+                                    // account they know is fine deserves the
+                                    // other possibility spelled out. Especially
+                                    // on a multi-WAN link, where this host
+                                    // presents several public addresses and can
+                                    // exhaust a 2-address allowance by itself.
+                                    if server.source_ips_are_tight() {
+                                        warn!(
+                                            target: "pool",
+                                            "{}: this account limits how many addresses \
+                                        may connect at once, and that is refused with the \
+                                        same code as a bad password. If the credentials \
+                                        are known good, something else is using the \
+                                        account. Two shapes to check: another machine on \
+                                        the same account, or THIS one leaving by more \
+                                        than one public address. The second is the one \
+                                        that surprises people - a router balancing \
+                                        several WAN links makes one host look like \
+                                        several, and it cannot be fixed from here, \
+                                        because `bind_ip` picks a LOCAL address and the \
+                                        balancing happens after the packets leave. That \
+                                        needs a policy route on the router pinning this \
+                                        traffic to one WAN; bind_ip only helps when this \
+                                        machine itself is multi-homed.",
+                                            server.host
+                                        );
+                                    }
+                                }
+                                return;
+                            }
+                            crate::nntp::AuthRefusal::Capacity => {
+                                // The account is fine; the server will not give us
+                                // ANOTHER session. Retrying at the same connection
+                                // count re-provokes exactly the limit being hit, so
+                                // this worker permanently yields its slot and the
+                                // survivors carry the job at a count the provider
+                                // will actually accept.
+                                if first {
+                                    warn!(
+                                        target: "pool",
+                                        "{}: at its connection/IP cap, reducing connections: {line}",
+                                        server.host
+                                    );
+                                }
+                                // Keep at least one worker trying, or a cap that
+                                // clears later would leave the server unused for
+                                // the rest of the run.
+                                if shared.auth[ctx.idx].claim_yield(&shared.alive[ctx.idx]) {
+                                    return;
+                                }
+                                connect_failures += 1;
+                                if connect_failures >= cfg.max_connect_attempts {
+                                    return;
+                                }
+                                if !backoff_or_finish(
+                                    cfg.connect_backoff * 2u32.pow(connect_failures.min(5) - 1),
+                                    &mut finished,
+                                    &shared,
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                                continue 'session;
                             }
                         }
-                        return;
                     }
-                    crate::nntp::AuthRefusal::Capacity => {
-                        // The account is fine; the server will not give us
-                        // ANOTHER session. Retrying at the same connection
-                        // count re-provokes exactly the limit being hit, so
-                        // this worker permanently yields its slot and the
-                        // survivors carry the job at a count the provider
-                        // will actually accept.
-                        if first {
-                            eprintln!(
-                                "[pool] {}: at its connection/IP cap, reducing connections: {line}",
-                                server.host
-                            );
-                        }
-                        // Keep at least one worker trying, or a cap that
-                        // clears later would leave the server unused for
-                        // the rest of the run.
-                        if shared.auth[ctx.idx].claim_yield(&shared.alive[ctx.idx]) {
-                            return;
-                        }
+                    Err(e) => {
                         connect_failures += 1;
+                        // Say WHY, once per worker per run. This was a bare
+                        // `Err(_)` and the silence was expensive: a server that
+                        // cannot authenticate, cannot resolve, or is refusing
+                        // the TLS handshake looks EXACTLY like a server whose
+                        // articles are all missing - every article ends up
+                        // Failed/Missing with no hint which of the two it was.
+                        // First failure only, so a flapping provider cannot
+                        // flood the log, and the message names the fix.
+                        if connect_failures == 1 {
+                            warn!(target: "pool", "{}: connect failed: {e}", server.host);
+                        }
                         if connect_failures >= cfg.max_connect_attempts {
+                            // This worker bows out; remaining work is served by the
+                            // others (or reported Failed when the queue drains at
+                            // exhausted attempts elsewhere).
                             return;
                         }
-                        if !backoff_or_finish(
-                            cfg.connect_backoff * 2u32.pow(connect_failures.min(5) - 1),
-                            &mut finished,
-                            &shared,
-                        )
-                        .await
-                        {
+                        let backoff = cfg.connect_backoff * 2u32.pow(connect_failures.min(5) - 1);
+                        if !backoff_or_finish(backoff, &mut finished, &shared).await {
                             return;
                         }
                         continue 'session;
                     }
-                }
-            }
-            Err(e) => {
-                connect_failures += 1;
-                // Say WHY, once per worker per run. This was a bare
-                // `Err(_)` and the silence was expensive: a server that
-                // cannot authenticate, cannot resolve, or is refusing
-                // the TLS handshake looks EXACTLY like a server whose
-                // articles are all missing - every article ends up
-                // Failed/Missing with no hint which of the two it was.
-                // First failure only, so a flapping provider cannot
-                // flood the log, and the message names the fix.
-                if connect_failures == 1 {
-                    eprintln!("[pool] {}: connect failed: {e}", server.host);
-                }
-                if connect_failures >= cfg.max_connect_attempts {
-                    // This worker bows out; remaining work is served by the
-                    // others (or reported Failed when the queue drains at
-                    // exhausted attempts elsewhere).
-                    return;
-                }
-                let backoff = cfg.connect_backoff * 2u32.pow(connect_failures.min(5) - 1);
-                if !backoff_or_finish(backoff, &mut finished, &shared).await {
-                    return;
-                }
-                continue 'session;
-            }
                 }
             }
         };
@@ -2298,7 +2583,7 @@ async fn session_loop(
         if let Some(live) = &cfg.live
             && let Some(sl) = live.servers.get(ctx.idx)
         {
-            sl.refusal.lock().unwrap().take();
+            sl.refusal.lock_ok().take();
         }
 
         // Dashboard gauge: this worker holds a session until the next
@@ -2378,7 +2663,9 @@ async fn session_loop(
                     continue 'session;
                 }
                 if let Some(l) = &cfg.live {
-                    l.servers[ctx.idx].articles_tried.fetch_add(1, Ordering::Relaxed);
+                    l.servers[ctx.idx]
+                        .articles_tried
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 shared.register_inflight(&w, ctx.idx);
                 inflight.push_back(w);
@@ -2427,7 +2714,8 @@ async fn session_loop(
             // this conn for promoted work within ~a TLS handshake.
             let mut shed_for_promote = false;
             let read = {
-                let read_fut = tokio::time::timeout(cfg.read_timeout, conn.read_body_into(&mut buf));
+                let read_fut =
+                    tokio::time::timeout(cfg.read_timeout, conn.read_body_into(&mut buf));
                 tokio::pin!(read_fut);
                 loop {
                     tokio::select! {
@@ -2442,7 +2730,7 @@ async fn session_loop(
                             // inside its span; shedding those would just
                             // refetch the same bytes after a reconnect).
                             let fetching_promoted = inflight.iter().any(|w| w.promoted) || {
-                                let ids = shared.promoted_ids.lock().unwrap();
+                                let ids = shared.promoted_ids.lock_ok();
                                 inflight.iter().any(|w| ids.contains(&w.id))
                             };
                             // And only abandon a read that has already
@@ -2499,7 +2787,9 @@ async fn session_loop(
                     shared.release_wire(1);
                     shared.bytes[ctx.idx].fetch_add(buf.len() as u64, Ordering::Relaxed);
                     if let Some(l) = &cfg.live {
-                        l.servers[ctx.idx].bytes.fetch_add(buf.len() as u64, Ordering::Relaxed);
+                        l.servers[ctx.idx]
+                            .bytes
+                            .fetch_add(buf.len() as u64, Ordering::Relaxed);
                     }
                     // Speed limiter: charge the body and sleep off any debt
                     // BEFORE processing continues (async - the runtime
@@ -2536,7 +2826,9 @@ async fn session_loop(
                     // charged even for dups (the response is authoritative
                     // for this server regardless of who owns the outcome).
                     if let Some(l) = &cfg.live {
-                        l.servers[ctx.idx].articles_missing.fetch_add(1, Ordering::Relaxed);
+                        l.servers[ctx.idx]
+                            .articles_missing
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                     // M29 oracle: the mirror of the hit above - one miss
                     // per actual 430/423 wire response. Derived Missing
@@ -2556,7 +2848,7 @@ async fn session_loop(
                         let live = shared.live_mask();
                         let mut unanimous = false;
                         {
-                            let mut m = shared.inflight.lock().unwrap();
+                            let mut m = shared.inflight.lock_ok();
                             if let Some(inf) = m.get_mut(&w.id) {
                                 inf.tried_430 |= ctx.group_bits;
                                 unanimous = inf.tried_430 & live == live;
@@ -2574,7 +2866,10 @@ async fn session_loop(
                         }
                         if unanimous && shared.claim_done(&w.id) {
                             let _ = out
-                                .send(FetchOutcome::Missing { id: w.id, cause: MissingCause::Gone })
+                                .send(FetchOutcome::Missing {
+                                    id: w.id,
+                                    cause: MissingCause::Gone,
+                                })
                                 .await;
                             shared.complete_one();
                         }
@@ -2582,7 +2877,7 @@ async fn session_loop(
                     }
                     // Fold in any 430s duplicate dispatches accumulated on
                     // the inflight entry while this original was reading.
-                    if let Some(inf) = shared.inflight.lock().unwrap().remove(&w.id) {
+                    if let Some(inf) = shared.inflight.lock_ok().remove(&w.id) {
                         w.tried_430 |= inf.tried_430;
                     }
                     // 430 is authoritative for this server AND its mirror
@@ -2594,7 +2889,10 @@ async fn session_loop(
                     if w.tried_430 & live == live {
                         if shared.claim_done(&w.id) {
                             let _ = out
-                                .send(FetchOutcome::Missing { id: w.id, cause: MissingCause::Gone })
+                                .send(FetchOutcome::Missing {
+                                    id: w.id,
+                                    cause: MissingCause::Gone,
+                                })
                                 .await;
                             shared.complete_one();
                         }
@@ -2678,7 +2976,7 @@ async fn seal_run(shared: &Arc<Shared>, out: &mpsc::Sender<FetchOutcome>, reason
     {
         let mut q = shared.queue.lock().await;
         orphans.extend(q.drain(..).map(|w| w.id));
-        let mut inf = shared.inflight.lock().unwrap();
+        let mut inf = shared.inflight.lock_ok();
         orphans.extend(inf.drain().map(|(id, _)| id));
     }
     let mut sealed = 0usize;
@@ -2687,14 +2985,18 @@ async fn seal_run(shared: &Arc<Shared>, out: &mpsc::Sender<FetchOutcome>, reason
             continue; // a duplicate dispatch already owns this outcome
         }
         let _ = out
-            .send(FetchOutcome::Failed { id, error: reason.to_string() })
+            .send(FetchOutcome::Failed {
+                id,
+                error: reason.to_string(),
+            })
             .await;
         shared.complete_one();
         sealed += 1;
     }
     if sealed > 0 {
-        eprintln!(
-            "[pool] fleet exhausted with {sealed} article(s) unresolved - reported \
+        error!(
+            target: "pool",
+            "fleet exhausted with {sealed} article(s) unresolved - reported \
              Failed ({reason}) so the run's terminal ledger is truthful"
         );
     }
@@ -2718,7 +3020,7 @@ async fn shed_pipeline(shared: &Shared, inflight: &mut VecDeque<Work>) {
             continue;
         }
         shared.deregister_inflight(&w);
-        if shared.done.lock().unwrap().contains(&w.id) {
+        if shared.done.lock_ok().contains(&w.id) {
             continue; // a dup already emitted this article's outcome
         }
         if w.promoted {
@@ -2822,7 +3124,7 @@ async fn requeue_or_fail(
                 continue;
             }
             shared.deregister_inflight(&w);
-            if shared.done.lock().unwrap().contains(&w.id) {
+            if shared.done.lock_ok().contains(&w.id) {
                 continue; // a dup already emitted this article's outcome
             }
             if charged {
@@ -2902,9 +3204,9 @@ mod tests {
                     socks5: None,
                     enabled: true,
                     warm_pool: false,
-            idle_release_secs: None,
-            idle_keep: None,
-            max_source_ips: None,
+                    idle_release_secs: None,
+                    idle_keep: None,
+                    max_source_ips: None,
                 },
                 PoolConfig::default(),
             )
@@ -2943,7 +3245,10 @@ mod tests {
             .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
             .collect();
         let n_fresh = reqs.len();
-        reqs.push(ArticleReq { id: "<ancient@x>".into(), age_days: 400 });
+        reqs.push(ArticleReq {
+            id: "<ancient@x>".into(),
+            age_days: 400,
+        });
 
         let cfg = PoolConfig {
             connections: 1,
@@ -2963,9 +3268,10 @@ mod tests {
         while let Ok(o) = rx.try_recv() {
             match o {
                 FetchOutcome::Done { .. } => done += 1,
-                FetchOutcome::Missing { id, cause: MissingCause::Retention } => {
-                    retention.push(id)
-                }
+                FetchOutcome::Missing {
+                    id,
+                    cause: MissingCause::Retention,
+                } => retention.push(id),
                 other => panic!("unexpected outcome: {other:?}"),
             }
         }
@@ -3009,9 +3315,9 @@ mod tests {
                 socks5: None,
                 enabled: true,
                 warm_pool: false,
-            idle_release_secs: None,
-            idle_keep: None,
-            max_source_ips: None,
+                idle_release_secs: None,
+                idle_keep: None,
+                max_source_ips: None,
             },
             PoolConfig::default(),
         );
@@ -3100,16 +3406,17 @@ mod tests {
                     socks5: None,
                     enabled: true,
                     warm_pool: false,
-            idle_release_secs: None,
-            idle_keep: None,
-            max_source_ips: None,
+                    idle_release_secs: None,
+                    idle_keep: None,
+                    max_source_ips: None,
                 },
                 PoolConfig::default(),
             )
         };
         let servers = vec![mk("a"), mk("b")];
-        let reqs: Vec<ArticleReq> =
-            (0..50).map(|i| ArticleReq::fresh(format!("<t{i}>"))).collect();
+        let reqs: Vec<ArticleReq> = (0..50)
+            .map(|i| ArticleReq::fresh(format!("<t{i}>")))
+            .collect();
         let (shared, _) = Shared::new(reqs, &servers);
         // Both servers "live" so nothing is judged unservable.
         let _a = WorkerLife::birth(&shared, 0);
@@ -3118,7 +3425,13 @@ mod tests {
         for w in shared.queue.lock().await.iter_mut() {
             w.tried_430 |= 0b01;
         }
-        let ctx = ServerCtx { idx: 0, bit: 0b01, all: 0b11, group_bits: 0b01, level: 0 };
+        let ctx = ServerCtx {
+            idx: 0,
+            bit: 0b01,
+            all: 0b11,
+            group_bits: 0b01,
+            level: 0,
+        };
         let (tx, _rx) = mpsc::channel(64);
 
         assert!(next_work(&shared, ctx, &tx, 0).await.is_none());
@@ -3139,7 +3452,9 @@ mod tests {
 
         // …and picks it up once the window passes.
         tokio::time::sleep(Duration::from_millis(SCAN_RETRY_MS + 30)).await;
-        let w = next_work(&shared, ctx, &tx, 0).await.expect("work after window");
+        let w = next_work(&shared, ctx, &tx, 0)
+            .await
+            .expect("work after window");
         assert_eq!(w.id, "<fresh>");
     }
 
@@ -3167,17 +3482,18 @@ mod tests {
                     socks5: None,
                     enabled: true,
                     warm_pool: false,
-            idle_release_secs: None,
-            idle_keep: None,
-            max_source_ips: None,
+                    idle_release_secs: None,
+                    idle_keep: None,
+                    max_source_ips: None,
                 },
                 PoolConfig::default(),
             )
         };
         let servers = vec![mk("a"), mk("b"), mk("c")];
         // 3 pending ≤ ENDGAME_MAX → endgame rules apply.
-        let reqs: Vec<ArticleReq> =
-            (0..3).map(|i| ArticleReq::fresh(format!("<e{i}>"))).collect();
+        let reqs: Vec<ArticleReq> = (0..3)
+            .map(|i| ArticleReq::fresh(format!("<e{i}>")))
+            .collect();
         let (shared, _) = Shared::new(reqs, &servers);
         // In flight on server 0, already 430'd by server 1's backbone.
         let lad = Work {
@@ -3192,19 +3508,30 @@ mod tests {
 
         // Fill gate first: a server whose required lower levels haven't
         // all 430'd yet must NOT join the race.
-        assert!(shared.pick_dup(2, 0b100, 0b100, 0b011, 0, 1).is_none(), "fill-gated");
+        assert!(
+            shared.pick_dup(2, 0b100, 0b100, 0b011, 0, 1).is_none(),
+            "fill-gated"
+        );
         // Endgame grant: no rate/staleness precondition needed.
         assert!(
             shared.pick_dup(2, 0b100, 0b100, 0, 3, 1).is_none(),
             "busy pipeline never carries a ladder probe"
         );
-        let d = shared.pick_dup(2, 0b100, 0b100, 0, 0, 1).expect("endgame dup race");
+        let d = shared
+            .pick_dup(2, 0b100, 0b100, 0, 0, 1)
+            .expect("endgame dup race");
         assert_eq!(d.id, "<e0>");
         assert!(d.dup);
         // Each backbone races at most once.
-        assert!(shared.pick_dup(2, 0b100, 0b100, 0, 0, 1).is_none(), "already racing");
+        assert!(
+            shared.pick_dup(2, 0b100, 0b100, 0, 0, 1).is_none(),
+            "already racing"
+        );
         // A backbone that 430'd it never re-tries.
-        assert!(shared.pick_dup(1, 0b010, 0b010, 0, 0, 1).is_none(), "430'd backbone");
+        assert!(
+            shared.pick_dup(1, 0b010, 0b010, 0, 0, 1).is_none(),
+            "430'd backbone"
+        );
 
         // Normal phase (pending > ENDGAME_MAX): same shape gets NO dup -
         // owner isn't slow (all rates 0) and isn't stale yet.
@@ -3221,7 +3548,10 @@ mod tests {
             dup: false,
         };
         big.register_inflight(&lad2, 0);
-        assert!(big.pick_dup(2, 0b100, 0b100, 0, 0, 0).is_none(), "normal phase unchanged");
+        assert!(
+            big.pick_dup(2, 0b100, 0b100, 0, 0, 0).is_none(),
+            "normal phase unchanged"
+        );
     }
 
     /// §35: a bigger server must not duplicate a smaller one's work just
@@ -3255,9 +3585,9 @@ mod tests {
                     socks5: None,
                     enabled: true,
                     warm_pool: false,
-            idle_release_secs: None,
-            idle_keep: None,
-            max_source_ips: None,
+                    idle_release_secs: None,
+                    idle_keep: None,
+                    max_source_ips: None,
                 },
                 PoolConfig::default(),
             )
@@ -3330,9 +3660,9 @@ mod tests {
                     socks5: None,
                     enabled: true,
                     warm_pool: false,
-            idle_release_secs: None,
-            idle_keep: None,
-            max_source_ips: None,
+                    idle_release_secs: None,
+                    idle_keep: None,
+                    max_source_ips: None,
                 },
                 PoolConfig::default(),
             )
@@ -3392,33 +3722,128 @@ mod tests {
                 socks5: None,
                 enabled: true,
                 warm_pool: false,
-            idle_release_secs: None,
-            idle_keep: None,
-            max_source_ips: None,
+                idle_release_secs: None,
+                idle_keep: None,
+                max_source_ips: None,
             },
             PoolConfig::default(),
         )];
-        let reqs: Vec<ArticleReq> =
-            (0..10).map(|i| ArticleReq::fresh(format!("<a{i}>"))).collect();
+        let reqs: Vec<ArticleReq> = (0..10)
+            .map(|i| ArticleReq::fresh(format!("<a{i}>")))
+            .collect();
         let (shared, unservable) = Shared::new(reqs, &servers);
         assert!(unservable.is_empty());
         let ctl = QueueControl::default();
         ctl.attach(&shared);
         // The caller's order (seek-point-first) is the front order - NOT
         // the queue's relative order.
-        let ids: Vec<String> = ["<a7>", "<a3>", "<a9>"].iter().map(|s| s.to_string()).collect();
+        let ids: Vec<String> = ["<a7>", "<a3>", "<a9>"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert_eq!(ctl.promote(&ids), 3);
         let q = shared.queue.lock().await;
         let order: Vec<&str> = q.iter().map(|w| w.id.as_str()).collect();
         assert_eq!(
             order,
-            ["<a7>", "<a3>", "<a9>", "<a0>", "<a1>", "<a2>", "<a4>", "<a5>", "<a6>", "<a8>"]
+            [
+                "<a7>", "<a3>", "<a9>", "<a0>", "<a1>", "<a2>", "<a4>", "<a5>", "<a6>", "<a8>"
+            ]
         );
         drop(q);
         // Unknown ids are a no-op; a dead pool (Weak gone) is a no-op.
         assert_eq!(ctl.promote(&["<zz>".to_string()]), 0);
         drop(shared);
         assert_eq!(ctl.promote(&ids), 0);
+    }
+
+    #[tokio::test]
+    async fn queue_control_cancel_removes_pending_and_completes_them() {
+        // Issue #14: cancelled articles leave the queue, count as
+        // terminal (pending reaches zero without them), and never emit
+        // an outcome. In-flight/unknown ids are untouched.
+        let servers = one_server();
+        let reqs: Vec<ArticleReq> = (0..6)
+            .map(|i| ArticleReq::fresh(format!("<c{i}>")))
+            .collect();
+        let (shared, unservable) = Shared::new(reqs, &servers);
+        assert!(unservable.is_empty());
+        let ctl = QueueControl::default();
+        ctl.attach(&shared);
+        let ids: HashSet<String> = ["<c1>", "<c4>", "<zz>"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut removed = ctl.cancel(&ids);
+        removed.sort();
+        assert_eq!(removed, ["<c1>", "<c4>"]);
+        assert_eq!(shared.pending.load(Ordering::Relaxed), 4);
+        let q = shared.queue.lock().await;
+        let order: Vec<&str> = q.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(order, ["<c0>", "<c2>", "<c3>", "<c5>"]);
+        drop(q);
+        // A second cancel of the same ids is a no-op (already done).
+        assert!(ctl.cancel(&ids).is_empty());
+        assert_eq!(shared.pending.load(Ordering::Relaxed), 4);
+        // Cancelling the rest drains the run: `finished` fires so the
+        // fleet winds down exactly as if the articles had resolved.
+        // (Subscribed BEFORE the send - a watch with no receivers drops
+        // the value, exactly like a workerless pool would.)
+        let fin = shared.finished.subscribe();
+        let rest: HashSet<String> = ["<c0>", "<c2>", "<c3>", "<c5>"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(ctl.cancel(&rest).len(), 4);
+        assert_eq!(shared.pending.load(Ordering::Relaxed), 0);
+        assert!(*fin.borrow());
+        // A dead pool (Weak gone) is a no-op.
+        drop(shared);
+        assert!(ctl.cancel(&rest).is_empty());
+    }
+
+    #[tokio::test]
+    async fn queue_control_requeue_resurrects_cancelled_work() {
+        // Issue #14 reconcile: a cancelled article can come back exactly
+        // as it was - pending restored, un-terminal, queued again. Only
+        // ids a prior cancel returned qualify, and a finished run
+        // refuses.
+        let servers = one_server();
+        let reqs: Vec<ArticleReq> = (0..4)
+            .map(|i| ArticleReq::fresh(format!("<r{i}>")))
+            .collect();
+        let (shared, _) = Shared::new(reqs, &servers);
+        let ctl = QueueControl::default();
+        ctl.attach(&shared);
+        let ids: HashSet<String> = ["<r1>", "<r2>"].iter().map(|s| s.to_string()).collect();
+        let cancelled = ctl.cancel(&ids);
+        assert_eq!(cancelled.len(), 2);
+        assert_eq!(shared.pending.load(Ordering::Relaxed), 2);
+        // Never-cancelled ids are ignored; cancelled ones come back.
+        let back: Vec<String> = ["<r0>", "<r1>", "<r2>"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(ctl.requeue(&back), 2);
+        assert_eq!(shared.pending.load(Ordering::Relaxed), 4);
+        {
+            let q = shared.queue.lock().await;
+            let mut order: Vec<&str> = q.iter().map(|w| w.id.as_str()).collect();
+            order.sort();
+            assert_eq!(order, ["<r0>", "<r1>", "<r2>", "<r3>"]);
+            let done = shared.done.lock().unwrap();
+            assert!(done.is_empty(), "requeued ids must be un-terminal");
+        }
+        // A second requeue finds an empty stash: no-op.
+        assert_eq!(ctl.requeue(&back), 0);
+        // Once the run has finished, a requeue must refuse and roll back.
+        let fin = shared.finished.subscribe();
+        let all: HashSet<String> = (0..4).map(|i| format!("<r{i}>")).collect();
+        assert_eq!(ctl.cancel(&all).len(), 4);
+        assert_eq!(shared.pending.load(Ordering::Relaxed), 0);
+        assert!(*fin.borrow());
+        assert_eq!(ctl.requeue(&back), 0);
+        assert_eq!(shared.pending.load(Ordering::Relaxed), 0);
     }
 
     fn one_server() -> Vec<(ServerConfig, PoolConfig)> {
@@ -3439,9 +3864,9 @@ mod tests {
                 socks5: None,
                 enabled: true,
                 warm_pool: false,
-            idle_release_secs: None,
-            idle_keep: None,
-            max_source_ips: None,
+                idle_release_secs: None,
+                idle_keep: None,
+                max_source_ips: None,
             },
             PoolConfig::default(),
         )]
@@ -3453,12 +3878,24 @@ mod tests {
         // be matched by exactly one release, whichever exit path takes it.
         let (shared, _) = Shared::new(vec![ArticleReq::fresh("<w@x>".into())], &one_server());
         assert_eq!(shared.inflight_body_bytes.load(Ordering::Acquire), 0);
-        assert!(!shared.wire_over_cap(EST_BODY_BYTES), "empty pool is under any cap");
+        assert!(
+            !shared.wire_over_cap(EST_BODY_BYTES),
+            "empty pool is under any cap"
+        );
 
         shared.charge_wire();
-        assert_eq!(shared.inflight_body_bytes.load(Ordering::Acquire), EST_BODY_BYTES);
-        assert!(shared.wire_over_cap(EST_BODY_BYTES), "at the cap counts as over");
-        assert!(!shared.wire_over_cap(0), "cap 0 = uncapped, never throttles");
+        assert_eq!(
+            shared.inflight_body_bytes.load(Ordering::Acquire),
+            EST_BODY_BYTES
+        );
+        assert!(
+            shared.wire_over_cap(EST_BODY_BYTES),
+            "at the cap counts as over"
+        );
+        assert!(
+            !shared.wire_over_cap(0),
+            "cap 0 = uncapped, never throttles"
+        );
         assert!(!shared.wire_over_cap(2 * EST_BODY_BYTES));
 
         // A batch release (shed / dead connection) drops the whole
@@ -3466,7 +3903,10 @@ mod tests {
         shared.charge_wire();
         shared.charge_wire();
         shared.release_wire(2);
-        assert_eq!(shared.inflight_body_bytes.load(Ordering::Acquire), EST_BODY_BYTES);
+        assert_eq!(
+            shared.inflight_body_bytes.load(Ordering::Acquire),
+            EST_BODY_BYTES
+        );
         shared.release_wire(1);
         assert_eq!(shared.inflight_body_bytes.load(Ordering::Acquire), 0);
         assert!(!shared.wire_over_cap(EST_BODY_BYTES));
@@ -3487,7 +3927,10 @@ mod tests {
         // pipeline depth one. Model the worker's dispatch sequence.
         let servers = one_server();
         let (shared, _) = Shared::new(
-            vec![ArticleReq::fresh("<f0@x>".into()), ArticleReq::fresh("<f1@x>".into())],
+            vec![
+                ArticleReq::fresh("<f0@x>".into()),
+                ArticleReq::fresh("<f1@x>".into()),
+            ],
             &servers,
         );
         let ctx = ctx_for(&servers, 0);
@@ -3520,7 +3963,10 @@ mod tests {
             0,
             "the dead pipeline must release exactly its own charges"
         );
-        assert!(!shared.wire_over_cap(EST_BODY_BYTES), "counter wrapped past zero");
+        assert!(
+            !shared.wire_over_cap(EST_BODY_BYTES),
+            "counter wrapped past zero"
+        );
     }
 
     #[tokio::test]
@@ -3528,8 +3974,9 @@ mod tests {
         // M11 stream mode: any reader touch (note_stream_active) or any
         // promote - even one that moves nothing - flips the pool into
         // shallow-pipeline mode; a fresh pool starts with it off.
-        let reqs: Vec<ArticleReq> =
-            (0..4).map(|i| ArticleReq::fresh(format!("<a{i}>"))).collect();
+        let reqs: Vec<ArticleReq> = (0..4)
+            .map(|i| ArticleReq::fresh(format!("<a{i}>")))
+            .collect();
         let (shared, _) = Shared::new(reqs, &one_server());
         let ctl = QueueControl::default();
         ctl.attach(&shared);
@@ -3538,7 +3985,9 @@ mod tests {
         assert!(shared.stream_active(), "reader touch engages stream mode");
 
         let (shared2, _) = Shared::new(
-            (0..4).map(|i| ArticleReq::fresh(format!("<b{i}>"))).collect(),
+            (0..4)
+                .map(|i| ArticleReq::fresh(format!("<b{i}>")))
+                .collect(),
             &one_server(),
         );
         let ctl2 = QueueControl::default();
@@ -3574,16 +4023,17 @@ mod tests {
                     socks5: None,
                     enabled: true,
                     warm_pool: false,
-            idle_release_secs: None,
-            idle_keep: None,
-            max_source_ips: None,
+                    idle_release_secs: None,
+                    idle_keep: None,
+                    max_source_ips: None,
                 },
                 PoolConfig::default(),
             )
         };
         let servers = vec![mk("slow"), mk("fast")];
-        let reqs: Vec<ArticleReq> =
-            (0..4).map(|i| ArticleReq::fresh(format!("<a{i}>"))).collect();
+        let reqs: Vec<ArticleReq> = (0..4)
+            .map(|i| ArticleReq::fresh(format!("<a{i}>")))
+            .collect();
         let (shared, _) = Shared::new(reqs, &servers);
         let _a = WorkerLife::birth(&shared, 0);
         let _b = WorkerLife::birth(&shared, 1);
@@ -3596,13 +4046,27 @@ mod tests {
         let ids: Vec<String> = ["<a1>", "<a2>"].iter().map(|s| s.to_string()).collect();
         assert_eq!(ctl.promote(&ids), 2);
 
-        let slow = ServerCtx { idx: 0, bit: 0b01, all: 0b11, group_bits: 0b01, level: 0 };
-        let fast = ServerCtx { idx: 1, bit: 0b10, all: 0b11, group_bits: 0b10, level: 0 };
+        let slow = ServerCtx {
+            idx: 0,
+            bit: 0b01,
+            all: 0b11,
+            group_bits: 0b01,
+            level: 0,
+        };
+        let fast = ServerCtx {
+            idx: 1,
+            bit: 0b10,
+            all: 0b11,
+            group_bits: 0b10,
+            level: 0,
+        };
         let (tx, _rx) = mpsc::channel(16);
 
         // The slow server skips a1/a2 and takes the first non-promoted
         // item; the promoted run stays at the queue front.
-        let w = next_work(&shared, slow, &tx, 0).await.expect("slow gets non-promoted work");
+        let w = next_work(&shared, slow, &tx, 0)
+            .await
+            .expect("slow gets non-promoted work");
         assert_eq!(w.id, "<a0>");
         assert_eq!(
             shared.queue.lock().await.front().map(|w| w.id.clone()),
@@ -3610,7 +4074,9 @@ mod tests {
             "promoted run must stay at the front for the fast server"
         );
         // The fast server takes the promoted item.
-        let w = next_work(&shared, fast, &tx, 0).await.expect("fast gets promoted work");
+        let w = next_work(&shared, fast, &tx, 0)
+            .await
+            .expect("fast gets promoted work");
         assert_eq!(w.id, "<a1>");
         assert!(w.promoted);
         // A promoted item some backbone already 430'd bypasses the
@@ -3618,7 +4084,9 @@ mod tests {
         // path (the live wedge: fast servers cycling 430 → requeue while
         // slow ones politely skipped).
         shared.queue.lock().await.front_mut().unwrap().tried_430 = 0b10;
-        let w = next_work(&shared, slow, &tx, 0).await.expect("slow takes the 430-recovery item");
+        let w = next_work(&shared, slow, &tx, 0)
+            .await
+            .expect("slow takes the 430-recovery item");
         assert_eq!(w.id, "<a2>");
         assert!(w.promoted);
 
@@ -3632,7 +4100,9 @@ mod tests {
         shared2.bytes[0].store(1_000_000, Ordering::Relaxed);
         shared2.bytes[1].store(10_000_000, Ordering::Relaxed);
         assert_eq!(ctl2.promote(&["<b0>".to_string()]), 1);
-        let w = next_work(&shared2, slow, &tx, 0).await.expect("slow takes it when alone");
+        let w = next_work(&shared2, slow, &tx, 0)
+            .await
+            .expect("slow takes it when alone");
         assert_eq!(w.id, "<b0>");
     }
 
@@ -3641,8 +4111,9 @@ mod tests {
         // M11 shed: a worker abandoning its pre-stream pipeline puts the
         // in-flight items back BEHIND the promoted run, in order, without
         // charging attempts; tail dups are dropped, not requeued.
-        let reqs: Vec<ArticleReq> =
-            (0..10).map(|i| ArticleReq::fresh(format!("<a{i}>"))).collect();
+        let reqs: Vec<ArticleReq> = (0..10)
+            .map(|i| ArticleReq::fresh(format!("<a{i}>")))
+            .collect();
         let (shared, _) = Shared::new(reqs, &one_server());
         let ctl = QueueControl::default();
         ctl.attach(&shared);
@@ -3681,7 +4152,9 @@ mod tests {
         let order: Vec<&str> = q.iter().map(|w| w.id.as_str()).collect();
         assert_eq!(
             order,
-            ["<a7>", "<a3>", "<a0>", "<a1>", "<a2>", "<a4>", "<a5>", "<a6>", "<a8>", "<a9>"],
+            [
+                "<a7>", "<a3>", "<a0>", "<a1>", "<a2>", "<a4>", "<a5>", "<a6>", "<a8>", "<a9>"
+            ],
             "shed items must slot in behind the promoted run, in order"
         );
         assert!(
@@ -3728,21 +4201,25 @@ mod tests {
                 socks5: None,
                 enabled: true,
                 warm_pool: false,
-            idle_release_secs: None,
-            idle_keep: None,
-            max_source_ips: None,
+                idle_release_secs: None,
+                idle_keep: None,
+                max_source_ips: None,
             },
             PoolConfig::default(),
         )];
-        let reqs: Vec<ArticleReq> =
-            (0..8).map(|i| ArticleReq::fresh(format!("<a{i}>"))).collect();
+        let reqs: Vec<ArticleReq> = (0..8)
+            .map(|i| ArticleReq::fresh(format!("<a{i}>")))
+            .collect();
         let (shared, _) = Shared::new(reqs, &servers);
         let ctl = QueueControl::default();
         ctl.attach(&shared);
 
         assert!(!ctl.is_draining());
         assert!(ctl.drain(), "drain should reach the live pool");
-        assert!(ctl.is_draining(), "is_draining must reflect a requested drain");
+        assert!(
+            ctl.is_draining(),
+            "is_draining must reflect a requested drain"
+        );
         // The queue is untouched - unstarted work is preserved for resume.
         assert_eq!(shared.queue.lock().await.len(), 8);
 
@@ -3804,7 +4281,10 @@ mod tests {
             el >= Duration::from_secs_f64(WORKERS as f64 * 0.8),
             "the cap was exceeded - {el:?} for {WORKERS}s of charged bytes"
         );
-        assert!(el <= Duration::from_secs(WORKERS * 3), "far too slow: {el:?}");
+        assert!(
+            el <= Duration::from_secs(WORKERS * 3),
+            "far too slow: {el:?}"
+        );
     }
 
     /// A live cap change must not leave a worker asleep against the old
@@ -3822,7 +4302,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         rl.set(0); // the user removed the limit
         waiter.await.unwrap();
-        assert!(t0.elapsed() < Duration::from_secs(5), "stranded against the old cap");
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "stranded against the old cap"
+        );
     }
 
     #[tokio::test]
@@ -3922,7 +4405,10 @@ mod tests {
         use crate::mock::{Chaos, MockServer};
         let srv = MockServer::start(
             std::collections::HashMap::new(),
-            Chaos { auth_rejected: true, ..Default::default() },
+            Chaos {
+                auth_rejected: true,
+                ..Default::default()
+            },
         )
         .await;
         let mut server = srv.server_config();
@@ -3978,9 +4464,7 @@ mod tests {
             std::collections::HashMap::new(),
             Chaos {
                 auth_rejected: true,
-                auth_refusal_text: Some(
-                    "481 max simultaneous IP addresses reached".into(),
-                ),
+                auth_refusal_text: Some("481 max simultaneous IP addresses reached".into()),
                 ..Default::default()
             },
         )
@@ -4068,7 +4552,11 @@ mod tests {
             max_connect_attempts: 5,
             ..Default::default()
         };
-        let fast = PoolConfig { connections: 2, ramp_delay: Duration::ZERO, ..Default::default() };
+        let fast = PoolConfig {
+            connections: 2,
+            ramp_delay: Duration::ZERO,
+            ..Default::default()
+        };
 
         let reqs: Vec<ArticleReq> = ids.iter().cloned().map(ArticleReq::fresh).collect();
         let (tx, mut rx) = mpsc::channel(64);
@@ -4150,7 +4638,10 @@ mod tests {
         let alive = AtomicUsize::new(2);
 
         // Worker 7 takes the refusal: one other is still up, so it goes.
-        assert!(auth.claim_yield(&alive), "a worker with company should yield");
+        assert!(
+            auth.claim_yield(&alive),
+            "a worker with company should yield"
+        );
         alive.fetch_sub(1, Ordering::SeqCst); // WorkerLife::drop
 
         // Worker 8 is now the last one on this server. Under the old
@@ -4159,7 +4650,11 @@ mod tests {
             !auth.claim_yield(&alive),
             "the last worker must not yield: that strands the server for the run"
         );
-        assert_eq!(alive.load(Ordering::SeqCst), 1, "someone must still be trying");
+        assert_eq!(
+            alive.load(Ordering::SeqCst),
+            1,
+            "someone must still be trying"
+        );
 
         // And it keeps refusing to leave however often the cap is hit.
         for _ in 0..5 {
@@ -4187,10 +4682,7 @@ mod tests {
             }
             let left = alive.load(Ordering::SeqCst);
             assert!(left >= 1, "fleet of {start} was stranded with no workers");
-            assert!(
-                left <= start,
-                "fleet of {start} somehow grew to {left}"
-            );
+            assert!(left <= start, "fleet of {start} somehow grew to {left}");
             if start > 1 {
                 assert!(
                     left < start,
@@ -4209,7 +4701,10 @@ mod tests {
         use crate::mock::{Chaos, MockServer};
         let srv = MockServer::start(
             std::collections::HashMap::new(),
-            Chaos { auth_rejected: true, ..Default::default() },
+            Chaos {
+                auth_rejected: true,
+                ..Default::default()
+            },
         )
         .await;
         let mut server = srv.server_config();
@@ -4319,7 +4814,10 @@ mod tests {
         let n = articles.len();
         let srv = MockServer::start(
             articles.clone(),
-            Chaos { mute_quit: true, ..Default::default() },
+            Chaos {
+                mute_quit: true,
+                ..Default::default()
+            },
         )
         .await;
         let cfg = PoolConfig {
@@ -4327,8 +4825,10 @@ mod tests {
             ramp_delay: Duration::ZERO,
             ..Default::default()
         };
-        let reqs: Vec<ArticleReq> =
-            articles.keys().map(|id| ArticleReq::fresh(id.clone())).collect();
+        let reqs: Vec<ArticleReq> = articles
+            .keys()
+            .map(|id| ArticleReq::fresh(id.clone()))
+            .collect();
         let (tx, mut rx) = mpsc::channel(64);
         let t0 = Instant::now();
         tokio::time::timeout(
@@ -4338,7 +4838,11 @@ mod tests {
         .await
         .expect("run hung on a mute-QUIT server");
         // Well under EXIT_GRACE: the bounded quit alone frees the join.
-        assert!(t0.elapsed() < Duration::from_secs(4), "took {:?}", t0.elapsed());
+        assert!(
+            t0.elapsed() < Duration::from_secs(4),
+            "took {:?}",
+            t0.elapsed()
+        );
         let mut done = 0;
         while let Ok(o) = rx.try_recv() {
             if matches!(o, FetchOutcome::Done { .. }) {
@@ -4366,7 +4870,10 @@ mod tests {
         let healthy = MockServer::start(articles.clone(), Chaos::default()).await;
         let mute = MockServer::start(
             std::collections::HashMap::new(),
-            Chaos { mute_greeting: true, ..Default::default() },
+            Chaos {
+                mute_greeting: true,
+                ..Default::default()
+            },
         )
         .await;
         let fast = PoolConfig {
@@ -4379,8 +4886,10 @@ mod tests {
             ramp_delay: Duration::ZERO,
             ..Default::default()
         };
-        let reqs: Vec<ArticleReq> =
-            articles.keys().map(|id| ArticleReq::fresh(id.clone())).collect();
+        let reqs: Vec<ArticleReq> = articles
+            .keys()
+            .map(|id| ArticleReq::fresh(id.clone()))
+            .collect();
         let (tx, mut rx) = mpsc::channel(64);
         let t0 = Instant::now();
         tokio::time::timeout(
@@ -4469,7 +4978,11 @@ mod tests {
         let warm = crate::warmpool::WarmPool::new(crate::warmpool::DEFAULT_MAX_IDLE, 4);
         let (c, _) = Connection::connect(&mute).await.expect("greeting");
         warm.give(&mute, c).await;
-        assert_eq!(warm.idle_count().await, 1, "the claim must have something to claim");
+        assert_eq!(
+            warm.idle_count().await,
+            1,
+            "the claim must have something to claim"
+        );
 
         let fast = PoolConfig {
             connections: 2,
@@ -4482,8 +4995,10 @@ mod tests {
             warm: Some(warm.clone()),
             ..Default::default()
         };
-        let reqs: Vec<ArticleReq> =
-            articles.keys().map(|id| ArticleReq::fresh(id.clone())).collect();
+        let reqs: Vec<ArticleReq> = articles
+            .keys()
+            .map(|id| ArticleReq::fresh(id.clone()))
+            .collect();
         let (tx, mut rx) = mpsc::channel(64);
         let t0 = Instant::now();
         tokio::time::timeout(
@@ -4503,7 +5018,10 @@ mod tests {
                 done += 1;
             }
         }
-        assert_eq!(done, n, "the healthy server still had to deliver every article");
+        assert_eq!(
+            done, n,
+            "the healthy server still had to deliver every article"
+        );
     }
 
     #[test]
@@ -4515,7 +5033,10 @@ mod tests {
         assert_eq!(session_backoff_delay(&cfg, 1), Duration::from_millis(100));
         assert_eq!(session_backoff_delay(&cfg, 2), Duration::from_millis(200));
         assert_eq!(session_backoff_delay(&cfg, 4), Duration::from_millis(800));
-        assert_eq!(session_backoff_delay(&cfg, 9), Duration::from_millis(25_600));
+        assert_eq!(
+            session_backoff_delay(&cfg, 9),
+            Duration::from_millis(25_600)
+        );
         assert_eq!(session_backoff_delay(&cfg, 10), SESSION_BACKOFF_MAX);
         // No overflow, no runaway, however deep the failure count goes.
         assert_eq!(session_backoff_delay(&cfg, u32::MAX), SESSION_BACKOFF_MAX);
@@ -4549,7 +5070,10 @@ mod tests {
         make_file_articles("storm.bin", &payload, 4_000, "st", &mut articles);
         let srv = MockServer::start(
             articles.clone(),
-            Chaos { body_error: Some(u64::MAX), ..Default::default() },
+            Chaos {
+                body_error: Some(u64::MAX),
+                ..Default::default()
+            },
         )
         .await;
         const WORKERS: usize = 4;
@@ -4563,8 +5087,10 @@ mod tests {
             article_retries: 200,
             ..Default::default()
         };
-        let reqs: Vec<ArticleReq> =
-            articles.keys().map(|id| ArticleReq::fresh(id.clone())).collect();
+        let reqs: Vec<ArticleReq> = articles
+            .keys()
+            .map(|id| ArticleReq::fresh(id.clone()))
+            .collect();
         let (tx, _rx) = mpsc::channel(1024);
         let window = Duration::from_secs(1);
         let t0 = Instant::now();
@@ -4603,7 +5129,10 @@ mod tests {
         let healthy = MockServer::start(articles.clone(), Chaos::default()).await;
         let broken = MockServer::start(
             articles.clone(),
-            Chaos { body_error: Some(u64::MAX), ..Default::default() },
+            Chaos {
+                body_error: Some(u64::MAX),
+                ..Default::default()
+            },
         )
         .await;
         let mk = |conns| PoolConfig {
@@ -4613,8 +5142,10 @@ mod tests {
             article_retries: 10,
             ..Default::default()
         };
-        let reqs: Vec<ArticleReq> =
-            articles.keys().map(|id| ArticleReq::fresh(id.clone())).collect();
+        let reqs: Vec<ArticleReq> = articles
+            .keys()
+            .map(|id| ArticleReq::fresh(id.clone()))
+            .collect();
         let (tx, mut rx) = mpsc::channel(256);
         tokio::time::timeout(
             Duration::from_secs(30),
@@ -4651,7 +5182,10 @@ mod tests {
         // The first three BODYs fail; after that the server is healthy.
         let srv = MockServer::start(
             articles.clone(),
-            Chaos { body_error: Some(3), ..Default::default() },
+            Chaos {
+                body_error: Some(3),
+                ..Default::default()
+            },
         )
         .await;
         let cfg = PoolConfig {
@@ -4662,8 +5196,10 @@ mod tests {
             article_retries: 10,
             ..Default::default()
         };
-        let reqs: Vec<ArticleReq> =
-            articles.keys().map(|id| ArticleReq::fresh(id.clone())).collect();
+        let reqs: Vec<ArticleReq> = articles
+            .keys()
+            .map(|id| ArticleReq::fresh(id.clone()))
+            .collect();
         let (tx, mut rx) = mpsc::channel(256);
         let t0 = Instant::now();
         tokio::time::timeout(
@@ -4740,7 +5276,10 @@ mod tests {
         make_file_articles("ceil.bin", &payload, 6_000, "cl", &mut articles);
         let srv = MockServer::start(
             articles.clone(),
-            Chaos { body_error: Some(u64::MAX), ..Default::default() },
+            Chaos {
+                body_error: Some(u64::MAX),
+                ..Default::default()
+            },
         )
         .await;
         const WORKERS: usize = 3;

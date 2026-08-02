@@ -60,6 +60,20 @@ fn describe(s: &Value) -> String {
     )
 }
 
+/// Serializes a whole read-modify-write of the JSON config.
+///
+/// Every server edit - save, enable, reorder, delete, import - reads the
+/// entire array, changes a copy, and writes the array back. The atomic
+/// rename stops a torn FILE; it does nothing about a stale READ. Eight
+/// HTTP workers run requests concurrently, so two edits could both load
+/// the same array, both succeed, and the second rename erase the first's
+/// change with no error anywhere. Hold this across the read AND the
+/// write, not just the write.
+pub(crate) fn config_write_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Read the `servers` array out of an existing config (if any). Anything
 /// else in the file (e.g. `tmdb_key`) is preserved separately on write.
 /// pub(crate): the dashboard's server editor (serve.rs) shares these so
@@ -146,14 +160,22 @@ fn add_server(existing: usize) -> Result<Value> {
     };
     let port: u16 = {
         let p = prompt("  Port [563 for secure, 119 for plain]: ")?;
-        if p.is_empty() { 563 } else { p.parse().unwrap_or(563) }
+        if p.is_empty() {
+            563
+        } else {
+            p.parse().unwrap_or(563)
+        }
     };
     let tls = port != 119;
     let user = prompt("  Username: ")?;
     let pass = rpassword::prompt_password("  Password (hidden as you type): ")?;
     let connections: u32 = {
         let c = prompt("  Max connections your plan allows [20]: ")?;
-        if c.is_empty() { 20 } else { c.parse().unwrap_or(20) }
+        if c.is_empty() {
+            20
+        } else {
+            c.parse().unwrap_or(20)
+        }
     };
     let level = if existing > 0 {
         let a = prompt(
@@ -187,8 +209,6 @@ fn add_server(existing: usize) -> Result<Value> {
     Ok(o)
 }
 
-/// Run the wizard. Returns `true` to proceed to the daemon, `false` to quit.
-
 /// Human-readable label for an interest key. Deliberately English-only
 /// and deliberately here rather than in the i18n catalogues: the CLI
 /// wizard is a plain terminal with no locale machinery, and the dashboard
@@ -215,7 +235,11 @@ fn indexing_summary(config_path: &Path) -> String {
     let stored = std::fs::read(&settings)
         .ok()
         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-        .and_then(|v| v.get("index_interests").and_then(Value::as_str).map(str::to_string));
+        .and_then(|v| {
+            v.get("index_interests")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
     match stored {
         None => "not asked yet".into(),
         Some(s) => {
@@ -223,7 +247,10 @@ fn indexing_summary(config_path: &Path) -> String {
             if keys.is_empty() {
                 "nothing".into()
             } else {
-                keys.iter().map(|k| interest_label(k)).collect::<Vec<_>>().join(", ")
+                keys.iter()
+                    .map(|k| interest_label(k))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             }
         }
     }
@@ -232,8 +259,12 @@ fn indexing_summary(config_path: &Path) -> String {
 /// Forget the stored answer so the question can be asked again.
 fn clear_interests(config_path: &Path) {
     let settings = config_path.with_file_name("settings.json");
-    let Ok(bytes) = std::fs::read(&settings) else { return };
-    let Ok(Value::Object(mut map)) = serde_json::from_slice::<Value>(&bytes) else { return };
+    let Ok(bytes) = std::fs::read(&settings) else {
+        return;
+    };
+    let Ok(Value::Object(mut map)) = serde_json::from_slice::<Value>(&bytes) else {
+        return;
+    };
     map.remove("index_interests");
     if let Ok(text) = serde_json::to_string_pretty(&Value::Object(map)) {
         let _ = crate::persist::write_atomic(&settings, text.as_bytes());
@@ -256,30 +287,37 @@ fn clear_interests(config_path: &Path) {
 fn ask_interests(config_path: &Path) -> Result<()> {
     let settings = config_path.with_file_name("settings.json");
     // Already answered (including answered "nothing")? Don't ask again.
-    if let Ok(bytes) = std::fs::read(&settings) {
-        if let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(&bytes) {
-            if map.contains_key("index_interests") {
-                return Ok(());
-            }
-        }
+    if let Ok(bytes) = std::fs::read(&settings)
+        && let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(&bytes)
+        && map.contains_key("index_interests")
+    {
+        return Ok(());
     }
     header();
-    println!("
-What should nzbfast keep an index of?");
-    println!("
-The index is what fills the browsable wall and what the");
+    println!(
+        "
+What should nzbfast keep an index of?"
+    );
+    println!(
+        "
+The index is what fills the browsable wall and what the"
+    );
     println!("watchlist matches against. It is OFF unless you choose here:");
     println!("pick nothing and nothing is indexed.");
-    println!("
+    println!(
+        "
 You can change this at any time in Settings.
-");
+"
+    );
     let opts = crate::interests::INTERESTS;
     for (i, it) in opts.iter().enumerate() {
         println!("  {}. {}", i + 1, interest_label(it.key));
         println!("       {}", it.groups.join(", "));
     }
-    println!("
-Enter the numbers you want, separated by commas (e.g. 1,3).");
+    println!(
+        "
+Enter the numbers you want, separated by commas (e.g. 1,3)."
+    );
     let answer = prompt("Or just press Return to index nothing: ")?;
     let chosen: Vec<&str> = answer
         .split(',')
@@ -308,41 +346,49 @@ Enter the numbers you want, separated by commas (e.g. 1,3).");
     // credential-bearing stores are supposed to have.
     crate::persist::write_atomic(&settings, text.as_bytes())?;
     if chosen.is_empty() {
-        println!("
-Nothing will be indexed. Nothing else changes.");
+        println!(
+            "
+Nothing will be indexed. Nothing else changes."
+        );
     } else {
-        println!("
-Saved. nzbfast will index:");
+        println!(
+            "
+Saved. nzbfast will index:"
+        );
         for k in &chosen {
             println!("  - {}", interest_label(k));
         }
-        println!("
-It subscribes the groups above that your provider carries,");
+        println!(
+            "
+It subscribes the groups above that your provider carries,"
+        );
         println!("once it has connected. Downloading works either way.");
     }
     pause()?;
     Ok(())
 }
 
+/// Run the wizard. Returns `true` to proceed to the daemon, `false` to quit.
 pub fn run(config_path: &Path) -> Result<bool> {
     let mut servers = read_servers(config_path);
 
     // No local config yet, but a SABnzbd install is present → offer to use
     // its servers as-is (the engine reads sabnzbd.ini directly at runtime).
-    if servers.is_empty() {
-        if let Some(sab) = nzbkit::config::sabnzbd_ini_path() {
-            header();
-            println!("\nFound your SABnzbd servers:");
-            println!("  {}", sab.display());
-            println!("\nnzbfast can use them directly - nothing to set up.");
-            println!("\n  [Return]  Use SABnzbd's servers and start");
-            println!("  s         Set up nzbfast's own server instead");
-            println!("  q         Quit");
-            match prompt("\nChoose: ")?.to_ascii_lowercase().as_str() {
-                "s" => {} // fall through to first-run add
-                "q" => return Ok(false),
-                _ => return Ok(true), // Return / anything else → use SAB
-            }
+    if servers.is_empty()
+        && let Some(sab) =
+            nzbkit::config::sabnzbd_ini_path(&config_path.parent().into_iter().collect::<Vec<_>>())
+    {
+        header();
+        println!("\nFound your SABnzbd servers:");
+        println!("  {}", sab.display());
+        println!("\nnzbfast can use them directly - nothing to set up.");
+        println!("\n  [Return]  Use SABnzbd's servers and start");
+        println!("  s         Set up nzbfast's own server instead");
+        println!("  q         Quit");
+        match prompt("\nChoose: ")?.to_ascii_lowercase().as_str() {
+            "s" => {} // fall through to first-run add
+            "q" => return Ok(false),
+            _ => return Ok(true), // Return / anything else → use SAB
         }
     }
 
@@ -367,7 +413,10 @@ pub fn run(config_path: &Path) -> Result<bool> {
         println!("\n  [Return]  Start downloading");
         println!("  a         Add another server (e.g. a backup/fill account)");
         println!("  r         Remove a server");
-        println!("  i         Choose what to index (currently: {})", indexing_summary(config_path));
+        println!(
+            "  i         Choose what to index (currently: {})",
+            indexing_summary(config_path)
+        );
         println!("  q         Quit without starting");
         match prompt("\nChoose: ")?.to_ascii_lowercase().as_str() {
             "" => return Ok(true),
@@ -486,7 +535,8 @@ mod tests {
     /// `.ini` extension) is still preserved to `.orig` and overwritten.
     #[test]
     fn corrupt_json_config_is_backed_up_then_rewritten() {
-        let dir = std::env::temp_dir().join(format!("nzbfast-setup-corrupt-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("nzbfast-setup-corrupt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let cfg = dir.join("config.local.json");
@@ -496,7 +546,10 @@ mod tests {
         write_servers(&cfg, &[s]).unwrap();
 
         let orig = dir.join("config.local.json.orig");
-        assert_eq!(std::fs::read_to_string(&orig).unwrap(), "this is not json at all");
+        assert_eq!(
+            std::fs::read_to_string(&orig).unwrap(),
+            "this is not json at all"
+        );
         assert_eq!(read_servers(&cfg).len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);

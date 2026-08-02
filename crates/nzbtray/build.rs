@@ -23,7 +23,10 @@ fn main() {
     // default manifest and rejects a second. Type 24 and ICON are
     // different resource types, so both can be id 1.
     let gnu = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu");
-    let manifest = root.join("packaging/windows/nzbfast.manifest").canonicalize().ok();
+    let manifest = root
+        .join("packaging/windows/nzbfast.manifest")
+        .canonicalize()
+        .ok();
     let manifest_line = match (&manifest, gnu) {
         (Some(m), true) => format!("1 24 \"{}\"\n", m.display().to_string().replace('\\', "/")),
         _ => String::new(),
@@ -43,6 +46,7 @@ BEGIN
   BEGIN
     BLOCK "040904b0"
     BEGIN
+      VALUE "CompanyName", "nzbfast"
       VALUE "ProductName", "nzbfast"
       VALUE "FileDescription", "nzbfast tray"
       VALUE "InternalName", "nzbtray"
@@ -63,11 +67,21 @@ END
     )
     .unwrap();
     let windres = std::env::var("WINDRES").unwrap_or_else(|_| {
-        if gnu { "x86_64-w64-mingw32-windres".into() } else { "windres".into() }
+        if gnu {
+            "x86_64-w64-mingw32-windres".into()
+        } else {
+            "windres".into()
+        }
     });
     let res = out.join("nzbtray.res.o");
     match std::process::Command::new(&windres)
-        .args([rc.to_str().unwrap(), "-O", "coff", "-o", res.to_str().unwrap()])
+        .args([
+            rc.to_str().unwrap(),
+            "-O",
+            "coff",
+            "-o",
+            res.to_str().unwrap(),
+        ])
         .status()
     {
         Ok(s) if s.success() => {

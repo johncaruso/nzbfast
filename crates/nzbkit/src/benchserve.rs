@@ -21,6 +21,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tracing::info;
 
 use md5::{Digest, Md5};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -136,7 +137,7 @@ fn build_par2(files: u32, file_size: u64, article: usize) -> Vec<u8> {
             (id.finalize().into(), name)
         })
         .collect();
-    fids.sort_by(|a, b| a.0.cmp(&b.0)); // Main lists ids sorted
+    fids.sort_by_key(|a| a.0); // Main lists ids sorted
 
     let mut main_body = Vec::with_capacity(12 + fids.len() * 16);
     main_body.extend_from_slice(&(bs as u64).to_le_bytes());
@@ -167,11 +168,7 @@ fn build_par2(files: u32, file_size: u64, article: usize) -> Vec<u8> {
     }
     let mut creator = b"nzbfast benchserve".to_vec();
     creator.resize(creator.len().div_ceil(4) * 4, 0);
-    blob.extend_from_slice(&par2_packet(
-        &set_id,
-        b"PAR 2.0\0Creator\0",
-        &creator,
-    ));
+    blob.extend_from_slice(&par2_packet(&set_id, b"PAR 2.0\0Creator\0", &creator));
     blob
 }
 
@@ -217,7 +214,10 @@ impl BenchSet {
         let par2 = par2.then(|| {
             let blob = build_par2(files, file_size, article);
             let parts = (blob.len().max(1)).div_ceil(article) as u32;
-            Par2Meta { blob: Arc::new(blob), parts }
+            Par2Meta {
+                blob: Arc::new(blob),
+                parts,
+            }
         });
         BenchSet {
             files,
@@ -259,7 +259,11 @@ impl BenchSet {
                 self.parts_per_file
             ));
             for p in 1..=self.parts_per_file {
-                let bytes = if p == self.parts_per_file { approx_tail } else { approx_full };
+                let bytes = if p == self.parts_per_file {
+                    approx_tail
+                } else {
+                    approx_full
+                };
                 out.push_str(&format!(
                     "<segment bytes=\"{bytes}\" number=\"{p}\">f{fi}-p{p}@bench</segment>\n"
                 ));
@@ -319,7 +323,11 @@ impl BenchSet {
     }
 
     fn name_for(&self, fi: u32) -> String {
-        if fi == u32::MAX { PAR2_NAME.into() } else { Self::file_name(fi) }
+        if fi == u32::MAX {
+            PAR2_NAME.into()
+        } else {
+            Self::file_name(fi)
+        }
     }
 
     /// Assemble one article: (header lines, shared body block, trailer).
@@ -400,8 +408,9 @@ pub async fn serve_with(
     let _ = socket.set_reuseaddr(true);
     socket.bind(addr)?;
     let listener: TcpListener = socket.listen(1024)?;
-    println!(
-        "[benchserve] NNTP on {} ({})",
+    info!(
+        target: "benchserve",
+        "NNTP on {} ({})",
         listener.local_addr()?,
         if tls.is_some() { "TLS" } else { "plain" }
     );
@@ -438,7 +447,8 @@ where
 {
     let mut reader = BufReader::with_capacity(4096, r);
     let mut w = tokio::io::BufWriter::with_capacity(1 << 20, w);
-    w.write_all(b"200 nzbfast benchserve ready (posting prohibited)\r\n").await?;
+    w.write_all(b"200 nzbfast benchserve ready (posting prohibited)\r\n")
+        .await?;
     w.flush().await?;
     loop {
         // Cap the command line: a client streaming bytes with no newline would
@@ -454,7 +464,11 @@ where
         }
         let line = String::from_utf8_lossy(&lb);
         let cmd = line.trim_end();
-        let upper_word = cmd.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
+        let upper_word = cmd
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase();
         let arg = cmd.split_whitespace().nth(1).unwrap_or("");
         match upper_word.as_str() {
             "BODY" | "ARTICLE" => match set.parse_id(arg) {
@@ -498,7 +512,8 @@ where
             },
             "STAT" => {
                 if set.parse_id(arg).is_some() {
-                    w.write_all(format!("223 0 {}\r\n", arg.trim()).as_bytes()).await?;
+                    w.write_all(format!("223 0 {}\r\n", arg.trim()).as_bytes())
+                        .await?;
                 } else {
                     w.write_all(b"430 no such article\r\n").await?;
                 }
@@ -520,11 +535,13 @@ where
                 }
             },
             "GROUP" => {
-                w.write_all(b"211 1000 1 1000 alt.binaries.bench\r\n").await?;
+                w.write_all(b"211 1000 1 1000 alt.binaries.bench\r\n")
+                    .await?;
             }
             "MODE" => w.write_all(b"200 reader, posting prohibited\r\n").await?,
             "CAPABILITIES" => {
-                w.write_all(b"101 capabilities\r\nVERSION 2\r\nREADER\r\n.\r\n").await?;
+                w.write_all(b"101 capabilities\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                    .await?;
             }
             "AUTHINFO" => {
                 let sub = arg.to_ascii_uppercase();
@@ -590,14 +607,21 @@ mod tests {
         // Materialize what the articles decode to: parts of payload().
         let mut content = Vec::with_capacity(file_size as usize);
         for p in 1..=set.parts_per_file {
-            let len = if p == set.parts_per_file { set.tail_len } else { article };
+            let len = if p == set.parts_per_file {
+                set.tail_len
+            } else {
+                article
+            };
             content.extend_from_slice(&payload(len));
         }
         assert_eq!(content.len() as u64, file_size);
 
         let names: Vec<&str> = parsed.files.iter().map(|f| f.name.as_str()).collect();
         for fi in 0..files {
-            assert!(names.contains(&BenchSet::file_name(fi).as_str()), "{names:?}");
+            assert!(
+                names.contains(&BenchSet::file_name(fi).as_str()),
+                "{names:?}"
+            );
         }
         for f in &parsed.files {
             assert_eq!(f.length, file_size);

@@ -51,37 +51,13 @@ pub(crate) enum SplitVolumeStep<'a, P> {
     Interrupted,
 }
 
-pub(crate) struct ChainedReader<'a> {
-    readers: Vec<Box<dyn Read + Send + 'a>>,
-    index: usize,
-}
-
-impl<'a> ChainedReader<'a> {
-    pub(crate) fn new(readers: Vec<Box<dyn Read + Send + 'a>>) -> Self {
-        Self { readers, index: 0 }
-    }
-}
-
-impl Read for ChainedReader<'_> {
-    fn read(&mut self, out: &mut [u8]) -> Result<usize> {
-        while let Some(reader) = self.readers.get_mut(self.index) {
-            let read = reader.read(out)?;
-            if read != 0 {
-                return Ok(read);
-            }
-            self.index += 1;
-        }
-        Ok(0)
-    }
-}
-
 /// One fragment of a split member, opened only when the chain reaches it.
 /// Failure surfaces as an `io::Error` on the read that needed it - the
 /// fragment is opened from inside `Read::read`, which has no other channel.
 pub(crate) type FragmentOpener<'a> =
     Box<dyn FnOnce() -> Result<Box<dyn Read + Send + 'a>> + Send + 'a>;
 
-/// [`ChainedReader`] that holds openers rather than open readers.
+/// A fragment chain that holds openers rather than open readers.
 ///
 /// A path-backed range reader is a live `File`, and the legacy formats built
 /// one for EVERY fragment before reading a byte: a ~300-volume split member
@@ -251,17 +227,20 @@ mod tests {
         assert_eq!(live.load(Ordering::SeqCst), 0, "and none left open at the end");
     }
 
+    /// An empty fragment must not end the chain: a zero-length packed
+    /// range is legal (a member whose split lands exactly on a volume
+    /// boundary), and stopping there would truncate the member.
     #[test]
-    fn chained_reader_reads_all_fragments_in_order() {
-        let readers: Vec<Box<dyn Read + Send>> = vec![
-            Box::new(Cursor::new(b"one".to_vec())),
-            Box::new(Cursor::new(Vec::new())),
-            Box::new(Cursor::new(b"two".to_vec())),
+    fn lazy_chained_reader_reads_past_an_empty_fragment() {
+        let openers: Vec<FragmentOpener> = vec![
+            Box::new(|| Ok(Box::new(Cursor::new(b"one".to_vec())) as Box<dyn Read + Send>)),
+            Box::new(|| Ok(Box::new(Cursor::new(Vec::new())) as Box<dyn Read + Send>)),
+            Box::new(|| Ok(Box::new(Cursor::new(b"two".to_vec())) as Box<dyn Read + Send>)),
         ];
-        let mut reader = ChainedReader::new(readers);
         let mut out = Vec::new();
-
-        reader.read_to_end(&mut out).unwrap();
+        LazyChainedReader::new(openers)
+            .read_to_end(&mut out)
+            .unwrap();
 
         assert_eq!(out, b"onetwo");
     }

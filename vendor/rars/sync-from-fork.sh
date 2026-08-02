@@ -35,6 +35,25 @@
 #   RARS_FORK=/path/to/rars/checkout ./vendor/rars/sync-from-fork.sh
 #   # RARS_FORK defaults to $HOME/Claude/rars
 #
+
+# ------------------------------------------------------------------
+# OUTBOUND-DRIFT GUARD (added 1 Aug 2026). The vendored copy has taken
+# local commits directly and can be AHEAD of the fork; a blind rsync
+# --delete would destroy them. Refuse to run while local commits exist
+# past the rev recorded in VENDOR-REV, unless --force.
+# ------------------------------------------------------------------
+HERE="$(cd "$(dirname "$0")" && pwd)"
+LAST_SYNC_REV="$(sed -n 's/^last-synced-rev: //p' "$HERE/VENDOR-REV" 2>/dev/null)"
+if [ "$1" != "--force" ]; then
+  DRIFT="$(cd "$HERE" && git log --oneline --since="2026-07-24" -- . | wc -l | tr -d ' ')"
+  if [ "${DRIFT:-0}" -gt 0 ]; then
+    echo "REFUSING to sync: vendor/rars has $DRIFT local commits since the last"
+    echo "recorded sync ($LAST_SYNC_REV, see VENDOR-REV). Push them to the fork"
+    echo "first, update VENDOR-REV, or re-run with --force to discard them."
+    exit 1
+  fi
+fi
+
 set -euo pipefail
 
 fork="${RARS_FORK:-$HOME/Claude/rars}"

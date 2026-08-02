@@ -42,8 +42,8 @@ for (const f of files) {
     if (txt.trim()) put(m[1], txt);
     else if (!(m[1] in out)) clash.push([m[1], '<EMPTY TEXT>', f]);
   }
-  // rich text (both -html sites are <div>…</div> with no nested div)
-  for (const m of s.matchAll(/(?<!\[)data-i18n-html="([\w.\-]+)"[^>]*>([\s\S]*?)<\/div>/g))
+  // rich text (-html sites are <div>…</div> or <p>…</p> with no nested div/p)
+  for (const m of s.matchAll(/(?<!\[)data-i18n-html="([\w.\-]+)"[^>]*>([\s\S]*?)<\/(?:div|p)>/g))
     put(m[1], m[2]);
   // attribute pairs
   for (const m of s.matchAll(/<[^>]*data-i18n-(title|placeholder)="[\w.\-]+"[^>]*>/g)) {

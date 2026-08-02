@@ -38,12 +38,27 @@ h3{font-size:16.5px;margin:28px 0 6px}
 h4{font-size:14.5px;margin:20px 0 4px}
 p{margin:8px 0}
 li{margin:3px 0}
+/* Prose breaks a long unbreakable token instead of pushing the page sideways.
+   The API section quotes a 368px query string, which does not fit the 280px
+   text column of a 320px phone. Deliberately not applied to header or data
+   cells: inside a scroll wrapper, breaking a cell reflows the columns rather
+   than letting the wide table scroll, which is what the wrapper is for. */
+p,li,.tip,.note,.warn-box{overflow-wrap:break-word}
 code,kbd{background:var(--code);border:1px solid var(--line);border-radius:5px;
   padding:1px 6px;font:12.5px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 pre{background:var(--code);border:1px solid var(--line);border-radius:9px;
   padding:12px 15px;overflow-x:auto;font:12.5px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 pre code{background:none;border:none;padding:0}
-table{border-collapse:collapse;width:100%;margin:12px 0;font-size:13.5px}
+/* A table scrolls inside its own box instead of widening the page. One long
+   unbreakable command in a cell (the docker compose upgrade line, 338px wide
+   in an 87px column) used to drag the whole document sideways on a phone:
+   +140 at 320px and +85 at 375px in English, up to +217 / +162 in the
+   longer-word locales, and da/nl even at 500px. The 12px margin sits on the
+   wrapper so it still collapses with the adjacent paragraph exactly as
+   the margin on the table itself did - a scroll box does not collapse
+   margins through, so leaving it in place would have opened every gap. */
+.tblwrap{overflow-x:auto;margin:12px 0}
+table{border-collapse:collapse;width:100%;margin:0;font-size:13.5px}
 th{text-align:start;color:var(--dim);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
 th,td{padding:7px 0;padding-inline-end:12px;border-bottom:1px solid var(--line);vertical-align:top}
 td code{white-space:nowrap}
@@ -80,6 +95,7 @@ hr{border:none;border-top:1px solid var(--line);margin:30px 0}
   body{background:#fff;color:#000;font-size:11.5pt}
   h2{page-break-after:avoid}
   pre{white-space:pre-wrap}
+  .tblwrap{overflow:visible}
   a{color:inherit}
 }
 </style>
@@ -225,7 +241,7 @@ nzbfast רץ, וזה מה שאתה רוצה בשולחן עבודה יחיד ש�
 
 <h2 id="concepts">3 · איך nzbfast עובד</h2>
 <p>אוצר מילים מהיר כדי ששאר המדריך ייקרא בקלות:</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>מונח</th><th>משמעות</th></tr>
 <tr><td><b>ספק / שרת</b></td><td>שירות Usenet שיש לך חשבון אצלו
 (Newshosting, Eweka, XS News…). כל אחד מתיר מספר מסוים של חיבורים בו-זמניים.</td></tr>
@@ -240,7 +256,7 @@ nzbfast רץ, וזה מה שאתה רוצה בשולחן עבודה יחיד ש�
 <tr><td><b>RAR במצב אחסון</b></td><td>רוב הרליסים ארוזים בכרכי RAR ללא
 דחיסה. nzbfast מזהה זאת וכותב את <em>הקובץ הפנימי</em> ישירות ל
 מיקומו הסופי תוך כדי הורדה - בלי שלב פריקה אחר כך.</td></tr>
-</table>
+</table></div>
 <p>הצינור מריץ הורדה → פענוח → אימות → חילוץ <em>בו-זמנית</em>. כרטיס
 הצינור בלוח המחוונים מציג את כל שלושת המסלולים נעים בבת אחת. כשהבייט האחרון
 מגיע, האימות כבר הסתיים והקובץ כבר מחולץ; זמן
@@ -257,13 +273,13 @@ nzbfast רץ, וזה מה שאתה רוצה בשולחן עבודה יחיד ש�
 <p>נמדד מול SABnzbd 5.0.4 ו-NZBGet 26.2 על אותה מכונה, אותם
 ספקים ואותם קובצי NZB, מתוזמן ל<em>קובץ שמיש</em> - הורדה, אימות,
 תיקון וחילוץ כלולים כולם, כי אז המשימה באמת מסתיימת:</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>גודל משימה</th><th>nzbfast</th><th>NZBGet 26.2</th><th>SABnzbd 5.0.4</th></tr>
 <tr><td>7 GB</td><td><b>13.7 s</b></td><td>+26%</td><td>+39%</td></tr>
 <tr><td>35 GB</td><td><b>67 s</b></td><td>+61%</td><td>+325%</td></tr>
 <tr><td>87 GB</td><td><b>272 s</b></td><td>+36%</td><td>+160%</td></tr>
 <tr><td>190 GB</td><td><b>9 m 00 s</b></td><td>+30%</td><td>+111%</td></tr>
-</table>
+</table></div>
 <p>הפער הוא העיבוד לאחר הורדה שהאחרים עדיין צריכים לבצע לאחר שהבייט האחרון
 נוחת. שני המתחרים כווננו לצורך ההשוואה, לא הושארו בברירות מחדל -
 SABnzbd בפרט מגיע עם צנרת בקשות <em>כבויה</em>, מה שעולה לו
@@ -356,7 +372,7 @@ NZB אחר לא מראה לך זאת; הוא קיים כדי להוכיח נקו
 <a href="#performance">כלי ביצועים</a>.</p>
 
 <h2 id="adding">5 · הוספת הורדות</h2>
-<table>
+<div class="tblwrap"><table>
 <tr><th>שיטה</th><th>איך</th></tr>
 <tr><td><b>גרור והשלך</b></td><td>הנח קובץ <code>.nzb</code> אחד או יותר בכל מקום על לוח המחוונים.</td></tr>
 <tr><td><b>תיקיית מעקב</b></td><td>הגדר תיקייה ב-Settings; כל <code>.nzb</code> שנשמר בתוכה
@@ -368,7 +384,7 @@ NZB אחר לא מראה לך זאת; הוא קיים כדי להוכיח נקו
 <tr><td><b>רשימת מעקב / RSS</b></td><td>אוטומטי - ראה <a href="#automation">אוטומציה</a>.</td></tr>
 <tr><td><b>Sonarr/Radarr וכו'</b></td><td>הם שולחים תפיסות ישר לתור - ראה <a href="#arr">§11</a>.</td></tr>
 <tr><td><b>שורת פקודה</b></td><td><code>nzbfast get file.nzb</code> מוריד בלי הדימון.</td></tr>
-</table>
+</table></div>
 <h3>קטגוריות, עדיפויות, סיסמאות</h3>
 <ul>
 <li><b>קטגוריות</b> הן תוויות חופשיות; כל אחת הופכת לתת-תיקייה של תיקיית
@@ -469,14 +485,14 @@ Wikipedia ו-AniList לא צריכים חשבונות. מפתח OMDb (חינמי
 <h2 id="servers">8 · שרתי Usenet</h2>
 <p>Settings → <b>Usenet servers</b> הוא העורך המלא: הוספה, עריכה, הסרה, שינוי סדר, והכנסה או הוצאה של כל שרת
 מהמאגר. לכל שרת יש:</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>שדה</th><th>הערות</th></tr>
 <tr><td>מארח / פורט</td><td>השתמש בפורט SSL <b>563</b>. TLS לא עולה שום דבר מדיד - nzbfast תמיד מצפין.</td></tr>
 <tr><td>שם משתמש / סיסמה</td><td>נשמרים מקומית ב-<code>config.local.json</code>, לעולם לא מוצגים חזרה לדפדפן. השארת סיסמה ריקה בעריכה שומרת על השמורה. הסיסמאות <a href="#passwords">מעורפלות על הדיסק, לא מוצפנות</a>.</td></tr>
 <tr><td>חיבורים</td><td>חיבורים בו-זמניים לכל שרת. השתמש ב-<b>כוונון חיבורים</b> (<a href="#performance">§13</a>) כדי למצוא את הנקודה המתוקה של כל ספק במקום לנחש גבוה.</td></tr>
 <tr><td>דרגה (רמה)</td><td>0 = ראשי; רמות גבוהות יותר הן שרתי מילוי, נשאלים רק על מאמרים שכל רמה נמוכה יותר החמיצה. שים חשבונות ללא הגבלה ב-0, חשבונות בלוק ב-1+.</td></tr>
 <tr><td>גודל בלוק (GB)</td><td>לחשבונות בלוק (תשלום-לכל-GB): nzbfast עוקב אחר שימוש לכל החיים מול זה ומפסיק להשתמש בשרת כשמנוצל (אזהרה ב-85%).</td></tr>
-</table>
+</table></div>
 <p><b>השאר קצת מרווח מתחת למגבלת החיבורים של החשבון שלך.</b> הגדרת החיבורים מעט מתחת למגבלה לא עולה דבר: קצב ההעברה מתיישר הרבה לפני החיבור האחרון או השניים האחרונים, ו<b>כוונון חיבורים</b> (<a href="#performance">§13</a>) מגיע ממילא מתחתיה. המקומות הפנויים האלה הם מה שמאפשר למכשיר שני, לתוכנה אחרת או לניסיון חוזר אחרי שקע שנפל להיכנס בכל זאת, במקום להידחות בזמן שזה תופס כל מקום.</p>
 <h3 id="passwords">כיצד נשמרות סיסמאות הספקים שלך</h3>
 <p>סיסמאות הספקים בקובץ <code>config.local.json</code> הן <b>מעורפלות, לא
@@ -508,11 +524,11 @@ Wikipedia ו-AniList לא צריכים חשבונות. מפתח OMDb (חינמי
 <p>לשתי אפשרויות נוספות לכל שרת עדיין אין פקד בלוח הבקרה: הוסף אותן ידנית ברשומה של
 אותו שרת בקובץ <code>config.local.json</code> (ראה <a href="#files">§17</a>) והפעל
 מחדש.</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>מפתח</th><th>הערות</th></tr>
 <tr><td><code>bind_ip</code></td><td>קושר את החיבורים היוצאים של השרת הזה לכתובת מקומית מסוימת, למכונות עם כמה יציאות ולמנהרות VPN מפוצלות. משפחת הכתובות בוחרת גם את משפחת היעד: קשירת v4 מתחברת לכתובת ה-v4 של השרת.</td></tr>
 <tr><td><code>socks5</code></td><td>שולח את תעבורת ה-NNTP של השרת הזה דרך פרוקסי SOCKS5: <code>host:port</code>, או <code>user:pass@host:port</code>. שם המארח נפתר <em>על ידי הפרוקסי</em>, כך שאין דליפת DNS מקומית.</td></tr>
-</table>
+</table></div>
 <ul>
 <li><b>הסימון</b> שליד כל שרת הוא מתג ההפעלה שלו: מסומן פירושו שהשרת נמצא במאגר
 ההורדה, לא מסומן פירושו מושבת. שרת מושבת שומר על פרטי ההתחברות וההגדרות שלו ועדיין ניתן
@@ -537,7 +553,7 @@ Wikipedia ו-AniList לא צריכים חשבונות. מפתח OMDb (חינמי
 הפקודה).</p>
 
 <h3>מהירות ותזמון <span class="pill live">חי</span></h3>
-<table>
+<div class="tblwrap"><table>
 <tr><th>הגדרה</th><th>מה היא עושה</th></tr>
 <tr><td>מגבלת מהירות</td><td>תקרה בבייטים/שנ' (<code>50M</code>, <code>1G</code>, 0 = ללא הגבלה). אפליקציות מרוחקות עשויות לשלוח אחוזים - הגדר <i>מהירות קו</i> כדי שיתורגמו נכון.</td></tr>
 <tr><td>מהירות אוטומטית</td><td>תקרה מווסתת-RTT שמפנה מקום לתעבורה ביתית אחרת ומתרחבת מחדש כשהקו שקט.</td></tr>
@@ -546,7 +562,7 @@ Wikipedia ו-AniList לא צריכים חשבונות. מפתח OMDb (חינמי
 <tr><td>עדכון אוטומטי / כתובת בדיקת עדכונים</td><td>ראה <a href="#updates">§14</a>.</td></tr>
 <tr><td>מהירות קו</td><td>המהירות המדורגת של החיבור שלך - מאפשרת מגבלות אחוזים מאפליקציות תואמות-SABnzbd.</td></tr>
 <tr><td>תזמון שבועי</td><td>עורך שורות לכללי זמן-בשבוע: השהה, המשך, או קבע מגבלת מהירות בימים/שעות נתונים (שעון מקומי). לדוגמה הגבל ל-20&nbsp;MB/s בימי חול 9–17, ללא הגבלה אחרת.</td></tr>
-</table>
+</table></div>
 
 <h3>הורדה הבאה <span class="pill live">חי</span></h3>
 <p><b>חיבורים</b> (לכל שרת), <b>חלון</b> (עומק צנרת לכל חיבור),
@@ -583,7 +599,7 @@ Wikipedia ו-AniList לא צריכים חשבונות. מפתח OMDb (חינמי
 נקי ומובן: סרט הופך ל-<code>Example Movie (2024)</code>, וסדרות שומרות על
 <code>Show - S01E02</code>. שמות מעורפלים או בלתי מזוהים נשארים בדיוק כפי שפורסמו במקום
 שינחשו.</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>הגדרה</th><th>מה היא עושה</th></tr>
 <tr><td>כלול רזולוציה</td><td>מוסיף <code>1080p</code>, <code>2160p</code>… לשם. <b>פעיל כברירת מחדל</b>; ארבעת התגים האחרים כבויים.</td></tr>
 <tr><td>כלול קודק וידאו</td><td><code>x265</code>, <code>x264</code>, <code>AV1</code>…</td></tr>
@@ -593,7 +609,7 @@ Wikipedia ו-AniList לא צריכים חשבונות. מפתח OMDb (חינמי
 <tr><td>הסר קובצי זבל</td><td><b>פעיל כברירת מחדל.</b> מוחק שאריות <code>.par2</code>, <code>.nzb</code>, <code>.sfv</code>, <code>.nfo</code> וקטעי דוגמה מתיקיות סרטים וסדרות שהסתיימו. לעולם לא את הווידאו או הכתוביות שלו.</td></tr>
 <tr><td>שמור רק את קובץ המדיה</td><td><b>כבוי כברירת מחדל, והרסני:</b> מוחק לצמיתות כל מה שבתיקייה חוץ מהווידאו (או הווידאו־אים) והכתוביות. כל פרק בחבילת עונה נשמר. גובר על <b>הסר קובצי זבל</b> כששניהם פעילים.</td></tr>
 <tr><td>Keep the other words in the name</td><td><b>מופעל כברירת מחדל.</b> ספורט, מרוצים ואירועים אחרים הם לעיתים קרובות אותה כותרת שחוזרת על עצמה לאורך כל העונה, במרחק מילה או שתיים - "Round11 Hungary Race" מול "Round11 Hungary Qualifying". שמירת המילים האלה היא מה שמונע מעונה שלמה להתמוטט לאותו שם. חל רק במקומות שבהם לא ניתן היה לסדר את השם בדרך אחרת, כך שסרטים ופרקים רגילים אינם נוגעים.</td></tr>
-</table>
+</table></div>
 <p class="dim">הקבוצה כולה פועלת אחרי התיקון והפריסה ולפני <b>העבר את שהושלמו אל</b>,
 ומדולגת לגמרי עבור משימה שעדיין ממתינה לסיסמה. שני שלבי המחיקה חלים <em>רק</em> על
 רליסים שזוהו כסרט או כסדרה: מטען תוכנה או מערך שלא ניתן לסווג (מעורפל) לעולם אינו
@@ -617,7 +633,7 @@ indexers כדי שתוכל לחפש בהם מהקיר. הפעל את זה אם �
 עדיין מפרסמים בשמות אמיתיים, או אם אתה רוצה לראות מה הספק שלך באמת נושא. כשהמתג כבוי
 דבר אינו נסרק או נמשך, לא נוצר מסד נתונים, והקיר, עיון, רשימת המעקב וערוץ ה-newznab
 מוסתרים.</div>
-<table>
+<div class="tblwrap"><table>
 <tr><th>הגדרה</th><th>מה היא עושה</th></tr>
 <tr><td>אינדקסר מובנה</td><td>המתג הראשי, <b>כבוי אלא אם תדליק אותו</b>. כבוי פירושו בלי סריקה, בלי חיפושי מטא-נתונים, בלי דגימת זמינות ובלי ערוץ newznab; אינדקס שכבר נמצא על הדיסק נשמר (יש כפתור מחיקה), כך שהדלקה מחדש ממשיכה במקום לסרוק מחדש.</td></tr>
 <tr><td>קבוצות</td><td>קבוצות דיון שהאינדקסר המובנה סורק (לדוגמה <code>alt.binaries.teevee</code>).</td></tr>
@@ -629,7 +645,12 @@ indexers כדי שתוכל לחפש בהם מהקיר. הפעל את זה אם �
 <tr><td>שערי קליטה</td><td>כללי JSON המסננים מה נכנס לאינדקס: סוגים (זבל מעורפל נזרק כברירת מחדל), שנה/רזולוציה/שפה, גבולות גודל.</td></tr>
 <tr><td>סרוק עכשיו / סריקה עמוקה מחדש</td><td>הרץ מעבר מיד; עם עומק, סרוק מחדש כמות זו של כותרות אחרונות.</td></tr>
 <tr><td>מפתח OMDb / רענון מטא-נתונים / מחיקה</td><td>בקרות העשרת קיר (<a href="#wall">§6</a>). מחיקה בונה מחדש את מסד הנתונים מאפס - נתיב השחזור אם הוא אי פעם נפגם.</td></tr>
-</table>
+<tr><td>הזנת pre</td><td><b>כבויה עד שתדליק אותה.</b> העלאות רבות מתפרסמות בלי השם שלהן, ולסריקה אין מה לקרוא. ערוצי ממסר ציבוריים מכריזים על השם האמיתי, והדרך הפתוחה היחידה לקשר פרסומים כאלה. הדלקה שומרת חיבור פתוח לרשת IRC ומאזינה: דבר לא נשלח אי פעם ולא נוצר חשבון. דורשת שהמפתח יהיה דלוק, כי הזנה בלי מקום לאחסן את מה ששמעה היא שקע שנשאר פתוח לחינם.</td></tr>
+<tr><td>שרת ממסר, ערוצי ממסר</td><td>רשת ה-IRC שנושאת את ההכרזות (מארח או מארח:פורט) והערוצים להאזנה, מופרדים בפסיקים. שינוי נכנס לתוקף בחיבור הבא: כבה והדלק את ההזנה כדי להחיל אותו מיד.</td></tr>
+<tr><td>מתן שם לפי מתאם</td><td>ממסרי השידור החי הציבוריים אינם נושאים שמות קבצים, ולכן רוב הפרסומים המעורפלים אינם ניתנים לקישור ישיר. מה שהכרזה כן קובעת הוא מתי גרסה הופיעה וכמה היא גדולה. זה משווה זמן וגודל מוכרזים לפרסומים חסרי שם, וכשהם מתאימים מציע את השם האמיתי בעמוד העיון. הצעה מסומנת כהצעה, דורשת את הלחיצה שלך, ולעולם אינה משנה שמות של קבצים בדיסק.</td></tr>
+<tr><td>החל התאמות חזקות אוטומטית</td><td>כבוי כברירת מחדל, ומחמיר כשהוא דלוק: הגודל חייב להתאים בהדוקות, שום הכרזה אחרת לא תתאים כמעט באותה מידה, וההכרזה חייבת לבחור את הפרסום הזה בחזרה בבדיקה ההפוכה. שם שהוחל משנה רק את אופן ההצגה, מסומן כמוסק, ויורד מעצמו אם הורדה שהסתיימה מפריכה אותו. כל מה שחלש יותר נשאר הצעה.</td></tr>
+<tr><td>היסטוריית הכרזות</td><td>ההזנה החיה שומעת רק הכרזות שנעשו אחרי שהודלקה. זה מביא כשישה חודשים של הכרזות קודמות ממסד pre ציבורי, בנימוס ופעם אחת, כדי שגם פרסומים שכבר במפתח יוכלו להתקשר. רץ ברקע כחצי שעה.</td></tr>
+</table></div>
 
 <h3>ספרייה, אבטחה, ממשק</h3>
 <p><b>ספרייה</b>: קטגוריות המטופלות כרשומות ספרייה מיידיות + מרווח בדיקה חוזרת.
@@ -641,17 +662,19 @@ indexers כדי שתוכל לחפש בהם מהקיר. הפעל את זה אם �
 שספקיות מציינות קווים). גדלי קבצים נשארים בבתים בכל מקרה. זו תכונה של הדימון ולא של
 הדפדפן שלך, ולכן היא חלה על כל מכשיר שמביט בהתקנה הזאת.</p>
 <h3>מתקדם: הגדרות בלי פקד בלוח הבקרה</h3>
-<p>לארבע הגדרות אין פקד בממשק ואין דגל בשורת הפקודה. קבע אותן דרך ה-API
+<p>לשש הגדרות אין פקד בממשק ואין דגל בשורת הפקודה. קבע אותן דרך ה-API
 (<a href="#api">§16</a>), למשל
 <code>/api?mode=config&amp;name=verify_mode&amp;value=lean&amp;apikey=…</code>. כמו כל
 היתר הן נשמרות אל <code>settings.json</code>.</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>שם</th><th>מה היא עושה</th></tr>
 <tr><td><code>verify_mode</code></td><td><code>full</code> | <code>fast</code> | <code>lean</code> (ברירת מחדל <code>fast</code>). <code>lean</code> הוא הדחיפה למעבדים איטיים: כמו fast, אך מדלג גם על ה-CRC של yEnc לכל מאמר ברגע ש-PAR2 מכסה קובץ, ומשאיר שכבת CRC32 אחת במקום שתיים. הורדות ללא PAR2 שומרות על ה-CRC של המאמרים, והאימות והתיקון בסוף המשימה אינם משתנים בשני המקרים. <b>אימות מהיר</b> שלמעלה הוא אותו פקד עצמו עבור full מול fast.</td></tr>
 <tr><td><code>auto_retry_mins</code></td><td>ההמתנה לפני הניסיון החוזר האוטומטי <em>היחיד</em> שכישלון ראשון עם מאמרים חסרים מקבל (ברירת מחדל 20). השהיית התפוצה היא סיבה אמיתית למאמרים חסרים והיא נפתרת מעצמה; בזכות היומן, ההרצה החוזרת מביאה רק את מה שעדיין חסר. כישלונות בגלל סיסמה או הסרה לעולם אינם נכללים.</td></tr>
 <tr><td><code>index_scan_par</code></td><td>כמה קבוצות המאנדקס סורק במקביל (ברירת מחדל 3, מוגבל ל-1-8).</td></tr>
 <tr><td><code>oracle_sample</code></td><td>תקציב ה-STAT בהמתנה של אורקל הזמינות (<a href="#oracle">§13</a>), בדיקות לשעה לכל שרת. ברירת מחדל 300, מקסימום 3600, <code>0</code> מכבה את הדגימה לחלוטין.</td></tr>
-</table>
+<tr><td><code>predb_max_rows</code></td><td>כמה הכרזות pre טבלת ההזנה שומרת (ברירת מחדל 250000, מוגבל לטווח 10000-5000000). הגיזום השעתי מקצר למספר הזה, והייבוא ההיסטורי מסרב להתחיל אם היה חורג ממנו, כך שייבוא לעולם אינו מוסיף שורות שהגיזום הבא ימחק.</td></tr>
+<tr><td><code>predb_seed_days</code></td><td>עד כמה אחורה מגיע ייבוא היסטורי שהופעל בלי חלון משלו (ברירת מחדל 180 יום, לכל היותר 366). חלון גדול יותר פירושו יותר בקשות למקור ה-pre, שקצבו בקשה אחת לכל שתי שניות.</td></tr>
+</table></div>
 <h2 id="automation">10 · אוטומציה</h2>
 <h3>רשימת מעקב</h3>
 <p>האוטומציה הפשוטה ביותר: הוסף כותר בלוח המחוונים, קבע העדפות איכות,
@@ -705,22 +728,22 @@ indexers כדי שתוכל לחפש בהם מהקיר. הפעל את זה אם �
 <p>nzbfast מיישם את <em>שני</em> פרוטוקולי השליטה-מרחוק המרכזיים, כך שכמעט כל
 אפליקציית נייד/טאבלט עובדת. בחר את הפרוטוקול שהאפליקציה שלך תומכת בו:</p>
 <h3>אפליקציות שדוברות NZBGet (nzb360, LunaSea, NZB Unity…)</h3>
-<table>
+<div class="tblwrap"><table>
 <tr><th>שדה באפליקציה</th><th>ערך</th></tr>
 <tr><td>סוג</td><td>NZBGet</td></tr>
 <tr><td>מארח / פורט</td><td>המכונה שלך : <b>6789</b></td></tr>
 <tr><td>שם משתמש</td><td>כל דבר (לדוגמה <code>nzbfast</code>)</td></tr>
 <tr><td>סיסמה</td><td>ה-<b>מפתח API</b> שלך</td></tr>
-</table>
+</table></div>
 <p>כל משטח ה-JSON-RPC שהאפליקציות האלה משתמשות בו מוגש: סטטוס, תור עם
 סידור מחדש/השהיה/מחיקה, היסטוריה, הוספת-NZB, מגבלת מהירות, השהיה/חידוש, יומן.</p>
 <h3>אפליקציות שדוברות SABnzbd</h3>
-<table>
+<div class="tblwrap"><table>
 <tr><th>שדה באפליקציה</th><th>ערך</th></tr>
 <tr><td>סוג</td><td>SABnzbd</td></tr>
 <tr><td>מארח / פורט</td><td>המכונה שלך : <b>6789</b></td></tr>
 <tr><td>מפתח API</td><td>מפתח ה-API שלך (או מפתח ה-NZB לגישת הוספה-בלבד)</td></tr>
-</table>
+</table></div>
 <h3>לוח המחוונים בטלפון שלך</h3>
 <p>פשוט פתח את <code>http://&lt;machine&gt;:6789</code> בדפדפן נייד - כל
 לוח המחוונים והקיר בעלי פריסת מגע. פאנל Settings → Remote access מציג
@@ -786,13 +809,13 @@ indexers כדי שתוכל לחפש בהם מהקיר. הפעל את זה אם �
 חינם, ובמשימות גדולות אתה יכול למדוד אותה.</p>
 <p>נמדד על מכונה אחת וקו אחד (M1 Ultra, 10 GbE), אותם קבצים בכל
 תקציב. כל הרצה הפיקה תוצאה נכונה, מאומתת במלואה, מחולצת:</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>גודל משימה</th><th>שפע RAM</th><th>תקציב 2 GB<br><span class="dim">≈ מכונת 8 GB</span></th><th>תקציב 1 GB<br><span class="dim">≈ מכונת 4 GB</span></th><th>תקציב 256 MB<br><span class="dim">≈ NAS של 2 GB</span></th></tr>
 <tr><td>7 GB</td><td>15 s</td><td>15 s</td><td>15 s</td><td>15 s</td></tr>
 <tr><td>35 GB</td><td>65 s</td><td>70 s</td><td>70 s</td><td>65 s</td></tr>
 <tr><td>87 GB</td><td>148 s</td><td>206 s <span class="dim">+39%</span></td><td>196 s <span class="dim">+32%</span></td><td>180 s <span class="dim">+22%</span></td></tr>
 <tr><td>190 GB</td><td>330 s</td><td>427 s <span class="dim">+29%</span></td><td>402 s <span class="dim">+22%</span></td><td>411 s <span class="dim">+25%</span></td></tr>
-</table>
+</table></div>
 <p>שיא הזיכרון עוקב אחר <em>התקציב</em>, לא אחר המשימה: אותה הורדת 190 GB מסתיימת
 בכ-1.1 GB של RAM. מה שאתה מוותר עליו תמורתו הוא זמן - ורק במשימות גדולות.</p>
 <ul>
@@ -839,9 +862,55 @@ indexers כדי שתוכל לחפש בהם מהקיר. הפעל את זה אם �
 עדכונים עושה את אותו הדבר.</li>
 </ul>
 
+<h3 id="updating">עדכון בלי לאבד את ההגדרות</h3>
+<p>כלל אחד מכסה כל התקנה: <b>עדכון מחליף את התוכנה, לעולם לא את ההגדרות
+שלך.</b> כל מה שהגדרת - שרתים, נתיבים, מפתח ה-API, התור - חי בקומץ קבצים
+בתיקייה אחת (<a href="#files">§17</a>), ושום מתקין, משיכת אימג' או שדרוג
+חבילה לא נוגעים בתיקייה הזו. כשההגדרות בכל זאת נראות נעלמות אחרי עדכון, זה
+כמעט תמיד משום שההתקנה החדשה קוראת תיקייה <em>אחרת, ריקה</em>, לא משום
+שמשהו נמחק; הקבצים הישנים עדיין נמצאים היכן שתמיד היו.
+<a href="#settings-gone">§18</a> מכיל את צעדי השחזור.</p>
+<div class="tblwrap"><table>
+<tr><th>התקנה</th><th>איך מעדכנים</th></tr>
+<tr><td>אפליקציית macOS</td><td>פתח את ה-DMG החדש וגרור את <b>NzbFast</b> אל
+<b>Applications</b>, תוך החלפת הישן. תיקיית הנתונים שלך נפרדת ואינה
+נפגעת.</td></tr>
+<tr><td>מתקין Windows</td><td>הרץ את תוכנית ההתקנה החדשה מעל ההתקנה הישנה.
+תיקיית הנתונים שלך נפרדת ואינה נפגעת.</td></tr>
+<tr><td>Docker (שורת פקודה)</td><td><code>docker pull nzbfast/nzbfast</code>,
+הסר את הקונטיינר הישן, ואז הרץ את החדש עם <b>בדיוק אותם מיפויי
+<code>-v</code></b>. האימג' הוא בר-החלפה; תיקיית ה-<code>/config</code>
+הממופה היא ההתקנה שלך. אם פקודת ההרצה שלך משתמשת בנתיב יחסי כמו
+<code>-v ./config:/config</code>, הרץ אותה מאותה תיקייה בכל פעם - מכל מקום
+אחר, <code>./config</code> היא תיקייה אחרת, ריקה.</td></tr>
+<tr><td>Docker Compose</td><td><code>docker compose pull &amp;&amp; docker compose
+up -d</code>, עם אותו קובץ compose באותו מקום. ה-<code>./config</code>
+שבקובץ מעוגן לתיקייה של הקובץ עצמו, אז השאר את הקובץ היכן שהוא.</td></tr>
+<tr><td>Watchtower</td><td>אין מה לעשות: הוא יוצר מחדש את הקונטיינר עם אותם
+מיפויים כשיוצא אימג' חדש.</td></tr>
+<tr><td>Unraid</td><td>לשונית Docker → <b>Check for Updates</b> → <b>Apply
+Update</b>. לעולם אל תסיר ותוסיף מחדש את האפליקציה כדי לעדכן אותה; אם אי
+פעם בכל זאת תתקין מחדש, שמור על אותו נתיב appdata כדי שהיא תמצא את
+ה-<code>/config</code> הקיים שלך.</td></tr>
+<tr><td>Synology (Container Manager)</td><td>הורד את האימג' החדש, עצור את
+הקונטיינר, וצור אותו מחדש עם אותן הגדרות אחסון - המדריך של Synology מלווה
+זאת קליק אחר קליק, כולל ביצוע לפי לוח זמנים.</td></tr>
+<tr><td>Synology (חבילה)</td><td>התקן את ה-<code>.spk</code> החדש
+ב-Package Center; הוא משתדרג במקומו.</td></tr>
+<tr><td>Homebrew</td><td><code>brew upgrade nzbfast</code></td></tr>
+<tr><td>קובץ בינארי רגיל</td><td>החלף את הקובץ הבינארי. התצורה שלך נשארת
+היכן שיצרת אותה (<a href="#files">§17</a>).</td></tr>
+</table></div>
+<div class="tip"><b>טיפ</b>משתמשי Docker שמחברים Sonarr או Radarr: שימו את
+מפתח ה-API בהגדרת הקונטיינר עצמה
+(<code>-e NZBFAST_APIKEY=…</code>, או בלוק ה-environment של קובץ ה-compose
+שלכם או של תבנית ה-Unraid). מפתח ששמור שם שורד כל תקלת קונטיינר, כי הוא חי
+על המארח, בתוך ההגדרה, ומוחל מחדש בכל הפעלה. מפתח שתקבעו מאוחר יותר
+בהגדרות עדיין גובר עליו.</div>
+
 <h2 id="cli">15 · שורת הפקודה</h2>
 <p>כל מה שהדימון עושה ניתן גם לסקריפטינג. הפקודות היומיומיות:</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>פקודה</th><th>מטרה</th></tr>
 <tr><td><code>nzbfast setup</code></td><td>הגדרת שרת אינטראקטיבית.</td></tr>
 <tr><td><code>nzbfast serve</code></td><td>הרץ את הדימון (לוח מחוונים + API + אוטומציה). <code>--open</code> פותח את הדפדפן; <code>--apikey</code> קובע את המפתח ידנית (<a href="#firstrun-key">§2</a>); <code>--bind</code> בוחר את כתובת ההאזנה, ברירת המחדל <code>0.0.0.0</code> (כל ממשק), <code>127.0.0.1</code> למכונה זו בלבד. ראה <code>--help</code> לרשימת הדגלים המלאה - לכל הגדרת לוח מחוונים יש דגל תאום.</td></tr>
@@ -851,10 +920,11 @@ indexers כדי שתוכל לחפש בהם מהקיר. הפעל את זה אם �
 <tr><td><code>nzbfast sysbench</code></td><td>בדיקת ביצועי המערכת + דוח גיוון, בטרמינל.</td></tr>
 <tr><td><code>nzbfast index / search</code></td><td>סרוק קבוצות לאינדקס / חפש בו, בלי הדימון.</td></tr>
 <tr><td><code>nzbfast import-sab</code></td><td>ייבא שרתים מ-ini של SABnzbd.</td></tr>
-</table>
+</table></div>
 <p class="dim">זמינות גם: <code>inspect</code>, <code>probe</code>,
 <code>bench</code>, <code>bench-cpu</code>, <code>soak</code>, <code>fetch</code>,
 <code>spots</code>/<code>spot-search</code>/<code>spot-get</code> (Spotnet),
+<code>predb-seed</code> (ממלא את מסד ה-pre בתקופה שלפני הפעלת ההזנה),
 <code>make-release-nzb</code>/<code>make-test-nzb</code> (מתקני בדיקה). כל
 פקודה מקבלת <code>--config</code> ו-<code>--help</code>. אליהם מצטרפת <code>post</code>: היא מעלה קבצים כמאמרי yEnc
 וכותבת את ה-NZB המתאים. כלי תפעול; היא דורשת <code>--post-server</code> מפורש ולעולם
@@ -865,7 +935,7 @@ indexers כדי שתוכל לחפש בהם מהקיר. הפעל את זה אם �
 תואם-SABnzbd, כך שאינטגרציות SAB קיימות עובדות ללא שינוי. שני מפתחות:
 <b>מפתח ה-API</b> (שליטה מלאה) ו<b>מפתח ה-NZB</b> (הוספה בלבד:
 <code>addfile</code>/<code>addurl</code>). <code>addnzblnk</code> אינו נכלל בכוונה בקבוצת ההוספה בלבד: פענוח קישור עלול לצרוך מכסת אינדקסר נמדדת, וזה לא עניינו של אישור שנועד להוספה בלבד.</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>תחום</th><th>מצבים</th></tr>
 <tr><td>תור</td><td><code>queue</code> (עם <code>name=delete/pause/resume/priority/switch</code>), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>addnzblnk</code>, <code>retry</code>, <code>set_password</code></td></tr>
 <tr><td>מידע</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code></td></tr>
@@ -875,10 +945,24 @@ indexers כדי שתוכל לחפש בהם מהקיר. הפעל את זה אם �
 <tr><td>אבחון</td><td><code>sysbench</code>, <code>bench_history</code>, <code>connladder</code>, <code>pooltest</code>, <code>diversity</code>, <code>update_check</code>, <code>update_apply</code></td></tr>
 <tr><td>NZBGet JSON-RPC</td><td><code>/jsonrpc</code> - status, listgroups, history, append, editqueue, rate, pause, log (אימות Basic: כל משתמש, מפתח API כסיסמה)</td></tr>
 <tr><td>תצוגה מקדימה / ניגון</td><td><code>/stream/&lt;nzo_id&gt;</code> (טווחי HTTP; הפעלת משימת ספרייה חונה דורשת אסימון <code>?t=</code> או מפתח), <code>/m3u/&lt;id&gt;</code> (דורש מפתח; יוצר את האסימון), <code>/wall</code>, <code>/art/…</code></td></tr>
-</table>
+</table></div>
 
 <h2 id="files">17 · קבצים ומיקומים</h2>
-<table>
+<p>היכן נמצאת תיקיית ההגדרות תלוי באופן שבו nzbfast הותקן. התיקייה האחת
+הזו מכילה את כל מה ששווה לגבות:</p>
+<div class="tblwrap"><table>
+<tr><th>התקנה</th><th>תיקיית ההגדרות</th></tr>
+<tr><td>אפליקציית macOS</td><td><code>~/Library/Application Support/nzbfast/</code></td></tr>
+<tr><td>Windows</td><td><code>%LOCALAPPDATA%\nzbfast\</code></td></tr>
+<tr><td>קונטיינרים של Docker / NAS</td><td><code>/config</code> בתוך
+הקונטיינר, שהיא תיקיית המארח שמיפית אליו. ב-Unraid זו תיקיית ה-appdata של
+האפליקציה.</td></tr>
+<tr><td>חבילת Synology</td><td><code>/var/packages/nzbfast/var/</code></td></tr>
+<tr><td>טרמינל</td><td>התיקייה שבה הרצת <code>nzbfast setup</code>, או לאן
+ש-<code>--config</code> / <code>$NZBFAST_CONFIG</code> מצביע.</td></tr>
+</table></div>
+<p>ומה נמצא בתוכה:</p>
+<div class="tblwrap"><table>
 <tr><th>קובץ</th><th>תוכן</th></tr>
 <tr><td><code>config.local.json</code></td><td>אישורי שרת ואפשרויות לכל שרת. נוצר על ידי האשף; ניתן לעריכה ב-Settings. שמור אותו פרטי. הסיסמאות <a href="#passwords">מעורפלות, לא מוצפנות</a>.</td></tr>
 <tr><td><code>settings.json</code></td><td>כל הגדרה ששונתה בלוח המחוונים. חי ליד התצורה; ערכי הממשק עוקפים דגלי שורת-פקודה. מחק מפתח (או את הקובץ) כדי לחזור לדגלים/ברירות מחדל.</td></tr>
@@ -887,10 +971,10 @@ indexers כדי שתוכל לחפש בהם מהקיר. הפעל את זה אם �
 <tr><td><code>&lt;config&gt;/.spool/</code></td><td>מצב התור (שורד הפעלות מחדש), קובצי NZB לכל משימה, יומן שימוש, היסטוריית בדיקות ביצועים, מטמון אמנות פוסטרים.</td></tr>
 <tr><td>יומן מאמרים</td><td>בתוך תיקיית הפלט של כל משימה בזמן שהיא לא שלמה - מפעיל חידוש לאחר קריסה וניסיון חוזר. מוסר בהצלחה.</td></tr>
 <tr><td>כלים חיצוניים</td><td>אין צורך בשום דבר - חילוץ RAR ותיקון PAR2 מקוריים. אם סט אקזוטי אי פעם צריך <code>unrar</code> או <code>par2</code> חיצוני כנפילה לאחור, nzbfast מחפש ליד קובץ ההפעלה שלו, ואז ב-<code>$PATH</code>.</td></tr>
-</table>
+</table></div>
 
 <h2 id="troubleshooting">18 · פתרון תקלות</h2>
-<table>
+<div class="tblwrap"><table>
 <tr><th>תסמין</th><th>בדוק</th></tr>
 <tr><td>הורדות איטיות</td><td>הרץ <b>בדיקת ביצועי מערכת</b> - היא נוקבת בצוואר הבקבוק במפורש. אם זו רשת: הרץ <b>כוונון חיבורים</b>, בדוק מספרי חיבורים לכל שרת, וודא שהספקים שלך אינם כולם עמוד שדרה אחד (<b>גיוון שרתים</b>).</td></tr>
 <tr><td>איטי רק במשימות גדולות מאוד<br>(NAS או מכונת RAM-נמוך)</td><td>צפוי, וניתן למדידה: תקציב זיכרון מורעב מגלים מטמונים לדיסק ועולה 20–40% מעבר ל-~87 GB. ראה <a href="#memory">תקציב זיכרון</a> למספרים וכמה RAM לתת לו. משימות קטנות יותר לא מושפעות.</td></tr>
@@ -901,12 +985,13 @@ indexers כדי שתוכל לחפש בהם מהקיר. הפעל את זה אם �
 <tr><td>ארכיון לא נחלץ</td><td>כשלי סיסמה ותיקון מציגים את עצמם בשורת ההיסטוריה. לכל השאר יש פתח מילוט: הגדרות → תיקיית מעקב ועיבוד לאחר הורדה → <b>חילוץ עם unrar חיצוני</b> (הגדרה מתקדמת) מוסר את החילוץ לתוכנת <code>unrar</code> המותקנת במחשב שלך במקום המחלץ המובנה. אחרת השאירו כבוי: הנתיב המובנה מהיר יותר בכל צורה שמדדנו, ופרסומים מוסווים עם שמות hash תמיד משתמשים בו ממילא, כי unrar אינו יכול לעקוב אחר שינויי השמות שלהם. אותו מתג עבור הרצות <code>nzbfast get</code> הוא משתנה הסביבה <code>NZBFAST_NO_NATIVE_UNRAR=1</code>. אם unrar חילץ ארכיון שהמחלץ המובנה סירב לו, אנא דווחו כדי שנתקן את הנתיב המובנה.</td></tr>
 <tr><td>Sonarr/Radarr לא מצליחים להתחבר</td><td>פורט 6789 נגיש? מפתח API נכון (מפתח מלא, לא מפתח NZB)? סוג הקליינט מוגדר ל-SABnzbd?</td></tr>
 <tr><td>לוח המחוונים מבקש מפתח API שמעולם לא קבעתי</td><td>התקנה חדשה יוצרת אחד לעצמה ומדפיסה אותו פעם אחת בהפעלה (<a href="#firstrun-key">§2</a>). הוא נמצא בקובץ <code>apikey</code> ליד התצורה שלך, וגם בפלט ההפעלה. או הקלד מפתח משלך ב-Settings → Security מדפדפן שכבר מחובר.</td></tr>
+<tr id="settings-gone"><td>כל ההגדרות שלי נראות נעלמות אחרי עדכון<br>(שרתים, נתיבים, מפתח API)</td><td>שום דבר בעדכון לא מוחק הגדרות; זה אומר ש-nzbfast קורא תיקייה אחרת, ריקה. ראשית: שדה מפתח ה-API בהגדרות מוצג ריק בכוונה - לחץ <b>Show</b> לפני שתסיק שהוא אבד. ב-Docker, השווה את מיפוי ה-<code>/config</code> של הקונטיינר החדש לזה של הישן: נתיב מארח ששונה, נתיב יחסי שהורץ מתיקייה אחרת, או תיקיית appdata טרייה - כולם מתחילים את nzbfast מאפס בעוד ההגדרות האמיתיות שלך יושבות ללא פגע בנתיב הקודם. מצא את התיקייה הישנה (חפש את <code>settings.json</code>, את קובץ התצורה שלך ואת <code>apikey</code> - המיקומים ב-<a href="#files">§17</a>), ואז הפנה את המיפוי חזרה אליה, או העתק את הקבצים האלה לתיקייה החדשה והפעל מחדש. יומן ההפעלה נוקב בקובץ ההגדרות המדויק שבשימוש: <code>[settings] applying saved settings from …</code></td></tr>
 <tr><td>שום דבר ברשת לא מצליח להגיע לדימון</td><td>בדוק את <code>--bind</code>: <code>127.0.0.1</code> משרת רק את המכונה שעליה nzbfast רץ. ברירת המחדל, <code>0.0.0.0</code>, משרתת כל ממשק. אחר כך בדוק את חומת האש של המכונה עצמה עבור פורט 6789.</td></tr>
 <tr><td>כרטיס העיון נשאר קטן</td><td>האינדקסר גדל ברקע - בדוק שקבוצות Settings → Indexing מוגדרות, ותן ל-העמקה בכל סריקה זמן לצבור היסטוריה. "סרוק עכשיו" מכריח מעבר; שורת הסטטוס מציגה התקדמות חיה.</td></tr>
 <tr><td>הקיר מציג אמנות שגויה/חסרה</td><td>גיליון פרטים → ✎ תקן התאמה או ↻ רענן מטא-נתונים. חיפושי סרטים משתפרים עם מפתח OMDb חינמי.</td></tr>
 <tr><td>הדימון לא מתחיל: פורט בשימוש</td><td>מופע אחר רץ - או שנה את <code>--port</code>.</td></tr>
 <tr><td>איפה היומנים?</td><td>כרטיס היומן בלוח המחוונים, או הטרמינל/קובץ היומן שאיתו הפעלת <code>serve</code>.</td></tr>
-</table>
+</table></div>
 <div class="note"><b>עדיין תקוע?</b>כרטיס היומן בדרך כלל נוקב באשם -
 כלול את הזנב שלו כשאתה מדווח על בעיה, יחד עם
 <code>nzbfast --version</code> שלך.</div>

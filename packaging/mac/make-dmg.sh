@@ -32,7 +32,11 @@ trap 'hdiutil detach "/Volumes/$VOL" -quiet 2>/dev/null || true' EXIT
 mkdir -p "$STAGE/.background" "$STAGE/.extras"
 cp -R "$APP" "$STAGE/NzbFast.app"
 ln -s /Applications "$STAGE/Applications"
-cp "$REPO/docs/MANUAL.html" "$STAGE/.extras/MANUAL.html"
+# Substituted, not copied raw: docs/MANUAL.html carries the shared
+# design tokens as a placeholder the DAEMON fills in when it serves
+# /manual. A raw copy shows the marker as body text and styles itself
+# against variables that were never declared.
+"$REPO/packaging/make-offline-manual.sh" "$REPO/docs/MANUAL.html" "$STAGE/.extras/MANUAL.html"
 cp "$REPO/LICENSE" "$STAGE/.extras/LICENSE"
 cp "$REPO/COPYRIGHT.md" "$STAGE/.extras/COPYRIGHT.md"
 cp "$APP/Contents/Resources/NzbFast.icns" "$STAGE/.VolumeIcon.icns"

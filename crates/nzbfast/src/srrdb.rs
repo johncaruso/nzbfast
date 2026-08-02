@@ -23,6 +23,7 @@
 //! never asks twice, a token bucket in front, and silence on every
 //! error. Nothing here retries.
 
+use crate::MutexExt;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -106,11 +107,11 @@ fn cache() -> &'static Mutex<HashMap<u32, Option<SrrHit>>> {
 /// fallback is the name it already had, so the three do not need telling
 /// apart.
 pub fn archive_crc(crc: u32) -> Option<SrrHit> {
-    if let Some(cached) = cache().lock().unwrap_or_else(|e| e.into_inner()).get(&crc) {
+    if let Some(cached) = cache().lock_ok().get(&crc) {
         return cached.clone();
     }
     let hit = fetch(crc);
-    cache().lock().unwrap_or_else(|e| e.into_inner()).insert(crc, hit.clone());
+    cache().lock_ok().insert(crc, hit.clone());
     hit
 }
 
@@ -170,7 +171,10 @@ mod tests {
 
     #[test]
     fn empty_and_malformed_answers_are_no_answer() {
-        assert_eq!(parse_archive_crc(r#"{"results":[],"resultsCount":0}"#), None);
+        assert_eq!(
+            parse_archive_crc(r#"{"results":[],"resultsCount":0}"#),
+            None
+        );
         assert_eq!(parse_archive_crc(r#"{"results":[{"imdbId":"1"}]}"#), None);
         assert_eq!(parse_archive_crc(r#"{"results":[{"release":"  "}]}"#), None);
         assert_eq!(parse_archive_crc("not json at all"), None);

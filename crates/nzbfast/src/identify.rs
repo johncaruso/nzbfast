@@ -81,6 +81,7 @@
 //! the part that was always going to earn its keep.
 
 use crate::ratelimit::{self, Provider};
+use tracing::warn;
 
 /// One film a catalogue offered as a possibility.
 #[derive(Debug, Clone, PartialEq)]
@@ -112,7 +113,6 @@ impl std::fmt::Display for Candidate {
 /// agreeing.
 #[derive(Debug, Clone)]
 pub struct SourceResult {
-    pub source: &'static str,
     /// Candidates inside the runtime WINDOW, before the exact-minute
     /// rule. This is what the shortlist shows the user.
     pub window: Vec<Candidate>,
@@ -250,7 +250,11 @@ pub fn identify(
         results.push(tmdb_candidates(key, years, minutes, lang));
     }
     let verdict = decide(minutes, &results);
-    Outcome { verdict, facts: rendered, shortlist: shortlist(minutes, &results) }
+    Outcome {
+        verdict,
+        facts: rendered,
+        shortlist: shortlist(minutes, &results),
+    }
 }
 
 /// The acceptance gate, pure and total over what the sources returned.
@@ -324,12 +328,16 @@ fn shortlist(minutes: u32, results: &[SourceResult]) -> Vec<String> {
     all.sort_by(|a, b| {
         let d = |c: &Candidate| c.runtime_min.abs_diff(minutes);
         d(a).cmp(&d(b))
-            .then_with(|| a.title.to_ascii_lowercase().cmp(&b.title.to_ascii_lowercase()))
+            .then_with(|| {
+                a.title
+                    .to_ascii_lowercase()
+                    .cmp(&b.title.to_ascii_lowercase())
+            })
             .then(a.year.cmp(&b.year))
     });
     for c in all {
         let key = nzbkit::release::norm_title(&c.title);
-        if seen.iter().any(|s| *s == key) {
+        if seen.contains(&key) {
             continue;
         }
         seen.push(key);
@@ -352,7 +360,7 @@ fn render_facts(f: &nzbkit::media::MediaFacts) -> String {
         parts.push(format!("{:.0}s", s));
     }
     if let (Some(w), Some(h)) = (f.width, f.height) {
-        parts.push(format!("{}", nzbkit::mkv::res_bucket(w, h)));
+        parts.push(nzbkit::mkv::res_bucket(w, h).to_string());
     }
     if let Some(v) = &f.video_codec {
         parts.push(v.clone());
@@ -377,13 +385,11 @@ fn render_facts(f: &nzbkit::media::MediaFacts) -> String {
 /// under two seconds.
 const QLEVER: &str = "https://qlever.cs.uni-freiburg.de/api/wikidata";
 
-fn wikidata_candidates(
-    years: (u32, u32),
-    minutes: u32,
-    lang: Option<&str>,
-) -> SourceResult {
-    let mut out =
-        SourceResult { source: "wikidata", window: Vec::new(), answered: false };
+fn wikidata_candidates(years: (u32, u32), minutes: u32, lang: Option<&str>) -> SourceResult {
+    let mut out = SourceResult {
+        window: Vec::new(),
+        answered: false,
+    };
     let sparql = wikidata_sparql(years, minutes, lang);
     ratelimit::acquire(Provider::WikidataQlever);
     let url = format!("{QLEVER}?query={}", percent_encode(&sparql));
@@ -407,7 +413,7 @@ fn wikidata_candidates(
                     .unwrap_or(if *code == 429 { 30 } else { 5 });
                 ratelimit::penalise(Provider::WikidataQlever, wait);
             }
-            eprintln!("[identify] wikidata: {e}");
+            warn!(target: "identify", "wikidata: {e}");
             return out;
         }
     };
@@ -428,16 +434,20 @@ fn wikidata_candidates(
             .as_str()
             .and_then(|s| s.parse::<f64>().ok())
             .map(|m| m.round());
-        let year = row["y"]["value"].as_str().and_then(|s| s.parse::<u32>().ok());
-        let (Some(mins), Some(year)) = (mins, year) else { continue };
+        let year = row["y"]["value"]
+            .as_str()
+            .and_then(|s| s.parse::<u32>().ok());
+        let (Some(mins), Some(year)) = (mins, year) else {
+            continue;
+        };
         if title.is_empty() || !(0.0..=1000.0).contains(&mins) {
             continue;
         }
         out.window.push(Candidate {
+            source: "wikidata",
             title: title.to_string(),
             year,
             runtime_min: mins as u32,
-            source: "wikidata",
             // ".../entity/Q116921951" -> "Q116921951"
             id: row["film"]["value"]
                 .as_str()
@@ -505,13 +515,11 @@ fn lang_clause(lang: Option<&str>) -> String {
 /// agreement between them is worth something: two catalogues that
 /// independently publish the same exact minute for the same film are
 /// much harder to both be wrong about than one.
-fn tmdb_candidates(
-    key: &str,
-    years: (u32, u32),
-    minutes: u32,
-    lang: Option<&str>,
-) -> SourceResult {
-    let mut out = SourceResult { source: "tmdb", window: Vec::new(), answered: false };
+fn tmdb_candidates(key: &str, years: (u32, u32), minutes: u32, lang: Option<&str>) -> SourceResult {
+    let mut out = SourceResult {
+        window: Vec::new(),
+        answered: false,
+    };
     let lo = minutes.saturating_sub(RUNTIME_WINDOW_MIN);
     let hi = minutes + RUNTIME_WINDOW_MIN;
     let mut any_failed = false;
@@ -563,10 +571,11 @@ fn tmdb_candidates(
                 // above exists because rate-limiting is expected.
                 match &e {
                     ureq::Error::Status(code, _) => {
-                        eprintln!("[identify] tmdb: status code {code}")
+                        warn!(target: "identify", "tmdb: status code {code}")
                     }
-                    ureq::Error::Transport(t) => eprintln!(
-                        "[identify] tmdb: {}{}",
+                    ureq::Error::Transport(t) => warn!(
+                        target: "identify",
+                        "tmdb: {}{}",
                         t.kind(),
                         t.message().map(|m| format!(": {m}")).unwrap_or_default(),
                     ),
@@ -591,12 +600,16 @@ fn tmdb_candidates(
         // unexpectedly large one is a reason to decline, not to spend a
         // hundred requests.
         for hit in rows.iter().take(DETAIL_BUDGET) {
-            let Some(id) = hit["id"].as_i64() else { continue };
+            let Some(id) = hit["id"].as_i64() else {
+                continue;
+            };
             let title = hit["title"].as_str().unwrap_or("").trim().to_string();
             if title.is_empty() {
                 continue;
             }
-            let Some(runtime) = tmdb_runtime(key, id) else { continue };
+            let Some(runtime) = tmdb_runtime(key, id) else {
+                continue;
+            };
             if !(lo..=hi).contains(&runtime) {
                 continue;
             }
@@ -638,7 +651,7 @@ fn tmdb_runtime(key: &str, id: i64) -> Option<u32> {
         .ok()?;
     let v: serde_json::Value = serde_json::from_str(&body).ok()?;
     let mins = v["runtime"].as_i64()?;
-    (mins > 0).then(|| mins as u32)
+    (mins > 0).then_some(mins as u32)
 }
 
 /// Minimal percent-encoding for a SPARQL query in a URL. Everything not
@@ -710,8 +723,11 @@ mod tests {
         }
     }
 
-    fn answered(source: &'static str, window: Vec<Candidate>) -> SourceResult {
-        SourceResult { source, window, answered: true }
+    fn answered(window: Vec<Candidate>) -> SourceResult {
+        SourceResult {
+            window,
+            answered: true,
+        }
     }
 
     #[test]
@@ -719,19 +735,33 @@ mod tests {
         // The window holds neighbours; only one sits on the exact minute.
         // That is worth telling the user and is NOT worth renaming on -
         // see the module docs for the real file this rule comes from.
-        let r = answered(
-            "wikidata",
-            vec![
-                cand("wikidata", "Supergirl", 2026, 108),
-                cand("wikidata", "Holland", 2025, 110),
-                cand("wikidata", "Sunny Dancer", 2026, 106),
-            ],
-        );
+        let r = answered(vec![
+            cand("wikidata", "Supergirl", 2026, 108),
+            cand("wikidata", "Holland", 2025, 110),
+            cand("wikidata", "Sunny Dancer", 2026, 106),
+        ]);
         let v = decide(108, &[r]);
-        assert_eq!(v, Verdict::Uncorroborated { title: "Supergirl".into(), year: 2026 });
-        let o = Outcome { verdict: v, facts: String::new(), shortlist: vec![] };
-        assert_eq!(o.accepted_name(), None, "an uncorroborated hit must not rename");
-        assert!(o.log_line().contains("Supergirl"), "but it must be reported");
+        assert_eq!(
+            v,
+            Verdict::Uncorroborated {
+                title: "Supergirl".into(),
+                year: 2026
+            }
+        );
+        let o = Outcome {
+            verdict: v,
+            facts: String::new(),
+            shortlist: vec![],
+        };
+        assert_eq!(
+            o.accepted_name(),
+            None,
+            "an uncorroborated hit must not rename"
+        );
+        assert!(
+            o.log_line().contains("Supergirl"),
+            "but it must be reported"
+        );
     }
 
     /// The measured false positive that made corroboration mandatory.
@@ -743,20 +773,22 @@ mod tests {
     /// one survivor, total confidence, wrong film.
     #[test]
     fn a_lone_catalogue_hit_on_the_wrong_film_does_not_rename() {
-        let wd = answered(
-            "wikidata",
-            vec![
-                cand("wikidata", "The Wings of a Serf", 1926, 79),
-                cand("wikidata", "The General", 1926, 75),
-            ],
-        );
+        let wd = answered(vec![
+            cand("wikidata", "The Wings of a Serf", 1926, 79),
+            cand("wikidata", "The General", 1926, 75),
+        ]);
         let v = decide(79, &[wd]);
         assert!(
             !matches!(v, Verdict::Named { .. }),
             "a lone catalogue hit renamed The General to something else: {v:?}"
         );
         assert_eq!(
-            Outcome { verdict: v, facts: String::new(), shortlist: vec![] }.accepted_name(),
+            Outcome {
+                verdict: v,
+                facts: String::new(),
+                shortlist: vec![]
+            }
+            .accepted_name(),
             None
         );
     }
@@ -765,13 +797,10 @@ mod tests {
     fn two_films_on_the_same_minute_name_neither() {
         // The measured common case: exact runtime alone is not unique.
         // Precision over recall means this declines rather than guesses.
-        let r = answered(
-            "wikidata",
-            vec![
-                cand("wikidata", "Supergirl", 2026, 108),
-                cand("wikidata", "Mountainhead", 2025, 108),
-            ],
-        );
+        let r = answered(vec![
+            cand("wikidata", "Supergirl", 2026, 108),
+            cand("wikidata", "Mountainhead", 2025, 108),
+        ]);
         assert_eq!(decide(108, &[r]), Verdict::Ambiguous);
     }
 
@@ -779,32 +808,35 @@ mod tests {
     fn a_window_with_no_exact_match_names_nothing() {
         // Near misses are not matches. A catalogue runtime two minutes
         // off is a different cut, or a different film.
-        let r = answered(
-            "wikidata",
-            vec![cand("wikidata", "Holland", 2025, 110), cand("wikidata", "Papers", 2025, 107)],
-        );
+        let r = answered(vec![
+            cand("wikidata", "Holland", 2025, 110),
+            cand("wikidata", "Papers", 2025, 107),
+        ]);
         assert_eq!(decide(108, &[r]), Verdict::Ambiguous);
         // An empty window is the same answer, reached sooner.
-        assert_eq!(decide(108, &[answered("wikidata", vec![])]), Verdict::Ambiguous);
+        assert_eq!(decide(108, &[answered(vec![])]), Verdict::Ambiguous);
     }
 
     #[test]
     fn two_sources_that_agree_are_what_accepts() {
-        let wd = answered("wikidata", vec![cand("wikidata", "Supergirl", 2026, 108)]);
-        let tm = answered("tmdb", vec![cand("tmdb", "Supergirl", 2026, 108)]);
+        let wd = answered(vec![cand("wikidata", "Supergirl", 2026, 108)]);
+        let tm = answered(vec![cand("tmdb", "Supergirl", 2026, 108)]);
         assert_eq!(
             decide(108, &[wd.clone(), tm]),
-            Verdict::Named { title: "Supergirl".into(), year: 2026 }
+            Verdict::Named {
+                title: "Supergirl".into(),
+                year: 2026
+            }
         );
         // Each source is certain, and they name different films. That is
         // the most dangerous shape this gate sees, and it must decline.
-        let other = answered("tmdb", vec![cand("tmdb", "Mountainhead", 2025, 108)]);
+        let other = answered(vec![cand("tmdb", "Mountainhead", 2025, 108)]);
         assert_eq!(decide(108, &[wd.clone(), other]), Verdict::Ambiguous);
         // A second source that is itself ambiguous also blocks.
-        let vague = answered(
-            "tmdb",
-            vec![cand("tmdb", "Supergirl", 2026, 108), cand("tmdb", "Shelter", 2026, 108)],
-        );
+        let vague = answered(vec![
+            cand("tmdb", "Supergirl", 2026, 108),
+            cand("tmdb", "Shelter", 2026, 108),
+        ]);
         assert_eq!(decide(108, &[wd, vague]), Verdict::Ambiguous);
     }
 
@@ -813,18 +845,24 @@ mod tests {
     /// an outage from reading as agreement.
     #[test]
     fn an_outage_cannot_stand_in_for_corroboration() {
-        let wd = answered("wikidata", vec![cand("wikidata", "Supergirl", 2026, 108)]);
-        let dead = SourceResult { source: "tmdb", window: vec![], answered: false };
+        let wd = answered(vec![cand("wikidata", "Supergirl", 2026, 108)]);
+        let dead = SourceResult {
+            window: vec![],
+            answered: false,
+        };
         assert_eq!(
             decide(108, &[wd, dead]),
-            Verdict::Uncorroborated { title: "Supergirl".into(), year: 2026 }
+            Verdict::Uncorroborated {
+                title: "Supergirl".into(),
+                year: 2026
+            }
         );
     }
 
     #[test]
     fn titles_that_differ_only_in_punctuation_still_agree() {
-        let wd = answered("wikidata", vec![cand("wikidata", "WALL-E", 2008, 98)]);
-        let tm = answered("tmdb", vec![cand("tmdb", "WALL·E", 2008, 98)]);
+        let wd = answered(vec![cand("wikidata", "WALL-E", 2008, 98)]);
+        let tm = answered(vec![cand("tmdb", "WALL·E", 2008, 98)]);
         assert!(matches!(decide(98, &[wd, tm]), Verdict::Named { .. }));
     }
 
@@ -833,13 +871,19 @@ mod tests {
         // The whole point of the `answered` flag: a failed lookup must
         // not be counted as "nobody matched", and must not let a second
         // source's single hit stand as confirmed-by-two.
-        let dead = SourceResult { source: "wikidata", window: vec![], answered: false };
-        assert_eq!(decide(108, &[dead.clone()]), Verdict::NoSource);
+        let dead = SourceResult {
+            window: vec![],
+            answered: false,
+        };
+        assert_eq!(decide(108, std::slice::from_ref(&dead)), Verdict::NoSource);
         assert_eq!(decide(108, &[]), Verdict::NoSource);
         // ...and a live source beside a dead one is one source, so its
         // certainty is reported and not applied.
-        let live = answered("tmdb", vec![cand("tmdb", "Supergirl", 2026, 108)]);
-        assert!(matches!(decide(108, &[dead, live]), Verdict::Uncorroborated { .. }));
+        let live = answered(vec![cand("tmdb", "Supergirl", 2026, 108)]);
+        assert!(matches!(
+            decide(108, &[dead, live]),
+            Verdict::Uncorroborated { .. }
+        ));
     }
 
     #[test]
@@ -851,13 +895,23 @@ mod tests {
             Verdict::Ambiguous,
             Verdict::NoSource,
             Verdict::NoRuntime,
-            Verdict::Uncorroborated { title: "Supergirl".into(), year: 2026 },
+            Verdict::Uncorroborated {
+                title: "Supergirl".into(),
+                year: 2026,
+            },
         ] {
-            let o = Outcome { verdict, facts: "108 min".into(), shortlist: vec![] };
+            let o = Outcome {
+                verdict,
+                facts: "108 min".into(),
+                shortlist: vec![],
+            };
             assert_eq!(o.accepted_name(), None);
         }
         let named = Outcome {
-            verdict: Verdict::Named { title: "Supergirl".into(), year: 2026 },
+            verdict: Verdict::Named {
+                title: "Supergirl".into(),
+                year: 2026,
+            },
             facts: String::new(),
             shortlist: vec![],
         };
@@ -867,10 +921,11 @@ mod tests {
     #[test]
     fn the_shortlist_merges_sources_and_is_capped() {
         let wd = answered(
-            "wikidata",
-            (0..20).map(|i| cand("wikidata", &format!("Film {i:02}"), 2025, 108)).collect(),
+            (0..20)
+                .map(|i| cand("wikidata", &format!("Film {i:02}"), 2025, 108))
+                .collect(),
         );
-        let tm = answered("tmdb", vec![cand("tmdb", "Film 00", 2025, 108)]);
+        let tm = answered(vec![cand("tmdb", "Film 00", 2025, 108)]);
         let list = shortlist(108, &[wd, tm]);
         assert_eq!(list.len(), SHORTLIST_MAX);
         // "Film 00" came from both catalogues and appears once.
@@ -886,15 +941,12 @@ mod tests {
     /// ones, which is what the first real end-to-end run produced.
     #[test]
     fn the_shortlist_leads_with_the_closest_runtimes() {
-        let r = answered(
-            "wikidata",
-            vec![
-                cand("wikidata", "Aardvark", 2025, 110),
-                cand("wikidata", "Zebra", 2025, 108),
-                cand("wikidata", "Badger", 2025, 109),
-                cand("wikidata", "Yak", 2025, 108),
-            ],
-        );
+        let r = answered(vec![
+            cand("wikidata", "Aardvark", 2025, 110),
+            cand("wikidata", "Zebra", 2025, 108),
+            cand("wikidata", "Badger", 2025, 109),
+            cand("wikidata", "Yak", 2025, 108),
+        ]);
         let list = shortlist(108, &[r]);
         // Both exact matches first (alphabetically among themselves),
         // then one minute out, then two.

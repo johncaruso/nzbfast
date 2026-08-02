@@ -13,6 +13,7 @@
 //! single user's traffic learns fast: one Omicron reseller's 430 pattern
 //! predicts every Omicron reseller.
 
+use crate::sync::MutexExt;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -108,11 +109,12 @@ pub fn backbone_of(host: &str) -> String {
         base = l;
         break;
     }
-    let stripped: String = base
-        .chars()
-        .filter(|c| c.is_ascii_alphabetic())
-        .collect();
-    let key = if stripped.is_empty() { base.to_string() } else { stripped };
+    let stripped: String = base.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+    let key = if stripped.is_empty() {
+        base.to_string()
+    } else {
+        stripped
+    };
     for (alias, backbone) in BACKBONE_ALIASES {
         if key == *alias {
             return (*backbone).to_string();
@@ -132,7 +134,11 @@ pub fn group_family(grp: &str) -> String {
         .or_else(|| g.strip_prefix("a.b."))
         .unwrap_or(&g);
     let fam = rest.split('.').next().unwrap_or("").trim();
-    if fam.is_empty() { "misc".to_string() } else { fam.to_string() }
+    if fam.is_empty() {
+        "misc".to_string()
+    } else {
+        fam.to_string()
+    }
 }
 
 /// One aggregated ledger observation, ready to ingest: `host` is the raw
@@ -166,21 +172,21 @@ impl OracleSink {
     /// Install the job context: pool server hosts (pool order) and the
     /// release's group family.
     pub fn set_context(&self, hosts: Vec<String>, family: String) {
-        *self.servers.lock().unwrap() = hosts;
-        *self.family.lock().unwrap() = family;
+        *self.servers.lock_ok() = hosts;
+        *self.family.lock_ok() = family;
     }
 
     /// Record one 222 body served by server `si` for an article
     /// `age_days` old (0 = fresh/unknown - bucketed as fresh; NZBs
     /// without dates are rare enough not to matter).
     pub fn hit(&self, si: usize, age_days: u32) {
-        let mut c = self.counts.lock().unwrap();
+        let mut c = self.counts.lock_ok();
         c.entry((si, age_bucket(age_days))).or_insert((0, 0)).0 += 1;
     }
 
     /// Record one 430/423 from server `si`.
     pub fn miss(&self, si: usize, age_days: u32) {
-        let mut c = self.counts.lock().unwrap();
+        let mut c = self.counts.lock_ok();
         c.entry((si, age_bucket(age_days))).or_insert((0, 0)).1 += 1;
     }
 
@@ -188,14 +194,20 @@ impl OracleSink {
     /// for a server index the context never named are dropped (can't
     /// attribute them).
     pub fn drain(&self) -> Vec<Sample> {
-        let servers = self.servers.lock().unwrap().clone();
-        let family = self.family.lock().unwrap().clone();
-        let counts = std::mem::take(&mut *self.counts.lock().unwrap());
+        let servers = self.servers.lock_ok().clone();
+        let family = self.family.lock_ok().clone();
+        let counts = std::mem::take(&mut *self.counts.lock_ok());
         let mut out: Vec<Sample> = counts
             .into_iter()
             .filter_map(|((si, bucket), (hits, misses))| {
                 let host = servers.get(si)?.clone();
-                Some(Sample { host, family: family.clone(), bucket, hits, misses })
+                Some(Sample {
+                    host,
+                    family: family.clone(),
+                    bucket,
+                    hits,
+                    misses,
+                })
             })
             .collect();
         out.sort_by(|a, b| (&a.host, a.bucket).cmp(&(&b.host, b.bucket)));
@@ -259,8 +271,7 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub fn load(db: &Connection) -> rusqlite::Result<Snapshot> {
-        let mut stmt =
-            db.prepare("SELECT backbone, family, bucket, hits, misses FROM oracle")?;
+        let mut stmt = db.prepare("SELECT backbone, family, bucket, hits, misses FROM oracle")?;
         let cells = stmt
             .query_map([], |r| {
                 Ok((
@@ -348,8 +359,17 @@ impl Snapshot {
                 if hi <= RED_HIGH {
                     // Confidently gone. Keep the bucket with the most
                     // misses (the strongest evidence of the wave).
-                    let cand = Reaped { family: fam.to_string(), bucket: b, hits: h, misses: m };
-                    if best.as_ref().map(|r| cand.misses > r.misses).unwrap_or(true) {
+                    let cand = Reaped {
+                        family: fam.to_string(),
+                        bucket: b,
+                        hits: h,
+                        misses: m,
+                    };
+                    if best
+                        .as_ref()
+                        .map(|r| cand.misses > r.misses)
+                        .unwrap_or(true)
+                    {
                         best = Some(cand);
                     }
                 }
@@ -412,12 +432,7 @@ impl Snapshot {
 
     /// Predicted verdict for a release in `family`, `age_days` old, given
     /// the user's enabled backbones. None = ledger too thin to say.
-    pub fn verdict(
-        &self,
-        backbones: &[String],
-        family: &str,
-        age_days: u32,
-    ) -> Option<Verdict> {
+    pub fn verdict(&self, backbones: &[String], family: &str, age_days: u32) -> Option<Verdict> {
         if backbones.is_empty() {
             return None;
         }

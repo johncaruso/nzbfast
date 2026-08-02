@@ -329,15 +329,20 @@ enable = 1
 
         // Raw JSON: zero-valued keys stay omitted so a plain single-server
         // import still writes a minimal config.
-        let raw: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
         let arr = raw["servers"].as_array().unwrap();
         assert_eq!(arr.len(), 4);
         // [0] = the -5 hand-edit, [1] = the priority-0 primary: neither
         // may emit a `level` key at all.
-        assert!(arr[0].get("level").is_none(), "negative priority must omit level");
+        assert!(
+            arr[0].get("level").is_none(),
+            "negative priority must omit level"
+        );
         assert!(arr[1].get("level").is_none(), "primary must omit level");
-        assert!(arr[1].get("retention_days").is_none(), "no retention key = omit");
+        assert!(
+            arr[1].get("retention_days").is_none(),
+            "no retention key = omit"
+        );
         assert_eq!(arr[2]["level"], 1);
         assert_eq!(arr[3]["retention_days"], 1200);
 
@@ -352,7 +357,10 @@ enable = 1
         assert_eq!(cfg.servers[1].level, 0);
         assert_eq!(cfg.servers[1].retention_days, 0);
         assert_eq!(cfg.servers[2].host, "block.backup.net");
-        assert_eq!(cfg.servers[2].level, 1, "block account must stay a backup tier");
+        assert_eq!(
+            cfg.servers[2].level, 1,
+            "block account must stay a backup tier"
+        );
         assert_eq!(cfg.servers[3].host, "short.filler.org");
         assert_eq!(cfg.servers[3].level, 2);
         assert_eq!(cfg.servers[3].retention_days, 1200);
@@ -360,13 +368,22 @@ enable = 1
         // The ini loader reading the SAME file directly agrees - both
         // import paths converge on the same tiers.
         let direct = nzbkit::config::parse_sabnzbd_ini(INI_TIERS).unwrap();
-        let mut direct: Vec<_> = direct.into_iter().map(|s| (s.host, s.level, s.retention_days)).collect();
+        let mut direct: Vec<_> = direct
+            .into_iter()
+            .map(|s| (s.host, s.level, s.retention_days))
+            .collect();
         direct.sort_by_key(|s| s.1);
         assert_eq!(direct[0].1, 0);
         assert!(direct.iter().any(|s| s.0 == "block.backup.net" && s.1 == 1));
-        assert!(direct.iter().any(|s| s.0 == "short.filler.org" && s.2 == 1200));
         assert!(
-            direct.iter().any(|s| s.0 == "hand.edited.example" && s.1 == 0),
+            direct
+                .iter()
+                .any(|s| s.0 == "short.filler.org" && s.2 == 1200)
+        );
+        assert!(
+            direct
+                .iter()
+                .any(|s| s.0 == "hand.edited.example" && s.1 == 0),
             "negative priority clamps to 0 on both paths"
         );
 
@@ -412,7 +429,10 @@ enable = 1
 
         import(&ini, &out, true).unwrap();
         let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
-        assert_eq!(raw["tmdb_key"], "keepme", "--force must not drop sibling keys");
+        assert_eq!(
+            raw["tmdb_key"], "keepme",
+            "--force must not drop sibling keys"
+        );
         let arr = raw["servers"].as_array().unwrap();
         assert_eq!(arr.len(), 2, "servers are replaced, not appended to");
         assert!(
@@ -424,10 +444,7 @@ enable = 1
         // erroring - there is nothing in it to preserve.
         std::fs::write(&out, "not json").unwrap();
         import(&ini, &out, true).unwrap();
-        assert_eq!(
-            nzbkit::config::Config::load(&out).unwrap().servers.len(),
-            2
-        );
+        assert_eq!(nzbkit::config::Config::load(&out).unwrap().servers.len(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

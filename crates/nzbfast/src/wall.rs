@@ -8,6 +8,7 @@
 //!   db + an on-disk art dir by the daemon's background worker). No key
 //!   ⇒ the wall still works, text-only.
 
+use crate::MutexExt;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
@@ -18,7 +19,7 @@ use crate::ratelimit::{self, Provider};
 // classifies at ingest - M25 browse view); re-exported so existing
 // call sites keep their wall:: paths.
 pub use nzbkit::release::{
-    movie_name, norm_title, parse_release, quality_label, quality_suffix, Kind, NameStyle, Parsed,
+    Kind, NameStyle, Parsed, movie_name, norm_title, parse_release, quality_label, quality_suffix,
 };
 
 // Cast and crew are entities, not a comma-joined string: the struct and
@@ -195,7 +196,11 @@ pub fn tmdb_lookup(api_key: &str, kind: &Kind, title: &str, year: u32) -> Option
         let _ = write!(url, "&{year_param}={year}");
     }
     ratelimit::acquire(Provider::Tmdb);
-    let resp = match crate::serve::shared_enrich_agent().get(&url).timeout(std::time::Duration::from_secs(10)).call() {
+    let resp = match crate::serve::shared_enrich_agent()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .call()
+    {
         Ok(r) => r,
         Err(e) => {
             note_http_err(&e);
@@ -244,7 +249,11 @@ pub fn tmdb_lookup(api_key: &str, kind: &Kind, title: &str, year: u32) -> Option
 /// bucket - see `ratelimit` for why the numbers are what they are.
 fn get_json(p: Provider, url: &str) -> Option<serde_json::Value> {
     ratelimit::acquire(p);
-    let resp = match crate::serve::shared_enrich_agent().get(url).timeout(std::time::Duration::from_secs(10)).call() {
+    let resp = match crate::serve::shared_enrich_agent()
+        .get(url)
+        .timeout(std::time::Duration::from_secs(10))
+        .call()
+    {
         Ok(r) => r,
         Err(e) => {
             // A 429/503 is the provider saying the bucket is too fast.
@@ -303,7 +312,12 @@ fn parse_tvmaze(v: &serde_json::Value) -> Option<TitleMeta> {
         rating: v["rating"]["average"].as_f64().unwrap_or(0.0),
         genres: v["genres"]
             .as_array()
-            .map(|g| g.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))
+            .map(|g| {
+                g.iter()
+                    .filter_map(|x| x.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
             .unwrap_or_default(),
         poster_url: poster,
         backdrop_url: backdrop,
@@ -319,10 +333,13 @@ fn parse_tvmaze(v: &serde_json::Value) -> Option<TitleMeta> {
 /// the enricher uses `tvmaze_lookup_full`, which gets cast and crew in
 /// this same request.
 pub fn tvmaze_lookup(title: &str) -> Option<TitleMeta> {
-    let v = get_json(Provider::Tvmaze, &format!(
-        "https://api.tvmaze.com/singlesearch/shows?q={}",
-        percent_encode(title)
-    ))?;
+    let v = get_json(
+        Provider::Tvmaze,
+        &format!(
+            "https://api.tvmaze.com/singlesearch/shows?q={}",
+            percent_encode(title)
+        ),
+    )?;
     parse_tvmaze(&v)
 }
 
@@ -335,10 +352,13 @@ pub fn tvmaze_lookup(title: &str) -> Option<TitleMeta> {
 /// with real roles) is the whole point. Measured live on 26 Jul 2026:
 /// Severance answers in 35 KB with 11 cast and 71 crew.
 pub fn tvmaze_lookup_full(title: &str) -> Option<TitleMeta> {
-    let v = get_json(Provider::Tvmaze, &format!(
-        "https://api.tvmaze.com/singlesearch/shows?q={}&embed[]=cast&embed[]=crew",
-        percent_encode(title)
-    ))?;
+    let v = get_json(
+        Provider::Tvmaze,
+        &format!(
+            "https://api.tvmaze.com/singlesearch/shows?q={}&embed[]=cast&embed[]=crew",
+            percent_encode(title)
+        ),
+    )?;
     let mut m = parse_tvmaze(&v)?;
     m.credits = parse_tvmaze_credits(&v["_embedded"]);
     m.actors = credit_line(&m.credits, 8);
@@ -516,9 +536,12 @@ fn parse_tvmaze_episodes(v: &serde_json::Value) -> Vec<EpInfo> {
 
 /// Full episode list (with airdates) for a TVmaze show id.
 pub fn tvmaze_episodes(show_id: i64) -> Vec<EpInfo> {
-    get_json(Provider::Tvmaze, &format!("https://api.tvmaze.com/shows/{show_id}/episodes"))
-        .map(|v| parse_tvmaze_episodes(&v))
-        .unwrap_or_default()
+    get_json(
+        Provider::Tvmaze,
+        &format!("https://api.tvmaze.com/shows/{show_id}/episodes"),
+    )
+    .map(|v| parse_tvmaze_episodes(&v))
+    .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -552,7 +575,9 @@ pub struct Candidate {
 }
 
 fn year_of_date(d: Option<&str>) -> u32 {
-    d.and_then(|d| d.get(..4)).and_then(|y| y.parse().ok()).unwrap_or(0)
+    d.and_then(|d| d.get(..4))
+        .and_then(|y| y.parse().ok())
+        .unwrap_or(0)
 }
 
 /// Pure parse of a TMDB search response (movie or tv) → candidates.
@@ -665,12 +690,17 @@ pub fn search_candidates(
             if year > 0 {
                 let _ = write!(url, "&{year_param}={year}");
             }
-            get_json(Provider::Tmdb, &url).map(|v| parse_tmdb_search(&v, kind)).unwrap_or_default()
+            get_json(Provider::Tmdb, &url)
+                .map(|v| parse_tmdb_search(&v, kind))
+                .unwrap_or_default()
         }
-        (None, Kind::Tv) => get_json(Provider::Tvmaze, &format!(
-            "https://api.tvmaze.com/search/shows?q={}",
-            percent_encode(query)
-        ))
+        (None, Kind::Tv) => get_json(
+            Provider::Tvmaze,
+            &format!(
+                "https://api.tvmaze.com/search/shows?q={}",
+                percent_encode(query)
+            ),
+        )
         .map(|v| parse_tvmaze_search(&v))
         .unwrap_or_default(),
         (None, _) => wikidata_search(query)
@@ -699,14 +729,13 @@ fn parse_omdb(v: &serde_json::Value) -> Option<TitleMeta> {
     }
     let imdb = omdb_field(&v["imdbID"]).unwrap_or("").to_string();
     // Numeric part of the tconst as the provider id (nonzero = found).
-    let id: i64 = imdb
-        .trim_start_matches("tt")
-        .parse()
-        .unwrap_or(1);
+    let id: i64 = imdb.trim_start_matches("tt").parse().unwrap_or(1);
     Some(TitleMeta {
         tmdb_id: id.max(1),
         overview: omdb_field(&v["Plot"]).unwrap_or("").to_string(),
-        rating: omdb_field(&v["imdbRating"]).and_then(|r| r.parse().ok()).unwrap_or(0.0),
+        rating: omdb_field(&v["imdbRating"])
+            .and_then(|r| r.parse().ok())
+            .unwrap_or(0.0),
         genres: omdb_field(&v["Genre"]).unwrap_or("").to_string(),
         poster_url: omdb_field(&v["Poster"]).unwrap_or("").to_string(),
         backdrop_url: String::new(),
@@ -732,9 +761,12 @@ pub fn omdb_lookup(key: &str, title: &str, year: u32) -> Option<TitleMeta> {
 /// OMDb: exact lookup by IMDb tconst (Wikidata resolves those keyless,
 /// so an OMDb title-miss often still lands via the id).
 pub fn omdb_lookup_imdb(key: &str, tconst: &str) -> Option<TitleMeta> {
-    get_json(Provider::Omdb, &format!("https://www.omdbapi.com/?apikey={key}&i={tconst}"))
-        .as_ref()
-        .and_then(parse_omdb)
+    get_json(
+        Provider::Omdb,
+        &format!("https://www.omdbapi.com/?apikey={key}&i={tconst}"),
+    )
+    .as_ref()
+    .and_then(parse_omdb)
 }
 
 /// Pure parse of an OMDb `s=` search response → candidates (tested).
@@ -774,10 +806,13 @@ fn parse_omdb_search(v: &serde_json::Value) -> Vec<Candidate> {
 
 /// OMDb candidate search for the wall's fix-match UI.
 pub fn omdb_search(key: &str, query: &str) -> Vec<Candidate> {
-    get_json(Provider::Omdb, &format!(
-        "https://www.omdbapi.com/?apikey={key}&type=movie&s={}",
-        percent_encode(query)
-    ))
+    get_json(
+        Provider::Omdb,
+        &format!(
+            "https://www.omdbapi.com/?apikey={key}&type=movie&s={}",
+            percent_encode(query)
+        ),
+    )
     .map(|v| parse_omdb_search(&v))
     .unwrap_or_default()
 }
@@ -816,7 +851,11 @@ fn omdb_free_radio(html: &str) -> Option<(String, String, String, bool)> {
         let end = rest.find('>').unwrap_or(rest.len());
         let tag = &rest[..end];
         rest = &rest[end..];
-        if tag_attr(tag, "type").map(str::to_ascii_lowercase).as_deref() != Some("radio") {
+        if tag_attr(tag, "type")
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+            != Some("radio")
+        {
             continue;
         }
         let value = tag_attr(tag, "value").unwrap_or("");
@@ -850,7 +889,9 @@ fn omdb_signup_fields(
         let end = rest.find('>').unwrap_or(rest.len());
         let tag = &rest[..end];
         rest = &rest[end..];
-        let Some(name) = tag_attr(tag, "name") else { continue };
+        let Some(name) = tag_attr(tag, "name") else {
+            continue;
+        };
         let name = name.to_string();
         let lname = name.to_ascii_lowercase();
         let value = tag_attr(tag, "value").unwrap_or("").to_string();
@@ -891,7 +932,10 @@ fn omdb_signup_fields(
         rest = &rest[p..];
         let end = rest.find('>').unwrap_or(rest.len());
         if let Some(name) = tag_attr(&rest[..end], "name") {
-            fields.push((name.to_string(), "Personal media library (poster wall metadata)".into()));
+            fields.push((
+                name.to_string(),
+                "Personal media library (poster wall metadata)".into(),
+            ));
         }
         rest = &rest[end..];
     }
@@ -925,20 +969,21 @@ pub fn omdb_signup(email: &str) -> Result<(), String> {
             .into_string()
             .map_err(|e| e.to_string())
     };
-    let mut page = crate::serve::shared_enrich_agent().get(URL)
+    let mut page = crate::serve::shared_enrich_agent()
+        .get(URL)
         .timeout(std::time::Duration::from_secs(15))
         .call()
         .map_err(|e| format!("couldn't load the signup form: {e}"))?
         .into_string()
         .map_err(|e| e.to_string())?;
-    if let Some((_, target, _, checked)) = omdb_free_radio(&page) {
-        if !checked {
-            let mut fields = omdb_signup_fields(&page, email, false)
-                .ok_or("the signup form has changed - request a key manually")?;
-            fields.push(("__EVENTTARGET".into(), target));
-            fields.push(("__EVENTARGUMENT".into(), String::new()));
-            page = post(&fields)?;
-        }
+    if let Some((_, target, _, checked)) = omdb_free_radio(&page)
+        && !checked
+    {
+        let mut fields = omdb_signup_fields(&page, email, false)
+            .ok_or("the signup form has changed - request a key manually")?;
+        fields.push(("__EVENTTARGET".into(), target));
+        fields.push(("__EVENTARGUMENT".into(), String::new()));
+        page = post(&fields)?;
     }
     let fields = omdb_signup_fields(&page, email, true)
         .ok_or("the signup form has changed - request a key manually")?;
@@ -978,7 +1023,8 @@ fn get_json_ua(p: Provider, url: &str) -> Option<serde_json::Value> {
     const BACKOFF_SECS: [u64; 2] = [5, 15];
     for attempt in 0..=BACKOFF_SECS.len() {
         ratelimit::acquire(p);
-        match crate::serve::shared_enrich_agent().get(url)
+        match crate::serve::shared_enrich_agent()
+            .get(url)
             .set("User-Agent", WIKI_UA)
             .timeout(std::time::Duration::from_secs(10))
             .call()
@@ -1093,9 +1139,7 @@ fn pick_wikidata_imdb(
         .filter_map(|c| c["id"].as_str())
         .collect();
     let year_of = |ent: &serde_json::Value| -> Option<u32> {
-        ent["claims"]["P577"]
-            .as_array()?
-            .first()?["mainsnak"]["datavalue"]["value"]["time"]
+        ent["claims"]["P577"].as_array()?.first()?["mainsnak"]["datavalue"]["value"]["time"]
             .as_str()?
             .get(1..5)?
             .parse()
@@ -1125,11 +1169,14 @@ fn pick_wikidata_imdb(
 /// Wikidata: resolve a movie title(+year) to an IMDb tconst - the join
 /// key for the IMDb ratings snapshot. Two keyless calls.
 pub fn wikidata_imdb(title: &str, year: u32) -> Option<String> {
-    let search = get_json_ua(Provider::Wikidata, &format!(
-        "https://www.wikidata.org/w/api.php?action=wbsearchentities&format=json\
+    let search = get_json_ua(
+        Provider::Wikidata,
+        &format!(
+            "https://www.wikidata.org/w/api.php?action=wbsearchentities&format=json\
          &language=en&type=item&limit=5&search={}",
-        percent_encode(title)
-    ))?;
+            percent_encode(title)
+        ),
+    )?;
     let ids: Vec<&str> = search["search"]
         .as_array()?
         .iter()
@@ -1138,11 +1185,14 @@ pub fn wikidata_imdb(title: &str, year: u32) -> Option<String> {
     if ids.is_empty() {
         return None;
     }
-    let entities = get_json_ua(Provider::Wikidata, &format!(
-        "https://www.wikidata.org/w/api.php?action=wbgetentities&format=json\
+    let entities = get_json_ua(
+        Provider::Wikidata,
+        &format!(
+            "https://www.wikidata.org/w/api.php?action=wbgetentities&format=json\
          &props=claims&ids={}",
-        ids.join("|")
-    ))?;
+            ids.join("|")
+        ),
+    )?;
     pick_wikidata_imdb(&search, &entities, year)
 }
 
@@ -1168,12 +1218,12 @@ pub fn wikidata_imdb(title: &str, year: u32) -> Option<String> {
 /// has no single film class, and the subtypes do not all declare P31 to
 /// the parent, so the specific ones have to be listed.
 const FILM_CLASSES: [&str; 7] = [
-    "Q11424",  // film
-    "Q24869",  // feature film
-    "Q506240", // television film
-    "Q202866", // animated film
-    "Q93204",  // documentary film
-    "Q24862",  // short film
+    "Q11424",    // film
+    "Q24869",    // feature film
+    "Q506240",   // television film
+    "Q202866",   // animated film
+    "Q93204",    // documentary film
+    "Q24862",    // short film
     "Q20650540", // adult film
 ];
 
@@ -1228,7 +1278,9 @@ fn earliest_publication(ent: &serde_json::Value) -> String {
 }
 
 fn is_film_entity(ent: &serde_json::Value) -> bool {
-    claim_entity_ids(ent, "P31").iter().any(|q| FILM_CLASSES.contains(&q.as_str()))
+    claim_entity_ids(ent, "P31")
+        .iter()
+        .any(|q| FILM_CLASSES.contains(&q.as_str()))
 }
 
 /// Pick the film entity a title(+year) means, in search-rank order
@@ -1277,10 +1329,7 @@ pub fn pick_wikidata_film(
 /// card (tested). A Q-id missing from `labels` is dropped rather than
 /// shown raw, because "Q157443" on a poster card is worse than one
 /// fewer genre.
-pub fn parse_wikidata_film(
-    ent: &serde_json::Value,
-    labels: &HashMap<String, String>,
-) -> TitleMeta {
+pub fn parse_wikidata_film(ent: &serde_json::Value, labels: &HashMap<String, String>) -> TitleMeta {
     let names = |ids: Vec<String>, cap: usize| -> String {
         ids.iter()
             .filter_map(|q| labels.get(q).cloned())
@@ -1325,8 +1374,12 @@ pub fn parse_wikidata_film(
 /// Deliberately short: these are the four the film community actually
 /// looks a film up by, and every one of them is already in the claims
 /// response we parse for genre and cast.
-const WIKIDATA_CREW: [(&str, &str); 4] =
-    [("P57", "director"), ("P58", "writer"), ("P86", "composer"), ("P162", "producer")];
+const WIKIDATA_CREW: [(&str, &str); 4] = [
+    ("P57", "director"),
+    ("P58", "writer"),
+    ("P86", "composer"),
+    ("P162", "producer"),
+];
 
 /// Cast and crew from a film entity's claims (tested).
 ///
@@ -1405,11 +1458,14 @@ pub fn parse_wikidata_credits(
 /// `descriptions` ride along because the candidate list needs them and
 /// they cost nothing extra.
 fn wikidata_search(title: &str) -> Option<(serde_json::Value, serde_json::Value)> {
-    let search = get_json_ua(Provider::Wikidata, &format!(
-        "https://www.wikidata.org/w/api.php?action=wbsearchentities&format=json\
+    let search = get_json_ua(
+        Provider::Wikidata,
+        &format!(
+            "https://www.wikidata.org/w/api.php?action=wbsearchentities&format=json\
          &language=en&type=item&limit=10&search={}",
-        percent_encode(title)
-    ))?;
+            percent_encode(title)
+        ),
+    )?;
     let ids: Vec<&str> = search["search"]
         .as_array()?
         .iter()
@@ -1418,11 +1474,14 @@ fn wikidata_search(title: &str) -> Option<(serde_json::Value, serde_json::Value)
     if ids.is_empty() {
         return None;
     }
-    let entities = get_json_ua(Provider::Wikidata, &format!(
-        "https://www.wikidata.org/w/api.php?action=wbgetentities&format=json\
+    let entities = get_json_ua(
+        Provider::Wikidata,
+        &format!(
+            "https://www.wikidata.org/w/api.php?action=wbgetentities&format=json\
          &props=claims|labels|descriptions&languages=en|mul&ids={}",
-        ids.join("|")
-    ))?;
+            ids.join("|")
+        ),
+    )?;
     Some((search, entities))
 }
 
@@ -1445,7 +1504,10 @@ pub fn parse_wikidata_candidates(
             continue;
         }
         let date = earliest_publication(ent);
-        let y = date.get(..4).and_then(|y| y.parse::<u32>().ok()).unwrap_or(0);
+        let y = date
+            .get(..4)
+            .and_then(|y| y.parse::<u32>().ok())
+            .unwrap_or(0);
         if year > 0 && y > 0 && y.abs_diff(year) > 1 {
             continue;
         }
@@ -1464,7 +1526,10 @@ pub fn parse_wikidata_candidates(
             year: y,
             // Wikidata's one-line description ("1999 film by the
             // Wachowskis") is exactly the disambiguator this list needs.
-            overview: ent["descriptions"]["en"]["value"].as_str().unwrap_or("").to_string(),
+            overview: ent["descriptions"]["en"]["value"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
             rating: 0.0,
             genres: String::new(),
             // No art: P18 is not a film poster (see
@@ -1541,7 +1606,7 @@ fn resolve_labels(ids: &[String]) -> HashMap<String, String> {
     let mut out = HashMap::new();
     let mut want: Vec<String> = Vec::new();
     {
-        let cache = label_cache().lock().unwrap();
+        let cache = label_cache().lock_ok();
         for q in ids {
             match cache.get(q) {
                 Some(name) => {
@@ -1558,14 +1623,17 @@ fn resolve_labels(ids: &[String]) -> HashMap<String, String> {
     if want.is_empty() {
         return out;
     }
-    let Some(v) = get_json_ua(Provider::Wikidata, &format!(
-        "https://www.wikidata.org/w/api.php?action=wbgetentities&format=json\
+    let Some(v) = get_json_ua(
+        Provider::Wikidata,
+        &format!(
+            "https://www.wikidata.org/w/api.php?action=wbgetentities&format=json\
          &props=labels&languages=en|mul&ids={}",
-        want.join("|")
-    )) else {
+            want.join("|")
+        ),
+    ) else {
         return out;
     };
-    let mut cache = label_cache().lock().unwrap();
+    let mut cache = label_cache().lock_ok();
     for q in want {
         let l = &v["entities"][&q]["labels"];
         if let Some(name) = l["en"]["value"].as_str().or(l["mul"]["value"].as_str()) {
@@ -1612,14 +1680,20 @@ fn is_qid(q: &str) -> bool {
 pub fn parse_person_facts(v: &serde_json::Value) -> HashMap<String, PersonFacts> {
     let mut out: HashMap<String, PersonFacts> = HashMap::new();
     for row in v["results"]["bindings"].as_array().into_iter().flatten() {
-        let Some(qid) = row["p"]["value"].as_str().and_then(|u| u.rsplit('/').next()) else {
+        let Some(qid) = row["p"]["value"]
+            .as_str()
+            .and_then(|u| u.rsplit('/').next())
+        else {
             continue;
         };
         if !is_qid(qid) {
             continue;
         }
         let e = out.entry(qid.to_string()).or_default();
-        if let Some(id) = row["imdb"]["value"].as_str().filter(|s| s.starts_with("nm")) {
+        if let Some(id) = row["imdb"]["value"]
+            .as_str()
+            .filter(|s| s.starts_with("nm"))
+        {
             e.imdb = id.to_string();
         }
         let born = wikidata_iso(row["dob"]["value"].as_str().unwrap_or(""));
@@ -1652,7 +1726,7 @@ fn person_facts(qids: &[String]) -> HashMap<String, PersonFacts> {
     let mut out = HashMap::new();
     let mut want: Vec<String> = Vec::new();
     {
-        let cache = facts_cache().lock().unwrap();
+        let cache = facts_cache().lock_ok();
         for q in qids.iter().filter(|q| is_qid(q)) {
             match cache.get(q) {
                 Some(f) => {
@@ -1671,7 +1745,11 @@ fn person_facts(qids: &[String]) -> HashMap<String, PersonFacts> {
     if want.is_empty() {
         return out;
     }
-    let values = want.iter().map(|q| format!("wd:{q}")).collect::<Vec<_>>().join(" ");
+    let values = want
+        .iter()
+        .map(|q| format!("wd:{q}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     let query = format!(
         "SELECT ?p ?imdb ?dob WHERE {{ \
            VALUES ?p {{ {values} }} \
@@ -1687,7 +1765,10 @@ fn person_facts(qids: &[String]) -> HashMap<String, PersonFacts> {
     // bucket, and every other network call in this file is paced.
     ratelimit::acquire(Provider::WikidataSparql);
     let Some(body) = crate::serve::shared_enrich_agent()
-        .get(&format!("https://query.wikidata.org/sparql?query={}", percent_encode(&query)))
+        .get(&format!(
+            "https://query.wikidata.org/sparql?query={}",
+            percent_encode(&query)
+        ))
         .set("User-Agent", WIKI_UA)
         .set("Accept", "application/sparql-results+json")
         .timeout(std::time::Duration::from_secs(30))
@@ -1707,7 +1788,7 @@ fn person_facts(qids: &[String]) -> HashMap<String, PersonFacts> {
         return out;
     };
     let got = parse_person_facts(&v);
-    let mut cache = facts_cache().lock().unwrap();
+    let mut cache = facts_cache().lock_ok();
     for q in want {
         let f = got.get(&q).cloned().unwrap_or_default();
         cache.insert(q.clone(), f.clone());
@@ -1722,8 +1803,11 @@ fn person_facts(qids: &[String]) -> HashMap<String, PersonFacts> {
 /// response; this is the one part of the credit that needs a second
 /// service to answer.
 fn fill_person_facts(credits: &mut [Credit]) {
-    let qids: Vec<String> =
-        credits.iter().map(|c| c.wikidata_qid.clone()).filter(|q| !q.is_empty()).collect();
+    let qids: Vec<String> = credits
+        .iter()
+        .map(|c| c.wikidata_qid.clone())
+        .filter(|q| !q.is_empty())
+        .collect();
     if qids.is_empty() {
         return;
     }
@@ -1784,7 +1868,11 @@ fn describes_a_screen_work(v: &serde_json::Value) -> bool {
 /// first, since "Dune" and "Dune (2021 film)" are different articles.
 pub fn wikipedia_page(title: &str, year: u32) -> Option<WikiPage> {
     let variants = if year > 0 {
-        vec![format!("{title} ({year} film)"), format!("{title} (film)"), title.to_string()]
+        vec![
+            format!("{title} ({year} film)"),
+            format!("{title} (film)"),
+            title.to_string(),
+        ]
     } else {
         vec![format!("{title} (film)"), title.to_string()]
     };
@@ -1801,33 +1889,26 @@ pub fn wikipedia_page(title: &str, year: u32) -> Option<WikiPage> {
             "https://en.wikipedia.org/api/rest_v1/page/summary/{}",
             percent_encode(&name.replace(' ', "_"))
         );
-        if let Some(v) = get_json_ua(Provider::Wikipedia, &url) {
-            if v["type"].as_str() == Some("standard")
-                && (self_describing || describes_a_screen_work(&v))
-            {
-                let page = WikiPage {
-                    extract: v["extract"].as_str().unwrap_or("").to_string(),
-                    image: v["originalimage"]["source"]
-                        .as_str()
-                        .or(v["thumbnail"]["source"].as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                };
-                // A disambiguation-ish hit with neither text nor art is
-                // not an answer - keep trying the other title forms.
-                if !page.extract.is_empty() || !page.image.is_empty() {
-                    return Some(page);
-                }
+        if let Some(v) = get_json_ua(Provider::Wikipedia, &url)
+            && v["type"].as_str() == Some("standard")
+            && (self_describing || describes_a_screen_work(&v))
+        {
+            let page = WikiPage {
+                extract: v["extract"].as_str().unwrap_or("").to_string(),
+                image: v["originalimage"]["source"]
+                    .as_str()
+                    .or(v["thumbnail"]["source"].as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            };
+            // A disambiguation-ish hit with neither text nor art is
+            // not an answer - keep trying the other title forms.
+            if !page.extract.is_empty() || !page.image.is_empty() {
+                return Some(page);
             }
         }
     }
     None
-}
-
-/// Plot only - the shape every caller wanted before posters came from
-/// here too.
-pub fn wikipedia_summary(title: &str, year: u32) -> Option<String> {
-    wikipedia_page(title, year).map(|p| p.extract).filter(|e| !e.is_empty())
 }
 
 /// Pure parse of an AniList GraphQL Media response (tested).
@@ -1840,7 +1921,12 @@ fn parse_anilist(v: &serde_json::Value) -> Option<TitleMeta> {
         rating: m["averageScore"].as_f64().unwrap_or(0.0) / 10.0,
         genres: m["genres"]
             .as_array()
-            .map(|g| g.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))
+            .map(|g| {
+                g.iter()
+                    .filter_map(|x| x.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
             .unwrap_or_default(),
         poster_url: m["coverImage"]["extraLarge"]
             .as_str()
@@ -1908,9 +1994,6 @@ pub fn anilist_lookup(title: &str) -> Option<TitleMeta> {
     parse_anilist(&v)
 }
 
-/// Parse IMDb's title.ratings TSV (tconst\taverageRating\tnumVotes),
-/// keeping rows with ≥ `min_votes` - drops the long tail of 1-vote
-/// entries and shrinks 1.5M rows to a few hundred k (tested).
 // ---------------------------------------------------------------------------
 // Music (MusicBrainz + Cover Art Archive) and books (OpenLibrary).
 //
@@ -1965,7 +2048,8 @@ fn get_json_paced(p: Provider, url: &str) -> Option<serde_json::Value> {
     const BACKOFF_SECS: [u64; 3] = [5, 15, 30];
     for attempt in 0..=BACKOFF_SECS.len() {
         ratelimit::acquire(p);
-        match crate::serve::shared_enrich_agent().get(url)
+        match crate::serve::shared_enrich_agent()
+            .get(url)
             .set("User-Agent", WIKI_UA)
             .timeout(std::time::Duration::from_secs(10))
             .call()
@@ -1987,7 +2071,7 @@ fn get_json_paced(p: Provider, url: &str) -> Option<serde_json::Value> {
                 }
                 return serde_json::from_str(&body).ok();
             }
-            Err(ureq::Error::Status(code, r)) if matches!(code, 429 | 503) => {
+            Err(ureq::Error::Status(429 | 503, r)) => {
                 let wait = r
                     .header("Retry-After")
                     .and_then(|v| v.parse::<u64>().ok())
@@ -2095,7 +2179,11 @@ pub fn musicbrainz_lookup(artist: &str, album: &str) -> Option<TitleMeta> {
     // "VA" is the scene's tag for a various-artists compilation and
     // means nothing to MusicBrainz, which files them under an artist
     // literally named "Various Artists".
-    let artist = if artist.eq_ignore_ascii_case("va") { "Various Artists" } else { artist };
+    let artist = if artist.eq_ignore_ascii_case("va") {
+        "Various Artists"
+    } else {
+        artist
+    };
     // Fail CLOSED without an artist. `credit_split` returns None on a
     // stem it cannot split, and the caller then passes "" - which made
     // this send `artist:""`, a clause Lucene simply ignores, so the
@@ -2165,7 +2253,10 @@ pub fn coverart_front(mbid: &str) -> String {
 /// Prefers the 500px thumbnail over the full-size scan, which can be a
 /// 20 MB flatbed image of a gatefold sleeve.
 fn parse_coverart(v: &serde_json::Value) -> String {
-    let images = v["images"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let images = v["images"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
     let front = images
         .iter()
         .find(|i| i["front"].as_bool() == Some(true))
@@ -2217,7 +2308,10 @@ fn useful_subject(s: &str) -> bool {
 /// genuinely non-Latin author (who has no Latin form to prefer) intact.
 fn mostly_latin(s: &str) -> bool {
     let letters = s.chars().filter(|c| c.is_alphabetic()).count();
-    let latin = s.chars().filter(|c| c.is_alphabetic() && c.is_ascii()).count();
+    let latin = s
+        .chars()
+        .filter(|c| c.is_alphabetic() && c.is_ascii())
+        .count();
     letters == 0 || latin * 2 >= letters
 }
 
@@ -2279,7 +2373,9 @@ fn parse_openlibrary(v: &serde_json::Value, title: &str) -> Option<TitleMeta> {
     } else {
         format!("Book by {author}")
     };
-    let key = best["key"].as_str().unwrap_or(best["title"].as_str().unwrap_or(""));
+    let key = best["key"]
+        .as_str()
+        .unwrap_or(best["title"].as_str().unwrap_or(""));
     let poster_url = best["cover_i"]
         .as_i64()
         .map(|id| format!("https://covers.openlibrary.org/b/id/{id}-L.jpg"))
@@ -2289,7 +2385,10 @@ fn parse_openlibrary(v: &serde_json::Value, title: &str) -> Option<TitleMeta> {
         overview,
         // OpenLibrary rates out of 5; every other provider here (and the
         // IMDb snapshot the card shares a star with) is out of 10.
-        rating: best["ratings_average"].as_f64().map(|r| r * 2.0).unwrap_or(0.0),
+        rating: best["ratings_average"]
+            .as_f64()
+            .map(|r| r * 2.0)
+            .unwrap_or(0.0),
         genres,
         poster_url,
         backdrop_url: String::new(),
@@ -2338,6 +2437,9 @@ fn title_case(s: &str) -> String {
         .join(" ")
 }
 
+/// Parse IMDb's title.ratings TSV (tconst\taverageRating\tnumVotes),
+/// keeping rows with ≥ `min_votes` - drops the long tail of 1-vote
+/// entries and shrinks 1.5M rows to a few hundred k (tested).
 pub fn parse_imdb_ratings(tsv: &str, min_votes: u64) -> Vec<(String, f64, u64)> {
     tsv.lines()
         .skip(1) // header
@@ -2354,7 +2456,8 @@ pub fn parse_imdb_ratings(tsv: &str, min_votes: u64) -> Vec<(String, f64, u64)> 
 /// Download + gunzip the daily IMDb ratings snapshot (keyless; IMDb's
 /// official non-commercial datasets - credited in the wall footer).
 pub fn imdb_ratings_fetch() -> Option<Vec<(String, f64, u64)>> {
-    let resp = crate::serve::shared_enrich_agent().get("https://datasets.imdbws.com/title.ratings.tsv.gz")
+    let resp = crate::serve::shared_enrich_agent()
+        .get("https://datasets.imdbws.com/title.ratings.tsv.gz")
         .timeout(std::time::Duration::from_secs(120))
         .call()
         .ok()?;
@@ -2365,7 +2468,9 @@ pub fn imdb_ratings_fetch() -> Option<Vec<(String, f64, u64)>> {
         .read_to_end(&mut gz)
         .ok()?;
     let mut tsv = String::new();
-    flate2::read::GzDecoder::new(&gz[..]).read_to_string(&mut tsv).ok()?;
+    flate2::read::GzDecoder::new(&gz[..])
+        .read_to_string(&mut tsv)
+        .ok()?;
     Some(parse_imdb_ratings(&tsv, 100))
 }
 
@@ -2465,9 +2570,10 @@ fn parse_tvmaze_castcredits(v: &serde_json::Value) -> Vec<FilmoEntry> {
 /// Every TV show a TVmaze person id has acted in. `None` = the service
 /// did not answer, which is NOT the same as "they have no TV credits".
 pub fn tvmaze_filmography(person_id: i64) -> Option<Vec<FilmoEntry>> {
-    get_json(Provider::Tvmaze, &format!(
-        "https://api.tvmaze.com/people/{person_id}/castcredits?embed=show"
-    ))
+    get_json(
+        Provider::Tvmaze,
+        &format!("https://api.tvmaze.com/people/{person_id}/castcredits?embed=show"),
+    )
     .map(|v| parse_tvmaze_castcredits(&v))
 }
 
@@ -2519,8 +2625,11 @@ pub fn parse_sparql_filmography(v: &serde_json::Value) -> Vec<FilmoEntry> {
             e.date = date;
         }
     }
-    let mut out: Vec<FilmoEntry> =
-        by_entity.into_iter().filter(|(q, _)| is_film.contains(q)).map(|(_, e)| e).collect();
+    let mut out: Vec<FilmoEntry> = by_entity
+        .into_iter()
+        .filter(|(q, _)| is_film.contains(q))
+        .map(|(_, e)| e)
+        .collect();
     sort_filmography(&mut out);
     out
 }
@@ -2537,8 +2646,7 @@ pub fn parse_sparql_filmography(v: &serde_json::Value) -> Vec<FilmoEntry> {
 /// for why. Measured on this exact query: `"en"` alone lost 7 of Tom
 /// Cruise's 60 credits, including Top Gun: Maverick.
 pub fn wikidata_filmography(qid: &str) -> Option<Vec<FilmoEntry>> {
-    if !qid.starts_with('Q') || qid.len() < 2 || !qid[1..].bytes().all(|b| b.is_ascii_digit())
-    {
+    if !qid.starts_with('Q') || qid.len() < 2 || !qid[1..].bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     // LIMIT keeps a prolific actor inside the service's query timeout.
@@ -2551,18 +2659,19 @@ pub fn wikidata_filmography(qid: &str) -> Option<Vec<FilmoEntry>> {
          }} LIMIT 400"
     );
     ratelimit::acquire(Provider::WikidataSparql);
-    let resp = crate::serve::shared_enrich_agent().get(&format!(
-        "https://query.wikidata.org/sparql?query={}",
-        percent_encode(&query)
-    ))
-    .set("User-Agent", WIKI_UA)
-    .set("Accept", "application/sparql-results+json")
-    // Longer than the metadata calls on purpose: SPARQL is a query
-    // engine, not a document fetch, and a busy service is slow before it
-    // is unavailable.
-    .timeout(std::time::Duration::from_secs(30))
-    .call()
-    .ok()?;
+    let resp = crate::serve::shared_enrich_agent()
+        .get(&format!(
+            "https://query.wikidata.org/sparql?query={}",
+            percent_encode(&query)
+        ))
+        .set("User-Agent", WIKI_UA)
+        .set("Accept", "application/sparql-results+json")
+        // Longer than the metadata calls on purpose: SPARQL is a query
+        // engine, not a document fetch, and a busy service is slow before it
+        // is unavailable.
+        .timeout(std::time::Duration::from_secs(30))
+        .call()
+        .ok()?;
     let body = resp.into_string().ok()?;
     serde_json::from_str(&body)
         .ok()
@@ -2636,15 +2745,25 @@ mod tests {
     /// ever revisited it.
     #[test]
     fn only_a_screen_work_may_answer_an_unqualified_title() {
-        let page = |desc: &str, extract: &str| {
-            serde_json::json!({"description": desc, "extract": extract})
-        };
+        let page = |desc: &str, extract: &str| serde_json::json!({"description": desc, "extract": extract});
         // Real films and TV, by description or by lead sentence.
-        assert!(describes_a_screen_work(&page("2022 American film", "Ambulance is a 2022 film.")));
-        assert!(describes_a_screen_work(&page("", "Sunlight is a 2019 Irish film directed by …")));
-        assert!(describes_a_screen_work(&page("British television series", "")));
+        assert!(describes_a_screen_work(&page(
+            "2022 American film",
+            "Ambulance is a 2022 film."
+        )));
+        assert!(describes_a_screen_work(&page(
+            "",
+            "Sunlight is a 2019 Irish film directed by …"
+        )));
+        assert!(describes_a_screen_work(&page(
+            "British television series",
+            ""
+        )));
         assert!(describes_a_screen_work(&page("2021 documentary", "")));
-        assert!(describes_a_screen_work(&page("anime television series", "")));
+        assert!(describes_a_screen_work(&page(
+            "anime television series",
+            ""
+        )));
 
         // The articles that were being adopted as posters.
         assert!(!describes_a_screen_work(&page(
@@ -2661,10 +2780,6 @@ mod tests {
         // only the start of the lead is examined.
         let buried = format!("{} It was later filmed for television.", "x".repeat(400));
         assert!(!describes_a_screen_work(&page("river in Norway", &buried)));
-    }
-
-    fn p(stem: &str) -> Parsed {
-        parse_release(stem)
     }
 
     #[test]
@@ -2698,8 +2813,16 @@ mod tests {
         // Anything we can't place is dropped, NOT stored: the column is
         // sorted as a plain string, so one stray format would misorder
         // every card around it.
-        for junk in ["", "N/A", "1999", "1999-03", "March 1999", "30 Foo 1999",
-                     "32 Mar 1999", "30 Mar 99"] {
+        for junk in [
+            "",
+            "N/A",
+            "1999",
+            "1999-03",
+            "March 1999",
+            "30 Foo 1999",
+            "32 Mar 1999",
+            "30 Mar 99",
+        ] {
             assert_eq!(iso_date(junk), "", "{junk:?}");
         }
     }
@@ -2725,10 +2848,13 @@ mod tests {
         )
         .unwrap();
         let f = parse_person_facts(&v);
-        assert_eq!(f["Q37079"], PersonFacts {
-            imdb: "nm0000129".into(),
-            born: "1962-07-03".into()
-        });
+        assert_eq!(
+            f["Q37079"],
+            PersonFacts {
+                imdb: "nm0000129".into(),
+                born: "1962-07-03".into()
+            }
+        );
         // No date is not a missing person - the row still carries an id.
         assert_eq!(f["Q129429"].imdb, "nm0000046");
         assert_eq!(f["Q129429"].born, "");
@@ -2744,7 +2870,10 @@ mod tests {
 
     #[test]
     fn art_names_are_flat_and_safe() {
-        assert_eq!(art_name("m:the matrix:1999", false), "m_the_matrix_1999.jpg");
+        assert_eq!(
+            art_name("m:the matrix:1999", false),
+            "m_the_matrix_1999.jpg"
+        );
         assert_eq!(art_name("t:severance", true), "t_severance.bd.jpg");
     }
 
@@ -2793,7 +2922,10 @@ mod tests {
         .unwrap();
         let c = parse_tmdb_search(&tm, &Kind::Movie);
         assert_eq!(c.len(), 1);
-        assert_eq!((c[0].id, c[0].year, c[0].kind.as_str()), (603, 1999, "movie"));
+        assert_eq!(
+            (c[0].id, c[0].year, c[0].kind.as_str()),
+            (603, 1999, "movie")
+        );
         assert_eq!(c[0].genres, "Sci-Fi, Action");
         assert_eq!(c[0].poster_url, "https://image.tmdb.org/t/p/w342/p.jpg");
         assert_eq!(c[0].provider, "tmdb");
@@ -2845,7 +2977,10 @@ mod tests {
         // the production manager, so a cap keeps the useful one.
         let crew: Vec<&Credit> = cr.iter().filter(|c| c.role != "actor").collect();
         assert_eq!(crew.len(), 2);
-        assert_eq!((crew[0].name.as_str(), crew[0].role.as_str()), ("Dan Erickson", "creator"));
+        assert_eq!(
+            (crew[0].name.as_str(), crew[0].role.as_str()),
+            ("Dan Erickson", "creator")
+        );
         assert_eq!(crew[0].born, "1980-01-02", "crew are people too");
         let show: serde_json::Value = serde_json::from_str(
             r#"{"id":431,"externals":{"imdb":"tt11280740"},"summary":"<p>x</p>"}"#,
@@ -2889,9 +3024,15 @@ mod tests {
         let cr = parse_wikidata_credits(&ent, &labels);
         // P1545 IS the billing order, so the ranked pair leads and the
         // unranked one falls in behind rather than jumping the queue.
-        let cast: Vec<&str> =
-            cr.iter().filter(|c| c.role == "actor").map(|c| c.name.as_str()).collect();
-        assert_eq!(cast, ["Laurence Fishburne", "Keanu Reeves", "Carrie-Anne Moss"]);
+        let cast: Vec<&str> = cr
+            .iter()
+            .filter(|c| c.role == "actor")
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(
+            cast,
+            ["Laurence Fishburne", "Keanu Reeves", "Carrie-Anne Moss"]
+        );
         // The character qualifier - 9 of 19 on the real entity carry one.
         let neo = cr.iter().find(|c| c.name == "Keanu Reeves").unwrap();
         assert_eq!(neo.character, "Neo");
@@ -2923,8 +3064,7 @@ mod tests {
         // Episode lists are cached as JSON in `kv`. A blob written before
         // these fields existed must still deserialize, or the calendar
         // empties itself on upgrade.
-        let old: EpInfo =
-            serde_json::from_str(r#"{"season":2,"episode":3,"name":"x"}"#).unwrap();
+        let old: EpInfo = serde_json::from_str(r#"{"season":2,"episode":3,"name":"x"}"#).unwrap();
         assert_eq!((old.season, old.episode, old.summary.as_str()), (2, 3, ""));
     }
 
@@ -2940,8 +3080,10 @@ mod tests {
         .unwrap();
         let f = parse_tvmaze_castcredits(&v);
         assert_eq!(f.len(), 2, "the nameless show is dropped");
-        assert_eq!((f[0].title.as_str(), f[0].year, f[0].kind.as_str()),
-                   ("The Odd Couple", 2015, "tv"));
+        assert_eq!(
+            (f[0].title.as_str(), f[0].year, f[0].kind.as_str()),
+            ("The Odd Couple", 2015, "tv")
+        );
         assert_eq!(f[0].character, "Emily");
         assert_eq!(f[1].date, "", "a null premiere is not a date");
     }
@@ -3026,10 +3168,23 @@ mod tests {
         );
         assert!(m.tmdb_id > 0, "no show id");
         let cast: Vec<&Credit> = m.credits.iter().filter(|c| c.role == "actor").collect();
-        assert!(cast.len() >= 3, "embed returned no cast ({} credits)", m.credits.len());
-        assert!(cast.iter().any(|c| c.tvmaze_id > 0), "no person ids - filmography is dead");
-        assert!(cast.iter().any(|c| !c.character.is_empty()), "no character names");
-        assert!(m.credits.iter().any(|c| c.role != "actor"), "crew embed returned nothing");
+        assert!(
+            cast.len() >= 3,
+            "embed returned no cast ({} credits)",
+            m.credits.len()
+        );
+        assert!(
+            cast.iter().any(|c| c.tvmaze_id > 0),
+            "no person ids - filmography is dead"
+        );
+        assert!(
+            cast.iter().any(|c| !c.character.is_empty()),
+            "no character names"
+        );
+        assert!(
+            m.credits.iter().any(|c| c.role != "actor"),
+            "crew embed returned nothing"
+        );
         assert!(!m.actors.is_empty(), "no credit line");
         std::thread::sleep(std::time::Duration::from_secs(2));
 
@@ -3046,15 +3201,22 @@ mod tests {
         let tv = tvmaze_filmography(pid)
             .unwrap_or_else(|| panic!("castcredits did not answer for person {pid}"));
         println!("  person {pid}: {} TV credits", tv.len());
-        assert!(!tv.is_empty(), "castcredits returned nothing for person {pid}");
+        assert!(
+            !tv.is_empty(),
+            "castcredits returned nothing for person {pid}"
+        );
 
         // 4. The film half: Wikidata SPARQL. Q43416 is Keanu Reeves -
         // the query whose noise (TV mixed into film results) the parser
         // filters, so a live run also proves the filter still fires.
-        let films = wikidata_filmography("Q43416")
-            .expect("the SPARQL endpoint did not answer at all");
+        let films =
+            wikidata_filmography("Q43416").expect("the SPARQL endpoint did not answer at all");
         println!("  Q43416: {} film credits", films.len());
-        assert!(films.len() >= 20, "SPARQL returned only {} films", films.len());
+        assert!(
+            films.len() >= 20,
+            "SPARQL returned only {} films",
+            films.len()
+        );
         assert!(
             films.iter().any(|f| f.title == "The Matrix"),
             "the best-known credit is missing - the P31 filter is too strict"
@@ -3071,14 +3233,17 @@ mod tests {
         // Cruise's 60 credits - no error, no warning, just a shorter
         // list. Only a live call can catch that class of loss, which is
         // exactly why this test exists.
-        let cruise = wikidata_filmography("Q37079")
-            .expect("the SPARQL endpoint did not answer for Q37079");
+        let cruise =
+            wikidata_filmography("Q37079").expect("the SPARQL endpoint did not answer for Q37079");
         println!("  Q37079: {} film credits", cruise.len());
         assert!(
             cruise.iter().any(|f| f.title.contains("Maverick")),
             "a mul-only title vanished - the label service is being asked for 'en' only"
         );
-        assert!(!cruise.iter().any(|f| f.title.starts_with('Q')), "raw Q-ids leaked as titles");
+        assert!(
+            !cruise.iter().any(|f| f.title.starts_with('Q')),
+            "raw Q-ids leaked as titles"
+        );
         // Undated rows exist and must be last, not first.
         if let Some(first_undated) = films.iter().position(|f| f.date.is_empty()) {
             assert!(
@@ -3131,7 +3296,10 @@ mod tests {
         .unwrap();
         let c = parse_omdb_search(&s);
         assert_eq!(c.len(), 2);
-        assert_eq!((c[0].id, c[0].year, c[0].imdb.as_str()), (133093, 1999, "tt0133093"));
+        assert_eq!(
+            (c[0].id, c[0].year, c[0].imdb.as_str()),
+            (133093, 1999, "tt0133093")
+        );
         assert_eq!(c[0].provider, "omdb");
         assert_eq!(c[1].year, 2001, "year ranges take the first year");
         assert!(c[1].poster_url.is_empty());
@@ -3150,13 +3318,18 @@ mod tests {
           <input type="submit" name="Submit" value="Submit" id="Submit" />
         </form></body></html>"#;
         let (name, target, value, checked) = omdb_free_radio(step1).unwrap();
-        assert_eq!((name.as_str(), target.as_str(), value.as_str()), ("at", "freeAcct", "freeAcct"));
+        assert_eq!(
+            (name.as_str(), target.as_str(), value.as_str()),
+            ("at", "freeAcct", "freeAcct")
+        );
         assert!(!checked, "live form defaults to the Patreon tier");
         // The radio-select postback carries state + the free radio but
         // must NOT press Submit.
         let f = omdb_signup_fields(step1, "user@example.com", false).unwrap();
         let get = |f: &[(String, String)], k: &str| {
-            f.iter().find(|(n, _)| n.contains(k)).map(|(_, v)| v.to_string())
+            f.iter()
+                .find(|(n, _)| n.contains(k))
+                .map(|(_, v)| v.to_string())
         };
         assert_eq!(get(&f, "__VIEWSTATE").as_deref(), Some("VS123"));
         assert_eq!(get(&f, "at").as_deref(), Some("freeAcct"));
@@ -3174,7 +3347,10 @@ mod tests {
           <input type="submit" name="Submit" value="Submit" />
           <input type="submit" name="Other" value="Other" />
         </form>"#;
-        assert!(omdb_free_radio(step2).unwrap().3, "free tier selected after postback");
+        assert!(
+            omdb_free_radio(step2).unwrap().3,
+            "free tier selected after postback"
+        );
         let f = omdb_signup_fields(step2, "user@example.com", true).unwrap();
         assert_eq!(get(&f, "__VIEWSTATE").as_deref(), Some("VS999"));
         assert_eq!(get(&f, "Email").as_deref(), Some("user@example.com"));
@@ -3192,10 +3368,8 @@ mod tests {
 
     #[test]
     fn wikidata_candidate_picking_honors_year_and_p345() {
-        let search: serde_json::Value = serde_json::from_str(
-            r#"{"search":[{"id":"Q1"},{"id":"Q2"},{"id":"Q3"}]}"#,
-        )
-        .unwrap();
+        let search: serde_json::Value =
+            serde_json::from_str(r#"{"search":[{"id":"Q1"},{"id":"Q2"},{"id":"Q3"}]}"#).unwrap();
         let entities: serde_json::Value = serde_json::from_str(
             r#"{"entities":{
               "Q1":{"claims":{}},
@@ -3376,25 +3550,31 @@ mod tests {
                 .unwrap_or_else(|| panic!("wikipedia has no page for {title} ({year})"));
             println!(
                 "{title}: imdb={} date={} genres={:?} cast={:?} poster={}",
-                m.imdb,
-                m.air_date,
-                m.genres,
-                m.actors,
-                &w.image
+                m.imdb, m.air_date, m.genres, m.actors, w.image
             );
             assert!(m.imdb.starts_with("tt"), "{title}: no imdb id");
             assert!(!m.air_date.is_empty(), "{title}: no release date");
             assert!(!m.actors.is_empty(), "{title}: no cast");
-            assert!(w.image.contains("upload.wikimedia.org"), "{title}: no poster");
+            assert!(
+                w.image.contains("upload.wikimedia.org"),
+                "{title}: no poster"
+            );
             // The person-facts leg fails the same silent way: the query
             // service can answer 200 with an empty result set, and
             // without these two fields every same-named credit merges
             // on the name alone again (see `person_upsert`). Asserted as
             // "most of the cast", not all, because Wikidata genuinely
             // holds no birthday for some people.
-            let with_imdb = m.credits.iter().filter(|c| c.imdb.starts_with("nm")).count();
+            let with_imdb = m
+                .credits
+                .iter()
+                .filter(|c| c.imdb.starts_with("nm"))
+                .count();
             let with_born = m.credits.iter().filter(|c| !c.born.is_empty()).count();
-            println!("  facts: {with_imdb} imdb / {with_born} born of {}", m.credits.len());
+            println!(
+                "  facts: {with_imdb} imdb / {with_born} born of {}",
+                m.credits.len()
+            );
             assert!(
                 with_imdb * 2 > m.credits.len(),
                 "{title}: person IMDb ids did not land ({with_imdb}/{})",
@@ -3459,7 +3639,11 @@ mod tests {
                 Some(meta) => meta.overview.is_empty() || meta.poster_url.is_empty(),
                 None => true,
             };
-            let w = if need_wiki { wikipedia_page(title, year) } else { None };
+            let w = if need_wiki {
+                wikipedia_page(title, year)
+            } else {
+                None
+            };
             println!(
                 "  {title}: wikidata {:.2}s, wikipedia {:.2}s",
                 wd.as_secs_f64(),
@@ -3511,7 +3695,10 @@ mod tests {
     #[test]
     #[ignore]
     fn provider_rate_probe() {
-        let ms: u64 = std::env::var("SPACING_MS").unwrap_or("1000".into()).parse().unwrap();
+        let ms: u64 = std::env::var("SPACING_MS")
+            .unwrap_or("1000".into())
+            .parse()
+            .unwrap();
         // Let any standing penalty from an earlier run expire first.
         std::thread::sleep(std::time::Duration::from_secs(60));
         let t0 = std::time::Instant::now();
@@ -3526,7 +3713,7 @@ mod tests {
                 "wikipedia" => format!(
                     "https://en.wikipedia.org/api/rest_v1/page/summary/{}",
                     percent_encode(
-                        &["The_Matrix", "Inception", "Jaws_(film)", "Arrival_(film)"][i % 4]
+                        ["The_Matrix", "Inception", "Jaws_(film)", "Arrival_(film)"][i % 4]
                     )
                 ),
                 _ if i % 2 == 0 => format!(
@@ -3560,11 +3747,12 @@ mod tests {
                 }
                 Err(e) => println!("  request {i} at {:.1}s: {e}", t0.elapsed().as_secs_f64()),
             }
-            std::thread::sleep(
-                std::time::Duration::from_millis(ms).saturating_sub(at.elapsed()),
-            );
+            std::thread::sleep(std::time::Duration::from_millis(ms).saturating_sub(at.elapsed()));
         }
-        println!("spacing {ms}ms: {ok}/24 ok in {:.1}s", t0.elapsed().as_secs_f64());
+        println!(
+            "spacing {ms}ms: {ok}/24 ok in {:.1}s",
+            t0.elapsed().as_secs_f64()
+        );
     }
 
     // ---- music + books --------------------------------------------------
@@ -3595,10 +3783,17 @@ mod tests {
         // co-author - live OpenLibrary really does return both.
         assert_eq!(m.actors, "Frank Herbert", "author belongs in actors");
         assert_eq!(m.air_date, "1965");
-        assert_eq!(m.poster_url, "https://covers.openlibrary.org/b/id/11481354-L.jpg");
+        assert_eq!(
+            m.poster_url,
+            "https://covers.openlibrary.org/b/id/11481354-L.jpg"
+        );
         assert_eq!(m.overview, "Book by Frank Herbert");
         // OpenLibrary rates out of 5, the card's star is out of 10.
-        assert!((m.rating - 8.4).abs() < 0.01, "rating not rescaled: {}", m.rating);
+        assert!(
+            (m.rating - 8.4).abs() < 0.01,
+            "rating not rescaled: {}",
+            m.rating
+        );
         // Shelving noise is not a genre.
         assert_eq!(m.genres, "Science Fiction, Fiction");
         // Nothing resembling the request → no card, rather than a wrong one.
@@ -3618,7 +3813,10 @@ mod tests {
              "artist-credit":[{"name":"Pink Floyd"}]},
         ]});
         let g = pick_release_group(&v, "The Dark Side of the Moon").expect("no group");
-        assert_eq!(g["id"], "f5093c06", "a scored near-miss beat the exact title");
+        assert_eq!(
+            g["id"], "f5093c06",
+            "a scored near-miss beat the exact title"
+        );
         let m = parse_release_group(&g).unwrap();
         assert_eq!(m.actors, "Pink Floyd", "artist belongs in actors");
         assert_eq!(m.air_date, "1973-03-24");
@@ -3679,10 +3877,14 @@ mod tests {
         // was stricter than the code's own contract and duly failed on a
         // transient. Requiring it from at least one album still catches
         // the case worth catching: the genre lookup being dead.
-        assert!(any_genres, "no album returned genres - the release-group lookup is dead");
-        for (author, title) in
-            [("Frank Herbert", "Dune"), ("Andy Weir", "Project Hail Mary")]
-        {
+        assert!(
+            any_genres,
+            "no album returned genres - the release-group lookup is dead"
+        );
+        for (author, title) in [
+            ("Frank Herbert", "Dune"),
+            ("Andy Weir", "Project Hail Mary"),
+        ] {
             let b = openlibrary_lookup(author, title)
                 .unwrap_or_else(|| panic!("openlibrary found nothing for {author} - {title}"));
             println!(

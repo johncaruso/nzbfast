@@ -1,0 +1,247 @@
+# CI for the PRIVATE repo, where development actually happens. Every
+# other workflow is gated to the public repo (cost rationale lives in
+# pr-check.yml); before this file existed nothing built or tested the
+# private tree between merge and release. Kept lean on purpose: format
+# + lint gates and the fast unit suites, on Linux and on Windows. The
+# long daemon/e2e suites stay nightly (nightly.yml) plus a local
+# pre-push discipline.
+name: ci
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+# There is deliberately NO workflow-level `concurrency` block here. It
+# used to be `group: ci-${{ github.ref }}` with `cancel-in-progress:
+# true`, and the note that replaced it predicted only that Windows
+# coverage would "arrive when the pushes pause". Measured on 2 Aug 2026,
+# it was worse than that: 39 of the last 40 runs on main ended
+# `cancelled` and the 40th was still going, so across 12:05-13:10 not
+# one run reached a verdict, and `windows-unit` had never completed once
+# since it landed that morning. A gate that never finishes is
+# indistinguishable from a gate that passes, which is the worse of the
+# two failure modes.
+#
+# The cause is arithmetic, not a bug. Sessions fast-forward main
+# directly rather than opening PRs (repo convention, and it is not
+# changing), so with a dozen of them merging origin/main the push rate
+# is roughly one every 90 seconds. A workflow-level group cancels EVERY
+# job on the run, so the ~8 minute Linux leg and the ~30 minute Windows
+# leg were both being killed long before either could finish, and the
+# fast leg was dying for the slow leg's sake.
+#
+# So the group moves down to the jobs, which is exactly the escape hatch
+# the old note named. Each leg now queues on its own and neither starves
+# the other. Read verdicts PER JOB, not per run: a run whose Windows job
+# was superseded while queued is `cancelled` at run level even when its
+# Linux job passed, so
+#   gh api repos/:owner/:repo/actions/runs/<id>/jobs \
+#     -q '.jobs[] | "\(.name) \(.conclusion)"'
+# is the honest query, and `gh run list` alone is not.
+jobs:
+  check:
+    if: github.repository != 'nzbfast/nzbfast'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Warm cache, measured: cache restore 1m01s, fmt 23s, clippy 36s,
+    # unit suites 5m31s, deny 1s. Call it eight minutes. Never cancelled
+    # on main, so at the push rate above main gets a real Linux verdict
+    # roughly every eight minutes instead of none at all; GitHub keeps
+    # at most one queued job per group, so this cannot back up - a newer
+    # push supersedes the WAITING job, never the running one.
+    #
+    # cancel-in-progress stays on for anything that is not main, because
+    # `workflow_dispatch` on a topic branch is how a session gets a real
+    # verdict without waiting in main's queue, and there superseding is
+    # what you want.
+    concurrency:
+      group: ci-check-${{ github.ref }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: ci-private-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: fmt
+        run: cargo fmt -p nzbkit -p nzbfast -p nzbtray --check
+      - name: clippy
+        # No escapes: every warning blocks. The categories still allowed
+        # are named in the workspace lints table in Cargo.toml, each with
+        # its reason.
+        run: cargo clippy -p nzbkit -p nzbfast -p nzbtray --all-targets --no-deps -- -D warnings
+      # Prebuilt binary pinned by version and checked by SHA256 rather
+      # than trusted, same pattern (and rationale) as the cargo-deny
+      # step below.
+      - name: install cargo-nextest
+        run: |
+          ver="0.9.140"
+          curl -sSfL -o cargo-nextest.tar.gz \
+            "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${ver}/cargo-nextest-${ver}-x86_64-unknown-linux-gnu.tar.gz"
+          echo "4ee9aaa0d0171a985a5d0eb735b87355894c1c455972e9674fb9fdbd1387c9a3  cargo-nextest.tar.gz" | sha256sum -c -
+          tar -xzf cargo-nextest.tar.gz
+          sudo mv cargo-nextest /usr/local/bin/
+          rm cargo-nextest.tar.gz
+      # nextest instead of libtest, and the reason is diagnostic: a flake
+      # must never again appear as an anonymous 505/506 tally - nextest
+      # names the failing test and the retry outcome. The retry policy in
+      # .config/nextest.toml (retries = 1, fail-fast off) CAPTURES flakes
+      # as named FLAKY results instead of hiding them; the ci profile
+      # also writes a JUnit report naming every test.
+      - name: unit tests
+        env:
+          # CLAUDE.md invariant 5. The bin suite runs product code that
+          # consults this at the network boundary (identity.rs
+          # `may_call_out`), so without it a push can put live xREL /
+          # TMDB requests on the wire from a CI runner. Both other
+          # workflows already set it; this job was the one that did not.
+          NZBFAST_NO_ENRICH: "1"
+        run: |
+          cargo nextest run --profile ci -p nzbkit --lib
+          cargo nextest run --profile ci -p nzbfast --bin nzbfast
+          cargo nextest run --profile ci -p nzbfast --test settings_catalogue --test newznab
+      # Advisory / license / source gate against deny.toml. Prebuilt
+      # binary pinned by tag and checked by SHA256 rather than trusted
+      # (same pattern as the par2 fetch in pr-check.yml); a cargo
+      # install would cost minutes of compile per push. nightly.yml runs
+      # the same check on a schedule to catch advisories published
+      # against an unchanged tree.
+      - name: install cargo-deny
+        run: |
+          ver="0.20.2"
+          curl -sSfL -o cargo-deny.tar.gz \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${ver}/cargo-deny-${ver}-x86_64-unknown-linux-musl.tar.gz"
+          echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  cargo-deny.tar.gz" | sha256sum -c -
+          tar -xzf cargo-deny.tar.gz
+          sudo mv "cargo-deny-${ver}-x86_64-unknown-linux-musl/cargo-deny" /usr/local/bin/
+          rm -rf cargo-deny.tar.gz "cargo-deny-${ver}-x86_64-unknown-linux-musl"
+      - name: cargo deny
+        run: cargo deny check
+
+  # The same fast unit suites, on Windows, on every push. The workspace
+  # suite had NEVER run on Windows on any architecture until a
+  # Windows-on-ARM probe added the public pr-check job, and that first
+  # run exposed four real product bugs - `copy_tree`'s fsync alone broke
+  # every cross-device move and the spool migration on the x64 binary we
+  # ship, and a download folder and a library on two different drives is
+  # the ordinary Windows setup. Development happens in THIS repo and
+  # pr-check never runs here, so a Windows regression merged to main had
+  # nothing to catch it until the next nightly at best, or a public-repo
+  # PR at worst. This job names the commit.
+  #
+  # Unit suites only, and that is the cost call: Windows runners bill at
+  # 2x on a private repo, the daemon and e2e targets are the slow ones,
+  # and they already run on Windows nightly (nightly.yml). Per-push
+  # coverage buys the most where regressions are cheapest to attribute -
+  # the platform-divergent code (paths, file handles, fsync, memory
+  # probing) lives in nzbkit's lib and the nzbfast bin, which is exactly
+  # what runs here.
+  windows-unit:
+    if: github.repository != 'nzbfast/nzbfast'
+    runs-on: windows-latest
+    # Windows compiles this workspace a good deal slower than Linux
+    # does, and a cold cache pays the whole cost.
+    timeout-minutes: 60
+    # Its own group, separate from `check`. This leg measured 25-33
+    # minutes on the windows-ci-proof branch, which is why sharing a
+    # group with the Linux leg was fatal to both. On its own it lands a
+    # Windows verdict every half hour or so rather than never, and it no
+    # longer decides whether the fast Linux gate gets to finish.
+    #
+    # Half-hourly is the right cadence to buy here and not more: this
+    # runner bills at 2x on a private repo, so one at a time is also the
+    # cost ceiling. Batched coverage is the trade - a verdict names the
+    # tip it ran, and every commit under it is an ancestor.
+    concurrency:
+      group: ci-windows-${{ github.ref }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # No toolchain step: rust-toolchain.toml pins the version and
+      # rustup installs it for the msvc host on the first cargo
+      # invocation. Same as the Windows jobs in pr-check.yml and
+      # nightly.yml; an explicit `rustup default stable` would be
+      # overridden by that pin anyway.
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          # runner.os is in the key, so this cannot collide with the
+          # Linux job's cache.
+          key: ci-private-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      # Same nextest, same pinned version and same trust model as the
+      # Linux job above: prebuilt, fetched by version, checked by SHA256
+      # rather than trusted. Using nextest on both legs is not tidiness -
+      # it is what makes a Windows flake report as a named FLAKY test
+      # (retries = 1 in .config/nextest.toml) instead of turning main red
+      # on a rerun-and-it-passes failure, and Windows is where a new
+      # flake is most likely to appear first.
+      - name: install cargo-nextest
+        shell: pwsh
+        run: |
+          $ver = "0.9.140"
+          $url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$ver/cargo-nextest-$ver-x86_64-pc-windows-msvc.zip"
+          Invoke-WebRequest -Uri $url -OutFile cargo-nextest.zip
+          $want = "ec39698dfe5bcfffb7d5da037f226bc1670584ba247123f4e684a0f224fe828d"
+          $got = (Get-FileHash cargo-nextest.zip -Algorithm SHA256).Hash.ToLower()
+          Write-Host "cargo-nextest zip sha256 = $got"
+          if ($got -ne $want) { throw "cargo-nextest zip sha256 mismatch: got $got, expected $want" }
+          New-Item -ItemType Directory -Force -Path C:\nextest | Out-Null
+          Expand-Archive cargo-nextest.zip -DestinationPath C:\nextest -Force
+          Remove-Item cargo-nextest.zip
+          "C:\nextest" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      # Three steps, not one `run:` block with three lines: under the
+      # default pwsh shell a multi-line block only propagates the LAST
+      # exit code, so a red first suite followed by a green third one
+      # would read as a green step. The Linux job can use one block
+      # because bash runs with `set -e`.
+      #
+      # NZBFAST_NO_ENRICH keeps the metadata workers off the real
+      # internet (CLAUDE.md invariant 5). NZBFAST_LAN_TESTS is
+      # deliberately NOT set: it opens an all-interfaces listener, which
+      # on Windows raises the Defender Firewall dialog, and a hosted
+      # runner has nobody to click it.
+      - name: nzbkit lib suite
+        env:
+          NZBFAST_NO_ENRICH: "1"
+        run: cargo nextest run --profile ci -p nzbkit --lib
+      - name: nzbfast bin suite
+        env:
+          NZBFAST_NO_ENRICH: "1"
+        run: cargo nextest run --profile ci -p nzbfast --bin nzbfast
+      - name: fast integration targets
+        env:
+          NZBFAST_NO_ENRICH: "1"
+        run: cargo nextest run --profile ci -p nzbfast --test settings_catalogue --test newznab
+      # The clippy gate that CANNOT run on Linux. Until this step, clippy
+      # ran in exactly two jobs - `check` above and pr-check's
+      # `build-and-test` - and BOTH are ubuntu-latest. clippy only lints
+      # what compiles for the host, so every `#[cfg(windows)]` block in
+      # the tree was linted on no runner anywhere. That is the exact
+      # mirror of the trap that held main red for six pushes over one
+      # `unused_unsafe` behind `cfg(target_os = "linux")` that no macOS
+      # session could reproduce; macOS arms are covered in practice
+      # because development happens on Macs, so Windows was the one real
+      # hole. First run found nine, including a needless_return in
+      # mem.rs's cfg(windows) arm of exactly the shape that trap ended on.
+      #
+      # Here and not nightly, for the same reason the unit suites moved
+      # here in TODO 81: per-push names the commit that broke it. The
+      # 2x Windows billing bought little - measured on an i7-1280P, this
+      # step is 1m26s with all three workspace crates dirty and deps
+      # cached, which is the normal case since the cache above is keyed
+      # on Cargo.lock.
+      #
+      # Runs AFTER the suites deliberately: the tests are the signal this
+      # job exists for, and a lint failure must not cost us them.
+      # --keep-going because clippy stops at the first failing crate -
+      # without it nzbtray's errors masked nzbkit's, which masked
+      # nzbfast's, and each round surfaced only one crate's worth.
+      - name: clippy (windows-gated code)
+        run: cargo clippy -p nzbkit -p nzbfast -p nzbtray --all-targets --no-deps --keep-going -- -D warnings

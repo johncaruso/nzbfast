@@ -7,6 +7,7 @@
 //! step. `write_at` takes `&self` - decoded articles from
 //! multiple consumer tasks write concurrently.
 
+use crate::sync::{MutexExt, RwLockExt};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -32,6 +33,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// must not size the spill path off this number.
 pub fn raise_fd_limit() -> u64 {
     #[cfg(unix)]
+    // SAFETY: libc::rlimit is a plain all-integer C struct, so the zeroed
+    // value is valid; getrlimit and setrlimit only read/write through the
+    // pointers to the live stack locals (`lim`, `next`) passed here.
     unsafe {
         let mut lim: libc::rlimit = std::mem::zeroed();
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
@@ -39,7 +43,13 @@ pub fn raise_fd_limit() -> u64 {
         }
         let start = lim.rlim_cur;
         let hard = lim.rlim_max;
-        let cap = |v: u64| if hard == libc::RLIM_INFINITY { v } else { v.min(hard) };
+        let cap = |v: u64| {
+            if hard == libc::RLIM_INFINITY {
+                v
+            } else {
+                v.min(hard)
+            }
+        };
         for target in [65536u64, 16384, 4096, 1024] {
             let want = cap(target);
             if want <= lim.rlim_cur {
@@ -51,7 +61,7 @@ pub fn raise_fd_limit() -> u64 {
                 return want;
             }
         }
-        return start;
+        start
     }
     #[cfg(not(unix))]
     0
@@ -197,7 +207,10 @@ fn rotational(path: &Path) -> Option<bool> {
     // Probe the directory itself, not a file inside it: the caller may not
     // have created anything yet.
     let dev = std::fs::metadata(path).ok()?.dev();
-    let (major, minor) = unsafe { (libc::major(dev), libc::minor(dev)) };
+    // libc::major/minor are safe fns on Linux (they only bit-shift the
+    // integer dev value) - an `unsafe` block here trips `-D unused-unsafe`
+    // on the CI runner, the one platform that compiles this cfg.
+    let (major, minor) = (libc::major(dev), libc::minor(dev));
     let sys = std::fs::canonicalize(format!("/sys/dev/block/{major}:{minor}")).ok()?;
     let read = |dir: &Path| -> Option<bool> {
         let raw = std::fs::read_to_string(dir.join("queue/rotational")).ok()?;
@@ -333,7 +346,10 @@ pub struct FileWriter {
     /// "are bytes [off, off+len) really on disk yet?". Out-of-order
     /// arrival keeps this list tiny (≈ number of gaps, not writes).
     intervals: std::sync::Mutex<Vec<(u64, u64)>>,
-    /// Next `written` watermark at which maybe_drop_cache fires.
+    /// Next `written` watermark at which maybe_drop_cache fires. Read
+    /// only on platforms where the cache-drop path compiles in, hence
+    /// dead elsewhere.
+    #[allow(dead_code)]
     drop_next: AtomicU64,
 }
 
@@ -396,6 +412,8 @@ fn preallocate_capped(file: &File, size: u64, cap: u64) -> io::Result<()> {
         // Best-effort: mode 0 allocates real blocks for [0, target). Any
         // failure (EOPNOTSUPP, EINVAL, ENOSPC racing) leaves the sparse
         // file from set_len above, which is always correct.
+        // SAFETY: fallocate takes only integer arguments; the raw fd comes
+        // from `file`, whose borrow keeps it open across the call.
         unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, target as libc::off_t) };
     }
     Ok(())
@@ -451,6 +469,10 @@ impl FileWriter {
         }
         let file = OpenOptions::new()
             .create(true)
+            // Never truncate: this is the RESUME open. The bytes already on
+            // disk are the point - a truncate here silently restarts the
+            // download it was called to continue.
+            .truncate(false)
             .read(true)
             .write(true)
             .open(path)?;
@@ -513,18 +535,24 @@ impl FileWriter {
         const STRIDE: u64 = 16 << 20;
         let w = self.written.load(Ordering::Relaxed);
         let due = self.drop_next.load(Ordering::Relaxed);
-        if w < due || self.drop_next.compare_exchange(
-            due, w + STRIDE, Ordering::Relaxed, Ordering::Relaxed
-        ).is_err() {
+        if w < due
+            || self
+                .drop_next
+                .compare_exchange(due, w + STRIDE, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
             return;
         }
         use std::os::unix::io::AsRawFd;
         // Parked: the handle is gone and its pages were synced on the way
         // down, so there is nothing to write back or evict.
-        let g = self.file.read().unwrap_or_else(|e| e.into_inner());
+        let g = self.file.read_ok();
         let Some(fd) = g.as_ref().map(|f| f.as_raw_fd()) else {
             return;
         };
+        // SAFETY: both calls take only the raw fd plus integer arguments;
+        // the read guard `g` keeps the File open across them, so `fd`
+        // stays valid.
         unsafe {
             // Start writeback for everything dirty, then drop what's
             // clean. Repeated calls sweep up what writeback finished.
@@ -550,7 +578,7 @@ impl FileWriter {
     /// lands now would be silently overwritten (or would corrupt what that
     /// process is rebuilding). Failing is the honest answer.
     fn handle(&self) -> io::Result<std::sync::RwLockReadGuard<'_, Option<File>>> {
-        let g = self.file.read().unwrap_or_else(|e| e.into_inner());
+        let g = self.file.read_ok();
         if g.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -578,7 +606,7 @@ impl FileWriter {
     /// `Arc`: releasing one reference cannot close anything while the daemon's
     /// stream picker or a settle reader still holds a clone.
     pub fn park(&self) -> io::Result<()> {
-        let mut g = self.file.write().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.file.write_ok();
         if let Some(f) = g.as_ref() {
             f.sync_data()?;
         }
@@ -598,7 +626,7 @@ impl FileWriter {
     ///
     /// [`park`]: FileWriter::park
     pub fn unpark(&self) -> io::Result<()> {
-        let mut g = self.file.write().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.file.write_ok();
         if g.is_some() {
             return Ok(());
         }
@@ -625,7 +653,7 @@ impl FileWriter {
         }
         self.written.fetch_add(len, Ordering::Relaxed);
         let (s, e) = (offset, offset + len);
-        let mut iv = self.intervals.lock().unwrap();
+        let mut iv = self.intervals.lock_ok();
         // First interval that could touch/overlap on the left (its end
         // reaches `s`), and first that starts beyond `e` (can't touch).
         let lo = iv.partition_point(|&(_, fe)| fe < s);
@@ -648,7 +676,7 @@ impl FileWriter {
 
     /// True when every byte of [off, off+len) has been written.
     pub fn covered(&self, off: u64, len: u64) -> bool {
-        let iv = self.intervals.lock().unwrap();
+        let iv = self.intervals.lock_ok();
         iv.iter().any(|&(s, e)| s <= off && off + len <= e)
     }
 
@@ -657,7 +685,7 @@ impl FileWriter {
     /// the extractor's fallback read-back must never copy those.
     pub fn covered_intervals(&self, off: u64, len: u64) -> Vec<(u64, u64)> {
         let end = off + len;
-        let iv = self.intervals.lock().unwrap();
+        let iv = self.intervals.lock_ok();
         iv.iter()
             .filter_map(|&(s, e)| {
                 let cs = s.max(off);
@@ -669,7 +697,7 @@ impl FileWriter {
 
     /// End of the contiguous prefix starting at 0 (the streaming frontier).
     pub fn contiguous_from_start(&self) -> u64 {
-        let iv = self.intervals.lock().unwrap();
+        let iv = self.intervals.lock_ok();
         match iv.first() {
             Some(&(0, e)) => e,
             _ => 0,
@@ -688,7 +716,7 @@ impl FileWriter {
     ///
     /// [`park`]: FileWriter::park
     pub fn sync(&self) -> io::Result<()> {
-        match self.file.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        match self.file.read_ok().as_ref() {
             Some(f) => f.sync_data(),
             None => Ok(()),
         }
@@ -827,11 +855,13 @@ pub fn sanitize_filename_for(name: &str, windows: bool) -> String {
             c => c.to_ascii_uppercase(),
         })
         .collect();
-    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CLOCK" | "CONIN" | "CONOUT")
-        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
-            && stem.len() == 4
-            && stem.as_bytes()[3].is_ascii_digit()
-            && stem.as_bytes()[3] != b'0');
+    let reserved = matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CLOCK" | "CONIN" | "CONOUT"
+    ) || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+        && stem.len() == 4
+        && stem.as_bytes()[3].is_ascii_digit()
+        && stem.as_bytes()[3] != b'0');
     if reserved {
         format!("_{trimmed}")
     } else {
@@ -962,7 +992,10 @@ mod tests {
         assert_eq!(here, Storage::Unknown, "only Linux exposes the flag");
         #[cfg(target_os = "linux")]
         assert!(
-            matches!(here, Storage::Solid | Storage::Unknown | Storage::Rotational),
+            matches!(
+                here,
+                Storage::Solid | Storage::Unknown | Storage::Rotational
+            ),
             "{here:?}"
         );
     }
@@ -972,7 +1005,10 @@ mod tests {
     /// else - unset, `auto`, a typo - defers to the probe.
     #[test]
     fn storage_override_maps_both_directions_and_defers_otherwise() {
-        assert_eq!(storage_override(Some("rotational")), Some(Storage::Rotational));
+        assert_eq!(
+            storage_override(Some("rotational")),
+            Some(Storage::Rotational)
+        );
         assert_eq!(storage_override(Some("hdd")), Some(Storage::Rotational));
         assert_eq!(storage_override(Some("ssd")), Some(Storage::Solid));
         assert_eq!(storage_override(Some("solid")), Some(Storage::Solid));
@@ -1025,7 +1061,11 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn fd_limit_is_a_no_op_where_there_is_no_such_limit() {
-        assert_eq!(raise_fd_limit(), 0, "nothing to raise on Windows - say so, don't invent one");
+        assert_eq!(
+            raise_fd_limit(),
+            0,
+            "nothing to raise on Windows - say so, don't invent one"
+        );
     }
 
     /// Whichever branch `preallocate` takes (raw fallocate where the
@@ -1296,7 +1336,10 @@ mod tests {
         // separators survive, so `join` can never escape the base.
         for s in ["../../../../tmp/pwned", "/tmp/abs", "..\\..\\win", "a/../b"] {
             let out = sanitize_filename(s);
-            assert!(!out.contains('/') && !out.contains('\\'), "{s:?} -> {out:?}");
+            assert!(
+                !out.contains('/') && !out.contains('\\'),
+                "{s:?} -> {out:?}"
+            );
             assert!(!out.starts_with('.'), "{s:?} -> {out:?}");
         }
         // Dots separated by spaces. The trim chain is not a fixed point:
@@ -1329,10 +1372,16 @@ mod tests {
             );
         }
         // Unix keeps ':' - it is legal there and common in release names.
-        assert_eq!(sanitize_filename_for("Movie: The Sequel.mkv", false), "Movie: The Sequel.mkv");
+        assert_eq!(
+            sanitize_filename_for("Movie: The Sequel.mkv", false),
+            "Movie: The Sequel.mkv"
+        );
         // Control characters (incl. embedded NUL/newline/tab) are replaced.
         let ctl = sanitize_filename("ev\u{7}il\nname\t.mkv");
-        assert!(!ctl.chars().any(|c| c.is_control()), "control char survived: {ctl:?}");
+        assert!(
+            !ctl.chars().any(|c| c.is_control()),
+            "control char survived: {ctl:?}"
+        );
         // Trailing dot/space that Windows would strip.
         assert_eq!(sanitize_filename("evil. "), "evil");
         // Windows reserved device names get a prefix so File::create can't
@@ -1372,19 +1421,32 @@ pub fn hide_from_user(path: &Path) {
     {
         const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
         const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
+        // SAFETY: the declarations must match the real kernel32 exports;
+        // these mirror the documented Win32 signatures (GetFileAttributesW:
+        // LPCWSTR -> DWORD; SetFileAttributesW: LPCWSTR, DWORD -> BOOL).
         unsafe extern "system" {
             fn GetFileAttributesW(name: *const u16) -> u32;
             fn SetFileAttributesW(name: *const u16, attrs: u32) -> i32;
         }
         use std::os::windows::ffi::OsStrExt;
-        let wide: Vec<u16> =
-            path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: `wide` is NUL-terminated (the chained 0 above) and stays
+        // alive across both calls, so each receives a valid wide C string;
+        // the attribute word is a plain integer.
         unsafe {
             // OR into whatever is already set: replacing the attribute
             // word outright would clear ARCHIVE/READONLY and anything
             // else the volume put there.
             let cur = GetFileAttributesW(wide.as_ptr());
-            let base = if cur == INVALID_FILE_ATTRIBUTES { 0 } else { cur };
+            let base = if cur == INVALID_FILE_ATTRIBUTES {
+                0
+            } else {
+                cur
+            };
             SetFileAttributesW(wide.as_ptr(), base | FILE_ATTRIBUTE_HIDDEN);
         }
     }

@@ -11,7 +11,9 @@
 //!   folder after it completes successfully.
 
 use std::path::{Path, PathBuf};
+use tracing::{info, warn};
 
+use crate::MutexExt;
 use serde::{Deserialize, Serialize};
 
 /// One Smart Folder rule as stored in settings.json ("smart_folders").
@@ -116,13 +118,14 @@ pub fn parse_ext_list(v: &str) -> Vec<String> {
 /// the wrapper ALWAYS comes off the name so a password never leaks into
 /// the display name or the output folder.
 pub fn name_password(name: &str) -> Option<(String, String)> {
-    if let (Some(a), Some(b)) = (name.find("{{"), name.rfind("}}")) {
-        if b > a + 2 {
-            let pw = name[a + 2..b].to_string();
-            let clean =
-                format!("{}{}", &name[..a], &name[b + 2..]).trim().to_string();
-            return Some((pw, clean));
-        }
+    if let (Some(a), Some(b)) = (name.find("{{"), name.rfind("}}"))
+        && b > a + 2
+    {
+        let pw = name[a + 2..b].to_string();
+        let clean = format!("{}{}", &name[..a], &name[b + 2..])
+            .trim()
+            .to_string();
+        return Some((pw, clean));
     }
     if let Some(i) = name.to_ascii_lowercase().find("password=") {
         let pw = name[i + 9..].trim().trim_end_matches('}').to_string();
@@ -134,14 +137,15 @@ pub fn name_password(name: &str) -> Option<(String, String)> {
             return Some((pw, clean));
         }
     }
-    if let (Some(a), Some(b)) = (name.find('{'), name.rfind('}')) {
-        if b > a + 1 {
-            let pw = &name[a + 1..b];
-            if !pw.is_empty() && !pw.contains(['{', '}']) {
-                let clean =
-                    format!("{}{}", &name[..a], &name[b + 1..]).trim().to_string();
-                return Some((pw.to_string(), clean));
-            }
+    if let (Some(a), Some(b)) = (name.find('{'), name.rfind('}'))
+        && b > a + 1
+    {
+        let pw = &name[a + 1..b];
+        if !pw.is_empty() && !pw.contains(['{', '}']) {
+            let clean = format!("{}{}", &name[..a], &name[b + 1..])
+                .trim()
+                .to_string();
+            return Some((pw.to_string(), clean));
         }
     }
     None
@@ -195,7 +199,10 @@ fn tv_path_as(stem: &str, show_of: impl Fn(&str) -> String) -> Option<(String, O
             return None;
         }
         let (year, air) = nzbkit::release::air_date_parts(p.date.as_deref()?)?;
-        return Some((format!("{show}/Season {year}"), Some(format!("{show} - {air}"))));
+        return Some((
+            format!("{show}/Season {year}"),
+            Some(format!("{show} - {air}")),
+        ));
     };
     let dir = format!("{show}/Season {season:02}");
     // Multi-episode posts keep the whole range in the filed name
@@ -206,6 +213,306 @@ fn tv_path_as(stem: &str, show_of: impl Fn(&str) -> String) -> Option<(String, O
         None => format!("{show} - S{season:02}E{e:02}"),
     });
     Some((dir, base))
+}
+
+// ---------------------------------------------------------------------------
+// Episode titles in TV names (TODO 78) - the last *arr rename parity piece.
+// ---------------------------------------------------------------------------
+
+/// What TV filing wrote after the episode base, as the job recorded it at
+/// the moment it wrote it: the episode-title segment (`" - Children"`,
+/// empty unless the `rename_episode_titles` setting was on AND the cache
+/// knew the title) and the quality suffix (`" [1080p]"`).
+///
+/// The two travel together because ownership of a name inside a SHARED
+/// season folder is decided by the WHOLE tail - see
+/// [`is_filed_episode_file`]. A delete that knew only the suffix half
+/// matched nothing at all once a title was in the name, which silently
+/// turned "delete this episode" and "play this episode" into no-ops.
+///
+/// A struct rather than two more `&str` parameters for the reason
+/// [`crate::serve::FinalizeJob`] is one: they are the same type, and a
+/// caller that swapped them would have compiled.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FiledTail {
+    pub title: String,
+    pub suffix: String,
+}
+
+impl FiledTail {
+    /// The quality suffix alone - every filed job carried exactly this
+    /// before episode titles existed, and a record written back then
+    /// still means it.
+    ///
+    /// Tests only: production builds this from the job record, where the
+    /// title half comes from the same place and cannot be forgotten.
+    #[cfg(test)]
+    pub fn suffix(suffix: &str) -> Self {
+        Self {
+            title: String::new(),
+            suffix: suffix.to_string(),
+        }
+    }
+
+    fn lowered(&self) -> Self {
+        Self {
+            title: self.title.to_ascii_lowercase(),
+            suffix: self.suffix.to_ascii_lowercase(),
+        }
+    }
+}
+
+/// Bytes one path component gets on every filesystem this lands on -
+/// ext4, APFS, NTFS, and the SMB/NFS shares `move_completed` writes to.
+const COMPONENT_BYTES: usize = 255;
+
+/// Room held back from [`COMPONENT_BYTES`] for the extension chain, so
+/// the title's budget depends only on the episode base and the quality
+/// suffix.
+///
+/// It has to. The title is RECORDED ([`FiledTail`]) and later matched
+/// literally, while the extension differs between files of one episode -
+/// a `.mkv` feature beside its `.en.srt`. Budgeting against the real
+/// extension would truncate the two differently and the record could
+/// only hold one of the answers.
+const EXT_RESERVE: usize = 16;
+
+/// How many episodes one post may claim before we stop collecting titles
+/// for it. A double or triple is ordinary; a range in the dozens is a
+/// season pack wearing an episode's clothes, and joining 24 titles
+/// produces a name that is all truncation and no information.
+const MAX_EP_SPAN: u32 = 8;
+
+/// The separator between the episode base and its title, which is
+/// Sonarr's default and what Plex, Jellyfin and Emby read back.
+const TITLE_SEP: &str = " - ";
+
+/// Episode titles for ONE show, read out of the enrichment cache before
+/// any renaming starts.
+///
+/// Cache-only by construction: this owns its answers already, so no
+/// rename can reach the network however obscure the show is or however
+/// long the job runs. That is the house rule stated in `tasks.rs` -
+/// network lives on the enricher threads - and it is also why a cache
+/// miss simply produces the name we produced before this existed, rather
+/// than a deferred second rename. A rename that lands after an *arr has
+/// imported the file breaks the import (memory `nzbfast-auto-rename`).
+///
+/// Empty is the ordinary case, and means every name below is
+/// byte-identical to what it was.
+#[derive(Clone, Debug, Default)]
+pub struct EpisodeTitles {
+    by_num: std::collections::HashMap<(u32, u32), String>,
+}
+
+impl EpisodeTitles {
+    /// Build from `(season, episode, title)` triples - the shape
+    /// `wall::EpInfo` carries out of the `eplist:*` cache blob. Blank
+    /// titles are dropped here so no caller has to test for them.
+    pub fn new(eps: impl IntoIterator<Item = (u32, u32, String)>) -> Self {
+        Self {
+            by_num: eps
+                .into_iter()
+                .filter(|(_, _, name)| !name.trim().is_empty())
+                .map(|(s, e, name)| ((s, e), name))
+                .collect(),
+        }
+    }
+
+    /// The `" - Episode Title"` segment for a release stem, ready to sit
+    /// between `base` and `suffix`, or an empty string when there is no
+    /// title to write.
+    ///
+    /// `base` and `suffix` are passed only for their LENGTH: the finished
+    /// component has to fit a filesystem name, and the title is the part
+    /// that gives way (the base identifies the episode and the suffix
+    /// tells one release from another - neither can be shortened without
+    /// breaking something).
+    pub fn segment(&self, stem: &str, base: &str, suffix: &str) -> String {
+        if self.by_num.is_empty() {
+            return String::new();
+        }
+        let Some((season, ep, ep2)) = confident_episode(stem) else {
+            return String::new();
+        };
+        let Some(joined) = self.joined(season, ep, ep2) else {
+            return String::new();
+        };
+        // The same strong, colon-aware sanitiser the show name gets: a
+        // title arrives from a third party and can hold anything a
+        // human typed, including "/" and a trailing dot.
+        let title = nzbkit::release::sanitize_name(&joined);
+        if title.is_empty() {
+            return String::new();
+        }
+        let spent = base.len() + TITLE_SEP.len() + suffix.len() + EXT_RESERVE;
+        let title = fit_title(&title, COMPONENT_BYTES.saturating_sub(spent));
+        if title.is_empty() {
+            return String::new();
+        }
+        format!("{TITLE_SEP}{title}")
+    }
+
+    /// Every title this post covers, as one string.
+    ///
+    /// Sonarr's conventions, because the libraries downstream were built
+    /// against them: distinct titles join with `" + "`, and a post that
+    /// covers both halves of a two-parter collapses to the shared stem
+    /// ("The Ceremony (1)" + "The Ceremony (2)" -> "The Ceremony")
+    /// rather than repeating it. Episodes the cache doesn't know are
+    /// skipped, so a partly-known double still gets the title it has.
+    fn joined(&self, season: u32, ep: u32, ep2: Option<u32>) -> Option<String> {
+        let last = ep2
+            .filter(|&e2| e2 > ep)
+            .unwrap_or(ep)
+            .min(ep.saturating_add(MAX_EP_SPAN - 1));
+        let titles: Vec<&str> = (ep..=last)
+            .filter_map(|e| self.by_num.get(&(season, e)))
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty())
+            .collect();
+        let first = *titles.first()?;
+        // Part collapse. Judged on ALL of them, and only when what is
+        // left still says something: a two-parter titled bare "Part 1" /
+        // "Part 2" strips to nothing, and joining those is the honest
+        // answer.
+        if titles.len() > 1 {
+            let stem = strip_part_marker(first);
+            if !stem.is_empty()
+                && titles
+                    .iter()
+                    .all(|t| strip_part_marker(t).eq_ignore_ascii_case(stem))
+            {
+                return Some(stem.to_string());
+            }
+        }
+        let mut out: Vec<&str> = Vec::with_capacity(titles.len());
+        for t in titles {
+            if !out.iter().any(|seen| seen.eq_ignore_ascii_case(t)) {
+                out.push(t);
+            }
+        }
+        Some(out.join(" + "))
+    }
+}
+
+/// The episode-title segment filing wrote for a job's OWN episode, which
+/// is what [`FiledTail`] has to record so a later delete or play can find
+/// the file again.
+///
+/// Computed from the same inputs `tv_organize` computes it from, so for
+/// the single-episode jobs that ownership matching applies to at all it
+/// is the same string. (A season pack has no single episode base -
+/// [`filed_bases`] is empty for one - so it never reaches a matcher.)
+///
+/// One seam is deliberately not chased: a show still filed under a
+/// PRE-sanitiser folder name ([`legacy_tv_path`]) has a base of a
+/// different length, so a title long enough to be truncated could be
+/// truncated by one word more or less there. The consequence is a name
+/// this stops recognising, which leaves a file behind - the cheap
+/// mistake this whole matcher exists to prefer.
+pub fn filed_title_segment(stem: &str, suffix: &str, titles: &EpisodeTitles) -> String {
+    match tv_path(stem) {
+        Some((_, Some(base))) => titles.segment(stem, &base, suffix),
+        _ => String::new(),
+    }
+}
+
+/// The season and episode numbers behind a release stem, but only when
+/// [`tv_path`] would also have built a specific episode base from it.
+///
+/// Kept in step with `tv_path_as`'s confident arm on purpose: a title may
+/// only ever decorate a name that already names one episode. A dated
+/// show (no season, no number) is deliberately excluded - the cache is
+/// keyed by season and number, and matching one by airdate is the
+/// separate piece of work TODO 78 records as a follow-up.
+fn confident_episode(stem: &str) -> Option<(u32, u32, Option<u32>)> {
+    let p = crate::wall::parse_release(stem);
+    if p.kind != crate::wall::Kind::Tv {
+        return None;
+    }
+    let season = p.season.filter(|&s| s > 0)?;
+    Some((season, p.episode?, p.episode2))
+}
+
+/// A title with its trailing part marker removed: "The Ceremony (2)",
+/// "The Ceremony: Part 2", "The Ceremony, Part Two" all reduce to "The
+/// Ceremony". Returns the title unchanged when it carries no marker.
+///
+/// Only a marker at the END counts, and only a recognised NUMBER after
+/// the word: "Part of the Plan" and "Parting Shot" are titles, not
+/// halves of one.
+fn strip_part_marker(title: &str) -> &str {
+    let s = title.trim_end();
+    // "The Ceremony (2)"
+    if let Some(body) = s.strip_suffix(')')
+        && let Some(open) = body.rfind('(')
+        && is_part_number(&body[open + 1..])
+    {
+        return trim_marker_sep(&body[..open]);
+    }
+    // "The Ceremony: Part 2" and every separator it is written with.
+    // `to_ascii_lowercase` preserves byte length, so the offset it finds
+    // indexes the original.
+    let lower = s.to_ascii_lowercase();
+    if let Some(at) = lower.rfind("part ")
+        && is_part_number(&s[at + "part ".len()..])
+    {
+        return trim_marker_sep(&s[..at]);
+    }
+    s
+}
+
+fn trim_marker_sep(s: &str) -> &str {
+    s.trim_end().trim_end_matches([':', '-', ',']).trim_end()
+}
+
+/// Does this read as a part number - "2", "Two", "II"? Closed lists, not
+/// a parser: everything it accepts is a word we DELETE from the user's
+/// filename, so a false positive costs information that was in the title.
+fn is_part_number(tok: &str) -> bool {
+    let t = tok.trim();
+    if !t.is_empty() && t.len() <= 3 && t.bytes().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    matches!(
+        t.to_ascii_lowercase().as_str(),
+        "one" | "two" | "three" | "four" | "five" | "six" | "i" | "ii" | "iii" | "iv" | "v" | "vi"
+    )
+}
+
+/// Cut a title down to `room` BYTES at a word boundary, or to nothing
+/// when no useful piece of it fits.
+///
+/// Bytes, not characters: the limit filesystems enforce is on the encoded
+/// name, and a Cyrillic or Japanese title spends two or three bytes per
+/// character. Never splits a UTF-8 sequence, and prefers a whole-word cut
+/// so the result reads as a shortened title rather than as damage.
+fn fit_title(title: &str, room: usize) -> String {
+    if title.len() <= room {
+        return title.to_string();
+    }
+    // Longest prefix inside the budget that is also a character boundary.
+    let mut end = room.min(title.len());
+    while end > 0 && !title.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = &title[..end];
+    // Back off to the last word boundary, unless that would leave a
+    // fragment too short to say anything - a single word longer than the
+    // whole budget is better cut mid-word than dropped.
+    let at_word = cut.rfind(' ').unwrap_or(0);
+    let kept = if at_word * 2 >= end {
+        &cut[..at_word]
+    } else {
+        cut
+    };
+    // Truncation can expose a trailing separator or a dot, which is what
+    // `sanitize_name` had already removed from the end of the full title.
+    kept.trim_end()
+        .trim_end_matches([',', ':', ';', '-', '_', '.', '('])
+        .trim_end()
+        .to_string()
 }
 
 /// Delete the file(s) a completed job was TV-filed to, WITHOUT touching
@@ -237,14 +544,18 @@ fn tv_path_as(stem: &str, show_of: impl Fn(&str) -> String) -> Option<(String, O
 /// - a release that didn't parse as a specific episode, or a filed name
 /// that didn't follow the rename (season-pack / collision fallback / a
 /// suffix that no longer matches because the naming settings changed).
-pub fn delete_filed_episode(dir: &Path, stem: &str, suffix: &str) -> usize {
+pub fn delete_filed_episode(dir: &Path, stem: &str, tail: &FiledTail) -> usize {
     let bases = filed_bases(stem);
     if bases.is_empty() {
         return 0;
     }
     // Read once, for the whole delete: see `remove_user_file`.
+    // Inline rather than parked with the sweeps' deferred worker ON
+    // PURPOSE: this deletes inside the user's LIBRARY, where a hidden
+    // staging folder is not ours to create - and it is one file, bounded
+    // by TRASH_DEADLINE plus the latch.
     let recoverable = delete_to_trash();
-    let suffix_lower = suffix.to_ascii_lowercase();
+    let tail_lower = tail.lowered();
     let Ok(rd) = std::fs::read_dir(dir) else {
         return 0;
     };
@@ -258,10 +569,10 @@ pub fn delete_filed_episode(dir: &Path, stem: &str, suffix: &str) -> usize {
             .file_name()
             .map(|n| n.to_string_lossy().to_ascii_lowercase())
             .unwrap_or_default();
-        if is_filed_episode_file(&name, &bases, &suffix_lower) {
+        if is_filed_episode_file(&name, &bases, &tail_lower) {
             match remove_user_file(&path, recoverable) {
                 Ok(()) => removed += 1,
-                Err(e) => eprintln!("[smart] delete filed {}: {e}", path.display()),
+                Err(e) => warn!(target: "smart", "delete filed {}: {e}", path.display()),
             }
         }
     }
@@ -286,28 +597,40 @@ fn filed_bases(stem: &str) -> Vec<String> {
 }
 
 /// Does `name` belong to the release filed under one of `bases` with
-/// `suffix`?
+/// `tail`?
 ///
 /// The one rule that decides ownership inside a SHARED season folder, so
 /// both the delete ([`delete_filed_episode`]) and the play
 /// ([`find_filed_episode_media`]) paths ask it rather than each carrying
-/// their own idea of "this job's file": match "Show - S03E05", then THIS
-/// release's own quality suffix, then only a tail our own rename can
-/// produce - never another quality of the same episode, a sibling
-/// ("…E06"), a longer episode number ("…E050"), or the user's own
-/// Sonarr/Plex file.
+/// their own idea of "this job's file": match "Show - S03E05", then the
+/// episode title THIS job wrote (when it wrote one), then THIS release's
+/// own quality suffix, then only a tail our own rename can produce -
+/// never another quality of the same episode, a sibling ("…E06"), a
+/// longer episode number ("…E050"), or the user's own Sonarr/Plex file.
+///
+/// The title is matched LITERALLY, from the job's own record of what it
+/// wrote ([`FiledTail`]), never recomputed: the cache behind it is
+/// refreshed every 12 hours and a provider that re-spells an episode
+/// would otherwise re-point this at a file that no longer exists - or,
+/// worse, at a neighbouring one. A record that carries no title (every
+/// job filed before this existed, and every job filed with the setting
+/// off) leaves this exactly as it was.
 ///
 /// All arguments arrive ASCII-lowercased.
-fn is_filed_episode_file(name: &str, bases: &[String], suffix_lower: &str) -> bool {
+fn is_filed_episode_file(name: &str, bases: &[String], tail_lower: &FiledTail) -> bool {
+    /// An empty part of the tail matches without consuming anything -
+    /// which is what makes "no title recorded" mean "as it was before".
+    fn strip<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+        if prefix.is_empty() {
+            Some(s)
+        } else {
+            s.strip_prefix(prefix)
+        }
+    }
     bases.iter().any(|base_lower| {
         name.strip_prefix(base_lower.as_str())
-            .and_then(|rest| {
-                if suffix_lower.is_empty() {
-                    Some(rest)
-                } else {
-                    rest.strip_prefix(suffix_lower)
-                }
-            })
+            .and_then(|rest| strip(rest, &tail_lower.title))
+            .and_then(|rest| strip(rest, &tail_lower.suffix))
             .is_some_and(is_rename_tail)
     })
 }
@@ -335,12 +658,12 @@ fn is_filed_episode_file(name: &str, bases: &[String], suffix_lower: &str) -> bo
 /// fallback, files moved away by hand, or naming settings that changed
 /// since filing. The caller reports "no playable file" rather than falling
 /// back to a guess, because every guess here is a sibling episode.
-pub fn find_filed_episode_media(dir: &Path, stem: &str, suffix: &str) -> Option<PathBuf> {
+pub fn find_filed_episode_media(dir: &Path, stem: &str, tail: &FiledTail) -> Option<PathBuf> {
     let bases = filed_bases(stem);
     if bases.is_empty() {
         return None;
     }
-    let suffix_lower = suffix.to_ascii_lowercase();
+    let tail_lower = tail.lowered();
     let mut hits: Vec<PathBuf> = std::fs::read_dir(dir)
         .ok()?
         .flatten()
@@ -352,7 +675,7 @@ pub fn find_filed_episode_media(dir: &Path, stem: &str, suffix: &str) -> Option<
                     is_filed_episode_file(
                         &n.to_string_lossy().to_ascii_lowercase(),
                         &bases,
-                        &suffix_lower,
+                        &tail_lower,
                     )
                 })
         })
@@ -418,8 +741,12 @@ fn is_rename_tail(rest: &str) -> bool {
     }
     // Optional "-GRP". A group token is one word, so a space anywhere in
     // it means this is a title, not our suffix.
-    let Some(g) = rest.strip_prefix('-') else { return false };
-    let Some((group, ext)) = g.split_once('.') else { return false };
+    let Some(g) = rest.strip_prefix('-') else {
+        return false;
+    };
+    let Some((group, ext)) = g.split_once('.') else {
+        return false;
+    };
     !group.is_empty()
         && !ext.is_empty()
         && !group.contains([' ', '[', ']'])
@@ -493,8 +820,8 @@ fn legacy_sanitize(t: &str) -> String {
 /// a disc rip, so they must be recognised as the largest video (the sample
 /// gate measures against it) as well as kept.
 const VIDEO_EXTS: &[&str] = &[
-    "mkv", "mp4", "avi", "m4v", "mov", "wmv", "mpg", "mpeg", "ts", "m2ts", "webm", "flv",
-    "divx", "vob", "iso", "img",
+    "mkv", "mp4", "avi", "m4v", "mov", "wmv", "mpg", "mpeg", "ts", "m2ts", "webm", "flv", "divx",
+    "vob", "iso", "img",
 ];
 
 /// Disc-structure and companion-track files that belong to a video payload
@@ -531,9 +858,8 @@ const SUBTITLE_EXTS: &[&str] = &["srt", "sub", "idx", "ass", "ssa", "vtt", "smi"
 /// the wrong place to be lucky, so the payload formats are named.
 const PAYLOAD_EXTS: &[&str] = &[
     // audio
-    "mp3", "m4b", "opus", "ogg", "oga", "wav", "aiff", "aif", "wma", "alac", "ape", "wv",
-    "cue", "log",
-    // books and comics
+    "mp3", "m4b", "opus", "ogg", "oga", "wav", "aiff", "aif", "wma", "alac", "ape", "wv", "cue",
+    "log", // books and comics
     "epub", "mobi", "azw", "azw3", "pdf", "cbz", "cbr", "cb7", "djvu",
 ];
 
@@ -547,7 +873,9 @@ const JUNK_EXTS: &[&str] = &[
 ];
 
 fn ext_of(p: &Path) -> String {
-    p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default()
+    p.extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default()
 }
 
 /// A still-packed archive volume or part: RAR (`.rar`/`.rNN`, rollover
@@ -605,7 +933,10 @@ fn looks_like_video_bytes(p: &Path) -> bool {
         return false;
     }
     let mut b = [0u8; 12];
-    if std::fs::File::open(p).and_then(|mut f| f.read_exact(&mut b)).is_err() {
+    if std::fs::File::open(p)
+        .and_then(|mut f| f.read_exact(&mut b))
+        .is_err()
+    {
         return false;
     }
     // Matroska/WebM (EBML), MP4/MOV family (....ftyp), AVI (RIFF....AVI ),
@@ -628,7 +959,10 @@ fn looks_like_video_bytes(p: &Path) -> bool {
 /// whole set on part 1 and hands back every member, which is the same
 /// collector the reporting path uses.
 fn zip_part_set(dir: &Path) -> std::collections::HashSet<PathBuf> {
-    nzbkit::zip::scan(dir).into_iter().flat_map(|f| f.parts).collect()
+    nzbkit::zip::scan(dir)
+        .into_iter()
+        .flat_map(|f| f.parts)
+        .collect()
 }
 
 /// Does the file start with the `PAR2\0PKT` packet magic? Obfuscated
@@ -648,7 +982,9 @@ fn par2_magic(p: &Path) -> bool {
 }
 
 fn stem_lower(p: &Path) -> String {
-    p.file_stem().map(|s| s.to_string_lossy().to_ascii_lowercase()).unwrap_or_default()
+    p.file_stem()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default()
 }
 
 /// A "sample"/"proof"-named video. Name only - NOT sufficient on its own to
@@ -681,12 +1017,11 @@ fn is_deletable_sample(p: &Path, feature_len: u64) -> bool {
     // episode with "sample" in its title sits small beside a
     // double-length special, but its own header says it runs like an
     // episode - nothing that long is deleted on a name.
-    if matches!(ext_of(p).as_str(), "mkv" | "webm") {
-        if let Some(i) = nzbkit::mkv::probe(p) {
-            if i.duration_secs.is_some_and(|d| d >= 15.0 * 60.0) {
-                return false;
-            }
-        }
+    if matches!(ext_of(p).as_str(), "mkv" | "webm")
+        && let Some(i) = nzbkit::mkv::probe(p)
+        && i.duration_secs.is_some_and(|d| d >= 15.0 * 60.0)
+    {
+        return false;
     }
     true
 }
@@ -772,10 +1107,10 @@ fn drop_finder_droppings(d: &Path) {
     let Ok(rd) = std::fs::read_dir(d) else { return };
     for entry in rd.flatten() {
         let path = entry.path();
-        if is_finder_dropping(&path) {
-            if let Err(e) = std::fs::remove_file(&path) {
-                eprintln!("[cleanup] {}: {e}", path.display());
-            }
+        if is_finder_dropping(&path)
+            && let Err(e) = std::fs::remove_file(&path)
+        {
+            warn!(target: "cleanup", "{}: {e}", path.display());
         }
     }
 }
@@ -806,7 +1141,9 @@ fn prune_empty_dirs(dir: &Path, depth: u32) -> usize {
         return 0;
     }
     let mut removed = 0;
-    let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
     for entry in rd.flatten() {
         let path = entry.path();
         if !is_real_dir(&path) {
@@ -820,10 +1157,10 @@ fn prune_empty_dirs(dir: &Path, depth: u32) -> usize {
         if std::fs::read_dir(&path).is_ok_and(|mut r| r.next().is_none()) {
             match std::fs::remove_dir(&path) {
                 Ok(()) => {
-                    println!("[cleanup] empty dir {}", path.display());
+                    info!(target: "cleanup", "empty dir {}", path.display());
                     removed += 1;
                 }
-                Err(e) => eprintln!("[cleanup] {}: {e}", path.display()),
+                Err(e) => warn!(target: "cleanup", "{}: {e}", path.display()),
             }
         }
     }
@@ -866,8 +1203,11 @@ fn largest_video(dir: &Path) -> Option<PathBuf> {
             best = Some((len, path));
         }
     };
-    let tops: Vec<PathBuf> =
-        std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).collect();
+    let tops: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .collect();
     for path in tops {
         if is_real_dir(&path) {
             if let Ok(rd) = std::fs::read_dir(&path) {
@@ -889,6 +1229,7 @@ pub fn cleanup(dir: &Path, exts: &[String]) -> usize {
     let mut removed = 0;
     // Read once, for the whole sweep: see `remove_user_file`.
     let recoverable = delete_to_trash();
+    let staging = trash_staging_dir(dir);
     let mut sweep = |d: &Path| {
         let Ok(rd) = std::fs::read_dir(d) else { return };
         for entry in rd.flatten() {
@@ -900,13 +1241,13 @@ pub fn cleanup(dir: &Path, exts: &[String]) -> usize {
                 .extension()
                 .map(|e| e.to_string_lossy().to_ascii_lowercase())
                 .unwrap_or_default();
-            if exts.iter().any(|x| *x == ext) {
-                match remove_user_file(&path, recoverable) {
+            if exts.contains(&ext) {
+                match remove_swept_file(&path, recoverable, staging.as_deref()) {
                     Ok(()) => {
-                        println!("[cleanup] removed {}", path.display());
+                        info!(target: "cleanup", "removed {}", path.display());
                         removed += 1;
                     }
-                    Err(e) => eprintln!("[cleanup] {}: {e}", path.display()),
+                    Err(e) => warn!(target: "cleanup", "{}: {e}", path.display()),
                 }
             }
         }
@@ -954,11 +1295,17 @@ pub fn cleanup(dir: &Path, exts: &[String]) -> usize {
 /// landed halfway through a sweep and split it between the two behaviours.
 pub fn remove_user_file(path: &Path, recoverable: bool) -> std::io::Result<()> {
     if recoverable && !trash_unresponsive() {
-        match trash::delete(path) {
+        match trash_delete_gated(|| trash_delete_bounded(path)) {
             Ok(()) => return Ok(()),
-            Err(e) => {
-                eprintln!(
-                    "[cleanup] could not move {} to the Trash ({e}) - deleting it instead",
+            // Another caller was inside the process's first Trash call
+            // when we arrived, and it came back "unresponsive". We never
+            // made a call of our own, so there is nothing to report: the
+            // file goes straight to the direct delete below.
+            Err(None) => {}
+            Err(Some(e)) => {
+                warn!(
+                    target: "cleanup",
+                    "could not move {} to the Trash ({e}) - deleting it instead",
                     path.display()
                 );
                 // On a headless Mac the crate's Finder/AppleScript backend
@@ -967,31 +1314,372 @@ pub fn remove_user_file(path: &Path, recoverable: bool) -> std::io::Result<()> {
                 // carries dozens of par2/nfo cleanup files, and those
                 // serialized stalls measured as 720 s of a 863 s job - the
                 // job is not done until its cleanup is. One timeout means
-                // every later call will stall the same way, so latch it and
-                // delete directly for the rest of the process. Ordinary
-                // failures (a volume with no trash dir) stay per-file:
-                // they are instant and the next file may live elsewhere.
-                let msg = e.to_string();
-                if msg.contains("timed out") || msg.contains("-1712") {
-                    eprintln!(
-                        "[cleanup] the Trash is not responding (headless session?) - \
+                // every later call will stall the same way, so the rest of
+                // the process deletes directly - `trash_delete_gated` has
+                // already latched that, before it let anyone else past, and
+                // all that is left here is to say so. Ordinary failures (a
+                // volume with no trash dir) stay per-file: they are instant
+                // and the next file may live elsewhere.
+                if looks_like_a_trash_timeout(&e) {
+                    warn!(
+                        target: "cleanup",
+                        "the Trash is not responding (headless session?) - \
                          deleting directly from now on"
                     );
-                    TRASH_UNRESPONSIVE.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
     }
-    std::fs::remove_file(path)
+    // A bounded call that gave up may STILL be running, and Finder may
+    // yet move the file to the Trash behind us. Then this direct delete
+    // races it and loses with NotFound - which is the outcome we wanted
+    // (the file is gone), not a failure to report to the caller.
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
 }
 
-/// Latched by `remove_user_file` on the first Finder-timeout failure;
-/// deliberately never reset - a Finder that timed out once will do it
-/// again, and each probe costs ~2 minutes of a live job.
+/// How long a single Trash call may hold up a finished job before we stop
+/// waiting for it. Only meaningful on macOS - see `trash_delete_bounded`.
+///
+/// Generous ON PURPOSE. The Trash is what makes a wrong junk-heuristic
+/// guess reversible by the user, which is the whole reason cleanup routes
+/// through it, so treating a merely SLOW Finder as a dead one would trade
+/// that away for the rest of the process. A healthy Finder answers in
+/// milliseconds; nothing legitimate takes half a minute.
+#[cfg(target_os = "macos")]
+const TRASH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `trash::delete`, but it cannot hold a finished job hostage.
+///
+/// On macOS the crate's backend asks Finder over AppleScript and waits
+/// with no application-level timeout, so on a headless session (ssh, a
+/// launchd daemon, a login window nobody has touched) every call blocks
+/// for about two minutes before returning "AppleEvent timed out (-1712)".
+/// Cleanup runs INSIDE post-processing and a job is not filed to history
+/// until it returns, so those stalls are wall-clock the user sees as a
+/// download that finished but never appeared: one measured job spent
+/// 720 s of its 863 s exactly here. `TRASH_UNRESPONSIVE` already stops
+/// the SECOND call paying it, but the first one still did.
+///
+/// So: run the call on its own thread and stop waiting at
+/// `TRASH_DEADLINE`. The thread is left to finish on its own - AppleEvent
+/// has no cancel, and abandoning it is the point. The file is then
+/// deleted directly by the caller, which tolerates the race where Finder
+/// eventually wins.
+///
+/// Every other platform calls straight through: the XDG and Windows
+/// backends are local filesystem work with no interprocess wait to bound,
+/// and a thread per file would be cost for nothing.
+fn trash_delete_bounded(path: &Path) -> Result<(), String> {
+    // No `return`: on non-mac targets the macos block below is stripped,
+    // making this block the tail expression - a `return` here trips
+    // clippy's needless_return on the Linux CI runner, the only clippy
+    // that ever compiles this arm.
+    #[cfg(not(target_os = "macos"))]
+    {
+        trash::delete(path).map_err(|e| e.to_string())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let p = path.to_path_buf();
+        match run_bounded(TRASH_DEADLINE, move || {
+            trash::delete(&p).map_err(|e| e.to_string())
+        }) {
+            Some(r) => r,
+            None => {
+                warn!(
+                    target: "cleanup",
+                    "the Trash did not answer within {}s for {} - \
+                     deleting directly from now on (headless session?)",
+                    TRASH_DEADLINE.as_secs(),
+                    path.display()
+                );
+                TRASH_UNRESPONSIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+                Err("timed out".to_string())
+            }
+        }
+    }
+}
+
+/// Run `f` on its own thread and give up waiting after `deadline`.
+/// `None` means it had not finished in time; the thread keeps running.
+///
+/// Split out from `trash_delete_bounded` so the give-up path is testable
+/// without a Finder to hang: the whole point of this code is the case
+/// that cannot be reproduced on a healthy developer machine.
+///
+/// `test` as well as `macos` in the gate: only the macOS path calls this
+/// at runtime, but the tests below cover it on every platform, and
+/// without `test` here a Linux or Windows build warns it is unused.
+#[cfg(any(target_os = "macos", test))]
+fn run_bounded<T: Send + 'static>(
+    deadline: std::time::Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // The receiver is gone once we time out; that send failing is the
+        // expected outcome, not an error worth surfacing.
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(deadline).ok()
+}
+
+/// Make one Trash call, with the process's FIRST one serialized so a dead
+/// Finder is probed once and not once per concurrent caller.
+///
+/// `TRASH_UNRESPONSIVE` stops a second call paying the deadline - but only
+/// once the first has finished paying it. The check and the latch are not
+/// atomic, so any two callers that overlap both read it clear, both start
+/// a probe, and both pay `TRASH_DEADLINE` in full. A queue soak on a
+/// headless bench box caught exactly that: "the Trash is not responding"
+/// printed twice in one leg, ~60 s added to a 208 s queue.
+///
+/// That soak ran before §64, when the finalize sweeps still called the
+/// Trash inline, and two jobs finishing together was the way to reproduce
+/// it. They park now (`remove_swept_file`), so sweeps are no longer the
+/// overlap - but four callers still reach the Trash directly and three of
+/// them are on different threads: the `deferred_trash` worker draining its
+/// queue, `delete_filed_episode` filing into the user's library, the
+/// watch-dir delete in `serve/tasks.rs`, and a sweep whose park failed
+/// (read-only tree, EXDEV, no parent) falling back inline. A worker
+/// mid-probe while an episode is filed is the same 2 x 30 s.
+///
+/// So whoever gets here first probes alone and everyone else waits for the
+/// verdict instead of asking again. `Err(None)` is that verdict coming
+/// back unresponsive: the caller made no call at all and must delete
+/// directly. The latch is set before the gate is released, so a waiter
+/// always sees it.
+///
+/// The gate costs a healthy Trash nothing beyond that first call: any
+/// answer - even a failure - proves the backend is alive, and from then on
+/// the gate is never taken again and deletes run as concurrently as they
+/// always did. Deliberately not `cfg(macos)`: only macOS bounds the call,
+/// but every platform reads the latch, and `trash::delete` is what it is.
+///
+/// The call is passed in rather than made here so the tests can supply one
+/// that hangs - same reason `run_bounded` is split out. A Finder that does
+/// not answer is the one case a healthy developer machine cannot produce.
+fn trash_delete_gated(call: impl FnOnce() -> Result<(), String>) -> Result<(), Option<String>> {
+    let _gate = if trash_answered() {
+        None
+    } else {
+        let held = FIRST_TRASH_CALL.lock_ok();
+        // Settled while we queued: the thread ahead of us got an answer, so
+        // there is nothing left to serialize. Hand the gate straight on
+        // rather than holding it across our own call.
+        if trash_answered() { None } else { Some(held) }
+    };
+    // The check that got the caller here is stale - the thread ahead of us
+    // may have latched the Trash off while we waited on the gate.
+    if trash_unresponsive() {
+        return Err(None);
+    }
+    let outcome = call();
+    match &outcome {
+        Err(e) if looks_like_a_trash_timeout(e) => {
+            // Under the gate on purpose: every thread queued behind us
+            // reads this the moment it wakes, and skips the Trash.
+            TRASH_UNRESPONSIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        _ => TRASH_ANSWERED.store(true, std::sync::atomic::Ordering::Relaxed),
+    }
+    outcome.map_err(Some)
+}
+
+/// The two shapes a Trash call that gave up comes back as: the crate's own
+/// wording, and the raw AppleEvent code behind it.
+fn looks_like_a_trash_timeout(msg: &str) -> bool {
+    msg.contains("timed out") || msg.contains("-1712")
+}
+
+/// Held for the duration of the process's first Trash call - see
+/// `trash_delete_gated`. Never taken again once `TRASH_ANSWERED` is set.
+static FIRST_TRASH_CALL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Set once any Trash call has come back, success or ordinary failure:
+/// proof the backend answers, and the point past which the first-call gate
+/// has nothing left to protect.
+static TRASH_ANSWERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn trash_answered() -> bool {
+    TRASH_ANSWERED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The flags below are process-global and the trash tests write them, so
+/// those tests take this first and run one at a time. Without it `cargo
+/// test` runs them together and one test's latch - or its reset - lands
+/// inside another test's delete: `a_junk_delete_is_recoverable_and_the_
+/// opt_out_is_not` then finds its fixture hard-deleted rather than binned.
+/// Lives out here, not in one test module, because both of them need it.
+#[cfg(test)]
+fn one_trash_test_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Poison is nothing here: each test sets the flags it cares about on
+    // the way in, so a panicking predecessor leaves nothing to inherit.
+    SERIAL.lock_ok()
+}
+
+/// Latched on the first Finder-timeout failure; deliberately never reset -
+/// a Finder that timed out once will do it again, and each probe costs ~2
+/// minutes of a live job.
 static TRASH_UNRESPONSIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 pub fn trash_unresponsive() -> bool {
     TRASH_UNRESPONSIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Where a sweep of `dir` parks recoverable deletes: a hidden folder
+/// BESIDE the swept directory, so the park is a same-volume rename.
+///
+/// Beside, not inside, for two reasons that are both load-bearing. Inside
+/// the swept tree the sweep's own one-level descent would walk into it and
+/// re-delete what it just parked. And `finalize_names` may move the whole
+/// job directory (onto a NAS, into a season folder) the moment the sweep
+/// returns - a parked file must stay put while that happens, or the queued
+/// path goes stale and the junk rides along into the library.
+fn trash_staging_dir(dir: &Path) -> Option<PathBuf> {
+    Some(dir.parent()?.join(".nzbfast-trash"))
+}
+
+/// The sweeps' delete: like `remove_user_file`, but a recoverable delete
+/// is parked in `staging` for the background worker instead of talking to
+/// the Trash inline. The rename is what actually empties the job
+/// directory, and it is instant - so a slow Finder can no longer hold
+/// `finalize_completed` (and with it the job's history entry) hostage.
+/// See §64: the first Trash call of a headless process used to cost the
+/// finalize path 30 s, and before the bound, minutes per file.
+///
+/// Any staging failure (no parent, EXDEV, a read-only tree) falls through
+/// to the inline delete, which still works everywhere it used to.
+fn remove_swept_file(
+    path: &Path,
+    recoverable: bool,
+    staging: Option<&Path>,
+) -> std::io::Result<()> {
+    // When the latch is set the inline path is a plain remove_file, which
+    // is as fast as the rename - no reason to park.
+    if recoverable
+        && !trash_unresponsive()
+        && let Some(root) = staging
+        && deferred_trash::stage(path, root).is_ok()
+    {
+        return Ok(());
+    }
+    remove_user_file(path, recoverable)
+}
+
+/// One background worker owns every conversation with the Trash, so no
+/// job's finalize ever waits on Finder.
+///
+/// A file is handed over by RENAME into a staging folder first - that is
+/// the synchronous part, and the reason a directory move immediately
+/// after a sweep cannot race the delete: by the time the sweep returns,
+/// the file is already out of the tree. The worker then does the real
+/// recoverable delete at its leisure, inheriting the bounded call and the
+/// unresponsive latch from `remove_user_file`.
+mod deferred_trash {
+    use crate::MutexExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock, mpsc};
+    use tracing::warn;
+
+    static SENDER: OnceLock<mpsc::Sender<PathBuf>> = OnceLock::new();
+    /// Staging roots this process has already drained of leftovers.
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+    /// Disambiguates same-named files from different jobs (every job has
+    /// a `.par2`, most have an `.nfo`).
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn sender() -> &'static mpsc::Sender<PathBuf> {
+        SENDER.get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<PathBuf>();
+            std::thread::Builder::new()
+                .name("trash-worker".into())
+                .spawn(move || {
+                    for p in rx {
+                        // The setting is re-read at disposal time, not
+                        // frozen at park time: the file already left the
+                        // user's tree when the sweep decided to delete it,
+                        // so only its disposition (Trash vs gone) is at
+                        // stake here - and under cfg(test) the default-off
+                        // global keeps the suite out of the developer's
+                        // real Trash, exactly like every sweep.
+                        // NotFound is Ok here (a double-enqueue after a
+                        // leftover drain, or Finder finishing behind us).
+                        if let Err(e) = super::remove_user_file(&p, super::delete_to_trash()) {
+                            warn!(target: "cleanup", "deferred trash {}: {e}", p.display());
+                        }
+                        // Leave nothing behind when the queue drains: an
+                        // empty staging folder is clutter beside the
+                        // user's downloads. Non-empty simply refuses.
+                        if let Some(root) = p.parent() {
+                            let _ = std::fs::remove_dir(root);
+                        }
+                    }
+                })
+                .expect("spawn trash worker");
+            tx
+        })
+    }
+
+    /// Move `path` into `root` and queue it for the worker. The caller
+    /// treats any Err as "park unavailable" and deletes inline instead.
+    pub(super) fn stage(path: &Path, root: &Path) -> std::io::Result<()> {
+        let name = path
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("no file name"))?;
+        std::fs::create_dir_all(root)?;
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut staged_name = std::ffi::OsString::from(format!("{}-{n}-", std::process::id()));
+        staged_name.push(name);
+        let dest = root.join(staged_name);
+        std::fs::rename(path, &dest)?;
+        // First touch of a root this process: sweep up leftovers a
+        // crashed predecessor parked and never got to. The listing
+        // includes `dest`, so nothing extra to send; later touches send
+        // just their own file. A racing second stager double-sends at
+        // worst, and the worker tolerates NotFound.
+        let fresh = SEEN
+            .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+            .lock_ok()
+            .insert(root.to_path_buf());
+        let tx = sender();
+        if fresh {
+            if let Ok(rd) = std::fs::read_dir(root) {
+                for e in rd.flatten() {
+                    let _ = tx.send(e.path());
+                }
+            }
+        } else {
+            let _ = tx.send(dest);
+        }
+        Ok(())
+    }
+}
+
+/// Is the Trash somewhere the user can actually find and empty?
+///
+/// On macOS and Windows, yes: one Trash, one Recycle Bin, both in front
+/// of the person the recoverability is for.
+///
+/// On Linux, no - and worse than no. When the download volume is not the
+/// volume the home trash lives on (which is every NAS, every container,
+/// every seedbox), the freedesktop rules send the file to a
+/// `.Trash-<uid>` directory the crate CREATES at the top of the download
+/// volume. So "recoverable" quietly means "moved to another folder on
+/// the same disk, forever": the space never comes back, nothing in the
+/// UI says where it went, and no desktop is running to empty it. It cost
+/// a user their SSD a directory at a time, reported from Unraid on
+/// 2 Aug 2026, and they left for another downloader over it.
+///
+/// So the recoverable default follows the platform, and Linux installs
+/// delete outright unless the operator turns `delete_to_trash` back on.
+/// Cleanup still tells the log what it removed either way.
+const fn trash_suits_this_platform() -> bool {
+    !cfg!(target_os = "linux")
 }
 
 /// Process-global so the free functions in here need no Daemon handle.
@@ -1001,7 +1689,7 @@ pub fn trash_unresponsive() -> bool {
 /// developer's real ~/.Trash and race each other through this one flag.
 /// The test that covers the Trash path opts in explicitly.
 static TRASH: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(!cfg!(test));
+    std::sync::atomic::AtomicBool::new(!cfg!(test) && trash_suits_this_platform());
 pub fn set_delete_to_trash(on: bool) {
     TRASH.store(on, std::sync::atomic::Ordering::Relaxed);
 }
@@ -1040,7 +1728,9 @@ fn is_nameless_scrap(p: &Path, ext: &str, feature_len: u64, recoverable: bool) -
     if !recoverable || !ext.is_empty() || feature_len == 0 {
         return false;
     }
-    let Ok(md) = std::fs::metadata(p) else { return false };
+    let Ok(md) = std::fs::metadata(p) else {
+        return false;
+    };
     if md.len() > 4096 {
         return false;
     }
@@ -1053,16 +1743,31 @@ fn is_nameless_scrap(p: &Path, ext: &str, feature_len: u64, recoverable: bool) -
         .unwrap_or(0);
     let head = &head[..read];
     const MAGIC: &[&[u8]] = &[
-        b"Rar!", b"PK\x03\x04", b"7z\xbc\xaf", b"\x1f\x8b", b"BZh", b"\xfd7zXZ",
-        b"\x1aE\xdf\xa3", b"RIFF", b"%PDF", b"\x89PNG", b"\xff\xd8\xff", b"ID3",
+        b"Rar!",
+        b"PK\x03\x04",
+        b"7z\xbc\xaf",
+        b"\x1f\x8b",
+        b"BZh",
+        b"\xfd7zXZ",
+        b"\x1aE\xdf\xa3",
+        b"RIFF",
+        b"%PDF",
+        b"\x89PNG",
+        b"\xff\xd8\xff",
+        b"ID3",
     ];
     !MAGIC.iter().any(|m| head.starts_with(m))
 }
 
 pub fn sweep_junk(dir: &Path) -> usize {
     let recoverable = delete_to_trash();
+    let staging = trash_staging_dir(dir);
     let keep = largest_video(dir);
-    let keep_len = keep.as_ref().and_then(|p| p.metadata().ok()).map(|m| m.len()).unwrap_or(0);
+    let keep_len = keep
+        .as_ref()
+        .and_then(|p| p.metadata().ok())
+        .map(|m| m.len())
+        .unwrap_or(0);
     let mut removed = 0;
     let mut sweep = |d: &Path| {
         let Ok(rd) = std::fs::read_dir(d) else { return };
@@ -1082,12 +1787,12 @@ pub fn sweep_junk(dir: &Path) -> usize {
                 || is_deletable_sample(&path, keep_len)
                 || is_nameless_scrap(&path, &ext, keep_len, recoverable);
             if junk {
-                match remove_user_file(&path, recoverable) {
+                match remove_swept_file(&path, recoverable, staging.as_deref()) {
                     Ok(()) => {
-                        println!("[cleanup] junk {}", path.display());
+                        info!(target: "cleanup", "junk {}", path.display());
                         removed += 1;
                     }
-                    Err(e) => eprintln!("[cleanup] {}: {e}", path.display()),
+                    Err(e) => warn!(target: "cleanup", "{}: {e}", path.display()),
                 }
             }
         }
@@ -1115,6 +1820,7 @@ pub fn keep_media_only(dir: &Path) -> usize {
     let mut removed = 0;
     // Read once, for the whole sweep: see `remove_user_file`.
     let recoverable = delete_to_trash();
+    let staging = trash_staging_dir(dir);
     // The feature size gates sample deletion: a same-size episode in a
     // "Proof"/"Sample" season pack is kept, only a small teaser is dropped.
     let Some(feature) = largest_video(dir) else {
@@ -1128,7 +1834,11 @@ pub fn keep_media_only(dir: &Path) -> usize {
         //
         // This guard is necessary but NOT sufficient: one bonus .mp4 in
         // such a job passes it. That is what PAYLOAD_EXTS is for.
-        println!("[cleanup] keep-media-only: no video in {} - left alone", dir.display());
+        info!(
+            target: "cleanup",
+            "keep-media-only: no video in {} - left alone",
+            dir.display()
+        );
         return 0;
     };
     let feature_len = feature.metadata().map(|m| m.len()).unwrap_or(0);
@@ -1161,12 +1871,12 @@ pub fn keep_media_only(dir: &Path) -> usize {
             {
                 continue;
             }
-            match remove_user_file(&path, recoverable) {
+            match remove_swept_file(&path, recoverable, staging.as_deref()) {
                 Ok(()) => {
-                    println!("[cleanup] non-media {}", path.display());
+                    info!(target: "cleanup", "non-media {}", path.display());
                     removed += 1;
                 }
-                Err(e) => eprintln!("[cleanup] {}: {e}", path.display()),
+                Err(e) => warn!(target: "cleanup", "{}: {e}", path.display()),
             }
         }
     };
@@ -1223,7 +1933,10 @@ pub fn move_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
     // to the same folder clear it, which costs disk space until it is
     // deleted and never costs a payload.
     let mut staging_name = std::ffi::OsString::from(".");
-    staging_name.push(dst.file_name().unwrap_or_else(|| std::ffi::OsStr::new("job")));
+    staging_name.push(
+        dst.file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("job")),
+    );
     staging_name.push(format!(
         ".moving.{}.{}",
         std::process::id(),
@@ -1254,8 +1967,9 @@ pub fn move_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
                     // it is rather than silently turning it into a fat copy
                     // of something outside the job.
                     let _ = std::fs::remove_file(&target); // our placeholder
-                    eprintln!(
-                        "[move] left symlink in place (cross-device): {}",
+                    warn!(
+                        target: "move",
+                        "left symlink in place (cross-device): {}",
                         from.display()
                     );
                     continue;
@@ -1275,8 +1989,9 @@ pub fn move_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
                         // Whatever broke the copy can break the unlink too
                         // (a share that dropped answers both with EIO), so
                         // say the fragment may still be sitting there.
-                        eprintln!(
-                            "[move] could not remove the partial copy {}: {rm}",
+                        warn!(
+                            target: "move",
+                            "could not remove the partial copy {}: {rm}",
                             target.display()
                         );
                     }
@@ -1385,24 +2100,35 @@ fn publish_staged(staging: &Path, dst: &Path) -> std::io::Result<()> {
 /// clutter to report - failing the move over it would tell the caller
 /// nothing had moved when everything had.
 fn drain_copied(src: &Path, copied: &std::collections::HashSet<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(src) else { return };
+    let Ok(rd) = std::fs::read_dir(src) else {
+        return;
+    };
     for entry in rd.flatten() {
         let from = entry.path();
         if is_real_dir(&from) {
             drain_copied(&from, copied);
         } else if is_real_file(&from) {
             if !copied.contains(&from) {
-                eprintln!(
-                    "[move] appeared after the copy, so it stays where it is: {}",
+                warn!(
+                    target: "move",
+                    "appeared after the copy, so it stays where it is: {}",
                     from.display()
                 );
                 continue;
             }
             if let Err(e) = std::fs::remove_file(&from) {
-                eprintln!("[move] copied, but the source stays: {} ({e})", from.display());
+                warn!(
+                    target: "move",
+                    "copied, but the source stays: {} ({e})",
+                    from.display()
+                );
             }
         } else {
-            eprintln!("[move] left symlink in place (cross-device): {}", from.display());
+            warn!(
+                target: "move",
+                "left symlink in place (cross-device): {}",
+                from.display()
+            );
         }
     }
     let _ = std::fs::remove_dir(src); // only removes if now empty
@@ -1504,6 +2230,13 @@ fn sync_written_file(path: &Path) -> std::io::Result<()> {
         }
         let md = std::fs::metadata(path)?;
         let mut relaxed = md.permissions();
+        // clippy::permissions_set_readonly_false objects that this leaves a
+        // file world-writable, which is a statement about Unix modes, and
+        // this arm is `cfg(not(unix))`. On Windows it clears the read-only
+        // ATTRIBUTE - the entire point of the block - and the original
+        // permissions go back on after the flush. std exposes no other
+        // stable way to touch that attribute.
+        #[allow(clippy::permissions_set_readonly_false)]
         relaxed.set_readonly(false);
         std::fs::set_permissions(path, relaxed)?;
         let flushed = std::fs::OpenOptions::new()
@@ -1533,7 +2266,11 @@ fn is_symlink(path: &Path) -> bool {
 fn reserve_free_name(path: &Path) -> std::io::Result<PathBuf> {
     use std::io::ErrorKind;
     let mut candidate = path.to_path_buf();
-    let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+    let stem = path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
     let ext = path
         .extension()
         .map(|e| format!(".{}", e.to_string_lossy()))
@@ -1562,16 +2299,21 @@ fn reserve_free_name(path: &Path) -> std::io::Result<PathBuf> {
 /// is the auto-rename quality tag (" [1080p]"), or "" for none. Existing
 /// targets are never overwritten. Returns the new directory, or None if
 /// the stem didn't parse as TV (job left untouched).
+///
+/// `titles` decorates each episode with its own name when the cache knows
+/// it ("Show - S01E02 - Children [1080p].mkv"); an empty one is the
+/// ordinary case and leaves every name exactly as it was.
 pub fn tv_organize(
     dest_parent: &Path,
     stem: &str,
     out_dir: &Path,
     suffix: &str,
+    titles: &EpisodeTitles,
 ) -> Option<PathBuf> {
     let (subdir, job_base) = match tv_path(stem) {
         Some(t) => t,
         None => {
-            println!("[smart] {stem:?} didn't parse as TV - leaving it in place");
+            info!(target: "smart", "{stem:?} didn't parse as TV - leaving it in place");
             return None;
         }
     };
@@ -1582,9 +2324,8 @@ pub fn tv_organize(
     // a new season joins the show too - and only when today's spelling
     // has no folder yet and the old one does.
     let show_dir = |sub: &str| dest_parent.join(sub.split('/').next().unwrap_or(sub));
-    let legacy = legacy_tv_path(stem).filter(|(sub, _)| {
-        *sub != subdir && !show_dir(&subdir).is_dir() && show_dir(sub).is_dir()
-    });
+    let legacy = legacy_tv_path(stem)
+        .filter(|(sub, _)| *sub != subdir && !show_dir(&subdir).is_dir() && show_dir(sub).is_dir());
     let filed_as_legacy = legacy.is_some();
     let (subdir, job_base) = legacy.unwrap_or((subdir, job_base));
     let dest = dest_parent.join(&subdir);
@@ -1592,7 +2333,7 @@ pub fn tv_organize(
         return None;
     }
     if let Err(e) = std::fs::create_dir_all(&dest) {
-        eprintln!("[smart] create {}: {e}", dest.display());
+        warn!(target: "smart", "create {}: {e}", dest.display());
         return None;
     }
     let entries: Vec<PathBuf> = std::fs::read_dir(out_dir)
@@ -1622,8 +2363,10 @@ pub fn tv_organize(
                 .extension()
                 .map(|e| e.to_string_lossy().to_ascii_lowercase())
                 .unwrap_or_default();
-            let file_stem =
-                path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let file_stem = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
             let is_sample = file_stem.to_ascii_lowercase().contains("sample");
             if VIDEO_EXTS.contains(&ext.as_str()) && !is_sample {
                 // The file's own name wins (season packs), else the job's
@@ -1633,9 +2376,17 @@ pub fn tv_organize(
                 } else {
                     tv_path(&file_stem)
                 };
-                let base = own.and_then(|(_, b)| b).or_else(|| job_base.clone());
+                // Which stem the base came from decides which episode's
+                // title belongs on it: a season pack's files each name
+                // their own episode, and only when none of them does
+                // (a single-episode job) does the job's stem answer.
+                let (base, titled_by) = match own.and_then(|(_, b)| b) {
+                    Some(b) => (Some(b), file_stem.as_str()),
+                    None => (job_base.clone(), stem),
+                };
                 if let Some(b) = base {
-                    new_name = format!("{b}{suffix}.{ext}");
+                    let title = titles.segment(titled_by, &b, suffix);
+                    new_name = format!("{b}{title}{suffix}.{ext}");
                     is_canonical_video = true;
                 }
             }
@@ -1647,8 +2398,9 @@ pub fn tv_organize(
             // library. Filing beside it under a raw name is what let
             // cleanup delete their copy, so the whole job stays put.
             if is_canonical_video {
-                println!(
-                    "[smart] {} already exists (or two job files map there) - \
+                info!(
+                    target: "smart",
+                    "{} already exists (or two job files map there) - \
                      leaving {:?} in its private folder",
                     target.display(),
                     stem
@@ -1661,8 +2413,9 @@ pub fn tv_organize(
             // every later episode of a season from filing at all: these
             // entries keep their original name, so the second episode
             // shipping Subs/ collided forever, with no UI signal.
-            println!(
-                "[smart] {} already exists - leaving it behind, still filing {:?}",
+            info!(
+                target: "smart",
+                "{} already exists - leaving it behind, still filing {:?}",
                 target.display(),
                 stem
             );
@@ -1697,11 +2450,16 @@ pub fn tv_organize(
         // lose, and a placeholder FILE would break the rename outright.
         let mut placeholder = false;
         if !path.is_dir() {
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(&target) {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)
+            {
                 Ok(_) => placeholder = true,
                 Err(e) => {
-                    eprintln!(
-                        "[smart] {} was taken before {} could be filed: {e}",
+                    warn!(
+                        target: "smart",
+                        "{} was taken before {} could be filed: {e}",
                         target.display(),
                         path.display()
                     );
@@ -1713,7 +2471,12 @@ pub fn tv_organize(
         match std::fs::rename(&path, &target) {
             Ok(()) => done.push((path, target)),
             Err(e) => {
-                eprintln!("[smart] move {} → {}: {e}", path.display(), target.display());
+                warn!(
+                    target: "smart",
+                    "move {} → {}: {e}",
+                    path.display(),
+                    target.display()
+                );
                 // Our own placeholder would otherwise be left behind as a
                 // zero-byte file wearing the episode's canonical name,
                 // which later cleanup matches by name.
@@ -1733,15 +2496,17 @@ pub fn tv_organize(
         // deleting the user's episode is not.
         for (path, target) in done.iter().rev() {
             if let Err(e2) = std::fs::rename(target, path) {
-                eprintln!(
-                    "[smart] could not undo {} → {}: {e2} (file left in the season folder)",
+                warn!(
+                    target: "smart",
+                    "could not undo {} → {}: {e2} (file left in the season folder)",
                     path.display(),
                     target.display()
                 );
             }
         }
-        println!(
-            "[smart] filing {stem:?} failed ({e}) - left in its private folder, \
+        info!(
+            target: "smart",
+            "filing {stem:?} failed ({e}) - left in its private folder, \
              not claiming the season folder"
         );
         return None;
@@ -1757,8 +2522,9 @@ pub fn tv_organize(
     // This is the same ownership invariant as the rollback above - the
     // earlier fix enforced only its failed-rename half.
     if done.is_empty() {
-        println!(
-            "[smart] nothing to file for {stem:?} - leaving it in its private folder \
+        info!(
+            target: "smart",
+            "nothing to file for {stem:?} - leaving it in its private folder \
              rather than claiming {}",
             dest.display()
         );
@@ -1767,38 +2533,51 @@ pub fn tv_organize(
     let moved = done.len();
     // Only vanishes if everything left it.
     let _ = std::fs::remove_dir(out_dir);
-    println!("[smart] filed {moved} item(s) → {}", dest.display());
+    info!(target: "smart", "filed {moved} item(s) → {}", dest.display());
     Some(dest)
 }
 
 /// Auto-rename for TV when the job ISN'T being Season-filed: rename video
-/// files IN PLACE to "Show - S01E02[ suffix].ext" (season packs rename per
-/// episode; samples untouched). Never overwrites an existing target.
-/// Returns how many files were renamed.
-pub fn tv_rename(dir: &Path, stem: &str, suffix: &str) -> usize {
+/// files IN PLACE to "Show - S01E02[ title][ suffix].ext" (season packs
+/// rename per episode; samples untouched). Never overwrites an existing
+/// target. Returns how many files were renamed.
+pub fn tv_rename(dir: &Path, stem: &str, suffix: &str, titles: &EpisodeTitles) -> usize {
     let job_base = tv_path(stem).and_then(|(_, b)| b);
-    let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
     let mut renamed = 0;
     for entry in rd.flatten() {
         let path = entry.path();
-        if !path.is_file()
-            || !VIDEO_EXTS.contains(&ext_of(&path).as_str())
-            || is_sample_clip(&path)
+        if !path.is_file() || !VIDEO_EXTS.contains(&ext_of(&path).as_str()) || is_sample_clip(&path)
         {
             continue;
         }
-        let file_stem =
-            path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        let base = tv_path(&file_stem).and_then(|(_, b)| b).or_else(|| job_base.clone());
+        let file_stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // As in `tv_organize`: the stem that named the episode is the
+        // stem whose title belongs on it.
+        let (base, titled_by) = match tv_path(&file_stem).and_then(|(_, b)| b) {
+            Some(b) => (Some(b), file_stem.as_str()),
+            None => (job_base.clone(), stem),
+        };
         let Some(b) = base else { continue };
+        let title = titles.segment(titled_by, &b, suffix);
         let ext = ext_of(&path);
-        let target = dir.join(format!("{b}{suffix}.{ext}"));
+        let target = dir.join(format!("{b}{title}{suffix}.{ext}"));
         if target == path || target.exists() {
             continue;
         }
         match std::fs::rename(&path, &target) {
             Ok(()) => renamed += 1,
-            Err(e) => eprintln!("[smart] rename {} → {}: {e}", path.display(), target.display()),
+            Err(e) => warn!(
+                target: "smart",
+                "rename {} → {}: {e}",
+                path.display(),
+                target.display()
+            ),
         }
     }
     renamed
@@ -1831,7 +2610,9 @@ fn is_generic_stem(stem: &str) -> bool {
 /// name ("Example.Movie.2024…-GRP0.srt"). The remainder has to start at
 /// an extension boundary for the sidecar to be ours.
 fn sidecar_tail<'a>(fname: &'a str, stem: &str) -> Option<&'a str> {
-    fname.strip_prefix(stem).filter(|rest| rest.starts_with('.'))
+    fname
+        .strip_prefix(stem)
+        .filter(|rest| rest.starts_with('.'))
 }
 
 /// Does this release name say enough to be worth stamping onto a
@@ -1842,19 +2623,9 @@ fn sidecar_tail<'a>(fname: &'a str, stem: &str) -> Option<&'a str> {
 /// them a wrong one.
 fn names_the_release(name: &str) -> bool {
     let p = crate::wall::parse_release(name);
-    !p.title.trim().is_empty()
-        && (p.res.is_some() || p.source.is_some() || p.group.is_some())
+    !p.title.trim().is_empty() && (p.res.is_some() || p.source.is_some() || p.group.is_some())
 }
 
-/// Auto-rename a completed MOVIE / loose-file job to the friendly `base`
-/// (already computed by `wall::movie_name`, path-safe, no extension):
-/// 1. if the job has exactly ONE top-level feature video, rename it to
-///    `base.ext` and re-stem its subtitle sidecars (`.en.srt` kept);
-///    multiple videos (CD1/CD2 etc.) are left alone to avoid collisions;
-/// 2. rename the job folder to `parent/base`, with `.2`/`.3` collision
-///    suffixes - an existing folder is never overwritten.
-/// Returns the new out_dir when the folder moved, else None (caller keeps
-/// the current path).
 /// Last resort for a payload we could not name cleverly: if the main
 /// video is still wearing an obfuscated stem, give it the release's own
 /// name.
@@ -1910,13 +2681,13 @@ pub fn nameless_video(dir: &Path) -> Option<PathBuf> {
         .ok()?
         .flatten()
         .map(|e| e.path())
-        .filter(|p| {
-            p.is_file() && VIDEO_EXTS.contains(&ext_of(p).as_str()) && !is_sample_clip(p)
-        })
+        .filter(|p| p.is_file() && VIDEO_EXTS.contains(&ext_of(p).as_str()) && !is_sample_clip(p))
         .collect();
     // More than one and we cannot tell which is the feature; renaming
     // either would be a guess, and CD1/CD2 sets collide.
-    let [video] = videos.as_slice() else { return None };
+    let [video] = videos.as_slice() else {
+        return None;
+    };
     let name = video.file_name()?.to_string_lossy().into_owned();
     let stem = name
         .strip_suffix(&format!(".{}", ext_of(video)))
@@ -1924,8 +2695,7 @@ pub fn nameless_video(dir: &Path) -> Option<PathBuf> {
         .to_string();
     // The poster named it something: that name stands, whatever a
     // catalogue might have offered.
-    (nzbkit::release::looks_obfuscated(&stem) || is_generic_stem(&stem))
-        .then(|| video.clone())
+    (nzbkit::release::looks_obfuscated(&stem) || is_generic_stem(&stem)).then(|| video.clone())
 }
 
 /// Put `base` on the lone still-nameless video in `out_dir`, carrying
@@ -1941,7 +2711,11 @@ pub fn nameless_video(dir: &Path) -> Option<PathBuf> {
 /// alone.
 pub fn rename_nameless_video(out_dir: &Path, base: &str) -> bool {
     let files: Vec<PathBuf> = match std::fs::read_dir(out_dir) {
-        Ok(rd) => rd.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect(),
+        Ok(rd) => rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file())
+            .collect(),
         Err(_) => return false,
     };
     let Some(video) = nameless_video(out_dir) else {
@@ -1952,8 +2726,10 @@ pub fn rename_nameless_video(out_dir: &Path, base: &str) -> bool {
     let Some(old_name) = video.file_name().map(|n| n.to_string_lossy().into_owned()) else {
         return false;
     };
-    let old_stem =
-        old_name.strip_suffix(&format!(".{ext}")).unwrap_or(&old_name).to_string();
+    let old_stem = old_name
+        .strip_suffix(&format!(".{ext}"))
+        .unwrap_or(&old_name)
+        .to_string();
     let clean = nzbkit::release::sanitize_name(base);
     if clean.is_empty() {
         return false; // nothing nameable survived sanitisation
@@ -1963,10 +2739,15 @@ pub fn rename_nameless_video(out_dir: &Path, base: &str) -> bool {
         return false;
     }
     if let Err(e) = std::fs::rename(video, &target) {
-        eprintln!("[smart] rename {} -> {}: {e}", video.display(), target.display());
+        warn!(
+            target: "smart",
+            "rename {} -> {}: {e}",
+            video.display(),
+            target.display()
+        );
         return false;
     }
-    println!("[smart] de-obfuscated {} -> {}", old_name, target.display());
+    info!(target: "smart", "de-obfuscated {} -> {}", old_name, target.display());
     // Carry subtitle sidecars along, keeping their language tail.
     for f in &files {
         if !SUBTITLE_EXTS.contains(&ext_of(f).as_str()) {
@@ -1985,6 +2766,15 @@ pub fn rename_nameless_video(out_dir: &Path, base: &str) -> bool {
     true
 }
 
+/// Auto-rename a completed MOVIE / loose-file job to the friendly `base`
+/// (already computed by `wall::movie_name`, path-safe, no extension):
+/// 1. if the job has exactly ONE top-level feature video, rename it to
+///    `base.ext` and re-stem its subtitle sidecars (`.en.srt` kept);
+///    multiple videos (CD1/CD2 etc.) are left alone to avoid collisions;
+/// 2. rename the job folder to `parent/base`, with `.2`/`.3` collision
+///    suffixes - an existing folder is never overwritten.
+/// Returns the new out_dir when the folder moved, else None (caller keeps
+/// the current path).
 pub fn rename_movie(parent: &Path, out_dir: &Path, base: &str) -> Option<PathBuf> {
     // `base` arrives path-safe from `movie_name`, but this is the last
     // point before it becomes a real file stem AND a real folder name, and
@@ -2008,17 +2798,25 @@ pub fn rename_movie(parent: &Path, out_dir: &Path, base: &str) -> Option<PathBuf
     if videos.len() == 1 {
         let video = videos[0];
         let ext = ext_of(video);
-        let old_name = video.file_name().map(|n| n.to_string_lossy().into_owned())?;
+        let old_name = video
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())?;
         // Strip the trailing ".ext" to get the stem prefix subtitles share.
         let old_stem = old_name
             .strip_suffix(&format!(".{ext}"))
             .unwrap_or(&old_name)
             .to_string();
         let target = out_dir.join(format!("{base}.{ext}"));
-        if target != *video && !target.exists() {
-            if let Err(e) = std::fs::rename(video, &target) {
-                eprintln!("[smart] rename {} → {}: {e}", video.display(), target.display());
-            }
+        if target != *video
+            && !target.exists()
+            && let Err(e) = std::fs::rename(video, &target)
+        {
+            warn!(
+                target: "smart",
+                "rename {} → {}: {e}",
+                video.display(),
+                target.display()
+            );
         }
         // Subtitle sidecars whose name starts with the old video stem:
         // "Stem.en.srt" → "base.en.srt", preserving the language tail.
@@ -2051,7 +2849,12 @@ pub fn rename_movie(parent: &Path, out_dir: &Path, base: &str) -> Option<PathBuf
     }
     match std::fs::rename(out_dir, &target) {
         Ok(()) => {
-            println!("[smart] renamed {} → {}", out_dir.display(), target.display());
+            info!(
+                target: "smart",
+                "renamed {} → {}",
+                out_dir.display(),
+                target.display()
+            );
             Some(target)
         }
         // Windows refuses to rename a DIRECTORY while any file inside it is
@@ -2077,16 +2880,18 @@ pub fn rename_movie(parent: &Path, out_dir: &Path, base: &str) -> Option<PathBuf
         // takes the branch above and never reaches this.
         Err(e) => match move_dir_contents(out_dir, &target) {
             Ok(()) => {
-                println!(
-                    "[smart] renamed {} → {} (entry by entry: {e})",
+                info!(
+                    target: "smart",
+                    "renamed {} → {} (entry by entry: {e})",
                     out_dir.display(),
                     target.display()
                 );
                 Some(target)
             }
             Err(e2) => {
-                eprintln!(
-                    "[smart] rename dir {} → {}: {e} (and entry by entry: {e2})",
+                warn!(
+                    target: "smart",
+                    "rename dir {} → {}: {e} (and entry by entry: {e2})",
                     out_dir.display(),
                     target.display()
                 );
@@ -2131,9 +2936,7 @@ pub fn encrypted_rar(dir: &Path) -> Option<PathBuf> {
         .ok()?
         .flatten()
         .map(|e| e.path())
-        .filter(|p| {
-            p.is_file() && p.extension().is_some_and(|x| x.eq_ignore_ascii_case("rar"))
-        })
+        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x.eq_ignore_ascii_case("rar")))
         .collect();
     rars.sort();
     rars.into_iter().find(|p| nzbkit::rar::needs_password(p))
@@ -2172,8 +2975,11 @@ pub fn unlock(dir: &Path, password: &str) -> bool {
                 rd.flatten()
                     .map(|e| e.path())
                     .filter(|p| {
-                        let name =
-                            p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+                        let name = p
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_lowercase();
                         // .rar plus split continuations (.r00, .r01, …).
                         name.ends_with(".rar")
                             || name.rfind('.').is_some_and(|i| {
@@ -2192,7 +2998,11 @@ pub fn unlock(dir: &Path, password: &str) -> bool {
         return false;
     }
     let removed = before.difference(&vol_snapshot(dir)).count();
-    println!("[unlock] {} unpacked - {removed} volume file(s) spent", dir.display());
+    info!(
+        target: "unlock",
+        "{} unpacked - {removed} volume file(s) spent",
+        dir.display()
+    );
     true
 }
 
@@ -2200,12 +3010,97 @@ pub fn unlock(dir: &Path, password: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Poll until `f()` holds or ~10 s pass: the deferred-trash worker is
+    /// asynchronous on purpose, so its outcomes need a bounded wait.
+    fn eventually(f: impl Fn() -> bool) -> bool {
+        for _ in 0..200 {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        f()
+    }
+
+    #[test]
+    fn staged_delete_leaves_the_tree_synchronously() {
+        // The §64 contract: by the time `stage` returns, the file is OUT
+        // of the job tree - so finalize can move the directory the very
+        // next instant without racing the delete - and the worker disposes
+        // of the parked copy behind us. Under cfg(test) the trash global
+        // defaults off, so the disposal is a direct delete rather than a
+        // real Trash conversation.
+        let parent = std::env::temp_dir().join(format!("defer-trash-{}", std::process::id()));
+        let job = parent.join("job");
+        std::fs::create_dir_all(&job).unwrap();
+        let f = job.join("junk.par2");
+        std::fs::write(&f, b"x").unwrap();
+        let staging = trash_staging_dir(&job).unwrap();
+        let r = deferred_trash::stage(&f, &staging);
+        assert!(r.is_ok(), "stage: {r:?}");
+        assert!(!f.exists(), "the rename must be synchronous");
+        assert!(
+            eventually(|| !staging.exists()),
+            "the worker must dispose of the parked file and prune the empty staging dir"
+        );
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn first_stage_drains_a_predecessors_leftovers() {
+        // A crash between park and disposal strands files in the staging
+        // folder. The first stage into that folder after a restart queues
+        // whatever it finds, so leftovers cannot accumulate forever.
+        let parent = std::env::temp_dir().join(format!("defer-leftover-{}", std::process::id()));
+        let job = parent.join("job");
+        std::fs::create_dir_all(&job).unwrap();
+        let staging = trash_staging_dir(&job).unwrap();
+        std::fs::create_dir_all(&staging).unwrap();
+        let leftover = staging.join("99999-0-stranded.nfo");
+        std::fs::write(&leftover, b"x").unwrap();
+        let f = job.join("junk.nfo");
+        std::fs::write(&f, b"x").unwrap();
+        deferred_trash::stage(&f, &staging).unwrap();
+        assert!(
+            eventually(|| !leftover.exists() && !staging.exists()),
+            "the leftover must go with the freshly staged file"
+        );
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn latched_swept_delete_stays_inline() {
+        // With the Finder latch set the inline path is already a plain
+        // remove_file, so parking would only add churn: the file goes
+        // directly and no staging folder appears.
+        //
+        // Serialized with the other latch-writing tests: this one leaves
+        // TRASH_UNRESPONSIVE set for the length of a delete, and
+        // `a_junk_delete_is_recoverable_and_the_opt_out_is_not` deletes
+        // into the real Trash and fails if it reads the latch set.
+        let _serial = one_trash_test_at_a_time();
+        let parent = std::env::temp_dir().join(format!("defer-latched-{}", std::process::id()));
+        let job = parent.join("job");
+        std::fs::create_dir_all(&job).unwrap();
+        let f = job.join("junk.sfv");
+        std::fs::write(&f, b"x").unwrap();
+        let staging = trash_staging_dir(&job).unwrap();
+        TRASH_UNRESPONSIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let r = remove_swept_file(&f, true, Some(&staging));
+        TRASH_UNRESPONSIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+        r.unwrap();
+        assert!(!f.exists());
+        assert!(!staging.exists(), "no staging dir on the latched path");
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
     #[test]
     fn trash_latch_still_deletes_the_file() {
         // With the Finder-unresponsive latch set, a recoverable delete must
         // skip the Trash entirely (each probe costs ~2 minutes headless)
         // and still remove the file. Restore the latch afterwards: it is
-        // process-global and this is the only test that touches it.
+        // process-global.
+        let _serial = one_trash_test_at_a_time();
         let dir = std::env::temp_dir().join(format!("trash-latch-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("junk.par2");
@@ -2214,8 +3109,122 @@ mod tests {
         let r = remove_user_file(&f, true);
         TRASH_UNRESPONSIVE.store(false, std::sync::atomic::Ordering::Relaxed);
         r.unwrap();
-        assert!(!f.exists(), "file must be gone even with the Trash latched off");
+        assert!(
+            !f.exists(),
+            "file must be gone even with the Trash latched off"
+        );
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// The give-up path, which is the entire point of the change and the
+    /// one case a healthy developer machine cannot produce: a Trash call
+    /// that never comes back must not hold the caller.
+    #[test]
+    fn a_hanging_trash_call_does_not_hold_the_caller() {
+        let started = std::time::Instant::now();
+        let out = run_bounded(std::time::Duration::from_millis(150), || {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            "finished"
+        });
+        assert!(
+            out.is_none(),
+            "a call past its deadline must report giving up"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the caller waited {:?} on a call it had given up on",
+            started.elapsed()
+        );
+    }
+
+    /// ...and a call that DOES answer in time is passed straight through,
+    /// so bounding it costs a healthy Finder nothing.
+    #[test]
+    fn a_prompt_trash_call_is_returned_unchanged() {
+        let out = run_bounded(std::time::Duration::from_secs(30), || 7);
+        assert_eq!(out, Some(7), "a prompt call must return its own result");
+    }
+
+    /// After giving up, the direct delete races the abandoned Finder call.
+    /// If Finder wins, the file is already gone and `remove_file` fails
+    /// NotFound - the outcome we wanted, so it must not surface as an
+    /// error. Without this the job would report a cleanup failure for a
+    /// file that was successfully binned.
+    #[test]
+    fn losing_the_race_to_the_trash_is_not_a_failure() {
+        let _serial = one_trash_test_at_a_time();
+        let dir = std::env::temp_dir().join(format!("trash-race-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gone = dir.join("already-binned.nfo");
+        // Never created: stands in for the file the abandoned call binned
+        // a moment before we got to it.
+        TRASH_UNRESPONSIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let r = remove_user_file(&gone, true);
+        TRASH_UNRESPONSIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            r.is_ok(),
+            "a file that is already gone is a success, not {r:?}"
+        );
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// The bug the gate exists for: callers that overlap each read the
+    /// latch before any of them set it, so each started its own probe and
+    /// each paid the full deadline. Observed on a headless bench box as
+    /// the "not responding" line printed twice and ~60 s added to a 208 s
+    /// queue. One probe for the process, however many callers overlap -
+    /// the deferred worker, a library delete and the watch dir can all be
+    /// in here at once.
+    #[test]
+    fn concurrent_callers_probe_a_dead_trash_only_once() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _serial = one_trash_test_at_a_time();
+        TRASH_UNRESPONSIVE.store(false, Relaxed);
+        TRASH_ANSWERED.store(false, Relaxed);
+
+        const CALLERS: usize = 4;
+        const PROBE: std::time::Duration = std::time::Duration::from_millis(300);
+        let probes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let start = std::sync::Arc::new(std::sync::Barrier::new(CALLERS));
+        let began = std::time::Instant::now();
+        let callers: Vec<_> = (0..CALLERS)
+            .map(|_| {
+                let probes = probes.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    // All four inside the check-then-call window together,
+                    // which is what made the real callers each probe.
+                    start.wait();
+                    trash_delete_gated(|| {
+                        probes.fetch_add(1, Relaxed);
+                        // Stands in for a Finder that never answers: the
+                        // real one is bounded at TRASH_DEADLINE and comes
+                        // back exactly like this.
+                        std::thread::sleep(PROBE);
+                        Err("timed out".to_string())
+                    })
+                })
+            })
+            .collect();
+        let verdicts: Vec<_> = callers.into_iter().map(|c| c.join().unwrap()).collect();
+        let elapsed = began.elapsed();
+        TRASH_UNRESPONSIVE.store(false, Relaxed);
+        TRASH_ANSWERED.store(false, Relaxed);
+
+        assert_eq!(
+            probes.load(Relaxed),
+            1,
+            "{CALLERS} concurrent callers must cost one probe, not one each"
+        );
+        assert_eq!(
+            verdicts.iter().filter(|v| matches!(v, Err(None))).count(),
+            CALLERS - 1,
+            "every caller but the prober must be told to delete directly: {verdicts:?}"
+        );
+        assert!(
+            elapsed < PROBE * 2,
+            "the callers took {elapsed:?} - a single {PROBE:?} probe should cover all {CALLERS}"
+        );
     }
 
     fn rule(pattern: &str) -> Rule {
@@ -2268,7 +3277,12 @@ mod tests {
         let mut b = rule("1080p");
         b.category = "tv".into();
         let rules = [a, b];
-        assert_eq!(first_match(&rules, "Show.S01E01.1080p", 0).unwrap().category, "tv-hd");
+        assert_eq!(
+            first_match(&rules, "Show.S01E01.1080p", 0)
+                .unwrap()
+                .category,
+            "tv-hd"
+        );
         assert!(first_match(&rules, "Show.S01E01.720p", 0).is_none());
     }
 
@@ -2288,17 +3302,26 @@ mod tests {
     fn tv_rename_mapping() {
         assert_eq!(
             tv_path("The.Bear.S03E05.1080p.WEB.h264-GRP"),
-            Some(("The Bear/Season 03".into(), Some("The Bear - S03E05".into())))
+            Some((
+                "The Bear/Season 03".into(),
+                Some("The Bear - S03E05".into())
+            ))
         );
         // Multi-episode posts keep the full range in the filed name
         // (§7b: the second episode used to vanish from the library).
         assert_eq!(
             tv_path("The.Bear.S03E05E06.1080p.WEB.h264-GRP"),
-            Some(("The Bear/Season 03".into(), Some("The Bear - S03E05-E06".into())))
+            Some((
+                "The Bear/Season 03".into(),
+                Some("The Bear - S03E05-E06".into())
+            ))
         );
         assert_eq!(
             tv_path("The.Bear.S03E05-E06.1080p.WEB.h264-GRP"),
-            Some(("The Bear/Season 03".into(), Some("The Bear - S03E05-E06".into())))
+            Some((
+                "The Bear/Season 03".into(),
+                Some("The Bear - S03E05-E06".into())
+            ))
         );
         // Season pack: directory but no rename base.
         assert_eq!(
@@ -2308,7 +3331,10 @@ mod tests {
         // 3x07 form.
         assert_eq!(
             tv_path("the-flash-3x07-720p-hdtv-x264"),
-            Some(("The Flash/Season 03".into(), Some("The Flash - S03E07".into())))
+            Some((
+                "The Flash/Season 03".into(),
+                Some("The Flash - S03E07".into())
+            ))
         );
         // Movies and obfuscated names refuse.
         assert_eq!(tv_path("Inception.2010.1080p.BluRay.x264-GRP"), None);
@@ -2332,18 +3358,27 @@ mod tests {
         // knows, normalized to the same name.
         assert_eq!(
             tv_path("At.Midnight.150615.720p.HDTV.x264-GRP"),
-            Some(("At Midnight/Season 2015".into(), Some("At Midnight - 2015.06.15".into())))
+            Some((
+                "At Midnight/Season 2015".into(),
+                Some("At Midnight - 2015.06.15".into())
+            ))
         );
         // Full YYYYMMDD datecode.
         assert_eq!(
             tv_path("At.Midnight.20150615.720p.HDTV.x264-GRP"),
-            Some(("At Midnight/Season 2015".into(), Some("At Midnight - 2015.06.15".into())))
+            Some((
+                "At Midnight/Season 2015".into(),
+                Some("At Midnight - 2015.06.15".into())
+            ))
         );
         // A compact YYMMDD the parser had to fix up on its own (no
         // four-digit year to lean on) files exactly like the dotted form.
         assert_eq!(
             tv_path("At.Midnight.260721.1080p.WEB.x264-GRP"),
-            Some(("At Midnight/Season 2026".into(), Some("At Midnight - 2026.07.21".into())))
+            Some((
+                "At Midnight/Season 2026".into(),
+                Some("At Midnight - 2026.07.21".into())
+            ))
         );
         // A numbered season still wins: a show that carries both is not
         // filed by date.
@@ -2359,7 +3394,10 @@ mod tests {
         // must not swallow it.
         assert_eq!(
             tv_path("Newsnight.2026.07.21.1080p.WEB-GRP"),
-            Some(("Newsnight/Season 2026".into(), Some("Newsnight - 2026.07.21".into())))
+            Some((
+                "Newsnight/Season 2026".into(),
+                Some("Newsnight - 2026.07.21".into())
+            ))
         );
         // The show title gets the same portability treatment as every
         // other emitted component.
@@ -2392,7 +3430,10 @@ mod tests {
         }
         // A real date under a title that is a hash: nothing to present,
         // so the poster's own name stands.
-        assert_eq!(tv_path("1fRbH6e0eX8v5hv7fSyXgBb.2026.07.21.1080p.WEB-GRP"), None);
+        assert_eq!(
+            tv_path("1fRbH6e0eX8v5hv7fSyXgBb.2026.07.21.1080p.WEB-GRP"),
+            None
+        );
         assert_eq!(tv_path("nzqymzflnjiyztgyntcynzzytq.150615.720p-GRP"), None);
         // A film with a release year is not a dated episode.
         assert_eq!(tv_path("Inception.2010.1080p.BluRay.x264-GRP"), None);
@@ -2438,10 +3479,23 @@ mod tests {
             std::fs::write(root.join(f), b"v").unwrap();
         }
         let stem = "The.Daily.Show.2026.07.21.1080p.WEB.x264-GRP";
-        assert_eq!(delete_filed_episode(&root, stem, " [1080p]"), 1);
-        assert!(!root.join("The Daily Show - 2026.07.21 [1080p].mkv").exists());
-        assert!(root.join("The Daily Show - 2026.07.22 [1080p].mkv").exists());
-        assert!(root.join("The Daily Show - 2026.07.21 - Guest Name.mkv").exists());
+        assert_eq!(
+            delete_filed_episode(&root, stem, &FiledTail::suffix(" [1080p]")),
+            1
+        );
+        assert!(
+            !root
+                .join("The Daily Show - 2026.07.21 [1080p].mkv")
+                .exists()
+        );
+        assert!(
+            root.join("The Daily Show - 2026.07.22 [1080p].mkv")
+                .exists()
+        );
+        assert!(
+            root.join("The Daily Show - 2026.07.21 - Guest Name.mkv")
+                .exists()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2455,29 +3509,54 @@ mod tests {
         let out = root.join("job");
         std::fs::create_dir_all(&out).unwrap();
         std::fs::write(out.join("1fRbH6e0eX8v5hv7fSyXgBb.mkv"), b"v").unwrap();
-        let dest = tv_organize(&root.join("tv"), stem, &out, " [1080p]").unwrap();
-        assert_eq!(dest, root.join("tv").join("The Daily Show").join("Season 2026"));
-        assert!(dest.join("The Daily Show - 2026.07.21 [1080p].mkv").exists());
+        let dest = tv_organize(
+            &root.join("tv"),
+            stem,
+            &out,
+            " [1080p]",
+            &EpisodeTitles::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            dest,
+            root.join("tv").join("The Daily Show").join("Season 2026")
+        );
+        assert!(
+            dest.join("The Daily Show - 2026.07.21 [1080p].mkv")
+                .exists()
+        );
         let _ = std::fs::remove_dir_all(&root);
 
         // tv_sort off: same name, in place.
         let dir = scratch("dailyren");
         std::fs::write(dir.join("1fRbH6e0eX8v5hv7fSyXgBb.mkv"), b"v").unwrap();
         std::fs::write(dir.join("sample.mkv"), b"s").unwrap();
-        assert_eq!(tv_rename(&dir, stem, " [1080p]"), 1);
+        assert_eq!(
+            tv_rename(&dir, stem, " [1080p]", &EpisodeTitles::default()),
+            1
+        );
         assert!(dir.join("The Daily Show - 2026.07.21 [1080p].mkv").exists());
         assert!(dir.join("sample.mkv").exists(), "samples keep their names");
 
         // Running it again is a no-op - the target is already there.
-        assert_eq!(tv_rename(&dir, stem, " [1080p]"), 0);
+        assert_eq!(
+            tv_rename(&dir, stem, " [1080p]", &EpisodeTitles::default()),
+            0
+        );
         let _ = std::fs::remove_dir_all(&dir);
 
         // Per-file stem beats the job stem, exactly as for numbered
         // seasons: a batch of dailies renames each to its own air date.
         let dir = scratch("dailybatch");
-        std::fs::write(dir.join("The.Daily.Show.2026.07.22.1080p.WEB.x264-GRP.mkv"), b"v")
-            .unwrap();
-        assert_eq!(tv_rename(&dir, stem, " [1080p]"), 1);
+        std::fs::write(
+            dir.join("The.Daily.Show.2026.07.22.1080p.WEB.x264-GRP.mkv"),
+            b"v",
+        )
+        .unwrap();
+        assert_eq!(
+            tv_rename(&dir, stem, " [1080p]", &EpisodeTitles::default()),
+            1
+        );
         assert!(dir.join("The Daily Show - 2026.07.22 [1080p].mkv").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2498,7 +3577,7 @@ mod tests {
         }
         // Delete only the E05 the old release filed to. Empty suffix =
         // auto-rename off, so the episode base is all filing had to go on.
-        let n = delete_filed_episode(&dir, "The.Bear.S03E05.720p.HDTV-A", "");
+        let n = delete_filed_episode(&dir, "The.Bear.S03E05.720p.HDTV-A", &FiledTail::suffix(""));
         assert_eq!(n, 2, "should remove the E05 video and its .srt sidecar");
         assert!(!dir.join("The Bear - S03E05.mkv").exists());
         assert!(!dir.join("The Bear - S03E05.en.srt").exists());
@@ -2507,7 +3586,10 @@ mod tests {
         assert!(dir.join("The Bear - S03E06.mkv").exists());
         // A release that doesn't parse to a specific episode is a no-op,
         // never a broad delete.
-        assert_eq!(delete_filed_episode(&dir, "2137d880a074ab31de52", ""), 0);
+        assert_eq!(
+            delete_filed_episode(&dir, "2137d880a074ab31de52", &FiledTail::suffix("")),
+            0
+        );
         assert!(dir.join("The Bear - S03E04.mkv").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -2527,13 +3609,23 @@ mod tests {
         std::fs::write(dir.join("The Bear - S03E05.mkv"), vec![0u8; 1024]).unwrap();
         std::fs::write(dir.join("The Bear - S03E06.mkv"), vec![0u8; 8192]).unwrap();
         std::fs::write(dir.join("The Bear - S03E05.en.srt"), b"subs").unwrap();
-        let got = find_filed_episode_media(&dir, "The.Bear.S03E05.720p.HDTV-A", "");
-        assert_eq!(got.as_deref(), Some(dir.join("The Bear - S03E05.mkv").as_path()));
+        let got =
+            find_filed_episode_media(&dir, "The.Bear.S03E05.720p.HDTV-A", &FiledTail::suffix(""));
+        assert_eq!(
+            got.as_deref(),
+            Some(dir.join("The Bear - S03E05.mkv").as_path())
+        );
         // A stem that doesn't parse as a specific episode owns nothing
         // here, so there is nothing safe to play: no fallback guess.
-        assert_eq!(find_filed_episode_media(&dir, "2137d880a074ab31de52", ""), None);
+        assert_eq!(
+            find_filed_episode_media(&dir, "2137d880a074ab31de52", &FiledTail::suffix("")),
+            None
+        );
         // Neither does an episode that was never filed into this folder.
-        assert_eq!(find_filed_episode_media(&dir, "The.Bear.S03E09.720p.HDTV-A", ""), None);
+        assert_eq!(
+            find_filed_episode_media(&dir, "The.Bear.S03E09.720p.HDTV-A", &FiledTail::suffix("")),
+            None
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2546,20 +3638,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("The Bear - S03E05 [720p].mkv"), vec![0u8; 1024]).unwrap();
-        std::fs::write(dir.join("The Bear - S03E05 [1080p]-GRP.mkv"), vec![0u8; 4096]).unwrap();
+        std::fs::write(
+            dir.join("The Bear - S03E05 [1080p]-GRP.mkv"),
+            vec![0u8; 4096],
+        )
+        .unwrap();
         let stem = "The.Bear.S03E05.720p.HDTV-A";
         assert_eq!(
-            find_filed_episode_media(&dir, stem, " [720p]").as_deref(),
+            find_filed_episode_media(&dir, stem, &FiledTail::suffix(" [720p]")).as_deref(),
             Some(dir.join("The Bear - S03E05 [720p].mkv").as_path()),
             "the smaller file is the one this row downloaded"
         );
         assert_eq!(
-            find_filed_episode_media(&dir, stem, " [1080p]-GRP").as_deref(),
+            find_filed_episode_media(&dir, stem, &FiledTail::suffix(" [1080p]-GRP")).as_deref(),
             Some(dir.join("The Bear - S03E05 [1080p]-GRP.mkv").as_path())
         );
         // A suffix that matches nothing on disk (the naming settings
         // changed since filing) reports nothing rather than guessing.
-        assert_eq!(find_filed_episode_media(&dir, stem, " [2160p]"), None);
+        assert_eq!(
+            find_filed_episode_media(&dir, stem, &FiledTail::suffix(" [2160p]")),
+            None
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2574,7 +3673,10 @@ mod tests {
         std::fs::write(dir.join("The Bear - S03E05.en.srt"), b"subs").unwrap();
         std::fs::write(dir.join("The Bear - S03E05.nfo"), b"info").unwrap();
         std::fs::write(dir.join("Subs/The Bear - S03E05.mkv"), vec![0u8; 4096]).unwrap();
-        assert_eq!(find_filed_episode_media(&dir, "The.Bear.S03E05.720p.HDTV-A", ""), None);
+        assert_eq!(
+            find_filed_episode_media(&dir, "The.Bear.S03E05.720p.HDTV-A", &FiledTail::suffix("")),
+            None
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2626,7 +3728,11 @@ mod tests {
         for f in ours.iter().chain(theirs.iter()) {
             std::fs::write(dir.join(f), b"x").unwrap();
         }
-        let n = delete_filed_episode(&dir, "The.Bear.S03E05.1080p.WEB.h264-GRP", "");
+        let n = delete_filed_episode(
+            &dir,
+            "The.Bear.S03E05.1080p.WEB.h264-GRP",
+            &FiledTail::suffix(""),
+        );
         assert_eq!(n, ours.len(), "every file this job filed, and only those");
         for f in ours {
             assert!(!dir.join(f).exists(), "{f} is ours and should have gone");
@@ -2671,11 +3777,13 @@ mod tests {
         };
         let old_stem = "The.Bear.S03E05.720p.HDTV-A";
         let new_stem = "The.Bear.S03E05.1080p.WEB.h264-GRP";
-        let suffix = |stem: &str| {
-            crate::wall::quality_suffix(&crate::wall::parse_release(stem), &style)
-        };
+        let suffix =
+            |stem: &str| crate::wall::quality_suffix(&crate::wall::parse_release(stem), &style);
         let (old_sfx, new_sfx) = (suffix(old_stem), suffix(new_stem));
-        assert!(!old_sfx.is_empty(), "auto-rename is on, so filing appended a suffix");
+        assert!(
+            !old_sfx.is_empty(),
+            "auto-rename is on, so filing appended a suffix"
+        );
         assert_ne!(old_sfx, new_sfx, "the upgrade is a different quality");
 
         let old_file = format!("The Bear - S03E05{old_sfx}.mkv");
@@ -2686,25 +3794,37 @@ mod tests {
         }
 
         // The upgrade landed; drop the copy it supersedes.
-        let n = delete_filed_episode(&dir, old_stem, &old_sfx);
+        let n = delete_filed_episode(&dir, old_stem, &FiledTail::suffix(&old_sfx));
         assert_eq!(n, 1, "exactly the superseded release, and nothing else");
         assert!(!dir.join(&old_file).exists(), "the superseded copy is gone");
         assert!(
             dir.join(&new_file).exists(),
             "the replacement we just downloaded must survive its own upgrade"
         );
-        assert!(dir.join(sibling).exists(), "a sibling episode is never touched");
+        assert!(
+            dir.join(sibling).exists(),
+            "a sibling episode is never touched"
+        );
 
         // And the other direction: deleting the NEW record later must not
         // reach back to a copy that carries a different suffix.
         std::fs::write(dir.join(&old_file), b"x").unwrap();
-        assert_eq!(delete_filed_episode(&dir, new_stem, &new_sfx), 1);
-        assert!(dir.join(&old_file).exists(), "the other quality is not this record's");
+        assert_eq!(
+            delete_filed_episode(&dir, new_stem, &FiledTail::suffix(&new_sfx)),
+            1
+        );
+        assert!(
+            dir.join(&old_file).exists(),
+            "the other quality is not this record's"
+        );
 
         // A suffix that no longer matches what is on disk (the user changed
         // the naming settings after filing) is a no-op, never a guess: a
         // leftover beats a destroyed episode.
-        assert_eq!(delete_filed_episode(&dir, old_stem, " [2160p REMUX]-ZZZ"), 0);
+        assert_eq!(
+            delete_filed_episode(&dir, old_stem, &FiledTail::suffix(" [2160p REMUX]-ZZZ")),
+            0
+        );
         assert!(dir.join(&old_file).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2840,7 +3960,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nzbfast-smart-clean-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
-        for p in ["a.mkv", "a.par2", "a.vol00+1.PAR2", "a.sfv", "sub/b.par2", "sub/b.mkv"] {
+        for p in [
+            "a.mkv",
+            "a.par2",
+            "a.vol00+1.PAR2",
+            "a.sfv",
+            "sub/b.par2",
+            "sub/b.mkv",
+        ] {
             std::fs::write(dir.join(p), b"x").unwrap();
         }
         let n = cleanup(&dir, &parse_ext_list("par2, sfv"));
@@ -2864,17 +3991,42 @@ mod tests {
         std::fs::write(out.join(format!("{stem}.nfo")), b"info").unwrap();
         std::fs::write(out.join("sample.mkv"), b"s").unwrap();
         std::fs::write(out.join("extras/x.srt"), b"subs").unwrap();
-        let dest = tv_organize(&root.join("tv"), stem, &out, " [1080p]").unwrap();
+        let dest = tv_organize(
+            &root.join("tv"),
+            stem,
+            &out,
+            " [1080p]",
+            &EpisodeTitles::default(),
+        )
+        .unwrap();
         assert_eq!(dest, root.join("tv/My Show/Season 01"));
-        assert_eq!(std::fs::read(dest.join("My Show - S01E02 [1080p].mkv")).unwrap(), b"video");
-        assert!(dest.join(format!("{stem}.nfo")).exists(), "non-video keeps its name");
-        assert!(dest.join("sample.mkv").exists(), "sample moved but not renamed");
+        assert_eq!(
+            std::fs::read(dest.join("My Show - S01E02 [1080p].mkv")).unwrap(),
+            b"video"
+        );
+        assert!(
+            dest.join(format!("{stem}.nfo")).exists(),
+            "non-video keeps its name"
+        );
+        assert!(
+            dest.join("sample.mkv").exists(),
+            "sample moved but not renamed"
+        );
         assert!(dest.join("extras/x.srt").exists(), "subdir moved whole");
         assert!(!out.exists(), "emptied job dir removed");
         // A movie stem refuses and leaves the directory alone.
         let mout = root.join("Movie.2020.1080p");
         std::fs::create_dir_all(&mout).unwrap();
-        assert!(tv_organize(&root, "Movie.2020.1080p", &mout, "").is_none());
+        assert!(
+            tv_organize(
+                &root,
+                "Movie.2020.1080p",
+                &mout,
+                "",
+                &EpisodeTitles::default()
+            )
+            .is_none()
+        );
         assert!(mout.exists());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2897,13 +4049,17 @@ mod tests {
                 &root.join("tv"),
                 "Show.S01E02.1080p.WEB.x265-GRP",
                 &out,
-                " 1080p"
+                " 1080p",
+                &EpisodeTitles::default(),
             )
             .is_none(),
             "a collision must keep the job private"
         );
         assert_eq!(std::fs::read(&canonical).unwrap(), b"library");
-        assert_eq!(std::fs::read(out.join("posted.release.mkv")).unwrap(), b"ours");
+        assert_eq!(
+            std::fs::read(out.join("posted.release.mkv")).unwrap(),
+            b"ours"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2929,7 +4085,14 @@ mod tests {
 
         // Our job has nothing left to place at all.
         assert!(
-            tv_organize(&root.join("tv"), "Show.S01E05.1080p.WEB-GRP", &out, " 1080p").is_none(),
+            tv_organize(
+                &root.join("tv"),
+                "Show.S01E05.1080p.WEB-GRP",
+                &out,
+                " 1080p",
+                &EpisodeTitles::default(),
+            )
+            .is_none(),
             "a job with nothing to file must not claim the season folder"
         );
         assert_eq!(
@@ -2958,8 +4121,14 @@ mod tests {
         std::fs::write(out.join("posted.release.mkv"), b"ours").unwrap();
         std::fs::write(out.join("Subs/en.srt"), b"subs").unwrap();
 
-        let dest = tv_organize(&root.join("tv"), "Show.S01E03.1080p.WEB-GRP", &out, " 1080p")
-            .expect("a shared Subs/ folder must not stop the episode filing");
+        let dest = tv_organize(
+            &root.join("tv"),
+            "Show.S01E03.1080p.WEB-GRP",
+            &out,
+            " 1080p",
+            &EpisodeTitles::default(),
+        )
+        .expect("a shared Subs/ folder must not stop the episode filing");
         assert_eq!(dest, season);
         assert!(
             season.join("Show - S01E03 1080p.mkv").is_file(),
@@ -2998,7 +4167,14 @@ mod tests {
         std::fs::set_permissions(&season, perms).unwrap();
 
         assert!(
-            tv_organize(&root.join("tv"), "Show.S01E04.1080p.WEB-GRP", &out, " 1080p").is_none(),
+            tv_organize(
+                &root.join("tv"),
+                "Show.S01E04.1080p.WEB-GRP",
+                &out,
+                " 1080p",
+                &EpisodeTitles::default(),
+            )
+            .is_none(),
             "a job whose move failed must not claim the season folder"
         );
         assert_eq!(
@@ -3079,10 +4255,16 @@ mod tests {
         std::os::unix::fs::symlink(&external, job.join("extras")).unwrap();
 
         cleanup(&job, &["nfo".to_string()]);
-        assert!(external.join("keep.nfo").exists(), "cleanup deleted outside the job");
+        assert!(
+            external.join("keep.nfo").exists(),
+            "cleanup deleted outside the job"
+        );
 
         sweep_junk(&job);
-        assert!(external.join("keep.nfo").exists(), "sweep_junk deleted outside the job");
+        assert!(
+            external.join("keep.nfo").exists(),
+            "sweep_junk deleted outside the job"
+        );
 
         keep_media_only(&job);
         assert!(
@@ -3108,8 +4290,15 @@ mod tests {
             claimed.push(reserve_free_name(&wanted).unwrap());
         }
         let unique: std::collections::HashSet<_> = claimed.iter().collect();
-        assert_eq!(unique.len(), claimed.len(), "a name was handed out twice: {claimed:?}");
-        assert_eq!(claimed[0], wanted, "the first caller still gets the plain name");
+        assert_eq!(
+            unique.len(),
+            claimed.len(),
+            "a name was handed out twice: {claimed:?}"
+        );
+        assert_eq!(
+            claimed[0], wanted,
+            "the first caller still gets the plain name"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3165,9 +4354,21 @@ mod tests {
         staged_move(&src, &dst, &staging).unwrap();
 
         assert_eq!(std::fs::read(dst.join("E02.mkv")).unwrap(), b"earlier");
-        assert_eq!(std::fs::read(dst.join("E01.mkv")).unwrap(), b"theirs", "existing kept");
-        assert_eq!(std::fs::read(dst.join("E01 (2).mkv")).unwrap(), b"ours", "ours beside it");
-        assert_eq!(std::fs::read(dst.join("Subs/E01.srt")).unwrap(), b"s", "subdir published");
+        assert_eq!(
+            std::fs::read(dst.join("E01.mkv")).unwrap(),
+            b"theirs",
+            "existing kept"
+        );
+        assert_eq!(
+            std::fs::read(dst.join("E01 (2).mkv")).unwrap(),
+            b"ours",
+            "ours beside it"
+        );
+        assert_eq!(
+            std::fs::read(dst.join("Subs/E01.srt")).unwrap(),
+            b"s",
+            "subdir published"
+        );
         assert!(!src.exists(), "drained source dir removed");
         assert!(!staging.exists(), "staging cleaned up");
         let _ = std::fs::remove_dir_all(&root);
@@ -3198,7 +4399,11 @@ mod tests {
         std::fs::write(src.join("Subs/late.srt"), b"late").unwrap();
         drain_copied(&src, &copied);
 
-        assert_eq!(std::fs::read(dst.join("Film.mkv")).unwrap(), b"v", "payload published");
+        assert_eq!(
+            std::fs::read(dst.join("Film.mkv")).unwrap(),
+            b"v",
+            "payload published"
+        );
         assert_eq!(std::fs::read(dst.join("Subs/Film.srt")).unwrap(), b"s");
         assert!(!src.join("Film.mkv").exists(), "what was copied is drained");
         assert_eq!(
@@ -3232,8 +4437,16 @@ mod tests {
         std::fs::write(&staging, b"in the way").unwrap();
 
         assert!(staged_move(&src, &dst, &staging).is_err());
-        assert_eq!(std::fs::read(src.join("Film.mkv")).unwrap(), b"v", "source untouched");
-        assert_eq!(std::fs::read(src.join("Film.nfo")).unwrap(), b"n", "source untouched");
+        assert_eq!(
+            std::fs::read(src.join("Film.mkv")).unwrap(),
+            b"v",
+            "source untouched"
+        );
+        assert_eq!(
+            std::fs::read(src.join("Film.nfo")).unwrap(),
+            b"n",
+            "source untouched"
+        );
         assert!(!dst.exists(), "nothing half-published at the destination");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3254,8 +4467,11 @@ mod tests {
             p
         };
 
-        let scrap = mk("GqRTzbOIvUzZg1hqbipRind85vn", &vec![b'x'; 56]);
-        assert!(is_nameless_scrap(&scrap, "", feat, true), "the reported leftover");
+        let scrap = mk("GqRTzbOIvUzZg1hqbipRind85vn", &[b'x'; 56]);
+        assert!(
+            is_nameless_scrap(&scrap, "", feat, true),
+            "the reported leftover"
+        );
         // The whole point of the gate: permanent delete, so do not guess.
         assert!(!is_nameless_scrap(&scrap, "", feat, false));
         // No feature identified = music/books/software, where extensionless
@@ -3264,9 +4480,15 @@ mod tests {
 
         // Must never fire on these.
         let big = mk("NoExtensionButBig", &vec![0u8; 8192]);
-        assert!(!is_nameless_scrap(&big, "", feat, true), "8 KB is over the ceiling");
+        assert!(
+            !is_nameless_scrap(&big, "", feat, true),
+            "8 KB is over the ceiling"
+        );
         let named = mk("notes.xyz", b"hi");
-        assert!(!is_nameless_scrap(&named, "xyz", feat, true), "an unknown ext is somebody's file");
+        assert!(
+            !is_nameless_scrap(&named, "xyz", feat, true),
+            "an unknown ext is somebody's file"
+        );
         for (n, magic) in [
             ("tiny_rar", &b"Rar!\x1a\x07\x00"[..]),
             ("tiny_zip", &b"PK\x03\x04xxxx"[..]),
@@ -3274,7 +4496,10 @@ mod tests {
             ("tiny_pdf", &b"%PDF-1.7xx"[..]),
         ] {
             let f = mk(n, magic);
-            assert!(!is_nameless_scrap(&f, "", feat, true), "{n}: magic must save it");
+            assert!(
+                !is_nameless_scrap(&f, "", feat, true),
+                "{n}: magic must save it"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3314,14 +4539,21 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("Show.S01E02.mkv"), vec![0u8; 4096]).unwrap();
         // Hash-named recovery volumes, exactly as they land on disk.
-        for h in ["a3fe9c80619b8674f7630bf390f2dc32", "f72b9763eb8f689acefad6891cbf876c"] {
+        for h in [
+            "a3fe9c80619b8674f7630bf390f2dc32",
+            "f72b9763eb8f689acefad6891cbf876c",
+        ] {
             let mut body = b"PAR2\x00PKT".to_vec();
             body.extend_from_slice(&[0u8; 64]);
             std::fs::write(dir.join(h), body).unwrap();
         }
         // A hash-named file that is NOT par2 stays: the magic decides,
         // not the shape of the name.
-        std::fs::write(dir.join("cc1a4c408b0b5990ca51a83ec219bca2"), b"not a par2 file").unwrap();
+        std::fs::write(
+            dir.join("cc1a4c408b0b5990ca51a83ec219bca2"),
+            b"not a par2 file",
+        )
+        .unwrap();
         let n = sweep_junk(&dir);
         assert_eq!(n, 2, "both obfuscated recovery volumes swept");
         assert!(dir.join("Show.S01E02.mkv").exists(), "episode kept");
@@ -3375,7 +4607,10 @@ mod tests {
         let n = keep_media_only(&dir);
         assert_eq!(n, 1, "only the poster goes");
         for packed in ["extras.zip", "bonus.rar", "more.7z", "split.zip.001"] {
-            assert!(dir.join(packed).exists(), "{packed} is payload we could not unpack");
+            assert!(
+                dir.join(packed).exists(),
+                "{packed} is payload we could not unpack"
+            );
         }
         // A .cbz is the deliverable, not packaging - but it is also not
         // media, so keep-media-only is still allowed to sweep it.
@@ -3416,7 +4651,11 @@ mod tests {
         std::fs::write(dir.join("poster.jpg"), b"x").unwrap();
         // A hash-named blob that is NOT a RAR is still clutter: the magic
         // decides, never the shape of the name.
-        std::fs::write(dir.join("cc98d076ce474159bec6a0fe670059ee32"), b"not an archive").unwrap();
+        std::fs::write(
+            dir.join("cc98d076ce474159bec6a0fe670059ee32"),
+            b"not an archive",
+        )
+        .unwrap();
         let n = keep_media_only(&dir);
         assert_eq!(n, 2, "the poster and the non-archive blob go, nothing else");
         for v in vols {
@@ -3494,7 +4733,11 @@ mod tests {
         for f in ["movie.iso", "movie.nfo", "cover.jpg"] {
             std::fs::write(iso.join(f), vec![0u8; 4096]).unwrap();
         }
-        assert_eq!(keep_media_only(&iso), 2, "the .iso IS the video; the nfo and jpg go");
+        assert_eq!(
+            keep_media_only(&iso),
+            2,
+            "the .iso IS the video; the nfo and jpg go"
+        );
         assert!(iso.join("movie.iso").exists(), "the payload");
         assert!(!iso.join("cover.jpg").exists());
         assert!(!iso.join("movie.nfo").exists());
@@ -3502,12 +4745,20 @@ mod tests {
         // A music album: no video at all, so the sweep declines to run.
         let album = root.join("Adele - 30 (2021) FLAC");
         std::fs::create_dir_all(&album).unwrap();
-        let tracks =
-            ["01 - Strangers By Nature.flac", "02 - Easy On Me.flac", "album.cue", "cover.jpg"];
+        let tracks = [
+            "01 - Strangers By Nature.flac",
+            "02 - Easy On Me.flac",
+            "album.cue",
+            "cover.jpg",
+        ];
         for f in tracks {
             std::fs::write(album.join(f), vec![0u8; 4096]).unwrap();
         }
-        assert_eq!(keep_media_only(&album), 0, "nothing here is safe to classify");
+        assert_eq!(
+            keep_media_only(&album),
+            0,
+            "nothing here is safe to classify"
+        );
         for f in tracks {
             assert!(album.join(f).exists(), "{f} is the payload, not clutter");
         }
@@ -3528,14 +4779,25 @@ mod tests {
         // PAYLOAD_EXTS the fifty were deleted as "non-media".
         let comics = root.join("Some.Comic.Vol.01-03.2026.COMIC-GRP");
         std::fs::create_dir_all(&comics).unwrap();
-        let keep = ["vol01.cbz", "vol02.cbr", "vol03.pdf", "extras.mp3", "read.epub",
-                    "album.cue", "bonus.mp4"];
+        let keep = [
+            "vol01.cbz",
+            "vol02.cbr",
+            "vol03.pdf",
+            "extras.mp3",
+            "read.epub",
+            "album.cue",
+            "bonus.mp4",
+        ];
         for f in keep {
             std::fs::write(comics.join(f), vec![0u8; 4096]).unwrap();
         }
         std::fs::write(comics.join("cover.jpg"), vec![0u8; 4096]).unwrap();
         std::fs::write(comics.join("info.nfo"), vec![0u8; 4096]).unwrap();
-        assert_eq!(keep_media_only(&comics), 2, "only the jpg and nfo are clutter");
+        assert_eq!(
+            keep_media_only(&comics),
+            2,
+            "only the jpg and nfo are clutter"
+        );
         for f in keep {
             assert!(comics.join(f).exists(), "{f} is payload and was deleted");
         }
@@ -3561,7 +4823,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("feature.m2ts"), vec![0u8; 4096]).unwrap();
-        let keep = ["index.bdmv", "00800.mpls", "VTS_01_0.ifo", "VTS_01_0.bup", "track.mka"];
+        let keep = [
+            "index.bdmv",
+            "00800.mpls",
+            "VTS_01_0.ifo",
+            "VTS_01_0.bup",
+            "track.mka",
+        ];
         for f in keep {
             std::fs::write(dir.join(f), b"x").unwrap();
         }
@@ -3606,7 +4874,10 @@ mod tests {
         assert!(dir.join("0aF3xQ").exists(), "matroska payload must survive");
         assert!(dir.join("9zZq11").exists(), "mp4 payload must survive");
         assert!(dir.join("kk22ww").exists(), "avi payload must survive");
-        assert!(!dir.join("readme_no_ext").exists(), "non-container junk still goes");
+        assert!(
+            !dir.join("readme_no_ext").exists(),
+            "non-container junk still goes"
+        );
         assert_eq!(removed, 1, "only the junk file");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3673,7 +4944,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nzbfast-proofpack-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let eps = ["Proof.S01E01.1080p.mkv", "Proof.S01E02.1080p.mkv", "Proof.S01E03.1080p.mkv"];
+        let eps = [
+            "Proof.S01E01.1080p.mkv",
+            "Proof.S01E02.1080p.mkv",
+            "Proof.S01E03.1080p.mkv",
+        ];
         for ep in eps {
             std::fs::write(dir.join(ep), vec![0u8; 4096]).unwrap();
         }
@@ -3719,10 +4994,19 @@ mod tests {
 
         assert_eq!(n, 1, "the sample clip");
         assert!(!dir.join("Sample").exists(), "emptied sample folder pruned");
-        assert!(!dir.join("Proof").exists(), "empty folder and its empty child pruned");
+        assert!(
+            !dir.join("Proof").exists(),
+            "empty folder and its empty child pruned"
+        );
         assert!(dir.join("Subs/english.srt").exists(), "subtitle kept");
-        assert!(dir.join("Subs").exists(), "folder that still holds a file stays");
-        assert!(dir.join("The.Movie.2024.1080p.mkv").exists(), "feature kept");
+        assert!(
+            dir.join("Subs").exists(),
+            "folder that still holds a file stays"
+        );
+        assert!(
+            dir.join("The.Movie.2024.1080p.mkv").exists(),
+            "feature kept"
+        );
         assert!(dir.exists(), "the job's own directory is never pruned");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3746,9 +5030,18 @@ mod tests {
         let n = prune_empty_dirs(&dir, 0);
 
         assert_eq!(n, 2, "both husks");
-        assert!(!dir.join("Sample").exists(), "a folder holding only .DS_Store is empty");
-        assert!(!dir.join("Proof").exists(), "…and so is one holding only an AppleDouble");
-        assert!(dir.join(".DS_Store").exists(), "the job's own dir is left alone");
+        assert!(
+            !dir.join("Sample").exists(),
+            "a folder holding only .DS_Store is empty"
+        );
+        assert!(
+            !dir.join("Proof").exists(),
+            "…and so is one holding only an AppleDouble"
+        );
+        assert!(
+            dir.join(".DS_Store").exists(),
+            "the job's own dir is left alone"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3769,7 +5062,10 @@ mod tests {
         let n = prune_empty_dirs(&dir, 0);
 
         assert_eq!(n, 1, "only the husk");
-        assert!(dir.join("Big/._big.mkv").exists(), "2 MiB is not a resource fork");
+        assert!(
+            dir.join("Big/._big.mkv").exists(),
+            "2 MiB is not a resource fork"
+        );
         assert!(dir.join("Big").exists(), "…so its folder is not empty");
         assert!(!dir.join("Small").exists(), "a real AppleDouble still goes");
         let _ = std::fs::remove_dir_all(&dir);
@@ -3788,7 +5084,10 @@ mod tests {
         assert_eq!(prune_empty_dirs(&dir, 0), 0);
 
         assert!(dir.join("Subs/english.srt").exists(), "content kept");
-        assert!(dir.join("Subs/.DS_Store").exists(), "not ours to remove while the folder lives");
+        assert!(
+            dir.join("Subs/.DS_Store").exists(),
+            "not ours to remove while the folder lives"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3804,7 +5103,10 @@ mod tests {
         }
         std::fs::create_dir_all(&deep).unwrap();
         prune_empty_dirs(&dir, 0);
-        assert!(deep.exists(), "below the cap the walk stops rather than recursing");
+        assert!(
+            deep.exists(),
+            "below the cap the walk stops rather than recursing"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3816,12 +5118,15 @@ mod tests {
         let stem = "My.Show.S01E02.1080p.WEB.x264-TEST";
         std::fs::write(dir.join(format!("{stem}.mkv")), b"v").unwrap();
         std::fs::write(dir.join("sample.mkv"), b"s").unwrap();
-        let n = tv_rename(&dir, stem, " [1080p]");
+        let n = tv_rename(&dir, stem, " [1080p]", &EpisodeTitles::default());
         assert_eq!(n, 1);
         assert!(dir.join("My Show - S01E02 [1080p].mkv").exists());
         assert!(dir.join("sample.mkv").exists(), "sample untouched");
         // delete_filed_episode still finds the suffixed name.
-        assert_eq!(delete_filed_episode(&dir, stem, " [1080p]"), 1);
+        assert_eq!(
+            delete_filed_episode(&dir, stem, &FiledTail::suffix(" [1080p]")),
+            1
+        );
         assert!(!dir.join("My Show - S01E02 [1080p].mkv").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3838,8 +5143,14 @@ mod tests {
         std::fs::write(out.join("sample.mkv"), b"s").unwrap();
         let dest = rename_movie(&root, &out, "Example Movie (2024) [1080p]").unwrap();
         assert_eq!(dest, root.join("Example Movie (2024) [1080p]"));
-        assert!(dest.join("Example Movie (2024) [1080p].mkv").exists(), "feature renamed");
-        assert!(dest.join("Example Movie (2024) [1080p].en.srt").exists(), "sub re-stemmed");
+        assert!(
+            dest.join("Example Movie (2024) [1080p].mkv").exists(),
+            "feature renamed"
+        );
+        assert!(
+            dest.join("Example Movie (2024) [1080p].en.srt").exists(),
+            "sub re-stemmed"
+        );
         assert!(dest.join("sample.mkv").exists(), "sample untouched");
         assert!(!out.exists(), "old folder gone");
         // Collision: a second job renaming to the same base gets ".2".
@@ -3864,12 +5175,18 @@ mod tests {
     fn assert_portable(name: &str) {
         assert!(!name.is_empty(), "empty component");
         assert!(!name.starts_with('.'), "hidden: {name:?}");
-        assert!(!name.ends_with('.') && !name.ends_with(' '), "Windows truncates: {name:?}");
+        assert!(
+            !name.ends_with('.') && !name.ends_with(' '),
+            "Windows truncates: {name:?}"
+        );
         assert!(!name.starts_with(' '), "leading space: {name:?}");
         assert!(!name.contains(':'), "drive/ADS meaning: {name:?}");
         let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
         assert!(
-            !matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "LPT1"),
+            !matches!(
+                stem.as_str(),
+                "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "LPT1"
+            ),
             "reserved device: {name:?}"
         );
     }
@@ -3894,8 +5211,14 @@ mod tests {
 
             let dest = rename_movie(&root, &out, base).unwrap();
             assert_eq!(dest, root.join(want), "folder for {base:?}");
-            assert!(dest.join(format!("{want}.mkv")).exists(), "feature for {base:?}");
-            assert!(dest.join(format!("{want}.en.srt")).exists(), "sidecar for {base:?}");
+            assert!(
+                dest.join(format!("{want}.mkv")).exists(),
+                "feature for {base:?}"
+            );
+            assert!(
+                dest.join(format!("{want}.en.srt")).exists(),
+                "sidecar for {base:?}"
+            );
             assert_portable(want);
             let _ = std::fs::remove_dir_all(&root);
         }
@@ -3928,7 +5251,10 @@ mod tests {
     fn de_obfuscation_emits_a_portable_name() {
         let out = &scratch("deobf-safe");
         std::fs::write(out.join("1fRbH6e0eX8v5hv7fSyXgBb.mkv"), b"v").unwrap();
-        assert!(rename_obfuscated_video(out, ".The Movie: Part 2 2024 1080p."));
+        assert!(rename_obfuscated_video(
+            out,
+            ".The Movie: Part 2 2024 1080p."
+        ));
         assert!(out.join("The Movie - Part 2 2024 1080p.mkv").exists());
         assert_portable("The Movie - Part 2 2024 1080p");
 
@@ -3996,12 +5322,330 @@ mod tests {
         std::fs::create_dir_all(&out).unwrap();
         std::fs::write(out.join("blob.mkv"), b"v").unwrap();
 
-        let dest = tv_organize(&root.join("tv"), stem, &out, " [1080p]").unwrap();
-        assert_eq!(dest, root.join("tv").join("Alien - Romulus").join("Season 01"));
+        let dest = tv_organize(
+            &root.join("tv"),
+            stem,
+            &out,
+            " [1080p]",
+            &EpisodeTitles::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            dest,
+            root.join("tv").join("Alien - Romulus").join("Season 01")
+        );
         assert!(dest.join("Alien - Romulus - S01E02 [1080p].mkv").exists());
 
-        assert_eq!(delete_filed_episode(&dest, stem, " [1080p]"), 1);
+        assert_eq!(
+            delete_filed_episode(&dest, stem, &FiledTail::suffix(" [1080p]")),
+            1
+        );
         assert!(!dest.join("Alien - Romulus - S01E02 [1080p].mkv").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // -----------------------------------------------------------------
+    // TODO 78: episode titles in TV names.
+    // -----------------------------------------------------------------
+
+    /// A show whose episode list the enrichment cache already holds.
+    fn titles_of(eps: &[(u32, u32, &str)]) -> EpisodeTitles {
+        EpisodeTitles::new(eps.iter().map(|&(s, e, n)| (s, e, n.to_string())))
+    }
+
+    /// The shape the whole feature exists to produce, end to end: the
+    /// title lands in the filed name, the job's own record of what it
+    /// wrote agrees with what is on disk, and both the delete and the
+    /// play path can still find the file afterwards.
+    #[test]
+    fn an_episode_title_reaches_the_filed_name_and_stays_findable() {
+        let root = scratch("eptitle");
+        let stem = "My.Show.S01E02.1080p.WEB.x264-TEST";
+        let out = root.join("tv").join(stem);
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join(format!("{stem}.mkv")), b"video").unwrap();
+        // A subtitle posted under the release name. `tv_organize` renames
+        // VIDEO_EXTS only, so this keeps the name it arrived with - the
+        // documented limit of `is_rename_tail`, unchanged by titles.
+        std::fs::write(out.join(format!("{stem}.en.srt")), b"subs").unwrap();
+        let titles = titles_of(&[(1, 1, "Pilot"), (1, 2, "The Ceremony")]);
+
+        let dest = tv_organize(&root.join("tv"), stem, &out, " [1080p]", &titles).unwrap();
+        let filed = dest.join("My Show - S01E02 - The Ceremony [1080p].mkv");
+        assert!(filed.is_file(), "the title is in the name");
+        assert!(
+            dest.join(format!("{stem}.en.srt")).exists(),
+            "a sidecar keeps its posted name, exactly as before titles"
+        );
+
+        // What the job records is what filing wrote - the whole basis of
+        // matching the file again later.
+        let tail = FiledTail {
+            title: filed_title_segment(stem, " [1080p]", &titles),
+            suffix: " [1080p]".into(),
+        };
+        assert_eq!(tail.title, " - The Ceremony");
+        assert_eq!(
+            find_filed_episode_media(&dest, stem, &tail).as_deref(),
+            Some(filed.as_path()),
+            "play finds the titled episode"
+        );
+        assert_eq!(delete_filed_episode(&dest, stem, &tail), 1);
+        assert!(!filed.exists(), "and delete takes it");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The ordinary case, and the one that must never regress: the cache
+    /// does not know this episode, so the name is the one we have always
+    /// written - byte for byte. An empty [`EpisodeTitles`] (the setting
+    /// off) takes the same path.
+    #[test]
+    fn a_cache_miss_files_exactly_as_it_did_before() {
+        for titles in [
+            EpisodeTitles::default(),
+            // Knows the show, but not this episode.
+            titles_of(&[(1, 1, "Pilot"), (2, 2, "Wrong Season")]),
+        ] {
+            let root = scratch("epmiss");
+            let stem = "My.Show.S01E02.1080p.WEB.x264-TEST";
+            let out = root.join("tv").join(stem);
+            std::fs::create_dir_all(&out).unwrap();
+            std::fs::write(out.join(format!("{stem}.mkv")), b"video").unwrap();
+
+            let dest = tv_organize(&root.join("tv"), stem, &out, " [1080p]", &titles).unwrap();
+            assert!(dest.join("My Show - S01E02 [1080p].mkv").is_file());
+            assert_eq!(filed_title_segment(stem, " [1080p]", &titles), "");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// Multi-episode posts, Sonarr's conventions: distinct titles join
+    /// with " + ", and a post carrying both halves of a two-parter says
+    /// the shared title once.
+    #[test]
+    fn multi_episode_titles_join_and_two_parters_collapse() {
+        let seg = |stem: &str, titles: &EpisodeTitles| {
+            let base = tv_path(stem).and_then(|(_, b)| b).unwrap();
+            titles.segment(stem, &base, " [1080p]")
+        };
+
+        let distinct = titles_of(&[(1, 1, "Pilot"), (1, 2, "Second Chances")]);
+        assert_eq!(
+            seg("My.Show.S01E01E02.1080p.WEB-GRP", &distinct),
+            " - Pilot + Second Chances"
+        );
+        // The other spelling of the same range.
+        assert_eq!(
+            seg("My.Show.S01E01-E02.1080p.WEB-GRP", &distinct),
+            " - Pilot + Second Chances"
+        );
+
+        // Two-parters, in each spelling the providers use.
+        for pair in [
+            ("The Ceremony (1)", "The Ceremony (2)"),
+            ("The Ceremony: Part 1", "The Ceremony: Part 2"),
+            ("The Ceremony, Part One", "The Ceremony, Part Two"),
+            ("The Ceremony - Part I", "The Ceremony - Part II"),
+        ] {
+            let t = titles_of(&[(1, 1, pair.0), (1, 2, pair.1)]);
+            assert_eq!(
+                seg("My.Show.S01E01E02.1080p.WEB-GRP", &t),
+                " - The Ceremony",
+                "{pair:?} should collapse to the shared title"
+            );
+        }
+
+        // A title that merely starts with "Part" is a title.
+        let t = titles_of(&[(1, 1, "Part of the Plan"), (1, 2, "Parting Shot")]);
+        assert_eq!(
+            seg("My.Show.S01E01E02.1080p.WEB-GRP", &t),
+            " - Part of the Plan + Parting Shot"
+        );
+
+        // A two-parter with nothing BUT the marker keeps both halves:
+        // stripping leaves nothing to say.
+        let t = titles_of(&[(1, 1, "Part 1"), (1, 2, "Part 2")]);
+        assert_eq!(
+            seg("My.Show.S01E01E02.1080p.WEB-GRP", &t),
+            " - Part 1 + Part 2"
+        );
+
+        // A repeated title is said once; a half-known double uses what
+        // the cache has.
+        let t = titles_of(&[(1, 1, "Reunion"), (1, 2, "Reunion")]);
+        assert_eq!(seg("My.Show.S01E01E02.1080p.WEB-GRP", &t), " - Reunion");
+        let t = titles_of(&[(1, 1, "Reunion")]);
+        assert_eq!(seg("My.Show.S01E01E02.1080p.WEB-GRP", &t), " - Reunion");
+    }
+
+    /// An episode title is a third party's free text. It reaches a
+    /// filename, so it gets the same treatment the show name does.
+    #[test]
+    fn a_hostile_episode_title_is_still_a_safe_filename() {
+        let seg = |title: &str| {
+            let t = titles_of(&[(1, 2, title)]);
+            t.segment("My.Show.S01E02.1080p.WEB-GRP", "My Show - S01E02", "")
+        };
+        // Path separators cannot survive: this is one component.
+        assert_eq!(seg("9/11: The Long Road"), " - 9 11 - The Long Road");
+        assert_eq!(seg("Up\\Down"), " - Up Down");
+        // Windows strips a trailing dot silently, so we strip it first.
+        assert_eq!(seg("The End."), " - The End");
+        // Colons expand the way Sonarr's "Smart" rule does.
+        assert_eq!(seg("Endgame: Part of It"), " - Endgame - Part of It");
+        // Non-ASCII is a title, not a hazard.
+        assert_eq!(seg("Le Déluge"), " - Le Déluge");
+        // Nothing nameable survives - no segment, and no bare separator
+        // left dangling in the filename.
+        assert_eq!(seg("///"), "");
+        assert_eq!(seg("   "), "");
+    }
+
+    /// The filename budget. A title is the part that gives way: the
+    /// episode base identifies the episode and the suffix tells one
+    /// release from another, so neither can be shortened.
+    #[test]
+    fn a_long_episode_title_gives_way_to_the_name_around_it() {
+        let long = "The Extremely Long Episode Title That Simply Refuses To Stop Going On \
+                    And On About Whatever It Is That Happened In This Particular Instalment \
+                    Of The Programme Which Nobody Could Reasonably Be Expected To Read All \
+                    The Way Through In A File Manager Window";
+        let titles = titles_of(&[(1, 2, long)]);
+        let base = "My Show - S01E02";
+        let seg = titles.segment("My.Show.S01E02.1080p.WEB-GRP", base, " [1080p]");
+        let name = format!("{base}{seg} [1080p].mkv");
+        assert!(
+            name.len() <= COMPONENT_BYTES,
+            "{} bytes is over the component limit",
+            name.len()
+        );
+        assert!(name.ends_with(" [1080p].mkv"), "suffix and extension kept");
+        assert!(
+            long.starts_with(seg.trim_start_matches(TITLE_SEP)),
+            "the kept part is a prefix of the real title"
+        );
+        assert!(
+            !seg.ends_with(' ') && long[seg.len() - TITLE_SEP.len()..].starts_with(' '),
+            "cut at a word boundary: {seg:?}"
+        );
+
+        // A single word longer than the whole budget is cut rather than
+        // dropped - something of the title is better than none.
+        let wall = "A".repeat(400);
+        let titles = titles_of(&[(1, 2, &wall)]);
+        let seg = titles.segment("My.Show.S01E02.1080p.WEB-GRP", base, " [1080p]");
+        assert!(!seg.is_empty() && seg.len() < 240);
+
+        // No room at all: the title is dropped, never the extension.
+        let base = "X".repeat(240);
+        let titles = titles_of(&[(1, 2, "Anything")]);
+        assert_eq!(
+            titles.segment("My.Show.S01E02.1080p.WEB-GRP", &base, ""),
+            ""
+        );
+    }
+
+    /// A title can contain anything a release name contains - "1080",
+    /// "S02", a group-shaped word. Filing must still find the same
+    /// episode when it re-reads the name it wrote, or a second
+    /// post-processing pass (a password unlock re-runs one) would rename
+    /// the file again.
+    #[test]
+    fn a_title_full_of_release_words_does_not_confuse_the_next_parse() {
+        let root = scratch("eproundtrip");
+        let stem = "My.Show.S01E02.1080p.WEB.x264-TEST";
+        let out = root.join("job");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join(format!("{stem}.mkv")), b"v").unwrap();
+        let titles = titles_of(&[(1, 2, "1080 Miles to S02 BluRay")]);
+
+        assert_eq!(tv_rename(&out, stem, " [1080p]", &titles), 1);
+        let filed = out.join("My Show - S01E02 - 1080 Miles to S02 BluRay [1080p].mkv");
+        assert!(filed.is_file(), "{:?}", std::fs::read_dir(&out).unwrap());
+
+        // Re-reading our own output finds the SAME episode, so the
+        // second pass is a no-op rather than a second rename.
+        let written = filed.file_stem().unwrap().to_string_lossy().into_owned();
+        assert_eq!(
+            tv_path(&written).and_then(|(_, b)| b).as_deref(),
+            Some("My Show - S01E02"),
+            "the episode base survives its own title"
+        );
+        assert_eq!(tv_rename(&out, stem, " [1080p]", &titles), 0, "idempotent");
+        assert!(filed.is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The reason the title is RECORDED rather than recomputed, and the
+    /// reason `is_rename_tail` refuses a bare " - Something" tail: with
+    /// titles on, our filename is the same shape as the one Sonarr and
+    /// Plex write, and the user's own copy of the episode is sitting in
+    /// the same folder. Only the file we wrote may be touched.
+    #[test]
+    fn the_users_own_copy_of_the_episode_is_never_ours() {
+        let root = scratch("eptheirs");
+        let season = root.join("The Bear/Season 03");
+        std::fs::create_dir_all(&season).unwrap();
+        let theirs = season.join("The Bear - S03E05 - Children.mkv");
+        let ours = season.join("The Bear - S03E05 - Children [1080p].mkv");
+        // Their whole-season library, in Sonarr's default layout.
+        let sibling = season.join("The Bear - S03E06 - Doors.mkv");
+        for f in [&theirs, &ours, &sibling] {
+            std::fs::write(f, b"x").unwrap();
+        }
+
+        let stem = "The.Bear.S03E05.1080p.WEB.h264-GRP";
+        let tail = FiledTail {
+            title: " - Children".into(),
+            suffix: " [1080p]".into(),
+        };
+        assert_eq!(
+            find_filed_episode_media(&season, stem, &tail).as_deref(),
+            Some(ours.as_path()),
+            "play serves the copy we downloaded, not theirs"
+        );
+        assert_eq!(delete_filed_episode(&season, stem, &tail), 1);
+        assert!(!ours.exists(), "ours went");
+        assert!(theirs.exists(), "their copy of the same episode survives");
+        assert!(sibling.exists(), "and so does the sibling episode");
+
+        // A record with no title recorded (filed before this existed, or
+        // with the setting off) matches nothing here rather than
+        // guessing - a leftover, never somebody else's episode.
+        assert_eq!(
+            delete_filed_episode(&season, stem, &FiledTail::suffix(" [1080p]")),
+            0
+        );
+        assert!(theirs.exists() && sibling.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A season pack renames per episode, so each file gets ITS OWN
+    /// title - the job's stem names no single episode and cannot answer
+    /// for any of them.
+    #[test]
+    fn a_season_pack_gives_every_episode_its_own_title() {
+        let root = scratch("eppack");
+        let stem = "My.Show.S01.1080p.WEB.x264-TEST";
+        let out = root.join("tv").join(stem);
+        std::fs::create_dir_all(&out).unwrap();
+        for f in [
+            "My.Show.S01E01.1080p.WEB.x264-TEST",
+            "My.Show.S01E02.1080p.WEB.x264-TEST",
+        ] {
+            std::fs::write(out.join(format!("{f}.mkv")), b"v").unwrap();
+        }
+        let titles = titles_of(&[(1, 1, "Pilot"), (1, 2, "The Ceremony")]);
+
+        let dest = tv_organize(&root.join("tv"), stem, &out, " [1080p]", &titles).unwrap();
+        assert!(dest.join("My Show - S01E01 - Pilot [1080p].mkv").is_file());
+        assert!(
+            dest.join("My Show - S01E02 - The Ceremony [1080p].mkv")
+                .is_file()
+        );
+        // The pack itself records no title: it owns no single episode
+        // name, and `filed_bases` refuses it for the same reason.
+        assert_eq!(filed_title_segment(stem, " [1080p]", &titles), "");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4021,16 +5665,28 @@ mod tests {
         std::fs::write(&filed, b"v").unwrap();
 
         // Play finds the episode it filed, under either spelling.
-        assert_eq!(find_filed_episode_media(&old, stem, " [1080p]").as_ref(), Some(&filed));
+        assert_eq!(
+            find_filed_episode_media(&old, stem, &FiledTail::suffix(" [1080p]")).as_ref(),
+            Some(&filed)
+        );
 
         // A later episode joins the show it belongs to.
         let out = root.join("job");
         std::fs::create_dir_all(&out).unwrap();
         std::fs::write(out.join("blob.mkv"), b"v").unwrap();
-        let dest = tv_organize(&tv, "Star Trek: Discovery S01E06 1080p WEB h264-GRP", &out, " [1080p]")
-            .unwrap();
+        let dest = tv_organize(
+            &tv,
+            "Star Trek: Discovery S01E06 1080p WEB h264-GRP",
+            &out,
+            " [1080p]",
+            &EpisodeTitles::default(),
+        )
+        .unwrap();
         assert_eq!(dest, old);
-        assert!(old.join("Star Trek Discovery - S01E06 [1080p].mkv").exists());
+        assert!(
+            old.join("Star Trek Discovery - S01E06 [1080p].mkv")
+                .exists()
+        );
         assert!(!tv.join("Star Trek - Discovery").exists(), "no second tree");
 
         // A NEW season of the same show joins it as well: the folder that
@@ -4038,25 +5694,56 @@ mod tests {
         let out = root.join("job2");
         std::fs::create_dir_all(&out).unwrap();
         std::fs::write(out.join("blob.mkv"), b"v").unwrap();
-        let dest = tv_organize(&tv, "Star Trek: Discovery S02E01 1080p WEB h264-GRP", &out, " [1080p]")
-            .unwrap();
+        let dest = tv_organize(
+            &tv,
+            "Star Trek: Discovery S02E01 1080p WEB h264-GRP",
+            &out,
+            " [1080p]",
+            &EpisodeTitles::default(),
+        )
+        .unwrap();
         assert_eq!(dest, tv.join("Star Trek Discovery").join("Season 02"));
-        assert!(!tv.join("Star Trek - Discovery").exists(), "still no second tree");
+        assert!(
+            !tv.join("Star Trek - Discovery").exists(),
+            "still no second tree"
+        );
 
         // ...and delete-with-files removes the old-spelling episode
         // rather than reporting zero and leaving it behind. E06 stays.
-        assert_eq!(delete_filed_episode(&old, stem, " [1080p]"), 1);
+        assert_eq!(
+            delete_filed_episode(&old, stem, &FiledTail::suffix(" [1080p]")),
+            1
+        );
         assert!(!filed.exists());
-        assert!(old.join("Star Trek Discovery - S01E06 [1080p].mkv").exists());
+        assert!(
+            old.join("Star Trek Discovery - S01E06 [1080p].mkv")
+                .exists()
+        );
 
         // Nothing on disk to inherit: today's spelling is what we write.
         let fresh = scratch("tvfresh");
         let out = fresh.join("job");
         std::fs::create_dir_all(&out).unwrap();
         std::fs::write(out.join("blob.mkv"), b"v").unwrap();
-        let dest = tv_organize(&fresh.join("tv"), stem, &out, " [1080p]").unwrap();
-        assert_eq!(dest, fresh.join("tv").join("Star Trek - Discovery").join("Season 01"));
-        assert!(dest.join("Star Trek - Discovery - S01E05 [1080p].mkv").exists());
+        let dest = tv_organize(
+            &fresh.join("tv"),
+            stem,
+            &out,
+            " [1080p]",
+            &EpisodeTitles::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            dest,
+            fresh
+                .join("tv")
+                .join("Star Trek - Discovery")
+                .join("Season 01")
+        );
+        assert!(
+            dest.join("Star Trek - Discovery - S01E05 [1080p].mkv")
+                .exists()
+        );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&fresh);
     }
@@ -4078,8 +5765,11 @@ mod tests {
 
         // Non-Matroska main video: never probed, never guessed.
         let dir = scratch("measured-mp4");
-        std::fs::write(dir.join("Example.Movie.2024.mp4"), b"\x00\x00\x00\x20ftypisom")
-            .unwrap();
+        std::fs::write(
+            dir.join("Example.Movie.2024.mp4"),
+            b"\x00\x00\x00\x20ftypisom",
+        )
+        .unwrap();
         assert_eq!(measured_res(&dir), None);
 
         // A Matroska that does not parse keeps the claim standing.
@@ -4094,14 +5784,16 @@ mod tests {
         // Small beside the feature, "sample" in the name - but its own
         // header says 50 minutes. That is an episode, not a clip.
         let episode = dir.join("Show.S01E02.sample.mkv");
-        std::fs::write(&episode, nzbkit::mkv::test_mux(Some(50.0 * 60.0), Some((1920, 1080))))
-            .unwrap();
+        std::fs::write(
+            &episode,
+            nzbkit::mkv::test_mux(Some(50.0 * 60.0), Some((1920, 1080))),
+        )
+        .unwrap();
         assert!(!is_deletable_sample(&episode, 1 << 30));
 
         // A real 45-second clip with the same shape still goes.
         let clip = dir.join("Show.S01E02.sample2.mkv");
-        std::fs::write(&clip, nzbkit::mkv::test_mux(Some(45.0), Some((1920, 1080))))
-            .unwrap();
+        std::fs::write(&clip, nzbkit::mkv::test_mux(Some(45.0), Some((1920, 1080)))).unwrap();
         assert!(is_deletable_sample(&clip, 1 << 30));
 
         // No readable duration: the old name+size verdict stands.
@@ -4113,8 +5805,8 @@ mod tests {
     fn scratch(tag: &str) -> PathBuf {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let d = std::env::temp_dir()
-            .join(format!("nzbfast-smart-{}-{tag}-{n}", std::process::id()));
+        let d =
+            std::env::temp_dir().join(format!("nzbfast-smart-{}-{tag}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -4128,13 +5820,20 @@ mod tests {
     #[test]
     fn obfuscated_video_takes_the_release_name() {
         let out = &scratch("f1");
-        let rel = "Formula1.2026.Round11.Hungary.Race.F1TV.WEB-DL.2160p.HLG.H265.DDP5.1.English-MWR";
+        let rel =
+            "Formula1.2026.Round11.Hungary.Race.F1TV.WEB-DL.2160p.HLG.H265.DDP5.1.English-MWR";
         std::fs::write(out.join("1fRbH6e0eX8v5hv7fSyXgBb.mkv"), b"video").unwrap();
         std::fs::write(out.join("1fRbH6e0eX8v5hv7fSyXgBb.en.srt"), b"subs").unwrap();
 
         assert!(rename_obfuscated_video(out, rel));
-        assert!(out.join(format!("{rel}.mkv")).exists(), "video takes the release name");
-        assert!(out.join(format!("{rel}.en.srt")).exists(), "sidecar follows, keeping .en");
+        assert!(
+            out.join(format!("{rel}.mkv")).exists(),
+            "video takes the release name"
+        );
+        assert!(
+            out.join(format!("{rel}.en.srt")).exists(),
+            "sidecar follows, keeping .en"
+        );
         assert!(!out.join("1fRbH6e0eX8v5hv7fSyXgBb.mkv").exists());
     }
 
@@ -4234,7 +5933,10 @@ mod tests {
         // The identified path applies it, sidecar and all.
         assert!(rename_nameless_video(out, title));
         assert!(out.join("Supergirl 2026.mkv").exists());
-        assert!(out.join("Supergirl 2026.en.srt").exists(), "sidecar follows");
+        assert!(
+            out.join("Supergirl 2026.en.srt").exists(),
+            "sidecar follows"
+        );
 
         // ...and it still refuses a payload that was never nameless, so
         // a wrong verdict cannot overwrite a name the poster gave.
@@ -4257,7 +5959,10 @@ mod tests {
         std::fs::write(out.join("movie.en.srt"), b"s").unwrap();
         assert!(rename_obfuscated_video(out, rel));
         assert!(out.join(format!("{rel}.mkv")).exists());
-        assert!(out.join(format!("{rel}.en.srt")).exists(), "sidecar follows");
+        assert!(
+            out.join(format!("{rel}.en.srt")).exists(),
+            "sidecar follows"
+        );
 
         for stem in ["video", "FILM", "output", "encoded", "media", "1", "07"] {
             let out = &scratch("generic-list");
@@ -4275,7 +5980,13 @@ mod tests {
 
         // Negative: near-misses of the generic list keep their names -
         // the list is exact, not a prefix or substring match.
-        for stem in ["movie2", "video_final", "Movie 2024", "encode", "media server"] {
+        for stem in [
+            "movie2",
+            "video_final",
+            "Movie 2024",
+            "encode",
+            "media server",
+        ] {
             let out = &scratch("generic-near");
             std::fs::write(out.join(format!("{stem}.mkv")), b"v").unwrap();
             assert!(!rename_obfuscated_video(out, rel), "{stem}");
@@ -4300,8 +6011,14 @@ mod tests {
 
         assert!(rename_obfuscated_video(out, rel));
         assert!(out.join(format!("{rel}.mkv")).exists());
-        assert!(out.join(format!("{rel}.srt")).exists(), "its own sidecar follows");
-        assert!(out.join(format!("{rel}.en.srt")).exists(), "language tail kept");
+        assert!(
+            out.join(format!("{rel}.srt")).exists(),
+            "its own sidecar follows"
+        );
+        assert!(
+            out.join(format!("{rel}.en.srt")).exists(),
+            "language tail kept"
+        );
         // The neighbours are untouched, and no fused name was emitted.
         assert!(out.join("10.srt").exists());
         assert!(out.join("12.srt").exists());
@@ -4341,7 +6058,11 @@ mod tests {
         }
 
         // Positive control: one hard fact is enough.
-        for rel in ["Example Movie 1080p", "Example Movie WEB-DL", "Example.Movie-GRP"] {
+        for rel in [
+            "Example Movie 1080p",
+            "Example Movie WEB-DL",
+            "Example.Movie-GRP",
+        ] {
             let out = &scratch("factful");
             std::fs::write(out.join("movie.mkv"), b"v").unwrap();
             assert!(rename_obfuscated_video(out, rel), "{rel}");
@@ -4370,10 +6091,7 @@ mod tests {
             Some(("s3cret".into(), "Rel.Name.2020".into()))
         );
         // Double brace wins when nested; plain names pass through.
-        assert_eq!(
-            name_password("Rel{{a}}").map(|(p, _)| p),
-            Some("a".into())
-        );
+        assert_eq!(name_password("Rel{{a}}").map(|(p, _)| p), Some("a".into()));
         assert_eq!(name_password("Plain.Release.2020.1080p"), None);
         assert_eq!(name_password("Rel{}"), None); // empty braces = nothing
     }
@@ -4462,6 +6180,9 @@ mod trash_tests {
     /// depending on test order).
     #[test]
     fn a_junk_delete_is_recoverable_and_the_opt_out_is_not() {
+        // This one really does reach the Trash, so it must not overlap a
+        // test that latches the Trash off underneath it.
+        let _serial = one_trash_test_at_a_time();
         let dir = std::env::temp_dir().join(format!("nzbfast-trash-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -4478,7 +6199,10 @@ mod trash_tests {
             // `remove_user_file` falls back to a hard delete when the Trash
             // refuses, and reports Ok either way - so this is the only thing
             // standing between "recoverable" and a permanent delete.
-            assert!(found, "not recoverable: nothing named {name} reached the Trash");
+            assert!(
+                found,
+                "not recoverable: nothing named {name} reached the Trash"
+            );
         }
 
         // Opted out: a real delete, not a silent Trash.

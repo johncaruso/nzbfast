@@ -48,8 +48,10 @@ WORKDIR /config
 VOLUME ["/config", "/downloads", "/watch"]
 EXPOSE 6789
 
-# Liveness probe: any HTTP answer is healthy (with an API key set the
-# body is an auth error but the status is still 200).
+# Liveness probe: keyless mode=version is answered by design (SAB
+# parity; the daemon allows it with no key presented precisely so this
+# healthcheck does not log an auth failure from loopback every cycle),
+# and any HTTP answer counts as healthy.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
     CMD curl -fsS "http://127.0.0.1:${NZBFAST_PORT:-6789}/api?mode=version&output=json" >/dev/null || exit 1
 

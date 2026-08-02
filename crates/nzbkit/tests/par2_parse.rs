@@ -2,7 +2,7 @@
 //! Fixture provenance: tests/fixtures/par2/README.txt
 //! (`par2 create -s4096 -r34 -n1 -a testset alpha.bin beta.bin`)
 
-use nzbkit::par2::{verify_file, verify_file_blocks, Par2Set};
+use nzbkit::par2::{Par2Set, verify_file, verify_file_blocks};
 
 const MAIN: &[u8] = include_bytes!("fixtures/par2/testset.par2");
 const VOL: &[u8] = include_bytes!("fixtures/par2/testset.vol0+4.par2");
@@ -202,9 +202,17 @@ fn member_hash16k_fingerprints_the_long_members_only() {
     // beta.bin is 33 KiB and qualifies; alpha.bin is 10 KiB and does not.
     assert_eq!(hashes.len(), 1, "got {hashes:?}");
     assert_eq!(hashes[0].1, "beta.bin");
-    assert_eq!(hashes[0].0, nzbkit::par2::hex16(&file(&set, "beta.bin").md5_16k));
+    assert_eq!(
+        hashes[0].0,
+        nzbkit::par2::hex16(&file(&set, "beta.bin").md5_16k)
+    );
     assert_eq!(hashes[0].0.len(), 32);
-    assert!(hashes[0].0.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    assert!(
+        hashes[0]
+            .0
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    );
     // The fingerprint is the file's own bytes, so an independent hash of
     // the first 16 KiB has to agree with what the sidecar declared.
     let want: [u8; 16] = <md5::Md5 as md5::Digest>::digest(&BETA[..16384]).into();

@@ -40,8 +40,7 @@ impl SweepResult {
         let n = self.matrix.first().map_or(0, |m| m.len());
         (0..n)
             .filter(|&i| {
-                self.matrix.iter().all(|m| m[i] == Avail::Missing)
-                    && !self.matrix.is_empty()
+                self.matrix.iter().all(|m| m[i] == Avail::Missing) && !self.matrix.is_empty()
             })
             .collect()
     }
@@ -115,10 +114,8 @@ pub async fn stat_sweep(
                         tokio::time::timeout(Duration::from_secs(20), conn.read_stat()).await;
                     match read {
                         Ok(Ok(have)) => {
-                            cells[mine[recv]].store(
-                                if have { HAVE } else { MISSING },
-                                Ordering::Relaxed,
-                            );
+                            cells[mine[recv]]
+                                .store(if have { HAVE } else { MISSING }, Ordering::Relaxed);
                             recv += 1;
                         }
                         _ => return, // remaining cells stay Unknown
@@ -150,8 +147,15 @@ pub async fn stat_sweep(
     }
 }
 
-/// Stratified sample of `n` segment indexes out of `total`: always the
-/// first and last, evenly spread between.
+/// Stratified sample of `n` segment indexes out of `total`, edges
+/// first: takedowns nuke the HEAD of a post and truncated uploads lose
+/// the TAIL, so with the budget for it the first three and last two
+/// indexes are always sampled - a single flaky STAT on a lone edge
+/// probe must not be the only witness to a head nuke - and the
+/// remainder spreads evenly across the interior. Deterministic on
+/// purpose: a re-probe STATs the identical indexes, so a later Green
+/// means the previously missing articles appeared, not a lucky
+/// re-roll (the §77 re-probe overwrite leans on this).
 pub fn stratified_sample(total: usize, n: usize) -> Vec<usize> {
     if total == 0 {
         return Vec::new();
@@ -160,9 +164,17 @@ pub fn stratified_sample(total: usize, n: usize) -> Vec<usize> {
         return (0..total).collect();
     }
     let n = n.max(2).min(total);
-    let mut out: Vec<usize> = (0..n)
-        .map(|i| i * (total - 1) / (n - 1))
-        .collect();
+    // Edge redundancy only once the budget covers it; tiny budgets keep
+    // one probe per edge.
+    let (head, tail) = if n >= 5 { (3, 2) } else { (1, 1) };
+    let mut out: Vec<usize> = (0..head).collect();
+    out.extend((total - tail)..total);
+    let mid = n - out.len();
+    let (lo, hi) = (head, total - tail);
+    for i in 0..mid {
+        out.push(lo + (i + 1) * (hi - lo) / (mid + 1));
+    }
+    out.sort_unstable();
     out.dedup();
     out
 }
@@ -181,5 +193,26 @@ mod tests {
         assert_eq!(s[0], 0);
         assert_eq!(*s.last().unwrap(), 999);
         assert!(s.len() >= 99 && s.len() <= 100);
+    }
+
+    #[test]
+    fn stratified_edge_redundancy() {
+        // With budget >= 5 the head gets three probes and the tail two,
+        // so one flaky edge answer cannot blind a verdict.
+        let s = stratified_sample(10_000, 8);
+        assert_eq!(s.len(), 8);
+        assert!(s.starts_with(&[0, 1, 2]));
+        assert!(s.ends_with(&[9_998, 9_999]));
+        // Interior points stay strictly between the edge blocks.
+        assert!(s[3..6].iter().all(|&i| i > 2 && i < 9_998));
+        // Deterministic: the identical call samples the identical
+        // indexes (the re-probe overwrite depends on it).
+        assert_eq!(s, stratified_sample(10_000, 8));
+        // Tight budgets keep one probe per edge.
+        assert_eq!(stratified_sample(100, 3)[0], 0);
+        assert_eq!(*stratified_sample(100, 3).last().unwrap(), 99);
+        // n one over the edge-block size still covers both edges.
+        let s = stratified_sample(10, 6);
+        assert!(s.starts_with(&[0, 1, 2]) && s.ends_with(&[8, 9]));
     }
 }

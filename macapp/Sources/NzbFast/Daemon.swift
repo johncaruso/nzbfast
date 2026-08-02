@@ -177,9 +177,13 @@ final class Daemon {
     /// sha256(token:nonce) for a nonce we make up per probe - so probing an
     /// impostor teaches it nothing.
     ///
-    /// An engine that answers with no proof at all is accepted as before:
-    /// that is what an engine older than this handshake does, and refusing
-    /// it would break attaching across the upgrade.
+    /// An engine that answers with no proof while `runtime.json` names
+    /// this port is REFUSED (see `provesIdentity`): a token in that file
+    /// can only have been written by an engine that also answers the
+    /// challenge, so proofless-with-token is a stranger, not an upgrade
+    /// case. Only when there is no runtime.json for the port - the actual
+    /// pre-handshake engine, or one from another data dir - is the reply
+    /// shape alone accepted.
     func isNzbfast(port: Int, timeout: TimeInterval = 1.5) async -> Bool {
         // Probe WITHOUT the key. Nothing has authenticated the far side yet, so
         // any unprivileged local process that binds this port first (6789 is
@@ -210,10 +214,15 @@ final class Daemon {
             return true
         }
         guard let proof = obj["hs_proof"] as? String else {
-            // An engine older than the handshake. Accepting it is what keeps
-            // the upgrade working; it is also exactly the pre-handshake
-            // behaviour, not a new hole.
-            return true
+            // A token in runtime.json can only have been written by an
+            // engine that also answers the challenge - the file write and
+            // the proof reply shipped in the same release, and the write
+            // is unconditional once the listener exists. So a reply with
+            // no proof is NOT an older engine: an older engine leaves no
+            // runtime.json and takes the `guard let token` arm above.
+            // Refuse - attaching would disclose the stored API key, and
+            // with it `mode=server_secret`.
+            return false
         }
         let want = launcherProof(token: token, nonce: nonce)
         // Length first, then a full-width compare - no early exit on the

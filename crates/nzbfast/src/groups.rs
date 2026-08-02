@@ -88,44 +88,159 @@ const CATS: &[(Category, &[&str])] = &[
     // Anime before TV/Movies: alt.binaries.anime is more specifically
     // anime than it is "video".
     (Category::Anime, &["anime", "manga", "hentai-free-zone"]),
-    (Category::Adult, &[
-        "erotica", "erotic", "sex", "porn", "xxx", "adult", "nude", "hentai",
-        "pictures.erotica",
-    ]),
-    (Category::Sports, &[
-        "sport", "sports", "motorsports", "motorsport", "racing", "f1",
-        "formula1", "nascar", "wrestling", "ufc", "mma", "boxing", "soccer",
-        "football", "nfl", "nba", "nhl", "mlb", "cricket", "rugby", "golf",
-        "cycling", "darts", "tennis", "autos", "auto", "cars", "car", "moto",
-        "motorcycles", "motorbikes", "automobiles",
-    ]),
-    (Category::Comics, &["comics", "comic", "cbr", "graphic-novels"]),
-    (Category::Books, &[
-        "ebook", "ebooks", "e-book", "e-books", "book", "books", "audiobook",
-        "audiobooks", "magazines", "mags", "textbooks",
-    ]),
-    (Category::Music, &[
-        "music", "mp3", "flac", "lossless", "sounds", "audio", "karaoke",
-        "vinyl", "opera", "jazz", "metal", "country", "classical",
-    ]),
-    (Category::Games, &[
-        "games", "game", "gaming", "nintendo", "playstation", "psx", "ps2",
-        "ps3", "ps4", "ps5", "xbox", "x-box", "wii", "gamecube", "dreamcast",
-        "emulators", "roms", "switch", "steam",
-    ]),
-    (Category::Tv, &[
-        "teevee", "tv", "hdtv", "television", "series", "shows", "documentaries",
-        "docus",
-    ]),
-    (Category::Movies, &[
-        "moovee", "movies", "movie", "film", "films", "dvd", "dvdr", "dvd-r",
-        "divx", "x264", "x265", "hevc", "bluray", "blu-ray", "bd", "uhd",
-        "cinema", "vcd", "svcd", "kino",
-    ]),
-    (Category::Software, &[
-        "software", "apps", "applications", "warez", "win", "windows", "mac",
-        "linux", "ubuntu", "iso", "isos", "cd", "cdr", "programs", "os",
-    ]),
+    (
+        Category::Adult,
+        &[
+            "erotica",
+            "erotic",
+            "sex",
+            "porn",
+            "xxx",
+            "adult",
+            "nude",
+            "hentai",
+            "pictures.erotica",
+        ],
+    ),
+    (
+        Category::Sports,
+        &[
+            "sport",
+            "sports",
+            "motorsports",
+            "motorsport",
+            "racing",
+            "f1",
+            "formula1",
+            "nascar",
+            "wrestling",
+            "ufc",
+            "mma",
+            "boxing",
+            "soccer",
+            "football",
+            "nfl",
+            "nba",
+            "nhl",
+            "mlb",
+            "cricket",
+            "rugby",
+            "golf",
+            "cycling",
+            "darts",
+            "tennis",
+            "autos",
+            "auto",
+            "cars",
+            "car",
+            "moto",
+            "motorcycles",
+            "motorbikes",
+            "automobiles",
+        ],
+    ),
+    (
+        Category::Comics,
+        &["comics", "comic", "cbr", "graphic-novels"],
+    ),
+    (
+        Category::Books,
+        &[
+            "ebook",
+            "ebooks",
+            "e-book",
+            "e-books",
+            "book",
+            "books",
+            "audiobook",
+            "audiobooks",
+            "magazines",
+            "mags",
+            "textbooks",
+        ],
+    ),
+    (
+        Category::Music,
+        &[
+            "music",
+            "mp3",
+            "flac",
+            "lossless",
+            "sounds",
+            "audio",
+            "karaoke",
+            "vinyl",
+            "opera",
+            "jazz",
+            "metal",
+            "country",
+            "classical",
+        ],
+    ),
+    (
+        Category::Games,
+        &[
+            "games",
+            "game",
+            "gaming",
+            "nintendo",
+            "playstation",
+            "psx",
+            "ps2",
+            "ps3",
+            "ps4",
+            "ps5",
+            "xbox",
+            "x-box",
+            "wii",
+            "gamecube",
+            "dreamcast",
+            "emulators",
+            "roms",
+            "switch",
+            "steam",
+        ],
+    ),
+    (
+        Category::Tv,
+        &[
+            "teevee",
+            "tv",
+            "hdtv",
+            "television",
+            "series",
+            "shows",
+            "documentaries",
+            "docus",
+        ],
+    ),
+    (
+        Category::Movies,
+        &[
+            "moovee", "movies", "movie", "film", "films", "dvd", "dvdr", "dvd-r", "divx", "x264",
+            "x265", "hevc", "bluray", "blu-ray", "bd", "uhd", "cinema", "vcd", "svcd", "kino",
+        ],
+    ),
+    (
+        Category::Software,
+        &[
+            "software",
+            "apps",
+            "applications",
+            "warez",
+            "win",
+            "windows",
+            "mac",
+            "linux",
+            "ubuntu",
+            "iso",
+            "isos",
+            "cd",
+            "cdr",
+            "programs",
+            "os",
+        ],
+    ),
 ];
 
 /// Hierarchies that actually carry binaries. NewsBin's own figures:
@@ -133,10 +248,21 @@ const CATS: &[(Category, &[&str])] = &[
 /// checkbox alone cuts 100k+ to under ten thousand. `alt.binaries` is the
 /// bulk of it; the rest are the historic binary trees still in use.
 const BINARY_PREFIXES: &[&str] = &[
-    "alt.binaries.", "alt.bin.", "a.b.", "free.binaries.", "dk.binaer.",
-    "de.alt.binaries.", "nl.binaries.", "fr.binaires.", "it.binari.",
-    "es.binarios.", "pl.binaria.", "alt.sources.", "comp.binaries.",
-    "rec.games.bolo.binaries.", "binaries.",
+    "alt.binaries.",
+    "alt.bin.",
+    "a.b.",
+    "free.binaries.",
+    "dk.binaer.",
+    "de.alt.binaries.",
+    "nl.binaries.",
+    "fr.binaires.",
+    "it.binari.",
+    "es.binarios.",
+    "pl.binaria.",
+    "alt.sources.",
+    "comp.binaries.",
+    "rec.games.bolo.binaries.",
+    "binaries.",
 ];
 
 /// Does this group live in a binary-carrying hierarchy?
@@ -244,8 +370,10 @@ pub fn classify(name: &str, desc: &str) -> Category {
     }
     if !desc.is_empty() {
         let ldesc = desc.to_ascii_lowercase();
-        let words: Vec<&str> =
-            ldesc.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).collect();
+        let words: Vec<&str> = ldesc
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect();
         for (cat, kws) in CATS {
             if kws.iter().any(|w| words.contains(w)) {
                 return *cat;
@@ -260,7 +388,10 @@ pub fn classify(name: &str, desc: &str) -> Category {
 /// directions are curated by hand - table-driven expansion over the
 /// category keyword lists would make "cd" match every Sports group.
 const SYNONYMS: &[(&str, &[&str])] = &[
-    ("car", &["auto", "autos", "cars", "motorsports", "racing", "formula1"]),
+    (
+        "car",
+        &["auto", "autos", "cars", "motorsports", "racing", "formula1"],
+    ),
     ("cars", &["auto", "autos", "car", "motorsports", "racing"]),
     ("auto", &["autos", "cars", "car", "motorsports", "racing"]),
     ("racing", &["f1", "nascar", "motorsports", "autos", "moto"]),
@@ -276,8 +407,14 @@ const SYNONYMS: &[(&str, &[&str])] = &[
     ("songs", &["mp3", "flac", "sounds", "music"]),
     ("book", &["ebook", "ebooks", "books", "audiobook"]),
     ("books", &["ebook", "ebooks", "book", "audiobook"]),
-    ("game", &["games", "roms", "nintendo", "playstation", "xbox"]),
-    ("games", &["game", "roms", "nintendo", "playstation", "xbox"]),
+    (
+        "game",
+        &["games", "roms", "nintendo", "playstation", "xbox"],
+    ),
+    (
+        "games",
+        &["game", "roms", "nintendo", "playstation", "xbox"],
+    ),
 ];
 
 /// How a group matched the query - better kinds sort first under the
@@ -299,10 +436,7 @@ fn match_group(g: &CatGroup, terms: &[String], syns: &[String]) -> Option<Hit> {
     if terms.iter().any(|t| t.contains('*') || t.contains('?')) {
         return terms
             .iter()
-            .all(|t| {
-                glob_matches(t, &lname)
-                    || glob_matches(&format!("*{t}*"), &lname)
-            })
+            .all(|t| glob_matches(t, &lname) || glob_matches(&format!("*{t}*"), &lname))
             .then_some(Hit::NameSegment);
     }
     // Dotted abbreviation: a.b.mo -> alt.binaries.movies.
@@ -369,11 +503,6 @@ impl Sort {
             _ => Sort::Posts,
         }
     }
-
-    /// Does this ordering need sampled stats?
-    pub fn needs_stats(self) -> bool {
-        matches!(self, Sort::Size | Sort::Activity | Sort::Fresh | Sort::AvgSize)
-    }
 }
 
 pub struct Query<'a> {
@@ -427,10 +556,10 @@ impl Query<'_> {
         }
         let Some(sc) = self.stats else { return true };
         let Some(s) = sc.get(name) else { return false };
-        if let Some(k) = self.kind {
-            if s.dominant() != Some(k) {
-                return false;
-            }
+        if let Some(k) = self.kind
+            && s.dominant() != Some(k)
+        {
+            return false;
         }
         if self.active_days > 0 {
             // last_post == 0 means the server gave us no usable dates,
@@ -458,13 +587,12 @@ pub struct Catalog {
 impl Catalog {
     /// Search + filter + sort + page. Returns (total matches, page).
     pub fn query(&self, q: &Query) -> (usize, Vec<&CatGroup>) {
-        let terms: Vec<String> = q
-            .q
-            .to_ascii_lowercase()
-            .split_whitespace()
-            .map(str::to_string)
-            .filter(|t| !t.is_empty())
-            .collect();
+        let terms: Vec<String> =
+            q.q.to_ascii_lowercase()
+                .split_whitespace()
+                .map(str::to_string)
+                .filter(|t| !t.is_empty())
+                .collect();
         let syns: Vec<String> = terms
             .iter()
             .flat_map(|t| {
@@ -480,8 +608,7 @@ impl Catalog {
             .filter(|g| q.cat.is_none_or(|c| g.cat == c))
             .filter(|g| {
                 !q.new_only
-                    || (g.first_seen > 0
-                        && self.fetched_at - g.first_seen < NEW_WINDOW_SECS)
+                    || (g.first_seen > 0 && self.fetched_at - g.first_seen < NEW_WINDOW_SECS)
             })
             .filter(|g| !q.binaries_only || is_binary(&g.name))
             .filter(|g| g.posts >= q.min_posts)
@@ -580,7 +707,12 @@ impl Catalog {
     ) -> Catalog {
         let dmap: std::collections::HashMap<String, String> = descs.into_iter().collect();
         let known: std::collections::HashMap<&str, i64> = prev
-            .map(|p| p.groups.iter().map(|g| (g.name.as_str(), g.first_seen)).collect())
+            .map(|p| {
+                p.groups
+                    .iter()
+                    .map(|g| (g.name.as_str(), g.first_seen))
+                    .collect()
+            })
             .unwrap_or_default();
         let mut groups: Vec<CatGroup> = active
             .into_iter()
@@ -620,8 +752,17 @@ impl Catalog {
         let mut out = String::with_capacity(self.groups.len() * 48);
         out.push_str(&format!("#nzbfast-groups\t3\t{}\n", self.fetched_at));
         for g in &self.groups {
-            let desc: String =
-                g.desc.chars().map(|c| if c == '\t' || c == '\n' || c == '\r' { ' ' } else { c }).collect();
+            let desc: String = g
+                .desc
+                .chars()
+                .map(|c| {
+                    if c == '\t' || c == '\n' || c == '\r' {
+                        ' '
+                    } else {
+                        c
+                    }
+                })
+                .collect();
             out.push_str(&format!(
                 "{}\t{}\t{}\t{}\t{}\n",
                 g.name, g.posts, g.first_seen, g.status, desc
@@ -646,9 +787,22 @@ impl Catalog {
         let fetched_at = hf.next().and_then(|s| s.parse().ok()).unwrap_or(0);
         let mut groups = Vec::new();
         for line in lines {
-            let mut f = line.splitn(if v3 { 5 } else if v2 { 4 } else { 3 }, '\t');
-            let (Some(name), Some(posts)) = (f.next(), f.next()) else { continue };
-            let Ok(posts) = posts.parse::<u64>() else { continue };
+            let mut f = line.splitn(
+                if v3 {
+                    5
+                } else if v2 {
+                    4
+                } else {
+                    3
+                },
+                '\t',
+            );
+            let (Some(name), Some(posts)) = (f.next(), f.next()) else {
+                continue;
+            };
+            let Ok(posts) = posts.parse::<u64>() else {
+                continue;
+            };
             let first_seen = if v2 {
                 f.next().and_then(|s| s.parse().ok()).unwrap_or(0)
             } else {
@@ -730,7 +884,10 @@ mod tests {
     fn classify_by_segment_not_substring() {
         assert_eq!(classify("alt.binaries.anime", ""), Category::Anime);
         assert_eq!(classify("alt.binaries.mangled", ""), Category::Other);
-        assert_eq!(classify("alt.binaries.multimedia.motorsports", ""), Category::Sports);
+        assert_eq!(
+            classify("alt.binaries.multimedia.motorsports", ""),
+            Category::Sports
+        );
         assert_eq!(classify("alt.binaries.e-books", ""), Category::Books);
         assert_eq!(classify("rec.autos.sport.f1", ""), Category::Sports);
     }
@@ -738,11 +895,19 @@ mod tests {
     #[test]
     fn gary_types_auto_and_finds_motor_racing() {
         let c = sample();
-        let (total, page) = c.query(&Query{ cat:None, sort:Sort::Posts, desc_order:true, ..q("auto") });
+        let (total, page) = c.query(&Query {
+            cat: None,
+            sort: Sort::Posts,
+            desc_order: true,
+            ..q("auto")
+        });
         let names: Vec<&str> = page.iter().map(|g| g.name.as_str()).collect();
         assert!(names.contains(&"rec.autos.sport.f1"), "{names:?}");
         // Synonym expansion pulls in motorsports + cars groups too.
-        assert!(names.contains(&"alt.binaries.multimedia.motorsports"), "{names:?}");
+        assert!(
+            names.contains(&"alt.binaries.multimedia.motorsports"),
+            "{names:?}"
+        );
         assert!(names.contains(&"uk.rec.cars.classic"), "{names:?}");
         assert_eq!(total, names.len());
     }
@@ -750,7 +915,12 @@ mod tests {
     #[test]
     fn description_matches_count() {
         let c = sample();
-        let (_, page) = c.query(&Query{ cat:None, sort:Sort::Posts, desc_order:true, ..q("formula") });
+        let (_, page) = c.query(&Query {
+            cat: None,
+            sort: Sort::Posts,
+            desc_order: true,
+            ..q("formula")
+        });
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].name, "rec.autos.sport.f1");
     }
@@ -758,7 +928,12 @@ mod tests {
     #[test]
     fn category_filter_and_posts_sort() {
         let c = sample();
-        let (total, page) = c.query(&Query{ cat:Some(Category::Sports), sort:Sort::Posts, desc_order:true, ..q("") });
+        let (total, page) = c.query(&Query {
+            cat: Some(Category::Sports),
+            sort: Sort::Posts,
+            desc_order: true,
+            ..q("")
+        });
         assert_eq!(total, 3);
         assert_eq!(page[0].name, "alt.binaries.multimedia.motorsports");
     }
@@ -766,7 +941,12 @@ mod tests {
     #[test]
     fn posts_rank_matches_regardless_of_hit_kind() {
         let c = sample();
-        let (_, page) = c.query(&Query{ cat:None, sort:Sort::Posts, desc_order:true, ..q("auto") });
+        let (_, page) = c.query(&Query {
+            cat: None,
+            sort: Sort::Posts,
+            desc_order: true,
+            ..q("auto")
+        });
         // The busiest matching group tops the list even when it matched
         // via a synonym - measured on real data, popularity among the
         // matches beats lexical closeness (autodesk.* vs motorsports).
@@ -776,7 +956,12 @@ mod tests {
     #[test]
     fn refresh_stamps_only_newly_appeared_groups() {
         use nzbkit::nntp::ActiveGroup;
-        let ag = |n: &str| ActiveGroup { name: n.into(), high: 100, low: 1, status: 'y' };
+        let ag = |n: &str| ActiveGroup {
+            name: n.into(),
+            high: 100,
+            low: 1,
+            status: 'y',
+        };
         // First fetch: nothing is "new" (no prev).
         let first = Catalog::build(1000, vec![ag("a.one"), ag("a.two")], vec![], None);
         assert!(first.groups.iter().all(|g| g.first_seen == 0));
@@ -791,7 +976,10 @@ mod tests {
         assert_eq!(by("a.three").first_seen, 2000);
         assert_eq!(by("a.one").first_seen, 0);
         // new_only shows exactly the newcomer.
-        let (total, page) = second.query(&Query { new_only: true, ..q("") });
+        let (total, page) = second.query(&Query {
+            new_only: true,
+            ..q("")
+        });
         assert_eq!((total, page[0].name.as_str()), (1, "a.three"));
         // A third refresh keeps a.three's stamp.
         let third = Catalog::build(
@@ -807,13 +995,25 @@ mod tests {
     #[test]
     fn binaries_only_and_min_posts_reduce_the_set() {
         let c = sample();
-        let (bin, _) = c.query(&Query { binaries_only: true, ..q("") });
+        let (bin, _) = c.query(&Query {
+            binaries_only: true,
+            ..q("")
+        });
         // rec.autos.*, uk.rec.cars.* and it.* are not binary hierarchies.
         assert!(bin < c.groups.len(), "binaries filter did nothing");
-        let (_, page) = c.query(&Query { binaries_only: true, ..q("") });
-        assert!(page.iter().all(|g| g.name.contains(".binaries.")
-            || g.name.starts_with("alt.binaries.")), "{page:?}");
-        let (big, _) = c.query(&Query { min_posts: 500_000, ..q("") });
+        let (_, page) = c.query(&Query {
+            binaries_only: true,
+            ..q("")
+        });
+        assert!(
+            page.iter()
+                .all(|g| g.name.contains(".binaries.") || g.name.starts_with("alt.binaries.")),
+            "{page:?}"
+        );
+        let (big, _) = c.query(&Query {
+            min_posts: 500_000,
+            ..q("")
+        });
         let (all, _) = c.query(&q(""));
         assert!(big < all, "min_posts did nothing");
     }
@@ -955,7 +1155,10 @@ mod tests {
         // so a loaded CI box cannot flake it - anything exponential is
         // still hundreds of seconds away from passing.
         let el = t.elapsed();
-        assert!(el < std::time::Duration::from_secs(2), "matcher took {el:?} - backtracking?");
+        assert!(
+            el < std::time::Duration::from_secs(2),
+            "matcher took {el:?} - backtracking?"
+        );
     }
 
     #[test]
@@ -976,9 +1179,24 @@ mod tests {
     fn posting_status_survives_a_cache_roundtrip() {
         use nzbkit::nntp::ActiveGroup;
         let active = vec![
-            ActiveGroup { name: "a.open".into(), high: 90, low: 1, status: 'y' },
-            ActiveGroup { name: "a.readonly".into(), high: 90, low: 1, status: 'n' },
-            ActiveGroup { name: "a.moderated".into(), high: 90, low: 1, status: 'm' },
+            ActiveGroup {
+                name: "a.open".into(),
+                high: 90,
+                low: 1,
+                status: 'y',
+            },
+            ActiveGroup {
+                name: "a.readonly".into(),
+                high: 90,
+                low: 1,
+                status: 'n',
+            },
+            ActiveGroup {
+                name: "a.moderated".into(),
+                high: 90,
+                low: 1,
+                status: 'm',
+            },
         ];
         let c = Catalog::build(1000, active, vec![], None);
         let dir = std::env::temp_dir().join(format!("nzbfast-gstatus-{}", std::process::id()));
@@ -988,7 +1206,10 @@ mod tests {
         let back = Catalog::load(&p).unwrap();
         std::fs::remove_dir_all(&dir).ok();
         let st = |n: &str| back.groups.iter().find(|g| g.name == n).unwrap().status;
-        assert_eq!((st("a.open"), st("a.readonly"), st("a.moderated")), ('y', 'n', 'm'));
+        assert_eq!(
+            (st("a.open"), st("a.readonly"), st("a.moderated")),
+            ('y', 'n', 'm')
+        );
     }
 
     #[test]
@@ -1003,11 +1224,20 @@ mod tests {
         // The one we care about is the LEAST posted, so a clamped page
         // sorted by posts desc could never contain it.
         groups.push(cg("alt.binaries.zzz.rare", 1, ""));
-        let c = Catalog { fetched_at: 1000, groups };
+        let c = Catalog {
+            fetched_at: 1000,
+            groups,
+        };
         let mine: std::collections::HashSet<String> =
             ["alt.binaries.zzz.rare".to_string()].into_iter().collect();
-        let (total, page) = c.query(&Query { only: Some(&mine), ..q("") });
-        assert_eq!(total, 1, "subscribed group outside the top page was dropped");
+        let (total, page) = c.query(&Query {
+            only: Some(&mine),
+            ..q("")
+        });
+        assert_eq!(
+            total, 1,
+            "subscribed group outside the top page was dropped"
+        );
         assert_eq!(page[0].name, "alt.binaries.zzz.rare");
     }
 
@@ -1022,7 +1252,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(back.fetched_at, c.fetched_at);
         assert_eq!(back.groups.len(), c.groups.len());
-        let f1 = back.groups.iter().find(|g| g.name == "rec.autos.sport.f1").unwrap();
+        let f1 = back
+            .groups
+            .iter()
+            .find(|g| g.name == "rec.autos.sport.f1")
+            .unwrap();
         assert_eq!(f1.desc, "Formula 1 motor racing.");
         assert_eq!(f1.cat, Category::Sports);
     }
@@ -1038,15 +1272,25 @@ mod tests {
         // Only one group has been looked at, and it is video.
         sc.map.insert(
             "alt.binaries.teevee".into(),
-            GroupStats { sample_n: 10, kinds: [10, 0, 0, 0, 0, 0], ..Default::default() },
+            GroupStats {
+                sample_n: 10,
+                kinds: [10, 0, 0, 0, 0, 0],
+                ..Default::default()
+            },
         );
-        let (total, page) =
-            c.query(&Query { stats: Some(&sc), kind: Some(Kind::Video), ..q("") });
+        let (total, page) = c.query(&Query {
+            stats: Some(&sc),
+            kind: Some(Kind::Video),
+            ..q("")
+        });
         assert_eq!(total, 1, "unprofiled groups must not pass a content filter");
         assert_eq!(page[0].name, "alt.binaries.teevee");
 
         // With no filter on, every group is still listed.
-        let (all, _) = c.query(&Query { stats: Some(&sc), ..q("") });
+        let (all, _) = c.query(&Query {
+            stats: Some(&sc),
+            ..q("")
+        });
         assert_eq!(all, c.groups.len());
     }
 
@@ -1059,7 +1303,11 @@ mod tests {
         let mut sc = StatsCache::default();
         sc.map.insert(
             "alt.binaries.e-books".into(),
-            GroupStats { sample_n: 5, est_bytes: 10, ..Default::default() },
+            GroupStats {
+                sample_n: 5,
+                est_bytes: 10,
+                ..Default::default()
+            },
         );
         for desc in [true, false] {
             let (_, page) = c.query(&Query {

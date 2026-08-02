@@ -279,8 +279,11 @@ pub(crate) fn parse_header(rest: &[u8]) -> HashMap<String, String> {
         let key = remaining[..eq].rsplit(' ').next().unwrap_or("").to_string();
         let after = &remaining[eq + 1..];
         if key == "name" {
-            map.entry(key)
-                .or_insert_with(|| after.trim_matches(|c: char| c.is_ascii_whitespace()).to_string());
+            map.entry(key).or_insert_with(|| {
+                after
+                    .trim_matches(|c: char| c.is_ascii_whitespace())
+                    .to_string()
+            });
             break;
         }
         let (value, rest2) = match after.find(' ') {
@@ -356,7 +359,10 @@ fn field_value<'a>(rest: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
 }
 
 pub(crate) fn field_u64(rest: &[u8], key: &[u8]) -> Option<u64> {
-    std::str::from_utf8(field_value(rest, key)?).ok()?.parse().ok()
+    std::str::from_utf8(field_value(rest, key)?)
+        .ok()?
+        .parse()
+        .ok()
 }
 
 pub(crate) fn field_hex(rest: &[u8], key: &[u8]) -> Option<u32> {
@@ -367,7 +373,7 @@ pub(crate) fn field_hex(rest: &[u8], key: &[u8]) -> Option<u32> {
 /// there is no `name=` token.
 pub(crate) fn field_name(rest: &[u8]) -> Option<&[u8]> {
     let i = find_key(rest, b"name")?;
-    Some((&rest[i + 5..]).trim_ascii()) // 5 = "name=".len()
+    Some(rest[i + 5..].trim_ascii()) // 5 = "name=".len()
 }
 
 // ---------------------------------------------------------------------------
@@ -432,9 +438,8 @@ pub fn encode(
         Some((p, _)) => out.extend_from_slice(
             format!("=yend size={} part={p} pcrc32={crc:08x}\r\n", data.len()).as_bytes(),
         ),
-        None => out.extend_from_slice(
-            format!("=yend size={} crc32={crc:08x}\r\n", data.len()).as_bytes(),
-        ),
+        None => out
+            .extend_from_slice(format!("=yend size={} crc32={crc:08x}\r\n", data.len()).as_bytes()),
     }
     out
 }
@@ -550,12 +555,12 @@ mod tests {
         let mut article = encode("c.bin", data.len() as u64, None, 1, &data);
         // Flip a payload byte (past the =ybegin line) to a harmless
         // non-critical value.
-        let payload_start = article
-            .windows(2)
-            .position(|w| w == b"\r\n")
-            .unwrap()
-            + 2;
-        article[payload_start] = if article[payload_start] == b'A' { b'B' } else { b'A' };
+        let payload_start = article.windows(2).position(|w| w == b"\r\n").unwrap() + 2;
+        article[payload_start] = if article[payload_start] == b'A' {
+            b'B'
+        } else {
+            b'A'
+        };
         match decode(&article) {
             Err(YencError::CrcMismatch { .. }) => {}
             other => panic!("expected CRC mismatch, got {other:?}"),
@@ -602,7 +607,11 @@ mod tests {
 
         // Garbage / overlong / empty CRC fields: ignored or clean error,
         // never a parse panic.
-        for crc in ["pcrc32=XYZNOTHEX", "pcrc32=deadbeefdeadbeefdeadbeef", "pcrc32="] {
+        for crc in [
+            "pcrc32=XYZNOTHEX",
+            "pcrc32=deadbeefdeadbeefdeadbeef",
+            "pcrc32=",
+        ] {
             let body = format!(
                 "=ybegin part=1 line=128 size=4 name=c.bin\r\n=ypart begin=1 end=4\r\ntest\r\n=yend size=4 {crc}\r\n"
             );
@@ -649,7 +658,7 @@ mod tests {
         assert_eq!(field_u64(h, b"part"), num(&kv, "part"));
         assert_eq!(field_hex(h, b"pcrc32"), hex(&kv, "pcrc32"));
         assert_eq!(field_u64(h, b"size"), Some(123456));
-        assert_eq!(field_hex(h, b"pcrc32"), Some(0xdeadBEEF));
+        assert_eq!(field_hex(h, b"pcrc32"), Some(0xDEAD_BEEF));
         // name runs to end of line, spaces and all.
         assert_eq!(field_name(h).unwrap(), b"My Movie (2026).mkv");
         // Absent / non-token-boundary keys.

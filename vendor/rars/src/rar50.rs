@@ -16,7 +16,8 @@ mod extract;
 mod write;
 
 pub use extract::{
-    extract_volume_sequence_to, extract_volumes_to, extract_volumes_to_with_redirections,
+    extract_volume_sequence_to, extract_volume_sequence_to_with_progress, extract_volumes_to,
+    extract_volumes_to_with_redirections,
 };
 pub use write::{
     ArchiveMetadataEntry, CompressedEntry, EncryptedArchiveCommentEntry, EncryptedCompressedEntry,
@@ -680,6 +681,15 @@ impl Archive {
         self.source.range_reader(range)
     }
 
+    /// [`Self::range_reader`] with no borrow of this archive - the growing
+    /// split chain needs a cursor that outlives a `Vec<Archive>` push.
+    pub(crate) fn owned_range_reader(
+        &self,
+        range: Range<usize>,
+    ) -> Result<crate::source::OwnedRangeReader> {
+        self.source.owned_range_reader(range)
+    }
+
     fn copy_range_to(&self, range: Range<usize>, writer: &mut dyn Write) -> Result<()> {
         let source_len = self.source_len()?;
         if range.start > range.end || range.end > source_len {
@@ -851,6 +861,49 @@ impl Archive {
         password: Option<&[u8]>,
         budget: u64,
     ) -> Result<Vec<usize>> {
+        self.repair_recovery_impl(dest, password, budget, false)
+    }
+
+    /// [`Self::repair_recovery_to_file`] for a caller that owns the
+    /// destination PATH rather than an open handle.
+    ///
+    /// When the archive itself was opened from a file, the initial
+    /// whole-volume copy becomes a filesystem clone where the platform
+    /// supports one (APFS, btrfs/XFS reflink) - near-free instead of a
+    /// full read+write. Any other source shape, and any box where the
+    /// clone is unavailable, takes the same streaming copy as the file
+    /// form.
+    pub fn repair_recovery_to_path(
+        &self,
+        dest: &std::path::Path,
+        password: Option<&[u8]>,
+        budget: u64,
+    ) -> Result<Vec<usize>> {
+        use crate::recovery::stream;
+
+        let prefilled = match &self.source {
+            ArchiveSource::File(path) => stream::clone_prefill(path, dest)?,
+            _ => false,
+        };
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create(true)
+            .truncate(false)
+            .open(dest)?;
+        if !prefilled {
+            out.set_len(0)?;
+        }
+        self.repair_recovery_impl(&mut out, password, budget, prefilled)
+    }
+
+    fn repair_recovery_impl(
+        &self,
+        dest: &mut std::fs::File,
+        password: Option<&[u8]>,
+        budget: u64,
+        dest_prefilled: bool,
+    ) -> Result<Vec<usize>> {
         use crate::recovery::stream;
 
         let recovery = self
@@ -907,7 +960,11 @@ impl Archive {
             Some(source) => source,
             None => &archive,
         };
-        stream::repair_prefix_streaming(&archive, prefix_start, &scan, parity, dest, budget)
+        if dest_prefilled {
+            stream::repair_prefix_streaming_prefilled(&archive, prefix_start, &scan, parity, dest, budget)
+        } else {
+            stream::repair_prefix_streaming(&archive, prefix_start, &scan, parity, dest, budget)
+        }
     }
 }
 
@@ -1468,10 +1525,19 @@ pub fn repair_inline_recovery_path(
 
     let scan = stream::scan_inline_recovery_chunks(&source, budget)?;
     let repaired = {
-        let mut out = std::fs::OpenOptions::new().write(true).read(true).open(dest)?;
-        out.set_len(0)?;
-        let repaired =
-            stream::repair_prefix_streaming(&source, 0, &scan, &source, &mut out, budget)?;
+        let prefilled = stream::clone_prefill(src, dest)?;
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create(true)
+            .truncate(false)
+            .open(dest)?;
+        let repaired = if prefilled {
+            stream::repair_prefix_streaming_prefilled(&source, 0, &scan, &source, &mut out, budget)?
+        } else {
+            out.set_len(0)?;
+            stream::repair_prefix_streaming(&source, 0, &scan, &source, &mut out, budget)?
+        };
         out.sync_all()?;
         repaired
     };

@@ -36,7 +36,10 @@ fn load_priv(path: Option<&String>) -> Result<SigningKey, String> {
     let path = path.ok_or("missing private-key path")?;
     let hexstr = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
     let raw = hex::decode(hexstr.trim()).map_err(|e| format!("private key not hex: {e}"))?;
-    let arr: [u8; 32] = raw.as_slice().try_into().map_err(|_| "private key must be 32 bytes".to_string())?;
+    let arr: [u8; 32] = raw
+        .as_slice()
+        .try_into()
+        .map_err(|_| "private key must be 32 bytes".to_string())?;
     Ok(SigningKey::from_bytes(&arr))
 }
 
@@ -61,7 +64,9 @@ fn keygen(out: Option<&String>) -> i32 {
                 use std::os::unix::fs::PermissionsExt as _;
                 let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
             }
-            println!("private key written to {path} (0600) - keep it offline, back it up, never commit it");
+            println!(
+                "private key written to {path} (0600) - keep it offline, back it up, never commit it"
+            );
             println!("public  (embed in serve.rs UPDATE_PUBKEY_HEX): {pub_hex}");
         }
         None => {

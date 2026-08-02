@@ -71,7 +71,10 @@ pub fn parse_releases(body: &str) -> Vec<XrelRelease> {
 /// TheMovieDB link is a real shape, and reading it positionally would
 /// file a TMDB id in an IMDb column.
 fn imdb_of(rel: &serde_json::Value) -> String {
-    let Some(uris) = rel.get("ext_info").and_then(|e| e.get("uris")).and_then(|u| u.as_array())
+    let Some(uris) = rel
+        .get("ext_info")
+        .and_then(|e| e.get("uris"))
+        .and_then(|u| u.as_array())
     else {
         return String::new();
     };
@@ -80,9 +83,7 @@ fn imdb_of(rel: &serde_json::Value) -> String {
         .find_map(|u| u.strip_prefix("imdb:"))
         .map(str::trim)
         .filter(|id| {
-            id.len() > 2
-                && id.starts_with("tt")
-                && id[2..].chars().all(|c| c.is_ascii_digit())
+            id.len() > 2 && id.starts_with("tt") && id[2..].chars().all(|c| c.is_ascii_digit())
         })
         .unwrap_or("")
         .to_string()
@@ -136,7 +137,10 @@ fn fetch(url: &str) -> Vec<XrelRelease> {
         .timeout(std::time::Duration::from_secs(10))
         .call()
     {
-        Ok(r) => r.into_string().map(|b| parse_releases(&b)).unwrap_or_default(),
+        Ok(r) => r
+            .into_string()
+            .map(|b| parse_releases(&b))
+            .unwrap_or_default(),
         Err(e) => {
             if let ureq::Error::Status(code @ (429 | 503), r) = &e {
                 // They send GitHub-style headers; `X-RateLimit-Reset` is
@@ -185,11 +189,18 @@ pub fn imdb_for_release(name: &str, hits: &[XrelRelease]) -> String {
     {
         return exact.imdb.clone();
     }
-    let mut ids = hits.iter().map(|h| h.imdb.as_str()).filter(|i| !i.is_empty());
+    let mut ids = hits
+        .iter()
+        .map(|h| h.imdb.as_str())
+        .filter(|i| !i.is_empty());
     let Some(first) = ids.next() else {
         return String::new();
     };
-    if ids.all(|i| i == first) { first.to_string() } else { String::new() }
+    if ids.all(|i| i == first) {
+        first.to_string()
+    } else {
+        String::new()
+    }
 }
 
 #[cfg(test)]
@@ -268,7 +279,10 @@ mod tests {
                 imdb: "tt2222222".into(),
             },
         ];
-        assert_eq!(imdb_for_release("a.film.2019.1080p-grp", &hits), "tt1111111");
+        assert_eq!(
+            imdb_for_release("a.film.2019.1080p-grp", &hits),
+            "tt1111111"
+        );
         // No exact match, and the hits disagree: no answer rather than a
         // coin toss, because this id goes on a history record.
         assert_eq!(imdb_for_release("C.Film.2019-GRP", &hits), "");

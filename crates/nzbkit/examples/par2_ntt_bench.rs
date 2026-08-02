@@ -14,11 +14,14 @@
 //!      production knobs (NZBFAST_NTT_W, NZBFAST_NTT_THREADS).
 
 use nzbkit::gf16;
-use nzbkit::par2repair::{input_base_logs, Reconstructor, SyndromePath};
+use nzbkit::par2repair::{Reconstructor, SyndromePath, input_base_logs};
 use std::time::Instant;
 
 fn envn(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 fn xorshift(state: &mut u64) -> u64 {
@@ -29,6 +32,16 @@ fn xorshift(state: &mut u64) -> u64 {
 }
 
 fn main() {
+    // nzbkit emits its timing lines as tracing events; an example binary
+    // has to install a sink or NZBFAST_REPAIR_TIMING prints nothing.
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        // Keep the target: it is the `repair-timing` / `fold-trace`
+        // key these lines have always been grepped by.
+        .with_target(true)
+        .with_writer(std::io::stderr)
+        .init();
     let block = envn("NZBFAST_NTT_BLOCK", 65536);
     let total = envn("NZBFAST_NTT_TOTAL", 16384);
     let miss = envn("NZBFAST_NTT_MISS", 1500);
@@ -81,7 +94,10 @@ fn main() {
         .enumerate()
         .map(|(e, w)| (e as u32, gf16::words_as_bytes(&w).to_vec()))
         .collect();
-    println!("recovery generation: {:.1}s (setup, unclocked)", t0.elapsed().as_secs_f64());
+    println!(
+        "recovery generation: {:.1}s (setup, unclocked)",
+        t0.elapsed().as_secs_f64()
+    );
 
     let mut baseline: Option<Vec<Vec<u8>>> = None;
     for (name, path) in [

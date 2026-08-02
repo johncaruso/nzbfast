@@ -16,6 +16,8 @@
 //! shared, because nzbfast is a binary-only crate and integration tests
 //! cannot import from each other.
 
+mod scratch;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
@@ -24,14 +26,16 @@ use std::process::{Child, Command, Stdio};
 use nzbkit::nntp::OverEntry;
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 /// (status, body) of a GET; connection refusals retried, answers never.
 fn http_get(port: u16, req: &str) -> (u16, String) {
-    let msg = format!(
-        "GET {req} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-    );
+    let msg = format!("GET {req} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
     let mut last = String::new();
     for attempt in 0..5u32 {
         match http_once(port, &msg) {
@@ -54,11 +58,21 @@ fn http_once(port: u16, msg: &str) -> std::io::Result<(u16, String)> {
     let read = s.read_to_string(&mut out);
     if out.is_empty() {
         return Err(read.err().unwrap_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "closed without answering")
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "closed without answering",
+            )
         }));
     }
-    let status: u16 = out.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
-    Ok((status, out.split("\r\n\r\n").nth(1).unwrap_or("").to_string()))
+    let status: u16 = out
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    Ok((
+        status,
+        out.split("\r\n\r\n").nth(1).unwrap_or("").to_string(),
+    ))
 }
 
 fn pct(s: &str) -> String {
@@ -105,10 +119,16 @@ async fn serve(dir: &Path, build: impl Fn(u16) -> Command) -> Daemon {
         .await
         .unwrap();
         if ready {
-            return Daemon { _child: child, port };
+            return Daemon {
+                _child: child,
+                port,
+            };
         }
         let tail = std::fs::read_to_string(&logfile).unwrap_or_default();
-        assert!(attempt < 2, "daemon exited without binding :{port}\n--- log ---\n{tail}");
+        assert!(
+            attempt < 2,
+            "daemon exited without binding :{port}\n--- log ---\n{tail}"
+        );
     }
     unreachable!()
 }
@@ -118,7 +138,9 @@ async fn serve(dir: &Path, build: impl Fn(u16) -> Command) -> Daemon {
 fn wait_ready(child: &mut KillOnDrop, port: u16, logfile: &Path) -> bool {
     let banner = format!("open the dashboard at  http://localhost:{port}/");
     for _ in 0..600 {
-        if std::fs::read_to_string(logfile).unwrap_or_default().contains(&banner)
+        if std::fs::read_to_string(logfile)
+            .unwrap_or_default()
+            .contains(&banner)
             && TcpStream::connect(("127.0.0.1", port)).is_ok()
         {
             return true;
@@ -148,8 +170,18 @@ fn over(number: u64, subject: &str, msgid: &str, bytes: u64) -> OverEntry {
 /// ever considers complete releases.
 fn release(n: u64, stem: &str) -> Vec<OverEntry> {
     vec![
-        over(n, &format!("\"{stem}.rar\" yEnc (1/1)"), &format!("<p{n}@x>"), 40_000),
-        over(n + 1, &format!("\"{stem}.par2\" yEnc (1/1)"), &format!("<q{n}@x>"), 400),
+        over(
+            n,
+            &format!("\"{stem}.rar\" yEnc (1/1)"),
+            &format!("<p{n}@x>"),
+            40_000,
+        ),
+        over(
+            n + 1,
+            &format!("\"{stem}.par2\" yEnc (1/1)"),
+            &format!("<q{n}@x>"),
+            400,
+        ),
     ]
 }
 
@@ -182,23 +214,34 @@ async fn watching(dir: &Path, seed: &[OverEntry], items: &str) -> Daemon {
     let db = dir.join("index.db");
     {
         let mut ix = nzbkit::index::Index::open(&db).unwrap();
-        ix.ingest("alt.binaries.teevee", seed, 1_700_000_000).unwrap();
+        ix.ingest("alt.binaries.teevee", seed, 1_700_000_000)
+            .unwrap();
     }
     let cfg = dir.join("config.json");
-    std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
-        .unwrap();
+    std::fs::write(
+        &cfg,
+        "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}",
+    )
+    .unwrap();
     // These cases drive the watchlist's LOCAL leg against a seeded
     // index, and the built-in indexer's master switch defaults OFF -
     // with it off the daemon will not open that database at all. So say
     // so; settings.json lives beside the config file.
-    std::fs::write(cfg.with_file_name("settings.json"), "{\"index_enabled\": true}").unwrap();
+    std::fs::write(
+        cfg.with_file_name("settings.json"),
+        "{\"index_enabled\": true}",
+    )
+    .unwrap();
     let d = serve(dir, |port| daemon_cmd(dir, &cfg, &db, port)).await;
     let port = d.port;
     let items = items.to_string();
     tokio::task::spawn_blocking(move || {
         let (_, r) = http_get(
             port,
-            &format!("/api?mode=config&name=watchlist&value={}&output=json", pct(&items)),
+            &format!(
+                "/api?mode=config&name=watchlist&value={}&output=json",
+                pct(&items)
+            ),
         );
         assert!(r.contains("true"), "watchlist not accepted: {r}");
         http_get(port, "/api?mode=watchlist_check_now&output=json");
@@ -260,7 +303,10 @@ fn slots_with(port: u16, needles: &[&str]) -> String {
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
     for n in needles {
-        assert!(last.contains(n), "no slot for {n} was ever recorded: {last}");
+        assert!(
+            last.contains(n),
+            "no slot for {n} was ever recorded: {last}"
+        );
     }
     last
 }
@@ -272,6 +318,7 @@ fn slots_with(port: u16, needles: &[&str]) -> String {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_season_pack_fills_the_season_and_its_episodes_stand_down() {
     let dir = std::env::temp_dir().join(format!("nzbfast-wlpack-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
     let mut seed = release(1, "Wanted.Show.S02.1080p.WEB");
     seed.extend(release(10, "Wanted.Show.S02E05.720p.HDTV"));
     let d = watching(
@@ -287,7 +334,10 @@ async fn a_season_pack_fills_the_season_and_its_episodes_stand_down() {
         grabbed_all(port, &["Wanted.Show.S02.1080p.WEB"]);
         // The season's slot is what the pack filled, not an episode's.
         let st = slots_with(port, &["\"slot\":\"s02\""]);
-        assert!(!st.contains("s02e05"), "the covered episode took a slot of its own: {st}");
+        assert!(
+            !st.contains("s02e05"),
+            "the covered episode took a slot of its own: {st}"
+        );
         // Give the pass room to make the second (wrong) decision too, so
         // this cannot pass merely by reading the queue too early.
         std::thread::sleep(std::time::Duration::from_millis(1500));
@@ -308,6 +358,7 @@ async fn a_season_pack_fills_the_season_and_its_episodes_stand_down() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_daily_show_grabs_every_night() {
     let dir = std::env::temp_dir().join(format!("nzbfast-wldaily-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
     let mut seed = release(1, "The.Daily.Show.2026.07.21.1080p.WEB.h264-GRP");
     seed.extend(release(10, "The.Daily.Show.2026.07.22.1080p.WEB.h264-GRP"));
     let d = watching(

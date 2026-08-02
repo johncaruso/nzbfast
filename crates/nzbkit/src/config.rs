@@ -1,6 +1,7 @@
 //! Local configuration (`config.local.json`, gitignored - holds credentials).
 
 use std::path::Path;
+use tracing::info;
 
 use serde::{Deserialize, Serialize};
 
@@ -369,8 +370,12 @@ pub fn deobfuscate(stored: &str) -> String {
     }
     let mut raw = Vec::with_capacity(hex.len() / 2);
     for pair in hex.as_bytes().chunks(2) {
-        let Ok(s) = std::str::from_utf8(pair) else { return stored.to_string() };
-        let Ok(b) = u8::from_str_radix(s, 16) else { return stored.to_string() };
+        let Ok(s) = std::str::from_utf8(pair) else {
+            return stored.to_string();
+        };
+        let Ok(b) = u8::from_str_radix(s, 16) else {
+            return stored.to_string();
+        };
         raw.push(b);
     }
     // A password is UTF-8; if it does not decode, the value was not ours
@@ -406,18 +411,22 @@ impl Config {
     /// per-platform location - a machine already running SAB needs no
     /// configuration at all.
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
-        let is_ini = |p: &Path| {
-            p.extension().is_some_and(|e| e.eq_ignore_ascii_case("ini"))
-        };
+        let is_ini = |p: &Path| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("ini"));
         let (bytes, ini) = match std::fs::read(path) {
             Ok(b) => (b, is_ini(path)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let Some(sab) = sabnzbd_ini_path() else { return Err(e.into()) };
+                // Search next to the missing config too: in Docker that
+                // is /config, the one place a user can put the file.
+                let near: Vec<&Path> = path.parent().into_iter().collect();
+                let Some(sab) = sabnzbd_ini_path(&near) else {
+                    return Err(e.into());
+                };
                 static NOTICE: std::sync::Once = std::sync::Once::new();
                 let b = std::fs::read(&sab)?;
                 NOTICE.call_once(|| {
-                    println!(
-                        "[config] {} not found - using SABnzbd servers from {}",
+                    info!(
+                        target: "config",
+                        "{} not found - using SABnzbd servers from {}",
                         path.display(),
                         sab.display()
                     );
@@ -428,7 +437,10 @@ impl Config {
         };
         let cfg = if ini {
             let text = String::from_utf8_lossy(&bytes);
-            Config { servers: parse_sabnzbd_ini(&text)?, tmdb_key: None }
+            Config {
+                servers: parse_sabnzbd_ini(&text)?,
+                tmdb_key: None,
+            }
         } else {
             serde_json::from_slice(&bytes)?
         };
@@ -445,15 +457,22 @@ impl Config {
     }
 }
 
-/// Standard sabnzbd.ini locations, most likely first.
-pub fn sabnzbd_ini_path() -> Option<std::path::PathBuf> {
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+/// Standard sabnzbd.ini locations, most likely first. `extra_dirs` are
+/// searched ahead of the OS install locations: callers pass the nzbfast
+/// config dir, which is where a Docker user's copied sabnzbd.ini lands -
+/// the OS locations all live under $HOME and never exist in a container
+/// (issue #15).
+pub fn sabnzbd_ini_path(extra_dirs: &[&Path]) -> Option<std::path::PathBuf> {
+    let mut candidates: Vec<std::path::PathBuf> =
+        extra_dirs.iter().map(|d| d.join("sabnzbd.ini")).collect();
     #[cfg(windows)]
     {
         for var in ["LOCALAPPDATA", "APPDATA"] {
             if let Ok(base) = std::env::var(var) {
                 candidates.push(
-                    std::path::Path::new(&base).join("sabnzbd").join("sabnzbd.ini"),
+                    std::path::Path::new(&base)
+                        .join("sabnzbd")
+                        .join("sabnzbd.ini"),
                 );
             }
         }
@@ -462,9 +481,7 @@ pub fn sabnzbd_ini_path() -> Option<std::path::PathBuf> {
     if let Ok(home) = std::env::var("HOME") {
         let home = std::path::Path::new(&home);
         #[cfg(target_os = "macos")]
-        candidates.push(
-            home.join("Library/Application Support/SABnzbd/sabnzbd.ini"),
-        );
+        candidates.push(home.join("Library/Application Support/SABnzbd/sabnzbd.ini"));
         candidates.push(home.join(".sabnzbd/sabnzbd.ini"));
     }
     candidates.into_iter().find(|p| p.is_file())
@@ -488,13 +505,13 @@ pub fn parse_sabnzbd_ini(text: &str) -> Result<Vec<ServerConfig>, ConfigError> {
         let opt = |v: &str| (!v.is_empty()).then(|| v.to_string());
         out.push(ServerConfig {
             host: host.to_string(),
-            port: get("port")
-                .parse()
-                .unwrap_or(if tls { 563 } else { 119 }),
+            port: get("port").parse().unwrap_or(if tls { 563 } else { 119 }),
             tls,
             username: opt(get("username")),
             password: opt(get("password")),
-            connections: get("connections").parse().unwrap_or_else(|_| default_connections()),
+            connections: get("connections")
+                .parse()
+                .unwrap_or_else(|_| default_connections()),
             rcvbuf: None,
             level: get("priority").parse().unwrap_or(0),
             group: None,
@@ -561,10 +578,18 @@ pub fn parse_nzbget_conf(text: &str) -> Vec<ServerConfig> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let Some((k, v)) = line.split_once('=') else { continue };
-        let Some(rest) = k.trim().strip_prefix("Server") else { continue };
-        let Some((idx, field)) = rest.split_once('.') else { continue };
-        let Ok(idx) = idx.parse::<u32>() else { continue };
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let Some(rest) = k.trim().strip_prefix("Server") else {
+            continue;
+        };
+        let Some((idx, field)) = rest.split_once('.') else {
+            continue;
+        };
+        let Ok(idx) = idx.parse::<u32>() else {
+            continue;
+        };
         by_idx
             .entry(idx)
             .or_default()
@@ -586,7 +611,9 @@ pub fn parse_nzbget_conf(text: &str) -> Vec<ServerConfig> {
             tls,
             username: opt(get("username")),
             password: opt(get("password")),
-            connections: get("connections").parse().unwrap_or_else(|_| default_connections()),
+            connections: get("connections")
+                .parse()
+                .unwrap_or_else(|_| default_connections()),
             rcvbuf: None,
             level: get("level").parse().unwrap_or(0),
             group: (grp > 0).then(|| format!("g{grp}")),
@@ -613,21 +640,24 @@ mod warm_pool_default_tests {
     /// existed must not silently start pooling on upgrade.
     #[test]
     fn connection_pooling_is_off_unless_a_server_opts_in() {
-        let s: ServerConfig =
-            serde_json::from_str(r#"{"host":"news.example.com"}"#).unwrap();
-        assert!(!s.warm_pool, "a server that never heard of the setting pools nothing");
+        let s: ServerConfig = serde_json::from_str(r#"{"host":"news.example.com"}"#).unwrap();
+        assert!(
+            !s.warm_pool,
+            "a server that never heard of the setting pools nothing"
+        );
 
-        let on: ServerConfig =
-            serde_json::from_str(r#"{"host":"h","warm_pool":true}"#).unwrap();
+        let on: ServerConfig = serde_json::from_str(r#"{"host":"h","warm_pool":true}"#).unwrap();
         assert!(on.warm_pool);
 
         // And it is per SERVER: one opting in says nothing about another.
-        let cfg: Config = serde_json::from_str(
-            r#"{"servers":[{"host":"a","warm_pool":true},{"host":"b"}]}"#,
-        )
-        .unwrap();
+        let cfg: Config =
+            serde_json::from_str(r#"{"servers":[{"host":"a","warm_pool":true},{"host":"b"}]}"#)
+                .unwrap();
         assert!(cfg.servers[0].warm_pool);
-        assert!(!cfg.servers[1].warm_pool, "pooling must not leak between servers");
+        assert!(
+            !cfg.servers[1].warm_pool,
+            "pooling must not leak between servers"
+        );
     }
 
     fn srv(json: &str) -> ServerConfig {
@@ -652,7 +682,10 @@ mod warm_pool_default_tests {
 
         // A host the heuristic flags, but the user's plan is generous.
         let s = srv(r#"{"host":"news.newshosting.com","max_source_ips":20}"#);
-        assert!(!s.source_ips_are_tight(), "a stated limit must beat the guess");
+        assert!(
+            !s.source_ips_are_tight(),
+            "a stated limit must beat the guess"
+        );
         assert_eq!(s.idle_release_policy().keep, 1);
 
         // 0 is how a provider prints "no limit", not "no addresses".
@@ -687,7 +720,10 @@ mod warm_pool_default_tests {
         assert_eq!(lax.after, Some(crate::warmpool::DEFAULT_IDLE_RELEASE));
         assert_eq!(lax.keep, 1, "the lax provider keeps a warm connection");
         assert_eq!(strict.after, Some(crate::warmpool::CAPPED_IDLE_RELEASE));
-        assert_eq!(strict.keep, 0, "a floor of one frees nothing against an address cap");
+        assert_eq!(
+            strict.keep, 0,
+            "a floor of one frees nothing against an address cap"
+        );
     }
 
     /// Explicit settings win, and resolve INDEPENDENTLY: lengthening the
@@ -700,21 +736,30 @@ mod warm_pool_default_tests {
         let s = srv(r#"{"host":"news.usenetexpress.com","idle_release_secs":900}"#);
         let p = s.idle_release_policy();
         assert_eq!(p.after, Some(std::time::Duration::from_secs(900)));
-        assert_eq!(p.keep, 0, "the derived floor still reflects the address limit");
+        assert_eq!(
+            p.keep, 0,
+            "the derived floor still reflects the address limit"
+        );
 
         let s = srv(r#"{"host":"news.example.com","idle_release_secs":0}"#);
         assert_eq!(s.idle_release_policy().after, None, "0 = hold them open");
 
         let s = srv(r#"{"host":"news.usenetexpress.com","idle_keep":2}"#);
         let p = s.idle_release_policy();
-        assert_eq!(p.keep, 2, "an explicit floor is honoured even where it frees nothing");
+        assert_eq!(
+            p.keep, 2,
+            "an explicit floor is honoured even where it frees nothing"
+        );
         assert_eq!(p.after, Some(crate::warmpool::CAPPED_IDLE_RELEASE));
 
         // Absent from the JSON entirely = derive. A config written
         // before any of this existed must not read as "hold forever".
         let s = srv(r#"{"host":"news.example.com"}"#);
         assert_eq!(s.idle_release_secs, None);
-        assert!(s.idle_release_policy().after.is_some(), "unset must not mean never");
+        assert!(
+            s.idle_release_policy().after.is_some(),
+            "unset must not mean never"
+        );
     }
 
     /// A too-short timeout is not merely useless, it is harmful, and it
@@ -741,11 +786,18 @@ mod warm_pool_default_tests {
         }
         // At and above the floor, the operator's number is honoured.
         let s = srv(r#"{"host":"h","idle_release_secs":300}"#);
-        assert_eq!(s.idle_release_policy().after, Some(std::time::Duration::from_secs(300)));
+        assert_eq!(
+            s.idle_release_policy().after,
+            Some(std::time::Duration::from_secs(300))
+        );
         // Zero keeps its own meaning - it is the off switch, not a
         // timeout to be floored up to 60.
         let s = srv(r#"{"host":"h","idle_release_secs":0}"#);
-        assert_eq!(s.idle_release_policy().after, None, "0 must stay 'never release'");
+        assert_eq!(
+            s.idle_release_policy().after,
+            None,
+            "0 must stay 'never release'"
+        );
     }
 
     /// A floor above what the pool will ever park is silently "never
@@ -755,7 +807,10 @@ mod warm_pool_default_tests {
     #[test]
     fn a_keep_floor_above_the_pool_cap_is_clamped_not_ignored() {
         let s = srv(r#"{"host":"h","idle_keep":100000}"#);
-        assert_eq!(s.idle_release_policy().keep, crate::warmpool::MAX_PER_SERVER);
+        assert_eq!(
+            s.idle_release_policy().keep,
+            crate::warmpool::MAX_PER_SERVER
+        );
         let s = srv(r#"{"host":"h","idle_keep":2}"#);
         assert_eq!(s.idle_release_policy().keep, 2);
     }
@@ -765,7 +820,10 @@ mod warm_pool_default_tests {
     /// down into the seconds where releasing costs more than it frees.
     #[test]
     fn neither_default_releases_fast_enough_to_defeat_the_pool() {
-        for d in [crate::warmpool::DEFAULT_IDLE_RELEASE, crate::warmpool::CAPPED_IDLE_RELEASE] {
+        for d in [
+            crate::warmpool::DEFAULT_IDLE_RELEASE,
+            crate::warmpool::CAPPED_IDLE_RELEASE,
+        ] {
             assert!(
                 d >= std::time::Duration::from_secs(60),
                 "{d:?} is short enough that a queue draining back to back would \
@@ -855,8 +913,8 @@ x = y
 
     #[test]
     fn sab_ini_defaults_port_from_ssl() {
-        let s = parse_sabnzbd_ini("[servers]\n[[a]]\nhost = h1\n[[b]]\nhost = h2\nssl = 0\n")
-            .unwrap();
+        let s =
+            parse_sabnzbd_ini("[servers]\n[[a]]\nhost = h1\n[[b]]\nhost = h2\nssl = 0\n").unwrap();
         assert_eq!((s[0].port, s[0].tls), (563, true));
         assert_eq!((s[1].port, s[1].tls), (119, false));
     }
@@ -868,6 +926,21 @@ x = y
         let p = dir.join("sabnzbd.ini");
         std::fs::write(&p, SAB_INI).unwrap();
         let cfg = Config::load(&p).unwrap();
+        assert_eq!(cfg.servers.len(), 2);
+    }
+
+    /// Issue #15: a sabnzbd.ini copied next to the config file (Docker's
+    /// /config) must be found by discovery and by Config::load's
+    /// missing-config fallback - the OS install locations never exist in
+    /// a container.
+    #[test]
+    fn sab_ini_next_to_config_is_discovered() {
+        let dir = std::env::temp_dir().join("nzbfast-cfg-test-near");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sabnzbd.ini"), SAB_INI).unwrap();
+        let found = sabnzbd_ini_path(&[dir.as_path()]).expect("extra dir searched");
+        assert_eq!(found, dir.join("sabnzbd.ini"));
+        let cfg = Config::load(&dir.join("config.local.json")).unwrap();
         assert_eq!(cfg.servers.len(), 2);
     }
 }
@@ -882,10 +955,18 @@ mod obf_tests {
         // is exactly the class of character rot13 would have left readable.
         // Every fixture here is synthetic on purpose: test data must never be
         // a credential anyone actually uses.
-        for pw in ["Tr0ub4dor&3!", "correcthorse", "a", "p@ss w/ spaces & £unicode✓"] {
+        for pw in [
+            "Tr0ub4dor&3!",
+            "correcthorse",
+            "a",
+            "p@ss w/ spaces & £unicode✓",
+        ] {
             let o = obfuscate(pw);
             assert!(o.starts_with(OBF_PREFIX), "{o}");
-            assert!(!o.contains(pw), "obfuscated form still contains the secret: {o}");
+            assert!(
+                !o.contains(pw),
+                "obfuscated form still contains the secret: {o}"
+            );
             assert_eq!(deobfuscate(&o), pw);
         }
     }
@@ -896,8 +977,11 @@ mod obf_tests {
         // mixed in so it does not.
         let o = obfuscate("aaaaaaaa");
         let hex = o.strip_prefix(OBF_PREFIX).unwrap();
-        let bytes: Vec<&str> = hex.as_bytes().chunks(2)
-            .map(|c| std::str::from_utf8(c).unwrap()).collect();
+        let bytes: Vec<&str> = hex
+            .as_bytes()
+            .chunks(2)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
         assert!(bytes.iter().collect::<std::collections::HashSet<_>>().len() > 1);
     }
 
@@ -912,7 +996,11 @@ mod obf_tests {
     fn empty_and_already_obfuscated_are_left_alone() {
         assert_eq!(obfuscate(""), "");
         let once = obfuscate("secret");
-        assert_eq!(obfuscate(&once), once, "must not double-obfuscate on re-save");
+        assert_eq!(
+            obfuscate(&once),
+            once,
+            "must not double-obfuscate on re-save"
+        );
         assert_eq!(deobfuscate(&once), "secret");
     }
 
@@ -936,7 +1024,10 @@ mod obf_tests {
         assert_eq!(c.servers[0].password.as_deref(), Some("Tr0ub4dor&3!"));
         // Serializing must write the obfuscated form, not the secret.
         let out = serde_json::to_string(&c.servers[0]).unwrap();
-        assert!(!out.contains("Tr0ub4dor"), "cleartext leaked on write: {out}");
+        assert!(
+            !out.contains("Tr0ub4dor"),
+            "cleartext leaked on write: {out}"
+        );
         assert!(out.contains("obf1:"), "{out}");
         let back: ServerConfig = serde_json::from_str(&out).unwrap();
         assert_eq!(back.password.as_deref(), Some("Tr0ub4dor&3!"));

@@ -30,14 +30,28 @@ fn xorshift(state: &mut u64) -> u64 {
 }
 
 fn main() {
+    // nzbkit emits its timing lines as tracing events; an example binary
+    // has to install a sink or NZBFAST_REPAIR_TIMING prints nothing.
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        // Keep the target: it is the `repair-timing` / `fold-trace`
+        // key these lines have always been grepped by.
+        .with_target(true)
+        .with_writer(std::io::stderr)
+        .init();
     // Env overrides so the sweep can mimic any repair shape:
     // NZBFAST_FOLD_BLOCK (bytes), NZBFAST_FOLD_MISSING (comma list),
     // NZBFAST_FOLD_BATCH (bytes of sources per fold call).
     let block: usize = std::env::var("NZBFAST_FOLD_BLOCK")
-        .ok().and_then(|v| v.parse().ok()).unwrap_or(BLOCK_DEFAULT);
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(BLOCK_DEFAULT);
     let words = block / 2;
     let batch: usize = std::env::var("NZBFAST_FOLD_BATCH")
-        .ok().and_then(|v| v.parse().ok()).unwrap_or(32 << 20);
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32 << 20);
     let inputs = (batch / block).max(1);
     let missing: Vec<usize> = std::env::var("NZBFAST_FOLD_MISSING")
         .ok()
@@ -76,7 +90,9 @@ fn main() {
         let exps: Vec<u32> = (0..m as u32).collect();
 
         let repeats: usize = std::env::var("NZBFAST_FOLD_ROUNDS")
-            .ok().and_then(|v| v.parse().ok()).unwrap_or(REPEATS_DEFAULT);
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(REPEATS_DEFAULT);
         let trace = std::env::var_os("NZBFAST_FOLD_ROUNDS").is_some();
         let mut best = f64::MAX;
         for r in 0..repeats {
@@ -86,8 +102,11 @@ fn main() {
             });
             let dt = t0.elapsed().as_secs_f64();
             if trace {
-                println!("  m={m} round {r}: {:.0} ms ({:.1} GB/s)", dt * 1e3,
-                    inputs as f64 * block as f64 * m as f64 / dt / 1e9);
+                println!(
+                    "  m={m} round {r}: {:.0} ms ({:.1} GB/s)",
+                    dt * 1e3,
+                    inputs as f64 * block as f64 * m as f64 / dt / 1e9
+                );
             }
             best = best.min(dt);
             std::hint::black_box(&dsts);

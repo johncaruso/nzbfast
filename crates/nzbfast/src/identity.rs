@@ -116,18 +116,18 @@ pub fn decide_name(f: &Facts) -> Option<(String, &'static str)> {
         // nothing usable if sanitising emptied it.
         (!cand.is_empty() && !cand.eq_ignore_ascii_case(posted)).then_some((cand, src))
     };
-    if let Some(hit) = &f.srr {
-        if let Some(got) = take(&hit.release, "srrdb") {
-            return Some(got);
-        }
+    if let Some(hit) = &f.srr
+        && let Some(got) = take(&hit.release, "srrdb")
+    {
+        return Some(got);
     }
     if !release::looks_obfuscated(posted) {
         return None;
     }
-    if let Some((name, _)) = &f.remembered {
-        if let Some(got) = take(name, "par-hash") {
-            return Some(got);
-        }
+    if let Some((name, _)) = &f.remembered
+        && let Some(got) = take(name, "par-hash")
+    {
+        return Some(got);
     }
     let title = f.mkv_title.as_deref()?;
     // The one candidate nobody vouched for, so it has to pass the
@@ -188,7 +188,8 @@ pub fn par_fingerprints(dir: &std::path::Path) -> Vec<(String, String)> {
         .flatten()
         .map(|e| e.path())
         .filter(|p| {
-            p.extension().is_some_and(|e| e.eq_ignore_ascii_case("par2"))
+            p.extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("par2"))
                 && p.is_file()
         })
         .filter_map(|p| Some((p.metadata().ok()?.len(), p)))
@@ -196,7 +197,9 @@ pub fn par_fingerprints(dir: &std::path::Path) -> Vec<(String, String)> {
         .collect();
     cands.sort();
     for (_, path) in cands.iter().take(4) {
-        let Ok(bytes) = std::fs::read(path) else { continue };
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
         if let Ok(set) = nzbkit::par2::Par2Set::parse(&[&bytes]) {
             let pairs = set.member_hash16k();
             if !pairs.is_empty() {
@@ -231,7 +234,10 @@ mod tests {
     use crate::srrdb::SrrHit;
 
     fn srr(release: &str) -> Option<SrrHit> {
-        Some(SrrHit { release: release.into(), imdb: "tt1".into() })
+        Some(SrrHit {
+            release: release.into(),
+            imdb: "tt1".into(),
+        })
     }
 
     const OBF: &str = "a4f9c2e1b7d0483951";
@@ -243,7 +249,11 @@ mod tests {
     /// media server matches on.
     #[test]
     fn an_exact_crc_hit_wins_even_over_a_readable_name() {
-        let f = Facts { posted: GOOD.into(), srr: srr(CANON), ..Default::default() };
+        let f = Facts {
+            posted: GOOD.into(),
+            srr: srr(CANON),
+            ..Default::default()
+        };
         assert_eq!(decide_name(&f), Some((CANON.to_string(), "srrdb")));
     }
 
@@ -270,26 +280,48 @@ mod tests {
             ..Default::default()
         };
         // The fingerprint is exact; the container's claim is not.
-        assert_eq!(decide_name(&remembered), Some((GOOD.to_string(), "par-hash")));
+        assert_eq!(
+            decide_name(&remembered),
+            Some((GOOD.to_string(), "par-hash"))
+        );
 
         let container = Facts {
             posted: OBF.into(),
             mkv_title: Some(GOOD.into()),
             ..Default::default()
         };
-        assert_eq!(decide_name(&container), Some((GOOD.to_string(), "mkv-title")));
+        assert_eq!(
+            decide_name(&container),
+            Some((GOOD.to_string(), "mkv-title"))
+        );
     }
 
     /// A container Title that is not a release name renames nothing -
     /// the muxer default, the human title, the path fragment.
     #[test]
     fn an_unconvincing_container_title_is_declined() {
-        for t in ["video", "Sintel", "Episode 3", "encoded by Handbrake", "a/b.mkv"] {
-            let f = Facts { posted: OBF.into(), mkv_title: Some(t.into()), ..Default::default() };
+        for t in [
+            "video",
+            "Sintel",
+            "Episode 3",
+            "encoded by Handbrake",
+            "a/b.mkv",
+        ] {
+            let f = Facts {
+                posted: OBF.into(),
+                mkv_title: Some(t.into()),
+                ..Default::default()
+            };
             assert_eq!(decide_name(&f), None, "{t:?}");
         }
         // …and neither does no oracle at all.
-        assert_eq!(decide_name(&Facts { posted: OBF.into(), ..Default::default() }), None);
+        assert_eq!(
+            decide_name(&Facts {
+                posted: OBF.into(),
+                ..Default::default()
+            }),
+            None
+        );
     }
 
     /// A name that agrees with the one we already have is not news, and
@@ -297,7 +329,11 @@ mod tests {
     /// row.
     #[test]
     fn an_answer_that_agrees_with_the_posted_name_is_not_recorded() {
-        let f = Facts { posted: GOOD.into(), srr: srr(GOOD), ..Default::default() };
+        let f = Facts {
+            posted: GOOD.into(),
+            srr: srr(GOOD),
+            ..Default::default()
+        };
         assert_eq!(decide_name(&f), None);
         let f = Facts {
             posted: GOOD.into(),
@@ -321,9 +357,17 @@ mod tests {
             ".hidden.Movie.2019.1080p-GRP",
             "/absolute/Example.Movie.2019-GRP",
         ] {
-            let f = Facts { posted: OBF.into(), srr: srr(bad), ..Default::default() };
+            let f = Facts {
+                posted: OBF.into(),
+                srr: srr(bad),
+                ..Default::default()
+            };
             assert_eq!(decide_name(&f), None, "{bad}");
-            let f = Facts { posted: OBF.into(), mkv_title: Some(bad.into()), ..Default::default() };
+            let f = Facts {
+                posted: OBF.into(),
+                mkv_title: Some(bad.into()),
+                ..Default::default()
+            };
             assert_eq!(decide_name(&f), None, "{bad}");
         }
     }
@@ -332,8 +376,7 @@ mod tests {
     /// directory, so what matters is that they answer on a real one and
     /// stay silent - never panic, never stall - on everything else.
     fn tmpdir(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir()
-            .join(format!("nzbfast-ident-{tag}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("nzbfast-ident-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -345,10 +388,16 @@ mod tests {
         // use, so the two cannot drift.
         const MAIN: &[u8] = include_bytes!("../../nzbkit/tests/fixtures/par2/testset.par2");
         let d = tmpdir("par");
-        assert!(par_fingerprints(&d).is_empty(), "an empty directory has no sidecar");
+        assert!(
+            par_fingerprints(&d).is_empty(),
+            "an empty directory has no sidecar"
+        );
         std::fs::write(d.join("notes.txt"), b"not a par2").unwrap();
         std::fs::write(d.join("broken.par2"), b"PAR2\0PKTnonsense").unwrap();
-        assert!(par_fingerprints(&d).is_empty(), "garbage must not parse as a set");
+        assert!(
+            par_fingerprints(&d).is_empty(),
+            "garbage must not parse as a set"
+        );
         std::fs::write(d.join("testset.par2"), MAIN).unwrap();
         let prints = par_fingerprints(&d);
         assert_eq!(prints.len(), 1, "{prints:?}");
@@ -403,7 +452,10 @@ mod tests {
             Some("Supergirl 2026")
         );
         // We already know the id.
-        assert_eq!(xrel_query("Supergirl.2026.1080P.WEB.H264-POKE", "tt8814476"), None);
+        assert_eq!(
+            xrel_query("Supergirl.2026.1080P.WEB.H264-POKE", "tt8814476"),
+            None
+        );
         // No group tag: not a release xREL indexes.
         assert_eq!(xrel_query("Supergirl 2026 1080p", ""), None);
         // Nothing to search with.

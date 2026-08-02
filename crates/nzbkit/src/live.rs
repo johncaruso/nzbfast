@@ -31,6 +31,7 @@
 //! claiming in-stream blocks on the IFSC CRC32 alone (TODO §10) - settle
 //! read-back and the no-IFSC whole-file check always keep full MD5.
 
+use crate::sync::{MutexExt, RwLockExt};
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
@@ -118,7 +119,9 @@ struct CrcParts {
 
 impl CrcParts {
     fn new() -> CrcParts {
-        CrcParts { parts: Vec::with_capacity(2) }
+        CrcParts {
+            parts: Vec::with_capacity(2),
+        }
     }
 
     /// Merge a fragment. Returns false on overlap with an existing part -
@@ -342,7 +345,7 @@ impl LiveVerifier {
 
     /// Declare that no PAR2 set will ever arrive (NZB has none).
     pub fn set_off(&self) {
-        *self.plan.write().unwrap() = Plan::Off;
+        *self.plan.write_ok() = Plan::Off;
     }
 
     /// Enable/disable fast verify (CRC32-only in-stream claims). Flip
@@ -366,7 +369,7 @@ impl LiveVerifier {
     /// needs a name). A later yEnc name would win only if none is set -
     /// call this exclusively for slots with zero pending articles.
     pub fn set_name_hint(&self, slot: usize, name: &str) {
-        let mut s = self.slots[slot].lock().unwrap();
+        let mut s = self.slots[slot].lock_ok();
         if s.name.is_none() && !name.is_empty() {
             s.name = Some(name.to_string());
         }
@@ -378,7 +381,7 @@ impl LiveVerifier {
     pub fn activate(&self, inputs: &[&[u8]]) -> Result<Arc<Par2Set>, Par2Error> {
         let set = Arc::new(pick_set(inputs)?);
         let claimed = Mutex::new(vec![None; set.files.len()]);
-        *self.plan.write().unwrap() = Plan::Active(Active {
+        *self.plan.write_ok() = Plan::Active(Active {
             set: set.clone(),
             claimed,
         });
@@ -399,14 +402,14 @@ impl LiveVerifier {
         {
             return false;
         }
-        if !matches!(&*self.plan.read().unwrap(), Plan::Active(_)) {
+        if !matches!(&*self.plan.read_ok(), Plan::Active(_)) {
             return false;
         }
-        self.slots[slot].lock().unwrap().file.is_some()
+        self.slots[slot].lock_ok().file.is_some()
     }
 
     pub fn set(&self) -> Option<Arc<Par2Set>> {
-        match &*self.plan.read().unwrap() {
+        match &*self.plan.read_ok() {
             Plan::Active(a) => Some(a.set.clone()),
             _ => None,
         }
@@ -496,8 +499,8 @@ impl LiveVerifier {
         data: &[u8],
         src: Src,
     ) {
-        let plan = self.plan.read().unwrap();
-        let mut s = self.slots[slot].lock().unwrap();
+        let plan = self.plan.read_ok();
+        let mut s = self.slots[slot].lock_ok();
 
         if s.name.is_none() && !name.is_empty() {
             s.name = Some(name.to_string());
@@ -661,7 +664,11 @@ impl LiveVerifier {
         // ALWAYS full-MD5 - lean does not weaken that contract.
         // (`crc_claims` above is the same condition - boundary fragments
         // of such spans were queued as CRC jobs.)
-        let check = if crc_claims { check_block_crc } else { check_block };
+        let check = if crc_claims {
+            check_block_crc
+        } else {
+            check_block
+        };
         let file = &set.files[fi];
         let mut results: Vec<(usize, bool)> = Vec::with_capacity(full.len() + ready.len());
         for bi in full {
@@ -694,8 +701,8 @@ impl LiveVerifier {
 
         if !results.is_empty() || !crc_frags.is_empty() {
             use std::sync::atomic::Ordering;
-            let mut s = self.slots[slot].lock().unwrap();
-            let mut record = |s: &mut SlotState, bi: usize, ok: bool| {
+            let mut s = self.slots[slot].lock_ok();
+            let record = |s: &mut SlotState, bi: usize, ok: bool| {
                 if s.blocks[bi] == BlockState::Pending {
                     s.blocks[bi] = if ok { BlockState::Ok } else { BlockState::Bad };
                     if ok {
@@ -749,7 +756,7 @@ impl LiveVerifier {
     /// trusted only after they hash clean (settle read-back backstops
     /// anything the backfill couldn't reach).
     pub fn seed_pre_spans(&self, slot: usize, spans: &[(u64, u64)]) {
-        let mut s = self.slots[slot].lock().unwrap();
+        let mut s = self.slots[slot].lock_ok();
         s.resume_seeded = true;
         for &(off, len) in spans {
             let (mut off, mut len) = (off, len);
@@ -774,7 +781,7 @@ impl LiveVerifier {
     /// vouch for may still be claimed CRC-only, so the disk round trip
     /// hands back no more trust than the span had live.
     pub fn take_pre_spans(&self, slot: usize) -> (Vec<(u64, u64)>, PreSpanSrc) {
-        let mut s = self.slots[slot].lock().unwrap();
+        let mut s = self.slots[slot].lock_ok();
         let lean = self.lean.load(std::sync::atomic::Ordering::Relaxed);
         let how = if s.resume_seeded || (s.pre_unvouched && !lean) {
             PreSpanSrc::Disk
@@ -810,7 +817,8 @@ impl LiveVerifier {
     pub fn live_counts(&self) -> (u64, u64) {
         use std::sync::atomic::Ordering;
         (
-            self.live_ok_total.load(Ordering::Relaxed) + self.live_bad_total.load(Ordering::Relaxed),
+            self.live_ok_total.load(Ordering::Relaxed)
+                + self.live_bad_total.load(Ordering::Relaxed),
             self.live_bad_total.load(Ordering::Relaxed),
         )
     }
@@ -830,12 +838,12 @@ impl LiveVerifier {
     /// direct-extracted RAR volumes the "file" is reconstructed on demand
     /// (header stash + extracted-file pread) instead of read from disk.
     pub fn finish_slot_from(&self, slot: usize, src: ReadAt<'_>) -> Option<SlotReport> {
-        let plan = self.plan.read().unwrap();
+        let plan = self.plan.read_ok();
         let active = match &*plan {
             Plan::Active(a) => a,
             _ => return None,
         };
-        let mut s = self.slots[slot].lock().unwrap();
+        let mut s = self.slots[slot].lock_ok();
         // Last-chance match (e.g. every article of the slot arrived before
         // activation, so on_data never ran while Active).
         if s.file.is_none() && !s.unmatchable {
@@ -928,7 +936,7 @@ impl LiveVerifier {
     /// PAR2 files no slot claimed (files entirely absent from the NZB or
     /// whose every article vanished before a name could be learned).
     pub fn unclaimed_files(&self) -> Vec<String> {
-        match &*self.plan.read().unwrap() {
+        match &*self.plan.read_ok() {
             Plan::Active(a) => a
                 .claimed
                 .lock()
@@ -977,7 +985,7 @@ impl SlotState {
     /// second. Requires `self.file.is_none()`.
     fn try_match(&mut self, slot: usize, active: &Active) -> bool {
         let files = &active.set.files;
-        let mut claimed = active.claimed.lock().unwrap();
+        let mut claimed = active.claimed.lock_ok();
 
         if let Some(name) = &self.name {
             let sname = crate::disk::sanitize_filename(name);
@@ -1073,7 +1081,11 @@ struct StreamedBlock {
 
 impl StreamedBlock {
     fn new() -> Self {
-        Self { crc: crc32fast::Hasher::new(), md5: Md5::new(), len: 0 }
+        Self {
+            crc: crc32fast::Hasher::new(),
+            md5: Md5::new(),
+            len: 0,
+        }
     }
 
     fn update(&mut self, bytes: &[u8]) {
@@ -1157,7 +1169,10 @@ fn src_md5(src: &ReadAt<'_>, expect_len: u64) -> io::Result<[u8; 16]> {
             use std::io::Read;
             let mut f = std::fs::File::open(path)?;
             if f.metadata()?.len() != expect_len {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "length mismatch"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "length mismatch",
+                ));
             }
             let mut buf = vec![0u8; 1 << 20];
             loop {

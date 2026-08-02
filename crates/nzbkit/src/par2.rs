@@ -33,7 +33,18 @@
 use md5::{Digest, Md5};
 use std::collections::HashMap;
 
-pub(crate) const MAGIC: &[u8; 8] = b"PAR2\0PKT";
+/// Public: the engine's in-stream sniff (issue #14) tests a decoded
+/// offset-0 article against this to identify obfuscated recovery volumes.
+pub const MAGIC: &[u8; 8] = b"PAR2\0PKT";
+
+/// MD5 of a file's first `min(16384, length)` bytes - the quantity a
+/// FileDesc packet's `md5_16k` records (short files are NOT zero-padded).
+/// For callers holding a decoded offset-0 span; None when the span does
+/// not cover that whole prefix.
+pub fn md5_16k_of_head(head: &[u8], file_length: u64) -> Option<[u8; 16]> {
+    let want = file_length.min(16384) as usize;
+    (want > 0 && head.len() >= want).then(|| Md5::digest(&head[..want]).into())
+}
 pub(crate) const TYPE_MAIN: &[u8; 16] = b"PAR 2.0\0Main\0\0\0\0";
 pub(crate) const TYPE_FILEDESC: &[u8; 16] = b"PAR 2.0\0FileDesc";
 pub(crate) const TYPE_IFSC: &[u8; 16] = b"PAR 2.0\0IFSC\0\0\0\0";
@@ -211,17 +222,19 @@ fn scan_packets_parallel<'a, F: FnMut(RawPacket<'a>)>(
     let bytes = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|s| {
         for _ in 0..threads {
-            s.spawn(|| loop {
-                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if i >= spans.len() || !ok.load(std::sync::atomic::Ordering::Relaxed) {
-                    return;
-                }
-                let (start, end) = spans[i];
-                let stored: [u8; 16] = input[start + 16..start + 32].try_into().unwrap();
-                bytes.fetch_add(end - (start + 32), std::sync::atomic::Ordering::Relaxed);
-                if Md5::digest(&input[start + 32..end]).as_slice() != stored {
-                    ok.store(false, std::sync::atomic::Ordering::Relaxed);
-                    return;
+            s.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= spans.len() || !ok.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    let (start, end) = spans[i];
+                    let stored: [u8; 16] = input[start + 16..start + 32].try_into().unwrap();
+                    bytes.fetch_add(end - (start + 32), std::sync::atomic::Ordering::Relaxed);
+                    if Md5::digest(&input[start + 32..end]).as_slice() != stored {
+                        ok.store(false, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
                 }
             });
         }
@@ -256,9 +269,7 @@ fn scan_packets_serial<'a>(input: &'a [u8], mut f: impl FnMut(RawPacket<'a>)) ->
     // A legitimate set hashes each packet exactly once, so its total is one
     // pass over the input - 4x leaves ample headroom for duplicate copies,
     // which is what the +1 resume exists to find.
-    let budget = (input.len() as u64)
-        .saturating_mul(4)
-        .max(16 * 1024 * 1024);
+    let budget = (input.len() as u64).saturating_mul(4).max(16 * 1024 * 1024);
     let mut hashed: u64 = 0;
     let mut off = 0usize;
     while off + (HEADER_LEN as usize) <= input.len() {
@@ -624,7 +635,10 @@ mod tests {
         );
         // Guard the guard: a bound nothing reaches would pass even if the
         // scan silently stopped doing any work at all.
-        assert!(hashed >= N as u64, "the hostile input must actually be scanned");
+        assert!(
+            hashed >= N as u64,
+            "the hostile input must actually be scanned"
+        );
     }
 
     /// The parallel scan (buffers ≥ PAR_SCAN_MIN) must agree with the
@@ -651,7 +665,10 @@ mod tests {
                 }
                 buf.extend(pkt(set_id, TYPE_RECVSLIC, &body(i)));
             }
-            assert!(buf.len() >= PAR_SCAN_MIN, "fixture must take the parallel path");
+            assert!(
+                buf.len() >= PAR_SCAN_MIN,
+                "fixture must take the parallel path"
+            );
             if corrupt_one {
                 let mid = buf.len() / 2;
                 buf[mid] ^= 0xFF;
@@ -732,7 +749,10 @@ mod tests {
         let short = build(1);
         let set = Par2Set::parse(&[&short]).unwrap();
         assert_eq!(set.files.len(), 1);
-        assert!(set.files[0].blocks.is_empty(), "a 1-entry IFSC must not vouch for a 4-block file");
+        assert!(
+            set.files[0].blocks.is_empty(),
+            "a 1-entry IFSC must not vouch for a 4-block file"
+        );
 
         // A long list is equally untrustworthy.
         let long = build(9);

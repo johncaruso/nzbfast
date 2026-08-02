@@ -6,7 +6,7 @@
 //! math matches it bit-for-bit.
 
 use nzbkit::par2::Par2Set;
-use nzbkit::par2repair::{recovery_slice_locators, Reconstructor};
+use nzbkit::par2repair::{Reconstructor, recovery_slice_locators};
 
 const MAIN: &[u8] = include_bytes!("fixtures/par2/testset.par2");
 const VOL: &[u8] = include_bytes!("fixtures/par2/testset.vol0+4.par2");
@@ -16,7 +16,11 @@ const BETA: &[u8] = include_bytes!("fixtures/par2/beta.bin"); // 33 KiB
 /// The fixture set: block 4096, Main order [beta (9 slices), alpha (3)].
 /// Returns (block_size, per-file (data, first_slice, n_slices) in Main
 /// order, the 4 recovery slices from the volume).
-fn fixture() -> (usize, Vec<(&'static [u8], usize, usize)>, Vec<(u32, Vec<u8>)>) {
+fn fixture() -> (
+    usize,
+    Vec<(&'static [u8], usize, usize)>,
+    Vec<(u32, Vec<u8>)>,
+) {
     let set = Par2Set::parse(&[MAIN, VOL]).expect("fixture parses");
     let bs = set.block_size as usize;
     assert_eq!(set.files[0].name, "beta.bin");
@@ -52,8 +56,7 @@ fn reconstruct_and_check(missing: &[usize]) {
     let (bs, layout, mut recovery) = fixture();
     let n_inputs: usize = layout.iter().map(|&(_, _, n)| n).sum();
     recovery.truncate(missing.len());
-    let mut rec =
-        Reconstructor::new(bs, n_inputs, missing, &recovery).expect("matrix inverts");
+    let mut rec = Reconstructor::new(bs, n_inputs, missing, &recovery).expect("matrix inverts");
     for &(data, first, n) in &layout {
         for i in 0..n {
             let g = first + i;
@@ -104,5 +107,9 @@ fn locators_report_the_reference_exponents() {
         .map(|(e, _, _)| e)
         .collect();
     exps.sort_unstable();
-    assert_eq!(exps, vec![0, 1, 2, 3], "par2cmdline numbers exponents from 0");
+    assert_eq!(
+        exps,
+        vec![0, 1, 2, 3],
+        "par2cmdline numbers exponents from 0"
+    );
 }

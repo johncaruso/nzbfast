@@ -38,12 +38,27 @@ h3{font-size:16.5px;margin:28px 0 6px}
 h4{font-size:14.5px;margin:20px 0 4px}
 p{margin:8px 0}
 li{margin:3px 0}
+/* Prose breaks a long unbreakable token instead of pushing the page sideways.
+   The API section quotes a 368px query string, which does not fit the 280px
+   text column of a 320px phone. Deliberately not applied to header or data
+   cells: inside a scroll wrapper, breaking a cell reflows the columns rather
+   than letting the wide table scroll, which is what the wrapper is for. */
+p,li,.tip,.note,.warn-box{overflow-wrap:break-word}
 code,kbd{background:var(--code);border:1px solid var(--line);border-radius:5px;
   padding:1px 6px;font:12.5px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 pre{background:var(--code);border:1px solid var(--line);border-radius:9px;
   padding:12px 15px;overflow-x:auto;font:12.5px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 pre code{background:none;border:none;padding:0}
-table{border-collapse:collapse;width:100%;margin:12px 0;font-size:13.5px}
+/* A table scrolls inside its own box instead of widening the page. One long
+   unbreakable command in a cell (the docker compose upgrade line, 338px wide
+   in an 87px column) used to drag the whole document sideways on a phone:
+   +140 at 320px and +85 at 375px in English, up to +217 / +162 in the
+   longer-word locales, and da/nl even at 500px. The 12px margin sits on the
+   wrapper so it still collapses with the adjacent paragraph exactly as
+   the margin on the table itself did - a scroll box does not collapse
+   margins through, so leaving it in place would have opened every gap. */
+.tblwrap{overflow-x:auto;margin:12px 0}
+table{border-collapse:collapse;width:100%;margin:0;font-size:13.5px}
 th{text-align:left;color:var(--dim);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
 th,td{padding:7px 12px 7px 0;border-bottom:1px solid var(--line);vertical-align:top}
 td code{white-space:nowrap}
@@ -72,6 +87,7 @@ hr{border:none;border-top:1px solid var(--line);margin:30px 0}
   body{background:#fff;color:#000;font-size:11.5pt}
   h2{page-break-after:avoid}
   pre{white-space:pre-wrap}
+  .tblwrap{overflow:visible}
   a{color:inherit}
 }
 </style>
@@ -227,7 +243,7 @@ bureau unique où rien d'autre n'a besoin d'y accéder.</p>
 
 <h2 id="concepts">3 · Comment nzbfast fonctionne</h2>
 <p>Un petit vocabulaire pour que la suite du manuel se lise facilement :</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Terme</th><th>Signification</th></tr>
 <tr><td><b>Fournisseur / serveur</b></td><td>Un service Usenet chez qui vous avez un
 compte (Newshosting, Eweka, XS News…). Chacun autorise un certain nombre de
@@ -245,7 +261,7 @@ automatiquement quand des articles sont endommagés ou manquants.</td></tr>
 en volumes RAR sans compression. nzbfast le détecte et écrit le <em>fichier
 interne</em> directement à son emplacement final pendant le téléchargement - aucune
 étape de décompression ensuite.</td></tr>
-</table>
+</table></div>
 <p>Le pipeline enchaîne téléchargement → décodage → vérification → extraction
 <em>en parallèle</em>. La carte Pipeline du tableau de bord montre les trois voies
 avancer en même temps. Quand le dernier octet arrive, la vérification est déjà faite
@@ -265,13 +281,13 @@ restauré contre la carte de blocs PAR2 avant de s'y fier.</p>
 fournisseurs et les mêmes NZB, chronométré jusqu'au <em>fichier utilisable</em> -
 téléchargement, vérification, réparation et extraction compris, car c'est là que la
 tâche est réellement terminée :</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Taille de la tâche</th><th>nzbfast</th><th>NZBGet 26.2</th><th>SABnzbd 5.0.4</th></tr>
 <tr><td>7 GB</td><td><b>13.7 s</b></td><td>+26%</td><td>+39%</td></tr>
 <tr><td>35 GB</td><td><b>67 s</b></td><td>+61%</td><td>+325%</td></tr>
 <tr><td>87 GB</td><td><b>272 s</b></td><td>+36%</td><td>+160%</td></tr>
 <tr><td>190 GB</td><td><b>9 m 00 s</b></td><td>+30%</td><td>+111%</td></tr>
-</table>
+</table></div>
 <p>L'écart, c'est le post-traitement que les autres doivent encore faire après
 l'arrivée du dernier octet. Les deux concurrents ont été réglés pour la comparaison,
 pas laissés sur leurs valeurs par défaut - SABnzbd, en particulier, est livré avec le
@@ -379,7 +395,7 @@ affichent l'usage cumulé par rapport à leur taille.</p>
 décrits dans <a href="#performance">Outils de performance</a>.</p>
 
 <h2 id="adding">5 · Ajouter des téléchargements</h2>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Méthode</th><th>Comment</th></tr>
 <tr><td><b>Glisser-déposer</b></td><td>Déposez un ou plusieurs fichiers <code>.nzb</code> n'importe où sur le tableau de bord.</td></tr>
 <tr><td><b>Dossier surveillé</b></td><td>Définissez un dossier dans les Paramètres ; tout
@@ -392,7 +408,7 @@ récupérations en un clic depuis les sites d'indexeurs.</td></tr>
 <tr><td><b>Liste de suivi / RSS</b></td><td>Automatique - voir <a href="#automation">Automatisation</a>.</td></tr>
 <tr><td><b>Sonarr/Radarr etc.</b></td><td>Ils envoient leurs récupérations directement dans la file - voir <a href="#arr">§11</a>.</td></tr>
 <tr><td><b>Ligne de commande</b></td><td><code>nzbfast get file.nzb</code> télécharge sans le daemon.</td></tr>
-</table>
+</table></div>
 <h3>Catégories, priorités, mots de passe</h3>
 <ul>
 <li>Les <b>catégories</b> sont des étiquettes libres ; chacune devient un sous-dossier
@@ -510,14 +526,14 @@ comme avant.</div>
 <h2 id="servers">8 · Serveurs Usenet</h2>
 <p>Paramètres → <b>Serveurs Usenet</b> est l'éditeur complet : ajouter, modifier, supprimer, réordonner, et faire
 entrer ou sortir n'importe quel serveur du pool. Chaque serveur a :</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Champ</th><th>Notes</th></tr>
 <tr><td>Hôte / port</td><td>Utilisez le port SSL <b>563</b>. TLS ne coûte rien de mesurable - nzbfast chiffre toujours.</td></tr>
 <tr><td>Nom d'utilisateur / mot de passe</td><td>Stockés localement dans <code>config.local.json</code>, jamais renvoyés au navigateur. Laisser le mot de passe vide à la modification conserve celui qui est stocké. Les mots de passe sont <a href="#passwords">obscurcis sur le disque, pas chiffrés</a>.</td></tr>
 <tr><td>Connexions</td><td>Connexions simultanées par serveur. Utilisez le <b>Réglage des connexions</b> (<a href="#performance">§13</a>) pour trouver l'optimum de chaque fournisseur plutôt que de viser haut au hasard.</td></tr>
 <tr><td>Niveau (tier)</td><td>0 = primaire ; les niveaux supérieurs sont des serveurs de fill, sollicités uniquement pour les articles manqués par tous les niveaux inférieurs. Mettez les comptes illimités à 0, les comptes à bloc à 1+.</td></tr>
 <tr><td>Taille du bloc (GB)</td><td>Pour les comptes à bloc (payés au GB) : nzbfast suit l'usage cumulé par rapport à cette taille et cesse d'utiliser le serveur une fois le bloc épuisé (avertissement à 85 %).</td></tr>
-</table>
+</table></div>
 <p><b>Laissez un peu de marge sous la limite de connexions de votre compte.</b> Régler les connexions un cran en dessous de la limite ne coûte rien : le débit plafonne bien avant les une ou deux dernières connexions, et le <b>Réglage des connexions</b> (<a href="#performance">§13</a>) s'arrête de toute façon en dessous. Ce sont ces places libres qui permettent à un deuxième appareil, à un autre client ou à une nouvelle tentative après une coupure de socket de passer quand même, au lieu d'être refusés pendant que celui-ci occupe toutes les places.</p>
 <h3 id="passwords">Comment vos mots de passe fournisseur sont stockés</h3>
 <p>Les mots de passe fournisseur dans <code>config.local.json</code> sont
@@ -558,11 +574,11 @@ comporte pareil partout est, pour l'instant, le meilleur compromis.</p>
 <p>Deux autres options par serveur n'ont pas encore de contrôle dans le tableau de
 bord : ajoutez-les à la main dans l'entrée de ce serveur dans
 <code>config.local.json</code> (voir <a href="#files">§17</a>), puis redémarrez.</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Clé</th><th>Notes</th></tr>
 <tr><td><code>bind_ip</code></td><td>Lie les connexions sortantes de ce serveur à une adresse locale précise, pour les machines multi-hébergées et les tunnels VPN partagés. La famille d'adresses choisit aussi la famille cible : une liaison v4 se connecte à l'adresse v4 du serveur.</td></tr>
 <tr><td><code>socks5</code></td><td>Fait passer le trafic NNTP de ce serveur par un proxy SOCKS5 : <code>host:port</code>, ou <code>user:pass@host:port</code>. Le nom d'hôte est résolu <em>par le proxy</em>, donc aucune fuite DNS locale.</td></tr>
-</table>
+</table></div>
 <ul>
 <li>La <b>coche</b> à côté de chaque serveur est son interrupteur : cochée, le serveur
 est dans le pool de téléchargement ; décochée, il est désactivé. Un serveur désactivé
@@ -594,7 +610,7 @@ ici est écrit dans <code>settings.json</code> et survit aux redémarrages (les 
 de l'interface l'emportent sur les options de ligne de commande).</p>
 
 <h3>Vitesse &amp; planification <span class="pill live">en direct</span></h3>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Réglage</th><th>Effet</th></tr>
 <tr><td>Limite de vitesse</td><td>Plafond en octets/s (<code>50M</code>, <code>1G</code>, 0 = illimité). Les applis distantes peuvent envoyer des pourcentages - définissez la <i>Vitesse de la ligne</i> pour qu'ils se traduisent correctement.</td></tr>
 <tr><td>Vitesse auto</td><td>Plafond régulé par RTT qui cède la place au reste du trafic du foyer et se ré-étend quand la ligne est calme.</td></tr>
@@ -603,7 +619,7 @@ de l'interface l'emportent sur les options de ligne de commande).</p>
 <tr><td>Mise à jour auto / URL de vérification des mises à jour</td><td>Voir <a href="#updates">§14</a>.</td></tr>
 <tr><td>Vitesse de la ligne</td><td>La vitesse nominale de votre connexion - active les limites en pourcentage depuis les applis compatibles SABnzbd.</td></tr>
 <tr><td>Planification hebdomadaire</td><td>Éditeur de règles horaires hebdomadaires : pause, reprise ou limite de vitesse à des jours/heures donnés (heure locale). Ex. : limiter à 20&nbsp;MB/s en semaine de 9 à 17 h, sans limite le reste du temps.</td></tr>
-</table>
+</table></div>
 
 <h3>Prochain téléchargement <span class="pill live">en direct</span></h3>
 <p><b>Connexions</b> (par serveur), <b>fenêtre</b> (profondeur de pipelining par
@@ -650,7 +666,7 @@ au fichier principal un nom propre et informatif : un film devient
 <code>Example Movie (2024)</code>, les séries gardent <code>Show - S01E02</code>. Les
 noms obscurcis ou non reconnus sont laissés exactement tels que postés plutôt que
 devinés.</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Réglage</th><th>Effet</th></tr>
 <tr><td>Inclure la résolution</td><td>Ajoute <code>1080p</code>, <code>2160p</code>… au nom. <b>Activé par défaut</b> ; les quatre autres marqueurs sont désactivés.</td></tr>
 <tr><td>Inclure le codec vidéo</td><td><code>x265</code>, <code>x264</code>, <code>AV1</code>…</td></tr>
@@ -660,7 +676,7 @@ devinés.</p>
 <tr><td>Supprimer les fichiers superflus</td><td><b>Activé par défaut.</b> Supprime les <code>.par2</code>, <code>.nzb</code>, <code>.sfv</code>, <code>.nfo</code> restants et les extraits d'échantillon des dossiers film/série terminés. Jamais la vidéo ni ses sous-titres.</td></tr>
 <tr><td>Ne garder que le fichier média</td><td><b>Désactivé par défaut, et destructeur :</b> supprime définitivement tout le dossier sauf la ou les vidéos et les sous-titres. Chaque épisode d'un pack de saison est conservé. Prend le pas sur <b>Supprimer les fichiers superflus</b> si les deux sont actifs.</td></tr>
 <tr><td>Keep the other words in the name</td><td><b>Activé par défaut.</b> Le sport, les courses et les autres événements sont souvent un même titre répété toute la saison, à un mot ou deux près - "Round11 Hungary Race" contre "Round11 Hungary Qualifying". Garder ces mots est ce qui empêche toute une saison de se réduire au même nom. Ne s'applique que là où le nom ne pouvait être mis au propre autrement, si bien que les films et épisodes ordinaires ne sont pas touchés.</td></tr>
-</table>
+</table></div>
 <p class="dim">L'ensemble s'exécute après réparation et décompression et avant
 <b>Déplacer les terminés vers</b>, et est entièrement sauté pour une tâche encore en
 attente de mot de passe. Les deux étapes de suppression ne s'appliquent
@@ -689,7 +705,7 @@ vous suivez des groupes précis où les gens postent encore sous de vrais noms, 
 vous voulez voir ce que votre fournisseur transporte réellement. Interrupteur éteint,
 rien n'est scanné ni récupéré, aucune base n'est créée, et le mur, Parcourir, la
 watchlist et le flux newznab sont masqués.</div>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Réglage</th><th>Effet</th></tr>
 <tr><td>Indexeur intégré</td><td>L'interrupteur principal, <b>éteint tant que vous ne l'allumez pas</b>. Éteint signifie aucun scan, aucune recherche de métadonnées, aucun échantillonnage de disponibilité et aucun flux newznab ; un index déjà sur le disque est conservé (il y a un bouton pour le supprimer), donc le rallumer reprend au lieu de tout rescanner.</td></tr>
 <tr><td>Groupes</td><td>Les newsgroups que l'indexeur intégré scanne (ex. <code>alt.binaries.teevee</code>).</td></tr>
@@ -701,7 +717,12 @@ watchlist et le flux newznab sont masqués.</div>
 <tr><td>Filtres d'ingestion</td><td>Règles JSON filtrant ce qui entre dans l'index : types (le tout-venant obfusqué est écarté par défaut), année/résolution/langue, bornes de taille.</td></tr>
 <tr><td>Scanner maintenant / rescan profond</td><td>Lance une passe immédiatement ; avec une profondeur, rescanne ce nombre d'en-têtes récents.</td></tr>
 <tr><td>Clé OMDb / rafraîchir les métadonnées / effacer</td><td>Contrôles d'enrichissement du mur (<a href="#wall">§6</a>). Effacer reconstruit la base de zéro - la voie de secours si elle est un jour corrompue.</td></tr>
-</table>
+<tr><td>Flux de pres</td><td><b>Désactivé tant que vous ne l'activez pas.</b> Beaucoup d'envois sont publiés sans leur nom, et une analyse n'a alors rien à lire. Des canaux de relais publics annoncent le vrai nom, seule voie ouverte pour rapprocher ces envois. Activer garde une connexion ouverte vers un réseau IRC et écoute : rien n'est jamais envoyé et aucun compte n'est créé. Exige l'indexeur actif, car un flux sans endroit où ranger ce qu'il entend n'est qu'une socket ouverte pour rien.</td></tr>
+<tr><td>Serveur de relais, Canaux de relais</td><td>Le réseau IRC qui porte les annonces (hôte ou hôte:port) et les canaux à écouter, séparés par des virgules. Un changement prend effet à la connexion suivante : coupez puis rallumez le flux pour l'appliquer tout de suite.</td></tr>
+<tr><td>Nommer par corrélation</td><td>Les relais publics en direct ne portent aucun nom de fichier, donc la plupart des envois obscurcis ne peuvent pas être rapprochés directement. Ce qu'une annonce fixe, en revanche, c'est le moment d'apparition d'une release et sa taille. Ceci compare l'heure et la taille annoncées aux envois sans nom et, quand cela concorde, propose le vrai nom dans Parcourir. Une suggestion est signalée comme telle, demande votre clic, et ne renomme jamais de fichier sur le disque.</td></tr>
+<tr><td>Appliquer automatiquement les correspondances fortes</td><td>Désactivé par défaut, et strict une fois actif : la taille doit concorder étroitement, aucune autre annonce ne doit convenir presque aussi bien, et l'annonce doit choisir cet envoi en retour lors du contrôle inverse. Un nom appliqué ne change que l'affichage, il est marqué comme déduit, et il se retire tout seul si un téléchargement terminé le contredit. Tout ce qui est plus faible reste une suggestion.</td></tr>
+<tr><td>Historique des annonces</td><td>Le flux en direct n'entend que les annonces postérieures à son activation. Ceci récupère environ six mois d'annonces passées auprès d'une base de pres publique, poliment et une seule fois, pour que les envois déjà indexés puissent aussi être rapprochés. Tourne en arrière-plan une demi-heure environ.</td></tr>
+</table></div>
 
 <h3>Bibliothèque, Sécurité, Interface</h3>
 <p><b>Bibliothèque</b> : catégories traitées comme entrées de bibliothèque
@@ -715,17 +736,19 @@ tailles de fichiers restent en octets. C'est une propriété du daemon, pas de v
 navigateur : cela vaut donc pour tous les appareils qui regardent cette
 installation.</p>
 <h3>Avancé : réglages sans contrôle dans le tableau de bord</h3>
-<p>Quatre réglages n'ont ni contrôle dans l'interface ni option de ligne de commande.
+<p>Six réglages n'ont ni contrôle dans l'interface ni option de ligne de commande.
 Passez par l'API (<a href="#api">§16</a>), p. ex.
 <code>/api?mode=config&amp;name=verify_mode&amp;value=lean&amp;apikey=…</code>. Comme
 tous les autres, ils sont écrits dans <code>settings.json</code>.</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Nom</th><th>Effet</th></tr>
 <tr><td><code>verify_mode</code></td><td><code>full</code> | <code>fast</code> | <code>lean</code> (<code>fast</code> par défaut). <code>lean</code> est le coup de pouce pour processeur lent : comme fast, mais en sautant aussi le CRC yEnc par article dès que PAR2 couvre un fichier, soit une couche de CRC32 au lieu de deux. Les téléchargements sans PAR2 gardent leurs CRC d'articles, et la vérification et la réparation de fin de tâche sont inchangées dans tous les cas. La <b>Vérification rapide</b> ci-dessus est le même contrôle pour full contre fast.</td></tr>
 <tr><td><code>auto_retry_mins</code></td><td>Délai avant l'<em>unique</em> nouvelle tentative automatique accordée à un premier échec pour articles manquants (20 par défaut). Le retard de propagation est une vraie cause d'articles manquants et se résorbe seul ; grâce au journal, la reprise ne récupère que ce qui manque encore. Les échecs pour mot de passe ou retrait n'y ont jamais droit.</td></tr>
 <tr><td><code>index_scan_par</code></td><td>Nombre de groupes analysés en parallèle par l'indexeur (3 par défaut, borné à 1-8).</td></tr>
 <tr><td><code>oracle_sample</code></td><td>Budget de STAT au repos de l'oracle de disponibilité (<a href="#oracle">§13</a>), sondes par heure et par serveur. 300 par défaut, 3600 au maximum, <code>0</code> désactive complètement l'échantillonnage.</td></tr>
-</table>
+<tr><td><code>predb_max_rows</code></td><td>Nombre d'annonces pre conservées dans la table du flux (250000 par défaut, borné à 10000-5000000). Le nettoyage horaire ramène la table à ce nombre et l'import historique refuse de démarrer s'il devait le dépasser, de sorte qu'un import n'ajoute jamais des lignes que le nettoyage suivant effacerait.</td></tr>
+<tr><td><code>predb_seed_days</code></td><td>Profondeur d'historique atteinte par un import de départ lancé sans fenêtre propre (180 jours par défaut, 366 au maximum). Une fenêtre plus large signifie plus de requêtes vers la source pre, cadencée à une toutes les deux secondes.</td></tr>
+</table></div>
 <h2 id="automation">10 · Automatisation</h2>
 <h3>Liste de suivi</h3>
 <p>L'automatisation la plus simple : ajoutez un titre sur le tableau de bord, réglez
@@ -785,23 +808,23 @@ fichier.</div>
 donc presque toutes les applis mobiles/tablette fonctionnent. Choisissez le protocole
 que votre appli prend en charge :</p>
 <h3>Applis qui parlent NZBGet (nzb360, LunaSea, NZB Unity…)</h3>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Champ dans l'appli</th><th>Valeur</th></tr>
 <tr><td>Type</td><td>NZBGet</td></tr>
 <tr><td>Hôte / port</td><td>votre machine : <b>6789</b></td></tr>
 <tr><td>Nom d'utilisateur</td><td>n'importe lequel (ex. <code>nzbfast</code>)</td></tr>
 <tr><td>Mot de passe</td><td>votre <b>clé API</b></td></tr>
-</table>
+</table></div>
 <p>Toute la surface JSON-RPC utilisée par ces applis est servie : statut, file avec
 réordonnancement/pause/suppression, historique, ajout de NZB, limite de vitesse,
 pause/reprise, journal.</p>
 <h3>Applis qui parlent SABnzbd</h3>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Champ dans l'appli</th><th>Valeur</th></tr>
 <tr><td>Type</td><td>SABnzbd</td></tr>
 <tr><td>Hôte / port</td><td>votre machine : <b>6789</b></td></tr>
 <tr><td>Clé API</td><td>votre clé API (ou la clé NZB pour un accès ajout seul)</td></tr>
-</table>
+</table></div>
 <h3>Le tableau de bord sur votre téléphone</h3>
 <p>Ouvrez simplement <code>http://&lt;machine&gt;:6789</code> dans un navigateur
 mobile - tout le tableau de bord et le mur ont une mise en page tactile. Le panneau
@@ -879,13 +902,13 @@ pas gratuit, et sur les grosses tâches il se mesure.</p>
 <p>Mesuré sur une seule machine et une seule ligne (M1 Ultra, 10 GbE), mêmes fichiers
 à chaque budget. Chaque exécution a produit un résultat correct, entièrement vérifié
 et extrait :</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Taille de la tâche</th><th>RAM abondante</th><th>Budget 2 GB<br><span class="dim">≈ machine 8 GB</span></th><th>Budget 1 GB<br><span class="dim">≈ machine 4 GB</span></th><th>Budget 256 MB<br><span class="dim">≈ NAS 2 GB</span></th></tr>
 <tr><td>7 GB</td><td>15 s</td><td>15 s</td><td>15 s</td><td>15 s</td></tr>
 <tr><td>35 GB</td><td>65 s</td><td>70 s</td><td>70 s</td><td>65 s</td></tr>
 <tr><td>87 GB</td><td>148 s</td><td>206 s <span class="dim">+39%</span></td><td>196 s <span class="dim">+32%</span></td><td>180 s <span class="dim">+22%</span></td></tr>
 <tr><td>190 GB</td><td>330 s</td><td>427 s <span class="dim">+29%</span></td><td>402 s <span class="dim">+22%</span></td><td>411 s <span class="dim">+25%</span></td></tr>
-</table>
+</table></div>
 <p>Le pic mémoire suit le <em>budget</em>, pas la tâche : ce téléchargement de
 190 GB se termine dans environ 1.1 GB de RAM. Ce que vous échangez contre cela,
 c'est du temps - et seulement sur les grosses tâches.</p>
@@ -940,9 +963,63 @@ officielle (le lien est figé dans l'app, il ne vient jamais du manifeste de mis
 manifeste de mise à jour ; une URL de vérification vide fait pareil.</li>
 </ul>
 
+<h3 id="updating">Mettre à jour sans perdre vos paramètres</h3>
+<p>Une seule règle couvre toutes les installations : <b>une mise à jour remplace
+le programme, jamais vos paramètres.</b> Tout ce que vous avez configuré -
+serveurs, chemins, clé API, file - vit dans une poignée de fichiers d'un seul
+dossier (<a href="#files">§17</a>), et aucun installateur, récupération d'image
+ou mise à niveau de paquet ne touche à ce dossier. Quand les paramètres semblent
+tout de même disparus après une mise à jour, c'est presque toujours parce que la
+nouvelle installation lit un dossier <em>différent, vide</em>, pas parce que quoi
+que ce soit a été supprimé ; les anciens fichiers sont toujours là où ils ont
+toujours été. <a href="#settings-gone">§18</a> donne les étapes de
+récupération.</p>
+<div class="tblwrap"><table>
+<tr><th>Installation</th><th>Comment mettre à jour</th></tr>
+<tr><td>App macOS</td><td>Ouvrez le nouveau DMG et faites glisser
+<b>NzbFast</b> dans <b>Applications</b>, en remplaçant l'ancienne. Votre dossier
+de données est séparé et n'est pas touché.</td></tr>
+<tr><td>Installateur Windows</td><td>Lancez le nouveau programme d'installation
+par-dessus l'installation existante. Votre dossier de données est séparé et
+n'est pas touché.</td></tr>
+<tr><td>Docker (ligne de commande)</td><td><code>docker pull nzbfast/nzbfast</code>,
+supprimez l'ancien conteneur, puis lancez le nouveau avec <b>exactement les mêmes
+montages <code>-v</code></b>. L'image est jetable ; le dossier
+<code>/config</code> monté est votre installation. Si votre commande de lancement
+utilise un chemin relatif comme <code>-v ./config:/config</code>, exécutez-la
+depuis le même répertoire à chaque fois - depuis n'importe où ailleurs,
+<code>./config</code> est un dossier différent, vide.</td></tr>
+<tr><td>Docker Compose</td><td><code>docker compose pull &amp;&amp; docker compose
+up -d</code>, avec le même fichier compose au même endroit. Le
+<code>./config</code> du fichier est ancré au dossier du fichier lui-même, donc
+laissez le fichier là où il est.</td></tr>
+<tr><td>Watchtower</td><td>Rien à faire : il recrée le conteneur avec les mêmes
+montages quand une nouvelle image sort.</td></tr>
+<tr><td>Unraid</td><td>Onglet Docker → <b>Check for Updates</b> → <b>Apply
+Update</b>. Ne mettez jamais à jour en supprimant puis réajoutant l'app ; si un
+jour vous réinstallez vraiment, gardez le même chemin appdata pour qu'elle
+retrouve votre <code>/config</code> existant.</td></tr>
+<tr><td>Synology (Container Manager)</td><td>Téléchargez la nouvelle image,
+arrêtez le conteneur et recréez-le avec les mêmes réglages de volumes - le guide
+Synology détaille l'opération clic par clic, y compris la façon de le faire
+selon une planification.</td></tr>
+<tr><td>Synology (paquet)</td><td>Installez le nouveau <code>.spk</code> dans
+Package Center ; il se met à niveau sur place.</td></tr>
+<tr><td>Homebrew</td><td><code>brew upgrade nzbfast</code></td></tr>
+<tr><td>Binaire simple</td><td>Remplacez le binaire. Votre config reste là où
+vous l'avez créée (<a href="#files">§17</a>).</td></tr>
+</table></div>
+<div class="tip"><b>Astuce</b>Utilisateurs Docker qui branchent Sonarr ou
+Radarr : mettez la clé API dans la définition du conteneur elle-même
+(<code>-e NZBFAST_APIKEY=…</code>, ou le bloc environment de votre fichier
+compose ou de votre template Unraid). Une clé stockée là survit à n'importe
+quelle mésaventure du conteneur, car elle vit sur l'hôte, dans la définition, et
+est réappliquée à chaque démarrage. Une clé que vous définissez plus tard dans
+les Paramètres garde tout de même la priorité sur elle.</div>
+
 <h2 id="cli">15 · Ligne de commande</h2>
 <p>Tout ce que fait le daemon est aussi scriptable. Les commandes de tous les jours :</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Commande</th><th>Rôle</th></tr>
 <tr><td><code>nzbfast setup</code></td><td>Configuration interactive des serveurs.</td></tr>
 <tr><td><code>nzbfast serve</code></td><td>Lance le daemon (tableau de bord + API + automatisation). <code>--open</code> ouvre le navigateur ; <code>--apikey</code> fixe la clé à la main (<a href="#firstrun-key">§2</a>) ; <code>--bind</code> choisit l'adresse d'écoute, par défaut <code>0.0.0.0</code> (toutes les interfaces), <code>127.0.0.1</code> pour cette machine seulement. Voir <code>--help</code> pour la liste complète des drapeaux - chaque réglage du tableau de bord a son jumeau en drapeau.</td></tr>
@@ -952,10 +1029,11 @@ manifeste de mise à jour ; une URL de vérification vide fait pareil.</li>
 <tr><td><code>nzbfast sysbench</code></td><td>Le benchmark système + le rapport de diversité, dans le terminal.</td></tr>
 <tr><td><code>nzbfast index / search</code></td><td>Scanne des groupes dans l'index / le cherche, sans le daemon.</td></tr>
 <tr><td><code>nzbfast import-sab</code></td><td>Importe les serveurs depuis un ini SABnzbd.</td></tr>
-</table>
+</table></div>
 <p class="dim">Également disponibles : <code>inspect</code>, <code>probe</code>,
 <code>bench</code>, <code>bench-cpu</code>, <code>soak</code>, <code>fetch</code>,
 <code>spots</code>/<code>spot-search</code>/<code>spot-get</code> (Spotnet),
+<code>predb-seed</code> (remplit la base de pres d'avant l'activation du flux),
 <code>make-release-nzb</code>/<code>make-test-nzb</code> (fixtures de test). Chaque
 commande accepte <code>--config</code> et <code>--help</code>. S'y ajoute <code>post</code> : il téléverse des
 fichiers en articles yEnc et écrit le NZB correspondant. Outil d'exploitation, il exige
@@ -967,7 +1045,7 @@ place.</p>
 compatible SABnzbd, donc les intégrations SAB existantes fonctionnent sans
 changement. Deux clés : la <b>clé API</b> (contrôle total) et la <b>clé NZB</b>
 (ajout seul : <code>addfile</code>/<code>addurl</code>). <code>addnzblnk</code> ne fait délibérément pas partie de l'ensemble en ajout seul : résoudre un lien peut consommer du quota d'indexeur facturé, ce qui n'est pas l'affaire d'un identifiant en ajout seul.</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Domaine</th><th>Modes</th></tr>
 <tr><td>File</td><td><code>queue</code> (avec <code>name=delete/pause/resume/priority/switch</code>), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>addnzblnk</code>, <code>retry</code>, <code>set_password</code></td></tr>
 <tr><td>Infos</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code></td></tr>
@@ -977,10 +1055,25 @@ changement. Deux clés : la <b>clé API</b> (contrôle total) et la <b>clé NZB<
 <tr><td>Diagnostics</td><td><code>sysbench</code>, <code>bench_history</code>, <code>connladder</code>, <code>pooltest</code>, <code>diversity</code>, <code>update_check</code>, <code>update_apply</code></td></tr>
 <tr><td>NZBGet JSON-RPC</td><td><code>/jsonrpc</code> - status, listgroups, history, append, editqueue, rate, pause, log (auth Basic : n'importe quel utilisateur, la clé API comme mot de passe)</td></tr>
 <tr><td>Aperçu / lecture</td><td><code>/stream/&lt;nzo_id&gt;</code> (plages HTTP ; démarrer une tâche de bibliothèque en attente exige le jeton <code>?t=</code> ou la clé), <code>/m3u/&lt;id&gt;</code> (exige la clé ; génère le jeton), <code>/wall</code>, <code>/art/…</code></td></tr>
-</table>
+</table></div>
 
 <h2 id="files">17 · Fichiers &amp; emplacements</h2>
-<table>
+<p>L'emplacement du dossier des paramètres dépend de la façon dont nzbfast a été
+installé. Ce seul dossier contient tout ce qui mérite une sauvegarde :</p>
+<div class="tblwrap"><table>
+<tr><th>Installation</th><th>Dossier des paramètres</th></tr>
+<tr><td>App macOS</td><td><code>~/Library/Application Support/nzbfast/</code></td></tr>
+<tr><td>Windows</td><td><code>%LOCALAPPDATA%\nzbfast\</code></td></tr>
+<tr><td>Docker / conteneurs NAS</td><td><code>/config</code> à l'intérieur du
+conteneur, c'est-à-dire le dossier de l'hôte que vous y avez monté. Sur Unraid,
+c'est le dossier appdata de l'app.</td></tr>
+<tr><td>Paquet Synology</td><td><code>/var/packages/nzbfast/var/</code></td></tr>
+<tr><td>Terminal</td><td>Le dossier dans lequel vous avez lancé
+<code>nzbfast setup</code>, ou l'endroit vers lequel pointe <code>--config</code>
+/ <code>$NZBFAST_CONFIG</code>.</td></tr>
+</table></div>
+<p>Et ce qu'il contient :</p>
+<div class="tblwrap"><table>
 <tr><th>Fichier</th><th>Contenu</th></tr>
 <tr><td><code>config.local.json</code></td><td>Identifiants des serveurs et options par serveur. Créé par l'assistant ; modifiable dans les Paramètres. Gardez-le privé. Les mots de passe sont <a href="#passwords">obscurcis, pas chiffrés</a>.</td></tr>
 <tr><td><code>settings.json</code></td><td>Chaque réglage modifié dans le tableau de bord. Vit à côté de la config ; les valeurs de l'interface priment sur les drapeaux de ligne de commande. Supprimez une clé (ou le fichier) pour retomber sur les drapeaux/valeurs par défaut.</td></tr>
@@ -989,10 +1082,10 @@ changement. Deux clés : la <b>clé API</b> (contrôle total) et la <b>clé NZB<
 <tr><td><code>&lt;config&gt;/.spool/</code></td><td>État de la file (survit aux redémarrages), NZB par tâche, registre de consommation, historique des benchmarks, cache des affiches.</td></tr>
 <tr><td>Journal d'articles</td><td>Dans le dossier de sortie de chaque tâche tant qu'elle est incomplète - alimente la reprise après crash et le réessai. Supprimé en cas de succès.</td></tr>
 <tr><td>Outils externes</td><td>Aucun n'est nécessaire - l'extraction RAR et la réparation PAR2 sont natives. Si un jeu exotique nécessite un jour un <code>unrar</code> ou <code>par2</code> externe en repli, nzbfast regarde à côté de son exécutable, puis dans <code>$PATH</code>.</td></tr>
-</table>
+</table></div>
 
 <h2 id="troubleshooting">18 · Dépannage</h2>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Symptôme</th><th>À vérifier</th></tr>
 <tr><td>Téléchargements lents</td><td>Lancez le <b>Benchmark système</b> - il nomme le goulot d'étranglement sans détour. Si c'est le réseau : lancez le <b>Réglage des connexions</b>, vérifiez le nombre de connexions par serveur, et assurez-vous que vos fournisseurs ne sont pas tous sur le même backbone (<b>Diversité des serveurs</b>).</td></tr>
 <tr><td>Lent seulement sur les très grosses tâches<br>(NAS ou machine avec peu de RAM)</td><td>Attendu, et mesurable : un budget mémoire trop maigre fait déborder les caches sur disque et coûte 20–40 % au-delà de ~87 GB. Voir <a href="#memory">Budget mémoire</a> pour les chiffres et la RAM à lui donner. Les tâches plus petites ne sont pas affectées.</td></tr>
@@ -1004,12 +1097,13 @@ pour trait et se résorbe seul.</td></tr>
 <tr><td>Une archive ne se décompresse pas</td><td>Les échecs de mot de passe et de réparation se nomment eux-mêmes dans la ligne d'Historique. Pour tout le reste il existe une porte de sortie : Paramètres → Dossier surveillé &amp; post-traitement → <b>Décompresser avec l'unrar externe</b> (un réglage avancé) confie la décompression au programme <code>unrar</code> installé sur votre machine au lieu de l'extracteur intégré. Laissez-le désactivé sinon : le chemin intégré est plus rapide sur toutes les formes que nous avons mesurées, et les publications obfusquées aux noms hachés l'utilisent de toute façon toujours, car unrar ne peut pas suivre leur renommage. Le même interrupteur pour les exécutions <code>nzbfast get</code> est la variable d'environnement <code>NZBFAST_NO_NATIVE_UNRAR=1</code>. Si unrar décompresse une archive que l'extracteur intégré a refusée, merci de le signaler pour que nous corrigions le chemin intégré.</td></tr>
 <tr><td>Sonarr/Radarr ne se connecte pas</td><td>Port 6789 joignable ? Clé API correcte (la clé complète, pas la clé NZB) ? Type de client réglé sur SABnzbd ?</td></tr>
 <tr><td>Le tableau de bord réclame une clé API que je n'ai jamais définie</td><td>Une nouvelle installation s'en fabrique une et l'affiche une fois au démarrage (<a href="#firstrun-key">§2</a>). Elle est dans le fichier <code>apikey</code> à côté de votre config, et dans la sortie de démarrage. Ou saisissez votre propre clé dans Paramètres → Sécurité depuis un navigateur déjà connecté.</td></tr>
+<tr id="settings-gone"><td>Tous mes paramètres semblent disparus après une mise à jour<br>(serveurs, chemins, clé API)</td><td>Rien dans une mise à jour ne supprime des paramètres ; cela signifie que nzbfast lit un dossier différent, vide. D'abord : le champ de la clé API dans les Paramètres s'affiche vide à dessein - cliquez sur <b>Show</b> avant de conclure qu'elle est perdue. Sur Docker, comparez le montage <code>/config</code> du nouveau conteneur avec celui de l'ancien : un chemin hôte modifié, un chemin relatif lancé depuis un autre répertoire ou un dossier appdata tout neuf font tous repartir nzbfast de zéro pendant que vos vrais paramètres restent intacts au chemin précédent. Retrouvez l'ancien dossier (cherchez <code>settings.json</code>, votre fichier de config et <code>apikey</code> - les emplacements sont en <a href="#files">§17</a>), puis soit repointez le montage vers lui, soit copiez ces fichiers dans le nouveau dossier et redémarrez. Le journal de démarrage nomme le fichier de paramètres exact en usage : <code>[settings] applying saved settings from …</code></td></tr>
 <tr><td>Rien sur le réseau n'arrive à joindre le daemon</td><td>Vérifiez <code>--bind</code> : <code>127.0.0.1</code> ne sert que la machine où tourne nzbfast. La valeur par défaut, <code>0.0.0.0</code>, sert toutes les interfaces. Vérifiez ensuite le pare-feu de la machine pour le port 6789.</td></tr>
 <tr><td>La carte Parcourir reste maigre</td><td>L'indexeur grandit en arrière-plan - vérifiez que les groupes sont définis dans Paramètres → Indexation, et laissez à Approfondir par scan le temps d'accumuler l'historique. « Scanner maintenant » force une passe ; la ligne d'état montre la progression en direct.</td></tr>
 <tr><td>Le mur montre une mauvaise affiche / aucune</td><td>Fiche détaillée → ✎ Corriger ou ↻ Rafraîchir les métadonnées. L'identification des films s'améliore avec une clé OMDb gratuite.</td></tr>
 <tr><td>Le daemon ne démarre pas : port occupé</td><td>Une autre instance tourne - ou changez <code>--port</code>.</td></tr>
 <tr><td>Où sont les journaux ?</td><td>La carte Journal du tableau de bord, ou le terminal/fichier de log avec lequel vous avez lancé <code>serve</code>.</td></tr>
-</table>
+</table></div>
 <div class="note"><b>Toujours bloqué ?</b>La carte Journal nomme généralement le
 coupable - joignez sa fin quand vous signalez un problème, avec votre
 <code>nzbfast --version</code>.</div>

@@ -141,6 +141,49 @@ impl ArchiveSource {
         }
     }
 
+    /// [`range_reader`](Self::range_reader) without the borrow.
+    ///
+    /// The growing split chain (`extract_volume_sequence_to`'s incremental
+    /// path) holds a cursor over volume k's fragment while it keeps pulling
+    /// volume k+1 into the same `Vec<Archive>` - a borrowing reader would
+    /// pin that Vec against the push. Every variant can serve one range
+    /// from an owned handle, so the chain carries no lifetime at all.
+    pub(crate) fn owned_range_reader(&self, range: Range<usize>) -> Result<OwnedRangeReader> {
+        if range.start > range.end {
+            return Err(Error::TooShort);
+        }
+        match self {
+            Self::Memory(data) => {
+                if range.end > data.len() {
+                    return Err(Error::TooShort);
+                }
+                Ok(OwnedRangeReader::Memory {
+                    data: Arc::clone(data),
+                    pos: range.start,
+                    end: range.end,
+                })
+            }
+            Self::File(path) => {
+                let mut file = File::open(path.as_ref())?;
+                file.seek(SeekFrom::Start(range.start as u64))?;
+                Ok(OwnedRangeReader::File {
+                    file,
+                    remaining: range.len() as u64,
+                })
+            }
+            Self::Stream { source, len } => {
+                if range.end > *len {
+                    return Err(Error::TooShort);
+                }
+                Ok(OwnedRangeReader::Stream {
+                    source: Arc::clone(source),
+                    pos: range.start as u64,
+                    end: range.end as u64,
+                })
+            }
+        }
+    }
+
     pub(crate) fn len(&self) -> Result<usize> {
         match self {
             Self::Memory(data) => Ok(data.len()),
@@ -155,6 +198,70 @@ impl ArchiveSource {
             Self::Memory(data) => Ok(data.to_vec()),
             Self::File(path) => Ok(std::fs::read(path.as_ref())?),
             Self::Stream { len, .. } => self.read_range(0..*len),
+        }
+    }
+}
+
+/// Sequential `Read` over one range of a source, owning whatever handle it
+/// needs - see [`ArchiveSource::owned_range_reader`]. A file-backed reader
+/// holds exactly one descriptor and the caller drops it before opening the
+/// next range, so descriptor use stays O(1) over a many-fragment member.
+#[derive(Debug)]
+pub(crate) enum OwnedRangeReader {
+    Memory {
+        data: Arc<[u8]>,
+        pos: usize,
+        end: usize,
+    },
+    File {
+        file: File,
+        remaining: u64,
+    },
+    Stream {
+        source: Arc<dyn BlockingRangeSource>,
+        pos: u64,
+        end: u64,
+    },
+}
+
+impl Read for OwnedRangeReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        match self {
+            Self::Memory { data, pos, end } => {
+                let take = buf.len().min(*end - *pos);
+                if take == 0 {
+                    return Ok(0);
+                }
+                buf[..take].copy_from_slice(&data[*pos..*pos + take]);
+                *pos += take;
+                Ok(take)
+            }
+            Self::File { file, remaining } => {
+                let take = buf
+                    .len()
+                    .min(usize::try_from(*remaining).unwrap_or(usize::MAX));
+                if take == 0 {
+                    return Ok(0);
+                }
+                let read = file.read(&mut buf[..take])?;
+                *remaining -= read as u64;
+                Ok(read)
+            }
+            Self::Stream { source, pos, end } => {
+                let remaining = end.saturating_sub(*pos);
+                if remaining == 0 {
+                    return Ok(0);
+                }
+                let take = buf
+                    .len()
+                    .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+                let read = source.read_at(*pos, &mut buf[..take])?;
+                *pos += read as u64;
+                Ok(read)
+            }
         }
     }
 }

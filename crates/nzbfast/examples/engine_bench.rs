@@ -22,7 +22,10 @@ fn main() -> anyhow::Result<()> {
             let mut par2_bytes: Vec<Vec<u8>> = Vec::new();
             for entry in std::fs::read_dir(&dir)? {
                 let path = entry?.path();
-                if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("par2")) {
+                if path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("par2"))
+                {
                     par2_bytes.push(std::fs::read(&path)?);
                 }
             }
@@ -39,7 +42,10 @@ fn main() -> anyhow::Result<()> {
                     Err(_) => bad_total += 1,
                 }
             }
-            println!("verify: {} file(s), {bad_total} bad block(s)/missing", set.files.len());
+            println!(
+                "verify: {} file(s), {bad_total} bad block(s)/missing",
+                set.files.len()
+            );
         }
         "extract" => {
             let first = PathBuf::from(args.get(3).expect("extract needs <first-volume>"));
@@ -53,13 +59,21 @@ fn main() -> anyhow::Result<()> {
 
 fn extract_volumes(dir: &Path, first: &Path) -> anyhow::Result<()> {
     use nzbkit::extract::{release_stem, vol_sort_key};
-    let first_name = first.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let first_name = first
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
     // Lowercased to match the `name` side below - see `stem_volume_set`.
     let stem = release_stem(&first_name.to_lowercase());
     let mut volumes: Vec<PathBuf> = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
-        let name = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
         let by_name = name.ends_with(".rar")
             || (name.rfind('.').is_some_and(|p| {
                 let t = &name[p + 1..];
@@ -69,11 +83,12 @@ fn extract_volumes(dir: &Path, first: &Path) -> anyhow::Result<()> {
             volumes.push(path);
         }
     }
-    volumes.sort_by_cached_key(|p| vol_sort_key(&p.file_name().unwrap_or_default().to_string_lossy()));
+    volumes
+        .sort_by_cached_key(|p| vol_sort_key(&p.file_name().unwrap_or_default().to_string_lossy()));
     anyhow::ensure!(!volumes.is_empty(), "no volumes for {first_name}");
     let archives = volumes
         .iter()
-        .map(|path| rars::ArchiveReader::read_path(path))
+        .map(rars::ArchiveReader::read_path)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| anyhow::anyhow!("parsing volumes: {e}"))?;
     let out = dir.join("extracted");
@@ -87,9 +102,15 @@ fn extract_volumes(dir: &Path, first: &Path) -> anyhow::Result<()> {
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        Ok(Box::new(std::io::BufWriter::new(std::fs::File::create(target)?)))
+        Ok(Box::new(std::io::BufWriter::new(std::fs::File::create(
+            target,
+        )?)))
     })
     .map_err(|e| anyhow::anyhow!("{e}"))?;
-    println!("extracted {} volume set to {}", volumes.len(), out.display());
+    println!(
+        "extracted {} volume set to {}",
+        volumes.len(),
+        out.display()
+    );
     Ok(())
 }

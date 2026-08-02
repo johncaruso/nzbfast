@@ -257,7 +257,7 @@ pub(crate) fn normalise_lang(raw: &str) -> Option<String> {
 /// that a linear scan beats a set, and order is worth keeping: the first
 /// audio track is the one a player picks.
 pub(crate) fn push_unique(list: &mut Vec<String>, v: String) {
-    if !v.is_empty() && !list.iter().any(|x| *x == v) {
+    if !v.is_empty() && !list.contains(&v) {
         list.push(v);
     }
 }

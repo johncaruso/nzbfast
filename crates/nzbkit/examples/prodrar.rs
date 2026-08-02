@@ -20,7 +20,10 @@ use std::path::PathBuf;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let dir = PathBuf::from(args.next().expect("usage: prodrar <voldir> <outdir> [password]"));
+    let dir = PathBuf::from(
+        args.next()
+            .expect("usage: prodrar <voldir> <outdir> [password]"),
+    );
     let out = PathBuf::from(args.next().expect("need an output directory"));
     let password = args.next();
 

@@ -638,6 +638,10 @@ fn encode_filter_data(
     }
 }
 
+/// Returns the packed blocks and the LZ window as it stands after the last
+/// block. That window holds the FILTERED chunks, which is what the decoder
+/// keeps, so the caller can assign it straight onto the encoder history.
+/// Its trim rule must stay identical to `Unpack50Encoder::remember`.
 fn filtered_lz_blocks(
     data: &[u8],
     filters: &[Rar50FilterSpec],
@@ -645,7 +649,7 @@ fn filtered_lz_blocks(
     algorithm_version: u8,
     options: EncodeOptions,
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, Vec<u8>)> {
     let filters = normalized_filter_specs(data.len(), filters)?;
     let mut out = Vec::new();
     let mut block_history =
@@ -695,7 +699,7 @@ fn filtered_lz_blocks(
         }
         chunk_start = chunk_end;
     }
-    Ok(out)
+    Ok((out, block_history))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -991,7 +995,7 @@ impl Unpack50Encoder {
         filters: &[Rar50FilterSpec],
     ) -> Result<Vec<u8>> {
         if input.len() > MAX_FILTER_BLOCK_LENGTH {
-            let packed = filtered_lz_blocks(
+            let (packed, history) = filtered_lz_blocks(
                 input,
                 filters,
                 &self.history,
@@ -999,7 +1003,7 @@ impl Unpack50Encoder {
                 self.options,
                 None,
             )?;
-            self.remember(input);
+            self.history = history;
             return Ok(packed);
         }
         let (filtered, records) = filtered_lz_member(input, filters)?;
@@ -1011,7 +1015,10 @@ impl Unpack50Encoder {
             self.options,
             None,
         )?;
-        self.remember(input);
+        // The window a solid successor is compressed against is what the
+        // decoder keeps, and the decoder keeps the LZ output: the filtered
+        // bytes, not `input`.
+        self.remember(&filtered);
         Ok(packed)
     }
 
@@ -1022,27 +1029,29 @@ impl Unpack50Encoder {
         filters: &[Rar50FilterSpec],
         progress: &mut dyn FnMut(usize) -> bool,
     ) -> Result<Vec<u8>> {
-        let packed = if input.len() > MAX_FILTER_BLOCK_LENGTH {
-            filtered_lz_blocks(
+        if input.len() > MAX_FILTER_BLOCK_LENGTH {
+            let (packed, history) = filtered_lz_blocks(
                 input,
                 filters,
                 &self.history,
                 algorithm_version,
                 self.options,
                 Some(progress),
-            )?
-        } else {
-            let (filtered, records) = filtered_lz_member(input, filters)?;
-            encode_lz_member_inner(
-                &filtered,
-                &self.history,
-                algorithm_version,
-                &records,
-                self.options,
-                Some(progress),
-            )?
-        };
-        self.remember(input);
+            )?;
+            self.history = history;
+            return Ok(packed);
+        }
+        let (filtered, records) = filtered_lz_member(input, filters)?;
+        let packed = encode_lz_member_inner(
+            &filtered,
+            &self.history,
+            algorithm_version,
+            &records,
+            self.options,
+            Some(progress),
+        )?;
+        // See `encode_member_with_filters`: remember the filtered bytes.
+        self.remember(&filtered);
         Ok(packed)
     }
 
@@ -2322,9 +2331,21 @@ impl StreamingOutput {
         // Filter hold-back headroom is likewise added lazily on the first
         // declared filter (most members have none; this keeps steady-state RSS
         // down).
-        let initial_window = history_limit
+        let mut initial_window = history_limit
             .min(STREAM_INITIAL_WINDOW_CAP)
             .max(history.len());
+        // A large-dictionary member whose output covers the window WILL grow
+        // the ring to its ceiling: decoded output reaches past the initial
+        // cap almost immediately, and the growth then holds both rings
+        // resident across a live-window copy - measured as the RSS peak of
+        // the whole extraction (128 MiB initial + 256 MiB grown for a
+        // 128 MiB dictionary). Start at the ceiling instead: the pages are
+        // untouched until the head actually reaches them, so a stream that
+        // never looks far back pays nothing, and one that does skips the
+        // copy and the double-residency.
+        if history_limit > STREAM_INITIAL_WINDOW_CAP && output_limit >= history_limit {
+            initial_window = history_limit;
+        }
         let capacity = (initial_window + 2 * STREAM_FLUSH_THRESHOLD)
             .next_power_of_two()
             .max(2 * STREAM_FLUSH_THRESHOLD);
@@ -6063,6 +6084,23 @@ mod tests {
         assert!(matches!(error, StreamDecodeError::FilteredMember));
     }
 
+    #[test]
+    fn a_large_dictionary_member_sizes_its_ring_once() {
+        // Growth to the ceiling used to hold the initial and the grown ring
+        // resident together across a live-window copy - the RSS peak of a
+        // 128 MiB-dictionary extraction. A member whose output covers the
+        // window now starts at the ceiling and must never grow.
+        let dict = 2 * STREAM_INITIAL_WINDOW_CAP;
+        let output = StreamingOutput::new(Vec::new(), 0, 4 * dict, dict, dict);
+        let ceiling = (dict + 2 * STREAM_FLUSH_THRESHOLD + STREAM_FILTER_HOLD_LIMIT)
+            .next_power_of_two();
+        assert_eq!(output.ring.len(), ceiling);
+
+        // A small member declaring the same dictionary keeps the lazy start.
+        let small = StreamingOutput::new(Vec::new(), 0, 1 << 20, dict, dict);
+        assert!(small.ring.len() < ceiling);
+    }
+
     /// Byte-at-a-time LZ reference: `out[i] = out[len - distance + i]`,
     /// overlap included - the semantics every copy path must reproduce.
     fn reference_extend(stream: &mut Vec<u8>, distance: usize, length: usize) {
@@ -6680,6 +6718,56 @@ mod tests {
                 .unwrap(),
             data
         );
+    }
+
+    /// `e8 <rel32>` call records, i.e. data an E8 filter really rewrites, so
+    /// the filtered stream differs from the input.
+    fn e8_call_records(len: usize) -> Vec<u8> {
+        let mut data = Vec::with_capacity(len + 5);
+        let mut word = 0u32;
+        while data.len() < len {
+            data.push(0xe8);
+            data.extend_from_slice(&word.wrapping_mul(2654435761).to_le_bytes());
+            word = word.wrapping_add(1);
+        }
+        data.truncate(len);
+        data
+    }
+
+    /// A solid member that follows a FILTERED member must compress against
+    /// the same window the decoder has. The decoder's window holds the LZ
+    /// output, i.e. the filter-encoded bytes, because a declared filter is
+    /// applied to a scratch copy of its range as that range completes and
+    /// never in place (trap 5, and unrar's `UnpackWriteBuf` copying into
+    /// `FilterSrcMemory` before `ApplyFilter`). The encoder used to remember
+    /// the PRE-filter input instead, so any cross-member match reaching into
+    /// a filter-mutated range resolved against bytes the decoder never had.
+    #[test]
+    fn solid_member_after_filtered_member_matches_decoder_window() {
+        // The small member takes the single-block `filtered_lz_member` path;
+        // the large one takes the `filtered_lz_blocks` path. Whether the
+        // large one actually emits a cross-member match into a mutated range
+        // is payload dependent, so it pins the branch rather than proving it.
+        for len in [4000usize, MAX_FILTER_BLOCK_LENGTH + 5000] {
+            let a = e8_call_records(len);
+            let b = a.clone();
+
+            let mut encoder = Unpack50Encoder::with_options(EncodeOptions::new(4));
+            let packed_a = encoder
+                .encode_member_with_filter(&a, 0, Rar50FilterSpec::new(Rar50FilterKind::E8))
+                .unwrap();
+            let packed_b = encoder.encode_member(&b, 0).unwrap();
+
+            let mut decoder = Unpack50Decoder::new();
+            let decoded_a = decoder
+                .decode_member(&packed_a, 0, a.len(), false, DecodeMode::Lz)
+                .unwrap();
+            assert_eq!(decoded_a, a, "len {len}: filtered member");
+            let decoded_b = decoder
+                .decode_member(&packed_b, 0, b.len(), true, DecodeMode::Lz)
+                .unwrap();
+            assert_eq!(decoded_b, b, "len {len}: solid member after a filter");
+        }
     }
 
     #[test]

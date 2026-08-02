@@ -26,8 +26,7 @@ const MAX_BOXES: usize = 20_000;
 /// Containers we descend into. Everything else is skipped by its size,
 /// so an unknown or hostile box costs one header read and a bounds
 /// check.
-const CONTAINERS: [&[u8; 4]; 6] =
-    [b"moov", b"trak", b"mdia", b"minf", b"stbl", b"udta"];
+const CONTAINERS: [&[u8; 4]; 6] = [b"moov", b"trak", b"mdia", b"minf", b"stbl", b"udta"];
 
 /// Handler types, from `hdlr`, that tell us what a track carries.
 const HDLR_VIDEO: &[u8; 4] = b"vide";
@@ -57,7 +56,10 @@ fn read_box(b: &[u8], at: usize, limit: usize) -> Option<BoxHdr> {
             if at + 16 > limit || at + 16 > b.len() {
                 return None;
             }
-            (u64::from_be_bytes(b[at + 8..at + 16].try_into().ok()?), 16usize)
+            (
+                u64::from_be_bytes(b[at + 8..at + 16].try_into().ok()?),
+                16usize,
+            )
         }
         // 0 means "to the end of the enclosing box" - legal only on the
         // last one.
@@ -73,7 +75,11 @@ fn read_box(b: &[u8], at: usize, limit: usize) -> Option<BoxHdr> {
     if end > limit {
         return None;
     }
-    Some(BoxHdr { kind, body: at + hdr, end: end.min(b.len()) })
+    Some(BoxHdr {
+        kind,
+        body: at + hdr,
+        end: end.min(b.len()),
+    })
 }
 
 /// Does this look like an ISO base media file? Checked before spending a
@@ -82,7 +88,10 @@ pub fn looks_like_mp4(b: &[u8]) -> bool {
     // `ftyp` is the required first box; `styp`, `moov` and `free`/`skip`
     // lead real files in the wild too.
     read_box(b, 0, b.len()).is_some_and(|h| {
-        matches!(&h.kind, b"ftyp" | b"styp" | b"moov" | b"free" | b"skip" | b"wide")
+        matches!(
+            &h.kind,
+            b"ftyp" | b"styp" | b"moov" | b"free" | b"skip" | b"wide"
+        )
     })
 }
 
@@ -112,12 +121,11 @@ pub fn facts_unanchored(b: &[u8]) -> Option<MediaFacts> {
         let at = from + rel;
         // The type field sits 4 bytes into the header.
         let start = at - 4;
-        if let Some(h) = read_box(b, start, b.len()) {
-            if &h.kind == b"moov" {
-                if let Some(f) = walk(b, start) {
-                    return Some(f);
-                }
-            }
+        if let Some(h) = read_box(b, start, b.len())
+            && &h.kind == b"moov"
+            && let Some(f) = walk(b, start)
+        {
+            return Some(f);
         }
         from = at + 4;
         tried += 1;
@@ -147,7 +155,10 @@ struct Track {
 }
 
 fn walk(b: &[u8], start: usize) -> Option<MediaFacts> {
-    let mut info = MediaFacts { container: "mp4", ..MediaFacts::default() };
+    let mut info = MediaFacts {
+        container: "mp4",
+        ..MediaFacts::default()
+    };
     // (box type, end offset) for every container we are inside. Same
     // shape as the EBML walk, for the same reason: a `trak` is judged
     // when it closes, because its `hdlr` may arrive after its `stsd`.
@@ -171,7 +182,9 @@ fn walk(b: &[u8], start: usize) -> Option<MediaFacts> {
         if pos >= limit {
             break;
         }
-        let Some(h) = read_box(b, pos, limit) else { break };
+        let Some(h) = read_box(b, pos, limit) else {
+            break;
+        };
         // A box that does not advance would spin the walk forever;
         // read_box already refuses size < header, so this is belt and
         // braces against a future edit of it.
@@ -254,10 +267,12 @@ fn file_track(info: &mut MediaFacts, track: &mut Track, longest: &mut Option<f64
     if t.handler.is_none() && t.codec.is_none() && t.lang.is_none() {
         return;
     }
-    if let Some(s) = t.secs {
-        if s.is_finite() && s > 0.0 && longest.is_none_or(|l| s > l) {
-            *longest = Some(s);
-        }
+    if let Some(s) = t.secs
+        && s.is_finite()
+        && s > 0.0
+        && longest.is_none_or(|l| s > l)
+    {
+        *longest = Some(s);
     }
     let lang = t.lang.as_deref().and_then(normalise_lang);
     match t.handler.as_ref() {
@@ -278,7 +293,7 @@ fn file_track(info: &mut MediaFacts, track: &mut Track, longest: &mut Option<f64
                 push_unique(&mut info.audio_langs, l);
             }
         }
-        Some(h) if matches!(h, b"sbtl" | b"text" | b"subt" | b"clcp") => {
+        Some(b"sbtl" | b"text" | b"subt" | b"clcp") => {
             if let Some(l) = lang {
                 push_unique(&mut info.sub_langs, l);
             }
@@ -312,7 +327,9 @@ fn mvhd_duration(p: &[u8]) -> Option<f64> {
 /// latter packed as three 5-bit letters offset by 0x60 ("und" is the
 /// no-answer value and normalises away).
 fn mdhd(p: &[u8]) -> (Option<f64>, Option<String>) {
-    let Some(&version) = p.first() else { return (None, None) };
+    let Some(&version) = p.first() else {
+        return (None, None);
+    };
     let (scale, dur, lang_at) = match version {
         0 if p.len() >= 22 => (
             u32::from_be_bytes(p[12..16].try_into().unwrap()) as u64,
@@ -379,8 +396,8 @@ fn stsd_first_entry(p: &[u8]) -> Option<(String, Option<(u32, u32)>)> {
 
 /// A minimal, valid MP4 for tests: one video track, one audio track per
 /// entry in `audio`, and one subtitle track per entry in `subs`.
-#[doc(hidden)]
-pub fn test_mp4(
+#[cfg(test)]
+fn test_mp4(
     duration_secs: f64,
     dims: (u32, u32),
     video_codec: &[u8; 4],

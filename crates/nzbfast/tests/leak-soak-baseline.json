@@ -1,0 +1,14 @@
+{
+  "_": "TODO 82 soak gate, read by crates/nzbfast/tests/leak_soak.rs. `drift` is the largest tolerated difference between the median of the FIRST third of the post-warmup samples and the median of the LAST third. `ceiling` is the largest tolerated single reading - it catches the run that starts high and stays flat, which no drift figure can see. rss_kib is KiB, the unit both /proc/<pid>/status and `ps -o rss` report.",
+  "_recording": "Measured 2 Aug 2026 on the dev box (macOS aarch64, 32 cores, 274 GB RAM, release build, 44 MiB of payload per cycle, 90 s settle). Two runs, 19 measured cycles. fds sat on exactly 17 and threads on exactly 48 in EVERY cycle of both runs - neither ever moved. RSS climbs 116 -> 237 MiB over the first five cycles (buffer pool and caches reaching working size) and is then flat: 237.0, 237.5, 237.6, 238.9 across cycles 6-9. The two higher readings after that (244.1, and 274.4 on the one cycle whose fetch took 6.2 s instead of the usual 1.2 s) are contention from a parallel session on the same box, not the daemon.",
+  "_recording_linux": "Confirmed on ubuntu-latest, 11 cycles, workflow_dispatch run 30747698239. fds constant at 16, threads constant at 20, rss oscillating 76.8-99.6 MiB with NO trend - drift +5.8 MiB, and the output root cleaned to 0 KiB every cycle. Linux shows none of the macOS warm-up ramp: the plateau is immediate there, so the 5-cycle warmup costs nothing and the ramp is a macOS allocator artifact. Absolute RSS is ~2.5x lower than macOS, as expected from a memory budget scaled off physical RAM.",
+  "_allowances": "rss 128 MiB is ~5x the worst drift either platform produced on a short run (macOS +22 and +28 MiB, Linux +5.8) and still catches any leak above ~1.4 MiB/cycle over the nightly's ~90 cycles, where each third holds ~30 samples and one outlier cannot move the median. Deliberately NOT tightened to the Linux figure: an 11-cycle dispatch is not the 90-cycle nightly, and a first-night false red teaches people to ignore the gate. fds and threads get 8 apiece: both were dead constant on both platforms, so any real drift is a finding, and 8 is just enough slack that one transient cannot cry wolf. The ceilings are a runaway backstop, not a tuning knob.",
+  "_rerecord": "From the `samples` array of a green run's report (NZBFAST_SOAK_REPORT; the nightly uploads it as the soak-report artifact). The figures here come from short runs on both platforms - re-record from the first full 150-minute nightly, where the thirds are ~30 samples each. Never widen an allowance to turn a red run green without first naming what legitimately grew.",
+  "recorded": "2026-08-02",
+  "recorded_on": "macos aarch64 (dev box) + ubuntu-latest (CI run 30747698239), release, 5 warmup cycles",
+  "limits": {
+    "rss_kib": { "drift": 131072, "ceiling": 1048576 },
+    "fds": { "drift": 8, "ceiling": 512 },
+    "threads": { "drift": 8, "ceiling": 256 }
+  }
+}

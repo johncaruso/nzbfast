@@ -3,6 +3,8 @@
 //! reliably serves, red for an ancient one it consistently 430s, and
 //! `verdict=ok` filters the browse list.
 
+mod scratch;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
@@ -38,7 +40,9 @@ fn http_get(port: u16, req: &str) -> (u16, String) {
             Ok(out) => return out,
             Err(e) => {
                 last = e.to_string();
-                std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(attempt) + 50));
+                std::thread::sleep(std::time::Duration::from_millis(
+                    100 * u64::from(attempt) + 50,
+                ));
             }
         }
     }
@@ -50,7 +54,10 @@ fn http_get(port: u16, req: &str) -> (u16, String) {
 /// caller's assertions to judge.
 fn http_get_once(port: u16, req: &str) -> std::io::Result<(u16, String)> {
     let mut s = TcpStream::connect(("127.0.0.1", port))?;
-    write!(s, "GET {req} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")?;
+    write!(
+        s,
+        "GET {req} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    )?;
     let mut out = String::new();
     // Zero bytes back is a refusal to serve, however the peer
     // phrased it: an RST (Err) when our request was never read off
@@ -73,7 +80,10 @@ fn http_get_once(port: u16, req: &str) -> std::io::Result<(u16, String)> {
         .nth(1)
         .and_then(|c| c.parse().ok())
         .unwrap_or(0);
-    Ok((status, out.split("\r\n\r\n").nth(1).unwrap_or("").to_string()))
+    Ok((
+        status,
+        out.split("\r\n\r\n").nth(1).unwrap_or("").to_string(),
+    ))
 }
 
 struct KillOnDrop(Child);
@@ -116,13 +126,19 @@ async fn serve(dir: &Path, build: impl Fn(u16) -> Command) -> Daemon {
         .await
         .unwrap();
         if ready {
-            return Daemon { _child: child, port };
+            return Daemon {
+                _child: child,
+                port,
+            };
         }
         // The daemon exited instead of binding: `free_port()` handed :port
         // to a parallel test between our bind(:0) and the daemon's bind,
         // and that test's daemon won it. Try a fresh port.
         let tail = std::fs::read_to_string(&logfile).unwrap_or_default();
-        assert!(attempt < 2, "daemon exited without binding :{port}\n--- log ---\n{tail}");
+        assert!(
+            attempt < 2,
+            "daemon exited without binding :{port}\n--- log ---\n{tail}"
+        );
     }
     unreachable!()
 }
@@ -142,7 +158,9 @@ async fn serve(dir: &Path, build: impl Fn(u16) -> Command) -> Daemon {
 fn wait_ready(child: &mut KillOnDrop, port: u16, logfile: &Path) -> bool {
     let banner = format!("open the dashboard at  http://localhost:{port}/");
     for _ in 0..600 {
-        if std::fs::read_to_string(logfile).unwrap_or_default().contains(&banner)
+        if std::fs::read_to_string(logfile)
+            .unwrap_or_default()
+            .contains(&banner)
             && TcpStream::connect(("127.0.0.1", port)).is_ok()
         {
             return true;
@@ -170,8 +188,7 @@ fn over(number: u64, subject: &str, msgid: &str, date: i64) -> OverEntry {
 #[tokio::test(flavor = "multi_thread")]
 async fn seeded_ledger_drives_browse_verdicts() {
     let dir = std::env::temp_dir().join(format!("nzbfast-oracle-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -228,21 +245,32 @@ async fn seeded_ledger_drives_browse_verdicts() {
             misses,
         };
         ix.oracle_ingest(
-            &[s("teevee", 1, 200, 0), s("teevee", 6, 2, 98), s("warez", 1, 3, 97)],
+            &[
+                s("teevee", 1, 200, 0),
+                s("teevee", 6, 2, 98),
+                s("warez", 1, 3, 97),
+            ],
             now,
         )
         .unwrap();
     }
 
     let cfg = dir.join("config.json");
-    std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
-        .unwrap();
+    std::fs::write(
+        &cfg,
+        "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}",
+    )
+    .unwrap();
     // The availability ledger is a table in the index database, which
     // the daemon refuses to open while the built-in indexer's master
     // switch is off (its default). This test seeds that database and
     // then reads verdicts back through browse, so it is the switched-on
     // case; settings.json lives beside the config file.
-    std::fs::write(cfg.with_file_name("settings.json"), "{\"index_enabled\": true}").unwrap();
+    std::fs::write(
+        cfg.with_file_name("settings.json"),
+        "{\"index_enabled\": true}",
+    )
+    .unwrap();
     let d = serve(&dir, |port| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
         // The daemon mints an API key on a genuinely first run (see
@@ -273,8 +301,10 @@ async fn seeded_ledger_drives_browse_verdicts() {
 
     tokio::task::spawn_blocking(move || {
         // Browse: each row carries its ledger verdict.
-        let (code, body) =
-            http_get(port, "/api?mode=index_browse&all=1&output=json&apikey=sekrit");
+        let (code, body) = http_get(
+            port,
+            "/api?mode=index_browse&all=1&output=json&apikey=sekrit",
+        );
         assert_eq!(code, 200, "{body}");
         let v: serde_json::Value = serde_json::from_str(&body).expect("browse json");
         let rows = v["results"].as_array().expect("results");
@@ -284,15 +314,35 @@ async fn seeded_ledger_drives_browse_verdicts() {
                 .unwrap_or_else(|| panic!("{stem} not in browse:\n{body}"))
                 .clone()
         };
-        assert_eq!(row_of("Fresh.Show")["verdict"], serde_json::json!("ok"), "{body}");
-        assert_eq!(row_of("Ancient.Show")["verdict"], serde_json::json!("gone"), "{body}");
+        assert_eq!(
+            row_of("Fresh.Show")["verdict"],
+            serde_json::json!("ok"),
+            "{body}"
+        );
+        assert_eq!(
+            row_of("Ancient.Show")["verdict"],
+            serde_json::json!("gone"),
+            "{body}"
+        );
 
         // M29 3d takedown fingerprint: the fresh-but-gone warez release is
         // flagged "reaped"; the ancient one (age-driven loss) and the
         // healthy fresh one are not.
-        assert_eq!(row_of("Reaped.App")["reaped"], serde_json::json!(true), "{body}");
-        assert_eq!(row_of("Ancient.Show")["reaped"], serde_json::json!(false), "{body}");
-        assert_eq!(row_of("Fresh.Show")["reaped"], serde_json::json!(false), "{body}");
+        assert_eq!(
+            row_of("Reaped.App")["reaped"],
+            serde_json::json!(true),
+            "{body}"
+        );
+        assert_eq!(
+            row_of("Ancient.Show")["reaped"],
+            serde_json::json!(false),
+            "{body}"
+        );
+        assert_eq!(
+            row_of("Fresh.Show")["reaped"],
+            serde_json::json!(false),
+            "{body}"
+        );
 
         // verdict=ok keeps only the predicted-complete row, AND `total`
         // reflects the filter (M29 3c: SQL predicate, not a page trim -

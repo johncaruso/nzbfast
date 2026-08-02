@@ -104,4 +104,28 @@ for lang in LOCALES:
         if lst:
             fail += 1
             print(f'  {name}: {lst[:12]}{" …" if len(lst) > 12 else ""}')
+# House copy rules, enforced (they were memory-and-sweep before, which
+# is how two Cyrillic em-dashes and a 28-locale "streaming app" string
+# shipped): no em-dash anywhere; no "streaming"/"media server"/"wall
+# time" in user-facing values ("in-stream" as a pipeline-stage modifier
+# is exempt; key NAMES are not user-facing).
+BANNED = re.compile(
+    r'\u2014'
+    r'|(?<!in-)\bstream(?:ing|ovac\u00ed|ovac\u00ed)?\b'
+    r'|\bmedia server\b|\bwall time\b'
+    r'|\u0441\u0442\u0440\u0438\u043c\u0438\u043d\u0433'  # cyrillic "striming"
+    r'|\u30b9\u30c8\u30ea\u30fc\u30df\u30f3\u30b0',        # katakana "sutoriimingu"
+    re.IGNORECASE)
+ALLOW_VALUE = ('in-stream', 'in the stream')
+for fp in sorted(glob.glob('web/i18n/*.json')):
+    d = json.load(open(fp, encoding='utf-8'))
+    fname = os.path.basename(fp)
+    for k, v in d.items():
+        if not isinstance(v, str):
+            continue
+        hit = BANNED.search(v)
+        if hit and not any(a in v.lower() for a in ALLOW_VALUE):
+            fail += 1
+            print(f'  BANNED-COPY {fname} {k}: {hit.group(0)!r} in {v[:60]!r}')
+
 sys.exit(1 if fail else 0)

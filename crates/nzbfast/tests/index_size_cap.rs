@@ -14,20 +14,30 @@
 //!    recently opened - survive a shrink that would otherwise take them;
 //!  * the two new modes sit behind the FULL key, not the add-only NZB key.
 
+mod scratch;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
 use nzbkit::nntp::OverEntry;
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 fn http(port: u16, req: &str) -> String {
     let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect daemon");
-    write!(s, "GET {req} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+    write!(
+        s,
+        "GET {req} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
     let mut out = String::new();
     s.read_to_string(&mut out).unwrap();
     out.split("\r\n\r\n").nth(1).unwrap_or("").to_string()
@@ -71,11 +81,9 @@ fn over(number: u64, subject: &str, msgid: &str, date: i64) -> OverEntry {
 /// `index_enabled` is stamped in unless the caller set it: the indexer's
 /// master switch defaults OFF, and every test in this file is about the
 /// index database, which the daemon will not even open while it is off.
-fn scratch(name: &str, settings: &str) -> PathBuf {
-    let dir = std::env::temp_dir()
-        .join(format!("nzbfast-sizecap-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+fn scratch(name: &str, settings: &str) -> scratch::ScratchDir {
+    let dir = std::env::temp_dir().join(format!("nzbfast-sizecap-{}-{name}", std::process::id()));
+    let dir = scratch::ScratchDir::attach(&dir);
     std::fs::write(dir.join("config.json"), "{\"servers\":[]}").unwrap();
     std::fs::write(dir.join("settings.json"), with_indexer_on(settings)).unwrap();
     dir
@@ -89,7 +97,11 @@ fn with_indexer_on(settings: &str) -> String {
         return settings.to_string();
     }
     let t = settings.trim();
-    let inner = t.strip_prefix('{').and_then(|s| s.strip_suffix('}')).unwrap_or("").trim();
+    let inner = t
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .unwrap_or("")
+        .trim();
     if inner.is_empty() {
         "{\"index_enabled\": true}".to_string()
     } else {
@@ -119,7 +131,8 @@ fn seed_index(dir: &Path, stems: &[&str]) {
             )
         })
         .collect();
-    ix.ingest("alt.binaries.teevee", &entries, now - 3600).unwrap();
+    ix.ingest("alt.binaries.teevee", &entries, now - 3600)
+        .unwrap();
 }
 
 fn serve(dir: &Path) -> Running {
@@ -149,7 +162,10 @@ fn serve(dir: &Path) -> Running {
             .stderr(Stdio::from(err))
             .spawn()
             .unwrap();
-        let mut running = Running { _child: KillOnDrop(child), port };
+        let mut running = Running {
+            _child: KillOnDrop(child),
+            port,
+        };
         // Readiness is OUR daemon's own listener banner in OUR log, not
         // "something answers on :port". A bare connect cannot tell the two
         // apart: `free_port()` can hand :port to a parallel test between our
@@ -161,7 +177,9 @@ fn serve(dir: &Path) -> Running {
         let banner = format!("open the dashboard at  http://localhost:{port}/");
         let mut dead = false;
         for _ in 0..300 {
-            if std::fs::read_to_string(&log).unwrap_or_default().contains(&banner)
+            if std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .contains(&banner)
                 && TcpStream::connect(("127.0.0.1", port)).is_ok()
             {
                 return running;
@@ -230,7 +248,11 @@ fn size_cap_settings_round_trip_validate_and_survive_a_restart() {
     // Order: closed set, case-insensitive, typos refused rather than
     // silently defaulted.
     for o in ["ladder", "oldest", "newest", "largest", "smallest"] {
-        assert_eq!(cfg(d.port, "index_evict_order", o)["status"], true, "order {o}");
+        assert_eq!(
+            cfg(d.port, "index_evict_order", o)["status"],
+            true,
+            "order {o}"
+        );
         assert_eq!(live(d.port)["index_evict_order"], o);
     }
     let bad = cfg(d.port, "index_evict_order", "biggest");
@@ -239,14 +261,27 @@ fn size_cap_settings_round_trip_validate_and_survive_a_restart() {
         bad["error"].as_str().unwrap_or_default().contains("ladder"),
         "the error should list the valid orders: {bad}"
     );
-    assert_eq!(live(d.port)["index_evict_order"], "smallest", "a refused write changes nothing");
+    assert_eq!(
+        live(d.port)["index_evict_order"],
+        "smallest",
+        "a refused write changes nothing"
+    );
 
     // Kinds: comma list, empty = every kind.
-    assert_eq!(cfg(d.port, "index_evict_kinds", "movie,other")["status"], true);
-    assert_eq!(live(d.port)["index_evict_kinds"], serde_json::json!(["movie", "other"]));
+    assert_eq!(
+        cfg(d.port, "index_evict_kinds", "movie,other")["status"],
+        true
+    );
+    assert_eq!(
+        live(d.port)["index_evict_kinds"],
+        serde_json::json!(["movie", "other"])
+    );
     let bad = cfg(d.port, "index_evict_kinds", "movie,film");
     assert_eq!(bad["status"], false);
-    assert!(bad["error"].as_str().unwrap_or_default().contains("film"), "{bad}");
+    assert!(
+        bad["error"].as_str().unwrap_or_default().contains("film"),
+        "{bad}"
+    );
     assert_eq!(cfg(d.port, "index_evict_kinds", "")["status"], true);
     assert_eq!(live(d.port)["index_evict_kinds"], serde_json::json!([]));
 
@@ -277,7 +312,10 @@ fn index_stats_reports_size_cap_and_pending_compact() {
     let d = serve(&dir);
 
     let s = stats(d.port);
-    assert!(s["db_bytes"].as_u64().unwrap_or(0) > 0, "db_bytes must be reported: {s}");
+    assert!(
+        s["db_bytes"].as_u64().unwrap_or(0) > 0,
+        "db_bytes must be reported: {s}"
+    );
     assert_eq!(s["index_max_bytes"], 0);
     assert_eq!(s["over_cap"], false, "no cap set, so never over it");
     assert_eq!(s["compact_pending"], false);
@@ -289,7 +327,10 @@ fn index_stats_reports_size_cap_and_pending_compact() {
     let s = stats(d.port);
     assert_eq!(s["index_max_bytes"], 1);
     assert_eq!(s["over_cap"], true, "{s}");
-    assert_eq!(s["index_evict"], false, "and still nothing has been deleted");
+    assert_eq!(
+        s["index_evict"], false,
+        "and still nothing has been deleted"
+    );
 }
 
 /// The hard rule: with `index_evict` off, nothing evicts. Not on demand,
@@ -316,7 +357,10 @@ fn eviction_never_runs_while_the_toggle_is_off() {
     let r = api(d.port, "mode=index_evict_now");
     assert_eq!(r["status"], false, "{r}");
     let e = r["error"].as_str().unwrap_or_default();
-    assert!(e.contains("index_evict"), "the error must name the switch: {r}");
+    assert!(
+        e.contains("index_evict"),
+        "the error must name the switch: {r}"
+    );
 
     // On the timer: the scan loop re-checks every 15 s when no groups are
     // configured, so this window covers several of its passes.
@@ -327,7 +371,10 @@ fn eviction_never_runs_while_the_toggle_is_off() {
         before,
         "the scan loop evicted with the toggle OFF: {s}"
     );
-    assert_eq!(s["compact_pending"], false, "nothing pruned, so nothing to compact");
+    assert_eq!(
+        s["compact_pending"], false,
+        "nothing pruned, so nothing to compact"
+    );
 
     // ...and the other half of the same wiring: the moment the switch is
     // on, the scan loop's next pass enforces the cap without anyone
@@ -367,7 +414,10 @@ fn a_pending_compact_fires_at_the_next_idle_window() {
 
     let r = api(d.port, "mode=index_shrink_to&value=1");
     assert_eq!(r["status"], true, "{r}");
-    assert_eq!(r["compact_pending"], true, "the prune must queue a compact: {r}");
+    assert_eq!(
+        r["compact_pending"], true,
+        "the prune must queue a compact: {r}"
+    );
 
     // Nothing is downloading and nothing is scanning, so the idle loop
     // (60 s tick) should pick it up on its first or second look.
@@ -405,7 +455,10 @@ fn shrink_to_reaches_its_target_or_reports_why_not() {
     let dir = scratch("shrink", "{}");
     seed_index(&dir, &stems);
     let d = serve(&dir);
-    assert_eq!(stats(d.port)["releases"].as_u64().unwrap(), stems.len() as u64);
+    assert_eq!(
+        stats(d.port)["releases"].as_u64().unwrap(),
+        stems.len() as u64
+    );
 
     // No size at all is a caller error, not a silent full wipe.
     let r = api(d.port, "mode=index_shrink_to");
@@ -416,13 +469,19 @@ fn shrink_to_reaches_its_target_or_reports_why_not() {
     assert_eq!(r["status"], true, "{r}");
     assert_eq!(r["removed"], 0);
     assert_eq!(r["reached"], true);
-    assert_eq!(stats(d.port)["releases"].as_u64().unwrap(), stems.len() as u64);
+    assert_eq!(
+        stats(d.port)["releases"].as_u64().unwrap(),
+        stems.len() as u64
+    );
 
     // Nothing here is watchlisted, queued, downloaded or opened, so a
     // 1-byte target should shed every row it can.
     let r = api(d.port, "mode=index_shrink_to&value=1");
     assert_eq!(r["status"], true, "{r}");
-    assert!(r["removed"].as_u64().unwrap() > 0, "nothing was pruned at all: {r}");
+    assert!(
+        r["removed"].as_u64().unwrap() > 0,
+        "nothing was pruned at all: {r}"
+    );
     assert!(
         r["bytes_after"].as_u64().unwrap() <= r["bytes_before"].as_u64().unwrap(),
         "{r}"
@@ -433,16 +492,27 @@ fn shrink_to_reaches_its_target_or_reports_why_not() {
         // silently: it must say so, and with nothing protected it must
         // not blame protection.
         let e = r["error"].as_str().unwrap_or_default();
-        assert!(!e.is_empty(), "fell short of the target without saying why: {r}");
+        assert!(
+            !e.is_empty(),
+            "fell short of the target without saying why: {r}"
+        );
         assert_eq!(r["protected_keys"], 0, "{r}");
-        assert!(e.contains("nothing is protected"), "misattributed the shortfall: {r}");
+        assert!(
+            e.contains("nothing is protected"),
+            "misattributed the shortfall: {r}"
+        );
     }
-    assert_eq!(stats(d.port)["releases"].as_u64().unwrap(), 0, "every unprotected row goes");
+    assert_eq!(
+        stats(d.port)["releases"].as_u64().unwrap(),
+        0,
+        "every unprotected row goes"
+    );
 
     // Reclaiming the disk is a VACUUM, and that is deferred to an idle
     // window rather than run inside this request.
     assert_eq!(
-        stats(d.port)["compact_pending"], true,
+        stats(d.port)["compact_pending"],
+        true,
         "a prune that frees pages must queue the compact"
     );
 }
@@ -469,7 +539,10 @@ fn the_size_cap_never_touches_protected_releases() {
         r#"{"watchlist":[{"id":1,"kind":"tv","title":"Watched Show",
                           "target_quality":"1080p","enabled":true}]}"#,
     );
-    seed_index(&dir, &[watched, queued, owned, opened, fetched, junk_a, junk_b]);
+    seed_index(
+        &dir,
+        &[watched, queued, owned, opened, fetched, junk_a, junk_b],
+    );
 
     // A queued job and a completed one, written the way a restart reads
     // them back. The queued record is paused so the scheduler leaves it
@@ -506,7 +579,10 @@ fn the_size_cap_never_touches_protected_releases() {
             .iter()
             .find(|r| r["name"].as_str() == Some(stem))
             .unwrap_or_else(|| panic!("{stem} missing from browse: {rows}"));
-        (r["id"].as_i64().unwrap(), r["key"].as_str().unwrap().to_string())
+        (
+            r["id"].as_i64().unwrap(),
+            r["key"].as_str().unwrap().to_string(),
+        )
     };
     let (_, opened_key) = find(opened);
     let (fetched_id, _) = find(fetched);
@@ -515,9 +591,15 @@ fn the_size_cap_never_touches_protected_releases() {
     // exact request the wall's sheet makes).
     let sheet = api(
         d.port,
-        &format!("mode=index_browse&limit=50&title_key={}", urlencode(&opened_key)),
+        &format!(
+            "mode=index_browse&limit=50&title_key={}",
+            urlencode(&opened_key)
+        ),
     );
-    assert!(sheet["results"].as_array().is_some_and(|a| !a.is_empty()), "{sheet}");
+    assert!(
+        sheet["results"].as_array().is_some_and(|a| !a.is_empty()),
+        "{sheet}"
+    );
     // 4b: pull the NZB, the way a grab does.
     let nzb = http(d.port, &format!("/getnzb/{fetched_id}.nzb"));
     assert!(nzb.contains("<nzb"), "getnzb did not return an NZB: {nzb}");
@@ -552,12 +634,21 @@ fn the_size_cap_never_touches_protected_releases() {
         (opened, "opened in detail"),
         (fetched, "fetched via getnzb"),
     ] {
-        assert!(left.contains(&stem.to_string()), "{why} release was evicted: {left:?}");
+        assert!(
+            left.contains(&stem.to_string()),
+            "{why} release was evicted: {left:?}"
+        );
     }
     // ...and the rows with no claim on them are gone, or the test proved
     // nothing.
-    assert!(!left.contains(&junk_a.to_string()), "nothing was evicted at all: {left:?}");
-    assert!(!left.contains(&junk_b.to_string()), "nothing was evicted at all: {left:?}");
+    assert!(
+        !left.contains(&junk_a.to_string()),
+        "nothing was evicted at all: {left:?}"
+    );
+    assert!(
+        !left.contains(&junk_b.to_string()),
+        "nothing was evicted at all: {left:?}"
+    );
 }
 
 /// A watch item that names a whole custom category (empty title) is the
@@ -605,7 +696,10 @@ fn a_whole_category_watch_item_protects_the_whole_category() {
         .iter()
         .filter(|r| r["kind"] == "formula-1")
         .count();
-    assert_eq!(f1, 2, "both rounds must be classified into the category: {all}");
+    assert_eq!(
+        f1, 2,
+        "both rounds must be classified into the category: {all}"
+    );
 
     let r = api(d.port, "mode=index_shrink_to&value=1");
     assert_eq!(r["status"], true, "{r}");
@@ -620,12 +714,21 @@ fn a_whole_category_watch_item_protects_the_whole_category() {
         .map(|r| r["name"].as_str().unwrap_or_default().to_string())
         .collect();
     for stem in [hungary, spa] {
-        assert!(left.contains(&stem.to_string()), "a watched category row was evicted: {left:?}");
+        assert!(
+            left.contains(&stem.to_string()),
+            "a watched category row was evicted: {left:?}"
+        );
     }
     // ...and the unclaimed rows are gone, or nothing was evicted at all
     // and the survival above means nothing.
-    assert!(!left.contains(&junk_a.to_string()), "nothing was evicted at all: {left:?}");
-    assert!(!left.contains(&junk_b.to_string()), "nothing was evicted at all: {left:?}");
+    assert!(
+        !left.contains(&junk_a.to_string()),
+        "nothing was evicted at all: {left:?}"
+    );
+    assert!(
+        !left.contains(&junk_b.to_string()),
+        "nothing was evicted at all: {left:?}"
+    );
 }
 
 /// The bug that made this feature unusable, pinned end to end.
@@ -646,29 +749,45 @@ fn the_cap_is_measured_against_live_content_not_the_unshrunk_file() {
     // Big enough that deleting everything is certain to free whole pages -
     // a handful of rows can vanish inside already-partial pages and leave
     // no freelist at all.
-    let stems: Vec<String> =
-        (0..300).map(|i| format!("Filler{i}.Show.S01E01.1080p.WEB.x264-GRP")).collect();
+    let stems: Vec<String> = (0..300)
+        .map(|i| format!("Filler{i}.Show.S01E01.1080p.WEB.x264-GRP"))
+        .collect();
     let refs: Vec<&str> = stems.iter().map(String::as_str).collect();
     let dir = scratch("livebytes", "{}");
     seed_index(&dir, &refs);
     let d = serve(&dir);
-    assert_eq!(stats(d.port)["releases"].as_u64().unwrap(), stems.len() as u64);
+    assert_eq!(
+        stats(d.port)["releases"].as_u64().unwrap(),
+        stems.len() as u64
+    );
 
     let r = api(d.port, "mode=index_shrink_to&value=1");
     assert_eq!(r["status"], true, "{r}");
-    assert!(r["removed"].as_u64().unwrap() > 0, "nothing was pruned: {r}");
+    assert!(
+        r["removed"].as_u64().unwrap() > 0,
+        "nothing was pruned: {r}"
+    );
 
     // Read the two sizes before the idle loop's compact can close the gap.
     let s = stats(d.port);
     let db = s["db_bytes"].as_u64().unwrap();
     let live = s["live_bytes"].as_u64().unwrap();
-    assert!(live < db, "a big delete must leave a freelist gap before the compact: {s}");
+    assert!(
+        live < db,
+        "a big delete must leave a freelist gap before the compact: {s}"
+    );
 
     // A cap between the two: too small for the file as it sits on disk,
     // comfortably big for what is actually in it.
     let cap = (db + live) / 2;
-    assert!(cap > live && cap < db, "test fixture did not straddle the gap: {s}");
-    assert_eq!(cfg(d.port, "index_max_bytes", &cap.to_string())["status"], true);
+    assert!(
+        cap > live && cap < db,
+        "test fixture did not straddle the gap: {s}"
+    );
+    assert_eq!(
+        cfg(d.port, "index_max_bytes", &cap.to_string())["status"],
+        true
+    );
     assert_eq!(
         stats(d.port)["over_cap"],
         false,
@@ -680,7 +799,10 @@ fn the_cap_is_measured_against_live_content_not_the_unshrunk_file() {
     assert_eq!(cfg(d.port, "index_evict", "1")["status"], true);
     let r = api(d.port, "mode=index_evict_now");
     assert_eq!(r["status"], true, "{r}");
-    assert_eq!(r["removed"], 0, "it kept evicting an index already under its cap: {r}");
+    assert_eq!(
+        r["removed"], 0,
+        "it kept evicting an index already under its cap: {r}"
+    );
     assert_eq!(r["reached"], true, "{r}");
     assert_eq!(r["blocked"], false, "{r}");
 }
@@ -700,10 +822,16 @@ fn the_new_modes_reject_an_add_only_key() {
     // The add-only key IS valid - it opens the add surface. Anything else
     // it is refused for is about tier, not a bad key.
     let v = api(d.port, "mode=version&apikey=ADDONLYKEY0000000000000");
-    assert!(v["version"].is_string(), "the nzbkey should pass mode=version: {v}");
+    assert!(
+        v["version"].is_string(),
+        "the nzbkey should pass mode=version: {v}"
+    );
 
     for mode in ["index_shrink_to&value=1", "index_evict_now"] {
-        let r = api(d.port, &format!("mode={mode}&apikey=ADDONLYKEY0000000000000"));
+        let r = api(
+            d.port,
+            &format!("mode={mode}&apikey=ADDONLYKEY0000000000000"),
+        );
         assert_eq!(r["status"], false, "{mode} accepted the add-only key: {r}");
         assert_eq!(r["error"], "API Key Incorrect", "{mode}: {r}");
         // No key at all is refused too.
@@ -719,7 +847,10 @@ fn the_new_modes_reject_an_add_only_key() {
     );
 
     // The full key reaches them.
-    let r = api(d.port, "mode=index_evict_now&apikey=FULLKEY0000000000000000");
+    let r = api(
+        d.port,
+        "mode=index_evict_now&apikey=FULLKEY0000000000000000",
+    );
     // Eviction is off and no cap is set, so this refuses on POLICY - but
     // it is a policy refusal, not an auth one.
     assert_eq!(r["status"], false, "{r}");

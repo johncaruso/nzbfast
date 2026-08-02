@@ -1,50 +1,70 @@
 //! nzbkit - the nzbfast engine.
 //!
-//! Module map (grows per the roadmap):
-//! - [`nzb`]      NZB XML parsing → files → segments → message-IDs
-//! - [`yenc`]     reference (scalar) yEnc codec with CRC32; rapidyenc FFI later
-//! - [`nntp`]     async NNTP client: TLS, AUTHINFO, pipelined BODY primitives
-//! - [`config`]   local config (`config.local.json`, gitignored credentials)
-//!
-//! Coming: `sched` (article scheduler, server tiers, completability math),
-//! `par2` (main-packet parsing, incremental block verification),
-//! `disk` (preallocated offset writer).
+//! One crate, one pass: parse an NZB ([`nzb`], [`nzblnk`]), schedule its
+//! articles over pooled NNTP connections ([`nntp`], [`pool`], [`warmpool`],
+//! [`live`], [`preflight`]), decode yEnc in place ([`yenc`], [`yenc_simd`]),
+//! land bytes at their final offsets ([`disk`], [`mem`], [`journal`]), verify
+//! and repair with PAR2 ([`par2`], [`par2repair`]), and extract archives in
+//! stream ([`extract`], [`rar`], [`zip`]). Around that core: media probing
+//! ([`mkv`], [`media`], [`mediaprobe`]), release identification ([`release`], [`oracle`],
+//! [`categories`], [`spot`], the IRC pre feed [`predb`]), the built-in
+//! indexer ([`index`]), posting
+//! ([`post`]), configuration ([`config`]), log capture ([`logtee`]),
+//! poison-free locking ([`sync`]), and benchmarking helpers
+//! ([`benchserve`], [`sysbench`], [`warmbench`]).
+//! Cipher internals (`rarcrypt`, `zipcrypt`), container probing (`mp4`) and
+//! the PAR2 NTT engine (`par2ntt`) are crate-private implementation detail.
 
 pub mod benchserve;
 pub mod categories;
 pub mod config;
+/// Population-level precision/recall floors for the pre-feed correlation
+/// tiers. Test-only: it asserts calibration, it is not part of the API.
+#[cfg(test)]
+mod corr_calibration;
 pub mod disk;
 pub mod extract;
+/// GF(2^16) primitives for the PAR2 engines. Not part of the real API:
+/// public only so nzbkit's own examples (par2_fold_bench, par2_ntt_bench)
+/// can build against it.
+#[doc(hidden)]
 pub mod gf16;
 pub mod index;
 pub mod journal;
 pub mod live;
 pub mod logtee;
 pub mod media;
+pub mod mediaprobe;
 pub mod mem;
 pub mod mkv;
+/// In-process mock NNTP server. Not part of the real API: public only for
+/// tests and examples in other crates (nzbfast's suites, mockserv).
+#[doc(hidden)]
 pub mod mock;
-pub mod mp4;
+pub(crate) mod mp4;
 pub mod nntp;
 pub mod nzb;
 pub mod nzblnk;
 pub mod oracle;
 pub mod par2;
-pub mod par2ntt;
+pub(crate) mod par2ntt;
 pub mod par2repair;
 pub mod pool;
 pub mod post;
+pub mod predb;
+pub mod predb_corr;
 pub mod preflight;
 pub mod rar;
+pub(crate) mod rarcrypt;
 pub mod release;
-pub mod rarcrypt;
 pub mod spot;
+pub mod sync;
 pub mod sysbench;
 pub mod warmbench;
 pub mod warmpool;
 pub mod yenc;
 pub mod yenc_simd;
 pub mod zip;
-pub mod zipcrypt;
+pub(crate) mod zipcrypt;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

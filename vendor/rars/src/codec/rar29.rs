@@ -2549,6 +2549,36 @@ impl Unpack29 {
         if copy_len < length {
             self.pending_match = Some((length - copy_len, offset));
         }
+        if offset == 1 {
+            let byte = *self
+                .output
+                .last()
+                .ok_or(Error::InvalidData("RAR 2.9 match distance is out of range"))?;
+            self.output.resize(self.output.len() + copy_len, byte);
+            return Ok(());
+        }
+
+        // A short-period overlap is periodic. After copying one complete
+        // period, the usable periodic span has doubled, so grow the source run
+        // geometrically instead of issuing one tiny extend per original
+        // distance. Long periods already copy cache-line-sized runs and keep
+        // the simple path below.
+        const PERIOD_DOUBLE_CEILING: usize = 4096;
+        if copy_len > offset && offset <= PERIOD_DOUBLE_CEILING {
+            let mut remaining = copy_len;
+            let mut period = offset;
+            while remaining > 0 {
+                let run = remaining.min(period);
+                let src_start = self.output.len() - period;
+                self.output.extend_from_within(src_start..src_start + run);
+                remaining -= run;
+                if run == period && period * 2 <= PERIOD_DOUBLE_CEILING {
+                    period *= 2;
+                }
+            }
+            return Ok(());
+        }
+
         // Chunked self-referential copy: runs capped at the match offset
         // reproduce the byte-loop's overlap periodicity.
         let mut remaining = copy_len;
@@ -3595,6 +3625,46 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         decoder.copy_match(4, 0, 5).unwrap();
 
         assert_eq!(decoder.output, b"ZZZZZ");
+    }
+
+    #[test]
+    fn copy_match_period_doubling_matches_bytewise_oracle() {
+        for distance in [1, 2, 3, 7, 64, 4096, 4097] {
+            for length in [1, distance - 1, distance, distance + 1, 10_003] {
+                let seed: Vec<u8> = (0..distance)
+                    .map(|index| ((index * 37 + 11) % 251) as u8)
+                    .collect();
+                let mut expected = seed.clone();
+                for _ in 0..length {
+                    let byte = expected[expected.len() - distance];
+                    expected.push(byte);
+                }
+
+                let mut decoder = Unpack29::new();
+                decoder.output = seed;
+                decoder
+                    .copy_match(length, distance, distance + length)
+                    .unwrap();
+                assert_eq!(
+                    decoder.output, expected,
+                    "distance={distance} length={length}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn copy_match_period_doubling_preserves_pending_remainder() {
+        let mut decoder = Unpack29::new();
+        decoder.output.extend_from_slice(b"abc");
+
+        decoder.copy_match(20, 3, 10).unwrap();
+        assert_eq!(decoder.output, b"abcabcabca");
+        assert_eq!(decoder.pending_match, Some((13, 3)));
+
+        decoder.drain_pending_match(23).unwrap();
+        assert_eq!(decoder.output, b"abcabcabcabcabcabcabcab");
+        assert_eq!(decoder.pending_match, None);
     }
 
     #[test]

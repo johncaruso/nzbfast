@@ -14,13 +14,19 @@
 //! here the on-disk cache is pre-seeded instead, which is the same code
 //! path a restart takes and needs no NNTP server.
 
+mod scratch;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 /// Response body of a GET against the daemon (headers stripped).
@@ -43,7 +49,9 @@ fn http(port: u16, req: &str) -> String {
             Ok(out) => return out,
             Err(e) => {
                 last = e.to_string();
-                std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(attempt) + 50));
+                std::thread::sleep(std::time::Duration::from_millis(
+                    100 * u64::from(attempt) + 50,
+                ));
             }
         }
     }
@@ -55,7 +63,10 @@ fn http(port: u16, req: &str) -> String {
 /// caller's assertions to judge.
 fn http_once(port: u16, req: &str) -> std::io::Result<String> {
     let mut s = TcpStream::connect(("127.0.0.1", port))?;
-    write!(s, "GET {req} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")?;
+    write!(
+        s,
+        "GET {req} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+    )?;
     let mut out = String::new();
     // Zero bytes back is a refusal to serve, however the peer
     // phrased it: an RST (Err) when our request was never read off
@@ -112,10 +123,9 @@ const CATALOGUE: &[(&str, u64)] = &[
 /// A scratch install: config, a settings file (so this reads as an
 /// EXISTING install and no first-run API key is minted - auth is not what
 /// these tests are about), and a pre-seeded group catalogue cache.
-fn scratch(name: &str) -> PathBuf {
+fn scratch(name: &str) -> scratch::ScratchDir {
     let dir = std::env::temp_dir().join(format!("nzbfast-groupsapi-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch::ScratchDir::attach(&dir);
     std::fs::write(dir.join("config.json"), "{\"servers\":[]}").unwrap();
     std::fs::write(dir.join("settings.json"), "{}").unwrap();
     // groups.tsv lives beside the index db (Daemon::groups_cache_path).
@@ -158,7 +168,10 @@ fn serve(dir: &Path) -> Running {
             .stderr(Stdio::from(err))
             .spawn()
             .unwrap();
-        let mut running = Running { _child: KillOnDrop(child), port };
+        let mut running = Running {
+            _child: KillOnDrop(child),
+            port,
+        };
         if wait_ready(&mut running._child, port, &logfile) {
             // Ours, and serving. Now wait for the catalogue to land.
             for _ in 0..100 {
@@ -173,7 +186,11 @@ fn serve(dir: &Path) -> Running {
         // The daemon exited instead of binding: `free_port()` handed :port
         // to a parallel test between our bind(:0) and the daemon's bind,
         // and that test's daemon won it. Try a fresh port.
-        assert!(attempt < 2, "daemon exited without binding :{port}\n{}", log(&logfile));
+        assert!(
+            attempt < 2,
+            "daemon exited without binding :{port}\n{}",
+            log(&logfile)
+        );
     }
     unreachable!()
 }
@@ -224,7 +241,10 @@ fn saved_groups(dir: &Path) -> Vec<String> {
     let text = std::fs::read_to_string(dir.join("settings.json")).unwrap_or_default();
     let v: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
     match v.get("index_groups").and_then(|g| g.as_array()) {
-        Some(a) => a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect(),
+        Some(a) => a
+            .iter()
+            .map(|v| v.as_str().unwrap_or("").to_string())
+            .collect(),
         None => Vec::new(),
     }
 }
@@ -239,14 +259,20 @@ fn add_all_matches_survives_a_restart() {
 
     // Start from one hand-picked group, the way a user who has been
     // clicking rows would.
-    let j = api(r.port, "mode=config&name=index_groups&value=alt.binaries.teevee");
+    let j = api(
+        r.port,
+        "mode=config&name=index_groups&value=alt.binaries.teevee",
+    );
     assert_eq!(j["status"], true, "seeding index_groups failed: {j}");
 
     // "+ Add all matches" for every binaries group.
     let j = api(r.port, "mode=groups_add_matching&q=alt.binaries.*");
     assert_eq!(j["status"], true, "bulk add rejected: {j}");
     assert_eq!(j["matched"], 7, "wrong match count: {j}");
-    assert_eq!(j["added"], 6, "teevee was already there, the other six are new: {j}");
+    assert_eq!(
+        j["added"], 6,
+        "teevee was already there, the other six are new: {j}"
+    );
     assert_eq!(j["capped"], false, "{j}");
 
     // Live state is right (it always was).
@@ -265,8 +291,14 @@ fn add_all_matches_survives_a_restart() {
     let mut after = live_groups(r2.port);
     after.sort();
     assert_eq!(after, saved, "bulk subscribe was lost across a restart");
-    assert!(after.contains(&"alt.binaries.hdtv".to_string()), "{after:?}");
-    assert!(after.contains(&"alt.binaries.teevee".to_string()), "{after:?}");
+    assert!(
+        after.contains(&"alt.binaries.hdtv".to_string()),
+        "{after:?}"
+    );
+    assert!(
+        after.contains(&"alt.binaries.teevee".to_string()),
+        "{after:?}"
+    );
 
     drop(r2);
     let _ = std::fs::remove_dir_all(&dir);
@@ -287,8 +319,14 @@ fn add_all_matches_keeps_the_rest_of_settings() {
 
     let text = std::fs::read_to_string(dir.join("settings.json")).unwrap();
     let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(v["index_interval_secs"], 900, "bulk add clobbered another setting: {text}");
-    assert!(v["index_groups"].as_array().is_some_and(|a| a.len() == 7), "{text}");
+    assert_eq!(
+        v["index_interval_secs"], 900,
+        "bulk add clobbered another setting: {text}"
+    );
+    assert!(
+        v["index_groups"].as_array().is_some_and(|a| a.len() == 7),
+        "{text}"
+    );
 
     drop(r);
     let _ = std::fs::remove_dir_all(&dir);
@@ -318,9 +356,19 @@ fn add_all_matches_honours_the_only_i_scan_filter() {
     // nothing to add. Before the fix this reported matched=7, added=5.
     let j = api(r.port, "mode=groups_add_matching&q=alt.binaries.*&sub=1");
     assert_eq!(j["status"], true, "{j}");
-    assert_eq!(j["matched"], list["total"], "bulk add matched a different set than the list: {j}");
-    assert_eq!(j["added"], 0, "bulk add subscribed groups that were not on screen: {j}");
-    assert_eq!(live_groups(r.port).len(), 2, "scan list grew behind the filter");
+    assert_eq!(
+        j["matched"], list["total"],
+        "bulk add matched a different set than the list: {j}"
+    );
+    assert_eq!(
+        j["added"], 0,
+        "bulk add subscribed groups that were not on screen: {j}"
+    );
+    assert_eq!(
+        live_groups(r.port).len(),
+        2,
+        "scan list grew behind the filter"
+    );
 
     // Toggle off, same query: now it is the whole seven, as before.
     let j = api(r.port, "mode=groups_add_matching&q=alt.binaries.*");

@@ -36,8 +36,14 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 6] =
-        [Kind::Video, Kind::Audio, Kind::Books, Kind::Images, Kind::Packed, Kind::Other];
+    pub const ALL: [Kind; 6] = [
+        Kind::Video,
+        Kind::Audio,
+        Kind::Books,
+        Kind::Images,
+        Kind::Packed,
+        Kind::Other,
+    ];
 
     pub fn key(self) -> &'static str {
         match self {
@@ -55,7 +61,10 @@ impl Kind {
     }
 
     fn index(self) -> usize {
-        Kind::ALL.iter().position(|k| *k == self).expect("Kind::ALL covers every variant")
+        Kind::ALL
+            .iter()
+            .position(|k| *k == self)
+            .expect("Kind::ALL covers every variant")
     }
 }
 
@@ -63,37 +72,78 @@ impl Kind {
 /// a file we can read. Checked longest-first so `.tar.gz` style suffixes
 /// cannot be shadowed by a shorter match.
 const EXT_KIND: &[(&str, Kind)] = &[
-    ("mkv", Kind::Video), ("mp4", Kind::Video), ("avi", Kind::Video),
-    ("m4v", Kind::Video), ("mov", Kind::Video), ("wmv", Kind::Video),
-    ("mpg", Kind::Video), ("mpeg", Kind::Video), ("m2ts", Kind::Video),
-    ("ts", Kind::Video), ("vob", Kind::Video), ("divx", Kind::Video),
-    ("webm", Kind::Video), ("iso", Kind::Video),
-    ("mp3", Kind::Audio), ("flac", Kind::Audio), ("m4a", Kind::Audio),
-    ("aac", Kind::Audio), ("ogg", Kind::Audio), ("wav", Kind::Audio),
-    ("ape", Kind::Audio), ("wma", Kind::Audio), ("opus", Kind::Audio),
-    ("epub", Kind::Books), ("mobi", Kind::Books), ("azw3", Kind::Books),
-    ("pdf", Kind::Books), ("cbz", Kind::Books), ("cbr", Kind::Books),
-    ("djvu", Kind::Books), ("azw", Kind::Books),
-    ("jpg", Kind::Images), ("jpeg", Kind::Images), ("png", Kind::Images),
-    ("gif", Kind::Images), ("bmp", Kind::Images), ("webp", Kind::Images),
+    ("mkv", Kind::Video),
+    ("mp4", Kind::Video),
+    ("avi", Kind::Video),
+    ("m4v", Kind::Video),
+    ("mov", Kind::Video),
+    ("wmv", Kind::Video),
+    ("mpg", Kind::Video),
+    ("mpeg", Kind::Video),
+    ("m2ts", Kind::Video),
+    ("ts", Kind::Video),
+    ("vob", Kind::Video),
+    ("divx", Kind::Video),
+    ("webm", Kind::Video),
+    ("iso", Kind::Video),
+    ("mp3", Kind::Audio),
+    ("flac", Kind::Audio),
+    ("m4a", Kind::Audio),
+    ("aac", Kind::Audio),
+    ("ogg", Kind::Audio),
+    ("wav", Kind::Audio),
+    ("ape", Kind::Audio),
+    ("wma", Kind::Audio),
+    ("opus", Kind::Audio),
+    ("epub", Kind::Books),
+    ("mobi", Kind::Books),
+    ("azw3", Kind::Books),
+    ("pdf", Kind::Books),
+    ("cbz", Kind::Books),
+    ("cbr", Kind::Books),
+    ("djvu", Kind::Books),
+    ("azw", Kind::Books),
+    ("jpg", Kind::Images),
+    ("jpeg", Kind::Images),
+    ("png", Kind::Images),
+    ("gif", Kind::Images),
+    ("bmp", Kind::Images),
+    ("webp", Kind::Images),
 ];
 
 /// Extensions that mean "this is a piece of a packed set" and therefore
 /// say nothing about the content on their own.
-const PACKED_EXT: &[&str] =
-    &["rar", "par2", "7z", "zip", "001", "002", "003", "nfo", "sfv", "srr", "srs"];
+const PACKED_EXT: &[&str] = &[
+    "rar", "par2", "7z", "zip", "001", "002", "003", "nfo", "sfv", "srr", "srs",
+];
 
 /// Release-name tokens that betray the content of a packed set. Only
 /// consulted when the extension itself was uninformative.
 const HINT: &[(&str, Kind)] = &[
-    ("1080p", Kind::Video), ("2160p", Kind::Video), ("720p", Kind::Video),
-    ("x264", Kind::Video), ("x265", Kind::Video), ("h264", Kind::Video),
-    ("hevc", Kind::Video), ("bluray", Kind::Video), ("bdrip", Kind::Video),
-    ("dvdrip", Kind::Video), ("webrip", Kind::Video), ("web-dl", Kind::Video),
-    ("hdtv", Kind::Video), ("xvid", Kind::Video), ("remux", Kind::Video),
-    ("flac", Kind::Audio), ("mp3", Kind::Audio), ("320kbps", Kind::Audio),
-    ("discography", Kind::Audio), ("vinyl", Kind::Audio), ("cdrip", Kind::Audio),
-    ("epub", Kind::Books), ("retail", Kind::Books), ("audiobook", Kind::Books),
+    ("1080p", Kind::Video),
+    ("2160p", Kind::Video),
+    ("720p", Kind::Video),
+    ("x264", Kind::Video),
+    ("x265", Kind::Video),
+    ("h264", Kind::Video),
+    ("hevc", Kind::Video),
+    ("bluray", Kind::Video),
+    ("bdrip", Kind::Video),
+    ("dvdrip", Kind::Video),
+    ("webrip", Kind::Video),
+    ("web-dl", Kind::Video),
+    ("hdtv", Kind::Video),
+    ("xvid", Kind::Video),
+    ("remux", Kind::Video),
+    ("flac", Kind::Audio),
+    ("mp3", Kind::Audio),
+    ("320kbps", Kind::Audio),
+    ("discography", Kind::Audio),
+    ("vinyl", Kind::Audio),
+    ("cdrip", Kind::Audio),
+    ("epub", Kind::Books),
+    ("retail", Kind::Books),
+    ("audiobook", Kind::Books),
 ];
 
 /// Pull the last `.ext` off a filename-looking token in a subject.
@@ -189,7 +239,13 @@ const SAMPLE_MAX_CHARS: usize = 120;
 /// multi-byte subject cannot be cut into invalid UTF-8.
 fn clean_subject(s: &str) -> String {
     s.chars()
-        .map(|c| if (c as u32) < 0x20 || c == '\u{7f}' || c == '\u{1f}' { ' ' } else { c })
+        .map(|c| {
+            if (c as u32) < 0x20 || c == '\u{7f}' || c == '\u{1f}' {
+                ' '
+            } else {
+                c
+            }
+        })
         .take(SAMPLE_MAX_CHARS)
         .collect::<String>()
         .trim()
@@ -206,7 +262,11 @@ impl GroupStats {
         posts: u64,
         entries: &[nzbkit::nntp::OverEntry],
     ) -> GroupStats {
-        let mut s = GroupStats { sampled_at, sample_n: entries.len() as u32, ..Default::default() };
+        let mut s = GroupStats {
+            sampled_at,
+            sample_n: entries.len() as u32,
+            ..Default::default()
+        };
         if entries.is_empty() {
             return s;
         }
@@ -229,8 +289,11 @@ impl GroupStats {
         // Dates: ignore unparseable (0) and anything implausibly far in
         // the future, which is common enough in real headers to matter.
         let horizon = sampled_at.saturating_add(7 * 86_400);
-        let mut dates: Vec<i64> =
-            entries.iter().map(|e| e.date).filter(|d| *d > 0 && *d <= horizon).collect();
+        let mut dates: Vec<i64> = entries
+            .iter()
+            .map(|e| e.date)
+            .filter(|d| *d > 0 && *d <= horizon)
+            .collect();
         if dates.is_empty() {
             return s;
         }
@@ -299,12 +362,6 @@ impl GroupStats {
             .filter(|k| self.kinds[k.index()] > 0)
             .or(Some(Kind::Other))
     }
-
-    /// Share of the sample in `k`, 0.0..=1.0.
-    pub fn share(&self, k: Kind) -> f64 {
-        let total: u32 = self.kinds.iter().sum();
-        if total == 0 { 0.0 } else { self.kinds[k.index()] as f64 / total as f64 }
-    }
 }
 
 /// Sampled stats for the catalogue, keyed by group name.
@@ -346,7 +403,11 @@ impl StatsCache {
                 s.est_bytes,
                 s.last_post,
                 s.per_day,
-                s.kinds.iter().map(u32::to_string).collect::<Vec<_>>().join(","),
+                s.kinds
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
                 s.samples.join("\u{1f}"),
             ));
         }
@@ -417,9 +478,18 @@ mod tests {
 
     #[test]
     fn extension_wins_when_the_subject_names_a_file() {
-        assert_eq!(classify_subject(r#"[01/42] - "Some.Film.mkv" yEnc (1/500)"#), Kind::Video);
-        assert_eq!(classify_subject(r#"[1/9] - "album - 01 track.flac" yEnc"#), Kind::Audio);
-        assert_eq!(classify_subject(r#""A Novel.epub" yEnc (1/2)"#), Kind::Books);
+        assert_eq!(
+            classify_subject(r#"[01/42] - "Some.Film.mkv" yEnc (1/500)"#),
+            Kind::Video
+        );
+        assert_eq!(
+            classify_subject(r#"[1/9] - "album - 01 track.flac" yEnc"#),
+            Kind::Audio
+        );
+        assert_eq!(
+            classify_subject(r#""A Novel.epub" yEnc (1/2)"#),
+            Kind::Books
+        );
         assert_eq!(classify_subject(r#""holiday.JPG" yEnc"#), Kind::Images);
     }
 
@@ -430,9 +500,15 @@ mod tests {
             classify_subject(r#"[03/55] - "Movie.2024.1080p.BluRay.x264.part02.rar" yEnc"#),
             Kind::Video
         );
-        assert_eq!(classify_subject(r#""Artist-Album-FLAC-2024.par2" yEnc"#), Kind::Audio);
+        assert_eq!(
+            classify_subject(r#""Artist-Album-FLAC-2024.par2" yEnc"#),
+            Kind::Audio
+        );
         // Nothing to go on: honest answer is "packed", not a guess.
-        assert_eq!(classify_subject(r#"[01/20] - "a7f3b91c2d.part01.rar" yEnc"#), Kind::Packed);
+        assert_eq!(
+            classify_subject(r#"[01/20] - "a7f3b91c2d.part01.rar" yEnc"#),
+            Kind::Packed
+        );
     }
 
     #[test]
@@ -445,9 +521,15 @@ mod tests {
     #[test]
     fn hostile_subjects_are_survivable() {
         for s in [
-            "\"\"", "...", "....................", "\"unclosed",
-            "a.b.c.d.e.f.g.h.i.j.k.l.m.n.o.p", "\u{1f600}.\u{1f600}",
-            "x.", ".rar", "\"\".mkv",
+            "\"\"",
+            "...",
+            "....................",
+            "\"unclosed",
+            "a.b.c.d.e.f.g.h.i.j.k.l.m.n.o.p",
+            "\u{1f600}.\u{1f600}",
+            "x.",
+            ".rar",
+            "\"\".mkv",
         ] {
             let _ = classify_subject(s);
         }
@@ -481,10 +563,15 @@ mod tests {
         let t0 = 1_700_000_000;
         // 200 articles across 49 s: fast, but measured over enough
         // seconds to mean something.
-        let entries: Vec<OverEntry> =
-            (0..200).map(|i| oe(r#""x.mkv""#, 1000, t0 + i / 4)).collect();
+        let entries: Vec<OverEntry> = (0..200)
+            .map(|i| oe(r#""x.mkv""#, 1000, t0 + i / 4))
+            .collect();
         let s = GroupStats::from_sample(t0 + 100, 200, &entries);
-        assert!(s.per_day > 100_000.0, "a genuinely busy group has a rate: {}", s.per_day);
+        assert!(
+            s.per_day > 100_000.0,
+            "a genuinely busy group has a rate: {}",
+            s.per_day
+        );
     }
 
     #[test]
@@ -492,10 +579,14 @@ mod tests {
         let t0 = 1_700_000_000;
         // Every article stamped within the same couple of seconds: the
         // clock's resolution, not a measurement.
-        let entries: Vec<OverEntry> =
-            (0..200).map(|i| oe(r#""x.mkv""#, 1000, t0 + i % 2)).collect();
+        let entries: Vec<OverEntry> = (0..200)
+            .map(|i| oe(r#""x.mkv""#, 1000, t0 + i % 2))
+            .collect();
         let s = GroupStats::from_sample(t0 + 100, 200, &entries);
-        assert_eq!(s.per_day, 0.0, "a 1 s span is clock granularity, not a rate");
+        assert_eq!(
+            s.per_day, 0.0,
+            "a 1 s span is clock granularity, not a rate"
+        );
     }
 
     #[test]
@@ -510,7 +601,11 @@ mod tests {
         assert_eq!(s.samples[0], "newest", "newest subject must lead");
         // The cache's own field separator cannot survive in a subject, or
         // a hostile poster could forge extra fields on reload.
-        assert!(!s.samples[1].contains('\u{1f}'), "separator survived: {:?}", s.samples[1]);
+        assert!(
+            !s.samples[1].contains('\u{1f}'),
+            "separator survived: {:?}",
+            s.samples[1]
+        );
         assert!(!s.samples[1].contains('\u{7}'), "control char survived");
         assert!(s.samples.len() <= KEEP_SAMPLES);
     }
@@ -559,7 +654,10 @@ mod tests {
     #[test]
     fn empty_sample_is_harmless() {
         let s = GroupStats::from_sample(1000, 500, &[]);
-        assert_eq!((s.sample_n, s.avg_bytes, s.per_day, s.dominant()), (0, 0, 0.0, None));
+        assert_eq!(
+            (s.sample_n, s.avg_bytes, s.per_day, s.dominant()),
+            (0, 0, 0.0, None)
+        );
     }
 
     #[test]
@@ -584,8 +682,13 @@ mod tests {
         c.save(&p).unwrap();
         let back = StatsCache::load(&p).unwrap();
         std::fs::remove_dir_all(&dir).ok();
-        let g = back.get("alt.binaries.teevee").expect("group survived the roundtrip");
-        assert_eq!((g.sample_n, g.avg_bytes, g.est_bytes), (200, 700_000, 7_000_000_000));
+        let g = back
+            .get("alt.binaries.teevee")
+            .expect("group survived the roundtrip");
+        assert_eq!(
+            (g.sample_n, g.avg_bytes, g.est_bytes),
+            (200, 700_000, 7_000_000_000)
+        );
         assert!((g.per_day - 1234.5).abs() < 0.01);
         assert_eq!(g.dominant(), Some(Kind::Video));
     }
@@ -593,7 +696,13 @@ mod tests {
     #[test]
     fn staleness_drives_resampling() {
         let mut c = StatsCache::default();
-        c.map.insert("a.b".into(), GroupStats { sampled_at: 1_000_000, ..Default::default() });
+        c.map.insert(
+            "a.b".into(),
+            GroupStats {
+                sampled_at: 1_000_000,
+                ..Default::default()
+            },
+        );
         assert!(!c.is_stale("a.b", 1_000_000 + SAMPLE_TTL_SECS - 1));
         assert!(c.is_stale("a.b", 1_000_000 + SAMPLE_TTL_SECS + 1));
         assert!(c.is_stale("never.sampled", 1_000_000));
@@ -604,11 +713,20 @@ mod tests {
     #[test]
     fn unreadable_is_distinguished_from_unsampled() {
         let t0 = 1_700_000_000;
-        let entries: Vec<OverEntry> =
-            (0..5).map(|i| oe("62a453c96e904a87a509e1f0cf573aec", 10, t0 + i * 60)).collect();
+        let entries: Vec<OverEntry> = (0..5)
+            .map(|i| oe("62a453c96e904a87a509e1f0cf573aec", 10, t0 + i * 60))
+            .collect();
         let s = GroupStats::from_sample(t0, 5, &entries);
-        assert_eq!(s.dominant(), Some(Kind::Other), "a looked-at group reports Other");
-        assert_eq!(GroupStats::default().dominant(), None, "an unsampled group reports nothing");
+        assert_eq!(
+            s.dominant(),
+            Some(Kind::Other),
+            "a looked-at group reports Other"
+        );
+        assert_eq!(
+            GroupStats::default().dominant(),
+            None,
+            "an unsampled group reports nothing"
+        );
     }
 
     /// A wide baseline replaces the burst estimate; a narrow or backwards
@@ -616,15 +734,29 @@ mod tests {
     #[test]
     fn rate_baseline_needs_a_real_span() {
         let t0 = 1_700_000_000;
-        let mut s = GroupStats { last_post: t0, per_day: 0.0, ..Default::default() };
+        let mut s = GroupStats {
+            last_post: t0,
+            per_day: 0.0,
+            ..Default::default()
+        };
         s.set_rate_from_baseline(50_000, t0 - 86_400);
-        assert!((s.per_day - 50_000.0).abs() < 1.0, "one day of baseline: {}", s.per_day);
+        assert!(
+            (s.per_day - 50_000.0).abs() < 1.0,
+            "one day of baseline: {}",
+            s.per_day
+        );
         // Too narrow to divide by.
-        let mut s2 = GroupStats { last_post: t0, ..Default::default() };
+        let mut s2 = GroupStats {
+            last_post: t0,
+            ..Default::default()
+        };
         s2.set_rate_from_baseline(50_000, t0 - 60);
         assert_eq!(s2.per_day, 0.0);
         // Baseline newer than the newest post: nonsense, refuse it.
-        let mut s3 = GroupStats { last_post: t0, ..Default::default() };
+        let mut s3 = GroupStats {
+            last_post: t0,
+            ..Default::default()
+        };
         s3.set_rate_from_baseline(50_000, t0 + 86_400);
         assert_eq!(s3.per_day, 0.0);
     }

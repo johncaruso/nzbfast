@@ -36,9 +36,11 @@
 //! Adding a setting therefore needs no change to this file. Forgetting
 //! one of the three lists fails it.
 
+mod scratch;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
 /// Settable, but deliberately never echoed by `get_config`.
@@ -48,8 +50,7 @@ use std::process::{Child, Command, Stdio};
 /// instead and the value never leaves the daemon. `index_interests_applied`
 /// is a one-shot marker recording that the interest presets were expanded
 /// into scan groups - it has no control on the settings page.
-const SETTABLE_NOT_ECHOED: &[&str] =
-    &["apikey", "nzbkey", "omdb_key", "index_interests_applied"];
+const SETTABLE_NOT_ECHOED: &[&str] = &["apikey", "nzbkey", "omdb_key", "index_interests_applied"];
 
 /// Echoed by `get_config`, but not settable through `mode=config`.
 ///
@@ -79,7 +80,11 @@ const ECHOED_READ_ONLY: &[&str] = &[
 ];
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 /// Response body of a GET against the daemon (headers stripped).
@@ -96,7 +101,9 @@ fn http(port: u16, req: &str) -> String {
             Ok(out) => return out,
             Err(e) => {
                 last = e.to_string();
-                std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(attempt) + 50));
+                std::thread::sleep(std::time::Duration::from_millis(
+                    100 * u64::from(attempt) + 50,
+                ));
             }
         }
     }
@@ -105,12 +112,18 @@ fn http(port: u16, req: &str) -> String {
 
 fn http_once(port: u16, req: &str) -> std::io::Result<String> {
     let mut s = TcpStream::connect(("127.0.0.1", port))?;
-    write!(s, "GET {req} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")?;
+    write!(
+        s,
+        "GET {req} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+    )?;
     let mut out = String::new();
     let read = s.read_to_string(&mut out);
     if out.is_empty() {
         return Err(read.err().unwrap_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "closed without answering")
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "closed without answering",
+            )
         }));
     }
     Ok(out.split("\r\n\r\n").nth(1).unwrap_or("").to_string())
@@ -138,11 +151,11 @@ fn settings_block(port: u16) -> serde_json::Map<String, serde_json::Value> {
 /// match is ever reformatted this stops finding arms and the count
 /// assertion below fails loudly, which is the right direction to fail.
 fn allowlist() -> Vec<String> {
-    let src = include_str!("../src/serve.rs");
+    let src = include_str!("../src/serve/settings.rs");
     let mut names = Vec::new();
     let mut inside = false;
     for line in src.lines() {
-        if line.starts_with("fn apply_setting") {
+        if line.starts_with("pub(super) fn apply_setting") {
             inside = true;
             continue;
         }
@@ -158,13 +171,20 @@ fn allowlist() -> Vec<String> {
             break;
         }
         // `        "a" | "b" => {` at exactly two levels of indent.
-        let Some(rest) = line.strip_prefix("        \"") else { continue };
-        let Some(head) = rest.split("=>").next().filter(|_| rest.contains("=>")) else { continue };
+        let Some(rest) = line.strip_prefix("        \"") else {
+            continue;
+        };
+        let Some(head) = rest.split("=>").next().filter(|_| rest.contains("=>")) else {
+            continue;
+        };
         let head = format!("\"{head}");
         // Only an arm made purely of string literals and `|` separators.
         if head.split('|').all(|p| {
             let p = p.trim();
-            p.len() > 2 && p.starts_with('"') && p.ends_with('"') && !p[1..p.len() - 1].contains('"')
+            p.len() > 2
+                && p.starts_with('"')
+                && p.ends_with('"')
+                && !p[1..p.len() - 1].contains('"')
         }) {
             for p in head.split('|') {
                 names.push(p.trim().trim_matches('"').to_string());
@@ -197,10 +217,9 @@ struct Running {
 /// A scratch install. `settings.json` exists from the start so this
 /// reads as an EXISTING install and no first-run API key is minted -
 /// auth is not what these tests are about.
-fn scratch(name: &str) -> PathBuf {
+fn scratch(name: &str) -> scratch::ScratchDir {
     let dir = std::env::temp_dir().join(format!("nzbfast-setcat-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch::ScratchDir::attach(&dir);
     std::fs::write(dir.join("config.json"), "{\"servers\":[]}").unwrap();
     std::fs::write(dir.join("settings.json"), "{}").unwrap();
     dir
@@ -250,14 +269,21 @@ fn serve_env(dir: &Path, env: &[(&str, &str)]) -> Running {
             .stderr(Stdio::from(err))
             .spawn()
             .unwrap();
-        let mut running = Running { _child: KillOnDrop(child), port };
+        let mut running = Running {
+            _child: KillOnDrop(child),
+            port,
+        };
         if wait_ready(&mut running._child, port, &logfile) {
             return running;
         }
         // The daemon exited instead of binding: `free_port()` handed
         // :port to a parallel test between our bind(:0) and the daemon's
         // bind. Try a fresh port.
-        assert!(attempt < 2, "daemon exited without binding :{port}\n{}", log(&logfile));
+        assert!(
+            attempt < 2,
+            "daemon exited without binding :{port}\n{}",
+            log(&logfile)
+        );
     }
     unreachable!()
 }
@@ -416,12 +442,24 @@ fn turning_fast_verify_off_survives_a_restart_after_lean_was_chosen() {
     {
         let d = serve(&dir);
         let r = api(d.port, "mode=config&name=verify_mode&value=lean");
-        assert_eq!(r["status"].as_bool(), Some(true), "verify_mode rejected: {r}");
+        assert_eq!(
+            r["status"].as_bool(),
+            Some(true),
+            "verify_mode rejected: {r}"
+        );
         assert_eq!(settings_block(d.port)["verify_mode"], "lean");
 
         let r = api(d.port, "mode=config&name=fast_verify&value=0");
-        assert_eq!(r["status"].as_bool(), Some(true), "fast_verify rejected: {r}");
-        assert_eq!(settings_block(d.port)["verify_mode"], "full", "not applied live");
+        assert_eq!(
+            r["status"].as_bool(),
+            Some(true),
+            "fast_verify rejected: {r}"
+        );
+        assert_eq!(
+            settings_block(d.port)["verify_mode"],
+            "full",
+            "not applied live"
+        );
     } // daemon killed here
 
     {
@@ -441,14 +479,25 @@ fn turning_fast_verify_off_survives_a_restart_after_lean_was_chosen() {
     {
         let d = serve(&dir);
         let r = api(d.port, "mode=config&name=fast_verify&value=1");
-        assert_eq!(r["status"].as_bool(), Some(true), "fast_verify rejected: {r}");
-        assert_eq!(settings_block(d.port)["verify_mode"], "fast", "not applied live");
+        assert_eq!(
+            r["status"].as_bool(),
+            Some(true),
+            "fast_verify rejected: {r}"
+        );
+        assert_eq!(
+            settings_block(d.port)["verify_mode"],
+            "fast",
+            "not applied live"
+        );
     }
 
     {
         let d = serve(&dir);
         let s = settings_block(d.port);
-        assert_eq!(s["verify_mode"], "fast", "fast verify did not survive the restart");
+        assert_eq!(
+            s["verify_mode"], "fast",
+            "fast verify did not survive the restart"
+        );
         assert_eq!(s["fast_verify"], true, "fast verify came back off: {s:?}");
     }
 
@@ -482,7 +531,11 @@ fn a_locked_port_cannot_be_moved_from_the_dashboard() {
     {
         let d = serve(&dir);
         let r = api(d.port, "mode=config&name=port&value=6999");
-        assert_eq!(r["status"].as_bool(), Some(true), "port rejected while unlocked: {r}");
+        assert_eq!(
+            r["status"].as_bool(),
+            Some(true),
+            "port rejected while unlocked: {r}"
+        );
         assert_eq!(saved_port(), 6999, "an accepted port was not saved");
     }
 
@@ -491,14 +544,22 @@ fn a_locked_port_cannot_be_moved_from_the_dashboard() {
     {
         let d = serve_locked(&dir);
         let r = api(d.port, "mode=config&name=port&value=7001");
-        assert_eq!(r["status"].as_bool(), Some(false), "a locked port was accepted: {r}");
+        assert_eq!(
+            r["status"].as_bool(),
+            Some(false),
+            "a locked port was accepted: {r}"
+        );
         let err = r["error"].as_str().unwrap_or_default();
         assert!(
             err.contains("how it was started"),
             "the refusal has to say WHERE the port lives, got: {err:?}"
         );
         // The refusal must not rewrite what is already saved either.
-        assert_eq!(saved_port(), 6999, "a refused write still touched settings.json");
+        assert_eq!(
+            saved_port(),
+            6999,
+            "a refused write still touched settings.json"
+        );
         // `get_config` reports the LIVE port, so this is the assertion that
         // the saved 6999 was ignored at startup rather than applied.
         assert_eq!(
@@ -537,14 +598,28 @@ fn the_daemon_proves_its_identity_to_a_launcher() {
         &std::fs::read_to_string(dir.join("runtime.json")).expect("no runtime.json"),
     )
     .unwrap();
-    assert_eq!(rt["port"].as_u64(), Some(d.port as u64), "runtime.json names another port");
+    assert_eq!(
+        rt["port"].as_u64(),
+        Some(d.port as u64),
+        "runtime.json names another port"
+    );
     let token = rt["token"].as_str().unwrap_or_default().to_string();
-    assert!(token.len() >= 32, "the token is not a credential: {token:?}");
+    assert!(
+        token.len() >= 32,
+        "the token is not a credential: {token:?}"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(dir.join("runtime.json")).unwrap().permissions().mode();
-        assert_eq!(mode & 0o077, 0, "runtime.json is readable by other accounts: {mode:o}");
+        let mode = std::fs::metadata(dir.join("runtime.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "runtime.json is readable by other accounts: {mode:o}"
+        );
     }
 
     let proof_of = |token: &str, nonce: &str| {
@@ -552,7 +627,10 @@ fn the_daemon_proves_its_identity_to_a_launcher() {
         h.update(token.as_bytes());
         h.update(b":");
         h.update(nonce.as_bytes());
-        h.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>()
+        h.finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     };
 
     // The challenge rides the keyless probe - which is the ONLY reply a
@@ -569,11 +647,54 @@ fn the_daemon_proves_its_identity_to_a_launcher() {
     assert_ne!(again["hs_proof"], r["hs_proof"]);
     // No challenge, no proof field - nothing leaks into ordinary replies.
     let plain = api(d.port, "mode=version");
-    assert!(plain.get("hs_proof").is_none(), "a proof appeared unasked: {plain}");
+    assert!(
+        plain.get("hs_proof").is_none(),
+        "a proof appeared unasked: {plain}"
+    );
     // And a nonce that could not have come from a launcher is ignored
     // rather than hashed into the response.
     let junk = api(d.port, "mode=version&hs=short");
-    assert!(junk.get("hs_proof").is_none(), "an out-of-shape nonce was answered: {junk}");
+    assert!(
+        junk.get("hs_proof").is_none(),
+        "an out-of-shape nonce was answered: {junk}"
+    );
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The recoverable-delete default follows the platform.
+///
+/// On macOS and Windows the Trash and the Recycle Bin are places the user
+/// can see and empty, so cleanup routes deletes through them and a wrong
+/// guess by the junk heuristics stays undoable.
+///
+/// On Linux it is not. When the download volume is not the volume the home
+/// trash lives on - every NAS, every container, every seedbox - the
+/// freedesktop rules make a hidden `.Trash-<uid>` directory at the TOP of
+/// the download volume and move the files there. Nothing shows it, nothing
+/// empties it, and the space never comes back: reported from Unraid on
+/// 2 Aug 2026 as "reserving space on my SSD".
+///
+/// Read from a freshly launched daemon on purpose. The flag is a
+/// process-global that defaults OFF under `cfg(test)` so the cleanup
+/// suites cannot empty into a developer's real Trash, so an in-process
+/// assertion would only ever see the test override. The real binary is
+/// the only thing that can answer what a user gets.
+#[test]
+fn the_trash_default_follows_the_platform() {
+    let dir = scratch("trashdefault");
+    let d = serve(&dir);
+    let echoed = settings_block(d.port);
+    let on = echoed
+        .get("delete_to_trash")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| panic!("get_config does not report delete_to_trash: {echoed:?}"));
+    assert_eq!(
+        on,
+        !cfg!(target_os = "linux"),
+        "cleanup's recoverable-delete default is wrong for this platform. \
+         On Linux it must be OFF: the trash lands on the download volume \
+         itself and fills the user's disk with files nothing will empty."
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

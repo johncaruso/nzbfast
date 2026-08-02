@@ -60,15 +60,30 @@ Issues: [issue tracker](https://github.com/nzbfast/nzbfast/issues)
 
 ```sh
 docker run -d -p 6789:6789 \
-  -v ./config:/config -v ./downloads:/downloads -v ./watch:/watch \
+  -v /srv/nzbfast/config:/config \
+  -v /srv/nzbfast/downloads:/downloads \
+  -v /srv/nzbfast/watch:/watch \
   nzbfast/nzbfast
 ```
+
+Pick your own host folders, but give the volumes **absolute** paths: the
+mapped `/config` folder *is* your install (settings, API key, queue), and a
+relative path like `./config` points at a different, empty folder every
+time the command runs from a different directory - which looks exactly like
+an update that wiped your settings. To update, pull the new image and
+recreate the container with the same mappings. Easier still is the repo's
+[docker-compose.yml](docker-compose.yml), where updating is
+`docker compose pull && docker compose up -d`.
 
 Then open `http://<host>:6789` and add your provider in the Welcome panel.
 On a new install nzbfast generates an API key for itself, prints it once at
 startup, and stores it as `apikey` beside the config - that is the value
 Sonarr/Radarr and phone apps want. An existing install is never given one,
-so upgrading changes nothing.
+so upgrading changes nothing. Wiring up Sonarr/Radarr? Add
+`-e NZBFAST_APIKEY=<your key>` to the run command (or the compose
+environment) instead: a key stored in the container definition lives on the
+host and survives any container recreation, and a key set later in Settings
+still wins over it.
 Synology (Container Manager) has a step-by-step guide:
 [**docs/SYNOLOGY.md**](docs/SYNOLOGY.md). Unraid / TrueNAS SCALE / QNAP use
 the same image.

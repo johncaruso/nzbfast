@@ -28,6 +28,8 @@
 /// physically installed.
 pub fn physical_ram() -> Option<u64> {
     #[cfg(unix)]
+    // SAFETY: sysconf is a plain FFI call taking only an integer constant;
+    // it reads no pointers and has no preconditions.
     unsafe {
         let pages = libc::sysconf(libc::_SC_PHYS_PAGES);
         let page = libc::sysconf(libc::_SC_PAGE_SIZE);
@@ -36,6 +38,10 @@ pub fn physical_ram() -> Option<u64> {
         }
     }
     #[cfg(windows)]
+    // SAFETY: MemoryStatusEx is #[repr(C)] matching the documented
+    // MEMORYSTATUSEX layout (comment below), every field is a plain integer
+    // so zeroed() is a valid value, `length` is set to the struct size
+    // before the call as the API requires, and the pointer is a valid &mut.
     unsafe {
         // MEMORYSTATUSEX (sysinfoapi.h): two DWORD then seven DWORDLONG.
         // `dwLength` must be the struct's own size before the call.
@@ -52,6 +58,8 @@ pub fn physical_ram() -> Option<u64> {
             avail_extended_virtual: u64,
         }
         #[link(name = "kernel32")]
+        // SAFETY: signature matches the documented kernel32 export
+        // GlobalMemoryStatusEx (sysinfoapi.h), per the layout comment above.
         unsafe extern "system" {
             fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
         }
@@ -89,6 +97,9 @@ fn process_memory_counters() -> Option<(u64, u64)> {
         peak_pagefile_usage: usize,
     }
     #[link(name = "kernel32")]
+    // SAFETY: signatures match the documented kernel32 exports
+    // (GetCurrentProcess; K32GetProcessMemoryInfo, the kernel32 export of
+    // psapi's GetProcessMemoryInfo, per the doc comment above).
     unsafe extern "system" {
         fn GetCurrentProcess() -> isize;
         fn K32GetProcessMemoryInfo(
@@ -97,6 +108,10 @@ fn process_memory_counters() -> Option<(u64, u64)> {
             cb: u32,
         ) -> i32;
     }
+    // SAFETY: ProcessMemoryCounters is #[repr(C)] matching the documented
+    // PROCESS_MEMORY_COUNTERS layout (comment above), every field is a plain
+    // integer so zeroed() is a valid value, cb is set to the struct size
+    // before the call, and both arguments passed are valid.
     unsafe {
         let mut c: ProcessMemoryCounters = std::mem::zeroed();
         c.cb = std::mem::size_of::<ProcessMemoryCounters>() as u32;
@@ -142,7 +157,11 @@ pub fn cgroup_mem_limit() -> Option<u64> {
         let found = if ctrls.is_empty() {
             tightest(Path::new("/sys/fs/cgroup"), rel, "memory.max")
         } else if ctrls.split(',').any(|c| c == "memory") {
-            tightest(Path::new("/sys/fs/cgroup/memory"), rel, "memory.limit_in_bytes")
+            tightest(
+                Path::new("/sys/fs/cgroup/memory"),
+                rel,
+                "memory.limit_in_bytes",
+            )
         } else {
             None
         };
@@ -180,7 +199,9 @@ impl MemBudget {
     /// half is spent on cache and half stays free for everything the
     /// budget doesn't track (decode scratch, repair matrices, stacks).
     pub fn auto() -> MemBudget {
-        MemBudget { total: Self::auto_total(physical_ram(), cgroup_mem_limit()) }
+        MemBudget {
+            total: Self::auto_total(physical_ram(), cgroup_mem_limit()),
+        }
     }
 
     fn auto_total(ram: Option<u64>, cgroup_limit: Option<u64>) -> u64 {
@@ -194,7 +215,9 @@ impl MemBudget {
     }
 
     pub fn with_total(total: u64) -> MemBudget {
-        MemBudget { total: total.max(Self::MIN) }
+        MemBudget {
+            total: total.max(Self::MIN),
+        }
     }
 
     /// Extractor held-span ceiling (spill: materialize volumes to disk).
@@ -317,9 +340,17 @@ pub struct ConcurrencyCaps {
 
 impl ConcurrencyCaps {
     /// Clamp the requested values to these caps.
-    pub fn apply(&self, connections: usize, window: usize, decoders: usize)
-    -> (usize, usize, usize) {
-        (connections.min(self.connections), window.min(self.window), decoders.min(self.decoders))
+    pub fn apply(
+        &self,
+        connections: usize,
+        window: usize,
+        decoders: usize,
+    ) -> (usize, usize, usize) {
+        (
+            connections.min(self.connections),
+            window.min(self.window),
+            decoders.min(self.decoders),
+        )
     }
 }
 
@@ -341,9 +372,17 @@ fn concurrency_caps_for(ram: Option<u64>, cgroup_limit: Option<u64>) -> Option<C
         (None, None) => return None,
     };
     if eff <= 512 << 20 {
-        Some(ConcurrencyCaps { connections: 4, window: 2, decoders: 2 })
+        Some(ConcurrencyCaps {
+            connections: 4,
+            window: 2,
+            decoders: 2,
+        })
     } else if eff <= 1 << 30 {
-        Some(ConcurrencyCaps { connections: 6, window: 3, decoders: 2 })
+        Some(ConcurrencyCaps {
+            connections: 6,
+            window: 3,
+            decoders: 2,
+        })
     } else {
         None
     }
@@ -354,19 +393,42 @@ fn concurrency_caps_for(ram: Option<u64>, cgroup_limit: Option<u64>) -> Option<C
 /// benchmarks quote.
 pub fn peak_rss() -> Option<u64> {
     #[cfg(unix)]
+    // SAFETY: libc::rusage is plain data (integer fields only) so zeroed()
+    // is a valid value, and getrusage writes through a valid &mut pointer.
     unsafe {
         let mut ru: libc::rusage = std::mem::zeroed();
         if libc::getrusage(libc::RUSAGE_SELF, &mut ru) == 0 {
             let raw = ru.ru_maxrss as u64;
-            return Some(if cfg!(target_os = "linux") { raw * 1024 } else { raw });
+            return Some(if cfg!(target_os = "linux") {
+                raw * 1024
+            } else {
+                raw
+            });
         }
     }
     #[cfg(windows)]
     {
-        return process_memory_counters().map(|(peak, _)| peak);
+        process_memory_counters().map(|(peak, _)| peak)
     }
     #[cfg(not(windows))]
     None
+}
+
+// The one true `task_info` declaration. It used to be declared twice,
+// locally in `current_rss` and `dashboard_rss`, each with its own
+// info-struct pointer type - two conflicting extern signatures for one
+// symbol, which the language rules call undefined behaviour even when
+// both are pointer-sized. Declared once with the real Mach signature
+// (`task_info_t` is `integer_t*`); callers cast their struct pointer.
+#[cfg(target_os = "macos")]
+// SAFETY: declared once, with the real Mach signature (`task_info_t` is
+// `integer_t*`) per the comment above, so there are no conflicting extern
+// declarations for the symbol; callers cast their #[repr(C)] info-struct
+// pointer at the call site.
+unsafe extern "C" {
+    static mach_task_self_: u32;
+    #[link_name = "task_info"]
+    fn mach_task_info(task: u32, flavor: u32, info: *mut i32, count: *mut u32) -> i32;
 }
 
 /// CURRENT resident set size in bytes - the live number the dashboard's
@@ -383,6 +445,11 @@ pub fn current_rss() -> Option<u64> {
         }
     }
     #[cfg(target_os = "macos")]
+    // SAFETY: TaskBasicInfo is #[repr(C)] matching the documented
+    // mach_task_basic_info layout (comment below), every field is a plain
+    // integer so zeroed() is a valid value, `count` is initialized to the
+    // struct size in integer_t units as task_info requires, and the
+    // out-pointers are valid; mach_task_self_ is a plain u32 read.
     unsafe {
         // struct mach_task_basic_info (mach/task_info.h): three
         // mach_vm_size_t, two time_value_t, policy_t, integer_t.
@@ -396,15 +463,16 @@ pub fn current_rss() -> Option<u64> {
             policy: i32,
             suspend_count: i32,
         }
-        unsafe extern "C" {
-            static mach_task_self_: u32;
-            fn task_info(task: u32, flavor: u32, info: *mut TaskBasicInfo, count: *mut u32)
-                -> i32;
-        }
         const MACH_TASK_BASIC_INFO: u32 = 20;
         let mut info: TaskBasicInfo = std::mem::zeroed();
         let mut count = (std::mem::size_of::<TaskBasicInfo>() / 4) as u32;
-        if task_info(mach_task_self_, MACH_TASK_BASIC_INFO, &mut info, &mut count) == 0 {
+        if mach_task_info(
+            mach_task_self_,
+            MACH_TASK_BASIC_INFO,
+            (&raw mut info).cast(),
+            &mut count,
+        ) == 0
+        {
             return Some(info.resident_size);
         }
     }
@@ -413,8 +481,14 @@ pub fn current_rss() -> Option<u64> {
         // statm field 2 = resident pages.
         if let Some(pages) = std::fs::read_to_string("/proc/self/statm")
             .ok()
-            .and_then(|s| s.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()))
+            .and_then(|s| {
+                s.split_whitespace()
+                    .nth(1)
+                    .and_then(|v| v.parse::<u64>().ok())
+            })
         {
+            // SAFETY: sysconf is a plain FFI call taking only an integer
+            // constant; it reads no pointers and has no preconditions.
             let page = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) };
             if page > 0 {
                 return Some(pages * page as u64);
@@ -432,6 +506,11 @@ pub fn current_rss() -> Option<u64> {
 /// current_rss.
 pub fn dashboard_rss() -> Option<u64> {
     #[cfg(target_os = "macos")]
+    // SAFETY: TaskVmInfo is #[repr(C)] matching the documented task_vm_info
+    // layout (comment below), every field is a plain integer so Default's
+    // zero value is valid, `count` is initialized to the struct size in
+    // integer_t units as task_info requires, and the out-pointers are
+    // valid; mach_task_self_ is a plain u32 read.
     unsafe {
         // struct task_vm_info (mach/task_info.h), flavor 22.
         #[repr(C)]
@@ -460,14 +539,15 @@ pub fn dashboard_rss() -> Option<u64> {
             min_address: u64,
             max_address: u64,
         }
-        unsafe extern "C" {
-            static mach_task_self_: u32;
-            fn task_info(task: u32, flavor: u32, info: *mut TaskVmInfo, count: *mut u32) -> i32;
-        }
         const TASK_VM_INFO: u32 = 22;
         let mut info = TaskVmInfo::default();
         let mut count = (std::mem::size_of::<TaskVmInfo>() / 4) as u32;
-        if task_info(mach_task_self_, TASK_VM_INFO, &mut info, &mut count) == 0
+        if mach_task_info(
+            mach_task_self_,
+            TASK_VM_INFO,
+            (&raw mut info).cast(),
+            &mut count,
+        ) == 0
             && info.phys_footprint > 0
         {
             return Some(info.phys_footprint);
@@ -486,6 +566,8 @@ pub fn dashboard_rss() -> Option<u64> {
 pub fn trim() -> u64 {
     #[cfg(target_os = "macos")]
     {
+        // SAFETY: signature matches the documented declaration in
+        // malloc/malloc.h (comment below).
         unsafe extern "C" {
             // malloc/malloc.h: zone == NULL means every zone, goal == 0
             // means "release as much as possible".
@@ -494,9 +576,13 @@ pub fn trim() -> u64 {
                 goal: libc::size_t,
             ) -> libc::size_t;
         }
+        // SAFETY: NULL zone and goal 0 are documented valid arguments (see
+        // the comment on the declaration above).
         return unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) as u64 };
     }
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: malloc_trim is a plain FFI call taking only an integer; it
+    // reads no pointers and has no preconditions.
     unsafe {
         libc::malloc_trim(0);
     }
@@ -507,6 +593,8 @@ pub fn trim() -> u64 {
 /// Deltas between samples over wall time give the process CPU%.
 pub fn cpu_time_secs() -> Option<f64> {
     #[cfg(unix)]
+    // SAFETY: libc::rusage is plain data (integer fields only) so zeroed()
+    // is a valid value, and getrusage writes through a valid &mut pointer.
     unsafe {
         let mut ru: libc::rusage = std::mem::zeroed();
         if libc::getrusage(libc::RUSAGE_SELF, &mut ru) == 0 {
@@ -519,6 +607,9 @@ pub fn cpu_time_secs() -> Option<f64> {
         }
     }
     #[cfg(windows)]
+    // SAFETY: FileTime is #[repr(C)] matching the documented FILETIME
+    // layout (comment below), and all four out-pointers passed to
+    // GetProcessTimes are valid &muts to initialized values.
     unsafe {
         // FILETIME pairs, 100-nanosecond units. Creation and exit times are
         // wall clock and not what this wants; kernel + user is the charge.
@@ -534,6 +625,9 @@ pub fn cpu_time_secs() -> Option<f64> {
             }
         }
         #[link(name = "kernel32")]
+        // SAFETY: signatures match the documented kernel32 exports
+        // (GetCurrentProcess, GetProcessTimes; FILETIME layout per the
+        // comment above).
         unsafe extern "system" {
             fn GetCurrentProcess() -> isize;
             fn GetProcessTimes(
@@ -544,14 +638,74 @@ pub fn cpu_time_secs() -> Option<f64> {
                 user: *mut FileTime,
             ) -> i32;
         }
-        let (mut c, mut e, mut k, mut u) =
-            (FileTime::default(), FileTime::default(), FileTime::default(), FileTime::default());
+        let (mut c, mut e, mut k, mut u) = (
+            FileTime::default(),
+            FileTime::default(),
+            FileTime::default(),
+            FileTime::default(),
+        );
         if GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u) != 0 {
             return Some(k.secs() + u.secs());
         }
     }
     None
 }
+
+/// Opt this process out of Windows 11 power throttling (EcoQoS).
+///
+/// Windows demotes sustained "background" CPU work - anything without a
+/// foreground window, which is exactly a daemon or an ssh-launched
+/// process - onto efficiency cores at reduced QoS a few seconds in.
+/// Measured on the i7-1280P: the GF(2^16) repair fold ran at 111 GB/s
+/// for ~3 s and then 13 GB/s for the rest of a heavy repair (the whole
+/// machine sat 66% idle). This opts out of execution-speed throttling
+/// while leaving priority CLASS alone, so we schedule normally instead
+/// of being parked, without starving anyone the way a raised priority
+/// would. No-op off Windows and on Windows versions without the API.
+#[cfg(windows)]
+pub fn opt_out_of_power_throttling() {
+    #[repr(C)]
+    struct PowerThrottlingState {
+        version: u32,
+        control_mask: u32,
+        state_mask: u32,
+    }
+    const VERSION: u32 = 1; // PROCESS_POWER_THROTTLING_CURRENT_VERSION
+    const EXECUTION_SPEED: u32 = 0x1; // PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+    const PROCESS_POWER_THROTTLING: i32 = 4; // PROCESS_INFORMATION_CLASS
+    #[link(name = "kernel32")]
+    // SAFETY: signatures match the documented kernel32 exports
+    // (GetCurrentProcess, SetProcessInformation).
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn SetProcessInformation(
+            process: isize,
+            class: i32,
+            info: *const core::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+    let state = PowerThrottlingState {
+        version: VERSION,
+        control_mask: EXECUTION_SPEED,
+        state_mask: 0, // control it, and set it OFF
+    };
+    // Failure (older Windows) just leaves the OS default in place.
+    // SAFETY: `state` is a live #[repr(C)] struct matching the documented
+    // PROCESS_POWER_THROTTLING_STATE layout (the named constants above),
+    // and the pointer and size passed describe exactly that struct.
+    unsafe {
+        SetProcessInformation(
+            GetCurrentProcess(),
+            PROCESS_POWER_THROTTLING,
+            &state as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<PowerThrottlingState>() as u32,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+pub fn opt_out_of_power_throttling() {}
 
 #[cfg(test)]
 mod tests {
@@ -564,7 +718,10 @@ mod tests {
         assert_eq!(b.partials_cap(), (1u64 << 30) as usize / 100 * 30);
         assert!(b.bufpool_bufs() >= 32 && b.bufpool_bufs() <= 512);
         // B2: channel depth scales with the budget and stays clamped.
-        assert_eq!(b.channel_depth(), ((1u64 << 30) / 16 / (800 * 1024)) as usize);
+        assert_eq!(
+            b.channel_depth(),
+            ((1u64 << 30) / 16 / (800 * 1024)) as usize
+        );
         assert_eq!(MemBudget::with_total(256 << 20).channel_depth(), 20);
         assert_eq!(MemBudget::with_total(64 << 20).channel_depth(), 8); // floor
         assert_eq!(MemBudget::with_total(16 << 30).channel_depth(), 256); // cap
@@ -594,7 +751,10 @@ mod tests {
         // Roomy limit doesn't inflate the host-derived figure.
         assert_eq!(MemBudget::auto_total(Some(8 * gb), Some(32 * gb)), 2 * gb);
         // Tiny limit floors at MIN, not at the 256 MB auto floor.
-        assert_eq!(MemBudget::auto_total(Some(25 * gb), Some(96 << 20)), MemBudget::MIN);
+        assert_eq!(
+            MemBudget::auto_total(Some(25 * gb), Some(96 << 20)),
+            MemBudget::MIN
+        );
     }
 
     #[test]
@@ -603,20 +763,36 @@ mod tests {
         // Tiny tier: <=512 MB.
         assert_eq!(
             concurrency_caps_for(mb(256), None),
-            Some(ConcurrencyCaps { connections: 4, window: 2, decoders: 2 })
+            Some(ConcurrencyCaps {
+                connections: 4,
+                window: 2,
+                decoders: 2
+            })
         );
         assert_eq!(
             concurrency_caps_for(mb(512), None),
-            Some(ConcurrencyCaps { connections: 4, window: 2, decoders: 2 })
+            Some(ConcurrencyCaps {
+                connections: 4,
+                window: 2,
+                decoders: 2
+            })
         );
         // Small tier: <=1 GB.
         assert_eq!(
             concurrency_caps_for(mb(513), None),
-            Some(ConcurrencyCaps { connections: 6, window: 3, decoders: 2 })
+            Some(ConcurrencyCaps {
+                connections: 6,
+                window: 3,
+                decoders: 2
+            })
         );
         assert_eq!(
             concurrency_caps_for(mb(1024), None),
-            Some(ConcurrencyCaps { connections: 6, window: 3, decoders: 2 })
+            Some(ConcurrencyCaps {
+                connections: 6,
+                window: 3,
+                decoders: 2
+            })
         );
         // Above 1 GB: no caps - big-box behavior byte-identical.
         assert_eq!(concurrency_caps_for(mb(1025), None), None);
@@ -624,9 +800,18 @@ mod tests {
         // The tighter of host RAM and cgroup limit picks the tier.
         assert_eq!(
             concurrency_caps_for(Some(64 << 30), mb(512)),
-            Some(ConcurrencyCaps { connections: 4, window: 2, decoders: 2 })
+            Some(ConcurrencyCaps {
+                connections: 4,
+                window: 2,
+                decoders: 2
+            })
         );
-        assert_eq!(concurrency_caps_for(mb(512), Some(64 << 30)).unwrap().connections, 4);
+        assert_eq!(
+            concurrency_caps_for(mb(512), Some(64 << 30))
+                .unwrap()
+                .connections,
+            4
+        );
         // Unknown RAM never clamps - a failed probe is not a small box.
         assert_eq!(concurrency_caps_for(None, None), None);
         assert_eq!(concurrency_caps_for(None, mb(256)).unwrap().connections, 4);
@@ -634,7 +819,11 @@ mod tests {
 
     #[test]
     fn concurrency_caps_apply_clamps_only_downward() {
-        let caps = ConcurrencyCaps { connections: 6, window: 3, decoders: 2 };
+        let caps = ConcurrencyCaps {
+            connections: 6,
+            window: 3,
+            decoders: 2,
+        };
         // Above the caps: clamped, per axis.
         assert_eq!(caps.apply(8, 4, 4), (6, 3, 2));
         // At or below: untouched - a deliberate low setting stays.
@@ -698,54 +887,3 @@ mod tests {
         trim(); // idempotent on an already-trimmed heap
     }
 }
-
-/// Opt this process out of Windows 11 power throttling (EcoQoS).
-///
-/// Windows demotes sustained "background" CPU work - anything without a
-/// foreground window, which is exactly a daemon or an ssh-launched
-/// process - onto efficiency cores at reduced QoS a few seconds in.
-/// Measured on the i7-1280P: the GF(2^16) repair fold ran at 111 GB/s
-/// for ~3 s and then 13 GB/s for the rest of a heavy repair (the whole
-/// machine sat 66% idle). This opts out of execution-speed throttling
-/// while leaving priority CLASS alone, so we schedule normally instead
-/// of being parked, without starving anyone the way a raised priority
-/// would. No-op off Windows and on Windows versions without the API.
-#[cfg(windows)]
-pub fn opt_out_of_power_throttling() {
-    #[repr(C)]
-    struct PowerThrottlingState {
-        version: u32,
-        control_mask: u32,
-        state_mask: u32,
-    }
-    const VERSION: u32 = 1; // PROCESS_POWER_THROTTLING_CURRENT_VERSION
-    const EXECUTION_SPEED: u32 = 0x1; // PROCESS_POWER_THROTTLING_EXECUTION_SPEED
-    const PROCESS_POWER_THROTTLING: i32 = 4; // PROCESS_INFORMATION_CLASS
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetCurrentProcess() -> isize;
-        fn SetProcessInformation(
-            process: isize,
-            class: i32,
-            info: *const core::ffi::c_void,
-            size: u32,
-        ) -> i32;
-    }
-    let state = PowerThrottlingState {
-        version: VERSION,
-        control_mask: EXECUTION_SPEED,
-        state_mask: 0, // control it, and set it OFF
-    };
-    // Failure (older Windows) just leaves the OS default in place.
-    unsafe {
-        SetProcessInformation(
-            GetCurrentProcess(),
-            PROCESS_POWER_THROTTLING,
-            &state as *const _ as *const core::ffi::c_void,
-            std::mem::size_of::<PowerThrottlingState>() as u32,
-        );
-    }
-}
-
-#[cfg(not(windows))]
-pub fn opt_out_of_power_throttling() {}

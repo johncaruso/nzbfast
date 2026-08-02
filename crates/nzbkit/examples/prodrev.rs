@@ -73,7 +73,9 @@ fn main() {
             }
         }
     }
-    let missing: Vec<usize> = (0..slots.len()).filter(|&i| slot_path[i].is_none()).collect();
+    let missing: Vec<usize> = (0..slots.len())
+        .filter(|&i| slot_path[i].is_none())
+        .collect();
     if missing.is_empty() {
         eprintln!("all data volumes verify; .rev not needed");
         return;
@@ -87,7 +89,10 @@ fn main() {
 
     let mut intact_sources: Vec<Option<FileSource>> = Vec::with_capacity(slots.len());
     for path in &slot_path {
-        intact_sources.push(path.as_ref().map(|p| FileSource::open(p).expect("open volume")));
+        intact_sources.push(
+            path.as_ref()
+                .map(|p| FileSource::open(p).expect("open volume")),
+        );
     }
     let intact: Vec<Option<&dyn RangeSource>> = intact_sources
         .iter()
@@ -153,7 +158,9 @@ fn rfind_ascii_ci(hay: &str, needle: &str) -> Option<usize> {
     if n.is_empty() || h.len() < n.len() {
         return None;
     }
-    (0..=h.len() - n.len()).rev().find(|&i| h[i..i + n.len()].eq_ignore_ascii_case(n))
+    (0..=h.len() - n.len())
+        .rev()
+        .find(|&i| h[i..i + n.len()].eq_ignore_ascii_case(n))
 }
 
 fn derive_part_name(known: &str, known_slot: usize, slot: usize) -> Option<String> {

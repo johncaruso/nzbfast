@@ -12,6 +12,7 @@
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use tracing::{error, warn};
 
 /// `queue.json` → `queue.json.bak` (same directory, so the pair travels
 /// together with the spool).
@@ -88,7 +89,10 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 pub(crate) fn json_store_unreadable(path: &Path) -> bool {
     let bak = sibling(path, ".bak");
     let readable = |p: &Path| {
-        std::fs::read(p).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).is_some()
+        std::fs::read(p)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .is_some()
     };
     // `.corrupt` counts as evidence the primary once existed: an
     // unparseable primary is RENAMED there, so by the next start the
@@ -118,8 +122,9 @@ pub(crate) fn load_json_with_backup(path: &Path) -> Option<Value> {
                 .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
             return match recovered {
                 Some(v) => {
-                    eprintln!(
-                        "[persist] {} is missing but {} is intact - recovering from it \
+                    warn!(
+                        target: "persist",
+                        "{} is missing but {} is intact - recovering from it \
                          (delete {} too if you meant to reset)",
                         path.display(),
                         bak.display(),
@@ -147,8 +152,9 @@ pub(crate) fn load_json_with_backup(path: &Path) -> Option<Value> {
         Err(e) => {
             let kept = sibling(path, ".corrupt");
             let _ = std::fs::rename(path, &kept);
-            eprintln!(
-                "[persist] {} won't parse ({e}) - bytes kept at {}",
+            warn!(
+                target: "persist",
+                "{} won't parse ({e}) - bytes kept at {}",
                 path.display(),
                 kept.display()
             );
@@ -157,13 +163,16 @@ pub(crate) fn load_json_with_backup(path: &Path) -> Option<Value> {
                 .and_then(|b| Some((serde_json::from_slice::<Value>(&b).ok()?, b)));
             match good {
                 Some((v, b)) => {
-                    eprintln!("[persist] restored last good state from {}", bak.display());
+                    warn!(target: "persist", "restored last good state from {}", bak.display());
                     let _ = write_atomic(path, &b);
                     Some(v)
                 }
                 None => {
-                    eprintln!(
-                        "[persist] no usable {} - starting empty ({} has the old bytes)",
+                    // Not a warning: the queue/history this file held is
+                    // gone, and nothing later recovers it.
+                    error!(
+                        target: "persist",
+                        "no usable {} - starting empty ({} has the old bytes)",
                         bak.display(),
                         kept.display()
                     );
@@ -201,7 +210,8 @@ mod tests {
     use serde_json::json;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("nzbfast-persist-{}-{name}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("nzbfast-persist-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

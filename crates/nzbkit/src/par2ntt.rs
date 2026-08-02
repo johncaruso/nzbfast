@@ -131,7 +131,12 @@ impl FlatPlan {
             *slot = Some(src);
         }
         let root = build_node(&slots, 1, needed, 0, &ip).expect("nonempty set built no tree");
-        Ok(FlatPlan { root, g_pow, kernel, needed })
+        Ok(FlatPlan {
+            root,
+            g_pow,
+            kernel,
+            needed,
+        })
     }
 
     pub fn new_scratch(&self, w: usize) -> Scratch {
@@ -200,9 +205,17 @@ fn build_node(
             }
         }
         conv_sources.sort_unstable();
-        return Some(Node::Leaf(LeafPlan { buf, conv_sources, x0: slots[0] }));
+        return Some(Node::Leaf(LeafPlan {
+            buf,
+            conv_sources,
+            x0: slots[0],
+        }));
     }
-    let p = [3usize, 5, 17].iter().copied().find(|p| n % p == 0).expect("bad node size");
+    let p = [3usize, 5, 17]
+        .iter()
+        .copied()
+        .find(|p| n.is_multiple_of(*p))
+        .expect("bad node size");
     let q = n / p;
     let sub_needed = needed.min(q);
     let mut children = Vec::new();
@@ -222,11 +235,17 @@ fn build_node(
     let mut coeffs = vec![0u16; rows * lives.len()];
     for k in 0..rows {
         for (j, &u) in lives.iter().enumerate() {
-            coeffs[k * lives.len() + j] =
-                gf16::pow2(root_log * (u as u64) * (k as u64) % N as u64);
+            coeffs[k * lives.len() + j] = gf16::pow2(root_log * (u as u64) * (k as u64) % N as u64);
         }
     }
-    Some(Node::Combine(CombinePlan { buf, rows, q, children, coeffs, child_nodes }))
+    Some(Node::Combine(CombinePlan {
+        buf,
+        rows,
+        q,
+        children,
+        coeffs,
+        child_nodes,
+    }))
 }
 
 fn child_buf(n: &Node) -> usize {
@@ -246,6 +265,11 @@ fn fold_into(dst: &mut [u16], srcs: &[*const u8], coeffs: &[u16], w: usize) {
         let cnt = (srcs.len() - g).min(8);
         let mut group: [&[u8]; 8] = [&[]; 8];
         for (t, &p) in srcs[g..g + cnt].iter().enumerate() {
+            // SAFETY: every src must be readable for w*2 bytes. Both
+            // callers uphold this: src_of pointers carry at least 2*w
+            // readable bytes per FlatPlan::transform's documented
+            // contract, and eval's pool pointers each address a full
+            // w-word row of a child slot.
             group[t] = unsafe { std::slice::from_raw_parts(p, w * 2) };
         }
         let done = gf16::xor_mul_multi_into(&mut dst[..w], &group[..cnt], &coeffs[g..g + cnt]);
@@ -293,7 +317,7 @@ fn eval(
             // X[0] = x[0] + every conv source, coefficient 1.
             fold_into(&mut out[..w], &ptrs, &ones, w);
             // X[g^m] = x[0] + Σ_i a_i · b[(m-i) mod 256].
-            let x0_ptr = leaf.x0.map(|s| src_of(s));
+            let x0_ptr = leaf.x0.map(src_of);
             let mut cptrs: Vec<*const u8> = Vec::with_capacity(leaf.conv_sources.len() + 1);
             let mut cco: Vec<u16> = Vec::with_capacity(leaf.conv_sources.len() + 1);
             for &(_, src) in &leaf.conv_sources {
@@ -315,6 +339,11 @@ fn eval(
             }
         }
         Node::Combine(c) => {
+            // SAFETY: scratch is the exclusive &mut Scratch that
+            // transform cast to a raw pointer; it stays valid for the
+            // whole recursion and only row pointers are derived from
+            // it here (no long-lived reference), per the aliasing
+            // argument in this function's doc comment.
             let (child_pool, child_rows): (*mut u16, usize) = unsafe {
                 match depth {
                     0 => ((*scratch).depth1.as_mut_ptr(), (*scratch).rows1),
@@ -325,6 +354,12 @@ fn eval(
             };
             for child in &c.child_nodes {
                 let b = child_buf(child);
+                // SAFETY: slot b spans child_rows*w words inside the
+                // depth pool; sibling slots are disjoint by
+                // construction and cousins reuse a slot only after the
+                // parent has consumed its children (see the fn doc),
+                // so this exclusive slice aliases no other live
+                // borrow.
                 let cbuf = unsafe {
                     std::slice::from_raw_parts_mut(
                         child_pool.add(b * child_rows * w),
@@ -340,8 +375,12 @@ fn eval(
             for k in 0..c.rows {
                 let s = k % c.q;
                 for (j, &b) in c.children.iter().enumerate() {
-                    srcs[j] =
-                        unsafe { child_pool.add(b * child_rows * w + s * w) as *const u8 };
+                    // SAFETY: points at row s of child slot b inside
+                    // the depth pool, in bounds per the slot layout
+                    // invariant in this function's doc comment; the
+                    // cbuf borrows from the loop above have ended, so
+                    // these raw reads alias no live &mut.
+                    srcs[j] = unsafe { child_pool.add(b * child_rows * w + s * w) as *const u8 };
                 }
                 let co = &c.coeffs[k * nc..(k + 1) * nc];
                 fold_into(&mut out[k * w..k * w + w], &srcs, co, w);
@@ -376,7 +415,11 @@ mod tests {
         let mut k = 0u32;
         while out.len() < n {
             k += 1;
-            if k % 3 != 0 && k % 5 != 0 && k % 17 != 0 && k % 257 != 0 {
+            if !k.is_multiple_of(3)
+                && !k.is_multiple_of(5)
+                && !k.is_multiple_of(17)
+                && !k.is_multiple_of(257)
+            {
                 out.push(k);
             }
         }
@@ -404,8 +447,11 @@ mod tests {
             }
             present.push((log, (0..w).map(|_| rng.word()).collect()));
         }
-        let ids: Vec<(u32, SrcId)> =
-            present.iter().enumerate().map(|(i, (l, _))| (*l, i as SrcId)).collect();
+        let ids: Vec<(u32, SrcId)> = present
+            .iter()
+            .enumerate()
+            .map(|(i, (l, _))| (*l, i as SrcId))
+            .collect();
         let plan = FlatPlan::build(&ids, needed).unwrap();
         let mut scratch = plan.new_scratch(w);
         let mut out = vec![0u16; needed * w];
@@ -436,6 +482,9 @@ mod tests {
         assert!(FlatPlan::build(&[(1, 0)], 0).is_err());
         assert!(FlatPlan::build(&[(1, 0)], N + 1).is_err());
         assert!(FlatPlan::build(&[(65535, 0)], 10).is_err());
-        assert!(FlatPlan::build(&[(1, 0), (1, 1)], 10).is_err(), "duplicate log");
+        assert!(
+            FlatPlan::build(&[(1, 0), (1, 1)], 10).is_err(),
+            "duplicate log"
+        );
     }
 }

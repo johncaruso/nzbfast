@@ -6,10 +6,15 @@
 //! it) and keeps the last `CAP` lines. On non-unix the tee is a no-op
 //! and the ring stays empty (the dashboard says so).
 
+use crate::sync::MutexExt;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
+/// Ring capacity, lines. Only the unix reader fills the ring, so off unix
+/// this and the two line helpers below exist solely for their tests -
+/// which still run on Windows, hence `test` rather than plain `cfg(unix)`.
+#[cfg(any(unix, test))]
 const CAP: usize = 2000;
 
 /// Handshake line [`drain`] writes down the pipe. Control bytes, so it
@@ -33,6 +38,10 @@ const DRAIN_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 /// error storm can fill the disk. When the echo target is a regular
 /// file past the cap, it is truncated in place with a notice line.
 /// NZBFAST_LOG_CAP_MB overrides (0 = uncapped).
+///
+/// Read only by the unix reader thread, and unlike [`CAP`] it has no test
+/// of its own, so off unix it is not compiled at all.
+#[cfg(unix)]
 fn log_cap_bytes() -> u64 {
     std::env::var("NZBFAST_LOG_CAP_MB")
         .ok()
@@ -53,7 +62,7 @@ pub fn tail(n: usize) -> Vec<String> {
     match RING.get() {
         None => Vec::new(),
         Some(r) => {
-            let g = r.lock().unwrap();
+            let g = r.lock_ok();
             g.iter().skip(g.len().saturating_sub(n)).cloned().collect()
         }
     }
@@ -75,8 +84,10 @@ pub fn mark() -> u64 {
 /// Returns what survives: the ring holds only `CAP` lines, so a span that
 /// outran it comes back short rather than wrong.
 pub fn since(mark: u64, max: usize) -> Vec<String> {
-    let Some(r) = RING.get() else { return Vec::new() };
-    let g = r.lock().unwrap();
+    let Some(r) = RING.get() else {
+        return Vec::new();
+    };
+    let g = r.lock_ok();
     let want = span_len(mark, SEEN.load(Ordering::Relaxed), g.len(), max);
     g.iter().skip(g.len() - want).cloned().collect()
 }
@@ -102,11 +113,13 @@ pub fn active() -> bool {
 /// undecodable byte becomes U+FFFD - never a dropped line. (Bug sweep: the
 /// old `lines()` reader returned Err on the first non-UTF-8 byte, which
 /// killed the tee thread and silently took the daemon down with it.)
+#[cfg(any(unix, test))]
 fn ring_line(buf: &[u8]) -> String {
     String::from_utf8_lossy(trim_newline(buf)).into_owned()
 }
 
 /// One captured line without its trailing CR/LF.
+#[cfg(any(unix, test))]
 fn trim_newline(buf: &[u8]) -> &[u8] {
     let mut end = buf.len();
     if end > 0 && buf[end - 1] == b'\n' {
@@ -160,8 +173,7 @@ pub fn install() {
                 // Size-cap bookkeeping for a redirected regular file:
                 // fstat only every ~1 MB echoed, not per line.
                 let cap = log_cap_bytes();
-                let echo_is_file =
-                    cap > 0 && echo.metadata().map(|m| m.is_file()).unwrap_or(false);
+                let echo_is_file = cap > 0 && echo.metadata().map(|m| m.is_file()).unwrap_or(false);
                 let mut since_check: u64 = 0;
                 loop {
                     buf.clear();
@@ -173,7 +185,7 @@ pub fn install() {
                         // A drain handshake, not output: everything
                         // written before it has now been echoed.
                         if let Some((n, cv)) = DRAIN.get() {
-                            *n.lock().unwrap() += 1;
+                            *n.lock_ok() += 1;
                             cv.notify_all();
                         }
                         continue;
@@ -209,7 +221,7 @@ pub fn install() {
                     // dashboard - U+FFFD in place of undecodable bytes,
                     // never a lost line.
                     let line = ring_line(&buf);
-                    let mut g = ring2.lock().unwrap();
+                    let mut g = ring2.lock_ok();
                     if g.len() >= CAP {
                         g.pop_front();
                     }
@@ -255,7 +267,7 @@ pub fn drain() {
     // across the write: a full pipe would block us there, and the reader
     // needs this lock to bump the count. A bump we miss in the gap is not
     // a lost wakeup either - the wait tests the counter, not an event.
-    let before = *count.lock().unwrap();
+    let before = *count.lock_ok();
     {
         let mut out = std::io::stdout().lock();
         if out.write_all(DRAIN_MARK).is_err() || writeln!(out).is_err() || out.flush().is_err() {
@@ -264,13 +276,13 @@ pub fn drain() {
     }
     // The pipe is FIFO: once the mark comes back, so has everything
     // written before it.
-    let seen = count.lock().unwrap();
+    let seen = count.lock_ok();
     let _ = cv.wait_timeout_while(seen, DRAIN_WAIT, |n| *n == before);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ring_line, span_len, CAP};
+    use super::{CAP, ring_line, span_len};
 
     /// The span a failed job snapshots has to survive every way its ends
     /// can disagree - the ring is global, bounded, and older than any one

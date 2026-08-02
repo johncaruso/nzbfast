@@ -28,7 +28,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::wall::{norm_title, Kind, Parsed};
+use crate::wall::{Kind, Parsed, norm_title};
 
 // ---------------------------------------------------------------------------
 // Item model (what the user edits; persisted as the `watchlist` setting)
@@ -138,6 +138,122 @@ pub struct WatchState {
     /// across restarts.
     #[serde(default)]
     pub ext_checked: HashMap<u64, i64>,
+    /// §74: item id (as text, so the state file stays a plain JSON
+    /// object) → the last grab this item got off the instant path.
+    #[serde(default)]
+    pub instant: HashMap<String, InstantGrab>,
+}
+
+/// One grab that happened because a release ARRIVED, not because the
+/// periodic pass came round: what was grabbed, when, and how long after
+/// the post went up. Purely a record - nothing decides anything from it -
+/// but it is the only place a user can see the feature working.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstantGrab {
+    pub stem: String,
+    /// When it was grabbed (unix).
+    pub at: i64,
+    /// Grab time minus the release's own first posted time, in seconds.
+    /// 0 when the post carried no usable date.
+    #[serde(default)]
+    pub lag: i64,
+}
+
+// ---------------------------------------------------------------------------
+// §74: the instant matcher
+// ---------------------------------------------------------------------------
+
+/// The cheap "could any watched item possibly want this name?" test,
+/// compiled once from the watchlist and run over every release as it
+/// arrives.
+///
+/// It exists to keep the hot path cheap, NOT to decide anything: a yes
+/// only means the watchlist pass is worth waking, and that pass then
+/// applies the whole ladder (quality, scope, age, packs, duplicates)
+/// against the database as it always has. So the contract is one-sided -
+/// it must never say no to something [`matches`] would accept, and it is
+/// free to say yes to things that go on to be rejected.
+///
+/// That is why it tests token containment rather than title equality:
+/// `matches` compares the normalised title the PARSER extracted, and
+/// parsing every arriving name to find out would be the cost this type
+/// exists to avoid. Every title the parser can extract is a run of words
+/// from the name itself, so containment is a superset of the real test.
+#[derive(Debug, Clone, Default)]
+pub struct InstantMatcher {
+    /// (item id, normalised title) for every enabled item. `None` is a
+    /// TITLELESS custom item, which matches on its category alone and so
+    /// accepts every name - the same reading [`title_ok`] gives it.
+    titles: Vec<(u64, Option<String>)>,
+}
+
+impl InstantMatcher {
+    /// Compile the enabled items. Disabled ones are left out entirely -
+    /// waking the pass for something it will not grab is pure cost. So
+    /// is a titleless built-in item, which `title_ok` matches nothing
+    /// against.
+    pub fn compile(items: &[WatchItem]) -> Self {
+        InstantMatcher {
+            titles: items
+                .iter()
+                .filter(|i| i.enabled)
+                .filter_map(|i| {
+                    let t = norm_title(&i.title);
+                    match (t.is_empty(), is_custom_kind(&i.kind)) {
+                        (true, true) => Some((i.id, None)),
+                        (true, false) => None,
+                        (false, _) => Some((i.id, Some(t))),
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// Nothing to match against - the caller can skip installing it and
+    /// pay nothing at all.
+    pub fn is_empty(&self) -> bool {
+        self.titles.is_empty()
+    }
+
+    /// The ids of every item this name could belong to (empty = none).
+    pub fn hits(&self, name: &str) -> Vec<u64> {
+        let hay = format!(" {} ", norm_title(name));
+        self.titles
+            .iter()
+            .filter(|(_, want)| {
+                want.as_ref()
+                    .is_none_or(|w| hay.contains(&format!(" {w} ")))
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Could any watched item want this name?
+    pub fn wants(&self, name: &str) -> bool {
+        !self.hits(name).is_empty()
+    }
+}
+
+/// §74: may the arrival path wake the pass again, given the passes it has
+/// already asked for this hour? Records the kick when it may.
+///
+/// `max` 0 means no limit. Refusing is deliberately cheap in consequence:
+/// the periodic pass runs a minute later over the same index with the
+/// same rules, so a spent allowance costs the seconds, never the grab.
+/// That is why the window is trimmed rather than reset - a burst does not
+/// lock the path out for a full hour after it ends.
+pub fn kick_allowed(recent: &mut std::collections::VecDeque<i64>, max: u32, now: i64) -> bool {
+    if max == 0 {
+        return true;
+    }
+    while recent.front().is_some_and(|t| now - *t >= 3_600) {
+        recent.pop_front();
+    }
+    if recent.len() as u32 >= max {
+        return false;
+    }
+    recent.push_back(now);
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -208,10 +324,7 @@ pub fn quality_rank(p: &Parsed) -> u32 {
         Some("DVD") => 50,
         _ => 0,
     };
-    res_points(p.res.as_deref()) * 1000
-        + if p.remux { 500 } else { 0 }
-        + src
-        + extras_points(p)
+    res_points(p.res.as_deref()) * 1000 + if p.remux { 500 } else { 0 } + src + extras_points(p)
 }
 
 /// What the user would rather have when one title has several encodes.
@@ -238,6 +351,9 @@ const PREF_ACODEC: &[&str] = &[
 const PREF_HDR: &[&str] = &["DV", "HDR10+", "HDR10", "HDR", "HLG"];
 
 impl QualityPrefs {
+    /// Are no preferences set at all? Only the tests ask - the ranking
+    /// path reads each field directly.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.res.is_empty()
             && self.vcodec.is_empty()
@@ -275,7 +391,9 @@ impl QualityPrefs {
                 .iter()
                 .find(|a| a.eq_ignore_ascii_case(raw))
                 .map(|a| (*a).to_string())
-                .ok_or_else(|| format!("{name}: unknown value {raw:?} (expected one of {allowed:?}, or empty)"))
+                .ok_or_else(|| {
+                    format!("{name}: unknown value {raw:?} (expected one of {allowed:?}, or empty)")
+                })
         };
         Ok(QualityPrefs {
             res: field("res", PREF_RES)?,
@@ -345,8 +463,18 @@ fn pref_matches(p: &Parsed, prefs: &QualityPrefs) -> (i64, Vec<&'static str>) {
         }
     };
     check(&prefs.res, p.res.as_deref(), PrefField::Res, "res");
-    check(&prefs.vcodec, p.vcodec.as_deref(), PrefField::Vcodec, "vcodec");
-    check(&prefs.acodec, p.acodec.as_deref(), PrefField::Acodec, "acodec");
+    check(
+        &prefs.vcodec,
+        p.vcodec.as_deref(),
+        PrefField::Vcodec,
+        "vcodec",
+    );
+    check(
+        &prefs.acodec,
+        p.acodec.as_deref(),
+        PrefField::Acodec,
+        "acodec",
+    );
     check(&prefs.hdr, p.hdr.as_deref(), PrefField::Hdr, "hdr");
     (weight, hits)
 }
@@ -403,15 +531,15 @@ pub fn age_ok(item: &WatchItem, posted_unix: i64, now_unix: i64) -> bool {
         return true;
     }
     let age = (now_unix - posted_unix).max(0) as u64;
-    if let Some(min) = parse_age_spec(&item.min_age) {
-        if age < min {
-            return false;
-        }
+    if let Some(min) = parse_age_spec(&item.min_age)
+        && age < min
+    {
+        return false;
     }
-    if let Some(max) = parse_age_spec(&item.max_age) {
-        if age > max {
-            return false;
-        }
+    if let Some(max) = parse_age_spec(&item.max_age)
+        && age > max
+    {
+        return false;
     }
     true
 }
@@ -508,27 +636,26 @@ pub fn matches(item: &WatchItem, stem: &str, p: &Parsed) -> bool {
     // A film's year is its release date; a custom event post's year is
     // its season ("Formula1.2026.Round11"). Both are worth pinning, and
     // an episodic post carries no year to compare against anyway.
-    if item.kind != "tv" {
-        if let (Some(want), Some(got)) = (item.year, p.year) {
-            if want != got {
-                return false;
-            }
-        }
+    if item.kind != "tv"
+        && let (Some(want), Some(got)) = (item.year, p.year)
+        && want != got
+    {
+        return false;
     }
     // Episodic scope: "series 3, episodes 1-13" etc. Applied against the
     // parsed marker; posts without one never reach a slot anyway. Custom
     // categories can be episodic too (wrestling, a sports season), so
     // the scope is only skipped for films.
     if item.kind != "movie" {
-        if let Some(s) = p.season {
-            if !in_range_spec(&item.seasons, s) {
-                return false;
-            }
+        if let Some(s) = p.season
+            && !in_range_spec(&item.seasons, s)
+        {
+            return false;
         }
-        if let Some(e) = p.episode {
-            if !in_range_spec(&item.episodes, e) {
-                return false;
-            }
+        if let Some(e) = p.episode
+            && !in_range_spec(&item.episodes, e)
+        {
+            return false;
         }
     }
     // The language gate is a heuristic for English-speaking users
@@ -732,14 +859,17 @@ pub fn season_state(
     // as redundant.
     let wanted = |e: u32| in_range_spec(&item.episodes, e);
     for slot in candidates {
-        if let Some((s, Some(e))) = slot_parts(slot) {
-            if s == season && wanted(e) {
-                known.insert(e);
-            }
+        if let Some((s, Some(e))) = slot_parts(slot)
+            && s == season
+            && wanted(e)
+        {
+            known.insert(e);
         }
     }
     for (key, slot) in slots {
-        let Some(name) = key.strip_prefix(&prefix) else { continue };
+        let Some(name) = key.strip_prefix(&prefix) else {
+            continue;
+        };
         match slot_parts(name) {
             Some((s, Some(e))) if s == season && wanted(e) => {
                 known.insert(e);
@@ -754,7 +884,11 @@ pub fn season_state(
             _ => {}
         }
     }
-    SeasonState { known: known.len() as u32, have: have.len() as u32, ..st }
+    SeasonState {
+        known: known.len() as u32,
+        have: have.len() as u32,
+        ..st
+    }
 }
 
 /// How many values a range spec names, when it names a bounded set:
@@ -880,7 +1014,7 @@ pub fn decide(
 mod tests {
     use super::*;
     use crate::wall::parse_release;
-    use nzbkit::categories::{classify, BaseBehavior, CustomCategory};
+    use nzbkit::categories::{BaseBehavior, CustomCategory, classify};
 
     /// The two categories the custom tests classify through - the same
     /// shape a user types into settings.
@@ -993,7 +1127,10 @@ mod tests {
         assert!(atmos_1080 > plain_4k);
         assert!(atmos_dv_1080 > atmos_1080);
         // Resolution outweighs the rest COMBINED when it is asked for.
-        let want4k = QualityPrefs { res: "2160p".into(), ..prefs.clone() };
+        let want4k = QualityPrefs {
+            res: "2160p".into(),
+            ..prefs.clone()
+        };
         let t = |stem: &str| preference_score(&parse_release(stem), &want4k);
         assert!(t("Film.2024.2160p.WEB-DL.x265-GRP") > t("Film.2024.1080p.WEB.x265.Atmos.DV-GRP"));
         let every_field = QualityPrefs {
@@ -1004,16 +1141,17 @@ mod tests {
         };
         let e = |stem: &str| preference_score(&parse_release(stem), &every_field);
         assert!(
-            e("Film.2024.2160p.WEB-DL.x264-GRP")
-                > e("Film.2024.1080p.WEB-DL.x265.Atmos.DV-GRP"),
+            e("Film.2024.2160p.WEB-DL.x264-GRP") > e("Film.2024.1080p.WEB-DL.x265.Atmos.DV-GRP"),
             "a requested resolution must outweigh every other preference combined"
         );
         // No preference set ⇒ plain quality order, nothing distorted.
         let none = QualityPrefs::default();
         assert!(none.is_empty());
         let q = |stem: &str| preference_score(&parse_release(stem), &none);
-        assert_eq!(q("Film.2024.2160p.WEB-DL.x265-GRP") as u32,
-                   quality_rank(&parse_release("Film.2024.2160p.WEB-DL.x265-GRP")));
+        assert_eq!(
+            q("Film.2024.2160p.WEB-DL.x265-GRP") as u32,
+            quality_rank(&parse_release("Film.2024.2160p.WEB-DL.x265-GRP"))
+        );
         assert!(q("Film.2024.2160p.WEB-DL.x265-GRP") > q("Film.2024.1080p.WEB.x265.Atmos.DV-GRP"));
     }
 
@@ -1035,7 +1173,11 @@ mod tests {
         // dropped the preference on every restart.
         let stored = p.to_json();
         assert_eq!(QualityPrefs::from_value(&stored).unwrap(), p);
-        assert!(QualityPrefs::from_value(&serde_json::json!({})).unwrap().is_empty());
+        assert!(
+            QualityPrefs::from_value(&serde_json::json!({}))
+                .unwrap()
+                .is_empty()
+        );
         // A typo is an error, not a preference that silently never matches.
         assert!(QualityPrefs::from_json(r#"{"acodec":"atoms"}"#).is_err());
         assert!(QualityPrefs::from_json(r#"{"res":"4k"}"#).is_err());
@@ -1058,24 +1200,56 @@ mod tests {
     #[test]
     fn matching_titles_and_kinds() {
         let tv = item("tv", "Severance");
-        assert!(matches(&tv, "Severance.S02E03.1080p.WEB.h264-GRP", &parse_release("Severance.S02E03.1080p.WEB.h264-GRP")));
+        assert!(matches(
+            &tv,
+            "Severance.S02E03.1080p.WEB.h264-GRP",
+            &parse_release("Severance.S02E03.1080p.WEB.h264-GRP")
+        ));
         // Separator/case-insensitive.
-        assert!(matches(&tv, "severance_S02E03_720p_HDTV-x", &parse_release("severance_S02E03_720p_HDTV-x")));
+        assert!(matches(
+            &tv,
+            "severance_S02E03_720p_HDTV-x",
+            &parse_release("severance_S02E03_720p_HDTV-x")
+        ));
         // Different show, movie kind, and superset titles all miss.
-        assert!(!matches(&tv, "Severance.Pay.S01E01.1080p.WEB-GRP", &parse_release("Severance.Pay.S01E01.1080p.WEB-GRP")));
-        assert!(!matches(&tv, "Severance.2024.1080p.BluRay.x264-GRP", &parse_release("Severance.2024.1080p.BluRay.x264-GRP")));
+        assert!(!matches(
+            &tv,
+            "Severance.Pay.S01E01.1080p.WEB-GRP",
+            &parse_release("Severance.Pay.S01E01.1080p.WEB-GRP")
+        ));
+        assert!(!matches(
+            &tv,
+            "Severance.2024.1080p.BluRay.x264-GRP",
+            &parse_release("Severance.2024.1080p.BluRay.x264-GRP")
+        ));
 
         let mv = item("movie", "Dune Part Two");
-        assert!(matches(&mv, "Dune.Part.Two.2024.2160p.WEB-DL-GRP", &parse_release("Dune.Part.Two.2024.2160p.WEB-DL-GRP")));
-        assert!(!matches(&mv, "Dune.Part.Two.S01E01.1080p.WEB-GRP", &parse_release("Dune.Part.Two.S01E01.1080p.WEB-GRP")));
+        assert!(matches(
+            &mv,
+            "Dune.Part.Two.2024.2160p.WEB-DL-GRP",
+            &parse_release("Dune.Part.Two.2024.2160p.WEB-DL-GRP")
+        ));
+        assert!(!matches(
+            &mv,
+            "Dune.Part.Two.S01E01.1080p.WEB-GRP",
+            &parse_release("Dune.Part.Two.S01E01.1080p.WEB-GRP")
+        ));
     }
 
     #[test]
     fn matching_year_pin() {
         let mut mv = item("movie", "Dune");
         mv.year = Some(2021);
-        assert!(matches(&mv, "Dune.2021.2160p.BluRay.REMUX-GRP", &parse_release("Dune.2021.2160p.BluRay.REMUX-GRP")));
-        assert!(!matches(&mv, "Dune.1984.1080p.BluRay.x264-GRP", &parse_release("Dune.1984.1080p.BluRay.x264-GRP")));
+        assert!(matches(
+            &mv,
+            "Dune.2021.2160p.BluRay.REMUX-GRP",
+            &parse_release("Dune.2021.2160p.BluRay.REMUX-GRP")
+        ));
+        assert!(!matches(
+            &mv,
+            "Dune.1984.1080p.BluRay.x264-GRP",
+            &parse_release("Dune.1984.1080p.BluRay.x264-GRP")
+        ));
     }
 
     #[test]
@@ -1083,9 +1257,21 @@ mod tests {
         let tv = item("tv", "Dark");
         // Tagged German-only audio: rejected. MULTI: accepted. Untagged:
         // accepted (scene convention = English).
-        assert!(!matches(&tv, "Dark.S01E01.German.1080p.WEB.x264-GRP", &parse_release("Dark.S01E01.German.1080p.WEB.x264-GRP")));
-        assert!(matches(&tv, "Dark.S01E01.MULTI.1080p.WEB.x264-GRP", &parse_release("Dark.S01E01.MULTI.1080p.WEB.x264-GRP")));
-        assert!(matches(&tv, "Dark.S01E01.1080p.WEB.x264-GRP", &parse_release("Dark.S01E01.1080p.WEB.x264-GRP")));
+        assert!(!matches(
+            &tv,
+            "Dark.S01E01.German.1080p.WEB.x264-GRP",
+            &parse_release("Dark.S01E01.German.1080p.WEB.x264-GRP")
+        ));
+        assert!(matches(
+            &tv,
+            "Dark.S01E01.MULTI.1080p.WEB.x264-GRP",
+            &parse_release("Dark.S01E01.MULTI.1080p.WEB.x264-GRP")
+        ));
+        assert!(matches(
+            &tv,
+            "Dark.S01E01.1080p.WEB.x264-GRP",
+            &parse_release("Dark.S01E01.1080p.WEB.x264-GRP")
+        ));
     }
 
     #[test]
@@ -1110,15 +1296,35 @@ mod tests {
         let mut tv = item("tv", "Severance");
         tv.seasons = "3".into();
         tv.episodes = "1-13".into();
-        assert!(matches(&tv, "Severance.S03E01.1080p.WEB-GRP", &parse_release("Severance.S03E01.1080p.WEB-GRP")));
-        assert!(matches(&tv, "Severance.S03E13.1080p.WEB-GRP", &parse_release("Severance.S03E13.1080p.WEB-GRP")));
+        assert!(matches(
+            &tv,
+            "Severance.S03E01.1080p.WEB-GRP",
+            &parse_release("Severance.S03E01.1080p.WEB-GRP")
+        ));
+        assert!(matches(
+            &tv,
+            "Severance.S03E13.1080p.WEB-GRP",
+            &parse_release("Severance.S03E13.1080p.WEB-GRP")
+        ));
         // Wrong season / episode outside the window.
-        assert!(!matches(&tv, "Severance.S02E03.1080p.WEB-GRP", &parse_release("Severance.S02E03.1080p.WEB-GRP")));
-        assert!(!matches(&tv, "Severance.S03E14.1080p.WEB-GRP", &parse_release("Severance.S03E14.1080p.WEB-GRP")));
+        assert!(!matches(
+            &tv,
+            "Severance.S02E03.1080p.WEB-GRP",
+            &parse_release("Severance.S02E03.1080p.WEB-GRP")
+        ));
+        assert!(!matches(
+            &tv,
+            "Severance.S03E14.1080p.WEB-GRP",
+            &parse_release("Severance.S03E14.1080p.WEB-GRP")
+        ));
         // "All" scope takes anything.
         tv.seasons = "all".into();
         tv.episodes.clear();
-        assert!(matches(&tv, "Severance.S02E03.1080p.WEB-GRP", &parse_release("Severance.S02E03.1080p.WEB-GRP")));
+        assert!(matches(
+            &tv,
+            "Severance.S02E03.1080p.WEB-GRP",
+            &parse_release("Severance.S02E03.1080p.WEB-GRP")
+        ));
     }
 
     #[test]
@@ -1154,14 +1360,29 @@ mod tests {
         // First acceptable version.
         assert_eq!(decide(None, hdtv720, min, target, true), Decision::Grab);
         // Better version while below target → upgrade.
-        assert_eq!(decide(Some(hdtv720), web1080, min, target, true), Decision::Upgrade);
+        assert_eq!(
+            decide(Some(hdtv720), web1080, min, target, true),
+            Decision::Upgrade
+        );
         // Already at target: a better encode no longer triggers.
-        assert_eq!(decide(Some(web1080), blu1080, min, target, true), Decision::Skip);
+        assert_eq!(
+            decide(Some(web1080), blu1080, min, target, true),
+            Decision::Skip
+        );
         // Upgrades disabled: first grab is final.
-        assert_eq!(decide(Some(hdtv720), web1080, min, target, false), Decision::Skip);
+        assert_eq!(
+            decide(Some(hdtv720), web1080, min, target, false),
+            Decision::Skip
+        );
         // Same or worse rank is never an upgrade.
-        assert_eq!(decide(Some(web1080), web1080, min, target, true), Decision::Skip);
-        assert_eq!(decide(Some(web1080), hdtv720, min, target, true), Decision::Skip);
+        assert_eq!(
+            decide(Some(web1080), web1080, min, target, true),
+            Decision::Skip
+        );
+        assert_eq!(
+            decide(Some(web1080), hdtv720, min, target, true),
+            Decision::Skip
+        );
     }
 
     /// 24D: a custom-category item matches through the SAME classify
@@ -1198,7 +1419,11 @@ mod tests {
         assert!(!matches(&it, QUALI, &quali));
         // Non-English audio is kept: a user category is an explicit want.
         const DE: &str = "Formula1.2026.Round12.Spa.Race.German.1080p.WEB-DL-MWR";
-        assert!(matches(&item("formula-1", "Formula1"), DE, &classify(DE, &cats)));
+        assert!(matches(
+            &item("formula-1", "Formula1"),
+            DE,
+            &classify(DE, &cats)
+        ));
     }
 
     /// The item the wall's ☆ button writes for a user category, exactly
@@ -1233,7 +1458,11 @@ mod tests {
         assert_eq!(album.kind, Kind::Music);
         assert!(!matches(&item("music", "Metallica"), ALBUM, &album));
         assert!(!matches(&item("music", ""), ALBUM, &album));
-        assert!(!matches(&item("software", "Sketch"), APP, &parse_release(APP)));
+        assert!(!matches(
+            &item("software", "Sketch"),
+            APP,
+            &parse_release(APP)
+        ));
     }
 
     /// The shapes that made the feature look wired-up and grab nothing:
@@ -1243,43 +1472,95 @@ mod tests {
     #[test]
     fn custom_items_match_the_shapes_a_parser_cannot_title() {
         let cats = vec![
-            CustomCategory { slug: "music".into(), name: "Music".into(),
-                pattern: "(?i)(flac|mp3|-cd-)".into(), not_match: String::new(),
-                base: BaseBehavior::None },
-            CustomCategory { slug: "combat".into(), name: "Combat".into(),
-                pattern: "(?i)^ufc".into(), not_match: String::new(),
-                base: BaseBehavior::Movie },
-            CustomCategory { slug: "anime".into(), name: "Anime".into(),
-                pattern: "(?i)(one.piece|subsplease)".into(), not_match: String::new(),
-                base: BaseBehavior::Tv },
+            CustomCategory {
+                slug: "music".into(),
+                name: "Music".into(),
+                pattern: "(?i)(flac|mp3|-cd-)".into(),
+                not_match: String::new(),
+                base: BaseBehavior::None,
+            },
+            CustomCategory {
+                slug: "combat".into(),
+                name: "Combat".into(),
+                pattern: "(?i)^ufc".into(),
+                not_match: String::new(),
+                base: BaseBehavior::Movie,
+            },
+            CustomCategory {
+                slug: "anime".into(),
+                name: "Anime".into(),
+                pattern: "(?i)(one.piece|subsplease)".into(),
+                not_match: String::new(),
+                base: BaseBehavior::Tv,
+            },
         ];
         let hit = |kind: &str, title: &str, stem: &str| {
             matches(&item(kind, title), stem, &classify(stem, &cats))
         };
         // Music: the album, the rip format and the year all end up in
         // the "title"; the artist is what the user types.
-        assert!(hit("music", "Metallica", "Metallica-72.Seasons-CD-FLAC-2023-PERFECT"));
-        assert!(hit("music", "Metallica", "Metallica-Ride.The.Lightning-Remastered-2016-FLAC"));
-        assert!(!hit("music", "Metallica", "Radiohead-OK.Computer-1997-MP3-320"));
+        assert!(hit(
+            "music",
+            "Metallica",
+            "Metallica-72.Seasons-CD-FLAC-2023-PERFECT"
+        ));
+        assert!(hit(
+            "music",
+            "Metallica",
+            "Metallica-Ride.The.Lightning-Remastered-2016-FLAC"
+        ));
+        assert!(!hit(
+            "music",
+            "Metallica",
+            "Radiohead-OK.Computer-1997-MP3-320"
+        ));
         // Combat sports: numbered events, no year, no episode.
-        assert!(hit("combat", "UFC", "UFC.310.Jones.vs.Miocic.PPV.1080p.WEB-DL-GRP"));
-        assert!(hit("combat", "UFC 310", "UFC.310.Jones.vs.Miocic.PPV.1080p.WEB-DL-GRP"));
+        assert!(hit(
+            "combat",
+            "UFC",
+            "UFC.310.Jones.vs.Miocic.PPV.1080p.WEB-DL-GRP"
+        ));
+        assert!(hit(
+            "combat",
+            "UFC 310",
+            "UFC.310.Jones.vs.Miocic.PPV.1080p.WEB-DL-GRP"
+        ));
         // Anime: the episode number lands inside the title.
-        assert!(hit("anime", "One Piece", "One.Piece.1085.1080p.WEB.x264-VARYG"));
-        assert!(hit("anime", "Frieren", "[SubsPlease] Frieren - 15 (1080p) [ABCD1234]"));
+        assert!(hit(
+            "anime",
+            "One Piece",
+            "One.Piece.1085.1080p.WEB.x264-VARYG"
+        ));
+        assert!(hit(
+            "anime",
+            "Frieren",
+            "[SubsPlease] Frieren - 15 (1080p) [ABCD1234]"
+        ));
         // Word-boundary aligned, so a shorter name is not a prefix match
         // on a longer one.
-        assert!(!hit("music", "Metal", "Metallica-72.Seasons-CD-FLAC-2023-PERFECT"));
+        assert!(!hit(
+            "music",
+            "Metal",
+            "Metallica-72.Seasons-CD-FLAC-2023-PERFECT"
+        ));
         // An empty title on a custom item means the whole category: the
         // rule already said what the user wants.
         assert!(hit("music", "", "Radiohead-OK.Computer-1997-MP3-320"));
-        assert!(hit("combat", "  ", "UFC.311.Makhachev.vs.Tsarukyan.PPV.1080p-GRP"));
+        assert!(hit(
+            "combat",
+            "  ",
+            "UFC.311.Makhachev.vs.Tsarukyan.PPV.1080p-GRP"
+        ));
         // ...but an empty title on a film or show still matches nothing,
         // or one blank row would grab the entire index.
         assert!(!matches(&item("movie", ""), MOVIE, &parse_release(MOVIE)));
         assert!(!matches(&item("tv", ""), SHOW, &parse_release(SHOW)));
         // And built-in titles stay EXACT: no containment creep.
-        assert!(matches(&item("tv", "Severance"), SHOW, &parse_release(SHOW)));
+        assert!(matches(
+            &item("tv", "Severance"),
+            SHOW,
+            &parse_release(SHOW)
+        ));
         assert!(!matches(&item("tv", "Sever"), SHOW, &parse_release(SHOW)));
         assert!(!matches(
             &item("tv", "Severance"),
@@ -1305,11 +1586,19 @@ mod tests {
         assert!(qs.starts_with("c:formula-1:"), "{qs}");
         // A better encode of the SAME session is the same slot - that is
         // what makes it an upgrade rather than a second download.
-        assert_eq!(s("Formula1.2026.Round11.Hungary.Qualifying.WEB-DL.2160p-GRP"), qs);
+        assert_eq!(
+            s("Formula1.2026.Round11.Hungary.Qualifying.WEB-DL.2160p-GRP"),
+            qs
+        );
 
         // Dated events: a whole matchday is not one thing to grab.
-        let foot = vec![CustomCategory { slug: "football".into(), name: "Football".into(),
-            pattern: "^epl".into(), not_match: String::new(), base: BaseBehavior::None }];
+        let foot = vec![CustomCategory {
+            slug: "football".into(),
+            name: "Football".into(),
+            pattern: "^epl".into(),
+            not_match: String::new(),
+            base: BaseBehavior::None,
+        }];
         let f = item("football", "EPL");
         let fs = |stem: &str| slot_of(&f, &classify(stem, &foot)).unwrap();
         let a = fs("EPL.2026.08.22.Arsenal.vs.Spurs.1080p.WEB.h264-VERUM");
@@ -1321,8 +1610,13 @@ mod tests {
 
         // An episodic custom tracks per episode, like TV, and its bare
         // season post fills that season's pack slot, like TV's.
-        let wcats = vec![CustomCategory { slug: "wrestling".into(), name: "Wrestling".into(),
-            pattern: "wwe".into(), not_match: String::new(), base: BaseBehavior::Tv }];
+        let wcats = vec![CustomCategory {
+            slug: "wrestling".into(),
+            name: "Wrestling".into(),
+            pattern: "wwe".into(),
+            not_match: String::new(),
+            base: BaseBehavior::Tv,
+        }];
         let w = item("wrestling", "WWE Raw");
         const E15: &str = "WWE.Raw.S2026E015.1080p.WEB.h264-GRP";
         let e15 = classify(E15, &wcats);
@@ -1340,7 +1634,6 @@ mod tests {
         scoped.episodes = "1-14".into();
         assert!(!matches(&scoped, E15, &e15));
     }
-
 
     #[test]
     fn custom_item_settings_round_trip() {
@@ -1362,7 +1655,6 @@ mod tests {
         assert!(!is_custom_kind("tv") && !is_custom_kind("movie") && !is_custom_kind(""));
     }
 
-
     // -----------------------------------------------------------------
     // Season packs
     // -----------------------------------------------------------------
@@ -1380,7 +1672,10 @@ mod tests {
     }
 
     fn state_of(item_id: u64, entries: &[(&str, Slot)]) -> HashMap<String, Slot> {
-        entries.iter().map(|(k, s)| (state_key(item_id, k), s.clone())).collect()
+        entries
+            .iter()
+            .map(|(k, s)| (state_key(item_id, k), s.clone()))
+            .collect()
     }
 
     #[test]
@@ -1392,7 +1687,13 @@ mod tests {
         assert_eq!(slot_parts("s2026"), Some((2026, None)));
         // Everything that is not part of a season answers None, so no
         // pack is ever thought to cover it.
-        for other in ["movie", "d:20260721", "c:formula-1:formula1:2026:round11", "", "sxx"] {
+        for other in [
+            "movie",
+            "d:20260721",
+            "c:formula-1:formula1:2026:round11",
+            "",
+            "sxx",
+        ] {
             assert_eq!(slot_parts(other), None, "{other}");
             assert!(!is_pack_slot(other), "{other}");
         }
@@ -1429,28 +1730,64 @@ mod tests {
         // anything is known about how long the season is.
         let nothing = SeasonState::default();
         assert!(pack_eligible(&tv, 1, webdl, nothing));
-        assert!(pack_eligible(&tv, 1, webdl, SeasonState { known: 10, ..nothing }));
+        assert!(pack_eligible(
+            &tv,
+            1,
+            webdl,
+            SeasonState {
+                known: 10,
+                ..nothing
+            }
+        ));
 
         // Half a season already grabbed: the pack brings as much as it
         // repeats, so it is still worth it...
-        let half = SeasonState { known: 10, have: 5, best_rank: hdtv, pack_rank: 0 };
+        let half = SeasonState {
+            known: 10,
+            have: 5,
+            best_rank: hdtv,
+            pack_rank: 0,
+        };
         assert!(pack_eligible(&tv, 1, webdl, half));
         // ...but not when it repeats more than it brings.
-        let mostly = SeasonState { known: 10, have: 8, best_rank: hdtv, pack_rank: 0 };
+        let mostly = SeasonState {
+            known: 10,
+            have: 8,
+            best_rank: hdtv,
+            pack_rank: 0,
+        };
         assert!(!pack_eligible(&tv, 1, webdl, mostly));
         // ...nor for a single missing episode, however little we hold.
-        let one_left = SeasonState { known: 2, have: 1, best_rank: hdtv, pack_rank: 0 };
+        let one_left = SeasonState {
+            known: 2,
+            have: 1,
+            best_rank: hdtv,
+            pack_rank: 0,
+        };
         assert!(!pack_eligible(&tv, 1, webdl, one_left));
 
         // A pack WORSE than the episodes already collected never
         // displaces them, however much of the season is missing.
-        let good_singles = SeasonState { known: 10, have: 4, best_rank: bluray, pack_rank: 0 };
+        let good_singles = SeasonState {
+            known: 10,
+            have: 4,
+            best_rank: bluray,
+            pack_rank: 0,
+        };
         assert!(!pack_eligible(&tv, 1, hdtv, good_singles));
-        assert!(pack_eligible(&tv, 1, bluray, good_singles), "equal quality is enough");
+        assert!(
+            pack_eligible(&tv, 1, bluray, good_singles),
+            "equal quality is enough"
+        );
 
         // A season already tracked as a pack keeps using packs: whether
         // this one is actually better is decide()'s question.
-        let packed = SeasonState { known: 10, have: 10, best_rank: bluray, pack_rank: hdtv };
+        let packed = SeasonState {
+            known: 10,
+            have: 10,
+            best_rank: bluray,
+            pack_rank: hdtv,
+        };
         assert!(pack_eligible(&tv, 1, webdl, packed));
 
         // Scope gates it: a season the item does not watch, and an item
@@ -1481,7 +1818,13 @@ mod tests {
             &[
                 ("s01e01", slot(4200, "Show.Name.S01E01.1080p.WEB-GRP")),
                 // An emptied slot (its grab failed) is known, not had.
-                ("s01e02", Slot { nzo_id: String::new(), ..slot(0, "") }),
+                (
+                    "s01e02",
+                    Slot {
+                        nzo_id: String::new(),
+                        ..slot(0, "")
+                    },
+                ),
                 // Another season's slots never count towards this one.
                 ("s02e01", slot(4200, "Show.Name.S02E01.1080p.WEB-GRP")),
                 ("movie", slot(9999, "irrelevant")),
@@ -1496,16 +1839,23 @@ mod tests {
 
         // The season's own pack is tracked separately from the singles.
         let mut with_pack = slots.clone();
-        with_pack.insert(state_key(1, "s01"), slot(3200, "Show.Name.S01.720p.HDTV-GRP"));
+        with_pack.insert(
+            state_key(1, "s01"),
+            slot(3200, "Show.Name.S01.720p.HDTV-GRP"),
+        );
         let st = season_state(&tv, 1, &with_pack, &[], &[1, 2, 3, 4]);
         assert_eq!(st.pack_rank, 3200);
         assert_eq!(st.have, 1, "a pack is not counted as an episode grab");
 
         // Another item's slots are not this item's, even at the same
         // season and episode numbers.
-        let other = season_state(&item("tv", "Show Name"), 1, &state_of(2, &[
-            ("s01e01", slot(4200, "x")),
-        ]), &[], &[]);
+        let other = season_state(
+            &item("tv", "Show Name"),
+            1,
+            &state_of(2, &[("s01e01", slot(4200, "x"))]),
+            &[],
+            &[],
+        );
         assert_eq!((other.known, other.have), (0, 0));
     }
 
@@ -1540,7 +1890,10 @@ mod tests {
             (10, 0),
             "ten episodes wanted, none of them held"
         );
-        assert_eq!(after.best_rank, 0, "a rank from out of scope is not this scope's");
+        assert_eq!(
+            after.best_rank, 0,
+            "a rank from out of scope is not this scope's"
+        );
     }
 
     /// What a pack means for the episodes under it: they read as "have
@@ -1553,7 +1906,11 @@ mod tests {
         // yet - which is the point of not enumerating them.
         for ep in [1u32, 5, 22] {
             let got = covering(&slots, 1, &episode_slot(1, ep));
-            assert_eq!(got.map(|s| s.stem.as_str()), Some(pack.stem.as_str()), "e{ep}");
+            assert_eq!(
+                got.map(|s| s.stem.as_str()),
+                Some(pack.stem.as_str()),
+                "e{ep}"
+            );
         }
         // Not another season, not the film slot, not another item.
         assert!(covering(&slots, 1, "s02e01").is_none());
@@ -1562,17 +1919,49 @@ mod tests {
 
         // Own grab vs pack: the better copy answers, whichever it is.
         let mut mixed = slots.clone();
-        mixed.insert(state_key(1, "s01e01"), slot(5200, "Show.Name.S01E01.2160p.WEB-GRP"));
-        mixed.insert(state_key(1, "s01e02"), slot(3200, "Show.Name.S01E02.720p.HDTV-GRP"));
+        mixed.insert(
+            state_key(1, "s01e01"),
+            slot(5200, "Show.Name.S01E01.2160p.WEB-GRP"),
+        );
+        mixed.insert(
+            state_key(1, "s01e02"),
+            slot(3200, "Show.Name.S01E02.720p.HDTV-GRP"),
+        );
         assert_eq!(covering(&mixed, 1, "s01e01").map(|s| s.rank), Some(5200));
-        assert_eq!(covering(&mixed, 1, "s01e02").map(|s| s.rank), Some(4200), "the pack is better");
+        assert_eq!(
+            covering(&mixed, 1, "s01e02").map(|s| s.rank),
+            Some(4200),
+            "the pack is better"
+        );
 
         // An emptied slot has nothing, and falls back to the pack.
         let mut emptied = slots.clone();
-        emptied.insert(state_key(1, "s01e03"), Slot { nzo_id: String::new(), ..slot(5200, "dead") });
+        emptied.insert(
+            state_key(1, "s01e03"),
+            Slot {
+                nzo_id: String::new(),
+                ..slot(5200, "dead")
+            },
+        );
         assert_eq!(covering(&emptied, 1, "s01e03").map(|s| s.rank), Some(4200));
         // ...and with no pack either, nothing at all.
-        assert!(covering(&state_of(1, &[("s01e03", Slot { nzo_id: String::new(), ..slot(5200, "dead") })]), 1, "s01e03").is_none());
+        assert!(
+            covering(
+                &state_of(
+                    1,
+                    &[(
+                        "s01e03",
+                        Slot {
+                            nzo_id: String::new(),
+                            ..slot(5200, "dead")
+                        }
+                    )]
+                ),
+                1,
+                "s01e03"
+            )
+            .is_none()
+        );
     }
 
     /// The decision an episode faces once a pack covers it: an equal or
@@ -1587,17 +1976,35 @@ mod tests {
         let cur = covering(&slots, 1, "s01e04").map(|s| s.rank);
         let ep = |stem: &str| quality_rank(&parse_release(stem));
         assert_eq!(
-            decide(cur, ep("Show.Name.S01E04.720p.HDTV-GRP"), min, target, tv.upgrade),
+            decide(
+                cur,
+                ep("Show.Name.S01E04.720p.HDTV-GRP"),
+                min,
+                target,
+                tv.upgrade
+            ),
             Decision::Skip,
             "a worse single of an episode the pack already covers"
         );
         assert_eq!(
-            decide(cur, ep("Show.Name.S01E04.1080p.WEB-GRP"), min, target, tv.upgrade),
+            decide(
+                cur,
+                ep("Show.Name.S01E04.1080p.WEB-GRP"),
+                min,
+                target,
+                tv.upgrade
+            ),
             Decision::Skip,
             "an equal single is not worth a second copy"
         );
         assert_eq!(
-            decide(cur, ep("Show.Name.S01E04.2160p.WEB-GRP"), min, target, tv.upgrade),
+            decide(
+                cur,
+                ep("Show.Name.S01E04.2160p.WEB-GRP"),
+                min,
+                target,
+                tv.upgrade
+            ),
             Decision::Upgrade
         );
     }
@@ -1623,7 +2030,11 @@ mod tests {
         // The YYMMDD convention normalizes to the same key as YYYY.MM.DD.
         let short = item("tv", "At Midnight");
         assert_eq!(
-            slot_of(&short, &parse_release("At.Midnight.150615.720p.HDTV.x264-GRP")).as_deref(),
+            slot_of(
+                &short,
+                &parse_release("At.Midnight.150615.720p.HDTV.x264-GRP")
+            )
+            .as_deref(),
             Some("d:20150615")
         );
         // A dated post is not part of any season, so no pack covers it
@@ -1632,7 +2043,11 @@ mod tests {
         // A show that posts BOTH ways keeps the episode key when it has
         // one: the marker is the better identity where it exists.
         assert_eq!(
-            slot_of(&tv, &parse_release("The.Daily.Show.S2026E140.1080p.WEB-GRP")).as_deref(),
+            slot_of(
+                &tv,
+                &parse_release("The.Daily.Show.S2026E140.1080p.WEB-GRP")
+            )
+            .as_deref(),
             Some("s2026e140")
         );
     }
@@ -1690,8 +2105,7 @@ mod tests {
         let st2 = season_state(&item("tv", "Severance"), 2, &st.slots, &[], &[]);
         assert_eq!((st2.known, st2.have, st2.pack_rank), (1, 1, 0));
         // And the new state round-trips through the same file format.
-        let round: WatchState =
-            serde_json::from_str(&serde_json::to_string(&st).unwrap()).unwrap();
+        let round: WatchState = serde_json::from_str(&serde_json::to_string(&st).unwrap()).unwrap();
         assert_eq!(round.slots.len(), 2);
     }
 
@@ -1728,15 +2142,132 @@ mod tests {
         };
         let now = 1_800_000_000i64;
         let hours = |h: i64| now - h * 3600;
-        assert!(!age_ok(&item, hours(1), now), "1h-old post is inside the 2h floor");
+        assert!(
+            !age_ok(&item, hours(1), now),
+            "1h-old post is inside the 2h floor"
+        );
         assert!(age_ok(&item, hours(3), now));
         assert!(age_ok(&item, hours(9 * 24), now));
-        assert!(!age_ok(&item, hours(11 * 24), now), "11d-old post crosses the 10d ceiling");
+        assert!(
+            !age_ok(&item, hours(11 * 24), now),
+            "11d-old post crosses the 10d ceiling"
+        );
         // Unknown upload date is never rejected.
         assert!(age_ok(&item, 0, now));
         // No constraints = everything passes.
         item.min_age.clear();
         item.max_age.clear();
         assert!(age_ok(&item, hours(1), now) && age_ok(&item, hours(1000 * 24), now));
+    }
+
+    /// The instant matcher's whole contract: it may over-accept, but it
+    /// must NEVER reject a name the real `matches` would take - a false
+    /// no is an arrival the watchlist never hears about.
+    #[test]
+    fn the_instant_matcher_never_rejects_what_matches_accepts() {
+        let cats = f1_cats();
+        let items = vec![
+            item("tv", "Wanted Show"),
+            WatchItem {
+                id: 2,
+                ..item("movie", "Some Film")
+            },
+            WatchItem {
+                id: 3,
+                // A titleless custom item: its category IS the filter.
+                ..item("formula-1", "")
+            },
+        ];
+        let m = InstantMatcher::compile(&items);
+        for name in [
+            "Wanted.Show.S02E05.1080p.WEB.h264-GRP",
+            "Wanted.Show.S02.2160p.BluRay.REMUX-GRP",
+            "Some.Film.2019.1080p.BluRay.x264-GRP",
+            "Formula1.2026.Round11.Race.1080p-GRP",
+        ] {
+            let p = classify(name, &cats);
+            let taken = items.iter().any(|i| matches(i, name, &p));
+            assert!(taken, "test fixture no longer matches: {name}");
+            assert!(
+                m.wants(name),
+                "the instant matcher would drop an arrival the pass grabs: {name}"
+            );
+        }
+        // Over-accepting is allowed; missing the point is not. A name
+        // sharing no title token with anything watched is not worth a
+        // pass. (Checked without the titleless custom item above, which
+        // deliberately accepts everything - a category with no title
+        // filter wakes the pass on every arrival, and that is what the
+        // rate limit is for.)
+        let titled = InstantMatcher::compile(&items[..2]);
+        assert!(!titled.wants("Unrelated.Thing.S01E01.1080p.WEB-GRP"));
+        assert!(m.wants("Unrelated.Thing.S01E01.1080p.WEB-GRP"));
+        // A disabled item stops waking the pass.
+        let off = InstantMatcher::compile(&[WatchItem {
+            enabled: false,
+            ..item("tv", "Wanted Show")
+        }]);
+        assert!(off.is_empty() && !off.wants("Wanted.Show.S02E05.1080p.WEB-GRP"));
+    }
+
+    /// A titleless BUILT-IN item matches nothing (`title_ok` rejects an
+    /// empty want), so it must not be compiled in as "everything" - that
+    /// would wake the pass for every post in every watched group.
+    #[test]
+    fn a_titleless_builtin_item_matches_nothing_instantly_either() {
+        let blank = item("tv", "");
+        let p = classify("Wanted.Show.S02E05.1080p.WEB-GRP", &f1_cats());
+        assert!(!matches(&blank, "Wanted.Show.S02E05.1080p.WEB-GRP", &p));
+        assert!(InstantMatcher::compile(&[blank]).is_empty());
+        // The custom kind is the one that reads blank as "no title
+        // filter", and the matcher agrees with `title_ok` there.
+        let any_f1 = InstantMatcher::compile(&[item("formula-1", "")]);
+        assert!(any_f1.wants("Formula1.2026.Round11.Race.1080p-GRP"));
+    }
+
+    /// Which item was hit is what the pass stamps its "instant" record
+    /// against, so the ids have to come back, not just a yes.
+    #[test]
+    fn instant_hits_name_the_items_they_belong_to() {
+        let items = vec![
+            item("tv", "Wanted Show"),
+            WatchItem {
+                id: 2,
+                ..item("movie", "Some Film")
+            },
+        ];
+        let m = InstantMatcher::compile(&items);
+        assert_eq!(m.hits("Wanted.Show.S02E05.1080p.WEB-GRP"), [1]);
+        assert_eq!(m.hits("Some.Film.2019.1080p.BluRay-GRP"), [2]);
+        assert!(m.hits("Neither.Of.Them.2019.1080p-GRP").is_empty());
+    }
+
+    /// The instant path's hourly ceiling: it bounds PASSES, and a refused
+    /// kick is a delay, never a lost grab. The window slides, so a burst
+    /// does not lock the path out for an hour after it ends.
+    #[test]
+    fn the_instant_rate_limit_slides_rather_than_resetting() {
+        let mut recent = std::collections::VecDeque::new();
+        let t0 = 1_800_000_000i64;
+        // Three allowed, then the fourth in the same window is refused.
+        for i in 0..3 {
+            assert!(kick_allowed(&mut recent, 3, t0 + i));
+        }
+        assert!(!kick_allowed(&mut recent, 3, t0 + 4));
+        // Half an hour on, still inside the window of all three.
+        assert!(!kick_allowed(&mut recent, 3, t0 + 1_800));
+        // A second before the hour is up, still nothing has aged out.
+        assert!(!kick_allowed(&mut recent, 3, t0 + 3_599));
+        // On the hour the FIRST kick ages out and frees exactly one slot,
+        // which the window then takes - so the very next call is refused
+        // again rather than the whole allowance coming back at once.
+        assert!(kick_allowed(&mut recent, 3, t0 + 3_600));
+        assert!(!kick_allowed(&mut recent, 3, t0 + 3_600));
+        // 0 = no limit, and no bookkeeping either.
+        let mut none = std::collections::VecDeque::new();
+        for i in 0..1000 {
+            assert!(kick_allowed(&mut none, 0, t0 + i));
+        }
+        assert!(none.is_empty());
     }
 }

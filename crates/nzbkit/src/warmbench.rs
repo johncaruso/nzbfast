@@ -108,9 +108,9 @@ const ARM_TIMEOUT: Duration = Duration::from_secs(20);
 /// exactly the direction that would turn noise into a recommendation.
 fn t_95(df: usize) -> f64 {
     const T: [f64; 30] = [
-        12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179,
-        2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086, 2.080, 2.074, 2.069, 2.064,
-        2.060, 2.056, 2.052, 2.048, 2.045, 2.042,
+        12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179, 2.160,
+        2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086, 2.080, 2.074, 2.069, 2.064, 2.060, 2.056,
+        2.052, 2.048, 2.045, 2.042,
     ];
     match df {
         0 => f64::INFINITY,
@@ -170,7 +170,10 @@ async fn time_fresh(server: &ServerConfig) -> Option<(Duration, Connection)> {
 /// pool does on checkout, which is the whole cost of a hit.
 async fn time_claim(conn: &mut Connection) -> Option<Duration> {
     let t0 = Instant::now();
-    tokio::time::timeout(ARM_TIMEOUT, conn.exec("DATE")).await.ok()?.ok()?;
+    tokio::time::timeout(ARM_TIMEOUT, conn.exec("DATE"))
+        .await
+        .ok()?
+        .ok()?;
     Some(t0.elapsed())
 }
 
@@ -258,9 +261,7 @@ pub async fn measure(server: &ServerConfig, pairs: usize) -> BenchResult {
     let fresh_ms = median(&mut fresh_all.clone());
     let warm_ms = median(&mut warm_all.clone());
     let detail = match verdict {
-        Verdict::Failed => {
-            "could not measure this server - no connection completed".to_string()
-        }
+        Verdict::Failed => "could not measure this server - no connection completed".to_string(),
         Verdict::NoMeasurableBenefit => format!(
             "no measurable benefit on this link: {mean:.0} ms saved per connection, \
              but the range ({lo:.0} to {hi:.0} ms) includes zero, so leave it off"
@@ -344,7 +345,11 @@ mod tests {
             addr.port()
         ))
         .unwrap();
-        GreetingRig { cfg, accepted, _task: task }
+        GreetingRig {
+            cfg,
+            accepted,
+            _task: task,
+        }
     }
 
     /// The alternation the module doc promises has to be REAL: on the
@@ -382,7 +387,11 @@ mod tests {
             r.fresh_ms
         );
         // The claim never touches the slowed connection.
-        assert!(r.warm_ms < 400.0, "claims are one round-trip, got {:.1} ms", r.warm_ms);
+        assert!(
+            r.warm_ms < 400.0,
+            "claims are one round-trip, got {:.1} ms",
+            r.warm_ms
+        );
     }
 
     /// Against a server that answers everything, no pair is lost - the
@@ -409,7 +418,10 @@ mod tests {
         let noisy = vec![120.0, -80.0, 200.0, -150.0, 90.0, -60.0, 30.0, -40.0];
         let (v, _, lo, hi) = verdict_from_deltas(&noisy);
         assert_eq!(v, Verdict::NoMeasurableBenefit);
-        assert!(lo < 0.0 && hi > 0.0, "interval should span zero: {lo}..{hi}");
+        assert!(
+            lo < 0.0 && hi > 0.0,
+            "interval should span zero: {lo}..{hi}"
+        );
     }
 
     /// A steady, real saving is recognised.
@@ -443,7 +455,11 @@ mod tests {
     /// in the direction that turns noise into a recommendation.
     #[test]
     fn small_samples_use_the_t_distribution() {
-        assert!(t_95(11) > 2.1, "t for n=12 should be ~2.20, got {}", t_95(11));
+        assert!(
+            t_95(11) > 2.1,
+            "t for n=12 should be ~2.20, got {}",
+            t_95(11)
+        );
         assert!(t_95(1) > 12.0, "t for n=2 is very wide");
         assert_eq!(t_95(100), 1.96, "large samples converge on the normal");
 

@@ -36,6 +36,28 @@ PORT="${NZBFAST_PORT:-6789}"
 OUT="${NZBFAST_OUT:-/downloads}"
 WATCH="${NZBFAST_WATCH:-/watch}"
 
+# Is the config directory actually a volume? If it sits on the container's
+# own filesystem, every setting - servers, paths, the API key, the queue -
+# is deleted with the container, and the next `docker run` looks like an
+# update that wiped the install. That is the single most-reported way of
+# "losing" settings, so say it at the moment it can still be fixed rather
+# than after. Device comparison, not a mountpoint lookup, so a config dir
+# that is a SUBFOLDER of a mounted volume still passes.
+#
+# A warning, not a refusal: throwaway runs are legitimate. Silence it with
+# NZBFAST_ALLOW_EPHEMERAL_CONFIG=1 if running without persistence is the
+# point.
+CONFDIR="$(dirname "$CONFIG")"
+if [ "${NZBFAST_ALLOW_EPHEMERAL_CONFIG:-0}" != "1" ] && [ -d "$CONFDIR" ] \
+    && [ "$(stat -c %d "$CONFDIR" 2>/dev/null)" = "$(stat -c %d / 2>/dev/null)" ]; then
+    echo "nzbfast: WARNING - $CONFDIR is not a mounted volume, so your settings," >&2
+    echo "         API key and queue live inside this container and are DELETED" >&2
+    echo "         with it. Map a host folder (-v /some/host/path:$CONFDIR, or the" >&2
+    echo "         volumes block of your compose file) to keep them. If a" >&2
+    echo "         throwaway container is what you want, set" >&2
+    echo "         -e NZBFAST_ALLOW_EPHEMERAL_CONFIG=1 to silence this." >&2
+fi
+
 # Is this the very first run? (No config yet.) Used to pick a secure
 # default without changing behaviour for anyone who already has an
 # install - existing configs are never touched below.
@@ -204,6 +226,16 @@ if [ "$(id -u)" = "0" ]; then
     # control API on the LAN.
     if [ -f "$KEYFILE" ]; then
         chown "$PUID:$PGID" "$KEYFILE" 2>/dev/null || true
+    fi
+    # The starter config has exactly the same problem, and worse odds: it
+    # was written as root 0600 above, and PUID is INFERRED from /config's
+    # owner, so the recursive loop below is skipped precisely when the
+    # user pre-made the bind mount - the setup every NAS guide describes.
+    # The daemon then starts as PUID and cannot read the file it was just
+    # told to edit. Only the one we created this run: an existing config
+    # is the user's, and is left alone as it always has been.
+    if [ "$FIRST_RUN" = "1" ] && [ -f "$CONFIG" ]; then
+        chown "$PUID:$PGID" "$CONFIG" 2>/dev/null || true
     fi
     for d in /config /downloads /watch /incomplete; do
         [ -d "$d" ] || continue

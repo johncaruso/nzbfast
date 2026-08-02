@@ -1,13 +1,13 @@
 //! The recovery-record repair the DAEMON actually runs: parse the archive,
-//! then `repair_recovery_to_file`, which scans only the recovery service's
-//! own bytes instead of hunting `{RB}` markers across the whole volume.
+//! then `repair_recovery_to_path`, which scans only the recovery service's
+//! own bytes instead of hunting `{RB}` markers across the whole volume,
+//! and clones rather than copies the volume where the filesystem can.
 //!
 //! `bench_rr_stream` times the raw fallback (headers unparseable), which is
 //! not the path a payload-damaged volume takes.
 //!
 //!   cargo run -q --release -p rars --example bench_rr_product -- <damaged.rar> <out.rar>
 
-use std::fs::File;
 use std::path::Path;
 use std::time::Instant;
 
@@ -24,16 +24,10 @@ fn main() {
     let parse_ms = t.elapsed().as_secs_f64() * 1000.0;
 
     std::fs::remove_file(out_path).ok();
-    let mut dest = File::options()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(out_path)
-        .expect("create output");
 
     let t2 = Instant::now();
     let rebuilt = archive
-        .repair_recovery_to_file(&mut dest, None, budget)
+        .repair_recovery_to_path(Path::new(out_path), None, budget)
         .expect("repair");
     let repair_ms = t2.elapsed().as_secs_f64() * 1000.0;
     let total_ms = t.elapsed().as_secs_f64() * 1000.0;

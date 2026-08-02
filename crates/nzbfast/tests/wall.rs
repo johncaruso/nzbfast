@@ -3,6 +3,8 @@
 //! show, obfuscated stems stay hidden, /wall serves the UI, /m3u hands a
 //! playlist to an external player.
 
+mod scratch;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
@@ -20,8 +22,11 @@ fn free_port() -> u16 {
 
 fn http_get(port: u16, req: &str) -> (u16, String) {
     let mut request = Vec::new();
-    write!(request, "GET {req} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
-        .unwrap();
+    write!(
+        request,
+        "GET {req} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
     split_response(&raw(port, &request))
 }
 
@@ -50,13 +55,24 @@ fn http_post(port: u16, req: &str, content_type: &str, body: &[u8]) -> (u16, Str
 /// the same latent break, but read strictly rather than lossily, so it
 /// failed outright the day a boundary split a multi-byte character.)
 fn split_response(bytes: &[u8]) -> (u16, String) {
-    let head_end = bytes.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4);
+    let head_end = bytes
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4);
     let head = String::from_utf8_lossy(&bytes[..head_end.unwrap_or(bytes.len())]).into_owned();
-    let status: u16 =
-        head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
-    let Some(at) = head_end else { return (status, String::new()) };
+    let status: u16 = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    let Some(at) = head_end else {
+        return (status, String::new());
+    };
     let body = &bytes[at..];
-    let body = if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+    let body = if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
         dechunk(body)
     } else {
         body.to_vec()
@@ -71,8 +87,7 @@ fn dechunk(mut b: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     while let Some(nl) = b.windows(2).position(|w| w == b"\r\n") {
         let line = String::from_utf8_lossy(&b[..nl]);
-        let n = usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
-            .unwrap_or(0);
+        let n = usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16).unwrap_or(0);
         if n == 0 {
             break; // terminating chunk
         }
@@ -107,11 +122,17 @@ fn raw(port: u16, request: &[u8]) -> Vec<u8> {
             Ok(out) => return out,
             Err(e) => {
                 last = e.to_string();
-                std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(attempt) + 50));
+                std::thread::sleep(std::time::Duration::from_millis(
+                    100 * u64::from(attempt) + 50,
+                ));
             }
         }
     }
-    let line = String::from_utf8_lossy(request).lines().next().unwrap_or("").to_string();
+    let line = String::from_utf8_lossy(request)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string();
     panic!("daemon on :{port} never answered {line:?}: {last}");
 }
 
@@ -185,7 +206,11 @@ struct Daemon {
 /// database, so it is the switched-on case. settings.json lives beside
 /// the config file.
 fn index_enabled(cfg: &Path) {
-    std::fs::write(cfg.with_file_name("settings.json"), "{\"index_enabled\": true}").unwrap();
+    std::fs::write(
+        cfg.with_file_name("settings.json"),
+        "{\"index_enabled\": true}",
+    )
+    .unwrap();
 }
 
 async fn serve(dir: &Path, build: impl Fn(u16) -> Command) -> Daemon {
@@ -207,13 +232,19 @@ async fn serve(dir: &Path, build: impl Fn(u16) -> Command) -> Daemon {
         .await
         .unwrap();
         if ready {
-            return Daemon { _child: child, port };
+            return Daemon {
+                _child: child,
+                port,
+            };
         }
         // The daemon exited instead of binding: `free_port()` handed :port
         // to a parallel test between our bind(:0) and the daemon's bind,
         // and that test's daemon won it. Try a fresh port.
         let tail = std::fs::read_to_string(&logfile).unwrap_or_default();
-        assert!(attempt < 2, "daemon exited without binding :{port}\n--- log ---\n{tail}");
+        assert!(
+            attempt < 2,
+            "daemon exited without binding :{port}\n--- log ---\n{tail}"
+        );
     }
     unreachable!()
 }
@@ -233,7 +264,9 @@ async fn serve(dir: &Path, build: impl Fn(u16) -> Command) -> Daemon {
 fn wait_ready(child: &mut KillOnDrop, port: u16, logfile: &Path) -> bool {
     let banner = format!("open the dashboard at  http://localhost:{port}/");
     for _ in 0..600 {
-        if std::fs::read_to_string(logfile).unwrap_or_default().contains(&banner)
+        if std::fs::read_to_string(logfile)
+            .unwrap_or_default()
+            .contains(&banner)
             && TcpStream::connect(("127.0.0.1", port)).is_ok()
         {
             return true;
@@ -261,8 +294,7 @@ fn over(number: u64, subject: &str, msgid: &str, bytes: u64) -> OverEntry {
 #[tokio::test(flavor = "multi_thread")]
 async fn wall_groups_dedupes_and_serves() {
     let dir = std::env::temp_dir().join(format!("nzbfast-wall-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let db = dir.join("index.db");
     {
@@ -271,19 +303,59 @@ async fn wall_groups_dedupes_and_serves() {
             "alt.binaries.teevee",
             &[
                 // Two encodes of ONE movie → one card, two releases.
-                over(1, "\"The.Matrix.1999.2160p.BluRay.REMUX-GRP.rar\" yEnc (1/1)", "<m1@x>", 5000),
-                over(2, "\"The.Matrix.1999.1080p.WEB.x264-OTHER.rar\" yEnc (1/1)", "<m2@x>", 2000),
+                over(
+                    1,
+                    "\"The.Matrix.1999.2160p.BluRay.REMUX-GRP.rar\" yEnc (1/1)",
+                    "<m1@x>",
+                    5000,
+                ),
+                over(
+                    2,
+                    "\"The.Matrix.1999.1080p.WEB.x264-OTHER.rar\" yEnc (1/1)",
+                    "<m2@x>",
+                    2000,
+                ),
                 // Two episodes + a season pack of ONE show → one TV card.
-                over(3, "\"Severance.S01E01.1080p.WEB-DL-NTb.rar\" yEnc (1/1)", "<t1@x>", 1000),
-                over(4, "\"Severance.S02E03.2160p.WEB-DL-NTb.rar\" yEnc (1/1)", "<t2@x>", 1200),
-                over(5, "\"Severance.S01.2160p.ATVP.WEB-DL-Cas.rar\" yEnc (1/1)", "<t3@x>", 8000),
+                over(
+                    3,
+                    "\"Severance.S01E01.1080p.WEB-DL-NTb.rar\" yEnc (1/1)",
+                    "<t1@x>",
+                    1000,
+                ),
+                over(
+                    4,
+                    "\"Severance.S02E03.2160p.WEB-DL-NTb.rar\" yEnc (1/1)",
+                    "<t2@x>",
+                    1200,
+                ),
+                over(
+                    5,
+                    "\"Severance.S01.2160p.ATVP.WEB-DL-Cas.rar\" yEnc (1/1)",
+                    "<t3@x>",
+                    8000,
+                ),
                 // Obfuscated → hidden unless all=1.
-                over(6, "\"2137d880a074fa4075a65ce4e21d2f95.rar\" yEnc (1/1)", "<o1@x>", 999),
+                over(
+                    6,
+                    "\"2137d880a074fa4075a65ce4e21d2f95.rar\" yEnc (1/1)",
+                    "<o1@x>",
+                    999,
+                ),
                 // Software → kind=software, hidden unless all=1.
-                over(7, "\"CCleaner.Professional.Plus.v6.36.11041.x64.Setup.rar\" yEnc (1/1)", "<s1@x>", 500),
+                over(
+                    7,
+                    "\"CCleaner.Professional.Plus.v6.36.11041.x64.Setup.rar\" yEnc (1/1)",
+                    "<s1@x>",
+                    500,
+                ),
                 // ROT13-obfuscated ("The.Wire.3x07.720p.HDTV.x264-BATV"
                 // letter-rotated) → rescued onto the wall decoded.
-                over(8, "\"Gur.Jver.3k07.720c.UQGI.k264-ONGI.rar\" yEnc (1/1)", "<r1@x>", 800),
+                over(
+                    8,
+                    "\"Gur.Jver.3k07.720c.UQGI.k264-ONGI.rar\" yEnc (1/1)",
+                    "<r1@x>",
+                    800,
+                ),
             ],
             1_700_000_000,
         )
@@ -291,8 +363,11 @@ async fn wall_groups_dedupes_and_serves() {
     }
 
     let cfg = dir.join("config.json");
-    std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
-        .unwrap();
+    std::fs::write(
+        &cfg,
+        "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}",
+    )
+    .unwrap();
     index_enabled(&cfg);
     let d = serve(&dir, |port| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
@@ -341,7 +416,10 @@ async fn wall_groups_dedupes_and_serves() {
         };
         // Curated (junk-gated) view hides the low-evidence junk posts.
         let curated = cards_of("/api?mode=wall2&matched=0&apikey=sekrit");
-        assert!(by_title(&curated, "The Matrix").is_none(), "junk-gated: {curated:?}");
+        assert!(
+            by_title(&curated, "The Matrix").is_none(),
+            "junk-gated: {curated:?}"
+        );
 
         // all=1 reveals the grouped cards. Two Matrix encodes → one movie
         // card; three Severance postings (2 eps + a season pack) → one TV
@@ -375,11 +453,18 @@ async fn wall_groups_dedupes_and_serves() {
         };
         let sev_rows = sheet(&sev["key"]);
         assert_eq!(sev_rows.len(), 3, "three Severance releases: {sev_rows:?}");
-        let mut seasons: Vec<u64> =
-            sev_rows.iter().filter_map(|r| r["season"].as_u64()).filter(|&s| s > 0).collect();
+        let mut seasons: Vec<u64> = sev_rows
+            .iter()
+            .filter_map(|r| r["season"].as_u64())
+            .filter(|&s| s > 0)
+            .collect();
         seasons.sort_unstable();
         seasons.dedup();
-        assert_eq!(seasons, vec![1, 2], "two seasons under the card: {sev_rows:?}");
+        assert_eq!(
+            seasons,
+            vec![1, 2],
+            "two seasons under the card: {sev_rows:?}"
+        );
         // The ROT13 post surfaces under its DECODED quality.
         let wire_rows = sheet(&wire["key"]);
         assert_eq!(wire_rows.len(), 1, "{wire_rows:?}");
@@ -438,7 +523,10 @@ async fn wall_groups_dedupes_and_serves() {
         let matched = cards_of("/api?mode=wall2&all=1&apikey=sekrit");
         let movie = by_title(&matched, "The Matrix").expect("matched movie card");
         let poster = movie["poster_full"].as_str().unwrap();
-        assert!(poster.starts_with("/art/m_the_matrix_1999.jpg?v="), "{poster}");
+        assert!(
+            poster.starts_with("/art/m_the_matrix_1999.jpg?v="),
+            "{poster}"
+        );
         let (code, art) = http_get(port, "/art/m_the_matrix_1999.jpg");
         assert_eq!(code, 200);
         assert!(art.contains("fake-poster-bytes"));
@@ -463,14 +551,23 @@ async fn wall_groups_dedupes_and_serves() {
 
         // OMDb key: live setting round-trip (masked in get_config as
         // has_omdb) and signup email validation.
-        let (_, body) =
-            http_get(port, "/api?mode=config&name=omdb_key&value=k123&apikey=sekrit");
+        let (_, body) = http_get(
+            port,
+            "/api?mode=config&name=omdb_key&value=k123&apikey=sekrit",
+        );
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!((v["status"].as_bool(), v["live"].as_bool()), (Some(true), Some(true)), "{body}");
+        assert_eq!(
+            (v["status"].as_bool(), v["live"].as_bool()),
+            (Some(true), Some(true)),
+            "{body}"
+        );
         let (_, body) = http_get(port, "/api?mode=get_config&apikey=sekrit");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["config"]["nzbfast"]["has_omdb"], true, "{body}");
-        assert!(!body.contains("k123"), "omdb key must not leak in get_config");
+        assert!(
+            !body.contains("k123"),
+            "omdb key must not leak in get_config"
+        );
         let (_, body) = http_post(
             port,
             "/api?mode=omdb_signup&apikey=sekrit",
@@ -478,7 +575,10 @@ async fn wall_groups_dedupes_and_serves() {
             br#"{"email":"not-an-email"}"#,
         );
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(v["status"], false, "bad email must be rejected before any network");
+        assert_eq!(
+            v["status"], false,
+            "bad email must be rejected before any network"
+        );
         // The wall page itself and the player handoff.
         let (code, html) = http_get(port, "/wall");
         assert_eq!(code, 200);
@@ -501,7 +601,10 @@ async fn wall_groups_dedupes_and_serves() {
         // The handoff mints the per-job stream token, so with an apikey
         // set the keyless form is refused.
         let (code, _) = http_get(port, "/m3u/SABnzbd_nzo_test");
-        assert_eq!(code, 401, "keyless /m3u must be rejected when an apikey is set");
+        assert_eq!(
+            code, 401,
+            "keyless /m3u must be rejected when an apikey is set"
+        );
         let (code, m3u) = http_get(port, "/m3u/SABnzbd_nzo_test?apikey=sekrit");
         assert_eq!(code, 200);
         assert!(m3u.starts_with("#EXTM3U"), "{m3u}");
@@ -525,8 +628,7 @@ async fn wall_groups_dedupes_and_serves() {
 #[tokio::test(flavor = "multi_thread")]
 async fn watchlist_grabs_for_a_user_category() {
     let dir = std::env::temp_dir().join(format!("nzbfast-wlcat-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let quali = "Formula1.2026.Round11.Hungary.Qualifying.F1TV.WEB-DL.1080p.H265-MWR";
     let race = "Formula1.2026.Round11.Hungary.Race.F1TV.WEB-DL.1080p.H265-MWR";
@@ -548,12 +650,16 @@ async fn watchlist_grabs_for_a_user_category() {
                 )
             })
             .collect();
-        ix.ingest("alt.binaries.teevee", &posts, 1_700_000_000).unwrap();
+        ix.ingest("alt.binaries.teevee", &posts, 1_700_000_000)
+            .unwrap();
     }
 
     let cfg = dir.join("config.json");
-    std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
-        .unwrap();
+    std::fs::write(
+        &cfg,
+        "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}",
+    )
+    .unwrap();
     index_enabled(&cfg);
     let d = serve(&dir, |port| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
@@ -621,12 +727,21 @@ async fn watchlist_grabs_for_a_user_category() {
         // Both sessions of the round are grabbed: they are separate
         // slots, keyed on the category identity key. A "movie"-shaped
         // single slot would have taken one and called the season done.
-        assert!(seen.contains("Hungary.Qualifying"), "qualifying not grabbed: {seen}");
+        assert!(
+            seen.contains("Hungary.Qualifying"),
+            "qualifying not grabbed: {seen}"
+        );
         assert!(seen.contains("Hungary.Race"), "race not grabbed: {seen}");
         // And nothing else was: not the film (a built-in kind), and not
         // the other category's release (right shape, wrong slug).
-        assert!(!seen.contains("The.Matrix"), "a non-matching film was grabbed: {seen}");
-        assert!(!seen.contains("MotoGP"), "another category's release was grabbed: {seen}");
+        assert!(
+            !seen.contains("The.Matrix"),
+            "a non-matching film was grabbed: {seen}"
+        );
+        assert!(
+            !seen.contains("MotoGP"),
+            "another category's release was grabbed: {seen}"
+        );
 
         // ...and the job says where it came from. A watchlist grab
         // stamped "wall" takes wall-job behaviour with it and answers
@@ -640,12 +755,17 @@ async fn watchlist_grabs_for_a_user_category() {
         };
         let (_, q) = http_get(port, "/api?mode=queue&apikey=sekrit");
         let (_, h) = http_get(port, "/api?mode=history&apikey=sekrit");
-        let grabs: Vec<serde_json::Value> =
-            slots(&q, "queue").into_iter().chain(slots(&h, "history")).collect();
+        let grabs: Vec<serde_json::Value> = slots(&q, "queue")
+            .into_iter()
+            .chain(slots(&h, "history"))
+            .collect();
         let f1: Vec<&serde_json::Value> = grabs
             .iter()
             .filter(|s| {
-                let name = s["filename"].as_str().or_else(|| s["name"].as_str()).unwrap_or("");
+                let name = s["filename"]
+                    .as_str()
+                    .or_else(|| s["name"].as_str())
+                    .unwrap_or("");
                 name.contains("Hungary")
             })
             .collect();
@@ -664,8 +784,7 @@ async fn watchlist_grabs_for_a_user_category() {
 #[tokio::test(flavor = "multi_thread")]
 async fn wall_arrivals_and_expanded_rows_answer_the_page_honestly() {
     let dir = std::env::temp_dir().join(format!("nzbfast-wallapi-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // Arrivals are recent uploads only (a backfilled old post is not an
     // arrival), so these have to be dated now, not at the epoch.
@@ -676,7 +795,7 @@ async fn wall_arrivals_and_expanded_rows_answer_the_page_honestly() {
     let db = dir.join("index.db");
     {
         let mut ix = nzbkit::index::Index::open(&db).unwrap();
-        let mut post = |n: u64, subject: &str, id: &str| {
+        let post = |n: u64, subject: &str, id: &str| {
             let mut e = over(n, subject, id, 400 << 20);
             e.date = now - 3600;
             e
@@ -685,10 +804,18 @@ async fn wall_arrivals_and_expanded_rows_answer_the_page_honestly() {
             "alt.binaries.teevee",
             &[
                 // One episode whole...
-                post(1, "\"Arrival.Show.S01E01.1080p.WEB-DL-GRP.mkv\" yEnc (1/1)", "<a1@x>"),
+                post(
+                    1,
+                    "\"Arrival.Show.S01E01.1080p.WEB-DL-GRP.mkv\" yEnc (1/1)",
+                    "<a1@x>",
+                ),
                 // ...and one that is still missing a part. Same show, so
                 // both land under one card and one title key.
-                post(2, "\"Arrival.Show.S01E02.1080p.WEB-DL-GRP.mkv\" yEnc (1/2)", "<a2@x>"),
+                post(
+                    2,
+                    "\"Arrival.Show.S01E02.1080p.WEB-DL-GRP.mkv\" yEnc (1/2)",
+                    "<a2@x>",
+                ),
             ],
             now,
         )
@@ -696,8 +823,11 @@ async fn wall_arrivals_and_expanded_rows_answer_the_page_honestly() {
     }
 
     let cfg = dir.join("config.json");
-    std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
-        .unwrap();
+    std::fs::write(
+        &cfg,
+        "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}",
+    )
+    .unwrap();
     index_enabled(&cfg);
     let d = serve(&dir, |port| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
@@ -734,7 +864,10 @@ async fn wall_arrivals_and_expanded_rows_answer_the_page_honestly() {
         // is why the first release to arrive on a fresh install was
         // never announced: every poll after it looked like a first poll.
         let opened = json("/api?mode=wall_tip&apikey=sekrit");
-        assert_eq!(opened["new"], 0, "a first poll must not cry 'everything is new': {opened}");
+        assert_eq!(
+            opened["new"], 0,
+            "a first poll must not cry 'everything is new': {opened}"
+        );
         assert!(opened["latest"].as_i64().unwrap_or(0) > 0, "{opened}");
         let polled = json("/api?mode=wall_tip&since=0&apikey=sekrit");
         assert_eq!(
@@ -768,7 +901,11 @@ async fn wall_arrivals_and_expanded_rows_answer_the_page_honestly() {
         };
         assert_eq!(rows(0).len(), 2, "unfiltered, the card holds both releases");
         let only_complete = rows(1);
-        assert_eq!(only_complete.len(), 1, "the filter must reach a key-scoped query");
+        assert_eq!(
+            only_complete.len(),
+            1,
+            "the filter must reach a key-scoped query"
+        );
         assert_eq!(only_complete[0]["complete"], true, "{only_complete:?}");
     })
     .await
@@ -786,8 +923,7 @@ async fn wall_arrivals_and_expanded_rows_answer_the_page_honestly() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_grab_names_the_job_from_the_index_however_deep_the_row_is() {
     let dir = std::env::temp_dir().join(format!("nzbfast-grabname-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let buried = "Buried.Movie.2011.1080p.BluRay.x264-GRP";
     let recent = "Recent.Show.S01E02.1080p.WEB-DL-GRP";
@@ -798,7 +934,12 @@ async fn a_grab_names_the_job_from_the_index_however_deep_the_row_is() {
         // sweep...
         ix.ingest(
             "alt.binaries.moovee",
-            &[over(1, &format!("\"{buried}.rar\" yEnc (1/1)"), "<b1@x>", 50 << 20)],
+            &[over(
+                1,
+                &format!("\"{buried}.rar\" yEnc (1/1)"),
+                "<b1@x>",
+                50 << 20,
+            )],
             1_700_000_000,
         )
         .unwrap();
@@ -815,18 +956,27 @@ async fn a_grab_names_the_job_from_the_index_however_deep_the_row_is() {
                 )
             })
             .collect();
-        ix.ingest("alt.binaries.teevee", &filler, 1_700_010_000).unwrap();
+        ix.ingest("alt.binaries.teevee", &filler, 1_700_010_000)
+            .unwrap();
         ix.ingest(
             "alt.binaries.teevee",
-            &[over(200_000, &format!("\"{recent}.rar\" yEnc (1/1)"), "<r1@x>", 50 << 20)],
+            &[over(
+                200_000,
+                &format!("\"{recent}.rar\" yEnc (1/1)"),
+                "<r1@x>",
+                50 << 20,
+            )],
             1_700_020_000,
         )
         .unwrap();
     }
 
     let cfg = dir.join("config.json");
-    std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
-        .unwrap();
+    std::fs::write(
+        &cfg,
+        "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}",
+    )
+    .unwrap();
     index_enabled(&cfg);
     let d = serve(&dir, |port| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
@@ -859,7 +1009,9 @@ async fn a_grab_names_the_job_from_the_index_however_deep_the_row_is() {
         // Ids the way the wall gets them: off a search page.
         let id_of = |stem: &str| -> i64 {
             let term = stem.split('.').next().unwrap();
-            let page = json(&format!("/api?mode=index_browse&all=1&q={term}&apikey=sekrit"));
+            let page = json(&format!(
+                "/api?mode=index_browse&all=1&q={term}&apikey=sekrit"
+            ));
             page["results"]
                 .as_array()
                 .and_then(|rs| rs.iter().find(|r| r["name"].as_str() == Some(stem)))
@@ -869,7 +1021,9 @@ async fn a_grab_names_the_job_from_the_index_however_deep_the_row_is() {
         // The grab, then the job it made. A dead server can fail the job
         // through to history, so both lists are read.
         let grab = |id: i64| -> serde_json::Value {
-            let r = json(&format!("/api?mode=index_get&id={id}&priority=1&apikey=sekrit"));
+            let r = json(&format!(
+                "/api?mode=index_get&id={id}&priority=1&apikey=sekrit"
+            ));
             assert_eq!(r["status"], true, "grab of {id}: {r}");
             let nzo = r["nzo_ids"][0].as_str().expect("a job id").to_string();
             for _ in 0..100 {
@@ -880,7 +1034,12 @@ async fn a_grab_names_the_job_from_the_index_however_deep_the_row_is() {
                     .cloned()
                     .unwrap_or_default()
                     .into_iter()
-                    .chain(h["history"]["slots"].as_array().cloned().unwrap_or_default())
+                    .chain(
+                        h["history"]["slots"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default(),
+                    )
                     .collect();
                 if let Some(s) = slots.iter().find(|s| s["nzo_id"] == nzo.as_str()) {
                     return s.clone();
@@ -898,7 +1057,11 @@ async fn a_grab_names_the_job_from_the_index_however_deep_the_row_is() {
         };
 
         let deep = grab(id_of(buried));
-        assert_eq!(name_of(&deep), buried, "the buried row's grab lost its name: {deep}");
+        assert_eq!(
+            name_of(&deep),
+            buried,
+            "the buried row's grab lost its name: {deep}"
+        );
         assert_ne!(
             deep["duplicate_key"], "",
             "a named job must carry a duplicate key, or the duplicate hold \

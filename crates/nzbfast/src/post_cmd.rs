@@ -6,8 +6,9 @@
 //! share a host). There is deliberately NO default - posting never picks
 //! "the first server" on its own.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tracing::info;
 
 use anyhow::{Context, Result};
 use nzbkit::config::{Config, ServerConfig};
@@ -42,7 +43,14 @@ fn select_server(cfg: &Config, wanted: &str) -> Result<ServerConfig> {
     let hosts = || {
         cfg.servers
             .iter()
-            .map(|s| format!("  {}:{}{}", s.host, s.port, if s.enabled { "" } else { " (disabled)" }))
+            .map(|s| {
+                format!(
+                    "  {}:{}{}",
+                    s.host,
+                    s.port,
+                    if s.enabled { "" } else { " (disabled)" }
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n")
     };
@@ -78,18 +86,18 @@ fn write_rescue(claim: &std::path::Path, xml: &str) -> std::io::Result<PathBuf> 
     // Write THROUGH the claim only while it is still empty, and check the
     // length on the open handle rather than the path, so the file we measure
     // is the file we write.
-    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(claim) {
-        if f.metadata().is_ok_and(|m| m.len() == 0) {
-            use std::io::Write;
-            match f.write_all(xml.as_bytes()) {
-                Ok(()) => return Ok(claim.to_path_buf()),
-                // A half-written claim reads exactly like an earlier run's
-                // rescue index, and the next run would tell the operator to
-                // publish it. Put it back to the empty claim it was, then
-                // try a name of our own.
-                Err(_) => {
-                    let _ = f.set_len(0);
-                }
+    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(claim)
+        && f.metadata().is_ok_and(|m| m.len() == 0)
+    {
+        use std::io::Write;
+        match f.write_all(xml.as_bytes()) {
+            Ok(()) => return Ok(claim.to_path_buf()),
+            // A half-written claim reads exactly like an earlier run's
+            // rescue index, and the next run would tell the operator to
+            // publish it. Put it back to the empty claim it was, then
+            // try a name of our own.
+            Err(_) => {
+                let _ = f.set_len(0);
             }
         }
     }
@@ -101,8 +109,16 @@ fn write_rescue(claim: &std::path::Path, xml: &str) -> std::io::Result<PathBuf> 
     let pid = std::process::id();
     let mut last = std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free rescue name");
     for n in 0..16 {
-        let path = alt(if n == 0 { format!(".{pid}") } else { format!(".{pid}.{n}") });
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        let path = alt(if n == 0 {
+            format!(".{pid}")
+        } else {
+            format!(".{pid}.{n}")
+        });
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
             Ok(mut f) => {
                 use std::io::Write;
                 f.write_all(xml.as_bytes())?;
@@ -125,7 +141,7 @@ fn release_empty_claim(claim: &std::path::Path) {
     }
 }
 
-pub async fn run(config: &PathBuf, args: PostArgs) -> Result<()> {
+pub async fn run(config: &Path, args: PostArgs) -> Result<()> {
     anyhow::ensure!(
         !args.post_server.trim().is_empty(),
         "--post-server is required: name the ONE configured server to post through"
@@ -178,7 +194,11 @@ pub async fn run(config: &PathBuf, args: PostArgs) -> Result<()> {
     // upload their own articles and both would rename onto the destination,
     // the loser's Message-IDs losing their only index. The claim makes the
     // second run stop here, before it posts anything.
-    match std::fs::OpenOptions::new().write(true).create_new(true).open(&nzb_tmp) {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&nzb_tmp)
+    {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             if std::fs::metadata(&nzb_tmp).is_ok_and(|m| m.len() > 0) {
@@ -205,15 +225,21 @@ pub async fn run(config: &PathBuf, args: PostArgs) -> Result<()> {
     }
 
     // The confirmation block: exactly which server, and what will happen.
-    println!(
-        "[post] server: {}:{} ({}{})",
+    info!(
+        target: "post",
+        "server: {}:{} ({}{})",
         server.host,
         server.port,
         if server.tls { "TLS" } else { "plain" },
-        if server.username.is_some() { ", authenticated" } else { "" }
+        if server.username.is_some() {
+            ", authenticated"
+        } else {
+            ""
+        }
     );
-    println!(
-        "[post] posting {} files ({:.1} MB, {} articles of ≤{} KB) to {} as {}",
+    info!(
+        target: "post",
+        "posting {} files ({:.1} MB, {} articles of ≤{} KB) to {} as {}",
         plan.len(),
         total_bytes as f64 / 1e6,
         total_articles,
@@ -221,7 +247,12 @@ pub async fn run(config: &PathBuf, args: PostArgs) -> Result<()> {
         args.group,
         args.from
     );
-    println!("[post] message-id domain: {} · nzb: {}", args.msgid_domain, args.nzb.display());
+    info!(
+        target: "post",
+        "message-id domain: {} · nzb: {}",
+        args.msgid_domain,
+        args.nzb.display()
+    );
 
     let opts = PostOpts {
         group: args.group.clone(),
@@ -234,8 +265,9 @@ pub async fn run(config: &PathBuf, args: PostArgs) -> Result<()> {
     let t0 = std::time::Instant::now();
     let progress: post::Progress = Arc::new(move |done, total, sent| {
         if done == total || done % 25 == 0 {
-            println!(
-                "[post] {done}/{total} articles · {:.1} MB on the wire",
+            info!(
+                target: "post",
+                "{done}/{total} articles · {:.1} MB on the wire",
                 sent as f64 / 1e6
             );
         }
@@ -250,13 +282,15 @@ pub async fn run(config: &PathBuf, args: PostArgs) -> Result<()> {
         Err(post::PostError::Aborted { message, posted }) => {
             let n: usize = posted.files.iter().map(|f| f.segments.len()).sum();
             let rescue = post::emit_nzb(&posted);
-            println!(
-                "[post] ABORTED - {n} articles were accepted or duplicate-reported by the server."
+            info!(
+                target: "post",
+                "ABORTED - {n} articles were accepted or duplicate-reported by the server."
             );
             match write_rescue(&nzb_tmp, &rescue) {
                 Ok(at) => {
-                    println!(
-                        "[post] their Message-IDs are in {} - rename it to {} to use it, \
+                    info!(
+                        target: "post",
+                        "their Message-IDs are in {} - rename it to {} to use it, \
                          or delete it once you no longer need the record.",
                         at.display(),
                         args.nzb.display()
@@ -270,8 +304,9 @@ pub async fn run(config: &PathBuf, args: PostArgs) -> Result<()> {
                 // Last resort: the index cannot be written, so put it where
                 // the operator can still copy it out of the terminal.
                 Err(e) => {
-                    println!(
-                        "[post] cannot write {} ({e}) - printing the retrieval index instead:",
+                    info!(
+                        target: "post",
+                        "cannot write {} ({e}) - printing the retrieval index instead:",
                         nzb_tmp.display()
                     );
                     println!("{rescue}");
@@ -293,8 +328,9 @@ pub async fn run(config: &PathBuf, args: PostArgs) -> Result<()> {
             anyhow::bail!("posting failed: {e}")
         }
     };
-    println!(
-        "[post] upload complete in {:.1}s",
+    info!(
+        target: "post",
+        "upload complete in {:.1}s",
         t0.elapsed().as_secs_f64()
     );
 
@@ -325,8 +361,9 @@ pub async fn run(config: &PathBuf, args: PostArgs) -> Result<()> {
             }
         }
         Err(e) => {
-            println!(
-                "[post] cannot write {} ({e}) - printing the retrieval index instead:",
+            info!(
+                target: "post",
+                "cannot write {} ({e}) - printing the retrieval index instead:",
                 nzb_tmp.display()
             );
             println!("{xml}");
@@ -338,7 +375,7 @@ pub async fn run(config: &PathBuf, args: PostArgs) -> Result<()> {
             );
         }
     }
-    println!("[post] wrote {}", args.nzb.display());
+    info!(target: "post", "wrote {}", args.nzb.display());
 
     if args.verify {
         verify(&server, &args, &plan).await?;
@@ -356,7 +393,7 @@ async fn verify(
 ) -> Result<()> {
     use nzbkit::pool::{ArticleReq, FetchOutcome, PoolConfig, fetch_all_multi};
 
-    println!("[verify] re-downloading the post from {} …", server.host);
+    info!(target: "verify", "re-downloading the post from {} …", server.host);
     // Freshly posted articles can take a moment to become retrievable
     // even on the posting server.
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -370,7 +407,20 @@ async fn verify(
     // message-id → (per-file temp handle). Preallocate one temp file per
     // posted file, next to the NZB so cleanup is obvious on failure.
     let tmp_dir = args.nzb.with_extension("verify.tmp");
-    std::fs::create_dir_all(&tmp_dir)?;
+    // Exclusive, not `create_dir_all`: this path is derived from a
+    // user-supplied NZB name, every child is opened with a truncating
+    // create, and the whole directory is `remove_dir_all`'d at the end.
+    // A directory that already exists is someone else's - a crashed
+    // earlier verify, a concurrent one, or unrelated data - and nothing
+    // here proves otherwise, so refuse instead of truncating and then
+    // recursively deleting it.
+    std::fs::create_dir(&tmp_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "verify scratch directory {} already exists or cannot be created ({e}) - \
+             remove it and re-run",
+            tmp_dir.display()
+        )
+    })?;
     let mut files: Vec<(String, PathBuf, std::fs::File, u64)> = Vec::new(); // (name, src, tmp, size)
     let mut id_to_file: std::collections::HashMap<String, usize> = Default::default();
     let mut reqs: Vec<ArticleReq> = Vec::new();
@@ -408,7 +458,9 @@ async fn verify(
     while let Some(outcome) = rx.recv().await {
         match outcome {
             FetchOutcome::Done { id, raw } => {
-                let Some(&idx) = id_to_file.get(&id) else { continue };
+                let Some(&idx) = id_to_file.get(&id) else {
+                    continue;
+                };
                 match nzbkit::yenc::decode(&raw) {
                     Ok(dec) => {
                         nzbkit::disk::write_all_at(&files[idx].2, &dec.data, dec.offset())?;
@@ -422,11 +474,11 @@ async fn verify(
         }
     }
     let _ = fetcher.await;
-    println!("[verify] fetched {got}/{total} articles");
+    info!(target: "verify", "fetched {got}/{total} articles");
 
     let mut failed = !problems.is_empty();
     for p in &problems {
-        println!("[verify] problem: {p}");
+        info!(target: "verify", "problem: {p}");
     }
     for (name, src, tmp, _) in files {
         drop(tmp); // close the write handle before hashing
@@ -434,9 +486,14 @@ async fn verify(
         let have = nzbkit::post::sha256_file(&tmp_dir.join(&name))?;
         let ok = want == have;
         failed |= !ok;
-        println!(
-            "[verify] {name}: {}",
-            if ok { format!("OK sha256={want}") } else { format!("MISMATCH source={want} downloaded={have}") }
+        info!(
+            target: "verify",
+            "{name}: {}",
+            if ok {
+                format!("OK sha256={want}")
+            } else {
+                format!("MISMATCH source={want} downloaded={have}")
+            }
         );
     }
     if failed {
@@ -446,7 +503,7 @@ async fn verify(
         );
     }
     std::fs::remove_dir_all(&tmp_dir)?;
-    println!("[verify] all files match - round trip proven");
+    info!(target: "verify", "all files match - round trip proven");
     Ok(())
 }
 
@@ -494,17 +551,29 @@ mod tests {
             srv("news.off.example", 563, false),
         ]);
         // Exact single host match, case-insensitive.
-        assert_eq!(select_server(&c, "News.Alpha.Example").unwrap().host, "news.alpha.example");
+        assert_eq!(
+            select_server(&c, "News.Alpha.Example").unwrap().host,
+            "news.alpha.example"
+        );
         // No match: hard error listing candidates.
-        let e = select_server(&c, "news.nope.example").unwrap_err().to_string();
+        let e = select_server(&c, "news.nope.example")
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("matches no configured server"), "{e}");
         assert!(e.contains("news.alpha.example:563"), "{e}");
         // Ambiguous host: must disambiguate with host:port.
-        let e = select_server(&c, "news.beta.example").unwrap_err().to_string();
+        let e = select_server(&c, "news.beta.example")
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("disambiguate"), "{e}");
-        assert_eq!(select_server(&c, "news.beta.example:119").unwrap().port, 119);
+        assert_eq!(
+            select_server(&c, "news.beta.example:119").unwrap().port,
+            119
+        );
         // Disabled server: refused even when named explicitly.
-        let e = select_server(&c, "news.off.example").unwrap_err().to_string();
+        let e = select_server(&c, "news.off.example")
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("disabled"), "{e}");
     }
 
@@ -578,12 +647,16 @@ mod tests {
         std::fs::rename(&claim, &published).unwrap();
         let at = write_rescue(&claim, "<nzb>later</nzb>").unwrap();
         assert!(
-            at.to_string_lossy().ends_with(&format!(".{}", std::process::id())),
+            at.to_string_lossy()
+                .ends_with(&format!(".{}", std::process::id())),
             "{}",
             at.display()
         );
         assert_eq!(std::fs::read_to_string(&at).unwrap(), "<nzb>later</nzb>");
-        assert_eq!(std::fs::read_to_string(&published).unwrap(), "<nzb>mine</nzb>");
+        assert_eq!(
+            std::fs::read_to_string(&published).unwrap(),
+            "<nzb>mine</nzb>"
+        );
 
         // Someone else's rescue index now sits at the claim path (our claim
         // was cleared away mid-run and a second run left its own record
@@ -597,7 +670,10 @@ mod tests {
             PathBuf::from(format!("{}.{}.1", claim.display(), std::process::id()))
         );
         assert_eq!(std::fs::read_to_string(&at2).unwrap(), "<nzb>ours</nzb>");
-        assert_eq!(std::fs::read_to_string(&claim).unwrap(), "<nzb>theirs</nzb>");
+        assert_eq!(
+            std::fs::read_to_string(&claim).unwrap(),
+            "<nzb>theirs</nzb>"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -650,7 +726,10 @@ mod tests {
 
         let err = format!("{:#}", run(&config_path, args()).await.unwrap_err());
         assert!(err.contains("posting failed"), "{err}");
-        assert!(!tmp.exists(), "the claim outlived a run that posted nothing");
+        assert!(
+            !tmp.exists(),
+            "the claim outlived a run that posted nothing"
+        );
         assert!(!nzb_path.exists());
 
         // So the retry gets as far as the server, instead of being refused
@@ -667,11 +746,9 @@ mod tests {
     /// pool and passes the hash comparison.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_posts_and_verifies_against_the_mock() {
-        let srv = nzbkit::mock::MockServer::start(
-            Default::default(),
-            nzbkit::mock::Chaos::default(),
-        )
-        .await;
+        let srv =
+            nzbkit::mock::MockServer::start(Default::default(), nzbkit::mock::Chaos::default())
+                .await;
         let dir = std::env::temp_dir().join(format!("nzbfast-postcmd-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -762,7 +839,10 @@ mod tests {
 
         let err = run(&config_path, args()).await.unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("2 articles are posted or may be posted"), "{msg}");
+        assert!(
+            msg.contains("2 articles are posted or may be posted"),
+            "{msg}"
+        );
 
         // The rescue index is a real NZB listing exactly what landed.
         let tmp = PathBuf::from(format!("{}.nzbtmp", nzb_path.display()));

@@ -8,6 +8,8 @@
 //! and `indexer_grab` must fetch the NZB from A and enqueue it. Budgets
 //! gate visibly, and expired/unknown tokens refuse cleanly.
 
+mod scratch;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
@@ -28,13 +30,16 @@ fn free_port() -> u16 {
 fn http_get(port: u16, req: &str) -> (u16, String) {
     let mut last = String::new();
     for attempt in 0..5u32 {
-        match http_once(port, &format!(
-            "GET {req} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-        )) {
+        match http_once(
+            port,
+            &format!("GET {req} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+        ) {
             Ok(out) => return out,
             Err(e) => {
                 last = e.to_string();
-                std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(attempt) + 50));
+                std::thread::sleep(std::time::Duration::from_millis(
+                    100 * u64::from(attempt) + 50,
+                ));
             }
         }
     }
@@ -53,7 +58,9 @@ fn http_post_json(port: u16, req: &str, body: &str) -> (u16, String) {
             Ok(out) => return out,
             Err(e) => {
                 last = e.to_string();
-                std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(attempt) + 50));
+                std::thread::sleep(std::time::Duration::from_millis(
+                    100 * u64::from(attempt) + 50,
+                ));
             }
         }
     }
@@ -67,12 +74,21 @@ fn http_once(port: u16, msg: &str) -> std::io::Result<(u16, String)> {
     let read = s.read_to_string(&mut out);
     if out.is_empty() {
         return Err(read.err().unwrap_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "closed without answering")
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "closed without answering",
+            )
         }));
     }
-    let status: u16 =
-        out.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
-    Ok((status, out.split("\r\n\r\n").nth(1).unwrap_or("").to_string()))
+    let status: u16 = out
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    Ok((
+        status,
+        out.split("\r\n\r\n").nth(1).unwrap_or("").to_string(),
+    ))
 }
 
 fn pct(s: &str) -> String {
@@ -119,10 +135,16 @@ async fn serve(dir: &Path, build: impl Fn(u16) -> Command) -> Daemon {
         .await
         .unwrap();
         if ready {
-            return Daemon { _child: child, port };
+            return Daemon {
+                _child: child,
+                port,
+            };
         }
         let tail = std::fs::read_to_string(&logfile).unwrap_or_default();
-        assert!(attempt < 2, "daemon exited without binding :{port}\n--- log ---\n{tail}");
+        assert!(
+            attempt < 2,
+            "daemon exited without binding :{port}\n--- log ---\n{tail}"
+        );
     }
     unreachable!()
 }
@@ -130,7 +152,9 @@ async fn serve(dir: &Path, build: impl Fn(u16) -> Command) -> Daemon {
 fn wait_ready(child: &mut KillOnDrop, port: u16, logfile: &Path) -> bool {
     let banner = format!("open the dashboard at  http://localhost:{port}/");
     for _ in 0..600 {
-        if std::fs::read_to_string(logfile).unwrap_or_default().contains(&banner)
+        if std::fs::read_to_string(logfile)
+            .unwrap_or_default()
+            .contains(&banner)
             && TcpStream::connect(("127.0.0.1", port)).is_ok()
         {
             return true;
@@ -235,30 +259,40 @@ fn mock_indexer() -> MockIndexer {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_title_page_search_uses_the_imdb_id() {
     let dir = std::env::temp_dir().join(format!("nzbfast-pullid-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // A local title row carrying the id the search must pick up.
     let db = dir.join("index.db");
     {
         let ix = nzbkit::index::Index::open(&db).unwrap();
-        ix.title_seed("m:kill bill:2003", "movie", "Kill Bill", 2003).unwrap();
+        ix.title_seed("m:kill bill:2003", "movie", "Kill Bill", 2003)
+            .unwrap();
         ix.title_fill(
             "m:kill bill:2003",
-            &nzbkit::index::TitleFill { imdb: "tt0266697", ..Default::default() },
+            &nzbkit::index::TitleFill {
+                imdb: "tt0266697",
+                ..Default::default()
+            },
             1_700_000_000,
         )
         .unwrap();
     }
     let mock = mock_indexer();
     let cfg = dir.join("config.json");
-    std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
-        .unwrap();
+    std::fs::write(
+        &cfg,
+        "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}",
+    )
+    .unwrap();
     // The id is resolved from the LOCAL titles table, which the daemon
     // will not open while the built-in indexer's master switch is off
     // (its default). A title page only exists when that switch is on
     // anyway, so this is the honest configuration for this test.
-    std::fs::write(cfg.with_file_name("settings.json"), "{\"index_enabled\": true}").unwrap();
+    std::fs::write(
+        cfg.with_file_name("settings.json"),
+        "{\"index_enabled\": true}",
+    )
+    .unwrap();
     let d = serve(&dir, |port| daemon_cmd(&dir, &cfg, &db, port, &[])).await;
     let port = d.port;
     let mport = mock.port;
@@ -323,8 +357,7 @@ async fn a_title_page_search_uses_the_imdb_id() {
 #[tokio::test(flavor = "multi_thread")]
 async fn watchlist_external_defaults_on_but_an_explicit_off_wins() {
     let dir = std::env::temp_dir().join(format!("nzbfast-pullwl-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // Peer A carries the episode; our own index (B) is empty.
     let dir_a = dir.join("a");
@@ -335,29 +368,49 @@ async fn watchlist_external_defaults_on_but_an_explicit_off_wins() {
         ix.ingest(
             "alt.binaries.teevee",
             &[
-                over(1, "\"Wanted.Show.S02E05.1080p.WEB.rar\" yEnc (1/1)", "<w1@x>", 4000),
-                over(2, "\"Wanted.Show.S02E05.1080p.WEB.par2\" yEnc (1/1)", "<w2@x>", 400),
+                over(
+                    1,
+                    "\"Wanted.Show.S02E05.1080p.WEB.rar\" yEnc (1/1)",
+                    "<w1@x>",
+                    4000,
+                ),
+                over(
+                    2,
+                    "\"Wanted.Show.S02E05.1080p.WEB.par2\" yEnc (1/1)",
+                    "<w2@x>",
+                    400,
+                ),
             ],
             1_700_000_000,
         )
         .unwrap();
     }
     let cfg_a = dir_a.join("config.json");
-    std::fs::write(&cfg_a, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
-        .unwrap();
+    std::fs::write(
+        &cfg_a,
+        "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}",
+    )
+    .unwrap();
     // A publishes its index over newznab, so its built-in indexer is on.
     // B deliberately leaves the switch at its default OFF: this test is
     // then also the regression for the watchlist's external leg working
     // with no local index at all, which is the ordinary new install.
-    std::fs::write(cfg_a.with_file_name("settings.json"), "{\"index_enabled\": true}").unwrap();
+    std::fs::write(
+        cfg_a.with_file_name("settings.json"),
+        "{\"index_enabled\": true}",
+    )
+    .unwrap();
     let a = serve(&dir_a, |port| daemon_cmd(&dir_a, &cfg_a, &db_a, port, &[])).await;
     let port_a = a.port;
 
     let dir_b = dir.join("b");
     std::fs::create_dir_all(&dir_b).unwrap();
     let cfg_b = dir_b.join("config.json");
-    std::fs::write(&cfg_b, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
-        .unwrap();
+    std::fs::write(
+        &cfg_b,
+        "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}",
+    )
+    .unwrap();
     let db_b = dir_b.join("index.db");
     let b = serve(&dir_b, |port| daemon_cmd(&dir_b, &cfg_b, &db_b, port, &[])).await;
     let port_b = b.port;
@@ -458,8 +511,7 @@ async fn watchlist_external_defaults_on_but_an_explicit_off_wins() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pull_search_grabs_from_a_second_nzbfast() {
     let dir = std::env::temp_dir().join(format!("nzbfast-pull-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // Daemon A: the "commercial indexer". Seeded index, key-protected.
     let dir_a = dir.join("a");
@@ -470,22 +522,39 @@ async fn pull_search_grabs_from_a_second_nzbfast() {
         ix.ingest(
             "alt.binaries.teevee",
             &[
-                over(1, "\"Pull.Show.S01E02.1080p.rar\" yEnc (1/1)", "<p1@x>", 1000),
-                over(2, "\"Pull.Show.S01E02.1080p.par2\" yEnc (1/1)", "<p2@x>", 200),
+                over(
+                    1,
+                    "\"Pull.Show.S01E02.1080p.rar\" yEnc (1/1)",
+                    "<p1@x>",
+                    1000,
+                ),
+                over(
+                    2,
+                    "\"Pull.Show.S01E02.1080p.par2\" yEnc (1/1)",
+                    "<p2@x>",
+                    200,
+                ),
             ],
             1_700_000_000,
         )
         .unwrap();
     }
     let cfg_a = dir_a.join("config.json");
-    std::fs::write(&cfg_a, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
-        .unwrap();
+    std::fs::write(
+        &cfg_a,
+        "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}",
+    )
+    .unwrap();
     // A is playing the role of a third-party indexer, so its built-in
     // indexer has to be switched on - that switch defaults OFF and
     // closes the newznab facade with it. B deliberately leaves it off,
     // which is the case this whole feature exists for: pull search
     // works with no local index at all.
-    std::fs::write(cfg_a.with_file_name("settings.json"), "{\"index_enabled\": true}").unwrap();
+    std::fs::write(
+        cfg_a.with_file_name("settings.json"),
+        "{\"index_enabled\": true}",
+    )
+    .unwrap();
     let a = serve(&dir_a, |port| {
         daemon_cmd(&dir_a, &cfg_a, &db_a, port, &["--apikey", "sekrit"])
     })
@@ -496,8 +565,11 @@ async fn pull_search_grabs_from_a_second_nzbfast() {
     let dir_b = dir.join("b");
     std::fs::create_dir_all(&dir_b).unwrap();
     let cfg_b = dir_b.join("config.json");
-    std::fs::write(&cfg_b, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
-        .unwrap();
+    std::fs::write(
+        &cfg_b,
+        "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}",
+    )
+    .unwrap();
     let db_b = dir_b.join("index.db");
     let b = serve(&dir_b, |port| daemon_cmd(&dir_b, &cfg_b, &db_b, port, &[])).await;
     let port_b = b.port;

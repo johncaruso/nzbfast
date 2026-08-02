@@ -259,6 +259,9 @@ select{background:var(--surface);color:var(--fg);border:1px solid var(--line);
 .nbadge{background:var(--surface-2);border:1px solid var(--line);color:var(--dim);
   font-size:9.5px;font-weight:600;letter-spacing:.02em;padding:1px 6px;border-radius:5px;
   white-space:nowrap;max-width:220px;overflow:hidden;text-overflow:ellipsis}
+/* A correlated-name suggestion: clickable, visibly tentative. */
+.nbadge.sugg{cursor:pointer;border-style:dashed;color:var(--fg);max-width:340px}
+.nbadge.sugg:hover{border-color:var(--accent,#7aa2f7)}
 /* Group-by-title: one row per title, releases nested under the expander. */
 #ltable .exp{background:transparent;border:none;color:var(--dim);cursor:pointer;
   font-size:12px;padding:2px 6px;border-radius:6px}
@@ -898,7 +901,10 @@ async function askKey(){
   return true;
 }
 async function api(mode, extra){
-  const r = await fetch(`/api?mode=${mode}&apikey=${encodeURIComponent(key)}${extra||''}`);
+  // Issue #4: the key rides the X-Api-Key header, not the query string
+  // (keeps it out of proxy logs / history / Referer). Navigation links
+  // (/m3u, /getnzb) still use ?apikey= - links cannot carry headers.
+  const r = await fetch(`/api?mode=${mode}${extra||''}`, {headers: key?{'X-Api-Key': key}:{}});
   const j = await r.json();
   if (j.error === 'API Key Incorrect' && await askKey()) return api(mode, extra);
   return j;
@@ -1785,6 +1791,19 @@ function nameBadges(r){
   const b=[];
   if(r.par2) b.push(`<span class="nbadge" data-i18n-skip title="${esc(t('wall.badge.par2.title','Repair data posted alongside: damaged parts can be rebuilt'))}">PAR2</span>`);
   if(r.rescued) b.push(`<span class="nbadge">${t('wall.rot.decoded','decoded')}</span>`);
+  if(r.pre){
+    // Two different claims, and the badge must not blur them: "pre"
+    // means a relay paired this posted filename with its real title;
+    // "correlated" means we inferred the pairing from timing and size.
+    const corr=/^predb\/(corr:|manual\+corr:)/.test(r.pre);
+    b.push(`<span class="nbadge" title="${esc(corr
+      ? t('wall.badge.corr.title','This name was inferred: a pre announcement matched this post on timing and size. It only changes how the release is shown, and it is taken back off if a download proves it wrong.')
+      : t('wall.badge.pre.title','Named by the pre feed: a relay announced this posted filename together with its real title.'))}">${
+      corr?t('wall.badge.corr','correlated'):t('wall.badge.pre','pre')}</span>`);
+  }
+  if(!r.pre && r.pre_hint && r.pre_hint.status==='suggested')
+    b.push(`<span class="nbadge sugg" onclick="event.stopPropagation();openPreCand(${r.id})"
+      title="${esc(t('wall.sugg.tip','A pre announcement matches this post on timing and size. Click to review the candidates: pick the right name or dismiss them.'))}">≈ ${esc(r.pre_hint.name)}</span>`);
   if(r.group) b.push(`<span class="nbadge" dir="ltr" title="${esc(r.group)}">${esc(r.group)}</span>`);
   return b.length?`<div class="brow">${b.join('')}</div>`:'';
 }
@@ -2253,6 +2272,49 @@ function closeOvl(){
   document.body.style.overflow='';
 }
 
+// ---- correlated-name candidates -------------------------------------
+// The pick-a-name view for an obfuscated post: the ranked pre
+// announcements whose timing and size fit. Accepting writes the name
+// with human-picked provenance; "none of these" makes the dismissal
+// permanent so the suggestion never nags again.
+function candGap(sec){
+  const v=Math.abs(sec|0);
+  return v>=172800?Math.round(v/86400)+'d':v>=5400?Math.round(v/3600)+'h':Math.max(1,Math.round(v/60))+'m';
+}
+async function openPreCand(id){
+  const sheet=document.getElementById('sheet');
+  sheet.innerHTML=`<div class="pbody"><div class="dim">${t('wall.person.loading','Loading…')}</div></div>`;
+  document.getElementById('ovl').classList.add('open');
+  document.body.style.overflow='hidden';
+  const j=await api('pre_candidates',`&id=${id}`).catch(()=>null);
+  const cands=(j&&j.candidates)||[];
+  sheet.innerHTML=`<div class="pbody">
+    <h3 style="margin:0 0 4px">${t('wall.cand.title','Which release is this?')}</h3>
+    <div class="dim" style="font-size:12.5px;margin-bottom:10px">${t('wall.cand.sub','Pre announcements whose timing and size fit this post, best first. Nothing is renamed on disk either way.')}</div>
+    ${cands.length?cands.map(c=>`
+      <div style="display:flex;align-items:center;gap:10px;padding:7px 2px;border-top:1px solid var(--line)">
+        <div style="flex:1;min-width:0">
+          <div dir="ltr" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(c.name)}</div>
+          <div class="dim" style="font-size:11.5px">${esc(t('wall.cand.meta','{score} points · announced {gap} apart · size ×{ratio}',
+            {score:c.score,gap:candGap(c.delta),ratio:(c.ratio||0).toFixed(2)}))}${c.nuked?` · <span style="color:var(--warn,#e0af68)">${t('wall.cand.nuked','nuked')}</span>`:''}</div>
+        </div>
+        <button class="act quiet" onclick="preAssign(${id},${c.predb_id})">${t('wall.cand.use','Use this name')}</button>
+      </div>`).join(''):`<div class="dim" style="padding:8px 0">${t('wall.cand.none','No announcement fits this post.')}</div>`}
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
+      <button class="act ghost" onclick="preReject(${id})">${t('wall.cand.notthese','None of these')}</button>
+      <button class="act quiet" onclick="closeOvl()">${t('wall.close','Close')}</button>
+    </div></div>`;
+}
+async function preAssign(id,pid){
+  const j=await api('pre_assign',`&id=${id}&predb_id=${pid}`).catch(()=>({status:false}));
+  if(!j.status){ toast(t('wall.cand.fail','That did not stick - the release may have been named meanwhile.')); return; }
+  closeOvl(); browseFetch();
+}
+async function preReject(id){
+  await api('pre_reject',`&id=${id}`).catch(()=>{});
+  closeOvl(); browseFetch();
+}
+
 // ---- cast, crew and person pages ------------------------------------
 // Provider text renders straight onto these chips, and character names
 // are the newest untrusted string on the page - everything below goes
@@ -2409,8 +2471,8 @@ async function loadFilmography(id, btn){
 // ---- M16 fix-match: re-search, pick a candidate, or scrub by hand ----
 let fixCands=[];
 async function apiPost(mode, body){
-  const r=await fetch(`/api?mode=${mode}&apikey=${encodeURIComponent(key)}`,
-    {method:'POST', body:JSON.stringify(body)});
+  const r=await fetch(`/api?mode=${mode}`,
+    {method:'POST', body:JSON.stringify(body), headers: key?{'X-Api-Key': key}:{}});
   const j=await r.json();
   if(j.error==='API Key Incorrect' && await askKey()) return apiPost(mode,body);
   return j;
@@ -2521,8 +2583,8 @@ async function artFromFile(inp){
   toast(t('wall.uploading','Uploading…'));
   const fd=new FormData(); fd.append('file', f, f.name||'poster');
   try{
-    const r=await fetch(`/api?mode=wall_art&apikey=${encodeURIComponent(key)}&key=${encodeURIComponent(openKey)}`,
-      {method:'POST', body:fd});
+    const r=await fetch(`/api?mode=wall_art&key=${encodeURIComponent(openKey)}`,
+      {method:'POST', body:fd, headers: key?{'X-Api-Key': key}:{}});
     await artDone(await r.json());
   }catch(e){ toast(t('wall.failed','Failed: {err}',{err:e.message})); }
 }

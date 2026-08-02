@@ -5,19 +5,16 @@
 //! suite stays green while it is open, and the `#[ignore]` comes off
 //! when it is fixed. All three are fixed and running.
 
+mod scratch;
+
 use nzbkit::index::{BrowseQuery, BrowseSort, Credit, Index};
 use nzbkit::nntp::OverEntry;
-use std::path::PathBuf;
 
 /// Fresh on-disk index in a per-test temp directory (same idiom as the
 /// in-crate index tests - no tempdir dev-dependency in this crate).
-fn temp_index(tag: &str) -> (Index, PathBuf) {
-    let dir = std::env::temp_dir().join(format!(
-        "nzbfast-index-regr-{tag}-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+fn temp_index(tag: &str) -> (Index, scratch::ScratchDir) {
+    let dir = std::env::temp_dir().join(format!("nzbfast-index-regr-{tag}-{}", std::process::id()));
+    let dir = scratch::ScratchDir::attach(&dir);
     let ix = Index::open(&dir.join("index.db")).unwrap();
     (ix, dir)
 }
@@ -42,9 +39,8 @@ fn entry(subject: &str, from: &str, id: &str, bytes: u64) -> OverEntry {
 #[test]
 fn category_sort_ranks_resolution_by_quality_not_lexicographically() {
     let (mut ix, _dir) = temp_index("c3");
-    let mk = |f: &str, from: &str, id: &str| {
-        entry(&format!("\"{f}\" yEnc (1/1)"), from, id, 4 << 30)
-    };
+    let mk =
+        |f: &str, from: &str, id: &str| entry(&format!("\"{f}\" yEnc (1/1)"), from, id, 4 << 30);
     ix.ingest(
         "alt.binaries.test",
         &[
@@ -92,9 +88,24 @@ fn rerar_with_reused_filenames_must_not_mark_a_mixed_generation_complete() {
     ix.ingest(
         "alt.binaries.test",
         &[
-            entry(&format!("\"{fname}\" yEnc (3/5)"), poster, "gen1-p3", 750_000),
-            entry(&format!("\"{fname}\" yEnc (4/5)"), poster, "gen1-p4", 750_000),
-            entry(&format!("\"{fname}\" yEnc (5/5)"), poster, "gen1-p5", 750_000),
+            entry(
+                &format!("\"{fname}\" yEnc (3/5)"),
+                poster,
+                "gen1-p3",
+                750_000,
+            ),
+            entry(
+                &format!("\"{fname}\" yEnc (4/5)"),
+                poster,
+                "gen1-p4",
+                750_000,
+            ),
+            entry(
+                &format!("\"{fname}\" yEnc (5/5)"),
+                poster,
+                "gen1-p5",
+                750_000,
+            ),
         ],
         1_000,
     )
@@ -109,8 +120,18 @@ fn rerar_with_reused_filenames_must_not_mark_a_mixed_generation_complete() {
     ix.ingest(
         "alt.binaries.test",
         &[
-            entry(&format!("\"{fname}\" yEnc (1/3)"), poster, "gen2-p1", 750_000),
-            entry(&format!("\"{fname}\" yEnc (2/3)"), poster, "gen2-p2", 750_000),
+            entry(
+                &format!("\"{fname}\" yEnc (1/3)"),
+                poster,
+                "gen2-p1",
+                750_000,
+            ),
+            entry(
+                &format!("\"{fname}\" yEnc (2/3)"),
+                poster,
+                "gen2-p2",
+                750_000,
+            ),
         ],
         2_000,
     )
@@ -217,7 +238,10 @@ fn person_upsert_keeps_two_people_apart_once_each_has_a_different_handle_type() 
             ..Default::default()
         })
         .unwrap();
-    assert_eq!(film, tv, "one human seen by two providers forked into two rows");
+    assert_eq!(
+        film, tv,
+        "one human seen by two providers forked into two rows"
+    );
     let row = ix.person_get(film).unwrap().unwrap();
     assert_eq!(
         (row.tvmaze_id, row.wikidata_qid.as_str(), row.imdb.as_str()),
@@ -269,7 +293,10 @@ fn person_upsert_separates_two_people_who_differ_on_the_imdb_id() {
         .unwrap();
     assert_eq!(again, a, "the IMDb id did not identify the person it names");
     let row = ix.person_get(a).unwrap().unwrap();
-    assert_eq!(row.tvmaze_id, 77, "the second provider's handle was not filled in");
+    assert_eq!(
+        row.tvmaze_id, 77,
+        "the second provider's handle was not filled in"
+    );
     // A credit that knows only the name still lands on one of them
     // rather than forking a third row: a blank never contradicts.
     let bare = ix
@@ -279,5 +306,8 @@ fn person_upsert_separates_two_people_who_differ_on_the_imdb_id() {
             ..Default::default()
         })
         .unwrap();
-    assert!(bare == a || bare == b, "a handle-less credit forked a new row");
+    assert!(
+        bare == a || bare == b,
+        "a handle-less credit forked a new row"
+    );
 }

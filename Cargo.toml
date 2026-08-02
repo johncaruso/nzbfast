@@ -7,6 +7,45 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/nzbfast/nzbfast"
 
+# Workspace-wide lints; each first-party crate opts in with
+# `[lints] workspace = true`. vendor/ crates keep their own tables.
+# Start small and ratchet: clashing extern declarations are UB and were
+# a real bug (mem.rs task_info); undocumented unsafe is the next target
+# once the existing prose comments are converted to SAFETY: form.
+[workspace.lints.rust]
+clashing_extern_declarations = "deny"
+
+# Burned down 1 Aug 2026 from 32 categories to these. CI runs clippy with
+# -D warnings and no -A escapes at all, so anything not listed here blocks
+# - including dead_code and unused_assignments, which used to be waived on
+# the command line. What is left splits in two: everything above the
+# divider is still debt (fix one, delete its line); everything below it
+# is house style, is expected to stay, and says why.
+[workspace.lints.clippy]
+too_many_arguments = "allow"
+type_complexity = "allow"
+large_enum_variant = "allow"
+ptr_arg = "allow"
+assertions_on_constants = "allow"
+unnecessary_unwrap = "allow"
+
+# --- below this line: kept on purpose, not debt ---
+# The two doc lints below are a house-style clash, not debt. Copy rules ban
+# em-dashes, so an aside is written as a spaced hyphen, and reflowing
+# puts one at the start of a line - which markdown then reads as a
+# bullet, making the rest of the paragraph a
+# "lazy continuation". Clippy's fix indents the paragraph under the
+# phantom bullet, which entrenches the misparse instead of fixing it.
+# Neither crate publishes rustdoc, so the rendering is not worth
+# reflowing 126 comments over.
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
+# Also style, not debt: the 15 remaining sites are numeric kernels and
+# fixtures where the index IS the value - gf16's log/exp tables, RAR5's
+# `<< (7 * i)` vint, the PAR2 matrix product, `format!("big.7z.{i+1}")`.
+# enumerate()/zip() reads worse in every one.
+needless_range_loop = "allow"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

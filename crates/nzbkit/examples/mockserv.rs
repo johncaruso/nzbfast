@@ -50,7 +50,10 @@ async fn main() {
     )
     .await;
     println!("mock NNTP on {} - nzb at {}", srv.addr, nzb_path.display());
-    println!("point nzbfast at host 127.0.0.1, port {}, TLS off, no auth", srv.addr.port());
+    println!(
+        "point nzbfast at host 127.0.0.1, port {}, TLS off, no auth",
+        srv.addr.port()
+    );
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
     }

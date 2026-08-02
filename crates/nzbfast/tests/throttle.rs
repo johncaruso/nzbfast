@@ -2,6 +2,8 @@
 //! clock it must, the cap is visible in mode=queue, and mode=config lifts
 //! it live without a restart.
 
+mod scratch;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -12,7 +14,9 @@ use std::time::Instant;
 use nzbkit::mock::{Chaos, MockServer, make_file_articles};
 
 fn payload(n: usize, seed: u8) -> Vec<u8> {
-    (0..n).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
+    (0..n)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+        .collect()
 }
 
 /// OS-assigned free port for a daemon under test. The old pid-derived
@@ -21,7 +25,11 @@ fn payload(n: usize, seed: u8) -> Vec<u8> {
 /// whichever daemon bound second - and could also land on the ephemeral
 /// range the suites' own client sockets draw from.
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 /// Response body of a request to the daemon (headers stripped).
@@ -44,7 +52,9 @@ fn http(port: u16, req: &str, body: Option<(&str, &[u8])>) -> String {
             Ok(out) => return out,
             Err(e) => {
                 last = e.to_string();
-                std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(attempt) + 50));
+                std::thread::sleep(std::time::Duration::from_millis(
+                    100 * u64::from(attempt) + 50,
+                ));
             }
         }
     }
@@ -58,7 +68,11 @@ fn http_once(port: u16, req: &str, body: Option<(&str, &[u8])>) -> std::io::Resu
     let mut request = Vec::new();
     match body {
         None => {
-            write!(request, "GET {req} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+            write!(
+                request,
+                "GET {req} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
         }
         Some((ctype, data)) => {
             write!(
@@ -183,13 +197,19 @@ async fn serve(dir: &Path, build: impl Fn(u16) -> Command) -> Daemon {
         .await
         .unwrap();
         if ready {
-            return Daemon { _child: child, port };
+            return Daemon {
+                _child: child,
+                port,
+            };
         }
         // The daemon exited instead of binding: `free_port()` handed :port
         // to a parallel test between our bind(:0) and the daemon's bind,
         // and that test's daemon won it. Try a fresh port.
         let tail = std::fs::read_to_string(&logfile).unwrap_or_default();
-        assert!(attempt < 2, "daemon exited without binding :{port}\n--- log ---\n{tail}");
+        assert!(
+            attempt < 2,
+            "daemon exited without binding :{port}\n--- log ---\n{tail}"
+        );
     }
     unreachable!()
 }
@@ -209,7 +229,9 @@ async fn serve(dir: &Path, build: impl Fn(u16) -> Command) -> Daemon {
 fn wait_ready(child: &mut KillOnDrop, port: u16, logfile: &Path) -> bool {
     let banner = format!("open the dashboard at  http://localhost:{port}/");
     for _ in 0..600 {
-        if std::fs::read_to_string(logfile).unwrap_or_default().contains(&banner)
+        if std::fs::read_to_string(logfile)
+            .unwrap_or_default()
+            .contains(&banner)
             && TcpStream::connect(("127.0.0.1", port)).is_ok()
         {
             return true;
@@ -226,8 +248,7 @@ fn wait_ready(child: &mut KillOnDrop, port: u16, logfile: &Path) -> bool {
 #[tokio::test(flavor = "multi_thread")]
 async fn speedlimit_paces_and_lifts_live() {
     let dir = std::env::temp_dir().join(format!("nzbfast-throttle-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // Two ~2 MB posts on one mock server.
     let slow_data = payload(2_000_000, 5);
@@ -344,8 +365,7 @@ async fn speedlimit_paces_and_lifts_live() {
 #[tokio::test(flavor = "multi_thread")]
 async fn auto_speed_governor_smoke() {
     let dir = std::env::temp_dir().join(format!("nzbfast-autospeed-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let data = payload(1_000_000, 17);
     let mut articles = HashMap::new();
@@ -398,13 +418,21 @@ async fn auto_speed_governor_smoke() {
         );
 
         // Toggle off: rate returns to the (unlimited) ceiling.
-        let r = http(port, "/api?mode=config&name=auto_speed&value=0&output=json", None);
+        let r = http(
+            port,
+            "/api?mode=config&name=auto_speed&value=0&output=json",
+            None,
+        );
         assert!(r.contains("\"status\":true"), "{r}");
         let q = http(port, "/api?mode=queue&output=json", None);
         assert!(q.contains("\"auto_speed\":false"), "{q}");
         assert!(q.contains("\"speedlimit_abs\":0"), "{q}");
         // And back on.
-        let r = http(port, "/api?mode=config&name=auto_speed&value=1&output=json", None);
+        let r = http(
+            port,
+            "/api?mode=config&name=auto_speed&value=1&output=json",
+            None,
+        );
         assert!(r.contains("\"status\":true"), "{r}");
     })
     .await

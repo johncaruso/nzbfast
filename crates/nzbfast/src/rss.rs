@@ -97,7 +97,9 @@ fn term_matches(term: &str, item: &FeedItem) -> bool {
     if term.contains('*') || term.contains('?') {
         glob_match(term, &item.title)
     } else {
-        item.title.to_ascii_lowercase().contains(&term.to_ascii_lowercase())
+        item.title
+            .to_ascii_lowercase()
+            .contains(&term.to_ascii_lowercase())
     }
 }
 
@@ -198,7 +200,12 @@ pub fn parse_feed(xml: &str) -> Vec<FeedItem> {
             .filter(|g| !g.is_empty())
             .unwrap_or_else(|| link.clone());
         if !title.is_empty() && !link.is_empty() {
-            out.push(FeedItem { title, link, size, guid });
+            out.push(FeedItem {
+                title,
+                link,
+                size,
+                guid,
+            });
         }
         rest = &rest[open + close + 7..];
     }

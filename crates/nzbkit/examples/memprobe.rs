@@ -4,13 +4,13 @@
 
 fn main() {
     let gb = |b: u64| b as f64 / (1u64 << 30) as f64;
-    println!(
-        "physical_ram: {:?} GB",
-        nzbkit::mem::physical_ram().map(gb)
-    );
+    println!("physical_ram: {:?} GB", nzbkit::mem::physical_ram().map(gb));
     println!(
         "cgroup_mem_limit: {:?} GB",
         nzbkit::mem::cgroup_mem_limit().map(gb)
     );
-    println!("auto budget: {:.2} GB", gb(nzbkit::mem::MemBudget::auto().total));
+    println!(
+        "auto budget: {:.2} GB",
+        gb(nzbkit::mem::MemBudget::auto().total)
+    );
 }

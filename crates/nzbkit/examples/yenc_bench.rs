@@ -15,7 +15,7 @@ const PASSES: usize = 3;
 fn main() {
     // Deterministic pseudo-random payload (splitmix64) - worst-ish case for
     // yEnc: ~1/256 escapes, exercises every byte value.
-    let mut seed = 0x00C0FFEE_5EED_1234u64;
+    let mut seed = 0x00C0_FFEE_5EED_1234_u64;
     let mut next = move || {
         seed = seed.wrapping_add(0x9E3779B97F4A7C15);
         let mut z = seed;
@@ -52,7 +52,9 @@ fn main() {
         PART_SIZE / 1000
     );
     let (dk, ck) = nzbkit::yenc_simd::kernels();
-    println!("rapidyenc kernels: decode=0x{dk:x} crc=0x{ck:x} (NEON=0x1000, ARMCRC=0x8, PMULL=0x48)");
+    println!(
+        "rapidyenc kernels: decode=0x{dk:x} crc=0x{ck:x} (NEON=0x1000, ARMCRC=0x8, PMULL=0x48)"
+    );
 
     // Warm-up + verify both paths agree before timing.
     let a = nzbkit::yenc::decode(&articles[0]).unwrap();

@@ -91,7 +91,10 @@ pub fn pat_match(pattern: &str, name: &str) -> bool {
     if p.is_empty() {
         return true;
     }
-    match regex_lite::RegexBuilder::new(p).case_insensitive(true).build() {
+    match regex_lite::RegexBuilder::new(p)
+        .case_insensitive(true)
+        .build()
+    {
         Ok(re) => re.is_match(name),
         Err(_) => name.to_ascii_lowercase().contains(&p.to_ascii_lowercase()),
     }
@@ -143,8 +146,7 @@ pub fn migrate_reserved_slugs(cats: &mut [CustomCategory]) -> Vec<(String, Strin
         }
         let mut candidate = format!("{}-custom", c.slug);
         let mut n = 2;
-        while RESERVED_KINDS.contains(&candidate.as_str())
-            || taken.iter().any(|t| t == &candidate)
+        while RESERVED_KINDS.contains(&candidate.as_str()) || taken.iter().any(|t| t == &candidate)
         {
             candidate = format!("{}-custom{n}", c.slug);
             n += 1;
@@ -327,7 +329,11 @@ mod tests {
         // "m:formula1:2026" for the entire season.
         assert_ne!(quali.key, show.key);
         assert_ne!(quali.key, race12.key);
-        assert!(quali.key.starts_with("c:formula-1:formula1:2026:"), "{}", quali.key);
+        assert!(
+            quali.key.starts_with("c:formula-1:formula1:2026:"),
+            "{}",
+            quali.key
+        );
         // Same session in two qualities = one key (furniture never
         // differentiates - carried over from the built-in keys).
         let quali720 = classify(
@@ -388,7 +394,10 @@ mod tests {
         // a whole matchday silently reduced to one fixture is not.
         assert_eq!(a.key, "c:podcasts:the daily show:20260721:guest");
         assert_ne!(a.key, b.key);
-        assert_eq!(release::parse_release("The.Daily.Show.2026.07.21.Guest.1080p").key, "t:the daily show");
+        assert_eq!(
+            release::parse_release("The.Daily.Show.2026.07.21.Guest.1080p").key,
+            "t:the daily show"
+        );
         // Same day in two qualities is still one identity.
         let a720 = classify("The.Daily.Show.2026.07.21.Guest.720p.WEB.h264-OTHER", &cats);
         assert_eq!(a.key, a720.key);
@@ -405,8 +414,14 @@ mod tests {
             not_match: String::new(),
             base: BaseBehavior::None,
         }];
-        let m1 = classify("EPL.2026.08.15.Arsenal.vs.Chelsea.1080p.WEB.h264-VERUM", &foot);
-        let m2 = classify("EPL.2026.08.22.Liverpool.vs.Everton.1080p.WEB.h264-VERUM", &foot);
+        let m1 = classify(
+            "EPL.2026.08.15.Arsenal.vs.Chelsea.1080p.WEB.h264-VERUM",
+            &foot,
+        );
+        let m2 = classify(
+            "EPL.2026.08.22.Liverpool.vs.Everton.1080p.WEB.h264-VERUM",
+            &foot,
+        );
         let m3 = classify("EPL.2026.08.22.Arsenal.vs.Spurs.720p.WEB.h264-VERUM", &foot);
         assert_eq!(m1.key, "c:football:epl:20260815:arsenal vs chelsea");
         assert_ne!(m1.key, m2.key);
@@ -414,7 +429,10 @@ mod tests {
         assert_ne!(m2.key, m3.key);
         // The same fixture in another quality is still one event: only
         // identity tokens reach the tail, never resolution or group.
-        let m3_hd = classify("EPL.2026.08.22.Arsenal.vs.Spurs.1080p.WEB.h264-OTHER", &foot);
+        let m3_hd = classify(
+            "EPL.2026.08.22.Arsenal.vs.Spurs.1080p.WEB.h264-OTHER",
+            &foot,
+        );
         assert_eq!(m3.key, m3_hd.key);
     }
 
@@ -463,9 +481,15 @@ mod tests {
         assert_eq!(base_of(&Kind::Tv, &cats), BaseBehavior::Tv);
         assert_eq!(base_of(&Kind::Software, &cats), BaseBehavior::None);
         assert_eq!(base_of(&Kind::Other, &cats), BaseBehavior::None);
-        assert_eq!(base_of(&Kind::Custom("formula-1".into()), &cats), BaseBehavior::Movie);
+        assert_eq!(
+            base_of(&Kind::Custom("formula-1".into()), &cats),
+            BaseBehavior::Movie
+        );
         // Deleted category → behaviors off, files left as posted.
-        assert_eq!(base_of(&Kind::Custom("gone".into()), &cats), BaseBehavior::None);
+        assert_eq!(
+            base_of(&Kind::Custom("gone".into()), &cats),
+            BaseBehavior::None
+        );
     }
 
     #[test]
@@ -526,10 +550,16 @@ mod tests {
             base: BaseBehavior::Movie,
         };
         let mut cats = vec![mk("music", "Music"), mk("formula-1", "Formula 1")];
-        assert!(validate(&cats).is_err(), "the collision must be a validation error");
+        assert!(
+            validate(&cats).is_err(),
+            "the collision must be a validation error"
+        );
 
         let renamed = migrate_reserved_slugs(&mut cats);
-        assert_eq!(renamed, vec![("music".to_string(), "music-custom".to_string())]);
+        assert_eq!(
+            renamed,
+            vec![("music".to_string(), "music-custom".to_string())]
+        );
         assert_eq!(cats[0].slug, "music-custom");
         assert_eq!(cats[1].slug, "formula-1", "other categories are untouched");
         validate(&cats).expect("after migration the whole list must load");

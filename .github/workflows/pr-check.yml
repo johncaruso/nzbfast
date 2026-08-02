@@ -47,8 +47,13 @@ jobs:
         # nzbkit's suites - yEnc, PAR2, RAR - never ran at all, and the run
         # reported one binary's result as if it had covered the workspace.
         run: cargo test --workspace --locked --no-fail-fast
-      - name: fmt (advisory)
-        run: cargo fmt --all --check || echo "::warning::cargo fmt differences (not blocking)"
+      - name: fmt
+        run: cargo fmt -p nzbkit -p nzbfast -p nzbtray --check
+      - name: clippy
+        # No escapes: every warning blocks. The categories still allowed
+        # are named in the workspace lints table in Cargo.toml, each with
+        # its reason.
+        run: cargo clippy -p nzbkit -p nzbfast -p nzbtray --all-targets --no-deps -- -D warnings
 
   # Windows, x64. The workspace suite had NEVER run on Windows on any
   # architecture until a Windows-on-ARM build probe added a job that ran
@@ -118,3 +123,13 @@ jobs:
           # Windows is exactly what raises the Defender Firewall dialog,
           # and a hosted runner has nobody to click it.
         run: cargo test --workspace --locked --no-fail-fast
+      # Parity with the Linux leg above, which has run clippy all along
+      # while this job did not - and clippy only lints what compiles for
+      # the host, so `#[cfg(windows)]` code was gated on no runner at all.
+      # nightly.yml's windows-unit job carries the same step for the
+      # private repo, where development actually happens; this one keeps a
+      # contributor PR from landing Windows-only lint debt.
+      # --keep-going because clippy otherwise stops at the first failing
+      # crate and reports one crate's worth per round.
+      - name: clippy
+        run: cargo clippy -p nzbkit -p nzbfast -p nzbtray --all-targets --no-deps --keep-going -- -D warnings

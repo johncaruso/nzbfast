@@ -6,6 +6,7 @@
 //! Runs on a real socket so the full client stack - TLS-less connect,
 //! AUTHINFO, pipelining, timeouts, reconnects - is exercised end to end.
 
+use crate::sync::MutexExt;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -138,7 +139,12 @@ pub struct PostChaos {
 struct PostCounters {
     commands: AtomicU64,
     articles: AtomicU64,
-    stats: AtomicU64,
+    /// STAT commands answered, across every connection. Shared with
+    /// [`MockServer::stats`] so a test can assert on probe traffic:
+    /// STAT leaves no trace in `body_log` (it transfers no body), and
+    /// "nothing probed while a download ran" is only checkable from the
+    /// server's side.
+    stats: Arc<AtomicU64>,
 }
 
 /// One overview row served for OVER/XOVER (spot-ingestion tests).
@@ -153,11 +159,21 @@ pub struct OverRow {
 }
 
 /// Header-plane data (HEAD + OVER); empty for the classic body-only mock.
+///
+/// The overview is behind a mutex because a real group GROWS while a
+/// client is connected: [`MockServer::post_overview`] appends rows
+/// mid-run, which is what lets a test watch a post finish going up.
 #[derive(Default)]
 struct HeaderPlane {
     /// Message-id (with angle brackets) → raw header block (CRLF lines).
     headers: HashMap<String, Vec<u8>>,
-    overview: Vec<OverRow>,
+    overview: std::sync::Mutex<Vec<OverRow>>,
+}
+
+impl HeaderPlane {
+    fn rows(&self) -> std::sync::MutexGuard<'_, Vec<OverRow>> {
+        self.overview.lock_ok()
+    }
 }
 
 /// Pause before a 430, so a refusal costs a round trip like a real one.
@@ -187,6 +203,10 @@ pub struct MockServer {
     /// Total TCP connections accepted, ever. The pacing tests assert on
     /// this: a broken account must not be reconnected to at full rate.
     pub accepted: Arc<AtomicU64>,
+    /// Total STAT commands answered, across all connections. The §77
+    /// pre-flight prober is STAT-only, so this is the one place its
+    /// traffic (or its absence, while a download runs) is visible.
+    pub stats: Arc<AtomicU64>,
     /// Every BODY request's message-id (with angle brackets) in arrival
     /// order, across all connections - the M11 tests assert queue-order
     /// effects (head/tail burst, seek promotion) against this.
@@ -196,6 +216,9 @@ pub struct MockServer {
     /// Lets ordering tests freeze the world, land a queue reorder at a
     /// known point in `body_log`, and then release - no wall-clock races.
     pub pause: Arc<std::sync::atomic::AtomicBool>,
+    /// The header plane, so a test can keep posting after the server is
+    /// up - see [`MockServer::post_overview`].
+    plane: Arc<HeaderPlane>,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -239,7 +262,11 @@ impl MockServer {
         let addr = listener.local_addr().unwrap();
         // Mutex (not plain Arc): POST/IHAVE insert articles at runtime.
         let articles = Arc::new(std::sync::Mutex::new(articles));
-        let plane = Arc::new(HeaderPlane { headers, overview });
+        let plane = Arc::new(HeaderPlane {
+            headers,
+            overview: std::sync::Mutex::new(overview),
+        });
+        let plane2 = plane.clone();
         let served = Arc::new(AtomicU64::new(0));
         let served2 = served.clone();
         let body_log: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
@@ -251,6 +278,7 @@ impl MockServer {
         let accepted = Arc::new(AtomicU64::new(0));
         let accepted2 = accepted.clone();
         let post_counters: Arc<PostCounters> = Default::default();
+        let stats = post_counters.stats.clone();
         let handle = tokio::spawn(async move {
             loop {
                 let Ok((sock, _)) = listener.accept().await else {
@@ -285,10 +313,20 @@ impl MockServer {
             addr,
             served,
             accepted,
+            stats,
             body_log,
             pause,
+            plane: plane2,
             handle,
         }
+    }
+
+    /// Append overview rows, as if those articles had just been posted.
+    /// GROUP's high-water mark moves with them, so a client tracking the
+    /// head of the group sees them on its next tick - which is how a post
+    /// that is still going up becomes a complete one.
+    pub fn post_overview(&self, rows: Vec<OverRow>) {
+        self.plane.rows().extend(rows);
     }
 
     /// A ServerConfig pointing at this mock (plain TCP, no auth).
@@ -308,7 +346,7 @@ impl MockServer {
             bind_ip: None,
             socks5: None,
             enabled: true,
-        warm_pool: false,
+            warm_pool: false,
             idle_release_secs: None,
             idle_keep: None,
             max_source_ips: None,
@@ -376,16 +414,25 @@ async fn serve_conn(
             w.write_all(b"205 bye\r\n").await?;
             return Ok(());
         } else if upper.starts_with("GROUP") {
-            if plane.overview.is_empty() {
-                w.write_all(b"211 100 1 100 mock.group\r\n").await?;
-            } else {
-                let low = plane.overview.iter().map(|r| r.number).min().unwrap_or(1);
-                let high = plane.overview.iter().map(|r| r.number).max().unwrap_or(1);
-                let name = cmd.split_whitespace().nth(1).unwrap_or("mock.group");
-                w.write_all(
-                    format!("211 {} {low} {high} {name}\r\n", plane.overview.len()).as_bytes(),
-                )
-                .await?;
+            // Snapshot under the lock, answer outside it: the guard is
+            // not Send and this connection is a spawned task.
+            let span = {
+                let rows = plane.rows();
+                (!rows.is_empty()).then(|| {
+                    (
+                        rows.iter().map(|r| r.number).min().unwrap_or(1),
+                        rows.iter().map(|r| r.number).max().unwrap_or(1),
+                        rows.len(),
+                    )
+                })
+            };
+            match span {
+                None => w.write_all(b"211 100 1 100 mock.group\r\n").await?,
+                Some((low, high, n)) => {
+                    let name = cmd.split_whitespace().nth(1).unwrap_or("mock.group");
+                    w.write_all(format!("211 {n} {low} {high} {name}\r\n").as_bytes())
+                        .await?;
+                }
             }
         } else if upper.starts_with("XFEATURE COMPRESS GZIP") {
             if chaos.gzip_headers {
@@ -413,10 +460,11 @@ async fn serve_conn(
                     (n, n)
                 }
             };
-            let rows: Vec<&OverRow> = plane
-                .overview
+            let rows: Vec<OverRow> = plane
+                .rows()
                 .iter()
                 .filter(|r| r.number >= a && r.number <= b)
+                .cloned()
                 .collect();
             if rows.is_empty() {
                 // RFC 3977: a valid range holding no articles is 423, not an
@@ -439,10 +487,8 @@ async fn serve_conn(
                     // Highwinds TERMINATOR variant: one gzip stream, then a
                     // plain-text dot line on the wire.
                     use std::io::Write as _;
-                    let mut enc = flate2::write::GzEncoder::new(
-                        Vec::new(),
-                        flate2::Compression::fast(),
-                    );
+                    let mut enc =
+                        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
                     enc.write_all(&body)?;
                     w.write_all(&enc.finish()?).await?;
                 } else {
@@ -465,10 +511,10 @@ async fn serve_conn(
         } else if upper == "POST" {
             if chaos.post_rejected {
                 w.write_all(b"440 posting not allowed\r\n").await?;
-            } else if post_counters.commands.fetch_add(1, Ordering::Relaxed)
-                < chaos.post.try_later
+            } else if post_counters.commands.fetch_add(1, Ordering::Relaxed) < chaos.post.try_later
             {
-                w.write_all(b"503 service temporarily unavailable\r\n").await?;
+                w.write_all(b"503 service temporarily unavailable\r\n")
+                    .await?;
             } else {
                 w.write_all(b"340 send article to be posted\r\n").await?;
                 w.flush().await?;
@@ -478,7 +524,7 @@ async fn serve_conn(
                         if nth <= chaos.post.ack_lost {
                             // Article read, nothing said back, socket gone.
                             if chaos.post.ack_lost_keeps {
-                                articles.lock().unwrap().insert(id, body);
+                                articles.lock_ok().insert(id, body);
                             }
                             return Ok(());
                         }
@@ -487,7 +533,7 @@ async fn serve_conn(
                             .reject_441
                             .as_deref()
                             .filter(|_| nth > chaos.post.reject_after);
-                        let duplicate = articles.lock().unwrap().contains_key(&id);
+                        let duplicate = articles.lock_ok().contains_key(&id);
                         if let Some(text) = reject {
                             w.write_all(format!("441 {text}\r\n").as_bytes()).await?;
                         } else if duplicate {
@@ -503,7 +549,7 @@ async fn serve_conn(
                                 .unwrap_or("441 435 Duplicate article rejected");
                             w.write_all(format!("{line}\r\n").as_bytes()).await?;
                         } else {
-                            articles.lock().unwrap().insert(id, body);
+                            articles.lock_ok().insert(id, body);
                             w.write_all(b"240 article received\r\n").await?;
                         }
                     }
@@ -516,8 +562,9 @@ async fn serve_conn(
         {
             let claimed = id.trim().to_string();
             if post_counters.commands.fetch_add(1, Ordering::Relaxed) < chaos.post.try_later {
-                w.write_all(b"436 transfer failed, try again later\r\n").await?;
-            } else if articles.lock().unwrap().contains_key(&claimed) {
+                w.write_all(b"436 transfer failed, try again later\r\n")
+                    .await?;
+            } else if articles.lock_ok().contains_key(&claimed) {
                 w.write_all(b"435 article not wanted\r\n").await?;
             } else {
                 w.write_all(b"335 send it\r\n").await?;
@@ -528,13 +575,13 @@ async fn serve_conn(
                         if nth <= chaos.post.ack_lost {
                             // Article read, nothing said back, socket gone.
                             if chaos.post.ack_lost_keeps {
-                                articles.lock().unwrap().insert(claimed, body);
+                                articles.lock_ok().insert(claimed, body);
                             }
                             return Ok(());
                         }
                         // File under the id the client CLAIMED - that is
                         // the id its NZB will carry.
-                        articles.lock().unwrap().insert(claimed, body);
+                        articles.lock_ok().insert(claimed, body);
                         w.write_all(b"235 article transferred\r\n").await?;
                     }
                     None => w.write_all(b"436 transfer failed\r\n").await?,
@@ -555,7 +602,7 @@ async fn serve_conn(
                 return Ok(());
             }
             if nth > chaos.post.stat_miss
-                && articles.lock().unwrap().contains_key(id)
+                && articles.lock_ok().contains_key(id)
                 && !chaos.missing.contains(id)
             {
                 w.write_all(format!("223 0 {id}\r\n").as_bytes()).await?;
@@ -569,7 +616,7 @@ async fn serve_conn(
         {
             let id = id.trim().to_string();
             let nth = {
-                let mut log = body_log.lock().unwrap();
+                let mut log = body_log.lock_ok();
                 log.push(id.clone());
                 log.len() as u64
             };
@@ -585,7 +632,7 @@ async fn serve_conn(
                 w.write_all(b"430 no such article\r\n").await?;
                 continue;
             }
-            let Some(article) = articles.lock().unwrap().get(&id).cloned() else {
+            let Some(article) = articles.lock_ok().get(&id).cloned() else {
                 refuse_delay(&chaos).await;
                 w.write_all(b"430 no such article\r\n").await?;
                 continue;
@@ -594,7 +641,7 @@ async fn serve_conn(
                 tokio::time::sleep(std::time::Duration::from_millis(chaos.delay_ms)).await;
             }
             w.write_all(format!("222 0 {id}\r\n").as_bytes()).await?;
-            if stall_once.lock().unwrap().remove(&id) {
+            if stall_once.lock_ok().remove(&id) {
                 // Status sent, body never comes - the client's per-response
                 // timeout must fire; the NEXT request for this id succeeds.
                 w.flush().await?;
@@ -629,13 +676,13 @@ async fn serve_conn(
             // the yEnc body is byte-for-byte identical, so a decoder that
             // scans for =ybegin is unaffected. Same chaos hooks as BODY.
             let id = id.trim().to_string();
-            body_log.lock().unwrap().push(id.clone());
+            body_log.lock_ok().push(id.clone());
             if chaos.missing.contains(&id) {
                 refuse_delay(&chaos).await;
                 w.write_all(b"430 no such article\r\n").await?;
                 continue;
             }
-            let Some(article) = articles.lock().unwrap().get(&id).cloned() else {
+            let Some(article) = articles.lock_ok().get(&id).cloned() else {
                 refuse_delay(&chaos).await;
                 w.write_all(b"430 no such article\r\n").await?;
                 continue;
@@ -644,7 +691,7 @@ async fn serve_conn(
                 tokio::time::sleep(std::time::Duration::from_millis(chaos.delay_ms)).await;
             }
             w.write_all(format!("220 0 {id}\r\n").as_bytes()).await?;
-            if stall_once.lock().unwrap().remove(&id) {
+            if stall_once.lock_ok().remove(&id) {
                 w.flush().await?;
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
                 return Ok(());
@@ -722,7 +769,11 @@ where
             continue;
         }
         // Un-dot-stuff and store with CRLF endings.
-        let payload = if trimmed.starts_with(b"..") { &trimmed[1..] } else { trimmed };
+        let payload = if trimmed.starts_with(b"..") {
+            &trimmed[1..]
+        } else {
+            trimmed
+        };
         body.extend_from_slice(payload);
         body.extend_from_slice(b"\r\n");
     }
@@ -747,13 +798,8 @@ pub fn make_file_articles(
     for (i, chunk) in data.chunks(art_size.max(1)).enumerate() {
         let part = i as u32 + 1;
         let begin = (i * art_size) as u64 + 1;
-        let article = crate::yenc::encode(
-            name,
-            data.len() as u64,
-            Some((part, total)),
-            begin,
-            chunk,
-        );
+        let article =
+            crate::yenc::encode(name, data.len() as u64, Some((part, total)), begin, chunk);
         let id = format!("{idtag}-{part}@mock");
         segs.push((id.clone(), article.len() as u64, part));
         out.insert(format!("<{id}>"), article);

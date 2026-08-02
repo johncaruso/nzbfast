@@ -7,21 +7,88 @@
 //! unrecognised answer resolves to nothing, and unticking removes only
 //! what ticking added.
 
+mod scratch;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
+/// Response body of a request to the daemon (headers stripped).
+///
+/// A request that produced NO bytes at all is retried. tiny_http's honest
+/// answer when it cannot start a thread for a new connection is to drop
+/// the socket unread, and with our request still sitting in its receive
+/// buffer the kernel turns that into an RST - which arrives here as
+/// ECONNRESET, not as a clean EOF. A full `cargo test -p nzbfast` runs
+/// this suite alongside every other daemon suite, so
+/// `thread::Builder::spawn` really does hit EAGAIN: this file was failing
+/// `ticking_and_unticking_are_symmetric` on the read below, roughly 1 run
+/// in 8, on a refusal to serve rather than on anything it asserts.
+///
+/// Once a byte has come back it is an answer and is returned exactly as it
+/// arrived - a truncated response must never be retried away. Same rule as
+/// daemon.rs's helper; see [[nzbfast-daemon-test-harness]].
+///
+/// DELIBERATELY DOES NOT DE-CHUNK, which is only safe because of what this
+/// file asks for. tiny_http switches to `Transfer-Encoding: chunked` above
+/// 32 KB, and a chunked body read as one blob keeps its hex chunk headers
+/// inline. Every request here is a small `/api?mode=config` or
+/// `mode=get_config` - measured at 27 and 3355 bytes, both answered with a
+/// Content-Length - so nothing chunks. Add a request that returns anything
+/// big (the dashboard `/` is ~490 KB and DOES chunk) and this helper must
+/// grow the de-chunking that http_wedge.rs's did, or the body silently
+/// gains chunk headers. Reading into bytes and going through
+/// `from_utf8_lossy` also keeps the related hazard away: `read_to_string`
+/// over a chunked response dies on "stream did not contain valid UTF-8"
+/// when a chunk header splits a multi-byte character.
 fn http(port: u16, req: &str) -> String {
-    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect daemon");
-    write!(s, "GET {req} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
-    let mut out = String::new();
-    s.read_to_string(&mut out).unwrap();
-    out.split("\r\n\r\n").nth(1).unwrap_or("").to_string()
+    let mut last = String::new();
+    for attempt in 0..5u32 {
+        match http_once(port, req) {
+            Ok(out) => return out,
+            Err(e) => {
+                last = e.to_string();
+                std::thread::sleep(std::time::Duration::from_millis(
+                    100 * u64::from(attempt) + 50,
+                ));
+            }
+        }
+    }
+    panic!("daemon on :{port} never served {req}: {last}");
+}
+
+/// One attempt. Err ONLY when the daemon produced nothing at all.
+fn http_once(port: u16, req: &str) -> std::io::Result<String> {
+    let mut s = TcpStream::connect(("127.0.0.1", port))?;
+    write!(
+        s,
+        "GET {req} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+    )?;
+    let mut out = Vec::new();
+    // Zero bytes back is a refusal to serve, however the peer phrased it:
+    // an RST (Err) when our request was never read off the receive buffer,
+    // a plain FIN (Ok) when it was read and then dropped unanswered.
+    // Neither carries anything to judge, so both are retried.
+    let read = s.read_to_end(&mut out);
+    if out.is_empty() {
+        return Err(read.err().unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "closed without answering",
+            )
+        }));
+    }
+    let out = String::from_utf8_lossy(&out).to_string();
+    Ok(out.split("\r\n\r\n").nth(1).unwrap_or("").to_string())
 }
 
 fn api(port: u16, q: &str) -> serde_json::Value {
@@ -68,11 +135,9 @@ struct Running {
 /// daemon loads `groups.tsv` beside the index db at startup, which is
 /// the same cache a real fetch writes. That is what lets this test
 /// resolve interests without a provider.
-fn scratch(name: &str, carried: &[&str], settings: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("nzbfast-interests-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+fn scratch(name: &str, carried: &[&str], settings: &str) -> scratch::ScratchDir {
+    let dir = std::env::temp_dir().join(format!("nzbfast-interests-{}-{name}", std::process::id()));
+    let dir = scratch::ScratchDir::attach(&dir);
     std::fs::write(dir.join("config.json"), "{\"servers\":[]}").unwrap();
     std::fs::write(dir.join("settings.json"), settings).unwrap();
     let mut tsv = String::from("#nzbfast-groups\t3\t1700000000\n");
@@ -84,37 +149,73 @@ fn scratch(name: &str, carried: &[&str], settings: &str) -> PathBuf {
 }
 
 fn serve(dir: &Path) -> Running {
-    let port = free_port();
-    let out = std::fs::File::create(dir.join("daemon.log")).unwrap();
-    let err = out.try_clone().unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_nzbfast"))
-        .env("NZBFAST_NO_ENRICH", "1")
-        .env_remove("NZBFAST_OPEN")
-        .arg("--config")
-        .arg(dir.join("config.json"))
-        .arg("serve")
-        .arg("--bind")
-        .arg("127.0.0.1")
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("--apikey")
-        .arg("sekrit")
-        .arg("--out")
-        .arg(dir.join("complete"))
-        .arg("--index-db")
-        .arg(dir.join("index.db"))
-        .stdout(Stdio::from(out))
-        .stderr(Stdio::from(err))
-        .spawn()
-        .unwrap();
-    let running = Running { _child: KillOnDrop(child), port };
-    for _ in 0..300 {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return running;
+    for attempt in 0..3 {
+        let port = free_port();
+        let banner = format!("open the dashboard at  http://localhost:{port}/");
+        let log = dir.join("daemon.log");
+        let out = std::fs::File::create(&log).unwrap();
+        let err = out.try_clone().unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_nzbfast"))
+            .env("NZBFAST_NO_ENRICH", "1")
+            .env_remove("NZBFAST_OPEN")
+            .arg("--config")
+            .arg(dir.join("config.json"))
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--index-db")
+            .arg(dir.join("index.db"))
+            .stdout(Stdio::from(out))
+            .stderr(Stdio::from(err))
+            .spawn()
+            .unwrap();
+        let mut running = Running {
+            _child: KillOnDrop(child),
+            port,
+        };
+        // Wait for the READINESS BANNER, not merely for a connect to succeed.
+        // The daemon takes its listener at the top of startup now (so a port
+        // it cannot have costs nothing on disk - see serve()'s note), which
+        // means the socket accepts long before the accept loop runs. A bare
+        // connect therefore returns the instant the process is up, and the
+        // first request then sat unanswered in the backlog. The banner is
+        // printed once startup is genuinely finished.
+        //
+        // ...and RELAUNCH on a fresh port if the daemon exited instead of
+        // binding. `free_port()` closes its listener before the child opens
+        // its own, so a parallel test can take :port in that window - a full
+        // `cargo test --workspace` runs a lot of daemons. This was the last
+        // suite still spending the whole 30 s gate and then blaming the
+        // daemon ("never came up on :56674") for a race the message itself
+        // named, one line down, as "Address already in use". Same 3-attempt
+        // shape the other suites already carry; the banner is read from THIS
+        // daemon's own log, so another test's daemon cannot answer for it.
+        for _ in 0..300 {
+            if std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .contains(&banner)
+                && TcpStream::connect(("127.0.0.1", port)).is_ok()
+            {
+                return running;
+            }
+            if running._child.0.try_wait().ok().flatten().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            attempt < 2,
+            "daemon never came up on :{port}\n--- log ---\n{}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
     }
-    panic!("daemon never bound a port");
+    unreachable!()
 }
 
 /// Wait for the startup task to turn the stored answer into groups. It
@@ -155,18 +256,28 @@ fn wait_saved(dir: &Path, key: &str) -> serde_json::Value {
 /// scans nothing at all, no matter how long it runs.
 #[test]
 fn an_unanswered_install_indexes_nothing() {
-    let dir = scratch("unanswered", &["alt.binaries.teevee", "alt.binaries.moovee"], "{}");
+    let dir = scratch(
+        "unanswered",
+        &["alt.binaries.teevee", "alt.binaries.moovee"],
+        "{}",
+    );
     let d = serve(&dir);
     // Give the startup path the same window the answered case needs.
     std::thread::sleep(std::time::Duration::from_millis(1500));
-    assert!(groups(d.port).is_empty(), "something was indexed without being asked for");
+    assert!(
+        groups(d.port).is_empty(),
+        "something was indexed without being asked for"
+    );
     let j = api(d.port, "mode=interests");
     assert!(j["chosen"].as_array().unwrap().is_empty());
     // Every option is offered with the groups it stands for, so a UI can
     // show them before the user agrees to anything.
     let opts = j["options"].as_array().unwrap();
     assert!(opts.len() >= 5, "{j}");
-    let linux = opts.iter().find(|o| o["key"] == "linux").expect("linux offered");
+    let linux = opts
+        .iter()
+        .find(|o| o["key"] == "linux")
+        .expect("linux offered");
     assert!(!linux["groups"].as_array().unwrap().is_empty());
     assert_eq!(linux["scanning"], 0);
 }
@@ -192,9 +303,15 @@ fn a_stored_answer_becomes_a_scan_list() {
     let g = wait_groups(d.port, 3);
     assert!(g.contains(&"alt.binaries.linux.iso".to_string()), "{g:?}");
     assert!(g.contains(&"alt.binaries.linux".to_string()), "{g:?}");
-    assert!(g.contains(&"alt.binaries.multimedia.sports".to_string()), "{g:?}");
+    assert!(
+        g.contains(&"alt.binaries.multimedia.sports".to_string()),
+        "{g:?}"
+    );
     // Not the groups this provider does not carry...
-    assert!(!g.contains(&"a.b.cd.image.linux".to_string()), "a dead group was subscribed: {g:?}");
+    assert!(
+        !g.contains(&"a.b.cd.image.linux".to_string()),
+        "a dead group was subscribed: {g:?}"
+    );
     // ...and emphatically not a TV group nobody asked for, even though
     // the provider has it and it is what the old one-click shortcut
     // would have picked.
@@ -208,7 +325,11 @@ fn a_stored_answer_becomes_a_scan_list() {
 fn ticking_and_unticking_are_symmetric() {
     let dir = scratch(
         "symmetric",
-        &["alt.binaries.linux.iso", "alt.binaries.multimedia.sports", "alt.binaries.mine"],
+        &[
+            "alt.binaries.linux.iso",
+            "alt.binaries.multimedia.sports",
+            "alt.binaries.mine",
+        ],
         "{}",
     );
     let d = serve(&dir);
@@ -220,15 +341,24 @@ fn ticking_and_unticking_are_symmetric() {
 
     set(d.port, "index_interests", "linux,sports");
     let g = wait_groups(d.port, 3);
-    assert!(g.contains(&"alt.binaries.multimedia.sports".to_string()), "{g:?}");
+    assert!(
+        g.contains(&"alt.binaries.multimedia.sports".to_string()),
+        "{g:?}"
+    );
 
     // Unticking sport stops scanning sport, and only sport.
     set(d.port, "index_interests", "linux");
     std::thread::sleep(std::time::Duration::from_millis(400));
     let g = groups(d.port);
-    assert!(!g.contains(&"alt.binaries.multimedia.sports".to_string()), "{g:?}");
+    assert!(
+        !g.contains(&"alt.binaries.multimedia.sports".to_string()),
+        "{g:?}"
+    );
     assert!(g.contains(&"alt.binaries.linux.iso".to_string()), "{g:?}");
-    assert!(g.contains(&"alt.binaries.mine".to_string()), "a hand-picked group was removed: {g:?}");
+    assert!(
+        g.contains(&"alt.binaries.mine".to_string()),
+        "a hand-picked group was removed: {g:?}"
+    );
 
     // Answering "nothing at all" leaves only what the user typed.
     set(d.port, "index_interests", "");
@@ -240,7 +370,12 @@ fn ticking_and_unticking_are_symmetric() {
     set(d.port, "index_interests", "everything,all,*");
     std::thread::sleep(std::time::Duration::from_millis(400));
     assert_eq!(groups(d.port), vec!["alt.binaries.mine".to_string()]);
-    assert!(api(d.port, "mode=interests")["chosen"].as_array().unwrap().is_empty());
+    assert!(
+        api(d.port, "mode=interests")["chosen"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// What ticking an interest has to leave on disk. The scan list, the
@@ -251,7 +386,11 @@ fn ticking_and_unticking_are_symmetric() {
 /// never reconsidered - the interest is silently dropped for good.
 #[test]
 fn ticking_an_interest_records_groups_provenance_and_marker_together() {
-    let dir = scratch("persisted", &["alt.binaries.linux.iso", "alt.binaries.mine"], "{}");
+    let dir = scratch(
+        "persisted",
+        &["alt.binaries.linux.iso", "alt.binaries.mine"],
+        "{}",
+    );
     let d = serve(&dir);
     set(d.port, "index_groups", "alt.binaries.mine");
     set(d.port, "index_interests", "linux");
@@ -298,7 +437,11 @@ fn an_upgrade_with_no_recorded_provenance_can_still_untick() {
             "index_groups":["alt.binaries.linux.iso","alt.binaries.mine"]}"#,
     );
     let d = serve(&dir);
-    assert_eq!(wait_groups(d.port, 2).len(), 2, "the stored scan list is carried over");
+    assert_eq!(
+        wait_groups(d.port, 2).len(),
+        2,
+        "the stored scan list is carried over"
+    );
     // Startup reconstructs what the preset owns, conservatively: the
     // preset's groups intersected with what is actually being indexed.
     let s = wait_saved(&dir, "index_interest_groups");

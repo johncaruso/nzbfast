@@ -159,13 +159,23 @@ impl MulTable {
     pub fn xor_mul_into(&self, dst: &mut [u16], src: &[u8]) {
         assert!(src.len().div_ceil(2) <= dst.len(), "src longer than dst");
         #[cfg(target_arch = "aarch64")]
+        // SAFETY: NEON is baseline on aarch64, so no runtime feature check
+        // is needed (see xor_mul_into_neon's docs); the assert above
+        // guarantees dst has a word for every byte pair of src.
         let done = unsafe { self.xor_mul_into_neon(dst, src) };
         #[cfg(target_arch = "x86_64")]
         let done = if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2") {
+            // SAFETY: GFNI and AVX2 verified by the detects on this branch;
+            // the assert above guarantees dst has a word for every byte
+            // pair of src.
             unsafe { self.xor_mul_into_gfni(dst, src) }
         } else if is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 verified by the detect on this branch; dst
+            // covers src per the assert above.
             unsafe { self.xor_mul_into_avx2(dst, src) }
         } else if is_x86_feature_detected!("ssse3") {
+            // SAFETY: SSSE3 verified by the detect on this branch; dst
+            // covers src per the assert above.
             unsafe { self.xor_mul_into_ssse3(dst, src) }
         } else {
             0usize
@@ -198,6 +208,11 @@ impl MulTable {
         if chunks == 0 {
             return 0;
         }
+        // SAFETY: NEON intrinsics are baseline on aarch64 (no feature
+        // precondition). All pointer accesses stay within the first
+        // chunks * 32 bytes: in bounds for src by chunks = src.len() / 32,
+        // and for dst by the caller's guarantee that dst has a word for
+        // every byte pair of src (the assert in xor_mul_into).
         unsafe {
             let (t0l, t1l, t2l, t3l) = (
                 vld1q_u8(self.nl[0].as_ptr()),
@@ -250,6 +265,12 @@ impl MulTable {
         if chunks == 0 {
             return 0;
         }
+        // SAFETY: SSSE3 is enabled here per #[target_feature], and every
+        // caller has verified it at runtime (documented requirement above).
+        // All pointer accesses stay within the first chunks * 32 bytes: in
+        // bounds for src by chunks = src.len() / 32, and for dst by the
+        // caller's guarantee that dst has a word for every byte pair of
+        // src (the assert in xor_mul_into).
         unsafe {
             let (t0l, t1l, t2l, t3l) = (
                 _mm_loadu_si128(self.nl[0].as_ptr() as *const __m128i),
@@ -311,6 +332,12 @@ impl MulTable {
         if chunks == 0 {
             return 0;
         }
+        // SAFETY: AVX2 is enabled here per #[target_feature], and every
+        // caller has verified it at runtime (documented requirement above).
+        // All pointer accesses stay within the first chunks * 64 bytes: in
+        // bounds for src by chunks = src.len() / 64, and for dst by the
+        // caller's guarantee that dst has a word for every byte pair of
+        // src (the assert in xor_mul_into).
         unsafe {
             let bc = |t: &[u8; 16]| {
                 _mm256_broadcastsi128_si256(_mm_loadu_si128(t.as_ptr() as *const __m128i))
@@ -375,6 +402,12 @@ impl MulTable {
         if chunks == 0 {
             return 0;
         }
+        // SAFETY: GFNI and AVX2 are enabled here per #[target_feature],
+        // and every caller has verified both at runtime (documented
+        // requirement above). All pointer accesses stay within the first
+        // chunks * 64 bytes: in bounds for src by chunks = src.len() / 64,
+        // and for dst by the caller's guarantee that dst has a word for
+        // every byte pair of src (the assert in xor_mul_into).
         unsafe {
             let mll = _mm256_set1_epi64x(self.affine[0] as i64);
             let mhl = _mm256_set1_epi64x(self.affine[1] as i64);
@@ -480,13 +513,21 @@ pub fn xor_mul_multi_into(dst: &mut [u16], srcs: &[&[u8]], coeffs: &[u16]) -> us
     #[cfg(target_arch = "aarch64")]
     {
         if std::arch::is_aarch64_feature_detected!("sha3") {
+            // SAFETY: sha3 verified by the detect above (NEON is baseline
+            // on aarch64); every source covers dst's full byte length, the
+            // documented precondition debug_asserted above.
             return unsafe { xor_mul_multi_neon_sha3(dst, srcs, coeffs) };
         }
-        return unsafe { xor_mul_multi_neon(dst, srcs, coeffs) };
+        // SAFETY: plain NEON (incl. pmull on poly8) is baseline on
+        // aarch64, no feature check needed; source coverage as above.
+        unsafe { xor_mul_multi_neon(dst, srcs, coeffs) }
     }
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2") {
+            // SAFETY: GFNI and AVX2 verified by the detect above; the
+            // kernel clamps its chunk range to the shortest source, so it
+            // never reads or writes past any slice.
             return unsafe { xor_mul_multi_gfni(dst, srcs, coeffs) };
         }
         let _ = (dst, srcs, coeffs);
@@ -608,6 +649,11 @@ unsafe fn xor_mul_multi_gfni(dst: &mut [u16], srcs: &[&[u8]], coeffs: &[u16]) ->
         let g1 = (g0 + 6).min(srcs.len());
         let s = &srcs[g0..g1];
         let c = &coeffs[g0..g1];
+        // SAFETY: gfni+avx2 are enabled on this fn per #[target_feature]
+        // (runtime-verified at the dispatch site), which covers the
+        // callee's requirement; `chunks` was clamped above to the shortest
+        // source and to dst's byte length, meeting the callee's bounds
+        // contract (its debug_assert).
         unsafe {
             match g1 - g0 {
                 1 => xor_mul_multi_gfni_n::<1>(dst, s, c, chunks),
@@ -638,6 +684,11 @@ unsafe fn xor_mul_multi_gfni_n<const N: usize>(
     use std::arch::x86_64::*;
     debug_assert_eq!(srcs.len(), N);
     debug_assert!(srcs.iter().all(|s| s.len() >= chunks * 32));
+    // SAFETY: gfni+avx2 are enabled here per #[target_feature] (runtime-
+    // verified at the dispatch site). All pointer accesses stay within the
+    // first chunks * 32 bytes of each slice: the caller
+    // (xor_mul_multi_gfni) clamps `chunks` to the shortest source and to
+    // dst's byte length, per the debug_asserts above.
     unsafe {
         // matNorm/matSwap per source, from the same four 8x8 bit-matrices
         // the single-source path uses ([`affine_matrices`]: [ll, hl, lh,
@@ -667,10 +718,8 @@ unsafe fn xor_mul_multi_gfni_n<const N: usize>(
             for s in 0..N {
                 let data = _mm256_loadu_si256(src_ptr[s].add(off) as *const __m256i);
                 let data = _mm256_shuffle_epi8(data, deint);
-                acc_n =
-                    _mm256_xor_si256(acc_n, _mm256_gf2p8affine_epi64_epi8::<0>(data, mat_n[s]));
-                acc_s =
-                    _mm256_xor_si256(acc_s, _mm256_gf2p8affine_epi64_epi8::<0>(data, mat_s[s]));
+                acc_n = _mm256_xor_si256(acc_n, _mm256_gf2p8affine_epi64_epi8::<0>(data, mat_n[s]));
+                acc_s = _mm256_xor_si256(acc_s, _mm256_gf2p8affine_epi64_epi8::<0>(data, mat_s[s]));
             }
             // 0x4E = _MM_SHUFFLE(1,0,3,2): swap the qwords of each lane,
             // bringing the cross-half contributions home.
@@ -693,6 +742,12 @@ unsafe fn xor_mul_multi_neon(dst: &mut [u16], srcs: &[&[u8]], coeffs: &[u16]) ->
     if chunks == 0 || srcs.is_empty() {
         return 0;
     }
+    // SAFETY: NEON (incl. pmull on poly8) is baseline on aarch64, no
+    // feature check needed (see the doc above). All pointer accesses stay
+    // within the first chunks * 32 bytes: in bounds for dst by
+    // chunks = (dst.len() * 2) / 32, and for each source by
+    // xor_mul_multi_into's documented precondition (debug_asserted there)
+    // that every source covers dst's full byte length.
     unsafe {
         let mut c_lo = [vdupq_n_p8(0); 16];
         let mut c_hi = [vdupq_n_p8(0); 16];
@@ -759,8 +814,12 @@ unsafe fn xor_mul_multi_neon_sha3(dst: &mut [u16], srcs: &[&[u8]], coeffs: &[u16
     // registers (ParPar generates its kernels per srcCount for the same
     // reason).
     if srcs.len() == 8 {
+        // SAFETY: same contract as this fn, forwarded unchanged; neon+sha3
+        // are already enabled here per #[target_feature], covering the
+        // callee's requirement.
         return unsafe { xor_mul_multi_neon_sha3_n::<8>(dst, srcs, coeffs) };
     }
+    // SAFETY: as above.
     unsafe { xor_mul_multi_neon_sha3_n::<0>(dst, srcs, coeffs) }
 }
 
@@ -776,6 +835,12 @@ unsafe fn xor_mul_multi_neon_sha3_n<const NC: usize>(
     if chunks == 0 || srcs.is_empty() {
         return 0;
     }
+    // SAFETY: neon+sha3 are enabled here per #[target_feature] (runtime-
+    // verified by the sha3 detect at the dispatch site). All pointer
+    // accesses stay within the first chunks * 32 bytes: in bounds for dst
+    // by chunks = (dst.len() * 2) / 32, and for each source by
+    // xor_mul_multi_into's documented precondition (debug_asserted there)
+    // that every source covers dst's full byte length.
     unsafe {
         // Q-register coefficient splats: the LOW-half multiply reads the
         // D register aliasing the low half (free), and the HIGH half goes
@@ -870,8 +935,13 @@ unsafe fn clmul_reduce(
     mid2: std::arch::aarch64::poly16x8_t,
     high1: std::arch::aarch64::poly16x8_t,
     high2: std::arch::aarch64::poly16x8_t,
-) -> (std::arch::aarch64::uint8x16_t, std::arch::aarch64::uint8x16_t) {
+) -> (
+    std::arch::aarch64::uint8x16_t,
+    std::arch::aarch64::uint8x16_t,
+) {
     use std::arch::aarch64::*;
+    // SAFETY: value-only NEON intrinsics, no memory access; NEON is
+    // baseline on aarch64, so there is no feature precondition.
     unsafe {
         // Repack the 16-bit pmull lanes into (low byte, high byte)
         // planes across all 16 words.
@@ -1026,8 +1096,9 @@ mod tests {
                     .map(|_| (0..words * 2).map(|_| rng() as u8).collect())
                     .collect();
                 let srcs: Vec<&[u8]> = srcs_owned.iter().map(|v| v.as_slice()).collect();
-                let coeffs: Vec<u16> =
-                    (0..n).map(|i| coeff_pool[(rng() as usize + i) % coeff_pool.len()]).collect();
+                let coeffs: Vec<u16> = (0..n)
+                    .map(|i| coeff_pool[(rng() as usize + i) % coeff_pool.len()])
+                    .collect();
                 let base: Vec<u16> = (0..words).map(|_| rng() as u16).collect();
                 let mut want = base.clone();
                 for (s, c) in srcs.iter().zip(&coeffs) {
@@ -1038,7 +1109,7 @@ mod tests {
                 // Kernels work in whole chunks (16 words on aarch64, 32
                 // on x86); whatever they leave is finished per-source.
                 assert!(
-                    done <= words && done % 16 == 0,
+                    done <= words && done.is_multiple_of(16),
                     "chunk accounting n={n} words={words} done={done}"
                 );
                 for (s, c) in srcs.iter().zip(&coeffs) {
@@ -1050,6 +1121,8 @@ mod tests {
                 #[cfg(target_arch = "aarch64")]
                 {
                     let mut got = base.clone();
+                    // SAFETY: plain NEON is baseline on aarch64; every src
+                    // holds words * 2 bytes, covering dst's byte length.
                     let done = unsafe { xor_mul_multi_neon(&mut got, &srcs, &coeffs) };
                     for (s, c) in srcs.iter().zip(&coeffs) {
                         MulTable::new(*c).xor_mul_into(&mut got[done..], &s[done * 2..]);
@@ -1057,8 +1130,9 @@ mod tests {
                     assert_eq!(got, want, "plain-neon n={n} words={words}");
                     if std::arch::is_aarch64_feature_detected!("sha3") {
                         let mut got = base.clone();
-                        let done =
-                            unsafe { xor_mul_multi_neon_sha3(&mut got, &srcs, &coeffs) };
+                        // SAFETY: sha3 verified by the detect above;
+                        // source coverage as above.
+                        let done = unsafe { xor_mul_multi_neon_sha3(&mut got, &srcs, &coeffs) };
                         for (s, c) in srcs.iter().zip(&coeffs) {
                             MulTable::new(*c).xor_mul_into(&mut got[done..], &s[done * 2..]);
                         }
@@ -1072,6 +1146,8 @@ mod tests {
                 #[cfg(target_arch = "x86_64")]
                 if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2") {
                     let mut got = base.clone();
+                    // SAFETY: GFNI and AVX2 verified by the detect above;
+                    // the kernel clamps to the shortest source.
                     let done = unsafe { xor_mul_multi_gfni(&mut got, &srcs, &coeffs) };
                     for (s, c) in srcs.iter().zip(&coeffs) {
                         MulTable::new(*c).xor_mul_into(&mut got[done..], &s[done * 2..]);
@@ -1122,18 +1198,25 @@ mod tests {
                 {
                     if is_x86_feature_detected!("ssse3") {
                         let mut got = base.clone();
+                        // SAFETY: SSSE3 verified by the detect above; got
+                        // holds words + 3 elements, a word for every byte
+                        // pair of src.
                         let done = unsafe { t.xor_mul_into_ssse3(&mut got, &src) };
                         MulTable::xor_mul_scalar(&t.lo, &t.hi, &mut got[done..], &src[done * 2..]);
                         assert_eq!(got, want, "ssse3 c={c:#x} len={len}");
                     }
                     if is_x86_feature_detected!("avx2") {
                         let mut got = base.clone();
+                        // SAFETY: AVX2 verified by the detect above; got
+                        // covers src as above.
                         let done = unsafe { t.xor_mul_into_avx2(&mut got, &src) };
                         MulTable::xor_mul_scalar(&t.lo, &t.hi, &mut got[done..], &src[done * 2..]);
                         assert_eq!(got, want, "avx2 c={c:#x} len={len}");
                     }
                     if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2") {
                         let mut got = base.clone();
+                        // SAFETY: GFNI and AVX2 verified by the detect
+                        // above; got covers src as above.
                         let done = unsafe { t.xor_mul_into_gfni(&mut got, &src) };
                         MulTable::xor_mul_scalar(&t.lo, &t.hi, &mut got[done..], &src[done * 2..]);
                         assert_eq!(got, want, "gfni c={c:#x} len={len}");

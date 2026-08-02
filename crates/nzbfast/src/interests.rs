@@ -53,7 +53,11 @@ pub const INTERESTS: &[Interest] = &[
     },
     Interest {
         key: "movies",
-        groups: &["alt.binaries.moovee", "alt.binaries.movies", "alt.binaries.x264"],
+        groups: &[
+            "alt.binaries.moovee",
+            "alt.binaries.movies",
+            "alt.binaries.x264",
+        ],
     },
     Interest {
         key: "tv",
@@ -120,7 +124,11 @@ pub const INTERESTS: &[Interest] = &[
         // Applications the user already licenses. `alt.binaries.warez`
         // and the pw-required/encrypted dumps are left out for the same
         // reason as above: an interest must be defensible in public.
-        groups: &["alt.binaries.software", "alt.binaries.apps", "alt.binaries.applications"],
+        groups: &[
+            "alt.binaries.software",
+            "alt.binaries.apps",
+            "alt.binaries.applications",
+        ],
     },
 ];
 
@@ -136,7 +144,11 @@ pub fn get(key: &str) -> Option<&'static Interest> {
 /// outcome this feature exists to prevent. Order and duplicates are
 /// normalized to the offered order, so the value is comparable.
 pub fn parse(s: &str) -> Vec<String> {
-    let picked: Vec<&str> = s.split(',').map(str::trim).filter(|k| !k.is_empty()).collect();
+    let picked: Vec<&str> = s
+        .split(',')
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .collect();
     INTERESTS
         .iter()
         .filter(|i| picked.iter().any(|k| k.eq_ignore_ascii_case(i.key)))
@@ -171,8 +183,12 @@ pub fn resolve(keys: &[String], carried: impl Fn(&str) -> bool) -> Vec<String> {
 
 /// Add `resolved` to the groups already being scanned, preserving order
 /// and never dropping one the user picked by hand. Returns the new list
-/// and how many were added, so the caller can skip the write when the
-/// answer is "nothing changed".
+/// and how many were added.
+///
+/// Test-only now: [`reconcile`] inlines this same add loop because it
+/// also has to track which groups it owns, so nothing in the daemon
+/// calls this. The tests below still pin the semantics through it.
+#[cfg(test)]
 pub fn merge(existing: &[String], resolved: &[String]) -> (Vec<String>, usize) {
     let mut out = existing.to_vec();
     let before = out.len();
@@ -185,7 +201,8 @@ pub fn merge(existing: &[String], resolved: &[String]) -> (Vec<String>, usize) {
     (out, added)
 }
 
-/// Drop `unwanted` from the scan list. The mirror of [`merge`]: ticking
+/// Drop `unwanted` from the scan list. The mirror of the add loop in
+/// [`reconcile`]: ticking
 /// an interest starts scanning its groups, unticking stops. Only groups
 /// the de-selected interest actually named are removed, so a group the
 /// user typed in by hand survives unless it was also part of what they
@@ -264,7 +281,10 @@ mod tests {
     #[test]
     fn backfill_claims_preset_groups_but_never_hand_added_ones() {
         let keys = parse("tv");
-        assert!(!keys.is_empty(), "the tv preset must exist for this test to mean anything");
+        assert!(
+            !keys.is_empty(),
+            "the tv preset must exist for this test to mean anything"
+        );
         let preset_groups = groups(&keys);
         assert!(!preset_groups.is_empty());
 
@@ -273,7 +293,10 @@ mod tests {
         let indexed = vec![preset_groups[0].clone(), mine.clone()];
         let owned = backfill_owned(&keys, &indexed);
 
-        assert!(owned.iter().any(|g| g == &preset_groups[0]), "preset group must be claimed");
+        assert!(
+            owned.iter().any(|g| g == &preset_groups[0]),
+            "preset group must be claimed"
+        );
         assert!(
             !owned.iter().any(|g| g == &mine),
             "a hand-added group must never be claimed as preset-owned - claiming it \
@@ -283,13 +306,21 @@ mod tests {
         // And with provenance restored, an untick now actually removes it.
         let (groups_after, _next_owned, dropped, _added) =
             reconcile(&indexed, &owned, &[preset_groups[0].clone()], &[]);
-        assert_eq!(dropped, 1, "unticking must remove the preset group once owned is known");
-        assert!(groups_after.contains(&mine), "and must leave the hand-added one alone");
+        assert_eq!(
+            dropped, 1,
+            "unticking must remove the preset group once owned is known"
+        );
+        assert!(
+            groups_after.contains(&mine),
+            "and must leave the hand-added one alone"
+        );
 
         // The pre-backfill state is the bug: empty owned removes nothing.
-        let (_, _, dropped_before, _) =
-            reconcile(&indexed, &[], &[preset_groups[0].clone()], &[]);
-        assert_eq!(dropped_before, 0, "this is what every upgrading install did");
+        let (_, _, dropped_before, _) = reconcile(&indexed, &[], &[preset_groups[0].clone()], &[]);
+        assert_eq!(
+            dropped_before, 0,
+            "this is what every upgrading install did"
+        );
     }
     use super::*;
 
@@ -347,7 +378,10 @@ mod tests {
         assert!(all.contains(&"alt.binaries.multimedia.sports".to_string()));
         // A provider with two of them subscribes two.
         let carried = |g: &str| {
-            matches!(g, "alt.binaries.linux.iso" | "alt.binaries.multimedia.sports")
+            matches!(
+                g,
+                "alt.binaries.linux.iso" | "alt.binaries.multimedia.sports"
+            )
         };
         assert_eq!(
             resolve(&keys, carried),
@@ -378,10 +412,23 @@ mod tests {
 
     #[test]
     fn merging_never_drops_a_hand_picked_group() {
-        let mine = vec!["alt.binaries.mine".to_string(), "alt.binaries.linux.iso".to_string()];
-        let (out, added) = merge(&mine, &["alt.binaries.linux.iso".into(), "alt.binaries.tv".into()]);
+        let mine = vec![
+            "alt.binaries.mine".to_string(),
+            "alt.binaries.linux.iso".to_string(),
+        ];
+        let (out, added) = merge(
+            &mine,
+            &["alt.binaries.linux.iso".into(), "alt.binaries.tv".into()],
+        );
         assert_eq!(added, 1);
-        assert_eq!(out, ["alt.binaries.mine", "alt.binaries.linux.iso", "alt.binaries.tv"]);
+        assert_eq!(
+            out,
+            [
+                "alt.binaries.mine",
+                "alt.binaries.linux.iso",
+                "alt.binaries.tv"
+            ]
+        );
         // Idempotent: applying the same resolution twice adds nothing.
         let (again, added) = merge(&out, &["alt.binaries.tv".into()]);
         assert_eq!(added, 0);
@@ -397,9 +444,11 @@ mod tests {
         let tv = resolve(&parse("tv"), |_| true);
         let (with_tv, owned, _, added) = reconcile(&manual, &[], &[], &tv);
         assert!(added > 0);
-        assert!(!owned.contains(&manual[0]), "pre-existing group is not preset-owned");
-        let (after, owned, dropped, _) =
-            reconcile(&with_tv, &owned, &groups(&parse("tv")), &[]);
+        assert!(
+            !owned.contains(&manual[0]),
+            "pre-existing group is not preset-owned"
+        );
+        let (after, owned, dropped, _) = reconcile(&with_tv, &owned, &groups(&parse("tv")), &[]);
         assert_eq!(after, manual);
         assert!(owned.is_empty());
         assert_eq!(dropped, added);

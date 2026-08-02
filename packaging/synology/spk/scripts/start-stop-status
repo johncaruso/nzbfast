@@ -85,14 +85,32 @@ case "$1" in
         # Confirm it is still alive rather than reporting success for a
         # process that exited immediately - the failure mode that makes a
         # broken package look installed.
+        #
+        # It has to DWELL. `running` is satisfied the moment the forked
+        # process exists, which is true microseconds after the `&` above,
+        # so checking once and exiting 0 reported a successful start for
+        # a daemon that then died on an unreadable config, a rejected API
+        # key or a port already bound - DSM recorded the package as
+        # started with nothing serving its port, which is the exact
+        # outcome this loop was written to prevent. Require it to still
+        # be there after the startup work that can fail.
         i=0
-        while [ "$i" -lt 10 ]; do
-            if running; then
-                echo "nzbfast started on port $NZBFAST_PORT."
-                exit 0
-            fi
-            i=$((i + 1))
+        alive=0
+        while [ "$i" -lt 15 ]; do
             sleep 1
+            i=$((i + 1))
+            if running; then
+                alive=$((alive + 1))
+                if [ "$alive" -ge 3 ]; then
+                    echo "nzbfast started on port $NZBFAST_PORT."
+                    exit 0
+                fi
+            else
+                # Not up yet (still exec'ing), or up and gone again.
+                # Either way the count restarts: only CONSECUTIVE
+                # seconds of life count as staying running.
+                alive=0
+            fi
         done
         echo "nzbfast failed to stay running - see $LOGFILE" >&2
         tail -5 "$LOGFILE" 2>/dev/null >&2

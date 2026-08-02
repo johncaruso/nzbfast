@@ -1,0 +1,215 @@
+# Nightly deep CI for the PRIVATE repo. ci-private stays lean on purpose
+# (format + lint + fast unit suites on every push); this picks up the
+# long daemon and e2e suites on a schedule so a regression in them shows
+# up within a day instead of at the next local pre-push run. Gated to
+# the private repo like ci-private.yml (cost rationale in pr-check.yml).
+name: nightly
+on:
+  schedule:
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+    inputs:
+      soak_minutes:
+        description: "Minutes of mixed-queue soak (TODO 82). The scheduled run uses 150."
+        required: false
+        default: "150"
+permissions:
+  contents: read
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  long-suites:
+    if: github.repository != 'nzbfast/nzbfast'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      # Same fixture dependency as pr-check: the e2e repair tests CREATE
+      # their PAR2 sets with the external `par2` and skip without it.
+      - name: test deps (par2 for repair e2e)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq par2
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: nightly-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: build
+        run: cargo build -p nzbfast --locked
+      # Both suites: NZBFAST_NO_ENRICH keeps enrichment workers off the
+      # real internet; NZBFAST_REQUIRE_PAR2 turns a broken par2 install
+      # into a red run instead of silently skipped repair coverage
+      # (rationale in pr-check.yml). --test-threads=1 is a hard
+      # requirement for the daemon suite (CLAUDE.md invariant 4); the
+      # e2e suite tolerates parallelism but carries timing-sensitive
+      # stall/watchdog tests (8-10s abort windows), so it runs
+      # single-threaded here too - nightly has the time budget.
+      - name: daemon suite
+        env:
+          NZBFAST_NO_ENRICH: "1"
+          NZBFAST_REQUIRE_PAR2: "1"
+        run: cargo test -p nzbfast --locked --test daemon -- --test-threads=1
+      - name: e2e suite
+        env:
+          NZBFAST_NO_ENRICH: "1"
+          NZBFAST_REQUIRE_PAR2: "1"
+        run: cargo test -p nzbfast --locked --test e2e -- --test-threads=1
+
+  # Windows leg for the PRIVATE repo. The test suite had NEVER run on
+  # Windows until a Windows-on-ARM build probe added the public-repo
+  # pr-check job, and that first run exposed four real product bugs -
+  # `copy_tree`'s fsync alone broke every cross-device move and the
+  # spool migration on the shipping x64 binary. Development happens in
+  # THIS repo, so a Windows regression merged here would otherwise sit
+  # invisible until it reached a public-repo PR or a release. Windows
+  # runners bill at 2x on private repos, which is why pr-check keeps
+  # its Windows job public-only.
+  #
+  # This job ran the fast unit suites until ci-private.yml took them on
+  # every push (TODO 81), which is strictly better: per-push names the
+  # commit that broke it. So the split now mirrors the Linux one -
+  # ci-private has the fast suites, nightly has the slow one. The
+  # daemon suite is the slow one, it is the suite most likely to break
+  # on Windows specifically (it spawns real daemons, binds ports and
+  # moves files across the paths where every one of those four bugs
+  # lived), and it had no Windows CI coverage here at all. e2e stays
+  # out: it needs the external par2 as a fixture creator, and it does
+  # run on Windows in pr-check's workspace pass on public PRs.
+  windows-daemon:
+    if: github.repository != 'nzbfast/nzbfast'
+    runs-on: windows-latest
+    # The Linux long-suites job above allows 90; Windows compiles this
+    # workspace a good deal slower, so it gets no less.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # No toolchain step: rust-toolchain.toml pins the version and
+      # rustup installs it for the msvc host on the first cargo
+      # invocation (same rationale as pr-check.yml's Windows job).
+      #
+      # No par2 fetch, unlike pr-check's Windows job: par2 there is a
+      # fixture tool for the e2e repair tests, which do not run here.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # runner.os is in the key, so this cannot collide with the
+          # Linux job's cache.
+          key: nightly-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: build
+        run: cargo build -p nzbfast --locked
+      # --test-threads=1 is a hard requirement for the daemon suite
+      # (CLAUDE.md invariant 4), same as the Linux leg above.
+      #
+      # NZBFAST_NO_ENRICH keeps enrichment workers off the real
+      # internet. NZBFAST_LAN_TESTS is deliberately NOT set: it opens an
+      # all-interfaces listener, which on Windows raises the Defender
+      # Firewall dialog, and a hosted runner has nobody to click it
+      # (same rationale as pr-check.yml's Windows job). NZBFAST_REQUIRE_PAR2
+      # is not set either, since no par2 is installed on this runner and
+      # the daemon suite does not create recovery sets.
+      - name: daemon suite
+        env:
+          NZBFAST_NO_ENRICH: "1"
+        run: cargo test -p nzbfast --locked --test daemon -- --test-threads=1
+
+  # TODO 82: the long-run soak. One daemon, a mixed queue (store RAR5,
+  # compressed RAR5, 7z, PAR2 repair, password) driven round and round
+  # against the in-process mock NNTP server for hours, with the daemon's
+  # RSS, fd count and thread count sampled at a quiescent point in every
+  # cycle and gated against the recorded baseline in
+  # crates/nzbfast/tests/leak-soak-baseline.json.
+  #
+  # Its own job rather than a step in long-suites: those two suites are a
+  # 90-minute budget and must stay able to go red fast, and a soak that
+  # shares their runner would serialise behind them AND compete for the
+  # CPU it is measuring.
+  #
+  # RELEASE, not debug. The soak measures the binary users run, and a
+  # debug build's decode throughput would cut the cycle count (and so the
+  # number of samples the drift fit is built from) several-fold. The cache
+  # key is soak-specific so it cannot collide with the debug caches the
+  # other jobs write under the same runner.os.
+  #
+  # Cost: ~2.5 h of private-repo Linux minutes a night at 1x. That is the
+  # single most expensive thing in this workflow, and it is deliberate -
+  # a slow leak is invisible to every other suite here, all of which
+  # start a fresh daemon per test. Turn the schedule down to weekly (or
+  # lower soak_minutes) if the bill needs it before the leak class does.
+  soak:
+    if: github.repository != 'nzbfast/nzbfast'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      # par2 is a FIXTURE tool here (runtime repair is native): the soak
+      # builds its damaged-post shape with `par2 create`. REQUIRE_PAR2
+      # below turns a broken install into a red run rather than a soak
+      # that quietly covers one shape fewer.
+      - name: test deps (par2 for the repair shape)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq par2
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: nightly-soak-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: build (release)
+        run: cargo build --release -p nzbfast --locked
+      - name: soak
+        env:
+          NZBFAST_NO_ENRICH: "1"
+          NZBFAST_REQUIRE_PAR2: "1"
+          # Scheduled runs get the full 150; a manual dispatch can ask for
+          # a short one to check the harness itself.
+          NZBFAST_SOAK_MINUTES: ${{ github.event.inputs.soak_minutes || '150' }}
+          NZBFAST_SOAK_REPORT: ${{ github.workspace }}/soak-report.json
+        # --nocapture so the per-cycle lines stream into the log: a job
+        # that prints nothing for two and a half hours is indistinguishable
+        # from a hung one.
+        run: cargo test --release -p nzbfast --locked --test leak_soak -- --ignored --nocapture
+      # Uploaded on failure TOO - a red soak's sample series is the whole
+      # diagnosis, and it is also what a legitimate new baseline gets
+      # re-recorded from.
+      - name: upload the sample series
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: soak-report
+          path: soak-report.json
+          if-no-files-found: warn
+
+  # Full cargo-deny pass (advisories, licenses, bans, sources) against
+  # deny.toml at the repo root. ci-private runs the same check on every
+  # push; the nightly run is what catches a NEW advisory published
+  # against an unchanged tree.
+  deny:
+    if: github.repository != 'nzbfast/nzbfast'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # Prebuilt binary, pinned by tag and checked by SHA256 rather than
+      # trusted, since it is fetched from a third party and put on PATH
+      # (same pattern as the par2 fetch in pr-check.yml). A cargo
+      # install would cost several minutes of compile per run.
+      - name: install cargo-deny
+        run: |
+          ver="0.20.2"
+          curl -sSfL -o cargo-deny.tar.gz \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${ver}/cargo-deny-${ver}-x86_64-unknown-linux-musl.tar.gz"
+          echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  cargo-deny.tar.gz" | sha256sum -c -
+          tar -xzf cargo-deny.tar.gz
+          sudo mv "cargo-deny-${ver}-x86_64-unknown-linux-musl/cargo-deny" /usr/local/bin/
+          rm -rf cargo-deny.tar.gz "cargo-deny-${ver}-x86_64-unknown-linux-musl"
+      - name: cargo deny
+        run: cargo deny check

@@ -30,6 +30,20 @@ AppName=nzbfast
 AppVersion={#AppVersion}
 AppPublisher=nzbfast
 AppPublisherURL=https://github.com/nzbfast/nzbfast
+; VERSIONINFO for setup.exe itself. Only the version needs stating:
+; VersionInfoCompany already defaults to AppPublisher and
+; VersionInfoProductName to AppName, but VersionInfoVersion defaults to
+; 0.0.0.0 - it does NOT inherit AppVersion - so an unstated version ships
+; an installer whose file properties read 0.0.0.0 while the product it
+; installs reads {#AppVersion}. A code-signing service that enforces
+; artifact metadata (product name plus consistent product versions)
+; rejects that mismatch, and it is the one field here with no working
+; default. Inno pads a three-part version to four.
+VersionInfoVersion={#AppVersion}
+VersionInfoProductName=nzbfast
+VersionInfoCompany=nzbfast
+VersionInfoDescription=nzbfast setup
+VersionInfoCopyright=GPL-3.0-or-later
 ; {autopf} is Program Files under an elevated install and
 ; {localappdata}\Programs under a per-user one, so a single line covers
 ; both. An existing install is upgraded in place wherever it already

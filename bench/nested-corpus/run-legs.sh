@@ -223,6 +223,14 @@ NzbCleanupDisk=yes
 HealthCheck=none
 NzbLog=no
 DupeCheck=no
+# A standalone -c config also inherits NZBGet's BUILT-IN UnrarCmd="unrar" /
+# SevenZipCmd="7z", which resolve against PATH - and the bench boxes have
+# neither on PATH, so every leg ended "Could not start unrar: No such file
+# or directory" and the whole NZBGet column read manual-intervention on
+# shapes it can actually finish (found 2 Aug 2026; the m3 25 Jul round has
+# the same fault). Point both at the binaries NZBGet itself ships.
+UnrarCmd=${NG_UNRAR:-$(dirname $NZBGET)/unrar}
+SevenZipCmd=${NG_7Z:-$(dirname $NZBGET)/7za}
 EOF
     "$NZBGET" -c "$OUTROOT/nzbget-bench.conf" -D || { log "LEG $LEGNAME nzbget rc=start-failed class=fail"; return; }
     sleep 2

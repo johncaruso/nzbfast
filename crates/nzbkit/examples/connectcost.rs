@@ -20,7 +20,10 @@ use std::time::Instant;
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let path = args.first().cloned().unwrap_or_else(|| "config.local.json".into());
+    let path = args
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "config.local.json".into());
     let samples: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(5);
 
     let cfg = match nzbkit::config::Config::load(std::path::Path::new(&path)) {
@@ -67,12 +70,6 @@ async fn main() {
             v[v.len() / 2]
         };
         let (c, w) = (med(&mut cold), med(&mut warm));
-        println!(
-            "{:<28} {:>9.1} ms {:>9.1} ms {:>8.1}x",
-            s.host,
-            c,
-            w,
-            c / w
-        );
+        println!("{:<28} {:>9.1} ms {:>9.1} ms {:>8.1}x", s.host, c, w, c / w);
     }
 }

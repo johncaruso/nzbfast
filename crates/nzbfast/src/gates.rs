@@ -107,12 +107,15 @@ impl Gates {
         (p(&self.min_size), p(&self.max_size))
     }
 
-    /// Does a release with this stem enter the index?
+    /// Does a release with this stem enter the index? No custom
+    /// categories - only the tests take this shortcut; the index path
+    /// always has the user's list to hand and calls `allows_with`.
+    #[cfg(test)]
     pub fn allows(&self, stem: &str) -> bool {
         self.allows_with(stem, &[])
     }
 
-    /// [`allows`] with the user's custom categories applied first: a
+    /// [`allows_with`] applies the user's custom categories first: a
     /// stem a category claims carries that category's slug as its kind,
     /// so `"kinds": ["movie", "formula-1"]` does what it reads as.
     pub fn allows_with(&self, stem: &str, cats: &[nzbkit::categories::CustomCategory]) -> bool {
@@ -134,27 +137,29 @@ impl Gates {
                 }
             }
         }
-        if let Some(y) = p.year {
-            if (self.min_year > 0 && y < self.min_year)
-                || (self.max_year > 0 && y > self.max_year)
-            {
-                return false;
-            }
+        if let Some(y) = p.year
+            && ((self.min_year > 0 && y < self.min_year)
+                || (self.max_year > 0 && y > self.max_year))
+        {
+            return false;
         }
-        if !self.res.is_empty() {
-            if let Some(r) = &p.res {
-                if !self.res.iter().any(|a| a.eq_ignore_ascii_case(r)) {
-                    return false;
-                }
-            }
+        if !self.res.is_empty()
+            && let Some(r) = &p.res
+            && !self.res.iter().any(|a| a.eq_ignore_ascii_case(r))
+        {
+            return false;
         }
         if !self.languages.is_empty() {
             let tagged: &[String] = &p.langs;
             let english = [String::from("english")];
-            let tagged = if tagged.is_empty() { &english[..] } else { tagged };
-            let ok = tagged.iter().any(|l| {
-                l == "multi" || self.languages.iter().any(|a| a.eq_ignore_ascii_case(l))
-            });
+            let tagged = if tagged.is_empty() {
+                &english[..]
+            } else {
+                tagged
+            };
+            let ok = tagged
+                .iter()
+                .any(|l| l == "multi" || self.languages.iter().any(|a| a.eq_ignore_ascii_case(l)));
             if !ok {
                 return false;
             }
@@ -288,11 +293,14 @@ mod tests {
             //    the bound reads as UNBOUNDED (0) - never as a clamp to
             //    MAX_SIZE_BYTES, which for `min` would prune every
             //    complete release: the same wipe by the other door.
-            let (min, max) = gates(&format!(r#"{{"max_size": "{s}", "min_size": "{s}"}}"#))
-                .size_bounds();
+            let (min, max) =
+                gates(&format!(r#"{{"max_size": "{s}", "min_size": "{s}"}}"#)).size_bounds();
             assert_eq!((min, max), (0, 0), "out-of-range bound must read unbounded");
             // The exact conversion prune_size performs on the bind.
-            assert!(max as i64 >= 0 && min as i64 >= 0, "bound wraps negative for {s:?}");
+            assert!(
+                max as i64 >= 0 && min as i64 >= 0,
+                "bound wraps negative for {s:?}"
+            );
         }
 
         // In-range gates - including an absurd-but-representable 9 EB -

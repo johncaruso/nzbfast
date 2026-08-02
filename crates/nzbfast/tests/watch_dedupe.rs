@@ -13,11 +13,17 @@
 //! re-ingest, and an install with no such row still ingests normally (so
 //! a passing skip test cannot be a watcher that simply never ran).
 
+mod scratch;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 struct KillOnDrop(Child);
@@ -72,10 +78,10 @@ fn sha_of(bytes: &[u8]) -> String {
 
 /// A config dir, a watch dir with one .nzb in it, and the sha the daemon
 /// will compute for that file.
-fn scratch(name: &str) -> (PathBuf, PathBuf, String) {
-    let dir = std::env::temp_dir()
-        .join(format!("nzbfast-watchdedupe-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+fn scratch(name: &str) -> (scratch::ScratchDir, PathBuf, String) {
+    let dir =
+        std::env::temp_dir().join(format!("nzbfast-watchdedupe-{}-{name}", std::process::id()));
+    let dir = scratch::ScratchDir::attach(&dir);
     let watch = dir.join("watch");
     std::fs::create_dir_all(&watch).unwrap();
     // No servers: nothing here is allowed to reach a provider.
@@ -106,34 +112,76 @@ fn seed_history(dir: &Path, sha: &str, state: &str) {
         "nzb_sha": sha,
     });
     let v = serde_json::json!({ "next_id": 2, "queue": [], "history": [record] });
-    std::fs::write(spool.join("queue.json"), serde_json::to_string_pretty(&v).unwrap()).unwrap();
+    std::fs::write(
+        spool.join("queue.json"),
+        serde_json::to_string_pretty(&v).unwrap(),
+    )
+    .unwrap();
 }
 
 /// Start the daemon watching `watch`, loopback-bound and keyless (the
-/// assertions here are about the watch poller, not about auth).
+/// assertions here are about the watch poller, not about auth), and
+/// return only once OUR daemon is actually serving.
+///
+/// The readiness gate matters here even though nothing in this file ever
+/// speaks HTTP - which is exactly why its absence stayed invisible. There
+/// is no request to be refused, so a daemon that lost `free_port()` to a
+/// parallel test (the port is closed between our bind(:0) and the child's,
+/// and a full `cargo test -p nzbfast` runs a lot of daemons) simply exited,
+/// and every `wait_for` below then spun out its full 20 s and blamed the
+/// watch poller: "never saw `has already been downloaded`" is a confusing
+/// way to say "the daemon was never up". Same missing retry as the other
+/// suites had, with a quieter and more misleading symptom.
+///
+/// The banner is read from THIS daemon's own log, so it cannot be another
+/// test's daemon answering on a port we lost.
 fn serve(dir: &Path, watch: &Path) -> Running {
-    let log = dir.join("daemon.log");
-    let out = std::fs::File::create(&log).unwrap();
-    let err = out.try_clone().unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_nzbfast"))
-        .env("NZBFAST_NO_ENRICH", "1")
-        .env("NZBFAST_OPEN", "1")
-        .arg("--config")
-        .arg(dir.join("config.json"))
-        .arg("serve")
-        .arg("--port")
-        .arg(free_port().to_string())
-        .arg("--bind")
-        .arg("127.0.0.1")
-        .arg("--out")
-        .arg(dir.join("complete"))
-        .arg("--watch")
-        .arg(watch)
-        .stdout(Stdio::from(out))
-        .stderr(Stdio::from(err))
-        .spawn()
-        .unwrap();
-    Running { _child: KillOnDrop(child), log }
+    for attempt in 0..3 {
+        let port = free_port();
+        let log = dir.join("daemon.log");
+        let out = std::fs::File::create(&log).unwrap();
+        let err = out.try_clone().unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_nzbfast"))
+            .env("NZBFAST_NO_ENRICH", "1")
+            .env("NZBFAST_OPEN", "1")
+            .arg("--config")
+            .arg(dir.join("config.json"))
+            .arg("serve")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--watch")
+            .arg(watch)
+            .stdout(Stdio::from(out))
+            .stderr(Stdio::from(err))
+            .spawn()
+            .unwrap();
+        let mut running = Running {
+            _child: KillOnDrop(child),
+            log,
+        };
+        let banner = format!("open the dashboard at  http://localhost:{port}/");
+        for _ in 0..300 {
+            if running.log().contains(&banner) {
+                return running;
+            }
+            // Exited instead of binding: it lost :port to a parallel
+            // test. Try again on a fresh one.
+            if running._child.0.try_wait().ok().flatten().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            attempt < 2,
+            "daemon never came up on :{port}\n--- log ---\n{}",
+            running.log()
+        );
+    }
+    unreachable!()
 }
 
 /// THE REGRESSION: an unremovable watched .nzb whose release is already

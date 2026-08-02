@@ -5,10 +5,10 @@
 //! order. NNTP responses arrive strictly in command order, which is what
 //! makes pipelining safe. AUTHINFO is never pipelined (done once at connect).
 
+use crate::sync::MutexExt;
 use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-
 
 use crate::config::ServerConfig;
 
@@ -210,7 +210,7 @@ pub fn parse_list_active(raw: &[u8]) -> Vec<ActiveGroup> {
 pub fn parse_list_newsgroups(raw: &[u8]) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for line in String::from_utf8_lossy(raw).lines() {
-        let mut parts = line.splitn(2, |c: char| c == '\t' || c == ' ');
+        let mut parts = line.splitn(2, ['\t', ' ']);
         let Some(name) = parts.next().filter(|n| !n.is_empty() && n.is_ascii()) else {
             continue;
         };
@@ -229,16 +229,23 @@ pub fn parse_list_newsgroups(raw: &[u8]) -> Vec<(String, String)> {
 /// two-digit years) → unix seconds. None if it doesn't look like a date.
 pub fn parse_nntp_date(s: &str) -> Option<i64> {
     let s = s.split('(').next().unwrap_or(s);
-    let toks: Vec<&str> = s.split([' ', ',', '\t']).filter(|t| !t.is_empty()).collect();
+    let toks: Vec<&str> = s
+        .split([' ', ',', '\t'])
+        .filter(|t| !t.is_empty())
+        .collect();
     const MONTHS: [&str; 12] = [
-        "jan", "feb", "mar", "apr", "may", "jun",
-        "jul", "aug", "sep", "oct", "nov", "dec",
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
     ];
     let month_of = |t: &str| {
         let l = t.to_ascii_lowercase();
-        MONTHS.iter().position(|m| l.starts_with(m)).map(|i| i as i64 + 1)
+        MONTHS
+            .iter()
+            .position(|m| l.starts_with(m))
+            .map(|i| i as i64 + 1)
     };
-    let mi = toks.iter().position(|t| t.len() >= 3 && month_of(t).is_some())?;
+    let mi = toks
+        .iter()
+        .position(|t| t.len() >= 3 && month_of(t).is_some())?;
     let month = month_of(toks[mi])?;
     let day: i64 = toks.get(mi.checked_sub(1)?)?.parse().ok()?;
     if !(1..=31).contains(&day) {
@@ -286,7 +293,11 @@ pub fn parse_nntp_date(s: &str) -> Option<i64> {
         _ => 0, // GMT / UT / UTC / Z / unknown
     };
     // Days from 1970-01-01 (Howard Hinnant's civil-days algorithm).
-    let (yy, mm) = if month <= 2 { (year - 1, month) } else { (year, month) };
+    let (yy, mm) = if month <= 2 {
+        (year - 1, month)
+    } else {
+        (year, month)
+    };
     let era = if yy >= 0 { yy } else { yy - 399 } / 400;
     let yoe = yy - era * 400;
     let doy = (153 * ((mm + 9) % 12) + 2) / 5 + day - 1;
@@ -304,7 +315,8 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin> Transport for T {}
 pub fn caps_support_compress_deflate(caps: &[String]) -> bool {
     caps.iter().any(|line| {
         let mut toks = line.split_whitespace();
-        toks.next().is_some_and(|k| k.eq_ignore_ascii_case("COMPRESS"))
+        toks.next()
+            .is_some_and(|k| k.eq_ignore_ascii_case("COMPRESS"))
             && toks.any(|a| a.eq_ignore_ascii_case("DEFLATE"))
     })
 }
@@ -451,7 +463,10 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for DeflateTransport<T> {
             // on the (rare) round where deflate wanted more room.
             me.wbuf.reserve((buf.len() / 2 + 256).max(1024));
             let before = me.enc.total_in();
-            if let Err(e) = me.enc.compress_vec(buf, &mut me.wbuf, flate2::FlushCompress::None) {
+            if let Err(e) = me
+                .enc
+                .compress_vec(buf, &mut me.wbuf, flate2::FlushCompress::None)
+            {
                 return Poll::Ready(Err(std::io::Error::other(e)));
             }
             let used = (me.enc.total_in() - before) as usize;
@@ -473,7 +488,9 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for DeflateTransport<T> {
             loop {
                 me.wbuf.reserve(4 * 1024);
                 let cap = me.wbuf.capacity();
-                if let Err(e) = me.enc.compress_vec(&[], &mut me.wbuf, flate2::FlushCompress::Sync)
+                if let Err(e) = me
+                    .enc
+                    .compress_vec(&[], &mut me.wbuf, flate2::FlushCompress::Sync)
                 {
                     return Poll::Ready(Err(std::io::Error::other(e)));
                 }
@@ -799,12 +816,13 @@ async fn direct_connect_opts(
     bind_ip: Option<&str>,
     rcvbuf: Option<u32>,
 ) -> std::io::Result<tokio::net::TcpStream> {
-    let bind: Option<std::net::IpAddr> = match bind_ip {
-        None => None,
-        Some(s) => Some(s.trim().parse().map_err(|_| {
-            std::io::Error::other(format!("bind_ip {s:?} is not an IP address"))
-        })?),
-    };
+    let bind: Option<std::net::IpAddr> =
+        match bind_ip {
+            None => None,
+            Some(s) => Some(s.trim().parse().map_err(|_| {
+                std::io::Error::other(format!("bind_ip {s:?} is not an IP address"))
+            })?),
+        };
     let mut addrs: Vec<std::net::SocketAddr> =
         tokio::net::lookup_host((host, port)).await?.collect();
     match bind {
@@ -863,7 +881,11 @@ async fn socks5_connect(
     let mut s = direct_connect(phost, pport, server).await?;
 
     // Method negotiation: offer user/pass only when we have one.
-    let methods: &[u8] = if creds.is_some() { &[0x00, 0x02] } else { &[0x00] };
+    let methods: &[u8] = if creds.is_some() {
+        &[0x00, 0x02]
+    } else {
+        &[0x00]
+    };
     let mut hello = vec![0x05, methods.len() as u8];
     hello.extend_from_slice(methods);
     s.write_all(&hello).await?;
@@ -934,17 +956,11 @@ fn tls_full_host(host: &str) -> bool {
     if std::env::var_os("NZBFAST_TLS_AES256").is_some() {
         return true;
     }
-    tls_full_hosts()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .contains(host)
+    tls_full_hosts().lock_ok().contains(host)
 }
 
 fn mark_tls_full_host(host: &str) {
-    tls_full_hosts()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(host.to_string());
+    tls_full_hosts().lock_ok().insert(host.to_string());
 }
 
 /// The trust anchors: webpki's built-in roots plus anything in
@@ -981,6 +997,21 @@ fn tls_roots() -> rustls::RootCertStore {
     roots
 }
 
+/// True when this process has asked for kernel TLS. Constant `false`
+/// unless the `ktls` feature is built in on Linux, and it is read
+/// before the first `ClientConfig` is built so the answer cannot
+/// change underneath a cached config.
+fn ktls_wanted() -> bool {
+    #[cfg(all(feature = "ktls", target_os = "linux"))]
+    {
+        ktls_offload::wanted()
+    }
+    #[cfg(not(all(feature = "ktls", target_os = "linux")))]
+    {
+        false
+    }
+}
+
 /// One shared ClientConfig per suite policy, for the life of the
 /// process: rustls keeps its session ticket cache inside the config, so
 /// sharing it enables TLS session RESUMPTION on reconnects (abbreviated
@@ -996,22 +1027,398 @@ fn tls_client_config(pin_fast_suite: bool) -> Arc<rustls::ClientConfig> {
         // rustls can no longer auto-select a process default - plain
         // `builder()` panics at runtime. Pin aws-lc-rs so the choice is
         // unambiguous regardless of what else links a provider.
-        Arc::new(
-            rustls::ClientConfig::builder_with_provider(Arc::new(tls_provider(
-                aes_accelerated(),
-                pin_fast_suite,
-            )))
-            .with_safe_default_protocol_versions()
-            .expect("aws-lc-rs supports safe default protocol versions")
-            .with_root_certificates(tls_roots())
-            .with_no_client_auth(),
-        )
+        let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(tls_provider(
+            aes_accelerated(),
+            pin_fast_suite,
+        )))
+        .with_safe_default_protocol_versions()
+        .expect("aws-lc-rs supports safe default protocol versions")
+        .with_root_certificates(tls_roots())
+        .with_no_client_auth();
+        // Kernel TLS needs the negotiated traffic secrets after the
+        // handshake, and rustls will only part with them when it was
+        // told so before the handshake. Left off otherwise: the secrets
+        // are in the process either way, but there is no reason to make
+        // them extractable when nothing extracts them.
+        cfg.enable_secret_extraction = ktls_wanted();
+        Arc::new(cfg)
     };
     if pin_fast_suite {
         LEAN.get_or_init(|| build(true)).clone()
     } else {
         FULL.get_or_init(|| build(false)).clone()
     }
+}
+
+/// Kernel TLS: after the rustls handshake, hand the traffic keys to the
+/// kernel and let it do the record crypto.
+///
+/// Every downloaded byte crosses this path, and userspace TLS charges
+/// three things for it (measured 26 Jul, +43% CPU/GB over plain TCP):
+/// the AEAD ~0.120 cpu-s/GB, one extra `recvmsg` per record ~0.079, and
+/// one extra copy per record ~0.081 - rustls decrypts in place and then
+/// `Payload::into_vec()`s the plaintext out, and it stops reading the
+/// socket the moment one record's worth is buffered, so a read is one
+/// ~16 KB record and never more. `setsockopt(TCP_ULP, "tls")` plus the
+/// extracted `TLS_TX`/`TLS_RX` keys turns the socket back into an
+/// ordinary one that happens to return plaintext: the AEAD stays (the
+/// kernel runs it on the same AES-NI), the copy goes, and one `read()`
+/// can drain every record the kernel has.
+///
+/// Opt-in twice over - the `ktls` cargo feature has to be built in AND
+/// `NZBFAST_KTLS=1` set - because the fallback matters more than the
+/// win: NAS firmware kernels predate TLS_RX, containers may not be able
+/// to autoload the `tls` module, and a kernel that refuses must cost a
+/// user nothing.
+///
+/// What the kernel will NOT do is renegotiate. A post-handshake
+/// KeyUpdate arrives as a control record the kernel cannot act on, so
+/// [`KtlsWire`] treats one as a dead connection: the pool reconnects,
+/// and that connection finishes in userspace.
+#[cfg(all(feature = "ktls", target_os = "linux"))]
+mod ktls_offload {
+    use super::Wire;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// `NZBFAST_KTLS=1` opts in. Read once, before the first
+    /// `ClientConfig` exists - [`super::ktls_wanted`] bakes the answer
+    /// into that config's `enable_secret_extraction`.
+    pub(super) fn wanted() -> bool {
+        static WANTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *WANTED.get_or_init(|| {
+            matches!(
+                std::env::var("NZBFAST_KTLS").as_deref(),
+                Ok("1") | Ok("true")
+            )
+        })
+    }
+
+    /// Latched the first time a kernel refuses the handoff. One process
+    /// talks to one kernel, so the second refusal would tell us nothing
+    /// the first did not - and every attempt costs a spent socket.
+    static OFF: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn active() -> bool {
+        wanted() && !OFF.load(Ordering::Relaxed)
+    }
+
+    /// Silent and total, one log line the first time. This is the whole
+    /// point of the opt-in: an old kernel just downloads in userspace.
+    pub(super) fn disable(why: &dyn std::fmt::Display) {
+        if !OFF.swap(true, Ordering::Relaxed) {
+            eprintln!("kTLS: kernel declined the handoff ({why}); TLS stays in userspace");
+        }
+    }
+
+    /// Handshake with rustls, then hand the socket to the kernel.
+    ///
+    /// - `Ok(Some(wire))` - kTLS is live on this connection.
+    /// - `Ok(None)` - the kernel refused. kTLS is off for the rest of
+    ///   the process and the caller must redial: draining rustls spent
+    ///   this socket.
+    /// - `Err(e)` - the TLS handshake itself failed, exactly as it
+    ///   would have without kTLS, and the caller's existing ladder
+    ///   (pinned suite → full cipher list) applies unchanged.
+    pub(super) async fn connect(
+        name: rustls::pki_types::ServerName<'static>,
+        tcp: tokio::net::TcpStream,
+        pin_fast_suite: bool,
+    ) -> std::io::Result<Option<Wire>> {
+        let connector = tokio_rustls::TlsConnector::from(super::tls_client_config(pin_fast_suite));
+        // The cork is load-bearing. rustls reads whatever the socket
+        // has, so by the time `connect` returns it can be holding a
+        // PARTIAL record - and the kernel, handed keys that start at a
+        // record boundary, could never decrypt the remainder. A corked
+        // stream stops at each boundary, which lets the drain below end
+        // exactly where the kernel begins.
+        let stream = connector.connect(name, ktls::CorkStream::new(tcp)).await?;
+        match ktls::config_ktls_client(stream).await {
+            Ok(k) => {
+                // Say so once. "It downloaded" is not evidence that the
+                // kernel took the socket - the fallback is silent and
+                // looks identical from the outside.
+                static LOGGED: AtomicBool = AtomicBool::new(false);
+                if !LOGGED.swap(true, Ordering::Relaxed) {
+                    eprintln!("kTLS: kernel TLS active - record crypto moved into the kernel");
+                }
+                // Whatever rustls decrypted before the handoff (the NNTP
+                // greeting usually arrives in the same flight) rides
+                // along inside the stream and comes out of the first
+                // reads, ahead of anything the kernel produces.
+                let (drained, tcp) = k.into_raw();
+                Ok(Some(Wire::buffered(Box::new(super::KtlsWire::new(
+                    tcp, drained,
+                )))))
+            }
+            Err(e) => {
+                disable(&e);
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// A socket the kernel decrypts: ordinary `read`/`write`, plaintext on
+/// both sides, plus whatever rustls had already decrypted when the
+/// kernel took over.
+///
+/// It exists instead of `ktls::KtlsStream` for one reason: control
+/// records. A `read()` on a kTLS socket fails with `EIO` for any record
+/// that is not application data, and the only way to see what it was is
+/// `recvmsg` with room for a `TLS_GET_RECORD_TYPE` control message. The
+/// crate's own stream does that too, but answers the awkward cases -
+/// an unexpected `cmsg`, a two-byte alert that arrives as one byte, a
+/// `change_cipher_spec` - with `panic!`. A panic in a pool worker takes
+/// the download with it (an `Err` never hangs the pool; a panic does),
+/// and every one of those cases is reachable from the far end of a
+/// socket, which is untrusted input. Here they are all errors, and an
+/// error just costs that one connection.
+#[cfg(all(feature = "ktls", target_os = "linux"))]
+struct KtlsWire {
+    tcp: tokio::net::TcpStream,
+    fd: std::os::fd::RawFd,
+    /// Plaintext rustls decrypted before the handoff (the NNTP greeting
+    /// usually), and how much of it has been handed out.
+    drained: Option<(usize, Vec<u8>)>,
+}
+
+#[cfg(all(feature = "ktls", target_os = "linux"))]
+impl KtlsWire {
+    /// `SOL_TLS` and `TLS_GET_RECORD_TYPE` from the kernel's
+    /// `include/uapi/linux/tls.h`; libc does not export them.
+    const SOL_TLS: libc::c_int = 282;
+    const TLS_GET_RECORD_TYPE: libc::c_int = 2;
+    const RECORD_ALERT: u8 = 21;
+    const RECORD_HANDSHAKE: u8 = 22;
+    const ALERT_CLOSE_NOTIFY: u8 = 0;
+    const HANDSHAKE_NEW_SESSION_TICKET: u8 = 4;
+    const HANDSHAKE_KEY_UPDATE: u8 = 24;
+
+    fn new(tcp: tokio::net::TcpStream, drained: Option<Vec<u8>>) -> Self {
+        use std::os::fd::AsRawFd as _;
+        let fd = tcp.as_raw_fd();
+        Self {
+            tcp,
+            fd,
+            drained: drained.map(|d| (0, d)),
+        }
+    }
+
+    /// Consume the one non-data record the kernel is holding, and say
+    /// what to do next. Until it is consumed, nothing behind it can be
+    /// read.
+    ///
+    /// `scratch` is the caller's own read buffer, borrowed and then
+    /// discarded: a control record's contents are never application
+    /// data, so nothing here is ever handed upward.
+    fn take_control_record(&mut self, scratch: &mut [u8]) -> std::io::Result<ControlRecord> {
+        // A union with the header, not a byte array: `CMSG_FIRSTHDR`
+        // casts this buffer to a `cmsghdr`, so it has to carry that
+        // type's alignment. A `[u8; N]` is 1-aligned and reads as a
+        // misaligned dereference - which a release build happily runs
+        // and a debug build aborts on (it did, first run).
+        union CmsgSpace {
+            _hdr: libc::cmsghdr,
+            bytes: [u8; 64],
+        }
+        let mut cmsg_space = CmsgSpace { bytes: [0u8; 64] };
+        let cmsg_len = std::mem::size_of::<CmsgSpace>();
+        // SAFETY: every pointer handed to recvmsg points at a live local
+        // buffer, the lengths match those buffers, and the cmsg walk uses
+        // the kernel's own macros over the header recvmsg filled in.
+        let (n, record_type) = unsafe {
+            let mut iov = libc::iovec {
+                iov_base: scratch.as_mut_ptr().cast(),
+                iov_len: scratch.len(),
+            };
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = cmsg_space.bytes.as_mut_ptr().cast();
+            msg.msg_controllen = cmsg_len as _;
+            let n = libc::recvmsg(self.fd, &mut msg, libc::MSG_DONTWAIT);
+            if n < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut ty = None;
+            let mut c = libc::CMSG_FIRSTHDR(&msg);
+            while !c.is_null() {
+                if (*c).cmsg_level == Self::SOL_TLS && (*c).cmsg_type == Self::TLS_GET_RECORD_TYPE {
+                    ty = Some(*libc::CMSG_DATA(c));
+                }
+                c = libc::CMSG_NXTHDR(&msg, c);
+            }
+            (n as usize, ty)
+        };
+        let Some(record_type) = record_type else {
+            // No record-type control message means this was not the
+            // control record we were told about. Nothing sane left to
+            // do with the connection.
+            return Err(std::io::Error::other(
+                "kTLS: EIO on read with no TLS record type",
+            ));
+        };
+        let body = &scratch[..n];
+        match record_type {
+            Self::RECORD_ALERT => match body {
+                // A close_notify is the peer hanging up cleanly, which
+                // is exactly EOF. Every other alert aborts the session
+                // by definition, so it is an error either way.
+                [_, Self::ALERT_CLOSE_NOTIFY] | [Self::ALERT_CLOSE_NOTIFY] => {
+                    Ok(ControlRecord::Eof)
+                }
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "kTLS: TLS alert",
+                )),
+            },
+            Self::RECORD_HANDSHAKE => match body.first().copied() {
+                // Session tickets: the ordinary post-handshake traffic
+                // of any TLS 1.3 server. The kernel cannot use them and
+                // neither can we now that rustls is out of the loop, so
+                // resumption is a cost kTLS connections pay - one extra
+                // round-trip on the NEXT connect to that host.
+                Some(Self::HANDSHAKE_NEW_SESSION_TICKET) => Ok(ControlRecord::Skip),
+                // A rekey. The kernel holds one set of keys and cannot
+                // be handed another mid-stream, so this connection is
+                // over - and a server that rekeys once will do it
+                // again, so stop using kTLS for the rest of the run.
+                Some(Self::HANDSHAKE_KEY_UPDATE) => {
+                    ktls_offload::disable(&"server sent a TLS KeyUpdate");
+                    Err(std::io::Error::other(
+                        "kTLS: TLS KeyUpdate cannot be applied",
+                    ))
+                }
+                _ => Ok(ControlRecord::Skip),
+            },
+            // change_cipher_spec (20) after the handshake, or anything
+            // else: not something a TLS 1.3 peer sends on a live
+            // connection.
+            other => Err(std::io::Error::other(format!(
+                "kTLS: unexpected TLS record type {other}"
+            ))),
+        }
+    }
+}
+
+/// What a consumed control record means for the read that hit it.
+#[cfg(all(feature = "ktls", target_os = "linux"))]
+enum ControlRecord {
+    /// Ignorable; read again.
+    Skip,
+    /// The peer closed cleanly.
+    Eof,
+}
+
+#[cfg(all(feature = "ktls", target_os = "linux"))]
+impl AsyncRead for KtlsWire {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let me = self.get_mut();
+        // Pre-handoff plaintext first - it sits in front of everything
+        // the kernel will ever produce.
+        if let Some((at, d)) = &mut me.drained {
+            let n = (d.len() - *at).min(buf.remaining());
+            buf.put_slice(&d[*at..*at + n]);
+            *at += n;
+            if *at >= d.len() {
+                me.drained = None;
+            }
+            return std::task::Poll::Ready(Ok(()));
+        }
+        match std::pin::Pin::new(&mut me.tcp).poll_read(cx, buf) {
+            std::task::Poll::Ready(Err(e)) if e.raw_os_error() == Some(libc::EIO) => {
+                // Not a failure: the kernel is holding a record it will
+                // not hand over as data, and says so with EIO.
+                match me.take_control_record(buf.initialize_unfilled()) {
+                    Ok(ControlRecord::Skip) => {
+                        // The record is consumed; whatever is behind it
+                        // may be readable right now, so try again
+                        // rather than wait for the next readiness edge.
+                        cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                    // Nothing filled == EOF.
+                    Ok(ControlRecord::Eof) => std::task::Poll::Ready(Ok(())),
+                    Err(e) => std::task::Poll::Ready(Err(e)),
+                }
+            }
+            other => other,
+        }
+    }
+}
+
+#[cfg(all(feature = "ktls", target_os = "linux"))]
+impl AsyncWrite for KtlsWire {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().tcp).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().tcp).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().tcp).poll_shutdown(cx)
+    }
+}
+
+/// The shared TLS client configuration, for the engine's non-NNTP TLS
+/// links (today: the pre feed's IRC connection). Full suite list, not
+/// the AES-128 pin - that pin is a per-byte throughput optimisation for
+/// the download path and means nothing on a link carrying a line of
+/// text a minute. Sharing the config also shares the trust anchors, so
+/// `NZBFAST_EXTRA_CA` applies here too.
+pub fn shared_tls_client_config() -> Arc<rustls::ClientConfig> {
+    tls_client_config(false)
+}
+
+/// The plain userspace rung: rustls owns the record layer, as it has
+/// on every platform since the beginning.
+async fn userspace_tls(
+    name: rustls::pki_types::ServerName<'static>,
+    tcp: tokio::net::TcpStream,
+    pin_fast_suite: bool,
+) -> std::io::Result<Wire> {
+    let connector = tokio_rustls::TlsConnector::from(tls_client_config(pin_fast_suite));
+    Ok(Wire::Tls(Box::new(connector.connect(name, tcp).await?)))
+}
+
+/// One rung of the handshake ladder. `Ok(None)` means "the kernel
+/// refused kTLS, the socket is spent, dial again" - it cannot happen
+/// when kTLS is not compiled in.
+#[cfg(all(feature = "ktls", target_os = "linux"))]
+async fn tls_handshake(
+    name: rustls::pki_types::ServerName<'static>,
+    tcp: tokio::net::TcpStream,
+    pin_fast_suite: bool,
+) -> std::io::Result<Option<Wire>> {
+    if ktls_offload::active() {
+        return ktls_offload::connect(name, tcp, pin_fast_suite).await;
+    }
+    userspace_tls(name, tcp, pin_fast_suite).await.map(Some)
+}
+
+#[cfg(not(all(feature = "ktls", target_os = "linux")))]
+async fn tls_handshake(
+    name: rustls::pki_types::ServerName<'static>,
+    tcp: tokio::net::TcpStream,
+    pin_fast_suite: bool,
+) -> std::io::Result<Option<Wire>> {
+    userspace_tls(name, tcp, pin_fast_suite).await.map(Some)
 }
 
 /// Diagnostic: handshake with `host:port` exactly as a download
@@ -1067,35 +1474,61 @@ impl Connection {
         let wire = if server.tls {
             let name = rustls::pki_types::ServerName::try_from(server.host.clone())
                 .map_err(|_| NntpError::TlsName)?;
-            // Hosts that rejected the AES-128-only offer, so every later
-            // connection to them skips straight to the full suite list
-            // instead of paying a doomed handshake each time.
-            let full = tls_full_host(&server.host);
-            let connector =
-                tokio_rustls::TlsConnector::from(tls_client_config(!full));
-            match connector.connect(name.clone(), tcp).await {
-                Ok(s) => Wire::Tls(Box::new(s)),
-                Err(e) if !full => {
-                    // The reduced offer failed. It is almost certainly a
-                    // real fault (cert, name, network) that will fail
-                    // again, but a server supporting neither AES-128 nor
-                    // ChaCha would look identical, and that server must
-                    // still work. Remember the host and retry ONCE with
-                    // everything; a genuine fault surfaces from the
-                    // retry with its own error. The socket is spent
-                    // either way, so this redials.
-                    mark_tls_full_host(&server.host);
-                    eprintln!(
-                        "{}: TLS handshake failed on the pinned cipher suite ({e}); \
-                         retrying with the full cipher list",
-                        server.host
-                    );
-                    let tcp = tcp_connect().await?;
-                    let connector =
-                        tokio_rustls::TlsConnector::from(tls_client_config(false));
-                    Wire::Tls(Box::new(connector.connect(name, tcp).await?))
+            // The handshake ladder: kernel TLS (when it is built in,
+            // asked for, and the kernel takes it), then userspace
+            // rustls on the pinned suite, then userspace rustls on the
+            // full cipher list. Every rung consumes its socket, so each
+            // one redials - and each rung can only be taken once (kTLS
+            // latches off, the full-list decision is remembered per
+            // host), so a steady-state connect takes the first and
+            // stops.
+            let mut tcp = tcp;
+            let mut wire = None;
+            for _ in 0..3 {
+                // Hosts that rejected the AES-128-only offer skip
+                // straight to the full suite list instead of paying a
+                // doomed handshake each time.
+                let full = tls_full_host(&server.host);
+                match tls_handshake(name.clone(), tcp, !full).await {
+                    Ok(Some(w)) => {
+                        wire = Some(w);
+                        break;
+                    }
+                    // The kernel refused the handoff. kTLS is off for
+                    // the rest of the process now; this connection just
+                    // redials and goes through userspace like any
+                    // other.
+                    Ok(None) => {}
+                    Err(e) if !full => {
+                        // The reduced offer failed. It is almost
+                        // certainly a real fault (cert, name, network)
+                        // that will fail again, but a server supporting
+                        // neither AES-128 nor ChaCha would look
+                        // identical, and that server must still work.
+                        // Remember the host and retry ONCE with
+                        // everything; a genuine fault surfaces from the
+                        // retry with its own error.
+                        mark_tls_full_host(&server.host);
+                        eprintln!(
+                            "{}: TLS handshake failed on the pinned cipher suite ({e}); \
+                             retrying with the full cipher list",
+                            server.host
+                        );
+                    }
+                    Err(e) => return Err(e.into()),
                 }
-                Err(e) => return Err(e.into()),
+                tcp = tcp_connect().await?;
+            }
+            match wire {
+                Some(w) => w,
+                // Unreachable: the third rung either connects or
+                // returns its own error. An error beats a silent
+                // reconnect loop if that ever stops being true.
+                None => {
+                    return Err(NntpError::Io(std::io::Error::other(
+                        "TLS handshake did not settle",
+                    )));
+                }
             }
         } else {
             Wire::buffered(Box::new(tcp))
@@ -1110,6 +1543,23 @@ impl Connection {
 
         let greeting = conn.read_status().await?;
         if !matches!(greeting.code, 200 | 201) {
+            // Providers reject over-cap connections in the GREETING as
+            // often as at AUTHINFO ("502 too many connections" before any
+            // command). Route those through the same capacity
+            // classification so the pool's one-at-a-time yield path takes
+            // over instead of the whole fleet hammering the generic
+            // connect-failure backoff. A non-capacity refusal stays
+            // Unexpected: a greeting 502 is also plain "permission
+            // denied" on some servers, and guessing Permanent there
+            // would blacklist a server over a transient wording.
+            if matches!(greeting.code, 400..=599)
+                && classify_auth_refusal(&greeting.line) == AuthRefusal::Capacity
+            {
+                return Err(NntpError::AuthFailed {
+                    kind: AuthRefusal::Capacity,
+                    line: greeting.line,
+                });
+            }
             return Err(NntpError::Unexpected {
                 cmd: "<greeting>".into(),
                 line: greeting.line,
@@ -1211,10 +1661,7 @@ impl Connection {
             return Err(NntpError::TooLarge(MAX_STATUS_BYTES));
         }
         let text = String::from_utf8_lossy(&self.line).trim_end().to_string();
-        let code = text
-            .get(..3)
-            .and_then(|c| c.parse().ok())
-            .unwrap_or(0);
+        let code = text.get(..3).and_then(|c| c.parse().ok()).unwrap_or(0);
         Ok(Status { code, line: text })
     }
 
@@ -1482,11 +1929,11 @@ where
             }
             if found.is_none() {
                 for nl in memchr::memchr_iter(b'\n', buf) {
-                    if buf.get(nl + 1) == Some(&b'.') {
-                        if let Some(hit) = confirm(nl + 1) {
-                            found = Some(hit);
-                            break;
-                        }
+                    if buf.get(nl + 1) == Some(&b'.')
+                        && let Some(hit) = confirm(nl + 1)
+                    {
+                        found = Some(hit);
+                        break;
                     }
                 }
             }
@@ -1596,7 +2043,12 @@ impl Connection {
             });
         }
         let mut parts = st.line.split_whitespace().skip(1);
-        let mut next = || parts.next().and_then(|p| p.parse::<u64>().ok()).unwrap_or(0);
+        let mut next = || {
+            parts
+                .next()
+                .and_then(|p| p.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
         let count = next();
         let low = next();
         let high = next();
@@ -1641,7 +2093,10 @@ impl Connection {
     pub async fn list_active(&mut self) -> Result<Vec<ActiveGroup>, NntpError> {
         let st = self.exec("LIST ACTIVE").await?;
         if st.code != 215 {
-            return Err(NntpError::Unexpected { cmd: "LIST ACTIVE".into(), line: st.line });
+            return Err(NntpError::Unexpected {
+                cmd: "LIST ACTIVE".into(),
+                line: st.line,
+            });
         }
         let mut raw = Vec::new();
         self.read_multiline_into(&mut raw).await?;
@@ -1653,7 +2108,10 @@ impl Connection {
     pub async fn list_newsgroups(&mut self) -> Result<Vec<(String, String)>, NntpError> {
         let st = self.exec("LIST NEWSGROUPS").await?;
         if st.code != 215 {
-            return Err(NntpError::Unexpected { cmd: "LIST NEWSGROUPS".into(), line: st.line });
+            return Err(NntpError::Unexpected {
+                cmd: "LIST NEWSGROUPS".into(),
+                line: st.line,
+            });
         }
         let mut raw = Vec::new();
         self.read_multiline_into(&mut raw).await?;
@@ -1900,8 +2358,10 @@ mod tls_provider_tests {
         let first_aes = p.cipher_suites.iter().position(|s| !is_chacha(s)).unwrap();
         assert!(p.cipher_suites[first_aes..].iter().all(|s| !is_chacha(s)));
         let default = rustls::crypto::aws_lc_rs::default_provider();
-        let aes_order: Vec<_> =
-            p.cipher_suites[first_aes..].iter().map(|s| s.suite()).collect();
+        let aes_order: Vec<_> = p.cipher_suites[first_aes..]
+            .iter()
+            .map(|s| s.suite())
+            .collect();
         let default_aes: Vec<_> = default
             .cipher_suites
             .iter()
@@ -1909,6 +2369,33 @@ mod tls_provider_tests {
             .map(|s| s.suite())
             .collect();
         assert_eq!(aes_order, default_aes);
+    }
+
+    /// The policy has to reach the handshake. `tls_provider` decides
+    /// what to offer, but what a connection actually offers is whatever
+    /// `tls_client_config` built - and the two only stay in step while
+    /// nothing else in this file constructs a `ClientConfig` of its
+    /// own. Verified live on x86_64 (2 Aug): a connection to the bench
+    /// server negotiates TLSv1_3 / TLS13_AES_128_GCM_SHA256, which is
+    /// the single suite this pin offers.
+    #[test]
+    fn the_shared_config_carries_the_pinned_offer() {
+        let cfg = super::tls_client_config(true);
+        let got: Vec<_> = cfg
+            .crypto_provider()
+            .cipher_suites
+            .iter()
+            .map(|s| s.suite())
+            .collect();
+        let want: Vec<_> = tls_provider(super::aes_accelerated(), true)
+            .cipher_suites
+            .iter()
+            .map(|s| s.suite())
+            .collect();
+        assert_eq!(got, want, "the built config must offer the pinned suite");
+        // Extractable traffic secrets are for kTLS and nothing else, so
+        // a process that did not ask for kTLS must not have them.
+        assert_eq!(cfg.enable_secret_extraction, super::ktls_wanted());
     }
 
     /// The fallback path must stay a superset - it is what rescues a
@@ -1947,10 +2434,15 @@ mod over_tests {
             HashMap::new(),
             HashMap::new(),
             rows(),
-            Chaos { xover_only: true, ..Default::default() },
+            Chaos {
+                xover_only: true,
+                ..Default::default()
+            },
         )
         .await;
-        let (mut conn, _) = Connection::connect(&srv.server_config()).await.expect("connect");
+        let (mut conn, _) = Connection::connect(&srv.server_config())
+            .await
+            .expect("connect");
         conn.group("mock.group").await.expect("group");
         let es = conn.over(1, 5).await.expect("over via xover fallback");
         assert_eq!(es.len(), 5);
@@ -1974,10 +2466,15 @@ mod over_tests {
             HashMap::new(),
             HashMap::new(),
             rows(),
-            Chaos { gzip_headers: true, ..Default::default() },
+            Chaos {
+                gzip_headers: true,
+                ..Default::default()
+            },
         )
         .await;
-        let (mut conn, _) = Connection::connect(&srv.server_config()).await.expect("connect");
+        let (mut conn, _) = Connection::connect(&srv.server_config())
+            .await
+            .expect("connect");
         conn.group("mock.group").await.expect("group");
         assert!(conn.enable_header_gzip().await, "290 must enable");
         let es = conn.over(1, 5).await.expect("compressed over");
@@ -1990,14 +2487,11 @@ mod over_tests {
 
         // Server that rejects the feature: enable returns false and the
         // plain path still works untouched.
-        let srv = MockServer::start_full(
-            HashMap::new(),
-            HashMap::new(),
-            rows(),
-            Chaos::default(),
-        )
-        .await;
-        let (mut conn, _) = Connection::connect(&srv.server_config()).await.expect("connect");
+        let srv =
+            MockServer::start_full(HashMap::new(), HashMap::new(), rows(), Chaos::default()).await;
+        let (mut conn, _) = Connection::connect(&srv.server_config())
+            .await
+            .expect("connect");
         conn.group("mock.group").await.expect("group");
         assert!(!conn.enable_header_gzip().await, "no 290 = stay plain");
         let es = conn.over(1, 5).await.expect("plain over");
@@ -2007,14 +2501,11 @@ mod over_tests {
 
     #[tokio::test]
     async fn over_capable_server_latches_supported() {
-        let srv = MockServer::start_full(
-            HashMap::new(),
-            HashMap::new(),
-            rows(),
-            Chaos::default(),
-        )
-        .await;
-        let (mut conn, _) = Connection::connect(&srv.server_config()).await.expect("connect");
+        let srv =
+            MockServer::start_full(HashMap::new(), HashMap::new(), rows(), Chaos::default()).await;
+        let (mut conn, _) = Connection::connect(&srv.server_config())
+            .await
+            .expect("connect");
         conn.group("mock.group").await.expect("group");
         let es = conn.over(1, 5).await.expect("over");
         assert_eq!(es.len(), 5);
@@ -2029,14 +2520,11 @@ mod over_tests {
         // the server answers 423. Reading that as a failure stalled the
         // whole pass: the caller bailed out, never advanced its mark, and
         // asked for the identical empty range on every retry, forever.
-        let srv = MockServer::start_full(
-            HashMap::new(),
-            HashMap::new(),
-            rows(),
-            Chaos::default(),
-        )
-        .await;
-        let (mut conn, _) = Connection::connect(&srv.server_config()).await.expect("connect");
+        let srv =
+            MockServer::start_full(HashMap::new(), HashMap::new(), rows(), Chaos::default()).await;
+        let (mut conn, _) = Connection::connect(&srv.server_config())
+            .await
+            .expect("connect");
         let g = conn.group("mock.group").await.expect("group");
         let es = conn
             .over(g.high + 1, g.high + 1000)
@@ -2059,10 +2547,15 @@ mod over_tests {
             HashMap::new(),
             HashMap::new(),
             rows(),
-            Chaos { over_rejected: true, ..Default::default() },
+            Chaos {
+                over_rejected: true,
+                ..Default::default()
+            },
         )
         .await;
-        let (mut conn, _) = Connection::connect(&srv.server_config()).await.expect("connect");
+        let (mut conn, _) = Connection::connect(&srv.server_config())
+            .await
+            .expect("connect");
         conn.group("mock.group").await.expect("group");
         assert!(
             conn.over(1, 5).await.is_err(),
@@ -2084,10 +2577,15 @@ mod quit_tests {
         // must not wait forever on a peer that takes the QUIT silently.
         let srv = MockServer::start(
             HashMap::new(),
-            Chaos { mute_quit: true, ..Default::default() },
+            Chaos {
+                mute_quit: true,
+                ..Default::default()
+            },
         )
         .await;
-        let (conn, _) = Connection::connect(&srv.server_config()).await.expect("connect");
+        let (conn, _) = Connection::connect(&srv.server_config())
+            .await
+            .expect("connect");
         let t0 = std::time::Instant::now();
         conn.quit().await;
         assert!(
@@ -2133,6 +2631,62 @@ mod quit_tests {
         };
         let r = Connection::connect(&server).await;
         assert!(r.is_err(), "connect to a mute server must error, got Ok");
+    }
+
+    /// Providers reject over-cap connections in the GREETING as often as
+    /// at AUTHINFO. That must reach the pool as AuthFailed(Capacity) -
+    /// the one-at-a-time yield path - while a non-capacity greeting
+    /// refusal stays Unexpected (guessing Permanent would blacklist a
+    /// server over transient wording).
+    #[tokio::test]
+    async fn capacity_greeting_takes_the_yield_path() {
+        use super::{AuthRefusal, NntpError};
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for greet in [
+                "502 too many connections for your account\r\n",
+                "502 access denied\r\n",
+            ] {
+                if let Ok((mut s, _)) = listener.accept() {
+                    let _ = s.write_all(greet.as_bytes());
+                    let _ = s.flush();
+                    // Hold briefly so the client reads before FIN races it.
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            }
+        });
+        let server = crate::config::ServerConfig {
+            host: "127.0.0.1".into(),
+            port,
+            tls: false,
+            username: None,
+            password: None,
+            connections: 1,
+            rcvbuf: None,
+            level: 0,
+            group: None,
+            retention_days: 0,
+            block_bytes: None,
+            bind_ip: None,
+            socks5: None,
+            enabled: true,
+            warm_pool: false,
+            idle_release_secs: None,
+            idle_keep: None,
+            max_source_ips: None,
+        };
+        match Connection::connect(&server).await {
+            Err(NntpError::AuthFailed { kind, .. }) => assert_eq!(kind, AuthRefusal::Capacity),
+            Err(e) => panic!("capacity greeting must classify as AuthFailed, got {e:?}"),
+            Ok(_) => panic!("capacity greeting must classify as AuthFailed, got Ok"),
+        }
+        match Connection::connect(&server).await {
+            Err(NntpError::Unexpected { cmd, .. }) => assert_eq!(cmd, "<greeting>"),
+            Err(e) => panic!("non-capacity greeting must stay Unexpected, got {e:?}"),
+            Ok(_) => panic!("non-capacity greeting must stay Unexpected, got Ok"),
+        }
     }
 
     /// A pair of connected loopback sockets with `preload` already sitting
@@ -2332,13 +2886,13 @@ mod quit_tests {
 
         let cases: &[&[u8]] = &[
             b"hello\r\nworld\r\n.\r\nNEXT",
-            b".\r\nNEXT",                              // empty block
-            b"..stuffed\r\n...also\r\n.\r\nNEXT",      // dot-stuffing preserved raw
-            b"bare\nlf lines\n.\nNEXT",                // bare-LF form
+            b".\r\nNEXT",                         // empty block
+            b"..stuffed\r\n...also\r\n.\r\nNEXT", // dot-stuffing preserved raw
+            b"bare\nlf lines\n.\nNEXT",           // bare-LF form
             b"mixed\r\nbare\n.\r\nNEXT",
             b"trailing dot data.\r\n.here\r\n.\r\nNEXT", // '.' mid/odd positions (stuffed-ish)
-            b"a\r\n\r\n.\r\nNEXT",                     // empty line before terminator
-            b"x.\r\n.y\r\n.\r\n",                      // no pipelined rest
+            b"a\r\n\r\n.\r\nNEXT",                       // empty line before terminator
+            b"x.\r\n.y\r\n.\r\n",                        // no pipelined rest
             b"=ybegin part=1\r\n\x01\x02.\x03\r\n.\r\n220 0 <x>\r\nmore",
         ];
         for wire in cases {
@@ -2359,7 +2913,11 @@ mod quit_tests {
         // EOF before terminator errors instead of hanging.
         let mut r = BufReader::with_capacity(4, &b"no terminator here\r\n"[..]);
         let mut out = Vec::new();
-        assert!(super::read_multiline_generic(&mut r, &mut out).await.is_err());
+        assert!(
+            super::read_multiline_generic(&mut r, &mut out)
+                .await
+                .is_err()
+        );
     }
 
     /// M32: Connection::connect rides a SOCKS5 proxy when the server
@@ -2390,13 +2948,19 @@ mod quit_tests {
             c.write_all(&[0x05, 0x00]).await.unwrap(); // no-auth
             let mut head = [0u8; 5];
             c.read_exact(&mut head).await.unwrap();
-            assert_eq!(&head[..4], &[0x05, 0x01, 0x00, 0x03], "domain CONNECT expected");
+            assert_eq!(
+                &head[..4],
+                &[0x05, 0x01, 0x00, 0x03],
+                "domain CONNECT expected"
+            );
             let mut dom = vec![0u8; head[4] as usize];
             c.read_exact(&mut dom).await.unwrap();
             let mut port = [0u8; 2];
             c.read_exact(&mut port).await.unwrap();
             dom_tx.send(String::from_utf8(dom).unwrap()).unwrap();
-            c.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.unwrap();
+            c.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
             let mut t = tokio::net::TcpStream::connect(taddr).await.unwrap();
             let _ = tokio::io::copy_bidirectional(&mut c, &mut t).await;
         });
@@ -2421,11 +2985,14 @@ mod quit_tests {
             idle_keep: None,
             max_source_ips: None,
         };
-        let (_conn, greeting) =
-            Connection::connect(&server).await.expect("connect through proxy");
+        let (_conn, greeting) = Connection::connect(&server)
+            .await
+            .expect("connect through proxy");
         assert_eq!(greeting.code, 200);
         assert_eq!(
-            dom_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            dom_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
             "nntp.behind-the-proxy.invalid",
             "hostname must be resolved by the proxy, not locally"
         );
@@ -2460,7 +3027,13 @@ mod compress_tests {
                     alt.no.desc\n";
         let d = super::parse_list_newsgroups(raw);
         assert_eq!(d.len(), 2);
-        assert_eq!(d[0], ("rec.autos.sport.f1".into(), "Formula 1 motor racing.".into()));
+        assert_eq!(
+            d[0],
+            (
+                "rec.autos.sport.f1".into(),
+                "Formula 1 motor racing.".into()
+            )
+        );
         assert_eq!(d[1].1, "Music binaries.");
     }
 
@@ -2470,13 +3043,23 @@ mod compress_tests {
 
     #[test]
     fn detects_compress_deflate_capability() {
-        assert!(caps_support_compress_deflate(&caps(&["VERSION 2", "COMPRESS DEFLATE"])));
+        assert!(caps_support_compress_deflate(&caps(&[
+            "VERSION 2",
+            "COMPRESS DEFLATE"
+        ])));
         // Case-insensitive; DEFLATE may be one of several algorithms.
-        assert!(caps_support_compress_deflate(&caps(&["compress shrink deflate"])));
-        assert!(!caps_support_compress_deflate(&caps(&["VERSION 2", "OVER"])));
+        assert!(caps_support_compress_deflate(&caps(&[
+            "compress shrink deflate"
+        ])));
+        assert!(!caps_support_compress_deflate(&caps(&[
+            "VERSION 2",
+            "OVER"
+        ])));
         assert!(!caps_support_compress_deflate(&caps(&["COMPRESS SHRINK"])));
         // Label must be exactly COMPRESS, not merely contain it.
-        assert!(!caps_support_compress_deflate(&caps(&["XCOMPRESS DEFLATE"])));
+        assert!(!caps_support_compress_deflate(&caps(&[
+            "XCOMPRESS DEFLATE"
+        ])));
         assert!(!caps_support_compress_deflate(&[]));
     }
 
@@ -2526,7 +3109,6 @@ mod compress_tests {
     /// `rows` controls the size of each OVER block so tests can push the
     /// adapter past its internal 16 KiB staging buffers.
     fn spawn_deflate_server(rows: u64, refuse_compress: bool) -> u16 {
-        use std::io::Write;
         fn handle(
             mut sock: std::net::TcpStream,
             rows: u64,
@@ -2536,8 +3118,9 @@ mod compress_tests {
             sock.write_all(b"200 deflate test server\r\n")?;
             loop {
                 match read_line(&mut sock)?.as_str() {
-                    "CAPABILITIES" => sock
-                        .write_all(b"101 caps\r\nVERSION 2\r\nCOMPRESS DEFLATE\r\n.\r\n")?,
+                    "CAPABILITIES" => {
+                        sock.write_all(b"101 caps\r\nVERSION 2\r\nCOMPRESS DEFLATE\r\n.\r\n")?
+                    }
                     "COMPRESS DEFLATE" => {
                         if refuse_compress {
                             sock.write_all(b"502 compression not available\r\n")?;
@@ -2623,13 +3206,10 @@ mod compress_tests {
         w.write_all(b"GROUP mock.group\r\n").await.unwrap();
         w.flush().await.unwrap();
         let mut raw = vec![0u8; 4096];
-        let n = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            wire_end.read(&mut raw),
-        )
-        .await
-        .expect("adapter never wrote to the wire after flush")
-        .unwrap();
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), wire_end.read(&mut raw))
+            .await
+            .expect("adapter never wrote to the wire after flush")
+            .unwrap();
         assert!(n > 0, "flush wrote nothing");
         let mut dec = flate2::Decompress::new(false);
         let mut out = Vec::with_capacity(1024);
@@ -2641,8 +3221,12 @@ mod compress_tests {
         // read it back through the adapter.
         let mut enc = flate2::Compress::new(flate2::Compression::default(), false);
         let mut frame = Vec::with_capacity(1024);
-        enc.compress_vec(b"211 5 1 5 mock.group\r\n", &mut frame, flate2::FlushCompress::Sync)
-            .unwrap();
+        enc.compress_vec(
+            b"211 5 1 5 mock.group\r\n",
+            &mut frame,
+            flate2::FlushCompress::Sync,
+        )
+        .unwrap();
         wire_end.write_all(&frame).await.unwrap();
         let mut got = vec![0u8; 64];
         let n = tokio::time::timeout(std::time::Duration::from_secs(5), r.read(&mut got))
@@ -2695,10 +3279,14 @@ mod compress_tests {
             let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
             let port = l.local_addr().unwrap().port();
             std::thread::spawn(move || {
-                let Ok((mut sock, _)) = l.accept() else { return };
+                let Ok((mut sock, _)) = l.accept() else {
+                    return;
+                };
                 let _ = sock.write_all(b"200 takedown test server\r\n");
                 loop {
-                    let Ok(line) = read_line(&mut sock) else { return };
+                    let Ok(line) = read_line(&mut sock) else {
+                        return;
+                    };
                     if line.is_empty() {
                         return;
                     }
@@ -2728,7 +3316,9 @@ mod compress_tests {
         assert!(raw.is_empty(), "a miss must append no body bytes");
         // The session survives: that is the whole point, since dropping it
         // is what charged the backoff ladder.
-        conn.send_body("<gone2@example>").await.expect("reuse session");
+        conn.send_body("<gone2@example>")
+            .await
+            .expect("reuse session");
         let mut raw2 = Vec::new();
         assert!(matches!(conn.read_body_into(&mut raw2).await, Ok(false)));
         conn.quit().await;
@@ -2743,8 +3333,15 @@ mod compress_tests {
         let port = spawn_deflate_server(5, true);
         let cfg = test_server_config(port);
         let (conn, _) = Connection::connect(&cfg).await.expect("connect");
-        let err = conn.enable_compression().await.err().expect("502 must error");
-        assert!(matches!(err, super::NntpError::Unexpected { .. }), "{err:?}");
+        let err = conn
+            .enable_compression()
+            .await
+            .err()
+            .expect("502 must error");
+        assert!(
+            matches!(err, super::NntpError::Unexpected { .. }),
+            "{err:?}"
+        );
         let (conn2, _) = Connection::connect(&cfg).await.expect("plain reconnect");
         conn2.quit().await;
     }
@@ -2766,10 +3363,7 @@ mod date_tests {
             parse_nntp_date("Fri, 21 Nov 1997 09:55:06 -0600 (CST)"),
             Some(880127706)
         );
-        assert_eq!(
-            parse_nntp_date("2 May 2024 12:34:56 GMT"),
-            Some(1714653296)
-        );
+        assert_eq!(parse_nntp_date("2 May 2024 12:34:56 GMT"), Some(1714653296));
         assert_eq!(
             parse_nntp_date("Thu, 02 May 2024 12:34:56 +0000"),
             Some(1714653296)

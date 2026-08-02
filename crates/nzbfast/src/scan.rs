@@ -1,0 +1,1549 @@
+//! The index and spotnet scan commands: header scanning passes, backfill bisection, index search, spot search/get, and the release/test NZB synthesis.
+//!
+//! Split out of main.rs verbatim; behaviour unchanged.
+
+use crate::*;
+use std::path::Path;
+use tracing::info;
+
+// ---------------------------------------------------------------------------
+// index / search - the built-in indexer (M12)
+// ---------------------------------------------------------------------------
+
+/// "90d" / "26w" / "6m" / "2y" (bare number = days) → seconds; ""/0 = 0.
+pub(crate) fn parse_age(s: &str) -> Result<u64> {
+    let s = s.trim();
+    if s.is_empty() || s == "0" {
+        return Ok(0);
+    }
+    let (num, unit) = match s.chars().last().unwrap() {
+        c if c.is_ascii_digit() => (s, 'd'),
+        // Slice at a char boundary: `s.len() - 1` lands inside a multi-byte
+        // final char (e.g. "90д") and panics; strip the char's real width.
+        c => (&s[..s.len() - c.len_utf8()], c.to_ascii_lowercase()),
+    };
+    let per = match unit {
+        'd' => 86_400.0,
+        'w' => 7.0 * 86_400.0,
+        'm' => 30.44 * 86_400.0,
+        'y' => 365.25 * 86_400.0,
+        _ => anyhow::bail!("age unit must be d/w/m/y: {s:?}"),
+    };
+    let n: f64 = num
+        .parse()
+        .map_err(|_| anyhow::anyhow!("can't parse age {s:?}"))?;
+    Ok((n * per) as u64)
+}
+
+/// First article number whose Date ≥ cutoff, found by bisecting the
+/// group's number range with small OVER probes (~20 round-trips) instead
+/// of fetching years of headers only to discard them. Expired holes and
+/// dateless articles read as "old side", which errs toward scanning more.
+pub(crate) async fn bisect_cutoff(
+    conn: &mut Connection,
+    mut lo: u64,
+    mut hi: u64,
+    cutoff: i64,
+) -> u64 {
+    // An empty group legitimately reports `low == high + 1` (RFC 3977), so
+    // `hi < lo` reaches here on any group whose articles have all expired.
+    // There is nothing to bisect, and `hi - lo` below would underflow: a
+    // subtract-overflow panic in debug, ~64 OVER probes over garbage ranges
+    // in release. `hi == lo` already fell straight through the loop.
+    if hi <= lo {
+        return lo;
+    }
+    async fn date_at(conn: &mut Connection, n: u64, hi: u64) -> i64 {
+        match conn.over(n, (n + 999).min(hi)).await {
+            Ok(es) => es.iter().map(|e| e.date).find(|d| *d > 0).unwrap_or(0),
+            Err(_) => 0,
+        }
+    }
+    if date_at(conn, lo, hi).await >= cutoff {
+        return lo; // whole retention is newer than the cutoff
+    }
+    while hi - lo > 1000 {
+        let mid = lo + (hi - lo) / 2;
+        let d = date_at(conn, mid, hi).await;
+        if d == 0 || d < cutoff {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+pub(crate) async fn index_scan(
+    config: &Path,
+    group: &str,
+    backfill: u64,
+    max_age_secs: u64,
+    gates: Option<&gates::Gates>,
+    db: &Path,
+) -> Result<()> {
+    let mut ix = nzbkit::index::Index::open(db)?;
+    // CLI scans classify with the built-ins only (custom categories are
+    // daemon settings); the daemon's reclassify pass reconciles any rows
+    // a CLI scan ingested.
+    index_scan_into(
+        config,
+        group,
+        backfill,
+        max_age_secs,
+        gates,
+        Vec::new(),
+        &mut ix,
+        None,
+        0,
+        None,
+        1,
+        true,
+        true,
+    )
+    .await
+}
+
+/// Scan into an already-open Index - the daemon shares ONE connection
+/// between the scan loop and every query handler, so committed rows are
+/// visible immediately (two connections in one process don't reliably
+/// share WAL state until checkpoint).
+///
+/// OVER fetching fans out over a few concurrent connections (headers are
+/// the bottleneck at ~10-50k/s/conn; ingest keeps up on one thread). The
+/// high-water mark only ever advances over a CONTIGUOUS completed prefix,
+/// so an aborted pass resumes without holes.
+///
+/// `deep` = one-off backfill override: rescan the last n articles even
+/// below the high-water mark (ingest is idempotent - message-id keyed).
+/// `progress`, when given, is kept at the pass's fetched-header count.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn index_scan_into(
+    config: &Path,
+    group: &str,
+    backfill: u64,
+    max_age_secs: u64,
+    gates: Option<&gates::Gates>,
+    // 24D user categories: applied to the ingest gate AND installed on
+    // the index so classification at ingest matches the daemon's rules.
+    cats: Vec<nzbkit::categories::CustomCategory>,
+    ix: &mut nzbkit::index::Index,
+    deep: Option<u64>,
+    // Articles of HISTORY to add per pass below the low-water mark
+    // (auto-deepen); 0 = off.
+    deepen: u64,
+    progress: Option<Arc<AtomicU64>>,
+    // M28: how many group scans run concurrently (this one included) -
+    // the per-scan connection budget divides the account limit by this
+    // so parallel groups never exceed it.
+    share: usize,
+    // M30 turbo: nothing is downloading, so header fetch may use a
+    // deeper per-group connection fan-out (clamp 10 instead of 5).
+    turbo: bool,
+    // A8: scan the OTHER eligible backbones' tips too (their own marks),
+    // so propagation holes and single-backbone posts reach the index.
+    coverage: bool,
+) -> Result<()> {
+    if let Some(g) = gates {
+        let g = g.clone();
+        let gc = cats.clone();
+        ix.set_gate(Box::new(move |stem| g.allows_with(stem, &gc)));
+    }
+    ix.set_custom(cats);
+    let cfg = Config::load(config).with_context(|| {
+        format!(
+            "loading {} (copy config.local.json.example?)",
+            config.display()
+        )
+    })?;
+    if cfg.servers.is_empty() {
+        anyhow::bail!("no servers configured");
+    }
+    // Single-server-era marks rows (server='') were built against
+    // whichever server was first in the config - claim them before any
+    // mark is read. Idempotent, so every scan path may call it.
+    let _ = ix.adopt_legacy_marks(&cfg.servers[0].host);
+
+    // Probe every scan-eligible backbone: who carries this group, and
+    // how much of it? A probe failure only drops that server from this
+    // pass - its coverage resumes from its own marks next time.
+    struct Probe {
+        server: ServerConfig,
+        key: String,
+        conn: Connection,
+        info: nzbkit::nntp::GroupInfo,
+    }
+    let mut probes: Vec<Probe> = Vec::new();
+    for s in scan_servers(&cfg) {
+        match Connection::connect(&s).await {
+            Ok((mut c, _)) => match c.group(group).await {
+                Ok(info) => probes.push(Probe {
+                    key: nzbkit::index::Index::server_key(&s.host),
+                    server: s,
+                    conn: c,
+                    info,
+                }),
+                Err(e) => {
+                    // 411 = this server does not carry the group. Routine,
+                    // and exactly what per-group provider choice is for.
+                    info!(target: "scan", "{}: {group}: {e}", s.host);
+                    c.quit().await;
+                }
+            },
+            Err(e) => info!(target: "scan", "{}: connect: {e}", s.host),
+        }
+    }
+    if probes.is_empty() {
+        anyhow::bail!("no configured server carries {group}");
+    }
+    if probes
+        .iter()
+        .all(|p| p.server.block_bytes.is_some_and(|b| b > 0))
+    {
+        info!(
+            target: "scan",
+            "{group}: only block accounts are enabled - header \
+             traffic is spending prepaid credit"
+        );
+    }
+    // Primary = the probe with the largest article span: one number
+    // that captures both carriage and retention depth, and comparable
+    // across servers in magnitude even though the numbers themselves
+    // are per-server. Ties keep the level/config-order rank. The
+    // primary runs the full forward + deepen legs; every other
+    // backbone contributes a cheap tip leg below.
+    let pi = probes
+        .iter()
+        .enumerate()
+        .max_by_key(|(i, p)| {
+            (
+                p.info.high.saturating_sub(p.info.low),
+                std::cmp::Reverse(*i),
+            )
+        })
+        .map(|(i, _)| i)
+        .expect("probes is non-empty");
+    let chosen = probes.remove(pi);
+    // Persist the choice so the realtime tip watcher follows the same
+    // server between passes (marks are only valid against their server).
+    let _ = ix.kv_set(&format!("scan_primary:{group}"), &chosen.key);
+    let server = chosen.server;
+    let skey = chosen.key;
+    let mut conn = chosen.conn;
+    let g = chosen.info;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let mark = ix.high_water(group, &skey);
+    // Resume from the mark; first scan starts at the age cutoff when
+    // one is set (Date bisection), else backfill-count from the newest.
+    // A deep override starts n articles back regardless of the mark.
+    let mut low = if let Some(n) = deep {
+        let start = g.high.saturating_sub(n).max(g.low);
+        if mark > 0 {
+            start.min(mark.saturating_add(1))
+        } else {
+            start
+        }
+    } else if mark > 0 {
+        mark.saturating_add(1)
+    } else if max_age_secs > 0 {
+        let at = bisect_cutoff(&mut conn, g.low, g.high, now - max_age_secs as i64).await;
+        println!(
+            "{group}: age cutoff at article {at} (group spans {}..{})",
+            g.low, g.high
+        );
+        at
+    } else {
+        g.high.saturating_sub(backfill).max(g.low)
+    };
+    // Max-age still gates a deep backfill: never walk past the cutoff.
+    if deep.is_some() && max_age_secs > 0 && low < g.high {
+        let at = bisect_cutoff(&mut conn, g.low, g.high, now - max_age_secs as i64).await;
+        low = low.max(at);
+    }
+    let t0 = Instant::now();
+    let mut scanned = 0u64;
+    let mut completed = 0u32;
+    // False once a pass has been abandoned on the idle deadline: the
+    // fan-out is unhealthy, so no leg after it may claim coverage.
+    let mut healthy = true;
+    if low > g.high {
+        println!("{group}: up to date (high {})", g.high);
+    } else {
+        println!(
+            "indexing {group}: articles {low}..{} ({})",
+            g.high,
+            g.high - low + 1
+        );
+        let pass = scan_article_range(
+            &server,
+            group,
+            &skey,
+            low,
+            g.high,
+            ix,
+            now,
+            Some(mark),
+            progress.as_ref(),
+            0,
+            t0,
+            share,
+            turbo,
+        )
+        .await?;
+        scanned += pass.scanned;
+        completed += pass.completed;
+        // An abandoned forward pass needs no repair here: the high-water
+        // only ever advanced over the contiguous prefix, so the next pass
+        // resumes exactly where coverage ends. The deepen leg is skipped
+        // though - the fan-out is already unhealthy, and a second pass on
+        // the same server would just spend another idle deadline.
+        healthy = pass.complete;
+    }
+    // Seed the low-water on first sight of the group - including the
+    // up-to-date branch (a group idle at scan time otherwise never
+    // starts deepening). Worst case the seed sits above already-scanned
+    // coverage and one slice gets rescanned; ingest is idempotent.
+    if ix.low_water(group, &skey) == 0 {
+        let seed = if low > g.high { mark } else { low }.max(g.low);
+        if seed > 0 {
+            let _ = ix.set_low_water(group, &skey, seed);
+        }
+    }
+
+    // Auto-deepen: besides tracking NEW posts, each pass also extends
+    // the index a bounded slice BACKWARD through group history, so
+    // depth accumulates in the background (a fresh index otherwise only
+    // ever covers its seed backfill - ~40k articles ≈ 2 h of a busy
+    // group - plus the live trickle, and 'left overnight it barely
+    // grew'). The low-water mark moves only once the WHOLE slice lands;
+    // a failed slice is rescanned next pass (ingest is idempotent).
+    if deepen > 0 && healthy {
+        let cur = ix.low_water(group, &skey);
+        let mut floor = g.low;
+        if max_age_secs > 0 && cur > floor {
+            floor =
+                floor.max(bisect_cutoff(&mut conn, g.low, g.high, now - max_age_secs as i64).await);
+        }
+        if cur > floor {
+            let hi2 = cur - 1;
+            let lo2 = cur.saturating_sub(deepen).max(floor);
+            println!(
+                "deepening {group}: articles {lo2}..{hi2} ({})",
+                hi2 - lo2 + 1
+            );
+            let pass = scan_article_range(
+                &server,
+                group,
+                &skey,
+                lo2,
+                hi2,
+                ix,
+                now,
+                None,
+                progress.as_ref(),
+                scanned,
+                t0,
+                share,
+                turbo,
+            )
+            .await?;
+            scanned += pass.scanned;
+            completed += pass.completed;
+            // The low-water marks history as COVERED, and this leg tracks
+            // no contiguous prefix - so an abandoned pass must not move
+            // it, or the un-scanned slice is written off forever. The
+            // whole slice is simply retried next pass (ingest is
+            // idempotent).
+            if pass.complete {
+                ix.set_low_water(group, &skey, lo2)?;
+                println!(
+                    "  history now back to article {lo2} ({} older articles remain)",
+                    lo2.saturating_sub(floor)
+                );
+            } else {
+                println!(
+                    "  deepen pass abandoned - history mark left at {cur}, slice retried next pass"
+                );
+            }
+        }
+    }
+    conn.quit().await;
+
+    // A8 coverage legs: every other eligible backbone advances its OWN
+    // forward tip under its own (grp, server) marks. Message-ids are
+    // portable, so ingest merges whatever the primary's spool never
+    // received - the release that looked permanently incomplete
+    // completes the moment another backbone's headers land. Forward
+    // only, on purpose: history depth is the primary's job (it was
+    // chosen for having the most of it), and old incompletes are the
+    // targeted gap-fill pass's job - re-deepening every backbone would
+    // multiply the whole history cost for mostly-duplicate headers.
+    // A secondary's failure never fails the pass; it resumes from its
+    // own marks next time.
+    if coverage {
+        for p in probes {
+            let Probe {
+                server: s,
+                key,
+                conn: mut sconn,
+                info,
+            } = p;
+            let smark = ix.high_water(group, &key);
+            let lo = if smark > 0 {
+                smark.saturating_add(1)
+            } else if max_age_secs > 0 {
+                bisect_cutoff(&mut sconn, info.low, info.high, now - max_age_secs as i64).await
+            } else {
+                info.high.saturating_sub(backfill).max(info.low)
+            };
+            sconn.quit().await;
+            if lo > info.high {
+                continue;
+            }
+            println!(
+                "coverage {group} via {}: articles {lo}..{} ({})",
+                s.host,
+                info.high,
+                info.high - lo + 1
+            );
+            match scan_article_range(
+                &s,
+                group,
+                &key,
+                lo,
+                info.high,
+                ix,
+                now,
+                Some(smark),
+                progress.as_ref(),
+                scanned,
+                t0,
+                share,
+                turbo,
+            )
+            .await
+            {
+                Ok(pass) => {
+                    scanned += pass.scanned;
+                    completed += pass.completed;
+                }
+                Err(e) => info!(target: "scan", "{}: coverage leg for {group}: {e}", s.host),
+            }
+        }
+    } else {
+        for p in probes {
+            p.conn.quit().await;
+        }
+    }
+
+    if let Some(g) = gates {
+        let (min, max) = g.size_bounds();
+        if min > 0 || max > 0 {
+            let n = ix.prune_size(min, max)?;
+            if n > 0 {
+                println!("  pruned {n} releases outside size gates");
+            }
+        }
+    }
+    let (rel, comp) = ix.stats()?;
+    println!(
+        "done: {scanned} headers in {:.1?} - index now {rel} releases, {comp} complete (+{completed} this run)",
+        t0.elapsed()
+    );
+    Ok(())
+}
+
+/// A8 phase 2: targeted gap-fill. Pick up to `count` incomplete
+/// releases and re-OVER each one's posting window on the OTHER eligible
+/// backbones - idempotent ingest merges whatever headers the release's
+/// scanning server never received, and `complete` flips the moment the
+/// last part lands. Marks are untouched (out-of-band coverage, exactly
+/// like the one-off deep rescan); every pick is stamped afterwards so
+/// the rotation moves on whatever the outcome.
+///
+/// The oracle ledger RANKS the candidate backbones (best measured
+/// carrier of the release's family and age first) but never skips one:
+/// the ledger measures BODY availability, and headers may well still be
+/// listed where bodies are gone - and an NZB indexed here is
+/// downloadable from the whole pool, not just the server that indexed
+/// it.
+///
+/// Returns (releases tried, releases now complete).
+pub(crate) async fn index_gapfill_pass(
+    config: &Path,
+    ix: &mut nzbkit::index::Index,
+    count: u32,
+    stop: impl Fn() -> bool,
+) -> Result<(u32, u32)> {
+    // The window around first_posted to re-read. first_posted is the
+    // EARLIEST article date seen, and uploads run forward from there,
+    // so the window leans forward. Multi-day uploads outrun this; the
+    // budget below bounds the spend either way.
+    const WIN_BACK: i64 = 1800;
+    const WIN_FWD: i64 = 4 * 3600;
+    // OVER budget per (group, server) per pass - a busy group's 4.5 h
+    // window can span ~100k articles, and this is background polish
+    // that must never crowd out the scan proper.
+    const MAX_ARTICLES: u64 = 100_000;
+    const CHUNK: u64 = 20_000;
+
+    let cfg = Config::load(config)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let picks = ix.gapfill_pick(count, now)?;
+    if picks.is_empty() {
+        return Ok((0, 0));
+    }
+    let servers = scan_servers(&cfg);
+    if servers.len() < 2 {
+        // One backbone total: there is no "other" provider to ask.
+        return Ok((0, 0));
+    }
+    let snap = ix.oracle_snapshot().unwrap_or_default();
+    let mut by_grp: std::collections::BTreeMap<String, Vec<(i64, i64)>> = Default::default();
+    for (id, grp, posted) in &picks {
+        by_grp.entry(grp.clone()).or_default().push((*id, *posted));
+    }
+    let mut completed = 0u32;
+    'grps: for (grp, mut rels) in by_grp {
+        if stop() {
+            break;
+        }
+        let primary = ix
+            .kv_get(&format!("scan_primary:{grp}"))
+            .unwrap_or_default();
+        let fam = nzbkit::oracle::group_family(&grp);
+        rels.sort_by_key(|&(_, p)| p);
+        // Cluster overlapping windows: one busy evening's picks cost one
+        // bisection pair, not one per release.
+        let mut windows: Vec<(i64, i64)> = Vec::new();
+        for &(_, p) in &rels {
+            let (s, e) = (p - WIN_BACK, p + WIN_FWD);
+            match windows.last_mut() {
+                Some(w) if s <= w.1 => w.1 = w.1.max(e),
+                _ => windows.push((s, e)),
+            }
+        }
+        // The ledger bucket the ranking reads: the median pick's age.
+        let mid_posted = rels[rels.len() / 2].1;
+        let bucket = nzbkit::oracle::age_bucket(((now - mid_posted).max(0) / 86_400) as u32);
+        let mut secs: Vec<&ServerConfig> = servers
+            .iter()
+            .filter(|s| nzbkit::index::Index::server_key(&s.host) != primary)
+            .collect();
+        if secs.is_empty() {
+            continue;
+        }
+        // Best measured carrier first; a blind spot ranks between a good
+        // and a bad cell (unknown is not gone).
+        let rate = |s: &ServerConfig| {
+            snap.carry_rate(&nzbkit::oracle::backbone_of(&s.host), &fam, bucket)
+                .unwrap_or(0.75)
+        };
+        secs.sort_by(|a, b| {
+            rate(b)
+                .partial_cmp(&rate(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for s in secs {
+            if stop() {
+                break 'grps;
+            }
+            let Ok((mut conn, _)) = Connection::connect(s).await else {
+                continue;
+            };
+            let Ok(g) = conn.group(&grp).await else {
+                conn.quit().await;
+                continue;
+            };
+            let mut budget = MAX_ARTICLES;
+            for &(ws, we) in &windows {
+                if budget == 0 || stop() {
+                    break;
+                }
+                let lo = bisect_cutoff(&mut conn, g.low, g.high, ws).await;
+                let hi = bisect_cutoff(&mut conn, g.low, g.high, we)
+                    .await
+                    .min(g.high);
+                if hi <= lo {
+                    continue;
+                }
+                let mut at = lo;
+                while at <= hi && budget > 0 && !stop() {
+                    let chunk_hi = at.saturating_add(CHUNK.min(budget) - 1).min(hi);
+                    match conn.over(at, chunk_hi).await {
+                        Ok(entries) => {
+                            let _ = ix.ingest(&grp, &entries, now);
+                        }
+                        Err(_) => break,
+                    }
+                    budget = budget.saturating_sub(chunk_hi - at + 1);
+                    at = chunk_hi.saturating_add(1);
+                }
+            }
+            conn.quit().await;
+            if rels.iter().all(|&(id, _)| ix.is_complete(id)) {
+                break; // every pick in this group landed - stop spending
+            }
+        }
+        for &(id, _) in &rels {
+            if ix.is_complete(id) {
+                completed += 1;
+            }
+        }
+    }
+    // Stamp every pick - including ones a stop() cut short. Rotating an
+    // untried pick is the lesser evil against a pause storm pinning the
+    // same picks forever.
+    for (id, _, _) in &picks {
+        let _ = ix.gapfill_mark(*id, now);
+    }
+    Ok((picks.len() as u32, completed))
+}
+
+/// Connect for a header scan, opting in to RFC 8054 COMPRESS DEFLATE
+/// when the server advertises it - overview text compresses ~10:1 and a
+/// scan is pure OVER traffic. Scan path ONLY: the download path never
+/// compresses (yEnc bodies don't compress, the CPU would be waste).
+/// Provider tolerance beats the win: a refused or malformed COMPRESS
+/// exchange falls back to a fresh uncompressed connection, never a
+/// corrupted scan. NZBFAST_NNTP_COMPRESS=0 is the kill switch.
+pub(crate) async fn scan_connect(
+    server: &nzbkit::config::ServerConfig,
+) -> Result<Connection, nzbkit::nntp::NntpError> {
+    let (mut c, _) = Connection::connect(server).await?;
+    if std::env::var("NZBFAST_NNTP_COMPRESS").is_ok_and(|v| v == "0") {
+        return Ok(c);
+    }
+    match c.capabilities().await {
+        Ok(caps) if nzbkit::nntp::caps_support_compress_deflate(&caps) => {
+            match c.enable_compression().await {
+                Ok(cc) => {
+                    // Say so ONCE per host: raw deflate is invisible on
+                    // the wire, and if a server's compression is slow or
+                    // flaky, a user's log must show what was negotiated
+                    // (NZBFAST_NNTP_COMPRESS=0 is the off switch).
+                    static ANNOUNCED: std::sync::Mutex<Vec<String>> =
+                        std::sync::Mutex::new(Vec::new());
+                    let mut seen = ANNOUNCED.lock_ok();
+                    if !seen.iter().any(|h| h == &server.host) {
+                        seen.push(server.host.clone());
+                        info!(target: "scan", "COMPRESS DEFLATE active on {}", server.host);
+                    }
+                    Ok(cc)
+                }
+                // Advertised but the exchange failed - retry plain once,
+                // and say so: a broken COMPRESS implementation costs a
+                // failed handshake per scan connection to this server.
+                Err(e) => {
+                    info!(
+                        target: "scan",
+                        "{} advertised COMPRESS DEFLATE but the exchange \
+                         failed ({e}) - scanning uncompressed",
+                        server.host
+                    );
+                    Ok(Connection::connect(server).await?.0)
+                }
+            }
+        }
+        // No COMPRESS on offer, or a pre-3977 server rejecting
+        // CAPABILITIES outright (its status line was consumed, the
+        // connection is still clean) - carry on uncompressed.
+        Ok(_) | Err(nzbkit::nntp::NntpError::Unexpected { .. }) => Ok(c),
+        Err(e) => Err(e),
+    }
+}
+
+/// Outcome of one OVER fan-out pass.
+pub(crate) struct ScanPass {
+    pub(crate) scanned: u64,
+    pub(crate) completed: u32,
+    /// False when the pass was ABANDONED on the idle deadline: some chunk
+    /// never came back, so coverage of `lo..=hi` is NOT complete. The
+    /// caller must not claim the range - in particular the deepen leg's
+    /// `set_low_water` has to be skipped, or the missing slice is written
+    /// off as scanned and never revisited.
+    pub(crate) complete: bool,
+}
+
+/// How long the collector waits for ANY worker to deliver a chunk before
+/// abandoning the pass. Generous: it is idle time across the whole
+/// fan-out, not per chunk.
+///
+/// The workers used to be detached tasks each holding a clone of the
+/// result sender, and the collector was a bare `while let Some(..) =
+/// rx.recv()`. One worker wedged somewhere the NNTP idle deadline does not
+/// reach never dropped its sender, so `recv()` never returned None,
+/// `index_scan_into` never returned, and the caller's scan JoinSet blocked
+/// forever - no group indexed again until restart. Two changes close that:
+/// the workers now live in a JoinSet that is aborted when this function
+/// returns, and the collector is bounded by this deadline.
+pub(crate) fn scan_idle_timeout() -> std::time::Duration {
+    let secs = std::env::var("NZBFAST_SCAN_IDLE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(300);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Fan OVER chunks for articles lo..=hi over a few connections and
+/// ingest them. `forward_mark` = Some(mark): the group's high-water
+/// advances over the contiguous completed prefix (an aborted pass
+/// resumes without holes). None = a backward deepen slice - no marks
+/// are touched here; the caller moves the low-water once the whole
+/// slice has landed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn scan_article_range(
+    server: &nzbkit::config::ServerConfig,
+    group: &str,
+    // Marks identity of `server` - the high-water this pass advances
+    // belongs to (group, mark_server).
+    mark_server: &str,
+    low: u64,
+    g_high: u64,
+    ix: &mut nzbkit::index::Index,
+    now: i64,
+    forward_mark: Option<u64>,
+    progress: Option<&Arc<AtomicU64>>,
+    progress_base: u64,
+    t0: Instant,
+    // M28: concurrent scans sharing the account's connection budget.
+    share: usize,
+    turbo: bool,
+) -> Result<ScanPass> {
+    // A few connections multiply header throughput; OVER is cheap for
+    // the server, but stay well inside the account's connection budget.
+    let nconn =
+        (server.connections as u64 / share.max(1) as u64).clamp(1, if turbo { 10 } else { 5 });
+    // Chunk size scales INVERSELY with the fan-out: per-request server
+    // latency (not RTT - measured stalls up to ~1 s before a response
+    // starts streaming) dominates small requests, so a lone connection
+    // wants big streaming ranges (100k articles ≈ 82-95k hdr/s vs
+    // 31-54k/s at 10k measured per-request). A wide fan-out keeps the
+    // old 10k chunks: there the whole pass finishes in seconds and
+    // work-stealing granularity wins - the 23 Jul A/B measured 20k
+    // chunks at 10 conns ~14% SLOWER by median (a straggling last
+    // chunk sets the tail). Budget also bounds buffered headers and
+    // keeps the contiguous-prefix resume mark reasonably fine-grained.
+    let chunk: u64 = (100_000 / nconn).clamp(10_000, 100_000);
+    let nconn = nconn.min(g_high.saturating_sub(low) / chunk + 1) as usize;
+    let next = Arc::new(AtomicU64::new(low));
+    // Bounded channel: workers stall rather than outrun SQLite ingest.
+    // Bound counts CHUNKS, so it shrinks as chunks grow - queued headers
+    // stay ~200k regardless of the chunk/fan-out split.
+    let bound = ((100_000 / chunk) as usize).clamp(2, 8);
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<Result<(u64, u64, Vec<nzbkit::nntp::OverEntry>)>>(bound);
+    // A JoinSet, not detached `tokio::spawn`: dropping it on the way out
+    // ABORTS every worker, so an abandoned pass takes its wedged
+    // connection with it instead of leaving it running for the life of
+    // the process (see `scan_idle_timeout`).
+    let mut workers = tokio::task::JoinSet::new();
+    for _ in 0..nconn {
+        let server = server.clone();
+        let group_s = group.to_string();
+        let next = next.clone();
+        let tx = tx.clone();
+        let mut conn: Option<Connection> = None;
+        // `tx` is moved into the task, so it drops on every exit path -
+        // normal return, early `break`, and panic-unwind alike (tokio
+        // drops a panicked task's future). What it does NOT cover is a
+        // worker that simply never returns; that is the collector's
+        // idle deadline below.
+        workers.spawn(async move {
+            loop {
+                let lo = next.fetch_add(chunk, Ordering::Relaxed);
+                if lo > g_high {
+                    break;
+                }
+                // Saturating: `g_high` is server-supplied (validated below
+                // u64::MAX in `group()`), but keep the chunk-high computation
+                // itself wrap-proof so a near-ceiling `lo` can never produce a
+                // reversed `hi < lo` range (which would underflow the
+                // `hi - lo + 1` accounting below and revisit ranges forever).
+                let hi = lo.saturating_add(chunk - 1).min(g_high);
+                // One reconnect-and-retry per chunk before giving up.
+                let mut retried = false;
+                let entries = loop {
+                    if conn.is_none() {
+                        // E2: compressed when the server offers it - see
+                        // scan_connect for the fallback contract. A chunk
+                        // RETRY reconnects PLAIN: if the first attempt
+                        // died mid-stream (e.g. a server whose deflate
+                        // implementation is broken past the handshake),
+                        // trying compression again would just fail the
+                        // chunk for good.
+                        let fresh = if retried {
+                            Connection::connect(&server).await.map(|(c, _)| c)
+                        } else {
+                            scan_connect(&server).await
+                        };
+                        match fresh {
+                            Ok(mut c) => match c.group(&group_s).await {
+                                Ok(_) => conn = Some(c),
+                                Err(e) if retried => break Err(anyhow::Error::from(e)),
+                                Err(_) => {
+                                    retried = true;
+                                    continue;
+                                }
+                            },
+                            Err(e) if retried => break Err(anyhow::Error::from(e)),
+                            Err(_) => {
+                                retried = true;
+                                continue;
+                            }
+                        }
+                    }
+                    match conn.as_mut().unwrap().over(lo, hi).await {
+                        Ok(es) => break Ok(es),
+                        Err(e) => {
+                            conn = None;
+                            if retried {
+                                break Err(anyhow::Error::from(e));
+                            }
+                            retried = true;
+                        }
+                    }
+                };
+                let failed = entries.is_err();
+                if tx.send(entries.map(|es| (lo, hi, es))).await.is_err() || failed {
+                    break;
+                }
+            }
+            if let Some(c) = conn {
+                c.quit().await;
+            }
+        });
+    }
+    drop(tx);
+
+    let pass = collect_scan_pass(
+        &mut rx,
+        ix,
+        group,
+        mark_server,
+        low,
+        g_high,
+        now,
+        forward_mark,
+        progress,
+        progress_base,
+        chunk,
+        t0,
+        scan_idle_timeout(),
+    )
+    .await;
+    // Dropping `workers` here aborts anything still running - including
+    // the worker that wedged - which also releases its connection.
+    drop(workers);
+    pass
+}
+
+/// The collect half of [`scan_article_range`], split out so the abandon
+/// path is reachable from a test without an NNTP server.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn collect_scan_pass(
+    rx: &mut tokio::sync::mpsc::Receiver<Result<(u64, u64, Vec<nzbkit::nntp::OverEntry>)>>,
+    ix: &mut nzbkit::index::Index,
+    group: &str,
+    mark_server: &str,
+    low: u64,
+    g_high: u64,
+    now: i64,
+    forward_mark: Option<u64>,
+    progress: Option<&Arc<AtomicU64>>,
+    progress_base: u64,
+    chunk: u64,
+    t0: Instant,
+    // How long to wait for ANY worker before abandoning (a parameter so
+    // the abandon path is testable without a 5-minute test).
+    idle: std::time::Duration,
+) -> Result<ScanPass> {
+    let mut scanned = 0u64;
+    let mut completed = 0u32;
+    // Chunks land out of order; the mark advances over the contiguous
+    // prefix only (never regressing below a pre-existing mark).
+    let mut next_expected = low;
+    let mut pending: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
+    let mut failure: Option<anyhow::Error> = None;
+    let mut complete = true;
+    loop {
+        let msg = match tokio::time::timeout(idle, rx.recv()).await {
+            Ok(Some(m)) => m,
+            // Every worker finished and dropped its sender: the pass
+            // covered the range.
+            Ok(None) => break,
+            Err(_) => {
+                // Nothing from ANY worker for the whole deadline. Abandon
+                // the pass rather than block the scan loop forever. What
+                // has been ingested stays (ingest is idempotent and the
+                // marks below only ever advanced over the CONTIGUOUS
+                // prefix), but the range is not claimed.
+                complete = false;
+                let dropped = g_high
+                    .saturating_sub(low)
+                    .saturating_add(1)
+                    .saturating_sub(scanned);
+                info!(
+                    target: "scan",
+                    "{group}: no chunk for {}s - abandoning this pass \
+                     ({scanned} headers in, ~{dropped} articles of {low}..{g_high} not scanned; \
+                     they are retried next pass)",
+                    idle.as_secs()
+                );
+                rx.close();
+                break;
+            }
+        };
+        match msg {
+            Ok((lo, hi, entries)) => {
+                completed += ix.ingest(group, &entries, now)?;
+                scanned += hi - lo + 1;
+                if let Some(p) = progress {
+                    p.store(progress_base + scanned, Ordering::Relaxed);
+                }
+                pending.insert(lo, hi);
+                while pending
+                    .first_key_value()
+                    .is_some_and(|(&l, _)| l == next_expected)
+                {
+                    let (_, hi) = pending.pop_first().unwrap();
+                    next_expected = hi.saturating_add(1);
+                    if let Some(mark) = forward_mark
+                        && hi > mark
+                    {
+                        ix.set_high_water(group, mark_server, hi)?;
+                    }
+                }
+                if scanned % 100_000 < chunk {
+                    let (rel, comp) = ix.stats()?;
+                    println!(
+                        "  … {scanned} headers, {rel} releases ({comp} complete), {:.0}/s",
+                        scanned as f64 / t0.elapsed().as_secs_f64()
+                    );
+                }
+            }
+            Err(e) => {
+                // Stop the fan-out; the contiguous mark makes the next
+                // pass resume exactly where coverage ends.
+                failure = Some(e);
+                rx.close();
+            }
+        }
+    }
+    if let Some(e) = failure {
+        return Err(e);
+    }
+    Ok(ScanPass {
+        scanned,
+        completed,
+        complete,
+    })
+}
+
+/// Truncate to at most `n` BYTES on a char boundary - `&s[..60]` panics
+/// mid-char on non-ASCII release names (Usenet-controlled text).
+pub(crate) fn trunc(s: &str, n: usize) -> &str {
+    if s.len() <= n {
+        return s;
+    }
+    let mut i = n;
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    &s[..i]
+}
+
+pub(crate) fn search_index(
+    query: &str,
+    db: &Path,
+    nzb_out: Option<&std::path::Path>,
+) -> Result<()> {
+    let ix = nzbkit::index::Index::open(db)?;
+    let hits = ix.search(query, 30)?;
+    if hits.is_empty() {
+        println!("no matches for '{query}'");
+        return Ok(());
+    }
+    for r in &hits {
+        println!(
+            "{:>6}  {:<60} {:>9.2} GB  {:>3} files  {}{}",
+            r.id,
+            trunc(&r.stem, 60),
+            r.total_bytes as f64 / 1e9,
+            r.files,
+            if r.complete { "complete" } else { "partial" },
+            if r.has_par2 { " +par2" } else { "" },
+        );
+    }
+    if let Some(path) = nzb_out {
+        let xml = ix.make_nzb(hits[0].id)?;
+        std::fs::write(path, xml)?;
+        println!("wrote {} ({})", path.display(), hits[0].stem);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// spots / spot-search / spot-get - Spotnet ingestion (M14j)
+// ---------------------------------------------------------------------------
+
+pub(crate) async fn spots_scan(config: &Path, group: &str, backfill: u64, db: &Path) -> Result<()> {
+    let server = load_server(config)?;
+    let mut ix = nzbkit::index::Index::open(db)?;
+    let (mut conn, _) = Connection::connect(&server).await?;
+    let t0 = Instant::now();
+    let _ = ix.adopt_legacy_marks(&server.host);
+    let sum = nzbkit::spot::scan_spots(&mut conn, &mut ix, group, &server.host, backfill).await?;
+    conn.quit().await;
+    let total = ix.spot_stats()?;
+    let records = sum.valid + sum.unverified;
+    println!(
+        "scanned {} headers in {:.1?}: {} spot records, {} verified{} ({} new), {} unverified, \
+         {} not spots{}{} - index now {total} spots",
+        sum.scanned,
+        t0.elapsed(),
+        records,
+        sum.valid,
+        if records > 0 {
+            format!(" ({:.1}%)", 100.0 * sum.valid as f64 / records as f64)
+        } else {
+            String::new()
+        },
+        sum.new,
+        sum.unverified,
+        sum.invalid - sum.unverified,
+        if sum.moderation > 0 {
+            format!(", {} moderation records", sum.moderation)
+        } else {
+            String::new()
+        },
+        if sum.hashcash_warn > 0 {
+            format!(", {} hashcash warnings", sum.hashcash_warn)
+        } else {
+            String::new()
+        },
+    );
+    Ok(())
+}
+
+/// One daemon spot pass over one group, into an already-open index.
+///
+/// Spots ride a single server: the feed is one decentralized group that
+/// every backbone carries the same way, so a second server would re-scan
+/// the same 200-odd records a day for nothing. Marks are per-server (A8),
+/// so switching servers later just costs one backfill.
+pub(crate) async fn spot_scan_pass(
+    config: &Path,
+    ix: &mut nzbkit::index::Index,
+    group: &str,
+    backfill: u64,
+) -> Result<nzbkit::spot::SpotScanSummary> {
+    let cfg = Config::load(config)?;
+    let server = scan_servers(&cfg)
+        .into_iter()
+        .next()
+        .context("no enabled server to scan spots from")?;
+    let (mut conn, _) = Connection::connect(&server).await?;
+    let _ = ix.adopt_legacy_marks(&server.host);
+    let sum = nzbkit::spot::scan_spots(&mut conn, ix, group, &server.host, backfill).await;
+    conn.quit().await;
+    Ok(sum?)
+}
+
+pub(crate) fn spot_search(query: &str, db: &Path) -> Result<()> {
+    let ix = nzbkit::index::Index::open(db)?;
+    let hits = ix.spot_search(query, 30)?;
+    if hits.is_empty() {
+        println!("no spots match '{query}'");
+        return Ok(());
+    }
+    for s in &hits {
+        println!(
+            "{:<60} {:>9.2} GB  cat {}{}  {}  {}{}",
+            trunc(&s.title, 60),
+            s.size as f64 / 1e9,
+            s.category,
+            if s.subcats.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", s.subcats)
+            },
+            s.spotter_id,
+            s.msgid,
+            if s.hashcash_ok { "" } else { "  (hashcash!)" },
+        );
+    }
+    Ok(())
+}
+
+pub(crate) async fn spot_get(config: &Path, msgid: &str, nzb: &Path, db: &Path) -> Result<()> {
+    let server = load_server(config)?;
+    let (mut conn, _) = Connection::connect(&server).await?;
+    let (sx, bytes) = nzbkit::spot::fetch_spot_nzb(&mut conn, msgid).await?;
+    conn.quit().await;
+    std::fs::write(nzb, &bytes)?;
+    // Cache the segment list on the indexed spot, if we have it.
+    let mid = if msgid.starts_with('<') {
+        msgid.to_string()
+    } else {
+        format!("<{msgid}>")
+    };
+    if let Ok(ix) = nzbkit::index::Index::open(db) {
+        let _ = ix.set_spot_nzb(&mid, &sx.nzb_segments);
+    }
+    println!(
+        "wrote {} ({} bytes, {} payload segments) - {}",
+        nzb.display(),
+        bytes.len(),
+        sx.nzb_segments.len(),
+        if sx.title.is_empty() {
+            msgid
+        } else {
+            &sx.title
+        },
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// make-release-nzb - find one complete release (data + par2) via OVER
+// ---------------------------------------------------------------------------
+
+/// Strip release-file suffixes down to the shared stem:
+/// `x.part01.rar`/`x.r00`/`x.vol000+01.par2`/`x.par2`/`x.rar` → `x`.
+pub(crate) fn release_stem(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    let mut end = lower.len();
+    let cut = |s: &str, end: usize, suffix_ok: &dyn Fn(&str) -> Option<usize>| -> usize {
+        suffix_ok(&s[..end]).unwrap_or(end)
+    };
+    // .par2 first (may wrap .volNN+MM)
+    end = cut(&lower, end, &|s| s.strip_suffix(".par2").map(|r| r.len()));
+    end = cut(&lower, end, &|s| {
+        // .volNNN+MM / range-style .volNNN-MMM
+        let vol = s.rfind(".vol")?;
+        let tail = &s[vol + 4..];
+        let (a, b) = tail.split_once(['+', '-'])?;
+        (!a.is_empty()
+            && a.bytes().all(|c| c.is_ascii_digit())
+            && !b.is_empty()
+            && b.bytes().all(|c| c.is_ascii_digit()))
+        .then_some(vol)
+    });
+    end = cut(&lower, end, &|s| s.strip_suffix(".rar").map(|r| r.len()));
+    end = cut(&lower, end, &|s| {
+        // .partNNN
+        let p = s.rfind(".part")?;
+        let tail = &s[p + 5..];
+        (!tail.is_empty() && tail.bytes().all(|c| c.is_ascii_digit())).then_some(p)
+    });
+    end = cut(&lower, end, &|s| {
+        // .rNN / .sNN (split archives)
+        let p = s.rfind('.')?;
+        let tail = &s[p + 1..];
+        (tail.len() >= 2
+            && (tail.starts_with('r') || tail.starts_with('s'))
+            && tail[1..].bytes().all(|c| c.is_ascii_digit()))
+        .then_some(p)
+    });
+    name[..end].to_string()
+}
+
+pub(crate) async fn make_release_nzb(
+    config: &Path,
+    group: &str,
+    min_gb: f64,
+    max_gb: f64,
+    out: &Path,
+) -> Result<()> {
+    use std::collections::BTreeMap;
+    use std::collections::HashMap;
+
+    let server = load_server(config)?;
+    let (mut conn, _) = Connection::connect(&server).await?;
+    let g = conn.group(group).await?;
+
+    // (poster, stem) → filename → (total parts, part → (msgid, bytes))
+    type Parts = BTreeMap<u32, (String, u64)>;
+    type Release = HashMap<String, (u32, Parts)>;
+    let mut releases: HashMap<(String, String), Release> = HashMap::new();
+
+    let mut high = g.high;
+    let mut scanned = 0u64;
+    let mut winner: Option<((String, String), Release)> = None;
+    while winner.is_none() && high > g.low && scanned < 2_000_000 {
+        let from = high.saturating_sub(20_000).max(g.low);
+        for e in conn.over(from, high).await? {
+            // Files without a (n/m) counter (nfo/sfv posts) are single-part.
+            let (base, part, total) =
+                split_subject(&e.subject).unwrap_or_else(|| (e.subject.clone(), 1, 1));
+            if e.message_id.is_empty() || part == 0 || total == 0 {
+                continue;
+            }
+            // Quoted filename from the counter-stripped subject.
+            let Some(fname) = quoted_name(&base) else {
+                continue;
+            };
+            let stem = release_stem(&fname);
+            if stem.is_empty() {
+                continue;
+            }
+            let rel = releases.entry((e.from.clone(), stem)).or_default();
+            let entry = rel.entry(fname).or_insert_with(|| (total, BTreeMap::new()));
+            entry.1.insert(part, (e.message_id, e.bytes));
+        }
+        scanned += high - from;
+
+        // A release qualifies when: every seen file is complete, it has a
+        // par2 main + at least one volume + at least one data file, and the
+        // total size is in range. (Volumes prove the par2 set is fetchable;
+        // the main index is what activates in-stream verification.)
+        for (key, rel) in &releases {
+            let all_complete = rel.values().all(|(t, p)| p.len() as u32 == *t);
+            if !all_complete || rel.len() < 3 {
+                continue;
+            }
+            let has_main = rel.keys().any(|n| {
+                let l = n.to_ascii_lowercase();
+                l.ends_with(".par2") && vol_count_from_name(n).is_none()
+            });
+            let has_vol = rel.keys().any(|n| vol_count_from_name(n).is_some());
+            let has_data = rel
+                .keys()
+                .any(|n| !n.to_ascii_lowercase().ends_with(".par2"));
+            let size: u64 = rel
+                .values()
+                .flat_map(|(_, p)| p.values())
+                .map(|v| v.1)
+                .sum();
+            let gb = size as f64 / 1e9;
+            if has_main && has_vol && has_data && gb >= min_gb && gb <= max_gb {
+                println!(
+                    "release: {} ({} files, {:.2} GB) by {}",
+                    key.1,
+                    rel.len(),
+                    gb,
+                    key.0
+                );
+                winner = Some((key.clone(), rel.clone()));
+                break;
+            }
+        }
+        if from == g.low {
+            break;
+        }
+        high = from - 1;
+    }
+    conn.quit().await;
+
+    let Some(((poster, _stem), rel)) = winner else {
+        anyhow::bail!("no complete release with par2 found in {scanned} headers");
+    };
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n",
+    );
+    let mut names: Vec<&String> = rel.keys().collect();
+    names.sort();
+    for fname in names {
+        let (total, parts) = &rel[fname];
+        let size: u64 = parts.values().map(|v| v.1).sum();
+        println!("  {fname}  ({total} parts, {:.1} MB)", size as f64 / 1e6);
+        xml.push_str(&format!(
+            "  <file poster=\"{}\" date=\"0\" subject=\"{}\">\n    <groups><group>{}</group></groups>\n    <segments>\n",
+            xml_escape(&poster),
+            xml_escape(&format!("\"{fname}\" yEnc (1/{total})")),
+            group,
+        ));
+        for (num, (msgid, bytes)) in parts {
+            xml.push_str(&format!(
+                "      <segment bytes=\"{bytes}\" number=\"{num}\">{}</segment>\n",
+                xml_escape(msgid.trim_matches(['<', '>']))
+            ));
+        }
+        xml.push_str("    </segments>\n  </file>\n");
+    }
+    xml.push_str("</nzb>\n");
+    std::fs::write(out, xml)?;
+    println!("wrote {}", out.display());
+    Ok(())
+}
+
+/// First quoted substring (unquoted-convention fallback included) -
+/// shared with the indexer so both paths accept the same subjects.
+pub(crate) fn quoted_name(s: &str) -> Option<String> {
+    nzbkit::index::quoted_name(s)
+}
+
+// ---------------------------------------------------------------------------
+// make-test-nzb - assemble a real NZB from complete posts in a group
+// ---------------------------------------------------------------------------
+
+pub(crate) async fn make_test_nzb(
+    config: &Path,
+    group: &str,
+    want_files: usize,
+    max_file_mb: u64,
+    out: &Path,
+) -> Result<()> {
+    use std::collections::BTreeMap;
+    use std::collections::HashMap;
+
+    let server = load_server(config)?;
+    let (mut conn, _) = Connection::connect(&server).await?;
+    let g = conn.group(group).await?;
+
+    // (poster, base-subject) → (total parts, map part → (msgid, bytes))
+    type Parts = BTreeMap<u32, (String, u64)>;
+    let mut groups: HashMap<(String, String), (u32, Parts)> = HashMap::new();
+    let mut complete: Vec<((String, String), (u32, Parts))> = Vec::new();
+
+    let mut high = g.high;
+    let mut scanned = 0u64;
+    while complete.len() < want_files && high > g.low && scanned < 300_000 {
+        let from = high.saturating_sub(8_000).max(g.low);
+        for e in conn.over(from, high).await? {
+            let Some((base, part, total)) = split_subject(&e.subject) else {
+                continue;
+            };
+            if e.message_id.is_empty() || part == 0 || total < 2 {
+                continue;
+            }
+            let entry = groups
+                .entry((e.from.clone(), base))
+                .or_insert_with(|| (total, BTreeMap::new()));
+            entry.1.insert(part, (e.message_id, e.bytes));
+            if entry.1.len() as u32 == entry.0 {
+                let key = (e.from.clone(), split_subject(&e.subject).unwrap().0);
+                if let Some(done) = groups.remove(&key) {
+                    let size: u64 = done.1.values().map(|v| v.1).sum();
+                    if size <= max_file_mb * 1_000_000 {
+                        complete.push((key, done));
+                    }
+                }
+            }
+        }
+        scanned += high - from;
+        if from == g.low {
+            break;
+        }
+        high = from - 1;
+    }
+    conn.quit().await;
+    anyhow::ensure!(
+        complete.len() >= want_files,
+        "only {} complete files found (wanted {want_files})",
+        complete.len()
+    );
+    complete.truncate(want_files);
+
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n",
+    );
+    for ((poster, base), (total, parts)) in &complete {
+        let size: u64 = parts.values().map(|v| v.1).sum();
+        println!("  {base}  ({total} parts, {:.1} MB)", size as f64 / 1e6);
+        xml.push_str(&format!(
+            "  <file poster=\"{}\" date=\"0\" subject=\"{}\">\n    <groups><group>{}</group></groups>\n    <segments>\n",
+            xml_escape(poster),
+            xml_escape(&format!("{base} (1/{total})")),
+            group,
+        ));
+        for (num, (msgid, bytes)) in parts {
+            xml.push_str(&format!(
+                "      <segment bytes=\"{bytes}\" number=\"{num}\">{}</segment>\n",
+                xml_escape(msgid.trim_matches(['<', '>']))
+            ));
+        }
+        xml.push_str("    </segments>\n  </file>\n");
+    }
+    xml.push_str("</nzb>\n");
+    std::fs::write(out, xml)?;
+    println!("wrote {} ({} files)", out.display(), complete.len());
+    Ok(())
+}
+
+/// Split `… "name" yEnc (n/m)` → (base subject without the counter, n, m).
+/// Shared with the indexer - rightmost parsing counter, `[n/m]`/`of` forms.
+pub(crate) fn split_subject(subject: &str) -> Option<(String, u32, u32)> {
+    nzbkit::index::split_subject(subject)
+}
+
+pub(crate) fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod scan_pass_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn tmp_index(tag: &str) -> (PathBuf, nzbkit::index::Index) {
+        let dir =
+            std::env::temp_dir().join(format!("nzbfast-scanpass-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ix = nzbkit::index::Index::open(&dir.join("index.db")).unwrap();
+        (dir, ix)
+    }
+
+    /// Tear the fixture down, closing the index BEFORE removing its
+    /// directory.
+    ///
+    /// The drop is load-bearing, not tidiness. `Index` holds an open SQLite
+    /// connection to `dir/index.db`, and SQLite opens its files without
+    /// FILE_SHARE_DELETE, so Windows refuses to remove the directory
+    /// underneath it: "The process cannot access the file because it is
+    /// being used by another process" (os error 32). Unix unlinks an open
+    /// file quite happily, which is why leaving the connection alive was
+    /// invisible here for as long as the suite only ever ran on Linux and
+    /// macOS. Every product assertion in these tests passed first - the
+    /// teardown was the only thing Windows objected to.
+    fn teardown(dir: PathBuf, ix: nzbkit::index::Index) {
+        drop(ix);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// BUG (HIGH): one wedged scan worker froze ALL indexing for the
+    /// process lifetime. Each worker held a clone of the result sender and
+    /// the collector was a bare `while let Some(..) = rx.recv().await`, so
+    /// a worker that never reached its exit path never dropped its sender,
+    /// `recv()` never returned None, `scan_article_range` and
+    /// `index_scan_into` never returned, and the caller's scan JoinSet
+    /// blocked forever - no further pass for ANY group until restart.
+    ///
+    /// The collector is now bounded: a stall abandons the pass.
+    #[tokio::test]
+    async fn a_wedged_worker_cannot_freeze_the_scan_collector() {
+        let (dir, mut ix) = tmp_index("wedged");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        // One chunk lands, then a worker wedges holding its sender.
+        let wedged = tx.clone();
+        tx.send(Ok((100, 199, Vec::new()))).await.unwrap();
+        drop(tx);
+
+        let pass = tokio::time::timeout(
+            Duration::from_secs(10),
+            collect_scan_pass(
+                &mut rx,
+                &mut ix,
+                "alt.test",
+                "srv1",
+                100,
+                999,
+                0,
+                Some(0),
+                None,
+                0,
+                100,
+                Instant::now(),
+                Duration::from_millis(50),
+            ),
+        )
+        .await
+        .expect("the collector must not block on a sender that never drops")
+        .unwrap();
+
+        assert!(!pass.complete, "an abandoned pass must not report complete");
+        assert_eq!(pass.scanned, 100);
+        // CRITICAL: the contiguous prefix stops where coverage really
+        // ends. Advancing it to g_high would write the missing 200..999
+        // off as scanned forever.
+        assert_eq!(ix.high_water("alt.test", "srv1"), 199);
+        drop(wedged);
+        teardown(dir, ix);
+    }
+
+    /// The control: a healthy pass must still report complete, so the
+    /// caller's `set_low_water` (the deepen leg) keeps running.
+    #[tokio::test]
+    async fn a_healthy_pass_reports_complete_and_advances_the_prefix() {
+        let (dir, mut ix) = tmp_index("healthy");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        // Out-of-order arrival: the prefix must still reach 299.
+        tx.send(Ok((200, 299, Vec::new()))).await.unwrap();
+        tx.send(Ok((100, 199, Vec::new()))).await.unwrap();
+        drop(tx);
+
+        let pass = tokio::time::timeout(
+            Duration::from_secs(10),
+            collect_scan_pass(
+                &mut rx,
+                &mut ix,
+                "alt.test",
+                "srv1",
+                100,
+                299,
+                0,
+                Some(0),
+                None,
+                0,
+                100,
+                Instant::now(),
+                Duration::from_millis(50),
+            ),
+        )
+        .await
+        .expect("a healthy pass must not hit the idle deadline")
+        .unwrap();
+
+        assert!(pass.complete);
+        assert_eq!(pass.scanned, 200);
+        assert_eq!(ix.high_water("alt.test", "srv1"), 299);
+        teardown(dir, ix);
+    }
+
+    /// A HOLE in the middle must not let the mark jump the gap, abandoned
+    /// or not: the prefix stops at the hole and the pass is incomplete.
+    #[tokio::test]
+    async fn an_abandoned_pass_never_marks_over_a_hole() {
+        let (dir, mut ix) = tmp_index("hole");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let wedged = tx.clone();
+        tx.send(Ok((100, 199, Vec::new()))).await.unwrap();
+        // 200..299 never arrives; 300..399 does.
+        tx.send(Ok((300, 399, Vec::new()))).await.unwrap();
+        drop(tx);
+
+        let pass = tokio::time::timeout(
+            Duration::from_secs(10),
+            collect_scan_pass(
+                &mut rx,
+                &mut ix,
+                "alt.test",
+                "srv1",
+                100,
+                399,
+                0,
+                Some(0),
+                None,
+                0,
+                100,
+                Instant::now(),
+                Duration::from_millis(50),
+            ),
+        )
+        .await
+        .expect("the collector must not block")
+        .unwrap();
+
+        assert!(!pass.complete);
+        assert_eq!(
+            ix.high_water("alt.test", "srv1"),
+            199,
+            "the mark must stop at the hole, not follow the last chunk in"
+        );
+        drop(wedged);
+        teardown(dir, ix);
+    }
+}

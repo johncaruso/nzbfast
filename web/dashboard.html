@@ -495,6 +495,11 @@ select.ctl:focus{outline:1px solid var(--acc)}
 .fsentry:hover{background:var(--surface-2)}
 .fsentry.file{color:var(--dim)}
 .fsfoot{display:flex;align-items:center;gap:10px;padding:12px 16px;border-top:1px solid var(--line)}
+/* This footer carries two guide pills, and locales with long words for
+   "guide" (bg/ru/cs) overflow a phone-width modal, which pushed Close off
+   the screen entirely. Only this footer wraps; the other modals keep the
+   single-row layout. */
+#cumodal .fsfoot{flex-wrap:wrap}
 #fswrite.ok{color:var(--ok)}#fswrite.warn{color:var(--warn)}
 @media(max-width:560px){.fsbody{grid-template-columns:1fr}.fsroots{display:none}}
 /* Container update recipe (fs modal skeleton, scrolling prose body) */
@@ -818,6 +823,10 @@ input.txt.sm{max-width:120px}
 .wlrow label{display:flex;gap:5px;align-items:center;font-size:12px;white-space:nowrap}
 .qbadge{display:inline-block;margin-inline-start:8px;padding:1px 7px;border-radius:999px;background:var(--surface-2);border:1px solid var(--line);font-size:11px;color:var(--dim);white-space:nowrap;vertical-align:1px}
 .qbadge.shape{max-width:min(100%,32em);overflow:hidden;text-overflow:ellipsis}
+/* The media chip. Quiet by default - it is a fact, not a status - and
+   amber only when the bytes contradict the name. */
+.qbadge.media{font-variant-numeric:tabular-nums}
+.qbadge.media.bad{color:var(--warn);border-color:var(--warn);background:color-mix(in srgb,var(--warn) 12%,transparent)}
 #wlCal h4{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 6px}
 .calrow{display:flex;gap:10px;align-items:baseline;font-size:12.5px;padding:3px 0;border-bottom:1px dashed var(--line)}
 .calrow:last-child{border-bottom:none}
@@ -1082,6 +1091,10 @@ input.txt.sm{max-width:120px}
     title="Each watched item asks your indexer accounts about twice a day, and only for things it has not found here. Your daily limits still apply.">
     <input type="checkbox" id="s_watchlist_external" onchange="setCfg('watchlist_external',this.checked?1:0)">
     <span data-i18n="watch.ext">Also search my indexer accounts for wanted items</span></label>
+  <label class="mtog" data-i18n-title="watch.instant.title"
+    title="Checks the moment a matching post appears in a watched newsgroup, instead of on the regular timer, so a new episode is grabbed seconds after it goes up. Everything else is unchanged: quality floors, upgrades, season packs and duplicate handling all still apply. Needs the built-in indexer.">
+    <input type="checkbox" id="s_watchlist_instant" onchange="setCfg('watchlist_instant',this.checked?1:0)">
+    <span data-i18n="watch.instant">Grab as soon as a match is posted</span></label>
   <div class="cardgrip" data-card="watchCard" tabindex="0" role="separator" aria-orientation="horizontal"></div>
 </div>
 
@@ -1279,9 +1292,9 @@ input.txt.sm{max-width:120px}
       <input class="txt sm" type="number" min="0" max="999" id="sv_maxips" data-i18n-placeholder="set.srv.ips.ph" placeholder="unknown"></div>
     <div class="infobox" id="sv_ipsnote">
       <b data-i18n="set.srv.ips.where.t">Where to find this</b>
-      <p data-i18n="set.srv.ips.where.b">Sign in to your provider's own website (the member area, control panel or "my account" page) and open the page for your plan or subscription. Look for wording like <i>IP addresses</i>, <i>locations</i>, <i>devices</i> or <i>simultaneous logins</i>. It is often printed next to the connection count and is a much smaller number: 1, 2 or 3 is common, and many providers set no limit at all. Your welcome email may say it too. If nothing mentions one, leave this blank.</p>
-      <p data-i18n="set.srv.ips.why.b"><b>Why it matters.</b> Holding a connection open makes the next download start faster, but it also keeps one of these address slots occupied while nothing is downloading. If you run nzbfast somewhere else too, or use this account from a laptop, a seedbox or another home, an idle machine can quietly lock the others out. With a limit of 1 or 2 that happens straight away. nzbfast uses this number to decide how soon to hang up when idle.</p>
-      <p data-i18n="set.srv.ips.wan.b"><b>More than one internet connection?</b> If this machine reaches the internet over several links (a router balancing two lines, or a multi-WAN setup), each connection can go out from a different address and use up several slots at once. Set a bind address on this server to pin it to one link.</p>
+      <p data-i18n-html="set.srv.ips.where.b">Sign in to your provider's own website (the member area, control panel or "my account" page) and open the page for your plan or subscription. Look for wording like <i>IP addresses</i>, <i>locations</i>, <i>devices</i> or <i>simultaneous logins</i>. It is often printed next to the connection count and is a much smaller number: 1, 2 or 3 is common, and many providers set no limit at all. Your welcome email may say it too. If nothing mentions one, leave this blank.</p>
+      <p data-i18n-html="set.srv.ips.why.b"><b>Why it matters.</b> Holding a connection open makes the next download start faster, but it also keeps one of these address slots occupied while nothing is downloading. If you run nzbfast somewhere else too, or use this account from a laptop, a seedbox or another home, an idle machine can quietly lock the others out. With a limit of 1 or 2 that happens straight away. nzbfast uses this number to decide how soon to hang up when idle.</p>
+      <p data-i18n-html="set.srv.ips.wan.b"><b>More than one internet connection?</b> If this machine reaches the internet over several links (a router balancing two lines, or a multi-WAN setup), each connection can go out from a different address and use up several slots at once. Set a bind address on this server to pin it to one link.</p>
     </div>
     <div class="row"><label data-i18n="set.srv.idlerel">Hang up when idle after<span class="hint" data-i18n="set.srv.idlerel.hint">seconds with nothing downloading before nzbfast closes this server's connections, freeing the account for your other machines. The next download opens fresh ones, which costs a moment at the start. Blank = choose for me, based on the address limit above. 0 = never hang up, which is right when this machine is the only thing using the account</span></label>
       <span><input class="txt sm" type="number" min="0" max="86400" id="sv_idlerel" data-i18n-placeholder="set.srv.auto" placeholder="auto">
@@ -1328,6 +1341,10 @@ input.txt.sm{max-width:120px}
     <input type="checkbox" id="s_auto_defer" onchange="setCfg('auto_defer',this.checked?1:0)"></div>
   <div class="row" data-adv="1"><label data-i18n="set.speed.prefetch">Prefetch on idle servers<span class="hint" data-i18n="set.speed.prefetch.hint">servers the active download can't use (its articles aren't on them) start the next queued job instead of idling; off automatically when a quota is set</span></label>
     <input type="checkbox" id="s_auto_prefetch" onchange="setCfg('auto_prefetch',this.checked?1:0)"></div>
+  <div class="row"><label data-i18n="set.speed.posthealth">Check posts before downloading<span class="hint" data-i18n="set.speed.posthealth.hint">while nothing is downloading, ask every server about a few of each queued post's articles and mark the row with the answer: a post your providers no longer carry is worth knowing about before the bandwidth is spent, not at 97%. Costs a few dozen tiny requests per job</span></label>
+    <input type="checkbox" id="s_post_health" onchange="setCfg('post_health',this.checked?1:0)"></div>
+  <div class="row" data-adv="1"><label data-i18n="set.speed.posthealthdefer">Healthy-looking posts start first<span class="hint" data-i18n="set.speed.posthealthdefer.hint">a job whose check came back bad waits behind items of the same priority that checked out better. It only changes the ORDER: nothing is removed, paused or failed, and forcing a job or raising its priority overrides it. Off by default, because a post uploaded moments ago is missing everywhere too</span></label>
+    <input type="checkbox" id="s_post_health_defer" onchange="setCfg('post_health_defer',this.checked?1:0)"></div>
   <div class="row" data-adv="1"><label data-i18n="set.speed.oracleroute">Skip providers the oracle says are gone<span class="hint" data-i18n="set.speed.oracleroute.hint">experimental: when the availability check is confident a provider's backbone has lost a release (takedown), skip it for that download instead of waiting for it to fail. Never skips your last provider. Off by default</span></label>
     <input type="checkbox" id="s_oracle_route" onchange="setCfg('oracle_route',this.checked?1:0)"></div>
   <div class="row" data-adv="1"><label data-i18n="set.speed.autoconn">Auto-tune connections<span class="hint" data-i18n="set.speed.autoconn.hint">while idle, measure each provider's connection sweet spot and cap downloads at it: asking a provider for too many sockets can be several times SLOWER than the right number</span></label>
@@ -1394,6 +1411,8 @@ input.txt.sm{max-width:120px}
     <input type="checkbox" id="s_par_cleanup" onchange="setCfg('par_cleanup',this.checked?1:0)"></div>
   <div class="row"><label data-i18n="set.watchdir.cleanup">Cleanup after download<span class="hint" data-i18n="set.watchdir.cleanup.hint">file extensions deleted from a job's folder once it completes successfully, e.g. sfv, srr, url; empty = off. Recovery files have their own switch above</span></label>
     <input class="txt" id="s_cleanup_exts" placeholder="sfv, srr, url" onchange="setCfg('cleanup_exts',this.value)"></div>
+  <div class="row"><label data-i18n="set.watchdir.trash">Deleted files go to the Trash<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.watchdir.trash.hint">cleanup moves files to the system Trash or Recycle Bin instead of deleting them, so a wrong guess about what was junk can be undone. On by default on macOS and Windows. Off on Linux, where there is usually no desktop Trash to empty: with it on, files go to a hidden .Trash folder on the same disk as your downloads, and that space stays used until you empty it yourself</span></label>
+    <input type="checkbox" id="s_delete_to_trash" onchange="setCfg('delete_to_trash',this.checked?1:0)"></div>
   <div class="row" data-adv="1"><label data-i18n="set.watchdir.extunrar">Unpack with external unrar<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.watchdir.extunrar.hint">use the unrar program installed on this machine instead of nzbfast's built-in extractor. An escape hatch for archives that fail to unpack: the built-in path is faster on every shape we have benchmarked, so leave this off unless one does. Hash-named obfuscated posts always use the built-in path, whose renaming unrar cannot follow. Needs unrar next to the nzbfast binary or on the system PATH</span></label>
     <input type="checkbox" id="s_prefer_external_unrar" onchange="setCfg('prefer_external_unrar',this.checked?1:0)"></div>
   <div class="row"><label data-i18n="set.watchdir.faillink">When a download fails<span class="hint" data-i18n="set.watchdir.faillink.hint">some indexers attach a report link to every NZB they serve. Telling them a post is dead is how they learn to stop offering it, and they usually answer with another copy of the same title. Only works for NZBs fetched by URL (RSS, Add-by-URL, your indexer's "send to" button) - a file you dropped in yourself carries no link. Off by default: it tells a third party what failed for you</span></label>
@@ -1427,7 +1446,7 @@ input.txt.sm{max-width:120px}
     <input type="checkbox" id="s_rename_source" onchange="setCfg('rename_source',this.checked?1:0);renameExample()"></div>
   <div class="row rename-sub" style="padding-left:16px"><label data-i18n="set.rename.group">Include release group<span class="hint" data-i18n="set.rename.group.hint">the -GROUP tag at the end</span></label>
     <input type="checkbox" id="s_rename_group" onchange="setCfg('rename_group',this.checked?1:0);renameExample()"></div>
-  <div class="row rename-sub" style="padding-left:16px"><label data-i18n="set.rename.yearparens">Year in brackets<span class="hint" data-i18n="set.rename.yearparens.hint">"Example Movie (2024)" instead of "Example Movie 2024". Off by default. Plex, Jellyfin and Radarr match films on the bracketed shape, so turn this on if a media server reads this folder</span></label>
+  <div class="row rename-sub" style="padding-left:16px"><label data-i18n="set.rename.yearparens">Year in brackets<span class="hint" data-i18n="set.rename.yearparens.hint">"Example Movie (2024)" instead of "Example Movie 2024". Off by default. Plex, Jellyfin and Radarr match films on the bracketed shape, so turn this on if one of those apps reads this folder</span></label>
     <input type="checkbox" id="s_rename_year_parens" onchange="setCfg('rename_year_parens',this.checked?1:0);renameExample()"></div>
   <div class="row rename-sub" style="padding-left:16px"><label data-i18n="set.rename.qbrackets">Quality in square brackets<span class="hint" data-i18n="set.rename.qbrackets.hint">"… [1080p x265]" instead of "… 1080p x265". Off by default</span></label>
     <input type="checkbox" id="s_rename_quality_brackets" onchange="setCfg('rename_quality_brackets',this.checked?1:0);renameExample()"></div>
@@ -1435,6 +1454,8 @@ input.txt.sm{max-width:120px}
     <input type="checkbox" id="s_rename_extra_words" onchange="setCfg('rename_extra_words',this.checked?1:0);renameExample()"></div>
   <div class="row rename-sub" style="padding-left:16px"><label data-i18n="set.rename.identify">Work out what a hidden film is<span class="hint" data-i18n="set.rename.identify.hint">some posts arrive with the name stripped off them, so the video lands as a string of random characters. When that happens, read the film's own running time, picture and sound formats and subtitle languages, then look those up in public film databases. Films only, and only once the download has finished. It renames the file ONLY when two separate databases agree on exactly one film, which needs a TMDB key in your config - without one it never renames, it just writes what it found into History so you can see what the file probably is</span></label>
     <input type="checkbox" id="s_rename_identify" onchange="setCfg('rename_identify',this.checked?1:0)"></div>
+  <div class="row rename-sub" style="padding-left:16px"><label data-i18n="set.rename.eptitles">Episode titles in TV names<span class="hint" data-i18n="set.rename.eptitles.hint">name an episode file "Show - S01E02 - The Ceremony [1080p].mkv" instead of "Show - S01E02 [1080p].mkv". Off by default, because it changes filenames your library and your *arr apps have already matched on. The title comes from the episode list already stored for shows on your watchlist, so it never waits on the internet and never renames a file later: a show we have no list for keeps today's name. Titles are in the show's original language, usually English</span></label>
+    <input type="checkbox" id="s_rename_episode_titles" onchange="setCfg('rename_episode_titles',this.checked?1:0);renameExample()"></div>
   <div class="row" style="grid-template-columns:1fr"><span class="hint" id="renameExample" style="font-style:italic"></span></div>
   <div class="row"><label data-i18n="set.rename.junk">Remove junk files<span class="hint" data-i18n="set.rename.junk.hint">delete leftover .par2, .nzb, .sfv, .nfo and sample clips from finished movie/TV folders, never the video or its subtitles</span></label>
     <input type="checkbox" id="s_rename_junk" onchange="setCfg('rename_junk',this.checked?1:0)"></div>
@@ -1549,6 +1570,26 @@ input.txt.sm{max-width:120px}
     <input type="checkbox" id="s_index_pause_dl" onchange="setCfg('index_pause_on_download',this.checked?1:0)"></div>
   <div class="row" data-adv="1"><label data-i18n="set.idx.gates">Ingest gates<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.gates.hint">optional JSON filter on what gets indexed: kinds/years/resolutions/languages/title patterns/size, e.g. {"kinds":["tv"],"res":["1080p"],"min_size":"200M"}. Empty = index everything</span></label>
     <textarea class="txt" id="s_index_gates" rows="3" style="resize:vertical" onchange="setCfg('index_gates',this.value)"></textarea></div>
+  <!-- The pre feed. Its own opt-in inside an opt-in: everything else on
+       this card talks to the news provider the user already chose, and
+       this one opens a connection to a network nothing else here uses.
+       That is a decision to be offered, not a default to be found. -->
+  <div class="row"><label data-i18n="set.idx.predb">Pre feed<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.predb.hint">off unless you turn it on. Plenty of uploads are posted with the name taken out, so a scan has nothing to read. Public relay channels announce the real name next to the filename a release was posted under, which is the one open way to match the two up. Turning this on keeps a connection open to an IRC network and listens. Nothing is ever posted, no account is created, and releases named this way are marked as having been named from the feed rather than read off the post.</span></label>
+    <input type="checkbox" id="s_predb_enabled" onchange="setCfg('predb_enabled',this.checked?1:0);setTimeout(refreshPredb,400)"></div>
+  <div class="row predb-sub" style="padding-left:16px"><label data-i18n="set.idx.predbsrv">Relay server<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.predbsrv.hint">the IRC network carrying the relay channels, as host or host:port</span></label>
+    <input class="txt" id="s_predb_server" autocomplete="off" onchange="setCfg('predb_server',this.value)"></div>
+  <div class="row predb-sub" style="padding-left:16px"><label data-i18n="set.idx.predbch">Relay channels<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.predbch.hint">comma-separated. Only what the channels announce is read; nothing is sent to them</span></label>
+    <input class="txt" id="s_predb_channels" autocomplete="off" onchange="setCfg('predb_channels',this.value)"></div>
+  <div class="row predb-sub" style="padding-left:16px"><label data-i18n="set.idx.predbstat">What it has heard<span class="hint" data-i18n="set.idx.predbstat.hint">a feed that quietly stops working looks exactly like one with nothing to say, so it reports both</span></label>
+    <span id="predbState" class="dim" style="font-size:12.5px;line-height:1.5"></span></div>
+  <div class="row"><label data-i18n="set.idx.corr">Name by correlation<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.corr.hint">the public announcement channels carry no filenames, so most obfuscated posts cannot be matched directly. What an announcement does pin down is when a release appeared and how big it is. This compares announcement timing and size against unnamed posts and, when they fit, suggests the real name on the Browse page. A suggestion is clearly marked, needs your click to apply, and never renames files on disk.</span></label>
+    <input type="checkbox" id="s_predb_corr_enabled" onchange="setCfg('predb_corr_enabled',this.checked?1:0);setTimeout(()=>{refreshPredb();refreshPredbCorr()},400)"></div>
+  <div class="row corr-sub" style="padding-left:16px"><label data-i18n="set.idx.corrauto">Apply strong matches automatically<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.corrauto.hint">a match this needs is strict: the size must agree tightly, no other announcement may fit nearly as well, and the announcement must pick this post back when checked the other way around. Applied names change only how a release is shown, they are marked as inferred, and a finished download that proves one wrong takes it back off on its own. Everything weaker stays a suggestion for you to review.</span></label>
+    <input type="checkbox" id="s_predb_corr_auto" onchange="setCfg('predb_corr_auto',this.checked?1:0)"></div>
+  <div class="row corr-sub" style="padding-left:16px"><label data-i18n="set.idx.seed">Announcement history<span class="hint" data-i18n="set.idx.seed.hint">the live feed only hears announcements from the moment it is switched on. This fetches roughly six months of past announcements from a public pre database, politely and once, so posts that are already indexed can be matched too. Runs in the background for half an hour or so; progress shows here.</span></label>
+    <span style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <button class="btn" id="predbSeedBtn" data-i18n="set.idx.seedbtn" onclick="startPredbSeed()">Import history</button>
+      <span id="predbSeedState" class="dim" style="font-size:12.5px;line-height:1.5"></span></span></div>
   <div class="row"><label data-i18n="set.idx.omdb">OMDb key<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.omdb.hint">optional: richer movie metadata on the wall (exact matches, cast, posters, IMDb ids) and ~4× faster movie enrichment. Free tier is 1,000 lookups/day. Empty = fully keyless</span></label>
     <input class="txt" id="s_omdb_key" autocomplete="off" onchange="setCfg('omdb_key',this.value)"></div>
   <div class="row"><label data-i18n="set.idx.omdbget">Get a free OMDb key<span class="hint" data-i18n="set.idx.omdbget.hint">only needs an email address: we submit the signup for you; OMDb emails you the key with an activation link. Or do it yourself at omdbapi.com/apikey.aspx</span></label>
@@ -1774,8 +1815,18 @@ input.txt.sm{max-width:120px}
       <button class="ghost mini" id="s_apikey_show" onclick="showApiKey(this)" data-i18n="set.sec.apikey.show">Show</button>
       <button class="ghost mini" onclick="newApiKey()" data-i18n="set.sec.apikey.new">Create new</button>
     </span></div>
-  <div class="row"><label data-i18n="set.sec.nzbkey">NZB key<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.sec.nzbkey.hint">add-only key: may submit NZBs but not read or change anything</span></label>
-    <input class="txt" id="s_nzbkey" autocomplete="off" onchange="saveKey('nzbkey',this)"></div>
+  <div class="row"><label data-i18n="set.sec.nzbkey">NZB key<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.sec.nzbkey.hint">add-only key: may submit NZBs and pass connection tests, but not see or change anything else</span></label>
+    <span style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+      <input class="txt" id="s_nzbkey" autocomplete="off" onchange="saveKey('nzbkey',this)">
+      <button class="ghost mini" id="s_nzbkey_show" onclick="showNzbKey(this)" data-i18n="set.sec.apikey.show">Show</button>
+      <button class="ghost mini" onclick="newNzbKey()" data-i18n="set.sec.apikey.new">Create new</button>
+    </span></div>
+  <div class="row"><label data-i18n="set.sec.backup">Settings backup<span class="hint" data-i18n="set.sec.backup.hint">one file holding every setting, your servers (passwords included) and both keys - keep it somewhere private. Restoring it on a fresh install brings everything back</span></label>
+    <span style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+      <button class="ghost mini" onclick="backupDownload()" data-i18n="set.sec.backup.dl">Download backup</button>
+      <button class="ghost mini" onclick="document.getElementById('backupFile').click()" data-i18n="set.sec.backup.restore">Restore from backup…</button>
+      <input type="file" id="backupFile" accept=".json,application/json" style="display:none" onchange="backupRestore(this)">
+    </span></div>
   <div class="row"><label data-i18n="set.sec.port">Port<span class="badge restart" id="s_portbadge" data-i18n="badge.restart">applies after restart</span></label>
     <input class="txt sm" type="number" min="1" max="65535" id="s_port" onchange="setCfg('port',this.value)"></div>
 </div>
@@ -1857,10 +1908,16 @@ input.txt.sm{max-width:120px}
     </ol>
     <div class="cup" data-i18n-html="cu.now.click">If you created it by searching the Registry and clicking Run: Registry →
     re-download the <b>latest</b> tag, then Container → stop nzbfast → Action → Reset.</div>
+    <div class="cup" data-i18n-html="cu.now.unraid">If you installed it on <b>Unraid</b> from Community
+    Applications: Docker tab → <b>Check for Updates</b> at the bottom of the page, then click the nzbfast
+    icon and choose <b>Apply Update</b>. Your ports, paths and settings are kept.</div>
 
     <h4 data-i18n="cu.auto">Keep it up to date by itself</h4>
     <p data-i18n="cu.auto.lead">Add this service to your Project's compose file, alongside the nzbfast
     service, and it checks nightly at 04:00 for a newer image. Set the timezone to yours.</p>
+    <div class="cup cunote" data-i18n-html="cu.auto.unraid">On Unraid you do not need any of this:
+    Community Applications adds an <b>Auto Update Applications</b> page under Settings that can keep
+    nzbfast current on its own.</div>
     <pre class="cuyaml" id="cuyaml">  watchtower:
     image: containrrr/watchtower
     container_name: nzbfast-watchtower
@@ -1887,6 +1944,8 @@ input.txt.sm{max-width:120px}
   <div class="fsfoot">
     <a class="pill" id="cuguide" target="_blank" rel="noopener" style="text-decoration:none"
       href="https://nzbfast.github.io/nzbfast/synology.html" data-i18n="cu.guide">Synology guide ↗</a>
+    <a class="pill" id="cuguideu" target="_blank" rel="noopener" style="text-decoration:none"
+      href="https://nzbfast.github.io/nzbfast/unraid.html" data-i18n="cu.guide.unraid">Unraid guide ↗</a>
     <span class="grow"></span>
     <button onclick="cuClose()" data-i18n="cu.close">Close</button>
   </div>
@@ -2427,8 +2486,10 @@ function ensureKey(failedKey){
 // reports it, for all ~60 callers at once.
 function httpFail(r){ return {status:false, error:'HTTP '+r.status}; }
 async function readJson(r){
-  if(!r.ok) return httpFail(r);
-  try { return await r.json(); } catch(e) { return httpFail(r); }
+  // Auth refusals are 403 with the same JSON error body (SAB parity);
+  // authFail() needs the phrase from that body, not a bare HTTP code.
+  try { const j = await r.json(); if(r.ok || (j && j.error)) return j; } catch(e) {}
+  return httpFail(r);
 }
 // `post` sends the same query-string request as a POST. Modes that reach
 // out to an address the caller picked (notify_test) or that are
@@ -2436,8 +2497,12 @@ async function readJson(r){
 // fire them with an <img> or a link prefetch.
 async function api(mode, extra, authKey, post){
   const sent = authKey != null ? authKey : key;
-  const r = await fetch(`/api?mode=${mode}&apikey=${encodeURIComponent(sent)}${extra||''}`,
-    post?{method:'POST'}:undefined);
+  // Issue #4: the key rides the X-Api-Key header, not the query string,
+  // so it stays out of reverse-proxy access logs, browser history and
+  // Referer headers. Navigations (the /m3u player handoff) still use
+  // ?apikey= - a location.href cannot carry a header.
+  const r = await fetch(`/api?mode=${mode}${extra||''}`,
+    {method: post?'POST':'GET', headers: sent?{'X-Api-Key': sent}:{}});
   const j = await readJson(r);
   // authKey set = an explicit one-shot credential (the apikey bootstrap):
   // never prompt for it, surface the error instead.
@@ -3125,7 +3190,7 @@ async function tick(){
       const left=parseFloat(act.mbleft)||0, eta=mbps>0?left/mbps:Infinity;
       setHtml('active',
         `<div style="display:flex;justify-content:space-between;font-size:13px">
-           <span style="min-width:0">${esc(act.filename||act.name)}${shapeBadge(act.archive_shape)}</span>
+           <span style="min-width:0">${esc(act.filename||act.name)}${mediaBadge(act.media)}${shapeBadge(act.archive_shape)}</span>
            <span class="dim mono">${act.percentage}% · ${t('queue.timeleft','{t} left',{t:fmtEta(eta)})}</span></div>
          <div class="bar" style="margin-top:6px"><i style="width:${act.percentage}%"></i></div>`);
     } else setHtml('active',`<span class="dim" id="idlepick" style="cursor:pointer;text-decoration:underline dotted">${t('queue.idle.drop','idle: drop a .nzb anywhere, or click here to choose one')}</span>`);
@@ -3224,6 +3289,95 @@ function shapeBadge(tag){
     : t('shape.why.onepass','The files are written straight out as the archive downloads - the archive parts never land on your disk.');
   return `<span class="qbadge shape" title="${escA(t('shape.title','What this download turned out to be.')+(why?' '+why:''))}">${esc(label)}</span>`;
 }
+// §77 pre-flight verdict for a queued job: what a STAT sample of a few
+// of its articles said, across every configured server, before a byte
+// was spent. ADVISORY - the job downloads either way, whatever colour
+// this is, because a post nobody carries yet and a post nobody carries
+// any more are the same answer.
+//
+// The tooltip always names the SAMPLE SIZE. Eight articles out of nine
+// thousand cannot measure how complete a release is, and a badge that
+// let itself be read as a percentage would be the whole feature going
+// wrong.
+function healthLabel(b){
+  return b==='green' ? t('queue.health.green','looks complete')
+       : b==='amber' ? t('queue.health.amber','may still be landing')
+       : b==='red'   ? t('queue.health.red','may be incomplete')
+       : '';
+}
+function healthTip(h){
+  return t('queue.health.title','Checked before downloading - sampled articles {sampled}, present on at least one server {present}, servers that answered {answered}, post age in days {age}. A sample this small cannot prove a post is bad, so this is a hint and the download runs either way.',
+    {sampled:h.sampled, present:h.present, answered:h.answered, age:h.age_days});
+}
+// The same verdict opened out in the queue drawer: the sentence, the
+// per-server split (which is the part that separates "nobody has this"
+// from "the cheap block account does not"), and the standing reminder
+// that none of it can stop the download.
+function healthDetail(h){
+  if(!h||!h.bucket) return '';
+  const cls = h.bucket==='green' ? 'ok' : h.bucket==='red' ? 'bad' : 'warn';
+  const per=(h.per_server||[]).map(x=>
+    `<span>${esc(String(x.host).replace(/^(news|reader)\./,''))} <b>${x.have}</b>/${h.sampled}</span>`).join('');
+  return `<div class="${cls}" style="font-size:12px;margin-top:7px">${t('drawer.health','Pre-flight check:')} ${esc(healthLabel(h.bucket))}<br>
+    <span class="dim">${esc(healthTip(h))}</span>`+
+    (per?`<div class="dsrv">${per}</div>`:'')+
+    (h.sunk?`<div class="dim" style="margin-top:4px">${t('drawer.health.sunk','Waiting behind items of the same priority that checked out better. Raise its priority or drag it up to run it now.')}</div>`:'')+
+    `<div class="dim" style="margin-top:4px">${t('drawer.health.hint','Advisory only. A post that was uploaded moments ago looks exactly like one that is gone, so nzbfast never blocks, pauses or fails a job because of this check.')}</div>`+
+    `</div>`;
+}
+function healthBadge(h){
+  if(!h||!h.bucket) return '';
+  const cls = h.bucket==='green' ? 'ok' : h.bucket==='red' ? 'bad' : 'warn';
+  // Green is a bare dot: the reassuring case is the overwhelmingly
+  // common one, and a queue of twenty rows each saying "looks complete"
+  // is noise the exceptional rows then have to shout over.
+  const body = h.bucket==='green' ? '●' : '● '+healthLabel(h.bucket);
+  return ` <span class="${cls}" title="${escA(healthTip(h))}">· ${body}</span>`;
+}
+
+// §76 quality chip: what the file's own header says it is, read while it
+// downloads. "2160p HEVC HDR10 · DDP 5.1".
+//
+// The tokens are deliberately NOT translated, for the same reason
+// identSource is not: they are format names that read the same in every
+// language, and they are the exact tokens the release name uses - which
+// is the whole point of putting the two side by side.
+function mediaLabel(m){
+  const head=[m.res,m.vcodec,m.hdr].filter(Boolean).join(' ');
+  return [head,m.audio].filter(Boolean).join(' · ');
+}
+// One sentence per contradiction, in the reader's language, with the two
+// technical tokens dropped in.
+function mediaWhy(m){
+  return (m.mismatch||[]).map(x=>t('media.mismatch.line',
+    'The name says {claimed}, but the file is {actual}.',{claimed:x.claimed,actual:x.actual}));
+}
+// The contradiction, spelled out. The row chip is glanceable and easy to
+// miss; a user who opens the drawer is asking "should I keep this?" and
+// deserves the sentences rather than a tooltip they have to hover for.
+function mediaWarnBlock(m){
+  const why=m?mediaWhy(m):[];
+  if(!why.length) return '';
+  return `<div class="warn" style="font-size:12px;margin-top:7px">${
+    esc(t('media.mismatch','This file does not match its name.'))}<br>
+    <span class="dim">${why.map(esc).join('<br>')}</span></div>`;
+}
+function mediaBadge(m){
+  if(!m) return '';
+  const label=mediaLabel(m);
+  if(!label) return '';
+  const why=mediaWhy(m);
+  // Partial reads are normal for the first seconds of a download and are
+  // not worth saying on the row itself; the tooltip mentions it. Its own
+  // sentence, not the panel's `probe.partial` fragment - that one is
+  // written to sit under a heading, and reads as a fault mid-tooltip.
+  const note=m.complete?'':' '+t('media.partial','This is what has arrived so far; more may follow as the download continues.');
+  const tip=why.length
+    ? t('media.mismatch','This file does not match its name.')+' '+why.join(' ')
+    : t('media.title','What this file actually is, read from the file itself rather than its name.')+note;
+  return `<span class="qbadge media${why.length?' bad':''}" title="${escA(tip)}">${
+    why.length?'⚠ ':''}${esc(label)}</span>`;
+}
 // Which oracle named a release, as a label. Deliberately NOT translated
 // and deliberately not the internal token: these are a service name and
 // two file formats, which read the same in every language, and "the
@@ -3303,7 +3457,7 @@ function renderHistory(slots){
       return `<tr class="item ${cls}" data-id="${escA(s.nzo_id)}" onclick="toggleHistRow(this)"
         ondblclick="openItem('${s.nzo_id}','file')" oncontextmenu="return histMenu(event,'${s.nzo_id}',${failed})"
         title="${escA(t('hist.row.title2','click: details · double-click: play · right-click: options'))}">
-        <td><span class="nm"><span class="caret">▶</span><span class="sdot"></span><span class="nmtxt">${esc(s.name)}${identName(s)}${shapeBadge(s.archive_shape)}</span></span></td>
+        <td><span class="nm"><span class="caret">▶</span><span class="sdot"></span><span class="nmtxt">${esc(s.name)}${identName(s)}${mediaBadge(s.media)}${shapeBadge(s.archive_shape)}</span></span></td>
         <td class="nowrap">${s.bytes!=null?fmtSize(s.bytes):esc(s.size||'')}${st}</td>
         <td class="nowrap" style="text-align:end">${ctl}</td></tr>`;
     }).join('')
@@ -3318,6 +3472,87 @@ function renderHistory(slots){
     : (histExpanded()&&shown.length>histRows()
         ? `<button class="ghost mini" onclick="setHistExpanded(false)">${esc(t('hist.less','show fewer'))}</button>`:''));
   applyAllCardCaps();
+}
+
+// §73 phase 1: what the file actually IS, read out of the container
+// itself rather than out of the name a poster chose. The daemon parses
+// whatever bytes have landed, so this answers mid-download - which is
+// the whole point: a release that turns out to be HEVC, or German-only,
+// is worth knowing about before the rest of it arrives.
+const PROBE={};                                   // nzo_id -> {at, j, busy}
+function probeFetch(id){
+  const e=PROBE[id]||(PROBE[id]={});
+  // One header read per poll, and the file does not change shape often.
+  // A settled answer is never re-fetched; an unfinished one is, slowly.
+  if(e.busy) return;
+  if(e.at&&(performance.now()-e.at<6000||!(e.j&&e.j.pending))) return;
+  e.busy=true;
+  // A refusal (no such job, nothing playable in it, a key the page does
+  // not have) is a settled answer, not a pending one: without a body to
+  // stand in for it the box would sit on "reading the file…" forever.
+  fetch('/preview/probe/'+encodeURIComponent(id), {headers:key?{'X-Api-Key':key}:{}})
+    .then(r=>r.ok?r.json():{media:null,pending:false}).catch(()=>({media:null,pending:false}))
+    .then(j=>{
+      e.busy=false; e.at=performance.now(); e.j=j;
+      const box=document.getElementById('pv-'+id);
+      if(box){
+        box.innerHTML=probeBody(id);
+        // The history drawer does not re-render on a tick the way the
+        // queue one does, so a still-arriving file needs its own nudge.
+        if(j&&j.pending) setTimeout(()=>{ if(document.getElementById('pv-'+id)) probeFetch(id); },6000);
+      }
+    });
+}
+// Language names come from the browser, in the reader's own language:
+// "German" in English, "Deutsch" in German. No catalogue key needed.
+const _langName={};
+function probeLang(c){
+  if(!c||c==='und') return t('probe.lang.unknown','language not stated');
+  try{ return (_langName[LOCALE]??=new Intl.DisplayNames([LOCALE],{type:'language'})).of(c)||c; }
+  catch(e){ return c; }
+}
+function probeDur(ms){
+  const s=Math.round(ms/1000), h=Math.floor(s/3600), m=Math.floor(s%3600/60), x=s%60;
+  return (h?h+':'+String(m).padStart(2,'0'):String(m))+':'+String(x).padStart(2,'0');
+}
+function probeBody(id){
+  const e=PROBE[id]||{}, j=e.j;
+  if(!j) return `<span class="dim">${esc(t('probe.checking','reading the file…'))}</span>`;
+  const m=j.media;
+  if(!m) return `<span class="dim">${esc(j.pending
+    ? t('probe.pending','not enough of the file has arrived yet')
+    : t('probe.none','no video file to read here'))}</span>`;
+  const v=(m.video||[])[0];
+  const head=[esc((m.container||'').toUpperCase())];
+  if(m.duration_ms) head.push(probeDur(m.duration_ms));
+  if(v&&v.width) head.push(v.width+'&times;'+v.height);
+  if(v&&v.fps) head.push(esc(String(v.fps))+' fps');
+  if(v&&v.hdr&&v.hdr.format&&v.hdr.format!=='SDR') head.push(`<b>${esc(v.hdr.format)}</b>`);
+  const line=(label,items)=>items.length
+    ? `<div><span class="dim">${esc(label)}</span> ${items.join(' <span class="dim">·</span> ')}</div>` : '';
+  const vids=(m.video||[]).map(x=>esc([x.codec, x.profile, x.level&&('L'+x.level),
+      x.bit_depth&&(x.bit_depth+'-bit')].filter(Boolean).join(' ')));
+  const auds=(m.audio||[]).map(x=>esc([x.codec, x.channel_layout, probeLang(x.lang)]
+      .filter(Boolean).join(' ')));
+  const subs=(m.subtitles||[]).map(x=>esc([x.codec, probeLang(x.lang),
+      x.forced?t('probe.forced','forced'):'',
+      x.kind==='bitmap'?t('probe.picture','picture'):''].filter(Boolean).join(' ')));
+  return `<div style="font-size:12.5px;line-height:1.6">
+    <div>${head.join(' <span class="dim">·</span> ')}</div>
+    ${line(t('probe.video','Video'),vids)}
+    ${line(t('probe.audio','Audio'),auds)}
+    ${line(t('probe.subs','Subtitles'),subs)}
+    ${(m.chapters||[]).length?`<div><span class="dim">${esc(t('probe.chapters','Chapters'))}</span> ${m.chapters.length}</div>`:''}
+    ${m.title?`<div><span class="dim">${esc(t('probe.name','Title'))}</span> ${esc(m.title)}</div>`:''}
+    ${m.complete?'':`<div class="dim">${esc(t('probe.partial','read from what has downloaded so far'))}</div>`}
+  </div>`;
+}
+// The box renders from the cache, so a re-render (the queue drawer
+// rebuilds every tick) restores whatever the last answer was instead of
+// flashing back to "reading…".
+function probeHtml(id){
+  probeFetch(id);
+  return `<div id="pv-${escA(id)}" style="margin-top:7px">${probeBody(id)}</div>`;
 }
 
 // Row detail: status in words, the failure message in full, and the path
@@ -3355,6 +3590,9 @@ function toggleHistRow(tr){
     rows.push([t('hist.why','Reason'),
       esc(t('hist.packed.title','{name} could not be unpacked - this format is not built in. The verified archive is in the output folder; unpack it with your own tool.',{name:s.unpack_blocked_by}))]);
   rows.push([t('col.location','Location'), esc(s.storage||s.path||'')]);
+  // What the container itself says it holds. Only for a job that
+  // finished with files on disk - a failed one has nothing to read.
+  if(!failed) rows.push([t('probe.head','Inside the file'), mediaWarnBlock(s.media)+probeHtml(s.nzo_id)]);
   // What an identity oracle said this release is. Only present when one
   // answered, and always attributed - "srrdb says" and "the video file
   // says" are different degrees of confidence.
@@ -3725,11 +3963,15 @@ function renderQueue(){
       // in a format we have no unpacker for, so it will arrive complete
       // and still packed. Better said now than after the download.
       (s.zip_packed?` <span class="warn" title="${escA(t('queue.zip.title','This post is zip-packed. Store and deflate zips are unpacked automatically, an encrypted one too when the job has a password; an unusual compression method is left in the output folder for you to unpack.'))}">· ${t('queue.zip','zip-packed')}</span>`:'')+
-      (s.prefetching?` <span class="ok" title="${escA(t('queue.prefetch.title',"Servers the active download can't use are already fetching this job - it finishes here or hands its progress over via the journal"))}">· ${t('queue.prefetching','prefetching')}${s.prefetched_mb?' '+fmtMB(s.prefetched_mb):''}</span>`:'');
+      (s.prefetching?` <span class="ok" title="${escA(t('queue.prefetch.title',"Servers the active download can't use are already fetching this job - it finishes here or hands its progress over via the journal"))}">· ${t('queue.prefetching','prefetching')}${s.prefetched_mb?' '+fmtMB(s.prefetched_mb):''}</span>`:'')+
+      // What the servers said about this post before the download
+      // started (§77). Advisory: it colours the row, it never holds
+      // the job back on its own.
+      healthBadge(s.health);
     const pzLabel=s.priority==='Duplicate'
       ? `<span class="dim" title="${escA(t('queue.dup.title','An equivalent release is already downloaded or queued: this copy is held, not stuck. Raise its priority to download it anyway.'))}">· ${t('queue.dup','held (duplicate)')}</span>`
       : `<span class="dim">· ${t('status.paused','paused')}</span>`;
-    return `<tr class="qrow${open?' open':''}" data-id="${s.nzo_id}" data-i="${i}" draggable="${dl?'false':'true'}"><td>${esc(s.filename||s.name)}${shapeBadge(s.archive_shape)}${pz?' '+pzLabel:''}${defer}</td><td class="nowrap">${fmtMB(s.mb)}</td>
+    return `<tr class="qrow${open?' open':''}" data-id="${s.nzo_id}" data-i="${i}" draggable="${dl?'false':'true'}"><td>${esc(s.filename||s.name)}${mediaBadge(s.media)}${shapeBadge(s.archive_shape)}${pz?' '+pzLabel:''}${defer}</td><td class="nowrap">${fmtMB(s.mb)}</td>
       <td class="nowrap dim">${fmtMB(s.mbleft)}</td><td class="nowrap mono" title="${escA(dl?t('queue.eta.active','time to finish this download'):t('queue.eta.queued','estimated finish, once the items ahead complete'))}">${pz?'-':fmtEta(eta)}</td>
       <td><div class="bar"><i style="width:${s.percentage}%"></i></div></td>
       <td class="nowrap" style="text-align:end">${ctl}</td></tr>`+
@@ -3782,7 +4024,7 @@ async function restartDaemon(btn){
     for(let i=0;i<40;i++){
       await new Promise(r=>setTimeout(r,1000));
       try{
-        const r=await fetch(`/api?mode=version&output=json&apikey=${encodeURIComponent(key)}`);
+        const r=await fetch(`/api?mode=version&output=json`, {headers: key?{'X-Api-Key': key}:{}});
         if(r.ok){ location.reload(); return; }
       }catch(e){/* still down */}
     }
@@ -3864,9 +4106,13 @@ function setAccent(v){
   if(el&&v) el.value=v;
   updateContrastReport();
 }
+// Interface scale. Drives `zoom` through --ui-zoom (the rule lives with
+// the shared tokens, so the wall scales too); the root font-size this
+// used to set moved nothing, because every size on this page is px.
 function setFontScale(v){
   const n=Math.min(140,Math.max(80,parseInt(v,10)||100));
-  document.documentElement.style.fontSize=n===100?'':(n+'%');
+  if(n===100) document.documentElement.style.removeProperty('--ui-zoom');
+  else document.documentElement.style.setProperty('--ui-zoom',(n/100).toFixed(2));
   if(n===100) localStorage.removeItem('nzbfastFontScale');
   else localStorage.setItem('nzbfastFontScale',(n/100).toFixed(2));
   const s=document.getElementById('s_fontscale'); if(s) s.value=n;
@@ -4082,7 +4328,7 @@ function drawerHtml(s){
     const srv=(st.servers||[]).map(x=>({host:x.host,b:Math.max(0,(x.bytes||0)-(jobBase.bytes[x.host]||0))})).filter(x=>x.b>0);
     const tot=srv.reduce((a,x)=>a+x.b,0);
     const sline=tot>0?`<div class="dsrv">${srv.map(x=>`<span>${esc(x.host.replace(/^(news|reader)\./,''))} <b>${fmtBytes(x.b)}</b> · ${(100*x.b/tot).toFixed(0)}%</span>`).join('')}</div>`:'';
-    return files+vline+sline;
+    return files+vline+sline+mediaWarnBlock(s.media)+probeHtml(s.nzo_id);
   }
   const prios=[[2,'Force',t('prio.force','Force')],[1,'High',t('prio.high','High')],[0,'Normal',t('prio.normal','Normal')],[-1,'Low',t('prio.low','Low')]];
   return `<div class="dgrid">
@@ -4093,8 +4339,13 @@ function drawerHtml(s){
       ${s.origin?`<span class="dim">${t('drawer.origin','added by')}</span><span>${esc(originLabel(s.origin))}</span>`:''}
       ${s.nzb_path?`<span class="dim">${t('drawer.nzbfile','NZB file')}</span><span class="mono" style="word-break:break-all;font-size:11.5px">${esc(s.nzb_path)}</span>`:''}
     </div>`+
+    // A stopped or paused job keeps whatever its download already read,
+    // and that is exactly when the warning matters most: this is the
+    // moment the user decides whether to resume it at all.
+    mediaWarnBlock(s.media)+
     (s.deferred?`<div class="warn" style="font-size:12px;margin-top:7px">${t('drawer.deferred','Deferred as slow:')} ${esc(s.defer_reason||'')}<br>
       <span class="dim">${t('drawer.deferred.hint','Runs when nothing faster is queued; change its priority or drag it up to override.')}</span></div>`:'')+
+    healthDetail(s.health)+
     (s.prefetching?`<div class="ok" style="font-size:12px;margin-top:7px">${t('drawer.prefetch2','Prefetching on idle servers: {s} landed while the active download runs.',{s:fmtMB(s.prefetched_mb||0)})}
       <span class="dim">${t('drawer.prefetch.hint',"If it can't finish there, the progress is kept and the normal download resumes from it.")}</span></div>`:'')+
     `<div class="dim" style="font-size:11.5px;margin-top:7px">${t('drawer.tiebreak','Queue order breaks ties within a priority: Force/High items download first regardless of position.')}</div>`;
@@ -4221,6 +4472,20 @@ function slotLabel(slot){
   if(d) return `${d[1]}-${d[2]}-${d[3]} `;
   return s.toUpperCase()+' ';
 }
+// §74: what the row says about its last grab off the arrival path.
+// Only ever shown when one has happened - "nothing yet" is what the rest
+// of the line already says, and a promise of speed with nothing behind it
+// is worse than silence. The lag is the honest number: grab time minus
+// the post's own date, so a post that went up while the daemon was off
+// reads as hours, not as a failure.
+function instantLine(st){
+  const i=st&&st.instant;
+  if(!i||!i.stem) return '';
+  const secs=Number(i.lag)||0;
+  return ' · ⚡ '+(secs>0&&secs<3600
+    ?t('watch.st.instant','{name}, {n}s after it was posted',{name:i.stem,n:secs})
+    :t('watch.st.instantnow','{name}, grabbed as it arrived',{name:i.stem}));
+}
 function paintWatchStatus(){
   for(const r of document.querySelectorAll('#wlrows .wlrow')){
     const st=wlStatusById[r.dataset.id], d=r.querySelector('[data-st]');
@@ -4228,7 +4493,7 @@ function paintWatchStatus(){
     if(!st||!(st.slots||[]).length){ d.textContent=t('watch.st.none','nothing grabbed yet: watching for a matching post'); continue; }
     const parts=st.slots.slice(0,4).map(s=>
       `${slotLabel(s.slot)}${s.quality||'?'}${s.upgrading?' ⬆ '+t('watch.st.upgrading','upgrading'):''}`);
-    d.textContent=`${t('watch.st.have','have:')} ${parts.join(' · ')}${st.slots.length>4?` · ${t('watch.st.more','+{n} more',{n:st.slots.length-4})}`:''}`;
+    d.textContent=`${t('watch.st.have','have:')} ${parts.join(' · ')}${st.slots.length>4?` · ${t('watch.st.more','+{n} more',{n:st.slots.length-4})}`:''}${instantLine(st)}`;
   }
 }
 async function refreshWatchStatus(){
@@ -4300,8 +4565,15 @@ async function loadWatchlist(){
     // nothing is scanning. IDX_ON leads, and it is a page-load token
     // rather than s.enabled on purpose: flipping the switch reloads
     // (see setIndexEnabled), and every other card decides on the token.
+    // §74: the local line says how QUICKLY as well as from where, but
+    // only when the instant path is actually armed - it needs the
+    // built-in indexer, so on the external-only legs below there is
+    // nothing to promise.
+    const fast=IDX_ON&&c.watchlist_instant!==false
+      ?' · '+t('watch.instant.on','checked the moment a match is posted')
+      :'';
     setHtml('wlStatus', IDX_ON&&(s.groups||[]).length
-      ?t('watch.status','matches everything indexed from <b>{groups}</b> (the watched newsgroups; edit them in ⚙ settings → Indexing) · min = floor · upgrade-to = ceiling',{groups:esc(s.groups.join(', '))})
+      ?t('watch.status','matches everything indexed from <b>{groups}</b> (the watched newsgroups; edit them in ⚙ settings → Indexing) · min = floor · upgrade-to = ceiling',{groups:esc(s.groups.join(', '))})+fast
       :!IDX_ON&&IDX_COUNT
       ?(c.watchlist_external
         ?t('watch.extonly','asks your indexer accounts about wanted items a couple of times a day · min = floor · upgrade-to = ceiling')
@@ -5581,7 +5853,8 @@ async function uploadNzbs(files, stream){
       const wantStream = stream && ok===0;
       toast(wantStream?t('toast.streaming','Testing {name}…',{name:f.name}):t('toast.uploading','Uploading {name}…',{name:f.name}));
       const sent=key;
-      const r=await fetch(`/api?mode=addfile${wantStream?'&stream=1':''}&apikey=${encodeURIComponent(sent)}`,{method:'POST',body:fd});
+      const r=await fetch(`/api?mode=addfile${wantStream?'&stream=1':''}`,
+        {method:'POST',body:fd,headers: sent?{'X-Api-Key': sent}:{}});
       const j=await r.json().catch(()=>({}));
       if(authFail(j)){ if(await ensureKey(sent)) return uploadNzbs(files, stream); return; }
       if(j.status){
@@ -5760,8 +6033,8 @@ async function addNzblnk(link){
   toast(t('toast.lnkLooking','Looking that link up…'));
   const sent=key;
   try{
-    const r=await fetch(`/api?mode=addnzblnk&output=json&apikey=${encodeURIComponent(sent)}`
-      +`&link=${encodeURIComponent(link.trim())}`);
+    const r=await fetch(`/api?mode=addnzblnk&output=json`
+      +`&link=${encodeURIComponent(link.trim())}`, {headers: sent?{'X-Api-Key': sent}:{}});
     const j=await r.json().catch(()=>({}));
     if(authFail(j)){ if(await ensureKey(sent)) return addNzblnk(link); return; }
     if(!j.status){
@@ -6026,8 +6299,8 @@ function sizeStr(b){
 }
 async function apiPost(mode, body){
   const sent=key;
-  const r=await fetch(`/api?mode=${mode}&apikey=${encodeURIComponent(sent)}`,
-    {method:'POST', body:JSON.stringify(body)});
+  const r=await fetch(`/api?mode=${mode}`,
+    {method:'POST', body:JSON.stringify(body), headers: sent?{'X-Api-Key': sent}:{}});
   const j=await readJson(r);
   if(authFail(j) && await ensureKey(sent)) return apiPost(mode,body);
   return j;
@@ -6057,6 +6330,10 @@ function renameExample(){
   let line=`${t('set.rename.eg','e.g.')} Example Movie ${year}${s}.mkv`;
   if(ck('s_rename_extra_words'))
     line+=` ${t('set.rename.eg.event','and an event keeps its own words:')} Example Race ${year} Round11 Hungary Practice${s}.mkv`;
+  // TV is a different shape from the film example above, so it only
+  // appears when the option that changes it is on.
+  if(ck('s_rename_episode_titles'))
+    line+=` ${t('set.rename.eg.eptitle','and an episode carries its own title:')} Example Show - S01E02 - The Ceremony${s}.mkv`;
   ex.textContent=line;
 }
 
@@ -6152,6 +6429,85 @@ async function newApiKey(){
   loadSettings();
 }
 
+// Same two buttons for the add-only NZB key (a Reddit ask: NZB Donkey
+// wants this key, and there was no way to see or mint one). Reveal
+// rides apikey_show, which returns both keys; both buttons still need
+// the full API key, so the NZB key can never read or rotate itself.
+async function showNzbKey(btn){
+  const el=document.getElementById('s_nzbkey');
+  if(btn.dataset.shown){
+    el.value='';
+    el.placeholder=t('ph.rotate','set: type a new key to rotate');
+    delete btn.dataset.shown; setHtml(btn, t('set.sec.apikey.show','Show'));
+    return;
+  }
+  const j=await api('apikey_show');
+  if(!j || j.status===false){ toast(tErr(j&&j.error)||t('set.sec.apikey.err','Could not read the key.'), true); return; }
+  if(!j.nzbkey){ toast(t('set.sec.nzbkey.none','No NZB key is set. Create one, or type your own in the box.'), true); return; }
+  el.value=j.nzbkey;
+  el.select && el.select();
+  try{ await navigator.clipboard.writeText(j.nzbkey); toast(t('set.sec.nzbkey.copied','NZB key copied to the clipboard.')); }
+  catch(e){ toast(t('set.sec.nzbkey.shown','NZB key shown - copy it from the box.')); }
+  btn.dataset.shown='1'; setHtml(btn, t('set.sec.apikey.hide','Hide'));
+}
+
+async function newNzbKey(){
+  if(!confirm(t('set.sec.nzbkey.confirm','Create a new NZB key?\n\nThe old one stops working immediately, so anything already submitting NZBs with it (NZB Donkey, scripts) has to be given the new key.')))
+    return;
+  const j=await api('nzbkey_new');
+  if(!j || j.status===false || !j.nzbkey){ toast(tErr(j&&j.error)||t('set.sec.apikey.err','Could not read the key.'), true); return; }
+  nzbkeyMem=j.nzbkey;  // authorizes an apikey bootstrap this session, same as typing one
+  const el=document.getElementById('s_nzbkey');
+  el.value=j.nzbkey;
+  const lost = j.saved === false;
+  if(lost) durNotice('nzbkey', t('set.sec.nzbkey','NZB key')); else durNoticeSaved('nzbkey');
+  const ok = lost ? t('toast.savedNotDurable','“{n}” is live now, but it could not be written to disk - it reverts when nzbfast restarts.',{n:t('set.sec.nzbkey','NZB key')})
+                  : t('set.sec.nzbkey.new.ok','New NZB key created. Paste it into anything that submits NZBs with the add-only key.');
+  try{ await navigator.clipboard.writeText(j.nzbkey); toast(lost?ok:t('set.sec.nzbkey.newcopied','New NZB key created and copied. Paste it into anything that submits NZBs with the add-only key.'), lost); }
+  catch(e){ toast(ok, lost); }
+  const b=document.getElementById('s_nzbkey_show');
+  if(b){ b.dataset.shown='1'; setHtml(b, t('set.sec.apikey.hide','Hide')); }
+  loadSettings();
+}
+
+// Settings backup: one JSON file with everything a lost /config takes
+// (settings, servers with their passwords, both keys). The server side
+// is backup_export / backup_import in serve/api/config.rs, both behind
+// the full API key.
+async function backupDownload(){
+  const j=await api('backup_export');
+  if(!j || j.status===false || !j.backup){ toast(tErr(j&&j.error)||t('set.sec.backup.err','Could not make the backup.'), true); return; }
+  const blob=new Blob([JSON.stringify(j.backup,null,2)],{type:'application/json'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download='nzbfast-backup-'+new Date().toISOString().slice(0,10)+'.json';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(a.href), 5000);
+  toast(t('set.sec.backup.done','Backup downloaded. It holds passwords and keys - keep the file private.'));
+}
+async function backupRestore(input){
+  const f=input.files&&input.files[0]; input.value='';
+  if(!f) return;
+  let bundle;
+  try{ bundle=JSON.parse(await f.text()); }
+  catch(e){ toast(t('set.sec.backup.notone','That file is not an nzbfast backup.'), true); return; }
+  if(!confirm(t('set.sec.backup.confirm','Restore this backup?\n\nEvery setting, server and key on this install is replaced by what the backup holds, and nzbfast restarts to apply it.')))
+    return;
+  const j=await apiPost('backup_import', bundle);
+  if(!j || j.status===false){ toast(tErr(j&&j.error)||t('set.sec.backup.notone','That file is not an nzbfast backup.'), true); return; }
+  toast(t('set.sec.backup.restored','Backup restored - restarting nzbfast to apply it.'));
+  // The user already confirmed the restart in the prompt above, so go
+  // straight to the API rather than through restartDaemon()'s own
+  // confirm. The one platform that cannot restart in place is told
+  // what to do instead.
+  const rj=await api('restart_daemon','',undefined,true);
+  if(rj && rj.status===false){
+    toast(rj.error==='restart-unsupported'
+      ? t('set.sec.backup.winrestart','Restored. Restart nzbfast from the system tray to apply it.')
+      : (tErr(rj.error)||rj.error||t('err.rejected','rejected')), true);
+  }
+}
+
 async function saveKey(name, el){
   const v=el.value.trim();
   if(!v) return; // blank = keep (never clear auth by accident)
@@ -6180,11 +6536,16 @@ async function loadSettings(){
   if(document.activeElement!==apf) apf.checked=!!c.auto_prefetch;
   const orr=document.getElementById('s_oracle_route');
   if(orr&&document.activeElement!==orr) orr.checked=!!c.oracle_route;
+  const phc=document.getElementById('s_post_health');
+  if(phc&&document.activeElement!==phc) phc.checked=!!c.post_health;
+  const phd=document.getElementById('s_post_health_defer');
+  if(phd&&document.activeElement!==phd) phd.checked=!!c.post_health_defer;
   [['s_auto_rename',c.auto_rename],['s_rename_resolution',c.rename_resolution],
    ['s_rename_vcodec',c.rename_vcodec],['s_rename_acodec',c.rename_acodec],
    ['s_rename_source',c.rename_source],['s_rename_group',c.rename_group],
    ['s_rename_year_parens',c.rename_year_parens],['s_rename_quality_brackets',c.rename_quality_brackets],
    ['s_rename_extra_words',c.rename_extra_words],['s_rename_identify',c.rename_identify],
+   ['s_rename_episode_titles',c.rename_episode_titles],
    ['s_rename_junk',c.rename_junk],['s_rename_media_only',c.rename_media_only]]
     .forEach(([id,v])=>{const el=document.getElementById(id);if(el&&document.activeElement!==el)el.checked=!!v;});
   renameToggles();
@@ -6218,6 +6579,10 @@ async function loadSettings(){
   // opposite.
   const pcl=document.getElementById('s_par_cleanup');
   if(document.activeElement!==pcl) pcl.checked = c.par_cleanup!==false;
+  // No default assumed: the daemon's default is per platform (off on
+  // Linux), and get_config always reports the live value.
+  const dtt=document.getElementById('s_delete_to_trash');
+  if(document.activeElement!==dtt) dtt.checked = c.delete_to_trash===true||c.delete_to_trash===1;
   put('s_failure_link', c.failure_link||'off');
   {
     // The four preferred-version pickers are one setting; the daemon
@@ -6254,7 +6619,21 @@ async function loadSettings(){
   // M35 phase 2: opt-IN, so === true (an absent value must read as off).
   const wex=document.getElementById('s_watchlist_external');
   if(wex&&document.activeElement!==wex) wex.checked=c.watchlist_external===true;
+  // §74: on by default, so !== false - and inert anyway without the
+  // built-in indexer, which is where the arrivals come from.
+  const win=document.getElementById('s_watchlist_instant');
+  if(win&&document.activeElement!==win) win.checked=c.watchlist_instant!==false;
   put('s_index_gates', c.index_gates||'');
+  // Pre feed. Opt-IN, so === true: an absent value must read as off.
+  const pdb=document.getElementById('s_predb_enabled');
+  if(pdb&&document.activeElement!==pdb) pdb.checked=c.predb_enabled===true;
+  put('s_predb_server', c.predb_server||'');
+  put('s_predb_channels', c.predb_channels||'');
+  for(const [el,key] of [['s_predb_corr_enabled','predb_corr_enabled'],
+                         ['s_predb_corr_auto','predb_corr_auto']]){
+    const n=document.getElementById(el);
+    if(n&&document.activeElement!==n) n.checked=c[key]===true;
+  }
   const ok=document.getElementById('s_omdb_key');
   if(document.activeElement!==ok){ ok.value=''; ok.placeholder=c.has_omdb?t('ph.keyset','set: paste a new key to replace'):t('ph.omdbunset','not set: paste your key here'); }
   put('s_index_db', c.index_db);
@@ -6270,7 +6649,7 @@ async function loadSettings(){
   EVICT_KIND_BOXES
     .forEach(([k,id])=>{ const el=document.getElementById(id);
       if(el&&document.activeElement!==el) el.checked=!ekinds.length||ekinds.includes(k); });
-  evictToggles(); refreshDbState();
+  evictToggles(); refreshDbState(); predbToggles(); refreshPredb(); refreshPredbCorr();
   put('s_library_cats', (c.library_cats||[]).join(', '));
   put('s_library_recheck_secs', c.library_recheck_secs);
   put('s_port', c.port);
@@ -6827,13 +7206,15 @@ function srvFormData(){
     // and is not what a blank box means, so coercing would turn "choose
     // for me" into "hold connections open forever" the first time
     // anyone opened this form.
-    max_source_ips:num(g('sv_maxips')),
-    idle_release_secs:num(g('sv_idlerel')),
-    idle_keep:num(g('sv_idlekeep')) };
+    max_source_ips:intOrBlank(g('sv_maxips')),
+    idle_release_secs:intOrBlank(g('sv_idlerel')),
+    idle_keep:intOrBlank(g('sv_idlekeep')) };
 }
 // '' for a blank or non-numeric box (the daemon clears the key), the
-// number otherwise - including 0.
-function num(v){ return v===''||isNaN(+v) ? '' : Math.max(0,Math.floor(+v)); }
+// number otherwise - including 0. NOT named num(): that is the page's
+// locale-aware num(v,d) formatter, and a second top-level declaration
+// hoists over it and strips the decimals off every size and speed.
+function intOrBlank(v){ return v===''||isNaN(+v) ? '' : Math.max(0,Math.floor(+v)); }
 async function saveServer(btn){ await busy(btn,t('busy.saving','Saving…'), async()=>{
   const j=await apiPost('server_save',{index:srvEditIdx, server:srvFormData()});
   if(!j.status){ toast(tErr(j.error)||t('err.rejected','rejected'), true); return; }
@@ -6911,6 +7292,63 @@ async function wipeIndex(btn){
     else toast(tErr(j.error)||t('err.failed','failed'), true);
     refreshDbState();
   });
+}
+// The relay settings only mean anything while the feed is on - greyed
+// rather than hidden, so the reason the card looks inert is visible.
+function predbToggles(){
+  const on=(document.getElementById('s_predb_enabled')||{}).checked;
+  document.querySelectorAll('.predb-sub input').forEach(el=>{ el.disabled=!on; });
+  // Correlation gates its own children, NOT on the feed switch: the
+  // imported history matches fine with the live connection off.
+  const corr=(document.getElementById('s_predb_corr_enabled')||{}).checked;
+  document.querySelectorAll('.corr-sub input,.corr-sub button').forEach(el=>{ el.disabled=!corr; });
+}
+// A feed that has quietly stopped working looks exactly like one with
+// nothing to announce, so report BOTH what it is doing and what it has
+// collected. Numbers are the honest part: "listening" alone would read
+// as success on a channel that has been renamed out from under us.
+async function refreshPredb(){
+  const el=document.getElementById('predbState'); if(!el) return;
+  predbToggles();
+  try{
+    const s=await api('predb_stats');
+    if(!s.index_enabled){ setHtml('predbState', t('predb.idxoff','the indexer is off, so there is nothing to name.')); return; }
+    if(!s.enabled){ setHtml('predbState', t('predb.off','not connected.')); return; }
+    const parts=[];
+    if(s.status) parts.push(esc(s.status));
+    if(s.lines!=null) parts.push(t('predb.held','{lines} announcements held, {nameable} of them naming a posted filename',
+                                   {lines:(+s.lines).toLocaleString(LOCALE),nameable:(+s.nameable).toLocaleString(LOCALE)}));
+    if(s.named!=null) parts.push(t('predb.named','{n} indexed releases named from the feed',
+                                   {n:(+s.named).toLocaleString(LOCALE)}));
+    setHtml('predbState', parts.join(' · '));
+  }catch(e){}
+}
+// The correlation half of the card: the status-by-status counters ARE
+// the precision meter (confirmed against rejected is the number that
+// earns keeping auto-apply on), and the seed importer reports here.
+async function refreshPredbCorr(){
+  const el=document.getElementById('predbSeedState'); if(!el) return;
+  try{
+    const s=await api('predb_stats');
+    const c=s.corr||{};
+    const n=k=>(+(c[k]||0)).toLocaleString(LOCALE);
+    const line=s.corr_enabled
+      ? t('predb.corr.state','{s} suggested · {a} applied · {c} confirmed · {r} rejected',
+          {s:n('suggested'),a:n('applied'),c:n('confirmed'),r:n('rejected')})
+      : '';
+    const seed=s.seed_running
+      ? t('predb.seed.running','importing: {msg}',{msg:s.seed_status||'…'})
+      : (s.seed_status?esc(s.seed_status):'');
+    setHtml('predbSeedState', [line,seed].filter(Boolean).join('<br>'));
+    const btn=document.getElementById('predbSeedBtn');
+    if(btn) btn.disabled=s.seed_running===true
+      || !(document.getElementById('s_predb_corr_enabled')||{}).checked;
+  }catch(e){}
+}
+async function startPredbSeed(){
+  const j=await api('predb_seed_start&days=180').catch(()=>({status:false}));
+  if(j&&j.status===false&&j.seed_status) setHtml('predbSeedState', esc(j.seed_status));
+  setTimeout(refreshPredbCorr,600);
 }
 // ---- Index database size: the cap, the eviction pass, the file itself ----
 // The size limit is a setting; deleting to honour it is a SEPARATE switch
@@ -7097,7 +7535,7 @@ function renderSetupSteps(c){
     {done:groups>0||(c.index_interests||'').length>0,
      t:t('setup.s3','Choose what to index'),
      h:groups ? tn('setup.s3.on',groups,'Indexing {n} newsgroup.','Indexing {n} newsgroups.')
-              : t('setup.s3.hint','optional: pick the kinds of thing you want indexed and they fill a browsable wall, the way a streaming app does. Nothing is indexed until you choose.'),
+              : t('setup.s3.hint','optional: pick the kinds of thing you want indexed and they fill a browsable wall of posters, the way a media library does. Nothing is indexed until you choose.'),
      cta:t('setup.s3.cta','Choose'), go:"goSetting('indexing')"},
   // Step 3 exists only while the built-in indexer does. It is off by
   // default now, so on a fresh install this checklist is two steps -

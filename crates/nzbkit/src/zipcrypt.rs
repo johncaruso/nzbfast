@@ -34,7 +34,11 @@ type HmacSha1 = Hmac<Sha1>;
 fn crc32_byte(crc: u32, b: u8) -> u32 {
     let mut c = crc ^ b as u32;
     for _ in 0..8 {
-        c = if c & 1 != 0 { (c >> 1) ^ 0xEDB8_8320 } else { c >> 1 };
+        c = if c & 1 != 0 {
+            (c >> 1) ^ 0xEDB8_8320
+        } else {
+            c >> 1
+        };
     }
     c
 }
@@ -58,7 +62,10 @@ impl ZipCrypto {
 
     fn update(&mut self, plain: u8) {
         self.k[0] = crc32_byte(self.k[0], plain);
-        self.k[1] = self.k[1].wrapping_add(self.k[0] & 0xFF).wrapping_mul(134_775_813).wrapping_add(1);
+        self.k[1] = self.k[1]
+            .wrapping_add(self.k[0] & 0xFF)
+            .wrapping_mul(134_775_813)
+            .wrapping_add(1);
         self.k[2] = crc32_byte(self.k[2], (self.k[1] >> 24) as u8);
     }
 
@@ -110,15 +117,16 @@ pub fn zipcrypto_check_byte(flags: u16, crc32: u32, dos_time: u16) -> u8 {
 /// out like rarcrypt's RAR5 chain rather than pulling a crate for a
 /// 20-line loop; pinned to the RFC 6070 vectors in the tests.
 pub fn pbkdf2_sha1(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u8]) {
-    let mut block: u32 = 1;
-    for chunk in out.chunks_mut(20) {
-        let mut mac = <HmacSha1 as Mac>::new_from_slice(password).expect("hmac accepts any key length");
+    for (block, chunk) in (1_u32..).zip(out.chunks_mut(20)) {
+        let mut mac =
+            <HmacSha1 as Mac>::new_from_slice(password).expect("hmac accepts any key length");
         mac.update(salt);
         mac.update(&block.to_be_bytes());
         let mut u = mac.finalize().into_bytes();
         let mut t = u;
         for _ in 1..iterations {
-            let mut m = <HmacSha1 as Mac>::new_from_slice(password).expect("hmac accepts any key length");
+            let mut m =
+                <HmacSha1 as Mac>::new_from_slice(password).expect("hmac accepts any key length");
             m.update(&u);
             u = m.finalize().into_bytes();
             for (a, b) in t.iter_mut().zip(u.iter()) {
@@ -126,7 +134,6 @@ pub fn pbkdf2_sha1(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u8]
             }
         }
         chunk.copy_from_slice(&t[..chunk.len()]);
-        block += 1;
     }
 }
 
@@ -176,7 +183,12 @@ impl AeCtr {
             32 => AnyAes::A256(aes::Aes256::new_from_slice(key).ok()?),
             _ => return None,
         };
-        Some(AeCtr { cipher, counter: 1, ks: [0; 16], used: 16 })
+        Some(AeCtr {
+            cipher,
+            counter: 1,
+            ks: [0; 16],
+            used: 16,
+        })
     }
 
     fn refill(&mut self) {
@@ -217,7 +229,11 @@ pub fn ae_derive(password: &[u8], salt: &[u8], key_len: usize) -> AeKeys {
     let verify = [dk[key_len * 2], dk[key_len * 2 + 1]];
     let mac_key = dk[key_len..key_len * 2].to_vec();
     dk.truncate(key_len);
-    AeKeys { enc_key: dk, mac_key, verify }
+    AeKeys {
+        enc_key: dk,
+        mac_key,
+        verify,
+    }
 }
 
 /// Incremental HMAC-SHA1 over the CIPHERTEXT (the AE authentication is
@@ -248,9 +264,24 @@ mod tests {
     #[test]
     fn pbkdf2_sha1_rfc6070_vectors() {
         let cases: [(&[u8], &[u8], u32, &str); 3] = [
-            (b"password", b"salt", 1, "0c60c80f961f0e71f3a9b524af6012062fe037a6"),
-            (b"password", b"salt", 2, "ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957"),
-            (b"password", b"salt", 4096, "4b007901b765489abead49d926f721d065a429c1"),
+            (
+                b"password",
+                b"salt",
+                1,
+                "0c60c80f961f0e71f3a9b524af6012062fe037a6",
+            ),
+            (
+                b"password",
+                b"salt",
+                2,
+                "ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957",
+            ),
+            (
+                b"password",
+                b"salt",
+                4096,
+                "4b007901b765489abead49d926f721d065a429c1",
+            ),
         ];
         for (pw, salt, c, want) in cases {
             let mut out = [0u8; 20];
@@ -260,7 +291,12 @@ mod tests {
         }
         // Multi-block output (dkLen > 20) - the AE shape (2*key+2).
         let mut out = [0u8; 25];
-        pbkdf2_sha1(b"passwordPASSWORDpassword", b"saltSALTsaltSALTsaltSALTsaltSALTsalt", 4096, &mut out);
+        pbkdf2_sha1(
+            b"passwordPASSWORDpassword",
+            b"saltSALTsaltSALTsaltSALTsaltSALTsalt",
+            4096,
+            &mut out,
+        );
         let got: String = out.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(got, "3d2eec4fe41c849b80c8d83662c0e44a8b291a964cf2f07038");
     }

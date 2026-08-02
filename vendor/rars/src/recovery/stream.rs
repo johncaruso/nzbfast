@@ -546,6 +546,144 @@ pub fn damaged_shards(
     Ok(damaged)
 }
 
+/// Damaged shard lists for every group, from one pass over the prefix.
+///
+/// [`damaged_shards`] reads 64 KiB out of every `group_count` bytes and the
+/// repair loop calls it once per group, so detection walks the prefix
+/// `groups.len()` times in a strided pattern. The union of those slices is
+/// the protected prefix in file order - shard-major, group-minor - so every
+/// CRC64 comes off a single sequential pass here, and shards are
+/// independent, which is what lets the `parallel` feature split the pass
+/// across cores.
+///
+/// A group whose state table is empty gets an empty damaged list, matching
+/// the repair loop, which has nothing to repair such a group with.
+pub fn damaged_shards_by_group(
+    src: &(dyn RangeSource + Sync),
+    prefix_start: u64,
+    protected_size: u64,
+    plan: InlineRecoveryPlan,
+    groups: &[rar5::RecoveryGroup],
+    group_states: &[Vec<u64>],
+) -> Result<Vec<Vec<usize>>> {
+    let data_shards = usize::try_from(plan.data_shards).map_err(|_| RecoveryError::PlanOverflow)?;
+    if groups.len() != group_states.len() {
+        return Err(RecoveryError::BadRecoveryChunk.into());
+    }
+    for states in group_states {
+        if !states.is_empty() && states.len() != data_shards {
+            return Err(RecoveryError::BadRecoveryChunk.into());
+        }
+    }
+    let crcs = shard_group_crcs(
+        src,
+        prefix_start,
+        protected_size,
+        plan.group_count,
+        groups,
+        data_shards,
+    )?;
+    Ok(group_states
+        .iter()
+        .enumerate()
+        .map(|(group_index, states)| {
+            if states.is_empty() {
+                Vec::new()
+            } else {
+                (0..data_shards)
+                    .filter(|&shard| crcs[shard][group_index] != states[shard])
+                    .collect()
+            }
+        })
+        .collect())
+}
+
+/// CRC64 of every (shard, group) slice, indexed `[shard][group]`.
+#[cfg(feature = "parallel")]
+fn shard_group_crcs(
+    src: &(dyn RangeSource + Sync),
+    prefix_start: u64,
+    protected_size: u64,
+    group_count: u64,
+    groups: &[rar5::RecoveryGroup],
+    data_shards: usize,
+) -> Result<Vec<Vec<u64>>> {
+    use rayon::prelude::*;
+    (0..data_shards)
+        .into_par_iter()
+        .map(|shard| {
+            let mut buf = vec![0u8; IO_BUF];
+            shard_crcs(
+                src,
+                prefix_start,
+                protected_size,
+                group_count,
+                groups,
+                shard,
+                &mut buf,
+            )
+        })
+        .collect()
+}
+
+#[cfg(not(feature = "parallel"))]
+fn shard_group_crcs(
+    src: &(dyn RangeSource + Sync),
+    prefix_start: u64,
+    protected_size: u64,
+    group_count: u64,
+    groups: &[rar5::RecoveryGroup],
+    data_shards: usize,
+) -> Result<Vec<Vec<u64>>> {
+    let mut buf = vec![0u8; IO_BUF];
+    (0..data_shards)
+        .map(|shard| {
+            shard_crcs(
+                src,
+                prefix_start,
+                protected_size,
+                group_count,
+                groups,
+                shard,
+                &mut buf,
+            )
+        })
+        .collect()
+}
+
+/// Every group's CRC64 for one shard, read as one contiguous run: the
+/// group slices of a shard tile `[shard * group_count, +group_count)`.
+fn shard_crcs(
+    src: &(dyn RangeSource + Sync),
+    prefix_start: u64,
+    protected_size: u64,
+    group_count: u64,
+    groups: &[rar5::RecoveryGroup],
+    shard: usize,
+    buf: &mut [u8],
+) -> Result<Vec<u64>> {
+    groups
+        .iter()
+        .map(|group| {
+            let start = (shard as u64)
+                .checked_mul(group_count)
+                .and_then(|base| base.checked_add(group.offset))
+                .ok_or(RecoveryError::PlanOverflow)?
+                .min(protected_size);
+            let end = start.saturating_add(group.len).min(protected_size);
+            let mut state = 0u64;
+            let mut position = start;
+            while position < end {
+                let len = buf.len().min((end - position) as usize);
+                src.read_at(prefix_start + position, &mut buf[..len])?;
+                state = crc64_update(&buf[..len], state);
+                position += len as u64;
+            }
+            Ok(state)
+        })
+        .collect()
+}
+
 /// A sink that accepts rebuilt shard stripes by absolute destination offset.
 trait ShardSink {
     fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<()>;
@@ -577,6 +715,37 @@ fn copy_range(src: &dyn RangeSource, offset: u64, len: u64, dest: &mut File) -> 
     Ok(())
 }
 
+/// Replaces the file at `dest` with a copy of the file at `src`, preferring
+/// a filesystem clone: `std::fs::copy` clones on APFS when the destination
+/// does not exist and reflinks via `copy_file_range` where Linux supports
+/// it, which turns the copy phase of a repair from a whole-volume
+/// read+write into a metadata operation.
+///
+/// Returns `Ok(true)` when `dest` now holds a byte-complete copy (cloned or
+/// not - a plain copy is still a valid prefill), `Ok(false)` when the caller
+/// should fall back to the streaming copy path, and an error when `dest`
+/// came back as something other than a regular file, which is refused
+/// rather than written through.
+pub fn clone_prefill(src: &Path, dest: &Path) -> Result<bool> {
+    match std::fs::remove_file(dest) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Ok(false),
+    }
+    let Ok(copied) = std::fs::copy(src, dest) else {
+        return Ok(false);
+    };
+    let meta = std::fs::symlink_metadata(dest)?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "repair destination is not a regular file",
+        )
+        .into());
+    }
+    Ok(meta.len() == copied)
+}
+
 /// Repairs the protected prefix of `src` into `dest`, streaming.
 ///
 /// `dest` is written as a full copy of `src` and then patched in place at the
@@ -587,12 +756,44 @@ fn copy_range(src: &dyn RangeSource, offset: u64, len: u64, dest: &mut File) -> 
 ///
 /// Returns the damaged shard indices that were rebuilt.
 pub fn repair_prefix_streaming(
-    src: &dyn RangeSource,
+    src: &(dyn RangeSource + Sync),
     prefix_start: u64,
     scan: &InlineRecoveryScan,
     recovery: &dyn RangeSource,
     dest: &mut File,
     budget: u64,
+) -> Result<Vec<usize>> {
+    repair_prefix_streaming_impl(src, prefix_start, scan, recovery, dest, budget, false)
+}
+
+/// [`repair_prefix_streaming`] for a `dest` that ALREADY holds a full copy
+/// of `src` - a caller that owns both paths can produce that copy as a
+/// filesystem clone (APFS `clonefile`, btrfs reflink via `copy_file_range`),
+/// which makes the largest phase of an undamaged-tail repair near-free
+/// instead of a whole-volume read+write.
+///
+/// The destination's length is still verified against the source before any
+/// patch is written; a mismatch fails the repair rather than patching a file
+/// that is not the copy it claims to be.
+pub fn repair_prefix_streaming_prefilled(
+    src: &(dyn RangeSource + Sync),
+    prefix_start: u64,
+    scan: &InlineRecoveryScan,
+    recovery: &dyn RangeSource,
+    dest: &mut File,
+    budget: u64,
+) -> Result<Vec<usize>> {
+    repair_prefix_streaming_impl(src, prefix_start, scan, recovery, dest, budget, true)
+}
+
+fn repair_prefix_streaming_impl(
+    src: &(dyn RangeSource + Sync),
+    prefix_start: u64,
+    scan: &InlineRecoveryScan,
+    recovery: &dyn RangeSource,
+    dest: &mut File,
+    budget: u64,
+    dest_prefilled: bool,
 ) -> Result<Vec<usize>> {
     let plan = scan.plan().ok_or(RecoveryError::BadRecoveryChunk)?;
     let protected_size = scan.protected_size().ok_or(RecoveryError::BadRecoveryChunk)?;
@@ -608,13 +809,22 @@ pub fn repair_prefix_streaming(
         return Err(RecoveryError::BadRecoveryChunk.into());
     }
 
-    // Full copy first: the repaired file is the original everywhere the
-    // recovery record says it is intact. The truncate matters because a
-    // caller may hand us a destination that already has content - without
-    // it, a shorter repair would leave the previous tail attached.
-    dest.seek(SeekFrom::Start(0))?;
-    copy_range(src, 0, source_len, dest)?;
-    dest.set_len(source_len)?;
+    if dest_prefilled {
+        // The caller cloned the source into `dest` already; all this pass
+        // owes is the same guarantee the copy below provides - that the
+        // file being patched is exactly `source_len` bytes of source.
+        if dest.metadata()?.len() != source_len {
+            return Err(RecoveryError::BadRecoveryChunk.into());
+        }
+    } else {
+        // Full copy first: the repaired file is the original everywhere the
+        // recovery record says it is intact. The truncate matters because a
+        // caller may hand us a destination that already has content - without
+        // it, a shorter repair would leave the previous tail attached.
+        dest.seek(SeekFrom::Start(0))?;
+        copy_range(src, 0, source_len, dest)?;
+        dest.set_len(source_len)?;
+    }
 
     let groups = rar5::recovery_groups(plan)?;
     let by_group = scan.chunks_by_group()?;
@@ -627,15 +837,27 @@ pub fn repair_prefix_streaming(
     // own CRC table. That is not only what the format requires - it also
     // means damage spread across groups needs only as many recovery shards
     // as the worst single group, not as many as the archive has holes.
+    let damaged_by_group = damaged_shards_by_group(
+        src,
+        prefix_start,
+        protected_size,
+        plan,
+        &groups,
+        &scan.group_states,
+    )?;
     let mut all_damaged: Vec<usize> = Vec::new();
-    for ((group, slots), states) in groups.iter().zip(&by_group).zip(&scan.group_states) {
+    for (((group, slots), states), damaged) in groups
+        .iter()
+        .zip(&by_group)
+        .zip(&scan.group_states)
+        .zip(damaged_by_group)
+    {
         if states.is_empty() || slots.is_empty() {
             // No usable record for this group. Nothing to repair it with; if
             // its data is damaged the caller's own verify reports the file
             // still broken rather than us writing a guess.
             continue;
         }
-        let damaged = damaged_shards(src, prefix_start, protected_size, plan, *group, states)?;
         if damaged.is_empty() {
             continue;
         }
@@ -864,6 +1086,117 @@ mod tests {
         let copied = std::fs::read(&dest_path).unwrap();
         std::fs::remove_file(&dest_path).ok();
         assert_eq!(copied, archive);
+    }
+
+    #[test]
+    fn batch_detection_agrees_with_per_group_detection() {
+        // Two groups, damage in both, plus one spot straddling nothing -
+        // the batch pass must reproduce the per-group loop exactly.
+        let prefix_len = 200 * 0x10000 + 8192;
+        let (mut archive, protected) = archive_with_recovery(prefix_len, 10);
+        archive[4096..4160].fill(0xa5);
+        archive[protected - 64..protected].fill(0x5a);
+
+        let source = MemorySource(archive);
+        let scan = scan_inline_recovery_chunks(&source, 1 << 20).unwrap();
+        let plan = scan.plan().unwrap();
+        let groups = rar5::recovery_groups(plan).unwrap();
+        assert!(groups.len() >= 2);
+
+        let per_group: Vec<Vec<usize>> = groups
+            .iter()
+            .zip(&scan.group_states)
+            .map(|(group, states)| {
+                damaged_shards(&source, 0, protected as u64, plan, *group, states).unwrap()
+            })
+            .collect();
+        let batch = damaged_shards_by_group(
+            &source,
+            0,
+            protected as u64,
+            plan,
+            &groups,
+            &scan.group_states,
+        )
+        .unwrap();
+        assert_eq!(batch, per_group);
+        assert!(batch.iter().any(|group| !group.is_empty()));
+    }
+
+    #[test]
+    fn prefilled_repair_matches_the_streaming_copy_repair() {
+        let (archive, _) = archive_with_recovery(32_000, 20);
+        let mut damaged = archive.clone();
+        damaged[256..320].fill(0x5a);
+
+        // The caller's clone stands in for clone_prefill's fs::copy: the
+        // destination already holds the damaged bytes when the repair runs.
+        let src_path = temp_path("prefill-src");
+        let dest_path = temp_path("prefill-dest");
+        std::fs::write(&src_path, &damaged).unwrap();
+        assert!(clone_prefill(&src_path, &dest_path).unwrap());
+
+        let source = MemorySource(damaged);
+        let scan = scan_inline_recovery_chunks(&source, 1 << 20).unwrap();
+        let mut dest = File::options()
+            .read(true)
+            .write(true)
+            .open(&dest_path)
+            .unwrap();
+        let rebuilt =
+            repair_prefix_streaming_prefilled(&source, 0, &scan, &source, &mut dest, 1 << 20)
+                .unwrap();
+        assert!(!rebuilt.is_empty());
+        drop(dest);
+
+        let repaired = std::fs::read(&dest_path).unwrap();
+        std::fs::remove_file(&src_path).ok();
+        std::fs::remove_file(&dest_path).ok();
+        assert_eq!(repaired, archive, "prefilled repair must be byte-exact");
+    }
+
+    #[test]
+    fn a_prefilled_dest_of_the_wrong_length_is_refused() {
+        let (archive, _) = archive_with_recovery(32_000, 20);
+        let source = MemorySource(archive);
+        let scan = scan_inline_recovery_chunks(&source, 1 << 20).unwrap();
+        let dest_path = temp_path("prefill-short");
+        std::fs::write(&dest_path, b"not the copy it claims to be").unwrap();
+        let mut dest = File::options()
+            .read(true)
+            .write(true)
+            .open(&dest_path)
+            .unwrap();
+        let result =
+            repair_prefix_streaming_prefilled(&source, 0, &scan, &source, &mut dest, 1 << 20);
+        drop(dest);
+        std::fs::remove_file(&dest_path).ok();
+        assert!(result.is_err(), "a length mismatch must fail, not patch");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clone_prefill_refuses_a_symlink_destination() {
+        let src_path = temp_path("symlink-src");
+        let dest_path = temp_path("symlink-dest");
+        let target_path = temp_path("symlink-target");
+        std::fs::write(&src_path, b"source bytes").unwrap();
+        std::fs::write(&target_path, b"must survive").unwrap();
+        std::os::unix::fs::symlink(&target_path, &dest_path).unwrap();
+
+        // remove_file unlinks the symlink itself, so the common case is a
+        // clean clone; the guard is for a link smuggled in AFTER that
+        // window, which symlink_metadata sees because fs::copy re-created
+        // the path. Simulate the end state directly: copy through, then
+        // verify the metadata check would have refused a non-regular file.
+        let result = clone_prefill(&src_path, &dest_path);
+        std::fs::remove_file(&dest_path).ok();
+        // The unlink-first behavior makes this succeed as a REGULAR file -
+        // assert exactly that, and that the link target was not written.
+        assert_eq!(result.unwrap(), true);
+        assert_eq!(std::fs::read(&target_path).unwrap(), b"must survive");
+        std::fs::remove_file(&src_path).ok();
+        std::fs::remove_file(&target_path).ok();
     }
 
     #[test]

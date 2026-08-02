@@ -22,11 +22,22 @@ services:
       - TZ=Etc/UTC
       # API key: the control API is published on your LAN (below), so on
       # first run nzbfast GENERATES a key and prints it in the logs
-      # (`docker logs nzbfast`) - use that in Sonarr/Radarr. To pin your
-      # own, set it here. To run keyless on a trusted network, NZBFAST_OPEN=1.
+      # (`docker logs nzbfast`) - use that in Sonarr/Radarr.
+      #
+      # Better, if you wire up Sonarr/Radarr: set your own key here and
+      # uncomment. A key in this file lives on the host and is re-applied
+      # on every start, so it survives the container being recreated,
+      # re-pulled, or rebuilt from scratch - your *arrs never need
+      # re-pairing. A key set later in the dashboard still wins over it.
+      # To run keyless on a trusted network, NZBFAST_OPEN=1.
       # - NZBFAST_APIKEY=change-me
       # - NZBFAST_OPEN=1
     volumes:
+      # ./ paths are anchored to THIS FILE's folder (not where you run the
+      # command from). The config volume IS your install - settings, API
+      # key, queue - so keep this file in place, and if you ever move it,
+      # move the folders with it or switch these to absolute paths.
+      # Updating never touches the volumes; see the manual's Updates page.
       - ./config:/config            # settings + index database
       - ./downloads:/downloads      # finished files
       - ./watch:/watch              # drop an .nzb here to auto-download

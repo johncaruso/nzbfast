@@ -14,6 +14,8 @@
 //! Also pinned: `p=` reaches the job's password (the durable record is
 //! the evidence), `t=` names the job, and junk is refused.
 
+mod scratch;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
@@ -22,22 +24,26 @@ use std::process::{Child, Command, Stdio};
 use nzbkit::nntp::OverEntry;
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 /// (status, body) of a GET; connection refusals retried, answers never.
 /// (See tests/newznab.rs for why zero-bytes-back is retried.)
 fn http_get(port: u16, req: &str) -> (u16, String) {
-    let msg = format!(
-        "GET {req} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-    );
+    let msg = format!("GET {req} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
     let mut last = String::new();
     for attempt in 0..5u32 {
         match http_once(port, &msg) {
             Ok(out) => return out,
             Err(e) => {
                 last = e.to_string();
-                std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(attempt) + 50));
+                std::thread::sleep(std::time::Duration::from_millis(
+                    100 * u64::from(attempt) + 50,
+                ));
             }
         }
     }
@@ -51,11 +57,21 @@ fn http_once(port: u16, msg: &str) -> std::io::Result<(u16, String)> {
     let read = s.read_to_string(&mut out);
     if out.is_empty() {
         return Err(read.err().unwrap_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "closed without answering")
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "closed without answering",
+            )
         }));
     }
-    let status: u16 = out.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
-    Ok((status, out.split("\r\n\r\n").nth(1).unwrap_or("").to_string()))
+    let status: u16 = out
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    Ok((
+        status,
+        out.split("\r\n\r\n").nth(1).unwrap_or("").to_string(),
+    ))
 }
 
 fn pct(s: &str) -> String {
@@ -102,10 +118,16 @@ async fn serve(dir: &Path, build: impl Fn(u16) -> Command) -> Daemon {
         .await
         .unwrap();
         if ready {
-            return Daemon { _child: child, port };
+            return Daemon {
+                _child: child,
+                port,
+            };
         }
         let tail = std::fs::read_to_string(&logfile).unwrap_or_default();
-        assert!(attempt < 2, "daemon exited without binding :{port}\n--- log ---\n{tail}");
+        assert!(
+            attempt < 2,
+            "daemon exited without binding :{port}\n--- log ---\n{tail}"
+        );
     }
     unreachable!()
 }
@@ -113,7 +135,9 @@ async fn serve(dir: &Path, build: impl Fn(u16) -> Command) -> Daemon {
 fn wait_ready(child: &mut KillOnDrop, port: u16, logfile: &Path) -> bool {
     let banner = format!("open the dashboard at  http://localhost:{port}/");
     for _ in 0..600 {
-        if std::fs::read_to_string(logfile).unwrap_or_default().contains(&banner)
+        if std::fs::read_to_string(logfile)
+            .unwrap_or_default()
+            .contains(&banner)
             && TcpStream::connect(("127.0.0.1", port)).is_ok()
         {
             return true;
@@ -167,10 +191,30 @@ const HEADER: &str = "7f3ac91e88a2";
 
 fn obfuscated_post() -> Vec<OverEntry> {
     vec![
-        over(1, &format!("\"{HEADER}.part01.rar\" yEnc (1/2)"), "<o1@x>", 4_000_000),
-        over(2, &format!("\"{HEADER}.part01.rar\" yEnc (2/2)"), "<o2@x>", 4_000_000),
-        over(3, &format!("\"{HEADER}.part02.rar\" yEnc (1/1)"), "<o3@x>", 3_000_000),
-        over(4, &format!("\"{HEADER}.par2\" yEnc (1/1)"), "<o4@x>", 400_000),
+        over(
+            1,
+            &format!("\"{HEADER}.part01.rar\" yEnc (1/2)"),
+            "<o1@x>",
+            4_000_000,
+        ),
+        over(
+            2,
+            &format!("\"{HEADER}.part01.rar\" yEnc (2/2)"),
+            "<o2@x>",
+            4_000_000,
+        ),
+        over(
+            3,
+            &format!("\"{HEADER}.part02.rar\" yEnc (1/1)"),
+            "<o3@x>",
+            3_000_000,
+        ),
+        over(
+            4,
+            &format!("\"{HEADER}.par2\" yEnc (1/1)"),
+            "<o4@x>",
+            400_000,
+        ),
     ]
 }
 
@@ -179,39 +223,56 @@ fn obfuscated_post() -> Vec<OverEntry> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pasted_link_resolves_from_our_own_index() {
     let dir = std::env::temp_dir().join(format!("nzbfast-lnk-local-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let db = dir.join("index.db");
     {
         let mut ix = nzbkit::index::Index::open(&db).unwrap();
-        ix.ingest("alt.binaries.boneless", &obfuscated_post(), 1_700_000_000).unwrap();
+        ix.ingest("alt.binaries.boneless", &obfuscated_post(), 1_700_000_000)
+            .unwrap();
     }
     let cfg = dir.join("config.json");
-    std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
-        .unwrap();
-    std::fs::write(cfg.with_file_name("settings.json"), "{\"index_enabled\": true}").unwrap();
+    std::fs::write(
+        &cfg,
+        "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}",
+    )
+    .unwrap();
+    std::fs::write(
+        cfg.with_file_name("settings.json"),
+        "{\"index_enabled\": true}",
+    )
+    .unwrap();
     let d = serve(&dir, |port| daemon_cmd(&dir, &cfg, &db, port, &[])).await;
     let port = d.port;
     let spool = cfg.with_file_name(".spool");
 
     tokio::task::spawn_blocking(move || {
         // Exactly what a board publishes, password and all.
-        let link = format!(
-            "nzblnk:?t=Der+Grosse+Film+2024&h={HEADER}&g=alt.binaries.boneless&p=v4c4t10n"
+        let link =
+            format!("nzblnk:?t=Der+Grosse+Film+2024&h={HEADER}&g=alt.binaries.boneless&p=v4c4t10n");
+        let (_, r) = http_get(
+            port,
+            &format!("/api?mode=addnzblnk&link={}&output=json", pct(&link)),
         );
-        let (_, r) =
-            http_get(port, &format!("/api?mode=addnzblnk&link={}&output=json", pct(&link)));
         let v: serde_json::Value = serde_json::from_str(&r).unwrap_or_default();
         assert_eq!(v["status"], true, "{r}");
-        assert_eq!(v["via"], "index", "the local rung should have answered: {r}");
+        assert_eq!(
+            v["via"], "index",
+            "the local rung should have answered: {r}"
+        );
         assert_eq!(v["partial"], false, "{r}");
         assert_eq!(v["nzo_ids"].as_array().map(Vec::len), Some(1), "{r}");
 
         // t= is the job name, not the header.
         let (_, q) = http_get(port, "/api?mode=queue&output=json");
-        assert!(q.contains("Der Grosse Film 2024"), "the title did not name the job:\n{q}");
-        assert!(!q.contains(HEADER), "the header leaked into the job name:\n{q}");
+        assert!(
+            q.contains("Der Grosse Film 2024"),
+            "the title did not name the job:\n{q}"
+        );
+        assert!(
+            !q.contains(HEADER),
+            "the header leaked into the job name:\n{q}"
+        );
 
         // p= reached the job's password, so the existing password-chain
         // unlock opens the archive with nothing more from the user. The
@@ -225,18 +286,32 @@ async fn a_pasted_link_resolves_from_our_own_index() {
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        assert!(saved.contains("\"password\": \"v4c4t10n\""), "password not stored:\n{saved}");
-        assert!(saved.contains("\"origin\": \"nzblnk\""), "origin not recorded:\n{saved}");
+        assert!(
+            saved.contains("\"password\": \"v4c4t10n\""),
+            "password not stored:\n{saved}"
+        );
+        assert!(
+            saved.contains("\"origin\": \"nzblnk\""),
+            "origin not recorded:\n{saved}"
+        );
 
         // A header nothing answers for fails with a reason, not a job.
-        let (_, miss) =
-            http_get(port, "/api?mode=addnzblnk&link=nzblnk%3A%3Fh%3Dnothinghere99&output=json");
+        let (_, miss) = http_get(
+            port,
+            "/api?mode=addnzblnk&link=nzblnk%3A%3Fh%3Dnothinghere99&output=json",
+        );
         let mv: serde_json::Value = serde_json::from_str(&miss).unwrap_or_default();
         assert_eq!(mv["status"], false, "{miss}");
-        assert!(mv["error"].as_str().unwrap_or("").contains("nothing found"), "{miss}");
+        assert!(
+            mv["error"].as_str().unwrap_or("").contains("nothing found"),
+            "{miss}"
+        );
 
         // Junk is refused by the parser, before any lookup.
-        for bad in ["https%3A%2F%2Fexample.invalid%2Fx.nzb", "nzblnk%3A%3Ft%3Donly+a+title"] {
+        for bad in [
+            "https%3A%2F%2Fexample.invalid%2Fx.nzb",
+            "nzblnk%3A%3Ft%3Donly+a+title",
+        ] {
             let (_, j) = http_get(port, &format!("/api?mode=addnzblnk&link={bad}&output=json"));
             assert!(j.contains("\"status\":false"), "{bad} was accepted: {j}");
         }
@@ -260,7 +335,10 @@ async fn a_pasted_link_resolves_from_our_own_index() {
         let rv: serde_json::Value = serde_json::from_str(&refused).unwrap_or_default();
         assert_eq!(rv["status"], false, "{refused}");
         assert!(
-            rv["error"].as_str().unwrap_or("").contains("too many links"),
+            rv["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("too many links"),
             "the refusal should say what to do: {refused}"
         );
     })
@@ -274,8 +352,7 @@ async fn a_pasted_link_resolves_from_our_own_index() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_link_we_cannot_resolve_locally_goes_to_the_indexers() {
     let dir = std::env::temp_dir().join(format!("nzbfast-lnk-pull-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // Peer A holds the posting and publishes it over its own facade.
     let dir_a = dir.join("a");
@@ -283,12 +360,20 @@ async fn a_link_we_cannot_resolve_locally_goes_to_the_indexers() {
     let db_a = dir_a.join("index.db");
     {
         let mut ix = nzbkit::index::Index::open(&db_a).unwrap();
-        ix.ingest("alt.binaries.boneless", &obfuscated_post(), 1_700_000_000).unwrap();
+        ix.ingest("alt.binaries.boneless", &obfuscated_post(), 1_700_000_000)
+            .unwrap();
     }
     let cfg_a = dir_a.join("config.json");
-    std::fs::write(&cfg_a, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
-        .unwrap();
-    std::fs::write(cfg_a.with_file_name("settings.json"), "{\"index_enabled\": true}").unwrap();
+    std::fs::write(
+        &cfg_a,
+        "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}",
+    )
+    .unwrap();
+    std::fs::write(
+        cfg_a.with_file_name("settings.json"),
+        "{\"index_enabled\": true}",
+    )
+    .unwrap();
     let a = serve(&dir_a, |port| daemon_cmd(&dir_a, &cfg_a, &db_a, port, &[])).await;
     let port_a = a.port;
 
@@ -297,8 +382,11 @@ async fn a_link_we_cannot_resolve_locally_goes_to_the_indexers() {
     let dir_b = dir.join("b");
     std::fs::create_dir_all(&dir_b).unwrap();
     let cfg_b = dir_b.join("config.json");
-    std::fs::write(&cfg_b, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
-        .unwrap();
+    std::fs::write(
+        &cfg_b,
+        "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}",
+    )
+    .unwrap();
     let db_b = dir_b.join("index.db");
     let b = serve(&dir_b, |port| daemon_cmd(&dir_b, &cfg_b, &db_b, port, &[])).await;
     let port_b = b.port;
@@ -307,26 +395,39 @@ async fn a_link_we_cannot_resolve_locally_goes_to_the_indexers() {
         // With no indexers configured yet, the link has nowhere to go -
         // and says so rather than reporting a queued job.
         let link = format!("nzblnk:?h={HEADER}&t=Ein+Anderer+Film");
-        let (_, none) =
-            http_get(port_b, &format!("/api?mode=addnzblnk&link={}&output=json", pct(&link)));
+        let (_, none) = http_get(
+            port_b,
+            &format!("/api?mode=addnzblnk&link={}&output=json", pct(&link)),
+        );
         assert!(none.contains("\"status\":false"), "{none}");
 
         let entry =
             format!(r#"[{{"name":"peer","url":"http://127.0.0.1:{port_a}/api","apikey":"x"}}]"#);
         let (_, r) = http_get(
             port_b,
-            &format!("/api?mode=config&name=indexers&value={}&output=json", pct(&entry)),
+            &format!(
+                "/api?mode=config&name=indexers&value={}&output=json",
+                pct(&entry)
+            ),
         );
         assert!(r.contains("true"), "{r}");
 
-        let (_, r) =
-            http_get(port_b, &format!("/api?mode=addnzblnk&link={}&output=json", pct(&link)));
+        let (_, r) = http_get(
+            port_b,
+            &format!("/api?mode=addnzblnk&link={}&output=json", pct(&link)),
+        );
         let v: serde_json::Value = serde_json::from_str(&r).unwrap_or_default();
         assert_eq!(v["status"], true, "{r}");
-        assert_eq!(v["via"], "peer", "the indexer rung should have answered: {r}");
+        assert_eq!(
+            v["via"], "peer",
+            "the indexer rung should have answered: {r}"
+        );
 
         let (_, q) = http_get(port_b, "/api?mode=queue&output=json");
-        assert!(q.contains("Ein Anderer Film"), "the job is not in the queue:\n{q}");
+        assert!(
+            q.contains("Ein Anderer Film"),
+            "the job is not in the queue:\n{q}"
+        );
     })
     .await
     .unwrap();
@@ -350,7 +451,11 @@ fn leaky_indexer(secret: &str) -> u16 {
             let Ok(mut s) = stream else { break };
             let mut buf = [0u8; 2048];
             let n = s.read(&mut buf).unwrap_or(0);
-            let line = String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or("").to_string();
+            let line = String::from_utf8_lossy(&buf[..n])
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string();
             let body = if line.contains("/getnzb") {
                 // Declare a body far over FETCH_MAX_BYTES so fetch_url
                 // refuses it before reading, naming the URL as it does.
@@ -386,30 +491,38 @@ fn leaky_indexer(secret: &str) -> u16 {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_grab_must_not_echo_the_indexer_apikey() {
     let dir = std::env::temp_dir().join(format!("nzbfast-lnk-leak-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     const SECRET: &str = "sUpErSeCrEtApIkEy1234";
     let mock = leaky_indexer(SECRET);
     let cfg = dir.join("config.json");
-    std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
-        .unwrap();
+    std::fs::write(
+        &cfg,
+        "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}",
+    )
+    .unwrap();
     let db = dir.join("index.db");
     let d = serve(&dir, |port| daemon_cmd(&dir, &cfg, &db, port, &[])).await;
     let port = d.port;
 
     tokio::task::spawn_blocking(move || {
-        let entry =
-            format!(r#"[{{"name":"leaky","url":"http://127.0.0.1:{mock}/api","apikey":"{SECRET}"}}]"#);
+        let entry = format!(
+            r#"[{{"name":"leaky","url":"http://127.0.0.1:{mock}/api","apikey":"{SECRET}"}}]"#
+        );
         let (_, r) = http_get(
             port,
-            &format!("/api?mode=config&name=indexers&value={}&output=json", pct(&entry)),
+            &format!(
+                "/api?mode=config&name=indexers&value={}&output=json",
+                pct(&entry)
+            ),
         );
         assert!(r.contains("true"), "{r}");
 
         let link = format!("nzblnk:?h={HEADER}&t=Leak+Probe");
-        let (_, body) =
-            http_get(port, &format!("/api?mode=addnzblnk&link={}&output=json", pct(&link)));
+        let (_, body) = http_get(
+            port,
+            &format!("/api?mode=addnzblnk&link={}&output=json", pct(&link)),
+        );
         assert!(
             !body.contains(SECRET),
             "the indexer apikey reached the browser:\n{body}"
@@ -435,15 +548,20 @@ async fn a_failed_grab_must_not_echo_the_indexer_apikey() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_add_only_key_cannot_spend_indexer_quota() {
     let dir = std::env::temp_dir().join(format!("nzbfast-lnk-tier-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
     let cfg = dir.join("config.json");
-    std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
-        .unwrap();
+    std::fs::write(
+        &cfg,
+        "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}",
+    )
+    .unwrap();
     let db = dir.join("index.db");
     let d = serve(&dir, |port| {
         let mut c = daemon_cmd(&dir, &cfg, &db, port, &[]);
-        c.arg("--apikey").arg("fullkey").arg("--nzbkey").arg("addkey");
+        c.arg("--apikey")
+            .arg("fullkey")
+            .arg("--nzbkey")
+            .arg("addkey");
         c
     })
     .await;
@@ -481,7 +599,10 @@ async fn the_add_only_key_cannot_spend_indexer_quota() {
             port,
             &format!("/api?mode=addnzblnk&apikey=fullkey&link={link}&output=json"),
         );
-        assert!(!full.contains("API Key"), "the full key was refused:\n{full}");
+        assert!(
+            !full.contains("API Key"),
+            "the full key was refused:\n{full}"
+        );
         assert!(full.contains("nothing found"), "{full}");
     })
     .await

@@ -27,6 +27,7 @@
 //! so callers work through [`AesKey`] and [`EntryKeys`] rather than
 //! assuming a 32-byte key and a header-supplied IV.
 
+use crate::sync::MutexExt;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -147,7 +148,11 @@ fn pbkdf2_chain(password: &[u8], salt: &[u8; 16], lg2_count: u8) -> Rar5Keys {
     for (i, b) in check_src.iter().enumerate() {
         psw_check[i % 8] ^= b;
     }
-    Rar5Keys { key, hash_key, psw_check }
+    Rar5Keys {
+        key,
+        hash_key,
+        psw_check,
+    }
 }
 
 /// KDF cache: a multi-volume set repeats ONE (salt, count) pair in every
@@ -166,13 +171,13 @@ pub fn derive_keys(password: &str, salt: &[u8; 16], lg2_count: u8) -> Option<Rar
     }
     let ck = (password.as_bytes().to_vec(), *salt, lg2_count);
     {
-        let g = KDF_CACHE.lock().unwrap();
+        let g = KDF_CACHE.lock_ok();
         if let Some(hit) = g.as_ref().and_then(|m| m.get(&ck)) {
             return Some(hit.clone());
         }
     }
     let keys = pbkdf2_chain(password.as_bytes(), salt, lg2_count);
-    let mut g = KDF_CACHE.lock().unwrap();
+    let mut g = KDF_CACHE.lock_ok();
     let m = g.get_or_insert_with(HashMap::new);
     if m.len() >= KDF_CACHE_MAX {
         m.clear();
@@ -210,13 +215,13 @@ static KDF4_CACHE: Mutex<Option<HashMap<(Vec<u8>, Option<[u8; 8]>), Rar4Keys>>> 
 pub fn derive_keys_v4(password: &str, salt: Option<[u8; 8]>) -> Rar4Keys {
     let ck = (password.as_bytes().to_vec(), salt);
     {
-        let g = KDF4_CACHE.lock().unwrap();
+        let g = KDF4_CACHE.lock_ok();
         if let Some(hit) = g.as_ref().and_then(|m| m.get(&ck)) {
             return hit.clone();
         }
     }
     let keys = rar4_schedule(password, salt);
-    let mut g = KDF4_CACHE.lock().unwrap();
+    let mut g = KDF4_CACHE.lock_ok();
     let m = g.get_or_insert_with(HashMap::new);
     if m.len() >= KDF_CACHE_MAX {
         m.clear();
@@ -260,14 +265,21 @@ fn rar4_schedule_short(raw: &[u8]) -> Rar4Keys {
     let mut iv = [0u8; 16];
     for i in 0..RAR4_ROUNDS {
         sha1.update(raw);
-        sha1.update([(i & 0xff) as u8, ((i >> 8) & 0xff) as u8, ((i >> 16) & 0xff) as u8]);
+        sha1.update([
+            (i & 0xff) as u8,
+            ((i >> 8) & 0xff) as u8,
+            ((i >> 16) & 0xff) as u8,
+        ]);
         // Every 16th of the rounds contributes one IV byte: the last byte
         // of the digest the chain has reached at that point.
         if i.is_multiple_of(RAR4_ROUNDS / 16) {
             iv[(i / (RAR4_ROUNDS / 16)) as usize] = sha1.clone().finalize()[19];
         }
     }
-    Rar4Keys { key: rar4_key_from_digest(&sha1.finalize()), iv }
+    Rar4Keys {
+        key: rar4_key_from_digest(&sha1.finalize()),
+        iv,
+    }
 }
 
 /// The full schedule, including RAR3's in-place mutation of the password
@@ -290,13 +302,20 @@ fn rar4_schedule_long(raw: &mut Vec<u8>) -> Rar4Keys {
             }
         }
         pos = pos.wrapping_add(raw_size as u32);
-        sha1.update([(i & 0xff) as u8, ((i >> 8) & 0xff) as u8, ((i >> 16) & 0xff) as u8]);
+        sha1.update([
+            (i & 0xff) as u8,
+            ((i >> 8) & 0xff) as u8,
+            ((i >> 16) & 0xff) as u8,
+        ]);
         pos = pos.wrapping_add(3);
         if i.is_multiple_of(RAR4_ROUNDS / 16) {
             iv[(i / (RAR4_ROUNDS / 16)) as usize] = sha1.clone().finalize()[19];
         }
     }
-    Rar4Keys { key: rar4_key_from_digest(&sha1.finalize()), iv }
+    Rar4Keys {
+        key: rar4_key_from_digest(&sha1.finalize()),
+        iv,
+    }
 }
 
 /// One 64-byte block of RAR3's password-buffer mutation: expand it as a
@@ -346,9 +365,9 @@ pub fn mac_crc32_with_key(hash_key: &[u8; 32], crc: u32) -> u32 {
         <HmacSha256 as Mac>::new_from_slice(hash_key).expect("HMAC accepts any key length");
     mac.update(&crc.to_le_bytes());
     let digest = mac.finalize().into_bytes();
-    digest
-        .chunks_exact(4)
-        .fold(0u32, |acc, c| acc ^ u32::from_le_bytes(c.try_into().unwrap()))
+    digest.chunks_exact(4).fold(0u32, |acc, c| {
+        acc ^ u32::from_le_bytes(c.try_into().unwrap())
+    })
 }
 
 /// [`mac_crc32_with_key`] against a derived key set.
@@ -581,7 +600,10 @@ mod tests {
     #[test]
     fn rar4_kdf_matches_the_fork_on_the_password_mutation_path() {
         let pw = "this-password-is-deliberately-long-enough-to-exceed-64-bytes-utf16";
-        assert!(pw.len() * 2 + 8 >= 64, "case must exercise the mutation path");
+        assert!(
+            pw.len() * 2 + 8 >= 64,
+            "case must exercise the mutation path"
+        );
         let keys = derive_keys_v4(pw, Some(*b"longsalt"));
         let mut data = *b"0123456789abcdefRAR AES CBC data";
         CbcEncStream::new(&AesKey::Aes128(keys.key), &keys.iv).encrypt(&mut data);
@@ -624,6 +646,52 @@ mod tests {
         dec.decrypt(a);
         dec.decrypt(b);
         assert_eq!(buf, plain);
+    }
+
+    /// Perf gate for the RustCrypto stack (the aes/cbc generation this
+    /// crate pins): decrypt 1 GiB of AES-CBC through [`CbcStream`] - the
+    /// exact path every encrypted-RAR byte takes - and print MB/s. Run
+    /// explicitly, in release, alone (a second test in the process
+    /// contends for the same cores):
+    ///
+    /// ```sh
+    /// cargo test -p nzbkit --release --lib -- --ignored --test-threads=1 \
+    ///   --exact rarcrypt::tests::aes_cbc_decrypt_throughput --nocapture
+    /// ```
+    ///
+    /// Hardware AES is unmissable here (~230 MB/s soft vs multi-GB/s on
+    /// AES-NI/ARMv8, measured 2026-07-21) - a dependency bump that
+    /// silently drops the hardware backend fails this by 50x, and a
+    /// same-backend regression shows up as a percentage. Not asserted,
+    /// by design: boxes vary; the number is for a human gate. This gate
+    /// is what kept the aes 0.9/cbc 0.2 convergence out on 2026-08-01
+    /// (see deny.toml's bans note for the numbers).
+    #[test]
+    #[ignore = "perf measurement - run in release with --nocapture"]
+    fn aes_cbc_decrypt_throughput() {
+        const CHUNK: usize = 64 * 1024 * 1024;
+        const PASSES: usize = 16; // 16 x 64 MiB = 1 GiB
+        let mut buf = vec![0u8; CHUNK];
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(31).wrapping_add(7);
+        }
+        for (label, key) in [
+            ("AES-256-CBC (RAR5)", AesKey::Aes256([0x42; 32])),
+            ("AES-128-CBC (RAR4)", AesKey::Aes128([0x42; 16])),
+        ] {
+            let mut dec = CbcStream::new(&key, &[7u8; 16]);
+            let t = std::time::Instant::now();
+            for _ in 0..PASSES {
+                dec.decrypt(&mut buf);
+            }
+            let secs = t.elapsed().as_secs_f64();
+            let mb = (PASSES * CHUNK) as f64 / 1e6;
+            std::hint::black_box(&buf);
+            println!(
+                "{label} decrypt: {:.0} MB/s ({secs:.3} s for {mb:.0} MB)",
+                mb / secs
+            );
+        }
     }
 
     /// The fold is keyed: the same CRC under a different password folds

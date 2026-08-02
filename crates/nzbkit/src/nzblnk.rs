@@ -152,7 +152,8 @@ fn decode(s: &str) -> String {
 fn is_group(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 128
-        && s.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'_' | b'+'))
+        && s.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'_' | b'+'))
         && s.contains('.')
 }
 
@@ -213,7 +214,9 @@ pub fn parse(s: &str) -> Result<NzbLnk, NzbLnkError> {
         }
     }
 
-    let header = header.filter(|h| !h.is_empty()).ok_or(NzbLnkError::NoHeader)?;
+    let header = header
+        .filter(|h| !h.is_empty())
+        .ok_or(NzbLnkError::NoHeader)?;
     out.header = clip(&header, MAX_HEADER);
     out.title = match title {
         Some(t) if !t.is_empty() => clip(&t, MAX_TITLE),
@@ -367,11 +370,24 @@ mod tests {
 
     #[test]
     fn junk_is_rejected() {
-        for s in ["", "   ", "hello", "http://example.invalid/x.nzb", "nzb:?h=abc", "nzblnk"] {
+        for s in [
+            "",
+            "   ",
+            "hello",
+            "http://example.invalid/x.nzb",
+            "nzb:?h=abc",
+            "nzblnk",
+        ] {
             assert_eq!(parse(s), Err(NzbLnkError::NotALink), "{s}");
             assert!(!looks_like(s), "{s}");
         }
-        for s in ["nzblnk:", "nzblnk:?", "nzblnk:?t=Title&p=pw", "nzblnk:?h=", "nzblnk:?h=%20%20"] {
+        for s in [
+            "nzblnk:",
+            "nzblnk:?",
+            "nzblnk:?t=Title&p=pw",
+            "nzblnk:?h=",
+            "nzblnk:?h=%20%20",
+        ] {
             assert_eq!(parse(s), Err(NzbLnkError::NoHeader), "{s}");
         }
     }
@@ -383,9 +399,14 @@ mod tests {
         assert_eq!(l.header.len(), MAX_HEADER);
         assert_eq!(l.title.len(), MAX_TITLE);
         assert_eq!(l.password.len(), MAX_PASSWORD);
-        let many: String =
-            (0..80).map(|i| format!("&g=alt.binaries.g{i}")).collect::<Vec<_>>().join("");
-        assert_eq!(parse(&format!("nzblnk:?h=abc{many}")).unwrap().groups.len(), MAX_GROUPS);
+        let many: String = (0..80)
+            .map(|i| format!("&g=alt.binaries.g{i}"))
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(
+            parse(&format!("nzblnk:?h=abc{many}")).unwrap().groups.len(),
+            MAX_GROUPS
+        );
         // The title FALLBACK is capped too, not just an explicit `t`. A long
         // header with no title used to hand back MAX_HEADER (1024) chars of
         // title - twice the cap - which reaches the UI and a filesystem stem.

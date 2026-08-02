@@ -190,9 +190,15 @@ pub fn strip_muxer_credit(title: &str) -> &str {
         && tail.contains('.')
         && !tail.starts_with('.')
         && !tail.ends_with('.')
-        && tail.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+        && tail
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
     let head = head.trim_end();
-    if domainish && !head.is_empty() { head } else { title }
+    if domainish && !head.is_empty() {
+        head
+    } else {
+        title
+    }
 }
 
 fn read_float(b: &[u8]) -> Option<f64> {
@@ -231,7 +237,10 @@ pub fn facts(b: &[u8]) -> Option<crate::media::MediaFacts> {
         return None;
     }
 
-    let mut info = MediaFacts { container: "mkv", ..MediaFacts::default() };
+    let mut info = MediaFacts {
+        container: "mkv",
+        ..MediaFacts::default()
+    };
     let mut scale: f64 = 1_000_000.0; // TimestampScale default, ns
     let mut raw_duration: Option<f64> = None;
 
@@ -355,10 +364,10 @@ pub fn facts(b: &[u8]) -> Option<crate::media::MediaFacts> {
             let payload = &b[body..end];
             match id {
                 TIMESTAMP_SCALE => {
-                    if let Some(v) = read_uint(payload) {
-                        if v > 0 {
-                            scale = v as f64;
-                        }
+                    if let Some(v) = read_uint(payload)
+                        && v > 0
+                    {
+                        scale = v as f64;
                     }
                 }
                 DURATION => raw_duration = read_float(payload),
@@ -367,9 +376,7 @@ pub fn facts(b: &[u8]) -> Option<crate::media::MediaFacts> {
                 // hostile override of what we already believed.
                 TITLE if info.title.is_none() => info.title = read_title(payload),
                 TRACK_TYPE => track.kind = read_uint(payload),
-                PIXEL_WIDTH => {
-                    track.width = read_uint(payload).and_then(|v| u32::try_from(v).ok())
-                }
+                PIXEL_WIDTH => track.width = read_uint(payload).and_then(|v| u32::try_from(v).ok()),
                 PIXEL_HEIGHT => {
                     track.height = read_uint(payload).and_then(|v| u32::try_from(v).ok())
                 }
@@ -393,12 +400,13 @@ pub fn facts(b: &[u8]) -> Option<crate::media::MediaFacts> {
         }
     }
 
-    if let Some(d) = raw_duration {
-        if d.is_finite() && d >= 0.0 {
-            let secs = d * scale / 1e9;
-            if secs.is_finite() {
-                info.duration_secs = Some(secs);
-            }
+    if let Some(d) = raw_duration
+        && d.is_finite()
+        && d >= 0.0
+    {
+        let secs = d * scale / 1e9;
+        if secs.is_finite() {
+            info.duration_secs = Some(secs);
         }
     }
     let empty = info.duration_secs.is_none()
@@ -523,12 +531,12 @@ pub fn test_mux_tracks(
         if let Some(l) = lang {
             entry.extend(el(&[0x22, 0xB5, 0x9C], l.as_bytes()));
         }
-        if *kind == TRACK_VIDEO {
-            if let Some((w, h)) = dims {
-                let mut video = el(&[0xB0], &w.to_be_bytes()[2..]);
-                video.extend(el(&[0xBA], &h.to_be_bytes()[2..]));
-                entry.extend(el(&[0xE0], &video));
-            }
+        if *kind == TRACK_VIDEO
+            && let Some((w, h)) = dims
+        {
+            let mut video = el(&[0xB0], &w.to_be_bytes()[2..]);
+            video.extend(el(&[0xBA], &h.to_be_bytes()[2..]));
+            entry.extend(el(&[0xE0], &video));
         }
         entries.extend(el(&[0xAE], &entry));
     }
@@ -624,7 +632,10 @@ mod tests {
         // cannot know where the next element begins - refuse rather than
         // resynchronise on whatever follows.
         let trailer = [0x1C, 0x53, 0xBB, 0x6B, 0xFF]; // Cues, unknown size
-        assert_eq!(parse(&streamed_mkv(Some(2700.0), Some((1920, 1080)), &trailer)), None);
+        assert_eq!(
+            parse(&streamed_mkv(Some(2700.0), Some((1920, 1080)), &trailer)),
+            None
+        );
     }
 
     #[test]
@@ -672,25 +683,43 @@ mod tests {
     #[test]
     fn a_title_is_read_and_its_muxer_credit_stripped() {
         let name = "Example.Movie.2019.1080p.BluRay.x264-GRP";
-        let b = test_mux_titled(Some(60.0), Some((1920, 1080)), Some(&format!("{name}, RMZ.cr")));
+        let b = test_mux_titled(
+            Some(60.0),
+            Some((1920, 1080)),
+            Some(&format!("{name}, RMZ.cr")),
+        );
         assert_eq!(parse(&b).unwrap().title.as_deref(), Some(name));
         // A Title-only mux still parses: the fields are independent, and
         // an obfuscated post's container is exactly where this pays.
         let b = test_mux_titled(None, None, Some(name));
         assert_eq!(parse(&b).unwrap().title.as_deref(), Some(name));
         // No Title element at all.
-        assert_eq!(parse(&test_mux(Some(60.0), Some((1920, 1080)))).unwrap().title, None);
+        assert_eq!(
+            parse(&test_mux(Some(60.0), Some((1920, 1080))))
+                .unwrap()
+                .title,
+            None
+        );
     }
 
     #[test]
     fn muxer_credits_are_stripped_structurally_not_by_name() {
         // The known signature, and its siblings.
-        assert_eq!(strip_muxer_credit("A.Film.2019.1080p-GRP, RMZ.cr"), "A.Film.2019.1080p-GRP");
-        assert_eq!(strip_muxer_credit("A.Film.2019-GRP,rarbg.to"), "A.Film.2019-GRP");
+        assert_eq!(
+            strip_muxer_credit("A.Film.2019.1080p-GRP, RMZ.cr"),
+            "A.Film.2019.1080p-GRP"
+        );
+        assert_eq!(
+            strip_muxer_credit("A.Film.2019-GRP,rarbg.to"),
+            "A.Film.2019-GRP"
+        );
         // A comma inside a real title is not a credit: the tail has to
         // read as a bare domain.
         assert_eq!(strip_muxer_credit("Hello, World 2019"), "Hello, World 2019");
-        assert_eq!(strip_muxer_credit("Fire, Walk With Me"), "Fire, Walk With Me");
+        assert_eq!(
+            strip_muxer_credit("Fire, Walk With Me"),
+            "Fire, Walk With Me"
+        );
         // Nothing left over after stripping is not a strip at all.
         assert_eq!(strip_muxer_credit(", RMZ.cr"), ", RMZ.cr");
         assert_eq!(strip_muxer_credit("A Film"), "A Film");
@@ -702,8 +731,15 @@ mod tests {
     #[test]
     fn hostile_titles_are_bounded_and_sanitised() {
         let long = "x".repeat(5_000);
-        let got = parse(&test_mux_titled(None, None, Some(&long))).unwrap().title.unwrap();
-        assert!(got.len() <= MAX_TITLE, "a {}-byte title escaped the cap", got.len());
+        let got = parse(&test_mux_titled(None, None, Some(&long)))
+            .unwrap()
+            .title
+            .unwrap();
+        assert!(
+            got.len() <= MAX_TITLE,
+            "a {}-byte title escaped the cap",
+            got.len()
+        );
         // Control characters (a newline injected into a name) are gone.
         let got = parse(&test_mux_titled(None, None, Some("Film.2019\n\u{7}-GRP")))
             .unwrap()
@@ -711,7 +747,12 @@ mod tests {
             .unwrap();
         assert_eq!(got, "Film.2019-GRP");
         // A whitespace-only Title is no Title.
-        assert_eq!(parse(&test_mux_titled(Some(60.0), None, Some("   "))).unwrap().title, None);
+        assert_eq!(
+            parse(&test_mux_titled(Some(60.0), None, Some("   ")))
+                .unwrap()
+                .title,
+            None
+        );
     }
 
     #[test]
@@ -791,7 +832,10 @@ mod tests {
         let mut entry = el(&[0x83], &[2]);
         entry.extend(el(&[0x86], &[0xFF, 0xFE, 0x00, 0x41]));
         entry.extend(el(&[0x22, 0xB5, 0x9C], &[0xC3, 0xA9, 0xC3, 0xA9]));
-        let mut seg = el(&[0x15, 0x49, 0xA9, 0x66], &el(&[0x44, 0x89], &6000f32.to_be_bytes()));
+        let mut seg = el(
+            &[0x15, 0x49, 0xA9, 0x66],
+            &el(&[0x44, 0x89], &6000f32.to_be_bytes()),
+        );
         seg.extend(el(&[0x16, 0x54, 0xAE, 0x6B], &el(&[0xAE], &entry)));
         let mut out = el(&[0x1A, 0x45, 0xDF, 0xA3], &[]);
         out.extend(el(&[0x18, 0x53, 0x80, 0x67], &seg));

@@ -1,0 +1,60 @@
+#!/bin/zsh
+# Write the OFFLINE copy of a manual: the shipped HTML with the shared
+# design tokens inlined.
+#
+#   packaging/make-offline-manual.sh <src.html> <dest.html>
+#
+# docs/MANUAL.html carries `__NZBFAST_UI_TOKENS__` in its <head>, and the
+# daemon substitutes web/ui-tokens.html for it when it serves /manual.
+# Every packager copied the RAW file instead - Windows installer, macOS
+# DMG, Homebrew, portable zips - so the shipped manual carried the marker
+# as visible body text and then styled itself against CSS variables that
+# were never declared. Nobody who opened it from an installer saw the
+# page the daemon serves.
+#
+# Substituting at package time keeps ONE source of truth: the marker
+# stays in docs/, the tokens stay in web/, and no copy of the palette is
+# forked into the manual where it would drift.
+set -euo pipefail
+
+if [ $# -ne 2 ]; then
+  echo "usage: $0 <src.html> <dest.html>" >&2
+  exit 1
+fi
+
+SRC=$1
+DEST=$2
+REPO=$(cd "$(dirname "$0")/.." && pwd)
+TOKENS="$REPO/web/ui-tokens.html"
+
+[ -f "$SRC" ] || { echo "no such manual: $SRC" >&2; exit 1; }
+[ -f "$TOKENS" ] || { echo "no such token file: $TOKENS" >&2; exit 1; }
+
+mkdir -p "$(dirname "$DEST")"
+# Read the marker's replacement from a file rather than building a sed
+# expression out of 13 KB of CSS: the tokens contain &, /, backslashes
+# and newlines, all of which sed would interpret.
+awk -v tokfile="$TOKENS" '
+  index($0, "__NZBFAST_UI_TOKENS__") {
+    n = index($0, "__NZBFAST_UI_TOKENS__")
+    printf "%s", substr($0, 1, n - 1)
+    while ((getline line < tokfile) > 0) print line
+    close(tokfile)
+    print substr($0, n + length("__NZBFAST_UI_TOKENS__"))
+    next
+  }
+  { print }
+' "$SRC" > "$DEST"
+
+# Fail rather than ship a manual that still names the marker. This is the
+# whole point of the script, and a silent no-op here is exactly the bug
+# it replaces.
+if grep -q "__NZBFAST_" "$DEST"; then
+  echo "make-offline-manual: $DEST still carries an unsubstituted marker" >&2
+  exit 1
+fi
+if ! grep -q -- "--bg" "$DEST"; then
+  echo "make-offline-manual: $DEST has no design tokens - substitution did nothing" >&2
+  exit 1
+fi
+echo "offline manual: $DEST"

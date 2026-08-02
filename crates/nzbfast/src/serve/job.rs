@@ -1,0 +1,2341 @@
+use super::*;
+use std::path::Path;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum JobState {
+    Queued,
+    Downloading,
+    Completed,
+    Failed,
+}
+
+pub struct Job {
+    pub nzo_id: String,
+    pub name: String,
+    pub nzb_path: PathBuf,
+    /// Where this job came from: "dashboard", "watch" (watch folder),
+    /// "rss", "arr", "watchlist", "url", "wall", "indexer" (M35 pull
+    /// search). Shown in the queue and history drawers, because "why is
+    /// this downloading?" was unanswerable from the UI - the record
+    /// simply had no such field, though it was assumed to.
+    pub origin: String,
+    pub category: String,
+    pub state: JobState,
+    pub total_bytes: u64,
+    pub out_dir: PathBuf,
+    pub fail_message: String,
+    /// The console block behind `fail_message`, captured when the job
+    /// failed. Empty for everything that did not fail (and on platforms
+    /// where the log tee does not run). See `fail_detail_snapshot`.
+    pub fail_detail: String,
+    pub finished_at: Option<Instant>,
+    /// Is post-processing in flight for this job right now?
+    ///
+    /// `finalize_completed` writes the job's new `out_dir` only as its
+    /// LAST statement, so for the whole of post-processing - the A6
+    /// hand-over, unlock, cleanup, rename, TV filing and the move to a
+    /// NAS, which is minutes on a large release - the durable record says
+    /// "Completed, payload is at X" while the payload is on its way to Y.
+    /// Nothing recorded that the work was in flight, so a restart in that
+    /// window filed the job to history as a clean success over a
+    /// half-moved directory, and Sonarr either imported a partial file or
+    /// stalled on a path that no longer held anything.
+    ///
+    /// Writing the intent down first is what makes the two cases
+    /// distinguishable at all: cleared means post-processing finished,
+    /// set means it did not. Nothing can tell them apart after the fact,
+    /// which is why neither "re-run it" nor "call it failed" was a safe
+    /// blind fix - a payload that finished moving leaves `out_dir`
+    /// pointing at a directory that no longer exists, and a re-run finds
+    /// nothing to do.
+    pub finalizing: bool,
+    /// SHA-256 of the NZB this job was created from, so "is this exact
+    /// NZB already queued?" survives a restart.
+    ///
+    /// The watch folder's only durable "I consumed this" marker was
+    /// deleting the file, and its in-memory `watch_failed` map is gone
+    /// after a restart. So whenever the delete could not happen - a share
+    /// that refuses it (the code explicitly anticipates that), a crash
+    /// between the queue write and the unlink, or an ENOSPC that made the
+    /// poller keep the file on purpose - the next start re-ingested the
+    /// surviving .nzb and downloaded the whole release a second time. For
+    /// a name with no SxxEyy or year there is no dupe_key either, so
+    /// nothing caught it, on every restart, forever.
+    pub nzb_sha: String,
+    /// When the job finished, in unix seconds, for anything that has to
+    /// survive a restart. `finished_at` is an `Instant` - monotonic,
+    /// process-local, and NOT persisted - so after a restart every
+    /// history row reported an age of zero and clients (nzb360,
+    /// LunaSea) showed a week of history as finished seconds ago,
+    /// re-sorted it wrongly, and re-notified every old item as new.
+    pub finished_unix: Option<i64>,
+    /// SABnzbd priority: 2 Force, 1 High, 0 Normal, -1 Low, -100 Default.
+    /// Force jobs start even while the queue is paused.
+    pub priority: i32,
+    pub paused: bool,
+    /// Times this job was sent back from history via mode=retry. The
+    /// article journal in out_dir makes each retry fetch only what's
+    /// still missing.
+    pub retries: u32,
+    /// M14f: normalized release identity ("show/s1e2", "movie/2026").
+    /// Jobs sharing a key are duplicates; later arrivals are held as
+    /// ALTERNATIVEs and auto-promoted if the original fails.
+    pub dupe_key: Option<String>,
+    /// M14i metadata-only mode: availability-check instead of downloading;
+    /// the NZB in the spool is the library entry, a .strm file the pointer.
+    pub library: bool,
+    /// A real download of this job has completed (bytes are on disk).
+    pub fetched: bool,
+    /// User deleted this job while it was DOWNLOADING: the pipeline is
+    /// being aborted; park() drops the record instead of filing it in
+    /// history (the user said remove, not fail).
+    pub tombstone: bool,
+    /// The delete that tombstoned this active job also asked for its files
+    /// (del_files=1). We must NOT remove them from the delete handler - the
+    /// pipeline is still writing and would recreate them right after - so
+    /// park() removes them once the fetch has drained and the writers are
+    /// gone. Not persisted (only ever true for the moment between abort and
+    /// park).
+    pub del_on_drop: bool,
+    /// M23e: queue pause aborted this job mid-download. The tail handler
+    /// re-queues it (the article journal resumes it later) instead of
+    /// failing it into history.
+    pub suspended: bool,
+    /// History stats: decoded bytes + wall-clock seconds of the network
+    /// phase (stamped at network-drain; tail/repair time excluded so
+    /// bytes÷seconds IS the average download speed).
+    pub downloaded_bytes: u64,
+    pub elapsed_secs: f64,
+    /// Slow-job watchdog: this job was demoted for being single-server-
+    /// bound and slow while other jobs waited. pick_job runs deferred
+    /// jobs only when nothing else is runnable; any user priority change
+    /// or drag-reorder clears the flag.
+    pub deferred: bool,
+    /// Why the watchdog deferred it (shown in the dashboard drawer).
+    pub defer_reason: String,
+    /// Times deferred - bounded so a job can't churn forever.
+    pub defer_count: u32,
+    /// Set by the watchdog just before aborting the pipeline: park()
+    /// must requeue this job (deferred, back of the queue) instead of
+    /// filing it in history as Failed.
+    pub demote: bool,
+    /// Archive password for encrypted RAR sets: the SAB API `password`
+    /// parameter, a `{{password}}` suffix on the submitted name, or the
+    /// NZB's `<meta type="password">`. Never exposed through the API -
+    /// only its existence is (has_password).
+    pub password: Option<String>,
+    /// In-stream verify: PAR2 blocks that hashed bad during this job's
+    /// download (0 = clean; feeds the dashboard's verify-health timeline).
+    pub bad_blocks: u64,
+    /// M23: the Smart Folder rule that matched at enqueue asked for TV
+    /// filing ([Show]/Season NN/ + rename) at completion.
+    pub tv_sort: bool,
+    /// TV filing actually RAN: `out_dir` is the SHARED `Show/Season NN`
+    /// library folder, not this job's private directory. Every operation
+    /// that treats out_dir as "this job's stuff" (delete-with-files,
+    /// recategorize, a retry's re-download) has to know, and it cannot be
+    /// re-derived from `state`: a retry re-queues the job, and the shape
+    /// test `tv_sort && Completed && "Season NN"` would then say "not
+    /// filed" about a directory that still holds the whole season.
+    /// Persisted for the same reason - a restart must not forget it.
+    pub filed: bool,
+    /// The quality suffix TV filing actually appended to this job's
+    /// episode files, as [`Daemon::finalize_names`] computed it under the
+    /// naming settings that stood at the time. `Some("")` is a real
+    /// answer - with auto-rename off, filing writes a bare
+    /// `{base}.{ext}` - and `None` means "not filed, or filed before this
+    /// was recorded".
+    ///
+    /// Persisted, and deliberately NOT recomputed when a delete needs it.
+    /// The rename settings are live: an install that turned auto-rename
+    /// off after an episode was filed recomputed an EMPTY suffix, and an
+    /// empty suffix matches the episode base plus ANY rename tail. A
+    /// watchlist upgrade then deleted both the copy it superseded and the
+    /// replacement it had just filed beside it, and the slot still
+    /// recorded the new release as owned, so it was never re-grabbed.
+    /// See [`delete_suffix`].
+    pub filed_suffix: Option<String>,
+    /// The episode-title segment TV filing appended to this job's episode
+    /// base (" - Children"), when `rename_episode_titles` was on and the
+    /// cached episode list knew the title. Empty means the file on disk
+    /// carries no title, which is every job filed before TODO 78 and
+    /// every job filed with the setting off.
+    ///
+    /// Persisted, and matched LITERALLY rather than recomputed, for a
+    /// sharper version of [`Job::filed_suffix`]'s reason: the episode
+    /// list behind it is refreshed from a third party every 12 hours.
+    /// A provider that re-spells an episode, or a user who turns the
+    /// setting off, would recompute a name that is not the one on disk -
+    /// and a name that is not on disk is at best a no-op delete and at
+    /// worst a match on a neighbouring file. `None` on an unfiled job,
+    /// and on records written before this field existed.
+    pub filed_title: Option<String>,
+    /// The STEM TV filing keyed on, when it was not this job's own name.
+    ///
+    /// Filing derives `Show/Season NN/Show - S01E02` from a release
+    /// stem, and since the identity ladder landed that stem is not
+    /// always `name`: an obfuscated post identified by an oracle is
+    /// filed under the name the oracle gave, because "a4f9c2e1" is not
+    /// a show. Every later operation on a filed job - delete this
+    /// episode without its siblings, play this episode out of a shared
+    /// season folder - has to look for the files that were actually
+    /// written, so it needs the same stem back.
+    ///
+    /// Persisted for exactly the reason [`Job::filed_suffix`] is: the
+    /// oracle's answer is not reproducible from the record, and a
+    /// restart that forgot it would leave a filed episode findable by
+    /// nothing. `None` on an unfiled job, and on any record written
+    /// before this existed - both of which mean "the name".
+    pub filed_base: Option<String>,
+    /// M24: completion found password-protected volumes and no (or a
+    /// wrong) password - the dashboard offers "unlock" on this job.
+    pub password_required: bool,
+    /// The NZB's own file list is zip-shaped, spotted at enqueue. Warns
+    /// in the queue before the download spends an hour arriving at a
+    /// format we cannot unpack. Name-based, so an obfuscated container
+    /// is invisible here and only [`Job::unpack_blocked_by`] catches it.
+    pub zip_packed: bool,
+    /// Name of an archive a COMPLETED job left packed because we have no
+    /// unpacker for it (today: any zip). Empty for a clean unpack.
+    ///
+    /// Sidecars only - a `Subs/subs.zip` beside a feature that unpacked
+    /// fine. A zip that IS the payload fails the job instead and reports
+    /// through `fail_message`, because Completed on an unusable release
+    /// is a conclusion an *arr acts on: it stops looking, and the series
+    /// sits stuck forever.
+    ///
+    /// Stored as the bare NAME, not a sentence: the dashboard has to
+    /// compose the message in the user's own language.
+    pub unpack_blocked_by: String,
+    /// What the extractor found this set to be: the space-separated
+    /// `ArchiveShape` tokens (`rar5 store one-pass`, `rar4 compressed
+    /// on-disk`, ...). Empty while nothing archive-shaped has parsed yet,
+    /// and on jobs that predate the field.
+    ///
+    /// Tokens, not a sentence, for the same reason as
+    /// [`Job::unpack_blocked_by`]: the dashboard composes the badge in
+    /// the user's own language. A downloading job's badge comes from the
+    /// live extractor instead (see `queue_json`) - this field is the
+    /// latched copy that survives into history.
+    pub archive_shape: String,
+    /// CRC32 of the first inner file this job's RAR headers named, as
+    /// the extractor latched it (see `Extractor::inner_crc`). 0 = the
+    /// headers were encrypted, or the set was not RAR-wrapped at all.
+    ///
+    /// Kept because it is an exact key into the open release databases
+    /// and the headers it came from do not survive the download: the
+    /// volumes are usually never written to disk. Persisted so a
+    /// restart does not have to re-derive it, and so a job whose lookup
+    /// failed offline can be asked about later.
+    pub inner_crc: u32,
+    /// What an identity oracle said this release actually is: the
+    /// canonical name, and the IMDb id that came with it. Empty when
+    /// nothing was asked or nothing answered.
+    ///
+    /// This is a SECOND opinion beside `name`, never a replacement for
+    /// it: `name` is what the user (or the *arr) submitted and every
+    /// client matches on it, so overwriting it would break the round
+    /// trip. Rename reads this; the API reports both.
+    pub identity_name: String,
+    pub identity_imdb: String,
+    /// Which oracle answered ("srrdb", "xrel", "par-hash", "mkv-title").
+    /// Shown beside the name, because "srrdb says" and "the container
+    /// says" are different degrees of confidence and the user is
+    /// entitled to tell them apart.
+    pub identity_src: String,
+    /// M32: a first failure with missing articles
+    /// schedules ONE automatic retry - propagation lag often fills the
+    /// gaps in. Unix seconds when the retry is due; the article journal
+    /// makes the rerun fetch only what's still missing.
+    pub auto_retry_at: Option<u64>,
+    /// M26 nzbget facade: post-processing parameters attached by the
+    /// jsonrpc `append` (name/value pairs). Sonarr/Radarr tag every add
+    /// with a `drone` GUID and match queue/history items ONLY by that
+    /// parameter - it must round-trip through listgroups/history.
+    pub pp_params: Vec<(String, String)>,
+    /// This job was given its own directory because a previously
+    /// COMPLETED job of the same name still had its payload on disk; on
+    /// success it takes over that canonical directory (see
+    /// `publish_over_previous`). `None` for the ordinary case where the
+    /// job already owns the canonical name.
+    pub replaces: Option<PathBuf>,
+    /// `X-DNZB-Failure` from the fetch that produced this NZB: the
+    /// indexer's own "this one was bad, here is another" endpoint. Empty
+    /// for an uploaded file, and for indexers that don't send it.
+    pub failure_link: String,
+    /// Host of the URL the NZB was fetched FROM - the only host this
+    /// job's failure link is allowed to point at. Without it the header
+    /// is an arbitrary URL, supplied by whatever server answered the
+    /// fetch, that the daemon later GETs from inside the user's network
+    /// (the SSRF guard deliberately permits LAN indexers). An indexer
+    /// may report a dead post to itself and nowhere else.
+    pub failure_host: String,
+    /// Was that fetch over TLS? Host equality alone would let an
+    /// `https://indexer/...` NZB hand back an `http://indexer/...` link
+    /// and quietly move a relationship the user had encrypted onto
+    /// plaintext - where the query string (which carries their indexer
+    /// apikey) is readable by anything on the path.
+    pub failure_https: bool,
+    /// How many failure-link replacements deep this job already is. A
+    /// replacement that also fails asks for another, and an indexer with
+    /// a long list of dead posts would otherwise walk the whole list
+    /// unattended. See `FAILURE_REGRAB_MAX`.
+    pub failure_depth: u8,
+    /// What post-download synthesised naming concluded about an
+    /// obfuscated payload: the container facts on the first line, then
+    /// one candidate film per line. Empty for every job the ladder did
+    /// not run on, which is nearly all of them.
+    ///
+    /// Recorded on the DECLINING outcomes above all, because that is
+    /// where it earns its place: the gate refuses to rename unless one
+    /// film survives, so the usual answer is "here is what your file is,
+    /// and here is the shortlist" and the user finishes the job. On the
+    /// accepting outcome the filename already says it, and this is the
+    /// audit trail for why.
+    ///
+    /// Free text in ENGLISH, unlike [`Job::unpack_blocked_by`]: it is
+    /// evidence (runtimes, codecs, film titles), not a status the
+    /// dashboard composes a sentence from, and the film titles inside it
+    /// are not ours to translate.
+    pub identify: String,
+    /// TODO §77: what a STAT sample of this post's articles across every
+    /// configured server said when the job was added. `None` until the
+    /// prober has run (and forever, if the operator turned it off).
+    ///
+    /// ADVISORY. Nothing may fail, block or remove a job because of what
+    /// is in here - see [`crate::health`] for why a post missing on
+    /// every server is not proof of anything. Persisted so a restart
+    /// keeps the badge (and the failure-time evidence) instead of
+    /// re-probing every queued job on every start.
+    pub health: Option<crate::health::PostHealth>,
+    /// §76: what the main video actually IS, read from its own container
+    /// header, plus anything the release name claims that those bytes
+    /// deny. `None` until the prober has an answer - which for most jobs
+    /// is a few seconds after the download starts, and for an archive
+    /// shape that only writes its payload at unpack time is the final
+    /// on-disk pass after post-processing.
+    ///
+    /// Latched onto the job rather than recomputed per request for the
+    /// same reason [`Job::archive_shape`] is: the queue and history are
+    /// polled every second by every open dashboard, and the writers this
+    /// came from are gone by the time history shows it.
+    pub media: Option<nzbkit::mediaprobe::MediaFacts>,
+}
+
+/// What [`Daemon::finalize_names`] needs to know about the job it is
+/// filing. A struct rather than more positional parameters because the
+/// list had reached four same-typed strings and bools, and a caller
+/// swapping `name` and `cat` would have compiled.
+pub struct FinalizeJob<'a> {
+    pub name: &'a str,
+    pub cat: &'a str,
+    pub tv_sort: bool,
+    /// The year this release was POSTED, which bounds an identified
+    /// film's release year from above. From the NZB's own article dates
+    /// (see [`post_year_of`]), not from the clock: a back-catalogue grab
+    /// of a 2019 film downloaded today is a 2019 post.
+    pub post_year: u32,
+}
+
+/// Everything post-processing learned that the durable job record has to
+/// keep. Replaced a tuple when the third field arrived - see the field
+/// docs for why each one can only be known here.
+pub struct Finalized {
+    /// The job's new directory, when renaming or the move-completed
+    /// destination changed it.
+    pub moved: Option<PathBuf>,
+    /// The quality suffix filing actually wrote. See [`Job::filed_suffix`].
+    pub suffix: String,
+    /// The episode-title segment filing actually wrote (" - Children"),
+    /// empty when titles were off or the cache did not know this one.
+    /// See [`Job::filed_title`].
+    pub filed_title: String,
+    /// What synthesised naming concluded, for [`Job::identify`]. Empty
+    /// when the ladder did not run.
+    pub identify: String,
+}
+
+/// The year a release was posted, from the newest article date in its
+/// NZB. Zero when the NZB is unreadable or carries no dates - callers
+/// fall back to the current year, which is right for a fresh grab and is
+/// the only guess available.
+///
+/// NEWEST rather than oldest: a repost or a fill tops up an old NZB with
+/// recent articles, and it is the most recent posting that bounds how
+/// new the film can be.
+pub fn post_year_of(nzb_path: &std::path::Path) -> u32 {
+    let Ok(bytes) = std::fs::read(nzb_path) else {
+        return 0;
+    };
+    let Ok(nzb) = nzbkit::nzb::Nzb::parse(&bytes) else {
+        return 0;
+    };
+    let newest = nzb.files.iter().map(|f| f.date).max().unwrap_or(0);
+    if newest <= 0 {
+        return 0;
+    }
+    // Same epoch-to-civil-year arithmetic the identifier uses; there is
+    // no chrono in the tree.
+    crate::identify::year_of_unix(newest)
+}
+
+/// Keeps the index paused for the entire lifetime of a foreground job,
+/// including verification/repair/extraction after its network phase.
+/// Tails may overlap the next job, so this is a counter rather than a
+/// boolean.
+pub(super) struct IndexJobGuard(pub(super) Arc<AtomicUsize>);
+
+impl Drop for IndexJobGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// A secondary download running on ONLY the servers the active job
+/// leaves idle (their copies of its articles keep 430ing). Its own hub
+/// gives it independent abort control and pool stats; its writes land in
+/// the job's normal out_dir + journal, so however it ends - completion,
+/// abort at active-job end, or "these servers don't have it either" -
+/// nothing is lost: the eventual primary run resumes from the journal.
+pub struct Sidecar {
+    pub nzo_id: String,
+    pub hub: Arc<crate::StreamHub>,
+    /// Decoded bytes so far (dashboard shows prefetch progress).
+    pub progress: Arc<AtomicU64>,
+    /// Pre-armed cancel: the pipeline installs its own abort flag into
+    /// the hub only once it starts - this one is checked by the task
+    /// BEFORE that, so a stop can never miss the install window.
+    pub cancelled: Arc<std::sync::atomic::AtomicBool>,
+    pub task: tokio::task::JoinHandle<()>,
+    /// True when this sidecar runs on connections BORROWED from servers
+    /// busy on the active job (no healthy idle server existed). An idle
+    /// sidecar suppresses the defer verdict - the idle capacity is
+    /// already on the next job, so demoting the slow one buys nothing.
+    /// A borrowed sidecar claims no idle capacity, so that reasoning
+    /// does not apply and the watchdog stays armed.
+    pub borrowed: bool,
+}
+
+/// Abort the sidecar (if any) and wait for it to wind down. Called by
+/// the runner at every primary-job end - the next pick may be the very
+/// job the sidecar holds open, and two pipelines must never share an
+/// out_dir or a server's connection budget. The abort is re-fired on a
+/// short interval because the pipeline installs its hub abort/queue-ctl
+/// handles asynchronously after launch.
+///
+/// This waits for the DOWNLOAD only. A sidecar that completed its job
+/// hands the post-processing tail to a task of its own (see
+/// `spawn_sidecar`), so the queue never waits on a move to a NAS.
+pub(super) async fn stop_sidecar(d: &Arc<Daemon>) {
+    let sc = d.sidecar.lock_ok().take();
+    if let Some(mut sc) = sc {
+        sc.cancelled.store(true, Ordering::Relaxed);
+        loop {
+            if let Some(f) = sc.hub.abort.lock_ok().as_ref() {
+                f.store(true, Ordering::Relaxed);
+            }
+            if let Some(c) = sc.hub.queue_ctl.lock_ok().as_ref() {
+                c.abort();
+            }
+            // A timeout means the handles are not installed yet - re-fire.
+            if tokio::time::timeout(std::time::Duration::from_millis(250), &mut sc.task)
+                .await
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
+}
+
+/// Launch the idle-server prefetch pipeline for `job` (see Sidecar).
+///
+/// `fleet` is the host set the sidecar may download on:
+/// - `borrow == false`: the idle hosts. The exclusion list is every host
+///   that IS serving the active job plus exhausted block accounts and
+///   auth-refused hosts - the sidecar may only touch idle capacity.
+/// - `borrow == true`: healthy BUSY hosts, used when no healthy idle
+///   server exists (the 31 Jul soak state: the only idle server
+///   auth-refused, and cross-job tail-overlap simply never engaged -
+///   49 s line-idle of a 144 s queue vs ~2% healthy). Each host stays in
+///   the sidecar's fleet but its pool is capped (hub.host_conn_caps) to
+///   a 1-2 connection slice sized into the headroom between the active
+///   job's fleet and the provider cap, so the next job's tail-overlap
+///   engages without starving the active job. When there is no headroom
+///   (the active fleet already fills the account limit) the single
+///   borrowed connection may be capacity-refused; the sidecar's own pool
+///   answers 481s by yielding, never hammering (see AuthState in
+///   nzbkit::pool), and picks the slot up as the active job's tail
+///   releases it - which is exactly when tail-overlap wants it.
+pub(super) fn spawn_sidecar(
+    d: &Arc<Daemon>,
+    config: &Path,
+    job: &Arc<Mutex<Job>>,
+    fleet: &[String],
+    deltas: &[(String, u64)],
+    budget: nzbkit::mem::MemBudget,
+    borrow: bool,
+) {
+    let (nzo_id, nzb_path, out_dir, password) = {
+        let g = job.lock_ok();
+        (
+            g.nzo_id.clone(),
+            g.nzb_path.clone(),
+            g.out_dir.clone(),
+            g.password.clone(),
+        )
+    };
+    let total: u64 = deltas.iter().map(|(_, b)| b).sum();
+    let cfg_loaded = nzbkit::config::Config::load(config).ok();
+    let block: std::collections::HashSet<String> = cfg_loaded
+        .as_ref()
+        .map(|c| {
+            c.servers
+                .iter()
+                .filter(|s| {
+                    s.block_bytes
+                        .is_some_and(|b| b > 0 && d.usage_lifetime(&s.host) >= b)
+                })
+                .map(|s| s.host.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    // Servers the active job's pool has recorded a refusal for (bad
+    // credential or connection/IP cap) moved no bytes, so the busy-host
+    // test below never catches them - but they are dead weight, not idle
+    // capacity, and the sidecar must not build its fleet on them. The
+    // pool clears the note on the next successful connect, so a cap that
+    // lifts re-qualifies the host for the NEXT spawn.
+    let refused: std::collections::HashSet<String> = d
+        .hub
+        .pool_live
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|l| {
+            l.servers
+                .iter()
+                .filter(|s| s.refusal.lock_ok().is_some())
+                .map(|s| s.host.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    // The caller filters too, but enforcement must not depend on it.
+    let fleet: Vec<String> = fleet
+        .iter()
+        .filter(|h| !refused.contains(*h) && !block.contains(*h))
+        .cloned()
+        .collect();
+    if fleet.is_empty() {
+        return;
+    }
+    // The borrowed slice per host: the provider cap (config `connections`
+    // - "we typically use far fewer") minus the active job's fleet is
+    // free headroom; take up to 2 connections of it so active + sidecar
+    // never overcount the account limit. With zero headroom, take 1 and
+    // let the pool's capacity-refusal handling wait it out (doc above).
+    let caps: std::collections::HashMap<String, usize> = if borrow {
+        let global = d.connections.load(Ordering::Relaxed).max(1);
+        fleet
+            .iter()
+            .filter_map(|h| {
+                let acct = cfg_loaded
+                    .as_ref()?
+                    .servers
+                    .iter()
+                    .find(|s| &s.host == h)?
+                    .connections
+                    .max(1) as usize;
+                let headroom = acct.saturating_sub(global.min(acct));
+                Some((h.clone(), headroom.clamp(1, 2)))
+            })
+            .collect()
+    } else {
+        Default::default()
+    };
+    // A borrowed host without a computed cap (config unreadable, or the
+    // host vanished from it) must not join the fleet at all - an
+    // uncapped "borrow" would be a full second fleet on a busy server.
+    // Narrowed BEFORE the exclusion list is built, so a dropped host
+    // falls back into it (it is busy) instead of slipping through both.
+    let fleet: Vec<String> = if borrow {
+        let kept: Vec<String> = fleet.into_iter().filter(|h| caps.contains_key(h)).collect();
+        if kept.is_empty() {
+            return;
+        }
+        kept
+    } else {
+        fleet
+    };
+    let mut excl: Vec<String> = deltas
+        .iter()
+        .filter(|(_, b)| (*b as f64) >= total as f64 * 0.01)
+        // Borrow mode deliberately keeps its (busy) fleet hosts in.
+        .filter(|(h, _)| !(borrow && fleet.contains(h)))
+        .map(|(h, _)| h.clone())
+        .collect();
+    excl.extend(block);
+    excl.extend(refused);
+    let hub = Arc::new(crate::StreamHub::default());
+    *hub.excluded_hosts.lock_ok() = excl;
+    *hub.host_conn_caps.lock_ok() = caps.clone();
+    // M29 3d: the idle-server prefetch is real availability signal too.
+    // The primary job's OracleSink lives on the daemon hub; this sidecar
+    // runs on a FRESH hub, so without its own sink every 222/430 it sees
+    // was silently dropped. Give it one and drain it when it winds down.
+    *hub.oracle.lock_ok() = Some(Arc::new(nzbkit::oracle::OracleSink::default()));
+    let progress = Arc::new(AtomicU64::new(0));
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut sc_guard = d.sidecar.lock_ok();
+    if sc_guard.is_some() {
+        return; // raced another spawn - keep the first
+    }
+    if borrow {
+        let slice: Vec<String> = fleet
+            .iter()
+            .map(|h| format!("{h} x{}", caps.get(h).copied().unwrap_or(1)))
+            .collect();
+        info!(
+            target: "prefetch",
+            "{nzo_id} borrowing connection(s) from busy server(s) {} while the active job downloads (no healthy idle server)",
+            slice.join(", ")
+        );
+    } else {
+        info!(
+            target: "prefetch",
+            "{nzo_id} starting on idle server(s) {} while the active job downloads",
+            fleet.join(", ")
+        );
+    }
+    let task = {
+        let d = d.clone();
+        let config = config.to_path_buf();
+        let job = job.clone();
+        let hub = hub.clone();
+        let progress = progress.clone();
+        let cancelled = cancelled.clone();
+        let nzo_id = nzo_id.clone();
+        let connections = d.connections.load(Ordering::Relaxed).max(1);
+        let window = d.window.load(Ordering::Relaxed).max(1);
+        let decoders = d.decoders.load(Ordering::Relaxed).max(1);
+        let fast_verify = d.fast_verify.load(Ordering::Relaxed);
+        let verify_lean = d.verify_lean.load(Ordering::Relaxed);
+        let par_cleanup = d.par_cleanup.load(Ordering::Relaxed);
+        tokio::spawn(async move {
+            let t0 = Instant::now();
+            let res = if cancelled.load(Ordering::Relaxed) {
+                Err(anyhow::anyhow!("cancelled before start"))
+            } else {
+                crate::get_with_progress(
+                    &config,
+                    &nzb_path,
+                    &out_dir,
+                    connections,
+                    window,
+                    decoders,
+                    fast_verify,
+                    verify_lean,
+                    false,
+                    par_cleanup,
+                    password,
+                    Some(progress.clone()),
+                    Some(hub.clone()),
+                    &nzo_id,
+                    None,
+                    budget,
+                )
+                .await
+            };
+            // Bill what moved to the per-server usage history either way
+            // (block accounts must see every byte).
+            let per: Vec<(String, u64)> = hub
+                .pool_live
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|l| {
+                    l.servers
+                        .iter()
+                        .map(|s| (s.host.clone(), s.bytes.load(Ordering::Relaxed)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            d.add_usage(&per);
+            // M29 3d: fold the sidecar's per-article hit/430 outcomes into
+            // the availability ledger, exactly as the primary job does at
+            // net-drain. Partial/cancelled runs still carry real signal.
+            if let Some(sink) = hub.oracle.lock_ok().take() {
+                let samples = sink.drain();
+                if !samples.is_empty() {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|t| t.as_secs() as i64)
+                        .unwrap_or(0);
+                    d.with_index(|ix| ix.oracle_ingest(&samples, now).ok());
+                }
+            }
+            match res {
+                Ok(()) => {
+                    // The whole job fit on the idle servers - it's done.
+                    {
+                        let mut g = job.lock_ok();
+                        g.state = JobState::Completed;
+                        g.fetched = true;
+                        g.downloaded_bytes = progress.load(Ordering::Relaxed);
+                        g.elapsed_secs = t0.elapsed().as_secs_f64();
+                        g.finished_at = Some(Instant::now());
+                        g.finished_unix = Some(unix_now());
+                    }
+                    info!(
+                        target: "prefetch",
+                        "{nzo_id} completed entirely on {}",
+                        if borrow {
+                            "borrowed connections"
+                        } else {
+                            "idle servers"
+                        }
+                    );
+                    // A sidecar completion is a completion: it owes the
+                    // job the same tail the runner gives one (hand-over,
+                    // unlock, junk sweep, rename, move), and it must run
+                    // before the pp-script and history see the job.
+                    //
+                    // On its OWN task, because the runner awaits this one
+                    // (stop_sidecar) at every primary-job end before it may
+                    // pick the next: a tail that copies the payload to a NAS
+                    // would hold the whole queue for the length of that copy.
+                    // Nothing here needs the sidecar's abort handles - the
+                    // download is over and its connections are gone.
+                    let d2 = d.clone();
+                    tokio::spawn(async move {
+                        finalize_completed(&d2, &job).await;
+                        d2.run_post_job_hooks(&job);
+                        d2.park(job);
+                    });
+                }
+                Err(e) => {
+                    // A restricted attempt, not a verdict - the job stays
+                    // queued and its journal keeps everything landed.
+                    info!(target: "prefetch", "{nzo_id} stopped: {e} (progress kept in the journal)");
+                }
+            }
+            let mut g = d.sidecar.lock_ok();
+            if g.as_ref().is_some_and(|s| s.nzo_id == nzo_id) {
+                *g = None;
+            }
+        })
+    };
+    *sc_guard = Some(Sidecar {
+        nzo_id,
+        hub,
+        progress,
+        cancelled,
+        task,
+        borrowed: borrow,
+    });
+}
+
+/// M23/M24 post-download work on a SUCCESSFUL job, in order: passworded
+/// volumes (unlock with the job's password, or flag for the dashboard),
+/// cleanup-rule deletes (don't move junk), then TV filing if the
+/// enqueue-time rule asked for it. File ops run on the blocking pool;
+/// out_dir/password_required update before the pp-script and history
+/// see them. A no-op on a job that did not complete.
+///
+/// Every completion that produced FILES goes through here, not just the
+/// runner's tail: the idle-server sidecar finishes a job outright whenever
+/// the idle servers happen to hold all of it, and such a job used to be
+/// parked raw - no canonical-directory hand-over, no unlock, no junk
+/// sweep, no rename, no move to the destination folder. The one completion
+/// that does not come through here is the M14i library metadata-only pick,
+/// which writes a .strm pointer and has nothing to unlock, rename or move.
+pub(super) async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
+    let (done_ok, out2, name2, cat2, tv2, pw2, repl2, crc2, nzb2) = {
+        let j = job.lock_ok();
+        (
+            // A tombstoned job was deleted by the user while it ran. If
+            // the fetch happened to return Ok in the window before the
+            // abort landed, none of this should follow: park() is about
+            // to drop the record (and, on delete-with-files, the payload
+            // too), so unpacking it, filing it into the TV library and
+            // moving it onto a NAS would publish a result nobody asked
+            // to keep.
+            j.state == JobState::Completed && !j.tombstone,
+            j.out_dir.clone(),
+            j.name.clone(),
+            j.category.clone(),
+            j.tv_sort,
+            j.password.clone(),
+            j.replaces.clone(),
+            j.inner_crc,
+            j.nzb_path.clone(),
+        )
+    };
+    let exts = {
+        let mut e = d.cleanup_exts.lock_ok().clone();
+        // Spent recovery files go with the sidecar junk by default. Added
+        // here rather than swept separately so it inherits the sweep's
+        // ordering guarantees - in particular that the identity rungs
+        // read the .par2 sidecars BEFORE anything deletes them.
+        if d.par_cleanup.load(Ordering::Relaxed) && !e.iter().any(|x| x == "par2") {
+            e.push("par2".to_string());
+        }
+        e
+    };
+    if done_ok {
+        // Write the intent down BEFORE touching anything. Everything
+        // below can move the payload out from under the recorded
+        // out_dir, and the record is not corrected until the very end -
+        // so without this marker a restart in between could not tell a
+        // finished job from one caught mid-move, and filed the latter to
+        // history as a clean success. Saved immediately: the flag is
+        // worth nothing if it only exists in memory.
+        job.lock_ok().finalizing = true;
+        d.save_queue();
+        // Cloned handle for the blocking finalize (the caller still
+        // needs its own for park()/script).
+        let d3 = d.clone();
+        let (needs_pw, blocked_by, moved, filed_sfx, filed_ttl, ident, identified) =
+            tokio::task::spawn_blocking(move || {
+            // Test hook: hold this job's tail open the way the field
+            // does (a Finder-trash stall, a NAS move), so the queue
+            // suite can pin the window where the NEXT job has drained
+            // but is still Downloading behind this tail. No effect
+            // unless the suite sets it.
+            if let Some(ms) = std::env::var("NZBFAST_TEST_STALL_FINALIZE_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+            // A6: this job downloaded beside a previous
+            // successful result of the same name. It verified,
+            // so it takes the canonical directory over now -
+            // before the unlock / still-packed / cleanup /
+            // rename steps below, every one of which reads the
+            // finished directory and must see the final one.
+            let mut out2 = out2;
+            let mut moved = repl2.and_then(|canon| publish_over_previous(&out2, &canon));
+            if let Some(dest) = &moved {
+                out2 = dest.clone();
+            }
+            let mut needs_pw = false;
+            if crate::smart::encrypted_rar(&out2).is_some() {
+                match pw2.as_deref() {
+                    Some(pw) if crate::smart::unlock(&out2, pw) => {}
+                    _ => {
+                        info!(
+                            target: "unlock",
+                            "{name2:?}: volumes are password-protected - set a password to unpack"
+                        );
+                        needs_pw = true;
+                    }
+                }
+            }
+            // Something in a SUCCESSFUL job is still packed
+            // and we have no unpacker for it (today: any
+            // zip). Read off the finished directory rather
+            // than threaded out of the engine, exactly like
+            // the encrypted-volume check above - which also
+            // means a resumed or retried job reports it
+            // just the same.
+            //
+            // Sidecars only. A zip that IS the payload
+            // fails the job outright now, so it arrives
+            // here as a fail_message and never reaches
+            // this block; what is left is the
+            // `Subs/subs.zip` beside a feature that
+            // unpacked fine, which is worth saying and is
+            // not worth failing over.
+            let blocked_by = crate::unsupported_archive_present(&out2)
+                .filter(|u| !u.blocking)
+                .map(|u| u.display)
+                .unwrap_or_default();
+            // BEFORE the sweeps: the .par2 sidecars the fingerprint
+            // rung reads are exactly what a cleanup rule deletes, and
+            // `keep_media_only` inside finalize_names deletes them
+            // whether or not one is configured.
+            let ident = if needs_pw {
+                // A still-locked job has no unpacked payload to inspect
+                // and no name to teach anything, and its archive headers
+                // never parsed - so there is nothing to ask about.
+                crate::identity::Identity::default()
+            } else {
+                d3.resolve_identity(&out2, &name2, crc2)
+            };
+            if !exts.is_empty() {
+                crate::smart::cleanup(&out2, &exts);
+            }
+            // Auto-rename & cleanup run only once the payload is
+            // actually unpacked (a still-locked job has no media
+            // to rename or non-junk to keep).
+            // `.or(moved)`: a renamed/relocated folder wins,
+            // but an A6 hand-over with no rename still has to
+            // report its new directory.
+            //
+            // The suffix comes back with it: it is what filing
+            // wrote onto the files, and only this moment knows
+            // it. A still-locked job never got that far, so it
+            // has none to record (None, not "").
+            let mut filed_sfx = None;
+            let mut filed_ttl = None;
+            let mut identify = String::new();
+            if !needs_pw {
+                // Rename off the canonical name when an oracle supplied
+                // one: `name2` is what the submitter called this and
+                // stays on the record, but it is not necessarily what
+                // the release IS.
+                let naming =
+                    if ident.name.is_empty() { name2.as_str() } else { ident.name.as_str() };
+                let post_year = match post_year_of(&nzb2) {
+                    0 => crate::identify::current_year(),
+                    y => y,
+                };
+                let done = d3.finalize_names(
+                    &out2,
+                    &FinalizeJob {
+                        name: naming,
+                        cat: &cat2,
+                        tv_sort: tv2,
+                        post_year,
+                    },
+                );
+                moved = done.moved.or(moved);
+                filed_sfx = Some(done.suffix);
+                filed_ttl = Some(done.filed_title);
+                identify = done.identify;
+            }
+            (needs_pw, blocked_by, moved, filed_sfx, filed_ttl, ident, identify)
+            })
+        .await
+        .unwrap_or_else(|_| {
+            (
+                false,
+                String::new(),
+                None,
+                None,
+                None,
+                crate::identity::Identity::default(),
+                String::new(),
+            )
+        });
+        {
+            let mut j = job.lock_ok();
+            j.password_required = needs_pw;
+            if needs_pw && j.fail_message.is_empty() {
+                j.fail_message = "password required to unpack".into();
+            }
+            j.unpack_blocked_by = blocked_by;
+            // Recorded even when it changed no filename: an IMDb id with
+            // no better name is still the thing that lets the history
+            // row link to what it actually is.
+            if !ident.is_empty() {
+                j.identity_name = ident.name;
+                j.identity_imdb = ident.imdb;
+                j.identity_src = ident.src.to_string();
+            }
+            // Only ever SET, never cleared: a job whose ladder did not
+            // run this time (unlock re-runs post-processing) must not
+            // lose the note the first pass wrote.
+            if !identified.is_empty() {
+                j.identify = identified;
+            }
+            if let Some(dest) = moved {
+                // Record whether the new home is the SHARED season folder, so
+                // every later "delete this job's files" knows not to take the
+                // siblings with it. See Job::filed.
+                j.filed = j.tv_sort && is_season_dir(&dest);
+                // ...and, with it, the suffix and episode title those
+                // files now carry. Only an actually-filed job has them
+                // to remember.
+                j.filed_suffix = if j.filed { filed_sfx } else { None };
+                j.filed_title = if j.filed { filed_ttl } else { None };
+                // Only when it is NOT the job's own name: `filed_stem`
+                // falls back to `name`, so storing a copy of it would
+                // just be a second thing to keep in step.
+                j.filed_base = j
+                    .filed
+                    .then(|| j.identity_name.clone())
+                    .filter(|n| !n.is_empty());
+                j.out_dir = dest;
+            }
+            // Cleared in the same breath as the corrected out_dir: from
+            // here the record describes where the payload actually is.
+            j.finalizing = false;
+        }
+        // Outside the job lock - save_queue locks every job in turn.
+        d.save_queue();
+    }
+}
+
+/// An equivalent release the user already has, as reported to the UI
+/// before a hand-picked grab is added. `where_` is "queue" (still
+/// coming) or "history" (already downloaded), which is the difference
+/// between "you are about to queue this twice" and "you already have
+/// this, do you want to play that copy instead".
+pub(crate) struct DupeCollision {
+    pub where_: &'static str,
+    pub name: String,
+    pub nzo_id: String,
+}
+
+pub(super) fn priority_name(p: i32) -> &'static str {
+    match p {
+        2 => "Force",
+        1 => "High",
+        -1 => "Low",
+        -3 => "Duplicate",
+        _ => "Normal",
+    }
+}
+
+/// SABnzbd's DEFAULT_PRIORITY sentinel: "whatever the default is", not a
+/// priority of its own. It is what every client sends when the user did
+/// not choose one, and it is the default of our own `priority=` parsing.
+pub(crate) const SAB_DEFAULT_PRIORITY: i32 = -100;
+
+/// The priority a job actually gets on the way into the queue.
+///
+/// The sentinel has to be resolved HERE, not left on the record. `pick_job`
+/// orders by the stored number, so a stored -100 sorted BELOW Low (-1) and
+/// even below a held Duplicate (-3) - while `priority_name` (the dashboard,
+/// the SAB queue API, the *arrs) labelled that same job "Normal". A job the
+/// user had explicitly demoted to Low therefore ran before the jobs the UI
+/// said were Normal, which is precisely backwards.
+///
+/// -2 is SAB's "add paused" flag rather than a priority; the caller sets
+/// `paused` from it and the job itself is Normal. There is no per-category
+/// default priority in this daemon (the categories API reports -100 for
+/// every category), so the default is Normal.
+pub(crate) fn enqueue_priority(requested: i32, duplicate: bool) -> i32 {
+    if duplicate {
+        // M14f alternative: held below everything until the original fails.
+        -3
+    } else if requested == -2 || requested == SAB_DEFAULT_PRIORITY {
+        0
+    } else {
+        requested
+    }
+}
+
+/// May `park` act on a watchdog demotion by sending the job back through
+/// the queue?
+///
+/// Only when the demotion's abort actually took the download down
+/// (`failed`). The watchdog decides from a rate window and fires an abort
+/// that can lose the race with the finish line - on 31 Jul it read a
+/// DRAINED pool ("100% of the last 10s from one host at 0.2 MB/s") while
+/// the job sat Downloading behind the previous job's stalled tail, so the
+/// flag landed on a job that then completed cleanly. Post-processing had
+/// renamed its directory by the time park ran, and the re-queue downloaded
+/// the whole release a second time into the renamed folder. A completed
+/// job files to history whatever the flag says; `park` scrubs the stale
+/// flag so a later retry cycle cannot trip over it either.
+///
+/// A free function so the queue soak's invariant - a finished job never
+/// re-queues itself - is pinned by a test that cannot drift from the code.
+pub(super) fn demote_requeues(demote: bool, tombstone: bool, failed: bool) -> bool {
+    demote && !tombstone && failed
+}
+
+/// Why a job failed, as far as the two policies that care are concerned:
+/// the auto-retry cooldown (`park`) and the dead-post report
+/// (`report_failure`). One classifier so they cannot drift apart - they
+/// already had, and a disk-full run was both auto-retried onto the same
+/// full disk AND reported to the indexer as a dead post.
+///
+/// Derived from `fail_message` rather than stored on the job: the
+/// terminal failure arrives here as an `anyhow` message from the download
+/// pipeline, so a field would be this same match written one layer
+/// earlier plus a second thing to keep in step with the sentence.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FailKind {
+    /// Articles were missing from every server that has the post.
+    MissingArticles,
+    /// Every lost segment was a TRANSPORT failure - timeouts, resets,
+    /// nonstandard responses, retry budgets exhausted - and no server
+    /// ever said 430. Says nothing about the post's health, so it must
+    /// NOT be reported to an indexer as a dead post (a flaky provider
+    /// under load used to file takedown reports for perfectly healthy
+    /// releases). Retrying can absolutely fix it.
+    Transport,
+    /// The bytes arrived but PAR2 could not make them whole.
+    Unrepairable,
+    /// Pre-flight sampling said the post is already beyond repair.
+    PreflightImpossible,
+    /// A library entry's post has since been taken down.
+    Gone,
+    /// Anything on THIS machine: disk full, permissions, a write error,
+    /// no usable servers, a bad config, an unpack that fell over. Says
+    /// nothing about the post.
+    Local,
+}
+
+impl FailKind {
+    /// Is the post itself unavailable? Only these are worth telling an
+    /// indexer about - the report marks a release dead for everyone else
+    /// using it, and under `regrab` it spends a re-download too.
+    pub(super) fn post_unavailable(self) -> bool {
+        !matches!(self, FailKind::Local | FailKind::Transport)
+    }
+
+    /// Might simply waiting fix it? Propagation fills missing articles in
+    /// all the time, and a repair can succeed once the last volumes land.
+    /// A local fault will not fix itself, and retrying it immediately
+    /// just runs the same job into the same full disk.
+    pub(crate) fn transient(self) -> bool {
+        matches!(
+            self,
+            FailKind::MissingArticles | FailKind::Unrepairable | FailKind::Transport
+        )
+    }
+}
+
+/// A finished job as NZBGet's own `(Status, ParStatus, UnpackStatus)`.
+///
+/// Everything that was not Completed used to report `FAILURE/PAR` with
+/// `ParStatus: FAILURE` - one bit, so "needs a password", "the disk
+/// filled up" and "the post is missing articles" were indistinguishable
+/// to a client, and all three were blamed on a repair that in two of the
+/// three cases never ran. NZBGet has vocabulary for each of them and the
+/// *arrs surface it, so the mapping only has to be honest.
+///
+/// `SUCCESS/UNPACK` is kept verbatim on the success path: it is what the
+/// M26 certification round proved against Sonarr and Radarr, and it says
+/// the same thing `SUCCESS/ALL` would.
+pub(crate) fn nzbget_status(j: &Job) -> (&'static str, &'static str, &'static str) {
+    if j.state == JobState::Completed {
+        return ("SUCCESS/UNPACK", "SUCCESS", "SUCCESS");
+    }
+    let msg = j.fail_message.to_ascii_lowercase();
+    // Both of these are unpack-stage verdicts with a dedicated NZBGet
+    // status, and neither is the release's fault - a client that showed
+    // "repair failed" for them sent the user looking in the wrong place.
+    if msg.contains("password") {
+        return ("FAILURE/UNPACK", "SUCCESS", "PASSWORD");
+    }
+    if msg.contains("no space left") || msg.contains("disk full") {
+        return ("FAILURE/UNPACK", "SUCCESS", "SPACE");
+    }
+    match fail_kind(&j.fail_message) {
+        // The one case that really is a failed repair.
+        FailKind::Unrepairable => ("FAILURE/PAR", "FAILURE", "NONE"),
+        // The post could not be fetched whole. NZBGet calls that health,
+        // and reports no par verdict because par never got to run.
+        // Transport joins them for the *arr's purposes (grab another
+        // release); the indexer dead-post report is gated separately by
+        // post_unavailable, which excludes it.
+        FailKind::MissingArticles
+        | FailKind::PreflightImpossible
+        | FailKind::Gone
+        | FailKind::Transport => ("FAILURE/HEALTH", "NONE", "NONE"),
+        // Anything on this machine. Says nothing about the release.
+        FailKind::Local => ("FAILURE/UNPACK", "SUCCESS", "FAILURE"),
+    }
+}
+
+/// NZBGet's priority scale onto ours.
+///
+/// They are not the same numbers: NZBGet uses -100/-50/0/50/100 with 900
+/// for force, SAB (and our stored `priority`) uses -1/0/1 with 2 for
+/// force. Passing one through as the other made "high" in an *arr land
+/// as a priority far above Force.
+pub(crate) fn nzbget_priority(p: i64) -> i32 {
+    match p {
+        900.. => 2,
+        50..=899 => 1,
+        i64::MIN..=-50 => -1,
+        _ => 0,
+    }
+}
+
+/// Cooldown ceiling for a `Transport` failure - a stalled pool, a flaky
+/// link, a server that never connected.
+///
+/// The configured `auto_retry_secs` is sized for propagation: articles
+/// genuinely absent from a server may appear in twenty minutes, so
+/// waiting is the remedy. Nothing about a stall gets better by waiting,
+/// so this caps it - the user is otherwise made to sit out a cooldown
+/// for a cause that was never in play. Still a cooldown and not zero: a
+/// link that just wedged deserves a moment, and an immediate retry into
+/// a still-broken pool would spin.
+pub(super) const SHORT_RETRY_SECS: u64 = 120;
+
+pub(crate) fn fail_kind(msg: &str) -> FailKind {
+    if msg.starts_with("download incomplete") {
+        FailKind::MissingArticles
+    } else if msg.starts_with("download failed on connection errors") {
+        FailKind::Transport
+    } else if msg.contains("repair could not complete") {
+        FailKind::Unrepairable
+    } else if msg.starts_with("pre-flight: articles missing beyond repair") {
+        FailKind::PreflightImpossible
+    } else if msg == "content no longer retrievable" || msg.starts_with("post is gone") {
+        // A download that proved every article absent on every backbone
+        // that answered. Deliberately NOT MissingArticles: that is
+        // transient, and an automatic retry against a post nothing
+        // carries only spends the same minutes proving it again.
+        FailKind::Gone
+    } else {
+        FailKind::Local
+    }
+}
+
+/// What a finished job still owes the outside world. `None` means
+/// nothing at all; `Some(failing)` says whether a failure report is due
+/// on top of the script and the notifications.
+///
+/// A tombstoned job was DELETED by the user while it ran. The delete
+/// aborts the pipeline, which surfaces as an `Err` and files the job
+/// Failed, so without this every cancellation ran the pp-script, sent a
+/// "Failed" notification, and - worst - reported a perfectly healthy post
+/// to the indexer as dead and (under `regrab`) started an unattended
+/// multi-GB re-download of the very title the user had just cancelled.
+/// A tombstoned job is dropped rather than filed; it owes nobody
+/// anything. The success race is covered too: if the fetch happened to
+/// return `Ok` just before the abort landed, the job is still deleted.
+pub(super) fn post_job_duties(
+    state: JobState,
+    tombstone: bool,
+    failure_mode: &str,
+) -> Option<bool> {
+    if tombstone {
+        return None;
+    }
+    Some(failure_mode != "off" && state == JobState::Failed)
+}
+
+/// Will `park` arm an M32 automatic retry for this job? `secs` is the
+/// configured cooldown (0 = the feature is off).
+///
+/// A free function so both callers - `park`, which arms it, and
+/// `post_job_plan`, which has to know the answer BEFORE park runs -
+/// share one predicate, and so it can be tested without a whole Daemon.
+pub(super) fn auto_retry_eligible(j: &Job, secs: u64) -> bool {
+    secs > 0
+        && j.state == JobState::Failed
+        && !j.tombstone
+        // A watchdog demotion goes back to the queue instead of history;
+        // park returns before the retry block for it.
+        && !j.demote
+        && fail_kind(&j.fail_message).transient()
+        // ONE automatic retry. The retry itself bumps `retries` and
+        // clears the stamp, so a second failure lands here ineligible -
+        // and that is the failure that reports, re-grabs and promotes.
+        && j.retries == 0
+        && !j.library
+        && !j.password_required
+        && j.auto_retry_at.is_none()
+}
+
+/// What `run_post_job_hooks` owes: `None` for nothing, `Some(failing)`
+/// where `failing` also means "and this failure is final".
+///
+/// The failure report, the re-grab it can pull in, and the promotion of a
+/// held M14f duplicate all treat a failure as the end of the story. Fired
+/// on a failure the daemon has already decided to retry itself, they put
+/// three grabs of one title on the user's block account for one transient
+/// gap - and tell the indexer a live release is dead over a gap that
+/// propagation is expected to fill.
+///
+/// Answered here, synchronously, rather than by reading `auto_retry_at`
+/// from inside the spawned hooks: `park` arms that stamp AFTER the hooks
+/// are spawned, so the field-read version is a race that merely looks
+/// safe while pp-scripts and notifications stay slow.
+pub(super) fn post_job_plan(j: &Job, failure_mode: &str, auto_retry_secs: u64) -> Option<bool> {
+    let failing = post_job_duties(j.state, j.tombstone, failure_mode)?;
+    Some(failing && !auto_retry_eligible(j, auto_retry_secs))
+}
+
+/// Carry stored notification tokens onto an incoming list.
+///
+/// `get_config` never hands a token back - it is the Plex token /
+/// Jellyfin API key / Kodi `user:password` - and the dashboard rebuilds
+/// the whole list from the DOM and replaces it wholesale. So a blank
+/// token means KEEP, and without this the first Apply after a page load
+/// would wipe every credential the user had stored.
+///
+/// Matched on (kind, url, name), never on position: rows get reordered
+/// and deleted between the load and the save, and an index match would
+/// hand one target's credential to another. Failing that, on (kind,
+/// name) alone when exactly one UNCLAIMED stored target answers to it -
+/// correcting a typo'd host or port is the commonest edit there is, and
+/// it must not silently throw the token away. Genuine ambiguity carries
+/// nothing forward: being asked for the token again is better than
+/// sending one server's credential to a different one.
+///
+/// "Unclaimed" is what stops the fallback stealing: a stored target that
+/// some incoming row already matches exactly is that row's, so a second
+/// row sharing only its name is a DIFFERENT server and must not inherit
+/// its credential. Without that filter, adding a second same-kind target
+/// under an existing target's name copied the first one's token onto it.
+pub(super) fn merge_notify_tokens(
+    list: &mut [crate::notify::Target],
+    old: &[crate::notify::Target],
+) {
+    // Computed up front, over the whole incoming list, so the answer does
+    // not depend on the order the rows happen to arrive in.
+    let claimed: Vec<bool> = old
+        .iter()
+        .map(|p| {
+            list.iter()
+                .any(|t| t.kind == p.kind && t.url == p.url && t.name == p.name)
+        })
+        .collect();
+    for t in list.iter_mut().filter(|t| t.token.is_empty()) {
+        let exact = old
+            .iter()
+            .find(|p| p.kind == t.kind && p.url == t.url && p.name == t.name);
+        let prev = exact.or_else(|| {
+            let mut by_name = old
+                .iter()
+                .enumerate()
+                .filter(|(i, p)| !claimed[*i] && p.kind == t.kind && p.name == t.name)
+                .map(|(_, p)| p);
+            by_name.next().filter(|_| by_name.next().is_none())
+        });
+        if let Some(prev) = prev {
+            t.token = prev.token.clone();
+        }
+    }
+}
+
+/// Is this path a TV-filing `Season NN` folder - i.e. a SHARED library
+/// directory holding every episode of a season, not one job's private
+/// output? The one place the shape is spelled out; `Job::filed` records
+/// the answer at the moment filing ran, and everything downstream reads
+/// the flag rather than re-testing.
+pub(crate) fn is_season_dir(p: &std::path::Path) -> bool {
+    p.file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_prefix("Season "))
+        .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Delete a finished job's downloaded content safely.
+///
+/// Normally `out_dir` is the job's own private folder, so we remove it
+/// wholesale. But once a job has been TV-filed (M23 tv_sort) `out_dir` is
+/// the SHARED `Show/Season NN` directory - recursively removing it would
+/// take every other episode of the season with it (bug sweep: a watchlist
+/// "replace old" upgrade, and a history "delete + files", both wiped whole
+/// seasons). For a filed job we delete only this episode's files; the rest
+/// of the season is left intact.
+///
+/// `tail` is what this release's filed files carry after the episode base
+/// (see [`delete_tail`]). Its quality-suffix half is what makes the filed
+/// delete release-SPECIFIC rather than merely episode-specific: an upgrade
+/// files the better copy into the same season folder under the same
+/// `Show - S03E05` base, so without it the delete of the superseded copy
+/// also took the replacement that had just landed beside it and the user
+/// was left with neither. Ignored for an unfiled job, whose directory is
+/// private either way.
+pub(super) fn remove_job_files(
+    out_dir: &std::path::Path,
+    name: &str,
+    filed: bool,
+    tail: &crate::smart::FiledTail,
+) {
+    // `filed` is the job's own persisted flag (Job::filed), NOT a shape
+    // test on the current state. Deriving it from `state == Completed`
+    // meant a re-queued job (retry) claimed its shared season folder as
+    // private and a later delete-with-files took the whole season.
+    if filed {
+        let n = crate::smart::delete_filed_episode(out_dir, name, tail);
+        info!(
+            target: "files",
+            "{name}: TV-filed - removed {n} file(s) from {}, siblings left intact",
+            out_dir.display()
+        );
+    } else {
+        let _ = std::fs::remove_dir_all(out_dir);
+    }
+}
+
+/// What a filed job's files really carry after the episode base, and so
+/// what [`remove_job_files`] (and the play path) has to match them with.
+///
+/// [`Job::filed_suffix`] is what filing itself used, and it is the answer.
+/// The naming settings are LIVE, so recomputing here asked today's
+/// settings about a name written weeks ago: turn auto-rename off and the
+/// recomputed suffix is empty, which does not mean "no suffix on disk" but
+/// "match the episode base plus any rename tail at all" - every quality of
+/// the episode, including the upgrade filed beside it a second ago.
+///
+/// `legacy` is [`Daemon::job_suffix`], and runs only for records written
+/// before the suffix was persisted: recomputing is what we did for all of
+/// them anyway, and a suffix that no longer matches is a leftover rather
+/// than a destroyed episode. What it must never be is a bare `""` default,
+/// which is the wildcard the bug was made of.
+///
+/// The episode title has NO legacy arm, and does not need one: a record
+/// old enough to be missing it was written before titles could be in a
+/// filename at all, so the empty string is not a guess about it - it is
+/// the fact.
+pub(super) fn delete_tail(j: &Job, legacy: impl FnOnce() -> String) -> crate::smart::FiledTail {
+    crate::smart::FiledTail {
+        title: j.filed_title.clone().unwrap_or_default(),
+        suffix: j.filed_suffix.clone().unwrap_or_else(legacy),
+    }
+}
+
+/// The stem a filed job's episode files on disk were built from, which
+/// is [`Job::filed_base`] when an identity oracle renamed the release
+/// and the job's own name otherwise.
+///
+/// Every filed-job lookup goes through here rather than reaching for
+/// `name` directly: an obfuscated post filed under an oracle's name has
+/// no file anywhere called after its hash, so a `name`-keyed delete
+/// leaves the episode behind and a `name`-keyed play cannot find it.
+pub(super) fn filed_stem(j: &Job) -> &str {
+    j.filed_base
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&j.name)
+}
+
+/// One history record as `plan_history_delete` needs to see it.
+///
+/// A struct rather than the tuple this was: with `filed` and `locked`
+/// adjacent, a positional record is one careless swap away from deciding
+/// the wrong record owns its files, and that decision reaches
+/// `remove_dir_all`.
+pub(crate) struct DeleteRecord {
+    pub nzo_id: String,
+    pub state: JobState,
+    pub out_dir: PathBuf,
+    /// TV-filed: `out_dir` is the shared season folder, claimed by every
+    /// episode in it.
+    pub filed: bool,
+    /// Waiting for the user's password. Complete on paper - every byte
+    /// arrived, so `state` is Completed - but the payload is still packed
+    /// and only this record carries the 🔑 that unlocks it. A
+    /// "clear the finished ones" sweep must leave it where it is.
+    pub locked: bool,
+}
+
+/// One history record's fate under a `mode=history&name=delete` call.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct HistoryDelete {
+    /// This record is leaving history.
+    pub doomed: bool,
+    /// ...and its `out_dir` is genuinely its alone, so `del_files=1` may
+    /// remove it. False when somebody else still lives there.
+    pub may_remove_files: bool,
+}
+
+/// Plan a history delete before any of it happens: which records go, and
+/// which of them own their output directory outright.
+///
+/// A completed job's directory is not necessarily its own to delete.
+/// `publish_over_previous` (A6) hands the CANONICAL directory to a verified
+/// re-download and leaves the superseded job's history record pointing at
+/// that same path, so a delete-with-files on the OLDER record used to
+/// `remove_dir_all` the NEWER job's payload - the record deleted was not
+/// the data destroyed. A directory with a second live claimant is not this
+/// record's to remove; the leftover record can always be deleted again
+/// without files.
+///
+/// The claimant test runs against the records that will SURVIVE, never the
+/// pre-delete list - `value=all` dooms every history record, so testing
+/// against the list as it stands would find each record's own directory
+/// "claimed" by a doomed sibling and silently stop deleting anything.
+///
+/// TV-filed records are exempt: their `out_dir` IS the shared season
+/// folder, so every episode of the season claims it, and the per-episode
+/// delete is already narrow by construction (`remove_job_files`).
+///
+/// `value` selects: an nzo_id, a comma list of them, or one of the bulk
+/// words - `all`, `failed`, or `completed`. `completed` is the dashboard's
+/// one-click "Clear completed": it is deliberately NARROWER than the
+/// history card's Completed filter chip, which counts password-locked
+/// records too (they finish downloading, so their state IS Completed).
+/// Sweeping those away would take the only 🔑 the user has with them, so
+/// they stay, exactly as failures do.
+///
+/// `queue_dirs` is every live queue job's directory (all of them survive a
+/// history delete).
+pub(crate) fn plan_history_delete(
+    records: &[DeleteRecord],
+    value: &str,
+    queue_dirs: &[PathBuf],
+) -> Vec<HistoryDelete> {
+    let doomed: Vec<bool> = records
+        .iter()
+        .map(|r| {
+            value == "all"
+                || (value == "failed" && r.state == JobState::Failed)
+                || (value == "completed" && r.state == JobState::Completed && !r.locked)
+                || value.split(',').any(|v| v == r.nzo_id)
+        })
+        .collect();
+    records
+        .iter()
+        .zip(&doomed)
+        .map(|(rec, &is_doomed)| {
+            let (dir, filed) = (&rec.out_dir, rec.filed);
+            // Survivors only: every queue job survives, and so does every
+            // history record this call is not deleting.
+            let other_claimant = queue_dirs.iter().any(|p| p == dir)
+                || records
+                    .iter()
+                    .zip(&doomed)
+                    .any(|(other, &other_doomed)| !other_doomed && &other.out_dir == dir);
+            HistoryDelete {
+                doomed: is_doomed,
+                may_remove_files: is_doomed && (filed || !other_claimant),
+            }
+        })
+        .collect()
+}
+
+/// Files under `dir`, recursively; 0 when it cannot be read (which is
+/// also what a directory that has been moved away answers). Symlinks
+/// count as the one file they are - never walked - matching how
+/// `move_tree` treats them.
+pub(super) fn file_count(dir: &std::path::Path) -> usize {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    rd.flatten()
+        .map(|e| {
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                file_count(&e.path())
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
+/// Series/movie identity from a release name (SAB "smart dedupe" model):
+/// `Show.Name.S01E02.1080p.WEB` → `show name/s1e2`,
+/// `Movie.Title.2026.2160p` → `movie title/2026`. Quality/group noise is
+/// exactly what must NOT distinguish duplicates, so only the title before
+/// the marker, the marker itself, and (for a year marker) whatever
+/// identity follows it go into the key.
+/// "head/<date> <identity tail>" for a dated post: everything before the
+/// date names the competition or show, everything identity-bearing after
+/// it names the event of that day. The group tag is trimmed off the tail
+/// (it is noise, and on some posts it is the last token), matching the
+/// movie-year arm below.
+pub(super) fn dated_key(
+    tokens: &[&str],
+    date_at: usize,
+    tail_from: usize,
+    date: &str,
+    raw_name: &str,
+) -> String {
+    let group = nzbkit::release::group_of(raw_name).map(str::to_ascii_lowercase);
+    let mut tail = nzbkit::release::identity_tail(tokens[tail_from..].iter().copied());
+    if tail.last().is_some_and(|l| Some(*l) == group.as_deref()) && tokens.last() == tail.last() {
+        tail.pop();
+    }
+    let head = tokens[..date_at].join(" ");
+    if tail.is_empty() {
+        format!("{head}/{date}")
+    } else {
+        format!("{head}/{date} {}", tail.join(" "))
+    }
+}
+
+pub(super) fn dupe_key(name: &str) -> Option<String> {
+    // Full non-alphanumeric flattening (not just ./_/-): friendly-named
+    // posts write "Title (2026)" and the parenthesized year token never
+    // matched the scene form's bare "2026", so the same film in two
+    // naming styles didn't dedupe (and the wall's have-badge missed).
+    let flat: String = name
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+        .collect();
+    let tokens: Vec<&str> = flat.split_whitespace().collect();
+    // Episode marker wins over a year token (`Show.2026.S01E02` is an
+    // episode, not a movie from 2026).
+    for (i, t) in tokens.iter().enumerate() {
+        // SxxEyy (also SxxEyyEzz double episodes - key on the first ep).
+        if let Some(rest) = t.strip_prefix('s') {
+            let mut it = rest.splitn(2, 'e');
+            if let (Some(s), Some(e)) = (it.next(), it.next()) {
+                let e_first: String = e.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) && !e_first.is_empty() {
+                    let (s, e): (u32, u32) = (s.parse().ok()?, e_first.parse().ok()?);
+                    return Some(format!("{}/s{s}e{e}", tokens[..i].join(" ")));
+                }
+            }
+        }
+    }
+    for (i, t) in tokens.iter().enumerate() {
+        // NxNN alternate episode form (3x07 ≡ S03E07) - same constraints
+        // as the wall parser (1-2 digit season, 2-3 digit episode, so
+        // "4x4" truck titles don't match). Without this the dupe check
+        // was skipped and a 3x07 alt of an owned S03E07 fully downloaded.
+        if let Some((s, e)) = t.split_once('x')
+            && !s.is_empty()
+            && s.len() <= 2
+            && s.bytes().all(|c| c.is_ascii_digit())
+            && (2..=3).contains(&e.len())
+            && e.bytes().all(|c| c.is_ascii_digit())
+        {
+            let (s, e): (u32, u32) = (s.parse().ok()?, e.parse().ok()?);
+            return Some(format!("{}/s{s}e{e}", tokens[..i].join(" ")));
+        }
+    }
+    // Daily-date episodes, both conventions normalized to yyyymmdd so a
+    // dotted post dedupes against a compact one. Must outrank the movie-
+    // year arm: it keyed every "Show.2026.07.21" episode to `show/2026`,
+    // so all of a year's daily episodes after the first were held as
+    // paused duplicates of episode one.
+    //
+    // The date alone is not the identity, for the same reason a season
+    // year alone was not: a matchday holds five fixtures and a fight
+    // card holds prelims and a main card. Keyed on `epl/20260822`,
+    // "Arsenal.vs.Spurs" and "Liverpool.vs.Everton" were one release -
+    // the second admitted PAUSED at priority -3 and never promoted
+    // (park only frees a held duplicate when the first FAILS), and
+    // adopted by the watchlist as a slot it already owned. So the
+    // identity tail after the date counts, exactly as it does after a
+    // year, and by the same rules: it stops at the first piece of hard
+    // furniture, so two encodes of one event still share a key.
+    let d2 = |s: &str, max: u32| {
+        s.len() == 2
+            && s.bytes().all(|c| c.is_ascii_digit())
+            && s.parse::<u32>().is_ok_and(|v| (1..=max).contains(&v))
+    };
+    for (i, t) in tokens.iter().enumerate() {
+        if i == 0 || !t.bytes().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        // Dotted: year token + MM + DD tokens ("2026 07 21" after
+        // separator flattening).
+        if t.len() == 4
+            && (t.starts_with("19") || t.starts_with("20"))
+            && tokens.get(i + 1).is_some_and(|m| d2(m, 12))
+            && tokens.get(i + 2).is_some_and(|d| d2(d, 31))
+        {
+            let date = format!("{t}{}{}", tokens[i + 1], tokens[i + 2]);
+            return Some(dated_key(&tokens, i, i + 3, &date, name));
+        }
+        // Compact: YYMMDD / YYYYMMDD ("At.Midnight.150615…").
+        if t.len() == 6 || t.len() == 8 {
+            let (y, md) = t.split_at(t.len() - 4);
+            let (mth, day) = md.split_at(2);
+            if d2(mth, 12) && d2(day, 31) {
+                let year = if y.len() == 2 {
+                    format!("20{y}")
+                } else {
+                    y.to_string()
+                };
+                return Some(dated_key(
+                    &tokens,
+                    i,
+                    i + 1,
+                    &format!("{year}{mth}{day}"),
+                    name,
+                ));
+            }
+        }
+    }
+    // Release group: taken from the RAW name, because the flattening
+    // above dissolved the hyphen that marks it. A group tag is pure
+    // noise, so it must never end up in the identity tail below.
+    let group = nzbkit::release::group_of(name).map(str::to_ascii_lowercase);
+    for (i, t) in tokens.iter().enumerate() {
+        // Movie year 1900–2099, not in first position (that's a title).
+        if i > 0
+            && t.len() == 4
+            && (t.starts_with("19") || t.starts_with("20"))
+            && t.chars().all(|c| c.is_ascii_digit())
+        {
+            // A year is not always a release date. Event posts use it as
+            // the SEASON and put their identity after it - the round, the
+            // country, the session ("Formula1.2026.Round11.Hungary.Pre-
+            // Qualifying.Show.F1TV.WEB-DL.1080p.H264.English-MWR"). Keyed
+            // on title+year alone, every session of every round of the
+            // year collapsed onto "formula1/2026" and each one after the
+            // first was held as a paused duplicate at priority -3. Same
+            // bug the daily-date arm above exists to prevent, one shape
+            // over.
+            //
+            // The tail stops at the first piece of hard furniture, so an
+            // ordinary film - whose year is followed straight by quality
+            // tags - keys exactly as it always did, and two encodes of
+            // one release still share a key: resolution, source, codec,
+            // edition and group can never reach the tail.
+            let mut tail = nzbkit::release::identity_tail(tokens[i + 1..].iter().copied());
+            if tail.last().is_some_and(|l| Some(*l) == group.as_deref())
+                && tokens.last() == tail.last()
+            {
+                tail.pop();
+            }
+            let head = tokens[..i].join(" ");
+            return Some(if tail.is_empty() {
+                format!("{head}/{t}")
+            } else {
+                format!("{head}/{t} {}", tail.join(" "))
+            });
+        }
+    }
+    None
+}
+
+/// PROPER/REPACK releases deliberately replace an earlier post - never
+/// hold them as duplicates. ("REAL" is excluded: too many titles contain
+/// the word; scene REALs virtually always also carry PROPER.)
+pub(super) fn is_proper(name: &str) -> bool {
+    let flat = name.to_ascii_lowercase().replace(['.', '_', '-'], " ");
+    flat.split_whitespace()
+        .any(|t| matches!(t, "proper" | "repack" | "rerip"))
+}
+
+/// Split the two persisted record arrays into the queue and the history
+/// the daemon comes back with. Returns `(queue, history)` in file order.
+///
+/// A record's ARRAY is not on its own the answer. A job goes Completed (or
+/// Failed) the moment its download ends, and only reaches history when
+/// `park` files it - between those two points sits the whole of
+/// post-processing: repair, unpack, unlock, junk sweep, rename, Season
+/// filing, the move to a NAS. Any `save_queue` during that window - and
+/// every queue mutation on the box calls one - persists a TERMINAL record
+/// inside the "queue" array. Restoring it there made it a permanent
+/// zombie: `pick_job` only ever picks a `Queued` job, nothing else
+/// reconciles the two arrays, so it sat in the queue forever, never ran,
+/// never appeared in history, and never reached the *arrs that were
+/// waiting on its outcome.
+///
+/// Such a record is routed to history instead, which is where `park` was
+/// about to put it and is the outcome the rest of the system is built
+/// around: visible, retryable, and reported. What it does not get is the
+/// hooks - the pp-script and the notifications fire from the runner, which
+/// died with the daemon.
+///
+/// Emphatically NOT a state rewrite: `job_from_json` maps a Downloading
+/// record to `Queued`, and that record stays in the QUEUE so the scheduler
+/// restarts it and its article journal resumes the transfer from what
+/// already landed.
+///
+/// De-duplicated by nzo_id. `park` retains-then-pushes before its single
+/// save, so a well-formed file never holds one job twice; a torn or
+/// hand-edited one must not be turned into two history entries by this.
+pub(super) fn restore_records(queue_arr: &[Value], hist_arr: &[Value]) -> (Vec<Job>, Vec<Job>) {
+    let mut queued: Vec<Job> = Vec::new();
+    let mut interrupted: Vec<Job> = Vec::new();
+    for j in queue_arr {
+        let Some(mut job) = job_from_json(j) else {
+            continue;
+        };
+        if matches!(job.state, JobState::Completed | JobState::Failed) {
+            // `finalizing` is the difference between "post-processing
+            // finished, only the hooks were lost" and "the payload was
+            // being moved when the daemon died". The second used to be
+            // filed as a clean success with a storage path that could be
+            // a half-copied directory - or one the move had already
+            // emptied - and the *arrs act on that: import the partial
+            // file, or stall on a release with no Failed state to
+            // trigger a re-grab.
+            //
+            // Reported Failed so a re-grab happens. A re-download costs
+            // bandwidth; importing half a file quietly corrupts a
+            // library, and there is no way after the fact to tell which
+            // of the two a given directory is. The bytes are left on
+            // disk, and the message says where, so nothing is lost that
+            // the user cannot pick up by hand.
+            if job.finalizing && job.state == JobState::Completed {
+                info!(
+                    target: "queue",
+                    "{} ({}) was interrupted DURING post-processing - \
+                     reporting it as failed so it is re-grabbed rather than \
+                     imported half-moved. Its files are under {}",
+                    job.nzo_id,
+                    job.name,
+                    job.out_dir.display()
+                );
+                job.state = JobState::Failed;
+                if job.fail_message.is_empty() {
+                    job.fail_message = format!(
+                        "post-processing was interrupted by a restart; the download \
+                         itself completed and its files are under {}",
+                        job.out_dir.display()
+                    );
+                }
+            } else {
+                info!(
+                    target: "queue",
+                    "{} ({}) was still in post-processing at shutdown - \
+                     filing it to history as {:?}",
+                    job.nzo_id, job.name, job.state
+                );
+            }
+            job.finalizing = false;
+            interrupted.push(job);
+        } else {
+            job.finalizing = false;
+            queued.push(job);
+        }
+    }
+    // Consumed on restore for the history array too, not only the queue
+    // arms above. The set_password unlock task saves while its
+    // ClearFinalizing guard is still in scope, so a history record can
+    // reach queue.json with `finalizing: true` and the guard's Drop then
+    // clears it in memory only. Carried back across a hard stop (docker
+    // stop, reboot, pkill - there is no SIGTERM handler), that stale
+    // flag made history_change_cat refuse the job FOREVER with
+    // "post-processing is still running", through both the dashboard and
+    // SAB editqueue set_cat, with no way to reset it. The flag has no
+    // consumer for a history record - the Completed->Failed conversion
+    // above applies only to the queue array - so clearing it here is the
+    // whole fix, whichever write path persisted the stale true.
+    let mut history: Vec<Job> = hist_arr
+        .iter()
+        .filter_map(job_from_json)
+        .map(|mut j| {
+            j.finalizing = false;
+            j
+        })
+        .collect();
+    // After the history array, not before: these finished last, and
+    // history reads newest-first off the end.
+    for job in interrupted {
+        if !history.iter().any(|h| h.nzo_id == job.nzo_id) {
+            history.push(job);
+        }
+    }
+    (queued, history)
+}
+
+/// Claim one of the EXTRA episode slots a multi-episode release covers.
+///
+/// A `S01E01E02` double owns both episodes, which is why it claims them:
+/// otherwise a standalone E02 gets grabbed again on the next pass. But
+/// the claim used to be a bare insert with no look at what was already
+/// there, so a 1080p double could take a slot that already held a
+/// standalone 2160p grab. The user's better copy stopped being tracked by
+/// any slot, and the very release they already had scored as an upgrade
+/// next pass and was re-downloaded with the duplicate hold bypassed.
+///
+/// Take the slot only when it is free, when we are at least as good as
+/// whoever holds it, or when it is our own record being refreshed.
+pub(super) fn claim_extra_slot(
+    slots: &mut std::collections::HashMap<String, crate::watchlist::Slot>,
+    key: String,
+    val: &crate::watchlist::Slot,
+) {
+    if let Some(prev) = slots.get(&key)
+        && prev.stem != val.stem
+        && prev.rank > val.rank
+    {
+        info!(
+            target: "watch",
+            "not taking the slot held by {} (better than {}) for its extra episode",
+            prev.stem, val.stem
+        );
+        return;
+    }
+    slots.insert(key, val.clone());
+}
+
+/// Content fingerprint of an NZB, so "already queued" can be answered
+/// after a restart from the persisted queue rather than from memory.
+pub(super) fn nzb_sha(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+/// The suffix `publish_over_previous` parks a superseded download under
+/// while it swaps the new one into place.
+pub(super) const REPLACED_SUFFIX: &str = ".nzbfast-replaced-";
+
+/// Finish, or undo, a replace that a crash caught between its two renames.
+///
+/// `publish_over_previous` renames the canonical directory aside, then
+/// renames the new payload onto it, and only then removes the aside. It
+/// rolls back on a reported error, but a power cut or a kill between the
+/// two renames left NO canonical directory at all: the previous
+/// completed job's history record pointed at a path that no longer
+/// existed, its bytes sat under a pid-suffixed name nothing would ever
+/// look at again, and the new payload stayed in its `.2` collision
+/// directory. Dashboard "open folder", delete-with-files and any *arr
+/// import against that job all hit a missing directory, silently. The
+/// aside name appeared in exactly one place in the whole tree - where it
+/// is built - so nothing swept, restored or even reported these.
+///
+/// Only the unambiguous case is repaired: the canonical path is GONE, so
+/// the aside is the only copy and belongs back. When both exist the
+/// likely story is that the second rename landed and only the cleanup
+/// was lost, but "likely" is not enough to delete a directory full of a
+/// user's media, so that one is reported and left alone.
+pub(super) fn recover_interrupted_publishes(out_root: &std::path::Path) {
+    // Job directories live at out_root/<name> or out_root/<cat>/<name>,
+    // so one level down is enough; this is startup, not a deep walk.
+    let mut dirs = vec![out_root.to_path_buf()];
+    if let Ok(rd) = std::fs::read_dir(out_root) {
+        for e in rd.flatten() {
+            if e.path().is_dir() {
+                dirs.push(e.path());
+            }
+        }
+    }
+    for dir in dirs {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let aside = e.path();
+            let Some(name) = aside.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            // Match the way the aside is BUILT: `<canonical>` + suffix +
+            // the parking process's pid, and nothing after it. A plain
+            // `find` accepted any name merely containing the suffix, so a
+            // user's own "Movie.nzbfast-replaced-Final" would be renamed
+            // to "Movie" over their heads - and, worse, the last
+            // occurrence is the one we split at, so a canonical name that
+            // itself ends in the suffix still resolves correctly.
+            let Some((stem, tail)) = name.rsplit_once(REPLACED_SUFFIX) else {
+                continue;
+            };
+            if stem.is_empty() || tail.is_empty() || !tail.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            if !aside.is_dir() {
+                continue;
+            }
+            let canon = dir.join(stem);
+            if canon.symlink_metadata().is_ok() {
+                info!(
+                    target: "replace",
+                    "{} and {} both exist - an interrupted replace left a spare \
+                     copy. Nothing is lost; delete whichever you do not want.",
+                    canon.display(),
+                    aside.display()
+                );
+                continue;
+            }
+            match std::fs::rename(&aside, &canon) {
+                Ok(()) => info!(
+                    target: "replace",
+                    "restored {} from {} - a replace was interrupted before the \
+                     new download took its place",
+                    canon.display(),
+                    aside.display()
+                ),
+                Err(err) => warn!(
+                    target: "replace",
+                    "could not restore {} from {}: {err} (the download is intact \
+                     under the second name)",
+                    canon.display(),
+                    aside.display()
+                ),
+            }
+        }
+    }
+}
+
+/// Who already holds a candidate output directory.
+pub(crate) enum DirClaim {
+    Free,
+    /// Another job is still working in it.
+    Active,
+    /// A completed job's payload is still there.
+    Payload,
+}
+
+/// Pick a new job's output directory, and the canonical directory it must
+/// publish over on success (`Job::replaces`).
+///
+/// Two DIFFERENT NZBs whose names sanitize to the same stem and carry no
+/// dupe_key (no SxxEyy/year marker - e.g. software or music posts) are not
+/// caught by the M14f duplicate hold, so they would share one out_dir.
+/// Their pipelines deliberately overlap (A's tail repairs/extracts while
+/// B's net leg runs), so B's journal + volume writers truncate the files A
+/// is still reading → both corrupt. A colliding job gets its own directory.
+///
+/// A COMPLETED job's payload claims its directory too. Treating it as
+/// inert meant a re-add reused the folder and the very first decoded span
+/// truncated the previous, good result - which was then gone for nothing
+/// if the replacement failed on missing articles, a password or ENOSPC.
+/// The re-add downloads under its own name and takes over the canonical
+/// directory only once it has verified. A FAILED job's leftovers are junk
+/// and are still reused in place, so retrying a flaky post does not climb
+/// .2, .3, .4.
+pub(crate) fn choose_out_dir(
+    base: &std::path::Path,
+    dir_stem: &str,
+    claim: &dyn Fn(&std::path::Path) -> DirClaim,
+) -> (PathBuf, Option<PathBuf>) {
+    let mut candidate = base.to_path_buf();
+    let mut replaces = None;
+    let mut n = 1u32;
+    loop {
+        match claim(&candidate) {
+            DirClaim::Free => return (candidate, replaces),
+            // Only the canonical directory is ever replaced; a numbered
+            // sibling left by some earlier collision is left alone.
+            DirClaim::Payload if candidate == base => replaces = Some(base.to_path_buf()),
+            _ => {}
+        }
+        n += 1;
+        candidate = base.with_file_name(format!("{dir_stem}.{n}"));
+    }
+}
+
+/// Where a re-queued job that had been TV-filed must download instead.
+///
+/// Its `out_dir` is the SHARED `Show/Season NN` library folder, so
+/// re-queueing it as-is aims the journal, the volume writers and every
+/// later "delete this job's files" at a directory belonging to the whole
+/// season. This picks the ordinary private directory the job would get on
+/// a fresh add - collision rules and all, so it cannot land on another
+/// job's folder either.
+pub(crate) fn refile_out_dir(
+    out_root: &std::path::Path,
+    category: &str,
+    name: &str,
+    claim: &dyn Fn(&std::path::Path) -> DirClaim,
+) -> (PathBuf, Option<PathBuf>) {
+    let dir_stem = nzbkit::disk::sanitize_filename(name.trim_end_matches(".nzb"));
+    let base = if category.is_empty() {
+        out_root.join(&dir_stem)
+    } else {
+        out_root
+            .join(nzbkit::disk::sanitize_filename(category))
+            .join(&dir_stem)
+    };
+    choose_out_dir(&base, &dir_stem, claim)
+}
+
+/// Take over the canonical output directory from the completed job this
+/// one replaces (see `Job::replaces`). Called once the job has finished
+/// successfully and before any renaming or relocation, so everything
+/// downstream sees the final location.
+///
+/// The previous result is moved aside first and only deleted once the new
+/// payload is in place; if the move in fails, the old result goes straight
+/// back and this job keeps its own directory. A re-add that never
+/// finishes therefore costs the user nothing - which is the whole point,
+/// since reusing the folder used to truncate the good payload with the
+/// replacement's first decoded span.
+///
+/// Returns the directory the job now lives in, or `None` when nothing
+/// moved.
+pub(crate) fn publish_over_previous(
+    out_dir: &std::path::Path,
+    canon: &std::path::Path,
+) -> Option<PathBuf> {
+    if out_dir == canon || !out_dir.exists() {
+        return None;
+    }
+    // Same constant `recover_interrupted_publishes` scans for at startup:
+    // a crash between the two renames below leaves this directory as the
+    // only copy of the superseded download, and the sweep puts it back.
+    let aside = canon.with_file_name(format!(
+        "{}{REPLACED_SUFFIX}{}",
+        canon.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    ));
+    let parked = canon.symlink_metadata().is_ok();
+    if parked && let Err(e) = std::fs::rename(canon, &aside) {
+        warn!(
+            target: "replace",
+            "could not move {} aside: {e} - keeping the new download in {}",
+            canon.display(),
+            out_dir.display()
+        );
+        return None;
+    }
+    match std::fs::rename(out_dir, canon) {
+        Ok(()) => {
+            if parked && let Err(e) = std::fs::remove_dir_all(&aside) {
+                warn!(
+                    target: "replace",
+                    "previous result left behind in {}: {e}",
+                    aside.display()
+                );
+            }
+            info!(target: "replace", "{} → {}", out_dir.display(), canon.display());
+            Some(canon.to_path_buf())
+        }
+        Err(e) => {
+            warn!(
+                target: "replace",
+                "{} → {}: {e} - keeping the new download where it is",
+                out_dir.display(),
+                canon.display()
+            );
+            if parked {
+                let _ = std::fs::rename(&aside, canon);
+            }
+            None
+        }
+    }
+}
+
+/// Are these two paths the same directory on disk?
+///
+/// A byte compare is not enough: a case variant on APFS or NTFS, a
+/// symlinked parent, or a "." component all name the same place while
+/// comparing unequal - and a move destination that aliases the download
+/// folder makes move_tree merge a directory with itself and rename every
+/// file in it to "name (2).ext".
+///
+/// canonicalize only works on paths that exist, so a missing path falls
+/// back to the byte compare. That is the safe direction here: the caller
+/// has just created the destination, and the check is a guard rail, not
+/// a security boundary.
+pub(super) fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
+    a == b
+        || match (a.canonicalize(), b.canonicalize()) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => false,
+        }
+}
+
+/// What both reference clients mean by "MB" in their APIs.
+///
+/// MEASURED, not assumed. An NZB whose segments sum to exactly
+/// 104857600 bytes was added to SABnzbd 5.0.4 and to NZBGet on the bench
+/// box, and both reported 100:
+///
+///   SAB    `mode=queue`  -> "mb": "100.00", "size": "100.0 MB"
+///   NZBGet `listgroups`  -> FileSizeMB: 100, from FileSizeLo/Hi 104857600
+///
+/// That is 1048576 bytes per MB in both. We divided by 1_000_000, which
+/// overstated every size by 4.9% - Sonarr multiplies the field back by
+/// 1024*1024, so its queue sizes and its free-space thresholds were both
+/// skewed. Anything feeding a client-facing *MB field goes through here.
+pub(super) const API_MB: f64 = 1024.0 * 1024.0;
+
+/// Integer form of [`API_MB`], for the NZBGet fields that are whole MB.
+pub(super) const API_MB_U: u64 = 1024 * 1024;
+
+/// Wall-clock seconds. Distinct from `Instant`, which is monotonic and
+/// process-local: anything that has to mean the same thing after a
+/// restart has to be stamped with this.
+pub(super) fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|t| t.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+pub(super) fn job_json(j: &Job) -> Value {
+    json!({
+        "nzo_id": j.nzo_id,
+        "name": j.name,
+        "nzb_path": j.nzb_path.to_string_lossy(),
+        "origin": j.origin,
+        "category": j.category,
+        "state": format!("{:?}", j.state),
+        "total_bytes": j.total_bytes,
+        "out_dir": j.out_dir.to_string_lossy(),
+        "fail_message": j.fail_message,
+        "fail_detail": j.fail_detail,
+        "priority": j.priority,
+        "paused": j.paused,
+        "retries": j.retries,
+        "dupe_key": j.dupe_key,
+        "library": j.library,
+        "fetched": j.fetched,
+        "downloaded_bytes": j.downloaded_bytes,
+        "elapsed_secs": j.elapsed_secs,
+        // Wall clock, so history ages survive a restart.
+        "finished_unix": j.finished_unix,
+        "nzb_sha": j.nzb_sha,
+        "finalizing": j.finalizing,
+        "deferred": j.deferred,
+        "defer_reason": j.defer_reason,
+        "defer_count": j.defer_count,
+        "password": j.password,
+        "bad_blocks": j.bad_blocks,
+        "tv_sort": j.tv_sort,
+        // Whether out_dir is the shared season folder. Persisted: a
+        // restart that forgot it would let a delete-with-files remove a
+        // whole season (see Job::filed).
+        "filed": j.filed,
+        // What filing appended to the episode files. Persisted because
+        // the naming settings are live and this is history: recomputing
+        // it later answers about today, not about the files on disk.
+        "filed_suffix": j.filed_suffix,
+        "filed_title": j.filed_title,
+        "filed_base": j.filed_base,
+        "password_required": j.password_required,
+        "zip_packed": j.zip_packed,
+        "unpack_blocked_by": j.unpack_blocked_by,
+        "archive_shape": j.archive_shape,
+        // The identity facts an oracle supplied. Persisted rather than
+        // recomputed: every one of them cost a third-party request, and
+        // the headers the CRC came from are long gone by restart.
+        "inner_crc": j.inner_crc,
+        "identity_name": j.identity_name,
+        "identity_imdb": j.identity_imdb,
+        "identity_src": j.identity_src,
+        "auto_retry_at": j.auto_retry_at,
+        "pp_params": j.pp_params,
+        "replaces": j.replaces.as_ref().map(|p| p.to_string_lossy()),
+        // Survives a restart: a job the daemon was killed mid-download
+        // still knows where to report its failure when it eventually
+        // does fail, and how deep the replacement chain already is.
+        "failure_link": j.failure_link,
+        "failure_host": j.failure_host,
+        "failure_https": j.failure_https,
+        "failure_depth": j.failure_depth,
+        "identify": j.identify,
+        // §77 pre-flight verdict. Persisted rather than recomputed: the
+        // probe cost a round of STATs against every server, and after a
+        // restart the answer to "was it already missing when you added
+        // it?" cannot be obtained any other way - the post has moved on.
+        "health": j.health.as_ref().map(crate::health::health_json),
+        // §76. Persisted, not recomputed: the live writer it was read
+        // from is gone, and re-probing every history row at load would
+        // wake a disk full of finished downloads to learn what we
+        // already knew.
+        "media": j.media,
+    })
+}
+
+pub(super) fn job_from_json(v: &Value) -> Option<Job> {
+    let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+    let out_dir = PathBuf::from(s("out_dir")?);
+    let tv_sort = v.get("tv_sort").and_then(Value::as_bool).unwrap_or(false);
+    // Records written before `filed` existed have to answer the question
+    // somehow, and the shape of `out_dir` is the whole answer: a season
+    // folder is shared no matter what state the job is sitting in.
+    //
+    // Emphatically NOT gated on `state == "Completed"`. The pre-upgrade
+    // `retry` re-queued a filed job without moving it off the season
+    // folder and then persisted it, so a legacy record can read `Queued`
+    // while `out_dir` is still `Show/Season NN` - and migrating that as
+    // `filed = false` is what hands the next delete-with-files a
+    // `remove_dir_all` of the season.
+    let filed = v
+        .get("filed")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| tv_sort && is_season_dir(&out_dir));
+    Some(Job {
+        nzo_id: s("nzo_id")?,
+        name: s("name")?,
+        nzb_path: PathBuf::from(s("nzb_path")?),
+        // Absent on records written before jobs carried an origin.
+        origin: s("origin").unwrap_or_default(),
+        category: s("category").unwrap_or_default(),
+        state: match v.get("state").and_then(Value::as_str)? {
+            "Completed" => JobState::Completed,
+            "Failed" => JobState::Failed,
+            // Queued - including a job caught mid-Downloading by the
+            // shutdown: it goes back through the scheduler and resumes.
+            _ => JobState::Queued,
+        },
+        total_bytes: v.get("total_bytes").and_then(Value::as_u64).unwrap_or(0),
+        out_dir,
+        fail_message: s("fail_message").unwrap_or_default(),
+        fail_detail: s("fail_detail").unwrap_or_default(),
+        // Monotonic clock cannot survive a process, so this stays None;
+        // `finished_unix` is the one that carries the age across.
+        finished_at: None,
+        finished_unix: v.get("finished_unix").and_then(Value::as_i64),
+        nzb_sha: s("nzb_sha").unwrap_or_default(),
+        finalizing: v
+            .get("finalizing")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        priority: v.get("priority").and_then(Value::as_i64).unwrap_or(0) as i32,
+        paused: v.get("paused").and_then(Value::as_bool).unwrap_or(false),
+        retries: v.get("retries").and_then(Value::as_u64).unwrap_or(0) as u32,
+        dupe_key: s("dupe_key"),
+        library: v.get("library").and_then(Value::as_bool).unwrap_or(false),
+        fetched: v.get("fetched").and_then(Value::as_bool).unwrap_or(false),
+        tombstone: false,
+        del_on_drop: false,
+        suspended: false,
+        downloaded_bytes: v
+            .get("downloaded_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        elapsed_secs: v.get("elapsed_secs").and_then(Value::as_f64).unwrap_or(0.0),
+        deferred: v.get("deferred").and_then(Value::as_bool).unwrap_or(false),
+        defer_reason: s("defer_reason").unwrap_or_default(),
+        defer_count: v.get("defer_count").and_then(Value::as_u64).unwrap_or(0) as u32,
+        demote: false,
+        password: s("password"),
+        bad_blocks: v.get("bad_blocks").and_then(Value::as_u64).unwrap_or(0),
+        tv_sort,
+        filed,
+        // Absent on records written before filing recorded its suffix.
+        // NOT `unwrap_or_default()`: an empty suffix is a real value that
+        // means "auto-rename was off, the files are bare {base}.{ext}",
+        // and as a match pattern it takes every quality of the episode.
+        // Legacy records say None and fall back to a recompute, which is
+        // what all of them did before this field existed.
+        filed_suffix: v
+            .get("filed_suffix")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        // Absent on every record written before episode titles existed,
+        // and `delete_tail` reads that absence as "no title on disk" -
+        // which for those records is a fact, not a fallback.
+        filed_title: v
+            .get("filed_title")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        filed_base: v
+            .get("filed_base")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        password_required: v
+            .get("password_required")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        zip_packed: v
+            .get("zip_packed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        unpack_blocked_by: s("unpack_blocked_by").unwrap_or_default(),
+        archive_shape: s("archive_shape").unwrap_or_default(),
+        inner_crc: v.get("inner_crc").and_then(Value::as_u64).unwrap_or(0) as u32,
+        identity_name: s("identity_name").unwrap_or_default(),
+        identity_imdb: s("identity_imdb").unwrap_or_default(),
+        identity_src: s("identity_src").unwrap_or_default(),
+        auto_retry_at: v.get("auto_retry_at").and_then(Value::as_u64),
+        pp_params: v
+            .get("pp_params")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|p| {
+                        let pair = p.as_array()?;
+                        Some((
+                            pair.first()?.as_str()?.to_string(),
+                            pair.get(1)?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        replaces: s("replaces").filter(|v| !v.is_empty()).map(PathBuf::from),
+        failure_link: s("failure_link").unwrap_or_default(),
+        // Absent in records written before the origin check existed. An
+        // empty host fails the match, so such a job reports nowhere -
+        // the safe direction, and only until its next fetch.
+        failure_host: s("failure_host").unwrap_or_default(),
+        // Absent in records written before the scheme was kept. `false`
+        // means "http origin", which only ever permits MORE than the
+        // truth would - and only until the job's next fetch restamps it.
+        failure_https: v
+            .get("failure_https")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        failure_depth: v.get("failure_depth").and_then(Value::as_u64).unwrap_or(0) as u8,
+        identify: s("identify").unwrap_or_default(),
+        // Absent on every record written before §77, and on any record
+        // whose verdict no longer parses: both mean "not sampled", which
+        // renders no badge and sinks nothing.
+        health: v.get("health").and_then(crate::health::health_from_json),
+        // Absent on every record written before §76, and on any that a
+        // future field addition cannot deserialize - both mean "nothing
+        // known about the bytes", which is what an unprobed job is.
+        media: v
+            .get("media")
+            .cloned()
+            .and_then(|m| serde_json::from_value(m).ok()),
+    })
+}

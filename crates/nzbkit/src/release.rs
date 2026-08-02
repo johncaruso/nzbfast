@@ -110,9 +110,8 @@ fn tv_marker(tok: &str) -> Option<(u32, Option<u32>, Option<u32>)> {
         // 1-2 digit seasons, plus year-as-season ("S2026E015" - annual
         // sports/soaps) when an episode follows; bare "S2026" stays a
         // year, not a season pack.
-        let year_season = digits.len() == 4
-            && is_year(&digits)
-            && rest[digits.len()..].starts_with('e');
+        let year_season =
+            digits.len() == 4 && is_year(&digits) && rest[digits.len()..].starts_with('e');
         if digits.is_empty() || (digits.len() > 2 && !year_season) {
             return None;
         }
@@ -144,21 +143,21 @@ fn tv_marker(tok: &str) -> Option<(u32, Option<u32>, Option<u32>)> {
         return None;
     }
     // Bare episode marker "E06" (season unknown).
-    if let Some(ed) = t.strip_prefix('e') {
-        if (2..=3).contains(&ed.len()) && ed.chars().all(|c| c.is_ascii_digit()) {
-            return Some((0, ed.parse().ok(), None));
-        }
+    if let Some(ed) = t.strip_prefix('e')
+        && (2..=3).contains(&ed.len())
+        && ed.chars().all(|c| c.is_ascii_digit())
+    {
+        return Some((0, ed.parse().ok(), None));
     }
     // 3x07 form.
-    if let Some((s, e)) = t.split_once('x') {
-        if !s.is_empty()
-            && s.len() <= 2
-            && s.chars().all(|c| c.is_ascii_digit())
-            && (2..=3).contains(&e.len())
-            && e.chars().all(|c| c.is_ascii_digit())
-        {
-            return Some((s.parse().ok()?, e.parse().ok(), None));
-        }
+    if let Some((s, e)) = t.split_once('x')
+        && !s.is_empty()
+        && s.len() <= 2
+        && s.chars().all(|c| c.is_ascii_digit())
+        && (2..=3).contains(&e.len())
+        && e.chars().all(|c| c.is_ascii_digit())
+    {
+        return Some((s.parse().ok()?, e.parse().ok(), None));
     }
     None
 }
@@ -167,31 +166,142 @@ fn tv_marker(tok: &str) -> Option<(u32, Option<u32>, Option<u32>)> {
 fn is_tag(tok: &str) -> bool {
     const TAGS: &[&str] = &[
         // resolution
-        "2160p", "1080p", "1080i", "720p", "576p", "480p", "4k", "uhd",
+        "2160p",
+        "1080p",
+        "1080i",
+        "720p",
+        "576p",
+        "480p",
+        "4k",
+        "uhd",
         // source
-        "bluray", "blu", "bdrip", "brrip", "remux", "web", "web-dl", "webdl",
-        "dl", "webrip", "hdtv", "dvdrip", "dvd", "hddvd", "hdrip", "camrip",
+        "bluray",
+        "blu",
+        "bdrip",
+        "brrip",
+        "remux",
+        "web",
+        "web-dl",
+        "webdl",
+        "dl",
+        "webrip",
+        "hdtv",
+        "dvdrip",
+        "dvd",
+        "hddvd",
+        "hdrip",
+        "camrip",
         "ts",
         // codec
-        "x264", "x265", "h264", "h265", "h", "hevc", "avc", "av1", "xvid",
-        "divx", "vc-1", "vc1",
+        "x264",
+        "x265",
+        "h264",
+        "h265",
+        "h",
+        "hevc",
+        "avc",
+        "av1",
+        "xvid",
+        "divx",
+        "vc-1",
+        "vc1",
         // audio
-        "dts", "dts-hd", "dtshd", "dts-x", "dtsx", "truehd", "atmos", "aac",
-        "ac3", "eac3", "dd5", "ddp", "ddp5", "flac", "opus", "mp3", "ma",
+        "dts",
+        "dts-hd",
+        "dtshd",
+        "dts-x",
+        "dtsx",
+        "truehd",
+        "atmos",
+        "aac",
+        "ac3",
+        "eac3",
+        "dd5",
+        "ddp",
+        "ddp5",
+        "flac",
+        "opus",
+        "mp3",
+        "ma",
         // misc release furniture
-        "proper", "repack", "rerip", "extended", "unrated", "internal",
-        "limited", "complete", "multi", "dual", "subbed", "dubbed", "vostfr",
-        "hdr", "hdr10", "hdr10+", "dv", "dovi", "sdr", "imax", "remastered",
-        "criterion", "3d", "10bit", "8bit", "retail", "readnfo", "hybrid",
-        "season", "series", "amzn", "nf", "dsnp", "hulu", "atvp", "max",
+        "proper",
+        "repack",
+        "rerip",
+        "extended",
+        "unrated",
+        "internal",
+        "limited",
+        "complete",
+        "multi",
+        "dual",
+        "subbed",
+        "dubbed",
+        "vostfr",
+        "hdr",
+        "hdr10",
+        "hdr10+",
+        "dv",
+        "dovi",
+        "sdr",
+        "imax",
+        "remastered",
+        "criterion",
+        "3d",
+        "10bit",
+        "8bit",
+        "retail",
+        "readnfo",
+        "hybrid",
+        "season",
+        "series",
+        "amzn",
+        "nf",
+        "dsnp",
+        "hulu",
+        "atvp",
+        "max",
         // sibling-file noise (nfo/sfv/samples post as their own "releases")
-        "nfo", "sfv", "srr", "srs", "sample", "proof", "subs", "par2", "nzb",
-        "rar", "mkv", "mp4", "avi", "m2ts", "iso", "img", "jpg", "png", "txt",
-        "diz", "vob",
+        "nfo",
+        "sfv",
+        "srr",
+        "srs",
+        "sample",
+        "proof",
+        "subs",
+        "par2",
+        "nzb",
+        "rar",
+        "mkv",
+        "mp4",
+        "avi",
+        "m2ts",
+        "iso",
+        "img",
+        "jpg",
+        "png",
+        "txt",
+        "diz",
+        "vob",
         // language / region / broadcast furniture
-        "german", "french", "dutch", "spanish", "italian", "swedish",
-        "danish", "norwegian", "flemish", "nordic", "english", "pal", "ntsc",
-        "dvdr", "pdtv", "sdtv", "ws", "nlsubbed", "dl-subbed",
+        "german",
+        "french",
+        "dutch",
+        "spanish",
+        "italian",
+        "swedish",
+        "danish",
+        "norwegian",
+        "flemish",
+        "nordic",
+        "english",
+        "pal",
+        "ntsc",
+        "dvdr",
+        "pdtv",
+        "sdtv",
+        "ws",
+        "nlsubbed",
+        "dl-subbed",
     ];
     TAGS.contains(&tok.to_ascii_lowercase().as_str())
 }
@@ -331,18 +441,59 @@ pub enum TokenRole {
 /// a film called "Cut" or "Ultimate" still parses by its leading tokens.
 const HARD_EXTRA: &[&str] = &[
     // audio spellings TAGS doesn't list ("DD.5.1" splits to a bare "dd")
-    "dd", "dd2", "dd7", "ddp7", "dtsma", "lpcm", "pcm", "mp2", "ac4",
+    "dd",
+    "dd2",
+    "dd7",
+    "ddp7",
+    "dtsma",
+    "lpcm",
+    "pcm",
+    "mp2",
+    "ac4",
     // edition markers ("Director's Cut", "Ultimate Edition", "Uncut")
-    "directors", "director", "theatrical", "uncut", "uncensored",
-    "restored", "anniversary", "collectors", "collector", "definitive",
-    "ultimate", "edition", "cut", "dc",
+    "directors",
+    "director",
+    "theatrical",
+    "uncut",
+    "uncensored",
+    "restored",
+    "anniversary",
+    "collectors",
+    "collector",
+    "definitive",
+    "ultimate",
+    "edition",
+    "cut",
+    "dc",
     // print provenance
-    "int", "scr", "screener", "dvdscr", "r5", "tc", "telesync", "telecine",
-    "cam", "hdcam", "workprint", "hc", "korsub", "cd",
+    "int",
+    "scr",
+    "screener",
+    "dvdscr",
+    "r5",
+    "tc",
+    "telesync",
+    "telecine",
+    "cam",
+    "hdcam",
+    "workprint",
+    "hc",
+    "korsub",
+    "cd",
     // resolution / colour words TAGS doesn't list
-    "hd", "fhd", "qhd", "sd", "ultra", "hdr10plus", "hlg", "12bit", "vp9",
+    "hd",
+    "fhd",
+    "qhd",
+    "sd",
+    "ultra",
+    "hdr10plus",
+    "hlg",
+    "12bit",
+    "vp9",
     // broadcast platforms beyond the TAGS set
-    "hmax", "pcok", "ip",
+    "hmax",
+    "pcok",
+    "ip",
 ];
 
 /// Dub / subtitle markers the language table doesn't carry.
@@ -365,8 +516,11 @@ fn is_hard_furniture(t: &str) -> bool {
     }
     // Counted furniture with the number in front ("6ch", "60fps", "v2").
     let counted = |n: &str| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit());
-    t.strip_suffix("ch").or_else(|| t.strip_suffix("fps")).is_some_and(counted)
-        || t.strip_prefix('v').is_some_and(|n| n.len() <= 2 && counted(n))
+    t.strip_suffix("ch")
+        .or_else(|| t.strip_suffix("fps"))
+        .is_some_and(counted)
+        || t.strip_prefix('v')
+            .is_some_and(|n| n.len() <= 2 && counted(n))
 }
 
 /// Role of a token that follows a release's identity marker.
@@ -416,15 +570,27 @@ pub fn identity_tail<'a, I: IntoIterator<Item = &'a str>>(after_year: I) -> Vec<
 /// that merely contains one of the words ("-RPGroup") is not one of these.
 fn is_reposter_tag(tag: &str) -> bool {
     const TAGS: &[&str] = &[
-        "obfuscated", "obfuscation", "scrambled", "sample", "postbot",
-        "xpost", "buymore", "asrequested", "alternativetorequested",
-        "gerov", "z0ids3n", "chamele0n", "4planet", "altezachen",
-        "repackpost", "nzbgeek", "rp",
+        "obfuscated",
+        "obfuscation",
+        "scrambled",
+        "sample",
+        "postbot",
+        "xpost",
+        "buymore",
+        "asrequested",
+        "alternativetorequested",
+        "gerov",
+        "z0ids3n",
+        "chamele0n",
+        "4planet",
+        "altezachen",
+        "repackpost",
+        "nzbgeek",
+        "rp",
     ];
     let low = tag.to_ascii_lowercase();
     TAGS.contains(&low.as_str())
-        || (low.starts_with("rakuv")
-            && low[5..].chars().all(|c| c.is_ascii_alphanumeric()))
+        || (low.starts_with("rakuv") && low[5..].chars().all(|c| c.is_ascii_alphanumeric()))
 }
 
 /// Strip those tags off the end of a stem. Repeatedly: they chain
@@ -480,7 +646,10 @@ pub fn looks_obfuscated(stem: &str) -> bool {
         return true;
     }
     // All tokens long hex → hash name ("2137d880a074…").
-    if toks.iter().all(|t| t.len() >= 8 && t.chars().all(|c| c.is_ascii_hexdigit())) {
+    if toks
+        .iter()
+        .all(|t| t.len() >= 8 && t.chars().all(|c| c.is_ascii_hexdigit()))
+    {
         return true;
     }
     // Fixed-width HEX blob the whole way across ("d41d8cd98f00b204…"):
@@ -585,7 +754,10 @@ pub fn looks_like_release_name(s: &str) -> bool {
 /// titles containing "Setup" or "The Professional" survive.
 fn software_marker(toks: &[&str]) -> Option<usize> {
     let strong = |t: &str| {
-        matches!(t, "keygen" | "keymaker" | "activator" | "preactivated" | "regged")
+        matches!(
+            t,
+            "keygen" | "keymaker" | "activator" | "preactivated" | "regged"
+        )
     };
     // Weak vocabulary splits in two: "namey" words are usually part of
     // the product name itself ("Office Professional Plus") and stay in
@@ -594,9 +766,23 @@ fn software_marker(toks: &[&str]) -> Option<usize> {
     let furniture = |t: &str| {
         matches!(
             t,
-            "crack" | "cracked" | "patch" | "serial" | "portable" | "installer"
-                | "setup" | "x64" | "x86" | "win32" | "win64" | "windows"
-                | "macos" | "linux" | "multilingual" | "software" | "incl"
+            "crack"
+                | "cracked"
+                | "patch"
+                | "serial"
+                | "portable"
+                | "installer"
+                | "setup"
+                | "x64"
+                | "x86"
+                | "win32"
+                | "win64"
+                | "windows"
+                | "macos"
+                | "linux"
+                | "multilingual"
+                | "software"
+                | "incl"
                 | "build"
         )
     };
@@ -610,9 +796,7 @@ fn software_marker(toks: &[&str]) -> Option<usize> {
             && t[1..].chars().any(|c| c.is_ascii_digit())
             && (t[1..].contains('.')
                 || toks.get(i + 1).is_some_and(|n| {
-                    !n.is_empty()
-                        && n.chars().all(|c| c.is_ascii_digit())
-                        && !is_year(n)
+                    !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) && !is_year(n)
                 }))
     };
     let mut first_furniture: Option<usize> = None;
@@ -660,9 +844,26 @@ fn software_marker(toks: &[&str]) -> Option<usize> {
 fn audio_marker(tok: &str) -> bool {
     matches!(
         tok,
-        "flac" | "mp3" | "m4a" | "alac" | "aiff" | "wavpack" | "webflac"
-            | "web-flac" | "ogg" | "wma" | "24bit" | "cdda" | "cdm" | "cds"
-            | "cdr" | "vinyl" | "vbr" | "320kbps" | "256kbps" | "192kbps"
+        "flac"
+            | "mp3"
+            | "m4a"
+            | "alac"
+            | "aiff"
+            | "wavpack"
+            | "webflac"
+            | "web-flac"
+            | "ogg"
+            | "wma"
+            | "24bit"
+            | "cdda"
+            | "cdm"
+            | "cds"
+            | "cdr"
+            | "vinyl"
+            | "vbr"
+            | "320kbps"
+            | "256kbps"
+            | "192kbps"
             | "128kbps"
     )
 }
@@ -673,8 +874,18 @@ fn audio_marker(tok: &str) -> bool {
 fn book_marker(tok: &str) -> bool {
     matches!(
         tok,
-        "epub" | "epub3" | "mobi" | "azw" | "azw3" | "fb2" | "djvu" | "cbz"
-            | "ebook" | "ebooks" | "audiobook" | "audiobooks"
+        "epub"
+            | "epub3"
+            | "mobi"
+            | "azw"
+            | "azw3"
+            | "fb2"
+            | "djvu"
+            | "cbz"
+            | "ebook"
+            | "ebooks"
+            | "audiobook"
+            | "audiobooks"
     )
 }
 
@@ -808,7 +1019,11 @@ fn scene_media(body: &str) -> Option<(Kind, String, String, Option<u32>)> {
         None if dated && body.contains('_') => Kind::Music,
         None => return None,
     };
-    let year = fields.iter().skip(2).find(|f| is_year(f)).and_then(|f| f.parse().ok());
+    let year = fields
+        .iter()
+        .skip(2)
+        .find(|f| is_year(f))
+        .and_then(|f| f.parse().ok());
     let credit = word_of(fields[0]).join(" ");
     let work = word_of(fields[1]).join(" ");
     if credit.is_empty() || work.is_empty() {
@@ -824,7 +1039,11 @@ fn scene_media(body: &str) -> Option<(Kind, String, String, Option<u32>)> {
 /// cards for one album. Artist+album is the identity, as it is for a
 /// show's seasons under "t:".
 fn media_key(kind: &Kind, title: &str) -> String {
-    let prefix = if matches!(kind, Kind::Book) { "bk" } else { "mu" };
+    let prefix = if matches!(kind, Kind::Book) {
+        "bk"
+    } else {
+        "mu"
+    };
     format!("{prefix}:{}", norm_title(title))
 }
 
@@ -870,11 +1089,10 @@ fn rot5_digits(s: &str) -> String {
 /// Common English words that survive into almost every real title -
 /// a decode containing one is strong evidence it isn't coincidence.
 const COMMON_WORDS: &[&str] = &[
-    "the", "a", "an", "and", "of", "to", "in", "on", "at", "is", "it",
-    "for", "with", "from", "my", "who", "what", "war", "world", "man",
-    "men", "girl", "boy", "king", "queen", "day", "night", "dead", "love",
-    "life", "star", "dark", "black", "white", "story", "game", "house",
-    "big", "little", "new", "last", "first", "one", "two",
+    "the", "a", "an", "and", "of", "to", "in", "on", "at", "is", "it", "for", "with", "from", "my",
+    "who", "what", "war", "world", "man", "men", "girl", "boy", "king", "queen", "day", "night",
+    "dead", "love", "life", "star", "dark", "black", "white", "story", "game", "house", "big",
+    "little", "new", "last", "first", "one", "two",
 ];
 
 /// (every word pronounceable, contains a common English word). A word
@@ -936,7 +1154,7 @@ fn rot13_rescue(stem: &str) -> Option<Parsed> {
         // A sane season number is the extra bit of evidence.
         let plausible = p.season.map_or(0, |s| u32::from((1..=40).contains(&s)));
         let score = signals * 2 + plausible;
-        if best.as_ref().map_or(true, |(s, _)| score > *s) {
+        if best.as_ref().is_none_or(|(s, _)| score > *s) {
             best = Some((score, p));
         }
     }
@@ -1032,7 +1250,10 @@ fn reversed_rescue(stem: &str, direct: &Parsed) -> Option<Parsed> {
     {
         return None;
     }
-    if !stem.split(|c: char| !c.is_ascii_alphanumeric()).any(reads_backwards) {
+    if !stem
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(reads_backwards)
+    {
         return None;
     }
     let p = parse_one(&stem.chars().rev().collect::<String>());
@@ -1040,11 +1261,17 @@ fn reversed_rescue(stem: &str, direct: &Parsed) -> Option<Parsed> {
         return None;
     }
     let episode = (p.season.is_some() || p.episode.is_some())
-        && p.season.map_or(true, |s| (1..=40).contains(&s));
-    let signals = [episode, p.year.is_some(), p.res.is_some(), p.source.is_some(), p.remux]
-        .iter()
-        .filter(|b| **b)
-        .count();
+        && p.season.is_none_or(|s| (1..=40).contains(&s));
+    let signals = [
+        episode,
+        p.year.is_some(),
+        p.res.is_some(),
+        p.source.is_some(),
+        p.remux,
+    ]
+    .iter()
+    .filter(|b| **b)
+    .count();
     if signals < 2 {
         return None;
     }
@@ -1072,11 +1299,10 @@ pub fn parse_release(stem: &str) -> Parsed {
         && direct.res.is_none()
         && direct.source.is_none()
         && !direct.remux
+        && let Some(mut p) = rot13_rescue(stem)
     {
-        if let Some(mut p) = rot13_rescue(stem) {
-            p.rescued = true;
-            return p;
-        }
+        p.rescued = true;
+        return p;
     }
     direct
 }
@@ -1113,8 +1339,7 @@ fn parse_one(stem: &str) -> Parsed {
     // Tokenize on dot/underscore/space; hyphens survive inside tokens
     // ("Spider-Man", "WEB-DL"). Exception: stems with NO other separator
     // and several hyphens are hyphen-separated ("the-flash-s01e01-720p").
-    let all_hyphen =
-        !body.contains(['.', '_', ' ']) && body.matches('-').count() >= 3;
+    let all_hyphen = !body.contains(['.', '_', ' ']) && body.matches('-').count() >= 3;
     let seps: &[char] = if all_hyphen { &['-'] } else { &['.', '_', ' '] };
     let toks: Vec<&str> = body
         .split(seps)
@@ -1200,9 +1425,8 @@ fn parse_one(stem: &str) -> Parsed {
     // Index of the first token AFTER the date, so the identity tail can
     // start there (the same trick the movie-year arm uses).
     let mut date_end: Option<usize> = None;
-    let is_datecode = |t: &str| {
-        (t.len() == 6 || t.len() == 8) && t.chars().all(|c| c.is_ascii_digit())
-    };
+    let is_datecode =
+        |t: &str| (t.len() == 6 || t.len() == 8) && t.chars().all(|c| c.is_ascii_digit());
     // A 2-digit month or day in range. At eight digits the daily flag is
     // deliberately looser than this (any run of that width reads as a
     // datecode); only a date that validates becomes an identity.
@@ -1311,17 +1535,17 @@ fn parse_one(stem: &str) -> Parsed {
             if let Some(v) = vcodec_of(cand) {
                 vcodec.get_or_insert(v.to_string());
             }
-            if let Some((rank, a)) = acodec_of(cand) {
-                if rank > arank {
-                    arank = rank;
-                    acodec = Some(a.to_string());
-                }
+            if let Some((rank, a)) = acodec_of(cand)
+                && rank > arank
+            {
+                arank = rank;
+                acodec = Some(a.to_string());
             }
-            if let Some((rank, h)) = hdr_of(cand) {
-                if rank > hrank {
-                    hrank = rank;
-                    hdr = Some(h.to_string());
-                }
+            if let Some((rank, h)) = hdr_of(cand)
+                && rank > hrank
+            {
+                hrank = rank;
+                hdr = Some(h.to_string());
             }
         }
     }
@@ -1330,9 +1554,8 @@ fn parse_one(stem: &str) -> Parsed {
     // them are already release furniture to `is_tag`, but the ebook ones
     // are not, so the marker also has to close the title region - "Frank
     // Herbert - Dune 1965 epub" must not keep "epub" in its title.
-    let media = media_marker(&toks).filter(|_| {
-        no_video_evidence(&res, &vcodec, &source, remux, season, daily)
-    });
+    let media = media_marker(&toks)
+        .filter(|_| no_video_evidence(&res, &vcodec, &source, remux, season, daily));
     if let Some((_, i)) = &media {
         boundary = boundary.min(*i);
     }
@@ -1353,10 +1576,10 @@ fn parse_one(stem: &str) -> Parsed {
     // look there, so a film titled "Rus" or "Ita" stays untagged.
     for t in &toks[cut..] {
         for part in t.split('-') {
-            if let Some(l) = lang_of(part) {
-                if !langs.iter().any(|x| x == l) {
-                    langs.push(l.to_string());
-                }
+            if let Some(l) = lang_of(part)
+                && !langs.iter().any(|x| x == l)
+            {
+                langs.push(l.to_string());
             }
         }
     }
@@ -1379,9 +1602,9 @@ fn parse_one(stem: &str) -> Parsed {
         // IS the title, not a suffix. I, V and X are left out on purpose:
         // as single letters they are far more often initials than numerals.
         const KEEP_UPPER: [&str; 28] = [
-            "ii", "iii", "iv", "vi", "vii", "viii", "ix", "xi", "xii", "xiii", "xiv", "xv",
-            "us", "uk", "usa", "wwe", "nhl", "nba", "nfl", "ufc", "fbi", "cia", "swat",
-            "nasa", "bbc", "cnn", "espn", "uefa",
+            "ii", "iii", "iv", "vi", "vii", "viii", "ix", "xi", "xii", "xiii", "xiv", "xv", "us",
+            "uk", "usa", "wwe", "nhl", "nba", "nfl", "ufc", "fbi", "cia", "swat", "nasa", "bbc",
+            "cnn", "espn", "uefa",
         ];
         let multi = title_toks.len() > 1;
         title = title
@@ -1393,7 +1616,9 @@ fn parse_one(stem: &str) -> Parsed {
                 }
                 let mut cs = w.chars();
                 match cs.next() {
-                    Some(f) => f.to_ascii_uppercase().to_string() + &cs.as_str().to_ascii_lowercase(),
+                    Some(f) => {
+                        f.to_ascii_uppercase().to_string() + &cs.as_str().to_ascii_lowercase()
+                    }
                     None => String::new(),
                 }
             })
@@ -1525,10 +1750,10 @@ pub struct NameStyle {
 /// appends it directly to a base name.
 pub fn quality_suffix(p: &Parsed, style: &NameStyle) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if style.resolution {
-        if let Some(r) = &p.res {
-            parts.push(r.clone());
-        }
+    if style.resolution
+        && let Some(r) = &p.res
+    {
+        parts.push(r.clone());
     }
     if style.source {
         if p.remux {
@@ -1537,15 +1762,15 @@ pub fn quality_suffix(p: &Parsed, style: &NameStyle) -> String {
             parts.push(s.clone());
         }
     }
-    if style.video_codec {
-        if let Some(v) = &p.vcodec {
-            parts.push(v.clone());
-        }
+    if style.video_codec
+        && let Some(v) = &p.vcodec
+    {
+        parts.push(v.clone());
     }
-    if style.audio_codec {
-        if let Some(a) = &p.acodec {
-            parts.push(a.clone());
-        }
+    if style.audio_codec
+        && let Some(a) = &p.acodec
+    {
+        parts.push(a.clone());
     }
     let mut out = String::new();
     if !parts.is_empty() {
@@ -1558,10 +1783,10 @@ pub fn quality_suffix(p: &Parsed, style: &NameStyle) -> String {
             out.push(']');
         }
     }
-    if style.group {
-        if let Some(g) = &p.group {
-            out.push_str(&format!("-{g}"));
-        }
+    if style.group
+        && let Some(g) = &p.group
+    {
+        out.push_str(&format!("-{g}"));
     }
     out
 }
@@ -1603,7 +1828,9 @@ fn days_in_month(year: u32, month: u32) -> u32 {
         // Proleptic Gregorian, which is what a four-digit year in a
         // release name means: every 4th year, except centuries, except
         // every 400th.
-        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) => {
+            29
+        }
         2 => 28,
         _ => 0,
     }
@@ -1807,7 +2034,10 @@ pub fn sanitize_name(t: &str) -> String {
         .collect();
     let collapsed = mapped.split_whitespace().collect::<Vec<_>>().join(" ");
     // A colon at the very start or end leaves a dangling separator behind.
-    let collapsed = collapsed.trim_start_matches("- ").trim_end_matches(" -").trim();
+    let collapsed = collapsed
+        .trim_start_matches("- ")
+        .trim_end_matches(" -")
+        .trim();
     if !collapsed.chars().any(|c| c.is_alphanumeric()) {
         return String::new();
     }
@@ -1827,10 +2057,18 @@ mod tests {
     /// whole season collapsing onto one name.
     #[test]
     fn extra_words_keep_events_apart() {
-        let on = NameStyle { resolution: true, extra_words: true, ..Default::default() };
-        let off = NameStyle { resolution: true, ..Default::default() };
+        let on = NameStyle {
+            resolution: true,
+            extra_words: true,
+            ..Default::default()
+        };
+        let off = NameStyle {
+            resolution: true,
+            ..Default::default()
+        };
 
-        let race = p("Formula1.2026.Round11.Hungary.Race.F1TV.WEB-DL.2160p.HLG.H265.DDP5.1.English-MWR");
+        let race =
+            p("Formula1.2026.Round11.Hungary.Race.F1TV.WEB-DL.2160p.HLG.H265.DDP5.1.English-MWR");
         let quali = p("Formula1.2026.Round11.Hungary.Qualifying.F1TV.WEB-DL.1080p.H264-MWR");
         let next = p("Formula1.2026.Round12.Belgium.Race.F1TV.WEB-DL.2160p.HLG.H265.DDP5.1-MWR");
 
@@ -1850,14 +2088,21 @@ mod tests {
 
         // Short numbers carry meaning and must survive ("Week 03").
         let nfl = p("NFL.2025.Week.03.Chiefs.vs.Bills.1080p.WEB.h264-SPORTSNET");
-        assert_eq!(movie_name(&nfl, &on).unwrap(), "NFL 2025 Week 03 Chiefs vs Bills 1080p");
+        assert_eq!(
+            movie_name(&nfl, &on).unwrap(),
+            "NFL 2025 Week 03 Chiefs vs Bills 1080p"
+        );
     }
 
     /// The option must not reach an ordinary film. It cannot, because a
     /// film that parses cleanly leaves `extra` empty - this pins that.
     #[test]
     fn extra_words_never_touch_a_clean_film() {
-        let on = NameStyle { resolution: true, extra_words: true, ..Default::default() };
+        let on = NameStyle {
+            resolution: true,
+            extra_words: true,
+            ..Default::default()
+        };
         for stem in [
             "Example.Movie.2024.1080p.BluRay.x265-GRP",
             "Another.Film.2019.EXTENDED.2160p.UHD.BluRay.x265.DTS-HD.MA.7.1-FGT",
@@ -1867,15 +2112,32 @@ mod tests {
             "Film.Name.2017.1080p.WEBRip.x264-[YTS.AM]",
         ] {
             let parsed = p(stem);
-            assert!(parsed.extra.is_empty(), "{stem} leaked {:?} into extra", parsed.extra);
-            assert_eq!(movie_name(&parsed, &on), movie_name(&parsed, &NameStyle { resolution: true, ..Default::default() }),
-                "{stem} renamed differently with extra words on");
+            assert!(
+                parsed.extra.is_empty(),
+                "{stem} leaked {:?} into extra",
+                parsed.extra
+            );
+            assert_eq!(
+                movie_name(&parsed, &on),
+                movie_name(
+                    &parsed,
+                    &NameStyle {
+                        resolution: true,
+                        ..Default::default()
+                    }
+                ),
+                "{stem} renamed differently with extra words on"
+            );
         }
     }
 
     #[test]
     fn extra_words_filters_noise_and_declines_when_nothing_is_left() {
-        let on = NameStyle { resolution: true, extra_words: true, ..Default::default() };
+        let on = NameStyle {
+            resolution: true,
+            extra_words: true,
+            ..Default::default()
+        };
         // Group tag is not repeated; it has its own opt-in.
         let mut m = p("Formula1.2026.Round11.Hungary.Race.1080p-MWR");
         m.extra.push("MWR".into());
@@ -1884,14 +2146,24 @@ mod tests {
 
         // A hash and a long bare number describe nothing.
         let mut n = p("Something.2020.1080p-GRP");
-        n.extra = vec!["b9320de1deb550b9f2f70716eabbcb19".into(), "1234567890".into()];
-        assert_eq!(movie_name(&n, &on), None, "noise-only extra must decline, not collide");
+        n.extra = vec![
+            "b9320de1deb550b9f2f70716eabbcb19".into(),
+            "1234567890".into(),
+        ];
+        assert_eq!(
+            movie_name(&n, &on),
+            None,
+            "noise-only extra must decline, not collide"
+        );
 
         // Cap: a padded post does not rebuild the whole release name.
         let mut many = p("Event.2020.1080p-GRP");
         many.extra = (1..=12).map(|i| format!("Word{i}")).collect();
         let capped = movie_name(&many, &on).unwrap();
-        assert!(capped.contains("Word6") && !capped.contains("Word7"), "{capped}");
+        assert!(
+            capped.contains("Word6") && !capped.contains("Word7"),
+            "{capped}"
+        );
     }
 
     #[test]
@@ -1926,7 +2198,10 @@ mod tests {
             Some("DV")
         );
         // Plain HDR flavours, most specific first.
-        assert_eq!(p("A.2020.2160p.HDR10+.x265-G").hdr.as_deref(), Some("HDR10+"));
+        assert_eq!(
+            p("A.2020.2160p.HDR10+.x265-G").hdr.as_deref(),
+            Some("HDR10+")
+        );
         assert_eq!(p("A.2020.2160p.HDR10.x265-G").hdr.as_deref(), Some("HDR10"));
         assert_eq!(p("A.2020.2160p.HDR.x265-G").hdr.as_deref(), Some("HDR"));
         assert_eq!(p("A.2020.2160p.HLG.x265-G").hdr.as_deref(), Some("HLG"));
@@ -1945,8 +2220,14 @@ mod tests {
         // Default: title + year + resolution only.
         // Brackets around the year and the quality facts are OFF by
         // default, so this is the shipped shape.
-        let def = NameStyle { resolution: true, ..Default::default() };
-        assert_eq!(movie_name(&m, &def).as_deref(), Some("Example Movie 2024 1080p"));
+        let def = NameStyle {
+            resolution: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            movie_name(&m, &def).as_deref(),
+            Some("Example Movie 2024 1080p")
+        );
         // Both bracket styles on: the shape nzbfast produced before they
         // were options, and the one Plex/Jellyfin/Radarr match films on.
         let brk = NameStyle {
@@ -1955,7 +2236,10 @@ mod tests {
             quality_brackets: true,
             ..Default::default()
         };
-        assert_eq!(movie_name(&m, &brk).as_deref(), Some("Example Movie (2024) [1080p]"));
+        assert_eq!(
+            movie_name(&m, &brk).as_deref(),
+            Some("Example Movie (2024) [1080p]")
+        );
         // Everything on.
         let full = NameStyle {
             resolution: true,
@@ -1978,10 +2262,20 @@ mod tests {
         );
         // No year → title alone; REMUX shows in the source slot.
         let r = p("Some.Movie.2160p.BluRay.REMUX.HEVC-GRP");
-        let src = NameStyle { resolution: true, source: true, ..Default::default() };
-        assert_eq!(movie_name(&r, &src).as_deref(), Some("Some Movie 2160p REMUX"));
+        let src = NameStyle {
+            resolution: true,
+            source: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            movie_name(&r, &src).as_deref(),
+            Some("Some Movie 2160p REMUX")
+        );
         // Obfuscated → no friendly name, keep the original.
-        assert_eq!(movie_name(&p("2137d880a074fa4075a65ce4e21d2f95"), &full), None);
+        assert_eq!(
+            movie_name(&p("2137d880a074fa4075a65ce4e21d2f95"), &full),
+            None
+        );
     }
 
     /// An event post's year is its SEASON, not a release date: everything
@@ -1992,13 +2286,22 @@ mod tests {
     /// poster's own name survives. Both stems are the user's real NZBs.
     #[test]
     fn event_releases_are_not_renamed_to_title_year() {
-        let style = NameStyle { resolution: true, ..Default::default() };
-        let show = p("Formula1.2026.Round11.Hungary.Post-Qualifying.Show.F1TV.WEB-DL.1080p.H264.English-MWR");
-        let quali =
-            p("Formula1.2026.Round11.Hungary.Qualifying.F1TV.WEB-DL.2160p.HLG.H265.DDP5.1.English-MWR");
+        let style = NameStyle {
+            resolution: true,
+            ..Default::default()
+        };
+        let show = p(
+            "Formula1.2026.Round11.Hungary.Post-Qualifying.Show.F1TV.WEB-DL.1080p.H264.English-MWR",
+        );
+        let quali = p(
+            "Formula1.2026.Round11.Hungary.Qualifying.F1TV.WEB-DL.2160p.HLG.H265.DDP5.1.English-MWR",
+        );
         // Both used to render "Formula1 (2026) [1080p]".
         assert_eq!(show.title, "Formula1");
-        assert_eq!(show.extra, ["Round11", "Hungary", "Post-Qualifying", "Show", "F1TV"]);
+        assert_eq!(
+            show.extra,
+            ["Round11", "Hungary", "Post-Qualifying", "Show", "F1TV"]
+        );
         assert_eq!(quali.extra, ["Round11", "Hungary", "Qualifying", "F1TV"]);
         // Which is the point: two different sessions no longer render one
         // filename. Neither is renamed under any style, so each keeps the
@@ -2008,14 +2311,29 @@ mod tests {
             assert_eq!(movie_name(&quali, s), None);
         }
         // Same for other event shapes.
-        assert_eq!(movie_name(&p("MotoGP.2026.Round05.France.Race.1080p.WEB-DL-GRP"), &style), None);
-        assert_eq!(movie_name(&p("NFL.2026.Week.05.Bears.at.Packers.1080p.WEB-DL-GRP"), &style), None);
+        assert_eq!(
+            movie_name(
+                &p("MotoGP.2026.Round05.France.Race.1080p.WEB-DL-GRP"),
+                &style
+            ),
+            None
+        );
+        assert_eq!(
+            movie_name(
+                &p("NFL.2026.Week.05.Bears.at.Packers.1080p.WEB-DL-GRP"),
+                &style
+            ),
+            None
+        );
         // And the guard is not really about sport: it declines whenever
         // "Title (Year)" would not name the release uniquely, which is
         // just as true of an edition the tag table doesn't know - a
         // "Final Cut" renamed to "Movie (2024)" collides with the
         // theatrical cut of the same year.
-        assert_eq!(movie_name(&p("Some.Movie.2024.Final.Cut.1080p.BluRay-GRP"), &style), None);
+        assert_eq!(
+            movie_name(&p("Some.Movie.2024.Final.Cut.1080p.BluRay-GRP"), &style),
+            None
+        );
     }
 
     /// Declining the RENAME must not change the KIND. `finalize_names`
@@ -2044,7 +2362,10 @@ mod tests {
     /// dubs, editions and split channel tokens.
     #[test]
     fn ordinary_movies_still_reduce_to_title_year() {
-        let style = NameStyle { resolution: true, ..Default::default() };
+        let style = NameStyle {
+            resolution: true,
+            ..Default::default()
+        };
         for s in [
             "The.Matrix.1999.1080p.BluRay.x264-GROUP",
             "The.Matrix.1999.2160p.UHD.BluRay.REMUX.HDR.HEVC.TrueHD.Atmos-FraMeSToR",
@@ -2072,8 +2393,12 @@ mod tests {
             movie_name(&p("The.Matrix.1999.1080p.BluRay.x264-GROUP"), &style).as_deref(),
             Some("The Matrix 1999 1080p")
         );
-        let brk = NameStyle { resolution: true, year_parens: true, quality_brackets: true,
-            ..Default::default() };
+        let brk = NameStyle {
+            resolution: true,
+            year_parens: true,
+            quality_brackets: true,
+            ..Default::default()
+        };
         assert_eq!(
             movie_name(&p("The.Matrix.1999.1080p.BluRay.x264-GROUP"), &brk).as_deref(),
             Some("The Matrix (1999) [1080p]")
@@ -2085,7 +2410,17 @@ mod tests {
     fn token_roles_split_furniture_from_identity() {
         use TokenRole::*;
         // Quality, source, codec, container, edition, provenance: hard.
-        for t in ["1080p", "WEB-DL", "x265", "REMUX", "HDR", "mkv", "Directors", "Cut", "HLG"] {
+        for t in [
+            "1080p",
+            "WEB-DL",
+            "x265",
+            "REMUX",
+            "HDR",
+            "mkv",
+            "Directors",
+            "Cut",
+            "HLG",
+        ] {
             assert_eq!(token_role(t), HardFurniture, "{t}");
         }
         // Languages are soft: dropped from a key, but never a stopper.
@@ -2099,7 +2434,9 @@ mod tests {
         // …but trailing digits alone decide nothing, so an event counter
         // stays identity. This is the whole reason the strip checks that
         // something is LEFT after the digits go.
-        for t in ["Round11", "Week05", "Stage11", "Hungary", "F1TV", "11", "05"] {
+        for t in [
+            "Round11", "Week05", "Stage11", "Hungary", "F1TV", "11", "05",
+        ] {
             assert_eq!(token_role(t), Identity, "{t}");
         }
         // A run of nothing but language tags is furniture; the same run
@@ -2151,32 +2488,69 @@ mod tests {
     #[test]
     fn air_dates_split_into_a_year_and_a_name() {
         let parts = air_date_parts;
-        assert_eq!(parts("20260721"), Some(("2026".into(), "2026.07.21".into())));
-        assert_eq!(parts("20150615"), Some(("2015".into(), "2015.06.15".into())));
-        // Both conventions the parser normalizes reach the same name.
         assert_eq!(
-            air_date_parts(p("At.Midnight.150615.720p.HDTV-GRP").date.as_deref().unwrap()),
-            air_date_parts(p("At.Midnight.20150615.720p.HDTV-GRP").date.as_deref().unwrap())
+            parts("20260721"),
+            Some(("2026".into(), "2026.07.21".into()))
         );
         assert_eq!(
-            parts(p("The.Daily.Show.2026.07.21.1080p.WEB-GRP").date.as_deref().unwrap()),
+            parts("20150615"),
+            Some(("2015".into(), "2015.06.15".into()))
+        );
+        // Both conventions the parser normalizes reach the same name.
+        assert_eq!(
+            air_date_parts(
+                p("At.Midnight.150615.720p.HDTV-GRP")
+                    .date
+                    .as_deref()
+                    .unwrap()
+            ),
+            air_date_parts(
+                p("At.Midnight.20150615.720p.HDTV-GRP")
+                    .date
+                    .as_deref()
+                    .unwrap()
+            )
+        );
+        assert_eq!(
+            parts(
+                p("The.Daily.Show.2026.07.21.1080p.WEB-GRP")
+                    .date
+                    .as_deref()
+                    .unwrap()
+            ),
             Some(("2026".into(), "2026.07.21".into()))
         );
         // Declines: wrong width, non-digits, out-of-range fields.
-        for s in ["", "2026072", "202607211", "2026-07-21", "2026o721", "20261321", "20260732",
-                  "20260700", "20260021", "00000101"] {
+        for s in [
+            "",
+            "2026072",
+            "202607211",
+            "2026-07-21",
+            "2026o721",
+            "20261321",
+            "20260732",
+            "20260700",
+            "20260021",
+            "00000101",
+        ] {
             assert_eq!(air_date_parts(s), None, "{s:?} is not an air date");
         }
         // And declines dates that pass a flat 1..=31 day check but do
         // not exist. These were filed as real episodes, under a season
         // folder named after a day that never happened.
-        for s in ["20260231", "20260431", "20260631", "20260931", "20261131", "20260230"] {
+        for s in [
+            "20260231", "20260431", "20260631", "20260931", "20261131", "20260230",
+        ] {
             assert_eq!(air_date_parts(s), None, "{s:?} is not a day that exists");
         }
         // February is the leap rule, in all three of its cases.
         assert!(air_date_parts("20240229").is_some(), "2024 is a leap year");
         assert_eq!(air_date_parts("20260229"), None, "2026 is not");
-        assert_eq!(air_date_parts("19000229"), None, "a century is not, unless…");
+        assert_eq!(
+            air_date_parts("19000229"),
+            None,
+            "a century is not, unless…"
+        );
         assert!(air_date_parts("20000229").is_some(), "…it divides by 400");
         // The month lengths themselves, at their real boundaries.
         assert!(air_date_parts("20260430").is_some());
@@ -2230,7 +2604,11 @@ mod tests {
         ] {
             let p = p(stem);
             assert_eq!(p.kind, Kind::Tv, "{stem}");
-            assert_eq!((p.season, p.episode, p.episode2), (Some(1), Some(1), Some(2)), "{stem}");
+            assert_eq!(
+                (p.season, p.episode, p.episode2),
+                (Some(1), Some(1), Some(2)),
+                "{stem}"
+            );
         }
         // Quality furniture glued to the episode is NOT a second episode,
         // and a lower second number is a typo, not a range.
@@ -2347,7 +2725,10 @@ mod tests {
         // A bare title with no furniture stays itself: its rotation is
         // unpronounceable garbage with no scene tokens.
         let bare = p("Inception");
-        assert_eq!((bare.kind.clone(), bare.title.as_str()), (Kind::Movie, "Inception"));
+        assert_eq!(
+            (bare.kind.clone(), bare.title.as_str()),
+            (Kind::Movie, "Inception")
+        );
         // Hash and blob names stay Other - their decodes carry no
         // furniture either.
         assert_eq!(p("2137d880a074fa4075a65ce4e21d2f95").kind, Kind::Other);
@@ -2373,8 +2754,14 @@ mod tests {
     #[test]
     fn movies_with_software_ish_words_stay_movies() {
         assert_eq!(p("Setup.2011.1080p.BluRay.x264-GRP").kind, Kind::Movie);
-        assert_eq!(p("Leon.The.Professional.1994.1080p.BluRay.x264-GRP").kind, Kind::Movie);
-        assert_eq!(p("V.For.Vendetta.2006.1080p.BluRay.x264-GRP").kind, Kind::Movie);
+        assert_eq!(
+            p("Leon.The.Professional.1994.1080p.BluRay.x264-GRP").kind,
+            Kind::Movie
+        );
+        assert_eq!(
+            p("V.For.Vendetta.2006.1080p.BluRay.x264-GRP").kind,
+            Kind::Movie
+        );
         assert_eq!(p("The.Matrix.1999.1080p.BluRay.x264-GRP").kind, Kind::Movie);
     }
 
@@ -2403,7 +2790,10 @@ mod tests {
         // dropping it the artist parses as "00".
         let n = p("00-piero_piccioni-the_light_at_the_edge_of_the_world-cd-flac-2014-GRP");
         assert_eq!(n.kind, Kind::Music);
-        assert_eq!(n.title, "piero piccioni - the light at the edge of the world");
+        assert_eq!(
+            n.title,
+            "piero piccioni - the light at the edge of the world"
+        );
         let t = p("000-va-bravo_hits_57-2cd-flac-2007-GRP");
         assert_eq!(t.title, "va - bravo hits 57");
     }
@@ -2452,7 +2842,10 @@ mod tests {
         // A concert BluRay says FLAC and is still a film; an episode is
         // still an episode. This gate is the whole safety margin for
         // claiming FLAC/MP3 as music markers at all.
-        assert_eq!(p("Some.Concert.2019.1080p.BluRay.FLAC.x264-GRP").kind, Kind::Movie);
+        assert_eq!(
+            p("Some.Concert.2019.1080p.BluRay.FLAC.x264-GRP").kind,
+            Kind::Movie
+        );
         assert_eq!(p("Some.Show.S01E01.720p.WEB.FLAC-GRP").kind, Kind::Tv);
         assert_eq!(p("Some.Doc.2019.2160p.REMUX.FLAC-GRP").kind, Kind::Movie);
         // The downloader's own lowercase movie convention has the exact
@@ -2474,9 +2867,18 @@ mod tests {
     #[test]
     fn fold_preserves_numerals_and_acronyms() {
         // Roman numerals and household acronyms survive the fold...
-        assert_eq!(p("PLANET.EARTH.II.2016.2160p.WEB-GRP").title, "Planet Earth II");
-        assert_eq!(p("the.office.us.s01e01.720p.web-grp").title, "The Office US");
-        assert_eq!(p("WWE.MONDAY.NIGHT.RAW.2026.720p.WEB-GRP").title, "WWE Monday Night Raw");
+        assert_eq!(
+            p("PLANET.EARTH.II.2016.2160p.WEB-GRP").title,
+            "Planet Earth II"
+        );
+        assert_eq!(
+            p("the.office.us.s01e01.720p.web-grp").title,
+            "The Office US"
+        );
+        assert_eq!(
+            p("WWE.MONDAY.NIGHT.RAW.2026.720p.WEB-GRP").title,
+            "WWE Monday Night Raw"
+        );
         assert_eq!(p("US.MARSHALS.1998.1080p.BluRay-GRP").title, "US Marshals");
         // ...but a single-word title is a TITLE, not a suffix: Peele's
         // "Us" must not become "US". (The fold's own >3-letters gate
@@ -2489,8 +2891,14 @@ mod tests {
 
     #[test]
     fn languages_come_from_furniture_not_title() {
-        assert_eq!(p("Der.Untergang.2004.German.1080p.BluRay.x264-GRP").langs, ["german"]);
-        assert_eq!(p("Drama.Show.E178.2001.KOR.CATV.DivX-EyeMaX").langs, ["korean"]);
+        assert_eq!(
+            p("Der.Untergang.2004.German.1080p.BluRay.x264-GRP").langs,
+            ["german"]
+        );
+        assert_eq!(
+            p("Drama.Show.E178.2001.KOR.CATV.DivX-EyeMaX").langs,
+            ["korean"]
+        );
         assert_eq!(p("Some.Film.2020.MULTi.1080p.WEB").langs, ["multi"]);
         // A film titled "Rus" is not Russian; untagged stays empty.
         assert!(p("Rus.2019.1080p.WEB").langs.is_empty());
@@ -2509,13 +2917,15 @@ mod tests {
         assert_eq!(dl.source.as_deref(), Some("WEB"));
     }
 
-
     /// Reposters append their own tag after the real group, and with
     /// `NameStyle::group` on it would land in the filename.
     #[test]
     fn reposter_tags_never_become_the_group() {
         let g = |s: &str| p(s).group;
-        assert_eq!(g("Example.Movie.2024.1080p.x264-GRP-Obfuscated").as_deref(), Some("GRP"));
+        assert_eq!(
+            g("Example.Movie.2024.1080p.x264-GRP-Obfuscated").as_deref(),
+            Some("GRP")
+        );
         assert_eq!(g("Example.Movie.2024.1080p.x264-Obfuscated"), None);
         // They chain, in any case, in any order.
         assert_eq!(
@@ -2526,13 +2936,31 @@ mod tests {
             g("Example.Movie.2024.1080p.x264-GRP-NZBGeek-postbot-RP").as_deref(),
             Some("GRP")
         );
-        assert_eq!(g("Example.Movie.2024.1080p.x264-GRP-RAKUVFINHEL").as_deref(), Some("GRP"));
-        assert_eq!(g("Example.Movie.2024.1080p.x264-GRP-AlteZachen").as_deref(), Some("GRP"));
-        assert_eq!(g("Example.Movie.2024.1080p.x264-GRP.-Chamele0n").as_deref(), Some("GRP"));
+        assert_eq!(
+            g("Example.Movie.2024.1080p.x264-GRP-RAKUVFINHEL").as_deref(),
+            Some("GRP")
+        );
+        assert_eq!(
+            g("Example.Movie.2024.1080p.x264-GRP-AlteZachen").as_deref(),
+            Some("GRP")
+        );
+        assert_eq!(
+            g("Example.Movie.2024.1080p.x264-GRP.-Chamele0n").as_deref(),
+            Some("GRP")
+        );
         // A real group that merely CONTAINS one of the words is untouched.
-        assert_eq!(g("Example.Movie.2024.1080p.x264-RPGroup").as_deref(), Some("RPGroup"));
-        assert_eq!(g("Example.Movie.2024.1080p.x264-Sampler").as_deref(), Some("Sampler"));
-        assert_eq!(g("Example.Movie.2024.1080p.x264-GEROVA").as_deref(), Some("GEROVA"));
+        assert_eq!(
+            g("Example.Movie.2024.1080p.x264-RPGroup").as_deref(),
+            Some("RPGroup")
+        );
+        assert_eq!(
+            g("Example.Movie.2024.1080p.x264-Sampler").as_deref(),
+            Some("Sampler")
+        );
+        assert_eq!(
+            g("Example.Movie.2024.1080p.x264-GEROVA").as_deref(),
+            Some("GEROVA")
+        );
         // Sonarr strips a bare "-1" too; we do not, it is too risky - so
         // the tail keeps hiding the group instead of exposing a wrong one.
         assert_eq!(g("Example.Movie.2024.1080p.x264-GRP-1"), None);
@@ -2613,23 +3041,25 @@ mod tests {
         // Cheap deterministic LCG so the corpus is reproducible.
         let mut state: u64 = 0x9e3779b97f4a7c15;
         let mut next = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (state >> 33) as u32
         };
         // Bytes chosen to stress char-boundary math: multi-byte UTF-8 leads,
         // scene separators, digits, and the S/E/v/x markers that drive the
         // byte-slicing branches.
         let alphabet: &[&str] = &[
-            "s", "e", "v", "x", "S", "E", "0", "1", "2", "6", "9", ".", "_", "-", " ",
-            "[", "]", "(", ")", "é", "ß", "λ", "中", "日", "\u{200f}", "\u{0301}", "🎬",
-            "\u{feff}", "\t", "\n", "web", "dl", "1080p", "x265", "2024", "s01e01",
+            "s", "e", "v", "x", "S", "E", "0", "1", "2", "6", "9", ".", "_", "-", " ", "[", "]",
+            "(", ")", "é", "ß", "λ", "中", "日", "\u{200f}", "\u{0301}", "🎬", "\u{feff}", "\t",
+            "\n", "web", "dl", "1080p", "x265", "2024", "s01e01",
         ];
         // A few fixed adversarial seeds alongside the random corpus.
         let seeds = [
             "",
-            "s01ée01",           // multi-byte char right after the season 's'
-            "vé.6",              // version closure: 'v' then a multi-byte char
-            "0é01",              // leading-zero SSEE lookalike with a wide char
+            "s01ée01", // multi-byte char right after the season 's'
+            "vé.6",    // version closure: 'v' then a multi-byte char
+            "0é01",    // leading-zero SSEE lookalike with a wide char
             "中文.2024.1080p.WEB-中",
             "\u{feff}s2026é015",
             "----",
@@ -2672,7 +3102,10 @@ mod tests {
         // Leading dot: hidden on macOS/Linux, and not what anyone asked
         // for on Windows either.
         assert_eq!(sanitize_name(".Hidden Movie (2024)"), "Hidden Movie (2024)");
-        assert_eq!(sanitize_name("..Hidden Movie (2024)"), "Hidden Movie (2024)");
+        assert_eq!(
+            sanitize_name("..Hidden Movie (2024)"),
+            "Hidden Movie (2024)"
+        );
         // Trailing dot / space: Windows strips them, so the name on disk
         // stops matching the name we recorded.
         assert_eq!(sanitize_name("Movie (2024)."), "Movie (2024)");
@@ -2682,7 +3115,13 @@ mod tests {
         assert_eq!(sanitize_name("com1"), "_com1");
         assert_eq!(sanitize_name("nul.mkv"), "_nul.mkv");
         // Path separators and the rest of the illegal set never survive.
-        for s in ["../../etc/passwd", "a\\b", "Movie <2024>", "Q|A?", "x\u{7}y"] {
+        for s in [
+            "../../etc/passwd",
+            "a\\b",
+            "Movie <2024>",
+            "Q|A?",
+            "x\u{7}y",
+        ] {
             let out = sanitize_name(s);
             assert_eq!(
                 std::path::Path::new(&out).components().count(),
@@ -2711,15 +3150,25 @@ mod tests {
         assert_eq!(sanitize_name("Alien: "), "Alien");
         // A hyphen that was always there is not a separator run and is
         // left exactly as the poster wrote it.
-        assert_eq!(sanitize_name("Spider-Man: Homecoming"), "Spider-Man - Homecoming");
-        assert_eq!(sanitize_name("Mission Impossible - Fallout"), "Mission Impossible - Fallout");
+        assert_eq!(
+            sanitize_name("Spider-Man: Homecoming"),
+            "Spider-Man - Homecoming"
+        );
+        assert_eq!(
+            sanitize_name("Mission Impossible - Fallout"),
+            "Mission Impossible - Fallout"
+        );
     }
 
     /// The same guarantees through the real movie entry point, and a
     /// legitimately-named release left byte-for-byte alone.
     #[test]
     fn movie_names_are_portable() {
-        let style = NameStyle { resolution: true, year_parens: true, ..Default::default() };
+        let style = NameStyle {
+            resolution: true,
+            year_parens: true,
+            ..Default::default()
+        };
         let name = |s: &str| movie_name(&p(s), &style);
 
         assert_eq!(
@@ -2730,7 +3179,10 @@ mod tests {
         // is - so the guard has to survive the whole build, not just the
         // title. With no year and no quality facts movie_name declines
         // anyway, which is the other half of the same safety.
-        assert_eq!(name("CON 2024 1080p x264-GRP").as_deref(), Some("CON (2024) 1080p"));
+        assert_eq!(
+            name("CON 2024 1080p x264-GRP").as_deref(),
+            Some("CON (2024) 1080p")
+        );
         assert_eq!(name("CON"), None);
         // Negative: an ordinary release is not reshaped by any of this.
         assert_eq!(
@@ -2738,7 +3190,12 @@ mod tests {
             Some("The Matrix (1999) 1080p")
         );
         // Whatever the shape, what comes out is a usable component.
-        for s in [".Hidden.2024.1080p", "Movie..2024.1080p", "CON.2024.1080p", "..2024.1080p"] {
+        for s in [
+            ".Hidden.2024.1080p",
+            "Movie..2024.1080p",
+            "CON.2024.1080p",
+            "..2024.1080p",
+        ] {
             if let Some(n) = name(s) {
                 assert!(!n.starts_with('.') && !n.ends_with('.'), "{s:?} -> {n:?}");
                 assert!(!n.ends_with(' '), "{s:?} -> {n:?}");
@@ -2792,7 +3249,10 @@ mod tests {
         ] {
             assert!(!p(s).rescued, "should not have flipped: {s}");
         }
-        assert_eq!(p("The.Matrix.1999.1080p.BluRay.x264-AMIABLE").title, "The Matrix");
+        assert_eq!(
+            p("The.Matrix.1999.1080p.BluRay.x264-AMIABLE").title,
+            "The Matrix"
+        );
         assert_eq!(p("Chapter.p027.2024").title, "Chapter p027");
     }
 
@@ -2804,7 +3264,10 @@ mod tests {
     /// legitimately-named file to "epaT 1080p".
     #[test]
     fn one_backwards_token_does_not_flip_a_forward_name() {
-        let style = NameStyle { resolution: true, ..Default::default() };
+        let style = NameStyle {
+            resolution: true,
+            ..Default::default()
+        };
         for s in [
             // Only the marker flips, and one resolution is not two facts.
             "Concert.Bootleg.p0801.Tape",
@@ -2846,8 +3309,10 @@ mod tests {
         assert_eq!(show.title, "Show Name");
         assert_eq!(show.year, None);
         // Both conventions normalize to the same identity.
-        assert_eq!(d("Show.Name.260721.1080p.WEB.x264-GRP"),
-                   d("Show.Name.20260721.1080p.WEB.x264-GRP"));
+        assert_eq!(
+            d("Show.Name.260721.1080p.WEB.x264-GRP"),
+            d("Show.Name.20260721.1080p.WEB.x264-GRP")
+        );
 
         // Not a date: month or day out of range, or a year that reads as
         // decades away. The token is left alone as an ordinary word, and
@@ -2866,7 +3331,10 @@ mod tests {
         }
 
         // Six digits that are part of an id are not a token at all.
-        for s in ["Show.Name.ID260721.1080p.WEB-GRP", "Show.Name.260721x.1080p.WEB-GRP"] {
+        for s in [
+            "Show.Name.ID260721.1080p.WEB-GRP",
+            "Show.Name.260721x.1080p.WEB-GRP",
+        ] {
             assert_eq!(d(s), None, "{s}");
         }
         // …and neither is a leading run, which is the title.
@@ -2882,7 +3350,10 @@ mod tests {
         assert_eq!(t.date, None);
         assert_eq!((t.season, t.episode), (Some(1), Some(2)));
         // Eight digits stay unambiguous, so a year alongside is fine.
-        assert_eq!(d("Show.Name.2024.20260721.1080p.WEB-GRP").as_deref(), Some("20260721"));
+        assert_eq!(
+            d("Show.Name.2024.20260721.1080p.WEB-GRP").as_deref(),
+            Some("20260721")
+        );
     }
 
     /// The gate every out-of-band name has to pass before it may rename
@@ -2904,7 +3375,7 @@ mod tests {
             "",
             "Sintel",
             "Episode 3",
-            "The Movie",           // a human title: no furniture at all
+            "The Movie", // a human title: no furniture at all
             "Big Buck Bunny",
             "encoded by Handbrake",
             "video",
@@ -2914,7 +3385,10 @@ mod tests {
             "d41d8cd98f00b204e9800998ecf8427e",
             "n1iY94U6fTpMVY9GPD",
         ] {
-            assert!(!looks_like_release_name(s), "{s:?} should NOT read as a release");
+            assert!(
+                !looks_like_release_name(s),
+                "{s:?} should NOT read as a release"
+            );
         }
         // One signal is not enough - a year alone is how plenty of
         // muxers title a film, and renaming on it would lose the name

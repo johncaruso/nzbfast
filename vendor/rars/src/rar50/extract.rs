@@ -3,7 +3,8 @@ use crate::codec::rar50::{DecodeMode, DecodedChunk, StreamDecodeError, Unpack50D
 use crate::crc32::{crc32, Crc32};
 use crate::crypto::rar50::{Rar50Cipher, Rar50Keys};
 use crate::error::{Error, Result};
-use crate::volume_extract::{ChainedReader, SplitVolumeState, SplitVolumeStep};
+use crate::source::OwnedRangeReader;
+use crate::volume_extract::{SplitVolumeState, SplitVolumeStep};
 use std::io::{Read, Write};
 
 // Filtered RAR5 members still need whole-member byte transforms. Members at or
@@ -400,6 +401,31 @@ impl FileHeader {
         buffered_decode_limit: u64,
         writer: &mut dyn Write,
     ) -> Result<()> {
+        let hash = streaming_hash_verifier(self)?;
+        let (crc, hash) =
+            self.stream_packed_digests(packed, decoder, buffered_decode_limit, writer, hash)?;
+        self.verify_streaming_integrity(crc, hash, keys)
+    }
+
+    /// [`Self::stream_packed_with_decoder`] stopping one step short: the
+    /// digests come back instead of being checked here.
+    ///
+    /// A split member's EXPECTED digests live in its LAST fragment's header
+    /// (WinRAR writes a different, running value in every earlier one, and
+    /// the rars writer leaves the earlier ones out entirely - both measured
+    /// on real sets), and the incremental split path does not have that
+    /// header until the decode has already run. So it drives the stream
+    /// from the FIRST fragment's shape - name, dictionary and unpacked size
+    /// all repeat across fragments - passes its own `hash` seed, and
+    /// verifies against the last fragment afterwards.
+    fn stream_packed_digests<R: Read + Send>(
+        &self,
+        packed: &mut R,
+        decoder: &mut Unpack50Decoder,
+        buffered_decode_limit: u64,
+        writer: &mut dyn Write,
+        hash: Option<([u8; 32], blake2sp::Hasher)>,
+    ) -> Result<(Crc32, Option<([u8; 32], blake2sp::Hasher)>)> {
         if self.is_stored() {
             return Err(Error::InvalidHeader(
                 "RAR 5 stored file does not use streaming compressed decode",
@@ -413,7 +439,6 @@ impl FileHeader {
         let output_size = usize::try_from(self.unpacked_size)
             .map_err(|_| Error::InvalidHeader("RAR 5 unpacked size overflows host address size"))?;
         let crc = Crc32::new();
-        let hash = streaming_hash_verifier(self)?;
 
         // Pipeline: the decoder runs on a spawned thread and hands coalesced
         // ~1 MB buffers over a bounded channel; writing stays on the calling
@@ -585,7 +610,7 @@ impl FileHeader {
             },
             StreamDecodeError::Sink(error) => Error::from(error),
         })?;
-        self.verify_streaming_integrity(crc, hash, keys)
+        Ok((crc, hash))
     }
 
     fn write_stored_to(
@@ -604,6 +629,7 @@ impl FileHeader {
 
         let (crc, hash) = match pipe_stored_chunks(
             &mut *reader,
+            self.unpacked_size,
             |error| ("decoding", Error::from(error)),
             crc,
             hash,
@@ -698,14 +724,43 @@ impl FileHeader {
 /// parked on the drained pool.
 const STORED_PIPE_BUF: usize = 1 << 20;
 const STORED_POOL: usize = 4;
+// Below this size, allocating four 1 MiB buffers and creating a reader plus
+// digest thread costs substantially more than the copy and integrity work.
+// Keep tiny STORE members on the caller: this path is especially important
+// for software/source archives with thousands of small independent files.
+const STORED_INLINE_MAX: u64 = 256 * 1024;
+const STORED_INLINE_BUF: usize = 64 * 1024;
 
 fn pipe_stored_chunks<E>(
     reader: &mut (dyn Read + Send),
+    size_hint: u64,
     read_error: impl Fn(std::io::Error) -> E,
     crc: Crc32,
     hash: Option<([u8; 32], blake2sp::Hasher)>,
     mut consume: impl FnMut(&[u8]) -> std::result::Result<usize, E>,
 ) -> std::result::Result<(Crc32, Option<([u8; 32], blake2sp::Hasher)>), E> {
+    if size_hint <= STORED_INLINE_MAX {
+        let capacity = usize::try_from(size_hint)
+            .unwrap_or(STORED_INLINE_BUF)
+            .clamp(1, STORED_INLINE_BUF);
+        let mut buf = vec![0u8; capacity];
+        let mut crc = crc;
+        let mut hash = hash;
+        loop {
+            let count = reader.read(&mut buf).map_err(&read_error)?;
+            if count == 0 {
+                return Ok((crc, hash));
+            }
+            let chunk = &buf[..count];
+            let content_len = consume(chunk)?;
+            let content = &chunk[..content_len];
+            crc.update(content);
+            if let Some((_, hasher)) = &mut hash {
+                hasher.update(content);
+            }
+        }
+    }
+
     let (data_tx, data_rx) =
         std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(STORED_POOL + 1);
     let (digest_tx, digest_rx) = std::sync::mpsc::channel::<(Vec<u8>, usize)>();
@@ -1444,14 +1499,66 @@ where
 /// Decoding is serial by design: the parallel member-pool and solid-chain
 /// plans inspect the whole set up front, and a chasing extraction is bound
 /// by arrival rate rather than decode rate.
+///
+/// A split member large enough to stream decodes INCREMENTALLY: its sink
+/// opens at the Start fragment and its packed bytes feed the decoder as
+/// each volume lands, instead of waiting for the Finish fragment and
+/// reading every fragment back. See
+/// [`extract_volume_sequence_to_with_progress`], which is the same walk
+/// with the per-volume consumption watermark exposed.
 pub fn extract_volume_sequence_to<P, F>(
+    next_volume: P,
+    options: crate::ArchiveReadOptions<'_>,
+    open: F,
+) -> Result<()>
+where
+    P: FnMut(usize) -> Result<Option<Archive>> + Send,
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+{
+    extract_volume_sequence_to_with_progress(next_volume, options, open, |_, _| {})
+}
+
+/// [`extract_volume_sequence_to`] reporting how much of each volume the
+/// engine is finished with.
+///
+/// `consumed(volume_index, offset)` says "nothing at or below `offset` in
+/// volume `volume_index` will be read again"; `u64::MAX` means the whole
+/// volume. A caller holding volumes in memory (nzbkit's chase holds each
+/// one in a frontier buffer) uses this to drop bytes behind the decode, so
+/// a set larger than its retention budget still extracts in one pass.
+///
+/// Two guarantees make the watermark safe to act on:
+///
+/// - **Packed reads run strictly forward.** The streaming RAR 5 decode
+///   pulls its packed input through one sequential reader and never seeks
+///   back, and the AES-CBC reader over an encrypted member is sequential
+///   by construction. Solid members change nothing here: the window
+///   carries across members, but the packed bytes are still consumed once,
+///   in order.
+/// - **A watermark is a promise, and the decode keeps it.** The one thing
+///   that could break it is the buffered retry that rescues a
+///   pathological-filter bail by re-reading the whole chain, so the
+///   incremental path only takes that retry when nothing has been
+///   published yet - which in practice means a bail on the very first
+///   read. A filtered member that bails later fails instead, and the
+///   caller (nzbkit's chase) answers that the way it answers any decode
+///   failure: materialize the volumes, let the disk ladder extract them.
+///   Posted payload is already-compressed video, where RAR filters do
+///   not appear at all.
+///
+/// The callback runs on the decode thread as well as this one, hence
+/// `Sync`; it must not block for long and must not call back into the
+/// extraction.
+pub fn extract_volume_sequence_to_with_progress<P, F, C>(
     mut next_volume: P,
     options: crate::ArchiveReadOptions<'_>,
     mut open: F,
+    consumed: C,
 ) -> Result<()>
 where
-    P: FnMut(usize) -> Result<Option<Archive>>,
+    P: FnMut(usize) -> Result<Option<Archive>> + Send,
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    C: Fn(usize, u64) + Sync,
 {
     let password = options.password;
     let mut split = SplitVolumeState::new();
@@ -1462,50 +1569,100 @@ where
     )
     .with_policy(rar50_execution_policy(options));
     let mut volumes: Vec<Archive> = Vec::new();
+    // Volumes already reported wholly consumed, and where to resume the
+    // entry walk after an incremental split handed the volume back.
+    let mut reported = 0usize;
+    let mut resume: Option<(usize, usize)> = None;
 
     loop {
-        let volume_index = volumes.len();
-        let Some(archive) = next_volume(volume_index)? else {
-            break;
+        let (volume_index, start_at) = match resume.take() {
+            Some(at) => at,
+            None => {
+                // The previous volume is walked out. Report it (and every
+                // one before it) consumed - unless a NON-incremental split
+                // is pending, which will read those fragments back at its
+                // Finish.
+                if !split.is_pending() {
+                    while reported < volumes.len() {
+                        consumed(reported, u64::MAX);
+                        reported += 1;
+                    }
+                }
+                let volume_index = volumes.len();
+                let Some(archive) = next_volume(volume_index)? else {
+                    break;
+                };
+                volumes.push(archive);
+                (volume_index, 0)
+            }
         };
-        volumes.push(archive);
-        let archive = &volumes[volume_index];
-        for (file_index, file) in archive.files().enumerate() {
-            match split.advance(file.is_split_before(), file.is_split_after()) {
-                SplitVolumeStep::Regular => {
-                    if file.redirection.is_some() {
-                        continue;
+
+        // Set when the walk meets a split Start worth decoding
+        // incrementally; the borrow of `volumes` has to end before the
+        // chain can grow it.
+        let mut chase_at: Option<usize> = None;
+        {
+            let archive = &volumes[volume_index];
+            for (file_index, file) in archive.files().enumerate().skip(start_at) {
+                match split.advance(file.is_split_before(), file.is_split_after()) {
+                    SplitVolumeStep::Regular => {
+                        if file.redirection.is_some() {
+                            continue;
+                        }
+                        let meta = file.metadata();
+                        let mut writer = open(&meta)?;
+                        if !meta.is_directory {
+                            session.write_file_to(archive, file, &mut writer)?;
+                        }
                     }
-                    let meta = file.metadata();
-                    let mut writer = open(&meta)?;
-                    if !meta.is_directory {
-                        session.write_file_to(archive, file, &mut writer)?;
+                    SplitVolumeStep::Start => {
+                        validate_split_fragment(file, password)?;
+                        // `advance` leaves the state untouched for Start
+                        // (only `begin` arms it), so breaking out here is
+                        // clean - the chain owns the member from now on.
+                        if incremental_split_worthwhile(file, &session) {
+                            chase_at = Some(file_index);
+                            break;
+                        }
+                        split.begin(PendingSplitRefs::new(file, volume_index, file_index));
                     }
-                }
-                SplitVolumeStep::Start => {
-                    validate_split_fragment(file, password)?;
-                    split.begin(PendingSplitRefs::new(file, volume_index, file_index));
-                }
-                SplitVolumeStep::Continue(current) => {
-                    validate_split_continuation_refs(current, file, password)?;
-                    current.append(volume_index, file_index);
-                }
-                SplitVolumeStep::Finish(mut completed) => {
-                    validate_split_continuation_refs(&completed, file, password)?;
-                    completed.append(volume_index, file_index);
-                    completed.write_to(&volumes, file, &mut session, &mut open)?;
-                }
-                SplitVolumeStep::MissingFirst => {
-                    return Err(Error::InvalidHeader(
-                        "RAR 5 split entry is missing its first part",
-                    ));
-                }
-                SplitVolumeStep::Interrupted => {
-                    return Err(Error::InvalidHeader(
-                        "RAR 5 split entry is interrupted by a regular entry",
-                    ));
+                    SplitVolumeStep::Continue(current) => {
+                        validate_split_continuation_refs(current, file, password)?;
+                        current.append(volume_index, file_index);
+                    }
+                    SplitVolumeStep::Finish(mut completed) => {
+                        validate_split_continuation_refs(&completed, file, password)?;
+                        completed.append(volume_index, file_index);
+                        completed.write_to(&volumes, file, &mut session, &mut open)?;
+                    }
+                    SplitVolumeStep::MissingFirst => {
+                        return Err(Error::InvalidHeader(
+                            "RAR 5 split entry is missing its first part",
+                        ));
+                    }
+                    SplitVolumeStep::Interrupted => {
+                        return Err(Error::InvalidHeader(
+                            "RAR 5 split entry is interrupted by a regular entry",
+                        ));
+                    }
                 }
             }
+        }
+
+        if let Some(file_index) = chase_at {
+            let finish = incremental_split_decode(
+                &mut volumes,
+                (volume_index, file_index),
+                &mut next_volume,
+                &options,
+                &mut session,
+                &mut open,
+                &consumed,
+            )?;
+            // The finishing volume may carry more members after the split
+            // member, so the walk resumes inside it rather than pulling
+            // the next volume.
+            resume = Some((finish.0, finish.1 + 1));
         }
     }
 
@@ -1517,6 +1674,468 @@ where
     }
 
     Ok(())
+}
+
+/// Is this split member worth decoding through the growing chain?
+///
+/// Exactly the members that would stream anyway. Below that bar a split
+/// member is small enough that retaining its fragments costs nothing, and
+/// the buffered whole-chain path stays the simpler answer.
+fn incremental_split_worthwhile(file: &FileHeader, session: &DecoderSession<'_>) -> bool {
+    file.redirection.is_none()
+        && !file.is_stored()
+        && file.should_stream_decode(session.buffered_decode_limit)
+}
+
+/// Decode one split member incrementally, starting at its Start fragment
+/// and pulling the volumes that carry the rest.
+///
+/// Returns the coordinates of the FINISH fragment so the caller can resume
+/// its entry walk inside that volume. `volumes` grows as the chain pulls;
+/// it is handed back with every volume the member spanned still in it, at
+/// its own index - the fragments are header structs, and keeping them is
+/// what lets a streaming-filter bail fall back to the buffered whole-chain
+/// decode exactly as `extract_volumes_to` would.
+#[allow(clippy::too_many_arguments)]
+fn incremental_split_decode<P, F, C>(
+    volumes: &mut Vec<Archive>,
+    start: (usize, usize),
+    next_volume: &mut P,
+    options: &crate::ArchiveReadOptions<'_>,
+    session: &mut DecoderSession<'_>,
+    open: &mut F,
+    consumed: &C,
+) -> Result<(usize, usize)>
+where
+    P: FnMut(usize) -> Result<Option<Archive>> + Send,
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    C: Fn(usize, u64) + Sync,
+{
+    let password = options.password;
+    let (start_volume, start_file) = start;
+    // An owned copy of the Start fragment's header: it drives the whole
+    // decode (name, dictionary, unpacked size and encryption all repeat
+    // across a split member's fragments) and the chain owns `volumes`.
+    let first = volumes
+        .get(start_volume)
+        .and_then(|archive| archive.files().nth(start_file))
+        .ok_or(Error::InvalidHeader("RAR 5 split entry is missing"))?
+        .clone();
+    let pending = PendingSplitRefs::new(&first, start_volume, start_file);
+    let decryptor = pending.split_decryptor(volumes, password)?;
+    let meta = ExtractedEntryMeta {
+        name: pending.name.clone(),
+        file_time: pending.file_time,
+        attr: pending.attr,
+        host_os: pending.host_os,
+        is_directory: false,
+    };
+    let mut writer = open(&meta)?;
+
+    let solid = first
+        .decoded_compression_info()
+        .map_err(|error| first.entry_error("decoding", error))?
+        .solid;
+    // Whether the streaming-filter bail could still fall back to the
+    // buffered whole-chain decode, which re-reads every fragment. It
+    // cannot for a member over the buffered ceiling - that guard predates
+    // this path - and once the chain has published a watermark it cannot
+    // either, whatever the size.
+    let retry_possible = first.unpacked_size <= session.buffered_decode_limit;
+    let mut chain = GrowingChainedReader::new(
+        std::mem::take(volumes),
+        pending,
+        &first,
+        next_volume,
+        password,
+        consumed,
+    );
+
+    let flat_limit = session.member_flat_limit(&first);
+    // Always hash. The expected value is the LAST fragment's, and the
+    // fragments do not agree on whether a hash record even EXISTS: the
+    // rars writer puts one only on the finish fragment, WinRAR puts a
+    // different running value on every one. Seeding off the first
+    // fragment would leave a set with nothing to check against. A
+    // malformed record on the first fragment still errors here, exactly
+    // as the whole-set walk errors on it.
+    let seed = match streaming_hash_verifier(&first)? {
+        Some(seed) => Some(seed),
+        None => Some(([0u8; 32], blake2sp::Hasher::new())),
+    };
+    let mut counting = CountingWriter {
+        inner: &mut *writer,
+        written: 0,
+    };
+    // Solid members decode on a clone so a failed stream leaves the
+    // session's window untouched for the buffered retry below - the same
+    // trade `PendingSplitRefs::write_to` makes.
+    let mut streaming_decoder = solid.then(|| session.decoder.clone());
+    let stream_result = {
+        let decoder = streaming_decoder.as_mut().unwrap_or(&mut session.decoder);
+        let mut packed: Box<dyn Read + Send + '_> = match &decryptor {
+            Some(decryptor) => Box::new(Rar50DecryptingReader::new(
+                &mut chain,
+                decryptor.keys.key,
+                decryptor.iv,
+            )),
+            None => Box::new(&mut chain),
+        };
+        first.stream_packed_digests(
+            &mut packed,
+            decoder,
+            flat_limit,
+            &mut counting,
+            seed,
+        )
+    };
+    let written = counting.written;
+
+    match stream_result {
+        Ok((crc, hash)) => {
+            if let Some(decoder) = streaming_decoder {
+                session.decoder = decoder;
+            }
+            let (finish, volumes_back) = chain.finish(written)?;
+            *volumes = volumes_back;
+            let final_file = volumes[finish.0]
+                .files()
+                .nth(finish.1)
+                .ok_or(Error::InvalidHeader("RAR 5 split entry is missing"))?;
+            // The expected digests are the LAST fragment's; whatever the
+            // earlier headers carry is not the file's. A set with no hash
+            // record at all simply has nothing to check here.
+            let hash = match (hash, streaming_hash_verifier(final_file)?) {
+                (Some((_, hasher)), Some((expected, _))) => Some((expected, hasher)),
+                _ => None,
+            };
+            final_file
+                .verify_streaming_integrity(
+                    crc,
+                    hash,
+                    decryptor.as_ref().map(|decryptor| &decryptor.keys),
+                )
+                .map_err(|error| final_file.entry_error("verifying", error))?;
+            Ok(finish)
+        }
+        Err(error) => {
+            // A real rars error behind the io error the decoder saw (a
+            // continuation that changed name or method, a volume that never
+            // arrived) is the one to report - bare, exactly as the
+            // whole-set walk reports it.
+            if let Some(error) = chain.take_error() {
+                let (_, volumes_back) = chain.into_parts();
+                *volumes = volumes_back;
+                return Err(error);
+            }
+            // The chain's own record is what makes the retry safe: if it
+            // published a watermark, the caller may already have released
+            // bytes the buffered path would have to read again. `written`
+            // alone is not enough - the decoder can emit (and so unblock
+            // the chain) a chunk that is still sitting in the pipe.
+            let retry = !chain.published()
+                && written == 0
+                && retry_possible
+                && is_streaming_filter_bail(&error);
+            if !retry {
+                let (_, volumes_back) = chain.into_parts();
+                *volumes = volumes_back;
+                return Err(first.entry_error("decoding", error));
+            }
+            // Nothing reached the writer, so nothing was reported consumed
+            // and every fragment is still readable: pull the rest of the
+            // chain and take the buffered whole-member path, which is what
+            // `PendingSplitRefs::write_to` does for the same bail.
+            chain.drain()?;
+            if let Some(error) = chain.take_error() {
+                let (_, volumes_back) = chain.into_parts();
+                *volumes = volumes_back;
+                return Err(error);
+            }
+            let (pending, volumes_back) = chain.into_parts();
+            *volumes = volumes_back;
+            let finish = *pending
+                .fragments
+                .last()
+                .expect("a drained chain has its finish fragment");
+            if !solid {
+                // A non-solid member must not see state the failed stream
+                // left behind; through `fresh_decoder` so the retry keeps
+                // the caller's window and worker limits.
+                session.decoder = session.fresh_decoder();
+            }
+            let final_file = volumes[finish.0]
+                .files()
+                .nth(finish.1)
+                .ok_or(Error::InvalidHeader("RAR 5 split entry is missing"))?;
+            let data = session
+                .decode_split(volumes, &pending, final_file, decryptor.as_ref())
+                .map_err(|error| final_file.entry_error("decoding", error))?;
+            final_file
+                .verify_integrity_with_keys(
+                    &data,
+                    decryptor.as_ref().map(|decryptor| &decryptor.keys),
+                )
+                .map_err(|error| final_file.entry_error("verifying", error))?;
+            counting
+                .write_all(&data)
+                .map_err(Error::from)
+                .map_err(|error| final_file.entry_error("writing", error))?;
+            Ok(finish)
+        }
+    }
+}
+
+/// The packed byte chain of a split member whose later fragments DO NOT
+/// EXIST YET.
+///
+/// `LazyChainedReader` serves a fragment list resolved up front; this one
+/// pulls the next volume from the sequence driver when the fragment in
+/// hand runs dry, which is what lets a split member start decoding at its
+/// Start fragment instead of its Finish. Fragments are consumed strictly
+/// forward and exactly once, one open cursor at a time.
+///
+/// Every volume it pulls stays in `volumes`, at its own index: those are
+/// header structs (the payload lives in whatever source backs them), and
+/// keeping them is what lets the caller fall back to the buffered
+/// whole-chain decode when the streaming decoder bails on a filter.
+struct GrowingChainedReader<'a, P, C> {
+    volumes: Vec<Archive>,
+    pending: PendingSplitRefs,
+    next_volume: &'a mut P,
+    consumed: &'a C,
+    password: Option<&'a [u8]>,
+    /// Identity every continuation is checked against.
+    compression_info: u64,
+    encrypted: bool,
+    unpacked_size: u64,
+    /// Index into `pending.fragments` of the fragment the cursor is on.
+    at: usize,
+    cursor: Option<OwnedRangeReader>,
+    /// Volume-space start of that fragment's packed range, and how far in
+    /// the decoder has read.
+    frag_start: u64,
+    frag_pos: u64,
+    /// The finish fragment (no SPLIT_AFTER) has been appended.
+    last_seen: bool,
+    /// Fragments already reported wholly consumed.
+    reported: usize,
+    /// Any watermark published at all - once true the caller may have
+    /// released bytes, so the buffered whole-chain retry is off.
+    published: bool,
+    /// The rars error behind the io error handed to the decoder.
+    error: Option<Error>,
+}
+
+impl<'a, P, C> GrowingChainedReader<'a, P, C>
+where
+    P: FnMut(usize) -> Result<Option<Archive>>,
+    C: Fn(usize, u64),
+{
+    fn new(
+        volumes: Vec<Archive>,
+        pending: PendingSplitRefs,
+        first: &FileHeader,
+        next_volume: &'a mut P,
+        password: Option<&'a [u8]>,
+        consumed: &'a C,
+    ) -> Self {
+        Self {
+            volumes,
+            pending,
+            next_volume,
+            consumed,
+            password,
+            compression_info: first.compression_info,
+            encrypted: first.encrypted,
+            unpacked_size: first.unpacked_size,
+            at: 0,
+            cursor: None,
+            frag_start: 0,
+            frag_pos: 0,
+            last_seen: !first.is_split_after(),
+            reported: 0,
+            published: false,
+            error: None,
+        }
+    }
+
+    fn take_error(&mut self) -> Option<Error> {
+        self.error.take()
+    }
+
+    fn published(&self) -> bool {
+        self.published
+    }
+
+    fn into_parts(self) -> (PendingSplitRefs, Vec<Archive>) {
+        (self.pending, self.volumes)
+    }
+
+    /// Finish coordinates plus the volumes, once the decode has run to the
+    /// end of the chain. A decode that declared success without draining
+    /// the chain (a member whose declared unpacked size is short of what
+    /// its fragments carry) is a malformed archive, not a success.
+    fn finish(mut self, written: u64) -> Result<((usize, usize), Vec<Archive>)> {
+        if !self.last_seen {
+            // The decoder stopped early: pull the rest so the member's
+            // real end is known, then report it.
+            self.drain()?;
+        }
+        if let Some(error) = self.error.take() {
+            return Err(error);
+        }
+        if written != self.unpacked_size {
+            return Err(Error::InvalidHeader(
+                "RAR 5 split entry decoded to a different size than its header declares",
+            ));
+        }
+        let finish = *self
+            .pending
+            .fragments
+            .last()
+            .expect("the chain always holds its start fragment");
+        Ok((finish, self.volumes))
+    }
+
+    /// Pull every remaining fragment without reading payload - the
+    /// buffered retry needs the whole list, and so does an early stop.
+    fn drain(&mut self) -> Result<()> {
+        while !self.last_seen {
+            self.pull_fragment()?;
+        }
+        Ok(())
+    }
+
+    /// Publish how much of each volume the engine is finished with.
+    ///
+    /// Every fragment behind the cursor is wholly consumed. The fragment
+    /// the cursor is ON reports its own byte offset, never `u64::MAX`:
+    /// the FINISHING volume carries the members after the split one, and
+    /// the caller resumes its walk there.
+    fn report(&mut self) {
+        while self.reported < self.at {
+            let (volume_index, _) = self.pending.fragments[self.reported];
+            (self.consumed)(volume_index, u64::MAX);
+            self.reported += 1;
+            self.published = true;
+        }
+        if let Some(&(volume_index, _)) = self.pending.fragments.get(self.at) {
+            (self.consumed)(volume_index, self.frag_start + self.frag_pos);
+            self.published = true;
+        }
+    }
+
+    /// Take the next volume from the driver and record its continuation
+    /// fragment. Volumes with no file entries are skipped, exactly as the
+    /// whole-set walk skips them.
+    fn pull_fragment(&mut self) -> Result<()> {
+        loop {
+            let volume_index = self.volumes.len();
+            let Some(archive) = (self.next_volume)(volume_index)? else {
+                return Err(Error::InvalidHeader("RAR 5 split entry is incomplete"));
+            };
+            self.volumes.push(archive);
+            let archive = &self.volumes[volume_index];
+            let Some(file) = archive.files().next() else {
+                continue;
+            };
+            if !file.is_split_before() {
+                return Err(Error::InvalidHeader(
+                    "RAR 5 split entry is interrupted by a regular entry",
+                ));
+            }
+            validate_split_fragment(file, self.password)?;
+            if file.name != self.pending.name {
+                return Err(Error::InvalidHeader("RAR 5 split entry name changed"));
+            }
+            if file.compression_info != self.compression_info {
+                return Err(Error::InvalidHeader(
+                    "RAR 5 split entry compression info changed",
+                ));
+            }
+            if file.encrypted != self.encrypted {
+                return Err(Error::InvalidHeader(
+                    "RAR 5 split entry encryption flag changed",
+                ));
+            }
+            // Not checked by the whole-set walk, which reads the size off
+            // the LAST fragment; the incremental decode is already running
+            // against the FIRST one's, so a disagreement has to be caught.
+            // Every fragment of a split member repeats the total.
+            if file.unpacked_size != self.unpacked_size {
+                return Err(Error::InvalidHeader(
+                    "RAR 5 split entry unpacked size changed",
+                ));
+            }
+            self.last_seen = !file.is_split_after();
+            self.pending.fragments.push((volume_index, 0));
+            return Ok(());
+        }
+    }
+
+    fn open_cursor(&mut self) -> Result<()> {
+        let (volume_index, file_index) = self.pending.fragments[self.at];
+        let archive = self
+            .volumes
+            .get(volume_index)
+            .ok_or(Error::InvalidHeader("RAR 5 split volume is missing"))?;
+        let file = archive
+            .files()
+            .nth(file_index)
+            .ok_or(Error::InvalidHeader("RAR 5 split entry is missing"))?;
+        let range = file.block.data_range.clone();
+        self.frag_start = range.start as u64;
+        self.frag_pos = 0;
+        self.cursor = Some(archive.owned_range_reader(range)?);
+        Ok(())
+    }
+
+    /// Record the real error and hand the decoder something to stop on.
+    fn fail(&mut self, error: Error) -> std::io::Error {
+        let message = error.to_string();
+        if self.error.is_none() {
+            self.error = Some(error);
+        }
+        std::io::Error::other(message)
+    }
+}
+
+impl<P, C> Read for GrowingChainedReader<'_, P, C>
+where
+    P: FnMut(usize) -> Result<Option<Archive>>,
+    C: Fn(usize, u64),
+{
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if let Some(cursor) = self.cursor.as_mut() {
+                let read = cursor.read(out)?;
+                if read != 0 {
+                    self.frag_pos += read as u64;
+                    self.report();
+                    return Ok(read);
+                }
+                // Drop the finished fragment BEFORE opening the next one.
+                self.cursor = None;
+                if self.last_seen && self.at + 1 == self.pending.fragments.len() {
+                    self.report();
+                    return Ok(0);
+                }
+                self.at += 1;
+            }
+            if self.at >= self.pending.fragments.len() {
+                if let Err(error) = self.pull_fragment() {
+                    return Err(self.fail(error));
+                }
+            }
+            if let Err(error) = self.open_cursor() {
+                return Err(self.fail(error));
+            }
+        }
+    }
 }
 
 // --- solid-chain MT decode (solid sets: one stream, cut at boundaries) -----
@@ -2639,6 +3258,7 @@ impl PendingSplitRefs {
         // operation label is dropped rather than double-wrapped.
         let (crc, hash) = pipe_stored_chunks(
             &mut *reader,
+            final_file.unpacked_size,
             Error::from,
             crc,
             hash,

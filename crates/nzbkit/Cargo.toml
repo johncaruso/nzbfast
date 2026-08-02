@@ -9,7 +9,16 @@ description = "Engine library for nzbfast: NZB parsing, yEnc codec, NNTP pool, s
 [build-dependencies]
 cc = "1"
 
+[lints]
+workspace = true
+
 [dependencies]
+# Events only - nzbkit is a library and installs no subscriber. The
+# binary does that (nzbfast::logging), so nzbkit's [pool] / [par2] lines
+# reach the same log pane as everything else, stamped the same way. No
+# default features: `attributes` (the #[instrument] proc macro) and
+# `log` compatibility are both unused here.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 memchr = "2"
 quick-xml = "0.41"
 thiserror = "2"
@@ -38,6 +47,12 @@ flate2 = "1"
 # directly so the zip reader can use the same decoder. Cargo dedupes,
 # so this costs no binary size.
 bzip2 = "0.6"
+# Same story for zip method 14 (LZMA): sevenz-rust2 already pulls
+# lzma-rust2 for 7z's LZMA/LZMA2 streams, so naming it costs no new
+# dependency. `encoder` is for `zip::fixtures` (lib-visible for the
+# fuzz corpus, like bzip2's and flate2's always-present encoder
+# halves); nothing in the shipping call graph reaches it.
+lzma-rust2 = { version = "0.16", default-features = false, features = ["std", "encoder"] }
 # RAR5 encrypted store-mode sets: AES-256-CBC + PBKDF2-HMAC-SHA256
 # (RustCrypto - pure Rust, no new C in the tree).
 aes = "0.8"
@@ -62,8 +77,36 @@ sevenz-rust2 = { version = "0.21", default-features = false, features = ["aes256
 [target.'cfg(all(target_arch = "x86_64", not(target_os = "windows")))'.dependencies]
 md-5 = { version = "0.10", features = ["asm"] }
 
+# Kernel TLS (TODO §70), Linux only and off by default. Nothing links it
+# unless the `ktls` feature is built in AND `NZBFAST_KTLS=1` is set at
+# run time, so the shipped binary is byte-identical to one built without
+# it. Pinned to the aws-lc-rs provider - the same one `tls_provider`
+# names, or the secrets it extracts would come from a second copy of
+# rustls' crypto stack.
+[target.'cfg(target_os = "linux")'.dependencies]
+ktls = { version = "6.0", default-features = false, features = ["aws_lc_rs"], optional = true }
+
+[features]
+# Off by default: the receive path this replaces is the one every
+# platform shares, and kTLS only exists on Linux.
+ktls = ["dep:ktls"]
+
 [dev-dependencies]
+# `hooks` is what gives the compact-abort test `progress_handler`, the
+# only way to fire an interrupt from inside the rewrite's own VM loop
+# rather than betting on a timer. It is a code gate (`hooks = []`
+# upstream, no extra C) and it belongs HERE, not on the dependency
+# above: resolver 2 keeps dev-dependency features out of non-test
+# builds, so the shipping binary's feature set does not widen for a
+# test. Verify with `cargo tree --no-dev-dependencies`.
+rusqlite = { version = "0.40.1", features = ["hooks"] }
+# Examples only. nzbkit itself emits tracing events and installs no
+# subscriber (the binary does that); without one here, the PAR2 bench
+# drivers' NZBFAST_REPAIR_TIMING / NZBFAST_FOLD_TRACE output would go
+# nowhere - which is what those drivers exist to print.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt"] }
 rand = "0.8"
+rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 # 7z test fixtures are written in-process (the writer needs the encoder
 # half of the crate; release builds keep it off).
 sevenz-rust2 = { version = "0.21", default-features = false, features = ["aes256", "bzip2", "deflate", "ppmd", "compress"] }

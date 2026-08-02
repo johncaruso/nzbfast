@@ -44,9 +44,10 @@
 //!   account rather than connections - see
 //!   [`WarmPool::set_release_policies`].
 
+use crate::sync::MutexExt;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
@@ -174,6 +175,20 @@ pub struct WarmStats {
 
 pub struct WarmPool {
     idle: Mutex<HashMap<String, Vec<Parked>>>,
+    /// Whether the pool will take new connections at all.
+    ///
+    /// `clear` is a one-shot drain, and a drain alone cannot express
+    /// "offline": a job winding down gracefully parks its fleet from
+    /// the drained exits by design, so every worker that reaches the
+    /// park AFTER the drain refills the pool the drain just emptied,
+    /// and nothing re-runs it. The daemon drops this first and then
+    /// clears, so the sessions stay gone until it comes back online.
+    ///
+    /// Deliberately NOT touched by `clear`/`retain_servers`: those are
+    /// config-change tools, and latching the flag there would leave a
+    /// password change silently running cold until the next
+    /// offline/online round trip.
+    accepting: AtomicBool,
     generation: AtomicU64,
     max_idle: Duration,
     /// Most connections parked per server. Never exceeds the account's
@@ -232,6 +247,7 @@ impl WarmPool {
     pub fn new(max_idle: Duration, per_server: usize) -> Arc<WarmPool> {
         let pool = Arc::new(WarmPool {
             idle: Mutex::new(HashMap::new()),
+            accepting: AtomicBool::new(true),
             generation: AtomicU64::new(0),
             max_idle,
             per_server,
@@ -284,18 +300,40 @@ impl WarmPool {
     /// `retain_servers`' business, which closes it outright instead of
     /// trimming it to a floor.
     pub fn set_release_policies(&self, servers: &[ServerConfig]) {
-        let next: HashMap<String, crate::config::ReleasePolicy> =
-            servers.iter().map(|s| (key(s), s.idle_release_policy())).collect();
-        *self.release.lock().unwrap() = next;
+        let next: HashMap<String, crate::config::ReleasePolicy> = servers
+            .iter()
+            .map(|s| (key(s), s.idle_release_policy()))
+            .collect();
+        *self.release.lock_ok() = next;
     }
 
     /// One server's installed policy, for the dashboard and for tests.
     pub fn release_policy(&self, server: &ServerConfig) -> Option<crate::config::ReleasePolicy> {
-        self.release.lock().unwrap().get(&key(server)).copied()
+        self.release.lock_ok().get(&key(server)).copied()
+    }
+
+    /// Open or close the pool to new parks.
+    ///
+    /// Closing is what "go offline" needs on top of [`Self::clear`]:
+    /// the drain empties the map, this stops the workers still winding
+    /// down from filling it again a moment later. Reopening is the
+    /// load-bearing half - a flag left down silently costs every later
+    /// job the 4.5-14.3x cold start with no visible symptom - so the
+    /// only caller that closes it must be the one that reopens it.
+    ///
+    /// Sync, like `set_release_policies` and for the same reason: the
+    /// daemon's offline switch runs on a blocking API handler thread.
+    pub fn set_accepting(&self, yes: bool) {
+        self.accepting.store(yes, Ordering::Release);
+    }
+
+    /// Is the pool taking parks? For the dashboard and for tests.
+    pub fn accepting(&self) -> bool {
+        self.accepting.load(Ordering::Acquire)
     }
 
     fn touch(&self) {
-        *self.last_activity.lock().unwrap() = Instant::now();
+        *self.last_activity.lock_ok() = Instant::now();
     }
 
     /// A live, validated session for `server`, or None to connect fresh.
@@ -347,7 +385,9 @@ impl WarmPool {
                         let mut idle = self.idle.lock().await;
                         idle.remove(&k).unwrap_or_default()
                     };
-                    self.stats.reaped.fetch_add(dead.len() as u64 + 1, Ordering::Relaxed);
+                    self.stats
+                        .reaped
+                        .fetch_add(dead.len() as u64 + 1, Ordering::Relaxed);
                     return None;
                 }
                 _ => {
@@ -364,6 +404,18 @@ impl WarmPool {
     /// Park a connection that has NO unread responses on its socket.
     /// Anything else must be closed instead - see the module docs.
     pub async fn give(&self, server: &ServerConfig, conn: Connection) {
+        // Checked before `touch`: a park the pool is refusing is not a
+        // job using this account, so it must not restart the
+        // idle-release clock for whatever else is still parked.
+        //
+        // QUIT rather than drop, like the `per_server == 0` branch
+        // below: a socket closed without a goodbye leaves a provider
+        // that counts sessions rather than FINs still holding the slot,
+        // which is the whole occupancy this is trying to give back.
+        if !self.accepting() {
+            conn.quit().await;
+            return;
+        }
         self.touch();
         if self.per_server == 0 {
             conn.quit().await;
@@ -371,6 +423,17 @@ impl WarmPool {
         }
         let k = key(server);
         let mut idle = self.idle.lock().await;
+        // Again, now under the map lock. This is what makes the gate
+        // airtight rather than merely likely: a park that passed the
+        // check above and then waited here cannot slip past a `clear`
+        // that took the lock first. The QUIT stays outside the guard,
+        // as everywhere else in this module - a mute provider's 500 ms
+        // goodbye held under it would stall every checkout.
+        if !self.accepting() {
+            drop(idle);
+            conn.quit().await;
+            return;
+        }
         let v = idle.entry(k).or_default();
         if v.len() >= self.per_server {
             drop(idle);
@@ -380,7 +443,12 @@ impl WarmPool {
         }
         let now = Instant::now();
         let generation = self.generation.load(Ordering::Acquire);
-        v.push(Parked { conn, generation, fresh_at: now, parked_at: now });
+        v.push(Parked {
+            conn,
+            generation,
+            fresh_at: now,
+            parked_at: now,
+        });
         self.stats.parked.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -414,8 +482,11 @@ impl WarmPool {
             // safe to drop a valid ping crossing a job boundary; it is not
             // safe to let a removed identity reappear after this returns.
             let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
-            let stale: Vec<String> =
-                idle.keys().filter(|k| !keep.contains(*k)).cloned().collect();
+            let stale: Vec<String> = idle
+                .keys()
+                .filter(|k| !keep.contains(*k))
+                .cloned()
+                .collect();
             let drained = stale
                 .into_iter()
                 .filter_map(|k| idle.remove(&k))
@@ -440,7 +511,7 @@ impl WarmPool {
 
     /// How long since a job last used the pool.
     pub fn idle_for(&self) -> Duration {
-        self.last_activity.lock().unwrap().elapsed()
+        self.last_activity.lock_ok().elapsed()
     }
 
     /// Trim each server down to ITS OWN floor once the pool has gone
@@ -463,7 +534,7 @@ impl WarmPool {
     /// "a few minutes", and it costs no second timer.
     async fn release_if_idle(&self) {
         let idle_for = self.idle_for();
-        let policies = self.release.lock().unwrap().clone();
+        let policies = self.release.lock_ok().clone();
         if policies.is_empty() {
             return;
         }
@@ -496,7 +567,9 @@ impl WarmPool {
         if surplus.is_empty() {
             return;
         }
-        self.stats.released.fetch_add(surplus.len() as u64, Ordering::Relaxed);
+        self.stats
+            .released
+            .fetch_add(surplus.len() as u64, Ordering::Relaxed);
         // Concurrently, for the reason in `quit_all`: a released fleet is
         // the same shape as a cleared one, and serially a black-holed set
         // of 64 would outlast the interval this tick is due again in.
@@ -531,7 +604,9 @@ impl WarmPool {
                 *v = keep;
             }
         }
-        self.stats.evicted.fetch_add(expired.len() as u64, Ordering::Relaxed);
+        self.stats
+            .evicted
+            .fetch_add(expired.len() as u64, Ordering::Relaxed);
         quit_all(expired).await;
         // Ping the whole batch at once. One black-holed flow costs a
         // VALIDATE_TIMEOUT, and serially a pool of 64 of them would take
@@ -551,9 +626,7 @@ impl WarmPool {
         }
         while let Some(joined) = pings.join_next().await {
             match joined {
-                Ok((k, mut p, true))
-                    if p.generation == self.generation.load(Ordering::Acquire) =>
-                {
+                Ok((k, mut p, true)) if p.generation == self.generation.load(Ordering::Acquire) => {
                     p.fresh_at = Instant::now();
                     let mut idle = self.idle.lock().await;
                     let v = idle.entry(k).or_default();
@@ -610,11 +683,7 @@ mod tests {
 
     /// `bare_config` with an explicit idle-release policy, since the
     /// policy now travels ON the server rather than on the pool.
-    fn policy_config(
-        addr: std::net::SocketAddr,
-        secs: Option<u64>,
-        keep: u32,
-    ) -> ServerConfig {
+    fn policy_config(addr: std::net::SocketAddr, secs: Option<u64>, keep: u32) -> ServerConfig {
         ServerConfig {
             idle_release_secs: Some(secs.unwrap_or(0)),
             idle_keep: Some(keep),
@@ -680,8 +749,11 @@ mod tests {
                             Ok(_) => {}
                         }
                         let quit = line.to_ascii_uppercase().starts_with("QUIT");
-                        let reply: &[u8] =
-                            if quit { b"205 bye\r\n" } else { b"111 20260731000000\r\n" };
+                        let reply: &[u8] = if quit {
+                            b"205 bye\r\n"
+                        } else {
+                            b"111 20260731000000\r\n"
+                        };
                         if s.write_all(reply).is_err() {
                             break;
                         }
@@ -717,7 +789,9 @@ mod tests {
     /// reach a multi-minute timeout without waiting out minutes.
     fn go_idle_for(pool: &WarmPool, d: Duration) {
         let mut t = pool.last_activity.lock().unwrap();
-        *t = t.checked_sub(d).expect("monotonic clock older than the rewind");
+        *t = t
+            .checked_sub(d)
+            .expect("monotonic clock older than the rewind");
     }
 
     /// The headline: an idle pool must hand the SOCKETS back, not merely
@@ -742,13 +816,21 @@ mod tests {
             let (conn, _) = Connection::connect(&sc).await.unwrap();
             pool.give(&sc, conn).await;
         }
-        assert_eq!(live_settles(&live, N).await, N, "the provider sees {N} sessions");
+        assert_eq!(
+            live_settles(&live, N).await,
+            N,
+            "the provider sees {N} sessions"
+        );
 
         // A pool that was in use a moment ago is not idle, and releasing
         // it would spend the 4.5-14.3x cold-start cost this module
         // exists to avoid.
         pool.tick().await;
-        assert_eq!(pool.idle_count().await, N, "a pool still in use must be left alone");
+        assert_eq!(
+            pool.idle_count().await,
+            N,
+            "a pool still in use must be left alone"
+        );
         assert_eq!(live.load(Ordering::SeqCst), N);
 
         go_idle_for(&pool, Duration::from_secs(301));
@@ -790,13 +872,21 @@ mod tests {
         }
         let newest = {
             let idle = pool.idle.lock().await;
-            idle.values().flatten().map(|p| p.parked_at).max().expect("four parked")
+            idle.values()
+                .flatten()
+                .map(|p| p.parked_at)
+                .max()
+                .expect("four parked")
         };
 
         go_idle_for(&pool, Duration::from_secs(121));
         pool.tick().await;
 
-        assert_eq!(pool.idle_count().await, 1, "released down to the floor, not to zero");
+        assert_eq!(
+            pool.idle_count().await,
+            1,
+            "released down to the floor, not to zero"
+        );
         assert_eq!(pool.stats.released.load(Ordering::Relaxed), 3);
         assert_eq!(
             live_settles(&live, 1).await,
@@ -805,7 +895,12 @@ mod tests {
         );
         {
             let idle = pool.idle.lock().await;
-            let kept = idle.values().flatten().map(|p| p.parked_at).next().expect("one left");
+            let kept = idle
+                .values()
+                .flatten()
+                .map(|p| p.parked_at)
+                .next()
+                .expect("one left");
             assert_eq!(
                 kept, newest,
                 "the floor kept the OLDEST session: it has the least of the warm \
@@ -893,7 +988,11 @@ mod tests {
         go_idle_for(&pool, Duration::from_secs(3600));
         pool.tick().await;
 
-        assert_eq!(pool.idle_count().await, 3, "nothing may be released with the policy off");
+        assert_eq!(
+            pool.idle_count().await,
+            3,
+            "nothing may be released with the policy off"
+        );
         assert_eq!(pool.stats.released.load(Ordering::Relaxed), 0);
         assert_eq!(live.load(Ordering::SeqCst), 3);
     }
@@ -943,7 +1042,6 @@ mod tests {
         let srv = server().await;
         let pool = WarmPool::new(DEFAULT_MAX_IDLE, 4);
         assert!(pool.take(&srv.server_config()).await.is_none());
-
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -956,11 +1054,12 @@ mod tests {
         pool.give(&sc, conn).await;
         assert_eq!(pool.idle_count().await, 1);
 
-
         let mut got = pool.take(&sc).await.expect("a parked connection");
         // Usable for real work, not merely non-null: this is the whole
         // contract the pool's worker relies on.
-        got.date().await.expect("checked-out connection still speaks NNTP");
+        got.date()
+            .await
+            .expect("checked-out connection still speaks NNTP");
         assert_eq!(pool.stats.hits.load(Ordering::Relaxed), 1);
         assert_eq!(pool.idle_count().await, 0);
     }
@@ -995,7 +1094,10 @@ mod tests {
         pool.give(&sc, conn).await;
         closed_rx.await.unwrap(); // the peer is definitively gone
 
-        assert!(pool.take(&sc).await.is_none(), "must not serve a dead session");
+        assert!(
+            pool.take(&sc).await.is_none(),
+            "must not serve a dead session"
+        );
         assert_eq!(pool.stats.reaped.load(Ordering::Relaxed), 1);
         assert_eq!(pool.stats.hits.load(Ordering::Relaxed), 0);
     }
@@ -1112,8 +1214,13 @@ mod tests {
         let (conn, _) = Connection::connect(&sc).await.unwrap();
         pool.give(&sc, conn).await;
 
-        let mut got = pool.take(&sc).await.expect("a slow provider is not a dead one");
-        got.date().await.expect("checked-out connection still speaks NNTP");
+        let mut got = pool
+            .take(&sc)
+            .await
+            .expect("a slow provider is not a dead one");
+        got.date()
+            .await
+            .expect("checked-out connection still speaks NNTP");
         assert_eq!(pool.stats.hits.load(Ordering::Relaxed), 1);
         assert_eq!(pool.stats.reaped.load(Ordering::Relaxed), 0);
     }
@@ -1155,7 +1262,11 @@ mod tests {
         pool.tick().await;
         let took = t0.elapsed();
 
-        assert_eq!(pool.stats.reaped.load(Ordering::Relaxed), 4, "all four are dead");
+        assert_eq!(
+            pool.stats.reaped.load(Ordering::Relaxed),
+            4,
+            "all four are dead"
+        );
         assert_eq!(pool.idle_count().await, 0, "nothing dead may stay parked");
         assert!(
             took < VALIDATE_TIMEOUT * 2,
@@ -1192,7 +1303,10 @@ mod tests {
 
         let mut other = sc.clone();
         other.username = Some("someone-else".into());
-        assert!(pool.take(&other).await.is_none(), "different account, different pool");
+        assert!(
+            pool.take(&other).await.is_none(),
+            "different account, different pool"
+        );
         // The original entry is untouched.
         assert!(pool.take(&sc).await.is_some());
     }
@@ -1334,8 +1448,7 @@ mod tests {
                 };
                 let servers = vec![(sc, cfg)];
                 let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-                let fetch =
-                    tokio::spawn(async move { fetch_all_multi(&servers, reqs, tx).await });
+                let fetch = tokio::spawn(async move { fetch_all_multi(&servers, reqs, tx).await });
                 let mut done = 0usize;
                 while let Some(o) = rx.recv().await {
                     if matches!(o, FetchOutcome::Done { .. }) {
@@ -1404,9 +1517,10 @@ mod tests {
         };
         let servers = vec![(sc.clone(), cfg)];
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-        let fetch = tokio::spawn(async move {
-            fetch_all_multi(&servers, Vec::<ArticleReq>::new(), tx).await
-        });
+        let fetch =
+            tokio::spawn(
+                async move { fetch_all_multi(&servers, Vec::<ArticleReq>::new(), tx).await },
+            );
         while rx.recv().await.is_some() {}
         fetch.await.unwrap();
 
@@ -1424,7 +1538,9 @@ mod tests {
         // Still usable, not merely counted: a re-parked claim has to be a
         // live session or the next job's checkout reaps it right back out.
         let mut got = pool.take(&sc).await.expect("a re-parked claim");
-        got.date().await.expect("re-parked connection still speaks NNTP");
+        got.date()
+            .await
+            .expect("re-parked connection still speaks NNTP");
     }
 
     /// The goodbye half of the same argument the batched ping makes above.
@@ -1474,5 +1590,173 @@ mod tests {
         pool.clear().await;
         assert_eq!(pool.idle_count().await, 0);
         assert!(pool.take(&sc).await.is_none());
+    }
+
+    /// "Go offline" has to STAY offline.
+    ///
+    /// `clear` on its own is a one-shot drain, and the job it is racing
+    /// parks by design: a graceful pause winds the fleet down through
+    /// the pool's drained exits, which hand every connection to `give`.
+    /// Those workers finish their in-flight windows over the following
+    /// seconds, i.e. after the drain, so an ungated `give` refills the
+    /// pool the operator just emptied - up to `MAX_PER_SERVER` sessions
+    /// per server, kept alive by the keepalive tick, while the UI and
+    /// `/api?mode=queue` both say offline. Against a provider that caps
+    /// concurrent source IPs that is the operator's other machine still
+    /// locked out minutes after they asked for the account back.
+    ///
+    /// Asserted at the PROVIDER, not in the map: bookkeeping that says
+    /// zero while the sockets are ESTABLISHED is exactly the failure.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_closed_pool_refuses_the_parks_that_land_after_the_drain() {
+        let (addr, live) = counting_provider();
+        let sc = bare_config(addr);
+        let pool = WarmPool::new(DEFAULT_MAX_IDLE, 8);
+
+        // A job's fleet, parked and warm.
+        for _ in 0..3 {
+            let (conn, _) = Connection::connect(&sc).await.unwrap();
+            pool.give(&sc, conn).await;
+        }
+        assert_eq!(
+            live_settles(&live, 3).await,
+            3,
+            "the provider sees the fleet"
+        );
+
+        // The operator goes offline: close first, then drain.
+        pool.set_accepting(false);
+        pool.clear().await;
+        assert_eq!(pool.idle_count().await, 0);
+        assert_eq!(
+            live_settles(&live, 0).await,
+            0,
+            "the drain hangs up what it drained"
+        );
+
+        // The workers still winding down now reach their drained exit
+        // and park, well after the drain ran.
+        for _ in 0..3 {
+            let (conn, _) = Connection::connect(&sc).await.unwrap();
+            pool.give(&sc, conn).await;
+        }
+        assert_eq!(
+            pool.idle_count().await,
+            0,
+            "a park that landed after the pool closed was accepted: offline drained \
+             the pool and the tail of the job filled it straight back up"
+        );
+        assert_eq!(
+            live_settles(&live, 0).await,
+            0,
+            "a refused park must QUIT, not drop: a socket closed without a goodbye \
+             is the same occupancy against a provider counting sessions"
+        );
+        assert!(
+            pool.take(&sc).await.is_none(),
+            "and nothing may be handed back out"
+        );
+    }
+
+    /// The same thing under the shape it actually happens in: parks
+    /// racing the drain rather than following it politely. A `give` that
+    /// passed the flag check and then waited on the map lock must not
+    /// slip past the `clear` that took the lock first, which is why the
+    /// flag is checked again with the lock held.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parks_racing_the_drain_do_not_survive_it() {
+        let (addr, live) = counting_provider();
+        let sc = bare_config(addr);
+        let pool = WarmPool::new(DEFAULT_MAX_IDLE, MAX_PER_SERVER);
+
+        // Connect first, park later: the connections exist while the
+        // pool is still open, exactly like a draining fleet's.
+        let mut conns = Vec::new();
+        for _ in 0..8 {
+            conns.push(Connection::connect(&sc).await.unwrap().0);
+        }
+        assert_eq!(live_settles(&live, 8).await, 8);
+
+        pool.set_accepting(false);
+        let mut parks = tokio::task::JoinSet::new();
+        for conn in conns {
+            let (pool, sc) = (pool.clone(), sc.clone());
+            parks.spawn(async move { pool.give(&sc, conn).await });
+        }
+        pool.clear().await;
+        while parks.join_next().await.is_some() {}
+
+        assert_eq!(
+            pool.idle_count().await,
+            0,
+            "a racing park outlived the drain"
+        );
+        assert_eq!(live_settles(&live, 0).await, 0, "and left its socket open");
+    }
+
+    /// The load-bearing half of the fix, and the regression nobody would
+    /// report: a flag left down kills pooling silently forever after.
+    /// Jobs still succeed, they just pay the cold start again, so this
+    /// only ever surfaces as a benchmark regression.
+    ///
+    /// Also pins that a rejected park does not count as "a job using
+    /// this account" - it must not reset the idle-release clock for
+    /// whatever else is parked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn coming_back_online_restores_pooling() {
+        let (addr, live) = counting_provider();
+        let sc = bare_config(addr);
+        let pool = WarmPool::new(DEFAULT_MAX_IDLE, 8);
+
+        pool.set_accepting(false);
+        go_idle_for(&pool, Duration::from_secs(100));
+        let (conn, _) = Connection::connect(&sc).await.unwrap();
+        pool.give(&sc, conn).await;
+        assert_eq!(pool.idle_count().await, 0, "closed means closed");
+        assert!(
+            pool.idle_for() >= Duration::from_secs(100),
+            "a refused park is not a job touching this account, so it must not \
+             restart the idle-release clock for whatever is still parked"
+        );
+
+        pool.set_accepting(true);
+        assert!(pool.accepting());
+        let (conn, _) = Connection::connect(&sc).await.unwrap();
+        pool.give(&sc, conn).await;
+        assert_eq!(pool.idle_count().await, 1, "online must park again");
+        assert_eq!(live_settles(&live, 1).await, 1);
+        let mut got = pool.take(&sc).await.expect("and hand it back out");
+        got.date()
+            .await
+            .expect("a reopened pool's session still speaks NNTP");
+    }
+
+    /// A config change is not an offline switch. `clear` and
+    /// `retain_servers` exist to drop superseded sessions, and if either
+    /// latched the flag a saved password would leave the pool dead until
+    /// the next offline/online round trip.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_config_change_does_not_close_the_pool() {
+        let srv = server().await;
+        let sc = srv.server_config();
+        let pool = WarmPool::new(DEFAULT_MAX_IDLE, 4);
+        let (conn, _) = Connection::connect(&sc).await.unwrap();
+        pool.give(&sc, conn).await;
+
+        pool.clear().await;
+        assert!(
+            pool.accepting(),
+            "clear is a config-change tool, not an off switch"
+        );
+        pool.retain_servers(std::slice::from_ref(&sc)).await;
+        assert!(pool.accepting());
+
+        let (conn, _) = Connection::connect(&sc).await.unwrap();
+        pool.give(&sc, conn).await;
+        assert_eq!(
+            pool.idle_count().await,
+            1,
+            "pooling must survive a config reload"
+        );
     }
 }

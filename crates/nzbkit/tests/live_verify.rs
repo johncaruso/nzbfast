@@ -5,6 +5,8 @@
 //! Uses the real par2cmdline fixture set (block size 4096):
 //!   beta.bin  33 KiB → 9 blocks,  alpha.bin 10 KiB → 3 blocks.
 
+mod scratch;
+
 use nzbkit::live::LiveVerifier;
 use nzbkit::par2::verify_file_blocks;
 
@@ -41,7 +43,14 @@ fn shuffled_articles(data: &[u8], art_size: usize, rng: &mut Rng) -> Vec<(u64, V
     arts
 }
 
-fn feed_all(v: &LiveVerifier, slot: usize, name: &str, data: &[u8], art_size: usize, rng: &mut Rng) {
+fn feed_all(
+    v: &LiveVerifier,
+    slot: usize,
+    name: &str,
+    data: &[u8],
+    art_size: usize,
+    rng: &mut Rng,
+) {
     for (off, chunk) in shuffled_articles(data, art_size, rng) {
         v.on_data(slot, name, data.len() as u64, off, &chunk);
     }
@@ -104,7 +113,10 @@ fn corruption_differential_random_orders() {
             reference_bad("beta.bin", &data),
             "trial {trial} (art={art}) diverged from reference"
         );
-        assert_eq!(r.readback_blocks, 0, "no read-back needed when all data flows");
+        assert_eq!(
+            r.readback_blocks, 0,
+            "no read-back needed when all data flows"
+        );
     }
 }
 
@@ -113,7 +125,7 @@ fn late_activation_settles_via_readback() {
     // Half the articles arrive BEFORE the par2 set is known; their blocks
     // must settle from disk at finish time.
     let dir = std::env::temp_dir().join(format!("nzbfast-live-test-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
     let path = dir.join("beta.bin");
     std::fs::write(&path, BETA).unwrap();
 
@@ -143,7 +155,7 @@ fn missing_article_hole_flags_its_blocks() {
     // never feed that span. Its blocks must come out Bad, matching the
     // reference run against the holed data.
     let dir = std::env::temp_dir().join(format!("nzbfast-live-hole-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
     let path = dir.join("beta.bin");
 
     let art = 5000usize;
@@ -174,7 +186,7 @@ fn obfuscated_name_matches_by_md5_16k() {
     // they settle by read-back, so the file must exist on disk (as it
     // always does in `get`, which writes before verifying).
     let dir = std::env::temp_dir().join(format!("nzbfast-live-obf-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
     let path = dir.join("obf.bin");
     std::fs::write(&path, BETA).unwrap();
 
@@ -192,7 +204,7 @@ fn obfuscated_name_matches_by_md5_16k() {
 fn short_file_obfuscated_match() {
     // alpha.bin (10 KiB < 16 KiB): head = whole file, md5_16k = file md5.
     let dir = std::env::temp_dir().join(format!("nzbfast-live-obf2-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
     let path = dir.join("obf2.bin");
     std::fs::write(&path, ALPHA).unwrap();
 
@@ -290,7 +302,7 @@ fn fast_verify_settle_readback_still_uses_md5() {
     // must keep the full MD5+CRC check even in fast mode: corrupt the
     // on-disk bytes of a span that was never fed live and expect Bad.
     let dir = std::env::temp_dir().join(format!("nzbfast-live-fast-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
     let path = dir.join("beta.bin");
 
     let art = 5000usize;
@@ -311,7 +323,10 @@ fn fast_verify_settle_readback_still_uses_md5() {
     }
     let r = v.finish_slot(0, Some(&path)).unwrap();
     assert_eq!(bad_set(&r), reference_bad("beta.bin", &holed));
-    assert!(r.readback_blocks > 0, "skipped span must settle by read-back");
+    assert!(
+        r.readback_blocks > 0,
+        "skipped span must settle by read-back"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -334,10 +349,16 @@ fn check_block_variants_semantics() {
     assert!(check_block(&good, bs, &bytes));
     assert!(check_block_crc(&good, bs, &bytes));
 
-    let mut wrong_md5 = good.clone();
+    let mut wrong_md5 = good;
     wrong_md5.md5[0] ^= 0xFF;
-    assert!(!check_block(&wrong_md5, bs, &bytes), "full check must reject bad MD5");
-    assert!(check_block_crc(&wrong_md5, bs, &bytes), "CRC-only ignores MD5 by design");
+    assert!(
+        !check_block(&wrong_md5, bs, &bytes),
+        "full check must reject bad MD5"
+    );
+    assert!(
+        check_block_crc(&wrong_md5, bs, &bytes),
+        "CRC-only ignores MD5 by design"
+    );
 
     let mut wrong_crc = good;
     wrong_crc.crc32 ^= 1;
@@ -388,7 +409,10 @@ fn fast_verify_boundary_blocks_hold_zero_bytes() {
     let v = LiveVerifier::new(1);
     v.activate(&[MAIN]).unwrap();
     feed_all(&v, 0, "beta.bin", BETA, 5000, &mut rng);
-    assert!(v.partials_stats().0 > 0, "full mode should buffer boundaries");
+    assert!(
+        v.partials_stats().0 > 0,
+        "full mode should buffer boundaries"
+    );
 }
 
 #[test]
@@ -419,7 +443,7 @@ fn fast_verify_mixed_disk_fragment_degrades_to_readback() {
     // disk spans owe full MD5). The block must fall back to settle
     // read-back and still verdict correctly.
     let dir = std::env::temp_dir().join(format!("nzbfast-live-b1mix-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
     let path = dir.join("beta.bin");
     std::fs::write(&path, BETA).unwrap();
 
@@ -463,13 +487,22 @@ fn delegates_integrity_only_when_full_md5_covers_the_slot() {
     assert!(!v.delegates_integrity(0));
     feed_all(&v, 0, "beta.bin", BETA, 5000, &mut rng);
     // Matched + full-MD5 mode: delegate.
-    assert!(v.delegates_integrity(0), "matched slot under full MD5 delegates");
+    assert!(
+        v.delegates_integrity(0),
+        "matched slot under full MD5 delegates"
+    );
     // Fast verify flips it off - CRC-only claims lean on the pcrc.
     v.set_fast_verify(true);
-    assert!(!v.delegates_integrity(0), "fast verify must keep the article CRC");
+    assert!(
+        !v.delegates_integrity(0),
+        "fast verify must keep the article CRC"
+    );
     // …unless the user opted into lean (single-CRC32 in-stream).
     v.set_lean(true);
-    assert!(v.delegates_integrity(0), "lean mode delegates under fast verify");
+    assert!(
+        v.delegates_integrity(0),
+        "lean mode delegates under fast verify"
+    );
     v.set_lean(false);
     v.set_fast_verify(false);
     // A slot the set has never matched stays undelegated.

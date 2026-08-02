@@ -25,9 +25,11 @@
 //! move that would turn a URL pointing somewhere harmless into a request
 //! somewhere else.
 
+use crate::MutexExt;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
+use tracing::{info, warn};
 
 use serde::{Deserialize, Serialize};
 
@@ -105,10 +107,14 @@ pub struct Ctx {
 
 impl Ctx {
     pub fn from_job(job: &Arc<Mutex<Job>>) -> Ctx {
-        let j = job.lock().unwrap();
+        let j = job.lock_ok();
         Ctx {
             name: j.name.clone(),
-            status: if j.state == JobState::Completed { "Completed" } else { "Failed" },
+            status: if j.state == JobState::Completed {
+                "Completed"
+            } else {
+                "Failed"
+            },
             category: j.category.clone(),
             dir: j.out_dir.to_string_lossy().into_owned(),
             bytes: j.total_bytes,
@@ -176,10 +182,12 @@ impl Ctx {
         while let Some(i) = rest.find('{') {
             out.push_str(&rest[..i]);
             rest = &rest[i..];
-            match rest
-                .find('}')
-                .and_then(|j| table.iter().find(|(k, _)| *k == &rest[1..j]).map(|(_, v)| (j, *v)))
-            {
+            match rest.find('}').and_then(|j| {
+                table
+                    .iter()
+                    .find(|(k, _)| *k == &rest[1..j])
+                    .map(|(_, v)| (j, *v))
+            }) {
                 Some((j, v)) => {
                     out.push_str(&esc(v));
                     rest = &rest[j + 1..];
@@ -244,10 +252,14 @@ fn wants(t: &Target, cx: &Ctx) -> bool {
 /// dropped.
 pub fn fire(targets: &[Target], cx: &Ctx) {
     for t in targets.iter().filter(|t| wants(t, cx)) {
-        let label = if t.name.is_empty() { format!("{:?}", t.kind) } else { t.name.clone() };
+        let label = if t.name.is_empty() {
+            format!("{:?}", t.kind)
+        } else {
+            t.name.clone()
+        };
         match send(t, cx) {
-            Ok(code) => println!("[notify] {label}: {code} for {:?}", cx.name),
-            Err(e) => eprintln!("[notify] {label} failed: {e}"),
+            Ok(code) => info!(target: "notify", "{label}: {code} for {:?}", cx.name),
+            Err(e) => warn!(target: "notify", "{label} failed: {e}"),
         }
     }
 }
@@ -261,15 +273,18 @@ pub fn fire(targets: &[Target], cx: &Ctx) {
 /// pressed Test on THIS row, and silently doing nothing because the row
 /// is switched off would read as a failure of the connection.
 pub fn test(t: &Target) -> Result<u16, String> {
-    send(t, &Ctx {
-        name: "Test Notification".into(),
-        status: "Completed",
-        category: t.category.clone(),
-        dir: String::new(),
-        bytes: 0,
-        error: String::new(),
-        nzo_id: "test".into(),
-    })
+    send(
+        t,
+        &Ctx {
+            name: "Test Notification".into(),
+            status: "Completed",
+            category: t.category.clone(),
+            dir: String::new(),
+            bytes: 0,
+            error: String::new(),
+            nzo_id: "test".into(),
+        },
+    )
 }
 
 /// SSRF-guarded like every other outbound fetch, with redirects off. See
@@ -301,7 +316,9 @@ fn send(t: &Target, cx: &Ctx) -> Result<u16, String> {
         // else entirely (or on another machine), so a directory-scoped
         // scan would silently do nothing. RefreshKodi makes the same call.
         Kind::Kodi => {
-            let req = a.post(&format!("{base}/jsonrpc")).set("Content-Type", "application/json");
+            let req = a
+                .post(&format!("{base}/jsonrpc"))
+                .set("Content-Type", "application/json");
             let req = match basic_auth(&t.token) {
                 Some(h) => req.set("Authorization", &h),
                 None => req,
@@ -337,7 +354,9 @@ fn send(t: &Target, cx: &Ctx) -> Result<u16, String> {
             } else {
                 cx.render_body(&t.body)
             };
-            a.post(&url).set("Content-Type", "application/json").send_string(&body)
+            a.post(&url)
+                .set("Content-Type", "application/json")
+                .send_string(&body)
         }
     };
     match resp {
@@ -348,7 +367,14 @@ fn send(t: &Target, cx: &Ctx) -> Result<u16, String> {
             let detail = r.into_string().unwrap_or_default();
             let detail = detail.trim();
             let detail: String = detail.chars().take(200).collect();
-            Err(format!("HTTP {code}{}", if detail.is_empty() { String::new() } else { format!(": {detail}") }))
+            Err(format!(
+                "HTTP {code}{}",
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                }
+            ))
         }
         // A transport error's Display starts with the whole request URL,
         // path and query included. For a Discord/ntfy/Gotify webhook that
@@ -360,7 +386,9 @@ fn send(t: &Target, cx: &Ctx) -> Result<u16, String> {
             "{}{}{}",
             t.kind(),
             t.message().map(|m| format!(": {m}")).unwrap_or_default(),
-            std::error::Error::source(&t).map(|s| format!(": {s}")).unwrap_or_default(),
+            std::error::Error::source(&t)
+                .map(|s| format!(": {s}"))
+                .unwrap_or_default(),
         )),
     }
 }
@@ -384,8 +412,16 @@ fn b64(input: &[u8]) -> String {
         let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
         out.push(T[(n >> 18 & 63) as usize] as char);
         out.push(T[(n >> 12 & 63) as usize] as char);
-        out.push(if c.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
-        out.push(if c.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+        out.push(if c.len() > 1 {
+            T[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if c.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -425,7 +461,10 @@ mod tests {
         // they land in: that is a broken request at best, and a name that
         // forges extra fields at worst.
         let out = cx().render_body(r#"{"content":"{name} finished"}"#);
-        assert_eq!(out, r#"{"content":"The Movie & Friends \"2024\" finished"}"#);
+        assert_eq!(
+            out,
+            r#"{"content":"The Movie & Friends \"2024\" finished"}"#
+        );
         serde_json::from_str::<serde_json::Value>(&out).expect("still valid JSON");
     }
 
@@ -433,15 +472,24 @@ mod tests {
     fn url_substitution_is_percent_encoded() {
         let out = cx().render_url("http://h/notify?t={name}&s={status}");
         assert!(!out.contains(' '), "spaces encoded: {out}");
-        assert!(out.contains("%26"), "the & in the name is encoded, not a new param: {out}");
-        assert!(out.ends_with("&s=Completed"), "our own separators survive: {out}");
+        assert!(
+            out.contains("%26"),
+            "the & in the name is encoded, not a new param: {out}"
+        );
+        assert!(
+            out.ends_with("&s=Completed"),
+            "our own separators survive: {out}"
+        );
     }
 
     #[test]
     fn unknown_placeholders_are_left_alone() {
         // Someone else's templating syntax passing through must not be
         // mangled into something unrecognisable.
-        assert_eq!(cx().render_body("{nope} {name}"), "{nope} The Movie & Friends \\\"2024\\\"");
+        assert_eq!(
+            cx().render_body("{nope} {name}"),
+            "{nope} The Movie & Friends \\\"2024\\\""
+        );
     }
 
     #[test]
@@ -485,8 +533,7 @@ mod tests {
     fn a_target_missing_enabled_still_fires() {
         // Round-trip from a settings.json written before the field
         // existed, and from a hand-edited one.
-        let t: Target =
-            serde_json::from_str(r#"{"kind":"kodi","url":"http://h:8080"}"#).unwrap();
+        let t: Target = serde_json::from_str(r#"{"kind":"kodi","url":"http://h:8080"}"#).unwrap();
         assert!(t.enabled);
         assert_eq!(t.kind, Kind::Kodi);
         assert!(wants(&t, &cx()));
@@ -509,8 +556,16 @@ mod tests {
 
     #[test]
     fn token_backed_kinds_refuse_to_call_without_one() {
-        assert!(send(&target(Kind::Plex), &cx()).unwrap_err().contains("token"));
-        assert!(send(&target(Kind::Jellyfin), &cx()).unwrap_err().contains("API key"));
+        assert!(
+            send(&target(Kind::Plex), &cx())
+                .unwrap_err()
+                .contains("token")
+        );
+        assert!(
+            send(&target(Kind::Jellyfin), &cx())
+                .unwrap_err()
+                .contains("API key")
+        );
     }
 
     /// Accept ONE request, hand back the raw head+body, and answer 200.
@@ -524,7 +579,9 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             use std::io::{Read, Write};
-            let Ok((mut sock, _)) = listener.accept() else { return };
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
             sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
             // Read the HEAD, then exactly Content-Length more. Responding
             // after a single read() passed when run alone and failed under
@@ -563,7 +620,8 @@ mod tests {
     }
 
     fn recv(rx: &std::sync::mpsc::Receiver<String>) -> String {
-        rx.recv_timeout(Duration::from_secs(5)).expect("server saw a request")
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("server saw a request")
     }
 
     #[test]
@@ -576,7 +634,10 @@ mod tests {
         let req = recv(&rx);
         assert!(req.starts_with("POST /jsonrpc "), "{req}");
         assert!(req.contains(r#""method":"VideoLibrary.Scan""#), "{req}");
-        assert!(req.contains("Authorization: Basic a29kaTpzZWNyZXQ="), "{req}");
+        assert!(
+            req.contains("Authorization: Basic a29kaTpzZWNyZXQ="),
+            "{req}"
+        );
     }
 
     #[test]
@@ -587,7 +648,10 @@ mod tests {
         t.token = "tok123".into();
         assert_eq!(send(&t, &cx()).unwrap(), 200);
         let req = recv(&rx);
-        assert!(req.starts_with("GET /library/sections/all/refresh "), "{req}");
+        assert!(
+            req.starts_with("GET /library/sections/all/refresh "),
+            "{req}"
+        );
         assert!(req.contains("X-Plex-Token: tok123"), "{req}");
     }
 
@@ -622,7 +686,11 @@ mod tests {
         let mut t = target(Kind::Webhook);
         t.url = url;
         assert_eq!(send(&t, &cx()).unwrap(), 200);
-        let body = recv(&rx).split("\r\n\r\n").nth(1).unwrap_or_default().to_string();
+        let body = recv(&rx)
+            .split("\r\n\r\n")
+            .nth(1)
+            .unwrap_or_default()
+            .to_string();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["name"], "The Movie & Friends \"2024\"");
         assert_eq!(v["id"], "abc123");
@@ -653,7 +721,10 @@ mod tests {
         assert!(!e.contains("webhooks"), "path leaked: {e}");
         assert!(!e.contains("127.0.0.1"), "host leaked from the URL: {e}");
         // Still worth reading: it must say what went wrong.
-        assert!(e.to_lowercase().contains("refused") || e.to_lowercase().contains("connect"), "{e}");
+        assert!(
+            e.to_lowercase().contains("refused") || e.to_lowercase().contains("connect"),
+            "{e}"
+        );
     }
 
     #[test]
@@ -662,7 +733,10 @@ mod tests {
         t.url = "discord.com/api/webhooks/12345/SUPERSECRETTOKEN".into();
         let e = send(&t, &cx()).unwrap_err();
         assert!(e.contains("http://"), "still says what is wanted: {e}");
-        assert!(!e.contains("SUPERSECRETTOKEN"), "the typed URL is a secret too: {e}");
+        assert!(
+            !e.contains("SUPERSECRETTOKEN"),
+            "the typed URL is a secret too: {e}"
+        );
     }
 
     #[test]
@@ -674,8 +748,14 @@ mod tests {
         let mut c = cx();
         c.name = "Some.Release.{dir}.{error}".into();
         let out = c.render_body(r#"{"text":"{name}"}"#);
-        assert!(out.contains("{dir}"), "the name's braces survive verbatim: {out}");
-        assert!(!out.contains("/downloads"), "the download path leaked: {out}");
+        assert!(
+            out.contains("{dir}"),
+            "the name's braces survive verbatim: {out}"
+        );
+        assert!(
+            !out.contains("/downloads"),
+            "the download path leaked: {out}"
+        );
         let v: serde_json::Value = serde_json::from_str(&out).expect("still valid JSON");
         assert_eq!(v["text"], "Some.Release.{dir}.{error}");
     }
@@ -684,7 +764,11 @@ mod tests {
     fn basic_auth_encodes_the_kodi_default() {
         // Kodi's out-of-the-box user with a blank password.
         assert_eq!(basic_auth("kodi:"), Some("Basic a29kaTo=".into()));
-        assert_eq!(basic_auth(""), None, "no token = no header, not an empty one");
+        assert_eq!(
+            basic_auth(""),
+            None,
+            "no token = no header, not an empty one"
+        );
         assert_eq!(b64(b"a"), "YQ==");
         assert_eq!(b64(b"ab"), "YWI=");
         assert_eq!(b64(b"abc"), "YWJj");

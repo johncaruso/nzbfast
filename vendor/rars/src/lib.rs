@@ -513,6 +513,31 @@ impl Archive {
         }
     }
 
+    /// [`Self::repair_recovery_to_file`] for a caller that owns the
+    /// destination path. For a RAR5 archive opened from a file this lets
+    /// the initial whole-volume copy become a filesystem clone (APFS,
+    /// btrfs/XFS reflink) instead of a full read+write; other families and
+    /// source shapes behave exactly like the file form.
+    pub fn repair_recovery_to_path(
+        &self,
+        dest: &std::path::Path,
+        password: Option<&[u8]>,
+        budget: u64,
+    ) -> Result<Vec<usize>> {
+        match self {
+            Self::Rar50Plus(archive) => archive.repair_recovery_to_path(dest, password, budget),
+            _ => {
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .read(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(dest)?;
+                self.repair_recovery_to_file(&mut file, password, budget)
+            }
+        }
+    }
+
     /// Returns the concrete RAR 1.3/1.4 archive when this archive has that family.
     pub fn as_rar13(&self) -> Option<&rar13::Archive> {
         match self {
@@ -769,9 +794,9 @@ impl ArchiveReader {
     /// frontier instead of failing; the source's abort path unblocks them
     /// with an error (see [`BlockingRangeSource`]).
     ///
-    /// Streaming sources are supported for the RAR 5 family only, and the
-    /// signature must sit at offset 0 (no SFX stub scan). Earlier families
-    /// fail with a clean unsupported-feature error.
+    /// Streaming sources are supported for the RAR 5 and RAR 1.5-4.x
+    /// families, and the signature must sit at offset 0 (no SFX stub
+    /// scan). RAR 1.3/1.4 fails with a clean unsupported-feature error.
     pub fn read_stream(
         source: std::sync::Arc<dyn BlockingRangeSource>,
         expected_len: u64,
@@ -791,12 +816,15 @@ impl ArchiveReader {
                 expected_len,
                 options,
             )?)),
-            family @ (ArchiveFamily::Rar13 | ArchiveFamily::Rar15To40) => {
-                Err(Error::UnsupportedFamilyFeature {
-                    family,
-                    feature: "streaming archive source",
-                })
-            }
+            ArchiveFamily::Rar15To40 => Ok(Archive::Rar15To40(rar15_40::Archive::parse_stream(
+                source,
+                expected_len,
+                options,
+            )?)),
+            family @ ArchiveFamily::Rar13 => Err(Error::UnsupportedFamilyFeature {
+                family,
+                feature: "streaming archive source",
+            }),
         }
     }
 }
@@ -2367,6 +2395,685 @@ mod tests {
         let extracted = collect_rar15_40_volumes(&archives, None).unwrap();
         assert_eq!(extracted[0].name, b"split-rar29.txt");
         assert_eq!(extracted[0].data, data);
+    }
+
+    #[test]
+    fn rar15_40_parse_stream_matches_the_seekable_parse() {
+        let mut seed = 0x2545f4914f6cdd1du64;
+        let data: Vec<u8> = (0..48_000)
+            .map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (seed >> 33) as u8
+            })
+            .collect();
+        let parts = rar15_40::write_compressed_volumes(
+            rar15_40::FileEntry {
+                name: b"stream.bin",
+                data: &data,
+                file_time: 0,
+                file_attr: 0x20,
+                host_os: 3,
+                password: None,
+                file_comment: None,
+            },
+            rar15_options(ArchiveVersion::Rar29),
+            16_000,
+        )
+        .unwrap();
+        assert!(parts.len() >= 2, "the set must actually split");
+        for part in &parts {
+            let seekable = rar15_40::Archive::parse(part).unwrap();
+            let buffer = std::sync::Arc::new(GrowableBuffer::with_total_len(part.len() as u64));
+            buffer.append(part);
+            let streamed = rar15_40::Archive::parse_stream(
+                buffer,
+                part.len() as u64,
+                ArchiveReadOptions::default(),
+            )
+            .unwrap();
+            let seekable_files: Vec<_> = seekable.files().collect();
+            let streamed_files: Vec<_> = streamed.files().collect();
+            assert_eq!(seekable_files, streamed_files);
+        }
+    }
+
+    #[test]
+    fn rar15_40_volume_sequence_extracts_a_streamed_compressed_set() {
+        // Splits force the sequence driver through the cross-volume split
+        // machinery; the feeder thread trickles bytes so the parse and the
+        // member reads genuinely BLOCK at the arrival frontier.
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let data: Vec<u8> = (0..96_000)
+            .map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (seed >> 33) as u8
+            })
+            .collect();
+        let parts = rar15_40::write_compressed_volumes(
+            rar15_40::FileEntry {
+                name: b"seq.bin",
+                data: &data,
+                file_time: 0,
+                file_attr: 0x20,
+                host_os: 3,
+                password: None,
+                file_comment: None,
+            },
+            rar15_options(ArchiveVersion::Rar29),
+            24_000,
+        )
+        .unwrap();
+        assert!(parts.len() >= 3, "the set must split across volumes");
+
+        let reference_archives: Vec<_> = parts
+            .iter()
+            .map(|part| rar15_40::Archive::parse(part).unwrap())
+            .collect();
+        let reference = collect_rar15_40_volumes(&reference_archives, None).unwrap();
+        assert_eq!(reference.len(), 1);
+        assert_eq!(reference[0].data, data);
+
+        let entries = RefCell::new(Vec::new());
+        let parts_ref = &parts;
+        let mut feeders: Vec<std::thread::JoinHandle<()>> = Vec::new();
+        rar15_40::extract_volume_sequence_to(
+            |index| {
+                if index >= parts_ref.len() {
+                    return Ok(None);
+                }
+                let part = parts_ref[index].clone();
+                let buffer = std::sync::Arc::new(GrowableBuffer::with_total_len(part.len() as u64));
+                let feed = std::sync::Arc::clone(&buffer);
+                feeders.push(std::thread::spawn(move || {
+                    for chunk in part.chunks(97) {
+                        feed.append(chunk);
+                        std::thread::yield_now();
+                    }
+                }));
+                Ok(Some(rar15_40::Archive::parse_stream(
+                    buffer,
+                    parts_ref[index].len() as u64,
+                    ArchiveReadOptions::default(),
+                )?))
+            },
+            read_options(None),
+            |meta| {
+                let data = Rc::new(RefCell::new(Vec::new()));
+                entries.borrow_mut().push((meta.clone(), Rc::clone(&data)));
+                Ok(Box::new(CollectWriter { data }))
+            },
+        )
+        .unwrap();
+        for feeder in feeders {
+            feeder.join().unwrap();
+        }
+
+        let streamed = entries.into_inner();
+        assert_eq!(streamed.len(), reference.len());
+        assert_eq!(streamed[0].0.name, reference[0].name);
+        assert_eq!(*streamed[0].1.borrow(), reference[0].data);
+    }
+
+    /// [`rar50_sequence_collect`] for the RAR 1.5-4.x twin.
+    fn rar15_40_sequence_collect(
+        parts: &[Vec<u8>],
+        password: Option<&[u8]>,
+    ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Vec<(usize, u64)>)> {
+        let entries = RefCell::new(Vec::new());
+        let reports = std::sync::Mutex::new(Vec::new());
+        let mut feeders: Vec<std::thread::JoinHandle<()>> = Vec::new();
+        let parts_ref = parts;
+        let result = rar15_40::extract_volume_sequence_to_with_progress(
+            |index| {
+                if index >= parts_ref.len() {
+                    return Ok(None);
+                }
+                let part = parts_ref[index].clone();
+                let buffer = std::sync::Arc::new(GrowableBuffer::with_total_len(part.len() as u64));
+                let feed = std::sync::Arc::clone(&buffer);
+                feeders.push(std::thread::spawn(move || {
+                    for chunk in part.chunks(97) {
+                        feed.append(chunk);
+                        std::thread::yield_now();
+                    }
+                }));
+                rar15_40::Archive::parse_stream(
+                    buffer,
+                    parts_ref[index].len() as u64,
+                    ArchiveReadOptions::with_optional_password(password),
+                )
+                .map(Some)
+            },
+            read_options(password),
+            |meta| {
+                let data = Rc::new(RefCell::new(Vec::new()));
+                entries
+                    .borrow_mut()
+                    .push((meta.name.clone(), Rc::clone(&data)));
+                Ok(Box::new(CollectWriter { data }))
+            },
+            |index, offset| reports.lock().unwrap().push((index, offset)),
+        );
+        for feeder in feeders {
+            feeder.join().unwrap();
+        }
+        result?;
+        Ok((
+            entries
+                .into_inner()
+                .into_iter()
+                .map(|(name, data)| (name, data.borrow().clone()))
+                .collect(),
+            reports.into_inner().unwrap(),
+        ))
+    }
+
+    /// The RAR4 twin of
+    /// [`rar50_volume_sequence_incremental_split_matches_the_whole_set_walk`]
+    /// over the WinRAR 3.00 fixtures - compressed, encrypted and stored
+    /// split sets, both volume naming schemes.
+    #[test]
+    fn rar15_40_volume_sequence_incremental_split_matches_the_whole_set_walk() {
+        let shapes: [(&[&str], Option<&[u8]>); 4] = [
+            (
+                &[
+                    "rar300/compressed_multivol_prng_rar300.rar",
+                    "rar300/compressed_multivol_prng_rar300.r00",
+                    "rar300/compressed_multivol_prng_rar300.r01",
+                    "rar300/compressed_multivol_prng_rar300.r02",
+                    "rar300/compressed_multivol_prng_rar300.r03",
+                ],
+                None,
+            ),
+            (
+                &[
+                    "rar300/multivol_newnaming_rar300.part01.rar",
+                    "rar300/multivol_newnaming_rar300.part02.rar",
+                ],
+                None,
+            ),
+            (
+                &[
+                    "rar300/multivol_oldnaming_rar300.rar",
+                    "rar300/multivol_oldnaming_rar300.r00",
+                ],
+                None,
+            ),
+            (
+                &[
+                    "rar300/stored_multivol_rar300.rar",
+                    "rar300/stored_multivol_rar300.r00",
+                    "rar300/stored_multivol_rar300.r01",
+                    "rar300/stored_multivol_rar300.r02",
+                ],
+                None,
+            ),
+        ];
+        for (names, password) in shapes {
+            let parts: Vec<Vec<u8>> = names
+                .iter()
+                .map(|name| std::fs::read(rar15_40_fixture(name)).unwrap())
+                .collect();
+            let archives: Vec<_> = parts
+                .iter()
+                .map(|part| rar15_40::Archive::parse(part).unwrap())
+                .collect();
+            let reference = collect_rar15_40_volumes(&archives, password).unwrap();
+            let (streamed, reports) = rar15_40_sequence_collect(&parts, password).unwrap();
+
+            assert_eq!(streamed.len(), reference.len(), "{names:?}");
+            for (got, want) in streamed.iter().zip(&reference) {
+                assert_eq!(got.0, want.name, "{names:?}");
+                assert_eq!(got.1, want.data, "{names:?}");
+            }
+            assert_eq!(
+                watermarks_of(&reports, parts.len()),
+                vec![u64::MAX; parts.len()],
+                "{names:?}: {reports:?}"
+            );
+        }
+    }
+
+    /// The RAR4 twin of the two structural pins: the split sink opens at
+    /// the START fragment, and the chain publishes mid-volume progress
+    /// while it is still reading.
+    #[test]
+    fn rar15_40_volume_sequence_decodes_a_split_member_incrementally() {
+        let names = [
+            "rar300/compressed_multivol_prng_rar300.rar",
+            "rar300/compressed_multivol_prng_rar300.r00",
+            "rar300/compressed_multivol_prng_rar300.r01",
+            "rar300/compressed_multivol_prng_rar300.r02",
+            "rar300/compressed_multivol_prng_rar300.r03",
+        ];
+        let parts: Vec<Vec<u8>> = names
+            .iter()
+            .map(|name| std::fs::read(rar15_40_fixture(name)).unwrap())
+            .collect();
+
+        let (_, reports) = rar15_40_sequence_collect(&parts, None).unwrap();
+        assert!(
+            reports
+                .iter()
+                .any(|&(_, offset)| offset > 0 && offset != u64::MAX),
+            "no partial watermark anywhere: {reports:?}"
+        );
+        let mut seen: std::collections::BTreeMap<usize, u64> = std::collections::BTreeMap::new();
+        for &(index, offset) in &reports {
+            let previous = seen.entry(index).or_insert(0);
+            assert!(
+                offset >= *previous,
+                "volume {index} watermark went backwards ({previous} -> {offset}): {reports:?}"
+            );
+            *previous = offset;
+        }
+
+        #[derive(Debug, PartialEq, Eq)]
+        enum Event {
+            Volume(usize),
+            Open,
+        }
+        let log = std::sync::Mutex::new(Vec::new());
+        let parts_ref = &parts;
+        rar15_40::extract_volume_sequence_to(
+            |index| {
+                log.lock().unwrap().push(Event::Volume(index));
+                if index >= parts_ref.len() {
+                    return Ok(None);
+                }
+                rar15_40::Archive::parse(&parts_ref[index]).map(Some)
+            },
+            read_options(None),
+            |_| {
+                log.lock().unwrap().push(Event::Open);
+                Ok(Box::new(std::io::sink()) as Box<dyn std::io::Write>)
+            },
+        )
+        .unwrap();
+        let log = log.into_inner().unwrap();
+        let opened = log.iter().position(|e| *e == Event::Open).expect("opened");
+        let second = log
+            .iter()
+            .position(|e| *e == Event::Volume(1))
+            .expect("pulled volume 1");
+        assert!(
+            opened < second,
+            "the split sink opened only after the set was pulled: {log:?}"
+        );
+    }
+
+    /// The RAR4 twin of the broken-chain pin.
+    #[test]
+    fn rar15_40_volume_sequence_incremental_split_rejects_a_broken_chain() {
+        let read = |name: &str| std::fs::read(rar15_40_fixture(name)).unwrap();
+
+        let renamed = vec![
+            read("rar300/compressed_multivol_prng_rar300.rar"),
+            read("rar300/multivol_oldnaming_rar300.r00"),
+        ];
+        let error = rar15_40_sequence_collect(&renamed, None).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::InvalidHeader("RAR 1.5 split entry name changed")
+            ),
+            "{error:?}"
+        );
+
+        let truncated = vec![
+            read("rar300/compressed_multivol_prng_rar300.rar"),
+            read("rar300/compressed_multivol_prng_rar300.r00"),
+        ];
+        let error = rar15_40_sequence_collect(&truncated, None).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::InvalidHeader("RAR 1.5 split entry is incomplete")
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// Drive a RAR 5 volume set through the sequence extractor, trickling
+    /// every volume's bytes through a `GrowableBuffer` so the header parse
+    /// AND every payload read genuinely block at the arrival frontier -
+    /// which is what makes the incremental split path do its real job.
+    /// Returns the entries in open() order plus every consumption report
+    /// the engine published, in order.
+    fn rar50_sequence_collect(
+        parts: &[Vec<u8>],
+        password: Option<&[u8]>,
+    ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Vec<(usize, u64)>)> {
+        let entries = RefCell::new(Vec::new());
+        let reports = std::sync::Mutex::new(Vec::new());
+        let mut feeders: Vec<std::thread::JoinHandle<()>> = Vec::new();
+        let parts_ref = parts;
+        let result = rar50::extract_volume_sequence_to_with_progress(
+            |index| {
+                if index >= parts_ref.len() {
+                    return Ok(None);
+                }
+                let part = parts_ref[index].clone();
+                let buffer = std::sync::Arc::new(GrowableBuffer::with_total_len(part.len() as u64));
+                let feed = std::sync::Arc::clone(&buffer);
+                feeders.push(std::thread::spawn(move || {
+                    for chunk in part.chunks(97) {
+                        feed.append(chunk);
+                        std::thread::yield_now();
+                    }
+                }));
+                rar50::Archive::parse_stream(
+                    buffer,
+                    parts_ref[index].len() as u64,
+                    ArchiveReadOptions::with_optional_password(password),
+                )
+                .map(Some)
+            },
+            read_options(password),
+            |meta| {
+                let data = Rc::new(RefCell::new(Vec::new()));
+                entries
+                    .borrow_mut()
+                    .push((meta.name.clone(), Rc::clone(&data)));
+                Ok(Box::new(CollectWriter { data }))
+            },
+            |index, offset| reports.lock().unwrap().push((index, offset)),
+        );
+        for feeder in feeders {
+            feeder.join().unwrap();
+        }
+        result?;
+        Ok((
+            entries
+                .into_inner()
+                .into_iter()
+                .map(|(name, data)| (name, data.borrow().clone()))
+                .collect(),
+            reports.into_inner().unwrap(),
+        ))
+    }
+
+    /// Compressible-but-not-trivial bytes. Straight LCG noise is
+    /// incompressible, and the volume writer STORES a member it cannot
+    /// shrink - which would quietly take these tests off the compressed
+    /// split path they exist to cover.
+    fn deterministic_squashable(len: usize) -> Vec<u8> {
+        deterministic_noise(len)
+            .into_iter()
+            .enumerate()
+            .map(|(index, byte)| if index % 3 == 0 { byte } else { 0 })
+            .collect()
+    }
+
+    /// Highest offset reported for each volume of a `parts.len()` set.
+    fn watermarks_of(reports: &[(usize, u64)], volumes: usize) -> Vec<u64> {
+        let mut marks = vec![0u64; volumes];
+        for &(index, offset) in reports {
+            if let Some(mark) = marks.get_mut(index) {
+                *mark = (*mark).max(offset);
+            }
+        }
+        marks
+    }
+
+    /// The incremental split decode has to land the same bytes as the
+    /// whole-set walk on every shape a chased set can carry - and the
+    /// WinRAR-made fixtures are the oracle for all four.
+    ///
+    /// Under `cfg(test)` the buffered decode limit is 1 KB, so every one
+    /// of these compressed members takes the incremental path.
+    #[test]
+    fn rar50_volume_sequence_incremental_split_matches_the_whole_set_walk() {
+        let shapes: [(&[&str], Option<&[u8]>); 4] = [
+            (
+                &["multivol.part1.rar", "multivol.part2.rar", "multivol.part3.rar"],
+                None,
+            ),
+            (
+                &[
+                    "solid_multivol.part01.rar",
+                    "solid_multivol.part02.rar",
+                    "solid_multivol.part03.rar",
+                    "solid_multivol.part04.rar",
+                    "solid_multivol.part05.rar",
+                    "solid_multivol.part06.rar",
+                ],
+                None,
+            ),
+            (
+                &[
+                    "encrypted_multivol.part1.rar",
+                    "encrypted_multivol.part2.rar",
+                    "encrypted_multivol.part3.rar",
+                ],
+                Some(b"password"),
+            ),
+            (
+                &[
+                    "stored_multivol.part1.rar",
+                    "stored_multivol.part2.rar",
+                    "stored_multivol.part3.rar",
+                ],
+                None,
+            ),
+        ];
+        for (names, password) in shapes {
+            let parts: Vec<Vec<u8>> = names
+                .iter()
+                .map(|name| std::fs::read(rar50_fixture(name)).unwrap())
+                .collect();
+            let archives: Vec<_> = parts
+                .iter()
+                .map(|part| rar50::Archive::parse_with_password(part, password).unwrap())
+                .collect();
+            let reference = collect_rar50_volumes(&archives, password).unwrap();
+            let (streamed, _) = rar50_sequence_collect(&parts, password).unwrap();
+
+            assert_eq!(streamed.len(), reference.len(), "{names:?}");
+            for (got, want) in streamed.iter().zip(&reference) {
+                assert_eq!(got.0, want.name, "{names:?}");
+                assert_eq!(got.1, want.data, "{names:?}");
+            }
+        }
+    }
+
+    /// The drop-behind contract, which is the whole point of the
+    /// incremental split: as the chain moves off a volume it says so,
+    /// and while it is still reading one it reports a byte offset inside
+    /// that volume rather than "all of it". Nothing downstream may
+    /// release bytes it has not been told about.
+    #[test]
+    fn rar50_volume_sequence_reports_volumes_consumed_behind_the_decode() {
+        // Six volumes of a WinRAR-made solid set: enough fragments that
+        // the decoder is producing output long before the chain reaches
+        // the last one, which is when partial watermarks appear.
+        let names = [
+            "solid_multivol.part01.rar",
+            "solid_multivol.part02.rar",
+            "solid_multivol.part03.rar",
+            "solid_multivol.part04.rar",
+            "solid_multivol.part05.rar",
+            "solid_multivol.part06.rar",
+        ];
+        let parts: Vec<Vec<u8>> = names
+            .iter()
+            .map(|name| std::fs::read(rar50_fixture(name)).unwrap())
+            .collect();
+        let (_, reports) = rar50_sequence_collect(&parts, None).unwrap();
+
+        // Mid-fragment progress: only the growing chain publishes a
+        // watermark that is neither zero nor "the whole volume", so this
+        // is what proves the member decoded incrementally rather than at
+        // its Finish fragment. (The walk only ever says `u64::MAX`.)
+        assert!(
+            reports
+                .iter()
+                .any(|&(_, offset)| offset > 0 && offset != u64::MAX),
+            "no partial watermark anywhere: {reports:?}"
+        );
+        // Per volume the watermark only ever moves forward - a caller
+        // acting on it releases bytes, so a report that went backwards
+        // would be a promise broken after the fact.
+        let mut seen: std::collections::BTreeMap<usize, u64> = std::collections::BTreeMap::new();
+        for &(index, offset) in &reports {
+            let previous = seen.entry(index).or_insert(0);
+            assert!(
+                offset >= *previous,
+                "volume {index} watermark went backwards ({previous} -> {offset}): {reports:?}"
+            );
+            *previous = offset;
+        }
+        // And every volume ends up wholly consumed - the last one once
+        // the driver has walked it out, which is why the WALK reports it
+        // rather than the chain.
+        assert_eq!(
+            watermarks_of(&reports, parts.len()),
+            vec![u64::MAX; parts.len()],
+            "{reports:?}"
+        );
+    }
+
+    /// The structural claim the whole feature rests on: the sink for a
+    /// split member opens at its START fragment, so decoding begins while
+    /// the later volumes are still arriving. The old walk opened it at
+    /// the FINISH fragment, after every volume had been pulled and
+    /// retained.
+    #[test]
+    fn rar50_volume_sequence_opens_the_split_sink_before_pulling_the_next_volume() {
+        let parts: Vec<Vec<u8>> = [
+            "multivol.part1.rar",
+            "multivol.part2.rar",
+            "multivol.part3.rar",
+        ]
+        .iter()
+        .map(|name| std::fs::read(rar50_fixture(name)).unwrap())
+        .collect();
+
+        #[derive(Debug, PartialEq, Eq)]
+        enum Event {
+            Volume(usize),
+            Open,
+        }
+        let log = std::sync::Mutex::new(Vec::new());
+        let parts_ref = &parts;
+        rar50::extract_volume_sequence_to(
+            |index| {
+                log.lock().unwrap().push(Event::Volume(index));
+                if index >= parts_ref.len() {
+                    return Ok(None);
+                }
+                rar50::Archive::parse(&parts_ref[index]).map(Some)
+            },
+            read_options(None),
+            |_| {
+                log.lock().unwrap().push(Event::Open);
+                Ok(Box::new(std::io::sink()) as Box<dyn std::io::Write>)
+            },
+        )
+        .unwrap();
+
+        let log = log.into_inner().unwrap();
+        let opened = log.iter().position(|e| *e == Event::Open).expect("opened");
+        let second = log
+            .iter()
+            .position(|e| *e == Event::Volume(1))
+            .expect("pulled volume 1");
+        assert!(
+            opened < second,
+            "the split sink opened only after the set was pulled: {log:?}"
+        );
+    }
+
+    /// A member split across a set the chain drives to the very end while
+    /// a LATER member sits behind it in the finishing volume: the walk has
+    /// to resume inside that volume, not skip to the next one.
+    #[test]
+    fn rar50_volume_sequence_resumes_the_finishing_volume_after_a_split() {
+        let payload = deterministic_squashable(40_000);
+        let tail = deterministic_squashable(3_000);
+        let entries = [
+            rar50::CompressedEntry {
+                name: b"split.bin",
+                data: &payload,
+                mtime: None,
+                attributes: 0x20,
+                host_os: 3,
+            },
+            rar50::CompressedEntry {
+                name: b"after.bin",
+                data: &tail,
+                mtime: None,
+                attributes: 0x20,
+                host_os: 3,
+            },
+        ];
+        let parts = rar50::Rar50VolumeWriter::new(rar50_options(ArchiveVersion::Rar50))
+            .compressed_entries(&entries)
+        .max_payload_per_volume(9_000)
+        .finish()
+        .unwrap();
+        assert!(parts.len() >= 3, "the set must split across volumes");
+
+        let archives: Vec<_> = parts
+            .iter()
+            .map(|part| rar50::Archive::parse(part).unwrap())
+            .collect();
+        let reference = collect_rar50_volumes(&archives, None).unwrap();
+        let (streamed, reports) = rar50_sequence_collect(&parts, None).unwrap();
+
+        assert_eq!(streamed.len(), 2);
+        assert_eq!(streamed[0].0, b"split.bin");
+        assert_eq!(streamed[0].1, payload);
+        assert_eq!(streamed[1].0, b"after.bin");
+        assert_eq!(streamed[1].1, tail);
+        assert_eq!(streamed.len(), reference.len());
+        assert_eq!(
+            watermarks_of(&reports, parts.len()),
+            vec![u64::MAX; parts.len()]
+        );
+    }
+
+    /// A continuation that disagrees with the Start fragment must abort
+    /// the decode with the SAME error the whole-set walk raises, even
+    /// though the incremental path has already emitted bytes by then -
+    /// and a set that simply ends early must say so, not hang or claim
+    /// success.
+    #[test]
+    fn rar50_volume_sequence_incremental_split_rejects_a_broken_chain() {
+        let read = |name: &str| std::fs::read(rar50_fixture(name)).unwrap();
+
+        // A continuation belonging to a DIFFERENT member: every header is
+        // well formed and CRC-valid, the chain is not.
+        let renamed = vec![
+            read("multivol.part1.rar"),
+            read("solid_multivol.part02.rar"),
+        ];
+        let error = rar50_sequence_collect(&renamed, None).unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidHeader("RAR 5 split entry name changed")),
+            "{error:?}"
+        );
+
+        // The set ends before the finish fragment - the chase's "bytes
+        // never arrived" shape. The whole-set walk answers the same way.
+        let truncated = vec![read("multivol.part1.rar"), read("multivol.part2.rar")];
+        let error = rar50_sequence_collect(&truncated, None).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::InvalidHeader("RAR 5 split entry is incomplete")
+            ),
+            "{error:?}"
+        );
+        let archives: Vec<_> = truncated
+            .iter()
+            .map(|part| rar50::Archive::parse(part).unwrap())
+            .collect();
+        let walk = collect_rar50_volumes(&archives, None).unwrap_err();
+        assert!(
+            matches!(walk, Error::InvalidHeader("RAR 5 split entry is incomplete")),
+            "{walk:?}"
+        );
     }
 
     #[test]

@@ -8,7 +8,19 @@
 use std::time::Instant;
 
 fn main() {
-    let dir = std::env::args().nth(1).expect("usage: par2_repair_dir <dir>");
+    // nzbkit emits its timing lines as tracing events; an example binary
+    // has to install a sink or NZBFAST_REPAIR_TIMING prints nothing.
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        // Keep the target: it is the `repair-timing` / `fold-trace`
+        // key these lines have always been grepped by.
+        .with_target(true)
+        .with_writer(std::io::stderr)
+        .init();
+    let dir = std::env::args()
+        .nth(1)
+        .expect("usage: par2_repair_dir <dir>");
     // The daemon does this at startup (crates/nzbfast/src/main.rs), and a
     // bench driver that skips it measures the Windows scheduler instead of the
     // repair path: execution-speed throttling demotes sustained "background"
@@ -30,13 +42,20 @@ fn main() {
     nzbkit::par2repair::set_fast_par_enabled(true);
     let t0 = Instant::now();
     let status = nzbkit::par2repair::repair_dir(std::path::Path::new(&dir));
-    println!("total {:.3?}  status: {:?}", t0.elapsed(), status.map(|s| match s {
-        nzbkit::par2repair::RepairStatus::NoDamage => "NoDamage".to_string(),
-        nzbkit::par2repair::RepairStatus::Repaired(r) => {
-            format!("Repaired rebuilt={} adopted={}", r.blocks_rebuilt, r.blocks_adopted)
-        }
-        nzbkit::par2repair::RepairStatus::Unrepairable { needed, have } => {
-            format!("Unrepairable needed={needed} have={have}")
-        }
-    }));
+    println!(
+        "total {:.3?}  status: {:?}",
+        t0.elapsed(),
+        status.map(|s| match s {
+            nzbkit::par2repair::RepairStatus::NoDamage => "NoDamage".to_string(),
+            nzbkit::par2repair::RepairStatus::Repaired(r) => {
+                format!(
+                    "Repaired rebuilt={} adopted={}",
+                    r.blocks_rebuilt, r.blocks_adopted
+                )
+            }
+            nzbkit::par2repair::RepairStatus::Unrepairable { needed, have } => {
+                format!("Unrepairable needed={needed} have={have}")
+            }
+        })
+    );
 }

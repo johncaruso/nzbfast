@@ -1,0 +1,1715 @@
+use super::super::*;
+use super::ApiCtx;
+
+/// Correlation hints for a page of rows, keyed by release id. One
+/// read-lock pass; an unavailable index is an empty map, exactly like
+/// every other decoration on these pages.
+fn corr_hints(
+    d: &Arc<Daemon>,
+    ids: impl Iterator<Item = i64>,
+) -> std::collections::HashMap<i64, Value> {
+    let ids: Vec<i64> = ids.collect();
+    if ids.is_empty() {
+        return Default::default();
+    }
+    d.with_index_read(|ix| ix.pre_hints(&ids).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(id, name, score, delta, ratio, status)| {
+            (
+                id,
+                json!({
+                    "name": name, "score": score, "delta": delta,
+                    "ratio": ratio as f64 / 1000.0, "status": status,
+                }),
+            )
+        })
+        .collect()
+}
+
+pub(in crate::serve) fn dispatch(
+    d: &Arc<Daemon>,
+    _req: &mut tiny_http::Request,
+    params: &std::collections::HashMap<String, String>,
+    mode: &str,
+    ctx: &ApiCtx<'_>,
+    _api_body: &mut Option<Vec<u8>>,
+) -> Option<Value> {
+    Some(match mode {
+        // Browse-card status: is indexing on, and how big is it?
+        "index_stats" => {
+            // Never blocks: served from a try_lock + cache, so
+            // this poll cannot park an HTTP worker behind a long
+            // scan batch (the 28 Jul all-workers-wedged hang).
+            let (total, complete, db_bytes, live_bytes) = d.index_stats_snapshot();
+            // Several groups can scan at once (M28): report the
+            // set joined + headers summed (dashboard shows one
+            // status line either way).
+            let (scanning, sgroup, sdone) = {
+                let ps = d.scan_progress.lock_ok();
+                (
+                    !ps.is_empty(),
+                    ps.iter()
+                        .map(|p| p.group.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    ps.iter()
+                        .map(|p| p.done.load(Ordering::Relaxed))
+                        .sum::<u64>(),
+                )
+            };
+            // "" when running. An index that has silently stopped
+            // growing is otherwise unexplainable from the UI, and
+            // the two causes need opposite actions from the user.
+            let paused = d.indexing_pause_reason().unwrap_or("");
+            // M34: how big has it actually grown? Until now
+            // nothing in the API answered that, so a user could
+            // not see the database filling their disk, let alone
+            // judge what to cap it at. db_bytes is the engine's
+            // page-accounted size; file_bytes is what the volume
+            // sees - they diverge after a prune, until the
+            // deferred compact returns the free pages.
+            //
+            // live_bytes is the third figure and the one the CAP
+            // is held against: db_bytes minus the freelist, i.e.
+            // the size the file would have if it were compacted
+            // right now. The gap between it and db_bytes is
+            // exactly what a pending compact would hand back, so
+            // the dashboard shows db_bytes as "the file" and
+            // quotes live_bytes as what it will become.
+            let file_bytes = std::fs::metadata(&d.index_db).map(|m| m.len()).unwrap_or(0);
+            let cap = d.index_max_bytes.load(Ordering::Relaxed);
+            json!({
+                // The master switch, separate from `paused`: the
+                // dashboard hides the whole indexer half of the
+                // UI on this rather than rendering it empty, and
+                // it must not need the settings block to do it.
+                "enabled": !d.indexer_off(),
+                "paused": paused,
+                "releases": total,
+                "complete": complete,
+                "groups": d.index_groups.lock_ok().clone(),
+                "interval_secs": d.index_interval_secs.load(Ordering::Relaxed),
+                "scanning": scanning,
+                "group": sgroup,
+                "headers_done": sdone,
+                "db_bytes": db_bytes,
+                "live_bytes": live_bytes,
+                "file_bytes": file_bytes,
+                "index_max_bytes": cap,
+                // Same quantity evict_pass tests, so the badge and
+                // the daemon can never disagree about whether the
+                // index is over its limit.
+                "over_cap": cap > 0 && live_bytes > cap,
+                "index_evict": d.index_evict.load(Ordering::Relaxed),
+                "index_evict_order": d.index_evict_order.lock_ok().clone(),
+                "index_evict_kinds": d.index_evict_kinds.lock_ok().clone(),
+                "compact_pending": d.compact_pending.load(Ordering::Relaxed),
+            })
+        }
+        // The pre feed's own readout. Its own action rather than
+        // three more columns on index_stats: that one is polled
+        // every few seconds by every open dashboard, and this is
+        // read when a settings card is looking at it.
+        //
+        // with_index_read, never a blocking lock on the shared
+        // handle - a settings poll must not park an HTTP worker
+        // behind a scan batch (the 28 Jul all-workers-wedged
+        // hang), and "not right now" is a perfectly good answer
+        // for a counter.
+        "predb_stats" => {
+            let counts = d.with_index_read(|ix| {
+                let (lines, nameable) = ix.predb_stats().ok()?;
+                Some((lines, nameable, ix.predb_named_count().unwrap_or(0)))
+            });
+            json!({
+                "enabled": d.predb_enabled.load(Ordering::Relaxed),
+                // Both switches are needed; the UI says which one
+                // is missing rather than showing a feed that
+                // silently does nothing.
+                "index_enabled": d.index_enabled.load(Ordering::Relaxed),
+                "server": d.predb_server.lock_ok().clone(),
+                "channels": d.predb_channels.lock_ok().clone(),
+                "status": d.predb_status.lock_ok().clone(),
+                "pending": d.predb_pending.lock_ok().len(),
+                "lines": counts.map(|c| c.0),
+                "nameable": counts.map(|c| c.1),
+                "named": counts.map(|c| c.2),
+                // Phase 2 correlation: switches, the precision meter
+                // (confirmed:rejected is the number that earns or
+                // loses the auto tier), and the seed importer's state.
+                "corr_enabled": d.predb_corr_enabled.load(Ordering::Relaxed),
+                "corr_auto": d.predb_corr_auto.load(Ordering::Relaxed),
+                "corr": d.with_index_read(|ix| ix.predb_corr_stats().ok())
+                    .map(|counts| {
+                        counts.into_iter()
+                            .map(|(k, v)| (k, json!(v)))
+                            .collect::<serde_json::Map<String, Value>>()
+                    }),
+                "seed_running": d.predb_seed_running.load(Ordering::Relaxed),
+                "seed_status": d.predb_seed_status.lock_ok().clone(),
+            })
+        }
+        // Phase 2: the ranked candidate list for one release (the
+        // pick-a-name view). Read-only and on demand.
+        "pre_candidates" => {
+            let id = params.get("id").and_then(|v| v.parse::<i64>().ok())?;
+            let cands = d
+                .with_index_read(|ix| ix.pre_candidates(id, 8).ok())
+                .unwrap_or_default();
+            json!({"candidates": cands.into_iter().map(
+                |(pid, name, score, delta, ratio, nuked, source)| json!({
+                    "predb_id": pid, "name": name, "score": score,
+                    "delta": delta, "ratio": ratio as f64 / 1000.0,
+                    "nuked": nuked, "source": source,
+                })).collect::<Vec<_>>()})
+        }
+        // Accept a correlated name by hand. The human is the gate;
+        // provenance records that it was a human.
+        "pre_assign" => {
+            let id = params.get("id").and_then(|v| v.parse::<i64>().ok())?;
+            let pid = params.get("predb_id").and_then(|v| v.parse::<i64>().ok())?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|t| t.as_secs() as i64)
+                .unwrap_or(0);
+            let ok = d
+                .with_index_mut(|ix| ix.pre_assign(id, pid, now).ok())
+                .unwrap_or(false);
+            json!({"status": ok})
+        }
+        // Decline a suggestion. Declined is forever (it must not nag);
+        // a correlation-applied name is revoked by the same action.
+        "pre_reject" => {
+            let id = params.get("id").and_then(|v| v.parse::<i64>().ok())?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|t| t.as_secs() as i64)
+                .unwrap_or(0);
+            let ok = d.with_index_mut(|ix| ix.pre_reject(id, now).ok()).is_some();
+            json!({"status": ok})
+        }
+        // Kick the historical seed import (manual, always - the
+        // opt-in-indexing rule applies doubly to a feature that
+        // fetches from a third party). days defaults to the design's
+        // 180; one import at a time.
+        "predb_seed_start" => {
+            let days = params
+                .get("days")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or_else(|| {
+                    d.predb_seed_days.load(std::sync::atomic::Ordering::Relaxed) as u32
+                })
+                .clamp(1, 366);
+            let started = super::super::predb_seed::spawn_seed_import(d.clone(), days);
+            json!({
+                "status": started,
+                "seed_status": d.predb_seed_status.lock_ok().clone(),
+            })
+        }
+        // Kick a scan pass immediately instead of waiting out the
+        // interval (full key). value=<n> deep-backfills the last n
+        // headers per group even where already scanned.
+        "index_scan_now" => {
+            if let Some(n) = params.get("value").and_then(|v| v.parse::<u64>().ok())
+                && n > 0
+            {
+                d.scan_deep.store(n, Ordering::Relaxed);
+            }
+            d.scan_now.notify_one();
+            json!({"status": true})
+        }
+        // Test hook, present only with NZBFAST_DEBUG_HOOKS=1 in
+        // the environment: hold the shared index connection for
+        // value seconds, standing in for a long catch-up ingest
+        // batch. The hang-regression test wedges the lock with
+        // this and asserts / and index_stats keep answering
+        // (28 Jul: a 62s hold + the dashboard's 15s status poll
+        // parked all 4 workers and the daemon served nothing).
+        "debug_hold_index" if std::env::var_os("NZBFAST_DEBUG_HOOKS").is_some() => {
+            let secs = params
+                .get("value")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(30)
+                .min(120);
+            let held = d
+                .with_index(|_| {
+                    std::thread::sleep(std::time::Duration::from_secs(secs));
+                    Some(true)
+                })
+                .unwrap_or(false);
+            json!({"held": held, "secs": secs})
+        }
+        // The same hook for the READ pool: hold one pooled read-only
+        // connection for value seconds, standing in for the slow query
+        // that caused the 2 Aug wedge (`wall2` at 85s, `wall_tip` at
+        // 76s, both full scans of a 32M-release table). More of these
+        // than there are connections must NOT queue - past
+        // INDEX_READ_CONNS they answer `busy` immediately, which is what
+        // keeps HTTP workers available for everything else.
+        "debug_hold_index_read" if std::env::var_os("NZBFAST_DEBUG_HOOKS").is_some() => {
+            let secs = params
+                .get("value")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(30)
+                .min(120);
+            match d.index_read_checked(|_| {
+                std::thread::sleep(std::time::Duration::from_secs(secs));
+                Some(true)
+            }) {
+                Ok(held) => json!({"held": held.unwrap_or(false), "secs": secs}),
+                Err(_) => json!({"held": false, "busy": true, "secs": secs}),
+            }
+        }
+        // M16: corruption recovery - delete the whole index
+        // database (+art cache) and rescan from scratch. The
+        // shared connection is dropped under the lock so no query
+        // touches a half-deleted file; the scan loop recreates the
+        // db on its next cycle. value=wipe is the confirmation.
+        "index_wipe" => {
+            if params.get("value").map(String::as_str) != Some("wipe") {
+                json!({"status": false, "error": "pass value=wipe to confirm"})
+            } else {
+                // Retire the generation FIRST. A scan pass holds a
+                // dedicated connection and reopens the shared one
+                // when it exits; without this it recreated the
+                // database we just deleted, moments after the API
+                // said it was gone.
+                let mut failed: Vec<String> = Vec::new();
+                {
+                    let mut guard = d.index.lock_ok();
+                    d.index_generation.fetch_add(1, Ordering::SeqCst);
+                    *guard = None;
+                    for suffix in ["", "-wal", "-shm"] {
+                        let p = PathBuf::from(format!("{}{suffix}", d.index_db.display()));
+                        // Report what did not go. On Windows an
+                        // open handle makes this fail outright,
+                        // and answering `true` over a database
+                        // still sitting on disk is the one thing
+                        // a corruption-recovery button must not
+                        // do.
+                        if let Err(e) = std::fs::remove_file(&p)
+                            && e.kind() != std::io::ErrorKind::NotFound
+                        {
+                            failed.push(format!("{}: {e}", p.display()));
+                        }
+                    }
+                    // AFTER the removes: a query re-opening the
+                    // read-only handle a beat earlier would pin
+                    // the deleted inode and keep serving the
+                    // wiped rows; dropping it last closes any
+                    // such straggler too.
+                    d.drop_index_read();
+                }
+                let art = d.spool.join("art");
+                if let Err(e) = std::fs::remove_dir_all(&art)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    failed.push(format!("{}: {e}", art.display()));
+                }
+                if failed.is_empty() {
+                    info!(
+                        target: "index",
+                        "{} wiped by request - rescan starts next cycle",
+                        d.index_db.display()
+                    );
+                    json!({"status": true})
+                } else {
+                    let why = failed.join("; ");
+                    warn!(target: "index", "wipe incomplete: {why}");
+                    json!({
+                        "status": false,
+                        "error": format!("the index was not fully removed - {why}"),
+                    })
+                }
+            }
+        }
+        // M31a: reclaim disk after retention pruning (VACUUM). Only
+        // safe when idle - it exclusive-locks and rewrites the
+        // whole file - so refuse while a download or scan is in
+        // flight and let the caller retry.
+        "index_compact" => {
+            // Jobs in flight rather than started_at, which reads None
+            // between queued jobs while the pipeline is still busy -
+            // the same trap c69eb45a closed for the idle loop.
+            if d.index_jobs_active.load(Ordering::Acquire) > 0
+                || !d.scan_progress.lock_ok().is_empty()
+            {
+                json!({"status": false,
+                               "error": "busy - retry when no download or scan is running"})
+            } else {
+                let before = std::fs::metadata(&d.index_db).map(|m| m.len()).unwrap_or(0);
+                let ok = d.with_index(|ix| ix.compact().ok()).is_some();
+                let after = std::fs::metadata(&d.index_db).map(|m| m.len()).unwrap_or(0);
+                let freed = before.saturating_sub(after);
+                if ok {
+                    info!(target: "index", "compacted - {} MB reclaimed", freed / (1 << 20));
+                    // An explicit compact answers whatever a prune
+                    // deferred, so the idle loop has nothing left to do.
+                    d.compact_pending.store(false, Ordering::Relaxed);
+                } else {
+                    warn!(target: "index", "manual compact failed");
+                }
+                json!({"status": ok, "freed_bytes": freed})
+            }
+        }
+        // M34 "shrink the database to X": prune until the index
+        // is under a caller-supplied size, then leave the VACUUM
+        // to the idle window (this returns as soon as the rows
+        // are gone - it does not sit on the connection rewriting
+        // a 40 GB file while the user waits on an HTTP request).
+        //
+        // Deliberately NOT gated on the index_evict toggle. That
+        // switch exists to stop the daemon deleting on its OWN
+        // initiative; this mode is the user pointing at a size
+        // and asking for it, which is the same act as clicking
+        // the button that sets the toggle. It cannot fire by
+        // itself - there is no scheduler behind it.
+        //
+        // Full-key tier: it lives in this match, which the
+        // add-only nzbkey never reaches (only addfile/addurl/
+        // version do). That is load-bearing - this deletes rows.
+        "index_shrink_to" => {
+            match params.get("value").and_then(|v| parse_size(v)) {
+                None => json!({"status": false,
+                                       "error": "pass value=<size>, e.g. value=20G"}),
+                Some(target) => {
+                    // The target is a promise about disk, so it is
+                    // measured against live_bytes - the size the
+                    // file takes once compacted. bytes_* below
+                    // still report the file itself, which is what
+                    // the user sees in Finder.
+                    let live = d.with_index(|ix| ix.live_bytes().ok()).unwrap_or(0);
+                    let before = d.with_index(|ix| ix.db_bytes().ok()).unwrap_or(0);
+                    if live <= target {
+                        json!({
+                            "status": true, "removed": 0,
+                            "bytes_before": before, "bytes_after": before,
+                            "live_bytes_before": live, "live_bytes_after": live,
+                            "target_bytes": target, "reached": true,
+                            "blocked": false,
+                            "compact_pending":
+                                d.compact_pending.load(Ordering::Relaxed),
+                        })
+                    } else {
+                        match d.evict_to(target) {
+                            EvictOutcome::Unavailable | EvictOutcome::Nothing => {
+                                json!({"status": false,
+                                               "error": "index unavailable"})
+                            }
+                            EvictOutcome::Ran(rep, n_prot) => {
+                                let reached = rep.live_after <= target;
+                                json!({
+                                    "status": true,
+                                    "removed": rep.removed,
+                                    "bytes_before": rep.bytes_before,
+                                    "bytes_after": rep.bytes_after,
+                                    "live_bytes_before": rep.live_before,
+                                    "live_bytes_after": rep.live_after,
+                                    "target_bytes": target,
+                                    "reached": reached,
+                                    // Stopped on purpose rather
+                                    // than short of the estimate:
+                                    // another pass would not help.
+                                    "blocked": rep.blocked,
+                                    "protected_keys": n_prot,
+                                    "compact_pending":
+                                        d.compact_pending.load(Ordering::Relaxed),
+                                    // Protection is absolute: we
+                                    // stop short rather than take
+                                    // a watchlisted, queued,
+                                    // downloaded or recently
+                                    // opened release. Say which.
+                                    "error": (!reached)
+                                        .then(|| shrink_shortfall_reason(n_prot)),
+                                })
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // M34: run the automatic policy once, now, instead of
+        // waiting for the next scan pass. "Against the current
+        // settings" is literal - including the master switch, so
+        // this cannot become a side door around an OFF toggle.
+        // (The way to prune with eviction off is index_shrink_to,
+        // where the user names the size themselves.)
+        "index_evict_now" => {
+            if !d.index_evict.load(Ordering::Relaxed) {
+                json!({"status": false,
+                               "error": "automatic eviction is off - turn on index_evict, \
+                                         or use index_shrink_to with an explicit size"})
+            } else if d.index_max_bytes.load(Ordering::Relaxed) == 0 {
+                json!({"status": false,
+                               "error": "index_max_bytes is 0 (unlimited) - set a cap first"})
+            } else {
+                let cap = d.index_max_bytes.load(Ordering::Relaxed);
+                let before = d.with_index(|ix| ix.db_bytes().ok()).unwrap_or(0);
+                let live = d.with_index(|ix| ix.live_bytes().ok()).unwrap_or(0);
+                match d.evict_pass() {
+                    // Already under the cap: nothing to do, and
+                    // that is a success, not an error.
+                    EvictOutcome::Nothing => json!({
+                        "status": true, "removed": 0,
+                        "bytes_before": before, "bytes_after": before,
+                        "live_bytes_before": live, "live_bytes_after": live,
+                        "index_max_bytes": cap, "reached": live <= cap,
+                        "blocked": false,
+                        "compact_pending":
+                            d.compact_pending.load(Ordering::Relaxed),
+                    }),
+                    EvictOutcome::Unavailable => {
+                        json!({"status": false, "error": "index unavailable"})
+                    }
+                    EvictOutcome::Ran(rep, n_prot) => {
+                        let reached = rep.live_after <= cap;
+                        json!({
+                            "status": true,
+                            "removed": rep.removed,
+                            "bytes_before": rep.bytes_before,
+                            "bytes_after": rep.bytes_after,
+                            "live_bytes_before": rep.live_before,
+                            "live_bytes_after": rep.live_after,
+                            "index_max_bytes": cap,
+                            "reached": reached,
+                            "blocked": rep.blocked,
+                            "protected_keys": n_prot,
+                            "compact_pending":
+                                d.compact_pending.load(Ordering::Relaxed),
+                            "error": (!reached)
+                                .then(|| shrink_shortfall_reason(n_prot)),
+                        })
+                    }
+                }
+            }
+        }
+        // Newsgroup discovery (the dashboard's "Find newsgroups"
+        // browser): search/filter/sort/page the cached LIST
+        // ACTIVE catalogue. First call with no catalogue and no
+        // cache kicks a background fetch and reports fetching -
+        // the UI polls until it lands.
+        "groups" => {
+            let get = |k: &str| params.get(k).map(String::as_str).unwrap_or("");
+            let cat = d.group_catalog.lock_ok().clone();
+            let err = d.group_fetch_err.lock_ok().clone();
+            match cat {
+                None => {
+                    // Only auto-kick while there's no error to
+                    // show: a dead server must not turn every
+                    // poll into a reconnect storm.
+                    if err.is_none() {
+                        kick_group_fetch(d, ctx.cfg_path.to_path_buf());
+                    }
+                    json!({
+                        "status": true,
+                        "fetching": d.group_fetching.load(Ordering::Relaxed),
+                        "fetched_at": 0, "total": 0, "count": 0,
+                        "groups": [], "error": err,
+                    })
+                }
+                Some(cat) => {
+                    let subscribed: std::collections::HashSet<String> =
+                        d.index_groups.lock_ok().iter().cloned().collect();
+                    let stats = d.group_stats.lock_ok().clone();
+                    let q = crate::groups::Query {
+                        q: get("q"),
+                        new_only: get("new") == "1",
+                        binaries_only: get("bin") == "1",
+                        min_posts: get("minposts").parse().unwrap_or(0),
+                        only: (get("sub") == "1").then_some(&subscribed),
+                        cat: crate::groups::Category::parse(get("cat")),
+                        stats: Some(&stats),
+                        kind: crate::groupstats::Kind::parse(get("kind")),
+                        active_days: get("activedays").parse().unwrap_or(0),
+                        with_desc: get("desc") == "1",
+                        sort: crate::groups::Sort::parse(get("sort")),
+                        desc_order: get("dir") != "asc",
+                        offset: get("offset").parse().unwrap_or(0),
+                        limit: get("limit").parse().unwrap_or(50),
+                    };
+                    // Subscribed-only view (tin's `y`): one toggle
+                    // between "the groups I scan" and the whole
+                    // server, rather than a separate screen. The
+                    // restriction rides in the query (see
+                    // Query::only) so paging stays correct.
+                    let (total, page) = cat.query(&q);
+                    let is_new =
+                        |fs: i64| fs > 0 && cat.fetched_at - fs < crate::groups::NEW_WINDOW_SECS;
+                    let new_total = cat.groups.iter().filter(|g| is_new(g.first_seen)).count();
+                    json!({
+                        "status": true,
+                        "fetching": d.group_fetching.load(Ordering::Relaxed),
+                        "fetched_at": cat.fetched_at,
+                        "total": total,
+                        "count": cat.groups.len(),
+                        "error": err,
+                        "new_total": new_total,
+                        "sampled": stats.map.len(),
+                        "groups": page.iter().map(|g| {
+                            // Sampled facts ride along when we have
+                            // them; absent keys mean "not sampled
+                            // yet", which the UI renders as a dash
+                            // rather than as a zero.
+                            let s = stats.get(&g.name);
+                            json!({
+                                "name": g.name, "posts": g.posts,
+                                "desc": g.desc, "cat": g.cat.key(),
+                                "sub": subscribed.contains(&g.name),
+                                "new": is_new(g.first_seen),
+                                "status": g.status.to_string(),
+                                "avg_bytes": s.map(|s| s.avg_bytes),
+                                "est_bytes": s.map(|s| s.est_bytes),
+                                "last_post": s.map(|s| s.last_post),
+                                "per_day": s.map(|s| s.per_day),
+                                "kind": s.and_then(|s| s.dominant()).map(|k| k.key()),
+                                "sampled_at": s.map(|s| s.sampled_at),
+                            })
+                        }).collect::<Vec<_>>(),
+                    })
+                }
+            }
+        }
+        // Bulk subscribe by pattern (slrn's `s` with a prefix,
+        // tin's `S`): 400 alt.binaries.* groups in one call
+        // instead of 400 clicks. Capped so a stray `*` cannot
+        // enqueue the whole server into the scan loop.
+        // What the indexer can be asked to look for, and what
+        // each choice actually scans. The UI prints the group
+        // names beside every option: an opt-in the user cannot
+        // read is not much of an opt-in.
+        "interests" => {
+            let chosen = crate::interests::parse(&d.index_interests.lock_ok().clone());
+            let cat = d.group_catalog.lock_ok().clone();
+            let carried: Option<std::collections::HashSet<&str>> = cat
+                .as_ref()
+                .map(|c| c.groups.iter().map(|g| g.name.as_str()).collect());
+            let subscribed: std::collections::HashSet<String> =
+                d.index_groups.lock_ok().iter().cloned().collect();
+            json!({
+                "status": true,
+                // Whether a provider group list is known yet. The
+                // wizard runs before one exists, so the UI has to
+                // be able to say "these will be checked against
+                // your provider" rather than promise a count.
+                "resolved": carried.is_some(),
+                "chosen": chosen,
+                "options": crate::interests::INTERESTS.iter().map(|i| json!({
+                    "key": i.key,
+                    "groups": i.groups,
+                    // Which of them this provider actually has,
+                    // once we know. Absent = not checked yet.
+                    "carried": carried.as_ref().map(|c| i.groups.iter()
+                        .filter(|g| c.contains(**g))
+                        .collect::<Vec<_>>()),
+                    "scanning": i.groups.iter()
+                        .filter(|g| subscribed.contains(**g)).count(),
+                })).collect::<Vec<_>>(),
+            })
+        }
+        "groups_add_matching" => {
+            let get = |k: &str| params.get(k).map(String::as_str).unwrap_or("");
+            let catalog = d.group_catalog.lock_ok().clone();
+            // Same `sub=1` ("Only groups I scan") restriction the
+            // list itself applies - the dashboard builds both
+            // requests from one query string, so ignoring it here
+            // made the button act on a WIDER set than the rows the
+            // user was looking at when they pressed it.
+            let subscribed: std::collections::HashSet<String> =
+                d.index_groups.lock_ok().iter().cloned().collect();
+            // The sampled filters have to ride along for the same
+            // reason `sub=1` does: the content-kind and
+            // still-active filters narrow the rows on screen, so
+            // omitting them here would again make the button act
+            // on a wider set than the user was looking at.
+            let stats = d.group_stats.lock_ok().clone();
+            let q = crate::groups::Query {
+                q: get("q"),
+                new_only: get("new") == "1",
+                binaries_only: get("bin") == "1",
+                min_posts: get("minposts").parse().unwrap_or(0),
+                only: (get("sub") == "1").then_some(&subscribed),
+                cat: crate::groups::Category::parse(get("cat")),
+                stats: Some(&stats),
+                kind: crate::groupstats::Kind::parse(get("kind")),
+                active_days: get("activedays").parse().unwrap_or(0),
+                with_desc: get("desc") == "1",
+                sort: crate::groups::Sort::Posts,
+                desc_order: true,
+                offset: 0,
+                limit: usize::MAX,
+            };
+            const MAX_BULK: usize = 200;
+            match catalog {
+                None => json!({"status": false, "error": "no group list yet"}),
+                Some(_) if get("q").is_empty() && q.cat.is_none() && !q.new_only => {
+                    // An unfiltered bulk add would enqueue the whole
+                    // server into the scan loop. Make the user narrow.
+                    json!({"status": false,
+                               "error": "refusing to add every group - narrow it first"})
+                }
+                Some(cat) => {
+                    let (total, hits) = cat.query(&q);
+                    let mut groups = d.index_groups.lock_ok().clone();
+                    let before = groups.len();
+                    for g in hits.iter().take(MAX_BULK) {
+                        if !groups.contains(&g.name) {
+                            groups.push(g.name.clone());
+                        }
+                    }
+                    let added = groups.len() - before;
+                    // apply_setting only updates the LIVE daemon; the
+                    // mode=config arm pairs it with save_setting, and
+                    // this one used to drop the returned value on the
+                    // floor. The scan list was rewritten in memory,
+                    // the UI said "Added N groups", and the whole bulk
+                    // subscribe vanished on the next restart.
+                    //
+                    // The clone above releases its guard at the end of
+                    // its own statement: holding it across this call
+                    // would deadlock on the same Mutex.
+                    let _ = apply_and_save(d, "index_groups", &groups.join(","));
+                    json!({"status": true, "added": added,
+                               "matched": total, "capped": total > MAX_BULK})
+                }
+            }
+        }
+        // One group in detail: the sampled profile, and the newest
+        // subjects so a user can SEE what is in there before
+        // committing a scan to it. Competitor research put this at
+        // the top of the list (NZBKing does it, nothing else does)
+        // and it is the difference between picking a group by name
+        // and picking it by contents.
+        "group_sample" => {
+            let name = params.get("group").cloned().unwrap_or_default();
+            let catalog = d.group_catalog.lock_ok().clone();
+            // Only groups the server actually carries: `name` is
+            // user input that becomes an NNTP GROUP command, and
+            // the catalogue is the allowlist.
+            let known = catalog
+                .as_ref()
+                .and_then(|c| c.groups.iter().find(|g| g.name == name))
+                .map(|g| g.posts);
+            match known {
+                None => json!({"status": false, "error": "unknown group"}),
+                Some(posts) => {
+                    let force = params.get("refresh").map(String::as_str) == Some("1");
+                    let now = epoch_secs() as i64;
+                    let cached = d.group_stats.lock_ok().get(&name).cloned();
+                    let stale = force || d.group_stats.lock_ok().is_stale(&name, now);
+                    if stale {
+                        kick_group_sample(d, ctx.cfg_path.to_path_buf(), name.clone(), posts);
+                    }
+                    let sampling = d.group_sampling.lock_ok().contains(&name);
+                    match cached {
+                        Some(s) => json!({
+                            "status": true, "sampling": sampling,
+                            "group": name,
+                            "sample_n": s.sample_n,
+                            "avg_bytes": s.avg_bytes,
+                            "est_bytes": s.est_bytes,
+                            "last_post": s.last_post,
+                            "per_day": s.per_day,
+                            "sampled_at": s.sampled_at,
+                            "kind": s.dominant().map(|k| k.key()),
+                            "samples": s.samples,
+                            "mix": crate::groupstats::Kind::ALL.iter()
+                                .map(|k| json!({
+                                    "kind": k.key(),
+                                    "n": s.kinds[
+                                        crate::groupstats::Kind::ALL.iter()
+                                            .position(|x| x == k).unwrap()],
+                                })).collect::<Vec<_>>(),
+                        }),
+                        // Nothing cached: the sample is in flight,
+                        // the UI polls.
+                        None => json!({
+                            "status": true, "sampling": true, "group": name,
+                        }),
+                    }
+                }
+            }
+        }
+        "groups_refresh" => {
+            *d.group_fetch_err.lock_ok() = None;
+            let started = kick_group_fetch(d, ctx.cfg_path.to_path_buf());
+            json!({"status": true, "started": started})
+        }
+        "index_search" => {
+            let q = params.get("q").cloned().unwrap_or_default();
+            let hits = d
+                .with_index_read(|ix| ix.search(&q, 60).ok())
+                .unwrap_or_default();
+            let hints = corr_hints(
+                d,
+                hits.iter().filter(|r| r.pre_title.is_empty()).map(|r| r.id),
+            );
+            {
+                // Parsed name facts ride along so the UI can show
+                // quality badges and offer one-click watchlisting.
+                let cats = d.custom_categories.read_ok().clone();
+                json!({"results": hits.iter().map(|r| {
+                            let name = r.display_name();
+                            let p = nzbkit::categories::classify(name, &cats);
+                            json!({
+                                "id": r.id, "name": name, "group": r.grp,
+                                // Provenance, so a rescued name can be
+                                // badged rather than shown as if it had
+                                // been read off the wire.
+                                "pre": r.pre_source,
+                                // Phase 2: the best CORRELATED name for
+                                // a still-unnamed obfuscated row - a
+                                // suggestion, clearly labelled, never
+                                // presented as the name.
+                                "pre_hint": hints.get(&r.id).cloned()
+                                    .unwrap_or(Value::Null),
+                                "size": r.total_bytes, "files": r.files,
+                                "complete": r.complete, "par2": r.has_par2,
+                                "first_seen": r.first_seen,
+                                "quality": crate::wall::quality_label(&p),
+                                "kind": nzbkit::index::kind_str(&p.kind).to_string(),
+                                "title": p.title, "year": p.year,
+                            })
+                        }).collect::<Vec<_>>()})
+            }
+        }
+        // M28: the poster wall, paged in SQL - replaces mode=wall's
+        // whole-index materialization (search('',5000) + client-side
+        // filtering). Cards come from Index::browse_cards; poster
+        // URLs point at the lazy /art/thumb_* thumbnails.
+        "wall2" => {
+            let get = |k: &str| params.get(k).map(String::as_str).unwrap_or("");
+            let show_all = get("all") == "1";
+            let sort = nzbkit::index::CardSort::parse(get("sort"));
+            let mut bq = nzbkit::index::BrowseQuery {
+                q: get("q").to_string(),
+                complete_only: matches!(get("complete"), "1" | "true"),
+                // Title reads naturally ascending; everything else
+                // defaults newest/biggest/best first.
+                desc: match get("dir") {
+                    "asc" => false,
+                    "desc" => true,
+                    _ => sort != nzbkit::index::CardSort::Title,
+                },
+                // Curation: junk hidden unless the user flips the
+                // "show hidden" toggle (all=1).
+                max_junk: (!show_all).then_some(50),
+                // M30: hides + learned rules always apply on the
+                // wall (the Hidden panel is its own API).
+                curated: true,
+                limit: 60,
+                ..Default::default()
+            };
+            match get("cat") {
+                "" | "all" => {}
+                "4k" => {
+                    bq.kind = Some("movie".into());
+                    bq.res = Some("2160p".into());
+                }
+                // Built-in kinds plus user-defined category slugs
+                // (lowercase alnum + '-'); the filter is a bound
+                // SQL parameter, and an unknown slug just matches
+                // nothing.
+                k if is_kind_slug(k) => bq.kind = Some(k.to_string()),
+                _ => {}
+            }
+            if let Some(r) = params.get("res").filter(|r| !r.is_empty()) {
+                bq.res = Some(r.clone());
+            }
+            // 24C: card-scoped fetch (&key=<title_key>) - the
+            // Releases surface's hover preview and group-by-title
+            // rows ask for ONE title's card. Same vocabulary as
+            // wall_art/wall_fix; deliberately does NOT mark the
+            // title "recently opened" (hovering is not opening -
+            // index_browse's title_key path is where that lives).
+            if let Some(k) = params.get("key").filter(|k| !k.is_empty()) {
+                bq.title_key = Some(k.clone());
+            }
+            // M30: genre chip + category grouping + decade range.
+            if let Some(g) = params.get("genre").filter(|g| !g.is_empty()) {
+                bq.genre = Some(g.clone());
+            }
+            if let Ok(n) = get("year_min").parse::<u32>() {
+                bq.year_min = n;
+            }
+            if let Ok(n) = get("year_max").parse::<u32>() {
+                bq.year_max = n;
+            }
+            let catgroup = get("catgroup") == "1";
+            if let Ok(n) = get("limit").parse::<u32>() {
+                bq.limit = n.clamp(1, 200);
+            }
+            if let Ok(n) = get("offset").parse::<u32>() {
+                bq.offset = n;
+            }
+            let matched_only = get("matched") != "0";
+            // M31b "your wall": the Affinity sort scores against
+            // the user's taste profile. Build it (and the owned
+            // set) OUTSIDE the index lock - taste_profile() takes
+            // that lock itself, so nesting would deadlock. None on
+            // cold start -> browse_cards degrades to "most posted".
+            let aff_ctx = (sort == nzbkit::index::CardSort::Affinity)
+                .then(|| d.affinity_ctx(&d.taste_profile()))
+                .flatten();
+            // index_read_checked, not with_index_read: a saturated read
+            // pool is not an empty wall, and drawing one as the other is
+            // how a busy index comes to be reported as a broken one.
+            // An `error` field is the shape wallFetch already handles -
+            // it toasts the text and returns WITHOUT re-rendering, so
+            // the grid keeps the cards it has and the next poll picks
+            // up the real answer. Blanking it is what "no cards" would
+            // have done.
+            match d.index_read_checked(|ix| {
+                ix.browse_cards(&bq, sort, matched_only, catgroup, aff_ctx.as_ref())
+                    .ok()
+            }) {
+                Err(_) => json!({
+                    "status": false, "busy": true,
+                    "error": "the index is busy - try again in a moment",
+                }),
+                Ok(Some((cards, total))) => {
+                    // M30: "you have this" card badge - the
+                    // newest release's dupe key against the
+                    // library (movies mostly; a show card only
+                    // badges when its latest episode is owned).
+                    let owned = d.owned_dupe_keys();
+                    // M30: whatever the wall is showing without
+                    // metadata yet gets (a) a titles row - the
+                    // old mode=wall was the ONLY seeder, so
+                    // since M28 fresh titles never reached the
+                    // enricher at all - and (b) a slot in the
+                    // hot queue, so on-screen titles get art
+                    // first.
+                    // try_with_index, not with_index: the seed is
+                    // a shrug-off side-write, and parking here
+                    // would hand back the very ingest-holds-the-
+                    // lock wait the read-only path just avoided.
+                    // A busy connection skips the seed; the next
+                    // wall poll re-offers the same cards.
+                    d.try_with_index(|ix| {
+                        for c in cards.iter().filter(|c| c.checked == 0) {
+                            let p = crate::wall::parse_release(&c.rep_stem);
+                            let _ = ix.title_seed(
+                                &c.title_key,
+                                &c.kind,
+                                if c.title.is_empty() {
+                                    &p.title
+                                } else {
+                                    &c.title
+                                },
+                                if c.year > 0 {
+                                    c.year
+                                } else {
+                                    p.year.unwrap_or(0)
+                                },
+                            );
+                        }
+                        Some(())
+                    });
+                    {
+                        let mut hot = d.enrich_hot.lock_ok();
+                        for c in cards.iter().filter(|c| c.checked == 0) {
+                            if !hot.contains(&c.title_key) {
+                                hot.push_back(c.title_key.clone());
+                            }
+                        }
+                        while hot.len() > 120 {
+                            hot.pop_front();
+                        }
+                    }
+                    let art_dir = d.spool.join("art");
+                    // M29: availability verdict per card, from the
+                    // newest release's group family × post age.
+                    let ocx = d.oracle_ctx(ctx.cfg_path);
+                    // M29 3d: families in an active takedown wave
+                    // (fresh posts confidently gone) - the wall
+                    // flags their cards as "being reaped".
+                    let reaped: std::collections::HashSet<String> = ocx
+                        .as_ref()
+                        .map(|(s, b)| s.reaped_families(b).into_iter().map(|r| r.family).collect())
+                        .unwrap_or_default();
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|t| t.as_secs() as i64)
+                        .unwrap_or(0);
+                    json!({
+                        "total": total,
+                        "offset": bq.offset,
+                        // 24D: the dynamic category set - the UI
+                        // renders one tab chip per entry.
+                        "cats": d.custom_categories.read_ok().iter()
+                            .map(|c| json!({"slug": c.slug, "name": c.name}))
+                            .collect::<Vec<_>>(),
+                        "cards": cards.iter().map(|c| {
+                            // Enriched title wins; unmatched cards
+                            // fall back to parsing the newest stem.
+                            let (title, year) = if !c.title.is_empty() {
+                                (c.title.clone(), c.year)
+                            } else {
+                                let p = crate::wall::parse_release(&c.rep_stem);
+                                (p.title, p.year.unwrap_or(0))
+                            };
+                            let art = |f: &str, thumb: bool| {
+                                if !f.is_empty() && art_dir.join(f).is_file() { if thumb {
+                                        format!("/art/thumb_{f}?v={}", c.checked)
+                                    } else {
+                                        format!("/art/{f}?v={}", c.checked)
+                                    } } else { Default::default() }
+                            };
+                            json!({
+                                "key": c.title_key, "kind": c.kind,
+                                "title": title, "year": year,
+                                "n": c.n_releases, "latest": c.latest_posted,
+                                "complete": c.any_complete,
+                                "size": c.max_bytes, "res": c.best_res,
+                                "rating": c.rating, "genres": c.genres,
+                                "overview": c.overview, "actors": c.actors,
+                                "aired": c.air_date,
+                                "stem": c.rep_stem,
+                                "poster": art(&c.poster_art, true),
+                                "poster_full": art(&c.poster_art, false),
+                                "backdrop": art(&c.backdrop_art, false),
+                                "matched": c.checked > 0 && !c.poster_art.is_empty(),
+                                "have": dupe_key(&c.rep_stem)
+                                    .is_some_and(|k| owned.contains(&k)),
+                                "verdict": oracle_verdict_json(
+                                    &ocx, &c.rep_grp, c.latest_posted, now),
+                                "reaped": reaped.contains(
+                                    &nzbkit::oracle::group_family(&c.rep_grp)),
+                            })
+                        }).collect::<Vec<_>>(),
+                    })
+                }
+                Ok(None) => json!({"status": false, "error": "index unavailable"}),
+            }
+        }
+        "oracle_takedowns" => {
+            // M29 3d: content families in an active takedown wave -
+            // fresh (≤7d) posts confidently gone on the user's
+            // backbones (retention can't expire a week-old post, so
+            // fresh+gone = a reap). Drives the wall's "being reaped"
+            // flag and a diagnostics panel.
+            let families = d
+                .oracle_ctx(ctx.cfg_path)
+                .map(|(s, b)| s.reaped_families(&b))
+                .unwrap_or_default();
+            json!({
+                "status": true,
+                "families": families.iter().map(|r| json!({
+                    "family": r.family,
+                    "bucket": r.bucket,
+                    "bucket_label": nzbkit::oracle::bucket_label(r.bucket),
+                    "hits": r.hits,
+                    "misses": r.misses,
+                })).collect::<Vec<_>>(),
+            })
+        }
+        "index_browse" => {
+            // M25 browse view: filtered/sorted/paginated release
+            // list (the wall's list mode). All params optional.
+            let get = |k: &str| params.get(k).map(String::as_str).unwrap_or("");
+            let mut bq = nzbkit::index::BrowseQuery {
+                q: get("q").to_string(),
+                complete_only: matches!(get("complete"), "1" | "true"),
+                sort: nzbkit::index::BrowseSort::parse(get("sort")),
+                desc: get("dir") != "asc",
+                ..Default::default()
+            };
+            // cat maps the UI tabs: built-in kinds and custom
+            // category slugs pass through; "4k" is the
+            // movie+2160p shorthand tab.
+            match get("cat") {
+                "" | "all" => {}
+                "4k" => {
+                    bq.kind = Some("movie".into());
+                    bq.res = Some("2160p".into());
+                }
+                k if is_kind_slug(k) => bq.kind = Some(k.to_string()),
+                _ => {}
+            }
+            if let Some(r) = params.get("res").filter(|r| !r.is_empty()) {
+                bq.res = Some(r.clone());
+            }
+            // M28: card-scoped listing (a wall card's releases)
+            // and the junk ceiling (all=1 shows everything).
+            if let Some(tk) = params.get("title_key").filter(|t| !t.is_empty()) {
+                bq.title_key = Some(tk.clone());
+                // M34: a title_key-scoped browse IS the card's
+                // detail sheet - the user opened this title. The
+                // schema has no "last seen on the wall" column
+                // (wall_hidden.at records the opposite act), so
+                // this deliberate open is what "recently opened"
+                // means, and the size cap protects it for
+                // OPENED_PROTECT_DAYS days. Coalesced: reopening
+                // the same card does not rewrite the log.
+                d.touch_opened_title(tk);
+            }
+            if get("all") != "1" && bq.title_key.is_none() {
+                bq.max_junk = Some(50);
+            }
+            // M30: curation applies to the list view but never to
+            // a card's own sheet (title_key-scoped) - the sheet
+            // shows everything a title has, rule-hit dubs
+            // included, so the user can see what a rule does.
+            bq.curated = bq.title_key.is_none();
+            if let Ok(n) = get("limit").parse::<u32>() {
+                bq.limit = n.clamp(1, 200);
+            }
+            if let Ok(n) = get("offset").parse::<u32>() {
+                bq.offset = n;
+            }
+            // M29 3c: per-row availability verdict; verdict=ok now
+            // pushes into the SQL WHERE (via bq.verdict_ok) so the
+            // returned `total` and page agree - the old page-level
+            // trim left total unfiltered, breaking paging.
+            let want_ok = get("verdict") == "ok";
+            // M30: badge rows the library already has (or that
+            // are queued) - history dupe-key join.
+            let owned = d.owned_dupe_keys();
+            let ocx = d.oracle_ctx(ctx.cfg_path);
+            // M29 3d: reaped families (fresh posts confidently
+            // gone) - the list flags their rows as "being reaped".
+            let reaped: std::collections::HashSet<String> = ocx
+                .as_ref()
+                .map(|(s, b)| s.reaped_families(b).into_iter().map(|r| r.family).collect())
+                .unwrap_or_default();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|t| t.as_secs() as i64)
+                .unwrap_or(0);
+            if want_ok {
+                // Reuse the loaded snapshot + backbones when present;
+                // an absent/empty ledger yields a filter that matches
+                // nothing (verdict null → not "ok"), i.e. total 0 -
+                // the same "show only confirmed-ok" semantics.
+                let (snap, bbs) = match &ocx {
+                    Some((s, b)) => (s.clone(), b.clone()),
+                    None => (nzbkit::oracle::Snapshot::default(), Vec::new()),
+                };
+                bq.verdict_ok = Some(nzbkit::index::VerdictFilter {
+                    snap,
+                    backbones: bbs,
+                    now,
+                });
+            }
+            let ccats = d.custom_categories.read_ok().clone();
+            // Ranked here, not in the browser: the weights are one
+            // Rust function, and mirroring them in JS would let the
+            // two drift apart.
+            let qprefs = d.quality_prefs.lock_ok().clone();
+            match d.with_index_read(|ix| ix.browse(&bq).ok()) {
+                Some((rows, total)) => {
+                    let hints = corr_hints(
+                        d,
+                        rows.iter().filter(|r| r.pre_title.is_empty()).map(|r| r.id),
+                    );
+                    json!({
+                        "total": total,
+                        "offset": bq.offset,
+                        // 24D: the dynamic category set - the UI
+                        // renders one tab chip per entry.
+                        "cats": ccats.iter()
+                            .map(|c| json!({"slug": c.slug, "name": c.name}))
+                            .collect::<Vec<_>>(),
+                        "results": rows.iter().map(|r| {
+                            let verdict = oracle_verdict_json(
+                                &ocx, &r.grp, r.first_posted, now);
+                            // Badge text still needs source/remux
+                            // - a per-row parse of one page is
+                            // cheap (pure text). Classified with
+                            // the custom categories so "key"
+                            // matches the stored title_key and
+                            // the info sheet opens the right card.
+                            // Parsed from the name the row is
+                            // SHOWN under: for a release the pre
+                            // feed rescued that is the real
+                            // title, and parsing the obfuscated
+                            // stem instead would throw the
+                            // rescue away at the last step.
+                            let name = r.display_name();
+                            let p = nzbkit::categories::classify(name, &ccats);
+                            json!({
+                                "verdict": verdict,
+                                "reaped": reaped.contains(
+                                    &nzbkit::oracle::group_family(&r.grp)),
+                                "have": dupe_key(name)
+                                    .is_some_and(|k| owned.contains(&k)),
+                                // ROT13-rescued: the stem is
+                                // rotated gibberish; title/year
+                                // carry the decoded name.
+                                "rescued": p.rescued,
+                                // The name came from a pre feed,
+                                // not off the wire. Carried so
+                                // the row can say so rather than
+                                // presenting somebody else's
+                                // claim as something we read.
+                                // '' on every ordinary release.
+                                "pre": r.pre_source,
+                                // Phase 2 suggestion for a row
+                                // still wearing its obfuscated
+                                // stem; null everywhere else.
+                                "pre_hint": hints.get(&r.id).cloned()
+                                    .unwrap_or(Value::Null),
+                                // The stem it was actually posted
+                                // under, when that differs.
+                                "posted": if r.pre_title.is_empty() {
+                                    String::new()
+                                } else {
+                                    r.stem.clone()
+                                },
+                                "id": r.id, "name": name, "group": r.grp,
+                                "size": r.total_bytes, "files": r.files,
+                                "complete": r.complete, "par2": r.has_par2,
+                                "first_posted": r.first_posted,
+                                "first_seen": r.first_seen,
+                                "kind": r.kind, "res": r.res,
+                                "have_parts": r.have_parts,
+                                "need_parts": r.need_parts,
+                                "quality": crate::wall::quality_label(&p),
+                                // What separates two encodes of one
+                                // film. Taken from the fresh parse
+                                // rather than the stored columns so
+                                // rows the quality_v8 pass has not
+                                // reached yet still show their tags.
+                                "vcodec": p.vcodec, "acodec": p.acodec,
+                                "hdr": p.hdr,
+                                // Higher = closer to what the user
+                                // said they want; the sheet orders on
+                                // this instead of raw size.
+                                "pref": crate::watchlist::preference_score(&p, &qprefs),
+                                // Which preferences this one
+                                // satisfies, so the row can say WHY
+                                // it sorted where it did.
+                                "prefhit": crate::watchlist::preference_hits(&p, &qprefs),
+                                // Wall-card dedupe key: lets the
+                                // list's info action open the
+                                // existing detail sheet.
+                                "key": p.key,
+                                "title": p.title, "year": p.year,
+                                // M28: the card sheet's episode
+                                // grid needs these per release.
+                                "season": p.season, "episode": p.episode,
+                            })
+                        }).collect::<Vec<_>>(),
+                    })
+                }
+                None => json!({"status": false, "error": "index unavailable"}),
+            }
+        }
+        // Does grabbing this indexed release collide with something
+        // the user already has? The wall asks BEFORE it adds, so a
+        // second copy is a decision rather than a surprise: the
+        // hold used to be applied silently, and a Play that became
+        // a paused duplicate was indistinguishable from a download
+        // that never started. Read-only; the answer carries the
+        // colliding job so the UI can offer it directly.
+        "index_dupe" => {
+            let id: i64 = params.get("id").and_then(|v| v.parse().ok()).unwrap_or(-1);
+            let stem = d.with_index_read(|ix| {
+                let hits = ix.search("", 100000).ok()?;
+                // display_name, so a release the pre feed named
+                // collides with the copy already in the library
+                // under the SAME real title. Keyed on the
+                // obfuscated stem it would never match one.
+                hits.iter()
+                    .find(|r| r.id == id)
+                    .map(|r| r.display_name().to_string())
+            });
+            match stem {
+                Some(stem) => match d.dupe_collision(&stem) {
+                    Some(c) => json!({"status": true, "dupe": true,
+                                "where": c.where_, "name": c.name, "nzo_id": c.nzo_id}),
+                    None => json!({"status": true, "dupe": false}),
+                },
+                None => json!({"status": false, "error": "release not found"}),
+            }
+        }
+        "index_get" => {
+            // Enqueue an indexed release for download by id.
+            let id: i64 = params.get("id").and_then(|v| v.parse().ok()).unwrap_or(-1);
+            let r = d.with_index_read(|ix| {
+                // Read the name by id. Scanning the newest rows
+                // for it instead missed anything the index had
+                // since buried, and the "release-<id>" fallback
+                // is not just an ugly job name: it carries no
+                // dupe key, so the duplicate hold, the
+                // watchlist's history check and the wall's
+                // "have" badge all go quiet for that grab.
+                let name = ix
+                    .stem_by_id(id)
+                    .ok()
+                    .flatten()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| format!("release-{id}"));
+                Some((ix.make_nzb(id).ok()?, name))
+            });
+            // M30: optional SAB priority (2 Force / 1 High / …) -
+            // the wall passes High for Download and Force for
+            // Play so a hand-picked grab never waits behind
+            // queued RSS/watchlist jobs.
+            let prio: i32 = params
+                .get("priority")
+                .and_then(|v| v.parse().ok())
+                .filter(|p| (-2..=2).contains(p))
+                .unwrap_or(-100);
+            // `dupe_ok=1`: the user was shown the collision by
+            // `index_dupe` and chose to download it anyway, so the
+            // hold does not apply. Only ever set by a click.
+            let dupe_ok = params.get("dupe_ok").map(String::as_str) == Some("1");
+            match r {
+                Some((xml, name)) => {
+                    match d.enqueue(xml.as_bytes(), &name, "", prio, None, "dashboard", dupe_ok) {
+                        Ok(nzo) => {
+                            // M34: queued from the wall - protect the
+                            // row from the size cap. The queue itself
+                            // is protected by title_key too, but that
+                            // stops the moment the job leaves the
+                            // queue and this outlives it.
+                            d.touch_opened_release(id);
+                            json!({"status": true, "nzo_ids": [nzo]})
+                        }
+                        Err(e) => json!({"status": false, "error": e.to_string()}),
+                    }
+                }
+                None => json!({"status": false, "error": "release not found"}),
+            }
+        }
+        // M35 pull search: fan a query out to the enabled
+        // third-party indexers, merge and dedupe, and hand the
+        // UI opaque grab tokens - the NZB links carry the user's
+        // per-site apikey and stay server-side.
+        "indexer_search" => {
+            let q = params.get("q").cloned().unwrap_or_default();
+            let kind = params.get("kind").cloned().unwrap_or_default();
+            // M35 phase 2: precision ids. `title_key` is the
+            // wall's own identity for a title, and the IMDb id
+            // is looked up from it HERE rather than being sent
+            // by the browser - the page never had the id (no
+            // card JSON carries one), and a client-supplied id
+            // would be a claim about someone else's data.
+            //
+            // There is deliberately no tvdbid: the only TV id we
+            // store is a TVmaze show id (titles.tmdb_id, reused
+            // for TV), which is a DIFFERENT namespace to
+            // TheTVDB's. Sending it as tvdbid would silently ask
+            // for the wrong series. TV therefore rides
+            // season/ep, which plan_query folds into the query
+            // text when an indexer cannot take them.
+            let season = params.get("season").and_then(|v| v.parse::<u32>().ok());
+            let ep = params.get("ep").and_then(|v| v.parse::<u32>().ok());
+            let imdbid = match params.get("title_key") {
+                Some(k) if !k.is_empty() => d
+                    .with_index_read(|ix| ix.title_get(k).ok().flatten())
+                    .map(|t| t.imdb)
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            let tvdbid = String::new();
+            let list: Vec<crate::newznab::IndexerConfig> = d
+                .indexers
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|i| i.enabled)
+                .cloned()
+                .collect();
+            if q.trim().is_empty() {
+                json!({"status": false, "error": "empty query"})
+            } else if list.is_empty() {
+                json!({"status": false, "error": "no indexers configured"})
+            } else {
+                // Budget/backoff gate, and the hit accounting,
+                // in one pass under the lock. Skips are surfaced
+                // per indexer - quota exhaustion must be
+                // visible, never a silently thinner result list.
+                let mut runnable = Vec::new();
+                let mut notes = Vec::new();
+                {
+                    let mut rt = d.indexer_rt.lock_ok();
+                    rt.usage.roll(unix_now());
+                    let now = Instant::now();
+                    for i in list {
+                        if rt.penalty_until.get(&i.name).is_some_and(|t| *t > now) {
+                            notes.push(json!({"indexer": i.name,
+                                        "skipped": "backing off after a limit error"}));
+                        } else if !rt.usage.hit_allowed(&i) {
+                            notes.push(json!({"indexer": i.name,
+                                        "skipped": "daily API budget reached"}));
+                        } else {
+                            rt.usage.count_hit(&i.name);
+                            runnable.push(i);
+                        }
+                    }
+                }
+                save_indexer_usage(d);
+                let query = crate::newznab::SearchQuery {
+                    q: q.trim().to_string(),
+                    cats: cat_for_kind(&kind).map(|c| vec![c]).unwrap_or_default(),
+                    limit: 100,
+                    offset: 0,
+                    imdbid,
+                    tvdbid,
+                    season,
+                    ep,
+                };
+                // Only an id-carrying query needs caps; a plain
+                // free-text one must never pay for a probe.
+                let wants_caps =
+                    !query.imdbid.is_empty() || !query.tvdbid.is_empty() || query.season.is_some();
+                // One xREL P2P search alongside the fan-out, and
+                // only when the query carries no IMDb id of its
+                // own: it is the id source for the true-P2P
+                // "tagger" groups that scene predbs never list,
+                // which is exactly the content a plain text
+                // query turns up with no identity attached.
+                //
+                // Never a reason for the search to be slower: it
+                // runs beside the indexers rather than after
+                // them, and it declines its own slot rather than
+                // queueing for one.
+                let xrel_q = (query.imdbid.is_empty() && d.identity_lookup.load(Ordering::Relaxed))
+                    .then(|| q.trim().to_string());
+                // Fan out on plain threads: user-clicked, each
+                // call capped at the agent's 15 s, so the search
+                // costs one slow indexer, not their sum.
+                let d_ref = &d;
+                let (outcomes, xrel_hits): (Vec<_>, Vec<crate::xrel::XrelRelease>) =
+                    std::thread::scope(|s| {
+                        let xh = xrel_q
+                            .as_deref()
+                            .map(|q| s.spawn(move || crate::xrel::try_search_p2p(q, XREL_UI_WAIT)));
+                        let handles: Vec<_> = runnable
+                            .into_iter()
+                            .map(|i| {
+                                let query = query.clone();
+                                s.spawn(move || {
+                                    let caps = wants_caps
+                                        .then(|| indexer_caps_cached(d_ref, &i))
+                                        .flatten();
+                                    let planned = crate::newznab::plan_query(caps.as_ref(), &query);
+                                    let r = indexer_search_one(&i, &planned);
+                                    (i, r)
+                                })
+                            })
+                            .collect();
+                        let outs = handles.into_iter().filter_map(|h| h.join().ok()).collect();
+                        (outs, xh.and_then(|h| h.join().ok()).unwrap_or_default())
+                    });
+                let xrel_ids = crate::xrel::by_dirname(&xrel_hits);
+                // Merge: same release listed by several indexers
+                // collapses to the highest-priority (lowest
+                // number) copy; ties keep the first seen.
+                struct Merged {
+                    prio: i32,
+                    indexer: String,
+                    item: crate::newznab::SearchResult,
+                }
+                let mut merged: std::collections::HashMap<String, Merged> =
+                    std::collections::HashMap::new();
+                {
+                    let mut rt = d.indexer_rt.lock_ok();
+                    let now = Instant::now();
+                    for (cfg, outcome) in outcomes {
+                        match outcome {
+                            Ok(items) => {
+                                for item in items {
+                                    let key = crate::newznab::dedupe_key(&item.title, item.size);
+                                    let cand = Merged {
+                                        prio: cfg.priority,
+                                        indexer: cfg.name.clone(),
+                                        item,
+                                    };
+                                    match merged.entry(key) {
+                                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                                            if cand.prio < e.get().prio {
+                                                e.insert(cand);
+                                            }
+                                        }
+                                        std::collections::hash_map::Entry::Vacant(e) => {
+                                            e.insert(cand);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                if matches!(e, crate::newznab::NewznabError::Limit(..)) {
+                                    rt.penalty_until
+                                        .insert(cfg.name.clone(), now + INDEXER_LIMIT_BACKOFF);
+                                }
+                                notes.push(json!({"indexer": cfg.name,
+                                            "error": e.to_string()}));
+                            }
+                        }
+                    }
+                }
+                let mut rows: Vec<Merged> = merged.into_values().collect();
+                // Newest first; unknown ages sink to the bottom.
+                rows.sort_by(|a, b| {
+                    b.item
+                        .posted
+                        .cmp(&a.item.posted)
+                        .then(b.item.grabs.cmp(&a.item.grabs))
+                });
+                rows.truncate(500);
+                let now_ts = unix_now();
+                let mut out = Vec::with_capacity(rows.len());
+                {
+                    let mut rt = d.indexer_rt.lock_ok();
+                    // Lazy TTL sweep keeps the cache honest even
+                    // if nobody ever grabs anything.
+                    let now = Instant::now();
+                    while let Some(front) = rt.order.front().cloned() {
+                        let stale = rt
+                            .results
+                            .get(&front)
+                            .is_none_or(|h| now.duration_since(h.at) > INDEXER_HIT_TTL);
+                        if stale {
+                            rt.order.pop_front();
+                            rt.results.remove(&front);
+                        } else {
+                            break;
+                        }
+                    }
+                    for m in rows {
+                        let token = fresh_secret();
+                        rt.results.insert(
+                            token.clone(),
+                            IndexerHit {
+                                url: m.item.link.clone(),
+                                title: m.item.title.clone(),
+                                indexer: m.indexer.clone(),
+                                at: now,
+                            },
+                        );
+                        rt.order.push_back(token.clone());
+                        out.push(json!({
+                            "token": token,
+                            "indexer": m.indexer,
+                            "title": m.item.title,
+                            // '' unless xREL named this exact
+                            // release. Exact only - see
+                            // `by_dirname`.
+                            "imdb": xrel_ids
+                                .get(&m.item.title.to_ascii_lowercase())
+                                .cloned()
+                                .unwrap_or_default(),
+                            "size": m.item.size,
+                            "kind": kind_for_cat(m.item.cat).unwrap_or("other"),
+                            "age_days": (m.item.posted > 0)
+                                .then(|| (now_ts - m.item.posted).max(0) / 86_400),
+                            "grabs": m.item.grabs,
+                        }));
+                    }
+                    while rt.order.len() > INDEXER_HIT_CAP {
+                        if let Some(old) = rt.order.pop_front() {
+                            rt.results.remove(&old);
+                        }
+                    }
+                }
+                json!({"status": true, "results": out, "notes": notes})
+            }
+        }
+        // Spotnet: search what the spot scanner has stored. A
+        // separate mode rather than a merge into the wall, because
+        // a spot is a different kind of claim - somebody signed a
+        // statement that they posted this - and folding the two
+        // together would leave no way to say which is which.
+        "spot_search" => {
+            let get = |k: &str| params.get(k).map(String::as_str).unwrap_or("");
+            let q = nzbkit::index::SpotQuery {
+                q: get("q").to_string(),
+                category: get("cat").parse().ok(),
+                include_adult: matches!(get("adult"), "1" | "true"),
+                limit: get("limit").parse().unwrap_or(60),
+                offset: get("offset").parse().unwrap_or(0),
+            };
+            let now = unix_now();
+            match d.with_index_read(|ix| ix.spot_browse(&q).ok()) {
+                None => json!({"status": true, "results": [], "total": 0,
+                            "on": d.spot_enabled.load(Ordering::Relaxed)}),
+                Some((hits, total)) => {
+                    let rows: Vec<Value> = hits
+                        .iter()
+                        .map(|s| {
+                            json!({
+                                "msgid": s.msgid,
+                                "title": s.title,
+                                "size": s.size,
+                                "kind": nzbkit::index::spot_kind(s.category),
+                                "cat": s.category,
+                                "age_days": (s.date > 0)
+                                    // saturating: the spot date is an
+                                    // unbounded i64 out of an
+                                    // attacker-mintable self-signed
+                                    // From record, and a huge positive
+                                    // one underflows this subtraction
+                                    // (debug panic on the API thread,
+                                    // silent wrap in release).
+                                    .then(|| now.saturating_sub(s.date).max(0) / 86_400),
+                                "spotter": s.spotter_id,
+                                "adult": nzbkit::index::spot_is_adult(&s.subcats),
+                                // A verified signature with a failed
+                                // proof-of-work is worth showing: it
+                                // is the one thing about a spot that
+                                // is odd rather than wrong.
+                                "hashcash_ok": s.hashcash_ok,
+                            })
+                        })
+                        .collect();
+                    json!({"status": true, "results": rows, "total": total,
+                                "on": d.spot_enabled.load(Ordering::Relaxed)})
+                }
+            }
+        }
+        // Grab a spot: fetch the NZB the spot points at and queue
+        // it like any other add.
+        //
+        // The message-id must already be in our own spots table.
+        // That is the whole authorization story: the daemon only
+        // ever fetches articles its own scanner verified and
+        // stored, so a browser cannot aim it at an arbitrary
+        // message-id, and a spot whose signature failed was never
+        // written in the first place.
+        "spot_grab" => {
+            let msgid = params
+                .get("msgid")
+                .or_else(|| params.get("value"))
+                .cloned()
+                .unwrap_or_default();
+            let prio: i32 = params
+                .get("priority")
+                .and_then(|v| v.parse().ok())
+                .filter(|p| (-2..=2).contains(p))
+                .unwrap_or(-100);
+            let cat = params.get("cat_name").cloned().unwrap_or_default();
+            let dupe_ok = params.get("dupe_ok").map(String::as_str) == Some("1");
+            let spot = d.with_index_read(|ix| ix.spot_by_msgid(&msgid).ok().flatten());
+            match spot {
+                None => json!({"status": false,
+                            "error": "no such spot - rescan and try again"}),
+                Some(spot) => {
+                    let cfg_path2 = ctx.cfg_path.to_path_buf();
+                    // block_on + a hard ceiling, like warm_bench:
+                    // a spot NZB is one HEAD plus a handful of
+                    // BODYs, but a black-holed server must not
+                    // wedge the API thread. Big spots are real -
+                    // one measured NZB was 929 KB over 2 payload
+                    // articles - so the ceiling is generous.
+                    let fetched = tokio::runtime::Handle::current().block_on(async {
+                        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+                            let cfg = nzbkit::config::Config::load(&cfg_path2)
+                                .map_err(|e| e.to_string())?;
+                            let server = crate::scan_servers(&cfg)
+                                .into_iter()
+                                .next()
+                                .ok_or_else(|| "no enabled server".to_string())?;
+                            let (mut conn, _) = nzbkit::nntp::Connection::connect(&server)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                            let r = nzbkit::spot::fetch_spot_nzb(&mut conn, &msgid)
+                                .await
+                                .map_err(|e| e.to_string());
+                            conn.quit().await;
+                            r
+                        })
+                        .await
+                    });
+                    match fetched {
+                        Err(_) => json!({"status": false,
+                                    "error": "timed out fetching that spot"}),
+                        Ok(Err(e)) => json!({"status": false, "error": e}),
+                        Ok(Ok((sx, nzb))) => {
+                            // Remember the payload segments so a
+                            // second grab of the same spot does
+                            // not re-walk the XML.
+                            d.with_index(|ix| ix.set_spot_nzb(&spot.msgid, &sx.nzb_segments).ok());
+                            // The spot's own title is the name:
+                            // it is signed, and it is the reason
+                            // this source exists at all.
+                            let name = if sx.title.is_empty() {
+                                spot.title.clone()
+                            } else {
+                                sx.title.clone()
+                            };
+                            match d.enqueue(&nzb, &name, &cat, prio, None, "spot", dupe_ok) {
+                                Ok(id) => {
+                                    info!(target: "spots", "grabbed {name}");
+                                    json!({"status": true, "nzo_ids": [id]})
+                                }
+                                Err(e) => {
+                                    json!({"status": false, "error": e.to_string()})
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // M35: grab one cached external result by token. The
+        // token is the ONLY way in - the daemon fetches exactly
+        // the URLs its own searches stored, so the browser can
+        // never aim it at an arbitrary address.
+        "indexer_grab" => {
+            let token = params.get("token").cloned().unwrap_or_default();
+            let prio: i32 = params
+                .get("priority")
+                .and_then(|v| v.parse().ok())
+                .filter(|p| (-2..=2).contains(p))
+                .unwrap_or(-100);
+            let dupe_ok = params.get("dupe_ok").map(String::as_str) == Some("1");
+            let hit = {
+                let rt = d.indexer_rt.lock_ok();
+                rt.results
+                    .get(&token)
+                    .filter(|h| h.at.elapsed() <= INDEXER_HIT_TTL)
+                    .cloned()
+            };
+            match hit {
+                None => json!({"status": false,
+                            "error": "result expired - search again"}),
+                Some(h) => {
+                    let cfg = d
+                        .indexers
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|i| i.name == h.indexer)
+                        .cloned();
+                    let allowed = {
+                        let mut rt = d.indexer_rt.lock_ok();
+                        rt.usage.roll(unix_now());
+                        cfg.as_ref().is_none_or(|c| rt.usage.grab_allowed(c))
+                    };
+                    if !allowed {
+                        json!({"status": false, "error":
+                                    format!("{}: daily grab budget reached", h.indexer)})
+                    } else {
+                        match fetch_url(&h.url) {
+                            Ok(f) => match d.enqueue_fetched(
+                                &f, &h.title, "", prio, None, 0, "indexer", dupe_ok,
+                            ) {
+                                Ok(id) => {
+                                    d.indexer_rt.lock_ok().usage.count_grab(&h.indexer);
+                                    save_indexer_usage(d);
+                                    json!({"status": true, "nzo_ids": [id]})
+                                }
+                                Err(e) => {
+                                    json!({"status": false, "error": e.to_string()})
+                                }
+                            },
+                            // Same leak the nzblnk ladder had:
+                            // fetch_url names the URL it failed
+                            // on, and h.url is the enclosure link
+                            // whose whole reason for living behind
+                            // a token is that it carries the
+                            // user's account credential.
+                            Err(e) => json!({"status": false,
+                                        "error": redact_url_creds(&e.to_string())}),
+                        }
+                    }
+                }
+            }
+        }
+        _ => return None,
+    })
+}

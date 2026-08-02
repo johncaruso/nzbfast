@@ -16,6 +16,8 @@
 
 #![allow(dead_code)]
 
+mod scratch;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -80,7 +82,9 @@ fn b5_parse_age_spec_huge_value_saturates_instead_of_wrapping() {
 // ---------------------------------------------------------------------------
 
 fn payload(n: usize, seed: u8) -> Vec<u8> {
-    (0..n).map(|i| (i as u8).wrapping_mul(29).wrapping_add(seed)).collect()
+    (0..n)
+        .map(|i| (i as u8).wrapping_mul(29).wrapping_add(seed))
+        .collect()
 }
 
 /// OS-assigned free port for a daemon under test.
@@ -102,7 +106,9 @@ fn http(port: u16, req: &str, body: Option<(&str, &[u8])>) -> String {
             Ok(out) => return out,
             Err(e) => {
                 last = e.to_string();
-                std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(attempt) + 50));
+                std::thread::sleep(std::time::Duration::from_millis(
+                    100 * u64::from(attempt) + 50,
+                ));
             }
         }
     }
@@ -113,7 +119,11 @@ fn http_once(port: u16, req: &str, body: Option<(&str, &[u8])>) -> std::io::Resu
     let mut request = Vec::new();
     match body {
         None => {
-            write!(request, "GET {req} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+            write!(
+                request,
+                "GET {req} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
         }
         Some((ctype, data)) => {
             write!(
@@ -136,7 +146,10 @@ fn raw_once(port: u16, request: &[u8]) -> std::io::Result<Vec<u8>> {
     let read = s.read_to_end(&mut out);
     if out.is_empty() {
         return Err(read.err().unwrap_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "closed without answering")
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "closed without answering",
+            )
         }));
     }
     Ok(out)
@@ -175,10 +188,17 @@ async fn serve(dir: &Path, build: impl Fn(u16) -> Command) -> Daemon {
         .await
         .unwrap();
         if ready {
-            return Daemon { _child: child, port, log };
+            return Daemon {
+                _child: child,
+                port,
+                log,
+            };
         }
         let tail = std::fs::read_to_string(&log).unwrap_or_default();
-        assert!(attempt < 2, "daemon exited without binding :{port}\n--- log ---\n{tail}");
+        assert!(
+            attempt < 2,
+            "daemon exited without binding :{port}\n--- log ---\n{tail}"
+        );
     }
     unreachable!()
 }
@@ -188,7 +208,9 @@ async fn serve(dir: &Path, build: impl Fn(u16) -> Command) -> Daemon {
 fn wait_ready(child: &mut KillOnDrop, port: u16, log: &Path) -> bool {
     let banner = format!("open the dashboard at  http://localhost:{port}/");
     for _ in 0..600 {
-        if std::fs::read_to_string(log).unwrap_or_default().contains(&banner)
+        if std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .contains(&banner)
             && TcpStream::connect(("127.0.0.1", port)).is_ok()
         {
             return true;
@@ -225,8 +247,7 @@ fn wait_ready(child: &mut KillOnDrop, port: u16, log: &Path) -> bool {
 #[tokio::test(flavor = "multi_thread")]
 async fn b3_duplicate_promotion_prefers_best_held_alternative() {
     let dir = std::env::temp_dir().join(format!("nzbfast-wlreg-b3-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let data = payload(120_000, 17);
     let mut articles = HashMap::new();
@@ -247,8 +268,9 @@ async fn b3_duplicate_promotion_prefers_best_held_alternative() {
             "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"&quot;ep.bin&quot; yEnc (1/9)\">\n    <groups><group>g</group></groups>\n    <segments>\n{inner}    </segments>\n  </file>\n</nzb>\n"
         )
     };
-    let ghost: Vec<(String, u64, u32)> =
-        (1..=3).map(|n| (format!("wbghost{n}@x"), 40_000, n)).collect();
+    let ghost: Vec<(String, u64, u32)> = (1..=3)
+        .map(|n| (format!("wbghost{n}@x"), 40_000, n))
+        .collect();
     let bad_xml = wrap(&seg_xml(&ghost)); // original - will finally fail
     let good_xml = wrap(&seg_xml(&segs)); // both alternatives are fetchable
 

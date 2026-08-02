@@ -48,9 +48,8 @@ const MAGICS: [&[u8; 4]; 3] = [b"PK\x03\x04", b"PK\x07\x08", b"PK00"];
 /// Extensions whose bytes ARE a zip container but whose file is the
 /// deliverable. Unpacking one is data loss, not extraction.
 const FINAL_FILE_EXTS: &[&str] = &[
-    "cbz", "epub", "docx", "xlsx", "pptx", "docm", "xlsm", "pptm", "odt", "ods", "odp",
-    "odg", "jar", "war", "aar", "apk", "ipa", "xpi", "crx", "vsix", "whl", "kra", "ora",
-    "sketch", "usdz",
+    "cbz", "epub", "docx", "xlsx", "pptx", "docm", "xlsm", "pptm", "odt", "ods", "odp", "odg",
+    "jar", "war", "aar", "apk", "ipa", "xpi", "crx", "vsix", "whl", "kra", "ora", "sketch", "usdz",
 ];
 
 /// How the container is laid out on disk.
@@ -96,7 +95,7 @@ pub fn has_magic(path: &Path) -> bool {
     let mut b = [0u8; 4];
     std::fs::File::open(path)
         .and_then(|mut f| f.read_exact(&mut b))
-        .is_ok_and(|()| MAGICS.iter().any(|m| *m == &b))
+        .is_ok_and(|()| MAGICS.contains(&&b))
 }
 
 /// A zip-container file whose extension marks it as the payload itself
@@ -193,7 +192,33 @@ pub fn split_part_name(name: &str) -> Option<(String, u32)> {
         return None;
     }
     let idx: u32 = tail.parse().ok()?;
-    (idx >= 1).then(|| (lower_head, idx))
+    (idx >= 1).then_some((lower_head, idx))
+}
+
+/// Bare-numeric split part for the STREAM: `movie.001`, no `.zip.`
+/// infix. Same digit discipline as [`split_part_name`], plus an
+/// ownership fence: a head naming another family's container is never a
+/// zip-split candidate, whatever the NZB looks like - `.7z.NNN` belongs
+/// to the 7z chase's grammar, and RAR/PAR2 heads carry their own magic,
+/// which classifies before the zip arm is ever consulted. The name
+/// alone proves nothing (RAR numeric volumes and hjsplit output share
+/// it), so the attach gates the DECLARED set on part 1 sniffing
+/// `PK\x03\x04` and forfeits otherwise, exactly as a declared
+/// `.zip.001` set does.
+pub fn numeric_split_part_name(name: &str) -> Option<(String, u32)> {
+    let (head, tail) = name.rsplit_once('.')?;
+    if tail.len() < 3 || tail.len() > 4 || !tail.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let lower_head = head.to_ascii_lowercase();
+    if [".zip", ".zipx", ".7z", ".rar", ".par2"]
+        .iter()
+        .any(|s| lower_head.ends_with(s))
+    {
+        return None;
+    }
+    let idx: u32 = tail.parse().ok()?;
+    (idx >= 1).then_some((lower_head, idx))
 }
 
 /// May the in-stream chase consider this POSTED file a single zip
@@ -211,9 +236,7 @@ pub fn chase_eligible_name(name: &str) -> bool {
     if is_final_name(&lower) {
         return false;
     }
-    lower.ends_with(".zip")
-        || lower.ends_with(".zipx")
-        || Path::new(&lower).extension().is_none()
+    lower.ends_with(".zip") || lower.ends_with(".zipx") || Path::new(&lower).extension().is_none()
 }
 
 /// Name-only test, for deciding BEFORE anything is on disk whether a
@@ -259,7 +282,10 @@ pub fn scan(dir: &Path) -> Vec<Finding> {
         } else if let Some((stem, n)) = split_part(&lower) {
             split.entry(stem).or_default().insert(n, path);
         } else if lower.ends_with(".zip") || lower.ends_with(".zipx") {
-            let stem = lower.rsplit_once('.').map(|(h, _)| h.to_string()).unwrap_or(lower);
+            let stem = lower
+                .rsplit_once('.')
+                .map(|(h, _)| h.to_string())
+                .unwrap_or(lower);
             named.insert(stem, path);
         } else if let Some((stem, n)) = numeric_part(&lower) {
             numeric.entry(stem).or_default().insert(n, path);
@@ -279,11 +305,19 @@ pub fn scan(dir: &Path) -> Vec<Finding> {
             None => file_name(&parts[0]),
         };
         parts.extend(tail);
-        out.push(Finding { name, parts, shape: Shape::Spanned });
+        out.push(Finding {
+            name,
+            parts,
+            shape: Shape::Spanned,
+        });
     }
     for (_stem, parts) in split {
         let parts: Vec<PathBuf> = parts.into_values().collect();
-        out.push(Finding { name: file_name(&parts[0]), parts, shape: Shape::ByteSplit });
+        out.push(Finding {
+            name: file_name(&parts[0]),
+            parts,
+            shape: Shape::ByteSplit,
+        });
     }
     // Bare numeric parts are only a zip set if the first part says so -
     // `.001` is also how RAR numeric volumes and hjsplit name themselves.
@@ -292,13 +326,25 @@ pub fn scan(dir: &Path) -> Vec<Finding> {
         if !has_magic(&parts[0]) {
             continue;
         }
-        out.push(Finding { name: file_name(&parts[0]), parts, shape: Shape::ByteSplit });
+        out.push(Finding {
+            name: file_name(&parts[0]),
+            parts,
+            shape: Shape::ByteSplit,
+        });
     }
     for (_stem, path) in named {
-        out.push(Finding { name: file_name(&path), parts: vec![path], shape: Shape::Single });
+        out.push(Finding {
+            name: file_name(&path),
+            parts: vec![path],
+            shape: Shape::Single,
+        });
     }
     for path in obfuscated {
-        out.push(Finding { name: file_name(&path), parts: vec![path], shape: Shape::Single });
+        out.push(Finding {
+            name: file_name(&path),
+            parts: vec![path],
+            shape: Shape::Single,
+        });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
@@ -311,7 +357,10 @@ pub fn first(dir: &Path) -> Option<Finding> {
 }
 
 fn file_name(p: &Path) -> String {
-    p.file_name().unwrap_or_default().to_string_lossy().to_string()
+    p.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -348,10 +397,14 @@ pub enum ZipError {
     /// Carries the user-facing reason.
     Unsupported(String),
     /// An entry's bytes did not match its stored CRC32.
-    BadCrc { name: String },
+    BadCrc {
+        name: String,
+    },
     /// An encrypted entry's password check refused the supplied
     /// password (ZipCrypto check byte / AE verifier).
-    WrongPassword { name: String },
+    WrongPassword {
+        name: String,
+    },
 }
 
 impl std::fmt::Display for ZipError {
@@ -386,24 +439,82 @@ pub(crate) const METHOD_DEFLATE: u16 = 8;
 /// streaming chase nor the disk reader could open one - so carrying it
 /// costs nothing and turns a dead shape into a working one.
 pub(crate) const METHOD_BZIP2: u16 = 12;
+/// LZMA (method 14). Same bargain as bzip2: `lzma-rust2` is already in
+/// the dependency tree for 7z's LZMA streams (via sevenz-rust2), so
+/// decoding it costs no new code in the binary that was not there
+/// already.
+pub(crate) const METHOD_LZMA: u16 = 14;
+
+/// The largest LZMA dictionary a zip entry may declare. The field is a
+/// hostile u32 from a downloaded header; the decoder grows its window
+/// lazily but clamps it to this declared value, so an absurd
+/// declaration is refused up front rather than honoured at read time.
+/// Real writers default to 8-64 MiB.
+const LZMA_DICT_MAX: u32 = 1 << 28;
 
 /// Can the tree decode this method? One predicate, because the chase and
 /// the disk reader must agree: a method the chase declines but the disk
 /// pass accepts merely costs a materialize, but the reverse ships a job
 /// that streamed nothing and then failed.
 pub(crate) fn method_supported(m: u16) -> bool {
-    matches!(m, METHOD_STORE | METHOD_DEFLATE | METHOD_BZIP2)
+    matches!(
+        m,
+        METHOD_STORE | METHOD_DEFLATE | METHOD_BZIP2 | METHOD_LZMA
+    )
 }
 
-/// The decoder for `m`, wrapping an already-decrypted byte source. Only
-/// ever called for a method [`method_supported`] accepted.
-pub(crate) fn decoder<'a, R: std::io::Read + 'a>(m: u16, src: R) -> Box<dyn std::io::Read + 'a> {
-    match m {
+/// The decoder for `e`'s real method, wrapping an already-decrypted byte
+/// source. Only ever called for a method [`method_supported`] accepted.
+/// Construction can read from `src` - zip's LZMA framing puts a
+/// properties header in front of the stream - so it can fail like any
+/// other read; callers report it with the entry's name the way they do
+/// body reads.
+pub(crate) fn decoder<'a, R: std::io::Read + 'a>(
+    e: &Entry,
+    mut src: R,
+) -> std::io::Result<Box<dyn std::io::Read + 'a>> {
+    use std::io::{Error, ErrorKind::InvalidData};
+    Ok(match real_method(e) {
         METHOD_STORE => Box::new(src),
         METHOD_BZIP2 => Box::new(bzip2::read::BzDecoder::new(src)),
+        METHOD_LZMA => {
+            // Zip method 14 prefixes the raw LZMA stream with its own
+            // header: a writer version (2 bytes, ignored), the length
+            // of the properties blob (2 bytes, spec value 5), then the
+            // blob - the lc/lp/pb byte plus the dictionary size. The
+            // uncompressed size is NOT in the stream; the entry header
+            // carries it, so the decoder is told where to stop instead
+            // of trusted to find an end marker (a stream that carries
+            // one anyway leaves it for the caller's drain, like any
+            // other source tail).
+            let mut hdr = [0u8; 4];
+            src.read_exact(&mut hdr)?;
+            let psize = u16::from_le_bytes([hdr[2], hdr[3]]) as usize;
+            if psize < 5 {
+                return Err(Error::new(InvalidData, "lzma properties are too short"));
+            }
+            let mut props = vec![0u8; psize];
+            src.read_exact(&mut props)?;
+            let dict_size = u32::from_le_bytes(props[1..5].try_into().unwrap());
+            if dict_size > LZMA_DICT_MAX {
+                return Err(Error::new(InvalidData, "lzma dictionary is too large"));
+            }
+            if e.uncompressed_size == 0 {
+                // Nothing to decode, and the known-size decode loop is
+                // not defined for a zero-byte target.
+                return Ok(Box::new(std::io::empty()));
+            }
+            Box::new(lzma_rust2::LzmaReader::new_with_props(
+                src,
+                e.uncompressed_size,
+                props[0],
+                dict_size,
+                None,
+            )?)
+        }
         // Deflate by elimination - `method_supported` gates every caller.
         _ => Box::new(flate2::read::DeflateDecoder::new(src)),
-    }
+    })
 }
 
 pub(crate) fn method_name(m: u16) -> &'static str {
@@ -429,6 +540,15 @@ const MAX_ENTRIES: u64 = 200_000;
 /// Longest entry name we will even consider (the sanitizer still has the
 /// final say on where it may land).
 const MAX_NAME: usize = 4096;
+/// How far back from the end-of-central-directory record a zip64 end
+/// record is still allowed to sit and count as the directory's end. The
+/// record and its locator are 76 bytes, so this is slack for an
+/// extensible data sector and nothing more. It is a bound on where the
+/// probe will READ, not just on what it will accept: the one-pass source
+/// blocks on bytes that have not arrived, and the EOCD is itself within
+/// 65557 bytes of the end, so this keeps the read inside the tail that
+/// both callers have already promoted.
+const MAX_Z64_TAIL_GAP: u64 = 4096;
 
 /// One central-directory record, already Zip64-resolved.
 #[derive(Debug, Clone)]
@@ -704,19 +824,18 @@ impl Archive {
         // Crypto framing + password check, shared verbatim with the
         // in-stream chase (see `entry_crypto`).
         let crypto = entry_crypto(&self.parts, e, data, end, password)?;
-        let mut rd_src: Box<dyn std::io::Read + '_> =
-            Box::new(crypto.cipher.wrap(RangeReader {
-                parts: &self.parts,
-                pos: data + crypto.head,
-                end: end - crypto.tail,
-            }));
+        let mut rd_src: Box<dyn std::io::Read + '_> = Box::new(crypto.cipher.wrap(RangeReader {
+            parts: &self.parts,
+            pos: data + crypto.head,
+            end: end - crypto.tail,
+        }));
         let mut crc = crc32fast::Hasher::new();
         let mut written = 0u64;
         let mut buf = vec![0u8; 64 * 1024];
         // One code path for both methods: `store` is just the identity
         // decoder, so the CRC/size accounting below cannot drift between
         // them.
-        let mut rd = decoder(real_method, RdAdapter(&mut rd_src));
+        let mut rd = decoder(e, RdAdapter(&mut rd_src))?;
         loop {
             let n = rd.read(&mut buf)?;
             if n == 0 {
@@ -744,9 +863,11 @@ impl Archive {
             return Err(ZipError::Malformed("entry shorter than its declared size"));
         }
         // AE-2 zeroes the CRC field by spec - its HMAC is the check.
-        let check_crc = e.aes.map_or(true, |a| !a.skips_crc());
+        let check_crc = e.aes.is_none_or(|a| !a.skips_crc());
         if check_crc && crc.finalize() != e.crc32 {
-            return Err(ZipError::BadCrc { name: e.name.clone() });
+            return Err(ZipError::BadCrc {
+                name: e.name.clone(),
+            });
         }
         Ok(())
     }
@@ -766,14 +887,18 @@ pub(crate) fn entry_data_offset<S: Source + ?Sized>(parts: &S, e: &Entry) -> Res
     let mut hdr = [0u8; 30];
     parts.read_exact_at(e.local_offset, &mut hdr)?;
     if &hdr[0..4] != b"PK\x03\x04" {
-        return Err(ZipError::Malformed("entry does not start with a local header"));
+        return Err(ZipError::Malformed(
+            "entry does not start with a local header",
+        ));
     }
     let name_len = rd_u16(&hdr[26..]) as u64;
     let extra_len = rd_u16(&hdr[28..]) as u64;
     e.local_offset
         .checked_add(30 + name_len + extra_len)
         .filter(|&o| o <= parts.total())
-        .ok_or(ZipError::Malformed("entry data starts past end of container"))
+        .ok_or(ZipError::Malformed(
+            "entry data starts past end of container",
+        ))
 }
 
 /// Reads a bounded logical range, so a decoder can never run past the
@@ -830,12 +955,12 @@ impl<R: std::io::Read> std::io::Read for AeReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.src.read(buf)?;
         if n == 0 {
-            if let Some(mac) = self.mac.take() {
-                if mac.finalize() != self.want {
-                    return Err(std::io::Error::other(
-                        "AES authentication failed (wrong password, or the archive is damaged)",
-                    ));
-                }
+            if let Some(mac) = self.mac.take()
+                && mac.finalize() != self.want
+            {
+                return Err(std::io::Error::other(
+                    "AES authentication failed (wrong password, or the archive is damaged)",
+                ));
             }
             return Ok(0);
         }
@@ -882,9 +1007,12 @@ impl EntryCipher {
         match self {
             EntryCipher::None => CryptoReader::Plain(src),
             EntryCipher::ZipCrypto(zc) => CryptoReader::Zc(ZipCryptoReader { src, zc }),
-            EntryCipher::Ae { ctr, mac, want } => {
-                CryptoReader::Ae(AeReader { src, ctr, mac: Some(mac), want })
-            }
+            EntryCipher::Ae { ctr, mac, want } => CryptoReader::Ae(AeReader {
+                src,
+                ctr,
+                mac: Some(mac),
+                want,
+            }),
         }
     }
 }
@@ -922,7 +1050,7 @@ pub(crate) fn real_method(e: &Entry) -> u16 {
 /// against it would fail every AE-2 entry; AE-1 and ZipCrypto keep the
 /// real CRC.
 pub(crate) fn crc_is_authoritative(e: &Entry) -> bool {
-    e.aes.map_or(true, |a| !a.skips_crc())
+    e.aes.is_none_or(|a| !a.skips_crc())
 }
 
 /// Resolve an entry's crypto framing and VERIFY the password, reading
@@ -942,7 +1070,11 @@ pub(crate) fn entry_crypto<S: Source>(
     password: Option<&str>,
 ) -> Result<EntryCrypto, ZipError> {
     if !e.is_encrypted() {
-        return Ok(EntryCrypto { head: 0, tail: 0, cipher: EntryCipher::None });
+        return Ok(EntryCrypto {
+            head: 0,
+            tail: 0,
+            cipher: EntryCipher::None,
+        });
     }
     let Some(pw) = password else {
         return Err(ZipError::Unsupported(format!(
@@ -952,8 +1084,8 @@ pub(crate) fn entry_crypto<S: Source>(
     };
     match &e.aes {
         Some(spec) => {
-            let (key_len, salt_len) = crate::zipcrypt::ae_strength_lens(spec.strength)
-                .ok_or_else(|| {
+            let (key_len, salt_len) =
+                crate::zipcrypt::ae_strength_lens(spec.strength).ok_or_else(|| {
                     ZipError::Unsupported(format!(
                         "{} uses an unknown AES strength ({})",
                         e.name, spec.strength
@@ -968,7 +1100,9 @@ pub(crate) fn entry_crypto<S: Source>(
             src.read_exact_at(data, &mut hd)?;
             let keys = crate::zipcrypt::ae_derive(pw.as_bytes(), &hd[..salt_len], key_len);
             if hd[salt_len..] != keys.verify {
-                return Err(ZipError::WrongPassword { name: e.name.clone() });
+                return Err(ZipError::WrongPassword {
+                    name: e.name.clone(),
+                });
             }
             let mut want = [0u8; crate::zipcrypt::AE_AUTH_LEN];
             src.read_exact_at(end - crate::zipcrypt::AE_AUTH_LEN as u64, &mut want)?;
@@ -986,16 +1120,24 @@ pub(crate) fn entry_crypto<S: Source>(
         }
         None => {
             if e.compressed_size < 12 {
-                return Err(ZipError::Malformed("ZipCrypto entry too short for its header"));
+                return Err(ZipError::Malformed(
+                    "ZipCrypto entry too short for its header",
+                ));
             }
             let mut hdr = [0u8; 12];
             src.read_exact_at(data, &mut hdr)?;
             let mut zc = crate::zipcrypt::ZipCrypto::new(pw.as_bytes());
             zc.decrypt(&mut hdr);
             if hdr[11] != crate::zipcrypt::zipcrypto_check_byte(e.flags, e.crc32, e.dos_time) {
-                return Err(ZipError::WrongPassword { name: e.name.clone() });
+                return Err(ZipError::WrongPassword {
+                    name: e.name.clone(),
+                });
             }
-            Ok(EntryCrypto { head: 12, tail: 0, cipher: EntryCipher::ZipCrypto(zc) })
+            Ok(EntryCrypto {
+                head: 12,
+                tail: 0,
+                cipher: EntryCipher::ZipCrypto(zc),
+            })
         }
     }
 }
@@ -1072,6 +1214,30 @@ pub(crate) fn find_central_directory<S: Source + ?Sized>(
     // and a saturated copy would fail every genuinely large archive.
     let eocd_at = start + pos as u64;
     let mut anchor = eocd_at;
+    // A writer emits the zip64 record and locator whenever the archive
+    // used zip64 ANYWHERE - a member of 4 GiB or more, or an input of
+    // unknown size piped in - even when every 32-bit EOCD field still
+    // fits. Info-ZIP and libarchive both do, and the branch below never
+    // sees those archives. Their 76 bytes sit between the directory's end
+    // and the EOCD, so the record, not the EOCD, is where the directory
+    // ends: a SECOND legal anchor. Probed by looking for the signature at
+    // the position the 32-bit fields already name, never by following the
+    // locator's pointer - so nothing attacker-chosen decides where to
+    // read, and the read stays a bounded step behind the EOCD, inside the
+    // tail both callers have already promoted (the one-pass source BLOCKS
+    // on bytes that have not arrived). A miss is silent and leaves the
+    // EOCD anchor alone; the geometry still comes from the 32-bit fields,
+    // which are authoritative whenever they fit.
+    let mut z64_anchor = None;
+    if let Some(ends) = cd_off.checked_add(cd_size)
+        && ends < eocd_at
+        && eocd_at - ends <= MAX_Z64_TAIL_GAP
+    {
+        let mut sig = [0u8; 4];
+        if parts.read_exact_at(ends, &mut sig).is_ok() && &sig == b"PK\x06\x06" {
+            z64_anchor = Some(ends);
+        }
+    }
     if entries == u16::MAX as u64
         || per_disk == u16::MAX as u64
         || cd_size == u32::MAX as u64
@@ -1094,7 +1260,9 @@ pub(crate) fn find_central_directory<S: Source + ?Sized>(
         let mut z64 = [0u8; 56];
         parts.read_exact_at(z64_at, &mut z64)?;
         if &z64[0..4] != b"PK\x06\x06" {
-            return Err(ZipError::Malformed("zip64 end record not where the locator says"));
+            return Err(ZipError::Malformed(
+                "zip64 end record not where the locator says",
+            ));
         }
         per_disk = rd_u64(&z64[24..]);
         entries = rd_u64(&z64[32..]);
@@ -1105,6 +1273,10 @@ pub(crate) fn find_central_directory<S: Source + ?Sized>(
         // not the 22-byte EOCD, is what the directory must end at: the
         // locator and the EOCD follow it.
         anchor = z64_at;
+        // Once the record is authoritative there is exactly one legal
+        // place for the directory to end, so drop the second anchor and
+        // leave this path governed by the same strict rule as before.
+        z64_anchor = None;
     }
     if entries > MAX_ENTRIES {
         return Err(ZipError::Unsupported(format!(
@@ -1117,7 +1289,11 @@ pub(crate) fn find_central_directory<S: Source + ?Sized>(
     // the total - and there is no spanned-read test in the tree to catch
     // a wrong guess, so do not guess.
     if !multi_disk {
-        if cd_off.checked_add(cd_size) != Some(anchor) {
+        // Two legal places to end: at the record the geometry came from,
+        // or - only on the unsaturated path - at a zip64 end record that
+        // the geometry itself points at.
+        let ends_at = cd_off.checked_add(cd_size);
+        if ends_at != Some(anchor) && z64_anchor != ends_at {
             return Err(ZipError::Malformed(
                 "the central directory does not end at the end-of-central-directory record",
             ));
@@ -1130,7 +1306,9 @@ pub(crate) fn find_central_directory<S: Source + ?Sized>(
     }
     let cd = parts
         .logical(multi_disk, cd_disk_no, cd_off)
-        .ok_or(ZipError::Malformed("central directory outside the container"))?;
+        .ok_or(ZipError::Malformed(
+            "central directory outside the container",
+        ))?;
     Ok((cd, entries, cd_size, multi_disk))
 }
 
@@ -1206,7 +1384,7 @@ pub(crate) fn parse_central_directory<S: Source + ?Sized>(
             if tag == 0x0001 {
                 let body = &extra[body_at..body_at + len];
                 let mut p = 0usize;
-                let mut take = |p: &mut usize| -> Option<u64> {
+                let take = |p: &mut usize| -> Option<u64> {
                     if *p + 8 <= body.len() {
                         let v = rd_u64(&body[*p..]);
                         *p += 8;
@@ -1222,8 +1400,7 @@ pub(crate) fn parse_central_directory<S: Source + ?Sized>(
                     csize = take(&mut p).ok_or(ZipError::Malformed("zip64 field truncated"))?;
                 }
                 if local_off == u32::MAX as u64 {
-                    local_off =
-                        take(&mut p).ok_or(ZipError::Malformed("zip64 field truncated"))?;
+                    local_off = take(&mut p).ok_or(ZipError::Malformed("zip64 field truncated"))?;
                 }
                 if disk == u16::MAX as u32 && p + 4 <= body.len() {
                     disk = rd_u32(&body[p..]);
@@ -1276,6 +1453,115 @@ pub(crate) fn parse_central_directory<S: Source + ?Sized>(
     Ok(out)
 }
 
+/// Fuzz seam for the CHASE's reader path (`zip_parse` covers the disk
+/// one). Both drive the same `Source`-generic parser, but only through
+/// this entry point are the pieces exercised in the ORDER and shape the
+/// in-stream worker uses them: `entry_data_offset` against a
+/// non-`Parts` source, `entry_crypto` resolving framing by reading
+/// ABOVE the body it is about to stream, and the explicit drain that
+/// reaches an AE HMAC a deflate decoder would otherwise stop short of.
+///
+/// It matters now that a zip chases at every depth: the bytes reaching
+/// this path can come from inside another archive, so nothing upstream
+/// has validated them either.
+///
+/// Mirrors `Extractor::zip_run` minus the extractor - keep the two in
+/// step when either changes.
+#[doc(hidden)]
+pub fn fuzz_stream_pass(data: &[u8], password: Option<&str>) {
+    struct SliceSource<'a>(&'a [u8]);
+    impl Source for SliceSource<'_> {
+        fn read_exact_at(&self, off: u64, buf: &mut [u8]) -> Result<(), ZipError> {
+            let at = usize::try_from(off).map_err(|_| ZipError::Malformed("offset overflow"))?;
+            let end = at
+                .checked_add(buf.len())
+                .filter(|&e| e <= self.0.len())
+                .ok_or(ZipError::Malformed("read past end of container"))?;
+            buf.copy_from_slice(&self.0[at..end]);
+            Ok(())
+        }
+        fn total(&self) -> u64 {
+            self.0.len() as u64
+        }
+    }
+    use std::io::Read as _;
+    let src = SliceSource(data);
+    let total = src.total();
+    let Ok((cd, count, cd_size, multi_disk)) = find_central_directory(&src) else {
+        return;
+    };
+    let Ok(entries) = parse_central_directory(&src, cd, count, cd_size, multi_disk) else {
+        return;
+    };
+    let mut buf = vec![0u8; 64 * 1024];
+    for e in entries.iter().filter(|e| !e.is_dir && !e.is_symlink()) {
+        if !method_supported(real_method(e)) {
+            continue;
+        }
+        let Ok(data_at) = entry_data_offset(&src, e) else {
+            continue;
+        };
+        let Some(end) = data_at
+            .checked_add(e.compressed_size)
+            .filter(|&v| v <= total)
+        else {
+            continue;
+        };
+        let Ok(crypto) = entry_crypto(&src, e, data_at, end, password) else {
+            continue;
+        };
+        // Bound the sink the same way `zip_parse` does: a valid header
+        // may legitimately claim a huge entry, and the fuzzer should not
+        // be measuring RAM.
+        let mut left: u64 = 1 << 20;
+        let mut rd_src = crypto.cipher.wrap(SourceRangeReader {
+            src: &src,
+            pos: data_at + crypto.head,
+            end: end.saturating_sub(crypto.tail),
+        });
+        if let Ok(mut rd) = decoder(e, &mut rd_src) {
+            while left > 0 {
+                match rd.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => left = left.saturating_sub(n as u64),
+                }
+            }
+        }
+        // The drain that authenticates an AE entry, exactly as the
+        // worker does it.
+        while let Ok(n) = rd_src.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+        }
+    }
+}
+
+/// Bounded `io::Read` over a range of a [`Source`], for
+/// [`fuzz_stream_pass`] - the in-memory twin of the chase's
+/// `BlockingRangeReader`. Distinct from this module's disk-path
+/// `RangeReader`, which reads through `Parts`.
+struct SourceRangeReader<'a, S: Source + ?Sized> {
+    src: &'a S,
+    pos: u64,
+    end: u64,
+}
+
+impl<S: Source + ?Sized> std::io::Read for SourceRangeReader<'_, S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.end.saturating_sub(self.pos);
+        if left == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+        let take = (left as usize).min(buf.len());
+        self.src
+            .read_exact_at(self.pos, &mut buf[..take])
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        self.pos += take as u64;
+        Ok(take)
+    }
+}
+
 /// Minimal zip WRITER, for unit tests and the fuzz corpus - the same
 /// role `rar::fixtures` plays for RAR. Deliberately hand-rolled so the
 /// reader is tested against bytes we control completely, including the
@@ -1288,7 +1574,11 @@ pub mod fixtures {
         ZipCrypto { password: &'a str },
         /// WinZip AE: `vendor_version` 1 (CRC kept) or 2 (CRC zeroed),
         /// `strength` 1/2/3 for AES-128/192/256.
-        Ae { password: &'a str, strength: u8, vendor_version: u16 },
+        Ae {
+            password: &'a str,
+            strength: u8,
+            vendor_version: u16,
+        },
     }
 
     /// One entry to encode: (name, payload, method, flags, external attrs).
@@ -1324,10 +1614,22 @@ pub mod fixtures {
             }
         }
         pub fn deflated(name: &'a str, data: &'a [u8]) -> Spec<'a> {
-            Spec { method: super::METHOD_DEFLATE, ..Spec::stored(name, data) }
+            Spec {
+                method: super::METHOD_DEFLATE,
+                ..Spec::stored(name, data)
+            }
         }
         pub fn bzip2(name: &'a str, data: &'a [u8]) -> Spec<'a> {
-            Spec { method: super::METHOD_BZIP2, ..Spec::stored(name, data) }
+            Spec {
+                method: super::METHOD_BZIP2,
+                ..Spec::stored(name, data)
+            }
+        }
+        pub fn lzma(name: &'a str, data: &'a [u8]) -> Spec<'a> {
+            Spec {
+                method: super::METHOD_LZMA,
+                ..Spec::stored(name, data)
+            }
         }
     }
 
@@ -1345,19 +1647,39 @@ pub mod fixtures {
         match s.method {
             super::METHOD_DEFLATE => {
                 use std::io::Write as _;
-                let mut e = flate2::write::DeflateEncoder::new(
-                    Vec::new(),
-                    flate2::Compression::default(),
-                );
+                let mut e =
+                    flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
                 e.write_all(s.data).unwrap();
                 e.finish().unwrap()
             }
             super::METHOD_BZIP2 => {
                 use std::io::Write as _;
-                let mut e =
-                    bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+                let mut e = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
                 e.write_all(s.data).unwrap();
                 e.finish().unwrap()
+            }
+            super::METHOD_LZMA => {
+                use std::io::Write as _;
+                let mut opts = lzma_rust2::LzmaOptions::with_preset(6);
+                // Tiny fixtures; a small window keeps the decode cheap
+                // and exercises nothing less.
+                opts.dict_size = 1 << 16;
+                let mut w =
+                    lzma_rust2::LzmaWriter::new_no_header(Vec::new(), &opts, false).unwrap();
+                w.write_all(s.data).unwrap();
+                let props = w.props();
+                let stream = w.finish().unwrap();
+                // Method 14's framing: writer version, properties
+                // length, the 5-byte properties blob, then the raw
+                // stream. No end marker - sizes are declared, so the
+                // decoder is told where to stop, like real writers do.
+                let mut out = Vec::with_capacity(stream.len() + 9);
+                u16le(0x0014, &mut out);
+                u16le(5, &mut out);
+                out.push(props);
+                u32le(opts.dict_size, &mut out);
+                out.extend_from_slice(&stream);
+                out
             }
             _ => s.data.to_vec(),
         }
@@ -1382,13 +1704,20 @@ pub mod fixtures {
                 z.encrypt(&mut payload);
                 (payload, s.method, crc, Vec::new())
             }
-            Some(Encrypt::Ae { password, strength, vendor_version }) => {
+            Some(Encrypt::Ae {
+                password,
+                strength,
+                vendor_version,
+            }) => {
                 let (kl, sl) = crate::zipcrypt::ae_strength_lens(*strength).expect("strength");
-                let salt: Vec<u8> =
-                    (0..sl).map(|i| (i as u8).wrapping_mul(41).wrapping_add(7)).collect();
+                let salt: Vec<u8> = (0..sl)
+                    .map(|i| (i as u8).wrapping_mul(41).wrapping_add(7))
+                    .collect();
                 let keys = crate::zipcrypt::ae_derive(password.as_bytes(), &salt, kl);
                 let mut ct = comp;
-                crate::zipcrypt::AeCtr::new(&keys.enc_key).expect("key").xor(&mut ct);
+                crate::zipcrypt::AeCtr::new(&keys.enc_key)
+                    .expect("key")
+                    .xor(&mut ct);
                 let mut mac = crate::zipcrypt::AeMac::new(&keys.mac_key);
                 mac.update(&ct);
                 let auth = mac.finalize();
@@ -1534,7 +1863,10 @@ mod tests {
         for n in ["comic.cbz", "book.epub", "sheet.xlsx", "app.apk", "lib.jar"] {
             write(&d, n, PK);
         }
-        assert!(scan(&d).is_empty(), "payload formats must never be unpacked");
+        assert!(
+            scan(&d).is_empty(),
+            "payload formats must never be unpacked"
+        );
         assert!(!is_container(&d.join("comic.cbz")));
         assert!(!name_is_zip_shaped("comic.cbz"));
     }
@@ -1628,10 +1960,23 @@ mod tests {
 
     #[test]
     fn name_shape_covers_what_a_nzb_can_show() {
-        for n in ["Movie.zip", "MOVIE.ZIP", "movie.zipx", "movie.z01", "movie.zip.001"] {
+        for n in [
+            "Movie.zip",
+            "MOVIE.ZIP",
+            "movie.zipx",
+            "movie.z01",
+            "movie.zip.001",
+        ] {
             assert!(name_is_zip_shaped(n), "{n} should read as zip-packed");
         }
-        for n in ["movie.rar", "movie.r01", "movie.7z", "movie.7z.001", "movie.001", "movie"] {
+        for n in [
+            "movie.rar",
+            "movie.r01",
+            "movie.7z",
+            "movie.7z.001",
+            "movie.001",
+            "movie",
+        ] {
             assert!(!name_is_zip_shaped(n), "{n} must not read as zip-packed");
         }
     }
@@ -1641,7 +1986,9 @@ mod tests {
     use fixtures::Spec;
 
     fn payload(n: usize, seed: u8) -> Vec<u8> {
-        (0..n).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
+        (0..n)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect()
     }
 
     /// Write a container to disk and open it.
@@ -1695,20 +2042,32 @@ mod tests {
     #[test]
     fn declined_methods_and_encryption_say_which() {
         let data = payload(1000, 7);
-        // lzma stands in for the undecodable class now that bzip2 is
-        // decoded (see `bzip2_entries_decode_on_the_disk_path`).
-        let z = fixtures::zip_of(&[Spec { method: 14, ..Spec::stored("a.bin", &data) }]);
-        let (d, ar) = open_bytes("rd-lzma", &z);
+        // zstd stands in for the undecodable class now that bzip2 and
+        // lzma are decoded (see `bzip2_entries_decode_on_the_disk_path`).
+        let z = fixtures::zip_of(&[Spec {
+            method: 93,
+            ..Spec::stored("a.bin", &data)
+        }]);
+        let (d, ar) = open_bytes("rd-zstd", &z);
         let e = extract(&ar.unwrap(), 0).unwrap_err();
-        assert!(matches!(&e, ZipError::Unsupported(m) if m.contains("lzma")), "{e}");
+        assert!(
+            matches!(&e, ZipError::Unsupported(m) if m.contains("zstd")),
+            "{e}"
+        );
         std::fs::remove_dir_all(&d).unwrap();
 
-        let z = fixtures::zip_of(&[Spec { flags: 0x0001, ..Spec::stored("a.bin", &data) }]);
+        let z = fixtures::zip_of(&[Spec {
+            flags: 0x0001,
+            ..Spec::stored("a.bin", &data)
+        }]);
         let (d, ar) = open_bytes("rd-enc", &z);
         let ar = ar.unwrap();
         assert!(ar.entries()[0].is_encrypted());
         let e = extract(&ar, 0).unwrap_err();
-        assert!(matches!(&e, ZipError::Unsupported(m) if m.contains("password")), "{e}");
+        assert!(
+            matches!(&e, ZipError::Unsupported(m) if m.contains("password")),
+            "{e}"
+        );
         std::fs::remove_dir_all(&d).unwrap();
     }
 
@@ -1721,6 +2080,18 @@ mod tests {
         let data: Vec<u8> = (0..90_000u32).map(|i| (i / 613 % 241) as u8).collect();
         let z = fixtures::zip_of(&[Spec::bzip2("a.bin", &data)]);
         let (d, ar) = open_bytes("rd-bz-ok", &z);
+        assert_eq!(extract(&ar.unwrap(), 0).unwrap(), data);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// lzma (method 14) decodes on the disk path too - same decoder
+    /// factory as the chase, pinned directly for the same reason as
+    /// bzip2 above.
+    #[test]
+    fn lzma_entries_decode_on_the_disk_path() {
+        let data: Vec<u8> = (0..90_000u32).map(|i| (i / 613 % 241) as u8).collect();
+        let z = fixtures::zip_of(&[Spec::lzma("a.bin", &data)]);
+        let (d, ar) = open_bytes("rd-lzma-ok", &z);
         assert_eq!(extract(&ar.unwrap(), 0).unwrap(), data);
         std::fs::remove_dir_all(&d).unwrap();
     }
@@ -1741,7 +2112,10 @@ mod tests {
     #[test]
     fn zip64_sizes_are_read_from_the_extra_field() {
         let data = payload(40_000, 11);
-        let z = fixtures::zip_of(&[Spec { zip64: true, ..Spec::stored("big.bin", &data) }]);
+        let z = fixtures::zip_of(&[Spec {
+            zip64: true,
+            ..Spec::stored("big.bin", &data)
+        }]);
         let (d, ar) = open_bytes("rd-z64", &z);
         let ar = ar.unwrap();
         assert_eq!(ar.entries()[0].uncompressed_size, data.len() as u64);
@@ -1779,7 +2153,11 @@ mod tests {
             + rd_u16(&good[rec + 32..]) as u32;
         // The comment starts at `good.len()`, so that is where the
         // forged record will sit once it is appended.
-        let cd_size = if stretch { good.len() as u32 - cd_off } else { one };
+        let cd_size = if stretch {
+            good.len() as u32 - cd_off
+        } else {
+            one
+        };
         let mut f = Vec::new();
         f.extend_from_slice(b"PK\x05\x06");
         f.extend_from_slice(&0u16.to_le_bytes()); // this disk
@@ -1807,7 +2185,11 @@ mod tests {
         let specs = [Spec::stored("a.bin", &a), Spec::stored("b.bin", &b)];
         let good = fixtures::zip_of(&specs);
         let (d, ar) = open_bytes("rd-forge-clean", &good);
-        assert_eq!(ar.unwrap().entries().len(), 2, "the untouched archive still opens");
+        assert_eq!(
+            ar.unwrap().entries().len(),
+            2,
+            "the untouched archive still opens"
+        );
         std::fs::remove_dir_all(&d).unwrap();
         for (tag, stretch) in [("short", false), ("stretched", true)] {
             let z = fixtures::zip_of_with_comment(&specs, &forged_eocd(&good, stretch));
@@ -1887,6 +2269,49 @@ mod tests {
         std::fs::remove_dir_all(&d).unwrap();
     }
 
+    /// The sibling shape, and the one REAL writers actually emit: a
+    /// zip64 end record and locator with every 32-bit EOCD field still
+    /// unsaturated. Info-ZIP writes it whenever the archive used zip64
+    /// anywhere - a member of 4 GiB or more, or an input of unknown size
+    /// piped in on stdin - and so does libarchive; the 76 bytes of
+    /// record plus locator then sit between the directory's end and the
+    /// EOCD. The directory legally ends at the record, not at the EOCD.
+    #[test]
+    fn an_unsaturated_zip64_end_record_is_a_legal_anchor() {
+        let a = payload(2_000, 21);
+        let b = payload(3_000, 22);
+        let specs = [Spec::stored("a.bin", &a), Spec::stored("b.bin", &b)];
+        let good = fixtures::zip_of(&specs);
+        let real_at = good.len() - 22;
+        let cd_size = rd_u32(&good[real_at + 12..]) as u64;
+        let cd_off = rd_u32(&good[real_at + 16..]) as u64;
+        let mut z = good[..real_at].to_vec();
+        let z64_at = z.len() as u64;
+        z.extend_from_slice(b"PK\x06\x06");
+        z.extend_from_slice(&44u64.to_le_bytes()); // size of the rest
+        z.extend_from_slice(&45u16.to_le_bytes()); // version made by
+        z.extend_from_slice(&45u16.to_le_bytes()); // version needed
+        z.extend_from_slice(&0u32.to_le_bytes()); // this disk
+        z.extend_from_slice(&0u32.to_le_bytes()); // disk with the directory
+        z.extend_from_slice(&2u64.to_le_bytes()); // entries on this disk
+        z.extend_from_slice(&2u64.to_le_bytes()); // entries in total
+        z.extend_from_slice(&cd_size.to_le_bytes());
+        z.extend_from_slice(&cd_off.to_le_bytes());
+        z.extend_from_slice(b"PK\x06\x07"); // locator
+        z.extend_from_slice(&0u32.to_le_bytes()); // disk holding the record
+        z.extend_from_slice(&z64_at.to_le_bytes());
+        z.extend_from_slice(&1u32.to_le_bytes()); // total disks
+        // Nothing saturates: the 32-bit copies all fit, which is exactly
+        // what makes this the shape the saturation branch never sees.
+        z.extend_from_slice(&good[real_at..]);
+        let (d, ar) = open_bytes("rd-z64-unsat", &z);
+        let ar = ar.unwrap_or_else(|e| panic!("a legal Info-ZIP-shaped archive was refused: {e}"));
+        assert_eq!(ar.entries().len(), 2);
+        assert_eq!(extract(&ar, 0).unwrap(), a);
+        assert_eq!(extract(&ar, 1).unwrap(), b);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
     #[test]
     fn a_directory_entry_is_flagged_and_not_payload() {
         let z = fixtures::zip_of(&[
@@ -1914,7 +2339,10 @@ mod tests {
             ("tiny", b"PK".to_vec()),
             ("no-eocd", payload(3_000, 1)),
             ("head-only", good[..good.len() / 2].to_vec()),
-            ("eocd-only", b"PK\x05\x06".iter().copied().chain([0u8; 18]).collect()),
+            (
+                "eocd-only",
+                b"PK\x05\x06".iter().copied().chain([0u8; 18]).collect(),
+            ),
             (
                 "forged-eocd-short",
                 fixtures::zip_of_with_comment(&two, &forged_eocd(&two_bytes, false)),
@@ -1974,6 +2402,11 @@ mod tests {
             ("store_deflate.zip", 3usize),
             ("commented.zip", 1),
             ("zip64.zip", 1),
+            // Written by Info-ZIP from stdin, so the input size was
+            // unknown and it emitted a zip64 end record and locator with
+            // every 32-bit EOCD field still fitting. No Python-written
+            // fixture has that shape, and it is what real writers emit.
+            ("zip64_unsaturated.zip", 1),
             ("empty_dirs.zip", 2),
         ];
         for (name, want) in cases {
@@ -2026,7 +2459,10 @@ mod tests {
         }
         // The AES fixture must actually be AE, not ZipCrypto in disguise.
         let a = Archive::open(&[root.join("aes256.zip")]).unwrap();
-        assert!(a.entries()[0].aes.is_some(), "aes256.zip lacks the AE extra field");
+        assert!(
+            a.entries()[0].aes.is_some(),
+            "aes256.zip lacks the AE extra field"
+        );
     }
 
     // -- phase 3: encrypted entries ------------------------------------
@@ -2080,7 +2516,11 @@ mod tests {
         let data = payload(50_000, 37);
         for (strength, ver) in [(1u8, 1u16), (2, 1), (3, 1), (3, 2)] {
             let z = fixtures::zip_of(&[Spec {
-                encrypt: Some(fixtures::Encrypt::Ae { password: "hunter2", strength, vendor_version: ver }),
+                encrypt: Some(fixtures::Encrypt::Ae {
+                    password: "hunter2",
+                    strength,
+                    vendor_version: ver,
+                }),
                 ..Spec::deflated("a.bin", &data)
             }]);
             let (d, ar) = open_bytes(&format!("ae-{strength}-{ver}"), &z);
@@ -2104,7 +2544,11 @@ mod tests {
         // Tamper: the verifier accepts (password is right), the HMAC
         // must refuse - never publish unauthenticated plaintext.
         let z = fixtures::zip_of(&[Spec {
-            encrypt: Some(fixtures::Encrypt::Ae { password: "hunter2", strength: 3, vendor_version: 2 }),
+            encrypt: Some(fixtures::Encrypt::Ae {
+                password: "hunter2",
+                strength: 3,
+                vendor_version: 2,
+            }),
             tamper: true,
             ..Spec::stored("a.bin", &data)
         }]);

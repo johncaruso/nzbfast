@@ -20,7 +20,9 @@ use std::sync::Arc;
 
 mod extract;
 mod write;
-pub use extract::extract_volumes_to;
+pub use extract::{
+    extract_volume_sequence_to, extract_volume_sequence_to_with_progress, extract_volumes_to,
+};
 use extract::{DecoderSession, DecryptingReader};
 pub use write::{
     write_compressed_archive, write_compressed_archive_with_comment,
@@ -996,25 +998,75 @@ impl Archive {
         })
     }
 
+    /// Parses an archive whose bytes are still arriving.
+    ///
+    /// `expected_len` is the archive's final size (the caller knows it up
+    /// front) and bounds every read; the source only needs to deliver bytes
+    /// toward it. Reads BLOCK at the data frontier - through
+    /// [`ArchiveSource::read_range`] - so this call, and any later
+    /// extraction from the returned archive, waits for missing bytes
+    /// instead of failing. Same walk as the file-backed parse: each
+    /// member's header precedes its data and data areas are skipped
+    /// arithmetically, so the parse cursor trails the arrival frontier and
+    /// returns once this volume's headers (through the end of the file
+    /// list) are readable.
+    ///
+    /// The archive signature must sit at offset 0: streaming sources carry
+    /// payloads whose start is already known, so no SFX stub scan is done.
+    pub fn parse_stream(
+        source: std::sync::Arc<dyn crate::source::BlockingRangeSource>,
+        expected_len: u64,
+        options: crate::ArchiveReadOptions<'_>,
+    ) -> Result<Self> {
+        let archive_len = usize::try_from(expected_len).map_err(|_| {
+            Error::InvalidHeader("RAR 1.5 archive size overflows host address size")
+        })?;
+        let source = ArchiveSource::Stream {
+            source,
+            len: archive_len,
+        };
+        let signature = source.read_range(0..RAR15_SIGNATURE.len())?;
+        if signature != *RAR15_SIGNATURE {
+            return Err(Error::UnsupportedSignature);
+        }
+        let mut walk = SourceWalk {
+            source: source.clone(),
+            len: expected_len,
+        };
+        Self::parse_walk(&mut walk, 0, source, options.password)
+    }
+
     fn parse_seekable(
-        mut file: File,
+        file: File,
         file_len: u64,
         sfx_offset: usize,
         source: ArchiveSource,
         password: Option<&[u8]>,
     ) -> Result<Self> {
-        let marker = read_block_header_at(&mut file, file_len, sfx_offset, 0)?;
+        let mut walk = FileWalk {
+            file,
+            len: file_len,
+        };
+        Self::parse_walk(&mut walk, sfx_offset, source, password)
+    }
+
+    fn parse_walk(
+        file: &mut impl WalkSource,
+        sfx_offset: usize,
+        source: ArchiveSource,
+        password: Option<&[u8]>,
+    ) -> Result<Self> {
+        let file_len = file.source_len();
+        let marker = read_block_header_at(file, file_len, sfx_offset, 0)?;
         if marker.head_type != MARK_HEAD || marker.head_size != RAR15_SIGNATURE.len() as u16 {
             return Err(Error::InvalidHeader("RAR 1.5 marker block is invalid"));
         }
 
-        let main_block =
-            read_block_header_at(&mut file, file_len, sfx_offset, marker.head_size as usize)?;
+        let main_block = read_block_header_at(file, file_len, sfx_offset, marker.head_size as usize)?;
         if main_block.head_type != MAIN_HEAD {
             return Err(Error::InvalidHeader("RAR 1.5 main header is missing"));
         }
-        let main_header = read_exact_at(
-            &mut file,
+        let main_header = file.read_at(
             sfx_offset + main_block.offset,
             main_block.head_size as usize,
         )?;
@@ -1027,7 +1079,7 @@ impl Archive {
             let (block, header, total) = if main.has_encrypted_headers() {
                 let password = password.ok_or(Error::NeedPassword)?;
                 let encrypted = read_encrypted_header_at(
-                    &mut file,
+                    file,
                     file_len,
                     sfx_offset,
                     pos,
@@ -1036,9 +1088,9 @@ impl Archive {
                 )?;
                 (encrypted.block, encrypted.header, encrypted.total_size)
             } else {
-                let block = read_block_header_at(&mut file, file_len, sfx_offset, pos)?;
+                let block = read_block_header_at(file, file_len, sfx_offset, pos)?;
                 let total = block_total_size(&block)?;
-                let header = read_exact_at(&mut file, sfx_offset + pos, block.head_size as usize)?;
+                let header = file.read_at(sfx_offset + pos, block.head_size as usize)?;
                 (block, header, total)
             };
             match block.head_type {
@@ -1114,6 +1166,15 @@ impl Archive {
 
     fn range_reader(&self, range: Range<usize>) -> Result<Box<dyn Read + Send + '_>> {
         self.source.range_reader(range)
+    }
+
+    /// [`Self::range_reader`] with no borrow of this archive - the growing
+    /// split chain needs a cursor that outlives a `Vec<Archive>` push.
+    pub(crate) fn owned_range_reader(
+        &self,
+        range: Range<usize>,
+    ) -> Result<crate::source::OwnedRangeReader> {
+        self.source.owned_range_reader(range)
     }
 
     pub fn files(&self) -> impl Iterator<Item = &FileHeader> {
@@ -1929,8 +1990,50 @@ fn decrypt_encrypted_header_at(
     })
 }
 
+/// Positioned header reads for the block walk, over whichever backing the
+/// archive has: one open file handle (the seekable parse) or an
+/// [`ArchiveSource`] (the streaming parse, whose reads BLOCK at the
+/// arrival frontier instead of failing).
+trait WalkSource {
+    fn source_len(&self) -> u64;
+    fn read_at(&mut self, absolute: usize, len: usize) -> Result<Vec<u8>>;
+}
+
+struct FileWalk {
+    file: File,
+    len: u64,
+}
+
+impl WalkSource for FileWalk {
+    fn source_len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_at(&mut self, absolute: usize, len: usize) -> Result<Vec<u8>> {
+        read_exact_at(&mut self.file, absolute, len)
+    }
+}
+
+struct SourceWalk {
+    source: ArchiveSource,
+    len: u64,
+}
+
+impl WalkSource for SourceWalk {
+    fn source_len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_at(&mut self, absolute: usize, len: usize) -> Result<Vec<u8>> {
+        let end = absolute
+            .checked_add(len)
+            .ok_or(Error::InvalidHeader("RAR 1.5 block offset overflows usize"))?;
+        self.source.read_range(absolute..end)
+    }
+}
+
 fn read_encrypted_header_at(
-    file: &mut File,
+    file: &mut impl WalkSource,
     file_len: u64,
     archive_offset: usize,
     offset: usize,
@@ -1943,7 +2046,7 @@ fn read_encrypted_header_at(
     if absolute as u64 + 24 > file_len {
         return Err(Error::TooShort);
     }
-    let first = read_exact_at(file, absolute, 24)?;
+    let first = file.read_at(absolute, 24)?;
     let salt = read_header_salt(&first, 0)?;
     let mut cipher = cipher_cache.cipher(password, salt)?;
     let mut first_block = [0u8; 16];
@@ -1962,7 +2065,7 @@ fn read_encrypted_header_at(
     if encrypted_start as u64 + encrypted_header_size as u64 > file_len {
         return Err(Error::TooShort);
     }
-    let encrypted_rest = read_exact_at(file, encrypted_start + 16, encrypted_header_size - 16)?;
+    let encrypted_rest = file.read_at(encrypted_start + 16, encrypted_header_size - 16)?;
     let mut header = Vec::with_capacity(encrypted_header_size);
     header.extend_from_slice(&first_block);
     header.extend_from_slice(&encrypted_rest);
@@ -2218,7 +2321,7 @@ fn decode_file_name(raw: &[u8], flags: u16) -> Vec<u8> {
 }
 
 fn read_block_header_at(
-    file: &mut File,
+    file: &mut impl WalkSource,
     file_len: u64,
     archive_offset: usize,
     offset: usize,
@@ -2229,7 +2332,7 @@ fn read_block_header_at(
     if absolute as u64 + 7 > file_len {
         return Err(Error::TooShort);
     }
-    let base = read_exact_at(file, absolute, 7)?;
+    let base = file.read_at(absolute, 7)?;
     let head_size = read_u16(&base, 5)? as usize;
     if head_size < 7 {
         return Err(Error::InvalidHeader("RAR 1.5 block header is too short"));
@@ -2240,7 +2343,7 @@ fn read_block_header_at(
     let header = if head_size == 7 {
         base
     } else {
-        read_exact_at(file, absolute, head_size)?
+        file.read_at(absolute, head_size)?
     };
     let mut block = parse_block_header(&header, 0)?;
     block.offset = offset;

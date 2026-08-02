@@ -175,7 +175,9 @@ mod probe_body {
             let v: Value =
                 serde_json::from_str(&std::fs::read_to_string(data_dir.join("tray.json")).ok()?)
                     .ok()?;
-            u16::try_from(v.get("port")?.as_u64()?).ok().filter(|p| *p != 0)
+            u16::try_from(v.get("port")?.as_u64()?)
+                .ok()
+                .filter(|p| *p != 0)
         };
         from_settings().or_else(from_tray)
     }
@@ -192,7 +194,9 @@ mod probe_body {
         let v: Value =
             serde_json::from_str(&std::fs::read_to_string(data_dir.join("runtime.json")).ok()?)
                 .ok()?;
-        let port = u16::try_from(v.get("port")?.as_u64()?).ok().filter(|p| *p != 0)?;
+        let port = u16::try_from(v.get("port")?.as_u64()?)
+            .ok()
+            .filter(|p| *p != 0)?;
         let token = stored_key(v.get("token")?.as_str()?)?;
         Some(Runtime { port, token })
     }
@@ -210,7 +214,11 @@ mod probe_body {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        format!("{:016x}{:016x}", clock ^ stack, counter ^ std::process::id() as u64)
+        format!(
+            "{:016x}{:016x}",
+            clock ^ stack,
+            counter ^ std::process::id() as u64
+        )
     }
 
     /// Does this reply prove the listener is the daemon `runtime.json`
@@ -254,13 +262,27 @@ mod probe_body {
                 == 0
     }
 
-    /// Whether a reply carried a launcher proof at all - i.e. whether the
-    /// far side is new enough to be held to it.
-    pub fn has_proof(body: &str) -> bool {
-        serde_json::from_str::<Value>(body)
-            .ok()
-            .and_then(|v| v.get("hs_proof").and_then(Value::as_str).map(str::to_string))
-            .is_some()
+    /// Is this listener the daemon we expect on this port?
+    ///
+    /// `token` is `Some` only when `runtime.json` names THIS port. In that
+    /// case the proof is MANDATORY: a token in runtime.json can only have
+    /// been written by a daemon that also answers the challenge - the file
+    /// write and the proof reply shipped in the same release, and the
+    /// write is unconditional once the listener exists. So a shape-valid
+    /// reply carrying no proof is NOT an older daemon (an older daemon
+    /// leaves no runtime.json at all and takes the `None` arm); it is
+    /// something else holding the port, and attaching to it means handing
+    /// over the stored API key - which grants daemon control and, through
+    /// `mode=server_secret`, the provider password.
+    ///
+    /// `None` - no runtime.json for this port, or one naming a different
+    /// port - stays permissive: that IS the pre-handshake daemon, and the
+    /// migration case.
+    pub fn identity_ok(body: &str, token: Option<&str>, nonce: &str) -> bool {
+        match token {
+            Some(t) => proof_matches(body, t, nonce),
+            None => true,
+        }
     }
 
     #[cfg(test)]
@@ -278,9 +300,13 @@ mod probe_body {
         #[test]
         fn auth_refusals_are_ours() {
             assert!(is_nzbfast(r#"{"status":false,"error":"API Key Required"}"#));
-            assert!(is_nzbfast(r#"{"status":false,"error":"API Key Incorrect"}"#));
+            assert!(is_nzbfast(
+                r#"{"status":false,"error":"API Key Incorrect"}"#
+            ));
             // Field order and whitespace are the serialiser's business.
-            assert!(is_nzbfast("{ \"error\" : \"API Key Required\" , \"status\" : false }"));
+            assert!(is_nzbfast(
+                "{ \"error\" : \"API Key Required\" , \"status\" : false }"
+            ));
         }
 
         #[test]
@@ -303,7 +329,9 @@ mod probe_body {
         #[test]
         fn other_error_bodies_are_not_ours() {
             assert!(!is_nzbfast(r#"{"status":false,"error":"Unauthorized"}"#));
-            assert!(!is_nzbfast(r#"{"status":false,"error":"api key required"}"#));
+            assert!(!is_nzbfast(
+                r#"{"status":false,"error":"api key required"}"#
+            ));
             assert!(!is_nzbfast(r#"{"status":false}"#));
             // The phrases only count as a refusal, not as success.
             assert!(!is_nzbfast(r#"{"status":true,"error":"API Key Required"}"#));
@@ -321,8 +349,8 @@ mod probe_body {
         /// A scratch data dir holding whichever of the two key sources
         /// the case needs.
         fn data_dir(name: &str, settings: Option<&str>, keyfile: Option<&str>) -> PathBuf {
-            let dir = std::env::temp_dir()
-                .join(format!("nzbtray-key-{}-{name}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("nzbtray-key-{}-{name}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             if let Some(s) = settings {
@@ -370,7 +398,10 @@ mod probe_body {
                 keyed_url("http://127.0.0.1:6789/api?mode=queue".into(), &d),
                 "http://127.0.0.1:6789/api?mode=queue&apikey=a%20b%26c"
             );
-            assert_eq!(dash_url(6789, &d), "http://127.0.0.1:6789/?apikey=a%20b%26c");
+            assert_eq!(
+                dash_url(6789, &d),
+                "http://127.0.0.1:6789/?apikey=a%20b%26c"
+            );
 
             // Keyless: no empty parameter left dangling on either URL.
             let d = data_dir("urlnone", None, None);
@@ -386,10 +417,10 @@ mod probe_body {
         /// key (and with it `mode=server_secret`).
         #[test]
         fn only_the_daemon_holding_our_token_can_prove_it() {
-            use super::{has_proof, proof_matches, runtime};
+            use super::{identity_ok, proof_matches, runtime};
             use sha2::{Digest, Sha256};
 
-            let token = "3c2f0f9a5e1d4b8f7a6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e";
+            let token = "3c2f0f9a5e1d4b8f7a6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e"; // leakcheck-allow-synthetic: hand-typed hex test vector
             let nonce = "0123456789abcdef";
             let proof = |t: &str| {
                 let mut h = Sha256::new();
@@ -407,27 +438,45 @@ mod probe_body {
                 r#"{{"status":false,"error":"API Key Required","nzbfast":"1.0.12","hs_proof":"{}"}}"#,
                 proof(token)
             );
-            assert!(has_proof(&real));
             assert!(proof_matches(&real, token, nonce));
+            assert!(identity_ok(&real, Some(token), nonce));
 
             // An impostor can print our JSON - it cannot read the token file,
             // so it cannot answer the challenge.
             let impostor = r#"{"status":false,"error":"API Key Required","nzbfast":"1.0.12"}"#;
-            assert!(!has_proof(impostor), "a reply with no proof must not pass as proven");
             assert!(!proof_matches(impostor, token, nonce));
+            // The downgrade that used to let it through: omitting `hs_proof`
+            // entirely was read as "an older daemon" and waived the check,
+            // so binding the saved port while the real daemon was down was
+            // enough to be handed the stored API key. A token in
+            // runtime.json can only have been written by a daemon that
+            // answers the challenge, so no-proof is now a stranger.
+            assert!(
+                !identity_ok(impostor, Some(token), nonce),
+                "a proofless reply must not pass while runtime.json names this port"
+            );
+            // ...and the compatibility case it must NOT break: with no
+            // runtime.json for this port there is nothing to hold it to.
+            assert!(
+                identity_ok(impostor, None, nonce),
+                "a pre-handshake daemon still attaches"
+            );
 
             // Nor can it guess one, or replay another nonce's answer.
             let forged = format!(
                 r#"{{"status":false,"error":"API Key Required","hs_proof":"{}"}}"#,
                 proof("some other token")
             );
-            assert!(has_proof(&forged));
             assert!(!proof_matches(&forged, token, nonce));
+            assert!(!identity_ok(&forged, Some(token), nonce));
             assert!(!proof_matches(&real, token, "a-different-nonce"));
 
             // The daemon's own runtime.json is what supplies the pair.
             let d = data_dir("runtime", None, None);
-            assert!(runtime(&d).is_none(), "no file means no expectation to hold it to");
+            assert!(
+                runtime(&d).is_none(),
+                "no file means no expectation to hold it to"
+            );
             std::fs::write(
                 d.join("runtime.json"),
                 format!(r#"{{"pid":42,"port":6790,"token":"{token}","version":"1.0.12"}}"#),
@@ -475,9 +524,19 @@ mod probe_body {
             // different JSON types), and 0 or out of range does not.
             write(&d, "settings.json", r#"{"port": "6791"}"#);
             assert_eq!(load_port(&d), Some(6791));
-            for bad in [r#"{"port": 0}"#, r#"{"port": 70000}"#, r#"{"port": true}"#, "{}", "not json"] {
+            for bad in [
+                r#"{"port": 0}"#,
+                r#"{"port": 70000}"#,
+                r#"{"port": true}"#,
+                "{}",
+                "not json",
+            ] {
                 write(&d, "settings.json", bad);
-                assert_eq!(load_port(&d), Some(6789), "fell through to tray.json for {bad}");
+                assert_eq!(
+                    load_port(&d),
+                    Some(6789),
+                    "fell through to tray.json for {bad}"
+                );
             }
         }
 
@@ -488,7 +547,10 @@ mod probe_body {
             let a = probe_nonce();
             let b = probe_nonce();
             assert_ne!(a, b);
-            assert!(a.len() >= 16 && a.bytes().all(|c| c.is_ascii_alphanumeric()), "{a}");
+            assert!(
+                a.len() >= 16 && a.bytes().all(|c| c.is_ascii_alphanumeric()),
+                "{a}"
+            );
         }
     }
 }
@@ -581,7 +643,12 @@ mod app {
             format!("http://127.0.0.1:{port}/api?mode={mode}&output=json"),
             data_dir,
         );
-        let body = agent(timeout_ms).get(&url).call().ok()?.into_string().ok()?;
+        let body = agent(timeout_ms)
+            .get(&url)
+            .call()
+            .ok()?
+            .into_string()
+            .ok()?;
         serde_json::from_str(&body).ok()
     }
 
@@ -611,28 +678,25 @@ mod app {
         }
         let rt = crate::probe_body::runtime(data_dir).filter(|r| r.port == port);
         let nonce = crate::probe_body::probe_nonce();
-        let url =
-            format!("http://127.0.0.1:{port}/api?mode=version&output=json&hs={nonce}");
-        let Some(body) = agent(900).get(&url).call().ok().and_then(|r| r.into_string().ok())
+        let url = format!("http://127.0.0.1:{port}/api?mode=version&output=json&hs={nonce}");
+        let Some(body) = agent(900)
+            .get(&url)
+            .call()
+            .ok()
+            .and_then(|r| r.into_string().ok())
         else {
             return Probe::Other;
         };
         if !crate::probe_body::is_nzbfast(&body) {
             return Probe::Other;
         }
-        match rt {
-            // We know what should be here. Hold it to the proof, unless it
-            // gave none at all (pre-handshake daemon).
-            Some(rt) if crate::probe_body::has_proof(&body) => {
-                if crate::probe_body::proof_matches(&body, &rt.token, &nonce) {
-                    Probe::Nzbfast
-                } else {
-                    Probe::Other
-                }
-            }
-            // No runtime.json for this port: an older daemon, or one started
-            // from a different data dir. Unchanged behaviour.
-            _ => Probe::Nzbfast,
+        // Proof is mandatory whenever runtime.json names this port - see
+        // `probe_body::identity_ok`. It used to be waived for a reply that
+        // simply omitted `hs_proof`, which any impostor can do.
+        if crate::probe_body::identity_ok(&body, rt.as_ref().map(|r| r.token.as_str()), &nonce) {
+            Probe::Nzbfast
+        } else {
+            Probe::Other
         }
     }
 
@@ -648,6 +712,12 @@ mod app {
             data3: 0x4565,
             data4: [0x91, 0x64, 0x39, 0xC4, 0x92, 0x5E, 0x46, 0x7B],
         };
+        // SAFETY: p is read, measured and freed only after
+        // SHGetKnownFolderPath returned 0 (S_OK) and set it non-null,
+        // which per that API's contract makes it a NUL-terminated UTF-16
+        // string allocated for the caller; the length walk stops at that
+        // NUL, from_raw_parts stays inside it, and CoTaskMemFree is the
+        // documented release for the allocation.
         unsafe {
             let mut p: *mut u16 = std::ptr::null_mut();
             if SHGetKnownFolderPath(&FOLDERID_DOWNLOADS, 0, std::ptr::null_mut(), &mut p) == 0
@@ -680,6 +750,9 @@ mod app {
     }
 
     fn open_url(url: &str) {
+        // SAFETY: FFI call; the verb and URL are NUL-terminated UTF-16
+        // from `w` whose buffers outlive the call, and the null
+        // hwnd/parameters/directory arguments are documented as valid.
         unsafe {
             ShellExecuteW(
                 std::ptr::null_mut(),
@@ -693,8 +766,16 @@ mod app {
     }
 
     fn message_box(text: &str, flags: u32) -> i32 {
+        // SAFETY: FFI call; text and caption are NUL-terminated UTF-16
+        // from `w` whose buffers outlive the call, and a null owner
+        // window is documented as valid.
         unsafe {
-            MessageBoxW(std::ptr::null_mut(), w(text).as_ptr(), w("nzbfast").as_ptr(), flags)
+            MessageBoxW(
+                std::ptr::null_mut(),
+                w(text).as_ptr(),
+                w("nzbfast").as_ptr(),
+                flags,
+            )
         }
     }
 
@@ -714,15 +795,25 @@ mod app {
     /// window, explicit data-dir paths, cwd = data dir.
     fn spawn_daemon(exe_dir: &Path, data_dir: &Path, out_dir: &Path, port: u16) -> Option<Child> {
         let log_path = data_dir.join("daemon.log");
-        if std::fs::metadata(&log_path).map(|m| m.len() > 5_000_000).unwrap_or(false) {
+        if std::fs::metadata(&log_path)
+            .map(|m| m.len() > 5_000_000)
+            .unwrap_or(false)
+        {
             let _ = std::fs::remove_file(data_dir.join("daemon.log.1"));
             let _ = std::fs::rename(&log_path, data_dir.join("daemon.log.1"));
         }
-        let log = std::fs::OpenOptions::new().create(true).append(true).open(&log_path).ok()?;
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .ok()?;
         let log2 = log.try_clone().ok()?;
         Command::new(exe_dir.join("nzbfast.exe"))
             .args(["serve", "--port", &port.to_string()])
-            .args(["--config", &data_dir.join("config.local.json").to_string_lossy()])
+            .args([
+                "--config",
+                &data_dir.join("config.local.json").to_string_lossy(),
+            ])
             .args(["--out", &out_dir.to_string_lossy()])
             // Watch the user's actual Downloads folder: save an .nzb the
             // way you save anything and it's queued automatically. Only
@@ -746,8 +837,9 @@ mod app {
     fn ensure_daemon(exe_dir: &Path, data_dir: &Path, out_dir: &Path) -> (u16, Option<Child>) {
         // Persisted port first (the attach contract), then the scan range.
         let saved = crate::probe_body::load_port(data_dir);
-        let candidates =
-            saved.into_iter().chain((BASE_PORT..BASE_PORT + SCAN_SPAN).filter(|p| Some(*p) != saved));
+        let candidates = saved
+            .into_iter()
+            .chain((BASE_PORT..BASE_PORT + SCAN_SPAN).filter(|p| Some(*p) != saved));
         let mut spawn_at = None;
         for p in candidates {
             match probe(p, data_dir) {
@@ -761,7 +853,10 @@ mod app {
         }
         let Some(port) = spawn_at else {
             message_box(
-                &format!("No free port found (tried {BASE_PORT}–{}).", BASE_PORT + SCAN_SPAN),
+                &format!(
+                    "No free port found (tried {BASE_PORT}–{}).",
+                    BASE_PORT + SCAN_SPAN
+                ),
                 MB_ICONERROR,
             );
             std::process::exit(1);
@@ -825,7 +920,10 @@ mod app {
         );
         let resp = agent(10_000)
             .post(&url)
-            .set("Content-Type", &format!("multipart/form-data; boundary={boundary}"))
+            .set(
+                "Content-Type",
+                &format!("multipart/form-data; boundary={boundary}"),
+            )
             .send_bytes(&body)
             .map_err(|e| format!("addfile: {e}"))?;
         let v: Value = serde_json::from_str(&resp.into_string().unwrap_or_default())
@@ -833,7 +931,11 @@ mod app {
         if v.get("status").and_then(Value::as_bool) == Some(true) {
             Ok(name)
         } else {
-            Err(v.get("error").and_then(Value::as_str).unwrap_or("rejected").to_string())
+            Err(v
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("rejected")
+                .to_string())
         }
     }
 
@@ -854,13 +956,23 @@ mod app {
             ),
             data_dir,
         );
-        let resp = agent(45_000).get(&url).call().map_err(|e| format!("addnzblnk: {e}"))?;
+        let resp = agent(45_000)
+            .get(&url)
+            .call()
+            .map_err(|e| format!("addnzblnk: {e}"))?;
         let v: Value = serde_json::from_str(&resp.into_string().unwrap_or_default())
             .map_err(|e| format!("addnzblnk parse: {e}"))?;
         if v.get("status").and_then(Value::as_bool) == Some(true) {
-            Ok(v.get("name").and_then(Value::as_str).unwrap_or("download").to_string())
+            Ok(v.get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("download")
+                .to_string())
         } else {
-            Err(v.get("error").and_then(Value::as_str).unwrap_or("rejected").to_string())
+            Err(v
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("rejected")
+                .to_string())
         }
     }
 
@@ -871,6 +983,10 @@ mod app {
     /// does not enumerate - the message-only pseudo-parent has to be named
     /// explicitly.
     fn find_tray_window() -> HWND {
+        // SAFETY: FFI call; class and title are NUL-terminated UTF-16
+        // from `w` whose buffers outlive the call, a null child-after
+        // handle is documented as valid, and HWND_MESSAGE is the
+        // documented pseudo-parent for the message-only search.
         unsafe {
             FindWindowExW(
                 HWND_MESSAGE,
@@ -894,11 +1010,15 @@ mod app {
     fn quit_running_instance(data_dir: &Path) {
         let hwnd = find_tray_window();
         if !hwnd.is_null() {
+            // SAFETY: FFI call carrying only a window handle and
+            // integers, no pointers into our memory.
             unsafe { PostMessageW(hwnd, WM_QUITAPP, 0, 0) };
             // The tray gives its daemon 5 s to drain before hard-killing,
             // so allow a little more than that before giving up.
             let t0 = Instant::now();
             while t0.elapsed() < Duration::from_secs(12) {
+                // SAFETY: FFI call carrying only a window handle, no
+                // pointers into our memory.
                 if unsafe { IsWindow(find_tray_window()) } == 0 {
                     return;
                 }
@@ -925,20 +1045,20 @@ mod app {
     /// tray's window so its process exits and its image file unlocks.
     /// Both halves are cooperative - nothing here terminates a process.
     fn legacy_shutdown(data_dir: &Path) {
-        if let Some(port) = crate::probe_body::load_port(data_dir) {
-            if matches!(probe(port, data_dir), Probe::Nzbfast) {
-                let url = keyed_url(
-                    format!("http://127.0.0.1:{port}/api?mode=shutdown&output=json"),
-                    data_dir,
-                );
-                let _ = agent(2000).post(&url).send_string("");
-                let t0 = Instant::now();
-                while t0.elapsed() < Duration::from_secs(8) {
-                    if matches!(probe(port, data_dir), Probe::Free) {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(200));
+        if let Some(port) = crate::probe_body::load_port(data_dir)
+            && matches!(probe(port, data_dir), Probe::Nzbfast)
+        {
+            let url = keyed_url(
+                format!("http://127.0.0.1:{port}/api?mode=shutdown&output=json"),
+                data_dir,
+            );
+            let _ = agent(2000).post(&url).send_string("");
+            let t0 = Instant::now();
+            while t0.elapsed() < Duration::from_secs(8) {
+                if matches!(probe(port, data_dir), Probe::Free) {
+                    break;
                 }
+                std::thread::sleep(Duration::from_millis(200));
             }
         }
         // The daemon is down (or was never up). Now the tray itself: an
@@ -948,9 +1068,13 @@ mod app {
         if hwnd.is_null() {
             return;
         }
+        // SAFETY: FFI call carrying only a window handle and integers, no
+        // pointers into our memory.
         unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
         let t0 = Instant::now();
         while t0.elapsed() < Duration::from_secs(8) {
+            // SAFETY: FFI call carrying only a window handle, no pointers
+            // into our memory.
             if unsafe { IsWindow(find_tray_window()) } == 0 {
                 return;
             }
@@ -961,6 +1085,10 @@ mod app {
     // ---- autostart (HKCU Run) -----------------------------------------
 
     fn autostart_enabled() -> bool {
+        // SAFETY: FFI call; key and value names are NUL-terminated UTF-16
+        // from `w` whose buffers outlive the call, ty and len point at
+        // live locals, and a null data buffer is documented as a
+        // size-only query.
         unsafe {
             let mut ty = 0u32;
             let mut len = 0u32;
@@ -977,6 +1105,13 @@ mod app {
     }
 
     fn set_autostart(on: bool) {
+        // SAFETY: FFI calls; all string arguments are NUL-terminated
+        // UTF-16 from `w` whose buffers outlive each call, hkey points at
+        // a live local, null security/class/disposition arguments are
+        // documented as valid, the REG_SZ pointer/length pair describes
+        // exactly val's buffer (val.len() u16s = twice that in bytes,
+        // including the terminating NUL from `w`), and each key handle is
+        // used and closed only on the ERROR_SUCCESS path that opened it.
         unsafe {
             if on {
                 let exe = std::env::current_exe().unwrap_or_default();
@@ -1024,6 +1159,9 @@ mod app {
     // ---- tray icon ----------------------------------------------------
 
     fn nid(hwnd: HWND) -> NOTIFYICONDATAW {
+        // SAFETY: NOTIFYICONDATAW is windows-sys's #[repr(C)] mirror of
+        // the documented OS struct - integers, handles and u16 arrays -
+        // so the all-zero bit pattern is a valid value for every field.
         let mut n: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
         n.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
         n.hWnd = hwnd;
@@ -1036,6 +1174,9 @@ mod app {
         n.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         n.uCallbackMessage = WM_TRAY;
         // Resource id 1 (see build.rs); stock glyph if the resource is absent.
+        // SAFETY: FFI calls; `1 as _` is the documented integer-resource
+        // encoding of that id, and null module/instance arguments are
+        // documented as valid.
         n.hIcon = unsafe {
             let h = LoadImageW(
                 GetModuleHandleW(std::ptr::null()),
@@ -1053,10 +1194,14 @@ mod app {
         };
         let tip = w("nzbfast");
         n.szTip[..tip.len()].copy_from_slice(&tip);
+        // SAFETY: FFI call; &n points at a live local NOTIFYICONDATAW
+        // with cbSize set (see nid) for the duration of the call.
         unsafe { Shell_NotifyIconW(NIM_ADD, &n) };
     }
 
     fn tray_remove(hwnd: HWND) {
+        // SAFETY: FFI call; the NOTIFYICONDATAW temporary from nid, with
+        // cbSize set, lives for the duration of the call.
         unsafe { Shell_NotifyIconW(NIM_DELETE, &nid(hwnd)) };
     }
 
@@ -1068,6 +1213,8 @@ mod app {
         let x = w(text);
         n.szInfoTitle[..t.len().min(64)].copy_from_slice(&t[..t.len().min(64)]);
         n.szInfo[..x.len().min(256)].copy_from_slice(&x[..x.len().min(256)]);
+        // SAFETY: FFI call; &n points at a live local NOTIFYICONDATAW
+        // with cbSize set (see nid) for the duration of the call.
         unsafe { Shell_NotifyIconW(NIM_MODIFY, &n) };
     }
 
@@ -1079,13 +1226,24 @@ mod app {
             let app = a.as_mut().unwrap();
             // Refresh the pause state while the user is mid-click; a slow
             // daemon just leaves the previous label.
-            if let Some(q) = api_get(app.port, &app.data_dir, "queue", 900) {
-                if let Some(p) = q.pointer("/queue/paused").and_then(Value::as_bool) {
-                    app.paused = p;
-                }
+            if let Some(q) = api_get(app.port, &app.data_dir, "queue", 900)
+                && let Some(p) = q.pointer("/queue/paused").and_then(Value::as_bool)
+            {
+                app.paused = p;
             }
-            (app.port, app.data_dir.clone(), app.owner, app.child_dead, app.paused)
+            (
+                app.port,
+                app.data_dir.clone(),
+                app.owner,
+                app.child_dead,
+                app.paused,
+            )
         });
+        // SAFETY: FFI calls; menu labels are NUL-terminated UTF-16 from
+        // `w` whose buffers outlive each AppendMenuW call, null pointers
+        // are passed only where the API documents them as valid, &mut pt
+        // points at a live local, and m is the menu handle created at the
+        // top of this block and destroyed exactly once at the bottom.
         unsafe {
             let m = CreatePopupMenu();
             let add = |m, id: u16, label: &str, flags: u32| {
@@ -1094,7 +1252,12 @@ mod app {
             add(m, ID_DASH, "Open Dashboard", MF_STRING);
             add(m, ID_DOWNLOADS, "Open Downloads Folder", MF_STRING);
             AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
-            add(m, ID_PAUSE, if paused { "Resume" } else { "Pause" }, MF_STRING);
+            add(
+                m,
+                ID_PAUSE,
+                if paused { "Resume" } else { "Pause" },
+                MF_STRING,
+            );
             AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
             add(
                 m,
@@ -1170,7 +1333,11 @@ mod app {
                 app.child_dead = false;
                 balloon(hwnd, "nzbfast", "Restarting the download engine…");
             } else {
-                balloon(hwnd, "nzbfast", "Restart failed - see daemon.log in the data folder.");
+                balloon(
+                    hwnd,
+                    "nzbfast",
+                    "Restart failed - see daemon.log in the data folder.",
+                );
             }
         });
     }
@@ -1183,106 +1350,113 @@ mod app {
         APP.with(|a| {
             let mut a = a.borrow_mut();
             let app = a.as_mut().unwrap();
-            if let Some(child) = app.child.as_mut() {
+            if let Some(child) = app.child.as_mut()
+                && child.try_wait().ok().flatten().is_none()
+            {
+                let url = keyed_url(
+                    format!(
+                        "http://127.0.0.1:{}/api?mode=shutdown&output=json",
+                        app.port
+                    ),
+                    &app.data_dir,
+                );
+                let _ = agent(2000).post(&url).send_string("");
+                let t0 = Instant::now();
+                while t0.elapsed() < Duration::from_secs(5) {
+                    if child.try_wait().ok().flatten().is_some() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
                 if child.try_wait().ok().flatten().is_none() {
-                    let url = keyed_url(
-                        format!(
-                            "http://127.0.0.1:{}/api?mode=shutdown&output=json",
-                            app.port
-                        ),
-                        &app.data_dir,
-                    );
-                    let _ = agent(2000).post(&url).send_string("");
-                    let t0 = Instant::now();
-                    while t0.elapsed() < Duration::from_secs(5) {
-                        if child.try_wait().ok().flatten().is_some() {
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
-                    if child.try_wait().ok().flatten().is_none() {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
                 }
             }
         });
+        // SAFETY: FFI call with no pointer arguments.
         unsafe { PostQuitMessage(0) };
     }
 
     // ---- window proc / message loop -----------------------------------
 
+    // SAFETY: unsafe only to match the WNDPROC signature; the sole
+    // registration is the WNDCLASSW in `run`, so the OS message
+    // dispatcher is the only caller and supplies the arguments.
     unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+        // SAFETY: the FFI calls made here (DefWindowProcW,
+        // PostQuitMessage) carry only the handles and integers the OS
+        // dispatcher passed in, no pointers into our memory.
         unsafe {
-        match msg {
-            WM_TRAY => {
-                match lp as u32 {
-                    WM_LBUTTONDBLCLK => {
-                        let (port, data_dir) = APP.with(|a| {
-                            let b = a.borrow();
-                            let app = b.as_ref().unwrap();
-                            (app.port, app.data_dir.clone())
-                        });
-                        open_url(&dash_url(port, &data_dir));
-                    }
-                    WM_RBUTTONUP | WM_CONTEXTMENU => show_menu(hwnd),
-                    _ => {}
-                }
-                0
-            }
-            // An `nzbtray.exe --quit` helper (the installer) asking for the
-            // same clean stop the tray menu performs.
-            WM_QUITAPP => {
-                quit(hwnd);
-                0
-            }
-            WM_TIMER if wp == TIMER_CHILD => {
-                // Child-death watchdog: single-threaded try_wait poll (no
-                // handle juggling across threads).
-                let died = APP.with(|a| {
-                    let mut a = a.borrow_mut();
-                    let app = a.as_mut().unwrap();
-                    if app.child_dead {
-                        return false;
-                    }
-                    match app.child.as_mut().map(|c| c.try_wait()) {
-                        Some(Ok(Some(status))) => {
-                            app.child_dead = true;
-                            Some(status)
+            match msg {
+                WM_TRAY => {
+                    match lp as u32 {
+                        WM_LBUTTONDBLCLK => {
+                            let (port, data_dir) = APP.with(|a| {
+                                let b = a.borrow();
+                                let app = b.as_ref().unwrap();
+                                (app.port, app.data_dir.clone())
+                            });
+                            open_url(&dash_url(port, &data_dir));
                         }
-                        _ => None,
+                        WM_RBUTTONUP | WM_CONTEXTMENU => show_menu(hwnd),
+                        _ => {}
                     }
-                    .is_some()
-                });
-                if died {
-                    // Some deaths are not "try again" deaths. A missing
-                    // or unusable API key stops startup deliberately and
-                    // will do so every time, so telling this user to hit
-                    // Restart sends them round a loop with no way out and
-                    // no idea why. The daemon writes the whole
-                    // explanation to daemon.log before it exits; if that
-                    // is what happened, show it and say nothing about
-                    // restarting.
-                    let dir = APP.with(|a| a.borrow().as_ref().unwrap().data_dir.clone());
-                    let tail = log_tail(&dir, 40);
-                    if let Some(at) = tail.find(KEYLESS_MARKER) {
-                        message_box(&tail[at..], MB_ICONERROR);
-                    } else {
-                        balloon(
-                            hwnd,
-                            "nzbfast stopped unexpectedly",
-                            "The download engine exited. Right-click the tray icon → Restart nzbfast.",
-                        );
-                    }
+                    0
                 }
-                0
+                // An `nzbtray.exe --quit` helper (the installer) asking for the
+                // same clean stop the tray menu performs.
+                WM_QUITAPP => {
+                    quit(hwnd);
+                    0
+                }
+                WM_TIMER if wp == TIMER_CHILD => {
+                    // Child-death watchdog: single-threaded try_wait poll (no
+                    // handle juggling across threads).
+                    let died = APP.with(|a| {
+                        let mut a = a.borrow_mut();
+                        let app = a.as_mut().unwrap();
+                        if app.child_dead {
+                            return false;
+                        }
+                        match app.child.as_mut().map(|c| c.try_wait()) {
+                            Some(Ok(Some(status))) => {
+                                app.child_dead = true;
+                                Some(status)
+                            }
+                            _ => None,
+                        }
+                        .is_some()
+                    });
+                    if died {
+                        // Some deaths are not "try again" deaths. A missing
+                        // or unusable API key stops startup deliberately and
+                        // will do so every time, so telling this user to hit
+                        // Restart sends them round a loop with no way out and
+                        // no idea why. The daemon writes the whole
+                        // explanation to daemon.log before it exits; if that
+                        // is what happened, show it and say nothing about
+                        // restarting.
+                        let dir = APP.with(|a| a.borrow().as_ref().unwrap().data_dir.clone());
+                        let tail = log_tail(&dir, 40);
+                        if let Some(at) = tail.find(KEYLESS_MARKER) {
+                            message_box(&tail[at..], MB_ICONERROR);
+                        } else {
+                            balloon(
+                                hwnd,
+                                "nzbfast stopped unexpectedly",
+                                "The download engine exited. Right-click the tray icon → Restart nzbfast.",
+                            );
+                        }
+                    }
+                    0
+                }
+                WM_DESTROY => {
+                    PostQuitMessage(0);
+                    0
+                }
+                _ => DefWindowProcW(hwnd, msg, wp, lp),
             }
-            WM_DESTROY => {
-                PostQuitMessage(0);
-                0
-            }
-            _ => DefWindowProcW(hwnd, msg, wp, lp),
-        }
         }
     }
 
@@ -1304,7 +1478,9 @@ mod app {
             .skip(1)
             .filter(|a| a.starts_with('-') || a.starts_with('/'))
             .filter(|a| {
-                !["--open", "--quit"].iter().any(|k| a.eq_ignore_ascii_case(k))
+                !["--open", "--quit"]
+                    .iter()
+                    .any(|k| a.eq_ignore_ascii_case(k))
             })
             .collect();
         if !unknown.is_empty() {
@@ -1328,9 +1504,7 @@ mod app {
         let args: Vec<PathBuf> = std::env::args_os()
             .skip(1)
             .map(PathBuf::from)
-            .filter(|p| {
-                p.extension().is_some_and(|e| e.eq_ignore_ascii_case("nzb")) && p.exists()
-            })
+            .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("nzb")) && p.exists())
             .collect();
         // nzblnk: links, from the URL-scheme association the installer
         // writes. They cannot ride `args`: that filter demands a .nzb
@@ -1358,7 +1532,10 @@ mod app {
         // single-instance mutex, or we would take the "already running"
         // branch and open the dashboard instead of closing it. Creates
         // nothing on disk: an uninstall must not resurrect the data dir.
-        if std::env::args_os().skip(1).any(|a| a.eq_ignore_ascii_case("--quit")) {
+        if std::env::args_os()
+            .skip(1)
+            .any(|a| a.eq_ignore_ascii_case("--quit"))
+        {
             quit_running_instance(&data_dir);
             return;
         }
@@ -1367,8 +1544,11 @@ mod app {
         // already exists so an upgrade doesn't split the library.
         let dl = downloads_dir();
         let legacy = dl.join("nzbfast");
-        let out_dir =
-            if legacy.is_dir() { legacy } else { dl.join("nzbfast downloads") };
+        let out_dir = if legacy.is_dir() {
+            legacy
+        } else {
+            dl.join("nzbfast downloads")
+        };
         let exe_dir = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(Path::to_path_buf))
@@ -1380,8 +1560,15 @@ mod app {
 
         // Single instance: second launches hand their .nzb (or a dashboard
         // request) to the running stack and exit.
+        // SAFETY: FFI calls; the mutex name is NUL-terminated UTF-16 from
+        // `w` whose buffer outlives the call, and a null
+        // security-attributes pointer is documented as valid.
         unsafe {
-            CreateMutexW(std::ptr::null(), 0, w("Local\\nzbfast-tray-single").as_ptr());
+            CreateMutexW(
+                std::ptr::null(),
+                0,
+                w("Local\\nzbfast-tray-single").as_ptr(),
+            );
             if GetLastError() == ERROR_ALREADY_EXISTS {
                 let port = crate::probe_body::load_port(&data_dir).unwrap_or(BASE_PORT);
                 if args.is_empty() && links.is_empty() {
@@ -1389,7 +1576,10 @@ mod app {
                 } else {
                     for p in &args {
                         if let Err(e) = post_nzb(port, &data_dir, p) {
-                            message_box(&format!("Couldn't queue {}:\n{e}", p.display()), MB_ICONERROR);
+                            message_box(
+                                &format!("Couldn't queue {}:\n{e}", p.display()),
+                                MB_ICONERROR,
+                            );
                         }
                     }
                     for l in &links {
@@ -1406,6 +1596,11 @@ mod app {
         save_port(&data_dir, port);
 
         // Hidden message window + tray icon.
+        // SAFETY: FFI calls; cls and the title are NUL-terminated UTF-16
+        // from `w` whose buffers outlive the RegisterClassW and
+        // CreateWindowExW calls that read them, &wc points at a live
+        // local, null handles/pointers are used only where documented as
+        // valid, and HWND_MESSAGE is the documented message-only parent.
         let hwnd = unsafe {
             let hinst = GetModuleHandleW(std::ptr::null());
             let cls = w(MSG_CLASS);
@@ -1451,6 +1646,9 @@ mod app {
             })
         });
         tray_add(hwnd);
+        // SAFETY: FFI call carrying only handles and integers; a None
+        // timer proc is documented as valid (WM_TIMER is posted to the
+        // window instead).
         unsafe { SetTimer(hwnd, TIMER_CHILD, 1000, None) };
 
         // File-association / drag-onto-exe path: queue, then say so.
@@ -1458,7 +1656,10 @@ mod app {
             match post_nzb(port, &data_dir, p) {
                 Ok(name) => balloon(hwnd, "nzbfast", &format!("Queued {name}")),
                 Err(e) => {
-                    message_box(&format!("Couldn't queue {}:\n{e}", p.display()), MB_ICONERROR);
+                    message_box(
+                        &format!("Couldn't queue {}:\n{e}", p.display()),
+                        MB_ICONERROR,
+                    );
                 }
             }
         }
@@ -1479,6 +1680,10 @@ mod app {
             open_url(&dash_url(port, &data_dir));
         }
 
+        // SAFETY: MSG is windows-sys's #[repr(C)] mirror of the
+        // documented OS struct, for which the all-zero bit pattern is a
+        // valid value, and &mut msg passed to the loop calls points at
+        // that live local.
         unsafe {
             let mut msg: MSG = std::mem::zeroed();
             while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {

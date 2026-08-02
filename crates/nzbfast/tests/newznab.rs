@@ -2,6 +2,8 @@
 //! INDEXER (caps/search/tvsearch → items → /getnzb), and the continuous
 //! scan loop populates the index from a live (mock) news server.
 
+mod scratch;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
@@ -38,7 +40,9 @@ fn http_get(port: u16, req: &str) -> (u16, String) {
             Ok(out) => return out,
             Err(e) => {
                 last = e.to_string();
-                std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(attempt) + 50));
+                std::thread::sleep(std::time::Duration::from_millis(
+                    100 * u64::from(attempt) + 50,
+                ));
             }
         }
     }
@@ -50,7 +54,10 @@ fn http_get(port: u16, req: &str) -> (u16, String) {
 /// caller's assertions to judge.
 fn http_get_once(port: u16, req: &str) -> std::io::Result<(u16, String)> {
     let mut s = TcpStream::connect(("127.0.0.1", port))?;
-    write!(s, "GET {req} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")?;
+    write!(
+        s,
+        "GET {req} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    )?;
     let mut out = String::new();
     // Zero bytes back is a refusal to serve, however the peer
     // phrased it: an RST (Err) when our request was never read off
@@ -73,7 +80,10 @@ fn http_get_once(port: u16, req: &str) -> std::io::Result<(u16, String)> {
         .nth(1)
         .and_then(|c| c.parse().ok())
         .unwrap_or(0);
-    Ok((status, out.split("\r\n\r\n").nth(1).unwrap_or("").to_string()))
+    Ok((
+        status,
+        out.split("\r\n\r\n").nth(1).unwrap_or("").to_string(),
+    ))
 }
 
 struct KillOnDrop(Child);
@@ -102,7 +112,11 @@ struct Daemon {
 /// marks the install as not-first-run, which these keyless suites
 /// already arrange for themselves with NZBFAST_OPEN.
 fn index_enabled(cfg: &Path) {
-    std::fs::write(cfg.with_file_name("settings.json"), "{\"index_enabled\": true}").unwrap();
+    std::fs::write(
+        cfg.with_file_name("settings.json"),
+        "{\"index_enabled\": true}",
+    )
+    .unwrap();
 }
 
 async fn serve(dir: &Path, build: impl Fn(u16) -> Command) -> Daemon {
@@ -125,13 +139,19 @@ async fn serve(dir: &Path, build: impl Fn(u16) -> Command) -> Daemon {
         .await
         .unwrap();
         if ready {
-            return Daemon { _child: child, port };
+            return Daemon {
+                _child: child,
+                port,
+            };
         }
         // The daemon exited instead of binding: `free_port()` handed :port
         // to a parallel test between our bind(:0) and the daemon's bind,
         // and that test's daemon won it. Try a fresh port.
         let tail = std::fs::read_to_string(&logfile).unwrap_or_default();
-        assert!(attempt < 2, "daemon exited without binding :{port}\n--- log ---\n{tail}");
+        assert!(
+            attempt < 2,
+            "daemon exited without binding :{port}\n--- log ---\n{tail}"
+        );
     }
     unreachable!()
 }
@@ -151,7 +171,9 @@ async fn serve(dir: &Path, build: impl Fn(u16) -> Command) -> Daemon {
 fn wait_ready(child: &mut KillOnDrop, port: u16, logfile: &Path) -> bool {
     let banner = format!("open the dashboard at  http://localhost:{port}/");
     for _ in 0..600 {
-        if std::fs::read_to_string(logfile).unwrap_or_default().contains(&banner)
+        if std::fs::read_to_string(logfile)
+            .unwrap_or_default()
+            .contains(&banner)
             && TcpStream::connect(("127.0.0.1", port)).is_ok()
         {
             return true;
@@ -179,14 +201,16 @@ fn over(number: u64, subject: &str, msgid: &str, bytes: u64) -> OverEntry {
 /// Same, but carrying the article's own Date - which is what makes the
 /// release's upload time differ from the time we indexed it.
 fn over_dated(number: u64, subject: &str, msgid: &str, bytes: u64, date: i64) -> OverEntry {
-    OverEntry { date, ..over(number, subject, msgid, bytes) }
+    OverEntry {
+        date,
+        ..over(number, subject, msgid, bytes)
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn newznab_caps_search_and_getnzb() {
     let dir = std::env::temp_dir().join(format!("nzbfast-nn-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // Seed a complete 2-file release + an incomplete one directly.
     let db = dir.join("index.db");
@@ -195,8 +219,18 @@ async fn newznab_caps_search_and_getnzb() {
         ix.ingest(
             "alt.binaries.teevee",
             &[
-                over(1, "\"Show.Name.S01E02.1080p.rar\" yEnc (1/1)", "<a1@x>", 1000),
-                over(2, "\"Show.Name.S01E02.1080p.par2\" yEnc (1/1)", "<a2@x>", 200),
+                over(
+                    1,
+                    "\"Show.Name.S01E02.1080p.rar\" yEnc (1/1)",
+                    "<a1@x>",
+                    1000,
+                ),
+                over(
+                    2,
+                    "\"Show.Name.S01E02.1080p.par2\" yEnc (1/1)",
+                    "<a2@x>",
+                    200,
+                ),
                 over(3, "\"Partial.Movie.2026.rar\" yEnc (1/2)", "<b1@x>", 1000),
             ],
             1_700_000_000,
@@ -205,8 +239,11 @@ async fn newznab_caps_search_and_getnzb() {
     }
 
     let cfg = dir.join("config.json");
-    std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
-        .unwrap();
+    std::fs::write(
+        &cfg,
+        "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}",
+    )
+    .unwrap();
     // The newznab facade IS the built-in index published over newznab,
     // and that indexer's master switch defaults OFF - a daemon with it
     // off answers every t= with <error code="101"> on purpose. These
@@ -248,7 +285,10 @@ async fn newznab_caps_search_and_getnzb() {
         // Caps.
         let (code, body) = http_get(port, "/api?t=caps&apikey=sekrit");
         assert_eq!(code, 200);
-        assert!(body.contains("<caps>") && body.contains("tv-search"), "{body}");
+        assert!(
+            body.contains("<caps>") && body.contains("tv-search"),
+            "{body}"
+        );
         // Search: only the COMPLETE release is offered, categorized TV.
         let (_, body) = http_get(port, "/newznab/api?t=search&q=show&apikey=sekrit");
         assert!(body.contains("Show.Name.S01E02.1080p"), "{body}");
@@ -267,7 +307,10 @@ async fn newznab_caps_search_and_getnzb() {
             .and_then(|r| r.split("</link>").next())
             .expect("item link")
             .replace("&amp;", "&");
-        let path = link.split(&format!(":{port}")).nth(1).expect("relative path");
+        let path = link
+            .split(&format!(":{port}"))
+            .nth(1)
+            .expect("relative path");
         let (code, nzb) = http_get(port, path);
         assert_eq!(code, 200, "{nzb}");
         assert!(nzb.contains("<nzb"), "{nzb}");
@@ -281,8 +324,7 @@ async fn newznab_caps_search_and_getnzb() {
 #[tokio::test(flavor = "multi_thread")]
 async fn scan_loop_populates_index_live() {
     let dir = std::env::temp_dir().join(format!("nzbfast-nnscan-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // Mock server with a header plane: two-file complete release.
     let rows = vec![
@@ -301,9 +343,13 @@ async fn scan_loop_populates_index_live() {
             bytes: 500,
         },
     ];
-    let srv =
-        MockServer::start_full(Default::default(), Default::default(), rows, Chaos::default())
-            .await;
+    let srv = MockServer::start_full(
+        Default::default(),
+        Default::default(),
+        rows,
+        Chaos::default(),
+    )
+    .await;
 
     let cfg = dir.join("config.json");
     std::fs::write(
@@ -387,14 +433,19 @@ fn http_get_hdrs(port: u16, req: &str, hdrs: &str) -> (u16, String) {
                 .nth(1)
                 .and_then(|c| c.parse().ok())
                 .unwrap_or(0);
-            let body = out.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
+            let body = out
+                .split_once("\r\n\r\n")
+                .map(|(_, b)| b.to_string())
+                .unwrap_or_default();
             Ok((code, body))
         };
         match once() {
             Ok(out) => return out,
             Err(e) => {
                 last = e.to_string();
-                std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(attempt) + 50));
+                std::thread::sleep(std::time::Duration::from_millis(
+                    100 * u64::from(attempt) + 50,
+                ));
             }
         }
     }
@@ -410,8 +461,7 @@ fn http_get_hdrs(port: u16, req: &str, hdrs: &str) -> (u16, String) {
 #[tokio::test(flavor = "multi_thread")]
 async fn newznab_categories_follow_the_standard_tree() {
     let dir = std::env::temp_dir().join(format!("nzbfast-nncat-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // One complete release per kind we carry an id for.
     let db = dir.join("index.db");
@@ -420,12 +470,42 @@ async fn newznab_categories_follow_the_standard_tree() {
         ix.ingest(
             "alt.binaries.misc",
             &[
-                over(1, "\"CCleaner.Pro.Plus.v6.36.x64.Setup.rar\" yEnc (1/1)", "<s1@x>", 1000),
-                over(2, "\"CCleaner.Pro.Plus.v6.36.x64.Setup.par2\" yEnc (1/1)", "<s2@x>", 200),
-                over(3, "\"Cat.Show.S04E01.1080p.rar\" yEnc (1/1)", "<t1@x>", 1000),
-                over(4, "\"Cat.Show.S04E01.1080p.par2\" yEnc (1/1)", "<t2@x>", 200),
-                over(5, "\"Cat.Movie.2019.1080p.BluRay.rar\" yEnc (1/1)", "<m1@x>", 1000),
-                over(6, "\"Cat.Movie.2019.1080p.BluRay.par2\" yEnc (1/1)", "<m2@x>", 200),
+                over(
+                    1,
+                    "\"CCleaner.Pro.Plus.v6.36.x64.Setup.rar\" yEnc (1/1)",
+                    "<s1@x>",
+                    1000,
+                ),
+                over(
+                    2,
+                    "\"CCleaner.Pro.Plus.v6.36.x64.Setup.par2\" yEnc (1/1)",
+                    "<s2@x>",
+                    200,
+                ),
+                over(
+                    3,
+                    "\"Cat.Show.S04E01.1080p.rar\" yEnc (1/1)",
+                    "<t1@x>",
+                    1000,
+                ),
+                over(
+                    4,
+                    "\"Cat.Show.S04E01.1080p.par2\" yEnc (1/1)",
+                    "<t2@x>",
+                    200,
+                ),
+                over(
+                    5,
+                    "\"Cat.Movie.2019.1080p.BluRay.rar\" yEnc (1/1)",
+                    "<m1@x>",
+                    1000,
+                ),
+                over(
+                    6,
+                    "\"Cat.Movie.2019.1080p.BluRay.par2\" yEnc (1/1)",
+                    "<m2@x>",
+                    200,
+                ),
             ],
             1_700_000_000,
         )
@@ -433,8 +513,11 @@ async fn newznab_categories_follow_the_standard_tree() {
     }
 
     let cfg = dir.join("config.json");
-    std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
-        .unwrap();
+    std::fs::write(
+        &cfg,
+        "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}",
+    )
+    .unwrap();
     // The newznab facade IS the built-in index published over newznab,
     // and that indexer's master switch defaults OFF - a daemon with it
     // off answers every t= with <error code="101"> on purpose. These
@@ -476,10 +559,16 @@ async fn newznab_categories_follow_the_standard_tree() {
         // software the way the old `_ => other` arm did.
         let (_, body) = http_get(port, "/api?t=search&cat=5000,5040");
         assert_eq!(items(&body), 1, "{body}");
-        assert!(body.contains("Cat.Show.S04E01") && body.contains("value=\"5000\""), "{body}");
+        assert!(
+            body.contains("Cat.Show.S04E01") && body.contains("value=\"5000\""),
+            "{body}"
+        );
         let (_, body) = http_get(port, "/api?t=search&cat=2000");
         assert_eq!(items(&body), 1, "{body}");
-        assert!(body.contains("Cat.Movie.2019") && body.contains("value=\"2000\""), "{body}");
+        assert!(
+            body.contains("Cat.Movie.2019") && body.contains("value=\"2000\""),
+            "{body}"
+        );
 
         // Categories we carry nothing for (3000 Audio, 7000 Books) are an
         // empty feed - never a silently unfiltered one.
@@ -495,7 +584,10 @@ async fn newznab_categories_follow_the_standard_tree() {
 
         // Caps advertise PC alongside the rest, so a client knows to ask.
         let (_, caps) = http_get(port, "/api?t=caps");
-        assert!(caps.contains(r#"<category id="4000" name="PC"/>"#), "{caps}");
+        assert!(
+            caps.contains(r#"<category id="4000" name="PC"/>"#),
+            "{caps}"
+        );
     })
     .await
     .unwrap();
@@ -534,8 +626,7 @@ fn pubdate_of(body: &str, needle: &str) -> String {
 #[tokio::test(flavor = "multi_thread")]
 async fn feed_items_are_dated_by_upload_not_by_index_time() {
     let dir = std::env::temp_dir().join(format!("nzbfast-nndate-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // 14 Jul 2017, the upload date carried by the articles.
     const UPLOADED: i64 = 1_500_000_000;
@@ -549,8 +640,20 @@ async fn feed_items_are_dated_by_upload_not_by_index_time() {
         ix.ingest(
             "alt.binaries.teevee",
             &[
-                over_dated(1, "\"Old.Show.S01E01.1080p.rar\" yEnc (1/1)", "<o1@x>", 1000, UPLOADED),
-                over_dated(2, "\"Old.Show.S01E01.1080p.par2\" yEnc (1/1)", "<o2@x>", 200, UPLOADED),
+                over_dated(
+                    1,
+                    "\"Old.Show.S01E01.1080p.rar\" yEnc (1/1)",
+                    "<o1@x>",
+                    1000,
+                    UPLOADED,
+                ),
+                over_dated(
+                    2,
+                    "\"Old.Show.S01E01.1080p.par2\" yEnc (1/1)",
+                    "<o2@x>",
+                    200,
+                    UPLOADED,
+                ),
             ],
             INDEXED,
         )
@@ -559,16 +662,29 @@ async fn feed_items_are_dated_by_upload_not_by_index_time() {
         // first_posted walks down to the 0 sentinel. (The MIN on conflict
         // is what a backfill leg does; first_seen is not rewritten.)
         let undated = [
-            over(3, "\"Nodate.Show.S02E02.1080p.rar\" yEnc (1/1)", "<n1@x>", 1000),
-            over(4, "\"Nodate.Show.S02E02.1080p.par2\" yEnc (1/1)", "<n2@x>", 200),
+            over(
+                3,
+                "\"Nodate.Show.S02E02.1080p.rar\" yEnc (1/1)",
+                "<n1@x>",
+                1000,
+            ),
+            over(
+                4,
+                "\"Nodate.Show.S02E02.1080p.par2\" yEnc (1/1)",
+                "<n2@x>",
+                200,
+            ),
         ];
         ix.ingest("alt.binaries.teevee", &undated, INDEXED).unwrap();
         ix.ingest("alt.binaries.teevee", &undated, 0).unwrap();
     }
 
     let cfg = dir.join("config.json");
-    std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
-        .unwrap();
+    std::fs::write(
+        &cfg,
+        "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}",
+    )
+    .unwrap();
     // The newznab facade IS the built-in index published over newznab,
     // and that indexer's master switch defaults OFF - a daemon with it
     // off answers every t= with <error code="101"> on purpose. These
@@ -614,7 +730,10 @@ async fn feed_items_are_dated_by_upload_not_by_index_time() {
             nodate.contains(" 2026 "),
             "unknown-date release should fall back to when we saw it: {nodate}\n{body}"
         );
-        assert!(!nodate.contains("1970"), "unknown-date release dated at the epoch: {nodate}");
+        assert!(
+            !nodate.contains("1970"),
+            "unknown-date release dated at the epoch: {nodate}"
+        );
     })
     .await
     .unwrap();
@@ -641,8 +760,7 @@ async fn feed_items_are_dated_by_upload_not_by_index_time() {
 #[tokio::test(flavor = "multi_thread")]
 async fn newznab_honours_the_arr_search_parameters() {
     let dir = std::env::temp_dir().join(format!("nzbfast-nnsearch-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let db = dir.join("index.db");
     {
@@ -650,12 +768,42 @@ async fn newznab_honours_the_arr_search_parameters() {
         ix.ingest(
             "alt.binaries.teevee",
             &[
-                over(1, "\"Cat.Show.S02E01.1080p.rar\" yEnc (1/1)", "<a1@x>", 1000),
-                over(2, "\"Cat.Show.S02E01.1080p.par2\" yEnc (1/1)", "<a2@x>", 200),
-                over(3, "\"Cat.Show.S02E02.1080p.rar\" yEnc (1/1)", "<b1@x>", 1000),
-                over(4, "\"Cat.Show.S02E02.1080p.par2\" yEnc (1/1)", "<b2@x>", 200),
-                over(5, "\"Cat.Show.S03E01.1080p.rar\" yEnc (1/1)", "<c1@x>", 1000),
-                over(6, "\"Cat.Show.S03E01.1080p.par2\" yEnc (1/1)", "<c2@x>", 200),
+                over(
+                    1,
+                    "\"Cat.Show.S02E01.1080p.rar\" yEnc (1/1)",
+                    "<a1@x>",
+                    1000,
+                ),
+                over(
+                    2,
+                    "\"Cat.Show.S02E01.1080p.par2\" yEnc (1/1)",
+                    "<a2@x>",
+                    200,
+                ),
+                over(
+                    3,
+                    "\"Cat.Show.S02E02.1080p.rar\" yEnc (1/1)",
+                    "<b1@x>",
+                    1000,
+                ),
+                over(
+                    4,
+                    "\"Cat.Show.S02E02.1080p.par2\" yEnc (1/1)",
+                    "<b2@x>",
+                    200,
+                ),
+                over(
+                    5,
+                    "\"Cat.Show.S03E01.1080p.rar\" yEnc (1/1)",
+                    "<c1@x>",
+                    1000,
+                ),
+                over(
+                    6,
+                    "\"Cat.Show.S03E01.1080p.par2\" yEnc (1/1)",
+                    "<c2@x>",
+                    200,
+                ),
             ],
             1_700_000_000,
         )
@@ -663,8 +811,11 @@ async fn newznab_honours_the_arr_search_parameters() {
     }
 
     let cfg = dir.join("config.json");
-    std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
-        .unwrap();
+    std::fs::write(
+        &cfg,
+        "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}",
+    )
+    .unwrap();
     // The newznab facade IS the built-in index published over newznab,
     // and that indexer's master switch defaults OFF - a daemon with it
     // off answers every t= with <error code="101"> on purpose. These
@@ -694,9 +845,16 @@ async fn newznab_honours_the_arr_search_parameters() {
     tokio::task::spawn_blocking(move || {
         // Season-pack search: both season-2 episodes, and NOT season 3.
         let (_, body) = http_get(port, "/api?t=tvsearch&q=Cat.Show&season=2");
-        assert_eq!(items(&body), 2, "season alone did not narrow the search: {body}");
+        assert_eq!(
+            items(&body),
+            2,
+            "season alone did not narrow the search: {body}"
+        );
         assert!(body.contains("S02E01") && body.contains("S02E02"), "{body}");
-        assert!(!body.contains("S03E01"), "season filter leaked another season: {body}");
+        assert!(
+            !body.contains("S03E01"),
+            "season filter leaked another season: {body}"
+        );
 
         // Season + episode still narrows to the one episode.
         let (_, body) = http_get(port, "/api?t=tvsearch&q=Cat.Show&season=2&ep=1");
@@ -707,13 +865,23 @@ async fn newznab_honours_the_arr_search_parameters() {
         // is no SxxEyy to narrow by, and an empty answer would be worse
         // than one Sonarr can date-filter itself.
         let (_, body) = http_get(port, "/api?t=tvsearch&q=Cat.Show&season=2026&ep=07/28");
-        assert_eq!(items(&body), 3, "a daily search should not be narrowed: {body}");
+        assert_eq!(
+            items(&body),
+            3,
+            "a daily search should not be narrowed: {body}"
+        );
 
         // The page footer a client needs to ask for page two.
         let (_, body) = http_get(port, "/api?t=search&q=Cat.Show&limit=2");
         assert_eq!(items(&body), 2, "{body}");
-        assert!(body.contains("<newznab:response"), "no paging element: {body}");
-        assert!(body.contains("total=\"3\""), "total should count matches, not the page: {body}");
+        assert!(
+            body.contains("<newznab:response"),
+            "no paging element: {body}"
+        );
+        assert!(
+            body.contains("total=\"3\""),
+            "total should count matches, not the page: {body}"
+        );
         assert!(body.contains("offset=\"0\""), "{body}");
 
         // Extended attrs ride along for the columns the *arrs show.
@@ -731,7 +899,10 @@ async fn newznab_honours_the_arr_search_parameters() {
         // HTTP 200, rather than being answered with a search.
         let (code, body) = http_get(port, "/api?t=music&q=Cat");
         assert_eq!(code, 200, "{body}");
-        assert!(body.contains("code=\"203\""), "audio search should decline: {body}");
+        assert!(
+            body.contains("code=\"203\""),
+            "audio search should decline: {body}"
+        );
         assert_eq!(items(&body), 0, "{body}");
         let (_, body) = http_get(port, "/api?t=frobnicate");
         assert!(body.contains("code=\"202\""), "{body}");
@@ -756,7 +927,10 @@ async fn newznab_honours_the_arr_search_parameters() {
 
         // Without the hops it is still the plain Host header.
         let (_, body) = http_get(port, "/api?t=search&q=Cat.Show");
-        assert!(body.contains(&format!("http://127.0.0.1:{port}/getnzb/")), "{body}");
+        assert!(
+            body.contains(&format!("http://127.0.0.1:{port}/getnzb/")),
+            "{body}"
+        );
     })
     .await
     .unwrap();
@@ -773,12 +947,14 @@ async fn newznab_honours_the_arr_search_parameters() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_indexer_switch_defaults_off_and_closes_the_facade() {
     let dir = std::env::temp_dir().join(format!("nzbfast-idxsw-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
     let db = dir.join("index.db");
     let cfg = dir.join("config.json");
-    std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
-        .unwrap();
+    std::fs::write(
+        &cfg,
+        "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}",
+    )
+    .unwrap();
     // An existing install, but one that never chose anything to index:
     // the migration must NOT read that as "was using the indexer".
     std::fs::write(cfg.with_file_name("settings.json"), "{}").unwrap();
@@ -820,7 +996,11 @@ async fn the_indexer_switch_defaults_off_and_closes_the_facade() {
 
         // The facade is closed, INCLUDING caps, which is what an *arr
         // tests an indexer with.
-        for q in ["/api?t=caps", "/api?t=tvsearch&q=show", "/newznab/api?t=search&q=show"] {
+        for q in [
+            "/api?t=caps",
+            "/api?t=tvsearch&q=show",
+            "/newznab/api?t=search&q=show",
+        ] {
             let (code, body) = http_get(port, q);
             assert_eq!(code, 200, "{q}: {body}");
             assert!(body.contains("code=\"101\""), "{q} answered: {body}");
@@ -828,16 +1008,25 @@ async fn the_indexer_switch_defaults_off_and_closes_the_facade() {
         }
 
         // Switch it on: the facade opens and the database appears.
-        let (_, body) = http_get(port, "/api?mode=config&name=index_enabled&value=1&output=json");
+        let (_, body) = http_get(
+            port,
+            "/api?mode=config&name=index_enabled&value=1&output=json",
+        );
         assert!(body.contains("\"status\":true"), "{body}");
         let (_, body) = http_get(port, "/api?t=caps");
         assert!(body.contains("<caps>"), "{body}");
         let (_, body) = http_get(port, "/api?mode=index_stats&output=json");
         assert!(body.contains("\"enabled\":true"), "{body}");
-        assert!(db2.exists(), "index.db missing after switching the indexer on");
+        assert!(
+            db2.exists(),
+            "index.db missing after switching the indexer on"
+        );
 
         // And off again closes it back up, in the same process.
-        let (_, body) = http_get(port, "/api?mode=config&name=index_enabled&value=0&output=json");
+        let (_, body) = http_get(
+            port,
+            "/api?mode=config&name=index_enabled&value=0&output=json",
+        );
         assert!(body.contains("\"status\":true"), "{body}");
         let (_, body) = http_get(port, "/api?t=caps");
         assert!(body.contains("code=\"101\""), "{body}");
@@ -853,11 +1042,13 @@ async fn the_indexer_switch_defaults_off_and_closes_the_facade() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_install_that_was_already_indexing_stays_on() {
     let dir = std::env::temp_dir().join(format!("nzbfast-idxmig-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
     let cfg = dir.join("config.json");
-    std::fs::write(&cfg, "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}")
-        .unwrap();
+    std::fs::write(
+        &cfg,
+        "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}",
+    )
+    .unwrap();
     std::fs::write(
         cfg.with_file_name("settings.json"),
         "{\"index_groups\":[\"alt.binaries.teevee\"]}",

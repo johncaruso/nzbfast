@@ -2,6 +2,8 @@
 //! addfile upload, queue polling, history with final storage path - all
 //! against the real binary + mock NNTP servers.
 
+mod scratch;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -11,7 +13,9 @@ use std::process::{Child, Command, Stdio};
 use nzbkit::mock::{Chaos, MockServer, make_file_articles};
 
 fn payload(n: usize, seed: u8) -> Vec<u8> {
-    (0..n).map(|i| (i as u8).wrapping_mul(29).wrapping_add(seed)).collect()
+    (0..n)
+        .map(|i| (i as u8).wrapping_mul(29).wrapping_add(seed))
+        .collect()
 }
 
 /// OS-assigned free port for a daemon under test. The old pid-derived
@@ -46,7 +50,9 @@ fn http(port: u16, req: &str, body: Option<(&str, &[u8])>) -> String {
             Ok(out) => return out,
             Err(e) => {
                 last = e.to_string();
-                std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(attempt) + 50));
+                std::thread::sleep(std::time::Duration::from_millis(
+                    100 * u64::from(attempt) + 50,
+                ));
             }
         }
     }
@@ -60,7 +66,11 @@ fn http_once(port: u16, req: &str, body: Option<(&str, &[u8])>) -> std::io::Resu
     let mut request = Vec::new();
     match body {
         None => {
-            write!(request, "GET {req} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+            write!(
+                request,
+                "GET {req} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
         }
         Some((ctype, data)) => {
             write!(
@@ -86,11 +96,17 @@ fn raw(port: u16, request: &[u8]) -> Vec<u8> {
             Ok(out) => return out,
             Err(e) => {
                 last = e.to_string();
-                std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(attempt) + 50));
+                std::thread::sleep(std::time::Duration::from_millis(
+                    100 * u64::from(attempt) + 50,
+                ));
             }
         }
     }
-    let line = String::from_utf8_lossy(request).lines().next().unwrap_or("").to_string();
+    let line = String::from_utf8_lossy(request)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string();
     panic!("daemon on :{port} never answered {line:?}: {last}");
 }
 
@@ -136,6 +152,14 @@ struct Daemon {
     log: PathBuf,
 }
 
+impl Daemon {
+    /// The child's pid, for the tests that must ask the OS about the
+    /// daemon rather than the daemon about itself.
+    fn pid(&self) -> u32 {
+        self._child.0.id()
+    }
+}
+
 /// Launch a daemon under `dir` and return once OUR daemon is serving.
 ///
 /// `build` is handed the port to serve on and returns the fully
@@ -161,13 +185,20 @@ async fn serve(dir: &Path, build: impl Fn(u16) -> Command) -> Daemon {
         .await
         .unwrap();
         if ready {
-            return Daemon { _child: child, port, log };
+            return Daemon {
+                _child: child,
+                port,
+                log,
+            };
         }
         // The daemon exited instead of binding: `free_port()` handed
         // :port to a parallel test between our bind(:0) and the daemon's
         // bind, and that test's daemon won it. Try a fresh port.
         let tail = std::fs::read_to_string(&log).unwrap_or_default();
-        assert!(attempt < 2, "daemon exited without binding :{port}\n--- log ---\n{tail}");
+        assert!(
+            attempt < 2,
+            "daemon exited without binding :{port}\n--- log ---\n{tail}"
+        );
     }
     unreachable!()
 }
@@ -180,14 +211,18 @@ async fn serve(dir: &Path, build: impl Fn(u16) -> Command) -> Daemon {
 /// the OTHER daemon. The test would run against a stranger and, when that
 /// stranger's owner finished and killed it, fail mid-request with
 /// ConnectionReset. The banner is read from this daemon's own log, so it
-/// can only be ours, and it is printed immediately after the bind returns.
+/// can only be ours. (The bind itself happens near the top of startup -
+/// see serve()'s note beside spool_dir - so the banner, printed once
+/// startup is genuinely finished, is the readiness signal, not the bind.)
 ///
 /// False means the child exited first (the port race above); a genuine
 /// hang panics with the log.
 fn wait_ready(child: &mut KillOnDrop, port: u16, log: &Path) -> bool {
     let banner = format!("open the dashboard at  http://localhost:{port}/");
     for _ in 0..600 {
-        if std::fs::read_to_string(log).unwrap_or_default().contains(&banner)
+        if std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .contains(&banner)
             && TcpStream::connect(("127.0.0.1", port)).is_ok()
         {
             return true;
@@ -235,7 +270,10 @@ fn delete_without_the_trash(cfg: &Path) {
             _ => None,
         })
         .unwrap_or_default();
-    saved.insert("delete_to_trash".to_string(), serde_json::Value::Bool(false));
+    saved.insert(
+        "delete_to_trash".to_string(),
+        serde_json::Value::Bool(false),
+    );
     if !cfg.with_file_name(".spool").exists() {
         for key in ["rename_year_parens", "rename_quality_brackets"] {
             saved.entry(key).or_insert(serde_json::Value::Bool(false));
@@ -247,8 +285,7 @@ fn delete_without_the_trash(cfg: &Path) {
 #[tokio::test(flavor = "multi_thread")]
 async fn sonarr_style_cycle() {
     let dir = std::env::temp_dir().join(format!("nzbfast-daemon-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // Content on the mock server.
     let data = payload(400_000, 3);
@@ -353,6 +390,19 @@ async fn sonarr_style_cycle() {
         // Version probe (Sonarr's connection test).
         let r = http(port, "/api?mode=version&apikey=sekrit&output=json", None);
         assert!(r.contains("version"), "{r}");
+        // KEYLESS mode=version is answered on a keyed daemon (SAB parity).
+        // The container HEALTHCHECK and the tray/.app probe both curl it
+        // with no key; requiring one meant every keyed Docker install
+        // logged its own healthcheck as a rejected key from loopback,
+        // forever. Only the truly keyless call passes - the wrong-key
+        // rejection above is the other half of this contract.
+        let r = http(port, "/api?mode=version&output=json", None);
+        assert!(r.contains("\"nzbfast\""), "keyless version probe refused: {r}");
+        assert!(!r.contains("API Key"), "keyless version probe refused: {r}");
+        // ...but keyless anything-else is still refused, with the
+        // no-key phrasing the *arrs match on.
+        let r = http(port, "/api?mode=queue&output=json", None);
+        assert!(r.contains("API Key Required"), "{r}");
         // SAB-compat: browser addons (NZBDonkey, NZB Unity) send mode and
         // apikey as POST form fields with an EMPTY query string. Both form
         // encodings must authenticate - these used to log "[auth] rejected
@@ -392,6 +442,63 @@ async fn sonarr_style_cycle() {
             )),
         );
         assert!(r.contains("version"), "query key must win: {r}");
+        // Issue #4: the key may ride a header instead of the query string
+        // (X-Api-Key, or Authorization: Bearer), which keeps it out of
+        // reverse-proxy access logs - the dashboard now sends it this way.
+        let hget = |path: &str, hdr: &str| {
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n{hdr}\r\n\r\n");
+            let out = raw(port, req.as_bytes());
+            String::from_utf8_lossy(&out)
+                .split("\r\n\r\n")
+                .nth(1)
+                .unwrap_or("")
+                .to_string()
+        };
+        let r = hget("/api?mode=queue&output=json", "X-Api-Key: sekrit");
+        assert!(
+            r.contains("queue") && !r.contains("API Key"),
+            "X-Api-Key header refused: {r}"
+        );
+        let r = hget("/api?mode=queue&output=json", "Authorization: Bearer sekrit");
+        assert!(
+            r.contains("queue") && !r.contains("API Key"),
+            "Bearer header refused: {r}"
+        );
+        // RFC 7235 makes the scheme token case-insensitive, and an auth
+        // proxy that normalizes headers sends BEARER.
+        let r = hget("/api?mode=queue&output=json", "Authorization: BEARER sekrit");
+        assert!(
+            r.contains("queue") && !r.contains("API Key"),
+            "uppercase Bearer refused: {r}"
+        );
+        let r = hget("/api?mode=queue&output=json", "X-Api-Key: wrong");
+        assert!(r.contains("API Key Incorrect"), "wrong header key accepted: {r}");
+        // An empty multipart boundary is not a form. `boundary=` with
+        // nothing after it makes the delimiter `--`, so a body of
+        // hyphens used to split once every two bytes into a vector
+        // holding a fat pointer per segment - allocated BEFORE auth,
+        // and outside the body budget that bounds the read. The
+        // request must be answered like any other malformed one, and
+        // the daemon must still be serving afterwards.
+        let junk = b"--".repeat(512 * 1024); // 1 MiB of delimiters
+        let r = http(
+            port,
+            "/api?mode=version&output=json",
+            Some(("multipart/form-data; boundary=", junk.as_slice())),
+        );
+        assert!(
+            r.contains("\"nzbfast\""),
+            "empty-boundary POST was not answered: {r}"
+        );
+        let r = http(port, "/api?mode=version&apikey=sekrit&output=json", None);
+        assert!(r.contains("version"), "daemon unhealthy after the flood: {r}");
+        // The query still wins on conflict, same rule as the body merge.
+        let r = hget(
+            "/api?mode=version&apikey=sekrit&output=json",
+            "X-Api-Key: wrong",
+        );
+        assert!(r.contains("version"), "query key must win over header: {r}");
         let r = http(port, "/api?mode=get_config&apikey=sekrit&output=json", None);
         assert!(r.contains("complete_dir"), "{r}");
 
@@ -480,8 +587,7 @@ async fn sonarr_style_cycle() {
 #[tokio::test(flavor = "multi_thread")]
 async fn scrambled_segment_numbering_single_file() {
     let dir = std::env::temp_dir().join(format!("nzbfast-scramble-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // 12 MB plain file; --mem-limit 64M puts the per-slot spill budget at
     // ~7.2 MB (holds_cap 28.8 MB / 4), so the scramble trips it mid-run.
@@ -633,8 +739,8 @@ async fn scrambled_segment_numbering_single_file() {
             log.len()
         );
 
-        let out = find_video(&out_root).expect("output file vanished after completion");
-        out
+
+        find_video(&out_root).expect("output file vanished after completion")
     })
     .await
     .map(|out| assert_eq!(std::fs::read(&out).unwrap(), data, "output not byte-identical"))
@@ -648,8 +754,7 @@ async fn scrambled_segment_numbering_single_file() {
 #[tokio::test(flavor = "multi_thread")]
 async fn sab_facade_priorities_and_retry() {
     let dir = std::env::temp_dir().join(format!("nzbfast-facade-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let data = payload(200_000, 5);
     let mut articles = HashMap::new();
@@ -674,8 +779,9 @@ async fn sab_facade_priorities_and_retry() {
     };
     let good_xml = nzb_for("good.bin", &segs);
     // Articles that don't exist on the server → the job must fail and park.
-    let ghost_segs: Vec<(String, u64, u32)> =
-        (1..=3).map(|n| (format!("ghost{n}@x"), 40_000, n)).collect();
+    let ghost_segs: Vec<(String, u64, u32)> = (1..=3)
+        .map(|n| (format!("ghost{n}@x"), 40_000, n))
+        .collect();
     let bad_xml = nzb_for("bad.bin", &ghost_segs);
 
     let cfg = dir.join("config.json");
@@ -832,8 +938,7 @@ async fn sab_facade_priorities_and_retry() {
 #[tokio::test(flavor = "multi_thread")]
 async fn duplicate_held_then_promoted() {
     let dir = std::env::temp_dir().join(format!("nzbfast-dupe-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let data = payload(120_000, 11);
     let mut articles = HashMap::new();
@@ -854,8 +959,9 @@ async fn duplicate_held_then_promoted() {
             "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"&quot;ep.bin&quot; yEnc (1/9)\">\n    <groups><group>g</group></groups>\n    <segments>\n{inner}    </segments>\n  </file>\n</nzb>\n"
         )
     };
-    let ghost: Vec<(String, u64, u32)> =
-        (1..=3).map(|n| (format!("dghost{n}@x"), 40_000, n)).collect();
+    let ghost: Vec<(String, u64, u32)> = (1..=3)
+        .map(|n| (format!("dghost{n}@x"), 40_000, n))
+        .collect();
     let bad_xml = wrap(&seg_xml(&ghost)); // 720p "original" - will fail
     let good_xml = wrap(&seg_xml(&segs)); // 1080p duplicate - must take over
 
@@ -964,8 +1070,7 @@ async fn duplicate_held_then_promoted() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rss_feed_auto_grabs() {
     let dir = std::env::temp_dir().join(format!("nzbfast-rss-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let data = payload(150_000, 13);
     let mut articles = HashMap::new();
@@ -1080,8 +1185,7 @@ async fn rss_feed_auto_grabs() {
 #[tokio::test(flavor = "multi_thread")]
 async fn disk_guard_holds_queue() {
     let dir = std::env::temp_dir().join(format!("nzbfast-guard-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let data = payload(100_000, 9);
     let mut articles = HashMap::new();
@@ -1162,17 +1266,28 @@ async fn stream_while_downloading() {
     // the window open; the reader must block on not-yet-landed spans).
     use nzbkit::rar::fixtures;
     let dir = std::env::temp_dir().join(format!("nzbfast-stream-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let inner = payload(24_000_000, 7); // 24 MB "movie"
     let vols = [
-        fixtures::rar5_volume_n(&[("movie.mkv", 24_000_000, &inner[..8_000_000], false, true)], 0),
         fixtures::rar5_volume_n(
-            &[("movie.mkv", 24_000_000, &inner[8_000_000..16_000_000], true, true)],
+            &[("movie.mkv", 24_000_000, &inner[..8_000_000], false, true)],
+            0,
+        ),
+        fixtures::rar5_volume_n(
+            &[(
+                "movie.mkv",
+                24_000_000,
+                &inner[8_000_000..16_000_000],
+                true,
+                true,
+            )],
             1,
         ),
-        fixtures::rar5_volume_n(&[("movie.mkv", 24_000_000, &inner[16_000_000..], true, false)], 2),
+        fixtures::rar5_volume_n(
+            &[("movie.mkv", 24_000_000, &inner[16_000_000..], true, false)],
+            2,
+        ),
     ];
     let mut articles = HashMap::new();
     let mut xml = String::from(
@@ -1299,8 +1414,7 @@ async fn stream_encrypted_while_downloading() {
     // so the served bytes prove the on-the-fly CBC decryption path.
     use nzbkit::rar::fixtures;
     let dir = std::env::temp_dir().join(format!("nzbfast-encstream-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let inner = payload(24_000_003, 8); // odd length → end-padding truncate
     let f = fixtures::encrypt_file("s3cret", &inner, 5);
@@ -1390,12 +1504,11 @@ async fn stream_encrypted_while_downloading() {
                 port,
                 b"GET /stream HTTP/1.1\r\nHost: x\r\nRange: bytes=0-99999\r\nConnection: close\r\n\r\n",
             );
-            if let Some(p) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
-                if String::from_utf8_lossy(&raw[..p]).contains("206") {
+            if let Some(p) = raw.windows(4).position(|w| w == b"\r\n\r\n")
+                && String::from_utf8_lossy(&raw[..p]).contains("206") {
                     got = raw[p + 4..].to_vec();
                     break;
                 }
-            }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         assert_eq!(got.len(), 100_000, "head range length");
@@ -1453,8 +1566,7 @@ async fn stream_encrypted_while_downloading() {
 async fn stream_seek_promotes_and_tail_bursts() {
     use nzbkit::rar::fixtures;
     let dir = std::env::temp_dir().join(format!("nzbfast-seekord-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // 48 MB movie in 3 store-mode rar5 volumes of 16 MB payload each:
     // volA = inner[0..16M], volB = [16..32M], volC = [32..48M]. Volumes
@@ -1462,12 +1574,24 @@ async fn stream_seek_promotes_and_tail_bursts() {
     // mid-volume seek still provably enters the volume mid-way.
     let inner = payload(48_000_000, 11);
     let vols = [
-        fixtures::rar5_volume_n(&[("movie.mkv", 48_000_000, &inner[..16_000_000], false, true)], 0),
         fixtures::rar5_volume_n(
-            &[("movie.mkv", 48_000_000, &inner[16_000_000..32_000_000], true, true)],
+            &[("movie.mkv", 48_000_000, &inner[..16_000_000], false, true)],
+            0,
+        ),
+        fixtures::rar5_volume_n(
+            &[(
+                "movie.mkv",
+                48_000_000,
+                &inner[16_000_000..32_000_000],
+                true,
+                true,
+            )],
             1,
         ),
-        fixtures::rar5_volume_n(&[("movie.mkv", 48_000_000, &inner[32_000_000..], true, false)], 2),
+        fixtures::rar5_volume_n(
+            &[("movie.mkv", 48_000_000, &inner[32_000_000..], true, false)],
+            2,
+        ),
     ];
     let mut articles = HashMap::new();
     let mut xml = String::from(
@@ -1655,17 +1779,28 @@ async fn stream_seek_promotes_and_tail_bursts() {
 async fn stream_promote_preempts_deep_windows() {
     use nzbkit::rar::fixtures;
     let dir = std::env::temp_dir().join(format!("nzbfast-seekpre-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let inner = payload(48_000_000, 13);
     let vols = [
-        fixtures::rar5_volume_n(&[("movie.mkv", 48_000_000, &inner[..16_000_000], false, true)], 0),
         fixtures::rar5_volume_n(
-            &[("movie.mkv", 48_000_000, &inner[16_000_000..32_000_000], true, true)],
+            &[("movie.mkv", 48_000_000, &inner[..16_000_000], false, true)],
+            0,
+        ),
+        fixtures::rar5_volume_n(
+            &[(
+                "movie.mkv",
+                48_000_000,
+                &inner[16_000_000..32_000_000],
+                true,
+                true,
+            )],
             1,
         ),
-        fixtures::rar5_volume_n(&[("movie.mkv", 48_000_000, &inner[32_000_000..], true, false)], 2),
+        fixtures::rar5_volume_n(
+            &[("movie.mkv", 48_000_000, &inner[32_000_000..], true, false)],
+            2,
+        ),
     ];
     let mut articles = HashMap::new();
     let mut xml = String::from(
@@ -1931,8 +2066,7 @@ async fn stream_promote_preempts_deep_windows() {
 #[tokio::test(flavor = "multi_thread")]
 async fn stream_add_returns_player_links() {
     let dir = std::env::temp_dir().join(format!("nzbfast-streamadd-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let data = payload(600_000, 3);
     let mut articles = HashMap::new();
@@ -2046,8 +2180,7 @@ async fn stream_add_returns_player_links() {
 #[tokio::test(flavor = "multi_thread")]
 async fn queue_survives_restart() {
     let dir = std::env::temp_dir().join(format!("nzbfast-persist-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let keeper_data = payload(200_000, 7);
     let later_data = payload(160_000, 11);
@@ -2117,8 +2250,13 @@ async fn queue_survives_restart() {
             Some((&format!("multipart/form-data; boundary={boundary}"), &body)),
         );
         assert!(r.contains("\"status\":true"), "{r}");
-        r.split("SABnzbd_nzo_").nth(1).unwrap().split('"').next()
-            .map(|s| format!("SABnzbd_nzo_{s}")).unwrap()
+        r.split("SABnzbd_nzo_")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .map(|s| format!("SABnzbd_nzo_{s}"))
+            .unwrap()
     };
     let poll_history = |port: u16, pred: &dyn Fn(&str) -> bool, what: &str| {
         for _ in 0..150 {
@@ -2157,7 +2295,10 @@ async fn queue_survives_restart() {
     tokio::task::spawn_blocking(move || {
         let q = http(port_b, "/api?mode=queue&apikey=sekrit&output=json", None);
         assert!(q.contains(&later_id), "queued job lost across restart: {q}");
-        assert!(q.contains("\"Paused\""), "per-job pause lost across restart: {q}");
+        assert!(
+            q.contains("\"Paused\""),
+            "per-job pause lost across restart: {q}"
+        );
         let h = http(port_b, "/api?mode=history&apikey=sekrit&output=json", None);
         assert!(h.contains(&keeper_id), "history lost across restart: {h}");
         assert!(h.contains("\"Completed\""), "{h}");
@@ -2195,8 +2336,7 @@ async fn queue_survives_restart() {
 #[tokio::test(flavor = "multi_thread")]
 async fn nzbget_jsonrpc_facade_cycle() {
     let dir = std::env::temp_dir().join(format!("nzbfast-jsonrpc-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let data = payload(200_000, 5);
     let mut articles = HashMap::new();
@@ -2249,8 +2389,16 @@ async fn nzbget_jsonrpc_facade_cycle() {
             let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
             out.push(A[(n >> 18) as usize & 63] as char);
             out.push(A[(n >> 12) as usize & 63] as char);
-            out.push(if c.len() > 1 { A[(n >> 6) as usize & 63] as char } else { '=' });
-            out.push(if c.len() > 2 { A[n as usize & 63] as char } else { '=' });
+            out.push(if c.len() > 1 {
+                A[(n >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if c.len() > 2 {
+                A[n as usize & 63] as char
+            } else {
+                '='
+            });
         }
         out
     }
@@ -2259,7 +2407,11 @@ async fn nzbget_jsonrpc_facade_cycle() {
     tokio::task::spawn_blocking(move || {
         let rpc = |method: &str, params: String| -> String {
             let body = format!("{{\"method\":\"{method}\",\"params\":{params},\"id\":7}}");
-            http(port, "/jsonrpc", Some(("application/json", body.as_bytes())))
+            http(
+                port,
+                "/jsonrpc",
+                Some(("application/json", body.as_bytes())),
+            )
         };
         // version
         let v = rpc("version", "[]".into());
@@ -2268,7 +2420,10 @@ async fn nzbget_jsonrpc_facade_cycle() {
         // downloading from the mock; that's fine.
         let ap = rpc(
             "append",
-            format!("[\"show.nzb\",\"{}\",\"tv\",0,false,false,\"\",0,\"SCORE\"]", b64(xml.as_bytes())),
+            format!(
+                "[\"show.nzb\",\"{}\",\"tv\",0,false,false,\"\",0,\"SCORE\"]",
+                b64(xml.as_bytes())
+            ),
         );
         let nzbid: i64 = serde_json::from_str::<serde_json::Value>(&ap)
             .ok()
@@ -2281,7 +2436,8 @@ async fn nzbget_jsonrpc_facade_cycle() {
         for _ in 0..50 {
             let lg = rpc("listgroups", "[]".into());
             let hi = rpc("history", "[]".into());
-            if lg.contains("show.nzb") || lg.contains("\"NZBID\"") && lg.contains(&nzbid.to_string())
+            if lg.contains("show.nzb")
+                || lg.contains("\"NZBID\"") && lg.contains(&nzbid.to_string())
                 || hi.contains(&format!("\"NZBID\":{nzbid}"))
             {
                 seen = true;
@@ -2300,7 +2456,10 @@ async fn nzbget_jsonrpc_facade_cycle() {
         // rate limit round-trip
         rpc("rate", "[2500]".into());
         let st = rpc("status", "[]".into());
-        assert!(st.contains(&format!("\"DownloadLimit\":{}", 2500 * 1024)), "{st}");
+        assert!(
+            st.contains(&format!("\"DownloadLimit\":{}", 2500 * 1024)),
+            "{st}"
+        );
         rpc("rate", "[0]".into());
         // history cleanup op is exercised by HistoryDelete once done.
         for _ in 0..100 {
@@ -2330,12 +2489,14 @@ async fn nzbget_jsonrpc_facade_cycle() {
 #[tokio::test(flavor = "multi_thread")]
 async fn apikey_reveal_and_rotate_need_the_api_key() {
     let dir = std::env::temp_dir().join(format!("nzbfast-keyui-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
     let cfg = dir.join("config.json");
     std::fs::write(
         &cfg,
-        format!("{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}", free_port()),
+        format!(
+            "{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}",
+            free_port()
+        ),
     )
     .unwrap();
     let d = serve(&dir, |port| {
@@ -2363,22 +2524,49 @@ async fn apikey_reveal_and_rotate_need_the_api_key() {
     tokio::task::spawn_blocking(move || {
         // The add-only key gets nothing from either mode.
         for mode in ["apikey_show", "apikey_new"] {
-            let r = http(port, &format!("/api?mode={mode}&apikey=addkey&output=json"), None);
-            assert!(r.contains("\"status\":false"), "{mode} answered the add-only key: {r}");
-            assert!(!r.contains("fullkey"), "{mode} LEAKED the api key to the add-only key: {r}");
+            let r = http(
+                port,
+                &format!("/api?mode={mode}&apikey=addkey&output=json"),
+                None,
+            );
+            assert!(
+                r.contains("\"status\":false"),
+                "{mode} answered the add-only key: {r}"
+            );
+            assert!(
+                !r.contains("fullkey"),
+                "{mode} LEAKED the api key to the add-only key: {r}"
+            );
             // And no key at all is refused too.
             let r = http(port, &format!("/api?mode={mode}&output=json"), None);
-            assert!(r.contains("\"status\":false"), "{mode} answered an unauthenticated caller: {r}");
-            assert!(!r.contains("fullkey"), "{mode} LEAKED the api key unauthenticated: {r}");
+            assert!(
+                r.contains("\"status\":false"),
+                "{mode} answered an unauthenticated caller: {r}"
+            );
+            assert!(
+                !r.contains("fullkey"),
+                "{mode} LEAKED the api key unauthenticated: {r}"
+            );
         }
 
         // The real key can read it.
-        let r = http(port, "/api?mode=apikey_show&apikey=fullkey&output=json", None);
-        assert!(r.contains("\"apikey\":\"fullkey\""), "reveal did not return the key: {r}");
+        let r = http(
+            port,
+            "/api?mode=apikey_show&apikey=fullkey&output=json",
+            None,
+        );
+        assert!(
+            r.contains("\"apikey\":\"fullkey\""),
+            "reveal did not return the key: {r}"
+        );
 
         // Rotate, then prove the OLD key is dead, the NEW one works, and
         // the new one reached settings.json rather than only memory.
-        let r = http(port, "/api?mode=apikey_new&apikey=fullkey&output=json", None);
+        let r = http(
+            port,
+            "/api?mode=apikey_new&apikey=fullkey&output=json",
+            None,
+        );
         let new = r
             .split("\"apikey\":\"")
             .nth(1)
@@ -2388,14 +2576,144 @@ async fn apikey_reveal_and_rotate_need_the_api_key() {
         assert_ne!(new, "fullkey", "rotate returned the same key: {r}");
 
         let r = http(port, "/api?mode=version&apikey=fullkey&output=json", None);
-        assert!(r.contains("\"status\":false"), "the old key still works after a rotate: {r}");
-        let r = http(port, &format!("/api?mode=version&apikey={new}&output=json"), None);
+        assert!(
+            r.contains("\"status\":false"),
+            "the old key still works after a rotate: {r}"
+        );
+        let r = http(
+            port,
+            &format!("/api?mode=version&apikey={new}&output=json"),
+            None,
+        );
         assert!(r.contains("\"nzbfast\""), "the new key does not work: {r}");
 
         let saved = std::fs::read_to_string(dir2.join("settings.json")).unwrap_or_default();
         assert!(
             saved.contains(&new),
             "rotated key never reached settings.json, so it dies on restart: {saved}"
+        );
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The add-only key's tier, from a push extension's point of view. NZB
+/// Donkey tests a connection with mode=status and fills its category
+/// dropdown from get_cats; NZB Unity tests with mode=fullstatus - so
+/// those three reads must answer the NZB key or the key looks broken in
+/// the exact tools it exists for. Everything with queue contents or
+/// control stays full-key, refusals carry HTTP 403 like SABnzbd (a 200
+/// refusal made NZB Unity's test read as success on a wrong key), and
+/// rotating the NZB key itself is a full-key act with the same
+/// no-self-promotion reasoning as apikey_show/apikey_new.
+#[tokio::test(flavor = "multi_thread")]
+async fn add_only_key_answers_extension_probes_but_nothing_more() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-nzbkeytier-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}",
+            free_port()
+        ),
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("fullkey")
+            .arg("--nzbkey")
+            .arg("addkey")
+            .arg("--out")
+            .arg(dir.join("complete"));
+        c
+    })
+    .await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        // The three probes the push extensions send, on the add-only key.
+        for (mode, marker) in [
+            ("status", "\"uptime\""),
+            ("fullstatus", "\"uptime\""),
+            ("get_cats", "\"categories\""),
+        ] {
+            let r = http(port, &format!("/api?mode={mode}&apikey=addkey&output=json"), None);
+            assert!(
+                r.contains(marker),
+                "{mode} refused the add-only key, so Donkey/Unity read the key as broken: {r}"
+            );
+        }
+
+        // Queue contents and control stay full-key.
+        for mode in ["queue", "history", "get_config", "pause"] {
+            let r = http(port, &format!("/api?mode={mode}&apikey=addkey&output=json"), None);
+            assert!(
+                r.contains("\"status\":false"),
+                "{mode} answered the add-only key: {r}"
+            );
+        }
+
+        // Refusals are HTTP 403 (SAB parity): a 200 refusal parses as JSON
+        // and NZB Unity's connection test then reports success on a wrong
+        // key. The keyless version probe must stay 200 - the container
+        // healthcheck curls it with -f.
+        let out = raw(
+            port,
+            b"GET /api?mode=queue&apikey=addkey&output=json HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        );
+        let head = String::from_utf8_lossy(&out);
+        assert!(
+            head.starts_with("HTTP/1.1 403"),
+            "a refusal did not carry 403: {head}"
+        );
+        let out = raw(
+            port,
+            b"GET /api?mode=version&output=json HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        );
+        let head = String::from_utf8_lossy(&out);
+        assert!(
+            head.starts_with("HTTP/1.1 200"),
+            "the keyless version probe lost its 200: {head}"
+        );
+
+        // The NZB key cannot rotate itself...
+        let r = http(port, "/api?mode=nzbkey_new&apikey=addkey&output=json", None);
+        assert!(
+            r.contains("\"status\":false"),
+            "nzbkey_new answered the add-only key: {r}"
+        );
+        // ...the full key can, the old NZB key dies at once, and the new
+        // one holds the same tier.
+        let r = http(port, "/api?mode=nzbkey_new&apikey=fullkey&output=json", None);
+        let new = r
+            .split("\"nzbkey\":\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("no key in nzbkey_new response")
+            .to_string();
+        assert_ne!(new, "addkey", "rotate returned the same key: {r}");
+        let r = http(port, "/api?mode=status&apikey=addkey&output=json", None);
+        assert!(
+            r.contains("\"status\":false"),
+            "the old NZB key still works after a rotate: {r}"
+        );
+        let r = http(port, &format!("/api?mode=status&apikey={new}&output=json"), None);
+        assert!(r.contains("\"uptime\""), "the rotated NZB key does not work: {r}");
+        let r = http(port, &format!("/api?mode=queue&apikey={new}&output=json"), None);
+        assert!(
+            r.contains("\"status\":false"),
+            "the rotated NZB key gained full control: {r}"
         );
     })
     .await
@@ -2422,12 +2740,14 @@ async fn a_rotation_that_cannot_be_persisted_says_so() {
         return;
     }
     let dir = std::env::temp_dir().join(format!("nzbfast-keyro-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
     let cfg = dir.join("config.json");
     std::fs::write(
         &cfg,
-        format!("{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}", free_port()),
+        format!(
+            "{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}",
+            free_port()
+        ),
     )
     .unwrap();
     let d = serve(&dir, |port| {
@@ -2456,14 +2776,22 @@ async fn a_rotation_that_cannot_be_persisted_says_so() {
         // which is exactly settings.json's atomic temp file.
         let before = std::fs::read_to_string(dir2.join("settings.json")).unwrap_or_default();
         std::fs::set_permissions(&dir2, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let rot = http(port, "/api?mode=apikey_new&apikey=fullkey&output=json", None);
+        let rot = http(
+            port,
+            "/api?mode=apikey_new&apikey=fullkey&output=json",
+            None,
+        );
         let new = rot
             .split("\"apikey\":\"")
             .nth(1)
             .and_then(|s| s.split('"').next())
             .unwrap_or_default()
             .to_string();
-        let ver = http(port, &format!("/api?mode=version&apikey={new}&output=json"), None);
+        let ver = http(
+            port,
+            &format!("/api?mode=version&apikey={new}&output=json"),
+            None,
+        );
         let after = std::fs::read_to_string(dir2.join("settings.json")).unwrap_or_default();
         // Restore before asserting, or the dir cannot be cleaned up.
         let _ = std::fs::set_permissions(&dir2, std::fs::Permissions::from_mode(0o755));
@@ -2473,13 +2801,22 @@ async fn a_rotation_that_cannot_be_persisted_says_so() {
     .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(rot.contains("\"status\":true"), "a live rotation reported failure: {rot}");
+    assert!(
+        rot.contains("\"status\":true"),
+        "a live rotation reported failure: {rot}"
+    );
     assert!(
         rot.contains("\"saved\":false"),
         "the un-persisted rotation claimed to be durable: {rot}"
     );
-    assert!(ver.contains("\"nzbfast\""), "the daemon is not on the key it handed out: {ver}");
-    assert_eq!(before, after, "settings.json changed under a read-only directory");
+    assert!(
+        ver.contains("\"nzbfast\""),
+        "the daemon is not on the key it handed out: {ver}"
+    );
+    assert_eq!(
+        before, after,
+        "settings.json changed under a read-only directory"
+    );
 }
 
 /// Security regression: the add-only `nzbkey` must not gain full control
@@ -2491,12 +2828,14 @@ async fn a_rotation_that_cannot_be_persisted_says_so() {
 #[tokio::test(flavor = "multi_thread")]
 async fn jsonrpc_add_only_key_cannot_control_queue() {
     let dir = std::env::temp_dir().join(format!("nzbfast-jrpc-tier-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
     let cfg = dir.join("config.json");
     std::fs::write(
         &cfg,
-        format!("{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}", free_port()),
+        format!(
+            "{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}",
+            free_port()
+        ),
     )
     .unwrap();
     let d = serve(&dir, |port| {
@@ -2583,8 +2922,7 @@ async fn jsonrpc_add_only_key_cannot_control_queue() {
 #[tokio::test(flavor = "multi_thread")]
 async fn smart_folders_and_cleanup() {
     let dir = std::env::temp_dir().join(format!("nzbfast-smart-e2e-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // Two files on the mock server: the episode video + an .sfv the
     // cleanup rule should delete.
@@ -2592,16 +2930,17 @@ async fn smart_folders_and_cleanup() {
     let video = payload(300_000, 7);
     let junk = payload(20_000, 9);
     let mut articles = HashMap::new();
-    let vsegs =
-        make_file_articles(&format!("{stem}.mkv"), &video, 40_000, "vid", &mut articles);
-    let jsegs =
-        make_file_articles(&format!("{stem}.sfv"), &junk, 40_000, "junk", &mut articles);
+    let vsegs = make_file_articles(&format!("{stem}.mkv"), &video, 40_000, "vid", &mut articles);
+    let jsegs = make_file_articles(&format!("{stem}.sfv"), &junk, 40_000, "junk", &mut articles);
     let srv = MockServer::start(articles, Chaos::default()).await;
 
     let mut xml = String::from(
         "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n",
     );
-    for (name, segs) in [(format!("{stem}.mkv"), &vsegs), (format!("{stem}.sfv"), &jsegs)] {
+    for (name, segs) in [
+        (format!("{stem}.mkv"), &vsegs),
+        (format!("{stem}.sfv"), &jsegs),
+    ] {
         xml.push_str(&format!(
             "  <file poster=\"x\" date=\"0\" subject=\"&quot;{name}&quot; yEnc (1/{})\">\n    <groups><group>g</group></groups>\n    <segments>\n",
             segs.len()
@@ -2762,6 +3101,199 @@ async fn smart_folders_and_cleanup() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// TODO 78: episode titles in TV renames, end to end.
+///
+/// The lookup is CACHE-ONLY - it reads the `eplist:` blob the watchlist's
+/// calendar refresher leaves in the index, and makes no request of its
+/// own - so the test seeds that blob directly and runs the daemon with
+/// `NZBFAST_NO_ENRICH=1` like every other one here. What it proves is
+/// the whole chain: the opt-in setting, the cache read inside
+/// `finalize_names`, the title in the filed name, and the job's own
+/// record of what it wrote being good enough to play the episode back
+/// out of a shared season folder afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn episode_titles_reach_a_filed_tv_rename() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-eptitle-e2e-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+
+    let stem = "My.Show.S01E02.1080p.WEB.x264-TEST";
+    let video = payload(200_000, 11);
+    let mut articles = HashMap::new();
+    let vsegs = make_file_articles(&format!("{stem}.mkv"), &video, 40_000, "vid", &mut articles);
+    let srv = MockServer::start(articles, Chaos::default()).await;
+
+    let mut xml = String::from(
+        "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n",
+    );
+    xml.push_str(&format!(
+        "  <file poster=\"x\" date=\"0\" subject=\"&quot;{stem}.mkv&quot; yEnc (1/{})\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+        vsegs.len()
+    ));
+    for (id, bytes, num) in vsegs.iter() {
+        xml.push_str(&format!(
+            "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+        ));
+    }
+    xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+
+    // The cache the rename reads, written the way the calendar refresher
+    // writes it: one blob per show, keyed by the normalised title.
+    let db = dir.join("index.db");
+    {
+        let ix = nzbkit::index::Index::open(&db).unwrap();
+        let key = format!("eplist:{}", nzbkit::release::norm_title("My Show"));
+        let blob = r#"{"fetched":1,"show_id":1,"episodes":[
+            {"season":1,"episode":1,"name":"Pilot","airdate":"2026-01-01"},
+            {"season":1,"episode":2,"name":"The Ceremony","airdate":"2026-01-08"}]}"#;
+        ix.kv_set(&key, blob).unwrap();
+    }
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    // The index has to be ON for the cache to be readable at all, and the
+    // titles setting is opt-in - it is off for everyone who does not ask.
+    std::fs::write(
+        cfg.with_file_name("settings.json"),
+        "{\"index_enabled\": true, \"rename_episode_titles\": true}",
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--index-db")
+            .arg(&db)
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"));
+        c
+    })
+    .await;
+    let port = d.port;
+
+    let dir2 = dir.clone();
+    tokio::task::spawn_blocking(move || {
+        let pct = |s: &str| -> String {
+            s.bytes()
+                .map(|b| {
+                    if b.is_ascii_alphanumeric() {
+                        (b as char).to_string()
+                    } else {
+                        format!("%{b:02X}")
+                    }
+                })
+                .collect()
+        };
+        let rule = r#"[{"name":"myshow","match":"^My\\.Show\\.","category":"tv","tv_sort":true}]"#;
+        let r = http(
+            port,
+            &format!(
+                "/api?mode=config&name=smart_folders&value={}&apikey=sekrit&output=json",
+                pct(rule)
+            ),
+            None,
+        );
+        assert!(r.contains("\"status\":true"), "{r}");
+        // The setting survived the restart replay and reads back on.
+        let cfgjson = http(port, "/api?mode=get_config&apikey=sekrit&output=json", None);
+        assert!(
+            cfgjson.contains("\"rename_episode_titles\":true"),
+            "setting not live: {cfgjson}"
+        );
+
+        let boundary = "----nzbfastboundary";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"{stem}.nzb\"\r\nContent-Type: application/x-nzb\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(xml.as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let ctype = format!("multipart/form-data; boundary={boundary}");
+        let r = http(
+            port,
+            "/api?mode=addfile&apikey=sekrit&output=json",
+            Some((&ctype, &body)),
+        );
+        assert!(r.contains("nzo_ids"), "{r}");
+
+        let mut hist = String::new();
+        for _ in 0..150 {
+            hist = http(port, "/api?mode=history&apikey=sekrit&output=json", None);
+            if hist.contains("\"Completed\"") || hist.contains("\"Failed\"") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        assert!(hist.contains("\"Completed\""), "never completed: {hist}");
+
+        // The episode's own name is in the filename, between the episode
+        // base and the quality tag. Bracketed here because a settings.json
+        // already on disk reads as an existing install, which keeps the
+        // pre-1.0.10 punctuation - see `legacy_rename_punctuation`.
+        let dest = dir2.join("complete/tv/My Show/Season 01");
+        let filed = dest.join("My Show - S01E02 - The Ceremony [1080p].mkv");
+        assert_eq!(
+            std::fs::read(&filed).unwrap_or_else(|e| panic!(
+                "no titled episode ({e}); folder holds {:?}",
+                std::fs::read_dir(&dest)
+                    .map(|rd| rd.flatten().map(|x| x.file_name()).collect::<Vec<_>>())
+            )),
+            payload(200_000, 11)
+        );
+
+        // ...and the record of it is good enough to serve the episode
+        // back out of the shared season folder. A sibling sitting beside
+        // it must not be what comes back.
+        std::fs::write(
+            dest.join("My Show - S01E03 - Doors [1080p].mkv"),
+            payload(400_000, 13),
+        )
+        .unwrap();
+        let id = hist
+            .split("\"nzo_id\":\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("nzo_id")
+            .to_string();
+        let resp = raw(
+            port,
+            format!("GET /stream/{id}?apikey=sekrit HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        );
+        let cut = resp.windows(4).position(|w| w == b"\r\n\r\n").expect("no headers") + 4;
+        let (head, served) = resp.split_at(cut);
+        let head = String::from_utf8_lossy(head).to_string();
+        assert!(head.contains("200 OK"), "play refused the titled episode: {head}");
+        assert_eq!(
+            served,
+            &payload(200_000, 11)[..],
+            "served the sibling, not the episode this job filed"
+        );
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Reported against 1.0.9: an F1 round finished as
 /// "1fRbH6e0eX8v5hv7fSyXgBb.mkv" with every rename option ticked. The
 /// smart renamer declines event posts on purpose (every round would
@@ -2770,16 +3302,20 @@ async fn smart_folders_and_cleanup() {
 #[tokio::test(flavor = "multi_thread")]
 async fn obfuscated_event_release_still_gets_named() {
     let dir = std::env::temp_dir().join(format!("nzbfast-obf-e2e-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // The job carries the real release name; the article inside does not.
     let rel = "Formula1.2026.Round11.Hungary.Race.F1TV.WEB-DL.2160p.HLG.H265.DDP5.1.English-MWR";
     let inner = "1fRbH6e0eX8v5hv7fSyXgBb";
     let video = payload(200_000, 21);
     let mut articles = HashMap::new();
-    let vsegs =
-        make_file_articles(&format!("{inner}.mkv"), &video, 40_000, "obf", &mut articles);
+    let vsegs = make_file_articles(
+        &format!("{inner}.mkv"),
+        &video,
+        40_000,
+        "obf",
+        &mut articles,
+    );
     let srv = MockServer::start(articles, Chaos::default()).await;
 
     let mut xml = String::from(
@@ -2887,15 +3423,19 @@ async fn obfuscated_event_release_still_gets_named() {
 #[tokio::test(flavor = "multi_thread")]
 async fn obfuscated_event_release_keeps_its_words() {
     let dir = std::env::temp_dir().join(format!("nzbfast-evw-e2e-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let rel = "Formula1.2026.Round11.Hungary.Race.F1TV.WEB-DL.2160p.HLG.H265.DDP5.1.English-MWR";
     let inner = "1fRbH6e0eX8v5hv7fSyXgBb";
     let video = payload(200_000, 21);
     let mut articles = HashMap::new();
-    let vsegs =
-        make_file_articles(&format!("{inner}.mkv"), &video, 40_000, "evw", &mut articles);
+    let vsegs = make_file_articles(
+        &format!("{inner}.mkv"),
+        &video,
+        40_000,
+        "evw",
+        &mut articles,
+    );
     let srv = MockServer::start(articles, Chaos::default()).await;
 
     let mut xml = String::from(
@@ -2999,8 +3539,7 @@ async fn obfuscated_event_release_keeps_its_words() {
 #[tokio::test(flavor = "multi_thread")]
 async fn passworded_archive_flow() {
     let dir = std::env::temp_dir().join(format!("nzbfast-pw-e2e-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // Three posts: an encrypted-header rar, and two plain bins for the
     // password-source paths (NZB meta / name convention).
@@ -3142,13 +3681,12 @@ async fn passworded_archive_flow() {
         for _ in 0..50 {
             let h = http(port, "/api?mode=history&apikey=sekrit&output=json", None);
             let s = slots(&h);
-            if let Some(l) = s.iter().find(|s| s["name"] == "Locked.Release.2026") {
-                if l["fail_message"].as_str().unwrap_or("").contains("did not unlock") {
+            if let Some(l) = s.iter().find(|s| s["name"] == "Locked.Release.2026")
+                && l["fail_message"].as_str().unwrap_or("").contains("did not unlock") {
                     assert_eq!(l["password_required"], true, "{l}");
                     reported = true;
                     break;
                 }
-            }
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
         assert!(reported, "wrong password never reported");
@@ -3171,8 +3709,7 @@ async fn passworded_archive_flow() {
 #[tokio::test(flavor = "multi_thread")]
 async fn queue_switch_reorders() {
     let dir = std::env::temp_dir().join(format!("nzbfast-switch-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // No articles needed - the queue stays paused, nothing downloads.
     let srv = MockServer::start(HashMap::new(), Chaos::default()).await;
@@ -3287,8 +3824,7 @@ async fn queue_switch_reorders() {
 #[tokio::test(flavor = "multi_thread")]
 async fn slow_single_server_job_deferred() {
     let dir = std::env::temp_dir().join(format!("nzbfast-defer-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // Fast server: warmup + fast job articles, tiny per-article delay so
     // completed-job averages are measured over a real span. Slow server:
@@ -3297,10 +3833,20 @@ async fn slow_single_server_job_deferred() {
     let mut fast_articles = HashMap::new();
     // Big enough that its network phase lasts ≥0.5 s (the guard for
     // recording a completed-job average into the session-best rate).
-    let warm_segs =
-        make_file_articles("warm.bin", &payload(8_000_000, 7), 40_000, "wm", &mut fast_articles);
-    let fastj_segs =
-        make_file_articles("fastjob.bin", &payload(1_600_000, 9), 40_000, "fj", &mut fast_articles);
+    let warm_segs = make_file_articles(
+        "warm.bin",
+        &payload(8_000_000, 7),
+        40_000,
+        "wm",
+        &mut fast_articles,
+    );
+    let fastj_segs = make_file_articles(
+        "fastjob.bin",
+        &payload(1_600_000, 9),
+        40_000,
+        "fj",
+        &mut fast_articles,
+    );
     let mut slow_articles = HashMap::new();
     let slow_segs = make_file_articles(
         "slowjob.bin",
@@ -3311,12 +3857,18 @@ async fn slow_single_server_job_deferred() {
     );
     let fast_srv = MockServer::start(
         fast_articles,
-        Chaos { delay_ms: 10, ..Chaos::default() },
+        Chaos {
+            delay_ms: 10,
+            ..Chaos::default()
+        },
     )
     .await;
     let slow_srv = MockServer::start(
         slow_articles,
-        Chaos { delay_ms: 250, ..Chaos::default() },
+        Chaos {
+            delay_ms: 250,
+            ..Chaos::default()
+        },
     )
     .await;
 
@@ -3460,8 +4012,7 @@ async fn slow_single_server_job_deferred() {
 #[tokio::test(flavor = "multi_thread")]
 async fn idle_servers_prefetch_next_job() {
     let dir = std::env::temp_dir().join(format!("nzbfast-prefetch-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // Slow server: ONLY job A's articles, 250 ms each (~160 KB/s at 2
     // conns → A runs ~19 s). Fast server: ONLY job B's articles.
@@ -3483,7 +4034,10 @@ async fn idle_servers_prefetch_next_job() {
     );
     let slow_srv = MockServer::start(
         slow_articles,
-        Chaos { delay_ms: 250, ..Chaos::default() },
+        Chaos {
+            delay_ms: 250,
+            ..Chaos::default()
+        },
     )
     .await;
     // Mildly delayed so the sidecar run spans a few poll ticks - the test
@@ -3491,7 +4045,10 @@ async fn idle_servers_prefetch_next_job() {
     // localhost transfer finishes between two 200 ms polls.
     let fast_srv = MockServer::start(
         fast_articles,
-        Chaos { delay_ms: 100, ..Chaos::default() },
+        Chaos {
+            delay_ms: 100,
+            ..Chaos::default()
+        },
     )
     .await;
 
@@ -3637,22 +4194,42 @@ async fn idle_servers_prefetch_next_job() {
 #[tokio::test(flavor = "multi_thread")]
 async fn prefetch_borrows_from_the_busy_server_when_no_healthy_idle() {
     let dir = std::env::temp_dir().join(format!("nzbfast-prefdead-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // Healthy server: A's AND B's articles, 250 ms each so A's run is
     // wide enough for the monitor's warmup+window to elapse. Dead
     // server: no articles, rejects every AUTHINFO.
     let mut articles = HashMap::new();
-    let a_segs =
-        make_file_articles("slowa.bin", &payload(4_000_000, 71), 20_000, "da", &mut articles);
-    let b_segs =
-        make_file_articles("afterb.bin", &payload(400_000, 73), 40_000, "db", &mut articles);
-    let good_srv =
-        MockServer::start(articles, Chaos { delay_ms: 250, ..Chaos::default() }).await;
-    let dead_srv =
-        MockServer::start(HashMap::new(), Chaos { auth_rejected: true, ..Chaos::default() })
-            .await;
+    let a_segs = make_file_articles(
+        "slowa.bin",
+        &payload(4_000_000, 71),
+        20_000,
+        "da",
+        &mut articles,
+    );
+    let b_segs = make_file_articles(
+        "afterb.bin",
+        &payload(400_000, 73),
+        40_000,
+        "db",
+        &mut articles,
+    );
+    let good_srv = MockServer::start(
+        articles,
+        Chaos {
+            delay_ms: 250,
+            ..Chaos::default()
+        },
+    )
+    .await;
+    let dead_srv = MockServer::start(
+        HashMap::new(),
+        Chaos {
+            auth_rejected: true,
+            ..Chaos::default()
+        },
+    )
+    .await;
 
     let nzb_for = |name: &str, segs: &[(String, u64, u32)]| {
         let mut xml = String::from(
@@ -3708,7 +4285,10 @@ async fn prefetch_borrows_from_the_busy_server_when_no_healthy_idle() {
     let port = d.port;
     let log_path = d.log.clone();
 
-    let (a_xml, b_xml) = (nzb_for("slowa.bin", &a_segs), nzb_for("afterb.bin", &b_segs));
+    let (a_xml, b_xml) = (
+        nzb_for("slowa.bin", &a_segs),
+        nzb_for("afterb.bin", &b_segs),
+    );
     let b_id = tokio::task::spawn_blocking(move || {
         let upload = |xml: &str, fname: &str| -> String {
             let boundary = "----prefd";
@@ -3804,7 +4384,9 @@ async fn prefetch_borrows_from_the_busy_server_when_no_healthy_idle() {
 
     let log = std::fs::read_to_string(&d.log).unwrap_or_default();
     assert!(
-        log.contains(&format!("[prefetch] {b_id} completed entirely on borrowed connections")),
+        log.contains(&format!(
+            "[prefetch] {b_id} completed entirely on borrowed connections"
+        )),
         "B was not finished by the borrowed sidecar:\n{log}"
     );
     // The budget never double-counted: the healthy server saw the active
@@ -3836,8 +4418,7 @@ async fn prefetch_borrows_from_the_busy_server_when_no_healthy_idle() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pause_suspends_active_download() {
     let dir = std::env::temp_dir().join(format!("nzbfast-pause-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // 2 MB at a 250 KB/s cap ≈ 8 s of transfer - a wide pause window.
     let data = payload(2_000_000, 9);
@@ -3991,15 +4572,17 @@ async fn pause_suspends_active_download() {
 #[tokio::test(flavor = "multi_thread")]
 async fn live_settings_survive_restart() {
     let dir = std::env::temp_dir().join(format!("nzbfast-liveset-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // A server entry is required by config load; nothing connects to it
     // in this test (no jobs are queued), so a dead port is fine.
     let cfg = dir.join("config.json");
     std::fs::write(
         &cfg,
-        format!("{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}", free_port()),
+        format!(
+            "{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}",
+            free_port()
+        ),
     )
     .unwrap();
     let build = |port: u16| {
@@ -4030,6 +4613,12 @@ async fn live_settings_survive_restart() {
         ("update_url", ""),
         ("index_deepen", "123456"),
         ("bench_interval", "6"),
+        // The pre feed's two capacity knobs. They were constants until
+        // 2 Aug 2026; the reason they are settings is that the PRUNE and
+        // the seed IMPORTER have to agree on the cap, and a constant the
+        // importer could not see meant importing rows the prune ate.
+        ("predb_max_rows", "400000"),
+        ("predb_seed_days", "90"),
         // 24D user categories: URL-encoded
         // [{"slug":"formula-1","name":"Formula 1","match":"formula1","base":"movie"}]
         (
@@ -4057,6 +4646,8 @@ async fn live_settings_survive_restart() {
         "\"update_url\":\"\"",
         "\"index_deepen\":123456",
         "\"bench_interval\":6",
+        "\"predb_max_rows\":400000",
+        "\"predb_seed_days\":90",
         "\"slug\":\"formula-1\"",
         "\"base\":\"movie\"",
         "\"kind\":\"formula-1\"",
@@ -4080,6 +4671,34 @@ async fn live_settings_survive_restart() {
         for e in expect {
             assert!(c.contains(e), "live after set, missing {e}: {c}");
         }
+        // The capacity knobs clamp rather than refuse: a number outside
+        // the sane range is a typo, and a typo must not leave the feed
+        // table with a cap of 1. The write reply only says "saved", so
+        // the clamp is read back from the config.
+        for (name, value) in [("predb_max_rows", "1"), ("predb_seed_days", "9999")] {
+            http(
+                port_a,
+                &format!("/api?mode=config&name={name}&value={value}&apikey=sekrit&output=json"),
+                None,
+            );
+        }
+        let c = http(port_a, "/api?mode=get_config&apikey=sekrit&output=json", None);
+        assert!(
+            c.contains("\"predb_max_rows\":10000"),
+            "predb_max_rows floor not applied: {c}"
+        );
+        assert!(
+            c.contains("\"predb_seed_days\":366"),
+            "predb_seed_days ceiling not applied: {c}"
+        );
+        // Put the round-trip values back for the restart half.
+        for (name, value) in [("predb_max_rows", "400000"), ("predb_seed_days", "90")] {
+            http(
+                port_a,
+                &format!("/api?mode=config&name={name}&value={value}&apikey=sekrit&output=json"),
+                None,
+            );
+        }
         // 24D: a category slug shadowing a built-in kind is refused, and
         // the refusal must not clobber the saved list.
         let r = http(
@@ -4100,9 +4719,148 @@ async fn live_settings_survive_restart() {
     let b = serve(&dir, &build).await;
     let port_b = b.port;
     tokio::task::spawn_blocking(move || {
-        let c = http(port_b, "/api?mode=get_config&apikey=sekrit&output=json", None);
+        let c = http(
+            port_b,
+            "/api?mode=get_config&apikey=sekrit&output=json",
+            None,
+        );
         for e in expect {
             assert!(c.contains(e), "lost across restart, missing {e}: {c}");
+        }
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A daemon that cannot have the port it was given must leave the data
+/// directory exactly as it found it.
+///
+/// The bind used to be the LAST step of startup, so a losing daemon had
+/// already minted a first-run API key, created `.spool` and written
+/// settings.json before it discovered the port was taken. Those writes
+/// are not incidental clutter - they ARE the answer to "is this a fresh
+/// install?" that `legacy_rename_punctuation` and `first_run_apikey`
+/// read. A failed start therefore rewrote the question for the next one.
+///
+/// That was a live flake rather than a theoretical one: `serve()` above
+/// re-launches on a fresh port when it loses the race for an OS-assigned
+/// one, and under `cargo test --workspace` (many suites, many daemons,
+/// all racing for ports) attempt 1's corpse told attempt 2 it was an
+/// upgrade. `obfuscated_event_release_keeps_its_words` then filed its
+/// download as `Formula1 (2026) ... [2160p]` - the pre-upgrade
+/// punctuation shape - and nothing about the failure looked like a port
+/// problem. The second half of this test is that exact sequence.
+///
+/// ONE DELIBERATE EXCEPTION, which this test does not exercise: the bind
+/// sits AFTER first_run_apikey, so a losing start on a genuine first run
+/// still leaves the minted `apikey` file. That is intentional. The key
+/// gate has to run first - it is what refuses to start on a broken
+/// credential, and binding ahead of it would report a lost port where an
+/// operator must be told the key file is unreadable (firstrun_key.rs
+/// pins that). The orphan key is harmless: `legacy_rename_punctuation`
+/// consults settings.json and `.spool` only, so the key feeds no
+/// fresh-vs-existing verdict, and the next start reuses it correctly -
+/// and MintDisclosure fires on that exit, so the user is told the key
+/// exists. runtime.json cannot be an artefact either: it is written only
+/// after the listener exists, just before the readiness banner.
+/// This test runs keyless (NZBFAST_OPEN=1), so nothing is minted and the
+/// directory must come out completely untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_that_loses_its_port_writes_nothing() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-bindfail-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}",
+            free_port()
+        ),
+    )
+    .unwrap();
+
+    // Squat the port for real, and keep holding it while the daemon
+    // tries: a closed listener would let the daemon win.
+    let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let taken = squatter.local_addr().unwrap().port();
+
+    let out = tokio::task::spawn_blocking({
+        let cfg = cfg.clone();
+        let dir = dir.clone();
+        move || {
+            Command::new(env!("CARGO_BIN_EXE_nzbfast"))
+                .env("NZBFAST_OPEN", "1")
+                .env("NZBFAST_NO_ENRICH", "1")
+                .arg("--config")
+                .arg(&cfg)
+                .arg("serve")
+                .arg("--bind")
+                .arg("127.0.0.1")
+                .arg("--port")
+                .arg(taken.to_string())
+                .arg("--out")
+                .arg(dir.join("complete"))
+                .output()
+                .unwrap()
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !out.status.success(),
+        "the daemon claimed a port that was taken"
+    );
+    let said =
+        String::from_utf8_lossy(&out.stderr).to_string() + &String::from_utf8_lossy(&out.stdout);
+    assert!(
+        said.contains(&format!("bind 127.0.0.1:{taken}")),
+        "a lost port must say so plainly: {said}"
+    );
+
+    let mut left: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        vec!["config.json".to_string()],
+        "a daemon that never bound touched the data directory: {left:?}"
+    );
+
+    // ...and because it touched nothing, the next start still reads the
+    // directory as the fresh install it actually is.
+    drop(squatter);
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"));
+        c
+    })
+    .await;
+    let port = d.port;
+    tokio::task::spawn_blocking(move || {
+        let body = http(port, "/api?mode=get_config&apikey=sekrit&output=json", None);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let cfg = &v["config"]["nzbfast"];
+        for key in ["rename_year_parens", "rename_quality_brackets"] {
+            assert_eq!(
+                cfg[key], false,
+                "a failed start upgraded a fresh install behind our back - {key}: {cfg}"
+            );
         }
     })
     .await
@@ -4128,14 +4886,16 @@ async fn live_settings_survive_restart() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pause_survives_restart() {
     let dir = std::env::temp_dir().join(format!("nzbfast-pausep-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // Nothing connects to it (no jobs are queued), so a dead port is fine.
     let cfg = dir.join("config.json");
     std::fs::write(
         &cfg,
-        format!("{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}", free_port()),
+        format!(
+            "{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}",
+            free_port()
+        ),
     )
     .unwrap();
     let build = |port: u16| {
@@ -4203,7 +4963,9 @@ async fn pause_survives_restart() {
     drop(c);
     let s = std::fs::read_to_string(&settings).unwrap();
     let mut v: serde_json::Value = serde_json::from_str(&s).unwrap();
-    let deadline = v["pause_until_unix"].as_i64().expect("timed pause wrote no deadline");
+    let deadline = v["pause_until_unix"]
+        .as_i64()
+        .expect("timed pause wrote no deadline");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -4218,9 +4980,16 @@ async fn pause_survives_restart() {
     let d = serve(&dir, &build).await;
     let port_d = d.port;
     tokio::task::spawn_blocking(move || {
-        assert!(!paused_now(port_d), "an expired timed pause came back paused");
+        assert!(
+            !paused_now(port_d),
+            "an expired timed pause came back paused"
+        );
         // 4. A clean shutdown pauses internally; that must not be saved.
-        let r = http(port_d, "/api?mode=shutdown&output=json", Some(("text/plain", b"")));
+        let r = http(
+            port_d,
+            "/api?mode=shutdown&output=json",
+            Some(("text/plain", b"")),
+        );
         assert!(r.contains("\"status\":true"), "{r}");
     })
     .await
@@ -4237,7 +5006,10 @@ async fn pause_survives_restart() {
     let e = serve(&dir, &build).await;
     let port_e = e.port;
     tokio::task::spawn_blocking(move || {
-        assert!(!paused_now(port_e), "came back paused after a clean shutdown");
+        assert!(
+            !paused_now(port_e),
+            "came back paused after a clean shutdown"
+        );
     })
     .await
     .unwrap();
@@ -4257,7 +5029,7 @@ async fn pause_survives_restart() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rename_punctuation_defaults_split_fresh_installs_from_upgrades() {
     let root = std::env::temp_dir().join(format!("nzbfast-renamedef-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let _scratch = scratch::ScratchDir::attach(&root);
 
     // Only a wizard answer on disk: still a fresh install.
     // Anything else: an install that has already been used.
@@ -4323,14 +5095,14 @@ async fn rename_punctuation_defaults_split_fresh_installs_from_upgrades() {
 #[tokio::test(flavor = "multi_thread")]
 async fn auto_retry_fires_once_after_cooldown() {
     let dir = std::env::temp_dir().join(format!("nzbfast-autoretry-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // No articles on the server at all → every segment is a ghost and the
     // job fails with "download incomplete" (the transient shape).
     let srv = MockServer::start(HashMap::new(), Chaos::default()).await;
-    let ghost_segs: Vec<(String, u64, u32)> =
-        (1..=3).map(|n| (format!("aghost{n}@x"), 40_000, n)).collect();
+    let ghost_segs: Vec<(String, u64, u32)> = (1..=3)
+        .map(|n| (format!("aghost{n}@x"), 40_000, n))
+        .collect();
     let mut xml = String::from(
         "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n",
     );
@@ -4441,8 +5213,7 @@ async fn auto_retry_fires_once_after_cooldown() {
 #[tokio::test(flavor = "multi_thread")]
 async fn zip_payload_post_fails_with_a_reason() {
     let dir = std::env::temp_dir().join(format!("nzbfast-zip-e2e-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // A movie-shaped release whose payload is one zip. Real local file
     // header magic so the on-disk detectors see a container, not just a
@@ -4590,11 +5361,12 @@ async fn zip_payload_post_fails_with_a_reason() {
 #[tokio::test(flavor = "multi_thread")]
 async fn zip_payload_post_unpacks_natively() {
     let dir = std::env::temp_dir().join(format!("nzbfast-zipok-e2e-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let stem = "Some.Movie.2021.1080p.BluRay.x264-TEST";
-    let movie: Vec<u8> = (0..300_000u32).map(|i| (i as u8).wrapping_mul(37)).collect();
+    let movie: Vec<u8> = (0..300_000u32)
+        .map(|i| (i as u8).wrapping_mul(37))
+        .collect();
     let zip = nzbkit::zip::fixtures::zip_of(&[
         nzbkit::zip::fixtures::Spec::deflated("Some.Movie.2021.mkv", &movie),
         nzbkit::zip::fixtures::Spec::stored("readme.nfo", b"scene info"),
@@ -4748,24 +5520,36 @@ fn walk_find_ext(root: &std::path::Path, ext: &str) -> Option<std::path::PathBuf
 #[tokio::test(flavor = "multi_thread")]
 async fn zip_sidecar_is_noted_and_survives_cleanup() {
     let dir = std::env::temp_dir().join(format!("nzbfast-zipside-e2e-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let stem = "Other.Movie.2021.1080p.BluRay.x264-TEST";
     let video = payload(300_000, 13);
     let mut extras = b"PK\x03\x04".to_vec();
     extras.extend_from_slice(&payload(50_000, 17));
     let mut articles = HashMap::new();
-    let vsegs =
-        make_file_articles(&format!("{stem}.mkv"), &video, 40_000, "vid2", &mut articles);
-    let zsegs =
-        make_file_articles(&format!("{stem}.zip"), &extras, 40_000, "zip2", &mut articles);
+    let vsegs = make_file_articles(
+        &format!("{stem}.mkv"),
+        &video,
+        40_000,
+        "vid2",
+        &mut articles,
+    );
+    let zsegs = make_file_articles(
+        &format!("{stem}.zip"),
+        &extras,
+        40_000,
+        "zip2",
+        &mut articles,
+    );
     let srv = MockServer::start(articles, Chaos::default()).await;
 
     let mut xml = String::from(
         "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n",
     );
-    for (name, segs) in [(format!("{stem}.mkv"), &vsegs), (format!("{stem}.zip"), &zsegs)] {
+    for (name, segs) in [
+        (format!("{stem}.mkv"), &vsegs),
+        (format!("{stem}.zip"), &zsegs),
+    ] {
         xml.push_str(&format!(
             "  <file poster=\"x\" date=\"0\" subject=\"&quot;{name}&quot; yEnc (1/{})\">\n    <groups><group>g</group></groups>\n    <segments>\n",
             segs.len()
@@ -4882,13 +5666,18 @@ async fn archive_shape_is_live_in_the_queue_and_kept_in_history() {
     // must survive onto the history entry once it finishes.
     use nzbkit::rar::fixtures;
     let dir = std::env::temp_dir().join(format!("nzbfast-shape-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let inner = payload(12_000_000, 11);
     let vols = [
-        fixtures::rar5_volume_n(&[("movie.mkv", 12_000_000, &inner[..6_000_000], false, true)], 0),
-        fixtures::rar5_volume_n(&[("movie.mkv", 12_000_000, &inner[6_000_000..], true, false)], 1),
+        fixtures::rar5_volume_n(
+            &[("movie.mkv", 12_000_000, &inner[..6_000_000], false, true)],
+            0,
+        ),
+        fixtures::rar5_volume_n(
+            &[("movie.mkv", 12_000_000, &inner[6_000_000..], true, false)],
+            1,
+        ),
     ];
     let mut articles = HashMap::new();
     let mut xml = String::from(
@@ -5026,8 +5815,7 @@ async fn archive_shape_is_live_in_the_queue_and_kept_in_history() {
 #[tokio::test(flavor = "multi_thread")]
 async fn retry_re_homes_off_a_completed_re_adds_folder() {
     let dir = std::env::temp_dir().join(format!("nzbfast-retryhome-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let data = payload(200_000, 31);
     let mut articles = HashMap::new();
@@ -5047,8 +5835,9 @@ async fn retry_re_homes_off_a_completed_re_adds_folder() {
         xml.push_str("    </segments>\n  </file>\n</nzb>\n");
         xml
     };
-    let ghost: Vec<(String, u64, u32)> =
-        (1..=3).map(|n| (format!("rhghost{n}@x"), 40_000, n)).collect();
+    let ghost: Vec<(String, u64, u32)> = (1..=3)
+        .map(|n| (format!("rhghost{n}@x"), 40_000, n))
+        .collect();
     let ghost_xml = nzb_for("gone.bin", &ghost);
     let good_xml = nzb_for("keeper.bin", &segs);
 
@@ -5188,16 +5977,40 @@ async fn retry_re_homes_off_a_completed_re_adds_folder() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelling_a_download_leaves_its_duplicate_held() {
     let dir = std::env::temp_dir().join(format!("nzbfast-canceldupe-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let mut articles = HashMap::new();
     // The cancelled original is deliberately long (250 ms an article, 2
     // connections → ~6 s) so the delete lands mid-transfer.
-    let orig = make_file_articles("orig.bin", &payload(2_000_000, 51), 40_000, "cd", &mut articles);
-    let held = make_file_articles("held.bin", &payload(400_000, 53), 40_000, "cd", &mut articles);
-    let alt = make_file_articles("alt.bin", &payload(400_000, 55), 40_000, "cd", &mut articles);
-    let srv = MockServer::start(articles, Chaos { delay_ms: 250, ..Chaos::default() }).await;
+    let orig = make_file_articles(
+        "orig.bin",
+        &payload(2_000_000, 51),
+        40_000,
+        "cd",
+        &mut articles,
+    );
+    let held = make_file_articles(
+        "held.bin",
+        &payload(400_000, 53),
+        40_000,
+        "cd",
+        &mut articles,
+    );
+    let alt = make_file_articles(
+        "alt.bin",
+        &payload(400_000, 55),
+        40_000,
+        "cd",
+        &mut articles,
+    );
+    let srv = MockServer::start(
+        articles,
+        Chaos {
+            delay_ms: 250,
+            ..Chaos::default()
+        },
+    )
+    .await;
 
     let nzb_for = |file: &str, segs: &[(String, u64, u32)]| {
         let mut xml = format!(
@@ -5212,8 +6025,9 @@ async fn cancelling_a_download_leaves_its_duplicate_held() {
         xml.push_str("    </segments>\n  </file>\n</nzb>\n");
         xml
     };
-    let ghost: Vec<(String, u64, u32)> =
-        (1..=3).map(|n| (format!("cdghost{n}@x"), 40_000, n)).collect();
+    let ghost: Vec<(String, u64, u32)> = (1..=3)
+        .map(|n| (format!("cdghost{n}@x"), 40_000, n))
+        .collect();
     let (orig_xml, held_xml) = (nzb_for("orig.bin", &orig), nzb_for("held.bin", &held));
     let (dead_xml, alt_xml) = (nzb_for("dead.bin", &ghost), nzb_for("alt.bin", &alt));
 
@@ -5290,6 +6104,33 @@ async fn cancelling_a_download_leaves_its_duplicate_held() {
                 .and_then(|a| a.iter().find(|s| s["nzo_id"] == id).cloned())
                 .unwrap_or(serde_json::Value::Null)
         };
+        // ONE history slot - the same rule as `qslot`, for a sharper
+        // reason. A FAILED record carries `fail_detail`: that job's
+        // console block, snapshotted out of the daemon's log ring. The
+        // ring is a GLOBAL tee of stdout, so every line any other lane
+        // printed while the failing job held the floor is in there too -
+        // including `[queue] added <nzo_id> as ALTERNATIVE (duplicate
+        // held)` for a job added mid-download. `h.contains(&id)`
+        // therefore answers "is this id mentioned ANYWHERE in history",
+        // which is not the question any assertion below asks.
+        //
+        // Not hypothetical: it is what made this test flaky under
+        // `cargo test --workspace` (2 Aug 2026 - 7 failures in 10 loaded
+        // runs, every one captured with history holding a single slot).
+        // The runner picks a queued job on a 500 ms tick, so the dead job
+        // could open its log bracket BEFORE the test's next upload
+        // landed, and a loaded box is exactly what makes that upload slow
+        // enough to lose that race. The poll then matched the
+        // ALTERNATIVE's id inside the dead job's `fail_detail` and
+        // returned before the alternative had downloaded at all.
+        let hslot = |h: &str, id: &str| -> serde_json::Value {
+            let v: serde_json::Value = serde_json::from_str(h)
+                .unwrap_or_else(|e| panic!("bad history JSON: {e}\n{h}"));
+            v["history"]["slots"]
+                .as_array()
+                .and_then(|a| a.iter().find(|s| s["nzo_id"] == id).cloned())
+                .unwrap_or(serde_json::Value::Null)
+        };
 
         // Paused so both land in the queue before the duplicate check runs.
         http(port, "/api?mode=pause&output=json", None);
@@ -5317,10 +6158,14 @@ async fn cancelling_a_download_leaves_its_duplicate_held() {
         let dead_id = upload(&dead_xml, "Other.Show.S05E01.720p.WEB.nzb");
         let alt_id = upload(&alt_xml, "Other.Show.S05E01.1080p.WEB.nzb");
         let (q, h) = poll(
-            &|_, h| h.contains(&dead_id) && h.contains(&alt_id),
+            &|_, h| !hslot(h, &dead_id).is_null() && !hslot(h, &alt_id).is_null(),
             "the failed original and its promoted alternative",
         );
-        assert!(h.contains("\"Failed\"") && h.contains("\"Completed\""), "{h}");
+        // Which job took which outcome, not merely that both words are
+        // somewhere in the payload: the old pair of substring searches
+        // passed just as happily with the two swapped.
+        assert_eq!(hslot(&h, &dead_id)["status"], "Failed", "{h}");
+        assert_eq!(hslot(&h, &alt_id)["status"], "Completed", "{h}");
 
         // The cancelled title's alternative is still held, and nothing
         // about the cancelled job reached history.
@@ -5329,8 +6174,14 @@ async fn cancelling_a_download_leaves_its_duplicate_held() {
             "Duplicate",
             "the cancelled download promoted its held duplicate: {q}"
         );
-        assert!(!h.contains(&held_id), "the held duplicate downloaded anyway: {h}");
-        assert!(!h.contains(&orig_id), "a cancelled job must not reach history: {h}");
+        assert!(
+            hslot(&h, &held_id).is_null(),
+            "the held duplicate downloaded anyway: {h}"
+        );
+        assert!(
+            hslot(&h, &orig_id).is_null(),
+            "a cancelled job must not reach history: {h}"
+        );
     })
     .await
     .unwrap();
@@ -5357,8 +6208,7 @@ async fn cancelling_a_download_leaves_its_duplicate_held() {
 #[tokio::test(flavor = "multi_thread")]
 async fn jsonrpc_delete_stops_a_prefetching_job() {
     let dir = std::env::temp_dir().join(format!("nzbfast-rpcdel-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // Slow server: only job A's articles (250 ms each → A runs ~19 s).
     // Fast server: B's and C's, delayed too so the sidecar run is wide
@@ -5372,14 +6222,36 @@ async fn jsonrpc_delete_stops_a_prefetching_job() {
         &mut slow_articles,
     );
     let mut fast_articles = HashMap::new();
-    let b_segs =
-        make_file_articles("doomed.bin", &payload(2_000_000, 63), 40_000, "fd", &mut fast_articles);
-    let c_segs =
-        make_file_articles("keeps.bin", &payload(600_000, 65), 40_000, "fk", &mut fast_articles);
-    let slow_srv =
-        MockServer::start(slow_articles, Chaos { delay_ms: 250, ..Chaos::default() }).await;
-    let fast_srv =
-        MockServer::start(fast_articles, Chaos { delay_ms: 250, ..Chaos::default() }).await;
+    let b_segs = make_file_articles(
+        "doomed.bin",
+        &payload(2_000_000, 63),
+        40_000,
+        "fd",
+        &mut fast_articles,
+    );
+    let c_segs = make_file_articles(
+        "keeps.bin",
+        &payload(600_000, 65),
+        40_000,
+        "fk",
+        &mut fast_articles,
+    );
+    let slow_srv = MockServer::start(
+        slow_articles,
+        Chaos {
+            delay_ms: 250,
+            ..Chaos::default()
+        },
+    )
+    .await;
+    let fast_srv = MockServer::start(
+        fast_articles,
+        Chaos {
+            delay_ms: 250,
+            ..Chaos::default()
+        },
+    )
+    .await;
 
     let nzb_for = |file: &str, segs: &[(String, u64, u32)]| {
         let mut xml = format!(
@@ -5539,8 +6411,7 @@ async fn jsonrpc_delete_stops_a_prefetching_job() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_client_that_added_a_job_is_named() {
     let dir = std::env::temp_dir().join(format!("nzbfast-origin-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // Nothing is ever fetched - the daemon is paused throughout - so an
     // empty server is enough to satisfy startup.
@@ -5644,12 +6515,14 @@ async fn the_client_that_added_a_job_is_named() {
 #[tokio::test(flavor = "multi_thread")]
 async fn categories_are_configurable_and_survive_a_restart() {
     let dir = std::env::temp_dir().join(format!("nzbfast-cats-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
     let cfg = dir.join("config.json");
     std::fs::write(
         &cfg,
-        format!("{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}", free_port()),
+        format!(
+            "{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}",
+            free_port()
+        ),
     )
     .unwrap();
     let launch = {
@@ -5724,7 +6597,10 @@ async fn categories_are_configurable_and_survive_a_restart() {
     let port = d.port;
     tokio::task::spawn_blocking(move || {
         let r = http(port, "/api?mode=get_cats&apikey=sekrit&output=json", None);
-        assert!(r.contains("\"sonarr\""), "category did not survive the restart: {r}");
+        assert!(
+            r.contains("\"sonarr\""),
+            "category did not survive the restart: {r}"
+        );
         assert!(r.contains("\"radarr\""), "{r}");
     })
     .await
@@ -5744,12 +6620,14 @@ async fn categories_are_configurable_and_survive_a_restart() {
 #[tokio::test(flavor = "multi_thread")]
 async fn nzbget_facade_reports_real_statuses_and_real_errors() {
     let dir = std::env::temp_dir().join(format!("nzbfast-nzbgstat-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
     let cfg = dir.join("config.json");
     std::fs::write(
         &cfg,
-        format!("{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}", free_port()),
+        format!(
+            "{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}",
+            free_port()
+        ),
     )
     .unwrap();
     let d = serve(&dir, |port| {
@@ -5829,8 +6707,7 @@ async fn nzbget_facade_reports_real_statuses_and_real_errors() {
 #[tokio::test(flavor = "multi_thread")]
 async fn sab_facade_status_warnings_and_change_cat() {
     let dir = std::env::temp_dir().join(format!("nzbfast-sabstat-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
     // A config with NO servers: the first-run state, and the one a user
     // wiring up Sonarr is most likely to be sitting in.
     let cfg = dir.join("config.json");
@@ -5938,12 +6815,14 @@ async fn sab_facade_status_warnings_and_change_cat() {
 #[tokio::test(flavor = "multi_thread")]
 async fn synthesised_naming_defaults_on_and_its_off_switch_persists() {
     let dir = std::env::temp_dir().join(format!("nzbfast-identify-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
     let cfg = dir.join("config.json");
     std::fs::write(
         &cfg,
-        format!("{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}", free_port()),
+        format!(
+            "{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}",
+            free_port()
+        ),
     )
     .unwrap();
     let launch = {
@@ -5970,7 +6849,10 @@ async fn synthesised_naming_defaults_on_and_its_off_switch_persists() {
     let port = d.port;
     tokio::task::spawn_blocking(move || {
         let cfg = http(port, "/api?mode=get_config&apikey=sekrit&output=json", None);
-        assert!(cfg.contains("\"rename_identify\":true"), "should default on: {cfg}");
+        assert!(
+            cfg.contains("\"rename_identify\":true"),
+            "should default on: {cfg}"
+        );
         let r = http(
             port,
             "/api?mode=config&name=rename_identify&value=0&apikey=sekrit&output=json",
@@ -6010,8 +6892,7 @@ async fn synthesised_naming_defaults_on_and_its_off_switch_persists() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_obfuscated_post_is_named_by_its_own_container() {
     let dir = std::env::temp_dir().join(format!("nzbfast-ident-e2e-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // What the poster called it: nothing at all.
     let stem = "a4f9c2e1b7d048395166cf20";
@@ -6039,7 +6920,9 @@ async fn an_obfuscated_post_is_named_by_its_own_container() {
         vsegs.len()
     ));
     for (id, bytes, num) in vsegs.iter() {
-        xml.push_str(&format!("      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"));
+        xml.push_str(&format!(
+            "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+        ));
     }
     xml.push_str("    </segments>\n  </file>\n</nzb>\n");
 
@@ -6144,12 +7027,14 @@ async fn an_obfuscated_post_is_named_by_its_own_container() {
 #[tokio::test(flavor = "multi_thread")]
 async fn bootstrap_hatch_cannot_write_a_setting_other_than_the_apikey() {
     let dir = std::env::temp_dir().join(format!("nzbfast-bootstrap-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
     let cfg = dir.join("config.json");
     std::fs::write(
         &cfg,
-        format!("{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}", free_port()),
+        format!(
+            "{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}",
+            free_port()
+        ),
     )
     .unwrap();
     // NZBFAST_OPEN keeps first_run_apikey from minting one, which is what
@@ -6237,8 +7122,7 @@ async fn bootstrap_hatch_cannot_write_a_setting_other_than_the_apikey() {
 async fn set_password_mid_download_unlocks_in_same_run() {
     use nzbkit::rar::fixtures;
     let dir = std::env::temp_dir().join(format!("nzbfast-latepw-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // Encrypted RAR5 STORE set, no password known at enqueue: every slot's
     // mapper blocks (encrypted entry, no password) and the volumes demote
@@ -6360,12 +7244,10 @@ async fn set_password_mid_download_unlocks_in_same_run() {
                 .ok()
                 .and_then(|v| v["history"]["slots"].as_array().cloned())
                 .and_then(|slots| slots.iter().find(|s| s["nzo_id"] == id.as_str()).cloned())
-            {
-                if s["status"] == "Completed" || s["status"] == "Failed" {
+                && (s["status"] == "Completed" || s["status"] == "Failed") {
                     slot = s;
                     break;
                 }
-            }
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
         assert_eq!(slot["status"], "Completed", "{slot}");
@@ -6423,8 +7305,7 @@ fn find_lp_volume(root: &std::path::Path) -> Option<std::path::PathBuf> {
 async fn set_password_mid_download_goes_one_pass() {
     use nzbkit::rar::fixtures;
     let dir = std::env::temp_dir().join(format!("nzbfast-latepw1p-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // Same shape as set_password_mid_download_unlocks_in_same_run:
     // encrypted RAR5 STORE set, no password known at enqueue.
@@ -6564,12 +7445,10 @@ async fn set_password_mid_download_goes_one_pass() {
                 .ok()
                 .and_then(|v| v["history"]["slots"].as_array().cloned())
                 .and_then(|slots| slots.iter().find(|s| s["nzo_id"] == id.as_str()).cloned())
-            {
-                if s["status"] == "Completed" || s["status"] == "Failed" {
+                && (s["status"] == "Completed" || s["status"] == "Failed") {
                     slot = s;
                     break;
                 }
-            }
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
         assert_eq!(slot["status"], "Completed", "{slot}");
@@ -6613,8 +7492,7 @@ async fn set_password_mid_download_goes_one_pass() {
 async fn set_password_wrong_then_right_mid_download_one_pass() {
     use nzbkit::rar::fixtures;
     let dir = std::env::temp_dir().join(format!("nzbfast-latepwwr-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let inner = payload(24_000_003, 8);
     let f = fixtures::encrypt_file("l4tepw", &inner, 5);
@@ -6759,12 +7637,10 @@ async fn set_password_wrong_then_right_mid_download_one_pass() {
                 .ok()
                 .and_then(|v| v["history"]["slots"].as_array().cloned())
                 .and_then(|slots| slots.iter().find(|s| s["nzo_id"] == id.as_str()).cloned())
-            {
-                if s["status"] == "Completed" || s["status"] == "Failed" {
+                && (s["status"] == "Completed" || s["status"] == "Failed") {
                     slot = s;
                     break;
                 }
-            }
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
         assert_eq!(slot["status"], "Completed", "{slot}");
@@ -6808,8 +7684,7 @@ async fn prefer_external_unrar_setting_routes_unpack_to_subprocess() {
         return;
     }
     let dir = std::env::temp_dir().join(format!("nzbfast-extunrar-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // Real WinRAR m3 fixture: compressed, so it can never one-pass as a
     // store set - with the chase latched off it must reach the disk path.
@@ -6948,8 +7823,7 @@ async fn prefer_external_unrar_setting_routes_unpack_to_subprocess() {
 #[tokio::test(flavor = "multi_thread")]
 async fn prefer_external_unrar_setting_ignored_for_obfuscated_sets() {
     let dir = std::env::temp_dir().join(format!("nzbfast-extunrar-obf-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     // The same compressed fixture under a hash name: compressed so the
     // store path demotes it to disk, extensionless so only the
@@ -7073,5 +7947,1891 @@ async fn prefer_external_unrar_setting_ignored_for_obfuscated_sets() {
     })
     .await
     .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Going offline stops the download that is ALREADY RUNNING, not just the
+/// ones that have not started.
+///
+/// "Offline" is the instant sibling of the idle-release timeout: its whole
+/// reason to exist is to stop occupying the provider account so the
+/// operator can use it from somewhere else. Its own doc comment, its log
+/// line ("queue paused, provider connections closing") and the dashboard's
+/// confirm ("Every connection to your providers is closed") all promise
+/// that. Setting `paused` does not deliver it: `paused` is a start-time
+/// gate read by `pick_job`, and nothing samples it inside a running fetch.
+/// So the header control turned the dot red, answered `{"offline":true}`,
+/// printed the log line - and the fleet kept transferring for as long as
+/// the job had left to run, which on a 40 GB job is hours of exactly the
+/// occupancy the operator pressed the control to end.
+///
+/// Driven end to end because the flag is not the behaviour: a job is
+/// started against a deliberately slow mock, `mode=offline` is called
+/// while it is genuinely on the wire, and this asserts BOTH halves - the
+/// job leaves Downloading, and the mock stops being asked for articles.
+#[tokio::test(flavor = "multi_thread")]
+async fn going_offline_winds_down_the_running_download() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-offline-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+
+    let mut articles = HashMap::new();
+    // 100 articles at 250 ms over 2 connections is ~12 s of transfer, so
+    // the offline call lands with most of the job still to fetch and the
+    // "did it stop?" question has a real answer either way.
+    let segs = make_file_articles(
+        "long.bin",
+        &payload(4_000_000, 61),
+        40_000,
+        "of",
+        &mut articles,
+    );
+    let srv = MockServer::start(
+        articles,
+        Chaos {
+            delay_ms: 250,
+            ..Chaos::default()
+        },
+    )
+    .await;
+
+    let mut xml = format!(
+        "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"&quot;long.bin&quot; yEnc (1/{})\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+        segs.len()
+    );
+    for (id, bytes, num) in &segs {
+        xml.push_str(&format!(
+            "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+        ));
+    }
+    xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--connections")
+            .arg("2");
+        c
+    })
+    .await;
+    let port = d.port;
+    let served = srv.served.clone();
+    let daemon_log = d.log.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let boundary = "----offb";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"long.nzb\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(xml.as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let r = http(
+            port,
+            "/api?mode=addfile&output=json",
+            Some((&format!("multipart/form-data; boundary={boundary}"), &body)),
+        );
+        assert!(r.contains("\"status\":true"), "{r}");
+        let id = r
+            .split("SABnzbd_nzo_")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .map(|s| format!("SABnzbd_nzo_{s}"))
+            .unwrap();
+
+        // ONE queue slot: the payload carries a queue-wide "status" of its
+        // own, so a substring search says nothing about THIS job.
+        let qslot = |id: &str| -> serde_json::Value {
+            let q = http(port, "/api?mode=queue&output=json", None);
+            let v: serde_json::Value =
+                serde_json::from_str(&q).unwrap_or_else(|e| panic!("bad queue JSON: {e}\n{q}"));
+            v["queue"]["slots"]
+                .as_array()
+                .and_then(|a| a.iter().find(|s| s["nzo_id"] == id).cloned())
+                .unwrap_or(serde_json::Value::Null)
+        };
+
+        // Wait for it to be genuinely on the wire, not merely picked.
+        let mut on_the_wire = false;
+        for _ in 0..300 {
+            if qslot(&id)["status"] == "Downloading" && served.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                on_the_wire = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(on_the_wire, "the job never started transferring");
+
+        let r = http(port, "/api?mode=offline&output=json", None);
+        assert!(r.contains("\"offline\":true"), "{r}");
+
+        // The job must leave Downloading. Reaching history instead is the
+        // bug: it means the transfer ran to completion with the operator
+        // locked out of their account for the whole of it.
+        let mut parked = false;
+        for _ in 0..240 {
+            let h = http(port, "/api?mode=history&output=json", None);
+            assert!(
+                !h.contains(&id),
+                "went offline mid-transfer and the job ran to COMPLETION anyway - \
+                 the provider fleet was never wound down\n{h}"
+            );
+            if qslot(&id)["status"] == "Paused" {
+                parked = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        let log = std::fs::read_to_string(&daemon_log).unwrap_or_default();
+        assert!(parked, "the running job never wound down after going offline\n--- log ---\n{log}");
+
+        // ...and the fleet must actually stop asking for articles. A
+        // graceful wind-down lets the in-flight window land first, so
+        // settle before measuring.
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let at_rest = served.load(std::sync::atomic::Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        assert_eq!(
+            served.load(std::sync::atomic::Ordering::Relaxed),
+            at_rest,
+            "articles were still being fetched after going offline"
+        );
+        // Rig check: this really did land mid-transfer.
+        assert!(
+            at_rest < segs.len() as u64,
+            "the mock served the whole job ({at_rest} articles) - offline never landed mid-transfer"
+        );
+
+        // The wind-down is graceful, so what landed is journalled and the
+        // job is PARKED, not failed: coming back online finishes it.
+        let r = http(port, "/api?mode=online&output=json", None);
+        assert!(r.contains("\"offline\":false"), "{r}");
+        http(port, "/api?mode=resume&output=json", None);
+        let mut done = false;
+        for _ in 0..600 {
+            let h = http(port, "/api?mode=history&output=json", None);
+            assert!(!h.contains("\"Failed\""), "the wound-down job failed instead of resuming\n{h}");
+            if h.contains(&id) && h.contains("\"Completed\"") {
+                done = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        let log = std::fs::read_to_string(&daemon_log).unwrap_or_default();
+        assert!(done, "the job never finished after coming back online\n--- log ---\n{log}");
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read(dir.join("complete/long/long.bin")).unwrap(),
+        payload(4_000_000, 61),
+        "payload differs after the offline wind-down and journal resume"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// TODO 65: "offline" is a promise the product makes in absolute terms -
+/// the confirm dialog says every connection is closed "so you can use the
+/// account from another machine", and the daemon logs "touching no
+/// provider" on restart. Force priority used to walk straight through it.
+///
+/// That is worse than it sounds. `pick_job` skipped only
+/// `queue_paused && priority < 2`, and NOTHING on the download path read
+/// `offline` at all, so the fleet reopened while the header still said
+/// Offline - and the operator's OTHER machine got refused at the account's
+/// connection cap, with no reason to suspect this daemon. Force is not
+/// even always a user's choice: the retry/start path hard-codes
+/// `priority = 2`.
+///
+/// Three ways in, all closed by one gate, all pinned here:
+///   1. a Force-priority job added while offline;
+///   2. NZBGet `resumedownload`, which clears `paused`;
+///   3. SAB `mode=resume`, which used to clear `offline` outright.
+/// Plus the escape hatch: coming back online really does release it.
+#[tokio::test(flavor = "multi_thread")]
+async fn offline_outranks_force_and_a_client_resume() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-offforce-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+
+    let data = payload(300_000, 71);
+    let mut articles = HashMap::new();
+    let segs = make_file_articles("forced.bin", &data, 40_000, "off2", &mut articles);
+    let srv = MockServer::start(articles, Chaos::default()).await;
+    let served = srv.served.clone();
+
+    let mut xml = format!(
+        "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"&quot;forced.bin&quot; yEnc (1/{})\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+        segs.len()
+    );
+    for (id, bytes, num) in &segs {
+        xml.push_str(&format!(
+            "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+        ));
+    }
+    xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--connections")
+            .arg("2");
+        c
+    })
+    .await;
+    let port = d.port;
+    let daemon_log = d.log.clone();
+
+    tokio::task::spawn_blocking(move || {
+        // Offline FIRST, with nothing running: this is about job START,
+        // not about winding a transfer down.
+        let r = http(port, "/api?mode=offline&output=json", None);
+        assert!(r.contains("\"offline\":true"), "{r}");
+
+        // Route 1: a Force-priority job, which is one click away in the
+        // SAB facade and is what the retry path sets by itself.
+        let boundary = "----offf";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"forced.nzb\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(xml.as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let r = http(
+            port,
+            "/api?mode=addfile&priority=2&output=json",
+            Some((&format!("multipart/form-data; boundary={boundary}"), &body)),
+        );
+        assert!(r.contains("\"status\":true"), "{r}");
+        let id = r
+            .split("SABnzbd_nzo_")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .map(|s| format!("SABnzbd_nzo_{s}"))
+            .unwrap();
+
+        let offline_now = |tag: &str| {
+            let q = http(port, "/api?mode=queue&output=json", None);
+            let v: serde_json::Value =
+                serde_json::from_str(&q).unwrap_or_else(|e| panic!("bad queue JSON at {tag}: {e}\n{q}"));
+            v["queue"]["offline"].as_bool().unwrap_or(false)
+        };
+        let idle = |tag: &str, secs: u64| {
+            for _ in 0..(secs * 4) {
+                let h = http(port, "/api?mode=history&output=json", None);
+                assert!(
+                    !h.contains(&id),
+                    "{tag}: the job reached history while the daemon reported itself OFFLINE - \
+                     the provider fleet reopened behind the operator's back\n{h}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        };
+
+        idle("force", 3);
+        assert!(offline_now("force"), "offline was cleared by adding a Force job");
+        assert_eq!(
+            served.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "articles were fetched from the provider while offline"
+        );
+
+        // Route 2: NZBGet resumedownload. Clears `paused`; must not
+        // smuggle the queue past `offline`.
+        let rpc = http(
+            port,
+            "/jsonrpc",
+            Some((
+                "application/json",
+                br#"{"method":"resumedownload","params":[]}"#.as_ref(),
+            )),
+        );
+        assert!(rpc.contains("\"result\":true"), "{rpc}");
+        idle("nzbget-resume", 3);
+        assert!(offline_now("nzbget-resume"), "NZBGet resumedownload cleared offline");
+
+        // Route 3: SAB mode=resume. This USED to call set_offline(false),
+        // which let any *arr take the operator back online silently - the
+        // one remaining way to reopen the account from a remote client.
+        // With a real gate it no longer has to: the queue unpauses and
+        // simply does not start, so nothing fails against a provider we
+        // promised not to touch.
+        let r = http(port, "/api?mode=resume&output=json", None);
+        assert!(r.contains("\"status\":true"), "{r}");
+        idle("sab-resume", 3);
+        assert!(
+            offline_now("sab-resume"),
+            "SAB mode=resume cleared offline: a remote client can still reopen the account"
+        );
+        assert_eq!(
+            served.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "articles were fetched after a client resume while offline"
+        );
+
+        // The escape hatch: coming back online is the operator's act, and
+        // it must actually release the job rather than stranding it.
+        let r = http(port, "/api?mode=online&output=json", None);
+        assert!(r.contains("\"offline\":false"), "{r}");
+        let mut done = false;
+        for _ in 0..600 {
+            let h = http(port, "/api?mode=history&output=json", None);
+            assert!(!h.contains("\"Failed\""), "the job failed after coming back online\n{h}");
+            if h.contains(&id) && h.contains("\"Completed\"") {
+                done = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        let log = std::fs::read_to_string(&daemon_log).unwrap_or_default();
+        assert!(done, "the job never ran after coming back online\n--- log ---\n{log}");
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read(dir.join("complete/forced/forced.bin")).unwrap(),
+        data,
+        "payload differs after the offline hold"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// §73 phase 1: `/preview/probe/{nzo_id}` tells the dashboard what the
+/// downloaded file actually IS - container, tracks, codecs, languages -
+/// so a user can confirm it is the right release without opening it in a
+/// player. The whole point of the feature is that this answer is
+/// available from the bytes themselves, not from the filename a poster
+/// chose, so the fixture is a real Matroska mux and the assertions are
+/// on what is INSIDE it.
+#[tokio::test(flavor = "multi_thread")]
+async fn preview_probe_reports_what_the_file_is() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-preview-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+
+    // A genuine Matroska header with a payload cluster behind it.
+    let data = nzbkit::mediaprobe::testmux::mkv_padded(400_000);
+    let mut articles = HashMap::new();
+    let segs = make_file_articles("movie.mkv", &data, 40_000, "pv", &mut articles);
+    let srv = MockServer::start(articles, Chaos::default()).await;
+
+    let mut xml = format!(
+        "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"&quot;movie.mkv&quot; yEnc (1/{})\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+        segs.len()
+    );
+    for (id, bytes, num) in &segs {
+        xml.push_str(&format!(
+            "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+        ));
+    }
+    xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    delete_without_the_trash(&cfg);
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--connections")
+            .arg("2");
+        c
+    })
+    .await;
+    let port = d.port;
+    let daemon_log = d.log.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let boundary = "----previewb";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"movie.nzb\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(xml.as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        http(
+            port,
+            "/api?mode=addfile&apikey=sekrit&output=json",
+            Some((&format!("multipart/form-data; boundary={boundary}"), &body)),
+        );
+
+        // Wait for it to finish, then ask what it is.
+        let mut nzo = String::new();
+        for _ in 0..300 {
+            let h = http(port, "/api?mode=history&apikey=sekrit&output=json", None);
+            if h.contains("\"Completed\"")
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&h)
+                && let Some(slot) = v["history"]["slots"].get(0)
+                && let Some(id) = slot["nzo_id"].as_str()
+            {
+                nzo = id.to_string();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        let log = std::fs::read_to_string(&daemon_log).unwrap_or_default();
+        assert!(!nzo.is_empty(), "the job never completed\n--- log ---\n{log}");
+
+        // Inspecting a download takes the same credentials as playing
+        // it: nzo_ids are enumerable, so an open probe would hand any
+        // LAN host the shape of the user's library a guess at a time.
+        let r = raw(
+            port,
+            format!("GET /preview/probe/{nzo} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        );
+        let head = String::from_utf8_lossy(&r).to_string();
+        assert!(head.starts_with("HTTP/1.1 401"), "unauthenticated probe was served: {head}");
+
+        let body = http(
+            port,
+            &format!("/preview/probe/{nzo}?apikey=sekrit"),
+            None,
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&body).unwrap_or_else(|e| panic!("{e}: {body}"));
+        assert_eq!(v["source"], "disk", "{body}");
+        // The renamer owns the final name (it reads the container's own
+        // Title, which this fixture carries), so the probe is asked only
+        // that it found the media file - not what it ended up called.
+        assert!(
+            v["file"].as_str().is_some_and(|f| f.ends_with(".mkv")),
+            "{body}"
+        );
+        let m = &v["media"];
+        assert_eq!(m["container"], "mkv", "{body}");
+        assert_eq!(m["duration_ms"], 60_000, "{body}");
+        // The codecs are read out of the container, not out of the name.
+        assert_eq!(m["video"][0]["codec"], "h264", "{body}");
+        assert_eq!(m["video"][0]["width"], 1920, "{body}");
+        assert_eq!(m["audio"][0]["codec"], "aac", "{body}");
+        assert_eq!(m["audio"][0]["lang"], "en", "{body}");
+        assert_eq!(m["subtitles"][0]["codec"], "srt", "{body}");
+        assert_eq!(m["playback"], "Remux", "{body}");
+        assert_eq!(m["complete"], true, "{body}");
+
+        // An nzo_id nobody has is a 404, not a probe of somebody else's
+        // download.
+        let r = raw(
+            port,
+            b"GET /preview/probe/SABnzbd_nzo_nope?apikey=sekrit HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        );
+        let head = String::from_utf8_lossy(&r).to_string();
+        assert!(head.starts_with("HTTP/1.1 404"), "{head}");
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same probe WHILE the download is still running - which is the
+/// whole point of the feature. The file is throttled so the window stays
+/// open, and the assertion is that the answer comes from the live writer
+/// (`source: "live"`) with the container already parsed: the metadata is
+/// at the front of any real mux, so it is readable long before the bytes
+/// behind it are.
+#[tokio::test(flavor = "multi_thread")]
+async fn preview_probe_answers_while_the_file_is_still_downloading() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-preview-live-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+
+    // Big enough that the throttle keeps it downloading for several
+    // seconds, so the probe really is answering mid-flight.
+    let data = nzbkit::mediaprobe::testmux::mkv_padded(12_000_000);
+    let mut articles = HashMap::new();
+    let segs = make_file_articles("movie.mkv", &data, 300_000, "lv", &mut articles);
+    let srv = MockServer::start(articles, Chaos::default()).await;
+
+    let mut xml = format!(
+        "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"&quot;movie.mkv&quot; yEnc (1/{})\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+        segs.len()
+    );
+    for (id, bytes, num) in &segs {
+        xml.push_str(&format!(
+            "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+        ));
+    }
+    xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    delete_without_the_trash(&cfg);
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .env("NZBFAST_THROTTLE_WRITE_MBPS", "3")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--connections")
+            .arg("2");
+        c
+    })
+    .await;
+    let port = d.port;
+    let daemon_log = d.log.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let boundary = "----previewlive";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"movie.nzb\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(xml.as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        http(
+            port,
+            "/api?mode=addfile&output=json",
+            Some((&format!("multipart/form-data; boundary={boundary}"), &body)),
+        );
+
+        // Find the job the moment it is queued, then keep probing it.
+        let mut nzo = String::new();
+        for _ in 0..200 {
+            let q = http(port, "/api?mode=queue&output=json", None);
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&q)
+                && let Some(slot) = v["queue"]["slots"].get(0)
+                && let Some(id) = slot["nzo_id"].as_str()
+            {
+                nzo = id.to_string();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(!nzo.is_empty(), "the job never reached the queue");
+
+        let mut live = None;
+        for _ in 0..400 {
+            let b = http(port, &format!("/preview/probe/{nzo}"), None);
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&b)
+                && v["source"] == "live"
+                && v["media"]["container"] == "mkv"
+            {
+                live = Some(v);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let log = std::fs::read_to_string(&daemon_log).unwrap_or_default();
+        let v = live.unwrap_or_else(|| {
+            panic!("the probe never answered from the live download\n--- log ---\n{log}")
+        });
+        // Read from the writer, not from a finished file on disk.
+        assert_eq!(v["source"], "live", "{v}");
+        assert!(v["coverage"]["head_bytes"].as_u64().unwrap_or(0) > 0, "{v}");
+        let m = &v["media"];
+        assert_eq!(m["video"][0]["codec"], "h264", "{v}");
+        assert_eq!(m["video"][0]["width"], 1920, "{v}");
+        assert_eq!(m["audio"][0]["lang"], "en", "{v}");
+        assert_eq!(m["duration_ms"], 60_000, "{v}");
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Files the process `pid` currently holds open, or `None` on a box that
+/// cannot be asked (no `/proc`, no `lsof`, Windows).
+///
+/// Deliberately a whole-process question. The bug this pins was a handle
+/// the daemon held from the download pipeline, and nothing inside the
+/// daemon reports its own descriptors - only the OS knows.
+fn open_files(pid: u32) -> Option<Vec<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        // A deleted-but-open file reads back as "/path/to/it (deleted)",
+        // which is exactly the state that keeps the blocks allocated - so
+        // callers match on a substring, never on equality.
+        let rd = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+        Some(
+            rd.flatten()
+                .filter_map(|e| std::fs::read_link(e.path()).ok())
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // -Fn: one field per line, names prefixed with 'n'. The exit
+        // status is not checked - lsof reports a non-zero status for
+        // perfectly ordinary partial answers - so an empty stdout is what
+        // reads as "could not ask".
+        let out = Command::new("/usr/sbin/lsof")
+            .arg("-p")
+            .arg(pid.to_string())
+            .arg("-Fn")
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        if text.is_empty() {
+            return None;
+        }
+        Some(
+            text.lines()
+                .filter_map(|l| l.strip_prefix('n'))
+                .map(str::to_string)
+                .collect(),
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// A finished job must not leave the daemon holding its output files
+/// open.
+///
+/// `Extractor::finish` keeps its writers open on purpose, and the hub
+/// keeps the extractor installed until the NEXT job starts - so an idle
+/// daemon used to sit on a descriptor for every file the last job wrote.
+/// On unix that descriptor keeps the blocks allocated after the file is
+/// unlinked, which is precisely what happens next: cleanup deletes the
+/// volumes and then Sonarr/Radarr imports the release and removes the
+/// folder. Reported from Unraid on 2 Aug as "nzbfast was reserving space
+/// on my SSD even when the file was moved... I had to keep restarting
+/// nzbfast before the folder was able to be deleted".
+///
+/// The download tail now parks the writers, so the assertion is simply
+/// that the OS sees no handle on the payload once history has the job.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_finished_job_holds_no_output_handles() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-fdrelease-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+
+    // One plain file, named distinctively enough that a substring match
+    // over the daemon's whole descriptor table means only this payload.
+    let data = payload(400_000, 11);
+    let mut articles = HashMap::new();
+    let segs = make_file_articles("fdrelease-payload.bin", &data, 40_000, "fd", &mut articles);
+    let srv = MockServer::start(articles, Chaos::default()).await;
+
+    let mut xml = String::from(
+        "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"&quot;fdrelease-payload.bin&quot; yEnc (1/11)\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+    );
+    for (id, bytes, num) in &segs {
+        xml.push_str(&format!(
+            "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+        ));
+    }
+    xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"));
+        c
+    })
+    .await;
+    let (port, pid) = (d.port, d.pid());
+
+    let held = tokio::task::spawn_blocking(move || {
+        let boundary = "----nzbfastboundary";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"fdrelease.nzb\"\r\nContent-Type: application/x-nzb\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(xml.as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let ctype = format!("multipart/form-data; boundary={boundary}");
+        let r = http(
+            port,
+            "/api?mode=addfile&apikey=sekrit&output=json",
+            Some((&ctype, &body)),
+        );
+        assert!(r.contains("nzo_ids"), "{r}");
+
+        let mut hist = String::new();
+        for _ in 0..150 {
+            hist = http(port, "/api?mode=history&apikey=sekrit&output=json", None);
+            if hist.contains("\"Completed\"") || hist.contains("\"Failed\"") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        assert!(hist.contains("\"Completed\""), "never completed: {hist}");
+
+        // History has the job, so the tail task has run to its end. The
+        // short retry is for the post-processing passes that open the
+        // payload for a moment of their own (the media probe reads its
+        // head), not for the leak: a leaked handle is held forever.
+        let mut held: Option<Vec<String>> = None;
+        for _ in 0..15 {
+            let hits: Vec<String> = open_files(pid)?
+                .into_iter()
+                .filter(|p| p.contains("fdrelease-payload.bin"))
+                .collect();
+            if hits.is_empty() {
+                return Some(Vec::new());
+            }
+            held = Some(hits);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        held
+    })
+    .await
+    .unwrap();
+
+    match held {
+        None => eprintln!("skipping the descriptor check: this box has no /proc and no lsof"),
+        Some(held) => assert!(
+            held.is_empty(),
+            "the daemon still holds the finished job's output open, so its \
+             blocks survive an *arr import: {held:?}"
+        ),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// TODO §77 pre-flight post health: the failure diagnostics, run
+/// backwards. A few of a queued job's articles are STATed across every
+/// server before a byte is spent and the verdict is hung on the queue
+/// row - and, crucially, it is ADVISORY: the job downloads exactly as it
+/// would have.
+///
+/// The mock answers every STAT with 430 while serving bodies normally
+/// (`stat_miss`), which is precisely the shape that separates "the
+/// sample said no" from "the download failed": nothing here is allowed
+/// to turn the first into the second.
+///
+/// Both halves of the propagation guard are pinned in one daemon: the
+/// 30-day post is RED, the 1-day post is only AMBER, and a 430 from
+/// every server means different things about the two. That is the trap
+/// this feature exists next to - see memory
+/// `nzbfast-retry-propagation-trap`.
+#[tokio::test(flavor = "multi_thread")]
+async fn preflight_health_badges_the_row_and_downloads_the_job_anyway() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-health-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+
+    let mut articles = HashMap::new();
+    let old_data = payload(120_000, 5);
+    let new_data = payload(120_000, 9);
+    let old_segs = make_file_articles("aged.bin", &old_data, 20_000, "aged", &mut articles);
+    let new_segs = make_file_articles("fresh.bin", &new_data, 20_000, "fresh", &mut articles);
+    // Every STAT is refused; every BODY is served. A sample that says
+    // "gone" over a post that downloads perfectly is the whole point.
+    let chaos = Chaos {
+        post: nzbkit::mock::PostChaos {
+            stat_miss: 1_000_000,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let srv = MockServer::start(articles, chaos).await;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let nzb = |file: &str, date: i64, segs: &[(String, u64, u32)]| {
+        let mut xml = format!(
+            "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"{date}\" subject=\"&quot;{file}&quot; yEnc (1/{})\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+            segs.len()
+        );
+        for (id, bytes, num) in segs {
+            xml.push_str(&format!(
+                "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+            ));
+        }
+        xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+        xml
+    };
+    let old_xml = nzb("aged.bin", now - 30 * 86_400, &old_segs);
+    let new_xml = nzb("fresh.bin", now - 86_400, &new_segs);
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .env("NZBFAST_HEALTH_TICK_SECS", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--out")
+            .arg(dir.join("complete"));
+        c
+    })
+    .await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        // Paused so the prober gets its idle window before the runner
+        // takes the queue: the probe deliberately stands down while a
+        // download is active.
+        http(port, "/api?mode=pause&output=json", None);
+        let old_id = upload_nzb(port, &old_xml, "aged.nzb");
+        let new_id = upload_nzb(port, &new_xml, "fresh.nzb");
+
+        let health = |id: &str| -> serde_json::Value {
+            let q = http(port, "/api?mode=queue&output=json", None);
+            let v: serde_json::Value = serde_json::from_str(&q).unwrap_or_default();
+            v["queue"]["slots"]
+                .as_array()
+                .and_then(|a| a.iter().find(|s| s["nzo_id"] == id).cloned())
+                .map(|s| s["health"].clone())
+                .unwrap_or(serde_json::Value::Null)
+        };
+        let wait_health = |id: &str| -> serde_json::Value {
+            for _ in 0..200 {
+                let h = health(id);
+                if h.get("bucket").is_some() {
+                    return h;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            panic!("{id} was never probed");
+        };
+
+        let aged = wait_health(&old_id);
+        assert_eq!(
+            aged["bucket"], "red",
+            "a 30-day post 430ing everywhere: {aged}"
+        );
+        assert_eq!(
+            aged["absent"], aged["sampled"],
+            "every sampled article was refused: {aged}"
+        );
+        assert!(
+            aged["sampled"].as_u64().unwrap_or(0) >= 2,
+            "the sample must disclose a real size: {aged}"
+        );
+        assert_eq!(aged["answered"], 1, "one server answered: {aged}");
+
+        // The binding constraint. Same evidence, younger post, and the
+        // verdict must NOT be red: propagation looks exactly like this.
+        let fresh = wait_health(&new_id);
+        assert_eq!(
+            fresh["bucket"], "amber",
+            "a 1-day post 430ing everywhere is still propagating: {fresh}"
+        );
+
+        // ADVISORY. Neither job was failed, paused or removed by the
+        // verdict, and both download normally once the queue runs.
+        let q = http(port, "/api?mode=queue&output=json", None);
+        assert!(
+            q.contains(&old_id) && q.contains(&new_id),
+            "a job left the queue: {q}"
+        );
+        assert!(!q.contains("\"Failed\""), "a verdict failed a job: {q}");
+
+        http(port, "/api?mode=resume&output=json", None);
+        for _ in 0..600 {
+            let h = http(port, "/api?mode=history&output=json", None);
+            assert!(
+                !h.contains("\"Failed\""),
+                "a job failed despite serving bodies\n{h}"
+            );
+            if h.contains(&old_id) && h.contains(&new_id) && h.matches("\"Completed\"").count() >= 2
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        panic!("the red-badged jobs never completed");
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read(dir.join("complete/aged/aged.bin")).unwrap(),
+        old_data,
+        "the red-badged payload differs"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// §77 discipline: no probe traffic while a download is running, and one
+/// probe per job however often the queue is rendered.
+///
+/// Asserted from the SERVER's side. STAT transfers no body, so it leaves
+/// no mark in `body_log` and the only honest observer is the mock's own
+/// STAT counter (memory `nzbfast-idle-connection-holders`: assert on
+/// sockets and commands, not on internal state).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_health_probe_stands_down_while_a_download_runs() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-healthidle-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+
+    let mut articles = HashMap::new();
+    let slow_data = payload(800_000, 2);
+    let next_data = payload(60_000, 4);
+    let slow_segs = make_file_articles("slow.bin", &slow_data, 20_000, "slow", &mut articles);
+    let next_segs = make_file_articles("next.bin", &next_data, 20_000, "next", &mut articles);
+    // Slow enough that the first job is still running while the second
+    // sits queued, which is the window the prober must sit out.
+    let srv = MockServer::start(
+        articles,
+        Chaos {
+            delay_ms: 200,
+            ..Default::default()
+        },
+    )
+    .await;
+    let stats = srv.stats.clone();
+
+    let nzb = |file: &str, segs: &[(String, u64, u32)]| {
+        let mut xml = format!(
+            "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"&quot;{file}&quot; yEnc (1/{})\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+            segs.len()
+        );
+        for (id, bytes, num) in segs {
+            xml.push_str(&format!(
+                "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+            ));
+        }
+        xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+        xml
+    };
+    let slow_xml = nzb("slow.bin", &slow_segs);
+    let next_xml = nzb("next.bin", &next_segs);
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .env("NZBFAST_HEALTH_TICK_SECS", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--connections")
+            .arg("1");
+        c
+    })
+    .await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        use std::sync::atomic::Ordering;
+        let slot = |id: &str| -> serde_json::Value {
+            let q = http(port, "/api?mode=queue&output=json", None);
+            let v: serde_json::Value = serde_json::from_str(&q).unwrap_or_default();
+            v["queue"]["slots"]
+                .as_array()
+                .and_then(|a| a.iter().find(|s| s["nzo_id"] == id).cloned())
+                .unwrap_or(serde_json::Value::Null)
+        };
+
+        let slow_id = upload_nzb(port, &slow_xml, "slow.nzb");
+        let mut started = false;
+        for _ in 0..300 {
+            if slot(&slow_id)["status"] == "Downloading" {
+                started = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(started, "the slow job never started");
+        let next_id = upload_nzb(port, &next_xml, "next.nzb");
+        let before = stats.load(Ordering::Relaxed);
+
+        // Several prober ticks pass with a download in flight. Not one
+        // STAT may go out, and the queued job stays unbadged.
+        for _ in 0..8 {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            if slot(&slow_id)["status"] != "Downloading" {
+                break;
+            }
+            assert_eq!(
+                stats.load(Ordering::Relaxed),
+                before,
+                "the prober STATed while a download was running"
+            );
+            assert!(
+                slot(&next_id)["health"].is_null(),
+                "the queued job was probed while a download was running"
+            );
+        }
+
+        // Free the line without finishing the job: a queue pause parks
+        // the active download back in the queue, so both jobs are
+        // Queued, nothing is downloading, and the prober's idle window
+        // opens with the second job still there to probe.
+        http(port, "/api?mode=pause&output=json", None);
+        for _ in 0..300 {
+            if slot(&next_id)["health"].get("bucket").is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        let h = slot(&next_id)["health"].clone();
+        assert_eq!(h["bucket"], "green", "an intact post on a live server: {h}");
+        let after_probe = stats.load(Ordering::Relaxed);
+        assert!(after_probe > before, "the idle prober never ran");
+        for _ in 0..6 {
+            http(port, "/api?mode=queue&output=json", None);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        assert_eq!(
+            stats.load(Ordering::Relaxed),
+            after_probe,
+            "rendering the queue re-probed the job"
+        );
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// §77 optional auto-defer: a red verdict may REORDER the queue and
+/// nothing else. The red job stays queued, a force overrides the sink,
+/// and when it does eventually fail its summary carries the pre-flight
+/// evidence ("it was already short when you added it").
+#[tokio::test(flavor = "multi_thread")]
+async fn health_auto_defer_reorders_and_never_removes() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-healthdefer-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+
+    let mut articles = HashMap::new();
+    let dead_data = payload(80_000, 6);
+    let good_data = payload(80_000, 7);
+    let dead_segs = make_file_articles("dead.bin", &dead_data, 20_000, "dead", &mut articles);
+    let good_segs = make_file_articles("good.bin", &good_data, 20_000, "good", &mut articles);
+    // The dead post is genuinely gone: 430 to STAT and to BODY alike.
+    let missing: std::collections::HashSet<String> = dead_segs
+        .iter()
+        .map(|(id, _, _)| format!("<{id}>"))
+        .collect();
+    // The healthy job is deliberately slow to fetch: the assertion below
+    // needs a window in which "good is running and dead is not" is
+    // unambiguous. The runner starts the NEXT job while the previous
+    // one's post-processing tail still runs, so with both jobs finishing
+    // instantly there is no such window and the test races itself.
+    // `delay_ms` covers successful bodies only - the dead post's 430s
+    // (and every STAT) are answered at full speed.
+    let srv = MockServer::start(
+        articles,
+        Chaos {
+            missing,
+            delay_ms: 300,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let nzb = |file: &str, segs: &[(String, u64, u32)]| {
+        let date = now - 30 * 86_400;
+        let mut xml = format!(
+            "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"{date}\" subject=\"&quot;{file}&quot; yEnc (1/{})\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+            segs.len()
+        );
+        for (id, bytes, num) in segs {
+            xml.push_str(&format!(
+                "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+            ));
+        }
+        xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+        xml
+    };
+    let dead_xml = nzb("dead.bin", &dead_segs);
+    let good_xml = nzb("good.bin", &good_segs);
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .env("NZBFAST_HEALTH_TICK_SECS", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--out")
+            .arg(dir.join("complete"));
+        c
+    })
+    .await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        let r = http(
+            port,
+            "/api?mode=config&name=post_health_defer&value=1&output=json",
+            None,
+        );
+        assert!(r.contains("\"status\":true"), "{r}");
+        // The dead post fails `Gone`, which never auto-retries; this
+        // just keeps the test honest if that classification ever moves.
+        http(
+            port,
+            "/api?mode=config&name=auto_retry_mins&value=0&output=json",
+            None,
+        );
+        http(port, "/api?mode=pause&output=json", None);
+        // Dead FIRST in queue order, so only the sink can reverse them.
+        let dead_id = upload_nzb(port, &dead_xml, "dead.nzb");
+        let good_id = upload_nzb(port, &good_xml, "good.nzb");
+
+        let slot = |id: &str| -> serde_json::Value {
+            let q = http(port, "/api?mode=queue&output=json", None);
+            let v: serde_json::Value = serde_json::from_str(&q).unwrap_or_default();
+            v["queue"]["slots"]
+                .as_array()
+                .and_then(|a| a.iter().find(|s| s["nzo_id"] == id).cloned())
+                .unwrap_or(serde_json::Value::Null)
+        };
+        let wait_bucket = |id: &str, want: &str| {
+            for _ in 0..200 {
+                if slot(id)["health"]["bucket"] == want {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            panic!("{id} never scored {want}: {}", slot(id));
+        };
+        wait_bucket(&dead_id, "red");
+        wait_bucket(&good_id, "green");
+        assert_eq!(
+            slot(&dead_id)["health"]["sunk"],
+            true,
+            "the red job should report that it is being held back"
+        );
+
+        http(port, "/api?mode=resume&output=json", None);
+        // The green job jumps the queue; the red one is still THERE,
+        // just later - reorder only.
+        let mut good_first = false;
+        for _ in 0..600 {
+            let s = slot(&good_id);
+            let h = http(port, "/api?mode=history&output=json", None);
+            // Anything but Queued means the runner has picked it: a
+            // finished job reports its post-processing tail as "Moving"
+            // and only reaches history once that tail is done, and the
+            // runner has started the NEXT job by then.
+            if s.is_null() || s["status"] != "Queued" || h.contains(&good_id) {
+                good_first = true;
+                break;
+            }
+            assert_eq!(
+                slot(&dead_id)["status"],
+                "Queued",
+                "the red job was picked ahead of the healthy one"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(good_first, "the healthy job never overtook the red one");
+        assert!(
+            !slot(&dead_id).is_null()
+                || http(port, "/api?mode=history&output=json", None).contains(&dead_id),
+            "the red job was removed from the queue"
+        );
+
+        // It runs anyway once nothing healthier is left, and its failure
+        // summary cites what pre-flight already knew.
+        for _ in 0..600 {
+            let h = http(port, "/api?mode=history&output=json", None);
+            if h.contains(&dead_id) {
+                assert!(
+                    h.contains("a pre-flight sample when this job was added"),
+                    "the failure summary dropped the pre-flight evidence\n{h}"
+                );
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        panic!("the red job never ran at all - the sink must reorder, not remove");
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Upload one NZB through the SAB addfile endpoint and return its id.
+fn upload_nzb(port: u16, xml: &str, fname: &str) -> String {
+    let boundary = "----healthup";
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"{fname}\"\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(xml.as_bytes());
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let r = http(
+        port,
+        "/api?mode=addfile&output=json",
+        Some((&format!("multipart/form-data; boundary={boundary}"), &body)),
+    );
+    assert!(r.contains("\"status\":true"), "{r}");
+    r.split("SABnzbd_nzo_")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .map(|s| format!("SABnzbd_nzo_{s}"))
+        .expect("addfile returned no nzo_id")
+}
+
+/// §76: the queue row's quality chip, and the fake catcher behind it.
+///
+/// The fixture is a genuine 1920x1080 h264 mux with a stereo AAC track,
+/// posted under a name claiming 2160p / x265 / DDP - which is exactly
+/// the shape of an upscale sold as a UHD release. Nothing else we run
+/// catches that: every article arrives, the mux is valid, the job
+/// completes green. The only witness is the container's own header, and
+/// the assertion is that the daemon reads it WHILE the download runs and
+/// says so on the record the queue is built from.
+///
+/// Both passes are covered: the live one off the still-writing file, and
+/// the latch that carries the answer into history.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_queue_row_says_what_the_file_is_and_flags_a_mislabelled_one() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-mediachip-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+
+    // Padded so the write throttle keeps the download open for several
+    // seconds: the chip has to appear DURING it, not after.
+    let data = nzbkit::mediaprobe::testmux::mkv_padded(12_000_000);
+    let mut articles = HashMap::new();
+    let segs = make_file_articles("movie.mkv", &data, 300_000, "mc", &mut articles);
+    let srv = MockServer::start(articles, Chaos::default()).await;
+
+    let mut xml = format!(
+        "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"&quot;movie.mkv&quot; yEnc (1/{})\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+        segs.len()
+    );
+    for (id, bytes, num) in &segs {
+        xml.push_str(&format!(
+            "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+        ));
+    }
+    xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    delete_without_the_trash(&cfg);
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .env("NZBFAST_THROTTLE_WRITE_MBPS", "3")
+            // The prober's own cadence, compressed so the test does not
+            // sit through the production five seconds.
+            .env("NZBFAST_MEDIA_TICK_MS", "300")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--connections")
+            .arg("2");
+        c
+    })
+    .await;
+    let port = d.port;
+    let daemon_log = d.log.clone();
+
+    tokio::task::spawn_blocking(move || {
+        // The lie is in the NZB's own filename, which becomes the job
+        // name every client matches on.
+        let boundary = "----mediachip";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"Example.Movie.2019.2160p.BluRay.x265.DDP5.1-GRP.nzb\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(xml.as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        http(
+            port,
+            "/api?mode=addfile&output=json",
+            Some((&format!("multipart/form-data; boundary={boundary}"), &body)),
+        );
+
+        // Pass 1: the chip lands on the QUEUE slot, mid-download.
+        let mut chip = None;
+        for _ in 0..400 {
+            let q = http(port, "/api?mode=queue&output=json", None);
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&q)
+                && let Some(slot) = v["queue"]["slots"].get(0)
+                && slot["media"].is_object()
+                && slot["status"] == "Downloading"
+            {
+                chip = Some(slot["media"].clone());
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let log = std::fs::read_to_string(&daemon_log).unwrap_or_default();
+        let m = chip.unwrap_or_else(|| {
+            panic!("the queue row never gained a media chip\n--- log ---\n{log}")
+        });
+
+        // What the row shows: the bytes, never the name.
+        assert_eq!(m["res"], "1080p", "{m}");
+        assert_eq!(m["vcodec"], "H.264", "{m}");
+        assert_eq!(m["audio"], "AAC 2.0", "{m}");
+        assert_eq!(m["container"], "mkv", "{m}");
+        assert!(m["hdr"].is_null(), "an untagged encode carries no format: {m}");
+
+        // ...and every claim the name made that those bytes deny.
+        let by = |field: &str| -> serde_json::Value {
+            m["mismatch"]
+                .as_array()
+                .expect("mismatch must be an array")
+                .iter()
+                .find(|x| x["field"] == field)
+                .unwrap_or_else(|| panic!("no {field} mismatch in {m}"))
+                .clone()
+        };
+        assert_eq!(by("resolution")["claimed"], "2160p", "{m}");
+        assert_eq!(by("resolution")["actual"], "1080p", "{m}");
+        assert_eq!(by("video")["claimed"], "x265", "{m}");
+        assert_eq!(by("video")["actual"], "H.264", "{m}");
+        assert_eq!(by("audio")["claimed"], "DDP", "{m}");
+        assert_eq!(by("audio")["actual"], "AAC 2.0", "{m}");
+
+        // Pass 2: the answer is latched, so it survives the move into
+        // history - where the writer it was read from no longer exists.
+        let mut hist = None;
+        for _ in 0..400 {
+            let h = http(port, "/api?mode=history&output=json", None);
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&h)
+                && let Some(slot) = v["history"]["slots"].get(0)
+                && slot["status"] == "Completed"
+                && slot["media"].is_object()
+            {
+                hist = Some(slot["media"].clone());
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let log = std::fs::read_to_string(&daemon_log).unwrap_or_default();
+        let h = hist.unwrap_or_else(|| {
+            panic!("history lost the media chip\n--- log ---\n{log}")
+        });
+        assert_eq!(h["res"], "1080p", "{h}");
+        assert_eq!(h["vcodec"], "H.264", "{h}");
+        assert_eq!(h["mismatch"].as_array().map(Vec::len), Some(3), "{h}");
+        // A completed file has been read end to end, so the chip is
+        // final rather than "what has arrived so far".
+        assert_eq!(h["complete"], true, "{h}");
+        // And the contradiction is in the log, where a user chasing "why
+        // is this amber" can find it without the dashboard.
+        assert!(
+            log.contains("the file contradicts its name"),
+            "the mismatch was never logged\n--- log ---\n{log}"
+        );
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The pre feed end to end: a real relay socket to a stored row.
+///
+/// `nzbkit::predb`'s unit tests already pin every wire format against
+/// the 2026 survey's verbatim lines. What they cannot see is the chain
+/// AROUND the parser - connect, IRC handshake, JOIN, the listener's
+/// pending buffer, the 20 s drain tick, `predb_store` - because every
+/// link of it lives in the daemon. A regression anywhere along that
+/// chain looks exactly like a quiet feed, and so does a feed with
+/// nothing to say.
+///
+/// So this drives the real binary against a fake relay speaking the
+/// three PLAIN formats the survey found live (pipe, `PRE:` prefix,
+/// parenthesised) plus two chatter lines that must NOT become rows. The
+/// row count is the assertion, and it only comes out right if all three
+/// parsed and neither of the other two did.
+///
+/// The TLS-first connect is exercised too: the relay hangs up on the
+/// ClientHello, so the daemon takes the plaintext fallback, which only
+/// exists when `NZBFAST_PREDB_ALLOW_PLAINTEXT=1`.
+#[tokio::test]
+async fn the_three_plain_relay_formats_reach_the_feed_table() {
+    /// Three announcements in the three plain shapes, colour codes and
+    /// all - on predataba.se the code lands inside the section field.
+    const ANNOUNCEMENTS: &[&str] = &[
+        "pre |\x032 X264-HD | Relay.Format.One.2026.1080p.BluRay.x264-ONE",
+        "\x0314PRE:\x03 [\x0314X264\x03] Relay.Format.Two.2026.1080p.WEB.H264-TWO",
+        "(PRE) (X264-HD) Relay.Format.Three.2026.1080p.WEB.H264-THREE",
+    ];
+    /// Lines that open like announcements and are not.
+    const CHATTER: &[&str] = &[
+        "PRE: the bot is back up",
+        "stats | 34512 pres | today: 1204",
+    ];
+
+    fn serve_irc(sock: &mut std::net::TcpStream) -> std::io::Result<()> {
+        use std::io::BufRead;
+        sock.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+        let mut out = sock.try_clone()?;
+        let mut nick = String::from("nzbfast");
+        for line in std::io::BufReader::new(sock).lines() {
+            let Ok(line) = line else { return Ok(()) };
+            let mut parts = line.split_whitespace();
+            match parts.next().unwrap_or("").to_ascii_uppercase().as_str() {
+                "NICK" => nick = parts.next().unwrap_or("nzbfast").to_string(),
+                // 001 is the "registered" reply the listener waits for
+                // before it dares JOIN.
+                "USER" => {
+                    write!(out, ":relay 001 {nick} :Welcome\r\n")?;
+                    out.flush()?;
+                }
+                "JOIN" => {
+                    let ch = parts.next().unwrap_or("#pre").to_string();
+                    write!(out, ":{nick}!u@h JOIN :{ch}\r\n")?;
+                    // After the JOIN, never before: the listener only
+                    // reads a channel it has joined, so sending early
+                    // would test nothing and pass anyway.
+                    for l in ANNOUNCEMENTS.iter().chain(CHATTER) {
+                        write!(out, ":bot!u@h PRIVMSG {ch} :{l}\r\n")?;
+                    }
+                    out.flush()?;
+                }
+                "QUIT" => return Ok(()),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let relay = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut sock) = conn else { continue };
+            // A TLS ClientHello opens with handshake record type 0x16.
+            // Hanging up on it beats waiting out the 20 s handshake
+            // timeout, and the fallback is what we want next anyway.
+            let mut first = [0u8; 1];
+            if sock.peek(&mut first).is_ok() && first[0] == 0x16 {
+                continue;
+            }
+            let _ = serve_irc(&mut sock);
+        }
+    });
+
+    let dir = std::env::temp_dir().join(format!("nzbfast-predbfeed-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+    let cfg = dir.join("config.json");
+    std::fs::write(&cfg, "{\"servers\":[]}").unwrap();
+    let build = |port: u16| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            // The fallback under test. Without it the daemon correctly
+            // refuses to speak plain text to an unauthenticated relay.
+            .env("NZBFAST_PREDB_ALLOW_PLAINTEXT", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--index-db")
+            .arg(dir.join("index.db"));
+        c
+    };
+
+    let d = serve(&dir, &build).await;
+    let port = d.port;
+    let want = ANNOUNCEMENTS.len() as u64;
+    let saw = tokio::task::spawn_blocking(move || {
+        // Order matters twice over: a server change only takes effect
+        // on connect, so enabling the feed LAST is what makes the first
+        // connect use it - and the feed is gated on the indexer being
+        // on as well (`predb_feed_on`), because a feed with nowhere to
+        // put what it hears is a socket held open for nothing. Indexing
+        // is opt-in, so the test opts in.
+        for (name, value) in [
+            ("index_enabled", "1".to_string()),
+            ("predb_server", format!("127.0.0.1:{relay}")),
+            ("predb_channels", "%23pre".to_string()),
+            ("predb_enabled", "1".to_string()),
+        ] {
+            let r = http(
+                port,
+                &format!("/api?mode=config&name={name}&value={value}&apikey=sekrit&output=json"),
+                None,
+            );
+            assert!(r.contains("\"status\":true"), "set {name}: {r}");
+        }
+        // The drain runs on the feed task's 20 s tick and the listener
+        // reconnects once on the way (the TLS attempt is a failed
+        // connect from its point of view), so the budget is several
+        // ticks wide.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let mut last = String::new();
+        while std::time::Instant::now() < deadline {
+            last = http(
+                port,
+                "/api?mode=predb_stats&apikey=sekrit&output=json",
+                None,
+            );
+            if last.contains(&format!("\"lines\":{want}")) {
+                return last;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        last
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        saw.contains(&format!("\"lines\":{want}")),
+        "expected exactly the {want} announcements and neither chatter line: {saw}"
+    );
+    // The plain formats carry a name and no posted filename, which is
+    // the whole reason correlation exists. A nameable row here would
+    // mean a parser invented a filename.
+    assert!(
+        saw.contains("\"nameable\":0"),
+        "plain-format lines must never look nameable: {saw}"
+    );
+
+    drop(d);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Nested zip through the DAEMON, on a REAL archive pair.
+///
+/// The unit and e2e coverage for the depth lift builds its containers
+/// from nzbkit's own fixtures, which is the right call there (they pin
+/// exact byte layouts). This one is the other half: Info-ZIP writes the
+/// zip and WinRAR writes the store volume around it, so the bytes are a
+/// real posting toolchain's rather than ours, and the whole thing goes
+/// in through `addfile` and comes out of the history the way a job from
+/// Sonarr does.
+///
+/// Skips when `rar` is absent - it is not in CI's image, and the same
+/// shape is covered without it by `zip_nested_in_store_rar_extracts_one_pass`
+/// (nzbkit) and `store_rar_wrapped_zip_extracts_one_pass` (e2e).
+#[tokio::test(flavor = "multi_thread")]
+async fn nested_zip_in_a_real_store_rar_extracts_through_the_daemon() {
+    if Command::new("rar")
+        .arg("-inul")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_err()
+    {
+        eprintln!("skipping: rar not installed");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("nzbfast-nestedzip-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+    let build = dir.join("build");
+    std::fs::create_dir_all(&build).unwrap();
+
+    // Incompressible, like real payload: a stored zip entry is the
+    // dominant shape and the one the copy path exists for.
+    let movie = payload(600_000, 7);
+    std::fs::write(build.join("movie.mkv"), &movie).unwrap();
+    // Info-ZIP, stored (-0), junking paths so the entry is a bare name.
+    let ok = Command::new("zip")
+        .current_dir(&build)
+        .args(["-0", "-q", "-j", "inner.zip", "movie.mkv"])
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "zip failed to build the fixture");
+    // WinRAR, STORE mode (-m0): the outer is a mapping, not a codec, so
+    // the chase reads the zip straight out of the volume.
+    let ok = Command::new("rar")
+        .current_dir(&build)
+        .args(["a", "-m0", "-ep", "-inul", "outer.rar", "inner.zip"])
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "rar failed to build the fixture");
+    let outer = std::fs::read(build.join("outer.rar")).unwrap();
+    let inner_len = std::fs::metadata(build.join("inner.zip")).unwrap().len();
+    assert!(
+        outer.len() as u64 > inner_len,
+        "store RAR should carry the zip whole"
+    );
+
+    let mut articles = HashMap::new();
+    let segs = make_file_articles("outer.rar", &outer, 60_000, "nz", &mut articles);
+    let srv = MockServer::start(articles, Chaos::default()).await;
+
+    let mut xml = format!(
+        "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"&quot;outer.rar&quot; yEnc (1/{})\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+        segs.len()
+    );
+    for (id, bytes, num) in &segs {
+        xml.push_str(&format!(
+            "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+        ));
+    }
+    xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+    let nzb = dir.join("nested-zip.nzb");
+    std::fs::write(&nzb, &xml).unwrap();
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    delete_without_the_trash(&cfg);
+
+    let complete = dir.join("complete");
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(&complete)
+            .arg("--connections")
+            .arg("3");
+        c
+    })
+    .await;
+    let port = d.port;
+
+    // Multipart, exactly as Sonarr posts one.
+    let boundary = "----nzbfastboundary";
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"nested-zip.nzb\"\r\nContent-Type: application/x-nzb\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(xml.as_bytes());
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let ctype = format!("multipart/form-data; boundary={boundary}");
+    tokio::task::spawn_blocking(move || {
+        let r = http(
+            port,
+            "/api?mode=addfile&apikey=sekrit&output=json",
+            Some((&ctype, &body)),
+        );
+        assert!(r.contains("\"status\":true"), "addfile refused: {r}");
+
+        let mut done = false;
+        for _ in 0..600 {
+            let h = http(port, "/api?mode=history&apikey=sekrit&output=json", None);
+            if h.contains("\"Completed\"") {
+                done = true;
+                break;
+            }
+            if h.contains("\"Failed\"") {
+                panic!("job failed: {h}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(done, "download never completed");
+    })
+    .await
+    .unwrap();
+
+    // Every file the job produced. Walked rather than named: the daemon
+    // renames a job's single video to the job's own name, which is a
+    // different subject from whether the two archive layers unwrapped.
+    fn walk(dir: &Path, into: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, into);
+            } else {
+                into.push(p);
+            }
+        }
+    }
+    let mut produced = Vec::new();
+    walk(&complete, &mut produced);
+    let names: Vec<String> = produced
+        .iter()
+        .map(|p| p.strip_prefix(&complete).unwrap().display().to_string())
+        .collect();
+
+    // The payload, byte-exact, out of two archive layers - and it is the
+    // ONLY thing the job produced.
+    assert_eq!(produced.len(), 1, "expected just the payload: {names:?}");
+    assert!(
+        std::fs::read(&produced[0]).unwrap() == movie,
+        "payload bytes differ ({names:?})"
+    );
+    // The point of the lift: NEITHER layer touches the output directory.
+    for stray in [".rar", ".zip"] {
+        assert!(
+            !names.iter().any(|n| n.ends_with(stray)),
+            "an intermediate {stray} was materialized - produced {names:?}"
+        );
+    }
+    let log = std::fs::read_to_string(&d.log).unwrap_or_default();
+    assert!(
+        !log.contains("nested fallback"),
+        "the nested chase demoted:\n{log}"
+    );
+
+    drop(d);
     let _ = std::fs::remove_dir_all(&dir);
 }

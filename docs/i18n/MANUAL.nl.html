@@ -38,12 +38,27 @@ h3{font-size:16.5px;margin:28px 0 6px}
 h4{font-size:14.5px;margin:20px 0 4px}
 p{margin:8px 0}
 li{margin:3px 0}
+/* Prose breaks a long unbreakable token instead of pushing the page sideways.
+   The API section quotes a 368px query string, which does not fit the 280px
+   text column of a 320px phone. Deliberately not applied to header or data
+   cells: inside a scroll wrapper, breaking a cell reflows the columns rather
+   than letting the wide table scroll, which is what the wrapper is for. */
+p,li,.tip,.note,.warn-box{overflow-wrap:break-word}
 code,kbd{background:var(--code);border:1px solid var(--line);border-radius:5px;
   padding:1px 6px;font:12.5px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 pre{background:var(--code);border:1px solid var(--line);border-radius:9px;
   padding:12px 15px;overflow-x:auto;font:12.5px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 pre code{background:none;border:none;padding:0}
-table{border-collapse:collapse;width:100%;margin:12px 0;font-size:13.5px}
+/* A table scrolls inside its own box instead of widening the page. One long
+   unbreakable command in a cell (the docker compose upgrade line, 338px wide
+   in an 87px column) used to drag the whole document sideways on a phone:
+   +140 at 320px and +85 at 375px in English, up to +217 / +162 in the
+   longer-word locales, and da/nl even at 500px. The 12px margin sits on the
+   wrapper so it still collapses with the adjacent paragraph exactly as
+   the margin on the table itself did - a scroll box does not collapse
+   margins through, so leaving it in place would have opened every gap. */
+.tblwrap{overflow-x:auto;margin:12px 0}
+table{border-collapse:collapse;width:100%;margin:0;font-size:13.5px}
 th{text-align:left;color:var(--dim);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
 th,td{padding:7px 12px 7px 0;border-bottom:1px solid var(--line);vertical-align:top}
 td code{white-space:nowrap}
@@ -72,6 +87,7 @@ hr{border:none;border-top:1px solid var(--line);margin:30px 0}
   body{background:#fff;color:#000;font-size:11.5pt}
   h2{page-break-after:avoid}
   pre{white-space:pre-wrap}
+  .tblwrap{overflow:visible}
   a{color:inherit}
 }
 </style>
@@ -220,7 +236,7 @@ waar verder niets toegang nodig heeft.</p>
 
 <h2 id="concepts">3 · Hoe nzbfast werkt</h2>
 <p>Eerst wat vocabulaire, dan leest de rest van de handleiding makkelijk:</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Term</th><th>Betekenis</th></tr>
 <tr><td><b>Provider / server</b></td><td>Een Usenet-dienst waar je een account bij hebt
 (Newshosting, Eweka, XS News…). Elke provider staat een bepaald aantal gelijktijdige
@@ -237,7 +253,7 @@ artikelen beschadigd zijn of ontbreken.</td></tr>
 RAR-volumes verpakt. nzbfast herkent dat en schrijft het <em>binnenste bestand</em>
 tijdens het downloaden rechtstreeks naar zijn definitieve plek - geen uitpakstap
 achteraf.</td></tr>
-</table>
+</table></div>
 <p>De pipeline draait download → decode → verificatie → uitpakken <em>gelijktijdig</em>.
 De Pipeline-kaart op het dashboard laat alle drie de banen tegelijk bewegen. Als de
 laatste byte binnenkomt is de verificatie al gedaan en het bestand al uitgepakt; de
@@ -255,13 +271,13 @@ tegen de PAR2-blokmap voordat het wordt vertrouwd.</p>
 <p>Gemeten tegen SABnzbd 5.0.4 en NZBGet 26.2 op dezelfde machine, dezelfde providers
 en dezelfde NZB's, geklokt tot een <em>bruikbaar bestand</em> - download, verificatie,
 reparatie en uitpakken allemaal meegerekend, want dán is de taak pas echt klaar:</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Taakgrootte</th><th>nzbfast</th><th>NZBGet 26.2</th><th>SABnzbd 5.0.4</th></tr>
 <tr><td>7 GB</td><td><b>13.7 s</b></td><td>+26%</td><td>+39%</td></tr>
 <tr><td>35 GB</td><td><b>67 s</b></td><td>+61%</td><td>+325%</td></tr>
 <tr><td>87 GB</td><td><b>272 s</b></td><td>+36%</td><td>+160%</td></tr>
 <tr><td>190 GB</td><td><b>9 m 00 s</b></td><td>+30%</td><td>+111%</td></tr>
-</table>
+</table></div>
 <p>Het gat is de nabewerking die de anderen na de laatste byte nog moeten doen. Beide
 concurrenten waren voor de vergelijking getuned, niet op standaardinstellingen gelaten
 - SABnzbd wordt met name met request-pipelining <em>uit</em> geleverd, wat hem duur
@@ -362,7 +378,7 @@ totale verbruik tegenover hun grootte.</p>
 in <a href="#performance">Prestatietools</a>.</p>
 
 <h2 id="adding">5 · Downloads toevoegen</h2>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Methode</th><th>Hoe</th></tr>
 <tr><td><b>Slepen &amp; neerzetten</b></td><td>Sleep één of meer <code>.nzb</code>-bestanden waar dan ook op het dashboard.</td></tr>
 <tr><td><b>Watchmap</b></td><td>Stel een map in bij Instellingen; elke <code>.nzb</code> die je erin
@@ -374,7 +390,7 @@ van je browser erop voor één-klik-grabs vanaf indexersites.</td></tr>
 <tr><td><b>Watchlist / RSS</b></td><td>Automatisch - zie <a href="#automation">Automatisering</a>.</td></tr>
 <tr><td><b>Sonarr/Radarr e.d.</b></td><td>Die sturen grabs rechtstreeks de wachtrij in - zie <a href="#arr">§11</a>.</td></tr>
 <tr><td><b>Commandoregel</b></td><td><code>nzbfast get file.nzb</code> downloadt zonder de daemon.</td></tr>
-</table>
+</table></div>
 <h3>Categorieën, prioriteiten, wachtwoorden</h3>
 <ul>
 <li><b>Categorieën</b> zijn vrije labels; elke categorie wordt een submap van je
@@ -485,14 +501,14 @@ als vanouds.</div>
 <h2 id="servers">8 · Usenet-servers</h2>
 <p>Instellingen → <b>Usenet-servers</b> is de volledige editor: toevoegen, bewerken, verwijderen, herordenen en elke
 server in of uit de pool halen. Elke server heeft:</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Veld</th><th>Toelichting</th></tr>
 <tr><td>Host / poort</td><td>Gebruik SSL-poort <b>563</b>. TLS kost niets meetbaars - nzbfast versleutelt altijd.</td></tr>
 <tr><td>Gebruikersnaam / wachtwoord</td><td>Lokaal opgeslagen in <code>config.local.json</code>, nooit terug naar de browser gestuurd. Laat je het wachtwoord bij bewerken leeg, dan blijft het opgeslagen wachtwoord staan. Wachtwoorden zijn <a href="#passwords">op schijf versluierd, niet versleuteld</a>.</td></tr>
 <tr><td>Verbindingen</td><td>Gelijktijdige verbindingen per server. Gebruik <b>Verbindingstuning</b> (<a href="#performance">§13</a>) om de sweet spot van elke provider te vinden in plaats van hoog te gokken.</td></tr>
 <tr><td>Niveau (tier)</td><td>0 = primair; hogere niveaus zijn fill-servers, die alleen artikelen gevraagd worden die elk lager niveau miste. Zet onbeperkte accounts op 0, blokaccounts op 1+.</td></tr>
 <tr><td>Blokgrootte (GB)</td><td>Voor blokaccounts (betalen per GB): nzbfast houdt hiertegen het totale verbruik bij en stopt met de server zodra het blok op is (waarschuwing bij 85%).</td></tr>
-</table>
+</table></div>
 <p><b>Laat wat ruimte onder de verbindingslimiet van je account.</b> De verbindingen net onder de limiet zetten kost niets: de doorvoer vlakt al ruim voor de laatste een of twee verbindingen af, en <b>Verbindingstuning</b> (<a href="#performance">§13</a>) komt er toch al onder uit. Die vrije plekken zijn wat een tweede apparaat, een ander programma of een nieuwe poging na een verbroken socket er nog door laat, in plaats van geweigerd te worden terwijl deze elke plek bezet houdt.</p>
 <h3 id="passwords">Hoe je providerwachtwoorden worden bewaard</h3>
 <p>Providerwachtwoorden in <code>config.local.json</code> zijn <b>versluierd, niet
@@ -531,11 +547,11 @@ ruil.</p>
 <p>Twee andere opties per server hebben nog geen bediening in het dashboard: zet ze
 met de hand bij de vermelding van die server in <code>config.local.json</code>
 (zie <a href="#files">§17</a>) en herstart.</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Sleutel</th><th>Opmerkingen</th></tr>
 <tr><td><code>bind_ip</code></td><td>Bindt de uitgaande verbindingen van deze server aan een specifiek lokaal adres, voor machines met meerdere uitgangen en VPN-splittunnels. De adresfamilie kiest meteen de doelfamilie: een v4-binding verbindt met het v4-adres van de server.</td></tr>
 <tr><td><code>socks5</code></td><td>Stuurt het NNTP-verkeer van deze server via een SOCKS5-proxy: <code>host:port</code>, of <code>user:pass@host:port</code>. De hostnaam wordt <em>door de proxy</em> opgezocht, dus geen lokaal DNS-lek.</td></tr>
-</table>
+</table></div>
 <ul>
 <li>Het <b>vinkje</b> naast elke server is de aan/uit-schakelaar: aangevinkt betekent
 dat de server in de downloadpool zit, niet aangevinkt betekent uitgeschakeld. Een
@@ -563,7 +579,7 @@ hier wordt bewaard in <code>settings.json</code> en overleeft herstarts (waarden
 interface winnen van opties op de opdrachtregel).</p>
 
 <h3>Snelheid &amp; planning <span class="pill live">live</span></h3>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Instelling</th><th>Wat het doet</th></tr>
 <tr><td>Snelheidslimiet</td><td>Limiet in bytes/sec (<code>50M</code>, <code>1G</code>, 0 = onbeperkt). Remote-apps kunnen percentages sturen - stel <i>Lijnsnelheid</i> in zodat die goed vertaald worden.</td></tr>
 <tr><td>Autosnelheid</td><td>RTT-gestuurde limiet die wijkt voor ander thuisverkeer en weer oprekt zodra de lijn stil is.</td></tr>
@@ -572,7 +588,7 @@ interface winnen van opties op de opdrachtregel).</p>
 <tr><td>Auto-update / Update-check-URL</td><td>Zie <a href="#updates">§14</a>.</td></tr>
 <tr><td>Lijnsnelheid</td><td>De nominale snelheid van je verbinding - maakt procentuele limieten vanuit SABnzbd-compatibele apps mogelijk.</td></tr>
 <tr><td>Weekschema</td><td>Rijeneditor voor regels per moment van de week: pauzeren, hervatten of een snelheidslimiet instellen op bepaalde dagen/tijden (lokale tijd). Bijv. door de week van 9–17 uur begrensd op 20&nbsp;MB/s, daarbuiten onbeperkt.</td></tr>
-</table>
+</table></div>
 
 <h3>Volgende download <span class="pill live">live</span></h3>
 <p><b>Verbindingen</b> (per server), <b>venster</b> (pipelining-diepte per verbinding),
@@ -616,7 +632,7 @@ hoofdbestand een schone, informatieve naam: een film wordt
 <code>Example Movie (2024)</code>, series houden <code>Show - S01E02</code>. Versluierde
 of niet-herkende namen blijven precies zoals ze gepost zijn in plaats van geraden te
 worden.</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Instelling</th><th>Wat het doet</th></tr>
 <tr><td>Resolutie opnemen</td><td>Zet <code>1080p</code>, <code>2160p</code>… in de naam. <b>Standaard aan</b>; de andere vier labels staan uit.</td></tr>
 <tr><td>Videocodec opnemen</td><td><code>x265</code>, <code>x264</code>, <code>AV1</code>…</td></tr>
@@ -626,7 +642,7 @@ worden.</p>
 <tr><td>Junkbestanden verwijderen</td><td><b>Standaard aan.</b> Verwijdert achtergebleven <code>.par2</code>, <code>.nzb</code>, <code>.sfv</code>, <code>.nfo</code> en samplefragmenten uit voltooide film- en seriemappen. Nooit de video of de ondertitels.</td></tr>
 <tr><td>Alleen het mediabestand bewaren</td><td><b>Standaard uit, en destructief:</b> verwijdert permanent alles in de map behalve de video('s) en de ondertitels. Elke aflevering van een seizoenspakket blijft staan. Gaat vóór <b>Junkbestanden verwijderen</b> als beide aan staan.</td></tr>
 <tr><td>Keep the other words in the name</td><td><b>Standaard aan.</b> Sport, races en andere evenementen zijn vaak één titel die het hele seizoen wordt herhaald, met maar een woord of twee verschil - "Round11 Hungary Race" tegenover "Round11 Hungary Qualifying". Die woorden bewaren is wat voorkomt dat een heel seizoen tot dezelfde naam samenvalt. Geldt alleen waar de naam niet op een andere manier opgeruimd kon worden, dus gewone films en afleveringen blijven ongemoeid.</td></tr>
-</table>
+</table></div>
 <p class="dim">De hele groep draait na reparatie en uitpakken en vóór <b>Voltooide
 verplaatsen naar</b>, en wordt volledig overgeslagen bij een taak die nog op een
 wachtwoord wacht. Beide verwijderstappen gelden <em>alleen</em> voor releases die als
@@ -653,7 +669,7 @@ de wall kunt doorzoeken. Zet dit aan als je specifieke groepen volgt waar mensen
 onder echte namen posten, of als je wilt zien wat je provider werkelijk draagt. Met de
 schakelaar uit wordt er niets gescand of opgehaald, wordt er geen database aangemaakt,
 en zijn de wall, Index doorzoeken, de watchlist en de newznab-feed verborgen.</div>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Instelling</th><th>Wat het doet</th></tr>
 <tr><td>Ingebouwde indexer</td><td>De hoofdschakelaar, <b>uit tenzij je hem aanzet</b>. Uit betekent geen scannen, geen metadata-opvragingen, geen beschikbaarheidssteekproeven en geen newznab-feed; een index die al op schijf staat blijft bewaard (er is een verwijderknop), dus weer aanzetten hervat in plaats van opnieuw te scannen.</td></tr>
 <tr><td>Groepen</td><td>Nieuwsgroepen die de ingebouwde indexer scant (bijv. <code>alt.binaries.teevee</code>).</td></tr>
@@ -665,7 +681,12 @@ en zijn de wall, Index doorzoeken, de watchlist en de newznab-feed verborgen.</d
 <tr><td>Ingest-filters</td><td>JSON-regels die filteren wat de index in gaat: soorten (geobfusceerde rommel wordt standaard genegeerd), jaar/resolutie/taal, grootte-grenzen.</td></tr>
 <tr><td>Nu scannen / diepe rescan</td><td>Voer direct een ronde uit; met een diepte worden zoveel recente headers opnieuw gescand.</td></tr>
 <tr><td>OMDb-sleutel / metadata verversen / wissen</td><td>Bediening van de wall-verrijking (<a href="#wall">§6</a>). Wissen bouwt de database vanaf nul opnieuw op - de reddingsboei als hij ooit corrupt raakt.</td></tr>
-</table>
+<tr><td>Pre-feed</td><td><b>Uit tot je hem aanzet.</b> Veel uploads worden zonder hun naam geplaatst, en een scan heeft dan niets te lezen. Publieke relaykanalen kondigen de echte naam aan, de enige open weg om die berichten te koppelen. Aanzetten houdt een verbinding met een IRC-netwerk open en luistert: er wordt nooit iets verstuurd en er wordt geen account aangemaakt. Vereist de indexer, want een feed zonder plek voor wat hij hoort is een socket die voor niets openstaat.</td></tr>
+<tr><td>Relayserver, Relaykanalen</td><td>Het IRC-netwerk dat de aankondigingen draagt (host of host:poort) en de kanalen om mee te luisteren, door komma's gescheiden. Een wijziging gaat in bij de volgende verbinding: zet de feed uit en weer aan om hem meteen toe te passen.</td></tr>
+<tr><td>Benoemen via correlatie</td><td>De publieke live-relays dragen geen bestandsnamen, dus de meeste versluierde berichten laten zich niet direct koppelen. Wat een aankondiging wel vastlegt, is wanneer een release verscheen en hoe groot die is. Dit vergelijkt aangekondigde tijd en grootte met naamloze berichten en stelt bij een passende match de echte naam voor in Bladeren. Een suggestie is als zodanig gemarkeerd, vraagt om je klik en hernoemt nooit bestanden op schijf.</td></tr>
+<tr><td>Sterke overeenkomsten automatisch toepassen</td><td>Standaard uit, en streng als hij aanstaat: de grootte moet nauw kloppen, geen andere aankondiging mag bijna even goed passen, en de aankondiging moet dit bericht bij de omgekeerde controle terugkiezen. Een toegepaste naam verandert alleen de weergave, is gemarkeerd als afgeleid en verdwijnt vanzelf als een voltooide download hem weerlegt. Al het zwakkere blijft een suggestie.</td></tr>
+<tr><td>Aankondigingsgeschiedenis</td><td>De live-feed hoort alleen aankondigingen van na het aanzetten. Dit haalt ongeveer zes maanden aan eerdere aankondigingen op uit een publieke pre-database, netjes en eenmalig, zodat ook al geïndexeerde berichten gekoppeld kunnen worden. Draait een half uur of zo op de achtergrond.</td></tr>
+</table></div>
 
 <h3>Bibliotheek, Beveiliging, Interface</h3>
 <p><b>Bibliotheek</b>: categorieën die als directe bibliotheekitems worden behandeld +
@@ -678,17 +699,19 @@ downloadmanagers, de standaard) of megabits (Mb/s, zoals providers lijnen opgeve
 Bestandsgroottes blijven in bytes. Dit is een eigenschap van de daemon, niet van je
 browser, dus het geldt voor elk apparaat dat naar deze installatie kijkt.</p>
 <h3>Geavanceerd: instellingen zonder bediening in het dashboard</h3>
-<p>Vier instellingen hebben geen bediening in de interface en geen optie op de
+<p>Zes instellingen hebben geen bediening in de interface en geen optie op de
 opdrachtregel. Zet ze via de API (<a href="#api">§16</a>), bijv.
 <code>/api?mode=config&amp;name=verify_mode&amp;value=lean&amp;apikey=…</code>. Net als
 alle andere worden ze bewaard in <code>settings.json</code>.</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Naam</th><th>Wat het doet</th></tr>
 <tr><td><code>verify_mode</code></td><td><code>full</code> | <code>fast</code> | <code>lean</code> (standaard <code>fast</code>). <code>lean</code> is de duw voor trage CPU's: als fast, maar slaat daarnaast de yEnc-CRC per artikel over zodra PAR2 een bestand dekt, wat één CRC32-laag oplevert in plaats van twee. Downloads zonder PAR2 houden hun artikel-CRC's, en de verificatie en reparatie aan het eind van de taak veranderen in geen geval. De <b>Snelle verificatie</b> hierboven is dezelfde bediening voor full tegenover fast.</td></tr>
 <tr><td><code>auto_retry_mins</code></td><td>Wachttijd vóór de <em>ene</em> automatische nieuwe poging die een eerste mislukking met ontbrekende artikelen krijgt (standaard 20). Propagatievertraging is een echte oorzaak van ontbrekende artikelen en lost zichzelf op; dankzij het journaal haalt de herhaling alleen op wat nog ontbreekt. Mislukkingen door wachtwoord of takedown komen nooit in aanmerking.</td></tr>
 <tr><td><code>index_scan_par</code></td><td>Hoeveel groepen de indexeerder parallel scant (standaard 3, begrensd op 1-8).</td></tr>
 <tr><td><code>oracle_sample</code></td><td>STAT-budget in rust van het beschikbaarheidsorakel (<a href="#oracle">§13</a>), peilingen per uur per server. Standaard 300, maximaal 3600, <code>0</code> schakelt het bemonsteren helemaal uit.</td></tr>
-</table>
+<tr><td><code>predb_max_rows</code></td><td>Hoeveel pre-aankondigingen de feedtabel bewaart (standaard 250000, begrensd op 10000-5000000). De uurlijkse opschoning snoeit tot dat aantal en de historische import weigert te starten zodra hij eroverheen zou gaan, zodat een import nooit rijen toevoegt die de volgende opschoning wist.</td></tr>
+<tr><td><code>predb_seed_days</code></td><td>Hoe ver terug een historische import reikt als hij zonder eigen venster wordt gestart (standaard 180 dagen, maximaal 366). Een groter venster betekent meer verzoeken aan de pre-bron, die op één per twee seconden loopt.</td></tr>
+</table></div>
 <h2 id="automation">10 · Automatisering</h2>
 <h3>Watchlist</h3>
 <p>De simpelste automatisering: voeg op het dashboard een titel toe, stel
@@ -746,23 +769,23 @@ onder een echte bestandsnaam is geplaatst.</div>
 <p>nzbfast implementeert <em>beide</em> grote afstandsbedieningsprotocollen, dus
 vrijwel elke mobiele/tablet-app werkt. Kies het protocol dat jouw app ondersteunt:</p>
 <h3>Apps die NZBGet spreken (nzb360, LunaSea, NZB Unity…)</h3>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Veld in de app</th><th>Waarde</th></tr>
 <tr><td>Type</td><td>NZBGet</td></tr>
 <tr><td>Host / poort</td><td>je machine : <b>6789</b></td></tr>
 <tr><td>Gebruikersnaam</td><td>maakt niet uit (bijv. <code>nzbfast</code>)</td></tr>
 <tr><td>Wachtwoord</td><td>je <b>API-sleutel</b></td></tr>
-</table>
+</table></div>
 <p>Het volledige JSON-RPC-oppervlak dat deze apps gebruiken wordt geserveerd: status,
 wachtrij met herordenen/pauzeren/verwijderen, geschiedenis, NZB toevoegen,
 snelheidslimiet, pauzeren/hervatten, log.</p>
 <h3>Apps die SABnzbd spreken</h3>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Veld in de app</th><th>Waarde</th></tr>
 <tr><td>Type</td><td>SABnzbd</td></tr>
 <tr><td>Host / poort</td><td>je machine : <b>6789</b></td></tr>
 <tr><td>API-sleutel</td><td>je API-sleutel (of de NZB-sleutel voor alleen-toevoegen-toegang)</td></tr>
-</table>
+</table></div>
 <h3>Het dashboard op je telefoon</h3>
 <p>Open gewoon <code>http://&lt;machine&gt;:6789</code> in een mobiele browser - het
 hele dashboard en de wall hebben een touch-lay-out. Het paneel Instellingen → Externe
@@ -834,13 +857,13 @@ heeft een spill-pad, en de engine wijkt uit naar meer schijf-I/O in plaats van t
 swappen of te falen. Maar die spill is niet gratis, en bij grote taken kun je hem meten.</p>
 <p>Gemeten op één machine en één lijn (M1 Ultra, 10 GbE), dezelfde bestanden bij elk
 budget. Elke run leverde een correct, volledig geverifieerd en uitgepakt resultaat op:</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Taakgrootte</th><th>RAM in overvloed</th><th>2 GB budget<br><span class="dim">≈ machine met 8 GB</span></th><th>1 GB budget<br><span class="dim">≈ machine met 4 GB</span></th><th>256 MB budget<br><span class="dim">≈ NAS met 2 GB</span></th></tr>
 <tr><td>7 GB</td><td>15 s</td><td>15 s</td><td>15 s</td><td>15 s</td></tr>
 <tr><td>35 GB</td><td>65 s</td><td>70 s</td><td>70 s</td><td>65 s</td></tr>
 <tr><td>87 GB</td><td>148 s</td><td>206 s <span class="dim">+39%</span></td><td>196 s <span class="dim">+32%</span></td><td>180 s <span class="dim">+22%</span></td></tr>
 <tr><td>190 GB</td><td>330 s</td><td>427 s <span class="dim">+29%</span></td><td>402 s <span class="dim">+22%</span></td><td>411 s <span class="dim">+25%</span></td></tr>
-</table>
+</table></div>
 <p>Het piekgeheugen volgt het <em>budget</em>, niet de taak: die download van 190 GB
 voltooit in ongeveer 1,1 GB RAM. Wat je ervoor inlevert is tijd - en alleen bij grote
 taken.</p>
@@ -891,9 +914,59 @@ op updates</b> (Instellingen) uit en het benadert het update-manifest helemaal
 niet meer; een lege update-check-URL doet hetzelfde.</li>
 </ul>
 
+<h3 id="updating">Bijwerken zonder je instellingen te verliezen</h3>
+<p>Eén regel geldt voor elke installatie: <b>een update vervangt het programma, nooit
+je instellingen.</b> Alles wat je hebt ingesteld - servers, paden, de API-sleutel, de
+wachtrij - staat in een handvol bestanden in één map (<a href="#files">§17</a>), en
+geen installatieprogramma, image-pull of pakketupgrade komt aan die map. Lijken
+instellingen na een update toch verdwenen, dan komt dat vrijwel altijd doordat de
+nieuwe installatie een <em>andere, lege</em> map leest, niet doordat er iets is
+verwijderd; de oude bestanden staan nog precies waar ze altijd stonden.
+<a href="#settings-gone">§18</a> heeft de herstelstappen.</p>
+<div class="tblwrap"><table>
+<tr><th>Installatie</th><th>Zo werk je bij</th></tr>
+<tr><td>macOS-app</td><td>Open de nieuwe DMG en sleep <b>NzbFast</b> naar
+<b>Apps</b>, over de oude heen. Je datamap staat er los van en wordt niet
+aangeraakt.</td></tr>
+<tr><td>Windows-installatieprogramma</td><td>Draai de nieuwe setup over de oude
+installatie heen. Je datamap staat er los van en wordt niet aangeraakt.</td></tr>
+<tr><td>Docker (commandoregel)</td><td><code>docker pull nzbfast/nzbfast</code>,
+verwijder de oude container en draai de nieuwe met <b>exact dezelfde
+<code>-v</code>-koppelingen</b>. De image is wegwerpbaar; de gekoppelde map
+<code>/config</code> is je installatie. Gebruikt je run-commando een relatief pad
+zoals <code>-v ./config:/config</code>, voer het dan elke keer vanuit dezelfde map
+uit - vanaf elke andere plek is <code>./config</code> een andere, lege
+map.</td></tr>
+<tr><td>Docker Compose</td><td><code>docker compose pull &amp;&amp; docker compose
+up -d</code>, met hetzelfde compose-bestand op dezelfde plek. De
+<code>./config</code> in het bestand is verankerd aan de map van het bestand zelf,
+dus laat het bestand staan waar het staat.</td></tr>
+<tr><td>Watchtower</td><td>Niets te doen: het maakt de container opnieuw aan met
+dezelfde koppelingen zodra er een nieuwe image verschijnt.</td></tr>
+<tr><td>Unraid</td><td>Tabblad Docker → <b>Check for Updates</b> → <b>Apply
+Update</b>. Verwijder de app nooit om hem voor een update opnieuw toe te voegen;
+mocht je ooit echt herinstalleren, houd dan hetzelfde appdata-pad aan zodat hij je
+bestaande <code>/config</code> terugvindt.</td></tr>
+<tr><td>Synology (Container Manager)</td><td>Download de nieuwe image, stop de
+container en maak hem opnieuw aan met dezelfde volume-instellingen - de walkthrough
+in de Synology-handleiding beschrijft het klik voor klik, inclusief hoe je het op
+een schema laat lopen.</td></tr>
+<tr><td>Synology (pakket)</td><td>Installeer de nieuwe <code>.spk</code> in Package
+Center; die wordt ter plekke bijgewerkt.</td></tr>
+<tr><td>Homebrew</td><td><code>brew upgrade nzbfast</code></td></tr>
+<tr><td>Kale binary</td><td>Vervang de binary. Je config blijft staan waar je hem
+hebt gemaakt (<a href="#files">§17</a>).</td></tr>
+</table></div>
+<div class="tip"><b>Tip</b>Docker-gebruikers die Sonarr of Radarr aansluiten: zet de
+API-sleutel in de containerdefinitie zelf
+(<code>-e NZBFAST_APIKEY=…</code>, of het environment-blok van je compose-bestand of
+Unraid-template). Een sleutel die daar staat overleeft elk containerongeluk, want hij
+staat op de host, in de definitie, en wordt bij elke start opnieuw toegepast. Een
+sleutel die je later in Instellingen instelt wint er nog steeds van.</div>
+
 <h2 id="cli">15 · Commandoregel</h2>
 <p>Alles wat de daemon doet is ook scriptbaar. De alledaagse commando's:</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Commando</th><th>Doel</th></tr>
 <tr><td><code>nzbfast setup</code></td><td>Interactieve serverinstallatie.</td></tr>
 <tr><td><code>nzbfast serve</code></td><td>Draai de daemon (dashboard + API + automatisering). <code>--open</code> opent de browser; <code>--apikey</code> stelt de sleutel met de hand in (<a href="#firstrun-key">§2</a>); <code>--bind</code> kiest het luisteradres, standaard <code>0.0.0.0</code> (elke interface), <code>127.0.0.1</code> voor alleen deze machine. Zie <code>--help</code> voor de volledige vlaggenlijst; elke dashboardinstelling heeft een vlag als tweelingbroer.</td></tr>
@@ -903,10 +976,11 @@ niet meer; een lege update-check-URL doet hetzelfde.</li>
 <tr><td><code>nzbfast sysbench</code></td><td>De systeembenchmark + het diversiteitsrapport, in de terminal.</td></tr>
 <tr><td><code>nzbfast index / search</code></td><td>Scan groepen de index in / doorzoek hem, zonder de daemon.</td></tr>
 <tr><td><code>nzbfast import-sab</code></td><td>Importeer servers uit een SABnzbd-ini.</td></tr>
-</table>
+</table></div>
 <p class="dim">Ook beschikbaar: <code>inspect</code>, <code>probe</code>,
 <code>bench</code>, <code>bench-cpu</code>, <code>soak</code>, <code>fetch</code>,
 <code>spots</code>/<code>spot-search</code>/<code>spot-get</code> (Spotnet),
+<code>predb-seed</code> (vult de pre-database met de tijd van voor het aanzetten van de feed),
 <code>make-release-nzb</code>/<code>make-test-nzb</code> (testfixtures). Elk commando
 accepteert <code>--config</code> en <code>--help</code>. Daar komt <code>post</code> bij: het uploadt bestanden als
 yEnc-artikelen en schrijft de bijbehorende NZB. Een operationeel gereedschap; het
@@ -917,7 +991,7 @@ vereist een expliciete <code>--post-server</code> en kiest nooit zelf een server
 SABnzbd-compatibel, dus bestaande SAB-integraties werken ongewijzigd. Twee sleutels:
 de <b>API-sleutel</b> (volledige controle) en de <b>NZB-sleutel</b> (alleen toevoegen:
 <code>addfile</code>/<code>addurl</code>). <code>addnzblnk</code> zit met opzet niet in de alleen-toevoegen set: een link oplossen kan afgerekende indexerquota kosten, en daar gaat een alleen-toevoegen sleutel niet over.</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Gebied</th><th>Modes</th></tr>
 <tr><td>Wachtrij</td><td><code>queue</code> (met <code>name=delete/pause/resume/priority/switch</code>), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>addnzblnk</code>, <code>retry</code>, <code>set_password</code></td></tr>
 <tr><td>Info</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code></td></tr>
@@ -927,10 +1001,25 @@ de <b>API-sleutel</b> (volledige controle) en de <b>NZB-sleutel</b> (alleen toev
 <tr><td>Diagnostiek</td><td><code>sysbench</code>, <code>bench_history</code>, <code>connladder</code>, <code>pooltest</code>, <code>diversity</code>, <code>update_check</code>, <code>update_apply</code></td></tr>
 <tr><td>NZBGet JSON-RPC</td><td><code>/jsonrpc</code> - status, listgroups, history, append, editqueue, rate, pause, log (Basic auth: willekeurige gebruiker, API-sleutel als wachtwoord)</td></tr>
 <tr><td>Voorvertoning / afspelen</td><td><code>/stream/&lt;nzo_id&gt;</code> (HTTP-ranges; het starten van een geparkeerde bibliotheektaak vereist een <code>?t=</code>-token of de sleutel), <code>/m3u/&lt;id&gt;</code> (vereist de sleutel; geeft het token uit), <code>/wall</code>, <code>/art/…</code></td></tr>
-</table>
+</table></div>
 
 <h2 id="files">17 · Bestanden &amp; locaties</h2>
-<table>
+<p>Waar de instellingenmap staat, hangt af van hoe nzbfast is geïnstalleerd. Deze ene
+map bevat alles wat een back-up waard is:</p>
+<div class="tblwrap"><table>
+<tr><th>Installatie</th><th>Instellingenmap</th></tr>
+<tr><td>macOS-app</td><td><code>~/Library/Application Support/nzbfast/</code></td></tr>
+<tr><td>Windows</td><td><code>%LOCALAPPDATA%\nzbfast\</code></td></tr>
+<tr><td>Docker / NAS-containers</td><td><code>/config</code> binnen de container,
+oftewel de hostmap die je eraan hebt gekoppeld. Op Unraid is dat de appdata-map van
+de app.</td></tr>
+<tr><td>Synology-pakket</td><td><code>/var/packages/nzbfast/var/</code></td></tr>
+<tr><td>Terminal</td><td>De map waarin je <code>nzbfast setup</code> draaide, of
+waar <code>--config</code> / <code>$NZBFAST_CONFIG</code> ook maar naar
+wijst.</td></tr>
+</table></div>
+<p>En wat erin staat:</p>
+<div class="tblwrap"><table>
 <tr><th>Bestand</th><th>Inhoud</th></tr>
 <tr><td><code>config.local.json</code></td><td>Serverinloggegevens en opties per server. Aangemaakt door de wizard; te bewerken in Instellingen. Houd hem privé. Wachtwoorden zijn <a href="#passwords">versluierd, niet versleuteld</a>.</td></tr>
 <tr><td><code>settings.json</code></td><td>Elke instelling die in het dashboard is gewijzigd. Staat naast de config; UI-waarden overschrijven commandoregelvlaggen. Verwijder een sleutel (of het bestand) om terug te vallen op vlaggen/standaardwaarden.</td></tr>
@@ -939,10 +1028,10 @@ de <b>API-sleutel</b> (volledige controle) en de <b>NZB-sleutel</b> (alleen toev
 <tr><td><code>&lt;config&gt;/.spool/</code></td><td>Wachtrijstatus (overleeft herstarts), NZB's per taak, verbruiksgrootboek, benchmarkgeschiedenis, posterart-cache.</td></tr>
 <tr><td>Artikeljournal</td><td>Staat in de uitvoermap van elke taak zolang die incompleet is - drijft crash-hervatting en opnieuw proberen aan. Wordt bij succes verwijderd.</td></tr>
 <tr><td>Externe tools</td><td>Geen nodig - RAR-uitpakken en PAR2-herstel zijn native. Mocht een exotische set ooit een externe <code>unrar</code> of <code>par2</code> als fallback nodig hebben, dan kijkt nzbfast eerst naast zijn executable en daarna op <code>$PATH</code>.</td></tr>
-</table>
+</table></div>
 
 <h2 id="troubleshooting">18 · Problemen oplossen</h2>
-<table>
+<div class="tblwrap"><table>
 <tr><th>Symptoom</th><th>Controleer</th></tr>
 <tr><td>Trage downloads</td><td>Draai de <b>Systeembenchmark</b> - die benoemt de bottleneck ronduit. Is het het netwerk: draai <b>Verbindingstuning</b>, check de aantallen verbindingen per server en controleer of je providers niet allemaal op één backbone zitten (<b>Serverdiversiteit</b>).</td></tr>
 <tr><td>Alleen traag bij heel grote taken<br>(NAS of machine met weinig RAM)</td><td>Verwacht, en meetbaar: een uitgehongerd geheugenbudget spilt caches naar schijf en kost 20–40% voorbij ~87 GB. Zie <a href="#memory">Geheugenbudget</a> voor de cijfers en hoeveel RAM je moet geven. Kleinere taken merken er niets van.</td></tr>
@@ -954,12 +1043,13 @@ er precies zo uit en lost zichzelf op.</td></tr>
 <tr><td>Een archief pakt niet uit</td><td>Wachtwoord- en reparatiefouten melden zichzelf in de geschiedenisregel. Voor al het andere is er een noodluik: Instellingen → Watchmap &amp; nabewerking → <b>Uitpakken met externe unrar</b> (een geavanceerde instelling) geeft het uitpakken aan het op je machine geïnstalleerde programma <code>unrar</code> in plaats van de ingebouwde uitpakker. Laat het anders uit: het ingebouwde pad is sneller op elke vorm die we hebben gemeten, en versluierde posts met hash-namen gebruiken het toch altijd, omdat unrar hun hernoeming niet kan volgen. Dezelfde schakelaar voor <code>nzbfast get</code>-runs is de omgevingsvariabele <code>NZBFAST_NO_NATIVE_UNRAR=1</code>. Als unrar een archief uitpakt dat de ingebouwde uitpakker weigerde, meld het dan zodat we het ingebouwde pad kunnen repareren.</td></tr>
 <tr><td>Sonarr/Radarr krijgt geen verbinding</td><td>Poort 6789 bereikbaar? API-sleutel correct (volledige sleutel, niet de NZB-sleutel)? Clienttype op SABnzbd gezet?</td></tr>
 <tr><td>Het dashboard vraagt om een API-sleutel die ik nooit heb ingesteld</td><td>Een nieuwe installatie maakt er zelf een aan en toont hem één keer bij het starten (<a href="#firstrun-key">§2</a>). Hij staat in het bestand <code>apikey</code> naast je config, en in de startuitvoer. Of typ een eigen sleutel bij Instellingen → Beveiliging vanuit een browser die al ingelogd is.</td></tr>
+<tr id="settings-gone"><td>Al mijn instellingen lijken weg na een update<br>(servers, paden, API-sleutel)</td><td>Niets in een update verwijdert instellingen; dit betekent dat nzbfast een andere, lege map leest. Eerst dit: het API-sleutelveld in Instellingen toont zich met opzet leeg - klik op <b>Show</b> voordat je concludeert dat de sleutel weg is. Vergelijk op Docker de <code>/config</code>-koppeling van de nieuwe container met die van de oude: een gewijzigd hostpad, een relatief pad dat vanuit een andere map is gedraaid of een verse appdata-map laten nzbfast allemaal van nul beginnen, terwijl je echte instellingen onaangeroerd op het vorige pad staan. Zoek de oude map op (kijk naar <code>settings.json</code>, je configbestand en <code>apikey</code> - locaties in <a href="#files">§17</a>) en richt de koppeling er weer op, of kopieer die bestanden naar de nieuwe map en herstart. Het startlog noemt het exacte instellingenbestand dat in gebruik is: <code>[settings] applying saved settings from …</code></td></tr>
 <tr><td>Niets op het netwerk kan de daemon bereiken</td><td>Check <code>--bind</code>: <code>127.0.0.1</code> bedient alleen de machine waarop nzbfast draait. De standaard, <code>0.0.0.0</code>, bedient elke interface. Controleer daarna de firewall van de machine zelf op poort 6789.</td></tr>
 <tr><td>De kaart Index doorzoeken blijft klein</td><td>De indexer groeit op de achtergrond - check of er groepen zijn ingesteld bij Instellingen → Indexeren, en geef Verdiepen per scan de tijd om geschiedenis op te bouwen. "Nu scannen" forceert een ronde; de statusregel toont live de voortgang.</td></tr>
 <tr><td>De wall toont verkeerde/geen artwork</td><td>Detailblad → ✎ Match corrigeren of ↻ Metadata verversen. Filmlookups worden beter met een gratis OMDb-sleutel.</td></tr>
 <tr><td>Daemon start niet: poort in gebruik</td><td>Er draait al een instantie - of wijzig <code>--port</code>.</td></tr>
 <tr><td>Waar zijn de logs?</td><td>De Log-kaart op het dashboard, of de terminal/het logbestand waarmee je <code>serve</code> startte.</td></tr>
-</table>
+</table></div>
 <div class="note"><b>Kom je er niet uit?</b>De Log-kaart benoemt meestal de boosdoener -
 stuur de staart ervan mee als je een probleem meldt, samen met je
 <code>nzbfast --version</code>.</div>

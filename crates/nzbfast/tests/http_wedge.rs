@@ -24,17 +24,38 @@
 //! The long lock hold is synthesized with the NZBFAST_DEBUG_HOOKS-gated
 //! mode=debug_hold_index, which sleeps inside with_index - the same
 //! mutex a real ingest batch holds.
+//!
+//! 2 Aug 2026: the same daemon went silent again, and it was the same
+//! shape one mutex further along. The read-only connection above was a
+//! SINGLE connection behind a single mutex, whose holds were assumed -
+//! never enforced - to be short. At 32M releases they were not: `wall2`
+//! took 85s and `wall_tip` 76s, both full scans, so every query handler
+//! serialized behind whichever was slowest and parked a worker waiting.
+//! The read path is now a bounded POOL that refuses rather than queues
+//! (`INDEX_READ_CONNS`), which caps how many workers any amount of slow
+//! query work can occupy; `a_slow_index_read_cannot_starve_the_http_pool`
+//! pins it, via the sibling hook mode=debug_hold_index_read. The two
+//! queries that triggered it were fixed as well - see `Index::optimize`
+//! (the database had never been ANALYZEd) and the `INDEXED BY` hint in
+//! `wall_tip` - but the ceiling is what makes the NEXT slow query a slow
+//! query rather than an outage.
+
+mod scratch;
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use nzbkit::nntp::OverEntry;
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 /// One attempt, returning the response BODY. Err ONLY when the daemon
@@ -58,7 +79,10 @@ fn free_port() -> u16 {
 /// like an empty body and buried the cause.
 fn http_once(port: u16, req: &str) -> std::io::Result<String> {
     let mut s = TcpStream::connect(("127.0.0.1", port))?;
-    write!(s, "GET {req} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")?;
+    write!(
+        s,
+        "GET {req} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+    )?;
     let mut raw = Vec::new();
     // Zero bytes back is a refusal to serve, however the peer phrased
     // it: ECONNREFUSED when the accept never happened, an RST or a bare
@@ -69,7 +93,10 @@ fn http_once(port: u16, req: &str) -> std::io::Result<String> {
     let read = s.read_to_end(&mut raw);
     if raw.is_empty() {
         return Err(read.err().unwrap_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "closed without answering")
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "closed without answering",
+            )
         }));
     }
     let Some(at) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
@@ -79,7 +106,11 @@ fn http_once(port: u16, req: &str) -> std::io::Result<String> {
     let chunked = String::from_utf8_lossy(head)
         .to_ascii_lowercase()
         .contains("transfer-encoding: chunked");
-    let body = if chunked { dechunk(body) } else { body.to_vec() };
+    let body = if chunked {
+        dechunk(body)
+    } else {
+        body.to_vec()
+    };
     Ok(String::from_utf8(body).expect("response body is UTF-8"))
 }
 
@@ -162,11 +193,9 @@ fn over(number: u64, subject: &str, msgid: &str, date: i64) -> OverEntry {
     }
 }
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir()
-        .join(format!("nzbfast-wedge-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+fn scratch(name: &str) -> scratch::ScratchDir {
+    let dir = std::env::temp_dir().join(format!("nzbfast-wedge-{}-{name}", std::process::id()));
+    let dir = scratch::ScratchDir::attach(&dir);
     std::fs::write(dir.join("config.json"), "{\"servers\":[]}").unwrap();
     // An existing install (no first-run key minted) with the indexer on -
     // the whole test is about the index connection.
@@ -190,7 +219,8 @@ fn seed_index(dir: &Path, n: usize) {
             )
         })
         .collect();
-    ix.ingest("alt.binaries.teevee", &entries, now - 3600).unwrap();
+    ix.ingest("alt.binaries.teevee", &entries, now - 3600)
+        .unwrap();
 }
 
 fn serve(dir: &Path) -> Running {
@@ -233,13 +263,18 @@ fn serve_with_hooks(dir: &Path, hooks: bool) -> Running {
             .stderr(Stdio::from(err))
             .spawn()
             .unwrap();
-        let mut running = Running { _child: KillOnDrop(child), port };
+        let mut running = Running {
+            _child: KillOnDrop(child),
+            port,
+        };
         // Readiness = OUR banner in OUR log (see index_size_cap.rs for
         // why a bare connect can catch a stranger on a recycled port).
         let banner = format!("open the dashboard at  http://localhost:{port}/");
         let mut dead = false;
         for _ in 0..300 {
-            if std::fs::read_to_string(&log).unwrap_or_default().contains(&banner)
+            if std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .contains(&banner)
                 && TcpStream::connect(("127.0.0.1", port)).is_ok()
             {
                 return running;
@@ -273,7 +308,10 @@ fn held_index_lock_does_not_wedge_the_api() {
 
     // Prime: one unlocked poll computes fresh figures and fills the cache.
     let fresh = api(port, "mode=index_stats");
-    assert_eq!(fresh["releases"], 8, "seed visible before the hold: {fresh}");
+    assert_eq!(
+        fresh["releases"], 8,
+        "seed visible before the hold: {fresh}"
+    );
 
     // The synthetic 62s batch, scaled to 15s of test time. It answers
     // {"held": true} only after the sleep, so join() doubles as proof
@@ -296,7 +334,10 @@ fn held_index_lock_does_not_wedge_the_api() {
             );
             // Served from the cache, not zeros - the pill must not read
             // "empty index" every time a scan batch is busy.
-            assert_eq!(s["releases"], 8, "stale-but-real figures during the hold: {s}");
+            assert_eq!(
+                s["releases"], 8,
+                "stale-but-real figures during the hold: {s}"
+            );
             std::thread::sleep(Duration::from_secs(1));
         }
     });
@@ -337,7 +378,10 @@ fn held_index_lock_does_not_wedge_the_api() {
                 "getnzb blocked {}ms behind the held index lock",
                 t.elapsed().as_millis()
             );
-            assert!(nzb.contains("<nzb"), "getnzb serves the NZB during the hold: {nzb}");
+            assert!(
+                nzb.contains("<nzb"),
+                "getnzb serves the NZB during the hold: {nzb}"
+            );
             std::thread::sleep(Duration::from_secs(1));
         }
     });
@@ -374,6 +418,203 @@ fn held_index_lock_does_not_wedge_the_api() {
     assert_eq!(after["releases"], 8, "fresh path after the hold: {after}");
 }
 
+/// The 2 Aug 2026 wedge: the SAME silence as 28 Jul, one mutex further
+/// along.
+///
+/// The 28 Jul fix moved the query endpoints off the read-write mutex and
+/// onto a dedicated read-only connection, on the stated assumption that
+/// "every hold of THIS mutex is a short query". On a 32M-release index
+/// that assumption failed: `wall2` spent 85s on its card COUNT and
+/// `wall_tip` 76s on a full scan, each holding that one connection, so
+/// every other query handler queued behind it - and a queued request
+/// holds the HTTP worker that is waiting. Eight of those and the daemon
+/// answered nothing at all: `mode=version`, which touches no database,
+/// timed out at 45s while the process sat there logging happily.
+///
+/// Reproduced against the live 45 GB index before this was written:
+/// eight concurrent wall2 calls, and then `/` and `mode=version` both
+/// returned nothing for the duration.
+///
+/// What must hold now, and what this pins: however many slow reads are
+/// in flight, the number of workers they can occupy is capped, so the
+/// rest of the API is untouched. Past `INDEX_READ_CONNS` a read is told
+/// the index is busy INSTEAD of queueing - the worker goes back to the
+/// pool rather than waiting out the slow query.
+#[test]
+fn a_slow_index_read_cannot_starve_the_http_pool() {
+    let dir = scratch("readpool");
+    seed_index(&dir, 8);
+    let d = serve(&dir);
+    let port = d.port;
+
+    // Prime the read path so `index_migrated` is set and the pool is the
+    // thing under test rather than the startup fallback to with_index.
+    let s = api(port, "mode=index_search&q=wedge");
+    assert_eq!(
+        s["results"].as_array().map(Vec::len),
+        Some(8),
+        "seed visible before the holds: {s}"
+    );
+
+    // Twelve concurrent slow reads - more than the 8 HTTP workers, so in
+    // the pre-fix daemon this is the wedge exactly. Only INDEX_READ_CONNS
+    // of them can hold a connection; the rest must come back "busy"
+    // promptly rather than parking a worker apiece.
+    let holders: Vec<_> = (0..12)
+        .map(|_| std::thread::spawn(move || api(port, "mode=debug_hold_index_read&value=15")))
+        .collect();
+    std::thread::sleep(Duration::from_millis(750));
+
+    // The whole point: endpoints that touch no index at all keep
+    // answering, at full speed, for the entire hold. `mode=version` is
+    // the exact call that went silent live, and `/` is the curl from the
+    // 28 Jul report.
+    for _ in 0..12 {
+        let t = Instant::now();
+        let v = api(port, "mode=version");
+        assert!(
+            v.get("version").is_some(),
+            "mode=version answered during the read holds: {v}"
+        );
+        assert!(
+            t.elapsed() < Duration::from_secs(2),
+            "mode=version took {}ms behind slow index reads - the pool is starved again",
+            t.elapsed().as_millis()
+        );
+        let t = Instant::now();
+        let page = http(port, "/");
+        assert!(!page.is_empty(), "/ served nothing during the read holds");
+        assert!(
+            t.elapsed() < Duration::from_secs(2),
+            "/ took {}ms behind slow index reads",
+            t.elapsed().as_millis()
+        );
+        let t = Instant::now();
+        let q = api(port, "mode=queue");
+        assert!(q.get("queue").is_some(), "mode=queue answered: {q}");
+        assert!(
+            t.elapsed() < Duration::from_secs(2),
+            "mode=queue took {}ms behind slow index reads",
+            t.elapsed().as_millis()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // A query endpoint asked while the pool is saturated must be TOLD
+    // so, quickly, rather than blanking or hanging: a busy index reading
+    // as an empty one is how "the wall is broken" gets reported for what
+    // is really "ask again in a moment".
+    let t = Instant::now();
+    let w = api(port, "mode=wall2&all=1&matched=0");
+    assert!(
+        t.elapsed() < Duration::from_secs(2),
+        "wall2 waited {}ms on a saturated pool instead of answering busy",
+        t.elapsed().as_millis()
+    );
+    assert_eq!(w["busy"], true, "wall2 says the index is busy: {w}");
+
+    let answers: Vec<serde_json::Value> = holders
+        .into_iter()
+        .map(|h| h.join().expect("holder thread"))
+        .collect();
+    let held = answers.iter().filter(|a| a["held"] == true).count();
+    let busy = answers.iter().filter(|a| a["busy"] == true).count();
+    // Exactly the ceiling got in. Not "at most": a pool that handed out
+    // fewer would pass every assertion above while quietly serializing
+    // the query surface, which is the bug this replaced.
+    assert_eq!(
+        held, 4,
+        "INDEX_READ_CONNS reads ran concurrently, the rest were refused: \
+         {held} held, {busy} busy"
+    );
+    assert_eq!(held + busy, 12, "every request got a verdict: {answers:?}");
+
+    // And the pool recovers: with the holds finished, reads are normal
+    // again - the refusals above were backpressure, not a broken handle.
+    let after = api(port, "mode=index_search&q=wedge");
+    assert_eq!(
+        after["results"].as_array().map(Vec::len),
+        Some(8),
+        "reads resume once the holds end: {after}"
+    );
+}
+
+/// The third wedge shape, found by the 2 Aug bug sweep before it fired
+/// live: `index_migrated` is sticky, so once the index database file
+/// vanishes (index_wipe deletes it; here the test deletes it directly)
+/// every query's read-only open FAILS - and the pre-fix fallback for
+/// that case was the UNBOUNDED read-write mutex. With anything long
+/// holding that mutex (a chunked compaction pass, the daily ANALYZE;
+/// here the debug hook), every query worker parked on it and the
+/// daemon went silent again. The fallback is now try-lock shaped: a
+/// held mutex means a prompt empty answer, never a parked worker.
+#[test]
+fn a_missing_index_db_plus_a_held_write_mutex_cannot_park_queries() {
+    let dir = scratch("unavail");
+    seed_index(&dir, 8);
+    let d = serve(&dir);
+    let port = d.port;
+
+    // Prime: sets index_migrated, so the pool (not the startup
+    // fallback) is what serves queries from here on.
+    let s = api(port, "mode=index_search&q=wedge");
+    assert_eq!(
+        s["results"].as_array().map(Vec::len),
+        Some(8),
+        "seed visible before the hold: {s}"
+    );
+
+    // A long hold of the read-write mutex - the compaction/ANALYZE
+    // stand-in. 12s: far above the promptness bound below, so a parked
+    // query is unambiguous.
+    let holder = std::thread::spawn(move || api(port, "mode=debug_hold_index&value=12"));
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Delete the database out from under the daemon - what index_wipe
+    // does. (On Windows the delete can fail against the open handle;
+    // then the read-only opens keep succeeding, the fallback is never
+    // reached, and the assertions below hold trivially - the pre-fix
+    // park cannot happen there either.)
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(dir.join(format!("index.db{suffix}")));
+    }
+
+    // More concurrent queries than the pool has idle connections: the
+    // surplus hits the failing read-only open. Pre-fix each of these
+    // parked on the held mutex for the rest of the hold; now every one
+    // must answer promptly, whatever the answer is.
+    let queries: Vec<_> = (0..6)
+        .map(|_| {
+            std::thread::spawn(move || {
+                let t = Instant::now();
+                let _ = api(port, "mode=index_search&q=wedge");
+                t.elapsed()
+            })
+        })
+        .collect();
+    for q in queries {
+        let took = q.join().expect("query thread");
+        assert!(
+            took < Duration::from_secs(5),
+            "query parked {}ms on the held write mutex behind a missing index db",
+            took.as_millis()
+        );
+    }
+
+    // And the daemon as a whole never lost its workers to the park.
+    let t = Instant::now();
+    let v = api(port, "mode=version");
+    assert!(v.get("version").is_some(), "version answered: {v}");
+    assert!(
+        t.elapsed() < Duration::from_secs(2),
+        "mode=version took {}ms behind the held mutex",
+        t.elapsed().as_millis()
+    );
+
+    let held = holder.join().expect("holder thread");
+    assert_eq!(held["held"], true, "the hook really held the lock: {held}");
+}
+
 /// The debug hook must not exist without its env var - it ties up a
 /// worker and the index lock on demand, which is exactly what an open
 /// API must not offer. (The gate is the environment, not a build flag,
@@ -386,10 +627,26 @@ fn debug_hook_absent_without_env() {
     let t = Instant::now();
     let r = api(port, "mode=debug_hold_index&value=30");
     // An unknown mode's error answer, immediately - not a 30s stall.
-    assert!(r.get("held").is_none(), "hook must not run without the env var: {r}");
+    assert!(
+        r.get("held").is_none(),
+        "hook must not run without the env var: {r}"
+    );
     assert!(
         t.elapsed() < Duration::from_secs(5),
         "unknown-mode answer took {}ms - did the hook run?",
+        t.elapsed().as_millis()
+    );
+    // Its read-pool sibling is gated on the same variable and would tie
+    // up a pooled connection just as happily.
+    let t = Instant::now();
+    let r = api(port, "mode=debug_hold_index_read&value=30");
+    assert!(
+        r.get("held").is_none(),
+        "read hook must not run without the env var: {r}"
+    );
+    assert!(
+        t.elapsed() < Duration::from_secs(5),
+        "unknown-mode answer took {}ms - did the read hook run?",
         t.elapsed().as_millis()
     );
 }
@@ -451,17 +708,21 @@ fn a_client_that_vanishes_mid_request_is_released() {
     // Meanwhile the abandoned sockets cost nobody else anything.
     std::thread::sleep(Duration::from_secs(2));
     let q = api(port, "mode=queue");
-    assert!(q.get("queue").is_some(), "daemon healthy beside dead clients: {q}");
+    assert!(
+        q.get("queue").is_some(),
+        "daemon healthy beside dead clients: {q}"
+    );
 
     let half_took = h.join().expect("half-request watcher");
     let silent_took = s.join().expect("silent watcher");
 
     // And afterwards, with both sockets reclaimed, still healthy.
     let q = api(port, "mode=queue");
-    assert!(q.get("queue").is_some(), "daemon healthy after reclaiming: {q}");
-    eprintln!(
-        "daemon released: half-request in {half_took:?}, silent in {silent_took:?}"
+    assert!(
+        q.get("queue").is_some(),
+        "daemon healthy after reclaiming: {q}"
     );
+    eprintln!("daemon released: half-request in {half_took:?}, silent in {silent_took:?}");
 }
 
 /// One keep-alive GET on an already-open connection; the response must
@@ -482,7 +743,11 @@ fn keepalive_get(s: &mut TcpStream, path: &str) -> serde_json::Value {
     let head = String::from_utf8_lossy(&head);
     let len: usize = head
         .lines()
-        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap()))
+        .find_map(|l| {
+            l.to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .map(|v| v.trim().parse().unwrap())
+        })
         .expect("response carries a Content-Length");
     let mut body = vec![0u8; len];
     s.read_exact(&mut body).expect("full keep-alive body");
@@ -504,10 +769,16 @@ fn dashboard_keepalive_outlives_its_poll_interval() {
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
 
     let first = keepalive_get(&mut s, "/api?output=json&mode=queue");
-    assert!(first.get("queue").is_some(), "first poll on the connection: {first}");
+    assert!(
+        first.get("queue").is_some(),
+        "first poll on the connection: {first}"
+    );
 
     std::thread::sleep(Duration::from_secs(16));
 
     let second = keepalive_get(&mut s, "/api?output=json&mode=queue");
-    assert!(second.get("queue").is_some(), "poll after 16s idle: {second}");
+    assert!(
+        second.get("queue").is_some(),
+        "poll after 16s idle: {second}"
+    );
 }

@@ -63,7 +63,9 @@ jobs:
           rm -rf "$STAGE" && mkdir -p "$STAGE" packaging/windows/out
           cp target/x86_64-pc-windows-gnu/release/nzbfast.exe "$STAGE/"
           cp target/x86_64-pc-windows-gnu/release/nzbtray.exe "$STAGE/"
-          cp docs/MANUAL.html LICENSE COPYRIGHT.md "$STAGE/"
+          # Same substituted manual make-installer.sh stages.
+          packaging/make-offline-manual.sh docs/MANUAL.html "$STAGE/MANUAL.html"
+          cp LICENSE COPYRIGHT.md "$STAGE/"
 
       # Inno Setup isn't preinstalled on windows-latest; choco is. Running
       # ISCC from packaging/windows/ reproduces make-installer.sh exactly

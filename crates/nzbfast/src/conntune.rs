@@ -15,6 +15,7 @@
 //! hard cap at application time - a knee above it is surfaced as a
 //! suggestion, never applied silently.
 
+use crate::MutexExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -58,7 +59,7 @@ pub fn load(config: &Path) -> HashMap<String, Tuned> {
 /// the torn write.
 pub fn record(config: &Path, host: &str, t: Tuned) {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = LOCK.lock_ok();
     let mut map = load(config);
     map.insert(host.to_string(), t);
     let path = path_for(config);
@@ -81,12 +82,24 @@ mod tests {
         record(
             &cfg,
             "news.example.com",
-            Tuned { connections: 12, granted: 12, gbps: 4.9, checked: 1, source: "auto".into() },
+            Tuned {
+                connections: 12,
+                granted: 12,
+                gbps: 4.9,
+                checked: 1,
+                source: "auto".into(),
+            },
         );
         record(
             &cfg,
             "fill.example.com",
-            Tuned { connections: 4, granted: 4, gbps: 0.8, checked: 2, source: "manual".into() },
+            Tuned {
+                connections: 4,
+                granted: 4,
+                gbps: 0.8,
+                checked: 2,
+                source: "manual".into(),
+            },
         );
         let m = load(&cfg);
         assert_eq!(m.len(), 2);

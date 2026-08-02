@@ -53,14 +53,28 @@
 
 use crate::gf16::{self, MulTable};
 use crate::par2::{self, BlockCheck, Par2File};
+use crate::sync::{MutexExt, RwLockExt};
 use md5::{Digest, Md5};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use tracing::{info, warn};
 
 /// PAR2 hard limit: number of naturals below 65535 coprime to it.
-const MAX_INPUT_SLICES: usize = 32768;
+/// Public so pre-repair planners (the mapped path's parity-as-a-source
+/// slot allocation) can refuse a set that could never repair anyway
+/// BEFORE committing any state to it.
+pub const MAX_INPUT_SLICES: usize = 32768;
+/// A dense missing x missing GF(2^16) inverse costs ~4*m^2 bytes (the
+/// matrix plus its inverse) and O(m^3) single-threaded field ops. The
+/// PAR2 spec slice cap (32768) is far too loose a bound for that: a
+/// crafted set declaring tens of thousands of missing blocks would pin
+/// multiple GB and run for hours (a repair-time DoS). Refuse a matrix
+/// larger than a real recovery set ever is; 8192 caps peak matrix memory
+/// near 256 MB. An extreme legitimate repair can still use par2cmdline.
+/// Public for the same pre-repair planners as [`MAX_INPUT_SLICES`].
+pub const MAX_REPAIR_DIM: usize = 8192;
 /// Present-slice bytes buffered between threaded syndrome flushes.
 const BATCH_BYTES: usize = 64 << 20;
 
@@ -91,7 +105,11 @@ pub fn input_base_logs(n: usize) -> Result<Vec<u32>, RepairError> {
     let mut k = 0u32;
     while logs.len() < n {
         k += 1;
-        if k % 3 != 0 && k % 5 != 0 && k % 17 != 0 && k % 257 != 0 {
+        if !k.is_multiple_of(3)
+            && !k.is_multiple_of(5)
+            && !k.is_multiple_of(17)
+            && !k.is_multiple_of(257)
+        {
             logs.push(k);
         }
     }
@@ -277,9 +295,8 @@ fn fold_chunk_multi(
     // of 16 words, so the fused kernel covers whole tiles and the
     // per-source remainder path stays out of the steady state.
     let ceiling = tile_words.max(16);
-    let tile_words = ((L2_TARGET_WORDS / dsts.len())
-        .clamp(MIN_TILE_WORDS.min(ceiling), ceiling))
-        & !15;
+    let tile_words =
+        ((L2_TARGET_WORDS / dsts.len()).clamp(MIN_TILE_WORDS.min(ceiling), ceiling)) & !15;
     let tile_words = tile_words.max(16);
     // Coefficients hoisted per (row, group) sweep, exactly as the table
     // path hoists them. Zero coefficients ride along (a pmull by zero
@@ -333,8 +350,7 @@ fn fold_chunk_multi(
                         // Only a non-32-byte-aligned FINAL tile lands here.
                         for (s, c) in full[..n].iter().zip(&gc[..n]) {
                             if *c != 0 {
-                                MulTable::new(*c)
-                                    .xor_mul_into(&mut dtile[done..], &s[done * 2..]);
+                                MulTable::new(*c).xor_mul_into(&mut dtile[done..], &s[done * 2..]);
                             }
                         }
                     }
@@ -401,11 +417,19 @@ pub fn bench_fold(
 /// physical count there).
 #[cfg(all(target_arch = "x86_64", windows))]
 fn physical_cores() -> Option<usize> {
+    // SAFETY: declaration matches the documented kernel32 ABI
+    // (LOGICAL_PROCESSOR_RELATIONSHIP as u32, byte buffer, in/out
+    // DWORD length, BOOL return).
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetLogicalProcessorInformationEx(rel: u32, buf: *mut u8, len: *mut u32) -> i32;
     }
     const RELATION_PROCESSOR_CORE: u32 = 0;
+    // SAFETY: the documented two-call protocol: the first call (null
+    // buffer, len 0) reports the required byte count, the second gets
+    // a buffer of exactly that many bytes, and record parsing stays
+    // inside `len` via the `off + 8 <= len` loop bound and the
+    // `size < 8` rejection.
     unsafe {
         let mut len: u32 = 0;
         GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, std::ptr::null_mut(), &mut len);
@@ -449,7 +473,9 @@ fn fold_parallel(
     if words == 0 {
         return;
     }
-    let cores = std::thread::available_parallelism().map_or(4, |n| n.get()).max(1);
+    let cores = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .max(1);
     // Hybrid x86: fold on PHYSICAL cores only, SMT siblings idle (par2j
     // runs 14 threads on the i7-1280P, never 20). Measured on that box:
     // HT added nothing to the old kernel and REGRESSED the affine2x one
@@ -561,7 +587,7 @@ fn fold_parallel(
         for _ in 0..workers {
             s.spawn(|| {
                 loop {
-                    let unit = units.lock().unwrap().pop();
+                    let unit = units.lock_ok().pop();
                     let Some(unit) = unit else { return };
                     // Each unit sees only its own bytes of every source;
                     // a source that ends before this range contributes
@@ -697,8 +723,7 @@ static FAST_PAR_ENABLED: std::sync::atomic::AtomicBool =
 /// whole-file verification (or panicked) and the fold retry ran. Once
 /// tripped, setting-driven dispatch prefers the fold for the rest of
 /// the process; the explicit env override still works.
-static FAST_PAR_TRIPPED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static FAST_PAR_TRIPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static NTT_DIVERGENCES: std::sync::Mutex<Vec<NttDivergence>> = std::sync::Mutex::new(Vec::new());
 
 /// Set the process-wide "fast par mode" flag (the daemon's setting).
@@ -739,7 +764,7 @@ pub struct NttDivergence {
 pub fn take_ntt_divergences() -> Vec<NttDivergence> {
     // Poison-proof: this log must never turn a caught panic elsewhere
     // into a new one (the push/take critical sections cannot panic).
-    std::mem::take(&mut NTT_DIVERGENCES.lock().unwrap_or_else(|p| p.into_inner()))
+    std::mem::take(&mut NTT_DIVERGENCES.lock_ok())
 }
 
 /// Per-attempt observation of the NTT dispatch, filled by the repair
@@ -772,17 +797,22 @@ fn record_ntt_divergence(probe: &NttProbe, panicked: bool) {
     };
     // Warning level on purpose: the fold and the NTT are bit-identical
     // by construction, so this is an NTT bug by definition, not noise.
-    eprintln!(
-        "[par2] WARNING: NTT syndrome path diverged ({}) - retrying with the fold path \
+    warn!(
+        target: "par2",
+        "WARNING: NTT syndrome path diverged ({}) - retrying with the fold path \
          (m={}, n_present={}, block_size={}, max_exp={}, context={})",
-        if panicked { "panic" } else { "repaired output failed verification" },
+        if panicked {
+            "panic"
+        } else {
+            "repaired output failed verification"
+        },
         d.m,
         d.n_present,
         d.block_size,
         d.max_exp,
         d.context,
     );
-    NTT_DIVERGENCES.lock().unwrap_or_else(|p| p.into_inner()).push(d);
+    NTT_DIVERGENCES.lock_ok().push(d);
 }
 
 /// Run a repair attempt, retrying once on the fold path when the NTT
@@ -961,8 +991,7 @@ fn resolve_syndrome_path(
             // What this prices is the NTT's INCREMENTAL footprint only;
             // see [`ntt_worker_arenas`] for what is deliberately left
             // out and why.
-            let corpus_budget =
-                budget.saturating_sub(ntt_worker_arenas(block_size, max_exp + 1));
+            let corpus_budget = budget.saturating_sub(ntt_worker_arenas(block_size, max_exp + 1));
             let gated = || {
                 ntt_gates_pass(
                     block_size,
@@ -1020,7 +1049,7 @@ impl Reconstructor {
         recovery: &[(u32, Vec<u8>)],
         path: SyndromePath,
     ) -> Result<Reconstructor, RepairError> {
-        if block_size == 0 || block_size % 2 != 0 {
+        if block_size == 0 || !block_size.is_multiple_of(2) {
             return Err(RepairError::Malformed(format!(
                 "block size {block_size} not a positive multiple of 2"
             )));
@@ -1032,14 +1061,8 @@ impl Reconstructor {
                 missing.len()
             )));
         }
-        // A dense missing x missing GF(2^16) inverse costs ~4*m^2 bytes (the
-        // matrix plus its inverse) and O(m^3) single-threaded field ops. The
-        // PAR2 spec slice cap (32768) is far too loose a bound for that: a
-        // crafted set declaring tens of thousands of missing blocks would pin
-        // multiple GB and run for hours (a repair-time DoS). Refuse a matrix
-        // larger than a real recovery set ever is; 8192 caps peak matrix memory
-        // near 256 MB. An extreme legitimate repair can still use par2cmdline.
-        const MAX_REPAIR_DIM: usize = 8192;
+        // See MAX_REPAIR_DIM's docs: a crafted set declaring tens of
+        // thousands of missing blocks is a repair-time DoS, not a repair.
         if missing.len() > MAX_REPAIR_DIM {
             return Err(RepairError::Malformed(format!(
                 "{} missing blocks exceeds the repair-matrix cap ({MAX_REPAIR_DIM})",
@@ -1058,8 +1081,7 @@ impl Reconstructor {
         // were themselves lost) make A a Vandermonde in the bases times
         // a diagonal, whose explicit inverse costs O(m²) instead of
         // Gauss-Jordan's O(m³).
-        let consecutive =
-            !recovery.is_empty() && recovery.windows(2).all(|w| w[1].0 == w[0].0 + 1);
+        let consecutive = !recovery.is_empty() && recovery.windows(2).all(|w| w[1].0 == w[0].0 + 1);
         let structured = if consecutive {
             let ks: Vec<u32> = missing.iter().map(|&j| base_logs[j]).collect();
             invert_vandermonde(&ks, recovery[0].0)
@@ -1083,8 +1105,9 @@ impl Reconstructor {
             }
         };
         if std::env::var_os("NZBFAST_REPAIR_TIMING").is_some() {
-            eprintln!(
-                "[repair-timing] matrix invert ({}x{0}, {label}): {:.2?}",
+            info!(
+                target: "repair-timing",
+                "matrix invert ({}x{0}, {label}): {:.2?}",
                 missing.len(),
                 t_inv.elapsed()
             );
@@ -1154,8 +1177,9 @@ impl Reconstructor {
                     if retained_bytes > budget {
                         // Budget blown: fold what we held and stream on.
                         if std::env::var_os("NZBFAST_REPAIR_TIMING").is_some() {
-                            eprintln!(
-                                "[repair-timing] ntt retention over budget \
+                            warn!(
+                                target: "repair-timing",
+                                "ntt retention over budget \
                                  ({retained_bytes} > {budget} bytes) - fold fallback"
                             );
                         }
@@ -1196,8 +1220,9 @@ impl Reconstructor {
                 let mb: usize = merged.iter().map(|b| b.arena.len()).sum();
                 bytes += mb;
                 if fold_trace {
-                    eprintln!(
-                        "[fold-trace] call {calls}: {} srcs, {:.1} MB, {:.2?}",
+                    warn!(
+                        target: "fold-trace",
+                        "call {calls}: {} srcs, {:.1} MB, {:.2?}",
                         merged.iter().map(|b| b.slices.len()).sum::<usize>(),
                         mb as f64 / 1e6,
                         t_f.elapsed()
@@ -1205,8 +1230,9 @@ impl Reconstructor {
                 }
             }
             if fold_trace {
-                eprintln!(
-                    "[fold-trace] total: {calls} calls, {:.1} MB, fold {:.2?}, recv-wait {:.2?}",
+                info!(
+                    target: "fold-trace",
+                    "total: {calls} calls, {:.1} MB, fold {:.2?}, recv-wait {:.2?}",
                     bytes as f64 / 1e6,
                     folded,
                     waited
@@ -1270,7 +1296,11 @@ impl Reconstructor {
             FeedBatch::with_capacity(self.batch_capacity),
         );
         // The worker outlives every sender; send can't fail.
-        let _ = self.tx.as_ref().expect("finish() not yet called").send(batch);
+        let _ = self
+            .tx
+            .as_ref()
+            .expect("finish() not yet called")
+            .send(batch);
     }
 
     /// A shareable feed handle for parallel producers (M2c.2). Each
@@ -1312,10 +1342,12 @@ impl Reconstructor {
             .expect("finish() called once")
             .join()
             .expect("syndrome fold worker panicked");
-        let mut report = SyndromeReport { ntt_used: false, n_present: 0 };
+        let mut report = SyndromeReport {
+            ntt_used: false,
+            n_present: 0,
+        };
         if !retained.is_empty() {
-            (report.ntt_used, report.n_present) =
-                self.ntt_syndromes(&mut syndromes, &retained);
+            (report.ntt_used, report.n_present) = self.ntt_syndromes(&mut syndromes, &retained);
         }
         // The retained corpus is dead the moment the syndromes are
         // computed, and it is the single biggest live allocation on the
@@ -1335,13 +1367,12 @@ impl Reconstructor {
             // row x column scheduler too - with one missing block this
             // solve is a single row, so rows alone would run it on one
             // thread.
-            let syn_bytes: Vec<&[u8]> =
-                syndromes.iter().map(|s| gf16::words_as_bytes(s)).collect();
+            let syn_bytes: Vec<&[u8]> = syndromes.iter().map(|s| gf16::words_as_bytes(s)).collect();
             let inverse = &self.inverse;
             let t_bs = std::time::Instant::now();
             fold_parallel(&mut out, &syn_bytes, &|j, i| inverse[j][i]);
             if std::env::var_os("NZBFAST_REPAIR_TIMING").is_some() {
-                eprintln!("[repair-timing] back-substitution: {:.2?}", t_bs.elapsed());
+                info!(target: "repair-timing", "back-substitution: {:.2?}", t_bs.elapsed());
             }
         }
         // Same reason as the retained corpus above: the syndrome rows
@@ -1366,11 +1397,7 @@ impl Reconstructor {
     /// out-of-range logs) falls back to folding the retained batches -
     /// bit-identical semantics either way, since the fold is pure XOR
     /// accumulation. Returns (ntt actually ran, present slices fed).
-    fn ntt_syndromes(
-        &self,
-        syndromes: &mut [Vec<u16>],
-        retained: &[FeedBatch],
-    ) -> (bool, usize) {
+    fn ntt_syndromes(&self, syndromes: &mut [Vec<u16>], retained: &[FeedBatch]) -> (bool, usize) {
         let timing = std::env::var_os("NZBFAST_REPAIR_TIMING").is_some();
         let t0 = std::time::Instant::now();
         let words = self.block_size / 2;
@@ -1437,7 +1464,7 @@ impl Reconstructor {
             Ok(p) => p,
             Err(why) => {
                 if timing {
-                    eprintln!("[repair-timing] ntt plan unbuildable ({why}) - fold fallback");
+                    info!(target: "repair-timing", "ntt plan unbuildable ({why}) - fold fallback");
                 }
                 fold_batches(&self.exponents, syndromes, retained);
                 return (false, 0);
@@ -1464,14 +1491,26 @@ impl Reconstructor {
             .unwrap_or(cores)
             .clamp(1, stripes.max(1));
         struct SynPtrs(Vec<*mut u16>, Vec<usize>);
+        // SAFETY: raw pointers into the syndrome rows; workers XOR
+        // into disjoint column ranges only (one stripe per atomic
+        // fetch_add claim, per the stripe/worker comment above), so
+        // sharing them across the scope's threads races nothing.
         unsafe impl Send for SynPtrs {}
+        // SAFETY: as above, writes are confined to the claiming
+        // worker's stripe columns.
         unsafe impl Sync for SynPtrs {}
         let syn = SynPtrs(
             syndromes.iter_mut().map(|s| s.as_mut_ptr()).collect(),
             self.exponents.iter().map(|&e| e as usize).collect(),
         );
         struct SrcTable(Vec<*const u8>);
+        // SAFETY: read-only pointers into the retained batch arenas
+        // and the finalized pad arena (stable per the second-pass
+        // comment above); neither is mutated while the scope's
+        // workers read them.
         unsafe impl Send for SrcTable {}
+        // SAFETY: as above, all access through these pointers is
+        // read-only.
         unsafe impl Sync for SrcTable {}
         let table = SrcTable(table);
         let next = std::sync::atomic::AtomicUsize::new(0);
@@ -1485,23 +1524,30 @@ impl Reconstructor {
                     let mut scratch = plan.new_scratch(w);
                     let mut out = vec![0u16; plan.needed * w];
                     loop {
-                        let c =
-                            next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let c = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if c >= stripes {
                             break;
                         }
                         let len = w.min(words - c * w);
+                        // SAFETY: every table entry is readable for
+                        // block_size bytes (full slices point into the
+                        // batch arenas, tails into the zero-padded
+                        // side arena, per the slice-table comment
+                        // above), and c*w*2 + 2*len <= block_size
+                        // because len = w.min(words - c*w), satisfying
+                        // transform's src_of contract.
                         let src_of = |id: crate::par2ntt::SrcId| unsafe {
                             table.0[id as usize].add(c * w * 2)
                         };
                         plan.transform(&src_of, len, &mut scratch, &mut out);
                         for (j, &e) in syn.1.iter().enumerate() {
-                            let row = unsafe {
-                                std::slice::from_raw_parts_mut(
-                                    syn.0[j].add(c * w),
-                                    len,
-                                )
-                            };
+                            // SAFETY: syndrome row j is words long and
+                            // c*w + len <= words, so the range is in
+                            // bounds; stripe c belongs to this worker
+                            // alone (claimed via the atomic queue), so
+                            // no other thread touches these columns.
+                            let row =
+                                unsafe { std::slice::from_raw_parts_mut(syn.0[j].add(c * w), len) };
                             for (d, s) in row.iter_mut().zip(&out[e * len..(e + 1) * len]) {
                                 *d ^= *s;
                             }
@@ -1511,8 +1557,9 @@ impl Reconstructor {
             }
         });
         if timing {
-            eprintln!(
-                "[repair-timing] ntt syndromes (m={}, needed={}, n={}, W={w}, threads={threads}): {:.2?}",
+            info!(
+                target: "repair-timing",
+                "ntt syndromes (m={}, needed={}, n={}, W={w}, threads={threads}): {:.2?}",
                 self.exponents.len(),
                 plan.needed,
                 present.len(),
@@ -1761,12 +1808,12 @@ fn invert_parallel(mut a: Vec<Vec<u16>>, threads: usize) -> Result<Vec<Vec<u16>>
                                 *x = gf16::mul(*x, f);
                             }
                         }
-                        let mut g = pivot_rows.write().unwrap();
+                        let mut g = pivot_rows.write_ok();
                         g.0.copy_from_slice(ar);
                         g.1.copy_from_slice(ir);
                     }
                     barrier.wait();
-                    let g = pivot_rows.read().unwrap();
+                    let g = pivot_rows.read_ok();
                     for (r, ar, ir) in shard.iter_mut() {
                         if *r == p {
                             continue;
@@ -1902,7 +1949,14 @@ pub fn repair_mapped(
     io: &dyn VolumeIo,
     full_verify: bool,
 ) -> Result<usize, RepairError> {
-    repair_mapped_with_path(files, block_size, recovery, io, full_verify, SyndromePath::Auto)
+    repair_mapped_with_path(
+        files,
+        block_size,
+        recovery,
+        io,
+        full_verify,
+        SyndromePath::Auto,
+    )
 }
 
 /// [`repair_mapped`] with an explicit initial syndrome path (test hook
@@ -1935,7 +1989,7 @@ fn repair_mapped_inner(
     path: SyndromePath,
     probe: &mut NttProbe,
 ) -> Result<usize, RepairError> {
-    if block_size == 0 || block_size % 2 != 0 {
+    if block_size == 0 || !block_size.is_multiple_of(2) {
         return Err(RepairError::Malformed(format!(
             "block size {block_size} not a positive multiple of 2"
         )));
@@ -1993,8 +2047,7 @@ fn repair_mapped_inner(
     let mut exps: Vec<u32> = by_exp.keys().copied().collect();
     exps.sort_unstable();
     exps.truncate(missing.len());
-    let chosen: Vec<(u32, Vec<u8>)> =
-        exps.iter().map(|e| (*e, by_exp[e].clone())).collect();
+    let chosen: Vec<(u32, Vec<u8>)> = exps.iter().map(|e| (*e, by_exp[e].clone())).collect();
 
     // Syndrome pass: stream every present slice once via io.read.
     // M2c.2: the reads were the measured hot spot (4.0 s of a 4.96 s
@@ -2009,68 +2062,72 @@ fn repair_mapped_inner(
     probe.m = missing.len();
     probe.block_size = block_size;
     probe.max_exp = chosen.last().map_or(0, |&(e, _)| e);
-    probe.context = files.first().map(|(f, _)| f.name.clone()).unwrap_or_default();
+    probe.context = files
+        .first()
+        .map(|(f, _)| f.name.clone())
+        .unwrap_or_default();
     let work: Vec<(usize, usize, u64, usize)> = files
         .iter()
         .enumerate()
         .flat_map(|(fi, (f, present))| {
             let base = first_slice[fi];
-            present.iter().enumerate().filter(|&(_, &p)| p).map(move |(i, _)| {
-                let off = i as u64 * bs;
-                (base + i, fi, off, (f.length - off).min(bs) as usize)
-            })
+            present
+                .iter()
+                .enumerate()
+                .filter(|&(_, &p)| p)
+                .map(move |(i, _)| {
+                    let off = i as u64 * bs;
+                    (base + i, fi, off, (f.length - off).min(bs) as usize)
+                })
         })
         .collect();
-    if work.is_empty() {
-        // Every block of every file is missing: there is nothing to
-        // stream into the syndrome pass, and `work.chunks(0)` below
-        // would panic. The all-missing rebuild belongs to the disk
-        // path - decline so the caller falls back gracefully.
-        return Err(RepairError::Malformed(
-            "no present blocks to stream - declining mapped repair".into(),
-        ));
-    }
-    let readers = std::thread::available_parallelism()
-        .map_or(4, |n| n.get())
-        .min(8)
-        .min(work.len())
-        .max(1);
-    // Split the shared batch budget across handles so total in-flight
-    // memory matches the old single-feeder design.
-    let per_reader_batch = (BATCH_BYTES / readers).max(1 << 20);
-    let chunk = work.len().div_ceil(readers);
-    let mut read_results: Vec<Result<(), RepairError>> =
-        (0..readers).map(|_| Ok(())).collect();
-    std::thread::scope(|s| {
-        for (wchunk, res) in work.chunks(chunk).zip(read_results.iter_mut()) {
-            let mut feeder = rec.feeder(per_reader_batch);
-            s.spawn(move || {
-                *res = (|| {
-                    // One reusable read buffer per reader: slices are
-                    // packed into the feeder's arena, so per-slice
-                    // allocations are gone (see FeedBatch).
-                    let mut buf = vec![0u8; block_size];
-                    for &(g, fi, off, take) in wchunk {
-                        io.read(fi, off, &mut buf[..take])?;
-                        feeder.feed(g, &buf[..take]);
-                    }
-                    Ok(())
-                })();
-                // feeder drops here → tail batch flushes.
-            });
+    // A par-only / whole-set-missing rebuild has NO present slices to
+    // stream: every input's contribution to the syndromes is zero, so
+    // the recovery slices already ARE the syndromes and the solve runs
+    // on them directly (parity as a source). Skip the reader fan-out -
+    // `work.chunks(0)` would panic on the empty list.
+    if !work.is_empty() {
+        let readers = std::thread::available_parallelism()
+            .map_or(4, |n| n.get())
+            .min(8)
+            .min(work.len())
+            .max(1);
+        // Split the shared batch budget across handles so total in-flight
+        // memory matches the old single-feeder design.
+        let per_reader_batch = (BATCH_BYTES / readers).max(1 << 20);
+        let chunk = work.len().div_ceil(readers);
+        let mut read_results: Vec<Result<(), RepairError>> = (0..readers).map(|_| Ok(())).collect();
+        std::thread::scope(|s| {
+            for (wchunk, res) in work.chunks(chunk).zip(read_results.iter_mut()) {
+                let mut feeder = rec.feeder(per_reader_batch);
+                s.spawn(move || {
+                    *res = (|| {
+                        // One reusable read buffer per reader: slices are
+                        // packed into the feeder's arena, so per-slice
+                        // allocations are gone (see FeedBatch).
+                        let mut buf = vec![0u8; block_size];
+                        for &(g, fi, off, take) in wchunk {
+                            io.read(fi, off, &mut buf[..take])?;
+                            feeder.feed(g, &buf[..take]);
+                        }
+                        Ok(())
+                    })();
+                    // feeder drops here → tail batch flushes.
+                });
+            }
+        });
+        for r in read_results {
+            r?;
         }
-    });
-    for r in read_results {
-        r?;
     }
     if timing {
-        eprintln!("[repair-timing] feed reads queued in {:.2?}", t0.elapsed());
+        info!(target: "repair-timing", "feed reads queued in {:.2?}", t0.elapsed());
     }
     let (rebuilt, syn_report) = rec.finish_reported();
     probe.used = syn_report.ntt_used;
     probe.n_present = syn_report.n_present;
     if timing {
-        eprintln!("[repair-timing] fold+solve done at {:.2?}", t0.elapsed());
+        info!(target: "repair-timing", "fold+solve done at {:.2?}", t0.elapsed());
     }
 
     // Write rebuilt blocks back, tails trimmed.
@@ -2136,16 +2193,12 @@ fn repair_mapped_inner(
                                     filled += seg;
                                     p += seg;
                                     if filled == block_size {
-                                        let done = std::mem::replace(
-                                            &mut crc,
-                                            crc32fast::Hasher::new(),
-                                        );
+                                        let done =
+                                            std::mem::replace(&mut crc, crc32fast::Hasher::new());
                                         if f.blocks.get(bidx).map(|b| b.crc32)
                                             != Some(done.finalize())
                                         {
-                                            return Err(RepairError::VerifyFailed(
-                                                f.name.clone(),
-                                            ));
+                                            return Err(RepairError::VerifyFailed(f.name.clone()));
                                         }
                                         filled = 0;
                                         bidx += 1;
@@ -2181,7 +2234,7 @@ fn repair_mapped_inner(
         r.expect("verify worker filled every slot")?;
     }
     if timing {
-        eprintln!("[repair-timing] patch+verify done at {:.2?}", t0.elapsed());
+        info!(target: "repair-timing", "patch+verify done at {:.2?}", t0.elapsed());
     }
     Ok(missing.len())
 }
@@ -2239,7 +2292,11 @@ impl RollingCrc {
         for (i, e) in table.iter_mut().enumerate() {
             let mut c = i as u32;
             for _ in 0..8 {
-                c = if c & 1 != 0 { (c >> 1) ^ 0xEDB8_8320 } else { c >> 1 };
+                c = if c & 1 != 0 {
+                    (c >> 1) ^ 0xEDB8_8320
+                } else {
+                    c >> 1
+                };
             }
             *e = c;
         }
@@ -2295,6 +2352,36 @@ fn path_identity_key(fold: bool, p: &Path) -> PathBuf {
     } else {
         p.to_path_buf()
     }
+}
+
+/// [`path_identity_key`] for a declared file NAME, sanitized the way the
+/// repair lands it. Same folding rule and the same reason.
+fn name_identity_key(fold: bool, name: &str) -> String {
+    let s = crate::disk::sanitize_filename(name);
+    if fold { s.to_lowercase() } else { s }
+}
+
+/// What the OTHER recovery sets sharing this directory declare.
+///
+/// A repair runs one set at a time - packets carrying any other set id
+/// are dropped before a target is ever built - so on its own a set
+/// cannot see that a neighbour claims the same destination, nor that a
+/// file it is about to write off as spare bytes is a neighbour's
+/// payload. Both cost data, so the multi-set entry points read every
+/// packet file once up front and hand the answer down. `repair_dir`,
+/// which is single-set by definition, passes the default and behaves
+/// exactly as it always has.
+#[derive(Default, Clone)]
+struct DirContext {
+    /// Destination names that more than one DISTINCT file descriptor
+    /// claims across the whole directory. Targets with these names are
+    /// disambiguated in EVERY set, so no two sets can land on one path.
+    /// Two sets describing the SAME file (identical descriptor) are not
+    /// contested - sharing that destination is correct.
+    contested: HashSet<String>,
+    /// Every name any set in the directory declares. Payload, whoever
+    /// owns it, and so never a spent adoption donor to sweep.
+    declared: HashSet<String>,
 }
 
 /// Files eligible as adoption sources: every regular non-.par2 file in
@@ -2383,8 +2470,7 @@ fn adopt_blocks(
     let mut head_cache: Vec<Option<[u8; 16]>> = vec![None; cands.len()];
     let mut md5_cache: Vec<Option<[u8; 16]>> = vec![None; cands.len()];
     for t in targets {
-        let unidentified =
-            !(t.exists && (t.intact || t.present.iter().any(|&p| p)));
+        let unidentified = !(t.exists && (t.intact || t.present.iter().any(|&p| p)));
         if t.n_slices == 0 || t.file.length == 0 || !unidentified {
             continue;
         }
@@ -2472,7 +2558,16 @@ fn sliding_scan(
         }
         let (p, len) = &cands[ci];
         scan_candidate(
-            p, *len, bs, &roll, &filter, &by_crc, &md5s, ci, adopted, &mut remaining,
+            p,
+            *len,
+            bs,
+            &roll,
+            &filter,
+            &by_crc,
+            &md5s,
+            ci,
+            adopted,
+            &mut remaining,
         )?;
     }
     Ok(())
@@ -2602,6 +2697,18 @@ pub struct RepairReport {
     pub files_patched: Vec<String>,
     /// Subset of `files_patched` that were missing entirely.
     pub files_created: Vec<String>,
+    /// Full paths of the extra files this repair CONSUMED as adoption
+    /// sources - obfuscated copies whose bytes now also exist under the
+    /// name the PAR2 set gives them. The engine never deletes them (it
+    /// does not own the directory), so a caller that DOES own it is told
+    /// which files are now redundant; on an obfuscated post this is the
+    /// difference between a finished folder and two copies of it.
+    ///
+    /// Recovery-set targets are excluded: a candidate can share a path
+    /// with a target (exactly what `used_sources` forces through the
+    /// temp+rename path below), and there the "source" IS the restored
+    /// payload. Deleting it would undo the repair.
+    pub consumed_sources: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -2644,8 +2751,7 @@ fn collect_packet_files(dir: &Path) -> Result<(Vec<PathBuf>, HashSet<PathBuf>), 
             continue;
         }
         let p = e.path();
-        if p
-            .extension()
+        if p.extension()
             .is_some_and(|x| x.eq_ignore_ascii_case("par2"))
         {
             packet_files.push(p);
@@ -2667,6 +2773,25 @@ fn collect_packet_files(dir: &Path) -> Result<(Vec<PathBuf>, HashSet<PathBuf>), 
     Ok((packet_files, sniffed))
 }
 
+/// The PAR2 packet files in `dir` that only a content sniff could find:
+/// recovery volumes an obfuscated post shipped under an extensionless
+/// hash name.
+///
+/// Deliberately NOT the whole packet set. Files named `*.par2` are
+/// already swept by extension wherever that matters; these are the ones
+/// no extension rule can ever match, which is why a finished obfuscated
+/// download kept its spent recovery set forever (issue #9).
+///
+/// Directory-wide, so it says nothing about which recovery SET a volume
+/// served. A caller holding more than one set must not act on this until
+/// every set it cares about has verified.
+pub fn sniffed_packet_files(dir: &Path) -> Result<Vec<PathBuf>, RepairError> {
+    let (_, sniffed) = collect_packet_files(dir)?;
+    let mut out: Vec<PathBuf> = sniffed.into_iter().collect();
+    out.sort();
+    Ok(out)
+}
+
 /// Repair the PAR2 recovery set found in `dir`: parse every `*.par2`
 /// file (packets only - data files are located by their FileDesc names),
 /// verify each recovery-set file block-by-block from disk, reconstruct
@@ -2676,7 +2801,35 @@ fn collect_packet_files(dir: &Path) -> Result<(Vec<PathBuf>, HashSet<PathBuf>), 
 /// When the dir carries packets from more than one recovery set, the
 /// first set seen (sorted packet-file order) is the one repaired.
 pub fn repair_dir(dir: &Path) -> Result<RepairStatus, RepairError> {
-    repair_dir_set(dir, None)
+    repair_dir_set(dir, None, &DirContext::default())
+}
+
+/// Every file name the PAR2 packets in `dir` describe, across EVERY
+/// recovery set present (obfuscated volumes included - the same
+/// magic-sniff `repair_dir` uses finds them).
+///
+/// A repair verdict is a verdict about one recovery set and nothing
+/// else, so a caller that wants to turn "the set is fine" into "the
+/// download is fine" has to know which files the set was ever speaking
+/// for. That is this list. Names come back exactly as the FileDesc
+/// packets spell them; compare on-disk names through
+/// [`crate::disk::sanitize_filename`], as the repair itself does.
+pub fn covered_names(dir: &Path) -> Result<Vec<String>, RepairError> {
+    let (packet_files, _) = collect_packet_files(dir)?;
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for path in &packet_files {
+        let bytes = std::fs::read(path)?;
+        par2::scan_packets(&bytes, |pkt| {
+            if pkt.ptype == *par2::TYPE_FILEDESC
+                && let Some((_, d)) = par2::parse_filedesc(pkt.body)
+                && seen.insert(d.name.clone())
+            {
+                out.push(d.name);
+            }
+        });
+    }
+    Ok(out)
 }
 
 /// Repair every recovery set in `dir` whose data files are actually
@@ -2689,15 +2842,60 @@ pub fn repair_dir(dir: &Path) -> Result<RepairStatus, RepairError> {
 /// disk. Sets are repaired in first-seen (sorted packet-file) order;
 /// per-set failures don't stop later sets. `Ok(vec![])` = nothing
 /// relevant here at all.
-pub fn repair_present_sets(
-    dir: &Path,
-) -> Result<Vec<Result<RepairStatus, RepairError>>, RepairError> {
+pub fn repair_present_sets(dir: &Path) -> Result<Vec<SetOutcome>, RepairError> {
+    repair_sets_inner(dir, false)
+}
+
+/// [`repair_present_sets`], plus a content fallback for the wholly
+/// renamed obfuscated post: when not a single FileDesc name is on disk,
+/// the sets are attempted anyway and the verdicts speak (issue #9's
+/// single-file shape, where not even a companion .nfo keeps its name).
+///
+/// A separate entry point because the fallback is WRONG for the other
+/// caller. The nested disk post-pass leans on the name gate to skip an
+/// outer index whose volumes never touched disk - attempted anyway,
+/// `repair_dir_set` would RECREATE those volumes on disk from recovery
+/// slices and adoption, materializing files the one-pass pipeline just
+/// proved it never needed to write. Only the no-set obfuscated arm,
+/// which owns a directory where everything already landed, wants this.
+pub fn repair_present_or_renamed_sets(dir: &Path) -> Result<Vec<SetOutcome>, RepairError> {
+    repair_sets_inner(dir, true)
+}
+
+/// One recovery set's verdict, with the file names that set declares.
+///
+/// The names travel WITH the verdict because a caller turning "the sets
+/// are fine" into "the download is fine" may only count coverage from a
+/// set that actually reported one. A set with no data file on disk is
+/// skipped, and folding its declared names into a directory-wide
+/// coverage union is how a wholly missing file - the everyday
+/// one-file-takedown shape - reached Completed with its journal
+/// deleted. [`covered_names`] is still the right answer for "whose
+/// payload is this file", which is a question about the packets, not
+/// about any repair.
+#[derive(Debug)]
+pub struct SetOutcome {
+    /// Every file name this set's FileDesc packets declare.
+    pub names: Vec<String>,
+    /// What repairing it produced. `Ok` means every one of `names` is
+    /// verified on disk; anything else means the set speaks for none of
+    /// them.
+    pub status: Result<RepairStatus, RepairError>,
+}
+
+fn repair_sets_inner(dir: &Path, renamed_fallback: bool) -> Result<Vec<SetOutcome>, RepairError> {
     let (packet_files, _) = collect_packet_files(dir)?;
     if packet_files.is_empty() {
         return Ok(Vec::new());
     }
+    let fold = crate::disk::case_insensitive_dir(dir);
     let mut order: Vec<[u8; 16]> = Vec::new();
     let mut names: HashMap<[u8; 16], Vec<String>> = HashMap::new();
+    // Which descriptors claim each destination name, directory-wide.
+    // A name claimed by two DIFFERENT descriptors is one destination
+    // holding two different files; a name claimed by one descriptor in
+    // two sets is the same file described twice, which is fine.
+    let mut claims: HashMap<String, HashSet<([u8; 16], u64, [u8; 16])>> = HashMap::new();
     for path in &packet_files {
         let bytes = std::fs::read(path)?;
         par2::scan_packets(&bytes, |pkt| {
@@ -2705,20 +2903,66 @@ pub fn repair_present_sets(
                 order.push(pkt.set_id);
                 Vec::new()
             });
-            if pkt.ptype == *par2::TYPE_FILEDESC {
-                if let Some((_, d)) = par2::parse_filedesc(pkt.body) {
-                    names.get_mut(&pkt.set_id).unwrap().push(d.name);
-                }
+            if pkt.ptype == *par2::TYPE_FILEDESC
+                && let Some((fid, d)) = par2::parse_filedesc(pkt.body)
+            {
+                claims
+                    .entry(name_identity_key(fold, &d.name))
+                    .or_default()
+                    .insert((fid, d.length, d.md5));
+                names.get_mut(&pkt.set_id).unwrap().push(d.name);
             }
         });
     }
+    let ctx = DirContext {
+        contested: claims
+            .iter()
+            .filter(|(_, who)| who.len() > 1)
+            .map(|(k, _)| k.clone())
+            .collect(),
+        declared: claims.into_keys().collect(),
+    };
     let mut out = Vec::new();
-    for id in order {
-        let present = names[&id]
+    for id in &order {
+        let present = names[id]
             .iter()
             .any(|n| dir.join(crate::disk::sanitize_filename(n)).is_file());
         if present {
-            out.push(repair_dir_set(dir, Some(id)));
+            out.push(SetOutcome {
+                names: names[id].clone(),
+                status: repair_dir_set(dir, Some(*id), &ctx),
+            });
+        }
+    }
+    // No set matched by NAME - which on a wholly renamed obfuscated post
+    // is the expected state, not proof of absence: every data file is on
+    // disk under a hash, and only the adoption scan's content match can
+    // tie one to a FileDesc. Skipping here failed exactly those posts.
+    //
+    // So when the caller asked for the renamed fallback and the name test
+    // found NOTHING, attempt the sets anyway and let the verdicts speak -
+    // but only if the directory holds at least one non-packet file that
+    // could serve as an adoption source; packets alone can only rebuild
+    // what `files_created` recreates from slices, and a caller wanting
+    // that shape drives `repair_dir` directly.
+    //
+    // Deliberately all-or-nothing: when even ONE set matched by name, an
+    // unmatched set stays skipped exactly as before. The fallback can
+    // therefore only run where the name gate returned an empty Vec - a
+    // job that was already failing - so a foreign junk set going
+    // Unrepairable here fails nothing that used to succeed.
+    if renamed_fallback && out.is_empty() {
+        let packet_set: HashSet<&PathBuf> = packet_files.iter().collect();
+        let has_candidates = std::fs::read_dir(dir)?
+            .flatten()
+            .any(|e| e.file_type().is_ok_and(|t| t.is_file()) && !packet_set.contains(&e.path()));
+        if has_candidates {
+            for id in &order {
+                out.push(SetOutcome {
+                    names: names[id].clone(),
+                    status: repair_dir_set(dir, Some(*id), &ctx),
+                });
+            }
         }
     }
     Ok(out)
@@ -2728,7 +2972,11 @@ pub fn repair_present_sets(
 /// `want` pins the recovery set to operate on (packets from other sets
 /// are ignored, exactly as foreign-set packets always were); `None`
 /// keeps the historical first-seen binding.
-fn repair_dir_set(dir: &Path, want: Option<[u8; 16]>) -> Result<RepairStatus, RepairError> {
+fn repair_dir_set(
+    dir: &Path,
+    want: Option<[u8; 16]>,
+    ctx: &DirContext,
+) -> Result<RepairStatus, RepairError> {
     // The NTT verify-failure retry is safe to run as a full re-attempt
     // here: the rerun re-verifies every target from disk, so any block
     // the failed attempt patched in place with wrong bytes fails its
@@ -2736,13 +2984,14 @@ fn repair_dir_set(dir: &Path, want: Option<[u8; 16]>) -> Result<RepairStatus, Re
     // fold; temp-file rebuilds were already cleaned up before the
     // VerifyFailed returned.
     run_with_ntt_fallback(SyndromePath::Auto, |path, probe| {
-        repair_dir_set_inner(dir, want, path, probe)
+        repair_dir_set_inner(dir, want, ctx, path, probe)
     })
 }
 
 fn repair_dir_set_inner(
     dir: &Path,
     want: Option<[u8; 16]>,
+    ctx: &DirContext,
     path: SyndromePath,
     probe: &mut NttProbe,
 ) -> Result<RepairStatus, RepairError> {
@@ -2753,8 +3002,9 @@ fn repair_dir_set_inner(
         move |label: &str| {
             if timing {
                 let now = std::time::Instant::now();
-                eprintln!(
-                    "[repair-timing] {label}: +{:.2?} (total {:.2?})",
+                info!(
+                    target: "repair-timing",
+                    "{label}: +{:.2?} (total {:.2?})",
                     now - last,
                     now - t0
                 );
@@ -2810,11 +3060,9 @@ fn repair_dir_set_inner(
                         ifscs.entry(fid).or_insert(blocks);
                     }
                 }
-                t if t == par2::TYPE_RECVSLIC => {
-                    if pkt.body.len() >= 4 {
-                        let e = u32::from_le_bytes(pkt.body[0..4].try_into().unwrap());
-                        rec_locs.push((pfi, pkt.body_offset + 4, e, pkt.body.len() - 4));
-                    }
+                t if t == par2::TYPE_RECVSLIC && pkt.body.len() >= 4 => {
+                    let e = u32::from_le_bytes(pkt.body[0..4].try_into().unwrap());
+                    rec_locs.push((pfi, pkt.body_offset + 4, e, pkt.body.len() - 4));
                 }
                 _ => {}
             }
@@ -2914,13 +3162,31 @@ fn repair_dir_set_inner(
         // land over the first - the very loss this block exists to prevent.
         let mut claimed: HashSet<PathBuf> = HashSet::new();
         for t in &mut targets {
-            if claimed.insert(path_identity_key(fold, &t.path)) {
+            // A name some OTHER set in this directory claims for
+            // DIFFERENT content is disambiguated on its first appearance
+            // here, not just on a repeat. The loop below only ever sees
+            // one set - `want` dropped every foreign packet long before
+            // this - so two sets each declaring a file that sanitizes to
+            // `a_b.bin` both chose that path, the second renamed its
+            // verified rebuild over the first's verified bytes, and both
+            // verdicts still came back green. Keyed by file_id, so the
+            // two sets independently agree on who gets which path and a
+            // retried attempt picks the same one again.
+            let contested = ctx
+                .contested
+                .contains(&name_identity_key(fold, &t.file.name));
+            if !contested && claimed.insert(path_identity_key(fold, &t.path)) {
                 continue;
             }
             let mut suffix = 0u32;
             loop {
-                let fid: String =
-                    t.file.file_id.iter().take(6).map(|b| format!("{b:02x}")).collect();
+                let fid: String = t
+                    .file
+                    .file_id
+                    .iter()
+                    .take(6)
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
                 let tag = if suffix == 0 {
                     format!(".dup-{fid}")
                 } else {
@@ -3024,9 +3290,9 @@ fn repair_dir_set_inner(
     // shifted - nothing on disk verifies) or the damage exceeds the
     // recovery slices on disk. The scan reads whole candidate files, so
     // it must never run on the everyday a-few-blocks-bad repair.
-    let any_unidentified = targets.iter().any(|t| {
-        t.n_slices > 0 && !(t.exists && (t.intact || t.present.iter().any(|&p| p)))
-    });
+    let any_unidentified = targets
+        .iter()
+        .any(|t| t.n_slices > 0 && !(t.exists && (t.intact || t.present.iter().any(|&p| p))));
     let (mut cands, mut adopted) =
         if !missing.is_empty() && (any_unidentified || missing.len() > by_exp.len()) {
             adopt_blocks(dir, &targets, &missing, bs, &sniffed)?
@@ -3130,10 +3396,19 @@ fn repair_dir_set_inner(
             .enumerate()
             .filter(|(_, t)| t.exists)
             .flat_map(|(ti, t)| {
-                t.present.iter().enumerate().filter(|&(_, &p)| p).map(move |(i, _)| {
-                    let off = i as u64 * block_size;
-                    (t.first_slice + i, ti, off, (t.file.length - off).min(block_size) as usize)
-                })
+                t.present
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &p)| p)
+                    .map(move |(i, _)| {
+                        let off = i as u64 * block_size;
+                        (
+                            t.first_slice + i,
+                            ti,
+                            off,
+                            (t.file.length - off).min(block_size) as usize,
+                        )
+                    })
             })
             .collect();
         if !work.is_empty() {
@@ -3183,7 +3458,13 @@ fn repair_dir_set_inner(
             list.sort_unstable_by_key(|&(_, off)| off);
             for (g, off) in list {
                 let take = bs.min(cands[ci].1.saturating_sub(off) as usize);
-                let data = cand_reader.read(AdoptSrc { cand: ci, offset: off }, take)?;
+                let data = cand_reader.read(
+                    AdoptSrc {
+                        cand: ci,
+                        offset: off,
+                    },
+                    take,
+                )?;
                 rec.feed(g, &data);
             }
         }
@@ -3210,12 +3491,18 @@ fn repair_dir_set_inner(
         .into_iter()
         .collect();
     adopted_from.sort();
+    // Which candidates donated anything. Turning these into whole paths
+    // the CALLER may delete needs a proof about every byte of the file,
+    // not just the window that matched, so it waits until after the
+    // final verify (see `spent_donors` below).
+    let donors: HashSet<usize> = adopted.values().map(|s| s.cand).collect();
     let mut report = RepairReport {
         blocks_rebuilt,
         blocks_adopted: adopted.len(),
         adopted_from,
         files_patched: Vec::new(),
         files_created: Vec::new(),
+        consumed_sources: Vec::new(),
     };
     let rebuilt_of: HashMap<usize, usize> =
         missing.iter().enumerate().map(|(mi, &g)| (g, mi)).collect();
@@ -3258,8 +3545,8 @@ fn repair_dir_set_inner(
         // In temp mode verified blocks are copied over from the old
         // file; in place they're already where they belong.
         let write_blocks = |f: &File,
-                           cand_reader: &mut CandReader,
-                           copy_present: bool|
+                            cand_reader: &mut CandReader,
+                            copy_present: bool|
          -> Result<(), RepairError> {
             f.set_len(t.file.length)?;
             let src = if copy_present && t.exists && t.present.iter().any(|&p| p) {
@@ -3315,8 +3602,9 @@ fn repair_dir_set_inner(
                 .unwrap_or_else(|| "file".into());
             let mut made = None;
             for n in 0..1024 {
-                let candidate =
-                    t.path.with_file_name(format!(".{base}.nzbfast-repair.{n}.tmp"));
+                let candidate = t
+                    .path
+                    .with_file_name(format!(".{base}.nzbfast-repair.{n}.tmp"));
                 match std::fs::OpenOptions::new()
                     .write(true)
                     .create_new(true)
@@ -3386,6 +3674,63 @@ fn repair_dir_set_inner(
         }
     }
     mark("final verify");
+    // --- which donors are provably spent ---
+    //
+    // One adopted block authenticates ONE window of the donor - a legal
+    // PAR2 block can be four bytes - and says nothing whatever about the
+    // donor's other bytes. Handing the caller every path that donated
+    // anything, which it deletes outright, therefore destroyed complete
+    // files over a shared block: zero padding, a common container
+    // header, or a neighbouring recovery set's payload (foreign targets
+    // are unidentified here, so they are ordinary adoption candidates).
+    //
+    // The case this cleanup exists for - issue #9, the obfuscated post -
+    // is the one where the hash-named donor IS the payload byte for
+    // byte, and the repair has just landed those same bytes under the
+    // FileDesc name. So require exactly that: the donor must match a
+    // target of this set in declared length AND in declared whole-file
+    // MD5. That is a proof about every byte, which is what deletion
+    // needs, and it is cheap to reach because the length test rejects
+    // almost everything before a hash is computed.
+    //
+    // A name any set in the directory declares is somebody's payload and
+    // is never swept, whatever it hashes to.
+    let declared_names: HashSet<String> = ctx
+        .declared
+        .iter()
+        .cloned()
+        .chain(
+            targets
+                .iter()
+                .map(|t| name_identity_key(fold, &t.file.name)),
+        )
+        .collect();
+    let target_keys: HashSet<PathBuf> = targets
+        .iter()
+        .map(|t| path_identity_key(fold, &t.path))
+        .collect();
+    let mut spent_donors: Vec<PathBuf> = Vec::new();
+    for ci in donors {
+        let (p, len) = &cands[ci];
+        if target_keys.contains(&path_identity_key(fold, p))
+            || p.file_name()
+                .map(|n| name_identity_key(fold, &n.to_string_lossy()))
+                .is_some_and(|n| declared_names.contains(&n))
+        {
+            continue;
+        }
+        let want: Vec<[u8; 16]> = targets
+            .iter()
+            .filter(|t| t.file.length == *len)
+            .map(|t| t.file.md5)
+            .collect();
+        // A hash that cannot be read decides nothing: keep the file.
+        if !want.is_empty() && md5_of_file(p, None).is_ok_and(|h| want.contains(&h)) {
+            spent_donors.push(p.clone());
+        }
+    }
+    spent_donors.sort();
+    report.consumed_sources = spent_donors;
     // Every adopted read and every verify is done - land the rebuilds.
     let temp_set: HashSet<usize> = renames.iter().map(|&(_, ti)| ti).collect();
     for &ti in &damaged {
@@ -3489,28 +3834,25 @@ fn verify_pass1(path: &Path, file: &Par2File, bs: usize) -> Result<Pass1Out, Rep
         }
         pos += take as u64;
     }
-    if bfill > 0 {
-        if let Some(ok) = blocks_ok.as_mut() {
-            // Tail block, zero-padded to the block size per spec - but
-            // only when the declared bytes were all on disk (a tail cut
-            // short by a truncated file is damage by definition).
-            let off = bidx as u64 * bs as u64;
-            let expect = (file.length - off).min(bs as u64);
-            if limit - off >= expect {
-                // Extended through the padding in O(log n) rather than by
-                // hashing a zero buffer: `bs` is wire-supplied up to 256 MiB,
-                // and a set of many one-byte targets made every parallel
-                // worker allocate one of those at its tail block - a
-                // metadata-driven `targets x block_size` memory spike on a
-                // file that could be a few KB. The read buffer above is
-                // already clamped for exactly this reason.
-                let padded = crate::yenc_simd::crc32_zeros(
-                    crc.clone().finalize(),
-                    (bs - bfill) as u64,
-                );
-                if let Some(check) = file.blocks.get(bidx) {
-                    ok[bidx] = padded == check.crc32;
-                }
+    if bfill > 0
+        && let Some(ok) = blocks_ok.as_mut()
+    {
+        // Tail block, zero-padded to the block size per spec - but
+        // only when the declared bytes were all on disk (a tail cut
+        // short by a truncated file is damage by definition).
+        let off = bidx as u64 * bs as u64;
+        let expect = (file.length - off).min(bs as u64);
+        if limit - off >= expect {
+            // Extended through the padding in O(log n) rather than by
+            // hashing a zero buffer: `bs` is wire-supplied up to 256 MiB,
+            // and a set of many one-byte targets made every parallel
+            // worker allocate one of those at its tail block - a
+            // metadata-driven `targets x block_size` memory spike on a
+            // file that could be a few KB. The read buffer above is
+            // already clamped for exactly this reason.
+            let padded = crate::yenc_simd::crc32_zeros(crc.clone().finalize(), (bs - bfill) as u64);
+            if let Some(check) = file.blocks.get(bidx) {
+                ok[bidx] = padded == check.crc32;
             }
         }
     }
@@ -3545,7 +3887,7 @@ fn verify_all_targets(targets: &mut [Target], bs: usize) -> Result<(), RepairErr
                 s.spawn(|| {
                     let mut out: Vec<(usize, Pass1Out)> = Vec::new();
                     loop {
-                        let Some(ti) = queue.lock().unwrap().pop() else {
+                        let Some(ti) = queue.lock_ok().pop() else {
                             return Ok(out);
                         };
                         let t = &targets_ref[ti];
@@ -3682,9 +4024,9 @@ mod tests {
                 .map(|i| {
                     let len = match i % 4 {
                         0 => words * 2,
-                        1 => words,     // short (and odd when words is odd)
+                        1 => words,         // short (and odd when words is odd)
                         2 => words * 2 - 1, // odd tail byte
-                        _ => 0,         // empty
+                        _ => 0,             // empty
                     };
                     (0..len).map(|_| rng() as u8).collect()
                 })
@@ -3707,14 +4049,7 @@ mod tests {
                 {
                     let mut views: Vec<&mut [u16]> =
                         got.iter_mut().map(|v| v.as_mut_slice()).collect();
-                    fold_chunk_tiled(
-                        &mut views,
-                        &src_refs,
-                        &|j, i| coeffs[j][i],
-                        0,
-                        tile,
-                        budget,
-                    );
+                    fold_chunk_tiled(&mut views, &src_refs, &|j, i| coeffs[j][i], 0, tile, budget);
                 }
                 assert_eq!(
                     got, want,
@@ -3729,7 +4064,10 @@ mod tests {
             // part - a mis-windowed source silently corrupts a repair.
             let mut got = base.clone();
             fold_parallel(&mut got, &src_refs, &|j, i| coeffs[j][i]);
-            assert_eq!(got, want, "fold_parallel rows={rows} nsrc={nsrc} words={words}");
+            assert_eq!(
+                got, want,
+                "fold_parallel rows={rows} nsrc={nsrc} words={words}"
+            );
         }
     }
 
@@ -3812,12 +4150,13 @@ mod tests {
         // Gapped exponents: every third, starting at 2 (max well within
         // the 3m dispatch bound but far from consecutive).
         let exps: Vec<u32> = (0..missing.len() as u32).map(|i| 2 + 3 * i).collect();
-        let recovery: Vec<(u32, Vec<u8>)> =
-            exps.iter().map(|&e| (e, generate_recovery(&padded, bs, e))).collect();
+        let recovery: Vec<(u32, Vec<u8>)> = exps
+            .iter()
+            .map(|&e| (e, generate_recovery(&padded, bs, e)))
+            .collect();
         let mut outs: Vec<Vec<Vec<u8>>> = Vec::new();
         for path in [SyndromePath::Fold, SyndromePath::NttForce(usize::MAX)] {
-            let mut rec =
-                Reconstructor::new_with_path(bs, n, &missing, &recovery, path).unwrap();
+            let mut rec = Reconstructor::new_with_path(bs, n, &missing, &recovery, path).unwrap();
             for (i, s) in slices.iter().enumerate() {
                 if !missing.contains(&i) {
                     rec.feed(i, s);
@@ -3831,6 +4170,37 @@ mod tests {
         }
     }
 
+    /// The smallest `(block_size, n_inputs, n_missing)` that clears
+    /// every clause of [`ntt_gates_pass`]: 8192 present slices, 512
+    /// missing, max exponent 511 under the 3x factor. At a 1 KiB block
+    /// the stripe geometry is one stripe wide, so the worker count
+    /// clamps to 1 on EVERY machine and the whole footprint is ~17 MB
+    /// (8 MB corpus + 9 MB arena). The admission tests use this rather
+    /// than the 64 KiB/16384/1500 benchmark leg because that leg needs
+    /// 930 MB of corpus budget on top of a core-count-dependent arena
+    /// charge, which made the expected value a function of the host's
+    /// RAM, its cgroup limit and its visible parallelism: red on a
+    /// 4 GiB dev box, in a `--memory=4g` container on a many-core
+    /// host, and under any exported `NZBFAST_NTT_BUDGET`.
+    const MINIMAL_NTT_SHAPE: (usize, usize, usize) = (1024, 8704, 512);
+
+    /// True when any NTT knob is exported. All four move what
+    /// [`resolve_syndrome_path`] returns - the budget directly, `W` and
+    /// `THREADS` through the arena charge - so the admission tests opt
+    /// out wholesale rather than fight a bench operator's shell.
+    /// Mutating the vars from inside the test is not an option: the lib
+    /// tests run in parallel with other readers of them.
+    fn ntt_env_knob_set() -> bool {
+        [
+            "NZBFAST_NTT",
+            "NZBFAST_NTT_BUDGET",
+            "NZBFAST_NTT_W",
+            "NZBFAST_NTT_THREADS",
+        ]
+        .iter()
+        .any(|k| std::env::var_os(k).is_some())
+    }
+
     /// The Auto arm's return value is the RETENTION budget, so it must
     /// be what is left after the per-worker arenas are paid for - the
     /// arenas are spoken for the moment the NTT is selected, and the
@@ -3839,33 +4209,63 @@ mod tests {
     /// explicit force arms keep returning the caller's budget verbatim.
     #[test]
     fn ntt_auto_retention_budget_excludes_the_worker_arenas() {
-        if std::env::var_os("NZBFAST_NTT").is_some() {
-            return; // the env override is exercised manually, not here
+        if ntt_env_knob_set() {
+            return; // the env overrides are exercised manually, not here
         }
-        let _g = NTT_STATE.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = NTT_STATE.lock_ok();
         FAST_PAR_TRIPPED.store(false, std::sync::atomic::Ordering::Relaxed);
         set_fast_par_enabled(true);
-        // The heavy benchmark leg, which clears every shape gate.
-        let exps: Vec<u32> = (0..1500).collect();
-        let arenas = ntt_worker_arenas(65536, 1500);
+        let (bs, n_inputs, m) = MINIMAL_NTT_SHAPE;
+        let exps: Vec<u32> = (0..m as u32).collect();
+        let arenas = ntt_worker_arenas(bs, m);
         assert!(arenas > 0, "the arenas are never free");
         assert_eq!(
-            resolve_syndrome_path(SyndromePath::Auto, 65536, 16384, 1500, &exps),
+            resolve_syndrome_path(SyndromePath::Auto, bs, n_inputs, m, &exps),
             Some(ntt_budget_env().saturating_sub(arenas)),
             "Auto must hand back the corpus budget, not the whole budget"
         );
         assert_eq!(
-            resolve_syndrome_path(
-                SyndromePath::NttForce(3 * 65536),
-                65536,
-                16384,
-                1500,
-                &exps
-            ),
-            Some(3 * 65536),
+            resolve_syndrome_path(SyndromePath::NttForce(3 * bs), bs, n_inputs, m, &exps),
+            Some(3 * bs),
             "the force arms pass the caller's budget through untouched"
         );
+        // Additionally pin the published benchmark leg (64 KiB blocks,
+        // 16384 inputs, 1500 missing), but ONLY on a host whose budget
+        // clears its corpus - that is the machine-dependent part, and
+        // it is computed here with the same arithmetic the gate uses
+        // rather than assumed.
+        let heavy: Vec<u32> = (0..1500).collect();
+        let heavy_corpus = ntt_budget_env().saturating_sub(ntt_worker_arenas(65536, 1500));
+        if heavy_corpus >= (16384 - 1500) * 65536 {
+            assert_eq!(
+                resolve_syndrome_path(SyndromePath::Auto, 65536, 16384, 1500, &heavy),
+                Some(heavy_corpus),
+                "the benchmark leg still dispatches to the NTT where it fits"
+            );
+        }
         set_fast_par_enabled(FAST_PAR_DEFAULT);
+    }
+
+    /// Shrinking the admission tests to [`MINIMAL_NTT_SHAPE`] collapses
+    /// the geometry to one stripe and therefore one worker, which turns
+    /// the `saturating_mul(threads)` factor in [`ntt_worker_arenas`]
+    /// into a no-op there. That factor is the whole point of the
+    /// arena charge (a many-core host inside a `--memory` cap is the
+    /// shape it defends against), so pin it here as a RELATION rather
+    /// than as a constant - no dependence on this machine's core count
+    /// or RAM.
+    #[test]
+    fn ntt_worker_arenas_price_every_worker() {
+        if ntt_env_knob_set() {
+            return; // W and THREADS both move the geometry
+        }
+        let (w, threads) = ntt_stripe_geometry(65536);
+        assert!(threads >= 1, "there is always at least one worker");
+        assert_eq!(
+            ntt_worker_arenas(65536, 1500),
+            crate::par2ntt::FlatPlan::scratch_bytes(1500, w).saturating_mul(threads),
+            "the arena charge is per worker, not per repair"
+        );
     }
 
     /// A set whose present slices are nearly all SHORT tails (many small
@@ -3895,16 +4295,17 @@ mod tests {
             })
             .collect();
         let exps: Vec<u32> = (0..m as u32).collect();
-        let recovery: Vec<(u32, Vec<u8>)> =
-            exps.iter().map(|&e| (e, generate_recovery(&padded, bs, e))).collect();
+        let recovery: Vec<(u32, Vec<u8>)> = exps
+            .iter()
+            .map(|&e| (e, generate_recovery(&padded, bs, e)))
+            .collect();
         // A budget the fed bytes clear on their own but the tail pads do not.
         let arena_bytes = present.len() * tail_len;
         let pad_bytes = present.len() * bs;
         let budget = arena_bytes + pad_bytes / 2;
         assert!(arena_bytes <= budget && arena_bytes + pad_bytes > budget);
         let run = |slices: &[Vec<u8>], recovery: &[(u32, Vec<u8>)], path| {
-            let mut rec =
-                Reconstructor::new_with_path(bs, n, &missing, recovery, path).unwrap();
+            let mut rec = Reconstructor::new_with_path(bs, n, &missing, recovery, path).unwrap();
             for &i in &present {
                 rec.feed(i, &slices[i]);
             }
@@ -3922,10 +4323,11 @@ mod tests {
         }
         // Control: the same corpus at full block length pays no pad, so
         // the same budget still admits the NTT.
-        let recovery_full: Vec<(u32, Vec<u8>)> =
-            exps.iter().map(|&e| (e, generate_recovery(&full, bs, e))).collect();
-        let (out_full, report_full) =
-            run(&full, &recovery_full, SyndromePath::NttForce(budget));
+        let recovery_full: Vec<(u32, Vec<u8>)> = exps
+            .iter()
+            .map(|&e| (e, generate_recovery(&full, bs, e)))
+            .collect();
+        let (out_full, report_full) = run(&full, &recovery_full, SyndromePath::NttForce(budget));
         assert!(
             report_full.ntt_used,
             "full-length slices pay no pad and must still run the NTT"
@@ -3944,8 +4346,10 @@ mod tests {
         let slices = demo_slices(n, bs);
         let missing: Vec<usize> = (0..m).map(|i| i * 17).collect();
         let exps: Vec<u32> = (0..m as u32).collect();
-        let recovery: Vec<(u32, Vec<u8>)> =
-            exps.iter().map(|&e| (e, generate_recovery(&slices, bs, e))).collect();
+        let recovery: Vec<(u32, Vec<u8>)> = exps
+            .iter()
+            .map(|&e| (e, generate_recovery(&slices, bs, e)))
+            .collect();
         // Budget far below the corpus: overflow is guaranteed.
         let mut rec = Reconstructor::new_with_path(
             bs,
@@ -3976,12 +4380,13 @@ mod tests {
         let slices = demo_slices(n, bs);
         let missing = [1usize, 30, 60, 90];
         let exps: Vec<u32> = (0..m as u32).collect();
-        let recovery: Vec<(u32, Vec<u8>)> =
-            exps.iter().map(|&e| (e, generate_recovery(&slices, bs, e))).collect();
+        let recovery: Vec<(u32, Vec<u8>)> = exps
+            .iter()
+            .map(|&e| (e, generate_recovery(&slices, bs, e)))
+            .collect();
         let mut outs: Vec<Vec<Vec<u8>>> = Vec::new();
         for path in [SyndromePath::Fold, SyndromePath::NttForce(usize::MAX)] {
-            let mut rec =
-                Reconstructor::new_with_path(bs, n, &missing, &recovery, path).unwrap();
+            let mut rec = Reconstructor::new_with_path(bs, n, &missing, &recovery, path).unwrap();
             for (i, s) in slices.iter().enumerate() {
                 if !missing.contains(&i) {
                     rec.feed(i, s);
@@ -4128,15 +4533,16 @@ mod tests {
             let mut files = self.files.lock().unwrap();
             let off = off as usize;
             files[file][off..off + data.len()].copy_from_slice(data);
-            if let Some((rf, ro)) = self.rot_on_first_write {
-                if !self.rotted.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    files[rf][ro] ^= 0xFF;
-                }
+            if let Some((rf, ro)) = self.rot_on_first_write
+                && !self.rotted.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                files[rf][ro] ^= 0xFF;
             }
-            if let Some((cf, co)) = self.corrupt_write_at {
-                if cf == file && (off..off + data.len()).contains(&co) {
-                    files[file][co] ^= 0xFF;
-                }
+            if let Some((cf, co)) = self.corrupt_write_at
+                && cf == file
+                && (off..off + data.len()).contains(&co)
+            {
+                files[file][co] ^= 0xFF;
             }
             Ok(())
         }
@@ -4147,7 +4553,12 @@ mod tests {
     /// recovery, pristine bytes).
     fn mapped_fixture(
         damage: &[(usize, usize)],
-    ) -> (Vec<(Par2File, Vec<bool>)>, usize, Vec<(u32, Vec<u8>)>, Vec<Vec<u8>>) {
+    ) -> (
+        Vec<(Par2File, Vec<bool>)>,
+        usize,
+        Vec<(u32, Vec<u8>)>,
+        Vec<Vec<u8>>,
+    ) {
         let bs = 64usize;
         let lens = [200usize, 97]; // 4 slices (tail 8) + 2 slices (tail 33)
         let pristine: Vec<Vec<u8>> = lens
@@ -4229,8 +4640,20 @@ mod tests {
         );
         // The heavy benchmark corpus (~0.93 GiB) still clears the gate
         // on a 16 GiB machine (budget 4 GiB) but not on a 2 GiB one.
-        assert!(ntt_gates_pass(65536, 14884, 1500, 1499, ntt_default_budget(Some(16 * gib), None)));
-        assert!(!ntt_gates_pass(65536, 14884, 1500, 1499, ntt_default_budget(Some(2 * gib), None)));
+        assert!(ntt_gates_pass(
+            65536,
+            14884,
+            1500,
+            1499,
+            ntt_default_budget(Some(16 * gib), None)
+        ));
+        assert!(!ntt_gates_pass(
+            65536,
+            14884,
+            1500,
+            1499,
+            ntt_default_budget(Some(2 * gib), None)
+        ));
     }
 
     /// Serializes the tests that touch the process-global fast-par
@@ -4239,7 +4662,7 @@ mod tests {
 
     #[test]
     fn ntt_divergence_falls_back_to_fold_and_records() {
-        let _g = NTT_STATE.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = NTT_STATE.lock_ok();
         FAST_PAR_TRIPPED.store(false, std::sync::atomic::Ordering::Relaxed);
         let _ = take_ntt_divergences(); // start from a clean log
         for (path, expect_panicked) in [
@@ -4293,13 +4716,14 @@ mod tests {
     /// ignores both (it models the env escape hatch's precedence).
     #[test]
     fn fast_par_setting_gates_the_auto_path() {
-        if std::env::var_os("NZBFAST_NTT").is_some() {
-            return; // the env override is exercised manually, not here
+        if ntt_env_knob_set() {
+            return; // the env overrides are exercised manually, not here
         }
-        let _g = NTT_STATE.lock().unwrap_or_else(|p| p.into_inner());
-        // A shape that passes every gate (the heavy benchmark leg).
-        let exps: Vec<u32> = (0..1500).collect();
-        let resolve = || resolve_syndrome_path(SyndromePath::Auto, 65536, 16384, 1500, &exps);
+        let _g = NTT_STATE.lock_ok();
+        // A shape that passes every gate on any host.
+        let (bs, n_inputs, m) = MINIMAL_NTT_SHAPE;
+        let exps: Vec<u32> = (0..m as u32).collect();
+        let resolve = || resolve_syndrome_path(SyndromePath::Auto, bs, n_inputs, m, &exps);
         set_fast_par_enabled(false);
         assert!(resolve().is_none(), "setting off: fold");
         set_fast_par_enabled(true);
@@ -4307,7 +4731,7 @@ mod tests {
         FAST_PAR_TRIPPED.store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(resolve().is_none(), "tripped breaker forces fold");
         assert!(
-            resolve_syndrome_path(SyndromePath::NttForce(usize::MAX), 65536, 16384, 1500, &exps)
+            resolve_syndrome_path(SyndromePath::NttForce(usize::MAX), bs, n_inputs, m, &exps)
                 .is_some(),
             "explicit force path ignores the breaker"
         );
@@ -4317,7 +4741,7 @@ mod tests {
         set_fast_par_enabled(true);
         let small: Vec<u32> = (0..3).collect();
         assert!(
-            resolve_syndrome_path(SyndromePath::Auto, 65536, 16384, 3, &small).is_none(),
+            resolve_syndrome_path(SyndromePath::Auto, bs, n_inputs, 3, &small).is_none(),
             "small shapes stay on the fold even with the setting on"
         );
         set_fast_par_enabled(FAST_PAR_DEFAULT);
@@ -4347,21 +4771,22 @@ mod tests {
     fn mapped_driver_rereads_files_it_did_not_rebuild() {
         // IFSC checksums present, so an untouched file takes the cheap
         // per-block CRC32 path rather than MD5.
-        let with_ifsc = |files: &mut Vec<(Par2File, Vec<bool>)>, pristine: &[Vec<u8>], bs: usize| {
-            for ((f, _), data) in files.iter_mut().zip(pristine) {
-                f.blocks = data
-                    .chunks(bs)
-                    .map(|c| {
-                        let mut padded = c.to_vec();
-                        padded.resize(bs, 0);
-                        BlockCheck {
-                            md5: Md5::digest(&padded).into(),
-                            crc32: crc32fast::hash(&padded),
-                        }
-                    })
-                    .collect();
-            }
-        };
+        let with_ifsc =
+            |files: &mut Vec<(Par2File, Vec<bool>)>, pristine: &[Vec<u8>], bs: usize| {
+                for ((f, _), data) in files.iter_mut().zip(pristine) {
+                    f.blocks = data
+                        .chunks(bs)
+                        .map(|c| {
+                            let mut padded = c.to_vec();
+                            padded.resize(bs, 0);
+                            BlockCheck {
+                                md5: Md5::digest(&padded).into(),
+                                crc32: crc32fast::hash(&padded),
+                            }
+                        })
+                        .collect();
+                }
+            };
 
         for full_verify in [false, true] {
             let damage = [(0usize, 1usize)];
@@ -4393,7 +4818,10 @@ mod tests {
         let mut on_disk = pristine.clone();
         on_disk[0][bs..2 * bs].fill(0);
         let io = MemIo::new(on_disk, None);
-        assert_eq!(repair_mapped(&files, bs, &recovery, &io, false).expect("repairs"), 1);
+        assert_eq!(
+            repair_mapped(&files, bs, &recovery, &io, false).expect("repairs"),
+            1
+        );
         assert_eq!(io.snapshot(), pristine, "byte-identical restoration");
     }
 
@@ -4447,9 +4875,11 @@ mod tests {
                 slices.push(v);
             }
         }
-        assert!(slices.len() > 100, "fixture must exceed one reader chunk each");
-        let damage: &[(usize, usize)] =
-            &[(1, 0), (1, 36), (2, 1), (3, 0), (4, 40), (5, 20)];
+        assert!(
+            slices.len() > 100,
+            "fixture must exceed one reader chunk each"
+        );
+        let damage: &[(usize, usize)] = &[(1, 0), (1, 36), (2, 1), (3, 0), (4, 40), (5, 20)];
         let recovery: Vec<(u32, Vec<u8>)> = (0..damage.len() as u32)
             .map(|e| (e, generate_recovery(&slices, bs, e)))
             .collect();
@@ -4510,7 +4940,8 @@ mod tests {
 
     #[test]
     fn mapped_driver_rejects_short_recovery_and_bad_present_len() {
-        let (files, bs, recovery, pristine) = mapped_fixture(&[(0, 0), (0, 1), (0, 2), (1, 0), (1, 1)]);
+        let (files, bs, recovery, pristine) =
+            mapped_fixture(&[(0, 0), (0, 1), (0, 2), (1, 0), (1, 1)]);
         let io = MemIo::new(pristine.clone(), None);
         // 5 missing, only 4 recovery slices.
         assert!(matches!(
@@ -4533,27 +4964,74 @@ mod tests {
         assert_eq!(io.snapshot(), pristine, "no-op wrote nothing");
     }
 
-    /// Every block of every mapped file missing (a single-volume set
-    /// whose data articles were all lost, headers parsed, recovery
-    /// plentiful): the driver must DECLINE cleanly so the caller falls
-    /// back to the disk path - `work.chunks(0)` used to panic here and
-    /// unwind out of the async repair.
+    /// Every block of every mapped file missing (a par-only post, or a
+    /// posted set whose data articles were all lost, recovery
+    /// plentiful): parity as a source. There are no present slices to
+    /// stream, so the recovery slices ARE the syndromes and the solve
+    /// rebuilds the whole set from them alone - byte-identical, MD5
+    /// self-proved through the same io. (This used to DECLINE - and
+    /// before that, `work.chunks(0)` panicked here.)
     #[test]
-    fn mapped_driver_declines_when_all_blocks_are_missing() {
+    fn mapped_driver_rebuilds_a_wholly_missing_set_from_parity_alone() {
         let bs = 64usize;
-        let pristine = payload_bytes(200, 42); // 4 slices, odd tail
+        let lens = [200usize, 97]; // 4 slices (odd tail) + 2 slices
+        let pristine: Vec<Vec<u8>> = lens
+            .iter()
+            .enumerate()
+            .map(|(i, &l)| payload_bytes(l, i as u64 + 42))
+            .collect();
+        let mut slices: Vec<Vec<u8>> = Vec::new();
+        for d in &pristine {
+            for c in d.chunks(bs) {
+                let mut v = c.to_vec();
+                v.resize(bs, 0);
+                slices.push(v);
+            }
+        }
+        let recovery: Vec<(u32, Vec<u8>)> = (0..slices.len() as u32)
+            .map(|e| (e, generate_recovery(&slices, bs, e)))
+            .collect();
+        let files: Vec<(Par2File, Vec<bool>)> = pristine
+            .iter()
+            .enumerate()
+            .map(|(fi, d)| {
+                (
+                    Par2File {
+                        file_id: [fi as u8 + 7; 16],
+                        name: format!("f{fi}.bin"),
+                        length: d.len() as u64,
+                        md5: Md5::digest(d).into(),
+                        md5_16k: Md5::digest(d).into(),
+                        blocks: Vec::new(),
+                    },
+                    vec![false; d.len().div_ceil(bs)],
+                )
+            })
+            .collect();
+        let io = MemIo::new(pristine.iter().map(|d| vec![0u8; d.len()]).collect(), None);
+        let n = repair_mapped(&files, bs, &recovery, &io, false).expect("rebuilds from parity");
+        assert_eq!(n, slices.len(), "every block rebuilt");
+        assert_eq!(io.snapshot(), pristine, "byte-identical reconstruction");
+    }
+
+    /// The parity-alone rebuild with too FEW recovery slices must still
+    /// fail loudly, not fabricate bytes: one slice short of the set.
+    #[test]
+    fn mapped_driver_wholly_missing_set_short_recovery_declines() {
+        let bs = 64usize;
+        let pristine = payload_bytes(200, 43); // 4 slices
         let mut slices: Vec<Vec<u8>> = Vec::new();
         for c in pristine.chunks(bs) {
             let mut v = c.to_vec();
             v.resize(bs, 0);
             slices.push(v);
         }
-        let recovery: Vec<(u32, Vec<u8>)> = (0..slices.len() as u32)
+        let recovery: Vec<(u32, Vec<u8>)> = (0..slices.len() as u32 - 1)
             .map(|e| (e, generate_recovery(&slices, bs, e)))
             .collect();
         let files = vec![(
             Par2File {
-                file_id: [7u8; 16],
+                file_id: [9u8; 16],
                 name: "f.bin".into(),
                 length: pristine.len() as u64,
                 md5: Md5::digest(&pristine).into(),
@@ -4563,10 +5041,10 @@ mod tests {
             vec![false; slices.len()],
         )];
         let io = MemIo::new(vec![vec![0u8; pristine.len()]], None);
-        match repair_mapped(&files, bs, &recovery, &io, false) {
-            Err(RepairError::Malformed(m)) => assert!(m.contains("declining"), "{m}"),
-            other => panic!("expected a graceful decline, got {other:?}"),
-        }
+        assert!(
+            repair_mapped(&files, bs, &recovery, &io, false).is_err(),
+            "3 recovery slices cannot rebuild 4 missing blocks"
+        );
     }
 
     #[test]

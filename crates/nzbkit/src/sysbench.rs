@@ -32,7 +32,11 @@ pub fn hw_aes() -> bool {
 
 /// Name of the AEAD a TLS connection will use on this CPU.
 pub fn tls_aead_name() -> &'static str {
-    if hw_aes() { "tls aead AES-128-GCM" } else { "tls aead ChaCha20" }
+    if hw_aes() {
+        "tls aead AES-128-GCM"
+    } else {
+        "tls aead ChaCha20"
+    }
 }
 
 /// Run the negotiated TLS AEAD over `p` in 16 KB TLS records, using
@@ -121,7 +125,10 @@ pub fn compute(mb: usize) -> ComputeReport {
             }
         });
         let all = (bytes * cores) as f64 / t0.elapsed().as_secs_f64() / 1e9;
-        StageRate { one_core: one, all_core: all }
+        StageRate {
+            one_core: one,
+            all_core: all,
+        }
     };
 
     let art = article.clone();
@@ -290,8 +297,10 @@ pub async fn timed_fetch_multi(
     // Cap the id list so fetch_all returns near the window.
     ids.truncate(max_ids.max(64));
     let n_servers = servers.len();
-    let reqs: Vec<crate::pool::ArticleReq> =
-        ids.into_iter().map(crate::pool::ArticleReq::fresh).collect();
+    let reqs: Vec<crate::pool::ArticleReq> = ids
+        .into_iter()
+        .map(crate::pool::ArticleReq::fresh)
+        .collect();
     // Stop via QueueControl at the deadline: aborting the outer future
     // instead LEAKED the spawned workers, which kept downloading and
     // strangled every later ladder step's measurement.
@@ -302,8 +311,11 @@ pub async fn timed_fetch_multi(
     // Track peak granted sockets while the fetch runs: when the queue
     // drains early the workers are already gone by the measure point, and
     // a point sample would read 0.
-    let peaks: Vec<Arc<std::sync::atomic::AtomicUsize>> =
-        live.servers.iter().map(|_| Arc::new(std::sync::atomic::AtomicUsize::new(0))).collect();
+    let peaks: Vec<Arc<std::sync::atomic::AtomicUsize>> = live
+        .servers
+        .iter()
+        .map(|_| Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+        .collect();
     let live2 = live.clone();
     let peaks2 = peaks.clone();
     let sampler = tokio::spawn(async move {
@@ -328,7 +340,10 @@ pub async fn timed_fetch_multi(
     let granted: Vec<usize> = if exhausted {
         peaks.iter().map(|p| p.load(Ordering::Relaxed)).collect()
     } else {
-        live.servers.iter().map(|s| s.connected.load(Ordering::Relaxed)).collect()
+        live.servers
+            .iter()
+            .map(|s| s.connected.load(Ordering::Relaxed))
+            .collect()
     };
     let stats = match early {
         Some(s) => s,
@@ -352,7 +367,12 @@ pub async fn timed_fetch_multi(
     } else {
         vec![0; n_servers]
     };
-    (bytes.load(Ordering::Relaxed) as f64 * 8.0 / 1e9 / secs_f, per, granted, exhausted)
+    (
+        bytes.load(Ordering::Relaxed) as f64 * 8.0 / 1e9 / secs_f,
+        per,
+        granted,
+        exhausted,
+    )
 }
 
 /// Returns (Gbps, raw bytes transferred) - bill the bytes.
@@ -368,6 +388,81 @@ pub async fn network_probe(
     let want = (connections * 60).max(secs as usize * 1250);
     let ids = discover_ids(server, group, want).await?;
     Ok(timed_fetch(server, ids, connections, secs).await)
+}
+
+/// Aggregate probe over a whole server set: every server pulls from one
+/// shared queue at its clamped connection count, which is what a real
+/// download does when it saturates all providers at once. One server's
+/// figure reads far below what several accounts deliver together
+/// (issue #12, round 2: five providers, 160+ connections, and a probe
+/// that could only ever show the first one).
+///
+/// Levels are flattened to 0 for the probe: the pool holds a fill
+/// server back until the primaries 430, which is correct for downloads
+/// and wrong for a capacity measurement - a backup that never gets
+/// asked measures as zero.
+///
+/// Returns (aggregate Gbps, per-server raw bytes in input order - bill
+/// each to its own host).
+pub async fn network_probe_multi(
+    servers: &[ServerConfig],
+    group: &str,
+    secs: u64,
+) -> Result<(f64, Vec<u64>), Box<dyn std::error::Error + Send + Sync>> {
+    use crate::pool::PoolConfig;
+    // Per-server clamp as before; a total cap keeps a many-account
+    // fleet's probe from becoming a real download - scale everyone
+    // down proportionally, never to zero.
+    let conns: Vec<usize> = servers
+        .iter()
+        .map(|s| (s.connections as usize).clamp(1, 100))
+        .collect();
+    let total: usize = conns.iter().sum();
+    let scale = if total > 200 {
+        200.0 / total as f64
+    } else {
+        1.0
+    };
+    let conns: Vec<usize> = conns
+        .iter()
+        .map(|&c| ((c as f64 * scale) as usize).max(1))
+        .collect();
+    let total: usize = conns.iter().sum();
+    // Discover from the first server that answers - message-IDs are
+    // universal, but the first configured server may be the dead one.
+    let want = (total * 60).max(secs as usize * 1250);
+    let mut ids = Vec::new();
+    let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+    for s in servers {
+        match discover_ids(s, group, want).await {
+            Ok(v) => {
+                ids = v;
+                break;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if ids.is_empty() {
+        return Err(last_err.unwrap_or_else(|| "no servers to probe".into()));
+    }
+    let set: Vec<(ServerConfig, PoolConfig)> = servers
+        .iter()
+        .zip(&conns)
+        .map(|(s, &c)| {
+            let mut s = s.clone();
+            s.level = 0;
+            (
+                s,
+                PoolConfig {
+                    connections: c,
+                    window: 4,
+                    ..PoolConfig::default()
+                },
+            )
+        })
+        .collect();
+    let (gbps, per, _granted, _exhausted) = timed_fetch_multi(set, ids, usize::MAX, secs).await;
+    Ok((gbps, per))
 }
 
 /// One step of a connection ladder: sockets asked for, sockets the
@@ -424,7 +519,11 @@ pub async fn conn_ladder(
         // Rotate so the next step reads different articles.
         let rot = per_step.min(ids.len().saturating_sub(1));
         ids.rotate_left(rot);
-        let cfg = PoolConfig { connections: c_now, window: 4, ..PoolConfig::default() };
+        let cfg = PoolConfig {
+            connections: c_now,
+            window: 4,
+            ..PoolConfig::default()
+        };
         let (gbps, per, granted, saturated) =
             timed_fetch_multi(vec![(server.clone(), cfg)], slice, per_step, secs_per_step).await;
         out.push(LadderStep {
@@ -459,8 +558,10 @@ pub async fn conn_ladder(
     // so the recommendation lands near the true knee.
     if stopped_flat && out.len() >= 2 {
         let peak = out.iter().map(|s| s.gbps).fold(0.0, f64::max);
-        let (mut lo, mut hi) =
-            (out[out.len() - 2].connections, out[out.len() - 1].connections);
+        let (mut lo, mut hi) = (
+            out[out.len() - 2].connections,
+            out[out.len() - 1].connections,
+        );
         for _ in 0..2 {
             if hi.saturating_sub(lo) <= (lo / 4).max(2) {
                 break;
@@ -470,7 +571,11 @@ pub async fn conn_ladder(
             let slice: Vec<String> = ids[..per_step].to_vec();
             let rot = per_step.min(ids.len().saturating_sub(1));
             ids.rotate_left(rot);
-            let cfg = PoolConfig { connections: mid, window: 4, ..PoolConfig::default() };
+            let cfg = PoolConfig {
+                connections: mid,
+                window: 4,
+                ..PoolConfig::default()
+            };
             let (gbps, per, granted, saturated) =
                 timed_fetch_multi(vec![(server.clone(), cfg)], slice, per_step, secs_per_step)
                     .await;
@@ -619,62 +724,69 @@ pub async fn diversity(
     let t_sweeps = Instant::now();
     // collect() eagerly: a lazy map would spawn each sweep only when the
     // join loop reaches it - sequential again.
-    let sweeps: Vec<_> = servers.iter().map(|s| {
-        let s = s.clone();
-        let ids: Vec<String> = sample_ids.to_vec();
-        tokio::spawn(async move {
-            let n = ids.len();
-            // Whole-sweep hard cap: send/flush have no per-op timeouts, so
-            // one black-holed connection would otherwise hang its task (and
-            // the whole report) forever.
-            let swept = tokio::time::timeout(Duration::from_secs(45), async move {
-                let t0 = Instant::now();
-                let mut vec = vec![false; ids.len()];
-                let mut connect_ok = false;
-                let mut rtt = 0.0;
-                let mut had = 0usize;
-                if let Ok(Ok((mut conn, _))) =
-                    tokio::time::timeout(Duration::from_secs(12), Connection::connect(&s)).await
-                {
-                    connect_ok = true;
-                    rtt = t0.elapsed().as_secs_f64() * 1000.0;
-                    // Pipelined STAT sweep.
-                    let window = 40usize;
-                    let mut sent = 0;
-                    let mut recv = 0;
-                    'sweep: while recv < ids.len() {
-                        while sent < ids.len() && sent - recv < window {
-                            if conn.send_stat(&ids[sent]).await.is_err() {
-                                break 'sweep;
-                            }
-                            sent += 1;
-                        }
-                        if conn.flush().await.is_err() {
-                            break;
-                        }
-                        match tokio::time::timeout(Duration::from_secs(20), conn.read_stat()).await
-                        {
-                            Ok(Ok(has)) => {
-                                vec[recv] = has;
-                                if has {
-                                    had += 1;
+    let sweeps: Vec<_> = servers
+        .iter()
+        .map(|s| {
+            let s = s.clone();
+            let ids: Vec<String> = sample_ids.to_vec();
+            tokio::spawn(async move {
+                let n = ids.len();
+                // Whole-sweep hard cap: send/flush have no per-op timeouts, so
+                // one black-holed connection would otherwise hang its task (and
+                // the whole report) forever.
+                let swept = tokio::time::timeout(Duration::from_secs(45), async move {
+                    let t0 = Instant::now();
+                    let mut vec = vec![false; ids.len()];
+                    let mut connect_ok = false;
+                    let mut rtt = 0.0;
+                    let mut had = 0usize;
+                    if let Ok(Ok((mut conn, _))) =
+                        tokio::time::timeout(Duration::from_secs(12), Connection::connect(&s)).await
+                    {
+                        connect_ok = true;
+                        rtt = t0.elapsed().as_secs_f64() * 1000.0;
+                        // Pipelined STAT sweep.
+                        let window = 40usize;
+                        let mut sent = 0;
+                        let mut recv = 0;
+                        'sweep: while recv < ids.len() {
+                            while sent < ids.len() && sent - recv < window {
+                                if conn.send_stat(&ids[sent]).await.is_err() {
+                                    break 'sweep;
                                 }
-                                recv += 1;
+                                sent += 1;
                             }
-                            _ => break,
+                            if conn.flush().await.is_err() {
+                                break;
+                            }
+                            match tokio::time::timeout(Duration::from_secs(20), conn.read_stat())
+                                .await
+                            {
+                                Ok(Ok(has)) => {
+                                    vec[recv] = has;
+                                    if has {
+                                        had += 1;
+                                    }
+                                    recv += 1;
+                                }
+                                _ => break,
+                            }
                         }
+                        conn.quit().await;
                     }
-                    conn.quit().await;
-                }
-                (connect_ok, rtt, had, vec)
+                    (connect_ok, rtt, had, vec)
+                })
+                .await;
+                swept.unwrap_or((false, 0.0, 0, vec![false; n]))
             })
-            .await;
-            swept.unwrap_or((false, 0.0, 0, vec![false; n]))
         })
-    }).collect();
+        .collect();
     let mut sweep_results = Vec::new();
     for h in sweeps {
-        sweep_results.push(h.await.unwrap_or((false, 0.0, 0, vec![false; sample_ids.len()])));
+        sweep_results.push(
+            h.await
+                .unwrap_or((false, 0.0, 0, vec![false; sample_ids.len()])),
+        );
     }
     println!(
         "[diversity] STAT sweeps done in {:.1}s ({} servers × {} ids)",
@@ -698,7 +810,11 @@ pub async fn diversity(
                 .filter(|&(_, &h)| h)
                 .map(|(id, _)| id.clone())
                 .collect();
-            if have.is_empty() { (0.0, 0) } else { timed_fetch(s, have, 8, 4).await }
+            if have.is_empty() {
+                (0.0, 0)
+            } else {
+                timed_fetch(s, have, 8, 4).await
+            }
         } else {
             (0.0, 0)
         };
@@ -712,7 +828,10 @@ pub async fn diversity(
         });
         present.push(vec);
     }
-    println!("[diversity] speed probes done in {:.1}s", t_probes.elapsed().as_secs_f64());
+    println!(
+        "[diversity] speed probes done in {:.1}s",
+        t_probes.elapsed().as_secs_f64()
+    );
 
     // Pairwise MISSING-set Jaccard: over the shared sample, articles this
     // server lacked. High overlap of gaps ⇒ same infra.
@@ -733,7 +852,11 @@ pub async fn diversity(
                     inter += 1;
                 }
             }
-            let jac = if union == 0 { 0.0 } else { inter as f64 / union as f64 };
+            let jac = if union == 0 {
+                0.0
+            } else {
+                inter as f64 / union as f64
+            };
             let verdict = if jac >= 0.8 {
                 "SAME infra - redundant for recovery (share takedowns/gaps)"
             } else if jac >= 0.4 {
@@ -810,7 +933,10 @@ mod tests {
     /// run out of the suite.
     #[test]
     fn verdict_picks_min() {
-        let flat = StageRate { one_core: 1.0, all_core: 8.0 };
+        let flat = StageRate {
+            one_core: 1.0,
+            all_core: 8.0,
+        };
         let c = ComputeReport {
             cores: 8,
             decode_simd: flat,
@@ -843,8 +969,7 @@ mod tests {
     async fn exhausted_supply_measures_actual_transfer_time() {
         let mut articles = std::collections::HashMap::new();
         let data: Vec<u8> = (0..400_000u32).map(|i| i as u8).collect();
-        let segs =
-            crate::mock::make_file_articles("t.bin", &data, 20_000, "sb", &mut articles);
+        let segs = crate::mock::make_file_articles("t.bin", &data, 20_000, "sb", &mut articles);
         let srv = crate::mock::MockServer::start(articles, crate::mock::Chaos::default()).await;
         let ids: Vec<String> = segs.iter().map(|(id, _, _)| format!("<{id}>")).collect();
         let cfg = crate::pool::PoolConfig {
@@ -877,9 +1002,9 @@ mod tests {
         // Not a network test - verify the Jaccard/verdict logic directly.
         // 3 "servers": A,B identical gaps; C independent.
         let present = [
-            vec![true, false, true, false, true, false],  // A: missing idx 1,3,5
-            vec![true, false, true, false, true, false],  // B: same
-            vec![false, true, true, true, false, true],   // C: missing 0,4
+            vec![true, false, true, false, true, false], // A: missing idx 1,3,5
+            vec![true, false, true, false, true, false], // B: same
+            vec![false, true, true, true, false, true],  // C: missing 0,4
         ];
         let jac = |x: &[bool], y: &[bool]| {
             let (mut i, mut u) = (0, 0);

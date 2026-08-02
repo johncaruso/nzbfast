@@ -1,0 +1,619 @@
+use super::super::*;
+use super::ApiCtx;
+
+pub(in crate::serve) fn dispatch(
+    d: &Arc<Daemon>,
+    req: &mut tiny_http::Request,
+    params: &std::collections::HashMap<String, String>,
+    mode: &str,
+    ctx: &ApiCtx<'_>,
+    _api_body: &mut Option<Vec<u8>>,
+) -> Option<Value> {
+    Some(match mode {
+        "server_stats" => {
+            // Shape SAB apps expect: total/month/week/day bytes,
+            // plus the same per server - fed from the usage ledger.
+            let u = d.usage.lock_ok().clone();
+            let days = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| (d.as_secs() / 86_400) as i64)
+                .unwrap_or(0);
+            let (y, m, dd) = civil_from_days(days);
+            let today = format!("{y:04}-{m:02}-{dd:02}");
+            let month_prefix = format!("{y:04}-{m:02}");
+            let week_cut = {
+                let (wy, wm, wd) = civil_from_days(days - 6);
+                format!("{wy:04}-{wm:02}-{wd:02}")
+            };
+            let mut tot = (0u64, 0u64, 0u64, 0u64); // total, month, week, day
+            let mut servers = serde_json::Map::new();
+            for (day, hosts) in &u {
+                if day == "reliability" {
+                    continue; // article counters, not byte buckets
+                }
+                let Some(hosts) = hosts.as_object() else {
+                    continue;
+                };
+                let lifetime = day == "lifetime";
+                for (host, b) in hosts {
+                    let b = b.as_u64().unwrap_or(0);
+                    let e = servers.entry(host.clone()).or_insert_with(|| {
+                        json!({"total":0u64,"month":0u64,"week":0u64,"day":0u64,
+                                    "daily":{}, "articles_tried":0,"articles_success":0})
+                    });
+                    let eo = e.as_object_mut().unwrap();
+                    let bump = |eo: &mut serde_json::Map<String, Value>, k: &str, v: u64| {
+                        let cur = eo.get(k).and_then(Value::as_u64).unwrap_or(0);
+                        eo.insert(k.into(), json!(cur + v));
+                    };
+                    if lifetime {
+                        bump(eo, "total", b);
+                        tot.0 += b;
+                    } else {
+                        if day.starts_with(&month_prefix) {
+                            bump(eo, "month", b);
+                            tot.1 += b;
+                        }
+                        if day.as_str() >= week_cut.as_str() {
+                            bump(eo, "week", b);
+                            tot.2 += b;
+                        }
+                        if *day == today {
+                            bump(eo, "day", b);
+                            tot.3 += b;
+                        }
+                    }
+                }
+            }
+            // Reliability ledger → the SAB per-server article
+            // counters apps already display.
+            if let Some(rel) = u.get("reliability").and_then(Value::as_object) {
+                for (host, counts) in rel {
+                    let g = |k| counts.get(k).and_then(Value::as_u64).unwrap_or(0);
+                    let (tried, missing) = (g("tried"), g("missing"));
+                    let e = servers.entry(host.clone()).or_insert_with(|| {
+                        json!({"total":0u64,"month":0u64,"week":0u64,"day":0u64,
+                                    "daily":{}, "articles_tried":0,"articles_success":0})
+                    });
+                    if let Some(eo) = e.as_object_mut() {
+                        eo.insert("articles_tried".into(), json!(tried));
+                        eo.insert(
+                            "articles_success".into(),
+                            json!(tried.saturating_sub(missing)),
+                        );
+                    }
+                }
+            }
+            json!({"total": tot.0, "month": tot.1, "week": tot.2, "day": tot.3,
+                        "servers": Value::Object(servers)})
+        }
+        "server_save" => {
+            let raw = read_body_capped(req.as_reader(), 1 << 20);
+            let body: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+            let idx = body.get("index").and_then(Value::as_i64).unwrap_or(-1);
+            // Read and write under one lock: this whole block is a
+            // read-modify-write of the entire server array.
+            let _cfg = crate::setup::config_write_lock();
+            let mut servers = current_servers(ctx.cfg_path);
+            let existing = usize::try_from(idx)
+                .ok()
+                .and_then(|i| servers.get(i))
+                .cloned();
+            match normalized_server(
+                existing.as_ref(),
+                body.get("server").unwrap_or(&Value::Null),
+            ) {
+                Ok(merged) => {
+                    match usize::try_from(idx).ok().filter(|i| *i < servers.len()) {
+                        Some(i) => servers[i] = merged,
+                        None => servers.push(merged),
+                    }
+                    match crate::setup::write_servers(ctx.cfg_path, &servers) {
+                        Ok(()) => {
+                            info!(
+                                target: "config",
+                                "servers updated ({} total) - applies from the next download",
+                                servers.len()
+                            );
+                            // Idle release is the exception to
+                            // "applies from the next download":
+                            // an operator turning it on does so
+                            // precisely because connections are
+                            // being held RIGHT NOW, and waiting
+                            // for a download to free them would
+                            // be backwards.
+                            // Re-read rather than reuse the raw
+                            // JSON above: `servers` here is the
+                            // untyped form that was written, and
+                            // the policy has to come from the
+                            // parsed config the daemon will
+                            // actually run with.
+                            if let Ok(c) = nzbkit::config::Config::load(ctx.cfg_path) {
+                                d.push_idle_release_policies(&c.servers);
+                            }
+                            json!({"status": true, "count": servers.len()})
+                        }
+                        Err(e) => json!({"status": false, "error": e.to_string()}),
+                    }
+                }
+                Err(e) => json!({"status": false, "error": e}),
+            }
+        }
+        // Reveal one server's stored cleartext password - an explicit,
+        // advanced action to ease copying credentials to another
+        // instance. The general server list masks it; this is the
+        // deliberate exception, behind the same apikey as the rest.
+        "server_secret" => {
+            let idx: usize = params
+                .get("value")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(usize::MAX);
+            match current_servers(ctx.cfg_path).get(idx) {
+                // Decoded on the way out: this endpoint's whole
+                // job is to hand back the CLEARTEXT so it can be
+                // copied into another instance, and every other
+                // writer stores obf1 - so a wizard-created or
+                // imported server used to return `obf1:9c1a…`
+                // labelled as the password. Pasted into
+                // SABnzbd/NZBGet that silently fails AUTHINFO.
+                // deobfuscate returns a non-obf1 string unchanged,
+                // so this also repairs the cleartext entries the
+                // dashboard already wrote to disk.
+                Some(s) => json!({
+                    "status": true,
+                    "username": s.get("username").and_then(Value::as_str).unwrap_or(""),
+                    "password": nzbkit::config::deobfuscate(
+                        s.get("password").and_then(Value::as_str).unwrap_or("")
+                    ),
+                }),
+                None => json!({"status": false, "error": "unknown server index"}),
+            }
+        }
+        // Soft on/off (keeps the server configured): value=idx,
+        // value2=0|1.
+        "server_enable" => {
+            let idx: usize = params
+                .get("value")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(usize::MAX);
+            let on = params.get("value2").map(String::as_str) != Some("0");
+            let _cfg = crate::setup::config_write_lock();
+            let mut servers = current_servers(ctx.cfg_path);
+            if idx >= servers.len() {
+                json!({"status": false, "error": "unknown server index"})
+            } else {
+                if let Some(o) = servers[idx].as_object_mut() {
+                    if on {
+                        o.remove("enabled"); // default; keeps the file clean
+                    } else {
+                        o.insert("enabled".into(), json!(false));
+                    }
+                }
+                match crate::setup::write_servers(ctx.cfg_path, &servers) {
+                    Ok(()) => {
+                        info!(
+                            target: "config",
+                            "{} {}",
+                            servers[idx]
+                                .get("host")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("?"),
+                            if on { "enabled" } else { "disabled" }
+                        );
+                        json!({"status": true})
+                    }
+                    Err(e) => json!({"status": false, "error": e.to_string()}),
+                }
+            }
+        }
+        // Persist a new server ORDER (e.g. fastest-first after a
+        // benchmark): POST {"order":[old indices]}.
+        "server_reorder" => {
+            let raw = read_body_capped(req.as_reader(), 1 << 20);
+            let order: Vec<usize> = serde_json::from_slice::<Value>(&raw)
+                .ok()
+                .and_then(|v| v.get("order").cloned())
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default();
+            let _cfg = crate::setup::config_write_lock();
+            let servers = current_servers(ctx.cfg_path);
+            let mut sorted: Vec<usize> = order.clone();
+            sorted.sort_unstable();
+            if sorted != (0..servers.len()).collect::<Vec<_>>() {
+                json!({"status": false,
+                            "error": "order must be a permutation of all server indices"})
+            } else {
+                let reordered: Vec<Value> = order.iter().map(|&i| servers[i].clone()).collect();
+                match crate::setup::write_servers(ctx.cfg_path, &reordered) {
+                    Ok(()) => {
+                        info!(target: "config", "servers reordered");
+                        json!({"status": true})
+                    }
+                    Err(e) => json!({"status": false, "error": e.to_string()}),
+                }
+            }
+        }
+        "server_delete" => {
+            let idx: usize = params
+                .get("value")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(usize::MAX);
+            let _cfg = crate::setup::config_write_lock();
+            let mut servers = current_servers(ctx.cfg_path);
+            if idx < servers.len() {
+                let gone = servers.remove(idx);
+                match crate::setup::write_servers(ctx.cfg_path, &servers) {
+                    Ok(()) => {
+                        info!(
+                            target: "config",
+                            "removed server {} ({} left)",
+                            gone.get("host").and_then(serde_json::Value::as_str).unwrap_or("?"),
+                            servers.len()
+                        );
+                        json!({"status": true, "count": servers.len()})
+                    }
+                    Err(e) => json!({"status": false, "error": e.to_string()}),
+                }
+            } else {
+                json!({"status": false, "error": "no such server"})
+            }
+        }
+        "server_test" => {
+            // Connect + TLS + AUTHINFO against the (merged) server
+            // without saving it - a blank password borrows the
+            // stored one, so "Test" works on saved servers too.
+            let raw = read_body_capped(req.as_reader(), 1 << 20);
+            let body: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+            let idx = body.get("index").and_then(Value::as_i64).unwrap_or(-1);
+            let servers = current_servers(ctx.cfg_path);
+            let existing = usize::try_from(idx)
+                .ok()
+                .and_then(|i| servers.get(i))
+                .cloned();
+            let sc = normalized_server(
+                existing.as_ref(),
+                body.get("server").unwrap_or(&Value::Null),
+            )
+            .and_then(|m| {
+                serde_json::from_value::<nzbkit::config::ServerConfig>(m).map_err(|e| e.to_string())
+            });
+            match sc {
+                Ok(sc) => {
+                    // Same block_on + hard-timeout pattern as
+                    // sysbench: a black-holed host must not wedge
+                    // the API thread.
+                    let t0 = std::time::Instant::now();
+                    let r = tokio::runtime::Handle::current().block_on(async {
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(12),
+                            nzbkit::nntp::Connection::connect(&sc),
+                        )
+                        .await
+                    });
+                    match r {
+                        Ok(Ok((conn, greeting))) => {
+                            let ms = t0.elapsed().as_millis() as u64;
+                            tokio::runtime::Handle::current().block_on(conn.quit());
+                            json!({"status": true, "greeting": greeting.line, "latency_ms": ms})
+                        }
+                        Ok(Err(e)) => {
+                            json!({"status": false, "error": e.to_string()})
+                        }
+                        Err(_) => json!({"status": false,
+                                    "error": "connect timed out (12 s)"}),
+                    }
+                }
+                Err(e) => json!({"status": false, "error": e}),
+            }
+        }
+        "indexer_test" => {
+            // M35: t=caps against one indexer entry without
+            // saving it. A blank apikey borrows the stored key
+            // of the same-named saved entry, so "Test" works on
+            // saved rows the UI round-trips with blank keys.
+            let raw = read_body_capped(req.as_reader(), 1 << 20);
+            let body: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+            let cfg = serde_json::from_value::<crate::newznab::IndexerConfig>(
+                body.get("indexer").cloned().unwrap_or(Value::Null),
+            );
+            match cfg {
+                Ok(mut cfg) if !cfg.url.trim().is_empty() => {
+                    if cfg.apikey.is_empty()
+                        && let Some(saved) = d
+                            .indexers
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .find(|i| i.name == cfg.name)
+                    {
+                        cfg.apikey = saved.apikey.clone();
+                    }
+                    // Network on the API thread is acceptable
+                    // here (user-clicked; the shared agent
+                    // carries a 15 s ceiling - the wall_search
+                    // precedent).
+                    match indexer_caps_one(&cfg) {
+                        Ok(caps) => {
+                            let out = json!({
+                                "status": true,
+                                "server": caps.server,
+                                "categories": caps.categories.len(),
+                                "search": caps.search,
+                                // Which precision searches this
+                                // site accepts, so the UI can
+                                // say so rather than the user
+                                // discovering it by result
+                                // quality.
+                                "tvsearch": !caps.tvsearch.is_empty(),
+                                "movie": !caps.movie.is_empty(),
+                                "imdbid": caps.movie.iter().any(|p| p == "imdbid"),
+                                "tvdbid": caps.tvsearch.iter().any(|p| p == "tvdbid"),
+                                "limit_default": caps.limit_default,
+                            });
+                            // A Test click is the freshest caps
+                            // answer there is - let searches use
+                            // it instead of re-probing. Under the
+                            // ENDPOINT's identity, never the
+                            // name: this cfg may be an unsaved
+                            // draft, and a draft that borrowed a
+                            // saved entry's name used to publish
+                            // its caps over the saved entry's -
+                            // which then planned id searches
+                            // against a site it never pointed at,
+                            // for the full 24 h TTL, even if the
+                            // user cancelled the edit.
+                            d.indexer_rt
+                                .lock()
+                                .unwrap()
+                                .caps
+                                .insert(cfg.identity(), (Instant::now(), Some(caps)));
+                            out
+                        }
+                        Err(e) => json!({"status": false, "error": e.to_string()}),
+                    }
+                }
+                Ok(_) => json!({"status": false, "error": "the entry needs a URL"}),
+                Err(e) => json!({"status": false, "error": format!("indexer: {e}")}),
+            }
+        }
+        // M18c: whole-pool burst - every server together at the
+        // CURRENT Connections setting, exactly like a real
+        // download. The number that matters after per-server
+        // tuning: does the union saturate the line?
+        "pooltest" => {
+            match nzbkit::config::Config::load(ctx.cfg_path) {
+                Err(e) => json!({"status": false, "error": e.to_string()}),
+                Ok(c) if c.servers.is_empty() => {
+                    json!({"status": false, "error": "no servers configured"})
+                }
+                Ok(mut c) => {
+                    c.servers.retain(|s| s.enabled);
+                    if c.servers.is_empty() {
+                        json!({"status": false, "error": "all servers disabled"})
+                    } else {
+                        let grp = PROBE_GROUP;
+                        let conns = d.connections.load(Ordering::Relaxed).max(1);
+                        let pool: Vec<(nzbkit::config::ServerConfig, nzbkit::pool::PoolConfig)> = c
+                            .servers
+                            .iter()
+                            .map(|s| {
+                                let cfg = nzbkit::pool::PoolConfig {
+                                    connections: conns.min(s.connections.max(1) as usize),
+                                    window: 4,
+                                    ..nzbkit::pool::PoolConfig::default()
+                                };
+                                (s.clone(), cfg)
+                            })
+                            .collect();
+                        let hosts: Vec<String> = c.servers.iter().map(|s| s.host.clone()).collect();
+                        tokio::runtime::Handle::current().block_on(async {
+                            // Enough ids to keep a multi-gig line busy
+                            // for the whole 8 s window - a small fixed
+                            // supply drains early and caps the reading
+                            // at supply/window.
+                            let ids = match tokio::time::timeout(
+                                std::time::Duration::from_secs(30),
+                                nzbkit::sysbench::discover_ids(&c.servers[0], grp, 10_000),
+                            )
+                            .await
+                            {
+                                Err(_) => {
+                                    return json!({"status": false,
+                                        "error": "article discovery timed out"});
+                                }
+                                Ok(Err(e)) => {
+                                    return json!({"status": false,
+                                        "error": format!("discovery: {e}")});
+                                }
+                                Ok(Ok(ids)) => ids,
+                            };
+                            let (gbps, per, granted, _) =
+                                nzbkit::sysbench::timed_fetch_multi(pool, ids, usize::MAX, 8).await;
+                            d.add_usage(
+                                &hosts
+                                    .iter()
+                                    .cloned()
+                                    .zip(per.iter().copied())
+                                    .collect::<Vec<_>>(),
+                            );
+                            let total: u64 = per.iter().sum::<u64>().max(1);
+                            let servers: Vec<Value> = hosts
+                                .iter()
+                                .zip(per.iter().zip(&granted))
+                                .map(|(h, (&b, &g))| {
+                                    json!({"host": h, "bytes": b, "granted": g,
+                                            "share_pct": (100.0 * b as f64 / total as f64).round()})
+                                })
+                                .collect();
+                            json!({"status": true, "gbps": gbps,
+                                    "connections_per_server": conns, "servers": servers})
+                        })
+                    }
+                }
+            }
+        }
+        // M18: per-server connection-count ladder. value = server
+        // index; measures Gbps at rising socket counts so the user
+        // can see what raising `connections` actually buys.
+        "connladder" => {
+            let idx: usize = params
+                .get("value")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            match nzbkit::config::Config::load(ctx.cfg_path)
+                .ok()
+                .and_then(|c| c.servers.into_iter().nth(idx))
+            {
+                None => json!({"status": false, "error": "unknown server index"}),
+                Some(srv) => {
+                    let grp = PROBE_GROUP;
+                    // Probe past the CONFIGURED limit on purpose:
+                    // some accounts allow 100 sockets, and the knee
+                    // may live above a conservative config value.
+                    // Over-asking is harmless (refused sockets bow
+                    // out; `granted` exposes the real ceiling).
+                    let cap = (srv.connections.max(1) as usize * 2).clamp(30, 100);
+                    // value2=N: test exactly N sockets (one step) -
+                    // "how many does the provider grant if I ask?"
+                    let fixed: Option<usize> = params.get("value2").and_then(|v| v.parse().ok());
+                    tokio::runtime::Handle::current().block_on(async {
+                        match tokio::time::timeout(std::time::Duration::from_secs(120), async {
+                            match fixed {
+                                Some(n) => {
+                                    let n = n.clamp(1, 150);
+                                    // Sized for a multi-gig
+                                    // line over the 6 s window
+                                    // - n×40 drains early and
+                                    // caps the reading.
+                                    let ids = nzbkit::sysbench::discover_ids(
+                                        &srv,
+                                        grp,
+                                        (n * 40).max(7_500),
+                                    )
+                                    .await?;
+                                    let cfg = nzbkit::pool::PoolConfig {
+                                        connections: n,
+                                        window: 4,
+                                        ..nzbkit::pool::PoolConfig::default()
+                                    };
+                                    let (gbps, per, granted, saturated) =
+                                        nzbkit::sysbench::timed_fetch_multi(
+                                            vec![(srv.clone(), cfg)],
+                                            ids,
+                                            usize::MAX,
+                                            6,
+                                        )
+                                        .await;
+                                    Ok(vec![nzbkit::sysbench::LadderStep {
+                                        connections: n,
+                                        granted: granted.first().copied().unwrap_or(0),
+                                        gbps,
+                                        bytes: per.first().copied().unwrap_or(0),
+                                        saturated,
+                                    }])
+                                }
+                                None => nzbkit::sysbench::conn_ladder(&srv, grp, cap, 5).await,
+                            }
+                        })
+                        .await
+                        {
+                            Err(_) => json!({"status": false,
+                                        "error": "connection ladder timed out"}),
+                            Ok(Err(e)) => json!({"status": false,
+                                        "error": format!("{}: {e}", srv.host)}),
+                            Ok(Ok(steps)) => {
+                                // Probe traffic is real provider
+                                // traffic - bill it.
+                                d.add_usage(&[(
+                                    srv.host.clone(),
+                                    steps.iter().map(|s| s.bytes).sum(),
+                                )]);
+                                // Smallest count reaching 90% of the
+                                // peak - robust against the non-
+                                // monotonic noise of real links.
+                                let peak = steps.iter().map(|s| s.gbps).fold(0.0, f64::max);
+                                let best = steps
+                                    .iter()
+                                    .find(|s| s.gbps >= peak * 0.9)
+                                    .map(|s| s.connections)
+                                    .unwrap_or(8);
+                                // Manual runs feed the same
+                                // auto-tune state (M7b.1).
+                                crate::conntune::record(
+                                    ctx.cfg_path,
+                                    &srv.host,
+                                    crate::conntune::Tuned {
+                                        connections: best,
+                                        granted: steps.iter().map(|s| s.granted).max().unwrap_or(0),
+                                        gbps: peak,
+                                        checked: epoch_secs(),
+                                        source: "manual".into(),
+                                    },
+                                );
+                                json!({
+                                    "status": true,
+                                    "host": srv.host,
+                                    "account_limit": srv.connections,
+                                    "steps": steps,
+                                    "recommended": best,
+                                    "peak_gbps": peak,
+                                })
+                            }
+                        }
+                    })
+                }
+            }
+        }
+        "diversity" => {
+            // Infrastructure-overlap detector across all servers.
+            match nzbkit::config::Config::load(ctx.cfg_path) {
+                Ok(c) => {
+                    let grp = PROBE_GROUP;
+                    // Sample ids spanning ages, discovered from the
+                    // first server. Both phases hard-capped so a dead
+                    // server can't wedge the API thread (see sysbench).
+                    let cap = std::time::Duration::from_secs(120);
+                    let t_sample = Instant::now();
+                    let sample = tokio::runtime::Handle::current().block_on(async {
+                        tokio::time::timeout(cap, sample_ids_for_diversity(&c.servers, grp))
+                            .await
+                            .unwrap_or_else(|_| Err("diversity sample timed out".into()))
+                    });
+                    match sample {
+                        Ok(ids) => {
+                            info!(
+                                target: "diversity",
+                                "sampled {} ids in {:.1}s",
+                                ids.len(),
+                                t_sample.elapsed().as_secs_f64()
+                            );
+                            let rep = tokio::runtime::Handle::current().block_on(async {
+                                tokio::time::timeout(
+                                    cap,
+                                    nzbkit::sysbench::diversity(&c.servers, &ids, grp),
+                                )
+                                .await
+                            });
+                            match rep {
+                                Ok(rep) => {
+                                    d.add_usage(
+                                        &rep.servers
+                                            .iter()
+                                            .map(|p| (p.host.clone(), p.bytes))
+                                            .collect::<Vec<_>>(),
+                                    );
+                                    serde_json::to_value(&rep).unwrap_or(json!({"status": false}))
+                                }
+                                Err(_) => json!({"status": false,
+                                            "error": "diversity sweep timed out"}),
+                            }
+                        }
+                        Err(e) => json!({"status": false, "error": e}),
+                    }
+                }
+                Err(e) => json!({"status": false, "error": e.to_string()}),
+            }
+        }
+        _ => return None,
+    })
+}

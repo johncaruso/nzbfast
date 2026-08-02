@@ -20,6 +20,14 @@ Needs nightly + `cargo install cargo-fuzz`.
 - `rar_extract`  - `ArchiveReader::read_with_options` + `extract_to`
   (the RAR13/15-40/50 decompressor). Window and output are bounded so a
   decompression bomb can't OOM/hang the run.
+- `mediaprobe`   - the container probe behind the preview-and-verify
+  panel (`mediaprobe::probe` over MKV/WebM, MP4 and AVI). It reads a file
+  that is still ARRIVING, before PAR2 has verified anything, so every
+  length it follows is attacker-declared. Asserts determinism (the same
+  bytes must probe to the same answer - which is why the parser's budgets
+  contain no wall clock) and that the track/chapter/warning lists stay
+  bounded, since a list that grows with a declared length is an
+  allocation attack.
 - `rar_recovery_scan` - the streaming recovery scanners:
   `scan_inline_recovery_chunks` (`{RB}` inline records) and
   `read_rev5_meta` / `verify_rev5_payload` (`.rev` headers). These size
@@ -47,6 +55,10 @@ starts from valid inputs and reaches the decode paths fast:
     mkdir -p corpus/rar_extract corpus/par2_parse corpus/rar_recovery_scan
     cp ../../../vendor/rars/tests/fixtures/rar*/*.rar corpus/rar_extract/
     cp ../tests/fixtures/par2/*.par2                  corpus/par2_parse/
+    # mediaprobe's fixtures are generated, not committed - the test
+    # suite writes them out on request:
+    NZBFAST_WRITE_FUZZ_SEEDS=$PWD/corpus/mediaprobe \
+      cargo test -p nzbkit --test mediaprobe write_fuzz_seeds
     # rar_recovery_scan needs CRC-valid headers to get past its first gate,
     # so seed it with real .rev volumes and RR-bearing archives.
     cp ../../../vendor/rars/tests/fixtures/rar*/**/*.rev \

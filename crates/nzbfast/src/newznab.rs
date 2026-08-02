@@ -208,7 +208,11 @@ pub fn parse_error(xml: &str) -> Option<NewznabError> {
     // an account that is already over quota.
     let mut t = xml.trim_start_matches('\u{feff}').trim_start();
     if let Some(rest) = t.strip_prefix("<?xml") {
-        t = rest.split_once("?>").map(|(_, r)| r).unwrap_or(rest).trim_start();
+        t = rest
+            .split_once("?>")
+            .map(|(_, r)| r)
+            .unwrap_or(rest)
+            .trim_start();
     }
     let rest = t.strip_prefix("<error")?;
     let tag = &rest[..rest.find('>').unwrap_or(rest.len())];
@@ -298,7 +302,9 @@ pub fn caps_url(cfg: &IndexerConfig) -> String {
 fn nn_attr(item: &str, name: &str) -> Option<String> {
     item.split("<newznab:attr").skip(1).find_map(|a| {
         let a = &a[..a.find('>').unwrap_or(a.len())];
-        (attr(a, "name") == Some(name)).then(|| attr(a, "value").map(str::to_string)).flatten()
+        (attr(a, "name") == Some(name))
+            .then(|| attr(a, "value").map(str::to_string))
+            .flatten()
     })
 }
 
@@ -312,11 +318,17 @@ pub fn parse_caps(xml: &str) -> Caps {
         Some(xml[p..end].to_string())
     };
     if let Some(t) = one_tag("<server") {
-        caps.server = unescape(attr(&t, "title").or_else(|| attr(&t, "appversion")).unwrap_or(""));
+        caps.server = unescape(
+            attr(&t, "title")
+                .or_else(|| attr(&t, "appversion"))
+                .unwrap_or(""),
+        );
     }
     if let Some(t) = one_tag("<limits") {
         caps.limit_max = attr(&t, "max").and_then(|v| v.parse().ok()).unwrap_or(0);
-        caps.limit_default = attr(&t, "default").and_then(|v| v.parse().ok()).unwrap_or(0);
+        caps.limit_default = attr(&t, "default")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
     }
     let params = |t: &str| -> Vec<String> {
         attr(t, "supportedParams")
@@ -329,15 +341,15 @@ pub fn parse_caps(xml: &str) -> Caps {
     if let Some(t) = one_tag("<search ") {
         caps.search = attr(&t, "available") == Some("yes");
     }
-    if let Some(t) = one_tag("<tv-search") {
-        if attr(&t, "available") == Some("yes") {
-            caps.tvsearch = params(&t);
-        }
+    if let Some(t) = one_tag("<tv-search")
+        && attr(&t, "available") == Some("yes")
+    {
+        caps.tvsearch = params(&t);
     }
-    if let Some(t) = one_tag("<movie-search") {
-        if attr(&t, "available") == Some("yes") {
-            caps.movie = params(&t);
-        }
+    if let Some(t) = one_tag("<movie-search")
+        && attr(&t, "available") == Some("yes")
+    {
+        caps.movie = params(&t);
     }
     // Top-level categories only: `<category id name>`; `<subcat>` rides
     // its parent's thousand and is noise at this level.
@@ -346,7 +358,10 @@ pub fn parse_caps(xml: &str) -> Caps {
         let tail = &rest[p..];
         let end = tail.find('>').unwrap_or(tail.len());
         let tag = &tail[..end];
-        if let (Some(id), Some(name)) = (attr(tag, "id").and_then(|v| v.parse().ok()), attr(tag, "name")) {
+        if let (Some(id), Some(name)) = (
+            attr(tag, "id").and_then(|v| v.parse().ok()),
+            attr(tag, "name"),
+        ) {
             caps.categories.push((id, unescape(name)));
         }
         rest = &tail[end..];
@@ -360,7 +375,9 @@ pub fn parse_results(xml: &str) -> Vec<SearchResult> {
     let mut out = Vec::new();
     let mut rest = xml;
     while let Some(open) = rest.find("<item") {
-        let Some(close) = rest[open..].find("</item>") else { break };
+        let Some(close) = rest[open..].find("</item>") else {
+            break;
+        };
         let item = &rest[open..open + close];
         let title = tag_text(item, "title").map(unescape).unwrap_or_default();
         let enclosure = item.find("<enclosure").map(|p| {
@@ -379,18 +396,30 @@ pub fn parse_results(xml: &str) -> Vec<SearchResult> {
             .filter(|s| *s > 0)
             .or_else(|| nn_attr(item, "size").and_then(|v| v.parse().ok()))
             .unwrap_or(0);
-        let cat = nn_attr(item, "category").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let cat = nn_attr(item, "category")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         let posted = nn_attr(item, "usenetdate")
             .and_then(|v| parse_rfc2822(&v))
             .or_else(|| tag_text(item, "pubDate").and_then(parse_rfc2822))
             .unwrap_or(0);
-        let grabs = nn_attr(item, "grabs").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let grabs = nn_attr(item, "grabs")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         let guid = tag_text(item, "guid")
             .map(unescape)
             .filter(|g| !g.is_empty())
             .unwrap_or_else(|| link.clone());
         if !title.is_empty() && !link.is_empty() {
-            out.push(SearchResult { title, link, guid, size, cat, posted, grabs });
+            out.push(SearchResult {
+                title,
+                link,
+                guid,
+                size,
+                cat,
+                posted,
+                grabs,
+            });
         }
         rest = &rest[open + close + 7..];
     }
@@ -434,7 +463,7 @@ pub fn parse_rfc2822(s: &str) -> Option<i64> {
         _ => return None,
     };
     let year: i64 = it.next()?.parse().ok()?;
-    if !(1..=31).contains(&day) || year < 1980 || year > 3000 {
+    if !(1..=31).contains(&day) || !(1980..=3000).contains(&year) {
         return None;
     }
     let mut hms = it.next()?.split(':');
@@ -473,7 +502,11 @@ pub fn parse_rfc2822(s: &str) -> Option<i64> {
 /// two releases that genuinely share a name but differ in content land
 /// in different buckets.
 pub fn dedupe_key(title: &str, size: u64) -> String {
-    format!("{}#{}", title.trim().to_ascii_lowercase(), size / (50 * 1024 * 1024))
+    format!(
+        "{}#{}",
+        title.trim().to_ascii_lowercase(),
+        size / (50 * 1024 * 1024)
+    )
 }
 
 /// Per-day hit/grab counters, persisted in `.spool/indexer-usage.json`.
@@ -494,13 +527,15 @@ impl Usage {
     pub fn roll(&mut self, now_ts: i64) {
         let day = now_ts.div_euclid(86_400);
         if day != self.day {
-            *self = Usage { day, ..Default::default() };
+            *self = Usage {
+                day,
+                ..Default::default()
+            };
         }
     }
 
     pub fn hit_allowed(&self, cfg: &IndexerConfig) -> bool {
-        cfg.hits_per_day == 0
-            || self.hits.get(&cfg.name).copied().unwrap_or(0) < cfg.hits_per_day
+        cfg.hits_per_day == 0 || self.hits.get(&cfg.name).copied().unwrap_or(0) < cfg.hits_per_day
     }
 
     pub fn grab_allowed(&self, cfg: &IndexerConfig) -> bool {
@@ -536,10 +571,22 @@ mod tests {
     #[test]
     fn endpoint_normalization() {
         // Site root, trailing slash, ready-made endpoint, Prowlarr path.
-        assert_eq!(cfg("https://api.nzbgeek.info").endpoint(), "https://api.nzbgeek.info/api");
-        assert_eq!(cfg("https://api.nzbgeek.info/").endpoint(), "https://api.nzbgeek.info/api");
-        assert_eq!(cfg("https://idx.example/api").endpoint(), "https://idx.example/api");
-        assert_eq!(cfg("http://nas:9696/1/api/").endpoint(), "http://nas:9696/1/api");
+        assert_eq!(
+            cfg("https://api.nzbgeek.info").endpoint(),
+            "https://api.nzbgeek.info/api"
+        );
+        assert_eq!(
+            cfg("https://api.nzbgeek.info/").endpoint(),
+            "https://api.nzbgeek.info/api"
+        );
+        assert_eq!(
+            cfg("https://idx.example/api").endpoint(),
+            "https://idx.example/api"
+        );
+        assert_eq!(
+            cfg("http://nas:9696/1/api/").endpoint(),
+            "http://nas:9696/1/api"
+        );
     }
 
     #[test]
@@ -580,8 +627,14 @@ mod tests {
             ..Default::default()
         };
         // Full TV support: the id wins and the episode fields ride along.
-        let p = plan_query(Some(&caps_with(&["q", "tvdbid", "season", "ep"], &[])), &tvq);
-        assert_eq!((p.tvdbid.as_str(), p.season, p.ep), ("12345", Some(1), Some(2)));
+        let p = plan_query(
+            Some(&caps_with(&["q", "tvdbid", "season", "ep"], &[])),
+            &tvq,
+        );
+        assert_eq!(
+            (p.tvdbid.as_str(), p.season, p.ep),
+            ("12345", Some(1), Some(2))
+        );
         assert!(search_url(&cfg("https://x"), &p).contains("t=tvsearch&"));
 
         // season/ep advertised but not tvdbid: keep the episode fields,
@@ -597,10 +650,17 @@ mod tests {
         assert!(u.contains("t=search&") && !u.contains("season="), "{u}");
 
         // Movies: imdbid only when advertised, and the tt is stripped.
-        let mq = SearchQuery { q: "Kill Bill".into(), imdbid: "tt0266697".into(), ..Default::default() };
+        let mq = SearchQuery {
+            q: "Kill Bill".into(),
+            imdbid: "tt0266697".into(),
+            ..Default::default()
+        };
         let p = plan_query(Some(&caps_with(&[], &["q", "imdbid"])), &mq);
         let u = search_url(&cfg("https://x"), &p);
-        assert!(u.contains("t=movie&") && u.contains("imdbid=0266697"), "{u}");
+        assert!(
+            u.contains("t=movie&") && u.contains("imdbid=0266697"),
+            "{u}"
+        );
         let p = plan_query(Some(&caps_with(&[], &["q"])), &mq);
         assert!(p.imdbid.is_empty());
         assert!(search_url(&cfg("https://x"), &p).contains("t=search&"));
@@ -617,9 +677,15 @@ mod tests {
         let e = parse_error(
             r#"<?xml version="1.0"?><error code="100" description="Incorrect user credentials"/>"#,
         );
-        assert_eq!(e, Some(NewznabError::Auth(100, "Incorrect user credentials".into())));
+        assert_eq!(
+            e,
+            Some(NewznabError::Auth(100, "Incorrect user credentials".into()))
+        );
         let e = parse_error(r#"<error code="500" description="Request limit reached"/>"#);
-        assert_eq!(e, Some(NewznabError::Limit(500, "Request limit reached".into())));
+        assert_eq!(
+            e,
+            Some(NewznabError::Limit(500, "Request limit reached".into()))
+        );
         // A result feed is not an error, even when a title says "error".
         let feed = r#"<?xml version="1.0"?><rss><channel><item><title>error.of.the.day</title></item></channel></rss>"#;
         assert_eq!(parse_error(feed), None);
@@ -649,8 +715,14 @@ mod tests {
         assert_eq!((caps.limit_max, caps.limit_default), (100, 100));
         assert!(caps.search);
         assert_eq!(caps.tvsearch, vec!["q", "rid", "tvdbid", "season", "ep"]);
-        assert!(caps.movie.is_empty(), "available=no must not advertise params");
-        assert_eq!(caps.categories, vec![(2000, "Movies & Films".into()), (5000, "TV".into())]);
+        assert!(
+            caps.movie.is_empty(),
+            "available=no must not advertise params"
+        );
+        assert_eq!(
+            caps.categories,
+            vec![(2000, "Movies & Films".into()), (5000, "TV".into())]
+        );
         // Degenerate caps: everything at defaults, nothing panics.
         let none = parse_caps("<caps></caps>");
         assert!(!none.search && none.categories.is_empty());
@@ -680,7 +752,10 @@ mod tests {
         assert_eq!(items[0].cat, 5040);
         assert_eq!(items[0].grabs, 42);
         // usenetdate (the upload) wins over pubDate (the indexing).
-        assert_eq!(items[0].posted, parse_rfc2822("Mon, 20 Jul 2026 09:00:00 +0000").unwrap());
+        assert_eq!(
+            items[0].posted,
+            parse_rfc2822("Mon, 20 Jul 2026 09:00:00 +0000").unwrap()
+        );
         assert_eq!(items[1].size, 1_500_000_000);
         assert_eq!(items[1].cat, 0);
         // Hostile shapes: truncated item, attr with no value, empty doc.
@@ -697,7 +772,10 @@ mod tests {
         // 21 Jul 2026 is 20 years after the classic Go reference epoch
         // sanity anchor: check against a value computed independently
         // (days_from_civil(2026,7,21) = 20655).
-        assert_eq!(parse_rfc2822("Tue, 21 Jul 2026 00:00:00 +0000"), Some(20655 * 86_400));
+        assert_eq!(
+            parse_rfc2822("Tue, 21 Jul 2026 00:00:00 +0000"),
+            Some(20655 * 86_400)
+        );
         // Zone math: +0200 is two hours EARLIER in unix time.
         assert_eq!(
             parse_rfc2822("Tue, 21 Jul 2026 02:00:00 +0200"),

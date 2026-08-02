@@ -22,8 +22,8 @@ fn main() {
     // Missing file or 0 (or a public-repo build, which has no file)
     // means "not a beta": the suffix simply never appears.
     println!("cargo:rerun-if-changed=../../packaging/beta-serial.txt");
-    let beta = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../packaging/beta-serial.txt");
+    let beta =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/beta-serial.txt");
     let beta = std::fs::read_to_string(beta)
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
@@ -47,7 +47,10 @@ fn main() {
     // MSVC's linker embeds a default manifest of its own and a second one
     // is a hard link error, so leave that target alone.
     let gnu = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu");
-    let manifest = root.join("packaging/windows/nzbfast.manifest").canonicalize().ok();
+    let manifest = root
+        .join("packaging/windows/nzbfast.manifest")
+        .canonicalize()
+        .ok();
     let manifest_line = match (&manifest, gnu) {
         (Some(m), true) => format!("1 24 \"{}\"\n", m.display().to_string().replace('\\', "/")),
         _ => String::new(),
@@ -66,6 +69,7 @@ BEGIN
   BEGIN
     BLOCK "040904b0"
     BEGIN
+      VALUE "CompanyName", "nzbfast"
       VALUE "ProductName", "nzbfast"
       VALUE "FileDescription", "nzbfast download engine"
       VALUE "InternalName", "nzbfast"
@@ -87,11 +91,21 @@ END
     .unwrap();
 
     let windres = std::env::var("WINDRES").unwrap_or_else(|_| {
-        if gnu { "x86_64-w64-mingw32-windres".into() } else { "windres".into() }
+        if gnu {
+            "x86_64-w64-mingw32-windres".into()
+        } else {
+            "windres".into()
+        }
     });
     let res = out.join("nzbfast.res.o");
     match std::process::Command::new(&windres)
-        .args([rc.to_str().unwrap(), "-O", "coff", "-o", res.to_str().unwrap()])
+        .args([
+            rc.to_str().unwrap(),
+            "-O",
+            "coff",
+            "-o",
+            res.to_str().unwrap(),
+        ])
         .status()
     {
         Ok(s) if s.success() => println!("cargo:rustc-link-arg={}", res.display()),

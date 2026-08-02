@@ -39,6 +39,7 @@
 //! - **Do not merge buckets by operator.** `Wikipedia` looks like it
 //!   belongs with `Wikidata` and does not - see its doc comment.
 
+use crate::MutexExt;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -213,7 +214,7 @@ pub fn acquire(p: Provider) {
     let (interval, tolerance) = timings(p);
     let wait = {
         let now = Instant::now();
-        let mut map = buckets().lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = buckets().lock_ok();
         let b = map.entry(p).or_insert(Bucket { tat: now });
         // How long until this request would be conforming. Computed as
         // `tat - (now + tolerance)` rather than `(tat - tolerance) - now`
@@ -247,7 +248,7 @@ pub fn try_acquire(p: Provider, max_wait: Duration) -> bool {
     let (interval, tolerance) = timings(p);
     let wait = {
         let now = Instant::now();
-        let mut map = buckets().lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = buckets().lock_ok();
         let b = map.entry(p).or_insert(Bucket { tat: now });
         let wait = b.tat.saturating_duration_since(now + tolerance);
         if wait > max_wait {
@@ -269,7 +270,7 @@ pub fn try_acquire(p: Provider, max_wait: Duration) -> bool {
 pub fn penalise(p: Provider, secs: u64) {
     let secs = secs.clamp(1, 60);
     let now = Instant::now();
-    let mut map = buckets().lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = buckets().lock_ok();
     let b = map.entry(p).or_insert(Bucket { tat: now });
     b.tat = b.tat.max(now) + Duration::from_secs(secs);
 }
@@ -394,7 +395,10 @@ mod tests {
         // from it - so both halves are unambiguous and neither sleeps.
         let t0 = Instant::now();
         assert!(try_acquire(Provider::Wikidata, Duration::from_millis(200)));
-        assert!(t0.elapsed() < Duration::from_millis(100), "an idle bucket made us wait");
+        assert!(
+            t0.elapsed() < Duration::from_millis(100),
+            "an idle bucket made us wait"
+        );
         assert!(
             !try_acquire(Provider::Wikidata, Duration::from_millis(200)),
             "the grant above did not claim the slot"

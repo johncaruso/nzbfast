@@ -7,6 +7,8 @@
 //! a key appearing under a running install would silently break the
 //! user's Sonarr/Radarr and phone remotes.
 
+mod scratch;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -20,7 +22,11 @@ fn nzbfast_keyless_marker() -> &'static str {
 }
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 /// Response body of a GET against the daemon (headers stripped).
@@ -42,7 +48,9 @@ fn http(port: u16, req: &str) -> String {
             Ok(body) => return body,
             Err(e) => {
                 last = e.to_string();
-                std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(attempt) + 50));
+                std::thread::sleep(std::time::Duration::from_millis(
+                    100 * u64::from(attempt) + 50,
+                ));
             }
         }
     }
@@ -54,7 +62,10 @@ fn http(port: u16, req: &str) -> String {
 /// caller's assertions to judge.
 fn http_once(port: u16, req: &str) -> std::io::Result<String> {
     let mut s = TcpStream::connect(("127.0.0.1", port))?;
-    write!(s, "GET {req} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")?;
+    write!(
+        s,
+        "GET {req} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+    )?;
     let mut raw = Vec::new();
     // Zero bytes back is a refusal to serve, however the peer
     // phrased it: an RST (Err) when our request was never read off
@@ -116,7 +127,10 @@ fn expect_refusal(dir: &Path, port: u16, extra: &[&str]) -> String {
                     String::from_utf8_lossy(&out.stdout),
                     String::from_utf8_lossy(&out.stderr)
                 );
-                assert!(!status.success(), "daemon started when it should have refused: {log}");
+                assert!(
+                    !status.success(),
+                    "daemon started when it should have refused: {log}"
+                );
                 return log;
             }
             None if std::time::Instant::now() >= deadline => {
@@ -129,11 +143,9 @@ fn expect_refusal(dir: &Path, port: u16, extra: &[&str]) -> String {
     }
 }
 
-fn scratch(name: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("nzbfast-firstrun-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+fn scratch(name: &str) -> scratch::ScratchDir {
+    let dir = std::env::temp_dir().join(format!("nzbfast-firstrun-{}-{name}", std::process::id()));
+    let dir = scratch::ScratchDir::attach(&dir);
     // A config with no servers is enough: nothing here downloads.
     std::fs::write(dir.join("config.json"), "{\"servers\":[]}").unwrap();
     dir
@@ -182,8 +194,11 @@ fn serve_env(dir: &Path, extra: &[&str], open_env: Option<&str>) -> Running {
         // prompt for every freshly built test binary - a new path on every
         // run. `bind_parses_and_defaults_to_all_interfaces` is the one test
         // that genuinely needs LAN reach and names its own bind.
-        let narrow: &[&str] =
-            if extra.contains(&"--bind") { &[] } else { &["--bind", "127.0.0.1"] };
+        let narrow: &[&str] = if extra.contains(&"--bind") {
+            &[]
+        } else {
+            &["--bind", "127.0.0.1"]
+        };
         let child = cmd
             .arg("--config")
             .arg(dir.join("config.json"))
@@ -198,7 +213,11 @@ fn serve_env(dir: &Path, extra: &[&str], open_env: Option<&str>) -> Running {
             .stderr(Stdio::from(err))
             .spawn()
             .unwrap();
-        let mut running = Running { _child: KillOnDrop(child), port, log };
+        let mut running = Running {
+            _child: KillOnDrop(child),
+            port,
+            log,
+        };
         // Readiness is OUR daemon's own listener banner, not "something
         // answers on :port". A bare connect cannot tell the two apart, and
         // under a full parallel run they diverge: `free_port()` can hand
@@ -222,7 +241,10 @@ fn serve_env(dir: &Path, extra: &[&str], open_env: Option<&str>) -> Running {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         let log = running.log();
-        assert!(dead && attempt < 2, "daemon never bound on :{port}\n--- log ---\n{log}");
+        assert!(
+            dead && attempt < 2,
+            "daemon never bound on :{port}\n--- log ---\n{log}"
+        );
     }
     unreachable!()
 }
@@ -248,7 +270,9 @@ fn rejected(body: &str) -> bool {
 }
 
 fn is_hex_key(k: &str) -> bool {
-    k.len() == 48 && k.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    k.len() == 48
+        && k.chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
 }
 
 /// (a) A brand-new install gets a strong key, stored and printed once,
@@ -265,25 +289,52 @@ fn fresh_install_generates_prints_and_enforces_a_key() {
     // Printed for the user, exactly once, with the key itself.
     let log = log_containing(&r, &key);
     assert!(log.contains("API key:"), "no first-run banner\n{log}");
-    assert_eq!(log.matches(&key as &str).count(), 1, "key printed more than once\n{log}");
+    assert_eq!(
+        log.matches(&key as &str).count(),
+        1,
+        "key printed more than once\n{log}"
+    );
 
-    // The API is now closed to anything without the key.
+    // The API is now closed to anything without the key. `mode=version`
+    // is the ONE deliberate exception - keyless version answers, matching
+    // real SABnzbd, so the container healthcheck and the wrapper probes
+    // stop tripping auth-rejection logging (the daemon suite's
+    // sonarr_style_cycle pins both halves of that rule).
     let anon = http(r.port, "/api?mode=version&output=json");
-    assert!(rejected(&anon), "unauthenticated request allowed: {anon}");
+    assert!(
+        anon.contains("version"),
+        "keyless mode=version must answer (SAB parity): {anon}"
+    );
     let anon = http(r.port, "/api?mode=queue&output=json");
-    assert!(rejected(&anon), "unauthenticated queue read allowed: {anon}");
+    assert!(
+        rejected(&anon),
+        "unauthenticated queue read allowed: {anon}"
+    );
     // ...and open with it.
-    let ok = http(r.port, &format!("/api?mode=version&apikey={key}&output=json"));
+    let ok = http(
+        r.port,
+        &format!("/api?mode=version&apikey={key}&output=json"),
+    );
     assert!(ok.contains("version"), "generated key rejected: {ok}");
 
     // Restarting reuses the SAME key - the *arrs hold it.
     drop(r);
     let r2 = serve(&dir, &[]);
-    let ok = http(r2.port, &format!("/api?mode=version&apikey={key}&output=json"));
-    assert!(ok.contains("version"), "key not stable across restarts: {ok}");
+    let ok = http(
+        r2.port,
+        &format!("/api?mode=version&apikey={key}&output=json"),
+    );
+    assert!(
+        ok.contains("version"),
+        "key not stable across restarts: {ok}"
+    );
     assert_eq!(std::fs::read_to_string(&keyfile).unwrap(), key);
     // ...and does not re-print it (it was printed once, on generation).
-    assert!(!r2.log().contains("API key:"), "banner repeated on restart\n{}", r2.log());
+    assert!(
+        !r2.log().contains("API key:"),
+        "banner repeated on restart\n{}",
+        r2.log()
+    );
 }
 
 /// A key typed into Settings is written to settings.json and NOWHERE
@@ -333,10 +384,16 @@ fn an_empty_apikey_flag_is_not_a_credential() {
 
     // And the empty credential must not open anything.
     let empty = http(r.port, "/api?mode=queue&output=json&apikey=");
-    assert!(rejected(&empty), "an empty --apikey authorised the control API: {empty}");
+    assert!(
+        rejected(&empty),
+        "an empty --apikey authorised the control API: {empty}"
+    );
     let anon = http(r.port, "/api?mode=queue&output=json");
     assert!(rejected(&anon), "unauthenticated request allowed: {anon}");
-    let ok = http(r.port, &format!("/api?mode=version&apikey={key}&output=json"));
+    let ok = http(
+        r.port,
+        &format!("/api?mode=version&apikey={key}&output=json"),
+    );
     assert!(ok.contains("version"), "minted key rejected: {ok}");
 }
 
@@ -358,7 +415,10 @@ fn an_empty_existing_keyfile_refuses_to_start_instead_of_opening_the_api() {
         .arg(dir.join("complete"))
         .output()
         .unwrap();
-    assert!(!out.status.success(), "daemon accepted an empty credential file");
+    assert!(
+        !out.status.success(),
+        "daemon accepted an empty credential file"
+    );
     let log = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -420,12 +480,17 @@ fn a_refusal_survives_the_exit_it_causes() {
             .stderr(Stdio::from(err))
             .spawn()
             .unwrap();
-        running.push((child, log));
+        // The guard rides along: dropping it here would delete the empty
+        // apikey file out from under the daemon before it could refuse.
+        running.push((child, log, dir));
     }
-    for (mut child, log) in running {
+    for (mut child, log, _dir) in running {
         let status = child.wait().unwrap();
         let text = std::fs::read_to_string(&log).unwrap_or_default();
-        assert!(!status.success(), "daemon accepted an empty credential file:\n{text}");
+        assert!(
+            !status.success(),
+            "daemon accepted an empty credential file:\n{text}"
+        );
         assert!(
             text.contains(nzbfast_keyless_marker()),
             "a refusal exited without saying why:\n{text}"
@@ -451,9 +516,17 @@ fn existing_install_with_settings_stays_keyless() {
     std::fs::write(dir.join("settings.json"), "{\"auto_speed\":false}").unwrap();
 
     let r = serve(&dir, &[]);
-    assert!(!dir.join("apikey").exists(), "a key was minted under an existing install");
-    let anon = http(r.port, "/api?mode=version&output=json");
-    assert!(anon.contains("version"), "existing keyless install started keyed: {anon}");
+    assert!(
+        !dir.join("apikey").exists(),
+        "a key was minted under an existing install"
+    );
+    // A gated mode, not mode=version: keyless version answers on keyed
+    // daemons too (SAB parity), so it cannot prove the API is open.
+    let anon = http(r.port, "/api?mode=queue&output=json");
+    assert!(
+        anon.contains("slots"),
+        "existing keyless install started keyed: {anon}"
+    );
 }
 
 /// The `nzbfast setup` wizard runs as its OWN process, so the indexing
@@ -464,12 +537,22 @@ fn existing_install_with_settings_stays_keyless() {
 #[test]
 fn a_wizard_answer_alone_is_still_a_first_run() {
     let dir = scratch("wizard-answer");
-    std::fs::write(dir.join("settings.json"), "{\"index_interests\":\"linux,sports\"}").unwrap();
+    std::fs::write(
+        dir.join("settings.json"),
+        "{\"index_interests\":\"linux,sports\"}",
+    )
+    .unwrap();
 
     let r = serve(&dir, &[]);
-    assert!(dir.join("apikey").exists(), "no key minted after the setup wizard ran");
-    let anon = http(r.port, "/api?mode=version&output=json");
-    assert!(rejected(&anon), "keyless request accepted on a fresh install: {anon}");
+    assert!(
+        dir.join("apikey").exists(),
+        "no key minted after the setup wizard ran"
+    );
+    let anon = http(r.port, "/api?mode=queue&output=json");
+    assert!(
+        rejected(&anon),
+        "keyless request accepted on a fresh install: {anon}"
+    );
 
     // ...and one real setting beside it makes it an established install
     // again, so the rule cannot be widened by accident.
@@ -480,8 +563,11 @@ fn a_wizard_answer_alone_is_still_a_first_run() {
     )
     .unwrap();
     let r2 = serve(&dir2, &[]);
-    assert!(!dir2.join("apikey").exists(), "a key was minted under an existing install");
-    assert!(http(r2.port, "/api?mode=version&output=json").contains("version"));
+    assert!(
+        !dir2.join("apikey").exists(),
+        "a key was minted under an existing install"
+    );
+    assert!(http(r2.port, "/api?mode=queue&output=json").contains("slots"));
 }
 
 /// (b, second marker) Same rule when the user never changed a dashboard
@@ -492,9 +578,15 @@ fn existing_install_with_a_spool_stays_keyless() {
     std::fs::create_dir_all(dir.join(".spool")).unwrap();
 
     let r = serve(&dir, &[]);
-    assert!(!dir.join("apikey").exists(), "a key was minted under an existing install");
+    assert!(
+        !dir.join("apikey").exists(),
+        "a key was minted under an existing install"
+    );
     let anon = http(r.port, "/api?mode=version&output=json");
-    assert!(anon.contains("version"), "existing keyless install started keyed: {anon}");
+    assert!(
+        anon.contains("version"),
+        "existing keyless install started keyed: {anon}"
+    );
 }
 
 /// (b, third marker) A genuinely legacy install - one that ran before the
@@ -509,9 +601,15 @@ fn existing_install_with_a_legacy_spool_stays_keyless() {
     std::fs::write(dir.join("settings.json"), "{\"auto_speed\":false}").unwrap();
 
     let r = serve(&dir, &[]);
-    assert!(!dir.join("apikey").exists(), "a key was minted under an existing install");
+    assert!(
+        !dir.join("apikey").exists(),
+        "a key was minted under an existing install"
+    );
     let anon = http(r.port, "/api?mode=version&output=json");
-    assert!(anon.contains("version"), "existing keyless install started keyed: {anon}");
+    assert!(
+        anon.contains("version"),
+        "existing keyless install started keyed: {anon}"
+    );
 }
 
 /// THE REGRESSION this file exists for on Windows: a REINSTALL.
@@ -539,12 +637,58 @@ fn reinstall_over_a_leftover_download_spool_mints_a_key() {
     assert!(is_hex_key(&key), "weak/odd generated key {key:?}");
 
     // And it is enforced, which is the whole point.
-    let anon = http(r.port, "/api?mode=version&output=json");
+    let anon = http(r.port, "/api?mode=queue&output=json");
     assert!(rejected(&anon), "reinstall left the API open: {anon}");
-    let ok = http(r.port, &format!("/api?mode=version&apikey={key}&output=json"));
+    let ok = http(
+        r.port,
+        &format!("/api?mode=version&apikey={key}&output=json"),
+    );
     assert!(ok.contains("version"), "generated key rejected: {ok}");
     let log = log_containing(&r, &key);
     assert!(log.contains("API key:"), "no first-run banner\n{log}");
+}
+
+/// A minted key beside a download root that is already in use is the
+/// signature of a MOVED config directory (a recreated container reading
+/// an empty /config, a relative bind mount run from somewhere new), not
+/// of a new user - and the log must say so, because from the dashboard
+/// this state is indistinguishable from "the update wiped my settings".
+/// It stays a warning: the mint itself is pinned by
+/// reinstall_over_a_leftover_download_spool_mints_a_key above, and the
+/// download root must never decide fresh-vs-existing (see
+/// first_run_apikey's doc comment for the regression that rule closed).
+#[test]
+fn fresh_config_beside_a_used_download_root_says_so() {
+    let dir = scratch("moved-config");
+    std::fs::create_dir_all(dir.join("complete/Some.Old.Download-GROUP")).unwrap();
+
+    let r = serve(&dir, &[]);
+    assert!(
+        dir.join("apikey").exists(),
+        "the warning must not suppress the mint"
+    );
+    let log = log_containing(&r, "different config directory");
+    assert!(
+        log.contains("is not empty"),
+        "warning does not name the evidence\n{log}"
+    );
+}
+
+/// The control: a genuinely fresh install (no download root at all) must
+/// start without the moved-config warning, or every real first run opens
+/// with a false alarm.
+#[test]
+fn a_genuinely_fresh_install_gets_no_moved_config_warning() {
+    let dir = scratch("genuinely-fresh");
+    let r = serve(&dir, &[]);
+    // The key banner prints after the listener is up, well after the
+    // warning would have appeared; once it is visible the startup lines
+    // are complete enough to judge.
+    let log = log_containing(&r, "API key:");
+    assert!(
+        !log.contains("different config directory"),
+        "moved-config warning on a truly fresh install\n{log}"
+    );
 }
 
 /// NZBFAST_OPEN=1 is the deliberate keyless opt-in, on a fresh install too.
@@ -552,9 +696,15 @@ fn reinstall_over_a_leftover_download_spool_mints_a_key() {
 fn nzbfast_open_env_stays_keyless() {
     let dir = scratch("open-env");
     let r = serve_env(&dir, &[], Some("1"));
-    assert!(!dir.join("apikey").exists(), "NZBFAST_OPEN=1 still minted a key");
-    let anon = http(r.port, "/api?mode=version&output=json");
-    assert!(anon.contains("version"), "NZBFAST_OPEN=1 did not stay keyless: {anon}");
+    assert!(
+        !dir.join("apikey").exists(),
+        "NZBFAST_OPEN=1 still minted a key"
+    );
+    let anon = http(r.port, "/api?mode=queue&output=json");
+    assert!(
+        anon.contains("slots"),
+        "NZBFAST_OPEN=1 did not stay keyless: {anon}"
+    );
 }
 
 /// (c) An explicit --apikey is the operator's choice and wins: nothing is
@@ -564,14 +714,26 @@ fn explicit_apikey_wins_on_a_fresh_install() {
     let dir = scratch("explicit");
     let r = serve(&dir, &["--apikey", "sekrit"]);
 
-    assert!(!dir.join("apikey").exists(), "--apikey should not mint or store a key");
-    assert!(!r.log().contains("API key:"), "first-run banner shown despite --apikey");
+    assert!(
+        !dir.join("apikey").exists(),
+        "--apikey should not mint or store a key"
+    );
+    assert!(
+        !r.log().contains("API key:"),
+        "first-run banner shown despite --apikey"
+    );
 
     let ok = http(r.port, "/api?mode=version&apikey=sekrit&output=json");
     assert!(ok.contains("version"), "--apikey rejected: {ok}");
+    // A PRESENTED-but-wrong key is still rejected even on mode=version:
+    // the keyless exception is for requests carrying no key at all, so a
+    // misconfigured *arr fails its connection test instead of going green.
     let bad = http(r.port, "/api?mode=version&apikey=wrong&output=json");
-    assert!(bad.contains("API Key Incorrect"), "wrong key accepted: {bad}");
-    let anon = http(r.port, "/api?mode=version&output=json");
+    assert!(
+        bad.contains("API Key Incorrect"),
+        "wrong key accepted: {bad}"
+    );
+    let anon = http(r.port, "/api?mode=queue&output=json");
     assert!(rejected(&anon), "unauthenticated request allowed: {anon}");
 }
 
@@ -591,28 +753,48 @@ fn clearing_the_key_in_the_dashboard_stays_cleared() {
     // A fresh install mints one...
     let r = serve(&dir, &[]);
     let key = std::fs::read_to_string(&keyfile).expect("apikey file must be written");
-    let ok = http(r.port, &format!("/api?mode=version&apikey={key}&output=json"));
+    let ok = http(
+        r.port,
+        &format!("/api?mode=version&apikey={key}&output=json"),
+    );
     assert!(ok.contains("version"), "generated key rejected: {ok}");
 
     // ...the user clears it in Settings.
-    let cleared =
-        http(r.port, &format!("/api?mode=config&name=apikey&value=&apikey={key}&output=json"));
+    let cleared = http(
+        r.port,
+        &format!("/api?mode=config&name=apikey&value=&apikey={key}&output=json"),
+    );
     assert!(cleared.contains("\"status\""), "clear rejected: {cleared}");
     // Immediately keyless, as it always was.
-    let anon = http(r.port, "/api?mode=version&output=json");
-    assert!(anon.contains("version"), "clearing the key did not open the API: {anon}");
+    let anon = http(r.port, "/api?mode=queue&output=json");
+    assert!(
+        anon.contains("slots"),
+        "clearing the key did not open the API: {anon}"
+    );
     // ...and the file that would resurrect it is gone. Gone, not blanked:
     // an empty file makes first_run_apikey warn on every single boot.
-    assert!(!keyfile.exists(), "the minted key file survived the clear - it will be read back");
+    assert!(
+        !keyfile.exists(),
+        "the minted key file survived the clear - it will be read back"
+    );
 
     // THE REGRESSION: the restart must come back up keyless.
     drop(r);
     let r2 = serve(&dir, &[]);
-    let anon = http(r2.port, "/api?mode=version&output=json");
-    assert!(anon.contains("version"), "a cleared key came back on restart: {anon}");
-    assert!(!keyfile.exists(), "a key was re-minted under an existing install");
+    let anon = http(r2.port, "/api?mode=queue&output=json");
+    assert!(
+        anon.contains("slots"),
+        "a cleared key came back on restart: {anon}"
+    );
+    assert!(
+        !keyfile.exists(),
+        "a key was re-minted under an existing install"
+    );
     let log = r2.log();
-    assert!(!log.contains("API key:"), "a new key was generated and printed\n{log}");
+    assert!(
+        !log.contains("API key:"),
+        "a new key was generated and printed\n{log}"
+    );
     assert!(
         !log.contains("refusing to replace"),
         "the deliberate clear left empty-keyfile noise on the next boot\n{log}"
@@ -621,8 +803,11 @@ fn clearing_the_key_in_the_dashboard_stays_cleared() {
     // And it stays gone: a third start is just as quiet.
     drop(r2);
     let r3 = serve(&dir, &[]);
-    let anon = http(r3.port, "/api?mode=version&output=json");
-    assert!(anon.contains("version"), "keyless install did not stay keyless: {anon}");
+    let anon = http(r3.port, "/api?mode=queue&output=json");
+    assert!(
+        anon.contains("slots"),
+        "keyless install did not stay keyless: {anon}"
+    );
     assert!(!keyfile.exists());
 }
 
@@ -636,17 +821,29 @@ fn setting_a_key_in_the_dashboard_survives_a_restart() {
     std::fs::write(dir.join("settings.json"), "{}").unwrap(); // existing install: keyless
 
     let r = serve(&dir, &[]);
-    let set = http(r.port, "/api?mode=config&name=apikey&value=chosen-key&output=json");
+    let set = http(
+        r.port,
+        "/api?mode=config&name=apikey&value=chosen-key&output=json",
+    );
     assert!(set.contains("\"status\""), "set rejected: {set}");
-    let anon = http(r.port, "/api?mode=version&output=json");
-    assert!(rejected(&anon), "setting a key did not close the API: {anon}");
+    let anon = http(r.port, "/api?mode=queue&output=json");
+    assert!(
+        rejected(&anon),
+        "setting a key did not close the API: {anon}"
+    );
 
     drop(r);
     let r2 = serve(&dir, &[]);
     let ok = http(r2.port, "/api?mode=version&apikey=chosen-key&output=json");
-    assert!(ok.contains("version"), "dashboard-set key lost across a restart: {ok}");
-    let anon = http(r2.port, "/api?mode=version&output=json");
-    assert!(rejected(&anon), "dashboard-set key not enforced after a restart: {anon}");
+    assert!(
+        ok.contains("version"),
+        "dashboard-set key lost across a restart: {ok}"
+    );
+    let anon = http(r2.port, "/api?mode=queue&output=json");
+    assert!(
+        rejected(&anon),
+        "dashboard-set key not enforced after a restart: {anon}"
+    );
     assert!(
         dir.join("apikey").exists(),
         "a dashboard-set key must also land in the key file the container reads"
@@ -670,13 +867,21 @@ fn clear_then_rekey_restores_the_key_file() {
 
     let r = serve(&dir, &[]);
     let key = std::fs::read_to_string(&keyfile).expect("apikey file must be written");
-    let cleared =
-        http(r.port, &format!("/api?mode=config&name=apikey&value=&apikey={key}&output=json"));
+    let cleared = http(
+        r.port,
+        &format!("/api?mode=config&name=apikey&value=&apikey={key}&output=json"),
+    );
     assert!(cleared.contains("\"status\""), "clear rejected: {cleared}");
-    assert!(!keyfile.exists(), "the clear must take the key file with it");
+    assert!(
+        !keyfile.exists(),
+        "the clear must take the key file with it"
+    );
 
     // THE REGRESSION: re-keying has to put the file back.
-    let set = http(r.port, "/api?mode=config&name=apikey&value=second-key&output=json");
+    let set = http(
+        r.port,
+        "/api?mode=config&name=apikey&value=second-key&output=json",
+    );
     assert!(set.contains("\"status\""), "re-key rejected: {set}");
     assert_eq!(
         std::fs::read_to_string(&keyfile).unwrap_or_default().trim(),
@@ -685,12 +890,15 @@ fn clear_then_rekey_restores_the_key_file() {
     );
 
     // And the key itself is live and survives the restart, as before.
-    let anon = http(r.port, "/api?mode=version&output=json");
+    let anon = http(r.port, "/api?mode=queue&output=json");
     assert!(rejected(&anon), "re-keying did not close the API: {anon}");
     drop(r);
     let r2 = serve(&dir, &[]);
     let ok = http(r2.port, "/api?mode=version&apikey=second-key&output=json");
-    assert!(ok.contains("version"), "re-keyed value lost across a restart: {ok}");
+    assert!(
+        ok.contains("version"),
+        "re-keyed value lost across a restart: {ok}"
+    );
 }
 
 /// (d) --bind exists, still defaults to 0.0.0.0, and narrows the listener
@@ -718,7 +926,10 @@ fn bind_parses_and_defaults_to_all_interfaces() {
     let dir = scratch("bind");
     let r = serve(&dir, &["--bind", "127.0.0.1", "--apikey", "sekrit"]);
     let ok = http(r.port, "/api?mode=version&apikey=sekrit&output=json");
-    assert!(ok.contains("version"), "--bind 127.0.0.1 did not serve loopback: {ok}");
+    assert!(
+        ok.contains("version"),
+        "--bind 127.0.0.1 did not serve loopback: {ok}"
+    );
 
     // The rest needs this machine's LAN address, and proving the wide
     // bind reaches it means opening an all-interfaces listener. On macOS
@@ -796,13 +1007,55 @@ fn failed_bind_on_first_run_discloses_the_minted_keyfile() {
     // disclose) - and the disclosed file is the credential that works.
     drop(holder);
     let r = serve(&dir, &[]);
-    let body = http(r.port, &format!("/api?mode=version&output=json&apikey={}", key.trim()));
-    assert!(body.contains("nzbfast"), "disclosed key does not authenticate: {body}");
+    let body = http(
+        r.port,
+        &format!("/api?mode=version&output=json&apikey={}", key.trim()),
+    );
+    assert!(
+        body.contains("nzbfast"),
+        "disclosed key does not authenticate: {body}"
+    );
     assert!(
         !r.log().contains("created an API key"),
         "reuse path must not repeat the failure disclosure:\n{}",
         r.log()
     );
+}
+
+/// One daemon per data directory. The second daemon here has its own
+/// free port - the bind succeeds - so the only thing standing between it
+/// and a shared settings.json is the data-dir lock. The classic real
+/// shape: an old container still running while its replacement starts,
+/// each save overwriting the other's.
+#[test]
+fn a_second_daemon_on_the_same_data_dir_refuses_to_start() {
+    let dir = scratch("second-daemon");
+    let r = serve(&dir, &[]);
+
+    let log = expect_refusal(&dir, free_port(), &["--bind", "127.0.0.1"]);
+    assert!(
+        log.contains("already serving from"),
+        "no lock refusal in the log:\n{log}"
+    );
+
+    // The first daemon is unharmed and still answering with its key.
+    let key = std::fs::read_to_string(dir.join("apikey")).unwrap();
+    let ok = http(
+        r.port,
+        &format!("/api?mode=version&apikey={}&output=json", key.trim()),
+    );
+    assert!(ok.contains("version"), "first daemon disturbed: {ok}");
+
+    // And once the first daemon exits, the same directory serves again -
+    // an advisory lock dies with its process, so there is nothing stale
+    // to clean up after a crash either.
+    drop(r);
+    let r2 = serve(&dir, &[]);
+    let ok = http(
+        r2.port,
+        &format!("/api?mode=version&apikey={}&output=json", key.trim()),
+    );
+    assert!(ok.contains("version"), "lock outlived its daemon: {ok}");
 }
 
 /// This host's routable IPv4, if it has one (no packets are sent).

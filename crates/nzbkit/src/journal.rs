@@ -51,6 +51,7 @@
 //! in particular a DOWNGRADE resume of a plaintext-once journal refetches
 //! encrypted files instead of copying plaintext into volume files.
 
+use crate::sync::MutexExt;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, Write};
@@ -174,11 +175,11 @@ impl Journal {
         let mut valid = false;
         if let Ok(f) = File::open(&path) {
             let mut lines = std::io::BufReader::new(f).lines();
-            if let Some(Ok(header)) = lines.next() {
-                if header.strip_prefix("nzbfast-journal v1 ") == Some(fp.as_str()) {
-                    valid = true;
-                    parse_lines(lines.map_while(Result::ok), &mut resume);
-                }
+            if let Some(Ok(header)) = lines.next()
+                && header.strip_prefix("nzbfast-journal v1 ") == Some(fp.as_str())
+            {
+                valid = true;
+                parse_lines(lines.map_while(Result::ok), &mut resume);
             }
         }
         let mut file = std::fs::OpenOptions::new()
@@ -217,7 +218,7 @@ impl Journal {
         let mut line = String::with_capacity(id.len() + 1);
         line.push_str(id);
         line.push('\n');
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock_ok();
         let _ = st.file.write_all(line.as_bytes());
     }
 
@@ -253,7 +254,16 @@ impl Journal {
         frags: &[Frag],
         crypto_mask: &[bool],
     ) {
-        self.record_letter('D', slot, id, slot_file, name, size, frags, Some(crypto_mask));
+        self.record_letter(
+            'D',
+            slot,
+            id,
+            slot_file,
+            name,
+            size,
+            frags,
+            Some(crypto_mask),
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -278,7 +288,7 @@ impl Journal {
         // per article, all inside this mutex the decoders share.
         use std::fmt::Write as _;
         let mut out = String::new();
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock_ok();
         if !st.slots_emitted.contains(&slot) {
             let (dest, dsize) = match slot_file {
                 Some((n, s)) => (n, s),
@@ -310,7 +320,11 @@ impl Journal {
             }
             list.push_str(&format!("{fidx}:{}:{}:{}", f.file_off, f.vol_off, f.len));
             if let Some(mask) = crypto_mask {
-                list.push_str(if mask.get(i).copied().unwrap_or(true) { ":1" } else { ":0" });
+                list.push_str(if mask.get(i).copied().unwrap_or(true) {
+                    ":1"
+                } else {
+                    ":0"
+                });
             }
         }
         let _ = writeln!(out, "{letter} {slot} {list} {id}");
@@ -328,7 +342,14 @@ impl Journal {
         let mut out = String::new();
         for ev in events {
             match ev {
-                CryptoJournalEvent::Params { name, salt, lg2, iv, unp, check } => {
+                CryptoJournalEvent::Params {
+                    name,
+                    salt,
+                    lg2,
+                    iv,
+                    unp,
+                    check,
+                } => {
                     let ck = check.map(|c| to_hex(&c)).unwrap_or_else(|| "-".into());
                     let _ = writeln!(
                         out,
@@ -341,12 +362,16 @@ impl Journal {
                     let _ = writeln!(out, "K {off} {} {name}", to_hex(block));
                 }
                 CryptoJournalEvent::TailPad { name, pad } => {
-                    let p = if pad.is_empty() { "-".to_string() } else { to_hex(pad) };
+                    let p = if pad.is_empty() {
+                        "-".to_string()
+                    } else {
+                        to_hex(pad)
+                    };
                     let _ = writeln!(out, "T {p} {name}");
                 }
             }
         }
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock_ok();
         let _ = st.file.write_all(out.as_bytes());
     }
 
@@ -388,7 +413,7 @@ impl Journal {
             buf.push_str(f);
             buf.push('\n');
         }
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock_ok();
         st.file.write_all(buf.as_bytes())?;
         st.file.sync_data()
     }
@@ -413,15 +438,19 @@ fn parse_lines(lines: impl Iterator<Item = String>, resume: &mut ResumeState) {
         if let Some(rest) = line.strip_prefix("E ") {
             // E <salt> <lg2> <iv> <unp> <check|-> <name>
             let mut it = rest.splitn(6, ' ');
-            if let (Some(salt), Some(lg2), Some(iv), Some(unp), Some(ck), Some(name)) =
-                (it.next(), it.next(), it.next(), it.next(), it.next(), it.next())
-                && let (Some(salt), Ok(lg2), Some(iv), Ok(unp)) = (
-                    from_hex16(salt),
-                    lg2.parse::<u8>(),
-                    from_hex16(iv),
-                    unp.parse::<u64>(),
-                )
-                && !name.is_empty()
+            if let (Some(salt), Some(lg2), Some(iv), Some(unp), Some(ck), Some(name)) = (
+                it.next(),
+                it.next(),
+                it.next(),
+                it.next(),
+                it.next(),
+                it.next(),
+            ) && let (Some(salt), Ok(lg2), Some(iv), Ok(unp)) = (
+                from_hex16(salt),
+                lg2.parse::<u8>(),
+                from_hex16(iv),
+                unp.parse::<u64>(),
+            ) && !name.is_empty()
             {
                 let check: Option<[u8; 12]> = match ck {
                     "-" => None,
@@ -458,7 +487,11 @@ fn parse_lines(lines: impl Iterator<Item = String>, resume: &mut ResumeState) {
             if let (Some(pad), Some(name)) = (it.next(), it.next())
                 && !name.is_empty()
             {
-                let pad = if pad == "-" { Some(Vec::new()) } else { from_hex(pad) };
+                let pad = if pad == "-" {
+                    Some(Vec::new())
+                } else {
+                    from_hex(pad)
+                };
                 if let Some(pad) = pad {
                     resume
                         .crypto_files
@@ -470,22 +503,20 @@ fn parse_lines(lines: impl Iterator<Item = String>, resume: &mut ResumeState) {
             continue;
         }
         if let Some(rest) = line.strip_prefix("F ") {
-            if let Some((idx, name)) = rest.split_once(' ') {
-                if let Ok(idx) = idx.parse::<usize>() {
-                    if !name.is_empty() {
-                        ftable.insert(idx, sanitize_filename(name));
-                    }
-                }
+            if let Some((idx, name)) = rest.split_once(' ')
+                && let Ok(idx) = idx.parse::<usize>()
+                && !name.is_empty()
+            {
+                ftable.insert(idx, sanitize_filename(name));
             }
         } else if let Some(rest) = line.strip_prefix("S ") {
             let mut it = rest.splitn(3, ' ');
-            if let (Some(slot), Some(size), Some(name)) = (it.next(), it.next(), it.next()) {
-                if let (Ok(slot), Ok(size)) = (slot.parse::<usize>(), size.parse::<u64>()) {
-                    if !name.is_empty() {
-                        // Last S wins - a later run knows the actual file.
-                        slot_meta.insert(slot, (sanitize_filename(name), size));
-                    }
-                }
+            if let (Some(slot), Some(size), Some(name)) = (it.next(), it.next(), it.next())
+                && let (Ok(slot), Ok(size)) = (slot.parse::<usize>(), size.parse::<u64>())
+                && !name.is_empty()
+            {
+                // Last S wins - a later run knows the actual file.
+                slot_meta.insert(slot, (sanitize_filename(name), size));
             }
         } else if let Some((rest, crypto)) = line
             .strip_prefix("R ")
@@ -496,7 +527,9 @@ fn parse_lines(lines: impl Iterator<Item = String>, resume: &mut ResumeState) {
             let (Some(slot), Some(list), Some(id)) = (it.next(), it.next(), it.next()) else {
                 continue;
             };
-            let Ok(slot) = slot.parse::<usize>() else { continue };
+            let Ok(slot) = slot.parse::<usize>() else {
+                continue;
+            };
             if id.is_empty() {
                 continue;
             }
@@ -571,7 +604,9 @@ fn parse_lines(lines: impl Iterator<Item = String>, resume: &mut ResumeState) {
         }
     }
     for (id, (slot, frags, crypto_frag, crypto)) in placed {
-        let Some((name, size)) = slot_meta.get(&slot) else { continue };
+        let Some((name, size)) = slot_meta.get(&slot) else {
+            continue;
+        };
         resume
             .slots
             .entry(slot)
@@ -581,7 +616,12 @@ fn parse_lines(lines: impl Iterator<Item = String>, resume: &mut ResumeState) {
                 articles: Vec::new(),
             })
             .articles
-            .push(Article { id, frags, crypto_frag, crypto });
+            .push(Article {
+                id,
+                frags,
+                crypto_frag,
+                crypto,
+            });
     }
 }
 
@@ -762,6 +802,10 @@ fn restore_crypto(
                 std::fs::OpenOptions::new()
                     .write(true)
                     .create(true)
+                    // Never truncate: the writes below land at offsets
+                    // inside a file this may be re-opening, and set_len
+                    // only ever grows it.
+                    .truncate(false)
                     .open(&j.dest)
                     .ok()
                     .inspect(|d| {
@@ -819,14 +863,17 @@ pub fn restore(out_dir: &Path, resume: &ResumeState, password: Option<&str>) -> 
                 // refetch - falling through to a copy would put
                 // PLAINTEXT into a volume file.
                 if resume.crypto_files.contains_key(f.file.as_str()) {
-                    jobs_by_file.entry(f.file.as_str()).or_default().push(CryptoRestoreJob {
-                        article,
-                        file_off: f.file_off,
-                        vol_off: f.vol_off,
-                        len: f.len,
-                        dest: out_dir.join(&rec.name),
-                        dest_size: rec.size,
-                    });
+                    jobs_by_file
+                        .entry(f.file.as_str())
+                        .or_default()
+                        .push(CryptoRestoreJob {
+                            article,
+                            file_off: f.file_off,
+                            vol_off: f.vol_off,
+                            len: f.len,
+                            dest: out_dir.join(&rec.name),
+                            dest_size: rec.size,
+                        });
                 } else {
                     meta_missing.push(article);
                 }
@@ -868,7 +915,13 @@ pub fn restore(out_dir: &Path, resume: &ResumeState, password: Option<&str>) -> 
         let mut srcs: HashMap<&str, Option<File>> = HashMap::new();
         let mut spans: Vec<(u64, u64)> = Vec::new();
         let mut restored_here = false;
-        for Article { id, frags, crypto_frag, crypto } in &rec.articles {
+        for Article {
+            id,
+            frags,
+            crypto_frag,
+            crypto,
+        } in &rec.articles
+        {
             if *crypto && crypto_verdict.get(&(slot, id.as_str())) != Some(&true) {
                 continue;
             }
@@ -902,6 +955,10 @@ pub fn restore(out_dir: &Path, resume: &ResumeState, password: Option<&str>) -> 
                     dest = std::fs::OpenOptions::new()
                         .write(true)
                         .create(true)
+                        // Never truncate - same reason as the encrypt
+                        // path above: offset writes into a file that may
+                        // already hold earlier records.
+                        .truncate(false)
                         .open(&dest_path)
                         .ok()
                         .inspect(|d| {
@@ -1042,9 +1099,15 @@ mod tests {
         let (_j2, resume) = Journal::open(&dir, nzb).unwrap();
         assert_eq!(resume.slots.len(), 3);
         let restored = restore(&dir, &resume, None);
-        assert!(restored.ids.contains("<vol@x>"), "copy-back article restored");
+        assert!(
+            restored.ids.contains("<vol@x>"),
+            "copy-back article restored"
+        );
         assert!(restored.ids.contains("<pl@x>"), "identity article restored");
-        assert!(!restored.ids.contains("<gone@x>"), "missing source must drop");
+        assert!(
+            !restored.ids.contains("<gone@x>"),
+            "missing source must drop"
+        );
 
         // The copied bytes really moved: vol.part1.rar[5000..15000] ==
         // inner.bin[10000..20000], and the file spans the recorded size.
@@ -1082,9 +1145,23 @@ mod tests {
         std::fs::write(dir.join("extra.bin"), &cipher).unwrap();
         let (j, _) = Journal::open(&dir, nzb).unwrap();
         for (id, off) in [("<a@x>", 0u64), ("<b@x>", 10_000)] {
-            j.record_placed(0, id, None, "v.part1.rar", 30_000, &[frag("movie.mkv", off, off, 10_000)]);
+            j.record_placed(
+                0,
+                id,
+                None,
+                "v.part1.rar",
+                30_000,
+                &[frag("movie.mkv", off, off, 10_000)],
+            );
         }
-        j.record_placed(1, "<c@x>", None, "v.part2.rar", 30_000, &[frag("extra.bin", 0, 0, 10_000)]);
+        j.record_placed(
+            1,
+            "<c@x>",
+            None,
+            "v.part2.rar",
+            30_000,
+            &[frag("extra.bin", 0, 0, 10_000)],
+        );
 
         // Without the barrier those all come back - the intact-ciphertext
         // resume, the fast path a crash before the publish still gets.
@@ -1120,7 +1197,14 @@ mod tests {
 
         // Retirement is positional: the refetched articles re-record and
         // are trusted again, so a second crash still resumes locally.
-        j2.record_placed(0, "<a@x>", None, "v.part1.rar", 30_000, &[frag("movie.mkv", 0, 0, 10_000)]);
+        j2.record_placed(
+            0,
+            "<a@x>",
+            None,
+            "v.part1.rar",
+            30_000,
+            &[frag("movie.mkv", 0, 0, 10_000)],
+        );
         drop(j2);
         let (_j3, resume) = Journal::open(&dir, nzb).unwrap();
         let restored = restore(&dir, &resume, None);
@@ -1128,7 +1212,10 @@ mod tests {
             restored.ids.contains("<a@x>"),
             "a placement recorded AFTER the retirement must still count"
         );
-        assert!(!restored.ids.contains("<b@x>"), "the stale one stays retired");
+        assert!(
+            !restored.ids.contains("<b@x>"),
+            "the stale one stays retired"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -38,12 +38,27 @@ h3{font-size:16.5px;margin:28px 0 6px}
 h4{font-size:14.5px;margin:20px 0 4px}
 p{margin:8px 0}
 li{margin:3px 0}
+/* Prose breaks a long unbreakable token instead of pushing the page sideways.
+   The API section quotes a 368px query string, which does not fit the 280px
+   text column of a 320px phone. Deliberately not applied to header or data
+   cells: inside a scroll wrapper, breaking a cell reflows the columns rather
+   than letting the wide table scroll, which is what the wrapper is for. */
+p,li,.tip,.note,.warn-box{overflow-wrap:break-word}
 code,kbd{background:var(--code);border:1px solid var(--line);border-radius:5px;
   padding:1px 6px;font:12.5px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 pre{background:var(--code);border:1px solid var(--line);border-radius:9px;
   padding:12px 15px;overflow-x:auto;font:12.5px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 pre code{background:none;border:none;padding:0}
-table{border-collapse:collapse;width:100%;margin:12px 0;font-size:13.5px}
+/* A table scrolls inside its own box instead of widening the page. One long
+   unbreakable command in a cell (the docker compose upgrade line, 338px wide
+   in an 87px column) used to drag the whole document sideways on a phone:
+   +140 at 320px and +85 at 375px in English, up to +217 / +162 in the
+   longer-word locales, and da/nl even at 500px. The 12px margin sits on the
+   wrapper so it still collapses with the adjacent paragraph exactly as
+   the margin on the table itself did - a scroll box does not collapse
+   margins through, so leaving it in place would have opened every gap. */
+.tblwrap{overflow-x:auto;margin:12px 0}
+table{border-collapse:collapse;width:100%;margin:0;font-size:13.5px}
 th{text-align:start;color:var(--dim);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
 th,td{padding:7px 0;padding-inline-end:12px;border-bottom:1px solid var(--line);vertical-align:top}
 td code{white-space:nowrap}
@@ -80,6 +95,7 @@ hr{border:none;border-top:1px solid var(--line);margin:30px 0}
   body{background:#fff;color:#000;font-size:11.5pt}
   h2{page-break-after:avoid}
   pre{white-space:pre-wrap}
+  .tblwrap{overflow:visible}
   a{color:inherit}
 }
 </style>
@@ -222,7 +238,7 @@ nzbfast serve --open     # start the daemon and open the dashboard</code></pre>
 
 <h2 id="concepts">3 · كيف يعمل nzbfast</h2>
 <p>مفردات سريعة كي تقرأ بقية الدليل بسهولة:</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>المصطلح</th><th>المعنى</th></tr>
 <tr><td><b>المزوّد / الخادم</b></td><td>خدمة Usenet لديك حساب فيها
 (Newshosting، Eweka، XS News…). يسمح كلٌّ منها بعدد من الاتصالات المتزامنة.</td></tr>
@@ -237,7 +253,7 @@ nzbfast serve --open     # start the daemon and open the dashboard</code></pre>
 <tr><td><b>RAR بنمط التخزين</b></td><td>تُحزَّم معظم الإصدارات في مجلدات RAR بلا
 ضغط. يتعرّف nzbfast على ذلك ويكتب <em>الملف الداخلي</em> مباشرة إلى موضعه
 النهائي أثناء التنزيل - بلا خطوة فكّ ضغط لاحقة.</td></tr>
-</table>
+</table></div>
 <p>يعمل خط المعالجة تنزيل ← فك تشفير ← تحقق ← استخراج <em>بالتزامن</em>. تُظهر
 بطاقة خط المعالجة على لوحة التحكم المسارات الثلاثة تتحرّك دفعةً واحدة. حين تصل آخر
 بايت، يكون التحقق قد تمّ فعلًا والملف قد استُخرج فعلًا؛ فيكون زمن "المعالجة اللاحقة"
@@ -254,13 +270,13 @@ nzbfast serve --open     # start the daemon and open the dashboard</code></pre>
 <p>مقيسًا مقابل SABnzbd 5.0.4 وNZBGet 26.2 على الجهاز نفسه، والمزوّدين
 أنفسهم، وملفات NZB نفسها، مؤقّتًا حتى <em>ملف قابل للاستخدام</em> - التنزيل والتحقق
 والإصلاح والاستخراج جميعها مشمولة، لأن عندها تكون المهمة قد أُنجزت فعلًا:</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>حجم المهمة</th><th>nzbfast</th><th>NZBGet 26.2</th><th>SABnzbd 5.0.4</th></tr>
 <tr><td>7 GB</td><td><b>13.7 s</b></td><td>+26%</td><td>+39%</td></tr>
 <tr><td>35 GB</td><td><b>67 s</b></td><td>+61%</td><td>+325%</td></tr>
 <tr><td>87 GB</td><td><b>272 s</b></td><td>+36%</td><td>+160%</td></tr>
 <tr><td>190 GB</td><td><b>9 m 00 s</b></td><td>+30%</td><td>+111%</td></tr>
-</table>
+</table></div>
 <p>الفجوة هي المعالجة اللاحقة التي لا يزال على الآخرين إجراؤها بعد حطّ آخر
 بايت. ضُبط كلا المنافسَين للمقارنة، لا تُرِكا على الإعدادات الافتراضية -
 فـ SABnzbd خصوصًا يأتي بتسلسل الطلبات بالأنابيب <em>معطّلًا</em>، ما يكلّفه
@@ -354,7 +370,7 @@ nzbfast serve --open     # start the daemon and open the dashboard</code></pre>
 <a href="#performance">أدوات الأداء</a>.</p>
 
 <h2 id="adding">5 · إضافة التنزيلات</h2>
-<table>
+<div class="tblwrap"><table>
 <tr><th>الطريقة</th><th>كيف</th></tr>
 <tr><td><b>السحب والإفلات</b></td><td>أفلِت ملفًا أو أكثر من <code>.nzb</code> في أي مكان على لوحة التحكم.</td></tr>
 <tr><td><b>مجلد المراقبة</b></td><td>عيّن مجلدًا في الإعدادات؛ أي <code>.nzb</code> يُحفَظ فيه
@@ -366,7 +382,7 @@ nzbfast serve --open     # start the daemon and open the dashboard</code></pre>
 <tr><td><b>قائمة المتابعة / RSS</b></td><td>تلقائي - انظر <a href="#automation">الأتمتة</a>.</td></tr>
 <tr><td><b>Sonarr/Radarr إلخ.</b></td><td>ترسل عمليات الجلب مباشرةً إلى قائمة الانتظار - انظر <a href="#arr">§11</a>.</td></tr>
 <tr><td><b>سطر الأوامر</b></td><td><code>nzbfast get file.nzb</code> يُنزّل دون الخدمة.</td></tr>
-</table>
+</table></div>
 <h3>الفئات، الأولويات، كلمات المرور</h3>
 <ul>
 <li><b>الفئات</b> تسميات حرّة الشكل؛ تصبح كلٌّ منها مجلدًا فرعيًا لمجلّد
@@ -468,14 +484,14 @@ Wikipedia وAniList لا تحتاج حسابات. مفتاح OMDb (مجاني، 
 <h2 id="servers">8 · خوادم Usenet</h2>
 <p>الإعدادات ← <b>خوادم Usenet</b> هو المحرّر الكامل: إضافة، تحرير، إزالة، إعادة ترتيب، وإدخال أي خادم إلى
 التجميع أو إخراجه منه. لكل خادم:</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>الحقل</th><th>ملاحظات</th></tr>
 <tr><td>المضيف / المنفذ</td><td>استخدم منفذ SSL <b>563</b>. TLS لا يكلّف شيئًا قابلًا للقياس - يشفّر nzbfast دائمًا.</td></tr>
 <tr><td>اسم المستخدم / كلمة المرور</td><td>تُخزَّن محليًا في <code>config.local.json</code>، ولا تُعاد للمتصفّح أبدًا. ترك كلمة المرور فارغةً عند التحرير يُبقي المخزَّنة. كلمات المرور <a href="#passwords">مموّهة على القرص، لا مشفّرة</a>.</td></tr>
 <tr><td>الاتصالات</td><td>الاتصالات المتزامنة لكل خادم. استخدم <b>ضبط الاتصالات</b> (<a href="#performance">§13</a>) لإيجاد النقطة المثلى لكل مزوّد بدل التخمين عاليًا.</td></tr>
 <tr><td>المستوى (الطبقة)</td><td>0 = أساسي؛ المستويات الأعلى خوادم تعبئة، تُطلَب فقط للمقالات التي فوّتها كل مستوى أدنى. ضع الحسابات غير المحدودة عند 0، وحسابات الكتلة عند 1+.</td></tr>
 <tr><td>حجم الكتلة (GB)</td><td>لحسابات الكتلة (الدفع لكل GB): يتتبّع nzbfast الاستخدام مدى الحياة مقابل هذا ويتوقّف عن استخدام الخادم عند النفاد (تحذير عند 85%).</td></tr>
-</table>
+</table></div>
 <p><b>اترك هامشًا بسيطًا تحت حد الاتصالات في حسابك.</b> ضبط الاتصالات أقل قليلًا من الحد لا يكلّف شيئًا: تتسطّح السرعة قبل الاتصالين الأخيرين بكثير، و<b>ضبط الاتصالات</b> (<a href="#performance">§13</a>) يستقر تحته على أي حال. تلك الأماكن الشاغرة هي ما يسمح لجهاز ثانٍ أو لبرنامج آخر أو لمحاولة جديدة بعد انقطاع المقبس بالدخول رغم ذلك، بدلًا من رفضها بينما يشغل هذا كل مكان.</p>
 <h3 id="passwords">كيف تُحفَظ كلمات مرور مزوّديك</h3>
 <p>كلمات مرور المزوّدين في <code>config.local.json</code> <b>مموّهة، لا مشفّرة</b>.
@@ -506,11 +522,11 @@ Windows وخدمات الأسرار في Linux ستمنح حماية حقيقي�
 <p>خياران آخران لكل خادم لا يملكان بعد عنصر تحكّم في اللوحة: أضفهما يدويًا إلى مدخل
 ذلك الخادم في <code>config.local.json</code> (انظر <a href="#files">§17</a>) ثم أعد
 التشغيل.</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>المفتاح</th><th>ملاحظات</th></tr>
 <tr><td><code>bind_ip</code></td><td>يربط اتصالات هذا الخادم الصادرة بعنوان محلي بعينه، للأجهزة متعددة المخارج ولأنفاق VPN المقسّمة. تختار عائلةُ العنوان عائلةَ الهدف أيضًا: ربط v4 يتصل بعنوان v4 للخادم.</td></tr>
 <tr><td><code>socks5</code></td><td>يمرّر حركة NNTP لهذا الخادم عبر وسيط SOCKS5: <code>host:port</code> أو <code>user:pass@host:port</code>. يحلّ <em>الوسيطُ</em> اسمَ المضيف، فلا يقع تسريب DNS محلي.</td></tr>
-</table>
+</table></div>
 <ul>
 <li><b>علامة الصح</b> بجانب كل خادم هي مفتاح تشغيله: المحدّدة تعني أن الخادم ضمن تجميع
 التنزيل، وغير المحدّدة تعني أنه معطّل. الخادم المعطّل يحتفظ ببيانات اعتماده وإعداداته
@@ -535,7 +551,7 @@ Windows وخدمات الأسرار في Linux ستمنح حماية حقيقي�
 الأوامر).</p>
 
 <h3>السرعة والجدولة <span class="pill live">مباشر</span></h3>
-<table>
+<div class="tblwrap"><table>
 <tr><th>الإعداد</th><th>ما يفعله</th></tr>
 <tr><td>حد السرعة</td><td>حد بالبايت/ثانية (<code>50M</code>، <code>1G</code>، 0 = بلا حد). قد ترسل التطبيقات البعيدة نسبًا مئوية - اضبط <i>سرعة الخط</i> كي تُترجَم صحيحًا.</td></tr>
 <tr><td>سرعة تلقائية</td><td>حد محكوم بـ RTT يُفسح المجال لحركة المرور المنزلية الأخرى ويتوسّع من جديد حين يهدأ الخط.</td></tr>
@@ -544,7 +560,7 @@ Windows وخدمات الأسرار في Linux ستمنح حماية حقيقي�
 <tr><td>التحديث التلقائي / رابط فحص التحديثات</td><td>انظر <a href="#updates">§14</a>.</td></tr>
 <tr><td>سرعة الخط</td><td>السرعة المصنّفة لاتصالك - تتيح حدود النسبة المئوية من التطبيقات المتوافقة مع SABnzbd.</td></tr>
 <tr><td>الجدولة الأسبوعية</td><td>محرّر صفوف لقواعد وقت-الأسبوع: أوقف مؤقتًا، أو استأنف، أو اضبط حد سرعة عند أيام/أوقات معيّنة (بالتوقيت المحلي). مثلًا حُدّ إلى 20&nbsp;MB/s أيام الأسبوع 9–17، وبلا حد غير ذلك.</td></tr>
-</table>
+</table></div>
 
 <h3>التنزيل التالي <span class="pill live">مباشر</span></h3>
 <p><b>الاتصالات</b> (لكل خادم)، و<b>النافذة</b> (عمق التسلسل بالأنابيب لكل اتصال)،
@@ -581,7 +597,7 @@ Windows وخدمات الأسرار في Linux ستمنح حماية حقيقي�
 اسمًا نظيفًا ومعبّرًا: يصير الفيلم <code>Example Movie (2024)</code>، وتحتفظ المسلسلات
 بـ<code>Show - S01E02</code>. أما الأسماء المموّهة أو غير المعروفة فتُترك تمامًا كما
 نُشرت بدل تخمينها.</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>الإعداد</th><th>ما يفعله</th></tr>
 <tr><td>تضمين الدقة</td><td>يضيف <code>1080p</code> و<code>2160p</code>… إلى الاسم. <b>مفعّل افتراضيًا</b>؛ والعلامات الأربع الأخرى مطفأة.</td></tr>
 <tr><td>تضمين ترميز الفيديو</td><td><code>x265</code>، <code>x264</code>، <code>AV1</code>…</td></tr>
@@ -591,7 +607,7 @@ Windows وخدمات الأسرار في Linux ستمنح حماية حقيقي�
 <tr><td>إزالة ملفات النفايات</td><td><b>مفعّلة افتراضيًا.</b> تحذف ما تبقّى من <code>.par2</code> و<code>.nzb</code> و<code>.sfv</code> و<code>.nfo</code> ومقاطع العيّنة من مجلدات الأفلام والمسلسلات المنتهية. ولا تحذف الفيديو ولا ترجماته أبدًا.</td></tr>
 <tr><td>الاحتفاظ بملف الوسائط فقط</td><td><b>مطفأة افتراضيًا، ومدمّرة:</b> تحذف نهائيًا كل ما في المجلد عدا الفيديو (أو مقاطع الفيديو) والترجمات. وتُحفظ كل حلقة من حزمة الموسم. وتتقدّم على <b>إزالة ملفات النفايات</b> حين تكون الاثنتان مفعّلتين.</td></tr>
 <tr><td>Keep the other words in the name</td><td><b>مُفعَّل افتراضيًا.</b> كثيرًا ما تكون الرياضة والسباقات وغيرها من الفعاليات عنوانًا واحدًا يتكرّر طوال الموسم، ولا يفصل بينها سوى كلمة أو كلمتين - "Round11 Hungary Race" مقابل "Round11 Hungary Qualifying". والاحتفاظ بتلك الكلمات هو ما يمنع موسمًا كاملًا من الانهيار إلى الاسم نفسه. ولا ينطبق إلا حيث تعذّر ترتيب الاسم بأي طريقة أخرى، فتبقى الأفلام والحلقات العادية دون مساس.</td></tr>
-</table>
+</table></div>
 <p class="dim">تعمل المجموعة كلها بعد الإصلاح وفكّ الضغط وقبل <b>نقل المكتملة إلى</b>،
 وتُتخطّى بالكامل لمهمة ما زالت تنتظر كلمة مرور. وتنطبق خطوتا الحذف <em>فقط</em> على
 الإصدارات المعروفة أنها فيلم أو مسلسل: أما حمولة برمجية أو مجموعة غير قابلة للتصنيف
@@ -615,7 +631,7 @@ Windows وخدمات الأسرار في Linux ستمنح حماية حقيقي�
 ينشرون فيها بأسماء حقيقية، أو أردت أن ترى ما يحمله مزوّدك فعلًا. ومع إطفاء المفتاح لا
 يُمسَح شيء ولا يُجلَب، ولا تُنشَأ قاعدة بيانات، ويُخفى الجدار وتصفّح الفهرس وقائمة
 المراقبة وتغذية newznab.</div>
-<table>
+<div class="tblwrap"><table>
 <tr><th>الإعداد</th><th>ما يفعله</th></tr>
 <tr><td>المفهرس المدمج</td><td>المفتاح الرئيسي، <b>مُطفأ ما لم تشغّله</b>. الإطفاء يعني لا مسح ولا استعلامات بيانات وصفية ولا أخذ عيّنات توفّر ولا تغذية newznab؛ ويُحتفَظ بأي فهرس موجود على القرص (ثمة زر حذف)، فإعادة التشغيل تستأنف بدل إعادة المسح.</td></tr>
 <tr><td>المجموعات</td><td>مجموعات الأخبار التي يفحصها المفهرِس المدمج (مثل <code>alt.binaries.teevee</code>).</td></tr>
@@ -627,7 +643,12 @@ Windows وخدمات الأسرار في Linux ستمنح حماية حقيقي�
 <tr><td>بوابات الاستيعاب</td><td>قواعد JSON تُرشّح ما يدخل الفهرس: الأنواع (النفايات المموّهة تُسقَط افتراضيًا)، والسنة/الدقة/اللغة، وحدود الحجم.</td></tr>
 <tr><td>افحص الآن / إعادة فحص عميقة</td><td>شغّل تمريرة فورًا؛ ومع عمق، أعِد فحص هذا العدد من الترويسات الأخيرة.</td></tr>
 <tr><td>مفتاح OMDb / تحديث البيانات الوصفية / محو</td><td>عناصر تحكّم إثراء الجدار (<a href="#wall">§6</a>). المحو يُعيد بناء قاعدة البيانات من الصفر - مسار الاستعادة إن تلفت يومًا.</td></tr>
-</table>
+<tr><td>تغذية الـpre</td><td><b>مطفأة حتى تشغّلها.</b> كثير من الرفعات تُنشر بلا اسمها، فلا يجد المسح ما يقرؤه. قنوات الترحيل العامة تعلن الاسم الحقيقي، وهو السبيل المفتوح الوحيد لمطابقة تلك المنشورات. التشغيل يبقي اتصالًا مفتوحًا بشبكة IRC ويستمع: لا يُرسل شيء أبدًا ولا يُنشأ حساب. تحتاج المفهرس مشغّلًا، لأن تغذية بلا مكان تضع فيه ما تسمعه ليست إلا مقبسًا مفتوحًا بلا طائل.</td></tr>
+<tr><td>خادوم الترحيل، قنوات الترحيل</td><td>شبكة الـIRC التي تحمل الإعلانات (مضيف أو مضيف:منفذ) والقنوات المراد الاستماع فيها، مفصولة بفواصل. يسري التغيير عند الاتصال التالي: أطفئ التغذية ثم شغّلها لتطبيقه فورًا.</td></tr>
+<tr><td>التسمية بالارتباط</td><td>الترحيلات العامة الحية لا تحمل أسماء ملفات، لذا يتعذّر ربط معظم المنشورات المموّهة مباشرة. لكن الإعلان يثبّت متى ظهرت الإصدارة وكم حجمها. يقارن هذا وقت الإعلان وحجمه بالمنشورات بلا اسم، وعند التوافق يقترح الاسم الحقيقي في صفحة التصفّح. الاقتراح مُعلَّم بوصفه اقتراحًا، ويحتاج نقرتك، ولا يعيد أبدًا تسمية ملفات على القرص.</td></tr>
+<tr><td>تطبيق المطابقات القوية تلقائيًا</td><td>مطفأ افتراضيًا، وصارم عند تشغيله: يجب أن يتوافق الحجم توافقًا وثيقًا، وألّا يقارب إعلان آخر التوافق نفسه، وأن يختار الإعلان هذا المنشور بدوره في الفحص العكسي. الاسم المطبَّق يغيّر طريقة عرض الإصدارة فحسب، ويُعلَّم بأنه مستنتَج، ويُسحب من تلقاء نفسه إذا أثبت تنزيل مكتمل خطأه. وكل ما هو أضعف يبقى اقتراحًا.</td></tr>
+<tr><td>تاريخ الإعلانات</td><td>التغذية الحية لا تسمع إلا الإعلانات التالية لتشغيلها. يجلب هذا نحو ستة أشهر من الإعلانات السابقة من قاعدة pre عامة، بأدب ومرة واحدة، لتُطابَق أيضًا المنشورات المفهرسة سلفًا. يعمل في الخلفية نحو نصف ساعة.</td></tr>
+</table></div>
 
 <h3>المكتبة، الأمان، الواجهة</h3>
 <p><b>المكتبة</b>: الفئات المعامَلة كإدخالات مكتبة فورية + فترة إعادة الفحص.
@@ -639,17 +660,19 @@ Windows وخدمات الأسرار في Linux ستمنح حماية حقيقي�
 كما يعلن المزوّدون سرعات الخطوط). وتبقى أحجام الملفات بالبايت في الحالتين. وهذه خاصية
 للخفيّ لا لمتصفّحك، فهي تسري على كل جهاز ينظر إلى هذا التثبيت.</p>
 <h3>متقدّم: إعدادات بلا عنصر تحكّم في اللوحة</h3>
-<p>أربعة إعدادات لا عنصر تحكّم لها في الواجهة ولا راية في سطر الأوامر. اضبطها عبر
+<p>ستة إعدادات لا عنصر تحكّم لها في الواجهة ولا راية في سطر الأوامر. اضبطها عبر
 الواجهة البرمجية (<a href="#api">§16</a>)، مثلًا
 <code>/api?mode=config&amp;name=verify_mode&amp;value=lean&amp;apikey=…</code>. وكغيرها
 جميعًا تُحفظ في <code>settings.json</code>.</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>الاسم</th><th>ما يفعله</th></tr>
 <tr><td><code>verify_mode</code></td><td><code>full</code> | <code>fast</code> | <code>lean</code> (الافتراضي <code>fast</code>). و<code>lean</code> هو الدفعة للمعالجات البطيئة: مثل fast، لكنه يتخطّى أيضًا تدقيق yEnc لكل مقالة متى غطّى PAR2 ملفًا، فتبقى طبقة CRC32 واحدة بدل اثنتين. أما التنزيلات بلا PAR2 فتحتفظ بتدقيق مقالاتها، ولا يتغيّر التحقق ولا الإصلاح في نهاية المهمة في الحالتين. و<b>التحقق السريع</b> أعلاه هو العنصر نفسه للاختيار بين full وfast.</td></tr>
 <tr><td><code>auto_retry_mins</code></td><td>مهلة الانتظار قبل المحاولة التلقائية <em>الوحيدة</em> التي يحظى بها إخفاق أول بسبب مقالات ناقصة (الافتراضي 20). فتأخّر الانتشار سبب حقيقي لنقص المقالات وينحلّ من تلقاء نفسه؛ وبفضل السجلّ لا تجلب الإعادة إلا ما بقي ناقصًا. ولا تندرج إخفاقات كلمة المرور أو الإزالة في هذا أبدًا.</td></tr>
 <tr><td><code>index_scan_par</code></td><td>كم مجموعة يمسحها المفهرس بالتوازي (الافتراضي 3، محصور بين 1-8).</td></tr>
 <tr><td><code>oracle_sample</code></td><td>ميزانية STAT في الخمول لعرّاف التوفّر (<a href="#oracle">§13</a>)، عدد السبر في الساعة لكل خادم. الافتراضي 300، وأقصاه 3600، و<code>0</code> يعطّل أخذ العينات كليًا.</td></tr>
-</table>
+<tr><td><code>predb_max_rows</code></td><td>كم إعلان pre يحتفظ به جدول التغذية (الافتراضي 250000، محصور بين 10000 و5000000). التشذيب الساعي يقلّص إلى هذا الرقم، والاستيراد التاريخي يرفض البدء إن كان سيتجاوزه، فلا يضيف استيراد أبدًا صفوفًا يحذفها التشذيب التالي.</td></tr>
+<tr><td><code>predb_seed_days</code></td><td>إلى أي مدى يعود الاستيراد التاريخي إذا بدأ دون نافذة خاصة به (الافتراضي 180 يومًا، بحد أقصى 366). النافذة الأوسع تعني طلبات أكثر إلى مصدر pre، وإيقاعه طلب واحد كل ثانيتين.</td></tr>
+</table></div>
 <h2 id="automation">10 · الأتمتة</h2>
 <h3>قائمة المتابعة</h3>
 <p>أبسط أتمتة: أضِف عنوانًا على لوحة التحكم، واضبط تفضيلات الجودة،
@@ -704,22 +727,22 @@ Windows وخدمات الأسرار في Linux ستمنح حماية حقيقي�
 <p>يُنفّذ nzbfast <em>كلا</em> بروتوكولَي التحكم عن بُعد الرئيسيَّين، فيعمل تقريبًا كل
 تطبيق للهاتف/اللوحي. اختر أيّ بروتوكول يدعمه تطبيقك:</p>
 <h3>التطبيقات التي تتحدّث NZBGet (nzb360، LunaSea، NZB Unity…)</h3>
-<table>
+<div class="tblwrap"><table>
 <tr><th>الحقل في التطبيق</th><th>القيمة</th></tr>
 <tr><td>النوع</td><td>NZBGet</td></tr>
 <tr><td>المضيف / المنفذ</td><td>جهازك : <b>6789</b></td></tr>
 <tr><td>اسم المستخدم</td><td>أي شيء (مثل <code>nzbfast</code>)</td></tr>
 <tr><td>كلمة المرور</td><td><b>مفتاح API</b> لديك</td></tr>
-</table>
+</table></div>
 <p>يُقدَّم كامل سطح JSON-RPC الذي تستخدمه هذه التطبيقات: الحالة، وقائمة الانتظار مع
 إعادة الترتيب/الإيقاف المؤقت/الحذف، والسجل، وإضافة NZB، وحد السرعة، والإيقاف المؤقت/الاستئناف، والسجل.</p>
 <h3>التطبيقات التي تتحدّث SABnzbd</h3>
-<table>
+<div class="tblwrap"><table>
 <tr><th>الحقل في التطبيق</th><th>القيمة</th></tr>
 <tr><td>النوع</td><td>SABnzbd</td></tr>
 <tr><td>المضيف / المنفذ</td><td>جهازك : <b>6789</b></td></tr>
 <tr><td>مفتاح API</td><td>مفتاح API لديك (أو مفتاح NZB للوصول بإضافة فقط)</td></tr>
-</table>
+</table></div>
 <h3>لوحة التحكم على هاتفك</h3>
 <p>افتح فقط <code>http://&lt;machine&gt;:6789</code> في متصفّح هاتف - لكامل
 لوحة التحكم والجدار تخطيط لمسي. تعرض لوحة الإعدادات ← الوصول عن بُعد
@@ -784,13 +807,13 @@ Windows وخدمات الأسرار في Linux ستمنح حماية حقيقي�
 مجانيًا، وفي المهام الكبيرة يمكنك قياسه.</p>
 <p>مقيسًا على جهاز واحد وخط واحد (M1 Ultra، 10 GbE)، بالملفات نفسها عند كل
 ميزانية. أنتج كل تشغيل نتيجةً صحيحة ومتحقَّقًا منها بالكامل ومستخرَجة:</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>حجم المهمة</th><th>وفرة من RAM</th><th>ميزانية 2 GB<br><span class="dim">≈ جهاز 8 GB</span></th><th>ميزانية 1 GB<br><span class="dim">≈ جهاز 4 GB</span></th><th>ميزانية 256 MB<br><span class="dim">≈ NAS بـ 2 GB</span></th></tr>
 <tr><td>7 GB</td><td>15 s</td><td>15 s</td><td>15 s</td><td>15 s</td></tr>
 <tr><td>35 GB</td><td>65 s</td><td>70 s</td><td>70 s</td><td>65 s</td></tr>
 <tr><td>87 GB</td><td>148 s</td><td>206 s <span class="dim">+39%</span></td><td>196 s <span class="dim">+32%</span></td><td>180 s <span class="dim">+22%</span></td></tr>
 <tr><td>190 GB</td><td>330 s</td><td>427 s <span class="dim">+29%</span></td><td>402 s <span class="dim">+22%</span></td><td>411 s <span class="dim">+25%</span></td></tr>
-</table>
+</table></div>
 <p>تتبع الذاكرة القصوى <em>الميزانية</em>، لا المهمة: فذلك التنزيل بحجم 190 GB يكتمل
 في نحو 1.1 GB من RAM. ما تقايض به هو الوقت - وعلى المهام الكبيرة فقط.</p>
 <ul>
@@ -837,9 +860,55 @@ Windows وخدمات الأسرار في Linux ستمنح حماية حقيقي�
 للتحقق يفعل الأمر نفسه.</li>
 </ul>
 
+<h3 id="updating">التحديث دون فقدان إعداداتك</h3>
+<p>قاعدة واحدة تشمل كل تنصيب: <b>التحديث يستبدل البرنامج، لا إعداداتك
+أبدًا.</b> كل ما هيّأته - الخوادم والمسارات ومفتاح API وقائمة الانتظار -
+يقيم في حفنة ملفات داخل مجلد واحد (<a href="#files">§17</a>)، ولا يمسّ ذلك
+المجلد أي مثبّت أو سحب صورة أو ترقية حزمة. وحين تبدو الإعدادات مختفية بعد
+تحديث، فالسبب في الغالب الأعم أن التنصيب الجديد يقرأ مجلدًا <em>آخر
+فارغًا</em>، لا أن شيئًا حُذف؛ فالملفات القديمة ما تزال حيث كانت دائمًا.
+وفي <a href="#settings-gone">§18</a> خطوات الاسترداد.</p>
+<div class="tblwrap"><table>
+<tr><th>التنصيب</th><th>كيفية التحديث</th></tr>
+<tr><td>تطبيق macOS</td><td>افتح صورة DMG الجديدة واسحب <b>NzbFast</b> إلى
+<b>Applications</b> مستبدلًا القديم. مجلد بياناتك منفصل ولا
+يُمسّ.</td></tr>
+<tr><td>مثبّت Windows</td><td>شغّل برنامج الإعداد الجديد فوق التنصيب
+القديم. مجلد بياناتك منفصل ولا يُمسّ.</td></tr>
+<tr><td>Docker (سطر الأوامر)</td><td><code>docker pull nzbfast/nzbfast</code>،
+أزل الحاوية القديمة، ثم شغّل الجديدة <b>بتعيينات <code>-v</code> نفسها
+تمامًا</b>. الصورة قابلة للاستغناء عنها؛ ومجلد <code>/config</code>
+المعيّن هو تنصيبك. إن كان أمر التشغيل لديك يستخدم مسارًا نسبيًا مثل
+<code>-v ./config:/config</code>، فشغّله من الدليل نفسه في كل مرة - فمن أي
+مكان آخر يكون <code>./config</code> مجلدًا آخر فارغًا.</td></tr>
+<tr><td>Docker Compose</td><td><code>docker compose pull &amp;&amp; docker compose
+up -d</code>، باستخدام ملف compose نفسه في المكان نفسه. فـ<code>./config</code>
+الوارد في الملف مرسوّ إلى مجلد الملف ذاته، فأبقِ الملف حيث هو.</td></tr>
+<tr><td>Watchtower</td><td>لا شيء تفعله: فهو يعيد إنشاء الحاوية بالتعيينات
+نفسها عند صدور صورة جديدة.</td></tr>
+<tr><td>Unraid</td><td>تبويب Docker ← <b>Check for Updates</b> ← <b>Apply
+Update</b>. لا تزل التطبيق وتعد إضافته أبدًا لتحديثه؛ وإن أعدت التنصيب
+يومًا فأبقِ مسار appdata نفسه ليجد <code>/config</code> الموجود
+لديك.</td></tr>
+<tr><td>Synology (Container Manager)</td><td>نزّل الصورة الجديدة، وأوقف
+الحاوية، وأعد إنشاءها بإعدادات وحدات التخزين نفسها - والشرح في دليل
+Synology يغطي ذلك نقرة نقرة، بما في ذلك تنفيذه على جدول زمني.</td></tr>
+<tr><td>Synology (حزمة)</td><td>ثبّت ملف <code>.spk</code> الجديد في
+Package Center؛ فيرقّي نفسه في مكانه.</td></tr>
+<tr><td>Homebrew</td><td><code>brew upgrade nzbfast</code></td></tr>
+<tr><td>ملف تنفيذي مجرّد</td><td>استبدل الملف التنفيذي. يبقى إعدادك حيث
+أنشأته (<a href="#files">§17</a>).</td></tr>
+</table></div>
+<div class="tip"><b>نصيحة</b>مستخدمو Docker الذين يوصلون Sonarr أو Radarr:
+ضعوا مفتاح API في تعريف الحاوية نفسه
+(<code>-e NZBFAST_APIKEY=…</code>، أو كتلة environment في ملف compose
+لديكم أو في قالب Unraid). المفتاح المخزّن هناك ينجو من أي حادث للحاوية،
+لأنه يقيم على المضيف، داخل التعريف، ويُعاد تطبيقه عند كل بدء تشغيل.
+والمفتاح الذي تضبطه لاحقًا في الإعدادات يظل يتقدّم عليه.</div>
+
 <h2 id="cli">15 · سطر الأوامر</h2>
 <p>كل ما تفعله الخدمة قابل للبرمجة أيضًا. الأوامر اليومية:</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>الأمر</th><th>الغرض</th></tr>
 <tr><td><code>nzbfast setup</code></td><td>إعداد خادم تفاعلي.</td></tr>
 <tr><td><code>nzbfast serve</code></td><td>شغّل الخدمة (لوحة التحكم + API + أتمتة). <code>--open</code> يفتح المتصفّح؛ و<code>--apikey</code> يضبط المفتاح يدويًا (<a href="#firstrun-key">§2</a>)؛ و<code>--bind</code> يختار عنوان الإصغاء، والافتراضي <code>0.0.0.0</code> (كل واجهة)، و<code>127.0.0.1</code> لهذا الجهاز وحده. انظر <code>--help</code> لقائمة الأعلام الكاملة - لكل إعداد في لوحة التحكم توأم عَلَم.</td></tr>
@@ -849,10 +918,11 @@ Windows وخدمات الأسرار في Linux ستمنح حماية حقيقي�
 <tr><td><code>nzbfast sysbench</code></td><td>قياس أداء النظام + تقرير التنوّع، في الطرفية.</td></tr>
 <tr><td><code>nzbfast index / search</code></td><td>افحص المجموعات إلى الفهرس / ابحث فيه، بلا خدمة.</td></tr>
 <tr><td><code>nzbfast import-sab</code></td><td>استورد الخوادم من ini الخاص بـ SABnzbd.</td></tr>
-</table>
+</table></div>
 <p class="dim">متوفّر أيضًا: <code>inspect</code>، <code>probe</code>،
 <code>bench</code>، <code>bench-cpu</code>، <code>soak</code>، <code>fetch</code>،
 <code>spots</code>/<code>spot-search</code>/<code>spot-get</code> (Spotnet)،
+<code>predb-seed</code> (يملأ قاعدة الـpre بالفترة السابقة لتشغيل التغذية)،
 <code>make-release-nzb</code>/<code>make-test-nzb</code> (تجهيزات اختبار). كل
 أمر يقبل <code>--config</code> و<code>--help</code>. ويضاف إليها <code>post</code>: ترفع الملفات مقالاتِ yEnc وتكتب
 ملف NZB المطابق. وهي أداة تشغيل، تتطلّب <code>--post-server</code> صريحًا ولا تختار لك
@@ -863,7 +933,7 @@ Windows وخدمات الأسرار في Linux ستمنح حماية حقيقي�
 متوافقة مع SABnzbd، فتعمل تكاملات SAB الحالية دون تغيير. مفتاحان:
 <b>مفتاح API</b> (تحكّم كامل) و<b>مفتاح NZB</b> (إضافة فقط:
 <code>addfile</code>/<code>addurl</code>). <code>addnzblnk</code> ليس ضمن مجموعة الإضافة فقط عن قصد: فحلّ رابط قد يستهلك حصة مفهرس مدفوعة، وهذا ليس من شأن اعتماد مخصّص للإضافة فقط.</p>
-<table>
+<div class="tblwrap"><table>
 <tr><th>المجال</th><th>الأوضاع</th></tr>
 <tr><td>قائمة الانتظار</td><td><code>queue</code> (مع <code>name=delete/pause/resume/priority/switch</code>)، <code>pause</code>، <code>resume</code>، <code>addfile</code>، <code>addurl</code>، <code>addnzblnk</code>، <code>retry</code>، <code>set_password</code></td></tr>
 <tr><td>المعلومات</td><td><code>history</code>، <code>status</code>/<code>fullstatus</code>، <code>stats</code>، <code>version</code>، <code>server_stats</code>، <code>usage</code>، <code>log</code>، <code>warnings</code></td></tr>
@@ -873,10 +943,24 @@ Windows وخدمات الأسرار في Linux ستمنح حماية حقيقي�
 <tr><td>التشخيص</td><td><code>sysbench</code>، <code>bench_history</code>، <code>connladder</code>، <code>pooltest</code>، <code>diversity</code>، <code>update_check</code>، <code>update_apply</code></td></tr>
 <tr><td>NZBGet JSON-RPC</td><td><code>/jsonrpc</code> - status، listgroups، history، append، editqueue، rate، pause، log (مصادقة Basic: أي مستخدم، مفتاح API ككلمة مرور)</td></tr>
 <tr><td>المعاينة / التشغيل</td><td><code>/stream/&lt;nzo_id&gt;</code> (نطاقات HTTP؛ بدء مهمة مكتبة متوقّفة يحتاج رمز <code>?t=</code> أو مفتاحًا)، <code>/m3u/&lt;id&gt;</code> (يحتاج مفتاحًا؛ يسكّ الرمز)، <code>/wall</code>، <code>/art/…</code></td></tr>
-</table>
+</table></div>
 
 <h2 id="files">17 · الملفات والمواقع</h2>
-<table>
+<p>يعتمد موضع مجلد الإعدادات على طريقة تنصيب nzbfast. هذا المجلد الواحد
+يحوي كل ما يستحق النسخ الاحتياطي:</p>
+<div class="tblwrap"><table>
+<tr><th>التنصيب</th><th>مجلد الإعدادات</th></tr>
+<tr><td>تطبيق macOS</td><td><code>~/Library/Application Support/nzbfast/</code></td></tr>
+<tr><td>Windows</td><td><code>%LOCALAPPDATA%\nzbfast\</code></td></tr>
+<tr><td>حاويات Docker / NAS</td><td><code>/config</code> داخل الحاوية، وهو
+مجلد المضيف الذي عيّنته إليها. وعلى Unraid هو مجلد appdata الخاص
+بالتطبيق.</td></tr>
+<tr><td>حزمة Synology</td><td><code>/var/packages/nzbfast/var/</code></td></tr>
+<tr><td>الطرفية</td><td>المجلد الذي شغّلت فيه <code>nzbfast setup</code>،
+أو حيث يشير <code>--config</code> / <code>$NZBFAST_CONFIG</code>.</td></tr>
+</table></div>
+<p>وما الذي بداخله:</p>
+<div class="tblwrap"><table>
 <tr><th>الملف</th><th>المحتويات</th></tr>
 <tr><td><code>config.local.json</code></td><td>بيانات اعتماد الخوادم وخيارات كل خادم. يُنشئه المعالج؛ قابل للتحرير في الإعدادات. أبقِه خاصًّا. كلمات المرور <a href="#passwords">مموّهة، لا مشفّرة</a>.</td></tr>
 <tr><td><code>settings.json</code></td><td>كل إعداد غُيّر في لوحة التحكم. يقيم بجانب الإعداد؛ قيم الواجهة تتجاوز أعلام سطر الأوامر. احذف مفتاحًا (أو الملف) للعودة إلى الأعلام/الافتراضيات.</td></tr>
@@ -885,10 +969,10 @@ Windows وخدمات الأسرار في Linux ستمنح حماية حقيقي�
 <tr><td><code>&lt;config&gt;/.spool/</code></td><td>حالة قائمة الانتظار (تبقى عبر إعادة التشغيل)، وملفات NZB لكل مهمة، وسجلّ الاستخدام، وتاريخ قياس الأداء، وذاكرة صور الملصقات المؤقتة.</td></tr>
 <tr><td>سجلّ المقالات</td><td>داخل مجلد خرج كل مهمة أثناء عدم اكتمالها - يشغّل استئناف التعطّل وإعادة المحاولة. يُزال عند النجاح.</td></tr>
 <tr><td>الأدوات الخارجية</td><td>لا يلزم شيء - استخراج RAR وإصلاح PAR2 أصيلان. إن احتاجت مجموعة غريبة يومًا إلى <code>unrar</code> أو <code>par2</code> خارجي كمسار احتياطي، يبحث nzbfast بجانب ملفه التنفيذي، ثم على <code>$PATH</code>.</td></tr>
-</table>
+</table></div>
 
 <h2 id="troubleshooting">18 · استكشاف الأخطاء</h2>
-<table>
+<div class="tblwrap"><table>
 <tr><th>العَرَض</th><th>افحص</th></tr>
 <tr><td>تنزيلات بطيئة</td><td>شغّل <b>قياس أداء النظام</b> - يسمّي عنق الزجاجة صراحةً. إن كان الشبكة: شغّل <b>ضبط الاتصالات</b>، وتحقّق من أعداد اتصالات كل خادم، وتأكّد أن مزوّديك ليسوا كلهم عمودًا فقريًا واحدًا (<b>تنوّع الخوادم</b>).</td></tr>
 <tr><td>بطيء فقط على المهام الكبيرة جدًا<br>(NAS أو جهاز منخفض الذاكرة)</td><td>متوقّع، وقابل للقياس: ميزانية ذاكرة مجوّعة تنسكب الذواكر المؤقتة إلى القرص وتكلّف 20–40% بعد ~87 GB. انظر <a href="#memory">ميزانية الذاكرة</a> للأرقام وكم RAM تمنحها. المهام الأصغر غير متأثّرة.</td></tr>
@@ -899,12 +983,13 @@ Windows وخدمات الأسرار في Linux ستمنح حماية حقيقي�
 <tr><td>أرشيف يتعذر فك ضغطه</td><td>أخطاء كلمة المرور والإصلاح تسمي نفسها في صف السجل. ولكل ما عدا ذلك يوجد مخرج طوارئ: الإعدادات → مجلد المراقبة والمعالجة اللاحقة → <b>فك الضغط بواسطة unrar خارجي</b> (إعداد متقدم) يسلم فك الضغط إلى برنامج <code>unrar</code> المثبت على جهازك بدلًا من المستخرج المدمج. اتركه معطلًا فيما عدا ذلك: المسار المدمج أسرع في كل شكل قسناه، والمنشورات المموهة بأسماء التجزئة تستخدمه دائمًا على أي حال، لأن unrar لا يستطيع متابعة إعادة تسميتها. المفتاح نفسه لتشغيلات <code>nzbfast get</code> هو متغير البيئة <code>NZBFAST_NO_NATIVE_UNRAR=1</code>. إذا فك unrar ضغط أرشيف رفضه المستخرج المدمج، فأبلغنا من فضلك لنصلح المسار المدمج.</td></tr>
 <tr><td>يتعذّر على Sonarr/Radarr الاتصال</td><td>هل المنفذ 6789 قابل للوصول؟ مفتاح API صحيح (المفتاح الكامل، لا مفتاح NZB)؟ نوع العميل مضبوط على SABnzbd؟</td></tr>
 <tr><td>تطلب لوحة التحكم مفتاح API لم أضبطه قط</td><td>يصنع التثبيت الجديد واحدًا لنفسه ويطبعه مرة واحدة عند البدء (<a href="#firstrun-key">§2</a>). وهو في ملف <code>apikey</code> بجانب إعدادك، وفي خرج البدء. أو اكتب مفتاحًا من عندك في الإعدادات ← الأمان من متصفّح سجّل الدخول أصلًا.</td></tr>
+<tr id="settings-gone"><td>كل إعداداتي تبدو مختفية بعد تحديث<br>(الخوادم، المسارات، مفتاح API)</td><td>لا شيء في التحديث يحذف الإعدادات؛ فهذا يعني أن nzbfast يقرأ مجلدًا آخر فارغًا. أولًا: حقل مفتاح API في الإعدادات يظهر فارغًا عمدًا - انقر <b>Show</b> قبل أن تستنتج أنه ضاع. وعلى Docker، قارن تعيين <code>/config</code> للحاوية الجديدة بتعيين القديمة: فمسار مضيف تغيّر، أو مسار نسبي شُغّل من دليل مختلف، أو مجلد appdata جديد، كلها تبدأ nzbfast من الصفر بينما تجلس إعداداتك الحقيقية دون مساس عند المسار السابق. اعثر على المجلد القديم (ابحث عن <code>settings.json</code> وملف إعدادك و<code>apikey</code> - المواقع في <a href="#files">§17</a>)، ثم إمّا أن تعيد توجيه التعيين إليه أو تنسخ تلك الملفات إلى المجلد الجديد وتعيد التشغيل. ويسمّي سجلّ البدء ملف الإعدادات المستخدم بالضبط: <code>[settings] applying saved settings from …</code></td></tr>
 <tr><td>لا شيء على الشبكة يصل إلى الخدمة</td><td>افحص <code>--bind</code>: فـ<code>127.0.0.1</code> يخدم الجهاز الذي يعمل عليه nzbfast وحده. والافتراضي، <code>0.0.0.0</code>، يخدم كل واجهة. ثم افحص جدار حماية الجهاز نفسه للمنفذ 6789.</td></tr>
 <tr><td>بطاقة التصفّح تبقى صغيرة</td><td>ينمو المفهرِس في الخلفية - تحقّق من ضبط مجموعات الإعدادات ← الفهرسة، وامنح التعميق لكل فحص وقتًا لتراكم التاريخ. "افحص الآن" يجبر تمريرة؛ ويعرض سطر الحالة تقدّمًا حيًّا.</td></tr>
 <tr><td>الجدار يعرض صورًا خاطئة/لا صور</td><td>ورقة التفاصيل ← ✎ أصلِح التطابق أو ↻ حدّث البيانات الوصفية. تتحسّن عمليات البحث عن الأفلام بمفتاح OMDb مجاني.</td></tr>
 <tr><td>لا تبدأ الخدمة: المنفذ مستخدم</td><td>مثيل آخر يعمل - أو غيّر <code>--port</code>.</td></tr>
 <tr><td>أين السجلات؟</td><td>بطاقة السجل على لوحة التحكم، أو الطرفية/ملف السجل الذي أطلقت به <code>serve</code>.</td></tr>
-</table>
+</table></div>
 <div class="note"><b>لا تزال عالقًا؟</b>عادةً تسمّي بطاقة السجل الجاني -
 ضمّن ذيلها عند الإبلاغ عن مشكلة، مع
 <code>nzbfast --version</code> لديك.</div>

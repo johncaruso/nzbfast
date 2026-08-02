@@ -31,6 +31,9 @@ use std::sync::Once;
 
 use crate::yenc::{Decoded, Meta, YencError, field_hex, field_name, field_u64};
 
+// SAFETY: these declarations must match the C definitions exported by the
+// vendored rapidyenc library (vendor/rapidyenc, see module doc). Pointer
+// contracts are documented and upheld at each call site below.
 unsafe extern "C" {
     fn rapidyenc_decode_init();
     fn rapidyenc_crc_init();
@@ -59,6 +62,9 @@ const END_ARTICLE: c_int = 2; // \r\n.\r\n seen
 static INIT: Once = Once::new();
 
 fn init() {
+    // SAFETY: argumentless FFI initialisers, nothing to dereference; the Once
+    // serialises the pair so rapidyenc is initialised exactly once before any
+    // other entry point (every public fn in this module calls init() first).
     INIT.call_once(|| unsafe {
         rapidyenc_decode_init();
         rapidyenc_crc_init();
@@ -68,6 +74,7 @@ fn init() {
 /// (decode_kernel, crc_kernel) as RYKERN_* values - for diagnostics/bench.
 pub fn kernels() -> (i32, i32) {
     init();
+    // SAFETY: argumentless FFI queries; init() has run on the line above.
     unsafe { (rapidyenc_decode_kernel(), rapidyenc_crc_kernel()) }
 }
 
@@ -76,6 +83,8 @@ pub fn kernels() -> (i32, i32) {
 /// fragments as 4-byte CRCs instead of block-sized buffers (B1).
 pub fn crc32_combine(crc1: u32, crc2: u32, len2: u64) -> u32 {
     init();
+    // SAFETY: by-value arguments only, nothing dereferenced; init() has run
+    // on the line above.
     unsafe { rapidyenc_crc_combine(crc1, crc2, len2) }
 }
 
@@ -84,6 +93,8 @@ pub fn crc32_combine(crc1: u32, crc2: u32, len2: u64) -> u32 {
 /// zero-padded to block_size).
 pub fn crc32_zeros(crc: u32, len: u64) -> u32 {
     init();
+    // SAFETY: by-value arguments only, nothing dereferenced; init() has run
+    // on the line above.
     unsafe { rapidyenc_crc_zeros(crc, len) }
 }
 
@@ -239,10 +250,17 @@ pub fn decode_into_integrity(
             // ---- payload mode: one rapidyenc pass over the rest ----
             let chunk = &body[pos..];
             data.reserve(chunk.len());
+            // SAFETY: data.len() <= capacity always holds for a Vec, so the
+            // offset lands at the start of the spare capacity, within (or one
+            // past the end of) the same allocation.
             let dest_base = unsafe { data.as_mut_ptr().add(data.len()) };
             let mut src: *const c_void = chunk.as_ptr().cast();
             let mut dst: *mut c_void = dest_base.cast();
             let mut state: c_int = STATE_CRLF;
+            // SAFETY: src covers exactly chunk.len() readable bytes of `body`;
+            // the reserve() above guarantees chunk.len() writable bytes at
+            // dest_base, enough because decode is non-expanding (written <=
+            // input, re-asserted below); src/dst/state are live locals.
             let endseq = unsafe {
                 rapidyenc_decode_incremental(&mut src, &mut dst, chunk.len(), &mut state)
             };
@@ -256,6 +274,9 @@ pub fn decode_into_integrity(
                 "rapidyenc decoded {written} bytes from {} input (would overflow the output buffer)",
                 chunk.len()
             );
+            // SAFETY: written <= chunk.len() <= the spare capacity reserved
+            // above (enforced by the assert), and rapidyenc has initialised
+            // those `written` bytes.
             unsafe { data.set_len(data.len() + written) };
             let consumed = src as usize - chunk.as_ptr() as usize;
             pos += consumed;
@@ -412,9 +433,11 @@ pub fn decode_into_integrity(
         // it force-skips regardless of delegation (bench only; the CRC
         // is the sole guard on PAR2-less sets - bare-LF trailer bug).
         static SKIP_PCRC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let force_skip = *SKIP_PCRC
-            .get_or_init(|| std::env::var("NZBFAST_SKIP_PCRC").is_ok_and(|v| v == "1"));
+        let force_skip =
+            *SKIP_PCRC.get_or_init(|| std::env::var("NZBFAST_SKIP_PCRC").is_ok_and(|v| v == "1"));
         if verify_crc && !force_skip {
+            // SAFETY: reads exactly data.len() bytes from the live `data`
+            // buffer; init() ran at function entry.
             let computed = unsafe { rapidyenc_crc(data.as_ptr().cast(), data.len(), 0) };
             if computed != header {
                 return Err(YencError::CrcMismatch { computed, header });
@@ -435,7 +458,10 @@ pub fn decode_into_integrity(
             end,
             len: data.len(),
         },
-        DecodeIntegrity { crc_checked, verified_article_crc },
+        DecodeIntegrity {
+            crc_checked,
+            verified_article_crc,
+        },
     ))
 }
 
@@ -627,7 +653,11 @@ mod tests {
         // rejection byte-for-byte.
         let mut bad = lf.clone();
         let first_payload = bad.iter().position(|&b| b == b'\n').unwrap() + 1;
-        bad[first_payload] = if bad[first_payload] == b'A' { b'B' } else { b'A' };
+        bad[first_payload] = if bad[first_payload] == b'A' {
+            b'B'
+        } else {
+            b'A'
+        };
         assert!(
             matches!(
                 decode(&bad),
@@ -649,7 +679,10 @@ mod tests {
             b"=ybegin line=128 size=8 name=a.bin\r\nAAAA\r\n=yzzzz\r\nBBBB\r\n=yend\r\n".as_slice();
         let simd = decode(body).expect("simd decode");
         let oracle = yenc::decode(body).expect("oracle decode");
-        assert_eq!(simd, oracle, "SIMD diverged from oracle on a `=y` payload line");
+        assert_eq!(
+            simd, oracle,
+            "SIMD diverged from oracle on a `=y` payload line"
+        );
         // 4 + 5 + 4: the middle line contributes 0x0F ('=y') then four 'z'.
         assert_eq!(
             simd.data,
@@ -833,7 +866,10 @@ mod tests {
         let padded = crc32fast::hash(&[&a[..], &[0u8; 733][..]].concat());
         assert_eq!(crc32_zeros(crc32fast::hash(&a), 733), padded);
         // Degenerate lengths.
-        assert_eq!(crc32_combine(crc32fast::hash(&a), 0, 0), crc32fast::hash(&a));
+        assert_eq!(
+            crc32_combine(crc32fast::hash(&a), 0, 0),
+            crc32fast::hash(&a)
+        );
         assert_eq!(crc32_zeros(crc32fast::hash(&a), 0), crc32fast::hash(&a));
     }
 
@@ -857,8 +893,12 @@ mod tests {
             .position(|w| w == b"\r\n=ypart ")
             .map(|i| i + 2)
             .expect("=ypart header");
-        let ypart_end =
-            hdr_end + art[hdr_end..].windows(2).position(|w| w == b"\r\n").unwrap() + 2;
+        let ypart_end = hdr_end
+            + art[hdr_end..]
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .unwrap()
+            + 2;
         for cut in [hdr_end, ypart_end] {
             assert!(
                 matches!(decode(&art[..cut]), Err(YencError::Truncated)),

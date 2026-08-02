@@ -3,6 +3,8 @@
 //! parked Completed with a .strm pointer, and downloaded for real only
 //! when /stream/<nzo_id> is first played. Missing content parks Failed.
 
+mod scratch;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -12,7 +14,9 @@ use std::process::{Child, Command, Stdio};
 use nzbkit::mock::{Chaos, MockServer, make_file_articles};
 
 fn payload(n: usize, seed: u8) -> Vec<u8> {
-    (0..n).map(|i| (i as u8).wrapping_mul(29).wrapping_add(seed)).collect()
+    (0..n)
+        .map(|i| (i as u8).wrapping_mul(29).wrapping_add(seed))
+        .collect()
 }
 
 /// OS-assigned free port for a daemon under test. The old pid-derived
@@ -21,7 +25,11 @@ fn payload(n: usize, seed: u8) -> Vec<u8> {
 /// whichever daemon bound second - and could also land on the ephemeral
 /// range the suites' own client sockets draw from.
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 /// Response body of a request to the daemon (headers stripped).
@@ -44,7 +52,9 @@ fn http(port: u16, req: &str, body: Option<(&str, &[u8])>) -> String {
             Ok(out) => return out,
             Err(e) => {
                 last = e.to_string();
-                std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(attempt) + 50));
+                std::thread::sleep(std::time::Duration::from_millis(
+                    100 * u64::from(attempt) + 50,
+                ));
             }
         }
     }
@@ -58,7 +68,11 @@ fn http_once(port: u16, req: &str, body: Option<(&str, &[u8])>) -> std::io::Resu
     let mut request = Vec::new();
     match body {
         None => {
-            write!(request, "GET {req} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+            write!(
+                request,
+                "GET {req} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
         }
         Some((ctype, data)) => {
             write!(
@@ -78,8 +92,11 @@ fn http_once(port: u16, req: &str, body: Option<(&str, &[u8])>) -> std::io::Resu
 /// Refusals are retried on the same terms as `http`.
 fn http_raw(port: u16, req: &str, extra_hdrs: &str) -> (String, Vec<u8>) {
     let mut request = Vec::new();
-    write!(request, "GET {req} HTTP/1.1\r\nHost: x\r\n{extra_hdrs}Connection: close\r\n\r\n")
-        .unwrap();
+    write!(
+        request,
+        "GET {req} HTTP/1.1\r\nHost: x\r\n{extra_hdrs}Connection: close\r\n\r\n"
+    )
+    .unwrap();
     let raw = self::raw(port, &request);
     match raw.windows(4).position(|w| w == b"\r\n\r\n") {
         Some(p) => (
@@ -97,11 +114,17 @@ fn raw(port: u16, request: &[u8]) -> Vec<u8> {
             Ok(out) => return out,
             Err(e) => {
                 last = e.to_string();
-                std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(attempt) + 50));
+                std::thread::sleep(std::time::Duration::from_millis(
+                    100 * u64::from(attempt) + 50,
+                ));
             }
         }
     }
-    let line = String::from_utf8_lossy(request).lines().next().unwrap_or("").to_string();
+    let line = String::from_utf8_lossy(request)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string();
     panic!("daemon on :{port} never answered {line:?}: {last}");
 }
 
@@ -246,13 +269,19 @@ async fn serve(dir: &Path, build: impl Fn(u16) -> Command) -> Daemon {
         .await
         .unwrap();
         if ready {
-            return Daemon { _child: child, port };
+            return Daemon {
+                _child: child,
+                port,
+            };
         }
         // The daemon exited instead of binding: `free_port()` handed :port
         // to a parallel test between our bind(:0) and the daemon's bind,
         // and that test's daemon won it. Try a fresh port.
         let tail = std::fs::read_to_string(&logfile).unwrap_or_default();
-        assert!(attempt < 2, "daemon exited without binding :{port}\n--- log ---\n{tail}");
+        assert!(
+            attempt < 2,
+            "daemon exited without binding :{port}\n--- log ---\n{tail}"
+        );
     }
     unreachable!()
 }
@@ -272,7 +301,9 @@ async fn serve(dir: &Path, build: impl Fn(u16) -> Command) -> Daemon {
 fn wait_ready(child: &mut KillOnDrop, port: u16, logfile: &Path) -> bool {
     let banner = format!("open the dashboard at  http://localhost:{port}/");
     for _ in 0..600 {
-        if std::fs::read_to_string(logfile).unwrap_or_default().contains(&banner)
+        if std::fs::read_to_string(logfile)
+            .unwrap_or_default()
+            .contains(&banner)
             && TcpStream::connect(("127.0.0.1", port)).is_ok()
         {
             return true;
@@ -305,8 +336,7 @@ fn poll_history_keyed(port: u16, status: &str, tries: usize, key: &str) -> Optio
 #[tokio::test(flavor = "multi_thread")]
 async fn library_job_completes_without_downloading() {
     let dir = std::env::temp_dir().join(format!("nzbfast-lib1-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let data = payload(400_000, 3);
     let mut articles = HashMap::new();
@@ -320,7 +350,11 @@ async fn library_job_completes_without_downloading() {
     let dir2 = dir.clone();
     tokio::task::spawn_blocking(move || {
         let (ctype, body) = multipart(&xml);
-        let r = http(port, "/api?mode=addfile&cat=library&output=json", Some((&ctype, &body)));
+        let r = http(
+            port,
+            "/api?mode=addfile&cat=library&output=json",
+            Some((&ctype, &body)),
+        );
         assert!(r.contains("\"status\":true"), "{r}");
         let id = nzo_id(&r);
 
@@ -340,8 +374,14 @@ async fn library_job_completes_without_downloading() {
         let content = std::fs::read_to_string(&strm)
             .unwrap_or_else(|e| panic!("missing {}: {e}", strm.display()));
         let prefix = format!("http://127.0.0.1:{port}/stream/{id}?t=");
-        assert!(content.starts_with(&prefix) && content.ends_with('\n'), "{content}");
-        assert!(content.trim_end().len() > prefix.len(), "empty stream token: {content}");
+        assert!(
+            content.starts_with(&prefix) && content.ends_with('\n'),
+            "{content}"
+        );
+        assert!(
+            content.trim_end().len() > prefix.len(),
+            "empty stream token: {content}"
+        );
     })
     .await
     .unwrap();
@@ -355,17 +395,28 @@ async fn stream_of_library_job_triggers_download() {
     // the movie's exact first bytes once the writers appear.
     use nzbkit::rar::fixtures;
     let dir = std::env::temp_dir().join(format!("nzbfast-lib2-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let inner = payload(6_000_000, 7);
     let vols = [
-        fixtures::rar5_volume_n(&[("movie.mkv", 6_000_000, &inner[..2_000_000], false, true)], 0),
         fixtures::rar5_volume_n(
-            &[("movie.mkv", 6_000_000, &inner[2_000_000..4_000_000], true, true)],
+            &[("movie.mkv", 6_000_000, &inner[..2_000_000], false, true)],
+            0,
+        ),
+        fixtures::rar5_volume_n(
+            &[(
+                "movie.mkv",
+                6_000_000,
+                &inner[2_000_000..4_000_000],
+                true,
+                true,
+            )],
             1,
         ),
-        fixtures::rar5_volume_n(&[("movie.mkv", 6_000_000, &inner[4_000_000..], true, false)], 2),
+        fixtures::rar5_volume_n(
+            &[("movie.mkv", 6_000_000, &inner[4_000_000..], true, false)],
+            2,
+        ),
     ];
     let mut articles = HashMap::new();
     let mut xml = String::from(
@@ -394,7 +445,11 @@ async fn stream_of_library_job_triggers_download() {
     let inner2 = inner.clone();
     tokio::task::spawn_blocking(move || {
         let (ctype, body) = multipart(&xml);
-        let r = http(port, "/api?mode=addfile&cat=library&output=json", Some((&ctype, &body)));
+        let r = http(
+            port,
+            "/api?mode=addfile&cat=library&output=json",
+            Some((&ctype, &body)),
+        );
         assert!(r.contains("\"status\":true"), "{r}");
         let id = nzo_id(&r);
         poll_history(port, "Completed", 40).expect("library check never completed");
@@ -402,15 +457,14 @@ async fn stream_of_library_job_triggers_download() {
 
         // First play: the endpoint itself waits for the forced download's
         // writers, so a single request must come back 206 with real bytes.
-        let (head, got) = http_raw(
-            port,
-            &format!("/stream/{id}"),
-            "Range: bytes=0-99999\r\n",
-        );
+        let (head, got) = http_raw(port, &format!("/stream/{id}"), "Range: bytes=0-99999\r\n");
         assert!(head.contains("206"), "{head}");
         assert_eq!(got.len(), 100_000, "range length");
         assert_eq!(&got[..], &inner2[..100_000], "streamed head bytes differ");
-        assert!(served.load(std::sync::atomic::Ordering::Relaxed) > 0, "no BODY fetched");
+        assert!(
+            served.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "no BODY fetched"
+        );
 
         // The job re-parks Completed in history once the download finishes.
         poll_history(port, "Completed", 100).expect("forced download never completed");
@@ -430,8 +484,7 @@ async fn unauthenticated_stream_cannot_start_parked_job() {
     // mutation (force-start past a pause) and must be rejected without the
     // key or the per-job token; /m3u is the authenticated token mint.
     let dir = std::env::temp_dir().join(format!("nzbfast-lib4-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let data = payload(400_000, 9);
     let mut articles = HashMap::new();
@@ -457,14 +510,23 @@ async fn unauthenticated_stream_cannot_start_parked_job() {
 
         // Keyless + tokenless: 401, and the job must stay parked.
         let (head, _) = http_raw(port, &format!("/stream/{id}"), "");
-        assert!(head.contains("401"), "unauthenticated /stream must be rejected: {head}");
+        assert!(
+            head.contains("401"),
+            "unauthenticated /stream must be rejected: {head}"
+        );
         // Wrong token: same.
         let (head, _) = http_raw(port, &format!("/stream/{id}?t=deadbeef"), "");
-        assert!(head.contains("401"), "bad-token /stream must be rejected: {head}");
+        assert!(
+            head.contains("401"),
+            "bad-token /stream must be rejected: {head}"
+        );
         // State unchanged: still parked Completed in history, not queued,
         // and not a single article body fetched.
         let q = http(port, "/api?mode=queue&output=json&apikey=sesame", None);
-        assert!(!q.contains(&id), "job must not be queued by unauthenticated /stream: {q}");
+        assert!(
+            !q.contains(&id),
+            "job must not be queued by unauthenticated /stream: {q}"
+        );
         let h = http(port, "/api?mode=history&output=json&apikey=sesame", None);
         assert!(h.contains(&id) && h.contains("\"Completed\""), "{h}");
         assert_eq!(
@@ -475,13 +537,18 @@ async fn unauthenticated_stream_cannot_start_parked_job() {
 
         // /m3u without the key must not mint a token…
         let (head, _) = http_raw(port, &format!("/m3u/{id}"), "");
-        assert!(head.contains("401"), "keyless /m3u must be rejected: {head}");
+        assert!(
+            head.contains("401"),
+            "keyless /m3u must be rejected: {head}"
+        );
         // …with it, the playlist carries the tokened stream URL.
         let (head, m3u) = http_raw(port, &format!("/m3u/{id}?apikey=sesame"), "");
         assert!(head.contains("200"), "{head}");
         let m3u = String::from_utf8_lossy(&m3u);
         let marker = format!("/stream/{id}?t=");
-        let tpos = m3u.find(&marker).unwrap_or_else(|| panic!("no tokened URL in {m3u}"));
+        let tpos = m3u
+            .find(&marker)
+            .unwrap_or_else(|| panic!("no tokened URL in {m3u}"));
         let tok: String = m3u[tpos + marker.len()..]
             .chars()
             .take_while(|c| c.is_ascii_hexdigit())
@@ -514,8 +581,7 @@ async fn unauthenticated_stream_cannot_start_parked_job() {
 #[tokio::test(flavor = "multi_thread")]
 async fn library_job_with_missing_articles_fails() {
     let dir = std::env::temp_dir().join(format!("nzbfast-lib3-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let data = payload(400_000, 5);
     let mut articles = HashMap::new();
@@ -531,7 +597,11 @@ async fn library_job_with_missing_articles_fails() {
     let xml = nzb_xml("gone.mkv", &segs);
     tokio::task::spawn_blocking(move || {
         let (ctype, body) = multipart(&xml);
-        let r = http(port, "/api?mode=addfile&cat=library&output=json", Some((&ctype, &body)));
+        let r = http(
+            port,
+            "/api?mode=addfile&cat=library&output=json",
+            Some((&ctype, &body)),
+        );
         assert!(r.contains("\"status\":true"), "{r}");
         let h = poll_history(port, "Failed", 40).expect("impossible job never parked Failed");
         assert!(h.contains("pre-flight"), "{h}");
@@ -550,13 +620,18 @@ async fn library_job_with_missing_articles_fails() {
 async fn stream_of_a_finished_download_serves_it_from_disk() {
     use nzbkit::rar::fixtures;
     let dir = std::env::temp_dir().join(format!("nzbfast-done-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let _scratch = scratch::ScratchDir::attach(&dir);
 
     let inner = payload(2_000_000, 11);
     let vols = [
-        fixtures::rar5_volume_n(&[("movie.mkv", 2_000_000, &inner[..1_000_000], false, true)], 0),
-        fixtures::rar5_volume_n(&[("movie.mkv", 2_000_000, &inner[1_000_000..], true, false)], 1),
+        fixtures::rar5_volume_n(
+            &[("movie.mkv", 2_000_000, &inner[..1_000_000], false, true)],
+            0,
+        ),
+        fixtures::rar5_volume_n(
+            &[("movie.mkv", 2_000_000, &inner[1_000_000..], true, false)],
+            1,
+        ),
     ];
     let mut articles = HashMap::new();
     let mut xml = String::from(

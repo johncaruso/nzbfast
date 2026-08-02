@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use tracing::warn;
 
 use rusqlite::{Connection, OptionalExtension};
 
@@ -24,6 +25,11 @@ pub struct Index {
     /// FTS5 available and rel_fts created - search/browse take the
     /// index path; false falls back to the LIKE scans.
     fts: bool,
+    /// pre_fts created - the small FTS index over pre-feed names. Its own
+    /// flag rather than riding on `fts`: it is created later than
+    /// `rel_fts`, so an index built before this feature existed has one
+    /// and not the other until the next open.
+    pre_fts: bool,
     /// people_fts created. Tracked separately from `fts` on purpose: the
     /// name-search leg is an OR inside the main browse predicate, so if
     /// that table were missing every search on the wall would fail, not
@@ -34,7 +40,55 @@ pub struct Index {
     /// built-in kinds; `reclassify_custom` reconciles stored rows after
     /// a config change.
     custom: Vec<crate::categories::CustomCategory>,
+    /// Does the pre feed hold anything? Read once at open so that on the
+    /// overwhelmingly common install - the feed is off, the table is
+    /// empty - ingest pays nothing at all for the naming lookup. An
+    /// install that switches the feed on gets the lookup from the next
+    /// re-open, which the scan loop does after every pass.
+    predb: bool,
+    /// Names the caller wants told about the moment a release gains or
+    /// changes one: release name → interesting? None = tell me nothing,
+    /// which costs a single null check per touched release. Same
+    /// arrangement as `gate` - the index applies a verdict it does not
+    /// author (here it is the daemon's watchlist).
+    watch: Option<Box<dyn Fn(&str) -> bool + Send>>,
+    /// What `watch` said yes to since the caller last drained it. Behind
+    /// a RefCell because the naming legs run on `&self`; the index is
+    /// single-threaded behind the daemon's mutex either way.
+    hits: std::cell::RefCell<WatchHits>,
 }
+
+/// A release a batch just touched that [`Index::set_watch_names`] said
+/// the caller cares about. Deliberately thin: it answers "is this worth
+/// waking the watchlist for", and every decision that follows is made by
+/// the watchlist pass against the database, not against this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchHit {
+    pub id: i64,
+    /// The name the release is known by NOW - the fed name where one has
+    /// been applied, the posted stem otherwise.
+    pub name: String,
+    /// Every file seen has all its parts. A fresh arrival is usually
+    /// false for its first few batches: the post is still going up.
+    pub complete: bool,
+}
+
+/// The journal behind [`Index::take_watch_hits`], with the cap that
+/// keeps a backfill from growing it without bound.
+#[derive(Default)]
+struct WatchHits {
+    list: Vec<WatchHit>,
+    /// Hits thrown away because the journal was full. Reported so a
+    /// dropped arrival is a number somebody can see rather than silence.
+    dropped: u32,
+}
+
+/// How many un-drained hits the journal holds. A tip tick drains after
+/// every chunk, so this is only ever reached by a leg that names
+/// thousands of releases at once (a correlation backlog sweep over a
+/// freshly seeded pre corpus). Losing the overflow costs latency, never
+/// coverage: the periodic watchlist pass sees the same releases.
+const WATCH_HITS_CAP: usize = 512;
 
 /// One indexed release (search result row).
 #[derive(Debug, Clone)]
@@ -66,18 +120,36 @@ pub struct Release {
     pub vcodec: String,
     pub acodec: String,
     pub hdr: String,
+    /// The real release name a pre feed gave this post ('' = never
+    /// named that way). When set, this is what the UI should show: the
+    /// stem beside it is the obfuscated string it was posted under.
+    pub pre_title: String,
+    /// Where that name came from, so the claim can be attributed rather
+    /// than presented as something we read off the wire.
+    pub pre_source: String,
 }
 
 /// Column list every Release row read shares (search + browse).
 const REL_COLS: &str = "id, stem, poster, grp, total_bytes, files, has_par2, complete,
      first_posted, first_seen, kind, res, have_parts, need_parts,
-     vcodec, acodec, hdr";
+     vcodec, acodec, hdr, pre_title, pre_source";
 
 /// How many candidate rows an NZBLNK header lookup will look at per
 /// rung before giving up. Bounds both the FTS verification pass and the
 /// unindexed filename scan; a header that matches this many things was
 /// never distinctive enough to identify one posting.
 const FIND_SCAN_CAP: u32 = 500;
+
+/// How many candidate releases one pre's forward window may return.
+///
+/// A cost bound that is also a correctness bound. `corr_mutual_best`
+/// asks whether OUR candidate beats the best competitor by the auto
+/// margin, and a competitor the query truncated away makes `best_other`
+/// understated - which loosens the gate in the direction that renames
+/// a release wrongly. So the cap is generous, and hitting it is treated
+/// as "this window cannot answer the question" rather than as an
+/// answer. Was 50, unordered, over a size-banded window.
+const CORR_WINDOW: usize = 200;
 
 fn release_from_row(r: &rusqlite::Row) -> rusqlite::Result<Release> {
     Ok(Release {
@@ -98,7 +170,23 @@ fn release_from_row(r: &rusqlite::Row) -> rusqlite::Result<Release> {
         vcodec: r.get(14)?,
         acodec: r.get(15)?,
         hdr: r.get(16)?,
+        pre_title: r.get(17)?,
+        pre_source: r.get(18)?,
     })
+}
+
+impl Release {
+    /// What to show a person: the fed name when we have one, otherwise
+    /// the posted stem. One function so the API, the classifier and
+    /// anything else that renders a release agree on which string is the
+    /// name.
+    pub fn display_name(&self) -> &str {
+        if self.pre_title.is_empty() {
+            &self.stem
+        } else {
+            &self.pre_title
+        }
+    }
 }
 
 /// Browse-view filter/sort/page request (M25). Defaults: everything,
@@ -388,12 +476,152 @@ pub(crate) const EXE_FILE_SQL: &str = "(LOWER(filename) LIKE '%.exe' \
      OR LOWER(filename) LIKE '%.com' OR LOWER(filename) LIKE '%.msi' \
      OR LOWER(filename) LIKE '%.vbs' OR LOWER(filename) LIKE '%.pif')";
 
-pub fn junk_score(
-    stem: &str,
-    p: &crate::release::Parsed,
-    total_bytes: u64,
-    has_exe: bool,
-) -> i64 {
+/// Per-release inputs to the correlation scorer, computed once per
+/// release per evaluation.
+#[derive(Debug, Clone)]
+struct CorrRelFacts {
+    #[allow(dead_code)]
+    stem: String,
+    first_posted: i64,
+    grp_kind: crate::predb_corr::GroupKind,
+    est_content: u64,
+    par2_identified: bool,
+    rel_files: u32,
+}
+
+/// One predb row as the correlation legs read it.
+#[derive(Debug, Clone)]
+struct CorrPreRow {
+    id: i64,
+    title: String,
+    category: String,
+    source: String,
+    size: u64,
+    files: u32,
+    nuked: bool,
+    pt: i64,
+    /// Carries a posted filename - such a row belongs to the exact
+    /// legs, which outrank correlation by construction.
+    has_fn: bool,
+}
+
+/// A scored (pre, release) candidate.
+#[derive(Debug, Clone)]
+struct CorrCand {
+    pre: CorrPreRow,
+    score: crate::predb_corr::CorrScore,
+}
+
+/// What `corr_consider` did with a release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CorrOutcome {
+    Nothing,
+    Suggested,
+    Applied,
+}
+
+/// The provenance base for a correlated name: the pre row's own source
+/// when it has one, "relay" otherwise, so `pre_source_label` renders
+/// `predb/corr:<where the pre came from>`.
+fn corr_source_base(source: &str) -> &str {
+    let s = source.trim();
+    if s.is_empty() { "relay" } else { s }
+}
+
+/// One member row of a split-container set, as `split_merge_group`
+/// reads it.
+struct SplitMember {
+    id: i64,
+    stem: String,
+    complete: bool,
+    has_par2: bool,
+    first_posted: i64,
+    first_seen: i64,
+    have_parts: i64,
+    need_parts: i64,
+    pre_named: bool,
+}
+
+/// `predb.tried_at` value meaning "swept, and its post never turned up".
+/// A timestamp far outside any real clock, so retired rows sort to the
+/// end of `idx_predb_tried` and the sweep's range scan stops before
+/// them. Deliberately not a separate column: one index, one scan.
+const PREDB_RETIRED: i64 = 1 << 40;
+
+/// Ask the pre feed what a posted stem was really called.
+///
+/// Exact key first, then the separator-insensitive one - both indexed on
+/// the `predb` side, which is why the lookup is cheap enough to sit in
+/// the ingest path. `ORDER BY id DESC` picks the most recently learned
+/// title when a filename has (unusually) been announced twice.
+///
+/// Returns `(title, source label)`. The label is never empty: a name
+/// nobody can attribute is a name we should not be showing.
+fn predb_lookup(db: &Connection, stem: &str) -> Option<(String, String)> {
+    if stem.is_empty() {
+        return None;
+    }
+    let lower = stem.to_ascii_lowercase();
+    // prepare_cached, not prepare: this sits in the ingest loop and runs
+    // once per clustered release, so re-planning the statement per call
+    // would be the whole cost of the feature.
+    let one = |sql: &str, arg: &String| -> Option<(String, String)> {
+        db.prepare_cached(sql)
+            .ok()?
+            .query_row([arg], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .optional()
+            .ok()
+            .flatten()
+    };
+    let hit = one(
+        "SELECT title, source FROM predb WHERE fnstem=?1 ORDER BY id DESC LIMIT 1",
+        &lower,
+    );
+    let hit = match hit {
+        Some(h) => Some(h),
+        None => {
+            let key = crate::predb::match_key(&lower);
+            if key.is_empty() {
+                return None;
+            }
+            one(
+                "SELECT title, source FROM predb WHERE fnkey=?1 ORDER BY id DESC LIMIT 1",
+                &key,
+            )
+        }
+    }?;
+    let (title, source) = hit;
+    if title.trim().is_empty() {
+        return None;
+    }
+    Some((title, pre_source_label(&source)))
+}
+
+/// The provenance string stored on a named release.
+///
+/// Always says "predb" so the origin of the name is legible without
+/// knowing the relay's own vocabulary, and appends the relay's source
+/// tag when it sent one. This is what a UI badge would render, and what
+/// makes the difference between "the post said so" and "somebody told
+/// us" visible rather than implied.
+/// Idempotent: the two callers reach it by different routes (one via
+/// `predb_lookup`, which has already labelled) and double-prefixing
+/// would produce `predb/predb/PRE`.
+fn pre_source_label(source: &str) -> String {
+    let s = source.trim();
+    if s == "predb" || s.starts_with("predb/") {
+        return s.to_string();
+    }
+    if s.is_empty() {
+        "predb".to_string()
+    } else {
+        format!("predb/{s}")
+    }
+}
+
+pub fn junk_score(stem: &str, p: &crate::release::Parsed, total_bytes: u64, has_exe: bool) -> i64 {
     use crate::release::Kind;
     let mut s: i64 = match p.kind {
         // Unparseable stems.
@@ -407,7 +635,9 @@ pub fn junk_score(
     // token, which would break its all-token rules).
     let bare = stem
         .rsplit_once('.')
-        .filter(|(b, ext)| !b.is_empty() && ext.len() <= 4 && ext.chars().all(|c| c.is_ascii_alphanumeric()))
+        .filter(|(b, ext)| {
+            !b.is_empty() && ext.len() <= 4 && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        })
         .map(|(b, _)| b)
         .unwrap_or(stem);
     if crate::release::looks_obfuscated(bare) {
@@ -422,7 +652,11 @@ pub fn junk_score(
     if p.year.is_none() && p.season.is_none() && p.res.is_none() {
         let blobbish = |t: &str| {
             let (up, lo, di) = t.chars().fold((false, false, false), |(u, l, d), c| {
-                (u || c.is_ascii_uppercase(), l || c.is_ascii_lowercase(), d || c.is_ascii_digit())
+                (
+                    u || c.is_ascii_uppercase(),
+                    l || c.is_ascii_lowercase(),
+                    d || c.is_ascii_digit(),
+                )
             });
             (t.len() >= 8 && t.chars().all(|c| c.is_ascii_alphanumeric()) && up && lo && di)
                 || (t.len() >= 10 && di && t.chars().all(|c| c.is_ascii_hexdigit()))
@@ -467,9 +701,7 @@ pub fn junk_score(
     if p.season.is_none() && p.episode.is_none() {
         let t = bare.trim_start();
         let nd = t.chars().take_while(|c| c.is_ascii_digit()).count();
-        if (1..=3).contains(&nd)
-            && t[nd..].trim_start_matches(' ').starts_with("- ")
-        {
+        if (1..=3).contains(&nd) && t[nd..].trim_start_matches(' ').starts_with("- ") {
             s = s.max(60);
         }
     }
@@ -477,12 +709,12 @@ pub fn junk_score(
     // name") - repost-bot spam whose inner name looks real and would
     // otherwise pollute a genuine title's card. Anime subgroup brackets
     // ("[SubsPlease]") are words, not hex, and survive.
-    if let Some(rest) = bare.strip_prefix('[') {
-        if let Some(end) = rest.find(']') {
-            let tag = &rest[..end];
-            if tag.len() >= 8 && tag.chars().all(|c| c.is_ascii_hexdigit()) {
-                s = s.max(60);
-            }
+    if let Some(rest) = bare.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        let tag = &rest[..end];
+        if tag.len() >= 8 && tag.chars().all(|c| c.is_ascii_hexdigit()) {
+            s = s.max(60);
         }
     }
     // junk_v6: a parsed MOVIE claiming HD on a sub-200 MB post is spam
@@ -517,8 +749,9 @@ pub fn junk_score(
     // riding a real release's name. These filled the newest-first list
     // with 0.00 GB rows no indexer site would show.
     let lower = stem.to_ascii_lowercase();
-    const FURNITURE: [&str; 8] =
-        [".nfo", ".srr", ".sfv", ".nzb", ".idx", ".sub", ".srt", ".sample"];
+    const FURNITURE: [&str; 8] = [
+        ".nfo", ".srr", ".sfv", ".nzb", ".idx", ".sub", ".srt", ".sample",
+    ];
     if FURNITURE.iter().any(|e| lower.ends_with(e)) {
         s = s.max(60);
     }
@@ -527,7 +760,9 @@ pub fn junk_score(
     // full releases with 'sample' in the title). Real samples are tens of
     // MB; past 300 MB the token is part of a title, not a role.
     if total_bytes < 300 << 20
-        && lower.split(['.', '_', '-', ' ']).any(|t| t == "sample" || t == "proof")
+        && lower
+            .split(['.', '_', '-', ' '])
+            .any(|t| t == "sample" || t == "proof")
     {
         s = s.max(60);
     }
@@ -582,8 +817,10 @@ fn pretty_key(key: &str) -> String {
     // hungary qualifying"), title-cased below like any other key.
     let custom_owned;
     let base = if let Some(rest) = key.strip_prefix("c:") {
-        custom_owned =
-            rest.split_once(':').map_or(rest, |(_, t)| t).replace(':', " ");
+        custom_owned = rest
+            .split_once(':')
+            .map_or(rest, |(_, t)| t)
+            .replace(':', " ");
         custom_owned.as_str()
     } else {
         key.strip_prefix("t:")
@@ -591,9 +828,7 @@ fn pretty_key(key: &str) -> String {
             .unwrap_or(key)
     };
     let (name, yr) = match base.rsplit_once(':') {
-        Some((w, y)) if !y.is_empty() && y.chars().all(|c| c.is_ascii_digit()) => {
-            (w, Some(y))
-        }
+        Some((w, y)) if !y.is_empty() && y.chars().all(|c| c.is_ascii_digit()) => (w, Some(y)),
         _ => (base, None),
     };
     let mut t = name
@@ -645,8 +880,7 @@ fn fts_match(query: &str) -> String {
 /// is permanently skipped, which matters because the enricher's one-shot
 /// `checked` stamp has no way back (see the tri-state plan in
 /// research/indexer-realtime-and-enrichment-plan-2026-07-26.md §11.1).
-const VISIBLE: &str =
-    "EXISTS (SELECT 1 FROM releases r WHERE r.title_key = t.key AND r.junk < 50)";
+const VISIBLE: &str = "EXISTS (SELECT 1 FROM releases r WHERE r.title_key = t.key AND r.junk < 50)";
 
 /// One enricher lane. Each runs on its own thread against its own set
 /// of providers, because the rate limits are per provider: a serial loop
@@ -716,7 +950,21 @@ impl Index {
         // scan pass simply re-fetches the headers whose commit was lost;
         // the high-water mark only advances over a contiguous prefix.
         db.execute_batch(
-            "PRAGMA journal_mode=WAL;
+            // §95: FIRST, and before any CREATE TABLE. Incremental
+            // auto-vacuum is what lets `compact_chunk` reclaim space in
+            // bounded, abortable pieces instead of one VACUUM that a
+            // starting download cannot reliably stop. SQLite only
+            // accepts the change on a database with no tables yet, so
+            // this line does the whole job for a fresh install and is a
+            // silent no-op on an existing one - those migrate on their
+            // next compact (see `Index::compact`).
+            //
+            // The cost is pointer-map pages: one per ~800 pages, so
+            // ~0.1% of the file, plus a ptrmap write when a page is
+            // allocated or freed. Cheap against a multi-GB index that
+            // otherwise blocks a download for minutes.
+            "PRAGMA auto_vacuum=INCREMENTAL;
+             PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
              PRAGMA temp_store=MEMORY;
              PRAGMA cache_size=-262144;
@@ -808,6 +1056,66 @@ impl Index {
                 field TEXT NOT NULL,
                 value TEXT NOT NULL,
                 PRIMARY KEY(field, value));
+             -- Pre feed (opt-in, off by default): one row per release a
+             -- relay channel has announced. The column that earns the
+             -- table is `filename` - the name the release was POSTED
+             -- under, which is the only thing that can join a real title
+             -- onto a deliberately obfuscated post.
+             --
+             -- Keyed on the title because that is what the relay treats
+             -- as the identity: a NEW line announces it, and UPD lines
+             -- fill fields in afterwards (very often the filename
+             -- itself, minutes later). Upserts therefore only ever
+             -- overwrite a field with a NON-EMPTY value.
+             CREATE TABLE IF NOT EXISTS predb(
+                id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL UNIQUE,
+                -- Posted filename, as the relay sent it.
+                filename TEXT NOT NULL DEFAULT '',
+                -- release_stem(filename), lowercased: the exact join key.
+                fnstem TEXT NOT NULL DEFAULT '',
+                -- predb::match_key(fnstem): separators and case removed,
+                -- the fallback join key.
+                fnkey TEXT NOT NULL DEFAULT '',
+                size INTEGER NOT NULL DEFAULT 0,
+                files INTEGER NOT NULL DEFAULT 0,
+                category TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT '',
+                requestid TEXT NOT NULL DEFAULT '',
+                grp TEXT NOT NULL DEFAULT '',
+                nuked INTEGER NOT NULL DEFAULT 0,
+                nuke_reason TEXT NOT NULL DEFAULT '',
+                -- When the RELAY says it was pre'd (0 = it did not say).
+                pre_at INTEGER NOT NULL DEFAULT 0,
+                -- When WE heard it. Drives pruning; always set.
+                seen_at INTEGER NOT NULL DEFAULT 0,
+                -- Last time this row was swept against already-indexed
+                -- releases, so the retro pass can round-robin instead of
+                -- re-trying the newest rows forever.
+                tried_at INTEGER NOT NULL DEFAULT 0);
+             CREATE INDEX IF NOT EXISTS idx_predb_fnstem ON predb(fnstem);
+             CREATE INDEX IF NOT EXISTS idx_predb_fnkey ON predb(fnkey);
+             CREATE INDEX IF NOT EXISTS idx_predb_seen ON predb(seen_at);
+             CREATE INDEX IF NOT EXISTS idx_predb_tried ON predb(tried_at);
+             -- Phase 2: correlation candidates. One row per release -
+             -- the BEST candidate only, with enough recorded to audit
+             -- the decision and to rank a re-computation against it.
+             -- Alternates are recomputed on demand, never stored.
+             CREATE TABLE IF NOT EXISTS pre_corr(
+                release_id INTEGER PRIMARY KEY,
+                predb_id   INTEGER NOT NULL,
+                score      INTEGER NOT NULL,
+                -- first_posted - pt, seconds. The audit trail.
+                delta      INTEGER NOT NULL,
+                -- est_content/SZ in thousandths (0 = sizeless pair).
+                ratio      INTEGER NOT NULL DEFAULT 0,
+                -- Best competing score at decision time.
+                runner_up  INTEGER NOT NULL DEFAULT 0,
+                -- suggested | applied | confirmed | rejected | revoked
+                status     TEXT NOT NULL DEFAULT 'suggested',
+                at         INTEGER NOT NULL);
+             CREATE INDEX IF NOT EXISTS idx_precorr_predb ON pre_corr(predb_id);
+             CREATE INDEX IF NOT EXISTS idx_precorr_status ON pre_corr(status);
              -- Repost fingerprints: the PAR2 hash16k of a member file
              -- (an OUTER volume) of a download we managed to name,
              -- against the name we gave it. A later obfuscated post
@@ -892,8 +1200,59 @@ impl Index {
             // last tried to complete this release (0 = never) - oldest
             // first, like oracle_at.
             "ALTER TABLE releases ADD COLUMN gapfill_at INTEGER NOT NULL DEFAULT 0",
+            // Pre feed: the real name a relay channel gave this release,
+            // and where that name came from. Kept BESIDE `stem` rather
+            // than replacing it - the stem is the posted identity, it is
+            // half of the UNIQUE key that makes ingest idempotent, and
+            // the FTS index is external-content over it with no UPDATE
+            // trigger. Overwriting it would break all three and lose the
+            // evidence that the two names are different things.
+            //
+            // '' = never named from the feed. Non-empty is a claim made
+            // by somebody else, which is why `pre_source` is not
+            // optional in practice: a name whose origin we cannot state
+            // is a name we should not be showing.
+            "ALTER TABLE releases ADD COLUMN pre_title TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE releases ADD COLUMN pre_source TEXT NOT NULL DEFAULT ''",
+            // When the retro sweep last considered this row (0 = never).
+            // Lets the backlog pass move through the index once instead
+            // of re-examining the newest rows every tick.
+            "ALTER TABLE releases ADD COLUMN pre_at INTEGER NOT NULL DEFAULT 0",
+            // Phase 2 correlation: the normalized pre time - announced
+            // time when the relay claimed one, arrival time otherwise.
+            // A stored column rather than a CASE expression because the
+            // correlation window range-scans it and an expression over
+            // two columns cannot use one index.
+            "ALTER TABLE predb ADD COLUMN pt INTEGER NOT NULL DEFAULT 0",
         ] {
             let _ = db.execute(ddl, []);
+        }
+        // The pt index and its one-shot backfill live here, after the
+        // ALTER above has guaranteed the column on every install. The
+        // kv flag keeps the UPDATE from re-running on every open of a
+        // large feed table; it runs BEFORE anything samples predb.
+        let _ = db.execute("CREATE INDEX IF NOT EXISTS idx_predb_pt ON predb(pt)", []);
+        let pt_done: bool = db
+            .query_row(
+                "SELECT 1 FROM kv WHERE k='predb_pt_backfill_v1'",
+                [],
+                |_| Ok(()),
+            )
+            .is_ok();
+        if !pt_done {
+            let done = db
+                .execute(
+                    "UPDATE predb SET pt=CASE WHEN pre_at>0 THEN pre_at ELSE seen_at END
+                      WHERE pt=0",
+                    [],
+                )
+                .is_ok();
+            if done {
+                let _ = db.execute(
+                    "INSERT OR REPLACE INTO kv(k,v) VALUES('predb_pt_backfill_v1','1')",
+                    [],
+                );
+            }
         }
         // A8: rebuild a single-server-era marks table (PRIMARY KEY(grp))
         // to the (grp, server) shape. SQLite cannot ALTER a primary key,
@@ -1017,6 +1376,39 @@ impl Index {
                      VALUES('delete', old.id, old.stem); END;",
             )
             .is_ok();
+        // A SECOND, tiny FTS index over the names the pre feed supplied.
+        //
+        // Not a column added to `rel_fts`: that is an external-content
+        // table over millions of stems, and widening it means dropping,
+        // recreating and rebuilding the whole thing at open - a minutes-
+        // long startup stall on a large index, paid by every install
+        // including the ones that never turn the feed on. This one only
+        // ever holds rows that HAVE a fed name, so on a default install
+        // it stays empty and costs a table definition.
+        //
+        // Unlike stems, a fed name arrives by UPDATE (the retro sweep
+        // names a release long after it was inserted), so this one does
+        // need the update trigger the stem index can do without.
+        let pre_fts = db
+            .execute_batch(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS pre_fts
+                   USING fts5(pre_title, content='releases', content_rowid='id');
+                 CREATE TRIGGER IF NOT EXISTS pre_fts_ai AFTER INSERT ON releases
+                   WHEN new.pre_title<>'' BEGIN
+                     INSERT INTO pre_fts(rowid, pre_title)
+                       VALUES(new.id, new.pre_title); END;
+                 CREATE TRIGGER IF NOT EXISTS pre_fts_ad AFTER DELETE ON releases
+                   WHEN old.pre_title<>'' BEGIN
+                     INSERT INTO pre_fts(pre_fts, rowid, pre_title)
+                       VALUES('delete', old.id, old.pre_title); END;
+                 CREATE TRIGGER IF NOT EXISTS pre_fts_au
+                   AFTER UPDATE OF pre_title ON releases BEGIN
+                     INSERT INTO pre_fts(pre_fts, rowid, pre_title)
+                       SELECT 'delete', old.id, old.pre_title WHERE old.pre_title<>'';
+                     INSERT INTO pre_fts(rowid, pre_title)
+                       SELECT new.id, new.pre_title WHERE new.pre_title<>''; END;",
+            )
+            .is_ok();
         // Cast and crew as entities rather than a rendered string.
         // `titles.actors` stays exactly as it is - it is what every card
         // renders today, and nothing may regress while this join table
@@ -1096,8 +1488,9 @@ impl Index {
         // One-time retroactive recompute after the completeness-rule
         // change (nfiles >= 2 → >= 1): existing rows only re-evaluate
         // when a scan touches them, which for finished uploads is never.
-        let rule: Option<String> =
-            db.query_row("SELECT v FROM kv WHERE k='complete_rule'", [], |r| r.get(0)).ok();
+        let rule: Option<String> = db
+            .query_row("SELECT v FROM kv WHERE k='complete_rule'", [], |r| r.get(0))
+            .ok();
         if rule.as_deref() != Some("2") {
             // One transaction, and the done-flag only lands if the
             // recompute did: as two autocommit statements, a SQLITE_BUSY
@@ -1133,8 +1526,9 @@ impl Index {
         // would block daemon startup for minutes, since every scan task
         // opens its own Index. Whatever is left resumes on the next
         // open; the read side is correct throughout either way.
-        let filled: Option<String> =
-            db.query_row("SELECT v FROM kv WHERE k='nsegs_fill'", [], |r| r.get(0)).ok();
+        let filled: Option<String> = db
+            .query_row("SELECT v FROM kv WHERE k='nsegs_fill'", [], |r| r.get(0))
+            .ok();
         if filled.as_deref() != Some("1") {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
             let _ = (|| -> rusqlite::Result<()> {
@@ -1144,9 +1538,8 @@ impl Index {
                     // once; a deferred transaction let two of them read
                     // the same cursor, then a delayed one could overwrite
                     // a later cursor with its stale lower value.
-                    let tx = db.transaction_with_behavior(
-                        rusqlite::TransactionBehavior::Immediate,
-                    )?;
+                    let tx =
+                        db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                     let cursor: i64 = tx
                         .query_row("SELECT v FROM kv WHERE k='nsegs_at'", [], |r| {
                             r.get::<_, String>(0)
@@ -1196,8 +1589,9 @@ impl Index {
         // columns for rows indexed before they existed. Same shape as
         // the complete_rule migration: one transaction, flag stamped
         // only if the fill landed, so SQLITE_BUSY just retries next open.
-        let done: Option<String> =
-            db.query_row("SELECT v FROM kv WHERE k='browse_cols'", [], |r| r.get(0)).ok();
+        let done: Option<String> = db
+            .query_row("SELECT v FROM kv WHERE k='browse_cols'", [], |r| r.get(0))
+            .ok();
         if done.as_deref() != Some("1") {
             let _ = (|| -> rusqlite::Result<()> {
                 let tx = db.unchecked_transaction()?;
@@ -1211,14 +1605,17 @@ impl Index {
                 )?;
                 {
                     let mut sel = tx.prepare("SELECT id, stem FROM releases WHERE kind=''")?;
-                    let mut upd =
-                        tx.prepare("UPDATE releases SET kind=?2, res=?3 WHERE id=?1")?;
+                    let mut upd = tx.prepare("UPDATE releases SET kind=?2, res=?3 WHERE id=?1")?;
                     let rows: Vec<(i64, String)> = sel
                         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
                         .collect::<rusqlite::Result<_>>()?;
                     for (id, stem) in rows {
                         let p = crate::release::parse_release(&stem);
-                        upd.execute(rusqlite::params![id, kind_str(&p.kind), p.res.unwrap_or_default()])?;
+                        upd.execute(rusqlite::params![
+                            id,
+                            kind_str(&p.kind),
+                            p.res.unwrap_or_default()
+                        ])?;
                     }
                 }
                 tx.execute(
@@ -1233,8 +1630,9 @@ impl Index {
         // triggers existed - 'rebuild' re-reads the whole content table.
         // Same stamped-in-transaction shape as the migrations above.
         if fts {
-            let done: Option<String> =
-                db.query_row("SELECT v FROM kv WHERE k='fts_v1'", [], |r| r.get(0)).ok();
+            let done: Option<String> = db
+                .query_row("SELECT v FROM kv WHERE k='fts_v1'", [], |r| r.get(0))
+                .ok();
             if done.as_deref() != Some("1") {
                 let _ = (|| -> rusqlite::Result<()> {
                     let tx = db.unchecked_transaction()?;
@@ -1250,15 +1648,15 @@ impl Index {
         }
         // M28: retroactive title_key + junk fill (rows only re-parse when
         // a scan touches them, which for finished uploads is never).
-        let done: Option<String> =
-            db.query_row("SELECT v FROM kv WHERE k='browse2'", [], |r| r.get(0)).ok();
+        let done: Option<String> = db
+            .query_row("SELECT v FROM kv WHERE k='browse2'", [], |r| r.get(0))
+            .ok();
         if done.as_deref() != Some("1") {
             let _ = (|| -> rusqlite::Result<()> {
                 let tx = db.unchecked_transaction()?;
                 {
-                    let mut sel = tx.prepare(
-                        "SELECT id, stem, total_bytes FROM releases WHERE title_key=''",
-                    )?;
+                    let mut sel = tx
+                        .prepare("SELECT id, stem, total_bytes FROM releases WHERE title_key=''")?;
                     let mut upd =
                         tx.prepare("UPDATE releases SET title_key=?2, junk=?3 WHERE id=?1")?;
                     let rows: Vec<(i64, String, i64)> = sel
@@ -1295,8 +1693,9 @@ impl Index {
         // skipped forever). 10k rows per transaction interleaves with
         // scan ingest; a partial pass resumes from the cursor on the
         // next open.
-        let done: Option<String> =
-            db.query_row("SELECT v FROM kv WHERE k='quality_v8'", [], |r| r.get(0)).ok();
+        let done: Option<String> = db
+            .query_row("SELECT v FROM kv WHERE k='quality_v8'", [], |r| r.get(0))
+            .ok();
         if done.as_deref() != Some("1") {
             let _ = (|| -> rusqlite::Result<()> {
                 let mut cursor: i64 = db
@@ -1406,7 +1805,43 @@ impl Index {
         }
         // M29 availability oracle: (backbone, family, age-bucket) ledger.
         let _ = crate::oracle::ensure_schema(&db);
-        Ok(Index { db, gate: None, fts, people_fts, custom: Vec::new() })
+        // `EXISTS` rather than a count: this only has to answer "is the
+        // feed worth consulting", and on a large predb the count is a
+        // full index scan at every open.
+        let predb = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM predb WHERE fnkey<>'')",
+                [],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap_or(false);
+        // The named-count's partial index rides on feed activity, not
+        // on `predb` above: a title-only feed (the common live shape)
+        // has no nameable rows yet still names releases through the
+        // correlation legs, and the settings card asks for the count
+        // either way. Any row in predb at all means the build is
+        // worth paying once here, on the writer - the API's read-only
+        // handle cannot create it. An install whose feed never ran
+        // has an empty table and never pays.
+        let feed_ever = db
+            .query_row("SELECT EXISTS(SELECT 1 FROM predb)", [], |r| {
+                r.get::<_, bool>(0)
+            })
+            .unwrap_or(false);
+        if feed_ever {
+            Self::ensure_named_index(&db);
+        }
+        Ok(Index {
+            db,
+            gate: None,
+            fts,
+            pre_fts,
+            people_fts,
+            custom: Vec::new(),
+            predb,
+            watch: None,
+            hits: Default::default(),
+        })
     }
 
     /// A read-only connection for query handlers, so an interactive
@@ -1436,10 +1871,17 @@ impl Index {
         // The per-connection tuning half of open()'s pragmas; query_only
         // makes any write that sneaks onto this connection fail loudly
         // instead of contending for the write lock.
+        //
+        // cache_size is a quarter of the writer's 256 MB: the daemon
+        // pools up to four of these connections and never evicts an
+        // idle one, so the writer's figure here would let query bursts
+        // pin ~1 GB of page cache forever - the difference between
+        // fitting and swapping on a NAS. Reads mostly ride the 1 GB
+        // mmap window anyway, which costs only address space.
         db.execute_batch(
             "PRAGMA query_only=ON;
              PRAGMA temp_store=MEMORY;
-             PRAGMA cache_size=-262144;
+             PRAGMA cache_size=-65536;
              PRAGMA mmap_size=1073741824;",
         )?;
         // FTS availability is detected, not created: the tables exist iff
@@ -1454,9 +1896,28 @@ impl Index {
         };
         let fts = has("rel_fts");
         let people_fts = fts && has("people_fts");
+        // Same detection for the pre-feed name index. Load-bearing: this
+        // is the connection every interactive search and browse runs on,
+        // so if it read `false` here a release the pre feed rescued would
+        // be findable by its obfuscated stem and by nothing else.
+        let pre_fts = has("pre_fts");
+        // `predb` gates the ingest-time naming lookup only, and ingest
+        // never happens on a query_only connection.
+        let predb = false;
         // No gate and no custom categories: both are ingest-time policy,
-        // and ingest cannot happen on a query_only connection.
-        Ok(Index { db, gate: None, fts, people_fts, custom: Vec::new() })
+        // and ingest cannot happen on a query_only connection. Same for
+        // the arrival watch - nothing arrives on a reader.
+        Ok(Index {
+            db,
+            gate: None,
+            fts,
+            pre_fts,
+            people_fts,
+            custom: Vec::new(),
+            predb,
+            watch: None,
+            hits: Default::default(),
+        })
     }
 
     // ---- M29 availability oracle -------------------------------------
@@ -1519,7 +1980,11 @@ impl Index {
         let mut at = 0.0f64;
         while (at as usize) < ids.len() && out.len() < max {
             let id = &ids[at as usize];
-            let b = if id.starts_with('<') { id.clone() } else { format!("<{id}>") };
+            let b = if id.starts_with('<') {
+                id.clone()
+            } else {
+                format!("<{id}>")
+            };
             out.push(b);
             at += step;
         }
@@ -1550,10 +2015,9 @@ impl Index {
                AND first_seen < ?2
              ORDER BY gapfill_at ASC, (id * 2654435761) % 4294967296 LIMIT ?1",
         )?;
-        let rows = stmt
-            .query_map(rusqlite::params![limit, now - 3600], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })?;
+        let rows = stmt.query_map(rusqlite::params![limit, now - 3600], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
         rows.collect()
     }
 
@@ -1604,9 +2068,8 @@ impl Index {
         tx.execute("DELETE FROM imdb_ratings", [])?;
         let mut n = 0u64;
         {
-            let mut ins = tx.prepare(
-                "INSERT INTO imdb_ratings(tconst, rating, votes) VALUES(?1, ?2, ?3)",
-            )?;
+            let mut ins =
+                tx.prepare("INSERT INTO imdb_ratings(tconst, rating, votes) VALUES(?1, ?2, ?3)")?;
             for (t, r, v) in rows {
                 ins.execute(rusqlite::params![t, r, v as i64])?;
                 n += 1;
@@ -1637,6 +2100,54 @@ impl Index {
         self.custom = cats;
     }
 
+    /// Install the arrival watch (see the `watch` field): a cheap
+    /// name test the index runs over every release a batch touches, so
+    /// the caller learns about the ones it cares about AS THEY LAND
+    /// rather than by re-scanning the table on a timer.
+    ///
+    /// The predicate must be cheap and permissive - it runs once per
+    /// touched release inside the ingest transaction, and its only job is
+    /// to keep the journal short. Saying yes too often costs a wasted
+    /// look; saying no wrongly loses the arrival entirely.
+    pub fn set_watch_names(&mut self, watch: Option<Box<dyn Fn(&str) -> bool + Send>>) {
+        self.watch = watch;
+        if self.watch.is_none() {
+            *self.hits.borrow_mut() = Default::default();
+        }
+    }
+
+    /// Take everything the arrival watch has collected since the last
+    /// call, plus how many hits were dropped for want of room.
+    pub fn take_watch_hits(&self) -> (Vec<WatchHit>, u32) {
+        let mut h = self.hits.borrow_mut();
+        (std::mem::take(&mut h.list), std::mem::take(&mut h.dropped))
+    }
+
+    /// Offer one touched release to the arrival watch. Costs a null check
+    /// when nothing is installed, which is every install that has no
+    /// watchlist.
+    fn note_watch(&self, id: i64, name: &str, complete: bool) {
+        let Some(watch) = &self.watch else { return };
+        if watch(name) {
+            self.push_watch_hit(WatchHit {
+                id,
+                name: name.to_string(),
+                complete,
+            });
+        }
+    }
+
+    /// Journal a hit the predicate has already accepted, dropping it (and
+    /// counting the drop) once the journal is full.
+    fn push_watch_hit(&self, hit: WatchHit) {
+        let mut h = self.hits.borrow_mut();
+        if h.list.len() >= WATCH_HITS_CAP {
+            h.dropped = h.dropped.saturating_add(1);
+            return;
+        }
+        h.list.push(hit);
+    }
+
     /// Ingest-time parse: built-in classifier plus the installed custom
     /// categories. Every site that WRITES kind/title_key must call this,
     /// not `parse_release`, or custom rows would flap back to their
@@ -1654,15 +2165,21 @@ impl Index {
     /// number of rows whose classification changed.
     pub fn reclassify_custom(&self) -> rusqlite::Result<u64> {
         let want = crate::categories::config_hash(&self.custom);
-        let have: Option<String> =
-            self.db.query_row("SELECT v FROM kv WHERE k='custom_cats_cfg'", [], |r| r.get(0)).ok();
+        let have: Option<String> = self
+            .db
+            .query_row("SELECT v FROM kv WHERE k='custom_cats_cfg'", [], |r| {
+                r.get(0)
+            })
+            .ok();
         let cursor_key = "custom_cats_cursor";
         let mut cursor: i64 = if have.as_deref() == Some(want.as_str()) {
             // Same config: either done (no cursor) or resuming a pass
             // that a restart interrupted.
             match self
                 .db
-                .query_row("SELECT v FROM kv WHERE k=?1", [cursor_key], |r| r.get::<_, String>(0))
+                .query_row("SELECT v FROM kv WHERE k=?1", [cursor_key], |r| {
+                    r.get::<_, String>(0)
+                })
                 .ok()
                 .and_then(|v| v.parse().ok())
             {
@@ -1836,7 +2353,9 @@ impl Index {
             if e.message_id.is_empty() || part == 0 || total == 0 {
                 continue;
             }
-            let Some(fname) = quoted_name(&base) else { continue };
+            let Some(fname) = quoted_name(&base) else {
+                continue;
+            };
             let stem = release_stem(&fname);
             if stem.is_empty() {
                 continue;
@@ -1859,8 +2378,28 @@ impl Index {
                 .1
                 .insert(part, (e.message_id.clone(), e.bytes));
         }
+        // Pre feed: ask the relay corpus what each clustered stem was
+        // really called, BEFORE the gate runs. Order matters - a gate
+        // like `{"kinds":["tv"]}` reads a name, and an obfuscated stem
+        // has none to read, so gating first would discard exactly the
+        // posts this feature exists to rescue. Done here rather than
+        // inside the loop below because the transaction borrows `db`
+        // mutably and these are reads.
+        let mut named: HashMap<String, (String, String)> = HashMap::new();
+        if self.predb {
+            for (_, stem) in clusters.keys() {
+                if named.contains_key(stem) {
+                    continue;
+                }
+                if let Some(hit) = predb_lookup(&self.db, stem) {
+                    named.insert(stem.clone(), hit);
+                }
+            }
+        }
         if let Some(gate) = &self.gate {
-            clusters.retain(|(_, stem), _| gate(stem));
+            clusters.retain(|(_, stem), _| {
+                gate(named.get(stem).map_or(stem.as_str(), |(t, _)| t.as_str()))
+            });
         }
 
         // IMMEDIATE, not the default DEFERRED. A deferred transaction takes
@@ -1874,6 +2413,9 @@ impl Index {
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut completed = 0u32;
+        // Arrivals the installed watch wants told about, journalled once
+        // the batch commits (see the note at the bottom of the loop).
+        let mut hits: Vec<WatchHit> = Vec::new();
         for ((poster, stem), files) in clusters {
             // Real upload time when the batch carried Dates; scan time
             // otherwise. MIN on conflict lets an older batch (backfill
@@ -1904,7 +2446,9 @@ impl Index {
                         "SELECT segments, total_parts FROM files
                           WHERE release_id=?1 AND filename=?2",
                     )?
-                    .query_row(rusqlite::params![rid, fname], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .query_row(rusqlite::params![rid, fname], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })
                     .ok();
                 // A file's "(x/y)" total does not change within one posting.
                 // If it disagrees with what we already hold, these are two
@@ -1925,14 +2469,17 @@ impl Index {
                 // The real fix is a generation identity on `files` so both
                 // postings can be indexed side by side, which needs a
                 // schema migration. Pinned by the D3 regression test.
-                if let Some((_, prev_total)) = &existing {
-                    if *prev_total > 0 && total > 0 && *prev_total != total {
-                        eprintln!(
-                            "[index] {fname}: ignoring a batch claiming {total} parts, \
+                if let Some((_, prev_total)) = &existing
+                    && *prev_total > 0
+                    && total > 0
+                    && *prev_total != total
+                {
+                    warn!(
+                        target: "index",
+                        "{fname}: ignoring a batch claiming {total} parts, \
                              already tracking {prev_total} - reused filename, different posting"
-                        );
-                        continue;
-                    }
+                    );
+                    continue;
                 }
                 let mut merged: BTreeMap<u32, (String, u64)> = existing
                     .and_then(|(s, _)| serde_json::from_str::<Vec<(u32, String, u64)>>(&s).ok())
@@ -2004,45 +2551,1483 @@ impl Index {
             // live teevee+moovee index). Indexer-spam tiny posts are the
             // size gate's job (gates min_size), not this flag's.
             let complete = nfiles >= 1 && ncomplete == nfiles;
-            let was: bool = tx
-                .prepare_cached("SELECT complete FROM releases WHERE id=?1")?
-                .query_row([rid], |r| r.get(0))?;
+            // pre_title/pre_source come back with `was` so a re-ingest
+            // cannot un-name a release the retro sweep already named:
+            // this batch's lookup wins when it found something, the
+            // stored value stands otherwise. Without that, every later
+            // batch touching the release would blank the name, and
+            // turning the feed off would erase every name it had given.
+            let (was, had_title, had_source): (bool, String, String) = tx
+                .prepare_cached("SELECT complete, pre_title, pre_source FROM releases WHERE id=?1")?
+                .query_row([rid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             // kind/res parse once per touched cluster - cheap (pure text)
             // and idempotent, so re-ingest keeps them current. Runs
             // through the installed custom categories (24D) so a user
             // kind survives re-ingest touches. (Field access, not
             // self.classify - `tx` holds the &mut borrow of self.db.)
-            let p = crate::categories::classify(&stem, &self.custom);
+            //
+            // Parsed from the FED name when there is one. That single
+            // substitution is what turns a pre hit into a real result:
+            // title_key lands the release on the right wall card, and
+            // kind/res/codecs/junk all come out of a name that actually
+            // says something instead of a random stem.
+            let (pre_title, pre_source) =
+                named.get(&stem).cloned().unwrap_or((had_title, had_source));
+            let name = if pre_title.is_empty() {
+                stem.as_str()
+            } else {
+                pre_title.as_str()
+            };
+            let p = crate::categories::classify(name, &self.custom);
             tx.prepare_cached(
                 "UPDATE releases SET files=?2, total_bytes=?3, has_par2=?4, complete=?5,
                         kind=?6, res=?7, have_parts=?8, need_parts=?9,
                         title_key=?10, junk=?11, langs=?12,
-                        vcodec=?13, acodec=?14, hdr=?15
+                        vcodec=?13, acodec=?14, hdr=?15,
+                        pre_title=?16, pre_source=?17, pre_at=?18
                  WHERE id=?1",
             )?
             .execute(rusqlite::params![
-                    rid,
-                    nfiles,
-                    tbytes as i64,
-                    npar2 > 0,
-                    complete,
-                    kind_str(&p.kind),
-                    p.res.as_deref().unwrap_or_default(),
-                    have,
-                    need,
-                    p.key,
-                    junk_score(&stem, &p, tbytes as u64, nexe > 0),
-                    p.langs.join(" "),
-                    p.vcodec.as_deref().unwrap_or_default(),
-                    p.acodec.as_deref().unwrap_or_default(),
-                    p.hdr.as_deref().unwrap_or_default()
+                rid,
+                nfiles,
+                { tbytes },
+                npar2 > 0,
+                complete,
+                kind_str(&p.kind),
+                p.res.as_deref().unwrap_or_default(),
+                have,
+                need,
+                p.key,
+                junk_score(name, &p, tbytes as u64, nexe > 0),
+                p.langs.join(" "),
+                p.vcodec.as_deref().unwrap_or_default(),
+                p.acodec.as_deref().unwrap_or_default(),
+                p.hdr.as_deref().unwrap_or_default(),
+                pre_title,
+                pre_source,
+                // Stamped whether or not the feed knew this one, so
+                // the backlog sweep does not re-examine rows the
+                // live path has already asked about.
+                now
             ])?;
             if complete && !was {
                 completed += 1;
             }
+            // Offer the release to the arrival watch. The predicate is
+            // read as a FIELD, not through `self.note_watch`: `tx` holds
+            // the &mut borrow of `self.db`, and a method taking `&self`
+            // would borrow the whole struct. The hits themselves are
+            // journalled after the commit, so a batch that fails to
+            // commit announces nothing.
+            if let Some(watch) = &self.watch
+                && watch(name)
+            {
+                hits.push(WatchHit {
+                    id: rid,
+                    name: name.to_string(),
+                    complete,
+                });
+            }
         }
         tx.commit()?;
+        for h in hits {
+            self.push_watch_hit(h);
+        }
         Ok(completed)
+    }
+
+    // ---- the pre feed -------------------------------------------------
+
+    /// Fold a batch of relay lines into `predb`.
+    ///
+    /// Upsert semantics mirror the wire: a NEW line announces a title, a
+    /// later UPD fills fields in, and a field only ever overwrites when
+    /// the new value is non-empty. That last rule is the whole reason
+    /// this is not a plain REPLACE - the filename usually arrives on the
+    /// second line about a release, and a REPLACE would blank it on the
+    /// third.
+    ///
+    /// Returns how many rows now carry a usable filename, which is the
+    /// only count worth reporting: a title with no filename cannot name
+    /// an obfuscated post.
+    pub fn predb_store(
+        &mut self,
+        lines: &[crate::predb::PreLine],
+        now: i64,
+    ) -> rusqlite::Result<usize> {
+        if lines.is_empty() {
+            return Ok(0);
+        }
+        // Feed activity is what makes the named count worth indexing;
+        // this is the first-session path, before the next `open` gets
+        // to build it (no-op once it exists).
+        Self::ensure_named_index(&self.db);
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut nameable = 0usize;
+        for l in lines {
+            if l.title.trim().is_empty() {
+                continue;
+            }
+            // The join keys are derived here, once, rather than at match
+            // time: the release side already stores a `release_stem` of
+            // the posted filename, so reducing the relay's filename the
+            // same way is what makes the two comparable at all.
+            let fnstem = if l.filename.is_empty() {
+                String::new()
+            } else {
+                crate::extract::release_stem(&l.filename).to_ascii_lowercase()
+            };
+            let fnkey = crate::predb::match_key(&fnstem);
+            if !fnkey.is_empty() {
+                nameable += 1;
+            }
+            tx.prepare_cached(
+                "INSERT INTO predb(title, filename, fnstem, fnkey, size, files, category,
+                                   source, requestid, grp, nuked, nuke_reason, pre_at, seen_at,
+                                   pt)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,
+                        CASE WHEN ?13<>0 THEN ?13 ELSE ?14 END)
+                 ON CONFLICT(title) DO UPDATE SET
+                   filename=CASE WHEN excluded.filename<>'' THEN excluded.filename ELSE filename END,
+                   fnstem  =CASE WHEN excluded.fnstem  <>'' THEN excluded.fnstem   ELSE fnstem   END,
+                   fnkey   =CASE WHEN excluded.fnkey   <>'' THEN excluded.fnkey    ELSE fnkey    END,
+                   size    =CASE WHEN excluded.size    <>0  THEN excluded.size     ELSE size     END,
+                   files   =CASE WHEN excluded.files   <>0  THEN excluded.files    ELSE files    END,
+                   category=CASE WHEN excluded.category<>'' THEN excluded.category ELSE category END,
+                   source  =CASE WHEN excluded.source  <>'' THEN excluded.source   ELSE source   END,
+                   requestid=CASE WHEN excluded.requestid<>'' THEN excluded.requestid ELSE requestid END,
+                   grp     =CASE WHEN excluded.grp     <>'' THEN excluded.grp      ELSE grp      END,
+                   -- A nuke is sticky: an UPD after one does not un-nuke.
+                   nuked   =MAX(nuked, excluded.nuked),
+                   nuke_reason=CASE WHEN excluded.nuke_reason<>'' THEN excluded.nuke_reason
+                                    ELSE nuke_reason END,
+                   pre_at  =CASE WHEN excluded.pre_at  <>0  THEN excluded.pre_at   ELSE pre_at   END,
+                   -- An announced time is better evidence than our
+                   -- first-arrival clock; otherwise pt keeps the
+                   -- EARLIEST sighting, which is the honest pre time.
+                   pt      =CASE WHEN excluded.pre_at  <>0  THEN excluded.pre_at   ELSE pt       END,
+                   -- A row that gained a filename is worth re-sweeping
+                   -- against the index, so clear its attempt stamp.
+                   tried_at=CASE WHEN excluded.fnkey<>'' AND fnkey='' THEN 0 ELSE tried_at END",
+            )?
+            .execute(rusqlite::params![
+                l.title.trim(),
+                l.filename,
+                fnstem,
+                fnkey,
+                l.size as i64,
+                l.files,
+                l.category,
+                l.source,
+                l.requestid,
+                l.group,
+                matches!(l.kind, crate::predb::PreKind::Nuk),
+                l.nuke_reason,
+                l.date,
+                now
+            ])?;
+        }
+        tx.commit()?;
+        if nameable > 0 {
+            self.predb = true;
+        }
+        Ok(nameable)
+    }
+
+    /// Rows held, and how many of those carry a posted filename.
+    pub fn predb_stats(&self) -> rusqlite::Result<(u64, u64)> {
+        self.db.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(fnkey<>''),0) FROM predb",
+            [],
+            |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+        )
+    }
+
+    /// Build the partial index behind `predb_named_count`. Tiny (only
+    /// named rows live in it) but load-bearing: without it that COUNT
+    /// walks the whole releases table - seconds per call on a large
+    /// index - and the settings card polls it. Deliberately not part
+    /// of `open`'s unconditional migrations: callers gate on feed
+    /// activity, so an install that never ran the feed never pays the
+    /// one-time build. On a read-only handle the CREATE fails and is
+    /// ignored, the same way the open-time migrations ignore it.
+    fn ensure_named_index(db: &Connection) {
+        let _ = db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rel_pre_named
+               ON releases(pre_title) WHERE pre_title<>''",
+            [],
+        );
+    }
+
+    /// How many releases carry a name the feed gave them.
+    pub fn predb_named_count(&self) -> rusqlite::Result<u64> {
+        // Self-heal for a writable handle (tests, CLI): the daemon's
+        // API polls this through a read-only connection, where the
+        // CREATE is a silent no-op and the index has to have been
+        // built by the writer - `open` and the store paths do that.
+        // With the index present the COUNT is an index-only scan of
+        // exactly the rows it counts; without it the scan below is
+        // slow but correct.
+        Self::ensure_named_index(&self.db);
+        self.db
+            .query_row(
+                "SELECT COUNT(*) FROM releases WHERE pre_title<>''",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|v| v as u64)
+    }
+
+    /// Cap the feed's size. Age first (a pre line's naming value decays
+    /// with the post's retention), then a hard row cap, oldest-heard
+    /// first - the same shape as the release retention prune, and for
+    /// the same reason: an always-on feed is otherwise unbounded.
+    /// Returns rows deleted.
+    pub fn predb_prune(
+        &self,
+        max_rows: u64,
+        max_age_secs: i64,
+        now: i64,
+    ) -> rusqlite::Result<usize> {
+        let mut removed = 0usize;
+        if max_age_secs > 0 {
+            removed += self.db.execute(
+                "DELETE FROM predb WHERE seen_at > 0 AND seen_at < ?1",
+                [now - max_age_secs],
+            )?;
+        }
+        if max_rows > 0 {
+            let n: i64 = self
+                .db
+                .query_row("SELECT COUNT(*) FROM predb", [], |r| r.get(0))?;
+            let over = n - max_rows as i64;
+            if over > 0 {
+                removed += self.db.execute(
+                    "DELETE FROM predb WHERE id IN
+                       (SELECT id FROM predb ORDER BY seen_at ASC, id ASC LIMIT ?1)",
+                    [over],
+                )?;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Sweep freshly-heard pre lines against releases that are ALREADY
+    /// indexed - the "the post came first, the announcement came second"
+    /// direction. Budgeted: `budget` rows per call, oldest attempt first.
+    ///
+    /// Driven from the feed rather than from the index on purpose. The
+    /// feed is small and its join keys are indexed, while `releases` is
+    /// millions of rows with no index on a normalized stem, so the same
+    /// work driven the other way would be a full table scan per tick.
+    /// Returns (rows examined, releases named).
+    pub fn predb_sweep(&mut self, budget: u32, now: i64) -> rusqlite::Result<(usize, usize)> {
+        if budget == 0 || !self.predb {
+            return Ok((0, 0));
+        }
+        // Only rows still worth asking about. `tried_at` doubles as the
+        // rotation key and the retirement marker:
+        //   0            never swept - always first
+        //   a timestamp  swept, still inside its retry window
+        //   RETIRED      the post never turned up; parked at the far end
+        //                of idx_predb_tried, so the range scan below
+        //                never even reaches it.
+        // Without retirement this query walks every row in the feed
+        // forever, re-asking about announcements whose posts arrived
+        // (and were named at ingest) months ago. The RETRY_FLOOR keeps a
+        // live row from being re-asked on every 20-second tick.
+        const RETRY_FLOOR: i64 = 600;
+        let rows: Vec<(i64, String, String, String, String)> = {
+            let mut stmt = self.db.prepare_cached(
+                "SELECT id, title, fnstem, fnkey, source FROM predb
+                  WHERE fnkey<>'' AND tried_at < ?1
+                  ORDER BY tried_at ASC, id DESC LIMIT ?2",
+            )?;
+            stmt.query_map(rusqlite::params![now - RETRY_FLOOR, budget], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        };
+        if rows.is_empty() {
+            return Ok((0, 0));
+        }
+        let mut named = 0usize;
+        for (id, title, fnstem, _fnkey, source) in &rows {
+            // Exact match only, and deliberately so. This leg is driven
+            // from the feed, so it looks releases up BY STEM - and the
+            // only index on that column is the plain one, which a
+            // normalized comparison cannot use. Adding the fallback here
+            // would turn each budgeted row into a full scan of millions.
+            // Nothing is lost: the normalized fallback lives on the two
+            // legs that look the other way (ingest and the backlog
+            // sweep), where both predb keys ARE indexed.
+            //
+            // `LIMIT 200` bounds the pathological case of a pre line
+            // whose filename matches a great many releases. A stem that
+            // generic is not evidence of anything, and re-naming
+            // thousands of unrelated releases off one line is the worst
+            // thing this feature could do.
+            let ids: Vec<i64> = {
+                let mut stmt = self.db.prepare_cached(
+                    "SELECT id FROM releases
+                      WHERE pre_title='' AND LOWER(stem)=?1 LIMIT 200",
+                )?;
+                stmt.query_map([fnstem], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            for rid in ids {
+                if self.apply_pre_name(rid, title, source, now)? {
+                    named += 1;
+                }
+            }
+            // Keep asking while the post could still show up, then
+            // retire the row. RETRY_WINDOW is generous because a pre can
+            // precede the actual upload by days.
+            const RETRY_WINDOW: i64 = 14 * 86_400;
+            self.db.execute(
+                "UPDATE predb
+                    SET tried_at = CASE WHEN seen_at > ?2 THEN ?3 ELSE ?4 END
+                  WHERE id=?1",
+                rusqlite::params![id, now - RETRY_WINDOW, now, PREDB_RETIRED],
+            )?;
+        }
+        Ok((rows.len(), named))
+    }
+
+    /// The other direction, and the one that only matters once: releases
+    /// that were indexed BEFORE the feed was switched on. Walks the
+    /// index downward from a stored cursor, one bounded slice per call,
+    /// asking the feed about each obfuscated-looking release.
+    ///
+    /// A cursor rather than a "not yet tried" flag because the flag
+    /// version degenerates: once the backlog is exhausted, every tick
+    /// re-scans the whole table to find the nothing that is left. The
+    /// cursor walks once, in id order, and stops. `window_secs` bounds
+    /// how far back it bothers to go (0 = the whole index).
+    ///
+    /// Returns (rows examined, releases named).
+    pub fn predb_backlog(
+        &mut self,
+        budget: u32,
+        window_secs: i64,
+        now: i64,
+    ) -> rusqlite::Result<(usize, usize)> {
+        if budget == 0 || !self.predb {
+            return Ok((0, 0));
+        }
+        // The oldest id still inside the window - the floor the walk
+        // stops at. Computed from `first_seen` (idx_rel_seen) once per
+        // call rather than filtered per row, so the walk itself can stay
+        // a plain primary-key range.
+        //
+        // Both ends are EXCLUSIVE-below (`id > floor`), so the floor is
+        // one below the oldest in-window row and the walk still reaches
+        // it. The cursor starts at the top of the table rather than
+        // i64::MAX, or the first hundred passes would sweep empty id
+        // space and never reach a row.
+        let cutoff = if window_secs > 0 {
+            now - window_secs
+        } else {
+            0
+        };
+        let floor: i64 = self.db.query_row(
+            "SELECT COALESCE(MIN(id),0) FROM releases WHERE first_seen>=?1",
+            [cutoff],
+            |r| r.get::<_, i64>(0).map(|v| v - 1),
+        )?;
+        let cursor: i64 = match self
+            .kv_get("predb_backlog_cursor")
+            .and_then(|v| v.parse().ok())
+        {
+            Some(v) => v,
+            None => self
+                .db
+                .query_row("SELECT COALESCE(MAX(id),0) FROM releases", [], |r| r.get(0))?,
+        };
+        if cursor <= floor {
+            // Walked the window already. New arrivals are named at
+            // ingest and late announcements by predb_sweep, so there is
+            // nothing left for this leg to do.
+            return Ok((0, 0));
+        }
+        // Bounded per call in ID SPACE, not just in rows returned: a
+        // slice with no matches must still cost a fixed amount of scan.
+        const STRIDE: i64 = 100_000;
+        let lo = cursor.saturating_sub(STRIDE).max(floor);
+        let rows: Vec<(i64, String)> = {
+            let mut stmt = self.db.prepare_cached(
+                // junk>=70 is the obfuscation band (junk_score pins an
+                // unparseable or blob-shaped stem there), so this looks
+                // only at releases the feed can actually help and leaves
+                // the ones already carrying a readable name alone.
+                "SELECT id, stem FROM releases
+                  WHERE id>?1 AND id<=?2 AND pre_title='' AND junk>=70
+                  ORDER BY id DESC LIMIT ?3",
+            )?;
+            stmt.query_map(rusqlite::params![lo, cursor, budget], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        };
+        // A full batch means the slice was cut short by the budget -
+        // resume just below the last row examined so nothing is skipped.
+        let next = if rows.len() as u32 >= budget {
+            rows.last().map(|(id, _)| id - 1).unwrap_or(lo)
+        } else {
+            lo
+        };
+        let mut named = 0usize;
+        for (rid, stem) in &rows {
+            if let Some((title, source)) = predb_lookup(&self.db, stem) {
+                if self.apply_pre_name(*rid, &title, &source, now)? {
+                    named += 1;
+                }
+            } else {
+                self.db.execute(
+                    "UPDATE releases SET pre_at=?2 WHERE id=?1",
+                    rusqlite::params![rid, now],
+                )?;
+            }
+        }
+        self.kv_set("predb_backlog_cursor", &next.to_string())?;
+        Ok((rows.len(), named))
+    }
+
+    /// Attach a fed name to one release and re-derive everything the old
+    /// name determined. Returns false when the row was already named or
+    /// has since vanished.
+    fn apply_pre_name(
+        &self,
+        rid: i64,
+        title: &str,
+        source: &str,
+        now: i64,
+    ) -> rusqlite::Result<bool> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Ok(false);
+        }
+        let Some((bytes, nexe, complete)): Option<(i64, i64, bool)> = self
+            .db
+            .prepare_cached(&format!(
+                "SELECT total_bytes,
+                        (SELECT COALESCE(SUM({EXE_FILE_SQL}),0) FROM files
+                          WHERE release_id=releases.id),
+                        complete
+                   FROM releases WHERE id=?1 AND pre_title=''"
+            ))?
+            .query_row([rid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .optional()?
+        else {
+            return Ok(false);
+        };
+        let p = crate::categories::classify(title, &self.custom);
+        // Same column set the ingest path writes, from the same parse -
+        // a release named here must be indistinguishable from one that
+        // was named at ingest, or the wall would file the two copies of
+        // the same show differently.
+        let n = self.db.execute(
+            "UPDATE releases
+                SET pre_title=?2, pre_source=?3, pre_at=?4,
+                    kind=?5, res=?6, title_key=?7, junk=?8, langs=?9,
+                    vcodec=?10, acodec=?11, hdr=?12
+              WHERE id=?1 AND pre_title=''",
+            rusqlite::params![
+                rid,
+                title,
+                pre_source_label(source),
+                now,
+                kind_str(&p.kind),
+                p.res.as_deref().unwrap_or_default(),
+                p.key,
+                junk_score(title, &p, bytes as u64, nexe > 0),
+                p.langs.join(" "),
+                p.vcodec.as_deref().unwrap_or_default(),
+                p.acodec.as_deref().unwrap_or_default(),
+                p.hdr.as_deref().unwrap_or_default()
+            ],
+        )?;
+        // A release that has just GAINED a name is an arrival as far as
+        // anything matching on names is concerned: until this moment it
+        // was an obfuscated stem no watchlist entry could ever match.
+        // Every naming leg - the exact predb legs, correlation auto-apply
+        // and a human picking from the candidate list - funnels through
+        // here, so this one line covers all of them.
+        if n > 0 {
+            self.note_watch(rid, title, complete);
+        }
+        Ok(n > 0)
+    }
+
+    // ---- Phase 2: time+size correlation ------------------------------
+    //
+    // The live public relays carry no filenames, so the exact legs
+    // above can never fire from them. What a pre does pin down is WHEN
+    // a release existed and (sometimes) how big it is; these legs turn
+    // that into scored candidates. The arithmetic lives in
+    // `crate::predb_corr`; everything here is queries, cursors and the
+    // gates that keep "probably" from ever silently becoming "is".
+
+    /// Per-release facts the scorer needs, gathered once per release.
+    fn corr_release_facts(&self, rid: i64) -> rusqlite::Result<Option<CorrRelFacts>> {
+        let row = self
+            .db
+            .prepare_cached(
+                "SELECT stem, grp, total_bytes, has_par2, first_posted,
+                        (SELECT COALESCE(SUM(bytes),0) FROM files
+                          WHERE release_id=releases.id
+                            AND LOWER(filename) LIKE '%.par2'),
+                        (SELECT COUNT(*) FROM files
+                          WHERE release_id=releases.id
+                            AND LOWER(filename) NOT LIKE '%.par2')
+                   FROM releases WHERE id=?1 AND pre_title='' AND first_posted>0",
+            )?
+            .query_row([rid], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, bool>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
+                ))
+            })
+            .optional()?;
+        let Some((stem, grp, total, has_par2, fp, par2_bytes, rel_files)) = row else {
+            return Ok(None);
+        };
+        // total_bytes is OVER-WIRE bytes, par2 included. The estimate
+        // models out identified par2 and the yEnc factor; disguised
+        // par2 (no .par2 extension - the common obfuscated shape) stays
+        // IN the estimate, which is what the scorer's asymmetric
+        // hidden-par2 band exists for.
+        let par2_identified = par2_bytes > 0 || has_par2;
+        let content_wire = (total - par2_bytes).max(0) as f64;
+        Ok(Some(CorrRelFacts {
+            stem,
+            first_posted: fp,
+            grp_kind: crate::predb_corr::group_kind(&grp),
+            est_content: (content_wire / crate::predb_corr::YENC_FACTOR) as u64,
+            par2_identified,
+            rel_files: rel_files.max(0) as u32,
+        }))
+    }
+
+    /// Score one pre row against one release's facts. `classify` is
+    /// only paid when the cheap fields cannot answer.
+    fn corr_score_pair(
+        &self,
+        f: &CorrRelFacts,
+        p: &CorrPreRow,
+    ) -> Option<crate::predb_corr::CorrScore> {
+        use crate::predb_corr as pc;
+        let mut kind_pre = pc::section_class(&p.category);
+        let mut kind_title = crate::release::Kind::Other;
+        let mut res_pre = None;
+        // The plausibility prior only matters sizeless, and the
+        // section usually answers the class question - classify only
+        // when one of them still needs the title read.
+        if kind_pre == pc::GroupKind::Unknown || p.size == 0 {
+            let parsed = crate::categories::classify(&p.title, &self.custom);
+            if kind_pre == pc::GroupKind::Unknown {
+                kind_pre = pc::kind_class(&parsed.kind);
+            }
+            res_pre = parsed.res.clone();
+            kind_title = parsed.kind;
+        }
+        pc::corr_score(&pc::CorrFeatures {
+            delta: f.first_posted - p.pt,
+            sz: p.size,
+            est_content: f.est_content,
+            par2_identified: f.par2_identified,
+            kind_pre,
+            grp_kind: f.grp_kind,
+            fl: p.files,
+            rel_files: f.rel_files,
+            kind_title,
+            res_pre,
+        })
+    }
+
+    /// The candidate pres for one release, scored and ranked (best
+    /// first). Uses idx_predb_pt for the window; the 4000-row LIMIT
+    /// truncates pathological windows newest-first, which is also the
+    /// time-score order.
+    fn corr_eval(&self, rid: i64) -> rusqlite::Result<Option<(CorrRelFacts, Vec<CorrCand>)>> {
+        let Some(facts) = self.corr_release_facts(rid)? else {
+            return Ok(None);
+        };
+        let lo = facts.first_posted - crate::predb_corr::DELTA_MAX;
+        let hi = facts.first_posted - crate::predb_corr::DELTA_MIN;
+        let pres: Vec<CorrPreRow> = {
+            let mut stmt = self.db.prepare_cached(
+                "SELECT id, title, category, source, size, files, nuked, pt, fnkey<>''
+                   FROM predb WHERE pt BETWEEN ?1 AND ?2
+                  ORDER BY pt DESC LIMIT 4000",
+            )?;
+            stmt.query_map([lo, hi], |r| {
+                Ok(CorrPreRow {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                    category: r.get(2)?,
+                    source: r.get(3)?,
+                    size: r.get::<_, i64>(4)?.max(0) as u64,
+                    files: r.get::<_, i64>(5)?.max(0) as u32,
+                    nuked: r.get(6)?,
+                    pt: r.get(7)?,
+                    has_fn: r.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        };
+        let mut cands: Vec<CorrCand> = pres
+            .into_iter()
+            .filter_map(|p| {
+                self.corr_score_pair(&facts, &p)
+                    .map(|score| CorrCand { pre: p, score })
+            })
+            .collect();
+        cands.sort_by_key(|c| std::cmp::Reverse(c.score.total));
+        Ok(Some((facts, cands)))
+    }
+
+    /// Evaluate one release and act on the outcome: store/refresh the
+    /// suggestion, and auto-apply when every gate agrees. Returns what
+    /// happened.
+    fn corr_consider(&mut self, rid: i64, auto: bool, now: i64) -> rusqlite::Result<CorrOutcome> {
+        use crate::predb_corr::{FLOOR, MARGIN};
+        // A row a human or an oracle has ruled on is settled: rejected
+        // must never nag again (in ANY form - suggestion or auto),
+        // applied/confirmed have nothing left to decide, and revoked
+        // means the correlation already guessed wrong here once.
+        let settled: Option<String> = self
+            .db
+            .prepare_cached("SELECT status FROM pre_corr WHERE release_id=?1")?
+            .query_row([rid], |r| r.get(0))
+            .optional()?;
+        if matches!(settled.as_deref(), Some(s) if s != "suggested") {
+            return Ok(CorrOutcome::Nothing);
+        }
+        let Some((facts, cands)) = self.corr_eval(rid)? else {
+            return Ok(CorrOutcome::Nothing);
+        };
+        let Some(best) = cands.first().cloned() else {
+            return Ok(CorrOutcome::Nothing);
+        };
+        if best.score.total < FLOOR {
+            return Ok(CorrOutcome::Nothing);
+        }
+        let delta = facts.first_posted - best.pre.pt;
+        let runner_up = cands.get(1).map(|c| c.score.total).unwrap_or(0);
+        // Store/refresh the suggestion - but never touch a row a human
+        // or an oracle has already ruled on ('rejected' must not nag,
+        // 'applied'/'confirmed' must not wander).
+        self.db.execute(
+            "INSERT INTO pre_corr(release_id, predb_id, score, delta, ratio, runner_up,
+                                  status, at)
+             VALUES(?1,?2,?3,?4,?5,?6,'suggested',?7)
+             ON CONFLICT(release_id) DO UPDATE SET
+               predb_id=excluded.predb_id, score=excluded.score, delta=excluded.delta,
+               ratio=excluded.ratio, runner_up=excluded.runner_up, at=excluded.at
+             WHERE pre_corr.status='suggested' AND excluded.score>=pre_corr.score",
+            rusqlite::params![
+                rid,
+                best.pre.id,
+                best.score.total,
+                delta,
+                best.score.ratio_milli as i64,
+                runner_up,
+                now
+            ],
+        )?;
+        if !auto {
+            return Ok(CorrOutcome::Suggested);
+        }
+        // The auto gate, every clause of it. Failing any clause is not
+        // an error: crowded, nuked, filename-bearing or sibling-shaped
+        // candidates are exactly what SUGGEST exists for.
+        if !best.score.strong()
+            || best.score.total - runner_up <= MARGIN
+            || best.pre.nuked
+            || best.pre.has_fn
+        {
+            return Ok(CorrOutcome::Suggested);
+        }
+        // Sibling rule: another above-floor pre with the same title_key
+        // is the REPACK/PROPER/other-group shape - a human picks those.
+        let best_key = crate::categories::classify(&best.pre.title, &self.custom).key;
+        let sibling = cands.iter().skip(1).any(|c| {
+            c.score.total >= FLOOR
+                && crate::categories::classify(&c.pre.title, &self.custom).key == best_key
+        });
+        if sibling {
+            return Ok(CorrOutcome::Suggested);
+        }
+        // Mutual best: the pre must also pick THIS release from its own
+        // forward window, by the same margin. Busy hours are asymmetric
+        // in both directions; this closes the second one.
+        if !self.corr_mutual_best(&best.pre, rid)? {
+            return Ok(CorrOutcome::Suggested);
+        }
+        let source = format!("corr:{}", corr_source_base(&best.pre.source));
+        if self.apply_pre_name(rid, &best.pre.title, &source, now)? {
+            self.db.execute(
+                "UPDATE pre_corr SET status='applied', at=?2 WHERE release_id=?1",
+                rusqlite::params![rid, now],
+            )?;
+            return Ok(CorrOutcome::Applied);
+        }
+        Ok(CorrOutcome::Suggested)
+    }
+
+    /// Does this pre, scanning its own forward window, pick `rid` and
+    /// by the auto margin?
+    /// The forward window's candidate releases for one pre. Sized pres
+    /// use the time+size-banded shape, which the partial index below
+    /// serves precisely; that matters twice over. First, cost: a plain
+    /// 14-day window over a large index holds millions of junk rows and
+    /// `LIMIT 50` would take an ARBITRARY 50 of them - the true match
+    /// mostly would not be in the sample. Second, the mutual-best gate:
+    /// missing a real competitor makes auto MORE permissive, so the
+    /// competitor set must actually be the size-plausible one. The
+    /// band is generous (the exact veto stays in Rust): wire bytes run
+    /// a few percent over content, and hidden par2 up to ~18% more.
+    fn corr_forward_ids(&self, pre: &CorrPreRow) -> rusqlite::Result<Vec<i64>> {
+        const WINDOW: i64 = CORR_WINDOW as i64;
+        let lo = pre.pt + crate::predb_corr::DELTA_MIN;
+        let hi = pre.pt + crate::predb_corr::DELTA_MAX;
+        if pre.size > 0 {
+            let blo = (pre.size as f64 * 0.68) as i64;
+            let bhi = (pre.size as f64 * 1.60) as i64;
+            let mut stmt = self.db.prepare_cached(
+                // The WHERE terms repeat the partial index's predicate
+                // verbatim so the planner may use idx_rel_corr.
+                "SELECT id FROM releases
+                  WHERE junk>=70 AND pre_title=''
+                    AND first_posted BETWEEN ?1 AND ?2
+                    AND total_bytes BETWEEN ?3 AND ?4 LIMIT ?5",
+            )?;
+            return stmt
+                .query_map(rusqlite::params![lo, hi, blo, bhi, WINDOW], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>();
+        }
+        let mut stmt = self.db.prepare_cached(
+            "SELECT id FROM releases
+              WHERE pre_title='' AND junk>=70
+                AND first_posted BETWEEN ?1 AND ?2 LIMIT ?3",
+        )?;
+        stmt.query_map(rusqlite::params![lo, hi, WINDOW], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()
+    }
+
+    /// Did [`corr_forward_ids`] return everything in the window, or did
+    /// it stop at the cap?
+    ///
+    /// The distinction is a correctness one, not a cosmetic one. The
+    /// mutual-best gate compares our score against the best COMPETITOR,
+    /// so a competitor the query never returned makes `best_other`
+    /// understated and the auto margin easier to clear - the failure
+    /// direction that renames a release wrongly. An arbitrary sample
+    /// cannot answer a question about a maximum, so a saturated window
+    /// means the gate does not know.
+    fn corr_window_saturated(ids: &[i64]) -> bool {
+        ids.len() >= CORR_WINDOW
+    }
+
+    /// The index `corr_forward_ids` leans on, built lazily on the first
+    /// correlation pass rather than at open - an install that never
+    /// turns the feature on must not pay an index over its junk rows.
+    /// kv-flagged so the CREATE (a table scan on a large index) runs
+    /// its check once, not every tick.
+    fn ensure_corr_index(&mut self) -> rusqlite::Result<()> {
+        if self.kv_get("predb_corr_idx_v1").is_some() {
+            return Ok(());
+        }
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rel_corr
+               ON releases(first_posted, total_bytes)
+             WHERE junk>=70 AND pre_title=''",
+            [],
+        )?;
+        self.kv_set("predb_corr_idx_v1", "1")
+    }
+
+    /// One pre against its forward window: probe the plausible posts
+    /// and hand floor-clearing pairs to the full release-driven
+    /// evaluation (so the stored suggestion carries honest competition
+    /// data). Shared by the live rotation and the catch-up pass.
+    fn corr_probe_pre(
+        &mut self,
+        p: &CorrPreRow,
+        auto: bool,
+        now: i64,
+        seen: &mut std::collections::HashSet<i64>,
+    ) -> rusqlite::Result<(usize, usize)> {
+        let (mut suggested, mut applied) = (0usize, 0usize);
+        for rid in self.corr_forward_ids(p)? {
+            // Dense windows are the whole cost story: sibling pres in
+            // one batch share most of their candidates, and the full
+            // release-driven evaluation each one triggers scans a
+            // 4000-row window. Measured live (2 Aug, the first seed
+            // catch-up): without these two skips a 150-pre tick held
+            // the write lock for ~40 s and the pass projected to half
+            // a day. First skip: one release, one evaluation per
+            // batch.
+            if seen.contains(&rid) {
+                continue;
+            }
+            let Some(f) = self.corr_release_facts(rid)? else {
+                continue;
+            };
+            let Some(pair) = self.corr_score_pair(&f, p) else {
+                continue;
+            };
+            if pair.total < crate::predb_corr::FLOOR {
+                continue;
+            }
+            // Second skip: a stored suggestion is already the best of a
+            // FULL evaluation. A pair that cannot beat it cannot change
+            // the stored row - and a settled row (applied/rejected/...)
+            // is not ours to reopen. The auto caveat: a stored
+            // STRONG-range suggestion may only be sitting unapplied
+            // because auto was off (or a gate has since cleared), so
+            // with auto on those few rows keep earning a fresh look
+            // until they settle one way or the other.
+            let stored: Option<(String, i64)> = self
+                .db
+                .prepare_cached("SELECT status, score FROM pre_corr WHERE release_id=?1")?
+                .query_row([rid], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
+            match &stored {
+                Some((st, _)) if st != "suggested" => continue,
+                Some((_, sc))
+                    if *sc >= i64::from(pair.total)
+                        && (!auto || *sc < i64::from(crate::predb_corr::STRONG)) =>
+                {
+                    continue;
+                }
+                _ => {}
+            }
+            // Marked seen HERE, where the expensive thing actually
+            // happens, not at the top of the loop. The skip exists to
+            // stop one release paying for a full 4000-row evaluation
+            // once per sibling pre in a batch; marking it before the
+            // floor test spent that budget on a pre that was then
+            // thrown away, so a weak pre with a higher id consumed the
+            // release and the tight 80+ pre behind it skipped straight
+            // past. Everything above this line is per-pair and cheap.
+            seen.insert(rid);
+            match self.corr_consider(rid, auto, now)? {
+                CorrOutcome::Suggested => suggested += 1,
+                CorrOutcome::Applied => applied += 1,
+                CorrOutcome::Nothing => {}
+            }
+        }
+        Ok((suggested, applied))
+    }
+
+    fn corr_mutual_best(&self, pre: &CorrPreRow, rid: i64) -> rusqlite::Result<bool> {
+        let ids = self.corr_forward_ids(pre)?;
+        // The window filled: somewhere past the cap there may be a
+        // stronger candidate this never scored, and not knowing means
+        // not auto-applying. The suggestion still stands for a human.
+        if Self::corr_window_saturated(&ids) {
+            return Ok(false);
+        }
+        let mut ours = None;
+        let mut best_other = 0i32;
+        for id in ids {
+            let Some(f) = self.corr_release_facts(id)? else {
+                continue;
+            };
+            let Some(s) = self.corr_score_pair(&f, pre) else {
+                continue;
+            };
+            if id == rid {
+                ours = Some(s.total);
+            } else {
+                best_other = best_other.max(s.total);
+            }
+        }
+        let Some(ours) = ours else { return Ok(false) };
+        Ok(ours - best_other > crate::predb_corr::MARGIN)
+    }
+
+    /// Release-driven correlation backlog: walks already-indexed
+    /// obfuscated releases once, same cursor discipline as
+    /// `predb_backlog` (stride-bounded, walks once, stops). The cursor
+    /// resets exactly when a seed import lands (`predb_seed_gen`
+    /// bumps) - a bigger pre corpus is the only event that makes
+    /// re-walking worth anything.
+    /// Returns (examined, suggested, applied).
+    pub fn predb_corr_backlog(
+        &mut self,
+        budget: u32,
+        window_secs: i64,
+        auto: bool,
+        now: i64,
+    ) -> rusqlite::Result<(usize, usize, usize)> {
+        if budget == 0 {
+            return Ok((0, 0, 0));
+        }
+        let seed_gen = self.kv_get("predb_seed_gen").unwrap_or_default();
+        if self.kv_get("predb_corr_seed_gen").unwrap_or_default() != seed_gen {
+            self.db
+                .execute("DELETE FROM kv WHERE k='predb_corr_cursor'", [])?;
+            self.kv_set("predb_corr_seed_gen", &seed_gen)?;
+        }
+        let cutoff = if window_secs > 0 {
+            now - window_secs
+        } else {
+            0
+        };
+        let floor: i64 = self.db.query_row(
+            "SELECT COALESCE(MIN(id),0) FROM releases WHERE first_seen>=?1",
+            [cutoff],
+            |r| r.get::<_, i64>(0).map(|v| v - 1),
+        )?;
+        let cursor: i64 = match self
+            .kv_get("predb_corr_cursor")
+            .and_then(|v| v.parse().ok())
+        {
+            Some(v) => v,
+            None => self
+                .db
+                .query_row("SELECT COALESCE(MAX(id),0) FROM releases", [], |r| r.get(0))?,
+        };
+        if cursor <= floor {
+            return Ok((0, 0, 0));
+        }
+        const STRIDE: i64 = 100_000;
+        let lo = cursor.saturating_sub(STRIDE).max(floor);
+        let ids: Vec<i64> = {
+            let mut stmt = self.db.prepare_cached(
+                "SELECT id FROM releases
+                  WHERE id>?1 AND id<=?2 AND pre_title='' AND junk>=70
+                    AND first_posted>0
+                  ORDER BY id DESC LIMIT ?3",
+            )?;
+            stmt.query_map(rusqlite::params![lo, cursor, budget], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let next = if ids.len() as u32 >= budget {
+            ids.last().map(|id| id - 1).unwrap_or(lo)
+        } else {
+            lo
+        };
+        let (mut suggested, mut applied) = (0usize, 0usize);
+        for rid in &ids {
+            match self.corr_consider(*rid, auto, now)? {
+                CorrOutcome::Suggested => suggested += 1,
+                CorrOutcome::Applied => applied += 1,
+                CorrOutcome::Nothing => {}
+            }
+        }
+        self.kv_set("predb_corr_cursor", &next.to_string())?;
+        Ok((ids.len(), suggested, applied))
+    }
+
+    /// Live pre-driven correlation: fresh title-only rows open a
+    /// forward window over arriving posts. Population provably disjoint
+    /// from `predb_sweep` (this filters `fnkey=''`, that filters
+    /// `fnkey<>''`), so the shared `tried_at` rotation cannot fight.
+    /// Seed rows are born RETIRED and never enter this rotation.
+    /// Returns (pre rows examined, suggested, applied).
+    pub fn predb_corr_sweep(
+        &mut self,
+        budget: u32,
+        auto: bool,
+        now: i64,
+    ) -> rusqlite::Result<(usize, usize, usize)> {
+        if budget == 0 {
+            return Ok((0, 0, 0));
+        }
+        const RETRY_FLOOR: i64 = 600;
+        let pres: Vec<CorrPreRow> = {
+            let mut stmt = self.db.prepare_cached(
+                "SELECT id, title, category, source, size, files, nuked, pt, fnkey<>''
+                   FROM predb WHERE fnkey='' AND tried_at < ?1
+                  ORDER BY tried_at ASC, id DESC LIMIT ?2",
+            )?;
+            stmt.query_map(rusqlite::params![now - RETRY_FLOOR, budget], |r| {
+                Ok(CorrPreRow {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                    category: r.get(2)?,
+                    source: r.get(3)?,
+                    size: r.get::<_, i64>(4)?.max(0) as u64,
+                    files: r.get::<_, i64>(5)?.max(0) as u32,
+                    nuked: r.get(6)?,
+                    pt: r.get(7)?,
+                    has_fn: r.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        };
+        if pres.is_empty() {
+            return Ok((0, 0, 0));
+        }
+        self.ensure_corr_index()?;
+        let (mut suggested, mut applied) = (0usize, 0usize);
+        let mut seen = std::collections::HashSet::new();
+        for p in &pres {
+            let (s2, a2) = self.corr_probe_pre(p, auto, now, &mut seen)?;
+            suggested += s2;
+            applied += a2;
+            // Keep asking while the window is open, then retire.
+            self.db.execute(
+                "UPDATE predb SET tried_at=CASE WHEN ?2 < pt + ?3 THEN ?2 ELSE ?4 END
+                  WHERE id=?1",
+                rusqlite::params![p.id, now, crate::predb_corr::DELTA_MAX, PREDB_RETIRED],
+            )?;
+        }
+        Ok((pres.len(), suggested, applied))
+    }
+
+    /// The catch-up pass: one walk over EVERY sized pre in the table -
+    /// retired seeds included - probing each one's forward window. This
+    /// is the historical mechanism: driving from the ~tens of thousands
+    /// of sized pres costs an hour; driving from the tens of MILLIONS
+    /// of obfuscated releases (the release-driven walk) costs months.
+    /// The release-driven backlog stays for the sizeless-suggestion
+    /// tail; this pass is what actually covers a seed import.
+    ///
+    /// Cursor discipline as everywhere: walks predb ids downward once,
+    /// parks at 0 when done, and re-opens exactly when a seed import
+    /// bumps `predb_seed_gen`. Does not touch `tried_at` - seeds stay
+    /// retired, and the live rotation's clock is not this pass's to
+    /// wind. Returns (pres examined, suggested, applied).
+    pub fn predb_corr_catchup(
+        &mut self,
+        budget: u32,
+        auto: bool,
+        now: i64,
+    ) -> rusqlite::Result<(usize, usize, usize)> {
+        if budget == 0 {
+            return Ok((0, 0, 0));
+        }
+        let seed_gen = self.kv_get("predb_seed_gen").unwrap_or_default();
+        if self.kv_get("predb_catchup_seed_gen").unwrap_or_default() != seed_gen {
+            self.db
+                .execute("DELETE FROM kv WHERE k='predb_catchup_cursor'", [])?;
+            self.kv_set("predb_catchup_seed_gen", &seed_gen)?;
+        }
+        let cursor: i64 = match self
+            .kv_get("predb_catchup_cursor")
+            .and_then(|v| v.parse().ok())
+        {
+            Some(v) => v,
+            None => self
+                .db
+                .query_row("SELECT COALESCE(MAX(id),0)+1 FROM predb", [], |r| r.get(0))?,
+        };
+        if cursor <= 0 {
+            return Ok((0, 0, 0));
+        }
+        self.ensure_corr_index()?;
+        let pres: Vec<CorrPreRow> = {
+            let mut stmt = self.db.prepare_cached(
+                "SELECT id, title, category, source, size, files, nuked, pt, fnkey<>''
+                   FROM predb WHERE id<?1 AND fnkey='' AND size>0
+                  ORDER BY id DESC LIMIT ?2",
+            )?;
+            stmt.query_map(rusqlite::params![cursor, budget], |r| {
+                Ok(CorrPreRow {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                    category: r.get(2)?,
+                    source: r.get(3)?,
+                    size: r.get::<_, i64>(4)?.max(0) as u64,
+                    files: r.get::<_, i64>(5)?.max(0) as u32,
+                    nuked: r.get(6)?,
+                    pt: r.get(7)?,
+                    has_fn: r.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        };
+        let (mut suggested, mut applied) = (0usize, 0usize);
+        let mut seen = std::collections::HashSet::new();
+        for p in &pres {
+            let (s2, a2) = self.corr_probe_pre(p, auto, now, &mut seen)?;
+            suggested += s2;
+            applied += a2;
+        }
+        // Fewer rows than asked for = the walk fell off the bottom of
+        // the table; park at 0 so later ticks cost one kv read.
+        let next = if pres.len() as u32 >= budget {
+            pres.last().map(|p| p.id).unwrap_or(0)
+        } else {
+            0
+        };
+        self.kv_set("predb_catchup_cursor", &next.to_string())?;
+        Ok((pres.len(), suggested, applied))
+    }
+
+    /// On-demand ranked candidate list for one release (the UI's
+    /// pick-a-name view). Top `n`, floor NOT applied - a human scanning
+    /// twenty names spots the right one below the floor too.
+    pub fn pre_candidates(
+        &self,
+        rid: i64,
+        n: usize,
+    ) -> rusqlite::Result<Vec<(i64, String, i32, i64, u32, bool, String)>> {
+        let Some((facts, cands)) = self.corr_eval(rid)? else {
+            return Ok(Vec::new());
+        };
+        Ok(cands
+            .into_iter()
+            .take(n)
+            .map(|c| {
+                (
+                    c.pre.id,
+                    c.pre.title.clone(),
+                    c.score.total,
+                    facts.first_posted - c.pre.pt,
+                    c.score.ratio_milli,
+                    c.pre.nuked,
+                    c.pre.source.clone(),
+                )
+            })
+            .collect())
+    }
+
+    /// Manual assignment from the candidate list. The human IS the
+    /// gate, so none of the auto clauses apply; provenance says a human
+    /// picked a correlated name.
+    pub fn pre_assign(&mut self, rid: i64, predb_id: i64, now: i64) -> rusqlite::Result<bool> {
+        let Some((title, source)) = self
+            .db
+            .prepare_cached("SELECT title, source FROM predb WHERE id=?1")?
+            .query_row([predb_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .optional()?
+        else {
+            return Ok(false);
+        };
+        let label = format!("manual+corr:{}", corr_source_base(&source));
+        if !self.apply_pre_name(rid, &title, &label, now)? {
+            return Ok(false);
+        }
+        self.db.execute(
+            "INSERT INTO pre_corr(release_id, predb_id, score, delta, ratio, runner_up,
+                                  status, at)
+             VALUES(?1,?2,0,0,0,0,'applied',?3)
+             ON CONFLICT(release_id) DO UPDATE SET
+               predb_id=excluded.predb_id, status='applied', at=excluded.at",
+            rusqlite::params![rid, predb_id, now],
+        )?;
+        Ok(true)
+    }
+
+    /// Reject a suggestion. A rejected row is never re-suggested (the
+    /// wall_dismissed lesson: a declined suggestion must not nag). If
+    /// the rejected name had been correlation-applied, it is revoked
+    /// too - rejection means "that name is wrong", not "stop showing
+    /// the hint".
+    pub fn pre_reject(&mut self, rid: i64, now: i64) -> rusqlite::Result<()> {
+        let applied: Option<String> = self
+            .db
+            .prepare_cached("SELECT pre_source FROM releases WHERE id=?1")?
+            .query_row([rid], |r| r.get(0))
+            .optional()?;
+        if let Some(src) = applied
+            && (src.starts_with("predb/corr:") || src.starts_with("predb/manual+corr:"))
+        {
+            self.revoke_pre_name(rid)?;
+        }
+        self.db.execute(
+            "INSERT INTO pre_corr(release_id, predb_id, score, delta, ratio, runner_up,
+                                  status, at)
+             VALUES(?1,0,0,0,0,0,'rejected',?2)
+             ON CONFLICT(release_id) DO UPDATE SET status='rejected', at=excluded.at",
+            rusqlite::params![rid, now],
+        )?;
+        Ok(())
+    }
+
+    /// Take a correlation-applied name back off: pre_title clears (the
+    /// pre_fts UPDATE trigger removes the search entry) and everything
+    /// the name determined is re-derived from the stem, exactly the way
+    /// ingest would. Exists ONLY for corr-applied rows; exact-leg names
+    /// are relay facts and are not touched by correlation code.
+    pub fn revoke_pre_name(&mut self, rid: i64) -> rusqlite::Result<bool> {
+        let row = self
+            .db
+            .prepare_cached(&format!(
+                "SELECT stem, total_bytes,
+                        (SELECT COALESCE(SUM({EXE_FILE_SQL}),0) FROM files
+                          WHERE release_id=releases.id)
+                   FROM releases WHERE id=?1 AND pre_title<>''"
+            ))?
+            .query_row([rid], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .optional()?;
+        let Some((stem, bytes, nexe)) = row else {
+            return Ok(false);
+        };
+        let p = crate::categories::classify(&stem, &self.custom);
+        let n = self.db.execute(
+            "UPDATE releases
+                SET pre_title='', pre_source='',
+                    kind=?2, res=?3, title_key=?4, junk=?5, langs=?6,
+                    vcodec=?7, acodec=?8, hdr=?9
+              WHERE id=?1",
+            rusqlite::params![
+                rid,
+                kind_str(&p.kind),
+                p.res.as_deref().unwrap_or_default(),
+                p.key,
+                junk_score(&stem, &p, bytes as u64, nexe > 0),
+                p.langs.join(" "),
+                p.vcodec.as_deref().unwrap_or_default(),
+                p.acodec.as_deref().unwrap_or_default(),
+                p.hdr.as_deref().unwrap_or_default()
+            ],
+        )?;
+        if n > 0 {
+            self.db.execute(
+                "UPDATE pre_corr SET status='revoked' WHERE release_id=?1",
+                [rid],
+            )?;
+        }
+        Ok(n > 0)
+    }
+
+    /// The download-time verdict: a byte-level oracle (srrdb CRC /
+    /// PAR2 hash16k) has just named the post `posted_stem` as
+    /// `oracle_name`. If a correlation had claimed (or suggested) a
+    /// name for that release, the oracle settles it: agreement is
+    /// 'confirmed' (and the now-PROVEN pairing is back-fed into the
+    /// predb row's filename, arming the exact legs for any repost);
+    /// disagreement is 'rejected', and an applied correlation name is
+    /// revoked on the spot. Exact-leg names (relay-paired filenames)
+    /// are never touched - the oracle vs relay fight, if it ever
+    /// happens, is not correlation's to referee.
+    ///
+    /// Returns Some(true)=confirmed, Some(false)=rejected, None when
+    /// no correlation row was involved. This is the mechanism behind
+    /// the confirmed:rejected precision meter.
+    pub fn pre_corr_verdict(
+        &mut self,
+        posted: &str,
+        oracle_name: &str,
+        now: i64,
+    ) -> rusqlite::Result<Option<bool>> {
+        let stem = crate::extract::release_stem(posted).to_ascii_lowercase();
+        let oracle_key = crate::predb::match_key(oracle_name);
+        if stem.is_empty() || oracle_key.is_empty() {
+            return Ok(None);
+        }
+        // Release identity is UNIQUE(stem, poster, grp), so a stem alone
+        // can name several rows - a crosspost is exactly that, the same
+        // release posted to two groups. The download tail knows only the
+        // posted name, so when more than one row carries a live
+        // correlation claim under this stem there is no way to tell
+        // which one the bytes belong to, and picking an arbitrary
+        // `LIMIT 1` let an oracle result for B confirm, reject or revoke
+        // A - and, on a confirm, back-feed B's filename into A's predb
+        // candidate, arming future exact matches on a pairing nothing
+        // ever proved. A verdict that cannot be aimed is not applied.
+        let ambiguous: i64 = self
+            .db
+            .prepare_cached(
+                "SELECT COUNT(*) FROM releases r
+                   JOIN pre_corr c ON c.release_id=r.id
+                  WHERE LOWER(r.stem)=?1 AND c.status IN ('suggested','applied')",
+            )?
+            .query_row([&stem], |r| r.get(0))?;
+        if ambiguous > 1 {
+            return Ok(None);
+        }
+        let row = self
+            .db
+            .prepare_cached(
+                "SELECT r.id, r.pre_title, r.pre_source, c.predb_id, c.status,
+                        COALESCE(p.title,''), COALESCE(p.filename,'')
+                   FROM releases r
+                   JOIN pre_corr c ON c.release_id=r.id
+                   LEFT JOIN predb p ON p.id=c.predb_id
+                  WHERE LOWER(r.stem)=?1 AND c.status IN ('suggested','applied')
+                  LIMIT 1",
+            )?
+            .query_row([&stem], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                ))
+            })
+            .optional()?;
+        let Some((rid, pre_title, pre_source, predb_id, status, cand_title, cand_fn)) = row else {
+            return Ok(None);
+        };
+        // What did correlation claim? The applied name for 'applied',
+        // the candidate's own title for 'suggested'.
+        let claimed = if status == "applied" {
+            &pre_title
+        } else {
+            &cand_title
+        };
+        if claimed.trim().is_empty() {
+            return Ok(None);
+        }
+        let corr_applied =
+            pre_source.starts_with("predb/corr:") || pre_source.starts_with("predb/manual+corr:");
+        if status == "applied" && !corr_applied {
+            // The applied name is an exact-leg fact, not ours.
+            return Ok(None);
+        }
+        if crate::predb::match_key(claimed) == oracle_key {
+            self.db.execute(
+                "UPDATE pre_corr SET status='confirmed', at=?2 WHERE release_id=?1",
+                rusqlite::params![rid, now],
+            )?;
+            // Back-feed the proven pairing: the posted stem IS this
+            // pre's filename now, which is exactly what the exact legs
+            // key on. Non-empty-wins as everywhere; the cleared
+            // tried_at puts the row at the front of the exact sweep.
+            if cand_fn.is_empty() && predb_id > 0 {
+                let fnkey = crate::predb::match_key(&stem);
+                self.db.execute(
+                    "UPDATE predb SET filename=?2, fnstem=?3, fnkey=?4, tried_at=0
+                      WHERE id=?1 AND filename=''",
+                    rusqlite::params![predb_id, posted, stem, fnkey],
+                )?;
+                self.predb = true;
+            }
+            return Ok(Some(true));
+        }
+        // The oracle says otherwise. Take an applied name back off
+        // before recording the verdict - revoke_pre_name flips the
+        // status to 'revoked', so 'rejected' is written after it.
+        if status == "applied" && corr_applied {
+            self.revoke_pre_name(rid)?;
+        }
+        self.db.execute(
+            "UPDATE pre_corr SET status='rejected', at=?2 WHERE release_id=?1",
+            rusqlite::params![rid, now],
+        )?;
+        Ok(Some(false))
+    }
+
+    /// Correlation hints for a page of browse rows: release_id ->
+    /// (name, score, delta, ratio_milli, status). One prepared lookup
+    /// per page; INNER JOIN so a pruned pre row simply drops its hint.
+    pub fn pre_hints(
+        &self,
+        ids: &[i64],
+    ) -> rusqlite::Result<Vec<(i64, String, i32, i64, u32, String)>> {
+        let mut out = Vec::new();
+        let mut stmt = self.db.prepare_cached(
+            "SELECT c.release_id, p.title, c.score, c.delta, c.ratio, c.status
+               FROM pre_corr c JOIN predb p ON p.id=c.predb_id
+              WHERE c.release_id=?1 AND c.status IN ('suggested','applied','confirmed')",
+        )?;
+        for id in ids {
+            if let Some(row) = stmt
+                .query_row([id], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get::<_, i64>(4)?.max(0) as u32,
+                        r.get(5)?,
+                    ))
+                })
+                .optional()?
+            {
+                out.push(row);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The correlation precision meter: counts by status. The
+    /// confirmed:rejected ratio is the number that earns (or loses) the
+    /// auto tier.
+    pub fn predb_corr_stats(&self) -> rusqlite::Result<Vec<(String, u64)>> {
+        let mut stmt = self
+            .db
+            .prepare_cached("SELECT status, COUNT(*) FROM pre_corr GROUP BY status")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get::<_, i64>(1)?.max(0) as u64)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Store a batch of HISTORICAL pres from an aggregator. Differs
+    /// from `predb_store` in exactly the ways the seed design demands:
+    /// a row without a timestamp is skipped entirely (it can feed
+    /// neither correlation nor exact matching - it could only collide),
+    /// rows are born RETIRED (the backlog walk reaches them by pt range;
+    /// they never enter the live rotation), and an existing row's
+    /// `source` is KEPT when non-empty - live provenance outranks seed
+    /// provenance for the same title. Returns rows stored or updated.
+    pub fn predb_seed_store(
+        &mut self,
+        lines: &[crate::predb::PreLine],
+        source: &str,
+        now: i64,
+    ) -> rusqlite::Result<usize> {
+        // Same reason as predb_store: seed rows are feed activity, and
+        // the named count needs its index before the read-only API
+        // handle starts asking.
+        Self::ensure_named_index(&self.db);
+        let tx = self.db.transaction()?;
+        let mut stored = 0usize;
+        for l in lines {
+            if l.title.trim().is_empty() || l.date <= 0 {
+                continue;
+            }
+            let n = tx
+                .prepare_cached(
+                    "INSERT INTO predb(title, filename, fnstem, fnkey, size, files,
+                                       category, source, requestid, grp, nuked,
+                                       nuke_reason, pre_at, seen_at, pt, tried_at)
+                     VALUES(?1,'','','',?2,?3,?4,?5,'','',?6,?7,?8,?9,?8,?10)
+                     ON CONFLICT(title) DO UPDATE SET
+                       size    =CASE WHEN excluded.size <>0 THEN excluded.size  ELSE size  END,
+                       files   =CASE WHEN excluded.files<>0 THEN excluded.files ELSE files END,
+                       category=CASE WHEN excluded.category<>'' THEN excluded.category
+                                     ELSE category END,
+                       source  =CASE WHEN source='' THEN excluded.source ELSE source END,
+                       nuked   =MAX(nuked, excluded.nuked),
+                       nuke_reason=CASE WHEN excluded.nuke_reason<>'' THEN excluded.nuke_reason
+                                        ELSE nuke_reason END,
+                       pre_at  =CASE WHEN excluded.pre_at<>0 THEN excluded.pre_at ELSE pre_at END,
+                       pt      =CASE WHEN excluded.pre_at<>0 THEN excluded.pre_at ELSE pt END",
+                )?
+                .execute(rusqlite::params![
+                    l.title.trim(),
+                    l.size as i64,
+                    l.files,
+                    l.category,
+                    source,
+                    matches!(l.kind, crate::predb::PreKind::Nuk),
+                    l.nuke_reason,
+                    l.date,
+                    now,
+                    PREDB_RETIRED
+                ])?;
+            stored += n;
+        }
+        tx.commit()?;
+        Ok(stored)
     }
 
     /// Search by substring over the stem (case-insensitive), newest first.
@@ -2058,18 +4043,36 @@ impl Index {
                 .collect::<Vec<_>>()
                 .join(" ")
         };
-        let terms: Vec<String> = norm(query).split(' ').filter(|t| !t.is_empty()).map(String::from).collect();
+        let terms: Vec<String> = norm(query)
+            .split(' ')
+            .filter(|t| !t.is_empty())
+            .map(String::from)
+            .collect();
         // M28: FTS path - prefix-match every term against the stem index
         // instead of a triple-REPLACE full scan per request. Gate on the
         // FTS expression itself, not `terms`: a punctuation-only query
         // ("!!!") yields a non-empty `terms` but an EMPTY fts_match, and
         // `rel_fts MATCH ''` is a hard FTS5 error - fall through to the
         // LIKE scan instead (mirrors browse()).
-        let m = if self.fts { fts_match(query) } else { String::new() };
+        let m = if self.fts {
+            fts_match(query)
+        } else {
+            String::new()
+        };
         if !m.is_empty() {
+            // Two indexes, one query: the stem index (what was posted)
+            // and the pre-feed name index (what it was called). Without
+            // the second leg a release the feed rescued is invisible to
+            // every search for its real title - which is the entire
+            // point of having rescued it.
+            let leg = if self.pre_fts {
+                "OR id IN (SELECT rowid FROM pre_fts WHERE pre_fts MATCH ?1)"
+            } else {
+                ""
+            };
             let mut stmt = self.db.prepare(&format!(
                 "SELECT {REL_COLS} FROM releases
-                 WHERE id IN (SELECT rowid FROM rel_fts WHERE rel_fts MATCH ?1)
+                 WHERE id IN (SELECT rowid FROM rel_fts WHERE rel_fts MATCH ?1) {leg}
                  ORDER BY first_seen DESC LIMIT ?2"
             ))?;
             let rows = stmt.query_map(rusqlite::params![m, limit], release_from_row)?;
@@ -2077,15 +4080,22 @@ impl Index {
         }
         // "REPLACE(REPLACE(REPLACE(LOWER(stem)…))" mirrors `norm` in SQL.
         const NS: &str = "REPLACE(REPLACE(REPLACE(LOWER(stem),'.',' '),'_',' '),'-',' ')";
+        const PS: &str = "REPLACE(REPLACE(REPLACE(LOWER(pre_title),'.',' '),'_',' '),'-',' ')";
         let where_clause = if terms.is_empty() {
             "1=1".to_string()
         } else {
-            terms
-                .iter()
-                .enumerate()
-                .map(|(i, _)| format!("{NS} LIKE '%' || ?{} || '%'", i + 1))
-                .collect::<Vec<_>>()
-                .join(" AND ")
+            // Same pairing as the FTS path above: match either the
+            // posted stem or the name the feed gave it. Both chains cite
+            // the same ?N, so the bind list is unchanged.
+            let chain = |col: &str| {
+                terms
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| format!("{col} LIKE '%' || ?{} || '%'", i + 1))
+                    .collect::<Vec<_>>()
+                    .join(" AND ")
+            };
+            format!("({}) OR (pre_title <> '' AND ({}))", chain(NS), chain(PS))
         };
         let sql = format!(
             "SELECT {REL_COLS} FROM releases WHERE {where_clause}
@@ -2093,10 +4103,8 @@ impl Index {
             terms.len() + 1
         );
         let mut stmt = self.db.prepare(&sql)?;
-        let mut params: Vec<&dyn rusqlite::ToSql> = terms
-            .iter()
-            .map(|t| t as &dyn rusqlite::ToSql)
-            .collect();
+        let mut params: Vec<&dyn rusqlite::ToSql> =
+            terms.iter().map(|t| t as &dyn rusqlite::ToSql).collect();
         params.push(&limit);
         let rows = stmt.query_map(params.as_slice(), release_from_row)?;
         rows.collect()
@@ -2162,9 +4170,9 @@ impl Index {
         // equality alone); only a genuine miss pays for the scans.
         //
         // 1a. Exact stem, served from idx_rel_stem.
-        let mut stmt = self
-            .db
-            .prepare(&format!("SELECT {REL_COLS} FROM releases WHERE stem = ?1 LIMIT ?2"))?;
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT {REL_COLS} FROM releases WHERE stem = ?1 LIMIT ?2"
+        ))?;
         let rows: Vec<Release> = stmt
             .query_map(rusqlite::params![header, limit], release_from_row)?
             .collect::<Result<_, _>>()?;
@@ -2195,7 +4203,11 @@ impl Index {
 
         // 2. FTS (or the LIKE fallback on a database without it), then
         //    verify: only a stem that really contains the header counts.
-        let m = if self.fts { fts_match(header) } else { String::new() };
+        let m = if self.fts {
+            fts_match(header)
+        } else {
+            String::new()
+        };
         let cands: Vec<Release> = if !m.is_empty() {
             let mut stmt = self.db.prepare(&format!(
                 "SELECT {REL_COLS} FROM releases
@@ -2213,7 +4225,13 @@ impl Index {
             stmt.query_map(rusqlite::params![want, FIND_SCAN_CAP], release_from_row)?
                 .collect::<Result<_, _>>()?
         };
-        push(cands.into_iter().filter(|r| norm(&r.stem).contains(&want)).collect(), &mut out);
+        push(
+            cands
+                .into_iter()
+                .filter(|r| norm(&r.stem).contains(&want))
+                .collect(),
+            &mut out,
+        );
         // Same reasoning as rung 1: rung 3 is a full scan of `files`, which
         // is the bigger table, so it must run only when nothing at all has
         // answered - not merely when fewer than `limit` things have.
@@ -2225,7 +4243,10 @@ impl Index {
         // 3. Filenames, anchored. The header's own LIKE metacharacters
         //    are escaped - an obfuscated name is allowed to contain `_`,
         //    and unescaped that is a single-character wildcard.
-        let esc = header.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let esc = header
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
         let mut stmt = self.db.prepare(&format!(
             "SELECT {REL_COLS} FROM releases WHERE id IN (
                  SELECT release_id FROM files
@@ -2312,8 +4333,9 @@ impl Index {
                 AND kind = 'movie' AND year > 0
               LIMIT 2",
         )?;
-        let years: Vec<u32> =
-            stmt.query_map([&key], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        let years: Vec<u32> = stmt
+            .query_map([&key], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
         Ok(match years.as_slice() {
             [y] => Some(*y),
             _ => None,
@@ -2416,22 +4438,37 @@ impl Index {
         }
         // Same separator-insensitive multi-term AND match as search() -
         // FTS prefix match when available, LIKE full-scan fallback.
-        let fts_m = if self.fts { fts_match(&q.q) } else { String::new() };
+        let fts_m = if self.fts {
+            fts_match(&q.q)
+        } else {
+            String::new()
+        };
         if !fts_m.is_empty() {
             let p = bind(&mut params, Box::new(fts_m));
+            // Posted stem OR pre-feed name - see search() for why the
+            // second index exists and is separate.
+            let leg = if self.pre_fts {
+                format!(" OR {{}}id IN (SELECT rowid FROM pre_fts WHERE pre_fts MATCH {p})")
+            } else {
+                String::new()
+            };
             wheres.push(format!(
-                "{{}}id IN (SELECT rowid FROM rel_fts WHERE rel_fts MATCH {p})"
+                "({{}}id IN (SELECT rowid FROM rel_fts WHERE rel_fts MATCH {p}){leg})"
             ));
         } else {
             const NS: &str = "REPLACE(REPLACE(REPLACE(LOWER({}stem),'.',' '),'_',' '),'-',' ')";
-            for term in q
-                .q
-                .to_ascii_lowercase()
-                .replace(['.', '_', '-'], " ")
-                .split_whitespace()
+            const PS: &str =
+                "REPLACE(REPLACE(REPLACE(LOWER({}pre_title),'.',' '),'_',' '),'-',' ')";
+            for term in
+                q.q.to_ascii_lowercase()
+                    .replace(['.', '_', '-'], " ")
+                    .split_whitespace()
             {
                 let p = bind(&mut params, Box::new(term.to_string()));
-                wheres.push(format!("{NS} LIKE '%' || {p} || '%'"));
+                wheres.push(format!(
+                    "({NS} LIKE '%' || {p} || '%' \
+                     OR ({{}}pre_title <> '' AND {PS} LIKE '%' || {p} || '%'))"
+                ));
             }
         }
         // Cross-posted releases (same stem in teevee AND moovee, or two
@@ -2444,7 +4481,11 @@ impl Index {
         // row at all, dropping the release from the list AND from
         // `total` while the grid still showed its card.
         let rep = alias(&wheres, "d.");
-        let rep = if rep.is_empty() { String::new() } else { format!(" AND {rep}") };
+        let rep = if rep.is_empty() {
+            String::new()
+        } else {
+            format!(" AND {rep}")
+        };
         wheres.push(format!(
             "id = (SELECT d.id FROM releases d WHERE d.stem = releases.stem{rep}
                    ORDER BY d.complete DESC,
@@ -2473,9 +4514,9 @@ impl Index {
             BrowseSort::Kind => format!("kind {dir}, {RES_RANK_SQL} {dir}"),
             // Completeness ratio; complete flag breaks ties so verified-
             // complete singles sort above 100%-but-unconfirmed rows.
-            BrowseSort::Completeness => format!(
-                "(CAST(have_parts AS REAL) / MAX(need_parts, 1)) {dir}, complete {dir}"
-            ),
+            BrowseSort::Completeness => {
+                format!("(CAST(have_parts AS REAL) / MAX(need_parts, 1)) {dir}, complete {dir}")
+            }
         };
         let total: u64 = self
             .db
@@ -2605,7 +4646,11 @@ impl Index {
                           (SELECT rowid FROM people_fts WHERE people_fts MATCH ?{n}))"
             )
         };
-        let fts_m = if self.fts { fts_match(&q.q) } else { String::new() };
+        let fts_m = if self.fts {
+            fts_match(&q.q)
+        } else {
+            String::new()
+        };
         if !fts_m.is_empty() {
             let p = bind(&mut params, Box::new(fts_m));
             let leg = people_leg(&mut params);
@@ -2613,17 +4658,15 @@ impl Index {
                 "({{}}id IN (SELECT rowid FROM rel_fts WHERE rel_fts MATCH {p}){leg})"
             ));
         } else if !q.q.trim().is_empty() {
-            const NS: &str =
-                "REPLACE(REPLACE(REPLACE(LOWER({}stem),'.',' '),'_',' '),'-',' ')";
+            const NS: &str = "REPLACE(REPLACE(REPLACE(LOWER({}stem),'.',' '),'_',' '),'-',' ')";
             // Every term must appear in the stem - but a people match
             // satisfies the whole query at once, so it wraps the lot
             // rather than being ANDed in term by term.
             let mut terms: Vec<String> = Vec::new();
-            for term in q
-                .q
-                .to_ascii_lowercase()
-                .replace(['.', '_', '-'], " ")
-                .split_whitespace()
+            for term in
+                q.q.to_ascii_lowercase()
+                    .replace(['.', '_', '-'], " ")
+                    .split_whitespace()
             {
                 let p = bind(&mut params, Box::new(term.to_string()));
                 terms.push(format!("{NS} LIKE '%' || {p} || '%'"));
@@ -2700,9 +4743,7 @@ impl Index {
             CardSort::Latest => "latest".into(),
             CardSort::Arrived => "MAX(r.first_seen)".into(),
             CardSort::Rating => "COALESCE(t.rating, 0)".into(),
-            CardSort::Title => {
-                "COALESCE(NULLIF(t.title,''), r.title_key) COLLATE NOCASE".into()
-            }
+            CardSort::Title => "COALESCE(NULLIF(t.title,''), r.title_key) COLLATE NOCASE".into(),
             CardSort::Releases => "n".into(),
             CardSort::Size => "max_bytes".into(),
             // Enriched year first; movies without metadata still carry
@@ -2759,10 +4800,7 @@ impl Index {
                             .take(OWNED_IN_CAP)
                             .map(|k| bind(&mut params, Box::new(k.clone())))
                             .collect();
-                        terms.push(format!(
-                            "(r.title_key IN ({})) * -1000.0",
-                            ph.join(",")
-                        ));
+                        terms.push(format!("(r.title_key IN ({})) * -1000.0", ph.join(",")));
                     }
                     format!("({})", terms.join(" + "))
                 }
@@ -2796,7 +4834,12 @@ impl Index {
                     MAX(r.total_bytes) AS max_bytes,
                     MAX(CASE r.res WHEN '2160p' THEN 4 WHEN '1080p' THEN 3
                                    WHEN '720p' THEN 2 WHEN '' THEN 0 ELSE 1 END),
-                    (SELECT s.stem FROM releases s
+                    -- The fed name when the pre feed supplied one: the
+                    -- representative is what drives the card's parse and
+                    -- the enrichment seed, and seeding those from a
+                    -- random stem when we hold the real title would
+                    -- throw the answer away at the last step.
+                    (SELECT COALESCE(NULLIF(s.pre_title,''), s.stem) FROM releases s
                       WHERE s.title_key = r.title_key AND {rep_where}
                       ORDER BY s.first_posted DESC, s.id DESC LIMIT 1),
                     (SELECT s.grp FROM releases s
@@ -2864,13 +4907,16 @@ impl Index {
         wheres: &mut Vec<String>,
         params: &mut Vec<Box<dyn rusqlite::ToSql>>,
     ) -> rusqlite::Result<()> {
-        wheres.push(format!("{pfx}title_key NOT IN (SELECT key FROM wall_hidden)"));
+        wheres.push(format!(
+            "{pfx}title_key NOT IN (SELECT key FROM wall_hidden)"
+        ));
         let rules: Vec<(String, String)> = {
-            let mut stmt = self.db.prepare_cached("SELECT field, value FROM wall_rules")?;
-            let r = stmt
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<rusqlite::Result<_>>()?;
-            r
+            let mut stmt = self
+                .db
+                .prepare_cached("SELECT field, value FROM wall_rules")?;
+
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?
         };
         for (field, value) in rules {
             let n = params.len() + 1;
@@ -2964,7 +5010,9 @@ impl Index {
             .prepare_cached("SELECT name, title_key FROM par_hashes WHERE hash16k = ?1")?;
         for (hash, _member) in pairs {
             let hit = stmt
-                .query_row([hash], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .query_row([hash], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
                 .optional()?;
             if hit.is_some() {
                 return Ok(hit);
@@ -2985,7 +5033,8 @@ impl Index {
     }
 
     pub fn unhide_title(&self, key: &str) -> rusqlite::Result<()> {
-        self.db.execute("DELETE FROM wall_hidden WHERE key = ?1", [key])?;
+        self.db
+            .execute("DELETE FROM wall_hidden WHERE key = ?1", [key])?;
         Ok(())
     }
 
@@ -3052,7 +5101,9 @@ impl Index {
         }
         let value = value.trim().to_lowercase();
         if value.is_empty() {
-            return Err(rusqlite::Error::InvalidParameterName("empty rule value".into()));
+            return Err(rusqlite::Error::InvalidParameterName(
+                "empty rule value".into(),
+            ));
         }
         self.db.execute(
             "INSERT INTO wall_rules(field, value, added, auto)
@@ -3069,7 +5120,8 @@ impl Index {
     }
 
     pub fn rule_delete(&self, id: i64) -> rusqlite::Result<()> {
-        self.db.execute("DELETE FROM wall_rules WHERE id = ?1", [id])?;
+        self.db
+            .execute("DELETE FROM wall_rules WHERE id = ?1", [id])?;
         Ok(())
     }
 
@@ -3095,10 +5147,9 @@ impl Index {
                 "SELECT field, value FROM wall_rules
                  UNION SELECT field, value FROM wall_dismissed",
             )?;
-            let r = stmt
-                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-                .collect::<rusqlite::Result<_>>()?;
-            r
+
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<rusqlite::Result<_>>()?
         };
         // One pass over the hidden titles' releases: per-title language
         // tags and display names.
@@ -3124,9 +5175,8 @@ impl Index {
         // Title-key words already come normalized (lowercase, separator-
         // collapsed). Generic words never make a good rule.
         const STOP: [&str; 24] = [
-            "the", "and", "of", "a", "an", "to", "in", "on", "at", "with", "for", "from",
-            "der", "die", "das", "les", "los", "las", "una", "del", "you", "not", "all",
-            "one",
+            "the", "and", "of", "a", "an", "to", "in", "on", "at", "with", "for", "from", "der",
+            "die", "das", "les", "los", "las", "una", "del", "you", "not", "all", "one",
         ];
         for (key, disp, langs, genres) in &hidden {
             let mut seen_l: HashSet<&str> = HashSet::new();
@@ -3216,7 +5266,13 @@ impl Index {
     /// daemon; this just remembers results, including "looked, found
     /// nothing" so a missing title is fetched once, not every poll).
     /// Insert a pending row for a parsed title if we've never seen it.
-    pub fn title_seed(&self, key: &str, kind: &str, title: &str, year: u32) -> rusqlite::Result<()> {
+    pub fn title_seed(
+        &self,
+        key: &str,
+        kind: &str,
+        title: &str,
+        year: u32,
+    ) -> rusqlite::Result<()> {
         self.db.execute(
             "INSERT OR IGNORE INTO titles(key, kind, title, year) VALUES(?1, ?2, ?3, ?4)",
             rusqlite::params![key, kind, title, year],
@@ -3243,8 +5299,7 @@ impl Index {
         })
     }
 
-    const TITLE_COLS: &'static str =
-        "key, kind, title, year, tmdb_id, overview, rating, genres,
+    const TITLE_COLS: &'static str = "key, kind, title, year, tmdb_id, overview, rating, genres,
          poster, backdrop, checked, imdb, actors, air_date";
 
     /// All cached title rows (the wall joins them to parsed releases).
@@ -3252,7 +5307,7 @@ impl Index {
         let mut stmt = self
             .db
             .prepare(&format!("SELECT {} FROM titles", Self::TITLE_COLS))?;
-        let rows = stmt.query_map([], |r| Self::title_row(r))?;
+        let rows = stmt.query_map([], Self::title_row)?;
         rows.collect()
     }
 
@@ -3262,18 +5317,14 @@ impl Index {
             "SELECT {} FROM titles WHERE checked=0 LIMIT ?1",
             Self::TITLE_COLS
         ))?;
-        let rows = stmt.query_map([limit], |r| Self::title_row(r))?;
+        let rows = stmt.query_map([limit], Self::title_row)?;
         rows.collect()
     }
 
     /// Pending titles split into the enricher's lanes: one thread each,
     /// because every provider's rate limit is independent and a serial
     /// loop makes each kind queue behind the slowest one.
-    pub fn titles_pending_lane(
-        &self,
-        limit: u32,
-        lane: Lane,
-    ) -> rusqlite::Result<Vec<TitleRow>> {
+    pub fn titles_pending_lane(&self, limit: u32, lane: Lane) -> rusqlite::Result<Vec<TitleRow>> {
         // M28: enrich in the order the wall shows cards - newest upload
         // first (idx_rel_title_key makes the correlated MAX cheap), junk
         // groups last. Fresh titles used to queue behind the whole
@@ -3287,7 +5338,7 @@ impl Index {
             Self::TITLE_COLS,
             lane.sql()
         ))?;
-        let rows = stmt.query_map(rusqlite::params![limit], |r| Self::title_row(r))?;
+        let rows = stmt.query_map(rusqlite::params![limit], Self::title_row)?;
         rows.collect()
     }
 
@@ -3300,11 +5351,7 @@ impl Index {
     /// card only reaches here when they have turned "show hidden" on and
     /// are looking straight at it - enriching that is answering a
     /// request, not spending the budget on nobody.
-    pub fn titles_hot(
-        &self,
-        keys: &[String],
-        lane: Lane,
-    ) -> rusqlite::Result<Vec<TitleRow>> {
+    pub fn titles_hot(&self, keys: &[String], lane: Lane) -> rusqlite::Result<Vec<TitleRow>> {
         let mut out = Vec::new();
         let mut stmt = self.db.prepare_cached(&format!(
             "SELECT {} FROM titles t WHERE key=?1 AND checked=0 AND {}",
@@ -3312,9 +5359,7 @@ impl Index {
             lane.sql()
         ))?;
         for k in keys {
-            let mut rows = stmt.query_map(rusqlite::params![k], |r| {
-                Self::title_row(r)
-            })?;
+            let mut rows = stmt.query_map(rusqlite::params![k], Self::title_row)?;
             if let Some(row) = rows.next() {
                 out.push(row?);
             }
@@ -3339,12 +5384,11 @@ impl Index {
                  GROUP BY r.title_key
                  ORDER BY MAX(r.first_posted) DESC LIMIT ?2",
             )?;
-            let r = stmt
-                .query_map(rusqlite::params![max_age_days, limit], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-                })?
-                .collect::<rusqlite::Result<_>>()?;
-            r
+
+            stmt.query_map(rusqlite::params![max_age_days, limit], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?
         };
         let mut n = 0;
         for (key, kind, stem) in rows {
@@ -3400,7 +5444,7 @@ impl Index {
             "SELECT {} FROM titles WHERE key=?1",
             Self::TITLE_COLS
         ))?;
-        let mut rows = stmt.query_map([key], |r| Self::title_row(r))?;
+        let mut rows = stmt.query_map([key], Self::title_row)?;
         rows.next().transpose()
     }
 
@@ -3412,9 +5456,10 @@ impl Index {
         keys: &[String],
     ) -> rusqlite::Result<std::collections::HashMap<String, TitleRow>> {
         let mut out = std::collections::HashMap::with_capacity(keys.len());
-        let mut stmt = self
-            .db
-            .prepare(&format!("SELECT {} FROM titles WHERE key=?1", Self::TITLE_COLS))?;
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT {} FROM titles WHERE key=?1",
+            Self::TITLE_COLS
+        ))?;
         for k in keys {
             if out.contains_key(k) {
                 continue;
@@ -3477,11 +5522,7 @@ impl Index {
     /// sort becomes useful on an existing library instead of only on
     /// titles indexed from here on. tmdb_id<>0 skips the rows no provider
     /// recognised: there is no date to go and fetch for those.
-    pub fn titles_missing_date(
-        &self,
-        limit: u32,
-        lane: Lane,
-    ) -> rusqlite::Result<Vec<TitleRow>> {
+    pub fn titles_missing_date(&self, limit: u32, lane: Lane) -> rusqlite::Result<Vec<TitleRow>> {
         let mut stmt = self.db.prepare(&format!(
             "SELECT {} FROM titles t
              WHERE checked > 0 AND air_tried = 0 AND air_date = ''
@@ -3492,7 +5533,7 @@ impl Index {
             Self::TITLE_COLS,
             lane.sql()
         ))?;
-        let rows = stmt.query_map(rusqlite::params![limit], |r| Self::title_row(r))?;
+        let rows = stmt.query_map(rusqlite::params![limit], Self::title_row)?;
         rows.collect()
     }
 
@@ -3516,17 +5557,8 @@ impl Index {
                     air_tried=1, checked=?11
              WHERE key=?1",
             rusqlite::params![
-                key,
-                m.tmdb_id,
-                m.overview,
-                m.rating,
-                m.genres,
-                m.poster,
-                m.backdrop,
-                m.imdb,
-                m.actors,
-                m.air_date,
-                now
+                key, m.tmdb_id, m.overview, m.rating, m.genres, m.poster, m.backdrop, m.imdb,
+                m.actors, m.air_date, now
             ],
         )?;
         Ok(())
@@ -3587,15 +5619,19 @@ impl Index {
     pub fn person_upsert(&self, c: &Credit) -> rusqlite::Result<i64> {
         let name = c.name.trim();
         if name.is_empty() {
-            return Err(rusqlite::Error::InvalidParameterName("empty person name".into()));
+            return Err(rusqlite::Error::InvalidParameterName(
+                "empty person name".into(),
+            ));
         }
         let mut existing: Option<i64> = None;
         if c.tvmaze_id > 0 {
             existing = self
                 .db
-                .query_row("SELECT id FROM people WHERE tvmaze_id=?1", [c.tvmaze_id], |r| {
-                    r.get(0)
-                })
+                .query_row(
+                    "SELECT id FROM people WHERE tvmaze_id=?1",
+                    [c.tvmaze_id],
+                    |r| r.get(0),
+                )
                 .optional()?;
         }
         if existing.is_none() && !c.wikidata_qid.is_empty() {
@@ -3611,7 +5647,9 @@ impl Index {
         if existing.is_none() && !c.imdb.is_empty() {
             existing = self
                 .db
-                .query_row("SELECT id FROM people WHERE imdb=?1", [&c.imdb], |r| r.get(0))
+                .query_row("SELECT id FROM people WHERE imdb=?1", [&c.imdb], |r| {
+                    r.get(0)
+                })
                 .optional()?;
         }
         if existing.is_none() {
@@ -3861,11 +5899,7 @@ impl Index {
 
     /// Title keys a set of people are credited on, curated - the search
     /// leg that turns "tom cruise" into the cards the user actually has.
-    pub fn titles_for_people(
-        &self,
-        ids: &[i64],
-        limit: u32,
-    ) -> rusqlite::Result<Vec<String>> {
+    pub fn titles_for_people(&self, ids: &[i64], limit: u32) -> rusqlite::Result<Vec<String>> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -3874,7 +5908,11 @@ impl Index {
         self.curation_wheres("r.", &mut wheres, &mut params)?;
         // ids are i64 read from our own table, so inlining them cannot
         // carry a caller string into the SQL.
-        let list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        let list = ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         params.push(Box::new(limit as i64));
         let n = params.len();
         let sql = format!(
@@ -3919,7 +5957,8 @@ impl Index {
     /// Drop a headshot URL that will never work (404, not an image), so
     /// the queue stops offering it.
     pub fn person_clear_photo(&self, id: i64) -> rusqlite::Result<()> {
-        self.db.execute("UPDATE people SET photo='' WHERE id=?1", [id])?;
+        self.db
+            .execute("UPDATE people SET photo='' WHERE id=?1", [id])?;
         Ok(())
     }
 
@@ -3927,11 +5966,19 @@ impl Index {
     /// Grabbing from the wall needs exactly this and nothing else: the
     /// stem becomes the job name, and through it the output directory,
     /// the spool file, the history label and the duplicate key.
+    /// The name a release is KNOWN by - the pre feed's title when it
+    /// supplied one, the posted stem otherwise. This is what names the
+    /// job a grab creates, and the job name is what the duplicate hold,
+    /// the watchlist's history check and the wall's "have" badge all key
+    /// on, so a rescued release grabbed under its obfuscated stem would
+    /// be invisible to every one of them.
     pub fn stem_by_id(&self, release_id: i64) -> rusqlite::Result<Option<String>> {
         self.db
-            .query_row("SELECT stem FROM releases WHERE id=?1", [release_id], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT COALESCE(NULLIF(pre_title,''), stem) FROM releases WHERE id=?1",
+                [release_id],
+                |r| r.get(0),
+            )
             .optional()
     }
 
@@ -3957,8 +6004,7 @@ impl Index {
         })?;
         for row in rows {
             let (fname, total, seg_json) = row?;
-            let segs: Vec<(u32, String, u64)> =
-                serde_json::from_str(&seg_json).unwrap_or_default();
+            let segs: Vec<(u32, String, u64)> = serde_json::from_str(&seg_json).unwrap_or_default();
             // date carries the release's real post time: the pool's
             // retention routing and the availability ledger's age
             // buckets both key off it (date="0" recorded every
@@ -4016,6 +6062,15 @@ impl Index {
             "DELETE FROM files WHERE release_id NOT IN (SELECT id FROM releases)",
             [],
         )?;
+        // Same recycled-id hazard, one table over: `pre_corr.release_id`
+        // IS the primary key, so an orphaned verdict left behind here is
+        // adopted whole by whatever release next takes that rowid -
+        // handing a brand-new post another release's `applied`/`confirmed`
+        // correlation, and with it a wrong name.
+        tx.execute(
+            "DELETE FROM pre_corr WHERE release_id NOT IN (SELECT id FROM releases)",
+            [],
+        )?;
         tx.commit()?;
         Ok(n)
     }
@@ -4036,12 +6091,256 @@ impl Index {
         if ids.is_empty() {
             return Ok(0);
         }
-        let list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        let list = ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         let tx = self.db.unchecked_transaction()?;
-        tx.execute(&format!("DELETE FROM files WHERE release_id IN ({list})"), [])?;
+        tx.execute(
+            &format!("DELETE FROM files WHERE release_id IN ({list})"),
+            [],
+        )?;
+        // `pre_corr.release_id` is the primary key, and `releases.id` has
+        // no AUTOINCREMENT (see `prune_size`), so a verdict left behind
+        // here is inherited by the next release to reuse that rowid.
+        tx.execute(
+            &format!("DELETE FROM pre_corr WHERE release_id IN ({list})"),
+            [],
+        )?;
         let n = tx.execute(&format!("DELETE FROM releases WHERE id IN ({list})"), [])?;
         tx.commit()?;
         Ok(n)
+    }
+
+    /// Fold the fragments of a split-container set (`x.7z.001` ...)
+    /// back into one release. Rows indexed before `release_stem`
+    /// learned the split shapes carry one fragment each - which hides
+    /// the set's true size from correlation, the wall, retention, all
+    /// of it (found live 2 Aug: one obfuscated post as 122 half-GB
+    /// rows). One-time and budgeted: an id-stride walk per call, kv
+    /// cursor, and when the walk completes it bumps `predb_seed_gen`
+    /// once so both correlation walks re-run against the real sizes.
+    ///
+    /// Scoped to junk>=70: those are the rows whose size is load-
+    /// bearing evidence. A readable fragmented set displays fine and
+    /// is left alone. Groups where any member already carries a fed
+    /// name are skipped whole - identity fights are not this pass's
+    /// job. Returns (groups merged, fragment rows folded, walk done).
+    pub fn split_merge(&mut self, now: i64) -> rusqlite::Result<(usize, usize, bool)> {
+        if self.kv_get("split_merge_done_v1").is_some() {
+            return Ok((0, 0, true));
+        }
+        const STRIDE: i64 = 100_000;
+        let cursor: i64 = self
+            .kv_get("split_merge_cursor")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let top: i64 = self
+            .db
+            .query_row("SELECT COALESCE(MAX(id),0) FROM releases", [], |r| r.get(0))?;
+        let hi = cursor.saturating_add(STRIDE);
+        // Candidate fragments in this stride. The LIKE prefilter keeps
+        // the stride scan cheap; release_stem() is the real test.
+        let cands: Vec<(i64, String, String, String)> = {
+            let mut stmt = self.db.prepare_cached(
+                "SELECT id, stem, poster, grp FROM releases
+                  WHERE id>?1 AND id<=?2 AND junk>=70
+                    AND (stem LIKE '%.7z.%' OR stem LIKE '%.zip.%')",
+            )?;
+            stmt.query_map([cursor, hi], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        };
+        let (mut groups, mut folded) = (0usize, 0usize);
+        let mut seen_bases: std::collections::HashSet<(String, String, String)> =
+            std::collections::HashSet::new();
+        for (_, stem, poster, grp) in cands {
+            let base = crate::extract::release_stem(&stem);
+            if base == stem {
+                continue; // not a fragment shape after all
+            }
+            if !seen_bases.insert((base.clone(), poster.clone(), grp.clone())) {
+                continue; // this stride already merged the group
+            }
+            let n = self.split_merge_group(&base, &poster, &grp, now)?;
+            if n > 0 {
+                groups += 1;
+                folded += n;
+            }
+        }
+        let done = hi >= top;
+        if done {
+            self.kv_set("split_merge_done_v1", "1")?;
+            self.db
+                .execute("DELETE FROM kv WHERE k='split_merge_cursor'", [])?;
+            // The whole point: the merged rows now carry true sizes
+            // worth re-correlating against.
+            let g: u64 = self
+                .kv_get("predb_seed_gen")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            self.kv_set("predb_seed_gen", &(g + 1).to_string())?;
+        } else {
+            self.kv_set("split_merge_cursor", &hi.to_string())?;
+        }
+        Ok((groups, folded, done))
+    }
+
+    /// Merge every fragment of one (base, poster, grp) set into its
+    /// lowest-id member (or the row already wearing the base stem).
+    /// Returns fragment rows folded away (0 = nothing to do / skipped).
+    fn split_merge_group(
+        &mut self,
+        base: &str,
+        poster: &str,
+        grp: &str,
+        now: i64,
+    ) -> rusqlite::Result<usize> {
+        // The stem range (base||'.', base||'/') covers every fragment
+        // ('.'+digits); the exact base row - already-correct rows from
+        // post-fix ingest - joins via the equality arm.
+        let members: Vec<SplitMember> = {
+            let mut stmt = self.db.prepare_cached(
+                "SELECT id, stem, complete, has_par2, first_posted, first_seen,
+                        have_parts, need_parts, pre_title
+                   FROM releases
+                  WHERE poster=?1 AND grp=?2
+                    AND (stem=?3 OR (stem>=?3||'.' AND stem<?3||'/'))",
+            )?;
+            stmt.query_map(rusqlite::params![poster, grp, base], |r| {
+                Ok(SplitMember {
+                    id: r.get(0)?,
+                    stem: r.get(1)?,
+                    complete: r.get(2)?,
+                    has_par2: r.get(3)?,
+                    first_posted: r.get(4)?,
+                    first_seen: r.get(5)?,
+                    have_parts: r.get(6)?,
+                    need_parts: r.get(7)?,
+                    pre_named: !r.get::<_, String>(8)?.is_empty(),
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        };
+        // Keep only true fragments of THIS base (plus the base row).
+        let members: Vec<SplitMember> = members
+            .into_iter()
+            .filter(|m| m.stem == base || crate::extract::release_stem(&m.stem) == base)
+            .collect();
+        if members.len() < 2 {
+            return Ok(0);
+        }
+        if members.iter().any(|m| m.pre_named) {
+            // Somebody (feed, correlation, a human) already named a
+            // member. Merging under it would silently extend that
+            // claim to bytes it never covered.
+            return Ok(0);
+        }
+        let keep = members
+            .iter()
+            .find(|m| m.stem == base)
+            .map(|m| m.id)
+            .unwrap_or_else(|| members.iter().map(|m| m.id).min().unwrap_or(0));
+        let old_stem = members
+            .iter()
+            .find(|m| m.id == keep)
+            .map(|m| m.stem.clone())
+            .unwrap_or_default();
+        let others: Vec<i64> = members
+            .iter()
+            .map(|m| m.id)
+            .filter(|id| *id != keep)
+            .collect();
+        let list = others
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let tx = self.db.unchecked_transaction()?;
+        // Files move to the kept row; a duplicate filename (the same
+        // part posted into two fragments) keeps the kept row's copy.
+        tx.execute(
+            &format!("UPDATE OR IGNORE files SET release_id=?1 WHERE release_id IN ({list})"),
+            [keep],
+        )?;
+        tx.execute(
+            &format!("DELETE FROM files WHERE release_id IN ({list})"),
+            [],
+        )?;
+        // Stale audit rows: fragment suggestions die with the
+        // fragments, and the kept row's (scored against one fragment's
+        // size) is wrong by construction now.
+        tx.execute(
+            &format!("DELETE FROM pre_corr WHERE release_id IN ({list}) OR release_id=?1"),
+            [keep],
+        )?;
+        tx.execute(&format!("DELETE FROM releases WHERE id IN ({list})"), [])?;
+        let (total, nfiles, nexe): (i64, i64, i64) = tx.query_row(
+            &format!(
+                "SELECT COALESCE(SUM(bytes),0), COUNT(*),
+                        COALESCE(SUM({EXE_FILE_SQL}),0)
+                   FROM files WHERE release_id=?1"
+            ),
+            [keep],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        let fp = members
+            .iter()
+            .map(|m| m.first_posted)
+            .filter(|v| *v > 0)
+            .min()
+            .unwrap_or(0);
+        let fs = members.iter().map(|m| m.first_seen).min().unwrap_or(now);
+        let complete = members.iter().all(|m| m.complete);
+        let has_par2 = members.iter().any(|m| m.has_par2);
+        let have: i64 = members.iter().map(|m| m.have_parts).sum();
+        let need: i64 = members.iter().map(|m| m.need_parts).sum();
+        let p = crate::categories::classify(base, &self.custom);
+        tx.execute(
+            "UPDATE releases
+                SET stem=?2, total_bytes=?3, files=?4, complete=?5, has_par2=?6,
+                    first_posted=?7, first_seen=?8, have_parts=?9, need_parts=?10,
+                    kind=?11, res=?12, title_key=?13, junk=?14, langs=?15,
+                    vcodec=?16, acodec=?17, hdr=?18
+              WHERE id=?1",
+            rusqlite::params![
+                keep,
+                base,
+                total,
+                nfiles,
+                complete,
+                has_par2,
+                fp,
+                fs,
+                have,
+                need,
+                kind_str(&p.kind),
+                p.res.as_deref().unwrap_or_default(),
+                p.key,
+                junk_score(base, &p, total.max(0) as u64, nexe > 0),
+                p.langs.join(" "),
+                p.vcodec.as_deref().unwrap_or_default(),
+                p.acodec.as_deref().unwrap_or_default(),
+                p.hdr.as_deref().unwrap_or_default()
+            ],
+        )?;
+        // rel_fts has no UPDATE trigger (external-content over stems),
+        // so the stem rewrite maintains it by hand. The fragment
+        // deletions above were covered by rel_fts_ad.
+        if self.fts && old_stem != base {
+            tx.execute(
+                "INSERT INTO rel_fts(rel_fts, rowid, stem) VALUES('delete', ?1, ?2)",
+                rusqlite::params![keep, old_stem],
+            )?;
+            tx.execute(
+                "INSERT INTO rel_fts(rowid, stem) VALUES(?1, ?2)",
+                rusqlite::params![keep, base],
+            )?;
+        }
+        tx.commit()?;
+        Ok(others.len())
     }
 
     /// M31a: age-based retention. Deletes releases older than the window,
@@ -4110,12 +6409,7 @@ impl Index {
     /// NOT applied - they need the browse path's whole filter machinery,
     /// and over-counting a badge by a rule-hidden title is a far smaller
     /// sin than making this poll expensive.
-    pub fn wall_tip(
-        &self,
-        since: i64,
-        posted_after: i64,
-        limit: u32,
-    ) -> rusqlite::Result<TipInfo> {
+    pub fn wall_tip(&self, since: i64, posted_after: i64, limit: u32) -> rusqlite::Result<TipInfo> {
         // Read the persistent counter, not MAX(releases.arrival_seq).
         // Eviction can empty the table; the next inserted release must
         // still advance beyond a browser's zero/current cursor.
@@ -4129,16 +6423,33 @@ impl Index {
                 |r| r.get(0),
             )
             .unwrap_or(0);
+        // INDEXED BY, because the planner gets this one wrong and the
+        // cost is the whole table. `arrival_seq > ?1` is the selective
+        // term by orders of magnitude - a poll asks about the handful of
+        // releases since the browser's cursor - but both statements
+        // below also want DISTINCT/GROUP BY on title_key, and SQLite
+        // prefers the index that satisfies THAT to the one that reduces
+        // the row count, then filters the arrivals out row by row.
+        // Measured 2 Aug on the 32M-release live index: 76s per poll for
+        // an answer of zero, against 6ms with the arrival index forced -
+        // and still 16x better at `since=0`, where the range matches
+        // everything and the forced plan is at its worst. The index has
+        // been there since M28 (see `open`); nothing but the hint was
+        // missing. It is created unconditionally, so this cannot fail
+        // for want of it.
         const VISIBLE: &str = "arrival_seq > ?1 AND first_posted > ?2
              AND junk < 50 AND title_key <> ''
              AND title_key NOT IN (SELECT key FROM wall_hidden)";
         let new_keys: u32 = self.db.query_row(
-            &format!("SELECT COUNT(*) FROM (SELECT DISTINCT title_key FROM releases WHERE {VISIBLE})"),
+            &format!(
+                "SELECT COUNT(*) FROM (SELECT DISTINCT title_key
+                   FROM releases INDEXED BY idx_rel_arrival WHERE {VISIBLE})"
+            ),
             [since, posted_after],
             |r| r.get(0),
         )?;
         let mut stmt = self.db.prepare(&format!(
-            "SELECT title_key FROM releases WHERE {VISIBLE}
+            "SELECT title_key FROM releases INDEXED BY idx_rel_arrival WHERE {VISIBLE}
              GROUP BY title_key ORDER BY MAX(arrival_seq) DESC LIMIT ?3"
         ))?;
         let keys = stmt
@@ -4146,7 +6457,11 @@ impl Index {
                 r.get::<_, String>(0)
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(TipInfo { latest, new_keys, keys })
+        Ok(TipInfo {
+            latest,
+            new_keys,
+            keys,
+        })
     }
 
     /// M31a: reap dead junk fragments regardless of max_age - the bulk
@@ -4164,11 +6479,7 @@ impl Index {
     /// the server). Wall-visible old content is the opt-in age prune's
     /// job, never this one's. Same chunking + hidden protection.
     /// Returns rows removed.
-    pub fn prune_stale_partials(
-        &self,
-        settle_secs: i64,
-        now: i64,
-    ) -> rusqlite::Result<usize> {
+    pub fn prune_stale_partials(&self, settle_secs: i64, now: i64) -> rusqlite::Result<usize> {
         let cutoff = now - settle_secs;
         let mut removed = 0;
         loop {
@@ -4200,17 +6511,149 @@ impl Index {
         Ok(removed)
     }
 
-    /// M31a: reclaim freed pages to disk. Exclusive-locks and rewrites
-    /// the whole file - the caller MUST ensure no scan pass or download
-    /// is in flight. Returns bytes freed (before - after file size).
+    /// M31a: reclaim freed pages to disk by rewriting the whole file.
+    /// Exclusive-locks it for the duration, so the caller MUST ensure no
+    /// scan pass or download is in flight.
+    ///
+    /// §95: this is now the SLOW path, kept for one reason - it is the
+    /// only way to put an existing database into incremental
+    /// auto-vacuum mode, which is what makes every later compact
+    /// abortable. See `compact_chunk`. `PRAGMA auto_vacuum` is a no-op
+    /// on a database that already has tables UNLESS a VACUUM follows it
+    /// on the same connection, so the two belong in one batch: the
+    /// migration IS a compact, and it is the last full rewrite this
+    /// database ever needs.
+    ///
+    /// If it is interrupted the pragma does not stick either, which is
+    /// the behaviour we want - `compact_pending` is sticky, so the
+    /// migration simply retries at the next idle moment.
     pub fn compact(&self) -> rusqlite::Result<()> {
-        self.db.execute_batch("VACUUM")
+        self.db
+            .execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM")
+    }
+
+    /// Free pages this database is holding that `compact_chunk` could
+    /// hand back to the filesystem, in PAGES (multiply by `PRAGMA
+    /// page_size` for bytes).
+    pub fn freelist_pages(&self) -> rusqlite::Result<u64> {
+        let n: i64 = self
+            .db
+            .query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+        Ok(n.max(0) as u64)
+    }
+
+    /// §95: reclaim at most `pages` freed pages, and return how many are
+    /// still on the freelist afterwards (0 = fully compacted).
+    ///
+    /// This exists because aborting a VACUUM is a request, not a
+    /// guarantee (see `interrupt_handle`), and the gap between those two
+    /// is a download sitting in `Downloading` making no progress. A
+    /// bounded chunk needs no abort mechanism at all: it is short by
+    /// construction, so the caller just checks between chunks and stops.
+    /// Nothing races, nothing is interrupted, and no phase of it is
+    /// immune to being stopped - the three things wrong with doing it as
+    /// one VACUUM.
+    ///
+    /// It is also RESUMABLE, which the VACUUM never was. Each chunk
+    /// commits and truncates the file, so standing down for a download
+    /// keeps every page reclaimed so far; an aborted VACUUM threw away
+    /// all of its work and started from the top next time.
+    ///
+    /// It reclaims strictly less than a VACUUM: whole free pages go
+    /// back, but free space stranded inside partly-emptied pages is not
+    /// defragmented. For this schema that gap is small - the bulk of the
+    /// bytes are `files.segments` blobs on overflow chains, which are
+    /// released whole when their row goes - and it is the same
+    /// approximation `live_bytes` already documents.
+    ///
+    /// Requires incremental auto-vacuum: on a database still in the
+    /// default mode this is a silent no-op, which is why the caller must
+    /// consult `compact_style` first.
+    /// The statement is STEPPED TO COMPLETION, and that is the whole
+    /// trick. `PRAGMA incremental_vacuum(N)` is a VDBE loop that frees
+    /// one page per step, so `execute_batch` - which steps once and
+    /// stops - frees exactly ONE page whatever N says. Measured: with a
+    /// 20,000-page freelist, `execute_batch("PRAGMA
+    /// incremental_vacuum(2048)")` freed 1 page; the same pragma
+    /// stepped to completion freed 2048. The first shape still WORKS
+    /// (the daemon loops until the freelist empties), which is what
+    /// makes it dangerous - it just costs one write transaction per
+    /// page, and it turned a 49 MB reclaim into 12,013 chunks.
+    pub fn compact_chunk(&self, pages: u32) -> rusqlite::Result<u64> {
+        let mut stmt = self
+            .db
+            .prepare(&format!("PRAGMA incremental_vacuum({})", pages.max(1)))?;
+        let mut rows = stmt.query([])?;
+        while rows.next()?.is_some() {}
+        drop(rows);
+        drop(stmt);
+        self.freelist_pages()
+    }
+
+    /// Which compaction path this database can take right now.
+    pub fn compact_style(&self) -> rusqlite::Result<CompactStyle> {
+        let mode: i64 = self.db.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
+        // 0 = NONE, 1 = FULL, 2 = INCREMENTAL. FULL is not a mode this
+        // code ever sets, but a database that somehow has it already
+        // reclaims on every commit and needs no compaction loop at all;
+        // treating it as chunked is still correct (the freelist is
+        // empty, so the loop exits at once) and costs one PRAGMA.
+        Ok(if mode >= 1 {
+            CompactStyle::Chunked
+        } else {
+            CompactStyle::FullRewrite
+        })
+    }
+
+    /// Refresh the query planner's statistics.
+    ///
+    /// Without `sqlite_stat1` SQLite plans from built-in guesses, and on a
+    /// large index those guesses go wrong in exactly one direction: it
+    /// picks the index that satisfies a DISTINCT or a GROUP BY over the
+    /// one that cuts the row count, and scans the whole releases table.
+    /// Measured 2 Aug on the live 32M-release index, which had never been
+    /// analyzed: `wall2`'s card COUNT took 85s, and 0.38s once these
+    /// statistics existed - a 224x difference in one query, from a plan
+    /// that flipped from "scan 32M releases, probe titles" to "scan 8.9k
+    /// titles, probe releases".
+    ///
+    /// `analysis_limit` is what makes this affordable to run on a
+    /// schedule: statistics are gathered from a bounded sample per index
+    /// rather than a full pass, which is approximate and entirely good
+    /// enough to get the join order right. `PRAGMA optimize` then does
+    /// nothing at all on the passes where nothing has changed enough to
+    /// matter - but it only reconsiders tables this connection has
+    /// queried, so a database with no statistics AT ALL gets a plain
+    /// ANALYZE (still under the sample limit) to guarantee a first set.
+    ///
+    /// Slow on the first run against a big unanalyzed database (~3
+    /// minutes on the 45 GB live index) and it holds the write
+    /// connection throughout, so it belongs in a maintenance leg behind
+    /// the same "nothing is downloading" gate as the prune.
+    pub fn optimize(&self) -> rusqlite::Result<()> {
+        self.db.execute_batch("PRAGMA analysis_limit=1000")?;
+        let analyzed: i64 = self.db.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'sqlite_stat1'",
+            [],
+            |r| r.get(0),
+        )?;
+        if analyzed > 0 {
+            self.db.execute_batch("PRAGMA optimize")
+        } else {
+            self.db.execute_batch("ANALYZE")
+        }
     }
 
     /// A handle another thread can use to abort whatever statement this
     /// connection is currently running.
     ///
-    /// It exists for `compact()`. On a multi-GB index a VACUUM is minutes
+    /// It exists for `compact()`, which since §95 is only the one-time
+    /// migration to incremental auto-vacuum - the routine path is
+    /// `compact_chunk`, which needs no interrupt because a chunk is
+    /// short by construction. Everything below is why that change was
+    /// worth making, and still applies to the migration rewrite.
+    ///
+    /// On a multi-GB index a VACUUM is minutes
     /// of synchronous rewriting, and it is held under the same gate that
     /// a starting download waits on - so a job that arrives one moment
     /// after the "is anything downloading?" check sits in `Downloading`,
@@ -4220,6 +6663,27 @@ impl Index {
     ///
     /// Interrupting is per-CONNECTION, not per-statement: only call this
     /// while you know the statement you mean to stop is the one running.
+    ///
+    /// It also does not abort a VACUUM at an arbitrary point, which is
+    /// easy to assume and wrong. The flag is only read from the VDBE, so
+    /// it reaches the phase that copies live pages into the temp
+    /// database and not the `sqlite3BtreeCopyFile` tail that writes the
+    /// result back over the original - a job arriving during the tail
+    /// still waits it out.
+    ///
+    /// Measured on Windows against an 80 MB index, 20 000 rows of 4 KB
+    /// with half deleted (interrupt once at a fixed offset, sweep the
+    /// offset - the abort test now builds a tenth of that, because a
+    /// progress handler needs opcodes rather than time): the rewrite
+    /// stops accepting an interrupt after the first few hundred
+    /// milliseconds, out of ~2 s idle and ~6 s with the cores busy. The
+    /// abortable part runs at memory speed - temp_store=MEMORY over a
+    /// cache that just wrote the data - while the tail is disk-bound, so
+    /// load and size both stretch the tail and leave the window where it
+    /// was. The abortable FRACTION therefore shrinks exactly when the
+    /// abort matters most, and on the multi-GB index this exists for it
+    /// is small. Interrupting still helps and still costs nothing; it is
+    /// just not the guarantee the name suggests.
     pub fn interrupt_handle(&self) -> rusqlite::InterruptHandle {
         self.db.get_interrupt_handle()
     }
@@ -4256,7 +6720,9 @@ impl Index {
     /// so automatic eviction re-fired on every scan pass forever.
     pub fn live_bytes(&self) -> rusqlite::Result<u64> {
         let pages: i64 = self.db.query_row("PRAGMA page_count", [], |r| r.get(0))?;
-        let free: i64 = self.db.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+        let free: i64 = self
+            .db
+            .query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
         let size: i64 = self.db.query_row("PRAGMA page_size", [], |r| r.get(0))?;
         Ok((pages - free).max(0) as u64 * size.max(0) as u64)
     }
@@ -4581,7 +7047,9 @@ impl Index {
             args.push(Box::new(c));
         }
         if !q.include_adult {
-            where_sql.push_str(&format!(" AND ',' || subcats || ',' NOT LIKE '%,{ADULT_SUBCAT},%'"));
+            where_sql.push_str(&format!(
+                " AND ',' || subcats || ',' NOT LIKE '%,{ADULT_SUBCAT},%'"
+            ));
         }
         // Moderation records are no longer stored (nzbkit::spot::is_moderation),
         // but a database scanned before that are still full of them, and they
@@ -4872,9 +7340,10 @@ pub fn split_subject(subject: &str) -> Option<(String, u32, u32)> {
             continue;
         };
         let inner = &subject[open + 1..close];
-        let sep = inner.find('/').map(|i| (i, 1)).or_else(|| {
-            inner.to_ascii_lowercase().find(" of ").map(|i| (i, 4))
-        });
+        let sep = inner
+            .find('/')
+            .map(|i| (i, 1))
+            .or_else(|| inner.to_ascii_lowercase().find(" of ").map(|i| (i, 4)));
         let Some((si, sl)) = sep else { continue };
         let (Ok(n), Ok(m)) = (
             inner[..si].trim().parse::<u32>(),
@@ -4906,7 +7375,9 @@ pub fn quoted_name(s: &str) -> Option<String> {
             if !t.starts_with(|c: char| c.is_ascii_alphanumeric()) || t.contains('@') {
                 return false;
             }
-            let Some(dot) = t.rfind('.') else { return false };
+            let Some(dot) = t.rfind('.') else {
+                return false;
+            };
             let ext = &t[dot + 1..];
             dot > 0
                 && ((ext.len() >= 2 && ext.bytes().all(|c| c.is_ascii_digit()))
@@ -4982,6 +7453,20 @@ pub struct EvictPolicy {
 pub struct Protected {
     pub title_keys: Vec<String>,
     pub release_ids: Vec<i64>,
+}
+
+/// §95: how this database can reclaim its freed pages. The difference
+/// the caller cares about is not speed, it is whether standing down for
+/// a download is prompt: a `Chunked` compaction stops between chunks and
+/// keeps what it has already reclaimed, a `FullRewrite` can only be
+/// asked to stop and may well refuse (see `Index::interrupt_handle`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactStyle {
+    /// Incremental auto-vacuum is on: `compact_chunk` in a loop.
+    Chunked,
+    /// Still in SQLite's default mode, so the only way to reclaim - and
+    /// the only way to reach `Chunked` - is one full `compact()`.
+    FullRewrite,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -5196,13 +7681,14 @@ mod tests {
     /// second download rewrite what the first one taught us.
     #[test]
     fn par_hashes_remember_first_and_recognise_reposts() {
-        let dir =
-            std::env::temp_dir().join(format!("nzbfast-index-ph-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nzbfast-index-ph-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let ix = Index::open(&dir.join("index.db")).unwrap();
         let pairs = |hs: &[&str]| -> Vec<(String, String)> {
-            hs.iter().map(|h| ((*h).to_string(), format!("{h}.r00"))).collect()
+            hs.iter()
+                .map(|h| ((*h).to_string(), format!("{h}.r00")))
+                .collect()
         };
 
         // Nothing known yet.
@@ -5210,22 +7696,31 @@ mod tests {
 
         let named = pairs(&["aa", "bb", "cc"]);
         assert_eq!(
-            ix.par_hash_remember(&named, "Example.Movie.2019.1080p-GRP", "m:example movie:2019", 100)
-                .unwrap(),
+            ix.par_hash_remember(
+                &named,
+                "Example.Movie.2019.1080p-GRP",
+                "m:example movie:2019",
+                100
+            )
+            .unwrap(),
             3
         );
         // A repost whose sidecar shares ONE volume fingerprint is the
         // same bytes, and one hit answers for the whole set.
         assert_eq!(
             ix.par_hash_lookup(&pairs(&["zz", "cc"])).unwrap(),
-            Some(("Example.Movie.2019.1080p-GRP".into(), "m:example movie:2019".into()))
+            Some((
+                "Example.Movie.2019.1080p-GRP".into(),
+                "m:example movie:2019".into()
+            ))
         );
 
         // The obfuscated repost must NOT overwrite the good name: the
         // first writer knew what it was, and every future repost depends
         // on that answer staying put.
         assert_eq!(
-            ix.par_hash_remember(&named, "8a7f2c1b9d0e4f", "", 200).unwrap(),
+            ix.par_hash_remember(&named, "8a7f2c1b9d0e4f", "", 200)
+                .unwrap(),
             0,
             "a later download rewrote a fingerprint it did not name"
         );
@@ -5236,7 +7731,11 @@ mod tests {
 
         // A nameless job records nothing at all rather than a blank row
         // that would then shadow the real name forever.
-        assert_eq!(ix.par_hash_remember(&pairs(&["dd"]), "  ", "", 300).unwrap(), 0);
+        assert_eq!(
+            ix.par_hash_remember(&pairs(&["dd"]), "  ", "", 300)
+                .unwrap(),
+            0
+        );
         assert_eq!(ix.par_hash_lookup(&pairs(&["dd"])).unwrap(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5249,8 +7748,7 @@ mod tests {
     /// reach and could answer a movie search with a TV series.
     #[test]
     fn a_tmdb_lookup_never_crosses_into_the_tv_namespace() {
-        let dir =
-            std::env::temp_dir().join(format!("nzbfast-index-tmdb-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nzbfast-index-tmdb-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let ix = Index::open(&dir.join("index.db")).unwrap();
@@ -5295,15 +7793,19 @@ mod tests {
     /// write lock.
     #[test]
     fn read_only_connection_sees_fresh_commits_and_refuses_writes() {
-        let dir =
-            std::env::temp_dir().join(format!("nzbfast-index-ro-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nzbfast-index-ro-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("index.db");
         let mut rw = Index::open(&db).unwrap();
         rw.ingest(
             "alt.binaries.test",
-            &[entry(r#""First.Release.S01E01.720p-GRP.rar" yEnc (1/1)"#, "p@x", "ro1", 900)],
+            &[entry(
+                r#""First.Release.S01E01.720p-GRP.rar" yEnc (1/1)"#,
+                "p@x",
+                "ro1",
+                900,
+            )],
             1000,
         )
         .unwrap();
@@ -5314,7 +7816,12 @@ mod tests {
         // A commit AFTER the read-only open, visible without a reopen.
         rw.ingest(
             "alt.binaries.test",
-            &[entry(r#""Second.Release.S01E02.720p-GRP.rar" yEnc (1/1)"#, "p@x", "ro2", 900)],
+            &[entry(
+                r#""Second.Release.S01E02.720p-GRP.rar" yEnc (1/1)"#,
+                "p@x",
+                "ro2",
+                900,
+            )],
             1000,
         )
         .unwrap();
@@ -5329,8 +7836,7 @@ mod tests {
 
     #[test]
     fn a_movie_year_answers_only_when_unambiguous() {
-        let dir =
-            std::env::temp_dir().join(format!("nzbfast-index-my-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nzbfast-index-my-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let ix = Index::open(&dir.join("index.db")).unwrap();
@@ -5372,8 +7878,7 @@ mod tests {
 
     #[test]
     fn curation_hides_rules_and_suggestions() {
-        let dir =
-            std::env::temp_dir().join(format!("nzbfast-index-cur-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nzbfast-index-cur-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut ix = Index::open(&dir.join("index.db")).unwrap();
@@ -5386,16 +7891,31 @@ mod tests {
                 mk("Inception.2010.1080p.BluRay.x264-GRP.mkv", "a@a", "c1"),
                 // Same title, German dub - lang rule must drop only this
                 // release, never the whole card.
-                mk("Inception.2010.German.1080p.BluRay.x264-DEU.mkv", "b@b", "c2"),
+                mk(
+                    "Inception.2010.German.1080p.BluRay.x264-DEU.mkv",
+                    "b@b",
+                    "c2",
+                ),
                 mk("Der.Film.2019.German.1080p.WEB.x264-DEU.mkv", "c@c", "c3"),
-                mk("Anderes.Werk.2021.German.720p.WEB.x264-DEU.mkv", "d@d", "c4"),
-                mk("Drittes.Ding.2022.German.2160p.WEB.x265-DEU.mkv", "e@e", "c5"),
+                mk(
+                    "Anderes.Werk.2021.German.720p.WEB.x264-DEU.mkv",
+                    "d@d",
+                    "c4",
+                ),
+                mk(
+                    "Drittes.Ding.2022.German.2160p.WEB.x265-DEU.mkv",
+                    "e@e",
+                    "c5",
+                ),
                 mk("WWE.Raw.2026.03.01.720p.HDTV.x264-GRP.mkv", "f@f", "c6"),
             ],
             1_000,
         )
         .unwrap();
-        let cur = BrowseQuery { curated: true, ..Default::default() };
+        let cur = BrowseQuery {
+            curated: true,
+            ..Default::default()
+        };
         let (_, base_total) = ix.browse(&cur).unwrap();
         assert_eq!(base_total, 6);
 
@@ -5423,7 +7943,10 @@ mod tests {
             cards.iter().any(|c| c.title_key.starts_with("m:inception")),
             "mixed-language card survives: {cards:?}"
         );
-        assert!(cards.iter().all(|c| !c.title_key.contains("anderes")), "{cards:?}");
+        assert!(
+            cards.iter().all(|c| !c.title_key.contains("anderes")),
+            "{cards:?}"
+        );
 
         // Word rule via FTS: exact token, not substring.
         ix.rule_add("word", "wwe", false).unwrap();
@@ -5434,7 +7957,8 @@ mod tests {
         // Rule management round-trip.
         let rules = ix.rules_list().unwrap();
         assert_eq!(rules.len(), 2);
-        ix.rule_delete(rules.iter().find(|r| r.field == "word").unwrap().id).unwrap();
+        ix.rule_delete(rules.iter().find(|r| r.field == "word").unwrap().id)
+            .unwrap();
         let (_, total) = ix.browse(&cur).unwrap();
         assert_eq!(total, 2);
 
@@ -5445,17 +7969,22 @@ mod tests {
             "Anderes.Werk.2021.German.720p.WEB.x264-DEU",
             "Drittes.Ding.2022.German.2160p.WEB.x265-DEU",
         ] {
-            ix.hide_title(&crate::release::parse_release(stem).key).unwrap();
+            ix.hide_title(&crate::release::parse_release(stem).key)
+                .unwrap();
         }
         let sug = ix.hide_suggestions().unwrap();
         assert!(
-            sug.iter().any(|s| s.field == "lang" && s.value == "german" && s.n == 3),
+            sug.iter()
+                .any(|s| s.field == "lang" && s.value == "german" && s.n == 3),
             "{sug:?}"
         );
         // Dismissed → never again.
         ix.suggestion_dismiss("lang", "german").unwrap();
         assert!(
-            ix.hide_suggestions().unwrap().iter().all(|s| s.value != "german"),
+            ix.hide_suggestions()
+                .unwrap()
+                .iter()
+                .all(|s| s.value != "german"),
             "dismissed suggestion must not return"
         );
         // Accepting a rule clears the dismissal and takes effect.
@@ -5465,7 +7994,10 @@ mod tests {
         // Unhide restores.
         ix.unhide_title(&key).unwrap();
         let (_, total) = ix.browse(&cur).unwrap();
-        assert_eq!(total, 2, "unhidden title's German release stays rule-hidden");
+        assert_eq!(
+            total, 2,
+            "unhidden title's German release stays rule-hidden"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5474,29 +8006,36 @@ mod tests {
     /// hides. The other copy is right there and passes.
     #[test]
     fn a_filtered_copy_does_not_take_the_whole_release_with_it() {
-        let dir =
-            std::env::temp_dir().join(format!("nzbfast-index-rep-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nzbfast-index-rep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut ix = Index::open(&dir.join("index.db")).unwrap();
-        let mk = |f: &str, id: &str, bytes: u64| {
-            entry(&format!("\"{f}\" yEnc (1/1)"), "a@a", id, bytes)
-        };
+        let mk =
+            |f: &str, id: &str, bytes: u64| entry(&format!("\"{f}\" yEnc (1/1)"), "a@a", id, bytes);
         // ONE release, cross-posted to two groups. The moovee copy is the
         // fatter one, so it is the copy the representative pick takes.
         let dune = "Dune.Part.Two.2024.1080p.BluRay.x264-GRP.mkv";
-        ix.ingest("alt.binaries.moovee", &[mk(dune, "d1", 8 << 30)], 1_000).unwrap();
-        ix.ingest("alt.binaries.teevee", &[mk(dune, "d2", 4 << 30)], 1_000).unwrap();
+        ix.ingest("alt.binaries.moovee", &[mk(dune, "d1", 8 << 30)], 1_000)
+            .unwrap();
+        ix.ingest("alt.binaries.teevee", &[mk(dune, "d2", 4 << 30)], 1_000)
+            .unwrap();
         // ...and a release only the hidden group carries, so the test can
         // tell "the filter works" from "the filter eats everything".
         ix.ingest(
             "alt.binaries.moovee",
-            &[mk("Other.Film.2023.1080p.BluRay.x264-GRP.mkv", "o1", 8 << 30)],
+            &[mk(
+                "Other.Film.2023.1080p.BluRay.x264-GRP.mkv",
+                "o1",
+                8 << 30,
+            )],
             1_000,
         )
         .unwrap();
 
-        let cur = BrowseQuery { curated: true, ..Default::default() };
+        let cur = BrowseQuery {
+            curated: true,
+            ..Default::default()
+        };
         let (rows, total) = ix.browse(&cur).unwrap();
         assert_eq!(total, 2, "the two copies collapse onto one row: {rows:?}");
 
@@ -5504,8 +8043,15 @@ mod tests {
         ix.rule_add("group", "alt.binaries.moovee", false).unwrap();
         let (rows, total) = ix.browse(&cur).unwrap();
         let kept: Vec<&Release> = rows.iter().filter(|r| r.stem.starts_with("Dune")).collect();
-        assert_eq!(kept.len(), 1, "the cross-posted release keeps its allowed copy: {rows:?}");
-        assert_eq!(kept[0].grp, "alt.binaries.teevee", "and it is that copy: {rows:?}");
+        assert_eq!(
+            kept.len(),
+            1,
+            "the cross-posted release keeps its allowed copy: {rows:?}"
+        );
+        assert_eq!(
+            kept[0].grp, "alt.binaries.teevee",
+            "and it is that copy: {rows:?}"
+        );
         // The rule still rules: a release the hidden group alone carries
         // stays gone, and the count agrees with the page.
         assert!(
@@ -5513,7 +8059,11 @@ mod tests {
             "a release only the hidden group carries must stay hidden: {rows:?}"
         );
         assert_eq!(total, 1, "{rows:?}");
-        assert_eq!(rows.len() as u64, total, "page and total must count the same: {rows:?}");
+        assert_eq!(
+            rows.len() as u64,
+            total,
+            "page and total must count the same: {rows:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5535,7 +8085,10 @@ mod tests {
         let now = base + 3 * 86_400; // verdict "now": fresh pair is 3d old
         ix.ingest(
             "alt.binaries.teevee",
-            &[mk("Fresh.Show.S01E01.1080p-A.mkv", "f1"), mk("Fresh.Show.S01E02.1080p-A.mkv", "f2")],
+            &[
+                mk("Fresh.Show.S01E01.1080p-A.mkv", "f1"),
+                mk("Fresh.Show.S01E02.1080p-A.mkv", "f2"),
+            ],
             base,
         )
         .unwrap();
@@ -5572,7 +8125,10 @@ mod tests {
 
         // verdict=ok on omicron: only the two fresh (green) releases, and
         // `total` reflects the filter - not the unfiltered 3.
-        let q = BrowseQuery { verdict_ok: Some(filt(&["omicron"])), ..Default::default() };
+        let q = BrowseQuery {
+            verdict_ok: Some(filt(&["omicron"])),
+            ..Default::default()
+        };
         let (rows, total) = ix.browse(&q).unwrap();
         assert_eq!(total, 2, "total counts only ok rows");
         assert_eq!(rows.len(), 2);
@@ -5597,7 +8153,10 @@ mod tests {
         assert_eq!(seen.len(), 2, "both ok rows reachable by paging");
 
         // No enabled backbones → verdict null for all → nothing is "ok".
-        let q = BrowseQuery { verdict_ok: Some(filt(&[])), ..Default::default() };
+        let q = BrowseQuery {
+            verdict_ok: Some(filt(&[])),
+            ..Default::default()
+        };
         let (rows, total) = ix.browse(&q).unwrap();
         assert_eq!(total, 0);
         assert!(rows.is_empty());
@@ -5622,8 +8181,12 @@ mod tests {
         let mut ix = Index::open(&dir.join("index.db")).unwrap();
         let mk = |f: &str, id: &str| entry(&format!("\"{f}\" yEnc (1/1)"), "a@a", id, 4 << 30);
         // Ingest with now=0 and undated articles → first_posted = 0.
-        ix.ingest("alt.binaries.teevee", &[mk("Undated.Show.S01E01-A.mkv", "u1")], 0)
-            .unwrap();
+        ix.ingest(
+            "alt.binaries.teevee",
+            &[mk("Undated.Show.S01E01-A.mkv", "u1")],
+            0,
+        )
+        .unwrap();
         // Ledger: teevee is confidently GREEN in bucket 6 (3y+) - exactly
         // the bucket the pre-fix `(now-0)/86400` misread would target.
         ix.oracle_ingest(
@@ -5657,8 +8220,7 @@ mod tests {
     /// that same year rather than sinking to the bottom of the wall.
     #[test]
     fn cards_aired_sort_orders_by_day_then_falls_back_to_year() {
-        let dir =
-            std::env::temp_dir().join(format!("nzbfast-index-aired-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nzbfast-index-aired-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut ix = Index::open(&dir.join("index.db")).unwrap();
@@ -5681,11 +8243,23 @@ mod tests {
             ("m:january film:2026", "January Film", "2026-01-05"),
         ] {
             ix.title_seed(key, "movie", title, 2026).unwrap();
-            ix.title_fill(key, &TitleFill { air_date: date, ..Default::default() }, 1)
-                .unwrap();
+            ix.title_fill(
+                key,
+                &TitleFill {
+                    air_date: date,
+                    ..Default::default()
+                },
+                1,
+            )
+            .unwrap();
         }
-        let q = BrowseQuery { desc: true, ..Default::default() };
-        let (cards, _) = ix.browse_cards(&q, CardSort::Aired, false, false, None).unwrap();
+        let q = BrowseQuery {
+            desc: true,
+            ..Default::default()
+        };
+        let (cards, _) = ix
+            .browse_cards(&q, CardSort::Aired, false, false, None)
+            .unwrap();
         let keys: Vec<&str> = cards.iter().map(|c| c.title_key.as_str()).collect();
         assert_eq!(
             keys,
@@ -5705,8 +8279,7 @@ mod tests {
 
     #[test]
     fn cards_group_by_kind_year_sort_and_genre_filter() {
-        let dir =
-            std::env::temp_dir().join(format!("nzbfast-index-grp-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nzbfast-index-grp-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut ix = Index::open(&dir.join("index.db")).unwrap();
@@ -5726,18 +8299,29 @@ mod tests {
         // Grouped: TV cluster leads, movies follow; Year sub-sort puts
         // the newer film first inside its cluster (parse-key fallback -
         // nothing is enriched here).
-        let q = BrowseQuery { desc: true, ..Default::default() };
-        let (cards, _) = ix.browse_cards(&q, CardSort::Year, false, true, None).unwrap();
+        let q = BrowseQuery {
+            desc: true,
+            ..Default::default()
+        };
+        let (cards, _) = ix
+            .browse_cards(&q, CardSort::Year, false, true, None)
+            .unwrap();
         let kinds: Vec<&str> = cards.iter().map(|c| c.kind.as_str()).collect();
         assert_eq!(kinds, ["tv", "movie", "movie"], "{cards:?}");
         assert!(cards[1].title_key.contains("2026"), "{cards:?}");
         assert!(cards[2].title_key.contains("1994"), "{cards:?}");
         // Genre filter: nothing enriched → everything drops out.
-        let gq = BrowseQuery { genre: Some("Drama".into()), ..Default::default() };
-        let (_, total) = ix.browse_cards(&gq, CardSort::Latest, false, false, None).unwrap();
+        let gq = BrowseQuery {
+            genre: Some("Drama".into()),
+            ..Default::default()
+        };
+        let (_, total) = ix
+            .browse_cards(&gq, CardSort::Latest, false, false, None)
+            .unwrap();
         assert_eq!(total, 0);
         // Enrich one row with a genre and it comes back.
-        ix.title_seed("m:new film:2026", "movie", "New Film", 2026).unwrap();
+        ix.title_seed("m:new film:2026", "movie", "New Film", 2026)
+            .unwrap();
         ix.db
             .execute(
                 "UPDATE titles SET genres='Drama, Thriller', checked=1
@@ -5745,7 +8329,9 @@ mod tests {
                 [],
             )
             .unwrap();
-        let (cards, total) = ix.browse_cards(&gq, CardSort::Latest, false, false, None).unwrap();
+        let (cards, total) = ix
+            .browse_cards(&gq, CardSort::Latest, false, false, None)
+            .unwrap();
         assert_eq!(total, 1, "{cards:?}");
         assert_eq!(cards[0].title_key, "m:new film:2026");
         let _ = std::fs::remove_dir_all(&dir);
@@ -5753,8 +8339,7 @@ mod tests {
 
     #[test]
     fn affinity_ranks_favoured_genre_and_sinks_owned() {
-        let dir =
-            std::env::temp_dir().join(format!("nzbfast-index-aff-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nzbfast-index-aff-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut ix = Index::open(&dir.join("index.db")).unwrap();
@@ -5795,9 +8380,13 @@ mod tests {
             decade_weight: 1.0,
             owned,
         };
-        let q = BrowseQuery { desc: true, ..Default::default() };
-        let (cards, _) =
-            ix.browse_cards(&q, CardSort::Affinity, false, false, Some(&aff)).unwrap();
+        let q = BrowseQuery {
+            desc: true,
+            ..Default::default()
+        };
+        let (cards, _) = ix
+            .browse_cards(&q, CardSort::Affinity, false, false, Some(&aff))
+            .unwrap();
         let order: Vec<&str> = cards.iter().map(|c| c.title_key.as_str()).collect();
         // Drama (unowned) leads; Comedy in the middle; owned Drama sinks last.
         assert_eq!(
@@ -5807,8 +8396,9 @@ mod tests {
         );
         // Cold start (no profile) → Affinity degrades to Releases order,
         // still returning every card rather than erroring.
-        let (cards, total) =
-            ix.browse_cards(&q, CardSort::Affinity, false, false, None).unwrap();
+        let (cards, total) = ix
+            .browse_cards(&q, CardSort::Affinity, false, false, None)
+            .unwrap();
         assert_eq!(total, 3, "{cards:?}");
         assert_eq!(cards.len(), 3);
         let _ = std::fs::remove_dir_all(&dir);
@@ -5816,23 +8406,44 @@ mod tests {
 
     #[test]
     fn retention_prune_reaps_old_spares_recent_hidden_and_undated() {
-        let dir =
-            std::env::temp_dir().join(format!("nzbfast-index-ret-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nzbfast-index-ret-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut ix = Index::open(&dir.join("index.db")).unwrap();
         const DAY: i64 = 86_400;
         let now = 1_000 * DAY;
         // now: full-size rows at various ages + one undated + one hidden.
-        let mut old = entry("\"Ancient.Movie.2001.1080p.mkv\" yEnc (1/1)", "p@x", "r1", 4 << 30);
+        let mut old = entry(
+            "\"Ancient.Movie.2001.1080p.mkv\" yEnc (1/1)",
+            "p@x",
+            "r1",
+            4 << 30,
+        );
         old.date = now - 800 * DAY;
-        let mut recent = entry("\"Fresh.Movie.2026.1080p.mkv\" yEnc (1/1)", "p@x", "r2", 4 << 30);
+        let mut recent = entry(
+            "\"Fresh.Movie.2026.1080p.mkv\" yEnc (1/1)",
+            "p@x",
+            "r2",
+            4 << 30,
+        );
         recent.date = now - 10 * DAY;
-        let mut hidden = entry("\"Hidden.Movie.2000.1080p.mkv\" yEnc (1/1)", "p@x", "r3", 4 << 30);
+        let mut hidden = entry(
+            "\"Hidden.Movie.2000.1080p.mkv\" yEnc (1/1)",
+            "p@x",
+            "r3",
+            4 << 30,
+        );
         hidden.date = now - 900 * DAY;
-        let undated = entry("\"Undated.Movie.2010.1080p.mkv\" yEnc (1/1)", "p@x", "r4", 4 << 30);
-        ix.ingest("alt.test", &[old, recent, hidden, undated], now).unwrap();
-        ix.hide_title(&crate::release::parse_release("Hidden.Movie.2000.1080p").key).unwrap();
+        let undated = entry(
+            "\"Undated.Movie.2010.1080p.mkv\" yEnc (1/1)",
+            "p@x",
+            "r4",
+            4 << 30,
+        );
+        ix.ingest("alt.test", &[old, recent, hidden, undated], now)
+            .unwrap();
+        ix.hide_title(&crate::release::parse_release("Hidden.Movie.2000.1080p").key)
+            .unwrap();
 
         // Keep 2 years (~730 days): the 800/900-day rows are candidates,
         // but the 900-day one is hidden and must survive.
@@ -5840,8 +8451,16 @@ mod tests {
         assert_eq!(removed, 1, "only the old non-hidden row");
         assert_eq!(ix.search("ancient", 10).unwrap().len(), 0, "old reaped");
         assert_eq!(ix.search("fresh", 10).unwrap().len(), 1, "recent kept");
-        assert_eq!(ix.search("hidden movie", 10).unwrap().len(), 1, "hidden kept");
-        assert_eq!(ix.search("undated", 10).unwrap().len(), 1, "unknown-date kept");
+        assert_eq!(
+            ix.search("hidden movie", 10).unwrap().len(),
+            1,
+            "hidden kept"
+        );
+        assert_eq!(
+            ix.search("undated", 10).unwrap().len(),
+            1,
+            "unknown-date kept"
+        );
         // FTS index stayed in sync (rowid count == releases count) and no
         // orphan files rows survived the batch delete.
         let (rels, _) = ix.stats().unwrap();
@@ -5864,43 +8483,81 @@ mod tests {
 
     #[test]
     fn stale_partials_reaps_dead_junk_spares_wall_and_settle() {
-        let dir =
-            std::env::temp_dir().join(format!("nzbfast-index-stale-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nzbfast-index-stale-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut ix = Index::open(&dir.join("index.db")).unwrap();
         const DAY: i64 = 86_400;
         let now = 1_000 * DAY;
         // Obfuscated hash name -> junk>=50, missing parts, OLD -> dead, reaped.
-        let mut dead =
-            entry("\"ugpoqs3l6bthdkgbn1ktwkl2wwxju8.part1.rar\" yEnc (1/9)", "p@x", "s1", 750_000);
+        let mut dead = entry(
+            "\"ugpoqs3l6bthdkgbn1ktwkl2wwxju8.part1.rar\" yEnc (1/9)",
+            "p@x",
+            "s1",
+            750_000,
+        );
         dead.date = now - 30 * DAY;
         // Same junk shape and an OLD POST, but only just indexed (mid-backfill
         // into history): first_seen is recent, so the reaper must spare it - the
         // settle clock is index age, not post age. (The old code reaped this.)
-        let mut fresh =
-            entry("\"zzq9x2m7v5t8k1n3b6h4j0w2e5r7y9.part1.rar\" yEnc (1/9)", "p@x", "s2", 750_000);
+        let mut fresh = entry(
+            "\"zzq9x2m7v5t8k1n3b6h4j0w2e5r7y9.part1.rar\" yEnc (1/9)",
+            "p@x",
+            "s2",
+            750_000,
+        );
         fresh.date = now - 30 * DAY;
         // Wall-visible (parses clean, junk<50), missing parts, OLD -> the
         // always-on reaper must NOT touch it (opt-in age prune's job).
-        let mut real =
-            entry("\"Real.Show.S01E01.720p.WEB.x264-GRP.mkv\" yEnc (1/9)", "p@x", "s3", 400 << 20);
+        let mut real = entry(
+            "\"Real.Show.S01E01.720p.WEB.x264-GRP.mkv\" yEnc (1/9)",
+            "p@x",
+            "s3",
+            400 << 20,
+        );
         real.date = now - 30 * DAY;
         // Junk + COMPLETE + old -> not this reaper (spares complete blobs).
-        let mut donejunk =
-            entry("\"a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3.mkv\" yEnc (1/1)", "p@x", "s4", 750_000);
+        let mut donejunk = entry(
+            "\"a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3.mkv\" yEnc (1/1)",
+            "p@x",
+            "s4",
+            750_000,
+        );
         donejunk.date = now - 30 * DAY;
         // dead/real/donejunk were indexed long ago (first_seen old); `fresh`
         // is indexed now, so its settle window has not elapsed.
-        ix.ingest("alt.test", &[dead, real, donejunk], now - 30 * DAY).unwrap();
+        ix.ingest("alt.test", &[dead, real, donejunk], now - 30 * DAY)
+            .unwrap();
         ix.ingest("alt.test", &[fresh], now).unwrap();
 
         let removed = ix.prune_stale_partials(7 * DAY, now).unwrap();
         assert_eq!(removed, 1, "only the old junk missing-parts row");
-        assert_eq!(ix.search("ugpoqs3l6bthdkgbn1ktwkl2wwxju8", 10).unwrap().len(), 0, "dead junk reaped");
-        assert_eq!(ix.search("zzq9x2m7v5t8k1n3b6h4j0w2e5r7y9", 10).unwrap().len(), 1, "in settle window");
-        assert_eq!(ix.search("real show", 10).unwrap().len(), 1, "wall-visible spared");
-        assert_eq!(ix.search("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3", 10).unwrap().len(), 1, "complete junk spared");
+        assert_eq!(
+            ix.search("ugpoqs3l6bthdkgbn1ktwkl2wwxju8", 10)
+                .unwrap()
+                .len(),
+            0,
+            "dead junk reaped"
+        );
+        assert_eq!(
+            ix.search("zzq9x2m7v5t8k1n3b6h4j0w2e5r7y9", 10)
+                .unwrap()
+                .len(),
+            1,
+            "in settle window"
+        );
+        assert_eq!(
+            ix.search("real show", 10).unwrap().len(),
+            1,
+            "wall-visible spared"
+        );
+        assert_eq!(
+            ix.search("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3", 10)
+                .unwrap()
+                .len(),
+            1,
+            "complete junk spared"
+        );
         teardown(&dir, ix);
     }
 
@@ -5920,13 +8577,28 @@ mod tests {
         // Track prefix wins even when a year parses further in.
         assert!(score("065 - Estatística RLM 2019.mp4", 400 << 20) >= 50);
         // Bracket-hex repost spam - inner name parses real, still junk.
-        assert!(score("[3b9550c02c]_[newzNZB]_atlanta.s01e10.1080p.hdtv.x264-xpert", 50 << 20) >= 50);
+        assert!(
+            score(
+                "[3b9550c02c]_[newzNZB]_atlanta.s01e10.1080p.hdtv.x264-xpert",
+                50 << 20
+            ) >= 50
+        );
         // Anime subgroup brackets are words, not hex - clean.
         assert!(score("[SubsPlease] Frieren - S01E01 (1080p) [ABCD1234]", 1 << 30) < 50);
         // Real releases with any single marker survive.
         assert!(score("Some.Documentary.2020.mp4", 2 << 30) < 50);
-        assert!(score("slings.and.arrows.s01e03.proper.dvdrip.xvid-nodlabs", 300 << 20) < 50);
-        assert!(score("Robin.Hood.2010.Theatrical.Cut.BluRay.1080p.DTS-X.7.1.AVC.HYBRID.REMUX-FraMeSToR.mkv", 33 << 30) < 50);
+        assert!(
+            score(
+                "slings.and.arrows.s01e03.proper.dvdrip.xvid-nodlabs",
+                300 << 20
+            ) < 50
+        );
+        assert!(
+            score(
+                "Robin.Hood.2010.Theatrical.Cut.BluRay.1080p.DTS-X.7.1.AVC.HYBRID.REMUX-FraMeSToR.mkv",
+                33 << 30
+            ) < 50
+        );
         // "24.S01E01" style: leading digits but a parsed episode - clean.
         assert!(score("24.S01E01.1080p.WEB.h264-GRP", 2 << 30) < 50);
         // Evidence-free software-ish name is hidden by the same rule.
@@ -5944,8 +8616,7 @@ mod tests {
         // M32 (Prowlarr#2329): an .exe inside a movie/TV-shaped release is
         // flagged past the default-hide line; Software releases keep their
         // normal score (executables are their content).
-        let dir =
-            std::env::temp_dir().join(format!("nzbfast-index-exe-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nzbfast-index-exe-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut ix = Index::open(&dir.join("index.db")).unwrap();
@@ -5964,8 +8635,12 @@ mod tests {
         // Both rows exist, but the junk ceiling hides the exe-carrying one.
         let (_, total_all) = ix.browse(&BrowseQuery::default()).unwrap();
         assert_eq!(total_all, 2);
-        let (rows, total) =
-            ix.browse(&BrowseQuery { max_junk: Some(50), ..Default::default() }).unwrap();
+        let (rows, total) = ix
+            .browse(&BrowseQuery {
+                max_junk: Some(50),
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(total, 1, "exe-carrying movie must be junk-hidden: {rows:?}");
         assert!(rows[0].stem.contains("Clean.Movie"), "{rows:?}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -5975,8 +8650,7 @@ mod tests {
     fn sample_token_only_junks_sample_sized_posts() {
         // M32: a full-size release with "sample"
         // in its TITLE is not furniture; a tens-of-MB one is.
-        let dir =
-            std::env::temp_dir().join(format!("nzbfast-index-smp-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nzbfast-index-smp-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut ix = Index::open(&dir.join("index.db")).unwrap();
@@ -5999,8 +8673,12 @@ mod tests {
             1_000,
         )
         .unwrap();
-        let (rows, total) =
-            ix.browse(&BrowseQuery { max_junk: Some(50), ..Default::default() }).unwrap();
+        let (rows, total) = ix
+            .browse(&BrowseQuery {
+                max_junk: Some(50),
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(total, 1, "only the real sample is hidden: {rows:?}");
         assert!(rows[0].stem.contains("Free.Sample"), "{rows:?}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -6008,8 +8686,7 @@ mod tests {
 
     #[test]
     fn people_identity_credits_and_the_search_leg() {
-        let dir =
-            std::env::temp_dir().join(format!("nzbfast-index-people-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nzbfast-index-people-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut ix = Index::open(&dir.join("index.db")).unwrap();
@@ -6020,21 +8697,35 @@ mod tests {
         ix.ingest(
             "alt.binaries.test",
             &[
-                mk("Top.Gun.Maverick.2022.1080p.BluRay.x264-GRP.mkv", "a@a", "t1"),
-                mk("Mission.Impossible.1996.1080p.BluRay.x264-GRP.mkv", "b@b", "m1"),
+                mk(
+                    "Top.Gun.Maverick.2022.1080p.BluRay.x264-GRP.mkv",
+                    "a@a",
+                    "t1",
+                ),
+                mk(
+                    "Mission.Impossible.1996.1080p.BluRay.x264-GRP.mkv",
+                    "b@b",
+                    "m1",
+                ),
                 mk("Breaking.Bad.S01E01.720p.WEB.x264-GRP.mkv", "c@c", "b1"),
             ],
             1_000,
         )
         .unwrap();
         let key = |s: &str| {
-            ix.browse_cards(&BrowseQuery::default(), CardSort::Latest, false, false, None)
-                .unwrap()
-                .0
-                .into_iter()
-                .find(|c| c.title_key.contains(s))
-                .unwrap_or_else(|| panic!("no card for {s}"))
-                .title_key
+            ix.browse_cards(
+                &BrowseQuery::default(),
+                CardSort::Latest,
+                false,
+                false,
+                None,
+            )
+            .unwrap()
+            .0
+            .into_iter()
+            .find(|c| c.title_key.contains(s))
+            .unwrap_or_else(|| panic!("no card for {s}"))
+            .title_key
         };
         let (tg, mi, bb) = (key("maverick"), key("mission"), key("breaking"));
         for (k, kind, title, year) in [
@@ -6043,7 +8734,15 @@ mod tests {
             (&bb, "tv", "Breaking Bad", 0),
         ] {
             ix.title_seed(k, kind, title, year).unwrap();
-            ix.title_fill(k, &TitleFill { tmdb_id: 1, ..Default::default() }, 5).unwrap();
+            ix.title_fill(
+                k,
+                &TitleFill {
+                    tmdb_id: 1,
+                    ..Default::default()
+                },
+                5,
+            )
+            .unwrap();
         }
 
         // A person seen first by Wikidata and later by TVmaze is ONE
@@ -6057,7 +8756,8 @@ mod tests {
             wikidata_qid: "Q37079".into(),
             ..Default::default()
         };
-        ix.title_credits_set(&tg, &[cruise_wd.clone()]).unwrap();
+        ix.title_credits_set(&tg, std::slice::from_ref(&cruise_wd))
+            .unwrap();
         ix.title_credits_set(
             &mi,
             &[Credit {
@@ -6071,28 +8771,41 @@ mod tests {
             }],
         )
         .unwrap();
-        let n_people: i64 =
-            ix.db.query_row("SELECT COUNT(*) FROM people", [], |r| r.get(0)).unwrap();
+        let n_people: i64 = ix
+            .db
+            .query_row("SELECT COUNT(*) FROM people", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n_people, 1, "one person, two providers");
         let p = ix.people_search("tom cru", 5).unwrap();
         assert_eq!(p.len(), 1, "prefix name search: {p:?}");
         assert_eq!((p[0].name.as_str(), p[0].n_titles), ("Tom Cruise", 2));
         let pid = p[0].id;
         let row = ix.person_get(pid).unwrap().unwrap();
-        assert_eq!((row.tvmaze_id, row.wikidata_qid.as_str()), (555, "Q37079"),
-                   "both handles landed on the one row");
+        assert_eq!(
+            (row.tvmaze_id, row.wikidata_qid.as_str()),
+            (555, "Q37079"),
+            "both handles landed on the one row"
+        );
 
         // The person page's in-index half, newest release first.
         let mine = ix.person_titles(pid).unwrap();
         assert_eq!(mine.len(), 2);
-        assert_eq!(mine[0].title, "Top Gun Maverick", "ordered by release date: {mine:?}");
+        assert_eq!(
+            mine[0].title, "Top Gun Maverick",
+            "ordered by release date: {mine:?}"
+        );
         assert_eq!(mine[0].character, "Maverick");
 
         // The search leg: "tom cruise" appears in no stem at all, so
         // before this it matched nothing.
         let found = |q: &str| {
             ix.browse_cards(
-                &BrowseQuery { q: q.into(), max_junk: Some(50), curated: true, ..Default::default() },
+                &BrowseQuery {
+                    q: q.into(),
+                    max_junk: Some(50),
+                    curated: true,
+                    ..Default::default()
+                },
                 CardSort::Latest,
                 false,
                 false,
@@ -6110,8 +8823,16 @@ mod tests {
         // must remove it from the person page and from the search leg,
         // or a cast chip is a way back into what the user just hid.
         ix.hide_title(&tg).unwrap();
-        assert_eq!(ix.person_titles(pid).unwrap().len(), 1, "hidden title still listed");
-        assert_eq!(found("tom cruise"), 1, "hidden title still searchable by cast");
+        assert_eq!(
+            ix.person_titles(pid).unwrap().len(),
+            1,
+            "hidden title still listed"
+        );
+        assert_eq!(
+            found("tom cruise"),
+            1,
+            "hidden title still searchable by cast"
+        );
         assert_eq!(ix.people_search("tom cru", 5).unwrap()[0].n_titles, 1);
         ix.unhide_title(&tg).unwrap();
 
@@ -6127,13 +8848,19 @@ mod tests {
             }],
         )
         .unwrap();
-        let n_people: i64 =
-            ix.db.query_row("SELECT COUNT(*) FROM people", [], |r| r.get(0)).unwrap();
+        let n_people: i64 = ix
+            .db
+            .query_row("SELECT COUNT(*) FROM people", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n_people, 2, "a conflicting handle forks, it does not merge");
         // They stay separate people with separate filmographies, but a
         // name search legitimately matches both - the searcher typed a
         // name, not an identity.
-        assert_eq!(ix.person_titles(pid).unwrap().len(), 2, "the fork stole a credit");
+        assert_eq!(
+            ix.person_titles(pid).unwrap().len(),
+            2,
+            "the fork stole a credit"
+        );
         assert_eq!(found("tom cruise"), 3);
 
         // Re-enrichment replaces the whole set rather than accumulating
@@ -6146,8 +8873,11 @@ mod tests {
         assert!(ix.person_titles(pid).unwrap().iter().any(|t| t.key == tg));
         assert_eq!(
             ix.db
-                .query_row("SELECT COUNT(*) FROM title_people WHERE key=?1", [&mi], |r| r
-                    .get::<_, i64>(0))
+                .query_row(
+                    "SELECT COUNT(*) FROM title_people WHERE key=?1",
+                    [&mi],
+                    |r| r.get::<_, i64>(0)
+                )
                 .unwrap(),
             0,
             "the merged-away key still holds credits"
@@ -6186,7 +8916,10 @@ mod tests {
         assert_eq!(ix.search("nosuchthing", 10).unwrap().len(), 0);
 
         // Browse with the junk ceiling: the hash stem drops out.
-        let q = BrowseQuery { max_junk: Some(50), ..Default::default() };
+        let q = BrowseQuery {
+            max_junk: Some(50),
+            ..Default::default()
+        };
         let (rows, total) = ix.browse(&q).unwrap();
         assert_eq!(total, 3, "junk hidden: {rows:?}");
         let (_, total_all) = ix.browse(&BrowseQuery::default()).unwrap();
@@ -6194,10 +8927,22 @@ mod tests {
 
         // Cards: inception's two posters group under one key.
         let (cards, ctotal) = ix
-            .browse_cards(&BrowseQuery { max_junk: Some(50), ..Default::default() }, CardSort::Latest, false, false, None)
+            .browse_cards(
+                &BrowseQuery {
+                    max_junk: Some(50),
+                    ..Default::default()
+                },
+                CardSort::Latest,
+                false,
+                false,
+                None,
+            )
             .unwrap();
         assert_eq!(ctotal, 2, "cards: {cards:?}");
-        let inception = cards.iter().find(|c| c.title_key.starts_with("m:inception")).unwrap();
+        let inception = cards
+            .iter()
+            .find(|c| c.title_key.starts_with("m:inception"))
+            .unwrap();
         assert_eq!(inception.n_releases, 2);
         assert_eq!(inception.best_res, "2160p");
         assert_eq!(inception.kind, "movie");
@@ -6212,7 +8957,10 @@ mod tests {
 
         // FTS query text is filtered per-term.
         let (_, n) = ix
-            .browse(&BrowseQuery { q: "inception \"2010".into(), ..Default::default() })
+            .browse(&BrowseQuery {
+                q: "inception \"2010".into(),
+                ..Default::default()
+            })
             .unwrap();
         assert_eq!(n, 2);
         let _ = std::fs::remove_dir_all(&dir);
@@ -6249,7 +8997,11 @@ mod tests {
         // Posted LATER (t=95_000) but seen FIRST (t=100_000).
         ix.ingest(
             "alt.test",
-            &[dated_entry("\"Posted.Later.2020.mkv\" yEnc (1/1)", "p1", 95_000)],
+            &[dated_entry(
+                "\"Posted.Later.2020.mkv\" yEnc (1/1)",
+                "p1",
+                95_000,
+            )],
             100_000,
         )
         .unwrap();
@@ -6257,12 +9009,19 @@ mod tests {
         // slow-to-complete set that Latest buries.
         ix.ingest(
             "alt.test",
-            &[dated_entry("\"Seen.Later.2020.mkv\" yEnc (1/1)", "s1", 91_000)],
+            &[dated_entry(
+                "\"Seen.Later.2020.mkv\" yEnc (1/1)",
+                "s1",
+                91_000,
+            )],
             110_000,
         )
         .unwrap();
 
-        let q = BrowseQuery { limit: 10, ..Default::default() };
+        let q = BrowseQuery {
+            limit: 10,
+            ..Default::default()
+        };
         let first = |sort| {
             let (cards, _) = ix.browse_cards(&q, sort, false, false, None).unwrap();
             cards[0].title_key.clone()
@@ -6295,33 +9054,65 @@ mod tests {
 
         // Split across batches so the merge path runs: part 2 arrives
         // after part 1, and nsegs has to end at 2, not 1.
-        ix.ingest("alt.test", &[entry("\"Film.2020.part1.rar\" yEnc (1/2)", "p@x", "a1", 900)], 1000)
-            .unwrap();
+        ix.ingest(
+            "alt.test",
+            &[entry(
+                "\"Film.2020.part1.rar\" yEnc (1/2)",
+                "p@x",
+                "a1",
+                900,
+            )],
+            1000,
+        )
+        .unwrap();
         let count = |ix: &Index| -> i64 {
             ix.db
-                .query_row("SELECT nsegs FROM files WHERE filename LIKE 'Film%'", [], |r| r.get(0))
+                .query_row(
+                    "SELECT nsegs FROM files WHERE filename LIKE 'Film%'",
+                    [],
+                    |r| r.get(0),
+                )
                 .unwrap()
         };
         assert_eq!(count(&ix), 1, "first batch: one part seen");
         assert_eq!(
-            ix.ingest("alt.test", &[entry("\"Film.2020.part1.rar\" yEnc (2/2)", "p@x", "a2", 900)], 1001)
-                .unwrap(),
+            ix.ingest(
+                "alt.test",
+                &[entry(
+                    "\"Film.2020.part1.rar\" yEnc (2/2)",
+                    "p@x",
+                    "a2",
+                    900
+                )],
+                1001
+            )
+            .unwrap(),
             1,
             "merging the second part completes the release"
         );
         assert_eq!(count(&ix), 2, "nsegs follows the MERGED set, not the batch");
-        assert!(ix.db
-            .query_row("SELECT complete FROM releases LIMIT 1", [], |r| r.get::<_, bool>(0))
-            .unwrap());
+        assert!(
+            ix.db
+                .query_row("SELECT complete FROM releases LIMIT 1", [], |r| r
+                    .get::<_, bool>(0))
+                .unwrap()
+        );
 
         // Simulate a row the chunked backfill has not reached: nsegs
         // back to 0 with the JSON intact, which is exactly the state
         // every pre-existing row is in on first open after upgrading.
         ix.db.execute("UPDATE files SET nsegs = 0", []).unwrap();
-        ix.db.execute("UPDATE kv SET v='0' WHERE k='nsegs_fill'", []).ok();
-        ix.ingest("alt.test", &[entry("\"Other.2020.mkv\" yEnc (1/1)", "p@y", "b1", 900)], 1002)
-            .unwrap();
-        let still_complete: bool = ix.db
+        ix.db
+            .execute("UPDATE kv SET v='0' WHERE k='nsegs_fill'", [])
+            .ok();
+        ix.ingest(
+            "alt.test",
+            &[entry("\"Other.2020.mkv\" yEnc (1/1)", "p@y", "b1", 900)],
+            1002,
+        )
+        .unwrap();
+        let still_complete: bool = ix
+            .db
             .query_row(
                 "SELECT complete FROM releases WHERE stem LIKE 'Film%'",
                 [],
@@ -6338,7 +9129,8 @@ mod tests {
         drop(ix);
         let ix = Index::open(&path).unwrap();
         assert_eq!(count(&ix), 2, "backfill restored the cached count");
-        let done: String = ix.db
+        let done: String = ix
+            .db
             .query_row("SELECT v FROM kv WHERE k='nsegs_fill'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(done, "1", "backfill stamped itself complete");
@@ -6361,7 +9153,11 @@ mod tests {
         // Posted t=91_000, first seen t=100_000.
         ix.ingest(
             "alt.test",
-            &[dated_entry("\"Old.Show.S01E01.mkv\" yEnc (1/1)", "o1", 91_000)],
+            &[dated_entry(
+                "\"Old.Show.S01E01.mkv\" yEnc (1/1)",
+                "o1",
+                91_000,
+            )],
             100_000,
         )
         .unwrap();
@@ -6373,7 +9169,11 @@ mod tests {
         // A genuine arrival: newly seen AND recently posted.
         ix.ingest(
             "alt.test",
-            &[dated_entry("\"New.Show.S02E02.mkv\" yEnc (1/1)", "n1", 95_000)],
+            &[dated_entry(
+                "\"New.Show.S02E02.mkv\" yEnc (1/1)",
+                "n1",
+                95_000,
+            )],
             101_000,
         )
         .unwrap();
@@ -6385,7 +9185,11 @@ mod tests {
         // the row-id cursor. A first_seen cursor used to miss this forever.
         ix.ingest(
             "alt.test",
-            &[dated_entry("\"Other.Show.S03E03.mkv\" yEnc (1/1)", "n2", 95_001)],
+            &[dated_entry(
+                "\"Other.Show.S03E03.mkv\" yEnc (1/1)",
+                "n2",
+                95_001,
+            )],
             101_000,
         )
         .unwrap();
@@ -6407,7 +9211,11 @@ mod tests {
             .unwrap();
         ix.ingest(
             "alt.test",
-            &[dated_entry("\"Replacement.Show.S04E04.mkv\" yEnc (1/1)", "n3", 95_002)],
+            &[dated_entry(
+                "\"Replacement.Show.S04E04.mkv\" yEnc (1/1)",
+                "n3",
+                95_002,
+            )],
             101_000,
         )
         .unwrap();
@@ -6422,7 +9230,11 @@ mod tests {
         // cards down and could not be found at all.
         ix.ingest(
             "alt.test",
-            &[dated_entry("\"Ancient.Film.2009.mkv\" yEnc (1/1)", "a1", 100)],
+            &[dated_entry(
+                "\"Ancient.Film.2009.mkv\" yEnc (1/1)",
+                "a1",
+                100,
+            )],
             102_000,
         )
         .unwrap();
@@ -6438,7 +9250,11 @@ mod tests {
         // (first_seen is set on insert only, so the mark does not move).
         ix.ingest(
             "alt.test",
-            &[dated_entry("\"New.Show.S02E02.mkv\" yEnc (1/1)", "n1", 95_000)],
+            &[dated_entry(
+                "\"New.Show.S02E02.mkv\" yEnc (1/1)",
+                "n1",
+                95_000,
+            )],
             103_000,
         )
         .unwrap();
@@ -6455,7 +9271,11 @@ mod tests {
         assert_eq!(ix.wall_tip(5, RECENT, 10).unwrap().latest, 5);
         ix.ingest(
             "alt.test",
-            &[dated_entry("\"After.Empty.S01E01.mkv\" yEnc (1/1)", "z1", 95_003)],
+            &[dated_entry(
+                "\"After.Empty.S01E01.mkv\" yEnc (1/1)",
+                "z1",
+                95_003,
+            )],
             104_000,
         )
         .unwrap();
@@ -6481,17 +9301,27 @@ mod tests {
 
         ix.ingest(
             "alt.test",
-            &[dated_entry("\"Before.Wipe.S01E01.mkv\" yEnc (1/1)", "b1", 91_000)],
+            &[dated_entry(
+                "\"Before.Wipe.S01E01.mkv\" yEnc (1/1)",
+                "b1",
+                91_000,
+            )],
             100_000,
         )
         .unwrap();
 
         // Somebody's kv cleanup took the counter with it.
-        ix.db.execute("DELETE FROM kv WHERE k='wall_arrival_seq'", []).unwrap();
+        ix.db
+            .execute("DELETE FROM kv WHERE k='wall_arrival_seq'", [])
+            .unwrap();
 
         ix.ingest(
             "alt.test",
-            &[dated_entry("\"After.Wipe.S02E02.mkv\" yEnc (1/1)", "a1", 95_000)],
+            &[dated_entry(
+                "\"After.Wipe.S02E02.mkv\" yEnc (1/1)",
+                "a1",
+                95_000,
+            )],
             101_000,
         )
         .expect("a missing kv row must not take the ingest transaction down with it");
@@ -6507,7 +9337,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 2, "both releases are in the table");
-        assert!(seq > 0, "the fallback gave the new row a real cursor, got {seq}");
+        assert!(
+            seq > 0,
+            "the fallback gave the new row a real cursor, got {seq}"
+        );
 
         // An index that predates this fix carries the old trigger, so the
         // upgrade has to replace it - a database still running the
@@ -6529,11 +9362,75 @@ mod tests {
         let ix = Index::open(&dir.join("index.db")).unwrap();
         let restored: i64 = ix
             .db
-            .query_row("SELECT CAST(v AS INTEGER) FROM kv WHERE k='wall_arrival_seq'", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT CAST(v AS INTEGER) FROM kv WHERE k='wall_arrival_seq'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(restored, seq, "re-open restored the counter from MAX(arrival_seq)");
+        assert_eq!(
+            restored, seq,
+            "re-open restored the counter from MAX(arrival_seq)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The 2 Aug wedge's proximate cause was an index that had never been
+    /// analyzed, so this pins the two things the daily maintenance leg
+    /// needs from `optimize`: a database with no statistics at all comes
+    /// out of it WITH some (the `PRAGMA optimize` path alone would not
+    /// guarantee that - it only reconsiders tables the connection has
+    /// queried), and calling it again on an already-analyzed database is
+    /// a no-op rather than an error, because the leg runs it forever.
+    #[test]
+    fn optimize_creates_statistics_and_is_safe_to_repeat() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-analyze-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ix = Index::open(&dir.join("index.db")).unwrap();
+        let now = 1_753_000_000i64;
+        let entries: Vec<crate::nntp::OverEntry> = (0..200)
+            .map(|i| crate::nntp::OverEntry {
+                number: i + 1,
+                subject: format!("\"Stats.Test.S01E{i:02}.1080p-GRP.rar\" yEnc (1/1)"),
+                from: "p@x".into(),
+                date: now - (i as i64) * 3_600,
+                message_id: format!("<stats{i}@x>"),
+                bytes: 4096,
+            })
+            .collect();
+        ix.ingest("alt.binaries.teevee", &entries, now).unwrap();
+
+        let stat_rows = |ix: &Index| -> i64 {
+            ix.db
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'sqlite_stat1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(stat_rows(&ix), 0, "a fresh index has never been analyzed");
+        ix.optimize().expect("first optimize");
+        assert_eq!(
+            stat_rows(&ix),
+            1,
+            "the first pass must produce statistics, not defer to a query that never came"
+        );
+        let analyzed: i64 = ix
+            .db
+            .query_row("SELECT COUNT(*) FROM sqlite_stat1", [], |r| r.get(0))
+            .unwrap();
+        assert!(analyzed > 0, "and rows in them, not just the table");
+
+        // Every later pass, forever. Nothing to do is the normal case.
+        ix.optimize().expect("second optimize");
+        ix.optimize().expect("third optimize");
+        assert!(
+            ix.stats().unwrap().0 > 0,
+            "the index still answers after being analyzed"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6552,36 +9449,160 @@ mod tests {
         let path = dir.join("index.db");
         let ix = Index::open(&path).unwrap();
 
-        // Enough freed pages that the rewrite is not instantaneous: the
-        // interrupt below lands 5 ms in, against a rewrite measured in
-        // hundreds of milliseconds.
+        // Ballast enough that the rewrite has a VM phase worth
+        // interrupting in at all. Since the interrupt is delivered from
+        // a progress handler rather than on a timer, "enough" is an
+        // OPCODE count, not a duration: the handler fires every
+        // `num_ops` VDBE steps OF THE STATEMENT RUNNING AT THE TIME, so
+        // the only requirement is that some statement inside the VACUUM
+        // runs past `num_ops`. VACUUM copies each table with one
+        // `INSERT INTO vacuum_db.x SELECT * FROM main.x`, which measures
+        // ~5 opcodes per row, so at the 1000 below the floor is ~200
+        // SURVIVING rows - 400 built, half deleted. Measured: 400 built
+        // fires exactly once, 300 never fires at all.
+        //
+        // The 2 000 below is therefore five handler calls against a
+        // floor of 1. It is NOT sized for duration, whatever the 20 000
+        // it replaced suggests, so do not read it as "the rewrite must
+        // last long enough to be hit" and do not tune it as a timing
+        // margin. Five is ample: the floor moves only if VACUUM's copy
+        // loop changes its opcodes per row, and it cannot spend fewer
+        // than the ~4 it takes to step a cursor and insert a record.
+        //
+        // Undershooting is not a flake. Too little ballast means the
+        // handler never fires at all, and `fired` below then fails
+        // loudly and identically on every platform - it cannot walk the
+        // interrupt somewhere subtler, because the fire point is a count
+        // of opcodes within one statement rather than a moment in time.
         let payload = vec![7u8; 4096];
-        ix.db.execute_batch("CREATE TABLE IF NOT EXISTS vac_ballast(id INTEGER PRIMARY KEY, b BLOB)")
+        ix.db
+            .execute_batch("CREATE TABLE IF NOT EXISTS vac_ballast(id INTEGER PRIMARY KEY, b BLOB)")
             .unwrap();
         {
             let tx = ix.db.unchecked_transaction().unwrap();
-            for _ in 0..20_000 {
-                tx.execute("INSERT INTO vac_ballast(b) VALUES(?1)", [&payload]).unwrap();
+            for _ in 0..2_000 {
+                tx.execute("INSERT INTO vac_ballast(b) VALUES(?1)", [&payload])
+                    .unwrap();
             }
             tx.commit().unwrap();
         }
-        ix.db.execute("DELETE FROM vac_ballast WHERE id % 2 = 0", []).unwrap();
+        ix.db
+            .execute("DELETE FROM vac_ballast WHERE id % 2 = 0", [])
+            .unwrap();
+        let free_before: i64 = ix
+            .db
+            .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+            .unwrap();
+        assert!(free_before > 0, "the delete left the rewrite nothing to do");
 
+        // The interrupt has to land inside the rewrite's VM phase, and
+        // nothing about ELAPSED TIME says when that is. Only the first
+        // part of a VACUUM - copying the live pages into the temp
+        // database - runs in the VDBE, which is the only place the
+        // interrupt flag is read; the `sqlite3BtreeCopyFile` tail that
+        // writes the result back over the original checks nothing and
+        // cannot be stopped. Measured on Windows against an 80 MB index
+        // (see `interrupt_handle`): the window is the first few hundred
+        // milliseconds of a rewrite that runs ~2 s idle and ~6 s with
+        // the cores busy, because the window is memory-speed work and
+        // only the tail is disk-bound. Load stretches the rewrite and
+        // leaves the window where it was.
+        //
+        // Both earlier shapes bet on time and lost. Sleeping 5 ms and
+        // interrupting once failed the Windows nightly leg on 2026-08-02
+        // (it fired before VACUUM had begun). Interrupting in a 1 ms
+        // loop until compact() returns failed the per-push windows-unit
+        // leg on d1716767, twice including the nextest retry: a freshly
+        // spawned thread on a loaded runner took longer to reach its
+        // first call than the window stayed open. On a 14-core Windows
+        // laptop with every core busy that first call measured 27-32 ms;
+        // the margin is real but it is only ever a margin.
+        //
+        // So take time out of it. The progress callback runs from
+        // inside the rewrite's own VM loop, so when it fires the VACUUM
+        // is provably mid-flight and provably still in the phase that
+        // reads the flag. It hands the job to another thread - the
+        // daemon aborts a compact from another thread, and that is the
+        // property worth pinning - and blocks until that thread's
+        // `interrupt()` has returned, so the rewrite cannot outrun it.
+        // The callback returns false: aborting is the interrupt's job
+        // here, not the progress handler's, or the test would pass
+        // without `interrupt_handle` working at all.
+        //
+        // 1000 opcodes is also what keeps the first call landing in the
+        // table copy rather than in VACUUM's own preamble. Traced by
+        // reporting the busy statement from inside the handler: at 1000
+        // the first call is always the `INSERT INTO vacuum_db.
+        // 'vac_ballast' SELECT*FROM main.'vac_ballast'`; at 100 and 10
+        // it is the schema mirror; at 5 it is the `ATTACH '' AS
+        // vacuum_...` that opens the temp database, which fails as
+        // "unable to open database" instead of "interrupted" - still an
+        // Err, so still a green test, but no longer the interrupt this
+        // is here to pin.
         let handle = ix.interrupt_handle();
-        let stop = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-            handle.interrupt();
+        let (ask, asked) = std::sync::mpsc::channel::<()>();
+        let (landed, confirm) = std::sync::mpsc::channel::<()>();
+        let aborter = std::thread::spawn(move || {
+            if asked.recv().is_ok() {
+                handle.interrupt();
+                let _ = landed.send(());
+            }
         });
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let once = std::sync::Arc::clone(&fired);
+        ix.db
+            .progress_handler(
+                1000,
+                Some(move || {
+                    if !once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        // A dead aborter closes the channel rather than
+                        // hanging the rewrite here.
+                        if ask.send(()).is_ok() {
+                            let _ = confirm.recv();
+                        }
+                    }
+                    false
+                }),
+            )
+            .unwrap();
         let r = ix.compact();
-        stop.join().unwrap();
-        assert!(r.is_err(), "the rewrite must abort rather than run to completion");
+        ix.db.progress_handler(1000, None::<fn() -> bool>).unwrap();
+        aborter.join().unwrap();
+        assert!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            "the rewrite never reached its VM loop, so nothing was interrupted"
+        );
+        assert!(
+            r.is_err(),
+            "the rewrite must abort rather than run to completion"
+        );
+        // And it aborted with work still to do. `fired` alone only says
+        // the VM loop was reached; the free pages are what say the
+        // interrupt beat `sqlite3BtreeCopyFile`, because a rewrite that
+        // reached the copy-back has no freelist left. This is the
+        // property the ballast is sized for, so it is the one that has
+        // to fail if the ballast ever gets too small to hold the first
+        // handler call inside the copy.
+        let free_after: i64 = ix
+            .db
+            .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            free_after, free_before,
+            "the abort landed after the rewrite, so it saved nothing"
+        );
 
         // Nothing was lost: the odd-id half is still all there, and the
         // index is usable straight afterwards.
-        let n: i64 =
-            ix.db.query_row("SELECT COUNT(*) FROM vac_ballast", [], |r| r.get(0)).unwrap();
-        assert_eq!(n, 10_000, "an aborted VACUUM must not cost a single row");
-        assert!(ix.db_bytes().unwrap() > 0, "the connection still works after the abort");
+        let n: i64 = ix
+            .db
+            .query_row("SELECT COUNT(*) FROM vac_ballast", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1_000, "an aborted VACUUM must not cost a single row");
+        assert!(
+            ix.db_bytes().unwrap() > 0,
+            "the connection still works after the abort"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6612,7 +9633,12 @@ mod tests {
         // unverified FTS prefix hit would hand the user this instead.
         ix.ingest(
             "alt.binaries.boneless",
-            &[entry("\"7f3ac91e88ff00.mkv\" yEnc (1/1)", "q@x", "d1", 4000)],
+            &[entry(
+                "\"7f3ac91e88ff00.mkv\" yEnc (1/1)",
+                "q@x",
+                "d1",
+                4000,
+            )],
             1000,
         )
         .unwrap();
@@ -6625,10 +9651,16 @@ mod tests {
         let nzb = ix.make_nzb(hits[0].id).unwrap();
         let parsed = crate::nzb::Nzb::parse(nzb.as_bytes()).unwrap();
         assert_eq!(parsed.files.len(), 3);
-        assert_eq!(parsed.files.iter().map(|f| f.segments.len()).sum::<usize>(), 4);
+        assert_eq!(
+            parsed.files.iter().map(|f| f.segments.len()).sum::<usize>(),
+            4
+        );
 
         // Case and separator spelling do not matter.
-        assert_eq!(ix.find_by_header("7F3AC91E88", 10).unwrap()[0].stem, "7f3ac91e88");
+        assert_eq!(
+            ix.find_by_header("7F3AC91E88", 10).unwrap()[0].stem,
+            "7f3ac91e88"
+        );
 
         // The other shape: per-file obfuscation, where the header names
         // a FILE inside a release whose stem is something else.
@@ -6652,12 +9684,21 @@ mod tests {
         let hits = ix.find_by_header("ab_cd%ef-9911", 10).unwrap();
         assert_eq!(hits.len(), 1, "filename rung missed: {hits:?}");
         assert_eq!(hits[0].stem, "Die.Hard.Umlaut.German");
-        assert!(ix.find_by_header("ab-cd-ef-9911", 10).unwrap().is_empty(),
-            "the wildcards were live");
+        assert!(
+            ix.find_by_header("ab-cd-ef-9911", 10).unwrap().is_empty(),
+            "the wildcards were live"
+        );
 
         // Nothing to resolve, and nothing distinctive enough to try.
-        assert!(ix.find_by_header("nosuchheaderatall", 10).unwrap().is_empty());
-        assert!(ix.find_by_header("7f3", 10).unwrap().is_empty(), "too short to identify");
+        assert!(
+            ix.find_by_header("nosuchheaderatall", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            ix.find_by_header("7f3", 10).unwrap().is_empty(),
+            "too short to identify"
+        );
         teardown(&dir, ix);
     }
 
@@ -6674,7 +9715,12 @@ mod tests {
             entry("\"Show.S01E01.part2.rar\" yEnc (1/1)", "p@x", "b1", 900),
             entry("\"Show.S01E01.par2\" yEnc (1/1)", "p@x", "c1", 100),
         ];
-        let b2 = vec![entry("\"Show.S01E01.part1.rar\" yEnc (2/2)", "p@x", "a2", 1000)];
+        let b2 = vec![entry(
+            "\"Show.S01E01.part1.rar\" yEnc (2/2)",
+            "p@x",
+            "a2",
+            1000,
+        )];
         assert_eq!(ix.ingest("alt.test", &b1, 1000).unwrap(), 0); // part1 incomplete
         assert_eq!(ix.ingest("alt.test", &b2, 1001).unwrap(), 1); // now complete
 
@@ -6705,7 +9751,8 @@ mod tests {
 
         // High-water marks persist, independently per server (A8:
         // article numbers are per-server, message-ids are not).
-        ix.set_high_water("alt.test", "News.EXAMPLE.com", 42).unwrap();
+        ix.set_high_water("alt.test", "News.EXAMPLE.com", 42)
+            .unwrap();
         assert_eq!(ix.high_water("alt.test", "news.example.com"), 42);
         assert_eq!(ix.high_water("alt.test", "other.example.com"), 0);
         assert_eq!(ix.stats().unwrap(), (1, 1));
@@ -6721,10 +9768,14 @@ mod tests {
 
         // Upsert works with no prior seed, then survives a later seed
         // attempt (INSERT OR IGNORE must not clobber the correction).
-        ix.title_set_identity("m:matrix", "movie", "The Matrix", 1999).unwrap();
+        ix.title_set_identity("m:matrix", "movie", "The Matrix", 1999)
+            .unwrap();
         ix.title_seed("m:matrix", "other", "matrix", 0).unwrap();
         let t = ix.title_get("m:matrix").unwrap().unwrap();
-        assert_eq!((t.kind.as_str(), t.title.as_str(), t.year), ("movie", "The Matrix", 1999));
+        assert_eq!(
+            (t.kind.as_str(), t.title.as_str(), t.year),
+            ("movie", "The Matrix", 1999)
+        );
         assert_eq!(t.checked, 0); // never looked up → pending
 
         // Fill, then re-scrub identity: metadata columns are preserved.
@@ -6744,9 +9795,13 @@ mod tests {
             111,
         )
         .unwrap();
-        ix.title_set_identity("m:matrix", "movie", "The Matrix", 1998).unwrap();
+        ix.title_set_identity("m:matrix", "movie", "The Matrix", 1998)
+            .unwrap();
         let t = ix.title_get("m:matrix").unwrap().unwrap();
-        assert_eq!((t.year, t.tmdb_id, t.overview.as_str()), (1998, 603, "Neo."));
+        assert_eq!(
+            (t.year, t.tmdb_id, t.overview.as_str()),
+            (1998, 603, "Neo.")
+        );
         assert_eq!(t.checked, 111);
         assert_eq!(t.air_date, "1999-03-30");
 
@@ -6764,7 +9819,12 @@ mod tests {
         ix.title_seed("t:show", "tv", "Show", 0).unwrap();
         ix.title_fill(
             "t:show",
-            &TitleFill { tmdb_id: 7, overview: "x", rating: 1.0, ..Default::default() },
+            &TitleFill {
+                tmdb_id: 7,
+                overview: "x",
+                rating: 1.0,
+                ..Default::default()
+            },
             5,
         )
         .unwrap();
@@ -6776,15 +9836,18 @@ mod tests {
         // enriched (which is what happened to music and books).
         ix.title_seed("o:junk", "other", "junk", 0).unwrap();
         ix.title_seed("s:app", "software", "App", 0).unwrap();
-        ix.title_seed("mu:album", "music", "Artist - Album", 0).unwrap();
-        ix.title_seed("bk:book", "book", "Author - Book", 0).unwrap();
+        ix.title_seed("mu:album", "music", "Artist - Album", 0)
+            .unwrap();
+        ix.title_seed("bk:book", "book", "Author - Book", 0)
+            .unwrap();
         // Every one needs a listable release: the backlog lane only
         // considers titles the wall would show, and a titles row with no
         // releases behind it is not a state the indexer ever produces.
-        for (i, key) in
-            ["m:matrix", "t:show", "o:junk", "s:app", "mu:album", "bk:book"]
-                .iter()
-                .enumerate()
+        for (i, key) in [
+            "m:matrix", "t:show", "o:junk", "s:app", "mu:album", "bk:book",
+        ]
+        .iter()
+        .enumerate()
         {
             ix.db
                 .execute(
@@ -6795,7 +9858,11 @@ mod tests {
                 .unwrap();
         }
         let lane = |l: Lane| -> Vec<String> {
-            ix.titles_pending_lane(10, l).unwrap().into_iter().map(|t| t.key).collect()
+            ix.titles_pending_lane(10, l)
+                .unwrap()
+                .into_iter()
+                .map(|t| t.key)
+                .collect()
         };
         assert_eq!(lane(Lane::Movies), ["m:matrix"]);
         let mut media = lane(Lane::MusicBooks);
@@ -6828,7 +9895,11 @@ mod tests {
         // whose only release is junk-gated.
         for (key, stem, junk) in [
             ("m:seen:2024", "Seen.Film.2024.1080p.BluRay.x264-GRP", 0),
-            ("m:hidden:2024", "Hidden.Film.2024.1080p.BluRay.x264-GRP", 70),
+            (
+                "m:hidden:2024",
+                "Hidden.Film.2024.1080p.BluRay.x264-GRP",
+                70,
+            ),
         ] {
             ix.title_seed(key, "movie", "x", 2024).unwrap();
             ix.db
@@ -6855,13 +9926,20 @@ mod tests {
             .into_iter()
             .map(|t| t.key)
             .collect();
-        assert_eq!(hot, ["m:hidden:2024"], "an on-screen card must still enrich");
+        assert_eq!(
+            hot,
+            ["m:hidden:2024"],
+            "an on-screen card must still enrich"
+        );
 
         // Deferred, not dropped: junk is recomputed on every ingest touch
         // and a mid-upload release sheds it as parts arrive, so the title
         // must become eligible the moment it would be listed.
         ix.db
-            .execute("UPDATE releases SET junk=0 WHERE title_key='m:hidden:2024'", [])
+            .execute(
+                "UPDATE releases SET junk=0 WHERE title_key='m:hidden:2024'",
+                [],
+            )
             .unwrap();
         let pending: Vec<String> = ix
             .titles_pending_lane(10, Lane::Movies)
@@ -6884,7 +9962,7 @@ mod tests {
         let db = dir.join("index.db");
         {
             let mut ix = Index::open(&db).unwrap();
-            let mut mk = |subj: &str, id: &str, bytes: u64, date: i64| {
+            let mk = |subj: &str, id: &str, bytes: u64, date: i64| {
                 let mut e = entry(subj, "p@x", id, bytes);
                 e.date = date;
                 e
@@ -6892,9 +9970,24 @@ mod tests {
             ix.ingest(
                 "alt.test",
                 &[
-                    mk("\"Big.Film.2020.2160p.WEB.mkv\" yEnc (1/1)", "m1", 5000, 100),
-                    mk("\"Small.Film.2021.1080p.BluRay.mkv\" yEnc (1/1)", "m2", 1000, 300),
-                    mk("\"Show.S01E01.1080p.WEB.part1.rar\" yEnc (1/2)", "t1", 800, 200),
+                    mk(
+                        "\"Big.Film.2020.2160p.WEB.mkv\" yEnc (1/1)",
+                        "m1",
+                        5000,
+                        100,
+                    ),
+                    mk(
+                        "\"Small.Film.2021.1080p.BluRay.mkv\" yEnc (1/1)",
+                        "m2",
+                        1000,
+                        300,
+                    ),
+                    mk(
+                        "\"Show.S01E01.1080p.WEB.part1.rar\" yEnc (1/2)",
+                        "t1",
+                        800,
+                        200,
+                    ),
                 ],
                 1000,
             )
@@ -6910,18 +10003,28 @@ mod tests {
 
             // Kind + res filters.
             let (movies, total) = ix
-                .browse(&BrowseQuery { kind: Some("movie".into()), ..Default::default() })
+                .browse(&BrowseQuery {
+                    kind: Some("movie".into()),
+                    ..Default::default()
+                })
                 .unwrap();
             assert_eq!((movies.len(), total), (2, 2));
             let (uhd, _) = ix
-                .browse(&BrowseQuery { res: Some("2160p".into()), ..Default::default() })
+                .browse(&BrowseQuery {
+                    res: Some("2160p".into()),
+                    ..Default::default()
+                })
                 .unwrap();
             assert_eq!(uhd.len(), 1);
             assert!(uhd[0].stem.starts_with("Big.Film"));
 
             // complete_only drops the half-uploaded show.
-            let (done, _) =
-                ix.browse(&BrowseQuery { complete_only: true, ..Default::default() }).unwrap();
+            let (done, _) = ix
+                .browse(&BrowseQuery {
+                    complete_only: true,
+                    ..Default::default()
+                })
+                .unwrap();
             assert!(done.iter().all(|r| r.complete));
             assert_eq!(done.len(), 2);
 
@@ -6929,7 +10032,10 @@ mod tests {
             let (by_date, _) = ix.browse(&BrowseQuery::default()).unwrap();
             assert!(by_date[0].stem.starts_with("Small.Film")); // date 300
             let (by_size, _) = ix
-                .browse(&BrowseQuery { sort: BrowseSort::Size, ..Default::default() })
+                .browse(&BrowseQuery {
+                    sort: BrowseSort::Size,
+                    ..Default::default()
+                })
                 .unwrap();
             assert!(by_size[0].stem.starts_with("Big.Film"));
             let (by_comp, _) = ix
@@ -6957,10 +10063,17 @@ mod tests {
 
             // Pagination: limit 1 pages through, total stays 3.
             let (p1, total) = ix
-                .browse(&BrowseQuery { limit: 1, ..Default::default() })
+                .browse(&BrowseQuery {
+                    limit: 1,
+                    ..Default::default()
+                })
                 .unwrap();
             let (p2, _) = ix
-                .browse(&BrowseQuery { limit: 1, offset: 1, ..Default::default() })
+                .browse(&BrowseQuery {
+                    limit: 1,
+                    offset: 1,
+                    ..Default::default()
+                })
                 .unwrap();
             assert_eq!(total, 3);
             assert_ne!(p1[0].id, p2[0].id);
@@ -7009,13 +10122,23 @@ mod tests {
             let mut ix = Index::open(&db).unwrap();
             ix.ingest(
                 "alt.binaries.test",
-                &[entry(&format!("\"{stem}.mkv\" yEnc (1/1)"), "a@a", "g1", 40 << 30)],
+                &[entry(
+                    &format!("\"{stem}.mkv\" yEnc (1/1)"),
+                    "a@a",
+                    "g1",
+                    40 << 30,
+                )],
                 1_000,
             )
             .unwrap();
             let r = &ix.search("", 10).unwrap()[0];
             assert_eq!(
-                (r.res.as_str(), r.vcodec.as_str(), r.acodec.as_str(), r.hdr.as_str()),
+                (
+                    r.res.as_str(),
+                    r.vcodec.as_str(),
+                    r.acodec.as_str(),
+                    r.hdr.as_str()
+                ),
                 ("2160p", "x265", "Atmos", "DV"),
                 "ingest should store what the parser already read"
             );
@@ -7047,7 +10170,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut ix = Index::open(&dir.join("index.db")).unwrap();
-        let mut mk = |subj: &str, id: &str, date: i64| {
+        let mk = |subj: &str, id: &str, date: i64| {
             let mut e = entry(subj, "p@x", id, 900);
             e.date = date;
             e
@@ -7058,21 +10181,37 @@ mod tests {
         ix.ingest(
             "alt.test",
             &[
-                mk("\"Alpha.Movie.2020.1080p.WEB.part1.rar\" yEnc (1/1)", "a1", 900),
-                mk("\"Alpha.Movie.2020.1080p.WEB.part2.rar\" yEnc (1/1)", "a2", 900),
+                mk(
+                    "\"Alpha.Movie.2020.1080p.WEB.part1.rar\" yEnc (1/1)",
+                    "a1",
+                    900,
+                ),
+                mk(
+                    "\"Alpha.Movie.2020.1080p.WEB.part2.rar\" yEnc (1/1)",
+                    "a2",
+                    900,
+                ),
             ],
             1000,
         )
         .unwrap();
         ix.ingest(
             "alt.test",
-            &[mk("\"Beta.Show.S01E01.720p.HDTV.mkv\" yEnc (1/1)", "b1", 500)],
+            &[mk(
+                "\"Beta.Show.S01E01.720p.HDTV.mkv\" yEnc (1/1)",
+                "b1",
+                500,
+            )],
             2000,
         )
         .unwrap();
         ix.ingest(
             "alt.test",
-            &[mk("\"Gamma.Tool.v3.2.x64.Setup.rar\" yEnc (1/1)", "g1", 100)],
+            &[mk(
+                "\"Gamma.Tool.v3.2.x64.Setup.rar\" yEnc (1/1)",
+                "g1",
+                100,
+            )],
             3000,
         )
         .unwrap();
@@ -7080,37 +10219,70 @@ mod tests {
         // Seen desc = most recently INDEXED first (Gamma), even though
         // its post date is the oldest.
         let (by_seen, _) = ix
-            .browse(&BrowseQuery { sort: BrowseSort::Seen, ..Default::default() })
+            .browse(&BrowseQuery {
+                sort: BrowseSort::Seen,
+                ..Default::default()
+            })
             .unwrap();
-        assert!(by_seen[0].stem.starts_with("Gamma."), "{:?}", by_seen[0].stem);
-        assert!(by_seen[2].stem.starts_with("Alpha."), "{:?}", by_seen[2].stem);
+        assert!(
+            by_seen[0].stem.starts_with("Gamma."),
+            "{:?}",
+            by_seen[0].stem
+        );
+        assert!(
+            by_seen[2].stem.starts_with("Alpha."),
+            "{:?}",
+            by_seen[2].stem
+        );
         // ...and posted desc still leads with Alpha (date 900).
         let (by_posted, _) = ix.browse(&BrowseQuery::default()).unwrap();
-        assert!(by_posted[0].stem.starts_with("Alpha."), "{:?}", by_posted[0].stem);
+        assert!(
+            by_posted[0].stem.starts_with("Alpha."),
+            "{:?}",
+            by_posted[0].stem
+        );
 
         // Files desc: the two-part Alpha release carries 2 files.
         let (by_files, _) = ix
-            .browse(&BrowseQuery { sort: BrowseSort::Files, ..Default::default() })
+            .browse(&BrowseQuery {
+                sort: BrowseSort::Files,
+                ..Default::default()
+            })
             .unwrap();
-        assert!(by_files[0].stem.starts_with("Alpha."), "{:?}", by_files[0].stem);
+        assert!(
+            by_files[0].stem.starts_with("Alpha."),
+            "{:?}",
+            by_files[0].stem
+        );
         assert_eq!(by_files[0].files, 2);
 
         // Kind asc groups the category column: movie < software < tv.
         let (by_kind, _) = ix
-            .browse(&BrowseQuery { sort: BrowseSort::Kind, desc: false, ..Default::default() })
+            .browse(&BrowseQuery {
+                sort: BrowseSort::Kind,
+                desc: false,
+                ..Default::default()
+            })
             .unwrap();
         let kinds: Vec<&str> = by_kind.iter().map(|r| r.kind.as_str()).collect();
         assert_eq!(kinds, ["movie", "software", "tv"], "{by_kind:?}");
 
         // browse_cards: no filter = three cards; an exact title_key
         // returns just that card with total agreeing.
-        let (cards, total) =
-            ix.browse_cards(&Default::default(), CardSort::Latest, false, false, None).unwrap();
+        let (cards, total) = ix
+            .browse_cards(&Default::default(), CardSort::Latest, false, false, None)
+            .unwrap();
         assert_eq!((cards.len(), total), (3, 3), "{cards:?}");
-        let alpha = cards.iter().find(|c| c.rep_stem.starts_with("Alpha.")).unwrap();
+        let alpha = cards
+            .iter()
+            .find(|c| c.rep_stem.starts_with("Alpha."))
+            .unwrap();
         let (one, total) = ix
             .browse_cards(
-                &BrowseQuery { title_key: Some(alpha.title_key.clone()), ..Default::default() },
+                &BrowseQuery {
+                    title_key: Some(alpha.title_key.clone()),
+                    ..Default::default()
+                },
                 CardSort::Latest,
                 false,
                 false,
@@ -7150,7 +10322,13 @@ mod tests {
                 )
                 .unwrap();
         };
-        rel(1, "Rep.Filter.2020.1080p.WEB.x264-GOOD", "alt.binaries.good", 0, 100);
+        rel(
+            1,
+            "Rep.Filter.2020.1080p.WEB.x264-GOOD",
+            "alt.binaries.good",
+            0,
+            100,
+        );
         rel(2, "0a1b2c3d4e5f60718293a4b5", "alt.binaries.junk", 90, 900);
 
         let cards = |q: BrowseQuery| -> Card {
@@ -7169,21 +10347,36 @@ mod tests {
 
         // Junk ceiling: the newest release is excluded, so the card must
         // describe itself with the one release the view kept.
-        let clean = cards(BrowseQuery { max_junk: Some(50), ..Default::default() });
+        let clean = cards(BrowseQuery {
+            max_junk: Some(50),
+            ..Default::default()
+        });
         assert_eq!(clean.n_releases, 1);
-        assert_eq!(clean.rep_stem, "Rep.Filter.2020.1080p.WEB.x264-GOOD", "{clean:?}");
+        assert_eq!(
+            clean.rep_stem, "Rep.Filter.2020.1080p.WEB.x264-GOOD",
+            "{clean:?}"
+        );
         assert_eq!(clean.rep_grp, "alt.binaries.good", "{clean:?}");
 
         // Same for a per-release curation rule (hide one group).
         ix.rule_add("group", "alt.binaries.junk", false).unwrap();
-        let curated = cards(BrowseQuery { curated: true, ..Default::default() });
+        let curated = cards(BrowseQuery {
+            curated: true,
+            ..Default::default()
+        });
         assert_eq!(curated.n_releases, 1);
-        assert_eq!(curated.rep_stem, "Rep.Filter.2020.1080p.WEB.x264-GOOD", "{curated:?}");
+        assert_eq!(
+            curated.rep_stem, "Rep.Filter.2020.1080p.WEB.x264-GOOD",
+            "{curated:?}"
+        );
         assert_eq!(curated.rep_grp, "alt.binaries.good", "{curated:?}");
 
         // ...and a row-level filter that excludes the OLDER release still
         // leaves the newest one as the representative.
-        let big = cards(BrowseQuery { newer_than: 500, ..Default::default() });
+        let big = cards(BrowseQuery {
+            newer_than: 500,
+            ..Default::default()
+        });
         assert_eq!(big.n_releases, 1);
         assert_eq!(big.rep_grp, "alt.binaries.junk", "{big:?}");
 
@@ -7200,12 +10393,18 @@ mod tests {
         let (rows, total) = ix.browse(&BrowseQuery::default()).unwrap();
         assert_eq!((rows.len(), total), (2, 2));
         let (rows, total) = ix
-            .browse(&BrowseQuery { max_junk: Some(50), ..Default::default() })
+            .browse(&BrowseQuery {
+                max_junk: Some(50),
+                ..Default::default()
+            })
             .unwrap();
         assert_eq!((rows.len(), total), (1, 1));
         assert_eq!(rows[0].stem, "Rep.Filter.2020.1080p.WEB.x264-GOOD");
         let (rows, _) = ix
-            .browse(&BrowseQuery { curated: true, ..Default::default() })
+            .browse(&BrowseQuery {
+                curated: true,
+                ..Default::default()
+            })
             .unwrap();
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].grp, "alt.binaries.good");
@@ -7234,7 +10433,9 @@ mod tests {
         assert_eq!(ix.search("no date", 10).unwrap()[0].first_posted, 9999);
 
         // Gate: clusters whose stem is refused never reach the DB.
-        ix.set_gate(Box::new(|stem| !stem.to_ascii_lowercase().contains("blocked")));
+        ix.set_gate(Box::new(|stem| {
+            !stem.to_ascii_lowercase().contains("blocked")
+        }));
         let g = entry("\"Blocked.Thing.2020.mkv\" yEnc (1/1)", "p@x", "g1", 500);
         ix.ingest("alt.test", &[g], 9999).unwrap();
         assert_eq!(ix.search("blocked", 10).unwrap().len(), 0);
@@ -7304,8 +10505,8 @@ mod tests {
     }
 
     fn ev_open(tag: &str) -> (std::path::PathBuf, Index) {
-        let dir = std::env::temp_dir()
-            .join(format!("nzbfast-index-ev-{tag}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("nzbfast-index-ev-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let ix = Index::open(&dir.join("index.db")).unwrap();
@@ -7313,7 +10514,10 @@ mod tests {
     }
 
     fn ev_ids(ix: &Index) -> Vec<i64> {
-        let mut stmt = ix.db.prepare("SELECT id FROM releases ORDER BY id").unwrap();
+        let mut stmt = ix
+            .db
+            .prepare("SELECT id FROM releases ORDER BY id")
+            .unwrap();
         let v: Vec<i64> = stmt
             .query_map([], |r| r.get(0))
             .unwrap()
@@ -7396,13 +10600,19 @@ mod tests {
             let (dir, ix) = ev_open(&format!("ord{order:?}"));
             ev_eight(&ix);
             let target = ev_target(&ix);
-            let policy = EvictPolicy { order, kinds: vec![] };
+            let policy = EvictPolicy {
+                order,
+                kinds: vec![],
+            };
             let rep = ix.evict_to(target, &policy, &Protected::default()).unwrap();
             let left = ev_ids(&ix);
             assert!(rep.removed > 0, "{order:?} must evict something");
             assert!(!left.is_empty(), "{order:?} must not empty the index");
             assert_eq!(rep.removed, 8 - left.len(), "{order:?} removed count");
-            assert!(rep.needs_compact, "{order:?} deleted rows, so compact is due");
+            assert!(
+                rep.needs_compact,
+                "{order:?} deleted rows, so compact is due"
+            );
             assert_prefix_evicted(&expected, &left);
             teardown(&dir, ix);
         }
@@ -7485,15 +10695,48 @@ mod tests {
         assert!(first.removed > 0);
         let after_first = ev_ids(&ix);
 
-        // Same cap, immediately again: the low-water mark left headroom,
-        // so there is nothing to do. Without hysteresis this call would
-        // shave another row off at the boundary on every single pass.
+        // The headroom the low-water mark bought, stated the way the
+        // DAEMON reads it: `evict_pass` acts only when live_bytes is over
+        // the cap, so landing anywhere inside the band means the next
+        // scan pass does nothing at all. This is the anti-thrash promise.
+        let live_after_first = ix.live_bytes().unwrap();
+        assert!(
+            live_after_first <= target,
+            "first call left {live_after_first} over the cap {target}, so every \
+             scan pass would evict again - the grind hysteresis exists to stop"
+        );
+
+        // Calling evict_to again at the same target is a stricter probe
+        // than the daemon ever makes, and it is NOT promised to be a
+        // no-op: the loop exits on `min(measured, predicted)`, so a
+        // prediction that under-shot by less than one row leaves the file
+        // a few bytes above the low-water mark and a second call shaves
+        // that one row. What must hold is that it CONVERGES rather than
+        // walking the file down a row per call.
+        //
+        // This used to be asserted as `second.removed == 0`, which passed
+        // on page-boundary luck: measured on this fixture, the first call
+        // landed 1228 bytes UNDER the mark before §95 gave the database a
+        // pointer-map page, and 103 bytes OVER it after - a 1.3 KB swing
+        // on a 540 KB fixture, decided entirely by 4 KB page granularity
+        // and never by hysteresis.
         let second = ix
             .evict_to(target, &EvictPolicy::default(), &Protected::default())
             .unwrap();
-        assert_eq!(second.removed, 0, "hysteresis: no boundary thrash");
-        assert!(!second.needs_compact);
-        assert_eq!(ev_ids(&ix), after_first);
+        assert!(
+            second.removed <= 1,
+            "a second call at the same target took {} rows - that is a grind, \
+             not a boundary rounding",
+            second.removed
+        );
+        let third = ix
+            .evict_to(target, &EvictPolicy::default(), &Protected::default())
+            .unwrap();
+        assert_eq!(third.removed, 0, "hysteresis: no boundary thrash");
+        assert!(!third.needs_compact);
+        if second.removed == 0 {
+            assert_eq!(ev_ids(&ix), after_first);
+        }
 
         // And the file really is under the cap (not merely under the
         // low-water estimate) once the freed pages are given back.
@@ -7510,20 +10753,47 @@ mod tests {
     fn evict_kinds_filter_restricts_to_listed_kinds() {
         let (dir, ix) = ev_open("kinds");
         for i in 1..=4i64 {
-            ev_rel(&ix, i, 0, 1, 1000 * i, 100, "tv", &format!("t:s{i}"), EV_BLOB);
+            ev_rel(
+                &ix,
+                i,
+                0,
+                1,
+                1000 * i,
+                100,
+                "tv",
+                &format!("t:s{i}"),
+                EV_BLOB,
+            );
         }
         for i in 5..=8i64 {
-            ev_rel(&ix, i, 0, 1, 1000 * i, 100, "movie", &format!("m:f{i}"), EV_BLOB);
+            ev_rel(
+                &ix,
+                i,
+                0,
+                1,
+                1000 * i,
+                100,
+                "movie",
+                &format!("m:f{i}"),
+                EV_BLOB,
+            );
         }
         // A legacy row that never got classified. It matches no filter, so
         // a kind-restricted eviction must leave it alone.
         ev_rel(&ix, 9, 90, 0, 10, 100, "", "", EV_BLOB);
 
         // Impossible cap, but only "tv" may be touched.
-        let policy = EvictPolicy { order: EvictOrder::Oldest, kinds: vec!["tv".into()] };
+        let policy = EvictPolicy {
+            order: EvictOrder::Oldest,
+            kinds: vec!["tv".into()],
+        };
         let rep = ix.evict_to(1, &policy, &Protected::default()).unwrap();
         assert_eq!(rep.removed, 4);
-        assert_eq!(ev_ids(&ix), vec![5, 6, 7, 8, 9], "only tv rows were eligible");
+        assert_eq!(
+            ev_ids(&ix),
+            vec![5, 6, 7, 8, 9],
+            "only tv rows were eligible"
+        );
         teardown(&dir, ix);
     }
 
@@ -7540,10 +10810,16 @@ mod tests {
         ids.extend([1i64, 2, 3, 4, 5, 6, 7, 8]);
         let mut keys: Vec<String> = (0..30_000).map(|i| format!("m:filler {i}:1999")).collect();
         keys.push("m:fixture 1:2020".into());
-        let prot = Protected { title_keys: keys, release_ids: ids };
+        let prot = Protected {
+            title_keys: keys,
+            release_ids: ids,
+        };
 
         let rep = ix.evict_to(1, &EvictPolicy::default(), &prot).unwrap();
-        assert_eq!(rep.removed, 0, "nothing may be deleted when all is protected");
+        assert_eq!(
+            rep.removed, 0,
+            "nothing may be deleted when all is protected"
+        );
         assert!(!rep.needs_compact);
         assert_eq!(ev_ids(&ix), vec![1, 2, 3, 4, 5, 6, 7, 8]);
 
@@ -7578,7 +10854,10 @@ mod tests {
         let rep = ix
             .evict_to(
                 db_before / 2,
-                &EvictPolicy { order: EvictOrder::Oldest, kinds: vec![] },
+                &EvictPolicy {
+                    order: EvictOrder::Oldest,
+                    kinds: vec![],
+                },
                 &Protected::default(),
             )
             .unwrap();
@@ -7596,7 +10875,10 @@ mod tests {
         );
         assert_eq!(rep.live_before, live_before);
         assert_eq!(rep.live_after, ix.live_bytes().unwrap());
-        assert!(rep.live_after < rep.bytes_after, "the gap a compact would reclaim");
+        assert!(
+            rep.live_after < rep.bytes_after,
+            "the gap a compact would reclaim"
+        );
         teardown(&dir, ix);
     }
 
@@ -7610,10 +10892,14 @@ mod tests {
         // Everything protected, impossible target: stopped short.
         let all: Vec<i64> = (1..=8).collect();
         let rep = ix
-            .evict_to(1, &EvictPolicy::default(), &Protected {
-                title_keys: vec![],
-                release_ids: all,
-            })
+            .evict_to(
+                1,
+                &EvictPolicy::default(),
+                &Protected {
+                    title_keys: vec![],
+                    release_ids: all,
+                },
+            )
             .unwrap();
         assert_eq!(rep.removed, 0);
         assert!(rep.blocked, "every candidate was protected: {rep:?}");
@@ -7622,12 +10908,19 @@ mod tests {
         // Nothing protected, generous target already met: done, not
         // stopped - even though `removed` is 0 here too.
         let big = ix.live_bytes().unwrap() * 4;
-        let rep = ix.evict_to(big, &EvictPolicy::default(), &Protected::default()).unwrap();
+        let rep = ix
+            .evict_to(big, &EvictPolicy::default(), &Protected::default())
+            .unwrap();
         assert_eq!(rep.removed, 0);
-        assert!(!rep.blocked, "already under the target is not blocked: {rep:?}");
+        assert!(
+            !rep.blocked,
+            "already under the target is not blocked: {rep:?}"
+        );
 
         // Unlimited is never blocked either.
-        let rep = ix.evict_to(0, &EvictPolicy::default(), &Protected::default()).unwrap();
+        let rep = ix
+            .evict_to(0, &EvictPolicy::default(), &Protected::default())
+            .unwrap();
         assert!(!rep.blocked);
         assert_eq!(rep.live_before, rep.live_after);
         teardown(&dir, ix);
@@ -7648,7 +10941,17 @@ mod tests {
                 2 => 64 * 1024,
                 _ => 16 * 1024,
             };
-            ev_rel(ix, i, 0, 1, 1000 * i, 100, "movie", &format!("m:e{i}:2020"), blob);
+            ev_rel(
+                ix,
+                i,
+                0,
+                1,
+                1000 * i,
+                100,
+                "movie",
+                &format!("m:e{i}:2020"),
+                blob,
+            );
         }
     }
 
@@ -7667,7 +10970,10 @@ mod tests {
         ix.compact().unwrap();
         let before = ix.db_bytes().unwrap();
         let target = before / 2;
-        let policy = EvictPolicy { order: EvictOrder::Oldest, kinds: vec![] };
+        let policy = EvictPolicy {
+            order: EvictOrder::Oldest,
+            kinds: vec![],
+        };
         let rep = ix.evict_to(target, &policy, &Protected::default()).unwrap();
         assert!(
             rep.removed > EVICT_PAGE,
@@ -7697,7 +11003,14 @@ mod tests {
         let before = ix.db_bytes().unwrap();
         let target = before / 2;
         let rep = ix
-            .evict_to(target, &EvictPolicy { order: EvictOrder::Oldest, kinds: vec![] }, &Protected::default())
+            .evict_to(
+                target,
+                &EvictPolicy {
+                    order: EvictOrder::Oldest,
+                    kinds: vec![],
+                },
+                &Protected::default(),
+            )
             .unwrap();
         assert!(rep.removed > 0);
         assert_eq!(
@@ -7773,7 +11086,10 @@ mod tests {
         .unwrap();
         // The category's kind filter finds exactly its releases.
         let (f1, total) = ix
-            .browse(&BrowseQuery { kind: Some("formula-1".into()), ..Default::default() })
+            .browse(&BrowseQuery {
+                kind: Some("formula-1".into()),
+                ..Default::default()
+            })
             .unwrap();
         assert_eq!(total, 2, "{f1:?}");
         assert!(f1.iter().all(|r| r.kind == "formula-1"), "{f1:?}");
@@ -7784,19 +11100,26 @@ mod tests {
             .unwrap()
             .iter()
             .map(|r| {
-                ix.db.query_row(
-                    "SELECT title_key FROM releases WHERE id=?1",
-                    [r.id],
-                    |row| row.get(0),
-                )
-                .unwrap()
+                ix.db
+                    .query_row(
+                        "SELECT title_key FROM releases WHERE id=?1",
+                        [r.id],
+                        |row| row.get(0),
+                    )
+                    .unwrap()
             })
             .collect();
         assert_eq!(keys.len(), 2, "{keys:?}");
-        assert!(keys.iter().all(|k| k.starts_with("c:formula-1:")), "{keys:?}");
+        assert!(
+            keys.iter().all(|k| k.starts_with("c:formula-1:")),
+            "{keys:?}"
+        );
         let (cards, _) = ix
             .browse_cards(
-                &BrowseQuery { kind: Some("formula-1".into()), ..Default::default() },
+                &BrowseQuery {
+                    kind: Some("formula-1".into()),
+                    ..Default::default()
+                },
                 CardSort::Latest,
                 false,
                 false,
@@ -7806,7 +11129,10 @@ mod tests {
         assert_eq!(cards.len(), 2, "{cards:?}");
         assert!(cards.iter().all(|c| c.kind == "formula-1"));
         let (movie, _) = ix
-            .browse(&BrowseQuery { kind: Some("movie".into()), ..Default::default() })
+            .browse(&BrowseQuery {
+                kind: Some("movie".into()),
+                ..Default::default()
+            })
             .unwrap();
         assert_eq!(movie.len(), 1);
         assert_eq!(movie[0].kind, "movie");
@@ -7842,7 +11168,10 @@ mod tests {
         )
         .unwrap();
         let (rows, _) = ix
-            .browse(&BrowseQuery { kind: Some("movie".into()), ..Default::default() })
+            .browse(&BrowseQuery {
+                kind: Some("movie".into()),
+                ..Default::default()
+            })
             .unwrap();
         assert_eq!(rows.len(), 2);
         // Define the category and reconcile.
@@ -7851,14 +11180,20 @@ mod tests {
         // Same config again: fingerprint no-op.
         assert_eq!(ix.reclassify_custom().unwrap(), 0);
         let (rows, _) = ix
-            .browse(&BrowseQuery { kind: Some("formula-1".into()), ..Default::default() })
+            .browse(&BrowseQuery {
+                kind: Some("formula-1".into()),
+                ..Default::default()
+            })
             .unwrap();
         assert_eq!(rows.len(), 2);
         // Delete the category: rows return to the built-in classifier.
         ix.set_custom(Vec::new());
         assert_eq!(ix.reclassify_custom().unwrap(), 2);
         let (rows, _) = ix
-            .browse(&BrowseQuery { kind: Some("movie".into()), ..Default::default() })
+            .browse(&BrowseQuery {
+                kind: Some("movie".into()),
+                ..Default::default()
+            })
             .unwrap();
         assert_eq!(rows.len(), 2);
         teardown(&dir, ix);
@@ -7902,11 +11237,16 @@ mod tests {
             // An install whose backfill has not run yet - either it never
             // did, or the key was bumped to pick up a new column.
             ix.db
-                .execute("DELETE FROM kv WHERE k IN ('quality_v8','quality_v8_cursor')", [])
+                .execute(
+                    "DELETE FROM kv WHERE k IN ('quality_v8','quality_v8_cursor')",
+                    [],
+                )
                 .unwrap();
             // ...and blank a built-in row's resolution, so the pass has
             // something to prove it still does its job.
-            ix.db.execute("UPDATE releases SET res='' WHERE kind='movie'", []).unwrap();
+            ix.db
+                .execute("UPDATE releases SET res='' WHERE kind='movie'", [])
+                .unwrap();
         }
 
         // The next open runs the pass with no categories installed, which
@@ -7944,7 +11284,9 @@ mod tests {
         // ...and the pass still backfilled the built-in row it is for.
         let res: String = ix
             .db
-            .query_row("SELECT res FROM releases WHERE kind='movie'", [], |r| r.get(0))
+            .query_row("SELECT res FROM releases WHERE kind='movie'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(res, "1080p", "the backfill must still fill built-in rows");
 
@@ -7992,7 +11334,9 @@ mod tests {
             ix.reclassify_custom().is_err(),
             "the interrupted pass must report the failure, not swallow it"
         );
-        ix.db.execute_batch("DROP TRIGGER kv_lose_the_cursor").unwrap();
+        ix.db
+            .execute_batch("DROP TRIGGER kv_lose_the_cursor")
+            .unwrap();
 
         // The machine is back. The category config is still new to this
         // index, so its rows must still be reclassified.
@@ -8003,7 +11347,10 @@ mod tests {
              reclassified these rows"
         );
         let (rows, _) = ix
-            .browse(&BrowseQuery { kind: Some("formula-1".into()), ..Default::default() })
+            .browse(&BrowseQuery {
+                kind: Some("formula-1".into()),
+                ..Default::default()
+            })
             .unwrap();
         assert_eq!(rows.len(), 2);
         teardown(&dir, ix);
@@ -8039,23 +11386,24 @@ mod obfuscated_posts_are_unindexable {
         // What the nzb claims: parses fine, which is why this looked
         // indexable right up until the article itself was read.
         let claimed = "\"30fb7ada0c0b15e12135927afe355933.10\" yEnc (1/260)";
-        let (base, part, total) = super::split_subject(claimed)
-            .unwrap_or_else(|| (claimed.to_string(), 1, 1));
+        let (base, part, total) =
+            super::split_subject(claimed).unwrap_or_else(|| (claimed.to_string(), 1, 1));
         assert!(part != 0 && total != 0);
-        assert!(super::quoted_name(&base).is_some(), "the nzb's version is parseable");
+        assert!(
+            super::quoted_name(&base).is_some(),
+            "the nzb's version is parseable"
+        );
 
         // What is actually on the wire. ingest() requires a quoted filename
         // and skips the entry without one, so this can never become a row -
         // no filename, no part marker, nothing to key a release on.
         let real = "ZvbiaQJJpLvLZpY";
-        let (rbase, _, _) =
-            super::split_subject(real).unwrap_or_else(|| (real.to_string(), 1, 1));
+        let (rbase, _, _) = super::split_subject(real).unwrap_or_else(|| (real.to_string(), 1, 1));
         assert!(
             super::quoted_name(&rbase).is_none(),
             "the real subject has no quoted filename, so ingest skips it"
         );
     }
-
 }
 
 #[cfg(test)]
@@ -8106,9 +11454,13 @@ mod multi_server_indexing {
         assert_eq!(ix.high_water("spots:free.pt", "news.first.example"), 77);
         // Adoption never clobbers what the server has since written: a
         // straggling legacy row for an already-claimed group is dropped.
-        ix.set_high_water("alt.old", "news.first.example", 900).unwrap();
+        ix.set_high_water("alt.old", "news.first.example", 900)
+            .unwrap();
         ix.db
-            .execute("INSERT INTO marks(grp, server, high, low) VALUES('alt.old', '', 1, 1)", [])
+            .execute(
+                "INSERT INTO marks(grp, server, high, low) VALUES('alt.old', '', 1, 1)",
+                [],
+            )
             .unwrap();
         ix.adopt_legacy_marks("news.first.example").unwrap();
         assert_eq!(ix.high_water("alt.old", "news.first.example"), 900);
@@ -8139,8 +11491,18 @@ mod multi_server_indexing {
         let grp = "alt.binaries.teevee";
         // Server A saw parts 1 and 2 of 3 (a propagation hole ate #3).
         let a = [
-            entry(r#""Show.S01E02.720p-GRP.mkv" yEnc (1/3)"#, "p@x", "s1e2.p1", 700_000),
-            entry(r#""Show.S01E02.720p-GRP.mkv" yEnc (2/3)"#, "p@x", "s1e2.p2", 700_000),
+            entry(
+                r#""Show.S01E02.720p-GRP.mkv" yEnc (1/3)"#,
+                "p@x",
+                "s1e2.p1",
+                700_000,
+            ),
+            entry(
+                r#""Show.S01E02.720p-GRP.mkv" yEnc (2/3)"#,
+                "p@x",
+                "s1e2.p2",
+                700_000,
+            ),
         ];
         ix.ingest(grp, &a, 1_000).unwrap();
         let (r, _) = ix.browse(&BrowseQuery::default()).unwrap();
@@ -8149,8 +11511,18 @@ mod multi_server_indexing {
         // Server B carries parts 2 and 3 - same message-ids for the
         // overlap, which must merge rather than duplicate.
         let b = [
-            entry(r#""Show.S01E02.720p-GRP.mkv" yEnc (2/3)"#, "p@x", "s1e2.p2", 700_000),
-            entry(r#""Show.S01E02.720p-GRP.mkv" yEnc (3/3)"#, "p@x", "s1e2.p3", 700_000),
+            entry(
+                r#""Show.S01E02.720p-GRP.mkv" yEnc (2/3)"#,
+                "p@x",
+                "s1e2.p2",
+                700_000,
+            ),
+            entry(
+                r#""Show.S01E02.720p-GRP.mkv" yEnc (3/3)"#,
+                "p@x",
+                "s1e2.p3",
+                700_000,
+            ),
         ];
         let flipped = ix.ingest(grp, &b, 1_000).unwrap();
         assert_eq!(flipped, 1, "the merge is what completes the release");
@@ -8179,32 +11551,1597 @@ mod multi_server_indexing {
         let now = 1_000_000i64;
         let old = now - 100_000;
         // Eligible: incomplete, seen long ago.
-        ix.ingest(grp, &[entry(r#""Old.Show.S01E01.720p-GRP.mkv" yEnc (1/2)"#, "p@x", "old.p1", 300_000_000)], old)
-            .unwrap();
+        ix.ingest(
+            grp,
+            &[entry(
+                r#""Old.Show.S01E01.720p-GRP.mkv" yEnc (1/2)"#,
+                "p@x",
+                "old.p1",
+                300_000_000,
+            )],
+            old,
+        )
+        .unwrap();
         // Complete: nothing to hunt.
-        ix.ingest(grp, &[entry(r#""Done.Show.S01E01.720p-GRP.mkv" yEnc (1/1)"#, "p@x", "done.p1", 300_000_000)], old)
-            .unwrap();
+        ix.ingest(
+            grp,
+            &[entry(
+                r#""Done.Show.S01E01.720p-GRP.mkv" yEnc (1/1)"#,
+                "p@x",
+                "done.p1",
+                300_000_000,
+            )],
+            old,
+        )
+        .unwrap();
         // Too fresh: parts are usually still propagating.
-        ix.ingest(grp, &[entry(r#""New.Show.S01E01.720p-GRP.mkv" yEnc (1/2)"#, "p@x", "new.p1", 300_000_000)], now - 60)
-            .unwrap();
+        ix.ingest(
+            grp,
+            &[entry(
+                r#""New.Show.S01E01.720p-GRP.mkv" yEnc (1/2)"#,
+                "p@x",
+                "new.p1",
+                300_000_000,
+            )],
+            now - 60,
+        )
+        .unwrap();
         // Junk-hidden: must not eat the budget.
-        ix.ingest(grp, &[entry(r#""Junky.Show.S01E01.720p-GRP.mkv" yEnc (1/2)"#, "p@x", "junk.p1", 300_000_000)], old)
-            .unwrap();
+        ix.ingest(
+            grp,
+            &[entry(
+                r#""Junky.Show.S01E01.720p-GRP.mkv" yEnc (1/2)"#,
+                "p@x",
+                "junk.p1",
+                300_000_000,
+            )],
+            old,
+        )
+        .unwrap();
         ix.db
             .execute("UPDATE releases SET junk=90 WHERE stem LIKE 'Junky%'", [])
             .unwrap();
         let picks = ix.gapfill_pick(10, now).unwrap();
-        assert_eq!(picks.len(), 1, "only the settled incomplete release qualifies");
+        assert_eq!(
+            picks.len(),
+            1,
+            "only the settled incomplete release qualifies"
+        );
         let (id, g, posted) = &picks[0];
         assert_eq!(g, grp);
         assert_eq!(*posted, old);
-        assert!(!ix.is_complete(*id) );
+        assert!(!ix.is_complete(*id));
         // The stamp rotates: a marked release yields to unmarked ones.
-        ix.ingest(grp, &[entry(r#""Also.Old.S01E01.720p-GRP.mkv" yEnc (1/2)"#, "p@x", "also.p1", 300_000_000)], old)
-            .unwrap();
+        ix.ingest(
+            grp,
+            &[entry(
+                r#""Also.Old.S01E01.720p-GRP.mkv" yEnc (1/2)"#,
+                "p@x",
+                "also.p1",
+                300_000_000,
+            )],
+            old,
+        )
+        .unwrap();
         ix.gapfill_mark(*id, now).unwrap();
         let picks2 = ix.gapfill_pick(1, now).unwrap();
         assert_eq!(picks2.len(), 1);
         assert_ne!(picks2[0].0, *id, "the stamped release rotates to the back");
         teardown(&dir, ix);
-    }}
+    }
+}
+
+#[cfg(test)]
+mod predb_tests {
+    use super::tests::teardown;
+    use super::*;
+    use crate::predb::{PreKind, PreLine};
+
+    fn dir(tag: &str) -> std::path::PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("nzbfast-index-predb-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn over(subject: &str, from: &str, id: &str, bytes: u64) -> OverEntry {
+        OverEntry {
+            number: 0,
+            subject: subject.into(),
+            from: from.into(),
+            message_id: format!("<{id}>"),
+            bytes,
+            date: 0,
+        }
+    }
+
+    fn pre(title: &str, filename: &str) -> PreLine {
+        PreLine {
+            kind: PreKind::New,
+            title: title.into(),
+            filename: filename.into(),
+            source: "PRE".into(),
+            ..Default::default()
+        }
+    }
+
+    /// §74 hook A: an installed arrival watch hears about the releases
+    /// it asked for as they are ingested, complete or not, and about
+    /// nothing else.
+    #[test]
+    fn the_arrival_watch_reports_the_names_it_was_given() {
+        let d = dir("watch-ingest");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        ix.set_watch_names(Some(Box::new(|n: &str| n.contains("Wanted"))));
+        ix.ingest(
+            "alt.binaries.teevee",
+            &[
+                over(
+                    r#""Wanted.Show.S01E01.1080p.WEB-GRP.rar" yEnc (1/1)"#,
+                    "p@x",
+                    "a1",
+                    100,
+                ),
+                over(
+                    r#""Other.Show.S01E01.1080p.WEB-GRP.rar" yEnc (1/1)"#,
+                    "p@x",
+                    "b1",
+                    100,
+                ),
+                // Two parts, one seen: still going up, so still incomplete.
+                over(
+                    r#""Wanted.Show.S01E02.1080p.WEB-GRP.rar" yEnc (1/2)"#,
+                    "p@x",
+                    "c1",
+                    100,
+                ),
+            ],
+            1000,
+        )
+        .unwrap();
+        let (hits, dropped) = ix.take_watch_hits();
+        assert_eq!(dropped, 0);
+        let mut got: Vec<(String, bool)> = hits.into_iter().map(|h| (h.name, h.complete)).collect();
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                ("Wanted.Show.S01E01.1080p.WEB-GRP".to_string(), true),
+                ("Wanted.Show.S01E02.1080p.WEB-GRP".to_string(), false),
+            ],
+            "the watch must see its own names and only those, \
+             with completeness as the index computed it"
+        );
+        // Draining empties it: a second ingest of nothing interesting
+        // must not re-announce the first batch.
+        assert!(ix.take_watch_hits().0.is_empty());
+        // Clearing the watch stops the journalling outright.
+        ix.set_watch_names(None);
+        ix.ingest(
+            "alt.binaries.teevee",
+            &[over(
+                r#""Wanted.Show.S01E03.1080p.WEB-GRP.rar" yEnc (1/1)"#,
+                "p@x",
+                "d1",
+                100,
+            )],
+            1000,
+        )
+        .unwrap();
+        assert!(ix.take_watch_hits().0.is_empty());
+        teardown(&d, ix);
+    }
+
+    /// §74 hook B: a release that GAINS a name is an arrival for anything
+    /// matching on names - until that moment it was an obfuscated stem no
+    /// watchlist entry could match. The ingest that stored it under the
+    /// stem says nothing; the naming leg does.
+    #[test]
+    fn naming_an_obfuscated_release_is_itself_an_arrival() {
+        let d = dir("watch-named");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        ix.set_watch_names(Some(Box::new(|n: &str| n.contains("Wanted"))));
+        ix.ingest(
+            "alt.binaries.boneless",
+            &[over(
+                r#""hH3jK9lM1nP5qR7s.part01.rar" yEnc (1/1)"#,
+                "p@x",
+                "n1",
+                4 << 30,
+            )],
+            1000,
+        )
+        .unwrap();
+        assert!(
+            ix.take_watch_hits().0.is_empty(),
+            "an obfuscated stem matches nothing, and must not be announced"
+        );
+        // The relay names it. Reopened first, because the naming lookup
+        // is gated on a flag read at open.
+        ix.predb_store(
+            &[pre("Wanted.Show.S01E01.1080p.WEB-GRP", "zzz.part01.rar")],
+            1000,
+        )
+        .unwrap();
+        let mut ix = {
+            drop(ix);
+            let mut re = Index::open(&d.join("index.db")).unwrap();
+            re.set_watch_names(Some(Box::new(|n: &str| n.contains("Wanted"))));
+            re
+        };
+        let rid: i64 = ix.search("", 10).unwrap()[0].id;
+        assert!(ix.pre_assign(rid, 1, 2000).unwrap());
+        let (hits, _) = ix.take_watch_hits();
+        assert_eq!(
+            hits,
+            [WatchHit {
+                id: rid,
+                name: "Wanted.Show.S01E01.1080p.WEB-GRP".into(),
+                complete: true,
+            }]
+        );
+        teardown(&d, ix);
+    }
+
+    /// The headline case: a fully obfuscated post is indexed as a random
+    /// stem, the relay names it, and the release comes out carrying the
+    /// real title everywhere the wall and the *arr feed read.
+    #[test]
+    fn an_obfuscated_post_gets_named_at_ingest() {
+        let d = dir("ingest");
+        let path = d.join("index.db");
+        {
+            let mut ix = Index::open(&path).unwrap();
+            // The pre line lands FIRST: the relay usually beats the
+            // header scan, which is what makes ingest-time naming the
+            // main path rather than a special case.
+            ix.predb_store(
+                &[pre(
+                    "Some.Film.2026.1080p.WEB-DL.x264-GRP",
+                    "p5cbKvaDJ1Y0PW6DvKCIfztzZ.part01.rar",
+                )],
+                1000,
+            )
+            .unwrap();
+        }
+        // Re-open: `predb` is sampled at open, so this is also the check
+        // that a daemon picks the feed up on its next handle.
+        let mut ix = Index::open(&path).unwrap();
+        ix.ingest(
+            "alt.binaries.boneless",
+            &[
+                over(
+                    r#""p5cbKvaDJ1Y0PW6DvKCIfztzZ.part01.rar" yEnc (1/1)"#,
+                    "poster@x",
+                    "o1",
+                    4 << 30,
+                ),
+                over(
+                    r#""p5cbKvaDJ1Y0PW6DvKCIfztzZ.part02.rar" yEnc (1/1)"#,
+                    "poster@x",
+                    "o2",
+                    4 << 30,
+                ),
+            ],
+            2000,
+        )
+        .unwrap();
+
+        let rows = ix.search("", 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        // The posted identity is kept - it is half the ingest key, and
+        // the evidence that the two names are different things.
+        assert_eq!(r.stem, "p5cbKvaDJ1Y0PW6DvKCIfztzZ");
+        assert_eq!(r.pre_title, "Some.Film.2026.1080p.WEB-DL.x264-GRP");
+        assert_eq!(r.pre_source, "predb/PRE", "the claim is attributed");
+        assert_eq!(r.display_name(), "Some.Film.2026.1080p.WEB-DL.x264-GRP");
+        // Everything the name determines is re-derived from the REAL
+        // name, not the stem it was posted under.
+        assert_eq!(r.kind, "movie");
+        assert_eq!(r.res, "1080p");
+        let (junk, key): (i64, String) = ix
+            .db
+            .query_row(
+                "SELECT junk, title_key FROM releases WHERE id=?1",
+                [r.id],
+                |x| Ok((x.get(0)?, x.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            junk < 50,
+            "a named release is no longer wall junk (junk={junk})"
+        );
+        assert!(
+            key.starts_with("m:some film"),
+            "landed on a real card: {key}"
+        );
+        // And it is findable by the name a person would actually type.
+        assert_eq!(ix.search("Some Film 2026", 10).unwrap().len(), 1);
+        teardown(&d, ix);
+    }
+
+    /// The other order: the post is indexed first and the relay only
+    /// announces it later. The sweep has to find it after the fact.
+    #[test]
+    fn a_late_announcement_names_an_already_indexed_release() {
+        let d = dir("sweep");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        ix.ingest(
+            "alt.binaries.boneless",
+            &[over(
+                r#""aB9zQ1mK7pR3tX5w.part01.rar" yEnc (1/1)"#,
+                "p@x",
+                "s1",
+                4 << 30,
+            )],
+            1000,
+        )
+        .unwrap();
+        assert_eq!(ix.search("", 10).unwrap()[0].pre_title, "");
+
+        ix.predb_store(
+            &[pre(
+                "Late.Show.S01E01.1080p.WEB-GRP",
+                "aB9zQ1mK7pR3tX5w.part01.rar",
+            )],
+            2000,
+        )
+        .unwrap();
+        let (tried, named) = ix.predb_sweep(50, 2000).unwrap();
+        assert_eq!((tried, named), (1, 1));
+
+        let r = &ix.search("", 10).unwrap()[0];
+        assert_eq!(r.pre_title, "Late.Show.S01E01.1080p.WEB-GRP");
+        assert_eq!(r.kind, "tv");
+        // A second sweep must not re-count it - the row is already named.
+        assert_eq!(ix.predb_sweep(50, 3000).unwrap().1, 0);
+        // ... and the retry floor keeps a just-swept row out of the very
+        // next tick, so a quiet feed is not re-asking the same questions
+        // three times a minute.
+        assert_eq!(ix.predb_sweep(50, 2100).unwrap(), (0, 0));
+
+        // Once the retry window closes on a row whose post never
+        // appeared, it retires: the sweep's range scan must not reach it
+        // again however long the daemon runs.
+        ix.predb_store(
+            &[pre("Never.Posted-GRP", "neverPostedStem123.part01.rar")],
+            2000,
+        )
+        .unwrap();
+        // Both rows are now past their retry window, so this sweep is
+        // the last one either of them gets.
+        let long_after = 2000 + 30 * 86_400;
+        assert_eq!(
+            ix.predb_sweep(50, long_after).unwrap().0,
+            2,
+            "swept once more"
+        );
+        assert_eq!(
+            ix.predb_sweep(50, long_after + 30 * 86_400).unwrap().0,
+            0,
+            "and never again"
+        );
+        teardown(&d, ix);
+    }
+
+    /// A re-ingest of the same articles (every later batch touching the
+    /// release) must not blank a name the sweep already applied.
+    #[test]
+    fn re_ingest_does_not_un_name_a_release() {
+        let d = dir("reingest");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        let art = over(
+            r#""kQ8vN2xL4hT6yW1e.part01.rar" yEnc (1/2)"#,
+            "p@x",
+            "r1",
+            4 << 30,
+        );
+        ix.ingest("alt.binaries.boneless", std::slice::from_ref(&art), 1000)
+            .unwrap();
+        ix.predb_store(
+            &[pre(
+                "Kept.Name.2026.1080p-GRP",
+                "kQ8vN2xL4hT6yW1e.part01.rar",
+            )],
+            1000,
+        )
+        .unwrap();
+        ix.predb_sweep(50, 1000).unwrap();
+        assert_eq!(
+            ix.search("", 10).unwrap()[0].pre_title,
+            "Kept.Name.2026.1080p-GRP"
+        );
+
+        // The second part of the same file arrives on a later batch.
+        ix.ingest(
+            "alt.binaries.boneless",
+            &[over(
+                r#""kQ8vN2xL4hT6yW1e.part01.rar" yEnc (2/2)"#,
+                "p@x",
+                "r2",
+                4 << 30,
+            )],
+            2000,
+        )
+        .unwrap();
+        let r = &ix.search("", 10).unwrap()[0];
+        assert_eq!(
+            r.pre_title, "Kept.Name.2026.1080p-GRP",
+            "the name survived a re-ingest"
+        );
+        assert!(r.complete);
+        teardown(&d, ix);
+    }
+
+    /// The backlog leg: releases indexed long before the feed was on.
+    /// Only obfuscated-looking rows are considered, and the cursor walks
+    /// once rather than re-reading the newest rows every tick.
+    #[test]
+    fn the_backlog_sweep_walks_once_and_only_touches_junk() {
+        let d = dir("backlog");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        ix.ingest(
+            "alt.binaries.boneless",
+            &[
+                over(
+                    r#""zX4mB8kP2vQ7nR1t.part01.rar" yEnc (1/1)"#,
+                    "p@x",
+                    "b1",
+                    4 << 30,
+                ),
+                // A perfectly readable scene name: the feed has a row for
+                // it too, but this leg must leave it alone - it is not
+                // what the feature is for and re-writing it would be
+                // churn on rows that already parse.
+                over(
+                    r#""Readable.Show.S01E01.1080p.WEB.x264-GRP.mkv" yEnc (1/1)"#,
+                    "p@x",
+                    "b2",
+                    4 << 30,
+                ),
+            ],
+            1000,
+        )
+        .unwrap();
+        ix.predb_store(
+            &[
+                pre(
+                    "Backlog.Film.2026.2160p.WEB-GRP",
+                    "zX4mB8kP2vQ7nR1t.part01.rar",
+                ),
+                pre(
+                    "Something.Else-GRP",
+                    "Readable.Show.S01E01.1080p.WEB.x264-GRP.mkv",
+                ),
+            ],
+            2000,
+        )
+        .unwrap();
+
+        let (tried, named) = ix.predb_backlog(100, 0, 2000).unwrap();
+        assert_eq!(
+            named, 1,
+            "only the obfuscated row was named (tried {tried})"
+        );
+        let hit = ix.search("Backlog Film", 10).unwrap();
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].stem, "zX4mB8kP2vQ7nR1t");
+        let readable = ix.search("Readable Show", 10).unwrap();
+        assert_eq!(
+            readable[0].pre_title, "",
+            "a readable name is left as posted"
+        );
+
+        // Cursor reached the floor: the leg is finished and costs
+        // nothing from here on.
+        assert_eq!(ix.predb_backlog(100, 0, 3000).unwrap(), (0, 0));
+        teardown(&d, ix);
+    }
+
+    /// Upsert semantics: a NEW line announces, a later UPD supplies the
+    /// filename, and neither may blank what the other established.
+    #[test]
+    fn an_update_line_fills_the_filename_in() {
+        let d = dir("upd");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        ix.predb_store(
+            &[PreLine {
+                title: "Two.Step.Release-GRP".into(),
+                category: "X264".into(),
+                ..Default::default()
+            }],
+            1000,
+        )
+        .unwrap();
+        assert_eq!(
+            ix.predb_stats().unwrap(),
+            (1, 0),
+            "a title alone names nothing"
+        );
+
+        ix.predb_store(
+            &[PreLine {
+                kind: PreKind::Upd,
+                title: "Two.Step.Release-GRP".into(),
+                filename: "hH3jK9lM1nP5qR7s.part01.rar".into(),
+                ..Default::default()
+            }],
+            2000,
+        )
+        .unwrap();
+        assert_eq!(ix.predb_stats().unwrap(), (1, 1), "one row, now nameable");
+        let cat: String = ix
+            .db
+            .query_row("SELECT category FROM predb", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cat, "X264", "the UPD did not blank what NEW established");
+
+        // A nuke afterwards is sticky and does not cost the filename.
+        ix.predb_store(
+            &[PreLine {
+                kind: PreKind::Nuk,
+                title: "Two.Step.Release-GRP".into(),
+                nuke_reason: "bad.crc".into(),
+                ..Default::default()
+            }],
+            3000,
+        )
+        .unwrap();
+        let (nuked, fname): (bool, String) = ix
+            .db
+            .query_row("SELECT nuked, filename FROM predb", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert!(nuked);
+        assert_eq!(fname, "hH3jK9lM1nP5qR7s.part01.rar");
+        teardown(&d, ix);
+    }
+
+    /// The named counter must not walk the releases table: the settings
+    /// card polls it, and on a multi-million-row index the full scan
+    /// took seconds per call. First use builds the partial index and
+    /// the COUNT must come out of it, not a table scan.
+    #[test]
+    fn the_named_count_takes_the_partial_index() {
+        let d = dir("namedcount");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        ix.ingest(
+            "alt.binaries.boneless",
+            &[over(
+                r#""qW4eR6tY8uI0oP2a.part01.rar" yEnc (1/1)"#,
+                "p@x",
+                "nc1",
+                4 << 30,
+            )],
+            1000,
+        )
+        .unwrap();
+        assert_eq!(ix.predb_named_count().unwrap(), 0);
+        // The first call built the index...
+        let n: i64 = ix
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type='index' AND name='idx_rel_pre_named'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "first use builds the partial index");
+        // ... and the COUNT actually plans onto it. This is the whole
+        // point of the index, so pin the plan, not just the schema.
+        let plan: String = ix
+            .db
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM releases WHERE pre_title<>''",
+                [],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("idx_rel_pre_named"),
+            "COUNT must use the partial index, planned: {plan}"
+        );
+        // Naming and revoking both move the counter - the partial
+        // index is maintained through the UPDATE paths, not just
+        // correct at build time.
+        ix.predb_store(
+            &[pre("Counted.Film.2026-GRP", "qW4eR6tY8uI0oP2a.part01.rar")],
+            2000,
+        )
+        .unwrap();
+        ix.predb_sweep(50, 2000).unwrap();
+        assert_eq!(ix.predb_named_count().unwrap(), 1);
+        let rid = ix.search("", 10).unwrap()[0].id;
+        assert!(ix.revoke_pre_name(rid).unwrap());
+        assert_eq!(ix.predb_named_count().unwrap(), 0);
+        teardown(&d, ix);
+    }
+
+    /// The daemon's API polls the count through a READ-ONLY handle,
+    /// which cannot create the index - the writer has to have built
+    /// it. The live shape that caught this: a title-only feed, so
+    /// nothing is `nameable` and the `predb` flag stays false, yet
+    /// the settings card still asks for the count.
+    #[test]
+    fn the_writer_builds_the_named_index_for_the_read_only_handle() {
+        let d = dir("namedro");
+        let path = d.join("index.db");
+        {
+            let mut ix = Index::open(&path).unwrap();
+            ix.predb_store(
+                &[PreLine {
+                    title: "Title.Only.Line-GRP".into(),
+                    ..Default::default()
+                }],
+                1000,
+            )
+            .unwrap();
+            // Simulate a database written before this index existed.
+            ix.db.execute("DROP INDEX idx_rel_pre_named", []).unwrap();
+        }
+        // The next writer open rebuilds it, because the feed has rows.
+        let ix = Index::open(&path).unwrap();
+        {
+            let ro = Index::open_read_only(&path).unwrap();
+            assert_eq!(ro.predb_named_count().unwrap(), 0);
+            let n: i64 = ro
+                .db
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                      WHERE type='index' AND name='idx_rel_pre_named'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "the writer's open built the index");
+        }
+        teardown(&d, ix);
+    }
+
+    /// The separator-insensitive fallback, and the fact that it is a
+    /// fallback: an exact key never has to go looking.
+    #[test]
+    fn the_normalized_key_is_the_fallback() {
+        let d = dir("norm");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        // The relay wrote the name with underscores, the post used dots.
+        ix.predb_store(&[pre("Norm.Test.2026-GRP", "ab_12_cd_34.part01.rar")], 1000)
+            .unwrap();
+        ix.ingest(
+            "alt.binaries.boneless",
+            &[over(
+                r#""ab-12-cd-34.part01.rar" yEnc (1/1)"#,
+                "p@x",
+                "n1",
+                4 << 30,
+            )],
+            2000,
+        )
+        .unwrap();
+        assert_eq!(
+            ix.search("", 10).unwrap()[0].pre_title,
+            "Norm.Test.2026-GRP"
+        );
+        teardown(&d, ix);
+    }
+
+    /// Pruning: the feed is always-on, so it must be bounded both ways.
+    #[test]
+    fn the_feed_is_pruned_by_age_and_by_row_cap() {
+        let d = dir("prune");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        for i in 0..10 {
+            ix.predb_store(
+                &[pre(&format!("R{i}-GRP"), &format!("fn{i}.rar"))],
+                1000 + i as i64,
+            )
+            .unwrap();
+        }
+        assert_eq!(ix.predb_stats().unwrap().0, 10);
+        // Age: everything heard before 1005 goes.
+        assert_eq!(ix.predb_prune(0, 100, 1105).unwrap(), 5);
+        assert_eq!(ix.predb_stats().unwrap().0, 5);
+        // Cap: oldest-heard first, down to 2.
+        assert_eq!(ix.predb_prune(2, 0, 2000).unwrap(), 3);
+        let left: Vec<String> = ix
+            .db
+            .prepare("SELECT title FROM predb ORDER BY seen_at")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(left, vec!["R8-GRP".to_string(), "R9-GRP".to_string()]);
+        teardown(&d, ix);
+    }
+
+    /// A feed that has never heard anything costs the ingest path
+    /// nothing at all - the lookup is gated on the table having content.
+    #[test]
+    fn an_empty_feed_changes_nothing() {
+        let d = dir("empty");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        assert!(!ix.predb, "no rows, no lookups");
+        ix.ingest(
+            "alt.binaries.boneless",
+            &[over(
+                r#""qQ1wW2eE3rR4tT5y.part01.rar" yEnc (1/1)"#,
+                "p@x",
+                "e1",
+                4 << 30,
+            )],
+            1000,
+        )
+        .unwrap();
+        let r = &ix.search("", 10).unwrap()[0];
+        assert_eq!(r.pre_title, "");
+        assert_eq!(r.display_name(), r.stem);
+        assert_eq!(ix.predb_sweep(50, 1000).unwrap(), (0, 0));
+        assert_eq!(ix.predb_backlog(50, 0, 1000).unwrap(), (0, 0));
+        teardown(&d, ix);
+    }
+
+    // ---- phase 2: correlation ---------------------------------------
+
+    /// An over entry with a controlled article date, because
+    /// correlation runs on `first_posted` and the plain helper leaves
+    /// it unset.
+    fn overd(subject: &str, id: &str, bytes: u64, date: i64) -> OverEntry {
+        OverEntry {
+            number: 0,
+            subject: subject.into(),
+            from: "p@x".into(),
+            message_id: format!("<{id}>"),
+            bytes,
+            date,
+        }
+    }
+
+    /// A title-only pre (the live public relay shape): a name, a
+    /// section, a size - no filename, ever.
+    fn tpre(title: &str, category: &str, size: u64, date: i64) -> PreLine {
+        PreLine {
+            kind: PreKind::New,
+            title: title.into(),
+            category: category.into(),
+            size,
+            date,
+            source: "PRE".into(),
+            ..Default::default()
+        }
+    }
+
+    /// The design's own worked example: pre at t=1000, obfuscated post
+    /// at t=4600 within 3% of the announced size. Suggest-only stores a
+    /// suggestion and changes nothing on the release; the auto tier
+    /// applies it with corr provenance.
+    #[test]
+    fn a_sized_fast_pair_suggests_then_auto_applies() {
+        let d = dir("corr-auto");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        // est_content = 5e9 / 1.03 = 4.854e9; announce 4.9e9 -> ratio
+        // 0.9906, the top band. Group and section agree on video.
+        ix.predb_store(
+            &[tpre(
+                "Some.Film.2026.1080p.WEB.H264-GRP",
+                "X264-HD",
+                4_900_000_000,
+                1000,
+            )],
+            1000,
+        )
+        .unwrap();
+        ix.ingest(
+            "alt.binaries.x264",
+            &[overd(
+                r#""aQ3xY7Bm2ZpK4L.part01.rar" yEnc (1/1)"#,
+                "c1",
+                5_000_000_000,
+                4600,
+            )],
+            5000,
+        )
+        .unwrap();
+        let rid = ix.search("", 10).unwrap()[0].id;
+
+        // Suggest-only: the walk stores the candidate, the release
+        // itself stays untouched.
+        let (examined, suggested, applied) = ix.predb_corr_backlog(100, 0, false, 5000).unwrap();
+        assert_eq!((examined, suggested, applied), (1, 1, 0));
+        let r = &ix.search("", 10).unwrap()[0];
+        assert_eq!(r.pre_title, "", "suggest-only must not name anything");
+        let hints = ix.pre_hints(&[rid]).unwrap();
+        assert_eq!(hints.len(), 1);
+        let (hid, hname, hscore, hdelta, _ratio, hstatus) = hints[0].clone();
+        assert_eq!(hid, rid);
+        assert_eq!(hname, "Some.Film.2026.1080p.WEB.H264-GRP");
+        assert_eq!(hdelta, 3600);
+        assert_eq!(hscore, 34 + 40 + 10, "T(<=2h) + S(top band) + C");
+        assert_eq!(hstatus, "suggested");
+
+        // Auto: the same pair clears every gate (unique, sized, tight,
+        // mutual-best, no sibling) and gets applied with provenance
+        // that says it was inferred.
+        let (_, _, applied) = ix.predb_corr_sweep(100, true, 5000).unwrap();
+        assert_eq!(applied, 1);
+        let r = &ix.search("", 10).unwrap()[0];
+        assert_eq!(r.pre_title, "Some.Film.2026.1080p.WEB.H264-GRP");
+        assert_eq!(r.pre_source, "predb/corr:PRE");
+        assert_eq!(r.display_name(), "Some.Film.2026.1080p.WEB.H264-GRP");
+        let hints = ix.pre_hints(&[rid]).unwrap();
+        assert_eq!(hints[0].5, "applied");
+        teardown(&d, ix);
+    }
+
+    /// Two same-size pres of the SAME title (REPACK) in the window: the
+    /// sibling rule caps at SUGGEST categorically - a human picks
+    /// REPACK vs original.
+    #[test]
+    fn a_repack_sibling_blocks_auto() {
+        let d = dir("corr-sibling");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        ix.predb_store(
+            &[
+                tpre(
+                    "Some.Show.S01E01.1080p.WEB.H264-GRP",
+                    "TV-WEB-HD-X264",
+                    4_900_000_000,
+                    1000,
+                ),
+                tpre(
+                    "Some.Show.S01E01.REPACK.1080p.WEB.H264-GRP",
+                    "TV-WEB-HD-X264",
+                    4_910_000_000,
+                    2000,
+                ),
+            ],
+            2000,
+        )
+        .unwrap();
+        ix.ingest(
+            "alt.binaries.x264",
+            &[overd(
+                r#""zZ9pQm2LxV4.part01.rar" yEnc (1/1)"#,
+                "s1",
+                5_000_000_000,
+                4600,
+            )],
+            5000,
+        )
+        .unwrap();
+        let (_, suggested, applied) = ix.predb_corr_backlog(100, 0, true, 5000).unwrap();
+        assert_eq!(applied, 0, "sibling pres must never auto-apply");
+        assert_eq!(suggested, 1);
+        assert_eq!(ix.search("", 10).unwrap()[0].pre_title, "");
+        teardown(&d, ix);
+    }
+
+    /// Two same-size pres of DIFFERENT titles: crowding. The margin
+    /// gate fails closed into a suggestion.
+    #[test]
+    fn a_crowded_window_blocks_auto() {
+        let d = dir("corr-crowd");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        ix.predb_store(
+            &[
+                tpre(
+                    "First.Film.2026.1080p.WEB.H264-GRP",
+                    "X264-HD",
+                    4_900_000_000,
+                    1000,
+                ),
+                tpre(
+                    "Other.Film.2026.1080p.WEB.H264-GRP",
+                    "X264-HD",
+                    4_905_000_000,
+                    1500,
+                ),
+            ],
+            1500,
+        )
+        .unwrap();
+        ix.ingest(
+            "alt.binaries.x264",
+            &[overd(
+                r#""kK4mN8rT2wQ.part01.rar" yEnc (1/1)"#,
+                "cr1",
+                5_000_000_000,
+                4600,
+            )],
+            5000,
+        )
+        .unwrap();
+        let (_, suggested, applied) = ix.predb_corr_backlog(100, 0, true, 5000).unwrap();
+        assert_eq!(applied, 0, "a crowded window must never auto-apply");
+        assert_eq!(suggested, 1);
+        teardown(&d, ix);
+    }
+
+    /// A sizeless pre can suggest but can never auto-apply, whatever
+    /// else agrees - the arithmetic caps it below STRONG.
+    #[test]
+    fn a_sizeless_pre_cannot_auto_apply() {
+        let d = dir("corr-sizeless");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        // Even with file-count agreement (the best a sizeless pair can
+        // do: T40 + C10 + F8 = 58) the ceiling sits under STRONG.
+        ix.predb_store(
+            &[PreLine {
+                files: 1,
+                ..tpre("Fast.Film.2026.1080p.WEB.H264-GRP", "X264-HD", 0, 4000)
+            }],
+            4000,
+        )
+        .unwrap();
+        ix.ingest(
+            "alt.binaries.x264",
+            &[overd(
+                r#""bB7cD3eF9gH.part01.rar" yEnc (1/1)"#,
+                "sz1",
+                5_000_000_000,
+                4300,
+            )],
+            5000,
+        )
+        .unwrap();
+        let (_, suggested, applied) = ix.predb_corr_backlog(100, 0, true, 5000).unwrap();
+        assert_eq!(applied, 0);
+        assert_eq!(suggested, 1, "fast + agreeing still suggests");
+        teardown(&d, ix);
+    }
+
+    /// The live rotation: a title-only row is re-asked while its
+    /// forward window is open and retired once it closes. Seed rows are
+    /// born retired and never enter the rotation at all.
+    #[test]
+    fn corr_rotation_retires_and_seeds_are_born_retired() {
+        let d = dir("corr-retire");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        ix.predb_store(&[tpre("Lone.Pre.2026.1080p-GRP", "X264-HD", 0, 1000)], 1000)
+            .unwrap();
+        // Inside the window: examined, stamped, not retired.
+        let (examined, _, _) = ix.predb_corr_sweep(100, false, 2000).unwrap();
+        assert_eq!(examined, 1);
+        let tried: i64 = ix
+            .db
+            .query_row("SELECT tried_at FROM predb", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tried, 2000);
+        // Window closed: the next look retires it, and after that the
+        // rotation never reaches it again.
+        let later = 1000 + 14 * 86_400 + 10;
+        assert_eq!(ix.predb_corr_sweep(100, false, later).unwrap().0, 1);
+        let tried: i64 = ix
+            .db
+            .query_row("SELECT tried_at FROM predb", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tried, PREDB_RETIRED);
+        assert_eq!(ix.predb_corr_sweep(100, false, later + 700).unwrap().0, 0);
+
+        // A seed row: stored retired, invisible to the rotation.
+        let n = ix
+            .predb_seed_store(
+                &[tpre("Seeded.Film.2026.1080p-GRP", "X264-HD", 1 << 30, 500)],
+                "seed:predb.net",
+                later,
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(ix.predb_corr_sweep(100, false, later + 1400).unwrap().0, 0);
+        // ...and a timestampless seed row is refused outright.
+        let n = ix
+            .predb_seed_store(
+                &[tpre("Undated.Film.2026-GRP", "X264-HD", 1 << 30, 0)],
+                "seed:predb.net",
+                later,
+            )
+            .unwrap();
+        assert_eq!(n, 0, "a pre with no time can do nothing but collide");
+        teardown(&d, ix);
+    }
+
+    /// A batch's "one evaluation per release" skip must be earned by an
+    /// evaluation, not spent by a pair that never got one.
+    ///
+    /// Sibling pres in a batch share candidates, so the release is
+    /// marked seen to stop it paying for a full 4000-row evaluation
+    /// once per pre. Marking it BEFORE the floor test meant a weak pair
+    /// - a sizeless pre, which by construction can never reach the auto
+    /// band - consumed the release, and the tight sized pre behind it
+    /// (rotation order is `tried_at ASC, id DESC`, so the higher id goes
+    /// first) skipped straight past a match it would have made.
+    #[test]
+    fn a_below_floor_pair_does_not_consume_the_release() {
+        let d = dir("corr-starve");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        // Stored in one call so both share a batch. The WEAK one is
+        // second, so it takes the higher id and is probed first.
+        ix.predb_store(
+            &[
+                tpre(
+                    "Strong.Film.2026.1080p.WEB.H264-GRP",
+                    "X264-HD",
+                    4_900_000_000,
+                    1000,
+                ),
+                // Sizeless and far back in the window: in range, so it
+                // is probed, but it cannot clear the floor.
+                tpre("Weak.Other.2026-GRP", "X264-HD", 0, 100),
+            ],
+            1000,
+        )
+        .unwrap();
+        ix.ingest(
+            "alt.binaries.x264",
+            &[overd(
+                r#""yY6tR3eW8qA.part01.rar" yEnc (1/1)"#,
+                "ov1",
+                5_000_000_000,
+                4600,
+            )],
+            5000,
+        )
+        .unwrap();
+        let rid = ix.search("", 10).unwrap()[0].id;
+        let (_, suggested, _) = ix.predb_corr_sweep(100, false, 5000).unwrap();
+        assert_eq!(
+            suggested, 1,
+            "the strong pre must still reach the release the weak one only looked at"
+        );
+        let stored: String = ix
+            .db
+            .query_row(
+                "SELECT p.title FROM pre_corr c JOIN predb p ON p.id=c.predb_id
+                  WHERE c.release_id=?1",
+                [rid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            stored.starts_with("Strong."),
+            "the wrong pre won the release: {stored}"
+        );
+        teardown(&d, ix);
+    }
+
+    /// The corr backlog cursor walks once and stops; a seed import
+    /// (predb_seed_gen bump) is the one event that re-opens it.
+    #[test]
+    fn corr_backlog_walks_once_until_a_seed_lands() {
+        let d = dir("corr-cursor");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        ix.ingest(
+            "alt.binaries.x264",
+            &[overd(
+                r#""mM1nB6vC8xZ.part01.rar" yEnc (1/1)"#,
+                "cu1",
+                5_000_000_000,
+                4600,
+            )],
+            5000,
+        )
+        .unwrap();
+        assert_eq!(ix.predb_corr_backlog(100, 0, false, 5000).unwrap().0, 1);
+        assert_eq!(
+            ix.predb_corr_backlog(100, 0, false, 5000).unwrap(),
+            (0, 0, 0),
+            "the cursor must not re-walk a dry backlog"
+        );
+        // A seed lands: the importer bumps the generation and the walk
+        // runs exactly once more.
+        ix.predb_seed_store(
+            &[tpre(
+                "Late.Seed.2026.1080p.WEB.H264-GRP",
+                "X264-HD",
+                4_900_000_000,
+                1000,
+            )],
+            "seed:predb.net",
+            6000,
+        )
+        .unwrap();
+        ix.kv_set("predb_seed_gen", "1").unwrap();
+        let (examined, suggested, _) = ix.predb_corr_backlog(100, 0, false, 6000).unwrap();
+        assert_eq!(examined, 1);
+        assert_eq!(suggested, 1, "the seeded pre now names the backlog row");
+        assert_eq!(
+            ix.predb_corr_backlog(100, 0, false, 6000).unwrap(),
+            (0, 0, 0)
+        );
+        teardown(&d, ix);
+    }
+
+    /// Revocation: a corr-applied name comes back off cleanly - stem
+    /// classification returns, the FTS entry disappears, the audit row
+    /// says revoked. And a rejected suggestion is never re-suggested.
+    #[test]
+    fn revoke_undoes_and_reject_never_nags() {
+        let d = dir("corr-revoke");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        ix.predb_store(
+            &[tpre(
+                "Named.Film.2026.1080p.WEB.H264-GRP",
+                "X264-HD",
+                4_900_000_000,
+                1000,
+            )],
+            1000,
+        )
+        .unwrap();
+        ix.ingest(
+            "alt.binaries.x264",
+            &[overd(
+                r#""rR5tY2uI9oP.part01.rar" yEnc (1/1)"#,
+                "rv1",
+                5_000_000_000,
+                4600,
+            )],
+            5000,
+        )
+        .unwrap();
+        let rid = ix.search("", 10).unwrap()[0].id;
+        let (_, _, applied) = ix.predb_corr_backlog(100, 0, true, 5000).unwrap();
+        assert_eq!(applied, 1);
+        assert_eq!(
+            ix.search("Named.Film", 10).unwrap().len(),
+            1,
+            "found via pre_fts"
+        );
+
+        assert!(ix.revoke_pre_name(rid).unwrap());
+        let r = &ix.search("", 10).unwrap()[0];
+        assert_eq!(r.pre_title, "");
+        assert_eq!(r.pre_source, "");
+        assert!(
+            ix.search("Named.Film", 10).unwrap().is_empty(),
+            "a revoked name must leave the search index"
+        );
+        let status: String = ix
+            .db
+            .query_row(
+                "SELECT status FROM pre_corr WHERE release_id=?1",
+                [rid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "revoked");
+
+        // Reject it: even though the candidate still scores, the legs
+        // must never suggest it again.
+        ix.pre_reject(rid, 6000).unwrap();
+        ix.kv_set("predb_seed_gen", "2").unwrap(); // force a re-walk
+        let (_, suggested, applied) = ix.predb_corr_backlog(100, 0, true, 6000).unwrap();
+        assert_eq!((suggested, applied), (0, 0), "a rejected row is settled");
+        let status: String = ix
+            .db
+            .query_row(
+                "SELECT status FROM pre_corr WHERE release_id=?1",
+                [rid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "rejected", "a rejected row must stay rejected");
+        assert_eq!(ix.search("", 10).unwrap()[0].pre_title, "");
+        teardown(&d, ix);
+    }
+
+    /// THE seed invariant: a seed row whose TITLE happens to equal a
+    /// release stem must not exact-match it - seeds are correlation
+    /// evidence only, and fnkey='' pins them out of every exact leg.
+    #[test]
+    fn a_seed_title_never_exact_matches() {
+        let d = dir("corr-seedinv");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        ix.ingest(
+            "alt.binaries.x264",
+            &[overd(
+                r#""Readable.Film.2026.1080p.WEB.H264-GRP.part01.rar" yEnc (1/1)"#,
+                "si1",
+                5_000_000_000,
+                4600,
+            )],
+            5000,
+        )
+        .unwrap();
+        ix.predb_seed_store(
+            &[tpre(
+                "Readable.Film.2026.1080p.WEB.H264-GRP",
+                "X264-HD",
+                0,
+                1000,
+            )],
+            "seed:predb.net",
+            5000,
+        )
+        .unwrap();
+        assert_eq!(
+            ix.predb_sweep(100, 6000).unwrap(),
+            (0, 0),
+            "nothing to sweep"
+        );
+        assert_eq!(
+            ix.predb_backlog(100, 0, 6000).unwrap().1,
+            0,
+            "the exact backlog must not see a seed"
+        );
+        assert_eq!(ix.search("", 10).unwrap()[0].pre_title, "");
+        teardown(&d, ix);
+    }
+
+    /// The catch-up pass: a seed import gets covered by walking the
+    /// SIZED pres once - including rows born retired - and it names
+    /// the backlog without the release-driven walk's help. Walks once,
+    /// parks, and re-opens only on the next seed generation.
+    #[test]
+    fn catchup_covers_a_seed_import_once_per_generation() {
+        let d = dir("corr-catchup");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        ix.ingest(
+            "alt.binaries.x264",
+            &[overd(
+                r#""tU8vB3nM6kQz.part01.rar" yEnc (1/1)"#,
+                "cu9",
+                5_000_000_000,
+                4600,
+            )],
+            5000,
+        )
+        .unwrap();
+        // The seed lands AFTER the release is indexed - the exact
+        // shape the live legs cannot reach.
+        ix.predb_seed_store(
+            &[tpre(
+                "Caught.Up.2026.1080p.WEB.H264-GRP",
+                "X264-HD",
+                4_900_000_000,
+                1000,
+            )],
+            "seed:predb.net",
+            6000,
+        )
+        .unwrap();
+        ix.kv_set("predb_seed_gen", "1").unwrap();
+        let (n, s, a) = ix.predb_corr_catchup(100, true, 6000).unwrap();
+        assert_eq!(n, 1, "the retired seed row is walked");
+        assert_eq!((s, a), (0, 1), "and the backlog release is auto-named");
+        let r = &ix.search("", 10).unwrap()[0];
+        assert_eq!(r.pre_title, "Caught.Up.2026.1080p.WEB.H264-GRP");
+        assert_eq!(r.pre_source, "predb/corr:seed:predb.net");
+        // Parked: later ticks cost nothing.
+        assert_eq!(ix.predb_corr_catchup(100, true, 6100).unwrap(), (0, 0, 0));
+        // A new generation re-opens the walk exactly once.
+        ix.kv_set("predb_seed_gen", "2").unwrap();
+        assert_eq!(ix.predb_corr_catchup(100, true, 6200).unwrap().0, 1);
+        assert_eq!(ix.predb_corr_catchup(100, true, 6300).unwrap(), (0, 0, 0));
+        teardown(&d, ix);
+    }
+
+    /// The banded forward query must not lose a true match at the band
+    /// edges, and must exclude the wildly-mismatched (which could only
+    /// waste probe budget - the Rust veto would kill them anyway).
+    #[test]
+    fn the_size_band_keeps_the_match_and_drops_the_absurd() {
+        let d = dir("corr-band");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        // Hidden-par2-heavy true match: wire bytes 1.18x the announce.
+        ix.ingest(
+            "alt.binaries.x264",
+            &[
+                overd(
+                    r#""hH2jK9lP4wX.part01.rar" yEnc (1/1)"#,
+                    "b1",
+                    5_900_000_000,
+                    4600,
+                ),
+                // A 10x-the-size post in the same window: band-excluded.
+                overd(
+                    r#""gG5fD8sA2qE.part01.rar" yEnc (1/1)"#,
+                    "b2",
+                    50_000_000_000,
+                    4600,
+                ),
+            ],
+            5000,
+        )
+        .unwrap();
+        ix.predb_seed_store(
+            &[tpre(
+                "Banded.Film.2026.1080p.WEB.H264-GRP",
+                "X264-HD",
+                5_000_000_000,
+                1000,
+            )],
+            "seed:predb.net",
+            5000,
+        )
+        .unwrap();
+        ix.kv_set("predb_seed_gen", "1").unwrap();
+        let (_, s, a) = ix.predb_corr_catchup(100, false, 6000).unwrap();
+        assert_eq!(
+            s + a,
+            1,
+            "exactly the plausible post is probed and suggested"
+        );
+        let hits = ix.search("", 10).unwrap();
+        let big = hits
+            .iter()
+            .find(|r| r.total_bytes > 10_000_000_000)
+            .unwrap();
+        assert!(
+            ix.pre_hints(&[big.id]).unwrap().is_empty(),
+            "no hint on the absurd one"
+        );
+        teardown(&d, ix);
+    }
+
+    /// The oracle verdict, both directions: agreement confirms and
+    /// back-feeds the proven filename (arming the exact legs for a
+    /// repost); contradiction revokes the applied name and records the
+    /// rejection.
+    #[test]
+    fn an_oracle_settles_a_correlation_both_ways() {
+        let d = dir("corr-verdict");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        ix.predb_store(
+            &[tpre(
+                "Oracle.Film.2026.1080p.WEB.H264-GRP",
+                "X264-HD",
+                4_900_000_000,
+                1000,
+            )],
+            1000,
+        )
+        .unwrap();
+        ix.ingest(
+            "alt.binaries.x264",
+            &[overd(
+                r#""yY6tR3eW8qA.part01.rar" yEnc (1/1)"#,
+                "ov1",
+                5_000_000_000,
+                4600,
+            )],
+            5000,
+        )
+        .unwrap();
+        let rid = ix.search("", 10).unwrap()[0].id;
+        assert_eq!(ix.predb_corr_backlog(100, 0, true, 5000).unwrap().2, 1);
+
+        // srrdb answers the SAME name (different separators, canonical
+        // case): confirmed, and the pre row now carries the proven
+        // posted filename so a repost exact-matches.
+        let v = ix
+            .pre_corr_verdict(
+                "yY6tR3eW8qA.part01.rar",
+                "Oracle.Film.2026.1080p.WEB.h264-GRP",
+                6000,
+            )
+            .unwrap();
+        assert_eq!(v, Some(true));
+        let (fnstem, tried): (String, i64) = ix
+            .db
+            .query_row("SELECT fnstem, tried_at FROM predb", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(fnstem, "yy6tr3ew8qa", "the proven pairing is fed back");
+        assert_eq!(tried, 0, "and queued for the exact sweep");
+        let status: String = ix
+            .db
+            .query_row(
+                "SELECT status FROM pre_corr WHERE release_id=?1",
+                [rid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "confirmed");
+
+        // A second, contradicted correlation: the applied name comes
+        // off and the rejection is recorded.
+        let d2 = dir("corr-verdict2");
+        let mut ix2 = Index::open(&d2.join("index.db")).unwrap();
+        ix2.predb_store(
+            &[tpre(
+                "Wrong.Guess.2026.1080p.WEB.H264-GRP",
+                "X264-HD",
+                4_900_000_000,
+                1000,
+            )],
+            1000,
+        )
+        .unwrap();
+        ix2.ingest(
+            "alt.binaries.x264",
+            &[overd(
+                r#""zX9cV4bN7mK.part01.rar" yEnc (1/1)"#,
+                "ov2",
+                5_000_000_000,
+                4600,
+            )],
+            5000,
+        )
+        .unwrap();
+        let rid2 = ix2.search("", 10).unwrap()[0].id;
+        assert_eq!(ix2.predb_corr_backlog(100, 0, true, 5000).unwrap().2, 1);
+        let v = ix2
+            .pre_corr_verdict(
+                "zX9cV4bN7mK.part01.rar",
+                "Actually.Other.Film.2026.1080p.WEB.H264-GRP",
+                6000,
+            )
+            .unwrap();
+        assert_eq!(v, Some(false));
+        let r = &ix2.search("", 10).unwrap()[0];
+        assert_eq!(r.pre_title, "", "the wrong name is gone");
+        let status: String = ix2
+            .db
+            .query_row(
+                "SELECT status FROM pre_corr WHERE release_id=?1",
+                [rid2],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "rejected");
+        // A release with no correlation involvement answers None.
+        assert_eq!(
+            ix2.pre_corr_verdict("no.such.post.rar", "X-GRP", 6000)
+                .unwrap(),
+            None
+        );
+        teardown(&d, ix);
+        teardown(&d2, ix2);
+    }
+
+    /// The split-set merge, end to end: legacy fragment rows (indexed
+    /// before release_stem knew the split shapes) fold into one
+    /// release with the true size, search follows the stem rewrite,
+    /// and the re-opened catch-up walk then names the merged set from
+    /// a seeded pre - the Supergirl acceptance shape.
+    #[test]
+    fn split_fragments_merge_and_then_correlate() {
+        let d = dir("split-merge");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        // Three legacy fragments, the shape old ingest produced: one
+        // row per volume, stems still carrying the digit tails.
+        for (i, (part, bytes)) in [
+            ("008", 2_000_000_000i64),
+            ("010", 2_000_000_000),
+            ("011", 1_000_000_000),
+        ]
+        .iter()
+        .enumerate()
+        {
+            ix.db
+                .execute(
+                    "INSERT INTO releases(stem, poster, grp, total_bytes, files, complete,
+                                          has_par2, first_posted, first_seen, kind, junk)
+                     VALUES(?1, 'p@x', 'alt.binaries.x264', ?2, 1, 1, 0, ?3, 5000,
+                            'other', 75)",
+                    rusqlite::params![format!("aQzXcV7Bn.7z.{part}"), bytes, 4600 + i as i64],
+                )
+                .unwrap();
+            let rid = ix.db.last_insert_rowid();
+            ix.db
+                .execute(
+                    "INSERT INTO files(release_id, filename, total_parts, bytes)
+                     VALUES(?1, ?2, 1, ?3)",
+                    rusqlite::params![rid, format!("aQzXcV7Bn.7z.{part}"), bytes],
+                )
+                .unwrap();
+        }
+        assert_eq!(ix.search("aQzXcV7Bn", 10).unwrap().len(), 3, "fragmented");
+
+        let (groups, folded, done) = ix.split_merge(6000).unwrap();
+        assert_eq!((groups, folded), (1, 2));
+        assert!(done, "one stride covers a small table");
+        let hits = ix.search("aQzXcV7Bn", 10).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "one release now, found via the rewritten stem"
+        );
+        let r = &hits[0];
+        assert_eq!(r.stem, "aQzXcV7Bn.7z");
+        assert_eq!(r.total_bytes, 5_000_000_000);
+        assert_eq!(r.files, 3);
+        assert_eq!(r.first_posted, 4600, "earliest fragment's clock");
+        // Parked: the next call is a kv read and nothing else.
+        assert_eq!(ix.split_merge(6100).unwrap(), (0, 0, true));
+
+        // The completion bumped the seed generation, so the catch-up
+        // re-walks - and the merged size now matches a seeded pre that
+        // no half-GB fragment ever could.
+        ix.predb_seed_store(
+            &[tpre(
+                "Whole.Set.2026.1080p.WEB.H264-GRP",
+                "X264-HD",
+                4_900_000_000,
+                1000,
+            )],
+            "seed:predb.net",
+            6000,
+        )
+        .unwrap();
+        let (_, s2, a2) = ix.predb_corr_catchup(100, true, 6200).unwrap();
+        assert_eq!(a2 + s2, 1, "the merged set correlates");
+        assert_eq!(a2, 1, "and tightly enough to auto-apply");
+        let r = &ix.search("Whole.Set", 10).unwrap()[0];
+        assert_eq!(r.pre_title, "Whole.Set.2026.1080p.WEB.H264-GRP");
+        teardown(&d, ix);
+    }
+
+    /// A group already wearing a fed name is not merged - extending a
+    /// name to bytes it never covered is exactly the wrong-name shape.
+    #[test]
+    fn a_named_fragment_blocks_its_groups_merge() {
+        let d = dir("split-named");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        for (part, title) in [("001", "Somebody.Named.This-GRP"), ("002", "")] {
+            ix.db
+                .execute(
+                    "INSERT INTO releases(stem, poster, grp, total_bytes, files, complete,
+                                          has_par2, first_posted, first_seen, kind, junk,
+                                          pre_title, pre_source)
+                     VALUES(?1, 'p@x', 'alt.binaries.x264', 1000000, 1, 1, 0, 4600, 5000,
+                            'other', 75, ?2, CASE WHEN ?2='' THEN '' ELSE 'predb' END)",
+                    rusqlite::params![format!("zZqWvU5Mk.7z.{part}"), title],
+                )
+                .unwrap();
+        }
+        let (groups, folded, _) = ix.split_merge(6000).unwrap();
+        assert_eq!((groups, folded), (0, 0), "a named member freezes the group");
+        assert_eq!(
+            ix.db
+                .query_row(
+                    "SELECT COUNT(*) FROM releases WHERE stem LIKE 'zZqWvU5Mk%'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            2
+        );
+        teardown(&d, ix);
+    }
+
+    /// pre_assign is the human path: no gates, but full provenance.
+    #[test]
+    fn manual_assign_carries_manual_provenance() {
+        let d = dir("corr-assign");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        ix.predb_seed_store(
+            &[tpre(
+                "Picked.Film.2026.1080p.WEB.H264-GRP",
+                "X264-HD",
+                0,
+                1000,
+            )],
+            "seed:predb.net",
+            5000,
+        )
+        .unwrap();
+        ix.ingest(
+            "alt.binaries.x264",
+            &[overd(
+                r#""qA2sD4fG6hJ.part01.rar" yEnc (1/1)"#,
+                "ma1",
+                5_000_000_000,
+                4600,
+            )],
+            5000,
+        )
+        .unwrap();
+        let rid = ix.search("", 10).unwrap()[0].id;
+        let pid: i64 = ix
+            .db
+            .query_row("SELECT id FROM predb", [], |r| r.get(0))
+            .unwrap();
+        assert!(ix.pre_assign(rid, pid, 6000).unwrap());
+        let r = &ix.search("", 10).unwrap()[0];
+        assert_eq!(r.pre_title, "Picked.Film.2026.1080p.WEB.H264-GRP");
+        assert_eq!(r.pre_source, "predb/manual+corr:seed:predb.net");
+        teardown(&d, ix);
+    }
+}

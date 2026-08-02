@@ -2,7 +2,9 @@
 //! the arithmetic gate would see.
 //! Usage: rarprobe [--head N] [--password PW] <files...>
 
-use nzbkit::rar::{feed_headers_incrementally_pub, ArchiveMap, ArithGate, EntryCrypt, VolumeMapper};
+use nzbkit::rar::{
+    ArchiveMap, ArithGate, EntryCrypt, VolumeMapper, feed_headers_incrementally_pub,
+};
 
 fn main() {
     // --head N: feed only the first N bytes (a partially-downloaded
@@ -35,10 +37,8 @@ fn main() {
             continue;
         };
         let size = f.metadata().map(|m| m.len()).unwrap_or(0);
-        let mut m = VolumeMapper::with_password(
-            size,
-            password.as_deref().map(std::sync::Arc::from),
-        );
+        let mut m =
+            VolumeMapper::with_password(size, password.as_deref().map(std::sync::Arc::from));
         if let Some(n) = head {
             use std::io::Read;
             let mut buf = vec![0u8; n];
@@ -103,7 +103,9 @@ fn main() {
     }
     let refs: Vec<&VolumeMapper> = mappers.iter().collect();
     match ArchiveMap::resolve_arithmetic(&refs) {
-        ArithGate::Place { bases, closed } => println!("GATE: Place closed={closed} bases={bases:?}"),
+        ArithGate::Place { bases, closed } => {
+            println!("GATE: Place closed={closed} bases={bases:?}")
+        }
         ArithGate::Shape => println!("GATE: Shape"),
         ArithGate::Numbers => println!("GATE: Numbers"),
     }

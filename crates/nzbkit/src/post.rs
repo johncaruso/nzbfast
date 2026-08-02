@@ -8,6 +8,7 @@
 //! caller-chosen domain, so nothing about the posting host leaks into the
 //! group (the header-plane twin of the remap-path-prefix binary scrub).
 
+use crate::sync::MutexExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -41,7 +42,10 @@ pub enum PostError {
     /// them means the operator can neither fetch nor cancel what they
     /// just published.
     #[error("{message}")]
-    Aborted { message: String, posted: Box<PostedSet> },
+    Aborted {
+        message: String,
+        posted: Box<PostedSet>,
+    },
     #[error("{0}")]
     Other(String),
 }
@@ -172,7 +176,12 @@ pub fn plan(paths: &[PathBuf], article_size: usize) -> Result<Vec<PlanFile>, Pos
                 u32::MAX
             )));
         }
-        plan.push(PlanFile { parts: parts as u32, path, name, size });
+        plan.push(PlanFile {
+            parts: parts as u32,
+            path,
+            name,
+            size,
+        });
     }
     Ok(plan)
 }
@@ -240,7 +249,11 @@ pub fn message_id(domain: &str) -> String {
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
         .collect();
-    let domain = if safe.is_empty() { "nzbfast.invalid" } else { safe.as_str() };
+    let domain = if safe.is_empty() {
+        "nzbfast.invalid"
+    } else {
+        safe.as_str()
+    };
     format!("{local}@{domain}")
 }
 
@@ -268,8 +281,7 @@ pub fn subject_for(
 pub fn rfc5322_date(unix: i64) -> String {
     const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
     let days = unix.div_euclid(86_400);
     let secs = unix.rem_euclid(86_400);
@@ -363,13 +375,10 @@ fn post_response_claims_duplicate(line: &str) -> bool {
     if words.next() != Some("441") || words.next() != Some("435") {
         return false;
     }
-    words
-        .next()
-        .is_some_and(|word| {
-            word
-                .trim_matches(|c: char| !c.is_ascii_alphabetic())
-                .eq_ignore_ascii_case("duplicate")
-        })
+    words.next().is_some_and(|word| {
+        word.trim_matches(|c: char| !c.is_ascii_alphabetic())
+            .eq_ignore_ascii_case("duplicate")
+    })
 }
 
 /// Upload one wire article. Tries POST first; a server that refuses
@@ -563,12 +572,12 @@ pub async fn post_files(
     // A double quote there injects a spurious quote our own subject parser
     // latches onto; a control char splits the Subject header line. Reject
     // both up front rather than emit a subject we cannot round-trip.
-    if let Some(t) = opts.title.as_deref() {
-        if t.chars().any(|c| c.is_control() || c == '"') {
-            return Err(PostError::Other(format!(
-                "post title {t:?} contains a control or double-quote character"
-            )));
-        }
+    if let Some(t) = opts.title.as_deref()
+        && t.chars().any(|c| c.is_control() || c == '"')
+    {
+        return Err(PostError::Other(format!(
+            "post title {t:?} contains a control or double-quote character"
+        )));
     }
     let date = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -657,7 +666,7 @@ pub async fn post_files(
         handles.push(tokio::spawn(async move {
             let mut conn: Option<Connection> = None;
             loop {
-                if failed.lock().unwrap().is_some() {
+                if failed.lock_ok().is_some() {
                     break;
                 }
                 let ti = next.fetch_add(1, Ordering::Relaxed);
@@ -721,7 +730,7 @@ pub async fn post_files(
                             if used_ihave {
                                 ihave_latch.store(true, Ordering::Relaxed);
                             }
-                            results[task.file].lock().unwrap()[task.part as usize - 1] =
+                            results[task.file].lock_ok()[task.part as usize - 1] =
                                 Some(PostedSegment {
                                     number: task.part,
                                     message_id: task.message_id.clone(),
@@ -761,7 +770,7 @@ pub async fn post_files(
                             // Message-ID unsafe. Preserve it in the rescue
                             // set before another worker's error wins the
                             // shared failure slot.
-                            results[task.file].lock().unwrap()[task.part as usize - 1] =
+                            results[task.file].lock_ok()[task.part as usize - 1] =
                                 Some(PostedSegment {
                                     number: task.part,
                                     message_id: task.message_id.clone(),
@@ -783,7 +792,7 @@ pub async fn post_files(
                         }
                     }
                 }
-                if failed.lock().unwrap().is_some() {
+                if failed.lock_ok().is_some() {
                     break;
                 }
             }
@@ -802,7 +811,7 @@ pub async fn post_files(
     // ride out with the error instead of being dropped alongside it.
     let mut missing: Option<String> = None;
     for (fi, slots) in results.iter().enumerate() {
-        let slots = slots.lock().unwrap();
+        let slots = slots.lock_ok();
         for (pi, s) in slots.iter().enumerate() {
             match s {
                 Some(seg) => files_out[fi].segments.push(seg.clone()),
@@ -819,7 +828,7 @@ pub async fn post_files(
             }
         }
     }
-    let aborted = { failed.lock().unwrap().take() }.or(missing);
+    let aborted = { failed.lock_ok().take() }.or(missing);
     if let Some(message) = aborted {
         // Files with nothing on the server are noise in a rescue index.
         files_out.retain(|f| !f.segments.is_empty());
@@ -844,7 +853,7 @@ pub async fn post_files(
 }
 
 fn fail(slot: &std::sync::Mutex<Option<String>>, msg: String) {
-    slot.lock().unwrap().get_or_insert(msg);
+    slot.lock_ok().get_or_insert(msg);
 }
 
 fn read_chunk(path: &Path, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
@@ -982,7 +991,14 @@ mod tests {
     #[test]
     fn wire_article_has_only_the_five_headers() {
         let body = crate::yenc::encode("h.bin", 4, None, 1, b"test");
-        let wire = build_wire_article("c@d.e", "alt.binaries.test", "\"h.bin\" yEnc (1/1)", "x@y", 0, &body);
+        let wire = build_wire_article(
+            "c@d.e",
+            "alt.binaries.test",
+            "\"h.bin\" yEnc (1/1)",
+            "x@y",
+            0,
+            &body,
+        );
         let text = String::from_utf8_lossy(&wire);
         let headers: Vec<&str> = text.split("\r\n\r\n").next().unwrap().lines().collect();
         assert_eq!(headers.len(), 5, "exactly five headers: {headers:?}");
@@ -1002,7 +1018,11 @@ mod tests {
         let evil = build_wire_article("a@b", "g", "s\r\nX-Injected: yes", "m@d", 0, &body);
         let etext = String::from_utf8_lossy(&evil).into_owned();
         assert!(etext.lines().all(|l| !l.starts_with("X-Injected:")));
-        assert!(etext.lines().any(|l| l.starts_with("Subject: s  X-Injected: yes")));
+        assert!(
+            etext
+                .lines()
+                .any(|l| l.starts_with("Subject: s  X-Injected: yes"))
+        );
     }
 
     #[test]
@@ -1047,9 +1067,19 @@ mod tests {
         // Directory walk is deterministic (sorted) and skips dotfiles.
         std::fs::write(dir.join(".hidden"), b"x").unwrap();
         std::fs::remove_file(dir.join("empty.bin")).unwrap();
-        let all = plan(&[dir.clone()], art).unwrap();
+        let all = plan(std::slice::from_ref(&dir), art).unwrap();
         let names: Vec<&str> = all.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(names, ["exact.bin", "minus1.bin", "plus1.bin", "spill.bin", "tiny.bin", "triple.bin"]);
+        assert_eq!(
+            names,
+            [
+                "exact.bin",
+                "minus1.bin",
+                "plus1.bin",
+                "spill.bin",
+                "tiny.bin",
+                "triple.bin"
+            ]
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1080,7 +1110,7 @@ mod tests {
         std::fs::write(dir.join("real.bin"), b"payload").unwrap();
         std::os::unix::fs::symlink(dir.join("real.bin"), dir.join("alias.bin")).unwrap();
         std::os::unix::fs::symlink(&dir, dir.join("loop")).unwrap();
-        let p = plan(&[dir.clone()], 1000).unwrap();
+        let p = plan(std::slice::from_ref(&dir), 1000).unwrap();
         let names: Vec<&str> = p.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, ["real.bin"]);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1124,7 +1154,7 @@ mod tests {
         std::fs::write(dir.join("multi.bin"), &multi).unwrap();
         std::fs::write(dir.join("single.bin"), &single).unwrap();
 
-        let plan_files = plan(&[dir.clone()], 1000).unwrap();
+        let plan_files = plan(std::slice::from_ref(&dir), 1000).unwrap();
         let opts = PostOpts {
             group: "alt.binaries.test".into(),
             from: "corpus@nzbfast.com".into(),
@@ -1139,7 +1169,9 @@ mod tests {
 
         let nzb = Nzb::parse(emit_nzb(&set).as_bytes()).expect("emitted NZB parses");
         assert_eq!(nzb.files.len(), 2);
-        let (mut conn, _) = Connection::connect(&srv.server_config()).await.expect("connect");
+        let (mut conn, _) = Connection::connect(&srv.server_config())
+            .await
+            .expect("connect");
         for f in &nzb.files {
             let name = f.filename_hint().expect("subject carries the filename");
             let source = std::fs::read(dir.join(name)).unwrap();
@@ -1171,7 +1203,10 @@ mod tests {
     #[tokio::test]
     async fn e2e_ihave_fallback_when_posting_rejected() {
         round_trip(
-            crate::mock::Chaos { post_rejected: true, ..Default::default() },
+            crate::mock::Chaos {
+                post_rejected: true,
+                ..Default::default()
+            },
             true,
         )
         .await;
@@ -1185,7 +1220,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("corpus.bin"), test_data(parts * art)).unwrap();
-        let plan_files = plan(&[dir.clone()], art).unwrap();
+        let plan_files = plan(std::slice::from_ref(&dir), art).unwrap();
         let opts = PostOpts {
             group: "alt.binaries.test".into(),
             from: "corpus@nzbfast.com".into(),
@@ -1199,7 +1234,9 @@ mod tests {
 
     /// Every Message-ID the set claims must be answerable by the server.
     async fn assert_all_present(srv: &crate::mock::MockServer, set: &PostedSet) {
-        let (mut conn, _) = Connection::connect(&srv.server_config()).await.expect("connect");
+        let (mut conn, _) = Connection::connect(&srv.server_config())
+            .await
+            .expect("connect");
         for f in &set.files {
             for seg in &f.segments {
                 assert!(
@@ -1461,7 +1498,10 @@ mod tests {
         let srv = crate::mock::MockServer::start(
             std::collections::HashMap::new(),
             crate::mock::Chaos {
-                post: crate::mock::PostChaos { try_later: 2, ..Default::default() },
+                post: crate::mock::PostChaos {
+                    try_later: 2,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )
@@ -1482,7 +1522,10 @@ mod tests {
             std::collections::HashMap::new(),
             crate::mock::Chaos {
                 post_rejected: true,
-                post: crate::mock::PostChaos { try_later: 1, ..Default::default() },
+                post: crate::mock::PostChaos {
+                    try_later: 1,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )
@@ -1503,7 +1546,10 @@ mod tests {
         let srv = crate::mock::MockServer::start(
             std::collections::HashMap::new(),
             crate::mock::Chaos {
-                post: crate::mock::PostChaos { try_later: u64::MAX, ..Default::default() },
+                post: crate::mock::PostChaos {
+                    try_later: u64::MAX,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )
@@ -1527,8 +1573,16 @@ mod tests {
                 date: 1_753_358_400,
                 size: 1400,
                 segments: vec![
-                    PostedSegment { number: 1, message_id: "one@corpus.example".into(), bytes: 730 },
-                    PostedSegment { number: 2, message_id: "two@corpus.example".into(), bytes: 731 },
+                    PostedSegment {
+                        number: 1,
+                        message_id: "one@corpus.example".into(),
+                        bytes: 730,
+                    },
+                    PostedSegment {
+                        number: 2,
+                        message_id: "two@corpus.example".into(),
+                        bytes: 731,
+                    },
                 ],
             }],
         };
