@@ -2805,11 +2805,22 @@ async function unhideKey(k){
 }
 function updateHidChip(){
   const c=document.getElementById('hidChip');
-  c.style.display=hidCount>0?'':'none';
-  c.textContent=t('wall.hid.chip','Hidden ({n})',{n:hidCount});
+  // Permanent entrance. The chip was the ONLY route to the hide-rule
+  // editor and it appeared only once something had been hidden, so the
+  // filters were unreachable from a clean wall - including for anyone
+  // who wanted to set a rule up before hiding anything by hand. It
+  // stays, and says "Filters" until it has a count to report.
+  // (`body.noidx` still hides it outright: no wall, no filters.)
+  c.style.display='';
+  c.textContent=hidCount>0
+    ? t('wall.hid.chip','Hidden ({n})',{n:hidCount})
+    : t('wall.hid.chip0','Filters');
 }
 async function loadHidCount(){
-  try{ const j=await api('wall_hidden'); hidCount=(j.hidden||[]).length; updateHidChip(); }catch(e){}
+  // The chip is the only entrance to the filter editor, so it goes up
+  // even when the count could not be fetched - it just says "Filters".
+  try{ const j=await api('wall_hidden'); hidCount=(j.hidden||[]).length; }catch(e){}
+  updateHidChip();
 }
 // Learning loop: the daemon watches what you hide; when a pattern
 // emerges it proposes ONE rule at a time, you confirm or dismiss.
@@ -3266,6 +3277,30 @@ renderChips();
 reflowBar();
 viewBadge();
 initArrivals();
+// Deep link: /wall#q=<title> lands with the search already run. The
+// dashboard's failure drawer sends people here ("find another release")
+// the moment the daemon says the post itself is the problem, and asking
+// them to retype a release name they were just looking at is the kind of
+// step that stops the advice being taken at all.
+//
+// Read before the first fetch below so the boot renders the SEARCH, not
+// the wall and then the search. Nothing is auto-grabbed - this only
+// fills the box the user would have filled.
+{
+  const m=/^#q=(.*)$/.exec(location.hash||'');
+  if(m){
+    let q='';
+    try{ q=decodeURIComponent(m[1].replace(/\+/g,' ')); }catch(e){ q=m[1]; }
+    q=q.trim();
+    if(q){
+      // The box only. Both surfaces filter on it, and forcing the table
+      // view here would write the user's view preference to localStorage
+      // (setView persists) - a link must not quietly re-set a setting.
+      document.getElementById('q').value=q;
+      lpage=0;
+    }
+  }
+}
 // setView drives its own fetch; the wall surface boots straight into
 // refresh() (its markup defaults are already wall-shaped).
 if(view==='releases') setView(view); else refresh();

@@ -1695,7 +1695,17 @@ async fn idle_bounded<F, T>(f: F) -> Result<T, NntpError>
 where
     F: std::future::Future<Output = std::io::Result<T>>,
 {
-    match tokio::time::timeout(STREAM_IDLE_TIMEOUT, f).await {
+    idle_bounded_for(STREAM_IDLE_TIMEOUT, f).await
+}
+
+/// [`idle_bounded`] with a caller-chosen no-progress deadline (the
+/// adaptive fetch path runs a much tighter stall bound than the 120 s
+/// default; see [`Connection::read_body_into_two_phase`]).
+async fn idle_bounded_for<F, T>(d: std::time::Duration, f: F) -> Result<T, NntpError>
+where
+    F: std::future::Future<Output = std::io::Result<T>>,
+{
+    match tokio::time::timeout(d, f).await {
         Err(_) => Err(NntpError::Timeout),
         Ok(r) => Ok(r?),
     }
@@ -1878,11 +1888,25 @@ pub(crate) async fn read_multiline_generic<R>(
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
+    read_multiline_paced(reader, out, STREAM_IDLE_TIMEOUT).await
+}
+
+/// [`read_multiline_generic`] with a caller-chosen per-read no-progress
+/// deadline. Any byte arriving resets it, so a slow-but-alive transfer
+/// never trips; only a genuine mid-body stall does.
+pub(crate) async fn read_multiline_paced<R>(
+    reader: &mut R,
+    out: &mut Vec<u8>,
+    stall: std::time::Duration,
+) -> Result<(), NntpError>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
     {
         use tokio::io::AsyncBufReadExt;
         let start = out.len();
         loop {
-            let buf = idle_bounded(reader.fill_buf()).await?;
+            let buf = idle_bounded_for(stall, reader.fill_buf()).await?;
             if buf.is_empty() {
                 return Err(NntpError::Closed);
             }
@@ -2213,6 +2237,47 @@ impl Connection {
                 Ok(true)
             }
             423 | 430 | 451 => Ok(false),
+            _ => Err(NntpError::Unexpected {
+                cmd: "BODY".into(),
+                line: st.line,
+            }),
+        }
+    }
+
+    /// [`read_body_into`] decomposed into the two phases a flat
+    /// whole-response timeout conflates:
+    ///
+    /// - **pre-byte** (`first_byte`): dispatch to status line. This is
+    ///   where a dead connection sits, and where a tight adaptive bound
+    ///   (the pool derives it from a per-server TTFB EWMA) detects it in
+    ///   seconds instead of the flat timeout's worst case.
+    /// - **post-byte** (`stall`): a per-read no-progress deadline on the
+    ///   body. Any byte arriving resets it, so a slow-but-alive transfer
+    ///   is never killed for taking longer than a flat cap - only a
+    ///   genuine mid-body stall trips.
+    ///
+    /// Both expiries surface as [`NntpError::Timeout`]. Returns the
+    /// measured time-to-status alongside the hit/miss so the caller can
+    /// feed its EWMA (measured for misses too: a 430 is a healthy,
+    /// timed response).
+    pub async fn read_body_into_two_phase(
+        &mut self,
+        out: &mut Vec<u8>,
+        first_byte: std::time::Duration,
+        stall: std::time::Duration,
+    ) -> Result<(bool, std::time::Duration), NntpError> {
+        let t0 = std::time::Instant::now();
+        let st = match tokio::time::timeout(first_byte, self.read_status()).await {
+            Err(_) => return Err(NntpError::Timeout),
+            Ok(r) => r?,
+        };
+        let ttfb = t0.elapsed();
+        match st.code {
+            222 => {
+                read_multiline_paced(&mut self.wire, out, stall).await?;
+                Ok((true, ttfb))
+            }
+            423 | 430 | 451 => Ok((false, ttfb)),
             _ => Err(NntpError::Unexpected {
                 cmd: "BODY".into(),
                 line: st.line,
@@ -2837,6 +2902,127 @@ mod quit_tests {
         assert!(
             t0.elapsed() > super::STREAM_IDLE_TIMEOUT * 5,
             "test did not actually outlast the idle deadline: {:?}",
+            t0.elapsed()
+        );
+    }
+
+    /// The paced reader's stall bound is the parameter, not the 120 s
+    /// default: a peer that goes mute mid-body trips at the caller's
+    /// deadline (the adaptive fetch path runs 8 s, not 120).
+    #[tokio::test(start_paused = true)]
+    async fn paced_multiline_stalls_at_the_callers_bound() {
+        let (client, _server) = mute_after(b"1\tsubject one\tposter\r\n2\tsubject t");
+        let mut reader = tokio::io::BufReader::new(client);
+        {
+            use tokio::io::AsyncBufReadExt as _;
+            let n = reader.fill_buf().await.expect("preload").len();
+            assert_eq!(n, 33, "preload should be buffered whole");
+        }
+        let stall = std::time::Duration::from_secs(8);
+        let mut out = Vec::new();
+        let t0 = tokio::time::Instant::now();
+        let err = super::read_multiline_paced(&mut reader, &mut out, stall)
+            .await
+            .expect_err("a mute peer must not read successfully");
+        assert!(matches!(err, super::NntpError::Timeout), "got {err:?}");
+        assert!(t0.elapsed() >= stall, "fired early: {:?}", t0.elapsed());
+        assert!(
+            t0.elapsed() < super::STREAM_IDLE_TIMEOUT,
+            "the caller's bound was ignored: {:?}",
+            t0.elapsed()
+        );
+    }
+
+    /// The tight stall bound is still an IDLE deadline: a body that
+    /// dribbles a chunk every 4 s under an 8 s stall bound completes no
+    /// matter how long it takes end to end. This is the property that
+    /// lets the adaptive path drop the flat whole-response cap without
+    /// killing slow-but-healthy transfers.
+    #[tokio::test(start_paused = true)]
+    async fn paced_slow_but_alive_survives_a_tight_stall_bound() {
+        let stall = std::time::Duration::from_secs(8);
+        let gap = std::time::Duration::from_secs(4);
+        let mut chunks: std::collections::VecDeque<Vec<u8>> = (0..20)
+            .map(|i| format!("{i}\tsubject {i}\tposter\r\n").into_bytes())
+            .collect();
+        chunks.push_back(b".\r\n".to_vec());
+        let mut reader = Dribble {
+            chunks,
+            cur: Vec::new(),
+            pos: 0,
+            gap,
+            sleep: None,
+        };
+        let mut out = Vec::new();
+        let t0 = tokio::time::Instant::now();
+        super::read_multiline_paced(&mut reader, &mut out, stall)
+            .await
+            .expect("a slow but live stream must complete");
+        assert!(out.ends_with(b"19\tsubject 19\tposter\r\n"));
+        assert!(
+            t0.elapsed() > stall * 5,
+            "test did not outlast the stall bound: {:?}",
+            t0.elapsed()
+        );
+    }
+
+    /// Two-phase body read, pre-byte half: a connection whose status
+    /// line never arrives dies at the caller's first-byte budget - the
+    /// adaptive path's seconds, not the flat timeout's 30.
+    #[tokio::test]
+    async fn two_phase_first_byte_budget_bounds_a_dead_connection() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let _ = s.write_all(b"200 ok\r\n");
+                let _ = s.flush();
+                // Swallow the BODY command and go mute, holding the
+                // socket open - the dead-connection shape.
+                let mut sink = [0u8; 512];
+                loop {
+                    match s.read(&mut sink) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            }
+        });
+        let server = crate::config::ServerConfig {
+            host: "127.0.0.1".into(),
+            port,
+            tls: false,
+            username: None,
+            password: None,
+            connections: 1,
+            rcvbuf: None,
+            level: 0,
+            group: None,
+            retention_days: 0,
+            block_bytes: None,
+            bind_ip: None,
+            socks5: None,
+            enabled: true,
+            warm_pool: false,
+            idle_release_secs: None,
+            idle_keep: None,
+            max_source_ips: None,
+        };
+        let (mut conn, _) = Connection::connect(&server).await.expect("connect");
+        conn.send("BODY <x@test>").await.expect("send");
+        let budget = std::time::Duration::from_millis(300);
+        let mut out = Vec::new();
+        let t0 = std::time::Instant::now();
+        let err = conn
+            .read_body_into_two_phase(&mut out, budget, std::time::Duration::from_secs(8))
+            .await
+            .expect_err("a statusless connection must time out");
+        assert!(matches!(err, super::NntpError::Timeout), "got {err:?}");
+        assert!(t0.elapsed() >= budget, "fired early: {:?}", t0.elapsed());
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "budget not honored: {:?}",
             t0.elapsed()
         );
     }

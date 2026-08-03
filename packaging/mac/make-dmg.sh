@@ -32,6 +32,9 @@ trap 'hdiutil detach "/Volumes/$VOL" -quiet 2>/dev/null || true' EXIT
 mkdir -p "$STAGE/.background" "$STAGE/.extras"
 cp -R "$APP" "$STAGE/NzbFast.app"
 ln -s /Applications "$STAGE/Applications"
+# Visible beside the app: a plain-HTML walkthrough of the unsigned first
+# launch (opens in a browser with no Gatekeeper friction).
+cp how-to-install.html "$STAGE/How to install.html"
 # Substituted, not copied raw: docs/MANUAL.html carries the shared
 # design tokens as a placeholder the DAEMON fills in when it serves
 # /manual. A raw copy shows the marker as body text and styles itself

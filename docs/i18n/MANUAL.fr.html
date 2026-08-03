@@ -362,8 +362,12 @@ plus rapide restant ainsi toujours en tête.</p>
 <li><b>Faites glisser les lignes pour réordonner</b> (au sein d'une bande de
 priorité - Forcé/Haute passent toujours d'abord) ; changez la priorité en ligne.</li>
 <li><b>Cliquez sur une ligne</b> pour le tiroir de détail : barres de progression par
-fichier, compteurs de blocs vérifiés, et quel serveur a contribué combien à
-<em>cette</em> tâche.</li>
+fichier, compteurs de blocs vérifiés, quel serveur a contribué combien à
+<em>cette</em> tâche, et une ligne « ajouté par » qui dit d'où vient la tâche
+(dossier surveillé, une appli connectée, l'API…). Un bouton
+<b>Télécharger le .nzb</b> vous enregistre le fichier <code>.nzb</code> de la tâche -
+nzbfast en garde sa propre copie, donc cela fonctionne pour chaque tâche, même quand
+le fichier d'origine a disparu depuis longtemps.</li>
 <li>Des badges signalent les états particuliers : <i>reporté (lent)</i>,
 <i>préchargement</i>, <i>en pause</i> (voir <a href="#performance">Outils de
 performance</a>).</li>
@@ -384,7 +388,11 @@ la moins bonne).</p>
 chiffrées affichent un contrôle de déverrouillage 🔑 - saisissez le mot de passe et
 la tâche se termine sur place. Le bandeau de santé de vérification trace les blocs
 PAR2 défectueux par téléchargement - une queue qui monte signale des articles qui
-arrivent endommagés.</p>
+arrivent endommagés.
+Le tiroir de chaque ligne dit qui a ajouté la tâche et propose le même bouton
+<b>Télécharger le .nzb</b> que la file - pratique pour télécharger une release à
+nouveau ailleurs, ou pour joindre le <code>.nzb</code> à un signalement de
+problème.</p>
 <p>La carte liste dix téléchargements par défaut et le reste est à un clic, sur le bouton ▤. Le statut, l'emplacement et la raison d'un échec vivent derrière un clic sur la ligne elle-même, si bien que le cas courant - ce qui s'est terminé, quelle taille, quand - reste lisible sans défilement. Tirez le bord inférieur de la carte pour faire défiler la liste à la hauteur de votre choix à la place. <b>History rows</b> dans Paramètres → Interface change ces dix ; comme c'est une propriété du daemon et non de votre navigateur, cela s'applique à tous les appareils qui regardent cette installation. <b>Colour History names</b>, juste à côté, teinte en vert les noms terminés et en rouge ceux qui ont échoué ; en le désactivant les noms restent neutres, et la pastille colorée comme les détails de la ligne disent toujours lequel est lequel.</p>
 <h3 id="dash-usage">Consommation</h3>
 <p>Barres quotidiennes par fournisseur et totaux Aujourd'hui / 7 jours / 30 jours -
@@ -399,8 +407,12 @@ décrits dans <a href="#performance">Outils de performance</a>.</p>
 <tr><th>Méthode</th><th>Comment</th></tr>
 <tr><td><b>Glisser-déposer</b></td><td>Déposez un ou plusieurs fichiers <code>.nzb</code> n'importe où sur le tableau de bord.</td></tr>
 <tr><td><b>Dossier surveillé</b></td><td>Définissez un dossier dans les Paramètres ; tout
-<code>.nzb</code> enregistré dedans est pris en charge sous 5 secondes et le fichier
-retiré. Pointez le répertoire de téléchargement de votre navigateur dessus pour des
+<code>.nzb</code> enregistré dedans est pris en charge sous 5 secondes et déplacé vers
+la corbeille, et un tableau de bord ouvert annonce chaque prise en charge par son nom
+(« … récupéré depuis Téléchargements »), si bien qu'un fichier qui quitte le dossier
+n'est jamais un mystère. Vous préférez conserver vos fichiers ? Activez
+<b>Conserver les .nzb après prise en charge</b> (voir <a href="#settings">§9</a>).
+Pointez le répertoire de téléchargement de votre navigateur dessus pour des
 récupérations en un clic depuis les sites d'indexeurs.</td></tr>
 <tr><td><b>Depuis une URL</b></td><td>Collez un lien NZB (API <code>mode=addurl</code>, ou via n'importe quelle appli connectée).</td></tr>
 <tr><td><b>Liens nzblnk:</b></td><td>Collez un lien <code>nzblnk:</code> n'importe où sur le tableau de bord, ou glissez-le dedans. Si vous avez installé depuis le DMG macOS ou l'installateur Windows, vous pouvez aussi en cliquer un directement sur un board. Voir <a href="#nzblnk">les liens nzblnk</a> plus bas.</td></tr>
@@ -627,13 +639,16 @@ connexion), <b>threads de décodage</b> (décodage parallèle). Échantillonnés
 démarrage de chaque tâche. Les valeurs par défaut conviennent à la plupart des
 lignes ; utilisez les outils de réglage avant d'augmenter à l'aveugle.</p>
 
-<p><b>Vérification rapide (CRC32)</b> (activée par défaut) revendique les blocs PAR2
-par CRC32 pendant que le téléchargement tourne encore, ce qui est 2-3x plus rapide sur
-un processeur lent. La somme de contrôle propre à chaque article reste vérifiée, et la
-passe finale utilise toujours le MD5 complet : rien n'est sacrifié côté exactitude.
-Décochez pour calculer aussi le MD5 par bloc pendant le téléchargement.</p>
+<p><b>Vérification pendant le téléchargement</b> choisit ce qui est contrôlé à mesure que
+les données arrivent. <i>Complète</i> confirme chaque bloc PAR2 en MD5. <i>Rapide</i>
+(par défaut) revendique les blocs par CRC32, ce qui est 2-3x plus rapide sur un
+processeur lent, et vérifie toujours la somme de contrôle propre à chaque article.
+<i>Économe</i> saute aussi ces sommes d'articles dès que PAR2 couvre un fichier : le
+dommage apparaît alors un instant plus tard, au niveau de son bloc. Dans les trois cas
+la passe finale et toute réparation utilisent le MD5 complet, et un téléchargement sans
+fichiers PAR2 garde ses sommes d'articles.</p>
 <h3>Disque &amp; quota <span class="pill live">en direct</span></h3>
-<p><b>Espace libre minimum</b> (met en pause les nouvelles tâches en dessous),
+<p><b>Espace libre minimum</b> (met en pause les nouvelles tâches en dessous ; 2 Go par défaut, 0 le désactive),
 <b>quota de téléchargement</b> par jour ou par mois (UTC ; les tâches Forcé le
 contournent), <b>budget mémoire</b> - l'enveloppe RAM du moteur (par défaut : ¼ de
 la RAM, borné ; augmentez-le sur une machine riche en RAM pour la vitesse maximale
@@ -683,6 +698,27 @@ attente de mot de passe. Les deux étapes de suppression ne s'appliquent
 <em>qu'aux</em> releases reconnues comme film ou série : une charge logicielle ou un
 jeu non classable (obscurci) n'est jamais nettoyé.</p>
 
+<p><b>Les fichiers supprimés vont à la Corbeille</b> décide de ce que « supprimer »
+signifie ci-dessus. Activé, le nettoyage déplace les fichiers vers la Corbeille du
+système, si bien qu'une erreur sur ce qui était superflu peut être annulée ;
+désactivé, ils sont supprimés définitivement. Il est <b>activé par défaut sur macOS
+et Windows</b>, où la Corbeille est un endroit que vous pouvez voir et vider, et
+<b>désactivé par défaut sur Linux</b>, où ce n'est en général pas le cas.</p>
+<div class="note"><b>Sur un NAS ou dans un conteneur, laissez-le désactivé.</b>
+Quand vos téléchargements sont sur un autre disque que votre répertoire personnel
+ - la configuration habituelle sur Unraid, Synology, une seedbox ou toute
+installation Docker avec un partage monté - les règles de corbeille de Linux
+n'utilisent aucune Corbeille de bureau. Elles créent un dossier caché
+<code>.Trash-1000</code> (le nombre est votre identifiant utilisateur) à la racine
+du disque de téléchargement et y déplacent les fichiers. Rien ne vous montre ce
+dossier, rien ne le vide, et l'espace qu'il occupe ne revient jamais.
+<p>Si vous avez utilisé une version antérieure de nzbfast sur Linux avec cette
+option activée, cherchez ce dossier à la racine de votre partage de
+téléchargement. Vous pouvez le vider sans risque : tout ce qu'il contient est un
+fichier dont le nettoyage avait déjà décidé que vous ne le vouliez pas. nzbfast ne
+le videra pas à votre place, car il est sur votre disque et c'est à vous d'en
+juger.</p></div>
+
 <h3>Dossiers &amp; traitement</h3>
 <p><b>Dossier de téléchargement</b> <span class="pill restart">redémarrage</span>,
 <b>dossier surveillé</b>, <b>script de post-traitement</b> (exécuté après chaque
@@ -690,6 +726,14 @@ tâche avec les arguments compatibles SABnzbd et l'environnement <code>SAB_*</co
 vos scripts SAB existants fonctionnent tels quels), <b>extensions de nettoyage</b>
 (fichiers parasites supprimés après réussite), <b>Dossiers intelligents</b>
 et <b>classement TV</b> (voir <a href="#automation">§10</a>).</p>
+<p><b>Conserver les .nzb après prise en charge</b> (désactivé par défaut) laisse le
+<code>.nzb</code> d'origine dans le dossier surveillé après sa mise en file, au lieu
+de le déplacer vers la corbeille - pour les collectionneurs, et pour transmettre le
+fichier quand un téléchargement pose problème. Un fichier conservé est mémorisé, y
+compris entre les redémarrages, et n'est pas remis en file ; réenregistrez-le pour le
+télécharger à nouveau. Quel que soit votre choix, le tiroir de chaque tâche a un
+bouton <b>Télécharger le .nzb</b>, donc une copie du <code>.nzb</code> de n'importe
+quelle tâche n'est jamais à plus d'un clic.</p>
 
 <h3>Indexation <span class="pill live">en direct</span></h3>
 <div class="note"><b>L'indexeur intégré est désactivé par défaut.</b> Il trouve les
@@ -735,14 +779,15 @@ téléchargement, par défaut) ou mégabits (Mb/s, comme les FAI annoncent les l
 tailles de fichiers restent en octets. C'est une propriété du daemon, pas de votre
 navigateur : cela vaut donc pour tous les appareils qui regardent cette
 installation.</p>
-<h3>Avancé : réglages sans contrôle dans le tableau de bord</h3>
-<p>Six réglages n'ont ni contrôle dans l'interface ni option de ligne de commande.
-Passez par l'API (<a href="#api">§16</a>), p. ex.
+<h3>Avancé : les réglages fins derrière les évidents</h3>
+<p>Six réglages sans option de ligne de commande. Chacun a désormais sa ligne avancée
+sur la carte de réglages qui le concerne, et reste accessible par l'API
+(<a href="#api">§16</a>), p. ex.
 <code>/api?mode=config&amp;name=verify_mode&amp;value=lean&amp;apikey=…</code>. Comme
 tous les autres, ils sont écrits dans <code>settings.json</code>.</p>
 <div class="tblwrap"><table>
 <tr><th>Nom</th><th>Effet</th></tr>
-<tr><td><code>verify_mode</code></td><td><code>full</code> | <code>fast</code> | <code>lean</code> (<code>fast</code> par défaut). <code>lean</code> est le coup de pouce pour processeur lent : comme fast, mais en sautant aussi le CRC yEnc par article dès que PAR2 couvre un fichier, soit une couche de CRC32 au lieu de deux. Les téléchargements sans PAR2 gardent leurs CRC d'articles, et la vérification et la réparation de fin de tâche sont inchangées dans tous les cas. La <b>Vérification rapide</b> ci-dessus est le même contrôle pour full contre fast.</td></tr>
+<tr><td><code>verify_mode</code></td><td><code>full</code> | <code>fast</code> | <code>lean</code> (<code>fast</code> par défaut). <code>lean</code> est le coup de pouce pour processeur lent : comme fast, mais en sautant aussi le CRC yEnc par article dès que PAR2 couvre un fichier, soit une couche de CRC32 au lieu de deux. Les téléchargements sans PAR2 gardent leurs CRC d'articles, et la vérification et la réparation de fin de tâche sont inchangées dans tous les cas. Le sélecteur <b>Vérification pendant le téléchargement</b> ci-dessus est ce réglage.</td></tr>
 <tr><td><code>auto_retry_mins</code></td><td>Délai avant l'<em>unique</em> nouvelle tentative automatique accordée à un premier échec pour articles manquants (20 par défaut). Le retard de propagation est une vraie cause d'articles manquants et se résorbe seul ; grâce au journal, la reprise ne récupère que ce qui manque encore. Les échecs pour mot de passe ou retrait n'y ont jamais droit.</td></tr>
 <tr><td><code>index_scan_par</code></td><td>Nombre de groupes analysés en parallèle par l'indexeur (3 par défaut, borné à 1-8).</td></tr>
 <tr><td><code>oracle_sample</code></td><td>Budget de STAT au repos de l'oracle de disponibilité (<a href="#oracle">§13</a>), sondes par heure et par serveur. 300 par défaut, 3600 au maximum, <code>0</code> désactive complètement l'échantillonnage.</td></tr>
@@ -1048,7 +1093,7 @@ changement. Deux clés : la <b>clé API</b> (contrôle total) et la <b>clé NZB<
 <div class="tblwrap"><table>
 <tr><th>Domaine</th><th>Modes</th></tr>
 <tr><td>File</td><td><code>queue</code> (avec <code>name=delete/pause/resume/priority/switch</code>), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>addnzblnk</code>, <code>retry</code>, <code>set_password</code></td></tr>
-<tr><td>Infos</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code></td></tr>
+<tr><td>Infos</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code>, plus <code>/jobnzb/&lt;nzo_id&gt;</code> (ressort le <code>.nzb</code> mis en réserve de la tâche elle-même, en file ou en historique ; clé API complète uniquement)</td></tr>
 <tr><td>Config</td><td><code>get_config</code>, <code>config&amp;name=&lt;setting&gt;&amp;value=…</code> (chaque champ des Paramètres), <code>server_save/delete/test/enable/reorder</code>, <code>import_probe/apply</code></td></tr>
 <tr><td>Index &amp; mur</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, plus newznab sur <code>/api?t=caps|search|tvsearch|movie</code> et <code>/getnzb/&lt;id&gt;</code></td></tr>
 <tr><td>Automatisation</td><td><code>watchlist</code>, <code>watchlist_check_now</code>, <code>watch_calendar</code>, <code>feeds</code>, <code>smart_folders</code>, <code>schedule</code></td></tr>

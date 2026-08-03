@@ -126,10 +126,31 @@ pub struct Job {
     pub password: Option<String>,
     /// In-stream verify: PAR2 blocks that hashed bad during this job's
     /// download (0 = clean; feeds the dashboard's verify-health timeline).
-    pub bad_blocks: u64,
+    ///
+    /// `None` means verification never RAN - a par2-less post, or a
+    /// resume that mapped no block to a recovery set. That case used to
+    /// store 0, which every reader downstream read as "verified clean":
+    /// the health tile counted un-verified downloads as clean
+    /// verifications and the timeline drew them as green ticks. Zero is
+    /// evidence only when something did the checking, so the absence of
+    /// checking is its own value.
+    pub bad_blocks: Option<u64>,
+    /// PAR2 blocks this job's in-stream verifier actually hashed (ok +
+    /// bad). What makes `bad_blocks: Some(0)` a claim rather than an
+    /// assertion - "0 bad in 12,847 blocks" is checkable, "verified
+    /// clean" alone is not. 0 whenever `bad_blocks` is None.
+    pub verify_blocks: u64,
     /// M23: the Smart Folder rule that matched at enqueue asked for TV
     /// filing ([Show]/Season NN/ + rename) at completion.
     pub tv_sort: bool,
+    /// The name of the Smart Folder rule that chose this job's category
+    /// and/or TV filing, empty when nothing matched. Provenance only, and
+    /// the reason it is stored rather than recomputed: the rules are live
+    /// and editable, so re-running them later answers "which rule would
+    /// match today", not "which rule put this download in Films". A user
+    /// looking at a job in an unexpected category is asking the second
+    /// question.
+    pub smart_rule: String,
     /// TV filing actually RAN: `out_dir` is the SHARED `Show/Season NN`
     /// library folder, not this job's private directory. Every operation
     /// that treats out_dir as "this job's stuff" (delete-with-files,
@@ -190,6 +211,18 @@ pub struct Job {
     /// M24: completion found password-protected volumes and no (or a
     /// wrong) password - the dashboard offers "unlock" on this job.
     pub password_required: bool,
+    /// TODO 101: this job's own consent to the volume-eating unpack,
+    /// given in the disk-full drawer ("extract in place by deleting the
+    /// archive parts as they are used").
+    ///
+    /// Per JOB, not a setting, because it forfeits the
+    /// retry-without-refetch property for THIS download and nothing
+    /// else. Read only in `low_disk` mode - `always` is its own consent
+    /// and `off` ignores it - and never sufficient on its own: the set
+    /// must still have verified. Persisted, because the answer is given
+    /// on a failed job in history and spent by the retry that follows,
+    /// which may be on the other side of a restart.
+    pub eat_volumes_ok: bool,
     /// The NZB's own file list is zip-shaped, spotted at enqueue. Warns
     /// in the queue before the download spends an hour arriving at a
     /// format we cannot unpack. Name-based, so an obfuscated container
@@ -207,6 +240,18 @@ pub struct Job {
     /// Stored as the bare NAME, not a sentence: the dashboard has to
     /// compose the message in the user's own language.
     pub unpack_blocked_by: String,
+    /// UX §18: the move to `move_completed` failed part way and left the
+    /// payload split. This is the SOURCE directory that still holds
+    /// files; `out_dir` has already followed the bytes that did move,
+    /// because those exist nowhere else. Empty when the job never moved
+    /// or moved whole.
+    ///
+    /// A path, not a sentence - the same rule as `unpack_blocked_by`
+    /// above, and for the same reason: the dashboard composes the
+    /// warning in the user's own language. It is also the only durable
+    /// record that the payload is in two places, since the mover's own
+    /// log line rolls out of the memory-only ring.
+    pub move_split: String,
     /// What the extractor found this set to be: the space-separated
     /// `ArchiveShape` tokens (`rar5 store one-pass`, `rar4 compressed
     /// on-disk`, ...). Empty while nothing archive-shaped has parsed yet,
@@ -248,6 +293,14 @@ pub struct Job {
     /// gaps in. Unix seconds when the retry is due; the article journal
     /// makes the rerun fetch only what's still missing.
     pub auto_retry_at: Option<u64>,
+    /// WHAT the armed retry is waiting for, as a token: `"transport"` (a
+    /// link or pool fault on this machine, short cooldown) or
+    /// `"propagation"` (articles the servers may still receive, full
+    /// cooldown). Recorded beside the stamp rather than re-derived from
+    /// `fail_message` later, because the decision that picked the DELAY
+    /// was taken here: a row that says "retrying in 2 minutes" has to be
+    /// able to say why it is 2 and not 20. `None` when no retry is armed.
+    pub auto_retry_why: Option<String>,
     /// M26 nzbget facade: post-processing parameters attached by the
     /// jsonrpc `append` (name/value pairs). Sonarr/Radarr tag every add
     /// with a `drone` GUID and match queue/history items ONLY by that
@@ -320,6 +373,34 @@ pub struct Job {
     /// polled every second by every open dashboard, and the writers this
     /// came from are gone by the time history shows it.
     pub media: Option<nzbkit::mediaprobe::MediaFacts>,
+    /// The chip in [`Job::media`] was judged against a claim name that
+    /// has since CHANGED - an identity oracle answered after pass 1
+    /// settled, and an obfuscated stem that claimed nothing must now be
+    /// judged against the canonical name that claims everything. Read
+    /// by `media_settled`, so the prober's final pass runs once more.
+    /// Deliberately not persisted: a restart just keeps the chip as
+    /// judged, which is the pre-§76 behaviour, never a wrong verdict.
+    pub media_rejudge: bool,
+    /// How many files post-processing's sweeps removed from this job's
+    /// finished directory: the cleanup-rule extensions (including the
+    /// `par_cleanup`-forced `.par2`), plus the junk sweep or
+    /// keep-media-only pass inside `finalize_names`. Zero for a job with
+    /// nothing to sweep, and for every record written before the field
+    /// existed. The counts used to be computed and dropped on the floor,
+    /// so files vanished from a finished download with no line anywhere
+    /// saying so - the history drawer now renders one from these.
+    pub cleaned_files: u32,
+    /// The `.par2` recovery files among [`Job::cleaned_files`]. Named
+    /// separately because they are deleted by a DEFAULT most users never
+    /// chose, and "where did my recovery data go" deserves its own half
+    /// of the answer.
+    pub cleaned_par2: u32,
+    /// Whether those deletes were recoverable when they ran - the
+    /// delete_to_trash setting stood and the Trash was answering. It is
+    /// the difference between "moved to the Trash" and "removed" in the
+    /// drawer line, recorded AT SWEEP TIME because the setting is live
+    /// and the drawer renders arbitrarily later.
+    pub cleaned_trash: bool,
 }
 
 /// What [`Daemon::finalize_names`] needs to know about the job it is
@@ -344,6 +425,10 @@ pub struct Finalized {
     /// The job's new directory, when renaming or the move-completed
     /// destination changed it.
     pub moved: Option<PathBuf>,
+    /// UX §18: the move-completed relocation failed part way, and this
+    /// source directory still holds part of the payload. `moved` has
+    /// followed the bytes that did move. See [`Job::move_split`].
+    pub move_split: Option<PathBuf>,
     /// The quality suffix filing actually wrote. See [`Job::filed_suffix`].
     pub suffix: String,
     /// The episode-title segment filing actually wrote (" - Children"),
@@ -353,6 +438,11 @@ pub struct Finalized {
     /// What synthesised naming concluded, for [`Job::identify`]. Empty
     /// when the ladder did not run.
     pub identify: String,
+    /// Files the junk sweep or keep-media-only pass removed. Only this
+    /// moment knows the number - the sweeps run inside finalize_names -
+    /// and it used to be discarded, so the deletes were invisible to the
+    /// job record. Feeds [`Job::cleaned_files`].
+    pub swept: usize,
 }
 
 /// The year a release was posted, from the newest article date in its
@@ -607,6 +697,7 @@ pub(super) fn spawn_sidecar(
             fleet.join(", ")
         );
     }
+    let eat_ok = job.lock_ok().eat_volumes_ok;
     let task = {
         let d = d.clone();
         let config = config.to_path_buf();
@@ -638,6 +729,9 @@ pub(super) fn spawn_sidecar(
                     false,
                     par_cleanup,
                     password,
+                    // The sidecar prefetches ANOTHER job; its consent
+                    // travels with that job's record, not this one's.
+                    eat_ok,
                     Some(progress.clone()),
                     Some(hub.clone()),
                     &nzo_id,
@@ -795,8 +889,18 @@ pub(super) async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
         // Cloned handle for the blocking finalize (the caller still
         // needs its own for park()/script).
         let d3 = d.clone();
-        let (needs_pw, blocked_by, moved, filed_sfx, filed_ttl, ident, identified) =
-            tokio::task::spawn_blocking(move || {
+        let (
+            needs_pw,
+            pw_used,
+            blocked_by,
+            moved,
+            move_split,
+            filed_sfx,
+            filed_ttl,
+            ident,
+            identified,
+            cleaned,
+        ) = tokio::task::spawn_blocking(move || {
             // Test hook: hold this job's tail open the way the field
             // does (a Finder-trash stall, a NAS move), so the queue
             // suite can pin the window where the NEXT job has drained
@@ -820,15 +924,43 @@ pub(super) async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
                 out2 = dest.clone();
             }
             let mut needs_pw = false;
-            if crate::smart::encrypted_rar(&out2).is_some() {
+            let mut pw_used: Option<String> = None;
+            let mut locked_name = String::new();
+            if let Some(vol) = crate::smart::encrypted_rar(&out2) {
+                locked_name = vol
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
                 match pw2.as_deref() {
                     Some(pw) if crate::smart::unlock(&out2, pw) => {}
                     _ => {
-                        info!(
-                            target: "unlock",
-                            "{name2:?}: volumes are password-protected - set a password to unpack"
-                        );
-                        needs_pw = true;
+                        // SAB/NZBGet-parity passwords file: the job's
+                        // own password is absent (or just failed), so
+                        // try the file's candidates top to bottom -
+                        // read fresh, so a line added minutes ago
+                        // counts. The winner is recorded onto the job
+                        // below - history then shows has_password, and
+                        // a retry of this job reuses it directly.
+                        match d3
+                            .read_unpack_passwords()
+                            .into_iter()
+                            .find(|pw| crate::smart::unlock(&out2, pw))
+                        {
+                            Some(pw) => {
+                                info!(
+                                    target: "unlock",
+                                    "{name2:?}: unlocked with a password from the passwords file"
+                                );
+                                pw_used = Some(pw);
+                            }
+                            None => {
+                                info!(
+                                    target: "unlock",
+                                    "{name2:?}: volumes are password-protected - set a password to unpack"
+                                );
+                                needs_pw = true;
+                            }
+                        }
                     }
                 }
             }
@@ -847,10 +979,20 @@ pub(super) async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
             // `Subs/subs.zip` beside a feature that
             // unpacked fine, which is worth saying and is
             // not worth failing over.
-            let blocked_by = crate::unsupported_archive_present(&out2)
+            let mut blocked_by = crate::unsupported_archive_present(&out2)
                 .filter(|u| !u.blocking)
                 .map(|u| u.display)
                 .unwrap_or_default();
+            // "never ask" prompt mode: the job completes with the set
+            // left packed for manual extraction, and since no failure
+            // text will say so, the amber still-packed note has to
+            // carry the WHY - the locked archive's own name.
+            if needs_pw
+                && blocked_by.is_empty()
+                && d3.password_prompt.lock_ok().as_str() == "never"
+            {
+                blocked_by = locked_name;
+            }
             // BEFORE the sweeps: the .par2 sidecars the fingerprint
             // rung reads are exactly what a cleanup rule deletes, and
             // `keep_media_only` inside finalize_names deletes them
@@ -863,8 +1005,18 @@ pub(super) async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
             } else {
                 d3.resolve_identity(&out2, &name2, crc2)
             };
+            // The counts survive into the job record now (see
+            // Job::cleaned_files): these sweeps delete files out of a
+            // finished download under settings and defaults, and nothing
+            // in the UI ever said so. Whether the deletes were
+            // recoverable is read AFTER the sweeps run - the setting is
+            // live and the drawer renders later, so only this moment
+            // knows - and reading it after means a Trash that latched
+            // unresponsive mid-sweep reports "removed", never a Trash
+            // that was not really used.
+            let mut cleaned = (0usize, 0usize);
             if !exts.is_empty() {
-                crate::smart::cleanup(&out2, &exts);
+                cleaned = crate::smart::cleanup(&out2, &exts);
             }
             // Auto-rename & cleanup run only once the payload is
             // actually unpacked (a still-locked job has no media
@@ -880,6 +1032,11 @@ pub(super) async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
             let mut filed_sfx = None;
             let mut filed_ttl = None;
             let mut identify = String::new();
+            // UX §18: set only when the relocation stopped part way and
+            // left the payload in two directories. Nothing else in the
+            // record can say so - `moved` follows the bytes that made
+            // it, which is exactly what makes the other half invisible.
+            let mut move_split = None;
             if !needs_pw {
                 // Rename off the canonical name when an oracle supplied
                 // one: `name2` is what the submitter called this and
@@ -901,35 +1058,94 @@ pub(super) async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
                     },
                 );
                 moved = done.moved.or(moved);
+                move_split = done.move_split;
                 filed_sfx = Some(done.suffix);
                 filed_ttl = Some(done.filed_title);
                 identify = done.identify;
+                cleaned.0 += done.swept;
             }
-            (needs_pw, blocked_by, moved, filed_sfx, filed_ttl, ident, identify)
+            let cleaned = (
+                cleaned.0,
+                cleaned.1,
+                crate::smart::delete_to_trash() && !crate::smart::trash_unresponsive(),
+            );
+            (
+                needs_pw, pw_used, blocked_by, moved, move_split, filed_sfx, filed_ttl, ident,
+                identify, cleaned,
+            )
             })
         .await
         .unwrap_or_else(|_| {
             (
                 false,
+                None,
                 String::new(),
+                None,
                 None,
                 None,
                 None,
                 crate::identity::Identity::default(),
                 String::new(),
+                (0, 0, false),
             )
         });
         {
             let mut j = job.lock_ok();
             j.password_required = needs_pw;
-            if needs_pw && j.fail_message.is_empty() {
+            // The candidate that worked becomes the job's password: a
+            // retry unlocks without consulting the list again, and the
+            // history row reports has_password.
+            if pw_used.is_some() {
+                j.password = pw_used;
+            }
+            // The in-stream probe's verified winner (the set decrypted
+            // one-pass, so the disk ladder above never ran). Owner-
+            // checked and taken, so the next job can never inherit it.
+            if j.password.is_none() {
+                let mut g = d.hub.password_found.lock_ok();
+                if g.as_ref().is_some_and(|(o, _)| *o == j.nzo_id) {
+                    j.password = g.take().map(|(_, pw)| pw);
+                }
+            }
+            // In "never ask" mode the locked outcome is not presented
+            // as a failure: the still-packed note (blocked_by above)
+            // says what happened, password_required keeps the 🔑
+            // available for whenever the user does have the password,
+            // and no text or sound nags for one.
+            if needs_pw
+                && j.fail_message.is_empty()
+                && d.password_prompt.lock_ok().as_str() != "never"
+            {
                 j.fail_message = "password required to unpack".into();
             }
             j.unpack_blocked_by = blocked_by;
+            // UX §18. Written unconditionally, so a re-run of
+            // post-processing that finally moves the rest also clears
+            // the warning. A path, not a sentence - see Job::move_split.
+            j.move_split = match &move_split {
+                Some(src) => src.to_string_lossy().to_string(),
+                None => String::new(),
+            };
             // Recorded even when it changed no filename: an IMDb id with
             // no better name is still the thing that lets the history
             // row link to what it actually is.
             if !ident.is_empty() {
+                // A settled chip was judged against the OLD claim name
+                // (an obfuscated stem claims nothing, so nothing could
+                // contradict it). The canonical name the oracle handed
+                // back claims everything - owe the job one more final
+                // pass so the bytes are judged against it.
+                let old_claim = if j.identity_name.is_empty() {
+                    j.name.clone()
+                } else {
+                    j.identity_name.clone()
+                };
+                if ident.name != old_claim
+                    && j.media.as_ref().is_some_and(|m| m.complete && m.any())
+                {
+                    j.media_rejudge = true;
+                    d.media_rejudge.lock_ok().push(j.nzo_id.clone());
+                }
                 j.identity_name = ident.name;
                 j.identity_imdb = ident.imdb;
                 j.identity_src = ident.src.to_string();
@@ -939,6 +1155,14 @@ pub(super) async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
             // lose the note the first pass wrote.
             if !identified.is_empty() {
                 j.identify = identified;
+            }
+            // ACCUMULATED, not assigned: an unlock re-runs this whole
+            // tail, and its second sweep only sees what the first left
+            // behind - overwriting would forget the first pass's count.
+            if cleaned.0 > 0 {
+                j.cleaned_files = j.cleaned_files.saturating_add(cleaned.0 as u32);
+                j.cleaned_par2 = j.cleaned_par2.saturating_add(cleaned.1 as u32);
+                j.cleaned_trash = cleaned.2;
             }
             if let Some(dest) = moved {
                 // Record whether the new home is the SHARED season folder, so
@@ -1007,10 +1231,15 @@ pub(crate) const SAB_DEFAULT_PRIORITY: i32 = -100;
 /// `paused` from it and the job itself is Normal. There is no per-category
 /// default priority in this daemon (the categories API reports -100 for
 /// every category), so the default is Normal.
+/// M14f alternative: held below everything until the original fails. Its
+/// own priority rather than a flag, so ordering and the API's priority
+/// vocabulary both keep working; `Daemon::held_as_duplicate` reads it back
+/// to tell an adder what actually happened to their job.
+pub(crate) const DUPE_PRIORITY: i32 = -3;
+
 pub(crate) fn enqueue_priority(requested: i32, duplicate: bool) -> i32 {
     if duplicate {
-        // M14f alternative: held below everything until the original fails.
-        -3
+        DUPE_PRIORITY
     } else if requested == -2 || requested == SAB_DEFAULT_PRIORITY {
         0
     } else {
@@ -1114,7 +1343,7 @@ pub(crate) fn nzbget_status(j: &Job) -> (&'static str, &'static str, &'static st
     if msg.contains("password") {
         return ("FAILURE/UNPACK", "SUCCESS", "PASSWORD");
     }
-    if msg.contains("no space left") || msg.contains("disk full") {
+    if disk_full_failure(&msg) {
         return ("FAILURE/UNPACK", "SUCCESS", "SPACE");
     }
     match fail_kind(&j.fail_message) {
@@ -1131,6 +1360,39 @@ pub(crate) fn nzbget_status(j: &Job) -> (&'static str, &'static str, &'static st
         | FailKind::Transport => ("FAILURE/HEALTH", "NONE", "NONE"),
         // Anything on this machine. Says nothing about the release.
         FailKind::Local => ("FAILURE/UNPACK", "SUCCESS", "FAILURE"),
+    }
+}
+
+/// Does this archive shape need room for the volumes AND the extracted
+/// payload at the same time? True for the shapes that materialize their
+/// parts on disk and unpack afterwards, which is what makes a disk that
+/// fits the download alone fail at the very end.
+pub(crate) fn shape_unpacks_on_disk(shape: &str) -> bool {
+    shape
+        .split_whitespace()
+        .any(|t| matches!(t, "on-disk" | "mixed-pass" | "unlock-at-end"))
+}
+
+/// Bytes the output directory must be able to take before this job can
+/// finish: what is still to fetch, plus the room the extraction needs.
+///
+/// The extracted payload is approximated by the set size - archives on
+/// Usenet are near-incompressible media - and it sits beside the parts,
+/// hence the second copy.
+///
+/// An ENCRYPTED set needs a THIRD. The finish decrypt does not work in
+/// place: it writes the plaintext into a temp file beside the ciphertext
+/// and renames it over the top, so both exist at the peak
+/// (`extract::crypto::create_decrypt_temp` + `decrypt_pass`). Counting
+/// only twice told a user with a 15.6 GB disk that a 13.85 GB encrypted
+/// job needed ~12 GB freed when the true figure was past 25, so they
+/// would have freed what we asked and failed at 96% a second time.
+pub(crate) fn unpack_space_needed(to_fetch: u64, total_bytes: u64, shape: &str) -> u64 {
+    let needed = to_fetch.saturating_add(total_bytes);
+    if shape.split_whitespace().any(|t| t == "encrypted") {
+        needed.saturating_add(total_bytes)
+    } else {
+        needed
     }
 }
 
@@ -1160,6 +1422,123 @@ pub(crate) fn nzbget_priority(p: i64) -> i32 {
 /// link that just wedged deserves a moment, and an immediate retry into
 /// a still-broken pool would spin.
 pub(super) const SHORT_RETRY_SECS: u64 = 120;
+
+/// Did this failure message come from a full disk? One matcher for the
+/// NZBGet SPACE verdict and the retry guidance, because each platform
+/// spells it differently: Unix ENOSPC says "No space left on device",
+/// Windows error 112 says "There is not enough space on the disk" - and
+/// the Windows form was invisible to a check that only knew the Unix
+/// words, so a tester's disk-full unpack reported as a generic unpack
+/// failure. Takes the message in any case; lowercases internally.
+///
+/// The numeric forms are there because the OS spells the words in the
+/// system language, but always appends "(os error N)" - and they are
+/// gated to the platform whose number that is, because the daemon
+/// classifies failures it produced itself: 112 is ERROR_DISK_FULL on
+/// Windows but EHOSTDOWN on Unix, and an unguarded match would have
+/// called a dead-host transport failure a full disk.
+pub(crate) fn disk_full_failure(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("no space left")
+        || m.contains("not enough space")
+        || m.contains("disk full")
+        // With the closing paren, so "os error 28" cannot match
+        // "os error 280" - std's io::Error always prints "(os error N)".
+        || (cfg!(windows) && m.contains("os error 112)"))
+        || (cfg!(unix) && m.contains("os error 28)"))
+}
+
+/// The classifier as a wire token, for history_json. The dashboard
+/// composes a per-kind "what to do next" line in the user's language -
+/// which needs the KIND, not the raw English diagnostic it was derived
+/// from. Tokens, not sentences, same contract as `ArchiveShape`.
+pub(crate) fn fail_kind_token(k: FailKind) -> &'static str {
+    match k {
+        FailKind::MissingArticles => "missing",
+        FailKind::Transport => "transport",
+        FailKind::Unrepairable => "unrepairable",
+        FailKind::PreflightImpossible => "preflight",
+        FailKind::Gone => "gone",
+        FailKind::Local => "local",
+    }
+}
+
+/// Tokens for the auto-retry's own reason - what the cooldown is WAITING
+/// for, which is also what decided its length (see `SHORT_RETRY_SECS`).
+pub(crate) const RETRY_WHY_TRANSPORT: &str = "transport";
+pub(crate) const RETRY_WHY_PROPAGATION: &str = "propagation";
+
+/// A sub-cause INSIDE the failure message, as a token, for the one action
+/// the drawer offers beside the reason.
+///
+/// `fail_kind` answers "whose fault, and is it worth retrying"; this
+/// answers "which button". Two failures can share a kind and need
+/// opposite next moves: `MissingArticles` because a `retention_days`
+/// setting excluded the segments is a settings row away from fixed, while
+/// `MissingArticles` on a post carrying no PAR2 at all is only ever
+/// answered by another release. Derived from the message like `fail_kind`
+/// (and for the same reason - the sentence is what the pipeline hands
+/// up), keyed on clauses `incomplete_reason` writes verbatim.
+///
+/// Empty means "no specific remedy": the kind's own action stands.
+pub(crate) fn fail_hint(msg: &str) -> &'static str {
+    if msg.starts_with("no usable servers") {
+        // Nothing was even attempted: every configured server is out of
+        // the pool. The message names them; the button opens the card.
+        "servers"
+    } else if msg.contains("configured retention") {
+        "retention"
+    } else if msg.contains("no PAR2 recovery data") {
+        "nopar2"
+    } else {
+        ""
+    }
+}
+
+/// The ONE thing worth offering a failed job, as a token.
+///
+/// Generalizes the disk-full drawer row, which is the only failure the
+/// dashboard ever gave a next move: everything else got the same generic
+/// Retry, including the two kinds the classifier itself says a retry
+/// cannot fix. Decided here rather than in the page because it is the
+/// same classification `fail_kind` and `fail_hint` already do - and
+/// because a rule ("a takedown is answered by another release, never by
+/// asking again") deserves a test, which a template literal does not get.
+///
+/// Tokens: `password` (unlock), `space` (the live free-space block),
+/// `servers`/`retention` (a settings row), `search` (find another
+/// release), `path` (show the folder), `retry` (ask again).
+pub(crate) fn fail_action(
+    kind: FailKind,
+    hint: &str,
+    msg: &str,
+    password_required: bool,
+) -> &'static str {
+    // Both of these outrank the kind: a locked archive and a full disk
+    // are `Local`, and "show the folder" answers neither of them.
+    if password_required {
+        return "password";
+    }
+    if disk_full_failure(msg) {
+        return "space";
+    }
+    // A sub-cause the message named beats the kind's default - see
+    // `fail_hint` for why two MissingArticles can want opposite moves.
+    match hint {
+        "servers" => return "servers",
+        "retention" => return "retention",
+        "nopar2" => return "search",
+        _ => {}
+    }
+    match kind {
+        // The post is the problem and asking again cannot change it.
+        FailKind::Gone | FailKind::PreflightImpossible | FailKind::Unrepairable => "search",
+        // Something on this machine: the folder is where the evidence is.
+        FailKind::Local => "path",
+        // Waiting, or the link settling, genuinely fixes these.
+        FailKind::MissingArticles | FailKind::Transport => "retry",
+    }
+}
 
 pub(crate) fn fail_kind(msg: &str) -> FailKind {
     if msg.starts_with("download incomplete") {
@@ -1330,25 +1709,89 @@ pub(crate) fn is_season_dir(p: &std::path::Path) -> bool {
 /// also took the replacement that had just landed beside it and the user
 /// was left with neither. Ignored for an unfiled job, whose directory is
 /// private either way.
+///
+/// Returns whether the files actually went, and why not when they didn't
+/// (see [`FilesGone`]). A recoverable delete that the Trash refuses now
+/// LEAVES them (see `smart::remove_user_dir` - the fallback used to be a
+/// permanent delete), so callers that tell the user what happened have to
+/// ask rather than assume.
 pub(super) fn remove_job_files(
     out_dir: &std::path::Path,
     name: &str,
     filed: bool,
     tail: &crate::smart::FiledTail,
-) {
+) -> FilesGone {
     // `filed` is the job's own persisted flag (Job::filed), NOT a shape
     // test on the current state. Deriving it from `state == Completed`
     // meant a re-queued job (retry) claimed its shared season folder as
     // private and a later delete-with-files took the whole season.
     if filed {
-        let n = crate::smart::delete_filed_episode(out_dir, name, tail);
+        let d = crate::smart::delete_filed_episode(out_dir, name, tail);
         info!(
             target: "files",
-            "{name}: TV-filed - removed {n} file(s) from {}, siblings left intact",
+            "{name}: TV-filed - removed {} file(s) from {}, siblings left intact",
+            d.removed,
             out_dir.display()
         );
+        // A refusal here leaves the episode sitting in the user's own
+        // library, which is the half of this they are most likely to
+        // find later and least likely to explain. Removing nothing at
+        // all is NOT a refusal: the matcher is deliberately conservative
+        // (a season pack, a name the rename never touched) and reporting
+        // "your files are still there" for a delete that never had a
+        // target to hit would cry wolf on every one of those.
+        match d.kept {
+            Some(why) => FilesGone::Kept(why),
+            None => FilesGone::Yes,
+        }
     } else {
-        let _ = std::fs::remove_dir_all(out_dir);
+        // Trash-aware, like every other delete of a user's downloaded
+        // content: this is the arm behind history "delete + files", a
+        // queue delete with files, and the watchlist delete_old upgrade,
+        // and it was a bare remove_dir_all - the one delete the
+        // "Deleted files go to the Trash" setting most obviously
+        // promises to soften, permanently removing whole releases while
+        // the settings hint said a wrong guess could be undone. The
+        // whole private folder goes as ONE recoverable item (a single
+        // bounded Trash call), so restoring "the download I deleted" is
+        // one drag rather than a thousand files. Read the flag here, at
+        // the delete's entry, per remove_user_file's contract.
+        let recoverable = crate::smart::delete_to_trash();
+        match crate::smart::remove_user_dir(out_dir, recoverable) {
+            Ok(()) => FilesGone::Yes,
+            Err(e) => {
+                warn!(
+                    target: "files",
+                    "{name}: could not remove {}: {e}",
+                    out_dir.display()
+                );
+                FilesGone::Kept(e.to_string())
+            }
+        }
+    }
+}
+
+/// What a delete-with-files actually managed to do on disk.
+///
+/// A plain `bool` was enough while "not removed" could only mean an error
+/// nobody could act on. It cannot carry the case this exists for: a
+/// recoverable delete the Trash refuses leaves the download exactly where
+/// it was, and the record the user was holding it by is removed anyway.
+/// The reason has to reach a surface a person actually looks at (see
+/// `Daemon::note_delete_kept`), so it travels back with the verdict rather
+/// than dying in a `warn!`.
+pub(super) enum FilesGone {
+    /// Nothing this job put on disk is left - or there was nothing there
+    /// to remove in the first place.
+    Yes,
+    /// The files are STILL on disk, and this is why.
+    Kept(String),
+}
+
+impl FilesGone {
+    /// Did the files go? For the callers that only need the old bool.
+    pub(super) fn gone(&self) -> bool {
+        matches!(self, FilesGone::Yes)
     }
 }
 
@@ -2147,7 +2590,9 @@ pub(super) fn job_json(j: &Job) -> Value {
         "defer_count": j.defer_count,
         "password": j.password,
         "bad_blocks": j.bad_blocks,
+        "verify_blocks": j.verify_blocks,
         "tv_sort": j.tv_sort,
+        "smart_rule": j.smart_rule,
         // Whether out_dir is the shared season folder. Persisted: a
         // restart that forgot it would let a delete-with-files remove a
         // whole season (see Job::filed).
@@ -2159,8 +2604,13 @@ pub(super) fn job_json(j: &Job) -> Value {
         "filed_title": j.filed_title,
         "filed_base": j.filed_base,
         "password_required": j.password_required,
+        "eat_volumes_ok": j.eat_volumes_ok,
         "zip_packed": j.zip_packed,
         "unpack_blocked_by": j.unpack_blocked_by,
+        // Persisted because it is the only record that the payload is
+        // in two places: nothing can work that out after the fact once
+        // the move's own log line has rolled out of the ring.
+        "move_split": j.move_split,
         "archive_shape": j.archive_shape,
         // The identity facts an oracle supplied. Persisted rather than
         // recomputed: every one of them cost a third-party request, and
@@ -2170,6 +2620,7 @@ pub(super) fn job_json(j: &Job) -> Value {
         "identity_imdb": j.identity_imdb,
         "identity_src": j.identity_src,
         "auto_retry_at": j.auto_retry_at,
+        "auto_retry_why": j.auto_retry_why,
         "pp_params": j.pp_params,
         "replaces": j.replaces.as_ref().map(|p| p.to_string_lossy()),
         // Survives a restart: a job the daemon was killed mid-download
@@ -2190,6 +2641,12 @@ pub(super) fn job_json(j: &Job) -> Value {
         // wake a disk full of finished downloads to learn what we
         // already knew.
         "media": j.media,
+        // What the post-processing sweeps removed (history drawer's
+        // cleanup line). Persisted: the sweeps ran once, at completion,
+        // and nothing can re-count them after the files are gone.
+        "cleaned_files": j.cleaned_files,
+        "cleaned_par2": j.cleaned_par2,
+        "cleaned_trash": j.cleaned_trash,
     })
 }
 
@@ -2257,7 +2714,24 @@ pub(super) fn job_from_json(v: &Value) -> Option<Job> {
         defer_count: v.get("defer_count").and_then(Value::as_u64).unwrap_or(0) as u32,
         demote: false,
         password: s("password"),
-        bad_blocks: v.get("bad_blocks").and_then(Value::as_u64).unwrap_or(0),
+        // Records written before verification became nullable stored 0
+        // for BOTH "nothing verified this" and "verified, nothing bad",
+        // and nothing else on the record tells them apart. A non-zero
+        // count is proof a verifier ran, so it survives as a verdict; a
+        // zero without the companion block count is unknowable and reads
+        // as "not verified" rather than claiming a check that may never
+        // have happened. New records carry `verify_blocks` and are
+        // exact.
+        bad_blocks: match (
+            v.get("bad_blocks").and_then(Value::as_u64),
+            v.get("verify_blocks").and_then(Value::as_u64),
+        ) {
+            (Some(bad), _) if bad > 0 => Some(bad),
+            (Some(bad), Some(checked)) if checked > 0 => Some(bad),
+            _ => None,
+        },
+        verify_blocks: v.get("verify_blocks").and_then(Value::as_u64).unwrap_or(0),
+        smart_rule: s("smart_rule").unwrap_or_default(),
         tv_sort,
         filed,
         // Absent on records written before filing recorded its suffix.
@@ -2285,17 +2759,23 @@ pub(super) fn job_from_json(v: &Value) -> Option<Job> {
             .get("password_required")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        eat_volumes_ok: v
+            .get("eat_volumes_ok")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         zip_packed: v
             .get("zip_packed")
             .and_then(Value::as_bool)
             .unwrap_or(false),
         unpack_blocked_by: s("unpack_blocked_by").unwrap_or_default(),
+        move_split: s("move_split").unwrap_or_default(),
         archive_shape: s("archive_shape").unwrap_or_default(),
         inner_crc: v.get("inner_crc").and_then(Value::as_u64).unwrap_or(0) as u32,
         identity_name: s("identity_name").unwrap_or_default(),
         identity_imdb: s("identity_imdb").unwrap_or_default(),
         identity_src: s("identity_src").unwrap_or_default(),
         auto_retry_at: v.get("auto_retry_at").and_then(Value::as_u64),
+        auto_retry_why: s("auto_retry_why").filter(|w| !w.is_empty()),
         pp_params: v
             .get("pp_params")
             .and_then(Value::as_array)
@@ -2337,5 +2817,15 @@ pub(super) fn job_from_json(v: &Value) -> Option<Job> {
             .get("media")
             .cloned()
             .and_then(|m| serde_json::from_value(m).ok()),
+        media_rejudge: false,
+        // Absent on records written before the cleanup line existed:
+        // zero renders no drawer row, which is all those records can
+        // truthfully say.
+        cleaned_files: v.get("cleaned_files").and_then(Value::as_u64).unwrap_or(0) as u32,
+        cleaned_par2: v.get("cleaned_par2").and_then(Value::as_u64).unwrap_or(0) as u32,
+        cleaned_trash: v
+            .get("cleaned_trash")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     })
 }

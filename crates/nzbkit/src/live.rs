@@ -35,7 +35,7 @@ use crate::sync::{MutexExt, RwLockExt};
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use md5::{Digest, Md5};
 
@@ -57,6 +57,81 @@ enum BlockState {
     Pending,
     Ok,
     Bad,
+}
+
+/// §94 B: the verified-block watermark the chase decode gates on.
+///
+/// Invariant it exists to enforce: **the chase decode may only consume
+/// bytes the PAR2 set has vouched for** - then a repair can never
+/// rewrite consumed bytes (repairs only target Bad blocks, and a gated
+/// decode never consumed a Bad or Pending block), and the frontier's
+/// `"repair rewrote chased bytes"` demote becomes structurally
+/// unreachable instead of being the outcome.
+///
+/// One cell per slot in VOLUME-offset space. `None` = ungated (no set,
+/// slot unclaimed, or the gate is switched off) and reads as
+/// `u64::MAX`; a claim engages the cell at 0 and verification advances
+/// it monotonically. `u64::MAX` after engagement means "every block
+/// verified" - the tail past the last block needs no gate.
+///
+/// Waiters poll with a bounded timeout instead of pairing this condvar
+/// with the frontier's: a gate-blocked reader must still observe
+/// buffer aborts and demotes, which notify the frontier's own condvar
+/// (the pool-deadlock rule - an Err must never hang a waiter).
+pub struct VerifyGate {
+    marks: Mutex<Vec<Option<u64>>>,
+    cv: Condvar,
+}
+
+impl VerifyGate {
+    pub fn new(n_slots: usize) -> Arc<VerifyGate> {
+        Arc::new(VerifyGate {
+            marks: Mutex::new(vec![None; n_slots]),
+            cv: Condvar::new(),
+        })
+    }
+
+    /// The slot's current watermark; ungated slots read as `u64::MAX`.
+    pub fn watermark(&self, slot: usize) -> u64 {
+        self.marks.lock_ok()[slot].unwrap_or(u64::MAX)
+    }
+
+    /// A claim engaged the gate for this slot: from here on the decode
+    /// waits for verification. Idempotent; never lowers an existing mark.
+    pub(crate) fn engage(&self, slot: usize) {
+        let mut m = self.marks.lock_ok();
+        if m[slot].is_none() {
+            m[slot] = Some(0);
+            drop(m);
+            self.cv.notify_all();
+        }
+    }
+
+    /// Monotonic advance (a lower value than the current one is a stale
+    /// racer and is dropped).
+    pub(crate) fn advance(&self, slot: usize, bytes: u64) {
+        let mut m = self.marks.lock_ok();
+        let cur = m[slot].unwrap_or(0);
+        if bytes > cur || m[slot].is_none() {
+            m[slot] = Some(bytes.max(cur));
+            drop(m);
+            self.cv.notify_all();
+        }
+    }
+
+    /// Park until the slot's watermark covers `offset`, or `timeout`
+    /// passes (callers loop and re-check their own abort conditions -
+    /// the bounded wait is what keeps an abort from stranding a
+    /// gate-blocked reader).
+    pub fn wait_past(&self, slot: usize, offset: u64, timeout: std::time::Duration) {
+        let m = self.marks.lock_ok();
+        if m[slot].unwrap_or(u64::MAX) > offset {
+            return;
+        }
+        let _ = self
+            .cv
+            .wait_timeout_while(m, timeout, |m| m[slot].unwrap_or(u64::MAX) <= offset);
+    }
 }
 
 /// A boundary block accumulating bytes from more than one article.
@@ -242,6 +317,10 @@ struct SlotState {
     /// Blocks verified in-stream (for the zero-read-back accounting).
     live_ok: u64,
     live_bad: u64,
+    /// §94 B: count of leading contiguous Ok blocks, maintained
+    /// incrementally so watermark publication is O(advance), not
+    /// O(blocks) per span.
+    ok_prefix: usize,
 }
 
 enum Plan {
@@ -283,6 +362,9 @@ impl SlotReport {
 pub struct LiveVerifier {
     plan: RwLock<Plan>,
     slots: Vec<Mutex<SlotState>>,
+    /// §94 B: watermark handle the chase decode gates on; None unless
+    /// the run wired one (env-gated in get.rs while the feature soaks).
+    gate: Mutex<Option<Arc<VerifyGate>>>,
     /// Run-wide counters for the dashboard's verify lane (M14h).
     live_ok_total: std::sync::atomic::AtomicU64,
     live_bad_total: std::sync::atomic::AtomicU64,
@@ -321,6 +403,7 @@ impl LiveVerifier {
             partials_spilled: Default::default(),
             fast: Default::default(),
             lean: Default::default(),
+            gate: Mutex::new(None),
             slots: (0..n_slots)
                 .map(|_| {
                     Mutex::new(SlotState {
@@ -337,10 +420,42 @@ impl LiveVerifier {
                         unmatchable: false,
                         live_ok: 0,
                         live_bad: 0,
+                        ok_prefix: 0,
                     })
                 })
                 .collect(),
         }
+    }
+
+    /// §94 B: hand this verifier the watermark handle to publish through.
+    /// Wire before articles flow; slots claimed afterwards engage their
+    /// cell at claim time, and every block transition advances it.
+    pub fn set_gate(&self, gate: Arc<VerifyGate>) {
+        *self.gate.lock_ok() = Some(gate);
+    }
+
+    /// §94 B: advance the slot's published watermark off its contiguous
+    /// Ok-block prefix. Called under the slot lock after any block
+    /// transition; O(newly-contiguous blocks) thanks to `ok_prefix`.
+    /// A fully-verified slot publishes `u64::MAX` - the tail past the
+    /// last block (and the whole file once every block claims) needs no
+    /// gate.
+    fn gate_publish(&self, slot: usize, s: &mut SlotState, block_size: usize) {
+        if s.file.is_none() {
+            return;
+        }
+        let Some(g) = self.gate.lock_ok().clone() else {
+            return;
+        };
+        while s.ok_prefix < s.blocks.len() && s.blocks[s.ok_prefix] == BlockState::Ok {
+            s.ok_prefix += 1;
+        }
+        let bytes = if s.ok_prefix == s.blocks.len() {
+            u64::MAX
+        } else {
+            s.ok_prefix as u64 * block_size as u64
+        };
+        g.advance(slot, bytes);
     }
 
     /// Declare that no PAR2 set will ever arrive (NZB has none).
@@ -406,6 +521,22 @@ impl LiveVerifier {
             return false;
         }
         self.slots[slot].lock_ok().file.is_some()
+    }
+
+    /// Has an ACTIVE set claimed this slot as one of its files?
+    ///
+    /// The same question [`Self::delegates_integrity`] asks, without its
+    /// fast/lean verify conditions - those are about whether the article
+    /// CRC may be skipped, which is a different matter from whether the
+    /// set speaks for these bytes. Completion accounting needs the plain
+    /// form: a slot the set covers has its bytes proven (or rebuilt) by
+    /// the set, so this run's own write-coverage map is not the witness
+    /// to consult about it. Name matching alone cannot answer it - an
+    /// obfuscated post's slot hint is a hash, and the set's FileDesc
+    /// carries the real name.
+    pub fn slot_in_set(&self, slot: usize) -> bool {
+        matches!(&*self.plan.read_ok(), Plan::Active(_))
+            && self.slots[slot].lock_ok().file.is_some()
     }
 
     pub fn set(&self) -> Option<Arc<Par2Set>> {
@@ -537,6 +668,11 @@ impl LiveVerifier {
             s.capture_head(offset, data);
             if s.unmatchable || !s.try_match(slot, active) {
                 return;
+            }
+            // §94 B: a fresh claim engages the gate - from here the chase
+            // decode for this slot waits on verification.
+            if let Some(g) = self.gate.lock_ok().clone() {
+                g.engage(slot);
             }
         }
 
@@ -746,6 +882,10 @@ impl LiveVerifier {
                     record(&mut s, bi, final_crc == file.blocks[bi].crc32);
                 }
             }
+            // §94 B: every claim above may have extended the contiguous
+            // Ok prefix - publish before the slot lock drops so a gated
+            // chase parked at the old watermark wakes.
+            self.gate_publish(slot, &mut s, bs);
         }
     }
 
@@ -846,8 +986,12 @@ impl LiveVerifier {
         let mut s = self.slots[slot].lock_ok();
         // Last-chance match (e.g. every article of the slot arrived before
         // activation, so on_data never ran while Active).
-        if s.file.is_none() && !s.unmatchable {
-            s.try_match(slot, active);
+        if s.file.is_none()
+            && !s.unmatchable
+            && s.try_match(slot, active)
+            && let Some(g) = self.gate.lock_ok().clone()
+        {
+            g.engage(slot);
         }
         let fi = s.file?;
         let file = &active.set.files[fi];
@@ -866,6 +1010,29 @@ impl LiveVerifier {
         if file.blocks.is_empty() {
             // No IFSC: whole-file MD5 is the only check.
             let ok = src_md5(&src, file.length).is_ok_and(|md5| md5 == file.md5);
+            // §94 B: this slot's gate was ENGAGED at claim time (on_data
+            // and the last-chance match above both engage), and a
+            // no-IFSC slot has no block stream to advance it - so its
+            // watermark sat at 0 forever, and any RAR/7z frontier reader
+            // waiting on it blocked until chase_finish joined the worker
+            // and the job hung (Codex sweep 3 Aug M6). The whole-file
+            // MD5 IS this slot's verdict, and it has now been taken, so
+            // the gate is released either way: a hung worker is
+            // unbounded, while a chase fed damaged bytes fails its own
+            // CRC and demotes to the disk ladder, which is bounded. The
+            // damage itself is not swallowed - it rides the bad_blocks
+            // report below, exactly as an IFSC slot's would.
+            if let Some(g) = self.gate.lock_ok().clone() {
+                g.advance(slot, u64::MAX);
+            }
+            if !ok {
+                tracing::warn!(
+                    target: "verify",
+                    "{}: whole-file MD5 failed (no IFSC blocks) - \
+                     releasing the chase gate; the chase will demote",
+                    file.name
+                );
+            }
             return Some(SlotReport {
                 par2_name: Some(file.name.clone()),
                 total_blocks: 0,
@@ -917,6 +1084,8 @@ impl LiveVerifier {
                 };
                 s.blocks[bi] = if ok { BlockState::Ok } else { BlockState::Bad };
             }
+            // §94 B: settle read-back claims advance the watermark too.
+            self.gate_publish(slot, &mut s, bs);
         }
         for (bi, st) in s.blocks.iter().enumerate() {
             if *st == BlockState::Bad {
@@ -1236,6 +1405,33 @@ pub fn summarize_damage<'a>(reports: impl Iterator<Item = &'a SlotReport>) -> Da
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// §94 B VerifyGate contract: ungated reads as MAX, a claim engages
+    /// at 0, advances are monotonic (a stale racer can never lower the
+    /// mark), and wait_past returns immediately once covered.
+    #[test]
+    fn verify_gate_engage_advance_monotonic() {
+        let g = VerifyGate::new(2);
+        assert_eq!(g.watermark(0), u64::MAX, "ungated = MAX");
+        g.engage(0);
+        assert_eq!(g.watermark(0), 0, "engaged at zero");
+        assert_eq!(g.watermark(1), u64::MAX, "other slots untouched");
+        g.advance(0, 4096);
+        assert_eq!(g.watermark(0), 4096);
+        g.advance(0, 1024); // stale racer
+        assert_eq!(g.watermark(0), 4096, "advance is monotonic");
+        g.engage(0); // idempotent, never lowers
+        assert_eq!(g.watermark(0), 4096);
+        g.advance(0, u64::MAX);
+        assert_eq!(g.watermark(0), u64::MAX, "fully verified ungates");
+        // Covered: returns without blocking.
+        g.wait_past(0, 0, std::time::Duration::from_secs(5));
+        // Uncovered: bounded by the timeout, not hung.
+        g.engage(1);
+        let t0 = std::time::Instant::now();
+        g.wait_past(1, 100, std::time::Duration::from_millis(50));
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2));
+    }
 
     /// Pre-activation spans are re-fed by the M15b backfill under ONE
     /// source per slot, so a span no wire CRC covered must not come back

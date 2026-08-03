@@ -2,8 +2,13 @@
 <!-- DMG window background. The Finder window is 660x400 pt; the canvas
      is a 660x660 SQUARE (all design in the top 400) because qlmanage
      pads non-square thumbnails with white - a square canvas renders
-     edge-to-edge dark. Palette = the dashboard dark theme. The bottom
-     band narrates the unsigned-app Gatekeeper path (shared rule 7). -->
+     edge-to-edge dark. Palette = the dashboard dark theme.
+     Layout contract with make-dmg-dsstore.py:
+       NzbFast.app icon center (165,165), Applications (495,165),
+       "How to install.html" (585,322) beside panel 4.
+     The bottom band walks the unsigned-app first launch as four
+     numbered panels (older macOS: right-click Open; newer macOS:
+     Open Anyway in System Settings), pointing at the bundled guide. -->
 <svg width="660" height="660" viewBox="0 0 660 660" xmlns="http://www.w3.org/2000/svg">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
@@ -28,22 +33,86 @@
           font-size="12" fill="#8991a5">the fast Usenet downloader</text>
   </g>
 
-  <!-- drag arrow between the two icon slots (icons at x=165 and x=495, y≈185) -->
+  <!-- drag arrow between the two icon slots (icons at x=165 and x=495, y=165) -->
   <g stroke="#4da3ff" stroke-width="4" fill="none" opacity="0.85" stroke-linecap="round">
-    <path d="M 245 185 L 400 185"/>
-    <path d="M 400 185 L 382 173 M 400 185 L 382 197"/>
+    <path d="M 245 165 L 400 165"/>
+    <path d="M 400 165 L 382 153 M 400 165 L 382 177"/>
   </g>
-  <text x="330" y="164" text-anchor="middle"
+  <text x="330" y="144" text-anchor="middle"
         font-family="-apple-system, 'Helvetica Neue', Helvetica, Arial, sans-serif"
         font-size="12.5" fill="#8991a5">drag to install</text>
 
-  <!-- unsigned-app narration band -->
-  <rect x="24" y="306" width="612" height="70" rx="10"
-        fill="#1e222b" stroke="rgba(140,150,175,.22)"/>
-  <text x="40" y="330" font-family="-apple-system, 'Helvetica Neue', Helvetica, Arial, sans-serif"
-        font-size="13" font-weight="700" fill="#f5b445">First launch: macOS will warn - nzbfast isn't Apple-notarized yet.</text>
-  <text x="40" y="350" font-family="-apple-system, 'Helvetica Neue', Helvetica, Arial, sans-serif"
-        font-size="12.5" fill="#e8eaf0">Right-click NzbFast in Applications and choose Open - or open System Settings →</text>
-  <text x="40" y="367" font-family="-apple-system, 'Helvetica Neue', Helvetica, Arial, sans-serif"
-        font-size="12.5" fill="#e8eaf0">Privacy &amp; Security, scroll down, and click “Open Anyway”.</text>
+  <!-- headline over the step panels -->
+  <text x="22" y="252" font-family="-apple-system, 'Helvetica Neue', Helvetica, Arial, sans-serif"
+        font-size="12.5" font-weight="700" fill="#f5b445">First launch needs two extra clicks - nzbfast isn't Apple-notarized yet</text>
+
+  <!-- step panels: 4 cards, 116x124, x = 22 / 148 / 274 / 400, y = 262 -->
+  <g font-family="-apple-system, 'Helvetica Neue', Helvetica, Arial, sans-serif">
+
+    <!-- panel 1: drag -->
+    <g transform="translate(22,262)">
+      <rect width="116" height="124" rx="10" fill="#1e222b" stroke="rgba(140,150,175,.22)"/>
+      <circle cx="18" cy="19" r="10" fill="url(#bolt)"/>
+      <text x="18" y="23" text-anchor="middle" font-size="11.5" font-weight="700" fill="#0e1014">1</text>
+      <text x="34" y="23" font-size="11" font-weight="700" fill="#e8eaf0">Install</text>
+      <!-- glyph: arrow into a folder slot -->
+      <g transform="translate(88,10)" stroke="#4da3ff" stroke-width="2" fill="none" stroke-linecap="round">
+        <path d="M 9 0 L 9 10 M 9 10 L 4 5 M 9 10 L 14 5"/>
+        <path d="M 2 14 L 16 14"/>
+      </g>
+      <text x="12" y="52" font-size="10.5" fill="#c3c9d8">Drag NzbFast onto</text>
+      <text x="12" y="67" font-size="10.5" fill="#c3c9d8">the Applications</text>
+      <text x="12" y="82" font-size="10.5" fill="#c3c9d8">folder above.</text>
+    </g>
+
+    <!-- panel 2: eject -->
+    <g transform="translate(148,262)">
+      <rect width="116" height="124" rx="10" fill="#1e222b" stroke="rgba(140,150,175,.22)"/>
+      <circle cx="18" cy="19" r="10" fill="url(#bolt)"/>
+      <text x="18" y="23" text-anchor="middle" font-size="11.5" font-weight="700" fill="#0e1014">2</text>
+      <text x="34" y="23" font-size="11" font-weight="700" fill="#e8eaf0">Eject</text>
+      <!-- glyph: eject symbol -->
+      <g transform="translate(88,10)" fill="#4da3ff">
+        <path d="M 9 0 L 17 8 L 1 8 Z"/>
+        <rect x="1" y="11" width="16" height="3" rx="1.5"/>
+      </g>
+      <text x="12" y="52" font-size="10.5" fill="#c3c9d8">Eject this disk:</text>
+      <text x="12" y="67" font-size="10.5" fill="#c3c9d8">click the eject icon</text>
+      <text x="12" y="82" font-size="10.5" fill="#c3c9d8">next to nzbfast in</text>
+      <text x="12" y="97" font-size="10.5" fill="#c3c9d8">the Finder sidebar.</text>
+    </g>
+
+    <!-- panel 3: first launch, right-click Open -->
+    <g transform="translate(274,262)">
+      <rect width="116" height="124" rx="10" fill="#1e222b" stroke="rgba(140,150,175,.22)"/>
+      <circle cx="18" cy="19" r="10" fill="url(#bolt)"/>
+      <text x="18" y="23" text-anchor="middle" font-size="11.5" font-weight="700" fill="#0e1014">3</text>
+      <text x="34" y="23" font-size="11" font-weight="700" fill="#e8eaf0">Open it</text>
+      <!-- glyph: context menu card -->
+      <g transform="translate(90,10)">
+        <rect width="16" height="14" rx="2" fill="none" stroke="#4da3ff" stroke-width="2"/>
+        <path d="M 3 5 L 13 5 M 3 9 L 10 9" stroke="#4da3ff" stroke-width="1.6" stroke-linecap="round"/>
+      </g>
+      <text x="12" y="52" font-size="10.5" fill="#c3c9d8">First launch must</text>
+      <text x="12" y="67" font-size="10.5" fill="#c3c9d8">be a right-click on</text>
+      <text x="12" y="82" font-size="10.5" fill="#c3c9d8">NzbFast in Applica-</text>
+      <text x="12" y="97" font-size="10.5" fill="#c3c9d8">tions, then Open.</text>
+    </g>
+
+    <!-- panel 4: the Gatekeeper dialog, both shapes -->
+    <g transform="translate(400,262)">
+      <rect width="116" height="124" rx="10" fill="#1e222b" stroke="rgba(245,180,69,.45)"/>
+      <circle cx="18" cy="19" r="10" fill="#f5b445"/>
+      <text x="18" y="23" text-anchor="middle" font-size="11.5" font-weight="700" fill="#0e1014">4</text>
+      <text x="34" y="23" font-size="11" font-weight="700" fill="#e8eaf0">If blocked</text>
+      <!-- glyph: shield -->
+      <path transform="translate(92,10)" d="M 7 0 L 14 3 L 14 8 C 14 12.5 11 15 7 16.5 C 3 15 0 12.5 0 8 L 0 3 Z"
+            fill="none" stroke="#f5b445" stroke-width="2"/>
+      <text x="12" y="46" font-size="10.5" fill="#c3c9d8">"Apple could not</text>
+      <text x="12" y="61" font-size="10.5" fill="#c3c9d8">verify...": go to</text>
+      <text x="12" y="76" font-size="10.5" fill="#c3c9d8">Privacy &amp; Security,</text>
+      <text x="12" y="91" font-size="10.5" fill="#c3c9d8">press Open Anyway.</text>
+      <text x="12" y="111" font-size="10.5" font-weight="700" fill="#4da3ff">Full guide &#8594;</text>
+    </g>
+  </g>
 </svg>

@@ -171,6 +171,23 @@ pub struct Daemon {
     /// Decoded bytes of the ACTIVE job (shared with the get pipeline).
     pub progress: Arc<AtomicU64>,
     pub active_total: AtomicU64,
+    /// The nzo_id whose NETWORK phase owns `progress` / `active_total`
+    /// right now, or None between jobs.
+    ///
+    /// The scheduler deliberately starts job N+1 while job N's tail
+    /// (settle, verify, repair, unpack) still runs, and BOTH stay
+    /// `Downloading` in the queue for all of it - so "the Downloading
+    /// slot" was never a safe way to pair a row with these counters. It
+    /// was not one: job N+1 zeroes them at its start, and job N's row,
+    /// the hero card and the drawer's per-server baseline all read the
+    /// globals unconditionally, so a finishing job's bar fell from ~98%
+    /// to 0 and then climbed with a download that was not its own.
+    ///
+    /// Written with the counters themselves (one lock section, so no
+    /// reader can pair this owner with the next job's zeroes) and
+    /// cleared at network-drain beside `started_at`, whose lifetime this
+    /// exactly shares: "this job's network phase is live".
+    pub active_dl: Mutex<Option<String>>,
     pub started_at: Mutex<Option<Instant>>,
     /// When the daemon last stopped downloading - the clock the
     /// idle-release policy runs on. Initialised at boot, so a daemon
@@ -181,6 +198,12 @@ pub struct Daemon {
     /// now". Releasing an account needs the other half of that: how long
     /// it has been since one was.
     pub last_download_end: Mutex<Instant>,
+    /// Open transfer-stall episode on the active fetch, if any:
+    /// (owning nzo_id, when bytes last moved). Written only by the
+    /// watchdog's stall tracker (tasks.rs) - observation, never action -
+    /// and read by the queue payload so the active row can say "no data
+    /// for Ns" instead of a silently flat chart.
+    pub stall_since: Mutex<Option<(String, Instant)>>,
     pub next_id: AtomicU64,
     /// Download root. Live-swappable (Settings "Download folder"): a change
     /// applies to the NEXT enqueue without a restart. Read via `out_dir()`.
@@ -375,6 +398,12 @@ pub struct Daemon {
     pub oracle_route: std::sync::atomic::AtomicBool,
     /// The running prefetch sidecar, if any.
     pub sidecar: Mutex<Option<Sidecar>>,
+    /// nzo_ids whose media chip settled before the identity oracle
+    /// answered, so the §76 prober owes them one more on-disk pass
+    /// against the canonical name. Pushed by post-processing, drained
+    /// by the prober each tick (its final-pass list is task-local, and
+    /// a settled job has already left it).
+    pub media_rejudge: Mutex<Vec<String>>,
     /// Best sustained download rate seen this session (bytes/sec) - the
     /// reference healthy jobs set for judging slow ones. Fed by the
     /// watchdog's rolling window and by completed-job averages.
@@ -389,6 +418,17 @@ pub struct Daemon {
     /// M14k RSS feeds - a live setting: the poller re-reads this list
     /// each pass, so dashboard edits apply without a restart.
     pub feeds: Mutex<Vec<crate::rss::FeedConfig>>,
+    /// §G: what each feed's last poll did, keyed by feed url. In memory
+    /// only - it describes this daemon's run, and a poll interval is
+    /// minutes, so a restart refills it almost at once. Pruned by the
+    /// poller to the feeds that still exist.
+    pub feed_health: Mutex<std::collections::HashMap<String, crate::rss::FeedHealth>>,
+    /// §G: the last refusal each news server gave, kept AFTER the pool
+    /// it came from is gone. `hub.pool_live` only exists while a job is
+    /// running, so the Providers card's refusal detail vanished the
+    /// moment the queue drained - which is exactly when someone goes
+    /// looking for why nothing downloaded.
+    pub last_refusals: Mutex<std::collections::HashMap<String, ServerRefusal>>,
     /// M35 third-party Newznab indexers - a live setting, read on every
     /// pull search. Entries carry the user's per-site apikey: masked in
     /// get_config (`has_key`), never logged, never sent to a browser.
@@ -483,6 +523,30 @@ pub struct Daemon {
     /// M23 cleanup rules - file extensions deleted from a job's folder
     /// after successful completion. Empty = off.
     pub cleanup_exts: Mutex<Vec<String>>,
+    /// SAB/NZBGet-parity passwords file (resolved path; default
+    /// `passwords.txt` next to the config): plain text, one candidate
+    /// archive password per line, tried in order when a job's volumes
+    /// are encrypted and its own password is absent or wrong - both by
+    /// the in-stream probe mid-download and by the completion unlock.
+    /// Read fresh at every use so hand-edits apply immediately. The
+    /// CONTENTS are credentials and never cross get_config or the log;
+    /// only the path and a count do.
+    pub password_file: Mutex<PathBuf>,
+    /// What the dashboard does when an archive turns out passworded:
+    /// "now" (prompt the moment the live probe wants one), "done"
+    /// (prompt when the job finishes locked - the default), or "never"
+    /// (no prompts: the job completes with the archive left packed,
+    /// reported through unpack_blocked_by). Consumed client-side except
+    /// for the "never" completion shape, which finalize applies.
+    pub password_prompt: Mutex<String>,
+    /// TODO 101: "off" (the default - volumes are only ever swept AFTER
+    /// a successful extraction), "low_disk" (eat them during extraction,
+    /// but only on a job whose forecast says it cannot otherwise fit and
+    /// whose user consented in the disk-full drawer), or "always" (every
+    /// on-disk unpack). Mirrored into [`crate::eatvol`], which is where
+    /// the unpack ladder reads it from - several layers below anything
+    /// holding a Daemon. An unverified set is never eaten in any mode.
+    pub unpack_eat_volumes: Mutex<String>,
     /// TODO 24D user-definable categories - a live setting: match rules
     /// (Smart Folder syntax) that classify releases into user kinds at
     /// scan/finalize time, each with a declared base behavior. Order is
@@ -502,8 +566,9 @@ pub struct Daemon {
     /// A switch rather than an assumption: it is the user's line, the
     /// requests name a release they downloaded, and somebody who does
     /// not want their daemon talking to third parties about that is
-    /// entitled to say so. No dashboard control - it is an API setting,
-    /// like the other things nobody should have to think about.
+    /// entitled to say so - which is why it is now an advanced row on
+    /// the Auto-rename card rather than an API-only setting. Somebody
+    /// who wants to say no has to be able to find the switch.
     pub identity_lookup: std::sync::atomic::AtomicBool,
     /// Auto-rename: on completion, rename the folder + main media file to a
     /// friendly "Title (Year)[ quality]" form (TV keeps Show - S01E02).
@@ -709,6 +774,16 @@ pub struct Daemon {
     /// download. Survives only in memory - a restart is itself an idle
     /// moment and the next prune re-raises it.
     pub compact_pending: std::sync::atomic::AtomicBool,
+    /// Truth-audit I: what the last AUTOMATIC index trim removed, and
+    /// when - (unix seconds, releases removed). The manual button
+    /// narrates its own outcome in full; the hourly pass that does the
+    /// same work silently was the reason a user could watch their index
+    /// shrink with nothing anywhere admitting to it.
+    ///
+    /// In memory only. It describes this daemon's run: a restart has not
+    /// trimmed anything yet, and claiming a trim from a previous process
+    /// would be answering a question about now with a fact about then.
+    pub last_auto_trim: std::sync::Mutex<Option<(i64, u64)>>,
     /// Releases and titles the user has actually looked at: title_key /
     /// release id → unix seconds of the last touch. This is the fourth
     /// protection the size cap honours ("don't evict what I've been
@@ -725,8 +800,16 @@ pub struct Daemon {
     pub index_gates: Mutex<(String, Option<crate::gates::Gates>)>,
     /// M21: the connection's full line speed in bytes/sec (0 = unset).
     /// SAB remote apps set speed limits as PERCENTAGES - this is what
-    /// the percentage is of.
+    /// the percentage is of. Doubles as the tuner's aim point: when the
+    /// measured capability of every enabled provider together falls
+    /// well short of it, `tune_hint` says so and suggests the lever.
     pub line_speed: AtomicU64,
+    /// What the connection tuner wants the user to know: a shortfall
+    /// against `line_speed` with the likeliest remedy, or empty when
+    /// capability is fine (or unjudgeable - line speed unset, or an
+    /// enabled server not yet probed). Read-only in the settings API;
+    /// written by the probe loop and manual ladder runs.
+    pub tune_hint: Mutex<String>,
     /// CPU% sampling state for stats: (sample time, cpu-secs, last pct).
     pub(super) cpu_sample: Mutex<Option<(Instant, f64, f64)>>,
     /// Rolling (time, decoded-bytes) samples for the live speed readout -
@@ -759,6 +842,28 @@ pub struct Daemon {
     pub(super) verify_lean: std::sync::atomic::AtomicBool,
     /// Pause new jobs below this many free bytes (0 = off).
     pub(super) min_free: AtomicU64,
+    /// Why the scheduler is starting nothing, for the queue payload:
+    /// `("disk", free_gb, floor_gb)` while the min_free guard holds, or
+    /// `("quota", spent_gb, cap_gb)` while the period's quota is spent.
+    /// `None` when downloads can start. Mirrors the worker's own
+    /// guard_reason - without this the dashboard showed "idle" over a
+    /// full queue and the only explanation lived in the daemon log.
+    pub(super) queue_hold: Mutex<Option<(String, f64, f64)>>,
+    /// Who paused the queue, for the header pill: `"user"` (a person at
+    /// the dashboard, a remote app, the API) or `"schedule"` (a schedule
+    /// entry fired). The offline case is derived from
+    /// `paused_by_offline` at render time and needs no slot here.
+    ///
+    /// Display only - nothing schedules on this. A pause the user never
+    /// made read exactly like one they did, so the only way to find out
+    /// that a quiet hour had started was to open Settings and work
+    /// through the schedule by hand.
+    pub(super) pause_source: Mutex<&'static str>,
+    /// Who set the speed ceiling now in force: `"user"` (the dashboard
+    /// or the config API), `"schedule"`, or `"api"` (a remote app's rate
+    /// call). `"auto"` is derived from `auto_speed` at render time.
+    /// Display only, same reasoning as `pause_source`.
+    pub(super) limit_source: Mutex<&'static str>,
     /// M32: seconds before the one automatic retry of a job that failed
     /// with missing articles (0 = off). Configured in minutes
     /// (auto_retry_mins); NZBFAST_AUTO_RETRY_SECS overrides for tests.
@@ -769,12 +874,73 @@ pub struct Daemon {
     pub(super) quota_period: std::sync::atomic::AtomicU8,
     /// Watch folder for dropped .nzb files (None = off).
     pub(super) watch_dir: Mutex<Option<PathBuf>>,
+    /// Keep the picked-up .nzb in the watch folder instead of moving it
+    /// to the Trash (Gary: collectors, and handing the file to someone
+    /// for debugging). Off = today's behaviour, where deletion IS the
+    /// processed-marker; on, the marker is the persisted seen-set the
+    /// watch loop keeps beside the spool (see watch_seen_path), or every
+    /// restart would re-download the whole folder. Live - read per
+    /// pickup, so it needs no boot-apply beyond the saved-settings replay.
+    pub watch_keep_nzb: AtomicBool,
     /// Watch-folder files that failed to parse/enqueue, with the
-    /// (mtime, len, error) they failed at. Skipped on later passes until
-    /// the file changes - with the watch folder defaulting to the user's
-    /// whole Downloads folder, a stray unparseable .nzb must not be
-    /// re-read every 5 s forever. Surfaced in queue_json for the UI.
-    pub(super) watch_failed: Mutex<std::collections::HashMap<PathBuf, (u64, u64, String)>>,
+    /// (mtime, len, error, related nzo_id) they failed at. Skipped on
+    /// later passes until the file changes - with the watch folder
+    /// defaulting to the user's whole Downloads folder, a stray
+    /// unparseable .nzb must not be re-read every 5 s forever. Surfaced
+    /// in queue_json for the UI.
+    ///
+    /// The id is the RECORD this file lost to, empty when there isn't
+    /// one: "already downloaded" is only actionable if the History entry
+    /// standing in the way can be reached, and matching it back up by
+    /// name in the page finds the wrong row for a re-post.
+    pub(super) watch_failed: Mutex<std::collections::HashMap<PathBuf, (u64, u64, String, String)>>,
+    /// Recent watch-folder ingests: (file name, source folder's display
+    /// name, unix seconds), newest last, capped small. Surfaced in
+    /// queue_json so an open dashboard can toast the pickup the moment
+    /// it happens - the consumed file vanishes from the folder (a
+    /// browser marks its download "Removed"), and without this the
+    /// disappearance had no explanation anywhere a user looks (Gary,
+    /// v1.0.14).
+    pub(super) watch_picked: Mutex<std::collections::VecDeque<(String, String, i64)>>,
+    /// M32: automatic retries that have just RE-QUEUED, as (nzo_id, name,
+    /// unix seconds), newest last, capped small. The same ring shape as
+    /// `watch_picked` and for the same reason: the moment is invisible
+    /// otherwise. A failed row is announced, sits in History for its
+    /// cooldown, then silently disappears from History and reappears in
+    /// the queue - which reads as the daemon losing the record and
+    /// starting an unasked-for download. Surfaced in queue_json; the
+    /// dashboard toasts each entry once.
+    pub(super) auto_retried: Mutex<std::collections::VecDeque<(String, String, i64)>>,
+    /// §96.3: targets the give-up breaker has just stopped chasing:
+    /// (the release that failed last, how many distinct releases had
+    /// failed, unix seconds), newest last, capped small. Same shape and
+    /// purpose as `watch_picked`: the breaker's decision only existed on
+    /// a `warn!` line, so a watched show simply stopped arriving with
+    /// nothing anywhere to say why.
+    pub(super) giveup_tripped: Mutex<std::collections::VecDeque<(String, u64, i64)>>,
+    /// Recent watchlist delete_old upgrades that removed the superseded
+    /// copy's record: (new release stem, superseded stem, superseded
+    /// quality, what became of its files, unix seconds), newest last,
+    /// capped small. The fate is `"trash"`, `"gone"` or `"kept"` - three
+    /// states, not two, because a Trash that refuses leaves the old copy
+    /// on disk and the toast must not announce a delete that did not
+    /// happen.
+    /// Same contract as `watch_picked` - surfaced in queue_json so an
+    /// open dashboard can toast the moment. The upgrade removes a
+    /// completed download AND its history row, and until this existed
+    /// two log lines were the only narration of a whole release
+    /// disappearing.
+    pub(super) watch_upgraded:
+        Mutex<std::collections::VecDeque<(String, String, String, String, i64)>>,
+    /// Deletes whose RECORD went but whose FILES did not: (job name, the
+    /// path still on disk, why it was refused, unix seconds), newest
+    /// last, capped small. See `Daemon::note_delete_kept`.
+    ///
+    /// Unlike the rings above this one is not a moment that scrolls past.
+    /// The dashboard keeps it on screen until the user dismisses it,
+    /// because the path IS the handle: the history row they would have
+    /// found the download by is exactly what the delete removed.
+    pub(super) delete_kept: Mutex<std::collections::VecDeque<(String, String, String, i64)>>,
     /// Failed API-key attempts per source address: (count, window start).
     ///
     /// The key comparison is constant-time, but nothing recorded a wrong one
@@ -822,6 +988,13 @@ pub struct Daemon {
     /// Media servers / webhooks told about every finished job. Empty =
     /// off, which is the default. See [`crate::notify`].
     pub(super) notify_targets: Mutex<Vec<crate::notify::Target>>,
+    /// §G: how each target's last delivery went, keyed by
+    /// [`crate::notify::target_key`]. A failed notification was log-only,
+    /// so a webhook with a revoked token stopped working and the only
+    /// place that said so was a log line nobody reads. The key embeds the
+    /// target url, which is itself a bearer credential for Discord/ntfy:
+    /// it is a map key and NOTHING else - never logged, never shipped.
+    pub(super) notify_health: Mutex<std::collections::HashMap<String, crate::notify::Outcome>>,
     /// What to do with an indexer's `X-DNZB-Failure` link when a job
     /// fails: "off" (default), "report", or "regrab". See
     /// [`Daemon::report_failure`].
@@ -907,6 +1080,19 @@ pub struct Daemon {
     pub watch_state: Mutex<crate::watchlist::WatchState>,
     /// mode=watchlist_check_now: wakes the watcher out of its sleep.
     pub(super) watch_now: tokio::sync::Notify,
+    /// §96.3 give-up breaker: distinct final failures per target
+    /// (episode/movie) before the target is given up. 0 = off, the
+    /// default - the breaker unmonitors things in the user's *arr, which
+    /// is not behaviour to default on.
+    pub(super) arr_giveup_threshold: AtomicU64,
+    /// The *arr instances the breaker may act on (settings key
+    /// `arr_instances`; apikeys redacted from get_config).
+    pub(super) arr_instances: Mutex<Vec<super::giveup::ArrInstance>>,
+    /// Per-target failure counters, fed by `park` from final failures of
+    /// arr- and watchlist-originated jobs. Persisted to
+    /// .spool/giveup-state.json. Arc'd so the *arr-calling thread can
+    /// release the action latch when the remote work fails.
+    pub(super) giveup: Arc<Mutex<super::giveup::GiveupState>>,
     /// Where UI-changed settings persist (next to the server config).
     pub(super) settings_path: PathBuf,
     /// M31b "your wall": cached taste profile (built from completed
@@ -930,6 +1116,28 @@ pub struct TasteProfile {
     /// Count of source signals (completed history + watchlist items).
     /// 0 = cold start.
     pub n_signals: u32,
+}
+
+/// §G: one news server's last refusal to authenticate, remembered past
+/// the pool that saw it.
+///
+/// [`nzbkit::pool::Refusal`] lives on the live pool, which exists only
+/// while a job is running. Copying it here at the point it is observed
+/// means the Providers card can still say "this provider rejected your
+/// sign-in" once the queue has drained - the state in which a user
+/// actually goes looking. Cleared when the same host later connects and
+/// moves bytes, so a fixed password stops being reported as broken.
+#[derive(Debug, Clone)]
+pub struct ServerRefusal {
+    /// True when retrying cannot help (a bad credential); false when the
+    /// account is fine and the server is simply at a connection or IP cap.
+    pub permanent: bool,
+    /// The server's own status line, verbatim. Not paraphrased on
+    /// purpose: "max simultaneous IP addresses reached" tells the user
+    /// what to do and our summary of it would not.
+    pub line: String,
+    /// Unix seconds when it was last seen.
+    pub at: i64,
 }
 
 /// What the scan loop is doing right now - the shared counter is bumped
@@ -1280,6 +1488,65 @@ pub(super) const COMPACT_ABORT_POLL_MS: u64 = 100;
 /// and resumable.
 pub(super) const COMPACT_CHUNK_PAGES: u32 = 2048;
 
+/// The rendezvous between a maintenance statement and the watcher that
+/// may need to abort it (Codex sweep 3 Aug M5).
+///
+/// An interrupt handle is per CONNECTION, not per statement, so handing
+/// the watcher a handle taken during an EARLIER `with_index` call was
+/// two bugs at once: a job starting before the maintenance closure
+/// reacquired the index mutex interrupted whatever unrelated writer
+/// held it in the gap (that write rolled back for nothing), and the
+/// maintenance then began anyway, with the job now active and the
+/// watcher already retired - the multi-minute stall the whole mechanism
+/// exists to prevent.
+///
+/// Both sides go through this one mutex, so exactly one of them wins:
+/// either the statement arms first (and the watcher's interrupt lands
+/// on it and nothing else), or the watcher stands the statement down
+/// first (and it never runs).
+#[derive(Default)]
+pub(super) struct MaintenanceArm {
+    inner: Mutex<MaintenanceArmState>,
+}
+
+#[derive(Default)]
+struct MaintenanceArmState {
+    handle: Option<nzbkit::index::InterruptHandle>,
+    stood_down: bool,
+}
+
+impl MaintenanceArm {
+    /// Called from the blocking task while it HOLDS the index guard,
+    /// immediately before the statement. `false` means a job appeared
+    /// first and the statement must not run at all.
+    pub(super) fn arm(&self, handle: nzbkit::index::InterruptHandle) -> bool {
+        let mut st = self.inner.lock_ok();
+        if st.stood_down {
+            return false;
+        }
+        st.handle = Some(handle);
+        true
+    }
+
+    /// Called from the blocking task once the statement has returned,
+    /// still holding the guard: a later interrupt must not land on
+    /// whatever this connection does next.
+    pub(super) fn disarm(&self) {
+        self.inner.lock_ok().handle = None;
+    }
+
+    /// Called from the watcher when a download starts. Interrupts the
+    /// armed statement if there is one, and in every case makes a
+    /// not-yet-armed statement stand down.
+    pub(super) fn abort(&self) {
+        let mut st = self.inner.lock_ok();
+        st.stood_down = true;
+        if let Some(h) = st.handle.take() {
+            h.interrupt();
+        }
+    }
+}
+
 /// Watch for a download starting while a VACUUM is in flight, and abort
 /// the rewrite when one does. Returns true if it aborted.
 ///
@@ -1358,6 +1625,12 @@ pub fn compact_verdict(
 }
 
 impl Daemon {
+    /// The passwords-file candidates, read fresh so hand-edits and a
+    /// just-imported competitor file apply to the very next unlock.
+    pub fn read_unpack_passwords(&self) -> Vec<String> {
+        crate::smart::read_password_file(&self.password_file.lock_ok())
+    }
+
     /// Why indexing is standing down, or None if it should run. A reason
     /// rather than a bool so the UI can say WHICH it is - an index that
     /// has quietly stopped growing is otherwise a mystery, and the two
@@ -1591,6 +1864,15 @@ impl Daemon {
     /// Route every manual/scheduled cap change through here so the
     /// governor's ceiling stays in sync.
     pub(super) fn set_speed_ceiling(&self, bps: u64) {
+        self.set_speed_ceiling_from(bps, "user");
+    }
+
+    /// As [`Self::set_speed_ceiling`], recording WHO chose the number.
+    /// A cap a schedule entry applied was presented as the operator's
+    /// own setting, so an unexpected 4 MB/s at 08:00 looked like a bug
+    /// in the limiter rather than the schedule doing its job.
+    pub(super) fn set_speed_ceiling_from(&self, bps: u64, src: &'static str) {
+        *self.limit_source.lock_ok() = src;
         self.speed_ceiling.store(bps, Ordering::Relaxed);
         self.hub.rate.set(bps);
     }
@@ -1767,15 +2049,52 @@ pub(super) fn wind_down_and_exit(d: &Arc<Daemon>, rt: &tokio::runtime::Handle, r
 /// platform. A second signal while the first wind-down is still running
 /// is ignored on purpose - the budget already bounds it, and re-entering
 /// the sequence would abort the QUITs it exists to send.
+///
+/// The wait runs on a DEDICATED thread with its own single-thread
+/// runtime, never as a task on the shared runtime. A spawned signal
+/// task is only as responsive as the runtime's free workers, and the
+/// index loops park workers in synchronous SQLite work behind one
+/// mutex: with every worker blocked that way, a spawned handler is not
+/// polled AT ALL - measured on a saturated 4-worker runtime, SIGTERM
+/// went unhandled for five minutes, and the live daemon sat ~30 s on
+/// SIGTERM mid-deepening (2 Aug, TODO §98.2). On its own thread the
+/// same handler answered in under a millisecond under the same
+/// saturation. `docker stop` SIGKILLs at 10 s, so those 30 s are the
+/// difference between a graceful exit and an abrupt one.
 pub(super) fn install_shutdown_signals(daemon: &Arc<Daemon>) {
     let rt = tokio::runtime::Handle::current();
     let d = daemon.clone();
-    tokio::spawn(async move {
-        let reason = wait_for_shutdown_signal().await;
-        // Off the runtime thread: the wind-down blocks on locks and on
-        // `Handle::block_on`, neither of which belongs on an async task.
-        std::thread::spawn(move || wind_down_and_exit(&d, &rt, reason));
-    });
+    let spawned = std::thread::Builder::new()
+        .name("signal-wait".into())
+        .spawn(move || {
+            let srt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    info!(target: "shutdown", "cannot build the signal runtime ({e}) - stop will be abrupt");
+                    return;
+                }
+            };
+            let reason = srt.block_on(wait_for_shutdown_signal());
+            // Off this thread too: the wind-down blocks on locks and on
+            // `Handle::block_on`, and this thread must stay free to keep
+            // ignoring further signals (see above).
+            std::thread::spawn(move || wind_down_and_exit(&d, &rt, reason));
+            // Park forever rather than return: dropping the runtime
+            // would unregister the signal handlers and restore the
+            // default disposition, so a second SIGTERM mid-wind-down
+            // would kill the process abruptly - the exact exit the
+            // wind-down exists to avoid.
+            loop {
+                std::thread::park();
+            }
+        })
+        .is_ok();
+    if !spawned {
+        info!(target: "shutdown", "cannot spawn the signal thread - stop will be abrupt");
+    }
 }
 
 /// Resolve to the name of whichever shutdown signal arrives first.
@@ -1810,6 +2129,10 @@ pub(super) async fn wait_for_shutdown_signal() -> &'static str {
 /// pause/resume happened in between (generation check).
 pub(super) fn timed_pause(d: &Arc<Daemon>, mins: u64, graceful: bool) {
     d.paused.store(true, Ordering::Relaxed);
+    // Every caller of this is a person or a client acting for one - the
+    // scheduler pauses through `apply_action`, which claims the pause
+    // for itself.
+    *d.pause_source.lock_ok() = "user";
     // M23e: also stop the transfer that's in flight, not just new jobs.
     d.suspend_active(graceful);
     if mins == 0 {
@@ -3082,6 +3405,7 @@ impl Daemon {
         // category (= out_root subfolder) and request TV filing.
         let mut category = category.to_string();
         let mut tv_sort = false;
+        let mut smart_rule = String::new();
         if let Some(r) =
             crate::smart::first_match(&self.smart_folders.lock_ok(), &stem, total_bytes)
         {
@@ -3089,6 +3413,9 @@ impl Daemon {
                 category = r.category.clone();
             }
             tv_sort = r.tv_sort;
+            // Kept on the job: "why is this in Films?" is answerable only
+            // by the rule that decided it, and the rule list is editable.
+            smart_rule = r.name.clone();
             info!(
                 target: "smart",
                 "rule {:?} matched {stem:?} → category {:?}{}",
@@ -3171,6 +3498,7 @@ impl Daemon {
             failure_depth: 0,
             identify: String::new(),
             media: None,
+            media_rejudge: false,
             retries: 0,
             dupe_key: key,
             library: self.library_cats.lock_ok().contains(&category),
@@ -3184,22 +3512,27 @@ impl Daemon {
             defer_reason: String::new(),
             defer_count: 0,
             demote: false,
-            bad_blocks: 0,
+            bad_blocks: None,
+            verify_blocks: 0,
             tv_sort,
+            smart_rule,
             filed: false,
             filed_suffix: None,
             filed_title: None,
             filed_base: None,
             password,
             password_required: false,
+            eat_volumes_ok: false,
             zip_packed,
             unpack_blocked_by: String::new(),
+            move_split: String::new(),
             archive_shape: String::new(),
             inner_crc: 0,
             identity_name: String::new(),
             identity_imdb: String::new(),
             identity_src: String::new(),
             auto_retry_at: None,
+            auto_retry_why: None,
             pp_params: Vec::new(),
             replaces,
             // §77: filled in by the health prober on its next idle tick.
@@ -3208,6 +3541,10 @@ impl Daemon {
             // poller, and none of them may block on a network round trip
             // to every configured server.
             health: None,
+            // Counted at completion by the post-processing sweeps.
+            cleaned_files: 0,
+            cleaned_par2: 0,
+            cleaned_trash: false,
         }));
         self.queue.lock_ok().push_back(job);
         // Published: the directory and the identity are now visible to
@@ -3220,6 +3557,25 @@ impl Daemon {
         }
         self.save_queue();
         Ok(nzo_id)
+    }
+
+    /// Truth-audit I: did this job park as a held ALTERNATIVE instead of
+    /// joining the queue to run? Read back rather than returned out of
+    /// `enqueue`, whose signature sixteen call sites share; the job is in
+    /// the queue by the time any caller can ask, and reading it here also
+    /// answers correctly for the paths that add through
+    /// `enqueue_fetched`.
+    ///
+    /// Without this the add reply said "Added to the queue" for a job that
+    /// is paused at Duplicate priority and will not download until the
+    /// original fails - the single most confusing thing the add flow could
+    /// say, because the row then sits there doing nothing with no
+    /// explanation the user asked for.
+    pub(super) fn held_as_duplicate(&self, nzo_id: &str) -> bool {
+        self.queue.lock_ok().iter().any(|j| {
+            let g = j.lock_ok();
+            g.nzo_id == nzo_id && g.paused && g.priority == DUPE_PRIORITY
+        })
     }
 
     /// M18b: bill per-server bytes of a finished download to today's
@@ -3549,6 +3905,17 @@ impl Daemon {
         {
             win.pop_front();
         }
+        // Drop the leading no-progress samples: at download start the
+        // window otherwise spans the TLS/connect handshakes, and the
+        // first shown figures are bytes divided by dead time - a rate
+        // that climbs to the truth over five seconds and reads as a slow
+        // ramp-up the line never had. Measured from the first byte that
+        // moved, the first figure is the real one. Steady state is
+        // untouched: consecutive one-second samples always differ while
+        // bytes flow.
+        while win.len() >= 2 && win[0].1 == win[1].1 {
+            win.pop_front();
+        }
         match (win.front(), win.back()) {
             (Some(&(t0, b0)), Some(&(t1, b1))) if t1.duration_since(t0).as_secs_f64() > 0.25 => {
                 (b1 - b0) as f64 / t1.duration_since(t0).as_secs_f64()
@@ -3642,7 +4009,16 @@ impl Daemon {
                 d.run_script(&script, &job);
             }
             if !targets.is_empty() {
-                crate::notify::fire(&targets, &crate::notify::Ctx::from_job(&job));
+                // §G: keep what each delivery did, so the settings row
+                // can say "last send failed: HTTP 401". The map is keyed
+                // by kind+url+name and only ever grows to the number of
+                // targets the user has configured.
+                let out =
+                    crate::notify::fire(&targets, &crate::notify::Ctx::from_job(&job), unix_now());
+                let mut health = d.notify_health.lock_ok();
+                for (k, o) in out {
+                    health.insert(k, o);
+                }
             }
             // Last: a webhook that reports failures should say so before
             // a replacement for the same title appears in the queue.
@@ -3916,6 +4292,36 @@ impl Daemon {
         Some(sc.nzo_id.clone())
     }
 
+    /// Record a delete that removed the RECORD but not the FILES, for the
+    /// dashboard's kept-files notice.
+    ///
+    /// Every delete-with-files path ends here on a [`FilesGone::Kept`],
+    /// and the reason is the same one each time: the user asked for
+    /// recoverable deletes, no Trash would take the path, and we now
+    /// leave the download alone rather than destroying it (70990f19).
+    /// That was the right call and it opened this hole - the queue row or
+    /// history row goes regardless, so the only handle the user had on a
+    /// folder that is still sitting there is the thing the delete removed,
+    /// and a `warn!` in a log they will never open is not telling them.
+    ///
+    /// The path is the replacement handle, which is why it is stored
+    /// rather than the id: they cannot open a record that no longer
+    /// exists, but they can go and look at the folder.
+    pub(super) fn note_delete_kept(&self, name: &str, path: &std::path::Path, why: &str) {
+        let mut k = self.delete_kept.lock_ok();
+        let path = path.display().to_string();
+        // One entry per path. A bulk history sweep over a shared season
+        // folder refuses once per record, and a dozen identical rows
+        // would bury the one thing the notice has to say.
+        if k.iter().any(|(_, p, _, _)| *p == path) {
+            return;
+        }
+        k.push_back((name.to_string(), path, why.to_string(), unix_now()));
+        while k.len() > 12 {
+            k.pop_front();
+        }
+    }
+
     /// Park a finished job in history (NZBGet-style: failures are parked,
     /// not lost - mode=retry sends them back through the queue and the
     /// journal resumes from what already landed).
@@ -3937,7 +4343,16 @@ impl Daemon {
             let g = job.lock_ok();
             if g.del_on_drop {
                 let tail = delete_tail(&g, || self.job_suffix(filed_stem(&g)));
-                remove_job_files(&g.out_dir, filed_stem(&g), g.filed, &tail);
+                // The user pressed delete-with-files on a LIVE download
+                // and this is where it finally happens, long after the
+                // request answered - so a refusal here has no response
+                // left to ride back on, and the notice is the only way it
+                // reaches them at all.
+                if let FilesGone::Kept(why) =
+                    remove_job_files(&g.out_dir, filed_stem(&g), g.filed, &tail)
+                {
+                    self.note_delete_kept(filed_stem(&g), &g.out_dir, &why);
+                }
             }
             if g.tombstone {
                 let _ = std::fs::remove_file(&g.nzb_path);
@@ -3947,6 +4362,8 @@ impl Daemon {
             .lock()
             .unwrap()
             .retain(|j| j.lock_ok().nzo_id != id);
+        // The job's queue-row activity dies with the row.
+        self.hub.activity.lock_ok().remove(&id);
         // Read LIVE, not from the snapshot above: everything between the two
         // is unlocked, and file removal is slow. A queue or JSON-RPC delete
         // landing in that window used to be decided against a stale
@@ -4020,14 +4437,28 @@ impl Daemon {
             // out 20 minutes for a propagation that was never the
             // problem.
             let kind = fail_kind(&job.lock_ok().fail_message);
-            let (secs, why) = match kind {
+            let (secs, why, token) = match kind {
                 FailKind::Transport => (
                     secs.min(SHORT_RETRY_SECS),
                     "connection trouble, not missing articles - retrying shortly",
+                    RETRY_WHY_TRANSPORT,
                 ),
-                _ => (secs, "articles missing - propagation may fill them"),
+                _ => (
+                    secs,
+                    "articles missing - propagation may fill them",
+                    RETRY_WHY_PROPAGATION,
+                ),
             };
-            job.lock_ok().auto_retry_at = Some(now + secs);
+            {
+                let mut g = job.lock_ok();
+                g.auto_retry_at = Some(now + secs);
+                // Beside the stamp, because the delay above was chosen
+                // from it: the drawer says "2 minutes, because this was
+                // the link and not the post" in the user's own language,
+                // which needs the reason as a token and not as this
+                // English log line.
+                g.auto_retry_why = Some(token.to_string());
+            }
             info!(
                 target: "retry",
                 "{id}: {why}; automatic retry in {} min \
@@ -4038,6 +4469,12 @@ impl Daemon {
         // Re-read once more: the demote arm above returns, so this is the
         // first point the history/promotion decisions are actually taken.
         let tombstone = job.lock_ok().tombstone;
+        // §96.3: feed the per-target give-up breaker. Here because this
+        // is where a failure becomes FINAL - a tombstone owes nobody
+        // anything and an armed auto-retry means the story continues.
+        if !tombstone {
+            self.giveup_note_outcome(&job, armed_auto_retry);
+        }
         if !tombstone {
             self.history.lock_ok().push(job);
         }
@@ -4084,6 +4521,171 @@ impl Daemon {
             }
         }
         self.save_queue();
+    }
+
+    /// §96.3: one terminal job outcome, seen by the give-up breaker.
+    ///
+    /// Only the two automated grab loops count - a job the user added by
+    /// hand failing says nothing an automation should act on. A
+    /// completed download clears its target's counters (the content was
+    /// obtainable); a FINAL failure records the release stem, and at the
+    /// threshold the target is given up: logged for both paths, and for
+    /// an *arr-originated job the configured instances are asked to
+    /// unmonitor-then-blocklist (in that order - see the giveup module
+    /// note). Caller has already excluded tombstones and holds no locks.
+    pub(super) fn giveup_note_outcome(&self, job: &Arc<Mutex<Job>>, armed_auto_retry: bool) {
+        let threshold = self.arr_giveup_threshold.load(Ordering::Relaxed);
+        if threshold == 0 {
+            return;
+        }
+        let (name, nzo_id, origin, state) = {
+            let g = job.lock_ok();
+            (g.name.clone(), g.nzo_id.clone(), g.origin.clone(), g.state)
+        };
+        let from_arr = origin == "arr" || origin.starts_with("arr:");
+        if !from_arr && origin != "watchlist" {
+            return;
+        }
+        let p = crate::wall::parse_release(&name);
+        let keys = super::giveup::target_keys(&p);
+        if keys.is_empty() {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        // `token` names the incarnation of each target this decision was
+        // made about, snapshotted under the same lock as the latch. The
+        // spawned worker below carries it and re-checks it before every
+        // destructive *arr call, so a "Try again" pressed while Sonarr
+        // is slow cannot be undone by work that was already in flight
+        // (Codex sweep 2, 3 Aug M3).
+        let (fire, dirty, token) = {
+            let mut st = self.giveup.lock_ok();
+            match state {
+                JobState::Completed => (false, st.record_success(&keys), Vec::new()),
+                JobState::Failed if !armed_auto_retry => {
+                    let count = st.record_failure(&keys, &name, now);
+                    // The latch makes one storm one action (and one log
+                    // line); a later success re-arms it.
+                    let fire = count >= threshold as usize && st.latch_action(&keys);
+                    let token = if fire {
+                        st.action_token(&keys)
+                    } else {
+                        Vec::new()
+                    };
+                    (fire, true, token)
+                }
+                _ => return, // not terminal for the breaker's purposes
+            }
+        };
+        if dirty {
+            self.save_giveup();
+        }
+        if !fire {
+            return;
+        }
+        warn!(
+            target: "giveup",
+            "{name}: {threshold} distinct releases have now failed for this \
+             target - giving it up (the watchlist stops pursuing it{})",
+            if from_arr { "; asking the *arr to unmonitor it" } else { "" }
+        );
+        // ...and say it somewhere a user actually looks. An open
+        // dashboard toasts this on its next poll and the Watchlist card
+        // lists it from `giveup_status` afterwards, so the moment a show
+        // stops being chased is visible and reversible.
+        {
+            let mut ring = self.giveup_tripped.lock_ok();
+            ring.push_back((name.clone(), threshold, now));
+            while ring.len() > 8 {
+                ring.pop_front();
+            }
+        }
+        if !from_arr {
+            return;
+        }
+        let instances: Vec<super::giveup::ArrInstance> = self
+            .arr_instances
+            .lock_ok()
+            .iter()
+            .filter(|i| i.enabled)
+            .cloned()
+            .collect();
+        // A plain thread, not the tokio blocking pool: park runs on both
+        // async and sync paths, and this fires a handful of times per
+        // install lifetime. The latch was taken above; if no instance
+        // proves ownership and acts, but at least one attempt FAILED
+        // (offline *arr, bad apikey), the latch is released so the next
+        // final failure of this target tries again - a logged error is
+        // not an unmonitor, and leaving the latch set would suppress the
+        // retry forever while the *arr keeps re-grabbing dead releases.
+        let giveup = self.giveup.clone();
+        let spool = self.spool.clone();
+        std::thread::spawn(move || {
+            let mut acted = false;
+            let mut errored = false;
+            let mut stood_down = false;
+            // Re-read under the lock every time it is asked, so the
+            // answer is about the target as it is NOW, not as it was
+            // when the thread started.
+            let still_wanted = {
+                let giveup = giveup.clone();
+                let token = token.clone();
+                move || giveup.lock_ok().action_current(&token)
+            };
+            for inst in &instances {
+                if !still_wanted() {
+                    stood_down = true;
+                    info!(
+                        target: "giveup",
+                        "{name}: the target was reset while this was in flight - \
+                         standing down, nothing was changed in any *arr"
+                    );
+                    break;
+                }
+                match super::giveup::arr_give_up(inst, &nzo_id, &name, &still_wanted) {
+                    Ok(Some(what)) => {
+                        acted = true;
+                        info!(target: "giveup", "{name}: {what}");
+                    }
+                    // The ordinary answer from every instance but the
+                    // owner: no history record for our downloadId.
+                    Ok(None) => {
+                        info!(target: "giveup", "{name}: {}: not the sender, left alone", inst.name)
+                    }
+                    Err(e) => {
+                        errored = true;
+                        warn!(target: "giveup", "{name}: {}: {e}", inst.name);
+                    }
+                }
+            }
+            // A stand-down is not a failed call: the latch belongs to
+            // whatever generation the target is on now, and re-arming
+            // it here would undo the reset the user just performed.
+            if !acted && errored && !stood_down {
+                giveup.lock_ok().clear_action(&token);
+                let path = spool.join("giveup-state.json");
+                if let Ok(text) = serde_json::to_string_pretty(&*giveup.lock_ok()) {
+                    let _ = crate::persist::write_atomic(&path, text.as_bytes());
+                }
+                info!(
+                    target: "giveup",
+                    "{name}: no *arr acted and at least one call failed - \
+                     will retry at the next final failure"
+                );
+            }
+        });
+    }
+
+    /// Persist the give-up counters (small, changes rarely - every
+    /// terminal outcome of an automated grab at most).
+    pub(super) fn save_giveup(&self) {
+        let path = self.spool.join("giveup-state.json");
+        if let Ok(text) = serde_json::to_string_pretty(&*self.giveup.lock_ok()) {
+            let _ = crate::persist::write_atomic(&path, text.as_bytes());
+        }
     }
 
     /// M23e: pause means PAUSE. Abort the active transfer (Force jobs
@@ -4323,11 +4925,16 @@ impl Daemon {
         // or a custom category that declared no base (keep-media-only
         // DELETES non-media files, which for a comics or audiobook
         // category is the payload).
+        // The counts come back with the record (Finalized::swept): these
+        // sweeps delete files out of a finished download, and a count
+        // computed and dropped meant the deletes were invisible - the
+        // history drawer's cleanup line is built from it.
+        let mut swept = 0usize;
         if matches!(base, Base::Movie | Base::Tv) {
             if self.rename_media_only.load(Ordering::Relaxed) {
-                crate::smart::keep_media_only(out_dir);
+                swept = crate::smart::keep_media_only(out_dir);
             } else if self.rename_junk.load(Ordering::Relaxed) {
-                crate::smart::sweep_junk(out_dir);
+                swept = crate::smart::sweep_junk(out_dir);
             }
         }
         let parent = if cat.is_empty() {
@@ -4441,11 +5048,14 @@ impl Daemon {
         } else {
             String::new()
         };
+        let (moved, move_split) = self.relocate_completed(out_dir, cat, renamed);
         Finalized {
-            moved: self.relocate_completed(out_dir, cat, renamed),
+            moved,
+            move_split,
             suffix,
             filed_title,
             identify: identified,
+            swept,
         }
     }
 
@@ -4528,12 +5138,18 @@ impl Daemon {
     /// destination, because those bytes exist nowhere else and the
     /// alternative is a job record, a dashboard link and a history storage
     /// path all pointing at a directory the files have left.
+    ///
+    /// Returns (the job's final directory when it changed, the SOURCE
+    /// directory that still holds part of the payload). The second is
+    /// `Some` only for the split case - UX §18: the split was logged and
+    /// then thrown away, so history painted the job green and named
+    /// exactly one of the two folders it was now in.
     pub(super) fn relocate_completed(
         &self,
         out_dir: &std::path::Path,
         cat: &str,
         renamed: Option<PathBuf>,
-    ) -> Option<PathBuf> {
+    ) -> (Option<PathBuf>, Option<PathBuf>) {
         // Per-category override wins; it IS that category's root, so
         // the category component is not repeated inside it. Overrides
         // apply even when the global destination is unset.
@@ -4546,7 +5162,7 @@ impl Daemon {
             .map(|(_, p)| p.clone());
         let global = self.move_completed.read_ok().clone();
         let Some(root) = cat_root.clone().or(global) else {
-            return renamed;
+            return (renamed, None);
         };
         let cur = renamed.clone().unwrap_or_else(|| out_dir.to_path_buf());
         // Mirror the layout under the destination: the path relative to
@@ -4592,7 +5208,7 @@ impl Daemon {
                 _ => false,
             };
         if same_place {
-            return renamed;
+            return (renamed, None);
         }
         // One dirent walk of the job's own folder, so a failure can be
         // told apart: nothing moved (the job is still where it was) or
@@ -4604,7 +5220,7 @@ impl Daemon {
         match crate::smart::move_tree(&cur, &dest) {
             Ok(()) => {
                 info!(target: "move", "completed → {}", dest.display());
-                Some(dest)
+                (Some(dest), None)
             }
             Err(e) => {
                 // NOT the flat "leaving files in place" this used to say.
@@ -4635,7 +5251,14 @@ impl Daemon {
                 // exist nowhere else, so keeping the old directory on the
                 // job record would send the dashboard, a later delete and
                 // the *arr import at a folder they have left.
-                if moved_some { Some(dest) } else { renamed }
+                // The source travels back beside it so the record can
+                // say the payload is in TWO places - the log line above
+                // is the only other witness, and it rolls out of the ring.
+                if moved_some {
+                    (Some(dest), Some(cur))
+                } else {
+                    (renamed, None)
+                }
             }
         }
     }
@@ -4695,6 +5318,30 @@ impl Daemon {
             .is_some_and(want)
     }
 
+    /// The wire status for a job that has left the network but is still
+    /// inside the pipeline - or None if it is not in a post-network tail.
+    ///
+    /// There is no Verifying/Repairing/Extracting `JobState`: the whole
+    /// tail runs inside the same fetch future, so the record says
+    /// `Downloading` from the first article to the last extracted byte.
+    /// The pipeline does say where it is, though - it advances
+    /// `hub.activity` at each section transition, tagged with the owning
+    /// nzo_id precisely because job N's tail overlaps job N+1's fetch -
+    /// so the phase word is read from there rather than from a second
+    /// mechanism that would have to be kept in step with it.
+    ///
+    /// The words are SABnzbd's own state vocabulary, like `Moving`
+    /// beside them in queue_json: Sonarr and Radarr already read all
+    /// three as "busy, keep waiting", which is exactly what they mean.
+    pub(super) fn tail_phase(&self, nzo_id: &str) -> Option<&'static str> {
+        match self.hub.activity.lock_ok().get(nzo_id).copied() {
+            Some("verifying") => Some("Verifying"),
+            Some("repairing") => Some("Repairing"),
+            Some("extracting") => Some("Extracting"),
+            _ => None,
+        }
+    }
+
     /// Fire the pause signal once. `hard` = the immediate abort (drop
     /// in-flight reads, they re-download on resume); otherwise the graceful
     /// drain (admit no new work, let in-flight finish and journal).
@@ -4735,7 +5382,21 @@ impl Daemon {
             if !want(&g) {
                 continue;
             }
-            if g.state == JobState::Downloading && g.priority < 2 && !g.tombstone {
+            // A job in its post-network tail has no transfer left to wind
+            // down, and marking it suspended did real damage: it read
+            // "Paused" in every client while its repair and unpack
+            // carried on, and the tail-completion arm treats
+            // `suspended && res.is_err()` as "the user paused this" and
+            // puts the job back in the QUEUE - so a pause-all issued
+            // during an unpack turned that unpack's failure into a
+            // silent re-queue, with no history record and no failure
+            // notification. `state == Downloading` cannot tell the two
+            // apart on its own; the pipeline's phase word can.
+            if g.state == JobState::Downloading
+                && g.priority < 2
+                && !g.tombstone
+                && self.tail_phase(&g.nzo_id).is_none()
+            {
                 g.suspended = true;
                 paused.push(g.nzo_id.clone());
                 info!(
@@ -4821,7 +5482,7 @@ impl Daemon {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let due: Vec<String> = self
+        let due: Vec<(String, String)> = self
             .history
             .lock()
             .unwrap()
@@ -4829,15 +5490,24 @@ impl Daemon {
             .filter_map(|j| {
                 let g = j.lock_ok();
                 (g.state == JobState::Failed && g.auto_retry_at.is_some_and(|t| t <= now))
-                    .then(|| g.nzo_id.clone())
+                    .then(|| (g.nzo_id.clone(), g.name.clone()))
             })
             .collect();
-        for id in due {
+        for (id, name) in due {
             if self.retry(&id) {
                 info!(
                     target: "retry",
                     "{id}: automatic retry (cooldown elapsed - refetching only what's missing)"
                 );
+                // The row the user was shown as FAILED has just left
+                // History and joined the queue. Announce the move: without
+                // it the record appears to have been lost and a download
+                // nobody asked for appears to have started.
+                let mut ring = self.auto_retried.lock_ok();
+                ring.push_back((id, name, now as i64));
+                while ring.len() > 8 {
+                    ring.pop_front();
+                }
             }
         }
     }
@@ -4862,6 +5532,18 @@ impl Daemon {
         let Some(pos) = h.iter().position(|j| j.lock_ok().nzo_id == nzo_id) else {
             return false;
         };
+        // A password unlock is finalizing this record right now - it is
+        // extracting/renaming/moving under `out_dir` and will write the
+        // committed state back when it settles. Removing and re-queueing
+        // the record here would reassign that directory under the
+        // running task (Codex sweep 3 Aug H1). Checked under the history
+        // lock: set_password raises the flag and then re-verifies the
+        // record is still present under this same lock, so whichever
+        // committed second sees the other.
+        if h[pos].lock_ok().finalizing {
+            info!(target: "retry", "{nzo_id}: refused - an unlock is finalizing it right now");
+            return false;
+        }
         let job = h.remove(pos);
         drop(h);
         // A TV-filed job's out_dir is the SHARED `Show/Season NN` library
@@ -4910,6 +5592,13 @@ impl Daemon {
             j.out_dir = dir;
             j.replaces = replaces;
             j.filed = false;
+            // The journal that backed those bytes is in the OLD folder,
+            // so nothing is on disk at the new one: this retry really
+            // does start from zero, and the queue row must say so rather
+            // than inherit a percentage from a directory it has just
+            // been moved out of. (An ordinary failed retry keeps its
+            // folder, its journal and its figure.)
+            j.downloaded_bytes = 0;
             // The two travel together: the job is no longer in the season
             // folder, so the suffix its old files carried there is not an
             // answer about anything this record now owns.
@@ -4918,6 +5607,15 @@ impl Daemon {
         {
             let mut j = job.lock_ok();
             j.state = JobState::Queued;
+            // A retry is an instruction to RUN the job, so it cannot
+            // arrive back in the queue holding a pause `pick_job` will
+            // skip it for (Codex sweep 2, 3 Aug M4). The flag reaches
+            // here from a pause taken while the job was in its
+            // post-network tail, which the tail correctly ignored and
+            // then left set; the shared transition now refuses to set
+            // it there at all, and this is the belt to that brace - a
+            // failed record's pause flag describes nothing either way.
+            j.paused = false;
             j.fail_message.clear();
             j.fail_detail.clear();
             j.finished_at = None;
@@ -4927,6 +5625,10 @@ impl Daemon {
             // included) - never leave a stale past-due stamp that would
             // re-trigger endlessly from history.
             j.auto_retry_at = None;
+            // Travels with the stamp: a cleared retry has no reason left
+            // to explain, and a stale token would caption the NEXT
+            // failure's row with the last one's cause.
+            j.auto_retry_why = None;
             // TODO §77: the pre-flight verdict is about a moment that has
             // passed. A retry exists BECAUSE the answer may have changed -
             // the automatic one runs on exactly the theory that propagation

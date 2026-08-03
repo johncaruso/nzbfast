@@ -142,6 +142,42 @@ pub struct WatchState {
     /// object) → the last grab this item got off the instant path.
     #[serde(default)]
     pub instant: HashMap<String, InstantGrab>,
+    /// Item id → why the last pass DECLINED a candidate for this item
+    /// ("giveup", "age", or one of "indexer_budget" / "indexer_backoff" /
+    /// "indexer_error" with ":name, name" naming the accounts). Every one
+    /// of those was a bare `continue` before, so an item that was being
+    /// deliberately passed over read exactly like one nothing had ever
+    /// been posted for.
+    ///
+    /// Deliberately not persisted: it describes the pass that just ran,
+    /// and a reason restored from disk minutes or days later would be a
+    /// claim about work nobody did. Rebuilt from scratch every pass.
+    #[serde(skip)]
+    pub skips: HashMap<String, String>,
+}
+
+/// Which skip reason a row should show when one pass declined the same
+/// item for more than one reason. The breaker leads (it is the only one
+/// the user can act on), then a spent indexer allowance, then the age
+/// window - and a fixed order at all, rather than "whichever came last",
+/// so the sub-line does not flicker between two true sentences.
+pub fn skip_rank(reason: &str) -> u8 {
+    match reason.split(':').next().unwrap_or_default() {
+        "giveup" => 3,
+        "indexer_budget" | "indexer_backoff" | "indexer_error" => 2,
+        "age" => 1,
+        _ => 0,
+    }
+}
+
+/// Record one declined candidate against an item, keeping the
+/// highest-ranked reason of the pass. Reporting only - nothing reads
+/// this back to decide anything.
+pub fn note_skip(skips: &mut HashMap<String, String>, item_id: u64, reason: &str) {
+    let e = skips.entry(item_id.to_string()).or_default();
+    if skip_rank(reason) > skip_rank(e) {
+        *e = reason.to_string();
+    }
 }
 
 /// One grab that happened because a release ARRIVED, not because the
@@ -1015,6 +1051,27 @@ mod tests {
     use super::*;
     use crate::wall::parse_release;
     use nzbkit::categories::{BaseBehavior, CustomCategory, classify};
+
+    #[test]
+    fn the_skip_reason_a_row_shows_is_the_most_actionable_one() {
+        let mut s = HashMap::new();
+        note_skip(&mut s, 7, "age");
+        assert_eq!(s["7"], "age");
+        // A spent indexer allowance outranks the age window...
+        note_skip(&mut s, 7, "indexer_budget:NZBGeek, DOGnzb");
+        assert_eq!(s["7"], "indexer_budget:NZBGeek, DOGnzb");
+        // ...and a given-up target outranks everything.
+        note_skip(&mut s, 7, "giveup");
+        note_skip(&mut s, 7, "age");
+        assert_eq!(s["7"], "giveup");
+        // Items don't bleed into each other.
+        note_skip(&mut s, 8, "age");
+        assert_eq!(s["8"], "age");
+        assert_eq!(s["7"], "giveup");
+        // An unknown token never displaces a real one.
+        note_skip(&mut s, 8, "who knows");
+        assert_eq!(s["8"], "age");
+    }
 
     /// The two categories the custom tests classify through - the same
     /// shape a user types into settings.

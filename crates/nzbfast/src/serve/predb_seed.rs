@@ -331,7 +331,12 @@ fn flush(
 fn cap_check(sink: &dyn SeedSink, _stored: usize) -> Result<(), String> {
     let rows = sink.rows();
     let cap = sink.cap();
-    if rows + 10_000 > cap.saturating_sub(headroom(cap)) {
+    // The lookahead scales with the cap the same way `headroom` does
+    // (cap/25 is the 10k it has always been at the 250k default). A
+    // fixed 10_000 exceeded the entire usable budget at small caps -
+    // at the documented PREDB_MAX_ROWS_MIN floor of 10k the budget is
+    // 8k, so every import refused with an EMPTY table.
+    if rows + cap / 25 > cap.saturating_sub(headroom(cap)) {
         return Err(format!(
             "the feed table holds {rows} rows - stopping short of the {cap} cap \
              rather than importing rows the prune would silently eat"
@@ -516,4 +521,60 @@ pub(crate) fn run_cli(db: &std::path::Path, days: u32, cap: u64) -> Result<Strin
         ));
     }
     run(&sink, days)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct StubSink {
+        rows: u64,
+        cap: u64,
+    }
+    impl SeedSink for StubSink {
+        fn kv_get(&self, _k: &str) -> Option<String> {
+            None
+        }
+        fn kv_set(&self, _k: &str, _v: &str) {}
+        fn store(&self, lines: &[nzbkit::predb::PreLine], _now: i64) -> Option<usize> {
+            Some(lines.len())
+        }
+        fn rows(&self) -> u64 {
+            self.rows
+        }
+        fn cap(&self) -> u64 {
+            self.cap
+        }
+        fn say(&self, _what: &str) {}
+    }
+
+    /// The fixed 10k lookahead exceeded the whole usable budget at small
+    /// caps: at the documented PREDB_MAX_ROWS_MIN floor (10k) the budget
+    /// is 8k, so every import refused with an EMPTY table. Proportional
+    /// now - and unchanged at the 250k default (refuses past 190k).
+    #[test]
+    fn the_cap_check_admits_imports_at_the_floor() {
+        let at_floor = StubSink {
+            rows: 0,
+            cap: PREDB_MAX_ROWS_MIN,
+        };
+        assert!(cap_check(&at_floor, 0).is_ok());
+        // Near the floor cap's own budget it still refuses.
+        let full_floor = StubSink {
+            rows: 7_800,
+            cap: PREDB_MAX_ROWS_MIN,
+        };
+        assert!(cap_check(&full_floor, 0).is_err());
+        // The 250k default keeps its historical refusal point.
+        let default_ok = StubSink {
+            rows: 189_000,
+            cap: PREDB_MAX_ROWS_DEFAULT,
+        };
+        assert!(cap_check(&default_ok, 0).is_ok());
+        let default_full = StubSink {
+            rows: 191_000,
+            cap: PREDB_MAX_ROWS_DEFAULT,
+        };
+        assert!(cap_check(&default_full, 0).is_err());
+    }
 }

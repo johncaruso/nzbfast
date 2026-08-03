@@ -41,6 +41,61 @@ fn default_interval() -> u64 {
     900
 }
 
+/// What the last poll of one feed actually did.
+///
+/// The poller used to fold every fetch and parse failure into an empty
+/// item list, so a revoked apikey, a typo'd host, a 403 and an indexer
+/// that had simply gone away all looked identical to a feed with nothing
+/// new to say: silent, forever, with the settings row still reading like
+/// a healthy feed. This is the difference, kept per feed url and shipped
+/// beside the feed in `get_config`.
+///
+/// Never build one of these by hand from a raw fetch error - use
+/// [`FeedHealth::failed`], which strips the url. A feed url essentially
+/// always carries the indexer's `apikey=`, and the fetch layer's errors
+/// lead with the url they were given.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct FeedHealth {
+    /// Unix seconds when the last poll attempt finished. 0 = never
+    /// polled (a feed added a moment ago, or a daemon just started).
+    pub last_poll: i64,
+    /// The last failure, with the url taken out. Empty when the last
+    /// poll succeeded.
+    pub last_error: String,
+    /// Items the last SUCCESSFUL parse produced, before the rules ran.
+    /// A feed that fetches fine and yields nothing is a rules or a
+    /// retention question, not a connection one, and the two must not
+    /// read the same on the row.
+    pub items_seen: usize,
+}
+
+impl FeedHealth {
+    /// A poll that fetched and parsed.
+    pub fn ok(now: i64, items_seen: usize) -> FeedHealth {
+        FeedHealth {
+            last_poll: now,
+            last_error: String::new(),
+            items_seen,
+        }
+    }
+
+    /// A poll that failed, with `redact` applied to the message. The
+    /// caller passes the daemon's url redactor rather than this module
+    /// growing its own copy of it.
+    pub fn failed(now: i64, err: &str, redact: impl Fn(&str) -> String) -> FeedHealth {
+        let msg = redact(err);
+        let msg = msg.trim();
+        FeedHealth {
+            last_poll: now,
+            // Bounded: an indexer that answers a 500 with a whole HTML
+            // error page would otherwise put all of it in get_config
+            // and in the settings row.
+            last_error: msg.chars().take(200).collect(),
+            items_seen: 0,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub struct FeedItem {
     pub title: String,
@@ -160,9 +215,61 @@ pub(crate) fn attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
     Some(&tag[start..end])
 }
 
+/// A body that came back HTTP 200 and is not a feed at all.
+#[derive(Debug, Clone)]
+pub struct FeedParseError(pub String);
+
+impl std::fmt::Display for FeedParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// [`parse_feed`], but refusing a body that is not a feed (Codex sweep
+/// 2, 3 Aug ML1).
+///
+/// The tolerant parser answers an empty list for anything it does not
+/// recognise, which is the RIGHT answer for junk INSIDE a feed and the
+/// wrong one for a body that is not a feed at all. An indexer whose
+/// apikey was revoked serves an HTTP 200 login page, and every caller
+/// then recorded "healthy, zero items" - the feed's settings row went
+/// on saying it was fine while it silently stopped grabbing anything.
+///
+/// The check is deliberately shallow: a recognizable feed root and
+/// nothing more. A genuinely empty feed is valid and must stay healthy,
+/// and the parser's tolerance for namespace prefixes, junk elements and
+/// half-formed items is load-bearing - feeds in the wild are messy.
+pub fn parse_feed_checked(xml: &str) -> Result<Vec<FeedItem>, FeedParseError> {
+    // Byte-limited scan: only the document's opening needs looking at,
+    // and a multi-megabyte body of HTML must not be lowercased whole.
+    let head: String = xml.chars().take(4096).collect::<String>().to_lowercase();
+    let looks_like_a_feed = ["<rss", "<feed", "<rdf:rdf", "<channel"]
+        .iter()
+        .any(|root| head.contains(root));
+    if !looks_like_a_feed {
+        // Name what it looks like instead - "not a feed" alone sends a
+        // user hunting in the wrong place, and a login page is by far
+        // the most common answer here.
+        let what = if head.contains("<html") || head.contains("<!doctype html") {
+            "the server answered with a web page, not a feed - \
+             the url is probably wrong, or the apikey has been revoked \
+             and this is a login page"
+        } else if head.trim().is_empty() {
+            "the server answered with an empty body"
+        } else {
+            "the server's answer is not an RSS or Atom feed"
+        };
+        return Err(FeedParseError(what.into()));
+    }
+    Ok(parse_feed(xml))
+}
+
 /// Minimal RSS 2.0 parser: <item> blocks with title, enclosure/link,
 /// size (enclosure length, else newznab size attr), guid. Tolerant of
 /// namespaces and junk - feeds in the wild are messy.
+///
+/// Callers that RECORD FEED HEALTH want [`parse_feed_checked`]: this
+/// one cannot tell an empty feed from a body that is not a feed.
 pub fn parse_feed(xml: &str) -> Vec<FeedItem> {
     let mut out = Vec::new();
     let mut rest = xml;
@@ -278,5 +385,80 @@ mod tests {
         assert_eq!(items[1].title, "Movie & More.2026.720p");
         assert_eq!(items[1].size, 1_500_000_000);
         assert_eq!(items[1].guid, "https://idx/get/def");
+    }
+
+    /// Codex sweep 2, 3 Aug ML1: an HTTP 200 that is not a feed used to
+    /// parse to an empty list and be recorded as "healthy, no items",
+    /// so a revoked apikey's login page looked exactly like a quiet
+    /// feed - for as long as the user left it there.
+    #[test]
+    fn a_body_that_is_not_a_feed_is_a_failure_not_an_empty_feed() {
+        let login = "<!DOCTYPE html><html><head><title>Sign in</title></head>\
+                     <body><form><input name=\"user\"></form></body></html>";
+        let e = parse_feed_checked(login).expect_err("a login page is not a feed");
+        assert!(e.to_string().contains("web page"), "{e}");
+        // Nothing of the body itself is echoed - it is attacker-shaped
+        // text on its way to the settings row.
+        assert!(!e.to_string().contains("Sign in"), "{e}");
+
+        assert!(
+            parse_feed_checked("").is_err(),
+            "an empty body is not a feed"
+        );
+        assert!(
+            parse_feed_checked("{\"error\":\"bad apikey\"}").is_err(),
+            "a JSON error body is not a feed"
+        );
+
+        // ...and the tolerance that matters is untouched: a genuinely
+        // EMPTY feed is valid and stays healthy, junk inside a feed is
+        // still skipped rather than failing the whole poll, and Atom
+        // and RDF roots are feeds too.
+        let empty = "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel>\
+                     <title>Nothing new</title></channel></rss>";
+        assert_eq!(parse_feed_checked(empty).unwrap().len(), 0);
+        let junky = "<?xml version=\"1.0\"?><rss><channel>\
+                     <item><title>no link at all</title></item>\
+                     <item><title>Good.Release</title><link>https://x/1</link></item>\
+                     </channel></rss>";
+        assert_eq!(parse_feed_checked(junky).unwrap().len(), 1);
+        assert!(parse_feed_checked("<feed xmlns=\"http://www.w3.org/2005/Atom\"/>").is_ok());
+        assert!(parse_feed_checked("<rdf:RDF><channel/></rdf:RDF>").is_ok());
+    }
+
+    /// §G. The recorded failure crosses to the browser and sits on the
+    /// settings row, so it goes through the url redactor on the way in -
+    /// a feed url essentially always carries the indexer's apikey, and
+    /// the fetch layer's errors lead with the url they were handed.
+    #[test]
+    fn a_recorded_feed_failure_carries_no_apikey() {
+        let raw = "https://idx.example/rss?apikey=DEADBEEF&t=tv: status code 403";
+        let h = FeedHealth::failed(99, raw, crate::serve::redact_url_creds);
+        assert!(!h.last_error.contains("DEADBEEF"), "{}", h.last_error);
+        assert!(!h.last_error.contains("apikey"), "{}", h.last_error);
+        // Still worth reading: the host and what went wrong survive.
+        assert!(h.last_error.contains("idx.example"), "{}", h.last_error);
+        assert!(h.last_error.contains("403"), "{}", h.last_error);
+        assert_eq!(h.last_poll, 99);
+        assert_eq!(h.items_seen, 0, "a failed poll saw nothing");
+    }
+
+    #[test]
+    fn a_feed_error_cannot_grow_without_bound() {
+        // An indexer answering a 500 with a whole HTML error page must
+        // not put all of it in get_config and in the row.
+        let h = FeedHealth::failed(1, &"x".repeat(5000), str::to_string);
+        assert_eq!(h.last_error.chars().count(), 200);
+    }
+
+    #[test]
+    fn a_feed_that_fetched_but_matched_nothing_is_not_an_error() {
+        // The distinction the row is for: zero items with no error is a
+        // rules or retention question; zero items WITH one is a broken
+        // feed, and they used to look identical.
+        let h = FeedHealth::ok(5, 0);
+        assert!(h.last_error.is_empty());
+        assert_eq!(h.items_seen, 0);
+        assert_eq!(h.last_poll, 5);
     }
 }

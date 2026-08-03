@@ -425,6 +425,16 @@ impl Extractor {
         self.inner.lock_ok().pw_probe = Some(hook);
     }
 
+    /// §94 B: install the verified-block watermark handle. Root level
+    /// ONLY, deliberately not inherited by children - nested levels'
+    /// bytes are outside the PAR2 set, so a child chase gating on a
+    /// level-0 slot index would wait on the wrong slot's verification.
+    /// Wire before the download starts (buffers created earlier would
+    /// miss it).
+    pub fn set_verify_gate(&self, gate: Arc<crate::live::VerifyGate>) {
+        self.inner.lock_ok().verify_gate = Some(gate);
+    }
+
     /// Install the finish-decrypt publish gate (see [`DecryptBarrier`]).
     /// Set it before `finish()`; children created afterwards inherit it,
     /// and children created earlier are updated too, so wiring order at

@@ -336,7 +336,11 @@ palveluntarjoajasi on aina ylimpänä.</p>
 <li><b>Raahaa rivejä järjestääksesi uudelleen</b> (prioriteettikaistan sisällä - Pakota/Korkea latautuu silti ensin);
 muuta prioriteettia rivin sisällä.</li>
 <li><b>Napsauta riviä</b> avataksesi tietolaatikon: tiedostokohtaiset edistymispalkit, varmistuslohkojen
-määrät ja mikä palvelin osallistui kuinka paljon <em>tähän</em> työhön.</li>
+määrät, mikä palvelin osallistui kuinka paljon <em>tähän</em> työhön, sekä "lisääjä"-rivi,
+joka kertoo mistä työ tuli (valvontakansio, yhdistetty sovellus, API…).
+<b>Lataa .nzb-tiedosto</b> -painike tallentaa työn <code>.nzb</code>-tiedoston - nzbfast
+säilyttää oman kopionsa, joten tämä toimii jokaiselle työlle, vaikka alkuperäinen
+tiedosto olisi jo kauan sitten poissa.</li>
 <li>Merkit näyttävät erityistilat: <i>lykätty (hidas)</i>, <i>esihaetaan</i>,
 <i>keskeytetty</i> (katso <a href="#performance">Suorituskykytyökalut</a>).</li>
 <li>Burn-down-kaavio seuraa jonossa jäljellä olevaa GB-määrää yhteensä.</li>
@@ -353,7 +357,10 @@ päivityssääntöjen mukaan (parempi kopio korvaa huonomman).</p>
 <p>Viimeaikaiset lataukset, kukin omalla rivillään. Epäonnistuneet työt tarjoavat <b>Yritä uudelleen</b>
 (jatkaa journaalista). Salatut arkistot näyttävät 🔑-lukituksen avauksen - syötä
 salasana ja työ valmistuu paikan päällä. Varmistuksen tila -nauha piirtää viallisia PAR2-
-lohkoja latausta kohti - nouseva loppupää tarkoittaa, että artikkelit saapuvat vioittuneina.</p>
+lohkoja latausta kohti - nouseva loppupää tarkoittaa, että artikkelit saapuvat vioittuneina.
+Jokaisen rivin tietolaatikko kertoo, kuka työn lisäsi, ja siinä on sama
+<b>Lataa .nzb-tiedosto</b> -painike kuin jonossa - kätevä, kun haluat ladata julkaisun
+uudelleen muualla tai liittää <code>.nzb</code>-tiedoston ongelmaraporttiin.</p>
 <p>Kortti listaa oletuksena kymmenen latausta, ja loput ovat yhden klikkauksen päässä ▤-painikkeesta. Tila, sijainti ja epäonnistumisen syy ovat rivin oman klikkauksen takana, joten tavallinen tapaus - mikä valmistui, kuinka suuri, milloin - pysyy luettavana ilman vieritystä. Vedä sen sijaan kortin alareunasta, niin lista vierii valitsemallasi korkeudella. <b>History rows</b> kohdassa Asetukset → Käyttöliittymä muuttaa tuota kymmentä; koska se on daemonin eikä selaimesi ominaisuus, se koskee jokaista tätä asennusta katsovaa laitetta. <b>Colour History names</b> sen vieressä värjää valmiit nimet vihreiksi ja epäonnistuneet punaisiksi; pois päältä nimet pysyvät neutraaleina, ja värillinen piste ja rivin omat tiedot kertovat yhä kumpi on kumpi.</p>
 <h3 id="dash-usage">Datan käyttö</h3>
 <p>Palveluntarjoajakohtaiset päiväpalkit ja Tänään / 7 päivää / 30 päivää -kokonaismäärät - olennaista
@@ -367,7 +374,10 @@ mitatuille ja lohkotileille. Lohkotilit näyttävät elinaikaisen käytön kokoa
 <tr><th>Tapa</th><th>Miten</th></tr>
 <tr><td><b>Raahaa &amp; pudota</b></td><td>Pudota yksi tai useampi <code>.nzb</code>-tiedosto minne tahansa koontinäytöllä.</td></tr>
 <tr><td><b>Valvontakansio</b></td><td>Aseta kansio Asetuksissa; mikä tahansa siihen tallennettu <code>.nzb</code>
-poimitaan 5 sekunnin sisällä ja tiedosto poistetaan. Ohjaa selaimesi latauskansio
+poimitaan 5 sekunnin sisällä ja siirretään roskakoriin, ja avoin koontinäyttö ilmoittaa
+jokaisesta poiminnasta nimellä ("… poimittu kansiosta Lataukset"), joten kansiosta katoava
+tiedosto ei jää koskaan arvoitukseksi. Haluatko mieluummin säilyttää tiedostosi? Kytke päälle
+<b>Säilytä .nzb-tiedostot poiminnan jälkeen</b> (katso <a href="#settings">§9</a>). Ohjaa selaimesi latauskansio
 siihen saadaksesi yhden napsautuksen nappaukset indeksoijasivustoilta.</td></tr>
 <tr><td><b>URL:sta</b></td><td>Liitä NZB-linkki (API <code>mode=addurl</code> tai minkä tahansa yhdistetyn sovelluksen kautta).</td></tr>
 <tr><td><b>nzblnk:-linkit</b></td><td>Liitä <code>nzblnk:</code>-linkki mihin tahansa kohtaan hallintapaneelia tai raahaa se sisään. Jos asensit macOS-DMG:stä tai Windows-asennusohjelmasta, voit myös napsauttaa linkkiä suoraan boardilla. Katso <a href="#nzblnk">nzblnk-linkit</a> alempaa.</td></tr>
@@ -575,13 +585,16 @@ voittavat komentorivivalitsimet).</p>
 <b>dekooderit</b> (rinnakkaiset dekoodaussäikeet). Näytteistetään kunkin työn alkaessa. Oletukset
 ovat oikeat useimmille linjoille; käytä viritystyökaluja ennen sokeaa nostamista.</p>
 
-<p><b>Pikavarmistus (CRC32)</b> (oletuksena päällä) lunastaa PAR2-lohkot pelkällä
-CRC32:lla latauksen vielä käydessä, mikä on hitaalla suorittimella 2-3x nopeampaa.
-Jokaisen artikkelin oma tarkistussumma varmistetaan silti, ja lopullinen kierros käyttää
-aina täyttä MD5:tä: oikeellisuudesta ei tingitä. Poista valinta, jos haluat laskea
-MD5:n lohkoittain myös latauksen aikana.</p>
+<p><b>Tarkistus latauksen aikana</b> valitsee, kuinka paljon varmistetaan sitä mukaa kuin
+data saapuu. <i>Täysi</i> vahvistaa jokaisen PAR2-lohkon MD5:llä. <i>Nopea</i>
+(oletus) lunastaa lohkot CRC32:lla, mikä on hitaalla suorittimella 2-3x nopeampaa, ja
+varmistaa yhä jokaisen artikkelin oman tarkistussumman. <i>Kevyt</i> ohittaa lisäksi
+nuo artikkelien tarkistussummat heti kun PAR2 kattaa tiedoston: vaurio tulee esiin
+hetkeä myöhemmin, omassa lohkossaan. Kaikissa kolmessa lopullinen kierros ja kaikki
+korjaus käyttävät täyttä MD5:tä, ja ilman PAR2-tiedostoja tehty lataus säilyttää
+artikkeliensa tarkistussummat.</p>
 <h3>Levy &amp; kiintiö <span class="pill live">live</span></h3>
-<p><b>Vähimmäisvapaa tila</b> (keskeytä uudet työt sen alle), <b>latauskiintiö</b> per
+<p><b>Vähimmäisvapaa tila</b> (keskeytä uudet työt sen alle; oletuksena 2 Gt, 0 poistaa sen käytöstä), <b>latauskiintiö</b> per
 päivä tai kuukausi (UTC; Pakota-työt ohittavat), <b>muistiraja</b> - moottorin RAM-budjetti
 (oletus: ¼ RAM:ista, rajattu; nosta sitä isomuistisella koneella maksiminopeuteen valtavissa
 töissä ja katso <a href="#memory">mitä vähäinen muisti maksaa</a> ennen sen laskemista)
@@ -629,12 +642,38 @@ Molemmat poistovaiheet koskevat <em>vain</em> elokuviksi tai sarjoiksi tunnistet
 julkaisuja: ohjelmistokuormaa tai luokittelematonta (hämärrettyä) settiä ei siivota
 koskaan.</p>
 
+<p><b>Poistetut tiedostot siirtyvät roskakoriin</b> ratkaisee, mitä "poistaa"
+tarkoittaa yllä. Kun se on päällä, siivous siirtää tiedostot järjestelmän
+roskakoriin, joten väärän arvauksen siitä, mikä oli roskaa, voi perua; kun se on
+pois, ne poistetaan saman tien. Se on <b>oletuksena päällä macOS:ssä ja
+Windowsissa</b>, joissa roskakori on paikassa, jonka näet ja voit tyhjentää, ja
+<b>oletuksena pois Linuxissa</b>, jossa se yleensä ei ole.</p>
+<div class="note"><b>NAS-laitteessa tai kontissa jätä tämä pois päältä.</b> Kun
+latauksesi ovat eri levyllä kuin kotihakemistosi - mikä on normaali järjestely, kun
+alustana on Unraid, Synology, seedbox tai mikä tahansa Docker-asennus liitetyllä
+jaolla - Linuxin roskakorisäännöt eivät käytä työpöydän roskakoria lainkaan. Ne
+luovat piilotetun <code>.Trash-1000</code>-kansion (numero on oma käyttäjä-id:si)
+latauslevyn juureen ja siirtävät tiedostot sinne. Mikään ei näytä sinulle sitä
+kansiota, mikään ei tyhjennä sitä, eikä sen pitämä tila palaa koskaan.
+<p>Jos ajoit aiempaa nzbfast-versiota Linuxissa tämä päällä, etsi se kansio
+latausjakosi juuresta. Sen voi huoletta tyhjentää: kaikki siellä on tiedostoja,
+joita siivous on jo päättänyt, ettet halunnut. nzbfast ei tyhjennä sitä puolestasi,
+koska se on sinun levylläsi ja sinun arvioitavasi.</p></div>
+
 <h3>Kansiot &amp; käsittely</h3>
 <p><b>Latauskansio</b> <span class="pill restart">restart</span>, <b>valvontakansio</b>,
 <b>jälkikäsittelykomentosarja</b> (ajetaan jokaisen työn jälkeen SABnzbd-yhteensopivilla argumenteilla
 ja <code>SAB_*</code>-ympäristöllä - olemassa olevat SAB-komentosarjat toimivat muuttumatta),
 <b>siivouspäätteet</b> (roskatiedostot poistetaan valmistumisen jälkeen), <b>Älykkäät kansiot</b>
 ja <b>TV-arkistointi</b> (katso <a href="#automation">§10</a>).</p>
+<p><b>Säilytä .nzb-tiedostot poiminnan jälkeen</b> (oletuksena pois päältä) jättää
+alkuperäisen <code>.nzb</code>-tiedoston valvontakansioon jonoon lisäämisen jälkeen sen
+sijaan, että se siirrettäisiin roskakoriin - keräilijöille, ja tiedoston antamiseen
+jollekulle, kun lataus ei toimi. Säilytetty tiedosto muistetaan, myös
+uudelleenkäynnistysten yli, eikä sitä lisätä jonoon uudelleen; tallenna se uudelleen
+ladataksesi sen uudestaan. Valitsitpa kumman tahansa, jokaisen työn tietolaatikossa on
+<b>Lataa .nzb-tiedosto</b> -painike, joten kopio minkä tahansa työn <code>.nzb</code>-tiedostosta
+on aina vain napsautuksen päässä.</p>
 
 <h3>Indeksointi <span class="pill live">live</span></h3>
 <div class="note"><b>Sisäänrakennettu indeksoija on oletuksena pois päältä.</b> Se
@@ -678,14 +717,15 @@ nopeus näytetään koontinäytössä: megatavuina (MB/s, latausohjelmien vakiin
 oletus) vai megabitteinä (Mb/s, kuten operaattorit ilmoittavat liittymät).
 Tiedostokoot pysyvät tavuina. Tämä on daemonin ominaisuus, ei selaimesi, joten se pätee
 jokaiseen laitteeseen, joka katsoo tätä asennusta.</p>
-<h3>Lisäasetukset: asetukset ilman hallintaa koontinäytössä</h3>
-<p>Kuudella asetuksella ei ole hallintaa käyttöliittymässä eikä komentorivivalitsinta.
-Aseta ne API:n kautta (<a href="#api">§16</a>), esim.
+<h3>Lisäasetukset: säätimet ilmeisten takana</h3>
+<p>Kuusi asetusta, joilla ei ole komentorivivalitsinta. Kullakin on nyt lisäasetusrivi
+sillä asetuskortilla, jolle se kuuluu, ja kunkin voi yhä asettaa API:n kautta
+(<a href="#api">§16</a>), esim.
 <code>/api?mode=config&amp;name=verify_mode&amp;value=lean&amp;apikey=…</code>. Kuten
 kaikki muutkin, ne tallentuvat tiedostoon <code>settings.json</code>.</p>
 <div class="tblwrap"><table>
 <tr><th>Nimi</th><th>Mitä se tekee</th></tr>
-<tr><td><code>verify_mode</code></td><td><code>full</code> | <code>fast</code> | <code>lean</code> (oletus <code>fast</code>). <code>lean</code> on vauhtia hitaille suorittimille: kuten fast, mutta ohittaa lisäksi artikkelikohtaisen yEnc-CRC:n heti kun PAR2 kattaa tiedoston, jolloin CRC32-kerroksia on yksi kahden sijaan. Ilman PAR2:ta ladatut säilyttävät artikkelien CRC:t, ja työn lopun varmistus ja korjaus pysyvät kummassakin tapauksessa ennallaan. Yllä oleva <b>Pikavarmistus</b> on sama säädin valintaan full vastaan fast.</td></tr>
+<tr><td><code>verify_mode</code></td><td><code>full</code> | <code>fast</code> | <code>lean</code> (oletus <code>fast</code>). <code>lean</code> on vauhtia hitaille suorittimille: kuten fast, mutta ohittaa lisäksi artikkelikohtaisen yEnc-CRC:n heti kun PAR2 kattaa tiedoston, jolloin CRC32-kerroksia on yksi kahden sijaan. Ilman PAR2:ta ladatut säilyttävät artikkelien CRC:t, ja työn lopun varmistus ja korjaus pysyvät kummassakin tapauksessa ennallaan. Yllä oleva valitsin <b>Tarkistus latauksen aikana</b> on tämä asetus.</td></tr>
 <tr><td><code>auto_retry_mins</code></td><td>Odotusaika ennen sitä <em>yhtä</em> automaattista uusintayritystä, jonka ensimmäinen puuttuviin artikkeleihin kaatunut yritys saa (oletus 20). Levitysviive on todellinen syy puuttuviin artikkeleihin ja korjaantuu itsestään; päiväkirjan ansiosta uusinta hakee vain sen mikä yhä puuttuu. Salasana- ja poistovirheet eivät kelpaa koskaan.</td></tr>
 <tr><td><code>index_scan_par</code></td><td>Montako ryhmää indeksoija skannaa rinnakkain (oletus 3, rajattu välille 1-8).</td></tr>
 <tr><td><code>oracle_sample</code></td><td>Saatavuusoraakkelin STAT-budjetti joutokäynnillä (<a href="#oracle">§13</a>), luotauksia tunnissa palvelinta kohti. Oletus 300, enintään 3600, <code>0</code> poistaa otannan kokonaan käytöstä.</td></tr>
@@ -969,7 +1009,7 @@ SABnzbd-yhteensopiva, joten olemassa olevat SAB-integraatiot toimivat muuttumatt
 <div class="tblwrap"><table>
 <tr><th>Alue</th><th>Tilat</th></tr>
 <tr><td>Jono</td><td><code>queue</code> (nimellä <code>name=delete/pause/resume/priority/switch</code>), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>addnzblnk</code>, <code>retry</code>, <code>set_password</code></td></tr>
-<tr><td>Tiedot</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code></td></tr>
+<tr><td>Tiedot</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code>, lisäksi <code>/jobnzb/&lt;nzo_id&gt;</code> (työn oma talletettu <code>.nzb</code> takaisin ulos, jonosta tai historiasta; vain täysi API-avain)</td></tr>
 <tr><td>Määritys</td><td><code>get_config</code>, <code>config&amp;name=&lt;setting&gt;&amp;value=…</code> (jokainen Asetukset-kenttä), <code>server_save/delete/test/enable/reorder</code>, <code>import_probe/apply</code></td></tr>
 <tr><td>Indeksi &amp; seinä</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, sekä newznab osoitteessa <code>/api?t=caps|search|tvsearch|movie</code> ja <code>/getnzb/&lt;id&gt;</code></td></tr>
 <tr><td>Automaatio</td><td><code>watchlist</code>, <code>watchlist_check_now</code>, <code>watch_calendar</code>, <code>feeds</code>, <code>smart_folders</code>, <code>schedule</code></td></tr>

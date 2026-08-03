@@ -336,7 +336,11 @@ udbyder altid er øverst.</p>
 <li><b>Træk rækker for at ændre rækkefølge</b> (inden for et prioritetsbånd - Tving/Høj kører stadig først);
 skift prioritet inline.</li>
 <li><b>Klik på en række</b> for detaljeskuffen: fremgangsbjælker pr. fil, antal verificerings-
-blokke, og hvilken server der bidrog med hvor meget til <em>dette</em> job.</li>
+blokke, hvilken server der bidrog med hvor meget til <em>dette</em> job, og en
+"tilføjet af"-linje, der fortæller, hvor jobbet kom fra (watch-mappen, en tilsluttet
+app, API'et…). Knappen <b>Hent .nzb-filen</b> gemmer jobbets <code>.nzb</code>-fil - nzbfast
+beholder sin egen kopi, så det virker for hvert job, selv når den originale fil
+for længst er væk.</li>
 <li>Mærker viser særlige tilstande: <i>udskudt (langsom)</i>, <i>prefetcher</i>,
 <i>på pause</i> (se <a href="#performance">Ydelsesværktøjer</a>).</li>
 <li>Et nedtællingsdiagram følger de samlede GB, der er tilbage i hele køen.</li>
@@ -353,7 +357,10 @@ opgraderingsregler (en bedre kopi erstatter en dårligere).</p>
 <p>Seneste downloads, én række hver. Mislykkede jobs tilbyder <b>Prøv igen</b>
 (genoptager fra journalen). Krypterede arkiver viser en 🔑 lås-op-kontrol - indtast
 adgangskoden, og jobbet bliver færdigt på stedet. Verificerings-sundhedsstriben viser defekte PAR2-
-blokke pr. download - en stigende hale betyder, at artikler kommer beskadigede frem.</p>
+blokke pr. download - en stigende hale betyder, at artikler kommer beskadigede frem.
+Hver rækkes skuffe fortæller, hvem der tilføjede jobbet, og har den samme
+<b>Hent .nzb-filen</b>-knap som køen - praktisk til at hente en release igen et andet
+sted, eller til at vedhæfte dens <code>.nzb</code> til en fejlrapport.</p>
 <p>Kortet viser ti downloads som standard, og resten er ét klik væk, på knappen ▤. Status, placering og årsagen til et fejlet job ligger bag et klik på selve rækken, så det almindelige tilfælde - hvad der blev færdigt, hvor stort, hvornår - forbliver læsbart uden at scrolle. Træk i kortets nederste kant for i stedet at lade listen scrolle i en højde, du selv vælger. <b>History rows</b> under Indstillinger → Grænseflade ændrer de ti; da det er en egenskab ved daemonen og ikke ved din browser, gælder det enhver enhed, der kigger på denne installation. <b>Colour History names</b> ved siden af farver færdige navne grønne og fejlede røde; slået fra forbliver navnene neutrale, og den farvede prik og rækkens egne detaljer siger stadig, hvad der er hvad.</p>
 <h3 id="dash-usage">Dataforbrug</h3>
 <p>Daglige bjælker pr. udbyder og totaler for I dag / 7 dage / 30 dage - uundværligt for målte
@@ -367,7 +374,10 @@ og blok-konti. Blok-konti viser livstidsforbrug mod deres størrelse.</p>
 <tr><th>Metode</th><th>Hvordan</th></tr>
 <tr><td><b>Træk &amp; slip</b></td><td>Slip en eller flere <code>.nzb</code>-filer hvor som helst på dashboardet.</td></tr>
 <tr><td><b>Watch-mappe</b></td><td>Vælg en mappe under Indstillinger; enhver <code>.nzb</code>, der gemmes i den, opfanges
-inden for 5 sekunder, og filen fjernes. Peg din browsers downloadmappe
+inden for 5 sekunder og flyttes til papirkurven, og et åbent dashboard melder hver
+afhentning ved navn ("… hentet fra Downloads"), så en fil, der forlader mappen,
+aldrig er et mysterium. Vil du hellere beholde dine filer? Slå <b>Behold .nzb-filer
+efter afhentning</b> til (se <a href="#settings">§9</a>). Peg din browsers downloadmappe
 mod den for hentninger med ét klik fra indexer-sites.</td></tr>
 <tr><td><b>Fra en URL</b></td><td>Indsæt et NZB-link (API <code>mode=addurl</code>, eller via en tilsluttet app).</td></tr>
 <tr><td><b>nzblnk:-links</b></td><td>Indsæt et <code>nzblnk:</code>-link hvor som helst på dashboardet, eller træk det ind. Har du installeret fra macOS-DMG'en eller Windows-installationsprogrammet, kan du også klikke på et direkte på et board. Se <a href="#nzblnk">nzblnk-links</a> nedenfor.</td></tr>
@@ -570,13 +580,15 @@ brugerfladen slår flag på kommandolinjen).</p>
 <b>decodere</b> (parallelle afkodningstråde). Aflæses, når hvert job starter. Standardværdierne
 passer til de fleste linjer; brug tuning-værktøjerne, før du hæver blindt.</p>
 
-<p><b>Hurtig verificering (CRC32)</b> (slået til som standard) gør krav på
-PAR2-blokke via CRC32, mens downloadet stadig kører, hvilket er 2-3x hurtigere på en
-langsom CPU. Hver artikels egen kontrolsum bliver stadig verificeret, og den afsluttende
-runde bruger altid fuld MD5: der gås ikke på kompromis med korrektheden. Fjern fluebenet
-for også at køre MD5 pr. blok under downloadet.</p>
+<p><b>Kontrol under download</b> vælger, hvor meget der verificeres, mens data kommer ind.
+<i>Fuld</i> bekræfter hver PAR2-blok med MD5. <i>Hurtig</i> (standard) gør krav på
+blokke via CRC32, hvilket er 2-3x hurtigere på en langsom CPU, og verificerer stadig
+hver artikels egen kontrolsum. <i>Let</i> springer desuden de artikelkontrolsummer over,
+så snart PAR2 dækker en fil: skaden dukker så op et øjeblik senere, ved sin blok. I alle
+tre bruger den afsluttende runde og enhver reparation fuld MD5, og et download uden
+PAR2-filer beholder sine artikelkontrolsummer.</p>
 <h3>Disk &amp; kvote <span class="pill live">live</span></h3>
-<p><b>Minimum fri plads</b> (sæt nye jobs på pause under den), <b>downloadkvote</b> pr.
+<p><b>Minimum fri plads</b> (sæt nye jobs på pause under den; 2 GB som standard, 0 slår det fra), <b>downloadkvote</b> pr.
 dag eller måned (UTC; Tving-jobs omgår den), <b>hukommelsesgrænse</b> - motorens RAM-budget
 (standard: ¼ af RAM, med loft; hæv den på en maskine med meget RAM for maksimal hastighed på kæmpe
 jobs, og se <a href="#memory">hvad lav hukommelse koster</a>, før du sænker den)
@@ -621,12 +633,38 @@ til</b>, og springes helt over for et job, der stadig venter på en adgangskode.
 sletttrin gælder <em>kun</em> udgivelser, der er genkendt som film eller serie: en
 softwarelast eller et sæt, der ikke kan klassificeres (sløret), bliver aldrig ryddet.</p>
 
+<p><b>Slettede filer ryger i papirkurven</b> afgør, hvad "slette" betyder ovenfor.
+Slået til flytter oprydningen filer til systemets papirkurv, så et forkert gæt om,
+hvad der var skrald, kan fortrydes; slået fra slettes de med det samme. Den er
+<b>slået til som standard på macOS og Windows</b>, hvor papirkurven er et sted, du
+kan se og tømme, og <b>slået fra som standard på Linux</b>, hvor den som regel ikke
+er det.</p>
+<div class="note"><b>På en NAS eller i en container: lad den være slået fra.</b> Når
+dine downloads ligger på en anden disk end din hjemmemappe - hvilket er det normale
+setup på Unraid, Synology, en seedbox eller enhver Docker-installation med et
+monteret share - bruger Linux' papirkurvsregler slet ikke nogen
+skrivebordspapirkurv. De opretter en skjult mappe <code>.Trash-1000</code> (tallet
+er dit bruger-id) øverst på downloaddisken og flytter filerne derhen i stedet.
+Intet viser dig den mappe, intet tømmer den, og pladsen, den holder på, kommer
+aldrig tilbage.
+<p>Har du kørt en tidligere version af nzbfast på Linux med den slået til, så kig
+efter den mappe i roden af dit download-share. Den er sikker at tømme: alt i den er
+filer, en oprydning allerede har afgjort, at du ikke ville have. nzbfast tømmer den
+ikke for dig, for den ligger på din disk, og det er dig, der dømmer.</p></div>
+
 <h3>Mapper &amp; behandling</h3>
 <p><b>Downloadmappe</b> <span class="pill restart">genstart</span>, <b>watch-mappe</b>,
 <b>efterbehandlingsscript</b> (kører efter hvert job med SABnzbd-kompatible argumenter
 og <code>SAB_*</code>-miljø - eksisterende SAB-scripts virker uændret),
 <b>oprydningsendelser</b> (skraldfiler slettet efter fuldførelse), <b>Smarte mapper</b>
 og <b>tv-arkivering</b> (se <a href="#automation">§10</a>).</p>
+<p><b>Behold .nzb-filer efter afhentning</b> (slået fra som standard) lader den
+originale <code>.nzb</code> blive i watch-mappen, efter den er sat i kø, i stedet
+for at flytte den til papirkurven - for samlere, og til at give filen videre, når en
+download driller. En beholdt fil huskes, også på tværs af genstarter, og sættes ikke
+i kø igen; gem den igen for at hente den på ny. Uanset hvad du vælger, har hvert
+jobs skuffe en <b>Hent .nzb-filen</b>-knap, så en kopi af ethvert jobs
+<code>.nzb</code> aldrig er mere end et klik væk.</p>
 
 <h3>Indeksering <span class="pill live">live</span></h3>
 <div class="note"><b>Den indbyggede indekser er slået fra som standard.</b> Den finder
@@ -670,14 +708,15 @@ hastighed vises i dashboardet: megabyte (MB/s, normen blandt downloadprogrammer,
 standarden) eller megabit (Mb/s, sådan som udbydere angiver linjer). Filstørrelser
 bliver i byte. Det er en egenskab ved daemonen, ikke ved din browser, så det gælder
 hver enhed, der kigger på denne installation.</p>
-<h3>Avanceret: indstillinger uden betjening i dashboardet</h3>
-<p>Seks indstillinger har hverken en betjening i brugerfladen eller et flag på
-kommandolinjen. Sæt dem via API'et (<a href="#api">§16</a>), f.eks.
+<h3>Avanceret: knapperne bag de indlysende</h3>
+<p>Seks indstillinger uden flag på kommandolinjen. Hver har nu en avanceret række på det
+indstillingskort, den hører til, og kan stadig sættes via API'et
+(<a href="#api">§16</a>), f.eks.
 <code>/api?mode=config&amp;name=verify_mode&amp;value=lean&amp;apikey=…</code>. Som
 alle andre gemmes de i <code>settings.json</code>.</p>
 <div class="tblwrap"><table>
 <tr><th>Navn</th><th>Hvad den gør</th></tr>
-<tr><td><code>verify_mode</code></td><td><code>full</code> | <code>fast</code> | <code>lean</code> (standard <code>fast</code>). <code>lean</code> er skubbet til langsomme CPU'er: som fast, men springer desuden yEnc-CRC pr. artikel over, så snart PAR2 dækker en fil, altså ét CRC32-lag i stedet for to. Downloads uden PAR2 beholder deres artikel-CRC'er, og verificering og reparation i slutningen af jobbet er uændrede i begge tilfælde. <b>Hurtig verificering</b> ovenfor er den samme betjening for full mod fast.</td></tr>
+<tr><td><code>verify_mode</code></td><td><code>full</code> | <code>fast</code> | <code>lean</code> (standard <code>fast</code>). <code>lean</code> er skubbet til langsomme CPU'er: som fast, men springer desuden yEnc-CRC pr. artikel over, så snart PAR2 dækker en fil, altså ét CRC32-lag i stedet for to. Downloads uden PAR2 beholder deres artikel-CRC'er, og verificering og reparation i slutningen af jobbet er uændrede i begge tilfælde. Vælgeren <b>Kontrol under download</b> ovenfor er denne indstilling.</td></tr>
 <tr><td><code>auto_retry_mins</code></td><td>Ventetid før det <em>ene</em> automatiske gentagne forsøg, som en første fejl med manglende artikler får (standard 20). Propagationsforsinkelse er en reel årsag til manglende artikler og løser sig selv; takket være journalen henter genkørslen kun det, der stadig mangler. Fejl på grund af adgangskode eller takedown kvalificerer sig aldrig.</td></tr>
 <tr><td><code>index_scan_par</code></td><td>Hvor mange grupper indekseringen skanner parallelt (standard 3, begrænset til 1-8).</td></tr>
 <tr><td><code>oracle_sample</code></td><td>Tilgængelighedsoraklets STAT-budget i tomgang (<a href="#oracle">§13</a>), sonderinger i timen pr. server. Standard 300, maks. 3600, <code>0</code> slår sampling helt fra.</td></tr>
@@ -957,7 +996,7 @@ SABnzbd-kompatibelt, så eksisterende SAB-integrationer virker uændret. To nøg
 <div class="tblwrap"><table>
 <tr><th>Område</th><th>Modes</th></tr>
 <tr><td>Kø</td><td><code>queue</code> (med <code>name=delete/pause/resume/priority/switch</code>), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>addnzblnk</code>, <code>retry</code>, <code>set_password</code></td></tr>
-<tr><td>Info</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code></td></tr>
+<tr><td>Info</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code>, plus <code>/jobnzb/&lt;nzo_id&gt;</code> (jobbets egen gemte <code>.nzb</code> ud igen, kø eller historik; kun fuld API-nøgle)</td></tr>
 <tr><td>Konfiguration</td><td><code>get_config</code>, <code>config&amp;name=&lt;setting&gt;&amp;value=…</code> (hvert Indstillinger-felt), <code>server_save/delete/test/enable/reorder</code>, <code>import_probe/apply</code></td></tr>
 <tr><td>Indeks &amp; væg</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, plus newznab på <code>/api?t=caps|search|tvsearch|movie</code> og <code>/getnzb/&lt;id&gt;</code></td></tr>
 <tr><td>Automatisering</td><td><code>watchlist</code>, <code>watchlist_check_now</code>, <code>watch_calendar</code>, <code>feeds</code>, <code>smart_folders</code>, <code>schedule</code></td></tr>

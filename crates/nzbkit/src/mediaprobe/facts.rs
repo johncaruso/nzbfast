@@ -366,8 +366,19 @@ pub fn check(info: &MediaInfo, name: &str) -> MediaFacts {
     // Audio: the claimed family must appear on SOME track. A release
     // with a TrueHD track and an AC3 compatibility track satisfies both
     // a "TrueHD" and an "AC3" name, which is exactly right.
+    //
+    // Only on a COMPLETE read: "no track in the claimed family" is an
+    // absence claim over the whole track list, and an incomplete probe
+    // (a header still downloading, or more tracks than we will list)
+    // knows its list is partial - the TrueHD track a name promises may
+    // sit in the unread tail while only the AC3 compatibility track was
+    // reached. Calling the file fake on evidence like that is the false
+    // amber this module must not raise; the video/resolution rules
+    // compare a track that WAS read, so they stand. A later complete
+    // probe re-judges (`media_settled` requires `complete`).
     if let Some(claimed) = &claim.acodec
         && let Some(family) = name_acodec_family(claimed)
+        && info.complete
         && !info.audio.is_empty()
         && !info
             .audio
@@ -573,6 +584,35 @@ mod tests {
         odd.video[0].codec_id = "V_WIBBLE".into();
         let m = check(&odd, "Example.Movie.2003.480p.DVDRip.x264-GRP").mismatch;
         assert!(m.iter().all(|x| x.field != Field::Video), "{m:?}");
+    }
+
+    /// The audio rule asserts an ABSENCE ("no track in the claimed
+    /// family"), and an incomplete probe knows its track list may be
+    /// partial - the TrueHD track an Atmos name promises can sit in the
+    /// unread tail while only the AC3 compatibility track was reached.
+    /// It must stand down until the read is complete; the same evidence
+    /// on a complete read is a genuine mismatch.
+    #[test]
+    fn a_partial_track_list_never_calls_the_audio_fake() {
+        let mut info = probed(&testmux::mkv_full());
+        assert!(info.complete);
+        // mkv_full's audio family does not satisfy a DTS name.
+        let name = "Example.Movie.2019.1080p.BluRay.x264.DTS-GRP";
+        assert!(
+            check(&info, name)
+                .mismatch
+                .iter()
+                .any(|m| m.field == Field::Audio),
+            "the complete read must still flag the mismatch"
+        );
+        info.incomplete("this file has more tracks than we will list");
+        assert!(
+            check(&info, name)
+                .mismatch
+                .iter()
+                .all(|m| m.field != Field::Audio),
+            "an incomplete track list is not evidence of absence"
+        );
     }
 
     #[test]

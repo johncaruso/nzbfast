@@ -33,6 +33,7 @@ pub use nzbkit::par2repair::FAST_PAR_DEFAULT;
 mod daemon;
 use daemon::*;
 
+mod giveup;
 pub(crate) mod predb_seed;
 mod tasks;
 
@@ -1086,7 +1087,12 @@ fn apply_saved_settings(opts: &mut ServeOpts, path: &std::path::Path) {
         }
     }
     if let Some(v) = n("min_free") {
-        opts.min_free = (v > 0).then_some(v);
+        // `Some(0)`, NOT None: 0 is the user saying OFF, and the launch
+        // default is non-zero (MIN_FREE_DEFAULT). Collapsing a saved 0
+        // into "nothing was saved" handed those installs the default
+        // back on every restart, which is the one answer the person who
+        // typed 0 had ruled out.
+        opts.min_free = Some(v);
     }
     if let Some(v) = n("auto_retry_mins") {
         opts.auto_retry_mins = v;
@@ -2347,6 +2353,24 @@ const WATCH_EXT_INTERVAL_SECS: i64 = 12 * 60 * 60;
 /// thing a low ceiling costs is the seconds.
 pub(super) const INSTANT_MAX_DEFAULT: u32 = 6;
 
+/// Free space the queue keeps in hand by default: new jobs wait below
+/// it, and the header says which floor is holding them.
+///
+/// It used to be 0, which is to say there was no protection at all
+/// unless the operator went looking for the setting. That is how a
+/// tester's disk reached 1.8 GB free (3 Aug): the download itself fits,
+/// so nothing objects, and the machine is the thing that suffers - a
+/// full disk tears settings writes, starves the OS, and fails the
+/// unpack that was going to need the room anyway.
+///
+/// 2 GB, not more: this is a floor against a disk hitting ZERO, not a
+/// per-job forecast (the queue row does that, and it counts the
+/// extraction). High enough that macOS and Windows keep working, low
+/// enough that a NAS deliberately run near full is not held hostage -
+/// and it is one field away from 0, which now MEANS off and survives a
+/// restart.
+pub(super) const MIN_FREE_DEFAULT: u64 = 2_000_000_000;
+
 /// §74: how long a matched-but-incomplete arrival keeps its short
 /// re-check before it is handed back to the periodic pass. A post still
 /// going up is the normal case at +6 s; one that has not finished ten
@@ -2376,6 +2400,10 @@ fn watchlist_pass(d: &Arc<Daemon>) {
     // The watcher owns this state: it's only ever mutated here, so
     // working on a clone and writing back at the end is race-free.
     let mut state = d.watch_state.lock_ok().clone();
+    // Bundle D: the skip reasons describe THIS pass, so the previous
+    // pass's are cleared rather than accumulated - an item that is no
+    // longer being declined must stop saying it is.
+    state.skips.clear();
     let mut dirty = false;
     let unix_now = || {
         std::time::SystemTime::now()
@@ -2458,7 +2486,9 @@ fn watchlist_pass(d: &Arc<Daemon>) {
                             t,
                         )
                     };
-                    remove_job_files(&dir, &name, filed, &tail);
+                    if let FilesGone::Kept(why) = remove_job_files(&dir, &name, filed, &tail) {
+                        d.note_delete_kept(&name, &dir, &why);
+                    }
                     let _ = std::fs::remove_file(&nzb);
                     d.save_queue();
                     info!(
@@ -2489,18 +2519,60 @@ fn watchlist_pass(d: &Arc<Daemon>) {
                             t,
                         )
                     };
-                    remove_job_files(&dir, &name, filed, &tail);
+                    let outcome = remove_job_files(&dir, &name, filed, &tail);
+                    if let FilesGone::Kept(why) = &outcome {
+                        d.note_delete_kept(&name, &dir, why);
+                    }
                     let _ = std::fs::remove_file(&nzb);
                     d.history
                         .lock()
                         .unwrap()
                         .retain(|j| j.lock_ok().nzo_id != p.old_nzo);
                     d.save_queue();
+                    // Read AFTER the delete, so a Trash that latched
+                    // unresponsive during it reports "deleted", never a
+                    // Trash that was not really used. The third state is
+                    // the other half of the same rule: a refused delete
+                    // leaves the files where they are, so neither "went to
+                    // the Trash" (they are not in it) nor "was deleted"
+                    // (it was not) is true of them.
+                    let fate = if !outcome.gone() {
+                        "kept"
+                    } else if crate::smart::delete_to_trash() && !crate::smart::trash_unresponsive()
+                    {
+                        "trash"
+                    } else {
+                        "gone"
+                    };
                     info!(
                         target: "watch",
-                        "upgrade landed - deleted superseded {} ({})",
-                        p.prev_stem, p.old_nzo
+                        "upgrade landed - superseded {} ({}) - {}",
+                        p.prev_stem,
+                        p.old_nzo,
+                        match fate {
+                            "trash" => "its files went to the Trash",
+                            "kept" => "its record went, its files are still on disk",
+                            _ => "its files were deleted",
+                        }
                     );
+                    // Narrate it where the user looks: a completed
+                    // download and its history row just disappeared, and
+                    // two log lines were the only witnesses. Same ring
+                    // pattern as watch_picked - queue_json carries it,
+                    // an open dashboard toasts it.
+                    {
+                        let mut wu = d.watch_upgraded.lock_ok();
+                        wu.push_back((
+                            p.new_stem.clone(),
+                            p.prev_stem.clone(),
+                            p.prev_quality.clone(),
+                            fate.to_string(),
+                            unix_now(),
+                        ));
+                        while wu.len() > 8 {
+                            wu.pop_front();
+                        }
+                    }
                 }
                 dirty = true;
             }
@@ -2617,6 +2689,13 @@ fn watchlist_pass(d: &Arc<Daemon>) {
         }
     }
 
+    // §96.3: snapshot the give-up breaker once per pass. A tripped
+    // target's candidates are skipped below - that skip IS the
+    // watchlist's "unmonitor", and it keeps the one-grab-path invariant:
+    // nothing new decides, the pass just declines dead content.
+    let giveup_threshold = d.arr_giveup_threshold.load(Ordering::Relaxed).min(1000) as u32;
+    let giveup = d.giveup.lock_ok().clone();
+
     // 2. Match the index against each enabled item.
     for item in items.iter().filter(|i| i.enabled) {
         let min = wl::threshold_rank(&item.min_quality);
@@ -2638,11 +2717,6 @@ fn watchlist_pass(d: &Arc<Daemon>) {
         let mut best: std::collections::HashMap<String, Cand> = std::collections::HashMap::new();
         let now_unix = unix_now();
         for r in hits.iter().filter(|r| r.complete) {
-            // M32: per-item age window - skip too-fresh
-            // (still propagating) and too-stale (repost) candidates.
-            if !wl::age_ok(item, r.first_posted, now_unix) {
-                continue;
-            }
             // Matched on the name the release is KNOWN by: a
             // watchlist entry can never match an obfuscated stem, and
             // the whole point of a pre hit is that we now have the
@@ -2650,6 +2724,26 @@ fn watchlist_pass(d: &Arc<Daemon>) {
             let name = r.display_name();
             let p = classify(name);
             if !wl::matches(item, name, &p) {
+                continue;
+            }
+            // M32: per-item age window - skip too-fresh
+            // (still propagating) and too-stale (repost) candidates.
+            //
+            // Deliberately AFTER the match test, which it used to
+            // precede: the search is a fuzzy title query, so most hits
+            // belong to some other title, and recording an age skip
+            // against every one of them would report the window
+            // rejecting posts this item never wanted. The cost is
+            // classifying the age-rejected minority, which is small
+            // beside the hits that reach here anyway.
+            if !wl::age_ok(item, r.first_posted, now_unix) {
+                wl::note_skip(&mut state.skips, item.id, "age");
+                continue;
+            }
+            // §96.3: the give-up breaker has concluded this target is
+            // not obtainable - stop pursuing it (any release of it).
+            if giveup.tripped(&p, giveup_threshold) {
+                wl::note_skip(&mut state.skips, item.id, "giveup");
                 continue;
             }
             let Some(slot) = wl::slot_of(item, &p) else {
@@ -2709,12 +2803,28 @@ fn watchlist_pass(d: &Arc<Daemon>) {
             if due {
                 state.ext_checked.insert(item.id, now_unix);
                 dirty = true;
-                for r in watchlist_external_candidates(d, item) {
+                let (ext, gated) = watchlist_external_candidates(d, item);
+                // The budget and backoff gates are the reason a "search
+                // my indexer accounts" item can go quiet for a day with
+                // nothing anywhere saying so - manual search has always
+                // shown these notes, the watchlist swallowed them.
+                if let Some(reason) = gated {
+                    wl::note_skip(&mut state.skips, item.id, &reason);
+                }
+                for r in ext {
                     let p = classify(&r.title);
                     if !wl::matches(item, &r.title, &p) {
                         continue;
                     }
+                    // §96.3: same give-up skip as the local leg - an
+                    // external candidate for a dead target would spend
+                    // third-party allowance re-proving it.
+                    if giveup.tripped(&p, giveup_threshold) {
+                        wl::note_skip(&mut state.skips, item.id, "giveup");
+                        continue;
+                    }
                     if !wl::age_ok(item, r.posted, now_unix) {
+                        wl::note_skip(&mut state.skips, item.id, "age");
                         continue;
                     }
                     let Some(slot) = wl::slot_of(item, &p) else {
@@ -3216,10 +3326,15 @@ struct ExtCand {
 /// remake. Season/episode are NOT sent - one search per item per
 /// cadence has to cover every wanted episode, and `slot_of` sorts the
 /// results out afterwards anyway.
+///
+/// Returns the candidates plus, when this leg asked NOBODY, the reason
+/// the gates gave - bundle D: those were bare `continue`s, so an item
+/// whose indexers were all out of daily allowance looked exactly like
+/// one nothing had been posted for.
 fn watchlist_external_candidates(
     d: &Arc<Daemon>,
     item: &crate::watchlist::WatchItem,
-) -> Vec<ExtCand> {
+) -> (Vec<ExtCand>, Option<String>) {
     let list: Vec<crate::newznab::IndexerConfig> = d
         .indexers
         .lock()
@@ -3229,18 +3344,24 @@ fn watchlist_external_candidates(
         .cloned()
         .collect();
     if list.is_empty() {
-        return Vec::new();
+        return (Vec::new(), None);
     }
     let mut runnable = Vec::new();
+    // Per-indexer, and named: "your indexers are out of allowance" is a
+    // different sentence from "NZBGeek is", and with three accounts
+    // configured only the second one is actionable.
+    let (mut spent, mut backed_off) = (Vec::new(), Vec::new());
     {
         let mut rt = d.indexer_rt.lock_ok();
         rt.usage.roll(unix_now());
         let now = Instant::now();
         for i in list {
             if rt.penalty_until.get(&i.name).is_some_and(|t| *t > now) {
+                backed_off.push(i.name.clone());
                 continue;
             }
             if !rt.usage.hit_allowed(&i) {
+                spent.push(i.name.clone());
                 continue;
             }
             rt.usage.count_hit(&i.name);
@@ -3248,7 +3369,17 @@ fn watchlist_external_candidates(
         }
     }
     if runnable.is_empty() {
-        return Vec::new();
+        // Budget leads: an exhausted daily allowance lasts until
+        // midnight and is the one the user can do something about,
+        // where a rate-limit backoff clears itself in minutes.
+        let gated = if !spent.is_empty() {
+            Some(format!("indexer_budget:{}", spent.join(", ")))
+        } else if !backed_off.is_empty() {
+            Some(format!("indexer_backoff:{}", backed_off.join(", ")))
+        } else {
+            None
+        };
+        return (Vec::new(), gated);
     }
     save_indexer_usage(d);
     let q = match (item.kind.as_str(), item.year) {
@@ -3277,9 +3408,12 @@ fn watchlist_external_candidates(
             .collect();
         handles.into_iter().filter_map(|h| h.join().ok()).collect()
     });
+    let mut asked_ok = 0usize;
+    let mut refused: Vec<String> = Vec::new();
     for (name, r) in results {
         match r {
             Ok(items) => {
+                asked_ok += 1;
                 for it in items {
                     out.push(ExtCand {
                         title: it.title,
@@ -3298,13 +3432,19 @@ fn watchlist_external_candidates(
                         .penalty_until
                         .insert(name.clone(), Instant::now() + INDEXER_LIMIT_BACKOFF);
                 }
+                refused.push(name.clone());
                 // Never fatal: the item simply has no external candidate
                 // this pass, and the local index still decides.
                 warn!(target: "watch", "{name}: {e}");
             }
         }
     }
-    out
+    // Every account we did ask refused us. Same class of silence as the
+    // gates above and reported the same way; a leg that partly answered
+    // says nothing, because the answer is what the item wanted.
+    let gated = (asked_ok == 0 && !refused.is_empty())
+        .then(|| format!("indexer_error:{}", refused.join(", ")));
+    (out, gated)
 }
 
 /// Current server list as JSON values ready for editing. Prefers the
@@ -3829,8 +3969,10 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
         reserved: Mutex::new(std::collections::HashSet::new()),
         progress: Arc::new(AtomicU64::new(0)),
         active_total: AtomicU64::new(0),
+        active_dl: Mutex::new(None),
         started_at: Mutex::new(None),
         last_download_end: Mutex::new(Instant::now()),
+        stall_since: Mutex::new(None),
         next_id: AtomicU64::new(1),
         out_root: std::sync::RwLock::new(out_root.clone()),
         move_completed: std::sync::RwLock::new(None),
@@ -3881,10 +4023,13 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
         update_url: Mutex::new(DEFAULT_UPDATE_URL.to_string()),
         ui_locale: Mutex::new(String::new()),
         sidecar: Mutex::new(None),
+        media_rejudge: Mutex::new(Vec::new()),
         best_rate_bps: AtomicU64::new(0),
         speed_ceiling: AtomicU64::new(0),
         mem_budget_total: mem_budget.total,
         feeds: Mutex::new(Vec::new()),
+        feed_health: Mutex::new(Default::default()),
+        last_refusals: Mutex::new(Default::default()),
         indexers: Mutex::new(Vec::new()),
         watchlist_external: std::sync::atomic::AtomicBool::new(false),
         watchlist_external_set: std::sync::atomic::AtomicBool::new(false),
@@ -3902,6 +4047,9 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
         fast_par: AtomicBool::new(FAST_PAR_DEFAULT),
         prefer_external_unrar: AtomicBool::new(false),
         cleanup_exts: Mutex::new(Vec::new()),
+        password_file: Mutex::new(config.with_file_name("passwords.txt")),
+        password_prompt: Mutex::new("done".to_string()),
+        unpack_eat_volumes: Mutex::new("off".to_string()),
         // Loaded from settings.json below (next to smart_folders); the
         // reclassify flag starts set so startup reconciles the stored
         // rows against the current config exactly once (the index stamps
@@ -4084,6 +4232,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                 .unwrap_or_default(),
         ),
         compact_pending: std::sync::atomic::AtomicBool::new(false),
+        last_auto_trim: std::sync::Mutex::new(None),
         index_opened: Mutex::new(
             crate::persist::load_json_with_backup(&spool.join("index-opened.json"))
                 .and_then(|v| serde_json::from_value::<OpenedLog>(v).ok())
@@ -4103,6 +4252,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
         ),
+        tune_hint: Mutex::new(String::new()),
         cpu_sample: Mutex::new(None),
         speed_win: Mutex::new(VecDeque::new()),
         usage: Mutex::new(
@@ -4117,7 +4267,10 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
         decoders: std::sync::atomic::AtomicUsize::new(decoders.max(1)),
         fast_verify: std::sync::atomic::AtomicBool::new(fast_verify),
         verify_lean: std::sync::atomic::AtomicBool::new(verify_lean),
-        min_free: AtomicU64::new(min_free.unwrap_or(0)),
+        min_free: AtomicU64::new(min_free.unwrap_or(MIN_FREE_DEFAULT)),
+        queue_hold: std::sync::Mutex::new(None),
+        pause_source: std::sync::Mutex::new("user"),
+        limit_source: std::sync::Mutex::new("user"),
         auto_retry_secs: AtomicU64::new(
             std::env::var("NZBFAST_AUTO_RETRY_SECS")
                 .ok()
@@ -4131,7 +4284,13 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
             b'd'
         }),
         watch_dir: Mutex::new(watch),
+        watch_keep_nzb: AtomicBool::new(false),
         watch_failed: Mutex::new(std::collections::HashMap::new()),
+        watch_picked: Mutex::new(std::collections::VecDeque::new()),
+        auto_retried: Mutex::new(std::collections::VecDeque::new()),
+        giveup_tripped: Mutex::new(std::collections::VecDeque::new()),
+        watch_upgraded: Mutex::new(std::collections::VecDeque::new()),
+        delete_kept: Mutex::new(std::collections::VecDeque::new()),
         auth_fails: Mutex::new(std::collections::HashMap::new()),
         enrich_hot: Mutex::new(std::collections::VecDeque::new()),
         group_catalog: Mutex::new(None),
@@ -4143,6 +4302,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
         script: Mutex::new(script),
         script_timeout: AtomicU64::new(3600),
         notify_targets: Mutex::new(Vec::new()),
+        notify_health: Mutex::new(Default::default()),
         failure_link: Mutex::new("off".to_string()),
         quality_prefs: Mutex::new(
             load_settings(&settings_path)
@@ -4195,6 +4355,9 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
         watchlist: Mutex::new(Vec::new()),
         watch_state: Mutex::new(Default::default()),
         watch_now: tokio::sync::Notify::new(),
+        arr_giveup_threshold: AtomicU64::new(0),
+        arr_instances: Mutex::new(Vec::new()),
+        giveup: Arc::new(Mutex::new(Default::default())),
         settings_path: settings_path.clone(),
         taste_cache: Mutex::new(None),
     });
@@ -4221,8 +4384,75 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                 Err(e) => warn!(target: "cleanup", "ignoring saved cleanup_exts: {e}"),
             }
         }
+        // SAB/NZBGet-parity passwords file. A saved path (adopted from a
+        // competitor import, or user-set) wins; empty/absent = the
+        // default next to the config.
+        if let Some(p) = saved
+            .get("password_file")
+            .and_then(Value::as_str)
+            .filter(|p| !p.trim().is_empty())
+        {
+            *daemon.password_file.lock_ok() = PathBuf::from(p.trim());
+        }
+        // One-shot migration: the short-lived `unpack_passwords` LIST
+        // setting (shipped and replaced the same day) seeds the file,
+        // but never overwrites one that already has content - the file
+        // is the operator's now.
+        if let Some(list) = saved
+            .get("unpack_passwords")
+            .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+            .filter(|l| !l.is_empty())
+        {
+            let path = daemon.password_file.lock_ok().clone();
+            if !path.exists() {
+                let body = list.join("\n") + "\n";
+                if let Err(e) = crate::persist::write_atomic(&path, body.as_bytes()) {
+                    warn!(target: "unlock", "could not migrate unpack_passwords to {}: {e}", path.display());
+                } else {
+                    info!(target: "unlock", "moved {} saved password(s) into {}", list.len(), path.display());
+                }
+            }
+        }
+        // Make sure the file exists so "where do passwords go" has one
+        // answer: the path the settings page shows. 0600 like every
+        // credential-bearing file (write_atomic's mode).
+        {
+            let path = daemon.password_file.lock_ok().clone();
+            if !path.exists()
+                && let Err(e) = crate::persist::write_atomic(&path, b"")
+            {
+                warn!(target: "unlock", "could not create {}: {e}", path.display());
+            }
+            // Mirror for the in-stream probe (it holds a hub, not the
+            // daemon).
+            *daemon.hub.unpack_password_file.lock_ok() = Some(path);
+        }
+        if let Some(m) = saved.get("password_prompt").and_then(Value::as_str)
+            && matches!(m, "now" | "done" | "never")
+        {
+            *daemon.password_prompt.lock_ok() = m.to_string();
+        }
+        // TODO 101: the mode is read by the unpack ladder through
+        // `eatvol`, so mirror it whether it was saved or defaulted -
+        // same shape as fast_par below. Nothing is ever eaten under the
+        // "off" default, so a mirror of the default is a no-op that
+        // keeps the two stores from drifting.
+        if let Some(m) = saved
+            .get("unpack_eat_volumes")
+            .and_then(Value::as_str)
+            .and_then(crate::eatvol::EatMode::parse)
+        {
+            *daemon.unpack_eat_volumes.lock_ok() = m.as_str().to_string();
+        }
+        crate::eatvol::set_mode(
+            crate::eatvol::EatMode::parse(&daemon.unpack_eat_volumes.lock_ok().clone())
+                .unwrap_or_default(),
+        );
         if let Some(on) = saved.get("par_cleanup").and_then(Value::as_bool) {
             daemon.par_cleanup.store(on, Ordering::Relaxed);
+        }
+        if let Some(on) = saved.get("watch_keep_nzb").and_then(Value::as_bool) {
+            daemon.watch_keep_nzb.store(on, Ordering::Relaxed);
         }
         if let Some(on) = saved.get("fast_par").and_then(Value::as_bool) {
             daemon.fast_par.store(on, Ordering::Relaxed);
@@ -4325,6 +4555,24 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
             match serde_json::from_value::<Vec<crate::notify::Target>>(v.clone()) {
                 Ok(list) => *daemon.notify_targets.lock_ok() = list,
                 Err(e) => warn!(target: "notify", "ignoring saved notify_targets: {e}"),
+            }
+        }
+        // §96.3 give-up breaker: the threshold, the *arr instances it may
+        // act on, and the counters a previous run accumulated.
+        if let Some(n) = saved.get("arr_giveup_threshold").and_then(Value::as_u64) {
+            daemon.arr_giveup_threshold.store(n, Ordering::Relaxed);
+        }
+        if let Some(v) = saved.get("arr_instances") {
+            match serde_json::from_value::<Vec<giveup::ArrInstance>>(v.clone()) {
+                Ok(list) => *daemon.arr_instances.lock_ok() = list,
+                Err(e) => warn!(target: "giveup", "ignoring saved arr_instances: {e}"),
+            }
+        }
+        let giveup_path = daemon.spool.join("giveup-state.json");
+        if let Some(v) = crate::persist::load_json_with_backup(&giveup_path) {
+            match serde_json::from_value(v) {
+                Ok(s) => *daemon.giveup.lock_ok() = s,
+                Err(e) => warn!(target: "giveup", "ignoring {}: {e}", giveup_path.display()),
             }
         }
         if let Some(v) = saved.get("ui_locale").and_then(Value::as_str) {
@@ -4653,6 +4901,20 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                 };
                 let url = req.url().to_string();
                 let (path, query) = url.split_once('?').unwrap_or((url.as_str(), ""));
+                // SABnzbd answers `/api/` exactly as it answers `/api`, and
+                // clients written against "the SABnzbd API" lean on that:
+                // Homepage's sabnzbd widget builds its URL with the slash and
+                // got a flat 404 from us (issue #22), which reads as "this
+                // API is broken" rather than "this API is picky". The same
+                // miss hit /newznab/api/, i.e. an *arr pointing an indexer
+                // here. Normalize ONE trailing slash for route matching.
+                // "/" must survive - it is the dashboard - and every
+                // sub-path arm below already trims its own remainder, so
+                // this only ever reaches the exact-match arms.
+                let path = match path.strip_suffix('/') {
+                    Some("") | None => path,
+                    Some(trimmed) => trimmed,
+                };
                 if path == "/" || path == "/index.html" {
                     let _ = req.respond(
                         // §5 i18n: stamp the daemon-default locale into the page
@@ -5252,6 +5514,77 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                     }
                     continue;
                 }
+                // A job's own spooled .nzb back out - the queue/history
+                // drawer's "Download .nzb". Works for EVERY origin,
+                // including jobs whose watch-folder original is long
+                // gone; nzbfast keeps a spool copy for the job's whole
+                // life (a cleared/deleted record removes it, hence the
+                // 404 arm). FULL key only, unlike /getnzb above: the
+                // add-only nzbkey may pull index-built NZBs, but a
+                // job's spool says what this user downloads, which is
+                // exactly what an add-only credential must not read.
+                if let Some(rest) = path.strip_prefix("/jobnzb/") {
+                    let given = params.get("apikey").map(String::as_str);
+                    let full_ok = match (&cur_apikey, &cur_nzbkey) {
+                        (None, None) => true,
+                        (Some(k), _) => given.is_some_and(|g| ct_eq(g, k)),
+                        (None, Some(_)) => false,
+                    };
+                    if !full_ok {
+                        let blocked = d.note_auth_failure(peer_ip(&req), "jobnzb");
+                        let _ = req.respond(if blocked {
+                            tiny_http::Response::from_string("too many bad keys")
+                                .with_status_code(429)
+                        } else {
+                            tiny_http::Response::from_string("bad apikey").with_status_code(401)
+                        });
+                        continue;
+                    }
+                    let id = rest.trim_end_matches(".nzb");
+                    let rec = {
+                        let pick = |j: &Arc<Mutex<Job>>| {
+                            let g = j.lock_ok();
+                            (g.nzo_id == id).then(|| (g.name.clone(), g.nzb_path.clone()))
+                        };
+                        let q = d.queue.lock_ok().iter().find_map(pick);
+                        q.or_else(|| d.history.lock_ok().iter().find_map(pick))
+                    };
+                    match rec.and_then(|(name, p)| std::fs::read(p).ok().map(|b| (name, b))) {
+                        Some((name, bytes)) => {
+                            // The name is the poster's text: keep it a
+                            // single header-safe token so it cannot
+                            // smuggle a quote or CR/LF into the header.
+                            let fname: String = nzbkit::disk::sanitize_filename(&name)
+                                .chars()
+                                .filter(|c| !c.is_control() && *c != '"')
+                                .collect();
+                            let _ = req.respond(
+                                tiny_http::Response::from_data(bytes)
+                                    .with_header(
+                                        tiny_http::Header::from_bytes(
+                                            &b"Content-Type"[..],
+                                            &b"application/x-nzb"[..],
+                                        )
+                                        .unwrap(),
+                                    )
+                                    .with_header(
+                                        tiny_http::Header::from_bytes(
+                                            &b"Content-Disposition"[..],
+                                            format!("attachment; filename=\"{fname}.nzb\"")
+                                                .into_bytes(),
+                                        )
+                                        .unwrap(),
+                                    ),
+                            );
+                        }
+                        None => {
+                            let _ = req.respond(
+                                tiny_http::Response::from_string("not found").with_status_code(404),
+                            );
+                        }
+                    }
+                    continue;
+                }
                 // M21: NZBGet JSON-RPC facade - remote-control apps built for
                 // NZBGet (nzb360, LunaSea, …) work unmodified. Auth is HTTP
                 // Basic; the password must be the API key (any username).
@@ -5269,14 +5602,30 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                 // as POST form fields with nothing in the query string - so a
                 // key that authenticates against SAB never reached our
                 // query-only parse and was rejected ("[auth] rejected key for
-                // api"). Read a form-shaped body ONCE here and merge its
-                // fields in (query wins); the addfile/wall_art arms consume
-                // the file part from this same buffer. JSON bodies (the
-                // dashboard's config/server_* calls) don't match the gate and
-                // keep their own reads. This does buffer a capped body before
-                // auth - SAB parity, loopback-bound by default, and the
+                // api"). Read the body ONCE here and merge any form fields in
+                // (query wins); the addfile/wall_art arms consume the file
+                // part from this same buffer. This does buffer a capped body
+                // before auth - SAB parity, loopback-bound by default, and the
                 // auth-fail limiter still counts the failure afterwards.
+                //
+                // EVERY post, whatever it calls itself (Codex sweep 2, 3 Aug
+                // H1). The read used to happen only for three recognized
+                // content types, and a handler whose body was not pre-read
+                // fell back to reading the socket itself - AFTER dispatch,
+                // which is after the authorization decision. So a caller
+                // holding key A could send `?mode=server_save&apikey=A` with
+                // NO Content-Type at all, stall the body, wait for the owner
+                // to rotate A to B, and then complete the destructive write
+                // under the revoked key. `Application/JSON` was a second way
+                // in: media types are case-insensitive and the classifier
+                // was not. Making the read unconditional retires the
+                // fallback entirely, so no handler can reach the socket
+                // after auth - see the `unwrap_or_default()` in each of
+                // them.
                 let mut api_body: Option<Vec<u8>> = None;
+                // Keeps the body-budget reservation alive for as long as
+                // `api_body` (and the parse of it) is - see [`BodyHold`].
+                let mut _api_body_hold: Option<BodyHold> = None;
                 if req.method() == &tiny_http::Method::Post {
                     let ctype = req
                         .headers()
@@ -5284,37 +5633,67 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                         .find(|h| h.field.equiv("Content-Type"))
                         .map(|h| h.value.as_str().to_string())
                         .unwrap_or_default();
-                    // Validated BEFORE the body is read, because the read
+                    // Media types are case-insensitive (RFC 9110), so the
+                    // comparisons below are made against a lowercased copy.
+                    let ctype_lc = ctype.to_ascii_lowercase();
+                    // Decided BEFORE the body is read, because the read
                     // is what an unauthenticated caller gets to trigger
                     // here (SAB parity: the key may be a form field, so
-                    // the body has to be parsed to find it). An empty
-                    // boundary - `boundary=` with nothing after it -
-                    // makes the delimiter `--`, and a body of hyphens
-                    // then splits once every two bytes. Nothing
-                    // legitimate sends one, so refuse to treat the
-                    // request as multipart at all and never read the
-                    // body for it.
-                    let boundary = ctype
-                        .split("boundary=")
-                        .nth(1)
-                        .map(|b| b.trim_matches('"').to_string())
-                        .filter(|b| valid_boundary(b));
-                    if boundary.is_some() || ctype.starts_with("application/x-www-form-urlencoded")
+                    // the body has to be parsed to find it), and a
+                    // nonsense boundary must not get that far.
+                    let boundary = multipart_boundary(&ctype);
+                    // The only content type that still changes anything:
+                    // a form body's fields are MERGED into `params`
+                    // (SAB parity - the key may be one of them). JSON
+                    // and untyped bodies are read and handed straight
+                    // to the handler.
+                    let form_body = ctype_lc.starts_with("application/x-www-form-urlencoded");
+                    // The endpoint's OWN limit, decided before the read
+                    // (Codex sweep 2, 3 Aug M1). This buffer used to be
+                    // capped at a flat 256 MiB and every handler applied
+                    // its real limit - 8 MiB for a config import, 1 MiB
+                    // for a server save or a wall fix - only in the
+                    // fallback branch that ran when the pre-read had NOT
+                    // happened. Once the pre-read covers everything that
+                    // branch is dead, so the cap has to be right here or
+                    // it is nowhere: a nominal 1 MiB endpoint would
+                    // otherwise receive and parse 256 MiB, and the body
+                    // budget deliberately lets its oldest live holder
+                    // reach the per-request cap, so it cannot stand in
+                    // for the limit either.
+                    //
+                    // `mode` from the QUERY only - the body has not been
+                    // read yet, and a mode arriving as a form field is
+                    // precisely the SAB-parity addfile shape, which
+                    // needs the ceiling anyway.
+                    let cap = match params.get("mode").map(String::as_str) {
+                        Some(m) => api_body_cap(m),
+                        None if boundary.is_some() || form_body => API_BODY_MAX,
+                        // No mode in the query and not a form: nothing
+                        // can dispatch, so nothing needs a large body.
+                        None => API_BODY_DEFAULT,
+                    };
                     {
-                        let raw = read_body_capped(req.as_reader(), 256 << 20);
+                        let (raw, hold) = read_body_capped_hold(req.as_reader(), cap);
+                        _api_body_hold = Some(hold);
                         match &boundary {
                             Some(b) => {
                                 for (k, v) in multipart_fields(&raw, b) {
                                     params.entry(k).or_insert(v);
                                 }
                             }
-                            None => {
+                            None if form_body => {
                                 if let Ok(s) = std::str::from_utf8(&raw) {
                                     for (k, v) in parse_query(s) {
                                         params.entry(k).or_insert(v);
                                     }
                                 }
                             }
+                            // A JSON body, or one that named no type at
+                            // all: nothing to merge into `params`, but it
+                            // is read all the same so the handler never
+                            // has to.
+                            None => {}
                         }
                         api_body = Some(raw);
                     }
@@ -5661,6 +6040,16 @@ fn urldecode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// A multipart part's header block is a handful of short ASCII lines
+/// (Content-Disposition with a name/filename, maybe a Content-Type).
+/// Bounding it BEFORE decoding matters more than usual here: this runs
+/// pre-authentication on a body of up to 256 MiB, and
+/// `String::from_utf8_lossy` expands each invalid byte to a 3-byte
+/// replacement character - so one part whose "header" is the whole body
+/// used to allocate ~3x the body on top of it (Codex H8). 8 KiB is far
+/// past any legitimate filename.
+const MAX_PART_HEADER: usize = 8 << 10;
+
 /// Extract (filename, bytes) of the first file part in a multipart body.
 fn multipart_file(body: &[u8], boundary: &str) -> Option<(String, Vec<u8>)> {
     if !valid_boundary(boundary) {
@@ -5672,6 +6061,9 @@ fn multipart_file(body: &[u8], boundary: &str) -> Option<(String, Vec<u8>)> {
         let Some(hdr_end) = find_bytes(part, b"\r\n\r\n") else {
             return true; // preamble/epilogue segments have no header block
         };
+        if hdr_end > MAX_PART_HEADER {
+            return true; // attacker-sized header: never decode it
+        }
         let headers = String::from_utf8_lossy(&part[..hdr_end]);
         if let Some(fn_pos) = headers.find("filename=\"") {
             let rest = &headers[fn_pos + 10..];
@@ -5712,6 +6104,9 @@ fn multipart_fields(body: &[u8], boundary: &str) -> Vec<(String, String)> {
         let Some(hdr_end) = find_bytes(part, b"\r\n\r\n") else {
             return true; // preamble/epilogue segments have no header block
         };
+        if hdr_end > MAX_PART_HEADER {
+            return true; // attacker-sized header: never decode it
+        }
         let headers = String::from_utf8_lossy(&part[..hdr_end]);
         if headers.contains("filename=\"") {
             return true; // the file part is multipart_file's business
@@ -5787,6 +6182,27 @@ fn for_each_split<'a>(hay: &'a [u8], needle: &[u8], mut f: impl FnMut(&'a [u8]) 
 /// repeated hyphens splits into a segment every two bytes.
 fn valid_boundary(b: &str) -> bool {
     !b.is_empty() && b.len() <= 70 && !b.contains('\r') && !b.contains('\n')
+}
+
+/// The multipart boundary in a `Content-Type`, or None when the header
+/// does not carry a usable one.
+///
+/// ONE copy, because there were three and they disagreed. The parameter
+/// NAME is case-insensitive like the media type around it, but the
+/// VALUE is a literal delimiter that has to keep its case - so the
+/// position is found in a lowercased copy and the text is cut from the
+/// original. The gateway learned that in Codex sweep 2's H1 while the
+/// two handler-side copies stayed case-sensitive, which left `Boundary=`
+/// parsing at the gateway (fields merged, auth decided) and failing in
+/// the handler (no file part at all).
+///
+/// [`valid_boundary`] is applied here rather than by callers: an empty
+/// `boundary=` makes the delimiter `--`, so a body of hyphens splits
+/// once every two bytes. Nothing legitimate sends one, and refusing it
+/// at the source means no caller can forget to.
+fn multipart_boundary(ctype: &str) -> Option<String> {
+    let at = ctype.to_ascii_lowercase().find("boundary=")? + "boundary=".len();
+    Some(ctype[at..].trim_matches('"').to_string()).filter(|b| valid_boundary(b))
 }
 
 fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -6493,7 +6909,7 @@ fn redact_apikey(s: &str) -> String {
 /// put it in the path. Blanking one parameter name there is a guess.
 /// The host is the only part of such a URL worth showing a user anyway -
 /// it names who failed - so everything after it goes.
-fn redact_url_creds(s: &str) -> String {
+pub(crate) fn redact_url_creds(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     // Whichever scheme comes first, when both appear.
@@ -6908,7 +7324,7 @@ fn resolve_nzblnk(
 /// 8 HTTP workers x the 256 MB per-request cap could hold ~2 GB of
 /// half-read uploads at once - enough to OOM a memory-clamped container
 /// - and `addfile` accepts the add-only tier, so the exposure does not
-/// need the admin key. Every `read_body_capped` reserves here as its
+/// need the admin key. Every `read_body_capped_hold` reserves here as its
 /// body grows and releases when the read completes; a reader that would
 /// push the total past the cap WAITS for another body to finish -
 /// except a sole reader, which may take everything alone, so one
@@ -6984,7 +7400,7 @@ impl BodyBudget {
     /// behind, and it only releases when its read loop ENDS - so two
     /// bodies that together reach the cap would each block on a condvar
     /// only the other could signal, wedging every HTTP worker behind
-    /// them. (`read_body_capped` reserves before each read, so even a
+    /// them. (`read_body_capped_hold` reserves before each read, so even a
     /// reader that has hit its own `take` limit - one line from breaking
     /// out and releasing - parks here first.)
     ///
@@ -7045,12 +7461,78 @@ impl BodyBudget {
     }
 }
 
-/// Read a request body with a hard size cap, so no single POST can
-/// balloon the daemon's RSS - tiny_http hands us the raw reader and
-/// nothing upstream bounds it. A body that hits the cap comes back
-/// truncated and fails its parse, which surfaces as the normal
-/// bad-request error for that endpoint.
-fn read_body_capped(r: impl std::io::Read, cap: u64) -> Vec<u8> {
+/// RAII form of a body's budget claim: the reservation lives exactly as
+/// long as this guard. The read used to release its claim at the end of
+/// the READ, before the body was parsed - so the parse phase (and a body
+/// retained for later arms, like the pre-auth form buffer) sat entirely
+/// outside the budget, and concurrent workers could each hold a full
+/// 256 MiB body "for free" while parsing (Codex H8). Callers that keep
+/// the bytes keep the guard beside them.
+///
+/// Since Codex sweep 2's H1 the /api pre-read covers EVERY post, so this
+/// window now spans dispatch for bodies that used to be read (and
+/// released) inside a handler - an untyped or `text/plain` POST among
+/// them. The extra exposure is bounded by [`api_body_cap`], which gives
+/// those [`API_BODY_DEFAULT`] rather than the ceiling, so it is ~1 MiB
+/// per worker; the modes that can hold the ceiling open through dispatch
+/// (addfile, wall_art) already did so through the old form path.
+struct BodyHold(Option<Hold>);
+impl Drop for BodyHold {
+    fn drop(&mut self) {
+        if let Some(h) = self.0.take() {
+            body_budget().release(h);
+        }
+    }
+}
+
+/// Largest body a POST to `/api` may carry, when nothing more specific
+/// is known: the ceiling every endpoint that takes a whole NZB needs.
+const API_BODY_MAX: u64 = 256 << 20;
+
+/// The cap for an /api POST that names no size-hungry mode. Generous
+/// enough for any JSON settings blob (the watchlist, feeds, notify
+/// targets and *arr instances all live well inside it) and far below
+/// the ceiling.
+const API_BODY_DEFAULT: u64 = 1 << 20;
+
+/// How large a body each `/api` mode is allowed to send.
+///
+/// The gateway reads every POST body before authorizing (see the
+/// pre-read at the front controller), so this is where the endpoint's
+/// real limit has to be applied - the handlers' own capped-read
+/// fallbacks are unreachable now, and a flat ceiling would let a
+/// nominal 1 MiB endpoint buffer and parse 256 MiB (Codex sweep 2,
+/// 3 Aug M1).
+///
+/// Only the modes that legitimately carry bulk are listed; everything
+/// else takes [`API_BODY_DEFAULT`]. Erring large costs memory on a
+/// request that was going to be refused anyway; erring small breaks a
+/// real upload, so anything that can carry an NZB, an archive of them,
+/// or an image is at the ceiling.
+/// Each figure is the cap the handler itself already declared, so this
+/// changes no endpoint's real limit - it moves the decision to the only
+/// place that still runs.
+fn api_body_cap(mode: &str) -> u64 {
+    match mode {
+        // A whole NZB, or a multipart batch of them.
+        "addfile" => API_BODY_MAX,
+        // A settings backup archive.
+        "backup_import" => 8 << 20,
+        // Poster/fanart upload.
+        "wall_art" => 10 << 20,
+        _ => API_BODY_DEFAULT,
+    }
+}
+
+/// Read a request body with a hard size cap, returning the budget claim
+/// alongside the bytes so the caller can keep the reservation alive
+/// through parsing.
+///
+/// The cap exists because no single POST may balloon the daemon's RSS -
+/// tiny_http hands us the raw reader and nothing upstream bounds it. A
+/// body that hits the cap comes back truncated and fails its parse,
+/// which surfaces as the normal bad-request error for that endpoint.
+fn read_body_capped_hold(r: impl std::io::Read, cap: u64) -> (Vec<u8>, BodyHold) {
     use std::io::Read as _;
     let budget = body_budget();
     let mut hold = Hold::default();
@@ -7073,8 +7555,7 @@ fn read_body_capped(r: impl std::io::Read, cap: u64) -> Vec<u8> {
     // `r.take(cap)` is what bounds the one body the pool may let past its
     // cap: the designated finisher can over-run by its own per-request
     // limit and no more.
-    budget.release(hold);
-    raw
+    (raw, BodyHold(Some(hold)))
 }
 
 /// Read a candidate SABnzbd/NZBGet config for import. The path is
@@ -7320,6 +7801,20 @@ fn history_change_cat(d: &Daemon, id: &str, cat: &str) -> Value {
             "error": "this job's files are already being moved - try again when it settles"});
     }
     let _claim = MoveClaim(d, id.to_string());
+    // The snapshot above happened BEFORE the claim went up, so re-verify
+    // both of its gates now that it has: a delete that slipped into the
+    // window has already removed the record (deleting files this move
+    // would race), and a password unlock that slipped in has raised
+    // `finalizing` (it checks `moving` only after raising, so exactly
+    // one of the two proceeds). Checked before any filesystem work.
+    if !d.history.lock_ok().iter().any(|j| Arc::ptr_eq(j, &job)) {
+        return json!({"status": false,
+            "error": "no job with that nzo_id (it was removed just now)"});
+    }
+    if job.lock_ok().finalizing {
+        return json!({"status": false,
+            "error": "post-processing is still running for this job - try again when it settles"});
+    }
     let mut split_error: Option<String> = None;
     // Nothing on disk to move: relabel and stop. Otherwise move_tree fails
     // (read_dir on a missing source is ENOENT) and the category could never
@@ -7523,6 +8018,39 @@ fn history_json(d: &Daemon, params: &std::collections::HashMap<String, String>) 
         })
         .map(|j| {
             let j = j.lock_ok();
+            // Truth-audit I: what this download is CALLED on disk, when
+            // that is not what it was posted as. A de-obfuscation rename
+            // left the history row saying "a4f9c2e1" and the folder
+            // saying "Example.Movie.2019.1080p-GRP", with nothing
+            // anywhere connecting the two - so a user who went looking
+            // for their download could not tell which folder was it.
+            // Empty when the two agree, so the drawer shows the row only
+            // when there is something to reconcile.
+            let filed_as = {
+                let disk = if j.filed {
+                    // A TV-filed job's directory is the SHARED season
+                    // folder, so its name says nothing about this
+                    // episode. The stem the episode files were written
+                    // under is the answer.
+                    j.filed_base.clone().unwrap_or_else(|| j.name.clone())
+                } else {
+                    j.out_dir
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                };
+                if disk == j.name { String::new() } else { disk }
+            };
+            // ...and whether `move_completed` put the payload somewhere
+            // the download folder does not contain. The completion toast
+            // announced a finished download and said nothing about the
+            // files having gone to a NAS. Empty for everything still
+            // under the download root.
+            let moved_to = if j.out_dir.starts_with(d.out_dir()) {
+                String::new()
+            } else {
+                j.out_dir.to_string_lossy().into_owned()
+            };
             json!({
                 "nzo_id": j.nzo_id,
                 "name": j.name,
@@ -7533,7 +8061,70 @@ fn history_json(d: &Daemon, params: &std::collections::HashMap<String, String>) 
                 "status": match j.state { JobState::Completed => "Completed", JobState::Failed => "Failed", _ => "Queued" },
                 "fail_message": j.fail_message,
                 "fail_detail": j.fail_detail,
+                // This failure was a full disk, decided by the same
+                // matcher the NZBGet SPACE verdict uses. Its own key so
+                // the drawer can pair the row with the LIVE free-space
+                // number instead of string-matching a sentence: the fix
+                // is entirely in the user's hands, and Retry re-runs
+                // just the unpack (the article journal re-fetches
+                // nothing while the volumes are intact).
+                "disk_full": j.state == JobState::Failed && disk_full_failure(&j.fail_message),
+                // What the retry actually needs FREE, which is not the
+                // set size: the volumes are already on the disk, so the
+                // room owed is the extracted payload - and, for an
+                // ENCRYPTED set, the finish decrypt's temp copy beside
+                // it as well. The drawer used to gate its Retry button
+                // on `bytes` alone and would have lit it up one whole
+                // payload too early on exactly the shape that hit this
+                // (RAR5 encrypted, a tester, 2 Aug).
+                "space_needed": unpack_space_needed(0, j.total_bytes, &j.archive_shape),
+                // The failure classifier as a token, so the drawer can
+                // say what to DO per kind - and suppress Retry for the
+                // two kinds the daemon itself knows retrying cannot fix
+                // (gone, preflight). Empty on anything not Failed.
+                "fail_kind": if j.state == JobState::Failed {
+                    fail_kind_token(fail_kind(&j.fail_message))
+                } else {
+                    ""
+                },
+                // M32: when the daemon has already scheduled its own
+                // retry, say so - the user was shown a hard failure and
+                // then watched the row silently resurrect. Unix seconds,
+                // null when no retry is armed.
+                "auto_retry_at": j.auto_retry_at,
+                // ...and WHAT it is waiting for ("transport" or
+                // "propagation"), which is also why the cooldown is the
+                // length it is. Null when no retry is armed.
+                "auto_retry_why": j.auto_retry_why,
+                // The sub-cause inside the message, for the ONE remedy
+                // button the drawer offers beside the reason. Two
+                // failures can share a fail_kind and need opposite next
+                // moves - see `fail_hint`. Empty on anything not Failed.
+                "fail_hint": if j.state == JobState::Failed {
+                    fail_hint(&j.fail_message)
+                } else {
+                    ""
+                },
+                // ...and the single action that answers it. One key so
+                // the page never has to re-derive the rule, and so the
+                // rule itself is testable.
+                "fail_action": if j.state == JobState::Failed {
+                    fail_action(
+                        fail_kind(&j.fail_message),
+                        fail_hint(&j.fail_message),
+                        &j.fail_message,
+                        j.password_required,
+                    )
+                } else {
+                    ""
+                },
                 "retry": j.retries,
+                // This job came out of the local index rather than from
+                // an NZB the user holds. It matters on a failure: a
+                // "gone" verdict here means the post rotted out of the
+                // library, nothing was ever written to disk, and the
+                // copy must not talk about resuming what downloaded.
+                "library": j.library,
                 "duplicate_key": j.dupe_key.as_deref().unwrap_or(""),
                 "storage": j.out_dir.to_string_lossy(),
                 "path": j.out_dir.to_string_lossy(),
@@ -7548,7 +8139,13 @@ fn history_json(d: &Daemon, params: &std::collections::HashMap<String, String>) 
                 // `finished_unix` - clients treat that as "unknown",
                 // never as 1970.
                 "completed": j.finished_unix.unwrap_or(0),
+                // NULL when nothing verified this download (no PAR2 in
+                // the post, or a resume that mapped no block) - the
+                // dashboard says "not verified" for that and keeps it
+                // out of the clean count. A number is a real verdict,
+                // and `verify_blocks` is how many blocks produced it.
                 "bad_blocks": j.bad_blocks,
+                "verify_blocks": j.verify_blocks,
                 // M24: the value never leaves the daemon - only the facts.
                 "password_required": j.password_required,
                 "has_password": j.password.is_some(),
@@ -7560,6 +8157,14 @@ fn history_json(d: &Daemon, params: &std::collections::HashMap<String, String>) 
                 // free-text slot a Completed history item has, and one
                 // existing clients already surface beside the status.
                 "unpack_blocked_by": j.unpack_blocked_by,
+                // UX §18: the move to the completed folder stopped part
+                // way and the payload is in TWO directories - this one
+                // and `storage`. Its own key beside `unpack_blocked_by`
+                // and for the same reason: SAB has no "succeeded with a
+                // caveat", so the PATH rides here and the dashboard
+                // composes the sentence in the user's own language.
+                // Empty on everything that moved whole or never moved.
+                "move_split": j.move_split,
                 "archive_shape": j.archive_shape,
                 // §76: the same quality chip the queue row carries,
                 // latched during the download and kept. Another additive
@@ -7573,6 +8178,19 @@ fn history_json(d: &Daemon, params: &std::collections::HashMap<String, String>) 
                 "identity_name": j.identity_name,
                 "identity_imdb": j.identity_imdb,
                 "identity_src": j.identity_src,
+                "filed_as": filed_as,
+                // The Smart Folder rule that chose its category, same
+                // reason: "why is this in Films?" is answerable only by
+                // the rule that decided it.
+                "smart_rule": j.smart_rule,
+                "moved_to": moved_to,
+                // What the post-processing sweeps removed from this
+                // job's directory, and whether the deletes were
+                // recoverable when they ran. Additive keys; zero means
+                // no drawer line.
+                "cleaned_files": j.cleaned_files,
+                "cleaned_par2": j.cleaned_par2,
+                "cleaned_trash": j.cleaned_trash,
                 // ...and when no oracle could name it, what synthesised
                 // naming made of the payload: the file's own facts, then
                 // the shortlist. English, and deliberately so - film
@@ -7779,6 +8397,36 @@ fn effective_state(entries: &[SchedEntry], now: u32) -> (Option<bool>, Option<u6
     (paused.map(|(_, p)| p), limit.map(|(_, v)| v))
 }
 
+/// Minutes from `now` (a minute-of-week) until the schedule's next
+/// Resume entry fires, or `None` when the schedule never resumes.
+///
+/// The header promises a time only when there is one: a schedule that
+/// pauses and never resumes leaves the queue held until someone acts,
+/// and inventing "until 08:00" out of the nearest entry of any kind
+/// would be a promise the daemon cannot keep. Pure - `now` is injected,
+/// exactly like [`effective_state`].
+fn next_resume_in(entries: &[SchedEntry], now: u32) -> Option<u32> {
+    entries
+        .iter()
+        .filter(|e| e.action == SchedAction::Resume)
+        .flat_map(|e| {
+            e.days
+                .iter()
+                .enumerate()
+                .filter(|(_, on)| **on)
+                .map(move |(day, _)| {
+                    let mow = day as u32 * 1440 + e.minute;
+                    match (mow + WEEK_MINUTES - now) % WEEK_MINUTES {
+                        // Fires this very minute - which is not a
+                        // future time. The next one is a week out.
+                        0 => WEEK_MINUTES,
+                        forward => forward,
+                    }
+                })
+        })
+        .min()
+}
+
 fn apply_action(d: &Arc<Daemon>, a: SchedAction) {
     match a {
         SchedAction::Pause | SchedAction::Resume => {
@@ -7792,11 +8440,14 @@ fn apply_action(d: &Arc<Daemon>, a: SchedAction) {
             *d.pause_until.lock_ok() = None;
             let pause = a == SchedAction::Pause;
             d.paused.store(pause, Ordering::Relaxed);
+            // Claim it, so the header can say who decided and until when
+            // instead of showing the same word a deliberate pause gets.
+            *d.pause_source.lock_ok() = "schedule";
             if pause {
                 d.suspend_active(true); // scheduled pause winds down gracefully
             }
         }
-        SchedAction::SpeedLimit(v) => d.set_speed_ceiling(v),
+        SchedAction::SpeedLimit(v) => d.set_speed_ceiling_from(v, "schedule"),
     }
 }
 
@@ -8777,6 +9428,83 @@ mod tests {
         super::job_from_json(&v).expect("job_from_json")
     }
 
+    /// UX §16: "verified clean" is a claim, and a claim needs a verifier.
+    ///
+    /// `bad_blocks` used to be a plain `u64` that defaulted to 0, so a
+    /// post carrying no PAR2 - and a resume that mapped no block to a
+    /// recovery set - arrived at the dashboard indistinguishable from a
+    /// download something had checked and found perfect. The health tile
+    /// counted them as clean verifications and the timeline drew them as
+    /// green ticks. Null is the third answer: nothing verified this.
+    #[test]
+    fn a_verify_verdict_needs_a_verifier_behind_it() {
+        let base = |extra: serde_json::Value| {
+            let mut v = json!({
+                "nzo_id": "x", "name": "Show.1080p", "nzb_path": "/spool/x.nzb",
+                "state": "Completed", "out_dir": "/dl/x",
+            });
+            for (k, val) in extra.as_object().unwrap() {
+                v[k] = val.clone();
+            }
+            job(v)
+        };
+        // Nothing recorded at all: not a verdict.
+        assert_eq!(base(json!({})).bad_blocks, None);
+        // A modern record that verified and found nothing wrong. The
+        // block count is what makes the zero mean something.
+        let clean = base(json!({"bad_blocks": 0, "verify_blocks": 12_847}));
+        assert_eq!(clean.bad_blocks, Some(0));
+        assert_eq!(clean.verify_blocks, 12_847);
+        // A modern record that verified and found damage.
+        assert_eq!(
+            base(json!({"bad_blocks": 900, "verify_blocks": 12_847})).bad_blocks,
+            Some(900)
+        );
+        // A record from before the field could be null. A zero with no
+        // companion count is unknowable - "verified clean" and "nobody
+        // looked" both wrote 0 - and must not be reported as a clean
+        // verification. A non-zero count is proof a verifier ran, so it
+        // survives as a verdict.
+        assert_eq!(base(json!({"bad_blocks": 0})).bad_blocks, None);
+        assert_eq!(base(json!({"bad_blocks": 3})).bad_blocks, Some(3));
+        // ...and a verifier that ran but mapped nothing checked zero
+        // blocks, which is the same non-answer.
+        assert_eq!(
+            base(json!({"bad_blocks": 0, "verify_blocks": 0})).bad_blocks,
+            None
+        );
+    }
+
+    /// UX §15: the queue percentage's two halves must count ONE thing.
+    ///
+    /// The pair this replaced divided decoded payload (every slot, PAR2
+    /// included) by the NZB's encoded bytes minus recovery volumes, so a
+    /// clean download stopped near 97% still claiming a gigabyte "left"
+    /// that did not exist, and a damaged one - where the extra recovery
+    /// bytes land on the numerator alone - pinned at 100% with articles
+    /// still in flight.
+    #[test]
+    fn fetch_progress_reaches_a_hundred_and_never_passes_it() {
+        use std::sync::atomic::Ordering;
+        let hub = crate::streamhub::StreamHub::default();
+        // No plan published yet: every caller must fall back rather than
+        // divide by a plan belonging to nobody.
+        assert_eq!(hub.fetch_left(), None);
+        hub.fetch_plan.store(1_000, Ordering::Relaxed);
+        assert_eq!(hub.fetch_left(), Some((0, 1_000, 1_000)));
+        // A resume seeds `done` with what is already in hand, so the bar
+        // starts where the bytes are.
+        hub.fetch_done.store(600, Ordering::Relaxed);
+        assert_eq!(hub.fetch_left(), Some((600, 1_000, 400)));
+        // Drained: exactly 100%, exactly nothing left.
+        hub.fetch_done.store(1_000, Ordering::Relaxed);
+        assert_eq!(hub.fetch_left(), Some((1_000, 1_000, 0)));
+        // Two independent atomics, so a reader can land past the plan.
+        // Clamped, never an overshoot or an underflowed remainder.
+        hub.fetch_done.store(1_200, Ordering::Relaxed);
+        assert_eq!(hub.fetch_left(), Some((1_000, 1_000, 0)));
+    }
+
     /// The NZBGet history verdict must separate the failures a user can
     /// actually act on.
     ///
@@ -8808,6 +9536,16 @@ mod tests {
         );
         assert_eq!(
             super::nzbget_status(&j("Failed", "write failed: no space left on device")),
+            ("FAILURE/UNPACK", "SUCCESS", "SPACE")
+        );
+        // Windows spells a full disk differently (error 112), and the
+        // check that only knew the Unix words reported a tester's
+        // disk-full unpack as a generic unpack failure.
+        assert_eq!(
+            super::nzbget_status(&j(
+                "Failed",
+                "unpack failed: There is not enough space on the disk. (os error 112)"
+            )),
             ("FAILURE/UNPACK", "SUCCESS", "SPACE")
         );
         // The post could not be fetched whole: health, and no par verdict,
@@ -9316,6 +10054,63 @@ mod tests {
             &crate::smart::FiledTail::default(),
         );
         assert!(!private.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A recoverable delete the Trash refuses must LEAVE the download and
+    /// hand the reason back, both arms of it.
+    ///
+    /// The leaving-it-alone half landed in 70990f19; this pins the half
+    /// that makes it visible. `remove_job_files` used to answer a plain
+    /// bool, so the refusal reached a `warn!` and stopped there - while
+    /// the history or queue row went regardless, taking with it the only
+    /// place the user could see that download named. A caller cannot
+    /// narrate what it was never told.
+    #[test]
+    fn a_refused_delete_keeps_the_files_and_says_why() {
+        let _serial = crate::smart::one_trash_test_at_a_time();
+        let root = std::env::temp_dir().join(format!("nzbfast-refused-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let private = root.join("Movie.2020");
+        let season = root.join("Show").join("Season 01");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::create_dir_all(&season).unwrap();
+        std::fs::write(private.join("movie.mkv"), b"c").unwrap();
+        std::fs::write(season.join("Show - S01E01.mkv"), b"a").unwrap();
+
+        let was = crate::smart::delete_to_trash();
+        crate::smart::set_delete_to_trash(true);
+        crate::smart::force_trash_unresponsive(true);
+        let unfiled = super::remove_job_files(
+            &private,
+            "Movie.2020",
+            false,
+            &crate::smart::FiledTail::default(),
+        );
+        // The filed arm deletes per FILE inside the user's own library,
+        // and refuses per file - it must report the same way.
+        let filed = super::remove_job_files(
+            &season,
+            "Show.S01E01.1080p",
+            true,
+            &crate::smart::FiledTail::default(),
+        );
+        crate::smart::force_trash_unresponsive(false);
+        crate::smart::set_delete_to_trash(was);
+
+        for (out, path, what) in [
+            (unfiled, private.join("movie.mkv"), "the private folder"),
+            (filed, season.join("Show - S01E01.mkv"), "the filed episode"),
+        ] {
+            assert!(path.exists(), "{what} must survive a refused delete");
+            match out {
+                FilesGone::Kept(why) => assert!(
+                    !why.is_empty(),
+                    "{what}: the refusal has to carry a reason to show"
+                ),
+                FilesGone::Yes => panic!("{what}: a refused delete reported success"),
+            }
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -9952,7 +10747,7 @@ mod tests {
         // Neither helper may parse a response without going through it.
         for helper in [
             "async function api(mode, extra, authKey, post){",
-            "async function apiPost(mode, body){",
+            "async function apiPost(mode, body, authKey){",
         ] {
             let body = &src[src.find(helper).expect("helper present")..];
             let body = &body[..body.find("\n}").expect("helper ends")];
@@ -9967,7 +10762,51 @@ mod tests {
         }
         // And the JSON-blob settings go up in a POST body, which has no
         // request-line limit to hit in the first place.
-        assert!(src.contains("await apiPost('config', {name, value})"));
+        assert!(src.contains("await apiPost('config', {name, value}, auth)"));
+    }
+
+    /// Codex sweep 2, 3 Aug MH1: a query string is not a private
+    /// channel. It reaches reverse-proxy access logs, the browser's own
+    /// network panel and history, and any Referer that follows - so a
+    /// setting whose VALUE is a credential must travel in a request
+    /// body, whatever its length. `setCfg` sent everything under ~1500
+    /// chars as `&value=`, and keys are short, so the one class that
+    /// must never be logged was the class that always was.
+    ///
+    /// Source-level like its neighbour above, and for the same reason:
+    /// the property is about which branch a name takes, and the branch
+    /// is one line.
+    #[test]
+    fn a_secret_setting_never_travels_in_the_request_line() {
+        let src = DASHBOARD_HTML;
+        // The length rule is still there for big JSON blobs, and the
+        // secret rule sits beside it as an OR - not an else.
+        assert!(
+            src.contains("(value.length > 1500 || SECRET_CFG.has(name))"),
+            "setCfg no longer forces secrets into the body"
+        );
+        let set = src
+            .split("const SECRET_CFG = new Set(")
+            .nth(1)
+            .and_then(|s| s.split(");").next())
+            .expect("SECRET_CFG present");
+        for name in [
+            "apikey",
+            "nzbkey",
+            "omdb_key",
+            "notify_targets",
+            "arr_instances",
+            "indexers",
+        ] {
+            assert!(set.contains(name), "{name} is not in SECRET_CFG: {set}");
+        }
+        // notify_test carries a webhook token AND a custom body
+        // template. `method:'POST'` does not move query parameters into
+        // the body, so it has to be an actual body call.
+        assert!(
+            src.contains("await apiPost('notify_test', {target: row})"),
+            "notify_test still puts the whole target in the request line"
+        );
     }
 
     /// BUG (MEDIUM): `apply_and_save` answers a write it could not persist
@@ -10281,6 +11120,48 @@ mod tests {
         );
     }
 
+    /// The unpack-space forecast has to count the decrypt's temp copy.
+    ///
+    /// Real case (a tester, 2 Aug): a 13.85 GB RAR5 ENCRYPTED set on a
+    /// disk with 15.6 GB free. The volumes fit, so the download ran to
+    /// completion and the unpack then died with the disk full. Counting
+    /// "volumes + payload" would have told them to free ~12 GB, they
+    /// would have freed it, and the finish decrypt - which writes the
+    /// plaintext into a temp beside the ciphertext before renaming -
+    /// would have failed them a second time.
+    #[test]
+    fn an_encrypted_set_is_forecast_a_copy_higher_than_a_plain_one() {
+        const GB: u64 = 1_000_000_000;
+        // Nothing fetched yet: parts + payload.
+        assert_eq!(
+            unpack_space_needed(10 * GB, 10 * GB, "rar5 store on-disk"),
+            20 * GB
+        );
+        // Same set, encrypted: the decrypt's temp is a third copy.
+        assert_eq!(
+            unpack_space_needed(10 * GB, 10 * GB, "rar5 store encrypted on-disk"),
+            30 * GB
+        );
+        // The tester's job, fully downloaded (nothing left to fetch):
+        // the honest answer is two more copies, not one.
+        assert_eq!(
+            unpack_space_needed(0, 13_850 * 1_000_000, "rar5 encrypted unlock-at-end"),
+            27_700 * 1_000_000
+        );
+        // Which shapes get a forecast at all: the ones that materialize.
+        assert!(shape_unpacks_on_disk("rar5 store encrypted on-disk"));
+        assert!(shape_unpacks_on_disk("rar5 store encrypted unlock-at-end"));
+        assert!(shape_unpacks_on_disk("rar4 mixed-pass"));
+        // A clean one-pass set never holds both at once.
+        assert!(!shape_unpacks_on_disk("rar5 store one-pass"));
+        assert!(!shape_unpacks_on_disk(""));
+        // Saturating, not panicking, on absurd sizes.
+        assert_eq!(
+            unpack_space_needed(u64::MAX, u64::MAX, "encrypted on-disk"),
+            u64::MAX
+        );
+    }
+
     /// BUG (MEDIUM): deleting an active download aborts the pipeline,
     /// which surfaces as an Err and files the job Failed - so a
     /// cancellation ran the pp-script, sent a "Failed" notification and
@@ -10437,6 +11318,170 @@ mod tests {
         // A takedown verdict is a real dead post, but not worth retrying.
         assert!(!fail_kind("pre-flight: articles missing beyond repair").transient());
     }
+
+    /// The wire tokens the drawer switches on. Pinned because they are an
+    /// API: renaming one silently drops a remedy button rather than
+    /// breaking a build.
+    #[test]
+    fn fail_kind_tokens_are_stable() {
+        for (msg, want) in [
+            (
+                "download incomplete: 3 file(s) with missing segments, 0 decode/write errors",
+                "missing",
+            ),
+            (
+                "download failed on connection errors: pool stalled",
+                "transport",
+            ),
+            (
+                "verification failed and PAR2 repair could not complete",
+                "unrepairable",
+            ),
+            (
+                "pre-flight: articles missing beyond repair (12 segments)",
+                "preflight",
+            ),
+            ("content no longer retrievable", "gone"),
+            ("No space left on device (os error 28)", "local"),
+        ] {
+            assert_eq!(fail_kind_token(fail_kind(msg)), want, "{msg}");
+        }
+    }
+
+    /// The sub-cause inside the message. Each token is keyed on a clause
+    /// `incomplete_reason` (or the pool) writes verbatim, so the strings
+    /// here are built by the real producers wherever possible.
+    #[test]
+    fn fail_hint_names_the_sub_cause() {
+        let retention = crate::incomplete_reason(
+            2,
+            0,
+            &crate::LossCauses {
+                missing_430: 1,
+                retention_excluded: 900,
+                ..no_causes()
+            },
+        );
+        assert_eq!(fail_hint(&retention), "retention", "{retention}");
+        // A post carrying no parity at all: another release is the only
+        // answer, even though the KIND is the retryable missing-articles.
+        let nopar2 = crate::incomplete_reason(
+            1,
+            0,
+            &crate::LossCauses {
+                missing_430: 3,
+                par2_slots: 0,
+                ..no_causes()
+            },
+        );
+        assert_eq!(fail_hint(&nopar2), "nopar2", "{nopar2}");
+        assert_eq!(fail_kind(&nopar2), FailKind::MissingArticles, "{nopar2}");
+        // Both forms of the empty pool, including the build tag that gets
+        // appended to every job failure.
+        for msg in [
+            "no usable servers: none are set up yet - add your provider in Server settings",
+            "no usable servers: every one you have set up is out of the pool right now - \
+             news.x.example (switched off)",
+        ] {
+            assert_eq!(fail_hint(msg), "servers", "{msg}");
+        }
+        // A plain failure has no sub-cause and falls back to its kind.
+        assert_eq!(fail_hint("Permission denied (os error 13)"), "");
+        let plain = crate::incomplete_reason(
+            2,
+            0,
+            &crate::LossCauses {
+                missing_430: 4,
+                par2_slots: 9,
+                ..no_causes()
+            },
+        );
+        assert_eq!(fail_hint(&plain), "", "{plain}");
+    }
+
+    /// ONE action per failure, and never the useless one: the audit found
+    /// every kind sharing a single Retry, including the two the daemon
+    /// itself classifies as unfixable by retrying.
+    #[test]
+    fn each_failure_gets_the_action_that_can_help() {
+        let act = |msg: &str, pw: bool| fail_action(fail_kind(msg), fail_hint(msg), msg, pw);
+        // Waiting genuinely helps these two, and only these two.
+        assert_eq!(
+            act(
+                "download incomplete: 1 file(s) with missing segments, 0 decode/write errors",
+                false
+            ),
+            "retry"
+        );
+        assert_eq!(
+            act("download failed on connection errors: pool stalled", false),
+            "retry"
+        );
+        // A dead post, a pre-flight verdict and an unrepairable set are
+        // all answered by another release, never by asking again.
+        for msg in [
+            "content no longer retrievable",
+            "pre-flight: articles missing beyond repair (12 segments)",
+            "verification failed and PAR2 repair could not complete",
+        ] {
+            assert_eq!(act(msg, false), "search", "{msg}");
+        }
+        // Sub-causes outrank the kind.
+        let retention = crate::incomplete_reason(
+            2,
+            0,
+            &crate::LossCauses {
+                missing_430: 1,
+                retention_excluded: 900,
+                ..no_causes()
+            },
+        );
+        assert_eq!(act(&retention, false), "retention", "{retention}");
+        assert_eq!(
+            act("no usable servers: none are set up yet", false),
+            "servers"
+        );
+        // ...and the two that outrank everything. Both are `Local`, and
+        // "show the folder" answers neither of them.
+        assert_eq!(act("No space left on device (os error 28)", false), "space");
+        assert_eq!(act("unpack failed", true), "password");
+        // A full disk stays a full disk even for a locked archive: the
+        // password prompt is the thing that can actually be completed.
+        assert_eq!(
+            act("No space left on device (os error 28)", true),
+            "password"
+        );
+        // Everything else local: the folder is where the evidence is.
+        assert_eq!(act("Permission denied (os error 13)", false), "path");
+    }
+
+    /// Six watch-folder states, four of which are SUCCESSES. The strip
+    /// showed one sentence for all six and offered a Delete that destroys
+    /// the only copy in exactly the states where it is not safe.
+    #[test]
+    fn watch_folder_states_are_told_apart() {
+        use super::tasks::{watch_fail_ingested, watch_fail_kind, watchfail};
+        for (msg, kind, ingested) in [
+            (watchfail::TRUNCATED.to_string(), "truncated", false),
+            (watchfail::ALREADY_QUEUED.to_string(), "queued", true),
+            (watchfail::ALREADY_DONE.to_string(), "done", true),
+            (watchfail::UNSAVED.to_string(), "unsaved", true),
+            (
+                format!("{}: Permission denied (os error 13)", watchfail::KEPT),
+                "kept",
+                true,
+            ),
+            (
+                "not an NZB: no <nzb> element".to_string(),
+                "rejected",
+                false,
+            ),
+        ] {
+            assert_eq!(watch_fail_kind(&msg), kind, "{msg}");
+            assert_eq!(watch_fail_ingested(kind), ingested, "{msg}");
+        }
+    }
+
     #[test]
     fn cat_dest_list_parses_and_round_trips() {
         let list = super::parse_cat_dests(" tv = /NAS/TV, movies=/NAS/Movies ; ; ").unwrap();
@@ -11906,6 +12951,43 @@ mod tests {
         assert!(super::multipart_file(&body, "").is_none());
     }
 
+    /// One boundary parse for the gateway and both file-part handlers.
+    ///
+    /// There were three copies and they disagreed after Codex sweep 2's
+    /// H1 taught the gateway that a media type's parameter names are
+    /// case-insensitive: `Boundary=` then parsed as multipart at the
+    /// gateway - fields merged, the key found, auth decided - and as
+    /// nothing in `addfile`, so the upload arrived with no file part at
+    /// all. The parameter NAME is matched case-insensitively; the VALUE
+    /// is a literal delimiter and keeps its case exactly.
+    #[test]
+    fn one_boundary_parse_serves_the_gateway_and_the_handlers() {
+        let b = |c: &str| super::multipart_boundary(c);
+        assert_eq!(
+            b("multipart/form-data; boundary=AbCd1234"),
+            Some("AbCd1234".into())
+        );
+        // The spellings a standards-compliant client may legally send.
+        assert_eq!(
+            b("Multipart/Form-Data; Boundary=AbCd1234"),
+            Some("AbCd1234".into())
+        );
+        assert_eq!(
+            b("multipart/form-data; BOUNDARY=\"AbCd1234\""),
+            Some("AbCd1234".into())
+        );
+        // The refusals `valid_boundary` exists for, now unforgettable
+        // because they live at the single source rather than in each
+        // caller.
+        assert_eq!(b("multipart/form-data; boundary="), None);
+        assert_eq!(b("multipart/form-data"), None);
+        assert_eq!(b("application/json"), None);
+        assert_eq!(
+            b(&format!("multipart/form-data; boundary={}", "x".repeat(71))),
+            None
+        );
+    }
+
     /// A form with thousands of fields is not a form. The parser's own
     /// working set must be bounded by something other than how many
     /// delimiters the caller sent.
@@ -11921,6 +13003,49 @@ mod tests {
         }
         body.extend_from_slice(format!("--{b}--\r\n").as_bytes());
         assert_eq!(super::multipart_fields(&body, b).len(), 256);
+    }
+
+    /// Codex H8: a part whose "header block" is attacker-sized invalid
+    /// UTF-8 must never reach the lossy decode - `from_utf8_lossy`
+    /// expands each invalid byte to a 3-byte replacement character, and
+    /// this parser runs pre-authentication on a body of up to 256 MiB.
+    /// The giant part is skipped; legitimate parts beside it still work.
+    #[test]
+    fn a_giant_part_header_is_never_decoded() {
+        let b = "----nzbfastboundary";
+        let mut body = Vec::new();
+        // One part: 4 MiB of 0xFF posing as the header, then CRLFCRLF.
+        body.extend_from_slice(format!("--{b}\r\n").as_bytes());
+        body.extend_from_slice(&vec![0xFFu8; 4 << 20]);
+        body.extend_from_slice(b"\r\n\r\nv\r\n");
+        // A normal field and a normal file part after it.
+        body.extend_from_slice(
+            format!("--{b}\r\nContent-Disposition: form-data; name=\"mode\"\r\n\r\naddfile\r\n")
+                .as_bytes(),
+        );
+        body.extend_from_slice(
+            format!(
+                "--{b}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"e.nzb\"\r\n\r\n<nzb/>\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(format!("--{b}--\r\n").as_bytes());
+        assert_eq!(
+            super::multipart_fields(&body, b),
+            vec![("mode".to_string(), "addfile".to_string())]
+        );
+        assert_eq!(super::multipart_file(&body, b).unwrap().1, b"<nzb/>");
+        // And a header just under the bound still parses - the cap must
+        // not eat legitimate long filenames.
+        let long_name = "x".repeat(300);
+        let mut small = Vec::new();
+        small.extend_from_slice(
+            format!(
+                "--{b}\r\nContent-Disposition: form-data; name=\"n\"; filename=\"{long_name}\"\r\n\r\nd\r\n--{b}--\r\n"
+            )
+            .as_bytes(),
+        );
+        assert_eq!(super::multipart_file(&small, b).unwrap().0, long_name);
     }
 
     #[test]
@@ -11973,7 +13098,9 @@ mod tests {
         assert_eq!(super::multipart_file(&body, b).unwrap().1, b"<nzb/>");
     }
 
-    use super::{SchedAction, effective_state, parse_days, parse_schedule, parse_size};
+    use super::{
+        SchedAction, effective_state, next_resume_in, parse_days, parse_schedule, parse_size,
+    };
 
     /// Minute-of-week helper for readable test times (Mon=0).
     fn mow(day: u32, h: u32, m: u32) -> u32 {
@@ -12119,6 +13246,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(effective_state(&tie, mow(0, 9, 0)).0, Some(false));
+    }
+
+    /// The "paused - by your schedule until 08:00" clause only gets a
+    /// time when the schedule really has one ahead of it.
+    #[test]
+    fn next_resume_is_the_nearest_one_ahead() {
+        let entries = parse_schedule(
+            r#"[
+              {"days": "mon-fri", "time": "23:00", "action": "pause"},
+              {"days": "mon-fri", "time": "08:00", "action": "resume"},
+              {"days": "sun", "time": "20:00", "action": "resume"}
+            ]"#,
+        )
+        .unwrap();
+
+        // Mon 23:30, inside the weekday quiet hours: Tuesday 08:00.
+        assert_eq!(next_resume_in(&entries, mow(0, 23, 30)), Some(8 * 60 + 30));
+        // Fri 23:30 - the weekday resumes are all behind us, so the
+        // nearest ahead is Sunday 20:00 (44.5 h), not Monday 08:00.
+        assert_eq!(next_resume_in(&entries, mow(4, 23, 30)), Some(44 * 60 + 30));
+        // Standing exactly ON a resume minute is not a future time, so
+        // the answer is that entry a week out - never "in 0 minutes".
+        assert_eq!(next_resume_in(&entries, mow(1, 8, 0)), Some(1440));
+
+        // A schedule that only ever pauses promises nothing.
+        let one_way =
+            parse_schedule(r#"[{"days": "all", "time": "23:00", "action": "pause"}]"#).unwrap();
+        assert_eq!(next_resume_in(&one_way, mow(0, 23, 30)), None);
+        assert_eq!(next_resume_in(&[], 0), None);
     }
 
     #[test]

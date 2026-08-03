@@ -253,6 +253,12 @@ pub async fn timed_fetch(
 /// connections still granted at the measure point, supply-exhausted
 /// flag), all vecs in input order.
 ///
+/// With a big-enough sample (≥8 completions over ≥1 s) the rate is
+/// measured first-completion to last-completion - steady state, the
+/// connect/TLS/slow-start ramp excluded - so ladder rungs with more
+/// sockets aren't penalized by their own bigger ramp. Small samples
+/// fall back to the whole-window figure below.
+///
 /// The rate is bytes over the time the transfer ACTUALLY took, not the
 /// nominal window: a fast line drains a fixed id supply in a fraction of
 /// the window, and dividing by the full window capped the measured rate
@@ -283,13 +289,36 @@ pub async fn timed_fetch_multi(
     // when the queue runs dry early (excludes the QUIT/teardown tail).
     let last_done_ns = Arc::new(AtomicU64::new(0));
     let last_done_ns2 = last_done_ns.clone();
+    // First in-window completion (time, bytes) and completion count:
+    // with enough completions the rate is measured first-article to
+    // last-article, excluding the connect/TLS/slow-start ramp. The ramp
+    // grows with the socket count, so measuring over the whole window
+    // systematically penalized the HIGHER rungs of a connection ladder -
+    // exactly the comparison the tuner makes - worst on high-RTT paths
+    // where extra connections matter most.
+    let first_done_ns = Arc::new(AtomicU64::new(u64::MAX));
+    let first_bytes = Arc::new(AtomicU64::new(0));
+    let done_count = Arc::new(AtomicU64::new(0));
+    let (first_done_ns2, first_bytes2, done_count2) = (
+        first_done_ns.clone(),
+        first_bytes.clone(),
+        done_count.clone(),
+    );
     let consumer = tokio::spawn(async move {
         while let Some(o) = rx.recv().await {
             if let FetchOutcome::Done { raw, .. } = o {
                 let now = Instant::now();
                 if now < deadline {
                     bytes2.fetch_add(raw.len() as u64, Ordering::Relaxed);
-                    last_done_ns2.store((now - t0).as_nanos() as u64, Ordering::Relaxed);
+                    let ns = (now - t0).as_nanos() as u64;
+                    last_done_ns2.store(ns, Ordering::Relaxed);
+                    done_count2.fetch_add(1, Ordering::Relaxed);
+                    if first_done_ns2
+                        .compare_exchange(u64::MAX, ns, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        first_bytes2.store(raw.len() as u64, Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -357,22 +386,31 @@ pub async fn timed_fetch_multi(
         }
     };
     let _ = consumer.await;
-    let secs_f = if exhausted {
-        (last_done_ns.load(Ordering::Relaxed) as f64 / 1e9).max(0.1)
+    let total = bytes.load(Ordering::Relaxed);
+    let first_ns = first_done_ns.load(Ordering::Relaxed);
+    let last_ns = last_done_ns.load(Ordering::Relaxed);
+    let n_done = done_count.load(Ordering::Relaxed);
+    let span = last_ns.saturating_sub(first_ns.min(last_ns)) as f64 / 1e9;
+    // Steady-state rate (first completion → last completion, first
+    // article's bytes excluded to match the span) whenever the sample is
+    // big enough to be meaningful; otherwise fall back to the whole
+    // window (ramp included, as before).
+    let gbps = if first_ns != u64::MAX && n_done >= 8 && span >= 1.0 {
+        total.saturating_sub(first_bytes.load(Ordering::Relaxed)) as f64 * 8.0 / 1e9 / span
     } else {
-        (secs as f64).max(0.1)
+        let secs_f = if exhausted {
+            (last_ns as f64 / 1e9).max(0.1)
+        } else {
+            (secs as f64).max(0.1)
+        };
+        total as f64 * 8.0 / 1e9 / secs_f
     };
     let per: Vec<u64> = if stats.len() == n_servers {
         stats.iter().map(|s| s.bytes).collect()
     } else {
         vec![0; n_servers]
     };
-    (
-        bytes.load(Ordering::Relaxed) as f64 * 8.0 / 1e9 / secs_f,
-        per,
-        granted,
-        exhausted,
-    )
+    (gbps, per, granted, exhausted)
 }
 
 /// Returns (Gbps, raw bytes transferred) - bill the bytes.
@@ -543,9 +581,48 @@ pub async fn conn_ladder(
         let n = out.len();
         // Stop once a doubling stopped paying (we've tested one step past
         // the knee), or the provider granted well under what we asked.
+        //
+        // The flat verdict is CONFIRMED before it sticks: one 5 s sample
+        // saying "8 conns barely beat 4" can be a transient (evening
+        // congestion, a background transfer, macOS timer coalescing on
+        // an idle daemon), and a false flat here bisects to a knee that
+        // silently caps the user's connections at half their line for a
+        // week. Re-race the same step once and keep the better reading;
+        // only a dip that reproduces ends the ladder. Field case: a
+        // gigabit fibre user tuned to 6 connections and downloaded at
+        // half the speed of a 16-connection client.
         if n >= 2 && !last_starved && out[n - 1].gbps <= out[n - 2].gbps * 1.12 {
-            stopped_flat = true;
-            break;
+            let want = supply_for(out.iter().map(|s| s.gbps).fold(0.0, f64::max), c_now);
+            let per_step = want.min(ids.len());
+            let slice: Vec<String> = ids[..per_step].to_vec();
+            let rot = per_step.min(ids.len().saturating_sub(1));
+            ids.rotate_left(rot);
+            let cfg = PoolConfig {
+                connections: c_now,
+                window: 4,
+                ..PoolConfig::default()
+            };
+            let (gbps, per, granted, saturated) =
+                timed_fetch_multi(vec![(server.clone(), cfg)], slice, per_step, secs_per_step)
+                    .await;
+            let redo_starved = saturated && per_step < want;
+            {
+                // The redo's bytes are billed whichever sample wins -
+                // both transfers happened.
+                let s = &mut out[n - 1];
+                s.bytes += per.first().copied().unwrap_or(0);
+                if gbps > s.gbps {
+                    s.gbps = gbps;
+                    s.granted = granted.first().copied().unwrap_or(s.granted);
+                    s.saturated = saturated;
+                }
+            }
+            if !redo_starved && out[n - 1].gbps <= out[n - 2].gbps * 1.12 {
+                stopped_flat = true;
+                break;
+            }
+            // The dip did not reproduce: the doubling paid after all -
+            // keep climbing.
         }
         if out[n - 1].granted + 2 < c_now {
             break;

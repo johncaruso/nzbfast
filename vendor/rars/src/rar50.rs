@@ -17,7 +17,7 @@ mod write;
 
 pub use extract::{
     extract_volume_sequence_to, extract_volume_sequence_to_with_progress, extract_volumes_to,
-    extract_volumes_to_with_redirections,
+    extract_volumes_to_with_progress, extract_volumes_to_with_redirections,
 };
 pub use write::{
     ArchiveMetadataEntry, CompressedEntry, EncryptedArchiveCommentEntry, EncryptedCompressedEntry,

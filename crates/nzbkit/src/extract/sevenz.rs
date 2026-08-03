@@ -168,7 +168,10 @@ impl Extractor {
         idx: u32,
     ) -> io::Result<bool> {
         let size = inner.slots[slot].size;
-        let buf = Arc::new(FrontierBuffer::new(size));
+        let buf = Arc::new(FrontierBuffer::new_gated(
+            size,
+            inner.verify_gate.clone().map(|g| (g, slot)),
+        ));
         if !ctl.set.register(
             idx,
             SetPart {

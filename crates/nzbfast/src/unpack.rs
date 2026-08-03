@@ -303,8 +303,23 @@ pub(crate) fn extract_nested(
                 })
                 .cloned(),
         ) {
-            if std::fs::remove_file(&p).is_ok() {
-                info!(target: "nest", "removed spent intermediate {}", p.display());
+            // A plain remove_file, deliberately NOT the trash-aware
+            // helpers (see the delete_to_trash audit): this branch only
+            // runs at depth > 0, so every one of these volumes was
+            // MATERIALIZED BY OUR OWN outer extraction seconds ago - the
+            // exact bytes a clean one-pass job consumes in-stream and
+            // never writes at all. The user's post (the outer set) is
+            // untouched, and the volumes' content survives as the
+            // extracted payload beside them, so there is nothing here a
+            // user could want back - routing multi-GB scratch through
+            // the Trash would only fill it with files they never saw.
+            match std::fs::remove_file(&p) {
+                Ok(()) => info!(target: "nest", "removed spent intermediate {}", p.display()),
+                Err(e) => warn!(
+                    target: "nest",
+                    "could not remove spent intermediate {}: {e}",
+                    p.display()
+                ),
             }
         }
     };
@@ -1647,7 +1662,10 @@ pub(crate) fn extract_obfuscated_rar(
         // Taken per set, immediately before the extraction that fills it:
         // the diff against it names exactly what THIS set published.
         let before = snapshot_recursive(dir).ok();
-        match write_archives_to(dir, &archives, password) {
+        // `sources` and `archives` came off the same unzip, so index i of
+        // one is index i of the other - the mapping §101's eating mode
+        // needs to delete each volume as the extractor finishes with it.
+        match write_archives_to_spending(dir, &archives, password, &sources) {
             Ok(()) => {
                 println!("native unpack complete ✔");
                 // Same depth gate the named-set sweep uses, and for the
@@ -1711,6 +1729,16 @@ pub(crate) fn sweep_spent_obfuscated(
     if published.is_empty() {
         return;
     }
+    // Trash-aware, unlike the nested-intermediate sweep above: these
+    // volumes were DOWNLOADED - they are the obfuscated post itself, the
+    // .rar set a user might well want to keep or re-share - and the
+    // "spent" verdict is a heuristic chain, which is exactly what the
+    // "Deleted files go to the Trash" setting promises to make
+    // reversible. Read once for the whole sweep (remove_user_file's
+    // contract), and parked for the deferred worker like the finalize
+    // sweeps (§64) so a slow Finder never sits inside the job's tail.
+    let recoverable = crate::smart::delete_to_trash();
+    let staging = crate::smart::trash_staging_dir(dir);
     for path in sources {
         if published.contains(path) {
             info!(
@@ -1720,9 +1748,22 @@ pub(crate) fn sweep_spent_obfuscated(
             );
             continue;
         }
-        match std::fs::remove_file(path) {
-            Ok(()) => info!(target: "extract", "removed spent volume {}", path.display()),
-            Err(e) => println!("⚠ could not remove spent volume {}: {e}", path.display()),
+        // §101: under the volume-eating mode the extraction already
+        // deleted this one as it read past it. Nothing left to sweep, and
+        // nothing worth warning about - the two paths agree on the end
+        // state, they just get there at different moments.
+        if !path.exists() {
+            continue;
+        }
+        match crate::smart::remove_swept_file(path, recoverable, staging.as_deref()) {
+            Ok(_) => info!(target: "extract", "removed spent volume {}", path.display()),
+            // warn!, not println: the daemon's log ring is where a user
+            // asking "why is this file still here" will look.
+            Err(e) => warn!(
+                target: "extract",
+                "could not remove spent volume {}: {e}",
+                path.display()
+            ),
         }
     }
 }
@@ -2210,6 +2251,21 @@ pub(crate) struct SniffCtl {
     pub(crate) state: std::sync::Mutex<SniffState>,
     pub(crate) deferred_articles: std::sync::atomic::AtomicUsize,
     pub(crate) deferred_bytes: std::sync::atomic::AtomicU64,
+    /// The run's fetch-progress counter, so a deferral can settle the
+    /// bytes it just cancelled (Codex sweep 2, 3 Aug ML2).
+    ///
+    /// Every payload-classified article contributes to `fetch_plan` when
+    /// the plan is published, and a terminal outcome credits it back -
+    /// including the ones that will never arrive, because "terminal is
+    /// terminal" and holding the bar short of 100% through the whole
+    /// repair is worse than counting a 430 as done. A live deferral is
+    /// terminal in exactly that sense (the articles are cancelled and
+    /// leave the pool without an outcome), and it was the one such exit
+    /// that credited nothing - so the bar and the SAB-compatible
+    /// `Remaining` sat short by the deferred bytes for the whole
+    /// verify/repair tail. Resume-recognised deferrals have always been
+    /// seeded into this counter; this is the live path catching up.
+    pub(crate) fetch_done: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Default)]
@@ -2309,6 +2365,16 @@ impl SniffCtl {
     }
 }
 
+/// Article id → (owning slot index, the article's declared byte size from
+/// the NZB). The size rides along beside the slot because the queue's
+/// fetch-progress counters have to be paid in exactly the unit their
+/// denominator is quoted in - declared NZB bytes - and this map is
+/// already consulted once per terminal article. A parallel id→bytes map
+/// would have duplicated every message-id string (~15 MB on a 128k
+/// article job); widening the value costs nothing, a `usize` and a
+/// `(u32, u32)` being the same eight bytes.
+pub(crate) type IdSlots = std::collections::HashMap<String, (u32, u32)>;
+
 /// The offset-0 article of a payload-classified slot decoded to the
 /// `PAR2\0PKT` magic: reclassify it. Elects (or switches) the bootstrap
 /// volume, defers everything else by cancelling its still-queued articles,
@@ -2323,7 +2389,7 @@ pub(crate) fn reclassify_sniffed_par2(
     head: &[u8],
     file_size: u64,
     queue: &nzbkit::pool::QueueControl,
-    id_to_slot: &std::collections::HashMap<String, usize>,
+    id_to_slot: &IdSlots,
     par2_outstanding: &std::sync::atomic::AtomicUsize,
 ) {
     use std::sync::atomic::Ordering;
@@ -2409,7 +2475,7 @@ pub(crate) fn reclassify_sniffed_par2(
             .segments
             .iter()
             .map(|seg| format!("<{}>", seg.message_id))
-            .filter(|b| id_to_slot.get(b).copied() == Some(sidx))
+            .filter(|b| id_to_slot.get(b).map(|&(s, _)| s as usize) == Some(sidx))
             .collect();
         queue.promote_opts(&promote, false);
     }
@@ -2431,7 +2497,7 @@ fn defer_sniffed_slot(
     slots: &[Arc<FileSlot>],
     sidx: usize,
     queue: &nzbkit::pool::QueueControl,
-    id_to_slot: &std::collections::HashMap<String, usize>,
+    id_to_slot: &IdSlots,
 ) -> f64 {
     use std::sync::atomic::Ordering;
     let f = &ctl.nzb.files[ctl.slot_file[sidx]];
@@ -2439,7 +2505,7 @@ fn defer_sniffed_slot(
     let mut bytes_of: std::collections::HashMap<String, u64> = Default::default();
     for seg in &f.segments {
         let b = format!("<{}>", seg.message_id);
-        if id_to_slot.get(&b).copied() == Some(sidx) {
+        if id_to_slot.get(&b).map(|&(s, _)| s as usize) == Some(sidx) {
             bytes_of.insert(b.clone(), seg.bytes);
             want.insert(b);
         }
@@ -2471,6 +2537,12 @@ fn defer_sniffed_slot(
     ctl.deferred_articles
         .fetch_add(removed.len(), Ordering::Relaxed);
     ctl.deferred_bytes.fetch_add(bytes, Ordering::Relaxed);
+    // These bytes will never produce a terminal outcome - the articles
+    // left the pool queue - so settle them here or the bar stops short
+    // by exactly this much for the rest of the run. Undone by
+    // `reconcile_deferred_payload` if they are ever requeued, since
+    // then the ordinary outcomes credit them again.
+    ctl.fetch_done.fetch_add(bytes, Ordering::Relaxed);
     // The exact removed ids, kept for a possible un-defer: only these may
     // ever be requeued (the pool stashes their Work items whole).
     ctl.state
@@ -2528,6 +2600,12 @@ pub(crate) fn reconcile_deferred_payload(
         slots[sidx].deferred.fetch_sub(n, Ordering::Relaxed);
         ctl.deferred_articles.fetch_sub(n, Ordering::Relaxed);
         ctl.deferred_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        // Give the deferral's progress credit back: these articles are
+        // in the pool again and will credit themselves when they land.
+        // Keeping it would take the bar past 100%. The drain fallback in
+        // get.rs is the opposite case - it side-fetches OUTSIDE the
+        // pool, so no outcome follows and the credit must stand.
+        ctl.fetch_done.fetch_sub(bytes, Ordering::Relaxed);
         // Payload again: articles arriving from the requeue take the
         // normal verifier path from here on.
         slots[sidx].par2_sniffed.store(false, Ordering::Release);

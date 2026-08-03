@@ -336,7 +336,11 @@ en hızlı sağlayıcın her zaman en üstte olur.</p>
 <li><b>Yeniden sıralamak için satırları sürükle</b> (bir öncelik bandı içinde - Zorla/Yüksek
 yine önce çalışır); önceliği satır içinde değiştir.</li>
 <li>Ayrıntı çekmecesi için <b>bir satıra tıkla</b>: dosya başına ilerleme çubukları, doğrulama
-blok sayıları ve <em>bu</em> işe hangi sunucunun ne kadar katkı sağladığı.</li>
+blok sayıları, <em>bu</em> işe hangi sunucunun ne kadar katkı sağladığı ve işin nereden
+geldiğini söyleyen bir «ekleyen» satırı (izleme klasörü, bağlı bir uygulama, API…).
+Bir <b>.nzb dosyasını indir</b> düğmesi işin <code>.nzb</code> dosyasını kaydeder - nzbfast
+kendi kopyasını sakladığından bu her iş için çalışır, orijinal dosya çoktan
+kaybolmuş olsa bile.</li>
 <li>Rozetler özel durumları gösterir: <i>ertelendi (yavaş)</i>, <i>ön yükleniyor</i>,
 <i>duraklatıldı</i> (bkz. <a href="#performance">Performans araçları</a>).</li>
 <li>Bir iniş grafiği kuyruk boyunca kalan toplam GB'ı izler.</li>
@@ -354,7 +358,10 @@ yerini alır) otomatik yakalanır.</p>
 <p>Son indirmeler, her biri tek satır. Başarısız işler <b>Yeniden Dene</b> sunar
 (günlükten devam eder). Şifreli arşivler bir 🔑 kilit açma denetimi gösterir - parolayı gir
 ve iş yerinde biter. Doğrulama sağlığı şeridi, indirme başına bozuk PAR2 bloklarını çizer -
-yükselen bir kuyruk makalelerin hasarlı geldiği anlamına gelir.</p>
+yükselen bir kuyruk makalelerin hasarlı geldiği anlamına gelir.
+Her satırın çekmecesi işi kimin eklediğini söyler ve kuyruktakiyle aynı
+<b>.nzb dosyasını indir</b> düğmesini taşır - bir sürümü başka bir yerde yeniden indirmek
+ya da <code>.nzb</code> dosyasını bir sorun bildirimine eklemek için kullanışlı.</p>
 <p>Kart varsayılan olarak on indirme listeler, gerisi ▤ düğmesiyle bir tık uzaktadır. Durum, konum ve bir işin neden başarısız olduğu satırın kendisine tıklamanın arkasındadır; böylece yaygın durum - ne bitti, ne kadar büyük, ne zaman - kaydırmadan okunabilir kalır. Bunun yerine kartın alt kenarını sürükleyerek listeyi seçtiğiniz bir yükseklikte kaydırabilirsiniz. Ayarlar → Arayüz altındaki <b>History rows</b> bu onu değiştirir; tarayıcınızın değil daemon'un bir özelliği olduğundan, bu kuruluma bakan her cihaz için geçerlidir. Yanındaki <b>Colour History names</b> biten adları yeşile, başarısız olanları kırmızıya boyar; kapatıldığında adlar sade kalır ve renkli nokta ile satırın kendi ayrıntıları hangisinin hangisi olduğunu yine söyler.</p>
 <h3 id="dash-usage">Veri kullanımı</h3>
 <p>Sağlayıcı başına günlük çubuklar ve Bugün / 7 günlük / 30 günlük toplamlar - sayaçlı ve
@@ -368,8 +375,12 @@ anlatılan üç kendini ölçme aracı.</p>
 <tr><th>Yöntem</th><th>Nasıl</th></tr>
 <tr><td><b>Sürükle &amp; bırak</b></td><td>Bir ya da daha fazla <code>.nzb</code> dosyasını panelin herhangi bir yerine bırak.</td></tr>
 <tr><td><b>İzleme klasörü</b></td><td>Ayarlar'da bir klasör belirle; içine kaydedilen her <code>.nzb</code>
-5 saniye içinde alınır ve dosya kaldırılır. Dizinleyici sitelerinden tek tıkla yakalamalar
-için tarayıcının indirme dizinini buna yönlendir.</td></tr>
+5 saniye içinde alınır ve çöp kutusuna taşınır; açık bir panel her alışı adıyla duyurur
+(«…, Downloads klasöründen alındı»), böylece klasörden ayrılan bir dosya asla bir
+gizem olmaz. Dosyalarını saklamayı mı tercih ediyorsun? <b>Alındıktan sonra .nzb
+dosyalarını sakla</b> ayarını aç (bkz. <a href="#settings">§9</a>). Dizinleyici
+sitelerinden tek tıkla yakalamalar için tarayıcının indirme dizinini buna
+yönlendir.</td></tr>
 <tr><td><b>Bir URL'den</b></td><td>Bir NZB bağlantısı yapıştır (API <code>mode=addurl</code> ya da bağlı herhangi bir uygulama üzerinden).</td></tr>
 <tr><td><b>nzblnk: bağlantıları</b></td><td>Bir <code>nzblnk:</code> bağlantısını panonun herhangi bir yerine yapıştırın ya da içine sürükleyin. macOS DMG'sinden veya Windows kurulumundan kurduysanız bir board üzerinde doğrudan tıklayabilirsiniz de. Aşağıdaki <a href="#nzblnk">nzblnk bağlantıları</a> bölümüne bakın.</td></tr>
 <tr><td><b>Dizine göz at</b></td><td>Göz at kartındaki tam bir sürüme tıkla.</td></tr>
@@ -578,13 +589,15 @@ yener).</p>
 <b>kod çözücüler</b> (paralel kod çözme iş parçacıkları). Her iş başladığında örneklenir.
 Varsayılanlar çoğu hat için doğrudur; körlemesine yükseltmeden önce ayar araçlarını kullan.</p>
 
-<p><b>Hızlı doğrulama (CRC32)</b> (öntanımlı olarak açık) indirme sürerken PAR2
-bloklarını yalnızca CRC32 ile sahiplenir; yavaş bir işlemcide bu 2-3x daha hızlıdır.
-Her makalenin kendi sağlama toplamı yine de doğrulanır ve son yerleşme geçişi her zaman
-tam MD5 kullanır: doğruluktan ödün verilmez. İndirme sırasında da blok başına MD5
-istiyorsanız işareti kaldırın.</p>
+<p><b>İndirme sırasında denetim</b>, veri gelirken ne kadarının doğrulanacağını seçer.
+<i>Tam</i>, her PAR2 bloğunu MD5 ile doğrular. <i>Hızlı</i> (öntanımlı), blokları
+bunun yerine CRC32 ile sahiplenir; yavaş bir işlemcide bu 2-3x daha hızlıdır ve her
+makalenin kendi sağlama toplamı yine doğrulanır. <i>Yalın</i> ise PAR2 bir dosyayı
+kapsar kapsamaz o makale sağlama toplamlarını da atlar: hasar bir an sonra, kendi
+bloğunda ortaya çıkar. Üçünde de son yerleşme geçişi ve her onarım tam MD5 kullanır ve
+PAR2 dosyası olmayan bir indirme makale sağlama toplamlarını korur.</p>
 <h3>Disk &amp; kota <span class="pill live">canlı</span></h3>
-<p><b>En az boş alan</b> (bunun altında yeni işleri duraklat), gün ya da ay başına
+<p><b>En az boş alan</b> (bunun altında yeni işleri duraklat; varsayılan 2 GB, 0 kapatır), gün ya da ay başına
 <b>indirme kotası</b> (UTC; Zorla işler atlar), <b>bellek sınırı</b> - motorun RAM bütçesi
 (varsayılan: RAM'in ¼'ü, kelepçeli; devasa işlerde en yüksek hız için büyük RAM'li bir
 makinede yükselt ve düşürmeden önce <a href="#memory">az belleğin ne maliyeti olduğuna</a>
@@ -629,12 +642,38 @@ Her iki silme adımı da <em>yalnızca</em> film veya dizi olarak tanınan sür�
 uygulanır: bir yazılım yükü ya da sınıflandırılamayan (gizlenmiş) bir takım asla
 süpürülmez.</p>
 
+<p><b>Silinen dosyalar Çöp Kutusuna gider</b> yukarıdaki "silme"nin ne anlama
+geldiğine karar verir. Açıkken temizlik dosyaları sistemin Çöp Kutusuna ya da Geri
+Dönüşüm Kutusuna taşır; böylece neyin çöp olduğuna dair yanlış bir tahmin geri
+alınabilir. Kapalıyken dosyalar doğrudan silinir. Çöp kutusunun görülüp
+boşaltılabildiği <b>macOS ve Windows'ta varsayılan olarak açık</b>, çoğu zaman öyle
+olmadığı <b>Linux'ta varsayılan olarak kapalıdır</b>.</p>
+<div class="note"><b>Bir NAS'ta ya da konteynerde bunu kapalı bırak.</b> İndirmelerin
+ev dizininden farklı bir diskteyse - ki Unraid, Synology, bir seedbox ya da bağlanmış
+paylaşımı olan herhangi bir Docker kurulumunda olağan düzen budur - Linux çöp
+kuralları masaüstü çöp kutusunu hiç kullanmaz. Bunun yerine indirme diskinin en
+üstünde gizli bir <code>.Trash-1000</code> klasörü (sayı senin kullanıcı kimliğindir)
+oluşturur ve dosyaları oraya taşır. O klasörü sana hiçbir şey göstermez, hiçbir şey
+boşaltmaz ve tuttuğu alan asla geri gelmez.
+<p>nzbfast'in eski bir sürümünü Linux'ta bu ayar açıkken çalıştırdıysan, o klasörü
+indirme paylaşımının kökünde ara. Boşaltması güvenlidir: içindeki her şey, temizliğin
+zaten istemediğine karar verdiği dosyalardır. nzbfast onu senin yerine boşaltmaz,
+çünkü senin diskindedir ve karar senindir.</p></div>
+
 <h3>Klasörler &amp; işleme</h3>
 <p><b>İndirme klasörü</b> <span class="pill restart">yeniden başlat</span>, <b>izleme
 klasörü</b>, <b>son işlem betiği</b> (her işten sonra SABnzbd uyumlu argümanlar ve
 <code>SAB_*</code> ortamıyla çalışır - mevcut SAB betikleri değişmeden çalışır),
 <b>temizleme uzantıları</b> (tamamlanmadan sonra silinen çöp dosyalar), <b>Akıllı
 Klasörler</b> ve <b>TV dosyalama</b> (bkz. <a href="#automation">§10</a>).</p>
+<p><b>Alındıktan sonra .nzb dosyalarını sakla</b> (varsayılan olarak kapalı) orijinal
+<code>.nzb</code> dosyasını kuyruğa eklendikten sonra çöp kutusuna taşımak yerine
+izleme klasöründe bırakır - koleksiyoncular için ve bir indirme sorun çıkardığında
+dosyayı birine vermek için. Saklanan bir dosya, yeniden başlatmalardan sonra bile
+hatırlanır ve yeniden kuyruğa alınmaz; yeniden indirmek için dosyayı tekrar kaydet.
+Hangisini seçersen seç, her işin çekmecesinde bir <b>.nzb dosyasını indir</b> düğmesi
+vardır; böylece herhangi bir işin <code>.nzb</code> dosyasının bir kopyası hiçbir
+zaman bir tıktan uzakta değildir.</p>
 
 <h3>Dizinleme <span class="pill live">canlı</span></h3>
 <div class="note"><b>Dahili dizinleyici varsayılan olarak kapalıdır.</b> Gerçek bir
@@ -678,14 +717,15 @@ gösterileceğini belirler: megabayt (MB/s, indirme yöneticilerinin alışılm�
 öntanımlı) ya da megabit (Mb/s, servis sağlayıcıların hatları ilan ettiği birim). Dosya
 boyutları her hâlde bayt kalır. Bu, tarayıcınızın değil daemon'un bir özelliğidir;
 dolayısıyla bu kuruluma bakan her aygıt için geçerlidir.</p>
-<h3>Gelişmiş: panoda denetimi olmayan ayarlar</h3>
-<p>Altı ayarın ne arayüzde bir denetimi ne de komut satırı bayrağı vardır. Bunları API
-üzerinden ayarlayın (<a href="#api">§16</a>), örn.
+<h3>Gelişmiş: bariz olanların ardındaki ayar düğmeleri</h3>
+<p>Komut satırı bayrağı olmayan altı ayar. Her biri artık kendisine ait ayar kartında
+gelişmiş bir satıra sahiptir ve API üzerinden de ayarlanmaya devam eder
+(<a href="#api">§16</a>), örn.
 <code>/api?mode=config&amp;name=verify_mode&amp;value=lean&amp;apikey=…</code>. Diğer
 her ayar gibi <code>settings.json</code> dosyasına yazılırlar.</p>
 <div class="tblwrap"><table>
 <tr><th>Ad</th><th>Ne yapar</th></tr>
-<tr><td><code>verify_mode</code></td><td><code>full</code> | <code>fast</code> | <code>lean</code> (öntanımlı <code>fast</code>). <code>lean</code> yavaş işlemciler için ek hızdır: fast gibidir, ama PAR2 bir dosyayı kapsar kapsamaz makale başına yEnc CRC'sini de atlar; yani iki yerine tek bir CRC32 katmanı kalır. PAR2'siz indirmeler makale CRC'lerini korur ve işin sonundaki doğrulama ile onarım her iki durumda da değişmez. Yukarıdaki <b>Hızlı doğrulama</b>, full ile fast arasındaki aynı denetimdir.</td></tr>
+<tr><td><code>verify_mode</code></td><td><code>full</code> | <code>fast</code> | <code>lean</code> (öntanımlı <code>fast</code>). <code>lean</code> yavaş işlemciler için ek hızdır: fast gibidir, ama PAR2 bir dosyayı kapsar kapsamaz makale başına yEnc CRC'sini de atlar; yani iki yerine tek bir CRC32 katmanı kalır. PAR2'siz indirmeler makale CRC'lerini korur ve işin sonundaki doğrulama ile onarım her iki durumda da değişmez. Yukarıdaki <b>İndirme sırasında denetim</b> seçicisi bu ayardır.</td></tr>
 <tr><td><code>auto_retry_mins</code></td><td>Eksik makale yüzünden ilk kez başarısız olan bir işe tanınan <em>tek</em> otomatik yeniden denemeden önceki bekleme (öntanımlı 20). Yayılma gecikmesi eksik makalelerin gerçek bir nedenidir ve kendiliğinden düzelir; günlük sayesinde yeniden çalıştırma yalnızca hâlâ eksik olanı çeker. Parola ve kaldırma kaynaklı başarısızlıklar asla bu kapsama girmez.</td></tr>
 <tr><td><code>index_scan_par</code></td><td>Dizinleyicinin kaç grubu paralel taradığı (öntanımlı 3, 1-8 aralığına sınırlı).</td></tr>
 <tr><td><code>oracle_sample</code></td><td>Erişilebilirlik kâhininin boştaki STAT bütçesi (<a href="#oracle">§13</a>), sunucu başına saatlik yoklama. Öntanımlı 300, en fazla 3600, <code>0</code> örneklemeyi tümüyle kapatır.</td></tr>
@@ -960,7 +1000,7 @@ SABnzbd uyumlu, bu yüzden mevcut SAB tümleştirmeleri değişmeden çalışır
 <div class="tblwrap"><table>
 <tr><th>Alan</th><th>Modlar</th></tr>
 <tr><td>Kuyruk</td><td><code>queue</code> (<code>name=delete/pause/resume/priority/switch</code> ile), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>addnzblnk</code>, <code>retry</code>, <code>set_password</code></td></tr>
-<tr><td>Bilgi</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code></td></tr>
+<tr><td>Bilgi</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code>, artı <code>/jobnzb/&lt;nzo_id&gt;</code> (işin kendi saklanan <code>.nzb</code> dosyasını geri verir, kuyruk veya geçmiş; yalnızca tam API anahtarı)</td></tr>
 <tr><td>Yapılandırma</td><td><code>get_config</code>, <code>config&amp;name=&lt;setting&gt;&amp;value=…</code> (her Ayarlar alanı), <code>server_save/delete/test/enable/reorder</code>, <code>import_probe/apply</code></td></tr>
 <tr><td>Dizin &amp; duvar</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, ayrıca <code>/api?t=caps|search|tvsearch|movie</code> ve <code>/getnzb/&lt;id&gt;</code>'de newznab</td></tr>
 <tr><td>Otomasyon</td><td><code>watchlist</code>, <code>watchlist_check_now</code>, <code>watch_calendar</code>, <code>feeds</code>, <code>smart_folders</code>, <code>schedule</code></td></tr>

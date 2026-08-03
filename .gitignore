@@ -55,6 +55,12 @@ website/MANUAL.*.html
 # checkout; siblings config.local.json/settings.json are ignored above)
 runtime.json
 
+# the archive-password list the extractor reads, at the repo root only.
+# It is user content - real passwords for real posts - and the dev daemon
+# writes one here whenever it runs from the checkout. Root-anchored so a
+# committed test fixture of the same name stays possible.
+/passwords.txt
+
 # per-machine Claude Code launch config + agent worktrees (worktrees
 # were only in .git/info/exclude before, which a fresh clone loses)
 .claude/launch.json

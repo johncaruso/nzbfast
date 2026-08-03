@@ -105,6 +105,15 @@ pub(in crate::serve) fn dispatch(
                 "index_evict_order": d.index_evict_order.lock_ok().clone(),
                 "index_evict_kinds": d.index_evict_kinds.lock_ok().clone(),
                 "compact_pending": d.compact_pending.load(Ordering::Relaxed),
+                // Truth-audit I: the hourly trim, narrated. The manual
+                // button reports exactly what it removed; the automatic
+                // pass doing the same work said nothing at all, so a
+                // shrinking index had no explanation anywhere in the UI.
+                // Null until this daemon run has actually trimmed
+                // something.
+                "last_auto_trim": d.last_auto_trim.lock_ok().map(|(at, removed)| json!({
+                    "at": at, "removed": removed,
+                })),
             })
         }
         // The pre feed's own readout. Its own action rather than

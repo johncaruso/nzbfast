@@ -345,7 +345,11 @@ provider is always on top.</p>
 <li><b>Drag rows to reorder</b> (within a priority band; Force/High still run first);
 change priority inline.</li>
 <li><b>Click a row</b> for the detail drawer: per-file progress bars, verify block
-counts, and which server contributed how much to <em>this</em> job.</li>
+counts, which server contributed how much to <em>this</em> job, and an "added by"
+line saying where the job came from (watch folder, a connected app, the API…).
+A <b>Download .nzb</b> button saves you the job's <code>.nzb</code> file - nzbfast
+keeps its own copy, so this works for every job, even when the original file is
+long gone.</li>
 <li>Badges show special states: <i>deferred (slow)</i>, <i>prefetching</i>,
 <i>paused</i> (see <a href="#performance">Performance tools</a>).</li>
 <li>A burn-down chart tracks total GB remaining across the queue.</li>
@@ -362,7 +366,10 @@ upgrade rules (a better copy replaces a worse one).</p>
 <p>Recent downloads, one row each. Failed jobs offer <b>Retry</b>
 (resumes from the journal). Encrypted archives show a 🔑 unlock control: enter the
 password and the job finishes in place. The verify-health strip charts bad PAR2
-blocks per download: a rising tail means articles are arriving damaged.</p>
+blocks per download: a rising tail means articles are arriving damaged.
+Each row's drawer says who added the job and has the same <b>Download .nzb</b>
+button as the queue - handy for downloading a release again somewhere else, or
+attaching the <code>.nzb</code> to a problem report.</p>
 <p>The card lists ten downloads by default and the rest are one click away, on the
 ▤ button. Status, location and the reason a job failed live behind a click on the
 row itself, so the common case - what finished, how big, when - stays readable
@@ -384,7 +391,10 @@ and block accounts. Block accounts show lifetime usage against their size.</p>
 <tr><th>Method</th><th>How</th></tr>
 <tr><td><b>Drag &amp; drop</b></td><td>Drop one or more <code>.nzb</code> files anywhere on the dashboard.</td></tr>
 <tr><td><b>Watch folder</b></td><td>Set a folder in Settings; any <code>.nzb</code> saved into it is
-picked up within 5 seconds and the file removed. Point your browser's download
+picked up within 5 seconds and moved to the Trash, and an open dashboard announces
+each pickup by name ("Picked up … from Downloads"), so a file leaving the folder is
+never a mystery. Prefer to keep your files? Turn on <b>Keep .nzb files after
+pickup</b> (see <a href="#settings">§9</a>). Point your browser's download
 directory at it for one-click grabs from indexer sites.</td></tr>
 <tr><td><b>From a URL</b></td><td>Paste an NZB link (API <code>mode=addurl</code>, or via any connected app).</td></tr>
 <tr><td><b>nzblnk: links</b></td><td>Paste an <code>nzblnk:</code> link anywhere on the dashboard, or drag it in. If you installed from the macOS DMG or the Windows installer you can also click one straight from a board. See <a href="#nzblnk">nzblnk links</a> below.</td></tr>
@@ -604,13 +614,17 @@ values apply on the next launch. Every change made here is persisted to
 <p><b>Connections</b> (per server), <b>window</b> (pipelining depth per connection),
 <b>decoders</b> (parallel decode threads). Sampled when each job starts. Defaults
 are right for most lines; use the tuning tools before raising blindly.</p>
-<p><b>Fast verify (CRC32)</b> (on by default) claims PAR2 blocks by CRC32 while the
-download is still running, which is 2-3x faster on a slow CPU. Every article's own
-checksum is still verified, and the final settle pass always uses full MD5, so this
-trades no correctness. Uncheck it to do per-block MD5 during the download too.</p>
+<p><b>Checking while downloading</b> picks how much is verified as the data arrives.
+<i>Full</i> confirms every PAR2 block with MD5. <i>Fast</i> (the default) claims blocks
+by CRC32 instead, which is 2-3x quicker on a slow CPU, and still verifies every
+article's own checksum. <i>Lean</i> also skips those article checksums once PAR2 covers
+a file, so damage surfaces a moment later, at its block. In all three the final settle
+pass and any repair use full MD5, and a download with no PAR2 files keeps its article
+checksums.</p>
 
 <h3>Disk &amp; quota <span class="pill live">live</span></h3>
-<p><b>Minimum free space</b> (pause new jobs below it), <b>download quota</b> per
+<p><b>Minimum free space</b> (pause new jobs below it; 2 GB by default, so a
+disk never fills to zero, and 0 turns it off), <b>download quota</b> per
 day or month (UTC; Force jobs bypass), <b>memory limit</b>, the engine's RAM budget
 (default: ¼ of RAM, clamped; raise it on a big-RAM box for maximum speed on huge
 jobs, and see <a href="#memory">what low memory costs</a> before lowering it)
@@ -676,6 +690,13 @@ you, because it is on your disk and yours to judge.</p></div>
 and <code>SAB_*</code> environment; existing SAB scripts work unchanged),
 <b>cleanup extensions</b> (junk files deleted after completion), <b>Smart Folders</b>
 and <b>TV filing</b> (see <a href="#automation">§10</a>).</p>
+<p><b>Keep .nzb files after pickup</b> (off by default) leaves the original
+<code>.nzb</code> in the watch folder after it is queued, instead of moving it to
+the Trash - for collectors, and for handing the file to someone when a download
+misbehaves. A kept file is remembered, across restarts too, and is not queued
+again; re-save it to download it again. Whichever you choose, every job's drawer
+has a <b>Download .nzb</b> button, so a copy of any job's <code>.nzb</code> is
+never more than a click away.</p>
 
 <h3>Indexing <span class="pill live">live</span></h3>
 <div class="note"><b>The built-in indexer is off by default.</b> It finds posts made
@@ -727,14 +748,15 @@ megabits (Mb/s, how ISPs quote line speeds). File sizes stay in bytes either way
 This is a property of the daemon, not of your browser, so it applies to every device
 looking at this install.</p>
 
-<h3>Advanced: settings with no dashboard control</h3>
-<p>Six settings have no UI control and no command-line flag. Set them through the
+<h3>Advanced: the tuning knobs behind the obvious ones</h3>
+<p>Six settings that have no command-line flag. Each one now has an advanced row on
+the settings card that owns it, and each is also settable through the
 API (<a href="#api">§16</a>), e.g.
 <code>/api?mode=config&amp;name=verify_mode&amp;value=lean&amp;apikey=…</code>. Like
 every other setting they persist to <code>settings.json</code>.</p>
 <div class="tblwrap"><table>
 <tr><th>Name</th><th>What it does</th></tr>
-<tr><td><code>verify_mode</code></td><td><code>full</code> | <code>fast</code> | <code>lean</code> (default <code>fast</code>). <code>lean</code> is the slow-CPU boost: like fast, but it also skips the per-article yEnc CRC once PAR2 covers a file, leaving one CRC32 layer instead of two. PAR2-less downloads keep their article CRCs, and end-of-job verification and repair are unchanged either way. The <b>Fast verify</b> tick above is the same control for full vs fast.</td></tr>
+<tr><td><code>verify_mode</code></td><td><code>full</code> | <code>fast</code> | <code>lean</code> (default <code>fast</code>). <code>lean</code> is the slow-CPU boost: like fast, but it also skips the per-article yEnc CRC once PAR2 covers a file, leaving one CRC32 layer instead of two. PAR2-less downloads keep their article CRCs, and end-of-job verification and repair are unchanged either way. The <b>Checking while downloading</b> picker above is this setting.</td></tr>
 <tr><td><code>auto_retry_mins</code></td><td>Cooldown before the <em>one</em> automatic retry a first failure gets when articles were missing (default 20). Propagation lag is a real cause of missing articles and clears on its own; the journal makes the rerun fetch only what is still absent. Password and takedown failures never qualify.</td></tr>
 <tr><td><code>index_scan_par</code></td><td>How many groups the indexer scans in parallel (default 3, clamped 1-8).</td></tr>
 <tr><td><code>oracle_sample</code></td><td>Idle STAT budget for the availability oracle (<a href="#oracle">§13</a>), probes per hour per server. Default 300, max 3600, <code>0</code> disables sampling entirely.</td></tr>
@@ -1015,7 +1037,7 @@ the <b>API key</b> (full control) and the <b>NZB key</b> (add-only:
 <div class="tblwrap"><table>
 <tr><th>Area</th><th>Modes</th></tr>
 <tr><td>Queue</td><td><code>queue</code> (with <code>name=delete/pause/resume/priority/switch</code>), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>addnzblnk</code>, <code>retry</code>, <code>set_password</code></td></tr>
-<tr><td>Info</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code></td></tr>
+<tr><td>Info</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code>, plus <code>/jobnzb/&lt;nzo_id&gt;</code> (the job's own spooled <code>.nzb</code> back out, queue or history; full API key only)</td></tr>
 <tr><td>Config</td><td><code>get_config</code>, <code>config&amp;name=&lt;setting&gt;&amp;value=…</code> (every Settings field), <code>server_save/delete/test/enable/reorder</code>, <code>import_probe/apply</code></td></tr>
 <tr><td>Index &amp; wall</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, plus newznab at <code>/api?t=caps|search|tvsearch|movie</code> and <code>/getnzb/&lt;id&gt;</code></td></tr>
 <tr><td>Automation</td><td><code>watchlist</code>, <code>watchlist_check_now</code>, <code>watch_calendar</code>, <code>feeds</code>, <code>smart_folders</code>, <code>schedule</code></td></tr>

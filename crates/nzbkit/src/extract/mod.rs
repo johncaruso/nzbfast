@@ -886,6 +886,12 @@ struct Inner {
     /// Holds-paging gate (`NZBFAST_NO_HOLDS_PAGE` / runtime setter).
     /// Off: a budget breach demotes exactly as before paging existed.
     holds_page_on: bool,
+    /// §94 B: verified-block watermark handle. Set only on the ROOT
+    /// extractor (nested levels' bytes are outside the PAR2 set, so
+    /// child chases stay ungated), and only when the run opted in
+    /// (env-gated in get.rs while the feature soaks). Chase frontier
+    /// buffers created while this is Some are gated on it.
+    verify_gate: Option<Arc<crate::live::VerifyGate>>,
     /// Preallocation ceiling + extracted-byte budget, SHARED down the
     /// child chain (see [`Limits`]).
     limits: Arc<Limits>,
@@ -1205,12 +1211,17 @@ impl Extractor {
                 password,
                 stream_states: HashMap::new(),
                 decrypt_barrier: None,
+                verify_gate: None,
                 // Plaintext-once gate: on for a live (enabled, fresh)
                 // extractor unless the env kill-switch restores the
-                // legacy ciphertext-then-finish-decrypt path. Resume
-                // never maps in-stream, so the flag is moot there.
+                // legacy ciphertext-then-finish-decrypt path. Tied to
+                // `enabled` alone: the old `!resume` term was redundant
+                // (every resume caller passed enabled=false too), and the
+                // §94 A replay path resumes with the extractor ENABLED,
+                // where in-stream decrypt must run - restore() put the
+                // volumes back in ciphertext form, so the replay re-derives
+                // keys from replayed headers exactly as the wire would.
                 instream_decrypt: enabled
-                    && !resume
                     && std::env::var("NZBFAST_NO_INSTREAM_DECRYPT").map_or(true, |v| v != "1"),
                 crypto_files: HashMap::new(),
                 crypto_events: Arc::new(Mutex::new(Vec::new())),

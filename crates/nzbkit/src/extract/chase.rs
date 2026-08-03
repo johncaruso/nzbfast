@@ -300,7 +300,10 @@ impl Extractor {
         grp.slots.push(slot);
         inner.slots[slot].group = Some(key.clone());
         inner.slots[slot].mode = SlotMode::RarChase;
-        let buf = Arc::new(FrontierBuffer::new(size));
+        let buf = Arc::new(FrontierBuffer::new_gated(
+            size,
+            inner.verify_gate.clone().map(|g| (g, slot)),
+        ));
         // Seed with everything already seen. The header stash MOVES in
         // (like the holds): the buffer keeps every byte from offset 0
         // for the life of the chase - reads never consume it, and a
@@ -1089,6 +1092,49 @@ mod tests {
         );
         assert_eq!(std::fs::read(dir.join("F.bin")).unwrap(), f);
         // One pass: no outer volume, no intermediate archive - ever.
+        assert_eq!(dir_files(&dir), vec!["F.bin".to_string()]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// §94 B: a GATED chase parks until the verified watermark covers
+    /// what it wants to decode, then completes byte-exact. The gate is
+    /// driven by hand here exactly as the verifier drives it (engage at
+    /// claim, advance as blocks verify) - the extractor-side contract is
+    /// what this pins: gated buffers wait, wake on advance, and the
+    /// result is indistinguishable from an ungated run.
+    #[test]
+    fn gated_chase_waits_for_verification_then_completes() {
+        let dir = tmpdir("chase-gate");
+        let f = payload(300_000, 96);
+        let inner_arch = rars_compressed_volume(&[("F.bin", &f)]);
+        assert_not_store(&inner_arch);
+        let outer = fixtures::rar5_volume(&[(
+            "inner.rar",
+            inner_arch.len() as u64,
+            &inner_arch,
+            false,
+            false,
+        )]);
+        let ex = Extractor::new(&dir, 1, true);
+        let gate = crate::live::VerifyGate::new(1);
+        ex.set_verify_gate(gate.clone());
+        gate.engage(0); // the verifier claimed slot 0
+        feed(&ex, 0, "v.rar", &outer, 7000, 9);
+        // The chase worker is parked at watermark 0 with every byte
+        // already in the frontier. Release it the way verification
+        // does: an advance to the volume midpoint, then full.
+        let total = outer.len() as u64;
+        let g = gate.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            g.advance(0, total / 2);
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            g.advance(0, u64::MAX);
+        });
+        let rep = ex.finish().unwrap();
+        t.join().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(std::fs::read(dir.join("F.bin")).unwrap(), f);
         assert_eq!(dir_files(&dir), vec!["F.bin".to_string()]);
         std::fs::remove_dir_all(&dir).unwrap();
     }

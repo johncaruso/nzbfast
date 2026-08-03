@@ -66,6 +66,8 @@ const ECHOED_READ_ONLY: &[&str] = &[
     "mem_budget_total",
     // Owned by conntune.json and the tuner that writes it.
     "conntune",
+    // The tuner's line-speed shortfall verdict - display only.
+    "tune_hint",
     // The server list has its own editor endpoints (credentials must not
     // ride the settings allowlist), and this is its first-run signal.
     "servers",
@@ -77,6 +79,9 @@ const ECHOED_READ_ONLY: &[&str] = &[
     "has_apikey",
     "has_nzbkey",
     "has_omdb",
+    // How many passwords the passwords file currently holds - display
+    // only; the file itself (not this row) is what you edit.
+    "password_file_count",
 ];
 
 fn free_port() -> u16 {
@@ -696,5 +701,76 @@ fn the_trash_default_follows_the_platform() {
          On Linux it must be OFF: the trash lands on the download volume \
          itself and fills the user's disk with files nothing will empty."
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Turning the low-disk floor OFF stays off across a restart.
+///
+/// `min_free` gained a non-zero launch default (MIN_FREE_DEFAULT) so a
+/// fresh install protects the machine from a disk that fills to zero.
+/// That default made an old shortcut dangerous: the restore path used to
+/// read a saved 0 as "nothing was saved" and fall back to the default,
+/// so the one person who had deliberately typed 0 got the floor handed
+/// back on every launch - silently, since the queue only holds once the
+/// disk is actually low.
+///
+/// Not covered by `settings_survive_a_restart`: that walks BOOLEANS, and
+/// this is the numeric value whose "off" collides with "unset".
+#[test]
+fn a_min_free_of_zero_survives_a_restart() {
+    let dir = scratch("minfree");
+
+    {
+        let d = serve(&dir);
+        // The default is what a fresh install gets.
+        let fresh = settings_block(d.port);
+        assert_eq!(
+            fresh.get("min_free").and_then(|v| v.as_u64()),
+            Some(2_000_000_000),
+            "a fresh install should carry the low-disk floor"
+        );
+        let r = api(d.port, "mode=config&name=min_free&value=0");
+        assert_eq!(
+            r["status"].as_bool(),
+            Some(true),
+            "min_free=0 rejected: {r}"
+        );
+        assert_eq!(
+            settings_block(d.port)
+                .get("min_free")
+                .and_then(|v| v.as_u64()),
+            Some(0),
+            "0 did not reach the running daemon"
+        );
+    } // daemon killed here
+
+    let d = serve(&dir);
+    assert_eq!(
+        settings_block(d.port)
+            .get("min_free")
+            .and_then(|v| v.as_u64()),
+        Some(0),
+        "an explicit 0 came back as the default - the restore path is \
+         reading it as \"unset\" again"
+    );
+
+    // And a real value still round-trips, so the fix did not simply
+    // stop reading the key.
+    let r = api(d.port, "mode=config&name=min_free&value=25G");
+    assert_eq!(
+        r["status"].as_bool(),
+        Some(true),
+        "min_free=25G rejected: {r}"
+    );
+    drop(d);
+    let d = serve(&dir);
+    assert_eq!(
+        settings_block(d.port)
+            .get("min_free")
+            .and_then(|v| v.as_u64()),
+        Some(25_000_000_000),
+        "a non-zero floor did not survive the restart"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }

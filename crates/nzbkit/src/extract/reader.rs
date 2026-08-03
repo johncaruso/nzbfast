@@ -665,6 +665,34 @@ impl Extractor {
         inner.slots[slot].writer.as_ref().map(|w| w.path.clone())
     }
 
+    /// Bytes of the slot's declared file range that were never written.
+    ///
+    /// The writer is sized from the post's `=ybegin size`, and the
+    /// decoder only ever validates a part against its OWN `=ypart`
+    /// begin/end - never against that total. A post declaring 16 MiB
+    /// and shipping one CRC-valid byte therefore leaves a file that is
+    /// one byte plus a hole, with every article counter at zero
+    /// (Codex sweep 3 Aug M7). The interval map already knows exactly
+    /// which bytes arrived; this is the question nobody was asking it
+    /// at completion.
+    ///
+    /// `None` for anything but a STABLY PLAIN slot, which is the only
+    /// shape whose on-disk file is supposed to hold the whole declared
+    /// range. A mapped or chased slot legitimately holds less: a
+    /// trimmed 7z chase spills only the prefix the engine has passed
+    /// and serves the rest from memory, and a mapped RAR volume owns no
+    /// such file at all - counting either as short would fail healthy
+    /// jobs.
+    pub fn slot_uncovered(&self, slot: usize) -> Option<u64> {
+        let w = self.stable_plain_writer(slot)?;
+        let covered: u64 = w
+            .covered_intervals(0, w.size)
+            .iter()
+            .map(|&(s, e)| e - s)
+            .sum();
+        Some(w.size.saturating_sub(covered))
+    }
+
     /// (file name, size) of the slot's on-disk file - what the journal
     /// records as the slot's restore destination.
     pub fn slot_file_info(&self, slot: usize) -> Option<(String, u64)> {
@@ -679,6 +707,29 @@ impl Extractor {
                 w.size,
             )
         })
+    }
+
+    /// Crash resume, REPLAY mode (§94 A): reserve `file_name` in the
+    /// chain-wide name set without creating a writer for it.
+    ///
+    /// A replay reads the restored file and pushes its spans back
+    /// through `write`, so the file is a live SOURCE for the whole run -
+    /// but a fresh extractor starts with an empty `names_taken`, so an
+    /// inner member sanitizing to the same name claimed it freely and
+    /// the inner output writer opened the very inode the replay loop
+    /// was still reading (Codex sweep 3 Aug H3). That both corrupts
+    /// unread packed bytes and, when a small shape finishes, lets the
+    /// all-good cleanup delete the extracted payload as if it were the
+    /// spent source. Claiming the name here pushes the inner output to a
+    /// disambiguated one, which is what the disk extractor achieves by
+    /// staging into an isolated directory.
+    pub fn preclaim_name(&self, file_name: &str) {
+        let inner = self.inner.lock_ok();
+        inner
+            .names_taken
+            .lock()
+            .unwrap()
+            .insert(name_collision_key(inner.fold_names, file_name));
     }
 
     /// Crash resume: adopt `file_name` (already restored on disk by the

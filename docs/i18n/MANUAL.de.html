@@ -356,8 +356,12 @@ Einstellungen → Oberfläche), damit dein schnellster Provider immer oben steht
 <li><b>Zeilen ziehen zum Umsortieren</b> (innerhalb eines Prioritätsbands -
 Erzwingen/Hoch läuft trotzdem zuerst); Priorität direkt in der Zeile ändern.</li>
 <li><b>Klick auf eine Zeile</b> für die Detail-Schublade: Fortschrittsbalken pro
-Datei, Prüf-Blockzähler und welcher Server wie viel zu <em>diesem</em> Job
-beigetragen hat.</li>
+Datei, Prüf-Blockzähler, welcher Server wie viel zu <em>diesem</em> Job
+beigetragen hat, und eine „Hinzugefügt von“-Zeile, die sagt, woher der Job kam
+(Watch-Ordner, eine verbundene App, die API…). Eine Schaltfläche
+<b>.nzb herunterladen</b> speichert dir die <code>.nzb</code>-Datei des Jobs -
+nzbfast behält eine eigene Kopie, das funktioniert also für jeden Job, auch wenn
+die Originaldatei längst weg ist.</li>
 <li>Badges zeigen Sonderzustände: <i>zurückgestellt (langsam)</i>, <i>Prefetch</i>,
 <i>pausiert</i> (siehe <a href="#performance">Performance-Tools</a>).</li>
 <li>Ein Burn-down-Diagramm verfolgt die verbleibenden GB über die ganze
@@ -376,7 +380,11 @@ und Upgrade-Regeln (eine bessere Kopie ersetzt eine schlechtere).</p>
 <p>Die jüngsten Downloads, eine Zeile je Download. Fehlgeschlagene Jobs bieten <b>Erneut</b> (setzt aus dem Journal fort). Verschlüsselte Archive zeigen ein
 🔑-Entsperr-Element - gib das Passwort ein und der Job wird an Ort und Stelle fertig.
 Der Prüfstatus-Streifen zeichnet defekte PAR2-Blöcke pro Download auf - ein steigendes
-Ende heißt: Artikel kommen beschädigt an.</p>
+Ende heißt: Artikel kommen beschädigt an.
+Die Schublade jeder Zeile sagt, wer den Job hinzugefügt hat, und hat dieselbe
+Schaltfläche <b>.nzb herunterladen</b> wie die Warteschlange - praktisch, um ein
+Release woanders noch einmal herunterzuladen oder die <code>.nzb</code> an eine
+Problemmeldung anzuhängen.</p>
 <p>Die Karte listet standardmäßig zehn Downloads, der Rest ist einen Klick entfernt, über die Schaltfläche ▤. Status, Ort und der Grund eines Fehlschlags liegen hinter einem Klick auf die Zeile selbst, damit der häufige Fall - was fertig wurde, wie groß, wann - ohne Scrollen lesbar bleibt. Zieh stattdessen die Unterkante der Karte, damit die Liste auf einer von dir gewählten Höhe scrollt. <b>History rows</b> unter Einstellungen → Oberfläche ändert die Zehn; da es eine Eigenschaft des Daemons ist und nicht deines Browsers, gilt es für jedes Gerät, das auf diese Installation schaut. <b>Colour History names</b> daneben färbt fertige Namen grün und fehlgeschlagene rot; ausgeschaltet bleiben die Namen schlicht, und der farbige Punkt wie auch die Details der Zeile sagen weiterhin, was was ist.</p>
 <h3 id="dash-usage">Datenverbrauch</h3>
 <p>Tagesbalken pro Provider und Summen für Heute / 7 Tage / 30 Tage - unverzichtbar
@@ -391,8 +399,12 @@ Größe.</p>
 <tr><th>Methode</th><th>So geht’s</th></tr>
 <tr><td><b>Drag &amp; Drop</b></td><td>Zieh eine oder mehrere <code>.nzb</code>-Dateien irgendwo aufs Dashboard.</td></tr>
 <tr><td><b>Watch-Ordner</b></td><td>Leg in den Einstellungen einen Ordner fest; jede dort
-gespeicherte <code>.nzb</code> wird binnen 5 Sekunden aufgegriffen und die Datei
-entfernt. Richte den Download-Ordner deines Browsers dorthin - für Ein-Klick-Grabs
+gespeicherte <code>.nzb</code> wird binnen 5 Sekunden aufgegriffen und in den
+Papierkorb verschoben, und ein offenes Dashboard meldet jede Übernahme beim Namen
+(„… aus Downloads übernommen“), sodass eine Datei, die aus dem Ordner verschwindet,
+nie ein Rätsel bleibt. Du behältst deine Dateien lieber? Schalte <b>.nzb-Dateien
+nach Übernahme behalten</b> ein (siehe <a href="#settings">§9</a>). Richte den
+Download-Ordner deines Browsers dorthin - für Ein-Klick-Grabs
 von Indexer-Seiten.</td></tr>
 <tr><td><b>Von einer URL</b></td><td>Füge einen NZB-Link ein (API <code>mode=addurl</code>, oder über jede verbundene App).</td></tr>
 <tr><td><b>nzblnk:-Links</b></td><td>Füge einen <code>nzblnk:</code>-Link irgendwo im Dashboard ein oder zieh ihn hinein. Aus dem macOS-DMG oder dem Windows-Installer installiert, kannst du auch direkt auf einem Board einen anklicken. Siehe <a href="#nzblnk">nzblnk-Links</a> weiter unten.</td></tr>
@@ -613,13 +625,16 @@ gespeichert und übersteht Neustarts (UI-Werte schlagen Kommandozeilen-Flags).</
 Standardwerte passen für die meisten Leitungen; nutz die Tuning-Tools, bevor du blind
 erhöhst.</p>
 
-<p><b>Schnellprüfung (CRC32)</b> (standardmäßig an) belegt PAR2-Blöcke schon während
-des laufenden Downloads allein per CRC32, was auf einer langsamen CPU 2-3x schneller
-ist. Die eigene Prüfsumme jedes Artikels wird trotzdem geprüft, und der abschließende
-Durchgang rechnet immer volles MD5: an der Korrektheit ändert sich also nichts.
-Abwählen, um auch während des Downloads MD5 pro Block zu rechnen.</p>
+<p><b>Prüfung während des Downloads</b> wählt, wie viel schon beim Eintreffen geprüft
+wird. <i>Vollständig</i> bestätigt jeden PAR2-Block per MD5. <i>Schnell</i> (die
+Vorgabe) belegt Blöcke stattdessen per CRC32, was auf einer langsamen CPU 2-3x
+schneller ist, und prüft weiterhin die eigene Prüfsumme jedes Artikels. <i>Sparsam</i>
+überspringt zusätzlich diese Artikel-Prüfsummen, sobald PAR2 eine Datei abdeckt: ein
+Schaden fällt dann einen Moment später auf, bei seinem Block. In allen dreien rechnen
+der abschließende Durchgang und jede Reparatur volles MD5, und ein Download ohne
+PAR2-Dateien behält seine Artikel-Prüfsummen.</p>
 <h3>Festplatte &amp; Quota <span class="pill live">live</span></h3>
-<p><b>Minimaler freier Platz</b> (neue Jobs darunter pausieren), <b>Download-Quota</b>
+<p><b>Minimaler freier Platz</b> (neue Jobs darunter pausieren; standardmäßig 2 GB, 0 schaltet es ab), <b>Download-Quota</b>
 pro Tag oder Monat (UTC; Erzwingen-Jobs umgehen sie), <b>Speicher-Budget</b> - die
 RAM-Zuteilung der Engine (Standard: ¼ des RAM, gedeckelt; erhöh es auf einer Maschine
 mit viel RAM für maximales Tempo bei riesigen Jobs, und lies vor dem Senken,
@@ -667,6 +682,28 @@ komplett übersprungen. Beide Löschschritte gelten <em>nur</em> für Releases, 
 Film oder Serie erkannt wurden: eine Software-Nutzlast oder ein nicht einzuordnender
 (verschleierter) Satz wird nie ausgemistet.</p>
 
+<p><b>Gelöschte Dateien in den Papierkorb</b> entscheidet, was "löschen" oben
+bedeutet. Ist die Option an, verschiebt die Bereinigung Dateien in den Papierkorb
+des Systems, sodass eine falsche Einschätzung darüber, was Müll war, rückgängig
+gemacht werden kann; ist sie aus, werden sie endgültig gelöscht. Sie ist
+<b>unter macOS und Windows standardmäßig an</b>, wo der Papierkorb ein Ort ist,
+den Sie sehen und leeren können, und <b>unter Linux standardmäßig aus</b>, wo das
+meist nicht der Fall ist.</p>
+<div class="note"><b>Auf einem NAS oder in einem Container lassen Sie das aus.</b>
+Liegen Ihre Downloads auf einer anderen Festplatte als Ihr Home-Verzeichnis - die
+übliche Anordnung auf Unraid, Synology, einer Seedbox oder jeder
+Docker-Installation mit eingebundener Freigabe - verwenden die Linux-Regeln für
+den Papierkorb gar keinen Desktop-Papierkorb. Sie legen einen versteckten Ordner
+<code>.Trash-1000</code> (die Zahl ist Ihre Benutzer-ID) oben auf der
+Download-Festplatte an und verschieben die Dateien dorthin. Nichts zeigt Ihnen
+diesen Ordner, nichts leert ihn, und der Platz, den er belegt, kommt nie zurück.
+<p>Wenn Sie eine frühere Version von nzbfast unter Linux mit dieser Option
+betrieben haben, suchen Sie diesen Ordner im Wurzelverzeichnis Ihrer
+Download-Freigabe. Sie können ihn gefahrlos leeren: Alles darin ist eine Datei,
+von der die Bereinigung bereits entschieden hatte, dass Sie sie nicht wollten.
+nzbfast leert ihn nicht für Sie, denn er liegt auf Ihrer Festplatte, und das
+Urteil darüber steht Ihnen zu.</p></div>
+
 <h3>Ordner &amp; Verarbeitung</h3>
 <p><b>Download-Ordner</b> <span class="pill restart">Neustart</span>, <b>Watch-Ordner</b>,
 <b>Nachbearbeitungs-Skript</b> (läuft nach jedem Job mit SABnzbd-kompatiblen
@@ -674,6 +711,14 @@ Argumenten und <code>SAB_*</code>-Umgebung - bestehende SAB-Skripte laufen
 unverändert), <b>Aufräum-Endungen</b> (Müll-Dateien, die nach dem Abschluss gelöscht
 werden), <b>Smarte Ordner</b> und <b>TV-Ablage</b> (siehe
 <a href="#automation">§10</a>).</p>
+<p><b>.nzb-Dateien nach Übernahme behalten</b> (standardmäßig aus) lässt die
+ursprüngliche <code>.nzb</code> nach dem Einreihen im Watch-Ordner liegen, statt
+sie in den Papierkorb zu verschieben - für Sammler, und um die Datei
+weiterzugeben, wenn ein Download Probleme macht. Eine behaltene Datei wird
+gemerkt, auch über Neustarts hinweg, und nicht erneut eingereiht; speichere sie
+neu, um sie erneut herunterzuladen. Wie auch immer du dich entscheidest: Die
+Schublade jedes Jobs hat eine Schaltfläche <b>.nzb herunterladen</b>, eine Kopie
+der <code>.nzb</code> eines Jobs ist also nie mehr als einen Klick entfernt.</p>
 
 <h3>Indexierung <span class="pill live">live</span></h3>
 <div class="note"><b>Der eingebaute Indexer ist standardmäßig aus.</b> Er findet
@@ -718,14 +763,15 @@ Geschwindigkeit im Dashboard angezeigt wird: Megabyte (MB/s, die Norm bei
 Download-Managern, Standard) oder Megabit (Mb/s, wie Provider Leitungen angeben).
 Dateigrößen bleiben in Byte. Das ist eine Eigenschaft des Daemons, nicht deines
 Browsers, gilt also für jedes Gerät, das auf diese Installation schaut.</p>
-<h3>Fortgeschritten: Einstellungen ohne Bedienelement</h3>
-<p>Sechs Einstellungen haben weder ein Bedienelement noch ein Kommandozeilen-Flag.
-Setze sie über die API (<a href="#api">§16</a>), z. B.
+<h3>Fortgeschritten: die Stellschrauben hinter den offensichtlichen</h3>
+<p>Sechs Einstellungen ohne Kommandozeilen-Flag. Jede hat jetzt eine erweiterte Zeile auf
+der Einstellungskarte, zu der sie gehört, und bleibt über die API setzbar
+(<a href="#api">§16</a>), z. B.
 <code>/api?mode=config&amp;name=verify_mode&amp;value=lean&amp;apikey=…</code>. Wie
 alle anderen landen sie dauerhaft in <code>settings.json</code>.</p>
 <div class="tblwrap"><table>
 <tr><th>Name</th><th>Wirkung</th></tr>
-<tr><td><code>verify_mode</code></td><td><code>full</code> | <code>fast</code> | <code>lean</code> (Standard <code>fast</code>). <code>lean</code> ist der Schub für langsame CPUs: wie fast, überspringt aber zusätzlich den yEnc-CRC pro Artikel, sobald PAR2 eine Datei abdeckt, also eine CRC32-Schicht statt zwei. Downloads ohne PAR2 behalten ihre Artikel-CRCs, und die Prüfung und Reparatur am Ende des Jobs bleiben in jedem Fall unverändert. Die <b>Schnellprüfung</b> oben ist dieselbe Steuerung für full gegen fast.</td></tr>
+<tr><td><code>verify_mode</code></td><td><code>full</code> | <code>fast</code> | <code>lean</code> (Standard <code>fast</code>). <code>lean</code> ist der Schub für langsame CPUs: wie fast, überspringt aber zusätzlich den yEnc-CRC pro Artikel, sobald PAR2 eine Datei abdeckt, also eine CRC32-Schicht statt zwei. Downloads ohne PAR2 behalten ihre Artikel-CRCs, und die Prüfung und Reparatur am Ende des Jobs bleiben in jedem Fall unverändert. Die Auswahl <b>Prüfung während des Downloads</b> oben ist diese Einstellung.</td></tr>
 <tr><td><code>auto_retry_mins</code></td><td>Wartezeit vor dem <em>einen</em> automatischen zweiten Versuch, den ein erstes Scheitern mit fehlenden Artikeln bekommt (Standard 20). Propagationsverzögerung ist eine echte Ursache fehlender Artikel und löst sich von selbst; dank Journal holt der zweite Lauf nur, was noch fehlt. Passwort- und Takedown-Fehler qualifizieren sich nie.</td></tr>
 <tr><td><code>index_scan_par</code></td><td>Wie viele Gruppen der Indexer parallel scannt (Standard 3, begrenzt auf 1-8).</td></tr>
 <tr><td><code>oracle_sample</code></td><td>Leerlauf-STAT-Budget des Verfügbarkeits-Orakels (<a href="#oracle">§13</a>), Proben pro Stunde und Server. Standard 300, Maximum 3600, <code>0</code> schaltet das Abtasten ganz ab.</td></tr>
@@ -1024,7 +1070,7 @@ Keys: der <b>API-Key</b> (volle Kontrolle) und der <b>NZB-Key</b> (nur Hinzufüg
 <div class="tblwrap"><table>
 <tr><th>Bereich</th><th>Modes</th></tr>
 <tr><td>Warteschlange</td><td><code>queue</code> (mit <code>name=delete/pause/resume/priority/switch</code>), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>addnzblnk</code>, <code>retry</code>, <code>set_password</code></td></tr>
-<tr><td>Info</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code></td></tr>
+<tr><td>Info</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code>, dazu <code>/jobnzb/&lt;nzo_id&gt;</code> (gibt die eigene gespoolte <code>.nzb</code> des Jobs wieder heraus, Warteschlange oder Verlauf; nur mit vollem API-Key)</td></tr>
 <tr><td>Konfiguration</td><td><code>get_config</code>, <code>config&amp;name=&lt;setting&gt;&amp;value=…</code> (jedes Einstellungs-Feld), <code>server_save/delete/test/enable/reorder</code>, <code>import_probe/apply</code></td></tr>
 <tr><td>Index &amp; Wand</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, dazu newznab unter <code>/api?t=caps|search|tvsearch|movie</code> und <code>/getnzb/&lt;id&gt;</code></td></tr>
 <tr><td>Automatisierung</td><td><code>watchlist</code>, <code>watchlist_check_now</code>, <code>watch_calendar</code>, <code>feeds</code>, <code>smart_folders</code>, <code>schedule</code></td></tr>

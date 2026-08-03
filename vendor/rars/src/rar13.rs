@@ -777,9 +777,39 @@ pub fn extract_volumes_to<F>(
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
+    extract_volumes_to_impl(volumes, password, &mut open, None)
+}
+
+/// [`extract_volumes_to`] reporting each volume the engine is finished
+/// with - the RAR 1.3 twin of
+/// [`crate::rar50::extract_volumes_to_with_progress`], same contract.
+pub fn extract_volumes_to_with_progress<F, C>(
+    volumes: &[Archive],
+    password: Option<&[u8]>,
+    mut open: F,
+    mut consumed: C,
+) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    C: FnMut(usize),
+{
+    extract_volumes_to_impl(volumes, password, &mut open, Some(&mut consumed))
+}
+
+fn extract_volumes_to_impl<F>(
+    volumes: &[Archive],
+    password: Option<&[u8]>,
+    open: &mut F,
+    mut consumed: Option<&mut dyn FnMut(usize)>,
+) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+{
     let mut pending: Option<PendingSplitRefs> = None;
     let mut unpack15 = Unpack15::new();
     let mut extracted_count = 0usize;
+    // Volumes already reported consumed - see the rar50 twin.
+    let mut reported = 0usize;
 
     for (volume_index, archive) in volumes.iter().enumerate() {
         for (entry_index, entry) in archive.entries.iter().enumerate() {
@@ -825,7 +855,7 @@ where
                     let completed = pending.take().expect("pending split");
                     let solid = archive.main.is_solid() && extracted_count != 0;
                     completed
-                        .write_to(volumes, entry, password, &mut unpack15, solid, &mut open)
+                        .write_to(volumes, entry, password, &mut unpack15, solid, &mut *open)
                         .map_err(|error| entry.entry_error("extracting", error))?;
                     extracted_count += 1;
                 }
@@ -833,6 +863,14 @@ where
                     return Err(Error::InvalidHeader(
                         "RAR 1.3 split entry flags are inconsistent",
                     ));
+                }
+            }
+        }
+        if pending.is_none() {
+            if let Some(consumed) = consumed.as_mut() {
+                while reported <= volume_index {
+                    consumed(reported);
+                    reported += 1;
                 }
             }
         }

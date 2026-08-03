@@ -29,12 +29,33 @@ jobs:
           key: pr-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
       - name: build
         run: cargo build --workspace --locked
-      - name: test
+      # The suite runs as TWO passes, split on the nzbfast package. The
+      # daemon suite is single-threaded by invariant (CLAUDE.md invariant
+      # 4), and under a plain parallel `cargo test --workspace` it flaked
+      # about 1 run in 3 on an unmodified tree
+      # (cancelling_a_download_leaves_its_duplicate_held), measured the
+      # same way against a clean checkout - so it is the invocation, not
+      # a regression in any change under review.
+      # cargo cannot exclude one test TARGET from a workspace pass, so the
+      # whole nzbfast package gets its own pass with --test-threads=1 -
+      # which is also how nightly.yml already runs daemon and e2e (e2e
+      # carries timing-sensitive stall/watchdog tests, so serialising it
+      # is a feature, not a cost).
+      - name: test (workspace minus nzbfast)
         env:
           NZBFAST_NO_ENRICH: "1"
           # par2 is installed above, so a PAR2 test that cannot find it is a
           # broken job. Without this they SKIP, and a broken install reads as
           # a green run with silently reduced coverage.
+          NZBFAST_REQUIRE_PAR2: "1"
+        # --no-fail-fast is not tidiness: cargo stops at the first failing
+        # TARGET, so a single red test in the nzbfast bin used to mean
+        # nzbkit's suites - yEnc, PAR2, RAR - never ran at all, and the run
+        # reported one binary's result as if it had covered the workspace.
+        run: cargo test --workspace --exclude nzbfast --locked --no-fail-fast
+      - name: test (nzbfast, single-threaded)
+        env:
+          NZBFAST_NO_ENRICH: "1"
           NZBFAST_REQUIRE_PAR2: "1"
           # Opens an all-interfaces listener to prove the wide bind still
           # reaches the LAN (NAS boxes and remote *arrs depend on it).
@@ -42,11 +63,7 @@ jobs:
           # firewall prompt on every rebuild; a Linux runner has no such
           # prompt, so CI is where this belongs.
           NZBFAST_LAN_TESTS: "1"
-        # --no-fail-fast is not tidiness: cargo stops at the first failing
-        # TARGET, so a single red test in the nzbfast bin used to mean
-        # nzbkit's suites - yEnc, PAR2, RAR - never ran at all, and the run
-        # reported one binary's result as if it had covered the workspace.
-        run: cargo test --workspace --locked --no-fail-fast
+        run: cargo test -p nzbfast --locked --no-fail-fast -- --test-threads=1
       - name: fmt
         run: cargo fmt -p nzbkit -p nzbfast -p nzbtray --check
       - name: clippy
@@ -73,8 +90,11 @@ jobs:
     if: github.repository == 'nzbfast/nzbfast'
     runs-on: windows-latest
     # Windows compiles this workspace a good deal slower than Linux does:
-    # a cold-cache release build of it measured 38 minutes.
-    timeout-minutes: 60
+    # a cold-cache release build of it measured 38 minutes. 75 rather
+    # than 60 since the nzbfast package's tests went single-threaded
+    # (see the test steps below); nightly.yml budgets 90 for build plus
+    # the serial daemon suite alone on this runner class.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # The same test dependency the Linux job installs with apt, for the
@@ -112,17 +132,26 @@ jobs:
           key: pr-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
       - name: build
         run: cargo build --workspace --locked
-      - name: test
+      # Same two-pass split as the Linux leg, for the same reason: the
+      # daemon suite is single-threaded by invariant (CLAUDE.md invariant
+      # 4) and flakes under a parallel workspace pass, and cargo cannot
+      # exclude one test target from --workspace.
+      - name: test (workspace minus nzbfast)
         env:
           NZBFAST_NO_ENRICH: "1"
           # As on the Linux leg: par2 is fetched above, so a skip here means
           # the install or the PATH broke and the run must say so.
           NZBFAST_REQUIRE_PAR2: "1"
+        run: cargo test --workspace --exclude nzbfast --locked --no-fail-fast
+      - name: test (nzbfast, single-threaded)
+        env:
+          NZBFAST_NO_ENRICH: "1"
+          NZBFAST_REQUIRE_PAR2: "1"
           # NZBFAST_LAN_TESTS is deliberately NOT set here. It belongs to
           # the Linux runner: it opens an all-interfaces listener, which on
           # Windows is exactly what raises the Defender Firewall dialog,
           # and a hosted runner has nobody to click it.
-        run: cargo test --workspace --locked --no-fail-fast
+        run: cargo test -p nzbfast --locked --no-fail-fast -- --test-threads=1
       # Parity with the Linux leg above, which has run clippy all along
       # while this job did not - and clippy only lints what compiles for
       # the host, so `#[cfg(windows)]` code was gated on no runner at all.

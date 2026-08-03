@@ -17,6 +17,8 @@ into the embedded dashboard pages, not environment variables.
 | `NZBFAST_CONFIG` | Config file path, same as `--config`; makes every subcommand and the daemon agree on one file (the container image sets `/config/config.json`) | `config.local.json` in the cwd | Supported |
 | `NZBFAST_STORAGE` | Force storage-type detection for the output path: `rotational`, `ssd`, or `auto` | `auto` (detect) | Supported |
 | `NZBFAST_READ_TIMEOUT_SECS` | Read-stall timeout for pooled NNTP connections, in seconds | 30 | Supported |
+| `NZBFAST_ADAPTIVE_TIMEOUT` | `1` replaces the flat per-response timeout with a two-phase bound: a pre-first-byte budget adapting to each server's measured response latency (dead connections detected in 2-10 s) plus an 8 s no-progress deadline once bytes flow (a slow but alive transfer is never cut for exceeding a flat cap). Experimental while it is benched | off | Experimental |
+| `NZBFAST_CHASE_VERIFY_GATE` | `1` gates the archive chase decode on the PAR2 verified-block watermark: the decode consumes only vouched bytes, so a mid-download repair can never rewrite already-decoded data and the job survives where it used to demote to the disk pass. Experimental while it soaks | off | Experimental |
 | `NZBFAST_STALL_ABORT_SECS` | Download stall watchdog: abort when decoded bytes AND outstanding articles are both frozen this long | 180 | Supported |
 | `NZBFAST_AUTO_RETRY_SECS` | Auto-retry interval for failed jobs, in seconds; overrides the `auto_retry_mins` setting (tests use it to compress the timeline) | `auto_retry_mins * 60` | Supported |
 | `NZBFAST_THROTTLE_WRITE_MBPS` | Cap the consumer's write rate (MB/s) to simulate a slow disk; backpressure then closes TCP windows upstream | unset (no throttle) | Supported |

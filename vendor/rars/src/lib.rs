@@ -873,6 +873,64 @@ where
     }
 }
 
+/// [`extract_volumes_to_with_options`] reporting each volume the engine
+/// is finished with.
+///
+/// `consumed(volume_index)` indexes `archives`, arrives in increasing
+/// order, and promises that no read will ever touch that volume again -
+/// so a caller holding the set on disk can delete it there and then.
+/// See [`rar50::extract_volumes_to_with_progress`] for what makes the
+/// promise true (and, for RAR 5, what it costs: the parallel member pool
+/// is off while the watermark is armed).
+///
+/// The volumes are handed to the family extractors in the order given,
+/// which is the order the set is read in, so the index the callback
+/// carries is an index into the caller's own list.
+pub fn extract_volumes_to_with_progress<F, C>(
+    archives: &[Archive],
+    options: ArchiveReadOptions<'_>,
+    mut open: F,
+    consumed: C,
+) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    C: FnMut(usize),
+{
+    let Some(first) = archives.first() else {
+        return Err(Error::InvalidHeader("volume set is empty"));
+    };
+
+    match first.family() {
+        ArchiveFamily::Rar13 => {
+            let typed = rar13_volumes(archives)?;
+            rar13::extract_volumes_to_with_progress(
+                &typed,
+                options.password,
+                |meta| open(&rar13_meta(meta)),
+                consumed,
+            )
+        }
+        ArchiveFamily::Rar15To40 => {
+            let typed = rar15_40_volumes(archives)?;
+            rar15_40::extract_volumes_to_with_progress(
+                &typed,
+                options,
+                |meta| open(&rar15_40_meta(meta)),
+                consumed,
+            )
+        }
+        ArchiveFamily::Rar50Plus => {
+            let typed = rar50_volumes(archives)?;
+            rar50::extract_volumes_to_with_progress(
+                &typed,
+                options,
+                |meta| open(&rar50_meta(meta)),
+                consumed,
+            )
+        }
+    }
+}
+
 fn rar13_meta(meta: &rar13::ExtractedEntryMeta) -> ExtractedEntryMeta {
     ExtractedEntryMeta {
         name: meta.name.clone(),
@@ -3030,6 +3088,88 @@ mod tests {
         assert_eq!(
             watermarks_of(&reports, parts.len()),
             vec![u64::MAX; parts.len()]
+        );
+    }
+
+    /// The whole-set consumption watermark: every volume reported once,
+    /// in order, and NOTHING reported while a split member is still
+    /// pending - its Finish fragment reads every volume it spanned, so a
+    /// caller deleting on the watermark would otherwise destroy the
+    /// fragments the decode is about to read back.
+    #[test]
+    fn extract_volumes_to_with_progress_reports_each_volume_once_and_never_early() {
+        let payload = deterministic_squashable(40_000);
+        let tail = deterministic_squashable(3_000);
+        let entries = [
+            rar50::CompressedEntry {
+                name: b"split.bin",
+                data: &payload,
+                mtime: None,
+                attributes: 0x20,
+                host_os: 3,
+            },
+            rar50::CompressedEntry {
+                name: b"after.bin",
+                data: &tail,
+                mtime: None,
+                attributes: 0x20,
+                host_os: 3,
+            },
+        ];
+        let parts = rar50::Rar50VolumeWriter::new(rar50_options(ArchiveVersion::Rar50))
+            .compressed_entries(&entries)
+            .max_payload_per_volume(9_000)
+            .finish()
+            .unwrap();
+        assert!(parts.len() >= 3, "the set must split across volumes");
+        let archives: Vec<_> = parts
+            .iter()
+            .map(|part| rar50::Archive::parse(part).unwrap())
+            .collect();
+
+        // One interleaved log, so "was volume 0 released before the split
+        // member was written?" is answerable rather than inferred.
+        #[derive(Debug, PartialEq)]
+        enum Event {
+            Opened(Vec<u8>),
+            Consumed(usize),
+        }
+        let log = std::cell::RefCell::new(Vec::new());
+        rar50::extract_volumes_to_with_progress(
+            &archives,
+            ArchiveReadOptions::new(),
+            |meta| {
+                log.borrow_mut().push(Event::Opened(meta.name.clone()));
+                Ok(Box::new(std::io::sink()) as Box<dyn Write>)
+            },
+            |index| log.borrow_mut().push(Event::Consumed(index)),
+        )
+        .unwrap();
+
+        let log = log.into_inner();
+        let consumed: Vec<usize> = log
+            .iter()
+            .filter_map(|e| match e {
+                Event::Consumed(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            consumed,
+            (0..parts.len()).collect::<Vec<_>>(),
+            "every volume exactly once, in order"
+        );
+        let first_consumed = log
+            .iter()
+            .position(|e| matches!(e, Event::Consumed(_)))
+            .unwrap();
+        let split_written = log
+            .iter()
+            .position(|e| e == &Event::Opened(b"split.bin".to_vec()))
+            .unwrap();
+        assert!(
+            split_written < first_consumed,
+            "a volume was released while the split member was still pending: {log:?}"
         );
     }
 

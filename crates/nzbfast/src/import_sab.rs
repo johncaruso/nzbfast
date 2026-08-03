@@ -116,6 +116,106 @@ fn parse_servers(ini: &str) -> Vec<SabServer> {
     out
 }
 
+/// A top-level (non-server) key's value from a SABnzbd ini - e.g.
+/// `password_file` under `[misc]`. Depth-2 `[[server]]` sections are
+/// skipped so a server's key of the same name can never shadow it.
+pub fn sab_ini_value(ini: &str, key: &str) -> Option<String> {
+    let mut in_subsection = false;
+    for line in ini.lines() {
+        let line = line.trim();
+        if line.starts_with("[[") {
+            in_subsection = true;
+            continue;
+        }
+        if line.starts_with('[') {
+            in_subsection = false;
+            continue;
+        }
+        if in_subsection {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=')
+            && k.trim() == key
+        {
+            let v = unquote(v);
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// A key's value from an nzbget.conf - plain `Key=Value` lines, no
+/// sections, `#` comments.
+pub fn nzbget_conf_value(conf: &str, key: &str) -> Option<String> {
+    for line in conf.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=')
+            && k.trim() == key
+        {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// SAB's `password_file` (the archive-passwords list) rides the same
+/// import: when the ini names one and the file is really there, record
+/// it in the sibling settings.json so the daemon unpacks with it from
+/// the next start. Never overwrites a path the user already saved -
+/// their curation wins over a re-import.
+fn adopt_password_file(ini: &str, out_path: &Path) {
+    let Some(pw_path) = sab_ini_value(ini, "password_file") else {
+        return;
+    };
+    if !Path::new(&pw_path).is_file() {
+        return;
+    }
+    let settings = out_path.with_file_name("settings.json");
+    // The daemon's own loader rules apply here too (Codex sweep 3 Aug
+    // MH1): a torn primary with a good .bak must recover from the .bak,
+    // and a store that exists but yields NOTHING must be refused - a
+    // raw parse-to-{} would write a valid one-key settings.json that
+    // the next daemon start trusts, refreshing the .bak from it and
+    // permanently erasing every other saved setting. (A daemon saving
+    // settings concurrently can still race this CLI write; import-sab
+    // is a setup-time command and documents running it with the daemon
+    // stopped.)
+    if crate::persist::json_store_unreadable(&settings) {
+        println!(
+            "  (not recording SABnzbd's password_file: {} exists but won't parse - \
+             fix or remove it first)",
+            settings.display()
+        );
+        return;
+    }
+    let mut doc = crate::persist::load_json_with_backup(&settings)
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| json!({}));
+    if doc
+        .get("password_file")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|p| !p.trim().is_empty())
+    {
+        return;
+    }
+    doc["password_file"] = json!(pw_path);
+    match serde_json::to_string_pretty(&doc)
+        .map_err(anyhow::Error::from)
+        .and_then(|s| crate::persist::write_atomic(&settings, s.as_bytes()).map_err(Into::into))
+    {
+        Ok(()) => println!("  adopted SABnzbd's archive passwords file: {pw_path}"),
+        Err(e) => println!("  (could not record SABnzbd's password_file: {e})"),
+    }
+}
+
 pub fn import(ini_path: &Path, out_path: &Path, force: bool) -> Result<()> {
     let text = std::fs::read_to_string(ini_path)
         .with_context(|| format!("reading {}", ini_path.display()))?;
@@ -194,6 +294,7 @@ pub fn import(ini_path: &Path, out_path: &Path, force: bool) -> Result<()> {
     // states for state files that can hold credentials.
     crate::persist::write_atomic(out_path, cfg.as_bytes())
         .with_context(|| format!("writing {}", out_path.display()))?;
+    adopt_password_file(&text, out_path);
     for s in &servers {
         println!(
             "  imported {} → {}:{} ({} conns{}{}{}{})",
@@ -445,6 +546,122 @@ enable = 1
         std::fs::write(&out, "not json").unwrap();
         import(&ini, &out, true).unwrap();
         assert_eq!(nzbkit::config::Config::load(&out).unwrap().servers.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn top_level_key_parsers() {
+        // The [misc] key is found; a server's key of the same name in a
+        // [[section]] is never mistaken for it.
+        let ini = "[misc]\npassword_file = \"/data/pw.txt\"\n[servers]\n[[s1]]\npassword_file = red-herring\nhost = h\n";
+        assert_eq!(
+            sab_ini_value(ini, "password_file").as_deref(),
+            Some("/data/pw.txt")
+        );
+        assert_eq!(
+            sab_ini_value("[misc]\npassword_file =\n", "password_file"),
+            None
+        );
+        let conf = "# UnpackPassFile=commented\nUnpackPassFile=/etc/pw.txt\nUnrarCmd=unrar\n";
+        assert_eq!(
+            nzbget_conf_value(conf, "UnpackPassFile").as_deref(),
+            Some("/etc/pw.txt")
+        );
+        assert_eq!(nzbget_conf_value(conf, "Missing"), None);
+    }
+
+    /// SAB's password_file rides the import into the sibling
+    /// settings.json - when the file really exists, and never over a
+    /// path the user already saved.
+    #[test]
+    fn import_adopts_password_file() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-impsab-pw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pw = dir.join("passwords.txt");
+        std::fs::write(&pw, "secret1\n").unwrap();
+        let ini = dir.join("sabnzbd.ini");
+        std::fs::write(
+            &ini,
+            format!("[misc]\npassword_file = {}\n{INI}", pw.display()),
+        )
+        .unwrap();
+        let out = dir.join("config.json");
+        import(&ini, &out, true).unwrap();
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(settings["password_file"], pw.to_string_lossy().as_ref());
+
+        // A user-saved path survives a re-import untouched.
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"password_file":"/my/own.txt"}"#, // a PATH, not a password - leakcheck-allow-synthetic
+        )
+        .unwrap();
+        import(&ini, &out, true).unwrap();
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(settings["password_file"], "/my/own.txt");
+
+        // A dangling path in the ini is ignored entirely.
+        std::fs::remove_file(dir.join("settings.json")).unwrap();
+        std::fs::remove_file(&pw).unwrap();
+        import(&ini, &out, true).unwrap();
+        assert!(
+            !dir.join("settings.json").exists(),
+            "dangling path must not be adopted"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adopt_recovers_settings_from_backup_and_refuses_an_unreadable_store() {
+        // Codex sweep 3 Aug MH1: a torn settings.json with a good .bak
+        // must never be replaced by a one-key file - the next daemon
+        // start would trust the primary, refresh the .bak from it, and
+        // every other saved setting would be gone for good.
+        let dir = std::env::temp_dir().join(format!("nzbfast-impsab-mh1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pw = dir.join("passwords.txt");
+        std::fs::write(&pw, "secret1\n").unwrap();
+        let ini = dir.join("sabnzbd.ini");
+        std::fs::write(
+            &ini,
+            format!("[misc]\npassword_file = {}\n{INI}", pw.display()),
+        )
+        .unwrap();
+        let out = dir.join("config.json");
+        let settings = dir.join("settings.json");
+
+        // Torn primary, intact backup: adoption must merge into the
+        // BACKUP's keys, not into {}.
+        std::fs::write(&settings, "{\"completed_dir\": \"/mn").unwrap();
+        std::fs::write(
+            dir.join("settings.json.bak"),
+            r#"{"completed_dir": "/mnt/done", "ui_locale": "de"}"#,
+        )
+        .unwrap();
+        import(&ini, &out, true).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+        assert_eq!(doc["completed_dir"], "/mnt/done", "backup keys preserved");
+        assert_eq!(doc["ui_locale"], "de", "backup keys preserved");
+        assert_eq!(doc["password_file"], pw.to_string_lossy().as_ref());
+
+        // Torn primary and NO usable backup: refuse to touch the store
+        // rather than defaulting it to one key.
+        std::fs::write(&settings, "{\"completed_dir\": \"/mn").unwrap();
+        std::fs::remove_file(dir.join("settings.json.bak")).unwrap();
+        let before = std::fs::read(&settings).unwrap();
+        import(&ini, &out, true).unwrap();
+        assert_eq!(
+            std::fs::read(&settings).unwrap(),
+            before,
+            "an unreadable store must be left untouched"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

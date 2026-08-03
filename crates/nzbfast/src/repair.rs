@@ -232,14 +232,17 @@ pub(crate) async fn fetch_volumes(
 /// Reservation ceiling for a recovery-volume side-fetch, the same bound
 /// `main` hands the extractor: a recovery volume cannot legitimately
 /// exceed the whole post, and the yEnc `size=` it declares is a poster-
-/// controlled number that on Linux turns into a real `fallocate`. 0
-/// posted bytes means the NZB carried no byte attributes at all - unknown,
-/// not zero, so no ceiling (matching the `total_bytes() > 0` gate on
-/// `set_prealloc_ceiling`).
+/// controlled number that on Linux turns into a real `fallocate`. The
+/// posted byte count is itself an untrusted attribute (and 0 means the
+/// NZB carried no byte attributes at all - unknown, not zero), so the
+/// post's article GEOMETRY bounds it either way: reserving more space
+/// requires declaring more articles, which the download is then held
+/// accountable for. See [`Nzb::geometry_bytes`].
 pub(crate) fn volume_prealloc_cap(nzb: &Nzb) -> u64 {
+    let geometry = nzb.geometry_bytes();
     match nzb.total_bytes() {
-        0 => u64::MAX,
-        posted => posted,
+        0 => geometry,
+        posted => posted.min(geometry),
     }
 }
 
@@ -506,11 +509,15 @@ mod recovery_volume_tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The ceiling is the NZB's own posted byte count, and 0 posted bytes
-    /// means "the NZB carried no byte attributes" - unknown, not zero. A
-    /// 0 ceiling would reserve nothing for every volume of such a post.
+    /// The ceiling for an NZB without byte attributes (0 posted bytes
+    /// means "unknown", not zero) used to be NO ceiling at all - which
+    /// let a poster omit `bytes=` and reserve the declared yEnc `size=`
+    /// unbounded. The post's article geometry bounds it instead: one
+    /// declared article justifies one article's worth of reservation,
+    /// never a 0 ceiling (which would reserve nothing for every volume
+    /// of such a post).
     #[test]
-    fn an_nzb_without_byte_attributes_gets_no_ceiling() {
+    fn an_nzb_without_byte_attributes_is_bounded_by_its_geometry() {
         let xml = br#"<?xml version="1.0"?>
 <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
  <file subject="set.vol000+01.par2 yEnc (1/1)" date="1700000000">
@@ -520,7 +527,38 @@ mod recovery_volume_tests {
 </nzb>"#;
         let nzb = nzbkit::nzb::Nzb::parse(xml).unwrap();
         assert_eq!(nzb.total_bytes(), 0);
-        assert_eq!(volume_prealloc_cap(&nzb), u64::MAX);
+        assert_eq!(volume_prealloc_cap(&nzb), 16 << 20);
+    }
+
+    /// Codex H3: the posted `bytes=` total is as poster-controlled as
+    /// the yEnc `size=`, so "min(size, posted)" was the attacker picking
+    /// both sides - one tiny article declaring two 100 GB numbers became
+    /// a real fallocate. The article geometry caps it: a single-segment
+    /// post can never justify more than one article's worth.
+    #[test]
+    fn an_inflated_posted_byte_count_is_bounded_by_its_geometry() {
+        let xml = br#"<?xml version="1.0"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+ <file subject="set.vol000+01.par2 yEnc (1/1)" date="1700000000">
+  <groups><group>alt.binaries.test</group></groups>
+  <segments><segment bytes="109951162777600" number="1">a@test</segment></segments>
+ </file>
+</nzb>"#;
+        let nzb = nzbkit::nzb::Nzb::parse(xml).unwrap();
+        assert_eq!(volume_prealloc_cap(&nzb), 16 << 20);
+        // And a genuine posted count under the geometry passes through.
+        let xml2 = br#"<?xml version="1.0"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+ <file subject="set.vol000+01.par2 yEnc (1/2)" date="1700000000">
+  <groups><group>alt.binaries.test</group></groups>
+  <segments>
+   <segment bytes="750000" number="1">a@test</segment>
+   <segment bytes="750000" number="2">b@test</segment>
+  </segments>
+ </file>
+</nzb>"#;
+        let nzb2 = nzbkit::nzb::Nzb::parse(xml2).unwrap();
+        assert_eq!(volume_prealloc_cap(&nzb2), 1_500_000);
     }
 
     /// BUG (LOW): the writer was created with `.expect("create recovery

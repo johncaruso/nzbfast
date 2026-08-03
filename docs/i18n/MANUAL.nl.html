@@ -348,7 +348,11 @@ staat.</p>
 <li><b>Sleep rijen om te herordenen</b> (binnen een prioriteitsband - Geforceerd/Hoog
 gaat nog steeds voor); wijzig de prioriteit inline.</li>
 <li><b>Klik op een rij</b> voor de detail-lade: voortgangsbalken per bestand, aantallen
-geverifieerde blokken, en welke server hoeveel aan <em>deze</em> taak bijdroeg.</li>
+geverifieerde blokken, welke server hoeveel aan <em>deze</em> taak bijdroeg, en een
+regel "toegevoegd door" die zegt waar de taak vandaan kwam (watchmap, een gekoppelde
+app, de API…). Een knop <b>Download de .nzb</b> slaat het <code>.nzb</code>-bestand
+van de taak voor je op - nzbfast bewaart een eigen kopie, dus dit werkt voor elke
+taak, ook als het originele bestand allang weg is.</li>
 <li>Badges tonen bijzondere toestanden: <i>uitgesteld (traag)</i>, <i>prefetchen</i>,
 <i>gepauzeerd</i> (zie <a href="#performance">Prestatietools</a>).</li>
 <li>Een burn-down-grafiek volgt het totaal aan resterende GB in de wachtrij.</li>
@@ -367,7 +371,10 @@ kwaliteitsvoorkeuren en upgraderegels (een betere versie vervangt een slechtere)
 proberen</b> (gaat verder vanuit het journal). Versleutelde archieven tonen een
 🔑-ontgrendelknop - voer het wachtwoord in en de taak maakt zichzelf ter plekke af. De
 verificatiegezondheidsstrook zet beschadigde PAR2-blokken per download uit - een
-oplopende staart betekent dat artikelen beschadigd binnenkomen.</p>
+oplopende staart betekent dat artikelen beschadigd binnenkomen.
+De lade van elke regel zegt wie de taak toevoegde en heeft dezelfde knop
+<b>Download de .nzb</b> als de wachtrij - handig om een release ergens anders opnieuw
+te downloaden, of om de <code>.nzb</code> bij een probleemmelding te voegen.</p>
 <p>De kaart toont standaard tien downloads en de rest is één klik weg, via de knop ▤. Status, locatie en de reden van een mislukking zitten achter een klik op de regel zelf, zodat het gewone geval - wat klaar is, hoe groot, wanneer - leesbaar blijft zonder scrollen. Sleep in plaats daarvan de onderrand van de kaart om de lijst op een door jou gekozen hoogte te laten scrollen. <b>History rows</b> in Instellingen → Interface verandert die tien; omdat het een eigenschap van de daemon is en niet van je browser, geldt het voor elk apparaat dat naar deze installatie kijkt. <b>Colour History names</b> daarnaast kleurt voltooide namen groen en mislukte rood; uitgezet blijven de namen neutraal, en de gekleurde stip en de details van de regel zeggen nog steeds welke welke is.</p>
 <h3 id="dash-usage">Dataverbruik</h3>
 <p>Dagelijkse balken per provider en totalen voor Vandaag / 7 dagen / 30 dagen -
@@ -382,7 +389,10 @@ in <a href="#performance">Prestatietools</a>.</p>
 <tr><th>Methode</th><th>Hoe</th></tr>
 <tr><td><b>Slepen &amp; neerzetten</b></td><td>Sleep één of meer <code>.nzb</code>-bestanden waar dan ook op het dashboard.</td></tr>
 <tr><td><b>Watchmap</b></td><td>Stel een map in bij Instellingen; elke <code>.nzb</code> die je erin
-opslaat wordt binnen 5 seconden opgepikt en het bestand verwijderd. Zet de downloadmap
+opslaat wordt binnen 5 seconden opgepikt en naar de prullenbak verplaatst, en een open
+dashboard meldt elke oppak op naam ("… opgepikt uit Downloads"), zodat een bestand dat
+uit de map verdwijnt nooit een raadsel is. Houd je je bestanden liever? Zet
+<b>.nzb-bestanden na oppakken bewaren</b> aan (zie <a href="#settings">§9</a>). Zet de downloadmap
 van je browser erop voor één-klik-grabs vanaf indexersites.</td></tr>
 <tr><td><b>Vanaf een URL</b></td><td>Plak een NZB-link (API <code>mode=addurl</code>, of via elke gekoppelde app).</td></tr>
 <tr><td><b>nzblnk:-links</b></td><td>Plak een <code>nzblnk:</code>-link ergens op het dashboard, of sleep hem erin. Heb je geïnstalleerd vanaf de macOS-DMG of het Windows-installatieprogramma, dan kun je er ook rechtstreeks een aanklikken op een board. Zie <a href="#nzblnk">nzblnk-links</a> hieronder.</td></tr>
@@ -596,13 +606,15 @@ interface winnen van opties op de opdrachtregel).</p>
 uitgelezen. De standaardwaarden zijn goed voor de meeste lijnen; gebruik de tuningtools
 voordat je blind verhoogt.</p>
 
-<p><b>Snelle verificatie (CRC32)</b> (standaard aan) claimt PAR2-blokken via CRC32
-terwijl de download nog loopt, wat 2-3x sneller is op een trage CPU. De eigen
-controlesom van elk artikel wordt nog steeds gecontroleerd, en de afsluitende ronde
-gebruikt altijd volledige MD5: aan correctheid wordt niets ingeleverd. Vink uit om ook
-tijdens de download MD5 per blok te doen.</p>
+<p><b>Controle tijdens het downloaden</b> kiest hoeveel er wordt gecontroleerd terwijl de
+gegevens binnenkomen. <i>Volledig</i> bevestigt elk PAR2-blok met MD5. <i>Snel</i> (de
+standaard) claimt blokken via CRC32, wat 2-3x sneller is op een trage CPU, en
+controleert nog steeds de eigen controlesom van elk artikel. <i>Zuinig</i> slaat die
+artikelcontrolesommen ook over zodra PAR2 een bestand dekt: schade komt dan een moment
+later boven, bij het blok. In alle drie gebruiken de afsluitende ronde en elke reparatie
+volledige MD5, en een download zonder PAR2-bestanden houdt zijn artikelcontrolesommen.</p>
 <h3>Schijf &amp; quotum <span class="pill live">live</span></h3>
-<p><b>Minimale vrije ruimte</b> (pauzeer nieuwe taken eronder), <b>downloadquotum</b>
+<p><b>Minimale vrije ruimte</b> (pauzeer nieuwe taken eronder; standaard 2 GB, 0 schakelt het uit), <b>downloadquotum</b>
 per dag of maand (UTC; taken met Geforceerd negeren het), <b>geheugenlimiet</b> - het
 RAM-budget van de engine (standaard: ¼ van het RAM, begrensd; verhoog hem op een
 machine met veel RAM voor maximale snelheid bij enorme taken, en zie
@@ -649,12 +661,40 @@ wachtwoord wacht. Beide verwijderstappen gelden <em>alleen</em> voor releases di
 film of serie zijn herkend: een softwarepayload of een niet te classificeren
 (versluierde) set wordt nooit opgeruimd.</p>
 
+<p><b>Verwijderde bestanden gaan naar de Prullenbak</b> bepaalt wat "verwijderen"
+hierboven betekent. Staat het aan, dan verplaatst het opruimen bestanden naar de
+Prullenbak van het systeem, zodat een verkeerde inschatting van wat rommel was
+ongedaan te maken is; staat het uit, dan worden ze definitief verwijderd. Het
+staat <b>standaard aan op macOS en Windows</b>, waar de Prullenbak een plek is die
+je kunt zien en legen, en <b>standaard uit op Linux</b>, waar dat meestal niet zo
+is.</p>
+<div class="note"><b>Op een NAS of in een container: laat dit uit.</b> Wanneer je
+downloads op een andere schijf staan dan je thuismap - de normale opstelling op
+Unraid, Synology, een seedbox of elke Docker-installatie met een gekoppelde share
+ - gebruiken de Linux-prullenbakregels helemaal geen bureaublad-Prullenbak. Ze
+maken een verborgen map <code>.Trash-1000</code> aan (het getal is je gebruikers-id)
+bovenaan de downloadschijf en verplaatsen de bestanden daarheen. Niets laat je
+die map zien, niets leegt hem, en de ruimte die hij vasthoudt komt nooit terug.
+<p>Heb je een eerdere versie van nzbfast op Linux met deze optie aan gedraaid,
+zoek die map dan in de root van je downloadshare. Je kunt hem veilig legen: alles
+erin is een bestand waarvan het opruimen al had besloten dat je het niet wilde.
+nzbfast leegt hem niet voor je, want hij staat op jouw schijf en het oordeel is
+aan jou.</p></div>
+
 <h3>Mappen &amp; nabewerking</h3>
 <p><b>Downloadmap</b> <span class="pill restart">herstart</span>, <b>watchmap</b>,
 <b>nabewerkingsscript</b> (draait na elke taak met SABnzbd-compatibele argumenten en
 <code>SAB_*</code>-omgeving - bestaande SAB-scripts werken ongewijzigd),
 <b>opruimextensies</b> (rommelbestanden die na voltooiing worden verwijderd), <b>Slimme mappen</b>
 en <b>tv-opbergen</b> (zie <a href="#automation">§10</a>).</p>
+<p><b>.nzb-bestanden na oppakken bewaren</b> (staat standaard uit) laat het originele
+<code>.nzb</code>-bestand in de watchmap staan nadat de taak in de wachtrij is gezet,
+in plaats van het naar de prullenbak te verplaatsen - voor verzamelaars, en om het
+bestand aan iemand te geven als een download misgaat. Een bewaard bestand wordt
+onthouden, ook na een herstart, en wordt niet opnieuw toegevoegd; sla het opnieuw op
+om het nogmaals te downloaden. Wat je ook kiest, de lade van elke taak heeft een knop
+<b>Download de .nzb</b>, zodat een kopie van de <code>.nzb</code> van elke taak nooit
+meer dan één klik weg is.</p>
 
 <h3>Indexeren <span class="pill live">live</span></h3>
 <div class="note"><b>De ingebouwde indexer staat standaard uit.</b> Hij vindt posts die
@@ -698,14 +738,15 @@ snelheid in het dashboard wordt getoond: megabytes (MB/s, de norm bij
 downloadmanagers, de standaard) of megabits (Mb/s, zoals providers lijnen opgeven).
 Bestandsgroottes blijven in bytes. Dit is een eigenschap van de daemon, niet van je
 browser, dus het geldt voor elk apparaat dat naar deze installatie kijkt.</p>
-<h3>Geavanceerd: instellingen zonder bediening in het dashboard</h3>
-<p>Zes instellingen hebben geen bediening in de interface en geen optie op de
-opdrachtregel. Zet ze via de API (<a href="#api">§16</a>), bijv.
+<h3>Geavanceerd: de knoppen achter de voor de hand liggende</h3>
+<p>Zes instellingen zonder optie op de opdrachtregel. Elk heeft nu een geavanceerde regel
+op de instellingenkaart waar hij bij hoort, en blijft via de API te zetten
+(<a href="#api">§16</a>), bijv.
 <code>/api?mode=config&amp;name=verify_mode&amp;value=lean&amp;apikey=…</code>. Net als
 alle andere worden ze bewaard in <code>settings.json</code>.</p>
 <div class="tblwrap"><table>
 <tr><th>Naam</th><th>Wat het doet</th></tr>
-<tr><td><code>verify_mode</code></td><td><code>full</code> | <code>fast</code> | <code>lean</code> (standaard <code>fast</code>). <code>lean</code> is de duw voor trage CPU's: als fast, maar slaat daarnaast de yEnc-CRC per artikel over zodra PAR2 een bestand dekt, wat één CRC32-laag oplevert in plaats van twee. Downloads zonder PAR2 houden hun artikel-CRC's, en de verificatie en reparatie aan het eind van de taak veranderen in geen geval. De <b>Snelle verificatie</b> hierboven is dezelfde bediening voor full tegenover fast.</td></tr>
+<tr><td><code>verify_mode</code></td><td><code>full</code> | <code>fast</code> | <code>lean</code> (standaard <code>fast</code>). <code>lean</code> is de duw voor trage CPU's: als fast, maar slaat daarnaast de yEnc-CRC per artikel over zodra PAR2 een bestand dekt, wat één CRC32-laag oplevert in plaats van twee. Downloads zonder PAR2 houden hun artikel-CRC's, en de verificatie en reparatie aan het eind van de taak veranderen in geen geval. De keuze <b>Controle tijdens het downloaden</b> hierboven is deze instelling.</td></tr>
 <tr><td><code>auto_retry_mins</code></td><td>Wachttijd vóór de <em>ene</em> automatische nieuwe poging die een eerste mislukking met ontbrekende artikelen krijgt (standaard 20). Propagatievertraging is een echte oorzaak van ontbrekende artikelen en lost zichzelf op; dankzij het journaal haalt de herhaling alleen op wat nog ontbreekt. Mislukkingen door wachtwoord of takedown komen nooit in aanmerking.</td></tr>
 <tr><td><code>index_scan_par</code></td><td>Hoeveel groepen de indexeerder parallel scant (standaard 3, begrensd op 1-8).</td></tr>
 <tr><td><code>oracle_sample</code></td><td>STAT-budget in rust van het beschikbaarheidsorakel (<a href="#oracle">§13</a>), peilingen per uur per server. Standaard 300, maximaal 3600, <code>0</code> schakelt het bemonsteren helemaal uit.</td></tr>
@@ -994,7 +1035,7 @@ de <b>API-sleutel</b> (volledige controle) en de <b>NZB-sleutel</b> (alleen toev
 <div class="tblwrap"><table>
 <tr><th>Gebied</th><th>Modes</th></tr>
 <tr><td>Wachtrij</td><td><code>queue</code> (met <code>name=delete/pause/resume/priority/switch</code>), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>addnzblnk</code>, <code>retry</code>, <code>set_password</code></td></tr>
-<tr><td>Info</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code></td></tr>
+<tr><td>Info</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code>, plus <code>/jobnzb/&lt;nzo_id&gt;</code> (de eigen gespoolde <code>.nzb</code> van de taak weer naar buiten, wachtrij of geschiedenis; alleen met de volledige API-sleutel)</td></tr>
 <tr><td>Config</td><td><code>get_config</code>, <code>config&amp;name=&lt;setting&gt;&amp;value=…</code> (elk veld uit Instellingen), <code>server_save/delete/test/enable/reorder</code>, <code>import_probe/apply</code></td></tr>
 <tr><td>Index &amp; wall</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, plus newznab op <code>/api?t=caps|search|tvsearch|movie</code> en <code>/getnzb/&lt;id&gt;</code></td></tr>
 <tr><td>Automatisering</td><td><code>watchlist</code>, <code>watchlist_check_now</code>, <code>watch_calendar</code>, <code>feeds</code>, <code>smart_folders</code>, <code>schedule</code></td></tr>

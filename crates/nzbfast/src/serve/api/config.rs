@@ -62,9 +62,7 @@ pub(in crate::serve) fn dispatch(
             if req.method() != &tiny_http::Method::Post {
                 json!({"status": false, "error": "POST required"})
             } else {
-                let raw = api_body
-                    .take()
-                    .unwrap_or_else(|| read_body_capped(req.as_reader(), 8 << 20));
+                let raw = api_body.take().unwrap_or_default();
                 let parsed = serde_json::from_slice::<Value>(&raw).ok();
                 let bundle = parsed.as_ref().and_then(|v| {
                     if v.get("nzbfast_backup").is_some() {
@@ -355,7 +353,7 @@ pub(in crate::serve) fn dispatch(
             // POST body; the GET form stays for the documented
             // SAB-compatible `mode=config` parity.
             let posted = if req.method() == &tiny_http::Method::Post {
-                let raw = read_body_capped(req.as_reader(), 1 << 20);
+                let raw = api_body.take().unwrap_or_default();
                 serde_json::from_slice::<Value>(&raw).ok()
             } else {
                 None
@@ -406,7 +404,15 @@ pub(in crate::serve) fn dispatch(
                                 " (NOT SAVED - reverts on restart)"
                             }
                         );
-                        json!({"status": true, "live": live, "saved": saved})
+                        // The path, but only when the write FAILED: "it
+                        // could not be written to disk" is not actionable
+                        // without knowing which disk. On the success path
+                        // it would just be the daemon volunteering its
+                        // filesystem layout to every API caller.
+                        json!({"status": true, "live": live, "saved": saved,
+                        "path": if saved { Value::Null } else {
+                            json!(d.settings_path.to_string_lossy())
+                        }})
                     }
                     Err(e) => json!({"status": false, "error": e}),
                 },
@@ -495,6 +501,32 @@ pub(in crate::serve) fn dispatch(
                             )
                         })
                         .collect();
+                    // Both competitors also name an archive-passwords
+                    // file (SAB `[misc] password_file`, NZBGet
+                    // `UnpackPassFile`). Importing their setup imports
+                    // that too - but only while OUR file is still
+                    // empty, so a list the user already curated here is
+                    // never abandoned by a re-import.
+                    let pw_adopted = {
+                        let key_val = if kind == "sabnzbd" || path.ends_with(".ini") {
+                            crate::import_sab::sab_ini_value(&text, "password_file")
+                        } else {
+                            crate::import_sab::nzbget_conf_value(&text, "UnpackPassFile")
+                        };
+                        key_val
+                            .filter(|p| std::path::Path::new(p).is_file())
+                            .filter(|_| d.read_unpack_passwords().is_empty())
+                            .and_then(|p| match apply_and_save(d, "password_file", &p) {
+                                Ok(_) => {
+                                    info!(target: "import", "adopted archive passwords file {p}");
+                                    Some(p)
+                                }
+                                Err(e) => {
+                                    warn!(target: "import", "could not adopt passwords file {p}: {e}");
+                                    None
+                                }
+                            })
+                    };
                     let (mut added, mut skipped) = (0, 0);
                     for s in incoming {
                         let key = (
@@ -511,7 +543,8 @@ pub(in crate::serve) fn dispatch(
                         }
                     }
                     if added == 0 {
-                        json!({"status": true, "added": 0, "skipped": skipped})
+                        json!({"status": true, "added": 0, "skipped": skipped,
+                               "password_file": pw_adopted})
                     } else {
                         match crate::setup::write_servers(ctx.cfg_path, &servers) {
                             Ok(()) => {
@@ -519,7 +552,8 @@ pub(in crate::serve) fn dispatch(
                                     target: "import",
                                     "{added} server(s) from {path} ({skipped} already present)"
                                 );
-                                json!({"status": true, "added": added, "skipped": skipped})
+                                json!({"status": true, "added": added, "skipped": skipped,
+                                       "password_file": pw_adopted})
                             }
                             Err(e) => json!({"status": false, "error": e.to_string()}),
                         }

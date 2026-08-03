@@ -11,7 +11,14 @@ cd "$(dirname "$0")"
 REPO="$(cd .. && pwd)"
 
 VERSION=$(grep '^version' "$REPO/crates/nzbfast/Cargo.toml" | head -1 | cut -d'"' -f2)
-echo "== NzbFast.app v$VERSION"
+# Beta serial rides into Info.plist so the wrapper can compare its
+# BUNDLED engine against a running one at attach time (the §98 upgrade
+# restart). Same source and same "0/missing = release" rule as the
+# engine's own build.rs - the two must agree or the wrapper would
+# restart an engine identical to its bundle.
+BETA=$(cat "$REPO/packaging/beta-serial.txt" 2>/dev/null | tr -d '[:space:]')
+case "$BETA" in ''|*[!0-9]*) BETA=0 ;; esac
+echo "== NzbFast.app v$VERSION (beta serial $BETA)"
 
 # --- engine: universal binary via the release lipo recipe -------------
 if [ -z "${ENGINE:-}" ]; then
@@ -62,6 +69,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>$VERSION</string>
+  <key>NzbFastBetaSerial</key><string>$BETA</string>
   <key>CFBundleIconFile</key><string>NzbFast</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>

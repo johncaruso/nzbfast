@@ -57,10 +57,13 @@ store_path = vol / ".DS_Store"
 with DSStore.open(str(store_path), "w+") as d:
     d["."]["bwsp"] = bwsp
     d["."]["icvp"] = icvp
-    # Icon centers, y from the top. The two protagonists sit on the
-    # arrow line; housekeeping entries are parked far below the window.
-    d["NzbFast.app"]["Iloc"] = (165, 185)
-    d["Applications"]["Iloc"] = (495, 185)
+    # Icon centers, y from the top, matching the layout contract noted
+    # in dmg-background.svg: the two protagonists sit on the arrow line,
+    # the install guide sits beside step panel 4 ("Full guide ->"), and
+    # housekeeping entries are parked far below the window.
+    d["NzbFast.app"]["Iloc"] = (165, 165)
+    d["Applications"]["Iloc"] = (495, 165)
+    d["How to install.html"]["Iloc"] = (585, 322)
     for hidden in (".background", ".extras", ".VolumeIcon.icns", ".fseventsd"):
         d[hidden]["Iloc"] = (330, 700)
 

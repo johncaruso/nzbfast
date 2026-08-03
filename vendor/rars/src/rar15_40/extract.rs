@@ -317,6 +317,38 @@ pub fn extract_volumes_to<F>(
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
+    extract_volumes_to_impl(volumes, options, &mut open, None)
+}
+
+/// [`extract_volumes_to`] reporting each volume the engine is finished
+/// with - the RAR4 twin of
+/// [`crate::rar50::extract_volumes_to_with_progress`], with the same
+/// contract: `consumed(volume_index)` means "no read will ever touch
+/// that volume again", indices arrive in increasing order, and nothing
+/// is reported while a split member is pending (its Finish reads every
+/// fragment back).
+pub fn extract_volumes_to_with_progress<F, C>(
+    volumes: &[Archive],
+    options: crate::ArchiveReadOptions<'_>,
+    mut open: F,
+    mut consumed: C,
+) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    C: FnMut(usize),
+{
+    extract_volumes_to_impl(volumes, options, &mut open, Some(&mut consumed))
+}
+
+fn extract_volumes_to_impl<F>(
+    volumes: &[Archive],
+    options: crate::ArchiveReadOptions<'_>,
+    open: &mut F,
+    mut consumed: Option<&mut dyn FnMut(usize)>,
+) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+{
     if volumes.is_empty() {
         return Err(Error::InvalidHeader("RAR 1.5 volume set is empty"));
     }
@@ -329,6 +361,9 @@ where
             .is_some_and(|archive| archive.main.is_solid()),
         password,
     );
+    // Volumes already reported consumed, so the catch-up after a split
+    // member releases the whole backlog in order.
+    let mut reported = 0usize;
     for (volume_index, archive) in volumes.iter().enumerate() {
         for (file_index, file) in archive.files().enumerate() {
             match split.advance(file.is_split_before(), file.is_split_after()) {
@@ -359,7 +394,7 @@ where
                 SplitVolumeStep::Finish(mut completed) => {
                     validate_split_continuation_refs(&completed, file, password)?;
                     completed.append(file, volume_index, file_index);
-                    completed.write_to(volumes, file, password, &mut session, &mut open)?;
+                    completed.write_to(volumes, file, password, &mut session, &mut *open)?;
                 }
                 SplitVolumeStep::MissingFirst => {
                     return Err(Error::InvalidHeader(
@@ -370,6 +405,16 @@ where
                     return Err(Error::InvalidHeader(
                         "RAR 1.5 split entry is interrupted by a regular entry",
                     ));
+                }
+            }
+        }
+        // Walked out of this volume - see the rar50 twin for why a
+        // pending split holds the report back.
+        if !split.is_pending() {
+            if let Some(consumed) = consumed.as_mut() {
+                while reported <= volume_index {
+                    consumed(reported);
+                    reported += 1;
                 }
             }
         }

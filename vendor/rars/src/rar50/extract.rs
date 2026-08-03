@@ -1369,7 +1369,54 @@ pub fn extract_volumes_to<F>(
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
-    extract_volumes_to_impl(volumes, options, &mut open, &mut |_, _| Ok(()), false)
+    extract_volumes_to_impl(volumes, options, &mut open, &mut |_, _| Ok(()), false, None)
+}
+
+/// [`extract_volumes_to`] reporting each volume the engine is finished
+/// with - the WHOLE-SET twin of
+/// [`extract_volume_sequence_to_with_progress`], for a set that is
+/// already materialized rather than one still arriving.
+///
+/// `consumed(volume_index)` says "no read will ever touch
+/// `volumes[volume_index]` again", and the indices arrive in increasing
+/// order. A caller holding the volumes on DISK uses this to delete each
+/// one the moment it is spent, so a set extracts without ever holding
+/// the volumes and the extracted payload at once.
+///
+/// Two things make the report safe to act on destructively:
+///
+/// - **The walk runs strictly forward.** Members are visited volume by
+///   volume, and a member's packed bytes live in the volume that
+///   declares it. Solid members change nothing: the window carries
+///   across members in RAM, the packed bytes are still read once, in
+///   order.
+/// - **A split member is the one thing that reads backwards**, at its
+///   Finish fragment, which pulls every fragment from the volumes it
+///   spanned. So nothing is reported while a split is pending; the
+///   backlog is released once the Finish has run.
+///
+/// Arming this DISABLES the parallel member pool. That plan decodes
+/// independent members across the whole set concurrently, which is
+/// exactly the out-of-order reading the watermark promises does not
+/// happen. The serial walk is what makes the promise true.
+pub fn extract_volumes_to_with_progress<F, C>(
+    volumes: &[Archive],
+    options: crate::ArchiveReadOptions<'_>,
+    mut open: F,
+    mut consumed: C,
+) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    C: FnMut(usize),
+{
+    extract_volumes_to_impl(
+        volumes,
+        options,
+        &mut open,
+        &mut |_, _| Ok(()),
+        false,
+        Some(&mut consumed),
+    )
 }
 
 pub fn extract_volumes_to_with_redirections<F, R>(
@@ -1382,7 +1429,7 @@ where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
 {
-    extract_volumes_to_impl(volumes, options, &mut open, &mut redirect, true)
+    extract_volumes_to_impl(volumes, options, &mut open, &mut redirect, true, None)
 }
 
 fn extract_volumes_to_impl<F, R>(
@@ -1391,6 +1438,7 @@ fn extract_volumes_to_impl<F, R>(
     open: &mut F,
     redirect: &mut R,
     emit_redirections: bool,
+    mut consumed: Option<&mut dyn FnMut(usize)>,
 ) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -1403,9 +1451,23 @@ where
     // Non-solid sets with several small compressed members decode them on a
     // worker pool (members are independent; unrar streams sequentially and
     // cannot). Writers and callbacks stay on this thread in archive order.
+    //
+    // Never under a consumption watermark: the pool reads members across
+    // the whole set at once, so "the walk has left volume N" would stop
+    // being true the moment a worker is still inside it. A caller that
+    // asked for the watermark asked for the serial walk.
     #[cfg(feature = "parallel")]
-    if let Some(plan) = member_pool_plan(volumes, options) {
-        return extract_volumes_pooled(volumes, options, open, redirect, emit_redirections, plan);
+    if consumed.is_none() {
+        if let Some(plan) = member_pool_plan(volumes, options) {
+            return extract_volumes_pooled(
+                volumes,
+                options,
+                open,
+                redirect,
+                emit_redirections,
+                plan,
+            );
+        }
     }
 
     let password = options.password;
@@ -1419,8 +1481,14 @@ where
     .with_policy(rar50_execution_policy(options));
     // Solid archives: a run of chainable members decodes as ONE stream
     // through the MT pipeline instead of member-by-member on one thread.
+    // Safe under a watermark, unlike the member pool above: a chain is
+    // collected from the claiming member FORWARD and its members are
+    // never split, so it reads ahead and never back.
     #[cfg(feature = "parallel")]
     let mut chain = SolidChainDriver::new();
+    // Volumes already reported consumed, so the catch-up after a split
+    // member releases the whole backlog in order.
+    let mut reported = 0usize;
 
     for (volume_index, archive) in volumes.iter().enumerate() {
         for (file_index, file) in archive.files().enumerate() {
@@ -1471,6 +1539,17 @@ where
                     return Err(Error::InvalidHeader(
                         "RAR 5 split entry is interrupted by a regular entry",
                     ));
+                }
+            }
+        }
+        // This volume is walked out. Report it - and every one still held
+        // back behind a split that has since finished - unless a split is
+        // pending right now, whose Finish will read those fragments back.
+        if !split.is_pending() {
+            if let Some(consumed) = consumed.as_mut() {
+                while reported <= volume_index {
+                    consumed(reported);
+                    reported += 1;
                 }
             }
         }

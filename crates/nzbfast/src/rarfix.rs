@@ -344,6 +344,12 @@ pub(crate) fn remove_spent_volumes(vols: &[PathBuf]) {
     for p in vols {
         match std::fs::remove_file(p) {
             Ok(()) => removed += 1,
+            // Already gone is not a failure to report. §101's eating mode
+            // deletes each volume mid-extraction, so this sweep - which
+            // runs afterwards over the same list - would otherwise print
+            // one "could not remove" warning per volume for a job that
+            // did exactly what it was told.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => println!("⚠ could not remove spent volume {}: {e}", p.display()),
         }
     }
@@ -1020,7 +1026,10 @@ pub(crate) fn try_rars_native(
         .map(|path| parse.read_path(path))
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| anyhow::anyhow!("parsing volumes: {e}"))?;
-    write_archives_to(dir, &archives, password)?;
+    // `volumes` and `archives` are the same set in the same order, which
+    // is what lets §101's eating mode delete each volume as the extractor
+    // finishes with it.
+    write_archives_to_spending(dir, &archives, password, &volumes)?;
     Ok(volumes)
 }
 
@@ -1037,6 +1046,28 @@ pub(crate) fn write_archives_to(
     archives: &[rars::Archive],
     password: Option<&str>,
 ) -> Result<()> {
+    write_archives_to_spending(dir, archives, password, &[])
+}
+
+/// [`write_archives_to`] that also knows which FILE each archive was
+/// parsed from, so a job running under TODO 101's volume-eating mode can
+/// delete each one the moment the extractor is finished with it.
+///
+/// `sources[i]` must be the path `archives[i]` was read from; hand `&[]`
+/// when the mapping is not known and the eating path is skipped entirely.
+/// Eating additionally requires [`crate::eatvol::armed`] - the per-job
+/// arming the daemon does once all of §101's gates have passed - so this
+/// is inert for every ordinary unpack.
+pub(crate) fn write_archives_to_spending(
+    dir: &std::path::Path,
+    archives: &[rars::Archive],
+    password: Option<&str>,
+    sources: &[PathBuf],
+) -> Result<()> {
+    // Eating needs a source path for EVERY archive: a partial mapping
+    // would delete some volumes and keep others, which is the worst of
+    // both (space not really freed, retry-without-refetch already lost).
+    let eating = crate::eatvol::armed() && !sources.is_empty() && sources.len() == archives.len();
     // Decompression-bomb guard: bound total extracted bytes at the target
     // filesystem's free space minus a reserve, so a crafted archive that
     // unpacks to far more than it downloaded (a store-mode "zip bomb")
@@ -1045,14 +1076,25 @@ pub(crate) fn write_archives_to(
     // every platform we ship - windows included, since GetDiskFreeSpaceExW
     // landed; before that free_bytes was None there and this guard silently
     // did nothing.
+    //
+    // Under eating, the volume bytes count as free: they are about to be
+    // handed back one file at a time, and that is the entire point of the
+    // mode. Without this the guard reads the disk as it stands at the
+    // FIRST byte - which on a job that armed `low_disk` is nearly full by
+    // definition - and kills the extraction the mode exists to rescue.
+    let freed = if eating {
+        crate::eatvol::volume_bytes(sources)
+    } else {
+        0
+    };
     let budget = crate::serve::free_bytes(dir)
-        .map(|free| free.saturating_sub(EXTRACT_RESERVE))
+        .map(|free| free.saturating_add(freed).saturating_sub(EXTRACT_RESERVE))
         .unwrap_or(u64::MAX);
     let written = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let staging = ExtractStaging::new(dir)?;
     let stage_dir = staging.path().to_path_buf();
-    rars::extract_volumes_to(archives, password.map(str::as_bytes), move |meta| {
+    let open = move |meta: &rars::ExtractedEntryMeta| {
         let target = sanitized_entry_path(&stage_dir, &meta.name_lossy()).ok_or_else(|| {
             rars::Error::from(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1072,8 +1114,50 @@ pub(crate) fn write_archives_to(
             written: written.clone(),
             budget,
         }) as Box<dyn std::io::Write>)
-    })
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    };
+    if eating {
+        println!(
+            "unpacking {} volume(s), deleting each as it is used up…",
+            sources.len()
+        );
+        let mut eaten = 0usize;
+        let mut bytes = 0u64;
+        // A HARD delete, deliberately not the trash-aware helper: the
+        // whole promise of the mode is that the space comes back this
+        // instant, and a Trash on the same filesystem gives back nothing.
+        // The callback is only ever reached for a volume rars has
+        // finished reading - see the guarantees on
+        // `extract_volumes_to_with_progress`.
+        let consumed = |i: usize| {
+            let Some(path) = sources.get(i) else { return };
+            let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            match std::fs::remove_file(path) {
+                Ok(()) => {
+                    eaten += 1;
+                    bytes = bytes.saturating_add(size);
+                }
+                // Not fatal: extraction has already read this volume, so
+                // a file we cannot remove costs space, not correctness.
+                Err(e) => println!("⚠ could not remove spent volume {}: {e}", path.display()),
+            }
+        };
+        let result = rars::extract_volumes_to_with_progress(
+            archives,
+            rars::ArchiveReadOptions::with_optional_password(password.map(str::as_bytes)),
+            open,
+            consumed,
+        );
+        if eaten > 0 {
+            println!(
+                "  freed {eaten} spent volume(s) during extraction ({:.1} GB)",
+                bytes as f64 / 1e9
+            );
+        }
+        result.map_err(|e| anyhow::anyhow!("{e}"))?;
+    } else {
+        rars::extract_volumes_to(archives, password.map(str::as_bytes), open)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
     staging.publish_into(dir)
 }
 
@@ -1832,6 +1916,138 @@ mod native_unrar_tests {
         assert!(try_unrar(&dir, None));
         let extracted = std::fs::read(dir.join("inner").join("data.bin")).unwrap();
         assert_eq!(extracted, payload);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A compressed, split, multivolume RAR5 set on disk - the shape
+    /// TODO 101 exists for. Returns the volume paths in set order.
+    fn write_multivolume_set(dir: &std::path::Path, payload: &[u8]) -> Vec<PathBuf> {
+        use rars::rar50::{CompressedEntry, Rar50VolumeWriter, WriterOptions};
+        let entries = [CompressedEntry {
+            name: b"inner/data.bin",
+            data: payload,
+            mtime: None,
+            attributes: 0o100644,
+            host_os: 1,
+        }];
+        let volumes = Rar50VolumeWriter::new(WriterOptions::default())
+            .compressed_entries(&entries)
+            .max_payload_per_volume(64 * 1024)
+            .finish()
+            .unwrap();
+        assert!(volumes.len() > 1, "expected a multivolume set");
+        volumes
+            .iter()
+            .enumerate()
+            .map(|(index, bytes)| {
+                let p = dir.join(format!("set.part{:02}.rar", index + 1));
+                std::fs::write(&p, bytes).unwrap();
+                p
+            })
+            .collect()
+    }
+
+    /// TODO 101: with eating armed, a verified set extracts correctly AND
+    /// leaves no volume behind - the deletions happen DURING extraction,
+    /// which is what makes the peak one volume rather than two whole
+    /// copies. The payload check is the half that matters: a mode that
+    /// frees space by breaking the extraction would pass a "the volumes
+    /// are gone" assertion on its own.
+    #[test]
+    fn eating_extracts_the_payload_and_leaves_no_volume_behind() {
+        let dir = temp_dir("eat-volumes");
+        let payload: Vec<u8> = (0..200_000u32)
+            .flat_map(|i| (i.wrapping_mul(2654435761)).to_le_bytes())
+            .collect();
+        let volumes = write_multivolume_set(&dir, &payload);
+
+        let _arm = crate::eatvol::EatArm::new(
+            crate::eatvol::decide(
+                crate::eatvol::EatMode::Always,
+                true,
+                false,
+                crate::eatvol::forecast(&dir, crate::eatvol::volume_bytes(&volumes), false),
+            )
+            .eats(),
+        );
+        assert!(try_unrar(&dir, None));
+
+        let extracted = std::fs::read(dir.join("inner").join("data.bin")).unwrap();
+        assert_eq!(extracted, payload, "the payload must survive the eating");
+        for v in &volumes {
+            assert!(!v.exists(), "{} outlived the extraction", v.display());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The gate that matters most: an UNVERIFIED set is never eaten,
+    /// whatever the mode says - so a retry still has the volumes and
+    /// re-downloads nothing. Driven through `decide` rather than by
+    /// hand-setting the arm, because the composition of the two is the
+    /// thing that could regress.
+    #[test]
+    fn an_unverified_set_keeps_every_volume() {
+        let dir = temp_dir("eat-unverified");
+        let payload: Vec<u8> = (0..120_000u32)
+            .flat_map(|i| (i.wrapping_mul(2246822519)).to_le_bytes())
+            .collect();
+        let volumes = write_multivolume_set(&dir, &payload);
+
+        let _arm = crate::eatvol::EatArm::new(
+            crate::eatvol::decide(
+                // `always` plus a disk with nothing on it - every reason
+                // to eat except the one that counts.
+                crate::eatvol::EatMode::Always,
+                false,
+                true,
+                crate::eatvol::Forecast {
+                    free: 0,
+                    volumes: crate::eatvol::volume_bytes(&volumes),
+                    encrypted: true,
+                },
+            )
+            .eats(),
+        );
+        assert!(try_unrar(&dir, None));
+
+        assert_eq!(
+            std::fs::read(dir.join("inner").join("data.bin")).unwrap(),
+            payload
+        );
+        for v in &volumes {
+            assert!(v.exists(), "{} was eaten unverified", v.display());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Off is off. The same set, the same tight disk, consent given -
+    /// and nothing is touched during extraction, because the mode was
+    /// never turned on.
+    #[test]
+    fn the_off_mode_never_eats_however_tight_the_disk() {
+        let dir = temp_dir("eat-off");
+        let payload: Vec<u8> = (0..120_000u32)
+            .flat_map(|i| (i.wrapping_mul(2654435761)).to_le_bytes())
+            .collect();
+        let volumes = write_multivolume_set(&dir, &payload);
+
+        let _arm = crate::eatvol::EatArm::new(
+            crate::eatvol::decide(
+                crate::eatvol::EatMode::Off,
+                true,
+                true,
+                crate::eatvol::Forecast {
+                    free: 0,
+                    volumes: crate::eatvol::volume_bytes(&volumes),
+                    encrypted: true,
+                },
+            )
+            .eats(),
+        );
+        assert!(try_unrar(&dir, None));
+        for v in &volumes {
+            assert!(v.exists(), "{} was eaten with the mode off", v.display());
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

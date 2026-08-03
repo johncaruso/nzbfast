@@ -6,6 +6,22 @@
 fn main() {
     println!("cargo:rerun-if-changed=../../packaging/icon/nzbfast.ico");
     println!("cargo:rerun-if-changed=../../packaging/windows/nzbfast.manifest");
+    // Beta serial, embedded exactly as the engine's build.rs embeds its
+    // own (crates/nzbfast/build.rs): the §98 upgrade handshake compares
+    // "what this tray ships" against "what the running engine serves",
+    // and a deploy build ("1.0.14 beta 5") must outrank the release it
+    // grew from ("1.0.14"). Before the cfg(windows) early-return - the
+    // probe_body module that does the comparison compiles and tests on
+    // every host.
+    println!("cargo:rerun-if-changed=../../packaging/beta-serial.txt");
+    let beta =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/beta-serial.txt");
+    let beta = std::fs::read_to_string(beta)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != "0")
+        .unwrap_or_default();
+    println!("cargo:rustc-env=NZBTRAY_BETA={beta}");
     if std::env::var("CARGO_CFG_WINDOWS").is_err() {
         return;
     }

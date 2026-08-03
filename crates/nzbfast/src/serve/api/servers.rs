@@ -7,7 +7,7 @@ pub(in crate::serve) fn dispatch(
     params: &std::collections::HashMap<String, String>,
     mode: &str,
     ctx: &ApiCtx<'_>,
-    _api_body: &mut Option<Vec<u8>>,
+    api_body: &mut Option<Vec<u8>>,
 ) -> Option<Value> {
     Some(match mode {
         "server_stats" => {
@@ -88,7 +88,7 @@ pub(in crate::serve) fn dispatch(
                         "servers": Value::Object(servers)})
         }
         "server_save" => {
-            let raw = read_body_capped(req.as_reader(), 1 << 20);
+            let raw = api_body.take().unwrap_or_default();
             let body: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
             let idx = body.get("index").and_then(Value::as_i64).unwrap_or(-1);
             // Read and write under one lock: this whole block is a
@@ -209,7 +209,7 @@ pub(in crate::serve) fn dispatch(
         // Persist a new server ORDER (e.g. fastest-first after a
         // benchmark): POST {"order":[old indices]}.
         "server_reorder" => {
-            let raw = read_body_capped(req.as_reader(), 1 << 20);
+            let raw = api_body.take().unwrap_or_default();
             let order: Vec<usize> = serde_json::from_slice::<Value>(&raw)
                 .ok()
                 .and_then(|v| v.get("order").cloned())
@@ -262,7 +262,7 @@ pub(in crate::serve) fn dispatch(
             // Connect + TLS + AUTHINFO against the (merged) server
             // without saving it - a blank password borrows the
             // stored one, so "Test" works on saved servers too.
-            let raw = read_body_capped(req.as_reader(), 1 << 20);
+            let raw = api_body.take().unwrap_or_default();
             let body: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
             let idx = body.get("index").and_then(Value::as_i64).unwrap_or(-1);
             let servers = current_servers(ctx.cfg_path);
@@ -297,7 +297,18 @@ pub(in crate::serve) fn dispatch(
                             json!({"status": true, "greeting": greeting.line, "latency_ms": ms})
                         }
                         Ok(Err(e)) => {
-                            json!({"status": false, "error": e.to_string()})
+                            // §G: the pool already tells a capacity cap
+                            // apart from a rejected credential, and the
+                            // Providers card renders the distinction -
+                            // but Test threw it away and printed one
+                            // flat failure. Someone whose plan allows 10
+                            // connections and who had asked for 20 was
+                            // told to go and check a password that was
+                            // never wrong. The classification costs
+                            // nothing to carry; the remedy is what the
+                            // user is here for.
+                            json!({"status": false, "error": e.to_string(),
+                                   "refusal": refusal_kind(&e)})
                         }
                         Err(_) => json!({"status": false,
                                     "error": "connect timed out (12 s)"}),
@@ -306,12 +317,77 @@ pub(in crate::serve) fn dispatch(
                 Err(e) => json!({"status": false, "error": e}),
             }
         }
+        // §G: fetch and parse ONE feed right now and say what came
+        // back. The poller runs on the feed's own interval - up to a
+        // quarter of an hour - so without this the only way to find out
+        // whether a url works was to add it and wait, and a feed that
+        // never worked at all is indistinguishable from one with nothing
+        // new until the next poll writes its health.
+        //
+        // POST like notify_test, and for the same reason: the url IS the
+        // credential (`?apikey=…`), and a GET would put it in access
+        // logs, browser history and any Referer that follows.
+        "feed_test" => {
+            if req.method() != &tiny_http::Method::Post {
+                json!({"status": false, "error": "POST required"})
+            } else {
+                // The body always arrives pre-read: serve() drains every
+                // POST to /api before it authorizes, so a handler that
+                // read the socket here would be reading it after the
+                // authorization decision - the rotation window Codex
+                // sweep 2's H1 closed. `unwrap_or_default()` and never a
+                // fallback read: an empty body is a bad request, not a
+                // reason to reach for the socket.
+                let raw = api_body.take().unwrap_or_default();
+                let body: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+                let url = body
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if url.is_empty() {
+                    json!({"status": false, "error": "no url"})
+                } else {
+                    // parse_feed_checked: a Test that got an HTTP 200
+                    // login page back must say so, not report a
+                    // healthy feed with zero items (Codex sweep 2,
+                    // 3 Aug ML1) - the whole point of the button is
+                    // telling a broken url from a quiet one.
+                    let r = fetch_url(&url).and_then(|f| {
+                        crate::rss::parse_feed_checked(&String::from_utf8_lossy(&f.bytes))
+                            .map_err(|e| anyhow::anyhow!("{e}"))
+                    });
+                    let health = match &r {
+                        Ok(items) => crate::rss::FeedHealth::ok(unix_now(), items.len()),
+                        Err(e) => crate::rss::FeedHealth::failed(
+                            unix_now(),
+                            &e.to_string(),
+                            redact_url_creds,
+                        ),
+                    };
+                    // A test of a CONFIGURED feed heals (or condemns) its
+                    // row straight away, instead of leaving a stale
+                    // failure sitting there until the next poll.
+                    if d.feeds.lock_ok().iter().any(|f| f.url == url) {
+                        d.feed_health.lock_ok().insert(url.clone(), health.clone());
+                    }
+                    match r {
+                        // Never the url, and never the feed's own text:
+                        // the count is the answer, and the error has
+                        // already been through redact_url_creds.
+                        Ok(items) => json!({"status": true, "items": items.len()}),
+                        Err(_) => json!({"status": false, "error": health.last_error}),
+                    }
+                }
+            }
+        }
         "indexer_test" => {
             // M35: t=caps against one indexer entry without
             // saving it. A blank apikey borrows the stored key
             // of the same-named saved entry, so "Test" works on
             // saved rows the UI round-trips with blank keys.
-            let raw = read_body_capped(req.as_reader(), 1 << 20);
+            let raw = api_body.take().unwrap_or_default();
             let body: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
             let cfg = serde_json::from_value::<crate::newznab::IndexerConfig>(
                 body.get("indexer").cloned().unwrap_or(Value::Null),
@@ -446,7 +522,10 @@ pub(in crate::serve) fn dispatch(
                                 })
                                 .collect();
                             json!({"status": true, "gbps": gbps,
-                                    "connections_per_server": conns, "servers": servers})
+                                    "connections_per_server": conns, "servers": servers,
+                                    // Yardstick for the verdict, not a
+                                    // bound on the measurement (0 = unset).
+                                    "line_speed": d.line_speed.load(Ordering::Relaxed)})
                         })
                     }
                 }
@@ -548,8 +627,21 @@ pub(in crate::serve) fn dispatch(
                                         gbps: peak,
                                         checked: epoch_secs(),
                                         source: "manual".into(),
+                                        // The user ran this ladder and
+                                        // sees every rung in the UI -
+                                        // their call, applied as-is.
+                                        suspect: false,
                                     },
                                 );
+                                // Manual runs re-judge line-speed
+                                // coverage too - same as the auto probe.
+                                if let Ok(c) = nzbkit::config::Config::load(ctx.cfg_path) {
+                                    crate::serve::tasks::update_tune_hint(
+                                        d,
+                                        &c.servers,
+                                        &crate::conntune::load(ctx.cfg_path),
+                                    );
+                                }
                                 json!({
                                     "status": true,
                                     "host": srv.host,
@@ -557,6 +649,9 @@ pub(in crate::serve) fn dispatch(
                                     "steps": steps,
                                     "recommended": best,
                                     "peak_gbps": peak,
+                                    // Yardstick for the verdict, not a
+                                    // bound on the measurement (0 = unset).
+                                    "line_speed": d.line_speed.load(Ordering::Relaxed),
                                 })
                             }
                         }
@@ -616,4 +711,83 @@ pub(in crate::serve) fn dispatch(
         }
         _ => return None,
     })
+}
+
+/// The word `server_test` hands the UI for a refusal it can act on.
+///
+/// Only an AUTHINFO/greeting refusal classifies: a timeout, a TLS
+/// failure or a closed socket is not a statement about the account, and
+/// labelling it "permanent" would tell the user to change a password
+/// over a flaky link. Those return None and keep the plain error.
+fn refusal_kind(e: &nzbkit::nntp::NntpError) -> Option<&'static str> {
+    match e {
+        nzbkit::nntp::NntpError::AuthFailed { kind, .. } => Some(match kind {
+            // Retrying at the same connection count re-provokes it: the
+            // remedy is FEWER connections, not new credentials.
+            nzbkit::nntp::AuthRefusal::Capacity => "capacity",
+            nzbkit::nntp::AuthRefusal::Permanent => "permanent",
+        }),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nzbkit::nntp::{AuthRefusal, NntpError};
+
+    /// The mapping the dashboard's remedy text hangs off. Capacity and
+    /// permanent are opposite advice - "lower your connections" versus
+    /// "your password is wrong" - so getting this backwards sends the
+    /// user to change a credential that works.
+    #[test]
+    fn a_refusal_reaches_the_ui_as_the_kind_the_pool_classified() {
+        let cap = NntpError::AuthFailed {
+            kind: AuthRefusal::Capacity,
+            line: "481 max simultaneous IP addresses reached".into(),
+        };
+        assert_eq!(refusal_kind(&cap), Some("capacity"));
+        let perm = NntpError::AuthFailed {
+            kind: AuthRefusal::Permanent,
+            line: "481 authentication failed".into(),
+        };
+        assert_eq!(refusal_kind(&perm), Some("permanent"));
+        // Not a statement about the account: no remedy, plain error.
+        assert_eq!(refusal_kind(&NntpError::Timeout), None);
+        assert_eq!(refusal_kind(&NntpError::Closed), None);
+        assert_eq!(
+            refusal_kind(&NntpError::Unexpected {
+                cmd: "<greeting>".into(),
+                line: "502 permission denied".into(),
+            }),
+            None
+        );
+    }
+
+    /// The classifier the arm above depends on, exercised through the
+    /// same door `Connection::connect` uses. A provider at its cap and a
+    /// wrong password share reply code 481, so the TEXT is the whole
+    /// signal - and anything unrecognised must fall to Permanent, since
+    /// retrying a bad credential forever is the worse failure.
+    #[test]
+    fn capacity_wording_is_told_apart_from_a_rejected_credential() {
+        for line in [
+            "481 max simultaneous IP addresses reached",
+            "502 Too many connections",
+            "481 Connection limit reached",
+        ] {
+            assert_eq!(
+                nzbkit::nntp::classify_auth_refusal(line),
+                AuthRefusal::Capacity,
+                "{line}"
+            );
+        }
+        for line in ["481 authentication failed", "481 account suspended"] {
+            assert_eq!(
+                nzbkit::nntp::classify_auth_refusal(line),
+                AuthRefusal::Permanent,
+                "{line}"
+            );
+        }
+    }
 }

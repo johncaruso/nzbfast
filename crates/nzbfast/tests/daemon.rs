@@ -403,6 +403,28 @@ async fn sonarr_style_cycle() {
         // no-key phrasing the *arrs match on.
         let r = http(port, "/api?mode=queue&output=json", None);
         assert!(r.contains("API Key Required"), "{r}");
+        // Issue #22: SABnzbd answers `/api/` exactly as it answers `/api`,
+        // and clients written against "the SABnzbd API" lean on that -
+        // Homepage's sabnzbd widget appends the slash and got our flat
+        // 404, which reads as a broken API rather than a picky one. The
+        // 404 body is the bare word nzbfast, so these assert on the
+        // payload rather than on the product name.
+        let r = http(port, "/api/?mode=version&output=json", None);
+        assert!(r.contains("version"), "trailing slash 404'd the SAB facade: {r}");
+        let r = http(port, "/api/?mode=queue&apikey=sekrit&output=json", None);
+        assert!(
+            r.contains("queue") && !r.contains("API Key"),
+            "trailing slash broke an authenticated call: {r}"
+        );
+        // The same miss hit the newznab facade, i.e. an *arr pointing an
+        // indexer here rather than a download client. Caps and the
+        // indexer-off refusal are both XML, so this pins the ROUTE
+        // without depending on whether the index is switched on.
+        let r = http(port, "/newznab/api/?t=caps&apikey=sekrit", None);
+        assert!(
+            r.contains("<?xml"),
+            "trailing slash 404'd the newznab facade: {r}"
+        );
         // SAB-compat: browser addons (NZBDonkey, NZB Unity) send mode and
         // apikey as POST form fields with an EMPTY query string. Both form
         // encodings must authenticate - these used to log "[auth] rejected
@@ -442,6 +464,33 @@ async fn sonarr_style_cycle() {
             )),
         );
         assert!(r.contains("version"), "query key must win: {r}");
+        // The form-shaped pre-read above DRAINS the body - a handler that
+        // then reads the socket again gets nothing. server_test used to do
+        // exactly that, so `curl -d '{json}'` (curl's default content type
+        // is form-urlencoded) always tested a Null body and answered
+        // "server needs a host" no matter what was sent. Handlers must
+        // consume the drained copy (api_body) instead. The listener drops
+        // every connection at accept, so a SEEN body fails fast with a
+        // refusal classification; a LOST body never dials at all.
+        let nntp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let nntp_port = nntp.local_addr().unwrap().port();
+        std::thread::spawn(move || for _ in nntp.incoming() {});
+        let body = format!(
+            r#"{{"server": {{"host": "127.0.0.1", "port": {nntp_port}, "tls": false, "connections": 1}}}}"#
+        );
+        let r = http(
+            port,
+            "/api?mode=server_test&apikey=sekrit&output=json",
+            Some(("application/x-www-form-urlencoded", body.as_bytes())),
+        );
+        assert!(
+            !r.contains("server needs a host"),
+            "form-encoded POST body was drained before server_test read it: {r}"
+        );
+        assert!(
+            r.contains("refusal"),
+            "server_test never dialed the host given in the body: {r}"
+        );
         // Issue #4: the key may ride a header instead of the query string
         // (X-Api-Key, or Authorization: Bearer), which keeps it out of
         // reverse-proxy access logs - the dashboard now sends it this way.
@@ -1064,6 +1113,195 @@ async fn duplicate_held_then_promoted() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// UX audit 3 Aug (#10): the held-duplicate row has told the user to
+/// "raise its priority to download it anyway" since M14f, and that
+/// instruction did nothing.
+///
+/// A hold is a PAUSE at priority -3. `pick_job` skips a paused job at
+/// any priority, and the priority arm wrote the number without touching
+/// `paused` - so the drawer's priority select, the one control the
+/// tooltip pointed at, left the job exactly as parked as before while
+/// answering `"status":true`. Raising the priority now releases the hold
+/// the same way the failed-original promotion does (paused=false), and
+/// only for -3: an ordinary paused job re-prioritised by a client stays
+/// paused, which is what every SAB caller expects.
+///
+/// Codex sweep 2, 3 Aug M4 extends it to the NZBGet `/jsonrpc` facade,
+/// which kept its own copy of the priority write and never got the hold
+/// release - so which client type the user happened to configure in
+/// Sonarr decided whether the one documented escape from a duplicate
+/// hold worked at all. Both paths now go through
+/// `api::queue::apply_priority`, and this drives one held duplicate
+/// down each of them.
+#[tokio::test(flavor = "multi_thread")]
+async fn raising_a_held_duplicates_priority_releases_it() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-dupeprio-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+
+    let mut articles = HashMap::new();
+    // Both copies are REAL: the point of the test is that the held one
+    // actually downloads once its priority is raised.
+    let a = make_file_articles("a.bin", &payload(120_000, 17), 40_000, "dq", &mut articles);
+    let b = make_file_articles("b.bin", &payload(120_000, 19), 40_000, "dq", &mut articles);
+    let c = make_file_articles("c.bin", &payload(120_000, 23), 40_000, "dq", &mut articles);
+    let srv = MockServer::start(articles, Chaos::default()).await;
+
+    let nzb = |file: &str, segs: &[(String, u64, u32)]| {
+        let mut x = format!(
+            "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"&quot;{file}&quot; yEnc (1/{})\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+            segs.len()
+        );
+        for (id, bytes, num) in segs {
+            x.push_str(&format!(
+                "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+            ));
+        }
+        x.push_str("    </segments>\n  </file>\n</nzb>\n");
+        x
+    };
+    let first_xml = nzb("a.bin", &a);
+    let held_xml = nzb("b.bin", &b);
+    let held2_xml = nzb("c.bin", &c);
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--connections")
+            .arg("2");
+        c
+    })
+    .await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        let upload = |xml: &str, fname: &str| -> String {
+            let boundary = "----dqb";
+            let mut body = Vec::new();
+            body.extend_from_slice(
+                format!("--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"{fname}\"\r\n\r\n").as_bytes(),
+            );
+            body.extend_from_slice(xml.as_bytes());
+            body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+            let r = http(
+                port,
+                "/api?mode=addfile&output=json",
+                Some((&format!("multipart/form-data; boundary={boundary}"), &body)),
+            );
+            assert!(r.contains("\"status\":true"), "{r}");
+            r.split("SABnzbd_nzo_")
+                .nth(1)
+                .and_then(|s| s.split('"').next())
+                .map(|s| format!("SABnzbd_nzo_{s}"))
+                .expect("addfile returned no nzo_id")
+        };
+        let qslot = |q: &str, id: &str| -> serde_json::Value {
+            let v: serde_json::Value =
+                serde_json::from_str(q).unwrap_or_else(|e| panic!("bad queue JSON: {e}\n{q}"));
+            v["queue"]["slots"]
+                .as_array()
+                .and_then(|a| a.iter().find(|s| s["nzo_id"] == id).cloned())
+                .unwrap_or(serde_json::Value::Null)
+        };
+
+        // Paused so both land in the queue before the duplicate check runs.
+        http(port, "/api?mode=pause&output=json", None);
+        let _first_id = upload(&first_xml, "Show.Name.S03E04.720p.WEB.nzb");
+        let held_id = upload(&held_xml, "Show.Name.S03E04.1080p.WEB.nzb");
+        let held2_id = upload(&held2_xml, "Show.Name.S03E04.2160p.WEB.nzb");
+
+        let q = http(port, "/api?mode=queue&output=json", None);
+        for id in [&held_id, &held2_id] {
+            let held = qslot(&q, id);
+            assert_eq!(held["priority"], "Duplicate", "not held: {q}");
+            assert_eq!(held["status"], "Paused", "a hold is a pause: {q}");
+        }
+
+        // The drawer's priority select, exactly as the page sends it.
+        let r = http(
+            port,
+            &format!("/api?mode=queue&name=priority&value={held_id}&value2=1&output=json"),
+            None,
+        );
+        assert!(r.contains("\"status\":true"), "{r}");
+
+        // The same instruction through the NZBGet facade - Sonarr with
+        // its client type set to NZBGet reaches only this one.
+        // NZBGet addresses jobs by the numeric tail of the nzo_id.
+        let nzbid: i64 = held2_id
+            .chars()
+            .rev()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>()
+            .parse()
+            .unwrap_or_else(|e| panic!("no numeric id in {held2_id}: {e}"));
+        let body = format!(
+            "{{\"method\":\"editqueue\",\"params\":[\"GroupSetPriority\",\"100\",[{nzbid}]],\"id\":3}}"
+        );
+        let r = http(port, "/jsonrpc", Some(("application/json", body.as_bytes())));
+        assert!(r.contains("true"), "GroupSetPriority refused: {r}");
+
+        let q = http(port, "/api?mode=queue&output=json", None);
+        assert_eq!(qslot(&q, &held_id)["priority"], "High", "{q}");
+        for id in [&held_id, &held2_id] {
+            assert_ne!(
+                qslot(&q, id)["status"],
+                "Paused",
+                "the priority write left the hold in place for {id}: {q}"
+            );
+        }
+
+        // ...and the scheduler agrees: both download.
+        http(port, "/api?mode=resume&output=json", None);
+        let mut ran = false;
+        for _ in 0..300 {
+            let h = http(port, "/api?mode=history&output=json", None);
+            let v: serde_json::Value = serde_json::from_str(&h).unwrap_or(serde_json::Value::Null);
+            let done = |id: &str| {
+                v["history"]["slots"].as_array().is_some_and(|a| {
+                    a.iter()
+                        .any(|s| s["nzo_id"] == id && s["status"] == "Completed")
+                })
+            };
+            if done(&held_id) && done(&held2_id) {
+                ran = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        assert!(
+            ran,
+            "a released duplicate never downloaded - the jsonrpc leg is the \
+             one that used to answer success and change nothing"
+        );
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// M14k: RSS automation - the daemon polls a feed, filters with rules,
 /// fetches the accepted item's NZB over HTTP, downloads it, and never
 /// re-grabs a seen guid.
@@ -1175,6 +1413,151 @@ async fn rss_feed_auto_grabs() {
         assert_eq!(grabs.load(std::sync::atomic::Ordering::Relaxed), 1);
         let q = http(port, "/api?mode=queue&output=json", None);
         assert!(!q.contains("Grab.Me"), "re-queued a seen item: {q}");
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A spent quota holds the queue, SAYS SO on the wire, and still lets a
+/// Force job through (SAB semantics).
+///
+/// The hold itself is old behaviour; what is pinned here is that the
+/// reason crosses the API. Before this, `guard_reason` was a local in
+/// the download worker: the queue sat still, the pill read "idle", and
+/// the only account of why lived in the daemon log.
+#[tokio::test(flavor = "multi_thread")]
+async fn quota_hold_is_on_the_wire_and_force_still_runs() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-quota-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+
+    let data = payload(60_000, 11);
+    let mut articles = HashMap::new();
+    let segs = make_file_articles("q.bin", &data, 30_000, "qq", &mut articles);
+    let srv = MockServer::start(articles, Chaos::default()).await;
+    let mut xml = String::from(
+        "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"&quot;q.bin&quot; yEnc (1/2)\">\n    <groups><group>q</group></groups>\n    <segments>\n",
+    );
+    for (id, bytes, num) in &segs {
+        xml.push_str(&format!(
+            "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+        ));
+    }
+    xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    // Seed the period's ledger BEFORE the daemon opens it: the guard
+    // needs bytes already spent, and downloading 500 GB to get them is
+    // not a test. Same file and shape QuotaLedger::save writes; `start`
+    // is this period's UTC midnight, or `open` treats it as a stale
+    // window and zeroes the count.
+    let spool = dir.join(".spool");
+    std::fs::create_dir_all(&spool).unwrap();
+    let midnight = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        / 86_400
+        * 86_400;
+    std::fs::write(
+        spool.join("quota.json"),
+        format!("{{\"start\":{midnight},\"bytes\":9000000000}}"),
+    )
+    .unwrap();
+
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--connections")
+            .arg("2");
+        c
+    })
+    .await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        // A quota smaller than what the ledger already says was spent.
+        let set = http(port, "/api?mode=config&name=quota&value=1G&output=json", None);
+        assert!(set.contains("\"status\":true"), "{set}");
+
+        let boundary = "----quotab";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"q.nzb\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(xml.as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let added = http(
+            port,
+            "/api?mode=addfile&output=json",
+            Some((&format!("multipart/form-data; boundary={boundary}"), &body)),
+        );
+        let nzo = added
+            .split("\"nzo_ids\":[\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .unwrap_or_else(|| panic!("no nzo_id in {added}"))
+            .to_string();
+
+        // The guard runs on the worker's own pass, so give it a few.
+        let mut q = String::new();
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            q = http(port, "/api?mode=queue&output=json", None);
+            if q.contains("\"hold\"") && !q.contains("\"hold\":null") {
+                break;
+            }
+        }
+        // The reason, and both numbers, named - not just a hold flag.
+        assert!(q.contains("\"kind\":\"quota\""), "{q}");
+        assert!(q.contains("\"reason\":\"quota\""), "{q}");
+        assert!(q.contains("\"spent_gb\":9.0"), "{q}");
+        assert!(q.contains("\"cap_gb\":1.0"), "{q}");
+        // Held, not paused: nothing touched the pause flag, so the
+        // pill's "held" wording is the only thing that can explain it.
+        assert!(q.contains("\"paused\":false"), "{q}");
+        assert!(q.contains("\"pause_source\":null"), "{q}");
+        assert!(q.contains("\"Queued\""), "{q}");
+        assert!(
+            http(port, "/api?mode=history&output=json", None).contains("\"noofslots\":0"),
+            "the held job must not have run"
+        );
+
+        // Force walks past a spent quota - SAB semantics, and what the
+        // banner now tells the user to do.
+        http(
+            port,
+            &format!("/api?mode=queue&name=priority&value={nzo}&value2=2&output=json"),
+            None,
+        );
+        let mut done = false;
+        for _ in 0..80 {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            if http(port, "/api?mode=history&output=json", None).contains("\"Completed\"") {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "Force did not run under a spent quota");
     })
     .await
     .unwrap();
@@ -2598,6 +2981,127 @@ async fn apikey_reveal_and_rotate_need_the_api_key() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Codex sweep 2, 3 Aug H1 and M1: the /api body contract.
+///
+/// H1 - the previous sweep moved the credential snapshot to AFTER the
+/// body read so a caller could not be authorized on key A, stall the
+/// body, and complete a destructive write once the owner rotated to B.
+/// But the pre-read only fired for three RECOGNIZED content types, and a
+/// handler whose body had not been pre-read fell back to reading the
+/// socket itself - after dispatch, which is after the authorization
+/// decision. So the whole fix could be skipped by omitting
+/// `Content-Type`, or by spelling it `Application/JSON` (media types are
+/// case-insensitive; the classifier was not).
+///
+/// M1 - with the pre-read now covering everything, the handlers' own
+/// caps live in a branch that can no longer run, so the gateway must
+/// apply the endpoint's real limit or nothing does.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_api_post_body_is_read_before_the_key_decision() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-apibody-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}",
+            free_port()
+        ),
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("fullkey")
+            .arg("--out")
+            .arg(dir.join("complete"));
+        c
+    })
+    .await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        // A JSON body sent with NO Content-Type at all. Before the fix
+        // this skipped the pre-read entirely; the handler then read the
+        // socket after auth, which is the whole rotation window. It has
+        // to keep WORKING - the dashboard's own fetch() sends
+        // text/plain - and it has to be read up front.
+        let body = br#"{"target":{"name":"t","kind":"webhook","url":"http://127.0.0.1:1/x","token":"SEKRIT"}}"#;
+        let r = http_once(port, "/api?mode=notify_test&apikey=fullkey&output=json", Some(("", &body[..])))
+            .expect("no answer");
+        assert!(
+            !r.contains("bad target"),
+            "an untyped JSON body must still reach the handler: {r}"
+        );
+
+        // Mixed-case spelling of the media type: standards-valid, and a
+        // second way past a case-sensitive classifier.
+        let r = http(
+            port,
+            "/api?mode=server_save&apikey=fullkey&output=json",
+            Some(("Application/JSON", br#"{"index":-1,"server":{"host":"h.example","port":119}}"#)),
+        );
+        assert!(
+            r.contains("\"status\":true"),
+            "Application/JSON must be recognized as JSON: {r}"
+        );
+
+        // A body with no key and no mode is refused - and the refusal
+        // must not depend on the handler having drained anything.
+        let r = http(
+            port,
+            "/api?mode=server_save&output=json",
+            Some(("application/json", br#"{"index":-1,"server":{"host":"x","port":119}}"#)),
+        );
+        assert!(!r.contains("\"status\":true"), "an unkeyed write succeeded: {r}");
+
+        // M1: server_save's declared limit is 1 MiB. A body past it is
+        // truncated at the gateway, so it arrives unparseable rather
+        // than being buffered whole - the old flat 256 MiB pre-read
+        // meant a nominal 1 MiB endpoint could take 256 of them.
+        let mut fat = Vec::from(&br#"{"index":-1,"server":{"host":"h2.example","port":119,"pad":""#[..]);
+        fat.resize(fat.len() + (2 << 20), b'A');
+        fat.extend_from_slice(br#""}}"#);
+        let r = http(
+            port,
+            "/api?mode=server_save&apikey=fullkey&output=json",
+            Some(("application/json", &fat)),
+        );
+        assert!(
+            !r.contains("\"status\":true"),
+            "a 2 MiB body reached a 1 MiB endpoint intact: {r}"
+        );
+
+        // ...while addfile, which legitimately carries whole NZBs, is
+        // still allowed well past that. Junk XML, so the ADD fails -
+        // what matters is that the body was not cut off at 1 MiB, which
+        // would have made it fail the same way and prove nothing. The
+        // size is echoed back through the parse error path instead:
+        // assert only that the daemon answered at all and did not
+        // refuse the request outright.
+        let mut big = Vec::from(&b"<?xml version=\"1.0\"?><nzb>"[..]);
+        big.resize(big.len() + (3 << 20), b' ');
+        big.extend_from_slice(b"</nzb>");
+        let r = http(
+            port,
+            "/api?mode=addfile&apikey=fullkey&output=json",
+            Some(("application/xml", &big)),
+        );
+        assert!(!r.is_empty(), "a 3 MiB addfile body got no answer at all: {r}");
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The add-only key's tier, from a push extension's point of view. NZB
 /// Donkey tests a connection with mode=status and fills its category
 /// dropdown from get_cats; NZB Unity tests with mode=fullstatus - so
@@ -3703,6 +4207,285 @@ async fn passworded_archive_flow() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// SAB/NZBGet-parity passwords file: with `password_file` configured, a
+/// job whose volumes turn out encrypted and which carries no password of
+/// its own unlocks at completion with the first file candidate that
+/// works - no manual set_password, no password_required parking - and
+/// the winner is recorded onto the job (history reports has_password).
+/// get_config exposes the path and a count, never the values.
+#[tokio::test(flavor = "multi_thread")]
+async fn passwords_file_unlocks_at_completion() {
+    use nzbkit::rar::fixtures;
+    let dir = std::env::temp_dir().join(format!("nzbfast-pwlist-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+
+    // One encrypted-data RAR5 store volume (`rar -m0 -p…` shape): the
+    // native unlock path decrypts it with no unrar on the box.
+    let inner = payload(80_001, 17);
+    let f = fixtures::encrypt_file("listpw", &inner, 9);
+    let n = f.cipher.len();
+    let vol = fixtures::rar5_volume_enc(&[("movie.mkv", &f, 0..n, false, false)], None);
+    let mut articles = HashMap::new();
+    let segs = make_file_articles("Listed.Release.2026.rar", &vol, 40_000, "lp", &mut articles);
+    let srv = MockServer::start(articles, Chaos::default()).await;
+
+    let mut xml = format!(
+        "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"&quot;Listed.Release.2026.rar&quot; yEnc (1/{})\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+        segs.len()
+    );
+    for (id, bytes, num) in &segs {
+        xml.push_str(&format!(
+            "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+        ));
+    }
+    xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"));
+        c
+    })
+    .await;
+    let port = d.port;
+
+    let dir2 = dir.clone();
+    tokio::task::spawn_blocking(move || {
+        let pct = |s: &str| -> String {
+            s.bytes()
+                .map(|b| format!("%{b:02X}"))
+                .collect::<String>()
+        };
+        // SAB/NZBGet-format passwords file: one per line, a wrong
+        // candidate first - order is part of the contract.
+        let pw_file = dir2.join("pw.txt");
+        std::fs::write(&pw_file, "not-this-one\nlistpw\n").unwrap();
+        let r = http(
+            port,
+            &format!(
+                "/api?mode=config&name=password_file&value={}&apikey=sekrit&output=json",
+                pct(&pw_file.to_string_lossy())
+            ),
+            None,
+        );
+        assert!(r.contains("\"status\":true"), "{r}");
+        // Only the path and the count reach the UI - never the values.
+        let r = http(port, "/api?mode=get_config&apikey=sekrit&output=json", None);
+        assert!(r.contains("\"password_file_count\":2"), "{r}");
+        assert!(!r.contains("listpw"), "password value leaked into get_config: {r}");
+
+        let boundary = "----nzbfastboundary";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"Listed.Release.2026.nzb\"\r\nContent-Type: application/x-nzb\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(xml.as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let ctype = format!("multipart/form-data; boundary={boundary}");
+        let r = http(port, "/api?mode=addfile&apikey=sekrit&output=json", Some((&ctype, &body)));
+        assert!(r.contains("nzo_ids"), "{r}");
+
+        let mut slot = serde_json::Value::Null;
+        for _ in 0..150 {
+            let h = http(port, "/api?mode=history&apikey=sekrit&output=json", None);
+            if let Some(s) = serde_json::from_str::<serde_json::Value>(&h)
+                .ok()
+                .and_then(|v| v["history"]["slots"].as_array().cloned())
+                .and_then(|s| s.iter().find(|s| s["name"] == "Listed.Release.2026").cloned())
+                && s["status"] == "Completed"
+            {
+                slot = s;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        assert_eq!(slot["status"], "Completed", "{slot}");
+        // Unlocked by the list, not parked - and the winner stayed on
+        // the job.
+        assert_eq!(slot["password_required"], false, "{slot}");
+        assert_eq!(slot["has_password"], true, "{slot}");
+        // Auto-rename may have retitled both the file and the folder, so
+        // take the directory from the record and find the payload by its
+        // unpacked (padding-truncated) size instead of by name.
+        let job_dir = std::path::PathBuf::from(slot["storage"].as_str().unwrap());
+        assert!(
+            job_dir.starts_with(dir2.join("complete")),
+            "unexpected storage dir: {job_dir:?}"
+        );
+        let files: Vec<_> = std::fs::read_dir(&job_dir)
+            .expect("job dir")
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert!(
+            files
+                .iter()
+                .any(|p| p.extension().is_some_and(|x| x == "mkv")
+                    && std::fs::metadata(p).is_ok_and(|m| m.len() == 80_001)),
+            "no unpacked 80001-byte mkv in {files:?}"
+        );
+        assert!(
+            !job_dir.join("Listed.Release.2026.rar").exists(),
+            "spent volume must be consumed by the unlock"
+        );
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// password_prompt=never: a locked job completes QUIETLY - no failure
+/// text (nothing for the dashboard to announce), the still-packed note
+/// names the archive so the row says why it is packed, and
+/// password_required keeps the manual 🔑 available.
+#[tokio::test(flavor = "multi_thread")]
+async fn password_prompt_never_leaves_archive_packed() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-pwnever-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+
+    // Undecryptable encrypted-header shape: no password will ever work,
+    // so the job always parks locked - which is exactly the state this
+    // mode reshapes.
+    let locked = nzbkit::rar::fixtures::rar4_encrypted_headers(4096);
+    let mut articles = HashMap::new();
+    let segs = make_file_articles(
+        "Quiet.Release.2026.rar",
+        &locked,
+        40_000,
+        "qn",
+        &mut articles,
+    );
+    let srv = MockServer::start(articles, Chaos::default()).await;
+
+    let mut xml = format!(
+        "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"&quot;Quiet.Release.2026.rar&quot; yEnc (1/{})\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+        segs.len()
+    );
+    for (id, bytes, num) in &segs {
+        xml.push_str(&format!(
+            "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+        ));
+    }
+    xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"));
+        c
+    })
+    .await;
+    let port = d.port;
+
+    let dir2 = dir.clone();
+    tokio::task::spawn_blocking(move || {
+        let r = http(
+            port,
+            "/api?mode=config&name=password_prompt&value=never&apikey=sekrit&output=json",
+            None,
+        );
+        assert!(r.contains("\"status\":true"), "{r}");
+        // A bad mode is rejected outright.
+        let r = http(
+            port,
+            "/api?mode=config&name=password_prompt&value=sometimes&apikey=sekrit&output=json",
+            None,
+        );
+        assert!(r.contains("\"status\":false"), "{r}");
+
+        let boundary = "----nzbfastboundary";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"Quiet.Release.2026.nzb\"\r\nContent-Type: application/x-nzb\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(xml.as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let ctype = format!("multipart/form-data; boundary={boundary}");
+        let r = http(port, "/api?mode=addfile&apikey=sekrit&output=json", Some((&ctype, &body)));
+        assert!(r.contains("nzo_ids"), "{r}");
+
+        let mut slot = serde_json::Value::Null;
+        for _ in 0..150 {
+            let h = http(port, "/api?mode=history&apikey=sekrit&output=json", None);
+            if let Some(s) = serde_json::from_str::<serde_json::Value>(&h)
+                .ok()
+                .and_then(|v| v["history"]["slots"].as_array().cloned())
+                .and_then(|s| s.iter().find(|s| s["name"] == "Quiet.Release.2026").cloned())
+                && s["status"] == "Completed"
+            {
+                slot = s;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        assert_eq!(slot["status"], "Completed", "{slot}");
+        // Locked, but presented as a quiet caveat, not a failure.
+        assert_eq!(slot["password_required"], true, "{slot}");
+        assert_eq!(slot["fail_message"], "", "{slot}");
+        let blocked = slot["unpack_blocked_by"].as_str().unwrap_or("");
+        assert!(
+            blocked.contains("Quiet.Release.2026.rar"),
+            "still-packed note must name the archive: {slot}"
+        );
+        // The verified volume stays on disk for manual extraction.
+        assert!(
+            dir2.join("complete/Quiet.Release.2026/Quiet.Release.2026.rar").exists(),
+            "volume must stay on disk"
+        );
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Drag-to-reorder: `mode=queue&name=switch&value=<nzo_id>&value2=<pos>`
 /// moves a queued job to that index (SAB parity for the dashboard's drag
 /// handles). Out-of-range positions clamp; unknown ids are refused.
@@ -4613,6 +5396,11 @@ async fn live_settings_survive_restart() {
         ("update_url", ""),
         ("index_deepen", "123456"),
         ("bench_interval", "6"),
+        // TODO 101: the volume-eating unpack mode. A string setting, so
+        // `settings_survive_a_restart` (which discovers booleans off the
+        // live response) does not cover it - this list is where its
+        // three places are held together.
+        ("unpack_eat_volumes", "low_disk"),
         // The pre feed's two capacity knobs. They were constants until
         // 2 Aug 2026; the reason they are settings is that the PRUNE and
         // the seed IMPORTER have to agree on the cap, and a constant the
@@ -4653,6 +5441,7 @@ async fn live_settings_survive_restart() {
         "\"kind\":\"formula-1\"",
         "\"title\":\"Formula1\"",
         "\"index_interests\":\"linux,sports\"",
+        "\"unpack_eat_volumes\":\"low_disk\"",
     ];
 
     let a = serve(&dir, &build).await;
@@ -4671,6 +5460,25 @@ async fn live_settings_survive_restart() {
         for e in expect {
             assert!(c.contains(e), "live after set, missing {e}: {c}");
         }
+        // TODO 101: an unknown mode is refused outright rather than
+        // quietly falling back to "off" - the three values decide
+        // whether downloaded volumes get deleted mid-extraction, and a
+        // typo must not be answered with a guess.
+        let r = http(
+            port_a,
+            "/api?mode=config&name=unpack_eat_volumes&value=sometimes&apikey=sekrit&output=json",
+            None,
+        );
+        assert!(r.contains("\"status\":false"), "{r}");
+        // ...and the per-job consent is refused for an nzo_id nobody
+        // holds, rather than silently reporting success. (It is offered
+        // at all only because the mode above is `low_disk`.)
+        let r = http(
+            port_a,
+            "/api?mode=eat_volumes&value=no-such-job&apikey=sekrit&output=json",
+            None,
+        );
+        assert!(r.contains("unknown nzo_id"), "{r}");
         // The capacity knobs clamp rather than refuse: a number outside
         // the sane range is a typo, and a typo must not leave the feed
         // table with a cap of 1. The write reply only says "saved", so
@@ -5176,13 +5984,64 @@ async fn auto_retry_fires_once_after_cooldown() {
         };
 
         // First failure parks with retry count 0…
-        poll(&|h: &str| h.contains("Failed"), "first failure");
+        let h = poll(&|h: &str| h.contains("Failed"), "first failure");
+        // …and SAYS SO on the wire. Everything the daemon had already
+        // decided about this row used to stop at its own log line: the
+        // user was shown a hard FAILURE for something scheduled to fix
+        // itself, and then watched the row vanish from History.
+        assert!(
+            h.contains("\"auto_retry_at\":") && !h.contains("\"auto_retry_at\":null"),
+            "an armed retry must ship its due time: {h}"
+        );
+        // What it is waiting for - which is also what chose the delay.
+        let why = if h.contains("\"auto_retry_why\":\"transport\"") {
+            "transport"
+        } else {
+            assert!(
+                h.contains("\"auto_retry_why\":\"propagation\""),
+                "an armed retry must ship its reason token: {h}"
+            );
+            "propagation"
+        };
+        // The reason token and the classifier must agree: a transport
+        // cooldown is the SHORT one precisely because the post is not
+        // implicated, so disagreeing here would mis-caption the wait.
+        assert_eq!(
+            why == "transport",
+            h.contains("\"fail_kind\":\"transport\""),
+            "auto_retry_why must follow fail_kind: {h}"
+        );
+        // ...and the drawer's single remedy rides along. This fixture's
+        // post carries NO PAR2, which the message says outright ("nothing
+        // can rebuild them"), so the sub-cause outranks the kind and the
+        // offered action is another release - even though the daemon
+        // still spends its one free retry first. The two are not in
+        // conflict: the retry is the daemon's own last look, and `search`
+        // is what is left for the user when it comes back empty.
+        assert!(
+            h.contains("\"fail_hint\":\"nopar2\"") && h.contains("\"fail_action\":\"search\""),
+            "a post with no parity is answered by another release: {h}"
+        );
         // …then the auto retry fires after ~2 s, runs, and fails again.
         let h = poll(
             &|h: &str| h.contains("\"retry\":1") && h.contains("Failed"),
             "the automatic retry to run and fail",
         );
         assert!(h.contains("Failed"), "{h}");
+        // The requeue itself is announced. Without this ring the row the
+        // user was told had FAILED simply left History and a download
+        // nobody asked for appeared in the queue.
+        let q = http(port, "/api?mode=queue&apikey=sekrit&output=json", None);
+        assert!(
+            q.contains("\"auto_retried\":[{") && q.contains("\"nzo_id\":\"SABnzbd_nzo_nzbfast1\""),
+            "the requeue must reach the dashboard as an event: {q}"
+        );
+        // The consumed stamp is cleared with its reason, so the row
+        // cannot go on advertising a retry that already happened.
+        assert!(
+            h.contains("\"auto_retry_at\":null") && h.contains("\"auto_retry_why\":null"),
+            "a spent retry clears both halves: {h}"
+        );
 
         // One shot only: well past another cooldown, no third attempt.
         std::thread::sleep(std::time::Duration::from_secs(5));
@@ -9834,4 +10693,838 @@ async fn nested_zip_in_a_real_store_rar_extracts_through_the_daemon() {
 
     drop(d);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Codex H5: `mode=change_cat` validated the job was Queued, released
+/// every lock, derived the new directory, then wrote `category` and
+/// `out_dir` WITHOUT revalidating - so a job the scheduler started in
+/// that window downloaded into its OLD directory while the record named
+/// the new one. The daemon runs with a test hook holding that window
+/// open; the change must refuse once the job is Downloading.
+#[tokio::test(flavor = "multi_thread")]
+async fn change_cat_refuses_a_job_that_started_inside_its_window() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-ccrace-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+
+    // Slow articles so the job is still Downloading when the stalled
+    // change_cat wakes up.
+    let data = payload(600_000, 3);
+    let mut articles = HashMap::new();
+    let segs = make_file_articles("slow.bin", &data, 40_000, "cc", &mut articles);
+    let srv = MockServer::start(
+        articles,
+        Chaos {
+            delay_ms: 400,
+            ..Chaos::default()
+        },
+    )
+    .await;
+
+    let mut xml = String::from(
+        "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"&quot;slow.bin&quot; yEnc (1/1)\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+    );
+    for (id, bytes, num) in &segs {
+        xml.push_str(&format!(
+            "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+        ));
+    }
+    xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            // Hold change_cat open for 8 s between its Queued snapshot
+            // and its out_dir publish.
+            .env("NZBFAST_TEST_STALL_CHANGE_CAT_MS", "8000")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--connections")
+            .arg("1");
+        c
+    })
+    .await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        // Pause, add: the job sits Queued.
+        http(port, "/api?mode=pause&apikey=sekrit&output=json", None);
+        let boundary = "----ccrace";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"slow.nzb\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(xml.as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let r = http(
+            port,
+            "/api?mode=addfile&apikey=sekrit&output=json",
+            Some((&format!("multipart/form-data; boundary={boundary}"), &body)),
+        );
+        assert!(r.contains("\"status\":true"), "{r}");
+        let id = r
+            .split("SABnzbd_nzo_")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .map(|s| format!("SABnzbd_nzo_{s}"))
+            .unwrap();
+
+        // change_cat snapshots the Queued job, then stalls inside its
+        // window on the test hook.
+        let cc = std::thread::spawn(move || {
+            http(
+                port,
+                &format!("/api?mode=change_cat&value={id}&value2=movies&apikey=sekrit&output=json"),
+                None,
+            )
+        });
+        // Give the request time to take its snapshot, then start the job.
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        http(port, "/api?mode=resume&apikey=sekrit&output=json", None);
+        let mut started = false;
+        for _ in 0..30 {
+            let q = http(port, "/api?mode=queue&apikey=sekrit&output=json", None);
+            if q.contains("\"status\":\"Downloading\"") {
+                started = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        assert!(started, "the job never started inside the stall window");
+
+        let r = cc.join().unwrap();
+        assert!(
+            r.contains("\"status\":false"),
+            "change_cat must refuse a job that started inside its window: {r}"
+        );
+        // And the running job keeps its real category/directory: the
+        // record must not name a directory the bytes never went to.
+        let q = http(port, "/api?mode=queue&apikey=sekrit&output=json", None);
+        assert!(
+            !q.contains("\"cat\":\"movies\""),
+            "the started job was refiled anyway: {q}"
+        );
+    })
+    .await
+    .unwrap();
+
+    drop(d);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// §96.3 give-up breaker, end to end: an *arr-originated job whose grab
+/// FINALLY fails trips the per-target counter at the configured
+/// threshold, and the daemon reaches into the configured *arr to
+/// unmonitor the target. The mock *arr answers with an already-swept
+/// queue, so this also exercises the parse fallback - the race with the
+/// *arr's own poll that the unmonitor-first ordering exists to survive
+/// (the ordering itself is pinned by the giveup module's unit tests).
+#[tokio::test(flavor = "multi_thread")]
+async fn giveup_breaker_unmonitors_after_final_failure() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-giveup-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+
+    // A news server that has NONE of the job's articles: the download
+    // fails with missing articles, and NZBFAST_AUTO_RETRY_SECS=0 below
+    // makes that first failure final.
+    let srv = MockServer::start(HashMap::new(), Chaos::default()).await;
+
+    // Mock Sonarr: log every request; queue is empty (its poll already
+    // swept the record), parse resolves the release to episode 7.
+    let arr_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let arr_url = format!("http://{}", arr_listener.local_addr().unwrap());
+    let arr_seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    {
+        let seen = arr_seen.clone();
+        std::thread::spawn(move || {
+            for sock in arr_listener.incoming() {
+                let Ok(mut sock) = sock else { return };
+                sock.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .ok();
+                // Drain the WHOLE request - headers, then the declared
+                // body - before answering, the way the giveup.rs unit
+                // mock does. A single read() answered as soon as the
+                // headers landed and then closed the socket (Connection:
+                // close below), so a PUT whose body arrived in a second
+                // segment had it written into a closed pipe. ureq
+                // surfaced that as an error, the give-up worker read
+                // "the remote call failed" and released the action latch
+                // it had already set - and this test failed on
+                // `actioned` being false, at whichever assertion the
+                // race happened to reach first.
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 8192];
+                let head_end = loop {
+                    match sock.read(&mut buf) {
+                        Ok(0) | Err(_) => break raw.len(),
+                        Ok(n) => raw.extend_from_slice(&buf[..n]),
+                    }
+                    if let Some(p) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break p + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
+                let want: usize = head
+                    .to_ascii_lowercase()
+                    .split("\r\n")
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                while raw.len() < head_end + want {
+                    match sock.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => raw.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let line = head.lines().next().unwrap_or_default().to_string();
+                let body = if line.starts_with("GET /api/v3/history") {
+                    // Ownership evidence: this instance sent the grab,
+                    // which is what licenses the parse fallback below.
+                    r#"{"records": [{"eventType": "grabbed"}]}"#
+                } else if line.starts_with("GET /api/v3/queue") {
+                    r#"{"records": []}"#
+                } else if line.starts_with("GET /api/v3/parse") {
+                    r#"{"episodes": [{"id": 7}]}"#
+                } else {
+                    "{}"
+                };
+                seen.lock().unwrap().push(line);
+                let _ = sock.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+    }
+
+    let cfg = dir.join("config.json");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    // Threshold 1: the first final failure trips. The instance points at
+    // the mock *arr above.
+    std::fs::write(
+        dir.join("settings.json"),
+        format!(
+            "{{\"arr_giveup_threshold\": 1, \"arr_instances\": [{{\
+             \"name\":\"mock\",\"kind\":\"sonarr\",\"url\":\"{arr_url}\",\
+             \"apikey\":\"k\",\"enabled\":true}}]}}"
+        ),
+    )
+    .unwrap();
+
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .env("NZBFAST_AUTO_RETRY_SECS", "0")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--connections")
+            .arg("2");
+        c
+    })
+    .await;
+    let port = d.port;
+
+    let spool = dir.join(".spool");
+    let dbg_log = d.log.clone();
+    let seen = arr_seen.clone();
+    tokio::task::spawn_blocking(move || {
+        // Ghost articles the news server does not carry.
+        let mut xml = String::from(
+            "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"&quot;ep.bin&quot; yEnc (1/3)\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+        );
+        for n in 1..=3 {
+            xml.push_str(&format!(
+                "      <segment bytes=\"40000\" number=\"{n}\">ghost{n}@x</segment>\n"
+            ));
+        }
+        xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+
+        // nzbname is what marks the add as *arr-originated (origin_of),
+        // and it is the name the target is parsed from.
+        let boundary = "----giveupb";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"j.nzb\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(xml.as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let r = http(
+            port,
+            "/api?mode=addfile&apikey=sekrit&output=json&nzbname=Giveup.Show.S01E02.720p.WEB.x264-TEST",
+            Some((&format!("multipart/form-data; boundary={boundary}"), &body)),
+        );
+        assert!(r.contains("\"status\":true"), "{r}");
+
+        for _ in 0..150 {
+            let h = http(port, "/api?mode=history&apikey=sekrit&output=json", None);
+            if h.contains("Failed") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+
+        // The breaker fires on a thread after park: poll for the *arr
+        // calls rather than reading once.
+        let mut calls = Vec::new();
+        for _ in 0..50 {
+            calls = seen.lock().unwrap().clone();
+            if calls.iter().any(|c| c.starts_with("PUT /api/v3/episode/monitor")) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        assert!(
+            calls.iter().any(|c| c.starts_with("GET /api/v3/queue")),
+            "the breaker never asked the *arr's queue: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.starts_with("PUT /api/v3/episode/monitor")),
+            "the target was never unmonitored: {calls:?}"
+        );
+
+        // And the evidence persists: the counter store names the episode.
+        let state = std::fs::read_to_string(spool.join("giveup-state.json"))
+            .expect("giveup-state.json written");
+        assert!(state.contains("s01e02"), "{state}");
+        assert!(
+            state.contains("\"actioned\": true"),
+            "{state}\nCALLS {calls:?}\nLOG {}",
+            std::fs::read_to_string(&dbg_log).unwrap_or_default()
+        );
+
+        // Bundle D: all of that used to happen with no endpoint that
+        // would even name it. `giveup_status` is what the Watchlist
+        // card's "Given up on" list reads.
+        let st = http(port, "/api?mode=giveup_status&apikey=sekrit&output=json", None);
+        let v: serde_json::Value = serde_json::from_str(&st).unwrap();
+        assert_eq!(v["on"], true, "{st}");
+        assert_eq!(v["threshold"], 1, "{st}");
+        let row = &v["targets"][0];
+        assert_eq!(row["label"], "Giveup Show S01E02", "{st}");
+        assert_eq!(row["tripped"], true, "{st}");
+        assert_eq!(row["actioned"], true, "{st}");
+        assert_eq!(row["stems"], 1, "{st}");
+        assert_eq!(
+            row["last_stem"], "Giveup.Show.S01E02.720p.WEB.x264-TEST",
+            "{st}"
+        );
+
+        // The trip also rides the queue payload the dashboard already
+        // polls every second - that is what toasts the moment.
+        let q = http(port, "/api?mode=queue&apikey=sekrit&output=json", None);
+        let qv: serde_json::Value = serde_json::from_str(&q).unwrap();
+        let ev = &qv["queue"]["giveup_tripped"][0];
+        assert_eq!(ev["name"], "Giveup.Show.S01E02.720p.WEB.x264-TEST", "{q}");
+        assert_eq!(ev["count"], 1, "{q}");
+
+        // "Try again" forgets the counters, so nothing is given up any
+        // more (and the latch is re-armed - see clear_target).
+        let key: String = row["key"]
+            .as_str()
+            .unwrap()
+            .bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect();
+        let r = http(
+            port,
+            &format!("/api?mode=giveup_reset&apikey=sekrit&output=json&value={key}"),
+            None,
+        );
+        assert!(r.contains("\"cleared\":true"), "{r}");
+        let after = http(port, "/api?mode=giveup_status&apikey=sekrit&output=json", None);
+        let av: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert!(
+            av["targets"].as_array().unwrap().is_empty(),
+            "the target should be gone: {after}"
+        );
+        // ...and that survives the daemon's own restart of the store.
+        let state = std::fs::read_to_string(spool.join("giveup-state.json")).unwrap();
+        assert!(!state.contains("s01e02"), "{state}");
+    })
+    .await
+    .unwrap();
+
+    drop(d);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The queue payload's `activity` field (the "what is happening right
+/// now" sub-line): empty while a job is queued, and a fetch-family
+/// token once the runner starts it. Driven against a dead server so
+/// the fetch sits in its connect ladder for the whole observation -
+/// no timing dependence on a mock's serving speed.
+#[tokio::test(flavor = "multi_thread")]
+async fn queue_activity_field_reports_the_fetch_phase() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-activity-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // A port with nothing listening: bind, read it back, drop it.
+    let dead_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!("{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{dead_port},\"tls\":false}}]}}"),
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--connections")
+            .arg("2");
+        c
+    })
+    .await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        let xml = "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"act.bin (1/1)\">\n    <groups><group>g</group></groups>\n    <segments>\n      <segment bytes=\"10000\" number=\"1\">actseg1@test</segment>\n    </segments>\n  </file>\n</nzb>\n";
+        let boundary = "----nzbfastboundary";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"act.nzb\"\r\nContent-Type: application/x-nzb\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(xml.as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let ctype = format!("multipart/form-data; boundary={boundary}");
+
+        // Paused first: a queued slot must say nothing.
+        let r = http(port, "/api?mode=pause&output=json", None);
+        assert!(r.contains("\"status\":true"), "{r}");
+        let r = http(port, "/api?mode=addfile&output=json", Some((&ctype, &body)));
+        assert!(r.contains("\"status\":true"), "{r}");
+        let q = http(port, "/api?mode=queue&output=json", None);
+        let v: serde_json::Value = serde_json::from_str(&q).unwrap();
+        let slot = &v["queue"]["slots"][0];
+        assert_eq!(slot["activity"], "", "queued slot must be silent: {q}");
+
+        // Resumed: the runner picks it up and the row must report a
+        // fetch-family token while the pool grinds its connect ladder.
+        let r = http(port, "/api?mode=resume&output=json", None);
+        assert!(r.contains("\"status\":true"), "{r}");
+        let mut seen = String::new();
+        for _ in 0..300 {
+            let q = http(port, "/api?mode=queue&output=json", None);
+            let v: serde_json::Value = serde_json::from_str(&q).unwrap();
+            if let Some(a) = v["queue"]["slots"][0]["activity"].as_str() {
+                seen = a.to_string();
+                if matches!(a, "connecting" | "reconnecting" | "fetching" | "waiting") {
+                    // The detail rides along for the phrases that name a
+                    // server; `connecting` carries the host.
+                    if a == "connecting" {
+                        assert_eq!(
+                            v["queue"]["slots"][0]["activity_detail"], "127.0.0.1",
+                            "{q}"
+                        );
+                    }
+                    return;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("no fetch-family activity token appeared; last seen: {seen:?}");
+    })
+    .await
+    .unwrap();
+
+    drop(d);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Bundle B: the post-download tail tells the truth, and one job's
+/// progress never appears on another job's row.
+///
+/// Two things used to go wrong at the seam between jobs, both of them
+/// because the record has exactly one state - `Downloading` - for the
+/// whole span from the first article to the last extracted byte.
+///
+/// 1. The scheduler deliberately starts job N+1 while job N's disk tail
+///    runs, and every `Downloading` slot answered its percentage from
+///    ONE pair of daemon-global counters. So the moment N+1 zeroed them,
+///    the finishing job's bar fell from ~98% to 0 and then climbed again
+///    with a download that was not its own.
+/// 2. The finishing job went on calling itself a download at 100% with
+///    the speed at zero, which is exactly what a dead pool looks like.
+///
+/// Sampled hard while two real jobs run through a mock server. The
+/// monotonicity assertion is the one that would have caught the bleed:
+/// a percentage that goes backwards is the bug, whatever caused it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_finishing_tail_is_named_and_never_borrows_the_next_job_s_bar() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-tailtruth-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+
+    // Two posts, big enough that the settle read-back after net-drain is
+    // wider than the poll interval below, and slow enough on the wire
+    // that job A is still finishing when job B starts.
+    let mut articles = HashMap::new();
+    let mut nzb = |name: &str, seed: u8| {
+        let data = payload(6_000_000, seed);
+        let segs = make_file_articles(name, &data, 100_000, name, &mut articles);
+        let mut xml = format!(
+            "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"&quot;{name}&quot; yEnc (1/60)\">\n    <groups><group>g</group></groups>\n    <segments>\n"
+        );
+        for (id, bytes, num) in &segs {
+            xml.push_str(&format!(
+                "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+            ));
+        }
+        xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+        xml
+    };
+    let xml_a = nzb("alpha.bin", 3);
+    let xml_b = nzb("bravo.bin", 7);
+    let srv = MockServer::start(
+        articles,
+        Chaos {
+            delay_ms: 12,
+            ..Chaos::default()
+        },
+    )
+    .await;
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--connections")
+            .arg("2");
+        c
+    })
+    .await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        let add = |xml: &str, name: &str| {
+            let b = "----tailboundary";
+            let mut body = Vec::new();
+            body.extend_from_slice(
+                format!(
+                    "--{b}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"{name}.nzb\"\r\nContent-Type: application/x-nzb\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(xml.as_bytes());
+            body.extend_from_slice(format!("\r\n--{b}--\r\n").as_bytes());
+            let r = http(
+                port,
+                "/api?mode=addfile&apikey=sekrit&output=json",
+                Some((&format!("multipart/form-data; boundary={b}"), &body)),
+            );
+            assert!(r.contains("\"status\":true"), "addfile refused: {r}");
+        };
+        add(&xml_a, "alpha");
+        add(&xml_b, "bravo");
+
+        // Every (status, percentage) this queue ever showed, per job, in
+        // the order it showed them.
+        let mut seen: HashMap<String, Vec<(String, u64)>> = HashMap::new();
+        let mut tails: Vec<(String, u64, String)> = Vec::new();
+        for _ in 0..4000 {
+            let body = http(port, "/api?mode=queue&apikey=sekrit&output=json", None);
+            let v: serde_json::Value = match serde_json::from_str(
+                body.split("\r\n\r\n").nth(1).unwrap_or(&body),
+            ) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let slots = v["queue"]["slots"].as_array().cloned().unwrap_or_default();
+            for s in &slots {
+                let id = s["nzo_id"].as_str().unwrap_or_default().to_string();
+                let st = s["status"].as_str().unwrap_or_default().to_string();
+                let pct: u64 = s["percentage"].as_str().unwrap_or("0").parse().unwrap_or(0);
+                if matches!(
+                    st.as_str(),
+                    "Verifying" | "Repairing" | "Extracting" | "Moving"
+                ) {
+                    tails.push((
+                        st.clone(),
+                        pct,
+                        s["mbleft"].as_str().unwrap_or_default().to_string(),
+                    ));
+                }
+                seen.entry(id).or_default().push((st, pct));
+            }
+            let h = http(port, "/api?mode=history&apikey=sekrit&output=json", None);
+            if h.matches("\"Completed\"").count() >= 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(4));
+        }
+
+        assert_eq!(seen.len(), 2, "both jobs should have been observed: {seen:?}");
+        // (1) No row's bar ever went backwards. This is the bleed, and
+        // it failed loudly before the owner tag: the finishing job's
+        // percentage dropped to whatever the next download had reached.
+        for (id, samples) in &seen {
+            let mut high = 0;
+            for (st, pct) in samples {
+                assert!(
+                    *pct >= high,
+                    "{id} went backwards to {pct}% (status {st}) after reaching {high}% \
+                     - that is another job's progress on this job's row.\nsamples: {samples:?}"
+                );
+                high = *pct;
+            }
+        }
+        // (2) The tail was named rather than reported as a download.
+        assert!(
+            tails
+                .iter()
+                .any(|(st, _, _)| st == "Verifying" || st == "Repairing" || st == "Extracting"),
+            "no verify/repair/unpack phase ever reached the queue payload; \
+             a finishing job still calls itself Downloading. observed: {tails:?}"
+        );
+        // (3) ...and a named tail reports its own bytes as all in.
+        for (st, pct, mbleft) in &tails {
+            assert_eq!(*pct, 100, "{st} reported {pct}%, not 100");
+            assert_eq!(mbleft, "0.00", "{st} reported {mbleft} MB left, not 0");
+        }
+    })
+    .await
+    .unwrap();
+
+    drop(d);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// UX §18: `move_completed` and the split-move field it introduced.
+///
+/// A relocation that stops part way leaves the payload in TWO
+/// directories, and the mover knew it and threw the fact away - so
+/// history painted the job green and its `storage` named exactly one of
+/// the two folders. `move_split` is the record of the other one.
+///
+/// This pins the whole-move path, which is the one that must NOT claim a
+/// split: the job's files reach the destination, `storage` follows them,
+/// and the field stays empty so no green download is ever slandered as
+/// half-moved. (The split branch itself is decided by counting the
+/// source directory before and after, in `relocate_completed`.)
+#[tokio::test(flavor = "multi_thread")]
+async fn a_completed_move_reports_its_destination_and_no_split() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-movesplit-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+
+    let data = payload(200_000, 5);
+    let mut articles = HashMap::new();
+    let segs = make_file_articles("moved-payload.bin", &data, 40_000, "mv", &mut articles);
+    let srv = MockServer::start(articles, Chaos::default()).await;
+
+    let mut xml = String::from(
+        "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"&quot;moved-payload.bin&quot; yEnc (1/5)\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+    );
+    for (id, bytes, num) in &segs {
+        xml.push_str(&format!(
+            "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+        ));
+    }
+    xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    // The destination is a sibling of the download folder, so the move is
+    // a plain same-filesystem one - the merge path, which is exactly the
+    // one that can split.
+    let dest = dir.join("library");
+    std::fs::create_dir_all(&dest).unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--out")
+            .arg(dir.join("complete"));
+        c
+    })
+    .await;
+    let port = d.port;
+    let dest2 = dest.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let r = http(
+            port,
+            &format!(
+                "/api?mode=config&name=move_completed&value={}&output=json",
+                urlenc(&dest2.to_string_lossy())
+            ),
+            None,
+        );
+        assert!(r.contains("true"), "move_completed was not accepted: {r}");
+
+        let boundary = "----movesplitb";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"moved.nzb\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(xml.as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let r = http(
+            port,
+            "/api?mode=addfile&output=json",
+            Some((&format!("multipart/form-data; boundary={boundary}"), &body)),
+        );
+        assert!(r.contains("nzo_ids"), "{r}");
+
+        let mut hist = String::new();
+        for _ in 0..150 {
+            hist = http(port, "/api?mode=history&output=json", None);
+            if hist.contains("\"Completed\"") || hist.contains("\"Failed\"") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        assert!(hist.contains("\"Completed\""), "never completed: {hist}");
+        let v: serde_json::Value = serde_json::from_str(&hist).unwrap();
+        let slot = &v["history"]["slots"][0];
+        // The record follows the bytes...
+        let storage = slot["storage"].as_str().unwrap_or("");
+        assert!(
+            storage.contains("library"),
+            "the record did not follow the move: {slot}"
+        );
+        // ...and says nothing about a split, because there was none.
+        assert_eq!(slot["move_split"], "", "a whole move claimed a split: {slot}");
+        // The payload really is at the destination and gone from the
+        // download folder - a green row over a half-moved job is the
+        // exact thing the field exists to prevent.
+        let moved = walk_files(&dest2);
+        assert!(
+            moved.iter().any(|p| p.ends_with("moved-payload.bin")),
+            "payload never reached the destination: {moved:?}"
+        );
+    })
+    .await
+    .unwrap();
+
+    drop(d);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Percent-encode a filesystem path for an API query value.
+fn urlenc(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// Every regular file under `root`, recursively.
+fn walk_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk_files(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
 }

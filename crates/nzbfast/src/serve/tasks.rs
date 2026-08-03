@@ -771,6 +771,31 @@ pub(super) fn spawn_predb_feed(daemon: &Arc<Daemon>) {
                         info!(target: "index", "split-set merge complete - correlation will re-walk");
                     }
                 }
+                // §87 the par2-sidecar fold: a split posting's recovery
+                // set lands as its own par2-only row on the bare base
+                // stem (88% of split-container rows have one). Folding
+                // it in kills the junk row and gives the container a
+                // true has_par2, closing the hidden-par2 scoring leak.
+                // Not one-time: ingest keeps producing pairs, so the
+                // walk parks at the top id and follows it.
+                if daemon2.indexing_pause_reason().is_none()
+                    && let Some((p, f)) = daemon2.with_index_mut(|ix| {
+                        // Same rule as above: an error must be SAID.
+                        match ix.par2_sidecar_fold() {
+                            Ok((p, f, _)) => Some((p, f)),
+                            Err(e) => {
+                                warn!(target: "index", "par2 sidecar fold error: {e}");
+                                None
+                            }
+                        }
+                    })
+                    && p > 0
+                {
+                    info!(
+                        target: "index",
+                        "par2 sidecar fold: {p} sidecar row(s) folded in ({f} par2 file(s))"
+                    );
+                }
                 // Phase 2: the correlation legs, behind their own
                 // switch. Same stand-down discipline as the exact legs;
                 // budgets smaller because each row costs a window query.
@@ -894,7 +919,7 @@ pub(super) fn spawn_scheduler(
             );
         }
         if let Some(l) = limit {
-            daemon.set_speed_ceiling(l);
+            daemon.set_speed_ceiling_from(l, "schedule");
             info!(target: "schedule", "startup: speedlimit {:.1} KB/s", l as f64 / 1e3);
         }
         *daemon.schedule.lock_ok() = entries;
@@ -928,6 +953,79 @@ pub(super) fn spawn_scheduler(
     Ok(())
 }
 
+/// The reasons a watch-folder file ends up listed rather than ingested.
+///
+/// Written as constants, and read back by [`watch_fail_kind`], because
+/// four of the six are SUCCESSES: the release is queued (or was
+/// downloaded weeks ago) and only the file on disk is unresolved. One
+/// sentence for all six told a user their download "couldn't be read"
+/// when it had in fact already finished, and offered a Delete that is
+/// harmless for some of them and destroys the only copy for others.
+/// Keeping the strings and the classifier in one place is what stops the
+/// two drifting: an edit to a message that forgets the mapping would
+/// silently demote that state back to the generic sentence.
+pub(super) mod watchfail {
+    /// No closing `</nzb>`, and the file has stopped growing. NOT
+    /// ingested - the only state where the user must act on the file.
+    pub(crate) const TRUNCATED: &str = "truncated: no closing </nzb>";
+    /// The identical NZB is already sitting in the queue.
+    pub(crate) const ALREADY_QUEUED: &str = "already queued";
+    /// ...and this one already finished downloading.
+    pub(crate) const ALREADY_DONE: &str = "already downloaded";
+    /// Queued, but the queue record could not be persisted, so the file
+    /// is deliberately KEPT as the recovery copy.
+    pub(crate) const UNSAVED: &str = "queued, but queue.json could not be written";
+    /// Queued and durable, but the source file could not be removed.
+    /// Prefix: the OS error is appended.
+    pub(crate) const KEPT: &str = "queued, but the file could not be removed";
+}
+
+/// Which of the six [`watchfail`] states a listed file is in, as a token
+/// the dashboard switches on. `"rejected"` is the sixth: an `enqueue`
+/// error, i.e. the only case besides `truncated` where the file really
+/// could not be used.
+/// Opaque, stable identity for one tracked watch-folder rejection
+/// (Codex sweep 2, 3 Aug L1).
+///
+/// The queue payload names these rows by basename, which is not an
+/// identity: change the watch directory and a rejected `same.nzb` can
+/// be tracked in both the old and the new one, leaving the user two
+/// identical-looking rows and the delete handler picking whichever
+/// HashMap iteration reached first. A digest of the FULL path names the
+/// row exactly. Truncated to 16 hex chars - this is a handle for a set
+/// with a handful of members, not a credential - and deliberately not
+/// the path itself, which the browser has no business holding.
+pub(crate) fn watch_fail_id(path: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(path.as_os_str().as_encoded_bytes());
+    format!("{:x}", h.finalize())[..16].to_string()
+}
+
+pub(crate) fn watch_fail_kind(msg: &str) -> &'static str {
+    if msg == watchfail::TRUNCATED {
+        "truncated"
+    } else if msg == watchfail::ALREADY_QUEUED {
+        "queued"
+    } else if msg == watchfail::ALREADY_DONE {
+        "done"
+    } else if msg == watchfail::UNSAVED {
+        "unsaved"
+    } else if msg.starts_with(watchfail::KEPT) {
+        "kept"
+    } else {
+        "rejected"
+    }
+}
+
+/// Is this listed file's release actually in hand? True for the four
+/// states where the queue (or history) owns it and only the file on disk
+/// is unfinished business - which is exactly the set where deleting the
+/// file is safe and "couldn't be read" is a lie.
+pub(crate) fn watch_fail_ingested(kind: &str) -> bool {
+    matches!(kind, "queued" | "done" | "unsaved" | "kept")
+}
+
 /// Watch-folder poller. Always running; the folder itself is a live
 /// setting (None = idle), so the dashboard can point it elsewhere or
 /// turn it off without a restart.
@@ -947,6 +1045,33 @@ pub(super) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
         // gate drops them until the writer renames.
         let mut prev_pass: std::collections::HashMap<PathBuf, (u64, u64)> =
             std::collections::HashMap::new();
+        // Keep-mode processed marker: path -> (mtime, len, nzb_sha) of
+        // every file ingested while "keep the .nzb" was on. Deleting
+        // the file WAS the durable consumed-marker; when the file
+        // stays, this set is what stops the next pass - and the next
+        // daemon START, hence persisted beside the spool - from
+        // re-downloading the whole folder. A re-save changes the
+        // signature and falls out of the set, so "re-save it to retry"
+        // stays true in keep mode too. The sha is recorded for
+        // debugging only; skipping compares (mtime, len) alone, so a
+        // settled file costs a stat per pass, never a read.
+        let seen_path = d.spool.join("watch_seen.json");
+        let mut watch_seen: std::collections::HashMap<PathBuf, (u64, u64, String)> =
+            std::fs::read(&seen_path)
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_default();
+        fn save_watch_seen(
+            path: &std::path::Path,
+            seen: &std::collections::HashMap<PathBuf, (u64, u64, String)>,
+        ) {
+            // Best-effort like save_queue: a failed write costs one
+            // re-dedupe against the queue/history shas after a restart,
+            // never a wrong download.
+            if let Ok(b) = serde_json::to_vec(seen) {
+                let _ = std::fs::write(path, b);
+            }
+        }
         // Filesystem notifications, so a drop is picked up in the time
         // it takes to write the file rather than on the next poll.
         //
@@ -967,10 +1092,28 @@ pub(super) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
             // (Re)arm the filesystem watch when the configured folder
             // changes. Failure is not fatal and not even noteworthy on
             // a share: the poll below still runs.
-            if watched != dir {
+            // Re-arm when the folder changes, AND retry while unarmed:
+            // a failed attach used to latch forever (the arm only ran on
+            // a config change), which left the watcher dead and the
+            // folder on pure 5 s polling for the daemon's whole life -
+            // exactly the "drops feel slow" a user reports. The warning
+            // still prints once per configured path, not once per retry.
+            if watched != dir || (_fs_watch.is_none() && dir.is_some()) {
+                let fresh = watched != dir;
                 _fs_watch = None;
                 watched = dir.clone();
                 if let Some(ref path) = dir {
+                    // FSEvents (and inotify by-path lookups) want an
+                    // absolute path: the daemon is launched with
+                    // `--watch watch`, and the bare relative form failed
+                    // with "No path was found" while the poll fallback
+                    // masked it. Canonicalize, falling back to cwd-join
+                    // for a folder that does not exist yet.
+                    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| {
+                        std::env::current_dir()
+                            .map(|c| c.join(path))
+                            .unwrap_or_else(|_| path.clone())
+                    });
                     let d2 = d.clone();
                     match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                         if res.is_ok() {
@@ -979,19 +1122,33 @@ pub(super) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
                     }) {
                         Ok(mut w) => {
                             use notify::Watcher;
-                            match w.watch(path, notify::RecursiveMode::NonRecursive) {
-                                Ok(()) => _fs_watch = Some(w),
-                                Err(e) => warn!(
+                            match w.watch(&abs, notify::RecursiveMode::NonRecursive) {
+                                Ok(()) => {
+                                    _fs_watch = Some(w);
+                                    info!(
+                                        target: "watch",
+                                        "watching {} - drops are picked up on the event, \
+                                         with a {}s polling backstop",
+                                        abs.display(),
+                                        d.watch_interval_secs.load(Ordering::Relaxed)
+                                    );
+                                }
+                                Err(e) if fresh => warn!(
                                     target: "watch",
                                     "{} is polled every {}s - the filesystem \
                                      watcher could not attach ({e}); this is normal on a \
-                                     network share",
-                                    path.display(),
+                                     network share (still retrying quietly)",
+                                    abs.display(),
                                     d.watch_interval_secs.load(Ordering::Relaxed)
                                 ),
+                                Err(_) => {}
                             }
                         }
-                        Err(e) => warn!(target: "watch", "no filesystem watcher ({e}); polling"),
+                        Err(e) => {
+                            if fresh {
+                                warn!(target: "watch", "no filesystem watcher ({e}); polling");
+                            }
+                        }
                     }
                 }
             }
@@ -1009,6 +1166,15 @@ pub(super) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
                         let Some(sig) = watch_sig(&p) else { continue };
                         let settled = prev_pass.get(&p) == Some(&sig);
                         this_pass.insert(p.clone(), sig);
+                        // Ingested earlier with keep-mode on and unchanged
+                        // since: already downloaded from here. Checked
+                        // before anything reads the file, so a kept
+                        // folder full of settled .nzbs costs stats, not
+                        // reads - and never lands in watch_failed as an
+                        // "already queued" warning it does not deserve.
+                        if watch_seen.get(&p).is_some_and(|(t, l, _)| (*t, *l) == sig) {
+                            continue;
+                        }
                         // Completeness is now the gate, and stillness
                         // only decides when to give up waiting for it.
                         //
@@ -1043,7 +1209,7 @@ pub(super) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
                                     );
                                     failed.insert(
                                         p.clone(),
-                                        (sig.0, sig.1, "truncated: no closing </nzb>".into()),
+                                        (sig.0, sig.1, watchfail::TRUNCATED.into(), String::new()),
                                     );
                                 }
                             }
@@ -1053,7 +1219,7 @@ pub(super) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
                             .lock()
                             .unwrap()
                             .get(&p)
-                            .is_some_and(|(t, l, _)| (*t, *l) == sig)
+                            .is_some_and(|(t, l, _, _)| (*t, *l) == sig)
                         {
                             continue;
                         }
@@ -1092,23 +1258,25 @@ pub(super) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
                             // has no dupe_key to catch it either.
                             // The queue IS persisted, so ask it.
                             let sha = nzb_sha(&bytes);
-                            let already = d
-                                .queue
-                                .lock()
-                                .unwrap()
-                                .iter()
-                                .any(|j| j.lock_ok().nzb_sha == sha);
-                            if already {
+                            // The id, not just the fact: the strip's whole
+                            // job here is to point at the record that made
+                            // this file redundant, and a name lookup in the
+                            // page picks the wrong row for a re-post.
+                            let queued_id = d.queue.lock().unwrap().iter().find_map(|j| {
+                                let g = j.lock_ok();
+                                (g.nzb_sha == sha).then(|| g.nzo_id.clone())
+                            });
+                            if let Some(queued_id) = queued_id {
                                 info!(
                                     target: "watch",
                                     "{} is already queued - leaving the file \
                                      alone rather than downloading it twice",
                                     p.display()
                                 );
-                                d.watch_failed
-                                    .lock()
-                                    .unwrap()
-                                    .insert(p.clone(), (sig.0, sig.1, "already queued".into()));
+                                d.watch_failed.lock().unwrap().insert(
+                                    p.clone(),
+                                    (sig.0, sig.1, watchfail::ALREADY_QUEUED.into(), queued_id),
+                                );
                                 continue;
                             }
                             // ...and once it finishes, it is not in the
@@ -1127,11 +1295,12 @@ pub(super) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
                             // retried - a takedown that later refills, a
                             // provider outage - so a failure must not
                             // become a permanent refusal to look at it.
-                            let done = d.history.lock_ok().iter().any(|j| {
+                            let done = d.history.lock_ok().iter().find_map(|j| {
                                 let j = j.lock_ok();
-                                j.nzb_sha == sha && j.state == JobState::Completed
+                                (j.nzb_sha == sha && j.state == JobState::Completed)
+                                    .then(|| j.nzo_id.clone())
                             });
-                            if done {
+                            if let Some(done_id) = done {
                                 info!(
                                     target: "watch",
                                     "{} has already been downloaded - leaving the \
@@ -1140,10 +1309,10 @@ pub(super) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
                                      or add the NZB from the dashboard",
                                     p.display()
                                 );
-                                d.watch_failed
-                                    .lock()
-                                    .unwrap()
-                                    .insert(p.clone(), (sig.0, sig.1, "already downloaded".into()));
+                                d.watch_failed.lock().unwrap().insert(
+                                    p.clone(),
+                                    (sig.0, sig.1, watchfail::ALREADY_DONE.into(), done_id),
+                                );
                                 continue;
                             }
                             let name = p
@@ -1151,6 +1320,29 @@ pub(super) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
                                 .unwrap_or_default()
                                 .to_string_lossy()
                                 .to_string();
+                            // The success path is the one moment nothing
+                            // explained: the file simply vanishes from
+                            // the folder (a browser's download list says
+                            // "Removed", and Gary read that as nzbfast
+                            // deleting his download). Say it in the log,
+                            // and remember it so an open dashboard can
+                            // toast it - named by the folder it came
+                            // from, which is what the user recognises.
+                            let folder = dir
+                                .file_name()
+                                .map(|f| f.to_string_lossy().to_string())
+                                .unwrap_or_else(|| dir.display().to_string());
+                            let note_pickup = || {
+                                info!(
+                                    target: "watch",
+                                    "picked up {name} from {folder} - queued"
+                                );
+                                let mut wp = d.watch_picked.lock_ok();
+                                wp.push_back((name.clone(), folder.clone(), unix_now()));
+                                while wp.len() > 8 {
+                                    wp.pop_front();
+                                }
+                            };
                             match d.enqueue(&bytes, &name, "", -100, None, "watch", false) {
                                 // Delete the user's file only once the
                                 // queue record is DURABLE.
@@ -1167,6 +1359,18 @@ pub(super) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
                                 // duplicate, and leaves the file to be
                                 // picked up if the daemon does restart.
                                 Ok(_) if d.save_queue() => {
+                                    note_pickup();
+                                    // Keep-mode: the user wants the file
+                                    // (collectors, sharing it for a bug
+                                    // report), so the durable marker is
+                                    // the seen-set instead of the
+                                    // deletion. Read live, per pickup.
+                                    if d.watch_keep_nzb.load(Ordering::Relaxed) {
+                                        watch_seen.insert(p.clone(), (sig.0, sig.1, sha.clone()));
+                                        save_watch_seen(&seen_path, &watch_seen);
+                                        d.watch_failed.lock_ok().remove(&p);
+                                        continue;
+                                    }
                                     // The queue owns the release now, so
                                     // the source goes. If it can't be
                                     // removed (read-only bind mount, no
@@ -1185,7 +1389,7 @@ pub(super) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
                                         &p,
                                         crate::smart::delete_to_trash(),
                                     ) {
-                                        Ok(()) => {
+                                        Ok(_) => {
                                             // Forget the signature with the
                                             // file: a re-drop of the same
                                             // .nzb at the same path would
@@ -1211,16 +1415,18 @@ pub(super) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
                                                 (
                                                     sig.0,
                                                     sig.1,
-                                                    format!(
-                                                        "queued, but the file could not be \
-                                                         removed: {err}"
-                                                    ),
+                                                    format!("{}: {err}", watchfail::KEPT),
+                                                    String::new(),
                                                 ),
                                             );
                                         }
                                     }
                                 }
                                 Ok(_) => {
+                                    // Queued in memory even though the
+                                    // save failed, so the pickup is
+                                    // still worth announcing.
+                                    note_pickup();
                                     warn!(
                                         target: "watch",
                                         "{name} queued but the queue could not be \
@@ -1232,8 +1438,8 @@ pub(super) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
                                         (
                                             sig.0,
                                             sig.1,
-                                            "queued, but queue.json could not be written"
-                                                .to_string(),
+                                            watchfail::UNSAVED.to_string(),
+                                            String::new(),
                                         ),
                                     );
                                 }
@@ -1242,7 +1448,7 @@ pub(super) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
                                     d.watch_failed
                                         .lock()
                                         .unwrap()
-                                        .insert(p, (sig.0, sig.1, err.to_string()));
+                                        .insert(p, (sig.0, sig.1, err.to_string(), String::new()));
                                 }
                             }
                         }
@@ -1253,6 +1459,14 @@ pub(super) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
                 }
                 // Files the user deleted or moved drop off the list.
                 d.watch_failed.lock_ok().retain(|p, _| p.exists());
+                // ...and off the keep-mode seen-set, so it never grows
+                // past what the folder actually holds. Persisted only
+                // when something actually left.
+                let before = watch_seen.len();
+                watch_seen.retain(|p, _| p.exists());
+                if watch_seen.len() != before {
+                    save_watch_seen(&seen_path, &watch_seen);
+                }
             }
             // Wake on whichever comes first: the backstop interval, or
             // the filesystem watcher saying the folder changed. The poll
@@ -1952,22 +2166,35 @@ pub(super) fn spawn_index_scan(
                     // aborts the statement the moment a job appears. An
                     // aborted refresh is NOT stamped, so it retries at
                     // the next idle hour.
-                    let handle = daemon2.with_index(|ix| Some(ix.interrupt_handle()));
+                    // The handle is taken INSIDE the blocking closure,
+                    // under the guard that runs the statement - see
+                    // MaintenanceArm. Taken out here (an earlier, since
+                    // released with_index) it belonged to a connection
+                    // some other writer could be using by the time the
+                    // watcher fired.
+                    let arm = Arc::new(super::daemon::MaintenanceArm::default());
                     let done = Arc::new(AtomicBool::new(false));
                     let watch = {
                         let jobs = daemon2.index_jobs_active.clone();
                         let done = done.clone();
+                        let arm = arm.clone();
                         tokio::spawn(abort_compact_when_job_starts(jobs, done, move || {
-                            if let Some(h) = &handle {
-                                h.interrupt();
-                            }
+                            arm.abort();
                         }))
                     };
                     let d3 = daemon2.clone();
                     let done2 = done.clone();
+                    let arm2 = arm.clone();
                     let outcome = tokio::task::spawn_blocking(move || {
                         d3.with_index(|ix| {
+                            if !arm2.arm(ix.interrupt_handle()) {
+                                // A download started before we got the
+                                // guard: do not begin at all.
+                                done2.store(true, Ordering::Release);
+                                return None;
+                            }
                             let r = ix.optimize();
+                            arm2.disarm();
                             // Inside the closure for the same reason as
                             // the VACUUM path: the watcher must never
                             // see "running" on a connection somebody
@@ -2026,7 +2253,22 @@ pub(super) fn spawn_index_scan(
                 let d3 = daemon2.clone();
                 // The prune is synchronous SQLite work on a shared
                 // connection - off the async worker.
-                let _ = tokio::task::spawn_blocking(move || d3.evict_pass()).await;
+                let outcome = tokio::task::spawn_blocking(move || d3.evict_pass()).await;
+                // Record a trim that actually removed something, so the
+                // DB card can say what happened to the releases that
+                // disappeared. `Nothing`/`Unavailable` removed nothing
+                // and must not overwrite the last real answer.
+                if let Ok(crate::serve::daemon::EvictOutcome::Ran(rep, _)) = &outcome
+                    && rep.removed > 0
+                {
+                    *daemon2.last_auto_trim.lock_ok() = Some((
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0),
+                        rep.removed as u64,
+                    ));
+                }
                 if daemon2.compact_pending.load(Ordering::Relaxed) {
                     // Republish so queries see the smaller db (the
                     // file is still big - the pages are free, not
@@ -2183,25 +2425,36 @@ pub(super) fn spawn_index_compact(
                  reclaim - this one cannot be cut short for a download, later ones can",
                 db_bytes as f64 / (1u64 << 20) as f64,
             );
-            let handle = d.with_index(|ix| Some(ix.interrupt_handle()));
+            // Armed inside the blocking closure, under the guard that
+            // runs the VACUUM - see MaintenanceArm. A handle taken here
+            // and used later belongs to a connection an unrelated
+            // writer may hold by then.
+            let arm = Arc::new(super::daemon::MaintenanceArm::default());
             let done = Arc::new(AtomicBool::new(false));
             let watch = {
                 let jobs = d.index_jobs_active.clone();
                 let done = done.clone();
+                let arm = arm.clone();
                 tokio::spawn(abort_compact_when_job_starts(jobs, done, move || {
-                    if let Some(h) = &handle {
-                        h.interrupt();
-                    }
+                    arm.abort();
                 }))
             };
             // VACUUM is a long synchronous rewrite - it belongs on a
             // blocking thread, not on an async worker.
             let done2 = done.clone();
+            let arm2 = arm.clone();
             let outcome = tokio::task::spawn_blocking(move || {
                 let before = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 let ok = d2
                     .with_index(|ix| {
+                        if !arm2.arm(ix.interrupt_handle()) {
+                            // A download started before we got the
+                            // guard: do not begin the rewrite at all.
+                            done2.store(true, Ordering::Release);
+                            return None;
+                        }
                         let r = ix.compact();
+                        arm2.disarm();
                         // Inside the closure, so the flag is set
                         // while this thread still holds the index
                         // lock: the watcher can never see "running"
@@ -3003,8 +3256,16 @@ pub(super) fn spawn_health_prober(daemon: &Arc<Daemon>, config: &std::path::Path
 }
 
 /// Is nothing downloading right now? The prober's whole stand-down rule.
+///
+/// Both pipelines, not just the primary runner: the idle-server prefetch
+/// sidecar holds live NNTP connections of its own (and in the borrow
+/// case it deliberately shares a BUSY server's headroom), and the runner
+/// clears `started_at` before it awaits the previous job's tail and
+/// winds the sidecar down - a span that has run minutes in the field.
+/// Probing through that window pipelines STATs onto servers the sidecar
+/// is downloading on, which is exactly what §77 stands down to avoid.
 fn download_idle(d: &Arc<Daemon>) -> bool {
-    d.started_at.lock_ok().is_none()
+    d.started_at.lock_ok().is_none() && d.sidecar.lock_ok().is_none()
 }
 
 /// The sampled message-ids for one job, and the age in days of the
@@ -3213,6 +3474,16 @@ pub(super) fn spawn_rss_poller(
         let mut due: std::collections::HashMap<String, Instant> = std::collections::HashMap::new();
         loop {
             let feed_list = d.feeds.lock_ok().clone();
+            // §G: forget the health of feeds that are no longer
+            // configured, so a removed-and-re-added url starts clean and
+            // the map cannot grow across a long-running daemon.
+            {
+                let live: std::collections::HashSet<&str> =
+                    feed_list.iter().map(|f| f.url.as_str()).collect();
+                d.feed_health
+                    .lock_ok()
+                    .retain(|u, _| live.contains(u.as_str()));
+            }
             for feed in feed_list {
                 let now = Instant::now();
                 if due.get(&feed.url).is_some_and(|t| *t > now) {
@@ -3222,17 +3493,63 @@ pub(super) fn spawn_rss_poller(
                     feed.url.clone(),
                     now + std::time::Duration::from_secs(feed.interval_secs.max(60)),
                 );
-                let items = tokio::task::spawn_blocking({
+                let polled = tokio::task::spawn_blocking({
                     let url = feed.url.clone();
                     move || {
-                        fetch_url(&url)
-                            .map(|f| crate::rss::parse_feed(&String::from_utf8_lossy(&f.bytes)))
+                        // parse_feed_checked, not parse_feed: an HTTP
+                        // 200 that is not a feed (the login page a
+                        // revoked apikey gets) has to reach the failure
+                        // arm below, not be recorded as a healthy feed
+                        // with nothing new (Codex sweep 2, 3 Aug ML1).
+                        let body = fetch_url(&url)?;
+                        crate::rss::parse_feed_checked(&String::from_utf8_lossy(&body.bytes))
+                            .map_err(|e| anyhow::anyhow!("{url}: {e}"))
                     }
                 })
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .unwrap_or_default();
+                .await;
+                // §G: what this poll did, recorded per feed. Every one of
+                // these arms used to collapse to an empty list, so a
+                // revoked apikey, a 403, a dead host and a feed with
+                // genuinely nothing new were the same event to everyone
+                // downstream - including the user, whose settings row
+                // said nothing either way.
+                let items = match polled {
+                    Ok(Ok(items)) => {
+                        d.feed_health.lock_ok().insert(
+                            feed.url.clone(),
+                            crate::rss::FeedHealth::ok(unix_now(), items.len()),
+                        );
+                        items
+                    }
+                    Ok(Err(e)) => {
+                        // redact_url_creds, always: a feed url essentially
+                        // always embeds the indexer's apikey, and both
+                        // ureq's Display and fetch_url's own bails lead
+                        // with the url they were handed. This string goes
+                        // to the log ring AND to the settings row.
+                        let h = crate::rss::FeedHealth::failed(
+                            unix_now(),
+                            &e.to_string(),
+                            redact_url_creds,
+                        );
+                        warn!(target: "rss", "feed poll failed: {}", h.last_error);
+                        d.feed_health.lock_ok().insert(feed.url.clone(), h);
+                        Vec::new()
+                    }
+                    Err(e) => {
+                        // The blocking task itself died (panic, or a
+                        // runtime shutting down). Nothing about the feed
+                        // is known; say that rather than "no items".
+                        let h = crate::rss::FeedHealth::failed(
+                            unix_now(),
+                            &format!("the poll did not finish: {e}"),
+                            redact_url_creds,
+                        );
+                        warn!(target: "rss", "feed poll task failed: {}", h.last_error);
+                        d.feed_health.lock_ok().insert(feed.url.clone(), h);
+                        Vec::new()
+                    }
+                };
                 for it in items {
                     if seen.lock_ok().contains(&it.guid) {
                         continue;
@@ -3482,6 +3799,11 @@ pub(super) fn spawn_download_worker(
                     );
                     guard_reason = Some("disk".into());
                 }
+                // Refreshed every pass, not just on entry: the free
+                // figure moves while the user clears space, and the row
+                // strip shows it live.
+                *d.queue_hold.lock_ok() =
+                    Some(("disk".into(), free as f64 / 1e9, min as f64 / 1e9));
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }
@@ -3532,11 +3854,19 @@ pub(super) fn spawn_download_worker(
                     );
                     guard_reason = Some("quota".into());
                 }
+                *d.queue_hold.lock_ok() =
+                    Some(("quota".into(), led.spent() as f64 / 1e9, quota as f64 / 1e9));
                 only_force = true;
             }
             if guard_reason.is_some() && !only_force {
                 info!(target: "guard", "cleared");
                 guard_reason = None;
+            }
+            if guard_reason.is_none() {
+                let mut h = d.queue_hold.lock_ok();
+                if h.is_some() {
+                    *h = None;
+                }
             }
             d.run_due_auto_retries();
             let Some(job) = d.pick_job(only_force) else {
@@ -3571,7 +3901,7 @@ pub(super) fn spawn_download_worker(
                     }
                 }
             }
-            let (nzb_path, out_dir, total, library, nzo_id, name, prio, job_password) = {
+            let (nzb_path, out_dir, total, library, nzo_id, name, prio, job_password, eat_ok) = {
                 let mut j = job.lock_ok();
                 j.state = JobState::Downloading;
                 (
@@ -3583,6 +3913,7 @@ pub(super) fn spawn_download_worker(
                     j.name.clone(),
                     j.priority,
                     j.password.clone(),
+                    j.eat_volumes_ok,
                 )
             };
             let index_job_guard = d.begin_index_job();
@@ -3594,8 +3925,25 @@ pub(super) fn spawn_download_worker(
                 let idle = index_pass_gate.lock().await;
                 drop(idle);
             }
-            d.progress.store(0, Ordering::Relaxed);
-            d.active_total.store(total, Ordering::Relaxed);
+            // Claim the shared progress counters for THIS job, in one
+            // lock section with the zeroing they describe. A queue
+            // payload that reads the owner can then never pair it with
+            // the next job's zeroes: it either gets the lock first and
+            // sees the previous owner with the previous counters, or
+            // gets it after and sees this job with this job's.
+            {
+                let mut owner = d.active_dl.lock_ok();
+                d.progress.store(0, Ordering::Relaxed);
+                d.active_total.store(total, Ordering::Relaxed);
+                // The UX §15 fetch-plan pair goes with them, and the plan
+                // is zeroed FIRST: a reader that catches the gap sees "no
+                // plan" and falls back to the counters above, never a
+                // fresh plan paired with the previous job's finished
+                // count.
+                d.hub.fetch_plan.store(0, Ordering::Relaxed);
+                d.hub.fetch_done.store(0, Ordering::Relaxed);
+                *owner = Some(nzo_id.clone());
+            }
             let t_start = Instant::now();
             *d.started_at.lock_ok() = Some(t_start);
 
@@ -3605,6 +3953,7 @@ pub(super) fn spawn_download_worker(
                 // M14i metadata-only: STAT-sample availability instead of
                 // downloading. Pass → Completed + .strm pointer; the real
                 // fetch happens on first /stream/<id> playback.
+                d.hub.activity.lock_ok().insert(nzo_id.clone(), "preflight");
                 let verdict = crate::check(&config, &nzb_path, 10, 4, 50).await;
                 {
                     let mut j = job.lock_ok();
@@ -3669,6 +4018,7 @@ pub(super) fn spawn_download_worker(
             // (a provider hiccup mid-probe) must never fail a job the
             // download itself might well complete.
             if d.preflight.load(Ordering::Relaxed) {
+                d.hub.activity.lock_ok().insert(nzo_id.clone(), "preflight");
                 match crate::check(&config, &nzb_path, 10, 4, 50).await {
                     Ok(crate::Verdict::Impossible {
                         est_missing,
@@ -3723,6 +4073,9 @@ pub(super) fn spawn_download_worker(
                 .spec_prefetch
                 .store(d.quota.load(Ordering::Relaxed) == 0, Ordering::Relaxed);
             *d.active_stream.lock_ok() = Some(nzo_id.clone());
+            // Queue-row sub-line: fetching, from here until the pipeline
+            // itself advances the token at its section transitions.
+            d.hub.activity.lock_ok().insert(nzo_id.clone(), "fetching");
             // Clear the hub's per-job slots BEFORE the fetch spawns: if
             // get_with_progress errors before repopulating them (bad
             // NZB, config error), net_rx resolves by drop and the
@@ -3731,6 +4084,11 @@ pub(super) fn spawn_download_worker(
             // and article counts and stamping its bad blocks here.
             *d.hub.pool_live.lock_ok() = None;
             *d.hub.verifier.lock_ok() = None;
+            // Same reason, for the resume credit: a leftover figure from
+            // the previous job would be subtracted from THIS job's
+            // network bytes, under-billing its quota and under-reporting
+            // its speed.
+            d.hub.resume_seeded.store(0, Ordering::Relaxed);
             // M29 oracle: fresh per-job sink - the pool records each
             // article's hit/430 into it; drained to the ledger below.
             *d.hub.oracle.lock_ok() = Some(Arc::new(nzbkit::oracle::OracleSink::default()));
@@ -3759,6 +4117,11 @@ pub(super) fn spawn_download_worker(
             // owner tag already keeps a stale entry from ever matching
             // this job's reads, so this is hygiene, not correctness.
             *d.hub.late_password.lock_ok() = None;
+            // Same owner-tag hygiene for the live wants-a-password
+            // signal and the probe's verified winner - a stale tag
+            // never matches this job's slot or record.
+            *d.hub.password_wanted.lock_ok() = None;
+            *d.hub.password_found.lock_ok() = None;
             // And the seek handle with it: SeekCtl holds a STRONG
             // extractor reference, so a stale one would pin the
             // previous job's whole extractor graph until this job
@@ -3794,6 +4157,7 @@ pub(super) fn spawn_download_worker(
                         false,
                         par_cleanup,
                         job_password,
+                        eat_ok,
                         Some(progress),
                         Some(hub),
                         &stream_owner,
@@ -3824,6 +4188,11 @@ pub(super) fn spawn_download_worker(
             // had renamed its directory, and the whole release
             // downloaded a second time (31 Jul queue soak).
             *d.started_at.lock_ok() = None;
+            // Release the progress counters at the same instant and for
+            // the same reason: from here this job reads 100% and its
+            // phase word, and the next job is free to zero them without
+            // its bar appearing on this one's row.
+            *d.active_dl.lock_ok() = None;
             // The network phase is what occupies the account, so the
             // idle clock starts here rather than after the tail: the
             // post-processing that follows touches no provider.
@@ -3848,6 +4217,13 @@ pub(super) fn spawn_download_worker(
             // at net-drain (the NEXT job resets the progress counter,
             // so capture before looping).
             let dl_bytes = d.progress.load(Ordering::Relaxed);
+            // ...and the same figure plus whatever a resume already had
+            // on disk, which is what a paused row needs to report. Read
+            // here for the same reason `dl_bytes` is: the tail task
+            // below runs concurrently with the next iteration, and that
+            // zeroes both.
+            let on_disk_bytes =
+                dl_bytes.saturating_add(d.hub.resume_seeded.load(Ordering::Relaxed));
             // Bill this job's per-server bytes to the usage history
             // (pool_live is still THIS job's - the next one hasn't
             // started yet), and its article tries/430s to the
@@ -3948,11 +4324,20 @@ pub(super) fn spawn_download_worker(
                         let mut j = job2.lock_ok();
                         j.state = JobState::Queued;
                         j.suspended = false;
+                        // What is on disk, not what this run fetched:
+                        // the queue row reports its percentage from this
+                        // while paused, and a job paused twice would
+                        // otherwise report only the second stint. It was
+                        // not recorded here at all - a paused row read
+                        // 0% with the full size still to go, which is
+                        // the exact reading that has users deleting a
+                        // job whose journal is intact.
+                        j.downloaded_bytes = on_disk_bytes;
                         info!(
                             target: "pause",
                             "{} parked back in the queue ({:.2} GB already on disk)",
                             j.nzo_id,
-                            dl_bytes as f64 / 1e9
+                            on_disk_bytes as f64 / 1e9
                         );
                     }
                     d2.save_queue();
@@ -3962,7 +4347,7 @@ pub(super) fn spawn_download_worker(
                 let demoted = {
                     let mut j = job2.lock_ok();
                     match &res {
-                        Ok(()) => {
+                        Ok(_) => {
                             j.state = JobState::Completed;
                             j.fetched = true;
                         }
@@ -3987,6 +4372,25 @@ pub(super) fn spawn_download_worker(
                             {
                                 j.fail_message.push_str(&clause);
                             }
+                            // A disk that filled up during the unpack is
+                            // the one failure where the fix is entirely
+                            // in the user's hands and the cost of the
+                            // retry is near zero: the spent-volume sweep
+                            // only removes volumes after a SUCCESSFUL
+                            // extraction, so the downloaded parts are
+                            // still on disk and mode=retry resumes from
+                            // the article journal without re-fetching a
+                            // byte. Say so, with the amount to free -
+                            // the extracted payload is roughly the size
+                            // of the set. APPENDED, same rule as the
+                            // health clause above.
+                            if crate::serve::disk_full_failure(&j.fail_message) {
+                                let clause = format!(
+                                    "; free about {:.1} GB on that disk and hit Retry - the downloaded archive parts are kept, so nothing is re-downloaded and only the unpack re-runs",
+                                    j.total_bytes as f64 / 1e9
+                                );
+                                j.fail_message.push_str(&clause);
+                            }
                             // Keep the console block that explains the
                             // one-liner. Failures are where a user
                             // needs the log MOST and where it is least
@@ -3996,7 +4400,19 @@ pub(super) fn spawn_download_worker(
                     }
                     j.downloaded_bytes = dl_bytes;
                     j.elapsed_secs = dl_secs;
-                    j.bad_blocks = verifier.as_ref().map_or(0, |v| v.live_counts().1);
+                    // A verdict only where something actually verified.
+                    // `live_counts()` is (ok + bad, bad): no verifier at
+                    // all (par2-less post) and a verifier that mapped
+                    // nothing (the resume case) both check zero blocks,
+                    // and neither is evidence the payload is clean. Keep
+                    // an earlier run's verdict rather than overwriting it
+                    // with "unknown" - a retry that maps nothing in
+                    // stream must not erase what the first pass proved.
+                    let (checked, bad) = verifier.as_ref().map_or((0, 0), |v| v.live_counts());
+                    if checked > 0 {
+                        j.bad_blocks = Some(bad);
+                        j.verify_blocks = checked;
+                    }
                     // Latch the shape for history. Keep whatever a
                     // previous run learned if this one recognized
                     // nothing (a resume maps nothing in-stream, and
@@ -4126,9 +4542,11 @@ fn media_claim_name(j: &Job) -> String {
 
 /// Has this job's chip stopped changing? A partial answer is worth
 /// showing - the resolution lands before the audio - but it is not worth
-/// keeping.
+/// keeping. A chip owed a re-judge (the identity oracle answered after
+/// pass 1 settled) is not settled either: the facts are complete but the
+/// NAME they were judged against has changed.
 fn media_settled(j: &Job) -> bool {
-    j.media.as_ref().is_some_and(|m| m.complete && m.any())
+    !j.media_rejudge && j.media.as_ref().is_some_and(|m| m.complete && m.any())
 }
 
 /// Latch a probe result, never downgrading. Same rule as
@@ -4244,6 +4662,15 @@ pub(super) fn spawn_media_prober(daemon: &Arc<Daemon>) {
                     }
                 }
             }
+            // Jobs whose chip settled before the identity oracle
+            // answered: post-processing queued them for one more pass
+            // against the canonical name (they left `finals` when they
+            // settled, so they have to be re-admitted here).
+            for id in d.media_rejudge.lock_ok().drain(..) {
+                if !finals.iter().any(|(f, _)| f == &id) {
+                    finals.push((id, std::time::Instant::now()));
+                }
+            }
             // Pass 2. One job per tick, and only once post-processing
             // has published the payload: `finalizing` is set for the
             // whole of unpack/rename/move, during which out_dir names a
@@ -4261,6 +4688,10 @@ pub(super) fn spawn_media_prober(daemon: &Arc<Daemon>) {
                     let Some(job) = d.history_job(&id) else {
                         continue;
                     };
+                    // This attempt IS the re-judge, whatever it reads:
+                    // cleared before the probe so a failed read leaves
+                    // the chip settled-as-judged, not owed forever.
+                    job.lock_ok().media_rejudge = false;
                     let (d2, job2) = (d.clone(), job.clone());
                     if let Ok(Some(facts)) =
                         tokio::task::spawn_blocking(move || probe_disk_facts(&d2, &job2)).await
@@ -4330,6 +4761,95 @@ fn probe_disk_facts(d: &Daemon, job: &Arc<Mutex<Job>>) -> Option<nzbkit::mediapr
 ///   capacity already downloading the next job, every server is busy
 ///   and demoting the slow job would only idle its lone server.
 /// Thresholds are env-tunable so tests can compress the timeline.
+/// Transfer-stall episode tracker (Gary, 2 Aug: a mid-download 30-40 s
+/// flatline resumed on its own and nothing anywhere said why). A pure
+/// state machine over per-tick pool-byte totals, so the timing logic is
+/// unit-testable with synthetic clocks. Observation ONLY: it produces
+/// log lines and the queue row's "no data for Ns" sub-line, and never
+/// touches the job - the stall watchdog that once aborted a healthy run
+/// is why action stays out of scope here. Zero throughput is not zero
+/// progress (a wholly-dead post moves no bytes while the pool drives
+/// its refusal ladder perfectly), so an episode is a fact to report,
+/// never a verdict.
+pub(crate) struct StallTracker {
+    threshold: std::time::Duration,
+    /// (nzo_id, display name) of the fetch being observed.
+    job: Option<(String, String)>,
+    last_total: u64,
+    /// When the pool-byte total last moved (or the job was first seen).
+    last_change: Instant,
+    open: bool,
+}
+
+pub(crate) enum StallEvent {
+    /// Bytes have not moved for the threshold: episode starts.
+    Opened { idle_secs: u64, since: Instant },
+    /// Bytes moved again after an open episode.
+    Cleared { idle_secs: u64 },
+    /// The job went away (finished, aborted, paused) mid-episode.
+    Ended { idle_secs: u64, name: String },
+}
+
+impl StallTracker {
+    pub(crate) fn new(threshold: std::time::Duration) -> Self {
+        Self {
+            threshold,
+            job: None,
+            last_total: 0,
+            last_change: Instant::now(),
+            open: false,
+        }
+    }
+
+    /// One sample: the active fetch (if any) and its pool's cumulative
+    /// byte total across all servers. At most one event per call.
+    pub(crate) fn observe(
+        &mut self,
+        now: Instant,
+        job: Option<(&str, &str)>,
+        total_bytes: u64,
+    ) -> Option<StallEvent> {
+        let ended = |s: &Self| {
+            s.open.then(|| StallEvent::Ended {
+                idle_secs: now.duration_since(s.last_change).as_secs(),
+                name: s.job.as_ref().map(|(_, n)| n.clone()).unwrap_or_default(),
+            })
+        };
+        let Some((id, name)) = job else {
+            let ev = ended(self);
+            self.job = None;
+            self.open = false;
+            return ev;
+        };
+        if self.job.as_ref().map(|(i, _)| i.as_str()) != Some(id) {
+            let ev = ended(self);
+            self.job = Some((id.to_string(), name.to_string()));
+            self.last_total = total_bytes;
+            self.last_change = now;
+            self.open = false;
+            return ev;
+        }
+        if total_bytes != self.last_total {
+            self.last_total = total_bytes;
+            let idle = now.duration_since(self.last_change).as_secs();
+            self.last_change = now;
+            if self.open {
+                self.open = false;
+                return Some(StallEvent::Cleared { idle_secs: idle });
+            }
+            return None;
+        }
+        if !self.open && now.duration_since(self.last_change) >= self.threshold {
+            self.open = true;
+            return Some(StallEvent::Opened {
+                idle_secs: now.duration_since(self.last_change).as_secs(),
+                since: self.last_change,
+            });
+        }
+        None
+    }
+}
+
 pub(super) fn spawn_slow_job_watchdog(
     daemon: &Arc<Daemon>,
     config: &std::path::Path,
@@ -4358,8 +4878,144 @@ pub(super) fn spawn_slow_job_watchdog(
         let mut attempted: std::collections::HashSet<String> = Default::default();
         // Once per active job: "every idle server has refused auth".
         let mut refusal_noted = false;
+        // Transfer-stall episodes: one log line when the active fetch
+        // moves no bytes for NZBFAST_STALL_LOG_SECS (default 10), one
+        // when it clears - so "send me the log" captures a flatline
+        // after the fact. Observation only, and always on: it runs
+        // BEFORE the auto-defer/prefetch gates below.
+        let mut stall = StallTracker::new(std::time::Duration::from_secs(secs(
+            "NZBFAST_STALL_LOG_SECS",
+            10,
+        )));
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(tick)).await;
+            {
+                // The fetch being observed: hub owner, Downloading, not
+                // pause-suspended (a pause legitimately stops bytes).
+                let fetching = d
+                    .started_at
+                    .lock_ok()
+                    .is_some()
+                    .then(|| d.active_stream.lock_ok().clone())
+                    .flatten();
+                let job_info = fetching.and_then(|id| {
+                    d.queue.lock().unwrap().iter().find_map(|j| {
+                        let g = j.lock_ok();
+                        (g.nzo_id == id && g.state == JobState::Downloading && !g.suspended)
+                            .then(|| (id.clone(), g.name.clone()))
+                    })
+                });
+                // Per-server (host, connections, bytes, refused) - the
+                // states the episode lines report.
+                let servers: Vec<(String, usize, u64, bool)> = d
+                    .hub
+                    .pool_live
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|l| {
+                        l.servers
+                            .iter()
+                            .map(|s| {
+                                (
+                                    s.host.clone(),
+                                    s.connected.load(Ordering::Relaxed),
+                                    s.bytes.load(Ordering::Relaxed),
+                                    s.refusal.lock_ok().is_some(),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // §G: copy any refusal somewhere that outlives the pool.
+                // The Providers card reads it from the live pool, which
+                // is gone the moment the queue drains - so the one
+                // sentence explaining why a paid-for provider did
+                // nothing disappeared exactly when the user went looking
+                // for it. Sampled here rather than in the stats handler
+                // because a headless run has no dashboard polling it.
+                //
+                // The clear arm is deliberately "moved bytes or holds a
+                // connection", not "has no refusal right now": every
+                // server starts each job with an empty refusal slot, so
+                // clearing on that alone would wipe the record a second
+                // after the next job began and refill it a second later.
+                // Bytes or a live connection are proof it authenticated.
+                {
+                    let live = d.hub.pool_live.lock_ok();
+                    if let Some(l) = live.as_ref() {
+                        let mut keep = d.last_refusals.lock_ok();
+                        for s in &l.servers {
+                            if let Some(r) = s.refusal.lock_ok().as_ref() {
+                                keep.insert(
+                                    s.host.clone(),
+                                    ServerRefusal {
+                                        permanent: r.permanent,
+                                        line: r.line.clone(),
+                                        at: unix_now(),
+                                    },
+                                );
+                            } else if s.connected.load(Ordering::Relaxed) > 0
+                                || s.bytes.load(Ordering::Relaxed) > 0
+                            {
+                                keep.remove(&s.host);
+                            }
+                        }
+                    }
+                }
+                let states = || -> String {
+                    if servers.is_empty() {
+                        return "pool not up yet".into();
+                    }
+                    servers
+                        .iter()
+                        .map(|(h, c, _, r)| {
+                            if *r {
+                                format!("{h} refused")
+                            } else {
+                                format!("{h} {c} conn")
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let total: u64 = servers.iter().map(|(_, _, b, _)| *b).sum();
+                let name = job_info
+                    .as_ref()
+                    .map(|(_, n)| n.clone())
+                    .unwrap_or_default();
+                match stall.observe(
+                    Instant::now(),
+                    job_info.as_ref().map(|(i, n)| (i.as_str(), n.as_str())),
+                    total,
+                ) {
+                    Some(StallEvent::Opened { idle_secs, since }) => {
+                        info!(
+                            target: "stall",
+                            "no data for {idle_secs}s on {name}; servers: {}",
+                            states()
+                        );
+                        *d.stall_since.lock_ok() =
+                            job_info.as_ref().map(|(i, _)| (i.clone(), since));
+                    }
+                    Some(StallEvent::Cleared { idle_secs }) => {
+                        info!(
+                            target: "stall",
+                            "data flowing again on {name} after {idle_secs}s; servers: {}",
+                            states()
+                        );
+                        *d.stall_since.lock_ok() = None;
+                    }
+                    Some(StallEvent::Ended { idle_secs, name }) => {
+                        info!(
+                            target: "stall",
+                            "stall on {name} not resolved after {idle_secs}s (job ended)"
+                        );
+                        *d.stall_since.lock_ok() = None;
+                    }
+                    None => {}
+                }
+            }
             if !d.auto_defer.load(Ordering::Relaxed) && !d.auto_prefetch.load(Ordering::Relaxed) {
                 win.clear();
                 continue;
@@ -4737,6 +5393,85 @@ pub(super) fn spawn_scheduled_bench(daemon: &Arc<Daemon>, config: &std::path::Pa
     });
 }
 
+/// Judge measured provider capability against the user's stated line
+/// speed (`line_speed`, the Settings hint of what the connection can
+/// do) and store the verdict in `tune_hint` for the dashboard. Called
+/// after every ladder - auto probe or manual run.
+///
+/// Only judges with a FULL picture: line speed set, and every enabled
+/// server probed. A missing probe reads as capability the daemon
+/// can't see yet, and a false "your setup is short" is worse than
+/// saying nothing.
+///
+/// Two ways to be wrong, so two bands: well under the line (providers
+/// are the lever) and well OVER it (the setting is the lever - the
+/// ladder never stops measuring at the line speed, so a stale 300M on a
+/// gigabit link shows up here rather than silently capping the reading).
+/// In between, the setup covers the line and the hint clears.
+pub(super) fn update_tune_hint(
+    d: &Daemon,
+    servers: &[nzbkit::config::ServerConfig],
+    tuned: &std::collections::HashMap<String, crate::conntune::Tuned>,
+) {
+    let expected_bps = d.line_speed.load(Ordering::Relaxed);
+    let mut hint = String::new();
+    let enabled: Vec<_> = servers.iter().filter(|s| s.enabled).collect();
+    if expected_bps > 0
+        && !enabled.is_empty()
+        && enabled.iter().all(|s| tuned.contains_key(&s.host))
+    {
+        let cap_bytes: f64 = enabled.iter().map(|s| tuned[&s.host].gbps).sum::<f64>() * 1e9 / 8.0;
+        let pct = (100.0 * cap_bytes / expected_bps as f64).round() as u64;
+        if cap_bytes > expected_bps as f64 * 1.1 {
+            // The ladder deliberately measures PAST the line speed, so a
+            // reading well above it is not an error - it means the number
+            // in Settings is stale (an unchanged 300M after a gigabit
+            // upgrade). Say so: percentage speed limits are computed from
+            // it, so a low setting silently throttles them too.
+            hint = format!(
+                "providers measured ~{:.0} Mbps together, {pct}% of the ~{:.0} Mbps \
+                 Line speed set in Settings - the setting looks low, raise it so \
+                 percentage speed limits and these readings are right",
+                cap_bytes * 8.0 / 1e6,
+                expected_bps as f64 * 8.0 / 1e6
+            );
+        } else if cap_bytes < expected_bps as f64 * 0.8 {
+            let meas = cap_bytes * 8.0 / 1e6;
+            let want = expected_bps as f64 * 8.0 / 1e6;
+            let mut tips: Vec<String> = Vec::new();
+            for s in &enabled {
+                let t = &tuned[&s.host];
+                if t.granted > 0 && (t.granted as u32) < s.connections.max(1) {
+                    tips.push(format!(
+                        "{} granted only {} of the {} connections asked for - the \
+                         account tier may cap it",
+                        s.host, t.granted, s.connections
+                    ));
+                }
+            }
+            if enabled.len() == 1 {
+                tips.push("a second provider adds parallel headroom".into());
+            } else if tips.is_empty() {
+                tips.push("a faster provider (or one more) is the likely lever".into());
+            }
+            hint = format!(
+                "providers measured ~{meas:.0} Mbps together, {pct}% of the \
+                 ~{want:.0} Mbps line - well short. {}",
+                tips.join("; ")
+            );
+        }
+    }
+    let mut cur = d.tune_hint.lock_ok();
+    if *cur != hint {
+        if hint.is_empty() {
+            info!(target: "tune", "provider capability now covers the stated line speed");
+        } else {
+            info!(target: "tune", "{hint}");
+        }
+        *cur = hint;
+    }
+}
+
 /// M7b.1: connection auto-tune (live setting auto_connections,
 /// default ON). While the queue is idle, probe one provider whose
 /// ladder result is missing or older than a week and store the knee
@@ -4766,7 +5501,12 @@ pub(super) fn spawn_auto_connections(daemon: &Arc<Daemon>, config: &std::path::P
                 .unwrap()
                 .iter()
                 .any(|j| j.lock_ok().state == JobState::Downloading);
-            if busy {
+            // An index scan or deepening pass pulls headers over the SAME
+            // provider the ladder measures (field case: a 90k headers/s
+            // deepening pull mid-probe reads every rung flat and fakes a
+            // knee at a fraction of the true one). "Idle" must mean the
+            // LINK is idle, not just the job queue.
+            if busy || d.scan_active.load(Ordering::Relaxed) {
                 continue;
             }
             let Ok(cfg) = nzbkit::config::Config::load(&cfg_path) else {
@@ -4788,7 +5528,28 @@ pub(super) fn spawn_auto_connections(daemon: &Arc<Daemon>, config: &std::path::P
                             .get(&srv.host)
                             .is_none_or(|&t| now.saturating_sub(t) > 6 * 3600)
                         && tuned.get(&srv.host).is_none_or(|t| {
-                            now.saturating_sub(t.checked) > crate::conntune::STALE_SECS
+                            // A knee that caps the server below HALF its
+                            // configured connections halves the user's
+                            // line if it is wrong, so it does not get a
+                            // week of trust: re-probe within hours - far
+                            // enough apart that the corroborating sample
+                            // sees a different time of day. A genuine
+                            // connect-flood knee will reproduce; a
+                            // transient (congestion, a busy Mac during
+                            // the 5 s samples) will not. Field case: a
+                            // gigabit user tuned to 6 and ran at half the
+                            // speed of a 16-connection client for days.
+                            // (`suspect` flags entries written by this
+                            // build; the half-check also catches knees
+                            // recorded before the flag existed.)
+                            let suspicious =
+                                t.suspect || t.connections * 2 <= srv.connections.max(1) as usize;
+                            let ttl = if suspicious {
+                                crate::conntune::SUSPECT_STALE_SECS
+                            } else {
+                                crate::conntune::STALE_SECS
+                            };
+                            now.saturating_sub(t.checked) > ttl
                         })
                 })
                 .cloned()
@@ -4809,6 +5570,19 @@ pub(super) fn spawn_auto_connections(daemon: &Arc<Daemon>, config: &std::path::P
             match res {
                 Ok(Ok(steps)) if !steps.is_empty() => {
                     d.add_usage(&[(srv.host.clone(), steps.iter().map(|s| s.bytes).sum())]);
+                    // The per-rung rates in the log are the ONLY record
+                    // of WHY a knee was chosen - a bare verdict left a
+                    // user report ("it picked 6") undiagnosable.
+                    let rungs: Vec<String> = steps
+                        .iter()
+                        .map(|s| {
+                            format!(
+                                "{}c {:.2} Gbps (granted {})",
+                                s.connections, s.gbps, s.granted
+                            )
+                        })
+                        .collect();
+                    info!(target: "tune", "{} ladder: {}", srv.host, rungs.join(", "));
                     let peak = steps.iter().map(|s| s.gbps).fold(0.0, f64::max);
                     let best = steps
                         .iter()
@@ -4816,6 +5590,17 @@ pub(super) fn spawn_auto_connections(daemon: &Arc<Daemon>, config: &std::path::P
                         .map(|s| s.connections)
                         .unwrap_or(8);
                     let granted = steps.iter().map(|s| s.granted).max().unwrap_or(0);
+                    let limit = srv.connections.max(1) as usize;
+                    // A knee that would cut the configured count to less
+                    // than half is applied only once TWO probes agree - a
+                    // one-time provider or link wobble at probe time must
+                    // not cap the user's jobs for a week (James: a 6-of-18
+                    // knee at a third of his real speed).
+                    let corroborated = tuned.get(&srv.host).is_some_and(|p| {
+                        let (a, b) = (p.connections.max(1) as f64, best.max(1) as f64);
+                        (a - b).abs() <= a.max(b) * 0.25
+                    });
+                    let suspect = best * 2 <= limit && !corroborated;
                     crate::conntune::record(
                         &cfg_path,
                         &srv.host,
@@ -4825,10 +5610,18 @@ pub(super) fn spawn_auto_connections(daemon: &Arc<Daemon>, config: &std::path::P
                             gbps: peak,
                             checked: now,
                             source: "auto".into(),
+                            suspect,
                         },
                     );
-                    let limit = srv.connections.max(1) as usize;
-                    if best < limit {
+                    if suspect {
+                        info!(
+                            target: "tune",
+                            "{}: knee {best} of {limit} configured looks LOW - \
+                             not applied yet; a re-probe in ~6 h must agree first \
+                             ({peak:.2} Gbps peak)",
+                            srv.host
+                        );
+                    } else if best < limit {
                         info!(
                             target: "tune",
                             "{}: knee is {best} of {limit} configured - jobs \
@@ -4850,6 +5643,9 @@ pub(super) fn spawn_auto_connections(daemon: &Arc<Daemon>, config: &std::path::P
                             srv.host
                         );
                     }
+                    // With this probe recorded, re-judge total provider
+                    // capability against the user's stated line speed.
+                    update_tune_hint(&d, &cfg.servers, &crate::conntune::load(&cfg_path));
                 }
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => info!(target: "tune", "{} ladder failed: {e}", srv.host),
@@ -4857,4 +5653,100 @@ pub(super) fn spawn_auto_connections(daemon: &Arc<Daemon>, config: &std::path::P
             }
         }
     });
+}
+
+#[cfg(test)]
+mod stall_tests {
+    use super::{StallEvent, StallTracker};
+    use std::time::{Duration, Instant};
+
+    const T: Duration = Duration::from_secs(10);
+
+    fn tick(t0: Instant, secs: u64) -> Instant {
+        t0 + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn opens_after_threshold_then_clears_on_bytes() {
+        let t0 = Instant::now();
+        let mut s = StallTracker::new(T);
+        assert!(s.observe(t0, Some(("a", "job-a")), 100).is_none());
+        assert!(s.observe(tick(t0, 5), Some(("a", "job-a")), 100).is_none());
+        let ev = s.observe(tick(t0, 12), Some(("a", "job-a")), 100);
+        assert!(matches!(ev, Some(StallEvent::Opened { idle_secs: 12, .. })));
+        // Still open: no repeat event while frozen.
+        assert!(s.observe(tick(t0, 17), Some(("a", "job-a")), 100).is_none());
+        let ev = s.observe(tick(t0, 40), Some(("a", "job-a")), 250);
+        assert!(matches!(ev, Some(StallEvent::Cleared { idle_secs: 40 })));
+        // Cleared for good: moving bytes stay quiet.
+        assert!(s.observe(tick(t0, 45), Some(("a", "job-a")), 400).is_none());
+    }
+
+    #[test]
+    fn a_slow_but_moving_transfer_never_opens() {
+        // The 31 Jul stall-watchdog lesson: slow is not stalled. Any byte
+        // movement between samples resets the clock, however small.
+        let t0 = Instant::now();
+        let mut s = StallTracker::new(T);
+        for i in 0..20u64 {
+            assert!(
+                s.observe(tick(t0, i * 5), Some(("a", "job-a")), 100 + i)
+                    .is_none(),
+                "trickle sample {i} must not open an episode"
+            );
+        }
+    }
+
+    #[test]
+    fn job_end_mid_episode_reports_ended() {
+        let t0 = Instant::now();
+        let mut s = StallTracker::new(T);
+        assert!(s.observe(t0, Some(("a", "job-a")), 100).is_none());
+        assert!(matches!(
+            s.observe(tick(t0, 15), Some(("a", "job-a")), 100),
+            Some(StallEvent::Opened { .. })
+        ));
+        let ev = s.observe(tick(t0, 20), None, 0);
+        match ev {
+            Some(StallEvent::Ended { idle_secs, name }) => {
+                assert_eq!(idle_secs, 20);
+                assert_eq!(name, "job-a");
+            }
+            other => panic!("expected Ended, got {}", kind(&other)),
+        }
+        // Fully reset afterwards.
+        assert!(s.observe(tick(t0, 25), None, 0).is_none());
+    }
+
+    #[test]
+    fn job_switch_resets_the_baseline_and_ends_an_open_episode() {
+        let t0 = Instant::now();
+        let mut s = StallTracker::new(T);
+        assert!(s.observe(t0, Some(("a", "job-a")), 100).is_none());
+        assert!(matches!(
+            s.observe(tick(t0, 15), Some(("a", "job-a")), 100),
+            Some(StallEvent::Opened { .. })
+        ));
+        // New job appears with an identical byte total (fresh pool also
+        // starts at whatever it starts at): the old episode ends and the
+        // new job's clock starts from this sample, not the stale one.
+        assert!(matches!(
+            s.observe(tick(t0, 20), Some(("b", "job-b")), 100),
+            Some(StallEvent::Ended { .. })
+        ));
+        assert!(s.observe(tick(t0, 25), Some(("b", "job-b")), 100).is_none());
+        assert!(matches!(
+            s.observe(tick(t0, 31), Some(("b", "job-b")), 100),
+            Some(StallEvent::Opened { .. })
+        ));
+    }
+
+    fn kind(ev: &Option<StallEvent>) -> &'static str {
+        match ev {
+            None => "None",
+            Some(StallEvent::Opened { .. }) => "Opened",
+            Some(StallEvent::Cleared { .. }) => "Cleared",
+            Some(StallEvent::Ended { .. }) => "Ended",
+        }
+    }
 }

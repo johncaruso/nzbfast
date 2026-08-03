@@ -337,7 +337,11 @@ rápido esteja sempre no topo.</p>
 <li><b>Arraste as linhas para reordenar</b> (dentro de uma faixa de prioridade - Forçar/Alta ainda baixam primeiro);
 altere a prioridade na própria linha.</li>
 <li><b>Clique em uma linha</b> para a gaveta de detalhes: barras de progresso por arquivo, contagens de
-blocos verificados e quanto cada servidor contribuiu para <em>este</em> trabalho.</li>
+blocos verificados, quanto cada servidor contribuiu para <em>este</em> trabalho, e uma linha
+"adicionado por" dizendo de onde o trabalho veio (pasta monitorada, um app conectado, a API…).
+Um botão <b>Transferir o .nzb</b> salva o arquivo <code>.nzb</code> do trabalho - o nzbfast
+mantém sua própria cópia, então isso funciona para todo trabalho, mesmo quando o arquivo
+original já desapareceu.</li>
 <li>Emblemas mostram estados especiais: <i>adiado (lento)</i>, <i>pré-carregando</i>,
 <i>pausado</i> (veja <a href="#performance">Ferramentas de desempenho</a>).</li>
 <li>Um gráfico de contagem regressiva acompanha o total de GB restantes em toda a fila.</li>
@@ -354,7 +358,10 @@ regras de melhoria (uma cópia melhor substitui uma pior).</p>
 <p>Downloads recentes, uma linha cada. Trabalhos que falharam oferecem <b>Repetir</b>
 (retoma a partir do diário). Arquivos criptografados mostram um controle de desbloqueio 🔑 - digite a
 senha e o trabalho termina no lugar. A faixa de saúde da verificação plota os blocos PAR2 defeituosos por
-download - uma cauda crescente indica que os artigos chegam danificados.</p>
+download - uma cauda crescente indica que os artigos chegam danificados.
+A gaveta de cada linha diz quem adicionou o trabalho e tem o mesmo botão
+<b>Transferir o .nzb</b> da fila - útil para baixar um lançamento de novo em outro
+lugar, ou para anexar o <code>.nzb</code> a um relato de problema.</p>
 <p>O cartão lista dez downloads por padrão e o restante fica a um clique, no botão ▤. Status, local e o motivo de uma falha ficam atrás de um clique na própria linha, de modo que o caso comum - o que terminou, de que tamanho, quando - continua legível sem rolagem. Arraste a borda inferior do cartão para que a lista role numa altura à sua escolha. <b>History rows</b> em Ajustes → Interface muda esse dez; por ser uma propriedade do daemon e não do seu navegador, vale para todos os dispositivos que olham para esta instalação. <b>Colour History names</b>, ao lado, tinge de verde os nomes concluídos e de vermelho os que falharam; desligado, os nomes ficam neutros, e o ponto colorido e os detalhes da linha continuam dizendo qual é qual.</p>
 <h3 id="dash-usage">Uso de dados</h3>
 <p>Barras diárias por provedor e totais de Hoje / 7 dias / 30 dias - essencial para contas
@@ -368,7 +375,10 @@ medidas e de bloco. Contas de bloco mostram o uso acumulado contra seu tamanho.<
 <tr><th>Método</th><th>Como</th></tr>
 <tr><td><b>Arrastar e soltar</b></td><td>Solte um ou mais arquivos <code>.nzb</code> em qualquer lugar do painel.</td></tr>
 <tr><td><b>Pasta monitorada</b></td><td>Defina uma pasta em Ajustes; qualquer <code>.nzb</code> salvo nela é
-detectado em até 5 segundos e o arquivo é removido. Aponte a pasta de downloads do seu navegador
+detectado em até 5 segundos e movido para o Lixo, e um painel aberto anuncia cada
+recolha pelo nome ("… recolhido de Downloads"), para que um arquivo sumindo da pasta
+nunca seja um mistério. Prefere manter seus arquivos? Ligue <b>Manter os .nzb após a
+recolha</b> (veja <a href="#settings">§9</a>). Aponte a pasta de downloads do seu navegador
 para ela para capturas de um clique a partir de sites indexadores.</td></tr>
 <tr><td><b>De uma URL</b></td><td>Cole um link NZB (API <code>mode=addurl</code>, ou por qualquer app conectado).</td></tr>
 <tr><td><b>Links nzblnk:</b></td><td>Cole um link <code>nzblnk:</code> em qualquer lugar do painel, ou arraste-o para dentro. Se você instalou pelo DMG do macOS ou pelo instalador do Windows, também dá para clicar num direto no board. Veja <a href="#nzblnk">os links nzblnk</a> mais abaixo.</td></tr>
@@ -573,13 +583,15 @@ comandos).</p>
 <b>decodificadores</b> (threads de decodificação em paralelo). Amostrados quando cada trabalho começa. Os padrões
 são adequados para a maioria das linhas; use as ferramentas de ajuste antes de aumentar às cegas.</p>
 
-<p><b>Verificação rápida (CRC32)</b> (ligada por omissão) reivindica os blocos PAR2
-por CRC32 enquanto o download ainda decorre, o que é 2-3x mais rápido num CPU lento. A
-soma de verificação de cada artigo continua a ser verificada, e a passagem final usa
-sempre MD5 completo: não se troca nada em correção. Desmarque para calcular também MD5
-por bloco durante o download.</p>
+<p><b>Verificação durante a transferência</b> escolhe quanto é conferido à medida que os
+dados chegam. <i>Completa</i> confirma cada bloco PAR2 com MD5. <i>Rápida</i> (a
+predefinida) reivindica os blocos por CRC32, o que é 2-3x mais rápido num CPU lento, e
+continua a verificar a soma de verificação de cada artigo. <i>Leve</i> salta também
+essas somas de artigo assim que o PAR2 cobre um ficheiro: o dano aparece um instante
+depois, no seu bloco. Nas três, a passagem final e qualquer reparação usam MD5 completo,
+e uma transferência sem ficheiros PAR2 mantém as suas somas de artigo.</p>
 <h3>Disco e cota <span class="pill live">ao vivo</span></h3>
-<p><b>Espaço livre mínimo</b> (pausa novos trabalhos abaixo dele), <b>cota de download</b> por
+<p><b>Espaço livre mínimo</b> (pausa novos trabalhos abaixo dele; 2 GB por padrão, 0 desativa), <b>cota de download</b> por
 dia ou mês (UTC; trabalhos Forçar a ignoram), <b>limite de memória</b> - o orçamento de RAM do
 motor (padrão: ¼ da RAM, com limite; aumente-o em uma máquina com muita RAM para velocidade máxima em
 trabalhos enormes, e veja <a href="#memory">o que a pouca memória custa</a> antes de reduzi-lo)
@@ -627,12 +639,37 @@ palavra-passe. Os dois passos de apagamento aplicam-se <em>apenas</em> a release
 reconhecidas como filme ou série: uma carga de software ou um conjunto não
 classificável (ofuscado) nunca é varrido.</p>
 
+<p><b>Ficheiros eliminados vão para a Reciclagem</b> decide o que "apagar" significa
+acima. Com ela ligada, a limpeza move os ficheiros para a Reciclagem do sistema, e um
+palpite errado sobre o que era lixo pode ser desfeito; com ela desligada, são apagados
+de vez. Está <b>ligada por omissão no macOS e no Windows</b>, onde a Reciclagem fica
+num sítio que pode ver e esvaziar, e <b>desligada por omissão no Linux</b>, onde
+normalmente não fica.</p>
+<div class="note"><b>Num NAS ou num contentor, deixe isto desligado.</b> Quando os
+seus downloads estão num disco diferente da sua pasta pessoal - que é o arranjo
+normal no Unraid, Synology, numa seedbox ou em qualquer instalação Docker com uma
+partilha montada - as regras de reciclagem do Linux não usam nenhuma Reciclagem de
+área de trabalho. Criam uma pasta oculta <code>.Trash-1000</code> (o número é o seu
+id de utilizador) no topo do disco de downloads e movem os ficheiros para lá. Nada
+lhe mostra essa pasta, nada a esvazia, e o espaço que ela ocupa nunca volta.
+<p>Se correu uma versão anterior do nzbfast em Linux com isto ligado, procure essa
+pasta na raiz da sua partilha de downloads. É seguro esvaziá-la: tudo o que lá está
+é um ficheiro que uma limpeza já decidiu que não queria. O nzbfast não a esvazia por
+si, porque está no seu disco e é a si que cabe julgar.</p></div>
+
 <h3>Pastas e processamento</h3>
 <p><b>Pasta de downloads</b> <span class="pill restart">reiniciar</span>, <b>pasta monitorada</b>,
 <b>script de pós-processamento</b> (executado após cada trabalho com argumentos compatíveis com o SABnzbd
 e ambiente <code>SAB_*</code> - scripts SAB existentes funcionam sem alteração),
 <b>extensões de limpeza</b> (arquivos de lixo excluídos após a conclusão), <b>Pastas inteligentes</b>
 e <b>arquivamento de TV</b> (veja <a href="#automation">§10</a>).</p>
+<p><b>Manter os .nzb após a recolha</b> (desligado por padrão) deixa o <code>.nzb</code>
+original na pasta monitorada depois de ele entrar na fila, em vez de movê-lo para o
+Lixo - para colecionadores, e para entregar o arquivo a alguém quando um download
+corre mal. Um arquivo mantido é lembrado, inclusive entre reinícios, e não volta à
+fila; salve-o de novo para baixá-lo outra vez. Seja qual for a escolha, a gaveta de
+cada trabalho tem um botão <b>Transferir o .nzb</b>, então uma cópia do <code>.nzb</code>
+de qualquer trabalho nunca está a mais de um clique.</p>
 
 <h3>Indexação <span class="pill live">ao vivo</span></h3>
 <div class="note"><b>O indexador embutido vem desligado.</b> Ele encontra posts feitos
@@ -676,14 +713,15 @@ velocidade é mostrada no painel: megabytes (MB/s, a norma dos gestores de downl
 valor por omissão) ou megabits (Mb/s, como os ISP anunciam as linhas). Os tamanhos de
 ficheiro ficam em bytes. É uma propriedade do daemon, não do seu navegador, por isso
 aplica-se a todos os dispositivos que olham para esta instalação.</p>
-<h3>Avançado: ajustes sem controlo no painel</h3>
-<p>Seis ajustes não têm controlo na interface nem opção de linha de comandos.
-Defina-os pela API (<a href="#api">§16</a>), p. ex.
+<h3>Avançado: os botões por trás dos evidentes</h3>
+<p>Seis ajustes sem opção de linha de comandos. Cada um tem agora uma linha avançada no
+cartão de definições a que pertence, e continua a poder ser definido pela API
+(<a href="#api">§16</a>), p. ex.
 <code>/api?mode=config&amp;name=verify_mode&amp;value=lean&amp;apikey=…</code>. Como
 todos os outros, ficam guardados em <code>settings.json</code>.</p>
 <div class="tblwrap"><table>
 <tr><th>Nome</th><th>O que faz</th></tr>
-<tr><td><code>verify_mode</code></td><td><code>full</code> | <code>fast</code> | <code>lean</code> (por omissão <code>fast</code>). <code>lean</code> é o impulso para CPU lento: como fast, mas também salta o CRC yEnc por artigo assim que o PAR2 cobre um ficheiro, deixando uma camada de CRC32 em vez de duas. Downloads sem PAR2 mantêm os CRC dos artigos, e a verificação e a reparação no fim do trabalho não mudam em caso algum. A <b>Verificação rápida</b> acima é este mesmo controlo para full contra fast.</td></tr>
+<tr><td><code>verify_mode</code></td><td><code>full</code> | <code>fast</code> | <code>lean</code> (por omissão <code>fast</code>). <code>lean</code> é o impulso para CPU lento: como fast, mas também salta o CRC yEnc por artigo assim que o PAR2 cobre um ficheiro, deixando uma camada de CRC32 em vez de duas. Downloads sem PAR2 mantêm os CRC dos artigos, e a verificação e a reparação no fim do trabalho não mudam em caso algum. O seletor <b>Verificação durante a transferência</b> acima é este ajuste.</td></tr>
 <tr><td><code>auto_retry_mins</code></td><td>Espera antes da <em>única</em> nova tentativa automática que uma primeira falha por artigos em falta recebe (20 por omissão). O atraso de propagação é uma causa real de artigos em falta e resolve-se sozinho; graças ao diário, a repetição vai buscar só o que ainda falta. Falhas por palavra-passe ou remoção nunca se qualificam.</td></tr>
 <tr><td><code>index_scan_par</code></td><td>Quantos grupos o indexador analisa em paralelo (3 por omissão, limitado a 1-8).</td></tr>
 <tr><td><code>oracle_sample</code></td><td>Orçamento de STAT em repouso do oráculo de disponibilidade (<a href="#oracle">§13</a>), sondagens por hora e por servidor. 300 por omissão, 3600 no máximo, <code>0</code> desativa a amostragem por completo.</td></tr>
@@ -963,7 +1001,7 @@ a <b>chave de API</b> (controle total) e a <b>chave NZB</b> (apenas adição:
 <div class="tblwrap"><table>
 <tr><th>Área</th><th>Modos</th></tr>
 <tr><td>Fila</td><td><code>queue</code> (com <code>name=delete/pause/resume/priority/switch</code>), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>addnzblnk</code>, <code>retry</code>, <code>set_password</code></td></tr>
-<tr><td>Informações</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code></td></tr>
+<tr><td>Informações</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code>, além de <code>/jobnzb/&lt;nzo_id&gt;</code> (devolve o próprio <code>.nzb</code> guardado do trabalho, fila ou histórico; só com a chave de API completa)</td></tr>
 <tr><td>Configuração</td><td><code>get_config</code>, <code>config&amp;name=&lt;setting&gt;&amp;value=…</code> (cada campo de Ajustes), <code>server_save/delete/test/enable/reorder</code>, <code>import_probe/apply</code></td></tr>
 <tr><td>Índice e mural</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, além de newznab em <code>/api?t=caps|search|tvsearch|movie</code> e <code>/getnzb/&lt;id&gt;</code></td></tr>
 <tr><td>Automação</td><td><code>watchlist</code>, <code>watchlist_check_now</code>, <code>watch_calendar</code>, <code>feeds</code>, <code>smart_folders</code>, <code>schedule</code></td></tr>

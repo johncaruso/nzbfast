@@ -336,7 +336,11 @@ providerul tău cel mai rapid să fie mereu în frunte.</p>
 <li><b>Trage rândurile pentru a le reordona</b> (în cadrul unei benzi de prioritate - Forțată/Ridicată rulează tot primele);
 schimbă prioritatea pe loc.</li>
 <li><b>Dă clic pe un rând</b> pentru sertarul de detalii: bare de progres per fișier, numărul de
-blocuri verificate și cât a contribuit fiecare server la <em>acest</em> job.</li>
+blocuri verificate, cât a contribuit fiecare server la <em>acest</em> job și o linie
+"adăugat de" care spune de unde a venit jobul (folderul monitorizat, o aplicație
+conectată, API-ul…). Un buton <b>Descarcă fișierul .nzb</b> îți salvează fișierul
+<code>.nzb</code> al jobului - nzbfast păstrează propria copie, așa că funcționează
+pentru fiecare job, chiar și când fișierul original a dispărut demult.</li>
 <li>Insignele arată stări speciale: <i>amânat (lent)</i>, <i>preîncărcare</i>,
 <i>în pauză</i> (vezi <a href="#performance">Instrumente de performanță</a>).</li>
 <li>Un grafic burn-down urmărește totalul de GB rămași în toată coada.</li>
@@ -353,7 +357,10 @@ upgrade (o copie mai bună o înlocuiește pe una mai slabă).</p>
 <p>Descărcări recente, câte un rând fiecare. Joburile eșuate oferă <b>Reîncearcă</b>
 (reia din jurnal). Arhivele criptate arată un control de deblocare 🔑 - introdu
 parola și jobul se termină pe loc. Fâșia de sănătate a verificării trasează blocurile PAR2
-defecte per descărcare - o coadă în creștere înseamnă că articolele sosesc deteriorate.</p>
+defecte per descărcare - o coadă în creștere înseamnă că articolele sosesc deteriorate.
+Sertarul fiecărui rând spune cine a adăugat jobul și are același buton
+<b>Descarcă fișierul .nzb</b> ca în coadă - util pentru a descărca un release din nou
+în altă parte, sau pentru a atașa fișierul <code>.nzb</code> la un raport de problemă.</p>
 <p>Cardul listează implicit zece descărcări, iar restul sunt la un clic distanță, pe butonul ▤. Starea, locația și motivul pentru care un job a eșuat stau în spatele unui clic pe rândul însuși, astfel încât cazul obișnuit - ce s-a terminat, cât de mare, când - rămâne lizibil fără derulare. Trage în schimb de marginea de jos a cardului ca lista să deruleze la o înălțime aleasă de tine. <b>History rows</b> din Setări → Interfață schimbă acel zece; fiind o proprietate a daemonului și nu a browserului tău, se aplică fiecărui dispozitiv care se uită la această instalare. <b>Colour History names</b>, alături, colorează numele terminate în verde și pe cele eșuate în roșu; dezactivat, numele rămân neutre, iar punctul colorat și detaliile rândului spun în continuare care e care.</p>
 <h3 id="dash-usage">Consum de date</h3>
 <p>Bare zilnice per provider și totaluri Azi / 7 zile / 30 de zile - esențiale pentru conturile contorizate
@@ -367,7 +374,11 @@ defecte per descărcare - o coadă în creștere înseamnă că articolele soses
 <tr><th>Metodă</th><th>Cum</th></tr>
 <tr><td><b>Trage și plasează</b></td><td>Trage unul sau mai multe fișiere <code>.nzb</code> oriunde pe panou.</td></tr>
 <tr><td><b>Folder monitorizat</b></td><td>Setează un folder în Setări; orice <code>.nzb</code> salvat în el este
-preluat în 5 secunde, iar fișierul e eliminat. Îndreaptă directorul de descărcări al browserului tău
+preluat în 5 secunde și mutat la coșul de gunoi, iar un panou deschis anunță fiecare
+preluare pe nume ("… preluat din Downloads"), astfel încât un fișier care dispare din
+folder nu e niciodată un mister. Preferi să-ți păstrezi fișierele? Activează
+<b>Păstrează fișierele .nzb după preluare</b> (vezi <a href="#settings">§9</a>).
+Îndreaptă directorul de descărcări al browserului tău
 spre el pentru preluări cu un singur clic de pe site-urile de indexer.</td></tr>
 <tr><td><b>Dintr-un URL</b></td><td>Lipește un link NZB (API <code>mode=addurl</code>, sau prin orice aplicație conectată).</td></tr>
 <tr><td><b>Legături nzblnk:</b></td><td>Lipește o legătură <code>nzblnk:</code> oriunde pe panou, sau trage-o înăuntru. Dacă ai instalat din DMG-ul macOS sau din instalatorul Windows, poți și să dai clic pe una direct pe un board. Vezi <a href="#nzblnk">legăturile nzblnk</a> mai jos.</td></tr>
@@ -573,13 +584,16 @@ făcută aici este salvată în <code>settings.json</code> și supraviețuiește
 <b>decodoare</b> (fire de decodare paralele). Eșantionate când pornește fiecare job. Valorile implicite
 sunt potrivite pentru majoritatea liniilor; folosește instrumentele de reglare înainte de a mări orbește.</p>
 
-<p><b>Verificare rapidă (CRC32)</b> (activată implicit) revendică blocurile PAR2 prin
-CRC32 cât timp descărcarea încă rulează, ceea ce e de 2-3x mai rapid pe un procesor
-lent. Suma de control proprie fiecărui articol este oricum verificată, iar trecerea
-finală folosește întotdeauna MD5 complet: nu se sacrifică nimic din corectitudine.
-Debifeaz-o pentru a calcula MD5 pe bloc și în timpul descărcării.</p>
+<p><b>Verificare în timpul descărcării</b> alege cât se verifică pe măsură ce datele
+sosesc. <i>Completă</i> confirmă fiecare bloc PAR2 cu MD5. <i>Rapidă</i> (implicită)
+revendică blocurile prin CRC32, ceea ce e de 2-3x mai rapid pe un procesor lent, și
+verifică în continuare suma de control proprie fiecărui articol. <i>Sobră</i> sare în
+plus peste acele sume ale articolelor de îndată ce PAR2 acoperă un fișier: dauna apare
+atunci o clipă mai târziu, la blocul ei. În toate trei, trecerea finală și orice
+reparație folosesc MD5 complet, iar o descărcare fără fișiere PAR2 își păstrează sumele
+articolelor.</p>
 <h3>Disc și cotă <span class="pill live">live</span></h3>
-<p><b>Spațiu liber minim</b> (pune în pauză joburile noi sub el), <b>cotă de descărcare</b> pe
+<p><b>Spațiu liber minim</b> (pune în pauză joburile noi sub el; 2 GB implicit, 0 îl dezactivează), <b>cotă de descărcare</b> pe
 zi sau lună (UTC; joburile Forțate ignoră), <b>limită de memorie</b> - bugetul de RAM al motorului
 (implicit: ¼ din RAM, limitat; mărește-l pe o mașină cu mult RAM pentru viteză maximă la joburi
 uriașe și vezi <a href="#memory">cât costă memoria redusă</a> înainte de a-l scădea)
@@ -626,12 +640,38 @@ Ambii pași de ștergere se aplică <em>doar</em> release-urilor recunoscute ca 
 serial: o încărcătură software sau un set neclasificabil (ofuscat) nu este niciodată
 curățat.</p>
 
+<p><b>Fișierele șterse ajung în Coșul de gunoi</b> decide ce înseamnă "ștergere" mai
+sus. Cu ea activă, curățarea mută fișierele în Coșul de gunoi al sistemului (Recycle
+Bin), astfel încât o presupunere greșită despre ce era gunoi poate fi anulată; cu ea
+oprită, fișierele sunt șterse definitiv. Este <b>activată implicit pe macOS și
+Windows</b>, unde Coșul de gunoi este un loc pe care îl vezi și îl poți goli, și
+<b>dezactivată implicit pe Linux</b>, unde de obicei nu este.</p>
+<div class="note"><b>Pe un NAS sau într-un container, las-o oprită.</b> Când
+descărcările tale sunt pe alt disc decât directorul tău home - aranjamentul obișnuit
+pe Unraid, Synology, un seedbox sau orice instalare Docker cu un share montat -
+regulile de coș de gunoi din Linux nu folosesc deloc un coș de desktop. Ele creează
+un folder ascuns <code>.Trash-1000</code> (numărul este id-ul tău de utilizator) la
+rădăcina discului de descărcare și mută fișierele acolo. Nimic nu îți arată acel
+folder, nimic nu îl golește, iar spațiul ocupat de el nu se mai întoarce niciodată.
+<p>Dacă ai rulat o versiune mai veche de nzbfast pe Linux cu setarea activă, caută
+acel folder la rădăcina share-ului de descărcare. Este sigur de golit: tot ce e în
+el este un fișier despre care curățarea a decis deja că nu îl voiai. nzbfast nu îl
+va goli pentru tine, pentru că e pe discul tău și e judecata ta.</p></div>
+
 <h3>Foldere și procesare</h3>
 <p><b>Folder de descărcare</b> <span class="pill restart">repornire</span>, <b>folder monitorizat</b>,
 <b>script de post-procesare</b> (rulat după fiecare job cu argumente compatibile SABnzbd
 și mediul <code>SAB_*</code> - scripturile SAB existente funcționează neschimbate),
 <b>extensii de curățare</b> (fișiere gunoi șterse după finalizare), <b>Foldere inteligente</b>
 și <b>arhivare TV</b> (vezi <a href="#automation">§10</a>).</p>
+<p><b>Păstrează fișierele .nzb după preluare</b> (dezactivată implicit) lasă fișierul
+<code>.nzb</code> original în folderul monitorizat după ce a fost pus în coadă, în loc
+să-l mute la coșul de gunoi - pentru colecționari, și pentru a da fișierul cuiva când o
+descărcare face probleme. Un fișier păstrat este ținut minte, inclusiv peste reporniri,
+și nu mai este pus în coadă; salvează-l din nou pentru a-l descărca încă o dată. Oricum
+ai alege, sertarul fiecărui job are un buton <b>Descarcă fișierul .nzb</b>, așa că o
+copie a fișierului <code>.nzb</code> al oricărui job nu e niciodată la mai mult de un
+clic distanță.</p>
 
 <h3>Indexare <span class="pill live">live</span></h3>
 <div class="note"><b>Indexatorul încorporat este oprit implicit.</b> Găsește postările
@@ -676,14 +716,15 @@ valoarea implicită) sau megabiți (Mb/s, așa cum își anunță furnizorii lin
 Dimensiunile fișierelor rămân în octeți. Este o proprietate a daemonului, nu a
 navigatorului tău, deci se aplică oricărui dispozitiv care privește această
 instalare.</p>
-<h3>Avansat: setări fără control în panou</h3>
-<p>Șase setări nu au nici control în interfață, nici opțiune în linia de comandă.
-Setează-le prin API (<a href="#api">§16</a>), de ex.
+<h3>Avansat: butoanele din spatele celor evidente</h3>
+<p>Șase setări fără opțiune în linia de comandă. Fiecare are acum un rând avansat pe
+cardul de setări căruia îi aparține și rămâne accesibilă prin API
+(<a href="#api">§16</a>), de ex.
 <code>/api?mode=config&amp;name=verify_mode&amp;value=lean&amp;apikey=…</code>. Ca toate
 celelalte, ajung în <code>settings.json</code>.</p>
 <div class="tblwrap"><table>
 <tr><th>Nume</th><th>Ce face</th></tr>
-<tr><td><code>verify_mode</code></td><td><code>full</code> | <code>fast</code> | <code>lean</code> (implicit <code>fast</code>). <code>lean</code> este impulsul pentru procesoare lente: ca fast, dar sare în plus peste CRC-ul yEnc per articol de îndată ce PAR2 acoperă un fișier, lăsând un singur strat CRC32 în loc de două. Descărcările fără PAR2 își păstrează CRC-urile de articol, iar verificarea și repararea de la finalul sarcinii rămân neschimbate în ambele cazuri. <b>Verificarea rapidă</b> de mai sus este același control pentru full față de fast.</td></tr>
+<tr><td><code>verify_mode</code></td><td><code>full</code> | <code>fast</code> | <code>lean</code> (implicit <code>fast</code>). <code>lean</code> este impulsul pentru procesoare lente: ca fast, dar sare în plus peste CRC-ul yEnc per articol de îndată ce PAR2 acoperă un fișier, lăsând un singur strat CRC32 în loc de două. Descărcările fără PAR2 își păstrează CRC-urile de articol, iar verificarea și repararea de la finalul sarcinii rămân neschimbate în ambele cazuri. Selectorul <b>Verificare în timpul descărcării</b> de mai sus este această setare.</td></tr>
 <tr><td><code>auto_retry_mins</code></td><td>Așteptarea dinaintea <em>singurei</em> reîncercări automate pe care o primește un prim eșec cu articole lipsă (implicit 20). Întârzierea de propagare este o cauză reală a articolelor lipsă și se rezolvă de la sine; datorită jurnalului, reluarea aduce doar ce încă lipsește. Eșecurile din cauza parolei sau a retragerii nu se califică niciodată.</td></tr>
 <tr><td><code>index_scan_par</code></td><td>Câte grupuri scanează indexatorul în paralel (implicit 3, limitat la 1-8).</td></tr>
 <tr><td><code>oracle_sample</code></td><td>Bugetul de STAT în repaus al oracolului de disponibilitate (<a href="#oracle">§13</a>), sondaje pe oră și pe server. Implicit 300, maximum 3600, <code>0</code> dezactivează complet eșantionarea.</td></tr>
@@ -966,7 +1007,7 @@ compatibil SABnzbd, așa că integrările SAB existente funcționează neschimba
 <div class="tblwrap"><table>
 <tr><th>Zonă</th><th>Moduri</th></tr>
 <tr><td>Coadă</td><td><code>queue</code> (cu <code>name=delete/pause/resume/priority/switch</code>), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>addnzblnk</code>, <code>retry</code>, <code>set_password</code></td></tr>
-<tr><td>Info</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code></td></tr>
+<tr><td>Info</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code>, plus <code>/jobnzb/&lt;nzo_id&gt;</code> (fișierul <code>.nzb</code> păstrat al jobului, înapoi la tine - din coadă sau din istoric; doar cu cheia API completă)</td></tr>
 <tr><td>Config</td><td><code>get_config</code>, <code>config&amp;name=&lt;setting&gt;&amp;value=…</code> (fiecare câmp din Setări), <code>server_save/delete/test/enable/reorder</code>, <code>import_probe/apply</code></td></tr>
 <tr><td>Index și perete</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, plus newznab la <code>/api?t=caps|search|tvsearch|movie</code> și <code>/getnzb/&lt;id&gt;</code></td></tr>
 <tr><td>Automatizare</td><td><code>watchlist</code>, <code>watchlist_check_now</code>, <code>watch_calendar</code>, <code>feeds</code>, <code>smart_folders</code>, <code>schedule</code></td></tr>

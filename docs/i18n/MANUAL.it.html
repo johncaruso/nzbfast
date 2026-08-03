@@ -352,8 +352,12 @@ provider più veloce è sempre in cima.</p>
 <li><b>Trascina le righe per riordinare</b> (entro la stessa fascia di priorità -
 Forza/Alta scaricano comunque per prime); cambia la priorità direttamente in riga.</li>
 <li><b>Clicca una riga</b> per il pannello dei dettagli: barre di avanzamento per
-file, conteggi dei blocchi di verifica e quanto ha contribuito ciascun server a
-<em>questo</em> job.</li>
+file, conteggi dei blocchi di verifica, quanto ha contribuito ciascun server a
+<em>questo</em> job, e una riga "aggiunto da" che dice da dove è arrivato il job
+(cartella monitorata, un'app collegata, l'API…). Il pulsante <b>Scarica il .nzb</b>
+ti salva il file <code>.nzb</code> del job - nzbfast ne conserva una copia propria,
+quindi funziona per ogni job, anche quando il file originale non c'è più da
+tempo.</li>
 <li>I badge segnalano gli stati speciali: <i>rinviato (lento)</i>, <i>prefetch in corso</i>,
 <i>in pausa</i> (vedi <a href="#performance">Strumenti per le prestazioni</a>).</li>
 <li>Un grafico burn-down traccia i GB totali rimanenti nell'intera coda.</li>
@@ -371,7 +375,11 @@ di qualità e regole di upgrade (una copia migliore sostituisce una peggiore).</
 <p>I download recenti, una riga ciascuno. I job non riusciti offrono <b>Riprova</b> (riprende dal journal). Gli archivi cifrati mostrano un controllo di
 sblocco 🔑 - inserisci la password e il job si completa sul posto. La striscia della
 salute delle verifiche traccia i blocchi PAR2 danneggiati per download - una coda in
-crescita indica articoli che arrivano danneggiati.</p>
+crescita indica articoli che arrivano danneggiati.
+Il pannello di ogni riga dice chi ha aggiunto il job e ha lo stesso pulsante
+<b>Scarica il .nzb</b> della coda - comodo per scaricare di nuovo una release da
+un'altra parte, o per allegare il <code>.nzb</code> a una segnalazione di
+problema.</p>
 <p>La scheda elenca dieci download per impostazione predefinita e il resto è a un clic, sul pulsante ▤. Stato, posizione e il motivo di un fallimento stanno dietro un clic sulla riga stessa, così il caso comune - cosa è finito, quanto grande, quando - resta leggibile senza scorrere. Trascina invece il bordo inferiore della scheda per far scorrere l'elenco a un'altezza scelta da te. <b>History rows</b> in Impostazioni → Interfaccia cambia quel dieci; essendo una proprietà del daemon e non del tuo browser, vale per ogni dispositivo che guarda questa installazione. <b>Colour History names</b>, lì accanto, tinge di verde i nomi completati e di rosso quelli falliti; disattivandolo i nomi restano neutri, e il pallino colorato e i dettagli della riga continuano a dire qual è quale.</p>
 <h3 id="dash-usage">Utilizzo dati</h3>
 <p>Barre giornaliere per provider e totali Oggi / 7 giorni / 30 giorni - essenziali
@@ -386,9 +394,12 @@ complessivo rispetto alla loro dimensione.</p>
 <tr><th>Metodo</th><th>Come</th></tr>
 <tr><td><b>Trascina e rilascia</b></td><td>Trascina uno o più file <code>.nzb</code> ovunque sulla dashboard.</td></tr>
 <tr><td><b>Cartella monitorata</b></td><td>Imposta una cartella nelle Impostazioni; ogni
-<code>.nzb</code> salvato lì dentro viene raccolto entro 5 secondi e il file rimosso.
-Punta lì la cartella di download del browser per prelievi a un clic dai siti
-indexer.</td></tr>
+<code>.nzb</code> salvato lì dentro viene raccolto entro 5 secondi e spostato nel
+Cestino, e una dashboard aperta annuncia ogni prelievo per nome ("… prelevato da
+Downloads"), così un file che lascia la cartella non è mai un mistero. Preferisci
+conservare i tuoi file? Attiva <b>Conserva i .nzb dopo il prelievo</b> (vedi
+<a href="#settings">§9</a>). Punta lì la cartella di download del browser per
+prelievi a un clic dai siti indexer.</td></tr>
 <tr><td><b>Da un URL</b></td><td>Incolla un link NZB (API <code>mode=addurl</code>, o tramite qualsiasi app collegata).</td></tr>
 <tr><td><b>Link nzblnk:</b></td><td>Incolla un link <code>nzblnk:</code> ovunque sulla dashboard, oppure trascinalo dentro. Se hai installato dal DMG macOS o dall'installer Windows puoi anche cliccarne uno direttamente su un board. Vedi <a href="#nzblnk">i link nzblnk</a> più sotto.</td></tr>
 <tr><td><b>Sfoglia indice</b></td><td>Clicca una release completa nella scheda Sfoglia.</td></tr>
@@ -603,13 +614,15 @@ connessione), <b>thread di decodifica</b> (decodifica in parallelo). Campionati
 all'avvio di ogni job. I valori predefiniti vanno bene per la maggior parte delle
 linee; usa gli strumenti di ottimizzazione prima di alzare alla cieca.</p>
 
-<p><b>Verifica rapida (CRC32)</b> (attiva per impostazione predefinita) rivendica i
-blocchi PAR2 tramite CRC32 mentre il download è ancora in corso, il che è 2-3x più
-veloce su una CPU lenta. Il checksum proprio di ogni articolo viene comunque verificato
-e la passata finale usa sempre MD5 completo: non si sacrifica nulla in correttezza.
-Toglila per calcolare anche l'MD5 per blocco durante il download.</p>
+<p><b>Controllo durante lo scaricamento</b> sceglie quanto viene verificato mentre i dati
+arrivano. <i>Completo</i> conferma ogni blocco PAR2 con MD5. <i>Rapido</i> (il
+predefinito) rivendica i blocchi tramite CRC32, che è 2-3x più veloce su una CPU lenta,
+e verifica comunque il checksum proprio di ogni articolo. <i>Ridotto</i> salta anche
+quei checksum degli articoli quando PAR2 copre un file: il danno emerge un attimo dopo,
+al suo blocco. In tutti e tre la passata finale e ogni riparazione usano MD5 completo, e
+uno scaricamento senza file PAR2 mantiene i checksum degli articoli.</p>
 <h3>Disco e quota <span class="pill live">live</span></h3>
-<p><b>Spazio libero minimo</b> (sotto la soglia i nuovi job vanno in pausa),
+<p><b>Spazio libero minimo</b> (sotto la soglia i nuovi job vanno in pausa; 2 GB per impostazione predefinita, 0 lo disattiva),
 <b>quota di download</b> per giorno o mese (UTC; i job Forza la ignorano),
 <b>budget di memoria</b> - la dotazione di RAM del motore (default: ¼ della RAM, con
 limiti; alzalo su una macchina con molta RAM per la velocità massima sui job enormi,
@@ -658,6 +671,25 @@ password. Entrambi i passi di cancellazione valgono <em>solo</em> per release
 riconosciute come film o serie: un payload software o un set non classificabile
 (offuscato) non viene mai ripulito.</p>
 
+<p><b>I file eliminati vanno nel Cestino</b> decide che cosa significa "eliminare"
+qui sopra. Con l'opzione attiva, la pulizia sposta i file nel Cestino di sistema,
+così una scelta sbagliata su cosa fosse spazzatura si può annullare; con l'opzione
+spenta vengono eliminati definitivamente. È <b>attiva per impostazione predefinita
+su macOS e Windows</b>, dove il Cestino è un posto che puoi vedere e svuotare, e
+<b>spenta per impostazione predefinita su Linux</b>, dove di solito non lo è.</p>
+<div class="note"><b>Su un NAS o in un container, lasciala spenta.</b> Quando i
+download stanno su un disco diverso da quello della tua home - la disposizione
+normale su Unraid, Synology, una seedbox o qualsiasi installazione Docker con una
+condivisione montata - le regole del cestino di Linux non usano affatto un Cestino
+desktop. Creano una cartella nascosta <code>.Trash-1000</code> (il numero è il tuo
+id utente) in cima al disco dei download e spostano lì i file. Niente ti mostra
+quella cartella, niente la svuota, e lo spazio che occupa non torna mai indietro.
+<p>Se hai usato una versione precedente di nzbfast su Linux con questa opzione
+attiva, cerca quella cartella alla radice della tua condivisione dei download.
+Puoi svuotarla senza rischi: tutto ciò che contiene è un file che la pulizia aveva
+già deciso che non volevi. nzbfast non la svuoterà per te, perché sta sul tuo
+disco e il giudizio spetta a te.</p></div>
+
 <h3>Cartelle ed elaborazione</h3>
 <p><b>Cartella di download</b> <span class="pill restart">riavvio</span>, <b>cartella monitorata</b>,
 <b>script di post-elaborazione</b> (eseguito dopo ogni job con argomenti compatibili
@@ -665,6 +697,14 @@ SABnzbd e ambiente <code>SAB_*</code> - gli script SAB esistenti funzionano senz
 modifiche), <b>estensioni da ripulire</b> (file spazzatura eliminati a job
 completato), <b>Cartelle smart</b> e <b>archiviazione TV</b> (vedi
 <a href="#automation">§10</a>).</p>
+<p><b>Conserva i .nzb dopo il prelievo</b> (disattivato per impostazione
+predefinita) lascia il file <code>.nzb</code> originale nella cartella monitorata
+dopo l'accodamento, invece di spostarlo nel Cestino - per i collezionisti, e per
+consegnare il file a qualcuno quando un download dà problemi. Un file conservato
+viene ricordato, anche dopo un riavvio, e non viene riaccodato; salvalo di nuovo
+per scaricarlo ancora. Qualunque cosa tu scelga, il pannello di ogni job ha un
+pulsante <b>Scarica il .nzb</b>, quindi una copia del <code>.nzb</code> di
+qualsiasi job non è mai a più di un clic di distanza.</p>
 
 <h3>Indicizzazione <span class="pill live">live</span></h3>
 <div class="note"><b>L'indicizzatore integrato è disattivato per impostazione
@@ -708,14 +748,15 @@ mostrata ogni velocità nella dashboard: megabyte (MB/s, la norma dei download m
 il valore predefinito) o megabit (Mb/s, come gli ISP dichiarano le linee). Le dimensioni
 dei file restano in byte. È una proprietà del daemon, non del tuo browser, quindi vale
 per ogni dispositivo che guarda questa installazione.</p>
-<h3>Avanzate: impostazioni senza controllo nella dashboard</h3>
-<p>Sei impostazioni non hanno né un controllo nell'interfaccia né un'opzione da
-riga di comando. Impostale tramite l'API (<a href="#api">§16</a>), ad es.
+<h3>Avanzate: le manopole dietro a quelle ovvie</h3>
+<p>Sei impostazioni senza opzione da riga di comando. Ognuna ha ora una riga avanzata
+sulla scheda di impostazioni che la possiede, e resta impostabile dall'API
+(<a href="#api">§16</a>), ad es.
 <code>/api?mode=config&amp;name=verify_mode&amp;value=lean&amp;apikey=…</code>. Come
 tutte le altre finiscono in <code>settings.json</code>.</p>
 <div class="tblwrap"><table>
 <tr><th>Nome</th><th>Cosa fa</th></tr>
-<tr><td><code>verify_mode</code></td><td><code>full</code> | <code>fast</code> | <code>lean</code> (predefinito <code>fast</code>). <code>lean</code> è la spinta per CPU lente: come fast, ma salta anche il CRC yEnc per articolo non appena PAR2 copre un file, lasciando uno strato di CRC32 invece di due. I download senza PAR2 mantengono i CRC degli articoli, e la verifica e la riparazione di fine lavoro non cambiano in nessun caso. La <b>Verifica rapida</b> qui sopra è lo stesso controllo per full contro fast.</td></tr>
+<tr><td><code>verify_mode</code></td><td><code>full</code> | <code>fast</code> | <code>lean</code> (predefinito <code>fast</code>). <code>lean</code> è la spinta per CPU lente: come fast, ma salta anche il CRC yEnc per articolo non appena PAR2 copre un file, lasciando uno strato di CRC32 invece di due. I download senza PAR2 mantengono i CRC degli articoli, e la verifica e la riparazione di fine lavoro non cambiano in nessun caso. Il selettore <b>Controllo durante lo scaricamento</b> qui sopra è questa impostazione.</td></tr>
 <tr><td><code>auto_retry_mins</code></td><td>Attesa prima dell'<em>unico</em> ritentativo automatico concesso a un primo fallimento con articoli mancanti (predefinito 20). Il ritardo di propagazione è una causa reale di articoli mancanti e si risolve da sé; grazie al journal la ripetizione recupera solo ciò che manca ancora. I fallimenti per password o rimozione non rientrano mai.</td></tr>
 <tr><td><code>index_scan_par</code></td><td>Quanti gruppi l'indicizzatore analizza in parallelo (predefinito 3, limitato a 1-8).</td></tr>
 <tr><td><code>oracle_sample</code></td><td>Budget di STAT a riposo dell'oracolo di disponibilità (<a href="#oracle">§13</a>), sonde all'ora per server. Predefinito 300, massimo 3600, <code>0</code> disattiva del tutto il campionamento.</td></tr>
@@ -1010,7 +1051,7 @@ NZB</b> (solo inserimento: <code>addfile</code>/<code>addurl</code>). <code>addn
 <div class="tblwrap"><table>
 <tr><th>Area</th><th>Modalità</th></tr>
 <tr><td>Coda</td><td><code>queue</code> (con <code>name=delete/pause/resume/priority/switch</code>), <code>pause</code>, <code>resume</code>, <code>addfile</code>, <code>addurl</code>, <code>addnzblnk</code>, <code>retry</code>, <code>set_password</code></td></tr>
-<tr><td>Info</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code></td></tr>
+<tr><td>Info</td><td><code>history</code>, <code>status</code>/<code>fullstatus</code>, <code>stats</code>, <code>version</code>, <code>server_stats</code>, <code>usage</code>, <code>log</code>, <code>warnings</code>, più <code>/jobnzb/&lt;nzo_id&gt;</code> (restituisce il <code>.nzb</code> conservato del job, in coda o nello Storico; solo con la chiave API completa)</td></tr>
 <tr><td>Config</td><td><code>get_config</code>, <code>config&amp;name=&lt;setting&gt;&amp;value=…</code> (ogni campo delle Impostazioni), <code>server_save/delete/test/enable/reorder</code>, <code>import_probe/apply</code></td></tr>
 <tr><td>Indice e bacheca</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, più newznab su <code>/api?t=caps|search|tvsearch|movie</code> e <code>/getnzb/&lt;id&gt;</code></td></tr>
 <tr><td>Automazione</td><td><code>watchlist</code>, <code>watchlist_check_now</code>, <code>watch_calendar</code>, <code>feeds</code>, <code>smart_folders</code>, <code>schedule</code></td></tr>

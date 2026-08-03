@@ -91,6 +91,44 @@ pub struct Target {
     pub category: String,
 }
 
+/// How one target's last delivery went, as its settings row reports it.
+///
+/// A failed notification was log-only: `fire` warned and moved on, which
+/// is right for the download but wrong for the user, whose Plex token
+/// expired three weeks ago and whose library has not been rescanned
+/// since. Nothing in the UI said so.
+#[derive(Clone, Debug, Serialize)]
+pub struct Outcome {
+    /// Unix seconds when the attempt finished.
+    pub at: i64,
+    /// The HTTP status the target answered with, or 0 when it never
+    /// answered at all (DNS, refused, timeout).
+    pub code: u16,
+    /// Empty on success. Otherwise the failure as [`send`] reports it,
+    /// which by construction never contains the url - see the transport
+    /// arm at the bottom of `send`.
+    pub error: String,
+    /// True when this was a Test rather than a finished download. The row
+    /// says which, because "it worked when I pressed Test" and "the last
+    /// real download told it" are different claims.
+    pub test: bool,
+}
+
+/// The map key a caller stores an [`Outcome`] under.
+///
+/// Kind + url + name is the same triple `notify_test` already uses to
+/// find a saved target when the UI sends a blank token, so a row keeps
+/// its outcome across edits that do not change its identity.
+///
+/// The key CONTAINS the url, which for a Discord/ntfy/Gotify webhook is
+/// itself the bearer credential. It is a lookup key and nothing else:
+/// never log it, never put it in a response.
+pub fn target_key(t: &Target) -> String {
+    // \u{1} cannot appear in any of the three, so the parts cannot run
+    // together into a colliding key.
+    format!("{:?}\u{1}{}\u{1}{}", t.kind, t.url, t.name)
+}
+
 /// The finished job, flattened for templating and for the default
 /// webhook payload. Taken under the job lock once, so nothing here can
 /// deadlock against a notification that runs long.
@@ -250,18 +288,42 @@ fn wants(t: &Target, cx: &Ctx) -> bool {
 /// the blocking pool. Never panics and never propagates an error - a
 /// media server being down is not a download problem, so it is logged and
 /// dropped.
-pub fn fire(targets: &[Target], cx: &Ctx) {
+///
+/// Returns what each attempted target's delivery did, keyed by
+/// [`target_key`], for the caller to store and the settings row to show.
+/// Targets that did not want this job are absent rather than recorded as
+/// anything: a category-filtered target has not failed.
+pub fn fire(targets: &[Target], cx: &Ctx, now: i64) -> Vec<(String, Outcome)> {
+    let mut out = Vec::new();
     for t in targets.iter().filter(|t| wants(t, cx)) {
         let label = if t.name.is_empty() {
             format!("{:?}", t.kind)
         } else {
             t.name.clone()
         };
-        match send(t, cx) {
-            Ok(code) => info!(target: "notify", "{label}: {code} for {:?}", cx.name),
-            Err(e) => warn!(target: "notify", "{label} failed: {e}"),
-        }
+        let o = match send(t, cx) {
+            Ok(code) => {
+                info!(target: "notify", "{label}: {code} for {:?}", cx.name);
+                Outcome {
+                    at: now,
+                    code,
+                    error: String::new(),
+                    test: false,
+                }
+            }
+            Err(e) => {
+                warn!(target: "notify", "{label} failed: {e}");
+                Outcome {
+                    at: now,
+                    code: 0,
+                    error: e,
+                    test: false,
+                }
+            }
+        };
+        out.push((target_key(t), o));
     }
+    out
 }
 
 /// Send one target a sample notification and report what happened, for
@@ -574,6 +636,17 @@ mod tests {
     /// wrong path or a missing auth header is exactly the bug that turns
     /// into "the scan never happens" with nothing in the log.
     fn capture_one() -> (String, std::sync::mpsc::Receiver<String>) {
+        capture_answering("200 OK", "ok")
+    }
+
+    /// The same one-shot server, answering a status of the test's
+    /// choosing - the outcome-recording tests need a target that takes
+    /// the request and then rejects it, which is what an expired Plex
+    /// token or a revoked webhook actually does.
+    fn capture_answering(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (tx, rx) = std::sync::mpsc::channel();
@@ -613,7 +686,13 @@ mod tests {
                 }
             }
             let _ = tx.send(String::from_utf8_lossy(&raw).into_owned());
-            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            let _ = sock.write_all(
+                format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
             let _ = sock.flush();
         });
         (url, rx)
@@ -703,7 +782,107 @@ mod tests {
         let mut t = target(Kind::Webhook);
         t.url = "http://127.0.0.1:1".into();
         assert!(send(&t, &cx()).is_err());
-        fire(&[t], &cx());
+        fire(&[t], &cx(), 100);
+    }
+
+    #[test]
+    fn a_delivery_that_worked_is_recorded_with_its_status() {
+        let (url, rx) = capture_answering("204 No Content", "");
+        let mut t = target(Kind::Webhook);
+        t.url = url;
+        let out = fire(&[t.clone()], &cx(), 1_700_000_000);
+        recv(&rx);
+        assert_eq!(out.len(), 1, "one target, one outcome");
+        assert_eq!(out[0].0, target_key(&t), "stored under its own identity");
+        assert_eq!(out[0].1.code, 204);
+        assert_eq!(out[0].1.error, "", "a 2xx is not a failure");
+        assert_eq!(out[0].1.at, 1_700_000_000);
+        assert!(!out[0].1.test, "a fire is a real delivery, not a test");
+    }
+
+    #[test]
+    fn a_rejected_delivery_records_what_the_target_said() {
+        // The case this whole row exists for: the token expired, the
+        // media server says so on every download, and the only place it
+        // was ever written was a log line.
+        let (url, rx) = capture_answering("401 Unauthorized", "bad token");
+        let mut t = target(Kind::Webhook);
+        t.url = url;
+        let out = fire(&[t], &cx(), 42);
+        recv(&rx);
+        assert_eq!(out.len(), 1);
+        let o = &out[0].1;
+        assert_eq!(o.code, 0, "no status is claimed for a refused send");
+        assert!(o.error.contains("HTTP 401"), "{}", o.error);
+        assert!(
+            o.error.contains("bad token"),
+            "the target's own words: {}",
+            o.error
+        );
+    }
+
+    #[test]
+    fn an_unreachable_target_records_a_failure_that_names_no_url() {
+        // Same secrecy contract as the log: a webhook path IS the
+        // credential, and this string is shipped to the browser in
+        // get_config and rendered on the settings row.
+        let mut t = target(Kind::Webhook);
+        t.url = "http://127.0.0.1:1/api/webhooks/12345/SUPERSECRETTOKEN".into();
+        let out = fire(&[t], &cx(), 7);
+        assert_eq!(out.len(), 1);
+        let o = &out[0].1;
+        assert_eq!(o.code, 0);
+        assert!(!o.error.is_empty(), "an unreachable target is a failure");
+        assert!(!o.error.contains("SUPERSECRETTOKEN"), "{}", o.error);
+        assert!(!o.error.contains("webhooks"), "{}", o.error);
+    }
+
+    #[test]
+    fn a_target_that_did_not_want_this_job_records_nothing() {
+        // Absence, not a recorded success: a category-filtered target
+        // that sat out this download has not delivered anything, and a
+        // row claiming it did would be a lie in the other direction.
+        let mut t = target(Kind::Webhook);
+        t.url = "http://127.0.0.1:1".into();
+        t.category = "tv".into();
+        assert!(fire(&[t.clone()], &cx(), 1).is_empty(), "category filtered");
+        t.category = String::new();
+        t.enabled = false;
+        assert!(fire(&[t.clone()], &cx(), 1).is_empty(), "switched off");
+        t.enabled = true;
+        let mut failed = cx();
+        failed.status = "Failed";
+        assert!(
+            fire(&[t], &failed, 1).is_empty(),
+            "did not ask about failures"
+        );
+    }
+
+    #[test]
+    fn each_target_keeps_its_own_outcome() {
+        // Two rows pointing at the same media server with different
+        // tokens are two targets, and one of them failing must not paint
+        // the other one red.
+        let a = target(Kind::Kodi);
+        let mut b = a.clone();
+        b.name = "upstairs".into();
+        let mut c = a.clone();
+        c.url = "http://10.0.0.6:8080".into();
+        let mut d = a.clone();
+        d.kind = Kind::Webhook;
+        let keys = [
+            target_key(&a),
+            target_key(&b),
+            target_key(&c),
+            target_key(&d),
+        ];
+        let uniq: std::collections::HashSet<&String> = keys.iter().collect();
+        assert_eq!(uniq.len(), 4, "name, url and kind each identify a row");
+        // The token is deliberately NOT part of the identity: fixing a
+        // password must not orphan the row's history.
+        let mut retoken = a.clone();
+        retoken.token = "new".into();
+        assert_eq!(target_key(&a), target_key(&retoken));
     }
 
     #[test]

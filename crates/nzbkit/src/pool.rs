@@ -179,6 +179,13 @@ pub struct PoolConfig {
     pub article_retries: u8,
     /// Per-response read timeout (stall detection).
     pub read_timeout: Duration,
+    /// TODO 96.1 (off by default, env NZBFAST_ADAPTIVE_TIMEOUT=1):
+    /// replace the flat whole-response `read_timeout` with a two-phase
+    /// bound - an adaptive pre-byte budget from the server's TTFB EWMA
+    /// (dead connections detected in 2-10 s instead of 30) plus a
+    /// progress-rolling stall deadline on the body (a slow-but-alive
+    /// transfer is never killed for exceeding a flat cap).
+    pub adaptive_timeout: bool,
     /// Backoff after a failed connect, doubled per consecutive failure.
     pub connect_backoff: Duration,
     /// Consecutive connect failures before a worker gives up.
@@ -300,6 +307,7 @@ impl Default for PoolConfig {
             ramp_delay: Duration::from_millis(150),
             article_retries: 3,
             read_timeout: Duration::from_secs(30),
+            adaptive_timeout: false,
             connect_backoff: Duration::from_secs(2),
             max_connect_attempts: 5,
             buf_pool: None,
@@ -893,6 +901,9 @@ struct Shared {
     inflight: std::sync::Mutex<HashMap<String, Inflight>>,
     /// Per-server raw byte counters (also the caller-visible stats).
     bytes: Vec<Arc<AtomicU64>>,
+    /// Per-server time-to-status EWMA in ms (adaptive timeout path,
+    /// TODO 96.1). 0 = unmeasured, which budgets at the clamp ceiling.
+    ttfb_ms: Vec<AtomicU64>,
     /// M29 oracle: article age in days by message-id (only ids with a
     /// known non-zero age; immutable after build). Lets the outcome
     /// recorder bucket a hit/430 without threading age through Work.
@@ -1024,6 +1035,14 @@ const STREAM_LINGER: Duration = Duration::from_secs(60);
 /// line is mid-transfer at ~1/130th fair share, exactly the case where
 /// the reconnect wins.
 const PROMOTE_SHED_MIN_AGE: Duration = Duration::from_millis(400);
+
+/// Adaptive timeout decomposition (TODO 96.1), all behind
+/// `PoolConfig::adaptive_timeout`. Budget clamps mirror nntppool's
+/// field-tested 2-10 s window; the stall bound is the rolling
+/// no-progress deadline once bytes flow.
+const ADAPTIVE_FIRST_BYTE_MIN: Duration = Duration::from_secs(2);
+const ADAPTIVE_FIRST_BYTE_MAX: Duration = Duration::from_secs(10);
+const ADAPTIVE_STALL: Duration = Duration::from_secs(8);
 
 /// Per-connection pipeline depth while stream mode is active. Depth 1
 /// means a promoted article waits at most one article's transfer before
@@ -1159,7 +1178,89 @@ impl Drop for WorkerLife {
     }
 }
 
+/// The pre-byte budget an EWMA of `ewma_ms` earns: 4x it, clamped to
+/// [2 s, 10 s], with 0 ("unmeasured") budgeting at the ceiling.
+///
+/// Free function rather than a method so the escalation ladder in
+/// [`Shared::note_ttfb_timeout`] can be walked in a unit test without
+/// standing up a pool and a server.
+fn ttfb_budget_ms(ewma_ms: u64) -> u64 {
+    if ewma_ms == 0 {
+        return ADAPTIVE_FIRST_BYTE_MAX.as_millis() as u64;
+    }
+    (4 * ewma_ms).clamp(
+        ADAPTIVE_FIRST_BYTE_MIN.as_millis() as u64,
+        ADAPTIVE_FIRST_BYTE_MAX.as_millis() as u64,
+    )
+}
+
+/// The EWMA a pre-byte timeout leaves behind, given the current one.
+///
+/// See [`Shared::note_ttfb_timeout`] for why this escalates from the
+/// budget that expired rather than from `ewma_ms` itself.
+fn escalated_ttfb_ms(ewma_ms: u64) -> u64 {
+    let ceiling = ADAPTIVE_FIRST_BYTE_MAX.as_millis() as u64 / 4;
+    // The expired budget in EWMA terms - it is 4x the EWMA by
+    // construction, so dividing back out gives the value that WOULD
+    // have produced it had the clamp not intervened. From unmeasured
+    // that is the ceiling already: there is nothing to double.
+    let implied = ttfb_budget_ms(ewma_ms) / 4;
+    (ewma_ms.max(implied) * 2).clamp(1, ceiling)
+}
+
 impl Shared {
+    /// Adaptive pre-byte budget for a server (TODO 96.1): 4x its
+    /// time-to-status EWMA, clamped to [2 s, 10 s]. Unmeasured servers
+    /// budget at the ceiling - generosity until the first sample, never
+    /// a guess. With pipelining the status line is often already
+    /// buffered (a ~0 ms sample); the floor keeps the budget honest
+    /// against that collapse.
+    fn ttfb_budget(&self, idx: usize) -> Duration {
+        Duration::from_millis(ttfb_budget_ms(self.ttfb_ms[idx].load(Ordering::Relaxed)))
+    }
+
+    /// Feed one measured time-to-status into the server's EWMA
+    /// (alpha 0.2, integer ms, floor 1 so a fast loopback sample can't
+    /// re-zero the cell back to "unmeasured"). Plain load/store: a lost
+    /// update under a race is one dropped sample, not a wrong number.
+    fn note_ttfb(&self, idx: usize, sample: Duration) {
+        let ms = (sample.as_millis() as u64).max(1);
+        let cell = &self.ttfb_ms[idx];
+        let old = cell.load(Ordering::Relaxed);
+        let new = if old == 0 { ms } else { (old * 4 + ms) / 5 };
+        cell.store(new.max(1), Ordering::Relaxed);
+    }
+
+    /// A pre-byte timeout on this server: widen the budget instead of
+    /// leaving it where it was.
+    ///
+    /// Only SUCCESSFUL status reads feed the EWMA, so a budget trained
+    /// down to the 2 s floor by pipelined ~0 ms samples had no way back
+    /// up if the provider then settled at a stable latency above it:
+    /// every read timed out, every timeout produced no sample, and
+    /// healthy articles failed forever on a link the flat 30 s path
+    /// would have served (Codex sweep 3 Aug M4). A timeout is evidence
+    /// too - censored evidence ("at least this long"), so it is folded
+    /// in as a doubling rather than a measurement, and the next
+    /// successful sample decays it back down through the ordinary EWMA.
+    ///
+    /// The doubling is applied to the budget that just EXPIRED, not to
+    /// the raw EWMA, because the floor routinely hides the EWMA far
+    /// below the budget it produced. Doubling the raw value took a
+    /// 1 ms EWMA through 2, 4, 8, 16 ms - four charged attempts that
+    /// every one of them still spent at the flat 2 s floor, so a
+    /// provider that settled at 2.5 s failed every article before the
+    /// budget could widen a millisecond (Codex sweep 2, 3 Aug M6).
+    /// Escalating from the expired budget makes the next attempt's
+    /// budget strictly larger than the one that just failed - 2 s, 4 s,
+    /// 8 s, ceiling - so the retry allowance is spent probing upwards
+    /// instead of re-testing the same floor four times.
+    fn note_ttfb_timeout(&self, idx: usize) {
+        let cell = &self.ttfb_ms[idx];
+        let old = cell.load(Ordering::Relaxed);
+        cell.store(escalated_ttfb_ms(old), Ordering::Relaxed);
+    }
+
     /// Refresh the stream-mode deadline: a reader touched the hub now.
     fn note_stream(&self) {
         let now = self.start.elapsed().as_millis() as u64;
@@ -1257,6 +1358,7 @@ impl Shared {
             bytes: (0..n_servers)
                 .map(|_| Arc::new(AtomicU64::new(0)))
                 .collect(),
+            ttfb_ms: (0..n_servers).map(|_| AtomicU64::new(0)).collect(),
             ages,
             start: Instant::now(),
             dups_issued: AtomicU64::new(0),
@@ -2714,8 +2816,39 @@ async fn session_loop(
             // this conn for promoted work within ~a TLS handshake.
             let mut shed_for_promote = false;
             let read = {
-                let read_fut =
-                    tokio::time::timeout(cfg.read_timeout, conn.read_body_into(&mut buf));
+                let read_fut = async {
+                    if cfg.adaptive_timeout {
+                        // TODO 96.1: two-phase bound. Pre-byte budget
+                        // adapts to this server's measured TTFB; once
+                        // bytes flow only a genuine no-progress stall
+                        // trips. Both expiries land in the same stall
+                        // arm as the flat path's timeout (requeue with
+                        // uncharged pipeline-mates, reconnect, no
+                        // session strike).
+                        let budget = shared.ttfb_budget(ctx.idx);
+                        match conn
+                            .read_body_into_two_phase(&mut buf, budget, ADAPTIVE_STALL)
+                            .await
+                        {
+                            Ok((hit, ttfb)) => {
+                                shared.note_ttfb(ctx.idx, ttfb);
+                                Ok(Ok(hit))
+                            }
+                            Err(crate::nntp::NntpError::Timeout) => {
+                                // Censored sample: widen, or a budget
+                                // trained to the floor can never recover
+                                // from a provider that got slower (M4).
+                                shared.note_ttfb_timeout(ctx.idx);
+                                Err(())
+                            }
+                            Err(e) => Ok(Err(e)),
+                        }
+                    } else {
+                        tokio::time::timeout(cfg.read_timeout, conn.read_body_into(&mut buf))
+                            .await
+                            .map_err(|_| ())
+                    }
+                };
                 tokio::pin!(read_fut);
                 loop {
                     tokio::select! {
@@ -3277,6 +3410,48 @@ mod tests {
         }
         assert_eq!(done, n_fresh, "fresh articles all served");
         assert_eq!(retention, vec!["<ancient@x>".to_string()]);
+    }
+
+    /// TODO 96.1: the adaptive two-phase read path serves a normal run
+    /// byte-identically to the flat-timeout path, and the per-server
+    /// TTFB EWMA comes out measured. The dark flag's happy path - the
+    /// failure-shape behavior is pinned at the nntp level
+    /// (`two_phase_first_byte_budget_bounds_a_dead_connection`,
+    /// `paced_multiline_stalls_at_the_callers_bound`).
+    #[tokio::test]
+    async fn adaptive_timeout_serves_a_clean_run() {
+        use crate::mock::{Chaos, MockServer, make_file_articles};
+        let mut articles = std::collections::HashMap::new();
+        let payload: Vec<u8> = (0..60_000u32).map(|i| (i * 7) as u8).collect();
+        let segs = make_file_articles("a.bin", &payload, 8_000, "adapt", &mut articles);
+        let srv = MockServer::start(articles, Chaos::default()).await;
+        let server = srv.server_config();
+        let reqs: Vec<ArticleReq> = segs
+            .iter()
+            .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
+            .collect();
+        let n = reqs.len();
+        let cfg = PoolConfig {
+            connections: 2,
+            ramp_delay: Duration::ZERO,
+            adaptive_timeout: true,
+            ..Default::default()
+        };
+        let (tx, mut rx) = mpsc::channel(64);
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            fetch_all_multi(&[(server, cfg)], reqs, tx),
+        )
+        .await
+        .expect("run hung");
+        let mut done = 0;
+        while let Ok(o) = rx.try_recv() {
+            match o {
+                FetchOutcome::Done { .. } => done += 1,
+                other => panic!("unexpected outcome: {other:?}"),
+            }
+        }
+        assert_eq!(done, n, "every article served through the adaptive path");
     }
 
     #[test]
@@ -3844,6 +4019,46 @@ mod tests {
         assert!(*fin.borrow());
         assert_eq!(ctl.requeue(&back), 0);
         assert_eq!(shared.pending.load(Ordering::Relaxed), 0);
+    }
+
+    /// Issue #14 sibling - a MEASUREMENT, not a gate (hence ignored).
+    /// The in-stream deferral cancels every sniffed volume one
+    /// `defer_sniffed_slot` at a time, and each `cancel` drains and
+    /// rebuilds the whole pending queue while holding its mutex -
+    /// O(queue) per volume, on the lock the dispatcher pops from, during
+    /// every obfuscated download. This times that lock-hold at field
+    /// scale so the "real dispatcher pressure" claim is a number. Run:
+    /// `cargo test -p nzbkit --release queue_control_cancel_cost -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "hand-run measurement of the cancel lock-hold, not a regression gate"]
+    async fn queue_control_cancel_cost_at_field_scale() {
+        let servers = one_server();
+        let n: usize = 100_000;
+        let reqs: Vec<ArticleReq> = (0..n)
+            .map(|i| ArticleReq::fresh(format!("<m{i}@bench>")))
+            .collect();
+        let (shared, _) = Shared::new(reqs, &servers);
+        let ctl = QueueControl::default();
+        ctl.attach(&shared);
+        // Eleven volumes of 60 articles each, at the queue tail - the
+        // deferral shape: volume bodies are queued after the payload.
+        let mut worst = std::time::Duration::ZERO;
+        let mut total = std::time::Duration::ZERO;
+        for v in 0..11 {
+            let ids: HashSet<String> = (0..60)
+                .map(|k| format!("<m{}@bench>", n - 1 - v * 60 - k))
+                .collect();
+            let t = std::time::Instant::now();
+            let removed = ctl.cancel(&ids);
+            let dt = t.elapsed();
+            assert_eq!(removed.len(), 60);
+            worst = worst.max(dt);
+            total += dt;
+            eprintln!("cancel of volume {v:2}: {dt:?}");
+        }
+        eprintln!(
+            "11 volumes vs a {n}-article queue: total {total:?}, worst single hold {worst:?}"
+        );
     }
 
     fn one_server() -> Vec<(ServerConfig, PoolConfig)> {
@@ -5022,6 +5237,60 @@ mod tests {
             done, n,
             "the healthy server still had to deliver every article"
         );
+    }
+
+    /// Codex sweep 2, 3 Aug M6. A budget trained down to the 2 s floor
+    /// by pipelined ~0 ms samples has to be able to climb back out
+    /// WITHIN the article retry allowance (four charged attempts by
+    /// default), or a provider that settles at a stable 2.5 s fails
+    /// every article on a link the flat path would have served.
+    ///
+    /// Deterministic and pool-free on purpose: with a live fleet the
+    /// other workers' successful samples feed the same cell, so a test
+    /// that drove real connections could pass on someone else's
+    /// evidence instead of on the escalation under test.
+    #[test]
+    fn a_pre_byte_timeout_widens_past_the_budget_that_expired() {
+        // The shape the bug needed: pipelining collapsed the EWMA to
+        // 1 ms, so every budget is the 2 s floor and doubling the raw
+        // value (1, 2, 4, 8, 16 ms) never moves it.
+        let mut ewma = 1u64;
+        let mut ladder = Vec::new();
+        for _ in 0..4 {
+            let budget = ttfb_budget_ms(ewma);
+            ladder.push(budget);
+            ewma = escalated_ttfb_ms(ewma);
+            // Strictly wider every time, until the ceiling - which is
+            // the only place a budget is allowed to stand still.
+            assert!(
+                ttfb_budget_ms(ewma) > budget
+                    || budget == ADAPTIVE_FIRST_BYTE_MAX.as_millis() as u64,
+                "a timeout at {budget} ms must buy the next attempt more than {budget} ms, \
+                 got {}",
+                ttfb_budget_ms(ewma)
+            );
+        }
+        assert_eq!(ladder, vec![2_000, 4_000, 8_000, 10_000]);
+        // A 2.5 s server is served by the SECOND attempt, well inside
+        // the default four - that is the whole point.
+        assert!(ladder[1] >= 2_500);
+
+        // The ceiling still holds however many timeouts arrive, and an
+        // unmeasured server (which already budgets at the ceiling) has
+        // nothing to widen.
+        let mut ewma = escalated_ttfb_ms(0);
+        for _ in 0..20 {
+            ewma = escalated_ttfb_ms(ewma);
+        }
+        assert_eq!(
+            ttfb_budget_ms(ewma),
+            ADAPTIVE_FIRST_BYTE_MAX.as_millis() as u64
+        );
+
+        // And the ordinary path is untouched: a genuinely slow server
+        // whose EWMA is already above the floor still doubles.
+        assert_eq!(ttfb_budget_ms(1_000), 4_000);
+        assert_eq!(ttfb_budget_ms(escalated_ttfb_ms(1_000)), 8_000);
     }
 
     #[test]

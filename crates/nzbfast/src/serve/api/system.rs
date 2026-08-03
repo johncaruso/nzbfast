@@ -7,7 +7,7 @@ pub(in crate::serve) fn dispatch(
     params: &std::collections::HashMap<String, String>,
     mode: &str,
     ctx: &ApiCtx<'_>,
-    _api_body: &mut Option<Vec<u8>>,
+    api_body: &mut Option<Vec<u8>>,
 ) -> Option<Value> {
     Some(match mode {
         // `version` stays the SAB-compat string (the *arrs
@@ -129,6 +129,7 @@ pub(in crate::serve) fn dispatch(
                 "move_completed" => d.move_completed.read_ok().clone(),
                 "watch" => d.watch_dir.lock_ok().clone(),
                 "script" => d.script.lock_ok().as_ref().and_then(|p| parent_of(p)),
+                "password_file" => parent_of(&d.password_file.lock_ok()),
                 "index_db" => parent_of(&d.index_db),
                 "config" => parent_of(&d.settings_path),
                 _ => None,
@@ -359,7 +360,25 @@ pub(in crate::serve) fn dispatch(
             if req.method() != &tiny_http::Method::Post {
                 json!({"status": false, "error": "POST required"})
             } else {
-                let raw = params.get("value").cloned().unwrap_or_default();
+                // From the BODY, with `&value=` kept only for callers
+                // that already had it (Codex sweep 2, 3 Aug MH1). The
+                // target carries a webhook token and a custom body
+                // template, and a POST is not private when its
+                // parameters ride the query string - reverse proxies log
+                // that line, and so does the browser. Being a POST was
+                // never the point: it exists so a page you merely visit
+                // cannot fire this with an <img>.
+                let raw = api_body
+                    .take()
+                    .filter(|b| !b.is_empty())
+                    .and_then(|b| {
+                        serde_json::from_slice::<Value>(&b)
+                            .ok()
+                            .and_then(|v| v.get("target").cloned())
+                            .map(|t| t.to_string())
+                    })
+                    .or_else(|| params.get("value").cloned())
+                    .unwrap_or_default();
                 match serde_json::from_str::<crate::notify::Target>(&raw) {
                     Err(e) => json!({"status": false, "error": format!("bad target: {e}")}),
                     Ok(mut t) => {
@@ -376,7 +395,22 @@ pub(in crate::serve) fn dispatch(
                         {
                             t.token = prev.token.clone();
                         }
-                        match crate::notify::test(&t) {
+                        // §G: a Test IS a delivery, so it updates the
+                        // row's last-send line too. Without this a user
+                        // who fixed a token and tested it successfully
+                        // still had a red "last send failed" sitting on
+                        // the row until the next download finished.
+                        let r = crate::notify::test(&t);
+                        d.notify_health.lock_ok().insert(
+                            crate::notify::target_key(&t),
+                            crate::notify::Outcome {
+                                at: unix_now(),
+                                code: *r.as_ref().unwrap_or(&0),
+                                error: r.as_ref().err().cloned().unwrap_or_default(),
+                                test: true,
+                            },
+                        );
+                        match r {
                             Ok(code) => json!({"status": true, "code": code}),
                             Err(e) => json!({"status": false, "error": e}),
                         }

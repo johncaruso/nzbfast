@@ -138,12 +138,19 @@ fn split_part(lower: &str) -> Option<(String, u32)> {
 /// Bare numeric part: `movie.001`. Ambiguous by name alone (RAR numeric
 /// volumes and hjsplit use the same grammar), so the caller gates the
 /// set on the first part carrying zip magic.
+///
+/// Index 0 is rejected, matching [`numeric_split_part_name`]'s stream
+/// grammar: no split tool numbers from zero, and accepting a junk
+/// same-stem `.000` sorted it FIRST in the group, so the magic gate
+/// sniffed the junk file and silently dropped the whole valid
+/// `.001`/`.002` set (Codex sweep 3 Aug M8).
 fn numeric_part(lower: &str) -> Option<(String, u32)> {
     let (head, tail) = lower.rsplit_once('.')?;
     if !(2..=4).contains(&tail.len()) || !tail.bytes().all(|c| c.is_ascii_digit()) {
         return None;
     }
-    Some((head.to_string(), tail.parse().ok()?))
+    let idx: u32 = tail.parse().ok()?;
+    (idx >= 1).then(|| (head.to_string(), idx))
 }
 
 /// Is this single path part of a zip container? Name-identified shapes
@@ -1923,6 +1930,22 @@ mod tests {
         assert_eq!(f[0].name, "movie.001");
         let names: Vec<String> = f[0].parts.iter().map(|p| file_name(p)).collect();
         assert_eq!(names, ["movie.001", "movie.002"]);
+    }
+
+    #[test]
+    fn a_junk_dot_000_does_not_hide_the_valid_set() {
+        // Codex sweep 3 Aug M8: `.000` grouped with `.001`/`.002` and,
+        // sorting first, was the one part the magic gate sniffed - a
+        // junk same-stem `.000` made the whole valid split set vanish.
+        let d = tmp("numeric-000");
+        write(&d, "movie.000", b"junk sidecar, not an archive");
+        write(&d, "movie.001", PK);
+        write(&d, "movie.002", b"two");
+        let f = scan(&d);
+        assert_eq!(f.len(), 1, "the .001/.002 set must still be found");
+        assert_eq!(f[0].shape, Shape::ByteSplit);
+        let names: Vec<String> = f[0].parts.iter().map(|p| file_name(p)).collect();
+        assert_eq!(names, ["movie.001", "movie.002"], ".000 is not a part");
     }
 
     #[test]

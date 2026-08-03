@@ -22,6 +22,7 @@ mod extract;
 mod write;
 pub use extract::{
     extract_volume_sequence_to, extract_volume_sequence_to_with_progress, extract_volumes_to,
+    extract_volumes_to_with_progress,
 };
 use extract::{DecoderSession, DecryptingReader};
 pub use write::{

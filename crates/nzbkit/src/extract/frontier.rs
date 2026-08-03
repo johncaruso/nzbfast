@@ -17,6 +17,12 @@ use crate::sync::MutexExt;
 pub(super) struct FrontierBuffer {
     pub(super) state: Mutex<FrontierState>,
     pub(super) arrived: Condvar,
+    /// §94 B: when Some, reads only serve bytes below the slot's
+    /// verified-block watermark - the chase decode consumes nothing the
+    /// PAR2 set has not vouched for, so a repair can never rewrite
+    /// consumed bytes. None = ungated (no set, unclaimed slot, feature
+    /// off): behavior is exactly the pre-gate code.
+    gate: Option<(std::sync::Arc<crate::live::VerifyGate>, usize)>,
 }
 
 #[derive(Default)]
@@ -66,13 +72,44 @@ impl std::fmt::Debug for FrontierBuffer {
 }
 
 impl FrontierBuffer {
+    /// Ungated construction. Production callers all attach the §94 B
+    /// watermark gate via [`Self::new_gated`], so this survives for the
+    /// tests, which exercise the buffer without a verify pipeline.
+    #[cfg(test)]
     pub(super) fn new(total: u64) -> FrontierBuffer {
+        Self::new_gated(total, None)
+    }
+
+    /// Construction with an optional §94 B watermark gate attached.
+    pub(super) fn new_gated(
+        total: u64,
+        gate: Option<(std::sync::Arc<crate::live::VerifyGate>, usize)>,
+    ) -> FrontierBuffer {
         FrontierBuffer {
             state: Mutex::new(FrontierState {
                 total,
                 ..Default::default()
             }),
             arrived: Condvar::new(),
+            gate,
+        }
+    }
+
+    /// The §94 B serving limit: bytes at or past this offset are not yet
+    /// PAR2-vouched and must not reach the decode. Ungated = MAX.
+    fn gate_limit(&self) -> u64 {
+        match &self.gate {
+            Some((g, slot)) => g.watermark(*slot),
+            None => u64::MAX,
+        }
+    }
+
+    /// Park briefly for a watermark advance past `offset`. Bounded so a
+    /// gate-blocked reader still observes buffer abort/demote (which
+    /// notify [`Self::arrived`], not the gate) on its next loop pass.
+    fn gate_wait(&self, offset: u64) {
+        if let Some((g, slot)) = &self.gate {
+            g.wait_past(*slot, offset, std::time::Duration::from_millis(100));
         }
     }
 
@@ -404,10 +441,24 @@ impl FrontierBuffer {
                     st.base
                 )));
             }
+            // §94 B: nothing at or past the verified watermark may reach
+            // the decode. Blocked-by-gate is a different wait from
+            // blocked-by-arrival: the bytes are here, the vouching is
+            // not - park on the gate (bounded) and re-run every check.
+            let lim = self.gate_limit();
+            if offset >= lim {
+                drop(st);
+                self.gate_wait(offset);
+                st = self.state.lock_ok();
+                continue;
+            }
             let frontier = st.frontier();
             if offset < frontier {
                 let start = (offset - st.base) as usize;
-                let take = buf.len().min(st.data.len() - start);
+                let take = buf
+                    .len()
+                    .min(st.data.len() - start)
+                    .min((lim - offset) as usize);
                 buf[..take].copy_from_slice(&st.data[start..start + take]);
                 return Ok(take);
             }
@@ -418,7 +469,7 @@ impl FrontierBuffer {
                 .filter(|&(&s, v)| s + v.len() as u64 > offset);
             if let Some((&s, v)) = hit {
                 let a = (offset - s) as usize;
-                let take = buf.len().min(v.len() - a);
+                let take = buf.len().min(v.len() - a).min((lim - offset) as usize);
                 buf[..take].copy_from_slice(&v[a..a + take]);
                 return Ok(take);
             }
@@ -450,10 +501,22 @@ impl rars::BlockingRangeSource for FrontierBuffer {
                     st.base
                 )));
             }
+            // §94 B: same gate as `read_covered_blocking` - the decode
+            // may only consume PAR2-vouched bytes.
+            let lim = self.gate_limit();
+            if offset >= lim && offset < st.total {
+                drop(st);
+                self.gate_wait(offset);
+                st = self.state.lock_ok();
+                continue;
+            }
             let frontier = st.frontier();
             if offset < frontier {
                 let start = (offset - st.base) as usize;
-                let take = buf.len().min(st.data.len() - start);
+                let take = buf
+                    .len()
+                    .min(st.data.len() - start)
+                    .min((lim - offset) as usize);
                 buf[..take].copy_from_slice(&st.data[start..start + take]);
                 return Ok(take);
             }
@@ -477,6 +540,50 @@ impl rars::BlockingRangeSource for FrontierBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// §94 B: a gated buffer serves only PAR2-vouched bytes. Bytes are
+    /// PRESENT past the watermark and must still not reach the decode -
+    /// serves clamp at the limit, and a fully-advanced gate releases
+    /// the rest. Ungated buffers (every other test here) are the teeth
+    /// proving the pre-gate behavior is untouched.
+    #[test]
+    fn gated_reads_clamp_at_the_verified_watermark() {
+        let gate = crate::live::VerifyGate::new(1);
+        gate.engage(0);
+        let buf = FrontierBuffer::new_gated(30, Some((gate.clone(), 0)));
+        buf.write_span(0, &[7u8; 30]);
+        // Watermark 10: a 16-byte read at 0 serves exactly 10.
+        gate.advance(0, 10);
+        let mut out = [0u8; 16];
+        let n = buf.read_covered_blocking(0, &mut out).unwrap();
+        assert_eq!(n, 10, "serve clamps at the watermark");
+        // A read AT the watermark parks; an advance releases it.
+        let b2 = std::sync::Arc::new(buf);
+        let (b3, g3) = (b2.clone(), gate.clone());
+        let t = std::thread::spawn(move || {
+            let mut out = [0u8; 32];
+            b3.read_covered_blocking(10, &mut out).unwrap()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        g3.advance(0, u64::MAX);
+        assert_eq!(t.join().unwrap(), 20, "advance releases the rest");
+        // An aborted buffer must not strand a gate-blocked reader.
+        let gate2 = crate::live::VerifyGate::new(1);
+        gate2.engage(0);
+        let b4 = std::sync::Arc::new(FrontierBuffer::new_gated(30, Some((gate2, 0))));
+        b4.write_span(0, &[1u8; 30]);
+        let b5 = b4.clone();
+        let t = std::thread::spawn(move || {
+            let mut out = [0u8; 8];
+            b5.read_covered_blocking(0, &mut out)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        b4.abort("test abort");
+        assert!(
+            t.join().unwrap().is_err(),
+            "abort must reach a gate-blocked reader"
+        );
+    }
 
     /// FrontierBuffer contract: out-of-order spans park and fold in as
     /// gaps fill; a blocked reader wakes on exactly the fill; peek and

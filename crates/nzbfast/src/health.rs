@@ -219,9 +219,29 @@ pub(crate) fn score(
                 .all(|a| a.cells.get(i) == Some(&Avail::Missing))
         })
         .count() as u32;
+    // An article NO voting server gave a definite answer about was never
+    // really sampled: the probe was cut short - the 20 s timeout, the
+    // stand-down when a download starts, a mid-batch read error on every
+    // server. Unknown must never manufacture a miss (above), but the
+    // Green sentence claims "all N sampled article(s) are present", and
+    // for these cells nobody was asked. With no definite miss elsewhere
+    // either, nothing was LEARNED: no verdict, same as an unanswered
+    // probe, rather than a latched green that unasked articles ride
+    // along on. A definite miss elsewhere still buckets below - misses
+    // are real evidence however short the probe fell.
+    let unanswered = (0..sampled)
+        .filter(|&i| {
+            voting
+                .iter()
+                .all(|a| !matches!(a.cells.get(i), Some(&Avail::Have) | Some(&Avail::Missing)))
+        })
+        .count() as u32;
     let present = sampled as u32 - absent;
     let answered = voting.len() as u32;
     let sampled = sampled as u32;
+    if absent == 0 && unanswered > 0 {
+        return None;
+    }
     // The whole guard, in one line: missing everywhere is only evidence
     // about the POST once the post is older than propagation. Below the
     // threshold - and for a dateless NZB, which reads as age 0 - the
@@ -498,6 +518,35 @@ mod tests {
         assert!(score(&[], 30, 0, 1).is_none());
         assert!(score(&[answer("a", &[U, U])], 30, 0, 1).is_none());
         assert!(score(&[answer("a", &[])], 30, 0, 1).is_none());
+    }
+
+    /// An abandoned probe - timeout, stand-down, mid-batch error - leaves
+    /// the unread tail Unknown, and ONE definite Have used to qualify the
+    /// row as voting and score Green: "all 8 sampled article(s) present"
+    /// with seven never asked. No definite answer for a cell on any
+    /// server plus no miss anywhere = nothing learned, no verdict.
+    #[test]
+    fn a_cut_short_probe_with_no_misses_scores_nothing() {
+        // 1 of 8 read, a Have, the rest Unknown on the only server.
+        assert!(score(&[answer("a", &[H, U, U, U, U, U, U, U])], 30, 0, 1).is_none());
+        // Same rows across two servers, both cut short at the same spot.
+        assert!(
+            score(
+                &[answer("a", &[H, H, U, U]), answer("b", &[H, U, U, U])],
+                30,
+                0,
+                1
+            )
+            .is_none()
+        );
+        // A definite MISS elsewhere is still evidence, however short the
+        // probe fell: this one buckets normally (30 days is past
+        // GONE_MIN_AGE_DAYS, so red).
+        let s = score(&[answer("a", &[M, H, U, U])], 30, 0, 1).unwrap();
+        assert_eq!(s.bucket, Bucket::Red);
+        // And a fully-answered green is untouched.
+        let s = score(&[answer("a", &[H, H, H, H])], 30, 0, 1).unwrap();
+        assert_eq!(s.bucket, Bucket::Green);
     }
 
     /// The sampled count rides every verdict, and none of them phrases

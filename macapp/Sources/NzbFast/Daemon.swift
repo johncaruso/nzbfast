@@ -252,6 +252,94 @@ final class Daemon {
         return err == "API Key Incorrect" || err == "API Key Required"
     }
 
+    // MARK: §98 upgrade restart - version handshake on attach
+
+    /// An engine version as ordered for the upgrade decision: the semver
+    /// components, then the beta serial. A beta build is made AFTER the
+    /// release its semver names (deploys bump packaging/beta-serial.txt;
+    /// publish resets it), so "1.0.14 beta 5" is newer than "1.0.14" and
+    /// older than "1.0.15".
+    struct EngineVersion: Comparable, CustomStringConvertible {
+        let nums: [Int]
+        let beta: Int
+        var description: String {
+            let v = nums.map(String.init).joined(separator: ".")
+            return beta > 0 ? "\(v) beta \(beta)" : v
+        }
+        static func parse(_ semver: String, beta: String) -> EngineVersion? {
+            let nums = semver.split(separator: ".").compactMap { Int($0) }
+            guard !nums.isEmpty else { return nil }
+            return EngineVersion(nums: nums, beta: Int(beta) ?? 0)
+        }
+        static func < (a: EngineVersion, b: EngineVersion) -> Bool {
+            for i in 0..<max(a.nums.count, b.nums.count) {
+                let x = i < a.nums.count ? a.nums[i] : 0
+                let y = i < b.nums.count ? b.nums[i] : 0
+                if x != y { return x < y }
+            }
+            return a.beta < b.beta
+        }
+    }
+
+    /// The version of the engine INSIDE this bundle, stamped into
+    /// Info.plist by make-app.sh from the same two sources the engine's
+    /// own build embeds (Cargo.toml + packaging/beta-serial.txt). Nil on
+    /// a bundle without the beta key (predates §98) - the caller then
+    /// attaches as it always did, which is the safe reading.
+    static func bundledVersion() -> EngineVersion? {
+        let info = Bundle.main.infoDictionary
+        guard let v = info?["CFBundleShortVersionString"] as? String,
+              let beta = info?["NzbFastBetaSerial"] as? String
+        else { return nil }
+        return EngineVersion.parse(v, beta: beta)
+    }
+
+    /// The version the engine on `self.port` is actually serving,
+    /// AUTHENTICATED - the keyless probe of a keyed daemon only ever sees
+    /// the refusal phrase, which carries no version. Nil when the key is
+    /// missing or wrong (a daemon from another data dir): the caller must
+    /// treat that as "not mine to restart" and attach.
+    private func remoteVersion() async -> EngineVersion? {
+        var req = URLRequest(url: apiURL("version"))
+        req.timeoutInterval = 3
+        guard let (data, _) = try? await URLSession.shared.data(for: req),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let v = obj["nzbfast"] as? String
+        else { return nil }
+        return EngineVersion.parse(v, beta: obj["beta"] as? String ?? "")
+    }
+
+    /// §98: the running engine is OLDER than the one in this bundle -
+    /// stop it and let the caller spawn ours. Shutdown by authenticated
+    /// API on the port it serves, which reaches the old engine wherever
+    /// its binary lives (the path-keyed sweep below only knows THIS
+    /// bundle's path); the sweep is the backstop for an engine too wedged
+    /// to answer. Returns true when the port came free - the caller then
+    /// spawns; false means the old engine would not die, and attaching to
+    /// it beats stranding the user with no engine at all.
+    ///
+    /// The wait is generous on purpose: mode=shutdown persists the queue
+    /// first, and a busy engine has taken ~30 s to wind down (TODO §98
+    /// point 2), so an impatient deadline here would fall through to the
+    /// SIGTERM sweep and turn every slow-but-clean shutdown into an
+    /// abrupt one.
+    private func upgradeRestart() async -> Bool {
+        var req = URLRequest(url: apiURL("shutdown"))
+        req.httpMethod = "POST"
+        req.timeoutInterval = 5
+        _ = try? await URLSession.shared.data(for: req)
+        for _ in 0..<160 { // 40 s
+            if !portTaken(port) { return true }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+        stopBundleOrphans()
+        for _ in 0..<20 { // 5 s
+            if !portTaken(port) { return true }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+        return false
+    }
+
     /// TCP-level check: is anything listening on 127.0.0.1:port?
     /// Localhost connects resolve immediately (accept or refuse), so a
     /// plain blocking connect is fine.
@@ -314,6 +402,39 @@ final class Daemon {
             // Every consumer follows the port we ACTUALLY attached to.
             port = candidate
             UserDefaults.standard.set(candidate, forKey: "daemonPort")
+            // §98: an engine that outlives the app also outlives an
+            // UPGRADE - installing a newer .dmg used to change nothing,
+            // because this arm attached to the old engine and never
+            // compared versions (localhost kept serving the previous
+            // release with no hint). Restart it only when the bundle is
+            // STRICTLY newer and both versions were readable; anything
+            // ambiguous - unreadable Info.plist, a daemon whose key we
+            // do not hold (another data dir's install) - attaches as it
+            // always did. A newer RUNNING engine also just attaches:
+            // downgrading a daemon someone deliberately updated ahead of
+            // the app would be the same silent surprise in reverse.
+            if let mine = Daemon.bundledVersion(),
+               let running = await remoteVersion(),
+               running < mine
+            {
+                NSLog(
+                    "nzbfast: engine on :%d is v%@, bundle carries v%@ - upgrade restart",
+                    port, running.description, mine.description)
+                if await upgradeRestart() {
+                    do {
+                        try spawn()
+                    } catch {
+                        return .failed(
+                            "stopped the old engine but couldn't launch the new one: \(error.localizedDescription)")
+                    }
+                    if await waitUntilUp(timeout: 15) { return .spawned }
+                    return .failed("the upgraded engine didn't answer on port \(port) within 15 s")
+                }
+                // The old engine would not stop. Attaching to it beats
+                // stranding the user engineless; the log above says why
+                // the dashboard still shows the old version.
+                NSLog("nzbfast: old engine on :%d would not stop - attaching to it", port)
+            }
             spawnedByUs = false
             return .attached
         }

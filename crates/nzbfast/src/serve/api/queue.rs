@@ -1,6 +1,77 @@
 use super::super::*;
 use super::ApiCtx;
 
+/// Is this job inside its post-network tail - verifying, repairing or
+/// unpacking?
+///
+/// `state == Downloading` cannot answer it: the record says Downloading
+/// from the first article to the last extracted byte, so every queue
+/// control that refuses to act on "the active download" was in fact
+/// still acting on a job whose download had finished minutes ago. The
+/// pipeline's own phase word is the answer, and the queue row is now
+/// rendered from the same one, so a control that refuses here is a
+/// control the user could already see was not on offer.
+fn finishing_tail(d: &Arc<Daemon>, g: &Job) -> bool {
+    g.state == JobState::Downloading && d.tail_phase(&g.nzo_id).is_some()
+}
+
+/// Set (or clear) one job's pause flag, with the one refusal that makes
+/// the flag mean anything. Returns whether the job took it.
+///
+/// There is nothing left to pause once the bytes are in: the
+/// verify/repair/unpack tail and the move to the destination run to
+/// completion whatever this flag says. Setting it anyway labelled a job
+/// "paused" in every client while its files went on moving - and left
+/// the flag SET, so a later auto-retry put the job back in the queue
+/// with `paused` still true and `pick_job` skipped it forever (Codex
+/// sweep 2, 3 Aug M4).
+///
+/// Shared so the SAB/API `mode=queue&name=pause` arm and the NZBGet
+/// JSON-RPC `GroupPause` cannot drift: they had drifted, and which
+/// client type the user happened to configure in Sonarr decided whether
+/// a paused job could ever run again.
+pub(in crate::serve) fn apply_pause(d: &Arc<Daemon>, g: &mut Job, pause: bool) -> bool {
+    if pause && (g.state == JobState::Completed || finishing_tail(d, g)) {
+        return false;
+    }
+    g.paused = pause;
+    true
+}
+
+/// Write one job's priority, releasing the states an explicit priority
+/// is an instruction to release. Returns whether the job took it.
+///
+/// A duplicate hold is a PAUSE at priority -3, and the UI has always
+/// told the user to raise the priority to download the copy anyway -
+/// which did nothing at all, because `pick_job` skips a paused job
+/// whatever its priority. An explicit priority write on a held
+/// duplicate is that instruction, so it releases the hold here, exactly
+/// as the failed-original promotion arm does (daemon.rs: paused=false,
+/// priority=0). Only for -3: an ordinary paused job re-prioritised by a
+/// client stays paused, which is what every SAB caller expects.
+///
+/// Refused on a job whose download is over for the same reason as
+/// [`apply_pause`]: priority decides what starts NEXT, and clearing the
+/// deferral and health waiver on a finished record is meaningless. A
+/// held duplicate has never started, so that guard can never claim one.
+pub(in crate::serve) fn apply_priority(d: &Arc<Daemon>, g: &mut Job, prio: i32) -> bool {
+    if g.state == JobState::Completed || finishing_tail(d, g) {
+        return false;
+    }
+    if g.priority == -3 && g.paused {
+        g.paused = false;
+    }
+    g.priority = prio;
+    // Explicit priority overrides a watchdog deferral - and §77's
+    // health sink, which is an advisory guess and does not get to argue
+    // with an order the user has just given.
+    g.deferred = false;
+    if let Some(h) = g.health.as_mut() {
+        h.waived = true;
+    }
+    true
+}
+
 pub(in crate::serve) fn dispatch(
     d: &Arc<Daemon>,
     req: &mut tiny_http::Request,
@@ -150,6 +221,14 @@ pub(in crate::serve) fn dispatch(
                                     "stem": s.stem, "nzo_id": s.nzo_id,
                                     "grabbed_at": s.grabbed_at,
                                     "upgrading": upgrading,
+                                    // Bundle D: a slot whose grabs kept
+                                    // failing is emptied but keeps its
+                                    // dead stems, so "three releases
+                                    // tried and failed" and "nothing was
+                                    // ever posted" used to render
+                                    // identically - as nothing at all.
+                                    "failed": s.failed.len(),
+                                    "failed_last": s.failed.last().cloned().unwrap_or_default(),
                                 }),
                             )
                         })
@@ -164,6 +243,12 @@ pub(in crate::serve) fn dispatch(
                         // the line only when there is something true to
                         // say.
                         "instant": st.instant.get(&it.id.to_string()),
+                        // Bundle D: why the last pass declined a
+                        // candidate for this item, when it did - a
+                        // given-up target, the age window, or an
+                        // indexer account that could not be asked.
+                        // Absent when the pass declined nothing.
+                        "skipped_reason": st.skips.get(&it.id.to_string()),
                     })
                 })
                 .collect();
@@ -175,6 +260,49 @@ pub(in crate::serve) fn dispatch(
                 "items": out,
                 "instant_on": d.watchlist_instant.load(Ordering::Relaxed) && !d.indexer_off(),
             })
+        }
+        // §96.3 bundle D: what the give-up breaker is counting, and what
+        // it has already stopped chasing. The breaker used to act - it
+        // unmonitors things inside the user's Sonarr - with its whole
+        // state in a spool file and not one endpoint that would name it.
+        //
+        // Read surface, so full key like the rest of /api (the add-only
+        // NZB key reaches addfile/addurl/version/status/get_cats and
+        // nothing else). Reporting ONLY: listing a target changes no
+        // decision, and there is still exactly one path that grabs.
+        "giveup_status" => {
+            let threshold = d.arr_giveup_threshold.load(Ordering::Relaxed).min(1000) as u32;
+            json!({
+                "targets": d.giveup.lock_ok().status_rows(threshold),
+                "threshold": threshold,
+                // 0 = the breaker is off, so nothing is given up and
+                // nothing is being counted. Old counters may still sit
+                // in the state file; the card says nothing about them
+                // rather than implying a breaker that is not running.
+                "on": threshold > 0,
+            })
+        }
+        // "Try again" on a given-up target: forget its counters, which
+        // also re-arms the action latch (see GiveupState::clear_target -
+        // exactly what a completed download does). The watchlist pass
+        // stops skipping the target on its next round; for an *arr
+        // target the user re-monitors it in the *arr, which is theirs to
+        // do - we never re-monitor on our own initiative, the same way
+        // we never grab on our own outside the one path.
+        "giveup_reset" => {
+            let key = params.get("value").cloned().unwrap_or_default();
+            if key.is_empty() {
+                json!({"status": false, "error": "giveup_reset needs value=<target key>"})
+            } else {
+                // Scoped: save_giveup takes the same (non-reentrant)
+                // lock, so the guard must be gone before it is called.
+                let cleared = { d.giveup.lock_ok().clear_target(&key) };
+                if cleared {
+                    d.save_giveup();
+                    info!(target: "giveup", "{key}: counters cleared - chasing it again");
+                }
+                json!({"status": true, "cleared": cleared})
+            }
         }
         // Recategorize a QUEUED job. The NZBGet facade has had
         // this as `GroupSetCategory` since M26 and the SAB side
@@ -225,34 +353,18 @@ pub(in crate::serve) fn dispatch(
                 // Already there: don't re-derive, or the job's own
                 // directory reads as taken and the name climbs .2.
                 Some((_, _, current)) if current == cat => json!({"status": true}),
-                Some((job, name, _)) => {
-                    // Choosing a directory and publishing it have to be ONE
-                    // transaction, under the same lock `add` uses: between
-                    // the `dir_claim` probe below and the assignment, this
-                    // job still names its OLD directory, so a concurrent
-                    // add reads the new one as Free and takes it - two jobs
-                    // writing one folder, which is the hole the 2 Aug sweep
-                    // closed for `add` and this path never joined.
-                    //
-                    // Scoped to this arm on purpose: `history_change_cat`
-                    // takes `add_lock` itself, and it is not reentrant.
-                    // Taken with no queue/history/job lock held - `add_lock`
-                    // sits above all three, and `dir_claim` locks every job
-                    // in both lists.
-                    let _publish = d.add_lock.lock_ok();
-                    let (dir, _) =
-                        refile_out_dir(&d.out_root.read_ok().clone(), &cat, &name, &|p| {
-                            d.dir_claim(p)
-                        });
-                    {
-                        let mut g = job.lock_ok();
-                        g.category = cat.clone();
-                        g.out_dir = dir;
+                Some((job, name, _)) => match requeue_category(d, &job, &name, &cat) {
+                    Err(e) => {
+                        return Some(json!({
+                            "status": false,
+                            "error": e
+                        }));
                     }
-                    d.register_cat(&cat);
-                    d.save_queue();
-                    json!({"status": true})
-                }
+                    Ok(()) => {
+                        d.save_queue();
+                        json!({"status": true})
+                    }
+                },
             }
         }
         "retry" => {
@@ -260,6 +372,46 @@ pub(in crate::serve) fn dispatch(
             // The *arrs adopt the returned nzo_id as the new
             // tracking id (SAB may reissue; we keep it stable).
             json!({"status": d.retry(&id), "nzo_id": id})
+        }
+        // TODO 101: this job's own consent to the volume-eating unpack,
+        // given in the disk-full drawer. Consent only - it starts
+        // nothing; the caller retries the job afterwards, and the
+        // decision is taken again there against the gates that matter
+        // (mode, verified, forecast).
+        //
+        // Refused outright unless the mode is `low_disk`, so a stale
+        // dashboard tab cannot arm a job on a daemon whose setting has
+        // since gone back to `off`. `always` needs no per-job answer.
+        "eat_volumes" => {
+            let id = params.get("value").cloned().unwrap_or_default();
+            let mode = crate::eatvol::EatMode::parse(&d.unpack_eat_volumes.lock_ok().clone())
+                .unwrap_or_default();
+            if mode != crate::eatvol::EatMode::LowDisk {
+                json!({"status": false,
+                       "error": "extract-in-place is only offered while \
+                                 'when the disk is too full' is selected in settings"})
+            } else {
+                let hit = |j: &&Arc<Mutex<Job>>| j.lock_ok().nzo_id == id;
+                let found = d
+                    .queue
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(hit)
+                    .cloned()
+                    .or_else(|| d.history.lock_ok().iter().find(hit).cloned());
+                match found {
+                    None => json!({"status": false, "error": "unknown nzo_id"}),
+                    Some(job) => {
+                        job.lock_ok().eat_volumes_ok = true;
+                        // Durable before the caller's retry: the answer
+                        // is given on a failed job and spent by a run
+                        // that may be on the other side of a restart.
+                        d.save_queue();
+                        json!({"status": true, "nzo_id": id})
+                    }
+                }
+            }
         }
         // M24: attach an archive password to a job. Queued jobs
         // use it at completion; a history job flagged
@@ -283,9 +435,26 @@ pub(in crate::serve) fn dispatch(
                 match found {
                     None => json!({"status": false, "error": "unknown nzo_id"}),
                     Some(job) => {
+                        // The snapshot (out_dir above all) and the
+                        // `finalizing` raise are ONE job-lock
+                        // acquisition: raised later, a recategorize
+                        // could snapshot the flag as false, move the
+                        // directory, and race the unlock's out_dir
+                        // write (Codex H7). A raise that finds the
+                        // flag already up refuses - a second unlock
+                        // task would clear it while the first still
+                        // runs.
                         let (locked, out_dir, name, cat, tv, nzb) = {
                             let mut j = job.lock_ok();
                             j.password = Some(pw.clone());
+                            if j.password_required && j.finalizing {
+                                return Some(json!({"status": false,
+                                    "error": "an unlock is already running for this job - \
+                                              try again when it settles"}));
+                            }
+                            if j.password_required {
+                                j.finalizing = true;
+                            }
                             (
                                 j.password_required,
                                 j.out_dir.clone(),
@@ -295,6 +464,42 @@ pub(in crate::serve) fn dispatch(
                                 j.nzb_path.clone(),
                             )
                         };
+                        // Raise-then-check against the recategorize
+                        // marker: history_change_cat inserts `moving`
+                        // and THEN re-reads `finalizing`, so whichever
+                        // of the two committed second sees the other
+                        // and refuses - never both proceeding on one
+                        // directory.
+                        if locked && d.moving.lock_ok().contains(&id) {
+                            job.lock_ok().finalizing = false;
+                            return Some(json!({"status": false,
+                                "error": "this job's files are being moved right now - \
+                                          try again when it settles"}));
+                        }
+                        // The delete/retry interlock, closed from this
+                        // side (Codex sweep 3 Aug H1): both remove the
+                        // record UNDER the history lock, and this
+                        // verify runs under the same lock AFTER the
+                        // finalizing raise - whichever committed second
+                        // sees the other. Without it, a delete or retry
+                        // that read `finalizing` just before the raise
+                        // could remove or re-queue the record while the
+                        // unlock still ran against its directory.
+                        if locked {
+                            let still = d.history.lock_ok().iter().any(|j| Arc::ptr_eq(j, &job));
+                            if !still {
+                                job.lock_ok().finalizing = false;
+                                return Some(json!({"status": false,
+                                    "error": "this job was just deleted or retried - \
+                                              the unlock was not started"}));
+                            }
+                            // Crash safety: the password (and the raised
+                            // flag) reach queue.json BEFORE any
+                            // filesystem mutation, so a restart still
+                            // knows the password the user supplied even
+                            // if power dies mid-unlock.
+                            d.save_queue();
+                        }
                         // C1: the job may be DOWNLOADING right now.
                         // Its task captured j.password once at start,
                         // so hand the live run this one through the
@@ -307,20 +512,28 @@ pub(in crate::serve) fn dispatch(
                         // just parks exactly as it did before.
                         if d.active_stream.lock_ok().as_deref() == Some(id.as_str()) {
                             *d.hub.late_password.lock_ok() = Some((id.clone(), pw.clone()));
+                            // The ask was answered - drop the live
+                            // wants-a-password badge now rather than on
+                            // the probe's next visit. A wrong password
+                            // simply gets the flag raised again there.
+                            let mut wanted = d.hub.password_wanted.lock_ok();
+                            if wanted.as_deref() == Some(id.as_str()) {
+                                *wanted = None;
+                            }
                         }
                         if locked {
                             let d2 = d.clone();
                             let job2 = job.clone();
-                            // Mark the job busy for the whole task.
-                            // unlock + finalize_names rewrite out_dir
-                            // for many seconds on a large encrypted
-                            // set, and history_change_cat's only
-                            // interlock is this flag - without it a
-                            // category change moves the directory out
-                            // from under the running extractor, and
-                            // the two then race to write j.out_dir
-                            // with whichever lands second winning.
-                            job.lock_ok().finalizing = true;
+                            // `finalizing` is already up - raised in
+                            // the snapshot acquisition above. unlock +
+                            // finalize_names rewrite out_dir for many
+                            // seconds on a large encrypted set, and
+                            // history_change_cat's interlock is this
+                            // flag - without it a category change
+                            // moves the directory out from under the
+                            // running extractor, and the two then race
+                            // to write j.out_dir with whichever lands
+                            // second winning.
                             tokio::task::spawn_blocking(move || {
                                 // Cleared on EVERY exit below,
                                 // including the unlock-failed path,
@@ -351,7 +564,15 @@ pub(in crate::serve) fn dispatch(
                                     );
                                     let mut j = job2.lock_ok();
                                     j.password_required = false;
-                                    if j.fail_message == "password required to unpack" {
+                                    // BOTH password stories end here: the one this
+                                    // record was parked with, and the one a WRONG
+                                    // guess wrote over it - a tester's failed guess
+                                    // followed by the right password left a
+                                    // Completed row whose Reason still read
+                                    // "password did not unlock the archive".
+                                    if j.fail_message == "password required to unpack"
+                                        || j.fail_message == "password did not unlock the archive"
+                                    {
                                         j.fail_message.clear();
                                     }
                                     if !done.identify.is_empty() {
@@ -389,6 +610,57 @@ pub(in crate::serve) fn dispatch(
         // M14h: live pool + pipeline stats of the active download -
         // the overlapping-lanes view no sequential client can draw.
         "stats" => {
+            // Host resources for the dashboard's combined chart -
+            // one getrusage + task_info + statvfs per poll, no
+            // sampling thread. CPU% is % of ALL cores (0-100),
+            // from the cpu-time delta since the previous poll;
+            // sub-500 ms re-polls (a second open dashboard) reuse
+            // the last reading instead of amplifying noise.
+            //
+            // §91: this block runs FIRST, before any of the live
+            // counters below, because the disk walk can take
+            // milliseconds. Sampling servers/verify/files and then
+            // walking the disk shipped counters from before the walk
+            // beside `downloaded` read after it - two instants in one
+            // answer. Monotone snapshots come last, beside the build.
+            let cpu_pct = {
+                let now = Instant::now();
+                let cpu = nzbkit::mem::cpu_time_secs().unwrap_or(0.0);
+                let ncpu = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
+                let mut prev = d.cpu_sample.lock_ok();
+                match *prev {
+                    Some((t0, _, last)) if now.duration_since(t0).as_secs_f64() < 0.5 => last,
+                    Some((t0, c0, _)) => {
+                        let wall = now.duration_since(t0).as_secs_f64();
+                        let pct = ((cpu - c0) / wall / ncpu * 100.0).clamp(0.0, 100.0);
+                        *prev = Some((now, cpu, pct));
+                        pct
+                    }
+                    None => {
+                        *prev = Some((now, cpu, 0.0));
+                        0.0
+                    }
+                }
+            };
+            let (disk_free, disk_total) = disk_stat_walk(&d.out_dir()).unwrap_or((0, 0));
+            // Phase 0(b) nested-archive prevalence (process lifetime):
+            // how often nested layers appear, of what inner type, and
+            // whether they streamed or demoted - real-world data for
+            // future nested-format priorities.
+            let nested_prevalence = {
+                let np = nzbkit::extract::nested_prevalence();
+                json!({
+                    "levels": np.levels,
+                    "in_stream": np.in_stream,
+                    "demoted": np.demoted,
+                    "disk": np.disk,
+                    "rar_store": np.rar_store,
+                    "rar_compressed": np.rar_compressed,
+                    "rar_encrypted": np.rar_encrypted,
+                    "sevenz": np.sevenz,
+                    "other": np.other,
+                })
+            };
             let servers: Vec<Value> = d
                 .hub
                 .pool_live
@@ -428,6 +700,21 @@ pub(in crate::serve) fn dispatch(
                         .collect()
                 })
                 .unwrap_or_default();
+            // §G: sorted by host so the card's rows do not reshuffle
+            // between polls (a HashMap's order is not stable).
+            let server_refusals: Vec<Value> = {
+                let keep = d.last_refusals.lock_ok();
+                let mut rows: Vec<&String> = keep.keys().collect();
+                rows.sort_unstable();
+                rows.into_iter()
+                    .filter_map(|h| {
+                        keep.get(h).map(|r| {
+                            json!({"host": h, "permanent": r.permanent,
+                                   "line": r.line, "at": r.at})
+                        })
+                    })
+                    .collect()
+            };
             let (vdone, vbad, vtotal) = d
                 .hub
                 .verifier
@@ -464,55 +751,18 @@ pub(in crate::serve) fn dispatch(
                         .collect()
                 })
                 .unwrap_or_default();
-            // Host resources for the dashboard's combined chart -
-            // one getrusage + task_info + statvfs per poll, no
-            // sampling thread. CPU% is % of ALL cores (0-100),
-            // from the cpu-time delta since the previous poll;
-            // sub-500 ms re-polls (a second open dashboard) reuse
-            // the last reading instead of amplifying noise.
-            let cpu_pct = {
-                let now = Instant::now();
-                let cpu = nzbkit::mem::cpu_time_secs().unwrap_or(0.0);
-                let ncpu = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
-                let mut prev = d.cpu_sample.lock_ok();
-                match *prev {
-                    Some((t0, _, last)) if now.duration_since(t0).as_secs_f64() < 0.5 => last,
-                    Some((t0, c0, _)) => {
-                        let wall = now.duration_since(t0).as_secs_f64();
-                        let pct = ((cpu - c0) / wall / ncpu * 100.0).clamp(0.0, 100.0);
-                        *prev = Some((now, cpu, pct));
-                        pct
-                    }
-                    None => {
-                        *prev = Some((now, cpu, 0.0));
-                        0.0
-                    }
-                }
-            };
-            let (disk_free, disk_total) = disk_stat_walk(&d.out_dir()).unwrap_or((0, 0));
-            // Phase 0(b) nested-archive prevalence (process lifetime):
-            // how often nested layers appear, of what inner type, and
-            // whether they streamed or demoted - real-world data for
-            // future nested-format priorities.
-            let nested_prevalence = {
-                let np = nzbkit::extract::nested_prevalence();
-                json!({
-                    "levels": np.levels,
-                    "in_stream": np.in_stream,
-                    "demoted": np.demoted,
-                    "disk": np.disk,
-                    "rar_store": np.rar_store,
-                    "rar_compressed": np.rar_compressed,
-                    "rar_encrypted": np.rar_encrypted,
-                    "sevenz": np.sevenz,
-                    "other": np.other,
-                })
-            };
             json!({
                 "active": d.started_at.lock_ok().is_some(),
                 "downloaded": d.progress.load(Ordering::Relaxed),
                 "total": d.active_total.load(Ordering::Relaxed),
                 "servers": servers,
+                // §G: the same refusals, kept past the pool that saw
+                // them. `servers` above is empty whenever nothing is
+                // downloading, which took the Providers card - and with
+                // it the only place that said a provider had rejected
+                // the sign-in - off the page at exactly the moment
+                // someone would go looking for why.
+                "server_refusals": server_refusals,
                 "verify": {"blocks_done": vdone, "blocks_bad": vbad, "blocks_total": vtotal},
                 "files": files,
                 "host": {
@@ -531,22 +781,17 @@ pub(in crate::serve) fn dispatch(
         }
         "addfile" => {
             // Multipart body: extract the first file part.
+            // Same parse the gateway used to fill `api_body` - one
+            // helper, so a mixed-case `Boundary=` cannot be
+            // multipart there and not here.
             let boundary = req
                 .headers()
                 .iter()
                 .find(|h| h.field.equiv("Content-Type"))
-                .and_then(|h| {
-                    h.value
-                        .as_str()
-                        .split("boundary=")
-                        .nth(1)
-                        .map(|b| b.trim_matches('"').to_string())
-                });
+                .and_then(|h| multipart_boundary(h.value.as_str()));
             // Generous: an NZB for a 190 GB job is tens of MB.
             // The form pre-read above may already hold the body.
-            let raw = api_body
-                .take()
-                .unwrap_or_else(|| read_body_capped(req.as_reader(), 256 << 20));
+            let raw = api_body.take().unwrap_or_default();
             match boundary.and_then(|b| multipart_file(&raw, &b)) {
                 Some((fname, bytes)) => {
                     // Sonarr and Radarr send the release name in
@@ -578,7 +823,15 @@ pub(in crate::serve) fn dispatch(
                             "m3u": format!("http://{}/m3u/{id}{}", ctx.host_hdr, ctx.key_q),
                             "stream": format!("http://{}/stream/{id}?t={}", ctx.host_hdr, d.stream_token(&id)),
                         }),
-                        Ok(id) => json!({"status": true, "nzo_ids": [id]}),
+                        // Truth-audit I: a job parked as a held
+                        // ALTERNATIVE has NOT joined the queue to run,
+                        // and "Added to the queue" was the reply either
+                        // way. `held` carries the ids that parked, so
+                        // the add flow can say which.
+                        Ok(id) => json!({
+                            "status": true, "nzo_ids": [id],
+                            "held": if d.held_as_duplicate(&id) { vec![id] } else { vec![] },
+                        }),
                         Err(e) => json!({"status": false, "error": e.to_string()}),
                     }
                 }
@@ -606,7 +859,10 @@ pub(in crate::serve) fn dispatch(
                             "m3u": format!("http://{}/m3u/{id}{}", ctx.host_hdr, ctx.key_q),
                             "stream": format!("http://{}/stream/{id}?t={}", ctx.host_hdr, d.stream_token(&id)),
                         }),
-                        Ok(id) => json!({"status": true, "nzo_ids": [id]}),
+                        Ok(id) => json!({
+                            "status": true, "nzo_ids": [id],
+                            "held": if d.held_as_duplicate(&id) { vec![id] } else { vec![] },
+                        }),
                         Err(e) => json!({"status": false, "error": e.to_string()}),
                     }
                 }
@@ -659,30 +915,83 @@ pub(in crate::serve) fn dispatch(
                 }
             }
         }
-        // Delete a rejected watch-folder file by NAME. Only files
-        // currently in the failed set can be deleted - the name is
-        // matched against tracked paths, never joined to a path,
-        // so it can't reach anything else on disk.
+        // Delete a rejected watch-folder file. Only files currently in
+        // the failed set can be deleted - `value` is matched against
+        // tracked paths, never joined to a path, so it can't reach
+        // anything else on disk.
+        //
+        // By IDENTITY first, name second (Codex sweep 2, 3 Aug L1). The
+        // queue payload used to expose only `file_name()`, and deletion
+        // took the first tracked path whose basename matched: change
+        // the watch directory while a rejected `same.nzb` sits in the
+        // old one and the new one, and the list shows two
+        // indistinguishable rows while HashMap iteration order decides
+        // which file is permanently deleted. `watch_fail_id` is an
+        // opaque digest of the full tracked path - enough to name a row
+        // exactly, without handing the browser the path itself.
         "watch_failed_delete" => {
-            let name = params.get("value").cloned().unwrap_or_default();
-            let path = d
-                .watch_failed
-                .lock()
-                .unwrap()
-                .keys()
-                .find(|p| p.file_name().is_some_and(|f| f.to_string_lossy() == name))
-                .cloned();
+            let want = params.get("value").cloned().unwrap_or_default();
+            let path = {
+                let wf = d.watch_failed.lock_ok();
+                wf.keys()
+                    .find(|p| crate::serve::tasks::watch_fail_id(p) == want)
+                    // Name fallback for any caller still addressing the
+                    // row the old way. Ambiguous by construction, which
+                    // is the whole finding - but refusing it outright
+                    // would break a script for a collision almost
+                    // nobody has.
+                    .or_else(|| {
+                        wf.keys()
+                            .find(|p| p.file_name().is_some_and(|f| f.to_string_lossy() == want))
+                    })
+                    .cloned()
+            };
             match path {
                 None => json!({"status": false, "error": "no such rejected file"}),
                 Some(p) => match std::fs::remove_file(&p) {
                     Ok(()) => {
                         d.watch_failed.lock_ok().remove(&p);
-                        info!(target: "watch", "deleted rejected {name}");
+                        // The full path, not the basename: whose
+                        // `same.nzb` this was is exactly what a reader
+                        // of this line needs to know.
+                        info!(target: "watch", "deleted rejected {}", p.display());
                         json!({"status": true})
                     }
                     Err(e) => json!({"status": false, "error": e.to_string()}),
                 },
             }
+        }
+        // Dismiss one kept-files notice by PATH. Acknowledgement only -
+        // it drops the entry from the ring and touches nothing on disk.
+        // Deliberately not a "delete it anyway" button: that is the
+        // permanent delete 70990f19 stopped us from performing on the
+        // user's behalf, and a one-click version of it in a notice they
+        // are trying to clear is the same mistake with a confirmation
+        // step. The way to get a permanent delete is still to turn
+        // "Deleted files go to the Trash" off and mean it.
+        "delete_kept_dismiss" => {
+            let path = params.get("value").cloned().unwrap_or_default();
+            let mut k = d.delete_kept.lock_ok();
+            let before = k.len();
+            k.retain(|(_, p, _, _)| *p != path);
+            json!({"status": k.len() < before})
+        }
+        // Re-attempt the queue write. For the watch-folder state where a
+        // release IS live in the queue but `queue.json` could not be
+        // written - so the user's .nzb was deliberately kept as the only
+        // recovery copy. The strip could describe that and not act on it:
+        // nothing else in the API forces the write, and the user's real
+        // question ("did it stick this time?") had no way to be asked.
+        "queue_save" => {
+            let saved = d.save_queue();
+            if saved {
+                info!(target: "queue", "queue re-saved on request");
+            }
+            json!({"status": saved, "saved": saved,
+            "error": if saved { Value::Null } else {
+                json!("the queue still could not be written - check free space \
+                       and write permission on the data folder")
+            }})
         }
         "queue" => {
             let value = params.get("value").cloned().unwrap_or_default();
@@ -695,6 +1004,9 @@ pub(in crate::serve) fn dispatch(
                     d.poke_sidecar(hit_id);
                     let del_files = params.get("del_files").map(String::as_str) == Some("1");
                     let mut stopped_active = false;
+                    // Collected under the queue lock, recorded after it -
+                    // the notice's own lock is a leaf and must stay one.
+                    let mut kept: Vec<(String, std::path::PathBuf, String)> = Vec::new();
                     let mut q = d.queue.lock_ok();
                     let before = q.len();
                     q.retain(|j| {
@@ -763,7 +1075,15 @@ pub(in crate::serve) fn dispatch(
                                     g.del_on_drop = true;
                                 } else {
                                     let tail = delete_tail(&g, || d.job_suffix(filed_stem(&g)));
-                                    remove_job_files(&g.out_dir, filed_stem(&g), g.filed, &tail);
+                                    if let FilesGone::Kept(why) =
+                                        remove_job_files(&g.out_dir, filed_stem(&g), g.filed, &tail)
+                                    {
+                                        kept.push((
+                                            filed_stem(&g).to_string(),
+                                            g.out_dir.clone(),
+                                            why,
+                                        ));
+                                    }
                                 }
                             }
                             false
@@ -773,6 +1093,13 @@ pub(in crate::serve) fn dispatch(
                     });
                     let removed = q.len() < before;
                     drop(q);
+                    // The row is gone from the queue either way - that is
+                    // what was asked for and it worked. What did NOT work
+                    // was the files half, and with the row went the only
+                    // place the user could see this download named.
+                    for (name, dir, why) in kept {
+                        d.note_delete_kept(&name, &dir, &why);
+                    }
                     // Only the job that OWNS the hub may fire its
                     // abort. `state == Downloading` is NOT that
                     // test: job N stays Downloading through its
@@ -810,9 +1137,14 @@ pub(in crate::serve) fn dispatch(
                         d.poke_sidecar(hit_id);
                     }
                     let mut n = 0;
+                    let mut finishing = 0;
                     for j in d.queue.lock_ok().iter().filter(|j| hit(j)) {
-                        j.lock_ok().paused = op == "pause";
-                        n += 1;
+                        let mut g = j.lock_ok();
+                        if apply_pause(d, &mut g, op == "pause") {
+                            n += 1;
+                        } else {
+                            finishing += 1;
+                        }
                     }
                     // The flag alone only takes effect when a job
                     // next enters the queue. Pausing the item that
@@ -827,7 +1159,11 @@ pub(in crate::serve) fn dispatch(
                     if n > 0 {
                         d.save_queue();
                     }
-                    json!({"status": n > 0})
+                    if n == 0 && finishing > 0 {
+                        json!({"status": false, "error": "this job is still finishing"})
+                    } else {
+                        json!({"status": n > 0})
+                    }
                 }
                 // SAB parity: mode=queue&name=switch&value=<nzo_id>
                 // &value2=<index> moves the item to that queue
@@ -891,23 +1227,23 @@ pub(in crate::serve) fn dispatch(
                         p => p,
                     };
                     let mut n = 0;
+                    let mut finishing = 0;
                     for j in d.queue.lock_ok().iter().filter(|j| hit(j)) {
                         let mut g = j.lock_ok();
-                        g.priority = prio;
-                        // Explicit priority overrides a watchdog
-                        // deferral - and §77's health sink, which is an
-                        // advisory guess and does not get to argue with
-                        // an order the user has just given.
-                        g.deferred = false;
-                        if let Some(h) = g.health.as_mut() {
-                            h.waived = true;
+                        if apply_priority(d, &mut g, prio) {
+                            n += 1;
+                        } else {
+                            finishing += 1;
                         }
-                        n += 1;
                     }
                     if n > 0 {
                         d.save_queue();
                     }
-                    json!({"status": n > 0, "position": -1})
+                    if n == 0 && finishing > 0 {
+                        json!({"status": false, "error": "this job is still finishing"})
+                    } else {
+                        json!({"status": n > 0, "position": -1})
+                    }
                 }
                 _ => queue_json(d, params),
             }
@@ -966,6 +1302,18 @@ pub(in crate::serve) fn dispatch(
                 }
                 Some("delete") => {
                     let del_files = params.get("del_files").map(String::as_str) == Some("1");
+                    // Snapshot the queue's directories BEFORE the
+                    // history lock: they are claimants too, and
+                    // taking the two locks in this order everywhere
+                    // is what keeps them from deadlocking.
+                    let queue_dirs: Vec<PathBuf> = d
+                        .queue
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|j| j.lock_ok().out_dir.clone())
+                        .collect();
+                    let mut h = d.history.lock_ok();
                     // A recategorize is moving one of these payloads on
                     // disk right now. It snapshotted the record before
                     // the move and writes `out_dir` back afterwards, so
@@ -973,7 +1321,12 @@ pub(in crate::serve) fn dispatch(
                     // leaves the moved data orphaned at a destination
                     // nothing names, or half-deleted across both
                     // folders. Refuse for the whole request rather than
-                    // silently skipping one id of a batch.
+                    // silently skipping one id of a batch. Checked
+                    // UNDER the history lock: a recategorize raises its
+                    // marker and then re-verifies the record is still
+                    // present, so a check outside this lock could pass
+                    // just before the marker went up while the move
+                    // still proceeded (Codex H7).
                     let busy: Vec<String> = {
                         let m = d.moving.lock_ok();
                         value
@@ -989,18 +1342,6 @@ pub(in crate::serve) fn dispatch(
                                 "{} is having its files moved right now - try again when it settles",
                                 busy.join(", "))}));
                     }
-                    // Snapshot the queue's directories BEFORE the
-                    // history lock: they are claimants too, and
-                    // taking the two locks in this order everywhere
-                    // is what keeps them from deadlocking.
-                    let queue_dirs: Vec<PathBuf> = d
-                        .queue
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .map(|j| j.lock_ok().out_dir.clone())
-                        .collect();
-                    let mut h = d.history.lock_ok();
                     let before = h.len();
                     let records: Vec<DeleteRecord> = h
                         .iter()
@@ -1020,6 +1361,33 @@ pub(in crate::serve) fn dispatch(
                     // the records that survive rather than the ones
                     // about to go (see plan_history_delete).
                     let plan = plan_history_delete(&records, &value, &queue_dirs);
+                    // A doomed record whose unlock task is `finalizing`
+                    // is mid-extraction/rename/move on disk right now
+                    // (Codex sweep 3 Aug H1) - same refusal as `moving`
+                    // above, but checked against the PLAN rather than
+                    // the value string, so the `all`/`failed`/
+                    // `completed` sweeps hit it too (and a bulk sweep
+                    // catching a mid-move id is refused here as well).
+                    let busy: Vec<String> = {
+                        let m = d.moving.lock_ok();
+                        h.iter()
+                            .zip(&plan)
+                            .filter(|(_, p)| p.doomed)
+                            .filter_map(|(j, _)| {
+                                let g = j.lock_ok();
+                                (g.finalizing || m.contains(&g.nzo_id)).then(|| g.nzo_id.clone())
+                            })
+                            .collect()
+                    };
+                    if !busy.is_empty() {
+                        return Some(json!({"status": false,
+                            "error": format!(
+                                "{} is being unlocked or moved right now - \
+                                 try again when it settles",
+                                busy.join(", "))}));
+                    }
+                    // Recorded after the history lock is dropped, below.
+                    let mut kept: Vec<(String, std::path::PathBuf, String)> = Vec::new();
                     for (j, p) in h.iter().zip(&plan) {
                         if !p.doomed {
                             continue;
@@ -1032,7 +1400,11 @@ pub(in crate::serve) fn dispatch(
                         if del_files {
                             if p.may_remove_files {
                                 let tail = delete_tail(&g, || d.job_suffix(filed_stem(&g)));
-                                remove_job_files(&g.out_dir, filed_stem(&g), g.filed, &tail);
+                                if let FilesGone::Kept(why) =
+                                    remove_job_files(&g.out_dir, filed_stem(&g), g.filed, &tail)
+                                {
+                                    kept.push((filed_stem(&g).to_string(), g.out_dir.clone(), why));
+                                }
                             } else {
                                 // A verified re-download published
                                 // over this record's directory and
@@ -1066,6 +1438,15 @@ pub(in crate::serve) fn dispatch(
                     // caller (SAB clients included).
                     let count = before - h.len();
                     drop(h);
+                    // "Delete + files" is two promises, and only the
+                    // record half is guaranteed. A row the user deleted
+                    // to reclaim the disk space, whose files are still
+                    // taking it up, is the case this exists for: the row
+                    // was their handle on that folder and it has just
+                    // gone, so the path has to be handed back.
+                    for (name, dir, why) in kept {
+                        d.note_delete_kept(&name, &dir, &why);
+                    }
                     if count > 0 {
                         d.save_queue();
                     }
@@ -1076,4 +1457,58 @@ pub(in crate::serve) fn dispatch(
         }
         _ => return None,
     })
+}
+
+/// The queued-recategorize transaction, shared by the SAB `change_cat`
+/// arm above and the NZBGet `GroupSetCategory` facade - category
+/// controls filesystem routing, so relabelling without re-deriving
+/// `out_dir` under `add_lock` splits the record from the download.
+///
+/// Choosing a directory and publishing it have to be ONE transaction,
+/// under the same lock `add` uses: between the `dir_claim` probe and the
+/// assignment, this job still names its OLD directory, so a concurrent
+/// add reads the new one as Free and takes it - two jobs writing one
+/// folder, which is the hole the 2 Aug sweep closed for `add`.
+///
+/// Codex H5: the caller's Queued snapshot released every lock before
+/// this point, and the scheduler flips a picked job to Downloading AND
+/// snapshots its out_dir in one job-lock critical section - so a job
+/// that started while `refile_out_dir` walked the lists would download
+/// into the OLD directory while its record names the new one.
+/// Re-validate under the same job lock the write needs: either the flip
+/// already happened (refuse), or this write lands first and the
+/// scheduler snapshots the new path.
+///
+/// Taken with no queue/history/job lock held - `add_lock` sits above all
+/// three, and `dir_claim` locks every job in both lists. Not reentrant
+/// with `history_change_cat`, which takes `add_lock` itself.
+pub(in crate::serve) fn requeue_category(
+    d: &Arc<Daemon>,
+    job: &Arc<Mutex<Job>>,
+    name: &str,
+    cat: &str,
+) -> Result<(), &'static str> {
+    // Test hook: hold the window between the caller's Queued snapshot
+    // and the publish below open, so the suite can start the job inside
+    // it (the H5 race). No effect unless the suite sets it.
+    if let Some(ms) = std::env::var("NZBFAST_TEST_STALL_CHANGE_CAT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+    let _publish = d.add_lock.lock_ok();
+    let (dir, _) = refile_out_dir(&d.out_root.read_ok().clone(), cat, name, &|p| {
+        d.dir_claim(p)
+    });
+    {
+        let mut g = job.lock_ok();
+        if g.state != JobState::Queued {
+            return Err("job already started");
+        }
+        g.category = cat.to_string();
+        g.out_dir = dir;
+    }
+    d.register_cat(cat);
+    Ok(())
 }

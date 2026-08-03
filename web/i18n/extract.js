@@ -97,6 +97,12 @@ Object.assign(out, {
   // Speed units: rendered via unit(k) = t('unit.'+k, UNIT_EN[k]). Latin
   // scripts keep the SI abbreviations; Cyrillic/Greek localize (e.g. ГБ/с).
   'unit.MB': 'MB', 'unit.GB': 'GB', 'unit.TB': 'TB',
+  // ...and the 1024-based trio, which release sizes are quoted in
+  // everywhere in this world (indexers, SABnzbd, our own `mb` field).
+  // fmtMB divides by 1024 and now says so; it used to divide by 1024 and
+  // print "GB" beside decimal disk-space readouts calling different
+  // bytes the same name.
+  'unit.MiB': 'MiB', 'unit.GiB': 'GiB', 'unit.TiB': 'TiB',
   'unit.MBs': 'MB/s', 'unit.GBs': 'GB/s', 'unit.Mbs': 'Mb/s', 'unit.Gbs': 'Gb/s',
   // Group-browser category chips: rendered via t('grp.cat.'+c, GB_CAT_EN[c])
   'grp.cat.all': 'All', 'grp.cat.movies': 'Movies', 'grp.cat.tv': 'TV',
@@ -126,6 +132,10 @@ Object.assign(out, {
   'status.Downloading': 'Downloading', 'status.Queued': 'Queued',
   'status.Paused': 'Paused', 'status.Completed': 'Completed',
   'status.Failed': 'Failed', 'status.Idle': 'Idle', 'status.idle': 'idle',
+  // The post-network tail, reported per phase by the pipeline itself.
+  // SABnzbd's own state words, so the *arrs read them unchanged.
+  'status.Verifying': 'Verifying', 'status.Repairing': 'Repairing',
+  'status.Extracting': 'Extracting', 'status.Moving': 'Moving',
   // tErr(): fixed daemon error strings (serve.rs), keyed by wire text
   'err.unknown nzo_id': 'unknown nzo_id',
   'err.empty password': 'empty password',
@@ -144,6 +154,7 @@ Object.assign(out, {
   'err.a valid email address is required': 'a valid email address is required',
   'err.release not found': 'release not found',
   'err.cannot move the active download': 'cannot move the active download',
+  'err.this job is still finishing': 'this job is still finishing',
   'err.no servers configured': 'no servers configured',
   'err.no such server': 'no such server',
   'err.unknown server index': 'unknown server index',

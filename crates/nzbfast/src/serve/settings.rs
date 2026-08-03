@@ -224,6 +224,9 @@ pub(super) const SPEED: &[Setting] = &[
     ro("conntune", |c| {
         serde_json::to_value(crate::conntune::load(c.cfg_path)).unwrap_or_else(|_| json!({}))
     }),
+    // The tuner's line-speed verdict (empty = fine or unjudged) -
+    // written by the probe loop, shown near the line-speed setting.
+    ro("tune_hint", |c| json!(c.d.tune_hint.lock_ok().clone())),
     rw("auto_prefetch", |c| {
         json!(c.d.auto_prefetch.load(Ordering::Relaxed))
     }),
@@ -414,10 +417,34 @@ pub(super) const INDEXING: &[Setting] = &[
 pub(super) const AUTOMATION: &[Setting] = &[
     rw("prefer_quality", |c| c.d.quality_prefs.lock_ok().to_json()),
     // Every feed url essentially always embeds the indexer's `apikey=`.
+    //
+    // §G: each entry also carries what its last poll did (last_poll,
+    // last_error, items_seen). Merged in here rather than shipped as a
+    // second keyed list on purpose - a separate block would have to
+    // repeat the feed url to say which feed it described, and that url
+    // is the credential. These are read-only additions: `saveFeeds`
+    // rebuilds the list from the row inputs, so nothing echoes back, and
+    // the persisted settings.json shape is unchanged (the writer
+    // serialises FeedConfig, which has no idea these exist).
     Setting {
         name: "feeds",
         expose: Expose::Config(|c| {
-            serde_json::to_value(&*c.d.feeds.lock_ok()).unwrap_or(json!([]))
+            let feeds = c.d.feeds.lock_ok().clone();
+            let health = c.d.feed_health.lock_ok();
+            Value::Array(
+                feeds
+                    .iter()
+                    .map(|f| {
+                        let mut v = serde_json::to_value(f).unwrap_or_else(|_| json!({}));
+                        if let (Some(m), Some(h)) = (v.as_object_mut(), health.get(&f.url)) {
+                            m.insert("last_poll".into(), json!(h.last_poll));
+                            m.insert("last_error".into(), json!(h.last_error));
+                            m.insert("items_seen".into(), json!(h.items_seen));
+                        }
+                        v
+                    })
+                    .collect(),
+            )
         }),
         write: Write::Setting,
         log: Log::Feeds,
@@ -473,8 +500,26 @@ pub(super) const AUTOMATION: &[Setting] = &[
     rw("cleanup_exts", |c| {
         json!(c.d.cleanup_exts.lock_ok().clone())
     }),
+    // SAB/NZBGet-parity passwords file. Only the PATH and a count reach
+    // the UI - the contents are credentials, edited in the file itself
+    // (the has_password/notify-token contract).
+    rw("password_file", |c| {
+        json!(c.d.password_file.lock_ok().to_string_lossy())
+    }),
+    ro("password_file_count", |c| {
+        json!(c.d.read_unpack_passwords().len())
+    }),
+    rw("password_prompt", |c| {
+        json!(c.d.password_prompt.lock_ok().clone())
+    }),
+    rw("unpack_eat_volumes", |c| {
+        json!(c.d.unpack_eat_volumes.lock_ok().clone())
+    }),
     rw("par_cleanup", |c| {
         json!(c.d.par_cleanup.load(Ordering::Relaxed))
+    }),
+    rw("watch_keep_nzb", |c| {
+        json!(c.d.watch_keep_nzb.load(Ordering::Relaxed))
     }),
     rw("fast_par", |c| json!(c.d.fast_par.load(Ordering::Relaxed))),
     rw("prefer_external_unrar", |c| {
@@ -487,13 +532,18 @@ pub(super) const AUTOMATION: &[Setting] = &[
     // blank token back onto the saved one, so a round-trip through the
     // dashboard cannot erase it. A target's `url` IS its bearer token for
     // Discord/ntfy/Gotify, so the log gets kinds and counts only.
+    //
+    // §G: `last_send` is what this target's last delivery did. The
+    // OUTCOME travels; the key it is stored under (which embeds the url)
+    // never does - the row is matched by position in this list, which is
+    // the same list the UI renders from.
     Setting {
         name: "notify_targets",
         expose: Expose::Config(|c| {
+            let targets = c.d.notify_targets.lock_ok().clone();
+            let health = c.d.notify_health.lock_ok();
             Value::Array(
-                c.d.notify_targets
-                    .lock()
-                    .unwrap()
+                targets
                     .iter()
                     .map(|t| {
                         json!({
@@ -505,6 +555,7 @@ pub(super) const AUTOMATION: &[Setting] = &[
                             "on_failure": t.on_failure,
                             "category": t.category,
                             "has_token": !t.token.is_empty(),
+                            "last_send": health.get(&crate::notify::target_key(t)),
                         })
                     })
                     .collect(),
@@ -516,6 +567,37 @@ pub(super) const AUTOMATION: &[Setting] = &[
     rw("failure_link", |c| {
         json!(c.d.failure_link.lock_ok().clone())
     }),
+    // §96.3 give-up breaker: distinct failed releases per target before
+    // it is unmonitored. 0 = off, the default.
+    rw("arr_giveup_threshold", |c| {
+        json!(c.d.arr_giveup_threshold.load(Ordering::Relaxed))
+    }),
+    // The *arr instances the breaker may act on. The apikey is a
+    // credential: only `has_key` crosses back to the UI, and the writer
+    // merges a blank key onto the stored one - the notify_targets
+    // contract.
+    Setting {
+        name: "arr_instances",
+        expose: Expose::Config(|c| {
+            Value::Array(
+                c.d.arr_instances
+                    .lock_ok()
+                    .iter()
+                    .map(|i| {
+                        json!({
+                            "name": i.name,
+                            "kind": i.kind,
+                            "url": i.url,
+                            "enabled": i.enabled,
+                            "has_key": !i.apikey.is_empty(),
+                        })
+                    })
+                    .collect(),
+            )
+        }),
+        write: Write::Setting,
+        log: Log::Targets,
+    },
 ];
 
 /// The dashboard itself, and update checking.
@@ -1048,7 +1130,7 @@ pub(super) fn apply_setting(
                     );
                 }
                 if let Some(l) = limit {
-                    d.set_speed_ceiling(l);
+                    d.set_speed_ceiling_from(l, "schedule");
                 }
                 *d.schedule.lock_ok() = entries;
                 *d.schedule_text.lock_ok() = text.clone();
@@ -1648,9 +1730,59 @@ pub(super) fn apply_setting(
             *d.cleanup_exts.lock_ok() = list.clone();
             (true, json!(list))
         }
+        "password_file" => {
+            // Path to the SAB/NZBGet-compatible passwords file (one per
+            // line). Empty resets to the default next to the config.
+            // Created immediately if missing so the path the UI shows
+            // is never a dangling promise; contents are read fresh per
+            // unlock, so this is live.
+            let p = v.trim();
+            let path = if p.is_empty() {
+                d.cfg_path.with_file_name("passwords.txt")
+            } else {
+                std::path::PathBuf::from(p)
+            };
+            if !path.exists() {
+                crate::persist::write_atomic(&path, b"")
+                    .map_err(|e| format!("password_file: cannot create {}: {e}", path.display()))?;
+            }
+            *d.password_file.lock_ok() = path.clone();
+            *d.hub.unpack_password_file.lock_ok() = Some(path.clone());
+            (true, json!(path.to_string_lossy()))
+        }
+        "password_prompt" => {
+            // now | done | never - what the dashboard does when an
+            // archive turns out passworded ("never" also changes the
+            // completion shape: left packed, no failure text).
+            let m = v.trim().to_ascii_lowercase();
+            if !matches!(m.as_str(), "now" | "done" | "never") {
+                return Err("password_prompt must be now, done or never".into());
+            }
+            *d.password_prompt.lock_ok() = m.clone();
+            (true, json!(m))
+        }
+        "unpack_eat_volumes" => {
+            // TODO 101. off | low_disk | always. Live: the decision is
+            // taken per job, at the moment its disk unpack is about to
+            // start, so a change here applies to the very next unpack -
+            // including one already downloading.
+            let m = v.trim().to_ascii_lowercase();
+            let Some(mode) = crate::eatvol::EatMode::parse(&m) else {
+                return Err("unpack_eat_volumes must be off, low_disk or always".into());
+            };
+            *d.unpack_eat_volumes.lock_ok() = mode.as_str().to_string();
+            crate::eatvol::set_mode(mode);
+            (true, json!(mode.as_str()))
+        }
         "par_cleanup" => {
             let on = flag();
             d.par_cleanup.store(on, Ordering::Relaxed);
+            (true, json!(on))
+        }
+        "watch_keep_nzb" => {
+            // Live: the watch loop reads it per pickup.
+            let on = flag();
+            d.watch_keep_nzb.store(on, Ordering::Relaxed);
             (true, json!(on))
         }
         "fast_par" => {
@@ -1731,6 +1863,58 @@ pub(super) fn apply_setting(
             }
             let persist = serde_json::to_value(&list).unwrap_or(json!([]));
             *d.notify_targets.lock_ok() = list;
+            (true, persist)
+        }
+        "arr_giveup_threshold" => {
+            // §96.3: distinct failed releases per target before the
+            // give-up fires. 0 = off. Capped loosely - a huge value is a
+            // breaker that never trips, which is just "off" spelt long.
+            let n = uint()?.min(1000);
+            d.arr_giveup_threshold.store(n, Ordering::Relaxed);
+            (true, json!(n))
+        }
+        "arr_instances" => {
+            // §96.3: JSON array of {name, kind, url, apikey, enabled}.
+            // Validated as a whole - a typo'd kind would otherwise be an
+            // instance the breaker silently never acts on.
+            let text = v.trim();
+            let mut list: Vec<super::giveup::ArrInstance> = if text.is_empty() {
+                Vec::new()
+            } else {
+                serde_json::from_str(text).map_err(|e| format!("arr_instances: {e}"))?
+            };
+            for i in &list {
+                if !matches!(i.kind.as_str(), "sonarr" | "radarr") {
+                    return Err(format!(
+                        "arr_instances: kind must be sonarr or radarr, not {:?}",
+                        i.kind
+                    ));
+                }
+                let u = i.url.trim();
+                if !(u.starts_with("http://") || u.starts_with("https://")) {
+                    return Err("arr_instances: url must start with http:// or https://".into());
+                }
+            }
+            // get_config never hands the apikey back, so a UI that
+            // round-trips the list submits a blank one for every
+            // unchanged row. Blank means KEEP: carried forward from the
+            // stored instance at the same (kind, url), or failing that
+            // the same (kind, name) - correcting a typo'd host must not
+            // throw the key away.
+            {
+                let old = d.arr_instances.lock_ok().clone();
+                for i in list.iter_mut().filter(|i| i.apikey.is_empty()) {
+                    if let Some(o) = old
+                        .iter()
+                        .find(|o| o.kind == i.kind && o.url == i.url)
+                        .or_else(|| old.iter().find(|o| o.kind == i.kind && o.name == i.name))
+                    {
+                        i.apikey = o.apikey.clone();
+                    }
+                }
+            }
+            let persist = serde_json::to_value(&list).unwrap_or(json!([]));
+            *d.arr_instances.lock_ok() = list;
             (true, persist)
         }
         // Restart-only: bound/opened at startup. Persisted now, applied

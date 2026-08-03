@@ -338,3 +338,76 @@ pub(super) const MANUAL_HTML: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../docs/MANUAL.html"
 ));
+
+#[cfg(test)]
+mod tests {
+    use super::DASHBOARD_HTML;
+
+    /// UX §14: a byte formatter may not pair one base with the other's
+    /// label.
+    ///
+    /// `fmtMB` divided by 1024 and printed "GB", so a 100 GiB job read
+    /// "100.00 GB" in its own queue row while contributing "107.4 GB" to
+    /// the decimal disk-space banner directly above it - the same
+    /// download, two numbers, both called GB. The 1024 base is the right
+    /// one for release sizes (it is what indexers and SABnzbd quote, and
+    /// what the API's `mb` field measures) and stays; the label was the
+    /// bug.
+    ///
+    /// Source-level rather than behavioural because the dashboard has no
+    /// runtime under `cargo test` - `web/fmt_test.js` exercises the
+    /// arithmetic under node. This one holds the line in CI, where the
+    /// page is only ever a string.
+    #[test]
+    fn byte_formatters_label_the_base_they_divide_by() {
+        // Body of `function NAME(` up to its balanced closing brace.
+        let body = |name: &str| {
+            let at = DASHBOARD_HTML
+                .find(&format!("function {name}("))
+                .unwrap_or_else(|| panic!("no function {name} in the dashboard"));
+            let mut depth = 0usize;
+            let bytes = DASHBOARD_HTML.as_bytes();
+            let start = at + DASHBOARD_HTML[at..].find('{').expect("no body brace");
+            for (i, b) in bytes[start..].iter().enumerate() {
+                match b {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return &DASHBOARD_HTML[start..start + i + 1];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("unbalanced body for {name}");
+        };
+        for name in ["fmtMB", "fmtSize"] {
+            let b = body(name);
+            assert!(
+                !b.contains("unit('MB')") && !b.contains("unit('GB')") && !b.contains("unit('TB')"),
+                "{name} is 1024-based and must say MiB/GiB/TiB, not MB/GB/TB"
+            );
+        }
+        for name in ["fmtBytes", "fmtGB"] {
+            let b = body(name);
+            assert!(
+                !b.contains("unit('MiB')")
+                    && !b.contains("unit('GiB')")
+                    && !b.contains("unit('TiB')"),
+                "{name} is 1000-based and must say MB/GB/TB, not MiB/GiB/TiB"
+            );
+        }
+        // Every symbol those formatters ask for has to be in the English
+        // table, or unit()'s fallback renders "undefined" in every locale
+        // that has no override of its own.
+        let en = DASHBOARD_HTML
+            .split("const UNIT_EN=")
+            .nth(1)
+            .and_then(|s| s.split('\n').next())
+            .expect("UNIT_EN table");
+        for k in ["MB:", "GB:", "TB:", "MiB:", "GiB:", "TiB:"] {
+            assert!(en.contains(k), "UNIT_EN is missing {k}");
+        }
+    }
+}

@@ -24,6 +24,7 @@ use clap::{Parser, Subcommand};
 
 mod conntune;
 mod diag;
+mod eatvol;
 mod gates;
 mod get;
 mod groups;
@@ -766,6 +767,11 @@ async fn run() -> Result<()> {
                 // only ever fires on a repair that verified.
                 true,
                 password,
+                // No CLI consent prompt: `unpack_eat_volumes=low_disk`
+                // asks per job through the dashboard drawer, and there is
+                // nowhere here to ask. `always` needs no consent and
+                // still applies to an offline `get`.
+                false,
                 None,
                 None,
                 "",

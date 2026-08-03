@@ -109,7 +109,7 @@ pub(in crate::serve) fn dispatch(
         //                   enricher never overwrites it.
         // Release/file rows are untouched by all three.
         "wall_fix" => {
-            let raw = read_body_capped(req.as_reader(), 1 << 20);
+            let raw = api_body.take().unwrap_or_default();
             let body: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
             let key = body["key"].as_str().unwrap_or("").to_string();
             let title = body["title"].as_str().unwrap_or("").trim().to_string();
@@ -237,23 +237,18 @@ pub(in crate::serve) fn dispatch(
         // art name and the row is stamped checked, so the
         // enricher never overwrites a hand-picked poster.
         "wall_art" => {
+            // Same parse the gateway used to fill `api_body` - one
+            // helper, so a mixed-case `Boundary=` cannot be
+            // multipart there and not here.
             let boundary = req
                 .headers()
                 .iter()
                 .find(|h| h.field.equiv("Content-Type"))
-                .and_then(|h| {
-                    h.value
-                        .as_str()
-                        .split("boundary=")
-                        .nth(1)
-                        .map(|b| b.trim_matches('"').to_string())
-                });
+                .and_then(|h| multipart_boundary(h.value.as_str()));
             // Slack over the 8 MB image limit for multipart framing;
             // the precise size check below still governs. The form
             // pre-read may already hold a multipart body.
-            let raw = api_body
-                .take()
-                .unwrap_or_else(|| read_body_capped(req.as_reader(), 10 << 20));
+            let raw = api_body.take().unwrap_or_default();
             let (key, bytes, src) = match boundary {
                 Some(b) => (
                     params.get("key").cloned().unwrap_or_default(),
@@ -335,7 +330,7 @@ pub(in crate::serve) fn dispatch(
         // Network on the API thread is fine here (user-clicked,
         // 15 s timeouts - the wall_search precedent).
         "omdb_signup" => {
-            let raw = read_body_capped(req.as_reader(), 1 << 20);
+            let raw = api_body.take().unwrap_or_default();
             let body: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
             let email = body["email"].as_str().unwrap_or("").trim().to_string();
             if !email.contains('@') || email.contains(char::is_whitespace) {

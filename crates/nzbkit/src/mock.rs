@@ -84,6 +84,111 @@ pub struct Chaos {
     pub auth_refusal_text: Option<String>,
     /// Upload-side failure injection (POST/IHAVE).
     pub post: PostChaos,
+    /// Bandwidth model (all zero = off, existing tests unaffected).
+    pub throttle: Throttle,
+}
+
+/// Bandwidth shaping for the BODY/ARTICLE path - the model the
+/// connection-tuner tests replay a real provider against. A provider is
+/// two ceilings: a per-socket cap (why more connections help at all)
+/// and the line (why they stop helping). The knee the tuner must find
+/// is line/per_conn.
+#[derive(Default, Clone)]
+pub struct Throttle {
+    /// Per-connection ceiling, bytes/sec (0 = uncapped). Each socket
+    /// delivers at most this, however deep the pipeline.
+    pub per_conn_bps: u64,
+    /// Whole-server ceiling, bytes/sec (0 = uncapped), shared by every
+    /// connection - the line.
+    pub line_bps: u64,
+    /// One TRANSIENT dip: the first time at least this many connections
+    /// are open at once, the line drops to `dip_to_bps` - and recovers
+    /// at the FIRST connection close after that, then full speed
+    /// forever. First-close is the one prompt, deterministic marker of
+    /// "the rung that triggered this is done measuring": teardown
+    /// begins the moment the window ends, while the LAST straggler can
+    /// drain queued bodies seconds into the next sample. Replays the
+    /// noisy sample that faked a knee on a healthy link (James's
+    /// 6-of-18): the reading of the trigger rung lies, every later one
+    /// is honest. 0 = no dip.
+    pub dip_at_conns: usize,
+    /// What the line dips TO while the dip is active (bytes/sec).
+    pub dip_to_bps: u64,
+}
+
+/// Shared pacing state for one mock server's [`Throttle`].
+struct ThrottleState {
+    /// Virtual availability clock for the line: each body reserves its
+    /// transfer time on it, so aggregate throughput can't exceed the
+    /// cap no matter how many sockets pull at once.
+    line_next: tokio::sync::Mutex<std::time::Instant>,
+    /// Open connections right now (drives the dip trigger).
+    active: std::sync::atomic::AtomicUsize,
+    /// Dip lifecycle: 0 = armed, 2 = dipping, 1 = spent. Spent by the
+    /// FIRST connection close after arming: the trigger rung's teardown
+    /// begins the moment its measuring window ends, while stragglers
+    /// (server tasks draining queued bodies to dead sockets at dip
+    /// pace) can linger seconds into the NEXT sample - so first-close
+    /// marks the rung boundary and last-close does not.
+    dip_state: std::sync::atomic::AtomicUsize,
+}
+
+impl ThrottleState {
+    fn new() -> Arc<Self> {
+        Arc::new(ThrottleState {
+            line_next: tokio::sync::Mutex::new(std::time::Instant::now()),
+            active: Default::default(),
+            dip_state: Default::default(),
+        })
+    }
+
+    /// The line cap in force right now, arming the dip when concurrency
+    /// first reaches the trigger.
+    fn line_bps_now(&self, t: &Throttle) -> u64 {
+        if t.dip_at_conns > 0 {
+            match self.dip_state.load(Ordering::Relaxed) {
+                0 if self.active.load(Ordering::Relaxed) >= t.dip_at_conns => {
+                    self.dip_state.store(2, Ordering::Relaxed);
+                    return t.dip_to_bps.max(1);
+                }
+                2 => return t.dip_to_bps.max(1),
+                _ => {}
+            }
+        }
+        t.line_bps
+    }
+
+    /// Reserve `bytes` of transfer time on both ceilings; sleeps until
+    /// the reservation comes due. Paced in 64 KB chunks so a rate
+    /// change mid-article (the dip arming or spending) takes effect
+    /// within a chunk - reserving a whole article at the old rate left
+    /// stale future reservations that throttled the NEXT rung long
+    /// after the dip was over. No lock is held across the sleeps.
+    async fn pace(&self, t: &Throttle, conn_next: &mut std::time::Instant, bytes: usize) {
+        if t.per_conn_bps == 0 && t.line_bps == 0 {
+            return;
+        }
+        let mut left = bytes;
+        while left > 0 {
+            let chunk = left.min(64 * 1024);
+            left -= chunk;
+            let now = std::time::Instant::now();
+            let mut until = now;
+            if t.per_conn_bps > 0 {
+                let d = std::time::Duration::from_secs_f64(chunk as f64 / t.per_conn_bps as f64);
+                *conn_next = (*conn_next).max(now) + d;
+                until = until.max(*conn_next);
+            }
+            let line_bps = self.line_bps_now(t);
+            if line_bps > 0 {
+                let d = std::time::Duration::from_secs_f64(chunk as f64 / line_bps as f64);
+                let mut next = self.line_next.lock().await;
+                *next = (*next).max(now) + d;
+                until = until.max(*next);
+            }
+            tokio::time::sleep_until(until.into()).await;
+        }
+    }
 }
 
 /// Failure injection for the POSTING path. Grouped because these only
@@ -279,6 +384,7 @@ impl MockServer {
         let accepted2 = accepted.clone();
         let post_counters: Arc<PostCounters> = Default::default();
         let stats = post_counters.stats.clone();
+        let throttle_state = ThrottleState::new();
         let handle = tokio::spawn(async move {
             loop {
                 let Ok((sock, _)) = listener.accept().await else {
@@ -293,19 +399,28 @@ impl MockServer {
                 let stall_once = stall_once.clone();
                 let pause = pause2.clone();
                 let post_counters = post_counters.clone();
+                let ts = throttle_state.clone();
+                ts.active.fetch_add(1, Ordering::Relaxed);
                 tokio::spawn(async move {
                     let _ = serve_conn(
                         sock,
                         articles,
                         plane,
-                        chaos,
+                        chaos.clone(),
                         served,
                         body_log,
                         stall_once,
                         pause,
                         post_counters,
+                        ts.clone(),
                     )
                     .await;
+                    ts.active.fetch_sub(1, Ordering::Relaxed);
+                    // First close after arming = the trigger rung's
+                    // teardown has begun: the dip is spent.
+                    let _ =
+                        ts.dip_state
+                            .compare_exchange(2, 1, Ordering::Relaxed, Ordering::Relaxed);
                 });
             }
         });
@@ -365,8 +480,11 @@ async fn serve_conn(
     stall_once: Arc<std::sync::Mutex<HashSet<String>>>,
     pause: Arc<std::sync::atomic::AtomicBool>,
     post_counters: Arc<PostCounters>,
+    throttle: Arc<ThrottleState>,
 ) -> std::io::Result<()> {
     sock.set_nodelay(true)?;
+    // This connection's slot on the per-socket ceiling.
+    let mut conn_next = std::time::Instant::now();
     let (r, mut w) = sock.into_split();
     let mut reader = BufReader::new(r);
     if chaos.mute_greeting {
@@ -660,6 +778,9 @@ async fn serve_conn(
                 w.write_all(&wire).await?;
                 return Ok(()); // cut the connection mid-body
             }
+            throttle
+                .pace(&chaos.throttle, &mut conn_next, wire.len())
+                .await;
             w.write_all(&wire).await?;
             served.fetch_add(1, Ordering::Relaxed);
             bodies_served += 1;
@@ -713,6 +834,9 @@ async fn serve_conn(
                 w.write_all(&wire).await?;
                 return Ok(());
             }
+            throttle
+                .pace(&chaos.throttle, &mut conn_next, wire.len())
+                .await;
             w.write_all(&wire).await?;
             served.fetch_add(1, Ordering::Relaxed);
             bodies_served += 1;

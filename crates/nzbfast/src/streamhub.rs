@@ -16,6 +16,22 @@ pub(crate) struct StreamHub {
     /// a request another job's extractor between the owner check and the
     /// clone.
     pub extractor: std::sync::Mutex<Option<(String, Arc<nzbkit::extract::Extractor>)>>,
+    /// UX §15 fetch progress for the queue row, in the ONE unit the
+    /// queue's denominator is quoted in: bytes as the NZB declares them.
+    /// `fetch_plan` is what the active run is responsible for, `fetch_done`
+    /// how much of it is accounted for (arrived, already on disk from a
+    /// resume, or terminally missing). The percentage they make therefore
+    /// reaches exactly 100% at net-drain and cannot exceed it - unlike the
+    /// decoded-payload-over-encoded-minus-recovery fraction it replaced,
+    /// which stopped near 97% on clean sets and pinned at 100% with
+    /// articles still in flight on damaged ones.
+    ///
+    /// The daemon zeroes both at the Downloading transition and
+    /// `get_with_progress` publishes the plan before the first article can
+    /// land; a zero plan means "no run owns these yet" and every reader
+    /// falls back rather than dividing by it.
+    pub fetch_plan: Arc<std::sync::atomic::AtomicU64>,
+    pub fetch_done: Arc<std::sync::atomic::AtomicU64>,
     /// M14h dashboard feeds: in-stream verifier + per-server pool gauges
     /// of the ACTIVE download.
     pub verifier: std::sync::Mutex<Option<Arc<nzbkit::live::LiveVerifier>>>,
@@ -78,6 +94,37 @@ pub(crate) struct StreamHub {
     /// round-trips on takedown'd content. Never empties the pool, so a
     /// wrong verdict costs only latency, never the last path.
     pub route_gone: std::sync::Mutex<Option<nzbkit::oracle::Snapshot>>,
+    /// "What is the pipeline doing right now", per owning nzo_id - the
+    /// queue row's sub-line. Keyed rather than a single slot because job
+    /// N's tail (verify/repair/unpack) overlaps job N+1's fetch, and both
+    /// rows are live at once. Values are short tokens the dashboard maps
+    /// to i18n phrases ("fetching", "verifying", "repairing",
+    /// "extracting", "preflight"); the pipeline writes one at each
+    /// section transition, never per article. Entries are removed at
+    /// `Daemon::park`, so the map never outgrows the queue. A CLI run
+    /// has no hub and a prefetch sidecar writes to its own hub, which
+    /// the queue payload never reads.
+    pub activity: std::sync::Mutex<std::collections::HashMap<String, &'static str>>,
+    /// Bytes this run will NOT fetch because the journal already has
+    /// those articles on disk (a resume).
+    ///
+    /// Added to the shared progress counter by whoever wants "how much
+    /// of this release is on disk" - the queue row, so a resumed
+    /// download's bar continues from where it stopped instead of
+    /// restarting at 0%. Restarting flatly contradicted the "nothing is
+    /// re-downloaded" promise the failure copy makes in three places,
+    /// and had testers reporting lost journals that had worked perfectly.
+    ///
+    /// Kept BESIDE that counter rather than added into it, because the
+    /// counter is every other consumer's idea of "bytes off the wire
+    /// this run": the quota ledger bills it, history divides it by
+    /// network seconds, the resulting average feeds the stall watchdog's
+    /// `best_rate_bps` reference, and both the CLI ticker and the
+    /// daemon's rolling speed window difference it between samples. A
+    /// resume that folded 40 GB into it in one instant would answer all
+    /// of those with a rate no line has ever run at. Set once, before
+    /// the pool starts; the daemon zeroes it per job.
+    pub resume_seeded: std::sync::atomic::AtomicU64,
     /// M24 late attach (C1): a password set via mode=set_password AFTER
     /// the active download started, tagged with its owning nzo_id. The
     /// download task captures `j.password` once at the Downloading
@@ -88,9 +135,47 @@ pub(crate) struct StreamHub {
     /// Owner-tagged for the same reason `extractor` is: a job
     /// transition must never hand this to the next download.
     pub late_password: std::sync::Mutex<Option<(String, String)>>,
+    /// SAB-parity passwords file: the daemon mirrors the resolved
+    /// `password_file` path here so the in-stream password probe can
+    /// re-read it per invocation (the operator may add the password
+    /// WHILE the download runs). None on CLI runs and sidecar hubs.
+    pub unpack_password_file: std::sync::Mutex<Option<std::path::PathBuf>>,
+    /// The password the in-stream probe VERIFIED for this owner (from
+    /// the passwords file or a harvested sidecar). The set decrypts
+    /// one-pass, so finalize never meets an encrypted volume - this
+    /// cell is how the winner still gets recorded onto the Job
+    /// (has_password, retry reuse), keeping the file's promise that a
+    /// password that works is kept on that download.
+    pub password_found: std::sync::Mutex<Option<(String, String)>>,
+    /// Live "this download wants a password" signal, owner-tagged like
+    /// `late_password`: set when the in-stream probe ran out of
+    /// candidates for an encrypted set, cleared when one verifies (or at
+    /// job teardown). queue_json surfaces it on the owning slot so the
+    /// dashboard's "ask at once" mode can prompt mid-download.
+    pub password_wanted: std::sync::Mutex<Option<String>>,
 }
 
 impl StreamHub {
+    /// UX §15: (accounted-for, planned, still to fetch) for the run that
+    /// owns this hub, all three in declared NZB bytes. `None` when no run
+    /// has published a plan - the gap between the daemon zeroing the pair
+    /// at the Downloading transition and the pipeline filling it, where a
+    /// caller must fall back rather than divide by a plan belonging to
+    /// nobody.
+    pub fn fetch_left(&self) -> Option<(u64, u64, u64)> {
+        use std::sync::atomic::Ordering;
+        let plan = self.fetch_plan.load(Ordering::Relaxed);
+        if plan == 0 {
+            return None;
+        }
+        // Clamped, not trusted: the two counters are independent atomics
+        // and a reader can land between the plan store and the adds that
+        // follow it. Better a percentage that pauses at 100 than one that
+        // prints 103% or an underflowed remainder.
+        let done = self.fetch_done.load(Ordering::Relaxed).min(plan);
+        Some((done, plan, plan - done))
+    }
+
     /// Clone the installed extractor, but only when it belongs to `want`.
     /// `want = None` is the M11 active-download stream, which owns whatever
     /// is installed. For `want = Some(id)` the tag must match, so the owner

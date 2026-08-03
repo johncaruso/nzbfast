@@ -539,15 +539,16 @@ fn fit_title(title: &str, room: usize) -> String {
 /// auto-rename was off, so the base alone is all filing had - today's
 /// behaviour.
 ///
-/// Returns the number of files removed. Returns 0 (a deliberate no-op,
-/// never a broad delete) when the episode can't be identified confidently
-/// - a release that didn't parse as a specific episode, or a filed name
-/// that didn't follow the rename (season-pack / collision fallback / a
-/// suffix that no longer matches because the naming settings changed).
-pub fn delete_filed_episode(dir: &Path, stem: &str, tail: &FiledTail) -> usize {
+/// Returns how many files went, and the first refusal if any (see
+/// [`FiledDelete`]). Removes 0 (a deliberate no-op, never a broad delete)
+/// when the episode can't be identified confidently - a release that
+/// didn't parse as a specific episode, or a filed name that didn't follow
+/// the rename (season-pack / collision fallback / a suffix that no longer
+/// matches because the naming settings changed).
+pub fn delete_filed_episode(dir: &Path, stem: &str, tail: &FiledTail) -> FiledDelete {
     let bases = filed_bases(stem);
     if bases.is_empty() {
-        return 0;
+        return FiledDelete::default();
     }
     // Read once, for the whole delete: see `remove_user_file`.
     // Inline rather than parked with the sweeps' deferred worker ON
@@ -557,9 +558,9 @@ pub fn delete_filed_episode(dir: &Path, stem: &str, tail: &FiledTail) -> usize {
     let recoverable = delete_to_trash();
     let tail_lower = tail.lowered();
     let Ok(rd) = std::fs::read_dir(dir) else {
-        return 0;
+        return FiledDelete::default();
     };
-    let mut removed = 0;
+    let mut out = FiledDelete::default();
     for entry in rd.flatten() {
         let path = entry.path();
         if !path.is_file() {
@@ -571,12 +572,33 @@ pub fn delete_filed_episode(dir: &Path, stem: &str, tail: &FiledTail) -> usize {
             .unwrap_or_default();
         if is_filed_episode_file(&name, &bases, &tail_lower) {
             match remove_user_file(&path, recoverable) {
-                Ok(()) => removed += 1,
-                Err(e) => warn!(target: "smart", "delete filed {}: {e}", path.display()),
+                Ok(()) => out.removed += 1,
+                Err(e) => {
+                    warn!(target: "smart", "delete filed {}: {e}", path.display());
+                    // First refusal only: they all carry the same reason
+                    // (one volume, one Trash), and the caller shows this
+                    // to a person rather than listing every file.
+                    out.kept.get_or_insert_with(|| e.to_string());
+                }
             }
         }
     }
-    removed
+    out
+}
+
+/// What one [`delete_filed_episode`] managed to do.
+///
+/// The count alone was enough while a failed delete could only be a
+/// permanent-delete error nobody could act on. Now a recoverable delete
+/// the Trash refuses LEAVES the episode in the user's library (see
+/// [`remove_user_file`]) while its History row goes, so the reason has to
+/// travel back to whoever can put it in front of them.
+#[derive(Default)]
+pub struct FiledDelete {
+    /// How many files were removed.
+    pub removed: usize,
+    /// Why at least one file is still in the library, when one is.
+    pub kept: Option<String>,
 }
 
 /// Every spelling of this release's filed episode base, ASCII-lowercased:
@@ -1224,9 +1246,15 @@ fn largest_video(dir: &Path) -> Option<PathBuf> {
 
 /// Delete files whose extension is in `exts` from `dir` (top level plus
 /// one subdirectory level - where extraction puts things). Logs each
-/// removal; returns how many went.
-pub fn cleanup(dir: &Path, exts: &[String]) -> usize {
+/// removal; returns `(total, par2)` - how many files went, and how many
+/// of those were `.par2` recovery files. The split exists for the
+/// history drawer's one-line cleanup report: recovery files are deleted
+/// by a default most users never chose (`par_cleanup`), so "12 of those
+/// were par2" is the half of the count that answers "where did my
+/// recovery data go".
+pub fn cleanup(dir: &Path, exts: &[String]) -> (usize, usize) {
     let mut removed = 0;
+    let mut par2 = 0;
     // Read once, for the whole sweep: see `remove_user_file`.
     let recoverable = delete_to_trash();
     let staging = trash_staging_dir(dir);
@@ -1246,6 +1274,9 @@ pub fn cleanup(dir: &Path, exts: &[String]) -> usize {
                     Ok(()) => {
                         info!(target: "cleanup", "removed {}", path.display());
                         removed += 1;
+                        if ext == "par2" {
+                            par2 += 1;
+                        }
                     }
                     Err(e) => warn!(target: "cleanup", "{}: {e}", path.display()),
                 }
@@ -1261,7 +1292,7 @@ pub fn cleanup(dir: &Path, exts: &[String]) -> usize {
             }
         }
     }
-    removed
+    (removed, par2)
 }
 
 /// Auto-rename companion: remove usenet furniture (`.par2`/`.nzb`/`.sfv`/
@@ -1282,11 +1313,17 @@ pub fn cleanup(dir: &Path, exts: &[String]) -> usize {
 /// those are internal churn, and routing them here would bury the user's
 /// Trash under files they never saw and cannot act on.
 ///
-/// Falls back to a permanent delete when there is no Trash to move to - a
-/// container, a headless box with no XDG trash dir, or a volume that has
-/// none - because the alternative is leaving the clutter behind forever.
-/// `delete_to_trash` turns it off for installs (NAS, seedbox) where a
-/// Trash just fills the same disk.
+/// A recoverable delete NEVER becomes a permanent one. When no Trash will
+/// take the path this returns an error and the file stays exactly where it
+/// is - see [`trash_attempt`]. It used to hard-delete instead, on the
+/// reasoning that leaving clutter forever was worse; that reasoning had it
+/// backwards. Every caller of this is a heuristic ("this looks like junk",
+/// "this looks like a sample"), the Trash is the only thing that makes a
+/// wrong guess survivable, and "the Trash refused, so destroy it" turns
+/// the one failure the setting promised to soften into the very outcome it
+/// promised to prevent. A user who genuinely wants permanent deletes turns
+/// `delete_to_trash` off - the NAS/seedbox default on Linux - and that
+/// path is untouched.
 ///
 /// `recoverable` is passed IN rather than read from the process-global
 /// here, so one sweep decides once (at its entry) and every file it touches
@@ -1294,41 +1331,11 @@ pub fn cleanup(dir: &Path, exts: &[String]) -> usize {
 /// change - or, in the test suite, another test's `set_delete_to_trash` -
 /// landed halfway through a sweep and split it between the two behaviours.
 pub fn remove_user_file(path: &Path, recoverable: bool) -> std::io::Result<()> {
-    if recoverable && !trash_unresponsive() {
-        match trash_delete_gated(|| trash_delete_bounded(path)) {
-            Ok(()) => return Ok(()),
-            // Another caller was inside the process's first Trash call
-            // when we arrived, and it came back "unresponsive". We never
-            // made a call of our own, so there is nothing to report: the
-            // file goes straight to the direct delete below.
-            Err(None) => {}
-            Err(Some(e)) => {
-                warn!(
-                    target: "cleanup",
-                    "could not move {} to the Trash ({e}) - deleting it instead",
-                    path.display()
-                );
-                // On a headless Mac the crate's Finder/AppleScript backend
-                // does not fail fast: every call blocks ~2 minutes before
-                // "AppleEvent timed out (-1712)". A queue of three jobs
-                // carries dozens of par2/nfo cleanup files, and those
-                // serialized stalls measured as 720 s of a 863 s job - the
-                // job is not done until its cleanup is. One timeout means
-                // every later call will stall the same way, so the rest of
-                // the process deletes directly - `trash_delete_gated` has
-                // already latched that, before it let anyone else past, and
-                // all that is left here is to say so. Ordinary failures (a
-                // volume with no trash dir) stay per-file: they are instant
-                // and the next file may live elsewhere.
-                if looks_like_a_trash_timeout(&e) {
-                    warn!(
-                        target: "cleanup",
-                        "the Trash is not responding (headless session?) - \
-                         deleting directly from now on"
-                    );
-                }
-            }
-        }
+    if recoverable {
+        return match trash_attempt(path) {
+            TrashVerdict::Took => Ok(()),
+            TrashVerdict::Refused(why) => Err(refusal(&why)),
+        };
     }
     // A bounded call that gave up may STILL be running, and Finder may
     // yet move the file to the Trash behind us. Then this direct delete
@@ -1338,6 +1345,138 @@ pub fn remove_user_file(path: &Path, recoverable: bool) -> std::io::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         other => other,
     }
+}
+
+/// [`remove_user_file`] for a whole DIRECTORY: a completed job's private
+/// output folder, deleted as one recoverable unit. One Trash call moves
+/// the folder intact - the user gets "the download I deleted" back as a
+/// single restorable item, not a thousand loose files - and it costs the
+/// same one bounded call a single file does.
+///
+/// This is what makes the "Deleted files go to the Trash" promise hold
+/// for the deletes users actually perform: history "delete + files", a
+/// queue delete with files, and the watchlist delete_old upgrade all end
+/// at a job directory, and every one of them used to be a bare
+/// `remove_dir_all` that no setting could soften.
+///
+/// This is the delete where refusing to hard-delete matters most: the
+/// argument in [`remove_user_file`] applies to a stray `.nfo`, and here it
+/// applies to an entire finished download. A `remove_dir_all` behind a
+/// failed Trash call is unrecoverable by anyone, and it lands on the user
+/// who ASKED for recoverable deletes. The directory is left alone and the
+/// caller says so instead.
+pub fn remove_user_dir(path: &Path, recoverable: bool) -> std::io::Result<()> {
+    if recoverable {
+        return match trash_attempt(path) {
+            TrashVerdict::Took => Ok(()),
+            TrashVerdict::Refused(why) => Err(refusal(&why)),
+        };
+    }
+    // NotFound tolerated for the same race as remove_user_file - and for
+    // the ordinary case of a job whose directory was never created.
+    match std::fs::remove_dir_all(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// What one recoverable-delete attempt settled on.
+enum TrashVerdict {
+    /// The Trash took `path` - or there was nothing there to take. Either
+    /// way the caller is done and the path is gone from the user's tree.
+    Took,
+    /// No Trash route would take it. Carries the reason for the log. The
+    /// caller must NOT fall back to a permanent delete: see
+    /// [`remove_user_file`].
+    Refused(String),
+}
+
+/// The error a refused recoverable delete comes back as. Worded to be
+/// READ: a user who asked for recoverable deletes needs to know why their
+/// files are still there and what to change, not just that something
+/// failed. It reaches them through the dashboard's kept-files notice as
+/// well as the log now, so it has to stand up in front of a person.
+///
+/// Deliberately does NOT name the path, though it once did. Every caller
+/// already prints it - `remove_job_files`, the filed-episode sweep, the
+/// deferred-trash drain and the watch-folder ingest all log
+/// `<path>: <this>` - so the path came out twice in a row on every line,
+/// and the notice repeats it a third time in its own sentence.
+fn refusal(why: &str) -> std::io::Error {
+    std::io::Error::other(format!(
+        "the Trash would not take it ({why}). Turn off \"Deleted files go \
+         to the Trash\" in Settings if you want files removed outright \
+         rather than left alone"
+    ))
+}
+
+/// One recoverable attempt against the Trash.
+fn trash_attempt(path: &Path) -> TrashVerdict {
+    // Nothing there to bin. Checked BEFORE the backend on purpose: macOS's
+    // Finder route reports a path it cannot see as a CLASS error
+    // ("Handler can't handle objects of this class", -10010), not as "not
+    // found" - the crate only canonicalizes the parent, so a missing leaf
+    // sails through to the AppleScript. That produced a live WARN reading
+    // "could not move <a user's download> to the Trash - deleting it
+    // instead" for a directory that had already gone, which is the most
+    // alarming line we could print about a no-op. It is also the shape of
+    // the race the old direct-delete fallback swallowed as NotFound.
+    if std::fs::symlink_metadata(path).is_err() {
+        return TrashVerdict::Took;
+    }
+    if trash_unresponsive() {
+        return TrashVerdict::Refused("the Trash is not responding".to_string());
+    }
+    match trash_delete_gated(|| trash_delete_bounded(path)) {
+        Ok(()) => TrashVerdict::Took,
+        // Another caller was inside the process's first Trash call when we
+        // arrived, and it came back unresponsive. We never made a call of
+        // our own, but the verdict is the same one we would have got.
+        Err(None) => TrashVerdict::Refused("the Trash is not responding".to_string()),
+        Err(Some(e)) => {
+            // On a headless Mac the crate's Finder/AppleScript backend
+            // does not fail fast: every call blocks ~2 minutes before
+            // "AppleEvent timed out (-1712)". A queue of three jobs
+            // carries dozens of par2/nfo cleanup files, and those
+            // serialized stalls measured as 720 s of a 863 s job - the
+            // job is not done until its cleanup is. One timeout means
+            // every later call will stall the same way, so the rest of
+            // the process stops asking - `trash_delete_gated` has already
+            // latched that, before it let anyone else past, and all that
+            // is left here is to say so. Ordinary failures (a volume with
+            // no trash at all) stay per-path: they are instant and the
+            // next file may live somewhere else entirely.
+            if looks_like_a_trash_timeout(&e) {
+                warn!(
+                    target: "cleanup",
+                    "the Trash is not responding (headless session?) - \
+                     not asking it again this run"
+                );
+            }
+            first_refusal_hint();
+            TrashVerdict::Refused(e)
+        }
+    }
+}
+
+/// Said once per process, the first time a recoverable delete is refused.
+///
+/// The per-path errors go where the caller logs them (a sweep line, a job
+/// line), and each one on its own reads like a transient hiccup. This is
+/// the sentence that explains the pattern: files are being LEFT, on
+/// purpose, and there are exactly two ways out. Once, not per file - a
+/// junk sweep refused is a dozen lines by itself.
+fn first_refusal_hint() {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    warn!(
+        target: "cleanup",
+        "the Trash refused a delete, so files are being left in place \
+         rather than permanently deleted. Turn off \"Deleted files go to \
+         the Trash\" in Settings if you want them removed outright"
+    );
 }
 
 /// How long a single Trash call may hold up a finished job before we stop
@@ -1365,13 +1504,23 @@ const TRASH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 ///
 /// So: run the call on its own thread and stop waiting at
 /// `TRASH_DEADLINE`. The thread is left to finish on its own - AppleEvent
-/// has no cancel, and abandoning it is the point. The file is then
-/// deleted directly by the caller, which tolerates the race where Finder
-/// eventually wins.
+/// has no cancel, and abandoning it is the point. The caller then leaves
+/// the file alone, and tolerates the race where Finder eventually wins
+/// (the path is simply gone next time anyone looks).
 ///
 /// Every other platform calls straight through: the XDG and Windows
 /// backends are local filesystem work with no interprocess wait to bound,
 /// and a thread per file would be cost for nothing.
+///
+/// macOS has a SECOND route, and this is where it is taken. See
+/// [`trash_via_file_manager`]. The other two platforms have exactly one
+/// each, and both fail for reasons no retry would fix - a Windows volume
+/// with the Recycle Bin turned off, a mapped network drive that has none,
+/// an item too big for the bin's quota; a freedesktop trash on a
+/// read-only or foreign-uid mount. Those come back as a refusal and the
+/// file stays, which is the same answer this reaches on macOS when both
+/// routes are out: the platforms differ in how many chances they get, not
+/// in what happens when they are spent.
 fn trash_delete_bounded(path: &Path) -> Result<(), String> {
     // No `return`: on non-mac targets the macos block below is stripped,
     // making this block the tail expression - a `return` here trips
@@ -1383,24 +1532,101 @@ fn trash_delete_bounded(path: &Path) -> Result<(), String> {
     }
     #[cfg(target_os = "macos")]
     {
-        let p = path.to_path_buf();
-        match run_bounded(TRASH_DEADLINE, move || {
-            trash::delete(&p).map_err(|e| e.to_string())
-        }) {
-            Some(r) => r,
-            None => {
-                warn!(
-                    target: "cleanup",
-                    "the Trash did not answer within {}s for {} - \
-                     deleting directly from now on (headless session?)",
-                    TRASH_DEADLINE.as_secs(),
-                    path.display()
-                );
-                TRASH_UNRESPONSIVE.store(true, std::sync::atomic::Ordering::Relaxed);
-                Err("timed out".to_string())
+        if !finder_is_out() {
+            match trash_via_finder(path) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    warn!(
+                        target: "cleanup",
+                        "Finder would not bin {} ({e}) - using the volume's \
+                         own Trash from now on",
+                        path.display()
+                    );
+                    FINDER_IS_OUT.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
+        trash_via_file_manager(path)
     }
+}
+
+/// The Finder/AppleScript route, bounded. First choice on macOS because it
+/// is the only one that records "Put Back", so a user restoring a wrongly
+/// swept file gets it back WHERE IT WAS rather than having to know where
+/// that was.
+#[cfg(target_os = "macos")]
+fn trash_via_finder(path: &Path) -> Result<(), String> {
+    use trash::macos::{DeleteMethod, TrashContextExtMacos};
+    let p = path.to_path_buf();
+    match run_bounded(TRASH_DEADLINE, move || {
+        let mut ctx = trash::TrashContext::new();
+        ctx.set_delete_method(DeleteMethod::Finder);
+        ctx.delete(&p).map_err(|e| e.to_string())
+    }) {
+        Some(r) => r,
+        None => {
+            warn!(
+                target: "cleanup",
+                "Finder did not answer within {}s for {} (headless session?)",
+                TRASH_DEADLINE.as_secs(),
+                path.display()
+            );
+            Err("timed out".to_string())
+        }
+    }
+}
+
+/// `NSFileManager.trashItemAtURL`, the route Finder cannot refuse on our
+/// behalf: it moves the item into the OWNING VOLUME's `.Trashes/<uid>`
+/// itself, with no Finder, no AppleScript and no GUI session in the way.
+///
+/// It exists here because the Finder route fails in ways that have nothing
+/// to do with whether a Trash is available:
+///  * `-10010` ("Handler can't handle objects of this class") for a path
+///    Finder cannot resolve. Seen live on 3 Aug 2026 against a directory
+///    on an external volume;
+///  * `-1712` (AppleEvent timed out) on a headless session, which used to
+///    condemn the whole process to permanent deletes for its lifetime;
+///  * an automation permission prompt nobody is there to answer.
+///
+/// Measured against an external APFS volume on Apple silicon: Finder
+/// 259 ms for one directory, this 40 ms, both landing in the volume's own
+/// `/Volumes/<vol>/.Trashes/<uid>`. The one thing it does not do
+/// is record Put Back (a macOS bug the crate documents), which is why it
+/// is the SECOND choice and not the first - a restore is a drag out of the
+/// Trash rather than one menu item, and that is a far smaller loss than
+/// the delete it replaces.
+///
+/// Bounded like the Finder call: this one has no interprocess wait to
+/// hang on, but a stale network mount can still block a filesystem call,
+/// and a bounded failure now means "leave the file", not "destroy it".
+#[cfg(target_os = "macos")]
+fn trash_via_file_manager(path: &Path) -> Result<(), String> {
+    use trash::macos::{DeleteMethod, TrashContextExtMacos};
+    let p = path.to_path_buf();
+    match run_bounded(TRASH_DEADLINE, move || {
+        let mut ctx = trash::TrashContext::new();
+        ctx.set_delete_method(DeleteMethod::NsFileManager);
+        ctx.delete(&p).map_err(|e| e.to_string())
+    }) {
+        Some(r) => r,
+        None => Err("timed out".to_string()),
+    }
+}
+
+/// Latched the first time the Finder route fails, for any reason: every
+/// later call on this volume - and most likely every later call at all -
+/// goes straight to [`trash_via_file_manager`]. Deliberately never reset,
+/// like `TRASH_UNRESPONSIVE`: re-probing costs up to `TRASH_DEADLINE` per
+/// delete and buys nothing but a Put Back entry.
+///
+/// Note what this latch does NOT mean: the Trash is still working. Only
+/// `TRASH_UNRESPONSIVE` says there is no route at all.
+#[cfg(target_os = "macos")]
+static FINDER_IS_OUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+fn finder_is_out() -> bool {
+    FINDER_IS_OUT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Run `f` on its own thread and give up waiting after `deadline`.
@@ -1514,16 +1740,35 @@ fn trash_answered() -> bool {
 /// opt_out_is_not` then finds its fixture hard-deleted rather than binned.
 /// Lives out here, not in one test module, because both of them need it.
 #[cfg(test)]
-fn one_trash_test_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn one_trash_test_at_a_time() -> std::sync::MutexGuard<'static, ()> {
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
     // Poison is nothing here: each test sets the flags it cares about on
     // the way in, so a panicking predecessor leaves nothing to inherit.
     SERIAL.lock_ok()
 }
 
-/// Latched on the first Finder-timeout failure; deliberately never reset -
-/// a Finder that timed out once will do it again, and each probe costs ~2
-/// minutes of a live job.
+/// Pretend every Trash route has given up, for tests that need a REFUSED
+/// recoverable delete without a machine that has one. The refusal is the
+/// interesting case - it is what leaves a user's download on disk after
+/// they asked for it to go - and it is otherwise unreachable from a test:
+/// the real latch only sets after a backend blows `TRASH_DEADLINE`.
+///
+/// Take [`one_trash_test_at_a_time`] first, and set it back on the way
+/// out: this is the same process-global every other trash test reads.
+#[cfg(test)]
+pub(crate) fn force_trash_unresponsive(v: bool) {
+    TRASH_UNRESPONSIVE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Latched when a Trash call gives up waiting - and on macOS only once
+/// BOTH routes have (`trash_delete_bounded` falls through to
+/// `NSFileManager` before it reports a failure at all). Deliberately never
+/// reset: a backend that timed out once will do it again, and each probe
+/// costs up to `TRASH_DEADLINE` of a live job.
+///
+/// Read publicly as "is a recoverable delete actually available", which is
+/// why a Finder failure must not set it: `FINDER_IS_OUT` covers that, and
+/// the volume's own Trash still works.
 static TRASH_UNRESPONSIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 pub fn trash_unresponsive() -> bool {
@@ -1539,7 +1784,11 @@ pub fn trash_unresponsive() -> bool {
 /// job directory (onto a NAS, into a season folder) the moment the sweep
 /// returns - a parked file must stay put while that happens, or the queued
 /// path goes stale and the junk rides along into the library.
-fn trash_staging_dir(dir: &Path) -> Option<PathBuf> {
+/// pub(crate): the engine-side sweeps (spent obfuscated volumes,
+/// consumed adoption sources in get.rs/unpack.rs) park the same way the
+/// finalize sweeps do, for the same §64 reason - their deletes run in a
+/// job's tail, and an inline Trash call is a Finder wait the job pays.
+pub(crate) fn trash_staging_dir(dir: &Path) -> Option<PathBuf> {
     Some(dir.parent()?.join(".nzbfast-trash"))
 }
 
@@ -1553,13 +1802,14 @@ fn trash_staging_dir(dir: &Path) -> Option<PathBuf> {
 ///
 /// Any staging failure (no parent, EXDEV, a read-only tree) falls through
 /// to the inline delete, which still works everywhere it used to.
-fn remove_swept_file(
+pub(crate) fn remove_swept_file(
     path: &Path,
     recoverable: bool,
     staging: Option<&Path>,
 ) -> std::io::Result<()> {
-    // When the latch is set the inline path is a plain remove_file, which
-    // is as fast as the rename - no reason to park.
+    // When the latch is set there is no Trash to park FOR: the inline path
+    // refuses and leaves the file, and a staging folder full of files
+    // nobody will ever dispose of is worse than the file where it was.
     if recoverable
         && !trash_unresponsive()
         && let Some(root) = staging
@@ -1609,6 +1859,14 @@ mod deferred_trash {
                         // real Trash, exactly like every sweep.
                         // NotFound is Ok here (a double-enqueue after a
                         // leftover drain, or Finder finishing behind us).
+                        //
+                        // A REFUSED delete leaves the file staged, which is
+                        // the one place this differs from an inline sweep:
+                        // the file has already left the user's tree, so the
+                        // log has to name where it is now or it is simply
+                        // missing. Staged is still recoverable - a visible
+                        // file on the same volume - and the next drain of
+                        // this root retries it.
                         if let Err(e) = super::remove_user_file(&p, super::delete_to_trash()) {
                             warn!(target: "cleanup", "deferred trash {}: {e}", p.display());
                         }
@@ -2928,6 +3186,28 @@ fn move_dir_contents(from: &Path, to: &Path) -> std::io::Result<()> {
 // M24 passworded archives (the survey's #2 Usenapp borrow)
 // ---------------------------------------------------------------------------
 
+/// Read a SAB/NZBGet-compatible passwords file: plain text, one
+/// password per line, tried top to bottom. Surrounding whitespace is
+/// stripped and blank lines are skipped - SABnzbd's exact reading
+/// (`misc.get_all_passwords` strips `"\r\n "`), and a superset of
+/// NZBGet's (UnpackController trims trailing CR/LF only), so one file
+/// serves all three programs. No comment syntax on purpose: both
+/// competitors treat every non-blank line as a password, and a `#`
+/// convention here would make a shared file try that line there.
+/// A missing or unreadable file is an empty list, never an error - the
+/// file is optional and the operator may delete it.
+pub fn read_password_file(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .map(|text| {
+            text.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// First password-protected volume in a completed job's folder (top
 /// level), or None. Merely-compressed leftovers don't count - those
 /// failed for other reasons (e.g. no unrar) and a password won't help.
@@ -3070,9 +3350,10 @@ mod tests {
 
     #[test]
     fn latched_swept_delete_stays_inline() {
-        // With the Finder latch set the inline path is already a plain
-        // remove_file, so parking would only add churn: the file goes
-        // directly and no staging folder appears.
+        // With the latch set there is no Trash to park FOR, so the sweep
+        // must not create a staging folder: a hidden folder beside the
+        // user's downloads that nobody will ever drain is exactly the
+        // Unraid `.Trash-<uid>` complaint in our own handwriting.
         //
         // Serialized with the other latch-writing tests: this one leaves
         // TRASH_UNRESPONSIVE set for the length of a delete, and
@@ -3088,30 +3369,91 @@ mod tests {
         TRASH_UNRESPONSIVE.store(true, std::sync::atomic::Ordering::Relaxed);
         let r = remove_swept_file(&f, true, Some(&staging));
         TRASH_UNRESPONSIVE.store(false, std::sync::atomic::Ordering::Relaxed);
-        r.unwrap();
-        assert!(!f.exists());
         assert!(!staging.exists(), "no staging dir on the latched path");
+        assert!(r.is_err(), "a refused sweep must report, not claim success");
+        assert!(
+            f.exists(),
+            "and the file it could not bin must still be there"
+        );
         let _ = std::fs::remove_dir_all(&parent);
     }
 
+    /// The rule this whole path exists for: a delete the user asked to be
+    /// RECOVERABLE never becomes a permanent one behind their back.
+    ///
+    /// It used to. Any Trash failure - a headless Finder timing out, or
+    /// (live, 3 Aug 2026) a `-10010` from a directory on an external
+    /// volume - fell through to `remove_file`/`remove_dir_all`, so the one
+    /// setting that promised a wrong guess could be undone became the
+    /// thing that made it permanent. Both shapes are covered: a swept junk
+    /// file, and a whole finished download.
     #[test]
-    fn trash_latch_still_deletes_the_file() {
-        // With the Finder-unresponsive latch set, a recoverable delete must
-        // skip the Trash entirely (each probe costs ~2 minutes headless)
-        // and still remove the file. Restore the latch afterwards: it is
-        // process-global.
+    fn a_refused_trash_leaves_the_files_alone() {
         let _serial = one_trash_test_at_a_time();
-        let dir = std::env::temp_dir().join(format!("trash-latch-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::env::temp_dir().join(format!("trash-refused-{}", std::process::id()));
+        let job = dir.join("Some.Release.2026");
+        std::fs::create_dir_all(&job).unwrap();
         let f = dir.join("junk.par2");
         std::fs::write(&f, b"x").unwrap();
+        std::fs::write(job.join("feature.mkv"), b"payload").unwrap();
+
         TRASH_UNRESPONSIVE.store(true, std::sync::atomic::Ordering::Relaxed);
-        let r = remove_user_file(&f, true);
+        let file = remove_user_file(&f, true);
+        let whole_job = remove_user_dir(&job, true);
         TRASH_UNRESPONSIVE.store(false, std::sync::atomic::Ordering::Relaxed);
-        r.unwrap();
+
+        assert!(file.is_err(), "a refused file delete must report it");
+        assert!(f.exists(), "the file must survive a Trash that refused it");
         assert!(
-            !f.exists(),
-            "file must be gone even with the Trash latched off"
+            whole_job.is_err(),
+            "a refused directory delete must report it"
+        );
+        assert!(
+            job.join("feature.mkv").exists(),
+            "a finished download must survive a Trash that refused it"
+        );
+        // It has to say what happened and what to do, not just that
+        // something went wrong: this string is read by a person, in the
+        // log and in the dashboard's kept-files notice. It no longer
+        // repeats the outcome ("left where they are") - both surfaces put
+        // this after a line that has already said the files are still
+        // there, and it said the same thing three times over.
+        let said = whole_job.unwrap_err().to_string();
+        assert!(
+            said.contains("the Trash would not take it")
+                && said.contains("Deleted files go to the Trash"),
+            "the error must name the cause and the setting: {said}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A path that is already gone is a no-op, not a Trash failure.
+    ///
+    /// macOS's Finder route reports an unresolvable path as `-10010`
+    /// ("Handler can't handle objects of this class"), because the crate
+    /// canonicalizes only the PARENT and a missing leaf reaches the
+    /// AppleScript intact. That printed "could not move <a user's
+    /// download> to the Trash - deleting it instead" for a directory that
+    /// had already gone - the live line that started all this. With the
+    /// refusal rule it would be worse than noise: a delete would come back
+    /// as an error for work already done.
+    #[test]
+    fn a_path_that_is_already_gone_is_not_a_refusal() {
+        let _serial = one_trash_test_at_a_time();
+        let dir = std::env::temp_dir().join(format!("trash-ghost-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ghost_file = dir.join("already-binned.nfo");
+        let ghost_dir = dir.join("already-deleted-job");
+        // Deliberately never created - and the latch is NOT set, so a
+        // regression here reaches the real backend rather than short-
+        // circuiting on it.
+        assert!(
+            remove_user_file(&ghost_file, true).is_ok(),
+            "a file that is already gone is a success"
+        );
+        assert!(
+            remove_user_dir(&ghost_dir, true).is_ok(),
+            "a directory that is already gone is a success"
         );
         let _ = std::fs::remove_dir(&dir);
     }
@@ -3480,7 +3822,7 @@ mod tests {
         }
         let stem = "The.Daily.Show.2026.07.21.1080p.WEB.x264-GRP";
         assert_eq!(
-            delete_filed_episode(&root, stem, &FiledTail::suffix(" [1080p]")),
+            delete_filed_episode(&root, stem, &FiledTail::suffix(" [1080p]")).removed,
             1
         );
         assert!(
@@ -3577,7 +3919,8 @@ mod tests {
         }
         // Delete only the E05 the old release filed to. Empty suffix =
         // auto-rename off, so the episode base is all filing had to go on.
-        let n = delete_filed_episode(&dir, "The.Bear.S03E05.720p.HDTV-A", &FiledTail::suffix(""));
+        let n = delete_filed_episode(&dir, "The.Bear.S03E05.720p.HDTV-A", &FiledTail::suffix(""))
+            .removed;
         assert_eq!(n, 2, "should remove the E05 video and its .srt sidecar");
         assert!(!dir.join("The Bear - S03E05.mkv").exists());
         assert!(!dir.join("The Bear - S03E05.en.srt").exists());
@@ -3587,7 +3930,7 @@ mod tests {
         // A release that doesn't parse to a specific episode is a no-op,
         // never a broad delete.
         assert_eq!(
-            delete_filed_episode(&dir, "2137d880a074ab31de52", &FiledTail::suffix("")),
+            delete_filed_episode(&dir, "2137d880a074ab31de52", &FiledTail::suffix("")).removed,
             0
         );
         assert!(dir.join("The Bear - S03E04.mkv").exists());
@@ -3732,7 +4075,8 @@ mod tests {
             &dir,
             "The.Bear.S03E05.1080p.WEB.h264-GRP",
             &FiledTail::suffix(""),
-        );
+        )
+        .removed;
         assert_eq!(n, ours.len(), "every file this job filed, and only those");
         for f in ours {
             assert!(!dir.join(f).exists(), "{f} is ours and should have gone");
@@ -3794,7 +4138,7 @@ mod tests {
         }
 
         // The upgrade landed; drop the copy it supersedes.
-        let n = delete_filed_episode(&dir, old_stem, &FiledTail::suffix(&old_sfx));
+        let n = delete_filed_episode(&dir, old_stem, &FiledTail::suffix(&old_sfx)).removed;
         assert_eq!(n, 1, "exactly the superseded release, and nothing else");
         assert!(!dir.join(&old_file).exists(), "the superseded copy is gone");
         assert!(
@@ -3810,7 +4154,7 @@ mod tests {
         // reach back to a copy that carries a different suffix.
         std::fs::write(dir.join(&old_file), b"x").unwrap();
         assert_eq!(
-            delete_filed_episode(&dir, new_stem, &FiledTail::suffix(&new_sfx)),
+            delete_filed_episode(&dir, new_stem, &FiledTail::suffix(&new_sfx)).removed,
             1
         );
         assert!(
@@ -3822,7 +4166,7 @@ mod tests {
         // the naming settings after filing) is a no-op, never a guess: a
         // leftover beats a destroyed episode.
         assert_eq!(
-            delete_filed_episode(&dir, old_stem, &FiledTail::suffix(" [2160p REMUX]-ZZZ")),
+            delete_filed_episode(&dir, old_stem, &FiledTail::suffix(" [2160p REMUX]-ZZZ")).removed,
             0
         );
         assert!(dir.join(&old_file).exists());
@@ -3970,8 +4314,11 @@ mod tests {
         ] {
             std::fs::write(dir.join(p), b"x").unwrap();
         }
-        let n = cleanup(&dir, &parse_ext_list("par2, sfv"));
+        let (n, par2) = cleanup(&dir, &parse_ext_list("par2, sfv"));
         assert_eq!(n, 4);
+        // 3 of the 4 were .par2 - the drawer's "(M par2 recovery files)"
+        // half of the count.
+        assert_eq!(par2, 3);
         assert!(dir.join("a.mkv").exists());
         assert!(dir.join("sub/b.mkv").exists());
         assert!(!dir.join("a.par2").exists());
@@ -5124,7 +5471,7 @@ mod tests {
         assert!(dir.join("sample.mkv").exists(), "sample untouched");
         // delete_filed_episode still finds the suffixed name.
         assert_eq!(
-            delete_filed_episode(&dir, stem, &FiledTail::suffix(" [1080p]")),
+            delete_filed_episode(&dir, stem, &FiledTail::suffix(" [1080p]")).removed,
             1
         );
         assert!(!dir.join("My Show - S01E02 [1080p].mkv").exists());
@@ -5337,7 +5684,7 @@ mod tests {
         assert!(dest.join("Alien - Romulus - S01E02 [1080p].mkv").exists());
 
         assert_eq!(
-            delete_filed_episode(&dest, stem, &FiledTail::suffix(" [1080p]")),
+            delete_filed_episode(&dest, stem, &FiledTail::suffix(" [1080p]")).removed,
             1
         );
         assert!(!dest.join("Alien - Romulus - S01E02 [1080p].mkv").exists());
@@ -5390,7 +5737,7 @@ mod tests {
             Some(filed.as_path()),
             "play finds the titled episode"
         );
-        assert_eq!(delete_filed_episode(&dest, stem, &tail), 1);
+        assert_eq!(delete_filed_episode(&dest, stem, &tail).removed, 1);
         assert!(!filed.exists(), "and delete takes it");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -5604,7 +5951,7 @@ mod tests {
             Some(ours.as_path()),
             "play serves the copy we downloaded, not theirs"
         );
-        assert_eq!(delete_filed_episode(&season, stem, &tail), 1);
+        assert_eq!(delete_filed_episode(&season, stem, &tail).removed, 1);
         assert!(!ours.exists(), "ours went");
         assert!(theirs.exists(), "their copy of the same episode survives");
         assert!(sibling.exists(), "and so does the sibling episode");
@@ -5613,7 +5960,7 @@ mod tests {
         // with the setting off) matches nothing here rather than
         // guessing - a leftover, never somebody else's episode.
         assert_eq!(
-            delete_filed_episode(&season, stem, &FiledTail::suffix(" [1080p]")),
+            delete_filed_episode(&season, stem, &FiledTail::suffix(" [1080p]")).removed,
             0
         );
         assert!(theirs.exists() && sibling.exists());
@@ -5711,7 +6058,7 @@ mod tests {
         // ...and delete-with-files removes the old-spelling episode
         // rather than reporting zero and leaving it behind. E06 stays.
         assert_eq!(
-            delete_filed_episode(&old, stem, &FiledTail::suffix(" [1080p]")),
+            delete_filed_episode(&old, stem, &FiledTail::suffix(" [1080p]")).removed,
             1
         );
         assert!(!filed.exists());
@@ -6196,9 +6543,9 @@ mod trash_tests {
         remove_user_file(&f, true).expect("trash delete");
         assert!(!f.exists(), "the file must leave the download folder");
         if let Some(found) = still_recoverable(&name) {
-            // `remove_user_file` falls back to a hard delete when the Trash
-            // refuses, and reports Ok either way - so this is the only thing
-            // standing between "recoverable" and a permanent delete.
+            // The file being GONE proves nothing on its own - a permanent
+            // delete looks identical from the download folder. This is the
+            // assertion that separates the two.
             assert!(
                 found,
                 "not recoverable: nothing named {name} reached the Trash"
@@ -6214,6 +6561,105 @@ mod trash_tests {
         if let Some(found) = still_recoverable(&name2) {
             assert!(!found, "opt-out still used the Trash");
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The directory delete behind "delete + files" and the watchlist
+    /// delete_old upgrade: recoverable moves the WHOLE folder to the
+    /// Trash as one restorable item, opt-out is a real remove_dir_all,
+    /// and a directory that never existed is Ok (jobs that never
+    /// downloaded have no folder).
+    #[test]
+    fn a_job_dir_delete_is_recoverable_and_the_opt_out_is_not() {
+        let _serial = one_trash_test_at_a_time();
+        let root = std::env::temp_dir().join(format!("nzbfast-trashdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let name = format!("nzbfast-trashdir-probe-{}", std::process::id());
+        let d = root.join(&name);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("payload.mkv"), b"x").unwrap();
+        remove_user_dir(&d, true).expect("trash delete");
+        assert!(!d.exists(), "the folder must leave the download tree");
+        if let Some(found) = still_recoverable(&name) {
+            assert!(
+                found,
+                "not recoverable: nothing named {name} reached the Trash"
+            );
+        }
+        // still_recoverable purges a FILE from the macOS Trash; a folder
+        // needs the recursive form or the probe lingers there forever.
+        #[cfg(target_os = "macos")]
+        if let Ok(home) = std::env::var("HOME") {
+            let _ = std::fs::remove_dir_all(std::path::Path::new(&home).join(".Trash").join(&name));
+        }
+
+        let name2 = format!("nzbfast-notrashdir-probe-{}", std::process::id());
+        let g = root.join(&name2);
+        std::fs::create_dir_all(&g).unwrap();
+        std::fs::write(g.join("payload.mkv"), b"x").unwrap();
+        remove_user_dir(&g, false).unwrap();
+        assert!(!g.exists());
+        if let Some(found) = still_recoverable(&name2) {
+            assert!(!found, "opt-out still used the Trash");
+        }
+
+        // A directory that is not there is a finished delete, not an
+        // error - remove_job_files runs on jobs that never started.
+        remove_user_dir(&root.join("never-existed"), true).unwrap();
+        remove_user_dir(&root.join("never-existed"), false).unwrap();
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// macOS's second route, exercised for real: `NSFileManager` must bin
+    /// a file with no Finder involved, and `trash_delete_bounded` must
+    /// reach it once the Finder latch is set.
+    ///
+    /// This is the fix for the live 3 Aug 2026 line, where Finder answered
+    /// `-10010` for a directory on an external volume and the delete
+    /// became permanent. Finder failing is not the same as having no
+    /// Trash, and the volume's own `.Trashes` was there the whole time.
+    ///
+    /// The latch is process-global and never reset in production, so the
+    /// test restores it by hand and serializes with the other latch tests.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_volume_trash_takes_over_when_finder_will_not() {
+        let _serial = one_trash_test_at_a_time();
+        let dir = std::env::temp_dir().join(format!("nzbfast-nsfm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Directly first: the route itself has to work before the
+        // fall-through to it means anything.
+        let name = format!("nzbfast-nsfm-probe-{}.par2", std::process::id());
+        let f = dir.join(&name);
+        std::fs::write(&f, b"junk").unwrap();
+        trash_via_file_manager(&f).expect("NSFileManager must bin a file with no Finder");
+        assert!(!f.exists());
+        assert_eq!(
+            still_recoverable(&name),
+            Some(true),
+            "NSFileManager did not put {name} anywhere recoverable"
+        );
+
+        // Then through the real entry point with Finder latched out, which
+        // is the state a -10010 or a headless timeout leaves behind.
+        let name2 = format!("nzbfast-nsfm-latched-{}.par2", std::process::id());
+        let g = dir.join(&name2);
+        std::fs::write(&g, b"junk").unwrap();
+        let was_out = finder_is_out();
+        FINDER_IS_OUT.store(true, std::sync::atomic::Ordering::Relaxed);
+        let r = remove_user_file(&g, true);
+        FINDER_IS_OUT.store(was_out, std::sync::atomic::Ordering::Relaxed);
+        r.expect("a latched Finder must not stop the delete");
+        assert!(!g.exists());
+        assert_eq!(
+            still_recoverable(&name2),
+            Some(true),
+            "with Finder out the delete went somewhere unrecoverable"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

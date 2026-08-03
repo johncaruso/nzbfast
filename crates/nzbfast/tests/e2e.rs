@@ -60,6 +60,19 @@ impl Fixture {
         self.nzb_files.push((name.to_string(), segs));
     }
 
+    /// A post whose `=ybegin size` LIES: one self-consistent part
+    /// covering `data`, but a declared total of `declared` bytes. Real
+    /// posters do misstate totals, so the decoder deliberately does not
+    /// reject on it - the job must still not call the result complete.
+    fn add_file_declaring(&mut self, name: &str, data: &[u8], declared: u64) {
+        let tag = format!("{}-{}", name.replace('.', "_"), self.nzb_files.len());
+        let article = nzbkit::yenc::encode(name, declared, Some((1, 1)), 1, data);
+        let id = format!("{tag}-1@mock");
+        self.articles.insert(format!("<{id}>"), article.clone());
+        self.nzb_files
+            .push((name.to_string(), vec![(id, article.len() as u64, 1)]));
+    }
+
     /// `add_file` with the NZB subject decoupled from the yEnc-declared
     /// name (the obfuscated norm: garbage subjects, real yEnc names).
     /// The data lands on disk under the REAL name, so `add_par2` covers
@@ -2880,6 +2893,148 @@ async fn kill9_resume_completes_without_refetching_everything() {
 /// The 2026-07 bench4 "honest loss": kill -9 mid-download of a store-mode
 /// RAR job being DIRECT-EXTRACTED. The bytes land in the extracted inner
 /// file, not in any volume file, so the v1 journal covered nothing and a
+/// §94 A (NZBFAST_RESUME_MAP): the same kill+resume as
+/// `kill9_resume_direct_extract_refetches_little`, but run 2 must resume
+/// INTO mapped mode - restored spans replay through the normal write
+/// path, the mappers re-derive their state from replayed headers, and
+/// the run stays one-pass: shape line says so, and no volume files exist
+/// at exit (nothing materialized, nothing re-extracted from disk).
+#[tokio::test(flavor = "multi_thread")]
+async fn kill9_resume_map_resumes_into_one_pass() {
+    if !have_par2() {
+        eprintln!("skipping: par2 not installed");
+        return;
+    }
+    let mut fx = Fixture::new("resume-map");
+    let inner = payload(3_000_000, 47);
+    let n_vols = 4;
+    let per = inner.len() / n_vols;
+    let mut vol_names: Vec<String> = Vec::new();
+    let mut pos = 0usize;
+    for i in 0..n_vols {
+        let len = if i == 0 {
+            per + 1
+        } else if i < n_vols - 1 {
+            per
+        } else {
+            inner.len() - pos
+        };
+        let part = &inner[pos..pos + len];
+        pos += len;
+        let vol = fixtures::rar5_volume_n(
+            &[("movie.mkv", inner.len() as u64, part, i > 0, i < n_vols - 1)],
+            i as u64,
+        );
+        let name = format!("r.part{}.rar", i + 1);
+        fx.add_file(&name, &vol, 25_000);
+        vol_names.push(name);
+    }
+    {
+        let names: Vec<&str> = vol_names.iter().map(String::as_str).collect();
+        assert!(fx.add_par2(20, &names, 25_000), "par2 create failed");
+    }
+    let total_articles = fx.articles.len() as u64;
+    let srv = MockServer::start(
+        fx.articles.clone(),
+        Chaos {
+            delay_ms: 10,
+            ..Chaos::default()
+        },
+    )
+    .await;
+    let served = srv.served.clone();
+    let cfg = fx.write_config(&[&srv]);
+    let nzb = fx.write_nzb();
+    let out = fx.dir.join("out");
+
+    // Run 1 (flag OFF - the kill can land either side of classification;
+    // what matters is a journal with real placements): kill -9 once ~40%
+    // of the articles are served AND at least one placement is recorded.
+    {
+        let cfg = cfg.clone();
+        let nzb = nzb.clone();
+        let out = out.clone();
+        let served = served.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut child = Command::new(env!("CARGO_BIN_EXE_nzbfast"))
+                .env("NZBFAST_OPEN", "1")
+                .arg("--config")
+                .arg(&cfg)
+                .arg("get")
+                .arg(&nzb)
+                .arg("--out")
+                .arg(&out)
+                .arg("--connections")
+                .arg("2")
+                .arg("--window")
+                .arg("2")
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let journal = out.join(".nzbfast.journal");
+            while served.load(std::sync::atomic::Ordering::Relaxed) < total_articles * 2 / 5
+                || !std::fs::read_to_string(&journal)
+                    .is_ok_and(|s| s.lines().any(|line| line.starts_with("R ")))
+            {
+                if std::time::Instant::now() > deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            child.kill().unwrap();
+            let _ = child.wait();
+        })
+        .await
+        .unwrap();
+    }
+    let served_run1 = served.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        served_run1 >= total_articles * 2 / 5,
+        "run 1 made no progress ({served_run1}/{total_articles})"
+    );
+
+    // Run 2: replay + map. One-pass all the way to a clean finish.
+    let (log, ok) = {
+        let cfg = cfg.clone();
+        let nzb = nzb.clone();
+        let out = out.clone();
+        tokio::task::spawn_blocking(move || {
+            run_get(&cfg, &nzb, &out, &[("NZBFAST_RESUME_MAP", "1")])
+        })
+        .await
+        .unwrap()
+    };
+    assert!(ok, "{log}");
+    assert!(log.contains("resume: replayed"), "no replay banner:\n{log}");
+    assert!(
+        log.contains("one-pass"),
+        "resumed run did not map in-stream:\n{log}"
+    );
+    // The old resume path's disk re-extraction must NOT have run.
+    assert!(
+        !log.contains("resumed job: the verified volumes"),
+        "took the disk re-extract path:\n{log}"
+    );
+    // Refetch stays bounded to the un-journaled remainder (+1 slack).
+    let journal_txt = std::fs::read_to_string(fx.dir.join("out/.nzbfast.journal")).ok();
+    let refetched = served.load(std::sync::atomic::Ordering::Relaxed) - served_run1;
+    assert!(
+        refetched <= total_articles,
+        "replay refetched more than the whole set ({refetched}); journal: {journal_txt:?}"
+    );
+    // End state: extracted output byte-identical, no volume files (the
+    // replayed sources are removed after the fully-good finish, and the
+    // map never materialized any), journal gone.
+    assert_eq!(std::fs::read(fx.dir.join("out/movie.mkv")).unwrap(), inner);
+    for v in &vol_names {
+        assert!(
+            !fx.dir.join("out").join(v).exists(),
+            "volume {v} left behind under resume replay:\n{log}"
+        );
+    }
+    assert!(!fx.dir.join("out/.nzbfast.journal").exists());
+}
+
 /// resume refetched the whole pre-kill payload (15.3 GB vs NZBGet's
 /// 0.2 GB). The placement journal must record where each article's bytes
 /// physically went, the resume must copy them back into volume files
@@ -3876,6 +4031,75 @@ async fn conntune_caps_connections() {
     assert!(
         log.contains("connection auto-tune: 127.0.0.1 1"),
         "tuned cap not applied:\n{log}"
+    );
+    assert_eq!(std::fs::read(fx.dir.join("out/t.bin")).unwrap(), data);
+}
+
+/// A SUSPECT knee (a low reading still awaiting a second probe's
+/// corroboration - James: a jittery ladder said 6 of his 18) must NOT
+/// cap the job: it is recorded state, not applied state.
+#[tokio::test(flavor = "multi_thread")]
+async fn suspect_conntune_knee_is_not_applied() {
+    let mut fx = Fixture::new("conntune_suspect");
+    let data = payload(300_000, 22);
+    fx.add_file("t.bin", &data, 40_000);
+    let srv = MockServer::start(fx.articles.clone(), Chaos::default()).await;
+    let cfg = fx.write_config(&[&srv]);
+    std::fs::write(
+        cfg.with_file_name("conntune.json"),
+        format!(
+            "{{\"{}\":{{\"connections\":1,\"granted\":1,\"gbps\":0.5,\"checked\":1,\"source\":\"auto\",\"suspect\":true}}}}",
+            srv.addr.ip()
+        ),
+    )
+    .unwrap();
+    let nzb = fx.write_nzb();
+    let out = fx.dir.join("out");
+    let (log, ok) = tokio::task::spawn_blocking(move || run_get(&cfg, &nzb, &out, &[]))
+        .await
+        .unwrap();
+    assert!(ok, "{log}");
+    assert!(
+        !log.contains("connection auto-tune:"),
+        "a suspect knee was applied:\n{log}"
+    );
+    assert_eq!(std::fs::read(fx.dir.join("out/t.bin")).unwrap(), data);
+}
+
+/// auto_connections OFF in settings.json must lift a stored knee from
+/// the very next job - off means off, the user's escape hatch from a
+/// bad probe (the toggle used to stop only the PROBING, and the stale
+/// cap kept applying with no way to override it short of deleting
+/// conntune.json by hand).
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_connections_off_lifts_the_conntune_cap() {
+    let mut fx = Fixture::new("conntune_off");
+    let data = payload(300_000, 23);
+    fx.add_file("t.bin", &data, 40_000);
+    let srv = MockServer::start(fx.articles.clone(), Chaos::default()).await;
+    let cfg = fx.write_config(&[&srv]);
+    std::fs::write(
+        cfg.with_file_name("conntune.json"),
+        format!(
+            "{{\"{}\":{{\"connections\":1,\"granted\":1,\"gbps\":0.5,\"checked\":1,\"source\":\"auto\"}}}}",
+            srv.addr.ip()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        cfg.with_file_name("settings.json"),
+        br#"{"auto_connections":false}"#,
+    )
+    .unwrap();
+    let nzb = fx.write_nzb();
+    let out = fx.dir.join("out");
+    let (log, ok) = tokio::task::spawn_blocking(move || run_get(&cfg, &nzb, &out, &[]))
+        .await
+        .unwrap();
+    assert!(ok, "{log}");
+    assert!(
+        !log.contains("connection auto-tune:"),
+        "knee applied with auto_connections off:\n{log}"
     );
     assert_eq!(std::fs::read(fx.dir.join("out/t.bin")).unwrap(), data);
 }
@@ -6605,6 +6829,14 @@ async fn kill9_resume_of_an_obfuscated_post_still_defers_recovery_volumes() {
 /// cores, once dropping the saving from 1.9 MB to 0.4 MB). Keep the
 /// payload dominant: it is what makes this assertion about deferral
 /// rather than about decoder scheduling.
+///
+/// The ratio is a cushion, not a proof - it still lost 1 run in 224 at
+/// 28-way concurrent copies of this test. What closes the race is the
+/// mock's `pause` gate below: once every offset-0 head has been
+/// REQUESTED, the mock freezes, the decode side sniffs and cancels
+/// against a world that cannot move, and only then does the fetcher get
+/// to walk on. Under the freeze, waiting longer is free, so the drain
+/// only has to beat scheduler starvation - never the fetcher.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_undamaged_obfuscated_post_defers_its_sniffed_recovery_volumes() {
     if !have_par2() {
@@ -6636,12 +6868,68 @@ async fn an_undamaged_obfuscated_post_defers_its_sniffed_recovery_volumes() {
     let cfg = fx.write_config(&[&srv]);
     let nzb = fx.write_nzb();
     let out = fx.dir.join("out");
+
+    // The determinism gate. Every file's offset-0 head is queued ahead of
+    // all data bodies, and the mock logs a BODY command when it READS it,
+    // before serving - so "all heads logged" means every head response is
+    // either written or committed to be written in full (`pause` gates the
+    // next read, never an in-flight response). Freeze there, wait for the
+    // in-flight tail to quiesce on the frozen log, give the decode side a
+    // generous drain to sniff all twelve heads and land every cancel
+    // against an unmoving queue, then release. The CLI is a subprocess
+    // behind `Command::output()`, so there is no live log to poll for a
+    // deferral marker - the frozen fixed wait stands in for one, and it
+    // is free precisely because the world is stopped.
+    // body_log stores message-ids WITH angle brackets; the NZB segments
+    // carry them bare.
+    let heads: Vec<String> = fx
+        .nzb_files
+        .iter()
+        .filter_map(|(_, segs)| segs.first().map(|(id, _, _)| format!("<{id}>")))
+        .collect();
+    let gate = {
+        let pause = srv.pause.clone();
+        let body_log = srv.body_log.clone();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                let all_heads_logged = {
+                    let log = body_log.lock().unwrap();
+                    heads.iter().all(|h| log.contains(h))
+                };
+                if all_heads_logged {
+                    break;
+                }
+                if std::time::Instant::now() > deadline {
+                    // Never freeze a run that went sideways early; the
+                    // assertions below still hold the line.
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            pause.store(true, std::sync::atomic::Ordering::Release);
+            // A connection mid-read when the flag landed serves that one
+            // command; wait until the frozen log stops moving.
+            let mut last = usize::MAX;
+            loop {
+                let len = body_log.lock().unwrap().len();
+                if len == last {
+                    break;
+                }
+                last = len;
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2000));
+            pause.store(false, std::sync::atomic::Ordering::Release);
+        })
+    };
     let (log, ok) = tokio::task::spawn_blocking({
         let (cfg, nzb, out) = (cfg.clone(), nzb.clone(), out.clone());
         move || run_get_win(&cfg, &nzb, &out, &[], &[], 1)
     })
     .await
     .unwrap();
+    gate.join().unwrap();
 
     assert!(ok, "get failed on a clean obfuscated post:\n{log}");
     assert!(
@@ -7058,5 +7346,125 @@ async fn corrupt_par2_index_still_fails_a_damaged_payload() {
     assert!(
         log.contains("download incomplete"),
         "payload loss must be reported as such:\n{log}"
+    );
+}
+
+/// Codex H4: the NZB parser refuses a segment whose message-id is
+/// wire-unsafe (CR/LF smuggling), but it used to drop the segment
+/// SILENTLY - a file whose every segment was refused entered the
+/// downloader with nothing to fetch and nothing missing, wrote zero
+/// bytes, and the job finished green. A refused segment must count as
+/// missing so the job fails (or repairs) instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_of_refused_segments_fails_the_job_not_greens_it() {
+    let mut fx = Fixture::new("dropped-segs");
+    fx.add_file("readme.txt", &payload(4096, 7), 2048);
+    let nzb_path = fx.write_nzb();
+    // Append a second file whose only segment id resolves to CR/LF -
+    // the parser drops the segment and keeps the file.
+    let mut xml = std::fs::read_to_string(&nzb_path).unwrap();
+    let hostile = "  <file poster=\"e2e@test\" date=\"0\" subject=\"&quot;movie.mkv&quot; yEnc (1/1)\">\n    <groups><group>mock.group</group></groups>\n    <segments>\n      <segment bytes=\"2048\" number=\"1\">a@b&#13;&#10;POST&#13;&#10;c@d</segment>\n    </segments>\n  </file>\n</nzb>\n";
+    xml = xml.replace("</nzb>\n", hostile);
+    std::fs::write(&nzb_path, xml).unwrap();
+    let srv = MockServer::start(fx.articles.clone(), Chaos::default()).await;
+    let cfg = fx.write_config(&[&srv]);
+    let out = fx.dir.join("out");
+
+    let (log, ok) = tokio::task::spawn_blocking(move || run_get(&cfg, &nzb_path, &out, &[]))
+        .await
+        .unwrap();
+    assert!(
+        !ok,
+        "a file whose only segment was refused must not finish green:\n{log}"
+    );
+    assert!(
+        log.contains("download incomplete"),
+        "the refused segment must surface as incomplete:\n{log}"
+    );
+}
+
+/// Codex sweep 3 Aug M7: a self-consistent yEnc part geometry can still
+/// leave most of the declared file unwritten. The decoder validates a
+/// part against its OWN `=ypart` range and deliberately not against
+/// `=ybegin size` (posters misstate totals), and the writer is sized
+/// from that untrusted total - so a one-part post declaring 16 MiB and
+/// shipping 64 KB used to retire every article counter to zero and
+/// complete GREEN as 64 KB plus a 16 MiB hole. Completion now
+/// reconciles the writer's covered intervals against the declared
+/// range.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lying_total_size_does_not_complete_green() {
+    let mut fx = Fixture::new("lyingsize");
+    let real = incompressible(64 << 10, 7);
+    fx.add_file_declaring("movie.mkv", &real, 16 << 20);
+    let srv = MockServer::start(fx.articles.clone(), Chaos::default()).await;
+    let cfg = fx.write_config(&[&srv]);
+    let nzb = fx.write_nzb();
+    let out = fx.dir.join("out");
+
+    let (log, ok) = tokio::task::spawn_blocking(move || run_get(&cfg, &nzb, &out, &[]))
+        .await
+        .unwrap();
+    assert!(
+        !ok,
+        "a file 16 MiB short of its declared size must not succeed:\n{log}"
+    );
+    assert!(
+        log.contains("never written"),
+        "the shortfall must be reported:\n{log}"
+    );
+}
+
+/// Codex sweep 2, 3 Aug M2: the M7 coverage census above was gated
+/// GLOBALLY on `verifier.set().is_none() && deferred_arts == 0`, which
+/// is a per-slot question asked once for the whole job. Any PAR2 set
+/// anywhere therefore exempted every slot in the post - so a sparse
+/// out-of-set sidecar sitting beside a perfectly healthy covered
+/// payload completed green with a hole in it, which is exactly the
+/// false-green M7 existed to close. The exemption is now per slot: the
+/// covered payload sits the census out (the set speaks for it), the
+/// out-of-set `.nfo` does not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lying_total_size_is_caught_beside_a_healthy_par2_set() {
+    if !have_par2() {
+        eprintln!("skipping: par2 not installed");
+        return;
+    }
+    let mut fx = Fixture::new("lyingsize-par2");
+    // The healthy half: an ordinary file the recovery set covers.
+    let good = payload(300_000, 21);
+    fx.add_file("movie.mkv", &good, 60_000);
+    assert!(
+        fx.add_par2(20, &["movie.mkv"], 60_000),
+        "par2 create failed"
+    );
+    // The sick half, posted OUTSIDE the set: one CRC-valid part of
+    // 64 KB under a declared total of 16 MiB.
+    fx.add_file_declaring("readme.nfo", &incompressible(64 << 10, 22), 16 << 20);
+
+    let srv = MockServer::start(fx.articles.clone(), Chaos::default()).await;
+    let cfg = fx.write_config(&[&srv]);
+    let nzb = fx.write_nzb();
+    let out = fx.dir.join("out");
+
+    let (log, ok) = tokio::task::spawn_blocking(move || run_get(&cfg, &nzb, &out, &[]))
+        .await
+        .unwrap();
+    assert!(
+        !ok,
+        "a sparse out-of-set sidecar must fail the job even though the \
+         set itself verified clean:\n{log}"
+    );
+    assert!(
+        log.contains("readme.nfo") && log.contains("never written"),
+        "the shortfall must name the sidecar:\n{log}"
+    );
+    // The regression that matters more than the fix: the covered file
+    // must NOT be accused. Its bytes are the set's business, and a
+    // census that failed healthy covered payload would be worse than
+    // the false green it replaces.
+    assert!(
+        !log.contains("movie.mkv: every article arrived"),
+        "the covered payload must sit the census out:\n{log}"
     );
 }

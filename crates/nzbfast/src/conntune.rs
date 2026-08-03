@@ -23,6 +23,31 @@ use std::path::{Path, PathBuf};
 /// Re-probe a provider after this long (knees move with provider policy).
 pub const STALE_SECS: u64 = 7 * 86_400;
 
+/// Re-probe a SUSPECT knee after this long instead - soon enough to
+/// confirm or clear it within a day, far enough that the second sample
+/// sees a different hour (a one-time provider or link issue at probe
+/// time shouldn't survive corroboration).
+pub const SUSPECT_STALE_SECS: u64 = 6 * 3600;
+
+/// Whether auto connection tuning is enabled in the dashboard settings
+/// (settings.json next to the config; absent key = the default, ON).
+/// The toggle gates APPLICATION as well as probing: switching it off
+/// must lift a stored knee from the very next job, not keep capping
+/// with stale state the user has disowned.
+///
+/// Through the same backup-aware loader every other settings read uses
+/// (Codex sweep 2, 3 Aug ML3). A bare `read` + parse treats a torn or
+/// half-written settings.json as "no setting", which for this key means
+/// the default - ON. The daemon meanwhile loads the .bak and correctly
+/// knows the user turned it OFF, so the two authorities disagreed and
+/// every new job re-applied stored knees the user had disowned. One
+/// loader, one answer.
+pub fn enabled(config: &Path) -> bool {
+    crate::persist::load_json_with_backup(&config.with_file_name("settings.json"))
+        .and_then(|v| v.get("auto_connections").and_then(|v| v.as_bool()))
+        .unwrap_or(true)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tuned {
     /// Recommended connection count (smallest reaching ≥90% of the
@@ -37,6 +62,14 @@ pub struct Tuned {
     /// "auto" (idle probe) or "manual" (dashboard ladder run).
     #[serde(default)]
     pub source: String,
+    /// The knee would cut the configured connection count substantially
+    /// and no earlier probe agrees yet - a single 5 s-per-rung ladder on
+    /// a jittery link can fake a knee far below the true one (James: 6
+    /// of 18). A suspect knee is NOT applied to jobs and is re-probed on
+    /// the short clock; a second probe landing in the same place clears
+    /// the flag (and, hours apart, samples a different time of day).
+    #[serde(default)]
+    pub suspect: bool,
 }
 
 pub fn path_for(config: &Path) -> PathBuf {
@@ -88,6 +121,7 @@ mod tests {
                 gbps: 4.9,
                 checked: 1,
                 source: "auto".into(),
+                suspect: false,
             },
         );
         record(
@@ -99,12 +133,23 @@ mod tests {
                 gbps: 0.8,
                 checked: 2,
                 source: "manual".into(),
+                suspect: true,
             },
         );
         let m = load(&cfg);
         assert_eq!(m.len(), 2);
         assert_eq!(m["news.example.com"].connections, 12);
+        assert!(!m["news.example.com"].suspect);
         assert_eq!(m["fill.example.com"].source, "manual");
+        assert!(m["fill.example.com"].suspect);
+        // No settings.json in the dir: the toggle defaults ON.
+        assert!(enabled(&cfg));
+        std::fs::write(
+            cfg.with_file_name("settings.json"),
+            br#"{"auto_connections":false}"#,
+        )
+        .unwrap();
+        assert!(!enabled(&cfg));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

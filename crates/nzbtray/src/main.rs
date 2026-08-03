@@ -146,6 +146,63 @@ mod probe_body {
             )
     }
 
+    // ---- §98 upgrade handshake: version ordering ----------------------
+
+    /// An engine version as ordered for the §98 upgrade decision: the
+    /// semver components, then the beta serial. A beta build is made
+    /// AFTER the release its semver names (deploys bump
+    /// packaging/beta-serial.txt; publish resets it), so "1.0.14 beta 5"
+    /// is newer than "1.0.14" and older than "1.0.15". Mirrors the Mac
+    /// wrapper's `EngineVersion` - the two launchers must order releases
+    /// identically or an upgrade behaves differently per platform.
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct EngineVersion {
+        nums: [u64; 3],
+        beta: u64,
+    }
+
+    impl EngineVersion {
+        /// `semver` like "1.0.14"; `beta` like "5" or "" (not a beta).
+        /// None on anything unreadable - and the §98 rule is that an
+        /// unreadable side means ATTACH, never restart.
+        pub fn parse(semver: &str, beta: &str) -> Option<EngineVersion> {
+            let mut nums = [0u64; 3];
+            let mut parts = semver.split('.');
+            for slot in nums.iter_mut() {
+                *slot = parts.next()?.trim().parse().ok()?;
+            }
+            if parts.next().is_some() {
+                return None;
+            }
+            let beta = beta.trim();
+            let beta = if beta.is_empty() {
+                0
+            } else {
+                beta.parse().ok()?
+            };
+            Some(EngineVersion { nums, beta })
+        }
+    }
+
+    /// The version this tray ships: its own crate version (kept in
+    /// lockstep with the engine - the comment in Cargo.toml is the
+    /// contract) plus the beta serial its build embedded from the same
+    /// file the engine's build reads.
+    pub fn bundled_version() -> Option<EngineVersion> {
+        EngineVersion::parse(env!("CARGO_PKG_VERSION"), env!("NZBTRAY_BETA"))
+    }
+
+    /// The version an AUTHENTICATED `mode=version` body reports. None on
+    /// a refusal (we hold no key for that daemon - another data dir's
+    /// install, not ours to restart) or anything else unreadable.
+    pub fn body_version(body: &str) -> Option<EngineVersion> {
+        let v = serde_json::from_str::<Value>(body).ok()?;
+        EngineVersion::parse(
+            v.get("nzbfast").and_then(Value::as_str)?,
+            v.get("beta").and_then(Value::as_str).unwrap_or(""),
+        )
+    }
+
     /// The port to look for first: what the DAEMON will bind, then what we
     /// last spawned it on.
     ///
@@ -287,12 +344,59 @@ mod probe_body {
 
     #[cfg(test)]
     mod tests {
-        use super::{apikey, dash_url, is_nzbfast, keyed_url, query_value, stored_key};
+        use super::{
+            EngineVersion, apikey, body_version, bundled_version, dash_url, is_nzbfast, keyed_url,
+            query_value, stored_key,
+        };
         use std::path::PathBuf;
 
         #[test]
         fn version_body_is_ours() {
             assert!(is_nzbfast(r#"{"version":"4.5.0","nzbfast":"1.0.9"}"#));
+        }
+
+        /// The §98 ordering contract, shared with the Mac wrapper: a beta
+        /// outranks the release it grew from and loses to the next one.
+        #[test]
+        fn beta_sits_between_its_release_and_the_next() {
+            let rel = EngineVersion::parse("1.0.14", "").unwrap();
+            let beta = EngineVersion::parse("1.0.14", "5").unwrap();
+            let next = EngineVersion::parse("1.0.15", "").unwrap();
+            assert!(rel < beta);
+            assert!(beta < next);
+            assert!(EngineVersion::parse("1.0.9", "9").unwrap() < rel);
+            assert_eq!(rel, EngineVersion::parse("1.0.14", "0").unwrap());
+        }
+
+        /// Unreadable versions mean ATTACH, so parse must refuse rather
+        /// than guess - and a refusal body (no key held) has no version.
+        #[test]
+        fn unreadable_versions_refuse_to_parse() {
+            assert!(EngineVersion::parse("", "").is_none());
+            assert!(EngineVersion::parse("1.0", "").is_none());
+            assert!(EngineVersion::parse("1.0.14.2", "").is_none());
+            assert!(EngineVersion::parse("1.0.x", "").is_none());
+            assert!(EngineVersion::parse("1.0.14", "x").is_none());
+            assert!(body_version(r#"{"status":false,"error":"API Key Required"}"#).is_none());
+            assert!(body_version("not json").is_none());
+        }
+
+        /// The authenticated body carries both fields; a release build's
+        /// beta arrives as "" (build.rs maps serial 0 to the empty string).
+        #[test]
+        fn body_versions_parse_like_the_daemon_answers() {
+            let beta5 = body_version(r#"{"beta":"5","nzbfast":"1.0.14","version":"4.5.0"}"#);
+            assert_eq!(beta5, EngineVersion::parse("1.0.14", "5"));
+            let rel = body_version(r#"{"beta":"","nzbfast":"1.0.14","version":"4.5.0"}"#);
+            assert_eq!(rel, EngineVersion::parse("1.0.14", ""));
+            assert!(rel < beta5);
+        }
+
+        /// Whatever this tray was built as, its own version must parse -
+        /// a tray that cannot read itself can never upgrade anything.
+        #[test]
+        fn the_bundled_version_parses() {
+            assert!(bundled_version().is_some());
         }
 
         /// The 1.0.9 regression: a keyed daemon refuses the keyless probe.
@@ -834,6 +938,54 @@ mod app {
 
     /// Attach to a running nzbfast or spawn our own. Returns
     /// (port, spawned child). Shows an error box and exits on failure.
+    /// §98: is the nzbfast engine on `port` older than this tray - and if
+    /// so, did we manage to stop it? True means the port is FREE and the
+    /// caller should spawn the bundled engine on it. False means attach:
+    /// same or newer engine, a version we could not read, a daemon whose
+    /// key we do not hold, or an old engine that would not die (attaching
+    /// to it beats stranding the user engineless).
+    ///
+    /// Shutdown is by authenticated API on the port it serves, which
+    /// reaches the old engine wherever its binary lives. The wait is
+    /// generous on purpose: `mode=shutdown` persists the queue first, and
+    /// a busy engine has taken ~30 s to wind down (TODO §98 point 2), so
+    /// an impatient deadline would turn every slow-but-clean shutdown
+    /// into a stranded attach. Mirrors the Mac wrapper's upgradeRestart.
+    fn upgrade_restart_if_older(port: u16, data_dir: &Path) -> bool {
+        let Some(mine) = crate::probe_body::bundled_version() else {
+            return false;
+        };
+        let url = keyed_url(
+            format!("http://127.0.0.1:{port}/api?mode=version&output=json"),
+            data_dir,
+        );
+        let Some(running) = agent(3000)
+            .get(&url)
+            .call()
+            .ok()
+            .and_then(|r| r.into_string().ok())
+            .and_then(|b| crate::probe_body::body_version(&b))
+        else {
+            return false;
+        };
+        if running >= mine {
+            return false;
+        }
+        let url = keyed_url(
+            format!("http://127.0.0.1:{port}/api?mode=shutdown&output=json"),
+            data_dir,
+        );
+        let _ = agent(5000).post(&url).send_string("");
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(40) {
+            if matches!(probe(port, data_dir), Probe::Free) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        false
+    }
+
     fn ensure_daemon(exe_dir: &Path, data_dir: &Path, out_dir: &Path) -> (u16, Option<Child>) {
         // Persisted port first (the attach contract), then the scan range.
         let saved = crate::probe_body::load_port(data_dir);
@@ -843,7 +995,25 @@ mod app {
         let mut spawn_at = None;
         for p in candidates {
             match probe(p, data_dir) {
-                Probe::Nzbfast => return (p, None), // attach - not ours to manage
+                Probe::Nzbfast => {
+                    // §98: an engine that outlives the tray also outlives
+                    // an UPGRADE - a winget/Scoop/zip upgrade replaces the
+                    // exes without running the installer's --quit step, so
+                    // this arm used to attach to the old engine and the
+                    // dashboard kept serving the previous release with no
+                    // hint. Restart it only when this tray is STRICTLY
+                    // newer and both versions were readable; anything
+                    // ambiguous - no key held (another data dir's
+                    // install), unreadable versions - attaches as always,
+                    // and so does a NEWER running engine (downgrading a
+                    // daemon someone deliberately updated ahead of the
+                    // tray would be the same silent surprise in reverse).
+                    if upgrade_restart_if_older(p, data_dir) {
+                        spawn_at = Some(p);
+                        break;
+                    }
+                    return (p, None); // attach - not ours to manage
+                }
                 Probe::Free => {
                     spawn_at = Some(p);
                     break;

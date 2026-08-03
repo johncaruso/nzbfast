@@ -549,6 +549,67 @@ pub(super) fn sab_units(n: f64) -> String {
     }
 }
 
+/// What one queue row reports as `(percentage, bytes left)`.
+///
+/// Pulled out of the queue walk because it is the rule the whole bundle
+/// turns on, and because getting it wrong is invisible until two jobs
+/// are live at once. The daemon has ONE pair of network progress
+/// counters, but up to two jobs are `Downloading` at any moment - the
+/// scheduler deliberately starts the next download while the previous
+/// job's disk tail runs, and the record has no state for that tail. So
+/// this decides, per row, which of four different things "progress"
+/// means:
+///
+/// - `live` is Some only for the slot that OWNS the counters (see
+///   `Daemon::active_dl`), and only that slot may read them. Every
+///   `Downloading` slot used to, so a finishing job drew the NEW
+///   download's bar: it fell from ~98% to 0 and climbed again.
+/// - `tail` (the pipeline is verifying / repairing / unpacking) wins
+///   even over ownership: a job holds the counters for the moment
+///   between draining the line and the scheduler picking the next job,
+///   and its verify pass must not report "97%, 40 MB left" at 0 MB/s.
+/// - a `Downloading` slot that is neither has flipped state but not yet
+///   claimed the counters (the index-pause gate can hold that gap open
+///   for a while). It has fetched nothing, and that is what it says.
+/// - anything else reports from the record: for a paused or re-queued
+///   job that is what the journal is holding, and 0-with-everything-left
+///   is what has users deleting a job that would resume in seconds.
+fn slot_progress(
+    state: JobState,
+    live: Option<(u64, u64)>,
+    tail: bool,
+    total_bytes: u64,
+    downloaded_bytes: u64,
+) -> (u64, u64) {
+    // Widened, because neither operand is trustworthy: `total_bytes` is
+    // summed from an NZB attribute (the parser saturates it rather than
+    // wrapping, so a hostile file really can present u64::MAX) and
+    // `downloaded_bytes` is whatever a previous run recorded. `x * 100`
+    // in u64 overflows well before that. An empty NZB divides by zero.
+    let pct_of = |done: u64, total: u64| {
+        (u128::from(done.min(total)) * 100)
+            .checked_div(u128::from(total))
+            .unwrap_or(0)
+            .min(100) as u64
+    };
+    match live.filter(|_| !tail) {
+        Some((done, total)) => (pct_of(done, total), total.saturating_sub(done)),
+        // The bytes are all in; what is left is the local tail (verify,
+        // repair, unpack, unlock, rename, and the move to the
+        // destination). Reporting 0% with everything still to fetch made
+        // a finished download look like it had gone backwards.
+        None if tail || state == JobState::Completed => (100, 0),
+        None if state == JobState::Downloading => (0, total_bytes),
+        // Decoded bytes against an encoded total, so this reads a few
+        // percent shy of the truth (audit #15). A floor, never an
+        // overstatement.
+        None => (
+            pct_of(downloaded_bytes, total_bytes),
+            total_bytes.saturating_sub(downloaded_bytes.min(total_bytes)),
+        ),
+    }
+}
+
 pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, String>) -> Value {
     // The running job's live archive shape, straight off its extractor -
     // the badge updates the moment the first volume's headers parse, long
@@ -562,12 +623,91 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
         .unwrap()
         .as_ref()
         .and_then(|(owner, ex)| ex.archive_shape().map(|sh| (owner.clone(), sh.tag())));
+    // The live "this download wants a password" owner tag (raised by the
+    // in-stream probe when an encrypted set blocked with no working
+    // candidate). Read once, matched per slot below - same pattern as
+    // live_shape, and taken before the queue lock for the same reason.
+    let pw_wanted = d.hub.password_wanted.lock_ok().clone();
     // §77: is the health sink switched on at all? Read once for the
     // whole payload rather than per slot.
     let health_defer = d.post_health_defer.load(Ordering::Relaxed);
+    // Free space on the output disk, read once per payload: feeds the
+    // per-slot unpack-space check below. This is per-job arithmetic,
+    // deliberately separate from the min_free floor (which holds the
+    // whole queue and knows nothing about shapes).
+    let free_now = free_bytes(&d.out_dir());
+    // Why nothing is starting, if the scheduler is holding the queue -
+    // the dashboard renders this instead of an unexplained "idle".
+    let hold = d.queue_hold.lock_ok().as_ref().map(|(k, a, b)| {
+        // `a`/`b` shipped first and stay, because the dashboard reads
+        // them - but a caller holding this payload cannot tell which is
+        // which, and the pair means different things per reason. Name
+        // them, units included: both numbers are gigabytes.
+        let mut o = serde_json::Map::new();
+        o.insert("kind".into(), json!(k));
+        o.insert("reason".into(), json!(k));
+        o.insert("a".into(), json!(a));
+        o.insert("b".into(), json!(b));
+        match k.as_str() {
+            "disk" => {
+                o.insert("free_gb".into(), json!(a));
+                o.insert("min_free_gb".into(), json!(b));
+            }
+            _ => {
+                o.insert("spent_gb".into(), json!(a));
+                o.insert("cap_gb".into(), json!(b));
+            }
+        }
+        Value::Object(o)
+    });
     let q = d.queue.lock_ok();
-    let done = d.progress.load(Ordering::Relaxed);
-    let total = d.active_total.load(Ordering::Relaxed).max(1);
+    // §91: the active job's progress is read fresh at every pairing with
+    // a slot's state (see `active_left` below), never snapshotted up
+    // here. A snapshot taken before the queue walk could pair the
+    // PREVIOUS job's near-100% progress with a slot that flipped to
+    // Downloading mid-walk - a state the queue was never in.
+    // ...and only for the slot that OWNS them. Two jobs are `Downloading`
+    // whenever one is finishing (job N stays in that state through its
+    // whole disk tail while job N+1 is already on the wire), and this
+    // used to answer for both - so the finishing row, the hero card and
+    // the drawer all drew the NEW download's bar: ~98%, then 0%, then
+    // climbing again. `None` means "not yours": the caller falls through
+    // to the tail arm, which has fixed numbers and needs no counters.
+    //
+    // The owner is re-read here with the counters, under the one lock
+    // the writer sets both in, so no reader can pair a stale owner with
+    // the next job's zeroes.
+    let active_left = |nzo_id: &str| {
+        let owner = d.active_dl.lock_ok();
+        if owner.as_deref() != Some(nzo_id) {
+            return None;
+        }
+        // UX §15, preferred whenever the pipeline has published one: both
+        // halves are declared NZB bytes of this run's article set, so the
+        // fraction reaches exactly 100% at net-drain and cannot pass it,
+        // and the seed already includes everything a resume had in hand.
+        //
+        // The arithmetic below is the fallback, and it is why the plan
+        // exists: decoded payload (every slot, PAR2 included) over the
+        // NZB's encoded bytes minus recovery volumes stalls near 97% on a
+        // clean set - the "1.5 GB left" that is not really left - and
+        // tops out early on a damaged one, where the extra recovery bytes
+        // land on its numerator alone.
+        if let Some(honest) = d.hub.fetch_left() {
+            return Some(honest);
+        }
+        let done = d
+            .progress
+            .load(Ordering::Relaxed)
+            // Bytes a resume never had to fetch. Counted here rather
+            // than in the shared counter so that everything measuring
+            // the WIRE (quota, average speed, best_rate_bps, the CLI
+            // ticker, the rolling speed window) goes on seeing only what
+            // this run actually moved. See StreamHub::resume_seeded.
+            .saturating_add(d.hub.resume_seeded.load(Ordering::Relaxed));
+        let total = d.active_total.load(Ordering::Relaxed).max(1);
+        Some((done.min(total), total, total.saturating_sub(done)))
+    };
     // Live speed over a ~5 s rolling window (see current_speed_bps): a
     // whole-job average hid stalls; idle or a fresh window reports 0,
     // never `bytes / ~zero elapsed`.
@@ -579,17 +719,56 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
         .unwrap()
         .as_ref()
         .map(|s| (s.nzo_id.clone(), s.progress.load(Ordering::Relaxed)));
+    // Queue-row activity: the pipeline's own token per job, the hub
+    // owner, an open stall episode, and a per-server pool view - all
+    // read before the queue lock like live_shape above. The fetch
+    // refinement below (connecting/reconnecting/waiting) only ever
+    // applies to the job that owns the hub.
+    let activity_map = d.hub.activity.lock_ok().clone();
+    let active_id = d.active_stream.lock_ok().clone();
+    let stall = d.stall_since.lock_ok().clone();
+    let pool_view: Vec<(String, usize, u64)> = d
+        .hub
+        .pool_live
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|l| {
+            l.servers
+                .iter()
+                .map(|s| {
+                    (
+                        s.host.clone(),
+                        s.connected.load(Ordering::Relaxed),
+                        s.bytes.load(Ordering::Relaxed),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     // Whole-queue bytes still to fetch, for the top-level sizeleft /
     // timeleft SAB carries (mirrors the per-slot mbleft arithmetic).
     let remaining_bytes: u64 = q
         .iter()
         .map(|j| {
             let j = j.lock_ok();
-            match j.state {
-                JobState::Downloading => total.saturating_sub(done),
-                JobState::Completed => 0,
-                _ => j.total_bytes,
-            }
+            // The SAME rule as the per-slot walk below, deliberately:
+            // this is the queue's own sizeleft and the ETA the header
+            // builds on it, and the two disagreeing is a bug report
+            // waiting to happen. Reading the globals for EVERY
+            // Downloading slot counted the active job's remainder twice
+            // whenever a tail overlapped a fetch.
+            slot_progress(
+                j.state,
+                (j.state == JobState::Downloading)
+                    .then(|| active_left(&j.nzo_id))
+                    .flatten()
+                    .map(|(done, total, _)| (done, total)),
+                j.state == JobState::Downloading && d.tail_phase(&j.nzo_id).is_some(),
+                j.total_bytes,
+                j.downloaded_bytes,
+            )
+            .1
         })
         .sum();
     // SAB's queue call takes the same category filter as history (the
@@ -608,22 +787,31 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
         })
         .map(|(i, j)| {
             let j = j.lock_ok();
-            let (pct, mbleft) = if j.state == JobState::Downloading {
-                (
-                    (done * 100 / total).min(100),
-                    (total.saturating_sub(done)) as f64 / API_MB,
-                )
-            } else if j.state == JobState::Completed {
-                // The bytes are all in; what is left is the local tail
-                // (repair hand-off, unlock, rename, move). Reporting 0%
-                // with everything still to fetch made a finished download
-                // look like it had gone backwards.
-                (100, 0.0)
-            } else {
-                (0, j.total_bytes as f64 / API_MB)
-            };
-            let timeleft = if j.state == JobState::Downloading && speed_bps > 1.0 {
-                sab_timeleft((total.saturating_sub(done)) as f64 / speed_bps)
+            // §91: both sampled under this slot's lock, after its state
+            // was read, so (status, percentage) is one instant.
+            //
+            // The pipeline's own phase word for this job once it is past
+            // the network: the queue has no state for the tail, so this
+            // is what tells a finishing job from a downloading one. A
+            // suspended job is answering "Paused" below and its phase
+            // would only contradict that.
+            let phase = (j.state == JobState::Downloading && !j.suspended)
+                .then(|| d.tail_phase(&j.nzo_id))
+                .flatten();
+            let live = (j.state == JobState::Downloading)
+                .then(|| active_left(&j.nzo_id))
+                .flatten();
+            let (pct, left) = slot_progress(
+                j.state,
+                live.map(|(done, total, _)| (done, total)),
+                phase.is_some(),
+                j.total_bytes,
+                j.downloaded_bytes,
+            );
+            let mbleft = left as f64 / API_MB;
+            // Only a job actually on the wire has a rate to divide by.
+            let timeleft = if live.is_some() && phase.is_none() && speed_bps > 1.0 {
+                sab_timeleft(left as f64 / speed_bps)
             } else {
                 "0:00:00".to_string()
             };
@@ -635,6 +823,79 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
                 .filter(|(owner, _)| *owner == j.nzo_id)
                 .map(|(_, tag)| tag.clone())
                 .unwrap_or_else(|| j.archive_shape.clone());
+            // "What is happening right now" for this row: a token the
+            // dashboard maps to an i18n phrase, an optional server-name
+            // detail (language-neutral by construction), and for an open
+            // stall episode the seconds since bytes last moved.
+            let (activity, activity_detail, activity_secs) = match j.state {
+                // The whole post-network tail: repair hand-off, unlock,
+                // rename, the move to the destination.
+                JobState::Completed => ("finalizing", String::new(), None),
+                JobState::Downloading if !j.suspended => {
+                    let tok = activity_map.get(&j.nzo_id).copied().unwrap_or("fetching");
+                    if tok == "fetching" && active_id.as_deref() == Some(j.nzo_id.as_str()) {
+                        let connected: usize = pool_view.iter().map(|(_, c, _)| *c).sum();
+                        let bytes: u64 = pool_view.iter().map(|(_, _, b)| *b).sum();
+                        let joined = |v: &[&str]| match v.len() {
+                            0 => String::new(),
+                            1 => v[0].to_string(),
+                            n => format!("{} +{}", v[0], n - 1),
+                        };
+                        if let Some((_, since)) = stall.as_ref().filter(|(sid, _)| *sid == j.nzo_id)
+                        {
+                            ("waiting", String::new(), Some(since.elapsed().as_secs()))
+                        } else if !pool_view.is_empty() && connected == 0 {
+                            let all: Vec<&str> =
+                                pool_view.iter().map(|(h, _, _)| h.as_str()).collect();
+                            // Bytes already moved means the connections
+                            // dropped mid-run; none yet means first dial.
+                            let tok = if bytes > 0 {
+                                "reconnecting"
+                            } else {
+                                "connecting"
+                            };
+                            (tok, joined(&all), None)
+                        } else {
+                            let up: Vec<&str> = pool_view
+                                .iter()
+                                .filter(|(_, c, _)| *c > 0)
+                                .map(|(h, _, _)| h.as_str())
+                                .collect();
+                            ("fetching", joined(&up), None)
+                        }
+                    } else {
+                        (tok, String::new(), None)
+                    }
+                }
+                _ => ("", String::new(), None),
+            };
+            // Unpack-space preflight: a shape whose volumes land on disk
+            // and unpack after the download needs room for the archive
+            // parts PLUS the extracted payload - roughly twice the set -
+            // and a disk that fits only the volumes fails at the very
+            // end, after every byte was spent. Warn the moment the shape
+            // is known instead. Bytes still short, not a boolean, so the
+            // row can say how much to free. `mixed-pass` overshoots (only
+            // part of it materializes) - an amber warning that is
+            // sometimes cautious beats a failure at 96%.
+            let space_short = free_now
+                .filter(|_| shape_unpacks_on_disk(&shape) && j.state != JobState::Completed)
+                .and_then(|free| {
+                    // Volumes already fetched sit on the disk and are
+                    // subtracted from `free` by their existence, so what
+                    // is still owed is the unfetched remainder plus the
+                    // whole extracted payload (approximated by the set
+                    // size - archives on Usenet are near-incompressible
+                    // media).
+                    // The same remainder the row reports - a job whose
+                    // volumes are already down and unpacking still needs
+                    // room for the payload, but not for bytes it has.
+                    // An encrypted set is counted a copy higher still:
+                    // see `unpack_space_needed`.
+                    let needed = unpack_space_needed(left, j.total_bytes, &shape);
+                    needed.checked_sub(free).filter(|s| *s > 0)
+                })
+                .unwrap_or(0);
             json!({
                 "nzo_id": j.nzo_id,
                 "filename": j.name,
@@ -649,6 +910,17 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
                     // user hits pause - not Downloading until the
                     // pipeline finishes unwinding and parks it.
                     JobState::Downloading if j.suspended => "Paused",
+                    // The post-network tail, by the phase the pipeline
+                    // says it is in. Same reasoning as `Moving` below:
+                    // the record has no state for any of this (it says
+                    // Downloading from the first article to the last
+                    // extracted byte), and calling a verify pass a
+                    // download meant a row that sat at "100%, 0 MB/s"
+                    // for minutes with nothing to distinguish it from a
+                    // pool that had died. These are SABnzbd's own state
+                    // words, so the *arrs already read them as "busy,
+                    // keep waiting".
+                    JobState::Downloading if phase.is_some() => phase.unwrap_or("Downloading"),
                     JobState::Downloading => "Downloading",
                     _ if j.paused => "Paused",
                     // `Completed` is set when the NETWORK leg ends, well
@@ -667,8 +939,38 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
                 "mb": format!("{:.2}", j.total_bytes as f64 / API_MB),
                 "mbleft": format!("{mbleft:.2}"),
                 "timeleft": timeleft,
+                // Ours, not SAB's, like `origin`: the active row's
+                // "what is happening right now" sub-line. Empty when
+                // there is nothing to say (queued, paused).
+                "activity": activity,
+                "activity_detail": activity_detail,
+                "activity_secs": activity_secs,
                 "priority": priority_name(j.priority),
+                // Truth-audit I: the canonical name an oracle gave this
+                // release, on the QUEUE row and not just in history. A
+                // retried obfuscated job already knew its own name - it
+                // survives the retry on the record - and still went back
+                // to showing a hash for the whole of its second
+                // download. Additive keys the *arrs ignore; the
+                // dashboard runs them through the same identName() the
+                // history row uses.
+                "identity_name": j.identity_name,
+                "identity_src": j.identity_src,
+                // ...and which Smart Folder rule chose this job's
+                // category, so a download that landed somewhere
+                // unexpected can say who sent it there. Empty when no
+                // rule matched.
+                "smart_rule": j.smart_rule,
                 "duplicate_key": j.dupe_key.as_deref().unwrap_or(""),
+                // M24, ours like `origin`: the queue drawer's password
+                // control shows whether one is already attached. The
+                // value itself never leaves the daemon - history's
+                // has_password contract.
+                "has_password": j.password.is_some(),
+                // ...and whether the RUNNING download is blocked on one
+                // right now (the "ask at once" prompt trigger, and a 🔑
+                // badge in every mode).
+                "password_needed": pw_wanted.as_deref() == Some(j.nzo_id.as_str()),
                 "deferred": j.deferred,
                 "defer_reason": j.defer_reason,
                 // TODO §77 pre-flight verdict, ours like `origin` and
@@ -696,6 +998,11 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
                 }),
                 "zip_packed": j.zip_packed,
                 "archive_shape": shape,
+                // Ours, like the keys around it: bytes the output disk
+                // is short of what this set's download + unpack will
+                // take. 0 = fine (or the shape one-passes and needs no
+                // headroom). Advisory - nothing is held back by it.
+                "space_short": space_short,
                 // §76. Ours, not SAB's, like the keys above it: what the
                 // main video's own header says it is, and anything the
                 // name claims that those bytes deny. Null until the
@@ -722,6 +1029,46 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
                 .div_ceil(60)
         })
         .unwrap_or(0);
+    // Who paused, and when the queue comes back.
+    //
+    // The offline mechanism's own pause is named here rather than
+    // stored: `paused_by_offline` is already the state that decides
+    // whether coming back online may resume, and a second copy of it
+    // could only ever disagree with it.
+    let paused_now = d.paused.load(Ordering::Relaxed);
+    let pause_source = if d.paused_by_offline.load(Ordering::Relaxed) {
+        "offline"
+    } else {
+        *d.pause_source.lock_ok()
+    };
+    // Unix seconds when downloading is expected to resume by itself.
+    // Null unless something has actually promised a time: a timed pause
+    // (its own deadline, to the second - `pause_int` rounds up to whole
+    // minutes and would say "1m left" for four seconds) or a schedule
+    // with a Resume entry ahead of it.
+    let resume_at = if !paused_now {
+        None
+    } else if let Some(left) = d
+        .pause_until
+        .lock_ok()
+        .map(|t| t.saturating_duration_since(Instant::now()).as_secs().max(1))
+    {
+        Some(job::unix_now() + left as i64)
+    } else if pause_source == "schedule" {
+        let entries = d.schedule.lock_ok().clone();
+        next_resume_in(&entries, local_minute_of_week())
+            .map(|mins| job::unix_now() + i64::from(mins) * 60)
+    } else {
+        None
+    };
+    // Who chose the speed cap now in force. The auto governor moves the
+    // number every second, so it names itself here rather than writing
+    // "auto" over the operator's stored source on every step.
+    let limit_source = if d.auto_speed.load(Ordering::Relaxed) {
+        "auto"
+    } else {
+        *d.limit_source.lock_ok()
+    };
     // Watch-folder rejects: shown in the Queue card with a Delete button
     // (mode=watch_failed_delete). Sorted for a stable render. Built
     // outside json! - the macro can't parse a typed let binding.
@@ -729,21 +1076,94 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
         let wf = d.watch_failed.lock_ok();
         let mut v: Vec<_> = wf
             .iter()
-            .map(|(p, (_, _, err))| {
+            .map(|(p, (_, _, err, id))| {
                 (
                     p.file_name()
                         .unwrap_or_default()
                         .to_string_lossy()
                         .to_string(),
                     err.clone(),
+                    id.clone(),
+                    // What Delete addresses. Two watch folders can hold
+                    // rejected files of the same NAME, and the basename
+                    // then names neither of them (Codex sweep 2,
+                    // 3 Aug L1).
+                    crate::serve::tasks::watch_fail_id(p),
                 )
             })
             .collect();
         v.sort();
         v.into_iter()
-            .map(|(name, error)| json!({"name": name, "error": error}))
+            .map(|(name, error, nzo_id, wf_id)| {
+                // The strip used to render one sentence for all six of
+                // these, four of which are successes with an unfinished
+                // file beside them. `kind` is the token it switches on
+                // and `ingested` is the half that decides whether Delete
+                // is safe here - both derived by the classifier that
+                // lives beside the strings that produced them.
+                let kind = crate::serve::tasks::watch_fail_kind(&error);
+                json!({"name": name, "error": error, "kind": kind,
+                       "ingested": crate::serve::tasks::watch_fail_ingested(kind),
+                       // The queue or history record that made this file
+                       // redundant, for the states that have one.
+                       "nzo_id": nzo_id,
+                       // The handle Delete sends back.
+                       "id": wf_id})
+            })
             .collect()
     };
+    // Recent watch-folder pickups, newest last. The dashboard toasts the
+    // ones stamped after its own first poll, so a page opened later never
+    // replays old events. Like watch_failed, built outside json!.
+    let watch_picked: Vec<Value> = d
+        .watch_picked
+        .lock_ok()
+        .iter()
+        .map(|(name, folder, at)| json!({"name": name, "folder": folder, "at": at}))
+        .collect();
+    // M32: automatic retries that have just re-queued. Same ring shape,
+    // same one-toast-each contract - see `Daemon::auto_retried`.
+    let auto_retried: Vec<Value> = d
+        .auto_retried
+        .lock_ok()
+        .iter()
+        .map(|(id, name, at)| json!({"nzo_id": id, "name": name, "at": at}))
+        .collect();
+    // §96.3: targets the give-up breaker has just stopped chasing,
+    // toasted the same way and for the same reason - the show stops
+    // arriving, and until now only a log line said so.
+    let giveup_tripped: Vec<Value> = d
+        .giveup_tripped
+        .lock_ok()
+        .iter()
+        .map(|(name, count, at)| json!({"name": name, "count": count, "at": at}))
+        .collect();
+    // Watchlist delete_old upgrades that removed the superseded copy,
+    // newest last - toasted the same way pickups are, because a whole
+    // completed download (and its history row) disappearing deserves at
+    // least one sentence in front of the user. `fate` picks between
+    // "went to the Trash", "was deleted" and "is still on disk" - the
+    // page must not promise a Trash the delete did not use, nor a delete
+    // the Trash refused to make.
+    let watch_upgraded: Vec<Value> = d
+        .watch_upgraded
+        .lock_ok()
+        .iter()
+        .map(|(name, old, oldq, fate, at)| {
+            json!({"name": name, "old": old, "oldq": oldq, "fate": fate, "at": at})
+        })
+        .collect();
+    // Deletes that removed the record but not the files. NOT a
+    // toast-once ring like the four above: those narrate a moment that
+    // is over, this one describes a folder that is still there, so the
+    // page keeps it until the user dismisses it
+    // (mode=delete_kept_dismiss).
+    let delete_kept: Vec<Value> = d
+        .delete_kept
+        .lock_ok()
+        .iter()
+        .map(|(name, path, why, at)| json!({"name": name, "path": path, "why": why, "at": at}))
+        .collect();
     json!({"queue": {
         "paused": d.paused.load(Ordering::Relaxed),
         // Deliberately NOT folded into "paused": the dashboard polls this
@@ -754,6 +1174,13 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
         // tell why nothing is downloading.
         "offline": d.offline.load(Ordering::Relaxed),
         "pause_int": format!("{pause_int}"),
+        // Ours: who paused ("user"|"schedule"|"offline"), when it comes
+        // back on its own (unix seconds, null when nothing promised a
+        // time), and who set the speed cap ("user"|"schedule"|"api"|
+        // "auto"). All three are presentation - the *arrs ignore them.
+        "pause_source": if paused_now { json!(pause_source) } else { Value::Null },
+        "resume_at": resume_at,
+        "limit_source": limit_source,
         // Update banner state: the dashboard already polls the queue
         // every second, so the chip appears without a dedicated poll.
         "update_version": d
@@ -782,12 +1209,37 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
         // set NZBFAST_OPEN=1 chose this, usually behind another auth
         // layer, and nagging them forever would teach everyone to ignore
         // the notice - including the people who did not choose it.
+        // What the dashboard should do when an archive wants a password
+        // (now|done|never). Rides the queue payload the page already
+        // polls every second - the prompt decision is made there, and
+        // get_config is only fetched when the settings view opens.
+        "password_prompt": d.password_prompt.lock_ok().clone(),
+        // TODO 101, and here for the same reason: the disk-full drawer
+        // has to decide whether to offer "extract in place", and it is
+        // drawn off the queue poll rather than off get_config (which is
+        // only fetched when the settings view opens).
+        "unpack_eat_volumes": d.unpack_eat_volumes.lock_ok().clone(),
         "open_api": d.apikey.lock_ok().is_none(),
         "open_optin": std::env::var("NZBFAST_OPEN").is_ok_and(|v| v == "1"),
         "diskspace1": format!("{:.2}", free_bytes(&d.out_dir()).unwrap_or(0) as f64 / 1e9),
+        // Ours: {kind:"disk"|"quota", a, b} while the scheduler holds
+        // the queue (a/b are free/floor or spent/cap, in GB). Null when
+        // downloads can start. The *arrs ignore unknown keys.
+        "hold": hold,
         "speedlimit_abs": d.hub.rate.get(),
+        // The configured line speed, bytes/sec, 0 when unset. Ours: the
+        // header's limit menu offers percentage presets only once this
+        // is known, because `apply_setting("speedlimit")` REFUSES a bare
+        // percentage without it - a menu entry that can only error is
+        // worse than no menu entry.
+        "line_speed": d.line_speed.load(Ordering::Relaxed),
         "auto_speed": d.auto_speed.load(Ordering::Relaxed),
         "watch_failed": watch_failed,
+        "watch_picked": watch_picked,
+        "auto_retried": auto_retried,
+        "giveup_tripped": giveup_tripped,
+        "watch_upgraded": watch_upgraded,
+        "delete_kept": delete_kept,
         // Direct id selection bypasses the start/limit window (SAB
         // semantics; see nzo_ids_param).
         "slots": if ids.is_some() { slots } else { paginate(slots, params) },
@@ -904,7 +1356,10 @@ pub(super) fn handle_jsonrpc(
     // the same restricted surface as the /api add-only tier - otherwise
     // /jsonrpc is a side door around it, escalating an add-only key to
     // editqueue/pause/rate/config (GroupFinalDelete wipes the queue).
-    let mut full_auth = keys.is_empty();
+    // The tier itself is decided ONLY by the post-body snapshot below;
+    // this pre-body pass exists to reject an unauthenticated caller
+    // before we read a 256 MiB body for them.
+    let full_auth;
     if !keys.is_empty() {
         let cred_pw = req
             .headers()
@@ -940,15 +1395,12 @@ pub(super) fn handle_jsonrpc(
             );
             return;
         }
-        // FULL only when the presented password IS the primary apikey.
-        // apikey unset + nzbkey matched => add-only tier (not full).
-        // Also ct_eq: this decides the TIER (full admin vs add-only), so a
-        // timing difference here leaks which of the two keys was presented.
-        full_auth = apikey.is_some_and(|ak| cred_pw.as_deref().is_some_and(|p| ct_eq(p, ak)));
     }
     // NZBGet's append carries the whole NZB base64-encoded in the params,
     // so this one needs a big-file cap, not a JSON-sized one.
-    let raw = read_body_capped(req.as_reader(), 256 << 20);
+    // The hold keeps the budget reservation alive through the parse and
+    // dispatch below, not just the read - see [`BodyHold`].
+    let (raw, _body_hold) = read_body_capped_hold(req.as_reader(), 256 << 20);
     // Re-decide against the key as of NOW, not as of the request line.
     // That body is client-paced: a caller authenticated with key A can
     // stream whitespace, wait out a rotation to key B, and only then
@@ -957,7 +1409,14 @@ pub(super) fn handle_jsonrpc(
     // exactly this reason, and the manual promises rotation takes
     // effect immediately. The tier is re-derived too, so a key demoted
     // from full to add-only mid-body cannot keep its old reach.
-    if !keys.is_empty() {
+    //
+    // UNCONDITIONAL, including the empty-to-non-empty transition (Codex
+    // sweep 3 Aug H4): this used to run only when the request-START key
+    // list was non-empty, so an install that was open when the request
+    // line arrived kept full_auth=true even if the owner set the very
+    // first key while the body was stalled - the anonymous request then
+    // completed as full admin against a now-keyed daemon.
+    {
         let now_apikey = d.apikey.lock_ok().clone();
         let now_nzbkey = d.nzbkey.lock_ok().clone();
         let now_keys: Vec<&str> = [now_apikey.as_deref(), now_nzbkey.as_deref()]
@@ -972,27 +1431,32 @@ pub(super) fn handle_jsonrpc(
             .and_then(|b| b64_decode(&b))
             .and_then(|raw| String::from_utf8(raw).ok())
             .and_then(|cred| cred.split_once(':').map(|(_, p)| p.to_string()));
-        let still_ok = !now_keys.is_empty()
-            && cred_pw
+        // Still open right now: no key exists, so the surface stays
+        // open exactly as it was at the request line.
+        if now_keys.is_empty() {
+            full_auth = true;
+        } else {
+            let still_ok = cred_pw
                 .as_deref()
                 .is_some_and(|p| now_keys.iter().any(|k| ct_eq(p, k)));
-        if !still_ok {
-            let _ = req.respond(
-                tiny_http::Response::from_string("Unauthorized")
-                    .with_status_code(401)
-                    .with_header(
-                        tiny_http::Header::from_bytes(
-                            &b"WWW-Authenticate"[..],
-                            &b"Basic realm=\"nzbfast\""[..],
-                        )
-                        .unwrap(),
-                    ),
-            );
-            return;
+            if !still_ok {
+                let _ = req.respond(
+                    tiny_http::Response::from_string("Unauthorized")
+                        .with_status_code(401)
+                        .with_header(
+                            tiny_http::Header::from_bytes(
+                                &b"WWW-Authenticate"[..],
+                                &b"Basic realm=\"nzbfast\""[..],
+                            )
+                            .unwrap(),
+                        ),
+                );
+                return;
+            }
+            full_auth = now_apikey
+                .as_deref()
+                .is_some_and(|ak| cred_pw.as_deref().is_some_and(|p| ct_eq(p, ak)));
         }
-        full_auth = now_apikey
-            .as_deref()
-            .is_some_and(|ak| cred_pw.as_deref().is_some_and(|p| ct_eq(p, ak)));
     }
     let body: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
     // Method from the body, or from a GET /jsonrpc/<method> path.
@@ -1042,9 +1506,13 @@ pub(super) fn handle_jsonrpc(
     let result: Value = match method.as_str() {
         "version" => json!("21.0"),
         "status" => {
-            let done = d.progress.load(Ordering::Relaxed);
-            let total = d.active_total.load(Ordering::Relaxed);
-            let remaining_active = total.saturating_sub(done);
+            let rate = d.current_speed_bps() as u64;
+            let (disk_free, _) = disk_stat_walk(&d.out_dir()).unwrap_or((0, 0));
+            let paused = d.paused.load(Ordering::Relaxed);
+            // §91: progress is sampled AFTER the disk walk above (which
+            // can take milliseconds) and right beside the queue scan, so
+            // "Downloaded"/"Remaining" describe the same instant as the
+            // rest of the answer - not a snapshot from before the walk.
             let queued_remaining: u64 = d
                 .queue
                 .lock()
@@ -1053,10 +1521,21 @@ pub(super) fn handle_jsonrpc(
                 .filter(|j| j.lock_ok().state == JobState::Queued)
                 .map(|j| j.lock_ok().total_bytes)
                 .sum();
-            let remaining = remaining_active + queued_remaining;
-            let rate = d.current_speed_bps() as u64;
-            let (disk_free, _) = disk_stat_walk(&d.out_dir()).unwrap_or((0, 0));
-            let paused = d.paused.load(Ordering::Relaxed);
+            let done = d.progress.load(Ordering::Relaxed);
+            // UX §15: what is left of the ACTIVE job comes from the fetch
+            // plan when one is published - declared bytes against declared
+            // bytes. `Downloaded` stays the decoded volume this session
+            // moved, which is what it has always meant; the two were never
+            // required to sum. Fallback keeps the old subtraction.
+            let active_remaining =
+                d.hub
+                    .fetch_left()
+                    .map(|(_, _, left)| left)
+                    .unwrap_or_else(|| {
+                        let total = d.active_total.load(Ordering::Relaxed);
+                        total.saturating_sub(done)
+                    });
+            let remaining = active_remaining + queued_remaining;
             let mut o = serde_json::Map::new();
             for (k, v) in size_fields("Remaining", remaining) {
                 o.insert(k, v);
@@ -1098,8 +1577,6 @@ pub(super) fn handle_jsonrpc(
             Value::Object(o)
         }
         "listgroups" => {
-            let done = d.progress.load(Ordering::Relaxed);
-            let total = d.active_total.load(Ordering::Relaxed).max(1);
             let groups: Vec<Value> = d
                 .queue
                 .lock()
@@ -1107,12 +1584,51 @@ pub(super) fn handle_jsonrpc(
                 .iter()
                 .map(|j| {
                     let g = j.lock_ok();
-                    let downloading = g.state == JobState::Downloading;
-                    let (dl, rem) = if downloading {
-                        (done, total.saturating_sub(done))
-                    } else {
-                        (0, g.total_bytes)
-                    };
+                    // The same pairing the SAB queue does, and for the
+                    // same reasons - this facade had the identical
+                    // defect. Every `Downloading` group read the shared
+                    // counters, so while job N finished its disk tail
+                    // (still Downloading, by state) an NZBGet client saw
+                    // N's group reporting job N+1's bytes.
+                    //
+                    // §91: sampled under this group's lock, after its
+                    // state was read, so (Status, Downloaded) is one
+                    // instant - a snapshot from before the queue walk
+                    // could pair the previous job's progress with a
+                    // group that started downloading mid-walk.
+                    let phase = (g.state == JobState::Downloading && !g.suspended)
+                        .then(|| d.tail_phase(&g.nzo_id))
+                        .flatten();
+                    let tail = phase.is_some();
+                    let live = (g.state == JobState::Downloading)
+                        .then(|| {
+                            let owner = d.active_dl.lock_ok();
+                            (owner.as_deref() == Some(g.nzo_id.as_str())).then(|| {
+                                // UX §15 pair first, exactly as the SAB
+                                // queue's active_left takes it - the two
+                                // compat surfaces must not disagree about
+                                // the same job's percentage.
+                                d.hub
+                                    .fetch_left()
+                                    .map(|(done, plan, _)| (done, plan))
+                                    .unwrap_or((
+                                        d.progress.load(Ordering::Relaxed).saturating_add(
+                                            d.hub.resume_seeded.load(Ordering::Relaxed),
+                                        ),
+                                        d.active_total.load(Ordering::Relaxed).max(1),
+                                    ))
+                            })
+                        })
+                        .flatten();
+                    // On the wire right now, as opposed to merely still
+                    // holding a queue slot: NZBGet has no state for the
+                    // tail either, and `ActiveDownloads` below claiming
+                    // this job's connections while another download
+                    // actually holds them is the same untruth.
+                    let downloading = live.is_some() && !tail;
+                    let (_, rem) =
+                        slot_progress(g.state, live, tail, g.total_bytes, g.downloaded_bytes);
+                    let dl = g.total_bytes.saturating_sub(rem);
                     let mut o = serde_json::Map::new();
                     for (k, v) in size_fields("File", g.total_bytes) {
                         o.insert(k, v);
@@ -1133,12 +1649,23 @@ pub(super) fn handle_jsonrpc(
                         ("Kind".to_string(), json!("NZB")),
                         (
                             "Status".to_string(),
-                            json!(if downloading {
-                                "DOWNLOADING"
-                            } else if g.paused {
-                                "PAUSED"
-                            } else {
-                                "QUEUED"
+                            // NZBGet's own post-processing states for the
+                            // tail, the counterpart of the SAB queue's
+                            // Verifying/Repairing/Extracting - a client
+                            // that knows this protocol knows to keep
+                            // waiting through them. Without them a
+                            // finishing job fell back to QUEUED, which
+                            // reads as "not started" for work that is
+                            // nearly done.
+                            json!(match phase {
+                                Some("Verifying") => "VERIFYING_SOURCES",
+                                Some("Repairing") => "REPAIRING",
+                                Some("Extracting") => "UNPACKING",
+                                Some(_) => "MOVING",
+                                None if downloading => "DOWNLOADING",
+                                None if g.state == JobState::Completed => "MOVING",
+                                None if g.paused => "PAUSED",
+                                None => "QUEUED",
                             }),
                         ),
                         ("Category".to_string(), json!(g.category)),
@@ -1252,7 +1779,7 @@ pub(super) fn handle_jsonrpc(
         "rate" => {
             // NZBGet rate is KB/s; 0 = unlimited.
             let kb = params.first().and_then(Value::as_u64).unwrap_or(0);
-            d.set_speed_ceiling(kb * 1024);
+            d.set_speed_ceiling_from(kb * 1024, "api");
             json!(true)
         }
         "append" => {
@@ -1403,10 +1930,20 @@ pub(super) fn handle_jsonrpc(
                         // of a "paused" job that would keep downloading.
                         d.poke_sidecar(hit_id);
                     }
+                    // Through the shared transition, not a bare flag
+                    // write (Codex sweep 2, 3 Aug M4). Setting `paused`
+                    // on a job in its verify/repair/unpack tail changes
+                    // nothing about the tail - it runs to completion -
+                    // but the flag STAYS, and an auto-retry then
+                    // requeued the job with `paused` still true, where
+                    // `pick_job` skips it forever. The /api arm has
+                    // refused that since the tail guard landed; this
+                    // one had its own copy and never got it.
                     for j in d.queue.lock_ok().iter() {
                         let mut g = j.lock_ok();
-                        if ids.contains(&nzo_int(&g.nzo_id)) {
-                            g.paused = cmd == "GroupPause";
+                        if ids.contains(&nzo_int(&g.nzo_id))
+                            && super::api::queue::apply_pause(d, &mut g, cmd == "GroupPause")
+                        {
                             ok = true;
                         }
                     }
@@ -1485,20 +2022,33 @@ pub(super) fn handle_jsonrpc(
                     } else {
                         nzbkit::disk::sanitize_filename(param_str.trim())
                     };
-                    for j in d.queue.lock_ok().iter() {
-                        let mut g = j.lock_ok();
-                        if ids.contains(&nzo_int(&g.nzo_id)) {
-                            g.category = cat.clone();
-                            ok = true;
+                    // Through the same queued-recategorize transaction as
+                    // the SAB change_cat arm (Codex sweep 3 Aug M9):
+                    // category controls filesystem routing, so writing the
+                    // label without re-deriving out_dir under add_lock left
+                    // the record saying movies while the job downloaded
+                    // into the old tv directory - and relabelled active
+                    // jobs the SAB side refuses.
+                    let targets: Vec<(Arc<Mutex<Job>>, String, String)> = d
+                        .queue
+                        .lock_ok()
+                        .iter()
+                        .filter_map(|j| {
+                            let g = j.lock_ok();
+                            (ids.contains(&nzo_int(&g.nzo_id)) && g.state == JobState::Queued)
+                                .then(|| (j.clone(), g.name.clone(), g.category.clone()))
+                        })
+                        .collect();
+                    for (job, name, current) in targets {
+                        if current == cat {
+                            ok = true; // already there: don't re-derive
+                            continue;
                         }
-                    }
-                    // Only when it actually landed on a job, matching the SAB
-                    // change_cat precedent. Unconditional, a loop of
-                    // editqueue calls naming ids that do not exist grows the
-                    // persisted category list without bound and pollutes the
-                    // list the *arrs validate against.
-                    if ok {
-                        d.register_cat(&cat);
+                        // register_cat happens inside, and only for a cat
+                        // that actually landed - matching the SAB
+                        // precedent (unregistered ids must not grow the
+                        // persisted category list).
+                        ok |= super::api::queue::requeue_category(d, &job, &name, &cat).is_ok();
                     }
                 }
                 "GroupSetPriority" => {
@@ -1508,30 +2058,60 @@ pub(super) fn handle_jsonrpc(
                     // all - and an unknown command answered `false`, which
                     // is also what "no such job" answers.
                     let prio = nzbget_priority(param_str.trim().parse::<i64>().unwrap_or(0));
+                    // Through the shared transition, not a bare write
+                    // (Codex sweep 2, 3 Aug M4). This copy cleared the
+                    // watchdog deferral but not the duplicate hold, so
+                    // raising a held duplicate to Normal or Force
+                    // answered success while `pick_job` - which skips a
+                    // paused job whatever its priority - went on
+                    // skipping it forever. That hold is precisely what
+                    // the UI tells the user to raise the priority to
+                    // release.
                     for j in d.queue.lock_ok().iter() {
                         let mut g = j.lock_ok();
-                        if ids.contains(&nzo_int(&g.nzo_id)) {
-                            g.priority = prio;
-                            // Explicit priority overrides a watchdog
-                            // deferral, exactly as on the SAB side.
-                            g.deferred = false;
+                        if ids.contains(&nzo_int(&g.nzo_id))
+                            && super::api::queue::apply_priority(d, &mut g, prio)
+                        {
                             ok = true;
                         }
                     }
                 }
                 "HistoryDelete" | "HistoryFinalDelete" => {
                     let mut h = d.history.lock_ok();
-                    let before = h.len();
-                    h.retain(|j| {
-                        let g = j.lock_ok();
-                        let hit = ids.contains(&nzo_int(&g.nzo_id));
-                        if hit {
-                            // Record deleted for good - drop its spooled .nzb.
-                            let _ = std::fs::remove_file(&g.nzb_path);
-                        }
-                        !hit
-                    });
-                    ok = h.len() < before;
+                    // Parity with the SAB/API delete (Codex sweep 3 Aug
+                    // M10): a record whose files are mid-move
+                    // (recategorize) or mid-unlock (password finalizing)
+                    // is being worked on disk right now, and removing it
+                    // leaves the payload at a destination no surviving
+                    // record names. Refuse the whole request, checked
+                    // under the history lock like the SAB side.
+                    let busy = {
+                        let m = d.moving.lock_ok();
+                        h.iter().any(|j| {
+                            let g = j.lock_ok();
+                            ids.contains(&nzo_int(&g.nzo_id))
+                                && (m.contains(&g.nzo_id) || g.finalizing)
+                        })
+                    };
+                    if busy {
+                        rpc_error = Some(
+                            "files are being moved or unlocked right now - \
+                             try again when it settles"
+                                .into(),
+                        );
+                    } else {
+                        let before = h.len();
+                        h.retain(|j| {
+                            let g = j.lock_ok();
+                            let hit = ids.contains(&nzo_int(&g.nzo_id));
+                            if hit {
+                                // Record deleted for good - drop its spooled .nzb.
+                                let _ = std::fs::remove_file(&g.nzb_path);
+                            }
+                            !hit
+                        });
+                        ok = h.len() < before;
+                    }
                 }
                 "HistoryRedownload" | "HistoryReturn" | "HistoryRetry" => {
                     let jobs: Vec<String> = d
@@ -1635,4 +2215,132 @@ pub(super) fn handle_jsonrpc(
         None => json!({"version": "1.1", "result": result, "error": Value::Null, "id": id}),
     };
     let _ = req.respond(json_resp(resp));
+}
+
+#[cfg(test)]
+mod tail_truth_tests {
+    use super::{JobState, slot_progress};
+
+    const GB: u64 = 1_000_000_000;
+
+    /// Two jobs are `Downloading` whenever one is finishing, and only one
+    /// of them owns the daemon's progress counters. The finishing one
+    /// reading them anyway is the wrong-bar bleed: job A sat at ~98%,
+    /// job B started and zeroed the counters, and A's row, the hero card
+    /// and the drawer all redrew A's bar as B's - 98%, then 0%, then
+    /// climbing through a download that was not A's.
+    #[test]
+    fn a_finishing_job_never_reads_the_next_download_s_counters() {
+        // B owns the counters and has fetched 2 of its 40 GB.
+        let b = slot_progress(
+            JobState::Downloading,
+            Some((2 * GB, 40 * GB)),
+            false,
+            40 * GB,
+            0,
+        );
+        assert_eq!(b, (5, 38 * GB), "the owner reports the live counters");
+
+        // A is in its tail: same state, no ownership, a phase word.
+        let a = slot_progress(JobState::Downloading, None, true, 50 * GB, 0);
+        assert_eq!(
+            a,
+            (100, 0),
+            "a finishing job reports its own bytes as all in - never the \
+             other job's fraction"
+        );
+    }
+
+    /// The single-job case, which ownership alone does not cover: nothing
+    /// starts behind the last job of a queue, so it still holds the
+    /// counters through its whole tail. Reported off them it read
+    /// "Downloading, 100%, 0 MB/s" for however long the repair and unpack
+    /// took - indistinguishable from a pool that had died.
+    #[test]
+    fn the_tail_phase_outranks_ownership() {
+        let done = (10 * GB, 10 * GB);
+        assert_eq!(
+            slot_progress(JobState::Downloading, Some(done), true, 10 * GB, 0),
+            (100, 0),
+            "still the owner, but verifying: the phase wins"
+        );
+        assert_eq!(
+            slot_progress(JobState::Downloading, Some(done), false, 10 * GB, 0),
+            (100, 0),
+            "and the numbers agree when it is still downloading"
+        );
+    }
+
+    /// A job that has flipped to Downloading but has not yet claimed the
+    /// counters (the index-pause gate can hold that gap open). It has
+    /// fetched nothing; reading the previous job's counters to claim
+    /// otherwise is the same bug from the other side.
+    #[test]
+    fn a_job_that_has_not_claimed_the_counters_reports_nothing_fetched() {
+        assert_eq!(
+            slot_progress(JobState::Downloading, None, false, 8 * GB, 0),
+            (0, 8 * GB)
+        );
+    }
+
+    /// A paused or re-queued job reports what its journal is holding.
+    /// Reporting 0% with the full size still to fetch is what has users
+    /// deleting a job that would resume in seconds - and it contradicts
+    /// the "nothing is re-downloaded" promise three copy sites make.
+    #[test]
+    fn a_paused_job_reports_what_is_already_on_disk() {
+        assert_eq!(
+            slot_progress(JobState::Queued, None, false, 40 * GB, 25 * GB),
+            (62, 15 * GB)
+        );
+        // Never run: no record, no claim.
+        assert_eq!(
+            slot_progress(JobState::Queued, None, false, 40 * GB, 0),
+            (0, 40 * GB)
+        );
+    }
+
+    /// The move to the destination, unchanged from before this bundle.
+    #[test]
+    fn a_completed_job_is_all_in() {
+        assert_eq!(
+            slot_progress(JobState::Completed, None, false, 40 * GB, 40 * GB),
+            (100, 0)
+        );
+    }
+
+    /// Untrusted arithmetic: `total_bytes` comes from an NZB attribute
+    /// and `downloaded_bytes` from a previous run, so neither bounds the
+    /// other. A row must not divide by zero, and a bar must not overshoot
+    /// its own end.
+    #[test]
+    fn the_percentage_cannot_divide_by_zero_or_pass_100() {
+        assert_eq!(slot_progress(JobState::Queued, None, false, 0, 0), (0, 0));
+        assert_eq!(
+            slot_progress(JobState::Queued, None, false, 10, 999),
+            (100, 0),
+            "more on disk than the NZB claims: clamped, not 9990%"
+        );
+        assert_eq!(
+            slot_progress(JobState::Downloading, Some((0, 0)), false, 0, 0),
+            (0, 0)
+        );
+        // A hostile NZB can present a saturated total (nzb.rs sums the
+        // segment attribute with saturating_add rather than wrapping),
+        // and `done * 100` in u64 overflows long before it.
+        assert_eq!(
+            slot_progress(JobState::Queued, None, false, u64::MAX, u64::MAX),
+            (100, 0)
+        );
+        assert_eq!(
+            slot_progress(
+                JobState::Downloading,
+                Some((u64::MAX / 2, u64::MAX)),
+                false,
+                0,
+                0
+            ),
+            (49, u64::MAX - u64::MAX / 2)
+        );
+    }
 }

@@ -36,6 +36,12 @@ pub struct NzbFile {
     pub date: i64,
     pub groups: Vec<String>,
     pub segments: Vec<Segment>,
+    /// Declared segments the parser refused (empty or wire-unsafe
+    /// message-id). The file's byte range still includes them, so a
+    /// downloader must treat each as a segment it can never fetch -
+    /// silently shrinking the manifest turns a hostile NZB into a
+    /// zero-filled file that finishes green.
+    pub dropped_segments: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,11 +232,12 @@ impl Nzb {
                         }
                     }
                     b"segment" => {
-                        if let (Some(f), Some(seg)) = (cur_file.as_mut(), cur_segment.take())
-                            && !seg.message_id.is_empty()
-                            && is_wire_safe(&seg.message_id)
-                        {
-                            f.segments.push(seg);
+                        if let (Some(f), Some(seg)) = (cur_file.as_mut(), cur_segment.take()) {
+                            if !seg.message_id.is_empty() && is_wire_safe(&seg.message_id) {
+                                f.segments.push(seg);
+                            } else {
+                                f.dropped_segments += 1;
+                            }
                         }
                     }
                     _ => {}
@@ -266,6 +273,26 @@ impl Nzb {
             .iter()
             .map(NzbFile::bytes)
             .fold(0u64, u64::saturating_add)
+    }
+
+    /// A preallocation ceiling justified by the post's GEOMETRY rather
+    /// than its byte claims: declared articles times a generous
+    /// per-article maximum. Both the NZB's `bytes=` attributes and the
+    /// yEnc `size=` header are poster-controlled, so `min(size, posted
+    /// bytes)` is an attacker choosing both sides - one tiny article
+    /// carrying two 100 GB claims turned into a real Linux `fallocate`
+    /// of the victim's free space. Articles are different: reserving
+    /// more space means DECLARING more articles, every one of which the
+    /// downloader fetches and holds the job accountable for. No real
+    /// article approaches 16 MB (providers cap them far lower), so this
+    /// never binds on a legitimate post.
+    pub fn geometry_bytes(&self) -> u64 {
+        const MAX_ARTICLE_BYTES: u64 = 16 << 20;
+        self.files
+            .iter()
+            .map(|f| (f.segments.len() + f.dropped_segments) as u64)
+            .fold(0u64, u64::saturating_add)
+            .saturating_mul(MAX_ARTICLE_BYTES)
     }
 
     /// Encoded bytes excluding PAR2 recovery volumes (what we download
@@ -401,6 +428,32 @@ POST]]></segment>
             "unsafe group survived: {:?}",
             f.groups
         );
+        // The drop must not silently shrink the manifest: the caller
+        // has to learn two declared segments can never be fetched, or a
+        // hostile NZB completes green with a zero-filled file.
+        assert_eq!(f.dropped_segments, 2);
+    }
+
+    /// A file whose EVERY segment is refused still parses (the NZB is
+    /// not empty), but it must carry the refusal count: with zero
+    /// segments and zero dropped it would enter the downloader with
+    /// nothing to fetch, nothing missing, and finish green having
+    /// written no bytes at all.
+    #[test]
+    fn a_file_of_only_unsafe_segments_records_the_drops() {
+        let xml = br#"<?xml version="1.0"?>
+<nzb>
+  <file subject="x" poster="p" date="1700000000">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments>
+      <segment bytes="1" number="1">a@b&#13;&#10;POST&#13;&#10;c@d</segment>
+    </segments>
+  </file>
+</nzb>"#;
+        let nzb = Nzb::parse(xml).expect("parses");
+        let f = &nzb.files[0];
+        assert!(f.segments.is_empty());
+        assert_eq!(f.dropped_segments, 1);
     }
 
     fn sample() -> &'static [u8] {

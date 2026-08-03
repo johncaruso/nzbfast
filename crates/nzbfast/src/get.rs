@@ -4,7 +4,7 @@
 
 use crate::*;
 use std::path::Path;
-use tracing::info;
+use tracing::{info, warn};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn get_with_progress(
@@ -35,6 +35,11 @@ pub(crate) async fn get_with_progress(
     // and the `Name{{password}}.nzb` filename convention are picked up
     // automatically; this overrides both.
     password: Option<String>,
+    // TODO 101: this job's own yes to the volume-eating unpack, given in
+    // the disk-full drawer. Consulted only in `low_disk` mode - `always`
+    // is itself the consent and `off` cannot be talked into it - and
+    // never enough on its own: the set must still have verified.
+    eat_consent: bool,
     progress: Option<Arc<AtomicU64>>,
     hub: Option<Arc<StreamHub>>,
     // The nzo_id that owns this run's hub extractor (daemon jobs); empty for
@@ -89,11 +94,26 @@ pub(crate) async fn get_with_progress(
         picked
     };
 
+    // Queue-row activity token, advanced at section transitions only
+    // (never per article): the daemon's queue payload reads it to say
+    // what the pipeline is doing right now. No hub (CLI) means no one
+    // is listening; a sidecar's hub is never read by the queue payload.
+    let note_activity = |tok: &'static str| {
+        if let Some(h) = &hub {
+            h.activity.lock_ok().insert(stream_owner.to_string(), tok);
+        }
+    };
     let mut cfg_all = Config::load(config)?;
+    // Which servers were taken OUT of the pool, and why. Only ever read
+    // when the pool ends up empty: "no usable servers" named nothing at
+    // all, so the one failure whose cause is entirely inside the user's
+    // own settings was also the one that said least about itself.
+    let mut sidelined: Vec<String> = Vec::new();
     // Soft-disabled servers never join a pool.
     cfg_all.servers.retain(|s| {
         if !s.enabled {
             info!(target: "config", "{} disabled - not in the pool", s.host);
+            sidelined.push(format!("{} (switched off)", s.host));
         }
         s.enabled
     });
@@ -114,13 +134,25 @@ pub(crate) async fn get_with_progress(
                         "{} excluded for this download (busy with the active job, refused, or block-exhausted)",
                         s.host
                     );
+                    sidelined
+                        .push(format!("{} (busy, refused the login, or out of block data)", s.host));
                 }
                 keep
             });
         }
     }
     if cfg_all.servers.is_empty() {
-        anyhow::bail!("no usable servers (all disabled or block-exhausted)");
+        // Opens with the same four words either way: `fail_hint` keys the
+        // dashboard's "open Server settings" button on that prefix.
+        if sidelined.is_empty() {
+            anyhow::bail!(
+                "no usable servers: none are set up yet - add your provider in Server settings"
+            );
+        }
+        anyhow::bail!(
+            "no usable servers: every one you have set up is out of the pool right now - {}",
+            sidelined.join(", ")
+        );
     }
     let xml = std::fs::read(nzb_path).with_context(|| format!("reading {}", nzb_path.display()))?;
     // Arc'd because the in-stream PAR2 sniff (issue #14) needs the file
@@ -287,8 +319,27 @@ pub(crate) async fn get_with_progress(
     let mut resume_sniffed_slots: Vec<usize> = Vec::new();
     let mut resume_deferred_arts = 0usize;
     let mut resume_deferred_bytes = 0u64;
+    // Bytes of articles this resume will SKIP because the journal already
+    // has them on disk. Published on the hub below (never added into the
+    // progress counter) so the queue row can pick the bar up where the
+    // last run left it - see the publish site for why the two stay apart.
+    let mut resume_have_bytes = 0u64;
     let mut slots: Vec<Arc<FileSlot>> = Vec::new();
-    let mut id_to_slot: HashMap<String, usize> = HashMap::new();
+    let mut id_to_slot: crate::unpack::IdSlots = HashMap::new();
+    // UX §15 honest percentage. `fetch_plan` is the declared NZB byte
+    // size of every article this run is responsible for, `fetch_done`
+    // the same measure for the ones already accounted for. Both count
+    // ONE thing - declared bytes of the eager article set - so the bar
+    // reaches exactly 100% when the fetch drains and can never pass it.
+    //
+    // The pair it replaces on the queue row could do neither: the
+    // numerator was decoded payload (all slots, PAR2 included), the
+    // denominator the NZB's encoded bytes minus recovery volumes. A
+    // clean download therefore stopped around 97% still claiming a
+    // gigabyte "left" that did not exist, and a damaged one - where the
+    // extra recovery bytes land on the numerator alone - pinned at
+    // 100% / 0 left with articles still in flight.
+    let mut plan_bytes = 0u64;
     // Slot index → NZB file index, for the in-stream sniff and the repair
     // planner (slots skip NZB-classified volumes, so the numberings differ).
     let mut slot_file: Vec<usize> = Vec::new();
@@ -325,9 +376,14 @@ pub(crate) async fn get_with_progress(
                 .unwrap_or_else(|| format!("file{idx:03}")),
             is_par2_main,
             par2_sniffed: std::sync::atomic::AtomicBool::new(resume_sniffed),
-            total_segments: f.segments.len(),
+            // A parser-dropped segment (empty or wire-unsafe message-id)
+            // is one this slot can never fetch: it counts toward the
+            // total and starts out missing, so the file either repairs
+            // through PAR2 or fails the job - it must not vanish from
+            // the manifest and finish green zero-filled.
+            total_segments: f.segments.len() + f.dropped_segments,
             remaining: AtomicUsize::new(f.segments.len()),
-            missing: AtomicUsize::new(0),
+            missing: AtomicUsize::new(f.dropped_segments),
             errors: AtomicUsize::new(0),
             deferred: AtomicUsize::new(0),
             capture: std::sync::Mutex::new(is_par2_main.then(Vec::new)),
@@ -344,16 +400,25 @@ pub(crate) async fn get_with_progress(
             // (yEnc offsets come from the article, not the NZB); a
             // cross-file repeat means these bytes never reach THIS file -
             // count it missing and let PAR2 repair fill the hole.
-            if let Some(&owner) = id_to_slot.get(&bracketed) {
+            if let Some(&(owner, _)) = id_to_slot.get(&bracketed) {
                 dup_segments += 1;
                 slots[idx].remaining.fetch_sub(1, Ordering::Relaxed);
-                if owner != idx {
+                if owner as usize != idx {
                     slots[idx].missing.fetch_add(1, Ordering::Relaxed);
                 }
                 enc_cum += seg.bytes;
                 continue;
             }
-            id_to_slot.insert(bracketed.clone(), idx);
+            id_to_slot.insert(bracketed.clone(), (idx as u32, seg.bytes as u32));
+            // Every article with an owner is this run's responsibility -
+            // including the ones already satisfied below, which are added
+            // to `have_bytes` as well so a resumed job's bar starts where
+            // its bytes actually are instead of at zero. A duplicate id
+            // (the `continue` above) is fetched once under its first
+            // owner and never counted twice; a segment the parser dropped
+            // has no entry at all and so cannot hold the bar short of
+            // 100%.
+            plan_bytes += seg.bytes;
             if !is_par2_main {
                 arts.push((enc_cum, bracketed.clone()));
             }
@@ -364,6 +429,7 @@ pub(crate) async fn get_with_progress(
             // the packets in memory).
             if !is_par2_main && completed.contains(&bracketed) {
                 slots[idx].remaining.fetch_sub(1, Ordering::Relaxed);
+                resume_have_bytes += seg.bytes;
                 continue;
             }
             // A resume-recognised recovery volume: everything not already
@@ -391,6 +457,28 @@ pub(crate) async fn get_with_progress(
     }
     if dup_segments > 0 {
         println!("  ⚠ NZB repeats {dup_segments} segment id(s) - each article is fetched once");
+    }
+    // Publish the fetch plan before the first article can land. The
+    // daemon zeroed both counters at the Downloading transition, and the
+    // queue payload treats a zero plan as "not ready yet" and falls back
+    // to the old arithmetic, so the window between the two is covered.
+    // `fetch_done` is the local handle either way: a CLI run has no hub
+    // and pays one uncontended atomic add per terminal article.
+    let fetch_done = hub
+        .as_ref()
+        .map(|h| h.fetch_done.clone())
+        .unwrap_or_default();
+    // Seeded with what is in hand before a byte moves: the articles the
+    // journal already satisfied, plus the recovery volumes a resume
+    // recognised on disk and deliberately never queued. Both are bytes of
+    // the plan this run is responsible for, so a resumed job's bar
+    // continues from where it stopped instead of restarting at 0%.
+    fetch_done.store(
+        resume_have_bytes.saturating_add(resume_deferred_bytes),
+        Ordering::Relaxed,
+    );
+    if let Some(h) = hub.as_ref() {
+        h.fetch_plan.store(plan_bytes, Ordering::Relaxed);
     }
     // M11 head+tail burst (hub-attached runs, i.e. the daemon): the first
     // volume's opening ~16 MB and the last volume's closing ~8 MB jump the
@@ -446,7 +534,14 @@ pub(crate) async fn get_with_progress(
     let verifier_seed_slots: Vec<usize> = slots
         .iter()
         .enumerate()
-        .filter(|(_, s)| !s.is_par2_main && s.remaining.load(Ordering::Relaxed) == 0)
+        .filter(|(_, s)| {
+            // remaining == 0 alone is not "complete": a slot whose
+            // segments were parser-dropped (or claimed by another file)
+            // never had anything to fetch and is missing, not done.
+            !s.is_par2_main
+                && s.remaining.load(Ordering::Relaxed) == 0
+                && s.missing.load(Ordering::Relaxed) == 0
+        })
         .map(|(i, _)| i)
         .collect();
 
@@ -492,6 +587,10 @@ pub(crate) async fn get_with_progress(
         state: Default::default(),
         deferred_articles: AtomicUsize::new(resume_deferred_arts),
         deferred_bytes: AtomicU64::new(resume_deferred_bytes),
+        // The same counter the resume seeding above already credited
+        // its deferred bytes into - a live deferral has to reach it too
+        // (Codex sweep 2, 3 Aug ML2).
+        fetch_done: fetch_done.clone(),
     });
     if !resume_sniffed_slots.is_empty() {
         println!(
@@ -510,17 +609,31 @@ pub(crate) async fn get_with_progress(
     }
     // All file writing goes through the extractor: plain files write
     // through; store-mode RAR volumes extract in-stream (M3). Resumed
-    // runs disable in-stream mapping (previous spans aren't refetched, so
-    // headers may be incomplete) - volumes materialize and extraction
-    // happens from disk after verification instead.
+    // runs without NZBFAST_RESUME_MAP disable in-stream mapping
+    // (restored spans then never flow through `write`, so headers would
+    // be incomplete) - volumes materialize and extraction happens from
+    // disk after verification instead. With it, the replay below feeds
+    // the restored spans through `write` first, and mapping proceeds as
+    // on a fresh run.
     // The archive shape prints ONCE, folded into the first volume line
     // that lands after the mappers have worked it out - several decode
     // consumers race for that line, so the flag is shared.
     let shape_said = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // §94 A: resumed jobs map in-stream. Restored spans REPLAY through
+    // the normal write path before the network opens, so the mappers
+    // re-derive their state from replayed headers and the run continues
+    // one-pass; only the still-missing fraction transits the wire, and
+    // only the resumed fraction is read back off disk. Opt-in while it
+    // soaks (NZBFAST_RESUME_MAP=1); without it a resumed run
+    // materializes volumes and extracts from disk, as before. `resume`
+    // stays true either way - writers must adopt restored files without
+    // truncating them.
+    let resume_map =
+        resuming && !no_extract && std::env::var("NZBFAST_RESUME_MAP").is_ok_and(|v| v == "1");
     let extractor = Arc::new(nzbkit::extract::Extractor::with_resume(
         out_dir,
         slots.len(),
-        !no_extract && !resuming,
+        !no_extract && (!resuming || resume_map),
         resuming,
     ));
     // The root has to know its own Arc before any span arrives, or a
@@ -529,6 +642,16 @@ pub(crate) async fn get_with_progress(
     // promote hook below anchors too, but it only exists on the daemon
     // path, and `nzbfast get` chases the same archives.
     extractor.anchor();
+    // §94 B, opt-in while it soaks (NZBFAST_CHASE_VERIFY_GATE=1): the
+    // chase decode gates on the PAR2 verified-block watermark, so a
+    // repair can never rewrite consumed bytes and the "repair rewrote
+    // chased bytes" demote becomes unreachable for gated sets. The
+    // frontier's conflict tripwire stays armed underneath either way.
+    if std::env::var("NZBFAST_CHASE_VERIFY_GATE").is_ok_and(|v| v == "1") {
+        let gate = nzbkit::live::VerifyGate::new(slots.len());
+        verifier.set_gate(gate.clone());
+        extractor.set_verify_gate(gate);
+    }
     extractor.set_holds_cap(budget.holds_cap());
     // One-pass zip, split sets: a byte-split zip cannot be sized from
     // its own bytes (no part carries a container-sizing header, unlike
@@ -575,9 +698,12 @@ pub(crate) async fn get_with_progress(
     // nothing is reserved at all). Deliberately a RESERVATION ceiling and
     // not a clamp on the declared size, which resume truncation and the
     // reported extracted size both depend on.
-    if nzb.total_bytes() > 0 {
-        extractor.set_prealloc_ceiling(nzb.total_bytes());
-    }
+    // The posted count is itself an untrusted attribute an attacker can
+    // inflate alongside the yEnc `size=`, and an NZB with NO byte
+    // attributes used to get no ceiling at all - so the post's article
+    // geometry (articles x a generous per-article max) bounds it both
+    // ways. Same bound as the recovery-volume side-fetch.
+    extractor.set_prealloc_ceiling(crate::repair::volume_prealloc_cap(&nzb));
     // Decompression-bomb budget for the IN-STREAM extractor - the same
     // guard `write_archives_to`/`extract_one_sevenz` put on the disk and
     // post-pass sinks, which until now covered only the fallback and not
@@ -641,6 +767,32 @@ pub(crate) async fn get_with_progress(
                     structured: false,
                 });
             }
+            // The operator's passwords file outranks the harvested
+            // guesses (curated beats scraped), re-read per invocation -
+            // the operator may add the password WHILE the download
+            // runs, and this probe is exactly the moment it pays off:
+            // the set re-keys in place and streams one-pass instead of
+            // parking for a post-completion unlock. Structured, like
+            // the typed password, so the KDF-depth gate never blocks
+            // an operator-supplied value.
+            if let Some(path) = hub_pw
+                .as_ref()
+                .and_then(|h| h.unpack_password_file.lock_ok().clone())
+            {
+                for (i, pw) in crate::smart::read_password_file(&path)
+                    .into_iter()
+                    .enumerate()
+                {
+                    cands.insert(
+                        i,
+                        PwCandidate {
+                            value: pw,
+                            source: "passwords file".into(),
+                            structured: true,
+                        },
+                    );
+                }
+            }
             // The late-typed password outranks every harvested guess:
             // first in line, and structured (operator-supplied) so the
             // KDF-depth gate never blocks it. Re-read per invocation -
@@ -676,8 +828,23 @@ pub(crate) async fn get_with_progress(
                         "🔑 archive password found in {} (in-stream probe)",
                         c.source
                     );
+                    // A verified key means nobody needs to be asked -
+                    // and the winner is parked for finalize to record
+                    // onto the Job (the volumes decrypt one-pass, so
+                    // the completion path never meets them).
+                    if let Some(h) = hub_pw.as_ref() {
+                        *h.password_wanted.lock_ok() = None;
+                        *h.password_found.lock_ok() = Some((owner.clone(), c.value.clone()));
+                    }
                     return Some(c.value);
                 }
+            }
+            // The probe only fires when an encrypted set is BLOCKED on a
+            // password, so a fruitless sweep IS the live "this download
+            // wants a password" moment. Owner-tagged; the dashboard's
+            // "ask at once" mode prompts off the queue slot this raises.
+            if let Some(h) = hub_pw.as_ref() {
+                *h.password_wanted.lock_ok() = Some(owner.clone());
             }
             None
         }));
@@ -703,10 +870,25 @@ pub(crate) async fn get_with_progress(
             None => Ok(()),
         }));
     }
-    // Crash resume (placement journal): adopt the restored volume files
-    // as slot writers and register their spans with the verifier - the
-    // M15b backfill hashes every restored byte against the PAR2 block map
-    // once the set activates, so nothing is trusted unverified.
+    // Crash resume (placement journal). Two modes:
+    //
+    // Replay (§94 A, NZBFAST_RESUME_MAP): restored spans flow through
+    // `Extractor::write` in offset order BEFORE the network opens,
+    // exactly as if the articles had just arrived - the offset-0 sniff
+    // fires, the mappers walk replayed headers, and the run continues
+    // one-pass. Deliberately NOT re-journaled: the spans are already
+    // durable, and the old records keep describing where the bytes are
+    // if this run is killed too (restored source files are only removed
+    // after a fully-good finish, below). The verifier sees each span as
+    // an unverified arrival - full MD5 under delegation - because no
+    // decoder vouched for these bytes THIS run.
+    //
+    // Adopt (default): restored files become plain slot writers and
+    // their spans are registered as pre-spans - the M15b backfill hashes
+    // every restored byte against the PAR2 block map once the set
+    // activates, so nothing is trusted unverified.
+    let mut replayed_files = 0usize;
+    let mut replayed_bytes = 0u64;
     for seed in &restored.seeds {
         // is_par2(): a resume-recognised recovery volume is not adopted as
         // a payload writer and its bytes stay out of the verifier - like a
@@ -714,14 +896,79 @@ pub(crate) async fn get_with_progress(
         if seed.slot >= slots.len() || slots[seed.slot].is_par2() {
             continue;
         }
-        if let Err(e) = extractor.seed_slot(seed.slot, &seed.name, seed.size, &seed.spans) {
-            eprintln!("resume: adopting {} failed: {e}", seed.name);
-            continue;
+        if resume_map {
+            // The restored file is a live SOURCE for this whole run.
+            // Claim its name before any replay so an inner member with
+            // the same sanitized name cannot open the same inode as an
+            // output writer (Codex sweep 3 Aug H3) - a fresh extractor
+            // starts with an empty name set, and `hash.bin` containing a
+            // member named `hash.bin` is exactly the shape the disk
+            // extractor stages into an isolated directory to avoid.
+            extractor.preclaim_name(&seed.name);
+            let path = out_dir.join(&seed.name);
+            let mut f = match std::fs::File::open(&path) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("resume: replaying {} failed to open: {e}", seed.name);
+                    continue;
+                }
+            };
+            // The journal name (the real on-disk name) beats the subject
+            // hint for PAR2 file matching, same as the adopt path.
+            verifier.set_name_hint(seed.slot, &seed.name);
+            let mut spans = seed.spans.clone();
+            spans.sort_unstable();
+            let mut buf = vec![0u8; 4 << 20];
+            let mut file_ok = true;
+            'spans: for &(off, len) in &spans {
+                let mut done = 0u64;
+                while done < len {
+                    use std::io::{Read, Seek, SeekFrom};
+                    let chunk = ((len - done).min(4 << 20)) as usize;
+                    if f.seek(SeekFrom::Start(off + done)).is_err()
+                        || f.read_exact(&mut buf[..chunk]).is_err()
+                    {
+                        eprintln!("resume: replaying {} failed mid-span", seed.name);
+                        file_ok = false;
+                        break 'spans;
+                    }
+                    if let Err(e) =
+                        extractor.write(seed.slot, &seed.name, seed.size, off + done, &buf[..chunk])
+                    {
+                        eprintln!("resume: replay write {}: {e}", seed.name);
+                        file_ok = false;
+                        break 'spans;
+                    }
+                    verifier.on_data_unverified(
+                        seed.slot,
+                        &seed.name,
+                        seed.size,
+                        off + done,
+                        &buf[..chunk],
+                    );
+                    done += chunk as u64;
+                }
+            }
+            if file_ok {
+                replayed_files += 1;
+                replayed_bytes += spans.iter().map(|s| s.1).sum::<u64>();
+            }
+        } else {
+            if let Err(e) = extractor.seed_slot(seed.slot, &seed.name, seed.size, &seed.spans) {
+                eprintln!("resume: adopting {} failed: {e}", seed.name);
+                continue;
+            }
+            verifier.seed_pre_spans(seed.slot, &seed.spans);
+            // The journal name (the real on-disk name) beats the subject hint
+            // for PAR2 file matching.
+            verifier.set_name_hint(seed.slot, &seed.name);
         }
-        verifier.seed_pre_spans(seed.slot, &seed.spans);
-        // The journal name (the real on-disk name) beats the subject hint
-        // for PAR2 file matching.
-        verifier.set_name_hint(seed.slot, &seed.name);
+    }
+    if replayed_files > 0 {
+        println!(
+            "resume: replayed {replayed_files} restored file(s) ({:.1} MB) through the one-pass path",
+            replayed_bytes as f64 / 1e6
+        );
     }
     // Fully-resumed slots see no articles - seed their names so PAR2
     // matching and read-back verification still reach them.
@@ -815,17 +1062,28 @@ pub(crate) async fn get_with_progress(
         .and_then(|v| v.parse().ok())
         .map(std::time::Duration::from_secs)
         .unwrap_or_else(|| PoolConfig::default().read_timeout);
+    // TODO 96.1, dark until benched: two-phase adaptive read bounds in
+    // place of the flat whole-response timeout.
+    let adaptive_timeout = std::env::var("NZBFAST_ADAPTIVE_TIMEOUT").is_ok_and(|v| v == "1");
     // Per-server budget: the CLI --connections is a ceiling; a server's
     // config `connections` (its account limit) caps its own pool; a
     // fresh auto-tuned knee (conntune.json, M7b.1) caps below that -
     // over-asking a provider measured 3-4× SLOWER than the knee.
-    let tuned = crate::conntune::load(config);
+    // Two knees are NOT applied: any knee while the auto_connections
+    // toggle is off (off must mean off - the user's escape hatch from a
+    // bad probe), and a `suspect` one (a low knee awaiting a second
+    // probe's corroboration) even while it's on.
+    let tuned = if crate::conntune::enabled(config) {
+        crate::conntune::load(config)
+    } else {
+        Default::default()
+    };
     let tuned_note: Vec<String> = cfg_all
         .servers
         .iter()
         .filter_map(|s| {
             let t = tuned.get(&s.host)?;
-            (t.connections > 0 && (t.connections as u32) < s.connections.max(1))
+            (!t.suspect && t.connections > 0 && (t.connections as u32) < s.connections.max(1))
                 .then(|| format!("{} {}", s.host, t.connections))
         })
         .collect();
@@ -861,12 +1119,13 @@ pub(crate) async fn get_with_progress(
             }
             let cfg = PoolConfig {
                 connections: match tuned.get(&s.host) {
-                    Some(t) if t.connections > 0 => base.min(t.connections),
+                    Some(t) if t.connections > 0 && !t.suspect => base.min(t.connections),
                     _ => base,
                 },
                 window,
                 buf_pool: Some(buf_pool.clone()),
                 read_timeout,
+                adaptive_timeout,
                 rate: hub.as_ref().map(|h| h.rate.clone()),
                 // B3: wire-side in-flight bytes are budget-exempt (window
                 // × connections × ~800 KB); this cap throttles pipeline
@@ -933,6 +1192,33 @@ pub(crate) async fn get_with_progress(
     let rx = Arc::new(std::sync::Mutex::new(rx));
     // The daemon shares this counter to report live queue progress.
     let decoded_bytes = progress.unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
+    // Publish what the journal already holds, so the queue row can add
+    // it to this counter and pick the bar up where the last run left it.
+    // A resume that stopped at 62% otherwise re-drew from 0 and climbed
+    // back, which reads as "it started over" however loudly the copy
+    // says nothing is re-downloaded - and is what a good share of the
+    // reports of a lost journal actually are.
+    //
+    // Beside the counter rather than added INTO it, deliberately. This
+    // one is every consumer's idea of "bytes off the wire this run": the
+    // quota ledger bills it, history divides it by network seconds, the
+    // resulting average feeds `best_rate_bps` (the stall watchdog's
+    // reference for what the line can do), the CLI ticker differences it
+    // per 2 s, and the daemon's rolling speed window differences it per
+    // sample. Crediting 40 GB of already-downloaded articles into it in
+    // one instant would answer all six of those with a number no line
+    // has ever run at. The reader that wants "how much of this release
+    // is on disk" adds the two; nothing else has to know.
+    //
+    // The figure is the NZB's encoded segment size, where a fetched
+    // article credits its decoded length - so the seeded stretch of the
+    // bar runs a few percent generous against an encoded denominator
+    // that the fetched stretch runs a few percent shy of. Squaring those
+    // two ends is audit #15's job; the percentage is clamped, so neither
+    // can overshoot the bar.
+    if let Some(h) = &hub {
+        h.resume_seeded.store(resume_have_bytes, Ordering::Relaxed);
+    }
     let decode_errors = Arc::new(AtomicU64::new(0));
     // Segments the pool never asked anyone for: outside every configured
     // server's retention window. Reported by cause in the failure summary
@@ -994,6 +1280,7 @@ pub(crate) async fn get_with_progress(
         let id_to_slot = id_to_slot.clone();
         let seek_names = seek_names.clone();
         let decoded_bytes = decoded_bytes.clone();
+        let fetch_done = fetch_done.clone();
         let decode_errors = decode_errors.clone();
         let retention_excluded = retention_excluded.clone();
         let missing_430 = missing_430.clone();
@@ -1037,10 +1324,14 @@ pub(crate) async fn get_with_progress(
                     for outcome in batch {
                         match outcome {
                             FetchOutcome::Done { id, raw } => {
-                                let Some(&sidx) = id_to_slot.get(&id) else {
+                                let Some(&(sidx, nbytes)) = id_to_slot.get(&id) else {
                                     pool.give(raw);
                                     continue;
                                 };
+                                let (sidx, nbytes) = (sidx as usize, nbytes as u64);
+                                // This article is now accounted for,
+                                // whatever the decode below makes of it.
+                                fetch_done.fetch_add(nbytes, Ordering::Relaxed);
                                 let slot = &slots[sidx];
                                 let mut out = out_pool.take();
                                 // M32 perf: once live verify (full-MD5 mode) has
@@ -1331,7 +1622,15 @@ pub(crate) async fn get_with_progress(
                                         missing_430.fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
-                                if let Some(&sidx) = id_to_slot.get(&id) {
+                                if let Some(&(sidx, nbytes)) = id_to_slot.get(&id) {
+                                    let sidx = sidx as usize;
+                                    // Terminal is terminal: an article
+                                    // that will never arrive still ends
+                                    // the fetch's responsibility for it,
+                                    // and leaving it out would hold the
+                                    // bar short of 100% on every damaged
+                                    // set while repair ran.
+                                    fetch_done.fetch_add(nbytes as u64, Ordering::Relaxed);
                                     slots[sidx].missing.fetch_add(1, Ordering::Relaxed);
                                     if slots[sidx].remaining.fetch_sub(1, Ordering::AcqRel) == 1
                                         && (slots[sidx].is_par2_main
@@ -1361,7 +1660,15 @@ pub(crate) async fn get_with_progress(
                             FetchOutcome::Failed { id, error } => {
                                 transport_failed.fetch_add(1, Ordering::Relaxed);
                                 transport_sample.lock_ok().get_or_insert(error);
-                                if let Some(&sidx) = id_to_slot.get(&id) {
+                                if let Some(&(sidx, nbytes)) = id_to_slot.get(&id) {
+                                    let sidx = sidx as usize;
+                                    // Terminal is terminal: an article
+                                    // that will never arrive still ends
+                                    // the fetch's responsibility for it,
+                                    // and leaving it out would hold the
+                                    // bar short of 100% on every damaged
+                                    // set while repair ran.
+                                    fetch_done.fetch_add(nbytes as u64, Ordering::Relaxed);
                                     slots[sidx].missing.fetch_add(1, Ordering::Relaxed);
                                     if slots[sidx].remaining.fetch_sub(1, Ordering::AcqRel) == 1
                                         && (slots[sidx].is_par2_main
@@ -1732,6 +2039,16 @@ pub(crate) async fn get_with_progress(
     }
     // Network drained: everything from here is disk/CPU. Tell the daemon
     // so the next queued download can start soaking the line now.
+    //
+    // The token moves FIRST, and it is what the queue row's status is
+    // read from - so by the time the daemon can act on the signal and
+    // start the next download, this job has already stopped calling
+    // itself a download. Announced here rather than at the verify pass
+    // below because the settle read-back, the backfill join and the
+    // deferred-payload sweep in between are all part of checking what
+    // landed; leaving the token on "fetching" for them is what made a
+    // finished transfer read as "downloading, 100%, 0 MB/s" for minutes.
+    note_activity("verifying");
     if let Some(tx) = net_done {
         let _ = tx.send(());
     }
@@ -1787,6 +2104,12 @@ pub(crate) async fn get_with_progress(
                 .map(|(_, b)| *b)
                 .unwrap_or(0);
             sniff.mark_reconciled(sidx);
+            // Deliberately NOT undoing the deferral's fetch_done credit
+            // the way the pool-side reconcile does: these bytes came in
+            // through `fetch_volumes` on the side machinery, so no
+            // terminal outcome will ever credit them again and dropping
+            // the credit would leave the bar short (Codex sweep 2,
+            // 3 Aug ML2).
             slots[sidx].par2_sniffed.store(false, Ordering::Release);
             // The side fetch re-attempted every article of the file, so
             // the sniff-era counters are stale; the verification feed
@@ -1929,6 +2252,25 @@ pub(crate) async fn get_with_progress(
     // the two ends of what one user actually needs to know.
     let mut missing_segments: u64 = 0;
     let mut total_segments: u64 = 0;
+    // Which slots the coverage census below may NOT speak for, because
+    // this run's interval map is not the whole story about their bytes
+    // (Codex sweep 2, 3 Aug M2 - see the census itself for why each
+    // one is here).
+    let set_names: Option<std::collections::HashSet<String>> = verifier.set().map(|set| {
+        set.files
+            .iter()
+            .map(|f| nzbkit::disk::sanitize_filename(&f.name).to_lowercase())
+            .collect()
+    });
+    let reconciled: std::collections::HashSet<usize> =
+        sniff.state.lock_ok().reconciled.iter().copied().collect();
+    // Slots that arrived complete by every counter and STILL do not
+    // cover the range the post declared. Carried out of the loop
+    // because the repair branch has to fail on them too: they sit
+    // outside the recovery set by construction, so no repair can heal
+    // them, and its own hole scan only looks at slots with a non-zero
+    // counter.
+    let mut sparse_slots: Vec<String> = Vec::new();
     for (i, slot) in slots.iter().enumerate() {
         if slot_recovery(i) {
             continue;
@@ -1944,6 +2286,69 @@ pub(crate) async fn get_with_progress(
             println!(
                 "  ⚠ {}: {} missing, {} unresolved of {} segments",
                 slot.hint, miss, unresolved, slot.total_segments
+            );
+            continue;
+        }
+        // Every article accounted for, but did the bytes actually COVER
+        // the file the post declared? The decoder validates each part
+        // against its own `=ypart` range and deliberately not against
+        // `=ybegin size` (posters do misstate totals, and rejecting on
+        // that would break real posts), while the writer is sized from
+        // exactly that untrusted total. So a self-consistent post can
+        // declare 16 MiB, ship one CRC-valid byte, retire every counter
+        // to zero, and leave a file that is one byte plus a hole - which
+        // used to complete green (Codex sweep 3 Aug M7). The interval
+        // map is the ground truth and costs one lock to ask.
+        //
+        // The interval map records what THIS run's decoder wrote, which
+        // is not the same as what the file legitimately holds, so some
+        // slots have to sit the census out. Which ones is a PER-SLOT
+        // question, and asking it globally - `verifier.set().is_none()
+        // && deferred_arts == 0` - exempted every slot in the job the
+        // moment any set existed or anything anywhere was deferred
+        // (Codex sweep 2, 3 Aug M2). A sparse out-of-set `.nfo` beside
+        // a healthy covered RAR therefore completed green with a
+        // one-byte-plus-hole file, and one unactivatable sniffed
+        // recovery volume exempted the entire payload of the post.
+        //
+        // The two real exemptions, both narrow:
+        //  - the recovery set NAMES the file, or the verifier has
+        //    matched this slot to one of its entries: repair rebuilds
+        //    such a file from parity, bytes no decoder in this run ever
+        //    wrote, and the set's own verification is the stronger
+        //    statement about it anyway;
+        //  - the slot was deferred as par2-shaped and then reconciled
+        //    back to payload, whose bytes arrive by side fetch
+        //    (`fetch_volumes` straight to disk) rather than through the
+        //    writer.
+        // Both were real false positives on the e2e suite. A stable
+        // plain slot outside the set is neither, and is exactly the
+        // case where NOTHING else checks the bytes - `slot_uncovered`
+        // itself returns None for the mapped and chased shapes that
+        // legitimately hold less than they declare.
+        let covered_by_set = verifier.slot_in_set(i)
+            || set_names.as_ref().is_some_and(|n| {
+                n.contains(&nzbkit::disk::sanitize_filename(&slot.hint).to_lowercase())
+            });
+        if !covered_by_set
+            && !reconciled.contains(&i)
+            && slot.deferred.load(Ordering::Relaxed) == 0
+            && let Some(gap) = extractor.slot_uncovered(i)
+            && gap > 0
+        {
+            incomplete += 1;
+            sparse_slots.push(slot.hint.clone());
+            println!(
+                "  ⚠ {}: every article arrived but {:.1} MB of the declared \
+                 {:.1} MB was never written - the post's size header and its \
+                 parts disagree",
+                slot.hint,
+                gap as f64 / 1e6,
+                extractor
+                    .slot_file_info(i)
+                    .map(|(_, sz)| sz)
+                    .unwrap_or_default() as f64
+                    / 1e6,
             );
         }
     }
@@ -1997,6 +2402,7 @@ pub(crate) async fn get_with_progress(
     // Slots whose offset-0 article never landed are still unclassified,
     // their spans held in memory - flush them to plain files so settle
     // read-back and PAR2 repair see the bytes on disk.
+    note_activity("verifying");
     extractor.settle_unclassified()?;
 
     // --- settle verification (in-stream results; read-back only for gaps) ---
@@ -2007,7 +2413,11 @@ pub(crate) async fn get_with_progress(
     // download. Holds WHICH extraction path gave up: several reach here
     // on jobs that never needed (or ran) a PAR2 repair at all, so the
     // reason travels with the flag rather than being assumed at the end.
-    let mut reextract_failed: Option<&'static str> = None;
+    // A String rather than a &'static str: the nested-archive arms below
+    // know WHICH archive stopped them, and "the log above names the
+    // archive" asked the user to go and find in a log ring what the
+    // sentence could simply have said.
+    let mut reextract_failed: Option<String> = None;
     // (needed, have) when repair died on recovery-block arithmetic - the
     // counts belong in the fail message, not just the console log.
     let mut repair_shortfall: Option<(usize, usize)> = None;
@@ -2287,6 +2697,7 @@ pub(crate) async fn get_with_progress(
                 vt0.elapsed().as_secs_f64() * 1000.0,
             );
             if damage > 0 {
+                note_activity("repairing");
                 // M2c.1: first try repairing straight INTO the extracted
                 // output through the block→payload mapping - no volume
                 // files ever touch disk. Every declined case (gate miss,
@@ -2389,6 +2800,7 @@ pub(crate) async fn get_with_progress(
                     // would only double the work.
                     let any_rar_chased = reports.iter().any(|(s, _)| extractor.is_rar_chased(*s));
                     if any_mapped || any_chased {
+                        note_activity("repairing");
                         println!("materializing volumes for repair…");
                         damage_in_mapped |= any_mapped || any_rar_chased;
                         for (sidx, r) in &reports {
@@ -2461,7 +2873,7 @@ pub(crate) async fn get_with_progress(
                         all_good = reextract_dir(out_dir, password.as_deref())?;
                         if !all_good {
                             reextract_failed =
-                                Some("PAR2 repair succeeded but re-extraction failed");
+                                Some("PAR2 repair succeeded but re-extraction failed".into());
                         }
                     } else {
                         all_good = repaired;
@@ -2710,6 +3122,7 @@ pub(crate) async fn get_with_progress(
                         sniffed_packet_files,
                     };
                     let t0 = Instant::now();
+                    note_activity("repairing");
                     println!(
                         "no PAR2 set came from the NZB, but the downloaded files \
                          include one - repairing from disk…"
@@ -2840,15 +3253,38 @@ pub(crate) async fn get_with_progress(
                         // directory" describes real payload too.
                         let mut freed: u64 = 0;
                         let mut gone: usize = 0;
+                        // Trash-aware: a consumed adoption source is the
+                        // obfuscated post's own downloaded volume - the
+                        // set a user might want to keep or re-share -
+                        // and the sniffed recovery files go "under the
+                        // setting that governs named .par2", which since
+                        // §64 has meant a recoverable delete. Parked for
+                        // the deferred worker like every other sweep in
+                        // a job's tail, and the flag read once here at
+                        // the sweep's entry (remove_user_file's
+                        // contract).
+                        let recoverable = crate::smart::delete_to_trash();
+                        let staging = crate::smart::trash_staging_dir(out_dir);
                         let mut remove = |p: &std::path::Path| {
                             let len = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-                            match std::fs::remove_file(p) {
-                                Ok(()) => {
+                            match crate::smart::remove_swept_file(
+                                p,
+                                recoverable,
+                                staging.as_deref(),
+                            ) {
+                                Ok(_) => {
                                     freed += len;
                                     gone += 1;
                                 }
                                 Err(e) => {
-                                    println!("  note: could not remove {} - {e}", p.display())
+                                    // warn!, not println: the log ring is
+                                    // where "why is this file still
+                                    // here" gets answered.
+                                    warn!(
+                                        target: "cleanup",
+                                        "could not remove {} - {e}",
+                                        p.display()
+                                    )
                                 }
                             }
                         };
@@ -2881,9 +3317,13 @@ pub(crate) async fn get_with_progress(
                             }
                         }
                         if gone > 0 {
+                            // "freed" only when the bytes actually left
+                            // the disk - a recoverable delete parks them
+                            // in the Trash on the same volume.
                             println!(
-                                "  cleaned up {gone} obfuscated leftover(s), {:.1} MB freed",
-                                freed as f64 / 1e6
+                                "  cleaned up {gone} obfuscated leftover(s), {:.1} MB {}",
+                                freed as f64 / 1e6,
+                                if recoverable { "to the Trash" } else { "freed" }
                             );
                         }
                         uncovered_after_par2 = slots
@@ -2916,6 +3356,19 @@ pub(crate) async fn get_with_progress(
                             })
                             .map(|(_, s)| s.hint.clone())
                             .collect();
+                        // The census's own out-of-set findings belong
+                        // here too (Codex sweep 2, 3 Aug M2). A slot
+                        // whose articles ALL arrived and still does not
+                        // cover its declared range has every counter at
+                        // zero, so the scan above cannot see it - and
+                        // it was exempted from the set by construction,
+                        // so the repair that just succeeded says
+                        // nothing about it.
+                        for hint in &sparse_slots {
+                            if !uncovered_after_par2.contains(hint) {
+                                uncovered_after_par2.push(hint.clone());
+                            }
+                        }
                         if uncovered_after_par2.is_empty() {
                             println!("repair complete in {:.2?} ✔", t0.elapsed());
                             all_good = true;
@@ -3038,13 +3491,84 @@ pub(crate) async fn get_with_progress(
         .as_ref()
         .and_then(|h| h.late_password_for(stream_owner))
         .or(password);
+    // Everything from here to the end of the run is unpack work (the
+    // disk-side ladders below, or the nested second pass) - close
+    // enough for the queue row even on jobs that skip them all, since
+    // those reach the finish within moments.
+    note_activity("extracting");
+    // TODO 101: should this job's disk unpack eat its own volumes as it
+    // consumes them? Decided ONCE, here, where every input is known and
+    // measured - the set is fully on disk by now, so the forecast is
+    // arithmetic rather than a projection - and armed for the length of
+    // the disk ladder below. `all_good` IS the verified gate: it is false
+    // for any set PAR2 could not vouch for, and an unverified set is
+    // never eaten whatever the mode says.
+    //
+    // Deliberately NOT extended over the nested pass further down: those
+    // are intermediates the extraction produced, owned by
+    // `sweep_spent_entry`, not the downloaded volume set this mode is
+    // about.
+    let eat_arm = {
+        let shape = final_shape
+            .as_ref()
+            .map(|s| s.display())
+            .unwrap_or_default();
+        let encrypted = shape.split_whitespace().any(|t| t == "encrypted");
+        let mut on_disk = collect_rar_volumes(out_dir).unwrap_or_default();
+        on_disk.extend(collect_obfuscated_rar_volumes(out_dir).unwrap_or_default());
+        let forecast =
+            crate::eatvol::forecast(out_dir, crate::eatvol::volume_bytes(&on_disk), encrypted);
+        let verdict = crate::eatvol::decide(crate::eatvol::mode(), all_good, eat_consent, forecast);
+        if verdict.eats() {
+            info!(
+                target: "extract",
+                "volume-eating unpack armed ({}): {} volume(s) on disk, {:.1} GB free, \
+                 the unpack needs {:.1} GB",
+                crate::eatvol::mode().as_str(),
+                on_disk.len(),
+                forecast.free as f64 / 1e9,
+                forecast.needed() as f64 / 1e9
+            );
+        }
+        crate::eatvol::EatArm::new(verdict.eats())
+    };
     // Resumed runs skipped in-stream extraction - extract from the (now
-    // verified) volume files on disk.
-    if resuming && !no_extract && all_good {
+    // verified) volume files on disk. Not under §94 A replay: there the
+    // extractor mapped in-stream like a fresh run, and whatever demoted
+    // takes the same disk ladder a fresh run's demotes take, below.
+    if resuming && !no_extract && !resume_map && all_good {
         all_good = reextract_dir(out_dir, password.as_deref())?;
         if !all_good {
             reextract_failed =
-                Some("resumed job: the verified volumes on disk could not be extracted");
+                Some("resumed job: the verified volumes on disk could not be extracted".into());
+        }
+    }
+    // §94 A: a replayed volume whose slot MAPPED (or chased) leaves its
+    // restored source file behind - the output came through the map, so
+    // the source is now redundant. Removed only on a fully-good finish
+    // (the crash journal's records keep pointing at these files until
+    // then, so a kill mid-run still resumes from them), and only when
+    // the slot did not adopt that exact file as its plain writer.
+    if resume_map && all_good {
+        for seed in &restored.seeds {
+            // Recovery volumes were never replayed; their files belong to
+            // the ordinary end-of-job PAR2 cleanup, not to this pass.
+            if seed.slot >= slots.len() || slots[seed.slot].is_par2() {
+                continue;
+            }
+            // Never delete a path an extraction PRODUCED. The preclaim
+            // at replay time already stops an inner member taking a
+            // restored source's name, so this is the second lock on the
+            // same door (Codex sweep 3 Aug H3): identity by path string
+            // alone once deleted the only output of the job while
+            // reporting it green.
+            if ex_report.extracted.iter().any(|(n, _)| n == &seed.name) {
+                continue;
+            }
+            let p = out_dir.join(&seed.name);
+            if extractor.slot_path(seed.slot).as_deref() != Some(p.as_path()) && p.exists() {
+                let _ = std::fs::remove_file(&p);
+            }
         }
     }
     // The unrar ladder below reasons about RAR VOLUMES, so a top-level 7z
@@ -3095,7 +3619,8 @@ pub(crate) async fn get_with_progress(
                 all_good = false;
                 reextract_failed = Some(
                     "the verified volumes could not be unpacked \
-                     (compressed set, or the password is wrong)",
+                     (compressed set, or the password is wrong)"
+                        .into(),
                 );
             }
         }
@@ -3105,7 +3630,7 @@ pub(crate) async fn get_with_progress(
             None => {
                 all_good = false;
                 reextract_failed =
-                    Some("the verified volumes could not be unpacked after a fallback");
+                    Some("the verified volumes could not be unpacked after a fallback".into());
             }
         }
     } else if all_good && enc_fallback {
@@ -3117,6 +3642,9 @@ pub(crate) async fn get_with_progress(
              {{{{password}}}} suffix on the NZB filename, then retry."
         );
     }
+    // The downloaded volume set is done with. Everything below works on
+    // what extraction PRODUCED, which this mode has no business eating.
+    drop(eat_arm);
     // Post-extraction pass: nested archives (a RAR whose payload is one
     // more RAR), 7z sets, and SFX payloads unpack here - the inner layer
     // only exists once the outer extraction produced it, so this is
@@ -3198,22 +3726,32 @@ pub(crate) async fn get_with_progress(
                     Some(u) if zip_gap => {
                         println!("{}", u.message());
                         all_good = false;
-                        reextract_failed = Some(
-                            "the payload is a zip that could not be unpacked \
+                        reextract_failed = Some(format!(
+                            "the payload {} could not be unpacked \
                              (damaged, encrypted, or an unsupported compression method)",
-                        );
+                            u.display
+                        ));
                     }
-                    _ => {
+                    // Either a non-zip gap over a named archive, or a pass
+                    // that stopped without leaving one we can point at.
+                    other => {
                         all_good = false;
-                        reextract_failed =
-                            Some("an archive in the output directory could not be unpacked");
+                        reextract_failed = Some(match other {
+                            Some(u) => format!(
+                                "{} in the output directory could not be unpacked",
+                                u.display
+                            ),
+                            None => {
+                                "an archive in the output directory could not be unpacked".into()
+                            }
+                        });
                     }
                 }
             }
             Err(e) => {
                 println!("⚠ nested-archive pass failed: {e}");
                 all_good = false;
-                reextract_failed = Some("the nested-archive pass failed");
+                reextract_failed = Some("the nested-archive pass failed".into());
             }
         }
     }
@@ -3248,6 +3786,12 @@ pub(crate) async fn get_with_progress(
         });
         let mut freed: u64 = 0;
         let mut gone: usize = 0;
+        // Same reasoning as the adoption-source sweep above: sniffed
+        // recovery files ride the setting that governs named `.par2`,
+        // and since §64 that is a recoverable, parked delete. Flag read
+        // once at the sweep's entry.
+        let recoverable = crate::smart::delete_to_trash();
+        let staging = crate::smart::trash_staging_dir(out_dir);
         for p in nzbkit::par2repair::sniffed_packet_files(out_dir).unwrap_or_default() {
             let is_payload = p
                 .file_name()
@@ -3257,18 +3801,25 @@ pub(crate) async fn get_with_progress(
                 continue;
             }
             let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-            match std::fs::remove_file(&p) {
-                Ok(()) => {
+            match crate::smart::remove_swept_file(&p, recoverable, staging.as_deref()) {
+                Ok(_) => {
                     freed += len;
                     gone += 1;
                 }
-                Err(e) => println!("  note: could not remove {} - {e}", p.display()),
+                Err(e) => warn!(
+                    target: "cleanup",
+                    "could not remove {} - {e}",
+                    p.display()
+                ),
             }
         }
         if gone > 0 {
+            // "freed" only when the bytes actually left the disk - see
+            // the adoption-source sweep above.
             println!(
-                "  cleaned up {gone} obfuscated leftover(s), {:.1} MB freed",
-                freed as f64 / 1e6
+                "  cleaned up {gone} obfuscated leftover(s), {:.1} MB {}",
+                freed as f64 / 1e6,
+                if recoverable { "to the Trash" } else { "freed" }
             );
         }
     }
@@ -3289,7 +3840,7 @@ pub(crate) async fn get_with_progress(
     print_failure_diagnostics(&servers, &stats);
     if let Some(why) = reextract_failed {
         anyhow::bail!(with_build(format!(
-            "{why} - verified files left in the output directory (the log above names the archive)"
+            "{why} - the verified files are still in the output directory"
         )))
     } else if incomplete > 0 || derrs > 0 {
         let causes = LossCauses {

@@ -13,6 +13,11 @@ use tracing::warn;
 
 use rusqlite::{Connection, OptionalExtension};
 
+/// SQLite's per-CONNECTION cancellation handle, re-exported so callers
+/// outside this crate (the daemon's maintenance watchers) can hold one
+/// without taking a direct rusqlite dependency.
+pub use rusqlite::InterruptHandle;
+
 use crate::extract::release_stem;
 use crate::nntp::OverEntry;
 
@@ -2791,26 +2796,69 @@ impl Index {
         max_age_secs: i64,
         now: i64,
     ) -> rusqlite::Result<usize> {
+        // One transaction over the whole prune (Codex sweep 2, 3 Aug
+        // M5). The two deletes and the orphan repair below used to
+        // autocommit separately, so a crash - or a failure in the
+        // second statement after the first had committed - left
+        // pre_corr rows pointing at predb ids that no longer exist,
+        // which is precisely the state the repair exists to prevent.
+        let tx = self.db.unchecked_transaction()?;
         let mut removed = 0usize;
         if max_age_secs > 0 {
-            removed += self.db.execute(
+            removed += tx.execute(
                 "DELETE FROM predb WHERE seen_at > 0 AND seen_at < ?1",
                 [now - max_age_secs],
             )?;
         }
         if max_rows > 0 {
-            let n: i64 = self
-                .db
-                .query_row("SELECT COUNT(*) FROM predb", [], |r| r.get(0))?;
+            let n: i64 = tx.query_row("SELECT COUNT(*) FROM predb", [], |r| r.get(0))?;
             let over = n - max_rows as i64;
             if over > 0 {
-                removed += self.db.execute(
+                removed += tx.execute(
                     "DELETE FROM predb WHERE id IN
                        (SELECT id FROM predb ORDER BY seen_at ASC, id ASC LIMIT ?1)",
                     [over],
                 )?;
             }
         }
+        // pre_corr has no FK onto predb, and predb ids are plain rowids
+        // SQLite reuses after the maximum is deleted (Codex sweep 3 Aug
+        // M2). Dangling references are not inert:
+        //  - an orphaned SUGGESTED row wedges out every future valid
+        //    candidate scoring below it (the upsert takes only
+        //    excluded.score >= pre_corr.score, and the probe shortcut
+        //    skips lower scores), while its own hint joins to nothing;
+        //  - a dangling reference in ANY row can silently rebind to an
+        //    unrelated pre once the rowid is reused, and the confirm
+        //    back-feed then writes the old release's stem into that
+        //    unrelated predb row, poisoning later exact matches.
+        // Suggested orphans are deleted outright; settled rows keep
+        // their status (rejected must never nag again) but drop the
+        // reference to 0, the same "pre gone" shape a pruned hint
+        // already presents through its INNER JOIN.
+        //
+        // UNCONDITIONAL, not `if removed > 0` (Codex sweep 2, 3 Aug
+        // M5). Gating the repair on this call's own delete count meant
+        // a store that already held dangling rows - left by a crash, or
+        // by the pre-transaction version failing between its two
+        // statements - only healed if some LATER prune happened to
+        // delete something, and a store past its retention window with
+        // a steady row count never prunes again. The repair is the
+        // invariant, so it runs every time and costs an indexed lookup
+        // per pre_corr row once an hour.
+        tx.execute(
+            "DELETE FROM pre_corr WHERE status='suggested'
+               AND predb_id>0
+               AND NOT EXISTS (SELECT 1 FROM predb p WHERE p.id=pre_corr.predb_id)",
+            [],
+        )?;
+        tx.execute(
+            "UPDATE pre_corr SET predb_id=0
+              WHERE predb_id>0
+                AND NOT EXISTS (SELECT 1 FROM predb p WHERE p.id=pre_corr.predb_id)",
+            [],
+        )?;
+        tx.commit()?;
         Ok(removed)
     }
 
@@ -3153,10 +3201,22 @@ impl Index {
     }
 
     /// The candidate pres for one release, scored and ranked (best
-    /// first). Uses idx_predb_pt for the window; the 4000-row LIMIT
-    /// truncates pathological windows newest-first, which is also the
-    /// time-score order.
-    fn corr_eval(&self, rid: i64) -> rusqlite::Result<Option<(CorrRelFacts, Vec<CorrCand>)>> {
+    /// first). Uses idx_predb_pt for the window; the LIMIT truncates
+    /// pathological windows newest-first, which is also the time-score
+    /// order.
+    ///
+    /// The third value is SATURATION: the window held at least as many
+    /// pres as the limit, so candidates were dropped. At the feed's own
+    /// documented rate (40-200 pres/hour) a 14-day window is routinely
+    /// 13k-67k rows, so this is the ordinary case, not a pathological
+    /// one - and the dropped OLDER candidates are invisible to the
+    /// runner-up margin and the sibling gate, which makes auto-apply
+    /// EASIER to clear, the failure direction that renames a release
+    /// wrongly. Same principle as `corr_window_saturated`: a sample
+    /// cannot prove a maximum, so a saturated window suggests but never
+    /// auto-applies.
+    fn corr_eval(&self, rid: i64) -> rusqlite::Result<Option<(CorrRelFacts, Vec<CorrCand>, bool)>> {
+        const CAND_LIMIT: usize = 4000;
         let Some(facts) = self.corr_release_facts(rid)? else {
             return Ok(None);
         };
@@ -3183,6 +3243,7 @@ impl Index {
             })?
             .collect::<rusqlite::Result<_>>()?
         };
+        let saturated = pres.len() >= CAND_LIMIT;
         let mut cands: Vec<CorrCand> = pres
             .into_iter()
             .filter_map(|p| {
@@ -3191,7 +3252,7 @@ impl Index {
             })
             .collect();
         cands.sort_by_key(|c| std::cmp::Reverse(c.score.total));
-        Ok(Some((facts, cands)))
+        Ok(Some((facts, cands, saturated)))
     }
 
     /// Evaluate one release and act on the outcome: store/refresh the
@@ -3211,7 +3272,7 @@ impl Index {
         if matches!(settled.as_deref(), Some(s) if s != "suggested") {
             return Ok(CorrOutcome::Nothing);
         }
-        let Some((facts, cands)) = self.corr_eval(rid)? else {
+        let Some((facts, cands, saturated)) = self.corr_eval(rid)? else {
             return Ok(CorrOutcome::Nothing);
         };
         let Some(best) = cands.first().cloned() else {
@@ -3248,8 +3309,13 @@ impl Index {
         }
         // The auto gate, every clause of it. Failing any clause is not
         // an error: crowded, nuked, filename-bearing or sibling-shaped
-        // candidates are exactly what SUGGEST exists for.
-        if !best.score.strong()
+        // candidates are exactly what SUGGEST exists for. A saturated
+        // candidate window fails closed too: the runner-up and sibling
+        // clauses below are proofs about a MAXIMUM over the whole
+        // window, and a truncated sample cannot give them (Codex sweep
+        // 3 Aug M1).
+        if saturated
+            || !best.score.strong()
             || best.score.total - runner_up <= MARGIN
             || best.pre.nuked
             || best.pre.has_fn
@@ -3273,14 +3339,66 @@ impl Index {
             return Ok(CorrOutcome::Suggested);
         }
         let source = format!("corr:{}", corr_source_base(&best.pre.source));
-        if self.apply_pre_name(rid, &best.pre.title, &source, now)? {
-            self.db.execute(
-                "UPDATE pre_corr SET status='applied', at=?2 WHERE release_id=?1",
-                rusqlite::params![rid, now],
-            )?;
-            return Ok(CorrOutcome::Applied);
+        // The apply is three statements and they have to be ONE
+        // transaction, re-checked at its head. Two holes otherwise
+        // (both walked on the 2 Aug Opus sweep):
+        //
+        //   1. The old status update set 'applied' WITHOUT re-asserting
+        //      predb_id - so when the stored suggestion still pointed
+        //      at an earlier, higher-scoring pre Y (the upsert above
+        //      keeps the best row), the release wore pre X's title
+        //      while the 'applied' row named Y. Every joined read -
+        //      the suggestion list, a human confirm, a later revoke -
+        //      then ruled on the wrong pairing. The upsert below
+        //      carries the pre that was ACTUALLY applied, the same
+        //      shape `pre_assign` uses.
+        //   2. The settled check at the top of this fn is stale by
+        //      now: a human pre_reject/pre_assign landing mid-walk
+        //      (another handle, the CLI importer) must not be stomped
+        //      by an unguarded write. Re-checked inside the savepoint.
+        self.db.execute_batch("SAVEPOINT corr_apply")?;
+        let out = (|| -> rusqlite::Result<CorrOutcome> {
+            let settled: Option<String> = self
+                .db
+                .prepare_cached("SELECT status FROM pre_corr WHERE release_id=?1")?
+                .query_row([rid], |r| r.get(0))
+                .optional()?;
+            if matches!(settled.as_deref(), Some(s) if s != "suggested") {
+                return Ok(CorrOutcome::Nothing);
+            }
+            if self.apply_pre_name(rid, &best.pre.title, &source, now)? {
+                self.db.execute(
+                    "INSERT INTO pre_corr(release_id, predb_id, score, delta, ratio,
+                                          runner_up, status, at)
+                     VALUES(?1,?2,?3,?4,?5,?6,'applied',?7)
+                     ON CONFLICT(release_id) DO UPDATE SET
+                       predb_id=excluded.predb_id, score=excluded.score,
+                       delta=excluded.delta, ratio=excluded.ratio,
+                       runner_up=excluded.runner_up, status='applied', at=excluded.at
+                     WHERE pre_corr.status='suggested'",
+                    rusqlite::params![
+                        rid,
+                        best.pre.id,
+                        best.score.total,
+                        delta,
+                        best.score.ratio_milli as i64,
+                        runner_up,
+                        now
+                    ],
+                )?;
+                return Ok(CorrOutcome::Applied);
+            }
+            Ok(CorrOutcome::Suggested)
+        })();
+        match &out {
+            Ok(_) => self.db.execute_batch("RELEASE corr_apply")?,
+            Err(_) => {
+                let _ = self
+                    .db
+                    .execute_batch("ROLLBACK TO corr_apply; RELEASE corr_apply");
+            }
         }
-        Ok(CorrOutcome::Suggested)
+        out
     }
 
     /// Does this pre, scanning its own forward window, pick `rid` and
@@ -3675,7 +3793,7 @@ impl Index {
         rid: i64,
         n: usize,
     ) -> rusqlite::Result<Vec<(i64, String, i32, i64, u32, bool, String)>> {
-        let Some((facts, cands)) = self.corr_eval(rid)? else {
+        let Some((facts, cands, _saturated)) = self.corr_eval(rid)? else {
             return Ok(Vec::new());
         };
         Ok(cands
@@ -6343,6 +6461,256 @@ impl Index {
         Ok(others.len())
     }
 
+    /// Fold a split-container set's par2 SIDECAR row into its
+    /// container release. The posting habit behind it: the volumes go
+    /// up as `x.7z.001`..`x.7z.121` and the recovery set as `x.par2` +
+    /// `x.volNN+MM.par2`, so ingest builds TWO rows - the container on
+    /// `x.7z` and a par2-only twin on the bare `x`. Measured against
+    /// a 30M-row live index, this is the norm, not an edge case:
+    /// 9,261 of 10,490 container rows (88%)
+    /// have such a twin - 77,977 files, 4,289 GiB of spurious rows.
+    /// Folding also closes a scoring leak: with its par2 in a separate
+    /// row the container reads `par2_identified=false`, which opens
+    /// the 22-point hidden-par2 size band for bytes that provably
+    /// contain no hidden par2.
+    ///
+    /// The join is exact and narrow: same poster and group, twin stem
+    /// equals the container stem minus its `.7z`/`.zip`, twin carries
+    /// nothing but par2 files (sampled 400 of the 9,261: all pure).
+    ///
+    /// Unlike `split_merge` this walk can never finish for good -
+    /// ingest keeps producing new pairs, because a par2 filename gives
+    /// `release_stem` no way to see the `.7z` it belongs to. So the
+    /// cursor parks at the top id and follows it, and each stride
+    /// looks BOTH ways (a container in the stride, or a twin in the
+    /// stride whose container an earlier stride already passed), so a
+    /// pair folds no matter which row the walk meets first. It waits
+    /// for `split_merge` to complete so the containers exist to fold
+    /// into, and the first full lap bumps `predb_seed_gen` once: the
+    /// folded rows carry different sizes and a true `has_par2`, worth
+    /// re-correlating. Returns (pairs folded, par2 files moved, walk
+    /// caught up with the top id).
+    pub fn par2_sidecar_fold(&mut self) -> rusqlite::Result<(usize, usize, bool)> {
+        if self.kv_get("split_merge_done_v1").is_none() {
+            // Containers are partly split_merge's output; walking ids
+            // it has not folded yet would pass pairs it later creates.
+            return Ok((0, 0, false));
+        }
+        const STRIDE: i64 = 100_000;
+        let top: i64 = self
+            .db
+            .query_row("SELECT COALESCE(MAX(id),0) FROM releases", [], |r| r.get(0))?;
+        let mut cursor: i64 = self
+            .kv_get("par2_fold_cursor")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        // A cursor ABOVE the top id means the fold itself deleted the
+        // row it parked on (folding removes the bare twin release, and
+        // that twin can be the maximum). releases.id has no
+        // AUTOINCREMENT, so the next insert reuses exactly that id -
+        // and a strictly-greater scan would then never visit the
+        // recreated row while every later insert passed it by (Codex
+        // sweep 3 Aug M3). Rewind to the surviving top; the pair logic
+        // is idempotent, so re-walking a fringe of ids is only cheap
+        // re-reads.
+        if cursor > top {
+            cursor = top;
+            self.kv_set("par2_fold_cursor", &cursor.to_string())?;
+        }
+        if cursor >= top {
+            return Ok((0, 0, true));
+        }
+        let hi = cursor.saturating_add(STRIDE).min(top);
+        // Either half of a pair makes a row a candidate. The twin-side
+        // EXISTS probes are point lookups on the (stem, poster, grp)
+        // unique index, so the stride stays cheap.
+        let cands: Vec<(String, String, String)> = {
+            let mut stmt = self.db.prepare_cached(
+                "SELECT stem, poster, grp FROM releases AS t
+                  WHERE t.id>?1 AND t.id<=?2 AND t.junk>=70
+                    AND (t.stem LIKE '%.7z' OR t.stem LIKE '%.zip'
+                         OR EXISTS(SELECT 1 FROM releases c
+                                    WHERE c.stem IN (t.stem||'.7z', t.stem||'.zip')
+                                      AND c.poster=t.poster AND c.grp=t.grp
+                                      AND c.junk>=70))",
+            )?;
+            stmt.query_map([cursor, hi], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let (mut pairs, mut moved) = (0usize, 0usize);
+        for (stem, poster, grp) in cands {
+            let containers: Vec<String> = if stem.ends_with(".7z") || stem.ends_with(".zip") {
+                vec![stem]
+            } else {
+                // Twin side: its container wears one of the two exts.
+                vec![format!("{stem}.7z"), format!("{stem}.zip")]
+            };
+            for cstem in &containers {
+                let n = self.par2_sidecar_fold_pair(cstem, &poster, &grp)?;
+                if n > 0 {
+                    pairs += 1;
+                    moved += n;
+                    break;
+                }
+            }
+        }
+        // Clamped to the max id that SURVIVED this stride: folding
+        // deletes bare twin rows, and if one of them was the table
+        // maximum, parking the cursor on its id would let SQLite hand
+        // the same id to the next insert - a row a strictly-greater
+        // scan then never visits (Codex sweep 3 Aug M3). The head-side
+        // rewind above only helps when the recreation happens AFTER the
+        // next fold call; this clamp closes the delete-and-recreate-
+        // between-folds interleaving too.
+        let survived: i64 =
+            self.db
+                .query_row("SELECT COALESCE(MAX(id),0) FROM releases", [], |r| r.get(0))?;
+        self.kv_set("par2_fold_cursor", &hi.min(survived).to_string())?;
+        let done = hi >= top;
+        if done && self.kv_get("par2_fold_lap_v1").is_none() {
+            self.kv_set("par2_fold_lap_v1", "1")?;
+            // The backlog lap is what moves thousands of sizes at
+            // once; later steady-state folds ride the live legs.
+            let g: u64 = self
+                .kv_get("predb_seed_gen")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            self.kv_set("predb_seed_gen", &(g + 1).to_string())?;
+        }
+        Ok((pairs, moved, done))
+    }
+
+    /// Fold one container's par2 twin, if it has one. Returns the par2
+    /// files moved in (0 = no twin, twin not purely par2, or a fed
+    /// name froze the pair).
+    fn par2_sidecar_fold_pair(
+        &mut self,
+        cstem: &str,
+        poster: &str,
+        grp: &str,
+    ) -> rusqlite::Result<usize> {
+        let Some(base) = cstem
+            .strip_suffix(".7z")
+            .or_else(|| cstem.strip_suffix(".zip"))
+            .filter(|b| !b.is_empty())
+        else {
+            return Ok(0);
+        };
+        let read = |db: &rusqlite::Connection,
+                    sql: &str,
+                    stem: &str|
+         -> rusqlite::Result<Option<SplitMember>> {
+            db.prepare_cached(sql)?
+                .query_row(rusqlite::params![stem, poster, grp], |r| {
+                    Ok(SplitMember {
+                        id: r.get(0)?,
+                        stem: r.get(1)?,
+                        complete: r.get(2)?,
+                        has_par2: r.get(3)?,
+                        first_posted: r.get(4)?,
+                        first_seen: r.get(5)?,
+                        have_parts: r.get(6)?,
+                        need_parts: r.get(7)?,
+                        pre_named: !r.get::<_, String>(8)?.is_empty(),
+                    })
+                })
+                .optional()
+        };
+        const COLS: &str = "SELECT id, stem, complete, has_par2, first_posted, first_seen,
+                        have_parts, need_parts, pre_title
+                   FROM releases";
+        // The junk>=70 scope rides on the CONTAINER: those are the
+        // obfuscated rows whose size is load-bearing correlation
+        // evidence. (The twin-side arm of the walk already required
+        // it; rechecking here keeps both arms identical.)
+        let Some(cont) = read(
+            &self.db,
+            &format!("{COLS} WHERE stem=?1 AND poster=?2 AND grp=?3 AND junk>=70"),
+            cstem,
+        )?
+        else {
+            return Ok(0);
+        };
+        let Some(twin) = read(
+            &self.db,
+            &format!("{COLS} WHERE stem=?1 AND poster=?2 AND grp=?3"),
+            base,
+        )?
+        else {
+            return Ok(0);
+        };
+        if cont.pre_named || twin.pre_named {
+            // Somebody (feed, correlation, a human) named a half.
+            // Merging under it would silently extend that claim to
+            // bytes it never covered.
+            return Ok(0);
+        }
+        // The twin must be NOTHING but par2. One content file means it
+        // is a genuine release that happens to share the base name.
+        let (tfiles, nonpar2): (i64, i64) = self.db.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(LOWER(filename) NOT LIKE '%.par2'),0)
+               FROM files WHERE release_id=?1",
+            [twin.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if tfiles == 0 || nonpar2 > 0 {
+            return Ok(0);
+        }
+        let tx = self.db.unchecked_transaction()?;
+        // Files move to the container; a duplicate filename keeps the
+        // container's copy.
+        tx.execute(
+            "UPDATE OR IGNORE files SET release_id=?1 WHERE release_id=?2",
+            [cont.id, twin.id],
+        )?;
+        tx.execute("DELETE FROM files WHERE release_id=?1", [twin.id])?;
+        // Stale audit rows: the twin's suggestions die with it, and
+        // the container's were scored against a size and a
+        // par2_identified flag that are both wrong now.
+        tx.execute(
+            "DELETE FROM pre_corr WHERE release_id IN (?1, ?2)",
+            [cont.id, twin.id],
+        )?;
+        // rel_fts_ad covers this deletion; the kept stem is untouched,
+        // so no manual FTS maintenance this time.
+        tx.execute("DELETE FROM releases WHERE id=?1", [twin.id])?;
+        let (total, nfiles, nexe): (i64, i64, i64) = tx.query_row(
+            &format!(
+                "SELECT COALESCE(SUM(bytes),0), COUNT(*),
+                        COALESCE(SUM({EXE_FILE_SQL}),0)
+                   FROM files WHERE release_id=?1"
+            ),
+            [cont.id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        let fp = [cont.first_posted, twin.first_posted]
+            .into_iter()
+            .filter(|v| *v > 0)
+            .min()
+            .unwrap_or(0);
+        let p = crate::categories::classify(cstem, &self.custom);
+        tx.execute(
+            "UPDATE releases
+                SET total_bytes=?2, files=?3, complete=?4, has_par2=1,
+                    first_posted=?5, first_seen=?6, have_parts=?7, need_parts=?8,
+                    junk=?9
+              WHERE id=?1",
+            rusqlite::params![
+                cont.id,
+                total,
+                nfiles,
+                cont.complete && twin.complete,
+                fp,
+                cont.first_seen.min(twin.first_seen),
+                cont.have_parts + twin.have_parts,
+                cont.need_parts + twin.need_parts,
+                junk_score(cstem, &p, total.max(0) as u64, nexe > 0),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(tfiles as usize)
+    }
+
     /// M31a: age-based retention. Deletes releases older than the window,
     /// EXCEPT unknown-date rows (`first_posted` 0, whose OVER Date failed
     /// to parse) and titles the user has hidden (the Hidden panel must
@@ -6684,7 +7052,7 @@ impl Index {
     /// abort matters most, and on the multi-GB index this exists for it
     /// is small. Interrupting still helps and still costs nothing; it is
     /// just not the guarantee the name suggests.
-    pub fn interrupt_handle(&self) -> rusqlite::InterruptHandle {
+    pub fn interrupt_handle(&self) -> InterruptHandle {
         self.db.get_interrupt_handle()
     }
 
@@ -12377,6 +12745,84 @@ mod predb_tests {
         teardown(&d, ix);
     }
 
+    /// 2 Aug Opus sweep: the applied status update did not re-assert
+    /// WHICH pre it applied. A stored suggestion pointing at an earlier,
+    /// higher-scoring pre survives the refresh upsert (score gate), and
+    /// the release then wore pre X's title while its 'applied' verdict
+    /// row named pre Y - so confirms, rejects and revokes all ruled on
+    /// the wrong pairing. The verdict row must end pointing at the pre
+    /// whose title was actually applied.
+    #[test]
+    fn the_applied_verdict_names_the_pre_that_was_applied() {
+        let d = dir("corr-applied-id");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        ix.predb_store(
+            &[
+                tpre(
+                    "Some.Film.2026.1080p.WEB.H264-GRP",
+                    "X264-HD",
+                    4_900_000_000,
+                    1000,
+                ),
+                // A decoy in another section entirely: never a candidate
+                // for this release, but a valid predb row to point at.
+                tpre("Other.Album.2026-GRP", "MP3", 100_000_000, 500),
+            ],
+            1000,
+        )
+        .unwrap();
+        ix.ingest(
+            "alt.binaries.x264",
+            &[overd(
+                r#""aQ3xY7Bm2ZpK4L.part01.rar" yEnc (1/1)"#,
+                "c1",
+                5_000_000_000,
+                4600,
+            )],
+            5000,
+        )
+        .unwrap();
+        let rid = ix.search("", 10).unwrap()[0].id;
+        let decoy: i64 = ix
+            .db
+            .query_row(
+                "SELECT id FROM predb WHERE title='Other.Album.2026-GRP'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // The stale higher-scoring suggestion: the refresh upsert keeps
+        // it (excluded.score >= pre_corr.score fails), exactly the state
+        // a drifted re-walk runs in.
+        ix.db
+            .execute(
+                "INSERT INTO pre_corr(release_id, predb_id, score, delta, ratio,
+                                      runner_up, status, at)
+                 VALUES(?1, ?2, 999, 0, 1000, 0, 'suggested', 4700)",
+                rusqlite::params![rid, decoy],
+            )
+            .unwrap();
+        let (_, _, applied) = ix.predb_corr_sweep(100, true, 5000).unwrap();
+        assert_eq!(applied, 1);
+        let r = &ix.search("", 10).unwrap()[0];
+        assert_eq!(r.pre_title, "Some.Film.2026.1080p.WEB.H264-GRP");
+        let (row_pre, status): (String, String) = ix
+            .db
+            .query_row(
+                "SELECT p.title, c.status FROM pre_corr c
+                  JOIN predb p ON p.id=c.predb_id WHERE c.release_id=?1",
+                [rid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "applied");
+        assert_eq!(
+            row_pre, "Some.Film.2026.1080p.WEB.H264-GRP",
+            "the verdict row must name the pre whose title the release wears"
+        );
+        teardown(&d, ix);
+    }
+
     /// Two same-size pres of the SAME title (REPACK) in the window: the
     /// sibling rule caps at SUGGEST categorically - a human picks
     /// REPACK vs original.
@@ -13103,6 +13549,323 @@ mod predb_tests {
                 .unwrap(),
             2
         );
+        teardown(&d, ix);
+    }
+
+    /// Insert one release row with `nfiles` files of `each` bytes,
+    /// named by `namer(i)`. Returns the release id.
+    fn sidecar_row(
+        ix: &Index,
+        stem: &str,
+        junk: i64,
+        first_posted: i64,
+        nfiles: usize,
+        each: i64,
+        namer: impl Fn(usize) -> String,
+    ) -> i64 {
+        ix.db
+            .execute(
+                "INSERT INTO releases(stem, poster, grp, total_bytes, files, complete,
+                                      has_par2, first_posted, first_seen, kind, junk)
+                 VALUES(?1, 'p@x', 'alt.binaries.x264', ?2, ?3, 1, 0, ?4, 5000, 'other', ?5)",
+                rusqlite::params![
+                    stem,
+                    each * nfiles as i64,
+                    nfiles as i64,
+                    first_posted,
+                    junk
+                ],
+            )
+            .unwrap();
+        let rid = ix.db.last_insert_rowid();
+        for i in 0..nfiles {
+            ix.db
+                .execute(
+                    "INSERT INTO files(release_id, filename, total_parts, bytes)
+                     VALUES(?1, ?2, 1, ?3)",
+                    rusqlite::params![rid, namer(i), each],
+                )
+                .unwrap();
+        }
+        rid
+    }
+
+    /// The par2-sidecar fold, both halves present: the par2-only twin
+    /// row disappears into its container, which gains the files, the
+    /// bytes, the earlier post date and a TRUE has_par2 - the flag
+    /// that closes the hidden-par2 scoring band for it. Stale
+    /// correlation rows on either half die with the fold.
+    #[test]
+    fn par2_sidecar_folds_into_its_container() {
+        let d = dir("sidecar-fold");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        let cid = sidecar_row(&ix, "qXv93KpL2.7z", 75, 4700, 3, 1_000_000_000, |i| {
+            format!("qXv93KpL2.7z.{:03}", i + 1)
+        });
+        let tid = sidecar_row(&ix, "qXv93KpL2", 75, 4650, 2, 100_000_000, |i| {
+            format!("qXv93KpL2.vol{i:02}+02.par2")
+        });
+        for rid in [cid, tid] {
+            ix.db
+                .execute(
+                    "INSERT INTO pre_corr(release_id, predb_id, score, delta, at)
+                     VALUES(?1, 9, 85, 60, 5100)",
+                    [rid],
+                )
+                .unwrap();
+        }
+        // The fold waits for split_merge (its containers may not exist
+        // before that walk finishes)...
+        assert_eq!(ix.par2_sidecar_fold().unwrap(), (0, 0, false));
+        assert!(ix.split_merge(6000).unwrap().2);
+        // ...then folds the pair in one stride.
+        assert_eq!(ix.par2_sidecar_fold().unwrap(), (1, 2, true));
+        let hits = ix.search("qXv93KpL2", 10).unwrap();
+        assert_eq!(hits.len(), 1, "the twin row is gone, from FTS too");
+        let r = &hits[0];
+        assert_eq!(r.stem, "qXv93KpL2.7z", "the container stem is kept");
+        assert!(r.has_par2, "the sidecar's par2 now counts as identified");
+        assert_eq!(r.total_bytes, 3_200_000_000);
+        assert_eq!(r.files, 5);
+        assert_eq!(r.first_posted, 4650, "the earlier half's clock");
+        let corr: i64 = ix
+            .db
+            .query_row("SELECT COUNT(*) FROM pre_corr", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(corr, 0, "both halves' stale correlation rows died");
+        // Parked: the next call is two kv reads and a MAX(id).
+        assert_eq!(ix.par2_sidecar_fold().unwrap(), (0, 0, true));
+        teardown(&d, ix);
+    }
+
+    /// Codex sweep 3 Aug M3: folding deletes the bare twin row, and
+    /// when that twin held the table's MAXIMUM id, SQLite hands the
+    /// same id to the next insert. A cursor parked on the deleted id
+    /// with a strictly-greater scan would never visit the recreated
+    /// row - the cursor must come to rest on the surviving top.
+    #[test]
+    fn a_recreated_twin_at_the_deleted_maximum_id_still_folds() {
+        let d = dir("sidecar-fold-reuse");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        let cid = sidecar_row(&ix, "zRq77TbN5.7z", 75, 4700, 3, 1_000_000_000, |i| {
+            format!("zRq77TbN5.7z.{:03}", i + 1)
+        });
+        let tid = sidecar_row(&ix, "zRq77TbN5", 75, 4650, 2, 100_000_000, |i| {
+            format!("zRq77TbN5.vol{i:02}+02.par2")
+        });
+        assert!(tid > cid, "the twin must be the maximum for this test");
+        assert!(ix.split_merge(6000).unwrap().2);
+        assert_eq!(ix.par2_sidecar_fold().unwrap().0, 1, "first fold");
+        let cursor: i64 = ix.kv_get("par2_fold_cursor").unwrap().parse().unwrap();
+        assert!(
+            cursor < tid,
+            "cursor parked on the deleted maximum id {tid}: {cursor}"
+        );
+        // A late article from the still-uploading recovery twin
+        // recreates the row - at exactly the reused maximum id.
+        let tid2 = sidecar_row(&ix, "zRq77TbN5", 75, 4800, 1, 50_000_000, |_| {
+            "zRq77TbN5.vol07+08.par2".into()
+        });
+        assert_eq!(tid2, tid, "SQLite reuses the deleted maximum id");
+        let (pairs, _, done) = ix.par2_sidecar_fold().unwrap();
+        assert!(done);
+        assert_eq!(pairs, 1, "the recreated twin at the reused id folds");
+        assert!(
+            ix.search("zRq77TbN5", 10)
+                .unwrap()
+                .iter()
+                .all(|r| r.stem == "zRq77TbN5.7z"),
+            "no bare twin row survives"
+        );
+        teardown(&d, ix);
+    }
+
+    /// Codex sweep 3 Aug M2: predb pruning must not leave dangling
+    /// pre_corr identities - an orphaned SUGGESTED row starves every
+    /// future lower-scoring valid candidate (the upsert takes only
+    /// >= scores), and a dangling reference in a settled row can
+    /// rebind to an unrelated pre once SQLite reuses the rowid.
+    #[test]
+    fn pruning_a_pre_releases_its_correlation_identity() {
+        let d = dir("prune-precorr");
+        let ix = Index::open(&d.join("index.db")).unwrap();
+        ix.db
+            .execute(
+                "INSERT INTO predb(id, title, seen_at) VALUES
+                   (1, 'Old.Release-GRP', 100), (2, 'Live.Release-GRP', 9000)",
+                [],
+            )
+            .unwrap();
+        ix.db
+            .execute(
+                "INSERT INTO pre_corr(release_id, predb_id, score, delta, status, at) VALUES
+                   (10, 1, 90, 60, 'suggested', 100),
+                   (11, 1, 88, 60, 'rejected', 100),
+                   (12, 2, 70, 60, 'suggested', 100)",
+                [],
+            )
+            .unwrap();
+        // Age-prune: cutoff at seen_at < 5000 takes pre 1, keeps pre 2.
+        assert_eq!(ix.predb_prune(0, 1000, 6000).unwrap(), 1);
+        // The orphaned suggestion is gone - a fresh score-85 candidate
+        // for release 10 must not be starved by a ghost score-90...
+        let suggested: Vec<(i64, i64)> = ix
+            .db
+            .prepare("SELECT release_id, predb_id FROM pre_corr WHERE status='suggested'")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            suggested,
+            vec![(12, 2)],
+            "only the live pre's suggestion survives"
+        );
+        // ...and the settled audit row keeps its verdict but drops the
+        // reference, so a reused rowid can never rebind or be back-fed.
+        let (pid, status): (i64, String) = ix
+            .db
+            .query_row(
+                "SELECT predb_id, status FROM pre_corr WHERE release_id=11",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((pid, status.as_str()), (0, "rejected"));
+        teardown(&d, ix);
+    }
+
+    /// Codex sweep 2, 3 Aug M5: the orphan repair used to run only when
+    /// the SAME call had just deleted a pre. A store that already holds
+    /// dangling rows - left by a crash between the delete and the
+    /// repair, or by the pre-transaction version failing partway - then
+    /// healed only if some later prune happened to delete something,
+    /// and a store inside its retention window with a steady row count
+    /// never deletes anything again. So the repair has to be
+    /// unconditional, and this seeds exactly that state: dangling rows,
+    /// nothing to prune.
+    #[test]
+    fn a_prune_that_deletes_nothing_still_heals_dangling_identities() {
+        let d = dir("prune-selfheal");
+        let ix = Index::open(&d.join("index.db")).unwrap();
+        // One live pre, well inside any retention window.
+        ix.db
+            .execute(
+                "INSERT INTO predb(id, title, seen_at) VALUES (7, 'Live.Release-GRP', 9000)",
+                [],
+            )
+            .unwrap();
+        // The wreckage: both rows point at pre 4, which does not exist.
+        ix.db
+            .execute(
+                "INSERT INTO pre_corr(release_id, predb_id, score, delta, status, at) VALUES
+                   (20, 4, 95, 60, 'suggested', 100),
+                   (21, 4, 88, 60, 'confirmed', 100),
+                   (22, 7, 70, 60, 'suggested', 100)",
+                [],
+            )
+            .unwrap();
+        // Nothing is old enough and the cap is not reached, so this
+        // prune deletes zero rows - the exact call that used to skip
+        // the repair.
+        assert_eq!(ix.predb_prune(1000, 1000, 9500).unwrap(), 0);
+
+        let suggested: Vec<(i64, i64)> = ix
+            .db
+            .prepare("SELECT release_id, predb_id FROM pre_corr WHERE status='suggested'")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            suggested,
+            vec![(22, 7)],
+            "the orphaned suggestion is gone and the live one is untouched"
+        );
+        let (pid, status): (i64, String) = ix
+            .db
+            .query_row(
+                "SELECT predb_id, status FROM pre_corr WHERE release_id=21",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (pid, status.as_str()),
+            (0, "confirmed"),
+            "the settled row keeps its verdict and drops the reference"
+        );
+        teardown(&d, ix);
+    }
+
+    /// The two refusals: a twin with any non-par2 content is a real
+    /// release sharing the base name, and a fed name on either half
+    /// freezes the pair - extending a name to bytes it never covered
+    /// is exactly the wrong-name shape.
+    #[test]
+    fn an_impure_or_named_twin_blocks_the_sidecar_fold() {
+        let d = dir("sidecar-blocked");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        // Pair 1: the twin has a content file among the par2s.
+        sidecar_row(&ix, "aWk40RzQ7.7z", 75, 4700, 2, 1_000_000_000, |i| {
+            format!("aWk40RzQ7.7z.{:03}", i + 1)
+        });
+        sidecar_row(&ix, "aWk40RzQ7", 75, 4650, 2, 100_000_000, |i| {
+            if i == 0 {
+                "aWk40RzQ7.nfo".into()
+            } else {
+                "aWk40RzQ7.vol01+02.par2".into()
+            }
+        });
+        // Pair 2: the container already wears a fed name.
+        let named = sidecar_row(&ix, "bTn81LmX4.7z", 75, 4700, 2, 1_000_000_000, |i| {
+            format!("bTn81LmX4.7z.{:03}", i + 1)
+        });
+        ix.db
+            .execute(
+                "UPDATE releases SET pre_title='Somebody.Named.This-GRP', pre_source='predb'
+                  WHERE id=?1",
+                [named],
+            )
+            .unwrap();
+        sidecar_row(&ix, "bTn81LmX4", 75, 4650, 1, 100_000_000, |_| {
+            "bTn81LmX4.vol01+02.par2".into()
+        });
+        assert!(ix.split_merge(6000).unwrap().2);
+        assert_eq!(ix.par2_sidecar_fold().unwrap(), (0, 0, true));
+        let n: i64 = ix
+            .db
+            .query_row("SELECT COUNT(*) FROM releases", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 4, "all four rows survive untouched");
+        teardown(&d, ix);
+    }
+
+    /// The rolling walk's reverse arm: the container's stride passes
+    /// before its twin exists (ingest produces new pairs forever, and
+    /// article order guarantees nothing). When the twin lands the walk
+    /// meets it twin-first and still finds the container behind it.
+    #[test]
+    fn a_late_twin_still_folds_after_the_walk_parked() {
+        let d = dir("sidecar-late");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        assert!(ix.split_merge(6000).unwrap().2);
+        sidecar_row(&ix, "zRq57TvB9.7z", 75, 4700, 2, 1_000_000_000, |i| {
+            format!("zRq57TvB9.7z.{:03}", i + 1)
+        });
+        // The walk parks at the top id with the container unpaired.
+        assert_eq!(ix.par2_sidecar_fold().unwrap(), (0, 0, true));
+        // The twin arrives above the parked cursor.
+        sidecar_row(&ix, "zRq57TvB9", 75, 4650, 1, 100_000_000, |_| {
+            "zRq57TvB9.vol03+04.par2".into()
+        });
+        assert_eq!(ix.par2_sidecar_fold().unwrap(), (1, 1, true));
+        let r = &ix.search("zRq57TvB9", 10).unwrap()[0];
+        assert_eq!(r.stem, "zRq57TvB9.7z");
+        assert!(r.has_par2);
+        assert_eq!(r.files, 3);
         teardown(&d, ix);
     }
 
