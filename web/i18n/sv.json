@@ -632,6 +632,8 @@
  "prov.stat.standby": "standby",
  "prov.stat.standby.title": "en backup-backbone som poolen inte har behövt anlita för den här nedladdningen",
  "prov.title": "Providers",
+ "prov.tuned": "automatiskt justerat från {m}",
+ "prov.tuned.title": "Den automatiska justeringen mätte att den här leverantören är snabbast vid {n} anslutningar, så nedladdningar använder {n} i stället för de {m} du ställt in: att begära fler än leverantören ger är ofta flera gånger långsammare. Stäng av det i Inställningar, under Justera anslutningar automatiskt.",
  "queue.act.connecting": "ansluter till {s}",
  "queue.act.downloading": "hämtar",
  "queue.act.extracting": "packar upp",

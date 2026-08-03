@@ -632,6 +632,8 @@
  "prov.stat.standby": "em reserva",
  "prov.stat.standby.title": "um backbone de backup ao qual o pool não precisou recorrer para este download",
  "prov.title": "Provedores",
+ "prov.tuned": "ajustado automaticamente a partir de {m}",
+ "prov.tuned.title": "O ajuste automático mediu que este fornecedor é mais rápido com {n} ligações, por isso as transferências usam {n} em vez das {m} que definiu: pedir a um fornecedor mais do que ele concede costuma ser várias vezes mais lento. Pode desligar nas Definições, em Ajuste automático de ligações.",
  "queue.act.connecting": "conectando a {s}",
  "queue.act.downloading": "baixando",
  "queue.act.extracting": "descompactando",

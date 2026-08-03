@@ -642,6 +642,8 @@
  "prov.stat.standby": "záloha",
  "prov.stat.standby.title": "záložní páteřní síť, kterou pool pro toto stahování nemusel využít",
  "prov.title": "Poskytovatelé",
+ "prov.tuned": "automaticky sníženo z {m}",
+ "prov.tuned.title": "Automatické ladění naměřilo, že tento poskytovatel je nejrychlejší při {n} připojeních, takže stahování používá {n} místo vámi nastavených {m}: žádat o víc, než poskytovatel povolí, bývá několikanásobně pomalejší. Vypnete to v Nastavení, v části Automatické ladění připojení.",
  "queue.act.connecting": "připojování k {s}",
  "queue.act.downloading": "stahování",
  "queue.act.extracting": "rozbalování",

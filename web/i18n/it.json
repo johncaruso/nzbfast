@@ -632,6 +632,8 @@
  "prov.stat.standby": "di riserva",
  "prov.stat.standby.title": "un backbone di backup a cui il pool non ha dovuto ricorrere per questo download",
  "prov.title": "Provider",
+ "prov.tuned": "regolato automaticamente da {m}",
+ "prov.tuned.title": "La regolazione automatica ha misurato che questo provider è più veloce con {n} connessioni, quindi i download usano {n} invece delle {m} impostate: chiedere a un provider più di quante ne conceda è spesso diverse volte più lento. Puoi disattivarla nelle Impostazioni, sotto Regolazione automatica delle connessioni.",
  "queue.act.connecting": "connessione a {s}",
  "queue.act.downloading": "download in corso",
  "queue.act.extracting": "estrazione in corso",

@@ -1078,17 +1078,28 @@ pub(crate) async fn get_with_progress(
     } else {
         Default::default()
     };
+    // Say what the cap IS and what it is capping, not just a bare
+    // number. `connection auto-tune: news.example.com 6` was the entire
+    // explanation a v1.0.14 tester had for why the 24 he had typed into
+    // Settings never took effect, and it read as a status line rather
+    // than as "something overrode you". Name the asked-for count and
+    // the switch that turns it off.
     let tuned_note: Vec<String> = cfg_all
         .servers
         .iter()
         .filter_map(|s| {
             let t = tuned.get(&s.host)?;
-            (!t.suspect && t.connections > 0 && (t.connections as u32) < s.connections.max(1))
-                .then(|| format!("{} {}", s.host, t.connections))
+            let asked = crate::conntune::effective_limit(connections, s.connections);
+            (!t.suspect && t.connections > 0 && t.connections < asked)
+                .then(|| format!("{} capped at {} of {asked}", s.host, t.connections))
         })
         .collect();
     if !tuned_note.is_empty() {
-        println!("  connection auto-tune: {}", tuned_note.join(" · "));
+        println!(
+            "  connection auto-tune: {} (measured sweet spot; \
+             Settings → Auto-tune connections turns this off)",
+            tuned_note.join(" · ")
+        );
     }
     // Config is reloaded for every daemon job, while the warm pool lives
     // across jobs. Reconcile the cache before building the new fleet so

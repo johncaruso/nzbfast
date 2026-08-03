@@ -642,6 +642,8 @@
  "prov.stat.standby": "u pripravnosti",
  "prov.stat.standby.title": "rezervna okosnica koju pool nije morao da pozove za ovo preuzimanje",
  "prov.title": "Provajderi",
+ "prov.tuned": "аутоматски подешено са {m}",
+ "prov.tuned.title": "Аутоматско подешавање је измерило да је овај провајдер најбржи при {n} веза, па преузимања користе {n} уместо подешених {m}: тражити више него што провајдер одобрава често је неколико пута спорије. Искључите то у Подешавањима, под Аутоматско подешавање веза.",
  "queue.act.connecting": "povezivanje sa {s}",
  "queue.act.downloading": "preuzimanje",
  "queue.act.extracting": "raspakivanje",

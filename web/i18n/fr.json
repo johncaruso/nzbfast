@@ -632,6 +632,8 @@
  "prov.stat.standby": "en réserve",
  "prov.stat.standby.title": "un backbone de secours que le pool n'a pas eu à solliciter pour ce téléchargement",
  "prov.title": "Fournisseurs",
+ "prov.tuned": "réglé automatiquement depuis {m}",
+ "prov.tuned.title": "Le réglage automatique a mesuré que ce fournisseur est le plus rapide à {n} connexions, donc les téléchargements utilisent {n} plutôt que les {m} que vous avez définies : demander à un fournisseur plus qu'il n'en accorde est souvent plusieurs fois plus lent. Désactivez-le dans les Réglages, sous Réglage automatique des connexions.",
  "queue.act.connecting": "connexion à {s}",
  "queue.act.downloading": "téléchargement",
  "queue.act.extracting": "décompression",

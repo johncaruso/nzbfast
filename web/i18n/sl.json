@@ -652,6 +652,8 @@
  "prov.stat.standby": "v pripravljenosti",
  "prov.stat.standby.title": "rezervna hrbtenica, ki je bazen za ta prenos še ni potreboval",
  "prov.title": "Ponudniki",
+ "prov.tuned": "samodejno prilagojeno z {m}",
+ "prov.tuned.title": "Samodejno prilagajanje je izmerilo, da je ta ponudnik najhitrejši pri {n} povezavah, zato prenosi uporabljajo {n} namesto nastavljenih {m}: zahtevati več, kot ponudnik dovoli, je pogosto večkrat počasneje. Izklopite ga v Nastavitvah, pod Samodejno prilagajanje povezav.",
  "queue.act.connecting": "povezovanje s {s}",
  "queue.act.downloading": "prenašanje",
  "queue.act.extracting": "razpakiranje",

@@ -642,6 +642,8 @@
  "prov.stat.standby": "rezerwa",
  "prov.stat.standby.title": "zapasowy szkielet, po który pula nie musiała sięgnąć przy tym pobieraniu",
  "prov.title": "Dostawcy",
+ "prov.tuned": "automatycznie dostrojono z {m}",
+ "prov.tuned.title": "Automatyczne strojenie zmierzyło, że ten dostawca jest najszybszy przy {n} połączeniach, więc pobierania używają {n} zamiast ustawionych {m}: proszenie dostawcy o więcej, niż przyznaje, bywa kilkukrotnie wolniejsze. Wyłączysz to w Ustawieniach, w sekcji Automatyczne strojenie połączeń.",
  "queue.act.connecting": "łączenie z {s}",
  "queue.act.downloading": "pobieranie",
  "queue.act.extracting": "rozpakowywanie",

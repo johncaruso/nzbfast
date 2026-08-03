@@ -632,6 +632,8 @@
  "prov.stat.standby": "valmiustila",
  "prov.stat.standby.title": "varakäytön backbone, jota ei ole tarvinnut käyttää tähän lataukseen",
  "prov.title": "Palveluntarjoajat",
+ "prov.tuned": "automaattisesti säädetty arvosta {m}",
+ "prov.tuned.title": "Automaattinen säätö mittasi, että tämä palveluntarjoaja on nopein {n} yhteydellä, joten lataukset käyttävät {n} asettamasi {m} sijaan: useamman pyytäminen kuin tarjoaja myöntää on usein moninkertaisesti hitaampaa. Voit kytkeä sen pois Asetuksista kohdasta Säädä yhteydet automaattisesti.",
  "queue.act.connecting": "yhdistetään palvelimeen {s}",
  "queue.act.downloading": "ladataan",
  "queue.act.extracting": "puretaan",

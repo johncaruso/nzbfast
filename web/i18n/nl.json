@@ -632,6 +632,8 @@
  "prov.stat.standby": "stand-by",
  "prov.stat.standby.title": "een back-up-backbone die de pool voor deze download nog niet heeft hoeven aanspreken",
  "prov.title": "Providers",
+ "prov.tuned": "automatisch afgesteld vanaf {m}",
+ "prov.tuned.title": "Automatisch afstellen heeft gemeten dat deze provider het snelst is bij {n} verbindingen, dus downloads gebruiken {n} in plaats van de {m} die je hebt ingesteld: meer vragen dan een provider toestaat is vaak vele malen trager. Zet het uit bij Instellingen, onder Verbindingen automatisch afstellen.",
  "queue.act.connecting": "verbinden met {s}",
  "queue.act.downloading": "downloaden",
  "queue.act.extracting": "uitpakken",

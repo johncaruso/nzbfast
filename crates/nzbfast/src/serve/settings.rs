@@ -1012,6 +1012,15 @@ pub(super) fn apply_setting(
         "connections" => {
             let n = uint()?.clamp(1, 999) as usize;
             d.connections.store(n, Ordering::Relaxed);
+            // Raising this number has to be able to beat a stored
+            // auto-tune knee, or it is a control that does nothing: a
+            // v1.0.14 tester set 22, then 24, restarted, tried a fresh
+            // NZB, and every job still ran at the knee of 6 the tuner
+            // had measured once. A knee is a measurement taken UNDER a
+            // ceiling, so a higher ceiling retires it pending a
+            // re-probe. Lowering the number changes nothing here -
+            // min(configured, knee) already handles that direction.
+            crate::conntune::reopen_for_install(&d.cfg_path, n);
             (true, json!(n))
         }
         "window" => {

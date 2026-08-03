@@ -131,6 +131,16 @@ pub(in crate::serve) fn dispatch(
                             if let Ok(c) = nzbkit::config::Config::load(ctx.cfg_path) {
                                 d.push_idle_release_policies(&c.servers);
                             }
+                            // Raising a server's own connection count
+                            // is the other half of the same control as
+                            // the global setting, and has to retire a
+                            // stored knee measured under the lower
+                            // ceiling for the same reason. See
+                            // conntune::reopen_low_knees.
+                            crate::conntune::reopen_for_install(
+                                ctx.cfg_path,
+                                d.connections.load(Ordering::Relaxed),
+                            );
                             json!({"status": true, "count": servers.len()})
                         }
                         Err(e) => json!({"status": false, "error": e.to_string()}),
@@ -631,6 +641,11 @@ pub(in crate::serve) fn dispatch(
                                         // sees every rung in the UI -
                                         // their call, applied as-is.
                                         suspect: false,
+                                        limit: crate::conntune::effective_limit(
+                                            d.connections.load(Ordering::Relaxed),
+                                            srv.connections,
+                                        ),
+                                        v: crate::conntune::SCHEMA,
                                     },
                                 );
                                 // Manual runs re-judge line-speed

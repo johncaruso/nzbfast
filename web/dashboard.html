@@ -4609,9 +4609,21 @@ function pipeline(s,mbps,queued,done,failed){
         else if(tried>0)         stat=` · <span class="dim" title="${escA(t('prov.stat.idle.title','has some of this content, but other backbones are serving the pool right now'))}">${t('prov.stat.idle','idle')}</span>`;
         else                     stat=` · <span class="dim" title="${escA(t('prov.stat.standby.title','a backup backbone the pool has not had to call on for this download'))}">${t('prov.stat.standby','standby')}</span>`;
       }
+      // Why is the budget lower than the number in Settings? Because
+      // auto-tune measured a sweet spot and capped it. Without this the
+      // pane reads a flat "6/6 conns" and a user who has typed 24 into
+      // Settings has no way at all to connect the two - which is the
+      // support thread this line closes (v1.0.14 field report: 6 of 24,
+      // ~25 MB/s on a 900 Mbps line, every job). Shown only when a knee
+      // is genuinely IN FORCE: toggle on, knee not suspect, and the
+      // budget actually at or below it.
+      const kn=srvAutoConn?srvTuned[sv.host]:null, asked=srvAsked[sv.host]||0;
+      const tuned=(kn&&!kn.suspect&&kn.connections>0&&kn.connections<asked&&sv.budget<=kn.connections)
+        ? ` · <span class="dim" title="${escA(t('prov.tuned.title','auto-tune measured this provider is fastest at {n} connections, so downloads use {n} rather than the {m} you set: asking a provider for more than it will grant is often several times slower. Turn it off in Settings, under Auto-tune connections.',{n:kn.connections,m:asked}))}">${t('prov.tuned','auto-tuned from {m}',{m:asked})}</span>`
+        : '';
       return `<div class="srv" data-host="${escA(sv.host)}">
         <span class="host" title="${escA(sv.host)}"><span class="sw" aria-hidden="true" style="background:${col}"></span>${esc(sv.host.replace(/^(news|reader)\./,''))}</span>
-        <span><span class="rate">${fmtRate(r)}</span><br><span class="util">${sv.connected}/${sv.budget} ${t('prov.conns','conns')} · ${util}%${comp}${stat}</span></span>
+        <span><span class="rate">${fmtRate(r)}</span><br><span class="util">${sv.connected}/${sv.budget} ${t('prov.conns','conns')} · ${util}%${comp}${tuned}${stat}</span></span>
         <span class="mono dim">${share.toFixed(0)}%</span>
         <span class="gb">${gb(sv.bytes)} ${unit('GB')}</span>${detail}</div>`;
     }).join(''));
@@ -7694,6 +7706,17 @@ addEventListener('drop', e=>{
 
 // --- Settings view (M16): read get_config, write mode=config / server_* ---
 let inSettings=false, srvList=[], srvEditIdx=-1, srvTuned={}, srvAutoConn=false;
+// host → the connection count a job would ask this server for if nothing
+// capped it: the smaller of the global Connections setting and the
+// server's own configured count. The Providers card needs it to say
+// "auto-tuned from 24" instead of an unexplained "6/6".
+let srvAsked={};
+function noteServerConfig(c){
+  srvList=c.servers||[]; srvTuned=c.conntune||{}; srvAutoConn=!!c.auto_connections;
+  const g=+c.connections||0;
+  srvAsked={};
+  for(const s of srvList) srvAsked[s.host]=Math.min(g||s.connections||0, s.connections||0)||0;
+}
 // Switch between the two views this page owns. Takes an explicit
 // destination rather than toggling, so the same call always lands in the
 // same place - the nav pills are destinations now, not a switch.
@@ -8389,7 +8412,7 @@ async function loadSettings(){
   // LAN URLs and QR codes. Same fact, same volume, in both places.
   const ob=document.getElementById('secOpenBadge'); if(ob) ob.style.display=c.has_apikey?'none':'';
   const on=document.getElementById('remoteOpenNote'); if(on) on.style.display=c.has_apikey?'none':'';
-  srvList=c.servers||[]; srvTuned=c.conntune||{}; srvAutoConn=!!c.auto_connections; renderServers(); renderSetup(c);
+  noteServerConfig(c); renderServers(); renderSetup(c);
   if(!document.querySelector('#schedrows :focus')) renderSched(parseSchedText(c.schedule));
   if(!document.querySelector('#feedrows :focus')) renderFeeds(c.feeds||[]);
   if(!document.querySelector('#idxrows :focus')) renderIdx(c.indexers||[]);
@@ -8871,7 +8894,10 @@ function renderSetup(c){
 // settings edit re-renders it via loadSettings).
 async function loadSetup(){
   const c=((await api('get_config')).config||{}).nzbfast;
-  if(c) renderSetup(c);
+  // Also the main page's only source for the auto-tune state: the
+  // Providers card explains a capped connection count, and a user who
+  // never opens Settings must still get that explanation.
+  if(c){ noteServerConfig(c); renderSetup(c); }
 }
 // Boot call, like every other one-shot loader on this page. Without it
 // the strip was populated only by the non-English i18n re-render and by
@@ -8925,7 +8951,11 @@ function renderServers(){
     }
     // Effective connections: auto-connections may cap below the configured
     // count (the measured knee - over-asking a provider was slower).
-    const tv=(srvAutoConn&&srvTuned[s.host]&&srvTuned[s.host].connections>0)?srvTuned[s.host].connections:0;
+    // A SUSPECT knee is recorded state, not applied state - jobs ignore
+    // it until a second probe agrees. Showing it as "auto-tuned to 6"
+    // told the user their downloads were capped when they were not.
+    const kn0=srvTuned[s.host];
+    const tv=(srvAutoConn&&kn0&&!kn0.suspect&&kn0.connections>0)?kn0.connections:0;
     // dim, not warn: a measured optimum is a fact, not a problem to fix.
     const tuneNote=(tv&&tv<s.connections)?` · <span class="dim" title="${escA(t('set.srv.tuned.title','auto-connections measured this provider is fastest at {n} sockets: more were slower. Turn off auto-connections (Connection tuning) to use your set value.',{n:tv}))}">${t('set.srv.tuned','auto-tuned to {n}',{n:tv})}</span>`:'';
     return `

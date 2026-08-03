@@ -642,6 +642,8 @@
  "prov.stat.standby": "u pripravnosti",
  "prov.stat.standby.title": "rezervna okosnica koju pool nije morao pozvati za ovo preuzimanje",
  "prov.title": "Pružatelji",
+ "prov.tuned": "automatski podešeno s {m}",
+ "prov.tuned.title": "Automatsko podešavanje izmjerilo je da je ovaj pružatelj najbrži pri {n} veza, pa preuzimanja koriste {n} umjesto {m} koliko ste postavili: traženje više nego što pružatelj odobrava često je nekoliko puta sporije. Isključite to u Postavkama, pod Automatsko podešavanje veza.",
  "queue.act.connecting": "spajanje na {s}",
  "queue.act.downloading": "preuzimanje",
  "queue.act.extracting": "raspakiravanje",

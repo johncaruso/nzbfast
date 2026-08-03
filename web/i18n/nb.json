@@ -632,6 +632,8 @@
  "prov.stat.standby": "standby",
  "prov.stat.standby.title": "en backup-backbone som poolen ikke har trengt å bruke for denne nedlastingen",
  "prov.title": "Leverandører",
+ "prov.tuned": "automatisk justert fra {m}",
+ "prov.tuned.title": "Automatisk justering målte at denne leverandøren er raskest med {n} tilkoblinger, så nedlastinger bruker {n} i stedet for de {m} du har satt: å be om flere enn leverandøren gir, er ofte flere ganger tregere. Slå det av i Innstillinger, under Automatisk justering av tilkoblinger.",
  "queue.act.connecting": "kobler til {s}",
  "queue.act.downloading": "laster ned",
  "queue.act.extracting": "pakker ut",

@@ -11500,6 +11500,116 @@ async fn a_completed_move_reports_its_destination_and_no_split() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Raising the Connections setting must beat a stored auto-tune knee.
+///
+/// The v1.0.14 field case: a single idle ladder measured 6 sockets for
+/// the tester's provider and wrote it to conntune.json. Every job from
+/// then on ran at 6 - about 25 MB/s on a 900 Mbps line - and nothing he
+/// could type made any difference. He set 22, then 24, restarted the
+/// app, tried a fresh NZB: still 6, with the Providers card reporting a
+/// flat "6/6". The guard added later only ran at RECORD time, so it
+/// could not help a knee already on disk.
+///
+/// Two wirings are pinned here, because the logic being right is not the
+/// same as it being called: the live settings write, and the boot sweep
+/// that reaches files written by older builds.
+#[tokio::test(flavor = "multi_thread")]
+async fn raising_connections_reopens_a_stored_low_knee() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-conntune-reopen-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+    let cfg = dir.join("config.json");
+    // A provider whose account allows 24. Nothing ever connects to it -
+    // this test is about the state file, not about downloading.
+    let write_cfg = || {
+        std::fs::write(
+            &cfg,
+            br#"{"servers":[{"host":"news.example.invalid","port":119,"tls":false,
+                 "username":"u","password":"p","connections":24}]}"#,
+        )
+        .unwrap()
+    };
+    // Exactly what v1.0.14 wrote: no `suspect`, no `limit`, no `v`.
+    let write_v0_knee = || {
+        std::fs::write(
+            cfg.with_file_name("conntune.json"),
+            br#"{"news.example.invalid":{"connections":6,"granted":6,"gbps":0.24,
+                 "checked":1754000000,"source":"auto"}}"#,
+        )
+        .unwrap()
+    };
+    let knee = || {
+        let raw = std::fs::read_to_string(cfg.with_file_name("conntune.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        v["news.example.invalid"].clone()
+    };
+    write_cfg();
+    write_v0_knee();
+
+    // Phase 1: the ceiling actually in force is the default 8, and 6 of
+    // 8 is the tuner agreeing with the user - it must NOT be disturbed.
+    fn boot(cfg: PathBuf, out: PathBuf, conns: &'static str) -> impl Fn(u16) -> Command {
+        move |port: u16| {
+            let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+            c.env("NZBFAST_NO_ENRICH", "1")
+                .arg("--config")
+                .arg(&cfg)
+                .arg("serve")
+                .arg("--bind")
+                .arg("127.0.0.1")
+                .arg("--port")
+                .arg(port.to_string())
+                .arg("--apikey")
+                .arg("sekrit")
+                .arg("--connections")
+                .arg(conns)
+                .arg("--out")
+                .arg(&out);
+            c
+        }
+    }
+    let out = dir.join("complete");
+    let d = serve(&dir, boot(cfg.clone(), out.clone(), "8")).await;
+    let port = d.port;
+    let k = knee();
+    assert_eq!(
+        k["suspect"], false,
+        "a knee at the ceiling in force was disturbed"
+    );
+    // Stamped, though: the entry has now been judged against a ceiling
+    // of 8, which is what stops the next restart judging it again.
+    assert_eq!(k["limit"], 8);
+
+    // Phase 2: the user types 24, the way the dashboard sends it.
+    tokio::task::spawn_blocking(move || {
+        let r = http(
+            port,
+            "/api?mode=config&name=connections&value=24&apikey=sekrit",
+            None,
+        );
+        assert!(r.contains("\"status\":true") || r.contains("24"), "{r}");
+    })
+    .await
+    .unwrap();
+    let k = knee();
+    assert_eq!(k["suspect"], true, "24 asked for, knee of 6 still applied");
+    assert_eq!(k["checked"], 0, "reopened knee not queued for a re-probe");
+    assert_eq!(k["limit"], 24);
+    assert_eq!(k["connections"], 6, "the measurement itself must survive");
+    drop(d);
+
+    // Phase 3: the same install, restarted. A tester who has ALREADY set
+    // 24 gets no settings write to hang the fix on, so the boot sweep is
+    // the only thing that can reach their file - it is the whole reason
+    // the pre-guard entries on disk are recoverable at all.
+    write_v0_knee();
+    let d = serve(&dir, boot(cfg.clone(), out.clone(), "24")).await;
+    let k = knee();
+    assert_eq!(k["suspect"], true, "boot did not sweep a pre-guard knee");
+    assert_eq!(k["limit"], 24);
+    drop(d);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Percent-encode a filesystem path for an API query value.
 fn urlenc(s: &str) -> String {
     s.bytes()

@@ -632,6 +632,8 @@
  "prov.stat.standby": "standby",
  "prov.stat.standby.title": "en backup-backbone, som poolen ikke har haft brug for at kalde på til denne download",
  "prov.title": "Udbydere",
+ "prov.tuned": "auto-justeret fra {m}",
+ "prov.tuned.title": "Automatisk justering målte, at denne udbyder er hurtigst ved {n} forbindelser, så downloads bruger {n} i stedet for de {m}, du har angivet: at bede en udbyder om flere, end den vil give, er ofte flere gange langsommere. Slå det fra under Indstillinger, ved Automatisk justering af forbindelser.",
  "queue.act.connecting": "forbinder til {s}",
  "queue.act.downloading": "henter",
  "queue.act.extracting": "udpakker",

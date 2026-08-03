@@ -632,6 +632,8 @@
  "prov.stat.standby": "Standby",
  "prov.stat.standby.title": "ein Backup-Backbone, das der Pool für diesen Download noch nicht anfordern musste",
  "prov.title": "Provider",
+ "prov.tuned": "automatisch angepasst von {m}",
+ "prov.tuned.title": "Die automatische Anpassung hat gemessen, dass dieser Provider bei {n} Verbindungen am schnellsten ist. Downloads nutzen daher {n} statt der von dir eingestellten {m}: mehr anzufordern, als ein Provider gewährt, ist oft um ein Vielfaches langsamer. Abschalten kannst du das in den Einstellungen unter Verbindungen automatisch anpassen.",
  "queue.act.connecting": "verbinde mit {s}",
  "queue.act.downloading": "lade herunter",
  "queue.act.extracting": "entpacke",

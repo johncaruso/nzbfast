@@ -632,6 +632,8 @@
  "prov.stat.standby": "beklemede",
  "prov.stat.standby.title": "bu indirme için başvurulması gerekmeyen bir yedek backbone",
  "prov.title": "Sağlayıcılar",
+ "prov.tuned": "otomatik ayarlandı, {m} yerine",
+ "prov.tuned.title": "Otomatik ayar bu sağlayıcının {n} bağlantıda en hızlı olduğunu ölçtü, bu yüzden indirmeler ayarladığınız {m} yerine {n} kullanıyor: bir sağlayıcıdan verdiğinden fazlasını istemek çoğu zaman kat kat yavaştır. Ayarlar bölümünde, Bağlantıları otomatik ayarla altından kapatabilirsiniz.",
  "queue.act.connecting": "{s} sunucusuna bağlanılıyor",
  "queue.act.downloading": "indiriliyor",
  "queue.act.extracting": "çıkarılıyor",

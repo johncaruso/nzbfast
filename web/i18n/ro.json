@@ -632,6 +632,8 @@
  "prov.stat.standby": "în rezervă",
  "prov.stat.standby.title": "un backbone de rezervă la care pool-ul nu a fost nevoit să apeleze pentru această descărcare",
  "prov.title": "Provideri",
+ "prov.tuned": "reglat automat de la {m}",
+ "prov.tuned.title": "Reglarea automată a măsurat că acest furnizor este cel mai rapid la {n} conexiuni, așa că descărcările folosesc {n} în loc de cele {m} setate de tine: a cere unui furnizor mai multe decât acordă este adesea de câteva ori mai lent. Îl poți opri în Setări, la Reglare automată a conexiunilor.",
  "queue.act.connecting": "conectare la {s}",
  "queue.act.downloading": "se descarcă",
  "queue.act.extracting": "se despachetează",

@@ -642,6 +642,8 @@
  "prov.stat.standby": "záloha",
  "prov.stat.standby.title": "záložná chrbticová sieť, ktorú pool pre toto sťahovanie nemusel využiť",
  "prov.title": "Poskytovatelia",
+ "prov.tuned": "automaticky doladené z {m}",
+ "prov.tuned.title": "Automatické ladenie namieralo, že tento poskytovateľ je najrýchlejší pri {n} pripojeniach, takže sťahovania používajú {n} namiesto nastavených {m}: žiadať viac, než poskytovateľ povolí, býva niekoľkonásobne pomalšie. Vypnete to v Nastaveniach, v časti Automatické ladenie pripojení.",
  "queue.act.connecting": "pripájanie k {s}",
  "queue.act.downloading": "sťahovanie",
  "queue.act.extracting": "rozbaľovanie",

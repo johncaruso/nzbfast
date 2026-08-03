@@ -632,6 +632,8 @@
  "prov.stat.standby": "スタンバイ",
  "prov.stat.standby.title": "このダウンロードでプールが呼び出す必要のなかった予備のバックボーン",
  "prov.title": "プロバイダー",
+ "prov.tuned": "自動調整（設定は {m}）",
+ "prov.tuned.title": "自動調整により、このプロバイダは {n} 接続が最速と測定されました。そのためダウンロードは設定した {m} ではなく {n} を使います。プロバイダが許可する数より多く要求すると、数倍遅くなることがよくあります。設定の「接続数の自動調整」でオフにできます。",
  "queue.act.connecting": "{s} に接続中",
  "queue.act.downloading": "ダウンロード中",
  "queue.act.extracting": "展開中",

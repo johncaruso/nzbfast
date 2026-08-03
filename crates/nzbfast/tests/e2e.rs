@@ -4029,7 +4029,7 @@ async fn conntune_caps_connections() {
         .unwrap();
     assert!(ok, "{log}");
     assert!(
-        log.contains("connection auto-tune: 127.0.0.1 1"),
+        log.contains("connection auto-tune: 127.0.0.1 capped at 1 of "),
         "tuned cap not applied:\n{log}"
     );
     assert_eq!(std::fs::read(fx.dir.join("out/t.bin")).unwrap(), data);

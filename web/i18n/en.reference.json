@@ -632,6 +632,8 @@
  "prov.stat.standby": "standby",
  "prov.stat.standby.title": "a backup backbone the pool has not had to call on for this download",
  "prov.title": "Providers",
+ "prov.tuned": "auto-tuned from {m}",
+ "prov.tuned.title": "auto-tune measured this provider is fastest at {n} connections, so downloads use {n} rather than the {m} you set: asking a provider for more than it will grant is often several times slower. Turn it off in Settings, under Auto-tune connections.",
  "queue.act.connecting": "connecting to {s}",
  "queue.act.downloading": "downloading",
  "queue.act.extracting": "unpacking",

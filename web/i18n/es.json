@@ -632,6 +632,8 @@
  "prov.stat.standby": "en reserva",
  "prov.stat.standby.title": "un backbone de respaldo al que el pool no ha tenido que recurrir para esta descarga",
  "prov.title": "Proveedores",
+ "prov.tuned": "ajustado automáticamente desde {m}",
+ "prov.tuned.title": "El ajuste automático midió que este proveedor es más rápido con {n} conexiones, así que las descargas usan {n} en lugar de las {m} que configuraste: pedir a un proveedor más de las que concede suele ser varias veces más lento. Puedes desactivarlo en Ajustes, en Ajuste automático de conexiones.",
  "queue.act.connecting": "conectando a {s}",
  "queue.act.downloading": "descargando",
  "queue.act.extracting": "desempaquetando",

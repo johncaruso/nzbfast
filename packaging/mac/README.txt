@@ -21,6 +21,10 @@ THIS ZIP: THE PORTABLE / SCRIPTED WAY
 -------------------------------------
   1. Keep all these files together in one folder.
   2. Double-click  "Start nzbfast.command".
+     Not the "nzbfast" file next to it - that one is the program
+     itself, and Finder answers a double-click on it with
+     "The application "nzbfast" can't be opened." The launcher is
+     what sets it up and starts it.
      The first time, macOS asks if you're sure you want to open it
      (it's from a developer it can't verify) - click Open.
        - If there's no Open button, go to System Settings ->
@@ -41,6 +45,21 @@ or "Remove a server".
 
 To stop nzbfast: press Control-C in its window, or close the window.
 To start it again later: double-click "Start nzbfast.command".
+
+IF NOTHING OPENS AT ALL
+-----------------------
+"The application ... can't be opened." with no other explanation
+almost always means the download lost its Unix permissions on the
+way to you. That happens when the files are passed on through a
+chat app, a cloud drive or a re-zip rather than downloaded from
+nzbfast.com or the GitHub releases page - macOS keeps the permission
+bit inside the .zip, and those channels do not.
+
+Download the .dmg or the .zip directly from the releases page and it
+will not happen. If you want to rescue the copy you already have,
+open Terminal, type  chmod +x   with a trailing space, drag the
+"Start nzbfast.command" and "nzbfast" files onto the window, and
+press Return - then double-click the launcher again.
 
 More detail and Sonarr/Radarr setup are in the User Manual
 (MANUAL.html - also at http://localhost:6789/manual while running).

@@ -632,6 +632,8 @@
  "prov.stat.standby": "készenlét",
  "prov.stat.standby.title": "tartalék backbone, amelyet ehhez a letöltéshez nem kellett igénybe venni",
  "prov.title": "Szolgáltatók",
+ "prov.tuned": "automatikusan hangolva erről: {m}",
+ "prov.tuned.title": "Az automatikus hangolás azt mérte, hogy ez a szolgáltató {n} kapcsolatnál a leggyorsabb, ezért a letöltések {n} kapcsolatot használnak a beállított {m} helyett: többet kérni, mint amennyit a szolgáltató ad, gyakran többszörösen lassabb. A Beállításokban kapcsolhatod ki, a Kapcsolatok automatikus hangolása alatt.",
  "queue.act.connecting": "kapcsolódás: {s}",
  "queue.act.downloading": "letöltés",
  "queue.act.extracting": "kibontás",

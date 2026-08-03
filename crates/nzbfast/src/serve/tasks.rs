@@ -5484,6 +5484,16 @@ pub(super) fn spawn_auto_connections(daemon: &Arc<Daemon>, config: &std::path::P
     let d = daemon.clone();
     let cfg_path = config.to_path_buf();
     let rt = tokio::runtime::Handle::current();
+    // Before anything else, and synchronously: sweep knees the user's
+    // current settings have outgrown. This runs at boot rather than in
+    // the probe thread below because a job can start inside the 120 s
+    // settling sleep, and a job that starts capped by a knee the user
+    // already disowned is the whole complaint (v1.0.14 field report:
+    // 6 sockets of 24 asked for, ~25 MB/s on a 900 Mbps line, across
+    // every download in his history). Pre-guard files on disk are only
+    // ever reachable from here - a record-time guard cannot revisit
+    // them.
+    crate::conntune::reopen_for_install(config, d.connections.load(Ordering::Relaxed));
     std::thread::spawn(move || {
         // In-memory failure backoff so an unreachable server is
         // retried in hours, not every minute.
@@ -5590,7 +5600,15 @@ pub(super) fn spawn_auto_connections(daemon: &Arc<Daemon>, config: &std::path::P
                         .map(|s| s.connections)
                         .unwrap_or(8);
                     let granted = steps.iter().map(|s| s.granted).max().unwrap_or(0);
-                    let limit = srv.connections.max(1) as usize;
+                    // The ceiling a job would really hand this server:
+                    // the global setting caps it too, and judging the
+                    // knee against the server's own number alone called
+                    // a knee "low" on an install whose global setting
+                    // WAS that number.
+                    let limit = crate::conntune::effective_limit(
+                        d.connections.load(Ordering::Relaxed),
+                        srv.connections,
+                    );
                     // A knee that would cut the configured count to less
                     // than half is applied only once TWO probes agree - a
                     // one-time provider or link wobble at probe time must
@@ -5611,6 +5629,8 @@ pub(super) fn spawn_auto_connections(daemon: &Arc<Daemon>, config: &std::path::P
                             checked: now,
                             source: "auto".into(),
                             suspect,
+                            limit,
+                            v: crate::conntune::SCHEMA,
                         },
                     );
                     if suspect {
