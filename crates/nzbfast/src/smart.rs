@@ -561,6 +561,12 @@ pub fn delete_filed_episode(dir: &Path, stem: &str, tail: &FiledTail) -> FiledDe
         return FiledDelete::default();
     };
     let mut out = FiledDelete::default();
+    // Optimistic until the first removal, then only as strong as the
+    // weakest one: a set of files where some reached a Trash and some
+    // did not is not recoverable, and saying so would send the user
+    // looking for a file that is not there.
+    let mut all_trashed = true;
+    let mut any_removed = false;
     for entry in rd.flatten() {
         let path = entry.path();
         if !path.is_file() {
@@ -572,7 +578,11 @@ pub fn delete_filed_episode(dir: &Path, stem: &str, tail: &FiledTail) -> FiledDe
             .unwrap_or_default();
         if is_filed_episode_file(&name, &bases, &tail_lower) {
             match remove_user_file(&path, recoverable) {
-                Ok(()) => out.removed += 1,
+                Ok(how) => {
+                    out.removed += 1;
+                    any_removed = true;
+                    all_trashed &= how == Removed::Trashed;
+                }
                 Err(e) => {
                     warn!(target: "smart", "delete filed {}: {e}", path.display());
                     // First refusal only: they all carry the same reason
@@ -583,6 +593,11 @@ pub fn delete_filed_episode(dir: &Path, stem: &str, tail: &FiledTail) -> FiledDe
             }
         }
     }
+    out.removed_as = if any_removed && all_trashed {
+        Removed::Trashed
+    } else {
+        Removed::Gone
+    };
     out
 }
 
@@ -593,12 +608,27 @@ pub fn delete_filed_episode(dir: &Path, stem: &str, tail: &FiledTail) -> FiledDe
 /// the Trash refuses LEAVES the episode in the user's library (see
 /// [`remove_user_file`]) while its History row goes, so the reason has to
 /// travel back to whoever can put it in front of them.
-#[derive(Default)]
 pub struct FiledDelete {
     /// How many files were removed.
     pub removed: usize,
     /// Why at least one file is still in the library, when one is.
     pub kept: Option<String>,
+    /// What the removals actually were. `Gone` unless EVERY one of them
+    /// was verified into a Trash: a mixed outcome must not be reported
+    /// as recoverable, because the half the user goes looking for may be
+    /// the half that is not there.
+    pub removed_as: Removed,
+}
+
+impl Default for FiledDelete {
+    fn default() -> Self {
+        FiledDelete {
+            removed: 0,
+            kept: None,
+            // Nothing was removed, so there is nothing to promise back.
+            removed_as: Removed::Gone,
+        }
+    }
 }
 
 /// Every spelling of this release's filed episode base, ASCII-lowercased:
@@ -1271,7 +1301,7 @@ pub fn cleanup(dir: &Path, exts: &[String]) -> (usize, usize) {
                 .unwrap_or_default();
             if exts.contains(&ext) {
                 match remove_swept_file(&path, recoverable, staging.as_deref()) {
-                    Ok(()) => {
+                    Ok(_) => {
                         info!(target: "cleanup", "removed {}", path.display());
                         removed += 1;
                         if ext == "par2" {
@@ -1330,10 +1360,11 @@ pub fn cleanup(dir: &Path, exts: &[String]) -> (usize, usize) {
 /// is treated the same way. Re-reading the flag per file meant a settings
 /// change - or, in the test suite, another test's `set_delete_to_trash` -
 /// landed halfway through a sweep and split it between the two behaviours.
-pub fn remove_user_file(path: &Path, recoverable: bool) -> std::io::Result<()> {
+pub fn remove_user_file(path: &Path, recoverable: bool) -> std::io::Result<Removed> {
     if recoverable {
         return match trash_attempt(path) {
-            TrashVerdict::Took => Ok(()),
+            TrashVerdict::Took => Ok(Removed::Trashed),
+            TrashVerdict::TookButGone | TrashVerdict::NotFound => Ok(Removed::Gone),
             TrashVerdict::Refused(why) => Err(refusal(&why)),
         };
     }
@@ -1342,8 +1373,9 @@ pub fn remove_user_file(path: &Path, recoverable: bool) -> std::io::Result<()> {
     // races it and loses with NotFound - which is the outcome we wanted
     // (the file is gone), not a failure to report to the caller.
     match std::fs::remove_file(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        other => other,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Removed::Gone),
+        Err(e) => Err(e),
+        Ok(()) => Ok(Removed::Gone),
     }
 }
 
@@ -1365,26 +1397,190 @@ pub fn remove_user_file(path: &Path, recoverable: bool) -> std::io::Result<()> {
 /// failed Trash call is unrecoverable by anyone, and it lands on the user
 /// who ASKED for recoverable deletes. The directory is left alone and the
 /// caller says so instead.
-pub fn remove_user_dir(path: &Path, recoverable: bool) -> std::io::Result<()> {
+pub fn remove_user_dir(path: &Path, recoverable: bool) -> std::io::Result<Removed> {
     if recoverable {
         return match trash_attempt(path) {
-            TrashVerdict::Took => Ok(()),
+            TrashVerdict::Took => Ok(Removed::Trashed),
+            TrashVerdict::TookButGone | TrashVerdict::NotFound => Ok(Removed::Gone),
             TrashVerdict::Refused(why) => Err(refusal(&why)),
         };
     }
     // NotFound tolerated for the same race as remove_user_file - and for
     // the ordinary case of a job whose directory was never created.
     match std::fs::remove_dir_all(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        other => other,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Removed::Gone),
+        Err(e) => Err(e),
+        Ok(()) => Ok(Removed::Gone),
     }
 }
 
 /// What one recoverable-delete attempt settled on.
+/// What a removal actually DID, as opposed to what the setting asked
+/// for.
+///
+/// The distinction is load-bearing and was missing: "its files went to
+/// the Trash" used to be reconstructed by the callers from two globals
+/// (`delete_to_trash()` and `!trash_unresponsive()`), never from what
+/// happened to those files. On 4 Aug that told a user a 14 GB download
+/// was recoverable while it had in fact been destroyed outright - the
+/// setting was on, nothing had timed out, and the backend returned Ok.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Removed {
+    /// In a Trash it can be restored from. Only ever reported when that
+    /// has been CHECKED, never inferred from the setting.
+    Trashed,
+    /// Gone, with no promise of getting it back. Covers a deliberate
+    /// permanent delete, a path that was already absent, and the case
+    /// above: a Trash route that reported success and left nothing
+    /// recoverable behind it.
+    Gone,
+}
+
+/// Did `path` actually land somewhere it can be restored from?
+///
+/// Asked AFTER a Trash route reports success, because that success means
+/// only "a backend returned Ok". macOS has two routes and both can
+/// answer Ok while the bytes are gone: on a volume whose per-user Trash
+/// is not usable - an external disk mounted `noowners` is the ordinary
+/// way to get one - Finder's scripted `delete` performs the delete
+/// -immediately behaviour its GUI would warn about, and says it worked.
+///
+/// Deliberately biased towards claiming recoverable: only a positive
+/// look in the expected place, coming back empty, downgrades the answer.
+/// Anything we cannot determine stays `Trashed`, because crying wolf on
+/// a delete that WAS recoverable is its own harm.
+/// What the Trash roots held that could be mistaken for this delete,
+/// taken BEFORE it happens.
+///
+/// Without it the check answers "recoverable" for a name that was
+/// already sitting there: `~/.Trash` keeps things for weeks, so the
+/// second delete of `Movie.mkv` - or a delete of anything whose name
+/// starts with a stem already in there - matched an entry from days
+/// ago and reported a hard delete as restorable. The claim has to be
+/// about an entry that appeared, not one that exists.
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct TrashBefore {
+    /// The exact target name already present in some root.
+    exact: bool,
+    /// Every stem-prefixed name already present, across all roots.
+    names: std::collections::HashSet<std::ffi::OsString>,
+}
+
+#[cfg(target_os = "macos")]
+fn trash_snapshot(path: &Path) -> TrashBefore {
+    let mut before = TrashBefore::default();
+    let Some(name) = path.file_name() else {
+        return before;
+    };
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| name.to_string_lossy().into_owned());
+    for root in trash_roots(path) {
+        if root.join(name).exists() {
+            before.exact = true;
+        }
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for e in entries.take(4096).flatten() {
+            if e.file_name().to_string_lossy().starts_with(&stem) {
+                before.names.insert(e.file_name());
+            }
+        }
+    }
+    before
+}
+
+/// The two places macOS puts a trashed item: the boot volume's per-user
+/// Trash, and a per-volume `.Trashes/<uid>` for anything else. A path
+/// under /Volumes/<name> is checked against its own volume first, then
+/// the home one - a cross-volume trash lands in the latter.
+#[cfg(target_os = "macos")]
+fn trash_roots(path: &Path) -> Vec<std::path::PathBuf> {
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    let comps: Vec<_> = path.components().collect();
+    if comps.len() > 2 && path.starts_with("/Volumes") {
+        let vol: std::path::PathBuf = comps[..3].iter().collect();
+        roots.push(
+            vol.join(".Trashes")
+                .join(unsafe { libc::getuid() }.to_string()),
+        );
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        roots.push(std::path::PathBuf::from(home).join(".Trash"));
+    }
+    roots
+}
+
+#[cfg(target_os = "macos")]
+fn landed_in_a_trash(path: &Path, before: &TrashBefore) -> bool {
+    let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        return true;
+    };
+    let roots = trash_roots(path);
+    if roots.is_empty() {
+        return true;
+    }
+    // Finder disambiguates a name collision by appending to the stem, so
+    // an exact hit is the common case and a prefix match covers the
+    // rest. Bounded: a long-untended Trash must not turn one delete into
+    // a directory walk of tens of thousands of entries.
+    //
+    // Matched against the BEFORE snapshot throughout: an entry that was
+    // already there is somebody else's old delete, and it is the whole
+    // reason this check could say "recoverable" about files that had
+    // just been destroyed outright.
+    for root in &roots {
+        if !before.exact && root.join(&name).exists() {
+            return true;
+        }
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| name.clone());
+        for e in entries.take(4096).flatten() {
+            if e.file_name().to_string_lossy().starts_with(&stem)
+                && !before.names.contains(&e.file_name())
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Every other platform's backend is a real XDG Trash or Recycle Bin,
+/// which does not have the "reported success, deleted anyway" mode this
+/// guards against. Nothing to second-guess.
+#[cfg(not(target_os = "macos"))]
+#[derive(Default)]
+struct TrashBefore;
+
+#[cfg(not(target_os = "macos"))]
+fn trash_snapshot(_path: &Path) -> TrashBefore {
+    TrashBefore
+}
+
+#[cfg(not(target_os = "macos"))]
+fn landed_in_a_trash(_path: &Path, _before: &TrashBefore) -> bool {
+    true
+}
+
 enum TrashVerdict {
-    /// The Trash took `path` - or there was nothing there to take. Either
-    /// way the caller is done and the path is gone from the user's tree.
+    /// A Trash route took `path` and it was found afterwards in a Trash
+    /// it can be restored from.
     Took,
+    /// A Trash route reported success, but nothing recoverable is there:
+    /// the path is gone for good. The files ARE removed - the caller
+    /// asked for that - but nothing may claim they can be restored.
+    TookButGone,
+    /// There was nothing at `path` to take.
+    NotFound,
     /// No Trash route would take it. Carries the reason for the log. The
     /// caller must NOT fall back to a permanent delete: see
     /// [`remove_user_file`].
@@ -1421,14 +1617,45 @@ fn trash_attempt(path: &Path) -> TrashVerdict {
     // instead" for a directory that had already gone, which is the most
     // alarming line we could print about a no-op. It is also the shape of
     // the race the old direct-delete fallback swallowed as NotFound.
-    if std::fs::symlink_metadata(path).is_err() {
-        return TrashVerdict::Took;
+    // NotFound only. `is_err()` swallowed every other stat failure too -
+    // EACCES on a parent that lost search permission, EIO/ESTALE on a
+    // dropped SMB or NFS mount - and reported each as "the Trash took
+    // it": `Ok(())` out of `remove_user_dir`, `FilesGone::Yes`, no
+    // `note_delete_kept`, no warning, and the history row dropped. A NAS
+    // user reclaiming space from a share that had just gone away was
+    // told the files were deleted while the whole payload was still
+    // sitting there, named by nothing - the exact failure class the
+    // kept-files notice exists to close. The non-recoverable arms
+    // already tolerate only NotFound; this one is now consistent with
+    // them.
+    if std::fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+        return TrashVerdict::NotFound;
     }
     if trash_unresponsive() {
         return TrashVerdict::Refused("the Trash is not responding".to_string());
     }
+    // Taken BEFORE the call: "is it in the Trash now" cannot tell a
+    // fresh entry from one that was already sitting there under the
+    // same name.
+    let before = trash_snapshot(path);
     match trash_delete_gated(|| trash_delete_bounded(path)) {
-        Ok(()) => TrashVerdict::Took,
+        // Ok from the backend is not the answer on its own - see
+        // `landed_in_a_trash`.
+        Ok(()) => {
+            if landed_in_a_trash(path, &before) {
+                TrashVerdict::Took
+            } else {
+                warn!(
+                    target: "files",
+                    "the Trash reported success for {} but nothing restorable is there - \
+                     reporting it as deleted, because that is what happened. A volume \
+                     whose per-user Trash is unusable (an external disk mounted \
+                     `noowners` is the common one) deletes outright and says it worked.",
+                    path.display()
+                );
+                TrashVerdict::TookButGone
+            }
+        }
         // Another caller was inside the process's first Trash call when we
         // arrived, and it came back unresponsive. We never made a call of
         // our own, but the verdict is the same one we would have got.
@@ -1806,7 +2033,7 @@ pub(crate) fn remove_swept_file(
     path: &Path,
     recoverable: bool,
     staging: Option<&Path>,
-) -> std::io::Result<()> {
+) -> std::io::Result<Removed> {
     // When the latch is set there is no Trash to park FOR: the inline path
     // refuses and leaves the file, and a staging folder full of files
     // nobody will ever dispose of is worse than the file where it was.
@@ -1815,7 +2042,10 @@ pub(crate) fn remove_swept_file(
         && let Some(root) = staging
         && deferred_trash::stage(path, root).is_ok()
     {
-        return Ok(());
+        // Staged, not yet disposed of. The worker decides the real
+        // outcome later, so this promises nothing: the sweeps that use
+        // this path do not report a fate to the user.
+        return Ok(Removed::Gone);
     }
     remove_user_file(path, recoverable)
 }
@@ -2046,7 +2276,7 @@ pub fn sweep_junk(dir: &Path) -> usize {
                 || is_nameless_scrap(&path, &ext, keep_len, recoverable);
             if junk {
                 match remove_swept_file(&path, recoverable, staging.as_deref()) {
-                    Ok(()) => {
+                    Ok(_) => {
                         info!(target: "cleanup", "junk {}", path.display());
                         removed += 1;
                     }
@@ -2130,7 +2360,7 @@ pub fn keep_media_only(dir: &Path) -> usize {
                 continue;
             }
             match remove_swept_file(&path, recoverable, staging.as_deref()) {
-                Ok(()) => {
+                Ok(_) => {
                     info!(target: "cleanup", "non-media {}", path.display());
                     removed += 1;
                 }
@@ -6446,6 +6676,79 @@ mod tests {
 
 #[cfg(test)]
 mod trash_tests {
+
+    /// A removal only claims "recoverable" when the file was FOUND in a
+    /// Trash afterwards.
+    ///
+    /// The backend returning Ok is not that claim: macOS has two routes
+    /// and both can report success while deleting outright, which is how
+    /// a 14 GB download was reported restorable on 4 Aug when it was
+    /// gone. This pins the check that catches it - a name that is in no
+    /// Trash answers false - and the permanent-delete arm, which must
+    /// never claim `Trashed`.
+    #[test]
+    fn a_removal_reports_what_it_actually_did() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-removed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // An opt-out delete is permanent by definition and says so.
+        let f = dir.join("plain.bin");
+        std::fs::write(&f, b"x").unwrap();
+        assert_eq!(
+            super::remove_user_file(&f, false).unwrap(),
+            super::Removed::Gone,
+            "a permanent delete must never report itself recoverable"
+        );
+        assert!(!f.exists());
+
+        // A path that was never there is gone, not trashed - there is
+        // nothing to restore and nothing may promise otherwise.
+        assert_eq!(
+            super::remove_user_file(&dir.join("never-existed.bin"), true).unwrap(),
+            super::Removed::Gone
+        );
+
+        // The verification itself: a file sitting in an ordinary
+        // directory has not landed in any Trash.
+        #[cfg(target_os = "macos")]
+        {
+            let never = dir.join("nzbfast-not-in-any-trash-9f3a.bin");
+            std::fs::write(&never, b"x").unwrap();
+            assert!(
+                !super::landed_in_a_trash(&never, &super::trash_snapshot(&never)),
+                "a file that was never trashed must not read as recoverable"
+            );
+
+            // A NAME that was already in the Trash is not evidence about
+            // THIS delete. Simulated by putting the would-be match into
+            // the before-snapshot: on a `noowners` volume Finder deletes
+            // outright and reports success, and a `Movie.mkv` binned
+            // last week then made the destroyed one read as restorable.
+            if let Some(home) = std::env::var_os("HOME") {
+                let root = std::path::PathBuf::from(home).join(".Trash");
+                let planted = root.join("nzbfast-stale-trash-probe-4b21.bin");
+                if std::fs::create_dir_all(&root).is_ok()
+                    && std::fs::write(&planted, b"old").is_ok()
+                {
+                    let target = dir.join("nzbfast-stale-trash-probe-4b21.bin");
+                    let before = super::trash_snapshot(&target);
+                    assert!(
+                        !super::landed_in_a_trash(&target, &before),
+                        "an entry that was ALREADY in the Trash must not \
+                         vouch for a delete that just happened"
+                    );
+                    // And a genuinely new arrival still counts.
+                    assert!(
+                        super::landed_in_a_trash(&target, &super::TrashBefore::default()),
+                        "a newly arrived entry must still read as recoverable"
+                    );
+                    let _ = std::fs::remove_file(&planted);
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     use super::*;
 
     /// Did a file this test just deleted actually reach the Trash, under
@@ -6669,4 +6972,193 @@ mod trash_tests {
     // which empties that test's fixtures into the developer's real Trash.
     // The setting itself is one atomic store, and the sweeps now read it
     // once at their entry and pass the answer down (see `remove_user_file`).
+}
+
+/// Put the configured permissions on a finished download (#20).
+///
+/// `umask` is the same number the shell and the linuxserver containers
+/// use, because that is what every guide about this prints: directories
+/// get `0o777 & !umask`, files `0o666 & !umask`, so the recommended `002`
+/// gives 775/664 and today's `0022` gives 755/644.
+///
+/// `root` is the job's final directory and is walked in full. `up_to` is
+/// the download root, and the directories BETWEEN the two get the
+/// directory mode as well - non-recursively, so nothing else living under
+/// them is touched. That part is not decoration: to import by renaming,
+/// an *arr has to unlink the job directory out of its parent, and unlink
+/// needs write permission on the PARENT, not on the directory being
+/// moved. Setting only the job's own tree produces a download the *arr
+/// can read and still cannot import.
+///
+/// Errors are logged once and otherwise swallowed. A mode we could not
+/// set is a slower import, while refusing to finish the job over it would
+/// turn a permissions preference into a failed download.
+#[cfg(unix)]
+pub fn apply_out_umask(root: &std::path::Path, up_to: Option<&std::path::Path>, umask: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir_mode = 0o777 & !umask;
+    let file_mode = 0o666 & !umask;
+    let mut failed: Option<String> = None;
+    let mut chmod = |p: &std::path::Path, mode: u32| {
+        if let Err(e) = std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode))
+            && failed.is_none()
+        {
+            failed = Some(format!("{}: {e}", p.display()));
+        }
+    };
+    // The job's own tree.
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        chmod(&dir, dir_mode);
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for ent in rd.flatten() {
+            let p = ent.path();
+            // symlink_metadata: never follow a link out of the tree and
+            // re-mode whatever it points at.
+            match std::fs::symlink_metadata(&p) {
+                Ok(m) if m.is_dir() => stack.push(p),
+                Ok(m) if m.is_file() => chmod(&p, file_mode),
+                _ => {}
+            }
+        }
+    }
+    // ...and every directory between it and the download root, so the
+    // *arr can rename the job out of the one holding it.
+    if let Some(stop) = up_to {
+        let mut cur = root.parent();
+        while let Some(p) = cur {
+            if !p.starts_with(stop) {
+                break;
+            }
+            chmod(p, dir_mode);
+            if p == stop {
+                break;
+            }
+            cur = p.parent();
+        }
+    }
+    if let Some(first) = failed {
+        tracing::warn!(target: "disk", "could not set output permissions ({first})");
+    }
+}
+
+/// Windows has no mode bits; the setting is stored and reported so a
+/// config survives a round trip through either platform.
+#[cfg(not(unix))]
+pub fn apply_out_umask(_root: &std::path::Path, _up_to: Option<&std::path::Path>, _umask: u32) {}
+
+#[cfg(all(test, unix))]
+mod out_umask_tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    fn mode(p: &Path) -> u32 {
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("nzbfast-umask-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The whole job tree, at both depths, files and directories.
+    #[test]
+    fn the_job_tree_gets_the_configured_modes() {
+        let root = scratch("tree");
+        let out = root.join("downloads");
+        let job = out.join("tv").join("Show.S01E01");
+        std::fs::create_dir_all(job.join("Subs")).unwrap();
+        std::fs::write(job.join("ep.mkv"), b"x").unwrap();
+        std::fs::write(job.join("Subs").join("en.srt"), b"x").unwrap();
+        for p in [
+            &job,
+            &job.join("Subs"),
+            &job.join("ep.mkv"),
+            &job.join("Subs").join("en.srt"),
+        ] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        super::apply_out_umask(&job, Some(&out), 0o002);
+
+        assert_eq!(mode(&job), 0o775, "job dir");
+        assert_eq!(mode(&job.join("Subs")), 0o775, "nested dir");
+        assert_eq!(mode(&job.join("ep.mkv")), 0o664, "file");
+        assert_eq!(mode(&job.join("Subs").join("en.srt")), 0o664, "nested file");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The reason the parent walk exists: an *arr imports by renaming the
+    /// job directory out of its parent, and unlink needs write on the
+    /// PARENT. A version that only did the job's own tree would leave a
+    /// download that is readable and still cannot be imported.
+    #[test]
+    fn the_parents_up_to_the_download_root_are_opened_too() {
+        let root = scratch("parents");
+        let out = root.join("downloads");
+        let job = out.join("tv").join("Show.S01E01");
+        std::fs::create_dir_all(&job).unwrap();
+        for p in [&out, &out.join("tv")] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        // Above the download root, and none of our business.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        super::apply_out_umask(&job, Some(&out), 0o002);
+
+        assert_eq!(mode(&out.join("tv")), 0o775, "category dir");
+        assert_eq!(mode(&out), 0o775, "download root");
+        assert_eq!(
+            mode(&root),
+            0o700,
+            "the walk climbed PAST the download root"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A sibling under the same parents must be left exactly as it was:
+    /// the parent walk is non-recursive on purpose.
+    #[test]
+    fn a_neighbouring_job_is_not_touched() {
+        let root = scratch("sibling");
+        let out = root.join("downloads");
+        let mine = out.join("tv").join("Mine");
+        let theirs = out.join("tv").join("Theirs");
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::create_dir_all(&theirs).unwrap();
+        std::fs::write(theirs.join("keep.mkv"), b"x").unwrap();
+        std::fs::set_permissions(&theirs, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            theirs.join("keep.mkv"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
+        super::apply_out_umask(&mine, Some(&out), 0o002);
+
+        assert_eq!(mode(&theirs), 0o700, "a sibling job was re-moded");
+        assert_eq!(mode(&theirs.join("keep.mkv")), 0o600, "a sibling's file");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 022 is what a container already gives, so choosing it must produce
+    /// exactly the modes that install has today - the proof that the
+    /// default-off path and the explicit-022 path agree.
+    #[test]
+    fn the_container_default_reproduces_todays_modes() {
+        let root = scratch("default");
+        let job = root.join("downloads").join("Job");
+        std::fs::create_dir_all(&job).unwrap();
+        std::fs::write(job.join("a.mkv"), b"x").unwrap();
+
+        super::apply_out_umask(&job, None, 0o022);
+
+        assert_eq!(mode(&job), 0o755);
+        assert_eq!(mode(&job.join("a.mkv")), 0o644);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

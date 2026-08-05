@@ -666,6 +666,7 @@ mod tests {
             username: None,
             password: None,
             connections: 1,
+            pin_connections: false,
             rcvbuf: None,
             level: 0,
             group: None,

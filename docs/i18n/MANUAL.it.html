@@ -844,6 +844,25 @@ pausa/ripresa, log.</p>
 dashboard e bacheca hanno un layout touch completo. Il pannello Impostazioni →
 Accesso remoto mostra gli URL esatti e un codice QR da inquadrare.</p>
 
+<h3 id="remote-proxy">Raggiungere nzbfast da fuori casa</h3>
+<p>Non esiste una pagina di accesso, ed è una scelta voluta. Un login con cookie di sessione è una superficie di sicurezza da mantenere per sempre, e resterebbe comunque la serratura più debole di qualunque cosa esposta su Internet. nzbfast si autentica invece con la tua chiave API, e accetta quella chiave sia in un'intestazione della richiesta sia nell'URL (<code>X-Api-Key</code>, oppure <code>Authorization: Bearer</code>) - ed è proprio questo che permette a un servizio davanti a lui di gestire l'accesso come si deve.</p>
+<p><b>La risposta più semplice è non pubblicarlo affatto.</b> Installa <b>Tailscale</b> su questa macchina e sul telefono: entrambi entrano nella stessa rete privata, non viene esposto nulla, non servono modifiche al router né certificati, e Impostazioni → Accesso remoto mostra un indirizzo che funziona ovunque non appena rileva Tailscale. Preferisci questa strada se non ti serve espressamente un dominio pubblico.</p>
+<p><b>Se ti serve davvero</b>, metti davanti un reverse proxy, affidagli il certificato e lascia che sia lui a fare l'autenticazione. Avvia nzbfast con <code>--bind 127.0.0.1</code> in modo che il proxy sia l'unica via d'ingresso, e punta il proxy a <code>http://127.0.0.1:6789</code>:</p>
+<pre><code># Caddy
+example.com {
+    reverse_proxy 127.0.0.1:6789
+}
+
+# nginx
+location / {
+    proxy_pass http://127.0.0.1:6789;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}</code></pre>
+<p>Aggiungi sopra quello che offre il tuo proxy: autenticazione basic, un servizio di forward-auth come Authelia o Authentik, oppure certificati client. Una cosa frega tutti - Sonarr, Radarr e le app per telefono non possono completare un login da browser, quindi lascia loro una via. Quasi tutti i proxy sanno far passare una richiesta con un'intestazione <code>X-Api-Key</code> valida e chiedere l'autenticazione per tutto il resto.</p>
+<div class="warn-box"><b>Non limitarti ad aprire la porta 6789 sul router.</b> La dashboard parla HTTP in chiaro: la tua chiave API e tutto ciò che ci fai attraverserebbero Internet leggibili da chiunque sul percorso, e un'installazione senza alcuna chiave è aperta a chi la trova. Se apri una porta lo stesso, imposta prima una chiave API.</div>
+
 <h2 id="performance">13 · Strumenti per le prestazioni</h2>
 <h3 id="perf-benchmark">Benchmark di sistema</h3>
 <p>Un clic misura i tuoi tre tetti - velocità di rete (una vera sonda
@@ -1104,6 +1123,7 @@ aspetto e si risolve da sé.</td></tr>
 <tr><td>Niente sulla rete riesce a raggiungere il daemon</td><td>Controlla <code>--bind</code>: <code>127.0.0.1</code> serve solo la macchina su cui gira nzbfast. Il predefinito, <code>0.0.0.0</code>, serve ogni interfaccia. Poi controlla il firewall della macchina stessa per la porta 6789.</td></tr>
 <tr><td>La scheda Sfoglia resta piccola</td><td>L'indexer cresce in background - controlla che i gruppi in Impostazioni → Indicizzazione siano impostati, e dai all'Approfondimento per scansione il tempo di accumulare storico. "Scansiona ora" forza una passata; la riga di stato mostra l'avanzamento in tempo reale.</td></tr>
 <tr><td>La bacheca mostra copertine sbagliate o assenti</td><td>Scheda di dettaglio → ✎ Correggi corrispondenza o ↻ Aggiorna metadati. Le ricerche dei film migliorano con una chiave OMDb gratuita.</td></tr>
+<tr id="mac-cant-open"><td>macOS dice che l'applicazione "nzbfast" non può essere aperta</td><td>Due cause, entrambe rapide. Se usi lo zip semplice <code>-macos-universal.zip</code>, fai doppio clic su <b>Start nzbfast.command</b>, non sul file <code>nzbfast</code> accanto: quello è il programma vero e proprio, e il Finder risponde a un doppio clic con esattamente questo messaggio. È il launcher che prepara tutto e avvia. Se lo stesso messaggio arriva anche dal launcher, la copia ha perso il bit di esecuzione Unix per strada: macOS conserva quel bit dentro lo .zip, ma le app di chat, i dischi cloud e un nuovo zip no, quindi una copia passata a mano arriva non eseguibile. Scarica il .dmg o lo .zip direttamente dalla pagina delle release e non succede. Per recuperare la copia che hai già: apri il Terminale, scrivi <code>chmod +x</code> con uno spazio finale, trascina <b>Start nzbfast.command</b> e il file <code>nzbfast</code> sulla finestra e premi Invio, poi fai di nuovo doppio clic sul launcher.</td></tr>
 <tr><td>Il daemon non parte: porta occupata</td><td>C'è un'altra istanza in esecuzione - oppure cambia <code>--port</code>.</td></tr>
 <tr><td>Dove sono i log?</td><td>Nella scheda Log della dashboard, o nel terminale/file di log con cui hai lanciato <code>serve</code>.</td></tr>
 </table></div>

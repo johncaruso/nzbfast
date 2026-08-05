@@ -832,6 +832,25 @@ snelheidslimiet, pauzeren/hervatten, log.</p>
 hele dashboard en de wall hebben een touch-lay-out. Het paneel Instellingen → Externe
 toegang toont de exacte URL's en een QR-code om te scannen.</p>
 
+<h3 id="remote-proxy">nzbfast van buitenaf bereiken</h3>
+<p>Er is geen inlogpagina, en dat is een bewuste keuze. Inloggen met een sessiecookie is een beveiligingsoppervlak dat je voor altijd moet onderhouden, en het zou nog steeds het zwakste slot zijn op alles wat aan het open internet hangt. nzbfast authenticeert in plaats daarvan met je API-sleutel, en accepteert die sleutel zowel in een request-header als in de URL (<code>X-Api-Key</code>, of <code>Authorization: Bearer</code>) - en juist dat laat iets ervoor de aanmelding netjes afhandelen.</p>
+<p><b>Het eenvoudigst is om helemaal niets te publiceren.</b> Installeer <b>Tailscale</b> op deze machine en op je telefoon: beide zitten dan in één privénetwerk, er staat niets open, je hoeft niets aan router of certificaat te doen, en Instellingen → Toegang op afstand toont een adres dat overal werkt zodra het Tailscale ziet draaien. Kies dit, tenzij je echt een publiek domein nodig hebt.</p>
+<p><b>Heb je dat wel nodig</b>, zet er dan een reverse proxy voor, geef die het certificaat en laat die de authenticatie doen. Start nzbfast met <code>--bind 127.0.0.1</code> zodat de proxy de enige ingang is, en wijs de proxy naar <code>http://127.0.0.1:6789</code>:</p>
+<pre><code># Caddy
+example.com {
+    reverse_proxy 127.0.0.1:6789
+}
+
+# nginx
+location / {
+    proxy_pass http://127.0.0.1:6789;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}</code></pre>
+<p>Leg erbovenop wat je proxy biedt: basic auth, een forward-auth-dienst als Authelia of Authentik, of clientcertificaten. Eén ding verrast iedereen - Sonarr, Radarr en de telefoon-apps kunnen geen browser-login doorlopen, laat ze er dus langs. De meeste proxy's kunnen een verzoek met een geldige <code>X-Api-Key</code>-header doorlaten en de rest om authenticatie vragen.</p>
+<div class="warn-box"><b>Zet poort 6789 niet zomaar open op je router.</b> Het dashboard spreekt gewoon HTTP: je API-sleutel en alles wat je ermee doet zouden leesbaar voor iedereen onderweg over het internet gaan, en een installatie zonder sleutel staat open voor wie hem vindt. Zet je toch een poort open, stel dan eerst een API-sleutel in.</div>
+
 <h2 id="performance">13 · Prestatietools</h2>
 <h3 id="perf-benchmark">Systeembenchmark</h3>
 <p>Eén klik meet je drie plafonds - netwerkdoorvoer (een echte meting van 8 seconden
@@ -1088,6 +1107,7 @@ er precies zo uit en lost zichzelf op.</td></tr>
 <tr><td>Niets op het netwerk kan de daemon bereiken</td><td>Check <code>--bind</code>: <code>127.0.0.1</code> bedient alleen de machine waarop nzbfast draait. De standaard, <code>0.0.0.0</code>, bedient elke interface. Controleer daarna de firewall van de machine zelf op poort 6789.</td></tr>
 <tr><td>De kaart Index doorzoeken blijft klein</td><td>De indexer groeit op de achtergrond - check of er groepen zijn ingesteld bij Instellingen → Indexeren, en geef Verdiepen per scan de tijd om geschiedenis op te bouwen. "Nu scannen" forceert een ronde; de statusregel toont live de voortgang.</td></tr>
 <tr><td>De wall toont verkeerde/geen artwork</td><td>Detailblad → ✎ Match corrigeren of ↻ Metadata verversen. Filmlookups worden beter met een gratis OMDb-sleutel.</td></tr>
+<tr id="mac-cant-open"><td>macOS zegt dat de app "nzbfast" niet geopend kan worden</td><td>Twee oorzaken, allebei snel verholpen. Gebruik je de kale <code>-macos-universal.zip</code>, dubbelklik dan op <b>Start nzbfast.command</b> en niet op het bestand <code>nzbfast</code> ernaast: dat is het programma zelf, en de Finder beantwoordt een dubbelklik daarop met precies deze melding. De starter is wat alles klaarzet en opstart. Geeft de starter dezelfde melding, dan is onderweg het Unix-uitvoerbit van de kopie verdwenen: macOS bewaart dat bit in de .zip, maar chat-apps, clouddrives en opnieuw inpakken doen dat niet, waardoor een doorgegeven kopie niet-uitvoerbaar aankomt. Download de .dmg of de .zip rechtstreeks van de releases-pagina, dan gebeurt het niet. Om de kopie te redden die je al hebt: open de Terminal, typ <code>chmod +x</code> met een spatie erachter, sleep <b>Start nzbfast.command</b> en het bestand <code>nzbfast</code> op het venster en druk op Return; dubbelklik daarna opnieuw op de starter.</td></tr>
 <tr><td>Daemon start niet: poort in gebruik</td><td>Er draait al een instantie - of wijzig <code>--port</code>.</td></tr>
 <tr><td>Waar zijn de logs?</td><td>De Log-kaart op het dashboard, of de terminal/het logbestand waarmee je <code>serve</code> startte.</td></tr>
 </table></div>

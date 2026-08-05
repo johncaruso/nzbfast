@@ -875,6 +875,25 @@ pause/reprise, journal.</p>
 mobile - tout le tableau de bord et le mur ont une mise en page tactile. Le panneau
 Paramètres → Accès à distance affiche les URL exactes et un QR code à scanner.</p>
 
+<h3 id="remote-proxy">Accéder à nzbfast depuis l'extérieur de chez vous</h3>
+<p>Il n'y a pas de page de connexion, et c'est délibéré. Une connexion par cookie de session est une surface de sécurité à maintenir indéfiniment, et elle resterait le maillon le plus faible de tout ce qui est exposé à Internet. nzbfast s'authentifie plutôt avec votre clé API, et il accepte cette clé dans un en-tête de requête aussi bien que dans l'URL (<code>X-Api-Key</code>, ou <code>Authorization: Bearer</code>) - c'est ce qui permet à un service placé devant lui de gérer correctement la connexion.</p>
+<p><b>La solution la plus simple est de ne rien publier du tout.</b> Installez <b>Tailscale</b> sur cette machine et sur votre téléphone : les deux rejoignent un même réseau privé, rien n'est exposé, aucun réglage de routeur ni de certificat n'est nécessaire, et Réglages → Accès à distance affiche une adresse qui fonctionne de partout dès qu'il détecte Tailscale. Préférez cette voie sauf si vous avez besoin d'un domaine public.</p>
+<p><b>Si vous en avez vraiment besoin</b>, placez un proxy inverse devant, confiez-lui le certificat et laissez-le assurer l'authentification. Démarrez nzbfast avec <code>--bind 127.0.0.1</code> pour que le proxy soit la seule entrée, et pointez le proxy vers <code>http://127.0.0.1:6789</code> :</p>
+<pre><code># Caddy
+example.com {
+    reverse_proxy 127.0.0.1:6789
+}
+
+# nginx
+location / {
+    proxy_pass http://127.0.0.1:6789;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}</code></pre>
+<p>Ajoutez par-dessus ce que propose votre proxy : authentification basique, un service de forward-auth comme Authelia ou Authentik, ou des certificats client. Un détail piège tout le monde - Sonarr, Radarr et les applications mobiles ne peuvent pas effectuer une connexion via navigateur, laissez-leur donc un passage. La plupart des proxys savent laisser passer une requête portant un en-tête <code>X-Api-Key</code> valide et exiger l'authentification pour tout le reste.</p>
+<div class="warn-box"><b>Ne redirigez pas simplement le port 6789 sur votre routeur.</b> Le tableau de bord parle du HTTP en clair : votre clé API et tout ce que vous en faites traverseraient Internet lisibles par quiconque sur le trajet, et une installation sans aucune clé est ouverte à qui la trouve. Si vous redirigez un port malgré tout, définissez d'abord une clé API.</div>
+
 <h2 id="performance">13 · Outils de performance</h2>
 <h3 id="perf-benchmark">Benchmark système</h3>
 <p>Un clic mesure vos trois plafonds - débit réseau (une vraie sonde
@@ -1146,6 +1165,7 @@ pour trait et se résorbe seul.</td></tr>
 <tr><td>Rien sur le réseau n'arrive à joindre le daemon</td><td>Vérifiez <code>--bind</code> : <code>127.0.0.1</code> ne sert que la machine où tourne nzbfast. La valeur par défaut, <code>0.0.0.0</code>, sert toutes les interfaces. Vérifiez ensuite le pare-feu de la machine pour le port 6789.</td></tr>
 <tr><td>La carte Parcourir reste maigre</td><td>L'indexeur grandit en arrière-plan - vérifiez que les groupes sont définis dans Paramètres → Indexation, et laissez à Approfondir par scan le temps d'accumuler l'historique. « Scanner maintenant » force une passe ; la ligne d'état montre la progression en direct.</td></tr>
 <tr><td>Le mur montre une mauvaise affiche / aucune</td><td>Fiche détaillée → ✎ Corriger ou ↻ Rafraîchir les métadonnées. L'identification des films s'améliore avec une clé OMDb gratuite.</td></tr>
+<tr id="mac-cant-open"><td>macOS dit que l'application « nzbfast » ne peut pas être ouverte</td><td>Deux causes, toutes deux vite réglées. Si vous utilisez le zip simple <code>-macos-universal.zip</code>, double-cliquez sur <b>Start nzbfast.command</b>, pas sur le fichier <code>nzbfast</code> à côté : celui-ci est le programme lui-même, et le Finder répond à un double-clic dessus par exactement ce message. C'est le lanceur qui met tout en place et démarre le programme. Si le lanceur donne le même message, la copie a perdu son bit d'exécution Unix en chemin : macOS conserve ce bit à l'intérieur du .zip, mais pas les applis de chat, les disques cloud ni un nouveau zip, si bien qu'une copie transmise de la main à la main arrive non exécutable. Téléchargez le .dmg ou le .zip directement depuis la page des releases et cela n'arrivera pas. Pour récupérer la copie que vous avez déjà : ouvrez le Terminal, tapez <code>chmod +x</code> suivi d'une espace, faites glisser <b>Start nzbfast.command</b> et le fichier <code>nzbfast</code> sur la fenêtre, appuyez sur Entrée, puis double-cliquez à nouveau sur le lanceur.</td></tr>
 <tr><td>Le daemon ne démarre pas : port occupé</td><td>Une autre instance tourne - ou changez <code>--port</code>.</td></tr>
 <tr><td>Où sont les journaux ?</td><td>La carte Journal du tableau de bord, ou le terminal/fichier de log avec lequel vous avez lancé <code>serve</code>.</td></tr>
 </table></div>

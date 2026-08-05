@@ -800,6 +800,25 @@ omordning/paus/radering, historik, add-NZB, hastighetsgräns, paus/återuppta, l
 instrumentpanelen och väggen har en touchlayout. Panelen Inställningar → Fjärråtkomst visar
 de exakta URL:erna och en QR-kod att skanna.</p>
 
+<h3 id="remote-proxy">Nå nzbfast utifrån</h3>
+<p>Det finns ingen inloggningssida, och det är avsiktligt. En inloggning med sessionscookie är en säkerhetsyta att underhålla för alltid, och den skulle ändå vara det svagaste låset på något som står mot öppna internet. nzbfast autentiserar i stället med din API-nyckel, och tar emot nyckeln både i en förfrågningsrubrik och i URL:en (<code>X-Api-Key</code> eller <code>Authorization: Bearer</code>) - vilket är just det som låter något framför sköta inloggningen ordentligt.</p>
+<p><b>Enklast är att inte publicera den alls.</b> Installera <b>Tailscale</b> på den här datorn och i telefonen så hamnar båda i samma privata nät: ingenting exponeras, ingen router eller certifikat behöver röras, och Inställningar → Fjärråtkomst visar en adress som fungerar överallt så snart Tailscale körs. Välj det här om du inte uttryckligen behöver en publik domän.</p>
+<p><b>Om du behöver det</b>, sätt en omvänd proxy framför, ge den certifikatet och låt den sköta autentiseringen. Starta nzbfast med <code>--bind 127.0.0.1</code> så att proxyn är enda vägen in, och peka proxyn mot <code>http://127.0.0.1:6789</code>:</p>
+<pre><code># Caddy
+example.com {
+    reverse_proxy 127.0.0.1:6789
+}
+
+# nginx
+location / {
+    proxy_pass http://127.0.0.1:6789;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}</code></pre>
+<p>Lägg på det din proxy erbjuder: basic auth, en forward-auth-tjänst som Authelia eller Authentik, eller klientcertifikat. En sak överraskar alla - Sonarr, Radarr och telefonapparna kan inte genomföra en webbläsarinloggning, så lämna dem en väg förbi. De flesta proxyer kan släppa igenom en förfrågan med en giltig <code>X-Api-Key</code>-rubrik och kräva autentisering för allt annat.</p>
+<div class="warn-box"><b>Vidarebefordra inte bara port 6789 i routern.</b> Panelen talar oskyddad HTTP, så din API-nyckel och allt du gör med den skulle korsa internet läsbart för alla på vägen, och en installation helt utan nyckel är öppen för den som hittar den. Vidarebefordrar du ändå en port, sätt en API-nyckel först.</div>
+
 <h2 id="performance">13 · Prestandaverktyg</h2>
 <h3 id="perf-benchmark">Systembenchmark</h3>
 <p>Ett klick mäter dina tre tak - nätverkshastighet (en riktig 8-sekunders
@@ -1049,6 +1068,7 @@ propagationsfördröjning ser likadan ut och löser sig själv.</td></tr>
 <tr><td>Ingenting på nätverket når daemonen</td><td>Kontrollera <code>--bind</code>: <code>127.0.0.1</code> betjänar bara maskinen som nzbfast kör på. Standarden, <code>0.0.0.0</code>, betjänar varje gränssnitt. Kontrollera sedan maskinens egen brandvägg för port 6789.</td></tr>
 <tr><td>Bläddra-kortet förblir litet</td><td>Indexeraren växer i bakgrunden - kontrollera att grupper är satta i Inställningar → Indexering, och ge Fördjupa per skanning tid att samla historik. "Skanna nu" tvingar fram ett pass; statusraden visar live-förlopp.</td></tr>
 <tr><td>Väggen visar fel/inget omslag</td><td>Detaljblad → ✎ Korrigera matchning eller ↻ Uppdatera metadata. Filmuppslag blir bättre med en gratis OMDb-nyckel.</td></tr>
+<tr id="mac-cant-open"><td>macOS säger att programmet "nzbfast" inte kan öppnas</td><td>Två orsaker, båda snabbt åtgärdade. Om du använder den enkla <code>-macos-universal.zip</code>: dubbelklicka på <b>Start nzbfast.command</b>, inte på filen <code>nzbfast</code> bredvid - den är själva programmet, och Finder svarar på en dubbelklick där med precis det här meddelandet. Det är startaren som ställer i ordning allt och startar det. Om startaren ger samma meddelande har kopian tappat sin Unix-körbit på vägen: macOS bevarar den biten inuti .zip-filen, men chattappar, molndiskar och omzippning gör det inte, så en kopia som skickats vidare för hand kommer fram utan körrättighet. Ladda ner .dmg eller .zip direkt från releases-sidan så händer det inte. För att rädda kopian du redan har: öppna Terminal, skriv <code>chmod +x</code> med ett mellanslag efter, dra <b>Start nzbfast.command</b> och filen <code>nzbfast</code> till fönstret och tryck Retur - dubbelklicka sedan på startaren igen.</td></tr>
 <tr><td>Daemonen vill inte starta: porten upptagen</td><td>En annan instans körs - eller ändra <code>--port</code>.</td></tr>
 <tr><td>Var finns loggarna?</td><td>Logg-kortet på instrumentpanelen, eller terminalen/loggfilen du startade <code>serve</code> med.</td></tr>
 </table></div>

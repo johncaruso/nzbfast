@@ -348,7 +348,16 @@ fn walk<R: Read + Seek>(
                 break;
             }
         };
-        if elem_end <= pos {
+        // `elem_end <= pos` catches a walk that would not advance. The second
+        // arm catches a DIFFERENT shape: `elem_end` is clamped to `limit`
+        // above (both on the sized arm's `.min(limit)` and on the unknown-size
+        // SEGMENT arm), and `body` is past the ID and size fields, so an
+        // element whose own header runs beyond its parent's declared end
+        // lands with `body > elem_end`. That still satisfies `elem_end > pos`,
+        // because `pos < limit` is guaranteed at the top of the loop - so the
+        // first arm waves it through and the `elem_end - body` below
+        // underflows. Found by the mediaprobe fuzz target, 4 Aug.
+        if elem_end <= pos || elem_end < body {
             info.incomplete("the container's structure ends here");
             break;
         }
@@ -860,6 +869,37 @@ mod tests {
         let mut c = Cursor::new(vec![0xAEu8]);
         let mut rd = Rd::new(&mut c, None).unwrap();
         assert_eq!(read_id(&mut rd).unwrap(), (0xAE, 1));
+    }
+
+    #[test]
+    fn an_element_header_running_past_its_parent_does_not_underflow() {
+        // Found by the mediaprobe fuzz target, 4 Aug. `elem_end` is clamped
+        // to the parent's `limit`, but `body` sits past the ID and size
+        // fields, so an element whose own header crosses that limit leaves
+        // `body > elem_end` - and `elem_end - body` underflowed. The loop
+        // guard only checked `elem_end <= pos`, which this shape satisfies.
+        //
+        // Debug builds panicked outright. Release has no overflow-checks, so
+        // there it wrapped to a near-u64::MAX payload length instead; every
+        // leaf reader caps its own read, so that degraded to a misparse
+        // rather than a huge allocation. The probe runs on files still
+        // arriving off Usenet, before PAR2 has verified anything.
+        let crash = [
+            0x1a, 0x45, 0xdf, 0xa3, 0x81, 0xd7, 0x81, 0x81, 0xff, 0x6d, 0x81, 0x81, 0x76, 0x6d,
+            0xff, 0x6d, 0xff,
+        ];
+        let out = super::super::probe(
+            &mut Cursor::new(&crash[..]),
+            super::super::ProbeHint {
+                filename: None,
+                known_size: Some(crash.len() as u64),
+            },
+        );
+        // The only requirement is that it terminates without panicking; a
+        // container this broken is free to probe to Err or to a partial Ok.
+        if let Ok(i) = out {
+            assert!(i.video.len() + i.audio.len() + i.subtitles.len() <= 64);
+        }
     }
 
     #[test]

@@ -544,6 +544,27 @@ pub(in crate::serve) fn dispatch(
         // M18: per-server connection-count ladder. value = server
         // index; measures Gbps at rising socket counts so the user
         // can see what raising `connections` actually buys.
+        // Live state of a ladder in flight, polled by the dashboard
+        // while the (minutes-long) run happens. Cheap and read-only: a
+        // clone of what the prober last published.
+        // Stop a ladder in flight. Returns at once - the prober notices
+        // at its next rung boundary, which is within a rung (5-10 s).
+        "connladder_cancel" => {
+            d.ladder_cancel.store(true, Ordering::Release);
+            json!({"status": true, "running": d.ladder_busy.load(Ordering::Acquire)})
+        }
+        "connladder_live" => match d.ladder_live.lock_ok().clone() {
+            None => json!({"status": true, "running": false}),
+            Some(l) => json!({
+                "status": true,
+                "running": !l.done,
+                "host": l.host,
+                "phase": l.phase,
+                "at": l.at,
+                "steps": l.steps,
+                "started": l.started,
+            }),
+        },
         "connladder" => {
             let idx: usize = params
                 .get("value")
@@ -565,8 +586,23 @@ pub(in crate::serve) fn dispatch(
                     // value2=N: test exactly N sockets (one step) -
                     // "how many does the provider grant if I ask?"
                     let fixed: Option<usize> = params.get("value2").and_then(|v| v.parse().ok());
+                    // One ladder at a time. Two of them are each other's
+                    // contention, so a second run does not just race to
+                    // write - it makes both readings wrong, on a probe
+                    // whose entire job is measuring contention.
+                    // A cancel left over from a previous run must not kill
+                    // this one before it has measured anything.
+                    d.ladder_cancel.store(false, Ordering::Release);
+                    let Some(_permit) = crate::serve::daemon::LadderPermit::try_take(d) else {
+                        return Some(json!({"status": false,
+                            "error": "a connection test is already running -                                       wait for it to finish, then try again"}));
+                    };
                     tokio::runtime::Handle::current().block_on(async {
-                        match tokio::time::timeout(std::time::Duration::from_secs(120), async {
+                        // Raised with the reopen check: a ladder that
+                        // stopped implausibly low now spends up to three
+                        // more 5 s probes proving it, and a timeout here
+                        // throws away a run the user is watching.
+                        match tokio::time::timeout(std::time::Duration::from_secs(240), async {
                             match fixed {
                                 Some(n) => {
                                     let n = n.clamp(1, 150);
@@ -601,73 +637,226 @@ pub(in crate::serve) fn dispatch(
                                         saturated,
                                     }])
                                 }
-                                None => nzbkit::sysbench::conn_ladder(&srv, grp, cap, 5).await,
+                                None => {
+                                    // Same ceiling the auto probe judges
+                                    // against: what a job would really
+                                    // be allowed to open here.
+                                    let ceiling = crate::conntune::effective_limit(
+                                        d.connections.load(Ordering::Relaxed),
+                                        srv.connections,
+                                    );
+                                    // Publish every phase change and
+                                    // every settled rung as it happens:
+                                    // this is the run a user is sitting
+                                    // and watching.
+                                    let host = srv.host.clone();
+                                    let started = epoch_secs();
+                                    let dd = d.clone();
+                                    nzbkit::sysbench::conn_ladder(
+                                        &srv,
+                                        grp,
+                                        cap,
+                                        ceiling,
+                                        5,
+                                        |phase, at, steps| {
+                                            *dd.ladder_live.lock_ok() =
+                                                Some(crate::serve::daemon::LadderLive {
+                                                    host: host.clone(),
+                                                    phase: phase.into(),
+                                                    at,
+                                                    steps: steps.to_vec(),
+                                                    started,
+                                                    done: false,
+                                                });
+                                            !dd.ladder_cancel.load(Ordering::Acquire)
+                                        },
+                                    )
+                                    .await
+                                }
                             }
                         })
                         .await
                         {
-                            Err(_) => json!({"status": false,
-                                        "error": "connection ladder timed out"}),
+                            Err(_) => {
+                                if let Some(l) = d.ladder_live.lock_ok().as_mut() {
+                                    l.done = true;
+                                }
+                                json!({"status": false,
+                                        "error": "connection ladder timed out"})
+                            }
                             Ok(Err(e)) => json!({"status": false,
                                         "error": format!("{}: {e}", srv.host)}),
                             Ok(Ok(steps)) => {
+                                // The run is over however it ends, so the
+                                // watcher stops watching. Set before the
+                                // re-measure below, which publishes its
+                                // own phases and would otherwise leave a
+                                // finished run looking live.
+                                if let Some(l) = d.ladder_live.lock_ok().as_mut() {
+                                    l.done = true;
+                                }
+                                // A ladder whose rungs contradict each
+                                // other gets those rungs re-measured once
+                                // and averaged in before anything is read
+                                // off it (~5 s per disagreeing rung). A
+                                // clean curve is its own corroboration -
+                                // every rung agrees with its neighbours -
+                                // so it pays nothing for this.
+                                let contested = crate::conntune::knee_of(&steps)
+                                    .map(|k| (k.contested, k.gbps))
+                                    .filter(|(c, _)| !c.is_empty());
+                                let steps = match contested {
+                                    None => steps,
+                                    Some((rungs, peak)) => {
+                                        match tokio::time::timeout(
+                                            std::time::Duration::from_secs(120),
+                                            nzbkit::sysbench::remeasure(&srv, grp, &rungs, peak, 5),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(extra)) => {
+                                                crate::conntune::merge_samples(&steps, &extra)
+                                            }
+                                            // A failed re-measure leaves
+                                            // the ladder as it was: still
+                                            // jagged, so still suspect.
+                                            _ => steps,
+                                        }
+                                    }
+                                };
                                 // Probe traffic is real provider
-                                // traffic - bill it.
+                                // traffic - bill it. merge_samples sums
+                                // both samples' bytes into the rung, so
+                                // this covers the re-measure too.
                                 d.add_usage(&[(
                                     srv.host.clone(),
                                     steps.iter().map(|s| s.bytes).sum(),
                                 )]);
-                                // Smallest count reaching 90% of the
-                                // peak - robust against the non-
-                                // monotonic noise of real links.
-                                let peak = steps.iter().map(|s| s.gbps).fold(0.0, f64::max);
-                                let best = steps
-                                    .iter()
-                                    .find(|s| s.gbps >= peak * 0.9)
-                                    .map(|s| s.connections)
-                                    .unwrap_or(8);
-                                // Manual runs feed the same
-                                // auto-tune state (M7b.1).
-                                crate::conntune::record(
-                                    ctx.cfg_path,
-                                    &srv.host,
-                                    crate::conntune::Tuned {
-                                        connections: best,
-                                        granted: steps.iter().map(|s| s.granted).max().unwrap_or(0),
-                                        gbps: peak,
-                                        checked: epoch_secs(),
-                                        source: "manual".into(),
-                                        // The user ran this ladder and
-                                        // sees every rung in the UI -
-                                        // their call, applied as-is.
-                                        suspect: false,
-                                        limit: crate::conntune::effective_limit(
+                                //
+                                // No knee at all when every rung moved
+                                // essentially nothing: the provider
+                                // answered GROUP/OVER and then served no
+                                // bodies. That is a failed test, not a
+                                // knee of 2, and recording it here is
+                                // the sharper half of the bug - this
+                                // path writes `suspect: false`, so one
+                                // such ladder would cap the server's
+                                // jobs at 2 connections from the very
+                                // next job, with no second probe needed.
+                                match crate::conntune::knee_of(&steps) {
+                                    None => json!({"status": false,
+                                    "error": format!(
+                                        "{}: the test moved no data at any connection \
+                                         count - the server accepted the connections but \
+                                         served no articles, so there is no knee to apply",
+                                        srv.host
+                                    )}),
+                                    Some(knee) => {
+                                        let (best, peak) = (knee.connections, knee.gbps);
+                                        // The SAME suspicion rule the auto
+                                        // probe uses. A hand-triggered run
+                                        // is the less controlled of the
+                                        // two - it runs whenever the user
+                                        // presses it, not when the queue
+                                        // and the scan are both idle - so
+                                        // it has no business being the one
+                                        // that applies a low knee on
+                                        // sight. See conntune::is_suspect.
+                                        let ceiling = crate::conntune::effective_limit(
                                             d.connections.load(Ordering::Relaxed),
                                             srv.connections,
-                                        ),
-                                        v: crate::conntune::SCHEMA,
-                                    },
-                                );
-                                // Manual runs re-judge line-speed
-                                // coverage too - same as the auto probe.
-                                if let Ok(c) = nzbkit::config::Config::load(ctx.cfg_path) {
-                                    crate::serve::tasks::update_tune_hint(
-                                        d,
-                                        &c.servers,
-                                        &crate::conntune::load(ctx.cfg_path),
-                                    );
+                                        );
+                                        // A `value2=N` run measures ONE rung, so
+                                        // `knee_of` cannot do anything but bless
+                                        // it: with a single step the peak IS that
+                                        // step, nothing can fall below the bar,
+                                        // and out comes a trusted knee of N from
+                                        // one 6 s sample. It then caps real jobs,
+                                        // and - worse - a low N parks itself as
+                                        // `pending`, so the next auto probe
+                                        // corroborates against a number a
+                                        // diagnostic invented.
+                                        //
+                                        // It also contradicts the screen it is on:
+                                        // the dashboard offers an explicit "Apply
+                                        // N to this server" button, which only
+                                        // means anything if testing does not
+                                        // itself apply. So this path measures and
+                                        // reports, and touches nothing.
+                                        // A cancelled ladder stopped
+                                        // wherever the user pressed the
+                                        // button, so its rungs are a
+                                        // truncated climb rather than a
+                                        // curve with a knee in it -
+                                        // reading one off would record a
+                                        // cap from wherever they happened
+                                        // to lose patience.
+                                        let cancelled = d.ladder_cancel.load(Ordering::Acquire);
+                                        if fixed.is_none() && !cancelled {
+                                            let suspect = crate::conntune::is_suspect(
+                                                best,
+                                                ceiling,
+                                                knee.jagged,
+                                                crate::conntune::load(ctx.cfg_path).get(&srv.host),
+                                            );
+                                            crate::conntune::record(
+                                                ctx.cfg_path,
+                                                &srv.host,
+                                                crate::conntune::Tuned {
+                                                    connections: best,
+                                                    granted: steps
+                                                        .iter()
+                                                        .map(|s| s.granted)
+                                                        .max()
+                                                        .unwrap_or(0),
+                                                    asked: knee.asked,
+                                                    gbps: peak,
+                                                    checked: epoch_secs(),
+                                                    source: "manual".into(),
+                                                    suspect,
+                                                    pending: None,
+                                                    limit: ceiling,
+                                                    v: crate::conntune::SCHEMA,
+                                                },
+                                            );
+                                            // Manual runs re-judge line-speed
+                                            // coverage too - same as the auto probe.
+                                            if let Ok(c) =
+                                                nzbkit::config::Config::load(ctx.cfg_path)
+                                            {
+                                                crate::serve::tasks::update_tune_hint(
+                                                    d,
+                                                    &c.servers,
+                                                    &crate::conntune::load(ctx.cfg_path),
+                                                );
+                                            }
+                                        }
+                                        json!({
+                                            "status": true,
+                                            "host": srv.host,
+                                            "account_limit": srv.connections,
+                                            // Read-only run: nothing was stored,
+                                            // so the UI must not imply a knee was
+                                            // applied.
+                                            "applied": fixed.is_none() && !cancelled,
+                                            "cancelled": cancelled,
+                                            "steps": steps,
+                                            "recommended": best,
+                                            // The rung the knee was read
+                                            // off: once clamped to the
+                                            // granted count the
+                                            // recommendation matches no
+                                            // rung, and the ★ marking it
+                                            // in the table would vanish.
+                                            "asked": knee.asked,
+                                            "jagged": knee.jagged,
+                                            "peak_gbps": peak,
+                                            // Yardstick for the verdict, not a
+                                            // bound on the measurement (0 = unset).
+                                            "line_speed": d.line_speed.load(Ordering::Relaxed),
+                                        })
+                                    }
                                 }
-                                json!({
-                                    "status": true,
-                                    "host": srv.host,
-                                    "account_limit": srv.connections,
-                                    "steps": steps,
-                                    "recommended": best,
-                                    "peak_gbps": peak,
-                                    // Yardstick for the verdict, not a
-                                    // bound on the measurement (0 = unset).
-                                    "line_speed": d.line_speed.load(Ordering::Relaxed),
-                                })
                             }
                         }
                     })

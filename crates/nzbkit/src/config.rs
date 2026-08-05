@@ -55,6 +55,22 @@ pub struct ServerConfig {
     /// Provider's allowed concurrent connections (we typically use far fewer).
     #[serde(default = "default_connections")]
     pub connections: u32,
+    /// Use exactly `connections` on this server: the auto-tuner may keep
+    /// measuring it, but its knee is never applied here.
+    ///
+    /// The tuner is a measurement, and a measurement can be wrong in a
+    /// way its own guards do not catch - a tester whose downloads got
+    /// faster all the way to 36 sockets was handed 6, and the only
+    /// escape was the GLOBAL auto-tune switch, which also gives up
+    /// tuning on the providers it was getting right. This is the
+    /// per-server lock: whatever the ladder decides, this number wins.
+    ///
+    /// Deliberately not a "disable tuning here" flag. The probe still
+    /// runs and still reports, because a user who pins a number is
+    /// exactly the user who wants to see what the ladder thinks of it -
+    /// they simply are not going to be overruled by it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pin_connections: bool,
     /// Socket receive buffer in bytes (best-effort; kernel may clamp).
     /// Leave unset: kernels autotune per-connection windows (Linux to
     /// ~6 MB via tcp_rmem, macOS to 4 MB via autorcvbufmax), and bench
@@ -512,6 +528,7 @@ pub fn parse_sabnzbd_ini(text: &str) -> Result<Vec<ServerConfig>, ConfigError> {
             connections: get("connections")
                 .parse()
                 .unwrap_or_else(|_| default_connections()),
+            pin_connections: false,
             rcvbuf: None,
             level: get("priority").parse().unwrap_or(0),
             group: None,
@@ -614,6 +631,7 @@ pub fn parse_nzbget_conf(text: &str) -> Vec<ServerConfig> {
             connections: get("connections")
                 .parse()
                 .unwrap_or_else(|_| default_connections()),
+            pin_connections: false,
             rcvbuf: None,
             level: get("level").parse().unwrap_or(0),
             group: (grp > 0).then(|| format!("g{grp}")),

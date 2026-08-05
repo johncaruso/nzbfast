@@ -222,6 +222,11 @@ pub struct BrowseQuery {
     /// rules). Wall/list views set this; API facades (newznab, *arrs)
     /// stay uncurated.
     pub curated: bool,
+    /// M30: leave adult titles out of the curated views. Off by default
+    /// so every uncurated facade (newznab, the *arrs) is untouched, and
+    /// so a caller has to ask for it deliberately - see
+    /// [`ADULT_GENRE_SQL`].
+    pub hide_adult: bool,
     /// M30: genre substring filter over the enriched metadata (cards
     /// only - unenriched cards drop out while it's active).
     pub genre: Option<String>,
@@ -248,6 +253,37 @@ pub struct VerdictFilter {
     pub now: i64,
 }
 
+/// The "this is adult" test, as one SQL predicate over `titles.genres`.
+///
+/// Kept in one place because two views have to agree about it (the
+/// poster wall and the release list), and because the shape of it is not
+/// obvious: see the call site in `browse_cards` for why "Adult" alone is
+/// not a substring match. `NOT (...)` rather than an inverted test so an
+/// unenriched title, whose genres are empty, is KEPT - an unknown genre
+/// is not evidence of anything, and dropping every unenriched card the
+/// moment the filter came on would gut the wall.
+macro_rules! adult_genre_match_sql {
+    () => {
+        "(\
+     LOWER(COALESCE(t.genres,'')) LIKE '%hentai%' \
+     OR LOWER(COALESCE(t.genres,'')) LIKE '%erotic%' \
+     OR LOWER(TRIM(COALESCE(t.genres,''))) = 'adult')"
+    };
+}
+
+pub const ADULT_GENRE_SQL: &str = concat!("NOT ", adult_genre_match_sql!());
+
+/// The same test the POSITIVE way round, for a query that has to SELECT
+/// adult titles rather than exclude them - the flat release list has no
+/// `titles` join, so it filters with a `title_key NOT IN (SELECT … WHERE
+/// <this>)` subquery instead.
+///
+/// Both spellings come from one literal on purpose: they are the two
+/// halves that have to agree, and they did not - the grouped view
+/// carried the filter and the flat one did not, so turning group-by-
+/// title off brought every Adult/Hentai/Erotic release straight back.
+pub const ADULT_GENRE_MATCH_SQL: &str = adult_genre_match_sql!();
+
 impl Default for BrowseQuery {
     fn default() -> Self {
         BrowseQuery {
@@ -264,6 +300,7 @@ impl Default for BrowseQuery {
             max_junk: None,
             title_key: None,
             curated: false,
+            hide_adult: false,
             genre: None,
             year_min: 0,
             year_max: 0,
@@ -4518,6 +4555,22 @@ impl Index {
         if q.curated {
             self.curation_wheres("{}", &mut wheres, &mut params)?;
         }
+        // M30: adult titles, when the caller asked for them to be left
+        // out. `browse_cards` joins `titles` and can test the genres
+        // directly; a flat release row only carries its parse key, so
+        // the same test runs as a subquery over the titles that MATCH -
+        // which keeps the unenriched-titles-are-kept behaviour the card
+        // query gets from its `NOT (...)` (an empty genre list matches
+        // nothing here, so the release stays).
+        //
+        // This whole clause was missing: the setting promises it covers
+        // the wall AND the release list, and switching group-by-title
+        // off put the adult releases straight back on screen.
+        if q.hide_adult {
+            wheres.push(format!(
+                "{{}}title_key NOT IN (SELECT t.key FROM titles t WHERE {ADULT_GENRE_MATCH_SQL})"
+            ));
+        }
         // M29 3c: availability verdict as a real SQL predicate. A scalar
         // function backed by the oracle Snapshot keeps ALL verdict logic
         // (Wilson bounds, family fallback, blind-spot demotion) in one
@@ -4806,6 +4859,24 @@ impl Index {
         if let Some(g) = q.genre.as_deref().filter(|g| !g.trim().is_empty()) {
             let p = bind(&mut params, Box::new(g.trim().to_string()));
             title_wheres.push(format!("t.genres LIKE '%' || {p} || '%'"));
+        }
+        // Adult titles, when the caller asked for them to be left out.
+        //
+        // The vocabulary is deliberately NARROW, and grounded in what the
+        // providers actually write rather than in what sounds right. Two
+        // tokens are unambiguous wherever they appear ("Hentai",
+        // "Erotic"). "Adult" is NOT: TVmaze hands it out alongside
+        // ordinary genres, and a bare substring test on it hides
+        // `Married With Children` ("Comedy, Family, Adult"), which is a
+        // mainstream sitcom. So it only counts when it stands alone -
+        // which is exactly how the genuinely adult titles carry it.
+        //
+        // Errs towards SHOWING: a title tagged "Adult, Romance" slips
+        // through. That is the right way round - wrongly hiding a show
+        // the user owns is a bug they will report, wrongly showing one
+        // is a chip away.
+        if q.hide_adult {
+            title_wheres.push(ADULT_GENRE_SQL.to_string());
         }
         // M30: decade chips - original-year range over the same
         // enriched-year-with-parse-key-fallback expression the Year
@@ -8703,6 +8774,122 @@ mod tests {
         assert_eq!(total, 1, "{cards:?}");
         assert_eq!(cards[0].title_key, "m:new film:2026");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The adult filter hides what it should and, more importantly,
+    /// does NOT hide what it should not.
+    ///
+    /// "Adult" is a genre TVmaze hands out alongside ordinary ones, so a
+    /// bare substring test on it hides `Married With Children`
+    /// ("Comedy, Family, Adult") - a mainstream sitcom. It only counts
+    /// when it stands alone, which is how the genuinely adult titles in
+    /// a real index carry it. An unenriched title has no genres at all
+    /// and must survive: an unknown genre is not evidence of anything.
+    #[test]
+    fn the_adult_filter_spares_a_sitcom_tagged_adult() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-index-adult-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ix = Index::open(&dir.join("index.db")).unwrap();
+        let mk = |f: &str, from: &str, id: &str| {
+            entry(&format!("\"{f}\" yEnc (1/1)"), from, id, 4 << 30)
+        };
+        ix.ingest(
+            "alt.binaries.test",
+            &[
+                mk(
+                    "Married With Children.2001.1080p.WEB.x264-GRP.mkv",
+                    "a@a",
+                    "a1",
+                ),
+                mk("All About Sex.2002.1080p.WEB.x264-GRP.mkv", "b@b", "a2"),
+                mk("Some Anime.2003.1080p.WEB.x264-GRP.mkv", "c@c", "a3"),
+                mk("Unenriched Film.2004.1080p.WEB.x264-GRP.mkv", "d@d", "a4"),
+            ],
+            1_000,
+        )
+        .unwrap();
+        for (key, genres) in [
+            ("m:married with children:2001", "Comedy, Family, Adult"),
+            ("m:all about sex:2002", "Adult"),
+            ("m:some anime:2003", "Hentai"),
+        ] {
+            ix.title_seed(key, "movie", "T", 2001).unwrap();
+            ix.db
+                .execute(
+                    "UPDATE titles SET genres=?2, checked=1 WHERE key=?1",
+                    rusqlite::params![key, genres],
+                )
+                .unwrap();
+        }
+        let titles = |hide_adult: bool| -> Vec<String> {
+            let (cards, _) = ix
+                .browse_cards(
+                    &BrowseQuery {
+                        curated: true,
+                        hide_adult,
+                        limit: 50,
+                        ..Default::default()
+                    },
+                    CardSort::Title,
+                    false,
+                    false,
+                    None,
+                )
+                .unwrap();
+            cards.into_iter().map(|c| c.title_key).collect()
+        };
+        let off = titles(false);
+        assert_eq!(off.len(), 4, "nothing is filtered when it is off: {off:?}");
+
+        let on = titles(true);
+        assert!(
+            on.iter().any(|k| k == "m:married with children:2001"),
+            "a sitcom tagged Adult beside Comedy and Family must survive: {on:?}"
+        );
+        assert!(
+            on.iter().any(|k| k == "m:unenriched film:2004"),
+            "an unenriched title has no genres and must survive: {on:?}"
+        );
+        assert!(
+            !on.iter().any(|k| k == "m:all about sex:2002"),
+            "Adult standing alone is the real thing: {on:?}"
+        );
+        assert!(
+            !on.iter().any(|k| k == "m:some anime:2003"),
+            "Hentai is unambiguous wherever it appears: {on:?}"
+        );
+
+        // The SAME expectations through the flat release list. The
+        // filter lived only in the card query, so switching
+        // group-by-title off was a way round the setting: every
+        // Adult/Hentai release came back.
+        let flat = |hide_adult: bool| -> Vec<String> {
+            let (rows, total) = ix
+                .browse(&BrowseQuery {
+                    curated: true,
+                    hide_adult,
+                    limit: 50,
+                    ..Default::default()
+                })
+                .unwrap();
+            // `total` drives the pager, so it has to agree with the page.
+            assert_eq!(total as usize, rows.len(), "total disagrees with the page");
+            rows.into_iter().map(|r| r.stem).collect()
+        };
+        let has = |v: &[String], needle: &str| v.iter().any(|s| s.to_lowercase().contains(needle));
+        let off = flat(false);
+        assert_eq!(off.len(), 4, "nothing is filtered when it is off: {off:?}");
+        let on = flat(true);
+        assert!(
+            has(&on, "married with children") && has(&on, "unenriched film"),
+            "the flat list must spare the same titles the grid spares: {on:?}"
+        );
+        assert!(
+            !has(&on, "all about sex") && !has(&on, "some anime"),
+            "the flat list still shows adult releases: {on:?}"
+        );
+        teardown(&dir, ix);
     }
 
     #[test]

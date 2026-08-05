@@ -807,6 +807,25 @@ reordonare/pauză/ștergere, istoric, adăugare-NZB, limită de viteză, pauză/
 panou și perete au un aspect tactil. Panoul Setări → Acces la distanță arată
 URL-urile exacte și un cod QR de scanat.</p>
 
+<h3 id="remote-proxy">Accesul la nzbfast din afara casei</h3>
+<p>Nu există o pagină de autentificare, iar asta este intenționat. Un login cu cookie de sesiune este o suprafață de securitate de întreținut la nesfârșit și ar rămâne oricum cea mai slabă încuietoare a oricărui lucru expus pe internet. nzbfast se autentifică în schimb cu cheia ta API și acceptă cheia atât într-un antet al cererii, cât și în URL (<code>X-Api-Key</code> sau <code>Authorization: Bearer</code>) - exact ceea ce permite unui serviciu aflat în față să se ocupe cum trebuie de autentificare.</p>
+<p><b>Cel mai simplu este să nu îl publici deloc.</b> Instalează <b>Tailscale</b> pe această mașină și pe telefon, iar amândouă intră în aceeași rețea privată: nimic nu este expus, nu e nevoie de router sau certificate, iar Setări → Acces la distanță afișează o adresă care funcționează de oriunde de îndată ce vede Tailscale pornit. Alege această cale dacă nu ai nevoie explicit de un domeniu public.</p>
+<p><b>Dacă ai nevoie</b>, pune în față un proxy invers, dă-i certificatul și lasă-l pe el să facă autentificarea. Pornește nzbfast cu <code>--bind 127.0.0.1</code>, ca proxy-ul să fie singura cale de intrare, și îndreaptă proxy-ul spre <code>http://127.0.0.1:6789</code>:</p>
+<pre><code># Caddy
+example.com {
+    reverse_proxy 127.0.0.1:6789
+}
+
+# nginx
+location / {
+    proxy_pass http://127.0.0.1:6789;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}</code></pre>
+<p>Adaugă deasupra ce oferă proxy-ul tău: autentificare basic, un serviciu de forward-auth precum Authelia sau Authentik, ori certificate de client. Un lucru îi prinde pe toți - Sonarr, Radarr și aplicațiile de telefon nu pot parcurge o autentificare din browser, așa că lasă-le o cale pe lângă. Majoritatea proxy-urilor pot lăsa să treacă o cerere cu un antet <code>X-Api-Key</code> valid și pot cere autentificare pentru tot restul.</p>
+<div class="warn-box"><b>Nu redirecționa pur și simplu portul 6789 pe router.</b> Panoul vorbește HTTP simplu, deci cheia ta API și tot ce faci cu ea ar traversa internetul lizibile pentru oricine de pe traseu, iar o instalare fără nicio cheie este deschisă oricui o găsește. Dacă redirecționezi totuși un port, setează mai întâi o cheie API.</div>
+
 <h2 id="performance">13 · Instrumente de performanță</h2>
 <h3 id="perf-benchmark">Benchmark de sistem</h3>
 <p>Un singur clic măsoară cele trei plafoane ale tale - debitul de rețea (o sondă reală de 8 secunde
@@ -1059,6 +1078,7 @@ reia singur o dată după o așteptare, fiindcă întârzierea de propagare arat
 <tr><td>Nimic din rețea nu ajunge la daemon</td><td>Verifică <code>--bind</code>: <code>127.0.0.1</code> servește doar mașina pe care rulează nzbfast. Valoarea implicită, <code>0.0.0.0</code>, servește fiecare interfață. Apoi verifică firewallul mașinii pentru portul 6789.</td></tr>
 <tr><td>Cardul Răsfoiește rămâne mic</td><td>Indexerul crește în fundal - verifică dacă grupurile din Setări → Indexare sunt setate și dă-i timp Aprofundării per scanare să acumuleze istoric. „Scanează acum” forțează o trecere; linia de stare arată progresul în timp real.</td></tr>
 <tr><td>Peretele arată grafică greșită/lipsă</td><td>Fișa de detalii → ✎ Corectează potrivirea sau ↻ Reîmprospătează metadatele. Căutările de filme se îmbunătățesc cu o cheie OMDb gratuită.</td></tr>
+<tr id="mac-cant-open"><td>macOS spune că aplicația "nzbfast" nu poate fi deschisă</td><td>Două cauze, ambele rapide. Dacă folosești arhiva simplă <code>-macos-universal.zip</code>, dă dublu clic pe <b>Start nzbfast.command</b>, nu pe fișierul <code>nzbfast</code> de lângă el: acela e programul propriu-zis, iar Finder răspunde la un dublu clic pe el exact cu acest mesaj. Lansatorul e cel care pregătește totul și pornește programul. Dacă și lansatorul dă același mesaj, copia și-a pierdut bitul Unix de execuție pe drum: macOS păstrează acel bit în interiorul arhivei .zip, dar aplicațiile de chat, discurile din cloud și rearhivarea nu îl păstrează, așa că o copie dată din mână în mână ajunge fără drept de execuție. Descarcă .dmg sau .zip direct de pe pagina de release-uri și nu se întâmplă. Ca să salvezi copia pe care o ai deja: deschide Terminalul, scrie <code>chmod +x</code> cu un spațiu la final, trage <b>Start nzbfast.command</b> și fișierul <code>nzbfast</code> în fereastră și apasă Return, apoi dă din nou dublu clic pe lansator.</td></tr>
 <tr><td>Daemonul nu pornește: portul e ocupat</td><td>Rulează altă instanță - sau schimbă <code>--port</code>.</td></tr>
 <tr><td>Unde sunt jurnalele?</td><td>Cardul Jurnal din panou sau terminalul/fișierul de jurnal cu care ai lansat <code>serve</code>.</td></tr>
 </table></div>

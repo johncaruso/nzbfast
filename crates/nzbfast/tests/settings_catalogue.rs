@@ -256,6 +256,15 @@ fn serve_env(dir: &Path, env: &[(&str, &str)]) -> Running {
         let child = cmd
             .env("NZBFAST_NO_ENRICH", "1")
             .env_remove("NZBFAST_OPEN")
+            // Run the daemon IN the scratch directory. Every path it is
+            // given here is absolute, so this changes nothing for the
+            // existing tests - but anything the daemon resolves against
+            // its own cwd now lands in scratch instead of in the crate
+            // directory the test binary happens to run from. That is
+            // what lets `a_relative_move_destination_is_refused_before_
+            // it_is_created` assert on the stray folder without a failure
+            // dropping one into the repo.
+            .current_dir(dir)
             .arg("--config")
             .arg(dir.join("config.json"))
             .arg("serve")
@@ -772,5 +781,190 @@ fn a_min_free_of_zero_survives_a_restart() {
         "a non-zero floor did not survive the restart"
     );
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A relative move destination is refused, and refused BEFORE the daemon
+/// creates anything.
+///
+/// `create_dir_all` is happy to make a relative path, and it lands under
+/// the daemon's WORKING DIRECTORY: `/var/lib/nzbfast` under the systemd
+/// unit, the container's workdir under Docker, and wherever the launcher
+/// happened to be otherwise. Typing `nas/movies` into the settings field
+/// therefore created a real folder, passed `path_writable`, passed the
+/// download-folder check, and was stored - and completed jobs were then
+/// moved into a directory the user never chose and would not think to
+/// look in.
+///
+/// Both the global destination and the per-category list reach the same
+/// `move_tree`, so both are pinned. The ordering assertion is the point
+/// of the test: a refusal that fires AFTER `create_dir_all` still leaves
+/// the stray folder behind.
+#[test]
+fn a_relative_move_destination_is_refused_before_it_is_created() {
+    let dir = scratch("relmove");
+    let d = serve(&dir);
+
+    // `serve_env` runs the daemon with its cwd here, so a relative
+    // destination would materialise at exactly this path.
+    let stray = dir.join("nas");
+
+    for (name, value) in [
+        ("move_completed", "nas/movies"),
+        ("move_completed_cats", "movies=nas/movies"),
+    ] {
+        let r = api(
+            d.port,
+            &format!("mode=config&name={name}&value={}", urlenc(value)),
+        );
+        assert_eq!(
+            r["status"].as_bool(),
+            Some(false),
+            "{name} accepted a relative destination: {r}"
+        );
+        let err = r["error"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("relative path") && err.contains("full path"),
+            "{name}'s refusal has to name what was expected, got: {err:?}"
+        );
+    }
+
+    assert!(
+        !stray.exists(),
+        "a refused destination was created anyway at {}",
+        stray.display()
+    );
+
+    // The guard must not have broken the case it is guarding. An
+    // absolute destination is still accepted and still read back.
+    let good = dir.join("library");
+    let r = api(
+        d.port,
+        &format!(
+            "mode=config&name=move_completed&value={}",
+            urlenc(&good.to_string_lossy())
+        ),
+    );
+    assert_eq!(
+        r["status"].as_bool(),
+        Some(true),
+        "an absolute destination was refused: {r}"
+    );
+    assert_eq!(
+        settings_block(d.port)
+            .get("move_completed")
+            .and_then(|v| v.as_str()),
+        Some(good.to_string_lossy().as_ref()),
+        "an accepted destination did not read back"
+    );
+
+    drop(d);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Percent-encode a query value. `/` is left alone so paths stay legible
+/// in a failure message; `=` and the rest are escaped, which is what the
+/// `category=path` value above needs.
+fn urlenc(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// #18: a rule says what its pattern will actually do, and saying it does
+/// not change what gets stored.
+///
+/// Both halves matter. `pat_match` never fails - a pattern that will not
+/// compile silently becomes a literal keyword search, and one that
+/// compiles to "match anything" silently claims the whole queue - so the
+/// verdict is the only way either is visible in the editor. And because
+/// it describes a value rather than being one, it must never end up IN
+/// the value: `Rule` is the persisted shape in settings.json, so a
+/// verdict that round-tripped through a save would be written to disk and
+/// then read back as part of the rule.
+#[test]
+fn a_rules_pattern_verdict_is_reported_but_never_stored() {
+    let dir = scratch("ruleverdict");
+    let d = serve(&dir);
+
+    // One that will not compile, one that matches everything, and one
+    // ordinary rule whose "but not" is the broken half.
+    let rules = r#"[{"name":"a","match":"*anime*","category":"anime"},
+                    {"name":"b","match":"!*","category":"junk"},
+                    {"name":"c","match":"2160p","not_match":".*","category":"movies"}]"#;
+    let r = api(
+        d.port,
+        &format!("mode=config&name=smart_folders&value={}", urlenc(rules)),
+    );
+    assert_eq!(r["status"].as_bool(), Some(true), "rules rejected: {r}");
+
+    let read = settings_block(d.port);
+    let got = read["smart_folders"].as_array().expect("smart_folders");
+    assert_eq!(got.len(), 3, "{got:?}");
+    assert_eq!(
+        got[0]["match_verdict"].as_str(),
+        Some("literal"),
+        "a pattern that cannot compile was not reported: {}",
+        got[0]
+    );
+    assert_eq!(
+        got[1]["match_verdict"].as_str(),
+        Some("matches_everything"),
+        "a catch-all pattern was not reported: {}",
+        got[1]
+    );
+    // An ordinary pattern says nothing at all - absent, not "ok".
+    assert!(
+        got[2].get("match_verdict").is_none(),
+        "an ordinary rule was annotated: {}",
+        got[2]
+    );
+    // ...and the verdict is per FIELD, so the "but not" is judged too.
+    assert_eq!(
+        got[2]["not_verdict"].as_str(),
+        Some("matches_everything"),
+        "but-not was not judged: {}",
+        got[2]
+    );
+
+    // Now the half that is easy to get wrong. Save the rules back exactly
+    // as the daemon just reported them - which is what an editor that
+    // echoed its payload would do - and settings.json must still hold only
+    // the rule's own fields.
+    let echoed = serde_json::to_string(got).unwrap();
+    let r = api(
+        d.port,
+        &format!("mode=config&name=smart_folders&value={}", urlenc(&echoed)),
+    );
+    assert_eq!(r["status"].as_bool(), Some(true), "re-save rejected: {r}");
+
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("settings.json")).unwrap()).unwrap();
+    let stored = saved["smart_folders"]
+        .as_array()
+        .expect("smart_folders missing from settings.json");
+    for rule in stored {
+        let keys: Vec<_> = rule
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|k| k.contains("verdict"))
+            .collect();
+        assert!(
+            keys.is_empty(),
+            "a verdict was written to settings.json: {rule}"
+        );
+    }
+    // And the rules themselves survived the round trip intact.
+    assert_eq!(stored.len(), 3);
+    assert_eq!(stored[0]["match"].as_str(), Some("*anime*"));
+    assert_eq!(stored[2]["not_match"].as_str(), Some(".*"));
+
+    drop(d);
     let _ = std::fs::remove_dir_all(&dir);
 }

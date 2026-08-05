@@ -208,12 +208,110 @@ pub struct PoolConfig {
     /// None = the old behaviour, connect per run and QUIT at the end,
     /// which is still right for a one-shot CLI `get`.
     pub warm: Option<Arc<crate::warmpool::WarmPool>>,
+    /// Tail fan-out prototype (off by default, env NZBFAST_TAIL_FANOUT=1):
+    /// in the endgame, an IDLE primary connection races a healthy
+    /// in-flight article too - same server included - instead of only
+    /// the 430-laddering ones. First completion wins, the loser's read
+    /// is abandoned, so the waste is bounded to bytes-in-flight at win
+    /// time. See `pick_dup` for the exact gates.
+    pub tail_fanout: bool,
+    /// Hedged-request experiment (off by default, env NZBFAST_HEDGE=1):
+    /// replace the flat 8 s staleness bound in the dup race with an
+    /// adaptive one - 3x the trained dispatch-to-done article-time EWMA,
+    /// clamped to [500 ms, 8 s] - so a mid-run straggler is raced after
+    /// roughly three article-times instead of a flat 8 s. Hedge issue
+    /// rate is capped (see `pick_dup`) so jitter cannot turn into a
+    /// duplicate storm.
+    pub hedge: bool,
+    /// Slow-connection recycle experiment (off by default, env
+    /// NZBFAST_RECYCLE_SLOW=1): a connection whose articles keep LOSING
+    /// dup races is a degraded TCP session - after
+    /// [`RECYCLE_RACE_LOSSES`] consecutive losses it sheds its pipeline
+    /// and redials instead of continuing to lose. Racing fixes the
+    /// symptom per article; this fixes the cause.
+    pub recycle_slow: bool,
+    /// Slope-recycle experiment (off by default, env
+    /// NZBFAST_RECYCLE_SLOPE=1): a session whose own delivery rate sits
+    /// below a quarter of its server's per-worker average after 10 s is
+    /// a degraded TCP session - redial it proactively, before it loses
+    /// races or strands a tail article. The reactive `recycle_slow`
+    /// waits for the damage; this watches the slope.
+    pub recycle_slope: bool,
+    /// Hot-spare experiment (off by default, env NZBFAST_HOT_SPARE=1):
+    /// keep ONE authenticated spare connection parked per server during
+    /// the run; a worker whose session dies claims it instantly instead
+    /// of paying dial + TLS + auth in its critical path, and a filler
+    /// task re-dials the spare in the background. The spare is +1 over
+    /// the configured budget - a provider at its cap simply refuses it,
+    /// which costs nothing.
+    pub hot_spare: bool,
+    /// Early fan-out experiment (env NZBFAST_TAIL_FANOUT=2, which also
+    /// implies `tail_fanout`): arm the endgame dup rules from the
+    /// moment the queue runs dry (the pool's tail latch) instead of
+    /// waiting for pending <= ENDGAME_MAX. With a big fleet the queue
+    /// dries with far more than 64 articles in flight - 48 connections
+    /// at window 4 is ~190 - and that whole stretch has idle capacity
+    /// the endgame gate refuses to spend. Earlier than queue-dry is
+    /// meaningless by construction: no worker is idle before it.
+    pub tail_fanout_early: bool,
 }
 
 /// Live per-server gauges, updated by workers with relaxed atomics and
 /// readable at any moment (the dashboard's connection-pool view).
 pub struct LiveStats {
     pub servers: Vec<ServerLive>,
+    /// A capped ring of timestamped pool events, so a throughput dip can
+    /// be ATTRIBUTED after the fact instead of guessed at.
+    ///
+    /// The gauges above are levels: they say what is true now, and a
+    /// counter that has been climbing all run cannot tell you that
+    /// something happened at 22:59. A dip is an event at a moment, and
+    /// until this existed the daemon recorded no moments at all - the
+    /// pool counted reconnects into a `PoolStats` field that only the
+    /// CLI ever read, and the capacity warning fired `if first`, so the
+    /// second and third bounce of a run were silent by construction.
+    /// One real dip on a 59 GB job had NOTHING anywhere to explain it.
+    ///
+    /// Capped and timestamped rather than logged: the log is the wrong
+    /// shape (a flapping provider floods it, and nothing aligns it with
+    /// the graph), while a bounded ring the UI can overlay on the
+    /// throughput trace answers the only question worth asking - what
+    /// else was happening at the moment the line fell over.
+    pub events: std::sync::Mutex<std::collections::VecDeque<PoolEvent>>,
+}
+
+/// One thing that happened to the pool, at a moment.
+#[derive(Debug, Clone)]
+pub struct PoolEvent {
+    /// Unix milliseconds. The dashboard's throughput samples carry their
+    /// own wall-clock, so this is what lets the two be laid on top of
+    /// each other; a monotonic instant could not cross the API.
+    pub at_ms: u64,
+    pub host: String,
+    /// `reconnect` | `cap` | `blocked` - see [`LiveStats::note`].
+    pub kind: &'static str,
+    /// Free text for the user, already specific: the provider's own
+    /// refusal line, or the reason a session ended.
+    pub detail: String,
+}
+
+/// How many events are kept. At the rate a healthy run generates them
+/// this is hours; at the rate a sick one does it is the last few
+/// minutes, which is exactly the window someone stares at a dip in.
+const EVENT_RING: usize = 256;
+
+/// How long a worker must wait on the write side before it is worth
+/// marking. A full channel is the pipeline working as designed - bodies
+/// arrive faster than they decode all the time - so the threshold is set
+/// where a pause stops being normal and starts being something a person
+/// would notice in the graph.
+const BLOCKED_NOTE_MS: u64 = 500;
+
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 pub struct ServerLive {
@@ -240,6 +338,33 @@ pub struct ServerLive {
     /// provider's own sentence ("max simultaneous IP addresses reached")
     /// tells the user what to do and our paraphrase would not.
     pub refusal: std::sync::Mutex<Option<Refusal>>,
+    /// Sessions this server lost and redialled MID-RUN (the first
+    /// connect is not one). The pool has always counted these into
+    /// `PoolStats::reconnects`, but only the one-shot CLI ever read that
+    /// - on the daemon path a worker whose socket died and came back was
+    /// invisible, which is the single most likely cause of a dip that
+    /// leaves the job itself undamaged.
+    pub reconnects: AtomicU64,
+    /// Milliseconds this server's workers spent parked because the
+    /// fetch→decode channel was FULL - i.e. waiting on everything
+    /// downstream (decode, verify, the disk), not on the network.
+    ///
+    /// This is the half that makes a dip diagnosable rather than merely
+    /// visible. Both causes look identical on the throughput graph, and
+    /// they have opposite remedies: if the line fell while this was
+    /// climbing, the network was fine and the write side could not keep
+    /// up (an external enclosure hiccuping, a slow volume); if it fell
+    /// while `reconnects` moved instead, it was the provider. Measuring
+    /// only one of them would have let every dip be blamed on the one we
+    /// happened to instrument.
+    pub blocked_ms: AtomicU64,
+    /// Unix ms of the last `blocked` event noted for this server, so a
+    /// genuinely stalled disk marks the graph once a second instead of
+    /// once per article. Without it a bad enough stall would flush the
+    /// whole ring with its own events and erase the reconnects sitting
+    /// beside them - the instrumentation would destroy the comparison it
+    /// exists to make.
+    pub last_blocked_note: AtomicU64,
 }
 
 /// A server's refusal to authenticate, as shown to the user.
@@ -265,9 +390,45 @@ impl LiveStats {
                     bytes: AtomicU64::new(0),
                     articles_tried: AtomicU64::new(0),
                     articles_missing: AtomicU64::new(0),
+                    reconnects: AtomicU64::new(0),
+                    blocked_ms: AtomicU64::new(0),
+                    last_blocked_note: AtomicU64::new(0),
                 })
                 .collect(),
+            events: std::sync::Mutex::new(std::collections::VecDeque::new()),
         })
+    }
+
+    /// Record one event against a server, oldest dropped at the cap.
+    ///
+    /// Deliberately infallible and deliberately quiet: instrumentation
+    /// that can fail, block, or log is instrumentation that changes the
+    /// thing it measures. A poisoned ring is not worth a panic in a
+    /// download worker, so it is simply skipped.
+    pub fn note(&self, idx: usize, kind: &'static str, detail: impl Into<String>) {
+        let Some(host) = self.servers.get(idx).map(|s| s.host.clone()) else {
+            return;
+        };
+        let Ok(mut ring) = self.events.lock() else {
+            return;
+        };
+        if ring.len() >= EVENT_RING {
+            ring.pop_front();
+        }
+        ring.push_back(PoolEvent {
+            at_ms: now_ms(),
+            host,
+            kind,
+            detail: detail.into(),
+        });
+    }
+
+    /// Events newest first, for the API.
+    pub fn recent_events(&self, limit: usize) -> Vec<PoolEvent> {
+        self.events
+            .lock()
+            .map(|r| r.iter().rev().take(limit).cloned().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -316,6 +477,12 @@ impl Default for PoolConfig {
             oracle: None,
             inflight_cap: 0,
             warm: None,
+            tail_fanout: false,
+            hedge: false,
+            recycle_slow: false,
+            recycle_slope: false,
+            hot_spare: false,
+            tail_fanout_early: false,
         }
     }
 }
@@ -755,6 +922,20 @@ impl QueueControl {
                 .and_then(std::sync::Weak::upgrade)
                 .is_some_and(|sh| sh.draining.load(Ordering::Acquire))
     }
+
+    /// Network-tail visibility (tail-prefetch experiment): Some(pending
+    /// article count) once a primary worker has found the queue dry
+    /// with articles still in flight - the pool's own tail latch - and
+    /// None before that moment or once the run is gone. `Some(0)` means
+    /// the tail completed; a live tail is `Some(n)` with `n > 0`.
+    pub fn tail_pending(&self) -> Option<usize> {
+        let sh = {
+            let g = self.shared.lock_ok();
+            g.as_ref()?.upgrade()?
+        };
+        let latched = sh.tail_started.lock_ok().is_some();
+        latched.then(|| sh.pending.load(Ordering::Acquire))
+    }
 }
 
 struct Work {
@@ -937,6 +1118,33 @@ struct Shared {
     cancelled: std::sync::Mutex<HashMap<String, Work>>,
     /// Tail duplicates that won their race (emitted the outcome).
     dup_wins: AtomicU64,
+    /// Opt-in tail fan-out (see [`PoolConfig::tail_fanout`] and
+    /// `pick_dup`): in the endgame, idle primaries race healthy
+    /// in-flight articles too. Uniform across servers - the daemon sets
+    /// every server's config from one env knob.
+    tail_fanout: bool,
+    /// Hedge experiment (see [`PoolConfig::hedge`]), uniform like
+    /// `tail_fanout`.
+    hedge: bool,
+    /// Early fan-out (see [`PoolConfig::tail_fanout_early`]), uniform.
+    tail_fanout_early: bool,
+    /// Dispatch-to-done article time EWMA in ms, trained by the 222
+    /// Done path only (430s answer with no body and requeues never
+    /// completed - both would drag the average away from what a
+    /// straggler actually costs). 0 = untrained. Includes time spent
+    /// queued behind pipeline-mates, deliberately: that IS the time an
+    /// article blocks its slot.
+    art_ms: AtomicU64,
+    /// Dup dispatches issued on staleness alone (the hedge), for the
+    /// issue-rate cap and the diagnostics line.
+    hedges_issued: AtomicU64,
+    /// Hot-spare experiment: one parked, authenticated connection per
+    /// server, claimed by any worker whose session dies. Filled by a
+    /// per-server background task (spawned lazily by the first worker,
+    /// so both the single-runtime and sharded paths get one).
+    spares: Vec<std::sync::Mutex<Option<Connection>>>,
+    /// One filler per server, whichever worker gets there first.
+    spare_filler_started: Vec<AtomicBool>,
     /// M14e tiers: per-server level and live-worker counts. A fill
     /// server's gate only counts LIVE lower-level servers, so a dead
     /// primary (all its workers bowed out) never wedges the queue.
@@ -1043,6 +1251,25 @@ const PROMOTE_SHED_MIN_AGE: Duration = Duration::from_millis(400);
 const ADAPTIVE_FIRST_BYTE_MIN: Duration = Duration::from_secs(2);
 const ADAPTIVE_FIRST_BYTE_MAX: Duration = Duration::from_secs(10);
 const ADAPTIVE_STALL: Duration = Duration::from_secs(8);
+
+/// Tail fan-out (opt-in, `PoolConfig::tail_fanout`): an idle primary only
+/// races a HEALTHY in-flight article once it has been on the wire this
+/// long. Same reasoning as `PROMOTE_SHED_MIN_AGE`: a read younger than
+/// this finishes faster than the duplicate's dispatch round-trip on any
+/// healthy line, so racing it buys nothing and doubles its bytes. A tail
+/// article still outstanding past this floor is exactly the straggler
+/// the fan-out exists for.
+const TAIL_FANOUT_MIN_AGE: Duration = Duration::from_millis(500);
+
+/// Hedge experiment: the flat staleness bound the adaptive one clamps
+/// to (and the bound used whenever hedging is off or untrained).
+const HEDGE_STALE_MAX: Duration = Duration::from_secs(8);
+
+/// Recycle experiment: consecutive dup-race losses before a connection
+/// concludes it is the slow one and redials. One loss can be bad luck
+/// (the endgame fan-out races healthy articles on purpose); two in a
+/// row with no win between them is a pattern.
+const RECYCLE_RACE_LOSSES: u32 = 2;
 
 /// Per-connection pipeline depth while stream mode is active. Depth 1
 /// means a promoted article waits at most one article's transfer before
@@ -1369,6 +1596,15 @@ impl Shared {
             drained_at: std::sync::Mutex::new(None),
             cancelled: std::sync::Mutex::new(HashMap::new()),
             dup_wins: AtomicU64::new(0),
+            tail_fanout: servers.iter().any(|(_, c)| c.tail_fanout),
+            tail_fanout_early: servers.iter().any(|(_, c)| c.tail_fanout_early),
+            hedge: servers.iter().any(|(_, c)| c.hedge),
+            art_ms: AtomicU64::new(0),
+            hedges_issued: AtomicU64::new(0),
+            spares: (0..n_servers)
+                .map(|_| std::sync::Mutex::new(None))
+                .collect(),
+            spare_filler_started: (0..n_servers).map(|_| AtomicBool::new(false)).collect(),
             levels: servers.iter().map(|(s, _)| s.level).collect(),
             alive: (0..n_servers).map(|_| AtomicUsize::new(0)).collect(),
             connected: (0..n_servers).map(|_| AtomicBool::new(false)).collect(),
@@ -1445,17 +1681,22 @@ impl Shared {
     fn report_diagnostics(&self) {
         let dups = self.dups_issued.load(Ordering::Relaxed);
         let wins = self.dup_wins.load(Ordering::Relaxed);
+        let hedges = self.hedges_issued.load(Ordering::Relaxed);
+        let art = self.art_ms.load(Ordering::Relaxed);
         let ts = *self.tail_started.lock_ok();
         let da = *self.drained_at.lock_ok();
         let run = self.start.elapsed().as_secs_f64();
         match (ts, da) {
             (Some(t), Some(d)) => info!(
                 target: "pool",
-                "run {run:.2}s · queue dry at {:.2}s · drained at {:.2}s · {dups} dups ({wins} won)",
+                "run {run:.2}s · queue dry at {:.2}s · drained at {:.2}s · {dups} dups ({wins} won) · {hedges} hedges · art {art} ms",
                 (t - self.start).as_secs_f64(),
                 (d - self.start).as_secs_f64(),
             ),
-            _ => info!(target: "pool", "run {run:.2}s · no tail · {dups} dups ({wins} won)"),
+            _ => info!(
+                target: "pool",
+                "run {run:.2}s · no tail · {dups} dups ({wins} won) · {hedges} hedges · art {art} ms"
+            ),
         }
     }
 
@@ -1562,6 +1803,40 @@ impl Shared {
         }
     }
 
+    /// Done-path deregistration: also feeds the article-time EWMA the
+    /// hedge bound trains on. Failure, requeue and shed paths use plain
+    /// [`Self::deregister_inflight`] - a requeue's age is not a
+    /// completion time.
+    fn deregister_inflight_done(&self, w: &Work) {
+        if w.dup {
+            return; // dups are tracked via the original's entry
+        }
+        if let Some(inf) = self.inflight.lock_ok().remove(&w.id) {
+            let ms = (inf.dispatched.elapsed().as_millis() as u64).max(1);
+            let old = self.art_ms.load(Ordering::Relaxed);
+            let new = if old == 0 { ms } else { old - old / 8 + ms / 8 };
+            self.art_ms.store(new.max(1), Ordering::Relaxed);
+        }
+    }
+
+    /// Hedge experiment: the staleness bound for the dup race. 3x the
+    /// trained article-time EWMA, clamped between the fan-out age floor
+    /// and the old flat 8 s - hedging can only be MORE responsive than
+    /// the flat rule, never less, and an untrained EWMA keeps the flat
+    /// bound.
+    fn hedge_stale_bound(&self) -> Duration {
+        if !self.hedge {
+            return HEDGE_STALE_MAX;
+        }
+        match self.art_ms.load(Ordering::Relaxed) {
+            0 => HEDGE_STALE_MAX,
+            ewma => Duration::from_millis((ewma * 3).clamp(
+                TAIL_FANOUT_MIN_AGE.as_millis() as u64,
+                HEDGE_STALE_MAX.as_millis() as u64,
+            )),
+        }
+    }
+
     /// B3 wire-cap: charge one dispatched BODY's estimated bytes.
     fn charge_wire(&self) {
         self.inflight_body_bytes
@@ -1615,6 +1890,22 @@ impl Shared {
     /// walking the server ladder hop by hop (measured ~7 s of 0.0 MB/s
     /// tail on the damaged leg). `required` keeps fill-server economics:
     /// a level-N server only joins once every live lower level 430'd.
+    ///
+    /// Opt-in tail fan-out (`PoolConfig::tail_fanout`): in the endgame,
+    /// an IDLE primary also races HEALTHY in-flight articles - the last
+    /// few articles sitting on whichever connection happened to grab
+    /// them, while everyone else has gone idle. Gates: endgame only,
+    /// level 0 only (block-account bytes are never spent on speed),
+    /// empty pipeline only (a busy worker is not the idle capacity this
+    /// spends), article on the wire ≥ [`TAIL_FANOUT_MIN_AGE`], and each
+    /// server races an article at most once (`dup_servers`) - which also
+    /// spreads idle workers across stragglers instead of piling them
+    /// all on one. Unlike the two rules above this one may race an
+    /// article on ANOTHER CONNECTION OF ITS OWN SERVER: at the tail the
+    /// enemy is usually one degraded TCP session, not a slow provider,
+    /// and a fresh session to the same host routinely beats it. The
+    /// owner connection can never dup itself - the article rides its
+    /// pipeline, so its `window_used` is never 0.
     fn pick_dup(
         &self,
         me: usize,
@@ -1624,7 +1915,15 @@ impl Shared {
         window_used: usize,
         level: u32,
     ) -> Option<Work> {
-        let endgame = self.pending.load(Ordering::Acquire) <= ENDGAME_MAX;
+        // Early fan-out experiment: the tail latch flips at the exact
+        // moment idle capacity first exists (a primary found the queue
+        // dry with work still in flight), which with a big fleet is
+        // long before pending reaches ENDGAME_MAX - 48 connections at
+        // window 4 dry the queue with ~190 articles still on the wire.
+        // The idle-only and once-per-server gates below keep the spend
+        // self-limiting at any pending count.
+        let endgame = self.pending.load(Ordering::Acquire) <= ENDGAME_MAX
+            || (self.tail_fanout_early && self.tail_started.lock_ok().is_some());
         // PER-WORKER, like `faster_can_take` above. `rate()` is a server's
         // whole-run byte total over wall time, so it measures its share of
         // the job, and that share is set mostly by how many connections it
@@ -1635,20 +1934,32 @@ impl Shared {
         // live workers asks the question the heuristic means to ask: is
         // this article's owner actually slower.
         let my_rate = self.rate_per_worker(me);
+        // Hedge experiment: adaptive staleness bound, and a cap on how
+        // many dups staleness ALONE may issue - one per 20 completions
+        // plus a small burst allowance. The rate rule and the endgame
+        // are never capped; the cap exists so EWMA jitter on a link
+        // with occasional slow articles cannot become a dup storm.
+        let stale_bound = self.hedge_stale_bound();
         let done = self.done.lock_ok();
+        let hedges_ok =
+            !self.hedge || self.hedges_issued.load(Ordering::Relaxed) < 4 + done.len() as u64 / 20;
         let mut inflight = self.inflight.lock_ok();
-        // (id, owner_rate, ladder-progress) - endgame prefers the article
-        // CLOSEST to its verdict, normal phase the slowest owner.
-        let mut best: Option<(&String, f64, u32)> = None;
+        // (id, owner_rate, ladder-progress, stale-only) - endgame prefers
+        // the article CLOSEST to its verdict, normal phase the slowest
+        // owner; stale-only marks a hedge for the issue-rate cap.
+        let mut best: Option<(&String, f64, u32, bool)> = None;
+        // Tail fan-out candidates: fewest racers first, then longest on
+        // the wire - so the second idle worker picks the second
+        // straggler, not the same one.
+        let mut fan: Option<(&String, u8, Instant)> = None;
         for (id, inf) in inflight.iter() {
-            if inf.server == me
-                || inf.tried_430 & my_bit != 0
-                || inf.dup_servers & my_bit != 0
-                || done.contains(id)
-            {
+            if inf.tried_430 & my_bit != 0 || inf.dup_servers & my_bit != 0 || done.contains(id) {
                 continue;
             }
             if endgame && inf.tried_430 != 0 {
+                if inf.server == me {
+                    continue;
+                }
                 if window_used > 0 {
                     continue; // ladder probes ride EMPTY pipelines only
                 }
@@ -1656,9 +1967,28 @@ impl Shared {
                     continue; // fill gate: lower levels first
                 }
                 let progress = inf.tried_430.count_ones();
-                if best.is_none_or(|(_, _, p)| progress > p) {
-                    best = Some((id, 0.0, progress));
+                if best.is_none_or(|(_, _, p, _)| progress > p) {
+                    best = Some((id, 0.0, progress, false));
                 }
+                continue;
+            }
+            // Tail fan-out (opt-in): endgame, healthy article, idle
+            // primary. Same-server racing allowed - see the doc above.
+            // An article younger than the age floor falls through to the
+            // normal rules instead, so switching this on never REMOVES a
+            // dup the rate rule would have issued.
+            if self.tail_fanout
+                && endgame
+                && level == 0
+                && window_used == 0
+                && inf.dispatched.elapsed() >= TAIL_FANOUT_MIN_AGE
+            {
+                if fan.is_none_or(|(_, d, t)| (inf.dups, inf.dispatched) < (d, t)) {
+                    fan = Some((id, inf.dups, inf.dispatched));
+                }
+                continue;
+            }
+            if inf.server == me {
                 continue;
             }
             if inf.dups >= 1 {
@@ -1677,15 +2007,23 @@ impl Shared {
                 continue;
             }
             let owner_rate = self.rate_per_worker(inf.server);
-            let stale = inf.dispatched.elapsed() > Duration::from_secs(8);
-            if my_rate > 2.0 * owner_rate || stale {
+            let slow_owner = my_rate > 2.0 * owner_rate;
+            let stale = inf.dispatched.elapsed() > stale_bound;
+            if slow_owner || (stale && hedges_ok) {
                 // Prefer the slowest owner.
-                if best.is_none_or(|(_, r, _)| owner_rate < r) {
-                    best = Some((id, owner_rate, 0));
+                if best.is_none_or(|(_, r, _, _)| owner_rate < r) {
+                    best = Some((id, owner_rate, 0, !slow_owner));
                 }
             }
         }
-        let id = best.map(|(id, _, _)| id.clone())?;
+        // Ladder probes and slow-owner races keep priority - they carry
+        // verdict or recovery value; the fan-out is pure speculation.
+        if let Some((_, _, _, true)) = best {
+            self.hedges_issued.fetch_add(1, Ordering::Relaxed);
+        }
+        let id = best
+            .map(|(id, _, _, _)| id.clone())
+            .or_else(|| fan.map(|(id, _, _)| id.clone()))?;
         let inf = inflight.get_mut(&id).unwrap();
         inf.dups += 1;
         inf.dup_servers |= group_bits;
@@ -2306,6 +2644,45 @@ async fn park_or_quit(cfg: &PoolConfig, server: &ServerConfig, conn: Connection)
 /// terminal-state exit protocol. Every worker leaves through here, so the
 /// last one out is the one that seals the run (see [`seal_run`]).
 #[allow(clippy::too_many_arguments)]
+/// Hot-spare filler: keeps ONE authenticated connection parked for its
+/// server until the run ends, re-dialling whenever a worker claims it.
+/// Ends with the run (`finished`) or on user abort, quitting whatever
+/// it still holds. Connect failures back off 5 s - a provider at its
+/// connection cap refuses the spare and that refusal must not become a
+/// dial storm against the very cap the workers depend on.
+async fn spare_filler(shared: Arc<Shared>, server: ServerConfig, idx: usize) {
+    let mut finished = shared.finished.subscribe();
+    loop {
+        if *finished.borrow() || shared.aborted.load(Ordering::Acquire) {
+            break;
+        }
+        let empty = shared.spares[idx].lock_ok().is_none();
+        if empty {
+            match Connection::connect(&server).await {
+                Ok((c, _)) => {
+                    *shared.spares[idx].lock_ok() = Some(c);
+                }
+                Err(_) => {
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                        _ = finished.wait_for(|f| *f) => break,
+                    }
+                }
+            }
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+            _ = finished.wait_for(|f| *f) => break,
+        }
+    }
+    // Guard dropped before the await - the lock must never be held
+    // across a suspension point.
+    let leftover = shared.spares[idx].lock_ok().take();
+    if let Some(c) = leftover {
+        c.quit().await;
+    }
+}
+
 async fn worker(
     server: &ServerConfig,
     cfg: &PoolConfig,
@@ -2401,6 +2778,9 @@ async fn session_loop(
     // useful work, and the delay they have armed for the next connect.
     let mut session_failures: u32 = 0;
     let mut pending_backoff: Option<Duration> = None;
+    // Recycle experiment: consecutive articles of OURS a duplicate
+    // dispatch finished first. Reset by any completion we win.
+    let mut race_losses: u32 = 0;
     let mut ever_connected = false;
     let mut finished = shared.finished.subscribe();
     let mut promote_gen = shared.promote_gen.subscribe();
@@ -2475,13 +2855,30 @@ async fn session_loop(
             return; // user abort
         }
 
+        // Hot-spare experiment: spawn this server's filler once,
+        // whichever worker gets here first (works on the single-runtime
+        // and sharded paths alike), and claim a parked spare before
+        // anything else - a worker arriving here after a session death
+        // skips the dial entirely.
+        if cfg.hot_spare && !shared.spare_filler_started[ctx.idx].swap(true, Ordering::AcqRel) {
+            tokio::spawn(spare_filler(shared.clone(), server.clone(), ctx.idx));
+        }
+        let spare = if cfg.hot_spare {
+            shared.spares[ctx.idx].lock_ok().take()
+        } else {
+            None
+        };
+        // Slope-recycle experiment: this session's own byte total and
+        // birth, so its personal rate can be compared to the fleet's.
+        let session_start = Instant::now();
+        let mut session_bytes: u64 = 0;
         // A parked connection first. `take` has already validated it with
         // a DATE round-trip, so it is interchangeable with a fresh
         // connect here and none of the error handling below has to know
         // the difference. Worth roughly five round-trips, a TLS
         // handshake, and - the part that actually dominates on a short
         // job - a TCP congestion window that is already open.
-        let warm = match preclaimed.take() {
+        let warm = match spare.or_else(|| preclaimed.take()) {
             Some(c) => Some(c),
             None => match &cfg.warm {
                 // Raced for the same reason as the dial below: the
@@ -2540,6 +2937,16 @@ async fn session_loop(
                         connects.fetch_add(1, Ordering::Relaxed);
                         if ever_connected {
                             reconnects.fetch_add(1, Ordering::Relaxed);
+                            // The daemon's copy. `reconnects` above is
+                            // the run total and only the CLI prints it;
+                            // this is per-server, live, and timestamped,
+                            // so a dip can be laid against it.
+                            if let Some(live) = &cfg.live {
+                                if let Some(sl) = live.servers.get(ctx.idx) {
+                                    sl.reconnects.fetch_add(1, Ordering::Relaxed);
+                                }
+                                live.note(ctx.idx, "reconnect", "session lost, redialled");
+                            }
                         }
                         ever_connected = true;
                         shared.connected[ctx.idx].store(true, Ordering::Relaxed);
@@ -2623,6 +3030,16 @@ async fn session_loop(
                                         "{}: at its connection/IP cap, reducing connections: {line}",
                                         server.host
                                     );
+                                }
+                                // The ring gets EVERY bounce, not just the
+                                // first. `if first` is right for the log -
+                                // a flapping provider would drown it - but
+                                // it is why a run that hit the cap at 16 s
+                                // and again fifteen minutes later looked
+                                // like it hit it once. The ring is capped,
+                                // so it can absorb what the log must not.
+                                if let Some(live) = &cfg.live {
+                                    live.note(ctx.idx, "cap", line.clone());
                                 }
                                 // Keep at least one worker trying, or a cap that
                                 // clears later would leave the server unused for
@@ -2918,6 +3335,7 @@ async fn session_loop(
                 Ok(Ok(true)) => {
                     let w = inflight.pop_front().expect("response without command");
                     shared.release_wire(1);
+                    session_bytes += buf.len() as u64;
                     shared.bytes[ctx.idx].fetch_add(buf.len() as u64, Ordering::Relaxed);
                     if let Some(l) = &cfg.live {
                         l.servers[ctx.idx]
@@ -2937,16 +3355,126 @@ async fn session_loop(
                     if let Some(o) = &cfg.oracle {
                         o.hit(ctx.idx, shared.ages.get(&w.id).copied().unwrap_or(0));
                     }
-                    shared.deregister_inflight(&w);
+                    shared.deregister_inflight_done(&w);
                     if shared.claim_done(&w.id) {
+                        race_losses = 0;
                         if w.dup {
                             shared.dup_wins.fetch_add(1, Ordering::Relaxed);
                         }
-                        let _ = out.send(FetchOutcome::Done { id: w.id, raw: buf }).await;
+                        // Handing a body downstream is where a SLOW DISK
+                        // becomes visible: when decode/verify/write cannot
+                        // keep up the channel fills, this await parks, and
+                        // the TCP windows close behind it. That is the
+                        // designed response - but it is indistinguishable
+                        // from a network dip on the graph unless somebody
+                        // measures it, so this does.
+                        //
+                        // try_send first, so the healthy path costs no
+                        // clock read at all: only a body that actually had
+                        // to WAIT is timed. Everything else would put an
+                        // Instant::now() on the hot path of every article
+                        // to observe a number that is almost always zero.
+                        let done = FetchOutcome::Done { id: w.id, raw: buf };
+                        if let Err(tokio::sync::mpsc::error::TrySendError::Full(done)) =
+                            out.try_send(done)
+                        {
+                            let waited = std::time::Instant::now();
+                            let _ = out.send(done).await;
+                            let ms = waited.elapsed().as_millis() as u64;
+                            if let Some(live) = &cfg.live
+                                && let Some(sl) = live.servers.get(ctx.idx)
+                            {
+                                sl.blocked_ms.fetch_add(ms, Ordering::Relaxed);
+                                // A pause long enough to bend the graph
+                                // earns a mark on it. Brief parks are
+                                // NORMAL - the channel is meant to fill -
+                                // so only a wait a person could see counts,
+                                // and at most one a second per server.
+                                if ms >= BLOCKED_NOTE_MS {
+                                    let now = now_ms();
+                                    let prev = sl.last_blocked_note.load(Ordering::Relaxed);
+                                    if now.saturating_sub(prev) >= 1000
+                                        && sl
+                                            .last_blocked_note
+                                            .compare_exchange(
+                                                prev,
+                                                now,
+                                                Ordering::Relaxed,
+                                                Ordering::Relaxed,
+                                            )
+                                            .is_ok()
+                                    {
+                                        live.note(
+                                            ctx.idx,
+                                            "blocked",
+                                            format!("waited {ms} ms for the write side"),
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         shared.complete_one();
-                    } else if let Some(p) = &cfg.buf_pool {
+                    } else {
                         // A duplicate dispatch beat us to it.
-                        p.give(buf);
+                        if let Some(p) = &cfg.buf_pool {
+                            p.give(buf);
+                        }
+                        // Recycle experiment: losing races back to back
+                        // means THIS session is the slow one - a fresh
+                        // dial to the same host routinely beats a
+                        // degraded TCP session. Deliberate reconnect:
+                        // no session strike, no backoff (same shape as
+                        // the promote shed above); the redial path
+                        // counts it into `reconnects`.
+                        race_losses += 1;
+                        if cfg.recycle_slow && race_losses >= RECYCLE_RACE_LOSSES {
+                            if let Some(l) = &cfg.live {
+                                l.note(
+                                    ctx.idx,
+                                    "reconnect",
+                                    format!(
+                                        "recycled a slow session after losing \
+                                         {race_losses} article races in a row"
+                                    ),
+                                );
+                            }
+                            race_losses = 0;
+                            shed_pipeline(&shared, &mut inflight).await;
+                            conn.quit().await; // internally bounded
+                            continue 'session;
+                        }
+                    }
+                    // Slope-recycle experiment: this session's own rate
+                    // collapsed against the fleet's per-worker average -
+                    // redial before it strands anything. Normal phase
+                    // only (endgame workers are legitimately idle-ish,
+                    // and the tail machinery owns that ground), and only
+                    // once the session has had 10 s to prove itself.
+                    // Checked ONLY on a completed article, so an idle
+                    // worker's decaying average can never trip it.
+                    if cfg.recycle_slope
+                        && shared.pending.load(Ordering::Acquire) > ENDGAME_MAX
+                        && session_start.elapsed() > Duration::from_secs(10)
+                    {
+                        let mine = session_bytes as f64 / session_start.elapsed().as_secs_f64();
+                        let fleet = shared.rate_per_worker(ctx.idx);
+                        if fleet > 0.0 && mine < 0.25 * fleet {
+                            if let Some(l) = &cfg.live {
+                                l.note(
+                                    ctx.idx,
+                                    "reconnect",
+                                    format!(
+                                        "recycled a degraded session ({:.1} MB/s vs the \
+                                         fleet's {:.1} MB/s per connection)",
+                                        mine / 1e6,
+                                        fleet / 1e6
+                                    ),
+                                );
+                            }
+                            shed_pipeline(&shared, &mut inflight).await;
+                            conn.quit().await; // internally bounded
+                            continue 'session;
+                        }
                     }
                 }
                 Ok(Ok(false)) => {
@@ -3328,6 +3856,7 @@ mod tests {
                     username: None,
                     password: None,
                     connections: 1,
+                    pin_connections: false,
                     rcvbuf: None,
                     level: 0,
                     group: None,
@@ -3481,6 +4010,7 @@ mod tests {
                 username: None,
                 password: None,
                 connections: 1,
+                pin_connections: false,
                 rcvbuf: None,
                 level: 0,
                 group: None,
@@ -3572,6 +4102,7 @@ mod tests {
                     username: None,
                     password: None,
                     connections: 1,
+                    pin_connections: false,
                     level: 0,
                     group: None,
                     retention_days: 0,
@@ -3648,6 +4179,7 @@ mod tests {
                     username: None,
                     password: None,
                     connections: 1,
+                    pin_connections: false,
                     level: 0,
                     group: None,
                     retention_days: 0,
@@ -3729,6 +4261,727 @@ mod tests {
         );
     }
 
+    /// Tail fan-out (opt-in `PoolConfig::tail_fanout`): in the endgame
+    /// an IDLE primary races a HEALTHY in-flight article - a fresh
+    /// session on the owner's own server included - once the article
+    /// has been on the wire past the age floor. Off by default; fill
+    /// servers, busy pipelines and too-young reads never join; each
+    /// server races an article at most once, which spreads idle workers
+    /// across stragglers.
+    #[tokio::test]
+    async fn tail_fanout_races_healthy_articles_in_the_endgame() {
+        let mk = |host: &str, level: u32, fanout: bool| {
+            (
+                ServerConfig {
+                    host: host.into(),
+                    port: 119,
+                    tls: false,
+                    username: None,
+                    password: None,
+                    connections: 1,
+                    pin_connections: false,
+                    level,
+                    group: None,
+                    retention_days: 0,
+                    rcvbuf: None,
+                    block_bytes: None,
+                    bind_ip: None,
+                    socks5: None,
+                    enabled: true,
+                    warm_pool: false,
+                    idle_release_secs: None,
+                    idle_keep: None,
+                    max_source_ips: None,
+                },
+                PoolConfig {
+                    tail_fanout: fanout,
+                    ..Default::default()
+                },
+            )
+        };
+        let servers = vec![mk("a", 0, true), mk("b", 0, true), mk("block", 1, true)];
+        // 3 pending ≤ ENDGAME_MAX → endgame rules apply.
+        let reqs: Vec<ArticleReq> = (0..3)
+            .map(|i| ArticleReq::fresh(format!("<h{i}>")))
+            .collect();
+        let (shared, _) = Shared::new(reqs, &servers);
+        // Healthy (never 430'd) article in flight on server 0.
+        let w = Work {
+            id: "<h0>".into(),
+            attempts: 0,
+            promoted: false,
+            tried_430: 0,
+            tried_fail: 0,
+            dup: false,
+        };
+        shared.register_inflight(&w, 0);
+
+        // Younger than the age floor: nobody speculates yet.
+        assert!(
+            shared.pick_dup(1, 0b010, 0b010, 0, 0, 0).is_none(),
+            "raced a read younger than the age floor"
+        );
+        shared
+            .inflight
+            .lock_ok()
+            .get_mut("<h0>")
+            .unwrap()
+            .dispatched = Instant::now() - Duration::from_secs(1);
+        // A busy pipeline is not idle capacity.
+        assert!(
+            shared.pick_dup(1, 0b010, 0b010, 0, 2, 0).is_none(),
+            "a busy worker speculated"
+        );
+        // A fill server never spends paid bytes on speculation.
+        assert!(
+            shared.pick_dup(2, 0b100, 0b100, 0b011, 0, 1).is_none(),
+            "a fill server speculated"
+        );
+        // An idle worker on the OWNER's own server races it...
+        let d = shared
+            .pick_dup(0, 0b001, 0b001, 0, 0, 0)
+            .expect("same-server tail race");
+        assert_eq!(d.id, "<h0>");
+        assert!(d.dup);
+        // ...each server at most once...
+        assert!(
+            shared.pick_dup(0, 0b001, 0b001, 0, 0, 0).is_none(),
+            "server a raced twice"
+        );
+        // ...and a second primary joins the same article.
+        let d2 = shared
+            .pick_dup(1, 0b010, 0b010, 0, 0, 0)
+            .expect("cross-server tail race");
+        assert_eq!(d2.id, "<h0>");
+
+        // A second straggler goes to the worker whose server is already
+        // racing the first - idle capacity spreads, not piles.
+        let w2 = Work {
+            id: "<h1>".into(),
+            attempts: 0,
+            promoted: false,
+            tried_430: 0,
+            tried_fail: 0,
+            dup: false,
+        };
+        shared.register_inflight(&w2, 0);
+        shared
+            .inflight
+            .lock_ok()
+            .get_mut("<h1>")
+            .unwrap()
+            .dispatched = Instant::now() - Duration::from_secs(1);
+        let d3 = shared
+            .pick_dup(1, 0b010, 0b010, 0, 0, 0)
+            .expect("second straggler race");
+        assert_eq!(d3.id, "<h1>");
+
+        // OFF (the default): the identical shape yields no speculation.
+        let servers_off = vec![mk("a", 0, false), mk("b", 0, false)];
+        let reqs: Vec<ArticleReq> = (0..3)
+            .map(|i| ArticleReq::fresh(format!("<h{i}>")))
+            .collect();
+        let (off, _) = Shared::new(reqs, &servers_off);
+        off.register_inflight(&w, 0);
+        off.inflight.lock_ok().get_mut("<h0>").unwrap().dispatched =
+            Instant::now() - Duration::from_secs(1);
+        assert!(
+            off.pick_dup(1, 0b010, 0b010, 0, 0, 0).is_none(),
+            "tail fan-out fired while switched off"
+        );
+
+        // Normal phase (pending > ENDGAME_MAX): fan-out stays out of it
+        // even when enabled - equal rates, not yet stale, no dup.
+        let servers_on = vec![mk("a", 0, true), mk("b", 0, true)];
+        let reqs: Vec<ArticleReq> = (0..(ENDGAME_MAX + 10))
+            .map(|i| ArticleReq::fresh(format!("<n{i}>")))
+            .collect();
+        let (big, _) = Shared::new(reqs, &servers_on);
+        let w3 = Work {
+            id: "<n0>".into(),
+            attempts: 0,
+            promoted: false,
+            tried_430: 0,
+            tried_fail: 0,
+            dup: false,
+        };
+        big.register_inflight(&w3, 0);
+        big.inflight.lock_ok().get_mut("<n0>").unwrap().dispatched =
+            Instant::now() - Duration::from_secs(1);
+        assert!(
+            big.pick_dup(1, 0b010, 0b010, 0, 0, 0).is_none(),
+            "speculated outside the endgame"
+        );
+    }
+
+    /// Payout rig: run one full fetch against mock servers and return
+    /// (elapsed, done-count, reconnect-note ring). Every leg must
+    /// complete every article - a payout that loses data is a loss.
+    async fn payout_leg(
+        servers: Vec<(ServerConfig, PoolConfig)>,
+        ids: Vec<ArticleReq>,
+    ) -> (Duration, usize, Vec<String>) {
+        let live = LiveStats::for_servers(&servers);
+        let servers: Vec<(ServerConfig, PoolConfig)> = servers
+            .into_iter()
+            .map(|(s, mut c)| {
+                c.live = Some(live.clone());
+                (s, c)
+            })
+            .collect();
+        let (tx, mut rx) = mpsc::channel(64);
+        let t0 = Instant::now();
+        let fetch = tokio::spawn(async move { fetch_all_multi(&servers, ids, tx).await });
+        let collect = tokio::spawn(async move {
+            let mut done = 0usize;
+            while let Some(o) = rx.recv().await {
+                if matches!(o, FetchOutcome::Done { .. }) {
+                    done += 1;
+                }
+            }
+            done
+        });
+        tokio::time::timeout(Duration::from_secs(120), fetch)
+            .await
+            .expect("payout leg hung")
+            .unwrap();
+        let elapsed = t0.elapsed();
+        let done = collect.await.unwrap();
+        let notes: Vec<String> = live
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.detail.clone())
+            .collect();
+        (elapsed, done, notes)
+    }
+
+    fn payout_server(
+        srv: &crate::mock::MockServer,
+        conns: usize,
+        cfg: PoolConfig,
+    ) -> (ServerConfig, PoolConfig) {
+        let mut sc = srv.server_config();
+        sc.connections = conns as u32;
+        (
+            sc,
+            PoolConfig {
+                connections: conns,
+                ramp_delay: Duration::from_millis(0),
+                ..cfg
+            },
+        )
+    }
+
+    /// PAYOUT: hedged requests, in the one shape the OLD rules cannot
+    /// see. A single article stalls on a server whose other connection
+    /// stays healthy - so the owner never reads as slow (the 2x rate
+    /// rule stays dark) and the only rescues are the flat 8 s stale
+    /// rule (off) versus the hedge's adaptive bound (on). Both servers
+    /// are throttled to EQUAL per-connection rates for the same reason.
+    /// The first version of this rig stalled ids early on an unthrottled
+    /// server and proved something else entirely: the rate rule rescued
+    /// everything in 500 ms because a hung loopback server's per-worker
+    /// rate collapses instantly. That is worth knowing - the existing
+    /// rules already cover the whole-server-degraded shape - but the
+    /// hedge exists for the single-straggler-on-a-healthy-server shape,
+    /// which is what this rig now builds.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "wall-clock payout measurement - flaky under suite load, run with --ignored"]
+    async fn payout_hedge_rescues_stalls_in_under_a_second_not_eight() {
+        let data: Vec<u8> = (0..640_000u32).map(|i| i as u8).collect();
+        let mk_maps = || {
+            let mut articles = std::collections::HashMap::new();
+            let segs = crate::mock::make_file_articles("h.bin", &data, 8_000, "hp", &mut articles);
+            (articles, segs)
+        };
+        let (arts_a, segs) = mk_maps();
+        let (arts_b, _) = mk_maps();
+        // Stragglers late in the queue, so the owner has a healthy rate
+        // history when they hit. Several of them, and A gets 3 of the 4
+        // connections below, because the mock's stall triggers on the
+        // FIRST request for an id wherever it lands: a single stalled id
+        // first-requested by healthy B proves nothing, and which server
+        // wins that race is a coin flip. Six ids against a 3:1 fleet
+        // makes "no stall ever bit A" a (1/4)^6 event.
+        let stall: std::collections::HashSet<String> = [55, 59, 63, 67, 71, 75]
+            .into_iter()
+            .map(|i| format!("<{}>", segs[i].0))
+            .collect();
+        let leg = |hedge: bool| {
+            let arts_a = arts_a.clone();
+            let arts_b = arts_b.clone();
+            let stall = stall.clone();
+            let ids: Vec<ArticleReq> = segs
+                .iter()
+                .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
+                .collect();
+            async move {
+                // 40 KB/s per connection stretches the run to ~4 s of
+                // pre-stall history. That matters: the old rate rule
+                // rescues once the hung server's RUN-AVERAGE decays
+                // past 2x, and that crossing lands at roughly four
+                // times the stall's onset - a fast rig compresses it
+                // right onto the hedge's own timescale and the two
+                // become indistinguishable (measured: 2.2 s vs 1.9 s
+                // at 200 KB/s). At 40 KB/s the old rules answer at
+                // ~11 s (flat-8s stale wins the crossing race), the
+                // hedge at ~5 s, and the gap is the payout.
+                let equal_rate = crate::mock::Throttle {
+                    per_conn_bps: 40_000,
+                    ..Default::default()
+                };
+                let a = crate::mock::MockServer::start(
+                    arts_a,
+                    crate::mock::Chaos {
+                        stall,
+                        throttle: equal_rate.clone(),
+                        ..Default::default()
+                    },
+                )
+                .await;
+                let b = crate::mock::MockServer::start(
+                    arts_b,
+                    crate::mock::Chaos {
+                        throttle: equal_rate,
+                        ..Default::default()
+                    },
+                )
+                .await;
+                let cfg = PoolConfig {
+                    hedge,
+                    window: 2,
+                    read_timeout: Duration::from_secs(12),
+                    ..Default::default()
+                };
+                let servers = vec![payout_server(&a, 3, cfg.clone()), payout_server(&b, 1, cfg)];
+                let r = payout_leg(servers, ids).await;
+                println!(
+                    "  leg: A served {} accepted {} · B served {} accepted {}",
+                    a.served.load(Ordering::Relaxed),
+                    a.accepted.load(Ordering::Relaxed),
+                    b.served.load(Ordering::Relaxed),
+                    b.accepted.load(Ordering::Relaxed),
+                );
+                r
+            }
+        };
+        let (off, done_off, _) = leg(false).await;
+        let (on, done_on, _) = leg(true).await;
+        println!("hedge payout: off {off:?} on {on:?}");
+        assert_eq!(done_off, segs.len());
+        assert_eq!(done_on, segs.len());
+        // Off: the stragglers wait for whichever old rule answers first
+        // (flat-8s stale, or the run-average crossing).
+        assert!(
+            off > Duration::from_secs(9),
+            "off leg finished too fast for the stalls to have bitten \
+             ({off:?}) - rig broken"
+        );
+        // On: the hedge rescues at the adaptive bound. Measured over
+        // repeated runs: off 11.9-13.0 s, on 6.2-7.9 s - a ratio bound
+        // absorbs the serialization variance through B's single idle
+        // connection where an absolute one flaked.
+        assert!(
+            on.as_secs_f64() < off.as_secs_f64() * 0.75,
+            "hedge paid out nothing ({on:?} vs {off:?})"
+        );
+    }
+
+    /// PAYOUT: slope recycle. One degraded session (8 KB/s against
+    /// healthy 100 KB/s siblings) on a single server. Reactive rules
+    /// cannot dup same-server outside the tail; the slope recycle
+    /// redials the degraded session as soon as it proves itself slow,
+    /// and the replacement is healthy. Slow by construction (~1 min for
+    /// both legs) - run explicitly.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "payout measurement (~1 min) - run with --ignored"]
+    async fn payout_slope_recycle_frees_a_degraded_session() {
+        let data: Vec<u8> = (0..6_000_000u32).map(|i| i as u8).collect();
+        let mut articles = std::collections::HashMap::new();
+        let segs = crate::mock::make_file_articles("s.bin", &data, 50_000, "sp", &mut articles);
+        let leg = |slope: bool| {
+            let articles = articles.clone();
+            let ids: Vec<ArticleReq> = segs
+                .iter()
+                .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
+                .collect();
+            async move {
+                let srv = crate::mock::MockServer::start(
+                    articles,
+                    crate::mock::Chaos {
+                        slow_conn: Some((1, 8_000)),
+                        throttle: crate::mock::Throttle {
+                            per_conn_bps: 100_000,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                )
+                .await;
+                let cfg = PoolConfig {
+                    recycle_slope: slope,
+                    ..Default::default()
+                };
+                payout_leg(vec![payout_server(&srv, 3, cfg)], ids).await
+            }
+        };
+        let (off, done_off, notes_off) = leg(false).await;
+        let (on, done_on, notes_on) = leg(true).await;
+        println!("slope payout: off {off:?} on {on:?} (notes on: {notes_on:?})");
+        assert_eq!(done_off, segs.len());
+        assert_eq!(done_on, segs.len());
+        assert!(
+            notes_on.iter().any(|n| n.contains("degraded session")),
+            "slope recycle never fired on the degraded-session rig"
+        );
+        assert!(
+            !notes_off.iter().any(|n| n.contains("degraded session")),
+            "off leg recycled - knob leak"
+        );
+        assert!(
+            on < off,
+            "recycling the degraded session did not pay ({on:?} vs {off:?})"
+        );
+    }
+
+    /// PAYOUT: hot spare. Connections die every 5 bodies and a dial
+    /// costs 250 ms (the mock's greeting delay standing in for
+    /// TCP+TLS+AUTH). The spare pays that cost in the background; the
+    /// workers' critical path skips it.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "wall-clock payout measurement - flaky under suite load, run with --ignored"]
+    async fn payout_hot_spare_hides_reconnect_latency() {
+        let data: Vec<u8> = (0..1_800_000u32).map(|i| i as u8).collect();
+        let mut articles = std::collections::HashMap::new();
+        let segs = crate::mock::make_file_articles("k.bin", &data, 20_000, "ks", &mut articles);
+        let leg = |spare: bool| {
+            let articles = articles.clone();
+            let ids: Vec<ArticleReq> = segs
+                .iter()
+                .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
+                .collect();
+            async move {
+                let srv = crate::mock::MockServer::start(
+                    articles,
+                    crate::mock::Chaos {
+                        drop_after: 8,
+                        greet_delay_ms: 250,
+                        // Throttled so deaths arrive slower than the
+                        // spare's refill cycle (poll + greet ~750 ms) -
+                        // the realistic shape; unthrottled loopback
+                        // kills sessions every few ms and no filler
+                        // could keep up (nor would it need to: that
+                        // shape is a dead server, not a flapping one).
+                        throttle: crate::mock::Throttle {
+                            per_conn_bps: 200_000,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                )
+                .await;
+                let cfg = PoolConfig {
+                    hot_spare: spare,
+                    connect_backoff: Duration::from_millis(50),
+                    ..Default::default()
+                };
+                payout_leg(vec![payout_server(&srv, 3, cfg)], ids).await
+            }
+        };
+        let (off, done_off, _) = leg(false).await;
+        let (on, done_on, _) = leg(true).await;
+        println!("spare payout: off {off:?} on {on:?}");
+        assert_eq!(done_off, segs.len());
+        assert_eq!(done_on, segs.len());
+        // The saving is bounded by the filler's 500 ms refill cycle
+        // against this rig's ~300 ms death spacing (~2-3 of 11 deaths
+        // covered, ~200 ms measured). Real sessions die minutes apart,
+        // where every death is covered; the refill cadence is the
+        // tuning lever if this graduates.
+        assert!(
+            on + Duration::from_millis(100) < off,
+            "the spare hid no reconnect latency ({on:?} vs {off:?})"
+        );
+    }
+
+    /// Early fan-out (NZBFAST_TAIL_FANOUT=2): the tail latch arms the
+    /// endgame dup rules at queue-dry, well above ENDGAME_MAX pending;
+    /// plain fan-out (=1) still waits for the pending threshold.
+    #[tokio::test]
+    async fn early_fanout_arms_at_the_tail_latch_not_the_pending_floor() {
+        let mk = |host: &str, early: bool| {
+            (
+                ServerConfig {
+                    host: host.into(),
+                    port: 119,
+                    tls: false,
+                    username: None,
+                    password: None,
+                    connections: 1,
+                    pin_connections: false,
+                    level: 0,
+                    group: None,
+                    retention_days: 0,
+                    rcvbuf: None,
+                    block_bytes: None,
+                    bind_ip: None,
+                    socks5: None,
+                    enabled: true,
+                    warm_pool: false,
+                    idle_release_secs: None,
+                    idle_keep: None,
+                    max_source_ips: None,
+                },
+                PoolConfig {
+                    tail_fanout: true,
+                    tail_fanout_early: early,
+                    ..Default::default()
+                },
+            )
+        };
+        let mk_reqs = || -> Vec<ArticleReq> {
+            (0..(ENDGAME_MAX + 40))
+                .map(|i| ArticleReq::fresh(format!("<q{i}>")))
+                .collect()
+        };
+        let w = Work {
+            id: "<q0>".into(),
+            attempts: 0,
+            promoted: false,
+            tried_430: 0,
+            tried_fail: 0,
+            dup: false,
+        };
+
+        // Plain fan-out, tail latched, pending far above the floor: the
+        // endgame rules stay dark.
+        let servers = vec![mk("a", false), mk("b", false)];
+        let (plain, _) = Shared::new(mk_reqs(), &servers);
+        plain
+            .tail_started
+            .lock_ok()
+            .get_or_insert_with(Instant::now);
+        plain.register_inflight(&w, 0);
+        plain.inflight.lock_ok().get_mut("<q0>").unwrap().dispatched =
+            Instant::now() - Duration::from_secs(1);
+        assert!(
+            plain.pick_dup(1, 0b10, 0b10, 0, 0, 0).is_none(),
+            "plain fan-out fired above ENDGAME_MAX"
+        );
+
+        // Early fan-out: same shape, latch armed -> healthy race fires.
+        let servers = vec![mk("a", true), mk("b", true)];
+        let (early, _) = Shared::new(mk_reqs(), &servers);
+        early.register_inflight(&w, 0);
+        early.inflight.lock_ok().get_mut("<q0>").unwrap().dispatched =
+            Instant::now() - Duration::from_secs(1);
+        // ...but not before the latch: no tail, no early rules.
+        assert!(
+            early.pick_dup(1, 0b10, 0b10, 0, 0, 0).is_none(),
+            "early fan-out fired before the queue ever ran dry"
+        );
+        early
+            .tail_started
+            .lock_ok()
+            .get_or_insert_with(Instant::now);
+        let d = early
+            .pick_dup(1, 0b10, 0b10, 0, 0, 0)
+            .expect("early fan-out races at the tail latch");
+        assert_eq!(d.id, "<q0>");
+        assert!(d.dup);
+    }
+
+    /// Tail-prefetch experiment: `QueueControl::tail_pending` answers
+    /// None before the pool's tail latch, Some(pending) after, and None
+    /// again once the run's Shared is gone.
+    #[tokio::test]
+    async fn queue_control_exports_the_tail_latch() {
+        let mk = |host: &str| {
+            (
+                ServerConfig {
+                    host: host.into(),
+                    port: 119,
+                    tls: false,
+                    username: None,
+                    password: None,
+                    connections: 1,
+                    pin_connections: false,
+                    level: 0,
+                    group: None,
+                    retention_days: 0,
+                    rcvbuf: None,
+                    block_bytes: None,
+                    bind_ip: None,
+                    socks5: None,
+                    enabled: true,
+                    warm_pool: false,
+                    idle_release_secs: None,
+                    idle_keep: None,
+                    max_source_ips: None,
+                },
+                PoolConfig::default(),
+            )
+        };
+        let servers = vec![mk("a")];
+        let reqs: Vec<ArticleReq> = (0..3)
+            .map(|i| ArticleReq::fresh(format!("<t{i}>")))
+            .collect();
+        let (shared, _) = Shared::new(reqs, &servers);
+        let ctl = QueueControl::default();
+        ctl.attach(&shared);
+        assert_eq!(ctl.tail_pending(), None, "no tail latched yet");
+        shared
+            .tail_started
+            .lock_ok()
+            .get_or_insert_with(Instant::now);
+        assert_eq!(ctl.tail_pending(), Some(3), "latched tail reports pending");
+        drop(shared);
+        assert_eq!(ctl.tail_pending(), None, "gone run answers None");
+    }
+
+    /// Hedge experiment (opt-in `PoolConfig::hedge`): the dup race's
+    /// staleness bound adapts to the trained article-time EWMA (3x,
+    /// clamped [500 ms, 8 s]) instead of a flat 8 s, the Done path
+    /// trains the EWMA, and stale-only dups respect the issue-rate cap.
+    /// Off keeps the flat bound.
+    #[tokio::test]
+    async fn hedge_races_a_straggler_at_the_adaptive_bound() {
+        let mk = |host: &str, hedge: bool| {
+            (
+                ServerConfig {
+                    host: host.into(),
+                    port: 119,
+                    tls: false,
+                    username: None,
+                    password: None,
+                    connections: 1,
+                    pin_connections: false,
+                    level: 0,
+                    group: None,
+                    retention_days: 0,
+                    rcvbuf: None,
+                    block_bytes: None,
+                    bind_ip: None,
+                    socks5: None,
+                    enabled: true,
+                    warm_pool: false,
+                    idle_release_secs: None,
+                    idle_keep: None,
+                    max_source_ips: None,
+                },
+                PoolConfig {
+                    hedge,
+                    ..Default::default()
+                },
+            )
+        };
+        let servers = vec![mk("a", true), mk("b", true)];
+        // Normal phase: the endgame's own rules must stay out of the way.
+        let reqs: Vec<ArticleReq> = (0..(ENDGAME_MAX + 10))
+            .map(|i| ArticleReq::fresh(format!("<s{i}>")))
+            .collect();
+        let (shared, _) = Shared::new(reqs, &servers);
+
+        // Bound math: untrained keeps the flat 8 s; trained is 3x the
+        // EWMA clamped to [500 ms, 8 s].
+        assert_eq!(shared.hedge_stale_bound(), Duration::from_secs(8));
+        shared.art_ms.store(100, Ordering::Relaxed);
+        assert_eq!(shared.hedge_stale_bound(), Duration::from_millis(500));
+        shared.art_ms.store(400, Ordering::Relaxed);
+        assert_eq!(shared.hedge_stale_bound(), Duration::from_millis(1200));
+        shared.art_ms.store(10_000, Ordering::Relaxed);
+        assert_eq!(shared.hedge_stale_bound(), Duration::from_secs(8));
+
+        // The Done path trains the EWMA (first sample is taken whole).
+        shared.art_ms.store(0, Ordering::Relaxed);
+        let w0 = Work {
+            id: "<s0>".into(),
+            attempts: 0,
+            promoted: false,
+            tried_430: 0,
+            tried_fail: 0,
+            dup: false,
+        };
+        shared.register_inflight(&w0, 0);
+        shared
+            .inflight
+            .lock_ok()
+            .get_mut("<s0>")
+            .unwrap()
+            .dispatched = Instant::now() - Duration::from_secs(1);
+        shared.deregister_inflight_done(&w0);
+        let trained = shared.art_ms.load(Ordering::Relaxed);
+        assert!(
+            (900..=1200).contains(&trained),
+            "one 1 s completion should train the EWMA to ~1000 ms, got {trained}"
+        );
+
+        // A healthy article 2 s in flight, equal rates: the flat rule
+        // keeps waiting, the trained bound (400 ms EWMA -> 1.2 s) races
+        // it and counts a hedge.
+        shared.art_ms.store(400, Ordering::Relaxed);
+        let w1 = Work {
+            id: "<s1>".into(),
+            attempts: 0,
+            promoted: false,
+            tried_430: 0,
+            tried_fail: 0,
+            dup: false,
+        };
+        shared.register_inflight(&w1, 0);
+        shared
+            .inflight
+            .lock_ok()
+            .get_mut("<s1>")
+            .unwrap()
+            .dispatched = Instant::now() - Duration::from_secs(2);
+        let d = shared
+            .pick_dup(1, 0b10, 0b10, 0, 0, 0)
+            .expect("straggler past the adaptive bound should be hedged");
+        assert_eq!(d.id, "<s1>");
+        assert!(d.dup);
+        assert_eq!(shared.hedges_issued.load(Ordering::Relaxed), 1);
+
+        // The issue-rate cap gates stale-only dups.
+        shared.hedges_issued.store(1000, Ordering::Relaxed);
+        let w2 = Work {
+            id: "<s2>".into(),
+            attempts: 0,
+            promoted: false,
+            tried_430: 0,
+            tried_fail: 0,
+            dup: false,
+        };
+        shared.register_inflight(&w2, 0);
+        shared
+            .inflight
+            .lock_ok()
+            .get_mut("<s2>")
+            .unwrap()
+            .dispatched = Instant::now() - Duration::from_secs(2);
+        assert!(
+            shared.pick_dup(1, 0b10, 0b10, 0, 0, 0).is_none(),
+            "a capped hedge still issued"
+        );
+
+        // OFF (the default): 2 s is not stale against the flat 8 s.
+        let servers_off = vec![mk("a", false), mk("b", false)];
+        let reqs: Vec<ArticleReq> = (0..(ENDGAME_MAX + 10))
+            .map(|i| ArticleReq::fresh(format!("<s{i}>")))
+            .collect();
+        let (off, _) = Shared::new(reqs, &servers_off);
+        off.art_ms.store(400, Ordering::Relaxed);
+        off.register_inflight(&w1, 0);
+        off.inflight.lock_ok().get_mut("<s1>").unwrap().dispatched =
+            Instant::now() - Duration::from_secs(2);
+        assert!(
+            off.pick_dup(1, 0b10, 0b10, 0, 0, 0).is_none(),
+            "hedge fired while switched off"
+        );
+    }
+
     /// §35: a bigger server must not duplicate a smaller one's work just
     /// for being bigger.
     ///
@@ -3751,6 +5004,7 @@ mod tests {
                     username: None,
                     password: None,
                     connections: 1,
+                    pin_connections: false,
                     level: 0,
                     group: None,
                     retention_days: 0,
@@ -3826,6 +5080,7 @@ mod tests {
                     username: None,
                     password: None,
                     connections: 1,
+                    pin_connections: false,
                     level,
                     group: None,
                     retention_days: 0,
@@ -3888,6 +5143,7 @@ mod tests {
                 username: None,
                 password: None,
                 connections: 1,
+                pin_connections: false,
                 level: 0,
                 group: None,
                 retention_days: 0,
@@ -4070,6 +5326,7 @@ mod tests {
                 username: None,
                 password: None,
                 connections: 1,
+                pin_connections: false,
                 level: 0,
                 group: None,
                 retention_days: 0,
@@ -4229,6 +5486,7 @@ mod tests {
                     username: None,
                     password: None,
                     connections: 1,
+                    pin_connections: false,
                     level: 0,
                     group: None,
                     retention_days: 0,
@@ -4407,6 +5665,7 @@ mod tests {
                 username: None,
                 password: None,
                 connections: 1,
+                pin_connections: false,
                 level: 0,
                 group: None,
                 retention_days: 0,
@@ -5168,6 +6427,7 @@ mod tests {
             username: None,
             password: None,
             connections: 1,
+            pin_connections: false,
             rcvbuf: None,
             level: 0,
             group: None,
@@ -5656,5 +6916,165 @@ mod tests {
             done, n,
             "every article must land: the server recovered before the ceiling"
         );
+    }
+
+    /// A SLOW WRITE SIDE is measured, and it is measured SEPARATELY from
+    /// anything the network did.
+    ///
+    /// This is the half of the dip instrumentation that had no signal at
+    /// all. A dip caused by an external disk hiccuping and a dip caused
+    /// by a provider dropping sessions look identical on the throughput
+    /// graph, and they want opposite remedies. Here the network is
+    /// perfect and the CONSUMER is slow, so `blocked_ms` must climb while
+    /// `reconnects` stays at zero - if both moved, or neither, the two
+    /// causes would still be indistinguishable and the instrumentation
+    /// would be decorative.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slow_write_side_is_measured_and_not_confused_with_the_network() {
+        use crate::mock::{Chaos, MockServer, make_file_articles};
+        let mut articles = std::collections::HashMap::new();
+        let payload: Vec<u8> = (0..400_000u32).map(|i| i as u8).collect();
+        let segs = make_file_articles("slow.bin", &payload, 8_000, "slow", &mut articles);
+        let srv = MockServer::start(articles, Chaos::default()).await;
+        let server = srv.server_config();
+
+        let live = LiveStats::for_servers(&[(server.clone(), PoolConfig::default())]);
+        let cfg = PoolConfig {
+            connections: 2,
+            ramp_delay: Duration::ZERO,
+            live: Some(live.clone()),
+            ..Default::default()
+        };
+        let reqs: Vec<ArticleReq> = segs
+            .iter()
+            .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
+            .collect();
+
+        // Depth 1 and a consumer that dawdles: the channel is full almost
+        // at once, which is exactly the shape a disk that cannot keep up
+        // produces. Nothing here touches the network.
+        let (tx, mut rx) = mpsc::channel(1);
+        let drain = tokio::spawn(async move {
+            let mut n = 0usize;
+            while let Some(_o) = rx.recv().await {
+                n += 1;
+                tokio::time::sleep(Duration::from_millis(60)).await;
+            }
+            n
+        });
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            fetch_all_multi(&[(server, cfg)], reqs, tx),
+        )
+        .await
+        .expect("run hung");
+        let got = drain.await.expect("drain panicked");
+        assert!(got > 0, "the run delivered nothing to measure");
+
+        let sl = &live.servers[0];
+        let blocked = sl.blocked_ms.load(Ordering::Relaxed);
+        let reconnects = sl.reconnects.load(Ordering::Relaxed);
+        assert!(
+            blocked > 0,
+            "a consumer sleeping 60 ms per article registered no wait at all"
+        );
+        assert_eq!(
+            reconnects, 0,
+            "a slow CONSUMER was booked as {reconnects} network reconnect(s) - \
+             the two causes are being conflated, which is the bug this exists to prevent"
+        );
+    }
+}
+
+#[cfg(test)]
+mod event_ring_tests {
+    use super::*;
+
+    /// Built directly rather than through `for_servers`: these tests are
+    /// about the ring, and threading a full ServerConfig literal through
+    /// them would make them fail whenever an unrelated field is added.
+    fn live(hosts: &[&str]) -> Arc<LiveStats> {
+        Arc::new(LiveStats {
+            servers: hosts
+                .iter()
+                .map(|h| ServerLive {
+                    host: (*h).to_string(),
+                    budget: 1,
+                    connected: AtomicUsize::new(0),
+                    refusal: std::sync::Mutex::new(None),
+                    bytes: AtomicU64::new(0),
+                    articles_tried: AtomicU64::new(0),
+                    articles_missing: AtomicU64::new(0),
+                    reconnects: AtomicU64::new(0),
+                    blocked_ms: AtomicU64::new(0),
+                    last_blocked_note: AtomicU64::new(0),
+                })
+                .collect(),
+            events: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        })
+    }
+
+    /// The ring is bounded, and it drops the OLDEST.
+    ///
+    /// A daemon runs for weeks. An unbounded event list would be a slow
+    /// leak in the one place nobody looks, and dropping the newest would
+    /// make it useless precisely when it is busy - which is when a dip
+    /// happens.
+    #[test]
+    fn the_ring_is_capped_and_keeps_the_newest() {
+        let l = live(&["a.example"]);
+        for i in 0..(EVENT_RING + 50) {
+            l.note(0, "reconnect", format!("#{i}"));
+        }
+        assert_eq!(l.events.lock().unwrap().len(), EVENT_RING);
+        let newest = l.recent_events(1);
+        assert_eq!(newest[0].detail, format!("#{}", EVENT_RING + 49));
+    }
+
+    /// Newest first, because that is the order the question is asked in:
+    /// "what just happened", never "what happened first".
+    #[test]
+    fn recent_events_are_newest_first() {
+        let l = live(&["a.example"]);
+        l.note(0, "cap", "one");
+        l.note(0, "cap", "two");
+        l.note(0, "cap", "three");
+        let got: Vec<String> = l.recent_events(2).into_iter().map(|e| e.detail).collect();
+        assert_eq!(got, vec!["three".to_string(), "two".to_string()]);
+    }
+
+    /// Events carry the host, so a dip on a six-provider run can be put
+    /// down to ONE of them. A count with no host would say a reconnect
+    /// happened and leave the user to guess where.
+    #[test]
+    fn an_event_names_the_server_it_happened_to() {
+        let l = live(&["a.example", "b.example"]);
+        l.note(1, "reconnect", "session lost, redialled");
+        let e = l.recent_events(1);
+        assert_eq!(e[0].host, "b.example");
+        assert_eq!(e[0].kind, "reconnect");
+    }
+
+    /// An out-of-range index is a no-op, not a panic. This is called from
+    /// download workers; instrumentation must never be the thing that
+    /// takes a run down.
+    #[test]
+    fn a_bad_index_is_ignored_rather_than_fatal() {
+        let l = live(&["a.example"]);
+        l.note(9, "reconnect", "nowhere");
+        assert!(l.recent_events(10).is_empty());
+    }
+
+    /// Timestamped in wall clock, which is what lets the UI lay an event
+    /// against a throughput sample. A monotonic instant could not cross
+    /// the API, and an index into the ring would not survive the cap.
+    #[test]
+    fn events_carry_a_wall_clock_moment() {
+        let before = now_ms();
+        let l = live(&["a.example"]);
+        l.note(0, "blocked", "waited 800 ms for the write side");
+        let e = l.recent_events(1);
+        assert!(e[0].at_ms >= before, "{} < {before}", e[0].at_ms);
+        assert!(e[0].at_ms <= now_ms());
     }
 }

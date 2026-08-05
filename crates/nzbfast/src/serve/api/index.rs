@@ -806,6 +806,9 @@ pub(in crate::serve) fn dispatch(
                 // M30: hides + learned rules always apply on the
                 // wall (the Hidden panel is its own API).
                 curated: true,
+                // Same tier as the hides and rules: a browsing filter,
+                // never applied to the uncurated facades.
+                hide_adult: d.wall_hide_adult.load(Ordering::Relaxed),
                 limit: 60,
                 ..Default::default()
             };
@@ -1061,6 +1064,11 @@ pub(in crate::serve) fn dispatch(
             // shows everything a title has, rule-hit dubs
             // included, so the user can see what a rule does.
             bq.curated = bq.title_key.is_none();
+            // Same tier, same scope: the adult filter is a browsing
+            // filter over the list, and the wall's grouped endpoint
+            // above has always set it. This one did not, so turning
+            // group-by-title off was a way round the setting.
+            bq.hide_adult = bq.curated && d.wall_hide_adult.load(Ordering::Relaxed);
             if let Ok(n) = get("limit").parse::<u32>() {
                 bq.limit = n.clamp(1, 200);
             }

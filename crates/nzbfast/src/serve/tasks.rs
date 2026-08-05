@@ -852,11 +852,35 @@ pub(super) fn spawn_predb_feed(daemon: &Arc<Daemon>) {
                 if now - last_prune >= 3_600 && daemon2.index_maintenance_ok() {
                     last_prune = now;
                     let keep_rows = daemon2.predb_max_rows.load(Ordering::Relaxed);
-                    if let Some(n) =
-                        daemon2.with_index(|ix| ix.predb_prune(keep_rows, KEEP_SECS, now).ok())
-                        && n > 0
-                    {
-                        info!(target: "predb", "pruned {n} pre line(s) past the retention window");
+                    // `.ok()` used to fold the error into the same None
+                    // the "no index" case returns, and `last_prune` was
+                    // advanced before the call - so a failure was both
+                    // silent and lost for a full hour. That matters more
+                    // since the prune became ONE transaction: a `?`
+                    // anywhere inside rolls the whole thing back, where
+                    // the old autocommitting version at least kept what
+                    // its first statement had done. SQLITE_BUSY from the
+                    // maintenance/VACUUM machinery is the ordinary way
+                    // in, and the feed then grows past both its row cap
+                    // and its retention window with nothing said.
+                    match daemon2.with_index(|ix| Some(ix.predb_prune(keep_rows, KEEP_SECS, now))) {
+                        Some(Ok(n)) if n > 0 => {
+                            info!(
+                                target: "predb",
+                                "pruned {n} pre line(s) past the retention window"
+                            );
+                        }
+                        Some(Err(e)) => {
+                            // Retry sooner than the hour, but not on the
+                            // next 20 s tick: whatever the prune was
+                            // contending with deserves room to finish.
+                            last_prune = now.saturating_sub(3_000);
+                            warn!(
+                                target: "predb",
+                                "prune failed and rolled back, retrying in ~10 min: {e}"
+                            );
+                        }
+                        _ => {}
                     }
                 }
                 // §74 hook B, the other half: whatever the naming legs
@@ -1262,7 +1286,7 @@ pub(super) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
                             // job here is to point at the record that made
                             // this file redundant, and a name lookup in the
                             // page picks the wrong row for a re-post.
-                            let queued_id = d.queue.lock().unwrap().iter().find_map(|j| {
+                            let queued_id = d.queue.lock_ok().iter().find_map(|j| {
                                 let g = j.lock_ok();
                                 (g.nzb_sha == sha).then(|| g.nzo_id.clone())
                             });
@@ -1273,7 +1297,7 @@ pub(super) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
                                      alone rather than downloading it twice",
                                     p.display()
                                 );
-                                d.watch_failed.lock().unwrap().insert(
+                                d.watch_failed.lock_ok().insert(
                                     p.clone(),
                                     (sig.0, sig.1, watchfail::ALREADY_QUEUED.into(), queued_id),
                                 );
@@ -1309,7 +1333,7 @@ pub(super) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
                                      or add the NZB from the dashboard",
                                     p.display()
                                 );
-                                d.watch_failed.lock().unwrap().insert(
+                                d.watch_failed.lock_ok().insert(
                                     p.clone(),
                                     (sig.0, sig.1, watchfail::ALREADY_DONE.into(), done_id),
                                 );
@@ -4867,6 +4891,16 @@ pub(super) fn spawn_slow_job_watchdog(
         };
         let warmup = secs("NZBFAST_DEFER_WARMUP_SECS", 45);
         let window = secs("NZBFAST_DEFER_WINDOW_SECS", 30);
+        // Tail-prefetch experiment (dark): when the active job's article
+        // queue runs dry (the pool's network tail), the flat byte window
+        // below would skip the whole prefetch block - which is exactly
+        // backwards, because the tail is when idle line capacity peaks.
+        // With the knob on, a latched tail overrides the flat-window and
+        // single-server gates; every other gate (warmup, quota, pause,
+        // one-sidecar) still applies, and the fleet the byte test then
+        // yields at a dry tail is the bounded BORROW fleet (all healthy
+        // hosts at 1-2 connections each), never a full-budget one.
+        let tail_prefetch = std::env::var("NZBFAST_TAIL_PREFETCH").is_ok_and(|v| v == "1");
         let tick = (window / 6).clamp(1, 5);
         // Rolling (time, per-host cumulative bytes) samples of the
         // ACTIVE job's pool; reset on job change. `attempted` = jobs
@@ -4899,7 +4933,7 @@ pub(super) fn spawn_slow_job_watchdog(
                     .then(|| d.active_stream.lock_ok().clone())
                     .flatten();
                 let job_info = fetching.and_then(|id| {
-                    d.queue.lock().unwrap().iter().find_map(|j| {
+                    d.queue.lock_ok().iter().find_map(|j| {
                         let g = j.lock_ok();
                         (g.nzo_id == id && g.state == JobState::Downloading && !g.suspended)
                             .then(|| (id.clone(), g.name.clone()))
@@ -5112,10 +5146,23 @@ pub(super) fn spawn_slow_job_watchdog(
             let rate = total as f64 / span;
             // Every sustained window is also a reference sample.
             d.best_rate_bps.fetch_max(rate as u64, Ordering::Relaxed);
+            // Tail-prefetch experiment: a latched network tail with
+            // work still in flight. Read fresh each tick - the latch
+            // only ever appears once per run, and `Some(0)` (tail
+            // finished) must not trigger.
+            let tail_now = tail_prefetch
+                && d.hub
+                    .queue_ctl
+                    .lock_ok()
+                    .as_ref()
+                    .and_then(|c| c.tail_pending())
+                    .is_some_and(|p| p > 0);
             // A wholly stalled job is the pool's retry logic's
             // problem, and a single-server setup has nothing to
-            // route around.
-            if total == 0 || deltas.len() < 2 {
+            // route around. (Unless the tail override is live: a dry
+            // tail IS a flat window, and borrowing 1-2 connections is
+            // meaningful even from a single server.)
+            if (total == 0 || deltas.len() < 2) && !tail_now {
                 continue;
             }
             if now.duration_since(t0).as_secs() < warmup {
@@ -5214,6 +5261,16 @@ pub(super) fn spawn_slow_job_watchdog(
                         attempted.insert(nj.lock_ok().nzo_id.clone());
                     }
                 }
+            }
+
+            // The tail override above unlocks ONLY the prefetch block.
+            // The defer verdict below must never see the tail shapes:
+            // `share = top/total` is NaN at total == 0 and NaN slips
+            // the `share < 0.90` demote gate (a healthy job would be
+            // aborted at its own tail), and a single-server job has
+            // nothing to route around.
+            if total == 0 || deltas.len() < 2 {
+                continue;
             }
 
             // ---- Defer verdict. Suppressed while an IDLE-server
@@ -5416,11 +5473,22 @@ pub(super) fn update_tune_hint(
     let expected_bps = d.line_speed.load(Ordering::Relaxed);
     let mut hint = String::new();
     let enabled: Vec<_> = servers.iter().filter(|s| s.enabled).collect();
+    // Only the servers the prober will ever measure. It skips block and
+    // backup accounts on purpose (a ladder would spend the user's block
+    // allowance), so requiring EVERY enabled server to carry an entry
+    // meant one enabled block account suppressed the line-speed verdict
+    // for the whole install, permanently and with nothing in the log
+    // saying why.
+    let measured: Vec<_> = enabled
+        .iter()
+        .copied()
+        .filter(|s| s.block_bytes.is_none())
+        .collect();
     if expected_bps > 0
-        && !enabled.is_empty()
-        && enabled.iter().all(|s| tuned.contains_key(&s.host))
+        && !measured.is_empty()
+        && measured.iter().all(|s| tuned.contains_key(&s.host))
     {
-        let cap_bytes: f64 = enabled.iter().map(|s| tuned[&s.host].gbps).sum::<f64>() * 1e9 / 8.0;
+        let cap_bytes: f64 = measured.iter().map(|s| tuned[&s.host].gbps).sum::<f64>() * 1e9 / 8.0;
         let pct = (100.0 * cap_bytes / expected_bps as f64).round() as u64;
         if cap_bytes > expected_bps as f64 * 1.1 {
             // The ladder deliberately measures PAST the line speed, so a
@@ -5439,17 +5507,35 @@ pub(super) fn update_tune_hint(
             let meas = cap_bytes * 8.0 / 1e6;
             let want = expected_bps as f64 * 8.0 / 1e6;
             let mut tips: Vec<String> = Vec::new();
-            for s in &enabled {
+            for s in &measured {
                 let t = &tuned[&s.host];
-                if t.granted > 0 && (t.granted as u32) < s.connections.max(1) {
+                // Against what the ladder ASKED for, not what the server
+                // is configured for. The ladder stops at the knee, so on
+                // a server set to 20 whose knee is 8 it may never ask
+                // beyond 16 - and comparing against 20 then told the
+                // user their account tier was capping them, using a
+                // number nothing had requested. `asked == 0` is an entry
+                // from before the field existed: unknown, so say
+                // nothing.
+                // The knee rung against what it was actually granted -
+                // "32 asked, 21 granted" - not against the CONFIGURED
+                // count. The ladder stops at the knee, so on a server set
+                // to 20 whose knee is 8 it may never ask beyond 16, and
+                // comparing against 20 told the user their account tier
+                // was capping them using a number nothing had requested.
+                // `connections` is already clamped to the granted count
+                // at that rung, so the pair is exact. `asked == 0` is an
+                // entry from before the field existed: unknown, so say
+                // nothing.
+                if t.asked > 0 && t.asked > t.connections {
                     tips.push(format!(
                         "{} granted only {} of the {} connections asked for - the \
                          account tier may cap it",
-                        s.host, t.granted, s.connections
+                        s.host, t.connections, t.asked
                     ));
                 }
             }
-            if enabled.len() == 1 {
+            if measured.len() == 1 {
                 tips.push("a second provider adds parallel headroom".into());
             } else if tips.is_empty() {
                 tips.push("a faster provider (or one more) is the likely lever".into());
@@ -5552,8 +5638,55 @@ pub(super) fn spawn_auto_connections(daemon: &Arc<Daemon>, config: &std::path::P
                             // (`suspect` flags entries written by this
                             // build; the half-check also catches knees
                             // recorded before the flag existed.)
-                            let suspicious =
-                                t.suspect || t.connections * 2 <= srv.connections.max(1) as usize;
+                            // Judged against the ceiling a job would
+                            // REALLY hand this server, which is what
+                            // `record` used when it decided `suspect` -
+                            // the global setting caps the per-server
+                            // number too. Against `srv.connections`
+                            // alone, a knee that is perfectly healthy
+                            // under a lower global reads as
+                            // "suspiciously low" forever: a default
+                            // global of 8 with a server configured at 50
+                            // calls a knee of 20 suspect, every probe
+                            // rewrites `checked`, and the 6-hourly clock
+                            // therefore never settles into the 7-day
+                            // one. That is roughly 5 GB of probe traffic
+                            // four times a day, billed to the user's
+                            // account and metered quota, for a verdict
+                            // that cannot change.
+                            let ceiling = crate::conntune::effective_limit(
+                                d.connections.load(Ordering::Relaxed),
+                                srv.connections,
+                            );
+                            // The half-check applies ONLY to entries
+                            // written before `suspect` existed. Left
+                            // unscoped it never lets a genuinely low
+                            // knee settle: global 20, server 20, true
+                            // knee 8 - probe one flags it, probe two
+                            // corroborates it, `suspect` clears and it
+                            // is applied and correct, and then every
+                            // later pass still reads 8*2 <= 20 and puts
+                            // it back on the 6-hourly clock. A full
+                            // ladder every six hours forever, for a
+                            // verdict that has already settled and
+                            // cannot change - the same cost this
+                            // comment was written to prevent, arrived at
+                            // from the other direction. The term
+                            // conflates "unproven" with "low"; after
+                            // corroboration only the first should still
+                            // buy a short clock.
+                            // A PARKED reading is an outstanding question
+                            // and belongs on the short clock. `reconcile`
+                            // deliberately leaves `suspect` false on these
+                            // - the point is that the old knee stays IN
+                            // FORCE while the new one waits - so reading
+                            // only `suspect` here made the second opinion
+                            // the whole mechanism exists to collect wait
+                            // seven days instead of six hours, defeating
+                            // the fix it is part of.
+                            let suspicious = t.suspect
+                                || t.pending.is_some()
+                                || (t.v < crate::conntune::SCHEMA && t.connections * 2 <= ceiling);
                             let ttl = if suspicious {
                                 crate::conntune::SUSPECT_STALE_SECS
                             } else {
@@ -5566,19 +5699,97 @@ pub(super) fn spawn_auto_connections(daemon: &Arc<Daemon>, config: &std::path::P
             else {
                 continue;
             };
+            // Never probe over a manual test the user is watching (or
+            // over another provider's auto probe): skip this cycle and
+            // come back, rather than making two measurements wrong.
+            let Some(_permit) = crate::serve::daemon::LadderPermit::try_take(&d) else {
+                continue;
+            };
             attempted.insert(srv.host.clone(), now);
             let grp = PROBE_GROUP;
             let cap = (srv.connections.max(1) as usize * 2).clamp(30, 100);
+            // What a job would really hand this server, which is what a
+            // knee has to be plausible against - not the probe cap.
+            let ceiling = crate::conntune::effective_limit(
+                d.connections.load(Ordering::Relaxed),
+                srv.connections,
+            );
             info!(target: "tune", "probing {} connection ladder (queue idle)", srv.host);
             let res = rt.block_on(async {
                 tokio::time::timeout(
-                    std::time::Duration::from_secs(180),
-                    nzbkit::sysbench::conn_ladder(&srv, grp, cap, 5),
+                    std::time::Duration::from_secs(240),
+                    // The background probe publishes too: it is the one
+                    // a user never asked for, so seeing WHY the number
+                    // moved matters even more than on a manual run.
+                    nzbkit::sysbench::conn_ladder(&srv, grp, cap, ceiling, 5, {
+                        let dd = d.clone();
+                        let host = srv.host.clone();
+                        move |phase, at, steps| {
+                            *dd.ladder_live.lock_ok() = Some(crate::serve::daemon::LadderLive {
+                                host: host.clone(),
+                                phase: phase.into(),
+                                at,
+                                steps: steps.to_vec(),
+                                started: now,
+                                done: false,
+                            });
+                            // Cancel stops whichever ladder is running,
+                            // and the permit means that is exactly one.
+                            !dd.ladder_cancel.load(Ordering::Acquire)
+                        }
+                    }),
                 )
                 .await
             });
+            if let Some(l) = d.ladder_live.lock_ok().as_mut() {
+                l.done = true;
+            }
             match res {
                 Ok(Ok(steps)) if !steps.is_empty() => {
+                    // A jagged ladder gets its contested rungs re-measured
+                    // once before anything is read off it. Costs a probe
+                    // per disagreeing rung (~5 s each) and only fires when
+                    // the rungs actually contradict each other - a clean
+                    // curve is its own corroboration, since every rung
+                    // agrees with its neighbours.
+                    let contested = crate::conntune::knee_of(&steps)
+                        .map(|k| (k.contested, k.gbps))
+                        .filter(|(c, _)| !c.is_empty());
+                    let steps = match contested {
+                        None => steps,
+                        Some((rungs, peak)) => {
+                            info!(
+                                target: "tune",
+                                "{}: ladder disagrees with itself - re-measuring {:?}",
+                                srv.host, rungs
+                            );
+                            let again = rt.block_on(async {
+                                tokio::time::timeout(
+                                    std::time::Duration::from_secs(120),
+                                    nzbkit::sysbench::remeasure(&srv, grp, &rungs, peak, 5),
+                                )
+                                .await
+                            });
+                            match again {
+                                // Not billed here: merge_samples SUMS the
+                                // two samples' bytes into the merged rung,
+                                // and the ledger write below bills the
+                                // merged ladder. Billing `extra` as well
+                                // would charge the re-measure twice.
+                                Ok(Ok(extra)) => crate::conntune::merge_samples(&steps, &extra),
+                                // A failed re-measure leaves the ladder as
+                                // it was: still jagged, so still suspect.
+                                _ => {
+                                    warn!(
+                                        target: "tune",
+                                        "{}: re-measure failed - keeping the jagged ladder",
+                                        srv.host
+                                    );
+                                    steps
+                                }
+                            }
+                        }
+                    };
                     d.add_usage(&[(srv.host.clone(), steps.iter().map(|s| s.bytes).sum())]);
                     // The per-rung rates in the log are the ONLY record
                     // of WHY a knee was chosen - a bare verdict left a
@@ -5593,12 +5804,49 @@ pub(super) fn spawn_auto_connections(daemon: &Arc<Daemon>, config: &std::path::P
                         })
                         .collect();
                     info!(target: "tune", "{} ladder: {}", srv.host, rungs.join(", "));
-                    let peak = steps.iter().map(|s| s.gbps).fold(0.0, f64::max);
-                    let best = steps
-                        .iter()
-                        .find(|s| s.gbps >= peak * 0.9)
-                        .map(|s| s.connections)
-                        .unwrap_or(8);
+                    // The idle gate at the top of this loop is a ONE-SHOT
+                    // pre-check, and the ladder runs for up to 180 s
+                    // after it passed. A job the scheduler picked up in
+                    // the meantime, or an index scan or deepening pass
+                    // waking, pulls headers over this very provider and
+                    // reads every rung flat - which is exactly the
+                    // faked-low-knee shape the corroboration rule exists
+                    // for, arriving this time from our own side. Nothing
+                    // tells the ladder that happened, so ask afterwards:
+                    // if the link is no longer idle the measurement
+                    // cannot be trusted, and an unrecorded provider is
+                    // simply re-probed where a wrongly-recorded one gets
+                    // applied.
+                    let still_idle = !d.scan_active.load(Ordering::Relaxed)
+                        && !d
+                            .queue
+                            .lock_ok()
+                            .iter()
+                            .any(|j| j.lock_ok().state == JobState::Downloading);
+                    if !still_idle {
+                        info!(
+                            target: "tune",
+                            "{}: a download or index scan started while the ladder ran - \
+                             discarding the measurement rather than recording a knee \
+                             taken against a busy link",
+                            srv.host
+                        );
+                        continue;
+                    }
+                    // A ladder that moved nothing is not a knee of 2 - it is
+                    // no measurement at all, and recording it would cap this
+                    // provider at 2 connections permanently once the next
+                    // probe reproduced it and called that corroboration.
+                    let Some(knee) = crate::conntune::knee_of(&steps) else {
+                        warn!(
+                            target: "tune",
+                            "{}: ladder moved no data at any rung - the provider \
+                             served no bodies, so no knee was recorded",
+                            srv.host
+                        );
+                        continue;
+                    };
+                    let (best, peak) = (knee.connections, knee.gbps);
                     let granted = steps.iter().map(|s| s.granted).max().unwrap_or(0);
                     // The ceiling a job would really hand this server:
                     // the global setting caps it too, and judging the
@@ -5609,28 +5857,63 @@ pub(super) fn spawn_auto_connections(daemon: &Arc<Daemon>, config: &std::path::P
                         d.connections.load(Ordering::Relaxed),
                         srv.connections,
                     );
-                    // A knee that would cut the configured count to less
-                    // than half is applied only once TWO probes agree - a
-                    // one-time provider or link wobble at probe time must
-                    // not cap the user's jobs for a week (James: a 6-of-18
-                    // knee at a third of his real speed).
-                    let corroborated = tuned.get(&srv.host).is_some_and(|p| {
-                        let (a, b) = (p.connections.max(1) as f64, best.max(1) as f64);
-                        (a - b).abs() <= a.max(b) * 0.25
-                    });
-                    let suspect = best * 2 <= limit && !corroborated;
+                    // Re-read the store rather than trust the snapshot
+                    // taken before the ladder. `record` replaces the
+                    // host's entry wholesale, and 180 s is long enough
+                    // for the user to have run the settings-page Test
+                    // and had it finish: their explicit run, documented
+                    // as "their call, applied as-is", was then silently
+                    // overwritten by a measurement that started before
+                    // it. The fresher answer wins, and it also feeds the
+                    // corroboration below - judging that against the
+                    // stale snapshot meant a newer sample could not even
+                    // influence the flag.
+                    let fresh = crate::conntune::load(&cfg_path);
+                    if fresh
+                        .get(&srv.host)
+                        .is_some_and(|p| p.source == "manual" && p.checked >= now)
+                    {
+                        info!(
+                            target: "tune",
+                            "{}: a manual test landed while this probe ran - keeping the \
+                             user's own result",
+                            srv.host
+                        );
+                        continue;
+                    }
+                    // One rule, shared with the dashboard's Test button.
+                    // `is_suspect` carries the same "unproven unless a
+                    // second probe agrees" logic and corroborates through
+                    // `corroborates`, so a parked reading is compared
+                    // against the parked value - see conntune.
+                    let suspect =
+                        crate::conntune::is_suspect(best, limit, knee.jagged, fresh.get(&srv.host));
+                    if knee.jagged {
+                        warn!(
+                            target: "tune",
+                            "{}: ladder is JAGGED - the rate drops below {:.0}% of \
+                             peak between {}c and the {}c peak, so the link was not \
+                             quiet enough to measure a knee",
+                            srv.host,
+                            crate::conntune::LADDER_BAR * 100.0,
+                            best,
+                            knee.peak_at
+                        );
+                    }
                     crate::conntune::record(
                         &cfg_path,
                         &srv.host,
                         crate::conntune::Tuned {
                             connections: best,
                             granted,
+                            asked: knee.asked,
                             gbps: peak,
                             checked: now,
                             source: "auto".into(),
                             suspect,
                             limit,
                             v: crate::conntune::SCHEMA,
+                            pending: None,
                         },
                     );
                     if suspect {

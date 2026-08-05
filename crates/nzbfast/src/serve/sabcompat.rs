@@ -27,7 +27,15 @@ pub(super) fn pause_int(d: &Daemon) -> String {
 /// currently true and currently stopping or degrading work - not a log
 /// tail, and not history. Nothing that resolves itself is listed, or the
 /// pane becomes noise nobody reads.
-pub(super) fn sab_warnings(d: &Daemon, cfg_path: &std::path::Path) -> Vec<Value> {
+/// `hide_job_names`: the caller holds the ADD-ONLY key. The tier is
+/// documented as giving "paused/warning/disk numbers" while queue
+/// contents stay full-key, and the password-waiting warnings name up
+/// to five queued releases - so they are counted but not named.
+pub(super) fn sab_warnings(
+    d: &Daemon,
+    cfg_path: &std::path::Path,
+    hide_job_names: bool,
+) -> Vec<Value> {
     let mut out: Vec<String> = Vec::new();
 
     // Nothing can download at all. This is the first-run state, and the
@@ -68,10 +76,19 @@ pub(super) fn sab_warnings(d: &Daemon, cfg_path: &std::path::Path) -> Vec<Value>
             g.password_required.then(|| g.name.clone())
         })
         .collect();
-    for name in waiting.iter().take(5) {
-        out.push(format!("{name} needs a password to unpack"));
+    if hide_job_names {
+        if !waiting.is_empty() {
+            out.push(format!(
+                "{} download(s) need a password to unpack",
+                waiting.len()
+            ));
+        }
+    } else {
+        for name in waiting.iter().take(5) {
+            out.push(format!("{name} needs a password to unpack"));
+        }
     }
-    if waiting.len() > 5 {
+    if !hide_job_names && waiting.len() > 5 {
         out.push(format!(
             "...and {} more waiting for a password",
             waiting.len() - 5
@@ -1987,7 +2004,24 @@ pub(super) fn handle_jsonrpc(
                     });
                     ok = q.len() < before;
                     drop(q);
-                    if stopped_active {
+                    // `owns_hub`, exactly as the REST arm does it, and for
+                    // the reason spelled out there: `state == Downloading`
+                    // is NOT the owner test. A job whose network leg has
+                    // finished still reads Downloading through its
+                    // verify/repair/unpack tail, by which time the
+                    // scheduler has handed the hub to the NEXT job -
+                    // so deleting the finished one aborted a healthy,
+                    // unrelated download, which then failed permanently
+                    // (a Local fail_kind is not `transient()`, so nothing
+                    // retried it) and fired its pp-script, failure
+                    // notification and failure re-grab.
+                    //
+                    // The REST path was fixed for this; the JSON-RPC
+                    // facade is a hand-copy that never got it, so which
+                    // client type the user configured in Sonarr decided
+                    // whether the bug was reachable - the same shape the
+                    // shared queue primitives were extracted to end.
+                    if stopped_active && d.owns_hub(hit_id) {
                         if let Some(f) = d.hub.abort.lock_ok().as_ref() {
                             f.store(true, Ordering::Relaxed);
                         }

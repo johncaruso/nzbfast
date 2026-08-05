@@ -1,6 +1,94 @@
 use super::super::*;
 use super::ApiCtx;
 
+/// Most of a log file we will read to answer for its last `n` lines.
+///
+/// The launchers rotate at 5 MB and a caller may ask for 2000 lines, so
+/// reading the file whole would pull megabytes into memory to throw
+/// nearly all of them away - on the API thread, on every refresh of a
+/// panel a user can leave open.
+const LOG_TAIL_BYTES: u64 = 1 << 20;
+
+/// What the log panel shows: the lines, and whether this daemon can show
+/// a log at all (which is the difference between "nothing logged yet"
+/// and "no log capture here" in the UI).
+///
+/// Split out from the request handler and taking the ring's state as
+/// ARGUMENTS because the interesting case cannot be reproduced on the
+/// platform this is developed on: unix always has a live tee, so the
+/// fallback branch would never be reached by any test running here, and
+/// the platform where it matters is the one that has historically hidden
+/// real bugs from us. As a function of its inputs it is testable
+/// everywhere.
+fn log_payload(
+    n: usize,
+    ring: Vec<String>,
+    active: bool,
+    dir: Option<&std::path::Path>,
+) -> (Vec<String>, bool) {
+    if !ring.is_empty() {
+        return (ring, active);
+    }
+    match dir.and_then(|d| tail_log_file(&d.join("daemon.log"), n)) {
+        // A readable log file IS this daemon showing you its log, so the
+        // flag turns true even when the file is empty - otherwise a
+        // quiet Windows daemon still reads as "not available on this
+        // platform", which is the bug being fixed.
+        Some(lines) => (lines, true),
+        None => (ring, active),
+    }
+}
+
+/// Last `n` lines of a log file, or `None` if it cannot be read.
+///
+/// `Some(vec![])` for a file that exists and is empty: the caller tells
+/// "nothing logged yet" from "no log here at all" by which of those it
+/// gets back, and those are different sentences in the UI.
+fn tail_log_file(path: &std::path::Path, n: usize) -> Option<Vec<String>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let from = len.saturating_sub(LOG_TAIL_BYTES);
+    f.seek(SeekFrom::Start(from)).ok()?;
+    let mut buf = Vec::new();
+    f.take(LOG_TAIL_BYTES).read_to_end(&mut buf).ok()?;
+    // Lossy: a legacy-encoded RAR/PAR2 filename printed by a child
+    // process reaches this file, and one undecodable byte must not cost
+    // the whole panel (the same reasoning the unix tee's reader uses).
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines = text.lines();
+    // A window that did not start at byte 0 almost certainly opened
+    // mid-line; drop that fragment rather than serving half a line.
+    if from > 0 {
+        lines.next();
+    }
+    let all: Vec<&str> = lines.collect();
+    Some(
+        all[all.len().saturating_sub(n)..]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+    )
+}
+
+/// The download root as the caller is allowed to see it.
+///
+/// `status` and `fullstatus` are in the add-only allowlist so a push
+/// extension's "test connection" button works, and that tier's contract
+/// is "a version string, paused/warning/disk numbers and the category
+/// names". The absolute download path is none of those, and `config`
+/// already withholds a path on its own success arm precisely so the
+/// daemon does not volunteer its filesystem layout to every API caller.
+/// Empty rather than absent: Sonarr and Radarr resolve a relative
+/// `completedir` and a missing key reads differently from a blank one.
+fn out_dir_for(d: &Daemon, ctx: &ApiCtx<'_>) -> String {
+    if ctx.via_add_only {
+        String::new()
+    } else {
+        d.out_dir().to_string_lossy().into_owned()
+    }
+}
+
 pub(in crate::serve) fn dispatch(
     d: &Arc<Daemon>,
     req: &mut tiny_http::Request,
@@ -90,15 +178,37 @@ pub(in crate::serve) fn dispatch(
             }
         }
         // In-UI log viewer: last N captured stdout/stderr lines.
+        //
+        // The self-tee works by dup2-ing our own stdout and stderr onto a
+        // pipe, which is a unix fd trick with no equivalent here off
+        // unix - so on Windows the ring has ALWAYS been empty and this
+        // panel has never shown a Windows user anything but "log capture
+        // is not available on this platform" (tester report, 4 Aug).
+        //
+        // Meanwhile the very same output has been on their disk the whole
+        // time: the tray launcher spawns the daemon with both streams
+        // appended to daemon.log in the data folder, and rotates it at
+        // 5 MB. So when the ring has nothing, read that instead. The
+        // fallback is keyed on the ring being EMPTY rather than on
+        // cfg(windows) - a unix daemon whose pipe() failed at startup is
+        // in exactly the same position, and would rather show the file
+        // than nothing.
         "log" => {
             let n: usize = params
                 .get("value")
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(200);
-            json!({
-                "lines": nzbkit::logtee::tail(n.min(2000)),
-                "capturing": nzbkit::logtee::active(),
-            })
+                .unwrap_or(200)
+                .min(2000);
+            // The folder beside the settings file, which is where every
+            // launcher puts daemon.log: derived entirely from our own
+            // config path, never from anything the caller sent.
+            let (lines, capturing) = log_payload(
+                n,
+                nzbkit::logtee::tail(n),
+                nzbkit::logtee::active(),
+                d.settings_path.parent(),
+            );
+            json!({ "lines": lines, "capturing": capturing })
         }
         // M18b: per-provider data-usage history (UTC days).
         "usage" => {
@@ -425,11 +535,11 @@ pub(in crate::serve) fn dispatch(
         // queue held on low disk, a job sitting waiting for a
         // password - were invisible to every client that has a
         // warnings pane, which is all of them.
-        "warnings" => json!({"warnings": sab_warnings(d, ctx.cfg_path)}),
+        "warnings" => json!({"warnings": sab_warnings(d, ctx.cfg_path, ctx.via_add_only)}),
         // What the mobile remotes poll instead of `fullstatus`.
         // Same numbers, plus the warning count they badge.
         "status" => {
-            let warns = sab_warnings(d, ctx.cfg_path);
+            let warns = sab_warnings(d, ctx.cfg_path, ctx.via_add_only);
             let free = free_bytes(&d.out_dir()).unwrap_or(0) as f64 / 1e9;
             json!({"status": {
                 "uptime": "0",
@@ -442,8 +552,12 @@ pub(in crate::serve) fn dispatch(
                 "diskspace1": format!("{free:.2}"),
                 "diskspace1_norm": format!("{free:.1} G"),
                 "speedlimit_abs": d.hub.rate.get().to_string(),
-                "complete_dir": d.out_dir().to_string_lossy(),
-                "completedir": d.out_dir().to_string_lossy(),
+                // Withheld from the add-only tier: config.rs already
+                // refuses to "volunteer its filesystem layout to every
+                // API caller", and a push extension needs the numbers,
+                // not the path.
+                "complete_dir": out_dir_for(d, ctx),
+                "completedir": out_dir_for(d, ctx),
                 "cache_art": "0",
                 "cache_size": "0 B",
                 "finishaction": Value::Null,
@@ -542,8 +656,8 @@ pub(in crate::serve) fn dispatch(
             "paused": d.paused.load(Ordering::Relaxed),
             // Sonarr/Radarr resolve a relative complete_dir via
             // "completedir" (no underscore); keep both spellings.
-            "complete_dir": d.out_dir().to_string_lossy(),
-            "completedir": d.out_dir().to_string_lossy(),
+            "complete_dir": out_dir_for(d, ctx),
+            "completedir": out_dir_for(d, ctx),
         }}),
         "sysbench" => {
             let now = epoch_secs();
@@ -586,4 +700,144 @@ pub(in crate::serve) fn dispatch(
         }),
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("nzbfast-logtail-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    fn tmpdir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("nzbfast-logdir-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The Windows case, reproduced here: no tee, so an empty ring and
+    /// `active` false - but daemon.log is sitting beside the config
+    /// where the launcher has been appending to it all along. The panel
+    /// must show that file and stop claiming there is no log.
+    #[test]
+    fn an_empty_ring_falls_back_to_the_log_file() {
+        let d = tmpdir("fallback");
+        std::fs::write(d.join("daemon.log"), b"started\nlistening\n").unwrap();
+        let (lines, capturing) = log_payload(200, Vec::new(), false, Some(d.as_path()));
+        assert_eq!(lines, vec!["started".to_string(), "listening".to_string()]);
+        assert!(capturing, "a readable log file means a log CAN be shown");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A file that exists but is quiet is "nothing logged yet", not "no
+    /// log capture on this platform" - the whole point of the flag.
+    #[test]
+    fn an_empty_log_file_still_counts_as_capturing() {
+        let d = tmpdir("quiet");
+        std::fs::write(d.join("daemon.log"), b"").unwrap();
+        let (lines, capturing) = log_payload(200, Vec::new(), false, Some(d.as_path()));
+        assert!(lines.is_empty());
+        assert!(capturing);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// No tee and no file (a bare exe run from a console) keeps the
+    /// honest "not available" answer rather than inventing one.
+    #[test]
+    fn no_ring_and_no_file_reports_no_capture() {
+        let d = tmpdir("bare");
+        let (lines, capturing) = log_payload(200, Vec::new(), false, Some(d.as_path()));
+        assert!(lines.is_empty());
+        assert!(!capturing);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Unix is untouched: a live ring is served as-is and the file on
+    /// disk is never consulted, so the fallback cannot shadow the tee.
+    #[test]
+    fn a_live_ring_wins_over_the_file() {
+        let d = tmpdir("ringwins");
+        std::fs::write(d.join("daemon.log"), b"stale from the file\n").unwrap();
+        let (lines, capturing) = log_payload(
+            200,
+            vec!["from the ring".to_string()],
+            true,
+            Some(d.as_path()),
+        );
+        assert_eq!(lines, vec!["from the ring".to_string()]);
+        assert!(capturing);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A missing file is not an empty one. The UI says "nothing logged
+    /// yet" for one and "no log capture" for the other, so the caller
+    /// has to be able to tell them apart.
+    #[test]
+    fn a_missing_log_is_none_and_an_empty_one_is_some() {
+        assert!(tail_log_file(&tmp("absent"), 10).is_none());
+        let p = tmp("empty");
+        std::fs::write(&p, b"").unwrap();
+        assert_eq!(tail_log_file(&p, 10), Some(Vec::new()));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The last `n`, oldest first - the order the panel prints.
+    #[test]
+    fn it_returns_the_last_n_lines_oldest_first() {
+        let p = tmp("short");
+        std::fs::write(&p, b"one\ntwo\nthree\nfour\n").unwrap();
+        assert_eq!(
+            tail_log_file(&p, 2),
+            Some(vec!["three".to_string(), "four".to_string()])
+        );
+        // Asking for more than the file holds returns what there is.
+        assert_eq!(tail_log_file(&p, 99).map(|v| v.len()), Some(4));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A file past the byte cap is read from its END, and the partial
+    /// line the window opens on is dropped rather than served as a line.
+    /// This is the case a 5 MB rotated log actually hits.
+    #[test]
+    fn a_huge_file_is_tailed_not_swallowed() {
+        let p = tmp("huge");
+        let mut body = String::new();
+        // Comfortably past LOG_TAIL_BYTES so the read really is a window.
+        for i in 0..80_000 {
+            body.push_str(&format!("line {i} padded out to make this file large\n"));
+        }
+        assert!(body.len() as u64 > LOG_TAIL_BYTES);
+        std::fs::write(&p, body.as_bytes()).unwrap();
+        let got = tail_log_file(&p, 3).expect("a large file still reads");
+        assert_eq!(
+            got,
+            vec![
+                "line 79997 padded out to make this file large".to_string(),
+                "line 79998 padded out to make this file large".to_string(),
+                "line 79999 padded out to make this file large".to_string(),
+            ]
+        );
+        // Every line handed back is whole - no leading fragment survived.
+        assert!(got.iter().all(|l| l.starts_with("line ")));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// One undecodable byte costs that character, never the panel: a
+    /// child process printing a legacy-encoded filename lands in this
+    /// same file.
+    #[test]
+    fn invalid_utf8_does_not_lose_the_log() {
+        let p = tmp("latin1");
+        std::fs::write(&p, b"before\nca\xe9 nam\xe9\nafter\n").unwrap();
+        let got = tail_log_file(&p, 10).expect("still readable");
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0], "before");
+        assert_eq!(got[2], "after");
+        assert!(got[1].contains('\u{fffd}'), "expected a replacement char");
+        let _ = std::fs::remove_file(&p);
+    }
 }

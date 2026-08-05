@@ -337,6 +337,48 @@ pub async fn timed_fetch_multi(
     let ctl2 = ctl.clone();
     let mut handle =
         tokio::spawn(async move { fetch_all_multi_ctl(&servers, reqs, tx, Some(&ctl2)).await });
+    // The deadline path below stops the pool politely. NOTHING stopped it
+    // when this whole future was DROPPED instead - and both ladder
+    // callers wrap the ladder in a timeout, so a slow provider that
+    // outruns it detaches the spawned task and leaves its workers pulling
+    // articles against the user's real downloads, billed to their
+    // account, for as long as the queue lasts. The wider that timeout
+    // gets - it is 240 s now, with a reopen probe and a best-of-three
+    // run-off inside it - the more there is to leak.
+    //
+    // `ctl.abort()` ONLY - deliberately no `handle.abort()` beside it,
+    // and the reason is the opposite of the obvious one.
+    //
+    // It is not that aborting the task would strand its workers (an
+    // earlier version of this comment said so and was wrong). The
+    // workers are owned by `fetch_all_multi_ctl`'s own
+    // `Vec<JoinHandle>`, which `join_fleet` consumes - and dropping a
+    // JoinHandle DETACHES rather than kills, so they survive the abort
+    // either way and still see `aborted` and still close their sockets.
+    //
+    // The cost is `join_fleet` itself. It is the only thing that ever
+    // reclaims a worker parked on a wedged connection: it waits for
+    // `finished`, sleeps EXIT_GRACE, and then abandons the stragglers
+    // with a "worker still parked" warning. `ctl.abort()` sends
+    // `finished`, so that reaper is armed and counting the moment this
+    // guard fires. Aborting the task would drop the reaper's future and
+    // leave a genuinely wedged worker running for good - reintroducing
+    // the exact leak this guard exists to close, wearing a tidier fix.
+    // (Mechanism established by the Codex sweep session, 4 Aug.)
+    //
+    // It needs no disarming. Once the run has finished the pool's last
+    // strong Arc is gone, the handle's Weak no longer upgrades, and
+    // abort() is a no-op that returns false.
+    struct AbortOnDrop(Arc<QueueControl>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    // Deliberately NOT `impl Drop for QueueControl`: the streaming layer
+    // holds one of these on purpose past the end of its run (see the type
+    // docs), and aborting there would kill live playback.
+    let _abort_on_cancel = AbortOnDrop(ctl.clone());
     // Track peak granted sockets while the fetch runs: when the queue
     // drains early the workers are already gone by the measure point, and
     // a point sample would read 0.
@@ -364,16 +406,19 @@ pub async fn timed_fetch_multi(
     }
     sampler.abort();
     let exhausted = early.is_some();
-    // Granted = sockets live at the measure point (asked ≠ granted near
-    // account limits); on early drain, the peak seen during the run.
-    let granted: Vec<usize> = if exhausted {
-        peaks.iter().map(|p| p.load(Ordering::Relaxed)).collect()
-    } else {
-        live.servers
-            .iter()
-            .map(|s| s.connected.load(Ordering::Relaxed))
-            .collect()
-    };
+    // Granted = the PEAK sockets held at once during the run, on both
+    // paths (asked ≠ granted near account limits).
+    //
+    // It used to be the instantaneous count at the measure point when
+    // the supply had not drained, and that is a single sample of a
+    // quantity the tuner now makes a decision on: the knee is clamped to
+    // it. A provider shedding a few sockets in the last second of the
+    // window reads "granted 5 of 16 asked" and caps every job at 5 for a
+    // week - and nothing re-checks it, because the contested re-measure
+    // keys off RATES. "The provider let us hold 16 at once" is a fact
+    // about the account either way; a socket count that fell at the
+    // deadline is not evidence it was never granted.
+    let granted: Vec<usize> = peaks.iter().map(|p| p.load(Ordering::Relaxed)).collect();
     let stats = match early {
         Some(s) => s,
         None => {
@@ -520,6 +565,149 @@ pub struct LadderStep {
     pub saturated: bool,
 }
 
+/// How much a doubling has to gain for the climb to continue.
+///
+/// Small on purpose. This is the threshold that decides how much speed
+/// the tuner is willing to leave on the table without even looking, and
+/// the answer the product wants is "almost none" - the sockets are free
+/// to the user and the seconds are not. The cost of a low bar is a
+/// longer ladder (a few more 5 s rungs), which is paid once per provider
+/// per week by a background probe on an idle link.
+const CLIMB_GAIN: f64 = 1.03;
+
+/// How close to the best rung a rung has to be to earn a run-off place.
+const RUNOFF_BAND: f64 = 0.90;
+
+/// Most rungs that get the longer second look.
+const RUNOFF_MAX: usize = 3;
+
+/// Extra races each run-off candidate gets, on top of its ladder rung.
+///
+/// Two, so every candidate ends up a best-of-THREE. This is the number
+/// that decides whether the selection bar can mean anything: a
+/// best-of-two still carries most of the ~6% spread that repeated
+/// samples of an identical rung show, and a 5% rule read off two such
+/// estimates is a coin toss wearing a decimal point. More samples of a
+/// subtractively-noisy quantity move every estimate closer to the true
+/// capacity, so the GAPS between candidates shrink toward the real ones.
+///
+/// The cost is the honest part: up to RUNOFF_MAX x this many extra
+/// windows at double length, so a ladder that reaches the run-off with
+/// three candidates spends about a minute more. It buys the difference
+/// between a recommendation that wanders between probes and one that
+/// does not, on a measurement made once per provider per week - and a
+/// user who does not want to wait has the per-server pin.
+const RUNOFF_ROUNDS: usize = 2;
+
+/// Has a doubling stopped paying?
+///
+/// Pulled out of the climb as a plain function on purpose. The end-to-end
+/// harness measures real throughput against a mock paced on real
+/// `Instant`s, so it is load-sensitive and flakes on a busy machine -
+/// which makes it a poor place to prove a THRESHOLD. The rule itself has
+/// no I/O in it and can be pinned exactly; the harness is then only
+/// asked whether the whole thing hangs together.
+///
+/// `starved` means the step ran out of articles before its window
+/// closed: the rate is ramp-biased low and must not be read as "the
+/// doubling stopped paying".
+fn climb_stalled(prev_gbps: f64, cur_gbps: f64, starved: bool) -> bool {
+    !starved && cur_gbps <= prev_gbps * CLIMB_GAIN
+}
+
+/// Is a finished climb too far below the account's allowance to be taken
+/// on trust? See the reopen block for why the answer is usually yes.
+///
+/// Note the argument: this asks about the top rung the climb REACHED,
+/// not about where the knee landed. A ladder that climbed to 16 of 20
+/// has not stopped short, whatever its knee says. Reading this predicate
+/// off a failure's shape instead of its signature is how a correct
+/// mechanism got raised as a release blocker.
+///
+/// Not part of the real API: public only so `tests/conn_tuner.rs` can
+/// gate an assertion on this exact rule rather than restate it, and an
+/// integration test is a separate crate so `pub(crate)` will not reach
+/// it. A restated copy meant changing the predicate here would leave the
+/// test asserting the old band - a silent version of the very defect it
+/// was written to fix. Call it, do not copy it.
+///
+/// `#[doc(hidden)]` because `sysbench` IS published (lib.rs names it in
+/// the crate docs) and TODO §84 puts nzbkit on crates.io: a bare `pub`
+/// would make a tuning heuristic a semver commitment, which is the exact
+/// freedom this was opened up to preserve.
+#[doc(hidden)]
+pub fn worth_reopening(top_rung: usize, ceiling: usize) -> bool {
+    ceiling > 2 && top_rung.saturating_mul(2) < ceiling
+}
+
+/// Did the ceiling probe beat the ladder's peak by enough to say the
+/// climb ended on noise rather than on a real limit?
+fn reopen_won(high_gbps: f64, peak_gbps: f64) -> bool {
+    high_gbps > peak_gbps * CLIMB_GAIN
+}
+
+/// Articles a ladder step needs to outlast its window, sized from the
+/// fastest rate seen so far (×2.5: a doubling step may better-than-
+/// double). A fixed connections×40 supply drains in a fraction of the
+/// window on a multi-gig line, capping every step at supply/window and
+/// reading as a flat ladder (East Coast bench box: identical per-conn
+/// rates at 2 and 4).
+fn ladder_supply_for(peak_gbps: f64, conns: usize, secs_per_step: u64) -> usize {
+    let by_rate =
+        (peak_gbps.max(0.05) * 2.5 * secs_per_step as f64 * 1e9 / 8.0 / 600_000.0) as usize;
+    (conns * 40).max(by_rate).max(64)
+}
+
+/// Re-measure specific rungs of a finished ladder, once each, back to
+/// back.
+///
+/// A jagged ladder is one whose rungs contradict each other, and the
+/// cure is a second sample of the rungs that disagree - not another full
+/// climb, which would re-measure six rungs to settle two. The caller
+/// averages these into the originals (`conntune::merge_samples`) and
+/// re-reads the knee.
+///
+/// `peak_gbps` is the finished ladder's peak: the article supply has to
+/// be sized for the rate these rungs are ALREADY known to reach, or a
+/// re-measure starves where the climb did not and reads low, which on
+/// this path would manufacture the very dip it was sent to check.
+pub async fn remeasure(
+    server: &ServerConfig,
+    group: &str,
+    rungs: &[usize],
+    peak_gbps: f64,
+    secs_per_step: u64,
+) -> Result<Vec<LadderStep>, Box<dyn std::error::Error + Send + Sync>> {
+    use crate::pool::PoolConfig;
+    let mut ids = discover_ids(server, group, 8_000).await?;
+    let mut out: Vec<LadderStep> = Vec::new();
+    for &c in rungs {
+        let c = c.clamp(1, 150);
+        let want = ladder_supply_for(peak_gbps, c, secs_per_step);
+        let per_step = want.min(ids.len());
+        let slice: Vec<String> = ids[..per_step].to_vec();
+        // Fresh articles per step, so provider-side caching cannot
+        // flatter the re-measure the way it would a repeat read.
+        let rot = per_step.min(ids.len().saturating_sub(1));
+        ids.rotate_left(rot);
+        let cfg = PoolConfig {
+            connections: c,
+            window: 4,
+            ..PoolConfig::default()
+        };
+        let (gbps, per, granted, saturated) =
+            timed_fetch_multi(vec![(server.clone(), cfg)], slice, per_step, secs_per_step).await;
+        out.push(LadderStep {
+            connections: c,
+            granted: granted.first().copied().unwrap_or(0),
+            gbps,
+            bytes: per.first().copied().unwrap_or(0),
+            saturated,
+        });
+    }
+    Ok(out)
+}
+
 /// M18: per-server connection tuning - ADAPTIVE: keep doubling the
 /// socket count (2, 4, 8, … up to `max_conns`) while the previous step
 /// still gained ≥12%, so the knee is found wherever it is - including
@@ -527,29 +715,46 @@ pub struct LadderStep {
 /// provider refuses the extras, workers bow out, and `granted` exposes
 /// the real ceiling). Distinct article slices per step so provider-side
 /// caching can't flatter the later steps.
+/// `ceiling` is what a job would really be allowed to open on this server
+/// (the account limit, already reconciled with the global setting) - NOT
+/// the probe cap, which is deliberately higher so the knee can be found
+/// above a conservative config value. 0 disables the reopen check.
+/// `on_progress(phase, conns, steps_so_far)` is called as the ladder
+/// works, so a caller can show it happening - and RETURNS false to stop
+/// it. The caller owns that decision because the caller owns the reason
+/// (a user pressing Cancel, a shutdown); the prober only has to honour
+/// it, which it does between rungs. Not mid-rung: a rung is 5-10 s and
+/// half of one is a worse number than none, so a cancelled ladder hands
+/// back the whole rungs it completed and nothing else. A full run is now minutes
+/// long - the climb, a re-race, the bisect, a ceiling check and a
+/// best-of-three run-off - and a user watching a spinner for four
+/// minutes has no way to tell a working probe from a hung one, nor any
+/// sight of the reasoning behind the number it eventually prints. Phases
+/// are TOKENS, not sentences: the translation belongs to whoever is
+/// displaying them.
 pub async fn conn_ladder(
     server: &ServerConfig,
     group: &str,
     max_conns: usize,
+    ceiling: usize,
     secs_per_step: u64,
+    mut on_progress: impl FnMut(&str, usize, &[LadderStep]) -> bool,
 ) -> Result<Vec<LadderStep>, Box<dyn std::error::Error + Send + Sync>> {
     use crate::pool::PoolConfig;
     let mut ids = discover_ids(server, group, 8_000).await?;
     let mut out: Vec<LadderStep> = Vec::new();
     let mut c = 2usize;
     let mut stopped_flat = false;
-    // Articles a step needs to outlast its window, sized from the fastest
-    // rate seen so far (×2.5: a doubling step may better-than-double).
-    // A fixed connections×40 supply drains in a fraction of the window on
-    // a multi-gig line, capping every step at supply/window and reading
-    // as a flat ladder (East Coast bench box: identical per-conn rates at 2 and 4).
     let supply_for = |peak_gbps: f64, conns: usize| -> usize {
-        let by_rate =
-            (peak_gbps.max(0.05) * 2.5 * secs_per_step as f64 * 1e9 / 8.0 / 600_000.0) as usize;
-        (conns * 40).max(by_rate).max(64)
+        ladder_supply_for(peak_gbps, conns, secs_per_step)
     };
     loop {
         let c_now = c.min(max_conns.max(2));
+        // Checkpoint: a cancel between rungs stops here with whole
+        // rungs only.
+        if !on_progress("climb", c_now, &out) {
+            return Ok(out);
+        }
         let peak = out.iter().map(|s| s.gbps).fold(0.0, f64::max);
         let want = supply_for(peak, c_now);
         let per_step = want.min(ids.len());
@@ -582,6 +787,15 @@ pub async fn conn_ladder(
         // Stop once a doubling stopped paying (we've tested one step past
         // the knee), or the provider granted well under what we asked.
         //
+        // Keep climbing while a doubling still pays at all - the bar is
+        // CLIMB_GAIN, not the 12% it used to be. 12% meant every real
+        // gain between 3% and 12% was thrown away and the ladder stopped
+        // there, which is not a rounding error on a download: a tester
+        // whose 4->8 step gained 8% was stopped at 8 and tuned to 6,
+        // while his own timings kept improving out to 36 connections
+        // (4 Aug). If the product will not give away 5% at the top, it
+        // cannot give away 11% in the middle either.
+        //
         // The flat verdict is CONFIRMED before it sticks: one 5 s sample
         // saying "8 conns barely beat 4" can be a transient (evening
         // congestion, a background transfer, macOS timer coalescing on
@@ -591,7 +805,10 @@ pub async fn conn_ladder(
         // only a dip that reproduces ends the ladder. Field case: a
         // gigabit fibre user tuned to 6 connections and downloaded at
         // half the speed of a 16-connection client.
-        if n >= 2 && !last_starved && out[n - 1].gbps <= out[n - 2].gbps * 1.12 {
+        if n >= 2 && climb_stalled(out[n - 2].gbps, out[n - 1].gbps, last_starved) {
+            if !on_progress("recheck", c_now, &out) {
+                return Ok(out);
+            }
             let want = supply_for(out.iter().map(|s| s.gbps).fold(0.0, f64::max), c_now);
             let per_step = want.min(ids.len());
             let slice: Vec<String> = ids[..per_step].to_vec();
@@ -617,7 +834,7 @@ pub async fn conn_ladder(
                     s.saturated = saturated;
                 }
             }
-            if !redo_starved && out[n - 1].gbps <= out[n - 2].gbps * 1.12 {
+            if climb_stalled(out[n - 2].gbps, out[n - 1].gbps, redo_starved) {
                 stopped_flat = true;
                 break;
             }
@@ -644,6 +861,10 @@ pub async fn conn_ladder(
                 break;
             }
             let mid = (lo + hi) / 2;
+            if !on_progress("refine", mid, &out) {
+                out.sort_by_key(|s| s.connections);
+                return Ok(out);
+            }
             let per_step = supply_for(peak, mid).min(ids.len());
             let slice: Vec<String> = ids[..per_step].to_vec();
             let rot = per_step.min(ids.len().saturating_sub(1));
@@ -670,6 +891,156 @@ pub async fn conn_ladder(
             }
         }
         out.sort_by_key(|s| s.connections);
+    }
+    // The climb stops on a rung that FAILED to gain, and a rung fails to
+    // gain for two very different reasons: the provider really has
+    // stopped giving, or that one 5 s sample was interfered with. Every
+    // mechanism that mis-measures a rung here reads it LOW - competing
+    // traffic, loss, a throttled burst - so the stop condition sits
+    // exactly where the noise does its damage, and the error always runs
+    // in the slow direction.
+    //
+    // Which is survivable when the answer lands near the account's
+    // ceiling anyway, and not survivable when it lands nowhere near it:
+    // a 4-of-50 knee is an enormous claim to make from two 5 s samples,
+    // and a tester whose real downloads got faster all the way to 36
+    // sockets was handed 6 (4 Aug). So when the climb stops far below
+    // what the account allows, ask the ceiling directly before believing
+    // it. One probe, and only on ladders that stopped implausibly low.
+    if stopped_flat {
+        let top = out.iter().map(|s| s.connections).max().unwrap_or(0);
+        let peak = out.iter().map(|s| s.gbps).fold(0.0, f64::max);
+        // Half the allowance untested is enough to want the check: one
+        // probe to confirm beats assuming, and the case this exists for
+        // (a climb stopped at 8 on an account allowing 50) is only the
+        // extreme end of it.
+        if worth_reopening(top, ceiling) {
+            let probe = |c: usize, ids: &mut Vec<String>| {
+                let per_step = supply_for(peak, c).min(ids.len());
+                let slice: Vec<String> = ids[..per_step].to_vec();
+                let rot = per_step.min(ids.len().saturating_sub(1));
+                ids.rotate_left(rot);
+                let cfg = PoolConfig {
+                    connections: c,
+                    window: 4,
+                    ..PoolConfig::default()
+                };
+                async move {
+                    let (gbps, per, granted, saturated) = timed_fetch_multi(
+                        vec![(server.clone(), cfg)],
+                        slice,
+                        per_step,
+                        secs_per_step,
+                    )
+                    .await;
+                    LadderStep {
+                        connections: c,
+                        granted: granted.first().copied().unwrap_or(0),
+                        gbps,
+                        bytes: per.first().copied().unwrap_or(0),
+                        saturated,
+                    }
+                }
+            };
+            if !on_progress("ceiling", ceiling, &out) {
+                out.sort_by_key(|s| s.connections);
+                return Ok(out);
+            }
+            let high = probe(ceiling, &mut ids).await;
+            let won = reopen_won(high.gbps, peak);
+            out.push(high);
+            let _ = on_progress("ceiling", ceiling, &out);
+            // It won, so the climb ended on noise rather than on a
+            // ceiling - and the knee is now somewhere in a bracket
+            // nothing has measured. Bisect it like the doubling's own
+            // overshoot, so the answer is not simply "use all of them".
+            if won {
+                let (mut lo, mut hi) = (top, ceiling);
+                for _ in 0..2 {
+                    if hi.saturating_sub(lo) <= (lo / 4).max(2) {
+                        break;
+                    }
+                    let mid = (lo + hi) / 2;
+                    let step = probe(mid, &mut ids).await;
+                    let gained =
+                        step.gbps >= peak.max(out.last().map(|s| s.gbps).unwrap_or(0.0)) * 0.9;
+                    out.push(step);
+                    if gained {
+                        hi = mid;
+                    } else {
+                        lo = mid;
+                    }
+                }
+            }
+            out.sort_by_key(|s| s.connections);
+        }
+    }
+    // Run-off. Whoever wins the ladder wins it on ONE 5 s sample, and the
+    // sample-to-sample spread on a domestic line is far wider than the
+    // 2% the selection rule now cares about - so without this, tightening
+    // that rule would only have bought a more confident way of picking
+    // the luckiest reading. Everything within RUNOFF_BAND of the best
+    // gets a second look at double the window, and the better of a rung's
+    // two readings stands (noise here is subtractive: contention, loss
+    // and a drained supply all read LOW, and nothing reads high).
+    //
+    // Capped at RUNOFF_MAX rungs, so the cost is bounded at a few tens of
+    // seconds on a probe that runs once per provider per week.
+    let peak = out.iter().map(|s| s.gbps).fold(0.0, f64::max);
+    if peak > 0.0 && out.len() > 1 {
+        let mut cands: Vec<usize> = out
+            .iter()
+            .filter(|s| s.gbps >= peak * RUNOFF_BAND)
+            .map(|s| s.connections)
+            .collect();
+        // Highest rungs first when there are more than we will pay for:
+        // the top of the curve is where the decision actually is.
+        cands.sort_unstable_by(|a, b| b.cmp(a));
+        cands.truncate(RUNOFF_MAX);
+        if cands.len() > 1 {
+            // Each candidate is re-raced RUNOFF_ROUNDS times, not once.
+            // One extra sample per rung narrows nothing: it still leaves
+            // every candidate represented by a single best-of-two, and
+            // two best-of-twos of the SAME rate still disagree by about
+            // the spread that made the ladder unreliable in the first
+            // place. Alternating the rungs round by round rather than
+            // finishing one before starting the next also means a slow
+            // patch part-way through the run-off lands on all of them
+            // instead of ruining whichever candidate owned that minute.
+            for round in 0..RUNOFF_ROUNDS {
+                for &c in &cands {
+                    if !on_progress(if round == 0 { "runoff" } else { "runoff2" }, c, &out) {
+                        return Ok(out);
+                    }
+                    let want = ladder_supply_for(peak, c, secs_per_step * 2).min(ids.len());
+                    let slice: Vec<String> = ids[..want].to_vec();
+                    let rot = want.min(ids.len().saturating_sub(1));
+                    ids.rotate_left(rot);
+                    let cfg = PoolConfig {
+                        connections: c,
+                        window: 4,
+                        ..PoolConfig::default()
+                    };
+                    let (gbps, per, granted, saturated) = timed_fetch_multi(
+                        vec![(server.clone(), cfg)],
+                        slice,
+                        want,
+                        secs_per_step * 2,
+                    )
+                    .await;
+                    if let Some(s) = out.iter_mut().find(|s| s.connections == c) {
+                        // Bytes SUM (both transfers happened and the ledger is
+                        // owed them); the rate is the better reading.
+                        s.bytes = s.bytes.saturating_add(per.first().copied().unwrap_or(0));
+                        s.granted = s.granted.max(granted.first().copied().unwrap_or(0));
+                        if gbps.is_finite() && gbps > s.gbps {
+                            s.gbps = gbps;
+                            s.saturated = saturated;
+                        }
+                    }
+                }
+            }
+        }
     }
     Ok(out)
 }
@@ -979,6 +1350,70 @@ pub async fn diversity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MB/s -> Gbps, so these read like the dashboard.
+    fn r(mbps: f64) -> f64 {
+        mbps * 8.0 / 1000.0
+    }
+
+    /// The reported field case, at the exact step that decided it: 4
+    /// connections read 25 MB/s and 8 read 27. Under the old 12% rule
+    /// that 8% gain was "the doubling stopped paying", the climb ended
+    /// at 8, and the bisect answered 6 - on an account allowing 50,
+    /// while the user's own timings kept improving out to 36 sockets.
+    #[test]
+    fn an_eight_percent_gain_is_a_gain() {
+        assert!(
+            !climb_stalled(r(25.0), r(27.0), false),
+            "8% is real speed and the climb must continue for it"
+        );
+        for (prev, cur) in [(25.0, 26.0), (25.0, 28.0), (100.0, 104.0)] {
+            assert!(
+                !climb_stalled(r(prev), r(cur), false),
+                "{prev} -> {cur} MB/s is a real gain"
+            );
+        }
+    }
+
+    /// It still has to STOP, or every ladder runs to the ceiling and
+    /// costs a fortune to learn nothing.
+    #[test]
+    fn a_flat_rung_still_stops_the_climb() {
+        assert!(climb_stalled(r(30.0), r(30.5), false), "under 3% is flat");
+        assert!(climb_stalled(r(30.0), r(20.0), false), "a drop is flat");
+        assert!(climb_stalled(r(30.0), r(30.0), false), "no change is flat");
+    }
+
+    /// A step that ran out of articles reads low for a reason that has
+    /// nothing to do with sockets, and must never end the climb.
+    #[test]
+    fn a_starved_step_never_ends_the_climb() {
+        assert!(
+            !climb_stalled(r(30.0), r(2.0), true),
+            "a drained supply is not a knee"
+        );
+    }
+
+    /// Over half the allowance untested is worth one confirming probe -
+    /// exactly the shape the field case had (stopped at 8, allowed 50).
+    #[test]
+    fn a_climb_that_stopped_low_gets_checked_against_the_ceiling() {
+        assert!(worth_reopening(8, 50), "8 of 50 must be checked");
+        assert!(worth_reopening(4, 20));
+        assert!(!worth_reopening(16, 20), "close to the ceiling: trust it");
+        assert!(!worth_reopening(30, 50));
+        assert!(!worth_reopening(8, 0), "no ceiling, nothing to check");
+    }
+
+    /// The ceiling probe reopens the climb only when it wins by the same
+    /// margin the climb itself needs - otherwise a tie at the top turns
+    /// every ladder into a march to the ceiling.
+    #[test]
+    fn the_ceiling_only_wins_by_a_real_margin() {
+        assert!(reopen_won(r(50.0), r(37.0)), "50 vs 37 is a real win");
+        assert!(!reopen_won(r(37.5), r(37.0)), "a tie is not a win");
+        assert!(!reopen_won(r(20.0), r(37.0)), "slower is not a win");
+    }
 
     #[test]
     fn compute_report_is_sane() {

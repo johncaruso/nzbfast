@@ -243,9 +243,22 @@ pub fn parse_feed_checked(xml: &str) -> Result<Vec<FeedItem>, FeedParseError> {
     // Byte-limited scan: only the document's opening needs looking at,
     // and a multi-megabyte body of HTML must not be lowercased whole.
     let head: String = xml.chars().take(4096).collect::<String>().to_lowercase();
-    let looks_like_a_feed = ["<rss", "<feed", "<rdf:rdf", "<channel"]
-        .iter()
-        .any(|root| head.contains(root));
+    // Compare the LOCAL name, cutting any `prefix:` between the `<` and
+    // the element name. A namespace prefix is legal on the root as much
+    // as anywhere else - `<atom:feed xmlns:atom="…">` is a perfectly
+    // good Atom document, and `<r:RDF>` a perfectly good RSS 1.0 one -
+    // but matching the literal strings refused both, so a valid feed
+    // went red in Settings and grabbing stopped. That is the same
+    // outcome this check exists to prevent, reached from the other
+    // side, and the parser below is deliberately prefix-tolerant.
+    const FEED_ROOTS: [&str; 4] = ["rss", "feed", "rdf", "channel"];
+    let looks_like_a_feed = head.match_indices('<').any(|(at, _)| {
+        let name = head[at + 1..]
+            .split(|c: char| c.is_whitespace() || c == '>' || c == '/')
+            .next()
+            .unwrap_or_default();
+        FEED_ROOTS.contains(&name.rsplit(':').next().unwrap_or(name))
+    });
     if !looks_like_a_feed {
         // Name what it looks like instead - "not a feed" alone sends a
         // user hunting in the wrong place, and a login page is by far
@@ -254,6 +267,13 @@ pub fn parse_feed_checked(xml: &str) -> Result<Vec<FeedItem>, FeedParseError> {
             "the server answered with a web page, not a feed - \
              the url is probably wrong, or the apikey has been revoked \
              and this is a login page"
+        } else if head.contains("<error") {
+            // A newznab error document IS the answer to "why is this
+            // feed empty", and it usually says "Incorrect user
+            // credentials". Reporting the generic line instead threw
+            // away the one message that names the cause.
+            "the indexer answered with an error, not a feed - \
+             check the apikey and the feed url"
         } else if head.trim().is_empty() {
             "the server answered with an empty body"
         } else {
@@ -264,13 +284,29 @@ pub fn parse_feed_checked(xml: &str) -> Result<Vec<FeedItem>, FeedParseError> {
     Ok(parse_feed(xml))
 }
 
-/// Minimal RSS 2.0 parser: <item> blocks with title, enclosure/link,
-/// size (enclosure length, else newznab size attr), guid. Tolerant of
-/// namespaces and junk - feeds in the wild are messy.
+/// Minimal RSS 2.0 + Atom parser: `<item>` (RSS) and `<entry>` (Atom)
+/// blocks with title, enclosure/link, size (enclosure length, else
+/// newznab size attr), guid. Tolerant of namespaces and junk - feeds in
+/// the wild are messy.
+///
+/// Both grammars, in one pass each, because [`parse_feed_checked`]
+/// ACCEPTS an Atom root and a caller that is told its feed is healthy
+/// must actually get its entries. Reading only `<item>` meant a valid
+/// Atom feed recorded "healthy, 0 items" for ever and silently grabbed
+/// nothing - the same failure `parse_feed_checked` exists to prevent,
+/// reached one layer further in.
 ///
 /// Callers that RECORD FEED HEALTH want [`parse_feed_checked`]: this
 /// one cannot tell an empty feed from a body that is not a feed.
 pub fn parse_feed(xml: &str) -> Vec<FeedItem> {
+    let mut out = parse_rss_items(xml);
+    // A document is one grammar or the other, so this costs a `find`
+    // that fails on every RSS feed there has ever been.
+    out.extend(parse_atom_entries(xml));
+    out
+}
+
+fn parse_rss_items(xml: &str) -> Vec<FeedItem> {
     let mut out = Vec::new();
     let mut rest = xml;
     while let Some(open) = rest.find("<item") {
@@ -315,6 +351,88 @@ pub fn parse_feed(xml: &str) -> Vec<FeedItem> {
             });
         }
         rest = &rest[open + close + 7..];
+    }
+    out
+}
+
+/// The Atom half: `<entry>` blocks.
+///
+/// The differences that matter are all in how the NZB is pointed at.
+/// Atom has no `<enclosure>` element - it carries the same thing as a
+/// `<link rel="enclosure" href="…" length="…">`, and its plain
+/// `<link href="…">` (rel absent, or "alternate") is the human page.
+/// The download link is preferred, exactly as the RSS half prefers an
+/// enclosure over `<link>`; a feed with only an alternate link still
+/// yields an item, because that is what the RSS half does with a bare
+/// `<link>` too. `<id>` stands in for `<guid>`.
+fn parse_atom_entries(xml: &str) -> Vec<FeedItem> {
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(open) = rest.find("<entry") {
+        let Some(close) = rest[open..].find("</entry>") else {
+            break;
+        };
+        let entry = &rest[open..open + close];
+        let title = tag_text(entry, "title").map(unescape).unwrap_or_default();
+        // Every <link .../> in the entry, as its raw tag text.
+        let links: Vec<&str> = entry
+            .match_indices("<link")
+            .map(|(at, _)| {
+                let end = entry[at..].find('>').map(|e| at + e).unwrap_or(entry.len());
+                &entry[at..end]
+            })
+            .collect();
+        let rel = |l: &str| attr(l, "rel").unwrap_or("alternate").to_ascii_lowercase();
+        let download = links
+            .iter()
+            .find(|l| rel(l) == "enclosure")
+            // A feed that declares the type but not the rel still means
+            // "this one is the file".
+            .or_else(|| {
+                links
+                    .iter()
+                    .find(|l| attr(l, "type").is_some_and(|t| t.contains("nzb")))
+            })
+            .copied();
+        let link = download
+            .or_else(|| links.first().copied())
+            .and_then(|l| attr(l, "href"))
+            .map(str::to_string)
+            // Some newznab servers serve Atom with an RSS-shaped
+            // <enclosure url="…"> bolted in; take it rather than lose
+            // the entry.
+            .or_else(|| {
+                let p = entry.find("<enclosure")?;
+                let end = entry[p..].find('>').map(|e| p + e).unwrap_or(entry.len());
+                attr(&entry[p..end], "url").map(str::to_string)
+            })
+            .map(|l| unescape(&l))
+            .unwrap_or_default();
+        let size = download
+            .and_then(|l| attr(l, "length"))
+            .and_then(|v| v.parse().ok())
+            .or_else(|| {
+                entry.split("<newznab:attr").skip(1).find_map(|a| {
+                    let a = &a[..a.find('>').unwrap_or(a.len())];
+                    (attr(a, "name") == Some("size"))
+                        .then(|| attr(a, "value")?.parse().ok())
+                        .flatten()
+                })
+            })
+            .unwrap_or(0);
+        let guid = tag_text(entry, "id")
+            .map(unescape)
+            .filter(|g| !g.is_empty())
+            .unwrap_or_else(|| link.clone());
+        if !title.is_empty() && !link.is_empty() {
+            out.push(FeedItem {
+                title,
+                link,
+                size,
+                guid,
+            });
+        }
+        rest = &rest[open + close + 8..];
     }
     out
 }
@@ -424,6 +542,72 @@ mod tests {
         assert_eq!(parse_feed_checked(junky).unwrap().len(), 1);
         assert!(parse_feed_checked("<feed xmlns=\"http://www.w3.org/2005/Atom\"/>").is_ok());
         assert!(parse_feed_checked("<rdf:RDF><channel/></rdf:RDF>").is_ok());
+
+        // An Atom root is ACCEPTED, so its entries have to come back:
+        // the empty-root assertions above passed while a real Atom feed
+        // recorded "healthy, 0 items" and grabbed nothing for ever.
+        let atom = "<?xml version=\"1.0\"?>\
+            <feed xmlns=\"http://www.w3.org/2005/Atom\">\
+              <title>An indexer</title>\
+              <entry>\
+                <title>Some.Release.1080p.WEB</title>\
+                <id>urn:uuid:abc-123</id>\
+                <link rel=\"alternate\" href=\"https://x/details/1\"/>\
+                <link rel=\"enclosure\" type=\"application/x-nzb\" \
+                      href=\"https://x/getnzb/1&amp;i=7\" length=\"4096\"/>\
+              </entry>\
+            </feed>";
+        let got = parse_feed_checked(atom).expect("a real Atom feed is a feed");
+        assert_eq!(got.len(), 1, "the Atom entry was not parsed: {got:?}");
+        assert_eq!(got[0].title, "Some.Release.1080p.WEB");
+        // The enclosure link wins over the human details page, and the
+        // ampersand is unescaped exactly as the RSS half unescapes it.
+        assert_eq!(got[0].link, "https://x/getnzb/1&i=7");
+        assert_eq!(got[0].size, 4096);
+        assert_eq!(got[0].guid, "urn:uuid:abc-123");
+
+        // No enclosure at all: the alternate link is still a link, the
+        // same way a bare RSS <link> is. Size falls back to the
+        // newznab attr.
+        let plain = "<feed xmlns=\"http://www.w3.org/2005/Atom\"><entry>\
+            <title>Other.Release</title>\
+            <link href=\"https://x/2\"/>\
+            <newznab:attr name=\"size\" value=\"1234\"/>\
+            </entry></feed>";
+        let got = parse_feed(plain);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].link, "https://x/2");
+        assert_eq!(got[0].size, 1234);
+        // No <id>: the link stands in for the guid, as it does in RSS.
+        assert_eq!(got[0].guid, "https://x/2");
+
+        // A namespace PREFIX on the root is legal, and the roots were
+        // matched as literal strings - so these valid feeds were
+        // refused, the settings row went red and grabbing stopped,
+        // which is the failure the check exists to prevent arriving
+        // from the other side.
+        assert!(
+            parse_feed_checked(
+                "<?xml version=\"1.0\"?><atom:feed \
+                 xmlns:atom=\"http://www.w3.org/2005/Atom\"/>"
+            )
+            .is_ok(),
+            "a prefixed Atom root is still an Atom feed"
+        );
+        assert!(
+            parse_feed_checked("<r:RDF xmlns:r=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"/>")
+                .is_ok(),
+            "RSS 1.0 may bind RDF to any prefix"
+        );
+        // And the refusals must not have loosened with it.
+        assert!(
+            parse_feed_checked("<!doctype html><html><body>login</body></html>").is_err(),
+            "a login page is still not a feed"
+        );
+        assert!(
+            parse_feed_checked("<notafeed><item/></notafeed>").is_err(),
+            "an unrelated root is still not a feed"
+        );
     }
 
     /// §G. The recorded failure crosses to the browser and sits on the

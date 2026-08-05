@@ -815,9 +815,80 @@ fn software_marker(toks: &[&str]) -> Option<usize> {
             first_furniture.get_or_insert(i);
         }
     }
+    // ONE furniture hit decides when the stem carries no video evidence
+    // at all - the same shape of gate the music rules below apply, and
+    // for the same reason.
+    //
+    // The case this exists for: vendors who version by YEAR.
+    // `Adobe.Illustrator.2026.u6.Multilingual` and
+    // `Android Studio 2026.1.3.7 Latest Offline Installer` carry no `v`
+    // token and no keygen vocabulary, so they needed two weak hits and
+    // had one each - and a bare trailing year parses as a film, so both
+    // landed on the wall as 2026 MOVIES, sitting between real releases.
+    //
+    // Narrow on both axes deliberately. Only the furniture words a film
+    // title does not use ("Setup", "Windows", "Patch", "Build" and the
+    // rest stay out - each is a plausible title word), and only with no
+    // resolution, source or codec anywhere in the stem. A real film that
+    // says "Multi" or "Setup" says 1080p and x264 beside it, which is
+    // what `movies_with_software_ish_words_stay_movies` pins.
+    let furniture_alone = |t: &str| {
+        matches!(
+            t,
+            "multilingual" | "installer" | "portable" | "x64" | "x86" | "win32" | "win64"
+        )
+    };
+    if weak_hits == 1
+        && let Some(w) = first_furniture
+        && toks
+            .get(w)
+            .is_some_and(|t| furniture_alone(&t.to_ascii_lowercase()))
+        && !toks.iter().any(|t| video_token(&t.to_ascii_lowercase()))
+    {
+        return Some(w);
+    }
     // Without a strong marker, two weak hits decide - but at least one
     // must be furniture, or "Pro" and "Plus" in a film title would do it.
     (weak_hits >= 2).then_some(first_furniture).flatten()
+}
+
+/// Does this token say "there is video here"? Resolution, source or
+/// codec - the three things every real film or episode release names and
+/// a software post never does.
+///
+/// Token-level rather than the parsed `no_video_evidence` below, because
+/// the software test runs before those fields exist.
+fn video_token(t: &str) -> bool {
+    matches!(
+        t,
+        "480p"
+            | "576p"
+            | "720p"
+            | "1080p"
+            | "1440p"
+            | "2160p"
+            | "4320p"
+            | "bluray"
+            | "blu-ray"
+            | "brrip"
+            | "bdrip"
+            | "bdremux"
+            | "webrip"
+            | "web-dl"
+            | "webdl"
+            | "hdtv"
+            | "dvdrip"
+            | "hdrip"
+            | "remux"
+            | "x264"
+            | "x265"
+            | "h264"
+            | "h265"
+            | "hevc"
+            | "avc"
+            | "xvid"
+            | "divx"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2749,6 +2820,41 @@ mod tests {
         let k = p("Some.App.Incl.Keygen-GROUP");
         assert_eq!(k.kind, Kind::Software);
         assert_eq!(k.title, "Some App");
+    }
+
+    /// A vendor that versions by YEAR is still software.
+    ///
+    /// These two were on the poster wall as 2026 FILMS: no `v` token and
+    /// no keygen vocabulary, so the two-weak-hits rule never fired, and
+    /// a bare trailing year parses as a movie. One unambiguous furniture
+    /// word plus NO resolution, source or codec anywhere is enough.
+    #[test]
+    fn software_versioned_by_year_is_not_a_film() {
+        assert_eq!(
+            p("Adobe.Illustrator.2026.u6.Multilingual").kind,
+            Kind::Software
+        );
+        assert_eq!(
+            p("Android Studio 2026.1.3.7 Latest Offline Installer").kind,
+            Kind::Software
+        );
+        // Cut at the furniture marker, as every other software post is:
+        // the version stays in the title, which is what names a build.
+        assert_eq!(
+            p("Adobe.Illustrator.2026.u6.Multilingual").title,
+            "Adobe Illustrator 2026 u6"
+        );
+
+        // ...and the narrowness holds. A film with media evidence keeps
+        // its kind however software-ish a word it carries, and a film
+        // with NO media evidence is not reclassified on a title word -
+        // only the furniture a film title does not use counts.
+        assert_eq!(
+            p("The.Portable.Door.2023.1080p.WEB-DL.x264-GRP").kind,
+            Kind::Movie
+        );
+        assert_eq!(p("Windows.2011").kind, Kind::Movie);
+        assert_eq!(p("The.Setup.1995").kind, Kind::Movie);
     }
 
     #[test]

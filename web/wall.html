@@ -855,7 +855,15 @@ let key = localStorage.nzbfastKey || '';
 // M31b: the sort is persisted so "For you" (affinity) sticks across
 // reloads; it also keeps the select's value in sync with sortBy given
 // affinity now leads the option list.
-let cards = [], tab = '', sortBy = localStorage.nzbfastWallSort || 'latest', hasTmdb = false, openKey = null, openSeq = 0;
+// The category tab persists like every other control on this bar. It
+// was the one that did not: sort, genre, density, matched-only and
+// grouping all survive a reload, while the tab silently reset to All -
+// so "show me films" was a choice you had to re-make on every single
+// visit, and what came back instead was everything, which on Usenet
+// means whatever posts most often: daily TV, talk shows, long-running
+// anime, foreign-language soaps. Choosing Movies is a preference, not a
+// one-off gesture.
+let cards = [], tab = localStorage.nzbfastWallCat || '', sortBy = localStorage.nzbfastWallSort || 'latest', hasTmdb = false, openKey = null, openSeq = 0;
 // 'year' became 'aired' (same ordering, now to the day where a provider
 // gave us one). Migrate rather than leaving the select blank on the
 // reload after an upgrade.
@@ -1067,7 +1075,9 @@ function updateCats(list){
   // A deleted category can leave the active tab orphaned - fall back
   // to All rather than filtering on a kind that no longer exists.
   if(tab && !document.querySelector(`#tabs button[data-k="${CSS.escape(tab)}"]`)){
-    tab=''; syncTabs();
+    // Clear the persisted choice too, or a category deleted in settings
+    // leaves a tab that silently resets on every single load.
+    tab=''; localStorage.nzbfastWallCat=''; syncTabs();
   } else syncTabs();
 }
 let _lastKind=null;
@@ -1211,7 +1221,14 @@ let stripSeq=0;
 async function renderStrips(){
   const box=document.getElementById('strips');
   const q=document.getElementById('q').value.trim();
-  if(q||tab||sortBy!=='latest'||view==='releases'||genreSel||resSel||decSel||catGroup){ box.innerHTML=''; return; }
+  // Deliberately NOT bailing on `tab` any more. The strips used to be
+  // an All-only feature, so the moment you narrowed to Movies every bit
+  // of curation vanished and you were left with a bare grid ordered by
+  // upload date - which is the one view a film watcher actually wants
+  // and the one that got the least help. They are scoped to the chosen
+  // category instead.
+  if(q||sortBy!=='latest'||view==='releases'||genreSel||resSel||decSel||catGroup){ box.innerHTML=''; return; }
+  const cat=`&cat=${encodeURIComponent(tab||'all')}`;
   const seq=++stripSeq;
   const toCard=c=>({
     key:c.key, kind:c.kind, title:c.title, year:c.year||0, aired:c.aired||'',
@@ -1223,19 +1240,41 @@ async function renderStrips(){
     // M31b: a "Recommended for you" row leads the default view when a
     // taste profile exists (cold start has none, so it's skipped and only
     // "Hot right now" shows - no duplicate "most posted" strip).
+    // One title earns one place. A card that is both recommended and
+    // newly released used to be drawn in both strips and again at the
+    // top of the grid, which is a large part of why the wall read as
+    // repetitive: the same handful of shows, three times, before you
+    // reached anything you had not already seen.
+    const seen=new Set();
+    const fresh=list=>list.filter(c=>!seen.has(c.key)&&seen.add(c.key));
     const taste=await api('taste','').catch(()=>({}));
     if(seq!==stripSeq) return;
     if((taste.n_signals>0)&&(taste.genres||[]).length){
-      const ja=await api('wall2','&sort=affinity&limit=14&matched=1&all=0');
+      const ja=await api('wall2',`&sort=affinity&limit=14&matched=1&all=0${cat}`);
       if(seq!==stripSeq) return;
-      const recs=(ja.cards||[]).map(toCard);
+      const recs=fresh((ja.cards||[]).map(toCard));
       if(recs.length) html+=`<div class="strip">
         <h2>${t('wall.strip.foryou','Recommended for you')}</h2>
         <div class="striprow">${recs.map(cardHtml).join('')}</div></div>`;
     }
-    const j=await api('wall2','&sort=releases&limit=14&matched=1&all=0');
+    // What actually came out recently, by release date - not by upload
+    // date. Those are different questions and the wall only answered the
+    // second one: sorted by "newest posts" a 1982 film someone re-posted
+    // last night outranks everything released this month, so "recent"
+    // meant "recently re-uploaded" and the grid looked like a random
+    // scatter of decades. `aired` is dated to the day where a provider
+    // gave us one, and falls back to the year otherwise.
+    const jn=await api('wall2',`&sort=aired&limit=14&matched=1&all=0${cat}`);
     if(seq!==stripSeq) return;
-    const hot=(j.cards||[]).filter(c=>(c.n||0)>=3).map(toCard);
+    const neu=fresh((jn.cards||[]).map(toCard));
+    if(neu.length) html+=`<div class="strip">
+      <h2>${tab==='movie'
+        ? t('wall.strip.newfilms','New films · recently released')
+        : t('wall.strip.new','New releases · recently released')}</h2>
+      <div class="striprow">${neu.map(cardHtml).join('')}</div></div>`;
+    const j=await api('wall2',`&sort=releases&limit=14&matched=1&all=0${cat}`);
+    if(seq!==stripSeq) return;
+    const hot=fresh((j.cards||[]).filter(c=>(c.n||0)>=3).map(toCard));
     if(hot.length) html+=`<div class="strip">
       <h2>${t('wall.strip.hot','Hot right now · most posted')}</h2>
       <div class="striprow">${hot.map(cardHtml).join('')}</div></div>`;
@@ -2931,6 +2970,7 @@ document.getElementById('views').addEventListener('click', e=>{
 document.getElementById('tabs').addEventListener('click', e=>{
   const b=e.target.closest('button'); if(!b) return;
   tab=b.dataset.k;
+  localStorage.nzbfastWallCat=tab;
   syncTabs();
   if(view==='releases'){ lpage=0; browseFetch(); } else wallFetch(true);
 });
@@ -3269,6 +3309,11 @@ function initArrivals(){ tipPoll(); setInterval(tipPoll, 5000); }
 // M31b: reflect the persisted sort (affinity leads the option list, so
 // without this the select would show "For you" while sortBy is 'latest').
 document.getElementById('sort').value=sortBy;
+// Same for the persisted category. `updateCats` re-syncs once the first
+// wall2 answer lands, but that is a whole round trip later, and the
+// markup ships with All pre-lit - so without this the bar visibly
+// flicks from All to Movies after the grid has already painted.
+syncTabs();
 applyZoom();
 renderDir();
 renderChips();

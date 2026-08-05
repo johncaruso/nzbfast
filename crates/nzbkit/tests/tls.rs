@@ -106,6 +106,7 @@ async fn downloads_a_body_over_tls() {
         username: None,
         password: None,
         connections: 1,
+        pin_connections: false,
         rcvbuf: None,
         level: 0,
         group: None,

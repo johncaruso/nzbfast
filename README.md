@@ -60,9 +60,10 @@ Issues: [issue tracker](https://github.com/nzbfast/nzbfast/issues)
 
 ```sh
 docker run -d -p 6789:6789 \
+  -e NZBFAST_OUT=/data/usenet \
   -v /srv/nzbfast/config:/config \
-  -v /srv/nzbfast/downloads:/downloads \
   -v /srv/nzbfast/watch:/watch \
+  -v /data/usenet:/data/usenet \
   nzbfast/nzbfast
 ```
 
@@ -74,6 +75,25 @@ an update that wiped your settings. To update, pull the new image and
 recreate the container with the same mappings. Easier still is the repo's
 [docker-compose.yml](docker-compose.yml), where updating is
 `docker compose pull && docker compose up -d`.
+
+**Running Sonarr or Radarr too?** The downloads line above is mapped to the
+same path on both sides, and under a root you also give them, and both
+halves matter. nzbfast reports where a finished job is, so that path has to
+mean the same thing inside their container as inside this one - otherwise
+the download sits in the queue and the \*arr reports a remote path mapping
+error while the files are perfectly fine. And when downloads and the
+library sit under one root (`/data/usenet` and `/data/media`), an import is
+a rename: instant, with no second copy. On separate mounts Docker makes
+them look like separate filesystems even when they are not, and every
+import copies the whole 5-50 GB release and deletes the original. The root
+does not have to be `/data` - `/shared`, `/storage`, anything - as long as
+every container uses the same one. Give nzbfast the usenet subtree only;
+your \*arr is what moves the files and it sees both sides.
+
+There is no `incomplete` folder to map. SABnzbd needs one because it writes
+there and moves everything when a job finishes; nzbfast writes at the final
+path from the first article on, so a SAB migrant has two filesystem
+boundaries to get right and an nzbfast user has exactly one.
 
 Then open `http://<host>:6789` and add your provider in the Welcome panel.
 On a new install nzbfast generates an API key for itself, prints it once at

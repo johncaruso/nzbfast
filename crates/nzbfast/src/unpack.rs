@@ -1639,6 +1639,17 @@ pub(crate) fn extract_obfuscated_rar(
         sets.iter().map(|s| s.len()).sum::<usize>()
     );
     let mut all_ok = true;
+    // §101, the same refusal the named-stem ladder makes: a directory
+    // holding more than one archive set must not eat. It was applied
+    // only in `try_unrar_spent`'s loop, and this path partitions by
+    // HEADER continuity rather than by stem, so a directory of two
+    // obfuscated sets slipped past it entirely. Set one eats its volumes
+    // and publishes; set two fails part-way with several of its own
+    // volumes already hard-deleted - and the failure arm below still
+    // says every volume of a failed set stays, "on a finished download
+    // they are the only copy", which eating has just made untrue.
+    // Held for the whole partitioned run, restored on drop.
+    let _single_set_only = (sets.len() > 1).then(|| crate::eatvol::EatArm::new(false));
     for set in sets {
         // Keep each set's SOURCE paths instead of dropping them on the
         // floor: they are the exact files we parsed and are about to feed
@@ -1665,7 +1676,35 @@ pub(crate) fn extract_obfuscated_rar(
         // `sources` and `archives` came off the same unzip, so index i of
         // one is index i of the other - the mapping §101's eating mode
         // needs to delete each volume as the extractor finishes with it.
-        match write_archives_to_spending(dir, &archives, password, &sources) {
+        //
+        // Withheld on the two gates the post-extraction sweep below
+        // already applies, because eating happens INSIDE the extractor
+        // and so runs before `sweep_spent_obfuscated` is ever consulted -
+        // its refusals cannot protect a file that is already gone.
+        //
+        //  - `has_member`: a memberless set is the `.rev` shape. Such a
+        //    file walks out of the extractor as a one-volume set with no
+        //    files, which reports `consumed(0)` immediately, so eating
+        //    hard-deleted the recovery data a damaged set is repaired
+        //    FROM. The sweep's own doc calls that the worst outcome
+        //    available here, and `repair.rs`'s
+        //    `obfuscated_sweep_never_touches_a_memberless_rar_file`
+        //    pins it as the property that must not bend - it passed only
+        //    because eating is disarmed under test.
+        //  - `depth >= 1`: depth 0 is the user's own set from the offline
+        //    `extract` CLI, whose retention is finalize/policy's call.
+        //    Unreachable today (the CLI never calls `eatvol::set_mode`,
+        //    so its mode is always Off), but the two paths must not
+        //    disagree about which volumes are spendable.
+        //
+        // An empty mapping is the off switch: `write_archives_to_spending`
+        // requires one source per archive before it will eat anything.
+        let eat_sources: &[PathBuf] = if has_member && depth >= 1 {
+            &sources
+        } else {
+            &[]
+        };
+        match write_archives_to_spending(dir, &archives, password, eat_sources) {
             Ok(()) => {
                 println!("native unpack complete ✔");
                 // Same depth gate the named-set sweep uses, and for the
@@ -2212,6 +2251,15 @@ pub(crate) struct FileSlot {
     /// volume in-stream and deferred (removed from the pool queue). Kept
     /// apart from `missing`: a deferred article is a choice, not damage.
     pub(crate) deferred: std::sync::atomic::AtomicUsize,
+    /// PAR2-race experiment: segments deliberately abandoned mid-run
+    /// because recovery blocks on hand already covered them with margin
+    /// and repair beats the fetch remainder. A third category next to
+    /// `missing` (damage we suffered) and `deferred` (a choice that is
+    /// not damage): this is a choice that IS damage - the settle
+    /// read-back counts the absent blocks as bad and repair heals them,
+    /// so it must exempt the sparse-slot census like a deferral while
+    /// still reading as damage evidence for the repair branches.
+    pub(crate) abandoned: std::sync::atomic::AtomicUsize,
     /// Par2-main slots capture decoded bytes in memory so the recovery set
     /// activates mid-download without re-reading from disk. `Some` from
     /// build time for slots the NZB names as par2; installed at sniff time

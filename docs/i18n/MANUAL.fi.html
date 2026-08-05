@@ -808,6 +808,25 @@ uudelleenjärjestyksellä/keskeytyksellä/poistolla, historia, lisää-NZB, nope
 koontinäytöllä ja seinällä on kosketusasettelu. Asetukset → Etäkäyttö -paneeli näyttää
 tarkat URL:t ja skannattavan QR-koodin.</p>
 
+<h3 id="remote-proxy">nzbfastin tavoittaminen kodin ulkopuolelta</h3>
+<p>Kirjautumissivua ei ole, ja se on tarkoituksellista. Istuntoevästeeseen perustuva kirjautuminen on tietoturvapinta, jota pitäisi ylläpitää ikuisesti, ja se olisi silti heikoin lukko missä tahansa avoimeen internetiin näkyvässä. nzbfast todentaa sen sijaan API-avaimellasi, ja ottaa avaimen vastaan sekä pyynnön otsakkeessa että osoitteessa (<code>X-Api-Key</code> tai <code>Authorization: Bearer</code>) - juuri se antaa edessä olevan palvelun hoitaa kirjautumisen kunnolla.</p>
+<p><b>Yksinkertaisinta on olla julkaisematta sitä lainkaan.</b> Asenna <b>Tailscale</b> tähän koneeseen ja puhelimeesi, niin molemmat liittyvät samaan yksityisverkkoon: mitään ei altisteta, reitittimeen tai varmenteisiin ei tarvitse koskea, ja Asetukset → Etäkäyttö näyttää kaikkialta toimivan osoitteen heti kun Tailscale on käynnissä. Valitse tämä, ellet nimenomaan tarvitse julkista verkkotunnusta.</p>
+<p><b>Jos tarvitset</b>, laita eteen käänteisproxy, anna sille varmenne ja anna sen hoitaa todennus. Käynnistä nzbfast valitsimella <code>--bind 127.0.0.1</code>, jotta proxy on ainoa reitti sisään, ja osoita proxy osoitteeseen <code>http://127.0.0.1:6789</code>:</p>
+<pre><code># Caddy
+example.com {
+    reverse_proxy 127.0.0.1:6789
+}
+
+# nginx
+location / {
+    proxy_pass http://127.0.0.1:6789;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}</code></pre>
+<p>Lisää päälle se, mitä proxysi tarjoaa: basic auth, forward-auth-palvelu kuten Authelia tai Authentik, tai asiakasvarmenteet. Yksi asia yllättää kaikki - Sonarr, Radarr ja puhelinsovellukset eivät pysty suorittamaan selainkirjautumista, joten jätä niille reitti ohi. Useimmat proxyt osaavat päästää läpi pyynnön, jossa on kelvollinen <code>X-Api-Key</code>-otsake, ja vaatia todennuksen kaikelta muulta.</p>
+<div class="warn-box"><b>Älä vain ohjaa porttia 6789 reitittimessäsi.</b> Hallintapaneeli puhuu salaamatonta HTTP:tä, joten API-avaimesi ja kaikki mitä sillä teet kulkisivat internetin yli kenen tahansa reitillä olevan luettavissa, ja asennus ilman avainta on avoin kenelle tahansa sen löytävälle. Jos ohjaat portin silti, aseta ensin API-avain.</div>
+
 <h2 id="performance">13 · Suorituskykytyökalut</h2>
 <h3 id="perf-benchmark">Järjestelmän mittaus</h3>
 <p>Yksi napsautus mittaa kolme kattoasi - verkon nopeuden (aito 8-sekuntinen
@@ -1061,6 +1080,7 @@ täsmälleen samalta ja korjaantuu itsestään.</td></tr>
 <tr><td>Mikään verkossa ei tavoita daemonia</td><td>Tarkista <code>--bind</code>: <code>127.0.0.1</code> palvelee vain sitä konetta, jolla nzbfast ajaa. Oletus, <code>0.0.0.0</code>, palvelee jokaista liitäntää. Tarkista sitten koneen oma palomuuri portin 6789 osalta.</td></tr>
 <tr><td>Selaa-kortti pysyy pienenä</td><td>Indeksoija kasvaa taustalla - tarkista, että Asetukset → Indeksointi -ryhmät on asetettu, ja anna Syvennä per skannaus -asetukselle aikaa kerätä historiaa. ”Skannaa nyt” pakottaa kierroksen; tilarivi näyttää live-edistymisen.</td></tr>
 <tr><td>Seinä näyttää väärän/ei kuvitusta</td><td>Tietosivu → ✎ Korjaa osuma tai ↻ Päivitä metatiedot. Elokuvahaut paranevat ilmaisella OMDb-avaimella.</td></tr>
+<tr id="mac-cant-open"><td>macOS sanoo, ettei sovellusta "nzbfast" voi avata</td><td>Kaksi syytä, molemmat nopeita. Jos käytät pelkkää <code>-macos-universal.zip</code>-pakettia, kaksoisnapsauta <b>Start nzbfast.command</b>-tiedostoa, älä sen vieressä olevaa <code>nzbfast</code>-tiedostoa: se on itse ohjelma, ja Finder vastaa sen kaksoisnapsautukseen juuri tällä ilmoituksella. Käynnistin on se, joka valmistelee ja käynnistää kaiken. Jos käynnistin antaa saman ilmoituksen, kopio on menettänyt Unix-suoritusbittinsä matkalla: macOS säilyttää bitin .zip-tiedoston sisällä, mutta chat-sovellukset, pilvilevyt ja uudelleenpakkaus eivät, joten kädestä käteen kulkenut kopio saapuu ilman suoritusoikeutta. Lataa .dmg tai .zip suoraan releases-sivulta, niin näin ei käy. Jos haluat pelastaa jo lataamasi kopion: avaa Pääte, kirjoita <code>chmod +x</code> ja välilyönti perään, raahaa <b>Start nzbfast.command</b> ja <code>nzbfast</code>-tiedosto ikkunaan ja paina rivinvaihtoa, ja kaksoisnapsauta sitten käynnistintä uudelleen.</td></tr>
 <tr><td>Daemon ei käynnisty: portti käytössä</td><td>Toinen instanssi on käynnissä - tai vaihda <code>--port</code>.</td></tr>
 <tr><td>Missä lokit ovat?</td><td>Koontinäytön Loki-kortti tai terminaali/lokitiedosto, jolla käynnistit <code>serve</code>n.</td></tr>
 </table></div>

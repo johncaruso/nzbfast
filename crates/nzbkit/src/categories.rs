@@ -100,6 +100,65 @@ pub fn pat_match(pattern: &str, name: &str) -> bool {
     }
 }
 
+/// What a rule's pattern is actually going to do, for the editor to show.
+///
+/// [`pat_match`] deliberately never fails: a pattern that will not compile
+/// falls back to a plain keyword search, and that fallback is what makes
+/// the documented "plain keywords work too" true. The cost is that both
+/// ways of getting a rule wrong are silent, and they fail in OPPOSITE
+/// directions, which is why one verdict is not enough:
+///
+/// - `*anime*` does not compile (nothing to repeat before the first `*`),
+///   so it becomes a literal search for those seven characters and can
+///   never match anything. A rule that quietly does nothing looks exactly
+///   like a rule that has not fired yet, so it can sit broken for weeks.
+/// - `!*` DOES compile - as "zero or more `!`" - so it matches every
+///   release there is. Smart Folders is first-match-wins and a match
+///   overrides an *arr's explicit `cat=`, so one rule like that at the top
+///   of the list silently misroutes the whole queue.
+///
+/// Nothing here changes what matches. It reports what the engine already
+/// decided, so a row can be marked. Reported by `get_config` alongside
+/// each rule rather than stored on it - see `smart_folders` in
+/// serve/settings.rs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatternVerdict {
+    /// Compiled, and selective. Nothing to say.
+    Ok,
+    /// Did not compile, so it is being searched for as literal text.
+    Literal,
+    /// Compiled, and matches every possible name.
+    MatchesEverything,
+}
+
+/// Classify a pattern the way [`pat_match`] will treat it.
+///
+/// An empty pattern is [`PatternVerdict::Ok`], not `MatchesEverything`:
+/// for a Smart Folder that is the documented catch-all (a size-only rule
+/// has no `match`), and for a category `cat_match` rejects it outright.
+/// Flagging it would be a warning on the one shape that is deliberate.
+///
+/// "Matches everything" is decided by asking whether the compiled regex
+/// matches the EMPTY string. `is_match` is an unanchored search, so a
+/// pattern that can match nothing-at-all necessarily also matches every
+/// input that contains it, which is all of them. That catches `!*`, `.*`,
+/// `a?` and anything else of the shape without a list of special cases.
+pub fn pat_verdict(pattern: &str) -> PatternVerdict {
+    let p = pattern.trim();
+    if p.is_empty() {
+        return PatternVerdict::Ok;
+    }
+    match regex_lite::RegexBuilder::new(p)
+        .case_insensitive(true)
+        .build()
+    {
+        Ok(re) if re.is_match("") => PatternVerdict::MatchesEverything,
+        Ok(_) => PatternVerdict::Ok,
+        Err(_) => PatternVerdict::Literal,
+    }
+}
+
 impl CustomCategory {
     /// Does this category claim the release name?
     pub fn matches(&self, name: &str) -> bool {
@@ -569,5 +628,53 @@ mod tests {
         migrate_reserved_slugs(&mut taken);
         assert_eq!(taken[0].slug, "book-custom2");
         validate(&taken).expect("dedup must produce a loadable list");
+    }
+}
+
+#[cfg(test)]
+mod pattern_verdict_tests {
+    use super::*;
+
+    /// The two silent failures the verdict exists for, and the proof that
+    /// they are opposites: the literal one matches NOTHING, the
+    /// everything one matches a name it has no business matching.
+    #[test]
+    fn the_two_silent_failures_are_reported_and_still_behave_as_before() {
+        // Will not compile -> searched for as literal text -> never fires.
+        assert_eq!(pat_verdict("*anime*"), PatternVerdict::Literal);
+        assert!(!pat_match("*anime*", "Some.Anime.S01E01.1080p"));
+        // ...and the fallback is still a real substring search, which is
+        // what makes "plain keywords work too" true.
+        assert!(pat_match("*anime*", "weird [*anime*] release"));
+
+        // Compiles, as "zero or more !", so it matches everything.
+        assert_eq!(pat_verdict("!*"), PatternVerdict::MatchesEverything);
+        assert!(pat_match("!*", "Nothing.To.Do.With.It"));
+    }
+
+    #[test]
+    fn an_ordinary_rule_says_nothing() {
+        for p in ["1080p", "Formula1", ".*anime.*x265", "S01E0[1-9]"] {
+            assert_eq!(pat_verdict(p), PatternVerdict::Ok, "{p}");
+        }
+    }
+
+    /// Empty is the one shape that matches everything ON PURPOSE - a
+    /// size-only Smart Folder rule - so it must not be marked.
+    #[test]
+    fn empty_is_not_a_warning() {
+        assert_eq!(pat_verdict(""), PatternVerdict::Ok);
+        assert_eq!(pat_verdict("   "), PatternVerdict::Ok);
+        assert!(pat_match("", "anything at all"));
+    }
+
+    /// Every shape that can match the empty string matches every input,
+    /// which is why the check is "does it match empty" and not a list.
+    #[test]
+    fn the_everything_check_generalises_past_the_reported_case() {
+        for p in [".*", "a?", "(foo)?", "x{0,3}", ".*|1080p"] {
+            assert_eq!(pat_verdict(p), PatternVerdict::MatchesEverything, "{p}");
+            assert!(pat_match(p, "Completely.Unrelated.Name"), "{p}");
+        }
     }
 }

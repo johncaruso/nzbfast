@@ -1010,6 +1010,10 @@ async fn run() -> Result<()> {
                 fast_verify: true,
                 verify_lean: false,
                 min_free: size("min-free", min_free)?,
+                // Settings-only (#20): there is no CLI flag, so the
+                // launch value is always "off" and apply_saved_settings
+                // is what turns it on.
+                out_umask: None,
                 auto_retry_mins: 20,
                 preflight: false,
                 quota: size("quota", quota)?,

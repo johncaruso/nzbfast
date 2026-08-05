@@ -386,6 +386,7 @@ pub(crate) async fn get_with_progress(
             missing: AtomicUsize::new(f.dropped_segments),
             errors: AtomicUsize::new(0),
             deferred: AtomicUsize::new(0),
+            abandoned: AtomicUsize::new(0),
             capture: std::sync::Mutex::new(is_par2_main.then(Vec::new)),
         }));
         let mut arts: Vec<(u64, String)> = Vec::new();
@@ -1065,6 +1066,34 @@ pub(crate) async fn get_with_progress(
     // TODO 96.1, dark until benched: two-phase adaptive read bounds in
     // place of the flat whole-response timeout.
     let adaptive_timeout = std::env::var("NZBFAST_ADAPTIVE_TIMEOUT").is_ok_and(|v| v == "1");
+    // "Race slow articles" (setting race_stragglers, ON by default;
+    // same loader as conntune::enabled so the daemon and the CLI read
+    // the one settings.json the dashboard writes). Covers the three
+    // speculation knobs with measured payouts: early tail fan-out
+    // (farm: tail 1.66 s -> 0.60 s), adaptive hedging (rig: 12-13 s ->
+    // 6-8 s on a stalled article), and slope recycle (rig: 45 s ->
+    // 25 s on one degraded session). The env vars override PER KNOB in
+    // either direction - the bench suite A/Bs single knobs against a
+    // live setting ("1"/"2" arms, anything else disarms).
+    let race = crate::persist::load_json_with_backup(&config.with_file_name("settings.json"))
+        .and_then(|v| v.get("race_stragglers").and_then(|v| v.as_bool()))
+        .unwrap_or(true);
+    let tf = std::env::var("NZBFAST_TAIL_FANOUT").ok();
+    let tail_fanout = tf.as_deref().map_or(race, |v| v == "1" || v == "2");
+    let tail_fanout_early = tf.as_deref().map_or(race, |v| v == "2");
+    let hedge = std::env::var("NZBFAST_HEDGE")
+        .ok()
+        .map_or(race, |v| v == "1");
+    let recycle_slope = std::env::var("NZBFAST_RECYCLE_SLOPE")
+        .ok()
+        .map_or(race, |v| v == "1");
+    // Still dark (env-only): the race-loss recycle (subsumed by the
+    // slope recycle in practice) and the hot spare (needs cap-aware
+    // gating first - at an exact provider cap the spare would steal a
+    // worker slot). NZBFAST_KEEPALIVE and NZBFAST_DIAL_RACE are read
+    // directly in the nntp dial path.
+    let recycle_slow = std::env::var("NZBFAST_RECYCLE_SLOW").is_ok_and(|v| v == "1");
+    let hot_spare = std::env::var("NZBFAST_HOT_SPARE").is_ok_and(|v| v == "1");
     // Per-server budget: the CLI --connections is a ceiling; a server's
     // config `connections` (its account limit) caps its own pool; a
     // fresh auto-tuned knee (conntune.json, M7b.1) caps below that -
@@ -1090,7 +1119,11 @@ pub(crate) async fn get_with_progress(
         .filter_map(|s| {
             let t = tuned.get(&s.host)?;
             let asked = crate::conntune::effective_limit(connections, s.connections);
-            (!t.suspect && t.connections > 0 && t.connections < asked)
+            // A pinned server is not capped, so it must not be announced
+            // as capped - this line is the ONLY explanation a user gets
+            // for a number they did not choose, and printing it for a
+            // number they DID choose is worse than printing nothing.
+            (!s.pin_connections && !t.suspect && t.connections > 0 && t.connections < asked)
                 .then(|| format!("{} capped at {} of {asked}", s.host, t.connections))
         })
         .collect();
@@ -1129,14 +1162,21 @@ pub(crate) async fn get_with_progress(
                 base = base.min((*cap).max(1));
             }
             let cfg = PoolConfig {
-                connections: match tuned.get(&s.host) {
-                    Some(t) if t.connections > 0 && !t.suspect => base.min(t.connections),
-                    _ => base,
-                },
+                connections: crate::conntune::applied_connections(
+                    base,
+                    s.pin_connections,
+                    tuned.get(&s.host),
+                ),
                 window,
                 buf_pool: Some(buf_pool.clone()),
                 read_timeout,
                 adaptive_timeout,
+                tail_fanout,
+                tail_fanout_early,
+                hedge,
+                recycle_slow,
+                recycle_slope,
+                hot_spare,
                 rate: hub.as_ref().map(|h| h.rate.clone()),
                 // B3: wire-side in-flight bytes are budget-exempt (window
                 // × connections × ~800 KB); this cap throttles pipeline
@@ -1950,6 +1990,164 @@ pub(crate) async fn get_with_progress(
             })
         })
     };
+    // PAR2-race experiment (dark, NZBFAST_PAR_RACE=1): once the set is
+    // active, if the recovery blocks already on hand cover the WORST
+    // CASE of every still-queued payload article being abandoned - with
+    // 2x margin - and the line is slow enough that the remainder is
+    // >30 s away, cancel the queued stragglers and let repair finish
+    // the job: the math beats the network. Conservative on every axis:
+    // on-hand is the activation count plus prefetched volumes counted
+    // off disk; per-article damage is the whole-block ceiling plus one
+    // (the block its edges straddle); in-flight articles are untouched
+    // (`cancel` only removes QUEUED work) and resolve normally. The
+    // articles removed get no pool outcome, so this owns the accounting
+    // exactly as a sniff deferral does: remaining down, abandoned up,
+    // fetch_done credited. Settle needs no new damage arithmetic - the
+    // final read-back finds the absent blocks and the repair self-proves
+    // by re-reading the whole set (the invariant this leans on).
+    // Fires at most once per run.
+    let par_race_task: Option<tokio::task::JoinHandle<()>> = std::env::var("NZBFAST_PAR_RACE")
+        .is_ok_and(|v| v == "1")
+        .then(|| {
+            let slots2 = slots.clone();
+            let verifier2 = verifier.clone();
+            let queue_ctl2 = queue_ctl.clone();
+            let stop = prefetch_stop.clone();
+            let pre = prefetched.clone();
+            let fetch_done2 = fetch_done.clone();
+            let bytes_now = decoded_bytes.clone();
+            let slot_file2 = slot_file.clone();
+            let nzb2 = nzb.clone();
+            tokio::spawn(async move {
+                use std::collections::{HashMap, HashSet, VecDeque};
+                let mut win: VecDeque<(std::time::Instant, u64)> = VecDeque::new();
+                loop {
+                    if stop.load(Ordering::Acquire) {
+                        return; // network phase over - settle owns it now
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    let Some(set) = verifier2.set() else { continue };
+                    // Rolling 10 s decode-rate window.
+                    let now = std::time::Instant::now();
+                    win.push_back((now, bytes_now.load(Ordering::Relaxed)));
+                    while win
+                        .front()
+                        .is_some_and(|(t, _)| now.duration_since(*t).as_secs() > 10)
+                    {
+                        win.pop_front();
+                    }
+                    let (Some(&(t0, b0)), Some(&(t1, b1))) = (win.front(), win.back()) else {
+                        continue;
+                    };
+                    let span = t1.duration_since(t0).as_secs_f64();
+                    if span < 8.0 {
+                        continue;
+                    }
+                    let rate = b1.saturating_sub(b0) as f64 / span;
+                    // Candidates: payload slots with unresolved articles.
+                    let block = set.block_size.max(1) as usize;
+                    let mut want: HashSet<String> = HashSet::new();
+                    let mut bytes_of: HashMap<String, (usize, u64)> = HashMap::new();
+                    let mut out_bytes = 0u64;
+                    let mut out_blocks = 0usize;
+                    for (sidx, s) in slots2.iter().enumerate() {
+                        let rem = s.remaining.load(Ordering::Relaxed);
+                        if s.is_par2() || rem == 0 {
+                            continue;
+                        }
+                        let f = &nzb2.files[slot_file2[sidx]];
+                        let per = (f.bytes() / f.segments.len().max(1) as u64).max(1);
+                        out_bytes += rem as u64 * per;
+                        out_blocks += rem * ((per as usize).div_ceil(block) + 1);
+                        for seg in &f.segments {
+                            let b = format!("<{}>", seg.message_id);
+                            bytes_of.insert(b.clone(), (sidx, seg.bytes));
+                            want.insert(b);
+                        }
+                    }
+                    if want.is_empty() {
+                        continue;
+                    }
+                    // The line must be slow enough that repair clearly
+                    // wins; a healthy line finishes the remainder before
+                    // any repair could start its verify pass.
+                    let eta = if rate > 0.0 {
+                        out_bytes as f64 / rate
+                    } else {
+                        f64::INFINITY
+                    };
+                    if eta < 30.0 {
+                        continue;
+                    }
+                    // Damage ceiling if every unresolved article is lost:
+                    // the queued ones we would cancel plus the already
+                    // bad or terminally missing.
+                    let (_, live_bad) = verifier2.live_counts();
+                    let missing_arts: usize = slots2
+                        .iter()
+                        .filter(|s| !s.is_par2())
+                        .map(|s| s.missing.load(Ordering::Relaxed))
+                        .sum();
+                    let per_art_blocks =
+                        ((out_bytes / want.len().max(1) as u64) as usize).div_ceil(block) + 1;
+                    let damage_ceiling =
+                        out_blocks + live_bad as usize + missing_arts * per_art_blocks;
+                    let mut on_hand = set.recovery_blocks_seen;
+                    for (_, paths) in pre.lock_ok().iter() {
+                        for p in paths {
+                            if let Ok(bytes) = std::fs::read(p) {
+                                on_hand += nzbkit::par2repair::recovery_slice_locators(
+                                    &bytes,
+                                    &set.recovery_set_id,
+                                )
+                                .into_iter()
+                                .filter(|(_, _, len)| *len == block)
+                                .count();
+                            }
+                        }
+                    }
+                    if on_hand < damage_ceiling.saturating_mul(2) {
+                        continue;
+                    }
+                    // Race. Cancel is best-effort under queue contention
+                    // (bounded try_lock) - same retry shape as the sniff
+                    // deferral.
+                    let mut removed = Vec::new();
+                    for attempt in 0..3 {
+                        removed = queue_ctl2.cancel(&want);
+                        if !removed.is_empty() {
+                            break;
+                        }
+                        if attempt < 2 {
+                            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                        }
+                    }
+                    if removed.is_empty() {
+                        continue; // everything already in flight or done
+                    }
+                    let mut freed = 0u64;
+                    for id in &removed {
+                        if let Some(&(sidx, b)) = bytes_of.get(id) {
+                            slots2[sidx].remaining.fetch_sub(1, Ordering::AcqRel);
+                            slots2[sidx].abandoned.fetch_add(1, Ordering::Relaxed);
+                            freed += b;
+                        }
+                    }
+                    // No outcome will ever arrive for these - settle the
+                    // bar here, exactly like a sniff deferral.
+                    fetch_done2.fetch_add(freed, Ordering::Relaxed);
+                    info!(
+                        target: "repair",
+                        "par-race: abandoned {} queued straggler article(s) ({:.1} MB) - \
+                         {on_hand} recovery blocks on hand cover the {damage_ceiling}-block \
+                         worst case at 2x, and repair beats the ~{eta:.0}s fetch remainder",
+                        removed.len(),
+                        freed as f64 / 1e6,
+                    );
+                    return;
+                }
+            })
+        });
     // D1 (big-link): the single-runtime path tops out at ~4.1 Gbps per
     // process - one I/O driver thread saturates while the NIC has headroom.
     // On big machines with enough connections, shard the fleet across
@@ -1990,6 +2188,9 @@ pub(crate) async fn get_with_progress(
     // mid-fetch prefetch finish before settle harvests the directory.
     prefetch_stop.store(true, Ordering::Release);
     if let Some(t) = spec_prefetch_task {
+        let _ = t.await;
+    }
+    if let Some(t) = par_race_task {
         let _ = t.await;
     }
     // Decode threads exit when the channel closes (fetch dropped tx).
@@ -2337,13 +2538,33 @@ pub(crate) async fn get_with_progress(
         // case where NOTHING else checks the bytes - `slot_uncovered`
         // itself returns None for the mapped and chased shapes that
         // legitimately hold less than they declare.
+        // The name test uses the name the BYTES WERE WRITTEN UNDER, not
+        // the NZB subject's guess at it. `slot.hint` comes off the
+        // subject line; the writer opens the file under the yEnc
+        // `name=`, and that is also the only thing `LiveVerifier` ever
+        // matches on, so it is the name a PAR2 FileDesc would carry.
+        // Granting an exemption on the hint meant a post whose subject
+        // disagreed with its yEnc header - a copy-pasted subject block,
+        // a repost - could be excused by a set that does not speak for
+        // it at all, which is a false green in the one place nothing
+        // else checks the bytes. It also makes the test WORK for an
+        // obfuscated post, whose hint is a hash and therefore matched
+        // nothing: there the on-disk name is the real one.
+        let written_as = extractor.slot_file_info(i).map(|(n, _)| n);
         let covered_by_set = verifier.slot_in_set(i)
-            || set_names.as_ref().is_some_and(|n| {
-                n.contains(&nzbkit::disk::sanitize_filename(&slot.hint).to_lowercase())
-            });
+            || match (&set_names, &written_as) {
+                (Some(n), Some(name)) => {
+                    n.contains(&nzbkit::disk::sanitize_filename(name).to_lowercase())
+                }
+                _ => false,
+            };
         if !covered_by_set
             && !reconciled.contains(&i)
             && slot.deferred.load(Ordering::Relaxed) == 0
+            // A par-race abandonment leaves exactly this shape (articles
+            // that will never arrive), but it is accounted as damage and
+            // healed by repair - not a size-header lie.
+            && slot.abandoned.load(Ordering::Relaxed) == 0
             && let Some(gap) = extractor.slot_uncovered(i)
             && gap > 0
         {
@@ -2691,7 +2912,8 @@ pub(crate) async fn get_with_progress(
                             && !covered.contains(i)
                             && (s.missing.load(Ordering::Relaxed) > 0
                                 || s.remaining.load(Ordering::Relaxed) > 0
-                                || s.errors.load(Ordering::Relaxed) > 0)
+                                || s.errors.load(Ordering::Relaxed) > 0
+                                || s.abandoned.load(Ordering::Relaxed) > 0)
                     })
                     .map(|(i, s)| (i, s.hint.as_str()))
                     .partition(|(_, hint)| {
@@ -2948,7 +3170,30 @@ pub(crate) async fn get_with_progress(
                         false
                     });
                 }
-                let uncovered_bad: Vec<&str> = uncovered_pairs.iter().map(|(_, h)| *h).collect();
+                let mut uncovered_bad: Vec<String> =
+                    uncovered_pairs.iter().map(|(_, h)| h.to_string()).collect();
+                // The census's own findings belong here too. A slot whose
+                // articles ALL arrived and still does not cover its declared
+                // range has missing/remaining/errors every one at zero, so
+                // the partition above cannot see it - it selects on exactly
+                // those three counters. The no-PAR2-set branch below already
+                // merges these, and the clean-set branch catches them through
+                // `incomplete`; this branch did neither, so a job that took
+                // ANY damage and carried a lying `=ybegin size` on a file
+                // outside the set finished GREEN with a hole in it, and
+                // deleted the journal that named what was missing.
+                //
+                // Safe against the false REDs that shaped the census: it is
+                // already exempt for anything the set covers (so a file
+                // rebuilt from parity, whose interval map is legitimately
+                // empty, never reaches here), for a reconciled deferral, and
+                // for every mapped or chased shape that holds less than it
+                // declares - `slot_uncovered` answers None for those.
+                for hint in &sparse_slots {
+                    if !uncovered_bad.contains(hint) {
+                        uncovered_bad.push(hint.clone());
+                    }
+                }
                 // Whatever the repair did, it did it inside the recovery set.
                 if all_good && !uncovered_bad.is_empty() {
                     all_good = false;
@@ -3346,7 +3591,8 @@ pub(crate) async fn get_with_progress(
                                 !s.is_par2()
                                     && (s.missing.load(Ordering::Relaxed) > 0
                                         || s.remaining.load(Ordering::Relaxed) > 0
-                                        || s.errors.load(Ordering::Relaxed) > 0)
+                                        || s.errors.load(Ordering::Relaxed) > 0
+                                        || s.abandoned.load(Ordering::Relaxed) > 0)
                             })
                             // A mapped or chased slot has no standalone
                             // file by design (its bytes went straight
@@ -3395,6 +3641,22 @@ pub(crate) async fn get_with_progress(
                 }
             }
             if !all_good {
+                // The census's findings have to reach THIS arm too, and
+                // by their own route. The merge above sits inside
+                // `dir_has_par2` AND `every_set_ok`, so a post carrying
+                // no PAR2 at all - a named RAR set with embedded
+                // recovery records, plus a sidecar whose `=ybegin size`
+                // over-declares - left `uncovered_after_par2` empty, the
+                // recovery records healed the RAR, and the guard below
+                // had nothing to refuse with. The job went green with a
+                // hole in the sidecar and deleted the journal, which is
+                // the same class the per-slot census exists to close,
+                // one arm further down.
+                for hint in &sparse_slots {
+                    if !uncovered_after_par2.contains(hint) {
+                        uncovered_after_par2.push(hint.clone());
+                    }
+                }
                 // Missing articles left zero-filled holes and no PAR2
                 // filled them - embedded RAR recovery records can.
                 all_good = try_rar_rr_repair(out_dir, password.as_deref());
@@ -3520,10 +3782,15 @@ pub(crate) async fn get_with_progress(
     // `sweep_spent_entry`, not the downloaded volume set this mode is
     // about.
     let eat_arm = {
-        let shape = final_shape
-            .as_ref()
-            .map(|s| s.display())
-            .unwrap_or_default();
+        // `tag()`, not `display()`. Every other consumer of this shape
+        // reads the raw tokens; `display()` runs each one through
+        // `shape_word` and joins with " · " for humans, so the token
+        // test worked only by the accident that "encrypted" is spelled
+        // the same either way. One rewording or one localization of that
+        // single word and the encrypted third copy would silently drop
+        // out of the forecast, leaving a `low_disk` job that must eat
+        // its volumes reading as "fits" and dying at the decrypt.
+        let shape = final_shape.as_ref().map(|s| s.tag()).unwrap_or_default();
         let encrypted = shape.split_whitespace().any(|t| t == "encrypted");
         let mut on_disk = collect_rar_volumes(out_dir).unwrap_or_default();
         on_disk.extend(collect_obfuscated_rar_volumes(out_dir).unwrap_or_default());

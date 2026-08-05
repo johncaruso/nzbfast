@@ -241,6 +241,23 @@ if [ "$(id -u)" = "0" ]; then
         [ -d "$d" ] || continue
         [ "$(stat -c %u "$d")" = "$PUID" ] || chown -R "$PUID:$PGID" "$d" 2>/dev/null || true
     done
+    # A relocated output directory. The compose example now puts downloads
+    # under a root shared with the *arr library, because that is what makes
+    # a Sonarr/Radarr import a rename instead of a 5-50 GB copy - and Docker
+    # creates a missing bind-mount source as root:root, so without this the
+    # daemon cannot create its per-job directories and the first job fails.
+    #
+    # Deliberately NOT recursive, unlike the loop above. Those four paths
+    # are ours by construction; NZBFAST_OUT is wherever the user pointed it,
+    # which may sit beside or inside a media library. Owning the directory
+    # is all the daemon needs in order to write into it, and rewriting the
+    # ownership of a library that happens to be mounted below it is not
+    # ours to do.
+    OUT="${NZBFAST_OUT:-/downloads}"
+    if [ "$OUT" != "/downloads" ] && [ -d "$OUT" ] \
+       && [ "$(stat -c %u "$OUT")" != "$PUID" ]; then
+        chown "$PUID:$PGID" "$OUT" 2>/dev/null || true
+    fi
     exec gosu "$PUID:$PGID" nzbfast "$@"
 fi
 

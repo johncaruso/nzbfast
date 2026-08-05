@@ -98,6 +98,47 @@ pub(super) const fn rw(name: &'static str, read: fn(&ConfigCtx) -> Value) -> Set
 }
 
 /// Readable and writable, but the value is a blob we only log the size of.
+/// Tell the editor what each rule's pattern will actually do (#18).
+///
+/// Both `match` and `but not` ride `nzbkit::categories::pat_match`, which
+/// never fails - a pattern that will not compile silently becomes a
+/// literal keyword search, and one that compiles to "match anything"
+/// silently claims the whole queue. Neither is visible in the rules
+/// editor, so a broken rule looks exactly like one that has not fired.
+///
+/// Computed on the READ path and attached here rather than stored on
+/// `Rule` / `CustomCategory`: those two structs are the persisted shape in
+/// settings.json, and a field that only ever describes the value would be
+/// written back into the file. The editors rebuild their payload from the
+/// row inputs and send only the keys they own (saveSmart / saveCats in
+/// dashboard.html), so these never echo back - the same read-only-sibling
+/// contract `feed_health` uses.
+///
+/// `PatternVerdict::Ok` is left off entirely: an absent key is the normal
+/// case, and shipping `"ok"` on every rule of every install would be pure
+/// payload for the reading that means "nothing to say".
+fn annotate_patterns(v: Value) -> Value {
+    use nzbkit::categories::{PatternVerdict, pat_verdict};
+    let Value::Array(rules) = v else { return v };
+    Value::Array(
+        rules
+            .into_iter()
+            .map(|mut rule| {
+                for (field, out) in [("match", "match_verdict"), ("not_match", "not_verdict")] {
+                    let pat = rule.get(field).and_then(Value::as_str).unwrap_or("");
+                    let verdict = pat_verdict(pat);
+                    if verdict != PatternVerdict::Ok
+                        && let Some(obj) = rule.as_object_mut()
+                    {
+                        obj.insert(out.into(), json!(verdict));
+                    }
+                }
+                rule
+            })
+            .collect(),
+    )
+}
+
 pub(super) const fn rw_opaque(name: &'static str, read: fn(&ConfigCtx) -> Value) -> Setting {
     Setting {
         name,
@@ -175,6 +216,17 @@ pub(super) const DOWNLOAD: &[Setting] = &[
         })
     }),
     rw("min_free", |c| json!(c.d.min_free.load(Ordering::Relaxed))),
+    // #20. Echoed as the octal STRING it was typed as, empty when off,
+    // so the field shows back what the guides print rather than a
+    // decimal nobody recognises.
+    rw("out_umask", |c| {
+        let m = c.d.out_umask.load(Ordering::Relaxed);
+        json!(if m <= 0o777 {
+            format!("{m:03o}")
+        } else {
+            String::new()
+        })
+    }),
     rw("auto_retry_mins", |c| {
         json!(c.d.auto_retry_secs.load(Ordering::Relaxed) / 60)
     }),
@@ -218,6 +270,9 @@ pub(super) const SPEED: &[Setting] = &[
     rw("post_health_defer", |c| {
         json!(c.d.post_health_defer.load(Ordering::Relaxed))
     }),
+    rw("wall_hide_adult", |c| {
+        json!(c.d.wall_hide_adult.load(Ordering::Relaxed))
+    }),
     rw("auto_connections", |c| {
         json!(c.d.auto_connections.load(Ordering::Relaxed))
     }),
@@ -229,6 +284,9 @@ pub(super) const SPEED: &[Setting] = &[
     ro("tune_hint", |c| json!(c.d.tune_hint.lock_ok().clone())),
     rw("auto_prefetch", |c| {
         json!(c.d.auto_prefetch.load(Ordering::Relaxed))
+    }),
+    rw("race_stragglers", |c| {
+        json!(c.d.race_stragglers.load(Ordering::Relaxed))
     }),
     rw("oracle_route", |c| {
         json!(c.d.oracle_route.load(Ordering::Relaxed))
@@ -292,6 +350,12 @@ pub(super) const RENAME: &[Setting] = &[
     }),
     rw("history_color_names", |c| {
         json!(c.d.history_color_names.load(Ordering::Relaxed))
+    }),
+    rw("media_chip_color", |c| {
+        json!(c.d.media_chip_color.load(Ordering::Relaxed))
+    }),
+    rw("shape_chip_color", |c| {
+        json!(c.d.shape_chip_color.load(Ordering::Relaxed))
     }),
 ];
 
@@ -492,10 +556,12 @@ pub(super) const AUTOMATION: &[Setting] = &[
         json!(c.d.watchlist_instant_max.load(Ordering::Relaxed))
     }),
     rw_opaque("smart_folders", |c| {
-        serde_json::to_value(&*c.d.smart_folders.lock_ok()).unwrap_or(json!([]))
+        annotate_patterns(serde_json::to_value(&*c.d.smart_folders.lock_ok()).unwrap_or(json!([])))
     }),
     rw("custom_categories", |c| {
-        serde_json::to_value(&*c.d.custom_categories.read_ok()).unwrap_or(json!([]))
+        annotate_patterns(
+            serde_json::to_value(&*c.d.custom_categories.read_ok()).unwrap_or(json!([])),
+        )
     }),
     rw("cleanup_exts", |c| {
         json!(c.d.cleanup_exts.lock_ok().clone())
@@ -835,6 +901,11 @@ pub(super) fn apply_setting(
             d.post_health_defer.store(on, Ordering::Relaxed);
             (true, json!(on))
         }
+        "wall_hide_adult" => {
+            let on = flag();
+            d.wall_hide_adult.store(on, Ordering::Relaxed);
+            (true, json!(on))
+        }
         "auto_connections" => {
             let on = flag();
             d.auto_connections.store(on, Ordering::Relaxed);
@@ -909,6 +980,14 @@ pub(super) fn apply_setting(
                 // Turning it off also stops a running sidecar.
                 d.poke_sidecar(|_| true);
             }
+            (true, json!(on))
+        }
+        "race_stragglers" => {
+            // The pool reads the persisted value per job, so this
+            // applies from the NEXT download; the atomic is the
+            // settings API's live mirror.
+            let on = flag();
+            d.race_stragglers.store(on, Ordering::Relaxed);
             (true, json!(on))
         }
         "oracle_route" => {
@@ -999,6 +1078,16 @@ pub(super) fn apply_setting(
             d.history_color_names.store(on, Ordering::Relaxed);
             (true, json!(on))
         }
+        "media_chip_color" => {
+            let on = flag();
+            d.media_chip_color.store(on, Ordering::Relaxed);
+            (true, json!(on))
+        }
+        "shape_chip_color" => {
+            let on = flag();
+            d.shape_chip_color.store(on, Ordering::Relaxed);
+            (true, json!(on))
+        }
         "rename_junk" => {
             let on = flag();
             d.rename_junk.store(on, Ordering::Relaxed);
@@ -1074,6 +1163,25 @@ pub(super) fn apply_setting(
             d.fast_verify.store(fast, Ordering::Relaxed);
             d.verify_lean.store(lean, Ordering::Relaxed);
             (true, json!(v.trim()))
+        }
+        "out_umask" => {
+            // Empty clears it, which is the documented way back to
+            // "whatever the process umask gives" - the state every
+            // install starts in.
+            let v = v.trim();
+            if v.is_empty() {
+                d.out_umask.store(u32::MAX, Ordering::Relaxed);
+                return Ok((true, json!("")));
+            }
+            // Octal, and range-checked. A umask outside 0-0777 is not a
+            // stricter setting, it is a typo: `0o1000` would wrap into
+            // mode bits that mean setuid rather than permission.
+            let m = u32::from_str_radix(v, 8)
+                .ok()
+                .filter(|m| *m <= 0o777)
+                .ok_or("out_umask must be an octal umask like 002 or 022")?;
+            d.out_umask.store(m, Ordering::Relaxed);
+            (true, json!(format!("{m:03o}")))
         }
         "min_free" => {
             let b = size()?;
@@ -1979,6 +2087,7 @@ pub(super) fn apply_setting(
                 (true, json!(""))
             } else {
                 let path = PathBuf::from(p);
+                require_absolute_dest(&path)?;
                 std::fs::create_dir_all(&path).map_err(|e| format!("can't use {p}: {e}"))?;
                 if !path_writable(&path) {
                     return Err(format!("{p} is not writable"));
@@ -1997,6 +2106,7 @@ pub(super) fn apply_setting(
             let list = parse_cat_dests(v)?;
             for (_, path) in &list {
                 let p = path.display();
+                require_absolute_dest(path)?;
                 std::fs::create_dir_all(path).map_err(|e| format!("can't use {p}: {e}"))?;
                 if !path_writable(path) {
                     return Err(format!("{p} is not writable"));

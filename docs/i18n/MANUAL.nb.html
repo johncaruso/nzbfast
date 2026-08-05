@@ -796,6 +796,25 @@ omsortering/pause/sletting, historikk, legg-til-NZB, fartsgrense, pause/fortsett
 veggen har en berøringslayout. Panelet Innstillinger → Fjerntilgang viser de nøyaktige
 URL-ene og en QR-kode å skanne.</p>
 
+<h3 id="remote-proxy">Nå nzbfast utenfra</h3>
+<p>Det finnes ingen innloggingsside, og det er med vilje. En innlogging med øktinformasjonskapsel er en sikkerhetsflate som må vedlikeholdes for alltid, og den ville uansett være den svakeste låsen på noe som vender mot det åpne internett. nzbfast autentiserer i stedet med API-nøkkelen din, og tar imot nøkkelen både i et forespørselshode og i URL-en (<code>X-Api-Key</code> eller <code>Authorization: Bearer</code>) - og det er nettopp det som lar noe foran håndtere innloggingen skikkelig.</p>
+<p><b>Det enkleste er ikke å publisere den i det hele tatt.</b> Installer <b>Tailscale</b> på denne maskinen og på telefonen, så havner begge på det samme private nettet: ingenting er eksponert, verken ruter eller sertifikat må røres, og Innstillinger → Fjerntilgang viser en adresse som fungerer overalt så snart Tailscale kjører. Velg dette med mindre du faktisk trenger et offentlig domene.</p>
+<p><b>Trenger du det</b>, sett en omvendt proxy foran, gi den sertifikatet, og la den ta autentiseringen. Start nzbfast med <code>--bind 127.0.0.1</code> slik at proxyen er eneste vei inn, og pek proxyen mot <code>http://127.0.0.1:6789</code>:</p>
+<pre><code># Caddy
+example.com {
+    reverse_proxy 127.0.0.1:6789
+}
+
+# nginx
+location / {
+    proxy_pass http://127.0.0.1:6789;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}</code></pre>
+<p>Legg på det proxyen din tilbyr: basic auth, en forward-auth-tjeneste som Authelia eller Authentik, eller klientsertifikater. Én ting overrasker alle - Sonarr, Radarr og telefonappene kan ikke fullføre en nettleserinnlogging, så la dem slippe forbi. De fleste proxyer kan slippe gjennom en forespørsel med et gyldig <code>X-Api-Key</code>-hode og kreve autentisering for alt annet.</p>
+<div class="warn-box"><b>Ikke bare videresend port 6789 på ruteren.</b> Panelet snakker ren HTTP, så API-nøkkelen din og alt du gjør med den ville krysse internett lesbart for alle underveis, og en installasjon helt uten nøkkel står åpen for den som finner den. Videresender du en port likevel, sett en API-nøkkel først.</div>
+
 <h2 id="performance">13 · Ytelsesverktøy</h2>
 <h3 id="perf-benchmark">Systembenchmark</h3>
 <p>Ett klikk måler dine tre tak - nettverksgjennomstrømning (en ekte 8-sekunders
@@ -1042,6 +1061,7 @@ akkurat slik ut og løser seg selv.</td></tr>
 <tr><td>Ingenting på nettverket når daemonen</td><td>Sjekk <code>--bind</code>: <code>127.0.0.1</code> betjener bare maskinen nzbfast kjører på. Standarden, <code>0.0.0.0</code>, betjener hvert grensesnitt. Sjekk så maskinens egen brannmur for port 6789.</td></tr>
 <tr><td>Utforsk-kortet forblir lite</td><td>Indeksereren vokser i bakgrunnen - sjekk at gruppene i Innstillinger → Indeksering er satt, og gi Fordyp per skanning tid til å bygge opp historikk. «Skann nå» tvinger en runde; statuslinjen viser live fremdrift.</td></tr>
 <tr><td>Veggen viser feil / ingen illustrasjon</td><td>Detaljark → ✎ Rett treff eller ↻ Oppdater metadata. Filmoppslag forbedres med en gratis OMDb-nøkkel.</td></tr>
+<tr id="mac-cant-open"><td>macOS sier at programmet "nzbfast" ikke kan åpnes</td><td>To årsaker, begge raske. Bruker du den enkle <code>-macos-universal.zip</code>, dobbeltklikk på <b>Start nzbfast.command</b> og ikke på filen <code>nzbfast</code> ved siden av - den er selve programmet, og Finder svarer på et dobbeltklikk der med nøyaktig denne meldingen. Det er starteren som setter opp alt og starter det. Gir starteren samme melding, har kopien mistet Unix-kjørebiten sin på veien: macOS tar vare på den biten inne i .zip-filen, men chat-apper, skydisker og ny zipping gjør det ikke, så en kopi som er sendt videre for hånd, kommer fram uten kjørerettighet. Last ned .dmg eller .zip direkte fra releases-siden, så skjer det ikke. For å redde kopien du allerede har: åpne Terminal, skriv <code>chmod +x</code> med et mellomrom etter, dra <b>Start nzbfast.command</b> og filen <code>nzbfast</code> inn i vinduet og trykk Retur - dobbeltklikk deretter på starteren igjen.</td></tr>
 <tr><td>Daemonen starter ikke: port i bruk</td><td>En annen instans kjører - eller endre <code>--port</code>.</td></tr>
 <tr><td>Hvor er loggene?</td><td>Logg-kortet på dashbordet, eller terminalen/loggfilen du startet <code>serve</code> med.</td></tr>
 </table></div>

@@ -1,21 +1,39 @@
-# Bounded fuzz smoke on every PR: a short libFuzzer burst over each
-# untrusted-input parser (yEnc, NZB, PAR2, RAR, zip). This is NOT a full
+# Bounded fuzz smoke: a short libFuzzer burst over each untrusted-input
+# parser (yEnc, NZB, PAR2, RAR, zip, media containers). This is NOT a full
 # campaign - long campaigns run offline - just enough to catch a change
 # that makes a parser panic/OOB/hang on the seed corpus plus fresh
 # mutations. A crash fails the job and uploads the reproducing input.
+#
+# Runs on BOTH repos, which it did not until 4 Aug. It was gated to the
+# public repo and triggered on pull_request only, and the public repo has
+# had two PRs ever - so eleven fuzz targets had never once run in CI, on
+# either side, while all the actual work lands as direct pushes here. That
+# is the gap the 4 Aug scorecard round found.
+#
+# Scheduled rather than per-push on purpose: a burst is ~11 minutes of
+# fuzzing plus a build, which is too much to pay on every commit for a
+# check that is looking for a slow-moving class of bug. Nightly at 05:00
+# UTC, four hours clear of nightly.yml's 09:00 so the two are not
+# competing for runners.
 name: fuzz-smoke
 on:
   pull_request:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: fuzz-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  # PR number when there is one, ref otherwise - without the fallback every
+  # scheduled run shares one empty group key and cancels the last.
+  group: fuzz-${{ github.event.pull_request.number || github.ref }}
+  # Superseding a PR push is right; killing a half-finished nightly burst
+  # because a dispatch fired is not.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   fuzz:
-    if: github.repository == 'nzbfast/nzbfast'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: nightly toolchain
@@ -57,8 +75,14 @@ jobs:
         working-directory: crates/nzbkit/fuzz
         run: |
           set -e
+          # All eleven targets. mediaprobe and zip_stream landed 2 Aug, after
+          # this list was last touched on 31 Jul, and were simply never added
+          # - not an exclusion. Both want covering: zip_stream is the chase's
+          # call order over an in-memory source, and mediaprobe runs over a
+          # file still arriving off Usenet, before PAR2 has verified anything.
           for t in yenc_decode nzb_parse nzblnk_parse par2_parse rar_extract \
-                   rar_map rar_recovery_scan mkv_parse zip_parse; do
+                   rar_map rar_recovery_scan mkv_parse zip_parse zip_stream \
+                   mediaprobe; do
             echo "::group::fuzz $t"
             cargo +nightly fuzz run "$t" -- \
               -max_total_time=60 -rss_limit_mb=4096 -timeout=10

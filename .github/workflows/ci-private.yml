@@ -70,6 +70,13 @@ jobs:
           key: ci-private-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
       - name: fmt
         run: cargo fmt -p nzbkit -p nzbfast -p nzbtray --check
+      # TODO 102b. Two manual sweeps failed to keep new code off
+      # `.lock().unwrap()`, so this is a gate rather than a third sweep.
+      # CI-only on purpose: it walks the working tree, and several Claude
+      # sessions share one checkout, so running it as a pre-commit hook would
+      # refuse your commit for another session's in-flight line.
+      - name: lock gate
+        run: tools/lock-gate.py
       - name: clippy
         # No escapes: every warning blocks. The categories still allowed
         # are named in the workspace lints table in Cargo.toml, each with

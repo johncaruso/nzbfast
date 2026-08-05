@@ -505,10 +505,23 @@ pub fn arr_give_up(
             urlencode(nzo_id)
         ),
     )?;
-    let owns = h
-        .get("records")
-        .and_then(Value::as_array)
-        .is_some_and(|r| !r.is_empty());
+    // Match the downloadId ourselves rather than trusting the query
+    // parameter to have been honoured. "any record came back" makes this
+    // gate only as strong as the remote's filtering: an instance that
+    // ignores an unrecognised parameter - an older or forked build, a
+    // reverse proxy that strips the query - answers with its 50 most
+    // recent records, and then EVERY configured *arr claims ownership.
+    // The title-parse fallback below would go on to unmonitor and
+    // blocklist in instances that never sent the grab, which is the one
+    // thing this gate exists to prevent. Step 1 just below already
+    // filters its queue records client-side; this is the same test.
+    let owns = h.get("records").and_then(Value::as_array).is_some_and(|r| {
+        r.iter().any(|rec| {
+            rec.get("downloadId")
+                .and_then(Value::as_str)
+                .is_some_and(|d| d.eq_ignore_ascii_case(nzo_id))
+        })
+    });
     if !owns {
         return Ok(None);
     }
@@ -603,9 +616,34 @@ pub fn arr_give_up(
             Some(&json!({"episodeIds": episode_ids, "monitored": false})),
         )?;
     } else {
-        let id = movie_id.unwrap();
+        let Some(id) = movie_id else {
+            return Ok(None);
+        };
         let mut movie = api_get(&a, inst, &format!("/api/v3/movie/{id}"))?;
-        movie["monitored"] = json!(false);
+        // Re-ask AFTER the GET, not only before it. The check above is
+        // the general guard, but this arm puts a whole round trip
+        // against a possibly-slow *arr between that check and the write
+        // - and a GET against a large Radarr library IS the window the
+        // guard was written to close. The Sonarr arm PUTs immediately
+        // and was already correct, so whether a user's "Try again" could
+        // be undone by work already in flight depended on which of the
+        // two they ran.
+        if !still_wanted() {
+            return Ok(None);
+        }
+        // `movie["monitored"] = …` panics on anything that is not an
+        // object or null, and `api_get` only promises 2xx plus valid
+        // JSON over a user-typed URL. A host answering 200 with an array
+        // took the give-up worker's thread down, leaving `actioned`
+        // latched with no `clear_action` repair - the breaker then went
+        // permanently silent for that target with nothing logged.
+        let Some(obj) = movie.as_object_mut() else {
+            return Err(format!(
+                "{}: /api/v3/movie/{id} did not answer with a movie object",
+                inst.url
+            ));
+        };
+        obj.insert("monitored".to_string(), json!(false));
         api_send(
             &a,
             inst,
@@ -980,17 +1018,25 @@ mod tests {
 
     /// A history page proving this instance grabbed the download - the
     /// ownership evidence step 0 requires before anything destructive.
-    fn owns() -> (&'static str, String) {
+    ///
+    /// The `downloadId` has to be the id under test. It was a hard-coded
+    /// `"NZO"` while no caller passes that, which went unnoticed because
+    /// the gate used to accept "any record came back" without ever
+    /// comparing the id - so the fixture proved nothing about ownership.
+    /// Callers pass it cased differently from their own nzo_id, the way
+    /// the queue fixtures below are, since the compare is deliberately
+    /// case-insensitive.
+    fn owns(download_id: &str) -> (&'static str, String) {
         (
             "/api/v3/history?",
-            json!({"records": [{"eventType": "grabbed", "downloadId": "NZO"}]}).to_string(),
+            json!({"records": [{"eventType": "grabbed", "downloadId": download_id}]}).to_string(),
         )
     }
 
     #[test]
     fn sonarr_unmonitors_before_it_blocklists() {
         let (url, seen) = arr_mock(vec![
-            owns(),
+            owns("NZO_X"),
             (
                 "/api/v3/queue?",
                 json!({"records": [
@@ -1046,7 +1092,7 @@ mod tests {
     #[test]
     fn a_target_reset_mid_call_never_reaches_the_destructive_step() {
         let (url, seen) = arr_mock(vec![
-            owns(),
+            owns("NZO_R"),
             (
                 "/api/v3/queue?",
                 json!({"records": [
@@ -1075,7 +1121,7 @@ mod tests {
     #[test]
     fn radarr_unmonitors_the_movie_then_drops_the_record() {
         let (url, seen) = arr_mock(vec![
-            owns(),
+            owns("nzo_m"),
             (
                 "/api/v3/queue?",
                 json!({"records": [
@@ -1116,7 +1162,7 @@ mod tests {
         // target by name and unmonitors it anyway; no queue record means
         // nothing to delete.
         let (url, seen) = arr_mock(vec![
-            owns(),
+            owns("NZO_G"),
             ("/api/v3/queue?", json!({"records": []}).to_string()),
             (
                 "/api/v3/parse?",
@@ -1168,10 +1214,57 @@ mod tests {
         );
     }
 
+    /// History that answers with records for SOMEONE ELSE'S download is
+    /// not proof of ownership.
+    ///
+    /// The gate asked only whether the records array was non-empty, so
+    /// it was exactly as strong as the remote's own filtering of the
+    /// `downloadId` query parameter. An instance that ignores an
+    /// unrecognised parameter - an older or forked build, a reverse
+    /// proxy that drops the query - answers with its most recent history
+    /// instead, and every configured *arr then claimed the grab. The
+    /// title-parse fallback would go on to unmonitor and blocklist in
+    /// instances that never sent it, which is the two-Sonarrs-one-show
+    /// case the gate exists to prevent.
+    #[test]
+    fn history_for_a_different_download_is_not_ownership() {
+        let (url, seen) = arr_mock(vec![
+            // The shape a filter-ignoring *arr returns: real records,
+            // none of them ours.
+            (
+                "/api/v3/history?",
+                json!({"records": [
+                    {"eventType": "grabbed", "downloadId": "someone_elses"},
+                    {"eventType": "grabbed", "downloadId": "another_job"},
+                ]})
+                .to_string(),
+            ),
+            (
+                "/api/v3/queue?",
+                json!({"records": [
+                    {"id": 3, "episodeId": 77, "downloadId": "nzo_q", "title": "t"},
+                ]})
+                .to_string(),
+            ),
+            (
+                "/api/v3/parse?",
+                json!({"episodes": [{"id": 77}]}).to_string(),
+            ),
+        ]);
+        let out = arr_give_up(&inst("sonarr", url), "nzo_q", "Show.S04E04.WEB", &wanted).unwrap();
+        assert!(out.is_none(), "non-owner must not act: {out:?}");
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .all(|r| !r.starts_with("PUT") && !r.starts_with("DELETE")),
+            "acted on history that named a different download: {seen:?}"
+        );
+    }
+
     #[test]
     fn an_owner_whose_target_vanished_reports_not_found() {
         let (url, _seen) = arr_mock(vec![
-            owns(),
+            owns("nzo_z"),
             ("/api/v3/queue?", json!({"records": []}).to_string()),
             ("/api/v3/parse?", "{}".to_string()),
         ]);

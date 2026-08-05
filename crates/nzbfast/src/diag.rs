@@ -247,7 +247,42 @@ pub(crate) fn incomplete_reason(incomplete: usize, derrs: u64, causes: &LossCaus
             && causes.retention_excluded == 0
             && causes.dead_servers.is_empty()
             && causes.post_age_days >= GONE_MIN_AGE_DAYS;
-        let mut msg = if post_gone {
+        // Every article accounted for, nothing lost anywhere, and files
+        // short all the same: that is the yEnc coverage census speaking,
+        // not missing segments. It must NOT open with "download
+        // incomplete", which `fail_kind` maps to `MissingArticles` and
+        // so arms an automatic retry - and the retry resumes from the
+        // journal, replays exactly the same spans, and arrives at
+        // exactly the same gap. A deterministic loop, whose message
+        // meanwhile blamed the post for lost segments the census itself
+        // says never happened ("1 file(s) with missing segments; 0 of
+        // 240 segment(s) never arrived" in one breath). Falls through to
+        // `FailKind::Local`, which does not retry.
+        // `derrs == 0` belongs here as much as the rest of it. A decode
+        // or write error decrements `remaining` and increments only the
+        // error counters, so `missing_segments` stays at zero while the
+        // failed article's bytes ARE a real gap - and the census flags
+        // the slot. Without this term the opening claimed "every article
+        // arrived and decoded" in the same breath as "1 decode/write
+        // errors", and worse, it moved the job from
+        // `FailKind::MissingArticles` to `Local`, which does not retry.
+        // A corrupt article is exactly the case a journal-resume retry
+        // can heal, so the previous opening was RIGHT for it: the bytes
+        // were posted, they merely arrived damaged.
+        let size_header_lies = causes.total_segments > 0
+            && causes.missing_segments == 0
+            && derrs == 0
+            && causes.missing_430 == 0
+            && causes.transport_failed == 0
+            && causes.retention_excluded == 0;
+        let mut msg = if size_header_lies {
+            format!(
+                "post size header disagrees with its parts: every article arrived and \
+                 decoded, but {incomplete} file(s) declare more bytes than the post \
+                 actually carries, {derrs} decode/write errors. Re-downloading cannot \
+                 change this - the missing bytes were never posted"
+            )
+        } else if post_gone {
             format!(
                 "post is gone: not one of the {} article(s) is on any server - all \
                  {incomplete} file(s) came back empty and not a byte arrived, \
@@ -1017,6 +1052,43 @@ mod main_tests {
         // A server that never connected did not vote, so unanimity is
         // unproven and "gone" would be a lie - the dead-server clause
         // still owns this case.
+        // A slot the coverage census flagged, with EVERY article
+        // accounted for: the size header over-declared, re-downloading
+        // cannot change it, and `fail_kind` must NOT read this as
+        // missing articles (that arms a retry which replays the same
+        // spans to the same gap).
+        let lying = super::incomplete_reason(
+            1,
+            0,
+            &LossCauses {
+                total_segments: 240,
+                ..no_causes()
+            },
+        );
+        assert!(
+            lying.starts_with("post size header disagrees with its parts"),
+            "{lying}"
+        );
+
+        // ...but a DECODE error is not that. The article was posted and
+        // arrived, it merely arrived damaged, so `missing_segments`
+        // stays at zero while the bytes are a real gap. Claiming "every
+        // article arrived and decoded" beside a non-zero decode count is
+        // self-contradicting, and routing it away from MissingArticles
+        // suppresses exactly the journal-resume retry that can heal it.
+        let corrupt = super::incomplete_reason(
+            1,
+            1,
+            &LossCauses {
+                total_segments: 240,
+                ..no_causes()
+            },
+        );
+        assert!(
+            corrupt.starts_with("download incomplete"),
+            "a decode error must keep the retryable opening: {corrupt}"
+        );
+
         let hosts = ["news.eu.example".to_string()];
         let unproven = super::incomplete_reason(
             94,

@@ -840,6 +840,45 @@ reorder/pause/delete, history, add-NZB, speed limit, pause/resume, log.</p>
 dashboard and wall have a touch layout. The Settings → Remote access panel shows
 the exact URLs and a QR code to scan.</p>
 
+<h3 id="remote-proxy">Reaching nzbfast from outside your home</h3>
+<p>There is no login page, and that is deliberate. A session-cookie login is a
+security surface to maintain forever, and it would still be the weakest lock on
+anything facing the open internet. nzbfast authenticates with your API key
+instead, and it takes that key in a request header as well as in the URL
+(<code>X-Api-Key</code>, or <code>Authorization: Bearer</code>) - which is what
+lets something in front of it handle the sign-in properly.</p>
+<p><b>The simplest answer is not to publish it at all.</b> Install
+<b>Tailscale</b> on this machine and on your phone and both join one private
+network: nothing is exposed, no router or certificate work is needed, and
+Settings → Remote access prints a works-from-anywhere address as soon as it sees
+Tailscale running. Prefer this unless you specifically need a public domain.</p>
+<p><b>If you do need one</b>, put a reverse proxy in front, give it the
+certificate, and let it do the authentication. Start nzbfast with
+<code>--bind 127.0.0.1</code> so the proxy is the only way in, and point the
+proxy at <code>http://127.0.0.1:6789</code>:</p>
+<pre><code># Caddy
+example.com {
+    reverse_proxy 127.0.0.1:6789
+}
+
+# nginx
+location / {
+    proxy_pass http://127.0.0.1:6789;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}</code></pre>
+<p>Layer on whatever your proxy offers: basic auth, a forward-auth service such
+as Authelia or Authentik, or client certificates. One thing catches everybody -
+Sonarr, Radarr and the phone apps cannot complete a browser login, so leave them
+a way past it. Most proxies can admit a request carrying a valid
+<code>X-Api-Key</code> header and challenge everything else.</p>
+<div class="warn-box"><b>Do not simply forward port 6789 on your router.</b> The
+dashboard speaks plain HTTP, so your API key and everything you do with it would
+cross the internet readable by anyone on the path, and an install with no key set
+at all is open to whoever finds it. If you forward a port regardless, set an API
+key first.</div>
+
 <h2 id="performance">13 · Performance tools</h2>
 <h3 id="perf-benchmark">System benchmark</h3>
 <p>One click measures your three ceilings: network throughput (a real 8-second
@@ -1086,6 +1125,7 @@ wherever <code>--config</code> / <code>$NZBFAST_CONFIG</code> points.</td></tr>
 <tr><td>Nothing on the network can reach the daemon</td><td>Check <code>--bind</code>: <code>127.0.0.1</code> serves only the machine nzbfast runs on. The default, <code>0.0.0.0</code>, serves every interface. Then check the machine's own firewall for port 6789.</td></tr>
 <tr><td>Browse card stays small</td><td>The indexer grows in the background. Check Settings → Indexing groups are set, and give Deepen per scan time to accumulate history. "Scan now" forces a pass; the status line shows live progress.</td></tr>
 <tr><td>Wall shows wrong/no artwork</td><td>Detail sheet → ✎ Fix match or ↻ Refresh metadata. Movie lookups improve with a free OMDb key.</td></tr>
+<tr id="mac-cant-open"><td>macOS says the application "nzbfast" can't be opened</td><td>Two causes, both quick. If you are using the plain <code>-macos-universal.zip</code>, double-click <b>Start nzbfast.command</b>, not the <code>nzbfast</code> file next to it: that one is the program itself, and Finder answers a double-click on it with exactly this message. The launcher is what sets it up and starts it. If the launcher gives the same message, the copy lost its Unix permission bit on the way to you: macOS keeps that bit inside the .zip, but chat apps, cloud drives and re-zips do not, so a build passed on by hand arrives unexecutable. Downloading the .dmg or the .zip straight from the releases page avoids it. To rescue the copy you already have, open Terminal, type <code>chmod +x</code> with a trailing space, drag <b>Start nzbfast.command</b> and the <code>nzbfast</code> file onto the window, and press Return, then double-click the launcher again.</td></tr>
 <tr><td>Daemon won't start: port in use</td><td>Another instance is running, or change <code>--port</code>.</td></tr>
 <tr><td>Where are the logs?</td><td>The Log card on the dashboard, or the terminal/logfile you launched <code>serve</code> with.</td></tr>
 </table></div>

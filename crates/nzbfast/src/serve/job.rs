@@ -1388,12 +1388,27 @@ pub(crate) fn shape_unpacks_on_disk(shape: &str) -> bool {
 /// job needed ~12 GB freed when the true figure was past 25, so they
 /// would have freed what we asked and failed at 96% a second time.
 pub(crate) fn unpack_space_needed(to_fetch: u64, total_bytes: u64, shape: &str) -> u64 {
-    let needed = to_fetch.saturating_add(total_bytes);
-    if shape.split_whitespace().any(|t| t == "encrypted") {
-        needed.saturating_add(total_bytes)
-    } else {
-        needed
+    let mut needed = to_fetch.saturating_add(total_bytes);
+    let has = |want: &str| shape.split_whitespace().any(|t| t == want);
+    // An encrypted set's finish decrypt writes the plaintext into a temp
+    // BESIDE the ciphertext before renaming, so it peaks one payload
+    // higher than it looks.
+    if has("encrypted") {
+        needed = needed.saturating_add(total_bytes);
     }
+    // So does a NESTED one, and for the same kind of reason: the outer
+    // volumes stay on disk (the nested pass deliberately keeps what it
+    // cannot prove spent), level 0's output IS the inner archive, and
+    // level 1's output is the real payload - three copies at the peak
+    // where this said two. Exactly the defect the `encrypted` arm was
+    // added for, one shape over, and it fails identically: no
+    // `space_short` amber, then ENOSPC at the second nesting level after
+    // the entire download has been paid for, and a drawer that names a
+    // figure the user can free and still fail at.
+    if has("inner-7z") || has("inner-rar") {
+        needed = needed.saturating_add(total_bytes);
+    }
+    needed
 }
 
 /// NZBGet's priority scale onto ours.
@@ -1742,7 +1757,7 @@ pub(super) fn remove_job_files(
         // target to hit would cry wolf on every one of those.
         match d.kept {
             Some(why) => FilesGone::Kept(why),
-            None => FilesGone::Yes,
+            None => FilesGone::Yes(d.removed_as),
         }
     } else {
         // Trash-aware, like every other delete of a user's downloaded
@@ -1758,7 +1773,7 @@ pub(super) fn remove_job_files(
         // the delete's entry, per remove_user_file's contract.
         let recoverable = crate::smart::delete_to_trash();
         match crate::smart::remove_user_dir(out_dir, recoverable) {
-            Ok(()) => FilesGone::Yes,
+            Ok(how) => FilesGone::Yes(how),
             Err(e) => {
                 warn!(
                     target: "files",
@@ -1783,16 +1798,14 @@ pub(super) fn remove_job_files(
 pub(super) enum FilesGone {
     /// Nothing this job put on disk is left - or there was nothing there
     /// to remove in the first place.
-    Yes,
+    /// Carries what actually happened, because "went to the Trash" is a
+    /// promise of recoverability and only the removal itself knows
+    /// whether it can be kept. Reconstructing it from the setting told a
+    /// user their 14 GB download was restorable when it had been
+    /// destroyed - see `smart::Removed`.
+    Yes(crate::smart::Removed),
     /// The files are STILL on disk, and this is why.
     Kept(String),
-}
-
-impl FilesGone {
-    /// Did the files go? For the callers that only need the old bool.
-    pub(super) fn gone(&self) -> bool {
-        matches!(self, FilesGone::Yes)
-    }
 }
 
 /// What a filed job's files really carry after the episode base, and so

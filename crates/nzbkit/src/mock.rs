@@ -86,6 +86,17 @@ pub struct Chaos {
     pub post: PostChaos,
     /// Bandwidth model (all zero = off, existing tests unaffected).
     pub throttle: Throttle,
+    /// Delay before the greeting on every accepted connection - the
+    /// localhost stand-in for what a real dial costs (TCP + TLS + AUTH
+    /// round-trips), so tests can price hiding that latency (hot
+    /// spare) without a real network. 0 = greet immediately.
+    pub greet_delay_ms: u64,
+    /// The Nth ACCEPTED connection (1-based) is capped to this many
+    /// bytes/sec; every other connection runs at the normal throttle.
+    /// Models ONE degraded TCP session on an otherwise healthy server
+    /// - the shape the slope recycle and the dup races exist for. A
+    /// reconnect naturally gets a fresh, healthy session.
+    pub slow_conn: Option<(u64, u64)>,
 }
 
 /// Bandwidth shaping for the BODY/ARTICLE path - the model the
@@ -390,10 +401,18 @@ impl MockServer {
                 let Ok((sock, _)) = listener.accept().await else {
                     return;
                 };
-                accepted2.fetch_add(1, Ordering::Relaxed);
+                let conn_no = accepted2.fetch_add(1, Ordering::Relaxed) + 1;
                 let articles = articles.clone();
                 let plane = plane.clone();
-                let chaos = chaos.clone();
+                let mut chaos = chaos.clone();
+                // One degraded session: the designated accept gets its
+                // own per-connection ceiling via the existing throttle
+                // pacing; later accepts (reconnects) are healthy.
+                if let Some((n, bps)) = chaos.slow_conn
+                    && conn_no == n
+                {
+                    chaos.throttle.per_conn_bps = bps;
+                }
                 let served = served2.clone();
                 let body_log = body_log2.clone();
                 let stall_once = stall_once.clone();
@@ -402,6 +421,10 @@ impl MockServer {
                 let ts = throttle_state.clone();
                 ts.active.fetch_add(1, Ordering::Relaxed);
                 tokio::spawn(async move {
+                    if chaos.greet_delay_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(chaos.greet_delay_ms))
+                            .await;
+                    }
                     let _ = serve_conn(
                         sock,
                         articles,
@@ -453,6 +476,7 @@ impl MockServer {
             username: None,
             password: None,
             connections: 50,
+            pin_connections: false,
             rcvbuf: None,
             level: 0,
             group: None,

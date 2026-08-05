@@ -2905,12 +2905,16 @@ async fn apikey_reveal_and_rotate_need_the_api_key() {
 
     let dir2 = dir.clone();
     tokio::task::spawn_blocking(move || {
-        // The add-only key gets nothing from either mode.
+        // The add-only key gets nothing from either mode. A rotation is
+        // POST-only (`credential_mutation_allowed`), so it is asked the
+        // way the dashboard asks it - the point here is the KEY tier,
+        // not the method.
+        let body = |mode: &str| (mode == "apikey_new").then_some(("application/json", &b""[..]));
         for mode in ["apikey_show", "apikey_new"] {
             let r = http(
                 port,
                 &format!("/api?mode={mode}&apikey=addkey&output=json"),
-                None,
+                body(mode),
             );
             assert!(
                 r.contains("\"status\":false"),
@@ -2921,7 +2925,7 @@ async fn apikey_reveal_and_rotate_need_the_api_key() {
                 "{mode} LEAKED the api key to the add-only key: {r}"
             );
             // And no key at all is refused too.
-            let r = http(port, &format!("/api?mode={mode}&output=json"), None);
+            let r = http(port, &format!("/api?mode={mode}&output=json"), body(mode));
             assert!(
                 r.contains("\"status\":false"),
                 "{mode} answered an unauthenticated caller: {r}"
@@ -2945,10 +2949,22 @@ async fn apikey_reveal_and_rotate_need_the_api_key() {
 
         // Rotate, then prove the OLD key is dead, the NEW one works, and
         // the new one reached settings.json rather than only memory.
+        // A rotation must not be reachable by NAVIGATION: a keyless
+        // install could otherwise be locked out by any page the user
+        // visits, with a key nobody can read.
         let r = http(
             port,
             "/api?mode=apikey_new&apikey=fullkey&output=json",
             None,
+        );
+        assert!(
+            r.contains("\"status\":false") && !r.contains("\"apikey\":\""),
+            "apikey_new minted a key on a GET: {r}"
+        );
+        let r = http(
+            port,
+            "/api?mode=apikey_new&apikey=fullkey&output=json",
+            Some(("application/json", b"")),
         );
         let new = r
             .split("\"apikey\":\"")
@@ -3192,14 +3208,28 @@ async fn add_only_key_answers_extension_probes_but_nothing_more() {
         );
 
         // The NZB key cannot rotate itself...
-        let r = http(port, "/api?mode=nzbkey_new&apikey=addkey&output=json", None);
+        let r = http(
+            port,
+            "/api?mode=nzbkey_new&apikey=addkey&output=json",
+            Some(("application/json", b"")),
+        );
         assert!(
             r.contains("\"status\":false"),
             "nzbkey_new answered the add-only key: {r}"
         );
         // ...the full key can, the old NZB key dies at once, and the new
         // one holds the same tier.
+        // GET cannot mint one - see the apikey_new rotation above.
         let r = http(port, "/api?mode=nzbkey_new&apikey=fullkey&output=json", None);
+        assert!(
+            r.contains("\"status\":false") && !r.contains("\"nzbkey\":\""),
+            "nzbkey_new minted a key on a GET: {r}"
+        );
+        let r = http(
+            port,
+            "/api?mode=nzbkey_new&apikey=fullkey&output=json",
+            Some(("application/json", b"")),
+        );
         let new = r
             .split("\"nzbkey\":\"")
             .nth(1)
@@ -3283,7 +3313,7 @@ async fn a_rotation_that_cannot_be_persisted_says_so() {
         let rot = http(
             port,
             "/api?mode=apikey_new&apikey=fullkey&output=json",
-            None,
+            Some(("application/json", b"")),
         );
         let new = rot
             .split("\"apikey\":\"")
@@ -10898,16 +10928,28 @@ async fn giveup_breaker_unmonitors_after_final_failure() {
                     }
                 }
                 let line = head.lines().next().unwrap_or_default().to_string();
-                let body = if line.starts_with("GET /api/v3/history") {
+                let body: String = if line.starts_with("GET /api/v3/history") {
                     // Ownership evidence: this instance sent the grab,
                     // which is what licenses the parse fallback below.
-                    r#"{"records": [{"eventType": "grabbed"}]}"#
+                    //
+                    // The record must carry the downloadId that was ASKED
+                    // for, the way a real *arr's filtered history does.
+                    // It used to carry none at all and still counted as
+                    // ownership, because the gate only asked whether any
+                    // record came back - so this fixture was asserting
+                    // nothing about whose grab it was.
+                    let id = line
+                        .split("downloadId=")
+                        .nth(1)
+                        .and_then(|s| s.split(['&', ' ']).next())
+                        .unwrap_or_default();
+                    format!(r#"{{"records": [{{"eventType": "grabbed", "downloadId": "{id}"}}]}}"#)
                 } else if line.starts_with("GET /api/v3/queue") {
-                    r#"{"records": []}"#
+                    r#"{"records": []}"#.to_string()
                 } else if line.starts_with("GET /api/v3/parse") {
-                    r#"{"episodes": [{"id": 7}]}"#
+                    r#"{"episodes": [{"id": 7}]}"#.to_string()
                 } else {
-                    "{}"
+                    "{}".to_string()
                 };
                 seen.lock().unwrap().push(line);
                 let _ = sock.write_all(
@@ -11637,4 +11679,124 @@ fn walk_files(root: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// #20: a finished download comes out with the configured permissions,
+/// and so do the directories an *arr has to rename it out of.
+///
+/// The unit tests in `smart.rs` pin what `apply_out_umask` does to a
+/// tree. This pins that it is REACHED - that the call sits after
+/// everything which creates files (unpack, the rename passes, the
+/// relocation) rather than before, where the payload would be re-created
+/// underneath it.
+///
+/// Unix only: mode bits are the whole subject.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_finished_download_carries_the_configured_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("nzbfast-outperm-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+
+    let data = payload(120_000, 3);
+    let mut articles = HashMap::new();
+    let segs = make_file_articles("perm-payload.bin", &data, 40_000, "pm", &mut articles);
+    let srv = MockServer::start(articles, Chaos::default()).await;
+
+    let mut xml = String::from(
+        "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"&quot;perm-payload.bin&quot; yEnc (1/3)\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+    );
+    for (id, bytes, num) in &segs {
+        xml.push_str(&format!(
+            "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+        ));
+    }
+    xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    let out_root = dir.join("complete");
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--out")
+            .arg(&out_root);
+        c
+    })
+    .await;
+    let port = d.port;
+    let out_root2 = out_root.clone();
+
+    tokio::task::spawn_blocking(move || {
+        // 0o007 rather than the recommended 0o002: it makes the expected
+        // modes (770 / 660) impossible to confuse with anything the
+        // process umask would have produced on its own, so a pass here
+        // cannot be the default leaking through.
+        let r = http(
+            port,
+            "/api?mode=config&name=out_umask&value=007&output=json",
+            None,
+        );
+        assert!(r.contains("\"status\":true"), "out_umask rejected: {r}");
+
+        let boundary = "----outpermb";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"perm.nzb\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(xml.as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let r = http(
+            port,
+            "/api?mode=addfile&output=json",
+            Some((&format!("multipart/form-data; boundary={boundary}"), &body)),
+        );
+        assert!(r.contains("nzo_ids"), "{r}");
+
+        // Wait for it to reach history.
+        let mut hist = String::new();
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            hist = http(port, "/api?mode=history&output=json", None);
+            if hist.contains("\"status\":\"Completed\"") {
+                break;
+            }
+        }
+        assert!(hist.contains("\"status\":\"Completed\""), "{hist}");
+
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let files = walk_files(&out_root2);
+        assert!(!files.is_empty(), "nothing landed under {out_root2:?}");
+        for f in &files {
+            assert_eq!(mode(f), 0o660, "file {f:?} did not get the configured mode");
+        }
+        // The job's own directory...
+        let job_dir = files[0].parent().unwrap();
+        assert_eq!(mode(job_dir), 0o770, "job dir {job_dir:?}");
+        // ...and the download root, which is the one an *arr needs write
+        // on in order to rename the job out of it.
+        assert_eq!(mode(&out_root2), 0o770, "download root");
+    })
+    .await
+    .unwrap();
+
+    drop(d);
+    let _ = std::fs::remove_dir_all(&dir);
 }

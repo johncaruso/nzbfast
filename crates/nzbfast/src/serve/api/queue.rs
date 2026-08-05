@@ -72,6 +72,51 @@ pub(in crate::serve) fn apply_priority(d: &Arc<Daemon>, g: &mut Job, prio: i32) 
     true
 }
 
+/// What the NEXT download would open on each configured server.
+///
+/// The live `servers` list comes from the job pool, so it is empty
+/// whenever nothing is downloading - and the Providers card, the only
+/// place in the product that shows a connection count, hides itself when
+/// that list is empty. Turn auto-tune on, then look at an idle
+/// dashboard, and there is nowhere at all that answers "how many
+/// connections am I going to use". Reported by a tester on 4 Aug, who
+/// had just re-enabled auto-tune and therefore most needed the answer.
+///
+/// So an idle daemon reports the PLAN instead of nothing: the same
+/// shape, `connected: 0`, and a budget computed through the very
+/// function the download path uses (`applied_connections`), so this can
+/// never drift into describing a number jobs would not actually open.
+/// `idle: true` marks them, because "0/16 now" and "16 next time" are
+/// different sentences and the UI has to be able to tell them apart.
+fn planned_servers(d: &Daemon, cfg_path: &std::path::Path) -> Vec<Value> {
+    let Ok(c) = nzbkit::config::Config::load(cfg_path) else {
+        return Vec::new();
+    };
+    let tuned = if crate::conntune::enabled(cfg_path) {
+        crate::conntune::load(cfg_path)
+    } else {
+        Default::default()
+    };
+    let global = d.connections.load(Ordering::Relaxed).max(1);
+    c.servers
+        .iter()
+        .filter(|s| s.enabled)
+        .map(|s| {
+            let base = global.min(s.connections.max(1) as usize);
+            json!({
+                "host": s.host,
+                "budget": crate::conntune::applied_connections(
+                    base, s.pin_connections, tuned.get(&s.host)),
+                "connected": 0,
+                "bytes": 0,
+                "tried": 0,
+                "missing": 0,
+                "idle": true,
+            })
+        })
+        .collect()
+}
+
 pub(in crate::serve) fn dispatch(
     d: &Arc<Daemon>,
     req: &mut tiny_http::Request,
@@ -578,6 +623,26 @@ pub(in crate::serve) fn dispatch(
                                     if !done.identify.is_empty() {
                                         j.identify = done.identify;
                                     }
+                                    // UX §18: the move-completed
+                                    // relocation can fail part way here
+                                    // exactly as it can on the ordinary
+                                    // completion path, and `moved` below
+                                    // follows the bytes that DID move -
+                                    // which is precisely what makes the
+                                    // other half invisible. Unlock
+                                    // consumed this and dropped it, so a
+                                    // payload split by a password unlock
+                                    // had no durable record at all: no
+                                    // warning in the row, and nothing for
+                                    // a later delete to reach the source
+                                    // side by. Written unconditionally,
+                                    // like the completion path, so a
+                                    // re-run that finally moves the rest
+                                    // clears the warning.
+                                    j.move_split = match &done.move_split {
+                                        Some(src) => src.to_string_lossy().to_string(),
+                                        None => String::new(),
+                                    };
                                     if let Some(dest) = done.moved {
                                         j.filed = j.tv_sort && is_season_dir(&dest);
                                         // The suffix and episode title
@@ -661,7 +726,7 @@ pub(in crate::serve) fn dispatch(
                     "other": np.other,
                 })
             };
-            let servers: Vec<Value> = d
+            let live_servers: Vec<Value> = d
                 .hub
                 .pool_live
                 .lock()
@@ -695,11 +760,51 @@ pub(in crate::serve) fn dispatch(
                                 "completion_pct": d.reliability(&s.host).map(|(t, m)| {
                                     100.0 * (t.saturating_sub(m)) as f64 / t as f64
                                 }),
+                                // The two halves of "why did the graph
+                                // dip". Sessions this server lost and
+                                // redialled, against time its workers
+                                // spent waiting on everything downstream
+                                // of the network. One of them moving
+                                // during a dip says which side to look
+                                // at; neither moving says the dip was
+                                // somewhere else entirely, which is also
+                                // an answer and was previously
+                                // unobtainable.
+                                "reconnects": s.reconnects.load(Ordering::Relaxed),
+                                "blocked_ms": s.blocked_ms.load(Ordering::Relaxed),
                             })
                         })
                         .collect()
                 })
                 .unwrap_or_default();
+            // The event ring, newest first. Timestamped in unix ms
+            // because the dashboard's throughput trace carries wall
+            // clock too - that is the whole point, laying one over the
+            // other. Capped well under the ring so a long-lived daemon
+            // cannot grow this payload without bound.
+            let pool_events: Vec<Value> = d
+                .hub
+                .pool_live
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|l| {
+                    l.recent_events(60)
+                        .into_iter()
+                        .map(|e| {
+                            json!({"at_ms": e.at_ms, "host": e.host,
+                                   "kind": e.kind, "detail": e.detail})
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            // Idle: report the plan rather than nothing, so the card
+            // stays up and the number in force is always visible.
+            let servers: Vec<Value> = if live_servers.is_empty() {
+                planned_servers(d, ctx.cfg_path)
+            } else {
+                live_servers
+            };
             // §G: sorted by host so the card's rows do not reshuffle
             // between polls (a HashMap's order is not stable).
             let server_refusals: Vec<Value> = {
@@ -756,6 +861,7 @@ pub(in crate::serve) fn dispatch(
                 "downloaded": d.progress.load(Ordering::Relaxed),
                 "total": d.active_total.load(Ordering::Relaxed),
                 "servers": servers,
+                "events": pool_events,
                 // §G: the same refusals, kept past the pool that saw
                 // them. `servers` above is empty whenever nothing is
                 // downloading, which took the Providers card - and with
@@ -971,10 +1077,18 @@ pub(in crate::serve) fn dispatch(
         // "Deleted files go to the Trash" off and mean it.
         "delete_kept_dismiss" => {
             let path = params.get("value").cloned().unwrap_or_default();
-            let mut k = d.delete_kept.lock_ok();
-            let before = k.len();
-            k.retain(|(_, p, _, _)| *p != path);
-            json!({"status": k.len() < before})
+            let dismissed = {
+                let mut k = d.delete_kept.lock_ok();
+                let before = k.len();
+                k.retain(|(_, p, _, _)| *p != path);
+                k.len() < before
+            };
+            // Persist the dismissal too, or the notice the user just
+            // cleared comes back at the next restart.
+            if dismissed {
+                d.save_delete_kept();
+            }
+            json!({"status": dismissed})
         }
         // Re-attempt the queue write. For the watch-folder state where a
         // release IS live in the queue but `queue.json` could not be
@@ -1007,6 +1121,26 @@ pub(in crate::serve) fn dispatch(
                     // Collected under the queue lock, recorded after it -
                     // the notice's own lock is a leaf and must stay one.
                     let mut kept: Vec<(String, std::path::PathBuf, String)> = Vec::new();
+                    // The file removal goes the same way, and for a
+                    // sharper reason: a Trash call is bounded at 30 s per
+                    // route and macOS runs TWO of them (Finder, then
+                    // NSFileManager), so doing this inside `q.retain`
+                    // held the GLOBAL queue lock for up to a minute on a
+                    // headless mac or a share with no .Trashes. pick_job,
+                    // queue_json, save_queue and every *arr status poll
+                    // stall behind it, and the *arr marks the client
+                    // unhealthy. Deleting after the lock is dropped costs
+                    // a reservation instead: `dir_claim` consults
+                    // `reserved` before anything else, precisely so a
+                    // directory with no record naming it cannot be
+                    // handed to a new job - which is exactly the window
+                    // that opens between the record going and the files.
+                    let mut doomed: Vec<(
+                        String,
+                        std::path::PathBuf,
+                        bool,
+                        crate::smart::FiledTail,
+                    )> = Vec::new();
                     let mut q = d.queue.lock_ok();
                     let before = q.len();
                     q.retain(|j| {
@@ -1073,17 +1207,31 @@ pub(in crate::serve) fn dispatch(
                                     // and its files would never be
                                     // removed at all.
                                     g.del_on_drop = true;
+                                    // Reserve for the SAME reason the
+                                    // non-deferred arm below does, and
+                                    // for longer: the queue row goes
+                                    // now and the files go in `park()`,
+                                    // once the fetch has drained. A
+                                    // tombstoned job is dropped rather
+                                    // than filed, so in between
+                                    // `dir_claim` finds the directory in
+                                    // neither queue nor history and
+                                    // calls it free - and a re-add of
+                                    // the same release (a user retry, an
+                                    // *arr re-grab) can claim it and be
+                                    // writing there when `park()`
+                                    // finally removes the whole
+                                    // directory. `park()` releases it.
+                                    d.reserved.lock_ok().insert(g.out_dir.clone());
                                 } else {
                                     let tail = delete_tail(&g, || d.job_suffix(filed_stem(&g)));
-                                    if let FilesGone::Kept(why) =
-                                        remove_job_files(&g.out_dir, filed_stem(&g), g.filed, &tail)
-                                    {
-                                        kept.push((
-                                            filed_stem(&g).to_string(),
-                                            g.out_dir.clone(),
-                                            why,
-                                        ));
-                                    }
+                                    d.reserved.lock_ok().insert(g.out_dir.clone());
+                                    doomed.push((
+                                        filed_stem(&g).to_string(),
+                                        g.out_dir.clone(),
+                                        g.filed,
+                                        tail,
+                                    ));
                                 }
                             }
                             false
@@ -1093,6 +1241,28 @@ pub(in crate::serve) fn dispatch(
                     });
                     let removed = q.len() < before;
                     drop(q);
+                    // Now that no global lock is held: the slow half.
+                    //
+                    // Every reservation is released AFTER the whole batch,
+                    // never per entry. `reserved` is a set, so two entries
+                    // naming one directory are one member: releasing after
+                    // the first would unreserve a directory a later entry
+                    // has not reached yet, and the gap is a whole Trash
+                    // call wide (30 s per route, two routes on macOS).
+                    let reserved_dirs: Vec<std::path::PathBuf> =
+                        doomed.iter().map(|(_, dir, _, _)| dir.clone()).collect();
+                    for (name, dir, filed, tail) in doomed {
+                        let outcome = remove_job_files(&dir, &name, filed, &tail);
+                        if let FilesGone::Kept(why) = outcome {
+                            kept.push((name, dir, why));
+                        }
+                    }
+                    {
+                        let mut r = d.reserved.lock_ok();
+                        for dir in &reserved_dirs {
+                            r.remove(dir);
+                        }
+                    }
                     // The row is gone from the queue either way - that is
                     // what was asked for and it worked. What did NOT work
                     // was the files half, and with the row went the only
@@ -1388,6 +1558,16 @@ pub(in crate::serve) fn dispatch(
                     }
                     // Recorded after the history lock is dropped, below.
                     let mut kept: Vec<(String, std::path::PathBuf, String)> = Vec::new();
+                    // And so is the removal itself - see the queue-delete
+                    // arm above for why a bounded Trash call must not run
+                    // under a global lock, and why the directory is
+                    // reserved across the gap.
+                    let mut to_remove: Vec<(
+                        String,
+                        std::path::PathBuf,
+                        bool,
+                        crate::smart::FiledTail,
+                    )> = Vec::new();
                     for (j, p) in h.iter().zip(&plan) {
                         if !p.doomed {
                             continue;
@@ -1400,10 +1580,55 @@ pub(in crate::serve) fn dispatch(
                         if del_files {
                             if p.may_remove_files {
                                 let tail = delete_tail(&g, || d.job_suffix(filed_stem(&g)));
-                                if let FilesGone::Kept(why) =
-                                    remove_job_files(&g.out_dir, filed_stem(&g), g.filed, &tail)
-                                {
-                                    kept.push((filed_stem(&g).to_string(), g.out_dir.clone(), why));
+                                d.reserved.lock_ok().insert(g.out_dir.clone());
+                                to_remove.push((
+                                    filed_stem(&g).to_string(),
+                                    g.out_dir.clone(),
+                                    g.filed,
+                                    tail,
+                                ));
+                                // UX §18: a move-completed (or
+                                // recategorize) that failed part way
+                                // left half the payload at the SOURCE,
+                                // and `out_dir` followed the bytes that
+                                // did move. Only `move_split` names the
+                                // other half - so a delete-with-files
+                                // that removes just `out_dir` takes the
+                                // record away and orphans those files,
+                                // with no row left to reach them by and
+                                // no kept-files note either. Both
+                                // locations, or neither promise is kept.
+                                //
+                                // `g.filed` carries over to the source,
+                                // and it MUST: for a TV-filed job the
+                                // folder `relocate_completed` moves FROM
+                                // is the shared season folder (see its
+                                // `same_place` comment), so `move_split`
+                                // can name a directory full of the
+                                // user's other episodes. Hardcoding
+                                // `false` here - "the source is always a
+                                // job-owned folder" - would have handed
+                                // a whole season to `remove_user_dir` on
+                                // a single episode's delete. With the
+                                // flag it takes the narrow per-episode
+                                // path, exactly as the destination side
+                                // above already does.
+                                let src = std::path::PathBuf::from(&g.move_split);
+                                let claimed = || {
+                                    queue_dirs.contains(&src)
+                                        || records
+                                            .iter()
+                                            .zip(&plan)
+                                            .any(|(o, op)| !op.doomed && o.out_dir == src)
+                                };
+                                if !g.move_split.is_empty() && src != g.out_dir && !claimed() {
+                                    d.reserved.lock_ok().insert(src.clone());
+                                    to_remove.push((
+                                        filed_stem(&g).to_string(),
+                                        src,
+                                        g.filed,
+                                        delete_tail(&g, || d.job_suffix(filed_stem(&g))),
+                                    ));
                                 }
                             } else {
                                 // A verified re-download published
@@ -1438,6 +1663,27 @@ pub(in crate::serve) fn dispatch(
                     // caller (SAB clients included).
                     let count = before - h.len();
                     drop(h);
+                    // Now that no global lock is held: the slow half.
+                    // Released after the whole batch - see the queue arm
+                    // above. It matters more here: `plan_history_delete`
+                    // counts only SURVIVORS as a claimant, so two doomed
+                    // records sharing one out_dir both earn
+                    // `may_remove_files`, and a set holds that directory
+                    // once.
+                    let reserved_dirs: Vec<std::path::PathBuf> =
+                        to_remove.iter().map(|(_, dir, _, _)| dir.clone()).collect();
+                    for (name, dir, filed, tail) in to_remove {
+                        let outcome = remove_job_files(&dir, &name, filed, &tail);
+                        if let FilesGone::Kept(why) = outcome {
+                            kept.push((name, dir, why));
+                        }
+                    }
+                    {
+                        let mut r = d.reserved.lock_ok();
+                        for dir in &reserved_dirs {
+                            r.remove(dir);
+                        }
+                    }
                     // "Delete + files" is two promises, and only the
                     // record half is guaranteed. A row the user deleted
                     // to reclaim the disk space, whose files are still

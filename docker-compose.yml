@@ -32,6 +32,10 @@ services:
       # To run keyless on a trusted network, NZBFAST_OPEN=1.
       # - NZBFAST_APIKEY=change-me
       # - NZBFAST_OPEN=1
+      #
+      # Where finished downloads land. See the volumes note below before
+      # changing it: this path and the mapping under it have to agree.
+      - NZBFAST_OUT=/data/usenet
     volumes:
       # ./ paths are anchored to THIS FILE's folder (not where you run the
       # command from). The config volume IS your install - settings, API
@@ -39,8 +43,38 @@ services:
       # move the folders with it or switch these to absolute paths.
       # Updating never touches the volumes; see the manual's Updates page.
       - ./config:/config            # settings + index database
-      - ./downloads:/downloads      # finished files
       - ./watch:/watch              # drop an .nzb here to auto-download
+      #
+      # DOWNLOADS. Two things about this line are deliberate.
+      #
+      # It is the SAME path on both sides. When a job finishes, nzbfast
+      # tells Sonarr/Radarr where the files are, and that path has to mean
+      # the same thing inside their container as it does inside this one.
+      # Map it to /downloads here and they are handed a path that does not
+      # exist in their namespace: the download sits in the queue and the
+      # *arr declines to import it, reporting a remote path mapping error
+      # while the files themselves are perfectly fine.
+      #
+      # And it sits under a root you also give your *arrs (/data here, but
+      # the name does not matter - /shared, /storage, whatever, as long as
+      # every container uses the one root). Point your library at
+      # /data/media and an import becomes a rename: instant, and no second
+      # copy of the release. Downloads on their own mount look like a
+      # separate filesystem to Docker even when they are not, and then
+      # every import copies 5-50 GB and deletes the original.
+      #
+      # Give nzbfast the usenet subtree only, not the whole root. It has no
+      # business in your library, and the rename still works: it is your
+      # *arr that moves the files, and it sees both sides.
+      - /data/usenet:/data/usenet
+      #
+      # No "incomplete" folder is needed, and that is not an omission.
+      # SABnzbd writes there and moves everything across when a job
+      # finishes; nzbfast writes at the final path from the first article
+      # on, so there is nothing to move. It does mean a folder named after
+      # completed downloads holds in-progress ones while they run, which is
+      # harmless - your *arrs import on the API's job state, not by
+      # watching the folder - but it surprises people who expect otherwise.
 
   # Auto-update. Watches for a newer nzbfast image and recreates the
   # container when one ships (your config/downloads persist - they live on

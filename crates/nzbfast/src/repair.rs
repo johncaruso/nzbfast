@@ -101,10 +101,28 @@ pub(crate) fn reextract_dir(dir: &std::path::Path, password: Option<&str>) -> Re
         let stem0 = lower_stem(&rars[0]);
         rars.iter().all(|p| lower_stem(p) == stem0)
     };
-    if one_set && password.is_some() && nzbkit::rar::headers_encrypted_to(&rars[0], password) {
+    let header_encrypted =
+        password.is_some() && nzbkit::rar::headers_encrypted_to(&rars[0], password);
+    // TODO 101: the disk-feed ladder below reads every volume in full and
+    // only removes them after `finish()`, so a job that ARMED the
+    // volume-eating unpack got none of it here - it budgeted against the
+    // free space as it stood and could refuse the very extraction the
+    // arming exists to rescue. A resumed run takes exactly this path
+    // (get.rs arms the mode and then calls `reextract_dir`), which is the
+    // one shape where the disk is tightest by definition. The native
+    // whole-set path IS the one that eats, so an armed job goes there
+    // first; a failure still falls through, and the guard below catches
+    // the case where falling through is impossible because the volumes
+    // have been spent.
+    if one_set && (header_encrypted || crate::eatvol::armed()) {
         println!(
-            "re-extracting {} header-encrypted volume(s) natively…",
-            rars.len()
+            "re-extracting {} volume(s) natively{}…",
+            rars.len(),
+            if header_encrypted {
+                " (header-encrypted)"
+            } else {
+                ""
+            }
         );
         match try_rars_native(dir, &rars[0], password) {
             Ok(consumed) => {
@@ -112,7 +130,24 @@ pub(crate) fn reextract_dir(dir: &std::path::Path, password: Option<&str>) -> Re
                 remove_spent_volumes(&consumed);
                 return Ok(true);
             }
-            Err(e) => println!("⚠ native re-extract failed ({e})"),
+            Err(e) => {
+                println!("⚠ native re-extract failed ({e})");
+                // The comment above ("a native failure just falls through
+                // to it, having published nothing") predates §101. Under
+                // the eating mode the failed pass may have consumed
+                // volumes as it read them, and the loop below re-reads
+                // every one by path - so its `File::open(path)?` would
+                // not fall through at all, it would `?` a hard error out
+                // of `get_with_progress` and fail the whole download task
+                // rather than this step. Fail cleanly here instead.
+                if rars.iter().any(|p| !p.exists()) {
+                    println!(
+                        "  ✘ volumes were consumed as they were read (the volume-eating \
+                         unpack), so there is nothing left to re-extract from"
+                    );
+                    return Ok(false);
+                }
+            }
         }
     }
     println!("re-extracting {} repaired volume(s)…", rars.len());
@@ -1509,6 +1544,7 @@ mod repair_tests {
             username: None,
             password: None,
             connections: 50,
+            pin_connections: false,
             rcvbuf: None,
             level: 0,
             group: None,
@@ -1980,6 +2016,59 @@ mod repair_tests {
             "volumes removed after extraction"
         );
         assert!(!dir.join("x.r00").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// TODO 101: a RESUMED job arms the volume-eating unpack and then
+    /// calls `reextract_dir`, which used to send every unencrypted set
+    /// down the disk-feed ladder first. That ladder reads every volume
+    /// IN FULL through the `Extractor`, budgets against the free space
+    /// as it stands (`set_extract_budget`, no credit for a volume that
+    /// has not been handed back yet) and removes the sources only after
+    /// `finish()` - so on the one shape where the disk is tightest by
+    /// definition it could refuse the extraction the arming exists to
+    /// rescue, and reach the eating path only by demoting to it after
+    /// re-reading the whole set. An armed job now goes straight there.
+    ///
+    /// What this pins is the routed behaviour end to end: the set
+    /// extracts, the volumes are spent, and a set that fails VERIFYING
+    /// takes the documented trade - the volumes it had already read are
+    /// gone, so a retry re-downloads rather than silently unpacking from
+    /// half a set. (It cannot pin which route ran: the ladder's demote
+    /// reaches the same native eating unpack, which is why the harm here
+    /// is a wasted full read and a budget measured too early rather than
+    /// a payload left packed.)
+    #[test]
+    fn reextract_dir_armed_eats_volumes_as_it_goes() {
+        use nzbkit::rar::fixtures;
+        let dir = reex_dir("armed-eats");
+        let a: Vec<u8> = (0..90_000u32)
+            .map(|i| (i as u8).wrapping_mul(29).wrapping_add(3))
+            .collect();
+        let b: Vec<u8> = (0..70_000u32)
+            .map(|i| (i as u8).wrapping_mul(11).wrapping_add(7))
+            .collect();
+        let v0 = fixtures::rar5_volume_n(&[("a.bin", a.len() as u64, &a, false, false)], 0);
+        // A stored CRC that does not match the bytes: the headers parse,
+        // the first volume extracts, and the SECOND member fails when it
+        // is verified - which is the only moment that can tell the two
+        // routes apart from outside.
+        let v1 = fixtures::rar5_volume_n_crc(
+            &[("b.bin", b.len() as u64, &b, false, false, Some(0xDEAD_BEEF))],
+            1,
+        );
+        std::fs::write(dir.join("x.part1.rar"), &v0).unwrap();
+        std::fs::write(dir.join("x.part2.rar"), &v1).unwrap();
+
+        let _arm = crate::eatvol::EatArm::new(true);
+        assert!(
+            !reextract_dir(&dir, None).unwrap(),
+            "a set whose second volume will not decode is not a success"
+        );
+        assert!(
+            !dir.join("x.part1.rar").exists(),
+            "the spent first volume was not handed back during extraction"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2780,6 +2869,56 @@ mod repair_tests {
             );
             std::fs::remove_dir_all(&dir).unwrap();
         }
+    }
+
+    /// The same property, with §101's volume-eating mode ARMED.
+    ///
+    /// The test above passes with eating off, which is the default and
+    /// is also the only way it has ever run - so it could not see that
+    /// eating deletes from INSIDE the extractor, before
+    /// `sweep_spent_obfuscated` is reached at all. Every one of that
+    /// sweep's three refusals, `has_member` first among them, sits after
+    /// the point where the file was already gone.
+    ///
+    /// Both halves matter here: the real volumes must still be eaten
+    /// (the mode has to keep working), and the memberless recovery
+    /// volume must still be untouched.
+    #[test]
+    fn eating_volumes_never_swallows_a_memberless_rar_file() {
+        let total: Vec<u8> = (0..400_000u32)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(19))
+            .collect();
+        let vols = reex_vols(&total);
+        let rev = rev_shaped_file();
+        let dir = reex_dir("obf-rev-eating");
+        std::fs::write(dir.join("f9a2c7b1049e6d3358ff20aa"), &vols[0]).unwrap();
+        std::fs::write(dir.join("18cc4d0e6b7a92f1d3e05581"), &vols[1]).unwrap();
+        std::fs::write(dir.join("5b3e91da77c0416f8a2d99e4"), &rev).unwrap();
+
+        {
+            // Armed for this thread only, restored on drop.
+            let _arm = crate::eatvol::EatArm::new(true);
+            let _ = obf_extract_at(&dir, 1);
+        }
+
+        assert_eq!(std::fs::read(dir.join("film.mkv")).unwrap(), total);
+        // The mode still does its job: the volumes that made the payload
+        // went during extraction rather than after it.
+        assert!(
+            !dir.join("f9a2c7b1049e6d3358ff20aa").exists(),
+            "the eating mode did not consume the first volume"
+        );
+        assert!(
+            !dir.join("18cc4d0e6b7a92f1d3e05581").exists(),
+            "the eating mode did not consume the second volume"
+        );
+        // …and the recovery volume is byte-for-byte where it was.
+        assert_eq!(
+            std::fs::read(dir.join("5b3e91da77c0416f8a2d99e4")).unwrap(),
+            rev,
+            "the volume-eating mode swallowed a memberless Rar!-magic file (the .rev shape)"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The fallback ladder's own entry point must see an obfuscated set.

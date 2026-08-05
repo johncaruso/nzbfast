@@ -858,6 +858,25 @@ Pause/Fortsetzen, Log.</p>
 das ganze Dashboard und die Wand haben ein Touch-Layout. Das Panel Einstellungen →
 Fernzugriff zeigt die genauen URLs und einen QR-Code zum Scannen.</p>
 
+<h3 id="remote-proxy">nzbfast von außerhalb erreichen</h3>
+<p>Es gibt keine Anmeldeseite, und das ist Absicht. Eine Anmeldung per Session-Cookie ist eine Sicherheitsfläche, die dauerhaft gepflegt werden muss, und sie wäre trotzdem das schwächste Schloss an allem, was im offenen Internet steht. nzbfast authentifiziert stattdessen mit Ihrem API-Schlüssel und nimmt diesen Schlüssel ebenso im Anfrage-Header wie in der URL entgegen (<code>X-Api-Key</code> oder <code>Authorization: Bearer</code>) - genau das erlaubt es einer vorgeschalteten Instanz, die Anmeldung sauber zu übernehmen.</p>
+<p><b>Am einfachsten ist es, gar nichts zu veröffentlichen.</b> Installieren Sie <b>Tailscale</b> auf diesem Rechner und auf Ihrem Telefon, und beide sind im selben privaten Netz: nichts ist exponiert, weder Router- noch Zertifikatsarbeit fällt an, und Einstellungen → Fernzugriff zeigt eine Adresse für überall, sobald Tailscale läuft. Nehmen Sie diesen Weg, sofern Sie nicht ausdrücklich eine öffentliche Domain brauchen.</p>
+<p><b>Falls doch</b>, setzen Sie einen Reverse-Proxy davor, geben Sie ihm das Zertifikat und lassen Sie ihn die Authentifizierung erledigen. Starten Sie nzbfast mit <code>--bind 127.0.0.1</code>, damit der Proxy der einzige Weg hinein ist, und richten Sie den Proxy auf <code>http://127.0.0.1:6789</code>:</p>
+<pre><code># Caddy
+example.com {
+    reverse_proxy 127.0.0.1:6789
+}
+
+# nginx
+location / {
+    proxy_pass http://127.0.0.1:6789;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}</code></pre>
+<p>Legen Sie darüber, was Ihr Proxy bietet: Basic Auth, einen Forward-Auth-Dienst wie Authelia oder Authentik, oder Client-Zertifikate. Eine Sache erwischt alle - Sonarr, Radarr und die Telefon-Apps können keine Browser-Anmeldung durchlaufen, lassen Sie ihnen also einen Weg daran vorbei. Die meisten Proxys können eine Anfrage mit gültigem <code>X-Api-Key</code>-Header durchlassen und alles andere abfragen.</p>
+<div class="warn-box"><b>Leiten Sie nicht einfach Port 6789 am Router weiter.</b> Das Dashboard spricht unverschlüsseltes HTTP, Ihr API-Schlüssel und alles, was Sie damit tun, liefe also für jeden auf dem Weg lesbar durchs Internet, und eine Installation ganz ohne Schlüssel steht jedem offen, der sie findet. Wenn Sie trotzdem einen Port weiterleiten, setzen Sie zuerst einen API-Schlüssel.</div>
+
 <h2 id="performance">13 · Performance-Tools</h2>
 <h3 id="perf-benchmark">System-Benchmark</h3>
 <p>Ein Klick misst deine drei Limits - Netzwerk-Durchsatz (eine echte
@@ -1123,6 +1142,7 @@ sieht genauso aus und löst sich von allein.</td></tr>
 <tr><td>Nichts im Netzwerk erreicht den Daemon</td><td>Prüf <code>--bind</code>: <code>127.0.0.1</code> bedient nur die Maschine, auf der nzbfast läuft. Der Standard, <code>0.0.0.0</code>, bedient jede Schnittstelle. Prüf dann die Firewall der Maschine selbst für Port 6789.</td></tr>
 <tr><td>Durchsuchen-Karte bleibt klein</td><td>Der Indexer wächst im Hintergrund - prüf, ob unter Einstellungen → Indexierung Gruppen gesetzt sind, und gib „Vertiefen pro Scan“ Zeit, Historie anzusammeln. „Jetzt scannen“ erzwingt einen Durchlauf; die Statuszeile zeigt den Live-Fortschritt.</td></tr>
 <tr><td>Wand zeigt falsches/kein Artwork</td><td>Detailblatt → ✎ Match korrigieren oder ↻ Metadaten erneuern. Film-Zuordnungen werden mit einem gratis OMDb-Key besser.</td></tr>
+<tr id="mac-cant-open"><td>macOS sagt, die Anwendung „nzbfast“ könne nicht geöffnet werden</td><td>Zwei Ursachen, beide schnell behoben. Wenn du das schlichte <code>-macos-universal.zip</code> verwendest: doppelklick <b>Start nzbfast.command</b>, nicht die Datei <code>nzbfast</code> daneben - das ist das Programm selbst, und der Finder beantwortet einen Doppelklick darauf mit genau dieser Meldung. Der Starter ist das, was alles einrichtet und startet. Kommt dieselbe Meldung auch beim Starter, hat die Kopie unterwegs ihr Unix-Ausführungsbit verloren: macOS bewahrt dieses Bit im .zip auf, Chat-Apps, Cloud-Laufwerke und erneutes Zippen aber nicht - so kommt ein weitergereichter Build nicht ausführbar bei dir an. Lade das .dmg oder das .zip direkt von der Releases-Seite, dann passiert das nicht. Um die vorhandene Kopie zu retten: Terminal öffnen, <code>chmod +x</code> mit einem Leerzeichen am Ende tippen, <b>Start nzbfast.command</b> und die Datei <code>nzbfast</code> ins Fenster ziehen, Return drücken - und dann den Starter erneut doppelklicken.</td></tr>
 <tr><td>Daemon startet nicht: Port belegt</td><td>Eine andere Instanz läuft schon - oder ändere <code>--port</code>.</td></tr>
 <tr><td>Wo sind die Logs?</td><td>Die Log-Karte im Dashboard, oder das Terminal bzw. die Logdatei, mit der du <code>serve</code> gestartet hast.</td></tr>
 </table></div>

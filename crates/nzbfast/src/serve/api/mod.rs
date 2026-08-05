@@ -23,6 +23,11 @@ pub(in crate::serve) struct ApiCtx<'a> {
     pub key_q: &'a str,
     pub tmdb_key: &'a Option<String>,
     pub bootstrap_apikey: bool,
+    /// The caller presented the ADD-ONLY NZB key, not the full API
+    /// key. Handlers in the allowlist use it to keep the tier's
+    /// stated promise that queue contents and the filesystem layout
+    /// stay full-key.
+    pub via_add_only: bool,
 }
 
 pub(in crate::serve) fn dispatch(

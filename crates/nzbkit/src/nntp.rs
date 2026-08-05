@@ -829,26 +829,137 @@ async fn direct_connect_opts(
         Some(ip) => addrs.retain(|a| a.is_ipv4() == ip.is_ipv4()),
         None => addrs.sort_by_key(|a| !a.is_ipv4()),
     }
-    let addr = *addrs.first().ok_or_else(|| {
-        std::io::Error::other(match bind {
+    if addrs.is_empty() {
+        return Err(std::io::Error::other(match bind {
             Some(ip) if ip.is_ipv4() => format!("{host} has no IPv4 address to match bind_ip"),
             Some(_) => format!("{host} has no IPv6 address to match bind_ip"),
             None => format!("{host} did not resolve"),
-        })
-    })?;
-    let socket = if addr.is_ipv4() {
-        tokio::net::TcpSocket::new_v4()?
-    } else {
-        tokio::net::TcpSocket::new_v6()?
+        }));
+    }
+    let one = |addr: std::net::SocketAddr| async move {
+        let socket = if addr.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()?
+        } else {
+            tokio::net::TcpSocket::new_v6()?
+        };
+        if let Some(rcvbuf) = rcvbuf {
+            // Best effort - the kernel clamps to its per-socket max.
+            let _ = socket.set_recv_buffer_size(rcvbuf);
+        }
+        // Keepalive experiment (dark, NZBFAST_KEEPALIVE=1): a NAT or
+        // provider silently dropping a connection otherwise costs a full
+        // read_timeout of dead air (or kills a parked warm session
+        // invisibly). Probe after 15 s idle, every 5 s, give up after 4
+        // misses - the kernel declares the death in ~35 s worst case and
+        // in seconds for a half-open peer, instead of us inferring it
+        // from silence. Best effort on both platforms.
+        #[cfg(unix)]
+        if std::env::var("NZBFAST_KEEPALIVE").is_ok_and(|v| v == "1") {
+            set_keepalive(&socket);
+        }
+        if let Some(ip) = bind {
+            socket.bind(std::net::SocketAddr::new(ip, 0))?;
+        }
+        socket.connect(addr).await
     };
-    if let Some(rcvbuf) = rcvbuf {
-        // Best effort - the kernel clamps to its per-socket max.
-        let _ = socket.set_recv_buffer_size(rcvbuf);
+    // Dial-race experiment (dark, NZBFAST_DIAL_RACE=1): providers sit
+    // behind DNS pools and individual nodes vary - a bad node hands out
+    // the "one mysteriously slow session" shape everything downstream
+    // then has to fight. Race the top two addresses, first TCP connect
+    // wins, loser is closed pre-greeting (a transient extra SYN, never
+    // an NNTP session, so provider session caps don't see it). The
+    // address-family preference above still orders the field.
+    let race = addrs.len() >= 2 && std::env::var("NZBFAST_DIAL_RACE").is_ok_and(|v| v == "1");
+    if !race {
+        return one(addrs[0]).await;
     }
-    if let Some(ip) = bind {
-        socket.bind(std::net::SocketAddr::new(ip, 0))?;
+    let (a, b) = (addrs[0], addrs[1]);
+    tokio::select! {
+        r = one(a) => match r {
+            Ok(s) => Ok(s),
+            Err(_) => one(b).await,
+        },
+        r = async {
+            // Stagger the second SYN slightly: on a healthy first
+            // address this keeps the race nearly free.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            one(b).await
+        } => match r {
+            Ok(s) => Ok(s),
+            Err(_) => one(a).await,
+        },
     }
-    socket.connect(addr).await
+}
+
+/// Best-effort short TCP keepalive on a not-yet-connected socket (see
+/// the keepalive experiment note at the call site). Unix only - the
+/// Windows equivalent (WSAIoctl SIO_KEEPALIVE_VALS) is a separate
+/// experiment if this one earns its keep.
+#[cfg(unix)]
+fn set_keepalive(socket: &tokio::net::TcpSocket) {
+    use std::os::fd::AsRawFd;
+    let fd = socket.as_raw_fd();
+    unsafe {
+        let on: libc::c_int = 1;
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_KEEPALIVE,
+            (&raw const on).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        let idle: libc::c_int = 15;
+        let interval: libc::c_int = 5;
+        let count: libc::c_int = 4;
+        #[cfg(target_os = "macos")]
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPALIVE,
+            (&raw const idle).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        #[cfg(target_os = "linux")]
+        {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPIDLE,
+                (&raw const idle).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            // TCP_USER_TIMEOUT: also bound how long WRITTEN data may sit
+            // unacknowledged - catches the half-open peer mid-transfer,
+            // which keepalive (idle-only) cannot.
+            let user_ms: libc::c_uint = 20_000;
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_USER_TIMEOUT,
+                (&raw const user_ms).cast(),
+                std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+            );
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPINTVL,
+                (&raw const interval).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPCNT,
+                (&raw const count).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+        // Other platforms: SO_KEEPALIVE alone, kernel defaults.
+        let _ = (interval, count);
+    }
 }
 
 /// Minimal SOCKS5 client (RFC 1928 CONNECT + RFC 1929 user/pass):
@@ -2681,6 +2792,7 @@ mod quit_tests {
             username: None,
             password: None,
             connections: 1,
+            pin_connections: false,
             rcvbuf: None,
             level: 0,
             group: None,
@@ -2729,6 +2841,7 @@ mod quit_tests {
             username: None,
             password: None,
             connections: 1,
+            pin_connections: false,
             rcvbuf: None,
             level: 0,
             group: None,
@@ -2996,6 +3109,7 @@ mod quit_tests {
             username: None,
             password: None,
             connections: 1,
+            pin_connections: false,
             rcvbuf: None,
             level: 0,
             group: None,
@@ -3158,6 +3272,7 @@ mod quit_tests {
             username: None,
             password: None,
             connections: 1,
+            pin_connections: false,
             rcvbuf: None,
             level: 0,
             group: None,
@@ -3257,6 +3372,7 @@ mod compress_tests {
             username: None,
             password: None,
             connections: 1,
+            pin_connections: false,
             rcvbuf: None,
             level: 0,
             group: None,

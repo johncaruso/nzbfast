@@ -166,44 +166,50 @@ pub(in crate::serve) fn dispatch(
         // arm as a hand-typed key so persistence, replay and the
         // masked logging are identical - a second write path for a
         // credential is how the two drift.
-        "apikey_new" => match random_apikey() {
-            // Live state, key file and settings.json in one ordered
-            // transaction (see `apply_and_save`) - persisting
-            // separately let two rotations leave the three
-            // disagreeing, and the loser's key came back on restart.
-            // Still `status: true` with the key when the write
-            // failed: the daemon IS on the new key now, so a page
-            // that refused to adopt it would lock itself out.
-            // `saved: false` is the durability signal.
-            Some(k) => match apply_and_save(d, "apikey", &k) {
-                Ok((_, saved)) => {
-                    info!(target: "config", "apikey regenerated");
-                    json!({ "status": true, "apikey": k, "saved": saved })
-                }
-                Err(e) => json!({ "status": false, "error": e }),
+        "apikey_new" => match credential_mutation_allowed(req) {
+            Err(why) => json!({"status": false, "error": why}),
+            Ok(()) => match random_apikey() {
+                // Live state, key file and settings.json in one ordered
+                // transaction (see `apply_and_save`) - persisting
+                // separately let two rotations leave the three
+                // disagreeing, and the loser's key came back on restart.
+                // Still `status: true` with the key when the write
+                // failed: the daemon IS on the new key now, so a page
+                // that refused to adopt it would lock itself out.
+                // `saved: false` is the durability signal.
+                Some(k) => match apply_and_save(d, "apikey", &k) {
+                    Ok((_, saved)) => {
+                        info!(target: "config", "apikey regenerated");
+                        json!({ "status": true, "apikey": k, "saved": saved })
+                    }
+                    Err(e) => json!({ "status": false, "error": e }),
+                },
+                None => json!({
+                    "status": false,
+                    "error": "could not read OS entropy for a new key",
+                }),
             },
-            None => json!({
-                "status": false,
-                "error": "could not read OS entropy for a new key",
-            }),
         },
         // Mint (or rotate) the add-only NZB key. Same shape and same
         // full-key gate as apikey_new: the NZB key must not be able to
         // rotate itself, or a leaked one could lock the owner's push
         // tools out. Revealing it rides apikey_show, which already
         // returns both keys.
-        "nzbkey_new" => match random_apikey() {
-            Some(k) => match apply_and_save(d, "nzbkey", &k) {
-                Ok((_, saved)) => {
-                    info!(target: "config", "nzbkey regenerated");
-                    json!({ "status": true, "nzbkey": k, "saved": saved })
-                }
-                Err(e) => json!({ "status": false, "error": e }),
+        "nzbkey_new" => match credential_mutation_allowed(req) {
+            Err(why) => json!({"status": false, "error": why}),
+            Ok(()) => match random_apikey() {
+                Some(k) => match apply_and_save(d, "nzbkey", &k) {
+                    Ok((_, saved)) => {
+                        info!(target: "config", "nzbkey regenerated");
+                        json!({ "status": true, "nzbkey": k, "saved": saved })
+                    }
+                    Err(e) => json!({ "status": false, "error": e }),
+                },
+                None => json!({
+                    "status": false,
+                    "error": "could not read OS entropy for a new key",
+                }),
             },
-            None => json!({
-                "status": false,
-                "error": "could not read OS entropy for a new key",
-            }),
         },
         "get_config" => {
             let cats: Vec<Value> = d.cats.lock_ok().iter()
@@ -563,4 +569,68 @@ pub(in crate::serve) fn dispatch(
         }
         _ => return None,
     })
+}
+
+/// May this request ROTATE a credential?
+///
+/// Minting a key is the one mutation that can lock the owner OUT, which
+/// makes it reachable-by-accident in a way nothing else here is. On a
+/// deliberately keyless install (`NZBFAST_OPEN=1`, or a legacy one that
+/// predates first-run key minting) the gateway's `(None, None) => true`
+/// arm authorises everything, so a hostile page the user happens to
+/// visit could navigate to `/api?mode=nzbkey_new` on their LAN address:
+/// the browser sends the request, the daemon mints a key, and the
+/// same-origin policy stops the page ever reading it. The install is now
+/// `(None, Some(unknown))`, which is exactly the state that turns full
+/// access off - the owner is locked out of their own daemon by a key
+/// nobody has.
+///
+/// Two gates, because neither is sufficient alone:
+///
+/// - **POST.** Kills the drive-by NAVIGATION - an `<img>`, an iframe, a
+///   redirect, a typed link. A cross-site FORM can still POST, hence:
+/// - **Same-site.** `Sec-Fetch-Site` (every browser since 2023 sends it
+///   on every request) must say the request did not come from another
+///   site, and an `Origin`, when present, must match the `Host` we were
+///   asked on. Both are checked only WHEN PRESENT: curl, the *arr
+///   clients and every script send neither, and those callers have to
+///   keep working - the point is to stop a BROWSER being used as a
+///   confused deputy, not to invent an authentication scheme.
+fn credential_mutation_allowed(req: &tiny_http::Request) -> Result<(), String> {
+    if req.method() != &tiny_http::Method::Post {
+        return Err("POST required to create a key".into());
+    }
+    let hv = |name: &'static str| {
+        req.headers()
+            .iter()
+            .find(|h| h.field.equiv(name))
+            .map(|h| h.value.as_str().trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    // "none" is a user-typed URL or a bookmark; "same-origin" is our own
+    // dashboard. "cross-site" and "same-site" are both somebody else's
+    // page - a sibling subdomain is not this daemon.
+    if let Some(site) = hv("Sec-Fetch-Site")
+        && !matches!(site.to_ascii_lowercase().as_str(), "same-origin" | "none")
+    {
+        return Err("a key can only be created from nzbfast's own pages".into());
+    }
+    // Compare HOSTS, not whole URLs: the dashboard may be reached over
+    // http or https through a reverse proxy, and the scheme the browser
+    // reports is not the scheme we were spoken to on.
+    if let Some(origin) = hv("Origin") {
+        let host_of = |s: &str| {
+            s.rsplit_once("//")
+                .map_or(s, |(_, rest)| rest)
+                .split('/')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+        };
+        let asked = hv("Host").unwrap_or_default().to_ascii_lowercase();
+        if host_of(&origin) != asked {
+            return Err("a key can only be created from nzbfast's own pages".into());
+        }
+    }
+    Ok(())
 }

@@ -66,6 +66,10 @@ jobs:
         run: cargo test -p nzbfast --locked --no-fail-fast -- --test-threads=1
       - name: fmt
         run: cargo fmt -p nzbkit -p nzbfast -p nzbtray --check
+      # Parity with ci-private.yml; see TODO 102b for why this is a script
+      # rather than clippy's disallowed-methods.
+      - name: lock gate
+        run: tools/lock-gate.py
       - name: clippy
         # No escapes: every warning blocks. The categories still allowed
         # are named in the workspace lints table in Cargo.toml, each with

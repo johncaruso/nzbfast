@@ -102,6 +102,54 @@ enum Reader<'a> {
     Unavailable,
 }
 
+/// RAII claim on "a connection ladder is running".
+///
+/// Released on drop, INCLUDING the drop that happens when a ladder
+/// future is cancelled by its caller's timeout - which is the case a
+/// bare set/clear pair gets wrong, leaving the tuner permanently
+/// "busy" after one slow provider.
+pub(in crate::serve) struct LadderPermit(std::sync::Arc<Daemon>);
+
+impl LadderPermit {
+    /// `None` when another ladder already holds it.
+    pub(in crate::serve) fn try_take(d: &std::sync::Arc<Daemon>) -> Option<Self> {
+        d.ladder_busy
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+            .then(|| LadderPermit(d.clone()))
+    }
+}
+
+impl Drop for LadderPermit {
+    fn drop(&mut self) {
+        self.0
+            .ladder_busy
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// A connection ladder in flight, as the dashboard sees it.
+#[derive(Clone, serde::Serialize)]
+pub struct LadderLive {
+    pub host: String,
+    /// What the ladder is doing right now, as a TOKEN the UI translates:
+    /// climb, recheck, refine, ceiling, runoff, runoff2, done.
+    pub phase: String,
+    /// Connection count currently being measured.
+    pub at: usize,
+    /// Every rung settled so far, oldest first.
+    pub steps: Vec<nzbkit::sysbench::LadderStep>,
+    /// Unix seconds when this run started, so the UI can show elapsed
+    /// time without trusting its own clock against the daemon's.
+    pub started: u64,
+    pub done: bool,
+}
+
 pub struct Daemon {
     /// Streaming handle into the active download (M11).
     pub hub: Arc<crate::StreamHub>,
@@ -312,6 +360,15 @@ pub struct Daemon {
     /// connection ladder and cap its per-job connections at the knee -
     /// over-asking measured 3-4× slower (connect-flood defense).
     pub auto_connections: std::sync::atomic::AtomicBool,
+    /// Leave adult titles out of the poster wall and the release list
+    /// (settings key `wall_hide_adult`, default ON).
+    ///
+    /// On by default because the Spotnet source already made that call
+    /// for the same reason and the wall should not disagree with it. The
+    /// curated views only: every uncurated facade - newznab, the *arrs -
+    /// is untouched, because a filter the user set for their own browsing
+    /// is not a filter to impose on an automation's search results.
+    pub wall_hide_adult: std::sync::atomic::AtomicBool,
     /// Slow-job watchdog on/off (live setting auto_defer): demote a job
     /// that is single-server-bound and slow while other jobs wait.
     pub auto_defer: std::sync::atomic::AtomicBool,
@@ -390,6 +447,16 @@ pub struct Daemon {
     /// the active job can't use (their copies 430'd) download the next
     /// queued job in a restricted secondary pipeline instead of idling.
     pub auto_prefetch: std::sync::atomic::AtomicBool,
+    /// "Race slow articles" (live setting race_stragglers, ON by
+    /// default): the pool may fetch a straggling article from more than
+    /// one connection at once - first copy wins, the loser is abandoned
+    /// - and replace a session delivering far below its siblings. Costs
+    /// a fraction of a percent of extra traffic; measured to halve the
+    /// end-of-job tail and to rescue stalled articles in under a second
+    /// instead of eight. The pool reads settings.json per job, so a
+    /// flip applies from the next download; this atomic backs the
+    /// settings API's live read.
+    pub race_stragglers: std::sync::atomic::AtomicBool,
     /// M29 opt-in routing (`oracle_route`, OFF by default): when on, a
     /// download skips any of your providers whose backbone the
     /// availability ledger is confident is GONE for the release's
@@ -501,6 +568,28 @@ pub struct Daemon {
     /// behind"). Implemented as an implicit extra entry in the
     /// `cleanup_exts` sweep, so it inherits that sweep's guards.
     pub par_cleanup: AtomicBool,
+    /// Permissions to put on finished downloads (#20), as a umask: dirs
+    /// get `0o777 & !umask`, files `0o666 & !umask`. `u32::MAX` is OFF
+    /// and is the default, so an install that says nothing keeps exactly
+    /// the modes it has today.
+    ///
+    /// This exists because ONE umask was covering two trust zones. The
+    /// systemd unit sets `UMask=0077` so the spool's API key and provider
+    /// credentials are owner-only, which is right - but `--out` lives
+    /// inside `ReadWritePaths=/var/lib/nzbfast`, so completed downloads
+    /// came out 0700/0600 too and a Sonarr running as any other user
+    /// could not read them, nor rename out of the directory. The three
+    /// cheap fixes are each wrong in a different direction: relaxing
+    /// `UMask` exposes everything the daemon creates at runtime including
+    /// a generated API key, moving `--out` relocates downloads for every
+    /// existing install on upgrade, and `ExecStartPost=chmod` only ever
+    /// reaches the root directory and not the per-job ones made later.
+    /// So the output tree gets its modes set explicitly, and the process
+    /// umask stays strict.
+    ///
+    /// Unix only. On Windows it is stored and reported so a config file
+    /// survives a round trip through either platform, and does nothing.
+    pub out_umask: std::sync::atomic::AtomicU32,
     /// "Fast PAR mode" - route heavy PAR2 repairs through the NTT
     /// syndrome path (research/NTT-STAGE2/3 docs). Live setting,
     /// mirrored into `nzbkit::par2repair::set_fast_par_enabled`; the
@@ -592,6 +681,47 @@ pub struct Daemon {
     pub history_rows: AtomicU64,
     /// Colour finished names green and failed ones red in History.
     pub history_color_names: std::sync::atomic::AtomicBool,
+    /// Live state of a connection ladder while it runs, for the
+    /// dashboard to poll. A full run is minutes long now, and the number
+    /// it prints is the sharpest single knob in the product - watching
+    /// it being derived is how a user comes to trust it, or to spot that
+    /// it is measuring a bad evening. `None` between runs.
+    ///
+    /// SINGLE-WRITER, held by [`LadderPermit`]: do not write this without
+    /// holding one. The invariant is structural rather than checked - one
+    /// permit means one ladder means one writer - and a generation stamp
+    /// here would be a second mechanism asserting what the permit already
+    /// guarantees, which is the kind of pair that rots when a third
+    /// writer appears and only one of them gets updated.
+    pub ladder_live: Mutex<Option<LadderLive>>,
+    /// One connection ladder at a time, across BOTH paths.
+    ///
+    /// Two ladders running at once do not merely race to write a knee -
+    /// they invalidate each other's numbers, because each one's sockets
+    /// are the other's contention, and a tuner whose whole job is
+    /// measuring contention cannot be measuring itself. The existing
+    /// post-hoc check ("a manual test landed while this probe ran")
+    /// decides who WINS the write; it does not stop either measurement
+    /// being wrong. They also both publish `ladder_live`, so the panel
+    /// would show one provider's phase against another's rungs.
+    pub ladder_busy: std::sync::atomic::AtomicBool,
+    /// Set by the dashboard's Cancel to stop a ladder in flight.
+    ///
+    /// A full run is minutes long and spends real, billed provider
+    /// traffic, so "I have changed my mind" has to be answerable. Read
+    /// between rungs rather than mid-rung: a rung is 5-10 s, and
+    /// abandoning one halfway would leave a half-measured step that is
+    /// worse than no step. Cleared when a run starts, so a stale cancel
+    /// cannot kill the next one.
+    pub ladder_cancel: std::sync::atomic::AtomicBool,
+    /// Tint the media chip by video codec, and the archive-shape chip by
+    /// what it took to unpack. Two switches rather than one because they
+    /// answer different questions - "what is this file" and "what did
+    /// getting it cost" - and a user who wants one is not asking for the
+    /// other. Both default ON, matching how they shipped; the chips
+    /// still spell both facts out in words when the colour is off.
+    pub media_chip_color: std::sync::atomic::AtomicBool,
+    pub shape_chip_color: std::sync::atomic::AtomicBool,
     /// Keep the words the parser did not recognise ("Round11 Hungary
     /// Race"), so releases differing only in those stay distinct.
     /// On by default: it only ever fires where the renamer would
@@ -4308,17 +4438,50 @@ impl Daemon {
     /// rather than the id: they cannot open a record that no longer
     /// exists, but they can go and look at the folder.
     pub(super) fn note_delete_kept(&self, name: &str, path: &std::path::Path, why: &str) {
-        let mut k = self.delete_kept.lock_ok();
-        let path = path.display().to_string();
-        // One entry per path. A bulk history sweep over a shared season
-        // folder refuses once per record, and a dozen identical rows
-        // would bury the one thing the notice has to say.
-        if k.iter().any(|(_, p, _, _)| *p == path) {
-            return;
+        {
+            let mut k = self.delete_kept.lock_ok();
+            let path = path.display().to_string();
+            // One entry per path. A bulk history sweep over a shared season
+            // folder refuses once per record, and a dozen identical rows
+            // would bury the one thing the notice has to say.
+            if k.iter().any(|(_, p, _, _)| *p == path) {
+                return;
+            }
+            k.push_back((name.to_string(), path, why.to_string(), unix_now()));
+            while k.len() > 12 {
+                k.pop_front();
+            }
         }
-        k.push_back((name.to_string(), path, why.to_string(), unix_now()));
-        while k.len() > 12 {
-            k.pop_front();
+        self.save_delete_kept();
+    }
+
+    /// Persist the kept-files notices to `.spool/delete-kept.json`.
+    ///
+    /// This ring is not a moment that scrolls past like the ones beside
+    /// it - it is the REPLACEMENT handle on a folder whose history row
+    /// was just deleted, and it stays on screen until dismissed. Held
+    /// only in memory it did not survive a restart, which includes the
+    /// auto-updater's own restart and `restart_daemon` from the settings
+    /// UI: the row was already gone, so the user was left with the exact
+    /// state the notice exists to prevent - a folder still eating disk,
+    /// named by nothing anywhere. The deferred `park()` refusal has no
+    /// response to ride back on at all, so for that path this is the
+    /// only channel there is.
+    pub(super) fn save_delete_kept(&self) {
+        let path = self.spool.join("delete-kept.json");
+        // The lock is held ACROSS the write, not just around a snapshot.
+        // Snapshotting and then writing lets two writers land in the
+        // opposite order to the states they carry: a refusal snapshots
+        // [X, Y] and is preempted, the user dismisses X and its write of
+        // [Y] completes, then the first write lands [X, Y] - and the next
+        // restart resurrects the notice the user just cleared, which is
+        // the one thing persisting the dismissal exists to prevent.
+        // Safe to hold: `write_atomic` takes no other lock of ours, and
+        // this mutex is a leaf (never acquired while queue/history are
+        // held - both delete arms record after dropping them).
+        let kept = self.delete_kept.lock_ok();
+        if let Ok(text) = serde_json::to_string_pretty(&*kept) {
+            let _ = crate::persist::write_atomic(&path, text.as_bytes());
         }
     }
 
@@ -4353,6 +4516,10 @@ impl Daemon {
                 {
                     self.note_delete_kept(filed_stem(&g), &g.out_dir, &why);
                 }
+                // The other end of the reservation the delete took when
+                // it set this flag: the directory is only safe to hand
+                // out once its files are actually gone.
+                self.reserved.lock_ok().remove(&g.out_dir);
             }
             if g.tombstone {
                 let _ = std::fs::remove_file(&g.nzb_path);
@@ -5049,6 +5216,24 @@ impl Daemon {
             String::new()
         };
         let (moved, move_split) = self.relocate_completed(out_dir, cat, renamed);
+        // #20: the modes go on LAST, once the payload has stopped moving.
+        // Anything earlier is undone by the unpack, the rename passes or
+        // the relocation itself, all of which create files of their own.
+        // `moved` is the destination when the job was relocated, and that
+        // is the tree the *arr will actually look at.
+        let umask = self.out_umask.load(Ordering::Relaxed);
+        if umask <= 0o777 {
+            let final_dir = moved.as_deref().unwrap_or(out_dir);
+            // Stop the parent walk at whichever root that tree belongs
+            // to: a moved job is under its destination, not under the
+            // download root, and walking past it would re-mode
+            // directories the user never gave us.
+            let root = moved
+                .as_deref()
+                .and_then(|_| self.move_completed.read_ok().clone())
+                .unwrap_or_else(|| self.out_root.read_ok().clone());
+            crate::smart::apply_out_umask(final_dir, Some(&root), umask);
+        }
         Finalized {
             moved,
             move_split,
@@ -5518,17 +5703,30 @@ impl Daemon {
         // so it must not interleave with an add (or another retry)
         // making the same decision about the same folder.
         let publish = self.add_lock.lock_ok();
+        let mut h = self.history.lock_ok();
         // A recategorize is moving this job's payload right now. Taking
         // it out of history and re-queueing it would start writers at
         // the path the move is emptying, and the move would then point
         // the record at the destination while the download continued at
         // the source. The auto-retry timer fires from the scheduler, so
         // this is not a race the user has to lose deliberately.
+        //
+        // UNDER the history lock, which is the half that makes it work
+        // (Codex H7). `history_change_cat` raises its `moving` marker and
+        // THEN re-verifies the record is still in history; a check taken
+        // outside this lock could pass just before the marker went up
+        // while the move still proceeded. Both REST and JSON-RPC history
+        // delete already sample it here; retry read it one lock too
+        // early, so a recategorize could re-verify the record present,
+        // block on `add_lock`, and then move the payload of a job this
+        // call had already pulled out of history and re-queued - leaving
+        // a full payload at the destination named by no record, while
+        // the re-queued job downloaded the release again into the
+        // directory the move was emptying.
         if self.moving.lock_ok().contains(nzo_id) {
             info!(target: "retry", "{nzo_id}: refused - its files are being moved right now");
             return false;
         }
-        let mut h = self.history.lock_ok();
         let Some(pos) = h.iter().position(|j| j.lock_ok().nzo_id == nzo_id) else {
             return false;
         };

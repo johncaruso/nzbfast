@@ -208,6 +208,18 @@ pub(crate) fn try_unrar_spent(
     // env override.
     if !nzbkit::extract::prefer_external_unrar() {
         println!("unpacking archive natively…");
+        // §101: a directory holding more than one archive set must not
+        // eat. The loop below calls the whole run successful if ANY
+        // group produced, so a second group failing halfway has already
+        // destroyed its own volumes while `report_leftovers` still calls
+        // them "still packed" - and the job finishes Completed with that
+        // release missing and no way back to it. Eating exists for the
+        // single large set that will not otherwise fit; it has nothing
+        // to offer a decoy-plus-release directory, and this is the one
+        // shape where losing the bet is invisible to the user.
+        //
+        // Held for the whole native pass, restored on drop.
+        let _single_set_only = (groups.len() > 1).then(|| crate::eatvol::EatArm::new(false));
         let mut consumed_all: Vec<PathBuf> = Vec::new();
         let mut produced = false;
         let mut failed: Vec<String> = Vec::new();
@@ -235,6 +247,20 @@ pub(crate) fn try_unrar_spent(
         if produced {
             report_leftovers(&failed);
             return Some(spent(consumed_all));
+        }
+        // §101: nothing produced, and under the eating mode the failed
+        // pass may have consumed volumes on its way down - in which case
+        // the unrar escape hatch below would be handed a directory with
+        // no volumes in it and fail for a reason that has nothing to do
+        // with unrar. Say what actually happened; the caller turns a
+        // None into a job failure either way, but the log is the only
+        // place this is explicable.
+        if groups.iter().any(|(_, g)| g.iter().any(|p| !p.exists())) {
+            println!(
+                "⚠ volumes were consumed as they were read (the volume-eating unpack), \
+                 so there is nothing left for unrar to retry - a retry re-downloads the set"
+            );
+            return None;
         }
         println!("falling back to unrar…");
     }
@@ -1077,19 +1103,21 @@ pub(crate) fn write_archives_to_spending(
     // landed; before that free_bytes was None there and this guard silently
     // did nothing.
     //
-    // Under eating, the volume bytes count as free: they are about to be
-    // handed back one file at a time, and that is the entire point of the
-    // mode. Without this the guard reads the disk as it stands at the
-    // FIRST byte - which on a job that armed `low_disk` is nearly full by
-    // definition - and kills the extraction the mode exists to rescue.
-    let freed = if eating {
-        crate::eatvol::volume_bytes(sources)
-    } else {
-        0
-    };
-    let budget = crate::serve::free_bytes(dir)
-        .map(|free| free.saturating_add(freed).saturating_sub(EXTRACT_RESERVE))
-        .unwrap_or(u64::MAX);
+    // Under eating the volume bytes come back one file at a time, and
+    // that is the entire point of the mode - so the guard has to grow as
+    // they do, or it reads the disk as it stands at the FIRST byte
+    // (which on a job that armed `low_disk` is nearly full by
+    // definition) and kills the extraction the mode exists to rescue.
+    //
+    // It grows on DELIVERY, never on promise: see [`BombBudget`] for the
+    // shape that pre-crediting `volume_bytes(sources)` broke, and why it
+    // broke it on the commonest set of all.
+    let budget = BombBudget::fixed(
+        crate::serve::free_bytes(dir)
+            .map(|free| free.saturating_sub(EXTRACT_RESERVE))
+            .unwrap_or(u64::MAX),
+    );
+    let credit = budget.credit_handle();
     let written = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let staging = ExtractStaging::new(dir)?;
@@ -1112,7 +1140,7 @@ pub(crate) fn write_archives_to_spending(
         Ok(Box::new(BombGuardWriter {
             inner: file,
             written: written.clone(),
-            budget,
+            budget: budget.clone(),
         }) as Box<dyn std::io::Write>)
     };
     if eating {
@@ -1135,6 +1163,11 @@ pub(crate) fn write_archives_to_spending(
                 Ok(()) => {
                     eaten += 1;
                     bytes = bytes.saturating_add(size);
+                    // The space is back NOW, so the guard may spend it
+                    // now - and not one byte before. A volume we could
+                    // not remove credits nothing, which is exactly what
+                    // the warning below is about.
+                    credit.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
                 }
                 // Not fatal: extraction has already read this volume, so
                 // a file we cannot remove costs space, not correctness.
@@ -1300,9 +1333,11 @@ pub(crate) fn extract_one_sevenz(
         ArchiveReader::open(container, pw).map_err(|e| anyhow::anyhow!("opening 7z: {e}"))?;
     // Staging sits on the same filesystem as the job directory, so this
     // still measures the volume the payload lands on.
-    let budget = crate::serve::free_bytes(out)
-        .map(|free| free.saturating_sub(EXTRACT_RESERVE))
-        .unwrap_or(u64::MAX);
+    let budget = BombBudget::fixed(
+        crate::serve::free_bytes(out)
+            .map(|free| free.saturating_sub(EXTRACT_RESERVE))
+            .unwrap_or(u64::MAX),
+    );
     let written = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     reader
         .for_each_entries(|entry, rd| {
@@ -1319,7 +1354,7 @@ pub(crate) fn extract_one_sevenz(
             let mut w = BombGuardWriter {
                 inner: std::io::BufWriter::new(std::fs::File::create(&target)?),
                 written: written.clone(),
-                budget,
+                budget: budget.clone(),
             };
             std::io::copy(rd, &mut w)?;
             use std::io::Write as _;
@@ -1392,9 +1427,11 @@ pub(crate) fn extract_one_zip(
 ) -> Result<()> {
     let archive =
         nzbkit::zip::Archive::open(parts).map_err(|e| anyhow::anyhow!("opening zip: {e}"))?;
-    let budget = crate::serve::free_bytes(out)
-        .map(|free| free.saturating_sub(EXTRACT_RESERVE))
-        .unwrap_or(u64::MAX);
+    let budget = BombBudget::fixed(
+        crate::serve::free_bytes(out)
+            .map(|free| free.saturating_sub(EXTRACT_RESERVE))
+            .unwrap_or(u64::MAX),
+    );
     let written = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     for e in archive.entries() {
         let target = sanitized_entry_path(out, &e.name)
@@ -1412,7 +1449,7 @@ pub(crate) fn extract_one_zip(
         let mut w = BombGuardWriter {
             inner: std::io::BufWriter::new(std::fs::File::create(&target)?),
             written: written.clone(),
-            budget,
+            budget: budget.clone(),
         };
         archive
             .read_entry_to_with(e, &mut w, password)
@@ -1435,14 +1472,63 @@ pub(crate) const EXTRACT_RESERVE: u64 = 256 * 1024 * 1024;
 pub(crate) struct BombGuardWriter<W: std::io::Write> {
     pub(crate) inner: W,
     pub(crate) written: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    pub(crate) budget: u64,
+    pub(crate) budget: BombBudget,
 }
+
+/// The bomb guard's ceiling.
+///
+/// `base` is what the target filesystem had free (less the reserve) when
+/// the extraction started. `credit` is space that has actually come BACK
+/// during it - TODO 101's volume-eating unpack deleting a spent volume -
+/// and it moves only after a `remove_file` has returned Ok.
+///
+/// That "actually" is the whole point. The eating path used to add
+/// `volume_bytes(sources)` to the budget UP FRONT, on the grounds that
+/// the volumes were about to be handed back one at a time. For a set of
+/// many members that is nearly true; for the dominant movie shape - ONE
+/// member split across every volume - it is not true at all. The RAR
+/// engine holds every consumption callback while a split member is
+/// pending and releases the backlog only after the finish fragment has
+/// written the WHOLE payload, so nothing is freed until everything is
+/// written. A 13.85 GB film with 1.75 GB free sailed past a guard that
+/// believed it had 15.6 GB, and met the real disk instead: ENOSPC, a
+/// half-written payload, and a filesystem with nothing left on it - the
+/// exact outcome the guard exists to prevent, caused by the guard.
+///
+/// Crediting only what came back keeps the mode working where it really
+/// does free space progressively, and turns the case where it cannot
+/// back into a clean refusal before a byte is written.
+#[derive(Clone)]
+pub(crate) struct BombBudget {
+    base: u64,
+    credit: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl BombBudget {
+    /// A budget nothing gives back to: every extraction except the
+    /// volume-eating one.
+    pub(crate) fn fixed(base: u64) -> Self {
+        Self {
+            base,
+            credit: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+    /// A handle on the credit side, for the consumption callback.
+    fn credit_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        self.credit.clone()
+    }
+    fn limit(&self) -> u64 {
+        self.base
+            .saturating_add(self.credit.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
 impl<W: std::io::Write> std::io::Write for BombGuardWriter<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         use std::sync::atomic::Ordering;
         let n = self.inner.write(buf)?;
         let total = self.written.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
-        if total > self.budget {
+        if total > self.budget.limit() {
             return Err(std::io::Error::other(
                 "extraction exceeded available disk space (possible decompression bomb)",
             ));
@@ -1978,6 +2064,56 @@ mod native_unrar_tests {
             assert!(!v.exists(), "{} outlived the extraction", v.display());
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The bomb guard may only spend space that has actually come back.
+    ///
+    /// The eating path used to add the WHOLE volume set to the budget
+    /// before a byte was written, on the reasoning that the volumes were
+    /// about to be handed back. The engine does hand them back - but for
+    /// the commonest set of all (one member split across every volume)
+    /// it hands back NOTHING until the whole payload is written, because
+    /// a pending split holds every consumption callback. So the guard
+    /// waved through an extraction that could not fit and the real
+    /// filesystem stopped it instead: ENOSPC on a disk with nothing left.
+    ///
+    /// This is the accounting rule underneath that, tested directly -
+    /// a free-space seam is not reachable from a unit test, but the
+    /// arithmetic that made the seam wrong is.
+    #[test]
+    fn the_bomb_guard_credits_only_space_that_came_back() {
+        use std::io::Write as _;
+        let budget = BombBudget::fixed(1_000);
+        let credit = budget.credit_handle();
+        assert_eq!(budget.limit(), 1_000, "a promise is not space");
+
+        let written = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut w = BombGuardWriter {
+            inner: Vec::new(),
+            written: written.clone(),
+            budget: budget.clone(),
+        };
+        assert!(w.write_all(&[0u8; 900]).is_ok());
+        // Still over the line, because nothing has been freed yet: this
+        // is exactly the write that used to be allowed on the strength
+        // of volumes that were still sitting on the disk.
+        assert!(
+            w.write_all(&[0u8; 200]).is_err(),
+            "the guard spent space the disk did not have"
+        );
+
+        // A volume actually removed credits its bytes, and only then.
+        credit.fetch_add(500, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(budget.limit(), 1_500);
+        let mut w2 = BombGuardWriter {
+            inner: Vec::new(),
+            written,
+            budget,
+        };
+        assert!(
+            w2.write_all(&[0u8; 300]).is_ok(),
+            "space that came back must be spendable"
+        );
     }
 
     /// The gate that matters most: an UNVERIFIED set is never eaten,

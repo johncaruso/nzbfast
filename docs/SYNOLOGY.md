@@ -33,6 +33,15 @@ watch       drop an .nzb here and it downloads
 That is the whole preparation, and it replaces the SSH session that used
 to be needed here.
 
+> **Running Sonarr or Radarr on this NAS? Read this first, not later.**
+> On a DiskStation `/docker` and your media library are almost always
+> different shared folders, and that one fact decides whether every import
+> is instant or is a full copy of a 5-50 GB release. Put downloads under
+> the *same* shared folder as the library instead - see
+> [Sonarr and Radarr: where downloads have to live](#sonarr-and-radarr-where-downloads-have-to-live)
+> below and use those folders in place of `downloads` throughout. It is
+> two minutes now and a rebuild later.
+
 **Why it matters.** nzbfast writes your downloads as a real user so the
 files belong to *you* rather than to root, and it works out which user
 from the folders it is given: folders you make in File Station belong to
@@ -85,7 +94,8 @@ below are the same thing done by hand.
          - "6789:6789"
        volumes:
          - ./config:/config          # settings + index database
-         - ./downloads:/downloads    # finished files
+         - ./downloads:/downloads    # finished files - but see below if
+                                     # you run Sonarr or Radarr
          - ./watch:/watch            # drop an .nzb here to auto-download
        # No PUID/PGID needed: nzbfast adopts the owner and group of the
        # folders you made above. No TZ either - times are stored as UTC
@@ -106,7 +116,7 @@ below are the same thing done by hand.
    ```
 
 3. Finish the wizard - Container Manager pulls the images and starts
-   them. Then jump to [First run](#first-run-add-your-provider).
+   them. Then jump to [First run](#first-run---add-your-provider).
 
 The one value worth changing is `TZ` on the **watchtower** service, and
 only so that "04:00" means 04:00 where you live. It does nothing on the
@@ -163,6 +173,9 @@ needs. You update it by hand, a few clicks each release.
    /docker/nzbfast/watch        ← drop an .nzb here to auto-download it
    ```
 
+   With Sonarr or Radarr on this NAS, downloads belong somewhere else -
+   see [Sonarr and Radarr: where downloads have to live](#sonarr-and-radarr-where-downloads-have-to-live).
+
 2. **Get the image.** Container Manager → **Registry** → search
    **`nzbfast`** → select **`nzbfast/nzbfast`** → **Download** → tag
    **`latest`**.
@@ -181,12 +194,15 @@ needs. You update it by hand, a few clicks each release.
      | `/docker/nzbfast/downloads`   | `/downloads`            |
      | `/docker/nzbfast/watch`       | `/watch`                |
 
+     Running Sonarr or Radarr? Replace the `downloads` row per
+     [Sonarr and Radarr: where downloads have to live](#sonarr-and-radarr-where-downloads-have-to-live).
+
    - **Environment:** nothing to add. Because you made the folders
      yourself, nzbfast takes its user and group from them. `TZ` is not
      needed either - times are stored as UTC and displayed in your
      browser's timezone.
 
-4. **Run it**, then jump to [First run](#first-run-add-your-provider).
+4. **Run it**, then jump to [First run](#first-run---add-your-provider).
 
 ---
 
@@ -221,14 +237,69 @@ folder, and it downloads.
 
 ---
 
+## Sonarr and Radarr: where downloads have to live
+
+Skip this if you do not run them.
+
+When an \*arr imports a finished download it either **renames** the files
+into your library, which is instant and costs no extra disk, or **copies**
+them and deletes the original, which on NAS hardware is the slowest thing
+in the chain. Which one you get is decided entirely by where the downloads
+sat, and Docker decides it more bluntly than the disk does: two separate
+mounts look like two filesystems to a container even when they are one
+volume underneath.
+
+So put both under one shared folder. If your library lives in a shared
+folder called `data`, make the tree:
+
+```
+/volume1/data/usenet     ← nzbfast downloads here
+/volume1/data/media      ← your Sonarr/Radarr library
+```
+
+Then mount it into nzbfast **at the same path on both sides**:
+
+| Folder (on your NAS) | Mount path in container |
+| -------------------- | ----------------------- |
+| `/volume1/data/usenet` | `/volume1/data/usenet`  |
+
+and add one environment variable, `NZBFAST_OUT` = `/volume1/data/usenet`.
+In the compose file that is `- /volume1/data/usenet:/volume1/data/usenet`
+under `volumes:` in place of the downloads line, and
+`- NZBFAST_OUT=/volume1/data/usenet` under `environment:`.
+
+**Both halves matter.** The shared root is what makes the import a rename.
+The identical path is what makes it happen at all: nzbfast tells your \*arr
+where a finished job is, so that path has to mean the same thing inside
+their container as it does inside nzbfast's. Map it somewhere else and the
+download simply sits in the queue while the \*arr reports a remote path
+mapping error, with nothing actually wrong with the files.
+
+Give nzbfast `usenet` only, not the whole `data` folder. It has no business
+in your library, and the rename still works, because it is your \*arr that
+moves the files and it can see both sides.
+
+There is **no `incomplete` folder** to make. SABnzbd needs one because it
+writes there and moves everything across when a job finishes. nzbfast
+writes at the final path from the first article on, so there is nothing to
+move - a SAB migrant has two filesystem boundaries to get right here and
+you have exactly one. The flip side: a folder holding finished downloads
+also holds in-progress ones while they run. That is harmless, because the
+\*arrs import on the API's job state rather than by watching the folder.
+
+If you would rather follow a guide written for DSM specifically, TRaSH
+keep one: <https://trash-guides.info/Hardlinks/How-to-setup-for/Synology/>
+
+---
+
 ## Connecting Sonarr / Radarr / Prowlarr
 
-nzbfast speaks the SABnzbd API. In your *arr app, add a **SABnzbd**
+nzbfast speaks the SABnzbd API. In your \*arr app, add a **SABnzbd**
 download client:
 
 - **Host:** your NAS IP  **Port:** `6789`
 - **API Key:** the same key you typed into the dashboard - the generated
-  one from [First run](#first-run-add-your-provider), or whatever you set
+  one from [First run](#first-run---add-your-provider), or whatever you set
   as `NZBFAST_APIKEY` on the container (Environment tab, or the commented
   line in the compose file).
 

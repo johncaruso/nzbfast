@@ -72,6 +72,9 @@ pub struct ServeOpts {
     pub library_recheck_secs: u64,
     /// Pause new jobs while free space on out_root is below this (bytes).
     pub min_free: Option<u64>,
+    /// Permissions for finished downloads, as a umask (#20). None =
+    /// off, which is the default and today's behaviour.
+    pub out_umask: Option<u32>,
     /// M32: minutes before the one automatic retry of a job that failed
     /// with missing articles (0 = off; default 20).
     pub auto_retry_mins: u64,
@@ -769,6 +772,42 @@ fn is_kind_slug(k: &str) -> bool {
 /// Parse "500M"/"10G"/"1.5T" (SAB-style size strings) to bytes.
 pub fn parse_size(s: &str) -> Option<u64> {
     let s = s.trim();
+    // BITS when the user says bits, and this is not a nicety: every ISP
+    // on earth advertises a line in megaBITS, so "900M" in the Line
+    // speed box is what a person with a 900 Mbps connection types - and
+    // it was read as 900 MB/s, eight times their actual line. The tuner
+    // then scored a perfectly good 37 MB/s as "4% of your line" (field
+    // report, 4 Aug).
+    //
+    // Nothing existing changes meaning: every suffixed form below is
+    // REJECTED by this function today (only a bare 900M or 1G parses at
+    // all), so this can only turn a refusal into a number. A bare
+    // magnitude stays BYTES, because that is what it has always meant
+    // here and 29 call sites depend on it - the disk and cache settings
+    // are not secretly about bits.
+    let s = s
+        .strip_suffix("/s")
+        .or_else(|| s.strip_suffix("/S"))
+        .unwrap_or(s)
+        .trim_end();
+    // Case matters exactly where the convention says it does: `b` is
+    // bits, `B` is bytes. The spelled-out forms are case-insensitive
+    // because nobody typing "Mbps" means anything else.
+    let lower = s.to_ascii_lowercase();
+    let (s, bits) = if let Some(rest) = lower
+        .strip_suffix("bits")
+        .or_else(|| lower.strip_suffix("bit"))
+        .or_else(|| lower.strip_suffix("bps"))
+    {
+        (&s[..rest.len()], true)
+    } else if let Some(rest) = s.strip_suffix('b') {
+        (rest, true)
+    } else if let Some(rest) = s.strip_suffix('B') {
+        (rest, false)
+    } else {
+        (s, false)
+    };
+    let s = s.trim_end();
     let (num, mult) = match s.chars().last()? {
         'k' | 'K' => (&s[..s.len() - 1], 1e3),
         'm' | 'M' => (&s[..s.len() - 1], 1e6),
@@ -777,7 +816,8 @@ pub fn parse_size(s: &str) -> Option<u64> {
         _ => (s, 1.0),
     };
     let v: f64 = num.trim().parse().ok()?;
-    (v >= 0.0).then_some((v * mult) as u64)
+    let bytes = if bits { v * mult / 8.0 } else { v * mult };
+    (v >= 0.0).then_some(bytes as u64)
 }
 
 /// (free, total) bytes of the filesystem holding `path`.
@@ -1096,6 +1136,20 @@ fn apply_saved_settings(opts: &mut ServeOpts, path: &std::path::Path) {
     }
     if let Some(v) = n("auto_retry_mins") {
         opts.auto_retry_mins = v;
+    }
+    // Stored as the octal STRING the user typed ("002"), because that is
+    // what every guide about this prints and what the field shows back.
+    // Parsed here exactly as the settings writer parses it; anything else
+    // is ignored and the install keeps its current behaviour rather than
+    // silently adopting a mode nobody chose.
+    if let Some(v) = s("out_umask") {
+        opts.out_umask = if v.trim().is_empty() {
+            None
+        } else {
+            u32::from_str_radix(v.trim(), 8)
+                .ok()
+                .filter(|m| *m <= 0o777)
+        };
     }
     if let Some(v) = b("preflight") {
         opts.preflight = v;
@@ -2448,15 +2502,27 @@ fn watchlist_pass(d: &Arc<Daemon>) {
                 // the superseded copy finished later and its files sat on
                 // disk forever with nothing reporting it. Keep the entry
                 // and settle it on a later pass instead.
-                let old_downloading = d.queue.lock_ok().iter().any(|j| {
+                // `finalizing` is live for the same reason Downloading
+                // is, and it is NOT covered by it: a Completed job whose
+                // post-processing (unlock, rename, TV filing, NAS move)
+                // is still running has already left Downloading, so this
+                // took the delete path below and removed the files out
+                // from under the mover - half-deleting a tree it was
+                // reading, or deleting the emptied source while the
+                // payload sat at the destination with no record left to
+                // delete it by. The queue-delete path has had this
+                // deferral since the 3 Aug sweep; watch settlement
+                // walked straight past it. Settle on a later pass, the
+                // way a still-downloading predecessor already does.
+                let old_busy = d.queue.lock_ok().iter().any(|j| {
                     let g = j.lock_ok();
-                    g.nzo_id == p.old_nzo && g.state == JobState::Downloading
+                    g.nzo_id == p.old_nzo && (g.state == JobState::Downloading || g.finalizing)
                 });
-                if old_downloading {
+                if old_busy {
                     info!(
                         target: "watch",
                         "upgrade landed, but the superseded {} is still \
-                         downloading - deleting it once it settles",
+                         downloading or being unpacked - deleting it once it settles",
                         p.prev_stem
                     );
                     state.pending.push(p);
@@ -2466,7 +2532,7 @@ fn watchlist_pass(d: &Arc<Daemon>) {
                     let mut q = d.queue.lock_ok();
                     let pos = q.iter().position(|j| {
                         let g = j.lock_ok();
-                        g.nzo_id == p.old_nzo && g.state != JobState::Downloading
+                        g.nzo_id == p.old_nzo && g.state != JobState::Downloading && !g.finalizing
                     });
                     pos.and_then(|i| q.remove(i))
                 };
@@ -2504,6 +2570,19 @@ fn watchlist_pass(d: &Arc<Daemon>) {
                     .iter()
                     .find(|j| j.lock_ok().nzo_id == p.old_nzo)
                     .cloned();
+                // A history row can be busy too: a password unlock marks
+                // the record `finalizing` while it extracts, renames and
+                // moves on disk. Same deferral as the queue side above.
+                if old.as_ref().is_some_and(|j| j.lock_ok().finalizing) {
+                    info!(
+                        target: "watch",
+                        "upgrade landed, but the superseded {} is being unlocked - \
+                         deleting it once it settles",
+                        p.prev_stem
+                    );
+                    state.pending.push(p);
+                    continue;
+                }
                 if let Some(job) = old {
                     let (dir, nzb, name, filed, tail) = {
                         let g = job.lock_ok();
@@ -2529,20 +2608,23 @@ fn watchlist_pass(d: &Arc<Daemon>) {
                         .unwrap()
                         .retain(|j| j.lock_ok().nzo_id != p.old_nzo);
                     d.save_queue();
-                    // Read AFTER the delete, so a Trash that latched
-                    // unresponsive during it reports "deleted", never a
-                    // Trash that was not really used. The third state is
-                    // the other half of the same rule: a refused delete
-                    // leaves the files where they are, so neither "went to
-                    // the Trash" (they are not in it) nor "was deleted"
-                    // (it was not) is true of them.
-                    let fate = if !outcome.gone() {
-                        "kept"
-                    } else if crate::smart::delete_to_trash() && !crate::smart::trash_unresponsive()
-                    {
-                        "trash"
-                    } else {
-                        "gone"
+                    // Asked of the REMOVAL, not of the settings. This
+                    // read the two globals and inferred a fate from them,
+                    // which is a promise the globals cannot make: on 4 Aug
+                    // a 14 GB download was reported "went to the Trash" -
+                    // the setting was on, nothing had latched
+                    // unresponsive - while it had been destroyed outright,
+                    // because the backend returned Ok on a volume whose
+                    // Trash is not usable. `Removed::Trashed` is now only
+                    // reported when the file was FOUND in a Trash
+                    // afterwards, so "trash" here is a checked claim.
+                    // A refused delete is the third state: the files are
+                    // still there, so neither "went to the Trash" nor
+                    // "was deleted" is true of them.
+                    let fate = match &outcome {
+                        FilesGone::Kept(_) => "kept",
+                        FilesGone::Yes(crate::smart::Removed::Trashed) => "trash",
+                        FilesGone::Yes(crate::smart::Removed::Gone) => "gone",
                     };
                     info!(
                         target: "watch",
@@ -3538,6 +3620,17 @@ fn normalized_server(
                 .map_or(8, |c| c.clamp(1, 999))
         ),
     );
+    // Absent means false, and the key is dropped rather than written
+    // false: this file is hand-edited by people, and a lock the user
+    // never asked for should not appear in it.
+    match incoming.get("pin_connections").and_then(Value::as_bool) {
+        Some(true) => {
+            ob.insert("pin_connections".into(), json!(true));
+        }
+        _ => {
+            ob.remove("pin_connections");
+        }
+    }
     for key in ["username", "group"] {
         match incoming.get(key).and_then(Value::as_str).map(str::trim) {
             Some("") => {
@@ -3767,6 +3860,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
         fast_verify,
         verify_lean,
         min_free,
+        out_umask,
         auto_retry_mins,
         preflight,
         quota,
@@ -3999,10 +4093,12 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
         auto_speed: std::sync::atomic::AtomicBool::new(auto_speed),
         preflight: std::sync::atomic::AtomicBool::new(preflight),
         auto_connections: std::sync::atomic::AtomicBool::new(true),
+        wall_hide_adult: std::sync::atomic::AtomicBool::new(true),
         auto_defer: std::sync::atomic::AtomicBool::new(true),
         post_health: std::sync::atomic::AtomicBool::new(true),
         post_health_defer: std::sync::atomic::AtomicBool::new(false),
         auto_prefetch: std::sync::atomic::AtomicBool::new(true),
+        race_stragglers: std::sync::atomic::AtomicBool::new(true),
         oracle_route: std::sync::atomic::AtomicBool::new(false),
         index_deepen: AtomicU64::new(200_000),
         index_coverage: std::sync::atomic::AtomicBool::new(true),
@@ -4044,6 +4140,9 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
         nzblnk_recent: Mutex::new(std::collections::VecDeque::new()),
         smart_folders: Mutex::new(Vec::new()),
         par_cleanup: AtomicBool::new(true),
+        // OFF unless asked for: an install that says nothing keeps
+        // exactly the modes it has today (#20).
+        out_umask: std::sync::atomic::AtomicU32::new(out_umask.unwrap_or(u32::MAX)),
         fast_par: AtomicBool::new(FAST_PAR_DEFAULT),
         prefer_external_unrar: AtomicBool::new(false),
         cleanup_exts: Mutex::new(Vec::new()),
@@ -4076,6 +4175,11 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
         rename_episode_titles: std::sync::atomic::AtomicBool::new(false),
         history_rows: AtomicU64::new(10),
         history_color_names: std::sync::atomic::AtomicBool::new(true),
+        ladder_live: Mutex::new(None),
+        ladder_busy: std::sync::atomic::AtomicBool::new(false),
+        ladder_cancel: std::sync::atomic::AtomicBool::new(false),
+        media_chip_color: std::sync::atomic::AtomicBool::new(true),
+        shape_chip_color: std::sync::atomic::AtomicBool::new(true),
         rename_junk: std::sync::atomic::AtomicBool::new(true),
         rename_media_only: std::sync::atomic::AtomicBool::new(false),
         index_max_age_secs: AtomicU64::new(index_max_age_secs),
@@ -4575,8 +4679,22 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                 Err(e) => warn!(target: "giveup", "ignoring {}: {e}", giveup_path.display()),
             }
         }
+        // The kept-files notices outlive the process on purpose: each one
+        // names a folder whose history row is gone, so losing them at a
+        // restart leaves the payload on disk with nothing anywhere
+        // pointing at it. See `Daemon::save_delete_kept`.
+        let kept_path = daemon.spool.join("delete-kept.json");
+        if let Some(v) = crate::persist::load_json_with_backup(&kept_path) {
+            match serde_json::from_value(v) {
+                Ok(k) => *daemon.delete_kept.lock_ok() = k,
+                Err(e) => warn!(target: "queue", "ignoring {}: {e}", kept_path.display()),
+            }
+        }
         if let Some(v) = saved.get("ui_locale").and_then(Value::as_str) {
             *daemon.ui_locale.lock_ok() = v.to_string();
+        }
+        if let Some(v) = saved.get("wall_hide_adult").and_then(Value::as_bool) {
+            daemon.wall_hide_adult.store(v, Ordering::Relaxed);
         }
         if let Some(v) = saved.get("auto_connections").and_then(Value::as_bool) {
             daemon.auto_connections.store(v, Ordering::Relaxed);
@@ -4597,6 +4715,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
             daemon.oracle_route.store(v, Ordering::Relaxed);
         }
         for (key, field) in [
+            ("race_stragglers", &daemon.race_stragglers),
             ("auto_rename", &daemon.auto_rename),
             ("identity_lookup", &daemon.identity_lookup),
             ("rename_resolution", &daemon.rename_resolution),
@@ -4610,6 +4729,8 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
             ("rename_identify", &daemon.rename_identify),
             ("rename_episode_titles", &daemon.rename_episode_titles),
             ("history_color_names", &daemon.history_color_names),
+            ("media_chip_color", &daemon.media_chip_color),
+            ("shape_chip_color", &daemon.shape_chip_color),
             ("rename_junk", &daemon.rename_junk),
             ("rename_media_only", &daemon.rename_media_only),
         ] {
@@ -5554,10 +5675,35 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                             // The name is the poster's text: keep it a
                             // single header-safe token so it cannot
                             // smuggle a quote or CR/LF into the header.
+                            //
+                            // ASCII-only, and that is load-bearing rather
+                            // than tidiness: tiny_http header values are
+                            // `AsciiString`, so `Header::from_bytes` REFUSES
+                            // any byte >= 0x80 and the `.unwrap()` below
+                            // panics. `sanitize_filename` maps separators and
+                            // control chars and passes everything else
+                            // through, so an accented or CJK release name -
+                            // "Amélie.2001.1080p" - reached it intact and
+                            // killed this worker thread for the life of the
+                            // process. There is no catch_unwind around the
+                            // worker loop, so a handful of such clicks take
+                            // the whole HTTP surface down until a restart.
                             let fname: String = nzbkit::disk::sanitize_filename(&name)
                                 .chars()
+                                .map(|c| if c.is_ascii() { c } else { '_' })
                                 .filter(|c| !c.is_control() && *c != '"')
                                 .collect();
+                            // Every char can legitimately filter out (a name
+                            // that was entirely non-ASCII collapses to
+                            // underscores, but a name of only quotes does
+                            // not), and an empty filename is a malformed
+                            // header rather than a panic - still worth not
+                            // emitting.
+                            let fname = if fname.trim().is_empty() {
+                                "download".to_string()
+                            } else {
+                                fname
+                            };
                             let _ = req.respond(
                                 tiny_http::Response::from_data(bytes)
                                     .with_header(
@@ -5684,7 +5830,10 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                             }
                             None if form_body => {
                                 if let Ok(s) = std::str::from_utf8(&raw) {
-                                    for (k, v) in parse_query(s) {
+                                    // Bounded: this runs pre-auth on a body
+                                    // of up to 256 MiB, exactly like the
+                                    // multipart arm above.
+                                    for (k, v) in parse_form_body(s) {
                                         params.entry(k).or_insert(v);
                                     }
                                 }
@@ -5773,13 +5922,22 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                     && cur_nzbkey
                         .as_deref()
                         .is_some_and(|k| given.is_some_and(|g| ct_eq(g, k)));
-                let authed = full
-                    || version_probe
-                    || (add_only
-                        && cur_nzbkey
-                            .as_deref()
-                            .is_some_and(|k| given.is_some_and(|g| ct_eq(g, k))))
-                    || bootstrap_apikey;
+                // Authorized by the ADD-ONLY key rather than the full one.
+                // The allowlist's contract is explicit that "queue/history
+                // contents, config and every mutation stay full-key", and
+                // two of the allowed reads quietly broke it: `status` and
+                // `fullstatus` carry `complete_dir`, and their warnings
+                // list names up to five queued releases waiting on a
+                // password. Handlers need to know which credential got
+                // them here to keep that promise - and `full` first, so a
+                // real API key is never demoted by the mode it happens to
+                // be calling.
+                let via_add_only = !full
+                    && add_only
+                    && cur_nzbkey
+                        .as_deref()
+                        .is_some_and(|k| given.is_some_and(|g| ct_eq(g, k)));
+                let authed = full || version_probe || via_add_only || bootstrap_apikey;
                 if !authed {
                     // Accounted like every other credentialed door (/m3u, /watch,
                     // /newznab, /getnzb, /stream, /jsonrpc all do this): the key
@@ -5865,6 +6023,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                     key_q: &key_q,
                     tmdb_key: &tmdb_key,
                     bootstrap_apikey,
+                    via_add_only,
                 };
                 let body = api::dispatch(&d, &mut req, &params, &mode, &ctx, &mut api_body)
                     .unwrap_or_else(
@@ -6009,6 +6168,38 @@ fn parse_query(q: &str) -> std::collections::HashMap<String, String> {
             Some((k.to_string(), urldecode(v)))
         })
         .collect()
+}
+
+/// [`parse_query`] for a REQUEST BODY, bounded the way `multipart_fields`
+/// is and for exactly the same reason.
+///
+/// A query string is bounded by tiny_http's header limit before it ever
+/// reaches `parse_query`. A body is not: the /api pre-drain reads up to
+/// `API_BODY_MAX` (256 MiB) BEFORE authenticating, so a form of that size
+/// full of tiny `k=` pairs turned into tens of millions of live `String`
+/// allocations - several GB of resident set, from an unauthenticated
+/// request, decided long before the 403. The multipart sibling has
+/// carried these two caps since it was written; the form path beside it
+/// never got them.
+///
+/// Same figures as `multipart_fields`: 256 fields, 4096 bytes a value.
+/// Every real caller is far inside both - the largest legitimate body
+/// field is an NZB, which arrives as a multipart FILE part, not here.
+fn parse_form_body(q: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for kv in q.split('&') {
+        if out.len() >= 256 {
+            break;
+        }
+        let Some((k, v)) = kv.split_once('=') else {
+            continue;
+        };
+        if k.is_empty() || k.len() > 256 || v.len() > 4096 {
+            continue;
+        }
+        out.push((k.to_string(), urldecode(v)));
+    }
+    out
 }
 
 fn urldecode(s: &str) -> String {
@@ -6202,7 +6393,28 @@ fn valid_boundary(b: &str) -> bool {
 /// at the source means no caller can forget to.
 fn multipart_boundary(ctype: &str) -> Option<String> {
     let at = ctype.to_ascii_lowercase().find("boundary=")? + "boundary=".len();
-    Some(ctype[at..].trim_matches('"').to_string()).filter(|b| valid_boundary(b))
+    // The value ends at the parameter separator, not at the end of the
+    // header. Taking the rest of the line swept up whatever followed:
+    // an ordinary `boundary="----abc"; charset=UTF-8` became
+    // `----abc"; charset=UTF-8` (the leading quote trimmed, the trailing
+    // one buried mid-string), which appears nowhere in the body. The
+    // split then found no delimiter, so the upload's file part was
+    // silently dropped as "no nzb file in request" - and a caller whose
+    // apikey travelled in the body had it stop being found at all,
+    // presenting a content-type problem as an authentication failure,
+    // which is the hardest possible thing to support.
+    //
+    // Cut from the ORIGINAL, so the delimiter keeps its case; `at` is
+    // valid there because the needle is ASCII and lowercasing does not
+    // move byte offsets for it.
+    let rest = ctype[at..].trim_start();
+    let value = match rest.strip_prefix('"') {
+        // Quoted: to the closing quote. A quoted value may legally hold
+        // characters that would otherwise end the parameter.
+        Some(q) => q.split('"').next().unwrap_or_default(),
+        None => rest.split(';').next().unwrap_or_default().trim_end(),
+    };
+    Some(value.to_string()).filter(|b| valid_boundary(b))
 }
 
 fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -7612,6 +7824,38 @@ fn path_writable(p: &std::path::Path) -> bool {
     }
 }
 
+/// A move destination has to be an absolute path.
+///
+/// `create_dir_all` is perfectly happy to make a relative one, and it
+/// lands under the daemon's WORKING DIRECTORY: `/var/lib/nzbfast` under
+/// the systemd unit, the container's workdir under Docker, and wherever
+/// the launcher happened to be otherwise. Typing `movies/anime` into the
+/// settings field therefore created a real directory, passed
+/// `path_writable`, passed the `same_dir` check against the download
+/// folder, and was stored - and finished downloads were then moved into
+/// a folder the user never chose and would not think to look in.
+///
+/// Refusing is deliberately preferred over resolving it against
+/// something ourselves. Every candidate base is a guess (the download
+/// root? the config's directory? the home directory?), and a
+/// destination the user cannot predict is worse than an error that says
+/// what was expected.
+///
+/// This applies to the MOVE destinations only. `out_dir` and `watch` are
+/// left alone on purpose: both are passed relative by the CLI's own
+/// defaults (`--out downloads`, `--watch watch`), so cwd-relative is
+/// their documented behaviour rather than a trap.
+fn require_absolute_dest(p: &std::path::Path) -> Result<(), String> {
+    if p.is_absolute() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} is a relative path - give the full path to the folder, \
+         starting from the top of the drive",
+        p.display()
+    ))
+}
+
 /// M33 v2: parse the per-category destination list ("tv=/NAS/TV,
 /// movies=/NAS/Movies"; comma or semicolon separated; empty = none).
 /// Category names get the same sanitizing the enqueue path applies, so
@@ -7974,6 +8218,20 @@ fn history_change_cat(d: &Daemon, id: &str, cat: &str) -> Value {
         g.category = cat.to_string();
         if let Some(p) = &moved {
             g.out_dir = p.clone();
+        }
+        // UX §18: a recategorize that stopped part way leaves the
+        // payload in two directories, and `out_dir` has just followed
+        // the bytes that made it. The error below tells whoever pressed
+        // the button, once - it was the ONLY witness, and it does not
+        // survive a page reload. Record the source the way the
+        // completion path records it, so the row keeps warning and a
+        // later delete has something to reach the other half by.
+        //
+        // SET, never cleared: a job that was already split by its
+        // completion move still is - this relocation only touched
+        // `out_dir`, and the source half it knows about is untouched.
+        if split_error.is_some() {
+            g.move_split = out_dir.to_string_lossy().to_string();
         }
     }
     d.register_cat(cat);
@@ -8480,6 +8738,45 @@ fn offline_pause_transition(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A line is advertised in megaBITS everywhere on earth, so "900M"
+    /// in the Line speed box is what a person on a 900 Mbps connection
+    /// types - and reading it as 900 MB/s made their line eight times
+    /// bigger than it is, which is how a healthy 37 MB/s got scored as
+    /// "4% of your line".
+    #[test]
+    fn bit_units_are_bits_and_byte_units_are_bytes() {
+        // 900 Mbps = 112.5 MB/s, however it is spelled.
+        for s in [
+            "900Mb", "900Mbit", "900Mbits", "900Mbps", "900mbps", "900 Mbps", "900Mb/s",
+        ] {
+            assert_eq!(parse_size(s), Some(112_500_000), "{s}");
+        }
+        assert_eq!(parse_size("1Gbps"), Some(125_000_000));
+        // Explicit bytes stay bytes...
+        assert_eq!(parse_size("900MB"), Some(900_000_000));
+        assert_eq!(parse_size("112MB/s"), Some(112_000_000));
+        // ...and so does a bare magnitude. 29 call sites read disk and
+        // cache sizes through this; they are not secretly about bits.
+        assert_eq!(parse_size("900M"), Some(900_000_000));
+        assert_eq!(parse_size("1G"), Some(1_000_000_000));
+        assert_eq!(parse_size("4096"), Some(4096));
+    }
+
+    /// Nothing that parsed before parses differently now. Every suffixed
+    /// form was REJECTED by this function, so the change can only turn a
+    /// refusal into a number - which is what made it safe to land
+    /// against a parser this widely used.
+    #[test]
+    fn the_old_accepted_forms_are_untouched() {
+        assert_eq!(parse_size("0"), Some(0));
+        assert_eq!(parse_size("10G"), Some(10_000_000_000));
+        assert_eq!(parse_size("4M"), Some(4_000_000));
+        assert_eq!(parse_size("  2K  "), Some(2_000));
+        assert_eq!(parse_size("who knows"), None);
+        assert_eq!(parse_size(""), None);
+        assert_eq!(parse_size("-5M"), None);
+    }
 
     /// SAB's `nzo_ids` selector: named ids bypass the start/limit
     /// window entirely (Sonarr reconciles weeks-old downloads by id -
@@ -10057,6 +10354,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// UX §18 + the filed flag, together: a split payload's SOURCE side
+    /// obeys `Job::filed` exactly as its destination does.
+    ///
+    /// `relocate_completed` moves a TV-filed job OUT of the shared
+    /// season folder (its own `same_place` comment says so), so a move
+    /// that fails part way records that shared folder as `move_split`.
+    /// The history delete now removes both halves - and it reads the
+    /// flag for both. Passing `false` for the source instead, on the
+    /// reasoning that a split source "is always a job-owned folder",
+    /// would hand a whole season of the user's episodes to
+    /// `remove_user_dir` on one episode's delete.
+    #[test]
+    fn a_split_source_that_is_a_season_folder_is_deleted_narrowly() {
+        let root = std::env::temp_dir().join(format!("nzbfast-splitfiled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // The SOURCE half of a split move: a shared season folder still
+        // holding this episode and two siblings that are nothing to do
+        // with the job being deleted.
+        let season = root.join("Show").join("Season 01");
+        std::fs::create_dir_all(&season).unwrap();
+        for ep in ["Show.S01E01.mkv", "Show.S01E02.mkv", "Show.S01E03.mkv"] {
+            std::fs::write(season.join(ep), b"x").unwrap();
+        }
+        super::remove_job_files(
+            &season,
+            "Show.S01E01.1080p",
+            true,
+            &crate::smart::FiledTail::default(),
+        );
+        assert!(
+            season.join("Show.S01E02.mkv").exists() && season.join("Show.S01E03.mkv").exists(),
+            "deleting one episode took its siblings from the split SOURCE folder"
+        );
+        assert!(
+            season.exists(),
+            "the shared season folder itself must survive"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A recoverable delete the Trash refuses must LEAVE the download and
     /// hand the reason back, both arms of it.
     ///
@@ -10108,7 +10445,7 @@ mod tests {
                     !why.is_empty(),
                     "{what}: the refusal has to carry a reason to show"
                 ),
-                FilesGone::Yes => panic!("{what}: a refused delete reported success"),
+                FilesGone::Yes(_) => panic!("{what}: a refused delete reported success"),
             }
         }
         let _ = std::fs::remove_dir_all(&root);
@@ -11147,6 +11484,30 @@ mod tests {
         assert_eq!(
             unpack_space_needed(0, 13_850 * 1_000_000, "rar5 encrypted unlock-at-end"),
             27_700 * 1_000_000
+        );
+        // A NESTED set materializes one more layer than it looks: the
+        // outer volumes stay on disk, level 0's output IS the inner
+        // archive, and level 1's is the payload. So a fully-downloaded
+        // 20 GB nested set needs the payload AND the intermediate, where
+        // this used to promise only the payload - and the job then hit
+        // ENOSPC at the second level with the whole download paid for.
+        assert_eq!(
+            unpack_space_needed(0, 20 * GB, "rar5 store on-disk inner-rar"),
+            40 * GB
+        );
+        assert_eq!(
+            unpack_space_needed(0, 20 * GB, "rar5 store on-disk inner-7z"),
+            40 * GB
+        );
+        // Encrypted AND nested pays for both.
+        assert_eq!(
+            unpack_space_needed(0, 10 * GB, "rar5 encrypted on-disk inner-rar"),
+            30 * GB
+        );
+        // The plain set beside them is untouched: whole tokens only.
+        assert_eq!(
+            unpack_space_needed(0, 20 * GB, "rar5 store on-disk"),
+            20 * GB
         );
         // Which shapes get a forecast at all: the ones that materialize.
         assert!(shape_unpacks_on_disk("rar5 store encrypted on-disk"));

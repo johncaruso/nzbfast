@@ -808,6 +808,25 @@ sıralama/duraklat/sil ile kuyruk, geçmiş, NZB ekle, hız sınırı, duraklat/
 ve duvarın bir dokunmatik düzeni vardır. Ayarlar → Uzaktan erişim paneli tam URL'leri ve
 taranacak bir QR kodu gösterir.</p>
 
+<h3 id="remote-proxy">nzbfast'e ev dışından erişmek</h3>
+<p>Oturum açma sayfası yok, bu bilinçli bir tercih. Oturum çerezine dayalı bir giriş, sonsuza kadar bakımı gereken bir güvenlik yüzeyidir ve açık internete bakan bir şeyin yine de en zayıf kilidi olurdu. nzbfast bunun yerine API anahtarınızla kimlik doğrular ve bu anahtarı URL'de olduğu kadar bir istek başlığında da kabul eder (<code>X-Api-Key</code> veya <code>Authorization: Bearer</code>) - önüne konan bir şeyin girişi düzgün biçimde üstlenmesini sağlayan da tam olarak budur.</p>
+<p><b>En basit yanıt onu hiç yayımlamamaktır.</b> Bu makineye ve telefonunuza <b>Tailscale</b> kurun, ikisi de aynı özel ağa katılsın: hiçbir şey dışa açılmaz, yönlendirici ya da sertifika işi gerekmez ve Ayarlar → Uzaktan erişim, Tailscale'i çalışır görür görmez her yerden çalışan bir adres gösterir. Açıkça bir genel alan adına ihtiyacınız yoksa bunu tercih edin.</p>
+<p><b>Gerçekten gerekiyorsa</b>, önüne bir ters vekil sunucu koyun, sertifikayı ona verin ve kimlik doğrulamayı o yapsın. nzbfast'i <code>--bind 127.0.0.1</code> ile başlatın ki tek giriş vekil sunucu olsun ve vekil sunucuyu <code>http://127.0.0.1:6789</code> adresine yönlendirin:</p>
+<pre><code># Caddy
+example.com {
+    reverse_proxy 127.0.0.1:6789
+}
+
+# nginx
+location / {
+    proxy_pass http://127.0.0.1:6789;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}</code></pre>
+<p>Üstüne vekil sunucunuzun sunduğunu ekleyin: basic auth, Authelia veya Authentik gibi bir forward-auth hizmeti ya da istemci sertifikaları. Bir ayrıntı herkesi yakalar - Sonarr, Radarr ve telefon uygulamaları tarayıcı girişini tamamlayamaz, bu yüzden onlara bir geçiş bırakın. Çoğu vekil sunucu, geçerli bir <code>X-Api-Key</code> başlığı taşıyan isteği geçirip diğer her şeyden kimlik doğrulama isteyebilir.</p>
+<div class="warn-box"><b>6789 numaralı bağlantı noktasını yönlendiricinizde öylece açmayın.</b> Panel düz HTTP konuşur; API anahtarınız ve onunla yaptığınız her şey, yol üzerindeki herkesin okuyabileceği biçimde internetten geçerdi ve hiç anahtar ayarlanmamış bir kurulum onu bulan herkese açıktır. Yine de bir bağlantı noktası yönlendirecekseniz, önce bir API anahtarı belirleyin.</div>
+
 <h2 id="performance">13 · Performans araçları</h2>
 <h3 id="perf-benchmark">Sistem kıyaslaması</h3>
 <p>Tek tık üç tavanını ölçer - ağ verimi (gerçek 8 saniyelik çok bağlantılı bir sonda),
@@ -1053,6 +1072,7 @@ kendiliğinden düzelir.</td></tr>
 <tr><td>Ağdaki hiçbir şey arka plan sürecine erişemiyor</td><td><code>--bind</code>'ı denetle: <code>127.0.0.1</code> yalnızca nzbfast'in çalıştığı makineye hizmet eder. Varsayılan olan <code>0.0.0.0</code> her arayüze hizmet eder. Sonra makinenin kendi güvenlik duvarını 6789 portu için denetle.</td></tr>
 <tr><td>Göz at kartı küçük kalıyor</td><td>Dizinleyici arka planda büyür - Ayarlar → Dizinleme gruplarının ayarlı olduğunu denetle ve Tarama başına derinleştir'e geçmiş biriktirmesi için zaman ver. "Şimdi tara" bir geçişi zorlar; durum satırı canlı ilerlemeyi gösterir.</td></tr>
 <tr><td>Duvar yanlış/görselsiz gösteriyor</td><td>Ayrıntı sayfası → ✎ Eşleşmeyi düzelt ya da ↻ Meta veriyi yenile. Film aramaları ücretsiz bir OMDb anahtarıyla iyileşir.</td></tr>
+<tr id="mac-cant-open"><td>macOS "nzbfast" uygulamasının açılamadığını söylüyor</td><td>İki nedeni var, ikisi de hızlı çözülür. Sade <code>-macos-universal.zip</code> paketini kullanıyorsan, yanındaki <code>nzbfast</code> dosyasına değil <b>Start nzbfast.command</b> dosyasına çift tıkla: o dosya programın kendisi ve Finder ona yapılan çift tıklamaya tam olarak bu mesajla karşılık verir. Her şeyi hazırlayıp başlatan şey başlatıcıdır. Başlatıcı da aynı mesajı veriyorsa, kopya yolda Unix çalıştırma bitini kaybetmiştir: macOS bu biti .zip dosyasının içinde saklar, ama sohbet uygulamaları, bulut sürücüleri ve yeniden sıkıştırma saklamaz, bu yüzden elden ele geçen bir kopya çalıştırılamaz halde gelir. .dmg veya .zip dosyasını doğrudan releases sayfasından indir, o zaman bu olmaz. Elindeki kopyayı kurtarmak için: Terminal'i aç, sonuna bir boşluk koyarak <code>chmod +x</code> yaz, <b>Start nzbfast.command</b> ve <code>nzbfast</code> dosyasını pencereye sürükle ve Return'e bas, sonra başlatıcıya yeniden çift tıkla.</td></tr>
 <tr><td>Arka plan süreci başlamıyor: port kullanımda</td><td>Başka bir örnek çalışıyor - ya da <code>--port</code>'u değiştir.</td></tr>
 <tr><td>Günlükler nerede?</td><td>Paneldeki Günlük kartı ya da <code>serve</code>'ü başlattığın terminal/günlük dosyası.</td></tr>
 </table></div>
