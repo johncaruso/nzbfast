@@ -924,6 +924,17 @@ const JUNK_EXTS: &[&str] = &[
     "website",
 ];
 
+/// Is this extension Usenet furniture rather than payload?
+///
+/// The one reader of [`JUNK_EXTS`] outside this module is the post-drain
+/// census (issue #23): a metadata file the recovery set does not cover
+/// must not fail a download whose payload is whole. Exposed as a
+/// predicate rather than the list so the exclusions that make the list
+/// safe - archives and executables are NOT here - travel with it.
+pub fn is_junk_ext(ext: &str) -> bool {
+    JUNK_EXTS.contains(&ext)
+}
+
 fn ext_of(p: &Path) -> String {
     p.extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
@@ -1753,9 +1764,16 @@ fn trash_delete_bounded(path: &Path) -> Result<(), String> {
     // making this block the tail expression - a `return` here trips
     // clippy's needless_return on the Linux CI runner, the only clippy
     // that ever compiles this arm.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "android", target_os = "ios")))]
     {
         trash::delete(path).map_err(|e| e.to_string())
+    }
+    // Android and iOS have no system trash; refuse and the file stays,
+    // exactly like the other platforms when their routes are spent.
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let _ = path;
+        Err("no system trash on this platform".to_string())
     }
     #[cfg(target_os = "macos")]
     {
@@ -1966,12 +1984,39 @@ fn trash_answered() -> bool {
 /// inside another test's delete: `a_junk_delete_is_recoverable_and_the_
 /// opt_out_is_not` then finds its fixture hard-deleted rather than binned.
 /// Lives out here, not in one test module, because both of them need it.
+///
+/// A writer excluding only other writers was not enough: every delete in
+/// the suite READS these globals (`delete_to_trash` at its entry, the
+/// latch inside the gate), so a delete-asserting test that overlapped a
+/// writer's window saw `TRASH` on and its delete came back refused - the
+/// file it asserted gone was still there, roughly one full-suite run in
+/// four. Worse, a reader that caught the window made a REAL Trash call,
+/// which set `TRASH_ANSWERED` under nobody's lock and broke
+/// `concurrent_callers_probe_a_dead_trash_only_once` from across the
+/// module. So this is a reader-writer lock: flag-writing tests take the
+/// write side, and every test whose delete reads the flags holds
+/// [`trash_globals_steady`] across the delete and its asserts - shared
+/// among themselves, exclusive against any writer.
 #[cfg(test)]
-pub(crate) fn one_trash_test_at_a_time() -> std::sync::MutexGuard<'static, ()> {
-    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn trash_globals_lock() -> &'static std::sync::RwLock<()> {
+    static SERIAL: std::sync::RwLock<()> = std::sync::RwLock::new(());
+    &SERIAL
+}
+
+/// Exclusive side, for tests that WRITE the trash globals.
+#[cfg(test)]
+pub(crate) fn one_trash_test_at_a_time() -> std::sync::RwLockWriteGuard<'static, ()> {
     // Poison is nothing here: each test sets the flags it cares about on
     // the way in, so a panicking predecessor leaves nothing to inherit.
-    SERIAL.lock_ok()
+    crate::RwLockExt::write_ok(trash_globals_lock())
+}
+
+/// Shared side, for tests whose deletes READ the trash globals: any test
+/// that asserts what a `remove_user_file`-family delete left on disk.
+/// Take it before creating fixtures and hold it past the last assert.
+#[cfg(test)]
+pub(crate) fn trash_globals_steady() -> std::sync::RwLockReadGuard<'static, ()> {
+    crate::RwLockExt::read_ok(trash_globals_lock())
 }
 
 /// Pretend every Trash route has given up, for tests that need a REFUSED
@@ -2396,6 +2441,123 @@ pub fn keep_media_only(dir: &Path) -> usize {
 /// destination. See [`move_tree`].
 static MOVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Dark knob: run the copy half of a move at background disk-I/O
+/// priority. `NZBFAST_MOVE_IOPOL=throttle|utility|off` - unset means off
+/// until the default is priced (see research/MOVE-INTERFERENCE-2026-08-05.md).
+///
+/// Only the COPY side is ever demoted. Renames are metadata and never
+/// contend with a download's writes; the clone that `std::fs::copy` makes
+/// on same-volume APFS is one too (measured: 4 GiB in 0.05 s with zero
+/// foreground impact).
+fn move_iopol() -> Option<&'static str> {
+    match std::env::var("NZBFAST_MOVE_IOPOL").ok()?.as_str() {
+        "throttle" => Some("throttle"),
+        "utility" => Some("utility"),
+        _ => None,
+    }
+}
+
+/// Lower the calling thread's disk-I/O priority while a bulk copy runs,
+/// and RESTORE it on drop: moves run on tokio's blocking pool, whose
+/// threads are reused, so a policy left set would demote whatever
+/// unrelated work lands on this thread next (a spool write, a directory
+/// sweep, another job's unlock).
+///
+/// macOS: `setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, ..)` -
+/// the mechanism Time Machine and Spotlight use, enforced in the kernel's
+/// I/O scheduler. Linux: `ioprio_set` to the idle class, best effort (it
+/// only shapes traffic under the CFQ/BFQ/mq-deadline schedulers; on none
+/// it is a no-op, which is fine for an opt-in knob). Windows: not
+/// implemented - `THREAD_MODE_BACKGROUND_BEGIN` also drops memory and
+/// scheduling priority, which is a bigger hammer than this knob promises,
+/// so it stays out until someone measures it.
+struct BackgroundIo {
+    #[cfg(target_os = "macos")]
+    prev: i32,
+    #[cfg(target_os = "linux")]
+    prev: i64,
+}
+
+#[cfg(target_os = "macos")]
+mod iopol {
+    pub const IOPOL_TYPE_DISK: i32 = 0;
+    pub const IOPOL_SCOPE_THREAD: i32 = 1;
+    pub const IOPOL_THROTTLE: i32 = 3;
+    pub const IOPOL_UTILITY: i32 = 4;
+    unsafe extern "C" {
+        pub fn getiopolicy_np(iotype: i32, scope: i32) -> i32;
+        pub fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
+    }
+}
+
+impl BackgroundIo {
+    /// Demote this thread per the knob; `None` when the knob is off (or
+    /// the platform has nothing to set), which callers hold just the same.
+    fn engage() -> Option<Self> {
+        let which = move_iopol()?;
+        #[cfg(target_os = "macos")]
+        {
+            let policy = if which == "throttle" {
+                iopol::IOPOL_THROTTLE
+            } else {
+                iopol::IOPOL_UTILITY
+            };
+            unsafe {
+                let prev = iopol::getiopolicy_np(iopol::IOPOL_TYPE_DISK, iopol::IOPOL_SCOPE_THREAD);
+                if iopol::setiopolicy_np(iopol::IOPOL_TYPE_DISK, iopol::IOPOL_SCOPE_THREAD, policy)
+                    != 0
+                {
+                    return None;
+                }
+                Some(Self { prev })
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // Both spellings demote to the idle class: Linux has no
+            // in-between the knob's two names map onto cleanly, and
+            // "utility" meaning "idle" beats the surprise of a knob that
+            // works on one platform and silently not the other.
+            let _ = which;
+            const IOPRIO_WHO_PROCESS: i64 = 1;
+            const IOPRIO_CLASS_IDLE: i64 = 3;
+            unsafe {
+                let prev = libc::syscall(libc::SYS_ioprio_get, IOPRIO_WHO_PROCESS, 0i64);
+                if libc::syscall(
+                    libc::SYS_ioprio_set,
+                    IOPRIO_WHO_PROCESS,
+                    0i64,
+                    IOPRIO_CLASS_IDLE << 13,
+                ) != 0
+                {
+                    return None;
+                }
+                Some(Self { prev })
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = which;
+            None
+        }
+    }
+}
+
+impl Drop for BackgroundIo {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            let _ =
+                iopol::setiopolicy_np(iopol::IOPOL_TYPE_DISK, iopol::IOPOL_SCOPE_THREAD, self.prev);
+        }
+        #[cfg(target_os = "linux")]
+        unsafe {
+            const IOPRIO_WHO_PROCESS: i64 = 1;
+            let _ = libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0i64, self.prev);
+        }
+    }
+}
+
 pub fn move_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)?;
@@ -2471,7 +2633,9 @@ pub fn move_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
                 // has not been touched yet at this point, so dropping our
                 // half-written copy can never cost the only copy - the file
                 // simply has not moved.
-                let copied = std::fs::copy(&from, &target).and_then(|_| sync_written_file(&target));
+                let _bg = BackgroundIo::engage();
+                let copied =
+                    copy_verified(&from, &target).and_then(|()| sync_written_file(&target));
                 if let Err(e) = copied {
                     if let Err(rm) = std::fs::remove_file(&target) {
                         // Whatever broke the copy can break the unlink too
@@ -2525,10 +2689,16 @@ fn rename_reaches(src: &Path, probe_dst: &Path) -> bool {
 /// the source whole until the destination is, so a failure costs the move
 /// and never the payload. It is the shape the spool migration already uses.
 fn staged_move(src: &Path, dst: &Path, staging: &Path) -> std::io::Result<()> {
+    // Held for the whole copy: this is the multi-GB bulk transfer that
+    // competes with a live download's write side. Dropped before the
+    // publish renames and the source drain - they are metadata and the
+    // download should not have to wait behind an idle-class unlink queue.
+    let bg = BackgroundIo::engage();
     let mut copied = std::collections::HashSet::new();
-    if let Err(e) =
-        copy_tree_into(src, staging, &mut copied).and_then(|()| publish_staged(staging, dst))
-    {
+    if let Err(e) = copy_tree_into(src, staging, &mut copied).and_then(|()| {
+        drop(bg);
+        publish_staged(staging, dst)
+    }) {
         // Nothing in `src` has been deleted, so the payload is still whole
         // where it was and the caller is right to report the move as not
         // taken. Drop what is still staged; note this cannot un-publish a
@@ -2651,12 +2821,32 @@ fn copy_tree_into(
         if is_real_dir(&from) {
             copy_tree_into(&from, &to, copied)?;
         } else if is_real_file(&from) {
-            std::fs::copy(&from, &to)?;
+            copy_verified(&from, &to)?;
             sync_written_file(&to)?;
             copied.insert(from);
         }
     }
     sync_dir(dst)
+}
+
+/// `std::fs::copy`, refusing to call a short copy done. The source is
+/// only ever deleted against what this wrote, so the check runs before
+/// anything downstream can trust the destination: a filesystem that
+/// silently truncated (an SMB share at quota, a FUSE layer that dropped
+/// a write) must fail the move while the source is still whole, not be
+/// discovered by the player. Sizes, not hashes - the byte-for-byte cost
+/// belongs to the transports that are known to lie, and none of the
+/// failures seen in the field so far kept the length intact.
+fn copy_verified(from: &Path, to: &Path) -> std::io::Result<()> {
+    let wrote = std::fs::copy(from, to)?;
+    let want = std::fs::metadata(from)?.len();
+    if wrote != want {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("short copy: wrote {wrote} of {want} bytes"),
+        ));
+    }
+    Ok(())
 }
 
 /// fsync a directory, so the names created in it survive power loss.
@@ -3520,6 +3710,54 @@ pub fn unlock(dir: &Path, password: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// The move-I/O demotion must RESTORE the thread's policy on drop:
+    /// moves run on tokio's pooled blocking threads, so a policy left set
+    /// would demote whatever unrelated work that thread picks up next.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn background_io_restores_the_thread_policy() {
+        // Own thread: the assertion is about THIS thread's policy, and the
+        // test harness's threads are shared.
+        std::thread::spawn(|| unsafe {
+            let before = iopol::getiopolicy_np(iopol::IOPOL_TYPE_DISK, iopol::IOPOL_SCOPE_THREAD);
+            let prev = before;
+            let guard = BackgroundIo { prev };
+            assert_eq!(
+                iopol::setiopolicy_np(
+                    iopol::IOPOL_TYPE_DISK,
+                    iopol::IOPOL_SCOPE_THREAD,
+                    iopol::IOPOL_THROTTLE
+                ),
+                0
+            );
+            assert_eq!(
+                iopol::getiopolicy_np(iopol::IOPOL_TYPE_DISK, iopol::IOPOL_SCOPE_THREAD),
+                iopol::IOPOL_THROTTLE
+            );
+            drop(guard);
+            assert_eq!(
+                iopol::getiopolicy_np(iopol::IOPOL_TYPE_DISK, iopol::IOPOL_SCOPE_THREAD),
+                before
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// A copy whose destination holds every byte passes; the verify is
+    /// what runs between "copied" and "the source may now be deleted".
+    #[test]
+    fn copy_verified_accepts_a_whole_copy() {
+        let dir = std::env::temp_dir().join(format!("copy-verified-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let from = dir.join("a.bin");
+        let to = dir.join("b.bin");
+        std::fs::write(&from, vec![7u8; 1 << 20]).unwrap();
+        copy_verified(&from, &to).unwrap();
+        assert_eq!(std::fs::metadata(&to).unwrap().len(), 1 << 20);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Poll until `f()` holds or ~10 s pass: the deferred-trash worker is
     /// asynchronous on purpose, so its outcomes need a bounded wait.
     fn eventually(f: impl Fn() -> bool) -> bool {
@@ -3534,6 +3772,7 @@ mod tests {
 
     #[test]
     fn staged_delete_leaves_the_tree_synchronously() {
+        let _steady = trash_globals_steady();
         // The §64 contract: by the time `stage` returns, the file is OUT
         // of the job tree - so finalize can move the directory the very
         // next instant without racing the delete - and the worker disposes
@@ -3558,6 +3797,7 @@ mod tests {
 
     #[test]
     fn first_stage_drains_a_predecessors_leftovers() {
+        let _steady = trash_globals_steady();
         // A crash between park and disposal strands files in the staging
         // folder. The first stage into that folder after a restart queues
         // whatever it finds, so leftovers cannot accumulate forever.
@@ -4026,6 +4266,7 @@ mod tests {
     /// same year folder is a different episode, and the only copy of it.
     #[test]
     fn date_shapes_are_not_episode_numbers() {
+        let _steady = trash_globals_steady();
         // Unchanged verdicts: a bare digit run is an episode number
         // whatever its width, and a dotted date is not a single token.
         assert!(reads_as_episode_number("2026"));
@@ -4135,6 +4376,7 @@ mod tests {
 
     #[test]
     fn delete_filed_episode_spares_siblings() {
+        let _steady = trash_globals_steady();
         let dir = std::env::temp_dir().join(format!("nzbfast-filed-del-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -4261,6 +4503,7 @@ mod tests {
     /// downloaded and cannot fetch again.
     #[test]
     fn delete_filed_episode_spares_the_users_own_library_file() {
+        let _steady = trash_globals_steady();
         let dir = std::env::temp_dir().join(format!("nzbfast-filed-lib-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -4332,6 +4575,7 @@ mod tests {
     /// drift apart.
     #[test]
     fn delete_filed_episode_spares_the_upgrade_that_replaced_it() {
+        let _steady = trash_globals_steady();
         let dir = std::env::temp_dir().join(format!("nzbfast-filed-up-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -4531,6 +4775,7 @@ mod tests {
 
     #[test]
     fn cleanup_two_levels() {
+        let _steady = trash_globals_steady();
         let dir = std::env::temp_dir().join(format!("nzbfast-smart-clean-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
@@ -4819,6 +5064,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cleanup_walkers_do_not_delete_through_a_directory_symlink() {
+        let _steady = trash_globals_steady();
         let root = std::env::temp_dir().join(format!("nzbfast-cleanlink-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let external = root.join("external");
@@ -5083,6 +5329,7 @@ mod tests {
 
     #[test]
     fn sweep_junk_keeps_media_and_feature() {
+        let _steady = trash_globals_steady();
         let dir = std::env::temp_dir().join(format!("nzbfast-sweep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
@@ -5111,6 +5358,7 @@ mod tests {
     /// 7-volume PAR2 set left beside the episode with junk-sweep on.
     #[test]
     fn sweep_junk_drops_extensionless_par2_by_magic() {
+        let _steady = trash_globals_steady();
         let dir = std::env::temp_dir().join(format!("nzbfast-obfpar2-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -5145,6 +5393,7 @@ mod tests {
 
     #[test]
     fn keep_media_only_spares_all_episodes() {
+        let _steady = trash_globals_steady();
         let dir = std::env::temp_dir().join(format!("nzbfast-keepmedia-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -5173,6 +5422,7 @@ mod tests {
     /// unpack it by hand. Job Completed, folder empty, nothing to show.
     #[test]
     fn keep_media_only_spares_still_packed_archives() {
+        let _steady = trash_globals_steady();
         let dir = std::env::temp_dir().join(format!("nzbfast-keeparc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -5208,6 +5458,7 @@ mod tests {
     /// must survive every sweep.
     #[test]
     fn keep_media_only_spares_obfuscated_rar_volumes() {
+        let _steady = trash_globals_steady();
         let dir = std::env::temp_dir().join(format!("nzbfast-keepobf-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -5250,6 +5501,7 @@ mod tests {
     /// consumed; nothing that only sees the finished directory may guess.
     #[test]
     fn sweep_junk_never_removes_an_archive() {
+        let _steady = trash_globals_steady();
         let dir = std::env::temp_dir().join(format!("nzbfast-sweeparc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -5273,6 +5525,7 @@ mod tests {
     /// the user the verified archive was waiting in the folder.
     #[test]
     fn keep_media_only_spares_every_part_of_a_split_zip() {
+        let _steady = trash_globals_steady();
         let dir = std::env::temp_dir().join(format!("nzbfast-keepsplit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -5301,6 +5554,7 @@ mod tests {
     /// Movie/Tv, so a FLAC album passes the kind gate that guards this.
     #[test]
     fn keep_media_only_leaves_a_video_less_job_alone() {
+        let _steady = trash_globals_steady();
         let root = std::env::temp_dir().join(format!("nzbfast-keepnovid-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
 
@@ -5396,6 +5650,7 @@ mod tests {
     /// and an external audio track can be the point of the release.
     #[test]
     fn keep_media_only_keeps_disc_structure_and_companion_tracks() {
+        let _steady = trash_globals_steady();
         let dir = std::env::temp_dir().join(format!("nzbfast-keepdisc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -5426,6 +5681,7 @@ mod tests {
     /// copy anywhere.
     #[test]
     fn keep_media_only_spares_extensionless_video_payload() {
+        let _steady = trash_globals_steady();
         let dir = std::env::temp_dir().join(format!("nzbfast-keepext-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -5466,6 +5722,7 @@ mod tests {
     /// the release existed for - with no copy anywhere to restore from.
     #[test]
     fn keep_media_only_keeps_modern_external_audio_tracks() {
+        let _steady = trash_globals_steady();
         let dir = std::env::temp_dir().join(format!("nzbfast-keepaudio-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -5497,6 +5754,7 @@ mod tests {
 
     #[test]
     fn sweep_junk_keeps_feature_titled_proof() {
+        let _steady = trash_globals_steady();
         // Regression: the 2005 film "Proof" - the feature's name contains
         // "proof" but it is the whole download and must never be swept.
         let dir = std::env::temp_dir().join(format!("nzbfast-proof-{}", std::process::id()));
@@ -5515,6 +5773,7 @@ mod tests {
 
     #[test]
     fn sweep_junk_keeps_proof_season_pack() {
+        let _steady = trash_globals_steady();
         // Regression: a "Proof" season pack - every episode name contains
         // "proof" and all are feature-sized. The old substring rule deleted
         // every episode (largest_video returned None -> keep=None).
@@ -5540,6 +5799,7 @@ mod tests {
 
     #[test]
     fn sweep_junk_still_drops_a_real_sample() {
+        let _steady = trash_globals_steady();
         // A genuine teaser (tiny) beside a full-size feature is still swept.
         let dir = std::env::temp_dir().join(format!("nzbfast-realsample-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -5555,6 +5815,7 @@ mod tests {
 
     #[test]
     fn sweep_junk_takes_the_emptied_sample_folder_too() {
+        let _steady = trash_globals_steady();
         // The husk of a swept `Sample/` folder used to survive the sweep,
         // so a tidied job still looked untidied. A folder that still holds
         // something - here the subtitle sidecars - stays.
@@ -5689,6 +5950,7 @@ mod tests {
 
     #[test]
     fn tv_rename_in_place_with_suffix() {
+        let _steady = trash_globals_steady();
         let dir = std::env::temp_dir().join(format!("nzbfast-tvrename-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -5893,6 +6155,7 @@ mod tests {
     /// must round-trip.
     #[test]
     fn a_sanitised_show_still_files_and_unfiles() {
+        let _steady = trash_globals_steady();
         let root = scratch("tvsafe");
         let stem = "Alien: Romulus S01E02 1080p WEB-GRP";
         let out = root.join("job");
@@ -5936,6 +6199,7 @@ mod tests {
     /// play path can still find the file afterwards.
     #[test]
     fn an_episode_title_reaches_the_filed_name_and_stays_findable() {
+        let _steady = trash_globals_steady();
         let root = scratch("eptitle");
         let stem = "My.Show.S01E02.1080p.WEB.x264-TEST";
         let out = root.join("tv").join(stem);
@@ -6160,6 +6424,7 @@ mod tests {
     /// the same folder. Only the file we wrote may be touched.
     #[test]
     fn the_users_own_copy_of_the_episode_is_never_ours() {
+        let _steady = trash_globals_steady();
         let root = scratch("eptheirs");
         let season = root.join("The Bear/Season 03");
         std::fs::create_dir_all(&season).unwrap();
@@ -6233,6 +6498,7 @@ mod tests {
     /// must land in that folder rather than starting a second tree.
     #[test]
     fn a_show_filed_under_the_old_spelling_is_still_ours() {
+        let _steady = trash_globals_steady();
         let root = scratch("tvlegacy");
         let stem = "Star Trek: Discovery S01E05 1080p WEB h264-GRP";
         let tv = root.join("tv");

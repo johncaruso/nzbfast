@@ -1,0 +1,83 @@
+# Coverage ratchet for the PRIVATE repo. TODO 106 phase 1.2.
+#
+# test:code ratio (0.69, best in the five-way field) is a VOLUME metric
+# and says nothing about what the tests actually reach - measured for the
+# first time on 4 Aug: nzbkit lib 86.25% lines, nzbfast bins 47.78%. The
+# split between those two numbers is where the §106 phase-3 work goes.
+#
+# The floors below are deliberately UNDER the measured values (rustnzb's
+# pattern, the only competitor with a coverage gate: floors below
+# baseline so the gate fires only on a real regression, never on noise).
+# Raise a floor deliberately, after the number has moved for a reason -
+# the bins floor went 45 -> 46 when phase 3 landed 139 daemon-file unit
+# tests (measured 47.97, 5 Aug). Never lower one to make a run pass; a
+# refactor that quietly drops a branch is exactly what this exists to
+# catch. The nzbkit floor was under water for most of 5 Aug (83.98,
+# then 83.81): the pool campaign landed code only the integration and
+# daemon suites exercise, which a --lib measurement cannot see. Fixed
+# the way the rule demands - 21 pool lib tests plus 4 over preflight's
+# STAT sweep, not a lower floor - and green again at 84.61 (b7e8d9c7).
+# That leaves ~0.6pp of headroom, and pool.rs alone took ~190 lines of
+# mostly uncovered product code on 5 Aug: the next red is more likely
+# to be honest drift than a regression, and the answer is still tests.
+#
+# Nightly, not per-push: a full coverage build recompiles the workspace
+# instrumented, which is minutes, and ci-private is deliberately lean.
+name: coverage
+on:
+  schedule:
+    # 07:00 UTC, two hours before nightly.yml, so the two never compete
+    # for the same cache write.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  coverage:
+    if: github.repository != 'nzbfast/nzbfast'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: toolchain
+        run: rustup toolchain install stable --profile minimal --component llvm-tools && rustup default stable
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Its own key: instrumented artifacts must never poison the
+          # plain debug caches the other workflows share.
+          key: coverage-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      # Prebuilt binary pinned by version and checked by SHA256 rather
+      # than trusted - same pattern (and rationale) as nextest and
+      # cargo-deny in ci-private.yml.
+      - name: install cargo-llvm-cov
+        run: |
+          ver="0.8.7"
+          curl -sSfL -o cargo-llvm-cov.tar.gz \
+            "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v${ver}/cargo-llvm-cov-x86_64-unknown-linux-musl.tar.gz"
+          echo "967b5cc996c29d8baa52bbb4595ef1f53af35255af8e2036ddbc6468d7b523c7  cargo-llvm-cov.tar.gz" | sha256sum -c -
+          tar -xzf cargo-llvm-cov.tar.gz
+          sudo mv cargo-llvm-cov /usr/local/bin/
+          rm cargo-llvm-cov.tar.gz
+      # Two floors, measured per crate, because one workspace-wide number
+      # would let a regression in the weak crate hide behind the strong
+      # one. NZBFAST_NO_ENRICH is CLAUDE.md invariant 5 - the bin suite
+      # runs product code that consults it at the network boundary.
+      - name: nzbkit lib coverage (floor 84, measured 84.61)
+        env:
+          NZBFAST_NO_ENRICH: "1"
+        run: cargo llvm-cov --locked -p nzbkit --lib --fail-under-lines 84
+      # if: always() so a breach of one floor never hides the other
+      # crate's measurement - the nightly that caught nzbkit under 84
+      # also needed the bins figure, and got neither.
+      - name: nzbfast bin coverage (floor 46, measured 47.90)
+        if: always()
+        env:
+          NZBFAST_NO_ENRICH: "1"
+        run: cargo llvm-cov --locked -p nzbfast --bins --fail-under-lines 46

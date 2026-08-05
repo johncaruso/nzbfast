@@ -1,0 +1,287 @@
+package app.nzbfast.mobile.api
+
+import org.json.JSONObject
+
+/**
+ * Thin models over the daemon's SABnzbd-compat JSON. Parsers are pure
+ * String -> model functions so the JVM snapshot tests exercise exactly
+ * the code the app runs. Only fields the app reads are modeled; the
+ * full field inventory lives in CONTRACT.md next to this app.
+ */
+
+data class QueueSlot(
+    val nzoId: String,
+    val name: String,
+    val status: String,
+    val percentage: Float,
+    val mb: Double,
+    val mbLeft: Double,
+    val timeLeft: String,
+    val activity: String,
+)
+
+data class QueueSnapshot(
+    val paused: Boolean,
+    val status: String,
+    val kbPerSec: Double,
+    val slots: List<QueueSlot>,
+)
+
+data class HistorySlot(
+    val nzoId: String,
+    val name: String,
+    val status: String,
+    val size: String,
+    val failMessage: String,
+    val completedAt: Long,
+)
+
+data class AddResult(
+    val ok: Boolean,
+    val nzoIds: List<String>,
+    val error: String?,
+)
+
+/** /preview/probe: the daemon's own playability verdict for one job. */
+data class ProbeResult(
+    val file: String?,
+    val mediaReady: Boolean,
+    val pending: Boolean,
+)
+
+/**
+ * Playback contract v1 (`mode=playback`): per-file readiness for one
+ * job. `reason` is a closed token set - live, disk, pending,
+ * not_fetched, not_started, no_media, failed, unknown - so the UI can
+ * branch on it without reading prose.
+ */
+data class Playback(
+    val ready: Boolean,
+    val reason: String,
+    val file: String?,
+    val size: Long,
+    val source: String,
+    val seekable: Boolean,
+    val headBytes: Long,
+    val pct: Double,
+)
+
+data class PlaybackJob(
+    val nzoId: String,
+    val name: String,
+    val status: String,
+    val percentage: Float,
+    val mb: Double,
+    val mbLeft: Double,
+    val timeLeft: String,
+    val activity: String,
+    val failMessage: String,
+    val playback: Playback,
+    /** Play URL carrying the job's scoped token, never the API key. */
+    val stream: String,
+)
+
+/** Byte-serving telemetry behind the player's health overlay. */
+data class StreamTelemetry(
+    val readers: Int,
+    val blockedReads: Long,
+    val zeroFilledBytes: Long,
+    val runwayMb: Long,
+    val runwayWaitMs: Long,
+)
+
+/** The whole of `mode=playback`: the one call this app polls. */
+data class PlaybackSnapshot(
+    val contract: Int,
+    val paused: Boolean,
+    val speedBps: Double,
+    val diskFreeGb: Double,
+    val warnings: Int,
+    val queue: List<PlaybackJob>,
+    val history: List<PlaybackJob>,
+    val stream: StreamTelemetry,
+)
+
+data class ServerTestResult(
+    val ok: Boolean,
+    val detail: String,
+)
+
+object Parse {
+
+    fun version(body: String): String =
+        JSONObject(body).optString("version", "")
+
+    fun queue(body: String): QueueSnapshot {
+        val q = JSONObject(body).getJSONObject("queue")
+        val slots = q.optJSONArray("slots")
+        val out = ArrayList<QueueSlot>(slots?.length() ?: 0)
+        if (slots != null) {
+            for (i in 0 until slots.length()) {
+                val s = slots.getJSONObject(i)
+                out.add(
+                    QueueSlot(
+                        nzoId = s.optString("nzo_id"),
+                        name = s.optString("filename"),
+                        status = s.optString("status"),
+                        percentage = s.optString("percentage", "0")
+                            .toFloatOrNull() ?: 0f,
+                        mb = s.optString("mb", "0").toDoubleOrNull() ?: 0.0,
+                        mbLeft = s.optString("mbleft", "0").toDoubleOrNull() ?: 0.0,
+                        timeLeft = s.optString("timeleft", ""),
+                        activity = s.optString("activity", ""),
+                    )
+                )
+            }
+        }
+        return QueueSnapshot(
+            paused = q.optBoolean("paused", false),
+            status = q.optString("status", ""),
+            kbPerSec = q.optString("kbpersec", "0").toDoubleOrNull() ?: 0.0,
+            slots = out,
+        )
+    }
+
+    fun history(body: String): List<HistorySlot> {
+        val h = JSONObject(body).getJSONObject("history")
+        val slots = h.optJSONArray("slots") ?: return emptyList()
+        val out = ArrayList<HistorySlot>(slots.length())
+        for (i in 0 until slots.length()) {
+            val s = slots.getJSONObject(i)
+            out.add(
+                HistorySlot(
+                    nzoId = s.optString("nzo_id"),
+                    name = s.optString("name"),
+                    status = s.optString("status"),
+                    size = s.optString("size"),
+                    failMessage = s.optString("fail_message"),
+                    completedAt = s.optLong("completed", 0),
+                )
+            )
+        }
+        return out
+    }
+
+    fun addResult(body: String): AddResult {
+        val j = JSONObject(body)
+        val ok = j.optBoolean("status", false)
+        val ids = ArrayList<String>()
+        j.optJSONArray("nzo_ids")?.let { a ->
+            for (i in 0 until a.length()) ids.add(a.getString(i))
+        }
+        return AddResult(ok, ids, j.optString("error", "").ifEmpty { null })
+    }
+
+    fun probe(body: String): ProbeResult {
+        val j = JSONObject(body)
+        val media = j.optJSONObject("media")
+        return ProbeResult(
+            file = j.optString("file", "").ifEmpty { null },
+            mediaReady = media != null,
+            pending = j.optBoolean("pending", false),
+        )
+    }
+
+    /**
+     * `mode=playback` - the one call a phone polls: server state, both
+     * job lists with per-file playback readiness, and the byte-serving
+     * telemetry. Replaces queue + history + a probe per job.
+     */
+    fun playback(body: String): PlaybackSnapshot {
+        val j = JSONObject(body)
+        val s = j.optJSONObject("stream")
+        return PlaybackSnapshot(
+            contract = j.optInt("contract", 0),
+            paused = j.optBoolean("paused", false),
+            speedBps = j.optDouble("speed_bps", 0.0),
+            diskFreeGb = j.optDouble("diskspace_gb", 0.0),
+            warnings = j.optInt("warnings", 0),
+            queue = playbackJobs(j.optJSONArray("queue")),
+            history = playbackJobs(j.optJSONArray("history")),
+            stream = StreamTelemetry(
+                readers = s?.optInt("readers", 0) ?: 0,
+                blockedReads = s?.optLong("blocked_reads", 0) ?: 0,
+                zeroFilledBytes = s?.optLong("zero_filled_bytes", 0) ?: 0,
+                runwayMb = s?.optLong("runway_mb", 0) ?: 0,
+                runwayWaitMs = s?.optLong("runway_wait_ms", 0) ?: 0,
+            ),
+        )
+    }
+
+    private fun playbackJobs(arr: org.json.JSONArray?): List<PlaybackJob> {
+        if (arr == null) return emptyList()
+        val out = ArrayList<PlaybackJob>(arr.length())
+        for (i in 0 until arr.length()) {
+            val j = arr.getJSONObject(i)
+            val p = j.optJSONObject("playback")
+            val cov = p?.optJSONObject("coverage")
+            out.add(
+                PlaybackJob(
+                    nzoId = j.optString("nzo_id"),
+                    name = j.optString("name"),
+                    status = j.optString("status"),
+                    // Numbers, not quoted strings: that is the whole
+                    // point of the mobile shapes over the SAB ones.
+                    percentage = j.optDouble("percentage", 0.0).toFloat(),
+                    mb = j.optDouble("mb", 0.0),
+                    mbLeft = j.optDouble("mbleft", 0.0),
+                    timeLeft = j.optString("timeleft", ""),
+                    activity = j.optString("activity", ""),
+                    failMessage = j.optString("fail_message", ""),
+                    playback = Playback(
+                        ready = p?.optBoolean("ready", false) ?: false,
+                        reason = p?.optString("reason", "unknown") ?: "unknown",
+                        file = p?.optString("file", "")?.ifEmpty { null },
+                        size = p?.optLong("size", 0) ?: 0,
+                        source = p?.optString("source", "none") ?: "none",
+                        seekable = p?.optBoolean("seekable", false) ?: false,
+                        headBytes = cov?.optLong("head_bytes", 0) ?: 0,
+                        pct = cov?.optDouble("pct", 0.0) ?: 0.0,
+                    ),
+                    stream = j.optString("stream", ""),
+                )
+            )
+        }
+        return out
+    }
+
+    /**
+     * `mode=stream_token`: the scoped per-job secret for a URL handed
+     * outside the app (an external player, a share sheet). Null when
+     * the daemon does not know the job.
+     */
+    fun streamToken(body: String): String? {
+        val j = JSONObject(body)
+        if (!j.optBoolean("status", false)) return null
+        return j.optString("stream", "").ifEmpty { null }
+    }
+
+    fun serversConfigured(getConfigBody: String): Boolean =
+        JSONObject(getConfigBody)
+            .optJSONObject("config")
+            ?.optJSONObject("nzbfast")
+            ?.optBoolean("servers_configured", false)
+            ?: false
+
+    fun serverTest(body: String): ServerTestResult {
+        val j = JSONObject(body)
+        return if (j.optBoolean("status", false)) {
+            ServerTestResult(true, j.optString("greeting", "connected"))
+        } else {
+            ServerTestResult(false, j.optString("error", "connection failed"))
+        }
+    }
+
+    fun statusOk(body: String): Boolean =
+        JSONObject(body).optBoolean("status", false)
+
+    /**
+     * /m3u body: "#EXTM3U\nhttp://host/stream/<id>?t=<token>". The
+     * URL line carries the per-job stream token, which keeps the API
+     * key out of long-lived player URLs.
+     */
+    fun m3uUrl(body: String): String? =
+        body.lineSequence()
+            .map { it.trim() }
+            .firstOrNull { it.isNotEmpty() && !it.startsWith("#") }
+}

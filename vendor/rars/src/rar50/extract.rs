@@ -22,6 +22,27 @@ const BUFFERED_DECODE_LIMIT: u64 = 1024;
 // override via `ArchiveReadOptions::rar50_max_window`.
 const DEFAULT_STREAM_WINDOW_LIMIT: u64 = 1024 * 1024 * 1024;
 
+/// AES-CBC block size. Encrypted stored data is padded up to this
+/// boundary, so an encrypted stored member may supply up to one block
+/// more ciphertext than its declared unpacked size.
+///
+/// The pad CONTENT is not specified by the format, and unrar never looks
+/// at it - it reads unpacked_size bytes and discards the rest. So any
+/// content rule we impose here is one real unrar does not, and issue #24
+/// is what that cost: an archive this crate rejected on ~30% of its
+/// volumes extracted cleanly under unrar and Total Commander.
+///
+/// Note the residue was NOT reproduced locally: RARLAB's own `rar` 7.x
+/// zero-pads, so a fixture built with it passes either rule. What is
+/// certain is the direction, because accepting arbitrary content is
+/// exactly what unrar does.
+///
+/// The LENGTH is still bounded, and that is the check worth keeping: it
+/// stops a header/payload disagreement hiding megabytes behind "it is
+/// only padding". Ciphertext is block-aligned, so a genuine pad is
+/// always shorter than one block.
+const AES_BLOCK: u64 = 16;
+
 impl FileHeader {
     fn crypto_with_password(&self, password: Option<&[u8]>) -> Result<Option<Rar50Keys>> {
         self.crypto_with_password_cached(password, &mut super::Rar50KeyCache::default())
@@ -347,9 +368,11 @@ impl FileHeader {
                         "RAR 5 encrypted stored file is shorter than unpacked size",
                     ));
                 }
-                if packed[unpacked_size..].iter().any(|&byte| byte != 0) {
+                // The tail past unpacked_size is AES padding. Its content is
+                // arbitrary (see AES_BLOCK), so only its length is checked.
+                if (packed.len() - unpacked_size) as u64 >= AES_BLOCK {
                     return Err(Error::InvalidHeader(
-                        "RAR 5 encrypted stored file has non-zero padding",
+                        "RAR 5 encrypted stored file supplies more data than one block of padding",
                     ));
                 }
                 return Ok(packed[..unpacked_size].to_vec());
@@ -626,6 +649,7 @@ impl FileHeader {
         let hash =
             streaming_hash_verifier(self).map_err(|error| self.entry_error("decoding", error))?;
         let mut written = 0u64;
+        let mut discarded = 0u64;
 
         let (crc, hash) = match pipe_stored_chunks(
             &mut *reader,
@@ -633,7 +657,7 @@ impl FileHeader {
             |error| ("decoding", Error::from(error)),
             crc,
             hash,
-            |buf| self.consume_stored_chunk(buf, &mut written, writer),
+            |buf| self.consume_stored_chunk(buf, &mut written, &mut discarded, writer),
         ) {
             Ok(digests) => digests,
             Err((operation, error)) => return Err(self.entry_error(operation, error)),
@@ -652,12 +676,13 @@ impl FileHeader {
     /// Padding check and write for one stored-file chunk; the digest
     /// stage downstream checksums the accepted content. Returns how many
     /// leading bytes are file content (an encrypted stored tail past
-    /// unpacked_size is AES padding, verified zero here and not
+    /// unpacked_size is AES padding, counted in `discarded` and not
     /// digested), or the failing operation label alongside the error.
     fn consume_stored_chunk(
         &self,
         buf: &[u8],
         written: &mut u64,
+        discarded: &mut u64,
         writer: &mut dyn Write,
     ) -> std::result::Result<usize, (&'static str, Error)> {
         let remaining =
@@ -666,11 +691,16 @@ impl FileHeader {
         let chunk = &buf[..chunk_len];
         if self.encrypted {
             // Encrypted stored data is padded up to the AES block, so a tail
-            // past unpacked_size is expected - but it must be zero.
-            if buf[chunk_len..].iter().any(|&byte| byte != 0) {
+            // past unpacked_size is expected. Its content is arbitrary (see
+            // AES_BLOCK); only the total length is bounded, and it is summed
+            // across chunks because a whole chunk can land past the end.
+            *discarded = discarded.saturating_add((buf.len() - chunk_len) as u64);
+            if *discarded >= AES_BLOCK {
                 return Err((
                     "decoding",
-                    Error::InvalidHeader("RAR 5 encrypted stored file has non-zero padding"),
+                    Error::InvalidHeader(
+                        "RAR 5 encrypted stored file supplies more data than one block of padding",
+                    ),
                 ));
             }
         } else if buf.len() > remaining {
@@ -3331,6 +3361,7 @@ impl PendingSplitRefs {
         let crc = Crc32::new();
         let hash = streaming_hash_verifier(final_file)?;
         let mut written = 0u64;
+        let mut discarded = 0u64;
 
         // Same bounded pipeline as the non-split stored path; the split
         // caller wraps every error as "extracting", so the per-chunk
@@ -3343,7 +3374,7 @@ impl PendingSplitRefs {
             hash,
             |buf| {
                 final_file
-                    .consume_stored_chunk(buf, &mut written, writer)
+                    .consume_stored_chunk(buf, &mut written, &mut discarded, writer)
                     .map_err(|(_operation, error)| error)
             },
         )?;
@@ -3944,11 +3975,31 @@ mod tests {
     }
 
     #[test]
-    fn stored_split_rejects_nonzero_encrypted_padding() {
+    // unrar never inspects the pad, so a non-zero tail must extract rather
+    // than fail (see AES_BLOCK). This is the shape that failed on ~30% of a
+    // reporter's encrypted stored volumes while unrar took all of them.
+    fn stored_split_accepts_nonzero_encrypted_padding() {
         let mut payload = b"encrypted split payload!".repeat(4);
         let logical = payload.len() as u64 - 6;
         let last = payload.len() - 1;
         payload[last] = 1; // non-zero pad byte
+        let expected = payload[..logical as usize].to_vec();
+        let (pending, final_file, volumes) =
+            two_fragment_split(&payload, true, logical, Some(crc32(&expected)));
+
+        let mut out: Vec<u8> = Vec::new();
+        pending
+            .write_stored_to(&volumes, &final_file, None, &mut out)
+            .expect("non-zero AES padding must extract");
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    // The length bound is what survives: padding may not exceed one AES
+    // block, so a header/payload disagreement cannot hide behind it.
+    fn stored_split_rejects_padding_past_one_aes_block() {
+        let payload = b"encrypted split payload!".repeat(4);
+        let logical = payload.len() as u64 - AES_BLOCK;
         let (pending, final_file, volumes) =
             two_fragment_split(&payload, true, logical, None);
 
@@ -3957,8 +4008,8 @@ mod tests {
             .write_stored_to(&volumes, &final_file, None, &mut out)
             .unwrap_err();
         assert!(
-            matches!(err, Error::InvalidHeader(msg) if msg.contains("non-zero padding")),
-            "expected padding rejection, got {err:?}"
+            matches!(err, Error::InvalidHeader(msg) if msg.contains("one block of padding")),
+            "expected over-length padding rejection, got {err:?}"
         );
     }
 
@@ -4118,7 +4169,7 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_stored_decode_rejects_nonzero_discarded_padding() {
+    fn encrypted_stored_decode_bounds_discarded_padding_by_length_not_content() {
         let mut file = plain_file(b"secret.txt", b"secret", None);
         file.encrypted = true;
         file.unpacked_size = 6;
@@ -4129,10 +4180,17 @@ mod tests {
                 .unwrap(),
             b"secret"
         );
+        // Residue, not zeroes, is what WinRAR actually writes.
+        assert_eq!(
+            file.decode_packed_with_decoder(b"secret\0\x01", &mut decoder)
+                .unwrap(),
+            b"secret"
+        );
+        // A whole block or more past the end is a size disagreement.
         assert!(matches!(
-            file.decode_packed_with_decoder(b"secret\0\x01", &mut decoder),
+            file.decode_packed_with_decoder(b"secret0123456789abcdef", &mut decoder),
             Err(Error::InvalidHeader(
-                "RAR 5 encrypted stored file has non-zero padding"
+                "RAR 5 encrypted stored file supplies more data than one block of padding"
             ))
         ));
     }
@@ -4287,14 +4345,16 @@ mod tests {
 
         let mut encrypted = plain_file(b"b.txt", &[0u8; 32], None);
         encrypted.encrypted = true;
-        encrypted.unpacked_size = 32;
+        encrypted.unpacked_size = 30;
         let too_short = vec![0u8; 16];
         assert!(matches!(
             encrypted.decode_packed_with_decoder(&too_short, &mut decoder),
             Err(Error::InvalidHeader(_))
         ));
 
-        let exact = vec![0u8; 64];
+        // Ciphertext is block-aligned, so the tail for a 30-byte member is
+        // the 2 bytes of padding that round it up to 32 - and it is trimmed.
+        let exact = vec![0u8; 32];
         let trimmed = encrypted
             .decode_packed_with_decoder(&exact, &mut decoder)
             .unwrap();

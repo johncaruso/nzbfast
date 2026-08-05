@@ -1,3 +1,4 @@
+#![cfg(feature = "indexer")]
 //! M13 gate seed: the poster wall - releases parse into title cards,
 //! encodes of one film dedupe onto one card, TV seasons group under one
 //! show, obfuscated stems stay hidden, /wall serves the UI, /m3u hands a

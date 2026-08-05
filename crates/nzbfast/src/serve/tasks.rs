@@ -18,6 +18,7 @@ use super::*;
 /// per-provider, so one serial loop made every TV title queue behind the
 /// movie crawl - and MusicBrainz's hard 1 request/second would have put
 /// an album backlog in front of every new episode had it shared a lane.
+#[cfg(feature = "indexer")]
 pub(super) fn wall_enricher(d: Arc<Daemon>, api_key: Option<String>) {
     use nzbkit::index::Lane;
     for lane in [Lane::Movies, Lane::MusicBooks] {
@@ -31,6 +32,7 @@ pub(super) fn wall_enricher(d: Arc<Daemon>, api_key: Option<String>) {
 /// fall into the `_` arm here and land on `Kind::Other`, which returns
 /// before touching any provider - so those rows were stamped "checked"
 /// having never been looked up.
+#[cfg(feature = "indexer")]
 pub(super) fn lane_kind(kind: &str) -> crate::wall::Kind {
     match kind {
         "tv" => crate::wall::Kind::Tv,
@@ -41,13 +43,45 @@ pub(super) fn lane_kind(kind: &str) -> crate::wall::Kind {
     }
 }
 
+#[cfg(feature = "indexer")]
 pub(super) fn wall_enrich_lane(d: Arc<Daemon>, api_key: Option<String>, lane: nzbkit::index::Lane) {
     let art = d.spool.join("art");
     let _ = std::fs::create_dir_all(&art);
     let mut said_backfilling = false;
+    // Titles whose whole provider chain could not be REACHED
+    // (DNS, timeout, TLS, 5xx - as opposed to "answered and had
+    // nothing"). Such a row deliberately stays unstamped so a later
+    // pass retries it, but without memory of the failure the lane
+    // offers it again on the very next batch: the live daemon spent a
+    // whole night logging the same title every ~7 seconds. Each key
+    // now waits BACKOFF_MIN after its first failed pass, doubling to
+    // the BACKOFF_MAX ceiling, and any pass that reaches a provider
+    // clears its slate. In-memory on purpose, like the photo
+    // fetcher's failed set: a restart retrying at once is fine, the
+    // tight loop is not. Keyed per title, so one unreachable title
+    // never delays the rest of the queue.
+    const BACKOFF_MIN: u64 = 60;
+    const BACKOFF_MAX: u64 = 6 * 3600;
+    let mut unreached: std::collections::HashMap<String, (u32, std::time::Instant)> =
+        std::collections::HashMap::new();
+    let backoff_after = |fails: u32| {
+        std::time::Instant::now()
+            + std::time::Duration::from_secs(
+                BACKOFF_MIN
+                    .saturating_mul(1u64 << fails.saturating_sub(1).min(9))
+                    .min(BACKOFF_MAX),
+            )
+    };
     loop {
         if d.park_if_off(30) {
             continue;
+        }
+        // Entries whose wait has expired retry on sight, so dropping
+        // them merely resets a counter - done only to bound the map
+        // for the life of the thread.
+        if unreached.len() > 2_048 {
+            let now_i = std::time::Instant::now();
+            unreached.retain(|_, (_, next)| *next > now_i);
         }
         // M30: what the wall is showing unenriched RIGHT NOW jumps the
         // backlog. Keys stay queued until this lane's query confirms
@@ -60,12 +94,12 @@ pub(super) fn wall_enrich_lane(d: Arc<Daemon>, api_key: Option<String>, lane: nz
             d.with_index(|ix| ix.titles_hot(&hot_keys, lane).ok())
                 .unwrap_or_default()
         };
-        let batch = if !hot.is_empty() {
+        let batch: Vec<_> = if !hot.is_empty() {
             {
                 let mut q = d.enrich_hot.lock_ok();
                 q.retain(|k| !hot.iter().any(|t| &t.key == k));
             }
-            hot.into_iter().take(12).collect()
+            hot
         } else {
             d
                 // Batch of 12 (was 6): fewer db round-trips, and it costs
@@ -73,9 +107,23 @@ pub(super) fn wall_enrich_lane(d: Arc<Daemon>, api_key: Option<String>, lane: nz
                 // rate now lives in the per-provider buckets, which do
                 // not care how many titles a batch holds. A fresh
                 // priority order is re-read every batch anyway.
-                .with_index(|ix| ix.titles_pending_lane(12, lane).ok())
+                //
+                // Over-fetched by the number of keys currently in
+                // backoff, so a run of skipped rows at the head of the
+                // priority order cannot starve the eligible rows
+                // behind them.
+                .with_index(|ix| {
+                    ix.titles_pending_lane(12 + unreached.len().min(200) as u32, lane)
+                        .ok()
+                })
                 .unwrap_or_default()
         };
+        let now_i = std::time::Instant::now();
+        let batch: Vec<_> = batch
+            .into_iter()
+            .filter(|r| unreached.get(&r.key).is_none_or(|(_, next)| *next <= now_i))
+            .take(12)
+            .collect();
         if batch.is_empty() {
             // Idle time goes on backfilling release dates onto titles
             // enriched before we stored them - otherwise the wall's
@@ -83,9 +131,19 @@ pub(super) fn wall_enrich_lane(d: Arc<Daemon>, api_key: Option<String>, lane: nz
             // from this version on, and an existing library would sort by
             // year forever. Only the date column is written, so artwork
             // and any hand-corrected metadata are left alone.
-            let back = d
-                .with_index(|ix| ix.titles_missing_date(6, lane).ok())
-                .unwrap_or_default();
+            let back: Vec<_> = d
+                .with_index(|ix| {
+                    ix.titles_missing_date(6 + unreached.len().min(200) as u32, lane)
+                        .ok()
+                })
+                .unwrap_or_default()
+                .into_iter()
+                // Same backoff as the enrichment batch above: a title
+                // whose backfill could not reach a provider waits its
+                // turn instead of being re-asked every pass.
+                .filter(|r| unreached.get(&r.key).is_none_or(|(_, next)| *next <= now_i))
+                .take(6)
+                .collect();
             if back.is_empty() {
                 std::thread::sleep(std::time::Duration::from_secs(15));
                 continue;
@@ -114,12 +172,20 @@ pub(super) fn wall_enrich_lane(d: Arc<Daemon>, api_key: Option<String>, lane: nz
                 // as permanent as the enricher's checked stamp, so a
                 // provider we could not reach must leave the row alone.
                 if date.is_empty() && crate::wall::saw_unreachable() {
+                    let fails = unreached.get(&row.key).map_or(0, |(n, _)| *n) + 1;
+                    let next = backoff_after(fails);
                     info!(
                         target: "wall",
-                        "{}: date backfill could not reach a provider, will retry",
-                        row.key
+                        "{}: date backfill could not reach a provider, retrying \
+                         in {} min",
+                        row.key,
+                        next.saturating_duration_since(std::time::Instant::now())
+                            .as_secs()
+                            .div_ceil(60)
                     );
+                    unreached.insert(row.key.clone(), (fails, next));
                 } else {
+                    unreached.remove(&row.key);
                     let _ = d.with_index(|ix| ix.title_set_air_date(&row.key, &date).ok());
                 }
             }
@@ -276,6 +342,9 @@ pub(super) fn wall_enrich_lane(d: Arc<Daemon>, api_key: Option<String>, lane: nz
             }
             match meta {
                 Some(m) => {
+                    // A provider answered: whatever backoff this key
+                    // accrued is over.
+                    unreached.remove(&row.key);
                     let save = |url: &str, backdrop: bool| -> String {
                         let name = wall::art_name(&row.key, backdrop);
                         match wall::fetch_image(url) {
@@ -345,13 +414,27 @@ pub(super) fn wall_enrich_lane(d: Arc<Daemon>, api_key: Option<String>, lane: nz
                     // requires checked=0. A brief uplink blip used to
                     // blank every title the lane touched while it lasted.
                     if wall::saw_unreachable() {
+                        // Remembered, so the retry waits out an
+                        // exponential backoff instead of burning a
+                        // batch slot (and this log line) every pass.
+                        let fails = unreached.get(&row.key).map_or(0, |(n, _)| *n) + 1;
+                        let next = backoff_after(fails);
                         info!(
                             target: "enrich",
                             "{}: no provider could be reached, leaving it for a \
-                             later pass rather than recording an empty card",
-                            row.key
+                             later pass rather than recording an empty card \
+                             (next try in {} min)",
+                            row.key,
+                            next.saturating_duration_since(std::time::Instant::now())
+                                .as_secs()
+                                .div_ceil(60)
                         );
+                        unreached.insert(row.key.clone(), (fails, next));
                     } else {
+                        // Providers answered and had nothing: the stamp
+                        // below retires the row, so its backoff entry
+                        // has nothing left to guard.
+                        unreached.remove(&row.key);
                         let _ = d.with_index(|ix| {
                             ix.title_fill(&row.key, &Default::default(), now).ok()
                         });
@@ -368,6 +451,7 @@ pub(super) fn wall_enrich_lane(d: Arc<Daemon>, api_key: Option<String>, lane: nz
 /// with portraits. Least-recently-USED wins: the person pages someone
 /// actually opens keep their art (the /art/ route touches the file on
 /// each read), and the long tail is what goes.
+#[cfg(feature = "indexer")]
 pub(super) const PERSON_ART_CAP_BYTES: u64 = 192 * 1024 * 1024;
 
 /// Headshot lane: fetch person photos the enricher recorded URLs for, and
@@ -377,6 +461,7 @@ pub(super) const PERSON_ART_CAP_BYTES: u64 = 192 * 1024 * 1024;
 /// CDN image reads, not API calls, so they must not spend any provider's
 /// rate-limit budget - and a photo arriving late costs nothing, whereas a
 /// card without a poster is visible.
+#[cfg(feature = "indexer")]
 pub(super) fn person_photo_fetcher(d: Arc<Daemon>) {
     let art = d.spool.join("art");
     let _ = std::fs::create_dir_all(&art);
@@ -452,6 +537,7 @@ pub(super) fn person_photo_fetcher(d: Arc<Daemon>) {
 /// Only `p<digits>.jpg` files are considered - posters and backdrops
 /// share this directory and are NOT evictable (they are the wall, and
 /// nothing re-fetches them on demand).
+#[cfg(feature = "indexer")]
 pub(super) fn prune_person_art(dir: &std::path::Path, cap: u64) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
@@ -507,6 +593,7 @@ pub(super) fn prune_person_art(dir: &std::path::Path, cap: u64) {
 /// datasets.imdbws.com, ingested wholesale into the index db. The wall
 /// joins titles.imdb → imdb_ratings at query time, so every card with a
 /// resolved tconst shows the real IMDb rating + vote count, offline.
+#[cfg(feature = "indexer")]
 pub(super) fn imdb_ratings_refresher(d: Arc<Daemon>) {
     loop {
         // MUST come before the staleness read. With no database the
@@ -555,6 +642,7 @@ pub(super) fn imdb_ratings_refresher(d: Arc<Daemon>) {
 /// buffer. Task 2 owns every database write, so the listener never
 /// takes the index write lock in the middle of a burst and cannot be
 /// stalled by a scan pass holding it.
+#[cfg(feature = "indexer")]
 pub(super) fn spawn_predb_feed(daemon: &Arc<Daemon>) {
     {
         let daemon2 = daemon.clone();
@@ -672,6 +760,13 @@ pub(super) fn spawn_predb_feed(daemon: &Arc<Daemon>) {
             // a download, and there is no deadline on naming a post.
             const SWEEP_BUDGET: u32 = 200;
             const BACKLOG_BUDGET: u32 = 200;
+            // The split-merge and sidecar-fold walks hold the
+            // shared index write mutex for their whole call, and the
+            // pause predicate is only consulted BETWEEN legs - so the
+            // per-call time budget is what keeps any single leg from
+            // parking ingest, the API and a starting download behind
+            // it for tens of seconds (observed live, 5 Aug).
+            const WALK_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
             let mut last_prune = 0i64;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(20)).await;
@@ -752,7 +847,7 @@ pub(super) fn spawn_predb_feed(daemon: &Arc<Daemon>) {
                     && let Some((g, n, done)) = daemon2.with_index_mut(|ix| {
                         // An error here must be SAID: a silent Err loops
                         // forever looking exactly like "nothing to do".
-                        match ix.split_merge(now) {
+                        match ix.split_merge(now, WALK_BUDGET) {
                             Ok(t) => Some(t),
                             Err(e) => {
                                 warn!(target: "index", "split-set merge error: {e}");
@@ -781,7 +876,7 @@ pub(super) fn spawn_predb_feed(daemon: &Arc<Daemon>) {
                 if daemon2.indexing_pause_reason().is_none()
                     && let Some((p, f)) = daemon2.with_index_mut(|ix| {
                         // Same rule as above: an error must be SAID.
-                        match ix.par2_sidecar_fold() {
+                        match ix.par2_sidecar_fold(WALK_BUDGET) {
                             Ok((p, f, _)) => Some((p, f)),
                             Err(e) => {
                                 warn!(target: "index", "par2 sidecar fold error: {e}");
@@ -1177,320 +1272,333 @@ pub(super) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
                 }
             }
             if let Some(dir) = dir {
-                if let Ok(entries) = std::fs::read_dir(&dir) {
-                    let mut this_pass = std::collections::HashMap::new();
-                    for e in entries.flatten() {
-                        let p = e.path();
-                        if !p.extension().is_some_and(|x| x.eq_ignore_ascii_case("nzb")) {
-                            continue;
-                        }
-                        // A file that already failed is skipped until
-                        // its mtime or size changes (re-saving it is
-                        // the user's retry).
-                        let Some(sig) = watch_sig(&p) else { continue };
-                        let settled = prev_pass.get(&p) == Some(&sig);
-                        this_pass.insert(p.clone(), sig);
-                        // Ingested earlier with keep-mode on and unchanged
-                        // since: already downloaded from here. Checked
-                        // before anything reads the file, so a kept
-                        // folder full of settled .nzbs costs stats, not
-                        // reads - and never lands in watch_failed as an
-                        // "already queued" warning it does not deserve.
-                        if watch_seen.get(&p).is_some_and(|(t, l, _)| (*t, *l) == sig) {
-                            continue;
-                        }
-                        // Completeness is now the gate, and stillness
-                        // only decides when to give up waiting for it.
-                        //
-                        // Stillness ALONE used to be the gate, and it is
-                        // not sound: a copy that stalls for two passes
-                        // looks identical to a finished one, and a clean
-                        // cut between </file> and </nzb> parses happily
-                        // as a SHORTER release. Measured on a stalled
-                        // 2-file nzb truncated after the first </file>:
-                        // queued as a 1-file release, and the user's
-                        // original deleted behind it - unrecoverable,
-                        // and silent. That predates the watcher; it is
-                        // just reachable in 5 s rather than never.
-                        //
-                        // So an incomplete file is never ingested. If it
-                        // also stops changing, say so and stop retrying
-                        // it - a visible complaint with the file still on
-                        // disk beats a fragment queued in its place.
-                        let complete = std::fs::read(&p)
-                            .ok()
-                            .is_some_and(|b| nzb_looks_complete(&b));
-                        if !complete {
-                            if settled {
-                                let mut failed = d.watch_failed.lock_ok();
-                                if !failed.contains_key(&p) {
+                // The pass is all stats and whole-file reads - and the
+                // watched folder is often an SMB/NFS share, where any of
+                // them can stall. It runs on a tokio worker, so demote
+                // the thread for the pass (there is no await anywhere
+                // inside it).
+                crate::persist::blocking_db(|| {
+                    if let Ok(entries) = std::fs::read_dir(&dir) {
+                        let mut this_pass = std::collections::HashMap::new();
+                        for e in entries.flatten() {
+                            let p = e.path();
+                            if !p.extension().is_some_and(|x| x.eq_ignore_ascii_case("nzb")) {
+                                continue;
+                            }
+                            // A file that already failed is skipped until
+                            // its mtime or size changes (re-saving it is
+                            // the user's retry).
+                            let Some(sig) = watch_sig(&p) else { continue };
+                            let settled = prev_pass.get(&p) == Some(&sig);
+                            this_pass.insert(p.clone(), sig);
+                            // Ingested earlier with keep-mode on and unchanged
+                            // since: already downloaded from here. Checked
+                            // before anything reads the file, so a kept
+                            // folder full of settled .nzbs costs stats, not
+                            // reads - and never lands in watch_failed as an
+                            // "already queued" warning it does not deserve.
+                            if watch_seen.get(&p).is_some_and(|(t, l, _)| (*t, *l) == sig) {
+                                continue;
+                            }
+                            // Completeness is now the gate, and stillness
+                            // only decides when to give up waiting for it.
+                            //
+                            // Stillness ALONE used to be the gate, and it is
+                            // not sound: a copy that stalls for two passes
+                            // looks identical to a finished one, and a clean
+                            // cut between </file> and </nzb> parses happily
+                            // as a SHORTER release. Measured on a stalled
+                            // 2-file nzb truncated after the first </file>:
+                            // queued as a 1-file release, and the user's
+                            // original deleted behind it - unrecoverable,
+                            // and silent. That predates the watcher; it is
+                            // just reachable in 5 s rather than never.
+                            //
+                            // So an incomplete file is never ingested. If it
+                            // also stops changing, say so and stop retrying
+                            // it - a visible complaint with the file still on
+                            // disk beats a fragment queued in its place.
+                            let complete = std::fs::read(&p)
+                                .ok()
+                                .is_some_and(|b| nzb_looks_complete(&b));
+                            if !complete {
+                                if settled {
+                                    let mut failed = d.watch_failed.lock_ok();
+                                    if !failed.contains_key(&p) {
+                                        info!(
+                                            target: "watch",
+                                            "{} looks truncated - no closing </nzb> tag, \
+                                             and it has stopped changing. Left alone; re-save it \
+                                             to retry.",
+                                            p.display()
+                                        );
+                                        failed.insert(
+                                            p.clone(),
+                                            (
+                                                sig.0,
+                                                sig.1,
+                                                watchfail::TRUNCATED.into(),
+                                                String::new(),
+                                            ),
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
+                            if d.watch_failed
+                                .lock()
+                                .unwrap()
+                                .get(&p)
+                                .is_some_and(|(t, l, _, _)| (*t, *l) == sig)
+                            {
+                                continue;
+                            }
+                            if let Ok(bytes) = std::fs::read(&p) {
+                                // Re-check the signature AFTER the read.
+                                // The settle test compared two passes and
+                                // then read seconds later, so a re-save
+                                // landing in that window was read as a
+                                // torn prefix - which still parses, since
+                                // the XML reader simply stops at the last
+                                // whole <file> - queued as if it were the
+                                // whole release, and then the user's
+                                // freshly written file was DELETED below.
+                                // That is the exact outcome the two-pass
+                                // settle exists to prevent, surviving in
+                                // the gap between the stat and the read.
+                                if watch_sig(&p) != Some(sig) {
                                     info!(
                                         target: "watch",
-                                        "{} looks truncated - no closing </nzb> tag, \
-                                         and it has stopped changing. Left alone; re-save it \
-                                         to retry.",
+                                        "{} changed while being read - leaving it \
+                                         for the next pass",
                                         p.display()
                                     );
-                                    failed.insert(
-                                        p.clone(),
-                                        (sig.0, sig.1, watchfail::TRUNCATED.into(), String::new()),
-                                    );
+                                    continue;
                                 }
-                            }
-                            continue;
-                        }
-                        if d.watch_failed
-                            .lock()
-                            .unwrap()
-                            .get(&p)
-                            .is_some_and(|(t, l, _, _)| (*t, *l) == sig)
-                        {
-                            continue;
-                        }
-                        if let Ok(bytes) = std::fs::read(&p) {
-                            // Re-check the signature AFTER the read.
-                            // The settle test compared two passes and
-                            // then read seconds later, so a re-save
-                            // landing in that window was read as a
-                            // torn prefix - which still parses, since
-                            // the XML reader simply stops at the last
-                            // whole <file> - queued as if it were the
-                            // whole release, and then the user's
-                            // freshly written file was DELETED below.
-                            // That is the exact outcome the two-pass
-                            // settle exists to prevent, surviving in
-                            // the gap between the stat and the read.
-                            if watch_sig(&p) != Some(sig) {
-                                info!(
-                                    target: "watch",
-                                    "{} changed while being read - leaving it \
-                                     for the next pass",
-                                    p.display()
-                                );
-                                continue;
-                            }
-                            // Is this exact NZB already waiting in the
-                            // queue? Deleting the file was the only
-                            // durable "consumed" marker, and the
-                            // in-memory skip list does not survive a
-                            // restart - so a share that refuses the
-                            // unlink, a crash between the queue write
-                            // and the delete, or a deliberately-kept
-                            // file after ENOSPC all meant the next
-                            // start downloaded the whole release
-                            // again. A name without an SxxEyy or year
-                            // has no dupe_key to catch it either.
-                            // The queue IS persisted, so ask it.
-                            let sha = nzb_sha(&bytes);
-                            // The id, not just the fact: the strip's whole
-                            // job here is to point at the record that made
-                            // this file redundant, and a name lookup in the
-                            // page picks the wrong row for a re-post.
-                            let queued_id = d.queue.lock_ok().iter().find_map(|j| {
-                                let g = j.lock_ok();
-                                (g.nzb_sha == sha).then(|| g.nzo_id.clone())
-                            });
-                            if let Some(queued_id) = queued_id {
-                                info!(
-                                    target: "watch",
-                                    "{} is already queued - leaving the file \
-                                     alone rather than downloading it twice",
-                                    p.display()
-                                );
-                                d.watch_failed.lock_ok().insert(
-                                    p.clone(),
-                                    (sig.0, sig.1, watchfail::ALREADY_QUEUED.into(), queued_id),
-                                );
-                                continue;
-                            }
-                            // ...and once it finishes, it is not in the
-                            // queue any more - it is in HISTORY, which is
-                            // persisted through the same file and carries
-                            // the same nzb_sha. Asking only the queue meant
-                            // a source file that cannot be deleted (a
-                            // read-only share, a NAS that refuses the
-                            // unlink) was re-ingested on every single
-                            // daemon start, re-downloading the whole
-                            // release each time; the in-memory skip list
-                            // covers the running process and nothing more.
-                            //
-                            // Completed rows only. A FAILED job's source
-                            // file is exactly the one a user wants
-                            // retried - a takedown that later refills, a
-                            // provider outage - so a failure must not
-                            // become a permanent refusal to look at it.
-                            let done = d.history.lock_ok().iter().find_map(|j| {
-                                let j = j.lock_ok();
-                                (j.nzb_sha == sha && j.state == JobState::Completed)
-                                    .then(|| j.nzo_id.clone())
-                            });
-                            if let Some(done_id) = done {
-                                info!(
-                                    target: "watch",
-                                    "{} has already been downloaded - leaving the \
-                                     file alone rather than downloading it twice. To \
-                                     download it again, delete its History entry first, \
-                                     or add the NZB from the dashboard",
-                                    p.display()
-                                );
-                                d.watch_failed.lock_ok().insert(
-                                    p.clone(),
-                                    (sig.0, sig.1, watchfail::ALREADY_DONE.into(), done_id),
-                                );
-                                continue;
-                            }
-                            let name = p
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .to_string();
-                            // The success path is the one moment nothing
-                            // explained: the file simply vanishes from
-                            // the folder (a browser's download list says
-                            // "Removed", and Gary read that as nzbfast
-                            // deleting his download). Say it in the log,
-                            // and remember it so an open dashboard can
-                            // toast it - named by the folder it came
-                            // from, which is what the user recognises.
-                            let folder = dir
-                                .file_name()
-                                .map(|f| f.to_string_lossy().to_string())
-                                .unwrap_or_else(|| dir.display().to_string());
-                            let note_pickup = || {
-                                info!(
-                                    target: "watch",
-                                    "picked up {name} from {folder} - queued"
-                                );
-                                let mut wp = d.watch_picked.lock_ok();
-                                wp.push_back((name.clone(), folder.clone(), unix_now()));
-                                while wp.len() > 8 {
-                                    wp.pop_front();
-                                }
-                            };
-                            match d.enqueue(&bytes, &name, "", -100, None, "watch", false) {
-                                // Delete the user's file only once the
-                                // queue record is DURABLE.
-                                //
-                                // `enqueue` persists best-effort and
-                                // returns Ok either way, and this deleted
-                                // on Ok - so ENOSPC or EIO on queue.json
-                                // plus a later crash lost both the record
-                                // and the source, with nothing left to
-                                // recover from. The job is live in memory
-                                // regardless, so on a failed commit we
-                                // keep their .nzb and record the failure:
-                                // that stops the next scan re-enqueueing a
-                                // duplicate, and leaves the file to be
-                                // picked up if the daemon does restart.
-                                Ok(_) if d.save_queue() => {
-                                    note_pickup();
-                                    // Keep-mode: the user wants the file
-                                    // (collectors, sharing it for a bug
-                                    // report), so the durable marker is
-                                    // the seen-set instead of the
-                                    // deletion. Read live, per pickup.
-                                    if d.watch_keep_nzb.load(Ordering::Relaxed) {
-                                        watch_seen.insert(p.clone(), (sig.0, sig.1, sha.clone()));
-                                        save_watch_seen(&seen_path, &watch_seen);
-                                        d.watch_failed.lock_ok().remove(&p);
-                                        continue;
-                                    }
-                                    // The queue owns the release now, so
-                                    // the source goes. If it can't be
-                                    // removed (read-only bind mount, no
-                                    // unlink right on the share) it has
-                                    // to be remembered exactly like a
-                                    // failure is: otherwise every pass
-                                    // re-reads the same bytes and the
-                                    // release is queued - and fetched
-                                    // from the provider - all over again,
-                                    // once every 5 s, forever.
-                                    // To the Trash, not gone: this is
-                                    // the user's own .nzb, and "I dropped
-                                    // it in and now I cannot find it
-                                    // again" is a real complaint.
-                                    match crate::smart::remove_user_file(
-                                        &p,
-                                        crate::smart::delete_to_trash(),
-                                    ) {
-                                        Ok(_) => {
-                                            // Forget the signature with the
-                                            // file: a re-drop of the same
-                                            // .nzb at the same path would
-                                            // otherwise match the record we
-                                            // just ingested (mtime-
-                                            // preserving copies reproduce it
-                                            // exactly) and count as settled
-                                            // on sight - the very thing the
-                                            // pass memory exists to stop.
-                                            this_pass.remove(&p);
-                                            d.watch_failed.lock_ok().remove(&p);
-                                        }
-                                        Err(err) => {
-                                            warn!(
-                                                target: "watch",
-                                                "{name} queued, but {} could not be \
-                                                 removed - {err}; delete it yourself or it \
-                                                 stays listed",
-                                                p.display()
-                                            );
-                                            d.watch_failed.lock_ok().insert(
-                                                p,
-                                                (
-                                                    sig.0,
-                                                    sig.1,
-                                                    format!("{}: {err}", watchfail::KEPT),
-                                                    String::new(),
-                                                ),
-                                            );
-                                        }
-                                    }
-                                }
-                                Ok(_) => {
-                                    // Queued in memory even though the
-                                    // save failed, so the pickup is
-                                    // still worth announcing.
-                                    note_pickup();
-                                    warn!(
+                                // Is this exact NZB already waiting in the
+                                // queue? Deleting the file was the only
+                                // durable "consumed" marker, and the
+                                // in-memory skip list does not survive a
+                                // restart - so a share that refuses the
+                                // unlink, a crash between the queue write
+                                // and the delete, or a deliberately-kept
+                                // file after ENOSPC all meant the next
+                                // start downloaded the whole release
+                                // again. A name without an SxxEyy or year
+                                // has no dupe_key to catch it either.
+                                // The queue IS persisted, so ask it.
+                                let sha = nzb_sha(&bytes);
+                                // The id, not just the fact: the strip's whole
+                                // job here is to point at the record that made
+                                // this file redundant, and a name lookup in the
+                                // page picks the wrong row for a re-post.
+                                let queued_id = d.queue.lock_ok().iter().find_map(|j| {
+                                    let g = j.lock_ok();
+                                    (g.nzb_sha == sha).then(|| g.nzo_id.clone())
+                                });
+                                if let Some(queued_id) = queued_id {
+                                    info!(
                                         target: "watch",
-                                        "{name} queued but the queue could not be \
-                                         saved - keeping your file at {}",
+                                        "{} is already queued - leaving the file \
+                                         alone rather than downloading it twice",
                                         p.display()
                                     );
                                     d.watch_failed.lock_ok().insert(
-                                        p,
-                                        (
-                                            sig.0,
-                                            sig.1,
-                                            watchfail::UNSAVED.to_string(),
-                                            String::new(),
-                                        ),
+                                        p.clone(),
+                                        (sig.0, sig.1, watchfail::ALREADY_QUEUED.into(), queued_id),
                                     );
+                                    continue;
                                 }
-                                Err(err) => {
-                                    info!(target: "watch", "{name} rejected: {err}");
-                                    d.watch_failed
-                                        .lock()
-                                        .unwrap()
-                                        .insert(p, (sig.0, sig.1, err.to_string(), String::new()));
+                                // ...and once it finishes, it is not in the
+                                // queue any more - it is in HISTORY, which is
+                                // persisted through the same file and carries
+                                // the same nzb_sha. Asking only the queue meant
+                                // a source file that cannot be deleted (a
+                                // read-only share, a NAS that refuses the
+                                // unlink) was re-ingested on every single
+                                // daemon start, re-downloading the whole
+                                // release each time; the in-memory skip list
+                                // covers the running process and nothing more.
+                                //
+                                // Completed rows only. A FAILED job's source
+                                // file is exactly the one a user wants
+                                // retried - a takedown that later refills, a
+                                // provider outage - so a failure must not
+                                // become a permanent refusal to look at it.
+                                let done = d.history.lock_ok().iter().find_map(|j| {
+                                    let j = j.lock_ok();
+                                    (j.nzb_sha == sha && j.state == JobState::Completed)
+                                        .then(|| j.nzo_id.clone())
+                                });
+                                if let Some(done_id) = done {
+                                    info!(
+                                        target: "watch",
+                                        "{} has already been downloaded - leaving the \
+                                         file alone rather than downloading it twice. To \
+                                         download it again, delete its History entry first, \
+                                         or add the NZB from the dashboard",
+                                        p.display()
+                                    );
+                                    d.watch_failed.lock_ok().insert(
+                                        p.clone(),
+                                        (sig.0, sig.1, watchfail::ALREADY_DONE.into(), done_id),
+                                    );
+                                    continue;
+                                }
+                                let name = p
+                                    .file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .to_string();
+                                // The success path is the one moment nothing
+                                // explained: the file simply vanishes from
+                                // the folder (a browser's download list says
+                                // "Removed", and Gary read that as nzbfast
+                                // deleting his download). Say it in the log,
+                                // and remember it so an open dashboard can
+                                // toast it - named by the folder it came
+                                // from, which is what the user recognises.
+                                let folder = dir
+                                    .file_name()
+                                    .map(|f| f.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| dir.display().to_string());
+                                let note_pickup = || {
+                                    info!(
+                                        target: "watch",
+                                        "picked up {name} from {folder} - queued"
+                                    );
+                                    let mut wp = d.watch_picked.lock_ok();
+                                    wp.push_back((name.clone(), folder.clone(), unix_now()));
+                                    while wp.len() > 8 {
+                                        wp.pop_front();
+                                    }
+                                };
+                                match d.enqueue(&bytes, &name, "", -100, None, "watch", false) {
+                                    // Delete the user's file only once the
+                                    // queue record is DURABLE.
+                                    //
+                                    // `enqueue` persists best-effort and
+                                    // returns Ok either way, and this deleted
+                                    // on Ok - so ENOSPC or EIO on queue.json
+                                    // plus a later crash lost both the record
+                                    // and the source, with nothing left to
+                                    // recover from. The job is live in memory
+                                    // regardless, so on a failed commit we
+                                    // keep their .nzb and record the failure:
+                                    // that stops the next scan re-enqueueing a
+                                    // duplicate, and leaves the file to be
+                                    // picked up if the daemon does restart.
+                                    Ok(_) if d.save_queue() => {
+                                        note_pickup();
+                                        // Keep-mode: the user wants the file
+                                        // (collectors, sharing it for a bug
+                                        // report), so the durable marker is
+                                        // the seen-set instead of the
+                                        // deletion. Read live, per pickup.
+                                        if d.watch_keep_nzb.load(Ordering::Relaxed) {
+                                            watch_seen
+                                                .insert(p.clone(), (sig.0, sig.1, sha.clone()));
+                                            save_watch_seen(&seen_path, &watch_seen);
+                                            d.watch_failed.lock_ok().remove(&p);
+                                            continue;
+                                        }
+                                        // The queue owns the release now, so
+                                        // the source goes. If it can't be
+                                        // removed (read-only bind mount, no
+                                        // unlink right on the share) it has
+                                        // to be remembered exactly like a
+                                        // failure is: otherwise every pass
+                                        // re-reads the same bytes and the
+                                        // release is queued - and fetched
+                                        // from the provider - all over again,
+                                        // once every 5 s, forever.
+                                        // To the Trash, not gone: this is
+                                        // the user's own .nzb, and "I dropped
+                                        // it in and now I cannot find it
+                                        // again" is a real complaint.
+                                        match crate::smart::remove_user_file(
+                                            &p,
+                                            crate::smart::delete_to_trash(),
+                                        ) {
+                                            Ok(_) => {
+                                                // Forget the signature with the
+                                                // file: a re-drop of the same
+                                                // .nzb at the same path would
+                                                // otherwise match the record we
+                                                // just ingested (mtime-
+                                                // preserving copies reproduce it
+                                                // exactly) and count as settled
+                                                // on sight - the very thing the
+                                                // pass memory exists to stop.
+                                                this_pass.remove(&p);
+                                                d.watch_failed.lock_ok().remove(&p);
+                                            }
+                                            Err(err) => {
+                                                warn!(
+                                                    target: "watch",
+                                                    "{name} queued, but {} could not be \
+                                                     removed - {err}; delete it yourself or it \
+                                                     stays listed",
+                                                    p.display()
+                                                );
+                                                d.watch_failed.lock_ok().insert(
+                                                    p,
+                                                    (
+                                                        sig.0,
+                                                        sig.1,
+                                                        format!("{}: {err}", watchfail::KEPT),
+                                                        String::new(),
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Ok(_) => {
+                                        // Queued in memory even though the
+                                        // save failed, so the pickup is
+                                        // still worth announcing.
+                                        note_pickup();
+                                        warn!(
+                                            target: "watch",
+                                            "{name} queued but the queue could not be \
+                                             saved - keeping your file at {}",
+                                            p.display()
+                                        );
+                                        d.watch_failed.lock_ok().insert(
+                                            p,
+                                            (
+                                                sig.0,
+                                                sig.1,
+                                                watchfail::UNSAVED.to_string(),
+                                                String::new(),
+                                            ),
+                                        );
+                                    }
+                                    Err(err) => {
+                                        info!(target: "watch", "{name} rejected: {err}");
+                                        d.watch_failed.lock_ok().insert(
+                                            p,
+                                            (sig.0, sig.1, err.to_string(), String::new()),
+                                        );
+                                    }
                                 }
                             }
                         }
+                        // Only names this pass actually saw carry over, so
+                        // an ingested or deleted file leaves nothing behind.
+                        prev_pass = this_pass;
                     }
-                    // Only names this pass actually saw carry over, so
-                    // an ingested or deleted file leaves nothing behind.
-                    prev_pass = this_pass;
-                }
-                // Files the user deleted or moved drop off the list.
-                d.watch_failed.lock_ok().retain(|p, _| p.exists());
-                // ...and off the keep-mode seen-set, so it never grows
-                // past what the folder actually holds. Persisted only
-                // when something actually left.
-                let before = watch_seen.len();
-                watch_seen.retain(|p, _| p.exists());
-                if watch_seen.len() != before {
-                    save_watch_seen(&seen_path, &watch_seen);
-                }
+                    // Files the user deleted or moved drop off the list.
+                    d.watch_failed.lock_ok().retain(|p, _| p.exists());
+                    // ...and off the keep-mode seen-set, so it never grows
+                    // past what the folder actually holds. Persisted only
+                    // when something actually left.
+                    let before = watch_seen.len();
+                    watch_seen.retain(|p, _| p.exists());
+                    if watch_seen.len() != before {
+                        save_watch_seen(&seen_path, &watch_seen);
+                    }
+                });
             }
             // Wake on whichever comes first: the backstop interval, or
             // the filesystem watcher saying the folder changed. The poll
@@ -1657,6 +1765,7 @@ pub(super) fn spawn_auto_speed(daemon: &Arc<Daemon>, config: &std::path::Path) {
 /// after that, a refetch once a day picks up newly created groups
 /// (the browser's "Newly added" chip and saved-search notices feed
 /// off the first_seen stamps that diff produces).
+#[cfg(feature = "indexer")]
 pub(super) fn spawn_group_catalog(daemon: &Arc<Daemon>, config: &std::path::Path) {
     let d = daemon.clone();
     let config = config.to_path_buf();
@@ -1738,6 +1847,7 @@ pub(super) fn spawn_group_catalog(daemon: &Arc<Daemon>, config: &std::path::Path
 /// marks in the index db make re-scans cheap). Always spawned: the
 /// group list / interval / backfill are live settings read each cycle,
 /// so indexing can be switched on from the dashboard.
+#[cfg(feature = "indexer")]
 pub(super) fn spawn_index_scan(
     daemon: &Arc<Daemon>,
     config: &std::path::Path,
@@ -2335,6 +2445,7 @@ pub(super) fn spawn_index_scan(
 /// again a minute later - a compact that never happens costs disk,
 /// a compact that runs at the wrong time costs the user their
 /// download.
+#[cfg(feature = "indexer")]
 pub(super) fn spawn_index_compact(
     daemon: &Arc<Daemon>,
     index_pass_gate: &Arc<tokio::sync::Mutex<()>>,
@@ -2364,7 +2475,11 @@ pub(super) fn spawn_index_compact(
             let Ok(_index_pass) = index_pass_gate.try_lock() else {
                 continue;
             };
-            let db_bytes = std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
+            // A stat, but on whatever volume holds the index - demote
+            // the worker like every other sync fs touch on a tokio task.
+            let db_bytes = crate::persist::blocking_db(|| {
+                std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0)
+            });
             // §95: which of the two paths this database can take, read
             // BEFORE the verdict because it decides whether the volume
             // needs room for a second copy. A fresh install has been
@@ -2393,7 +2508,9 @@ pub(super) fn spawn_index_compact(
                 // pipeline is still busy.
                 d.index_jobs_active.load(Ordering::Acquire) > 0,
                 db_bytes,
-                free_bytes(db.parent().unwrap_or(std::path::Path::new("."))),
+                crate::persist::blocking_db(|| {
+                    free_bytes(db.parent().unwrap_or(std::path::Path::new(".")))
+                }),
                 style == nzbkit::index::CompactStyle::FullRewrite,
             );
             match verdict {
@@ -2539,6 +2656,7 @@ pub(super) fn spawn_index_compact(
 /// multi-minute pass is the 2 Aug wedge shape all over again. Between
 /// chunks the mutex is free, so an admin edit waits one chunk (~100 ms),
 /// not the whole compaction.
+#[cfg(feature = "indexer")]
 async fn chunked_compact(d: &Arc<Daemon>, db: &std::path::Path) {
     let d2 = d.clone();
     let jobs = d.index_jobs_active.clone();
@@ -2612,6 +2730,7 @@ async fn chunked_compact(d: &Arc<Daemon>, db: &std::path::Path) {
 /// `None` clears it, which is what an install with no watchlist - or the
 /// setting switched off - must do, or a handle would keep journalling
 /// hits nobody will ever drain.
+#[cfg(feature = "indexer")]
 pub(super) fn install_instant_watch(
     ix: &mut nzbkit::index::Index,
     matcher: Option<crate::watchlist::InstantMatcher>,
@@ -2630,6 +2749,7 @@ pub(super) fn install_instant_watch(
 /// considers complete releases. Nothing here decides anything about a
 /// release - the pass does that, with the whole ladder - so the worst a
 /// wrong call costs is a wasted look or a minute of latency.
+#[cfg(feature = "indexer")]
 pub(super) fn instant_arrivals(
     d: &Arc<Daemon>,
     hits: Vec<nzbkit::index::WatchHit>,
@@ -2698,6 +2818,7 @@ pub(super) fn instant_arrivals(
 /// simply picked up by the next pass, exactly as before - the mark
 /// only ever advances over a contiguous prefix, so falling behind
 /// costs latency, never coverage.
+#[cfg(feature = "indexer")]
 pub(super) fn spawn_tip_watcher(
     daemon: &Arc<Daemon>,
     config: &std::path::Path,
@@ -2969,6 +3090,7 @@ pub(super) fn spawn_tip_watcher(
 /// = STATs/hour/server (live setting, default 300; 0 disables). Sits
 /// out whole ticks while a download is active so it never competes
 /// for account connection slots.
+#[cfg(feature = "indexer")]
 pub(super) fn spawn_oracle_sampler(daemon: &Arc<Daemon>, config: &std::path::Path) {
     let config = config.to_path_buf();
     let d = daemon.clone();
@@ -3709,6 +3831,7 @@ pub(super) fn spawn_watchlist_watcher(daemon: &Arc<Daemon>, settings_path: &std:
                 // stale and it would re-fetch the same shows from
                 // TVmaze every minute. Skip it rather than let it
                 // run uncached; the pass itself does not need it.
+                #[cfg(feature = "indexer")]
                 if local {
                     watch_calendar_refresh(&d2);
                 }
@@ -3717,6 +3840,7 @@ pub(super) fn spawn_watchlist_watcher(daemon: &Arc<Daemon>, settings_path: &std:
             .await;
         }
     });
+    #[cfg(feature = "indexer")]
     spawn_instant_recheck(daemon);
 }
 
@@ -3732,6 +3856,7 @@ pub(super) fn spawn_watchlist_watcher(daemon: &Arc<Daemon>, settings_path: &std:
 /// Cheap by construction: one indexed lookup per parked release, and the
 /// loop does nothing at all while the map is empty, which is almost
 /// always.
+#[cfg(feature = "indexer")]
 fn spawn_instant_recheck(daemon: &Arc<Daemon>) {
     let d = daemon.clone();
     tokio::spawn(async move {
@@ -3805,13 +3930,35 @@ pub(super) fn spawn_download_worker(
         let mut guard_reason: Option<String> = None;
         // The previous job's in-flight tail (≤1 outstanding).
         let mut prev_tail: Option<tokio::task::JoinHandle<()>> = None;
+        // In-flight statfs probe for the min-free guard (≤1 outstanding).
+        let mut disk_probe: Option<tokio::task::JoinHandle<Option<u64>>> = None;
         loop {
             // M14g guards. Low disk stops everything (a Force job
             // can't write to a full disk either); a spent quota still
             // lets Force jobs through (SAB semantics).
+            //
+            // statfs on an external or network volume can hang without
+            // bound (a NAS share that dropped, a sleeping USB disk), and
+            // this loop IS the runner - a hung probe here stops every
+            // pick. Probe on the blocking pool with a timeout; a timeout
+            // means "unknown", which must not block the pick (None
+            // already means the guard stands down, same as a missing
+            // directory). Keep the ONE stuck probe and re-await it next
+            // pass rather than stacking a new blocked thread per pass.
             let min = d.min_free.load(Ordering::Relaxed);
+            let mut free_now: Option<u64> = None;
+            if min > 0 {
+                let mut probe = disk_probe.take().unwrap_or_else(|| {
+                    let out = d.out_dir();
+                    tokio::task::spawn_blocking(move || free_bytes(&out))
+                });
+                match tokio::time::timeout(std::time::Duration::from_secs(2), &mut probe).await {
+                    Ok(res) => free_now = res.ok().flatten(),
+                    Err(_) => disk_probe = Some(probe),
+                }
+            }
             if min > 0
-                && let Some(free) = free_bytes(&d.out_dir())
+                && let Some(free) = free_now
                 && free < min
             {
                 if guard_reason.as_deref() != Some("disk") {
@@ -3822,6 +3969,16 @@ pub(super) fn spawn_download_worker(
                         min as f64 / 1e9
                     );
                     guard_reason = Some("disk".into());
+                    // Marker on the transition only - this loop re-checks
+                    // every 5 s and the row strip carries the live figure.
+                    d.note_event(
+                        "disk",
+                        format!(
+                            "downloads paused - {:.1} GB free is under the {:.1} GB minimum",
+                            free as f64 / 1e9,
+                            min as f64 / 1e9
+                        ),
+                    );
                 }
                 // Refreshed every pass, not just on entry: the free
                 // figure moves while the user clears space, and the row
@@ -3877,6 +4034,15 @@ pub(super) fn spawn_download_worker(
                         quota as f64 / 1e9
                     );
                     guard_reason = Some("quota".into());
+                    d.note_event(
+                        "quota",
+                        format!(
+                            "download quota spent ({:.1} of {:.1} GB) - only Force \
+                             jobs run until the period rolls over",
+                            led.bytes as f64 / 1e9,
+                            quota as f64 / 1e9
+                        ),
+                    );
                 }
                 *d.queue_hold.lock_ok() =
                     Some(("quota".into(), led.spent() as f64 / 1e9, quota as f64 / 1e9));
@@ -3885,6 +4051,10 @@ pub(super) fn spawn_download_worker(
             if guard_reason.is_some() && !only_force {
                 info!(target: "guard", "cleared");
                 guard_reason = None;
+                d.note_event(
+                    "clear",
+                    "the space and quota guards cleared - downloads resume",
+                );
             }
             if guard_reason.is_none() {
                 let mut h = d.queue_hold.lock_ok();
@@ -3928,6 +4098,28 @@ pub(super) fn spawn_download_worker(
             let (nzb_path, out_dir, total, library, nzo_id, name, prio, job_password, eat_ok) = {
                 let mut j = job.lock_ok();
                 j.state = JobState::Downloading;
+                // Late-pick marker: the runner was free when this job
+                // arrived, yet took over 2 s to start it - the signature
+                // of the fixed runner-starvation bug, named so any
+                // recurrence attributes itself. Taken, not read, so a
+                // job that requeues can never replay a stale stamp.
+                if let Some(waited) = j
+                    .queued_at
+                    .take()
+                    .filter(|_| j.idle_at_add)
+                    .map(|t| t.elapsed())
+                    .filter(|w| *w > std::time::Duration::from_secs(2))
+                {
+                    d.note_event(
+                        "late",
+                        format!(
+                            "{} started {:.1} s after it was added with nothing \
+                             ahead of it - the runner was slow to pick it up",
+                            j.name,
+                            waited.as_secs_f64()
+                        ),
+                    );
+                }
                 (
                     j.nzb_path.clone(),
                     j.out_dir.clone(),
@@ -3985,14 +4177,15 @@ pub(super) fn spawn_download_worker(
                         Ok(crate::Verdict::Impossible {
                             est_missing,
                             recovery,
+                            ..
                         }) => {
                             j.state = JobState::Failed;
                             // The counts make the verdict checkable;
                             // append-only, the prefix is classified on.
                             j.fail_message = crate::with_build(format!(
                                 "pre-flight: articles missing beyond repair - an \
-                                 estimated {est_missing} segment(s) unavailable vs \
-                                 {recovery} recovery block(s) in the NZB"
+                                 estimated {est_missing} payload segment(s) \
+                                 unavailable vs {recovery} recovery block(s) in the NZB"
                             ));
                         }
                         Ok(_) => {
@@ -4047,14 +4240,15 @@ pub(super) fn spawn_download_worker(
                     Ok(crate::Verdict::Impossible {
                         est_missing,
                         recovery,
+                        ..
                     }) => {
                         {
                             let mut j = job.lock_ok();
                             j.state = JobState::Failed;
                             j.fail_message = crate::with_build(format!(
                                 "pre-flight: articles missing beyond repair - an \
-                                 estimated {est_missing} segment(s) unavailable vs \
-                                 {recovery} recovery block(s) in the NZB"
+                                 estimated {est_missing} payload segment(s) \
+                                 unavailable vs {recovery} recovery block(s) in the NZB"
                             ));
                             j.fail_detail = crate::fail_detail_snapshot(log_mark);
                             j.finished_at = Some(Instant::now());
@@ -4122,11 +4316,19 @@ pub(super) fn spawn_download_worker(
             // (family, age-bucket). Off → cleared, so a plain job never
             // consults it. A wrong verdict costs only latency (the
             // engine never removes the last usable provider).
-            *d.hub.route_gone.lock_ok() = if d.oracle_route.load(Ordering::Relaxed) {
-                d.with_index(|ix| ix.oracle_snapshot().ok())
-            } else {
-                None
-            };
+            #[cfg(feature = "indexer")]
+            {
+                *d.hub.route_gone.lock_ok() = if d.oracle_route.load(Ordering::Relaxed) {
+                    d.with_index(|ix| ix.oracle_snapshot().ok())
+                } else {
+                    None
+                };
+            }
+            // Slim build: no availability ledger, so no snapshot to route by.
+            #[cfg(not(feature = "indexer"))]
+            {
+                *d.hub.route_gone.lock_ok() = None;
+            }
             // Also drop the previous job's extractor. It is otherwise
             // left installed for post-completion streaming, but now that
             // active_stream points at THIS job, a /stream/<this id>
@@ -4212,6 +4414,14 @@ pub(super) fn spawn_download_worker(
             // had renamed its directory, and the whole release
             // downloaded a second time (31 Jul queue soak).
             *d.started_at.lock_ok() = None;
+            // Phase marker: the pipeline (download AND checks) is over.
+            // This is what closes the chart's "checking files" shading -
+            // without it the tint would run on into the idle time after
+            // the job, dressing ordinary quiet as an endless check.
+            d.note_event(
+                "finished",
+                "job finished - the line is idle until the next download",
+            );
             // Release the progress counters at the same instant and for
             // the same reason: from here this job reads 100% and its
             // phase word, and the next job is free to zero them without
@@ -4278,6 +4488,7 @@ pub(super) fn spawn_download_worker(
             d.add_reliability(&per_server_rel);
             // M29 oracle: fold this job's per-article outcomes into
             // the availability ledger (one batched transaction).
+            #[cfg(feature = "indexer")]
             if let Some(sink) = d.hub.oracle.lock_ok().take() {
                 let samples = sink.drain();
                 if !samples.is_empty() {
@@ -5330,11 +5541,146 @@ pub(super) fn spawn_slow_job_watchdog(
     });
 }
 
+/// TODO 112 (dark, NZBFAST_LIVE_TUNE=1): the live connection tuner's
+/// epoch loop - one `EpochObs` per server per epoch off the live
+/// gauges, fed to the pure controller in `nzbkit::livetune`, whose
+/// verdict moves the per-host `ConnTarget` the pool build attached.
+///
+/// Everything noisy stays in `livetune` behind pinned rules; this loop
+/// only OBSERVES:
+/// - rate: per-host byte delta over the epoch, from `pool_live`,
+/// - busy: the same pool spanned the whole epoch, bytes moved, and the
+///   article queue has not latched its tail (a drying queue measures
+///   the queue, not the line),
+/// - rate_limited: the global limiter is set and the aggregate sat
+///   near it - socket-count verdicts are meaningless at a byte cap,
+/// - capacity_pressure: a "cap" ring event for this host inside the
+///   epoch (481/502 refusals and the flap-keeper clamp both emit it),
+/// - fleet_met: the fleet actually reached the target it was asked
+///   to run.
+///
+/// The controller's belief lives here (per host, daemon lifetime); the
+/// ceiling is re-read from config each epoch so a settings change
+/// clamps within one epoch. Nothing is ever written to settings - the
+/// target is state, and the dashboard's "using M of N" gauge follows
+/// it through `ServerLive::budget`.
+pub(super) fn spawn_live_tuner(daemon: &Arc<Daemon>, config: &std::path::Path) {
+    if !crate::conntune::live_tune_on() {
+        return;
+    }
+    let d = daemon.clone();
+    let config = config.to_path_buf();
+    tokio::spawn(async move {
+        let epoch_secs: u64 = std::env::var("NZBFAST_LIVE_TUNE_EPOCH_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60)
+            .max(5);
+        let epoch = std::time::Duration::from_secs(epoch_secs);
+        info!("live-tune: epoch controller on ({epoch_secs}s epochs)");
+        let mut tuners: std::collections::HashMap<String, nzbkit::livetune::ServerTuner> =
+            Default::default();
+        // (pool identity, per-host cumulative bytes) at epoch start.
+        let mut prev: Option<(Arc<nzbkit::pool::LiveStats>, Vec<(String, u64)>)> = None;
+        loop {
+            tokio::time::sleep(epoch).await;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|t| t.as_millis() as u64)
+                .unwrap_or(0);
+            let live = d.hub.pool_live.lock_ok().clone();
+            let Some(live) = live else {
+                prev = None;
+                continue;
+            };
+            let bytes_now: Vec<(String, u64)> = live
+                .servers
+                .iter()
+                .map(|s| (s.host.clone(), s.bytes.load(Ordering::Relaxed)))
+                .collect();
+            // The epoch is only a measurement if the SAME run spanned
+            // it end to end.
+            let Some((plive, pbytes)) = prev.replace((live.clone(), bytes_now.clone())) else {
+                continue;
+            };
+            if !Arc::ptr_eq(&plive, &live) {
+                continue;
+            }
+            let tail_latched = d
+                .hub
+                .queue_ctl
+                .lock_ok()
+                .as_ref()
+                .and_then(|q| q.tail_pending())
+                .is_some();
+            let deltas: Vec<(String, u64)> = bytes_now
+                .iter()
+                .zip(pbytes.iter())
+                .filter(|((h1, _), (h2, _))| h1 == h2)
+                .map(|((h, b1), (_, b0))| (h.clone(), b1.saturating_sub(*b0)))
+                .collect();
+            let total: u64 = deltas.iter().map(|(_, b)| *b).sum();
+            let cap = d.hub.rate.get();
+            let rate_limited = cap > 0 && (total as f64 / epoch.as_secs_f64()) >= cap as f64 * 0.85;
+            // Capacity events inside this epoch, by host.
+            let epoch_start_ms = now_ms.saturating_sub(epoch.as_millis() as u64);
+            let cap_events: std::collections::HashSet<String> = live
+                .recent_events(60)
+                .into_iter()
+                .filter(|e| e.kind == "cap" && e.at_ms >= epoch_start_ms)
+                .map(|e| e.host)
+                .collect();
+            let cfg_servers = nzbkit::config::Config::load(&config)
+                .map(|c| c.servers)
+                .unwrap_or_default();
+            let global = d.connections.load(Ordering::Relaxed).max(1);
+            for (i, sl) in live.servers.iter().enumerate() {
+                let target = {
+                    let g = d.hub.live_targets.lock_ok();
+                    g.get(&sl.host).cloned()
+                };
+                // No handle = pinned server, sidecar hub, or the
+                // feature raced a config change: nothing to move.
+                let Some(target) = target else { continue };
+                let ceiling = cfg_servers
+                    .iter()
+                    .find(|s| s.host == sl.host)
+                    .map(|s| crate::conntune::effective_limit(global, s.connections))
+                    .unwrap_or_else(|| target.get());
+                let tuner = tuners.entry(sl.host.clone()).or_insert_with(|| {
+                    nzbkit::livetune::ServerTuner::new(target.get(), ceiling, 3)
+                });
+                let delta = deltas.get(i).map(|(_, b)| *b).unwrap_or(0);
+                let connected = sl.connected.load(Ordering::Relaxed);
+                let before = tuner.target();
+                tuner.on_epoch(nzbkit::livetune::EpochObs {
+                    rate_bps: delta as f64 / epoch.as_secs_f64(),
+                    busy: delta > 0 && !tail_latched,
+                    rate_limited,
+                    capacity_pressure: cap_events.contains(&sl.host),
+                    fleet_met: connected >= target.get(),
+                });
+                let desired = tuner.desired().min(ceiling);
+                target.set(desired);
+                sl.budget.store(target.get(), Ordering::Relaxed);
+                if tuner.target() != before {
+                    info!(
+                        "live-tune: {} using {} of {ceiling} (was {before})",
+                        sl.host,
+                        tuner.target()
+                    );
+                }
+            }
+        }
+    });
+}
+
 /// NZBFAST_NO_ENRICH=1 disables the metadata workers entirely - set by
 /// the test suite (they hit the real internet: the IMDb refresher pulls
 /// a ~25 MB dataset and ingests 425k rows on every fresh db, whose
 /// write transaction also locked the first index scan out - the
 /// long-standing scan_loop test "flake").
+#[cfg(feature = "indexer")]
 pub(super) fn spawn_enrichment_workers(daemon: &Arc<Daemon>, tmdb_key: &Option<String>) {
     if std::env::var_os("NZBFAST_NO_ENRICH").is_none() {
         {
@@ -6053,3 +6399,7 @@ mod stall_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tasks_tests.rs"]
+mod tasks_tests;

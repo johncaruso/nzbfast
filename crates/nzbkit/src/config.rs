@@ -1051,3 +1051,383 @@ mod obf_tests {
         assert_eq!(back.password.as_deref(), Some("Tr0ub4dor&3!"));
     }
 }
+
+/// One SABnzbd category, reduced to the two fields that have a home in
+/// nzbfast: its name, and where finished downloads in it should land.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SabCategory {
+    /// The category name, already reduced to a single path component -
+    /// nzbfast's `enqueue` and `refile_out_dir` both sanitize it into
+    /// one, so `movies/anime` would become the literal folder
+    /// `movies_anime` rather than a nested path. The nesting, when there
+    /// is any, lives in `dir` instead.
+    pub name: String,
+    /// Absolute destination for this category, or `None` when SAB's
+    /// layout already matches what nzbfast does by default and an
+    /// override would change nothing.
+    pub dir: Option<String>,
+}
+
+/// What [`parse_sabnzbd_categories`] found, and what it could not carry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SabCategories {
+    pub cats: Vec<SabCategory>,
+    /// Human-readable notes about fields that were present in the file
+    /// and deliberately not imported. Surfaced to the user rather than
+    /// dropped silently: an import that looks complete when it is not is
+    /// worse than one that says what it left behind.
+    pub dropped: Vec<String>,
+}
+
+/// Parse the `[categories]` section of a SABnzbd configobj ini.
+///
+/// Only `name` and `dir` come over. A SAB category has six fields and
+/// four of them have nowhere to go: `pp`, `script` and `priority` are
+/// per-category in SAB and global here, `order` is real precedence in SAB
+/// (`get_ordered_categories` sorts by it) while `Daemon::cats` is a
+/// `BTreeSet` rendered alphabetically, and `newzbin` matches the
+/// INDEXER-supplied category or newsgroup name rather than the release
+/// name - which nzbfast deliberately declines to route on. Every one of
+/// those is reported in `dropped` instead of being ignored.
+///
+/// The directory rules mirror SAB's own `get_complete_directory`:
+///
+/// - a `dir` ending in `*` means "no per-job subdirectory". nzbfast
+///   always joins a job folder, so the star is stripped and the
+///   behaviour is reported as not carried over. It cannot simply be left
+///   on: `sanitize_filename` does not map `*`, so on Linux it would
+///   become a real folder with a star in its name.
+/// - an EMPTY `dir` falls back to the `[[*]]` category's `dir`, not to
+///   `complete_dir`, so `[[*]]` has to be read even though it is not
+///   itself an importable category.
+/// - a relative `dir` is resolved against `[misc] complete_dir`; an
+///   absolute one is left alone and a leading `~/` is expanded. nzbfast's
+///   `move_completed_cats` REFUSES a relative path, so resolving here is
+///   required rather than merely tidy.
+/// - a `dir` that is just the category's own name needs no entry at all:
+///   nzbfast already files a category into its own subfolder, so an
+///   override would say what the default already says.
+pub fn parse_sabnzbd_categories(text: &str) -> SabCategories {
+    use std::collections::HashMap;
+
+    let mut complete_dir = String::new();
+    // Insertion-ordered so the emitted list follows the file rather than
+    // a hash seed; `order` itself cannot be honoured (see `dropped`).
+    let mut order: Vec<String> = Vec::new();
+    let mut cats: HashMap<String, HashMap<String, String>> = HashMap::new();
+
+    let mut section = String::new();
+    let mut sub: Option<String> = None;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(inner) = line.strip_prefix("[[").and_then(|s| s.strip_suffix("]]")) {
+            let name = inner.trim().to_string();
+            if section.eq_ignore_ascii_case("categories") && !name.is_empty() {
+                if !cats.contains_key(&name) {
+                    order.push(name.clone());
+                }
+                cats.entry(name.clone()).or_default();
+                sub = Some(name);
+            } else {
+                sub = None;
+            }
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line
+                .trim_matches(|c| c == '[' || c == ']')
+                .trim()
+                .to_string();
+            sub = None;
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let k = k.trim().to_ascii_lowercase();
+        let v = v.trim();
+        let v = v
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .or_else(|| v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+            .unwrap_or(v)
+            .trim();
+        if section.eq_ignore_ascii_case("misc") && k == "complete_dir" {
+            complete_dir = v.to_string();
+        }
+        if let Some(name) = sub.as_ref()
+            && let Some(map) = cats.get_mut(name)
+        {
+            map.insert(k, v.to_string());
+        }
+    }
+
+    // `[[*]]` is SAB's default category: it supplies the fallback `dir`
+    // for every other one, and is not itself importable.
+    let star_dir = cats
+        .get("*")
+        .and_then(|m| m.get("dir"))
+        .map(String::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let mut out = SabCategories::default();
+    let mut saw_star_flag = false;
+    let saw = |set: &mut Vec<String>, note: &str| {
+        if !set.iter().any(|s| s == note) {
+            set.push(note.to_string());
+        }
+    };
+
+    for name in &order {
+        if name == "*" {
+            continue;
+        }
+        let map = &cats[name];
+        for (key, note) in [
+            ("order", "the order categories are tried in"),
+            ("newzbin", "the indexer-category match terms"),
+            ("pp", "the per-category post-processing level"),
+            ("script", "the per-category post-processing script"),
+            ("priority", "the per-category priority"),
+        ] {
+            if map.get(key).is_some_and(|v| !v.is_empty()) {
+                saw(&mut out.dropped, note);
+            }
+        }
+
+        // SAB lets the display name differ from the section name; the
+        // section name is what `cat_convert` matches on, so it wins when
+        // `name` is absent.
+        let display = map.get("name").filter(|s| !s.is_empty()).unwrap_or(name);
+        let cat = crate::disk::sanitize_filename(display);
+        if cat.is_empty() {
+            continue;
+        }
+
+        let raw_dir = map.get("dir").map(String::as_str).unwrap_or("");
+        let raw_dir = if raw_dir.is_empty() {
+            star_dir.as_str()
+        } else {
+            raw_dir
+        };
+        let (raw_dir, starred) = match raw_dir.strip_suffix('*') {
+            Some(stripped) => (stripped.trim_end_matches('/'), true),
+            None => (raw_dir, false),
+        };
+        if starred {
+            saw_star_flag = true;
+        }
+
+        let dir = if raw_dir.is_empty() || raw_dir == cat {
+            // Nothing to override: with no dir at all, or with a dir that
+            // is exactly the category's own folder, nzbfast's default
+            // filing already puts it in the same place.
+            None
+        } else {
+            Some(resolve_sab_dir(raw_dir, &complete_dir))
+        };
+        out.cats.push(SabCategory { name: cat, dir });
+    }
+
+    if saw_star_flag {
+        saw(
+            &mut out.dropped,
+            "\"no job folder\" (a dir ending in *) - nzbfast always makes one",
+        );
+    }
+    // Any category whose destination could not be made absolute is not
+    // importable as an override, because `move_completed_cats` refuses a
+    // relative path.
+    let unresolved = out
+        .cats
+        .iter()
+        .filter(|c| c.dir.as_deref().is_some_and(|d| !is_absolute_path(d)))
+        .count();
+    if unresolved > 0 {
+        saw(
+            &mut out.dropped,
+            "folders for some categories, because sabnzbd.ini has no [misc] complete_dir \
+             to resolve them against",
+        );
+        out.cats.iter_mut().for_each(|c| match c.dir.as_deref() {
+            Some(d) if !is_absolute_path(d) => c.dir = None,
+            _ => {}
+        });
+    }
+    out
+}
+
+/// SAB's `real_path`: absolute stays, `~/` expands, anything else is
+/// relative to `complete_dir`.
+fn resolve_sab_dir(dir: &str, complete_dir: &str) -> String {
+    if is_absolute_path(dir) {
+        return dir.to_string();
+    }
+    if let Some(rest) = dir.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        return format!("{}/{rest}", home.trim_end_matches('/'));
+    }
+    if complete_dir.is_empty() {
+        return dir.to_string();
+    }
+    format!("{}/{dir}", complete_dir.trim_end_matches('/'))
+}
+
+/// Absolute on either platform, because a sabnzbd.ini written on Windows
+/// is a perfectly ordinary thing to import on Linux and vice versa.
+fn is_absolute_path(p: &str) -> bool {
+    p.starts_with('/')
+        || p.starts_with('\\')
+        || (p.len() > 2
+            && p.as_bytes()[1] == b':'
+            && (p.as_bytes()[2] == b'\\' || p.as_bytes()[2] == b'/'))
+}
+
+#[cfg(test)]
+mod sab_category_tests {
+    use super::*;
+
+    const INI: &str = r#"
+[misc]
+complete_dir = /data/usenet/complete
+[categories]
+[[*]]
+name = *
+dir = ""
+[[movies_anime]]
+name = movies_anime
+order = 0
+dir = movies/movies_anime
+newzbin = *anime*
+[[books]]
+name = books
+dir = books
+[[flat]]
+name = flat
+dir = oneshot/*
+[[absolute]]
+name = absolute
+dir = /mnt/nas/Absolute
+[[bare]]
+name = bare
+[servers]
+[[news.example.com]]
+host = news.example.com
+"#;
+
+    fn cats(text: &str) -> SabCategories {
+        parse_sabnzbd_categories(text)
+    }
+
+    /// Pitfall 6: `[[*]]` supplies fallbacks, it is not a category.
+    #[test]
+    fn the_star_category_is_not_imported() {
+        assert!(!cats(INI).cats.iter().any(|c| c.name == "*"));
+    }
+
+    /// Pitfall 1: a relative dir resolves against `[misc] complete_dir`,
+    /// an absolute one is left alone. This is not cosmetic - since #20,
+    /// `move_completed_cats` REFUSES a relative path outright.
+    #[test]
+    fn a_relative_dir_resolves_against_complete_dir_and_an_absolute_one_does_not() {
+        let c = cats(INI);
+        let by = |n: &str| c.cats.iter().find(|c| c.name == n).unwrap().dir.clone();
+        assert_eq!(
+            by("movies_anime"),
+            Some("/data/usenet/complete/movies/movies_anime".into())
+        );
+        assert_eq!(by("absolute"), Some("/mnt/nas/Absolute".into()));
+    }
+
+    /// Pitfall 4: a dir equal to the category's own name is already what
+    /// nzbfast does, so it must NOT bloat the override setting.
+    #[test]
+    fn a_dir_that_is_just_the_category_name_needs_no_override() {
+        let c = cats(INI);
+        let books = c.cats.iter().find(|c| c.name == "books").unwrap();
+        assert_eq!(
+            books.dir, None,
+            "an override was emitted that changes nothing"
+        );
+        // ...and so does a category with no dir at all, which falls back
+        // to `[[*]]`'s empty dir rather than to complete_dir.
+        let bare = c.cats.iter().find(|c| c.name == "bare").unwrap();
+        assert_eq!(bare.dir, None);
+    }
+
+    /// Pitfall 2: a trailing `*` is a "no job folder" FLAG, not a path.
+    /// It must be stripped (sanitize_filename does not map `*`, so it
+    /// would otherwise become a real folder with a star in its name) and
+    /// the behaviour must be reported as not carried over.
+    #[test]
+    fn a_starred_dir_is_stripped_and_the_lost_behaviour_is_reported() {
+        let c = cats(INI);
+        let flat = c.cats.iter().find(|c| c.name == "flat").unwrap();
+        assert_eq!(flat.dir, Some("/data/usenet/complete/oneshot".into()));
+        assert!(
+            c.dropped.iter().any(|d| d.contains("no job folder")),
+            "the star's meaning was dropped silently: {:?}",
+            c.dropped
+        );
+    }
+
+    /// Pitfall 5: the category is one path component. A nested dir can
+    /// only live in the override, never in the name.
+    #[test]
+    fn a_category_name_is_always_a_single_component() {
+        let c = cats("[categories]\n[[x]]\nname = movies/anime\ndir = /a/b\n");
+        assert_eq!(c.cats[0].name, "movies_anime");
+        assert_eq!(c.cats[0].dir, Some("/a/b".into()));
+    }
+
+    /// Pitfall 7 and the scope note: everything with nowhere to go is
+    /// NAMED, so an import cannot look complete when it is not.
+    #[test]
+    fn every_unimportable_field_is_reported() {
+        let c = cats(INI);
+        let joined = c.dropped.join(" | ");
+        for want in ["order", "indexer-category", "no job folder"] {
+            assert!(joined.contains(want), "{want:?} not reported in {joined:?}");
+        }
+        let c2 = cats("[categories]\n[[a]]\ndir = /x\npp = 3\nscript = go.sh\npriority = -1\n");
+        let j2 = c2.dropped.join(" | ");
+        for want in [
+            "post-processing level",
+            "post-processing script",
+            "priority",
+        ] {
+            assert!(
+                want.is_empty() || j2.contains(want),
+                "{want:?} not in {j2:?}"
+            );
+        }
+    }
+
+    /// With no `complete_dir` there is nothing to resolve a relative dir
+    /// against. Dropping the override is the honest answer - emitting a
+    /// relative one would be rejected by the settings arm anyway.
+    #[test]
+    fn a_relative_dir_with_no_complete_dir_is_dropped_and_said_so() {
+        let c = cats("[categories]\n[[tv]]\nname = tv\ndir = shows/tv\n");
+        assert_eq!(c.cats[0].dir, None);
+        assert!(
+            c.dropped.iter().any(|d| d.contains("complete_dir")),
+            "{:?}",
+            c.dropped
+        );
+    }
+
+    /// The parser must not wander into `[servers]` or back out of it.
+    #[test]
+    fn only_the_categories_section_is_read() {
+        let c = cats(INI);
+        assert!(!c.cats.iter().any(|c| c.name.contains("news")));
+        assert_eq!(c.cats.len(), 5, "{:?}", c.cats);
+    }
+}

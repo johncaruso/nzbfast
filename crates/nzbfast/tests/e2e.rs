@@ -2234,6 +2234,67 @@ async fn corrupt_article_detected_and_repaired() {
     );
 }
 
+/// TODO 111 experiment 1, the pricing leg: corrupt-article storm
+/// priced END TO END, repair time included. One server corrupts every
+/// 5th body it serves (a broken cache node) beside a clean server.
+/// Off, every corrupt body it delivers is terminal damage and the run
+/// pays verify + PAR2 repair; on (NZBFAST_CRC_RETRY=1) the pool
+/// refetches each bad article from the clean server at delivery time
+/// and the run finishes clean, no repair at all. Wall-clock
+/// measurement - stays ignored, run with --ignored for the numbers.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "wall-clock payout measurement (corrupt storm incl repair) - run with --ignored"]
+async fn payout_crc_retry_prices_corrupt_storm_end_to_end() {
+    if !have_par2() {
+        eprintln!("skipping: par2 not installed");
+        return;
+    }
+    let mut fx = Fixture::new("crcstorm");
+    let data = payload(6_000_000, 7);
+    fx.add_file("payload.bin", &data, 32_000);
+    assert!(fx.add_par2(30, &["payload.bin"], 32_000));
+    let nzb = fx.write_nzb();
+    for (env, tag) in [("0", "off"), ("1", "on")] {
+        let a = MockServer::start(
+            fx.articles.clone(),
+            Chaos {
+                corrupt_every: 5,
+                ..Default::default()
+            },
+        )
+        .await;
+        let b = MockServer::start(fx.articles.clone(), Chaos::default()).await;
+        let cfg = fx.write_config(&[&a, &b]);
+        let out = fx.dir.join(format!("out-{tag}"));
+        let (cfg2, nzb2, out2) = (cfg.clone(), nzb.clone(), out.clone());
+        let t0 = std::time::Instant::now();
+        let (log, ok) = tokio::task::spawn_blocking(move || {
+            run_get(&cfg2, &nzb2, &out2, &[("NZBFAST_CRC_RETRY", env)])
+        })
+        .await
+        .unwrap();
+        let wall = t0.elapsed();
+        assert!(ok, "{tag} leg failed:\n{log}");
+        assert_eq!(
+            std::fs::read(out.join("payload.bin")).unwrap(),
+            data,
+            "{tag} leg: output bytes differ"
+        );
+        if env == "0" {
+            assert!(
+                log.contains("repair complete"),
+                "off leg took no damage - the storm never bit:\n{log}"
+            );
+        } else {
+            assert!(
+                !log.contains("repair complete"),
+                "on leg still needed repair - the gate leaked damage:\n{log}"
+            );
+        }
+        println!("crc-retry storm, {tag}: wall {wall:.2?}");
+    }
+}
+
 /// The 2026-07 damaged-post bench scenario: a store-mode RAR set
 /// direct-extracting when DATA articles turn out missing on the wire.
 /// Volumes materialize for repair, par2 repairs them, and re-extraction
@@ -2786,6 +2847,68 @@ async fn preflight_flags_impossible() {
     .unwrap();
     let log = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(log.contains("IMPOSSIBLE"), "{log}");
+}
+
+/// Issue #23 at the pre-flight boundary: the reporter's exact post -
+/// payload whole, one absent article in a single-segment `.nfo`, 51
+/// spare recovery blocks in the NZB.
+///
+/// The old verdict weighed 1 missing article against 51 blocks and
+/// printed REPAIRABLE, a repair that can never happen: nothing covers a
+/// `.nfo` the recovery set does not name. The downloader now completes
+/// such a job and drops the file (f73cb362, 13332dfa), so pre-flight has
+/// to predict THAT and not a heal.
+///
+/// The `.mkv` is here to hold the other half of the rule in place. A
+/// version that simply stopped counting missing articles would pass on
+/// the `.nfo` alone, so the second leg re-runs the same post with the
+/// PAYLOAD article missing instead and demands the repair verdict back.
+#[tokio::test(flavor = "multi_thread")]
+async fn preflight_does_not_promise_a_repair_for_an_uncovered_nfo() {
+    for gone in ["release_nfo", "release_mkv"] {
+        let mut fx = Fixture::new(&format!("preflight_meta_{gone}"));
+        fx.add_file("release.mkv", &payload(400_000, 9), 40_000);
+        fx.add_file("release.nfo", b"scene notes", 40_000);
+        // Recovery volumes never reach the STAT sample - they exist here
+        // only for the block budget the verdict is weighed against.
+        fx.add_file("release.vol000+51.par2", &payload(4_000, 3), 40_000);
+        let chaos = Chaos {
+            missing: fx
+                .articles
+                .keys()
+                .filter(|k| k.contains(gone))
+                .cloned()
+                .collect(),
+            ..Default::default()
+        };
+        assert!(!chaos.missing.is_empty(), "nothing selected for {gone}");
+        let srv = MockServer::start(fx.articles.clone(), chaos).await;
+        let cfg = fx.write_config(&[&srv]);
+        let nzb = fx.write_nzb();
+
+        let out = tokio::task::spawn_blocking(move || {
+            Command::new(env!("CARGO_BIN_EXE_nzbfast"))
+                .env("NZBFAST_OPEN", "1")
+                .arg("--config")
+                .arg(&cfg)
+                .arg("check")
+                .arg(&nzb)
+                .arg("--sample")
+                .arg("100")
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        let log = String::from_utf8_lossy(&out.stdout).to_string();
+        if gone == "release_nfo" {
+            assert!(log.contains("COMPLETE"), "{log}");
+            assert!(!log.contains("REPAIRABLE"), "promised a repair:\n{log}");
+            assert!(log.contains("release.nfo"), "unnamed metadata:\n{log}");
+        } else {
+            assert!(log.contains("REPAIRABLE"), "{log}");
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -6602,13 +6725,28 @@ async fn a_wholly_renamed_post_still_repairs_and_cleans_up() {
 /// This post carries one file OUTSIDE the set (a `.nfo`, the everyday
 /// shape) whose every article 430s, next to a payload the obfuscated
 /// recovery set covers completely. The set therefore verifies clean - a
-/// verdict about the set, not about the job. Taking it as a verdict
-/// about the job filed the download Completed, deleted the journal (the
-/// only record of what was still missing, so a retry could no longer
-/// fetch just the gap) and handed an *arr a directory with a zero-filled
-/// hole in it. The failure summary must also not claim the post "carries
-/// no PAR2 recovery data" - it demonstrably does; it just cannot speak
-/// for the .nfo.
+/// verdict about the set, not about the job.
+///
+/// **This test used to assert the job FAILED, and issue #23 is why it no
+/// longer does.** The original reasoning was right about the hazard and
+/// wrong about the remedy. Filing such a job Completed used to hand an
+/// *arr a directory containing a zero-filled hole that looks like a real
+/// .nfo - genuinely worse than failing. But failing meant every download
+/// the reporter attempted died over one absent article in a file their
+/// own cleanup settings would have deleted seconds later, with no history
+/// row for the *arr to read, an endless 20-minute retry for an article no
+/// server has, and a good release reported to the indexer as dead.
+///
+/// The answer neither position reached: complete the job AND REMOVE the
+/// partial file. Nothing can rebuild it (the set does not cover it) and
+/// it is furniture rather than payload, so there is nothing to keep - and
+/// with it gone, the hazard this test was written to catch cannot happen.
+/// What must still hold, and is asserted below, is that the file is NAMED
+/// and does not survive as a holed copy.
+///
+/// The failure summary must also not claim the post "carries no PAR2
+/// recovery data" - it demonstrably does; it just cannot speak for the
+/// .nfo. That half is unchanged.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_disk_repair_does_not_certify_files_outside_its_recovery_set() {
     if !have_par2() {
@@ -6651,33 +6789,34 @@ async fn a_disk_repair_does_not_certify_files_outside_its_recovery_set() {
         log.contains("PAR2 set live"),
         "the sniffed recovery set never activated, so this pins nothing:\n{log}"
     );
+    // #23: furniture the set cannot cover no longer fails the job...
     assert!(
-        !ok,
-        "a PAR2 set verifying clean is not proof the .nfo outside it arrived:\n{log}"
+        ok,
+        "a missing .nfo outside the set still failed the job (#23):\n{log}"
     );
+    // ...but it is named, both where it went short and in the closing line.
     assert!(
-        log.contains("release.nfo: 1 missing"),
+        log.contains("release.nfo"),
         "the uncovered file was never named in the log:\n{log}"
     );
     assert!(
-        !log.contains("carries no PAR2 recovery data"),
-        "the failure summary lies about a post whose recovery set was sniffed:\n{log}"
+        log.contains("metadata file(s) no server had"),
+        "the job completed silently about what it completed without:\n{log}"
     );
-    // The journal is the retry's map of the hole - it must survive.
-    let journals: Vec<PathBuf> = std::fs::read_dir(&out)
-        .map(|rd| {
-            rd.flatten()
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.file_name()
-                        .is_some_and(|n| n.to_string_lossy().contains("journal"))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
     assert!(
-        !journals.is_empty(),
-        "the journal was deleted, so a retry cannot fetch just the gap:\n{log}"
+        !log.contains("carries no PAR2 recovery data"),
+        "the summary lies about a post whose recovery set was sniffed:\n{log}"
+    );
+    // The hazard the original test existed for: a holed .nfo handed to an
+    // *arr is worse than no .nfo. It must not be on disk at all.
+    assert!(
+        !out.join("release.nfo").exists(),
+        "a partial .nfo was left in the completed directory:\n{log}"
+    );
+    // The payload the set DOES cover is whole and present.
+    assert!(
+        out.join("Rt9bKe4mZp1").exists() || std::fs::read_dir(&out).unwrap().flatten().count() > 0,
+        "the completed directory is empty:\n{log}"
     );
 }
 
@@ -7466,5 +7605,98 @@ async fn a_lying_total_size_is_caught_beside_a_healthy_par2_set() {
     assert!(
         !log.contains("movie.mkv: every article arrived"),
         "the covered payload must sit the census out:\n{log}"
+    );
+}
+
+/// Issue #23: a missing `.nfo` must not fail a download whose payload is
+/// whole - and a missing payload file still must.
+///
+/// The reporter's every job died on one absent article in a
+/// single-segment `.nfo`, while the video verified clean in-stream
+/// against a recovery set with fifty spare blocks, and their own cleanup
+/// settings would have deleted that .nfo seconds later. Downstream, the
+/// job never reached history, so Sonarr fell back to a guessed path and
+/// the import failed; it then retried every twenty minutes forever, and
+/// with "report it to the indexer" set, told the indexer a good release
+/// was dead. SABnzbd completes the identical NZB against the same
+/// servers.
+///
+/// Both halves are asserted in one test on purpose: the rule is only
+/// safe because it is narrow, and a version that spared everything would
+/// pass the first assertion just as well.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_missing_nfo_completes_the_job_but_a_missing_payload_file_still_fails() {
+    // --- the reporter's shape: payload + a one-segment .nfo ---
+    let mut fx = Fixture::new("nfo-spare");
+    let video = payload(300_000, 7);
+    fx.add_file("release.mkv", &video, 40_000);
+    fx.add_file("release.nfo", b"scene notes, one article", 40_000);
+
+    // The .nfo's only article is absent everywhere.
+    let nfo_ids: Vec<String> = fx
+        .nzb_files
+        .iter()
+        .find(|(n, _)| n == "release.nfo")
+        .expect("nfo in fixture")
+        .1
+        .iter()
+        .map(|(id, _, _)| format!("<{id}>"))
+        .collect();
+    assert_eq!(nfo_ids.len(), 1, "the reported shape is a SINGLE segment");
+    let chaos = Chaos {
+        missing: nfo_ids.iter().cloned().collect(),
+        ..Default::default()
+    };
+    let srv = MockServer::start(fx.articles.clone(), chaos).await;
+    let cfg = fx.write_config(&[&srv]);
+    let nzb = fx.write_nzb();
+    let out = fx.dir.join("out");
+
+    let (log, ok) = tokio::task::spawn_blocking(move || run_get(&cfg, &nzb, &out, &[]))
+        .await
+        .unwrap();
+    assert!(ok, "a missing .nfo failed the whole job (#23):\n{log}");
+    // It completed, and it SAID what it completed without - "done" and
+    // "everything arrived" are different claims.
+    assert!(
+        log.contains("without 1 metadata file(s)") && log.contains("release.nfo"),
+        "the job completed silently about the missing .nfo:\n{log}"
+    );
+    // The payload is on disk and intact.
+    let got = std::fs::read(fx.dir.join("out/release.mkv")).expect("payload missing");
+    assert_eq!(got, video, "payload bytes differ");
+
+    // --- the other half: payload short, same one-article gap ---
+    let mut fx2 = Fixture::new("nfo-spare-neg");
+    let video2 = payload(300_000, 9);
+    fx2.add_file("release.mkv", &video2, 40_000);
+    fx2.add_file("release.nfo", b"scene notes, one article", 40_000);
+    let mkv_ids: Vec<String> = fx2
+        .nzb_files
+        .iter()
+        .find(|(n, _)| n == "release.mkv")
+        .expect("mkv in fixture")
+        .1
+        .iter()
+        .map(|(id, _, _)| format!("<{id}>"))
+        .collect();
+    let chaos2 = Chaos {
+        missing: [mkv_ids[0].clone()].into_iter().collect(),
+        ..Default::default()
+    };
+    let srv2 = MockServer::start(fx2.articles.clone(), chaos2).await;
+    let cfg2 = fx2.write_config(&[&srv2]);
+    let nzb2 = fx2.write_nzb();
+    let out2 = fx2.dir.join("out");
+    let (log2, ok2) = tokio::task::spawn_blocking(move || run_get(&cfg2, &nzb2, &out2, &[]))
+        .await
+        .unwrap();
+    assert!(
+        !ok2,
+        "a missing PAYLOAD article was spared - the rule is too wide:\n{log2}"
+    );
+    assert!(
+        log2.contains("download incomplete"),
+        "wrong verdict for a short payload:\n{log2}"
     );
 }

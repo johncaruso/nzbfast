@@ -73,6 +73,17 @@ pub struct Job {
     /// Force jobs start even while the queue is paused.
     pub priority: i32,
     pub paused: bool,
+    /// When this job entered the queue. Process-local and not
+    /// persisted - a restart restores it as None and the late-pick
+    /// marker simply doesn't fire. Consumed (taken) at pick, so a job
+    /// that goes back to Queued later can never replay a stale stamp.
+    pub queued_at: Option<Instant>,
+    /// Snapshot at add time: was the runner free to take this job at
+    /// once (nothing downloading, queue not paused, no runnable job
+    /// ahead)? Only then is a slow pick evidence the runner itself was
+    /// starved - the fixed inline-SQLite starvation held picks back
+    /// 38 s - rather than ordinary waiting in line.
+    pub idle_at_add: bool,
     /// Times this job was sent back from history via mode=retry. The
     /// article journal in out_dir makes each retry fetch only what's
     /// still missing.
@@ -473,11 +484,22 @@ pub fn post_year_of(nzb_path: &std::path::Path) -> u32 {
 /// including verification/repair/extraction after its network phase.
 /// Tails may overlap the next job, so this is a counter rather than a
 /// boolean.
-pub(super) struct IndexJobGuard(pub(super) Arc<AtomicUsize>);
+pub(super) struct IndexJobGuard(
+    pub(super) Arc<AtomicUsize>,
+    /// Weak so the guard can mark "indexing resumed" on the 1 -> 0
+    /// edge without keeping the daemon alive at shutdown.
+    pub(super) std::sync::Weak<Daemon>,
+);
 
 impl Drop for IndexJobGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Release);
+        if self.0.fetch_sub(1, Ordering::Release) == 1
+            && let Some(d) = self.1.upgrade()
+            && d.index_pause_on_download.load(Ordering::Relaxed)
+            && d.index_enabled.load(Ordering::Relaxed)
+        {
+            d.note_event("indexer", "downloads done - indexing picks back up");
+        }
     }
 }
 
@@ -519,6 +541,10 @@ pub struct Sidecar {
 pub(super) async fn stop_sidecar(d: &Arc<Daemon>) {
     let sc = d.sidecar.lock_ok().take();
     if let Some(mut sc) = sc {
+        d.note_event(
+            "sidecar",
+            "early start wound down - the main queue takes over",
+        );
         sc.cancelled.store(true, Ordering::Relaxed);
         loop {
             if let Some(f) = sc.hub.abort.lock_ok().as_ref() {
@@ -690,12 +716,17 @@ pub(super) fn spawn_sidecar(
             "{nzo_id} borrowing connection(s) from busy server(s) {} while the active job downloads (no healthy idle server)",
             slice.join(", ")
         );
+        d.note_event(
+            "sidecar",
+            "next job started early on connections borrowed from busy servers",
+        );
     } else {
         info!(
             target: "prefetch",
             "{nzo_id} starting on idle server(s) {} while the active job downloads",
             fleet.join(", ")
         );
+        d.note_event("sidecar", "next job started early on idle servers");
     }
     let eat_ok = job.lock_ok().eat_volumes_ok;
     let task = {
@@ -758,6 +789,7 @@ pub(super) fn spawn_sidecar(
             // M29 3d: fold the sidecar's per-article hit/430 outcomes into
             // the availability ledger, exactly as the primary job does at
             // net-drain. Partial/cancelled runs still carry real signal.
+            #[cfg(feature = "indexer")]
             if let Some(sink) = hub.oracle.lock_ok().take() {
                 let samples = sink.drain();
                 if !samples.is_empty() {
@@ -788,6 +820,14 @@ pub(super) fn spawn_sidecar(
                         } else {
                             "idle servers"
                         }
+                    );
+                    d.note_event(
+                        "sidecar",
+                        if borrow {
+                            "early start finished the whole job on borrowed connections"
+                        } else {
+                            "early start finished the whole job on idle servers"
+                        },
                     );
                     // A sidecar completion is a completion: it owes the
                     // job the same tail the runner gives one (hand-over,
@@ -1197,6 +1237,9 @@ pub(super) async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
 /// coming) or "history" (already downloaded), which is the difference
 /// between "you are about to queue this twice" and "you already have
 /// this, do you want to play that copy instead".
+// Slim builds still detect the collision (enqueue checks is_some()) but the
+// only field readers live in the gated index API.
+#[cfg_attr(not(feature = "indexer"), allow(dead_code))]
 pub(crate) struct DupeCollision {
     pub where_: &'static str,
     pub name: String,
@@ -2710,6 +2753,10 @@ pub(super) fn job_from_json(v: &Value) -> Option<Job> {
             .unwrap_or(false),
         priority: v.get("priority").and_then(Value::as_i64).unwrap_or(0) as i32,
         paused: v.get("paused").and_then(Value::as_bool).unwrap_or(false),
+        // Monotonic like finished_at, so a restart clears it - the
+        // late-pick marker measures THIS process's reaction time.
+        queued_at: None,
+        idle_at_add: false,
         retries: v.get("retries").and_then(Value::as_u64).unwrap_or(0) as u32,
         dupe_key: s("dupe_key"),
         library: v.get("library").and_then(Value::as_bool).unwrap_or(false),
@@ -2842,3 +2889,7 @@ pub(super) fn job_from_json(v: &Value) -> Option<Job> {
             .unwrap_or(false),
     })
 }
+
+#[cfg(test)]
+#[path = "job_tests.rs"]
+mod job_tests;

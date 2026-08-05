@@ -579,7 +579,10 @@ pub(crate) async fn index_gapfill_pass(
                     let chunk_hi = at.saturating_add(CHUNK.min(budget) - 1).min(hi);
                     match conn.over(at, chunk_hi).await {
                         Ok(entries) => {
-                            let _ = ix.ingest(&grp, &entries, now);
+                            // blocking_db: an inline ingest transaction on
+                            // an async worker starves the runtime (see
+                            // persist::blocking_db).
+                            let _ = crate::persist::blocking_db(|| ix.ingest(&grp, &entries, now));
                         }
                         Err(_) => break,
                     }
@@ -904,7 +907,10 @@ pub(crate) async fn collect_scan_pass(
         };
         match msg {
             Ok((lo, hi, entries)) => {
-                completed += ix.ingest(group, &entries, now)?;
+                // blocking_db: same reasoning as the gapfill leg - this
+                // is the deepen pass's main ingest, three of which ran
+                // concurrently in the measured 38 s runner starvation.
+                completed += crate::persist::blocking_db(|| ix.ingest(group, &entries, now))?;
                 scanned += hi - lo + 1;
                 if let Some(p) = progress {
                     p.store(progress_base + scanned, Ordering::Relaxed);

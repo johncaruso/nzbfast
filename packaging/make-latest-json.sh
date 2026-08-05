@@ -2,9 +2,11 @@
 # make-latest-json.sh <dist-dir> [notes]
 #
 # Generate the auto-update manifest (latest.json) from a dist directory
-# containing the autoupdate payload binaries. Platform keys must match
-# platform_key() in crates/nzbfast/src/serve.rs; the windows payload
-# carries an .exe suffix (see the v1.0.0 release assets).
+# containing the autoupdate payload binaries. Platform keys are the
+# manifest contract for update clients (docs/UPDATE-DESIGN.md): a
+# client picks its exact key (macos-arm64, macos-x64, ...) and falls
+# back to macos-universal. The windows payload carries an .exe suffix
+# (see the v1.0.0 release assets).
 #
 # Version comes from crates/nzbfast/Cargo.toml (the source of truth).
 #
@@ -15,7 +17,7 @@
 # success at every step. Missing payloads are now fatal. Omit a platform
 # on purpose by naming it:
 #   ALLOW_MISSING="linux-arm64 windows-x64" packaging/make-latest-json.sh dist
-# ALLOW_MISSING=all waives them all, but an EMPTY platforms map is always
+# ALLOW_MISSING=all waives them all, but an EMPTY payloads map is always
 # fatal - a manifest that installs nowhere is never what anyone meant.
 set -eu
 
@@ -45,14 +47,51 @@ sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
 # belong. Renaming is safe for deployed clients: the updater reads full
 # URLs from this manifest, and latest.json itself keeps its name.
 # NOTE: no `v` in the asset name. The tag is vX.Y.Z; the files are not.
-PLATFORMS='macos-universal windows-x64 linux-x64 linux-arm64'
-payload() {   # $1 = platform key -> path of its autoupdate payload
+#
+# TODO 107: payloads ship per-arch and GZIPPED. Measured on the real
+# v1.0.15 asset: universal raw 51.4 MB -> arm64 thin + gzipped 10.6 MB,
+# a 79% cut per update fetch. (`strip` buys nothing - the release
+# profile already strips.) macos-universal STAYS in the map: a future
+# client with an unrecognised arch needs a fallback, and the DMG story
+# for humans is unchanged either way. The manifest's sha256 is of the
+# COMPRESSED bytes - the client verifies what it fetched, then
+# decompresses, never the reverse. Format changes are free only while
+# self-update is notify-only (today: the daemon reads version/serial/
+# notes and never touches this map); the moment the opt-in updater
+# ships, this shape is frozen.
+PLATFORMS='macos-universal macos-arm64 macos-x64 windows-x64 linux-x64 linux-arm64'
+payload() {   # $1 = platform key -> path of its RAW autoupdate payload
     if [ "$1" = windows-x64 ]; then
         printf '%s' "$DIST/nzbfast-updater-$VERSION-$1.exe"
     else
         printf '%s' "$DIST/nzbfast-updater-$VERSION-$1"
     fi
 }
+
+# The mac thin payloads are derived, not built: build-bundles.sh emits
+# the universal binary, and `lipo -thin` here cuts the two arch slices
+# from it. Derivation is skipped only when the thin file is NEWER than
+# the universal (a future build-bundles.sh may emit them directly); a
+# thin file older than the universal is a leftover from a previous run
+# and re-deriving it is what keeps a same-version re-cut honest - a
+# stale slice would sha-match and sign cleanly, and nothing downstream
+# could catch it. Loudly fatal when lipo cannot extract a slice - a
+# universal payload missing an arch is a broken build, not a waivable
+# absence.
+UNI=$(payload macos-universal)
+if [ -f "$UNI" ] && command -v lipo >/dev/null 2>&1; then
+    for arch in arm64 x64; do
+        thin=$(payload "macos-$arch")
+        [ -f "$thin" ] && [ "$thin" -nt "$UNI" ] && continue
+        lipo_arch=$arch
+        [ "$arch" = x64 ] && lipo_arch=x86_64
+        lipo "$UNI" -thin "$lipo_arch" -output "$thin" || {
+            echo "ERROR: lipo could not extract $lipo_arch from $(basename "$UNI")" >&2
+            exit 1
+        }
+        echo "derived $(basename "$thin") from the universal payload" >&2
+    done
+fi
 
 # ---- Pre-flight: refuse to build a manifest that installs nowhere ------
 WAIVED=$(printf ' %s ' "${ALLOW_MISSING:-}" | tr ',' ' ')
@@ -76,14 +115,14 @@ if [ -n "$missing" ]; then
     echo "ERROR: autoupdate payload(s) not found in $DIST:" >&2
     printf '%s' "$missing" >&2
     echo "       A manifest without them is still valid JSON and still" >&2
-    echo "       signs fine - it just never updates those platforms." >&2
+    echo "       signs fine - it just never carries those payloads." >&2
     echo "       Build the missing payloads, check the names (no 'v'," >&2
     echo "       version $VERSION), or waive them deliberately with:" >&2
     echo "         ALLOW_MISSING=\"<platform> ...\" $0 $DIST" >&2
     exit 1
 fi
 if [ "$present" -eq 0 ]; then
-    echo "ERROR: no autoupdate payloads at all in $DIST - the platforms" >&2
+    echo "ERROR: no autoupdate payloads at all in $DIST - the payloads" >&2
     echo "       map would be empty. A signed, valid manifest advertising" >&2
     echo "       no downloads is a dead release, so this is never allowed" >&2
     echo "       (not even with ALLOW_MISSING). Expected one or more of:" >&2
@@ -129,10 +168,27 @@ if [ -f "$SERIAL_FILE" ]; then
     fi
 fi
 
+# ---- Compress the payloads; the .gz files are the release assets ------
+# `gzip -9 -n`: -n drops the name+mtime header fields, so the same input
+# bytes always give the same .gz bytes and a re-run cannot silently
+# change a sha256 the manifest already advertised.
+for plat in $PLATFORMS; do
+    f=$(payload "$plat")
+    [ -f "$f" ] || continue
+    gzip -9 -n -c "$f" > "$f.gz"
+done
+
 OUT="$DIST/latest.json"
 first=1
 {
-    printf '{\n  "version": "%s",\n  "serial": %s,\n  "notes": %s,\n  "platforms": {' \
+    # "payloads", NOT "platforms": the pre-1.0.5 self-updater read
+    # `platforms[<key>].url`, hashed whatever bytes it fetched, and
+    # wrote them over the executable - so a gzip payload under the OLD
+    # field name would sha-verify and get installed as the binary
+    # (brick on restart). Under the new name those ghost clients find
+    # nothing, do nothing, and keep their notify banner. Every client
+    # shipped since 1.0.5 reads only version/serial/notes.
+    printf '{\n  "version": "%s",\n  "serial": %s,\n  "notes": %s,\n  "payloads": {' \
         "$VERSION" "$SERIAL" "$(printf '%s' "$NOTES" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
     for plat in $PLATFORMS; do
         # Absence is already decided above: anything still missing here
@@ -141,10 +197,12 @@ first=1
         if [ ! -f "$f" ]; then
             continue
         fi
+        # sha256 is of the COMPRESSED bytes: the client checks exactly
+        # what it fetched, before any byte reaches a decompressor.
         [ $first = 1 ] || printf ','
         first=0
-        printf '\n    "%s": {\n      "url": "%s/%s",\n      "sha256": "%s"\n    }' \
-            "$plat" "$BASE" "$(basename "$f")" "$(sha "$f")"
+        printf '\n    "%s": {\n      "url": "%s/%s",\n      "sha256": "%s",\n      "compression": "gzip"\n    }' \
+            "$plat" "$BASE" "$(basename "$f").gz" "$(sha "$f.gz")"
     done
     printf '\n  }\n}\n'
 } > "$OUT"

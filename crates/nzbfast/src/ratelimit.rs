@@ -49,6 +49,9 @@ use std::time::{Duration, Instant};
 /// Archive, not by MusicBrainz, and spending one's budget on the other
 /// is exactly the mistake §4 C3 describes ("lanes should be per
 /// provider, not per kind").
+// Slim builds only exercise the Srrdb/Xrel/Qlever lanes; gating variants would
+// cascade through every match below, so the unused ones are allowed instead.
+#[cfg_attr(not(feature = "indexer"), allow(dead_code))]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Provider {
     /// Hard ~1 req/s, enforced, and they block abusers. Not a courtesy.
@@ -244,6 +247,7 @@ pub fn acquire(p: Provider) {
 /// A refusal must cost the caller nothing and the LANE nothing: `tat` is
 /// left exactly as it was, so a refused click does not slow the
 /// enricher down or push the next caller further out.
+#[cfg(feature = "indexer")]
 pub fn try_acquire(p: Provider, max_wait: Duration) -> bool {
     let (interval, tolerance) = timings(p);
     let wait = {
@@ -360,6 +364,7 @@ mod tests {
     /// `try_acquire` refuses without reserving. Both halves matter: a
     /// refusal that still pushed `tat` would let a burst of refused
     /// clicks starve the enricher of the very allowance they never used.
+    #[cfg(feature = "indexer")]
     #[test]
     fn try_acquire_refuses_without_consuming() {
         // TVmaze's bucket belongs to this test alone. Drain its burst
@@ -389,6 +394,7 @@ mod tests {
     }
 
     /// An idle bucket grants immediately, and the grant IS a claim.
+    #[cfg(feature = "indexer")]
     #[test]
     fn try_acquire_grants_and_claims() {
         // Wikidata: no burst, 7.5 s apart, and no other test here spends

@@ -44,12 +44,21 @@ jobs:
     if: github.repository != 'nzbfast/nzbfast'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Warm cache, measured: cache restore 1m01s, fmt 23s, clippy 36s,
-    # unit suites 5m31s, deny 1s. Call it eight minutes. Never cancelled
-    # on main, so at the push rate above main gets a real Linux verdict
-    # roughly every eight minutes instead of none at all; GitHub keeps
-    # at most one queued job per group, so this cannot back up - a newer
-    # push supersedes the WAITING job, never the running one.
+    # Warm cache: measured at eight minutes (restore 1m01s, fmt 23s,
+    # clippy 36s, unit suites 5m31s, deny 1s) when this job ran four
+    # named test targets. ac3f4a04 widened it to the whole workspace and
+    # that figure is now WRONG - the last green run before this edit
+    # (d7d1bd43, 5 Aug 2026) was 18m31s against the 30-minute cap. TODO
+    # 116; the note that said "call it eight minutes" is corrected here
+    # rather than left to rot further. Never cancelled on main, so at
+    # the push rate above main gets a real Linux verdict roughly every
+    # twenty minutes instead of none at all; GitHub keeps at most one
+    # queued job per group, so this cannot back up - a newer push
+    # supersedes the WAITING job, never the running one.
+    #
+    # The cap stays at 30. TODO 116 is explicit that raising it only
+    # hides the growth (2556 -> 3224 tests inside one hour of main
+    # activity on 5 Aug); the lever is the debuginfo env below.
     #
     # cancel-in-progress stays on for anything that is not main, because
     # `workflow_dispatch` on a topic branch is how a session gets a real
@@ -58,7 +67,72 @@ jobs:
     concurrency:
       group: ci-check-${{ github.ref }}
       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    env:
+      # This job died four times on 5 Aug 2026 (77e0b1c0, 7ea59bf4,
+      # 520248ac, febb6a26) with `No space left on device (os error 28)`
+      # in the unit-tests step, one of them naming
+      # `target/debug/incremental/.../query-cache.bin` outright. Every
+      # gate above it passed; the suite never ran at all.
+      #
+      # Incremental is pure cost here and roughly a 2x one. Measured on
+      # the dev checkout, `target/debug/incremental` is 94 GB against 95
+      # GB of `deps` - about a byte of incremental state per byte of
+      # artifact - and CI never spends it: the cache below is keyed on
+      # Cargo.lock alone, so the restored `target` is frozen at whatever
+      # the day's first build left, and every push after it recompiles
+      # the changed crates from cold anyway. Turning it off halves the
+      # peak and skips the work of writing state nothing reads.
+      CARGO_INCREMENTAL: "0"
+      # TODO 116, the named lever for the SUCCESSOR to that bug: this
+      # job is growing toward its timeout, and debuginfo dominates the
+      # cost of statically linking forty-odd test binaries on a runner
+      # whose linker copies DWARF INTO each executable (see the reclaim
+      # step). `line-tables-only` rather than `0` on purpose - it keeps
+      # file:line in panic backtraces, which is the whole diagnostic
+      # value of debuginfo in a test job, and drops the variable and
+      # type DWARF that is the bulk of the bytes and the link time.
+      #
+      # Job-level env, not step-level, and that is load-bearing: clippy
+      # `--all-targets` builds the test targets too, so a step-level
+      # setting would give clippy and nextest different fingerprints for
+      # the same units and each would rebuild what the other just built.
+      #
+      # This applies to `profile.test`, so dependencies (built with
+      # `dev`) keep full debuginfo. That is the intended half - the test
+      # executables are what there are forty of.
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
+      # ac3f4a04 widened this job from four named test targets to the
+      # whole workspace, which is the right call (see the long note on
+      # the unit-tests step) but it is what put the runner over. It is
+      # 37 integration targets plus the lib and bin suites, and on Linux
+      # the linker copies DWARF INTO each executable rather than leaving
+      # it in the object files the way macOS does, so a local `ls -la`
+      # on a Mac reads 8-15 MB per test binary and badly understates
+      # what ubuntu writes. Forty-odd of those, each statically linking
+      # the full crate graph, is several GB before `deps` is counted.
+      #
+      # A GitHub-hosted ubuntu runner ships ~14 GB free on `/`, most of
+      # it spent on toolchains this job has no use for. Reclaiming them
+      # is the standard workaround and it buys more than the whole
+      # deficit. Inline `rm` rather than a marketplace action on
+      # purpose: every third-party step in this repo is pinned by SHA
+      # and audited, and none of this is worth a new supply-chain edge.
+      #
+      # `hostedtoolcache/CodeQL` only, never the whole hostedtoolcache -
+      # python3 lives under it on some images and the three gate scripts
+      # below are `#!/usr/bin/env python3`.
+      - name: reclaim disk
+        run: |
+          df -h / | tail -1
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/share/swift \
+            /usr/local/share/powershell
+          df -h / | tail -1
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: toolchain
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
@@ -67,7 +141,39 @@ jobs:
           path: |
             ~/.cargo/registry
             target
-          key: ci-private-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          # `-v2` is not decoration and it MUST NOT be dropped: it rides
+          # with the CARGO_PROFILE_TEST_DEBUG change above, in the same
+          # commit, because that flag invalidates every fingerprint in
+          # the archive this key would otherwise hit. The key has no
+          # restore-keys, and actions/cache saves ONLY on an exact-key
+          # miss - it never refreshes a key it hit - so an archive built
+          # under the old flag would be restored on every push, rebuilt
+          # from cold under the new one, and never replaced. Cold
+          # forever, silently, with a green cache-hit line in the log.
+          # Bump the suffix again for any future change that moves
+          # rustc's fingerprint inputs (profile flags, RUSTFLAGS,
+          # toolchain pin) without moving Cargo.lock.
+          #
+          # Contrast the incremental-eviction step below, which fixes a
+          # dirtier archive with no cache-key bump at all: eviction is
+          # self-healing because nothing downstream reads what it
+          # deletes. A stale fingerprint is not - only a new key clears
+          # it. That is the whole difference between the two fixes.
+          key: ci-private-v2-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      # CARGO_INCREMENTAL above stops us WRITING incremental state; this
+      # evicts what the cache hands us. The key has no restore-keys, so
+      # actions/cache saves only on an exact-key miss and never updates
+      # a key it hit: the archive restored on every push today was
+      # written at 02:21 by the first build after Cargo.lock last
+      # changed, incremental dirs and all, and it will keep being
+      # restored unchanged until the lockfile moves. Deleting them costs
+      # nothing (nothing downstream reads them) and it is self-healing -
+      # the next lockfile bump saves a clean archive, because by then
+      # there are no incremental dirs left to put in it.
+      - name: drop restored incremental state
+        run: |
+          du -sh target/*/incremental 2>/dev/null || true
+          rm -rf target/*/incremental
       - name: fmt
         run: cargo fmt -p nzbkit -p nzbfast -p nzbtray --check
       # TODO 102b. Two manual sweeps failed to keep new code off
@@ -77,6 +183,22 @@ jobs:
       # refuse your commit for another session's in-flight line.
       - name: lock gate
         run: tools/lock-gate.py
+      # TODO 106. serve() regrew 1,819 -> 2,234 within days of TODO 43
+      # splitting it, so the splits get a ratchet before they get redone.
+      # Baselines live in the script; each entry is deleted as its target
+      # is split, and the gate refuses stale entries so the list only
+      # shrinks.
+      - name: size gate
+        run: tools/size-gate.py
+      # TODO 88. Horizontal overflow on the site bit three times in two days
+      # (8058b393, 6b2274a6, 3195f9da) and every one was found by hand, days
+      # later. Static on purpose - a headless browser would gate ubuntu's font
+      # metrics, and the header bug was ~792px in English and ~900px in French
+      # on macOS alone. `--selftest` first: it reconstructs all three incidents
+      # and asserts the gate still refuses them, so a refactor cannot quietly
+      # turn the gate into a no-op that passes everything.
+      - name: overflow gate
+        run: tools/overflow-gate.py --selftest && tools/overflow-gate.py
       - name: clippy
         # No escapes: every warning blocks. The categories still allowed
         # are named in the workspace lints table in Cargo.toml, each with
@@ -108,10 +230,53 @@ jobs:
           # TMDB requests on the wire from a CI runner. Both other
           # workflows already set it; this job was the one that did not.
           NZBFAST_NO_ENRICH: "1"
+        # `--workspace` minus a named exclusion list, NOT a list of the
+        # packages and targets to include. That direction is the whole
+        # point: a test target added tomorrow runs on push automatically,
+        # and the only names anyone maintains are the few that must not.
+        #
+        # It replaces three steps that between them named `-p nzbkit
+        # --lib`, `-p nzbfast --bin nzbfast` and two nzbfast integration
+        # targets. Everything else in the workspace was reachable ONLY
+        # through pr-check.yml - which triggers on `pull_request`, and
+        # this repo pushes straight to main, so it effectively never
+        # ran. 27 integration targets plus vendor/rars (728 tests, the
+        # RAR engine, under active work), vendor/tiny_http and nzbtray
+        # were covered by a workflow nobody fires. That is how a
+        # conn_tuner assertion stayed red for a day with main green.
+        #
+        # Nobody DEFERRED those - they were wired to a branch model this
+        # project does not use, and the header's "long suites stay
+        # nightly plus a local pre-push discipline" was a decision made
+        # about daemon/e2e, not about them. The local discipline does not
+        # reach them either: CLAUDE.md documents the unit suites and the
+        # daemon suite.
+        #
+        # Cost, measured on an M-series box with `--retries 0` on this
+        # profile: 2522 tests in 37.9s. Both sessions that costed this
+        # first estimated 5-8 MINUTES, from serialised `cargo test`
+        # timings - `cargo test` runs test BINARIES sequentially while
+        # nextest schedules across them, so ~500s of sequential work is
+        # ~38s of wall clock. Never cost a nextest job from cargo-test
+        # numbers.
+        #
+        # The seven exclusions are the targets with a real home in
+        # nightly.yml, which names all of them: daemon/e2e/leak_soak were
+        # already there by an actual decision, and conn_tuner,
+        # index_size_cap, http_wedge and queue_soak are ~80% of the total
+        # runtime because they MEASURE ELAPSED TIME - a different kind of
+        # test, not merely a dearer one.
+        #
+        # Note what does NOT need saying here: `binary(daemon)` is pinned
+        # to a max-threads-1 test group in .config/nextest.toml, so
+        # CLAUDE.md invariant 4 holds by configuration rather than by
+        # everyone remembering `-- --test-threads=1`. If an exclusion is
+        # ever dropped, the serialisation arrives with the target.
         run: |
-          cargo nextest run --profile ci -p nzbkit --lib
-          cargo nextest run --profile ci -p nzbfast --bin nzbfast
-          cargo nextest run --profile ci -p nzbfast --test settings_catalogue --test newznab
+          cargo nextest run --profile ci --workspace -E '
+            not binary(conn_tuner) and not binary(index_size_cap) and
+            not binary(http_wedge) and not binary(queue_soak) and
+            not binary(daemon) and not binary(e2e) and not binary(leak_soak)'
       # Advisory / license / source gate against deny.toml. Prebuilt
       # binary pinned by tag and checked by SHA256 rather than trusted
       # (same pattern as the par2 fetch in pr-check.yml); a cargo
@@ -167,6 +332,16 @@ jobs:
     concurrency:
       group: ci-windows-${{ github.ref }}
       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    env:
+      # Same rationale as the `check` job's copy. This leg has not run
+      # out of disk - a windows-latest runner starts with more headroom
+      # than an ubuntu one - but it compiles the same forty-odd test
+      # binaries from the same workspace-wide expression, so it sits on
+      # the same trap, and at 2x private-repo billing the minutes saved
+      # not writing incremental state it never reads are the dearest
+      # minutes in this file. No reclaim step to match: nothing here is
+      # short of space, and `rm` on a 2x runner is not free.
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # No toolchain step: rust-toolchain.toml pins the version and
@@ -180,8 +355,28 @@ jobs:
             ~/.cargo/registry
             target
           # runner.os is in the key, so this cannot collide with the
-          # Linux job's cache.
+          # Linux job's cache - which is also why this key deliberately
+          # does NOT carry the `-v2` the Linux one grew: the two are
+          # already separate archives, and this job does not set
+          # CARGO_PROFILE_TEST_DEBUG, so its fingerprints are unchanged
+          # and bumping would buy one cold rebuild for nothing.
+          #
+          # Why this leg does not get the flag (TODO 116 named the Linux
+          # job): there is no timeout pressure here - measured 28m22s
+          # against a 60-minute cap on 5 Aug - and adopting it costs an
+          # unavoidable cold rebuild on a runner that bills at 2x and
+          # whose cold path is the one the 60-minute cap was sized for.
+          # Wrong trade today. If this leg starts crowding 60 the lever
+          # is the same one, and so is the rule: flag and key bump in
+          # ONE commit, or it rebuilds cold forever.
           key: ci-private-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      # The Linux twin of this step carries the reasoning. pwsh, and
+      # -ErrorAction SilentlyContinue, because Remove-Item throws on a
+      # missing path where `rm -rf` does not, and a cold cache is
+      # exactly when this path is missing.
+      - name: drop restored incremental state
+        shell: pwsh
+        run: Remove-Item -Recurse -Force -ErrorAction SilentlyContinue target\*\incremental
       # Same nextest, same pinned version and same trust model as the
       # Linux job above: prebuilt, fetched by version, checked by SHA256
       # rather than trusted. Using nextest on both legs is not tidiness -
@@ -214,18 +409,27 @@ jobs:
       # deliberately NOT set: it opens an all-interfaces listener, which
       # on Windows raises the Defender Firewall dialog, and a hosted
       # runner has nobody to click it.
-      - name: nzbkit lib suite
+      # Same exclusion-list form as the `check` job above, and for the
+      # same reason - see the long note there. Windows had the identical
+      # hole: three steps naming a handful of targets, everything else
+      # reachable only through a workflow that never fires.
+      #
+      # Worth knowing that this half is UNMEASURED. The 37.9s figure is
+      # from an M-series mac; this broadens a Windows runner's test set
+      # for the first time, and vendor/rars, vendor/tiny_http and the 27
+      # integration targets have not run on Windows before. If it turns
+      # this job red, the finding is a real Windows gap rather than a
+      # broken workflow - that class has bitten here before (four bugs
+      # hidden by exactly this absence) - but the honest response is to
+      # fix what it names, not to narrow the expression back.
+      - name: workspace suite
         env:
           NZBFAST_NO_ENRICH: "1"
-        run: cargo nextest run --profile ci -p nzbkit --lib
-      - name: nzbfast bin suite
-        env:
-          NZBFAST_NO_ENRICH: "1"
-        run: cargo nextest run --profile ci -p nzbfast --bin nzbfast
-      - name: fast integration targets
-        env:
-          NZBFAST_NO_ENRICH: "1"
-        run: cargo nextest run --profile ci -p nzbfast --test settings_catalogue --test newznab
+        run: |
+          cargo nextest run --profile ci --workspace -E '
+            not binary(conn_tuner) and not binary(index_size_cap) and
+            not binary(http_wedge) and not binary(queue_soak) and
+            not binary(daemon) and not binary(e2e) and not binary(leak_soak)'
       # The clippy gate that CANNOT run on Linux. Until this step, clippy
       # ran in exactly two jobs - `check` above and pr-check's
       # `build-and-test` - and BOTH are ubuntu-latest. clippy only lints

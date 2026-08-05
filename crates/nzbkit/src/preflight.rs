@@ -182,6 +182,118 @@ pub fn stratified_sample(total: usize, n: usize) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mock::{Chaos, MockServer, make_file_articles};
+
+    /// Three present ids and two the server has never heard of, swept
+    /// over one mock. The matrix is the whole point of the pass: a cell
+    /// per (server, article), and the verdict helpers read only it.
+    #[tokio::test]
+    async fn a_sweep_fills_one_cell_per_article_and_names_the_absent_ones() {
+        let mut articles = std::collections::HashMap::new();
+        let payload: Vec<u8> = (0..24_000u32).map(|i| i as u8).collect();
+        let segs = make_file_articles("p.bin", &payload, 8_000, "pf", &mut articles);
+        let srv = MockServer::start(articles, Chaos::default()).await;
+        let mut ids: Vec<String> = segs.iter().map(|(id, _, _)| format!("<{id}>")).collect();
+        let present = ids.len();
+        ids.push("<gone-1@mock>".into());
+        ids.push("<gone-2@mock>".into());
+
+        let out = tokio::time::timeout(
+            Duration::from_secs(20),
+            stat_sweep(&[srv.server_config()], &ids, 2, 4),
+        )
+        .await
+        .expect("sweep hung");
+
+        assert_eq!(out.matrix.len(), 1, "one row per server");
+        assert_eq!(out.matrix[0].len(), ids.len());
+        assert_eq!(out.server_counts(0), (present, 2, 0));
+        assert_eq!(
+            out.union_missing(),
+            vec![present, present + 1],
+            "only the ids no server could produce"
+        );
+    }
+
+    /// `check --window 0` sent not one STAT and then waited out the
+    /// 20 s reply timeout with every cell Unknown, which `union_missing`
+    /// reads as COMPLETE. Both counts clamp to one inside the sweep.
+    #[tokio::test]
+    async fn zero_window_and_zero_connections_still_sweep() {
+        let mut articles = std::collections::HashMap::new();
+        let payload: Vec<u8> = (0..16_000u32).map(|i| (i * 5) as u8).collect();
+        let segs = make_file_articles("w.bin", &payload, 8_000, "win", &mut articles);
+        let srv = MockServer::start(articles, Chaos::default()).await;
+        let ids: Vec<String> = segs.iter().map(|(id, _, _)| format!("<{id}>")).collect();
+
+        let out = tokio::time::timeout(
+            Duration::from_secs(10),
+            stat_sweep(&[srv.server_config()], &ids, 0, 0),
+        )
+        .await
+        .expect("a zero window hung the sweep again");
+        assert_eq!(out.server_counts(0), (ids.len(), 0, 0));
+        assert!(out.union_missing().is_empty());
+    }
+
+    /// A server that cannot be dialled leaves its row Unknown - and an
+    /// Unknown must never be counted as evidence of absence, or an
+    /// unreachable server alone would condemn a healthy NZB.
+    #[tokio::test]
+    async fn an_undialable_server_leaves_unknowns_that_never_condemn_an_article() {
+        let mut articles = std::collections::HashMap::new();
+        let payload: Vec<u8> = (0..8_000u32).map(|i| i as u8).collect();
+        let segs = make_file_articles("d.bin", &payload, 8_000, "dead", &mut articles);
+        let srv = MockServer::start(articles, Chaos::default()).await;
+        let mut dead = srv.server_config();
+        // Bound and then closed by the mock's own listener choice: a
+        // port nothing is listening on refuses immediately.
+        dead.port = 1;
+        dead.host = "127.0.0.1".into();
+        let mut ids: Vec<String> = segs.iter().map(|(id, _, _)| format!("<{id}>")).collect();
+        ids.push("<absent@mock>".into());
+
+        let out = tokio::time::timeout(
+            Duration::from_secs(20),
+            stat_sweep(&[srv.server_config(), dead], &ids, 1, 8),
+        )
+        .await
+        .expect("sweep hung");
+
+        assert_eq!(out.matrix.len(), 2);
+        assert_eq!(out.server_counts(1), (0, 0, ids.len()), "row never dialled");
+        assert!(
+            out.union_missing().is_empty(),
+            "Missing on the live server plus Unknown on the dead one is not a verdict"
+        );
+        assert!(out.elapsed > Duration::ZERO);
+    }
+
+    /// The two verdict helpers, off a matrix built by hand - the shapes
+    /// a sweep cannot be made to produce on demand.
+    #[test]
+    fn union_missing_needs_every_server_to_agree() {
+        let none = SweepResult {
+            matrix: Vec::new(),
+            elapsed: Duration::ZERO,
+        };
+        assert!(
+            none.union_missing().is_empty(),
+            "no server answered: nothing is provably absent"
+        );
+
+        use Avail::{Have, Missing, Unknown};
+        let r = SweepResult {
+            matrix: vec![
+                vec![Missing, Missing, Have, Missing],
+                vec![Missing, Have, Have, Unknown],
+            ],
+            elapsed: Duration::from_millis(3),
+        };
+        assert_eq!(r.union_missing(), vec![0]);
+        assert_eq!(r.server_counts(0), (1, 3, 0));
+        assert_eq!(r.server_counts(1), (2, 1, 1));
+    }
 
     #[test]
     fn stratified_edges() {

@@ -54,6 +54,49 @@ report, no telemetry. Turning the check off entirely is a setting.
 4. **Version comparison.** A manifest advertising a version at or below
    the running one is not an update, whatever it is signed with.
 
+## The payload format
+
+Each `payloads` entry names one artifact: its URL, the sha256 of the
+exact bytes at that URL, and its compression. The field is `payloads`,
+deliberately NOT the pre-TODO 107 `platforms`: the retired pre-1.0.5
+self-updater read `platforms[<key>]`, hashed the fetched bytes, and
+wrote them over the executable - a gzip entry under the old name would
+sha-verify and be installed as the binary. Under the new name any such
+ghost install finds nothing, stages nothing, and keeps its working
+notify banner. `version`/`serial`/`notes` stay top-level, which is all
+any 1.0.5+ client reads.
+
+```json
+"macos-arm64": {
+  "url": ".../nzbfast-updater-1.0.17-macos-arm64.gz",
+  "sha256": "<sha256 of the .gz bytes>",
+  "compression": "gzip"
+}
+```
+
+Rules a client must follow, fixed now so the first self-update client is
+written against them:
+
+- **Verify, then decompress - never the reverse.** The sha256 covers the
+  compressed bytes as fetched, so the hash check completes before any
+  byte reaches a decompressor. Nothing unauthenticated is ever parsed.
+- **Pick the exact platform key first** (`macos-arm64`, `macos-x64`,
+  `linux-x64`, ...), falling back to `macos-universal` only when the
+  running arch has no entry. The per-arch payloads exist because an
+  update fetch was measured at 51.4 MB universal-raw against 10.6 MB
+  thin-gzipped - a 79% cut; the universal entry stays as the fallback.
+- **An unknown `compression` value is a refusal**, not a passthrough. A
+  client that predates a future format must fail closed and leave the
+  notify banner, never write bytes it cannot interpret. An ABSENT
+  `compression` field means raw passthrough with the sha256 over the
+  raw bytes - and a manifest with no `payloads` field at all (a stale
+  or mirrored pre-TODO 107 copy) is a notify-only manifest, not an
+  error.
+
+The human downloads are unaffected: the DMG stays universal on purpose.
+A person can pick the wrong arch and get a confusing failure; a manifest
+lookup cannot, so only the machine path is arch-split.
+
 Known limitation, stated plainly: none of this catches a freeze, where
 an attacker serves the newest valid manifest forever so the client never
 learns of a later release. Catching that requires manifest expiry, which

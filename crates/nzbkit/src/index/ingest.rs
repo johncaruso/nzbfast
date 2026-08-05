@@ -1,0 +1,1727 @@
+//! OVER ingest and classification (TODO 106 phase 2.2, cut 5): the
+//! subject/counter parsers, the junk scorer, custom-category
+//! (re)classification, per-server watermarks and `ingest` itself. Bodies
+//! are verbatim moves from the old index.rs; see
+//! research/SEAM-TABLE-index-rs-2026-08-05.md.
+
+use super::*;
+
+pub fn junk_score(stem: &str, p: &crate::release::Parsed, total_bytes: u64, has_exe: bool) -> i64 {
+    use crate::release::Kind;
+    let mut s: i64 = match p.kind {
+        // Unparseable stems.
+        Kind::Other => 70,
+        // Keygen/crack/app-spam markers.
+        Kind::Software => 55,
+        _ => 0,
+    };
+    // Hash/blob names - parse_release can still guess a Kind for these,
+    // so ask the obfuscation detector directly (sans a short extension
+    // token, which would break its all-token rules).
+    let bare = stem
+        .rsplit_once('.')
+        .filter(|(b, ext)| {
+            !b.is_empty() && ext.len() <= 4 && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        })
+        .map(|(b, _)| b)
+        .unwrap_or(stem);
+    if crate::release::looks_obfuscated(bare) {
+        s = s.max(70);
+    }
+    // Multi-token blobs the single-token detector misses
+    // ("NGKzwg4lCQF_vMr95eoDx2X9NxbLi", "[ff63de8461]_[newzNZB]_…"):
+    // a mixed-case-with-digits token ≥8 chars, or a ≥10-char hex run,
+    // is no word from any title - but only damn a stem that parsed NO
+    // real structure (year/season/resolution), so scene names with
+    // hashes next to real markers survive.
+    if p.year.is_none() && p.season.is_none() && p.res.is_none() {
+        let blobbish = |t: &str| {
+            let (up, lo, di) = t.chars().fold((false, false, false), |(u, l, d), c| {
+                (
+                    u || c.is_ascii_uppercase(),
+                    l || c.is_ascii_lowercase(),
+                    d || c.is_ascii_digit(),
+                )
+            });
+            (t.len() >= 8 && t.chars().all(|c| c.is_ascii_alphanumeric()) && up && lo && di)
+                || (t.len() >= 10 && di && t.chars().all(|c| c.is_ascii_hexdigit()))
+                // Scattered internal caps, no digits ("gUSbVwIDqhrR") -
+                // same signal as the single-token detector, per token.
+                || (t.len() >= 9
+                    && t.chars().all(|c| c.is_ascii_alphabetic())
+                    && t.chars().skip(1).filter(|c| c.is_ascii_uppercase()).count() >= 3)
+        };
+        if bare
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(blobbish)
+            // Nothing but digits and separators ("12895-1.11").
+            || !bare.chars().any(|c| c.is_ascii_alphabetic())
+        {
+            s = s.max(70);
+        }
+    }
+    // junk_v6: evidence-free "media". A real scene/P2P post virtually
+    // always carries at least one technical marker (year, S/E, res,
+    // source, codec, remux). A media extension on bare words
+    // ("aula.mp4", "misfits-wegedeutschensd") is a course rip, personal
+    // file, or spam - nothing an indexer would list. The trailing
+    // -group token deliberately does NOT count as evidence: any
+    // "words-blob" name grows one for free.
+    let no_evidence = p.year.is_none()
+        && p.season.is_none()
+        && p.episode.is_none()
+        && p.res.is_none()
+        && p.source.is_none()
+        && p.vcodec.is_none()
+        && p.acodec.is_none()
+        && !p.remux;
+    if no_evidence && matches!(p.kind, Kind::Movie | Kind::Tv) {
+        s = s.max(60);
+    }
+    // junk_v6: numbered-lecture prefix ("003 - Estômago.mp4",
+    // "056 - Ortografia II") - course/track dumps open with a short
+    // track number; scene names never start "NNN - ". Fires even when a
+    // stray year parses later in the name, but never on anything that
+    // parsed a season/episode.
+    if p.season.is_none() && p.episode.is_none() {
+        let t = bare.trim_start();
+        let nd = t.chars().take_while(|c| c.is_ascii_digit()).count();
+        if (1..=3).contains(&nd) && t[nd..].trim_start_matches(' ').starts_with("- ") {
+            s = s.max(60);
+        }
+    }
+    // junk_v6: leading bracketed pure-hex tag ("[a1911f7bca]_[newzNZB]_
+    // name") - repost-bot spam whose inner name looks real and would
+    // otherwise pollute a genuine title's card. Anime subgroup brackets
+    // ("[SubsPlease]") are words, not hex, and survive.
+    if let Some(rest) = bare.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        let tag = &rest[..end];
+        if tag.len() >= 8 && tag.chars().all(|c| c.is_ascii_hexdigit()) {
+            s = s.max(60);
+        }
+    }
+    // junk_v6: a parsed MOVIE claiming HD on a sub-200 MB post is spam
+    // or a fake repost - a real 720p+ feature is never that small.
+    // Mid-uploads shed this as their parts arrive (scores recompute on
+    // every ingest touch). TV is exempt: short-form episodes can be
+    // legitimately tiny.
+    if matches!(p.kind, Kind::Movie)
+        && p.res.is_some()
+        && total_bytes > 0
+        && total_bytes < 200 << 20
+    {
+        s = s.max(55);
+    }
+    // Media-shaped title on a tiny post: indexer spam or nfo-only. A
+    // parsed movie/episode name claiming <10 MB is never the media
+    // itself - hide it outright (55 crosses the default-50 line). A
+    // custom category is exempt in BOTH directions: its payloads can be
+    // legitimately tiny (comics, podcasts), so tiny is not evidence of
+    // anything there. Books and music are exempt for the same reason and
+    // it is not a nicety: an epub is about a megabyte and a single
+    // track a few, so scoring them by film sizes would have hidden the
+    // whole lane the moment the parser started producing it.
+    if total_bytes > 0 && total_bytes < 10 << 20 {
+        s = match p.kind {
+            Kind::Movie | Kind::Tv => s.max(55),
+            Kind::Custom(_) | Kind::Music | Kind::Book => s,
+            _ => s + 40,
+        };
+    }
+    // Furniture posted as its own "release": nfo/srr/sfv/sample/subs
+    // riding a real release's name. These filled the newest-first list
+    // with 0.00 GB rows no indexer site would show.
+    let lower = stem.to_ascii_lowercase();
+    const FURNITURE: [&str; 8] = [
+        ".nfo", ".srr", ".sfv", ".nzb", ".idx", ".sub", ".srt", ".sample",
+    ];
+    if FURNITURE.iter().any(|e| lower.ends_with(e)) {
+        s = s.max(60);
+    }
+    // "sample"/"proof" as a NAME token is only furniture when the post is
+    // sample-SIZED (M32: name-only matching wrongly damns
+    // full releases with 'sample' in the title). Real samples are tens of
+    // MB; past 300 MB the token is part of a title, not a role.
+    if total_bytes < 300 << 20
+        && lower
+            .split(['.', '_', '-', ' '])
+            .any(|t| t == "sample" || t == "proof")
+    {
+        s = s.max(60);
+    }
+    // M32 (Prowlarr#2329): an executable riding a media-shaped release is
+    // the classic malware shape - no legitimate movie/episode/music post
+    // carries an .exe. Software releases legitimately do, so only their
+    // Kind escapes the hammer.
+    if has_exe && !matches!(p.kind, Kind::Software) {
+        s = s.max(85);
+    }
+    s.min(100)
+}
+
+/// `… "name" yEnc (n/m)` → (subject minus counter, n, m).
+///
+/// The counter is the RIGHTMOST group that actually parses as one:
+/// `(n/m)`, `[n/m]`, or `(n of m)`. Taking the last `(` unconditionally
+/// broke on trailing tags - `… (5/50) (German)` or `… (5/50) (4.2 GB)`
+/// returned None, every part collapsed to (1,1), and a 50-part file
+/// indexed as one segment yet counted "complete".
+pub fn split_subject(subject: &str) -> Option<(String, u32, u32)> {
+    let opens: Vec<(usize, char, char)> = subject
+        .char_indices()
+        .filter_map(|(i, c)| match c {
+            '(' => Some((i, '(', ')')),
+            '[' => Some((i, '[', ']')),
+            _ => None,
+        })
+        .collect();
+    for &(open, _, close_ch) in opens.iter().rev() {
+        let Some(close) = subject[open..].find(close_ch).map(|j| j + open) else {
+            continue;
+        };
+        let inner = &subject[open + 1..close];
+        let sep = inner
+            .find('/')
+            .map(|i| (i, 1))
+            .or_else(|| inner.to_ascii_lowercase().find(" of ").map(|i| (i, 4)));
+        let Some((si, sl)) = sep else { continue };
+        let (Ok(n), Ok(m)) = (
+            inner[..si].trim().parse::<u32>(),
+            inner[si + sl..].trim().parse::<u32>(),
+        ) else {
+            continue;
+        };
+        let mut base = String::new();
+        base.push_str(subject[..open].trim_end());
+        base.push_str(subject[close + close_ch.len_utf8()..].trim_end());
+        return Some((base, n, m));
+    }
+    None
+}
+
+/// Filename from a counter-stripped subject: the quoted name, else - for
+/// the unquoted convention `Release.Name.part01.rar yEnc` - the first
+/// whitespace token with a plausible extension (all-digit `.001`-style,
+/// or letter-led 2-5 alphanumerics, or `.7z`). Quote-only parsing made
+/// entire unquoted releases invisible to the indexer.
+pub fn quoted_name(s: &str) -> Option<String> {
+    if let Some(name) = crate::nzb::quoted_filename(s) {
+        return Some(name.to_string());
+    }
+    s.split_whitespace()
+        .find(|t| {
+            // Poster furniture ("[#a.b.group]", "<foo.bar>") is not a
+            // filename even when it carries a dotted extension shape.
+            if !t.starts_with(|c: char| c.is_ascii_alphanumeric()) || t.contains('@') {
+                return false;
+            }
+            let Some(dot) = t.rfind('.') else {
+                return false;
+            };
+            let ext = &t[dot + 1..];
+            dot > 0
+                && ((ext.len() >= 2 && ext.bytes().all(|c| c.is_ascii_digit()))
+                    || (ext.len() >= 2
+                        && ext.len() <= 5
+                        && ext.as_bytes()[0].is_ascii_alphabetic()
+                        && ext.bytes().all(|c| c.is_ascii_alphanumeric()))
+                    || ext.eq_ignore_ascii_case("7z"))
+        })
+        .map(str::to_string)
+}
+
+impl Index {
+    /// Ingest-time parse: built-in classifier plus the installed custom
+    /// categories. Every site that WRITES kind/title_key must call this,
+    /// not `parse_release`, or custom rows would flap back to their
+    /// built-in kind on the next re-ingest touch.
+    fn classify(&self, stem: &str) -> crate::release::Parsed {
+        crate::categories::classify(stem, &self.custom)
+    }
+
+    /// TODO 24D: chunked re-classification of stored rows after the
+    /// category config changed. Same shape as the quality_v8 migration
+    /// (10k-row transactions, persisted cursor, write-only-on-change) so
+    /// it can run against a live db without starving parallel scanners.
+    /// The current config's fingerprint is stamped in `kv`; calling this
+    /// again with an unchanged config is a cheap no-op. Returns the
+    /// number of rows whose classification changed.
+    pub fn reclassify_custom(&self) -> rusqlite::Result<u64> {
+        let want = crate::categories::config_hash(&self.custom);
+        let have: Option<String> = self
+            .db
+            .query_row("SELECT v FROM kv WHERE k='custom_cats_cfg'", [], |r| {
+                r.get(0)
+            })
+            .ok();
+        let cursor_key = "custom_cats_cursor";
+        let mut cursor: i64 = if have.as_deref() == Some(want.as_str()) {
+            // Same config: either done (no cursor) or resuming a pass
+            // that a restart interrupted.
+            match self
+                .db
+                .query_row("SELECT v FROM kv WHERE k=?1", [cursor_key], |r| {
+                    r.get::<_, String>(0)
+                })
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                Some(c) => c,
+                None => return Ok(0),
+            }
+        } else {
+            // New config: stamp it and start from the top. Stamping
+            // FIRST is deliberate - an interrupted pass resumes from the
+            // cursor rather than restarting, exactly like quality_v8.
+            // The fingerprint and cursor are ONE state transition. Two
+            // autocommit writes left a crash window where the new
+            // fingerprint existed without a cursor; every later call then
+            // read that as "already finished" and skipped reclassification
+            // forever.
+            // IMMEDIATE, not the deferred `unchecked_transaction`: this
+            // reads a cursor and writes it back, and a deferred lock
+            // upgrade does NOT get the busy timeout - it returns
+            // SQLITE_BUSY at once (the same trap the nsegs migration
+            // above documents). Losing it costs no data, but the retry is
+            // a whole scan interval away, so a category change looks like
+            // it did nothing.
+            let tx = rusqlite::Transaction::new_unchecked(
+                &self.db,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            tx.execute(
+                "INSERT INTO kv(k, v) VALUES('custom_cats_cfg', ?1)
+                 ON CONFLICT(k) DO UPDATE SET v=?1",
+                [&want],
+            )?;
+            tx.execute(
+                "INSERT INTO kv(k, v) VALUES(?1, '0')
+                 ON CONFLICT(k) DO UPDATE SET v='0'",
+                [cursor_key],
+            )?;
+            tx.commit()?;
+            0
+        };
+        let mut changed = 0u64;
+        loop {
+            let tx = rusqlite::Transaction::new_unchecked(
+                &self.db,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let rows: Vec<(i64, String, i64, bool)> = {
+                let mut sel = tx.prepare_cached(&format!(
+                    "SELECT id, stem, total_bytes,
+                            EXISTS(SELECT 1 FROM files
+                                   WHERE release_id=releases.id AND {EXE_FILE_SQL})
+                     FROM releases WHERE id > ?1 ORDER BY id LIMIT 10000"
+                ))?;
+                sel.query_map([cursor], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?
+            };
+            if rows.is_empty() {
+                tx.execute("DELETE FROM kv WHERE k=?1", [cursor_key])?;
+                tx.commit()?;
+                break;
+            }
+            {
+                let mut upd = tx.prepare_cached(
+                    "UPDATE releases SET kind=?2, title_key=?3, junk=?4
+                     WHERE id=?1 AND (kind<>?2 OR title_key<>?3 OR junk<>?4)",
+                )?;
+                for (id, stem, bytes, has_exe) in &rows {
+                    let p = self.classify(stem);
+                    changed += upd.execute(rusqlite::params![
+                        id,
+                        kind_str(&p.kind),
+                        p.key,
+                        junk_score(stem, &p, *bytes as u64, *has_exe),
+                    ])? as u64;
+                }
+            }
+            cursor = rows.last().unwrap().0;
+            tx.execute(
+                "INSERT INTO kv(k, v) VALUES(?1, ?2) ON CONFLICT(k) DO UPDATE SET v=?2",
+                rusqlite::params![cursor_key, cursor.to_string()],
+            )?;
+            tx.commit()?;
+        }
+        Ok(changed)
+    }
+
+    /// Canonical marks identity for a server: the lowercased host.
+    /// Precise on purpose - even same-backbone resellers get their own
+    /// rows, because nothing guarantees two spools share numbering.
+    pub fn server_key(host: &str) -> String {
+        host.trim().to_ascii_lowercase()
+    }
+
+    /// One-time adoption of single-server-era marks rows (server=''):
+    /// they were built against whichever server was `servers[0]`, so the
+    /// caller passes that host and the rows become its. A group that
+    /// already has a row for this server keeps it (the fresher of the
+    /// two); its legacy row is dropped either way. Idempotent - after
+    /// the first call there are no '' rows left.
+    pub fn adopt_legacy_marks(&self, host: &str) -> rusqlite::Result<()> {
+        let server = Self::server_key(host);
+        if server.is_empty() {
+            return Ok(());
+        }
+        self.db.execute(
+            "UPDATE marks SET server=?1
+              WHERE server=''
+                AND grp NOT IN (SELECT grp FROM marks WHERE server=?1)",
+            [&server],
+        )?;
+        self.db.execute("DELETE FROM marks WHERE server=''", [])?;
+        Ok(())
+    }
+
+    /// Deepest article this group's history has been scanned back to on
+    /// `server` (0 = never recorded). The scan loop's auto-deepen
+    /// extends this downward a bounded slice per pass.
+    pub fn low_water(&self, grp: &str, server: &str) -> u64 {
+        self.db
+            .query_row(
+                "SELECT low FROM marks WHERE grp=?1 AND server=?2",
+                [grp, &Self::server_key(server)],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|v| v as u64)
+            .unwrap_or(0)
+    }
+
+    pub fn set_low_water(&self, grp: &str, server: &str, low: u64) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT INTO marks(grp, server, high, low) VALUES(?1, ?2, 0, ?3)
+             ON CONFLICT(grp, server) DO UPDATE SET low=excluded.low",
+            rusqlite::params![grp, Self::server_key(server), low as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn high_water(&self, grp: &str, server: &str) -> u64 {
+        self.db
+            .query_row(
+                "SELECT high FROM marks WHERE grp=?1 AND server=?2",
+                [grp, &Self::server_key(server)],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|v| v as u64)
+            .unwrap_or(0)
+    }
+
+    pub fn set_high_water(&self, grp: &str, server: &str, high: u64) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT INTO marks(grp, server, high) VALUES(?1, ?2, ?3)
+             ON CONFLICT(grp, server) DO UPDATE SET high=excluded.high",
+            rusqlite::params![grp, Self::server_key(server), high as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Ingest one batch of OVER entries for `grp`. Returns releases whose
+    /// completeness changed to complete in this batch.
+    pub fn ingest(&mut self, grp: &str, entries: &[OverEntry], now: i64) -> rusqlite::Result<u32> {
+        // Cluster the batch in memory first: (poster, stem) → filename →
+        // (total, parts: number → (msgid, bytes)).
+        type Parts = BTreeMap<u32, (String, u64)>;
+        let mut clusters: HashMap<(String, String), HashMap<String, (u32, Parts)>> = HashMap::new();
+        // Earliest article Date per cluster → the release's upload time.
+        let mut posted: HashMap<(String, String), i64> = HashMap::new();
+        for e in entries {
+            let (base, part, total) =
+                split_subject(&e.subject).unwrap_or_else(|| (e.subject.clone(), 1, 1));
+            if e.message_id.is_empty() || part == 0 || total == 0 {
+                continue;
+            }
+            let Some(fname) = quoted_name(&base) else {
+                continue;
+            };
+            let stem = release_stem(&fname);
+            if stem.is_empty() {
+                continue;
+            }
+            let key = (e.from.clone(), stem);
+            if e.date > 0 {
+                // Clamp a future Date: header to the scan time. A garbled or
+                // hostile far-future date would otherwise pin the release to
+                // the top of the "newest" sort forever AND make it immune to
+                // age-retention pruning (first_posted < cutoff never holds).
+                let d = e.date.min(now);
+                let p = posted.entry(key.clone()).or_insert(d);
+                *p = (*p).min(d);
+            }
+            clusters
+                .entry(key)
+                .or_default()
+                .entry(fname)
+                .or_insert_with(|| (total, BTreeMap::new()))
+                .1
+                .insert(part, (e.message_id.clone(), e.bytes));
+        }
+        // Pre feed: ask the relay corpus what each clustered stem was
+        // really called, BEFORE the gate runs. Order matters - a gate
+        // like `{"kinds":["tv"]}` reads a name, and an obfuscated stem
+        // has none to read, so gating first would discard exactly the
+        // posts this feature exists to rescue. Done here rather than
+        // inside the loop below because the transaction borrows `db`
+        // mutably and these are reads.
+        let mut named: HashMap<String, (String, String)> = HashMap::new();
+        if self.predb {
+            for (_, stem) in clusters.keys() {
+                if named.contains_key(stem) {
+                    continue;
+                }
+                if let Some(hit) = predb::predb_lookup(&self.db, stem) {
+                    named.insert(stem.clone(), hit);
+                }
+            }
+        }
+        if let Some(gate) = &self.gate {
+            clusters.retain(|(_, stem), _| {
+                gate(named.get(stem).map_or(stem.as_str(), |(t, _)| t.as_str()))
+            });
+        }
+
+        // IMMEDIATE, not the default DEFERRED. A deferred transaction takes
+        // its write lock lazily, on the first write statement, and SQLite
+        // does NOT apply the busy timeout to that upgrade - it returns
+        // SQLITE_BUSY immediately. The `?` then aborts the whole scan pass
+        // for that group until the next interval. Every group scan opens
+        // its own Index and the shared handle is replaced after each pass,
+        // so there is one vulnerable ingest per group per pass, forever.
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut completed = 0u32;
+        // Arrivals the installed watch wants told about, journalled once
+        // the batch commits (see the note at the bottom of the loop).
+        let mut hits: Vec<WatchHit> = Vec::new();
+        for ((poster, stem), files) in clusters {
+            // Real upload time when the batch carried Dates; scan time
+            // otherwise. MIN on conflict lets an older batch (backfill
+            // runs newest-first) walk first_posted back to the truth.
+            // Clamp to now + 1 day of clock skew: the Date comes from an
+            // untrusted OVER header, and a far-future date would pin the release
+            // atop every Latest/Posted view for years AND dodge both retention
+            // prunes (they only delete rows OLDER than a cutoff).
+            let up = posted
+                .get(&(poster.clone(), stem.clone()))
+                .copied()
+                .unwrap_or(now)
+                .min(now + 86_400);
+            tx.prepare_cached(
+                "INSERT INTO releases(stem, poster, grp, first_seen, first_posted)
+                 VALUES(?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(stem, poster, grp) DO UPDATE SET
+                   first_posted=MIN(first_posted, excluded.first_posted)",
+            )?
+            .execute(rusqlite::params![stem, poster, grp, now, up])?;
+            let rid: i64 = tx
+                .prepare_cached("SELECT id FROM releases WHERE stem=?1 AND poster=?2 AND grp=?3")?
+                .query_row(rusqlite::params![stem, poster, grp], |r| r.get(0))?;
+            for (fname, (total, parts)) in files {
+                // Merge with existing segments (batches split arbitrarily).
+                let existing: Option<(String, u32)> = tx
+                    .prepare_cached(
+                        "SELECT segments, total_parts FROM files
+                          WHERE release_id=?1 AND filename=?2",
+                    )?
+                    .query_row(rusqlite::params![rid, fname], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })
+                    .ok();
+                // A file's "(x/y)" total does not change within one posting.
+                // If it disagrees with what we already hold, these are two
+                // DIFFERENT postings that happen to reuse a filename - most
+                // often a re-rar at a new volume size. Unioning their part
+                // numbers used to satisfy `nsegs >= total_parts` from two
+                // incompatible sets at once, so the release went complete
+                // and make_nzb emitted message-ids from both generations:
+                // a "complete" download that extracts to garbage.
+                //
+                // Keep the generation already established and drop the
+                // conflicting batch for this file. Being wrong that way
+                // costs a release that reads incomplete until a rescan;
+                // being wrong the other way hands the user a corrupt file
+                // and calls it done. It also means a single garbled
+                // subject line cannot wipe an accumulated set.
+                //
+                // The real fix is a generation identity on `files` so both
+                // postings can be indexed side by side, which needs a
+                // schema migration. Pinned by the D3 regression test.
+                if let Some((_, prev_total)) = &existing
+                    && *prev_total > 0
+                    && total > 0
+                    && *prev_total != total
+                {
+                    warn!(
+                        target: "index",
+                        "{fname}: ignoring a batch claiming {total} parts, \
+                             already tracking {prev_total} - reused filename, different posting"
+                    );
+                    continue;
+                }
+                let mut merged: BTreeMap<u32, (String, u64)> = existing
+                    .and_then(|(s, _)| serde_json::from_str::<Vec<(u32, String, u64)>>(&s).ok())
+                    .map(|v| v.into_iter().map(|(n, id, b)| (n, (id, b))).collect())
+                    .unwrap_or_default();
+                for (n, v) in parts {
+                    merged.insert(n, v);
+                }
+                let bytes: u64 = merged.values().map(|v| v.1).sum();
+                let seg_json = serde_json::to_string(
+                    &merged
+                        .iter()
+                        .map(|(n, (id, b))| (*n, id.clone(), *b))
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+                tx.prepare_cached(
+                    "INSERT INTO files(release_id, filename, total_parts, bytes, segments, nsegs)
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(release_id, filename) DO UPDATE SET
+                       total_parts=excluded.total_parts, bytes=excluded.bytes,
+                       segments=excluded.segments, nsegs=excluded.nsegs",
+                )?
+                .execute(rusqlite::params![
+                    rid,
+                    fname,
+                    total,
+                    bytes as i64,
+                    seg_json,
+                    merged.len() as i64
+                ])?;
+            }
+            // Recompute release aggregates.
+            let (nfiles, tbytes, ncomplete, npar2, have, need, nexe): (
+                u32,
+                i64,
+                u32,
+                u32,
+                i64,
+                i64,
+                u32,
+            ) = tx
+                .prepare_cached(&format!(
+                    "SELECT COUNT(*), COALESCE(SUM(bytes),0),
+                            SUM(CASE WHEN nsegs > 0 THEN nsegs
+                                     ELSE json_array_length(segments) END >= total_parts),
+                            SUM(LOWER(filename) LIKE '%.par2'),
+                            COALESCE(SUM(CASE WHEN nsegs > 0 THEN nsegs
+                                              ELSE json_array_length(segments) END),0),
+                            COALESCE(SUM(total_parts),0),
+                            SUM({EXE_FILE_SQL})
+                     FROM files WHERE release_id=?1"
+                ))?
+                .query_row([rid], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                })?;
+            // A release is complete when every file we've seen has all
+            // its parts. Single-file posts (one mkv/iso, no par2 set)
+            // are common and legitimate - the old `nfiles >= 2` rule
+            // froze them all as incomplete forever (measured 55% of a
+            // live teevee+moovee index). Indexer-spam tiny posts are the
+            // size gate's job (gates min_size), not this flag's.
+            let complete = nfiles >= 1 && ncomplete == nfiles;
+            // pre_title/pre_source come back with `was` so a re-ingest
+            // cannot un-name a release the retro sweep already named:
+            // this batch's lookup wins when it found something, the
+            // stored value stands otherwise. Without that, every later
+            // batch touching the release would blank the name, and
+            // turning the feed off would erase every name it had given.
+            let (was, had_title, had_source): (bool, String, String) = tx
+                .prepare_cached("SELECT complete, pre_title, pre_source FROM releases WHERE id=?1")?
+                .query_row([rid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            // kind/res parse once per touched cluster - cheap (pure text)
+            // and idempotent, so re-ingest keeps them current. Runs
+            // through the installed custom categories (24D) so a user
+            // kind survives re-ingest touches. (Field access, not
+            // self.classify - `tx` holds the &mut borrow of self.db.)
+            //
+            // Parsed from the FED name when there is one. That single
+            // substitution is what turns a pre hit into a real result:
+            // title_key lands the release on the right wall card, and
+            // kind/res/codecs/junk all come out of a name that actually
+            // says something instead of a random stem.
+            let (pre_title, pre_source) =
+                named.get(&stem).cloned().unwrap_or((had_title, had_source));
+            let name = if pre_title.is_empty() {
+                stem.as_str()
+            } else {
+                pre_title.as_str()
+            };
+            let p = crate::categories::classify(name, &self.custom);
+            tx.prepare_cached(
+                "UPDATE releases SET files=?2, total_bytes=?3, has_par2=?4, complete=?5,
+                        kind=?6, res=?7, have_parts=?8, need_parts=?9,
+                        title_key=?10, junk=?11, langs=?12,
+                        vcodec=?13, acodec=?14, hdr=?15,
+                        pre_title=?16, pre_source=?17, pre_at=?18
+                 WHERE id=?1",
+            )?
+            .execute(rusqlite::params![
+                rid,
+                nfiles,
+                { tbytes },
+                npar2 > 0,
+                complete,
+                kind_str(&p.kind),
+                p.res.as_deref().unwrap_or_default(),
+                have,
+                need,
+                p.key,
+                junk_score(name, &p, tbytes as u64, nexe > 0),
+                p.langs.join(" "),
+                p.vcodec.as_deref().unwrap_or_default(),
+                p.acodec.as_deref().unwrap_or_default(),
+                p.hdr.as_deref().unwrap_or_default(),
+                pre_title,
+                pre_source,
+                // Stamped whether or not the feed knew this one, so
+                // the backlog sweep does not re-examine rows the
+                // live path has already asked about.
+                now
+            ])?;
+            if complete && !was {
+                completed += 1;
+            }
+            // Offer the release to the arrival watch. The predicate is
+            // read as a FIELD, not through `self.note_watch`: `tx` holds
+            // the &mut borrow of `self.db`, and a method taking `&self`
+            // would borrow the whole struct. The hits themselves are
+            // journalled after the commit, so a batch that fails to
+            // commit announces nothing.
+            if let Some(watch) = &self.watch
+                && watch(name)
+            {
+                hits.push(WatchHit {
+                    id: rid,
+                    name: name.to_string(),
+                    complete,
+                });
+            }
+        }
+        tx.commit()?;
+        for h in hits {
+            self.push_watch_hit(h);
+        }
+        Ok(completed)
+    }
+
+    // ---- the pre feed -------------------------------------------------
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::testutil::{dated_entry, entry, teardown};
+
+    #[test]
+    fn split_subject_conventions() {
+        // Canonical (n/m).
+        assert_eq!(
+            split_subject(r#"x - "f.rar" yEnc (5/50)"#),
+            Some((r#"x - "f.rar" yEnc"#.to_string(), 5, 50))
+        );
+        // Trailing parenthesized tag must not shadow the counter.
+        assert_eq!(
+            split_subject(r#"x - "f.rar" yEnc (5/50) (German)"#).map(|(_, n, m)| (n, m)),
+            Some((5, 50))
+        );
+        assert_eq!(
+            split_subject(r#"x - "f.rar" yEnc (5/50) (4.2 GB)"#).map(|(_, n, m)| (n, m)),
+            Some((5, 50))
+        );
+        // Bracketed and "of" counters.
+        assert_eq!(
+            split_subject("Release.part01.rar yEnc [1/50]").map(|(_, n, m)| (n, m)),
+            Some((1, 50))
+        );
+        assert_eq!(
+            split_subject(r#"x - "f.rar" yEnc (1 of 50)"#).map(|(_, n, m)| (n, m)),
+            Some((1, 50))
+        );
+        // No counter at all.
+        assert_eq!(split_subject("just a subject (German)"), None);
+    }
+
+    #[test]
+    fn quoted_name_conventions() {
+        // Quoted, with a decoy quoted run first.
+        assert_eq!(
+            quoted_name(r#""S01E01" - "Show.part01.rar" yEnc"#),
+            Some("Show.part01.rar".to_string())
+        );
+        // Unquoted convention.
+        assert_eq!(
+            quoted_name("Release.Name.part01.rar yEnc"),
+            Some("Release.Name.part01.rar".to_string())
+        );
+        assert_eq!(
+            quoted_name("Backup.7z.001 yEnc"),
+            Some("Backup.7z.001".to_string())
+        );
+        // Size fragments and version dots are not filenames.
+        assert_eq!(quoted_name("Big Release 4.2GB yEnc"), None);
+        assert_eq!(quoted_name("Release v1.0 done"), None);
+    }
+
+    #[test]
+    fn junk_v6_evidence_free_media_and_lecture_dumps() {
+        let score = |stem: &str, bytes: u64| {
+            let p = crate::release::parse_release(stem);
+            junk_score(stem, &p, bytes, false)
+        };
+        // Course/lecture dumps (real leaks from a live teevee+moovee
+        // index): numbered tracks and bare-words media files.
+        assert!(score("003 - Estômago.mp4", 100 << 20) >= 50);
+        assert!(score("056 - Ortografia II.mp4", 200 << 20) >= 50);
+        assert!(score("aula.mp4", 700 << 20) >= 50);
+        assert!(score("Configurando Dsers.mp4", 80 << 20) >= 50);
+        assert!(score("misfits-wegedeutschensd", 100 << 20) >= 50);
+        // Track prefix wins even when a year parses further in.
+        assert!(score("065 - Estatística RLM 2019.mp4", 400 << 20) >= 50);
+        // Bracket-hex repost spam - inner name parses real, still junk.
+        assert!(
+            score(
+                "[3b9550c02c]_[newzNZB]_atlanta.s01e10.1080p.hdtv.x264-xpert",
+                50 << 20
+            ) >= 50
+        );
+        // Anime subgroup brackets are words, not hex - clean.
+        assert!(score("[SubsPlease] Frieren - S01E01 (1080p) [ABCD1234]", 1 << 30) < 50);
+        // Real releases with any single marker survive.
+        assert!(score("Some.Documentary.2020.mp4", 2 << 30) < 50);
+        assert!(
+            score(
+                "slings.and.arrows.s01e03.proper.dvdrip.xvid-nodlabs",
+                300 << 20
+            ) < 50
+        );
+        assert!(
+            score(
+                "Robin.Hood.2010.Theatrical.Cut.BluRay.1080p.DTS-X.7.1.AVC.HYBRID.REMUX-FraMeSToR.mkv",
+                33 << 30
+            ) < 50
+        );
+        // "24.S01E01" style: leading digits but a parsed episode - clean.
+        assert!(score("24.S01E01.1080p.WEB.h264-GRP", 2 << 30) < 50);
+        // Evidence-free software-ish name is hidden by the same rule.
+        assert!(score("Topaz Video AI Pro 8.1.6", 500 << 20) >= 50);
+        // Sub-200 MB "HD movie" posts are fakes; a real small movie
+        // without an HD claim (old SD rip) survives, and TV stays
+        // exempt (short-form episodes are legitimately tiny).
+        assert!(score("Dont.Breathe.2016.1080p.WEB-DL.DD5.1.H264-FGT", 180 << 20) >= 50);
+        assert!(score("Old.Short.Film.1962.DVDRip.XviD-GRP", 180 << 20) < 50);
+        assert!(score("some.show.s01e04.720p.hdtv.x264-grp", 150 << 20) < 50);
+    }
+
+    #[test]
+    fn executable_content_junks_media_releases() {
+        // M32 (Prowlarr#2329): an .exe inside a movie/TV-shaped release is
+        // flagged past the default-hide line; Software releases keep their
+        // normal score (executables are their content).
+        let dir = std::env::temp_dir().join(format!("nzbfast-index-exe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ix = Index::open(&dir.join("index.db")).unwrap();
+        let mk = |f: &str, from: &str, id: &str| {
+            entry(&format!("\"{f}\" yEnc (1/1)"), from, id, 4 << 30)
+        };
+        ix.ingest(
+            "alt.binaries.test",
+            &[
+                mk("Some.Movie.2026.1080p.BluRay.x264-GRP.exe", "a@a", "x1"),
+                mk("Clean.Movie.2026.1080p.BluRay.x264-GRP.mkv", "b@b", "x2"),
+            ],
+            1_000,
+        )
+        .unwrap();
+        // Both rows exist, but the junk ceiling hides the exe-carrying one.
+        let (_, total_all) = ix.browse(&BrowseQuery::default()).unwrap();
+        assert_eq!(total_all, 2);
+        let (rows, total) = ix
+            .browse(&BrowseQuery {
+                max_junk: Some(50),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 1, "exe-carrying movie must be junk-hidden: {rows:?}");
+        assert!(rows[0].stem.contains("Clean.Movie"), "{rows:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sample_token_only_junks_sample_sized_posts() {
+        // M32: a full-size release with "sample"
+        // in its TITLE is not furniture; a tens-of-MB one is.
+        let dir = std::env::temp_dir().join(format!("nzbfast-index-smp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ix = Index::open(&dir.join("index.db")).unwrap();
+        ix.ingest(
+            "alt.binaries.test",
+            &[
+                entry(
+                    "\"The.Free.Sample.2026.1080p.BluRay.x264-GRP.mkv\" yEnc (1/1)",
+                    "a@a",
+                    "s1",
+                    4 << 30,
+                ),
+                entry(
+                    "\"Other.Movie.2026.1080p-GRP.sample.mkv\" yEnc (1/1)",
+                    "b@b",
+                    "s2",
+                    60 << 20,
+                ),
+            ],
+            1_000,
+        )
+        .unwrap();
+        let (rows, total) = ix
+            .browse(&BrowseQuery {
+                max_junk: Some(50),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 1, "only the real sample is hidden: {rows:?}");
+        assert!(rows[0].stem.contains("Free.Sample"), "{rows:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `nsegs` caches what `json_array_length(segments)` used to
+    /// recompute on every touch. Two things must hold: it tracks the
+    /// merged part set exactly, and completeness stays right for rows
+    /// the backfill has not reached yet (an unfilled row reads 0, which
+    /// would otherwise flip a complete release to incomplete).
+    #[test]
+    fn nsegs_tracks_segments_and_survives_a_half_done_backfill() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-nsegs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.db");
+        let mut ix = Index::open(&path).unwrap();
+
+        // Split across batches so the merge path runs: part 2 arrives
+        // after part 1, and nsegs has to end at 2, not 1.
+        ix.ingest(
+            "alt.test",
+            &[entry(
+                "\"Film.2020.part1.rar\" yEnc (1/2)",
+                "p@x",
+                "a1",
+                900,
+            )],
+            1000,
+        )
+        .unwrap();
+        let count = |ix: &Index| -> i64 {
+            ix.db
+                .query_row(
+                    "SELECT nsegs FROM files WHERE filename LIKE 'Film%'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(count(&ix), 1, "first batch: one part seen");
+        assert_eq!(
+            ix.ingest(
+                "alt.test",
+                &[entry(
+                    "\"Film.2020.part1.rar\" yEnc (2/2)",
+                    "p@x",
+                    "a2",
+                    900
+                )],
+                1001
+            )
+            .unwrap(),
+            1,
+            "merging the second part completes the release"
+        );
+        assert_eq!(count(&ix), 2, "nsegs follows the MERGED set, not the batch");
+        assert!(
+            ix.db
+                .query_row("SELECT complete FROM releases LIMIT 1", [], |r| r
+                    .get::<_, bool>(0))
+                .unwrap()
+        );
+
+        // Simulate a row the chunked backfill has not reached: nsegs
+        // back to 0 with the JSON intact, which is exactly the state
+        // every pre-existing row is in on first open after upgrading.
+        ix.db.execute("UPDATE files SET nsegs = 0", []).unwrap();
+        ix.db
+            .execute("UPDATE kv SET v='0' WHERE k='nsegs_fill'", [])
+            .ok();
+        ix.ingest(
+            "alt.test",
+            &[entry("\"Other.2020.mkv\" yEnc (1/1)", "p@y", "b1", 900)],
+            1002,
+        )
+        .unwrap();
+        let still_complete: bool = ix
+            .db
+            .query_row(
+                "SELECT complete FROM releases WHERE stem LIKE 'Film%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            still_complete,
+            "a release whose files the backfill has not reached must not \
+             be flipped to incomplete by the cached count reading 0"
+        );
+
+        // Re-opening runs the backfill and fills them in.
+        drop(ix);
+        let ix = Index::open(&path).unwrap();
+        assert_eq!(count(&ix), 2, "backfill restored the cached count");
+        let done: String = ix
+            .db
+            .query_row("SELECT v FROM kv WHERE k='nsegs_fill'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(done, "1", "backfill stamped itself complete");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The arrivals counter lives in `kv`, and three separate code paths
+    /// do `DELETE FROM kv WHERE k=...`. If that row ever went missing the
+    /// trigger's `SELECT v FROM kv` yielded NULL, the `UPDATE releases
+    /// SET arrival_seq=NULL` hit the NOT NULL constraint, and the whole
+    /// ingest transaction rolled back - one mistyped key away from an
+    /// index that can never be written to again. The fallback makes the
+    /// worst case a duplicate cursor value, not a dead database.
+    #[test]
+    fn arrival_seq_trigger_survives_a_missing_counter_row() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-arrseq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ix = Index::open(&dir.join("index.db")).unwrap();
+
+        ix.ingest(
+            "alt.test",
+            &[dated_entry(
+                "\"Before.Wipe.S01E01.mkv\" yEnc (1/1)",
+                "b1",
+                91_000,
+            )],
+            100_000,
+        )
+        .unwrap();
+
+        // Somebody's kv cleanup took the counter with it.
+        ix.db
+            .execute("DELETE FROM kv WHERE k='wall_arrival_seq'", [])
+            .unwrap();
+
+        ix.ingest(
+            "alt.test",
+            &[dated_entry(
+                "\"After.Wipe.S02E02.mkv\" yEnc (1/1)",
+                "a1",
+                95_000,
+            )],
+            101_000,
+        )
+        .expect("a missing kv row must not take the ingest transaction down with it");
+
+        // The release really landed, and it carries a usable cursor
+        // value rather than the 0 that means "not yet claimed".
+        let (n, seq): (i64, i64) = ix
+            .db
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(arrival_seq), 0) FROM releases",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(n, 2, "both releases are in the table");
+        assert!(
+            seq > 0,
+            "the fallback gave the new row a real cursor, got {seq}"
+        );
+
+        // An index that predates this fix carries the old trigger, so the
+        // upgrade has to replace it - a database still running the
+        // original definition is still fail-dead.
+        let old: i64 = ix
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type='trigger' AND name='rel_arrival_seq_ai'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old, 0, "the pre-fix trigger must be dropped on open");
+
+        // And the counter heals itself on the next open, so the id
+        // fallback stays a one-insert stopgap rather than the new normal.
+        drop(ix);
+        let ix = Index::open(&dir.join("index.db")).unwrap();
+        let restored: i64 = ix
+            .db
+            .query_row(
+                "SELECT CAST(v AS INTEGER) FROM kv WHERE k='wall_arrival_seq'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            restored, seq,
+            "re-open restored the counter from MAX(arrival_seq)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ingest_cluster_search_synthesize() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-index-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ix = Index::open(&dir.join("index.db")).unwrap();
+
+        // Two batches split mid-file: merging must complete the release.
+        let b1 = vec![
+            entry("\"Show.S01E01.part1.rar\" yEnc (1/2)", "p@x", "a1", 1000),
+            entry("\"Show.S01E01.part2.rar\" yEnc (1/1)", "p@x", "b1", 900),
+            entry("\"Show.S01E01.par2\" yEnc (1/1)", "p@x", "c1", 100),
+        ];
+        let b2 = vec![entry(
+            "\"Show.S01E01.part1.rar\" yEnc (2/2)",
+            "p@x",
+            "a2",
+            1000,
+        )];
+        assert_eq!(ix.ingest("alt.test", &b1, 1000).unwrap(), 0); // part1 incomplete
+        assert_eq!(ix.ingest("alt.test", &b2, 1001).unwrap(), 1); // now complete
+
+        // Separator-insensitive, multi-term AND search: a dotted stem
+        // must match a space-separated *arr query (and vice-versa).
+        assert_eq!(ix.search("show.s01e01", 10).unwrap().len(), 1);
+        assert_eq!(ix.search("show s01e01", 10).unwrap().len(), 1);
+        assert_eq!(ix.search("SHOW", 10).unwrap().len(), 1);
+        assert_eq!(ix.search("s01e01 show", 10).unwrap().len(), 1); // order-free
+        assert_eq!(ix.search("show s09e09", 10).unwrap().len(), 0); // term absent
+        assert_eq!(ix.search("", 10).unwrap().len(), 1); // empty = all
+
+        let hits = ix.search("show.s01e01", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        let r = &hits[0];
+        assert!(r.complete && r.has_par2);
+        assert_eq!(r.files, 3);
+        assert_eq!(r.total_bytes, 3000);
+
+        // NZB synthesis parses and carries every segment.
+        let nzb = ix.make_nzb(r.id).unwrap();
+        let parsed = crate::nzb::Nzb::parse(nzb.as_bytes()).unwrap();
+        assert_eq!(parsed.files.len(), 3);
+        assert_eq!(
+            parsed.files.iter().map(|f| f.segments.len()).sum::<usize>(),
+            4
+        );
+
+        // High-water marks persist, independently per server (A8:
+        // article numbers are per-server, message-ids are not).
+        ix.set_high_water("alt.test", "News.EXAMPLE.com", 42)
+            .unwrap();
+        assert_eq!(ix.high_water("alt.test", "news.example.com"), 42);
+        assert_eq!(ix.high_water("alt.test", "other.example.com"), 0);
+        assert_eq!(ix.stats().unwrap(), (1, 1));
+        teardown(&dir, ix);
+    }
+
+    fn f1_cats() -> Vec<crate::categories::CustomCategory> {
+        vec![crate::categories::CustomCategory {
+            slug: "formula-1".into(),
+            name: "Formula 1".into(),
+            pattern: r"^formula\.?1\.".into(),
+            not_match: String::new(),
+            base: crate::categories::BaseBehavior::Movie,
+        }]
+    }
+
+    /// 24D end-to-end at the index level: define a category, ingest
+    /// matching releases, see them under the category's kind in browse
+    /// AND as separate wall cards (the F1 dedupe lesson).
+    #[test]
+    fn custom_category_ingest_browse_and_cards() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-cats-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ix = Index::open(&dir.join("index.db")).unwrap();
+        ix.set_custom(f1_cats());
+        ix.ingest(
+            "alt.test",
+            &[
+                entry("\"Formula1.2026.Round11.Hungary.Qualifying.F1TV.WEB-DL.1080p-MWR.mkv\" yEnc (1/1)", "p@x", "f1", 900 << 20),
+                entry("\"Formula1.2026.Round11.Hungary.Post-Qualifying.Show.F1TV.WEB-DL.1080p-MWR.mkv\" yEnc (1/1)", "p@x", "f2", 900 << 20),
+                entry("\"The.Matrix.1999.1080p.BluRay.x264-GRP.mkv\" yEnc (1/1)", "p@x", "m1", 900 << 20),
+            ],
+            100,
+        )
+        .unwrap();
+        // The category's kind filter finds exactly its releases.
+        let (f1, total) = ix
+            .browse(&BrowseQuery {
+                kind: Some("formula-1".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 2, "{f1:?}");
+        assert!(f1.iter().all(|r| r.kind == "formula-1"), "{f1:?}");
+        // The two sessions keep DISTINCT dedupe keys (pre-24D both were
+        // "m:formula1:2026") → two wall cards, and the movie is untouched.
+        let keys: std::collections::HashSet<String> = ix
+            .search("formula1", 10)
+            .unwrap()
+            .iter()
+            .map(|r| {
+                ix.db
+                    .query_row(
+                        "SELECT title_key FROM releases WHERE id=?1",
+                        [r.id],
+                        |row| row.get(0),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(keys.len(), 2, "{keys:?}");
+        assert!(
+            keys.iter().all(|k| k.starts_with("c:formula-1:")),
+            "{keys:?}"
+        );
+        let (cards, _) = ix
+            .browse_cards(
+                &BrowseQuery {
+                    kind: Some("formula-1".into()),
+                    ..Default::default()
+                },
+                CardSort::Latest,
+                false,
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(cards.len(), 2, "{cards:?}");
+        assert!(cards.iter().all(|c| c.kind == "formula-1"));
+        let (movie, _) = ix
+            .browse(&BrowseQuery {
+                kind: Some("movie".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(movie.len(), 1);
+        assert_eq!(movie[0].kind, "movie");
+        // Custom titles get seeded for the wall (pretty names), and the
+        // custom key renders readably.
+        assert!(ix.seed_missing_titles(365000, 100).unwrap() >= 2);
+        assert_eq!(
+            pretty_key("c:formula-1:formula1:2026:round11 hungary qualifying f1tv"),
+            "Formula1 2026 Round11 Hungary Qualifying F1tv"
+        );
+        teardown(&dir, ix);
+    }
+
+    /// 24D reclassification: rows indexed BEFORE a category existed move
+    /// under it when the config changes, the pass is fingerprint-stamped
+    /// (unchanged config = no-op), and deleting the category moves them
+    /// back to their built-in kind.
+    #[test]
+    fn reclassify_custom_reconciles_stored_rows() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-recat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ix = Index::open(&dir.join("index.db")).unwrap();
+        // No categories yet: both sessions collapse onto one movie key -
+        // the exact pre-24D failure.
+        ix.ingest(
+            "alt.test",
+            &[
+                entry("\"Formula1.2026.Round11.Hungary.Qualifying.F1TV.WEB-DL.1080p-MWR.mkv\" yEnc (1/1)", "p@x", "f1", 900 << 20),
+                entry("\"Formula1.2026.Round12.Spa.Race.F1TV.WEB-DL.1080p-MWR.mkv\" yEnc (1/1)", "p@x", "f2", 900 << 20),
+            ],
+            100,
+        )
+        .unwrap();
+        let (rows, _) = ix
+            .browse(&BrowseQuery {
+                kind: Some("movie".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        // Define the category and reconcile.
+        ix.set_custom(f1_cats());
+        assert_eq!(ix.reclassify_custom().unwrap(), 2);
+        // Same config again: fingerprint no-op.
+        assert_eq!(ix.reclassify_custom().unwrap(), 0);
+        let (rows, _) = ix
+            .browse(&BrowseQuery {
+                kind: Some("formula-1".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        // Delete the category: rows return to the built-in classifier.
+        ix.set_custom(Vec::new());
+        assert_eq!(ix.reclassify_custom().unwrap(), 2);
+        let (rows, _) = ix
+            .browse(&BrowseQuery {
+                kind: Some("movie".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        teardown(&dir, ix);
+    }
+
+    /// `Index::open`'s quality_v8 backfill re-parses every stem, and it
+    /// runs BEFORE `set_custom` by construction - the constructor
+    /// hardcodes an empty category list, so the pass cannot see the
+    /// user's categories however the caller is written. Left unguarded it
+    /// rewrote every row a custom category had claimed back to the
+    /// built-in answer: each F1 session collapsing onto one movie card,
+    /// out of the category tab, and losing the Custom junk exemption.
+    ///
+    /// And it did not heal. `reclassify_custom` reads an unchanged
+    /// fingerprint with no cursor and returns Ok(0) on every later start,
+    /// so the damage stood until the user happened to edit the category
+    /// config. Bumping the kv key - which the comment above the pass
+    /// advertises as the ordinary way to backfill a new column - would
+    /// re-inflict it on every install.
+    #[test]
+    fn the_quality_backfill_leaves_custom_classifications_alone() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-qv8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.db");
+        {
+            let mut ix = Index::open(&path).unwrap();
+            ix.ingest(
+                "alt.test",
+                &[
+                    entry("\"Formula1.2026.Round11.Hungary.Qualifying.F1TV.WEB-DL.1080p-MWR.mkv\" yEnc (1/1)", "p@x", "f1", 900 << 20),
+                    entry("\"Formula1.2026.Round12.Spa.Race.F1TV.WEB-DL.1080p-MWR.mkv\" yEnc (1/1)", "p@x", "f2", 900 << 20),
+                    entry("\"The.Matrix.1999.1080p.BluRay.x264-GRP.mkv\" yEnc (1/1)", "p@x", "m1", 900 << 20),
+                ],
+                100,
+            )
+            .unwrap();
+            ix.set_custom(f1_cats());
+            assert_eq!(ix.reclassify_custom().unwrap(), 2, "both sessions claimed");
+
+            // An install whose backfill has not run yet - either it never
+            // did, or the key was bumped to pick up a new column.
+            ix.db
+                .execute(
+                    "DELETE FROM kv WHERE k IN ('quality_v8','quality_v8_cursor')",
+                    [],
+                )
+                .unwrap();
+            // ...and blank a built-in row's resolution, so the pass has
+            // something to prove it still does its job.
+            ix.db
+                .execute("UPDATE releases SET res='' WHERE kind='movie'", [])
+                .unwrap();
+        }
+
+        // The next open runs the pass with no categories installed, which
+        // is the only state `Index::open` can be in.
+        let ix = Index::open(&path).unwrap();
+        // Scoped: a live `Statement` borrows the connection, so `teardown`
+        // could not take the index while this was still in hand - and the
+        // statement holds SQLite resources of its own that want releasing
+        // before the connection anyway.
+        let rows: Vec<(String, String)> = {
+            let mut stmt = ix
+                .db
+                .prepare(
+                    "SELECT kind, title_key FROM releases WHERE stem LIKE 'Formula1%' ORDER BY id",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(rows.len(), 2);
+        for (kind, key) in &rows {
+            assert_eq!(kind, "formula-1", "the backfill unclassified a custom row");
+            assert!(
+                key.starts_with("c:formula-1:"),
+                "the backfill rewrote a custom title key to {key:?} - every session of \
+                 the season then collapses onto one card"
+            );
+        }
+        // The two sessions must still be SEPARATE cards, which is the
+        // whole point of the category.
+        assert_ne!(rows[0].1, rows[1].1);
+
+        // ...and the pass still backfilled the built-in row it is for.
+        let res: String = ix
+            .db
+            .query_row("SELECT res FROM releases WHERE kind='movie'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(res, "1080p", "the backfill must still fill built-in rows");
+
+        teardown(&dir, ix);
+    }
+
+    /// The fingerprint and the cursor are ONE state transition, and this
+    /// is what happens when they are not: an interruption between the two
+    /// writes leaves the new config stamped with no cursor, which every
+    /// later call reads as "already finished". Reclassification is then
+    /// skipped forever - the user's new category never reaches the rows
+    /// already in the index, and nothing short of hand-editing `kv` gets
+    /// it back.
+    ///
+    /// The interruption is a trigger that aborts the cursor write rather
+    /// than a killed process: same window, made deterministic. What is
+    /// asserted is the recovery, not the mechanism - after the failure,
+    /// the next call must still have the work to do.
+    #[test]
+    fn an_interrupted_reclassify_stamp_does_not_declare_the_work_done() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-recat-crash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ix = Index::open(&dir.join("index.db")).unwrap();
+        ix.ingest(
+            "alt.test",
+            &[
+                entry("\"Formula1.2026.Round11.Hungary.Qualifying.F1TV.WEB-DL.1080p-MWR.mkv\" yEnc (1/1)", "p@x", "f1", 900 << 20),
+                entry("\"Formula1.2026.Round12.Spa.Race.F1TV.WEB-DL.1080p-MWR.mkv\" yEnc (1/1)", "p@x", "f2", 900 << 20),
+            ],
+            100,
+        )
+        .unwrap();
+
+        // Crash the cursor write, leave the fingerprint write alone.
+        ix.db
+            .execute_batch(
+                "CREATE TRIGGER kv_lose_the_cursor BEFORE INSERT ON kv
+                   WHEN new.k='custom_cats_cursor'
+                   BEGIN SELECT RAISE(ABORT, 'interrupted before the cursor landed'); END;",
+            )
+            .unwrap();
+        ix.set_custom(f1_cats());
+        assert!(
+            ix.reclassify_custom().is_err(),
+            "the interrupted pass must report the failure, not swallow it"
+        );
+        ix.db
+            .execute_batch("DROP TRIGGER kv_lose_the_cursor")
+            .unwrap();
+
+        // The machine is back. The category config is still new to this
+        // index, so its rows must still be reclassified.
+        assert_eq!(
+            ix.reclassify_custom().unwrap(),
+            2,
+            "a half-written stamp made the index believe it had already \
+             reclassified these rows"
+        );
+        let (rows, _) = ix
+            .browse(&BrowseQuery {
+                kind: Some("formula-1".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        teardown(&dir, ix);
+    }
+}
+
+#[cfg(test)]
+mod obfuscated_posts_are_unindexable {
+    /// Why a header-scanning index cannot see a fully obfuscated release,
+    /// however many groups it scans.
+    ///
+    /// Traced from a real one: Supergirl.2026.2160p, which downloaded
+    /// perfectly and which DOGnzb lists, but which does not appear in our
+    /// index. Every theory about coverage was wrong - the article range WAS
+    /// scanned (1,933 neighbours from the same hour are stored), the
+    /// neighbours ARE obfuscated so obfuscation alone is not disqualifying,
+    /// and servers[0] DOES carry the articles.
+    ///
+    /// The nzb lies. Its <groups>, subject= and poster= are all indexer
+    /// metadata, not what is on the wire. Fetched live from the provider,
+    /// the same message-id carries:
+    ///
+    ///   Newsgroups: alt.binaries.encrypted   (nzb said alt.binaries.teevee)
+    ///   Subject:    ZvbiaQJJpLvLZpY          (nzb said "30fb7ada….10" yEnc (1/260))
+    ///   From:       wQXbPchc1NPZZqPmbWr5 …   (nzb said e24e6f0f… )
+    ///
+    /// So it is in a group nobody would index for TV, under a subject with
+    /// no filename, no part marker and no relationship to the release. The
+    /// indexers that list it are not scanning headers - they hold a
+    /// message-id mapping from the uploader.
+    #[test]
+    fn a_real_obfuscated_subject_carries_nothing_to_index_on() {
+        // What the nzb claims: parses fine, which is why this looked
+        // indexable right up until the article itself was read.
+        let claimed = "\"30fb7ada0c0b15e12135927afe355933.10\" yEnc (1/260)";
+        let (base, part, total) =
+            super::split_subject(claimed).unwrap_or_else(|| (claimed.to_string(), 1, 1));
+        assert!(part != 0 && total != 0);
+        assert!(
+            super::quoted_name(&base).is_some(),
+            "the nzb's version is parseable"
+        );
+
+        // What is actually on the wire. ingest() requires a quoted filename
+        // and skips the entry without one, so this can never become a row -
+        // no filename, no part marker, nothing to key a release on.
+        let real = "ZvbiaQJJpLvLZpY";
+        let (rbase, _, _) = super::split_subject(real).unwrap_or_else(|| (real.to_string(), 1, 1));
+        assert!(
+            super::quoted_name(&rbase).is_none(),
+            "the real subject has no quoted filename, so ingest skips it"
+        );
+    }
+}
+
+#[cfg(test)]
+mod multi_server_indexing {
+    use crate::index::testutil::teardown;
+    use crate::index::{BrowseQuery, Index};
+    use crate::nntp::OverEntry;
+
+    fn entry(subject: &str, from: &str, id: &str, bytes: u64) -> OverEntry {
+        OverEntry {
+            number: 0,
+            subject: subject.into(),
+            from: from.into(),
+            message_id: format!("<{id}>"),
+            bytes,
+            date: 0,
+        }
+    }
+
+    /// A8: a single-server-era marks table (PRIMARY KEY on grp alone)
+    /// migrates to the (grp, server) shape with its coverage intact, and
+    /// adopt_legacy_marks hands the '' rows to the historical primary
+    /// without ever clobbering a row that server has since written.
+    #[test]
+    fn marks_migrate_to_per_server_and_adoption_never_clobbers() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-marksmig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("index.db");
+        {
+            // Build the old shape by hand, exactly as v1.0.10 left it.
+            let db = rusqlite::Connection::open(&db_path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE marks(grp TEXT PRIMARY KEY, high INTEGER NOT NULL);
+                 ALTER TABLE marks ADD COLUMN low INTEGER NOT NULL DEFAULT 0;
+                 INSERT INTO marks(grp, high, low) VALUES('alt.old', 500, 100);
+                 INSERT INTO marks(grp, high, low) VALUES('spots:free.pt', 77, 0);",
+            )
+            .unwrap();
+        }
+        let ix = Index::open(&db_path).unwrap();
+        // Migrated rows are visible to no server until adopted.
+        assert_eq!(ix.high_water("alt.old", "news.first.example"), 0);
+        ix.adopt_legacy_marks("News.FIRST.Example").unwrap();
+        assert_eq!(ix.high_water("alt.old", "news.first.example"), 500);
+        assert_eq!(ix.low_water("alt.old", "news.first.example"), 100);
+        // Spot marks migrate the same way (they share the table).
+        assert_eq!(ix.high_water("spots:free.pt", "news.first.example"), 77);
+        // Adoption never clobbers what the server has since written: a
+        // straggling legacy row for an already-claimed group is dropped.
+        ix.set_high_water("alt.old", "news.first.example", 900)
+            .unwrap();
+        ix.db
+            .execute(
+                "INSERT INTO marks(grp, server, high, low) VALUES('alt.old', '', 1, 1)",
+                [],
+            )
+            .unwrap();
+        ix.adopt_legacy_marks("news.first.example").unwrap();
+        assert_eq!(ix.high_water("alt.old", "news.first.example"), 900);
+        // Idempotent: nothing legacy left.
+        ix.adopt_legacy_marks("news.first.example").unwrap();
+        // Per-server independence - the whole point of the migration.
+        ix.set_high_water("alt.old", "other.example", 42).unwrap();
+        assert_eq!(ix.high_water("alt.old", "other.example"), 42);
+        assert_eq!(ix.high_water("alt.old", "news.first.example"), 900);
+        // A fresh database gets the new shape directly (no rebuild): the
+        // reopen must not have bumped anything - just prove reads work.
+        drop(ix);
+        let ix2 = Index::open(&db_path).unwrap();
+        assert_eq!(ix2.high_water("alt.old", "news.first.example"), 900);
+        teardown(&dir, ix2);
+    }
+
+    /// A8: two servers scanning the same group merge into one release -
+    /// message-ids are portable, so a part the first server's spool
+    /// never received completes the release when another backbone's
+    /// headers land. Overlap must not double-count.
+    #[test]
+    fn coverage_scans_from_two_servers_merge_and_complete() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-covmerge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ix = Index::open(&dir.join("index.db")).unwrap();
+        let grp = "alt.binaries.teevee";
+        // Server A saw parts 1 and 2 of 3 (a propagation hole ate #3).
+        let a = [
+            entry(
+                r#""Show.S01E02.720p-GRP.mkv" yEnc (1/3)"#,
+                "p@x",
+                "s1e2.p1",
+                700_000,
+            ),
+            entry(
+                r#""Show.S01E02.720p-GRP.mkv" yEnc (2/3)"#,
+                "p@x",
+                "s1e2.p2",
+                700_000,
+            ),
+        ];
+        ix.ingest(grp, &a, 1_000).unwrap();
+        let (r, _) = ix.browse(&BrowseQuery::default()).unwrap();
+        assert_eq!(r.len(), 1);
+        assert!(!r[0].complete, "two of three parts is incomplete");
+        // Server B carries parts 2 and 3 - same message-ids for the
+        // overlap, which must merge rather than duplicate.
+        let b = [
+            entry(
+                r#""Show.S01E02.720p-GRP.mkv" yEnc (2/3)"#,
+                "p@x",
+                "s1e2.p2",
+                700_000,
+            ),
+            entry(
+                r#""Show.S01E02.720p-GRP.mkv" yEnc (3/3)"#,
+                "p@x",
+                "s1e2.p3",
+                700_000,
+            ),
+        ];
+        let flipped = ix.ingest(grp, &b, 1_000).unwrap();
+        assert_eq!(flipped, 1, "the merge is what completes the release");
+        let (r, _) = ix.browse(&BrowseQuery::default()).unwrap();
+        assert_eq!(r.len(), 1, "still one release, not one per server");
+        assert!(r[0].complete);
+        let nzb = ix.make_nzb(r[0].id).unwrap();
+        let parsed = crate::nzb::Nzb::parse(nzb.as_bytes()).unwrap();
+        assert_eq!(
+            parsed.files.iter().map(|f| f.segments.len()).sum::<usize>(),
+            3,
+            "the overlapping part must not be emitted twice"
+        );
+        teardown(&dir, ix);
+    }
+
+    /// A8 gap-fill pick: only incomplete, junk-gated, settled releases
+    /// are worth re-hunting, and the stamp rotates the pick.
+    #[test]
+    fn gapfill_pick_gates_and_rotates() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-gapfill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ix = Index::open(&dir.join("index.db")).unwrap();
+        let grp = "alt.binaries.teevee";
+        let now = 1_000_000i64;
+        let old = now - 100_000;
+        // Eligible: incomplete, seen long ago.
+        ix.ingest(
+            grp,
+            &[entry(
+                r#""Old.Show.S01E01.720p-GRP.mkv" yEnc (1/2)"#,
+                "p@x",
+                "old.p1",
+                300_000_000,
+            )],
+            old,
+        )
+        .unwrap();
+        // Complete: nothing to hunt.
+        ix.ingest(
+            grp,
+            &[entry(
+                r#""Done.Show.S01E01.720p-GRP.mkv" yEnc (1/1)"#,
+                "p@x",
+                "done.p1",
+                300_000_000,
+            )],
+            old,
+        )
+        .unwrap();
+        // Too fresh: parts are usually still propagating.
+        ix.ingest(
+            grp,
+            &[entry(
+                r#""New.Show.S01E01.720p-GRP.mkv" yEnc (1/2)"#,
+                "p@x",
+                "new.p1",
+                300_000_000,
+            )],
+            now - 60,
+        )
+        .unwrap();
+        // Junk-hidden: must not eat the budget.
+        ix.ingest(
+            grp,
+            &[entry(
+                r#""Junky.Show.S01E01.720p-GRP.mkv" yEnc (1/2)"#,
+                "p@x",
+                "junk.p1",
+                300_000_000,
+            )],
+            old,
+        )
+        .unwrap();
+        ix.db
+            .execute("UPDATE releases SET junk=90 WHERE stem LIKE 'Junky%'", [])
+            .unwrap();
+        let picks = ix.gapfill_pick(10, now).unwrap();
+        assert_eq!(
+            picks.len(),
+            1,
+            "only the settled incomplete release qualifies"
+        );
+        let (id, g, posted) = &picks[0];
+        assert_eq!(g, grp);
+        assert_eq!(*posted, old);
+        assert!(!ix.is_complete(*id));
+        // The stamp rotates: a marked release yields to unmarked ones.
+        ix.ingest(
+            grp,
+            &[entry(
+                r#""Also.Old.S01E01.720p-GRP.mkv" yEnc (1/2)"#,
+                "p@x",
+                "also.p1",
+                300_000_000,
+            )],
+            old,
+        )
+        .unwrap();
+        ix.gapfill_mark(*id, now).unwrap();
+        let picks2 = ix.gapfill_pick(1, now).unwrap();
+        assert_eq!(picks2.len(), 1);
+        assert_ne!(picks2[0].0, *id, "the stamped release rotates to the back");
+        teardown(&dir, ix);
+    }
+}

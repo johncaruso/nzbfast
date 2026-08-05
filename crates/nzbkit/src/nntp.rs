@@ -911,7 +911,7 @@ fn set_keepalive(socket: &tokio::net::TcpSocket) {
         let idle: libc::c_int = 15;
         let interval: libc::c_int = 5;
         let count: libc::c_int = 4;
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         libc::setsockopt(
             fd,
             libc::IPPROTO_TCP,
@@ -919,7 +919,7 @@ fn set_keepalive(socket: &tokio::net::TcpSocket) {
             (&raw const idle).cast(),
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             libc::setsockopt(
                 fd,
@@ -940,7 +940,12 @@ fn set_keepalive(socket: &tokio::net::TcpSocket) {
                 std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
             );
         }
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "android"
+        ))]
         {
             libc::setsockopt(
                 fd,
@@ -2377,11 +2382,29 @@ impl Connection {
         first_byte: std::time::Duration,
         stall: std::time::Duration,
     ) -> Result<(bool, std::time::Duration), NntpError> {
+        let status_seen = std::sync::atomic::AtomicBool::new(false);
+        self.read_body_into_two_phase_noting(out, first_byte, stall, &status_seen)
+            .await
+    }
+
+    /// [`read_body_into_two_phase`], additionally flipping `status_seen`
+    /// the moment the status line lands - so a caller racing this read
+    /// against a suspicion timer (the TODO 115 TTFB hedge) can tell "still
+    /// in pre-byte silence" from "bytes are flowing, just slowly" without
+    /// waiting for the read to finish.
+    pub async fn read_body_into_two_phase_noting(
+        &mut self,
+        out: &mut Vec<u8>,
+        first_byte: std::time::Duration,
+        stall: std::time::Duration,
+        status_seen: &std::sync::atomic::AtomicBool,
+    ) -> Result<(bool, std::time::Duration), NntpError> {
         let t0 = std::time::Instant::now();
         let st = match tokio::time::timeout(first_byte, self.read_status()).await {
             Err(_) => return Err(NntpError::Timeout),
             Ok(r) => r?,
         };
+        status_seen.store(true, std::sync::atomic::Ordering::Release);
         let ttfb = t0.elapsed();
         match st.code {
             222 => {

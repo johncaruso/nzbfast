@@ -21,6 +21,7 @@ use std::net::TcpStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
+#[cfg(feature = "indexer")]
 use nzbkit::nntp::OverEntry;
 
 fn free_port() -> u16 {
@@ -151,6 +152,7 @@ fn wait_ready(child: &mut KillOnDrop, port: u16, logfile: &Path) -> bool {
     panic!("daemon never came up on :{port}\n--- log ---\n{tail}");
 }
 
+#[cfg(feature = "indexer")]
 fn over(number: u64, subject: &str, msgid: &str, bytes: u64) -> OverEntry {
     OverEntry {
         number,
@@ -189,6 +191,7 @@ fn daemon_cmd(dir: &Path, cfg: &Path, db: &Path, port: u16, extra: &[&str]) -> C
 /// it, and nothing in the name says what the release is.
 const HEADER: &str = "7f3ac91e88a2";
 
+#[cfg(feature = "indexer")]
 fn obfuscated_post() -> Vec<OverEntry> {
     vec![
         over(
@@ -220,6 +223,7 @@ fn obfuscated_post() -> Vec<OverEntry> {
 
 /// Rung 1: the link resolves against our own scan data, offline, and the
 /// NZB is rebuilt from the segment ids the index already holds.
+#[cfg(feature = "indexer")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pasted_link_resolves_from_our_own_index() {
     let dir = std::env::temp_dir().join(format!("nzbfast-lnk-local-{}", std::process::id()));
@@ -349,6 +353,7 @@ async fn a_pasted_link_resolves_from_our_own_index() {
 
 /// Rung 2: nothing in our own index, so the same header goes out to the
 /// user's configured indexers and the winning NZB is fetched from there.
+#[cfg(feature = "indexer")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_link_we_cannot_resolve_locally_goes_to_the_indexers() {
     let dir = std::env::temp_dir().join(format!("nzbfast-lnk-pull-{}", std::process::id()));

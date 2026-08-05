@@ -20,7 +20,7 @@ pub mod categories;
 pub mod config;
 /// Population-level precision/recall floors for the pre-feed correlation
 /// tiers. Test-only: it asserts calibration, it is not part of the API.
-#[cfg(test)]
+#[cfg(all(test, feature = "indexer"))]
 mod corr_calibration;
 pub mod disk;
 pub mod extract;
@@ -29,9 +29,11 @@ pub mod extract;
 /// can build against it.
 #[doc(hidden)]
 pub mod gf16;
+#[cfg(feature = "indexer")]
 pub mod index;
 pub mod journal;
 pub mod live;
+pub mod livetune;
 pub mod logtee;
 pub mod media;
 pub mod mediaprobe;
@@ -57,6 +59,7 @@ pub mod preflight;
 pub mod rar;
 pub(crate) mod rarcrypt;
 pub mod release;
+#[cfg(feature = "indexer")]
 pub mod spot;
 pub mod sync;
 pub mod sysbench;

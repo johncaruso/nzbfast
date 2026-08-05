@@ -39,7 +39,7 @@ webpki-roots = "1"
 # download path uses. Every downloaded byte is decrypted, so on a weak
 # core that term belongs in the per-byte budget next to md5 and decode.
 aws-lc-rs = "1.17"
-rusqlite = { version = "0.40.1", features = ["bundled", "functions"] }
+rusqlite = { version = "0.40.1", features = ["bundled", "functions"], optional = true }
 rsa = "0.9"
 sha1 = { version = "0.10", features = ["oid"] }
 flate2 = "1"
@@ -87,6 +87,12 @@ md-5 = { version = "0.10", features = ["asm"] }
 ktls = { version = "6.0", default-features = false, features = ["aws_lc_rs"], optional = true }
 
 [features]
+default = ["indexer"]
+# The indexer stack: newsgroup index, Spotnet source, availability
+# oracle - sqlite's only consumers. Slim builds (phones, small boxes)
+# disable it and the whole bundled-sqlite C build drops out of the
+# binary. Queue/history are JSON and unaffected.
+indexer = ["dep:rusqlite"]
 # Off by default: the receive path this replaces is the one every
 # platform shares, and kTLS only exists on Linux.
 ktls = ["dep:ktls"]

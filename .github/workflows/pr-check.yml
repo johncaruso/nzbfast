@@ -70,6 +70,9 @@ jobs:
       # rather than clippy's disallowed-methods.
       - name: lock gate
         run: tools/lock-gate.py
+      # Parity with ci-private.yml; TODO 106's regrowth ratchet.
+      - name: size gate
+        run: tools/size-gate.py
       - name: clippy
         # No escapes: every warning blocks. The categories still allowed
         # are named in the workspace lints table in Cargo.toml, each with

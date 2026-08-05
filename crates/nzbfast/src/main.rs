@@ -22,12 +22,16 @@ static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+mod chaos_serve;
 mod conntune;
 mod diag;
 mod eatvol;
+#[cfg(feature = "indexer")]
 mod gates;
 mod get;
+#[cfg(feature = "indexer")]
 mod groups;
+#[cfg(feature = "indexer")]
 mod groupstats;
 mod health;
 mod identify;
@@ -44,6 +48,7 @@ mod rarfix;
 mod ratelimit;
 mod repair;
 mod rss;
+#[cfg(feature = "indexer")]
 mod scan;
 mod serve;
 mod setup;
@@ -51,6 +56,13 @@ mod smart;
 mod srrdb;
 mod tools;
 mod unpack;
+#[cfg(feature = "indexer")]
+mod wall;
+// Slim builds compile out wall.rs; wall_slim.rs keeps the
+// `crate::wall::` paths the core filing/rename code uses alive. Shared
+// with lib.rs (the embedded/FFI crate root) via `#[path]`.
+#[cfg(not(feature = "indexer"))]
+#[path = "wall_slim.rs"]
 mod wall;
 mod watchlist;
 mod xrel;
@@ -69,6 +81,7 @@ use nzbkit::nzb::{FileKind, Nzb};
 pub use nzbkit::sync::{MutexExt, RwLockExt};
 use rarfix::*;
 use repair::*;
+#[cfg(feature = "indexer")]
 use scan::*;
 use streamhub::*;
 
@@ -302,7 +315,67 @@ enum Command {
         #[arg(long)]
         tls_key: Option<PathBuf>,
     },
+    /// Chaos NNTP server (TODO 111 fault matrix): serves a generated
+    /// corpus through the in-process chaos mock with a fault profile
+    /// chosen by flag, so ANY client can be raced against the same
+    /// fault shapes the payout rigs price. Writes the matching .nzb;
+    /// two-server profiles bind a clean twin on --port2.
+    #[command(hide = true)]
+    ChaosServe {
+        /// One of: clean, flap, deadair, deadair-dial, brownout,
+        /// jitter, jitter-dial, corrupt, corruptstorm, splitbrain,
+        /// slowconn (the -dial variants add a 250 ms greeting delay
+        /// per connection, so reconnect strategies pay their real
+        /// dial cost on loopback).
+        #[arg(long, default_value = "clean")]
+        profile: String,
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+        /// Faulty (or single) server port.
+        #[arg(long, default_value_t = 1190)]
+        port: u16,
+        /// Clean-twin port (flap/brownout/corrupt/corruptstorm/
+        /// splitbrain profiles).
+        #[arg(long, default_value_t = 1191)]
+        port2: u16,
+        /// Total corpus payload ("300M", "1G", …). Held in RAM.
+        #[arg(long, default_value = "300M")]
+        size: String,
+        #[arg(long, default_value_t = 3)]
+        files: u32,
+        /// Article payload size; ~740K matches real posts.
+        #[arg(long, default_value = "740K")]
+        article_size: String,
+        /// Where to write the matching NZB.
+        #[arg(long, default_value = "chaos.nzb")]
+        nzb: PathBuf,
+        /// Shifts deterministic fault positions and corpus bytes; keep
+        /// it fixed across clients so every client sees the same run.
+        #[arg(long, default_value_t = 111)]
+        seed: u64,
+        /// Healthy per-connection cap ("2M" = 2 MB/s).
+        #[arg(long, default_value = "2M")]
+        per_conn: String,
+        /// Whole-server line cap; 0 = per-connection cap only.
+        #[arg(long, default_value = "0")]
+        line: String,
+        /// Create real PAR2 recovery volumes at this redundancy (%)
+        /// with an external `par2` binary (PAR2_BIN to override) and
+        /// serve them as part of the corpus.
+        #[arg(long)]
+        par2_redundancy: Option<u32>,
+        /// Override the profile's faulted-article count
+        /// (deadair/corrupt/splitbrain) or every-N (corruptstorm).
+        #[arg(long)]
+        fault_count: Option<usize>,
+        /// Article-ize real files from disk into the corpus (repeatable).
+        /// A playable video here turns the chaos rig into a playback
+        /// end-to-end fixture; --files 0 serves only these.
+        #[arg(long)]
+        media: Vec<PathBuf>,
+    },
     /// Scan group headers into the local release index (M12).
+    #[cfg(feature = "indexer")]
     Index {
         #[arg(long, default_value = "alt.binaries.teevee")]
         group: String,
@@ -324,6 +397,7 @@ enum Command {
         db: PathBuf,
     },
     /// Search the local release index.
+    #[cfg(feature = "indexer")]
     Search {
         query: String,
         #[arg(long, default_value = "index.db")]
@@ -336,6 +410,7 @@ enum Command {
     /// correlation legs have announcements from before the live feed
     /// was switched on. Same walk, pacing and refusals as the
     /// dashboard's button; no daemon needed.
+    #[cfg(feature = "indexer")]
     PredbSeed {
         /// How far back to reach, in days.
         #[arg(long, default_value_t = 180)]
@@ -349,6 +424,7 @@ enum Command {
     },
     /// Scan a Spotnet group's spot headers (From-record parse + RSA verify)
     /// into the local index (M14j). Header-only pass - no article bodies.
+    #[cfg(feature = "indexer")]
     Spots {
         #[arg(long, default_value = "free.pt")]
         group: String,
@@ -360,6 +436,7 @@ enum Command {
         db: PathBuf,
     },
     /// Search locally indexed spots by title.
+    #[cfg(feature = "indexer")]
     SpotSearch {
         query: String,
         #[arg(long, default_value = "index.db")]
@@ -367,6 +444,7 @@ enum Command {
     },
     /// Fetch one spot's NZB payload (X-XML headers → alt.binaries.ftd
     /// segments → inflate) and write the NZB file.
+    #[cfg(feature = "indexer")]
     SpotGet {
         /// Spot message-id (angle brackets optional).
         msgid: String,
@@ -469,24 +547,30 @@ enum Command {
         #[arg(long, default_value_t = 21600)]
         library_recheck_secs: u64,
         /// Index database (newznab facade + dashboard browse).
+        #[cfg(feature = "indexer")]
         #[arg(long, default_value = "index.db")]
         index_db: PathBuf,
         /// Groups to OVER-scan continuously (comma-separated); the
         /// newznab endpoint serves whatever lands in the index.
+        #[cfg(feature = "indexer")]
         #[arg(long, value_delimiter = ',')]
         index_groups: Vec<String>,
         /// Seconds between incremental index scans.
+        #[cfg(feature = "indexer")]
         #[arg(long, default_value_t = 900)]
         index_interval: u64,
         /// Articles to backfill on a group's first scan.
+        #[cfg(feature = "indexer")]
         #[arg(long, default_value_t = 20000)]
         index_backfill: u64,
         /// Only index posts newer than this ("90d"/"6m"/"2y"; bare
         /// number = days; empty/0 = off). Overrides --index-backfill on
         /// a group's first scan via a Date bisection.
+        #[cfg(feature = "indexer")]
         #[arg(long, default_value = "")]
         index_max_age: String,
         /// Ingest gates JSON for the index scanner (see gates.rs).
+        #[cfg(feature = "indexer")]
         #[arg(long)]
         index_gates: Option<PathBuf>,
     },
@@ -544,6 +628,7 @@ enum Command {
     /// Build an NZB of one COMPLETE release (data + par2 main + volumes,
     /// one poster, shared filename stem) found via OVER - the full-pipeline
     /// test fixture generator.
+    #[cfg(feature = "indexer")]
     MakeReleaseNzb {
         #[arg(long, default_value = "alt.binaries.boneless")]
         group: String,
@@ -557,6 +642,7 @@ enum Command {
         out: PathBuf,
     },
     /// Build a real test NZB from complete multipart posts found via OVER.
+    #[cfg(feature = "indexer")]
     MakeTestNzb {
         #[arg(long, default_value = "alt.binaries.boneless")]
         group: String,
@@ -743,12 +829,13 @@ async fn run() -> Result<()> {
                 if let Verdict::Impossible {
                     est_missing,
                     recovery,
+                    ..
                 } = verdict
                 {
                     anyhow::bail!(
                         "aborting: pre-flight says this post cannot complete - an \
-                         estimated {est_missing} segment(s) are unavailable on every \
-                         server against {recovery} recovery block(s) in the NZB"
+                         estimated {est_missing} payload segment(s) are unavailable on \
+                         every server against {recovery} recovery block(s) in the NZB"
                     );
                 }
             }
@@ -887,6 +974,48 @@ async fn run() -> Result<()> {
             nzbkit::benchserve::serve_with(&format!("{bind}:{port}"), set, tls).await?;
             Ok(())
         }
+        Command::ChaosServe {
+            profile,
+            bind,
+            port,
+            port2,
+            size,
+            files,
+            article_size,
+            nzb,
+            seed,
+            per_conn,
+            line,
+            par2_redundancy,
+            fault_count,
+            media,
+        } => {
+            let size = serve::parse_size(&size).ok_or_else(|| anyhow::anyhow!("bad --size"))?;
+            let article_size = serve::parse_size(&article_size)
+                .ok_or_else(|| anyhow::anyhow!("bad --article-size"))?
+                as usize;
+            let per_conn_bps =
+                serve::parse_size(&per_conn).ok_or_else(|| anyhow::anyhow!("bad --per-conn"))?;
+            let line_bps = serve::parse_size(&line).ok_or_else(|| anyhow::anyhow!("bad --line"))?;
+            chaos_serve::run(chaos_serve::Opts {
+                profile,
+                bind,
+                port,
+                port2,
+                size,
+                files,
+                article_size,
+                nzb,
+                seed,
+                per_conn_bps,
+                line_bps,
+                par2_redundancy,
+                fault_count,
+                media,
+            })
+            .await
+        }
+        #[cfg(feature = "indexer")]
         Command::Index {
             group,
             backfill,
@@ -930,6 +1059,7 @@ async fn run() -> Result<()> {
             )
             .await
         }
+        #[cfg(feature = "indexer")]
         Command::PredbSeed { days, max_rows, db } => {
             // Blocking (paced HTTP, one request every 2 s) and there is
             // nothing else to do meanwhile, so it runs on a worker
@@ -942,13 +1072,17 @@ async fn run() -> Result<()> {
             println!("{msg}");
             Ok(())
         }
+        #[cfg(feature = "indexer")]
         Command::Search { query, db, nzb } => search_index(&query, &db, nzb.as_deref()),
+        #[cfg(feature = "indexer")]
         Command::Spots {
             group,
             backfill,
             db,
         } => spots_scan(&cli.config, &group, backfill, &db).await,
+        #[cfg(feature = "indexer")]
         Command::SpotSearch { query, db } => spot_search(&query, &db),
+        #[cfg(feature = "indexer")]
         Command::SpotGet { msgid, nzb, db } => spot_get(&cli.config, &msgid, &nzb, &db).await,
         Command::Setup => {
             if setup::run(&cli.config)? {
@@ -978,11 +1112,17 @@ async fn run() -> Result<()> {
             auto_speed,
             library_cats,
             library_recheck_secs,
+            #[cfg(feature = "indexer")]
             index_db,
+            #[cfg(feature = "indexer")]
             index_groups,
+            #[cfg(feature = "indexer")]
             index_interval,
+            #[cfg(feature = "indexer")]
             index_backfill,
+            #[cfg(feature = "indexer")]
             index_max_age,
+            #[cfg(feature = "indexer")]
             index_gates,
         } => {
             let size = |name: &str, v: Option<String>| -> Result<Option<u64>> {
@@ -1025,11 +1165,17 @@ async fn run() -> Result<()> {
                 library_cats,
                 library_recheck_secs,
                 mem_budget: budget,
+                #[cfg(feature = "indexer")]
                 index_db,
+                #[cfg(feature = "indexer")]
                 index_groups,
+                #[cfg(feature = "indexer")]
                 index_interval_secs: index_interval,
+                #[cfg(feature = "indexer")]
                 index_backfill,
+                #[cfg(feature = "indexer")]
                 index_max_age_secs: parse_age(&index_max_age)?,
+                #[cfg(feature = "indexer")]
                 index_gates: index_gates.as_deref().map(gates::Gates::load).transpose()?,
             };
             serve::serve(cli.config.clone(), opts).await
@@ -1054,12 +1200,14 @@ async fn run() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        #[cfg(feature = "indexer")]
         Command::MakeReleaseNzb {
             group,
             min_gb,
             max_gb,
             out,
         } => make_release_nzb(&cli.config, &group, min_gb, max_gb, &out).await,
+        #[cfg(feature = "indexer")]
         Command::MakeTestNzb {
             group,
             files,

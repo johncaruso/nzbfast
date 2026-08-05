@@ -1,3 +1,4 @@
+#![cfg(feature = "indexer")]
 //! TODO §74 end to end: a watched show is grabbed SECONDS after it is
 //! posted, not at the next periodic watchlist pass.
 //!

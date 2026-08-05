@@ -1,0 +1,8 @@
+.gradle/
+build/
+app/build/
+engine/
+local.properties
+*.keystore
+*.apk
+snapshots-tmp/

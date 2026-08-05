@@ -513,6 +513,7 @@ pub(crate) fn load_server(config: &Path) -> Result<ServerConfig> {
 /// Resolve a marks server key (see [`nzbkit::index::Index::server_key`])
 /// back to its config entry - the scan loop persists only the key.
 /// None = the config no longer carries that server.
+#[cfg(feature = "indexer")]
 pub(crate) fn find_scan_server(config: &Path, key: &str) -> Option<ServerConfig> {
     let cfg = Config::load(config).ok()?;
     cfg.servers
@@ -521,6 +522,7 @@ pub(crate) fn find_scan_server(config: &Path, key: &str) -> Option<ServerConfig>
         .cloned()
 }
 
+#[cfg(feature = "indexer")]
 pub(crate) fn scan_servers(cfg: &Config) -> Vec<ServerConfig> {
     let eligible: Vec<&ServerConfig> = {
         let flat: Vec<&ServerConfig> = cfg
@@ -1095,7 +1097,7 @@ pub(crate) fn inspect(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "indexer"))]
 mod multi_server_selection {
     use super::*;
 

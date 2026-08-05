@@ -1,0 +1,5 @@
+build/
+nzbfast-test.apk
+nzbfast-android-arm64
+nzbfast-android-x86_64
+*.idsig

@@ -1,0 +1,22 @@
+[package]
+name = "nzbfast-ffi"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "C ABI for embedding the nzbfast engine in a host app (iOS staticlib)"
+
+[lints]
+workspace = true
+
+# staticlib is the product (linked into the iOS app); rlib keeps
+# `cargo check`/tests working on the host.
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# Slim on purpose: the phones ship without the indexer stack, and the
+# ffi feature is what turns nzbfast's lib root from empty into the real
+# module tree.
+nzbfast = { path = "../nzbfast", default-features = false, features = ["ffi"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }

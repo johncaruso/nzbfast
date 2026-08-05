@@ -17,6 +17,10 @@ use crate::sync::MutexExt;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+// The ledger persistence below is the module's only sqlite; everything
+// else (buckets, backbone/family naming, the in-memory sink, Snapshot
+// math) compiles in slim builds too - the core download path uses it.
+#[cfg(feature = "indexer")]
 use rusqlite::Connection;
 
 /// Age buckets (days → bucket index). Availability changes with post age
@@ -216,6 +220,7 @@ impl OracleSink {
 }
 
 /// Create the ledger table (idempotent; called from `Index::open`).
+#[cfg(feature = "indexer")]
 pub fn ensure_schema(db: &Connection) -> rusqlite::Result<()> {
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS oracle(
@@ -230,6 +235,7 @@ pub fn ensure_schema(db: &Connection) -> rusqlite::Result<()> {
 }
 
 /// Fold a batch of samples into the ledger (one transaction).
+#[cfg(feature = "indexer")]
 pub fn ingest(db: &Connection, samples: &[Sample], now: i64) -> rusqlite::Result<()> {
     if samples.is_empty() {
         return Ok(());
@@ -270,6 +276,7 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    #[cfg(feature = "indexer")]
     pub fn load(db: &Connection) -> rusqlite::Result<Snapshot> {
         let mut stmt = db.prepare("SELECT backbone, family, bucket, hits, misses FROM oracle")?;
         let cells = stmt
@@ -631,6 +638,7 @@ mod tests {
         assert!(sink.drain().is_empty());
     }
 
+    #[cfg(feature = "indexer")]
     #[test]
     fn ledger_roundtrip_merges_backbones() {
         let db = Connection::open_in_memory().unwrap();

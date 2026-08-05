@@ -177,6 +177,7 @@ pub fn groups(keys: &[String]) -> Vec<String> {
 /// against a catalogue the daemon already holds. A preset that named
 /// four groups on a provider carrying one subscribes one, never four
 /// dead names the scan loop would retry forever.
+#[cfg(feature = "indexer")]
 pub fn resolve(keys: &[String], carried: impl Fn(&str) -> bool) -> Vec<String> {
     groups(keys).into_iter().filter(|g| carried(g)).collect()
 }
@@ -189,6 +190,7 @@ pub fn resolve(keys: &[String], carried: impl Fn(&str) -> bool) -> Vec<String> {
 /// also has to track which groups it owns, so nothing in the daemon
 /// calls this. The tests below still pin the semantics through it.
 #[cfg(test)]
+#[cfg(feature = "indexer")]
 pub fn merge(existing: &[String], resolved: &[String]) -> (Vec<String>, usize) {
     let mut out = existing.to_vec();
     let before = out.len();
@@ -207,6 +209,7 @@ pub fn merge(existing: &[String], resolved: &[String]) -> (Vec<String>, usize) {
 /// the de-selected interest actually named are removed, so a group the
 /// user typed in by hand survives unless it was also part of what they
 /// just switched off.
+#[cfg(feature = "indexer")]
 pub fn remove(existing: &[String], unwanted: &[String]) -> (Vec<String>, usize) {
     let before = existing.len();
     let out: Vec<String> = existing
@@ -243,6 +246,7 @@ pub fn backfill_owned(applied_keys: &[String], indexed: &[String]) -> Vec<String
         .collect()
 }
 
+#[cfg(feature = "indexer")]
 pub fn reconcile(
     existing: &[String],
     owned: &[String],
@@ -278,6 +282,7 @@ mod tests {
     /// Unticking a preset was dead on every install that predated
     /// provenance tracking: `owned` was empty, so `reconcile` found
     /// nothing removable, and re-ticking did not repair it either.
+    #[cfg(feature = "indexer")]
     #[test]
     fn backfill_claims_preset_groups_but_never_hand_added_ones() {
         let keys = parse("tv");
@@ -370,6 +375,7 @@ mod tests {
         assert_eq!(parse("tv,linux"), parse("linux,tv"));
     }
 
+    #[cfg(feature = "indexer")]
     #[test]
     fn resolution_keeps_only_what_the_provider_carries() {
         let keys = parse("linux,sports");
@@ -395,6 +401,7 @@ mod tests {
     /// nothing else. Without the second half of this, the only way to
     /// undo a choice would be to edit the group list by hand - and the
     /// point of the setting is that the user never has to.
+    #[cfg(feature = "indexer")]
     #[test]
     fn unticking_removes_exactly_what_it_added() {
         let mine = vec!["alt.binaries.mine".to_string()];
@@ -410,6 +417,7 @@ mod tests {
         assert_eq!(dropped, 0);
     }
 
+    #[cfg(feature = "indexer")]
     #[test]
     fn merging_never_drops_a_hand_picked_group() {
         let mine = vec![
@@ -438,6 +446,7 @@ mod tests {
         assert_eq!(added, 0);
     }
 
+    #[cfg(feature = "indexer")]
     #[test]
     fn preset_provenance_spares_an_overlapping_manual_group() {
         let manual = vec!["alt.binaries.teevee".to_string()];

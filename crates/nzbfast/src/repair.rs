@@ -249,7 +249,11 @@ pub(crate) async fn fetch_volumes(
         for seg in &nzb.files[fi].segments {
             let b = format!("<{}>", seg.message_id);
             id_to_file.insert(b.clone(), fi);
-            ids.push(nzbkit::pool::ArticleReq { id: b, age_days });
+            ids.push(nzbkit::pool::ArticleReq {
+                id: b,
+                age_days,
+                part: seg.number,
+            });
         }
     }
     fetch_volume_articles(
@@ -310,8 +314,11 @@ pub(crate) fn side_pool_servers(
 
 /// Inner driver for recovery-volume side-fetches: downloads the given
 /// article set on its own small pool and assembles the volume file(s)
-/// in `out_dir`. Returns the paths written (the M2c.5 prefetch counts
-/// their on-disk recovery slices for the exact-fit discount).
+/// in `out_dir`. Returns (article failures, paths written) - the
+/// failure count is how a caller tells a COMPLETE volume from a
+/// partial one, and only a complete volume may ever enter a whole-file
+/// exclusion list (a partial one must stay fetchable for its missing
+/// articles).
 pub(crate) async fn fetch_volume_articles(
     servers: &[(ServerConfig, nzbkit::pool::PoolConfig)],
     ids: Vec<nzbkit::pool::ArticleReq>,
@@ -321,7 +328,7 @@ pub(crate) async fn fetch_volume_articles(
     // Ceiling on what one volume writer may RESERVE - see
     // [`volume_prealloc_cap`]. u64::MAX = no ceiling.
     prealloc_cap: u64,
-) -> Result<Vec<PathBuf>> {
+) -> Result<(usize, Vec<PathBuf>)> {
     use nzbkit::pool::{FetchOutcome, fetch_all_multi};
     // Side-fetch: small volume sets, fast disk-writer consumer - a
     // modest fixed depth (≈25 MB) instead of the old 256 (~200 MB of
@@ -346,7 +353,7 @@ pub(crate) async fn fetch_volume_articles(
             String::new()
         }
     );
-    Ok(paths)
+    Ok((failures as usize, paths))
 }
 
 /// Decode side-fetched articles onto their volume files. Returns
@@ -1379,6 +1386,7 @@ mod repair_tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(feature = "indexer")]
     #[test]
     fn trunc_respects_char_boundaries() {
         // `&stem[..60]` panicked mid-char on non-ASCII release names.

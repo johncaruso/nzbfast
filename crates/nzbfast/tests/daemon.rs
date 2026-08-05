@@ -2,7 +2,9 @@
 //! addfile upload, queue polling, history with final storage path - all
 //! against the real binary + mock NNTP servers.
 
+mod playback_contract;
 mod scratch;
+mod stream_chaos;
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -420,11 +422,16 @@ async fn sonarr_style_cycle() {
         // indexer here rather than a download client. Caps and the
         // indexer-off refusal are both XML, so this pins the ROUTE
         // without depending on whether the index is switched on.
-        let r = http(port, "/newznab/api/?t=caps&apikey=sekrit", None);
-        assert!(
-            r.contains("<?xml"),
-            "trailing slash 404'd the newznab facade: {r}"
-        );
+        // Slim builds compile the facade out entirely, so the route
+        // check only exists with the indexer.
+        #[cfg(feature = "indexer")]
+        {
+            let r = http(port, "/newznab/api/?t=caps&apikey=sekrit", None);
+            assert!(
+                r.contains("<?xml"),
+                "trailing slash 404'd the newznab facade: {r}"
+            );
+        }
         // SAB-compat: browser addons (NZBDonkey, NZB Unity) send mode and
         // apikey as POST form fields with an EMPTY query string. Both form
         // encodings must authenticate - these used to log "[auth] rejected
@@ -3645,6 +3652,7 @@ async fn smart_folders_and_cleanup() {
 /// `finalize_names`, the title in the filed name, and the job's own
 /// record of what it wrote being good enough to play the episode back
 /// out of a shared season folder afterwards.
+#[cfg(feature = "indexer")]
 #[tokio::test(flavor = "multi_thread")]
 async fn episode_titles_reach_a_filed_tv_rename() {
     let dir = std::env::temp_dir().join(format!("nzbfast-eptitle-e2e-{}", std::process::id()));
@@ -5435,7 +5443,9 @@ async fn live_settings_survive_restart() {
         // 2 Aug 2026; the reason they are settings is that the PRUNE and
         // the seed IMPORTER have to agree on the cap, and a constant the
         // importer could not see meant importing rows the prune ate.
+        #[cfg(feature = "indexer")]
         ("predb_max_rows", "400000"),
+        #[cfg(feature = "indexer")]
         ("predb_seed_days", "90"),
         // 24D user categories: URL-encoded
         // [{"slug":"formula-1","name":"Formula 1","match":"formula1","base":"movie"}]
@@ -5446,6 +5456,7 @@ async fn live_settings_survive_restart() {
         // Opt-in indexing: the interest keys the user chose. Unknown
         // keys are dropped, so what comes back is exactly the offered
         // set they asked for and nothing else.
+        #[cfg(feature = "indexer")]
         ("index_interests", "linux%2Csports%2Cnot-a-thing"),
         // 24D: a watchlist entry targeting that category - kind is the
         // slug, and a year pin is legal on it (an event post's year is
@@ -5464,12 +5475,15 @@ async fn live_settings_survive_restart() {
         "\"update_url\":\"\"",
         "\"index_deepen\":123456",
         "\"bench_interval\":6",
+        #[cfg(feature = "indexer")]
         "\"predb_max_rows\":400000",
+        #[cfg(feature = "indexer")]
         "\"predb_seed_days\":90",
         "\"slug\":\"formula-1\"",
         "\"base\":\"movie\"",
         "\"kind\":\"formula-1\"",
         "\"title\":\"Formula1\"",
+        #[cfg(feature = "indexer")]
         "\"index_interests\":\"linux,sports\"",
         "\"unpack_eat_volumes\":\"low_disk\"",
     ];
@@ -5512,30 +5526,34 @@ async fn live_settings_survive_restart() {
         // The capacity knobs clamp rather than refuse: a number outside
         // the sane range is a typo, and a typo must not leave the feed
         // table with a cap of 1. The write reply only says "saved", so
-        // the clamp is read back from the config.
-        for (name, value) in [("predb_max_rows", "1"), ("predb_seed_days", "9999")] {
-            http(
-                port_a,
-                &format!("/api?mode=config&name={name}&value={value}&apikey=sekrit&output=json"),
-                None,
+        // the clamp is read back from the config. Slim builds have no
+        // pre feed and refuse the setting outright.
+        #[cfg(feature = "indexer")]
+        {
+            for (name, value) in [("predb_max_rows", "1"), ("predb_seed_days", "9999")] {
+                http(
+                    port_a,
+                    &format!("/api?mode=config&name={name}&value={value}&apikey=sekrit&output=json"),
+                    None,
+                );
+            }
+            let c = http(port_a, "/api?mode=get_config&apikey=sekrit&output=json", None);
+            assert!(
+                c.contains("\"predb_max_rows\":10000"),
+                "predb_max_rows floor not applied: {c}"
             );
-        }
-        let c = http(port_a, "/api?mode=get_config&apikey=sekrit&output=json", None);
-        assert!(
-            c.contains("\"predb_max_rows\":10000"),
-            "predb_max_rows floor not applied: {c}"
-        );
-        assert!(
-            c.contains("\"predb_seed_days\":366"),
-            "predb_seed_days ceiling not applied: {c}"
-        );
-        // Put the round-trip values back for the restart half.
-        for (name, value) in [("predb_max_rows", "400000"), ("predb_seed_days", "90")] {
-            http(
-                port_a,
-                &format!("/api?mode=config&name={name}&value={value}&apikey=sekrit&output=json"),
-                None,
+            assert!(
+                c.contains("\"predb_seed_days\":366"),
+                "predb_seed_days ceiling not applied: {c}"
             );
+            // Put the round-trip values back for the restart half.
+            for (name, value) in [("predb_max_rows", "400000"), ("predb_seed_days", "90")] {
+                http(
+                    port_a,
+                    &format!("/api?mode=config&name={name}&value={value}&apikey=sekrit&output=json"),
+                    None,
+                );
+            }
         }
         // 24D: a category slug shadowing a built-in kind is refused, and
         // the refusal must not clobber the saved list.
@@ -10381,6 +10399,7 @@ async fn the_queue_row_says_what_the_file_is_and_flags_a_mislabelled_one() {
 /// The TLS-first connect is exercised too: the relay hangs up on the
 /// ClientHello, so the daemon takes the plaintext fallback, which only
 /// exists when `NZBFAST_PREDB_ALLOW_PLAINTEXT=1`.
+#[cfg(feature = "indexer")]
 #[tokio::test]
 async fn the_three_plain_relay_formats_reach_the_feed_table() {
     /// Three announcements in the three plain shapes, colour codes and
@@ -11238,6 +11257,20 @@ async fn queue_activity_field_reports_the_fetch_phase() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// SAB's binary `to_units` output, back to bytes: "998 B", "417 KB",
+/// "1.2 MB", "1.2 GB". None for anything else.
+fn sab_size_bytes(s: &str) -> Option<f64> {
+    let (num, unit) = s.trim().split_once(' ')?;
+    let mult = match unit.trim() {
+        "B" => 1.0,
+        "KB" => 1024.0,
+        "MB" => 1024.0 * 1024.0,
+        "GB" => 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    Some(num.parse::<f64>().ok()? * mult)
+}
+
 /// Bundle B: the post-download tail tells the truth, and one job's
 /// progress never appears on another job's row.
 ///
@@ -11348,6 +11381,9 @@ async fn the_finishing_tail_is_named_and_never_borrows_the_next_job_s_bar() {
         // the order it showed them.
         let mut seen: HashMap<String, Vec<(String, u64)>> = HashMap::new();
         let mut tails: Vec<(String, u64, String)> = Vec::new();
+        // §91: every poll's header `sizeleft` beside the sum of the
+        // `mbleft` values it is the total of.
+        let mut header_vs_rows: Vec<(f64, f64)> = Vec::new();
         for _ in 0..4000 {
             let body = http(port, "/api?mode=queue&apikey=sekrit&output=json", None);
             let v: serde_json::Value = match serde_json::from_str(
@@ -11372,6 +11408,24 @@ async fn the_finishing_tail_is_named_and_never_borrows_the_next_job_s_bar() {
                     ));
                 }
                 seen.entry(id).or_default().push((st, pct));
+            }
+            // No category filter and no start/limit on this poll, so the
+            // slots ARE the whole queue and their remainders are exactly
+            // what the header totals.
+            let rows: f64 = slots
+                .iter()
+                .map(|s| {
+                    s["mbleft"]
+                        .as_str()
+                        .unwrap_or("0")
+                        .parse::<f64>()
+                        .unwrap_or(0.0)
+                        * 1024.0
+                        * 1024.0
+                })
+                .sum();
+            if let Some(hdr) = sab_size_bytes(v["queue"]["sizeleft"].as_str().unwrap_or("")) {
+                header_vs_rows.push((hdr, rows));
             }
             let h = http(port, "/api?mode=history&apikey=sekrit&output=json", None);
             if h.matches("\"Completed\"").count() >= 2 {
@@ -11407,6 +11461,34 @@ async fn the_finishing_tail_is_named_and_never_borrows_the_next_job_s_bar() {
         for (st, pct, mbleft) in &tails {
             assert_eq!(*pct, 100, "{st} reported {pct}%, not 100");
             assert_eq!(mbleft, "0.00", "{st} reported {mbleft} MB left, not 0");
+        }
+        // (4) §91: the header's total agrees with the rows it totals.
+        //
+        // `sizeleft` and the per-row `mbleft` used to be two separate
+        // walks over the same queue, the header's running first - a
+        // second lock on every job with the live counters re-read in
+        // between, so the total described one instant and its parts
+        // another. They are one walk now, and the total is summed from
+        // the very numbers the rows print.
+        //
+        // The tolerance is deliberately loose: `sizeleft` is SAB's
+        // two-significant-digit string ("1.2 MB"), not a byte count, so
+        // exact equality is not available at this seam. What it catches
+        // is the failure that matters - a whole job's bytes on one side
+        // of the payload and not the other.
+        // ...and it saw a queue with bytes actually outstanding, so the
+        // comparison below is not 0 against 0 for every sample.
+        assert!(
+            header_vs_rows.iter().any(|(_, rows)| *rows > 0.0),
+            "no queue payload ever had bytes left to fetch, so nothing was compared"
+        );
+        for (hdr, rows) in &header_vs_rows {
+            let tol = hdr.max(*rows) * 0.06 + 64.0 * 1024.0;
+            assert!(
+                (hdr - rows).abs() <= tol,
+                "queue sizeleft is {hdr:.0} B but its own slots have {rows:.0} B left \
+                 between them - the header and the rows are describing different instants"
+            );
         }
     })
     .await
@@ -11793,6 +11875,135 @@ async fn a_finished_download_carries_the_configured_permissions() {
         // ...and the download root, which is the one an *arr needs write
         // on in order to rename the job out of it.
         assert_eq!(mode(&out_root2), 0o770, "download root");
+    })
+    .await
+    .unwrap();
+
+    drop(d);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// TODO 97's "Clear queue" button, from the daemon's side: the wildcard
+/// the dashboard posts (`value=all`) empties the queue in one call, and
+/// says how many rows it took.
+///
+/// The count is the point of the assertion. `status` is a boolean and
+/// always was; the button's toast reports a number, and a number the
+/// daemon did not actually produce is exactly the kind of lie an
+/// undoable-looking action must not tell. Asserted alongside the two
+/// promises the confirm dialog makes on its behalf: nothing is filed to
+/// history (a cleared job is dropped, not recorded), and without
+/// `del_files` nothing on disk is touched - which for a job that never
+/// ran means its output directory survives, payload and all.
+///
+/// Driven against a dead server, paused, so all three rows sit in the
+/// queue for the whole test instead of racing a mock to failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn clear_queue_empties_every_row_and_counts_them() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-qclear-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let dead_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!("{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{dead_port},\"tls\":false}}]}}"),
+    )
+    .unwrap();
+    let out = dir.join("complete");
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--out")
+            .arg(dir.join("complete"));
+        c
+    })
+    .await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        let upload = |stem: &str| {
+            let xml = format!(
+                "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"{stem}.bin (1/1)\">\n    <groups><group>g</group></groups>\n    <segments>\n      <segment bytes=\"10000\" number=\"1\">{stem}seg1@test</segment>\n    </segments>\n  </file>\n</nzb>\n"
+            );
+            let boundary = "----nzbfastboundary";
+            let mut body = Vec::new();
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"{stem}.nzb\"\r\nContent-Type: application/x-nzb\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(xml.as_bytes());
+            body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+            let ctype = format!("multipart/form-data; boundary={boundary}");
+            let r = http(port, "/api?mode=addfile&output=json", Some((&ctype, &body)));
+            assert!(r.contains("\"status\":true"), "{r}");
+        };
+
+        let r = http(port, "/api?mode=pause&output=json", None);
+        assert!(r.contains("\"status\":true"), "{r}");
+        for stem in ["alpha", "bravo", "charlie"] {
+            upload(stem);
+        }
+        let q = http(port, "/api?mode=queue&output=json", None);
+        let v: serde_json::Value = serde_json::from_str(&q).unwrap();
+        assert_eq!(v["queue"]["slots"].as_array().map(Vec::len), Some(3), "{q}");
+
+        // A directory the clear must NOT remove: the queue delete the
+        // button posts carries no del_files, exactly like the per-row ✕.
+        let kept = out.join("alpha-payload");
+        std::fs::create_dir_all(&kept).unwrap();
+        std::fs::write(kept.join("part.bin"), b"still here").unwrap();
+
+        let r = http(
+            port,
+            "/api?mode=queue&name=delete&value=all&output=json",
+            None,
+        );
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["status"], true, "{r}");
+        assert_eq!(v["removed"], 3, "the clear must count what it took: {r}");
+
+        let q = http(port, "/api?mode=queue&output=json", None);
+        let v: serde_json::Value = serde_json::from_str(&q).unwrap();
+        assert_eq!(v["queue"]["slots"].as_array().map(Vec::len), Some(0), "{q}");
+
+        // Dropped, not filed: a cleared job leaves no history record to
+        // retry from, which is what the confirm dialog promises.
+        let h = http(port, "/api?mode=history&output=json", None);
+        let v: serde_json::Value = serde_json::from_str(&h).unwrap();
+        assert_eq!(
+            v["history"]["slots"].as_array().map(Vec::len),
+            Some(0),
+            "a cleared queue must not file anything to history: {h}"
+        );
+        assert!(
+            kept.join("part.bin").exists(),
+            "the clear deleted files it never promised to touch"
+        );
+
+        // An empty queue is a no-op, and says so with both fields.
+        let r = http(
+            port,
+            "/api?mode=queue&name=delete&value=all&output=json",
+            None,
+        );
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["status"], false, "{r}");
+        assert_eq!(v["removed"], 0, "{r}");
     })
     .await
     .unwrap();

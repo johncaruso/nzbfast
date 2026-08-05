@@ -1,0 +1,150 @@
+//! Embedded (in-process) crate root, for hosts that cannot exec a
+//! binary - the iOS staticlib is the customer (see crates/nzbfast-ffi).
+//! Compiles to EMPTY unless the `ffi` feature is on, so every existing
+//! build and test target is untouched: the bin root (main.rs) declares
+//! this same module tree independently and nothing is shared at compile
+//! time except the source files themselves.
+//!
+//! `dead_code`/`unused_imports` are allowed because this root has no
+//! CLI: everything only the subcommand arms call is dead here by
+//! construction, and proving each item live per-root would fork the
+//! module files. The bin root keeps full lint coverage.
+#![cfg(feature = "ffi")]
+#![allow(dead_code)]
+#![allow(unused_imports)]
+// Same reason as main.rs: `job_json` is one `json!` literal per
+// persisted Job field, and the macro recurses per key.
+#![recursion_limit = "256"]
+
+// The same crate-root imports main.rs holds: module files resolve
+// `crate::Arc`, `crate::info` etc. through these.
+use anyhow::{Context, Result};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+use tracing::info;
+
+mod chaos_serve;
+mod conntune;
+mod diag;
+mod eatvol;
+#[cfg(feature = "indexer")]
+mod gates;
+mod get;
+#[cfg(feature = "indexer")]
+mod groups;
+#[cfg(feature = "indexer")]
+mod groupstats;
+mod health;
+mod identify;
+mod identity;
+mod import_sab;
+mod interests;
+pub mod logging;
+mod nettools;
+mod newznab;
+mod notify;
+mod persist;
+mod post_cmd;
+mod rarfix;
+mod ratelimit;
+mod repair;
+mod rss;
+#[cfg(feature = "indexer")]
+mod scan;
+pub mod serve;
+mod setup;
+mod smart;
+mod srrdb;
+mod tools;
+mod unpack;
+#[cfg(feature = "indexer")]
+mod wall;
+#[cfg(not(feature = "indexer"))]
+#[path = "wall_slim.rs"]
+mod wall;
+mod watchlist;
+mod xrel;
+use unpack::*;
+mod check;
+use check::*;
+use get::*;
+mod streamhub;
+use diag::*;
+use nettools::*;
+use nzbkit::config::{Config, ServerConfig};
+use nzbkit::nntp::Connection;
+use nzbkit::nzb::{FileKind, Nzb};
+// Re-exported, not merely imported: this is what lets the rest of the crate
+// say `use crate::MutexExt;` for `lock_ok()` rather than naming nzbkit.
+pub use nzbkit::sync::{MutexExt, RwLockExt};
+use rarfix::*;
+use repair::*;
+#[cfg(feature = "indexer")]
+use scan::*;
+use streamhub::*;
+
+/// The [`serve::ServeOpts`] an embedded host runs with: the CLI's
+/// defaults, a loopback bind (the host process owns the only client),
+/// everything else settings-driven - `apply_saved_settings` overlays
+/// settings.json exactly as it does for the daemon.
+pub fn embedded_serve_opts(
+    port: u16,
+    apikey: Option<String>,
+    out_root: PathBuf,
+) -> serve::ServeOpts {
+    serve::ServeOpts {
+        port,
+        bind: "127.0.0.1".into(),
+        open: false,
+        apikey,
+        nzbkey: None,
+        out_root,
+        watch: None,
+        script: None,
+        connections: 8,
+        window: 4,
+        decoders: 6,
+        fast_verify: true,
+        verify_lean: false,
+        library_cats: Vec::new(),
+        library_recheck_secs: 21600,
+        min_free: None,
+        out_umask: None,
+        auto_retry_mins: 20,
+        preflight: false,
+        quota: None,
+        quota_period: 'd',
+        feeds: None,
+        speedlimit: None,
+        schedule: None,
+        auto_speed: false,
+        mem_budget: nzbkit::mem::MemBudget::auto(),
+        group_desc_isc: false,
+        #[cfg(feature = "indexer")]
+        index_db: PathBuf::from("index.db"),
+        #[cfg(feature = "indexer")]
+        index_groups: Vec::new(),
+        #[cfg(feature = "indexer")]
+        index_interval_secs: 900,
+        #[cfg(feature = "indexer")]
+        index_backfill: 20000,
+        #[cfg(feature = "indexer")]
+        index_max_age_secs: 0,
+        #[cfg(feature = "indexer")]
+        index_gates: None,
+    }
+}
+
+/// Process-wide one-time setup the CLI's `run()` does before serving,
+/// minus the pieces that make no sense in a host app (power-throttling
+/// opt-out is Windows-only and harmless; the allocator stays the
+/// system's - mimalloc is cfg'd to macOS + Linux).
+pub fn embedded_init() {
+    logging::init(logging::Style::Daemon);
+    nzbkit::disk::raise_fd_limit();
+    nzbkit::mem::opt_out_of_power_throttling();
+    let budget = nzbkit::mem::MemBudget::auto();
+    nzbkit::mem::set_process_budget(budget);
+}

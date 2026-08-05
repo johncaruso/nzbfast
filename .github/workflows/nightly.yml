@@ -58,6 +58,33 @@ jobs:
           NZBFAST_NO_ENRICH: "1"
           NZBFAST_REQUIRE_PAR2: "1"
         run: cargo test -p nzbfast --locked --test e2e -- --test-threads=1
+      # The other half of ci-private's exclusion list. That job runs
+      # `--workspace` minus seven names; three of them (daemon, e2e,
+      # leak_soak) already had a home here, and these four did not have
+      # one anywhere - so without this step the exclusion would not be
+      # deferring them, it would be dropping them.
+      #
+      # They are excluded from the push path because they MEASURE
+      # ELAPSED TIME, not because they are merely slow: conn_tuner races
+      # a throttled mock over a connection ladder, index_size_cap and
+      # queue_soak fill real stores, http_wedge waits on a bounded pool.
+      # Roughly 80% of the workspace's runtime between them, and the kind
+      # of test that wants a machine with time rather than a push gate.
+      #
+      # Named explicitly rather than globbed, deliberately: a target
+      # added to crates/*/tests/ tomorrow must inherit "runs on push"
+      # from ci-private's --workspace, never "runs nightly, maybe" from a
+      # pattern here. The push path is the default; this list is the
+      # exception, and an exception should be a decision.
+      - name: elapsed-time suites
+        env:
+          NZBFAST_NO_ENRICH: "1"
+          NZBFAST_REQUIRE_PAR2: "1"
+        run: |
+          cargo test -p nzbkit --locked --test conn_tuner
+          cargo test -p nzbfast --locked --test index_size_cap -- --test-threads=1
+          cargo test -p nzbfast --locked --test http_wedge -- --test-threads=1
+          cargo test -p nzbfast --locked --test queue_soak -- --test-threads=1
 
   # Windows leg for the PRIVATE repo. The test suite had NEVER run on
   # Windows until a Windows-on-ARM build probe added the public-repo

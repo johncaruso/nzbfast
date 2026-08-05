@@ -1,0 +1,57 @@
+# CodeQL, on the PUBLIC repo only. TODO 106 phase 1.3.
+#
+# The inverse gate of every other workflow here: CodeQL on a private
+# repo requires a GitHub Advanced Security seat, and the public mirror
+# is where the shipped source lives anyway - it is the tree an attacker
+# reads. weaver runs CodeQL and Scorecard and we ran neither; this
+# closes half of that. The file ships with the .github sync (whole-dir
+# entry in packaging/PUBLIC_MANIFEST) and activates on the mirror's
+# next publish; until then the `if:` keeps it inert here.
+#
+# Three languages: rust is the product; javascript covers the embedded
+# dashboard's inline JS (web/dashboard.html and wall.html are the
+# daemon's whole UI); python covers tools/ - the two gate scripts run
+# in CI on every push, which makes them supply-chain surface.
+name: codeql
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * 3"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  analyze:
+    if: github.repository == 'nzbfast/nzbfast'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: rust
+          - language: javascript-typescript
+          - language: python
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: github/codeql-action/init@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6
+        with:
+          languages: ${{ matrix.language }}
+          # Source-based extraction for rust; no build to instrument.
+          build-mode: none
+          # vendor/ is upstream's code style and upstream's findings -
+          # rars/rapidyenc/tiny_http issues get fixed in the forks and
+          # upstreamed (see the rars campaign), not triaged as nzbfast
+          # alerts. Scanning it would bury the signal in noise we
+          # cannot land fixes for here.
+          config: |
+            paths-ignore:
+              - vendor
+      - uses: github/codeql-action/analyze@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6
+        with:
+          category: "/language:${{ matrix.language }}"

@@ -1,0 +1,46 @@
+{
+    "contract": 1,
+    "diskspace_gb": 599.824113664,
+    "history": [
+        {
+            "bytes": 2994402,
+            "cat": "*",
+            "completed": 1785958997,
+            "fail_message": "",
+            "name": "job",
+            "nzo_id": "SABnzbd_nzo_nzbfast1",
+            "playback": {
+                "coverage": {
+                    "head_bytes": 900579,
+                    "pct": 100.0,
+                    "tail_ok": true
+                },
+                "file": "job 720p.mkv",
+                "ready": true,
+                "reason": "disk",
+                "seekable": true,
+                "size": 900579,
+                "source": "disk"
+            },
+            "status": "Completed",
+            "stream": "http://127.0.0.1:8877/stream/SABnzbd_nzo_nzbfast1?t=exampletoken00000000000000000001"
+        }
+    ],
+    "history_total": 1,
+    "nzbfast": "1.0.16",
+    "pause_int": "0",
+    "paused": false,
+    "queue": [],
+    "queue_total": 0,
+    "speed_bps": 0.0,
+    "status": true,
+    "stream": {
+        "blocked_reads": 0,
+        "readers": 0,
+        "runway_mb": 16,
+        "runway_wait_ms": 3000,
+        "zero_filled_bytes": 0
+    },
+    "version": "4.5.0",
+    "warnings": 0
+}

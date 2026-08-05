@@ -97,6 +97,73 @@ pub struct Chaos {
     /// - the shape the slope recycle and the dup races exist for. A
     /// reconnect naturally gets a fresh, healthy session.
     pub slow_conn: Option<(u64, u64)>,
+    /// IP/connection cap: while this many connections are already live,
+    /// a further accept is greeted with the provider's own capacity
+    /// refusal ("502 max number of simultaneous IP addresses reached")
+    /// and closed. With `drop_after` this reproduces the flap shape: the
+    /// few winners keep dying, the rest keep bouncing off the cap.
+    pub accept_cap: Option<u64>,
+    /// Ids whose FIRST request hangs BEFORE the status line (the
+    /// dead-air shape a flat read timeout waits full length on, and the
+    /// adaptive TTFB budget cuts short). Retries succeed, like `stall`.
+    pub stall_pre: HashSet<String>,
+    /// Brownout: once this many bodies have been served (across all
+    /// connections), EVERY further BODY request hangs in dead air - the
+    /// whole frontend goes mute mid-run and never comes back. 0 = off.
+    pub brownout_after: u64,
+    /// Jitter: every Nth body (server-wide, deterministic) is preceded
+    /// by an extra delay of this many ms - a spiky but perfectly
+    /// healthy link (the satellite shape). The SAFETY rig for any
+    /// timeout tightening: the right behaviour here is to kill
+    /// nothing.
+    pub jitter: Option<(u64, u64)>,
+    /// Corrupt-article storm: every Nth BODY request (server-wide,
+    /// counted in arrival order like `jitter`) gets one payload byte
+    /// flipped, so its yEnc pcrc32 fails downstream. The per-id
+    /// `corrupt` set models a damaged POST; this models a damaged
+    /// SERVER (a broken cache node) - a deterministic fraction of
+    /// everything it serves is bad, and every re-request to the same
+    /// server serves the same bad copy. 0 = off.
+    pub corrupt_every: u64,
+    /// Split-brain: a request for the key id is answered with the
+    /// VALUE id's article instead - a fully valid, self-consistent
+    /// yEnc body that is simply the wrong article (storage backend
+    /// serving mismatched content, seen live as "downloads complete
+    /// but never verify"). Its own pcrc32 PASSES; only the article's
+    /// declared identity (yEnc part number) can give it away. Every
+    /// copy from this server is the same wrong copy.
+    pub swap: HashMap<String, String>,
+    /// Slow-start trickle: for the first `ms` milliseconds of every
+    /// connection's life, its BODY bytes are paced at `bps` instead of
+    /// the normal throttle - a congestion-window/middlebox warm-up
+    /// where each fresh session crawls before it runs. Punishes
+    /// reconnect-heavy behaviour specifically; a parked spare rides
+    /// the window out while idle.
+    pub slow_start: Option<(u64, u64)>,
+    /// Satellite handover: `(period_ms, freeze_ms, wans)`. Every
+    /// `period_ms`, BODY service freezes in dead air for `freeze_ms`
+    /// (mid-pipeline, all at once) - the Starlink route switch. With
+    /// `wans > 1`, connections belong to WAN `conn_no % wans` (the
+    /// multi-WAN load balancer) and the WANs' freeze windows are
+    /// staggered evenly across the period, so some of the fleet is
+    /// always healthy - the single-WAN whole-fleet freeze and the
+    /// multi-WAN half-fleet freeze are the same knob. Brief and
+    /// RECOVERING, unlike `brownout_after`; whole-connection, unlike
+    /// the per-id stalls.
+    pub handover: Option<(u64, u64, u64)>,
+    /// Asymmetric multi-WAN rates: connection `conn_no` gets per-conn
+    /// ceiling `wan_conn_bps[(conn_no - 1) % len]` - one entry per WAN
+    /// of a load-balanced router (Starlink beside a DSL fallback).
+    /// `slow_conn`, when it names the same connection, wins. Empty =
+    /// off.
+    pub wan_conn_bps: Vec<u64>,
+    /// CGNAT eviction: after this many bodies, the connection goes
+    /// PERMANENTLY silent - no close, no RST, the next response simply
+    /// never comes (a NAT table entry aged out mid-transfer). Unlike
+    /// `drop_after` (clean close, instant requeue) the client learns
+    /// nothing until its read bound fires; a reconnect gets a fresh
+    /// NAT entry and works. 0 = off.
+    pub mute_after_bodies: u64,
 }
 
 /// Bandwidth shaping for the BODY/ARTICLE path - the model the
@@ -142,6 +209,15 @@ struct ThrottleState {
     /// pace) can linger seconds into the NEXT sample - so first-close
     /// marks the rung boundary and last-close does not.
     dip_state: std::sync::atomic::AtomicUsize,
+    /// TODO 112 rig 2 (the facts-changed case): a LIVE replacement for
+    /// the configured `line_bps`, settable mid-run via
+    /// [`MockServer::set_line_bps`]. 0 = no override. The dip, while
+    /// active, still wins - it models a transient, this models the
+    /// provider genuinely re-provisioning the line.
+    line_override: std::sync::atomic::AtomicU64,
+    /// Server birth - the shared epoch the handover schedule ticks
+    /// against, so every connection freezes on the SAME clock.
+    started: std::time::Instant,
 }
 
 impl ThrottleState {
@@ -150,6 +226,8 @@ impl ThrottleState {
             line_next: tokio::sync::Mutex::new(std::time::Instant::now()),
             active: Default::default(),
             dip_state: Default::default(),
+            line_override: Default::default(),
+            started: std::time::Instant::now(),
         })
     }
 
@@ -166,7 +244,38 @@ impl ThrottleState {
                 _ => {}
             }
         }
-        t.line_bps
+        match self.line_override.load(Ordering::Relaxed) {
+            0 => t.line_bps,
+            n => n,
+        }
+    }
+
+    /// Pace `data` onto the wire: reserve each 64 KB chunk's transfer
+    /// time on both ceilings, sleep the reservation, then write THAT
+    /// chunk - the shape of a real throttled TCP stream, where bytes
+    /// trickle for the whole transfer. The old shape (reserve the whole
+    /// body, then burst it) gave a pipelined response a first-byte time
+    /// equal to its full queue delay, which no real line produces - on
+    /// a slow shared line that tripped the client's adaptive TTFB
+    /// budget into a timeout/requeue cascade the wire never earned,
+    /// and every abandoned socket then drained its queued bodies into
+    /// the void at line pace (~20 s of dead wire on the playback rig).
+    async fn pace_write<W: tokio::io::AsyncWrite + Unpin>(
+        &self,
+        t: &Throttle,
+        conn_next: &mut std::time::Instant,
+        w: &mut W,
+        data: &[u8],
+    ) -> std::io::Result<()> {
+        if t.per_conn_bps == 0 && t.line_bps == 0 && self.line_override.load(Ordering::Relaxed) == 0
+        {
+            return w.write_all(data).await;
+        }
+        for chunk in data.chunks(64 * 1024) {
+            self.pace(t, conn_next, chunk.len()).await;
+            w.write_all(chunk).await?;
+        }
+        Ok(())
     }
 
     /// Reserve `bytes` of transfer time on both ceilings; sleeps until
@@ -176,7 +285,8 @@ impl ThrottleState {
     /// stale future reservations that throttled the NEXT rung long
     /// after the dip was over. No lock is held across the sleeps.
     async fn pace(&self, t: &Throttle, conn_next: &mut std::time::Instant, bytes: usize) {
-        if t.per_conn_bps == 0 && t.line_bps == 0 {
+        if t.per_conn_bps == 0 && t.line_bps == 0 && self.line_override.load(Ordering::Relaxed) == 0
+        {
             return;
         }
         let mut left = bytes;
@@ -335,12 +445,25 @@ pub struct MockServer {
     /// The header plane, so a test can keep posting after the server is
     /// up - see [`MockServer::post_overview`].
     plane: Arc<HeaderPlane>,
+    /// Shared pacing state, kept so a test can re-provision the line
+    /// mid-run - see [`MockServer::set_line_bps`].
+    throttle_state: Arc<ThrottleState>,
     handle: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for MockServer {
     fn drop(&mut self) {
         self.handle.abort();
+    }
+}
+
+/// See [`MockServer::line_control`].
+#[derive(Clone)]
+pub struct LineControl(Arc<ThrottleState>);
+
+impl LineControl {
+    pub fn set_line_bps(&self, bps: u64) {
+        self.0.line_override.store(bps, Ordering::Relaxed);
     }
 }
 
@@ -389,6 +512,8 @@ impl MockServer {
         let body_log2 = body_log.clone();
         let stall_once: Arc<std::sync::Mutex<HashSet<String>>> =
             Arc::new(std::sync::Mutex::new(chaos.stall.clone()));
+        let stall_pre_once: Arc<std::sync::Mutex<HashSet<String>>> =
+            Arc::new(std::sync::Mutex::new(chaos.stall_pre.clone()));
         let pause: Arc<std::sync::atomic::AtomicBool> = Default::default();
         let pause2 = pause.clone();
         let accepted = Arc::new(AtomicU64::new(0));
@@ -396,6 +521,7 @@ impl MockServer {
         let post_counters: Arc<PostCounters> = Default::default();
         let stats = post_counters.stats.clone();
         let throttle_state = ThrottleState::new();
+        let throttle_state2 = throttle_state.clone();
         let handle = tokio::spawn(async move {
             loop {
                 let Ok((sock, _)) = listener.accept().await else {
@@ -405,6 +531,13 @@ impl MockServer {
                 let articles = articles.clone();
                 let plane = plane.clone();
                 let mut chaos = chaos.clone();
+                // Asymmetric multi-WAN: this connection's per-socket
+                // ceiling is its WAN's rate (round-robin by accept
+                // order, the load-balancer stand-in).
+                if !chaos.wan_conn_bps.is_empty() {
+                    let wan = ((conn_no - 1) % chaos.wan_conn_bps.len() as u64) as usize;
+                    chaos.throttle.per_conn_bps = chaos.wan_conn_bps[wan];
+                }
                 // One degraded session: the designated accept gets its
                 // own per-connection ceiling via the existing throttle
                 // pacing; later accepts (reconnects) are healthy.
@@ -416,23 +549,42 @@ impl MockServer {
                 let served = served2.clone();
                 let body_log = body_log2.clone();
                 let stall_once = stall_once.clone();
+                let stall_pre_once = stall_pre_once.clone();
                 let pause = pause2.clone();
                 let post_counters = post_counters.clone();
                 let ts = throttle_state.clone();
                 ts.active.fetch_add(1, Ordering::Relaxed);
                 tokio::spawn(async move {
+                    if let Some(cap) = chaos.accept_cap
+                        && ts.active.load(Ordering::Relaxed) as u64 > cap
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        let (_, mut w) = sock.into_split();
+                        let _ = w
+                            .write_all(
+                                format!(
+                                    "502 max number of simultaneous IP addresses reached: {cap}\r\n"
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                        ts.active.fetch_sub(1, Ordering::Relaxed);
+                        return;
+                    }
                     if chaos.greet_delay_ms > 0 {
                         tokio::time::sleep(std::time::Duration::from_millis(chaos.greet_delay_ms))
                             .await;
                     }
                     let _ = serve_conn(
                         sock,
+                        conn_no,
                         articles,
                         plane,
                         chaos.clone(),
                         served,
                         body_log,
                         stall_once,
+                        stall_pre_once,
                         pause,
                         post_counters,
                         ts.clone(),
@@ -455,8 +607,26 @@ impl MockServer {
             body_log,
             pause,
             plane: plane2,
+            throttle_state: throttle_state2,
             handle,
         }
+    }
+
+    /// Re-provision the line LIVE (TODO 112 rig 2): from the next 64 KB
+    /// pacing chunk on, the whole-server ceiling is `bps`. 0 restores
+    /// the configured `line_bps`. Connections in flight feel it
+    /// mid-article - that is the point.
+    pub fn set_line_bps(&self, bps: u64) {
+        self.throttle_state
+            .line_override
+            .store(bps, Ordering::Relaxed);
+    }
+
+    /// A cloneable, 'static handle for [`MockServer::set_line_bps`], so
+    /// a rig can schedule the re-provision from a task or closure that
+    /// cannot borrow the server.
+    pub fn line_control(&self) -> LineControl {
+        LineControl(self.throttle_state.clone())
     }
 
     /// Append overview rows, as if those articles had just been posted.
@@ -493,15 +663,77 @@ impl MockServer {
     }
 }
 
+/// The POST arm of [`serve_conn`], lifted out to keep that function
+/// under the size gate: the reject / try-later gates, the ack-lost
+/// hang-up, and the duplicate / 441 response shapes. Returns false
+/// when the connection must close (ack-lost simulates a dead socket).
+async fn handle_post(
+    w: &mut tokio::net::tcp::OwnedWriteHalf,
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    articles: &Arc<std::sync::Mutex<HashMap<String, Vec<u8>>>>,
+    chaos: &Chaos,
+    post_counters: &Arc<PostCounters>,
+) -> std::io::Result<bool> {
+    if chaos.post_rejected {
+        w.write_all(b"440 posting not allowed\r\n").await?;
+    } else if post_counters.commands.fetch_add(1, Ordering::Relaxed) < chaos.post.try_later {
+        w.write_all(b"503 service temporarily unavailable\r\n")
+            .await?;
+    } else {
+        w.write_all(b"340 send article to be posted\r\n").await?;
+        w.flush().await?;
+        match read_posted_article(reader).await? {
+            Some((id, body)) => {
+                let nth = post_counters.articles.fetch_add(1, Ordering::Relaxed) + 1;
+                if nth <= chaos.post.ack_lost {
+                    // Article read, nothing said back, socket gone.
+                    if chaos.post.ack_lost_keeps {
+                        articles.lock_ok().insert(id, body);
+                    }
+                    return Ok(false);
+                }
+                let reject = chaos
+                    .post
+                    .reject_441
+                    .as_deref()
+                    .filter(|_| nth > chaos.post.reject_after);
+                let duplicate = articles.lock_ok().contains_key(&id);
+                if let Some(text) = reject {
+                    w.write_all(format!("441 {text}\r\n").as_bytes()).await?;
+                } else if duplicate {
+                    // A real server keeps the copy it already has and
+                    // refuses the resend, quoting the reason code in
+                    // the free-form part (INN's shape). Only a STAT
+                    // distinguishes this from a rejection that merely
+                    // mentions duplicates.
+                    let line = chaos
+                        .post
+                        .duplicate_text
+                        .as_deref()
+                        .unwrap_or("441 435 Duplicate article rejected");
+                    w.write_all(format!("{line}\r\n").as_bytes()).await?;
+                } else {
+                    articles.lock_ok().insert(id, body);
+                    w.write_all(b"240 article received\r\n").await?;
+                }
+            }
+            None => w.write_all(b"441 posting failed\r\n").await?,
+        }
+    }
+    Ok(true)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn serve_conn(
     sock: tokio::net::TcpStream,
+    conn_no: u64,
     articles: Arc<std::sync::Mutex<HashMap<String, Vec<u8>>>>,
     plane: Arc<HeaderPlane>,
     chaos: Chaos,
     served: Arc<AtomicU64>,
     body_log: Arc<std::sync::Mutex<Vec<String>>>,
     stall_once: Arc<std::sync::Mutex<HashSet<String>>>,
+    stall_pre_once: Arc<std::sync::Mutex<HashSet<String>>>,
     pause: Arc<std::sync::atomic::AtomicBool>,
     post_counters: Arc<PostCounters>,
     throttle: Arc<ThrottleState>,
@@ -509,6 +741,8 @@ async fn serve_conn(
     sock.set_nodelay(true)?;
     // This connection's slot on the per-socket ceiling.
     let mut conn_next = std::time::Instant::now();
+    // Birth of this connection, for the slow-start trickle window.
+    let conn_started = std::time::Instant::now();
     let (r, mut w) = sock.into_split();
     let mut reader = BufReader::new(r);
     if chaos.mute_greeting {
@@ -651,52 +885,8 @@ async fn serve_conn(
                 None => w.write_all(b"430 no such article\r\n").await?,
             }
         } else if upper == "POST" {
-            if chaos.post_rejected {
-                w.write_all(b"440 posting not allowed\r\n").await?;
-            } else if post_counters.commands.fetch_add(1, Ordering::Relaxed) < chaos.post.try_later
-            {
-                w.write_all(b"503 service temporarily unavailable\r\n")
-                    .await?;
-            } else {
-                w.write_all(b"340 send article to be posted\r\n").await?;
-                w.flush().await?;
-                match read_posted_article(&mut reader).await? {
-                    Some((id, body)) => {
-                        let nth = post_counters.articles.fetch_add(1, Ordering::Relaxed) + 1;
-                        if nth <= chaos.post.ack_lost {
-                            // Article read, nothing said back, socket gone.
-                            if chaos.post.ack_lost_keeps {
-                                articles.lock_ok().insert(id, body);
-                            }
-                            return Ok(());
-                        }
-                        let reject = chaos
-                            .post
-                            .reject_441
-                            .as_deref()
-                            .filter(|_| nth > chaos.post.reject_after);
-                        let duplicate = articles.lock_ok().contains_key(&id);
-                        if let Some(text) = reject {
-                            w.write_all(format!("441 {text}\r\n").as_bytes()).await?;
-                        } else if duplicate {
-                            // A real server keeps the copy it already has and
-                            // refuses the resend, quoting the reason code in
-                            // the free-form part (INN's shape). Only a STAT
-                            // distinguishes this from a rejection that merely
-                            // mentions duplicates.
-                            let line = chaos
-                                .post
-                                .duplicate_text
-                                .as_deref()
-                                .unwrap_or("441 435 Duplicate article rejected");
-                            w.write_all(format!("{line}\r\n").as_bytes()).await?;
-                        } else {
-                            articles.lock_ok().insert(id, body);
-                            w.write_all(b"240 article received\r\n").await?;
-                        }
-                    }
-                    None => w.write_all(b"441 posting failed\r\n").await?,
-                }
+            if !handle_post(&mut w, &mut reader, &articles, &chaos, &post_counters).await? {
+                return Ok(());
             }
         } else if let Some(id) = cmd
             .strip_prefix("IHAVE ")
@@ -762,6 +952,28 @@ async fn serve_conn(
                 log.push(id.clone());
                 log.len() as u64
             };
+            // CGNAT eviction: this connection's NAT entry is gone -
+            // dead air forever, no close. A reconnect gets a fresh
+            // entry (a fresh accept), which is the recovery path.
+            if chaos.mute_after_bodies > 0 && bodies_served >= chaos.mute_after_bodies {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                return Ok(());
+            }
+            // Satellite handover: dead air while this connection's WAN
+            // switches routes. All connections of one WAN freeze on the
+            // shared server clock; other WANs' windows are staggered.
+            if let Some((period, freeze, wans)) = chaos.handover
+                && period > 0
+                && freeze > 0
+            {
+                let wans = wans.max(1);
+                let offset = ((conn_no - 1) % wans) * (period / wans);
+                let phase =
+                    (throttle.started.elapsed().as_millis() as u64 + period - offset) % period;
+                if phase < freeze {
+                    tokio::time::sleep(std::time::Duration::from_millis(freeze - phase)).await;
+                }
+            }
             if chaos.body_error.is_some_and(|n| nth <= n) {
                 // Not a BODY status at all: the client can only treat this
                 // as a protocol error and drop the session.
@@ -774,13 +986,35 @@ async fn serve_conn(
                 w.write_all(b"430 no such article\r\n").await?;
                 continue;
             }
-            let Some(article) = articles.lock_ok().get(&id).cloned() else {
+            // Split-brain: the index knows the requested id (no 430),
+            // but the storage backend hands back a different article's
+            // bytes - so the swap applies after the missing checks and
+            // the status line still echoes what was ASKED for.
+            let stored = chaos.swap.get(&id).unwrap_or(&id);
+            let Some(article) = articles.lock_ok().get(stored).cloned() else {
                 refuse_delay(&chaos).await;
                 w.write_all(b"430 no such article\r\n").await?;
                 continue;
             };
             if chaos.delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(chaos.delay_ms)).await;
+            }
+            if let Some((nth, ms)) = chaos.jitter
+                && nth > 0
+                && served.load(Ordering::Relaxed).is_multiple_of(nth)
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            }
+            if chaos.brownout_after > 0 && served.load(Ordering::Relaxed) >= chaos.brownout_after {
+                // The frontend has browned out: dead air for everyone.
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                return Ok(());
+            }
+            if stall_pre_once.lock_ok().remove(&id) {
+                // Dead air: no status, no bytes - the client sees pure
+                // silence until its pre-byte bound fires.
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                return Ok(());
             }
             w.write_all(format!("222 0 {id}\r\n").as_bytes()).await?;
             if stall_once.lock_ok().remove(&id) {
@@ -791,7 +1025,9 @@ async fn serve_conn(
                 return Ok(());
             }
             let mut body = article;
-            if chaos.corrupt.contains(&id) {
+            if chaos.corrupt.contains(&id)
+                || (chaos.corrupt_every > 0 && nth.is_multiple_of(chaos.corrupt_every))
+            {
                 // Flip a byte in the middle of the payload region.
                 let mid = body.len() / 2;
                 body[mid] ^= 0x01;
@@ -802,10 +1038,24 @@ async fn serve_conn(
                 w.write_all(&wire).await?;
                 return Ok(()); // cut the connection mid-body
             }
-            throttle
-                .pace(&chaos.throttle, &mut conn_next, wire.len())
-                .await;
-            w.write_all(&wire).await?;
+            // Slow-start trickle: a young connection is paced at the
+            // crawl rate instead of its normal ceiling.
+            let in_slow_start = chaos.slow_start.is_some_and(|(ms, _)| {
+                conn_started.elapsed() < std::time::Duration::from_millis(ms)
+            });
+            if let Some((_, bps)) = chaos.slow_start.filter(|_| in_slow_start) {
+                let crawl = Throttle {
+                    per_conn_bps: bps,
+                    ..chaos.throttle.clone()
+                };
+                throttle
+                    .pace_write(&crawl, &mut conn_next, &mut w, &wire)
+                    .await?;
+            } else {
+                throttle
+                    .pace_write(&chaos.throttle, &mut conn_next, &mut w, &wire)
+                    .await?;
+            }
             served.fetch_add(1, Ordering::Relaxed);
             bodies_served += 1;
             if chaos.drop_after > 0 && bodies_served >= chaos.drop_after {
@@ -816,24 +1066,73 @@ async fn serve_conn(
             .or_else(|| cmd.strip_prefix("article "))
         {
             // ARTICLE = headers + body in one response. Some clients
-            // fetch via ARTICLE rather than BODY. Mirror the BODY
-            // path with a 220 status and a minimal synthetic header block;
-            // the yEnc body is byte-for-byte identical, so a decoder that
-            // scans for =ybegin is unaffected. Same chaos hooks as BODY.
+            // fetch via ARTICLE rather than BODY (rustnzb does). Mirror
+            // the BODY path with a 220 status and a minimal synthetic
+            // header block; the yEnc body is byte-for-byte identical, so
+            // a decoder that scans for =ybegin is unaffected. EVERY
+            // chaos hook from the BODY path applies here too, in the
+            // same order - the TODO 111 fault matrix found this path
+            // missing stall_pre/brownout/jitter (and the round-7
+            // shapes), which let an ARTICLE-fetching client sail
+            // untouched through three fault profiles and score
+            // impossible walls. A green leg is not a result.
             let id = id.trim().to_string();
-            body_log.lock_ok().push(id.clone());
+            let nth = {
+                let mut log = body_log.lock_ok();
+                log.push(id.clone());
+                log.len() as u64
+            };
+            // CGNAT eviction (see BODY).
+            if chaos.mute_after_bodies > 0 && bodies_served >= chaos.mute_after_bodies {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                return Ok(());
+            }
+            // Satellite handover (see BODY).
+            if let Some((period, freeze, wans)) = chaos.handover
+                && period > 0
+                && freeze > 0
+            {
+                let wans = wans.max(1);
+                let offset = ((conn_no - 1) % wans) * (period / wans);
+                let phase =
+                    (throttle.started.elapsed().as_millis() as u64 + period - offset) % period;
+                if phase < freeze {
+                    tokio::time::sleep(std::time::Duration::from_millis(freeze - phase)).await;
+                }
+            }
+            if chaos.body_error.is_some_and(|n| nth <= n) {
+                w.write_all(b"502 byte limit exceeded\r\n").await?;
+                w.flush().await?;
+                continue;
+            }
             if chaos.missing.contains(&id) {
                 refuse_delay(&chaos).await;
                 w.write_all(b"430 no such article\r\n").await?;
                 continue;
             }
-            let Some(article) = articles.lock_ok().get(&id).cloned() else {
+            // Split-brain swap (see BODY).
+            let stored = chaos.swap.get(&id).unwrap_or(&id);
+            let Some(article) = articles.lock_ok().get(stored).cloned() else {
                 refuse_delay(&chaos).await;
                 w.write_all(b"430 no such article\r\n").await?;
                 continue;
             };
             if chaos.delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(chaos.delay_ms)).await;
+            }
+            if let Some((nth, ms)) = chaos.jitter
+                && nth > 0
+                && served.load(Ordering::Relaxed).is_multiple_of(nth)
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            }
+            if chaos.brownout_after > 0 && served.load(Ordering::Relaxed) >= chaos.brownout_after {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                return Ok(());
+            }
+            if stall_pre_once.lock_ok().remove(&id) {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                return Ok(());
             }
             w.write_all(format!("220 0 {id}\r\n").as_bytes()).await?;
             if stall_once.lock_ok().remove(&id) {
@@ -842,7 +1141,9 @@ async fn serve_conn(
                 return Ok(());
             }
             let mut body = article;
-            if chaos.corrupt.contains(&id) {
+            if chaos.corrupt.contains(&id)
+                || (chaos.corrupt_every > 0 && nth.is_multiple_of(chaos.corrupt_every))
+            {
                 let mid = body.len() / 2;
                 body[mid] ^= 0x01;
             }
@@ -858,10 +1159,23 @@ async fn serve_conn(
                 w.write_all(&wire).await?;
                 return Ok(());
             }
-            throttle
-                .pace(&chaos.throttle, &mut conn_next, wire.len())
-                .await;
-            w.write_all(&wire).await?;
+            // Slow-start trickle (see BODY).
+            let in_slow_start = chaos.slow_start.is_some_and(|(ms, _)| {
+                conn_started.elapsed() < std::time::Duration::from_millis(ms)
+            });
+            if let Some((_, bps)) = chaos.slow_start.filter(|_| in_slow_start) {
+                let crawl = Throttle {
+                    per_conn_bps: bps,
+                    ..chaos.throttle.clone()
+                };
+                throttle
+                    .pace_write(&crawl, &mut conn_next, &mut w, &wire)
+                    .await?;
+            } else {
+                throttle
+                    .pace_write(&chaos.throttle, &mut conn_next, &mut w, &wire)
+                    .await?;
+            }
             served.fetch_add(1, Ordering::Relaxed);
             bodies_served += 1;
             if chaos.drop_after > 0 && bodies_served >= chaos.drop_after {

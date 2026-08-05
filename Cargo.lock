@@ -1486,7 +1486,7 @@ dependencies = [
 
 [[package]]
 name = "nzbfast"
-version = "1.0.16"
+version = "1.0.17"
 dependencies = [
  "anyhow",
  "clap",
@@ -1516,6 +1516,14 @@ dependencies = [
  "trash",
  "ureq",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "nzbfast-ffi"
+version = "0.1.0"
+dependencies = [
+ "nzbfast",
+ "tokio",
 ]
 
 [[package]]
@@ -1558,7 +1566,7 @@ dependencies = [
 
 [[package]]
 name = "nzbtray"
-version = "1.0.16"
+version = "1.0.17"
 dependencies = [
  "serde_json",
  "sha2 0.10.9",

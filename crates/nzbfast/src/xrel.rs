@@ -111,6 +111,7 @@ pub fn search_p2p(query: &str) -> Vec<XrelRelease> {
 /// seconds at a time - which is how a dashboard stops polling. An
 /// enrichment nobody asked for explicitly must never be the reason a
 /// search feels slow: no slot, no id, same results.
+#[cfg(feature = "indexer")]
 pub fn try_search_p2p(query: &str, max_wait: std::time::Duration) -> Vec<XrelRelease> {
     let Some(url) = url_for(query) else {
         return Vec::new();
@@ -165,6 +166,7 @@ fn fetch(url: &str) -> Vec<XrelRelease> {
 /// already believes it has identified. A pull search is free text: "the
 /// matrix" legitimately returns several different films, and taking the
 /// majority id across them would stamp one film's id onto another's row.
+#[cfg(feature = "indexer")]
 pub fn by_dirname(hits: &[XrelRelease]) -> std::collections::HashMap<String, String> {
     hits.iter()
         .filter(|h| !h.imdb.is_empty())

@@ -1,3 +1,4 @@
+#![cfg(feature = "indexer")]
 //! The 28 Jul 2026 all-workers-wedged hang, as a regression test.
 //!
 //! Mechanism of the incident: a catch-up ingest held the shared index

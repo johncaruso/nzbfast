@@ -14,7 +14,11 @@ fn main() {
     let t0 = std::time::Instant::now();
     let (mut pairs, mut moved, mut strides) = (0usize, 0usize, 0u64);
     loop {
-        let (p, f, done) = ix.par2_sidecar_fold().expect("fold stride");
+        // A generous budget: this harness wants throughput, not the
+        // daemon's ~1 s mutex-hold bound.
+        let (p, f, done) = ix
+            .par2_sidecar_fold(std::time::Duration::from_secs(30))
+            .expect("fold stride");
         pairs += p;
         moved += f;
         strides += 1;

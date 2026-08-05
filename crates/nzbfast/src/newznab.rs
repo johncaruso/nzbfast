@@ -120,6 +120,7 @@ pub struct SearchQuery {
 /// Season/episode are different: `s01e02` in a free-text query is a
 /// perfectly good filter against scene names, so when `tvsearch` is
 /// unavailable they fold into `q` the way our own facade does.
+#[cfg(feature = "indexer")]
 pub fn plan_query(caps: Option<&Caps>, q: &SearchQuery) -> SearchQuery {
     let has = |list: &[String], name: &str| list.iter().any(|p| p == name);
     let mut out = q.clone();
@@ -501,6 +502,7 @@ pub fn parse_rfc2822(s: &str) -> Option<i64> {
 /// accounting. Case-folded name + 50 MB size bucket collapses those;
 /// two releases that genuinely share a name but differ in content land
 /// in different buckets.
+#[cfg(feature = "indexer")]
 pub fn dedupe_key(title: &str, size: u64) -> String {
     format!(
         "{}#{}",
@@ -604,6 +606,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "indexer")]
     fn caps_with(tv: &[&str], movie: &[&str]) -> Caps {
         Caps {
             tvsearch: tv.iter().map(|s| s.to_string()).collect(),
@@ -617,6 +620,7 @@ mod tests {
     /// other case degrades to a free-text search, which is mandatory in
     /// the protocol. Sending imdbid to a site that ignores it would
     /// answer a specific-film request with an unfiltered feed.
+    #[cfg(feature = "indexer")]
     #[test]
     fn query_planning_follows_caps() {
         let tvq = SearchQuery {
@@ -792,6 +796,7 @@ mod tests {
         assert_eq!(parse_rfc2822("Tue, 21 Jul 1969 00:00:00 +0000"), None);
     }
 
+    #[cfg(feature = "indexer")]
     #[test]
     fn dedupe_and_budgets() {
         // Same release, par2-overhead size wobble: same bucket.

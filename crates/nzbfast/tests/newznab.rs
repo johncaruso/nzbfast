@@ -1,3 +1,4 @@
+#![cfg(feature = "indexer")]
 //! M12 gate: the newznab facade - Sonarr/Radarr can use nzbfast as an
 //! INDEXER (caps/search/tvsearch → items → /getnzb), and the continuous
 //! scan loop populates the index from a live (mock) news server.

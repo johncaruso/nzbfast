@@ -1,3 +1,4 @@
+#![cfg(feature = "indexer")]
 //! M35 gate: pull search end to end, with no network beyond loopback.
 //!
 //! Our own Newznab facade is a spec-true server, so one nzbfast plays

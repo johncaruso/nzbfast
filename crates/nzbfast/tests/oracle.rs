@@ -1,3 +1,4 @@
+#![cfg(feature = "indexer")]
 //! M29 availability oracle: a seeded ledger drives browse/wall verdicts
 //! through the daemon API - green for a fresh post the (mock) backbone
 //! reliably serves, red for an ancient one it consistently 430s, and

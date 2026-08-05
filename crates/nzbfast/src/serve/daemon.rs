@@ -11,6 +11,7 @@ use tracing::{error, info, warn};
 /// as well as a ceiling - the single shared read connection they
 /// replace serialized every query handler behind whichever one was
 /// slowest.
+#[cfg(feature = "indexer")]
 pub(super) const INDEX_READ_CONNS: usize = 4;
 
 /// How long a request may wait for a free read connection before it is
@@ -20,6 +21,7 @@ pub(super) const INDEX_READ_CONNS: usize = 4;
 /// two orders of magnitude of headroom for an ordinary burst - and a
 /// hard promise that a saturated index costs an HTTP worker a tenth of
 /// a second rather than however long the slowest query runs.
+#[cfg(feature = "indexer")]
 pub(super) const INDEX_READ_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// The read-only connection pool behind [`Daemon::with_index_read`].
@@ -28,6 +30,7 @@ pub(super) const INDEX_READ_WAIT: std::time::Duration = std::time::Duration::fro
 /// has to invalidate connections that are LENT OUT right now (index_wipe
 /// deletes the file under them), which the generation stamp does without
 /// waiting for their queries to end.
+#[cfg(feature = "indexer")]
 #[derive(Default)]
 pub struct IndexReadPool {
     inner: Mutex<IndexReadState>,
@@ -35,6 +38,7 @@ pub struct IndexReadPool {
     handed_back: std::sync::Condvar,
 }
 
+#[cfg(feature = "indexer")]
 #[derive(Default)]
 struct IndexReadState {
     /// Open connections nobody is using.
@@ -52,6 +56,7 @@ struct IndexReadState {
 /// on the unwind out of a panicking handler, which is why this is a guard and
 /// not a matched pair of calls. A leaked connection would shrink the pool by
 /// one permanently, and four panics would close the read path for good.
+#[cfg(feature = "indexer")]
 pub(super) struct IndexReader<'a> {
     pool: &'a IndexReadPool,
     /// `Some` until dropped.
@@ -59,6 +64,7 @@ pub(super) struct IndexReader<'a> {
     generation: u64,
 }
 
+#[cfg(feature = "indexer")]
 impl std::ops::Deref for IndexReader<'_> {
     type Target = nzbkit::index::Index;
     fn deref(&self) -> &Self::Target {
@@ -67,6 +73,7 @@ impl std::ops::Deref for IndexReader<'_> {
     }
 }
 
+#[cfg(feature = "indexer")]
 impl Drop for IndexReader<'_> {
     fn drop(&mut self) {
         let Some(conn) = self.conn.take() else { return };
@@ -87,10 +94,12 @@ impl Drop for IndexReader<'_> {
 
 /// Every read connection is in use. Not an error in the database sense -
 /// nothing failed, the answer just is not available cheaply right now.
+#[cfg(feature = "indexer")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct IndexBusy;
 
 /// What [`Daemon::index_read_acquire`] could do for the caller.
+#[cfg(feature = "indexer")]
 enum Reader<'a> {
     Got(IndexReader<'a>),
     /// Every connection is in use and none came free in time. The caller
@@ -252,6 +261,13 @@ pub struct Daemon {
     /// and read by the queue payload so the active row can say "no data
     /// for Ns" instead of a silently flat chart.
     pub stall_since: Mutex<Option<(String, Instant)>>,
+    /// A2 playback contract: memo for the DISK half of per-file playback
+    /// readiness, `nzo_id -> (unix secs, media file name and size)`.
+    /// Finding a finished job's media file is a bounded directory walk,
+    /// and the compact mobile poll asks about a page of history every
+    /// few seconds; the answer only changes when someone moves the
+    /// files. Entries age out (see `DISK_READINESS_TTL_SECS`).
+    pub playback_disk: Mutex<std::collections::HashMap<String, (u64, Option<(String, u64)>)>>,
     pub next_id: AtomicU64,
     /// Download root. Live-swappable (Settings "Download folder"): a change
     /// applies to the NEXT enqueue without a restart. Read via `out_dir()`.
@@ -300,6 +316,7 @@ pub struct Daemon {
     /// nzo_id whose extractor the hub holds (the last real download started).
     pub active_stream: Mutex<Option<String>>,
     /// M12: index database path.
+    #[cfg(feature = "indexer")]
     pub index_db: PathBuf,
     /// M12: the shared read-WRITE Index connection (tip watcher, wall
     /// enricher, IMDb refresher, eviction, and every handler that
@@ -310,6 +327,7 @@ pub struct Daemon {
     /// each scan task ingests through its own scratch connection and the
     /// busy timeout arbitrates the writers, so cross-connection use
     /// against this WAL database is the daily norm, not a hazard.
+    #[cfg(feature = "indexer")]
     pub index: Mutex<Option<nzbkit::index::Index>>,
     /// The read-ONLY siblings for interactive query handlers (wall2,
     /// search, browse, make_nzb, the newznab facade). WAL readers never
@@ -331,16 +349,19 @@ pub struct Daemon {
     /// at all - the same silence as 28 Jul, one mutex further along.
     /// See [`INDEX_READ_CONNS`] for why a ceiling matters more than the
     /// concurrency.
+    #[cfg(feature = "indexer")]
     pub index_read: IndexReadPool,
     /// When the saturation warning above was last logged (epoch seconds),
     /// so a wedged query surface reports itself once a minute instead of
     /// once per poll.
+    #[cfg(feature = "indexer")]
     pub index_read_warned: AtomicU64,
     /// Whether a read-write `Index::open` has succeeded in this process
     /// - i.e. schema creation and migrations have run. Until then
     /// `with_index_read` routes through `with_index`, so a query handler
     /// can never open the read-only connection against a database an
     /// older binary wrote and trip over a missing column.
+    #[cfg(feature = "indexer")]
     pub index_migrated: std::sync::atomic::AtomicBool,
     /// Last computed index_stats figures (releases, complete, db_bytes,
     /// live_bytes), served whenever the connection above is busy. The
@@ -348,6 +369,7 @@ pub struct Daemon {
     /// that mutex: a catch-up ingest once held it 62s straight, each
     /// poll parked another of the 4 workers, and one open dashboard
     /// tab wedged the whole API (28 Jul hang).
+    #[cfg(feature = "indexer")]
     pub index_stats_cache: Mutex<Option<(u64, u64, u64, u64)>>,
     /// M14g3 auto-speed governor on/off (live-toggleable).
     pub auto_speed: std::sync::atomic::AtomicBool,
@@ -457,6 +479,17 @@ pub struct Daemon {
     /// flip applies from the next download; this atomic backs the
     /// settings API's live read.
     pub race_stragglers: std::sync::atomic::AtomicBool,
+    /// "Adaptive connection timeouts" (live setting adaptive_timeouts,
+    /// ON by default): replaces the flat 30 s per-response timeout with
+    /// a two-phase bound - a pre-first-byte budget trained on each
+    /// server's measured response latency (a dead connection is cut in
+    /// seconds instead of half a minute) plus a no-progress deadline
+    /// once bytes flow, so a slow but alive transfer is never cut.
+    /// Fault rigs: 4x on dead-air stalls, stacks on brownout, zero
+    /// false kills on a jittery link. Read from settings.json per job
+    /// like race_stragglers; this atomic backs the settings API's live
+    /// read. NZBFAST_ADAPTIVE_TIMEOUT overrides in either direction.
+    pub adaptive_timeouts: std::sync::atomic::AtomicBool,
     /// M29 opt-in routing (`oracle_route`, OFF by default): when on, a
     /// download skips any of your providers whose backbone the
     /// availability ledger is confident is GONE for the release's
@@ -496,6 +529,14 @@ pub struct Daemon {
     /// moment the queue drained - which is exactly when someone goes
     /// looking for why nothing downloaded.
     pub last_refusals: Mutex<std::collections::HashMap<String, ServerRefusal>>,
+    /// Throughput-attribution events the DAEMON owns - guard pauses,
+    /// user pause/resume, cap changes, sidecar starts, indexer yields,
+    /// late picks. Same shape and cap as the pool's ring in
+    /// `nzbkit::pool::LiveStats`, kept here because `hub.pool_live`
+    /// only exists while a job runs and half of what dents throughput
+    /// happens outside the pool (the `last_refusals` precedent). The
+    /// stats endpoint merges the two rings into one `events` list.
+    pub events: Mutex<std::collections::VecDeque<DaemonEvent>>,
     /// M35 third-party Newznab indexers - a live setting, read on every
     /// pull search. Entries carry the user's per-site apikey: masked in
     /// get_config (`has_key`), never logged, never sent to a browser.
@@ -532,6 +573,7 @@ pub struct Daemon {
     /// §74: when the instant path last woke the pass, newest last,
     /// trimmed to the last hour - the window `watchlist_instant_max`
     /// applies over.
+    #[cfg(feature = "indexer")]
     pub(super) instant_kicks: Mutex<std::collections::VecDeque<i64>>,
     /// §74: arrivals that MATCHED but were not complete yet - release id
     /// → when we first saw it. A post at +6 s is usually still going up,
@@ -539,6 +581,7 @@ pub struct Daemon {
     /// re-checked on a short cadence instead of being dropped. Missing
     /// articles are never read as final (that is a propagation trap, not
     /// a dead post): an entry simply expires back to the periodic pass.
+    #[cfg(feature = "indexer")]
     pub(super) instant_pending: Mutex<std::collections::HashMap<i64, i64>>,
     /// §74: the arrival names that caused the pass now running to be
     /// woken. The pass drains this and stamps any grab it makes of one of
@@ -818,6 +861,7 @@ pub struct Daemon {
     /// Lines heard but not yet written. The relay is chatty in bursts
     /// and the index is shared with the scanner, so lines are batched
     /// rather than each taking the write lock on arrival.
+    #[cfg(feature = "indexer")]
     pub(super) predb_pending: Mutex<Vec<nzbkit::predb::PreLine>>,
     /// Last thing the feed did, for the settings card. Plain text, shown
     /// as-is: a feature whose whole job is to talk to somebody else's
@@ -841,9 +885,11 @@ pub struct Daemon {
     /// more requests, which is why it is a knob and not a guess.
     pub(super) predb_seed_days: std::sync::atomic::AtomicU64,
     /// A seed import is in flight (one at a time, ever).
+    #[cfg(feature = "indexer")]
     pub(super) predb_seed_running: std::sync::atomic::AtomicBool,
     /// What the seed importer is doing / last did, for the settings
     /// card. Same contract as `predb_status`.
+    #[cfg(feature = "indexer")]
     pub(super) predb_seed_status: Mutex<String>,
     /// Spotnet spot ingestion, OFF by default and independent of
     /// `index_enabled`.
@@ -873,6 +919,7 @@ pub struct Daemon {
     /// just been taken away. The switch then read as off while a live
     /// connection sat behind it, and a wipe reported success over files
     /// an exiting scan put back.
+    #[cfg(feature = "indexer")]
     pub(super) index_generation: AtomicU64,
     /// Number of foreground jobs whose pipeline has not reached its
     /// terminal park yet. Job N's tail can overlap job N+1's network
@@ -903,6 +950,7 @@ pub struct Daemon {
     /// moment (`compact_loop`) rather than stalling a scan pass or a
     /// download. Survives only in memory - a restart is itself an idle
     /// moment and the next prune re-raises it.
+    #[cfg(feature = "indexer")]
     pub compact_pending: std::sync::atomic::AtomicBool,
     /// Truth-audit I: what the last AUTOMATIC index trim removed, and
     /// when - (unix seconds, releases removed). The manual button
@@ -913,6 +961,7 @@ pub struct Daemon {
     /// In memory only. It describes this daemon's run: a restart has not
     /// trimmed anything yet, and claiming a trim from a previous process
     /// would be answering a question about now with a fact about then.
+    #[cfg(feature = "indexer")]
     pub last_auto_trim: std::sync::Mutex<Option<(i64, u64)>>,
     /// Releases and titles the user has actually looked at: title_key /
     /// release id → unix seconds of the last touch. This is the fourth
@@ -923,10 +972,12 @@ pub struct Daemon {
     /// deliberate acts: opening a card's detail sheet, pulling an NZB
     /// through /getnzb, and queueing an indexed release.
     /// Persisted to .spool/index-opened.json.
+    #[cfg(feature = "indexer")]
     pub index_opened: Mutex<OpenedLog>,
     /// M12 ingest gates, live: (raw JSON text as shown in the UI, parsed
     /// form the scanner uses). Text is empty when gates came from a
     /// --index-gates file (the parsed form still applies).
+    #[cfg(feature = "indexer")]
     pub index_gates: Mutex<(String, Option<crate::gates::Gates>)>,
     /// M21: the connection's full line speed in bytes/sec (0 = unset).
     /// SAB remote apps set speed limits as PERCENTAGES - this is what
@@ -1082,15 +1133,19 @@ pub struct Daemon {
     /// showing unenriched RIGHT NOW. The enricher lanes drain these
     /// ahead of the newest-first backlog, so what's on screen gets its
     /// art first. Bounded FIFO (stale entries evict).
+    #[cfg(feature = "indexer")]
     pub(super) enrich_hot: Mutex<std::collections::VecDeque<String>>,
     /// Newsgroup discovery catalogue (mode=groups): the primary server's
     /// LIST ACTIVE + LIST NEWSGROUPS, cached in groups.tsv next to the
     /// index db so a restart doesn't refetch ~100k groups. None until the
     /// cache loads or the first fetch lands.
+    #[cfg(feature = "indexer")]
     pub(super) group_catalog: Mutex<Option<Arc<crate::groups::Catalog>>>,
     /// True while a catalogue fetch is in flight (single-flight guard).
+    #[cfg(feature = "indexer")]
     pub(super) group_fetching: std::sync::atomic::AtomicBool,
     /// Last catalogue-fetch failure, surfaced in the browser UI.
+    #[cfg(feature = "indexer")]
     pub(super) group_fetch_err: Mutex<Option<String>>,
     /// Sampled per-group profiles (size, freshness, rate, content mix)
     /// from an OVER over each group's newest articles. Separate from the
@@ -1098,10 +1153,12 @@ pub struct Daemon {
     /// catalogue is one fetch for every group, this is one round trip
     /// PER group, so it is only ever done for groups someone looked at
     /// or that the background pass has reached.
+    #[cfg(feature = "indexer")]
     pub(super) group_stats: Mutex<Arc<crate::groupstats::StatsCache>>,
     /// Groups with a sample in flight, so two viewers opening the same
     /// row do not both go to the provider (and so the background pass
     /// never races an on-demand request).
+    #[cfg(feature = "indexer")]
     pub(super) group_sampling: Mutex<std::collections::HashSet<String>>,
     /// Opt-in: also fetch newsgroup descriptions from ISC. Off by
     /// default because it is the daemon's only outbound request to a host
@@ -1167,9 +1224,11 @@ pub struct Daemon {
     /// sleep; scan_deep carries a one-off backfill-depth override
     /// (0 = none) consumed at the start of the next pass.
     pub(super) scan_now: tokio::sync::Notify,
+    #[cfg(feature = "indexer")]
     pub(super) scan_deep: AtomicU64,
     /// Live progress of the in-flight scan pass, for index_stats.
     /// Groups currently scanning (several at once since M28).
+    #[cfg(feature = "indexer")]
     pub(super) scan_progress: Mutex<Vec<ScanProgress>>,
     /// M28: concurrent group scans per pass (live setting, clamp 1-8).
     pub(super) index_scan_par: AtomicU64,
@@ -1228,6 +1287,7 @@ pub struct Daemon {
     /// M31b "your wall": cached taste profile (built from completed
     /// history + watchlist). Rebuilt on a ~60 s TTL - a few hundred
     /// history rows is cheap, but the affinity sort hits it per page.
+    #[cfg(feature = "indexer")]
     pub(super) taste_cache: Mutex<Option<(std::time::Instant, TasteProfile)>>,
 }
 
@@ -1235,6 +1295,7 @@ pub struct Daemon {
 /// downloads and watchlist. Feeds the Affinity ("For you") wall sort and
 /// the "Because you watch …" caption. Genre/kind weights are normalized
 /// to sum ~1.0; `decade_center` is the weighted-mean release year.
+#[cfg(feature = "indexer")]
 #[derive(Debug, Clone, Default)]
 pub struct TasteProfile {
     /// (genre, normalized weight), strongest first, top ~8.
@@ -1258,6 +1319,28 @@ pub struct TasteProfile {
 /// actually goes looking. Cleared when the same host later connects and
 /// moves bytes, so a fixed password stops being reported as broken.
 #[derive(Debug, Clone)]
+/// One daemon-owned moment for the throughput chart's marker ring -
+/// the daemon-side twin of `nzbkit::pool::PoolEvent`, minus the host
+/// (these moments belong to the whole daemon, not to one news server).
+pub struct DaemonEvent {
+    /// Unix milliseconds, same clock as the pool ring and the chart's
+    /// throughput samples, so all three lay on top of each other.
+    pub at_ms: u64,
+    /// `pause` | `resume` | `limit` | `disk` | `quota` | `clear` |
+    /// `sidecar` | `indexer` | `late` | `finished` - the dashboard maps
+    /// these to severity classes (fault / recovery / phase / user
+    /// action), and `finished` is also what closes its "checking
+    /// files" phase shading.
+    pub kind: &'static str,
+    /// A whole sentence for the user, like the pool ring's details.
+    pub detail: String,
+}
+
+/// Cap for [`Daemon::events`], matching the pool ring's reasoning: a
+/// bounded window the UI can always afford to serve.
+const DAEMON_EVENT_RING: usize = 256;
+
+#[derive(Debug, Clone)]
 pub struct ServerRefusal {
     /// True when retrying cannot help (a bad credential); false when the
     /// account is fine and the server is simply at a connection or IP cap.
@@ -1272,6 +1355,7 @@ pub struct ServerRefusal {
 
 /// What the scan loop is doing right now - the shared counter is bumped
 /// by index_scan_into as OVER chunks land.
+#[cfg(feature = "indexer")]
 pub struct ScanProgress {
     pub group: String,
     pub done: Arc<AtomicU64>,
@@ -1285,11 +1369,13 @@ pub struct ScanProgress {
 /// order the UI lists them. Kept as strings here because that is what
 /// crosses the settings/API boundary; `parse_evict_order` is the single
 /// place that turns one into the engine's enum.
+#[cfg(feature = "indexer")]
 pub const EVICT_ORDERS: [&str; 5] = ["ladder", "oldest", "newest", "largest", "smallest"];
 
 /// Release kinds the index stores, and so the only values
 /// `index_evict_kinds` may name. Anything else is a typo that would
 /// silently make the whole restriction match nothing.
+#[cfg(feature = "indexer")]
 pub const EVICT_KINDS: [&str; 4] = ["movie", "tv", "software", "other"];
 
 /// How long a deliberate touch (detail sheet, /getnzb, queue add) keeps a
@@ -1297,16 +1383,19 @@ pub const EVICT_KINDS: [&str; 4] = ["movie", "tv", "software", "other"];
 /// to be protected; a month is long enough that a title you browsed
 /// before the weekend is still there on Monday, short enough that a
 /// year of idle curiosity does not pin the whole database.
+#[cfg(feature = "indexer")]
 pub const OPENED_PROTECT_DAYS: i64 = 30;
 
 /// Don't rewrite index-opened.json for a key already touched this
 /// recently - browsing a card repeatedly is one signal, not fifty.
+#[cfg(feature = "indexer")]
 pub(super) const OPENED_COALESCE_SECS: i64 = 3_600;
 
 /// Ceiling on either half of the touch log, so a scripted crawl of the
 /// wall cannot grow the file without bound. Oldest touches drop first,
 /// which is exactly the order the protection window would have expired
 /// them in anyway.
+#[cfg(feature = "indexer")]
 pub(super) const OPENED_MAX_ENTRIES: usize = 5_000;
 
 /// There is deliberately NO ceiling on the protected set.
@@ -1333,9 +1422,11 @@ pub(super) const OPENED_MAX_ENTRIES: usize = 5_000;
 /// re-runs while it is still making progress, up to this many times. Each
 /// pass re-seeds its estimate from the measured file, so convergence is
 /// fast; the bound is only there so a pathological fixture cannot spin.
+#[cfg(feature = "indexer")]
 pub(super) const EVICT_MAX_PASSES: usize = 8;
 
 /// Deliberate user attention, remembered. See `Daemon::index_opened`.
+#[cfg(feature = "indexer")]
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OpenedLog {
     /// Wall title_key → unix seconds of the last detail-sheet open.
@@ -1346,6 +1437,7 @@ pub struct OpenedLog {
     pub releases: std::collections::HashMap<i64, i64>,
 }
 
+#[cfg(feature = "indexer")]
 impl OpenedLog {
     /// Record a touch. Returns true when the caller should persist -
     /// i.e. this is new information, not the same card opened twice in a
@@ -1398,6 +1490,7 @@ impl OpenedLog {
 /// The `index_evict_order` string → the engine's enum. `None` for
 /// anything else, which `apply_setting` refuses to store in the first
 /// place; the fallback at read time is Ladder.
+#[cfg(feature = "indexer")]
 pub fn parse_evict_order(s: &str) -> Option<nzbkit::index::EvictOrder> {
     use nzbkit::index::EvictOrder as O;
     Some(match s.trim().to_ascii_lowercase().as_str() {
@@ -1414,6 +1507,7 @@ pub fn parse_evict_order(s: &str) -> Option<nzbkit::index::EvictOrder> {
 /// `Err` names the offender: a typo here would restrict eviction to a
 /// kind no row carries, and the user would be left staring at a cap that
 /// never frees anything.
+#[cfg(feature = "indexer")]
 pub fn parse_evict_kinds(s: &str) -> std::result::Result<Vec<String>, String> {
     let mut out: Vec<String> = Vec::new();
     for raw in s.split(',') {
@@ -1447,6 +1541,7 @@ pub fn parse_evict_kinds(s: &str) -> std::result::Result<Vec<String>, String> {
 /// title_keys of everything queued, downloading or completed; the touch
 /// log's title_keys and release ids, already filtered to the protection
 /// window.
+#[cfg(feature = "indexer")]
 pub fn assemble_protected(
     watchlisted: Vec<String>,
     owned: Vec<String>,
@@ -1473,6 +1568,7 @@ pub fn assemble_protected(
 /// TV keys carry no year so they are exact; a film pinned to a year also
 /// matches the year-less form, because a stem without a year in it
 /// parses to `m:<title>`.
+#[cfg(feature = "indexer")]
 pub fn watch_item_keys(item: &crate::watchlist::WatchItem) -> Vec<String> {
     let norm = nzbkit::release::norm_title(&item.title);
     if norm.is_empty() {
@@ -1500,6 +1596,7 @@ pub fn watch_item_keys(item: &crate::watchlist::WatchItem) -> Vec<String> {
 /// whole file, so anything else touching the database waits it out.
 /// Split out from the loop so the "defer while busy, fire when idle"
 /// rule is testable on its own.
+#[cfg(feature = "indexer")]
 #[derive(Debug, PartialEq, Eq)]
 pub enum CompactVerdict {
     /// Nothing to do - no prune has asked for it.
@@ -1518,6 +1615,7 @@ pub enum CompactVerdict {
 
 /// What one eviction attempt did. Every variant except `Ran` means
 /// nothing was deleted.
+#[cfg(feature = "indexer")]
 pub enum EvictOutcome {
     /// The engine ran. Carries its report and how many protected keys
     /// stood in the way (0 = the shortfall, if any, is not protection).
@@ -1531,6 +1629,7 @@ pub enum EvictOutcome {
 /// Why a prune stopped short of the size it was asked for. Two very
 /// different situations wear the same symptom, and telling the user the
 /// wrong one sends them hunting for protected releases that do not exist.
+#[cfg(feature = "indexer")]
 pub fn shrink_shortfall_reason(protected_keys: usize) -> String {
     if protected_keys == 0 {
         "nothing is protected, so this is the database's own floor - the schema, its \
@@ -1571,6 +1670,7 @@ pub(super) fn find_job<'a>(
     list.into_iter().find(|j| j.lock_ok().nzo_id == id).cloned()
 }
 
+#[cfg(feature = "indexer")]
 pub(super) fn wall_tip_body(
     tip: Option<nzbkit::index::TipInfo>,
     initialized: bool,
@@ -1589,6 +1689,7 @@ pub(super) fn wall_tip_body(
 /// point is that a download does not visibly stall, so this is the worst
 /// case the user could see - it wants to be well under the moment it
 /// takes them to notice, and it costs one relaxed atomic load per tick.
+#[cfg(feature = "indexer")]
 pub(super) const COMPACT_ABORT_POLL_MS: u64 = 100;
 
 /// §95: how much of the freelist one `compact_chunk` reclaims, in pages.
@@ -1616,6 +1717,7 @@ pub(super) const COMPACT_ABORT_POLL_MS: u64 = 100;
 /// the single VACUUM did (5991 ms vs 4218 ms on that 1.16 GB index),
 /// which is the right trade for idle work that is now both abortable
 /// and resumable.
+#[cfg(feature = "indexer")]
 pub(super) const COMPACT_CHUNK_PAGES: u32 = 2048;
 
 /// The rendezvous between a maintenance statement and the watcher that
@@ -1634,17 +1736,20 @@ pub(super) const COMPACT_CHUNK_PAGES: u32 = 2048;
 /// either the statement arms first (and the watcher's interrupt lands
 /// on it and nothing else), or the watcher stands the statement down
 /// first (and it never runs).
+#[cfg(feature = "indexer")]
 #[derive(Default)]
 pub(super) struct MaintenanceArm {
     inner: Mutex<MaintenanceArmState>,
 }
 
+#[cfg(feature = "indexer")]
 #[derive(Default)]
 struct MaintenanceArmState {
     handle: Option<nzbkit::index::InterruptHandle>,
     stood_down: bool,
 }
 
+#[cfg(feature = "indexer")]
 impl MaintenanceArm {
     /// Called from the blocking task while it HOLDS the index guard,
     /// immediately before the statement. `false` means a job appeared
@@ -1691,6 +1796,7 @@ impl MaintenanceArm {
 /// `abort` is a closure rather than the interrupt handle itself so this
 /// can be tested without a database - and so the caller keeps the
 /// decision about WHICH connection it is entitled to interrupt.
+#[cfg(feature = "indexer")]
 pub(super) async fn abort_compact_when_job_starts(
     jobs: Arc<AtomicUsize>,
     done: Arc<AtomicBool>,
@@ -1718,6 +1824,7 @@ pub(super) async fn abort_compact_when_job_starts(
 /// forever - on exactly the small NAS volumes where reclaiming the space
 /// matters most, and where `compact_pending` being sticky means the
 /// deferral is silent and permanent.
+#[cfg(feature = "indexer")]
 pub fn compact_verdict(
     pending: bool,
     scanning: bool,
@@ -1769,6 +1876,7 @@ impl Daemon {
     /// The download half counts jobs in flight, NOT `started_at`: job
     /// N's tail overlaps job N+1's network phase, so `started_at` goes
     /// None between queued jobs while the pipeline is still busy.
+    #[cfg(feature = "indexer")]
     pub(super) fn indexing_pause_reason(&self) -> Option<&'static str> {
         // Offline outranks everything: it is a promise that this machine
         // is touching no provider, and a scan is provider traffic. The
@@ -1791,6 +1899,14 @@ impl Daemon {
         {
             return Some("downloading");
         }
+        // A QUEUED job outranks background scans exactly as a running
+        // one does. Measured 2026-08-05: four adds sat 38 s before the
+        // runner could pick the first - `index_jobs_active` only rises
+        // AFTER pick, so the scanners' whole 100 ms stand-down
+        // machinery was blind to work the runner had not reached yet.
+        if self.index_pause_on_download.load(Ordering::Relaxed) && self.queue_has_runnable() {
+            return Some("downloading");
+        }
         None
     }
 
@@ -1799,6 +1915,7 @@ impl Daemon {
     /// scanning", and a download outranks every background scan
     /// regardless of which source it feeds - but the switches are
     /// independent, so "off" is asked separately.
+    #[cfg(feature = "indexer")]
     pub(super) fn spot_pause_reason(&self) -> Option<&'static str> {
         if self.offline.load(Ordering::Relaxed) {
             return Some("offline");
@@ -1814,13 +1931,35 @@ impl Daemon {
         {
             return Some("downloading");
         }
+        // A QUEUED job outranks background scans exactly as a running
+        // one does. Measured 2026-08-05: four adds sat 38 s before the
+        // runner could pick the first - `index_jobs_active` only rises
+        // AFTER pick, so the scanners' whole 100 ms stand-down
+        // machinery was blind to work the runner had not reached yet.
+        if self.index_pause_on_download.load(Ordering::Relaxed) && self.queue_has_runnable() {
+            return Some("downloading");
+        }
         None
+    }
+
+    /// True when some queue entry is ready for the runner (Queued and
+    /// not paused; deferred counts - the runner picks deferred work
+    /// when nothing else is runnable, so it still wants the threads).
+    /// Deliberately cheap and approximate: this feeds the scanners'
+    /// 100 ms stand-down polls, which need "is a download imminent",
+    /// not the runner's full pick logic.
+    pub(super) fn queue_has_runnable(&self) -> bool {
+        self.queue.lock_ok().iter().any(|j| {
+            let g = j.lock_ok();
+            g.state == JobState::Queued && !g.paused
+        })
     }
 
     /// Does anything want the index database open? The file backs both
     /// sources, so it is created and held for as long as EITHER switch
     /// is on - and with both off it is never opened, never created on a
     /// fresh install, exactly as when indexing was the only source.
+    #[cfg(feature = "indexer")]
     pub(super) fn index_db_wanted(&self) -> bool {
         self.index_enabled.load(Ordering::Relaxed) || self.spot_enabled.load(Ordering::Relaxed)
     }
@@ -1853,6 +1992,7 @@ impl Daemon {
     /// `None` when the feature is off or there is nothing enabled to
     /// match - the callers use that to skip installing an arrival watch
     /// at all, so an install without a watchlist pays nothing.
+    #[cfg(feature = "indexer")]
     pub(super) fn instant_matcher(&self) -> Option<crate::watchlist::InstantMatcher> {
         if !self.watchlist_instant.load(Ordering::Relaxed) {
             return None;
@@ -1868,6 +2008,7 @@ impl Daemon {
     /// the periodic pass runs a minute later over the same index and
     /// applies exactly the same rules, so the ceiling only ever costs the
     /// "instant" part.
+    #[cfg(feature = "indexer")]
     pub(super) fn instant_kick(&self, names: &[String], now: i64) -> bool {
         if names.is_empty() {
             return false;
@@ -1910,6 +2051,7 @@ impl Daemon {
     /// the pause preference: with "pause while downloading" switched off,
     /// `indexing_pause_reason()` is None during a job, so gating on it
     /// alone let a prune run straight through somebody's download.
+    #[cfg(feature = "indexer")]
     pub(super) fn index_maintenance_ok(&self) -> bool {
         self.indexing_pause_reason().is_none()
             && self.index_jobs_active.load(Ordering::Acquire) == 0
@@ -1922,16 +2064,19 @@ impl Daemon {
     /// because the feed writes into the index database and names indexed
     /// releases - with the indexer off there is nothing for it to name
     /// and nowhere to put what it hears.
+    #[cfg(feature = "indexer")]
     pub(super) fn predb_feed_on(&self) -> bool {
         self.predb_enabled.load(Ordering::Relaxed) && self.index_enabled.load(Ordering::Relaxed)
     }
 
     /// Record what the feed is doing, for the settings card.
+    #[cfg(feature = "indexer")]
     pub(super) fn predb_say(&self, what: &str) {
         *self.predb_status.lock_ok() = what.to_string();
     }
 
     /// Turn the stored settings into a connection description.
+    #[cfg(feature = "indexer")]
     pub(super) fn predb_irc_config(&self) -> nzbkit::predb::IrcConfig {
         let raw = self.predb_server.lock_ok().trim().to_string();
         // `host`, `host:port`, `[v6]`, `[v6]:port`. The bracket form has
@@ -1986,9 +2131,18 @@ impl Daemon {
         }
     }
 
-    pub(super) fn begin_index_job(&self) -> IndexJobGuard {
-        self.index_jobs_active.fetch_add(1, Ordering::AcqRel);
-        IndexJobGuard(self.index_jobs_active.clone())
+    pub(super) fn begin_index_job(self: &Arc<Self>) -> IndexJobGuard {
+        let prev = self.index_jobs_active.fetch_add(1, Ordering::AcqRel);
+        // Phase marker on the 0 -> 1 edge only (tails overlap the next
+        // job, so the counter can sit above 1 for a while), and only
+        // when the yield-to-downloads setting actually pauses anything.
+        if prev == 0
+            && self.index_pause_on_download.load(Ordering::Relaxed)
+            && self.index_enabled.load(Ordering::Relaxed)
+        {
+            self.note_event("indexer", "indexing set aside while downloads run");
+        }
+        IndexJobGuard(self.index_jobs_active.clone(), Arc::downgrade(self))
     }
 
     /// Route every manual/scheduled cap change through here so the
@@ -2002,9 +2156,54 @@ impl Daemon {
     /// own setting, so an unexpected 4 MB/s at 08:00 looked like a bug
     /// in the limiter rather than the schedule doing its job.
     pub(super) fn set_speed_ceiling_from(&self, bps: u64, src: &'static str) {
+        // Marker on change only: startup re-applies the persisted cap
+        // through here, and re-applying the number already in force is
+        // not a change anyone made. The auto-speed governor's AIMD
+        // steps deliberately bypass this method, so they cannot flood
+        // the ring either.
+        let old = self.speed_ceiling.swap(bps, Ordering::Relaxed);
+        if old != bps {
+            let who = match src {
+                "schedule" => " by the schedule",
+                "api" => " by an API client",
+                _ => "",
+            };
+            let detail = if bps == 0 {
+                format!("speed limit removed{who}")
+            } else {
+                format!("speed limit set to {:.1} MB/s{who}", bps as f64 / 1e6)
+            };
+            self.note_event("limit", detail);
+        }
         *self.limit_source.lock_ok() = src;
-        self.speed_ceiling.store(bps, Ordering::Relaxed);
         self.hub.rate.set(bps);
+    }
+
+    /// Record one daemon-owned moment for the throughput chart's marker
+    /// ring, oldest dropped at the cap. Same contract as the pool
+    /// ring's `note`: infallible and quiet, because instrumentation
+    /// that can fail or block changes the thing it measures.
+    pub(super) fn note_event(&self, kind: &'static str, detail: impl Into<String>) {
+        let Ok(mut ring) = self.events.lock() else {
+            return;
+        };
+        if ring.len() >= DAEMON_EVENT_RING {
+            ring.pop_front();
+        }
+        ring.push_back(DaemonEvent {
+            at_ms: nzbkit::pool::now_ms(),
+            kind,
+            detail: detail.into(),
+        });
+    }
+
+    /// Daemon events newest first, for the stats endpoint's merge with
+    /// the pool ring.
+    pub(super) fn recent_events(&self, limit: usize) -> Vec<DaemonEvent> {
+        self.events
+            .lock()
+            .map(|r| r.iter().rev().take(limit).cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Per-job capability token for /stream URLs (`?t=…`). Media players
@@ -2258,13 +2457,25 @@ pub(super) async fn wait_for_shutdown_signal() -> &'static str {
 /// minutes", SAB's set_pause). The timer only fires if no manual
 /// pause/resume happened in between (generation check).
 pub(super) fn timed_pause(d: &Arc<Daemon>, mins: u64, graceful: bool) {
-    d.paused.store(true, Ordering::Relaxed);
+    let was_paused = d.paused.swap(true, Ordering::Relaxed);
     // Every caller of this is a person or a client acting for one - the
     // scheduler pauses through `apply_action`, which claims the pause
     // for itself.
     *d.pause_source.lock_ok() = "user";
     // M23e: also stop the transfer that's in flight, not just new jobs.
     d.suspend_active(graceful);
+    // Marker on the transition only; a re-sent pause of a paused queue
+    // is not a new moment.
+    if !was_paused {
+        d.note_event(
+            "pause",
+            if mins == 0 {
+                "downloads paused".to_string()
+            } else {
+                format!("downloads paused for {mins} minutes")
+            },
+        );
+    }
     if mins == 0 {
         // Still bump the generation: a plain pause has to cancel any
         // auto-resume a previous timed pause left pending.
@@ -2293,6 +2504,7 @@ pub(super) fn arm_pause_timer(d: &Arc<Daemon>, dur: std::time::Duration) {
             *d.pause_until.lock_ok() = None;
             persist_pause(&d);
             info!(target: "pause", "timed pause over - resumed");
+            d.note_event("resume", "timed pause over - downloads resumed");
         }
     });
 }
@@ -2453,12 +2665,14 @@ impl Daemon {
     /// Where the newsgroup catalogue cache lives: next to the index db,
     /// same lifecycle (wiping the index leaves it - it's server data,
     /// not scan data).
+    #[cfg(feature = "indexer")]
     pub(super) fn groups_cache_path(&self) -> PathBuf {
         self.index_db.with_file_name("groups.tsv")
     }
 
     /// Sampled per-group profiles, beside the catalogue and with the same
     /// lifecycle.
+    #[cfg(feature = "indexer")]
     pub(super) fn groupstats_cache_path(&self) -> PathBuf {
         self.index_db.with_file_name("groupstats.tsv")
     }
@@ -2469,6 +2683,7 @@ impl Daemon {
     /// M30: dupe keys of everything already in the library or on its
     /// way there - Completed history plus the current queue. The wall
     /// joins browse rows against this to badge "you have this".
+    #[cfg(feature = "indexer")]
     pub(super) fn owned_dupe_keys(&self) -> std::collections::HashSet<String> {
         let mut set = std::collections::HashSet::new();
         for j in self.queue.lock_ok().iter() {
@@ -2491,6 +2706,7 @@ impl Daemon {
     /// completed history plus the live queue. These are `title_key`s (the
     /// wall's grouping key), NOT dupe keys, so the Affinity sort can sink
     /// owned titles with a plain `title_key IN (...)`.
+    #[cfg(feature = "indexer")]
     pub(super) fn owned_title_keys(&self) -> std::collections::HashSet<String> {
         let mut set = std::collections::HashSet::new();
         let mut push = |name: &str| {
@@ -2515,11 +2731,13 @@ impl Daemon {
 
     /// Where the "recently opened" touch log lives (spool, beside the
     /// watchlist state - same lifecycle, same crash-safe writer).
+    #[cfg(feature = "indexer")]
     pub(super) fn opened_path(&self) -> PathBuf {
         self.spool.join("index-opened.json")
     }
 
     /// Note that the user opened a card's detail sheet.
+    #[cfg(feature = "indexer")]
     pub fn touch_opened_title(&self, title_key: &str) {
         let now = epoch_secs() as i64;
         let dirty = self
@@ -2534,6 +2752,7 @@ impl Daemon {
 
     /// Note that the user pulled an indexed release - /getnzb, or
     /// queueing it from the wall.
+    #[cfg(feature = "indexer")]
     pub fn touch_opened_release(&self, id: i64) {
         let now = epoch_secs() as i64;
         let dirty = self.index_opened.lock_ok().touch_release(id, now);
@@ -2542,6 +2761,7 @@ impl Daemon {
         }
     }
 
+    #[cfg(feature = "indexer")]
     pub(super) fn save_opened(&self) {
         let now = epoch_secs() as i64;
         let snapshot = {
@@ -2558,6 +2778,7 @@ impl Daemon {
     /// unrecognised order can only get here through a hand-edited
     /// settings.json (`apply_setting` validates), and falls back to the
     /// default rather than refusing to run.
+    #[cfg(feature = "indexer")]
     pub(super) fn evict_policy(&self) -> nzbkit::index::EvictPolicy {
         let order_s = self.index_evict_order.lock_ok().clone();
         nzbkit::index::EvictPolicy {
@@ -2582,6 +2803,7 @@ impl Daemon {
     /// year, and for every custom-category entry - one card query each to
     /// resolve the keys the index actually holds. It is called at most
     /// once per eviction pass.
+    #[cfg(feature = "indexer")]
     pub fn protected_set(&self) -> nzbkit::index::Protected {
         let items = self.watchlist.lock_ok().clone();
         let mut watchlisted: Vec<String> = Vec::new();
@@ -2709,6 +2931,7 @@ impl Daemon {
     ///
     /// The caller decides WHETHER to evict (the `index_evict` toggle);
     /// this decides only HOW.
+    #[cfg(feature = "indexer")]
     pub(super) fn evict_to(&self, target: u64) -> EvictOutcome {
         let policy = self.evict_policy();
         let protected = self.protected_set();
@@ -2792,6 +3015,7 @@ impl Daemon {
     /// `Nothing` when the feature is off, unconfigured, or the database
     /// is already under its cap - the common case, and the reason this is
     /// cheap to call after every pass.
+    #[cfg(feature = "indexer")]
     pub(super) fn evict_pass(&self) -> EvictOutcome {
         if !self.index_evict.load(Ordering::Relaxed) {
             return EvictOutcome::Nothing;
@@ -2822,6 +3046,7 @@ impl Daemon {
     /// M31b: build (or return the cached) taste profile - the genre/kind/
     /// decade distribution of what the user has downloaded and watchlisted.
     /// Cached for ~60 s; the affinity wall sort calls this per page.
+    #[cfg(feature = "indexer")]
     pub(super) fn taste_profile(&self) -> TasteProfile {
         {
             let g = self.taste_cache.lock_ok();
@@ -2919,6 +3144,7 @@ impl Daemon {
     /// context, or None when there is nothing to rank by (cold start).
     /// Weights are pre-scaled so genre dominates, kind is secondary, and
     /// decade is a light nudge; owned titles get a -1000 sink in SQL.
+    #[cfg(feature = "indexer")]
     pub(super) fn affinity_ctx(&self, tp: &TasteProfile) -> Option<nzbkit::index::AffinityCtx> {
         if tp.n_signals == 0
             || (tp.genres.is_empty() && tp.kinds.is_empty() && tp.decade_center.is_none())
@@ -2987,6 +3213,7 @@ impl Daemon {
         });
     }
 
+    #[cfg(feature = "indexer")]
     pub(super) fn with_index<T>(
         &self,
         f: impl FnOnce(&nzbkit::index::Index) -> Option<T>,
@@ -2994,14 +3221,23 @@ impl Daemon {
         if !self.index_db_wanted() {
             return None;
         }
-        let mut guard = self.index.lock_ok();
-        if guard.is_none() {
-            *guard = nzbkit::index::Index::open(&self.index_db).ok();
-            if guard.is_some() {
-                self.index_migrated.store(true, Ordering::Release);
+        // blocking_db: both the mutex WAIT (up to another writer's
+        // whole transaction, 10 s busy_timeout included) and the
+        // closure's own synchronous SQLite run off the async workers.
+        // Measured 2026-08-05: three inline deepen ingests plus the tip
+        // ingest and a predb fold occupied every tokio worker at once,
+        // and the download runner - a ready task with an expired 500 ms
+        // poll timer - had no thread to resume on for 38 s.
+        crate::persist::blocking_db(|| {
+            let mut guard = self.index.lock_ok();
+            if guard.is_none() {
+                *guard = nzbkit::index::Index::open(&self.index_db).ok();
+                if guard.is_some() {
+                    self.index_migrated.store(true, Ordering::Release);
+                }
             }
-        }
-        guard.as_ref().and_then(f)
+            guard.as_ref().and_then(f)
+        })
     }
 
     /// Borrow one of the pooled read-only connections, opening another
@@ -3011,6 +3247,7 @@ impl Daemon {
     /// the feature: the caller is an HTTP worker, and a worker that
     /// waits without a bound is a worker the next slow query removes
     /// from the pool.
+    #[cfg(feature = "indexer")]
     fn index_read_acquire(&self) -> Reader<'_> {
         let deadline = std::time::Instant::now() + INDEX_READ_WAIT;
         let mut st = self.index_read.inner.lock_ok();
@@ -3104,6 +3341,7 @@ impl Daemon {
     /// time, and parking every query worker on it is the 2 Aug wedge.
     /// Saturation deliberately does not fall back at all: that mutex is
     /// exactly what this path exists to stay off.
+    #[cfg(feature = "indexer")]
     pub(super) fn with_index_read<T>(
         &self,
         f: impl FnOnce(&nzbkit::index::Index) -> Option<T>,
@@ -3116,6 +3354,7 @@ impl Daemon {
     /// connection was busy. The query surfaces a user watches while it
     /// runs (the wall, search) say so instead of blanking, which is the
     /// honest answer and stops a busy index reading as an empty one.
+    #[cfg(feature = "indexer")]
     pub(super) fn index_read_checked<T>(
         &self,
         f: impl FnOnce(&nzbkit::index::Index) -> Option<T>,
@@ -3139,6 +3378,7 @@ impl Daemon {
     /// seeding) - the point of the read-only path is that those handlers
     /// never park behind an ingest, so their embedded writes must not
     /// park either.
+    #[cfg(feature = "indexer")]
     pub(super) fn try_with_index<T>(
         &self,
         f: impl FnOnce(&nzbkit::index::Index) -> Option<T>,
@@ -3169,6 +3409,7 @@ impl Daemon {
     /// Connections lent out right now are retired by the generation
     /// bump: their query finishes on the old handle and the guard closes
     /// it instead of pooling it, so this never waits on a running query.
+    #[cfg(feature = "indexer")]
     pub(super) fn drop_index_read(&self) {
         let mut st = self.index_read.inner.lock_ok();
         st.generation = st.generation.wrapping_add(1);
@@ -3188,6 +3429,7 @@ impl Daemon {
     /// the last known figures. A few-seconds-stale count is fine for a
     /// status pill - four HTTP workers queued behind a 62s lock hold
     /// is how one dashboard tab wedged the whole daemon.
+    #[cfg(feature = "indexer")]
     pub(super) fn index_stats_snapshot(&self) -> (u64, u64, u64, u64) {
         if !self.index_db_wanted() {
             return (0, 0, 0, 0);
@@ -3220,6 +3462,7 @@ impl Daemon {
 
     /// Mutable variant for the odd transaction-shaped call (IMDb
     /// snapshot ingest). Same lazy-open, same single connection.
+    #[cfg(feature = "indexer")]
     pub(super) fn with_index_mut<T>(
         &self,
         f: impl FnOnce(&mut nzbkit::index::Index) -> Option<T>,
@@ -3227,14 +3470,18 @@ impl Daemon {
         if !self.index_db_wanted() {
             return None;
         }
-        let mut guard = self.index.lock_ok();
-        if guard.is_none() {
-            *guard = nzbkit::index::Index::open(&self.index_db).ok();
-            if guard.is_some() {
-                self.index_migrated.store(true, Ordering::Release);
+        // blocking_db: see `with_index` - the write side is the one
+        // that actually starved the runner.
+        crate::persist::blocking_db(|| {
+            let mut guard = self.index.lock_ok();
+            if guard.is_none() {
+                *guard = nzbkit::index::Index::open(&self.index_db).ok();
+                if guard.is_some() {
+                    self.index_migrated.store(true, Ordering::Release);
+                }
             }
-        }
-        guard.as_mut().and_then(f)
+            guard.as_mut().and_then(f)
+        })
     }
 
     /// Every path to the index database goes through `with_index` or its
@@ -3252,6 +3499,7 @@ impl Daemon {
     /// the OTHER source no longer wants it - so the connection, its page
     /// cache and the WAL go with it rather than sitting resident until
     /// restart.
+    #[cfg(feature = "indexer")]
     pub(super) fn close_index(&self) {
         // Still wanted by the other source: nothing to close.
         if self.index_db_wanted() {
@@ -3271,6 +3519,7 @@ impl Daemon {
 
     /// The generation a scan pass must still be running under to publish
     /// its connection. See [`Self::index_generation`].
+    #[cfg(feature = "indexer")]
     pub(super) fn index_era(&self) -> u64 {
         self.index_generation.load(Ordering::SeqCst)
     }
@@ -3279,6 +3528,7 @@ impl Daemon {
     /// pass that started at `era` - unless the index was switched off or
     /// wiped while that pass ran, in which case the pass's connection is
     /// simply dropped and the index stays closed.
+    #[cfg(feature = "indexer")]
     pub(super) fn publish_index(&self, era: u64, fresh: nzbkit::index::Index) {
         let mut guard = self.index.lock_ok();
         // `index_db_wanted`, not `index_enabled`: a spot pass republishes
@@ -3299,8 +3549,15 @@ impl Daemon {
     /// promises the second. The enrichers would still call out to the
     /// art cache and the photo lane would still walk `.spool/art` on
     /// disk, so each one asks this before its first move of the cycle.
+    #[cfg(feature = "indexer")]
     pub(super) fn indexer_off(&self) -> bool {
         !self.index_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Slim build: there is no built-in indexer, so it is always off.
+    #[cfg(not(feature = "indexer"))]
+    pub(super) fn indexer_off(&self) -> bool {
+        true
     }
 
     /// Park a worker thread while the indexer is off. Returns true when
@@ -3309,6 +3566,7 @@ impl Daemon {
     /// once-in-an-install event, and up to `secs` of extra latency
     /// before the metadata lanes wake is invisible next to the scan pass
     /// that has to run first anyway.
+    #[cfg(feature = "indexer")]
     pub(super) fn park_if_off(&self, secs: u64) -> bool {
         if self.indexer_off() {
             std::thread::sleep(std::time::Duration::from_secs(secs));
@@ -3320,6 +3578,7 @@ impl Daemon {
     /// M29: everything a wall verdict needs - the availability-ledger
     /// snapshot plus the user's enabled backbones. None when the ledger
     /// is still empty or no server is enabled (verdicts all null).
+    #[cfg(feature = "indexer")]
     pub(super) fn oracle_ctx(
         &self,
         cfg_path: &std::path::Path,
@@ -3589,7 +3848,12 @@ impl Daemon {
         // until the push, so without the lock two concurrent adds of one
         // release agree on everything and then collide.
         let publish = self.add_lock.lock_ok();
-        let (out_dir, replaces) = choose_out_dir(&base_out_dir, &dir_stem, &|p| self.dir_claim(p));
+        // dir_claim stats the output volume (`p.exists()`), which can be
+        // a network share, and enqueue is reachable from tokio tasks
+        // (watchlist watcher, RSS poller) - demote the worker around it.
+        let (out_dir, replaces) = crate::persist::blocking_db(|| {
+            choose_out_dir(&base_out_dir, &dir_stem, &|p| self.dir_claim(p))
+        });
         self.register_cat(&category);
         // M14f duplicate check: same identity already queued, running, or
         // successfully completed → hold this one as an ALTERNATIVE
@@ -3602,6 +3866,16 @@ impl Daemon {
         // reasons about duplicates keeps working.
         let key = dupe_key(&stem);
         let duplicate = !allow_dupe && self.dupe_collision(&stem).is_some();
+        // Late-pick groundwork: was the runner free to take this job the
+        // moment it lands? Only then does a slow pick mean the runner was
+        // starved (the fixed inline-SQLite bug held picks back 38 s)
+        // rather than the job simply waiting its turn.
+        let runner_idle = self.started_at.lock_ok().is_none()
+            && !self.paused.load(std::sync::atomic::Ordering::Relaxed)
+            && !self.queue.lock_ok().iter().any(|j| {
+                let g = j.lock_ok();
+                g.state == JobState::Queued && !g.paused
+            });
         let job = Arc::new(Mutex::new(Job {
             origin: origin.to_string(),
             nzo_id: nzo_id.clone(),
@@ -3620,6 +3894,8 @@ impl Daemon {
             // SAB priority -2 means "add paused", -100 means "the default".
             priority: enqueue_priority(priority, duplicate),
             paused: duplicate || priority == -2,
+            queued_at: Some(Instant::now()),
+            idle_at_add: runner_idle,
             // Stamped by `enqueue_fetched` when the NZB came from a URL
             // and the indexer sent an X-DNZB-Failure header.
             failure_link: String::new(),
@@ -3981,6 +4257,7 @@ impl Daemon {
     /// How long since a download last ran, or `None` while one is
     /// running. The clock the background samplers check before deciding
     /// whether to hold a session open across their sleep.
+    #[cfg(feature = "indexer")]
     pub fn download_idle_for(&self) -> Option<std::time::Duration> {
         if self.started_at.lock_ok().is_some() {
             return None;
@@ -4007,6 +4284,7 @@ impl Daemon {
     ///
     /// Holding is still right while a download runs, when the account is
     /// in use by this host anyway and the reconnects would be pure cost.
+    #[cfg(feature = "indexer")]
     pub fn sampler_may_hold(&self, server: &nzbkit::config::ServerConfig) -> bool {
         let Some(after) = server.idle_release_policy().after else {
             return true;
@@ -4927,12 +5205,17 @@ impl Daemon {
             return EpisodeTitles::default();
         }
         // Same key the calendar writes: `eplist:<normalised show title>`.
+        #[cfg(feature = "indexer")]
         let key = format!("eplist:{}", crate::wall::norm_title(&p.title));
+        #[cfg(feature = "indexer")]
         let eps: Vec<crate::wall::EpInfo> = self
             .with_index(|ix| ix.kv_get(&key))
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
             .and_then(|v| serde_json::from_value(v["episodes"].clone()).ok())
             .unwrap_or_default();
+        // Slim build: no index, so no cached episode list to consult.
+        #[cfg(not(feature = "indexer"))]
+        let eps: Vec<crate::wall::EpInfo> = Vec::new();
         EpisodeTitles::new(eps.into_iter().map(|e| (e.season, e.episode, e.name)))
     }
 
@@ -4958,6 +5241,7 @@ impl Daemon {
         // The local facts first - they cost a directory read and no
         // request, and the fingerprints are needed either way (a job we
         // CAN name is one this table wants to learn from).
+        #[cfg(feature = "indexer")]
         let prints = crate::identity::par_fingerprints(out_dir);
         let obfuscated = release::looks_obfuscated(posted);
         let facts = crate::identity::Facts {
@@ -4968,9 +5252,12 @@ impl Daemon {
             // tail, and parking it behind a long ingest batch would
             // hold the finished job's rename and move behind the
             // scanner.
+            #[cfg(feature = "indexer")]
             remembered: obfuscated
                 .then(|| self.with_index_read(|ix| ix.par_hash_lookup(&prints).ok().flatten()))
                 .flatten(),
+            #[cfg(not(feature = "indexer"))]
+            remembered: None,
             mkv_title: obfuscated
                 .then(|| crate::identity::container_title(out_dir))
                 .flatten(),
@@ -4990,6 +5277,7 @@ impl Daemon {
         // are revoked before the wrong name outlives the evidence.
         // mkv-title deliberately does not qualify: it is an unverified
         // claim, and the meter must count only proof.
+        #[cfg(feature = "indexer")]
         if matches!(id.src, "srrdb" | "par-hash") {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -5017,9 +5305,11 @@ impl Daemon {
         // Whatever we now believe this release is called is what the id
         // hunt and the repost table both key on.
         let best = if id.name.is_empty() { posted } else { &id.name };
+        #[cfg(feature = "indexer")]
         let parsed = release::parse_release(best);
         // Our own index may already hold the id, in which case xREL must
         // not be asked - see `xrel_query`.
+        #[cfg(feature = "indexer")]
         if id.imdb.is_empty() {
             id.imdb = self
                 .with_index_read(|ix| ix.title_get(&parsed.key).ok().flatten())
@@ -5041,6 +5331,7 @@ impl Daemon {
         // Teach the repost table. Only from a job we can actually name -
         // filing a fingerprint under an obfuscated stem would hand every
         // future repost of these bytes the same non-answer, permanently.
+        #[cfg(feature = "indexer")]
         if !prints.is_empty() && !release::looks_obfuscated(best) {
             self.with_index(|ix| {
                 ix.par_hash_remember(&prints, best, &parsed.key, unix_now())
@@ -5129,6 +5420,7 @@ impl Daemon {
         // already knows the title by exactly one year (the enricher
         // resolved it). Ambiguity declines inside movie_year: a remade
         // title must never guess between its years.
+        #[cfg(feature = "indexer")]
         if auto_rename
             && matches!(base, Base::Movie)
             && p.year.is_none()
@@ -5943,3 +6235,7 @@ impl Daemon {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "daemon_tests.rs"]
+mod daemon_tests;

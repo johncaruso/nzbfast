@@ -328,6 +328,19 @@ pub(crate) fn try_unrar_spent(
                 println!("⚠ unrar exited with {st} (encrypted or damaged?)");
                 None
             }
+            // "not runnable (No such file or directory (os error 2))" is what
+            // a container user saw after the native path failed, and it names
+            // neither the cause nor the cure. The release image ships no unrar
+            // on purpose (extraction is native), so ENOENT here is the common
+            // case, not the exotic one, and it deserves its own sentence.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!(
+                    "⚠ unrar is not installed, so there was nothing to fall back to \
+                     - volumes left on disk"
+                );
+                println!("  install unrar to enable this fallback, or unpack them by hand");
+                None
+            }
             Err(e) => {
                 println!("⚠ unrar not runnable ({e}) - volumes left on disk");
                 None

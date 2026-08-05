@@ -1,0 +1,273 @@
+//! Test-only Daemon fixture (§106 phase 3). The real `Daemon` is built
+//! exactly once, inline in `serve()`, after the listener is bound - but
+//! nothing in the struct itself is a socket, so tests can stand one up
+//! against a temp directory and reach the ~40 in-memory methods (and
+//! every `set_*` settings helper) that were untestable before the split.
+//!
+//! Mirrors the `serve()` literal with fixed defaults in place of CLI
+//! options. Tests must not assert on a default they care about - set the
+//! field explicitly first. If a field is added to `Daemon`, this literal
+//! fails to compile: add the field here with the same default `serve()`
+//! uses.
+
+use super::*;
+
+/// A Daemon over a temp directory: `dir/out` as the download root,
+/// `dir/spool` as the spool, `dir/settings.json` for settings (created
+/// on demand by the seed helpers). No sockets, no spawned tasks, no
+/// index database - `index: None`.
+pub(crate) fn test_daemon(dir: &Path) -> Arc<Daemon> {
+    let out_root = dir.join("out");
+    let spool = dir.join("spool");
+    let _ = std::fs::create_dir_all(&out_root);
+    let _ = std::fs::create_dir_all(&spool);
+    let config = dir.join("nzbfast.toml");
+    let settings_path = dir.join("settings.json");
+    Arc::new(Daemon {
+        hub: Arc::new(crate::StreamHub::default()),
+        paused: std::sync::atomic::AtomicBool::new(false),
+        offline: std::sync::atomic::AtomicBool::new(false),
+        paused_by_offline: std::sync::atomic::AtomicBool::new(false),
+        queue: Mutex::new(VecDeque::new()),
+        history: Mutex::new(Vec::new()),
+        add_lock: Mutex::new(()),
+        moving: Mutex::new(std::collections::HashSet::new()),
+        reserved: Mutex::new(std::collections::HashSet::new()),
+        progress: Arc::new(AtomicU64::new(0)),
+        active_total: AtomicU64::new(0),
+        active_dl: Mutex::new(None),
+        started_at: Mutex::new(None),
+        last_download_end: Mutex::new(Instant::now()),
+        stall_since: Mutex::new(None),
+        playback_disk: Mutex::new(std::collections::HashMap::new()),
+        next_id: AtomicU64::new(1),
+        out_root: std::sync::RwLock::new(out_root),
+        move_completed: std::sync::RwLock::new(None),
+        move_completed_cats: std::sync::RwLock::new(Vec::new()),
+        spool: spool.clone(),
+        cfg_path: config,
+        cats: Mutex::new(DEFAULT_CATS.iter().map(|s| s.to_string()).collect()),
+        port: 0,
+        launcher_token: String::new(),
+        port_locked: false,
+        library_cats: Mutex::new(Vec::new()),
+        active_stream: Mutex::new(None),
+        #[cfg(feature = "indexer")]
+        index_db: spool.join("index.db"),
+        #[cfg(feature = "indexer")]
+        index: Mutex::new(None),
+        #[cfg(feature = "indexer")]
+        index_read: IndexReadPool::default(),
+        #[cfg(feature = "indexer")]
+        index_read_warned: AtomicU64::new(0),
+        #[cfg(feature = "indexer")]
+        index_migrated: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(feature = "indexer")]
+        index_stats_cache: Mutex::new(None),
+        auto_speed: std::sync::atomic::AtomicBool::new(false),
+        preflight: std::sync::atomic::AtomicBool::new(false),
+        auto_connections: std::sync::atomic::AtomicBool::new(true),
+        wall_hide_adult: std::sync::atomic::AtomicBool::new(true),
+        auto_defer: std::sync::atomic::AtomicBool::new(true),
+        post_health: std::sync::atomic::AtomicBool::new(true),
+        post_health_defer: std::sync::atomic::AtomicBool::new(false),
+        auto_prefetch: std::sync::atomic::AtomicBool::new(true),
+        race_stragglers: std::sync::atomic::AtomicBool::new(true),
+        adaptive_timeouts: std::sync::atomic::AtomicBool::new(true),
+        oracle_route: std::sync::atomic::AtomicBool::new(false),
+        index_deepen: AtomicU64::new(200_000),
+        index_coverage: std::sync::atomic::AtomicBool::new(true),
+        index_gapfill: AtomicU64::new(4),
+        bench_interval: AtomicU64::new(0),
+        bench_last: AtomicU64::new(0),
+        update_manifest: Mutex::new(None),
+        update_serial_seen: std::sync::atomic::AtomicU64::new(0),
+        update_checks: std::sync::atomic::AtomicBool::new(true),
+        unit_bits: std::sync::atomic::AtomicBool::new(false),
+        update_url: Mutex::new(DEFAULT_UPDATE_URL.to_string()),
+        ui_locale: Mutex::new(String::new()),
+        sidecar: Mutex::new(None),
+        media_rejudge: Mutex::new(Vec::new()),
+        best_rate_bps: AtomicU64::new(0),
+        speed_ceiling: AtomicU64::new(0),
+        mem_budget_total: 1 << 30,
+        feeds: Mutex::new(Vec::new()),
+        feed_health: Mutex::new(Default::default()),
+        last_refusals: Mutex::new(Default::default()),
+        events: Mutex::new(Default::default()),
+        indexers: Mutex::new(Vec::new()),
+        watchlist_external: std::sync::atomic::AtomicBool::new(false),
+        watchlist_external_set: std::sync::atomic::AtomicBool::new(false),
+        indexer_rt: Mutex::new(IndexerRuntime::default()),
+        watchlist_instant: AtomicBool::new(true),
+        watchlist_instant_max: std::sync::atomic::AtomicU32::new(INSTANT_MAX_DEFAULT),
+        #[cfg(feature = "indexer")]
+        instant_kicks: Mutex::new(std::collections::VecDeque::new()),
+        #[cfg(feature = "indexer")]
+        instant_pending: Mutex::new(std::collections::HashMap::new()),
+        instant_hint: Mutex::new(Vec::new()),
+        nzblnk_recent: Mutex::new(std::collections::VecDeque::new()),
+        smart_folders: Mutex::new(Vec::new()),
+        par_cleanup: AtomicBool::new(true),
+        out_umask: std::sync::atomic::AtomicU32::new(u32::MAX),
+        fast_par: AtomicBool::new(FAST_PAR_DEFAULT),
+        prefer_external_unrar: AtomicBool::new(false),
+        cleanup_exts: Mutex::new(Vec::new()),
+        password_file: Mutex::new(dir.join("passwords.txt")),
+        password_prompt: Mutex::new("done".to_string()),
+        unpack_eat_volumes: Mutex::new("off".to_string()),
+        custom_categories: std::sync::RwLock::new(Vec::new()),
+        reclassify_pending: std::sync::atomic::AtomicBool::new(true),
+        identity_lookup: std::sync::atomic::AtomicBool::new(true),
+        auto_rename: std::sync::atomic::AtomicBool::new(true),
+        rename_resolution: std::sync::atomic::AtomicBool::new(true),
+        rename_vcodec: std::sync::atomic::AtomicBool::new(false),
+        rename_acodec: std::sync::atomic::AtomicBool::new(false),
+        rename_source: std::sync::atomic::AtomicBool::new(false),
+        rename_group: std::sync::atomic::AtomicBool::new(false),
+        rename_year_parens: std::sync::atomic::AtomicBool::new(false),
+        rename_quality_brackets: std::sync::atomic::AtomicBool::new(false),
+        rename_extra_words: std::sync::atomic::AtomicBool::new(true),
+        rename_identify: std::sync::atomic::AtomicBool::new(true),
+        rename_episode_titles: std::sync::atomic::AtomicBool::new(false),
+        history_rows: AtomicU64::new(10),
+        history_color_names: std::sync::atomic::AtomicBool::new(true),
+        ladder_live: Mutex::new(None),
+        ladder_busy: std::sync::atomic::AtomicBool::new(false),
+        ladder_cancel: std::sync::atomic::AtomicBool::new(false),
+        media_chip_color: std::sync::atomic::AtomicBool::new(true),
+        shape_chip_color: std::sync::atomic::AtomicBool::new(true),
+        rename_junk: std::sync::atomic::AtomicBool::new(true),
+        rename_media_only: std::sync::atomic::AtomicBool::new(false),
+        index_max_age_secs: AtomicU64::new(0),
+        index_retention: seed_index_retention(&settings_path),
+        index_pause_on_download: seed_index_pause_on_download(&settings_path),
+        index_paused: seed_index_paused(&settings_path),
+        index_enabled: std::sync::atomic::AtomicBool::new(false),
+        predb_enabled: seed_predb_enabled(&settings_path),
+        predb_server: seed_predb_server(&settings_path),
+        predb_channels: seed_predb_channels(&settings_path),
+        predb_nick: seed_predb_nick(&settings_path),
+        #[cfg(feature = "indexer")]
+        predb_pending: Mutex::new(Vec::new()),
+        predb_status: Mutex::new(String::new()),
+        predb_corr_enabled: seed_predb_corr_enabled(&settings_path),
+        predb_corr_auto: seed_predb_corr_auto(&settings_path),
+        #[cfg(feature = "indexer")]
+        predb_max_rows: std::sync::atomic::AtomicU64::new(predb_seed::PREDB_MAX_ROWS_DEFAULT),
+        #[cfg(not(feature = "indexer"))]
+        predb_max_rows: std::sync::atomic::AtomicU64::new(250_000),
+        #[cfg(feature = "indexer")]
+        predb_seed_days: std::sync::atomic::AtomicU64::new(predb_seed::PREDB_SEED_DAYS_DEFAULT),
+        #[cfg(not(feature = "indexer"))]
+        predb_seed_days: std::sync::atomic::AtomicU64::new(180),
+        #[cfg(feature = "indexer")]
+        predb_seed_running: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(feature = "indexer")]
+        predb_seed_status: Mutex::new(String::new()),
+        spot_enabled: seed_spot_enabled(&settings_path),
+        spot_groups: seed_spot_groups(&settings_path),
+        spot_backfill: seed_spot_backfill(&settings_path),
+        #[cfg(feature = "indexer")]
+        index_generation: AtomicU64::new(0),
+        index_jobs_active: Arc::new(AtomicUsize::new(0)),
+        index_max_bytes: seed_index_max_bytes(&settings_path),
+        index_evict: seed_index_evict(&settings_path),
+        #[cfg(feature = "indexer")]
+        index_evict_order: seed_index_evict_order(&settings_path),
+        #[cfg(not(feature = "indexer"))]
+        index_evict_order: Mutex::new("ladder".to_string()),
+        #[cfg(feature = "indexer")]
+        index_evict_kinds: seed_index_evict_kinds(&settings_path),
+        #[cfg(not(feature = "indexer"))]
+        index_evict_kinds: Mutex::new(Vec::new()),
+        #[cfg(feature = "indexer")]
+        compact_pending: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(feature = "indexer")]
+        last_auto_trim: std::sync::Mutex::new(None),
+        #[cfg(feature = "indexer")]
+        index_opened: Mutex::new(OpenedLog::default()),
+        #[cfg(feature = "indexer")]
+        index_gates: seed_index_gates(&settings_path, None),
+        line_speed: seed_line_speed(&settings_path),
+        tune_hint: Mutex::new(String::new()),
+        cpu_sample: Mutex::new(None),
+        speed_win: Mutex::new(VecDeque::new()),
+        usage: Mutex::new(Default::default()),
+        pause_until: Mutex::new(None),
+        pause_gen: AtomicU64::new(0),
+        connections: std::sync::atomic::AtomicUsize::new(20),
+        window: std::sync::atomic::AtomicUsize::new(64),
+        decoders: std::sync::atomic::AtomicUsize::new(2),
+        fast_verify: std::sync::atomic::AtomicBool::new(false),
+        verify_lean: std::sync::atomic::AtomicBool::new(false),
+        min_free: AtomicU64::new(MIN_FREE_DEFAULT),
+        queue_hold: std::sync::Mutex::new(None),
+        pause_source: std::sync::Mutex::new("user"),
+        limit_source: std::sync::Mutex::new("user"),
+        auto_retry_secs: seed_auto_retry_secs(&settings_path, 0),
+        quota: AtomicU64::new(0),
+        quota_period: std::sync::atomic::AtomicU8::new(b'd'),
+        watch_dir: Mutex::new(None),
+        watch_keep_nzb: AtomicBool::new(false),
+        watch_failed: Mutex::new(std::collections::HashMap::new()),
+        watch_picked: Mutex::new(std::collections::VecDeque::new()),
+        auto_retried: Mutex::new(std::collections::VecDeque::new()),
+        giveup_tripped: Mutex::new(std::collections::VecDeque::new()),
+        watch_upgraded: Mutex::new(std::collections::VecDeque::new()),
+        delete_kept: Mutex::new(std::collections::VecDeque::new()),
+        auth_fails: Mutex::new(std::collections::HashMap::new()),
+        #[cfg(feature = "indexer")]
+        enrich_hot: Mutex::new(std::collections::VecDeque::new()),
+        #[cfg(feature = "indexer")]
+        group_catalog: Mutex::new(None),
+        #[cfg(feature = "indexer")]
+        group_fetching: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(feature = "indexer")]
+        group_fetch_err: Mutex::new(None),
+        #[cfg(feature = "indexer")]
+        group_stats: Mutex::new(Arc::new(crate::groupstats::StatsCache::default())),
+        #[cfg(feature = "indexer")]
+        group_sampling: Mutex::new(std::collections::HashSet::new()),
+        group_desc_isc: std::sync::atomic::AtomicBool::new(false),
+        script: Mutex::new(None),
+        script_timeout: AtomicU64::new(3600),
+        notify_targets: Mutex::new(Vec::new()),
+        notify_health: Mutex::new(Default::default()),
+        failure_link: Mutex::new("off".to_string()),
+        quality_prefs: seed_quality_prefs(&settings_path),
+        apikey: Mutex::new(None),
+        nzbkey: Mutex::new(None),
+        stream_secret: seed_stream_secret(&settings_path),
+        omdb_key: seed_omdb_key(&settings_path),
+        library_recheck_secs: AtomicU64::new(300),
+        index_groups: Mutex::new(Vec::new()),
+        index_interests: Mutex::new(String::new()),
+        index_interests_applied: Mutex::new(String::new()),
+        index_interest_groups: Mutex::new(Vec::new()),
+        index_interval_secs: AtomicU64::new(900),
+        index_backfill: AtomicU64::new(20000),
+        scan_now: tokio::sync::Notify::new(),
+        #[cfg(feature = "indexer")]
+        scan_deep: AtomicU64::new(0),
+        #[cfg(feature = "indexer")]
+        scan_progress: Mutex::new(Vec::new()),
+        index_scan_par: AtomicU64::new(3),
+        scan_active: std::sync::atomic::AtomicBool::new(false),
+        index_tip_secs: AtomicU64::new(20),
+        watch_interval_secs: AtomicU64::new(5),
+        watch_scan_now: tokio::sync::Notify::new(),
+        oracle_sample: AtomicU64::new(300),
+        schedule: Mutex::new(Vec::new()),
+        schedule_text: Mutex::new(String::new()),
+        watchlist: Mutex::new(Vec::new()),
+        watch_state: Mutex::new(Default::default()),
+        watch_now: tokio::sync::Notify::new(),
+        arr_giveup_threshold: AtomicU64::new(0),
+        arr_instances: Mutex::new(Vec::new()),
+        giveup: Arc::new(Mutex::new(Default::default())),
+        settings_path,
+        #[cfg(feature = "indexer")]
+        taste_cache: Mutex::new(None),
+    })
+}

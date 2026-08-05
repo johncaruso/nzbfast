@@ -393,6 +393,15 @@ pub fn effective_limit(global: usize, server_connections: u32) -> usize {
     global.max(1).min((server_connections.max(1)) as usize)
 }
 
+/// TODO 112: the live epoch controller's master gate. Dark until the
+/// three loopback rigs (nzbkit tests/live_tune.rs) have earned it a
+/// default. Independent of `auto_connections` on purpose: that toggle
+/// governs the OFFLINE prober; the per-server escape from live tuning
+/// is `pin_connections`, exactly as it is for applied knees.
+pub fn live_tune_on() -> bool {
+    std::env::var("NZBFAST_LIVE_TUNE").is_ok_and(|v| v == "1")
+}
+
 /// Whether a freshly measured knee should be withheld from jobs until a
 /// second probe agrees with it.
 ///

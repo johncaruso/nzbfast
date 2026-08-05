@@ -1,0 +1,176 @@
+# Mobile client API contract (playback contract v1, FROZEN)
+
+The endpoint list the native mobile clients use. Rows 1-15 are the P0
+surface; rows 16-17 are the frozen v1 additions. This file
+is the single shared contract: the Android Compose app (here) and the
+iOS SwiftUI shell both build against it. Rows below marked "iOS" are
+used by that client only. Sources are cited as
+file:line in crates/nzbfast/src/serve/. Response snapshots recorded
+from a live daemon live in `app/src/test/resources/snapshots/` and are
+exercised by the JVM unit tests (`app/src/test/`).
+
+## Auth
+
+- API key travels as `X-Api-Key: <key>` header on every call this
+  client makes (query `?apikey=` and `Authorization: Bearer` also work
+  server-side; precedence query > header > form body, mod.rs:5669).
+- `mode=version` answers without a key; a WRONG key is still rejected.
+- 403 body: `{"status":false,"error":"API Key Required"|"API Key
+  Incorrect", ...}`.
+- Never send a `t=` query param to `/api` - that path is claimed by
+  the newznab facade (mod.rs:5679).
+- Two-tier keys exist: the full apikey and an add-only nzbkey
+  (allowlist: addfile, addurl, version, status, fullstatus, get_cats).
+  This app uses the full key.
+
+## Endpoints used by the app
+
+| # | call | notes |
+|---|------|-------|
+| 1 | `GET /api?mode=version` | liveness + first-run probe. Reads `version`. |
+| 2 | `GET /api?mode=queue` | reads `queue.paused`, `queue.status`, `queue.kbpersec`, and per slot: `nzo_id`, `filename`, `status`, `percentage`, `mb`, `mbleft`, `timeleft`, `activity`. Slot `status` values seen: Downloading, Queued, Paused, Moving, plus tail-phase words. |
+| 3 | `GET /api?mode=history` | reads `history.slots[]`: `nzo_id`, `name`, `status` (Completed/Failed/Queued), `size`, `fail_message`, `completed`. |
+| 4 | `POST /api?mode=addfile` | multipart/form-data; file part field `nzbfile` (server takes the first part with a filename, mod.rs:6382); optional form fields `cat`, `nzbname`, `password`, `priority`, `stream=1`. Response `{"status":true,"nzo_ids":[...],"held":[...]}`; with `stream=1` also `m3u` and `stream` URLs. |
+| 5 | `GET /api?mode=addnzblnk&link=<nzblnk:?...>` | response like addfile; `{"status":false,"reason":"badlink",...}` on a bad link. |
+| 5b | `GET /api?mode=addurl&name=<url>` | iOS (pasted NZB URLs). Same `cat`/`nzbname`/`password`/`priority`/`stream` params and response shapes as addfile (api/queue.rs:976). |
+| 6 | `GET /api?mode=queue&name=pause|resume&value=<nzo_id>` | per-job. `{"status":bool}`; resume of a finishing job returns `{"status":false,"error":"this job is still finishing"}`. |
+| 7 | `GET /api?mode=queue&name=delete&value=<nzo_id>[&del_files=1]` | value also takes `all` or a csv. |
+| 8 | `GET /api?mode=history&name=delete&value=<nzo_id>[&del_files=1]` | value also takes `all|failed|completed`. |
+| 9 | `GET /api?mode=pause` / `GET /api?mode=resume` | global. `pause` takes optional `value=<minutes>`. |
+| 10 | `GET /api?mode=get_config` | reads only `config.nzbfast.servers_configured` (first-run signal). |
+| 11 | `POST /api?mode=server_save` JSON `{"index":-1,"server":{host,port,tls,username,password,connections}}` | first-run news-server save; index -1 appends. `{"status":true,"count":n}`. Defaults: port 563, tls true, connections 8 (mod.rs:3643). |
+| 12 | `POST /api?mode=server_test` same body | dry run. `{"status":true,"greeting","latency_ms"}` or `{"status":false,"error","refusal"}`. |
+| 13 | `GET /preview/probe/<nzo_id>` | THE playback-readiness signal. `media != null` = playable now; `media == null && pending == true` = keep polling (dashboard polls every 6 s); `media == null && pending == false` = settled no. Also `file`, `size`, `coverage{head_bytes,pct,tail_ok}`, `source`. Auth: key or per-job `?t=`. 404 while nothing is downloadable. |
+| 14 | `GET /m3u/<nzo_id>` | body line 2 is `http://<host>/stream/<id>?t=<token>` - the tokenized play URL. The app plays THIS so the long-lived player URL never carries the API key - URLs that reach players and logs hold the scoped per-job token, never the key. |
+| 15 | `GET /stream/<nzo_id>` | byte-serving. No file-selection param - the daemon picks the media file (live: largest writer with a media extension; finished: largest media file, or the filed episode for season packs; stream.rs:31,37,56). Ranges: always `Accept-Ranges: bytes`; 206 + `Content-Range` on Range; `Content-Type: video/mp4` for .mp4 else `video/x-matroska`; no chunked encoding. Live jobs: reads block on the write frontier; a Range past the frontier promotes those articles (a real seek). Finished jobs and library force-starts need key or `t` token; live byte-serving is deliberately unauthenticated. 503 past 64 concurrent streams. |
+
+## Playback contract v1 - FROZEN (workstream A2, 2026-08-05)
+
+Everything in this section is frozen for v1: keys keep their name,
+their type and their meaning, and the daemon may only ADD keys.
+`contract: 1` on the payload says which version answered. The three
+calls above that the players use (13, 14, 15) are part of the freeze
+too. Server side: `crates/nzbfast/src/serve/api/playback.rs` and
+`stream::playback_readiness`; gate test
+`playback_contract_answers_readiness_and_scoped_tokens` in
+crates/nzbfast/tests/playback_contract/mod.rs.
+
+### 16. `GET /api?mode=playback` - the one compact call
+
+Full API key only (queue contents are never add-only). Optional
+`limit` (default 10, max 100) applies to BOTH lists; `category` and
+`nzo_ids` filter as they do on queue/history.
+
+```
+{ "status": true, "contract": 1,
+  "version": "4.5.0", "nzbfast": "1.0.16",
+  "paused": false, "pause_int": "0",
+  "speed_bps": 0.0, "diskspace_gb": 601.03, "warnings": 0,
+  "queue_total": 1, "history_total": 0,
+  "queue":   [ <job>, ... ],
+  "history": [ <job>, ... ],
+  "stream": { "readers": 0, "blocked_reads": 0, "zero_filled_bytes": 0,
+              "runway_mb": 16, "runway_wait_ms": 3000 } }
+```
+
+A `<job>`:
+
+```
+{ "nzo_id": "...", "name": "...", "status": "Downloading", "cat": "*",
+  "percentage": 31.0, "mb": 2.86, "mbleft": 1.97,
+  "timeleft": "0:00:00", "activity": "fetching",
+  "fail_message": "",            // history rows
+  "bytes": 2994402,              // history rows
+  "completed": 1785958761,       // history rows, unix seconds
+  "playback": { ... },
+  "stream": "http://host/stream/<id>?t=<token>" }
+```
+
+Numbers are NUMBERS here (the SAB payloads quote theirs); `status`
+words and `activity` tokens are the same ones rows 2 and 3 carry.
+`queue_total` / `history_total` count before `limit` cuts the page.
+
+`playback` is per-file readiness - the file `/stream/<id>` would
+actually serve, decided by the same two pickers that serve it:
+
+```
+{ "ready": true, "reason": "disk", "file": "job 720p.mkv",
+  "size": 900579, "source": "disk", "seekable": true,
+  "coverage": { "head_bytes": 900579, "pct": 100.0, "tail_ok": true } }
+```
+
+`reason` is a closed token set - branch on it, never on prose:
+
+| reason | ready | meaning |
+|---|---|---|
+| `live` | yes | playing now, still downloading (container parsed) |
+| `disk` | yes | finished; the file is on disk |
+| `pending` | no | downloading, not enough of the container yet - poll |
+| `not_started` | no | queued, paused or held |
+| `not_fetched` | no | library entry; playing it STARTS the download |
+| `no_media` | no | finished, no playable file on disk any more |
+| `failed` | no | the job failed |
+| `unknown` | no | no such nzo_id |
+
+`seekable` is `ready && coverage.tail_ok`: the index at the end of the
+file has arrived, so scrubbing will work. `coverage` is null when
+there is nothing to cover yet.
+
+This call is READ-ONLY by design: unlike `/preview/probe/<id>` it
+never promotes articles to pull a file index forward. A client that
+wants that (and the full track/codec/language detail) still calls the
+probe for the ONE job a user opened.
+
+`stream` telemetry is cumulative since daemon start - difference two
+polls for a rate. `blocked_reads` counts reads that had to wait for
+their span (server-side buffering); `zero_filled_bytes` is picture
+served as zeros because the articles under it were terminally missing
+(see research/STREAM-HARDENING-2026-08.md for both mechanisms and for
+what `runway_mb` / `runway_wait_ms` shape).
+
+### 17. `GET /api?mode=stream_token&value=<nzo_id>`
+
+The scoped secret for a URL handed OUTSIDE the app - an external
+player, a share sheet, a `.strm` pointer.
+
+```
+{ "status": true, "nzo_id": "...", "token": "examplet...",
+  "stream": "http://host/stream/<id>?t=<token>", "expires": null }
+```
+
+`{"status":false,"error":"unknown nzo_id"}` for an id the daemon does
+not have. The token is derived from the install secret and the job id:
+it starts and serves THAT job and nothing else, and it does not
+expire (a `.strm` in a Jellyfin library may first be played months
+later) - scope is what makes it safe, not lifetime. **The API key must
+never appear in a URL handed to a player, a log or a file.** Row 16's
+`stream` field carries the same token, so a client polling `playback`
+does not need this call at all.
+
+## Not used yet (candidates for the next phase)
+
+- `mode=stats` `files[]` (active job only) - per-file list for a job
+  detail screen.
+- `mode=get_cats` for a category picker (only if categories exist
+  server-side).
+- `mode=status` - SAB's compact poll. Superseded for these clients by
+  `mode=playback` (row 16); still what push extensions probe.
+
+## Recording the snapshots
+
+```sh
+ffmpeg -f lavfi -i testsrc=size=1280x720:rate=24:duration=20 \
+  -f lavfi -i sine=frequency=440:duration=20 -c:v libx264 \
+  -preset ultrafast -pix_fmt yuv420p -c:a aac movie.mkv
+nzbfast chaos-serve --profile clean --port 8899 --media movie.mkv \
+  --nzb job.nzb --size 2MB --files 1 --line 2MB
+NZBFAST_NO_ENRICH=1 nzbfast --config config.json serve \
+  --bind 127.0.0.1 --port 8877 --apikey snapkey --out ./complete
+curl -F "nzbfile=@job.nzb" \
+  "http://127.0.0.1:8877/api?mode=addfile&apikey=snapkey&output=json"
+```
+
+then curl each endpoint above into `app/src/test/resources/snapshots/`
+(strip the host/port and the key from anything recorded). The iOS
+shell has no test target yet; it reads the same fields, and this file
+is the sync point between the two.

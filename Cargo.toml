@@ -1,5 +1,18 @@
 [workspace]
-members = ["crates/nzbkit", "crates/nzbfast", "crates/nzbtray", "vendor/rars", "vendor/tiny_http"]
+members = [
+    "crates/nzbkit",
+    "crates/nzbfast",
+    "crates/nzbfast-ffi",
+    "crates/nzbtray",
+    "vendor/rars",
+    "vendor/tiny_http",
+]
+# nzbfast-ffi is deliberately NOT a default member: it turns on
+# nzbfast's `ffi` feature, and feature unification would then compile
+# the whole module tree a second time (as the lib target) in every
+# workspace-wide build and test run. Build it explicitly:
+# `cargo build -p nzbfast-ffi --target aarch64-apple-ios-sim`.
+default-members = ["crates/nzbkit", "crates/nzbfast", "crates/nzbtray", "vendor/rars", "vendor/tiny_http"]
 resolver = "2"
 
 [workspace.package]

@@ -1,0 +1,838 @@
+//! The fetch plan (TODO 106 phase 2.1, cut 7): one pass over the NZB's
+//! files building the slot table, the article-id ownership map, the
+//! honest-percentage byte plan, the per-slot seek ladders, the queue
+//! order (par2 main first, then heads, then data with the M11 head+tail
+//! burst), and the resume bookkeeping. Body is a verbatim move from the
+//! orchestrator.
+
+use crate::*;
+use nzbkit::nzb::FileKind;
+use nzbkit::pool::ArticleReq;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::sync::atomic::AtomicUsize;
+
+/// Everything the rest of the run needs from planning. Field names match
+/// the local bindings the inline code used; the orchestrator
+/// destructures them back under the same names.
+pub(super) struct FetchPlan {
+    pub(super) resume_sniffed_slots: Vec<usize>,
+    pub(super) resume_deferred_arts: usize,
+    pub(super) resume_deferred_bytes: u64,
+    pub(super) resume_have_bytes: u64,
+    pub(super) slots: Vec<Arc<FileSlot>>,
+    pub(super) id_to_slot: crate::unpack::IdSlots,
+    pub(super) slot_file: Vec<usize>,
+    pub(super) slot_arts: Vec<(Vec<(u64, String)>, u64)>,
+    pub(super) ids: Vec<ArticleReq>,
+    pub(super) fetch_done: Arc<AtomicU64>,
+}
+
+pub(super) fn build_fetch_plan(
+    nzb: &Arc<Nzb>,
+    hub: &Option<Arc<StreamHub>>,
+    completed: &HashSet<String>,
+    resuming: bool,
+    bootstrap_vol: Option<usize>,
+    resume_vols: &HashMap<usize, PathBuf>,
+) -> FetchPlan {
+    let mut resume_sniffed_slots: Vec<usize> = Vec::new();
+    let mut resume_deferred_arts = 0usize;
+    let mut resume_deferred_bytes = 0u64;
+    // Bytes of articles this resume will SKIP because the journal already
+    // has them on disk. Published on the hub below (never added into the
+    // progress counter) so the queue row can pick the bar up where the
+    // last run left it - see the publish site for why the two stay apart.
+    let mut resume_have_bytes = 0u64;
+    let mut slots: Vec<Arc<FileSlot>> = Vec::new();
+    let mut id_to_slot: crate::unpack::IdSlots = HashMap::new();
+    // UX §15 honest percentage. `fetch_plan` is the declared NZB byte
+    // size of every article this run is responsible for, `fetch_done`
+    // the same measure for the ones already accounted for. Both count
+    // ONE thing - declared bytes of the eager article set - so the bar
+    // reaches exactly 100% when the fetch drains and can never pass it.
+    //
+    // The pair it replaces on the queue row could do neither: the
+    // numerator was decoded payload (all slots, PAR2 included), the
+    // denominator the NZB's encoded bytes minus recovery volumes. A
+    // clean download therefore stopped around 97% still claiming a
+    // gigabyte "left" that did not exist, and a damaged one - where the
+    // extra recovery bytes land on the numerator alone - pinned at
+    // 100% / 0 left with articles still in flight.
+    let mut plan_bytes = 0u64;
+    // Slot index → NZB file index, for the in-stream sniff and the repair
+    // planner (slots skip NZB-classified volumes, so the numberings differ).
+    let mut slot_file: Vec<usize> = Vec::new();
+    // M11: per-slot article ladder (encoded cumulative offset → id) for
+    // seek promotion; aligned with `slots` (empty for par2 slots).
+    let mut slot_arts: Vec<(Vec<(u64, String)>, u64)> = Vec::new();
+    let mut par2_ids: Vec<ArticleReq> = Vec::new();
+    // Each data file's FIRST segment goes right after the par2 index:
+    // the offset-0 article carries the RAR signature + headers, so the
+    // extractor classifies every slot within the first round-trips instead
+    // of holding gigabytes of unclassifiable spans (M3 scheduling rule).
+    let mut head_ids: Vec<ArticleReq> = Vec::new();
+    let mut data_ids: Vec<ArticleReq> = Vec::new();
+    let mut dup_segments = 0usize;
+    for (fi, f) in nzb.files.iter().enumerate() {
+        // Articles inherit their file's post date; per-server retention
+        // routing (M14e) keys off this age.
+        let age_days = nzb_age_days(f.date);
+        let is_bootstrap = bootstrap_vol == Some(fi);
+        if f.kind() == FileKind::Par2Volume && !is_bootstrap {
+            continue;
+        }
+        let is_par2_main = f.kind() == FileKind::Par2Main || is_bootstrap;
+        let idx = slots.len();
+        let resume_sniffed = !is_par2_main && resume_vols.contains_key(&idx);
+        if resume_sniffed {
+            resume_sniffed_slots.push(idx);
+        }
+        slot_file.push(fi);
+        slots.push(Arc::new(FileSlot {
+            hint: f
+                .filename_hint()
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("file{idx:03}")),
+            is_par2_main,
+            par2_sniffed: std::sync::atomic::AtomicBool::new(resume_sniffed),
+            // A parser-dropped segment (empty or wire-unsafe message-id)
+            // is one this slot can never fetch: it counts toward the
+            // total and starts out missing, so the file either repairs
+            // through PAR2 or fails the job - it must not vanish from
+            // the manifest and finish green zero-filled.
+            total_segments: f.segments.len() + f.dropped_segments,
+            remaining: AtomicUsize::new(f.segments.len()),
+            missing: AtomicUsize::new(f.dropped_segments),
+            errors: AtomicUsize::new(0),
+            deferred: AtomicUsize::new(0),
+            abandoned: AtomicUsize::new(0),
+            capture: std::sync::Mutex::new(is_par2_main.then(Vec::new)),
+        }));
+        let mut arts: Vec<(u64, String)> = Vec::new();
+        let mut enc_cum = 0u64;
+        for (si, seg) in f.segments.iter().enumerate() {
+            let bracketed = format!("<{}>", seg.message_id);
+            // Malformed NZBs repeat a message-id, within one file or across
+            // two. The pool fetches each id exactly once (a second request
+            // would never turn terminal - the duplicate-id forever-hang),
+            // so a repeat is settled here: the FIRST occurrence owns the
+            // article. A same-file repeat is covered by that one fetch
+            // (yEnc offsets come from the article, not the NZB); a
+            // cross-file repeat means these bytes never reach THIS file -
+            // count it missing and let PAR2 repair fill the hole.
+            if let Some(&(owner, _)) = id_to_slot.get(&bracketed) {
+                dup_segments += 1;
+                slots[idx].remaining.fetch_sub(1, Ordering::Relaxed);
+                if owner as usize != idx {
+                    slots[idx].missing.fetch_add(1, Ordering::Relaxed);
+                }
+                enc_cum += seg.bytes;
+                continue;
+            }
+            id_to_slot.insert(bracketed.clone(), (idx as u32, seg.bytes as u32));
+            // Every article with an owner is this run's responsibility -
+            // including the ones already satisfied below, which are added
+            // to `have_bytes` as well so a resumed job's bar starts where
+            // its bytes actually are instead of at zero. A duplicate id
+            // (the `continue` above) is fetched once under its first
+            // owner and never counted twice; a segment the parser dropped
+            // has no entry at all and so cannot hold the bar short of
+            // 100%.
+            plan_bytes += seg.bytes;
+            if !is_par2_main {
+                arts.push((enc_cum, bracketed.clone()));
+            }
+            enc_cum += seg.bytes;
+            // On resume, journal-completed data articles are skipped -
+            // their bytes are on disk and the settle pass verifies them.
+            // Par2-main articles always refetch (tiny; activation needs
+            // the packets in memory).
+            if !is_par2_main && completed.contains(&bracketed) {
+                slots[idx].remaining.fetch_sub(1, Ordering::Relaxed);
+                resume_have_bytes += seg.bytes;
+                continue;
+            }
+            // A resume-recognised recovery volume: everything not already
+            // on disk is deferred outright - never queued.
+            if resume_sniffed {
+                slots[idx].remaining.fetch_sub(1, Ordering::Relaxed);
+                slots[idx].deferred.fetch_add(1, Ordering::Relaxed);
+                resume_deferred_arts += 1;
+                resume_deferred_bytes += seg.bytes;
+                continue;
+            }
+            let req = ArticleReq {
+                id: bracketed,
+                age_days,
+                // Segment number = expected yEnc part; the CRC-retry
+                // gate uses it to spot a valid-but-wrong body.
+                part: seg.number,
+            };
+            if is_par2_main {
+                par2_ids.push(req);
+            } else if si == 0 {
+                head_ids.push(req);
+            } else {
+                data_ids.push(req);
+            }
+        }
+        slot_arts.push((arts, enc_cum));
+    }
+    if dup_segments > 0 {
+        println!("  ⚠ NZB repeats {dup_segments} segment id(s) - each article is fetched once");
+    }
+    // Publish the fetch plan before the first article can land. The
+    // daemon zeroed both counters at the Downloading transition, and the
+    // queue payload treats a zero plan as "not ready yet" and falls back
+    // to the old arithmetic, so the window between the two is covered.
+    // `fetch_done` is the local handle either way: a CLI run has no hub
+    // and pays one uncontended atomic add per terminal article.
+    let fetch_done = hub
+        .as_ref()
+        .map(|h| h.fetch_done.clone())
+        .unwrap_or_default();
+    // Seeded with what is in hand before a byte moves: the articles the
+    // journal already satisfied, plus the recovery volumes a resume
+    // recognised on disk and deliberately never queued. Both are bytes of
+    // the plan this run is responsible for, so a resumed job's bar
+    // continues from where it stopped instead of restarting at 0%.
+    fetch_done.store(
+        resume_have_bytes.saturating_add(resume_deferred_bytes),
+        Ordering::Relaxed,
+    );
+    if let Some(h) = hub.as_ref() {
+        h.fetch_plan.store(plan_bytes, Ordering::Relaxed);
+    }
+    // M11 head+tail burst (hub-attached runs, i.e. the daemon): the first
+    // volume's opening ~16 MB and the last volume's closing ~8 MB jump the
+    // data queue, so a media player gets the container header AND the
+    // end-of-file seek index (MKV Cues / MP4 moov both live at the end)
+    // within seconds of queue-add. These are ordinary file bytes - nothing
+    // is wasted if nobody ever streams.
+    if hub.is_some() {
+        let mut data_slots: Vec<usize> = slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.is_par2_main)
+            .map(|(i, _)| i)
+            .collect();
+        data_slots.sort_by_key(|&i| nzbkit::extract::vol_sort_key(&slots[i].hint));
+        let mut burst: std::collections::HashSet<&str> = Default::default();
+        if let Some(&first) = data_slots.first() {
+            for (off, id) in &slot_arts[first].0 {
+                if *off >= 16_000_000 {
+                    break;
+                }
+                burst.insert(id.as_str());
+            }
+        }
+        if let Some(&last) = data_slots.last() {
+            let (arts, total) = &slot_arts[last];
+            for (off, id) in arts.iter().rev() {
+                if off + 8_000_000 <= *total {
+                    break;
+                }
+                burst.insert(id.as_str());
+            }
+        }
+        if !burst.is_empty() {
+            let (mut early, rest): (Vec<_>, Vec<_>) = data_ids
+                .into_iter()
+                .partition(|r| burst.contains(r.id.as_str()));
+            early.extend(rest);
+            data_ids = early;
+        }
+    }
+    let mut ids = par2_ids;
+    ids.extend(head_ids);
+    ids.extend(data_ids);
+    if resuming {
+        println!(
+            "resuming: {} article(s) already on disk, {} to fetch",
+            completed.len(),
+            ids.len()
+        );
+    }
+    FetchPlan {
+        resume_sniffed_slots,
+        resume_deferred_arts,
+        resume_deferred_bytes,
+        resume_have_bytes,
+        slots,
+        id_to_slot,
+        slot_file,
+        slot_arts,
+        ids,
+        fetch_done,
+    }
+}
+
+/// Everything read and resolved before a byte moves: the server pool
+/// (filtered and oracle-routed), the parsed NZB, the archive password
+/// in priority order, and the crash-resume journal state. Field names
+/// match the local bindings the inline code used.
+pub(super) struct Intake {
+    pub(super) cfg_all: Config,
+    pub(super) nzb: Arc<Nzb>,
+    pub(super) job_family: String,
+    pub(super) job_posted: Option<i64>,
+    pub(super) password: Option<String>,
+    pub(super) journal: Arc<nzbkit::journal::Journal>,
+    pub(super) restored: nzbkit::journal::Restored,
+    pub(super) completed: HashSet<String>,
+    pub(super) resuming: bool,
+    pub(super) has_main: bool,
+    pub(super) bootstrap_vol: Option<usize>,
+    pub(super) resume_vols: HashMap<usize, PathBuf>,
+}
+
+pub(super) fn build_intake(
+    config: &Path,
+    nzb_path: &Path,
+    out_dir: &Path,
+    password: Option<String>,
+    hub: &Option<Arc<StreamHub>>,
+) -> Result<Intake> {
+    // This pre-header stretch (config read, NZB read+parse, journal
+    // open/restore) is synchronous disk and CPU work on the caller's
+    // tokio worker - on a big resumed job the journal restore alone
+    // copies substantial data. Each leg runs under blocking_db so the
+    // worker is demoted for the duration (inline off the runtime, e.g.
+    // the CLI path).
+    let mut cfg_all = crate::persist::blocking_db(|| Config::load(config))?;
+    // Which servers were taken OUT of the pool, and why. Only ever read
+    // when the pool ends up empty: "no usable servers" named nothing at
+    // all, so the one failure whose cause is entirely inside the user's
+    // own settings was also the one that said least about itself.
+    let mut sidelined: Vec<String> = Vec::new();
+    // Soft-disabled servers never join a pool.
+    cfg_all.servers.retain(|s| {
+        if !s.enabled {
+            info!(target: "config", "{} disabled - not in the pool", s.host);
+            sidelined.push(format!("{} (switched off)", s.host));
+        }
+        s.enabled
+    });
+    // Exhausted block accounts (daemon-computed): out of the pool.
+    if let Some(h) = &hub {
+        let excluded = h.excluded_hosts.lock_ok().clone();
+        if !excluded.is_empty() {
+            cfg_all.servers.retain(|s| {
+                let keep = !excluded.contains(&s.host);
+                if !keep {
+                    // The exclusion list carries three different reasons
+                    // (busy with the active job, auth-refused, or a spent
+                    // block account) - saying "exhausted" for all of them
+                    // sent a bench investigation chasing a phantom quota
+                    // bug, so say what it means.
+                    info!(
+                        target: "block",
+                        "{} excluded for this download (busy with the active job, refused, or block-exhausted)",
+                        s.host
+                    );
+                    sidelined
+                        .push(format!("{} (busy, refused the login, or out of block data)", s.host));
+                }
+                keep
+            });
+        }
+    }
+    if cfg_all.servers.is_empty() {
+        // Opens with the same four words either way: `fail_hint` keys the
+        // dashboard's "open Server settings" button on that prefix.
+        if sidelined.is_empty() {
+            anyhow::bail!(
+                "no usable servers: none are set up yet - add your provider in Server settings"
+            );
+        }
+        anyhow::bail!(
+            "no usable servers: every one you have set up is out of the pool right now - {}",
+            sidelined.join(", ")
+        );
+    }
+    let xml = crate::persist::blocking_db(|| std::fs::read(nzb_path))
+        .with_context(|| format!("reading {}", nzb_path.display()))?;
+    // Arc'd because the in-stream PAR2 sniff (issue #14) needs the file
+    // list on the decode threads, which outlive this scope's borrows.
+    // Parsing is CPU-bound and scales with the segment count - a large
+    // NZB is worth demoting for too.
+    let nzb = Arc::new(crate::persist::blocking_db(|| Nzb::parse(&xml)).context("parsing NZB")?);
+
+    // The release's dominant group family - one NZB ≈ one family. Used
+    // both for the oracle routing gate below and the ledger sink context.
+    let job_family = {
+        let mut freq: HashMap<&str, usize> = HashMap::new();
+        for f in &nzb.files {
+            for g in &f.groups {
+                *freq.entry(g.as_str()).or_default() += 1;
+            }
+        }
+        freq.into_iter()
+            .max_by_key(|(_, n)| *n)
+            .map(|(g, _)| nzbkit::oracle::group_family(g))
+            .unwrap_or_else(|| "misc".into())
+    };
+    // Newest article post date, or None when the release is fully undated.
+    // Undated jobs carry no usable age, so the oracle IGNORES them entirely
+    // (no routing verdict, no ledger recording): an undated outcome would
+    // otherwise mis-file as bucket 0 ("fresh") for the writer but read back
+    // as bucket 6 ("3y+") on every read - a split-brain that can even
+    // false-flag an undated retention-expired family as "being reaped".
+    let job_posted: Option<i64> = nzb
+        .files
+        .iter()
+        .filter_map(|f| (f.date > 0).then_some(f.date))
+        .max();
+
+    // M29 opt-in routing (`oracle_route`, OFF unless the daemon installed
+    // a snapshot): drop enabled servers whose backbone the availability
+    // ledger is confident is GONE for this release's (family, age-bucket),
+    // saving the doomed primary round-trips on takedown'd content. Guarded
+    // three ways: needs an installed snapshot, needs a real post date to
+    // pick an age bucket, and NEVER empties the pool - so a wrong verdict
+    // only costs latency (a surviving server + the fill ladder still try),
+    // never the last path.
+    if let Some(snap) = hub.as_ref().and_then(|h| h.route_gone.lock_ok().clone())
+        && let Some(date) = job_posted
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|t| t.as_secs() as i64)
+            .unwrap_or(0);
+        let age = ((now - date).max(0) / 86_400) as u32;
+        let gone: Vec<String> = cfg_all
+            .servers
+            .iter()
+            .filter(|s| snap.backbone_gone(&nzbkit::oracle::backbone_of(&s.host), &job_family, age))
+            .map(|s| s.host.clone())
+            .collect();
+        // Only skip if at least one server survives (never the last path).
+        if !gone.is_empty() && gone.len() < cfg_all.servers.len() {
+            cfg_all.servers.retain(|s| {
+                    let keep = !gone.contains(&s.host);
+                    if !keep {
+                        info!(
+                            target: "oracle",
+                            "{} predicted gone for {job_family} (age {age}d) - skipping it this download",
+                            s.host
+                        );
+                    }
+                    keep
+                });
+        }
+    }
+
+    // Archive password, in priority order: explicit > NZB meta > filename
+    // convention. Only consulted if the set turns out to be encrypted.
+    let password: Option<String> = match password {
+        Some(p) => {
+            info!(target: "password", "using supplied archive password");
+            Some(p)
+        }
+        None => {
+            if let Some(p) = nzb.password() {
+                info!(target: "password", "NZB carries an archive password (meta)");
+                Some(p.to_string())
+            } else if let Some(p) = braces_password(nzb_path) {
+                info!(target: "password", "archive password taken from {{{{…}}}} in the NZB filename");
+                Some(p)
+            } else {
+                None
+            }
+        }
+    };
+
+    // Crash-resume journal: completed articles from a previous run of this
+    // exact NZB are already on disk - at final offsets in their own file
+    // (v1 lines) or at journal-recorded placements (direct-extracted
+    // spans), which the restore pass copies back into volume files now.
+    let (journal, resume_state) =
+        crate::persist::blocking_db(|| nzbkit::journal::Journal::open(out_dir, &xml))?;
+    let journal = Arc::new(journal);
+    // Plaintext-once (`D`) records re-encrypt through the password; with
+    // no password those articles refetch instead - never guessed.
+    let restored = crate::persist::blocking_db(|| {
+        nzbkit::journal::restore(out_dir, &resume_state, password.as_deref())
+    });
+    let mut completed = resume_state.completed;
+    if !restored.ids.is_empty() {
+        let moved: u64 = restored
+            .seeds
+            .iter()
+            .flat_map(|s| s.spans.iter().map(|&(_, l)| l))
+            .sum();
+        println!(
+            "resume: restored {} article(s) ({:.1} MB) from previous run's output files",
+            restored.ids.len(),
+            moved as f64 / 1e6
+        );
+        completed.extend(restored.ids.iter().cloned());
+    }
+    let resuming = !completed.is_empty();
+
+    // Eager set: everything except PAR2 recovery volumes (minimality layer 1).
+    // Par2-main segments go FIRST in the queue so the recovery set activates
+    // within the first round-trips and verification runs in-stream.
+    //
+    // Obfuscated posts often ship recovery volumes but no plain `.par2`
+    // index. The critical packets (Main/FileDesc/IFSC) are duplicated in
+    // every volume, so bootstrap the set from the smallest volume instead -
+    // its recovery slices also count toward any later repair.
+    let has_main = nzb.files.iter().any(|f| f.kind() == FileKind::Par2Main);
+    let bootstrap_vol: Option<usize> = if has_main {
+        None
+    } else {
+        nzb.files
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.kind() == FileKind::Par2Volume)
+            .min_by_key(|(_, f)| f.bytes())
+            .map(|(i, _)| i)
+    };
+    if let Some(bi) = bootstrap_vol {
+        println!(
+            "no main .par2 in NZB - bootstrapping set from smallest volume ({:.1} MB)",
+            nzb.files[bi].bytes() as f64 / 1e6
+        );
+    }
+    // Issue #14 on resume: a journal-completed head article never
+    // re-decodes, so the in-stream sniff cannot fire for it - but its
+    // bytes are on disk (restore() just wrote them), so classify restored
+    // slots by reading the first bytes of their files instead. Slots
+    // recognised here are deferred AT BUILD TIME (their unfetched
+    // articles never enter the queue) and never elected bootstrap: a
+    // resumed run settles and repairs from disk anyway, and an on-disk
+    // volume needs no capture.
+    let resume_vols: HashMap<usize, PathBuf> = crate::persist::blocking_db(|| {
+        restored
+            .seeds
+            .iter()
+            .filter(|s| s.spans.iter().any(|&(o, l)| o == 0 && l >= 8))
+            .filter_map(|s| {
+                use std::io::Read;
+                let p = out_dir.join(&s.name);
+                let mut buf = [0u8; 8];
+                (std::fs::File::open(&p)
+                    .and_then(|mut f| f.read_exact(&mut buf))
+                    .is_ok()
+                    && &buf == nzbkit::par2::MAGIC)
+                    .then_some((s.slot, p))
+            })
+            .collect()
+    });
+    Ok(Intake {
+        cfg_all,
+        nzb,
+        job_family,
+        job_posted,
+        password,
+        journal,
+        restored,
+        completed,
+        resuming,
+        has_main,
+        bootstrap_vol,
+        resume_vols,
+    })
+}
+
+/// The B4 small-RAM concurrency clamp and the rotational-output
+/// decoder pick. A clamp on the effective values, not a config
+/// rewrite - settings stay portable and apply in full on bigger
+/// hardware.
+pub(super) fn clamp_concurrency(
+    connections: usize,
+    window: usize,
+    decoders: usize,
+    out_dir: &Path,
+) -> (usize, usize, usize) {
+    // B4: on small-RAM boxes clamp job concurrency to the machine's tier
+    // - spill-churn on an HDD costs more than the connections buy, so
+    // consistency wins over peak. A clamp on the effective values, not a
+    // config rewrite: settings stay portable and apply in full on bigger
+    // hardware. Above 1 GB the caps are None and nothing changes.
+    let (connections, window, decoders) = match nzbkit::mem::concurrency_caps() {
+        Some(caps) => {
+            let clamped = caps.apply(connections, window, decoders);
+            if clamped != (connections, window, decoders) {
+                info!(
+                    target: "mem",
+                    "small-RAM machine: clamping to {} conns × window {} × {} decoders (was {connections}×{window}×{decoders})",
+                    clamped.0, clamped.1, clamped.2
+                );
+            }
+            clamped
+        }
+        None => (connections, window, decoders),
+    };
+    // Rotational output on a NAS-class box: one decoder, so the article
+    // lanes stop being seek lanes. See disk::decoders_for_storage for why
+    // it is gated on the box as well as the disk.
+    let decoders = {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let storage = nzbkit::disk::detect_storage(out_dir);
+        let picked = nzbkit::disk::decoders_for_storage(storage, cores, decoders);
+        if picked != decoders {
+            info!(
+                target: "disk",
+                "rotational output on a {cores}-core box: {picked} decoder \
+                 (was {decoders}) to keep writes in order - override with \
+                 NZBFAST_STORAGE=ssd"
+            );
+        }
+        picked
+    };
+    (connections, window, decoders)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nzb(xml: &str) -> Arc<Nzb> {
+        Arc::new(Nzb::parse(xml.as_bytes()).expect("test NZB parses"))
+    }
+
+    fn plan(
+        n: &Arc<Nzb>,
+        completed: &HashSet<String>,
+        bootstrap_vol: Option<usize>,
+        resume_vols: &HashMap<usize, PathBuf>,
+    ) -> FetchPlan {
+        build_fetch_plan(
+            n,
+            &None,
+            completed,
+            !completed.is_empty(),
+            bootstrap_vol,
+            resume_vols,
+        )
+    }
+
+    fn ids_of(p: &FetchPlan) -> Vec<&str> {
+        p.ids.iter().map(|r| r.id.as_str()).collect()
+    }
+
+    /// Queue order: the par2 main's articles first (the recovery set
+    /// activates in the first round-trips), then every file's head
+    /// segment (offset-0 carries the archive signature), then data.
+    #[test]
+    fn par2_main_then_heads_then_data() {
+        let n = nzb(r#"<?xml version="1.0"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+ <file subject='"m.part1.rar" yEnc (1/3)' date="1700000000">
+  <groups><group>alt.binaries.test</group></groups>
+  <segments>
+   <segment bytes="100" number="1">a@t</segment>
+   <segment bytes="200" number="2">b@t</segment>
+   <segment bytes="300" number="3">c@t</segment>
+  </segments>
+ </file>
+ <file subject='"m.par2" yEnc (1/2)' date="1700000000">
+  <groups><group>alt.binaries.test</group></groups>
+  <segments>
+   <segment bytes="50" number="1">p1@t</segment>
+   <segment bytes="60" number="2">p2@t</segment>
+  </segments>
+ </file>
+ <file subject='"m.part2.rar" yEnc (1/2)' date="1700000000">
+  <groups><group>alt.binaries.test</group></groups>
+  <segments>
+   <segment bytes="400" number="1">d@t</segment>
+   <segment bytes="500" number="2">e@t</segment>
+  </segments>
+ </file>
+</nzb>"#);
+        let p = plan(&n, &HashSet::new(), None, &HashMap::new());
+        assert_eq!(
+            ids_of(&p),
+            [
+                "<p1@t>", "<p2@t>", "<a@t>", "<d@t>", "<b@t>", "<c@t>", "<e@t>"
+            ]
+        );
+        assert_eq!(p.slot_file, [0, 1, 2]);
+        assert!(p.slots[1].is_par2_main);
+        assert!(
+            p.slots[1].capture.lock_ok().is_some(),
+            "par2 main captures in memory"
+        );
+        // Per-slot seek ladder: cumulative encoded offsets, empty for par2.
+        assert_eq!(
+            p.slot_arts[0].0,
+            vec![
+                (0, "<a@t>".to_string()),
+                (100, "<b@t>".to_string()),
+                (300, "<c@t>".to_string())
+            ]
+        );
+        assert_eq!(p.slot_arts[0].1, 600);
+        assert!(p.slot_arts[1].0.is_empty());
+        // Fresh run: nothing pre-credited on the progress counter.
+        assert_eq!(p.fetch_done.load(Ordering::Relaxed), 0);
+    }
+
+    /// A repeated message-id is fetched once, under its FIRST owner. The
+    /// same-file repeat only decrements remaining; the cross-file repeat
+    /// also counts as missing for the losing file.
+    #[test]
+    fn duplicate_ids_are_owned_once() {
+        let n = nzb(r#"<?xml version="1.0"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+ <file subject='"dup.part1.rar" yEnc (1/2)' date="1700000000">
+  <groups><group>alt.binaries.test</group></groups>
+  <segments>
+   <segment bytes="100" number="1">a@t</segment>
+   <segment bytes="150" number="2">a@t</segment>
+  </segments>
+ </file>
+ <file subject='"dup.part2.rar" yEnc (1/2)' date="1700000000">
+  <groups><group>alt.binaries.test</group></groups>
+  <segments>
+   <segment bytes="100" number="1">a@t</segment>
+   <segment bytes="200" number="2">b@t</segment>
+  </segments>
+ </file>
+</nzb>"#);
+        let p = plan(&n, &HashSet::new(), None, &HashMap::new());
+        assert_eq!(p.id_to_slot.len(), 2, "each id has exactly one owner");
+        assert_eq!(p.id_to_slot["<a@t>"].0, 0, "the first occurrence owns");
+        assert_eq!(
+            ids_of(&p),
+            ["<a@t>", "<b@t>"],
+            "a dup is never queued twice"
+        );
+        // Same-file repeat: covered by the one fetch, not damage.
+        assert_eq!(p.slots[0].remaining.load(Ordering::Relaxed), 1);
+        assert_eq!(p.slots[0].missing.load(Ordering::Relaxed), 0);
+        // Cross-file repeat: these bytes never reach THIS file.
+        assert_eq!(p.slots[1].remaining.load(Ordering::Relaxed), 1);
+        assert_eq!(p.slots[1].missing.load(Ordering::Relaxed), 1);
+        assert_eq!(p.slots[0].total_segments, 2);
+        assert_eq!(p.slots[1].total_segments, 2);
+    }
+
+    /// A parser-dropped segment (empty message-id) still counts toward
+    /// the total and starts out missing - it must not vanish from the
+    /// manifest and finish green zero-filled.
+    #[test]
+    fn parser_dropped_segments_start_missing() {
+        let n = nzb(r#"<?xml version="1.0"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+ <file subject='"gap.rar" yEnc (1/2)' date="1700000000">
+  <groups><group>alt.binaries.test</group></groups>
+  <segments>
+   <segment bytes="100" number="1"></segment>
+   <segment bytes="200" number="2">ok@t</segment>
+  </segments>
+ </file>
+</nzb>"#);
+        assert_eq!(n.files[0].dropped_segments, 1);
+        let p = plan(&n, &HashSet::new(), None, &HashMap::new());
+        assert_eq!(
+            p.slots[0].total_segments,
+            n.files[0].segments.len() + n.files[0].dropped_segments
+        );
+        assert_eq!(p.slots[0].missing.load(Ordering::Relaxed), 1);
+        assert_eq!(p.slots[0].remaining.load(Ordering::Relaxed), 1);
+        assert_eq!(ids_of(&p), ["<ok@t>"]);
+    }
+
+    /// Resume: journal-completed ids land in resume_have_bytes and stay
+    /// out of the queue; a resume-recognised recovery volume defers every
+    /// unfetched article; fetch_done is seeded with have + deferred.
+    #[test]
+    fn resume_credits_have_and_deferred_bytes() {
+        let n = nzb(r#"<?xml version="1.0"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+ <file subject='"r.part1.rar" yEnc (1/3)' date="1700000000">
+  <groups><group>alt.binaries.test</group></groups>
+  <segments>
+   <segment bytes="1000" number="1">a@t</segment>
+   <segment bytes="2000" number="2">b@t</segment>
+   <segment bytes="3000" number="3">c@t</segment>
+  </segments>
+ </file>
+ <file subject='"obfhash1" yEnc (1/2)' date="1700000000">
+  <groups><group>alt.binaries.test</group></groups>
+  <segments>
+   <segment bytes="500" number="1">d@t</segment>
+   <segment bytes="700" number="2">e@t</segment>
+  </segments>
+ </file>
+</nzb>"#);
+        let completed: HashSet<String> = ["<a@t>".to_string()].into();
+        let resume_vols: HashMap<usize, PathBuf> =
+            [(1usize, PathBuf::from("/nonexistent/vol"))].into();
+        let p = plan(&n, &completed, None, &resume_vols);
+        assert_eq!(p.resume_have_bytes, 1000);
+        assert_eq!(p.resume_deferred_arts, 2);
+        assert_eq!(p.resume_deferred_bytes, 1200);
+        assert_eq!(p.resume_sniffed_slots, [1]);
+        assert!(p.slots[1].par2_sniffed.load(Ordering::Relaxed));
+        assert_eq!(p.slots[1].deferred.load(Ordering::Relaxed), 2);
+        assert_eq!(p.slots[1].remaining.load(Ordering::Relaxed), 0);
+        // Only slot 0's unfetched data articles remain in the queue.
+        assert_eq!(ids_of(&p), ["<b@t>", "<c@t>"]);
+        assert_eq!(p.slots[0].remaining.load(Ordering::Relaxed), 2);
+        assert_eq!(p.fetch_done.load(Ordering::Relaxed), 1000 + 1200);
+        // Completed and deferred ids still have owners in the manifest.
+        assert_eq!(p.id_to_slot.len(), 5);
+    }
+
+    /// A Par2Volume gets a slot only as the elected bootstrap, so slot
+    /// indices diverge from NZB file indices and slot_file records the
+    /// mapping.
+    #[test]
+    fn only_the_elected_bootstrap_volume_gets_a_slot() {
+        let n = nzb(r#"<?xml version="1.0"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+ <file subject='"m.part1.rar" yEnc (1/1)' date="1700000000">
+  <groups><group>alt.binaries.test</group></groups>
+  <segments><segment bytes="100" number="1">a@t</segment></segments>
+ </file>
+ <file subject='"m.vol000+01.par2" yEnc (1/1)' date="1700000000">
+  <groups><group>alt.binaries.test</group></groups>
+  <segments><segment bytes="50" number="1">v1@t</segment></segments>
+ </file>
+ <file subject='"m.vol001+02.par2" yEnc (1/1)' date="1700000000">
+  <groups><group>alt.binaries.test</group></groups>
+  <segments><segment bytes="80" number="1">v2@t</segment></segments>
+ </file>
+</nzb>"#);
+        let p = plan(&n, &HashSet::new(), Some(1), &HashMap::new());
+        assert_eq!(p.slots.len(), 2, "the non-elected volume never gets a slot");
+        assert_eq!(
+            p.slot_file,
+            [0, 1],
+            "slot index maps back to NZB file index"
+        );
+        assert!(
+            p.slots[1].is_par2_main,
+            "the bootstrap is treated as par2 main"
+        );
+        assert_eq!(
+            ids_of(&p),
+            ["<v1@t>", "<a@t>"],
+            "bootstrap articles queue first"
+        );
+        // No election at all: both volumes are skipped.
+        let p = plan(&n, &HashSet::new(), None, &HashMap::new());
+        assert_eq!(p.slots.len(), 1);
+        assert_eq!(p.slot_file, [0]);
+    }
+
+    /// A subject with no quoted filename falls back to file{idx:03}.
+    #[test]
+    fn hint_falls_back_to_the_slot_index() {
+        let n = nzb(r#"<?xml version="1.0"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+ <file subject="no quotes anywhere yEnc (1/1)" date="1700000000">
+  <groups><group>alt.binaries.test</group></groups>
+  <segments><segment bytes="10" number="1">x@t</segment></segments>
+ </file>
+</nzb>"#);
+        let p = plan(&n, &HashSet::new(), None, &HashMap::new());
+        assert_eq!(p.slots[0].hint, "file000");
+    }
+}

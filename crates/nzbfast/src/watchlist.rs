@@ -216,6 +216,7 @@ pub struct InstantGrab {
 /// exists to avoid. Every title the parser can extract is a run of words
 /// from the name itself, so containment is a superset of the real test.
 #[derive(Debug, Clone, Default)]
+#[cfg(feature = "indexer")]
 pub struct InstantMatcher {
     /// (item id, normalised title) for every enabled item. `None` is a
     /// TITLELESS custom item, which matches on its category alone and so
@@ -223,6 +224,7 @@ pub struct InstantMatcher {
     titles: Vec<(u64, Option<String>)>,
 }
 
+#[cfg(feature = "indexer")]
 impl InstantMatcher {
     /// Compile the enabled items. Disabled ones are left out entirely -
     /// waking the pass for something it will not grab is pure cost. So
@@ -278,6 +280,7 @@ impl InstantMatcher {
 /// same rules, so a spent allowance costs the seconds, never the grab.
 /// That is why the window is trimmed rather than reset - a burst does not
 /// lock the path out for a full hour after it ends.
+#[cfg(feature = "indexer")]
 pub fn kick_allowed(recent: &mut std::collections::VecDeque<i64>, max: u32, now: i64) -> bool {
     if max == 0 {
         return true;
@@ -450,6 +453,7 @@ impl QualityPrefs {
 /// How much each satisfied preference is worth. Resolution outweighs the
 /// rest together, so "I want 4K" is not overturned by a 1080p release
 /// that happens to tick the other three.
+#[cfg(feature = "indexer")]
 fn pref_weight(field: PrefField) -> i64 {
     match field {
         // Strictly greater than HDR + audio + video (4 + 4 + 2).
@@ -460,6 +464,7 @@ fn pref_weight(field: PrefField) -> i64 {
     }
 }
 
+#[cfg(feature = "indexer")]
 enum PrefField {
     Res,
     Vcodec,
@@ -475,6 +480,7 @@ enum PrefField {
 /// This never HIDES anything: scene names omit tags all the time (plenty
 /// of Atmos releases never say "Atmos"), so a preference biases the order
 /// and nothing more. With no preference set it degrades to quality_rank.
+#[cfg(feature = "indexer")]
 pub fn preference_score(p: &Parsed, prefs: &QualityPrefs) -> i64 {
     // 10_000 clears the whole quality_rank range (max 5_960), so a
     // preference match can never be outvoted by raw quality.
@@ -485,10 +491,12 @@ pub fn preference_score(p: &Parsed, prefs: &QualityPrefs) -> i64 {
 /// field names ("res" / "vcodec" / "acodec" / "hdr"). The UI marks these
 /// so it is obvious WHY a release is at the top, rather than presenting
 /// an unexplained order.
+#[cfg(feature = "indexer")]
 pub fn preference_hits(p: &Parsed, prefs: &QualityPrefs) -> Vec<&'static str> {
     pref_matches(p, prefs).1
 }
 
+#[cfg(feature = "indexer")]
 fn pref_matches(p: &Parsed, prefs: &QualityPrefs) -> (i64, Vec<&'static str>) {
     let mut weight = 0;
     let mut hits = Vec::new();
@@ -1150,6 +1158,7 @@ mod tests {
     /// The encode tie-break orders releases that used to rank identically,
     /// without ever disturbing the resolution bands or the remux floor
     /// that `threshold_rank` depends on.
+    #[cfg(feature = "indexer")]
     #[test]
     fn encode_extras_break_ties_without_crossing_bands() {
         let r = |stem: &str| quality_rank(&parse_release(stem));
@@ -1168,6 +1177,7 @@ mod tests {
         assert!(r("Film.2024.2160p.BluRay.REMUX.x265.Atmos.DV-GRP") >= threshold_rank("remux"));
     }
 
+    #[cfg(feature = "indexer")]
     #[test]
     fn preference_puts_what_you_asked_for_first() {
         let prefs = QualityPrefs {
@@ -2220,6 +2230,7 @@ mod tests {
     /// The instant matcher's whole contract: it may over-accept, but it
     /// must NEVER reject a name the real `matches` would take - a false
     /// no is an arrival the watchlist never hears about.
+    #[cfg(feature = "indexer")]
     #[test]
     fn the_instant_matcher_never_rejects_what_matches_accepts() {
         let cats = f1_cats();
@@ -2270,6 +2281,7 @@ mod tests {
     /// A titleless BUILT-IN item matches nothing (`title_ok` rejects an
     /// empty want), so it must not be compiled in as "everything" - that
     /// would wake the pass for every post in every watched group.
+    #[cfg(feature = "indexer")]
     #[test]
     fn a_titleless_builtin_item_matches_nothing_instantly_either() {
         let blank = item("tv", "");
@@ -2284,6 +2296,7 @@ mod tests {
 
     /// Which item was hit is what the pass stamps its "instant" record
     /// against, so the ids have to come back, not just a yes.
+    #[cfg(feature = "indexer")]
     #[test]
     fn instant_hits_name_the_items_they_belong_to() {
         let items = vec![
@@ -2302,6 +2315,7 @@ mod tests {
     /// The instant path's hourly ceiling: it bounds PASSES, and a refused
     /// kick is a delay, never a lost grab. The window slides, so a burst
     /// does not lock the path out for an hour after it ends.
+    #[cfg(feature = "indexer")]
     #[test]
     fn the_instant_rate_limit_slides_rather_than_resetting() {
         let mut recent = std::collections::VecDeque::new();

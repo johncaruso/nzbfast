@@ -297,7 +297,12 @@ body:not(.noidx) .idxoff{display:none!important}
 .setupsteps .b{min-width:0}
 .setupsteps .t{font-weight:600;font-size:14px}
 .setupsteps li.done .t{color:var(--dim);font-weight:550}
-.setupsteps .h{display:block;color:var(--dim);font-size:12.5px;margin-top:2px;line-height:1.5}
+/* anywhere, not the default: step 2's hint is the download PATH, which is one
+   unbreakable token and is as long as the user's filesystem makes it. Measured
+   at 320px, /Users/.../downloads. rendered 289px in a 232px box and pushed the
+   document 31px wide. Same class as the site's `ul.plain` item (6b2274a6). */
+.setupsteps .h{display:block;color:var(--dim);font-size:12.5px;margin-top:2px;line-height:1.5;
+  overflow-wrap:anywhere}
 .setupsteps .act{margin-top:8px}
 .setupsteps .opt{font-size:11px;color:var(--dim);border:1px solid var(--line);border-radius:99px;
   padding:1px 7px;margin-inline-start:7px;font-weight:500;vertical-align:1px}
@@ -353,11 +358,17 @@ body.compact #dashview th,body.compact #dashview td,
 .filterbar{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:9px}
 .filterbar button{padding:2px 9px;font-size:11.5px;line-height:1.6;margin:0}
 .filterbar button.on{border-color:var(--acc);color:var(--acc)}
-.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
-.tile{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:13px 15px}
-.tile .k{color:var(--dim);font-size:12px;margin-bottom:5px}
-.tile .val{font-size:22px;font-weight:640;letter-spacing:-.01em}
-.tile .val small{font-size:13px;color:var(--dim);font-weight:400}
+/* One slim strip, not four boxes: the session stats are glanceable
+   numbers, and a full card each cost ~100px of the fold for three
+   short lines apiece. Baseline-aligned inline groups wrap on narrow
+   screens; the sub-line folds in after a separator. */
+.tiles{display:flex;flex-wrap:wrap;gap:4px 26px;align-items:baseline;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:9px 15px}
+.tile{display:flex;align-items:baseline;gap:7px}
+.tile .k{color:var(--dim);font-size:11.5px}
+.tile .val{font-size:17px;font-weight:640;letter-spacing:-.01em}
+.tile .val small{font-size:11.5px;color:var(--dim);font-weight:400}
+.tile .sub{color:var(--dim);font-size:11.5px}
+.tile .sub::before{content:"· "}
 /* Lanes stack full-width - each stage spans the card, like on a phone.
    The overlapping bars read better stacked than in side-by-side columns,
    so we pin one column at every width instead of auto-fitting. */
@@ -371,7 +382,12 @@ body.compact #dashview th,body.compact #dashview td,
 .lane.verify .bar i{background:var(--ok)}.lane.extract .bar i{background:var(--acc2)}
 .lane .note{color:var(--dim);font-variant-numeric:tabular-nums}
 /* Provider rows flow into columns so the card stays wide, not tall. */
-#servers{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));column-gap:26px}
+/* min(320px,100%), not a bare 320px: a bare minmax floor holds a 320px track
+   open inside a 272px phone column and pushes the document, which is exactly
+   what four of the site's grids did before 6b2274a6. Only visible with a server
+   configured - the card is hidden on a server-less daemon, so no live sweep of
+   a fresh install can see it. tools/overflow-gate.py R3 catches it statically. */
+#servers{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(320px,100%),1fr));column-gap:26px}
 .srv{display:grid;grid-template-columns:auto auto 1fr;gap:2px 12px;align-items:center;
   font-size:12.5px;padding:7px 0;border-top:1px solid var(--line)}
 .srv .host{grid-column:1/-1}
@@ -1021,6 +1037,9 @@ body.chipcolor-shape .qbadge.shape.t-mid{color:var(--acc);border-color:color-mix
 input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--warn) 8%,var(--surface-2))}
 .rulewarn{grid-column:1/-1;font-size:11.5px;line-height:1.45;color:var(--warn);margin:-2px 0 4px}
 .catrow{display:grid;grid-template-columns:130px 1fr 1fr 130px 36px;gap:8px;margin:6px 0;align-items:center}
+/* #19: category | folder (+ browse) | remove, with the validation line
+   spanning the row like .fhealth does. */
+.catfilerow{display:grid;grid-template-columns:180px 1fr 36px;gap:8px;margin:6px 0;align-items:center}
 /* Opt-in indexing rows: a tick, the plain-language interest, and the
    newsgroups it actually scans underneath it. */
 .wantrow{display:flex;gap:9px;align-items:flex-start;margin:7px 0;cursor:pointer}
@@ -1035,7 +1054,7 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
 .notifyrow .nbody{grid-column:1/-1;margin:-2px 0 4px}
 /* Phone: one column, so the control drops below its own explanation
    rather than hunting for a right-hand gutter that is no longer there. */
-@media(max-width:720px){.set .row{grid-template-columns:1fr}.set .row>label,.set .row>.hint{grid-area:auto;max-width:none}.set .row>*:not(label):not(.hint){grid-area:auto;justify-self:start;margin-top:3px}.schedrow{grid-template-columns:1fr 1fr}.feedrow{grid-template-columns:1fr 1fr}.smartrow{grid-template-columns:1fr 1fr}.wlrow{grid-template-columns:1fr 1fr}.notifyrow{grid-template-columns:1fr 1fr}.arrrow{grid-template-columns:1fr 1fr}.catrow{grid-template-columns:1fr 1fr}.idxrow{grid-template-columns:1fr 1fr}}
+@media(max-width:720px){.set .row{grid-template-columns:1fr}.set .row>label,.set .row>.hint{grid-area:auto;max-width:none}.set .row>*:not(label):not(.hint){grid-area:auto;justify-self:start;margin-top:3px}.schedrow{grid-template-columns:1fr 1fr}.feedrow{grid-template-columns:1fr 1fr}.smartrow{grid-template-columns:1fr 1fr}.wlrow{grid-template-columns:1fr 1fr}.notifyrow{grid-template-columns:1fr 1fr}.arrrow{grid-template-columns:1fr 1fr}.catrow{grid-template-columns:1fr 1fr}.catfilerow{grid-template-columns:1fr 1fr}.idxrow{grid-template-columns:1fr 1fr}}
 
 /* ================= phone + touch layer - purely additive ================= */
 /* Tap targets ≥44px on touch screens (and in any phone-width window). */
@@ -1216,6 +1235,15 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     </div>
     <div class="chartwrap"><canvas id="speedChart"></canvas></div>
   </div>
+  <!-- Marker key for the event ticks on the trace. Hidden until the
+       first event exists, so a quiet daemon keeps a clean card. -->
+  <div id="evLegend" class="dim" style="display:none;font-size:10px;margin-top:4px;text-align:right"
+       data-i18n-title="ev.leg.title" title="Ticks on the chart mark moments that shaped the speed line - hover the chart for what happened in plain words">
+    <span style="color:var(--bad)">●</span> <span data-i18n="ev.leg.fault">fault</span>&ensp;
+    <span style="color:var(--ok)">●</span> <span data-i18n="ev.leg.recovery">recovery</span>&ensp;
+    <span style="color:var(--acc2)">●</span> <span data-i18n="ev.leg.phase">phase</span>&ensp;
+    <span style="color:var(--acc)">●</span> <span data-i18n="ev.leg.user">your action</span>
+  </div>
   <div class="chartwrap" style="height:50px;margin-top:10px;display:none"><canvas id="histChart" data-i18n-title="hero.hist.title2" title="How this session's speed samples distribute - height is time spent at that speed, left is slow, right is peak"></canvas></div>
   <div id="active" style="margin-top:12px"></div>
 </div>
@@ -1246,6 +1274,15 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
 
 <div class="card" id="queueCard">
   <h3 data-i18n="queue.title">Queue <span class="dim mono" id="qcount"></span>
+<!-- Placed and styled like History's #histClear, and first among the
+     floats so it lands at the same edge of the same header; the
+     free-space readout keeps its place just inside it. Hidden while
+     the queue is empty, for the same reason that one is: a button
+     whose whole job is already done is noise. -->
+<button class="ghost" id="qClear" style="float:inline-end;margin-top:-4px;margin-inline-start:10px;display:none"
+  onclick="clearQueue(this)" data-i18n-title="queue.clear.title"
+  title="Remove every download from the queue. Nothing is deleted from disk."
+  data-i18n="queue.clear">Clear queue</button>
 <span class="dim mono" id="qfree" style="float:inline-end;text-transform:none;letter-spacing:0;font-weight:400"></span>
 </h3>
 <!-- Visible add affordances. Drag-drop and body-paste still work, but
@@ -1589,6 +1626,8 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <input type="checkbox" id="s_auto_prefetch" onchange="setCfg('auto_prefetch',this.checked?1:0)"></div>
   <div class="row"><label data-i18n="set.speed.race">Race slow articles<span class="hint" data-i18n="set.speed.race.hint">near the end of a download, idle connections fetch the last slow articles a second time and the first copy wins; a connection running far below its siblings is reconnected. Finishes jobs sooner for a fraction of a percent of extra traffic</span></label>
     <input type="checkbox" id="s_race_stragglers" onchange="setCfg('race_stragglers',this.checked?1:0)"></div>
+  <div class="row"><label data-i18n="set.speed.adaptive">Adaptive connection timeouts<span class="hint" data-i18n="set.speed.adaptive.hint">a connection that goes quiet is cut in seconds instead of half a minute, judged against that server's usual response time; a slow but alive transfer is never cut. In fault tests it cleared dead-air stalls about 4x sooner, helped further when a whole server went mute, and dropped nothing on a spiky but healthy link</span></label>
+    <input type="checkbox" id="s_adaptive_timeouts" onchange="setCfg('adaptive_timeouts',this.checked?1:0)"></div>
   <div class="row"><label data-i18n="set.speed.posthealth">Check posts before downloading<span class="hint" data-i18n="set.speed.posthealth.hint">while nothing is downloading, ask every server about a few of each queued post's articles and mark the row with the answer: a post your providers no longer carry is worth knowing about before the bandwidth is spent, not at 97%. Costs a few dozen tiny requests per job</span></label>
     <input type="checkbox" id="s_post_health" onchange="setCfg('post_health',this.checked?1:0)"></div>
   <div class="row" data-adv="1"><label data-i18n="set.speed.posthealthdefer">Healthy-looking posts start first<span class="hint" data-i18n="set.speed.posthealthdefer.hint">a job whose check came back bad waits behind items of the same priority that checked out better. It only changes the ORDER: nothing is removed, paused or failed, and forcing a job or raising its priority overrides it. Off by default, because a post uploaded moments ago is missing everywhere too</span></label>
@@ -1640,10 +1679,12 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <div class="pathrow"><input class="txt" id="s_out_dir" onchange="setCfg('out_dir',this.value)"><button class="mini" onclick="browseDir('out_dir','dir')" data-i18n-title="btn.browse.title" title="Browse for a folder - including other drives" data-i18n="btn.browse">Browse…</button><button class="mini" onclick="openDir('out_dir')" data-i18n-title="btn.openfolder.title" title="Open this folder" aria-label="Open this folder">📂</button></div></div>
   <div class="row"><label data-i18n="set.disk.move">Move completed to<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.disk.move.hint">after unpack and renaming, finished downloads move here - a NAS share, media drive etc. Category subfolders are kept. Empty = leave them in the download folder. If the destination is unreachable the files stay put</span></label>
     <div class="pathrow"><input class="txt" id="s_move_completed" data-i18n-placeholder="set.disk.move.ph" placeholder="e.g. /Volumes/Media - empty = off" onchange="setCfg('move_completed',this.value)"><button class="mini" onclick="browseDir('move_completed','dir')" data-i18n-title="btn.browse.title" title="Browse for a folder - including other drives" data-i18n="btn.browse">Browse…</button><button class="mini" onclick="openDir('move_completed')" data-i18n-title="btn.openfolder.title" title="Open this folder" aria-label="Open this folder">📂</button></div></div>
-  <div class="row"><label data-i18n="set.disk.cats">Categories<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.disk.cats.hint">the categories offered to Sonarr, Radarr and other clients, and the subfolder each one downloads into. tv, movies, music and books are always available; add any others your apps are set to use - a client whose category is missing here refuses to connect</span></label>
-    <input class="txt" id="s_categories" data-i18n-placeholder="set.disk.cats.ph" placeholder="tv, movies, music, books" onchange="setCfg('categories',this.value)"></div>
-  <div class="row"><label data-i18n="set.disk.movecats">Per-category destinations<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.disk.movecats.hint">override where specific categories land, e.g. tv=/Volumes/NAS/TV, movies=/Volumes/NAS/Movies. The path IS that category's folder. Other categories follow the setting above; empty = no overrides</span></label>
-    <input class="txt" id="s_move_completed_cats" data-i18n-placeholder="set.disk.movecats.ph" placeholder="tv=/Volumes/NAS/TV, movies=/Volumes/NAS/Movies" onchange="setCfg('move_completed_cats',this.value)"></div>
+  <div class="row" style="grid-template-columns:1fr"><label data-i18n="set.disk.cats">Categories<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.disk.cats.hint">the categories offered to Sonarr, Radarr and other clients, and where each one's finished downloads go. tv, movies, music and books are always available; add any others your apps are set to use - a client whose category is missing here refuses to connect. Leave a folder blank and that category lands in its own subfolder of the download root, which is what most setups want. Rows are listed alphabetically, and a category an app sends that is not here yet adds itself</span></label></div>
+  <div id="catfilerows"></div>
+  <div class="savebar">
+    <button class="ghost" onclick="addCatFileRow()" data-i18n="set.disk.cats.add">+ Add category</button>
+    <button onclick="saveCatFiles(this)" data-i18n="set.disk.cats.apply">Apply categories</button>
+  </div>
   <div class="row" data-adv="1"><label data-i18n="set.disk.outperm">Permissions on finished downloads<span class="badge next" data-i18n="badge.next">applies from the next download</span><span class="hint" data-i18n="set.disk.outperm.hint">a umask, the same number Docker and the setup guides use: 002 gives folders 775 and files 664, 022 gives 755 and 644. Leave it empty and nzbfast changes nothing, which is what it has always done. Set it when Sonarr or Radarr run as a different user in the same group and cannot read or import what lands here - on a systemd install they usually cannot, because the unit keeps everything the daemon writes owner-only to protect the API key. Ignored on Windows, which has no such thing</span></label>
     <input class="txt sm" id="s_out_umask" data-i18n-placeholder="set.disk.outperm.ph" placeholder="off" onchange="setCfg('out_umask',this.value)"></div>
   <div class="row"><label data-i18n="set.disk.minfree">Minimum free space<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.disk.minfree.hint">pause new jobs below this, e.g. 25G. Defaults to 2G so the disk never fills completely; 0 = off</span></label>
@@ -3248,6 +3289,10 @@ function drawSpeed(frac=0){
     ctx.fillText(`${fmtRate(speedHist[speedHist.length-1]||0)} · ${t('chart.peak','peak')} `
       +fmtRate(Math.max(...speedHist.slice(s0))), w-4, 10);
     ctx.textAlign='left';
+    // The markers still draw at this height - they are the part of the
+    // chart that explains the line, and a condensed hero card is not a
+    // reason to lose the explanation. Only the watermark rules go.
+    drawEventMarks(m);
     return;
   }
   if(det==='rich'){
@@ -3278,16 +3323,38 @@ function drawSpeed(frac=0){
   ctx.setLineDash([]);
   drawEventMarks(m);
 }
-// What each kind of event looks like on the graph. Deliberately three
-// different colours: the whole value of the overlay is telling a network
-// cause apart from a write-side one at a glance, so they must not share
-// a swatch. --bad/--warn are legitimate here - these ARE faults - and
-// --acc2 carries the write-side case, which is congestion rather than a
-// failure and should not be dressed as one.
+// What each kind of event looks like on the graph. Colour now names the
+// severity CLASS, not the kind - the taxonomy outgrew one-colour-per-kind
+// when it went from three kinds to twenty. Red says something denied
+// throughput, green says the system was winning it back, slate marks an
+// expected phase boundary (the biggest clarity win: the natural
+// end-of-job taper used to read as a fault), accent marks the user's own
+// hand. The per-kind distinction the first three colours carried
+// (network vs write side) moved into the hover text, which names the
+// kind and quotes the detail sentence.
+const EVENT_CLASS={fault:'--bad',recovery:'--ok',phase:'--acc2',user:'--acc'};
 const EVENT_STYLE = {
-  reconnect: {css:'--bad',  label:()=>t('ev.reconnect','reconnected')},
-  cap:       {css:'--warn', label:()=>t('ev.cap','connection cap')},
-  blocked:   {css:'--acc2', label:()=>t('ev.blocked','waiting on the write side')},
+  reconnect: {cls:'fault',    label:()=>t('ev.reconnect','reconnected')},
+  cap:       {cls:'fault',    label:()=>t('ev.cap','connection cap')},
+  blocked:   {cls:'fault',    label:()=>t('ev.blocked','waiting on the write side')},
+  retired:   {cls:'fault',    label:()=>t('ev.retired','server out of the run')},
+  missing:   {cls:'fault',    label:()=>t('ev.missing','articles missing')},
+  timeout:   {cls:'fault',    label:()=>t('ev.timeout','response timed out')},
+  wire:      {cls:'fault',    label:()=>t('ev.wire','memory ceiling reached')},
+  disk:      {cls:'fault',    label:()=>t('ev.disk','low disk space')},
+  quota:     {cls:'fault',    label:()=>t('ev.quota','quota spent')},
+  late:      {cls:'fault',    label:()=>t('ev.late','slow to start')},
+  racing:    {cls:'recovery', label:()=>t('ev.racing','racing slow articles')},
+  sidecar:   {cls:'recovery', label:()=>t('ev.sidecar','early start')},
+  clear:     {cls:'recovery', label:()=>t('ev.clear','guards cleared')},
+  tail:      {cls:'phase',    label:()=>t('ev.tail','queue dry')},
+  drained:   {cls:'phase',    label:()=>t('ev.drained','all data in')},
+  settle:    {cls:'phase',    label:()=>t('ev.settle','checking files')},
+  finished:  {cls:'phase',    label:()=>t('ev.finished','finished')},
+  indexer:   {cls:'phase',    label:()=>t('ev.indexer','indexing yields')},
+  pause:     {cls:'user',     label:()=>t('ev.pause','paused')},
+  resume:    {cls:'user',     label:()=>t('ev.resume','resumed')},
+  limit:     {cls:'user',     label:()=>t('ev.limit','speed limit')},
 };
 // Lay the pool's events over the throughput trace at the moment they
 // happened. A dip with a red tick under it is a provider dropping
@@ -3301,19 +3368,44 @@ function drawEventMarks(m){
   // One sample's worth of slack at each end so an event that landed
   // between two polls still lands on the chart rather than vanishing.
   const slack=(t1-t0)/Math.max(1,sampleT.length-1);
-  ctx.save();
-  poolEvents.forEach(e=>{
-    if(e.at_ms<t0-slack || e.at_ms>t1+slack) return;
-    // Nearest sample by time, not by index arithmetic: polls are not
-    // evenly spaced (API latency jitters them), so interpolating on
-    // index would slide markers away from the dip they explain.
+  // Nearest sample by time, not by index arithmetic: polls are not
+  // evenly spaced (API latency jitters them), so interpolating on
+  // index would slide markers away from the dip they explain.
+  const nearestX=ms=>{
     let best=s0, bd=Infinity;
     for(let i=s0;i<sampleT.length;i++){
-      const d=Math.abs(sampleT[i]-e.at_ms);
+      const d=Math.abs(sampleT[i]-ms);
       if(d<bd){ bd=d; best=i; }
     }
+    return x(best);
+  };
+  ctx.save();
+  // Phase shading FIRST, under the tick lines: the stretch from a phase
+  // boundary to whatever ends it is tinted, so the whole tail or
+  // checking period reads as one deliberate region rather than a
+  // mystery sag. The tail runs to the drain (or the settle marker, when
+  // the drain fell between polls); the checking phase runs until the
+  // next queue-dry latch (the next job) or the live right edge.
+  const asc=poolEvents.slice().sort((a,b)=>a.at_ms-b.at_ms);
+  const rightX=x(sampleT.length-1);
+  asc.forEach(p=>{
+    if(p.kind!=='tail' && p.kind!=='settle') return;
+    if(p.at_ms>t1+slack) return;
+    const enders=p.kind==='tail'?['drained','settle']:['tail','finished'];
+    const end=asc.find(e=>e.at_ms>p.at_ms && enders.includes(e.kind));
+    const endMs=end?end.at_ms:t1+slack;
+    if(endMs<t0-slack) return;
+    const x1=p.at_ms<t0?0:nearestX(p.at_ms);
+    const x2=end?nearestX(endMs):rightX;
+    if(x2<=x1) return;
+    ctx.globalAlpha=.07; ctx.fillStyle=css(EVENT_CLASS.phase);
+    ctx.fillRect(x1,0,x2-x1,h);
+  });
+  ctx.globalAlpha=1;
+  poolEvents.forEach(e=>{
+    if(e.at_ms<t0-slack || e.at_ms>t1+slack) return;
     const st=EVENT_STYLE[e.kind]; if(!st) return;
-    const col=css(st.css), px=x(best);
+    const col=css(EVENT_CLASS[st.cls]||'--dim'), px=nearestX(e.at_ms);
     ctx.globalAlpha=.55; ctx.strokeStyle=col; ctx.lineWidth=1;
     ctx.beginPath(); ctx.moveTo(px,0); ctx.lineTo(px,h); ctx.stroke();
     ctx.globalAlpha=1; ctx.fillStyle=col;
@@ -4758,7 +4850,7 @@ function pipeline(s,mbps,queued,done,failed){
     // Any damage at all caps the figure just short of whole.
     health!=null?[t('tile.verify','Verify health'), num(s.verify.blocks_bad?Math.min(health,99.99):health,health>=100?0:2)+'<small>%</small>', (s.verify.blocks_bad?t('tile.badblocks','{n} bad blocks',{n:s.verify.blocks_bad}):t('tile.clean','clean'))]
       :[t('tile.peak','Peak speed'), fmtRate(Math.max(...speedHist,0)), t('tile.sessionmax','session max')],
-  ].map(([k,val,sub])=>`<div class="tile"><div class="k">${k}</div><div class="val">${val}</div><div class="k" style="margin:4px 0 0">${sub}</div></div>`).join(''));
+  ].map(([k,val,sub])=>`<div class="tile"><span class="k">${k}</span><span class="val">${val}</span><span class="sub">${sub}</span></div>`).join(''));
 
   // Host resources: CPU / RAM / disk / net on one chart. Net rides the
   // aggregate MB/s already computed; the rest come from the host block.
@@ -4798,11 +4890,20 @@ function pipeline(s,mbps,queued,done,failed){
 
   // Providers: live rate, utilization, share.
   const provc=document.getElementById('provcard'), servers=s.servers||[];
-  // The daemon's event ring. Replaced wholesale rather than merged: it
-  // IS the daemon's window, so a run that ends and clears it should
-  // clear the markers too instead of leaving last job's ticks hanging
-  // over this job's trace.
+  // The daemon's event list (its own ring merged with the running
+  // pool's). Replaced wholesale rather than merged client-side: it IS
+  // the daemon's window, so a run that ends and clears the pool half
+  // clears those markers too instead of leaving last job's ticks
+  // hanging over this job's trace - while daemon-owned moments (pauses,
+  // guard holds, late picks) persist across jobs by design.
   poolEvents=(s.events||[]).filter(e=>e && e.at_ms);
+  // The marker key appears with the first marker and then stays: a
+  // toggle that tracked the visible window would blink as old events
+  // scrolled off, which reads as the page glitching.
+  if(poolEvents.length){
+    const lg=document.getElementById('evLegend');
+    if(lg && lg.style.display==='none') lg.style.display='';
+  }
   // §G: refusals kept by the daemon past the pool that saw them. The
   // live list above is empty whenever nothing is downloading, which used
   // to take this card - and the only sentence saying a provider had
@@ -4868,7 +4969,14 @@ function pipeline(s,mbps,queued,done,failed){
     setHtml('servers',provOrder.filter(h=>byHost[h]).map(h=>{
       const sv=byHost[h];
       const r=rates[sv.host]||0, share=agg>0?100*r/agg:0, col=PC[hostOrder.indexOf(sv.host)%PC.length];
-      const util=sv.budget?Math.round(100*sv.connected/sv.budget):0;
+      // The settings model (TODO 112): the server's configured
+      // `connections` is a FACT about the account - the most the
+      // provider offers, entered by the user, never written by any
+      // automation. The number IN USE right now is runtime state
+      // (ramp, tuner verdicts, capacity yields, flap clamps), so the
+      // row reads "using M of N": M = live sockets, N = the account
+      // fact. Falls back to the job budget until get_config lands.
+      const mx=srvMax[sv.host]||sv.budget;
       // Lifetime article completion (reliability ledger), dim; colored
       // only once it drops below the warn/bad thresholds.
       const c=sv.completion_pct;
@@ -4929,7 +5037,7 @@ function pipeline(s,mbps,queued,done,failed){
         <span class="host" title="${escA(sv.host)}"><span class="sw" aria-hidden="true" style="background:${col}"></span>${esc(sv.host.replace(/^(news|reader)\./,''))}</span>
         <span>${sv.idle
           ? `<span class="util">${t('prov.willuse','up to {n} connections next download',{n:sv.budget})}${tuned}</span>`
-          : `<span class="rate">${fmtRate(r)}</span><br><span class="util">${sv.connected}/${sv.budget} ${t('prov.conns','conns')} · ${util}%${comp}${tuned}${stat}${drops}${held}</span>`}</span>
+          : `<span class="rate">${fmtRate(r)}</span><br><span class="util"><span title="${escA(t('prov.using.title','{m} connections in use right now. {n} is the most your provider account allows, set per server in Settings. The number in use varies during a download.',{m:sv.connected,n:mx}))}">${t('prov.using','using {m} of {n}',{m:sv.connected,n:mx})}</span>${comp}${tuned}${stat}${drops}${held}</span>`}</span>
         <span class="mono dim">${share.toFixed(0)}%</span>
         <span class="gb">${gb(sv.bytes)} ${unit('GB')}</span>${detail}</div>`;
     }).join(''));
@@ -5157,6 +5265,11 @@ function renderQueue(){
   // only speaks for its own job. Above the drag guard: numbers keep
   // moving even while a row is mid-drag.
   const freeGB=parseFloat(lastQ&&lastQ.diskspace1)||0;
+  // Same rule as History's clear button: it appears only when it has
+  // work to do. Above the drag guard with the numbers - a row leaving
+  // mid-drag must not leave a button offering to clear nothing.
+  const qc=document.getElementById('qClear');
+  if(qc) qc.style.display=slots.length?'':'none';
   const qf=document.getElementById('qfree');
   if(qf){
     qf.textContent=lastQ?t('queue.free','{gb} GB free',{gb:freeGB.toFixed(1)}):'';
@@ -6246,6 +6359,37 @@ async function stopJob(id){
   await qOp('delete', id);
   toast(t('toast.stopped','Download stopped.'));
 }
+// History's "Clear completed", for the queue - and a blunter thing than
+// that one, because what it discards has not finished. So it says the
+// whole consequence before it acts, and it says the surprising half
+// first: "the queue" as the user sees it includes the row on the wire
+// and the one being repaired or unpacked, and those stop too.
+//
+// It is the SAME delete the per-row ✕ calls (`value=all` is the
+// daemon's own wildcard, already honoured by that arm), which is what
+// makes the promise in the confirm true rather than aspirational: no
+// del_files, so nothing on disk is touched, and every trash-aware
+// nicety of that path - the deferred removal, the kept-files notice -
+// is inherited rather than reimplemented beside it.
+//
+// The daemon picks the rows, not this list. Posting the ids the page
+// happens to be holding would silently spare anything queued between
+// paint and click (a watchlist grab, an *arr push, a drop) and leave
+// the user reading "cleared" over a queue with rows still in it.
+async function clearQueue(btn){
+  const slots=(lastQ&&lastQ.slots)||[];
+  if(!slots.length) return;
+  const busyRow=slots.some(s=>s.status==='Downloading'||isTail(s));
+  if(!confirm((busyRow?t('confirm.qclear.active','This stops the download in progress, and anything still repairing or unpacking.')+'\n\n':'')
+      +t('confirm.qclear','Remove everything from the queue?\n\nNo files are deleted: whatever has already arrived stays on disk, and adding the same NZB again picks up from there - but that needs your own copy of the .nzb file, because the queue\'s copy goes with the row.\n\nNothing is filed to history, and this cannot be undone.'))) return;
+  await busy(btn, t('busy.clearing','Clearing…'), async()=>{
+    const j=await api('queue','&name=delete&value=all');
+    // Counted from the daemon's own sweep, and worded without a plural
+    // noun so one string covers 0, 1 and 20 in every locale.
+    toast(t('toast.qCleared','Removed {n} from the queue.',{n:num(j.removed||0,0)}));
+    tick();
+  });
+}
 async function forceJob(id){
   const j=await api('queue',`&name=priority&value=${id}&value2=2`);
   // ⏫ promises "starts even while paused", and priority alone does not
@@ -6474,14 +6618,19 @@ const FS_TITLES=()=>({out_dir:t('fs.t.out','Choose the download folder'),watch:t
 function fsClose(){ document.getElementById('fsov').classList.remove('on');
   modalClose(document.getElementById('fsmodal')); }
 function fsUp(){ if(fsCtx.parent) fsGo(fsCtx.parent); }
+// `key` is a SETTING name (the field is `s_<key>` and the pick is saved
+// immediately), or an <input> element for a row in a table, where there
+// is no single id and the value is applied by that table's own Apply.
+// #19 needed the second form: one per-row folder button per category.
 async function browseDir(key,mode){
-  fsCtx={key,mode:mode||'dir',path:'',parent:null};
-  document.getElementById('fstitle').textContent=FS_TITLES()[key]||t('fs.title','Choose a folder');
+  const el = typeof key==='string' ? document.getElementById('s_'+key) : key;
+  fsCtx={key:typeof key==='string'?key:null, el, mode:mode||'dir', path:'', parent:null};
+  document.getElementById('fstitle').textContent=
+    (typeof key==='string'&&FS_TITLES()[key])||t('fs.title','Choose a folder');
   document.getElementById('fschoose').style.display=fsCtx.mode==='file'?'none':'';
   document.getElementById('fsov').classList.add('on');
   modalOpen(document.getElementById('fsmodal'));
-  const cur=(document.getElementById('s_'+key)||{}).value||'';
-  await fsGo(cur);
+  await fsGo((el||{}).value||'');
 }
 // Join a directory with a child name using the OS separator we can infer
 // from the current path (so Windows backslash paths stay backslash).
@@ -6521,9 +6670,11 @@ async function fsNewFolder(){
   else toast(tErr(j.error)||t('toast.mkdirfail','Could not create that folder.'),true);
 }
 function fsApply(path){
-  const el=document.getElementById('s_'+fsCtx.key);
+  const el=fsCtx.el||document.getElementById('s_'+fsCtx.key);
   if(el) el.value=path;
-  setCfg(fsCtx.key,path);
+  // A row in a table has no setting of its own - its Apply writes the
+  // whole list - so only the keyed form saves here.
+  if(fsCtx.key) setCfg(fsCtx.key,path);
   fsClose();
   toast(t('toast.setto','Set to {p}',{p:path}));
 }
@@ -7596,9 +7747,12 @@ function eventsNearSample(i){
   if(!near.length) return '';
   return '<br>'+near.map(e=>{
     const st=EVENT_STYLE[e.kind];
+    // Run-level events (phase boundaries, user actions, guard pauses)
+    // carry no host on purpose - they belong to the whole daemon.
     const host=esc((e.host||'').replace(/^(news|reader)\./,''));
     const what=st?esc(st.label()):esc(e.kind);
-    return `<span style="color:${st?css(st.css):'inherit'}">●</span> ${host} · ${what}`
+    const col=st?css(EVENT_CLASS[st.cls]||'--dim'):'inherit';
+    return `<span style="color:${col}">●</span> ${host?host+' · ':''}${what}`
       +(e.detail?`<br><span class="dim" style="font-size:11px">${esc(e.detail)}</span>`:'');
   }).join('<br>');
 }
@@ -8309,11 +8463,18 @@ let inSettings=false, srvList=[], srvEditIdx=-1, srvTuned={}, srvAutoConn=false;
 // server's own configured count. The Providers card needs it to say
 // "auto-tuned from 24" instead of an unexplained "6/6".
 let srvAsked={};
+// host → the server's own configured connection count, untouched by the
+// global setting: the provider-account fact the "using M of N" row
+// reports as N.
+let srvMax={};
 function noteServerConfig(c){
   srvList=c.servers||[]; srvTuned=c.conntune||{}; srvAutoConn=!!c.auto_connections;
   const g=+c.connections||0;
-  srvAsked={};
-  for(const s of srvList) srvAsked[s.host]=Math.min(g||s.connections||0, s.connections||0)||0;
+  srvAsked={}; srvMax={};
+  for(const s of srvList){
+    srvAsked[s.host]=Math.min(g||s.connections||0, s.connections||0)||0;
+    srvMax[s.host]=+s.connections||0;
+  }
 }
 // Switch between the two views this page owns. Takes an explicit
 // destination rather than toggling, so the same call always lands in the
@@ -8852,6 +9013,8 @@ async function loadSettings(){
   if(document.activeElement!==apf) apf.checked=!!c.auto_prefetch;
   const rsg=document.getElementById('s_race_stragglers');
   if(rsg&&document.activeElement!==rsg) rsg.checked=!!c.race_stragglers;
+  const adt=document.getElementById('s_adaptive_timeouts');
+  if(adt&&document.activeElement!==adt) adt.checked=!!c.adaptive_timeouts;
   const orr=document.getElementById('s_oracle_route');
   if(orr&&document.activeElement!==orr) orr.checked=!!c.oracle_route;
   put('s_oracle_sample', c.oracle_sample??300);
@@ -8892,7 +9055,7 @@ async function loadSettings(){
   const peu=document.getElementById('s_prefer_external_unrar');
   if(document.activeElement!==peu) peu.checked=c.prefer_external_unrar===true||c.prefer_external_unrar===1;
   put('s_mem_limit', sizeStr(c.mem_limit));
-  put('s_out_dir', c.out_dir); put('s_move_completed', c.move_completed||''); put('s_categories', c.categories||''); put('s_move_completed_cats', c.move_completed_cats||''); put('s_out_umask', c.out_umask||''); put('s_min_free', sizeStr(c.min_free)); put('s_quota', sizeStr(c.quota));
+  put('s_out_dir', c.out_dir); put('s_move_completed', c.move_completed||''); renderCatFiles(c.categories||'', c.move_completed_cats||''); put('s_out_umask', c.out_umask||''); put('s_min_free', sizeStr(c.min_free)); put('s_quota', sizeStr(c.quota));
   put('s_quota_period', c.quota_period||'d');
   put('s_nested_max_depth', c.nested_max_depth??5);
   put('s_watch', c.watch); put('s_script', c.script);
@@ -9282,6 +9445,96 @@ function ruleWarnRow(r){
 }
 const patCls = v => v ? ' patbad' : '';
 
+// #19: the filing categories as a table, one row per category, instead
+// of two hand-synced comma strings ("tv, movies" in one field and
+// "tv=/NAS/TV, movies=/NAS/Movies" in another, with nothing pairing them
+// visually). Storage is unchanged: the rows serialise straight back into
+// the same two settings, exactly as saveCats does for custom_categories.
+//
+// No drag handle, deliberately, unlike SAB's version of this table.
+// There, row order IS match precedence; here `Daemon::cats` is a
+// BTreeSet rendered alphabetically, so rows would re-sort themselves the
+// moment they were saved. A handle that did not survive Apply would be a
+// lie about what the setting can hold, so the card says the order is
+// alphabetical instead of implying it is yours to choose.
+// The four the daemon floors the list with. `apply_setting`'s categories
+// arm seeds every save from DEFAULT_CATS - "the built-ins are a floor,
+// not a starting point: a client already configured against one must not
+// stop resolving because the list was edited" - so deleting or renaming
+// one here would silently come back on Apply. The row says so instead of
+// letting someone discover it: name read-only, delete disabled, folder
+// still editable, because WHERE a built-in lands is genuinely yours.
+const BUILTIN_CATS = ['tv', 'movies', 'music', 'books'];
+function catFileRowHtml(name, dir){
+  const fixed = BUILTIN_CATS.includes((name||'').toLowerCase());
+  const why = escA(t('set.disk.cats.builtin.title','always available, so it cannot be renamed or removed - its folder is still yours to set'));
+  return `<div class="catfilerow">
+    <input class="txt" data-k="name" value="${escA(name||'')}"${fixed?` readonly title="${why}"`:''} placeholder="${escA(t('set.disk.cats.name.ph','category'))}" ${fixed?'':`title="${escA(t('set.disk.cats.name.title','the name Sonarr, Radarr or your app is configured with'))}"`} oninput="catFileCheck(this)">
+    <div class="pathrow"><input class="txt" data-k="dir" value="${escA(dir||'')}" placeholder="${escA(t('set.disk.cats.dir.ph','a subfolder of the download root'))}" title="${escA(t('set.disk.cats.dir.title','where this category lands. Blank = its own subfolder of the download root'))}" oninput="catFileCheck(this)"><button class="mini" onclick="browseDir(this.previousElementSibling,'dir')" data-i18n-title="btn.browse.title" title="Browse for a folder - including other drives" data-i18n="btn.browse">Browse…</button></div>
+    <button class="ghost" onclick="this.closest('.catfilerow').remove()"${fixed?' disabled':''} title="${fixed?why:escA(t('set.disk.cats.remove.title','Delete this category'))}" aria-label="${fixed?why:escA(t('set.disk.cats.remove.title','Delete this category'))}">×</button>
+    <div class="rulewarn" style="display:none"></div></div>`;
+}
+// The two rules the row surfaces rather than letting someone discover on
+// save. A name is ONE path component (enqueue and refile_out_dir both
+// sanitize it, and sanitize_filename maps `/` to `_`, so `movies/anime`
+// silently becomes the folder `movies_anime`), and parse_cat_dests
+// splits the destination list on `,` and `;`, so neither can appear in a
+// path.
+function catFileCheck(el){
+  const row=el.closest('.catfilerow');
+  const warn=row.querySelector('.rulewarn');
+  const name=(row.querySelector('[data-k=name]')||{}).value||'';
+  const dir=(row.querySelector('[data-k=dir]')||{}).value||'';
+  const msgs=[];
+  if(/[\/\\]/.test(name))
+    msgs.push(t('set.disk.cats.warn.slash','A category is one folder name, so this will be saved as "{safe}".',
+      {safe:name.replace(/[\/\\]/g,'_')}));
+  if(/[,;]/.test(dir))
+    msgs.push(t('set.disk.cats.warn.comma','A folder cannot contain a comma or a semicolon - those separate the list.'));
+  row.querySelector('[data-k=name]').classList.toggle('patbad', /[\/\\]/.test(name));
+  row.querySelector('[data-k=dir]').classList.toggle('patbad', /[,;]/.test(dir));
+  warn.style.display=msgs.length?'':'none';
+  warn.textContent=msgs.length?'⚠ '+msgs.join(' '):'';
+}
+// `categories` is a comma list; `move_completed_cats` is `name=path`
+// pairs. Joined here into one row per category - which is the pairing
+// the two strings never showed.
+function renderCatFiles(cats, dests){
+  const dir={};
+  for(const item of String(dests||'').split(/[,;]/)){
+    const i=item.indexOf('='); if(i<0) continue;
+    const k=item.slice(0,i).trim(); if(k) dir[k]=item.slice(i+1).trim();
+  }
+  const names=String(cats||'').split(',').map(s=>s.trim()).filter(Boolean);
+  // A destination for a category that is not in the list would vanish on
+  // the next Apply, so show it rather than silently drop it.
+  for(const k of Object.keys(dir)) if(!names.includes(k)) names.push(k);
+  setHtml('catfilerows', names.length
+    ? names.map(n=>catFileRowHtml(n, dir[n])).join('')
+    : `<div class="dim">${t('set.disk.cats.none','no categories yet')}</div>`);
+}
+function addCatFileRow(){
+  const cr=document.getElementById('catfilerows');
+  if(cr.firstElementChild&&!cr.firstElementChild.classList.contains('catfilerow')) cr.innerHTML='';
+  cr.__h=null;
+  cr.insertAdjacentHTML('beforeend', catFileRowHtml('',''));
+  cr.lastElementChild.querySelector('[data-k=name]').focus();
+}
+async function saveCatFiles(btn){ await busy(btn,t('busy.applying','Applying…'), async()=>{
+  const rows=[...document.querySelectorAll('#catfilerows .catfilerow')];
+  const names=[], dests=[];
+  for(const r of rows){
+    const g=k=>((r.querySelector(`[data-k=${k}]`)||{}).value||'').trim();
+    const name=g('name'); if(!name) continue;
+    names.push(name);
+    const dir=g('dir'); if(dir) dests.push(`${name}=${dir}`);
+  }
+  // Both settings, in this order: a destination naming a category the
+  // list does not carry yet would be refused.
+  if(await setCfg('categories', names.join(', ')) === false) return;
+  await setCfg('move_completed_cats', dests.join(', '));
+}); }
+
 // M23 Smart Folders editor: rows ↔ the daemon's smart_folders JSON.
 // Sizes round-trip as SAB-style strings ("200M"); the daemon stores bytes.
 function smartRowHtml(r){
@@ -9664,13 +9917,38 @@ async function importServers(btn){ await busy(btn,t('busy.scanning','Scanning…
   let imported=0;
   for(const c of cands){
     const names=c.servers.map(s=>s.host).join(', ');
+    // #17: categories come over too, and they are the half that decides
+    // whether Sonarr and Radarr will talk to us at all - they validate
+    // their configured category against our list and refuse to connect
+    // when it is missing. So the prompt names them before anything is
+    // written, rather than surprising the user afterwards.
+    const cats=(c.categories||[]).map(x=>x.name);
+    const catLine=cats.length
+      ? '\n\n'+t('confirm.import.cats','{n} categor(ies): {names}',{n:cats.length,names:cats.join(', ')})
+      : '';
     if(!confirm(t('confirm.import','Found {kind} config:\n{path}\n\n{n} server(s): {names}\n\nImport them? (existing servers are kept; duplicates skipped)',
-        {kind:c.kind==='sabnzbd'?'SABnzbd':'NZBGet', path:c.path, n:c.servers.length, names}))) continue;
+        {kind:c.kind==='sabnzbd'?'SABnzbd':'NZBGet', path:c.path, n:c.servers.length, names})+catLine)) continue;
     const r=await api('import_apply',`&value=${encodeURIComponent(c.path)}&value2=${c.kind}`);
     if(r.error){ toast(tErr(r.error), true); continue; }
     imported+=r.added||0;
     toast(t('toast.imported','Imported {n} server(s){skipped}.',
       {n:r.added, skipped:r.skipped?' '+t('toast.imported.skipped','({n} already present)',{n:r.skipped}):''}));
+    // What the categories half did, and what it could not do. Reported
+    // separately because the two halves fail independently: a folder the
+    // SAB machine had may simply not exist on this one, which is the
+    // normal case for a migration between hosts.
+    const rc=r.categories||{};
+    if(rc.added||rc.folders){
+      imported++;
+      toast(t('toast.imported.cats','Imported {n} categor(ies) and {f} folder(s).',
+        {n:rc.added||0, f:rc.folders||0}));
+    }
+    for(const f of (rc.folders_failed||[]))
+      toast(t('toast.import.catdir','Could not set the folder for "{name}": {err}',
+        {name:f.name, err:f.error}), true);
+    if((rc.dropped||[]).length)
+      toast(t('toast.import.dropped','Not imported from {kind}: {what}',
+        {kind:c.kind==='sabnzbd'?'SABnzbd':'NZBGet', what:rc.dropped.join('; ')}));
   }
   if(imported) loadSettings();
 }); }

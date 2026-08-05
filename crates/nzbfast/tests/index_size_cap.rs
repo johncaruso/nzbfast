@@ -1,3 +1,4 @@
+#![cfg(feature = "indexer")]
 //! M34: the index size cap, its settings, and - the part that matters -
 //! what it refuses to delete, driven against the real binary.
 //!

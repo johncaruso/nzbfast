@@ -9,11 +9,96 @@ use std::path::Path;
 // check - pre-flight availability (M2): STAT sweep + verdict
 // ---------------------------------------------------------------------------
 
+/// What pre-flight expects the download to do.
+///
+/// `dropped` names the files whose loss does NOT decide the verdict:
+/// Usenet furniture (`.nfo`, `.sfv`, `.txt`, …) that no server has in
+/// full. It rides on every variant because a job can lose furniture in
+/// any state of repair, and because the count is a separate claim from
+/// the payload one - see [`is_droppable_metadata`].
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Verdict {
-    Complete,
-    Repairable { est_missing: usize, recovery: usize },
-    Impossible { est_missing: usize, recovery: usize },
+    Complete {
+        dropped: Vec<String>,
+    },
+    Repairable {
+        est_missing: usize,
+        recovery: usize,
+        dropped: Vec<String>,
+    },
+    Impossible {
+        est_missing: usize,
+        recovery: usize,
+        dropped: Vec<String>,
+    },
+}
+
+/// Is this NZB file Usenet furniture whose loss should not decide the
+/// verdict?
+///
+/// Issue #23. The old verdict weighed TOTAL missing articles against
+/// TOTAL recovery blocks and never asked which file the articles came
+/// from, so one absent article in a single-segment `.nfo` beside 51
+/// spare blocks printed `REPAIRABLE` - a repair that could never happen,
+/// because a `.nfo` is not in the recovery set. The reporter's downloads
+/// then failed on every release, over a file their own cleanup settings
+/// would have deleted seconds later.
+///
+/// This is the same predicate the post-drain census now uses to spare
+/// such a slot (`smart::is_junk_ext`, via `get::census`), which is the
+/// point: pre-flight should predict what the downloader will actually
+/// do. Its exclusions are what make it safe - archives and executables
+/// are deliberately NOT furniture, so a missing `.rar` or `.mkv` still
+/// decides the verdict.
+///
+/// Two narrowings on top of the shared list:
+///
+/// - No extension, no spare. An obfuscated post ships hashes for names,
+///   and we cannot tell furniture from payload by guessing.
+/// - `.par2` is on the junk list (cleanup deletes it) but is not
+///   furniture HERE: the main packet is how repair happens at all. The
+///   census reaches the same place by skipping recovery slots outright.
+pub(crate) fn is_droppable_metadata(name: &str) -> bool {
+    let ext = std::path::Path::new(name)
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    !ext.is_empty() && ext != "par2" && crate::smart::is_junk_ext(&ext)
+}
+
+/// The verdict, given a PAYLOAD deficit - furniture already set aside.
+///
+/// Splitting the deficit is what makes the answer honest in both
+/// directions. Furniture the set does not cover can never be repaired,
+/// so counting it towards `recovery` promised a repair that will not
+/// happen (#23); but its articles do not SPEND recovery blocks either,
+/// so counting it could equally flip a payload that repairs fine to
+/// IMPOSSIBLE. Neither number is the payload's, and only the payload's
+/// decides whether the job completes.
+///
+/// Pre-flight is STAT-only: it never downloads the PAR2 packets, so it
+/// cannot read the set's real file list and cannot KNOW that a given
+/// `.nfo` is uncovered - it infers it from the name, exactly as the
+/// downloader now does. That inference only affects the fate of the
+/// file, never the fate of the job: if the set does not cover it the
+/// download completes and drops it, and if the set does cover it repair
+/// rebuilds it. The copy says both rather than picking one.
+pub(crate) fn verdict_of(est_missing: usize, recovery: usize, dropped: Vec<String>) -> Verdict {
+    if est_missing == 0 {
+        Verdict::Complete { dropped }
+    } else if est_missing <= recovery {
+        Verdict::Repairable {
+            est_missing,
+            recovery,
+            dropped,
+        }
+    } else {
+        Verdict::Impossible {
+            est_missing,
+            recovery,
+            dropped,
+        }
+    }
 }
 
 pub(crate) async fn check(
@@ -81,59 +166,206 @@ pub(crate) async fn check(
     }
 
     let missing = sweep.union_missing();
-    let est_missing: f64 = missing.iter().map(|&i| weights[i]).sum();
+    // Which NZB files are furniture rather than payload. Only DATA files
+    // qualify: `Par2Volume` never reaches the sample, and `Par2Main` is
+    // the packet repair is made of, not something to shrug off.
+    let furniture: Vec<bool> = nzb
+        .files
+        .iter()
+        .map(|f| {
+            f.kind() == FileKind::Data
+                && is_droppable_metadata(f.filename_hint().unwrap_or(&f.subject))
+        })
+        .collect();
+    let est_missing: f64 = missing
+        .iter()
+        .filter(|&&i| !furniture[file_of[i]])
+        .map(|&i| weights[i])
+        .sum();
     let est_missing = est_missing.round() as usize;
     let mut missing_files: std::collections::BTreeMap<usize, usize> = Default::default();
     for &i in &missing {
         *missing_files.entry(file_of[i]).or_default() += 1;
     }
+    let mut dropped: Vec<String> = Vec::new();
     for (fi, count) in &missing_files {
         let f = &nzb.files[*fi];
+        let name = f.filename_hint().unwrap_or(&f.subject);
         println!(
-            "  ✘ {}: {count} of {} sampled segment(s) missing on every server",
-            f.filename_hint().unwrap_or(&f.subject),
+            "  ✘ {name}: {count} of {} sampled segment(s) missing on every server{}",
             f.segments.len().min(
                 (f.segments.len() * sample_pct.min(100) as usize)
                     .div_ceil(100)
                     .max(2)
             ),
+            if furniture[*fi] {
+                " - metadata, not payload"
+            } else {
+                ""
+            },
+        );
+        if furniture[*fi] {
+            dropped.push(name.to_string());
+        }
+    }
+    if !dropped.is_empty() {
+        println!(
+            "  note: metadata files are Usenet furniture the recovery set usually does \
+             not cover, and pre-flight is STAT-only so it cannot read the set's file \
+             list to be sure. Uncovered, the download completes and the file is \
+             dropped; covered, repair rebuilds it from the same block budget."
         );
     }
 
     // Verdict in article units (block ≈ article for typical posts; the
-    // live ledger is exact once the par2 main packet is in hand).
-    let verdict = if est_missing == 0 {
-        Verdict::Complete
-    } else if est_missing <= recovery {
-        Verdict::Repairable {
-            est_missing,
-            recovery,
-        }
-    } else {
-        Verdict::Impossible {
-            est_missing,
-            recovery,
+    // live ledger is exact once the par2 main packet is in hand), and in
+    // PAYLOAD articles only - see verdict_of.
+    let verdict = verdict_of(est_missing, recovery, dropped);
+    let dropped_tail = |dropped: &[String]| {
+        if dropped.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; {} metadata file(s) no server has in full: {}",
+                dropped.len(),
+                dropped.join(", ")
+            )
         }
     };
     match &verdict {
-        Verdict::Complete => println!(
+        Verdict::Complete { dropped } if dropped.is_empty() => println!(
             "verdict: COMPLETE - every sampled article present on at least one server ({:.2?})",
+            sweep.elapsed
+        ),
+        Verdict::Complete { dropped } => println!(
+            "verdict: COMPLETE - the payload is whole{} ({:.2?})",
+            dropped_tail(dropped),
             sweep.elapsed
         ),
         Verdict::Repairable {
             est_missing,
             recovery,
+            dropped,
         } => println!(
-            "verdict: REPAIRABLE - ≈{est_missing} article(s) missing everywhere ≤ {recovery} recovery block(s) ({:.2?})",
+            "verdict: REPAIRABLE - ≈{est_missing} payload article(s) missing everywhere ≤ {recovery} recovery block(s){} ({:.2?})",
+            dropped_tail(dropped),
             sweep.elapsed
         ),
         Verdict::Impossible {
             est_missing,
             recovery,
+            dropped,
         } => println!(
-            "verdict: IMPOSSIBLE - ≈{est_missing} article(s) missing everywhere > {recovery} recovery block(s) ({:.2?})",
+            "verdict: IMPOSSIBLE - ≈{est_missing} payload article(s) missing everywhere > {recovery} recovery block(s){} ({:.2?})",
+            dropped_tail(dropped),
             sweep.elapsed
         ),
     }
     Ok(verdict)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Issue #23 in one assertion: the reporter's post, one absent
+    /// article in a single-segment `.nfo`, 51 spare recovery blocks.
+    ///
+    /// The old verdict weighed 1 against 51 and said REPAIRABLE. It is
+    /// not repairable at any block count - a `.nfo` the recovery set
+    /// does not cover has no parity behind it - and the downloader now
+    /// completes the job and drops the file. Pre-flight has to predict
+    /// THAT, so the only wrong answer here is any verdict carrying a
+    /// repair promise.
+    #[test]
+    fn a_missing_nfo_is_not_a_repair_promise() {
+        let v = verdict_of(0, 51, names(&["release.nfo"]));
+        assert_eq!(
+            v,
+            Verdict::Complete {
+                dropped: names(&["release.nfo"])
+            }
+        );
+        // And the reverse framing: nothing missing anywhere is still the
+        // plain COMPLETE, with nothing to say about metadata.
+        assert_eq!(
+            verdict_of(0, 51, vec![]),
+            Verdict::Complete { dropped: vec![] }
+        );
+    }
+
+    /// Furniture set aside must not spend the block budget either. A
+    /// payload deficit that fits is REPAIRABLE even when the same post
+    /// also lost a `.sfv`, and the dropped file rides along rather than
+    /// being folded into the count.
+    #[test]
+    fn furniture_does_not_spend_the_recovery_budget() {
+        assert_eq!(
+            verdict_of(4, 51, names(&["release.sfv"])),
+            Verdict::Repairable {
+                est_missing: 4,
+                recovery: 51,
+                dropped: names(&["release.sfv"]),
+            }
+        );
+        assert_eq!(
+            verdict_of(52, 51, names(&["release.sfv"])),
+            Verdict::Impossible {
+                est_missing: 52,
+                recovery: 51,
+                dropped: names(&["release.sfv"]),
+            }
+        );
+        // The boundary the old code drew, undisturbed: exactly enough
+        // blocks still repairs.
+        assert_eq!(
+            verdict_of(51, 51, vec![]),
+            Verdict::Repairable {
+                est_missing: 51,
+                recovery: 51,
+                dropped: vec![],
+            }
+        );
+    }
+
+    /// The rule is only correct while it is NARROW - a version that
+    /// spared everything would pass the tests above just as well. Both
+    /// halves in one function so neither can be deleted alone.
+    #[test]
+    fn only_usenet_furniture_is_droppable() {
+        for n in [
+            "release.nfo",
+            "release.NFO",
+            "release.sfv",
+            "release.txt",
+            "release.srr",
+            "Some.Release-GRP.md5",
+        ] {
+            assert!(is_droppable_metadata(n), "{n} should be furniture");
+        }
+        for n in [
+            // Payload, in every shape: the whole point of the check.
+            "release.mkv",
+            "release.rar",
+            "release.r00",
+            "release.part01.rar",
+            "release.7z",
+            "setup.exe",
+            "release.zip",
+            // The main packet is how repair happens at all, so it is not
+            // furniture here even though cleanup deletes it.
+            "release.par2",
+            "release.vol000+51.par2",
+            // Obfuscated: a hash with no extension could be anything,
+            // and guessing wrong drops a video.
+            "8upt36kdv2iwfhb1ev81aj",
+            "",
+        ] {
+            assert!(!is_droppable_metadata(n), "{n} should NOT be furniture");
+        }
+    }
 }

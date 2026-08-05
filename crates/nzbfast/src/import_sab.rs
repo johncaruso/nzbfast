@@ -321,6 +321,34 @@ pub fn import(ini_path: &Path, out_path: &Path, force: bool) -> Result<()> {
     if skipped > 0 {
         println!("  ({skipped} disabled/empty server(s) skipped)");
     }
+    // #17: categories, and what could not come with them.
+    //
+    // The CLI writes a SERVER config; categories are daemon settings and
+    // live in settings.json, which this command does not own. So it
+    // reports rather than writes - a line the user can paste, and the
+    // dashboard's own importer does the merging. Saying nothing here
+    // would leave `import-sab` looking like it had migrated everything
+    // when the *arrs are still about to fail their category check.
+    let cats = nzbkit::config::parse_sabnzbd_categories(&text);
+    if !cats.cats.is_empty() {
+        let names: Vec<&str> = cats.cats.iter().map(|c| c.name.as_str()).collect();
+        println!("\n{} categor(ies) found:", names.len());
+        println!("  Categories:            {}", names.join(", "));
+        let dirs: Vec<String> = cats
+            .cats
+            .iter()
+            .filter_map(|c| c.dir.as_ref().map(|d| format!("{}={d}", c.name)))
+            .collect();
+        if !dirs.is_empty() {
+            println!("  Per-category folders:  {}", dirs.join(", "));
+        }
+        println!("  Paste those into Settings, or press Import in the dashboard");
+        println!("  to merge them for you. Sonarr and Radarr refuse to connect");
+        println!("  while a category they are configured for is missing here.");
+        for d in &cats.dropped {
+            println!("  not imported: {d}");
+        }
+    }
     // Absolute, because the relative form is what made this land in the wrong
     // place unnoticed: "wrote config.local.json" from a /config cwd reads
     // exactly like success even when the daemon is serving another file.

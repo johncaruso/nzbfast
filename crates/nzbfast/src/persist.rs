@@ -9,6 +9,8 @@
 //!   the file as "empty" (the next save would make the loss permanent):
 //!   the corrupt bytes are set aside as `.corrupt` and the `.bak` is
 //!   restored instead, loudly.
+//! * `blocking_db` - runs a synchronous database closure without
+//!   starving the async runtime (see its doc).
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -27,6 +29,15 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
 /// counter keeps concurrent writers in this process off each other's
 /// temp file; the pid does the same across processes.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    // The two fsyncs below (file, then directory) can take arbitrarily long
+    // on a busy or remote filesystem, and several callers run on tokio
+    // worker threads - save_queue via the watch poller, QuotaLedger::save
+    // on the download runner. Same starvation class as blocking_db's doc:
+    // demote the worker for the duration; off the runtime it runs inline.
+    blocking_db(|| write_atomic_sync(path, bytes))
+}
+
+fn write_atomic_sync(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir)?;
@@ -201,6 +212,32 @@ pub(crate) fn load_json_config(path: &Path) -> Option<Value> {
         }
         // Not JSON (e.g. a SABnzbd .ini) - do not touch the file.
         Err(_) => None,
+    }
+}
+
+/// Run a synchronous database closure without starving the async
+/// runtime.
+///
+/// Measured 2026-08-05: the index deepen pass's three inline ingest
+/// transactions, the tip watcher's ingest, and a predb fold each ran
+/// their SQLite work directly on tokio worker threads - and with one
+/// worker per core all occupied at once, the download runner (a ready
+/// task whose 500 ms poll timer had expired) had no thread to resume
+/// on for 38 seconds. Four queued jobs sat unstarted the whole time.
+///
+/// `block_in_place` demotes the current worker so the scheduler
+/// backfills it; the closure (INCLUDING any mutex wait for a db handle,
+/// which can be another writer's whole transaction) then costs this
+/// thread, never the runtime. On a current-thread runtime - or none -
+/// `block_in_place` would panic, so the closure just runs inline there,
+/// which is the old behaviour in the contexts where it was already
+/// fine.
+pub(crate) fn blocking_db<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
     }
 }
 

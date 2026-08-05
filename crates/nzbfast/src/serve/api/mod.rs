@@ -7,10 +7,13 @@
 use super::*;
 
 pub(in crate::serve) mod config;
+#[cfg(feature = "indexer")]
 pub(in crate::serve) mod index;
+pub(in crate::serve) mod playback;
 pub(in crate::serve) mod queue;
 pub(in crate::serve) mod servers;
 pub(in crate::serve) mod system;
+#[cfg(feature = "indexer")]
 pub(in crate::serve) mod wall;
 
 /// The `serve()` locals the arms read besides the daemon itself. One
@@ -21,6 +24,7 @@ pub(in crate::serve) struct ApiCtx<'a> {
     pub host_hdr: &'a str,
     pub ua_hdr: &'a str,
     pub key_q: &'a str,
+    #[cfg(feature = "indexer")]
     pub tmdb_key: &'a Option<String>,
     pub bootstrap_apikey: bool,
     /// The caller presented the ADD-ONLY NZB key, not the full API
@@ -38,10 +42,14 @@ pub(in crate::serve) fn dispatch(
     ctx: &ApiCtx<'_>,
     api_body: &mut Option<Vec<u8>>,
 ) -> Option<Value> {
-    queue::dispatch(d, req, params, mode, ctx, api_body)
+    let hit = queue::dispatch(d, req, params, mode, ctx, api_body)
         .or_else(|| system::dispatch(d, req, params, mode, ctx, api_body))
         .or_else(|| config::dispatch(d, req, params, mode, ctx, api_body))
         .or_else(|| servers::dispatch(d, req, params, mode, ctx, api_body))
+        .or_else(|| playback::dispatch(d, req, params, mode, ctx, api_body));
+    #[cfg(feature = "indexer")]
+    let hit = hit
         .or_else(|| index::dispatch(d, req, params, mode, ctx, api_body))
-        .or_else(|| wall::dispatch(d, req, params, mode, ctx, api_body))
+        .or_else(|| wall::dispatch(d, req, params, mode, ctx, api_body));
+    hit
 }

@@ -331,6 +331,7 @@ pub(super) fn ui_shell_state(d: &Daemon, page: String) -> String {
         .replace("__NZBFAST_INDEXERS__", &d.enabled_indexers().to_string())
 }
 
+#[cfg(feature = "indexer")]
 pub(super) const WALL_HTML: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../web/wall.html"));
 

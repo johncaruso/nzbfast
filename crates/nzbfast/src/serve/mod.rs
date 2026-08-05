@@ -34,10 +34,14 @@ mod daemon;
 use daemon::*;
 
 mod giveup;
+#[cfg(feature = "indexer")]
 pub(crate) mod predb_seed;
 mod tasks;
 
 mod api;
+
+#[cfg(test)]
+mod testutil;
 
 pub struct ServeOpts {
     pub port: u16,
@@ -105,18 +109,24 @@ pub struct ServeOpts {
     /// M15: pipeline cache-tier budget (see nzbkit::mem).
     pub mem_budget: nzbkit::mem::MemBudget,
     /// M12: index database path (newznab facade + dashboard browse).
+    #[cfg(feature = "indexer")]
     pub index_db: PathBuf,
     /// M12: groups to OVER-scan continuously (empty = no scanning).
+    #[cfg(feature = "indexer")]
     pub index_groups: Vec<String>,
+    #[cfg(feature = "indexer")]
     pub index_interval_secs: u64,
     /// Articles to backfill on a group's first scan.
+    #[cfg(feature = "indexer")]
     pub index_backfill: u64,
     /// Fetch newsgroup descriptions from ISC as well as the provider.
     pub group_desc_isc: bool,
     /// Only index posts newer than this (seconds; 0 = off). Overrides
     /// the backfill count on a first scan via Date bisection.
+    #[cfg(feature = "indexer")]
     pub index_max_age_secs: u64,
     /// Ingest gates for the scanner (kind/year/res/language/title/size).
+    #[cfg(feature = "indexer")]
     pub index_gates: Option<crate::gates::Gates>,
 }
 
@@ -371,6 +381,7 @@ fn fresh_secret() -> String {
 
 /// M29: JSON verdict for one release - "ok"/"maybe"/"gone", or null when
 /// the ledger is too thin (or oracle context unavailable).
+#[cfg(feature = "indexer")]
 fn oracle_verdict_json(
     ocx: &Option<(nzbkit::oracle::Snapshot, Vec<String>)>,
     grp: &str,
@@ -745,6 +756,7 @@ fn first_run_apikey(
 /// Install the daemon's live ingest policy on an Index connection. The
 /// shared tip connection is reopened after full scans, so neither custom
 /// classification nor its gate closure can be assumed to survive.
+#[cfg(feature = "indexer")]
 fn install_live_ingest_policy(
     ix: &mut nzbkit::index::Index,
     gates: Option<crate::gates::Gates>,
@@ -763,6 +775,7 @@ fn install_live_ingest_policy(
 /// a custom-category slug (lowercase alnum + '-'). The filter is a bound
 /// SQL parameter, so this is a shape check, not a security boundary - an
 /// unknown slug simply matches no rows.
+#[cfg(feature = "indexer")]
 fn is_kind_slug(k: &str) -> bool {
     !k.is_empty()
         && k.chars()
@@ -959,7 +972,12 @@ impl QuotaLedger {
             start: Self::period_start(period),
             bytes: 0,
         };
-        if let Some(v) = crate::persist::load_json_with_backup(&led.path) {
+        // Opened from the download runner's tick, which is a tokio task:
+        // the read (and the .bak refresh it may write) is disk IO that
+        // must not run undemoted on a worker thread.
+        if let Some(v) =
+            crate::persist::blocking_db(|| crate::persist::load_json_with_backup(&led.path))
+        {
             let start = v["start"].as_u64().unwrap_or(0);
             if start == led.start {
                 led.bytes = v["bytes"].as_u64().unwrap_or(0);
@@ -1172,15 +1190,19 @@ fn apply_saved_settings(opts: &mut ServeOpts, path: &std::path::Path) {
     if let Some(v) = n("library_recheck_secs") {
         opts.library_recheck_secs = v.max(1);
     }
+    #[cfg(feature = "indexer")]
     if let Some(v) = s("index_db").filter(|v| !v.is_empty()) {
         opts.index_db = PathBuf::from(v);
     }
+    #[cfg(feature = "indexer")]
     if let Some(v) = list("index_groups") {
         opts.index_groups = v;
     }
+    #[cfg(feature = "indexer")]
     if let Some(v) = n("index_interval_secs") {
         opts.index_interval_secs = v;
     }
+    #[cfg(feature = "indexer")]
     if let Some(v) = n("index_backfill") {
         opts.index_backfill = v;
     }
@@ -1200,9 +1222,11 @@ fn apply_saved_settings(opts: &mut ServeOpts, path: &std::path::Path) {
             nzbkit::mem::MemBudget::auto()
         };
     }
+    #[cfg(feature = "indexer")]
     if let Some(v) = n("index_max_age_secs") {
         opts.index_max_age_secs = v;
     }
+    #[cfg(feature = "indexer")]
     if let Some(v) = s("index_gates") {
         opts.index_gates = if v.trim().is_empty() {
             None
@@ -1506,10 +1530,12 @@ fn epoch_secs() -> u64 {
 /// binary providers reject it, which just means blank descriptions).
 /// Where ISC publishes the community's newsgroup descriptions: about
 /// 45,000 of them, refreshed hourly, one `group<TAB>description` per line.
+#[cfg(feature = "indexer")]
 const ISC_NEWSGROUPS_URL: &str = "https://ftp.isc.org/pub/usenet/CONFIG/newsgroups";
 
 /// Cap on the descriptions file. It is around 3 MB; this is a ceiling on
 /// a fetch from a host we do not control, not a size estimate.
+#[cfg(feature = "indexer")]
 const ISC_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Fetch the ISC newsgroup descriptions.
@@ -1521,6 +1547,7 @@ const ISC_MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// a description - which leaves the browser's search matching names only.
 ///
 /// Goes through the SSRF-guarded agent like every other outbound fetch.
+#[cfg(feature = "indexer")]
 fn fetch_isc_descriptions() -> std::result::Result<Vec<(String, String)>, String> {
     let resp = ssrf_safe_agent(3, 30)
         .get(ISC_NEWSGROUPS_URL)
@@ -1559,6 +1586,7 @@ fn fetch_isc_descriptions() -> std::result::Result<Vec<(String, String)>, String
     Ok(out)
 }
 
+#[cfg(feature = "indexer")]
 async fn fetch_group_catalog(
     config: &Path,
     prev: Option<&crate::groups::Catalog>,
@@ -1608,16 +1636,19 @@ async fn fetch_group_catalog(
 /// How many of a group's newest articles one sample covers. 200 is
 /// enough for a stable mean and a usable content mix, and small enough
 /// that a sample is one quick OVER rather than a scan.
+#[cfg(feature = "indexer")]
 const GROUP_SAMPLE_N: u64 = 200;
 
 /// How far back the rate baseline reaches, widened until it spans at
 /// least an hour. A quiet group is answered by the first step; the
 /// busiest groups on a big provider need the last one.
+#[cfg(feature = "indexer")]
 const RATE_BASELINE_STEPS: &[u64] = &[50_000, 1_000_000, 20_000_000];
 
 /// Sample one group: select it, pull OVER across its newest articles,
 /// and reduce that to a profile. One connection, one round trip, closed
 /// immediately - this must never compete with the download pool.
+#[cfg(feature = "indexer")]
 async fn sample_one_group(
     config: &Path,
     group: &str,
@@ -1687,6 +1718,7 @@ async fn sample_one_group(
 /// Per-group single-flight rather than one global flag: opening two rows
 /// in the browser should sample both, but opening the same row twice
 /// should not go to the provider twice.
+#[cfg(feature = "indexer")]
 fn kick_group_sample(d: &Arc<Daemon>, config: PathBuf, group: String, posts: u64) -> bool {
     {
         let mut inflight = d.group_sampling.lock_ok();
@@ -1821,6 +1853,7 @@ fn api_origin(user_agent: &str, fallback: &str) -> String {
 /// Only files whose name looks like ours are considered, and only ones
 /// older than a grace period, so a job being enqueued right now (spool
 /// written, not yet in the queue) cannot be swept out from under itself.
+#[cfg(feature = "indexer")]
 fn sweep_orphan_spool_nzbs(d: &Arc<Daemon>) -> usize {
     const GRACE_SECS: u64 = 3600;
     let referenced: std::collections::HashSet<PathBuf> = d
@@ -1923,11 +1956,13 @@ fn restart_in_place(
 /// this governs how quickly those filters become useful. 150 an hour
 /// covers the ~2000 groups worth profiling inside a day or so, and costs
 /// a few minutes of one sequential connection per hour, only while idle.
+#[cfg(feature = "indexer")]
 const SAMPLE_BUDGET_PER_TICK: usize = 150;
 
 /// Below this many profiles the install counts as unprofiled, and the
 /// first-run burst runs. An established install is far above it (the
 /// steady pass alone reaches ~2000 within a day), so it never bursts.
+#[cfg(feature = "indexer")]
 const BURST_PROFILE_TARGET: usize = 500;
 
 /// Hard bound 1: samples the burst may start in one process lifetime.
@@ -1935,18 +1970,21 @@ const BURST_PROFILE_TARGET: usize = 500;
 /// fails or times out every sample is contacted a bounded number of
 /// times and then dropped back to the hourly pass. At the >=1s spacing
 /// below, this is also a floor of ~25 minutes on how long it can last.
+#[cfg(feature = "indexer")]
 const BURST_MAX_SAMPLES: usize = 1_500;
 
 /// Hard bound 2: wall-clock window from daemon start. Covers the cases
 /// the sample bound cannot - no provider configured, no group catalogue
 /// yet, or a catalogue so small that the burst finishes it and would
 /// otherwise sit in its short tick forever.
+#[cfg(feature = "indexer")]
 const BURST_WINDOW_SECS: u64 = 60 * 60;
 
 /// Seconds between burst ticks. Short, because a burst tick that finds
 /// nothing to do (the catalogue has not been fetched yet, which is the
 /// normal state for the first minute of a first run) should retry soon
 /// rather than an hour later.
+#[cfg(feature = "indexer")]
 const BURST_TICK_SECS: u64 = 60;
 
 /// Should the fresh-install profile burst run?
@@ -1956,13 +1994,14 @@ const BURST_TICK_SECS: u64 = 60;
 /// install (bad credentials, a provider that rejects OVER) retry at the
 /// burst cadence forever, which is the ban-shaped traffic the pool's
 /// reconnect pacing was written to stop.
+#[cfg(feature = "indexer")]
 fn should_burst_profiles(profiled: usize, burst_samples: usize, since_start_secs: u64) -> bool {
     profiled < BURST_PROFILE_TARGET
         && burst_samples < BURST_MAX_SAMPLES
         && since_start_secs < BURST_WINDOW_SECS
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "indexer"))]
 mod group_burst_tests {
     use super::{
         BURST_MAX_SAMPLES, BURST_PROFILE_TARGET, BURST_WINDOW_SECS, should_burst_profiles,
@@ -2030,6 +2069,7 @@ mod group_burst_tests {
 /// and spaces them further apart while the pool is busy, so the extra
 /// load is a single connection opened every few seconds - not a new
 /// concurrency tier.
+#[cfg(feature = "indexer")]
 async fn sample_top_groups(d: &Arc<Daemon>, config: &Path, burst: bool) -> usize {
     if !burst && d.started_at.lock_ok().is_some() {
         return 0; // downloading: the pool owns the connections
@@ -2110,6 +2150,7 @@ async fn sample_top_groups(d: &Arc<Daemon>, config: &Path, burst: bool) -> usize
 ///  * only groups the provider actually carries are subscribed, so a
 ///    preset can never point the scan loop at a name that will never
 ///    answer.
+#[cfg(feature = "indexer")]
 fn apply_interests(d: &Arc<Daemon>) {
     let want = d.index_interests.lock_ok().clone();
     if want == *d.index_interests_applied.lock_ok() {
@@ -2206,6 +2247,7 @@ fn apply_interests(d: &Arc<Daemon>) {
 
 /// Start a background catalogue fetch unless one is already running
 /// (single-flight). Returns whether THIS call started it.
+#[cfg(feature = "indexer")]
 fn kick_group_fetch(d: &Arc<Daemon>, config: PathBuf) -> bool {
     if d.group_fetching.swap(true, Ordering::SeqCst) {
         return false;
@@ -2342,6 +2384,7 @@ use settings::*;
 /// (`eplist:<norm title>`), refreshed every 12 h; "show not found" is
 /// cached too so unknown titles aren't re-queried every minute. Runs on
 /// the watcher's blocking thread, so the network calls are fine here.
+#[cfg(feature = "indexer")]
 fn watch_calendar_refresh(d: &Arc<Daemon>) {
     let items = d.watchlist.lock_ok().clone();
     let now = std::time::SystemTime::now()
@@ -2385,8 +2428,12 @@ fn watch_calendar_refresh(d: &Arc<Daemon>) {
 /// between finding it and deciding on it is identical - only the fetch
 /// differs, and only an external one costs a metered grab.
 enum CandSrc {
+    #[cfg(feature = "indexer")]
     Local(i64),
-    External { url: String, indexer: String },
+    External {
+        url: String,
+        indexer: String,
+    },
 }
 
 /// Default cadence for the watchlist's external leg: how long an item
@@ -2431,9 +2478,11 @@ pub(super) const MIN_FREE_DEFAULT: u64 = 2_000_000_000;
 /// minutes later is either enormous or in trouble, and either way the
 /// periodic pass is the right owner. NEVER read as "the post is dead" -
 /// missing articles are not evidence of that.
+#[cfg(feature = "indexer")]
 pub(super) const INSTANT_PENDING_SECS: i64 = 10 * 60;
 
 /// §74: cadence of that re-check.
+#[cfg(feature = "indexer")]
 pub(super) const INSTANT_RECHECK_SECS: u64 = 30;
 
 fn watchlist_pass(d: &Arc<Daemon>) {
@@ -2793,11 +2842,13 @@ fn watchlist_pass(d: &Arc<Daemon>) {
             /// used to say how far behind the post an instant grab was.
             posted: i64,
         }
+        #[cfg(feature = "indexer")]
         let hits = d
             .with_index(|ix| ix.search(&item.title, 1000).ok())
             .unwrap_or_default();
         let mut best: std::collections::HashMap<String, Cand> = std::collections::HashMap::new();
         let now_unix = unix_now();
+        #[cfg(feature = "indexer")]
         for r in hits.iter().filter(|r| r.complete) {
             // Matched on the name the release is KNOWN by: a
             // watchlist entry can never match an obfuscated stem, and
@@ -3214,6 +3265,7 @@ fn note_instant(
 /// there is no cached list (an unwatched title, a show TVmaze does not
 /// have, a first pass before the refresh) - `pack_eligible` reads that
 /// as "nobody knows", not as "nothing exists".
+#[cfg_attr(not(feature = "indexer"), allow(unused_variables))]
 fn aired_episodes(d: &Arc<Daemon>, item: &crate::watchlist::WatchItem, season: u32) -> Vec<u32> {
     if item.kind != "tv" {
         return Vec::new();
@@ -3224,12 +3276,17 @@ fn aired_episodes(d: &Arc<Daemon>, item: &crate::watchlist::WatchItem, season: u
         .unwrap_or(0);
     let (y, m, dd) = civil_from_days(days);
     let today = format!("{y:04}-{m:02}-{dd:02}");
+    #[cfg(feature = "indexer")]
     let key = format!("eplist:{}", crate::wall::norm_title(&item.title));
+    #[cfg(feature = "indexer")]
     let eps: Vec<crate::wall::EpInfo> = d
         .with_index(|ix| ix.kv_get(&key))
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .and_then(|v| serde_json::from_value(v["episodes"].clone()).ok())
         .unwrap_or_default();
+    // Slim build: no index, so no cached episode list to consult.
+    #[cfg(not(feature = "indexer"))]
+    let eps: Vec<crate::wall::EpInfo> = Vec::new();
     eps.iter()
         .filter(|e| e.season == season && !e.airdate.is_empty() && e.airdate <= today)
         .map(|e| e.episode)
@@ -3312,6 +3369,7 @@ fn watchlist_grab(
     // goes through enqueue_fetched so a watchlist grab gets the same
     // X-DNZB failure-link handling a hand-clicked one does.
     let nzo = match src {
+        #[cfg(feature = "indexer")]
         CandSrc::Local(id) => {
             let xml = d.with_index(|ix| ix.make_nzb(*id).ok())?;
             d.enqueue(
@@ -3795,677 +3853,13 @@ impl Drop for MintDisclosure {
     }
 }
 
-pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
-    // First thing: capture our own stdout/stderr so the dashboard's log
-    // viewer sees the whole session, startup lines included.
-    nzbkit::logtee::install();
-    let settings_path = settings_file(&config);
-    apply_saved_settings(&mut opts, &settings_path);
-    // Secure-by-default on a genuinely new install (and ONLY there - see
-    // first_run_apikey). Printed once, prominently, next to the listener
-    // banner below, which is where a new user is looking.
-    let minted_key = first_run_apikey(&mut opts, &settings_path, &config)?;
-    // A key minted THIS RUN must be disclosed even if startup dies before
-    // the banner (see MintDisclosure).
-    let mut mint_disclosure =
-        MintDisclosure(minted_key.as_ref().map(|(_, keyfile)| keyfile.clone()));
-    // One explanation, printed at the moment it is true. A minted key
-    // means the data directory read as brand new; a download root already
-    // in use says the more likely story is an EXISTING install whose
-    // config directory moved out from under it - a recreated container
-    // reading an empty /config, a relative bind mount run from a
-    // different directory, a fresh appdata path. From here everything
-    // behaves like a first run, and without this line the user's next
-    // stop is a bug report titled "all my settings are gone" (issue #9's
-    // field report, verbatim).
-    //
-    // A warning ONLY. The download root must never join the
-    // fresh-vs-existing decision itself - that was tried, and it was a
-    // security regression (see first_run_apikey). Nothing here changes
-    // what was minted or decided.
-    if minted_key.is_some() {
-        let prior_use = opts.out_root.join(".spool").exists()
-            || std::fs::read_dir(&opts.out_root)
-                .map(|mut entries| entries.next().is_some())
-                .unwrap_or(false);
-        if prior_use {
-            eprintln!(
-                "⚠ starting as a NEW install (nothing in the config directory), but the \
-                 download folder {} is not empty. If you had settings before - servers, \
-                 paths, an API key - nothing deleted them: nzbfast is most likely reading \
-                 a different config directory than your previous install used. Docker and \
-                 NAS users: compare the /config volume mapping with the old container's. \
-                 The manual has the recovery steps, under Troubleshooting (/manual in the \
-                 dashboard). If this really is a new install, carry on - nothing is wrong.",
-                opts.out_root.display()
-            );
-        }
-    }
-    // Saved settings may have overridden the CLI budget; republish so the
-    // repair paths use the same figure the rest of the daemon does.
-    nzbkit::mem::set_process_budget(opts.mem_budget);
-    let ServeOpts {
-        group_desc_isc: _,
-        port,
-        bind,
-        open,
-        apikey,
-        nzbkey,
-        out_root,
-        watch,
-        script,
-        connections,
-        window,
-        decoders,
-        fast_verify,
-        verify_lean,
-        min_free,
-        out_umask,
-        auto_retry_mins,
-        preflight,
-        quota,
-        quota_period,
-        feeds,
-        speedlimit,
-        schedule,
-        auto_speed,
-        library_cats,
-        library_recheck_secs,
-        mem_budget,
-        index_db,
-        index_groups,
-        index_interval_secs,
-        index_backfill,
-        index_max_age_secs,
-        index_gates,
-    } = opts;
-    let legacy_rename_punctuation = legacy_rename_punctuation(&config, &out_root, &settings_path);
-    // The indexer's master switch, and the one migration it needs.
-    //
-    // A saved value always wins - that is the user's answer. With NO
-    // saved value we are either a fresh install (off: see the field's
-    // doc comment) or an install from before the switch existed, and
-    // those two are told apart by whether anything was ever chosen to
-    // index. Groups here already carry settings.json and the config file
-    // (see the settings merge above), so a CLI `--index-groups` or a
-    // hand-written config counts too - starting a daemon that was
-    // explicitly pointed at groups and then not scanning them would be
-    // the same surprise as the upgrade case.
-    let index_enabled = {
-        let saved = load_settings(&settings_path);
-        match saved.get("index_enabled").and_then(Value::as_bool) {
-            Some(v) => v,
-            None => {
-                let configured = !index_groups.is_empty()
-                    || saved
-                        .get("index_interests")
-                        .and_then(Value::as_str)
-                        .is_some_and(|s| !s.trim().is_empty());
-                //
-                // Deliberately NOT written back to settings.json. The
-                // derivation is stable (it re-runs identically every
-                // start), the first touch of the switch in the UI saves
-                // a real answer that wins from then on, and startup
-                // writes to that file are their own hazard - the
-                // first-run API key mint keys off which keys are in it
-                // (see SETUP_ANSWER_KEYS).
-                if configured {
-                    info!(
-                        target: "index",
-                        "indexing is on for the groups this install already had; \
-                         it is a switch now (Settings → Indexing) and new installs start off"
-                    );
-                }
-                configured
-            }
-        }
-    };
-    // Resolved once: every spool path below must agree, or a migrated
-    // daemon reads half its state from the old location.
-    // ABSOLUTE from here on. Sonarr reads `misc.complete_dir` out of
-    // get_config to learn where this client puts files, and a relative
-    // path means nothing to another process - different cwd, often a
-    // different container or host - so it reports "Remote Path Mapping"
-    // while the downloads themselves land perfectly, because WE resolve
-    // it against our own cwd. That is exactly the shape of the v1.0.9
-    // report: right folder, wrong error. SABnzbd always answers absolute.
-    //
-    // Resolved rather than canonicalized: the directory may not exist
-    // yet on a first run, and canonicalize() fails on a missing path.
-    let out_root = if out_root.is_absolute() {
-        out_root
-    } else {
-        std::env::current_dir()
-            .map(|c| c.join(&out_root))
-            .unwrap_or(out_root)
-    };
-    // Take the listener HERE: after the API key is settled, and before the
-    // first thing that writes to the data directory.
-    //
-    // The bind used to sit at the very end of startup, thousands of lines
-    // below, so a daemon that could not have its port had already created
-    // `.spool` and written settings.json before it found out. Those writes
-    // are not incidental clutter - they ARE the "is this a fresh install?"
-    // answer that `legacy_rename_punctuation` reads above.
-    // A failed start therefore converted the directory from "fresh" to
-    // "existing", and the NEXT start read the converted answer.
-    //
-    // That was a live flake, not a theoretical one: the daemon suites
-    // spawn on an OS-assigned port and relaunch when they lose it to a
-    // parallel test, so under `cargo test --workspace`
-    // `obfuscated_event_release_keeps_its_words` filed its download as
-    // `Formula1 (2026) ... [2160p]` - the pre-upgrade punctuation shape -
-    // because attempt 1's corpse told attempt 2 it was an upgrade. Nothing
-    // about the failure looked like a port problem. For a user the same
-    // ordering meant `nzbfast serve --port <taken>` left a half-initialised
-    // data directory behind.
-    //
-    // WHY HERE AND NOT EARLIER. The port is final from `apply_saved_settings`
-    // onwards (settings.json wins over the CLI), so this could sit further
-    // up - but it must not. `first_run_apikey` above is the gate that
-    // REFUSES to start on an empty or unreadable key file, and binding
-    // before it would turn a lost port into a bind error where an operator
-    // (and firstrun_key.rs) expects to be told the credential is broken.
-    // Binding after it also means the listener never exists before the
-    // credential does, so there is no window in which tiny_http's accept
-    // thread is up without an API key behind it. The one thing a failed
-    // bind can still leave is the minted key file, which is harmless: it
-    // feeds neither `legacy_rename_punctuation` nor anything else that
-    // decides fresh-vs-existing, and the next start correctly reuses it -
-    // and MintDisclosure is armed above, so exactly this exit is the one
-    // that tells the user the key exists.
-    //
-    // runtime.json is NOT written here: it stays down by the banner. Its
-    // invariant is "the listener exists AND the file appears before the
-    // readiness banner" - both still hold with the bind up here - and it
-    // needs the daemon's launcher token, which is only constructed below.
-    let server = tiny_http::Server::http((bind.as_str(), port))
-        .map_err(|e| anyhow::anyhow!("bind {bind}:{port}: {e}"))?;
-    let spool = spool_dir(&config, &out_root);
-    // Windows has no dotfile convention, so `.spool` is plainly visible
-    // wherever it lands - including inside the user's download folder on
-    // an install that predates the data-dir move. Create it up front so
-    // there is something to set the attribute ON: every other writer
-    // makes it implicitly via create_dir_all of a child, which would
-    // leave the hide to lose a race it cannot see.
-    let _ = std::fs::create_dir_all(&spool);
-    nzbkit::disk::hide_from_user(&spool);
-    // ONE daemon per data directory. Two daemons sharing one - the
-    // classic shape is an old container still running while its
-    // replacement starts on another port - trade last-writer-wins
-    // clobbers of settings.json and the queue, each overwriting the
-    // other's state on every save with nothing on screen to say so. An
-    // OS advisory lock, so it dies with the process and there is no
-    // stale-lock state to recover from.
-    //
-    // Placement: after `spool_dir`, whose migration logic treats an
-    // empty new spool as a placeholder to remove - a lock file created
-    // inside it earlier would read as a completed migration. After the
-    // bind, so a daemon that merely lost its port still exits through
-    // the bind error and writes nothing (pinned by
-    // a_daemon_that_loses_its_port_writes_nothing). And before the
-    // Daemon is constructed, ahead of every runtime writer.
-    //
-    // Only a HELD lock refuses. A filesystem that cannot lock at all
-    // (some network mounts) carries on silently: refusing there would
-    // brick every NAS install that survives today, to close a race it
-    // cannot even detect.
-    let _serve_lock = match std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(spool.join("serve.lock"))
-    {
-        Ok(f) => {
-            // A restart is allowed to overlap itself: launchers and
-            // deploy scripts start the replacement while the old
-            // process is still tearing down, and the lock is released
-            // at its death, not at any earlier point. So a held lock
-            // gets a few seconds to clear before it is treated as a
-            // genuinely concurrent daemon.
-            let mut verdict = f.try_lock();
-            for _ in 0..25 {
-                match verdict {
-                    Err(std::fs::TryLockError::WouldBlock) => {
-                        std::thread::sleep(std::time::Duration::from_millis(120));
-                        verdict = f.try_lock();
-                    }
-                    _ => break,
-                }
-            }
-            match verdict {
-                Ok(()) => Some(f),
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    let dir = config.parent().unwrap_or(&config);
-                    anyhow::bail!(
-                        "another nzbfast daemon is already serving from {} - two daemons \
-                         sharing one data directory overwrite each other's settings and \
-                         queue, so this one is stopping. Stop the other daemon first; an \
-                         old container or launcher still running is the usual cause. To \
-                         run several daemons on purpose, give each its own --config.",
-                        dir.display()
-                    );
-                }
-                Err(std::fs::TryLockError::Error(_)) => None,
-            }
-        }
-        Err(_) => None,
-    };
-    let daemon = Arc::new(Daemon {
-        hub: Arc::new(crate::StreamHub::default()),
-        paused: std::sync::atomic::AtomicBool::new(false),
-        offline: std::sync::atomic::AtomicBool::new(false),
-        paused_by_offline: std::sync::atomic::AtomicBool::new(false),
-        queue: Mutex::new(VecDeque::new()),
-        history: Mutex::new(Vec::new()),
-        add_lock: Mutex::new(()),
-        moving: Mutex::new(std::collections::HashSet::new()),
-        reserved: Mutex::new(std::collections::HashSet::new()),
-        progress: Arc::new(AtomicU64::new(0)),
-        active_total: AtomicU64::new(0),
-        active_dl: Mutex::new(None),
-        started_at: Mutex::new(None),
-        last_download_end: Mutex::new(Instant::now()),
-        stall_since: Mutex::new(None),
-        next_id: AtomicU64::new(1),
-        out_root: std::sync::RwLock::new(out_root.clone()),
-        move_completed: std::sync::RwLock::new(None),
-        move_completed_cats: std::sync::RwLock::new(Vec::new()),
-        spool: spool.clone(),
-        cfg_path: config.clone(),
-        cats: Mutex::new(DEFAULT_CATS.iter().map(|s| s.to_string()).collect()),
-        port,
-        // A failed mint leaves an EMPTY token, and `launcher_proof` then
-        // answers a challenge with sha256(":nonce") - a value any process
-        // could compute. Refuse to answer at all instead: the wrappers
-        // treat "no proof" as "an older daemon" and fall back, which is
-        // strictly better than a proof anyone can forge.
-        launcher_token: random_apikey().unwrap_or_default(),
-        port_locked: port_locked(),
-        library_cats: Mutex::new(library_cats),
-        active_stream: Mutex::new(None),
-        index_db: index_db.clone(),
-        index: Mutex::new(None),
-        index_read: IndexReadPool::default(),
-        index_read_warned: AtomicU64::new(0),
-        index_migrated: std::sync::atomic::AtomicBool::new(false),
-        index_stats_cache: Mutex::new(None),
-        auto_speed: std::sync::atomic::AtomicBool::new(auto_speed),
-        preflight: std::sync::atomic::AtomicBool::new(preflight),
-        auto_connections: std::sync::atomic::AtomicBool::new(true),
-        wall_hide_adult: std::sync::atomic::AtomicBool::new(true),
-        auto_defer: std::sync::atomic::AtomicBool::new(true),
-        post_health: std::sync::atomic::AtomicBool::new(true),
-        post_health_defer: std::sync::atomic::AtomicBool::new(false),
-        auto_prefetch: std::sync::atomic::AtomicBool::new(true),
-        race_stragglers: std::sync::atomic::AtomicBool::new(true),
-        oracle_route: std::sync::atomic::AtomicBool::new(false),
-        index_deepen: AtomicU64::new(200_000),
-        index_coverage: std::sync::atomic::AtomicBool::new(true),
-        index_gapfill: AtomicU64::new(4),
-        bench_interval: AtomicU64::new(0),
-        bench_last: AtomicU64::new(0),
-        update_manifest: Mutex::new(None),
-        update_serial_seen: std::sync::atomic::AtomicU64::new(0),
-        // Notify-only: finding a newer version raises the dashboard
-        // banner and nothing else - the daemon never replaces its own
-        // binary (the self-update code was removed in 1.0.5; the
-        // manifest itself is still ed25519-verified before the banner
-        // trusts it). ON by default so users hear about releases; turn
-        // it off here (or empty update_url) and the daemon never
-        // phones the manifest at all.
-        update_checks: std::sync::atomic::AtomicBool::new(true),
-        unit_bits: std::sync::atomic::AtomicBool::new(false),
-        update_url: Mutex::new(DEFAULT_UPDATE_URL.to_string()),
-        ui_locale: Mutex::new(String::new()),
-        sidecar: Mutex::new(None),
-        media_rejudge: Mutex::new(Vec::new()),
-        best_rate_bps: AtomicU64::new(0),
-        speed_ceiling: AtomicU64::new(0),
-        mem_budget_total: mem_budget.total,
-        feeds: Mutex::new(Vec::new()),
-        feed_health: Mutex::new(Default::default()),
-        last_refusals: Mutex::new(Default::default()),
-        indexers: Mutex::new(Vec::new()),
-        watchlist_external: std::sync::atomic::AtomicBool::new(false),
-        watchlist_external_set: std::sync::atomic::AtomicBool::new(false),
-        indexer_rt: Mutex::new(IndexerRuntime::default()),
-        // §74: on by default and inert without the indexer - see the
-        // field. Saved settings replay over these below.
-        watchlist_instant: AtomicBool::new(true),
-        watchlist_instant_max: std::sync::atomic::AtomicU32::new(INSTANT_MAX_DEFAULT),
-        instant_kicks: Mutex::new(std::collections::VecDeque::new()),
-        instant_pending: Mutex::new(std::collections::HashMap::new()),
-        instant_hint: Mutex::new(Vec::new()),
-        nzblnk_recent: Mutex::new(std::collections::VecDeque::new()),
-        smart_folders: Mutex::new(Vec::new()),
-        par_cleanup: AtomicBool::new(true),
-        // OFF unless asked for: an install that says nothing keeps
-        // exactly the modes it has today (#20).
-        out_umask: std::sync::atomic::AtomicU32::new(out_umask.unwrap_or(u32::MAX)),
-        fast_par: AtomicBool::new(FAST_PAR_DEFAULT),
-        prefer_external_unrar: AtomicBool::new(false),
-        cleanup_exts: Mutex::new(Vec::new()),
-        password_file: Mutex::new(config.with_file_name("passwords.txt")),
-        password_prompt: Mutex::new("done".to_string()),
-        unpack_eat_volumes: Mutex::new("off".to_string()),
-        // Loaded from settings.json below (next to smart_folders); the
-        // reclassify flag starts set so startup reconciles the stored
-        // rows against the current config exactly once (the index stamps
-        // the config fingerprint, so an unchanged config is a no-op).
-        custom_categories: std::sync::RwLock::new(Vec::new()),
-        reclassify_pending: std::sync::atomic::AtomicBool::new(true),
-        // Auto-rename defaults: on, with resolution in the name; codecs /
-        // source / group off; junk sweep on; keep-media-only off. Saved
-        // settings replay over these below.
-        identity_lookup: std::sync::atomic::AtomicBool::new(true),
-        auto_rename: std::sync::atomic::AtomicBool::new(true),
-        rename_resolution: std::sync::atomic::AtomicBool::new(true),
-        rename_vcodec: std::sync::atomic::AtomicBool::new(false),
-        rename_acodec: std::sync::atomic::AtomicBool::new(false),
-        rename_source: std::sync::atomic::AtomicBool::new(false),
-        rename_group: std::sync::atomic::AtomicBool::new(false),
-        rename_year_parens: std::sync::atomic::AtomicBool::new(legacy_rename_punctuation),
-        rename_quality_brackets: std::sync::atomic::AtomicBool::new(legacy_rename_punctuation),
-        rename_extra_words: std::sync::atomic::AtomicBool::new(true),
-        rename_identify: std::sync::atomic::AtomicBool::new(true),
-        // Off by default, alone among the rename sub-settings: it
-        // changes filenames an existing install already wrote, and an
-        // *arr's import matcher is reading those. See the field docs.
-        rename_episode_titles: std::sync::atomic::AtomicBool::new(false),
-        history_rows: AtomicU64::new(10),
-        history_color_names: std::sync::atomic::AtomicBool::new(true),
-        ladder_live: Mutex::new(None),
-        ladder_busy: std::sync::atomic::AtomicBool::new(false),
-        ladder_cancel: std::sync::atomic::AtomicBool::new(false),
-        media_chip_color: std::sync::atomic::AtomicBool::new(true),
-        shape_chip_color: std::sync::atomic::AtomicBool::new(true),
-        rename_junk: std::sync::atomic::AtomicBool::new(true),
-        rename_media_only: std::sync::atomic::AtomicBool::new(false),
-        index_max_age_secs: AtomicU64::new(index_max_age_secs),
-        // Retention defaults ON: if a user bothered to set a max-age
-        // window they almost always want the DB to hold ~that window,
-        // not hoard everything older. Off = ingest-gate-only (the
-        // pre-M31 behavior), toggle in Settings (persists across
-        // restarts like the other live settings).
-        index_retention: std::sync::atomic::AtomicBool::new(
-            load_settings(&settings_path)
-                .get("index_retention")
-                .and_then(Value::as_bool)
-                .unwrap_or(true),
-        ),
-        index_pause_on_download: std::sync::atomic::AtomicBool::new(
-            load_settings(&settings_path)
-                .get("index_pause_on_download")
-                .and_then(Value::as_bool)
-                .unwrap_or(true),
-        ),
-        index_paused: std::sync::atomic::AtomicBool::new(
-            load_settings(&settings_path)
-                .get("index_paused")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-        ),
-        index_enabled: std::sync::atomic::AtomicBool::new(index_enabled),
-        // Pre feed: OFF unless the user has explicitly saved it on. A
-        // missing key, a null, or a non-bool all land here - there is no
-        // path that opens an outbound IRC connection by accident.
-        predb_enabled: std::sync::atomic::AtomicBool::new(
-            load_settings(&settings_path)
-                .get("predb_enabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-        ),
-        predb_server: Mutex::new(
-            load_settings(&settings_path)
-                .get("predb_server")
-                .and_then(Value::as_str)
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or(nzbkit::predb::DEFAULT_HOST)
-                .to_string(),
-        ),
-        predb_channels: Mutex::new(
-            load_settings(&settings_path)
-                .get("predb_channels")
-                .and_then(Value::as_str)
-                .filter(|s| !s.trim().is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| nzbkit::predb::DEFAULT_CHANNELS.join(",")),
-        ),
-        predb_nick: Mutex::new(
-            load_settings(&settings_path)
-                .get("predb_nick")
-                .and_then(Value::as_str)
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or(nzbkit::predb::DEFAULT_NICK)
-                .to_string(),
-        ),
-        predb_pending: Mutex::new(Vec::new()),
-        predb_status: Mutex::new(String::new()),
-        // Correlation: same explicit-opt-in contract as the feed. Both
-        // default OFF; a missing key never turns an inference engine on.
-        predb_corr_enabled: std::sync::atomic::AtomicBool::new(
-            load_settings(&settings_path)
-                .get("predb_corr_enabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-        ),
-        predb_corr_auto: std::sync::atomic::AtomicBool::new(
-            load_settings(&settings_path)
-                .get("predb_corr_auto")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-        ),
-        predb_max_rows: std::sync::atomic::AtomicU64::new(predb_seed::PREDB_MAX_ROWS_DEFAULT),
-        predb_seed_days: std::sync::atomic::AtomicU64::new(predb_seed::PREDB_SEED_DAYS_DEFAULT),
-        predb_seed_running: std::sync::atomic::AtomicBool::new(false),
-        predb_seed_status: Mutex::new(String::new()),
-        // Spots are new, so there is no existing-install case to seed
-        // from: nobody has one running today. Straight off until asked.
-        spot_enabled: std::sync::atomic::AtomicBool::new(
-            load_settings(&settings_path)
-                .get("spot_enabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-        ),
-        spot_groups: Mutex::new(
-            load_settings(&settings_path)
-                .get("spot_groups")
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_else(|| vec!["free.pt".to_string()]),
-        ),
-        spot_backfill: AtomicU64::new(
-            load_settings(&settings_path)
-                .get("spot_backfill")
-                .and_then(Value::as_u64)
-                .unwrap_or(50_000)
-                .clamp(1_000, 1_000_000),
-        ),
-        index_generation: AtomicU64::new(0),
-        index_jobs_active: Arc::new(AtomicUsize::new(0)),
-        // M34 size cap. UI-only settings (no CLI flags), read straight
-        // off settings.json like index_retention above.
-        index_max_bytes: AtomicU64::new(
-            load_settings(&settings_path)
-                .get("index_max_bytes")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-        ),
-        // OFF unless the user has explicitly saved it on. A missing key,
-        // a null, or a non-bool all land here - there is no path that
-        // turns deletion on by accident.
-        index_evict: std::sync::atomic::AtomicBool::new(
-            load_settings(&settings_path)
-                .get("index_evict")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-        ),
-        index_evict_order: Mutex::new(
-            load_settings(&settings_path)
-                .get("index_evict_order")
-                .and_then(Value::as_str)
-                // A hand-edited settings.json can hold anything; keep
-                // the invariant that this field is always valid.
-                .filter(|s| parse_evict_order(s).is_some())
-                .unwrap_or("ladder")
-                .to_string(),
-        ),
-        index_evict_kinds: Mutex::new(
-            load_settings(&settings_path)
-                .get("index_evict_kinds")
-                .and_then(|v| match v {
-                    // save_setting persists the parsed Vec<String>; the
-                    // comma string is accepted too so a hand-written
-                    // settings.json works.
-                    Value::Array(a) => Some(
-                        a.iter()
-                            .filter_map(Value::as_str)
-                            .collect::<Vec<_>>()
-                            .join(","),
-                    ),
-                    Value::String(s) => Some(s.clone()),
-                    _ => None,
-                })
-                .and_then(|s| parse_evict_kinds(&s).ok())
-                .unwrap_or_default(),
-        ),
-        compact_pending: std::sync::atomic::AtomicBool::new(false),
-        last_auto_trim: std::sync::Mutex::new(None),
-        index_opened: Mutex::new(
-            crate::persist::load_json_with_backup(&spool.join("index-opened.json"))
-                .and_then(|v| serde_json::from_value::<OpenedLog>(v).ok())
-                .unwrap_or_default(),
-        ),
-        index_gates: Mutex::new((
-            load_settings(&settings_path)
-                .get("index_gates")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            index_gates,
-        )),
-        line_speed: AtomicU64::new(
-            load_settings(&settings_path)
-                .get("line_speed")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-        ),
-        tune_hint: Mutex::new(String::new()),
-        cpu_sample: Mutex::new(None),
-        speed_win: Mutex::new(VecDeque::new()),
-        usage: Mutex::new(
-            crate::persist::load_json_with_backup(&spool.join("usage.json"))
-                .and_then(|v| v.as_object().cloned())
-                .unwrap_or_default(),
-        ),
-        pause_until: Mutex::new(None),
-        pause_gen: AtomicU64::new(0),
-        connections: std::sync::atomic::AtomicUsize::new(connections.max(1)),
-        window: std::sync::atomic::AtomicUsize::new(window.max(1)),
-        decoders: std::sync::atomic::AtomicUsize::new(decoders.max(1)),
-        fast_verify: std::sync::atomic::AtomicBool::new(fast_verify),
-        verify_lean: std::sync::atomic::AtomicBool::new(verify_lean),
-        min_free: AtomicU64::new(min_free.unwrap_or(MIN_FREE_DEFAULT)),
-        queue_hold: std::sync::Mutex::new(None),
-        pause_source: std::sync::Mutex::new("user"),
-        limit_source: std::sync::Mutex::new("user"),
-        auto_retry_secs: AtomicU64::new(
-            std::env::var("NZBFAST_AUTO_RETRY_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(auto_retry_mins * 60),
-        ),
-        quota: AtomicU64::new(quota.unwrap_or(0)),
-        quota_period: std::sync::atomic::AtomicU8::new(if quota_period == 'm' {
-            b'm'
-        } else {
-            b'd'
-        }),
-        watch_dir: Mutex::new(watch),
-        watch_keep_nzb: AtomicBool::new(false),
-        watch_failed: Mutex::new(std::collections::HashMap::new()),
-        watch_picked: Mutex::new(std::collections::VecDeque::new()),
-        auto_retried: Mutex::new(std::collections::VecDeque::new()),
-        giveup_tripped: Mutex::new(std::collections::VecDeque::new()),
-        watch_upgraded: Mutex::new(std::collections::VecDeque::new()),
-        delete_kept: Mutex::new(std::collections::VecDeque::new()),
-        auth_fails: Mutex::new(std::collections::HashMap::new()),
-        enrich_hot: Mutex::new(std::collections::VecDeque::new()),
-        group_catalog: Mutex::new(None),
-        group_fetching: std::sync::atomic::AtomicBool::new(false),
-        group_fetch_err: Mutex::new(None),
-        group_stats: Mutex::new(Arc::new(crate::groupstats::StatsCache::default())),
-        group_sampling: Mutex::new(std::collections::HashSet::new()),
-        group_desc_isc: std::sync::atomic::AtomicBool::new(opts.group_desc_isc),
-        script: Mutex::new(script),
-        script_timeout: AtomicU64::new(3600),
-        notify_targets: Mutex::new(Vec::new()),
-        notify_health: Mutex::new(Default::default()),
-        failure_link: Mutex::new("off".to_string()),
-        quality_prefs: Mutex::new(
-            load_settings(&settings_path)
-                .get("prefer_quality")
-                .and_then(|v| crate::watchlist::QualityPrefs::from_value(v).ok())
-                .unwrap_or_default(),
-        ),
-        apikey: Mutex::new(apikey),
-        nzbkey: Mutex::new(nzbkey),
-        stream_secret: {
-            let saved = load_settings(&settings_path)
-                .get("stream_secret")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
-            match saved {
-                Some(s) => s,
-                None => {
-                    let s = fresh_secret();
-                    save_setting(&settings_path, "stream_secret", json!(&s));
-                    s
-                }
-            }
-        },
-        omdb_key: Mutex::new(
-            load_settings(&settings_path)
-                .get("omdb_key")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .filter(|k| !k.is_empty()),
-        ),
-        library_recheck_secs: AtomicU64::new(library_recheck_secs.max(1)),
-        index_groups: Mutex::new(index_groups),
-        index_interests: Mutex::new(String::new()),
-        index_interests_applied: Mutex::new(String::new()),
-        index_interest_groups: Mutex::new(Vec::new()),
-        index_interval_secs: AtomicU64::new(index_interval_secs),
-        index_backfill: AtomicU64::new(index_backfill),
-        scan_now: tokio::sync::Notify::new(),
-        scan_deep: AtomicU64::new(0),
-        scan_progress: Mutex::new(Vec::new()),
-        index_scan_par: AtomicU64::new(3),
-        scan_active: std::sync::atomic::AtomicBool::new(false),
-        index_tip_secs: AtomicU64::new(20),
-        watch_interval_secs: AtomicU64::new(5),
-        watch_scan_now: tokio::sync::Notify::new(),
-        oracle_sample: AtomicU64::new(300),
-        schedule: Mutex::new(Vec::new()),
-        schedule_text: Mutex::new(String::new()),
-        watchlist: Mutex::new(Vec::new()),
-        watch_state: Mutex::new(Default::default()),
-        watch_now: tokio::sync::Notify::new(),
-        arr_giveup_threshold: AtomicU64::new(0),
-        arr_instances: Mutex::new(Vec::new()),
-        giveup: Arc::new(Mutex::new(Default::default())),
-        settings_path: settings_path.clone(),
-        taste_cache: Mutex::new(None),
-    });
-
+fn restore_runtime_state(
+    daemon: &Arc<Daemon>,
+    settings_path: &Path,
+    _spool: &Path,
+    _config: &Path,
+    speedlimit: &Option<String>,
+) -> Result<()> {
     // Bring back the job records a previous run persisted (Downloading
     // reverts to Queued inside load_queue - the download restarts and its
     // journal skips what already landed).
@@ -4475,7 +3869,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
     // exist only in settings.json (no CLI flag), parsed here because
     // they need the daemon to exist.
     {
-        let saved = load_settings(&settings_path);
+        let saved = load_settings(settings_path);
         if let Some(v) = saved.get("smart_folders") {
             match serde_json::from_value::<Vec<crate::smart::Rule>>(v.clone()) {
                 Ok(list) => *daemon.smart_folders.lock_ok() = list,
@@ -4592,7 +3986,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                         );
                     }
                     if !renamed.is_empty() {
-                        save_settings(&settings_path, &[("custom_categories", json!(&list))]);
+                        save_settings(settings_path, &[("custom_categories", json!(&list))]);
                     }
                     match nzbkit::categories::validate(&list) {
                         Ok(()) => *daemon.custom_categories.write_ok() = list,
@@ -4644,7 +4038,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
                              that predates provenance tracking",
                             owned.len()
                         );
-                        save_settings(&settings_path, &[("index_interest_groups", json!(&owned))]);
+                        save_settings(settings_path, &[("index_interest_groups", json!(&owned))]);
                         *daemon.index_interest_groups.lock_ok() = owned;
                     }
                 }
@@ -4716,6 +4110,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
         }
         for (key, field) in [
             ("race_stragglers", &daemon.race_stragglers),
+            ("adaptive_timeouts", &daemon.adaptive_timeouts),
             ("auto_rename", &daemon.auto_rename),
             ("identity_lookup", &daemon.identity_lookup),
             ("rename_resolution", &daemon.rename_resolution),
@@ -4829,6 +4224,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
         if let Some(v) = saved.get("index_gapfill").and_then(Value::as_u64) {
             daemon.index_gapfill.store(v.min(100), Ordering::Relaxed);
         }
+        #[cfg(feature = "indexer")]
         if let Some(v) = saved.get("predb_max_rows").and_then(Value::as_u64) {
             daemon.predb_max_rows.store(
                 v.clamp(
@@ -4868,22 +4264,421 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
     // A pause the user set is part of the state a restart has to land in,
     // the same as the queue itself. Before the scheduler below, which may
     // overrule it.
-    restore_pause(&daemon, &load_settings(&settings_path));
+    restore_pause(daemon, &load_settings(settings_path));
 
     // `docker stop`, `systemctl stop`, a Ctrl-C in a terminal: all of
     // them are a request to stop, and until now none of them reached the
     // wind-down the tray's Quit item has always had (issue #13).
-    install_shutdown_signals(&daemon);
+    install_shutdown_signals(daemon);
+    Ok(())
+}
 
-    tasks::spawn_scheduler(&daemon, &settings_path, &schedule)?;
+fn seed_index_retention(settings_path: &Path) -> std::sync::atomic::AtomicBool {
+    std::sync::atomic::AtomicBool::new(
+        load_settings(settings_path)
+            .get("index_retention")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+    )
+}
 
-    tasks::spawn_watch_folder(&daemon);
+fn seed_index_pause_on_download(settings_path: &Path) -> std::sync::atomic::AtomicBool {
+    std::sync::atomic::AtomicBool::new(
+        load_settings(settings_path)
+            .get("index_pause_on_download")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+    )
+}
 
-    tasks::spawn_memory_trim(&daemon);
+fn seed_index_paused(settings_path: &Path) -> std::sync::atomic::AtomicBool {
+    std::sync::atomic::AtomicBool::new(
+        load_settings(settings_path)
+            .get("index_paused")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    )
+}
 
-    tasks::spawn_auto_speed(&daemon, &config);
+fn seed_predb_enabled(settings_path: &Path) -> std::sync::atomic::AtomicBool {
+    std::sync::atomic::AtomicBool::new(
+        load_settings(settings_path)
+            .get("predb_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    )
+}
 
-    tasks::spawn_group_catalog(&daemon, &config);
+fn seed_predb_server(settings_path: &Path) -> Mutex<String> {
+    Mutex::new(
+        load_settings(settings_path)
+            .get("predb_server")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(nzbkit::predb::DEFAULT_HOST)
+            .to_string(),
+    )
+}
+
+fn seed_predb_channels(settings_path: &Path) -> Mutex<String> {
+    Mutex::new(
+        load_settings(settings_path)
+            .get("predb_channels")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| nzbkit::predb::DEFAULT_CHANNELS.join(",")),
+    )
+}
+
+fn seed_predb_nick(settings_path: &Path) -> Mutex<String> {
+    Mutex::new(
+        load_settings(settings_path)
+            .get("predb_nick")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(nzbkit::predb::DEFAULT_NICK)
+            .to_string(),
+    )
+}
+
+fn seed_predb_corr_enabled(settings_path: &Path) -> std::sync::atomic::AtomicBool {
+    std::sync::atomic::AtomicBool::new(
+        load_settings(settings_path)
+            .get("predb_corr_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    )
+}
+
+fn seed_predb_corr_auto(settings_path: &Path) -> std::sync::atomic::AtomicBool {
+    std::sync::atomic::AtomicBool::new(
+        load_settings(settings_path)
+            .get("predb_corr_auto")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    )
+}
+
+fn seed_spot_enabled(settings_path: &Path) -> std::sync::atomic::AtomicBool {
+    std::sync::atomic::AtomicBool::new(
+        load_settings(settings_path)
+            .get("spot_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    )
+}
+
+fn seed_spot_groups(settings_path: &Path) -> Mutex<Vec<String>> {
+    Mutex::new(
+        load_settings(settings_path)
+            .get("spot_groups")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_else(|| vec!["free.pt".to_string()]),
+    )
+}
+
+fn seed_spot_backfill(settings_path: &Path) -> AtomicU64 {
+    AtomicU64::new(
+        load_settings(settings_path)
+            .get("spot_backfill")
+            .and_then(Value::as_u64)
+            .unwrap_or(50_000)
+            .clamp(1_000, 1_000_000),
+    )
+}
+
+fn seed_index_max_bytes(settings_path: &Path) -> AtomicU64 {
+    AtomicU64::new(
+        load_settings(settings_path)
+            .get("index_max_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    )
+}
+
+fn seed_index_evict(settings_path: &Path) -> std::sync::atomic::AtomicBool {
+    std::sync::atomic::AtomicBool::new(
+        load_settings(settings_path)
+            .get("index_evict")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    )
+}
+
+#[cfg(feature = "indexer")]
+fn seed_index_evict_order(settings_path: &Path) -> Mutex<String> {
+    Mutex::new(
+        load_settings(settings_path)
+            .get("index_evict_order")
+            .and_then(Value::as_str)
+            // A hand-edited settings.json can hold anything; keep
+            // the invariant that this field is always valid.
+            .filter(|s| parse_evict_order(s).is_some())
+            .unwrap_or("ladder")
+            .to_string(),
+    )
+}
+
+#[cfg(feature = "indexer")]
+fn seed_index_evict_kinds(settings_path: &Path) -> Mutex<Vec<String>> {
+    Mutex::new(
+        load_settings(settings_path)
+            .get("index_evict_kinds")
+            .and_then(|v| match v {
+                // save_setting persists the parsed Vec<String>; the
+                // comma string is accepted too so a hand-written
+                // settings.json works.
+                Value::Array(a) => Some(
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .and_then(|s| parse_evict_kinds(&s).ok())
+            .unwrap_or_default(),
+    )
+}
+
+#[cfg(feature = "indexer")]
+fn seed_index_gates(
+    settings_path: &Path,
+    index_gates: Option<crate::gates::Gates>,
+) -> Mutex<(String, Option<crate::gates::Gates>)> {
+    Mutex::new((
+        load_settings(settings_path)
+            .get("index_gates")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        index_gates,
+    ))
+}
+
+fn seed_line_speed(settings_path: &Path) -> AtomicU64 {
+    AtomicU64::new(
+        load_settings(settings_path)
+            .get("line_speed")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    )
+}
+
+fn seed_auto_retry_secs(_settings_path: &Path, auto_retry_mins: u64) -> AtomicU64 {
+    AtomicU64::new(
+        std::env::var("NZBFAST_AUTO_RETRY_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(auto_retry_mins * 60),
+    )
+}
+
+fn seed_quality_prefs(settings_path: &Path) -> Mutex<crate::watchlist::QualityPrefs> {
+    Mutex::new(
+        load_settings(settings_path)
+            .get("prefer_quality")
+            .and_then(|v| crate::watchlist::QualityPrefs::from_value(v).ok())
+            .unwrap_or_default(),
+    )
+}
+
+fn seed_stream_secret(settings_path: &Path) -> String {
+    {
+        let saved = load_settings(settings_path)
+            .get("stream_secret")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        match saved {
+            Some(s) => s,
+            None => {
+                let s = fresh_secret();
+                save_setting(settings_path, "stream_secret", json!(&s));
+                s
+            }
+        }
+    }
+}
+
+fn seed_omdb_key(settings_path: &Path) -> Mutex<Option<String>> {
+    Mutex::new(
+        load_settings(settings_path)
+            .get("omdb_key")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|k| !k.is_empty()),
+    )
+}
+
+#[cfg(feature = "indexer")]
+fn resolve_index_enabled(settings_path: &Path, index_groups: &[String]) -> bool {
+    let saved = load_settings(settings_path);
+    match saved.get("index_enabled").and_then(Value::as_bool) {
+        Some(v) => v,
+        None => {
+            let configured = !index_groups.is_empty()
+                || saved
+                    .get("index_interests")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.trim().is_empty());
+            //
+            // Deliberately NOT written back to settings.json. The
+            // derivation is stable (it re-runs identically every
+            // start), the first touch of the switch in the UI saves
+            // a real answer that wins from then on, and startup
+            // writes to that file are their own hazard - the
+            // first-run API key mint keys off which keys are in it
+            // (see SETUP_ANSWER_KEYS).
+            if configured {
+                info!(
+                    target: "index",
+                    "indexing is on for the groups this install already had; \
+                     it is a switch now (Settings → Indexing) and new installs start off"
+                );
+            }
+            configured
+        }
+    }
+}
+
+fn take_listener(bind: &str, port: u16) -> Result<tiny_http::Server> {
+    // Take the listener HERE: after the API key is settled, and before the
+    // first thing that writes to the data directory.
+    //
+    // The bind used to sit at the very end of startup, thousands of lines
+    // below, so a daemon that could not have its port had already created
+    // `.spool` and written settings.json before it found out. Those writes
+    // are not incidental clutter - they ARE the "is this a fresh install?"
+    // answer that `legacy_rename_punctuation` reads above.
+    // A failed start therefore converted the directory from "fresh" to
+    // "existing", and the NEXT start read the converted answer.
+    //
+    // That was a live flake, not a theoretical one: the daemon suites
+    // spawn on an OS-assigned port and relaunch when they lose it to a
+    // parallel test, so under `cargo test --workspace`
+    // `obfuscated_event_release_keeps_its_words` filed its download as
+    // `Formula1 (2026) ... [2160p]` - the pre-upgrade punctuation shape -
+    // because attempt 1's corpse told attempt 2 it was an upgrade. Nothing
+    // about the failure looked like a port problem. For a user the same
+    // ordering meant `nzbfast serve --port <taken>` left a half-initialised
+    // data directory behind.
+    //
+    // WHY HERE AND NOT EARLIER. The port is final from `apply_saved_settings`
+    // onwards (settings.json wins over the CLI), so this could sit further
+    // up - but it must not. `first_run_apikey` above is the gate that
+    // REFUSES to start on an empty or unreadable key file, and binding
+    // before it would turn a lost port into a bind error where an operator
+    // (and firstrun_key.rs) expects to be told the credential is broken.
+    // Binding after it also means the listener never exists before the
+    // credential does, so there is no window in which tiny_http's accept
+    // thread is up without an API key behind it. The one thing a failed
+    // bind can still leave is the minted key file, which is harmless: it
+    // feeds neither `legacy_rename_punctuation` nor anything else that
+    // decides fresh-vs-existing, and the next start correctly reuses it -
+    // and MintDisclosure is armed above, so exactly this exit is the one
+    // that tells the user the key exists.
+    //
+    // runtime.json is NOT written here: it stays down by the banner. Its
+    // invariant is "the listener exists AND the file appears before the
+    // readiness banner" - both still hold with the bind up here - and it
+    // needs the daemon's launcher token, which is only constructed below.
+    tiny_http::Server::http((bind, port)).map_err(|e| anyhow::anyhow!("bind {bind}:{port}: {e}"))
+}
+
+fn acquire_serve_lock(spool: &Path, config: &Path) -> Result<Option<std::fs::File>> {
+    // ONE daemon per data directory. Two daemons sharing one - the
+    // classic shape is an old container still running while its
+    // replacement starts on another port - trade last-writer-wins
+    // clobbers of settings.json and the queue, each overwriting the
+    // other's state on every save with nothing on screen to say so. An
+    // OS advisory lock, so it dies with the process and there is no
+    // stale-lock state to recover from.
+    //
+    // Placement: after `spool_dir`, whose migration logic treats an
+    // empty new spool as a placeholder to remove - a lock file created
+    // inside it earlier would read as a completed migration. After the
+    // bind, so a daemon that merely lost its port still exits through
+    // the bind error and writes nothing (pinned by
+    // a_daemon_that_loses_its_port_writes_nothing). And before the
+    // Daemon is constructed, ahead of every runtime writer.
+    //
+    // Only a HELD lock refuses. A filesystem that cannot lock at all
+    // (some network mounts) carries on silently: refusing there would
+    // brick every NAS install that survives today, to close a race it
+    // cannot even detect.
+    Ok(
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(spool.join("serve.lock"))
+        {
+            Ok(f) => {
+                // A restart is allowed to overlap itself: launchers and
+                // deploy scripts start the replacement while the old
+                // process is still tearing down, and the lock is released
+                // at its death, not at any earlier point. So a held lock
+                // gets a few seconds to clear before it is treated as a
+                // genuinely concurrent daemon.
+                let mut verdict = f.try_lock();
+                for _ in 0..25 {
+                    match verdict {
+                        Err(std::fs::TryLockError::WouldBlock) => {
+                            std::thread::sleep(std::time::Duration::from_millis(120));
+                            verdict = f.try_lock();
+                        }
+                        _ => break,
+                    }
+                }
+                match verdict {
+                    Ok(()) => Some(f),
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        let dir = config.parent().unwrap_or(config);
+                        anyhow::bail!(
+                            "another nzbfast daemon is already serving from {} - two daemons \
+                         sharing one data directory overwrite each other's settings and \
+                         queue, so this one is stopping. Stop the other daemon first; an \
+                         old container or launcher still running is the usual cause. To \
+                         run several daemons on purpose, give each its own --config.",
+                            dir.display()
+                        );
+                    }
+                    Err(std::fs::TryLockError::Error(_)) => None,
+                }
+            }
+            Err(_) => None,
+        },
+    )
+}
+
+fn spawn_core_tasks(
+    daemon: &Arc<Daemon>,
+    config: &Path,
+    settings_path: &Path,
+    schedule: &Option<PathBuf>,
+    feeds: &Option<PathBuf>,
+    #[cfg(feature = "indexer")] index_db: &Path,
+    mem_budget: nzbkit::mem::MemBudget,
+) -> Result<()> {
+    tasks::spawn_scheduler(daemon, settings_path, schedule)?;
+
+    tasks::spawn_watch_folder(daemon);
+
+    tasks::spawn_memory_trim(daemon);
+
+    tasks::spawn_auto_speed(daemon, config);
+
+    #[cfg(feature = "indexer")]
+    tasks::spawn_group_catalog(daemon, config);
 
     // Full scans, the tip watcher and VACUUM all write the same SQLite
     // file. A shared pass gate makes the exclusion two-way: checking an
@@ -4891,54 +4686,53 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
     // and writing after a full pass began.
     let index_pass_gate = Arc::new(tokio::sync::Mutex::new(()));
 
-    tasks::spawn_index_scan(&daemon, &config, &index_db, &index_pass_gate);
+    #[cfg(feature = "indexer")]
+    tasks::spawn_index_scan(daemon, config, index_db, &index_pass_gate);
 
-    tasks::spawn_index_compact(&daemon, &index_pass_gate);
+    #[cfg(feature = "indexer")]
+    tasks::spawn_index_compact(daemon, &index_pass_gate);
 
     // The pre feed: the IRC listener and its database writer (both inert
     // unless the user has switched the feature on) - see tasks.rs.
-    tasks::spawn_predb_feed(&daemon);
+    #[cfg(feature = "indexer")]
+    tasks::spawn_predb_feed(daemon);
 
-    tasks::spawn_tip_watcher(&daemon, &config, &index_pass_gate);
+    #[cfg(feature = "indexer")]
+    tasks::spawn_tip_watcher(daemon, config, &index_pass_gate);
 
-    tasks::spawn_oracle_sampler(&daemon, &config);
+    #[cfg(feature = "indexer")]
+    tasks::spawn_oracle_sampler(daemon, config);
 
-    tasks::spawn_health_prober(&daemon, &config);
+    tasks::spawn_health_prober(daemon, config);
 
-    tasks::spawn_rss_poller(&daemon, &settings_path, &feeds)?;
+    tasks::spawn_rss_poller(daemon, settings_path, feeds)?;
 
-    tasks::spawn_watchlist_watcher(&daemon, &settings_path);
+    tasks::spawn_watchlist_watcher(daemon, settings_path);
 
-    tasks::spawn_download_worker(&daemon, &config, &index_pass_gate, mem_budget);
+    tasks::spawn_download_worker(daemon, config, &index_pass_gate, mem_budget);
 
-    tasks::spawn_library_recheck(&daemon, &config);
+    tasks::spawn_library_recheck(daemon, config);
 
     // §76: the queue-row quality chip - reads the running job's own
     // container header so the row can say what the file IS, and warn
     // when that contradicts the name it was posted under.
-    tasks::spawn_media_prober(&daemon);
+    tasks::spawn_media_prober(daemon);
 
-    tasks::spawn_slow_job_watchdog(&daemon, &config, mem_budget);
+    tasks::spawn_slow_job_watchdog(daemon, config, mem_budget);
+    tasks::spawn_live_tuner(daemon, config);
+    Ok(())
+}
 
-    // M13: metadata enrichment worker. With a TMDB key (config tmdb_key
-    // or TMDB_API_KEY env) it uses TMDB; WITHOUT one it still runs,
-    // keyless, via TVmaze (tv) + Wikidata/Wikipedia (movies) - TMDB
-    // declines API applications for NZB tooling, so keyless is the normal
-    // path. iTunes used to serve movies; Apple removed that endpoint.
-    // Network stays on this thread - never the API's.
-    let tmdb_key = nzbkit::config::Config::load(&config)
-        .ok()
-        .and_then(|c| c.tmdb_key)
-        .or_else(|| std::env::var("TMDB_API_KEY").ok())
-        .filter(|k| !k.is_empty());
-    tasks::spawn_enrichment_workers(&daemon, &tmdb_key);
-
-    tasks::spawn_update_checker(&daemon);
-
-    tasks::spawn_scheduled_bench(&daemon, &config);
-
-    tasks::spawn_auto_connections(&daemon, &config);
-
+#[allow(clippy::too_many_arguments)]
+fn announce_ready(
+    daemon: &Arc<Daemon>,
+    settings_path: &Path,
+    bind: &str,
+    port: u16,
+    minted_key: &Option<(String, PathBuf)>,
+    mint_disclosure: &mut MintDisclosure,
+    open: bool,
+) {
     // HTTP API on a blocking thread. The listener itself was taken at the
     // top of startup (see the bind note beside spool_dir); this is where
     // we start answering on it, and where readiness is announced.
@@ -4951,7 +4745,7 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
     // then silently degraded to the no-token path, which is exactly the
     // permissive arm. The listener is already bound here, so nothing
     // about the file's meaning changes.
-    write_runtime_file(&settings_path, port, &daemon.launcher_token);
+    write_runtime_file(settings_path, port, &daemon.launcher_token);
     println!("nzbfast is running - open the dashboard at  http://localhost:{port}/");
     println!("(SABnzbd-compatible API for Sonarr/Radarr at  http://localhost:{port}/api)");
     if let Some((key, keyfile)) = &minted_key {
@@ -4993,1057 +4787,574 @@ pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
     if open {
         open_dashboard(port, minted_key.as_ref().map(|(k, _)| k.clone()));
     }
-    // A small worker pool over the shared listener (tiny_http's recv() is
-    // thread-safe): slow handlers - sysbench (~30-60 s), server_test (12 s),
-    // addurl fetches, large index searches - must not freeze queue/stats
-    // polling, or the dashboard appears to hang while they run. Eight, not
-    // four: with 4, one dashboard tab's repeating index_stats poll queued
-    // behind a long-held index lock wedged every worker within a minute
-    // (28 Jul hang). index_stats no longer blocks, but other index reads
-    // (wall2, search) still can - the extra headroom keeps / and the queue
-    // endpoints answering while they wait.
-    let server = std::sync::Arc::new(server);
-    for _ in 0..8 {
-        let server = server.clone();
-        let d = daemon.clone();
-        let cfg_path = config.clone();
-        let tmdb_key = tmdb_key.clone();
-        tokio::task::spawn_blocking(move || {
-            loop {
-                // The socket has been listening since partway through
-                // startup (see the bind note beside spool_dir), and
-                // tiny_http's accept thread has been parsing into its queue
-                // since then. This is the first line that ANSWERS anything,
-                // so it must stay below first_run_apikey - as must the bind
-                // itself.
-                let mut req = match server.recv() {
-                    Ok(r) => r,
-                    Err(_) => break,
-                };
-                let url = req.url().to_string();
-                let (path, query) = url.split_once('?').unwrap_or((url.as_str(), ""));
-                // SABnzbd answers `/api/` exactly as it answers `/api`, and
-                // clients written against "the SABnzbd API" lean on that:
-                // Homepage's sabnzbd widget builds its URL with the slash and
-                // got a flat 404 from us (issue #22), which reads as "this
-                // API is broken" rather than "this API is picky". The same
-                // miss hit /newznab/api/, i.e. an *arr pointing an indexer
-                // here. Normalize ONE trailing slash for route matching.
-                // "/" must survive - it is the dashboard - and every
-                // sub-path arm below already trims its own remainder, so
-                // this only ever reaches the exact-match arms.
-                let path = match path.strip_suffix('/') {
-                    Some("") | None => path,
-                    Some(trimmed) => trimmed,
-                };
-                if path == "/" || path == "/index.html" {
-                    let _ = req.respond(
-                        // §5 i18n: stamp the daemon-default locale into the page
-                        // (the JS token '__NZBFAST_LOCALE__') so embedded
-                        // webviews localize without a saved browser pref.
-                        tiny_http::Response::from_string(
-                            ui_shell_state(&d, ui_themed(DASHBOARD_HTML))
-                                .replace("__NZBFAST_LOCALE__", &d.ui_locale.lock_ok()),
-                        )
-                        .with_header(
-                            tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..])
-                                .unwrap(),
-                        )
-                        // A stale cached page keeps polling with old JS -
-                        // always revalidate so daemon upgrades reach the UI.
-                        .with_header(
-                            tiny_http::Header::from_bytes(&b"Cache-Control"[..], &b"no-cache"[..])
-                                .unwrap(),
-                        ),
-                    );
-                    continue;
-                }
-                // §5 i18n catalogues (key→string JSON, embedded like the HTML).
-                if let Some(lang) = path
-                    .strip_prefix("/i18n/")
-                    .and_then(|f| f.strip_suffix(".json"))
-                {
-                    let resp = match i18n_catalog(lang) {
-                        Some(body) => tiny_http::Response::from_string(body)
-                            .with_header(
-                                tiny_http::Header::from_bytes(
-                                    &b"Content-Type"[..],
-                                    &b"application/json"[..],
-                                )
-                                .unwrap(),
-                            )
-                            .with_header(
-                                tiny_http::Header::from_bytes(
-                                    &b"Cache-Control"[..],
-                                    &b"no-cache"[..],
-                                )
-                                .unwrap(),
-                            ),
-                        None => tiny_http::Response::from_string("{}").with_status_code(404),
-                    };
-                    let _ = req.respond(resp);
-                    continue;
-                }
-                // Browser icons and the web manifest, embedded like the pages.
-                // Unauthenticated on purpose: a browser fetches a favicon and a
-                // manifest without our session, and they carry nothing private.
-                if let Some((body, mime)) = web_icon(path) {
-                    let _ = req.respond(
-                        tiny_http::Response::from_data(body)
-                            .with_header(
-                                tiny_http::Header::from_bytes(
-                                    &b"Content-Type"[..],
-                                    mime.as_bytes(),
-                                )
-                                .unwrap(),
-                            )
-                            // Immutable content, but a daemon upgrade can change
-                            // the artwork - a day is long enough to keep the tab
-                            // strip quiet and short enough to pick that up.
-                            .with_header(
-                                tiny_http::Header::from_bytes(
-                                    &b"Cache-Control"[..],
-                                    &b"max-age=86400"[..],
-                                )
-                                .unwrap(),
-                            ),
-                    );
-                    continue;
-                }
-                if path == "/stream" || path.starts_with("/stream/") {
-                    // M11: progressive playback of the active download's media
-                    // file; M14i: /stream/<nzo_id> fetches a parked library job
-                    // on demand. Byte-serving stays unauthenticated (media
-                    // players don't do API keys), but the M14i library trigger
-                    // is a state mutation - force-starting a parked job past a
-                    // user pause - so it needs the API key or the per-job
-                    // `?t=` token the authenticated handoffs (/m3u, .strm)
-                    // embed. Own thread - a stream can outlive many API polls.
-                    let want = path
-                        .strip_prefix("/stream/")
-                        .map(|s| s.trim_matches('/').to_string())
-                        .filter(|s| !s.is_empty());
-                    let mut sp = parse_query(query);
-                    if let Some(k) = header_apikey(&req) {
-                        sp.entry("apikey".to_string()).or_insert(k);
-                    }
-                    let given = sp.get("apikey").map(String::as_str);
-                    let key_ok = {
-                        let a = d.apikey.lock_ok().clone();
-                        let n = d.nzbkey.lock_ok().clone();
-                        match (&a, &n) {
-                            (None, None) => true,
-                            (a, n) => {
-                                a.as_deref()
-                                    .is_some_and(|k| given.is_some_and(|g| ct_eq(g, k)))
-                                    || n.as_deref()
-                                        .is_some_and(|k| given.is_some_and(|g| ct_eq(g, k)))
-                            }
-                        }
-                    };
-                    let token_ok = want
-                        .as_deref()
-                        .zip(sp.get("t").map(String::as_str))
-                        .is_some_and(|(id, t)| ct_eq(t, &d.stream_token(id)));
-                    let authed = key_ok || token_ok;
-                    let d = d.clone();
-                    // Cap concurrent /stream worker threads. Each dedicates an OS
-                    // thread + open FD + socket and can block for minutes on an
-                    // uncovered span, and byte-serving is unauthenticated by
-                    // design - so an unbounded spawn is a trivial resource-
-                    // exhaustion DoS (open thousands of connections, exhaust
-                    // threads/FDs). 64 is far above any real household (a handful
-                    // of simultaneous previews); past it we shed load with 503.
-                    static STREAM_THREADS: AtomicUsize = AtomicUsize::new(0);
-                    const MAX_STREAM_THREADS: usize = 64;
-                    if STREAM_THREADS.fetch_add(1, Ordering::AcqRel) >= MAX_STREAM_THREADS {
-                        STREAM_THREADS.fetch_sub(1, Ordering::AcqRel);
-                        let _ = req.respond(
-                            tiny_http::Response::from_string("too many concurrent streams")
-                                .with_status_code(503),
-                        );
-                        continue;
-                    }
-                    std::thread::spawn(move || {
-                        // Decrement on exit, including a panic in stream_request.
-                        struct Guard;
-                        impl Drop for Guard {
-                            fn drop(&mut self) {
-                                STREAM_THREADS.fetch_sub(1, Ordering::AcqRel);
-                            }
-                        }
-                        let _g = Guard;
-                        stream_request(d, req, want, authed);
-                    });
-                    continue;
-                }
-                if let Some(id) = path.strip_prefix("/preview/probe/") {
-                    // §73 phase 1: what the downloading file IS -
-                    // container, tracks, codecs, languages, HDR - so the
-                    // dashboard can say "this is the right file" (or the
-                    // wrong one) before the download finishes.
-                    //
-                    // Same auth as /stream: either key, or the per-job
-                    // token the player handoffs already embed. This
-                    // reads only container headers and never blocks, so
-                    // unlike /stream it cannot sit on a thread for
-                    // minutes - but it does open a file and do disk I/O,
-                    // so it takes its own smaller cap.
-                    let id = id.trim_matches('/').to_string();
-                    if id.is_empty() {
-                        let _ = req.respond(
-                            tiny_http::Response::from_string("nzo_id required")
-                                .with_status_code(404),
-                        );
-                        continue;
-                    }
-                    let mut sp = parse_query(query);
-                    if let Some(k) = header_apikey(&req) {
-                        sp.entry("apikey".to_string()).or_insert(k);
-                    }
-                    let given = sp.get("apikey").map(String::as_str);
-                    let key_ok = {
-                        let a = d.apikey.lock_ok().clone();
-                        let n = d.nzbkey.lock_ok().clone();
-                        match (&a, &n) {
-                            (None, None) => true,
-                            (a, n) => {
-                                a.as_deref()
-                                    .is_some_and(|k| given.is_some_and(|g| ct_eq(g, k)))
-                                    || n.as_deref()
-                                        .is_some_and(|k| given.is_some_and(|g| ct_eq(g, k)))
-                            }
-                        }
-                    };
-                    let token_ok = sp.get("t").is_some_and(|t| ct_eq(t, &d.stream_token(&id)));
-                    if !(key_ok || token_ok) {
-                        let blocked = d.note_auth_failure(peer_ip(&req), "preview probe");
-                        let _ = req.respond(if blocked {
-                            tiny_http::Response::from_string("too many bad keys")
-                                .with_status_code(429)
-                        } else {
-                            tiny_http::Response::from_string(
-                                "inspecting a download needs an apikey or stream token (?t=)",
-                            )
-                            .with_status_code(401)
-                        });
-                        continue;
-                    }
-                    static PROBE_THREADS: AtomicUsize = AtomicUsize::new(0);
-                    const MAX_PROBE_THREADS: usize = 8;
-                    if PROBE_THREADS.fetch_add(1, Ordering::AcqRel) >= MAX_PROBE_THREADS {
-                        PROBE_THREADS.fetch_sub(1, Ordering::AcqRel);
-                        let _ = req.respond(
-                            tiny_http::Response::from_string("busy")
-                                .with_status_code(503)
-                                .with_header(
-                                    tiny_http::Header::from_bytes(&b"Retry-After"[..], &b"2"[..])
-                                        .unwrap(),
-                                ),
-                        );
-                        continue;
-                    }
-                    let d = d.clone();
-                    std::thread::spawn(move || {
-                        struct Guard;
-                        impl Drop for Guard {
-                            fn drop(&mut self) {
-                                PROBE_THREADS.fetch_sub(1, Ordering::AcqRel);
-                            }
-                        }
-                        let _g = Guard;
-                        preview_probe_request(d, req, id);
-                    });
-                    continue;
-                }
-                if path == "/manual" || path == "/manual/" || path.starts_with("/manual/") {
-                    // The full user manual, embedded like the dashboard so
-                    // every install carries its own docs. §5 i18n: /manual/<lang>
-                    // serves the translated manual; /manual stays English (each
-                    // page carries the EN·FR·DE·IT·ES·NL switcher). A UI locale
-                    // without a translated manual yet (Tier 1b: pt/sv/da/nb/…)
-                    // falls back to English so the dashboard's 📖 pill - which
-                    // links /manual/<active locale> - never 404s.
-                    let body = match path.trim_start_matches("/manual").trim_matches('/') {
-                        "" => Some(MANUAL_HTML),
-                        lang => manual_i18n(lang)
-                            .or_else(|| UI_LOCALES.contains(&lang).then_some(MANUAL_HTML)),
-                    };
-                    let Some(body) = body else {
-                        let _ = req.respond(
-                            tiny_http::Response::from_string("not found").with_status_code(404),
-                        );
-                        continue;
-                    };
-                    let _ = req.respond(
-                        tiny_http::Response::from_string(ui_themed(body))
-                            .with_header(
-                                tiny_http::Header::from_bytes(
-                                    &b"Content-Type"[..],
-                                    &b"text/html"[..],
-                                )
-                                .unwrap(),
-                            )
-                            .with_header(
-                                tiny_http::Header::from_bytes(
-                                    &b"Cache-Control"[..],
-                                    &b"no-cache"[..],
-                                )
-                                .unwrap(),
-                            ),
-                    );
-                    continue;
-                }
-                if path == "/wall" || path == "/wall/" {
-                    // M13: the poster wall (embedded like the dashboard).
-                    let _ = req.respond(
-                        tiny_http::Response::from_string(
-                            ui_shell_state(&d, ui_themed(WALL_HTML))
-                                .replace("__NZBFAST_LOCALE__", &d.ui_locale.lock_ok()),
-                        )
-                        .with_header(
-                            tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..])
-                                .unwrap(),
-                        )
-                        .with_header(
-                            tiny_http::Header::from_bytes(&b"Cache-Control"[..], &b"no-cache"[..])
-                                .unwrap(),
-                        ),
-                    );
-                    continue;
-                }
-                if let Some(f) = path.strip_prefix("/art/") {
-                    // M13: cached TMDB posters/backdrops. Names are our own
-                    // sanitized art_name() output - refuse anything else. A
-                    // "thumb_" request also joins the source name it strips
-                    // to, so both components go through the check.
-                    let safe = art_name_ok(f)
-                        && match f.strip_prefix("thumb_") {
-                            Some(src) => art_name_ok(src),
-                            None => true,
-                        };
-                    // M28: "thumb_<name>" is a lazy server-side thumbnail -
-                    // generated from the full poster on first request, then
-                    // cached on disk like any other art file. The grid loads
-                    // ~20 KB thumbs instead of the original (≤4 MB) JPEGs.
-                    let art_root = d.spool.join("art");
-                    let bytes = if !safe {
-                        None
-                    } else if let Some(src) = f.strip_prefix("thumb_") {
-                        std::fs::read(art_root.join(f)).ok().or_else(|| {
-                            let t = make_thumb(&std::fs::read(art_root.join(src)).ok()?)?;
-                            let _ = std::fs::write(art_root.join(f), &t);
-                            Some(t)
-                        })
-                    } else {
-                        std::fs::read(art_root.join(f)).ok()
-                    };
-                    match bytes {
-                        Some(bytes) => {
-                            let _ = req.respond(
-                                tiny_http::Response::from_data(bytes)
-                                    .with_header(
-                                        tiny_http::Header::from_bytes(
-                                            &b"Content-Type"[..],
-                                            &b"image/jpeg"[..],
-                                        )
-                                        .unwrap(),
-                                    )
-                                    .with_header(
-                                        tiny_http::Header::from_bytes(
-                                            &b"Cache-Control"[..],
-                                            &b"max-age=604800"[..],
-                                        )
-                                        .unwrap(),
-                                    ),
-                            );
-                        }
-                        None => {
-                            let _ = req.respond(
-                                tiny_http::Response::from_string("").with_status_code(404),
-                            );
-                        }
-                    }
-                    continue;
-                }
-                if let Some(id) = path.strip_prefix("/m3u/") {
-                    // M11: player handoff - a one-line playlist pointing at the
-                    // stream; the OS opens it in the default player (VLC/IINA/
-                    // Infuse), which then speaks HTTP ranges to /stream. The
-                    // playlist embeds the per-job stream token (that's what
-                    // lets the keyless player start a parked library job), so
-                    // minting one requires either key - the wall's ▶ Play
-                    // passes ?apikey=. Keyless installs stay open, as ever.
-                    let id = id.trim_matches('/');
-                    let mut sp = parse_query(query);
-                    if let Some(k) = header_apikey(&req) {
-                        sp.entry("apikey".to_string()).or_insert(k);
-                    }
-                    let given = sp.get("apikey").map(String::as_str);
-                    let ok = {
-                        let a = d.apikey.lock_ok().clone();
-                        let n = d.nzbkey.lock_ok().clone();
-                        match (&a, &n) {
-                            (None, None) => true,
-                            (a, n) => {
-                                a.as_deref()
-                                    .is_some_and(|k| given.is_some_and(|g| ct_eq(g, k)))
-                                    || n.as_deref()
-                                        .is_some_and(|k| given.is_some_and(|g| ct_eq(g, k)))
-                            }
-                        }
-                    };
-                    if !ok {
-                        let blocked = d.note_auth_failure(peer_ip(&req), "m3u/watch");
-                        let _ = req.respond(if blocked {
-                            tiny_http::Response::from_string("too many bad keys")
-                                .with_status_code(429)
-                        } else {
-                            tiny_http::Response::from_string("apikey required")
-                                .with_status_code(401)
-                        });
-                        continue;
-                    }
-                    let host = req
-                        .headers()
-                        .iter()
-                        .find(|h| h.field.equiv("Host"))
-                        .map(|h| h.value.as_str().to_string())
-                        .unwrap_or_else(|| format!("127.0.0.1:{}", d.port));
-                    let target = if id.is_empty() {
-                        format!("http://{host}/stream")
-                    } else {
-                        format!("http://{host}/stream/{id}?t={}", d.stream_token(id))
-                    };
-                    let _ = req.respond(
-                        tiny_http::Response::from_string(format!("#EXTM3U\n{target}\n"))
-                            .with_header(
-                                tiny_http::Header::from_bytes(
-                                    &b"Content-Type"[..],
-                                    &b"audio/x-mpegurl"[..],
-                                )
-                                .unwrap(),
-                            )
-                            .with_header(
-                                tiny_http::Header::from_bytes(
-                                    &b"Content-Disposition"[..],
-                                    &b"attachment; filename=\"nzbfast.m3u\""[..],
-                                )
-                                .unwrap(),
-                            ),
-                    );
-                    continue;
-                }
-                if path == "/watch" {
-                    // One-link streaming: GET /watch?url=<nzb-url> enqueues at
-                    // Force priority and redirects to the .m3u - bookmark it,
-                    // paste it in a player, or wire it into an indexer's
-                    // "open with". Same key rule as /m3u: either key when
-                    // configured; keyless installs stay open.
-                    let mut sp = parse_query(query);
-                    if let Some(k) = header_apikey(&req) {
-                        sp.entry("apikey".to_string()).or_insert(k);
-                    }
-                    let given = sp.get("apikey").map(String::as_str);
-                    let ok = {
-                        let a = d.apikey.lock_ok().clone();
-                        let n = d.nzbkey.lock_ok().clone();
-                        match (&a, &n) {
-                            (None, None) => true,
-                            (a, n) => {
-                                a.as_deref()
-                                    .is_some_and(|k| given.is_some_and(|g| ct_eq(g, k)))
-                                    || n.as_deref()
-                                        .is_some_and(|k| given.is_some_and(|g| ct_eq(g, k)))
-                            }
-                        }
-                    };
-                    if !ok {
-                        let blocked = d.note_auth_failure(peer_ip(&req), "m3u/watch");
-                        let _ = req.respond(if blocked {
-                            tiny_http::Response::from_string("too many bad keys")
-                                .with_status_code(429)
-                        } else {
-                            tiny_http::Response::from_string("apikey required")
-                                .with_status_code(401)
-                        });
-                        continue;
-                    }
-                    let Some(url) = sp.get("url").filter(|u| !u.is_empty()).cloned() else {
-                        let _ = req.respond(
-                            tiny_http::Response::from_string("missing url=").with_status_code(400),
-                        );
-                        continue;
-                    };
-                    let name = sp.get("name").cloned().unwrap_or_else(|| {
-                        url.rsplit('/').next().unwrap_or("watch.nzb").to_string()
-                    });
-                    let resp = match fetch_url(&url)
-                        .and_then(|f| d.enqueue_fetched(&f, &name, "", 2, None, 0, "url", false))
-                    {
-                        Ok(id) => {
-                            // Reflect the key into the redirect ONLY when it really
-                            // is a configured key. On a keyless install `ok` above
-                            // is true for ANY `apikey=` value, and this value went
-                            // verbatim into a `Location:` header - tiny_http
-                            // validates header values with `AsciiString::from_ascii`
-                            // and CR/LF are ASCII, so `apikey=%0d%0aHTTP/1.1 200...`
-                            // wrote a second, attacker-controlled response onto the
-                            // daemon's own origin (response splitting), and a
-                            // non-ASCII byte made the `from_bytes(..).unwrap()`
-                            // below panic, permanently killing one of the four HTTP
-                            // workers. A configured key is echoed back unchanged;
-                            // anything else is dropped.
-                            let key_q = given
-                                .filter(|g| {
-                                    let a = d.apikey.lock_ok().clone();
-                                    let n = d.nzbkey.lock_ok().clone();
-                                    a.as_deref().is_some_and(|k| ct_eq(g, k))
-                                        || n.as_deref().is_some_and(|k| ct_eq(g, k))
-                                })
-                                // Belt and braces: a key set through mode=config is
-                                // not charset-validated, so keep the header to a
-                                // charset that cannot carry a delimiter at all.
-                                .filter(|g| {
-                                    g.chars().all(|c| {
-                                        c.is_ascii_alphanumeric() || matches!(c, '-' | '_')
-                                    })
-                                })
-                                .map(|k| format!("?apikey={k}"))
-                                .unwrap_or_default();
-                            // A get-NZB link carries the indexer credential in
-                            // its query (`apikey=`, `api_key=`, `r=`, …), and
-                            // this line lands in stdout, container logs and the
-                            // in-UI log viewer. Same treatment the failure-link
-                            // and RSS-origin paths already give a remote URL.
-                            info!(target: "watch", "{} → {id} (streaming)", redact_url_creds(&url));
-                            tiny_http::Response::from_string("")
-                                .with_status_code(303)
-                                .with_header(
-                                    tiny_http::Header::from_bytes(
-                                        &b"Location"[..],
-                                        format!("/m3u/{id}{key_q}").into_bytes(),
-                                    )
-                                    .unwrap(),
-                                )
-                        }
-                        Err(e) => tiny_http::Response::from_string(format!("watch failed: {e}"))
-                            .with_status_code(502),
-                    };
-                    let _ = req.respond(resp);
-                    continue;
-                }
-                let mut params = parse_query(query);
-                // Header key fills a MISSING apikey only, so the precedence
-                // is query > header > POST body (the body merge below also
-                // never overwrites) - an explicit URL key always wins.
-                if let Some(k) = header_apikey(&req) {
-                    params.entry("apikey".to_string()).or_insert(k);
-                }
-                // M12 newznab facade: Sonarr/Radarr point an indexer at us.
-                // `/api?t=...` (their convention) or the explicit /newznab/api;
-                // the `t` param disambiguates from the SABnzbd facade's `mode`.
-                let is_newznab =
-                    path == "/newznab/api" || (path == "/api" && params.contains_key("t"));
-                // Keys are live settings (rotatable from the dashboard) -
-                // read the current pair once per request.
-                let cur_apikey = d.apikey.lock_ok().clone();
-                let cur_nzbkey = d.nzbkey.lock_ok().clone();
-                let nz_authed = || {
-                    let given = params.get("apikey").map(String::as_str);
-                    match (&cur_apikey, &cur_nzbkey) {
-                        (None, None) => true,
-                        (a, n) => {
-                            a.as_deref()
-                                .is_some_and(|k| given.is_some_and(|g| ct_eq(g, k)))
-                                || n.as_deref()
-                                    .is_some_and(|k| given.is_some_and(|g| ct_eq(g, k)))
-                        }
-                    }
-                };
-                if is_newznab {
-                    if !nz_authed() {
-                        let blocked = d.note_auth_failure(peer_ip(&req), "newznab");
-                        let _ = req.respond(if blocked {
-                        tiny_http::Response::from_string("too many bad keys")
-                            .with_status_code(429)
-                    } else {
-                        tiny_http::Response::from_string(
-                            r#"<?xml version="1.0"?><error code="100" description="Incorrect user credentials"/>"#,
-                        )
-                        .with_status_code(401)
-                    });
-                        continue;
-                    }
-                    let base = public_base(&req, d.port);
-                    let key = params.get("apikey").cloned().unwrap_or_default();
-                    let xml = newznab_xml(&d, &params, &base, &key);
-                    let _ = req.respond(
-                        tiny_http::Response::from_string(xml).with_header(
-                            tiny_http::Header::from_bytes(
-                                &b"Content-Type"[..],
-                                &b"application/rss+xml; charset=utf-8"[..],
-                            )
-                            .unwrap(),
-                        ),
-                    );
-                    continue;
-                }
-                if let Some(rest) = path.strip_prefix("/getnzb/") {
-                    if !nz_authed() {
-                        let blocked = d.note_auth_failure(peer_ip(&req), "getnzb");
-                        let _ = req.respond(if blocked {
-                            tiny_http::Response::from_string("too many bad keys")
-                                .with_status_code(429)
-                        } else {
-                            tiny_http::Response::from_string("bad apikey").with_status_code(401)
-                        });
-                        continue;
-                    }
-                    let id: i64 = rest.trim_end_matches(".nzb").parse().unwrap_or(-1);
-                    let r = d.with_index_read(|ix| ix.make_nzb(id).ok());
-                    match r {
-                        Some(xml) => {
-                            // M34: pulling the NZB is the strongest "I want
-                            // this" signal there is - the size cap protects
-                            // it for the next OPENED_PROTECT_DAYS days.
-                            d.touch_opened_release(id);
-                            let _ = req.respond(
-                                tiny_http::Response::from_string(xml)
-                                    .with_header(
-                                        tiny_http::Header::from_bytes(
-                                            &b"Content-Type"[..],
-                                            &b"application/x-nzb"[..],
-                                        )
-                                        .unwrap(),
-                                    )
-                                    .with_header(
-                                        tiny_http::Header::from_bytes(
-                                            &b"Content-Disposition"[..],
-                                            format!("attachment; filename=\"{id}.nzb\"")
-                                                .into_bytes(),
-                                        )
-                                        .unwrap(),
-                                    ),
-                            );
-                        }
-                        None => {
-                            let _ = req.respond(
-                                tiny_http::Response::from_string("not found").with_status_code(404),
-                            );
-                        }
-                    }
-                    continue;
-                }
-                // A job's own spooled .nzb back out - the queue/history
-                // drawer's "Download .nzb". Works for EVERY origin,
-                // including jobs whose watch-folder original is long
-                // gone; nzbfast keeps a spool copy for the job's whole
-                // life (a cleared/deleted record removes it, hence the
-                // 404 arm). FULL key only, unlike /getnzb above: the
-                // add-only nzbkey may pull index-built NZBs, but a
-                // job's spool says what this user downloads, which is
-                // exactly what an add-only credential must not read.
-                if let Some(rest) = path.strip_prefix("/jobnzb/") {
-                    let given = params.get("apikey").map(String::as_str);
-                    let full_ok = match (&cur_apikey, &cur_nzbkey) {
-                        (None, None) => true,
-                        (Some(k), _) => given.is_some_and(|g| ct_eq(g, k)),
-                        (None, Some(_)) => false,
-                    };
-                    if !full_ok {
-                        let blocked = d.note_auth_failure(peer_ip(&req), "jobnzb");
-                        let _ = req.respond(if blocked {
-                            tiny_http::Response::from_string("too many bad keys")
-                                .with_status_code(429)
-                        } else {
-                            tiny_http::Response::from_string("bad apikey").with_status_code(401)
-                        });
-                        continue;
-                    }
-                    let id = rest.trim_end_matches(".nzb");
-                    let rec = {
-                        let pick = |j: &Arc<Mutex<Job>>| {
-                            let g = j.lock_ok();
-                            (g.nzo_id == id).then(|| (g.name.clone(), g.nzb_path.clone()))
-                        };
-                        let q = d.queue.lock_ok().iter().find_map(pick);
-                        q.or_else(|| d.history.lock_ok().iter().find_map(pick))
-                    };
-                    match rec.and_then(|(name, p)| std::fs::read(p).ok().map(|b| (name, b))) {
-                        Some((name, bytes)) => {
-                            // The name is the poster's text: keep it a
-                            // single header-safe token so it cannot
-                            // smuggle a quote or CR/LF into the header.
-                            //
-                            // ASCII-only, and that is load-bearing rather
-                            // than tidiness: tiny_http header values are
-                            // `AsciiString`, so `Header::from_bytes` REFUSES
-                            // any byte >= 0x80 and the `.unwrap()` below
-                            // panics. `sanitize_filename` maps separators and
-                            // control chars and passes everything else
-                            // through, so an accented or CJK release name -
-                            // "Amélie.2001.1080p" - reached it intact and
-                            // killed this worker thread for the life of the
-                            // process. There is no catch_unwind around the
-                            // worker loop, so a handful of such clicks take
-                            // the whole HTTP surface down until a restart.
-                            let fname: String = nzbkit::disk::sanitize_filename(&name)
-                                .chars()
-                                .map(|c| if c.is_ascii() { c } else { '_' })
-                                .filter(|c| !c.is_control() && *c != '"')
-                                .collect();
-                            // Every char can legitimately filter out (a name
-                            // that was entirely non-ASCII collapses to
-                            // underscores, but a name of only quotes does
-                            // not), and an empty filename is a malformed
-                            // header rather than a panic - still worth not
-                            // emitting.
-                            let fname = if fname.trim().is_empty() {
-                                "download".to_string()
-                            } else {
-                                fname
-                            };
-                            let _ = req.respond(
-                                tiny_http::Response::from_data(bytes)
-                                    .with_header(
-                                        tiny_http::Header::from_bytes(
-                                            &b"Content-Type"[..],
-                                            &b"application/x-nzb"[..],
-                                        )
-                                        .unwrap(),
-                                    )
-                                    .with_header(
-                                        tiny_http::Header::from_bytes(
-                                            &b"Content-Disposition"[..],
-                                            format!("attachment; filename=\"{fname}.nzb\"")
-                                                .into_bytes(),
-                                        )
-                                        .unwrap(),
-                                    ),
-                            );
-                        }
-                        None => {
-                            let _ = req.respond(
-                                tiny_http::Response::from_string("not found").with_status_code(404),
-                            );
-                        }
-                    }
-                    continue;
-                }
-                // M21: NZBGet JSON-RPC facade - remote-control apps built for
-                // NZBGet (nzb360, LunaSea, …) work unmodified. Auth is HTTP
-                // Basic; the password must be the API key (any username).
-                if path == "/jsonrpc" || path.starts_with("/jsonrpc/") {
-                    handle_jsonrpc(&d, req, cur_apikey.as_deref(), cur_nzbkey.as_deref());
-                    continue;
-                }
-                if path != "/api" {
-                    let _ = req
-                        .respond(tiny_http::Response::from_string("nzbfast").with_status_code(404));
-                    continue;
-                }
-                // SABnzbd merges GET and POST parameters; the browser addons
-                // (NZBDonkey, NZB Unity) rely on that and send mode/apikey/cat
-                // as POST form fields with nothing in the query string - so a
-                // key that authenticates against SAB never reached our
-                // query-only parse and was rejected ("[auth] rejected key for
-                // api"). Read the body ONCE here and merge any form fields in
-                // (query wins); the addfile/wall_art arms consume the file
-                // part from this same buffer. This does buffer a capped body
-                // before auth - SAB parity, loopback-bound by default, and the
-                // auth-fail limiter still counts the failure afterwards.
-                //
-                // EVERY post, whatever it calls itself (Codex sweep 2, 3 Aug
-                // H1). The read used to happen only for three recognized
-                // content types, and a handler whose body was not pre-read
-                // fell back to reading the socket itself - AFTER dispatch,
-                // which is after the authorization decision. So a caller
-                // holding key A could send `?mode=server_save&apikey=A` with
-                // NO Content-Type at all, stall the body, wait for the owner
-                // to rotate A to B, and then complete the destructive write
-                // under the revoked key. `Application/JSON` was a second way
-                // in: media types are case-insensitive and the classifier
-                // was not. Making the read unconditional retires the
-                // fallback entirely, so no handler can reach the socket
-                // after auth - see the `unwrap_or_default()` in each of
-                // them.
-                let mut api_body: Option<Vec<u8>> = None;
-                // Keeps the body-budget reservation alive for as long as
-                // `api_body` (and the parse of it) is - see [`BodyHold`].
-                let mut _api_body_hold: Option<BodyHold> = None;
-                if req.method() == &tiny_http::Method::Post {
-                    let ctype = req
-                        .headers()
-                        .iter()
-                        .find(|h| h.field.equiv("Content-Type"))
-                        .map(|h| h.value.as_str().to_string())
-                        .unwrap_or_default();
-                    // Media types are case-insensitive (RFC 9110), so the
-                    // comparisons below are made against a lowercased copy.
-                    let ctype_lc = ctype.to_ascii_lowercase();
-                    // Decided BEFORE the body is read, because the read
-                    // is what an unauthenticated caller gets to trigger
-                    // here (SAB parity: the key may be a form field, so
-                    // the body has to be parsed to find it), and a
-                    // nonsense boundary must not get that far.
-                    let boundary = multipart_boundary(&ctype);
-                    // The only content type that still changes anything:
-                    // a form body's fields are MERGED into `params`
-                    // (SAB parity - the key may be one of them). JSON
-                    // and untyped bodies are read and handed straight
-                    // to the handler.
-                    let form_body = ctype_lc.starts_with("application/x-www-form-urlencoded");
-                    // The endpoint's OWN limit, decided before the read
-                    // (Codex sweep 2, 3 Aug M1). This buffer used to be
-                    // capped at a flat 256 MiB and every handler applied
-                    // its real limit - 8 MiB for a config import, 1 MiB
-                    // for a server save or a wall fix - only in the
-                    // fallback branch that ran when the pre-read had NOT
-                    // happened. Once the pre-read covers everything that
-                    // branch is dead, so the cap has to be right here or
-                    // it is nowhere: a nominal 1 MiB endpoint would
-                    // otherwise receive and parse 256 MiB, and the body
-                    // budget deliberately lets its oldest live holder
-                    // reach the per-request cap, so it cannot stand in
-                    // for the limit either.
-                    //
-                    // `mode` from the QUERY only - the body has not been
-                    // read yet, and a mode arriving as a form field is
-                    // precisely the SAB-parity addfile shape, which
-                    // needs the ceiling anyway.
-                    let cap = match params.get("mode").map(String::as_str) {
-                        Some(m) => api_body_cap(m),
-                        None if boundary.is_some() || form_body => API_BODY_MAX,
-                        // No mode in the query and not a form: nothing
-                        // can dispatch, so nothing needs a large body.
-                        None => API_BODY_DEFAULT,
-                    };
-                    {
-                        let (raw, hold) = read_body_capped_hold(req.as_reader(), cap);
-                        _api_body_hold = Some(hold);
-                        match &boundary {
-                            Some(b) => {
-                                for (k, v) in multipart_fields(&raw, b) {
-                                    params.entry(k).or_insert(v);
-                                }
-                            }
-                            None if form_body => {
-                                if let Ok(s) = std::str::from_utf8(&raw) {
-                                    // Bounded: this runs pre-auth on a body
-                                    // of up to 256 MiB, exactly like the
-                                    // multipart arm above.
-                                    for (k, v) in parse_form_body(s) {
-                                        params.entry(k).or_insert(v);
-                                    }
-                                }
-                            }
-                            // A JSON body, or one that named no type at
-                            // all: nothing to merge into `params`, but it
-                            // is read all the same so the handler never
-                            // has to.
-                            None => {}
-                        }
-                        api_body = Some(raw);
-                    }
-                }
-                // Re-read the pair AFTER the body, not at the top of the
-                // request. That body is client-paced, so the snapshot taken
-                // before it can be arbitrarily stale by the time it is used:
-                // a caller who starts a form POST under the old key, stalls,
-                // and finishes after the owner rotates was still authorised -
-                // and `apikey_show` / `config name=apikey` then handed them
-                // the NEW key, undoing the rotation. Decide against the key
-                // as of the DECISION. Shadowed rather than mutated so the
-                // earlier `nz_authed` / `handle_jsonrpc` uses, which both
-                // returned before this point, are untouched.
-                let cur_apikey = d.apikey.lock_ok().clone();
-                let cur_nzbkey = d.nzbkey.lock_ok().clone();
-                let mode = params.get("mode").cloned().unwrap_or_default();
-                // Two-tier keys (SABnzbd model): the full API key unlocks
-                // everything; the NZB key can only add jobs.
-                let given = params.get("apikey").map(String::as_str);
-                let full = match (&cur_apikey, &cur_nzbkey) {
-                    // Fully open ONLY when NEITHER key is configured - matches
-                    // the /stream, /m3u, /newznab pattern. The old `match
-                    // &cur_apikey { None => true }` made `full` unconditionally
-                    // true whenever no full key was set, silently voiding the
-                    // nzbkey as a credential and leaving the whole API (queue
-                    // delete, config writes, shutdown) open to any LAN host.
-                    (None, None) => true,
-                    (Some(k), _) => given.is_some_and(|g| ct_eq(g, k)),
-                    (None, Some(_)) => false,
-                };
-                // SABnzbd's nzb_key stops at addfile/addurl/version, which
-                // fails every push extension's "test connection" button:
-                // NZB Donkey probes mode=status, NZB Unity probes
-                // mode=fullstatus, and both fetch get_cats for their
-                // category dropdown - so an add-only key looked broken in
-                // the very tools it exists for. Allow those three reads: a
-                // version string, paused/warning/disk numbers and the
-                // category names give no control, and this key can already
-                // inject arbitrary downloads. Queue/history contents,
-                // config and every mutation stay full-key.
-                let add_only = matches!(
-                    mode.as_str(),
-                    "addfile" | "addurl" | "version" | "status" | "fullstatus" | "get_cats"
-                );
-                // SABnzbd answers `mode=version` with no key at all, and two
-                // of our own probes rely on that: the container HEALTHCHECK
-                // curls it keyless from loopback every 30s, and the tray/.app
-                // identify a daemon with a keyless `mode=version&hs=` probe.
-                // Requiring a key here meant every keyed Docker install
-                // logged "[auth] rejected key for api from 127.0.0.1" once a
-                // minute forever - its own healthcheck - which users read as
-                // the API being broken. Keyless ONLY: a key that was
-                // presented and is wrong is still rejected, so a
-                // misconfigured *arr fails its connection test instead of
-                // turning green on the version call. The keyless body leaks
-                // nothing the keyless refusal did not already carry (both
-                // answer `nzbfast` plus the hs proof).
-                let version_probe = mode == "version" && given.is_none();
-                // Bootstrap the FIRST full API key when none is configured yet.
-                // With only the add-only NZB key set, `config` needs `full` (which
-                // the NZB key cannot grant), so an admin who set the NZB key first
-                // would be permanently locked out of ever setting an API key from
-                // the UI. Allow EXACTLY the first `config name=apikey` write, proven
-                // by presenting the valid NZB key. Loopback source address is NOT a
-                // credential: a browser request from any website still connects to
-                // 127.0.0.1 from a loopback address, so trusting the source address
-                // let a malicious page install its own full key via a cross-site GET
-                // (<img src=".../api?mode=config&name=apikey&value=attacker">). The
-                // admin who set the NZB key knows it and can present it here; a
-                // remote page cannot. Once an apikey exists this path is dead (apikey
-                // is Some => `full` is required to change it), so the NZB key stays
-                // strictly add-only in the configured steady state.
-                let bootstrap_apikey = cur_apikey.is_none()
-                    && mode == "config"
-                    && params.get("name").map(String::as_str) == Some("apikey")
-                    && cur_nzbkey
-                        .as_deref()
-                        .is_some_and(|k| given.is_some_and(|g| ct_eq(g, k)));
-                // Authorized by the ADD-ONLY key rather than the full one.
-                // The allowlist's contract is explicit that "queue/history
-                // contents, config and every mutation stay full-key", and
-                // two of the allowed reads quietly broke it: `status` and
-                // `fullstatus` carry `complete_dir`, and their warnings
-                // list names up to five queued releases waiting on a
-                // password. Handlers need to know which credential got
-                // them here to keep that promise - and `full` first, so a
-                // real API key is never demoted by the mode it happens to
-                // be calling.
-                let via_add_only = !full
-                    && add_only
-                    && cur_nzbkey
-                        .as_deref()
-                        .is_some_and(|k| given.is_some_and(|g| ct_eq(g, k)));
-                let authed = full || version_probe || via_add_only || bootstrap_apikey;
-                if !authed {
-                    // Accounted like every other credentialed door (/m3u, /watch,
-                    // /newznab, /getnzb, /stream, /jsonrpc all do this): the key
-                    // is 192 bits so brute force is not the worry, but this is the
-                    // busiest endpoint and a key-spraying host was leaving no
-                    // trace on it at all. Rate-limiting decisions stay with
-                    // `note_auth_failure`; the answer below is unchanged.
-                    // Say WHICH failure this was: a Reddit-grade log excerpt
-                    // of bare "rejected key for api" lines cannot be
-                    // diagnosed, and "no key sent" vs "wrong key" is exactly
-                    // the fork a support answer needs.
-                    let _ = d.note_auth_failure(
-                        peer_ip(&req),
-                        if given.is_none() {
-                            "api (no key sent)"
-                        } else {
-                            "api (wrong key)"
-                        },
-                    );
-                    // Exact SAB phrases - the *arrs substring-match these to
-                    // tell "wrong key" from "no key" in their Test() dialog.
-                    let msg = if given.is_none() {
-                        "API Key Required"
-                    } else {
-                        "API Key Incorrect"
-                    };
-                    // ...and our own marker beside them, because the phrases
-                    // alone are SABnzbd's. The tray and the .app probe a port
-                    // WITHOUT a key (sending it would hand the key, and with it
-                    // mode=server_secret, to whatever bound the port first), so
-                    // a refusal is all they get to identify us by - and a match
-                    // means attach-and-never-kill. `nzbfast` is the same field
-                    // the version body carries, so both wrappers already accept
-                    // it and neither can mistake a real SABnzbd for us.
-                    // ...and, when the caller sent a challenge, the proof that
-                    // we hold the token in runtime.json. This is the reply a
-                    // wrapper's probe actually gets (it deliberately carries no
-                    // key), so the proof has to ride the REFUSAL, not the
-                    // authenticated version body. Nothing here leaks: the
-                    // answer is a hash, and a caller that cannot read the token
-                    // file cannot check or forge it.
-                    let mut refusal = json!({
-                        "status": false,
-                        "error": msg,
-                        "nzbfast": env!("CARGO_PKG_VERSION"),
-                    });
-                    if let Some(proof) =
-                        launcher_proof(&d.launcher_token, params.get("hs").map(String::as_str))
-                    {
-                        refusal["hs_proof"] = json!(proof);
-                    }
-                    // 403 like SABnzbd (interface.py sets it on every
-                    // check_apikey failure). The 200 we used to send made
-                    // NZB Unity's connection test report SUCCESS on a
-                    // wrong key - it only fails on a non-2xx or non-JSON
-                    // answer - and then every real call fell over. The
-                    // body is unchanged: the *arrs and the wrapper probes
-                    // read the phrases and the hs proof from it, not the
-                    // status line.
-                    let _ = req.respond(json_resp(refusal).with_status_code(403));
-                    continue;
-                }
-                // For stream-mode adds: absolute player-handoff links need the
-                // host the CLIENT used to reach us.
-                let host_hdr = req
-                    .headers()
-                    .iter()
-                    .find(|h| h.field.equiv("Host"))
-                    .map(|h| h.value.as_str().to_string())
-                    .unwrap_or_else(|| format!("127.0.0.1:{}", d.port));
-                // Which automation is talking to us, for the job's origin.
-                let ua_hdr = req
-                    .headers()
-                    .iter()
-                    .find(|h| h.field.equiv("User-Agent"))
-                    .map(|h| h.value.as_str().to_string())
-                    .unwrap_or_default();
-                let key_q = given.map(|k| format!("?apikey={k}")).unwrap_or_default();
-                let ctx = api::ApiCtx {
-                    cfg_path: &cfg_path,
-                    host_hdr: &host_hdr,
-                    ua_hdr: &ua_hdr,
-                    key_q: &key_q,
-                    tmdb_key: &tmdb_key,
-                    bootstrap_apikey,
-                    via_add_only,
-                };
-                let body = api::dispatch(&d, &mut req, &params, &mode, &ctx, &mut api_body)
-                    .unwrap_or_else(
-                        || json!({"status": false, "error": format!("unimplemented mode {mode}")}),
-                    );
-                let _ = req.respond(json_resp(body));
-            }
-        });
-    }
-
-    // Park forever (workers run in the background).
-    futures_never().await
 }
 
-async fn futures_never() -> Result<()> {
+/// Issue #9: a fresh-install mint with a non-empty download root means
+/// the config directory most likely moved - say so, loudly, once.
+fn warn_if_config_moved(minted_key: &Option<(String, PathBuf)>, out_root: &Path) {
+    if minted_key.is_some() {
+        let prior_use = out_root.join(".spool").exists()
+            || std::fs::read_dir(out_root)
+                .map(|mut entries| entries.next().is_some())
+                .unwrap_or(false);
+        if prior_use {
+            eprintln!(
+                "⚠ starting as a NEW install (nothing in the config directory), but the \
+                 download folder {} is not empty. If you had settings before - servers, \
+                 paths, an API key - nothing deleted them: nzbfast is most likely reading \
+                 a different config directory than your previous install used. Docker and \
+                 NAS users: compare the /config volume mapping with the old container's. \
+                 The manual has the recovery steps, under Troubleshooting (/manual in the \
+                 dashboard). If this really is a new install, carry on - nothing is wrong.",
+                out_root.display()
+            );
+        }
+    }
+}
+
+pub async fn serve(config: PathBuf, mut opts: ServeOpts) -> Result<()> {
+    reset_embedded_stop();
+    // First thing: capture our own stdout/stderr so the dashboard's log
+    // viewer sees the whole session, startup lines included.
+    nzbkit::logtee::install();
+    let settings_path = settings_file(&config);
+    apply_saved_settings(&mut opts, &settings_path);
+    // Secure-by-default on a genuinely new install (and ONLY there - see
+    // first_run_apikey). Printed once, prominently, next to the listener
+    // banner below, which is where a new user is looking.
+    let minted_key = first_run_apikey(&mut opts, &settings_path, &config)?;
+    // A key minted THIS RUN must be disclosed even if startup dies before
+    // the banner (see MintDisclosure).
+    let mut mint_disclosure =
+        MintDisclosure(minted_key.as_ref().map(|(_, keyfile)| keyfile.clone()));
+    // One explanation, printed at the moment it is true. A minted key
+    // means the data directory read as brand new; a download root already
+    // in use says the more likely story is an EXISTING install whose
+    // config directory moved out from under it - a recreated container
+    // reading an empty /config, a relative bind mount run from a
+    // different directory, a fresh appdata path. From here everything
+    // behaves like a first run, and without this line the user's next
+    // stop is a bug report titled "all my settings are gone" (issue #9's
+    // field report, verbatim).
+    //
+    // A warning ONLY. The download root must never join the
+    // fresh-vs-existing decision itself - that was tried, and it was a
+    // security regression (see first_run_apikey). Nothing here changes
+    // what was minted or decided.
+    warn_if_config_moved(&minted_key, &opts.out_root);
+    // Saved settings may have overridden the CLI budget; republish so the
+    // repair paths use the same figure the rest of the daemon does.
+    nzbkit::mem::set_process_budget(opts.mem_budget);
+    let ServeOpts {
+        group_desc_isc: _,
+        port,
+        bind,
+        open,
+        apikey,
+        nzbkey,
+        out_root,
+        watch,
+        script,
+        connections,
+        window,
+        decoders,
+        fast_verify,
+        verify_lean,
+        min_free,
+        out_umask,
+        auto_retry_mins,
+        preflight,
+        quota,
+        quota_period,
+        feeds,
+        speedlimit,
+        schedule,
+        auto_speed,
+        library_cats,
+        library_recheck_secs,
+        mem_budget,
+        #[cfg(feature = "indexer")]
+        index_db,
+        #[cfg(feature = "indexer")]
+        index_groups,
+        #[cfg(feature = "indexer")]
+        index_interval_secs,
+        #[cfg(feature = "indexer")]
+        index_backfill,
+        #[cfg(feature = "indexer")]
+        index_max_age_secs,
+        #[cfg(feature = "indexer")]
+        index_gates,
+    } = opts;
+    let legacy_rename_punctuation = legacy_rename_punctuation(&config, &out_root, &settings_path);
+    // The indexer's master switch, and the one migration it needs.
+    //
+    // A saved value always wins - that is the user's answer. With NO
+    // saved value we are either a fresh install (off: see the field's
+    // doc comment) or an install from before the switch existed, and
+    // those two are told apart by whether anything was ever chosen to
+    // index. Groups here already carry settings.json and the config file
+    // (see the settings merge above), so a CLI `--index-groups` or a
+    // hand-written config counts too - starting a daemon that was
+    // explicitly pointed at groups and then not scanning them would be
+    // the same surprise as the upgrade case.
+    #[cfg(not(feature = "indexer"))]
+    let index_enabled = false;
+    #[cfg(feature = "indexer")]
+    let index_enabled = resolve_index_enabled(&settings_path, &index_groups);
+    // Resolved once: every spool path below must agree, or a migrated
+    // daemon reads half its state from the old location.
+    // ABSOLUTE from here on. Sonarr reads `misc.complete_dir` out of
+    // get_config to learn where this client puts files, and a relative
+    // path means nothing to another process - different cwd, often a
+    // different container or host - so it reports "Remote Path Mapping"
+    // while the downloads themselves land perfectly, because WE resolve
+    // it against our own cwd. That is exactly the shape of the v1.0.9
+    // report: right folder, wrong error. SABnzbd always answers absolute.
+    //
+    // Resolved rather than canonicalized: the directory may not exist
+    // yet on a first run, and canonicalize() fails on a missing path.
+    let out_root = if out_root.is_absolute() {
+        out_root
+    } else {
+        std::env::current_dir()
+            .map(|c| c.join(&out_root))
+            .unwrap_or(out_root)
+    };
+    let server = take_listener(&bind, port)?;
+    let spool = spool_dir(&config, &out_root);
+    // Windows has no dotfile convention, so `.spool` is plainly visible
+    // wherever it lands - including inside the user's download folder on
+    // an install that predates the data-dir move. Create it up front so
+    // there is something to set the attribute ON: every other writer
+    // makes it implicitly via create_dir_all of a child, which would
+    // leave the hide to lose a race it cannot see.
+    let _ = std::fs::create_dir_all(&spool);
+    nzbkit::disk::hide_from_user(&spool);
+    let _serve_lock = acquire_serve_lock(&spool, &config)?;
+    let daemon = Arc::new(Daemon {
+        hub: Arc::new(crate::StreamHub::default()),
+        paused: std::sync::atomic::AtomicBool::new(false),
+        offline: std::sync::atomic::AtomicBool::new(false),
+        paused_by_offline: std::sync::atomic::AtomicBool::new(false),
+        queue: Mutex::new(VecDeque::new()),
+        history: Mutex::new(Vec::new()),
+        add_lock: Mutex::new(()),
+        moving: Mutex::new(std::collections::HashSet::new()),
+        reserved: Mutex::new(std::collections::HashSet::new()),
+        progress: Arc::new(AtomicU64::new(0)),
+        active_total: AtomicU64::new(0),
+        active_dl: Mutex::new(None),
+        started_at: Mutex::new(None),
+        last_download_end: Mutex::new(Instant::now()),
+        stall_since: Mutex::new(None),
+        playback_disk: Mutex::new(std::collections::HashMap::new()),
+        next_id: AtomicU64::new(1),
+        out_root: std::sync::RwLock::new(out_root.clone()),
+        move_completed: std::sync::RwLock::new(None),
+        move_completed_cats: std::sync::RwLock::new(Vec::new()),
+        spool: spool.clone(),
+        cfg_path: config.clone(),
+        cats: Mutex::new(DEFAULT_CATS.iter().map(|s| s.to_string()).collect()),
+        port,
+        // A failed mint leaves an EMPTY token, and `launcher_proof` then
+        // answers a challenge with sha256(":nonce") - a value any process
+        // could compute. Refuse to answer at all instead: the wrappers
+        // treat "no proof" as "an older daemon" and fall back, which is
+        // strictly better than a proof anyone can forge.
+        launcher_token: random_apikey().unwrap_or_default(),
+        port_locked: port_locked(),
+        library_cats: Mutex::new(library_cats),
+        active_stream: Mutex::new(None),
+        #[cfg(feature = "indexer")]
+        index_db: index_db.clone(),
+        #[cfg(feature = "indexer")]
+        index: Mutex::new(None),
+        #[cfg(feature = "indexer")]
+        index_read: IndexReadPool::default(),
+        #[cfg(feature = "indexer")]
+        index_read_warned: AtomicU64::new(0),
+        #[cfg(feature = "indexer")]
+        index_migrated: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(feature = "indexer")]
+        index_stats_cache: Mutex::new(None),
+        auto_speed: std::sync::atomic::AtomicBool::new(auto_speed),
+        preflight: std::sync::atomic::AtomicBool::new(preflight),
+        auto_connections: std::sync::atomic::AtomicBool::new(true),
+        wall_hide_adult: std::sync::atomic::AtomicBool::new(true),
+        auto_defer: std::sync::atomic::AtomicBool::new(true),
+        post_health: std::sync::atomic::AtomicBool::new(true),
+        post_health_defer: std::sync::atomic::AtomicBool::new(false),
+        auto_prefetch: std::sync::atomic::AtomicBool::new(true),
+        race_stragglers: std::sync::atomic::AtomicBool::new(true),
+        adaptive_timeouts: std::sync::atomic::AtomicBool::new(true),
+        oracle_route: std::sync::atomic::AtomicBool::new(false),
+        index_deepen: AtomicU64::new(200_000),
+        index_coverage: std::sync::atomic::AtomicBool::new(true),
+        index_gapfill: AtomicU64::new(4),
+        bench_interval: AtomicU64::new(0),
+        bench_last: AtomicU64::new(0),
+        update_manifest: Mutex::new(None),
+        update_serial_seen: std::sync::atomic::AtomicU64::new(0),
+        // Notify-only: finding a newer version raises the dashboard
+        // banner and nothing else - the daemon never replaces its own
+        // binary (the self-update code was removed in 1.0.5; the
+        // manifest itself is still ed25519-verified before the banner
+        // trusts it). ON by default so users hear about releases; turn
+        // it off here (or empty update_url) and the daemon never
+        // phones the manifest at all.
+        update_checks: std::sync::atomic::AtomicBool::new(true),
+        unit_bits: std::sync::atomic::AtomicBool::new(false),
+        update_url: Mutex::new(DEFAULT_UPDATE_URL.to_string()),
+        ui_locale: Mutex::new(String::new()),
+        sidecar: Mutex::new(None),
+        media_rejudge: Mutex::new(Vec::new()),
+        best_rate_bps: AtomicU64::new(0),
+        speed_ceiling: AtomicU64::new(0),
+        mem_budget_total: mem_budget.total,
+        feeds: Mutex::new(Vec::new()),
+        feed_health: Mutex::new(Default::default()),
+        last_refusals: Mutex::new(Default::default()),
+        events: Mutex::new(Default::default()),
+        indexers: Mutex::new(Vec::new()),
+        watchlist_external: std::sync::atomic::AtomicBool::new(false),
+        watchlist_external_set: std::sync::atomic::AtomicBool::new(false),
+        indexer_rt: Mutex::new(IndexerRuntime::default()),
+        // §74: on by default and inert without the indexer - see the
+        // field. Saved settings replay over these below.
+        watchlist_instant: AtomicBool::new(true),
+        watchlist_instant_max: std::sync::atomic::AtomicU32::new(INSTANT_MAX_DEFAULT),
+        #[cfg(feature = "indexer")]
+        instant_kicks: Mutex::new(std::collections::VecDeque::new()),
+        #[cfg(feature = "indexer")]
+        instant_pending: Mutex::new(std::collections::HashMap::new()),
+        instant_hint: Mutex::new(Vec::new()),
+        nzblnk_recent: Mutex::new(std::collections::VecDeque::new()),
+        smart_folders: Mutex::new(Vec::new()),
+        par_cleanup: AtomicBool::new(true),
+        // OFF unless asked for: an install that says nothing keeps
+        // exactly the modes it has today (#20).
+        out_umask: std::sync::atomic::AtomicU32::new(out_umask.unwrap_or(u32::MAX)),
+        fast_par: AtomicBool::new(FAST_PAR_DEFAULT),
+        prefer_external_unrar: AtomicBool::new(false),
+        cleanup_exts: Mutex::new(Vec::new()),
+        password_file: Mutex::new(config.with_file_name("passwords.txt")),
+        password_prompt: Mutex::new("done".to_string()),
+        unpack_eat_volumes: Mutex::new("off".to_string()),
+        // Loaded from settings.json below (next to smart_folders); the
+        // reclassify flag starts set so startup reconciles the stored
+        // rows against the current config exactly once (the index stamps
+        // the config fingerprint, so an unchanged config is a no-op).
+        custom_categories: std::sync::RwLock::new(Vec::new()),
+        reclassify_pending: std::sync::atomic::AtomicBool::new(true),
+        // Auto-rename defaults: on, with resolution in the name; codecs /
+        // source / group off; junk sweep on; keep-media-only off. Saved
+        // settings replay over these below.
+        identity_lookup: std::sync::atomic::AtomicBool::new(true),
+        auto_rename: std::sync::atomic::AtomicBool::new(true),
+        rename_resolution: std::sync::atomic::AtomicBool::new(true),
+        rename_vcodec: std::sync::atomic::AtomicBool::new(false),
+        rename_acodec: std::sync::atomic::AtomicBool::new(false),
+        rename_source: std::sync::atomic::AtomicBool::new(false),
+        rename_group: std::sync::atomic::AtomicBool::new(false),
+        rename_year_parens: std::sync::atomic::AtomicBool::new(legacy_rename_punctuation),
+        rename_quality_brackets: std::sync::atomic::AtomicBool::new(legacy_rename_punctuation),
+        rename_extra_words: std::sync::atomic::AtomicBool::new(true),
+        rename_identify: std::sync::atomic::AtomicBool::new(true),
+        // Off by default, alone among the rename sub-settings: it
+        // changes filenames an existing install already wrote, and an
+        // *arr's import matcher is reading those. See the field docs.
+        rename_episode_titles: std::sync::atomic::AtomicBool::new(false),
+        history_rows: AtomicU64::new(10),
+        history_color_names: std::sync::atomic::AtomicBool::new(true),
+        ladder_live: Mutex::new(None),
+        ladder_busy: std::sync::atomic::AtomicBool::new(false),
+        ladder_cancel: std::sync::atomic::AtomicBool::new(false),
+        media_chip_color: std::sync::atomic::AtomicBool::new(true),
+        shape_chip_color: std::sync::atomic::AtomicBool::new(true),
+        rename_junk: std::sync::atomic::AtomicBool::new(true),
+        rename_media_only: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(feature = "indexer")]
+        index_max_age_secs: AtomicU64::new(index_max_age_secs),
+        #[cfg(not(feature = "indexer"))]
+        index_max_age_secs: AtomicU64::new(0),
+        // Retention defaults ON: if a user bothered to set a max-age
+        // window they almost always want the DB to hold ~that window,
+        // not hoard everything older. Off = ingest-gate-only (the
+        // pre-M31 behavior), toggle in Settings (persists across
+        // restarts like the other live settings).
+        index_retention: seed_index_retention(&settings_path),
+        index_pause_on_download: seed_index_pause_on_download(&settings_path),
+        index_paused: seed_index_paused(&settings_path),
+        index_enabled: std::sync::atomic::AtomicBool::new(index_enabled),
+        // Pre feed: OFF unless the user has explicitly saved it on. A
+        // missing key, a null, or a non-bool all land here - there is no
+        // path that opens an outbound IRC connection by accident.
+        predb_enabled: seed_predb_enabled(&settings_path),
+        predb_server: seed_predb_server(&settings_path),
+        predb_channels: seed_predb_channels(&settings_path),
+        predb_nick: seed_predb_nick(&settings_path),
+        #[cfg(feature = "indexer")]
+        predb_pending: Mutex::new(Vec::new()),
+        predb_status: Mutex::new(String::new()),
+        // Correlation: same explicit-opt-in contract as the feed. Both
+        // default OFF; a missing key never turns an inference engine on.
+        predb_corr_enabled: seed_predb_corr_enabled(&settings_path),
+        predb_corr_auto: seed_predb_corr_auto(&settings_path),
+        #[cfg(feature = "indexer")]
+        predb_max_rows: std::sync::atomic::AtomicU64::new(predb_seed::PREDB_MAX_ROWS_DEFAULT),
+        #[cfg(not(feature = "indexer"))]
+        predb_max_rows: std::sync::atomic::AtomicU64::new(250_000),
+        #[cfg(feature = "indexer")]
+        predb_seed_days: std::sync::atomic::AtomicU64::new(predb_seed::PREDB_SEED_DAYS_DEFAULT),
+        #[cfg(not(feature = "indexer"))]
+        predb_seed_days: std::sync::atomic::AtomicU64::new(180),
+        #[cfg(feature = "indexer")]
+        predb_seed_running: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(feature = "indexer")]
+        predb_seed_status: Mutex::new(String::new()),
+        // Spots are new, so there is no existing-install case to seed
+        // from: nobody has one running today. Straight off until asked.
+        spot_enabled: seed_spot_enabled(&settings_path),
+        spot_groups: seed_spot_groups(&settings_path),
+        spot_backfill: seed_spot_backfill(&settings_path),
+        #[cfg(feature = "indexer")]
+        index_generation: AtomicU64::new(0),
+        index_jobs_active: Arc::new(AtomicUsize::new(0)),
+        // M34 size cap. UI-only settings (no CLI flags), read straight
+        // off settings.json like index_retention above.
+        index_max_bytes: seed_index_max_bytes(&settings_path),
+        // OFF unless the user has explicitly saved it on. A missing key,
+        // a null, or a non-bool all land here - there is no path that
+        // turns deletion on by accident.
+        index_evict: seed_index_evict(&settings_path),
+        #[cfg(feature = "indexer")]
+        index_evict_order: seed_index_evict_order(&settings_path),
+        #[cfg(not(feature = "indexer"))]
+        index_evict_order: Mutex::new("ladder".to_string()),
+        #[cfg(feature = "indexer")]
+        index_evict_kinds: seed_index_evict_kinds(&settings_path),
+        #[cfg(not(feature = "indexer"))]
+        index_evict_kinds: Mutex::new(Vec::new()),
+        #[cfg(feature = "indexer")]
+        compact_pending: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(feature = "indexer")]
+        last_auto_trim: std::sync::Mutex::new(None),
+        #[cfg(feature = "indexer")]
+        index_opened: Mutex::new(
+            crate::persist::load_json_with_backup(&spool.join("index-opened.json"))
+                .and_then(|v| serde_json::from_value::<OpenedLog>(v).ok())
+                .unwrap_or_default(),
+        ),
+        #[cfg(feature = "indexer")]
+        index_gates: seed_index_gates(&settings_path, index_gates),
+        line_speed: seed_line_speed(&settings_path),
+        tune_hint: Mutex::new(String::new()),
+        cpu_sample: Mutex::new(None),
+        speed_win: Mutex::new(VecDeque::new()),
+        usage: Mutex::new(
+            crate::persist::load_json_with_backup(&spool.join("usage.json"))
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default(),
+        ),
+        pause_until: Mutex::new(None),
+        pause_gen: AtomicU64::new(0),
+        connections: std::sync::atomic::AtomicUsize::new(connections.max(1)),
+        window: std::sync::atomic::AtomicUsize::new(window.max(1)),
+        decoders: std::sync::atomic::AtomicUsize::new(decoders.max(1)),
+        fast_verify: std::sync::atomic::AtomicBool::new(fast_verify),
+        verify_lean: std::sync::atomic::AtomicBool::new(verify_lean),
+        min_free: AtomicU64::new(min_free.unwrap_or(MIN_FREE_DEFAULT)),
+        queue_hold: std::sync::Mutex::new(None),
+        pause_source: std::sync::Mutex::new("user"),
+        limit_source: std::sync::Mutex::new("user"),
+        auto_retry_secs: seed_auto_retry_secs(&settings_path, auto_retry_mins),
+        quota: AtomicU64::new(quota.unwrap_or(0)),
+        quota_period: std::sync::atomic::AtomicU8::new(if quota_period == 'm' {
+            b'm'
+        } else {
+            b'd'
+        }),
+        watch_dir: Mutex::new(watch),
+        watch_keep_nzb: AtomicBool::new(false),
+        watch_failed: Mutex::new(std::collections::HashMap::new()),
+        watch_picked: Mutex::new(std::collections::VecDeque::new()),
+        auto_retried: Mutex::new(std::collections::VecDeque::new()),
+        giveup_tripped: Mutex::new(std::collections::VecDeque::new()),
+        watch_upgraded: Mutex::new(std::collections::VecDeque::new()),
+        delete_kept: Mutex::new(std::collections::VecDeque::new()),
+        auth_fails: Mutex::new(std::collections::HashMap::new()),
+        #[cfg(feature = "indexer")]
+        enrich_hot: Mutex::new(std::collections::VecDeque::new()),
+        #[cfg(feature = "indexer")]
+        group_catalog: Mutex::new(None),
+        #[cfg(feature = "indexer")]
+        group_fetching: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(feature = "indexer")]
+        group_fetch_err: Mutex::new(None),
+        #[cfg(feature = "indexer")]
+        group_stats: Mutex::new(Arc::new(crate::groupstats::StatsCache::default())),
+        #[cfg(feature = "indexer")]
+        group_sampling: Mutex::new(std::collections::HashSet::new()),
+        group_desc_isc: std::sync::atomic::AtomicBool::new(opts.group_desc_isc),
+        script: Mutex::new(script),
+        script_timeout: AtomicU64::new(3600),
+        notify_targets: Mutex::new(Vec::new()),
+        notify_health: Mutex::new(Default::default()),
+        failure_link: Mutex::new("off".to_string()),
+        quality_prefs: seed_quality_prefs(&settings_path),
+        apikey: Mutex::new(apikey),
+        nzbkey: Mutex::new(nzbkey),
+        stream_secret: seed_stream_secret(&settings_path),
+        omdb_key: seed_omdb_key(&settings_path),
+        library_recheck_secs: AtomicU64::new(library_recheck_secs.max(1)),
+        #[cfg(feature = "indexer")]
+        index_groups: Mutex::new(index_groups),
+        #[cfg(not(feature = "indexer"))]
+        index_groups: Mutex::new(Vec::new()),
+        index_interests: Mutex::new(String::new()),
+        index_interests_applied: Mutex::new(String::new()),
+        index_interest_groups: Mutex::new(Vec::new()),
+        #[cfg(feature = "indexer")]
+        index_interval_secs: AtomicU64::new(index_interval_secs),
+        #[cfg(not(feature = "indexer"))]
+        index_interval_secs: AtomicU64::new(900),
+        #[cfg(feature = "indexer")]
+        index_backfill: AtomicU64::new(index_backfill),
+        #[cfg(not(feature = "indexer"))]
+        index_backfill: AtomicU64::new(20000),
+        scan_now: tokio::sync::Notify::new(),
+        #[cfg(feature = "indexer")]
+        scan_deep: AtomicU64::new(0),
+        #[cfg(feature = "indexer")]
+        scan_progress: Mutex::new(Vec::new()),
+        index_scan_par: AtomicU64::new(3),
+        scan_active: std::sync::atomic::AtomicBool::new(false),
+        index_tip_secs: AtomicU64::new(20),
+        watch_interval_secs: AtomicU64::new(5),
+        watch_scan_now: tokio::sync::Notify::new(),
+        oracle_sample: AtomicU64::new(300),
+        schedule: Mutex::new(Vec::new()),
+        schedule_text: Mutex::new(String::new()),
+        watchlist: Mutex::new(Vec::new()),
+        watch_state: Mutex::new(Default::default()),
+        watch_now: tokio::sync::Notify::new(),
+        arr_giveup_threshold: AtomicU64::new(0),
+        arr_instances: Mutex::new(Vec::new()),
+        giveup: Arc::new(Mutex::new(Default::default())),
+        settings_path: settings_path.clone(),
+        #[cfg(feature = "indexer")]
+        taste_cache: Mutex::new(None),
+    });
+
+    restore_runtime_state(&daemon, &settings_path, &spool, &config, &speedlimit)?;
+
+    spawn_core_tasks(
+        &daemon,
+        &config,
+        &settings_path,
+        &schedule,
+        &feeds,
+        #[cfg(feature = "indexer")]
+        &index_db,
+        mem_budget,
+    )?;
+
+    // M13: metadata enrichment worker. With a TMDB key (config tmdb_key
+    // or TMDB_API_KEY env) it uses TMDB; WITHOUT one it still runs,
+    // keyless, via TVmaze (tv) + Wikidata/Wikipedia (movies) - TMDB
+    // declines API applications for NZB tooling, so keyless is the normal
+    // path. iTunes used to serve movies; Apple removed that endpoint.
+    // Network stays on this thread - never the API's.
+    #[cfg(feature = "indexer")]
+    let tmdb_key = nzbkit::config::Config::load(&config)
+        .ok()
+        .and_then(|c| c.tmdb_key)
+        .or_else(|| std::env::var("TMDB_API_KEY").ok())
+        .filter(|k| !k.is_empty());
+    #[cfg(feature = "indexer")]
+    tasks::spawn_enrichment_workers(&daemon, &tmdb_key);
+
+    tasks::spawn_update_checker(&daemon);
+
+    tasks::spawn_scheduled_bench(&daemon, &config);
+
+    tasks::spawn_auto_connections(&daemon, &config);
+
+    announce_ready(
+        &daemon,
+        &settings_path,
+        &bind,
+        port,
+        &minted_key,
+        &mut mint_disclosure,
+        open,
+    );
+    #[cfg(feature = "indexer")]
+    http::spawn_http_workers(server, daemon.clone(), config.clone(), tmdb_key.clone());
+    #[cfg(not(feature = "indexer"))]
+    http::spawn_http_workers(server, daemon.clone(), config.clone());
+
+    park_for_embedded_stop().await;
+    // Returning drops our Arc<server>; the workers drop theirs within one
+    // HTTP_IDLE_TICK (they poll the stop flag between accepts), and the
+    // last drop closes the listener so the port is free to rebind.
+    Ok(())
+}
+
+/// A leftover stop request from a previous embedded run (see
+/// `request_stop`) must not fell the next one: called first thing in
+/// [`serve`], before anything can wait on the flag.
+fn reset_embedded_stop() {
+    STOP_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Park until an embedded host asks for an in-process stop. The CLI
+/// daemon never does - its stop paths (signals, tray Quit) exit the
+/// process - so for it this parks forever, exactly as before.
+async fn park_for_embedded_stop() {
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        stop_notify().notified().await;
+        // Load, never consume: the HTTP workers read this same flag to
+        // wind up after serve() returns; it resets at the next entry.
+        if STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
     }
 }
 
+/// One tick of the HTTP workers' accept wait. Long enough to cost
+/// nothing (8 workers waking twice a second), short enough that an
+/// embedded stop releases the listener promptly.
+const HTTP_IDLE_TICK: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Set by [`request_stop`], consumed by [`serve`]'s park loop and polled
+/// by the HTTP workers between accepts. Reset at serve() entry so a stop
+/// request from a previous embedded run cannot fell the next one.
+static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn stop_notify() -> &'static tokio::sync::Notify {
+    static N: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+    N.get_or_init(tokio::sync::Notify::new)
+}
+
+/// In-process stop for embedded builds (the iOS staticlib, where exec
+/// and process exit are not available): [`serve`] returns instead of
+/// parking and the HTTP workers wind up, closing the listener. This is
+/// NOT the graceful wind-down the signal path runs - the embedded host
+/// stops the tokio runtime after serve() returns, which is what cancels
+/// the background tasks. Safe to call before or more than once per
+/// serve(): a permit is held until consumed and the flag is re-checked.
+// dead_code: only the embedded crate root (lib.rs, `ffi` feature) has a
+// caller; the CLI daemon stops by process exit. The module compiles
+// under both roots, so the bin build sees this as dead.
+#[allow(dead_code)]
+pub fn request_stop() {
+    STOP_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    stop_notify().notify_one();
+}
+
+mod http;
 mod stream;
 use stream::*;
 
@@ -6329,6 +5640,7 @@ fn multipart_fields(body: &[u8], boundary: &str) -> Vec<(String, String)> {
 /// Minimal magic-number sniff for user-supplied poster bytes (M21
 /// wall_art): JPEG / PNG / GIF / WebP. Anything else is refused before
 /// it can land in the art cache.
+#[cfg(feature = "indexer")]
 fn looks_image(b: &[u8]) -> bool {
     b.starts_with(&[0xFF, 0xD8, 0xFF])
         || b.starts_with(&[0x89, b'P', b'N', b'G'])
@@ -6438,6 +5750,7 @@ fn json_resp(v: Value) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
 /// off during the pass: the era may well still match - switching off
 /// does bump it, but a pass could equally have started while off - and
 /// "closed" has to stay closed.
+#[cfg(feature = "indexer")]
 fn may_publish_index(era: u64, pass_era: u64, enabled: bool) -> bool {
     era == pass_era && enabled
 }
@@ -6594,6 +5907,7 @@ fn drain_to_nowhere(mut r: impl std::io::Read) {
 /// Empty is normal and not an error: the headshot lane fetches lazily,
 /// and the cache evicts under its cap, so the UI must always be able to
 /// fall back to initials.
+#[cfg(feature = "indexer")]
 fn person_photo_url(art_dir: &std::path::Path, id: i64) -> String {
     let f = crate::wall::person_art_name(id);
     if art_dir.join(&f).is_file() {
@@ -6613,6 +5927,7 @@ fn person_photo_url(art_dir: &std::path::Path, id: i64) -> String {
 /// has nobody to type EOF into), so it holds one of the few HTTP worker
 /// threads for the life of the process. Real art names carry a "m_"/"t_"
 /// key prefix, so none of them can be a device name.
+#[cfg(feature = "indexer")]
 fn art_name_ok(n: &str) -> bool {
     !n.is_empty()
         && !n.contains("..")
@@ -6624,6 +5939,7 @@ fn art_name_ok(n: &str) -> bool {
 /// M28: poster-grid thumbnail - fit inside 342×513 (the TMDB w342
 /// aspect), JPEG q80. ~20 KB out of a multi-MB source; None on decode
 /// failure (the route then 404s and the client falls back to full art).
+#[cfg(feature = "indexer")]
 fn make_thumb(src: &[u8]) -> Option<Vec<u8>> {
     let img = image::load_from_memory(src).ok()?;
     // Some providers (TVmaze mediums) already serve small posters -
@@ -7026,12 +6342,15 @@ struct IndexerRuntime {
     /// user set limits on, and only a saved entry ever runs a search.
     penalty_until: std::collections::HashMap<String, Instant>,
     usage: crate::newznab::Usage,
+    #[cfg(feature = "indexer")]
     results: std::collections::HashMap<String, IndexerHit>,
     /// Insertion order, for capping `results`.
+    #[cfg(feature = "indexer")]
     order: std::collections::VecDeque<String>,
 }
 
 /// One cached external search result, grabbable by token.
+#[cfg(feature = "indexer")]
 #[derive(Clone)]
 struct IndexerHit {
     url: String,
@@ -7052,6 +6371,7 @@ const NZBLNK_MAX: usize = 20;
 const NZBLNK_EXTERNAL_MAX: usize = 6;
 
 /// A grab token stays valid this long after its search.
+#[cfg(feature = "indexer")]
 const INDEXER_HIT_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// How long a pull search will wait for an xREL slot before giving up on
@@ -7059,8 +6379,10 @@ const INDEXER_HIT_TTL: std::time::Duration = std::time::Duration::from_secs(30 *
 /// second search inside that window finds the bucket empty - and a
 /// search that returns its releases a beat sooner without an IMDb id is
 /// a better answer than one that returns everything late.
+#[cfg(feature = "indexer")]
 const XREL_UI_WAIT: std::time::Duration = std::time::Duration::from_millis(400);
 /// Ceiling on cached external results across all searches.
+#[cfg(feature = "indexer")]
 const INDEXER_HIT_CAP: usize = 5000;
 /// Ceiling on one search/caps response body. A 100-item page of XML is
 /// well under 1 MB; 8 MB is runaway-response territory, same idea as
@@ -7070,10 +6392,12 @@ const INDEXER_BODY_MAX: u64 = 8 * 1024 * 1024;
 const INDEXER_LIMIT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 /// How long a successful `t=caps` answer stays fresh. Capabilities
 /// change when a site is upgraded, which is rare.
+#[cfg(feature = "indexer")]
 const INDEXER_CAPS_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 /// How long a FAILED caps probe is remembered. Short, because the cause
 /// is usually transient (the site was down), but not zero, because the
 /// alternative is a caps request in front of every search.
+#[cfg(feature = "indexer")]
 const INDEXER_CAPS_FAIL_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// The one agent every pull-search call goes out through: SSRF-guarded
@@ -7201,6 +6525,7 @@ fn indexer_search_one(
 /// Only called when a query actually carries an id worth planning
 /// around: a plain free-text search needs no caps at all, and must not
 /// pay for a probe.
+#[cfg(feature = "indexer")]
 fn indexer_caps_cached(
     d: &Daemon,
     cfg: &crate::newznab::IndexerConfig,
@@ -7324,6 +6649,7 @@ fn resolve_nzblnk(
     // group the link named beats one somewhere else, then size. `>` and
     // not `>=`, so ties keep find_by_header's own ordering (exact stem
     // ahead of a filename match).
+    #[cfg(feature = "indexer")]
     let rank = |r: &nzbkit::index::Release| {
         (
             r.complete,
@@ -7336,6 +6662,7 @@ fn resolve_nzblnk(
     // read-write connection a catch-up ingest or maintenance pass would
     // park the paste for as long as it holds the mutex (measured at 62s
     // for wall2 before the read-only connection existed).
+    #[cfg(feature = "indexer")]
     let local = d.with_index_read(|ix| {
         let mut best: Option<nzbkit::index::Release> = None;
         for r in ix.find_by_header(&l.header, 8).ok()? {
@@ -7345,6 +6672,7 @@ fn resolve_nzblnk(
         }
         best
     });
+    #[cfg(feature = "indexer")]
     let queue_local = |r: &nzbkit::index::Release,
                        partial: bool,
                        notes: &Vec<serde_json::Value>| {
@@ -7378,9 +6706,11 @@ fn resolve_nzblnk(
             Err(e) => json!({"status": false, "error": e.to_string()}),
         }
     };
+    #[cfg(feature = "indexer")]
     if let Some(r) = local.as_ref().filter(|r| r.complete) {
         return queue_local(r, false, &notes);
     }
+    #[cfg(feature = "indexer")]
     if local.is_some() {
         notes.push(json!({"index": "found the post, but parts are still missing"}));
     }
@@ -7524,6 +6854,7 @@ fn resolve_nzblnk(
     }
 
     // ---- Last resort: the partial local hit, honestly labelled. ------
+    #[cfg(feature = "indexer")]
     if let Some(r) = local.as_ref() {
         return queue_local(r, true, &notes);
     }
@@ -7899,6 +7230,9 @@ fn fs_roots(cur_download: &std::path::Path) -> Value {
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/"));
+    // Mobile targets have no volume enumeration arm below: the app
+    // sandbox is the whole visible filesystem, so `roots` never grows.
+    #[cfg_attr(any(target_os = "ios", target_os = "android"), allow(unused_mut))]
     let mut roots = vec![
         json!({"name": "Home", "path": home.to_string_lossy()}),
         json!({"name": "Current downloads", "path": cur_download.to_string_lossy()}),
@@ -8268,14 +7602,23 @@ fn history_json(d: &Daemon, params: &std::collections::HashMap<String, String>) 
     let slots: Vec<Value> = h
         .iter()
         .rev()
-        .filter(|j| {
-            let g = j.lock_ok();
-            (!failed_only || g.state == JobState::Failed)
-                && cat_filter.is_none_or(|c| g.category == *c)
-                && ids.as_ref().is_none_or(|s| s.contains(g.nzo_id.as_str()))
-        })
-        .map(|j| {
+        .filter_map(|j| {
             let j = j.lock_ok();
+            // §91: selected and rendered under ONE lock on the record.
+            // Taking it twice - once to test the filter, again to build
+            // the row - let the two see different states: a Failed job
+            // whose auto-retry cooldown came due between them is pulled
+            // back out of history and reset to Queued, so `failed_only=1`
+            // answered with a row saying `"status": "Queued"` and an
+            // empty `fail_kind` / `fail_action`. An *arr asking for
+            // failures is entitled to get only failures back, and the
+            // remedy keys it reads to act on one must be there.
+            if (failed_only && j.state != JobState::Failed)
+                || !cat_filter.is_none_or(|c| j.category == *c)
+                || !ids.as_ref().is_none_or(|s| s.contains(j.nzo_id.as_str()))
+            {
+                return None;
+            }
             // Truth-audit I: what this download is CALLED on disk, when
             // that is not what it was posted as. A de-obfuscation rename
             // left the history row saying "a4f9c2e1" and the folder
@@ -8309,7 +7652,7 @@ fn history_json(d: &Daemon, params: &std::collections::HashMap<String, String>) 
             } else {
                 j.out_dir.to_string_lossy().into_owned()
             };
-            json!({
+            Some(json!({
                 "nzo_id": j.nzo_id,
                 "name": j.name,
                 "nzb_name": format!("{}.nzb", j.name),
@@ -8465,7 +7808,7 @@ fn history_json(d: &Daemon, params: &std::collections::HashMap<String, String>) 
                         j.unpack_blocked_by
                     )
                 },
-            })
+            }))
         })
         .collect();
     let n = slots.len();
@@ -9086,6 +8429,7 @@ mod tests {
     /// unconditionally when it exited, so switching the indexer OFF
     /// mid-scan got a live shared connection back, and wiping got the
     /// database recreated seconds after the API reported it gone.
+    #[cfg(feature = "indexer")]
     #[test]
     fn a_scan_pass_may_only_publish_into_the_index_it_started_in() {
         // The ordinary case: same era, still on.
@@ -9493,7 +8837,7 @@ mod tests {
             .0;
         body.lines()
             .filter_map(|l| l.strip_prefix("        \""))
-            .filter(|l| l.contains("=> {") || l.contains("=> ("))
+            .filter(|l| l.contains("=> {") || l.contains("=> (") || l.contains("=> set_"))
             .flat_map(|l| {
                 // One arm can carry several names: `"a" | "b" => {`.
                 l.split("=>")
@@ -9520,6 +8864,26 @@ mod tests {
     #[test]
     fn apply_arms_match_the_table() {
         let arms = apply_setting_arms();
+        // The source scan cannot see cfg attributes, so in slim builds
+        // subtract the indexer arms that are compiled out together with
+        // their table rows.
+        #[cfg(not(feature = "indexer"))]
+        let arms: std::collections::BTreeSet<String> = {
+            const INDEXER_ARMS: &[&str] = &[
+                "index_db",
+                "index_gates",
+                "index_enabled",
+                "spot_enabled",
+                "index_interests",
+                "index_evict_order",
+                "index_evict_kinds",
+                "predb_max_rows",
+                "predb_seed_days",
+            ];
+            arms.into_iter()
+                .filter(|a| !INDEXER_ARMS.contains(&a.as_str()))
+                .collect()
+        };
         assert!(
             arms.len() > 60,
             "the source scan found only {} arms - it has stopped matching \
@@ -9654,6 +9018,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "indexer")]
     #[test]
     fn live_tip_policy_applies_custom_categories_to_gate_and_ingest() {
         let db = std::env::temp_dir().join(format!(
@@ -10163,6 +9528,7 @@ mod tests {
     /// record with del_files=1 and the replacement's payload survives.
     #[test]
     fn a_published_over_directory_is_not_the_old_records_to_delete() {
+        let _steady = crate::smart::trash_globals_steady();
         let root = std::env::temp_dir().join(format!("nzbfast-published-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let canon = root.join("Movie.2024");
@@ -10268,6 +9634,7 @@ mod tests {
     /// `remove_dir_all(SeasonDir)` - the whole season.
     #[test]
     fn retrying_a_filed_job_leaves_the_season_folder_alone() {
+        let _steady = crate::smart::trash_globals_steady();
         let root = std::env::temp_dir().join(format!("nzbfast-refile-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let out_root = root.join("downloads");
@@ -10326,6 +9693,7 @@ mod tests {
     /// private directory.
     #[test]
     fn remove_job_files_reads_the_flag_not_the_state() {
+        let _steady = crate::smart::trash_globals_steady();
         let root = std::env::temp_dir().join(format!("nzbfast-rmfiles-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let season = root.join("Show").join("Season 01");
@@ -10367,6 +9735,7 @@ mod tests {
     /// `remove_user_dir` on one episode's delete.
     #[test]
     fn a_split_source_that_is_a_season_folder_is_deleted_narrowly() {
+        let _steady = crate::smart::trash_globals_steady();
         let root = std::env::temp_dir().join(format!("nzbfast-splitfiled-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         // The SOURCE half of a split move: a shared season folder still
@@ -10483,6 +9852,7 @@ mod tests {
     /// asserting on the shape predicate.
     #[test]
     fn a_legacy_requeued_record_still_migrates_as_filed() {
+        let _steady = crate::smart::trash_globals_steady();
         let root = std::env::temp_dir().join(format!("nzbfast-legacyfiled-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let season = root.join("tv").join("Some Show").join("Season 03");
@@ -10562,6 +9932,7 @@ mod tests {
     /// off: it returns exactly the empty string that did the damage.
     #[test]
     fn turning_auto_rename_off_does_not_delete_the_upgrade_that_replaced_an_episode() {
+        let _steady = crate::smart::trash_globals_steady();
         let root = std::env::temp_dir().join(format!("nzbfast-filedsfx-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let season = root.join("tv").join("The Bear").join("Season 03");
@@ -10622,6 +9993,7 @@ mod tests {
     /// route cannot find it either.
     #[test]
     fn a_job_filed_under_an_oracles_name_is_deleted_by_that_name() {
+        let _steady = crate::smart::trash_globals_steady();
         let root = std::env::temp_dir().join(format!("nzbfast-fbase-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let season = root.join("tv").join("The Bear").join("Season 03");
@@ -10686,6 +10058,7 @@ mod tests {
     /// back to a recompute, never to a bare "".
     #[test]
     fn an_auto_rename_off_install_still_deletes_the_episode_it_filed() {
+        let _steady = crate::smart::trash_globals_steady();
         let root = std::env::temp_dir().join(format!("nzbfast-nosfx-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let season = root.join("tv").join("The Bear").join("Season 03");
@@ -11220,6 +10593,7 @@ mod tests {
     /// re-emitted the literal into every served page. A single `.replace`
     /// does not recurse, so nothing broke visibly - it just shipped a
     /// stray marker. Hence the "no marker survives" half.
+    #[cfg(feature = "indexer")]
     #[test]
     fn every_served_page_gets_the_shared_design_tokens() {
         const MARK: &str = "__NZBFAST_UI_TOKENS__";
@@ -11275,6 +10649,7 @@ mod tests {
     /// `node --check` cannot catch this (the file is valid JS), so the
     /// guard is a source-level one: no name may be declared twice at the
     /// top level of a served page.
+    #[cfg(feature = "indexer")]
     #[test]
     fn no_served_page_declares_the_same_function_twice() {
         for (name, page) in [("dashboard", DASHBOARD_HTML), ("wall", WALL_HTML)] {
@@ -12136,6 +11511,7 @@ mod tests {
     /// The order setting is a closed set. Anything else is rejected at
     /// the settings boundary, which is what lets `evict_policy` treat the
     /// stored string as always-valid.
+    #[cfg(feature = "indexer")]
     #[test]
     fn evict_order_setting_accepts_exactly_the_five_orders() {
         use nzbkit::index::EvictOrder as O;
@@ -12186,6 +11562,7 @@ mod tests {
     /// a RESTRICTION ("evict only these"), so a typo does not evict the
     /// wrong thing - it evicts nothing, and the user is left staring at a
     /// cap that never frees a byte with no error anywhere.
+    #[cfg(feature = "indexer")]
     #[test]
     fn evict_kinds_setting_validates_and_normalizes() {
         assert_eq!(super::parse_evict_kinds("").unwrap(), Vec::<String>::new());
@@ -12387,6 +11764,7 @@ mod tests {
     /// TV keys carry no year, so they are exact; a film pinned to a year
     /// ALSO protects the year-less form, because a stem with no year in
     /// it parses to `m:<title>` and is the same film.
+    #[cfg(feature = "indexer")]
     #[test]
     fn watchlist_entry_yields_the_keys_its_releases_carry() {
         let item = |kind: &str, title: &str, year: Option<u32>| crate::watchlist::WatchItem {
@@ -12434,6 +11812,7 @@ mod tests {
     /// it is data the user explicitly asked to keep. All four categories
     /// must survive the assembly, and the assembly must not lose one to
     /// deduplication against another.
+    #[cfg(feature = "indexer")]
     #[test]
     fn protected_set_carries_all_four_categories() {
         let p = super::assemble_protected(
@@ -12473,6 +11852,7 @@ mod tests {
     /// An empty protected set is an empty protected set - it must not
     /// pick up a stray "" key, which would match every unparsed row and
     /// quietly protect the junk the cap exists to shed.
+    #[cfg(feature = "indexer")]
     #[test]
     fn protected_set_never_contains_the_empty_key() {
         let p = super::assemble_protected(
@@ -12488,6 +11868,7 @@ mod tests {
     /// (browsing a card twice is one signal), it expires, and it is
     /// bounded - a scripted crawl of the wall cannot grow the file
     /// without limit or pin the whole database forever.
+    #[cfg(feature = "indexer")]
     #[test]
     fn opened_log_coalesces_expires_and_stays_bounded() {
         let mut log = super::OpenedLog::default();
@@ -12537,6 +11918,7 @@ mod tests {
     /// `.unwrap_or_default()` did - made the NEXT successful poll report
     /// every non-junk title posted in the last week as an arrival: the
     /// pill claiming 890,000 arrivals, arrived at from the other side.
+    #[cfg(feature = "indexer")]
     #[test]
     fn a_failed_tip_read_is_not_a_cursor_of_zero() {
         use nzbkit::index::TipInfo;
@@ -12585,6 +11967,7 @@ mod tests {
     /// refuse to latch a non-number. This greps the shipped wall for that
     /// guard because the HTML is embedded in the binary, so a regression
     /// here ships silently.
+    #[cfg(feature = "indexer")]
     #[test]
     fn the_wall_poll_refuses_to_latch_a_failed_tip() {
         let poll = WALL_HTML
@@ -12609,6 +11992,7 @@ mod tests {
     /// logged for the whole VACUUM: measured on a 175 MB database that is
     /// ~0.5 s, so on the multi-GB indexes this feature exists for it is
     /// minutes. The watcher keeps asking, and can still act on the answer.
+    #[cfg(feature = "indexer")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_download_that_starts_mid_vacuum_aborts_it() {
         use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -12676,6 +12060,7 @@ mod tests {
     /// VACUUM waits for a moment with no scan pass and no download, and
     /// it also waits for room - it rewrites the whole file beside the
     /// original, and these run on NAS boxes.
+    #[cfg(feature = "indexer")]
     #[test]
     fn compaction_defers_while_busy_and_fires_when_idle() {
         use super::CompactVerdict as V;
@@ -12751,6 +12136,7 @@ mod tests {
     /// a large set costs scan work and nothing else. What is still bounded
     /// is how many passes an on-demand eviction will make before giving
     /// up, which is the only loop that could otherwise spin.
+    #[cfg(feature = "indexer")]
     #[test]
     fn evict_pass_count_is_bounded_and_useful() {
         assert!(
@@ -12769,6 +12155,7 @@ mod tests {
     /// Two very different reasons a prune stops short, and telling the
     /// user the wrong one sends them hunting for protected releases that
     /// do not exist.
+    #[cfg(feature = "indexer")]
     #[test]
     fn shrink_shortfall_distinguishes_protection_from_the_db_floor() {
         let floor = super::shrink_shortfall_reason(0);
@@ -13260,6 +12647,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "indexer")]
     #[test]
     fn image_sniff_accepts_real_formats_only() {
         assert!(super::looks_image(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00]));
@@ -13276,6 +12664,7 @@ mod tests {
     /// the ones that bite: they pass the alphanumeric class, and on
     /// Windows the open resolves to the console and the read never
     /// returns, wedging an HTTP worker for good.
+    #[cfg(feature = "indexer")]
     #[test]
     fn art_names_reject_traversal_and_dos_devices() {
         assert!(super::art_name_ok("m_the_matrix_1999.jpg"));

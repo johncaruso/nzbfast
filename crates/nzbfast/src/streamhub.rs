@@ -75,6 +75,15 @@ pub(crate) struct StreamHub {
     /// connections, so the active job keeps its budget. Exclusion stays
     /// all-or-nothing (`excluded_hosts`); this is the bounded middle.
     pub host_conn_caps: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    /// TODO 112 (dark, NZBFAST_LIVE_TUNE=1): per-host live connection
+    /// targets, shared between each job's pool build and the epoch
+    /// controller in tasks.rs. On the hub rather than per job because
+    /// the controller's belief must survive job boundaries - that is
+    /// the whole point of a live tuner over the offline snapshot. A
+    /// prefetch sidecar runs on a fresh hub, so sidecars are never
+    /// live-tuned. State, never a setting: nothing here is persisted.
+    pub live_targets:
+        std::sync::Mutex<std::collections::HashMap<String, Arc<nzbkit::pool::ConnTarget>>>,
     /// M2c.5: may this run speculatively prefetch a recovery volume the
     /// moment an article goes terminally Missing? The daemon enables it
     /// per MAIN job when no quota is configured (mirrors the sidecar-
@@ -153,6 +162,30 @@ pub(crate) struct StreamHub {
     /// job teardown). queue_json surfaces it on the owning slot so the
     /// dashboard's "ask at once" mode can prompt mid-download.
     pub password_wanted: std::sync::Mutex<Option<String>>,
+    /// A2 playback contract: what the byte-serving path has had to do
+    /// for the player, for the mobile clients' health overlay.
+    pub stream_stats: Arc<StreamStats>,
+}
+
+/// Counters the /stream read path keeps so a client can show WHY
+/// playback looks the way it does (workstream A2; the hardening round
+/// that produced these numbers is research/STREAM-HARDENING-2026-08.md).
+///
+/// Process-wide rather than per job: a reader is attached to at most one
+/// job at a time and the numbers are read beside that job's own state,
+/// so a second job's history cannot be mistaken for this one's - but
+/// they are cumulative since start, so a client that wants a rate
+/// differences two polls rather than reading an absolute.
+#[derive(Default)]
+pub(crate) struct StreamStats {
+    /// Reads that had to wait for their span to land: the server-side
+    /// count of what a viewer experiences as buffering.
+    pub blocked_reads: std::sync::atomic::AtomicU64,
+    /// Bytes served as zeros because the articles under them were
+    /// terminally missing and nothing in flight carried them (the
+    /// dead-span path). Non-zero means the picture is degraded, which
+    /// no player can tell a client on its own.
+    pub zero_filled_bytes: std::sync::atomic::AtomicU64,
 }
 
 impl StreamHub {
@@ -308,6 +341,51 @@ impl SeekCtl {
         spans: &[(u64, u64)],
         engage_stream: bool,
     ) -> usize {
+        let ids = self.map_span_ids(name, file_size, spans);
+        // promote() ranks by first occurrence, so cross-span duplicates
+        // are harmless.
+        self.ctl.promote_opts(&ids, engage_stream)
+    }
+
+    /// Can any byte of output span [start, start+len) of `name` still be
+    /// delivered by the fetch run attached right now?
+    ///
+    /// - `Some(true)`: something live carries it (or we cannot rule that
+    ///   out - an unmapped span and a missed lock both land here).
+    /// - `Some(false)`: the span maps to articles and NONE of them is
+    ///   pending or in flight - all terminal (430'd everywhere, out of
+    ///   retries), so nothing short of settle-side repair will ever
+    ///   cover those bytes.
+    /// - `None`: no pool attached - the run ended (or has not started);
+    ///   only repair can change the file now, and the caller decides how
+    ///   long repair deserves.
+    ///
+    /// The mapping carries the same ±article slack the promotes use, and
+    /// slack articles count as live - so a span is only ever declared
+    /// dead a little LATE, never early.
+    pub fn span_deliverable(
+        &self,
+        name: &str,
+        file_size: u64,
+        start: u64,
+        len: u64,
+    ) -> Option<bool> {
+        let ids = self.map_span_ids(name, file_size, &[(start, start + len)]);
+        if ids.is_empty() {
+            return Some(true);
+        }
+        self.ctl.any_live(&ids)
+    }
+
+    /// The pending-article ids carrying output bytes of `name` for every
+    /// span, in span order - the mapping behind [`Self::promote_output_spans`]
+    /// and [`Self::span_can_still_arrive`].
+    pub(crate) fn map_span_ids(
+        &self,
+        name: &str,
+        file_size: u64,
+        spans: &[(u64, u64)],
+    ) -> Vec<String> {
         let mut ids: Vec<String> = Vec::new();
         for &(start, end) in spans {
             if start >= end {
@@ -349,7 +427,7 @@ impl SeekCtl {
                 // first seconds, exactly when the player probes the
                 // tail). Estimate from NZB metadata alone.
                 self.ladder_fallback(file_size, start, end, &mut ids);
-                continue;
+                continue; // next span
             }
             // map_output_range returns pieces sorted by output offset, so
             // pushing in iteration order preserves player-read order.
@@ -377,9 +455,7 @@ impl SeekCtl {
                 }
             }
         }
-        // promote() ranks by first occurrence, so cross-span duplicates
-        // are harmless.
-        self.ctl.promote_opts(&ids, engage_stream)
+        ids
     }
 
     /// Register the yEnc-declared name observed for `slot`'s articles.

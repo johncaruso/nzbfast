@@ -326,6 +326,7 @@ pub(super) fn stream_request(
                 d.hub.stream_readers.clone(),
                 d.hub.stream_gen.clone(),
                 d.hub.stream_alive.clone(),
+                d.hub.stream_stats.clone(),
             );
             return;
         }
@@ -549,6 +550,169 @@ fn fill_live_probe(
 }
 
 // ---------------------------------------------------------------------------
+// A2 (playback contract v1): readiness as API truth
+// ---------------------------------------------------------------------------
+
+/// How long a finished job's disk answer is reused before the walk runs
+/// again. The answer only changes when someone moves or deletes the
+/// files, and the compact mobile poll asks for a page of history every
+/// few seconds on a phone that is also playing video.
+const DISK_READINESS_TTL_SECS: u64 = 30;
+
+/// The file `/stream/{id}` would serve if a player asked right now, and
+/// whether it can be played yet.
+///
+/// This is the A2 contract's "readiness as API truth": the same question
+/// `/preview/probe` answers per job, in a form a job list can carry, and
+/// decided by the same two functions the byte-serving path picks its
+/// file with ([`open_live_probe`] live, [`finished_media_path`] on
+/// disk) - so a client that is told "ready" is told it about the file it
+/// will actually receive.
+///
+/// Deliberately read-only: unlike the probe it never promotes articles
+/// for a file index. A list poll must not steer the download queue, and
+/// a client that wants the index pulled has `/preview/probe/{id}`.
+///
+/// `reason` is a closed token set, so a client can branch without
+/// parsing prose: `live` (playable, still downloading), `disk`
+/// (playable, finished), `pending` (downloading, not enough of the
+/// container yet), `not_fetched` (a library entry - playing it IS the
+/// download trigger), `not_started` (queued or paused), `no_media`
+/// (finished with no playable file on disk any more), `failed`,
+/// `unknown`.
+pub(super) fn playback_readiness(d: &Daemon, id: &str) -> serde_json::Value {
+    let mut o = serde_json::json!({
+        "ready": false,
+        "reason": "unknown",
+        "file": serde_json::Value::Null,
+        "size": 0,
+        "source": "none",
+        "coverage": serde_json::Value::Null,
+        "seekable": false,
+    });
+    if let Some((name, w, mut r)) = open_live_probe(d, id) {
+        let mut body = serde_json::json!({});
+        fill_live_probe(&mut body, &name, &w, || {
+            nzbkit::mediaprobe::probe(
+                &mut r,
+                nzbkit::mediaprobe::ProbeHint {
+                    filename: Some(name.clone()),
+                    known_size: Some(w.size),
+                },
+            )
+        });
+        // Same predicate the dashboard's Play affordance uses: a parsed
+        // container means a player can start on what has landed.
+        let ready = !body["media"].is_null();
+        let tail_ok = body["coverage"]["tail_ok"] == serde_json::Value::Bool(true);
+        o["ready"] = ready.into();
+        o["reason"] = if ready { "live" } else { "pending" }.into();
+        o["file"] = body["file"].clone();
+        o["size"] = body["size"].clone();
+        o["source"] = "live".into();
+        o["coverage"] = body["coverage"].clone();
+        // The strongest "scrubbing will work" predicate there is: the
+        // index at the end of the file has arrived.
+        o["seekable"] = (ready && tail_ok).into();
+        return o;
+    }
+    let Some(job) = d.history_job(id) else {
+        // Still in the queue. A job whose bytes are moving but whose
+        // media file cannot be read yet is PENDING, not "not started" -
+        // the download begins with the archive volumes, and the media
+        // writer only appears once the first of them unpacks. Anything
+        // parked (queued, paused, held) has not begun.
+        let running = {
+            // §91: the id test and the state read are one lock on the
+            // record, so no job can answer for the state it was in
+            // before the walk found it.
+            let q = d.queue.lock_ok();
+            q.iter().find_map(|j| {
+                let j = j.lock_ok();
+                (j.nzo_id == *id)
+                    .then(|| j.state == JobState::Downloading && !j.suspended && !j.paused)
+            })
+        };
+        o["reason"] = match running {
+            Some(true) => "pending",
+            Some(false) => "not_started",
+            None => "unknown",
+        }
+        .into();
+        return o;
+    };
+    let (state, fetched, library, tombstone) = {
+        let j = job.lock_ok();
+        (j.state, j.fetched, j.library, j.tombstone)
+    };
+    match state {
+        JobState::Failed => {
+            o["reason"] = "failed".into();
+            return o;
+        }
+        // A library entry nobody has fetched: /stream/{id} starts the
+        // download (with a key or the job's stream token). Not ready,
+        // but startable - a different sentence from "no media".
+        JobState::Completed if library && !fetched => {
+            o["reason"] = "not_fetched".into();
+            return o;
+        }
+        JobState::Completed if fetched && !tombstone => {}
+        _ => {
+            o["reason"] = "not_started".into();
+            return o;
+        }
+    }
+    let found = disk_media_memo(d, id, &job);
+    match found {
+        Some((name, size)) => {
+            o["ready"] = true.into();
+            o["reason"] = "disk".into();
+            o["file"] = name.into();
+            o["size"] = size.into();
+            o["source"] = "disk".into();
+            o["coverage"] = serde_json::json!({
+                "head_bytes": size, "pct": 100.0, "tail_ok": true,
+            });
+            o["seekable"] = true.into();
+        }
+        None => o["reason"] = "no_media".into(),
+    }
+    o
+}
+
+/// [`finished_media_path`] behind a short-TTL memo - see
+/// [`DISK_READINESS_TTL_SECS`] for why. Returns the file's name and its
+/// size on disk.
+fn disk_media_memo(d: &Daemon, id: &str, job: &Arc<Mutex<Job>>) -> Option<(String, u64)> {
+    let now = unix_now().max(0) as u64;
+    {
+        let memo = d.playback_disk.lock_ok();
+        if let Some((at, v)) = memo.get(id)
+            && now.saturating_sub(*at) < DISK_READINESS_TTL_SECS
+        {
+            return v.clone();
+        }
+    }
+    let v = finished_media_path(d, job).map(|p| {
+        let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+        (
+            p.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            size,
+        )
+    });
+    let mut memo = d.playback_disk.lock_ok();
+    // Drop what has aged out rather than letting a long-lived daemon's
+    // whole history sit in here.
+    memo.retain(|_, (at, _)| now.saturating_sub(*at) < DISK_READINESS_TTL_SECS);
+    memo.insert(id.to_string(), (now, v.clone()));
+    v
+}
+
+// ---------------------------------------------------------------------------
 // M11: HTTP range streaming over a still-downloading file
 // ---------------------------------------------------------------------------
 
@@ -581,6 +745,17 @@ pub(super) struct LiveRangeReader {
     /// ping-pong, and a dead probe must hand rights back).
     my_gen: u64,
     alive: Arc<std::sync::Mutex<std::collections::BTreeSet<u64>>>,
+    /// End of a span already judged terminally undeliverable: reads
+    /// inside [pos, dead_until) zero-fill immediately. The verdict is
+    /// taken ONCE for the whole hole (up to the next covered byte) -
+    /// tiny_http reads in 8 KB chunks, and re-litigating per read call
+    /// turned one dead article into minutes of grace waits. Coverage
+    /// is still re-checked every read, so bytes that DO land inside a
+    /// condemned span (a retry, a repair) serve as real data.
+    dead_until: u64,
+    /// A2: what this reader has had to do, for the clients' health
+    /// overlay. Shared with every other reader on the hub.
+    stats: Arc<crate::StreamStats>,
 }
 
 impl LiveRangeReader {
@@ -598,6 +773,56 @@ impl LiveRangeReader {
                 self.w.covered(lo, clen)
             }
             None => self.w.covered(pos, len),
+        }
+    }
+
+    /// Length of the covered prefix at the cursor, up to `n`: 0 when
+    /// the cursor byte itself has not landed. Binary search over
+    /// `covered` so the encrypted-store block mapping is honored too.
+    /// Only called at coverage boundaries (a window that is neither
+    /// fully covered nor fully hole), so the ~17 interval probes are
+    /// nowhere near any hot path.
+    fn covered_prefix(&self, n: u64) -> u64 {
+        if n == 0 || !self.covered(self.pos, 1) {
+            return 0;
+        }
+        let (mut lo, mut hi) = (1u64, n);
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if self.covered(self.pos, mid) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        lo
+    }
+
+    /// The whole uncovered hole under the cursor, bounded to `scan`
+    /// bytes: the span a dead-span verdict should be taken over, ending
+    /// at the next covered byte so real data resumes right behind it.
+    /// The cursor byte itself must be uncovered (both callers serve a
+    /// covered head as a short read first) - a covered interval AT the
+    /// cursor would be clipped to start exactly at `pos` and the
+    /// `> pos` filter below would skip it, mistaking real bytes for
+    /// hole. Encrypted streams judge one read's worth at a time
+    /// instead - the ciphertext-block mapping makes the next-covered
+    /// computation fiddly, and the case is rare enough to take the
+    /// slow path.
+    fn uncovered_hole_len(&self, scan: u64, n: u64) -> u64 {
+        if self.crypt.is_some() {
+            return n;
+        }
+        let next_covered = self
+            .w
+            .covered_intervals(self.pos, scan)
+            .into_iter()
+            .map(|(s, _)| s)
+            .filter(|s| *s > self.pos)
+            .min();
+        match next_covered {
+            Some(s) => s - self.pos,
+            None => scan,
         }
     }
 }
@@ -630,6 +855,64 @@ pub(super) fn stream_runway() -> u64 {
             .map(|mb| mb * 1_000_000)
             .unwrap_or(16_000_000)
     })
+}
+
+/// Cap on how long a blocked read holds out for the FULL runway once
+/// the bytes under the cursor have landed. The runway is a batching
+/// hint, not a debt: on a fast line it fills inside this cap and
+/// nothing changes, but on a line slower than the runway/cap ratio
+/// (~5 MB/s) an uncapped wait turned into a stare - measured on the
+/// chaos rig, play start took 31 s at 0.6 MB/s and every seek 12 s at
+/// 1.3 MB/s, all of it spent waiting for 16 MB that the line could not
+/// possibly deliver sooner. Past the cap the reader serves what it has
+/// and lets the player's own buffering take over.
+/// Env NZBFAST_STREAM_RUNWAY_WAIT_MS overrides for A/B tuning.
+pub(super) fn stream_runway_wait_ms() -> u64 {
+    static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("NZBFAST_STREAM_RUNWAY_WAIT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(3_000)
+    })
+}
+
+/// Grace before a blocked read even starts asking whether its span is
+/// terminally undeliverable, and the spacing of the consecutive
+/// verdicts it requires. The check itself is authoritative (pool item
+/// state), so the grace only has to outlive decode/write latency and
+/// the pop-to-registration blind spot `QueueControl::any_live`
+/// documents - not any network timeout.
+const DEAD_SPAN_GRACE_MS: u64 = 5_000;
+const DEAD_SPAN_VOTE_MS: u64 = 1_000;
+/// Consecutive "nothing live can deliver this" verdicts required
+/// before the reader zero-fills; see `QueueControl::any_live` for the
+/// race this papers over.
+const DEAD_SPAN_VOTES: u32 = 2;
+
+/// How long a blocked read waits once NO fetch run is attached (the
+/// run drained or the job parked) before it concludes the hole under
+/// the cursor is never coming. This window is what settle-side repair
+/// gets: a repair that covers the span inside it un-blocks the read
+/// with REAL bytes, so it must be long enough for a plausible repair
+/// pass, short enough that a failed job's preview does not sit frozen
+/// for the full 5-minute timeout. Env NZBFAST_STREAM_DEAD_GRACE_MS
+/// overrides (the regression tests shrink it).
+fn stream_dead_grace_ms() -> u64 {
+    static G: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        std::env::var("NZBFAST_STREAM_DEAD_GRACE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(15_000)
+    })
+}
+
+/// Kill switch for the degraded-playback path: NZBFAST_STREAM_ZEROFILL=0
+/// restores the old wait-out-the-timeout behavior.
+fn stream_zerofill() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("NZBFAST_STREAM_ZEROFILL").is_ok_and(|v| v == "0"))
 }
 
 /// Bytes of file tail kept hot alongside the playhead window (matches the
@@ -696,14 +979,64 @@ impl std::io::Read for LiveRangeReader {
                 }
             }
         }
+        // Bytes under the cursor that HAVE landed are never waited on
+        // and never zero-filled: a window straddling the frontier (or
+        // the edge of a condemned hole) shrinks to its covered head and
+        // serves that as a short read - the hole then starts exactly at
+        // the next read's cursor. Without this, the dead-span paths
+        // below judged a straddling window by its hole and zero-filled
+        // from `pos`, replacing up to a read's worth of real, landed
+        // bytes with zeros.
+        let n = match self.covered(self.pos, n as u64) {
+            true => n,
+            false => match self.covered_prefix(n as u64) {
+                0 => n,
+                head => head as usize,
+            },
+        };
+        // Fast path through a condemned hole: the dead-span verdict was
+        // already taken for [pos, dead_until) - zero-fill chunk by
+        // chunk without re-waiting. Bytes that landed since (retry,
+        // repair) win: the covered check runs first, every read.
+        if self.pos < self.dead_until && !self.covered(self.pos, n as u64) {
+            let hole = self
+                .uncovered_hole_len(self.dead_until - self.pos, n as u64)
+                .min(self.dead_until - self.pos);
+            let gap = (hole as usize).min(n);
+            if gap > 0 {
+                buf[..gap].fill(0);
+                self.stats
+                    .zero_filled_bytes
+                    .fetch_add(gap as u64, Ordering::Relaxed);
+                self.pos += gap as u64;
+                return Ok(gap);
+            }
+        }
         // Wait (up to 5 min) for the span to land - a stalled provider
         // should buffer the player, not corrupt the stream. If we block
-        // at all, wait for RUNWAY bytes, not just this chunk: the player
-        // shows one buffering pause instead of a stutter per span.
+        // at all, prefer to come back with RUNWAY bytes, not just this
+        // chunk (one buffering pause instead of a stutter per span) -
+        // but the runway is capped in TIME, not owed in bytes: once the
+        // cursor bytes are here, a slow line stops the batching wait at
+        // stream_runway_wait_ms and serves what it has. Only the bytes
+        // under the cursor may hold the read - a hole further along the
+        // runway is the next read's problem, not this one's (waiting on
+        // it here turned one missing article up to 16 MB ahead into a
+        // full stall of perfectly playable video).
         if !self.covered(self.pos, n as u64) {
+            // A2 telemetry: this read is about to wait for its span -
+            // server-side, that IS the viewer's buffering event.
+            self.stats.blocked_reads.fetch_add(1, Ordering::Relaxed);
             let runway = (n as u64).max((self.end - self.pos).min(stream_runway()));
             let mut waited = 0u64;
-            while !self.covered(self.pos, runway) {
+            let mut dead_votes = 0u32;
+            loop {
+                if self.covered(self.pos, runway) {
+                    break;
+                }
+                if self.covered(self.pos, n as u64) && waited >= stream_runway_wait_ms() {
+                    break;
+                }
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 waited += 50;
                 // Re-issue the promotion occasionally while blocked: the
@@ -714,6 +1047,51 @@ impl std::io::Read for LiveRangeReader {
                     && self.newest_alive()
                 {
                     promote_playhead(sc, &self.name, &self.w, self.pos);
+                }
+                // Degraded playback beats a stall: when the bytes under
+                // the cursor went terminally missing (430 everywhere /
+                // out of retries - nothing pending or in flight carries
+                // them), serve zeros for the hole instead of blocking a
+                // preview on the 5-minute timeout. The file on disk is
+                // never touched: settle-side repair still gets its gap,
+                // and a later Range request re-reads whatever repair
+                // wrote. With NO pool attached (run drained, job parked)
+                // the verdict cannot be asked, so repair gets a bounded
+                // window instead - a repair landing inside it un-blocks
+                // this read with real bytes. Consecutive votes per
+                // any_live's blind spot.
+                if stream_zerofill()
+                    && waited >= DEAD_SPAN_GRACE_MS
+                    && waited.is_multiple_of(DEAD_SPAN_VOTE_MS)
+                    && !self.covered(self.pos, n as u64)
+                    && let Some(sc) = &self.seek
+                {
+                    // The verdict spans the WHOLE hole (cursor to the
+                    // next covered byte, runway-bounded) so one grace
+                    // period condemns it once; the fast path above then
+                    // fills it chunk by chunk.
+                    let hole = self.uncovered_hole_len(runway, n as u64);
+                    let dead = match sc.span_deliverable(&self.name, self.w.size, self.pos, hole) {
+                        Some(live) => !live,
+                        None => waited >= stream_dead_grace_ms(),
+                    };
+                    dead_votes = if dead { dead_votes + 1 } else { 0 };
+                    if dead_votes >= DEAD_SPAN_VOTES && !self.covered(self.pos, n as u64) {
+                        let gap = (self.uncovered_hole_len(runway, n as u64) as usize).min(n);
+                        self.dead_until = self.pos + hole;
+                        buf[..gap].fill(0);
+                        self.stats
+                            .zero_filled_bytes
+                            .fetch_add(gap as u64, Ordering::Relaxed);
+                        info!(
+                            target: "stream",
+                            "{}: zero-filling {hole} B at {} - the articles under it are \
+                             terminally missing and nothing in flight carries them",
+                            self.name, self.pos
+                        );
+                        self.pos += gap as u64;
+                        return Ok(gap);
+                    }
                 }
                 if waited > 300_000 {
                     return Err(std::io::Error::new(
@@ -772,6 +1150,7 @@ pub(super) fn serve_range(
     readers: Arc<std::sync::atomic::AtomicUsize>,
     latest_gen: Arc<std::sync::atomic::AtomicU64>,
     alive: Arc<std::sync::Mutex<std::collections::BTreeSet<u64>>>,
+    stats: Arc<crate::StreamStats>,
 ) {
     let total = w.size;
     let range = req
@@ -833,6 +1212,8 @@ pub(super) fn serve_range(
         readers,
         my_gen,
         alive,
+        dead_until: 0,
+        stats,
     };
     // tiny_http chunks any body over ~1 MB even with a known length -
     // players want identity + exact Content-Length for seeking.
@@ -915,6 +1296,67 @@ mod preview_probe_tests {
         // parse means there is no index to promote for.
         assert_eq!(body["coverage"]["tail_ok"], false, "{body}");
         assert!(!need_tail, "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod dead_span_tests {
+    use super::*;
+    use std::io::Read;
+
+    /// A read window straddling the edge of a condemned hole serves its
+    /// covered head as REAL bytes (a short read), and only the hole
+    /// itself zero-fills. Before the covered-prefix guard, the fast
+    /// path judged the straddling window by its hole: covered_intervals
+    /// clips the interval at the cursor to start exactly at `pos`, the
+    /// `> pos` filter skipped it, and the whole window - real landed
+    /// tail of the last good article included - went out as zeros.
+    #[test]
+    fn a_condemned_hole_never_swallows_the_covered_head() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-deadspan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("movie.mkv");
+        const SIZE: u64 = 300_000;
+        const HOLE_START: u64 = 100_000; // covered: [0, 100k)
+        const HOLE_END: u64 = 200_000; // covered: [200k, 300k); hole between
+        let w = Arc::new(nzbkit::disk::FileWriter::create(&path, SIZE).unwrap());
+        w.write_at(0, &vec![0xAB; HOLE_START as usize]).unwrap();
+        w.write_at(HOLE_END, &vec![0xCD; (SIZE - HOLE_END) as usize])
+            .unwrap();
+        let alive = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::from([0])));
+        let mut r = LiveRangeReader {
+            w: w.clone(),
+            f: std::fs::File::open(&path).unwrap(),
+            crypt: None,
+            pos: HOLE_START - 4_096,
+            end: SIZE,
+            seek: None,
+            name: "movie.mkv".into(),
+            promoted_to: 0,
+            readers: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            my_gen: 0,
+            alive,
+            // The hole was already condemned (dead-span verdict taken).
+            dead_until: HOLE_END,
+            stats: Arc::new(Default::default()),
+        };
+        // Straddling read: 4 KB of real bytes remain before the hole.
+        // They must come back as data, as a short read - not zeros.
+        let mut buf = vec![0u8; 8_192];
+        let got = r.read(&mut buf).unwrap();
+        assert_eq!(got, 4_096, "covered head must be a short REAL read");
+        assert!(
+            buf[..got].iter().all(|&b| b == 0xAB),
+            "head bytes must be the landed data, not zero-fill"
+        );
+        assert_eq!(r.pos, HOLE_START);
+        // The next read starts exactly at the hole: condemned span, so
+        // it zero-fills immediately (no wait) up to the hole's end.
+        let got = r.read(&mut buf).unwrap();
+        assert_eq!(got, 8_192, "condemned hole still zero-fills");
+        assert!(buf[..got].iter().all(|&b| b == 0), "hole bytes are zeros");
+        assert_eq!(r.pos, HOLE_START + 8_192);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

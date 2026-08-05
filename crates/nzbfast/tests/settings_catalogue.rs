@@ -968,3 +968,110 @@ fn a_rules_pattern_verdict_is_reported_but_never_stored() {
     drop(d);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// #17: importing a sabnzbd.ini brings its categories over, merged.
+///
+/// Categories are not cosmetic on this side. `register_cat` exists
+/// because Sonarr and Radarr validate their configured category against
+/// our list and REFUSE TO CONNECT when it is missing, and it only runs
+/// when a job carrying that category arrives - the wrong order for a
+/// migration. Without this the *arrs fail their category check from the
+/// moment the servers land until someone retypes every category by hand.
+///
+/// The folder half is applied per category ON PURPOSE, and this pins it:
+/// the paths come from the machine SAB ran on, so on a real migration
+/// some of them do not exist here. One unreachable path must not abandon
+/// the overrides that would have worked, and the ones it drops must be
+/// reported rather than left to a log line.
+#[test]
+fn importing_a_sabnzbd_ini_merges_its_categories_and_says_what_it_could_not_take() {
+    let dir = scratch("sabcats");
+    let reachable = dir.join("reach");
+    std::fs::create_dir_all(&reachable).unwrap();
+    let ini = dir.join("sabnzbd.ini");
+    std::fs::write(
+        &ini,
+        format!(
+            "[misc]\ncomplete_dir = {}\n\
+             [categories]\n\
+             [[*]]\nname = *\ndir = \"\"\n\
+             [[movies_anime]]\nname = movies_anime\norder = 0\ndir = movies/anime\nnewzbin = *anime*\n\
+             [[books]]\nname = books\ndir = books\n\
+             [[series]]\nname = series\ndir = /nonexistent-root-for-this-test/series\n\
+             [servers]\n[[news.example.com]]\nhost = news.example.com\nport = 563\n",
+            reachable.display()
+        ),
+    )
+    .unwrap();
+
+    let d = serve(&dir);
+    let before = settings_block(d.port)["categories"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(before.contains("books"), "built-ins missing: {before}");
+
+    let r = api(
+        d.port,
+        &format!(
+            "mode=import_apply&value={}&value2=sabnzbd",
+            urlenc(&ini.to_string_lossy())
+        ),
+    );
+    assert_eq!(r["status"].as_bool(), Some(true), "import failed: {r}");
+    let cats = &r["categories"];
+
+    // Merged, not replaced: the built-ins survive and the new ones join.
+    let after = settings_block(d.port)["categories"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    for want in ["books", "movies", "music", "tv", "movies_anime", "series"] {
+        assert!(after.contains(want), "{want} missing after import: {after}");
+    }
+    // `*` is SAB's default category, not a real one.
+    assert!(!after.split(',').any(|c| c.trim() == "*"), "{after}");
+
+    // The reachable override landed and is ABSOLUTE (the settings arm
+    // refuses a relative path outright).
+    let dests = settings_block(d.port)["move_completed_cats"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        dests.contains("movies_anime=") && dests.contains("/movies/anime"),
+        "the resolvable override did not land: {dests}"
+    );
+    // `books`'s dir is just its own name, which is already what we do -
+    // an override there would say nothing.
+    assert!(
+        !dests.contains("books="),
+        "an override was emitted that changes nothing: {dests}"
+    );
+    // The unreachable one did NOT take the others down with it, and it
+    // is reported with its reason.
+    assert!(!dests.contains("series="), "{dests}");
+    let failed = cats["folders_failed"].as_array().expect("folders_failed");
+    assert_eq!(failed.len(), 1, "{cats}");
+    assert_eq!(failed[0]["name"].as_str(), Some("series"));
+    assert!(
+        !failed[0]["error"].as_str().unwrap_or_default().is_empty(),
+        "a dropped folder must say why: {cats}"
+    );
+
+    // Everything with nowhere to go is named, so the import cannot look
+    // complete when it is not.
+    let dropped = cats["dropped"]
+        .as_array()
+        .expect("dropped")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    for want in ["order", "indexer-category"] {
+        assert!(dropped.contains(want), "{want:?} not reported: {dropped:?}");
+    }
+
+    drop(d);
+    let _ = std::fs::remove_dir_all(&dir);
+}

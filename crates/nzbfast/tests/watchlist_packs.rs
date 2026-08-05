@@ -1,3 +1,4 @@
+#![cfg(feature = "indexer")]
 //! M23e end to end: the two shapes of post a watchlist item used to be
 //! blind to, driven through a real daemon over its own API.
 //!

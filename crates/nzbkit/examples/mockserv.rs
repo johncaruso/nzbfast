@@ -5,9 +5,11 @@
 //! host 127.0.0.1, the printed port, TLS off) can run a real download
 //! through the full stack - pool, decode, verify, assemble.
 //!
-//!   cargo run -p nzbkit --example mockserv -- [outdir] [port]
+//!   cargo run -p nzbkit --example mockserv -- [outdir] [port] [mb]
 //!
-//! Runs until killed.
+//! `mb` sizes the payload (default 4 - the installer-acceptance
+//! shape); the netem rounds serve hundreds of MB so a lossy-link leg
+//! runs long enough to measure. Runs until killed.
 
 use std::collections::HashMap;
 
@@ -18,9 +20,10 @@ async fn main() {
     let mut args = std::env::args().skip(1);
     let outdir = std::path::PathBuf::from(args.next().unwrap_or_else(|| ".".into()));
     let port: u16 = args.next().and_then(|p| p.parse().ok()).unwrap_or(1190);
+    let mb: u64 = args.next().and_then(|p| p.parse().ok()).unwrap_or(4);
 
-    // Deterministic, incompressible-ish 4 MB payload in ~500 KB articles.
-    let data: Vec<u8> = (0..4_000_000u64)
+    // Deterministic, incompressible-ish payload in ~500 KB articles.
+    let data: Vec<u8> = (0..mb * 1_000_000)
         .map(|i| (i.wrapping_mul(2654435761) >> 16) as u8)
         .collect();
     let mut articles = HashMap::new();

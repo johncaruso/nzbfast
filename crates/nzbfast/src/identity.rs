@@ -175,6 +175,7 @@ pub fn xrel_query(name: &str, known_imdb: &str) -> Option<String> {
 /// post shipped, and the recovery volumes repeat the same critical
 /// packets, so the index alone answers. Called BEFORE the cleanup sweep,
 /// which is what deletes them.
+#[cfg(feature = "indexer")]
 pub fn par_fingerprints(dir: &std::path::Path) -> Vec<(String, String)> {
     // A main index is small (tens of KB); a `.vol000+50.par2` is not,
     // and reading a 700 MB recovery volume to learn what its first
@@ -382,6 +383,7 @@ mod tests {
         d
     }
 
+    #[cfg(feature = "indexer")]
     #[test]
     fn par_fingerprints_read_a_real_sidecar_and_shrug_at_everything_else() {
         // The same checked-in par2cmdline output nzbkit's parser tests

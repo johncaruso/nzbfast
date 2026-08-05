@@ -8,6 +8,8 @@ config.local.json
 # Swift app build artifacts
 macapp/.build/
 macapp/build/
+# iOS spike harness bundle (built by packaging/ios/build-harness.sh)
+packaging/ios/NZBFastHarness.app/
 
 # Runtime SQLite index + WAL sidecars (churn every daemon run)
 *.db
